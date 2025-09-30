@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"io/fs"
@@ -202,12 +203,56 @@ type APIConfig struct {
 	SkipSSLVerify bool          `json:"skip_ssl_verify"`
 }
 
+// getMachineID returns a machine ID similar to github.com/denisbrodbeck/machineid
+func getMachineID() string {
+	var id string
+
+	switch runtime.GOOS {
+	case "linux":
+		// Try /etc/machine-id first (systemd)
+		if data, err := os.ReadFile("/etc/machine-id"); err == nil {
+			id = strings.TrimSpace(string(data))
+			if id != "" {
+				return id
+			}
+		}
+		// Try /var/lib/dbus/machine-id as fallback
+		if data, err := os.ReadFile("/var/lib/dbus/machine-id"); err == nil {
+			id = strings.TrimSpace(string(data))
+			if id != "" {
+				return id
+			}
+		}
+	case "darwin":
+		// macOS: use IOPlatformUUID
+		if data, err := os.ReadFile("/sys/class/dmi/id/product_uuid"); err == nil {
+			id = strings.TrimSpace(string(data))
+			if id != "" {
+				return id
+			}
+		}
+		// Alternative: use ioreg command if available
+		// This is a simplified version, the actual library uses ioreg
+	case "windows":
+		// Windows: would use registry or WMI
+		// Simplified: use computername as fallback
+	}
+
+	// Fallback to hostname if machine-id not available
+	if hostname, err := os.Hostname(); err == nil {
+		id = hostname
+	} else {
+		id = "unknown-machine-id"
+	}
+
+	return id
+}
+
 // Default returns the default configuration
 func DefaultConfig(extName string) *Config {
-	// Simplified machine ID generation (without external dependency)
-	machineID := "standalone-machine-id"
-	if hostname, err := os.Hostname(); err == nil {
-		machineID = hostname
+	machineID := getMachineID()
+	if machineID == "" {
+		machineID = "unknown-machine-id"
 	}
 
 	userName := "unknown"
@@ -2076,15 +2121,192 @@ func RunAnalysis(params AnalysisParams) {
 	os.Exit(0)
 }
 
+// ===== Usage Display Functions =====
+
+// usageRow represents a single row of usage data for processing
+type usageRow struct {
+	date          string
+	model         string
+	inputTokens   int
+	outputTokens  int
+	cacheRead     int
+	cacheCreation int
+	total         int
+}
+
+// processUsageDataForTable extracts structured rows from the usage data map
+func processUsageDataForTable(usageData map[string]interface{}) ([]usageRow, usageRow) {
+	var rows []usageRow
+	totals := usageRow{}
+
+	// Sort dates for consistent display
+	dates := make([]string, 0, len(usageData))
+	for date := range usageData {
+		dates = append(dates, date)
+	}
+	sort.Strings(dates)
+
+	for _, date := range dates {
+		// GetUsageFromDirectories returns ConversationUsage (map[string]interface{})
+		dateUsage, ok := usageData[date].(ConversationUsage)
+		if !ok {
+			continue
+		}
+
+		// Sort models for consistent display
+		models := make([]string, 0, len(dateUsage))
+		for model := range dateUsage {
+			models = append(models, model)
+		}
+		sort.Strings(models)
+
+		for _, model := range models {
+			usage := dateUsage[model]
+			inputTokens, outputTokens, cacheRead, cacheCreation, total := extractTokenCountsForTable(usage)
+
+			rows = append(rows, usageRow{
+				date:          date,
+				model:         model,
+				inputTokens:   inputTokens,
+				outputTokens:  outputTokens,
+				cacheRead:     cacheRead,
+				cacheCreation: cacheCreation,
+				total:         total,
+			})
+
+			// Accumulate totals
+			totals.inputTokens += inputTokens
+			totals.outputTokens += outputTokens
+			totals.cacheRead += cacheRead
+			totals.cacheCreation += cacheCreation
+			totals.total += total
+		}
+	}
+
+	return rows, totals
+}
+
+func extractTokenCountsForTable(usage interface{}) (input, output, cacheRead, cacheCreation, total int) {
+	// GetUsageFromDirectories returns actual structs (*ClaudeUsage or *CodexUsage)
+	switch u := usage.(type) {
+	case *ClaudeUsage:
+		input = u.InputTokens
+		output = u.OutputTokens
+		cacheRead = u.CacheReadInputTokens
+		cacheCreation = u.CacheCreationInputTokens
+		total = input + output + cacheRead + cacheCreation
+	case *CodexUsage:
+		if u.TotalTokenUsage != nil {
+			input = u.TotalTokenUsage["input_tokens"]
+			output = u.TotalTokenUsage["output_tokens"] + u.TotalTokenUsage["reasoning_output_tokens"]
+			cacheRead = u.TotalTokenUsage["cached_input_tokens"]
+			total = u.TotalTokenUsage["total_tokens"]
+		}
+	}
+	return
+}
+
+// displayStaticTable shows a static version of the usage table
+func displayStaticTable(usageData map[string]interface{}) {
+	if len(usageData) == 0 {
+		fmt.Println("⚠️  No usage data found in Claude Code or Codex sessions")
+		return
+	}
+
+	rows, totals := processUsageDataForTable(usageData)
+
+	// Print header
+	fmt.Printf("%-12s %-40s %15s %15s %15s %15s %15s\n",
+		"Date", "Model", "Input Tokens", "Output Tokens", "Cache Read", "Cache Creation", "Total")
+	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+	// Print data rows
+	for _, row := range rows {
+		fmt.Printf("%-12s %-40s %15d %15d %15d %15d %15d\n",
+			row.date,
+			row.model,
+			row.inputTokens,
+			row.outputTokens,
+			row.cacheRead,
+			row.cacheCreation,
+			row.total,
+		)
+	}
+
+	// Print summary
+	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	fmt.Printf("%-12s %-40s %15d %15d %15d %15d %15d\n",
+		"",
+		"TOTAL",
+		totals.inputTokens,
+		totals.outputTokens,
+		totals.cacheRead,
+		totals.cacheCreation,
+		totals.total,
+	)
+	fmt.Println()
+}
+
 // ===== Main Function (Example Usage) =====
 
-func main() {
-	// Example 1: Analyze a JSONL file
-	if len(os.Args) > 1 {
-		filePath := os.Args[1]
-		fmt.Printf("Analyzing file: %s\n", filePath)
+func printUsage() {
+	fmt.Println("Standalone Parser Example")
+	fmt.Println("=========================")
+	fmt.Println()
+	fmt.Println("This is a standalone version of the telemetry parser that includes:")
+	fmt.Println("- parser.go: Main parsing logic")
+	fmt.Println("- usage.go: Usage statistics calculation")
+	fmt.Println("- input.go: Input processing for both Claude Code and Codex")
+	fmt.Println("- All dependencies (config, paths, version, logger, etc.)")
+	fmt.Println()
+	fmt.Println("Commands:")
+	fmt.Println("  analysis           Analyze a JSONL file and output results")
+	fmt.Println("  usage              Show token usage statistics")
+	fmt.Println("  help               Show this help message")
+	fmt.Println()
+	fmt.Println("Analysis Flags:")
+	fmt.Println("  --path <file>      Path to JSONL file to analyze")
+	fmt.Println("  --output <file>    Output path to save analysis result as JSON file (optional)")
+	fmt.Println()
+	fmt.Println("Usage Flags:")
+	fmt.Println("  --json             Output raw JSON instead of table view")
+	fmt.Println()
+	fmt.Println("Examples:")
+	fmt.Println("  go run parser_example.go analysis --path examples/test_conversation.jsonl")
+	fmt.Println("  go run parser_example.go analysis --path examples/test_conversation.jsonl --output result.json")
+	fmt.Println("  go run parser_example.go usage")
+	fmt.Println("  go run parser_example.go usage --json")
+	fmt.Println()
+	fmt.Println("Backward compatibility:")
+	fmt.Println("  go run parser_example.go <file>         Direct file path (legacy)")
+}
 
-		result := AnalyzeJSONLFile(filePath)
+func main() {
+	if len(os.Args) < 2 {
+		printUsage()
+		return
+	}
+
+	command := os.Args[1]
+
+	switch command {
+	case "analysis":
+		// Parse analysis-specific flags
+		analysisFS := flag.NewFlagSet("analysis", flag.ContinueOnError)
+		pathFlag := analysisFS.String("path", "", "Path to JSONL file to analyze")
+		outputFlag := analysisFS.String("output", "", "Output path to save analysis result as JSON file (optional)")
+		if err := analysisFS.Parse(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error parsing analysis flags: %v\n", err)
+			os.Exit(2)
+		}
+
+		if *pathFlag == "" {
+			fmt.Println("Error: Please provide a file path using --path flag")
+			fmt.Println("Usage: go run parser_example.go analysis --path <file>")
+			os.Exit(1)
+		}
+
+		result := AnalyzeJSONLFile(*pathFlag)
 		if len(result) == 0 {
 			fmt.Println("No results found or file doesn't exist")
 			return
@@ -2096,24 +2318,68 @@ func main() {
 			fmt.Printf("Error marshaling result: %v\n", err)
 			return
 		}
-		fmt.Println(string(jsonOutput))
-	} else {
-		// Example 2: Show usage information
-		fmt.Println("Standalone Parser Example")
-		fmt.Println("=========================")
-		fmt.Println()
-		fmt.Println("This is a standalone version of the telemetry parser that includes:")
-		fmt.Println("- parser.go: Main parsing logic")
-		fmt.Println("- usage.go: Usage statistics calculation")
-		fmt.Println("- input.go: Input processing for both Claude Code and Codex")
-		fmt.Println("- All dependencies (config, paths, version, logger, etc.)")
-		fmt.Println()
-		fmt.Println("Usage:")
-		fmt.Println("  go run parser_example.go <path-to-jsonl-file>")
-		fmt.Println()
-		fmt.Println("Example:")
-		fmt.Println("  go run parser_example.go ~/.claude/projects/my-project/conversation.jsonl")
-		fmt.Println()
-		fmt.Println("The output will be a JSON object containing analysis results.")
+
+		// Save to output file if specified
+		if *outputFlag != "" {
+			if err := os.WriteFile(*outputFlag, jsonOutput, 0644); err != nil {
+				fmt.Fprintf(os.Stderr, "Error writing output file: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("Analysis result saved to: %s\n", *outputFlag)
+		} else {
+			// Print to stdout if no output file specified
+			fmt.Println(string(jsonOutput))
+		}
+
+	case "usage":
+		// Parse usage-specific flags
+		usageFS := flag.NewFlagSet("usage", flag.ContinueOnError)
+		jsonOutput := usageFS.Bool("json", false, "Output raw JSON instead of table view")
+		if err := usageFS.Parse(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error parsing usage flags: %v\n", err)
+			os.Exit(2)
+		}
+
+		usage, err := GetUsageFromDirectories()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error calculating usage: %v\n", err)
+			os.Exit(1)
+		}
+
+		if *jsonOutput {
+			// Output raw JSON if requested
+			jsonData, err := json.MarshalIndent(usage, "", "  ")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error formatting usage data: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println(string(jsonData))
+		} else {
+			// Display static table
+			displayStaticTable(usage)
+		}
+
+	case "help", "-h", "--help":
+		printUsage()
+
+	default:
+		// For backward compatibility, if the first arg is a file path, analyze it
+		if _, err := os.Stat(os.Args[1]); err == nil {
+			result := AnalyzeJSONLFile(os.Args[1])
+			if len(result) == 0 {
+				fmt.Println("No results found")
+				return
+			}
+			jsonOutput, err := json.MarshalIndent(result, "", "  ")
+			if err != nil {
+				fmt.Printf("Error marshaling result: %v\n", err)
+				return
+			}
+			fmt.Println(string(jsonOutput))
+		} else {
+			fmt.Fprintf(os.Stderr, "Unknown command: %s\n\n", command)
+			printUsage()
+			os.Exit(1)
+		}
 	}
 }
