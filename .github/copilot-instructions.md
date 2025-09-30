@@ -340,7 +340,7 @@ cargo test test_parse_iso_timestamp
 - Archives exclude debug symbols and unnecessary files
 
 ### Platform-Specific Dependencies
-- Linux MUSL targets require `musl-tools` for static linking
+- Linux MUSL targets require `musl-dev` package in Alpine containers for static linking (includes crti.o and other linking libraries)
 - macOS builds work on both Intel and Apple Silicon
 - Windows builds use MSVC toolchain
 
