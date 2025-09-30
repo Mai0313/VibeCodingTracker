@@ -221,13 +221,16 @@ impl Widget for ChatWidget {
 
 我希望實際TUI的介面可以類似下面這種格式
 
+請注意 下方的所有指令皆為 "範例" 請依照專案中真實存在的指令來改寫
+但指令一定要有 `/exit`, 這個指令也可以被 `/quit` `/q` 或 `ctrl + c` 去 trigger
+
 ```bash
-❯ codex
+❯ codex_usage
 ╭────────────────────────────────────────────────╮
-│ >_ OpenAI Codex (v0.42.0)                      │
+│ >_ Codex Usage (v0.42.0)                       │
 │                                                │
-│ model:     gpt-5-codex high   /model to change │
-│ directory: ~/repo/codex_usage                  │
+│ Version:     xxxx                              │
+│ directory:  Current Folder Path                │
 ╰────────────────────────────────────────────────╯
 
   To get started, describe a task or try one of these commands:
@@ -246,12 +249,12 @@ impl Widget for ChatWidget {
 當我打 斜線以後 下面會有一些 hint
 
 ```bash
-❯ codex
+❯ codex_usage
 ╭────────────────────────────────────────────────╮
-│ >_ OpenAI Codex (v0.42.0)                      │
+│ >_ Codex Usage (v0.42.0)                       │
 │                                                │
-│ model:     gpt-5-codex high   /model to change │
-│ directory: ~/repo/codex_usage                  │
+│ Version:     xxxx                              │
+│ directory:  Current Folder Path                │
 ╰────────────────────────────────────────────────╯
 
   To get started, describe a task or try one of these commands:
