@@ -77,7 +77,7 @@ jobs:
 
       - name: Cargo build (release)
         run: |
-          cargo build --target ${{ matrix.target }} --release --locked --bin codex_usage
+          cargo build --target ${{ matrix.target }} --release --locked --bin ${{ github.event.repository.name }}
 
       - name: Stage Artifact
         shell: bash
@@ -86,7 +86,7 @@ jobs:
           dest="dist/${{ matrix.target }}"
           mkdir -p "$dest"
           bin_dir="target/${{ matrix.target }}/release"
-          bin="codex_usage"
+          bin="${{ github.event.repository.name }}"
           if [[ "${{ matrix.runner }}" == windows* ]]; then
             bin="${bin}.exe"
           fi
@@ -100,8 +100,8 @@ jobs:
           $ErrorActionPreference = "Stop"
           $dest = "dist/${{ matrix.target }}"
           $version = "${env:GITHUB_REF_NAME}".Substring(1)
-          $bin = "codex_usage.exe"
-          $zip = "codex_usage-v$version-${{ matrix.friendly_id }}.zip"
+          $bin = "${{ github.event.repository.name }}.exe"
+          $zip = "${{ github.event.repository.name }}-v$version-${{ matrix.friendly_id }}.zip"
           Compress-Archive -Path "$dest\$bin" -DestinationPath "$dest\$zip" -Force
 
       - name: Create .tar.gz (all platforms)
@@ -111,8 +111,8 @@ jobs:
           set -euo pipefail
           dest="dist/${{ matrix.target }}"
           version="${GITHUB_REF_NAME#v}"
-          bin="codex_usage"
-          archive="codex_usage-v${version}-${{ matrix.friendly_id }}.tar.gz"
+          bin="${{ github.event.repository.name }}"
+          archive="${{ github.event.repository.name }}-v${version}-${{ matrix.friendly_id }}.tar.gz"
           # Try to include .exe if present, otherwise fall back to unix name
           tar -C "$dest" -czf "$dest/${archive}" "${bin}" "${bin}.exe" 2>/dev/null || \
           tar -C "$dest" -czf "$dest/${archive}" "${bin}"

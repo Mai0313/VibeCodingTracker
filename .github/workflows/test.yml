@@ -48,7 +48,7 @@ jobs:
 
       - name: Build
         run: |
-          make
+          cargo build --locked --verbose
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@v2
