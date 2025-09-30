@@ -27,13 +27,14 @@ fn test_code_analysis_tool_calls_default() {
 
 #[test]
 fn test_code_analysis_tool_calls_serialization() {
-    let mut tool_calls = CodeAnalysisToolCalls::default();
-    tool_calls.read = 5;
-    tool_calls.write = 3;
-    tool_calls.edit = 2;
-    tool_calls.todo_write = 1;
-    tool_calls.bash = 4;
-    
+    let tool_calls = CodeAnalysisToolCalls {
+        read: 5,
+        write: 3,
+        edit: 2,
+        todo_write: 1,
+        bash: 4,
+    };
+
     let json = serde_json::to_value(&tool_calls).unwrap();
     assert_eq!(json["Read"], 5);
     assert_eq!(json["Write"], 3);
@@ -50,7 +51,7 @@ fn test_code_analysis_detail_base_serialization() {
         character_count: 2500,
         timestamp: 1724851028611,
     };
-    
+
     let json = serde_json::to_value(&detail).unwrap();
     assert_eq!(json["filePath"], "/path/to/file.rs");
     assert_eq!(json["lineCount"], 100);
@@ -69,7 +70,7 @@ fn test_code_analysis_write_detail_serialization() {
         },
         content: "fn main() {}".to_string(),
     };
-    
+
     let json = serde_json::to_value(&detail).unwrap();
     assert_eq!(json["filePath"], "/path/to/file.rs");
     assert_eq!(json["content"], "fn main() {}");
@@ -85,7 +86,7 @@ fn test_code_analysis_read_detail_serialization() {
             timestamp: 1724851028611,
         },
     };
-    
+
     let json = serde_json::to_value(&detail).unwrap();
     assert_eq!(json["filePath"], "/path/to/file.rs");
     assert_eq!(json["lineCount"], 50);
@@ -103,7 +104,7 @@ fn test_code_analysis_apply_diff_detail_serialization() {
         old_string: "old code".to_string(),
         new_string: "new code".to_string(),
     };
-    
+
     let json = serde_json::to_value(&detail).unwrap();
     assert_eq!(json["filePath"], "/path/to/file.rs");
     assert_eq!(json["oldString"], "old code");
@@ -122,7 +123,7 @@ fn test_code_analysis_run_command_detail_serialization() {
         command: "cargo build".to_string(),
         description: "Build the project".to_string(),
     };
-    
+
     let json = serde_json::to_value(&detail).unwrap();
     assert_eq!(json["command"], "cargo build");
     assert_eq!(json["description"], "Build the project");
@@ -155,7 +156,7 @@ fn test_code_analysis_record_deserialization() {
         "folderPath": "/home/user/project",
         "gitRemoteUrl": "https://github.com/test/repo.git"
     }"#;
-    
+
     let record: CodeAnalysisRecord = serde_json::from_str(json_str).unwrap();
     assert_eq!(record.total_unique_files, 5);
     assert_eq!(record.total_write_lines, 100);
@@ -172,7 +173,7 @@ fn test_code_analysis_full_serialization() {
         machine_id: "test-machine".to_string(),
         records: vec![],
     };
-    
+
     let json = serde_json::to_value(&analysis).unwrap();
     assert_eq!(json["user"], "testuser");
     assert_eq!(json["extensionName"], "Claude-Code");
@@ -184,16 +185,16 @@ fn test_code_analysis_full_serialization() {
 #[test]
 fn test_usage_result_serialization() {
     use std::collections::HashMap;
-    
+
     let mut tool_calls = HashMap::new();
     tool_calls.insert("Read".to_string(), 5);
     tool_calls.insert("Write".to_string(), 3);
-    
+
     let usage_result = UsageResult {
         tool_call_counts: tool_calls,
         conversation_usage: HashMap::new(),
     };
-    
+
     let json = serde_json::to_value(&usage_result).unwrap();
     assert_eq!(json["toolCallCounts"]["Read"], 5);
     assert_eq!(json["toolCallCounts"]["Write"], 3);

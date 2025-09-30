@@ -25,7 +25,15 @@ package: ## Build crate package (.crate)
 	cargo package --locked --allow-dirty
 
 test: ## Run all tests
+	cargo test --all
+
+test-verbose: ## Run all tests with verbose output
 	cargo test --all --verbose
+
+coverage: ## Generate test coverage report (requires cargo-llvm-cov)
+	@cargo install cargo-llvm-cov
+	@cargo llvm-cov --workspace --lcov --output-path lcov.info --quiet
+	@cargo llvm-cov report
 
 run: ## Run the application
 	cargo run --release

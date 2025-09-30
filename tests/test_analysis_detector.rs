@@ -8,7 +8,11 @@ use serde_json::json;
 fn test_detect_extension_type_empty_data() {
     let data = vec![];
     let result = detect_extension_type(&data);
-    assert_eq!(result, ExtensionType::Codex, "Empty data should default to Codex");
+    assert_eq!(
+        result,
+        ExtensionType::Codex,
+        "Empty data should default to Codex"
+    );
 }
 
 #[test]
@@ -26,7 +30,7 @@ fn test_detect_extension_type_claude_code() {
             "type": "assistant"
         }),
     ];
-    
+
     let result = detect_extension_type(&data);
     assert_eq!(
         result,
@@ -49,7 +53,7 @@ fn test_detect_extension_type_codex() {
             "content": "response"
         }),
     ];
-    
+
     let result = detect_extension_type(&data);
     assert_eq!(
         result,
@@ -71,7 +75,7 @@ fn test_detect_extension_type_mixed_data() {
             "type": "assistant"
         }),
     ];
-    
+
     let result = detect_extension_type(&data);
     // Should detect as Claude Code because at least one record has parentUuid
     assert_eq!(result, ExtensionType::ClaudeCode);
@@ -84,7 +88,7 @@ fn test_detect_extension_type_single_claude_record() {
         "sessionId": "test",
         "message": "test"
     })];
-    
+
     let result = detect_extension_type(&data);
     assert_eq!(result, ExtensionType::ClaudeCode);
 }
@@ -92,12 +96,8 @@ fn test_detect_extension_type_single_claude_record() {
 #[test]
 fn test_detect_extension_type_non_object_records() {
     // Test with non-object records (should default to Codex)
-    let data = vec![
-        json!("string value"),
-        json!(123),
-        json!([1, 2, 3]),
-    ];
-    
+    let data = vec![json!("string value"), json!(123), json!([1, 2, 3])];
+
     let result = detect_extension_type(&data);
     assert_eq!(result, ExtensionType::Codex);
 }
