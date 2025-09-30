@@ -2,14 +2,19 @@
 
 ## Project Overview
 
-This is a production-ready Rust project template designed to bootstrap new Rust applications quickly. The template provides:
+This is a production-ready Rust implementation that translates the original Go codebase (`parser.go`) for parsing and analyzing JSONL log files from Claude Code and Codex. The project provides:
 
-- Modern Cargo workspace structure
+- Complete CLI implementation with analysis and usage statistics commands
+- Modern Cargo workspace structure with modular design
 - Comprehensive CI/CD pipeline with GitHub Actions
 - Multi-platform cross-compilation support
 - Docker containerization
 - Automated testing, linting, and formatting
 - Release management with GitHub Releases
+
+### Translation from Go to Rust
+
+This project is a complete Rust translation of the original Go implementation. All core functionality has been preserved and enhanced with Rust's type safety and performance benefits.
 
 ## Technical Architecture
 
@@ -17,20 +22,50 @@ This is a production-ready Rust project template designed to bootstrap new Rust 
 ```
 codex_usage/
 ├── src/
-│   ├── lib.rs          # Library code
-│   └── main.rs         # Binary entry point
-├── tests/              # Integration tests
+│   ├── lib.rs              # Library code
+│   ├── main.rs             # Binary entry point
+│   ├── cli.rs              # CLI argument parsing
+│   ├── models/             # Data models
+│   │   ├── mod.rs
+│   │   ├── analysis.rs     # Analysis data structures
+│   │   ├── usage.rs        # Usage data structures
+│   │   ├── claude.rs       # Claude Code log models
+│   │   └── codex.rs        # Codex log models
+│   ├── analysis/           # Analysis functionality
+│   │   ├── mod.rs
+│   │   ├── analyzer.rs     # Main analyzer
+│   │   ├── claude_analyzer.rs
+│   │   ├── codex_analyzer.rs
+│   │   └── detector.rs     # Extension type detection
+│   ├── usage/              # Usage statistics
+│   │   ├── mod.rs
+│   │   ├── calculator.rs   # Usage calculation
+│   │   └── display.rs      # Usage display formatting
+│   └── utils/              # Utility functions
+│       ├── mod.rs
+│       ├── paths.rs        # Path handling
+│       ├── time.rs         # Time parsing
+│       ├── file.rs         # File I/O
+│       └── git.rs          # Git operations
+├── examples/               # Example JSONL files
+├── tests/                  # Integration tests
 ├── docker/
-│   └── Dockerfile      # Multi-stage build
+│   └── Dockerfile          # Multi-stage build
 ├── .github/
-│   ├── workflows/      # CI/CD pipelines
+│   ├── workflows/          # CI/CD pipelines
 │   └── copilot-instructions.md
-├── Makefile            # Build automation
-└── Cargo.toml          # Dependencies and metadata
+├── Makefile                # Build automation
+└── Cargo.toml              # Dependencies and metadata
 ```
 
 ### Key Dependencies
-- **Runtime**: Standard Rust libraries
+- **CLI**: clap (v4.5) with derive macros for argument parsing
+- **Serialization**: serde, serde_json for JSON handling
+- **Error Handling**: anyhow, thiserror for robust error management
+- **Time**: chrono for timestamp parsing
+- **File System**: walkdir for directory traversal, home for path resolution
+- **Regex**: regex for pattern matching in log parsing
+- **Logging**: log, env_logger for debugging
 - **Development**: clippy, rustfmt for code quality
 - **CI/CD**: GitHub Actions with comprehensive workflow matrix
 
@@ -78,6 +113,87 @@ cargo run --release
 make package       # Create .crate package
 cargo package --locked --allow-dirty
 ```
+
+## CLI Commands
+
+### Analysis Command
+
+Analyzes JSONL conversation files from Claude Code or Codex:
+
+```bash
+# Analyze and output to stdout
+./target/debug/codex_usage analysis --path examples/test_conversation.jsonl
+
+# Analyze and save to file
+./target/debug/codex_usage analysis --path examples/test_conversation.jsonl --output result.json
+```
+
+### Usage Command
+
+Displays token usage statistics from Claude Code and Codex sessions:
+
+```bash
+# Display in table format
+./target/debug/codex_usage usage
+
+# Display in JSON format
+./target/debug/codex_usage usage --json
+```
+
+### Version Command
+
+Displays version information:
+
+```bash
+./target/debug/codex_usage version
+```
+
+## Go to Rust Function Mapping
+
+For developers familiar with the original Go implementation, here's the mapping between Go functions and their Rust equivalents:
+
+| Go Function | Rust Implementation | Module | Description |
+|-------------|---------------------|--------|-------------|
+| `analyzeConversations` | `analyze_claude_conversations` | `analysis::claude_analyzer` | Analyzes Claude Code conversation logs |
+| `analyzeCodexConversations` | `analyze_codex_conversations` | `analysis::codex_analyzer` | Analyzes Codex conversation logs |
+| `CalculateUsageFromJSONL` | `calculate_usage_from_jsonl` | `usage::calculator` | Calculates usage statistics from a single JSONL file |
+| `GetUsageFromDirectories` | `get_usage_from_directories` | `usage::calculator` | Aggregates usage statistics from multiple session directories |
+| `ReadJSONL` | `read_jsonl` | `utils::file` | Reads and parses JSONL files |
+| `parseISOTimestamp` | `parse_iso_timestamp` | `utils::time` | Parses ISO timestamp strings to Unix milliseconds |
+| `getGitRemoteOriginURL` | `get_git_remote_url` | `utils::git` | Extracts Git remote origin URL from repository |
+| `detectExtensionType` | `detect_extension_type` | `analysis::detector` | Auto-detects whether logs are from Claude Code or Codex |
+| `processClaudeUsageData` | `process_claude_usage` | `analysis::claude_analyzer` | Processes Claude usage statistics |
+| `processCodexUsageData` | `process_codex_usage` | `analysis::codex_analyzer` | Processes Codex usage statistics |
+| `displayStaticTable` | `display_usage_table` | `usage::display` | Displays usage statistics in table format |
+
+### Type Mappings
+
+| Go Type | Rust Type | Notes |
+|---------|-----------|-------|
+| `map[string]interface{}` | `HashMap<String, Value>` | JSON value maps using serde_json::Value |
+| `[]map[string]interface{}` | `Vec<Value>` | Array of JSON objects |
+| `string` | `String` | Owned strings |
+| `int64` | `i64` | 64-bit integers |
+| `time.Time` | `i64` (Unix millis) | Timestamps stored as milliseconds |
+| `error` | `Result<T, anyhow::Error>` | Error handling using Result type |
+
+## Implementation Highlights
+
+### Features Preserved from Go
+
+1. **Analysis Functionality**: Complete analysis of both Claude Code and Codex logs
+2. **Usage Calculation**: Token usage statistics with date-based aggregation
+3. **Path Handling**: Automatic path resolution and normalization
+4. **Git Integration**: Extraction of Git remote URLs from repositories
+5. **Format Detection**: Automatic detection of log source (Claude Code vs Codex)
+
+### Rust-Specific Enhancements
+
+1. **Type Safety**: Strong typing eliminates entire classes of runtime errors
+2. **Error Handling**: Comprehensive error handling with `anyhow` and `thiserror`
+3. **Performance**: Zero-cost abstractions and optimized release builds
+4. **Memory Safety**: No null pointers, guaranteed memory safety without garbage collection
+5. **Modular Design**: Clean separation of concerns with module system
 
 ### Development Workflow
 - **After every edit**: Run `cargo build` to confirm compilation is successful before proceeding

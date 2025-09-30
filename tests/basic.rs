@@ -1,4 +1,6 @@
 #[test]
-fn add_works() {
-    assert_eq!(codex_usage::add(10, 5), 15);
+fn version_info_works() {
+    let version_info = codex_usage::get_version_info();
+    assert!(!version_info.version.is_empty());
+    assert_eq!(version_info.version, codex_usage::VERSION);
 }
