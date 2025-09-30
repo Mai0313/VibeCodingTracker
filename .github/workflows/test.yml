@@ -47,19 +47,18 @@ jobs:
           components: clippy, rustfmt
 
       - name: Build
-        run: cargo build --locked --verbose
-
-      - name: Test
-        run: cargo test --all --locked --verbose
+        run: |
+          make
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
 
-      - name: Coverage (lcov)
+      - name: Coverage
         run: |
-          cargo llvm-cov --workspace --lcov --output-path lcov.info
+          cargo llvm-cov --workspace --lcov --output-path lcov.info --quiet
+          cargo llvm-cov report
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v4.6.2
