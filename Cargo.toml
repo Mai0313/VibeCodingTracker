@@ -38,6 +38,9 @@ log = "0.4"
 # Hostname
 hostname = "0.4"
 
+[dev-dependencies]
+tempfile = "3.15"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

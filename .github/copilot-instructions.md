@@ -278,6 +278,55 @@ Types: `feat`, `fix`, `docs`, `style`, `refactor`, `test`, `chore`
 - Updated documentation if needed
 - Tests added for new features
 
+## Testing
+
+This project includes a comprehensive test suite with 50+ tests covering all core functionality.
+
+### Test Structure
+
+**Unit Tests** (`tests/test_*.rs`):
+- `test_utils_time.rs` - Time parsing and timestamp handling (6 tests)
+- `test_utils_paths.rs` - Path resolution and user/machine ID (4 tests)
+- `test_utils_file.rs` - File I/O, JSONL reading, JSON saving (10 tests)
+- `test_utils_git.rs` - Git remote URL extraction (4 tests)
+- `test_models.rs` - Data model serialization/deserialization (12 tests)
+- `test_analysis_detector.rs` - Extension type detection (6 tests)
+
+**Integration Tests** (`tests/test_integration_*.rs`):
+- `test_integration_analysis.rs` - Complete analysis workflows (7 tests)
+- `test_integration_usage.rs` - Usage statistics calculation (6 tests)
+
+### Running Tests
+
+```bash
+# Run all tests
+cargo test
+
+# Run specific test module
+cargo test test_utils_time
+
+# Run with output显示
+cargo test -- --nocapture
+
+# Verbose mode
+cargo test --verbose
+
+# Run single test
+cargo test test_parse_iso_timestamp
+```
+
+### Test Coverage
+
+- **Total Tests**: 50+
+- **Unit Tests**: 40+
+- **Integration Tests**: 13
+- **Module Coverage**: utils, models, analysis, usage
+- **All Tests Pass**: ✅
+
+### Test Dependencies
+
+- `tempfile` (3.15) - Temporary file handling for tests
+
 ## Cross-Platform Considerations
 
 ### Binary Naming
