@@ -3,7 +3,10 @@
 # CodexUsage — Codex & Claude Code Telemetry Parser
 
 [![rust](https://img.shields.io/badge/Rust-stable-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![license](https://img.shields.io/badge/License-MIT-green.svg?labelColor=gray)](LICENSE)
+[![tests](https://github.com/Mai0313/CodexUsage/actions/workflows/test.yml/badge.svg)](https://github.com/Mai0313/CodexUsage/actions/workflows/test.yml)
+[![code-quality](https://github.com/Mai0313/CodexUsage/actions/workflows/code-quality-check.yml/badge.svg)](https://github.com/Mai0313/CodexUsage/actions/workflows/code-quality-check.yml)
+[![license](https://img.shields.io/badge/License-MIT-green.svg?labelColor=gray)](https://github.com/Mai0313/CodexUsage/tree/master?tab=License-1-ov-file)
+[![PRs](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/Mai0313/CodexUsage/pulls)
 
 </center>
 
