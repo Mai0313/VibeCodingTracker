@@ -15,7 +15,7 @@ This is a production-ready Rust project template designed to bootstrap new Rust 
 
 ### Project Structure
 ```
-rust_template/
+codex_usage/
 ├── src/
 │   ├── lib.rs          # Library code
 │   └── main.rs         # Binary entry point
@@ -50,7 +50,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # Clone and setup project
 git clone <repository-url>
-cd rust_template
+cd codex_usage
 cargo build
 ```
 
@@ -116,7 +116,7 @@ The CI/CD pipeline supports building for multiple target architectures:
 - Unix platforms: `{binary-name}-v{version}-{target}.tar.gz`
 - Windows: `{binary-name}-v{version}-{target}.zip`
 
-Example: `rust_template-v1.0.0-x86_64-unknown-linux-gnu.tar.gz`
+Example: `codex_usage-v1.0.0-x86_64-unknown-linux-gnu.tar.gz`
 
 ## CI/CD Workflows
 

@@ -1,6 +1,6 @@
 fn main() {
     let a = 2;
     let b = 3;
-    let sum = rust_template::add(a, b);
+    let sum = codex_usage::add(a, b);
     println!("{a} + {b} = {sum}");
 }

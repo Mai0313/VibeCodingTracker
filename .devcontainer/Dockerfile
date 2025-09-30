@@ -1,7 +1,7 @@
 FROM mcr.microsoft.com/devcontainers/rust:1-1-bookworm
 
 LABEL maintainer="Wei Lee <mai@mai0313.com>" \
-      org.label-schema.name="rust_template" \
+      org.label-schema.name="codex_usage" \
       org.label-schema.vendor="Wei Lee" \
       org.label-schema.schema-version="1.0" \
       com.centurylinklabs.watchtower.stop-signal="SIGINT"
