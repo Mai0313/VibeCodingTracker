@@ -1,0 +1,116 @@
+name: Code Scanning
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+
+permissions: write-all
+
+jobs:
+  secret-scanning:
+    name: Secret Scanning
+    runs-on: ubuntu-latest
+    # container: catthehacker/ubuntu:act-22.04  # Uncomment it if you use it on Gitea
+
+    steps:
+      - name: Disable SSL Verify
+        run: git config --global http.sslVerify false
+
+      # - name: Setup MTK Certification
+      #   uses: https://gitea.mediatek.inc/actions/mtk-cert-action@v1.2.0
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: GitLeaks Scanning
+        uses: gitleaks/gitleaks-action@v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Trufflehog Scanning
+        uses: trufflesecurity/trufflehog@v3.90.5
+        with:
+          extra_args: --results=verified,unknown
+
+  codeql-scanning:
+    name: CodeQL Scanning
+    runs-on: ubuntu-latest
+    # container: catthehacker/ubuntu:act-22.04  # Uncomment it if you use it on Gitea
+
+    steps:
+      - name: Disable SSL Verify
+        run: git config --global http.sslVerify false
+
+      # - name: Setup MTK Certification
+      #   uses: https://gitea.mediatek.inc/actions/mtk-cert-action@v1.2.0
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: CodeQL Initialize
+        uses: github/codeql-action/init@v3.29.11
+        with:
+          languages: rust
+
+      - name: CodeQL Analyze
+        uses: github/codeql-action/analyze@v3.29.11
+
+  trivy-scanning:
+    name: Trivy Scanning
+    runs-on: ubuntu-latest
+    # container: catthehacker/ubuntu:act-22.04  # Uncomment it if you use it on Gitea
+
+    steps:
+      - name: Disable SSL Verify
+        run: git config --global http.sslVerify false
+
+      # - name: Setup MTK Certification
+      #   uses: https://gitea.mediatek.inc/actions/mtk-cert-action@v1.2.0
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Trivy
+        uses: aquasecurity/setup-trivy@v0.2.3
+
+      - name: Trivy Scanning
+        uses: aquasecurity/trivy-action@0.32.0
+        with:
+          scan-type: fs
+          ignore-unfixed: true
+          format: sarif
+          output: trivy-results.sarif
+          exit-code: 1
+          severity: HIGH,CRITICAL
+          skip-setup-trivy: true
+
+      - name: Trivy Scanning Result
+        uses: aquasecurity/trivy-action@0.32.0
+        with:
+          scan-type: fs
+          ignore-unfixed: true
+          format: table
+          exit-code: 1
+          severity: HIGH,CRITICAL
+          skip-setup-trivy: true
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3.29.11
+        with:
+          # Path to SARIF file relative to the root of the repository
+          sarif_file: trivy-results.sarif

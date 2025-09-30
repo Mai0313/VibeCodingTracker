@@ -1,0 +1,30 @@
+# Build artifacts
+debug
+target
+dist
+tmp
+.cache
+
+# VCS and tooling
+.git
+.github
+.devcontainer
+.vscode
+.idea
+.gitignore
+.gitattributes
+.editorconfig
+
+# Source we don't need in image
+docs
+**/*.md
+tests
+notebooks
+
+# Rust specific
+**/*.rs.bk
+*.pdb
+**/mutants.out*/
+
+# OS files
+*.DS_Store

@@ -1,0 +1,39 @@
+# This workflow finds which files were changed, prints them,
+# and runs `pre-commit` on those files.
+
+# Inspired by the sktime library:
+# https://github.com/alan-turing-institute/sktime/blob/main/.github/workflows/test.yml
+
+name: Code Quality Check
+
+on:
+  pull_request:
+
+permissions: write-all
+
+jobs:
+  code-quality-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Disable SSL Verify
+        run: git config --global http.sslVerify false
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: rustfmt (check)
+        run: |
+          cargo fmt --all -- --check
+
+      - name: clippy (deny warnings)
+        run: |
+          cargo clippy --all-targets --all-features -- -D warnings

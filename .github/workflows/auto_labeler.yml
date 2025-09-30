@@ -1,0 +1,32 @@
+name: Pull Request Labeler
+
+on:
+  push:
+  pull_request:
+
+permissions: write-all
+
+jobs:
+  labeler:
+    runs-on: ubuntu-latest
+    # container: catthehacker/ubuntu:act-20.04  # Uncomment it if you use it on Gitea
+
+    steps:
+      - name: Disable SSL Verify
+        run: git config --global http.sslVerify false
+
+      # - name: Setup MTK Certification
+      #   uses: https://gitea.mediatek.inc/actions/mtk-cert-action@v1.2.0
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Labeler
+        id: labeler
+        uses: actions/labeler@v5
+        with:
+          sync-labels: true
+          configuration-path: .github/labeler.yml

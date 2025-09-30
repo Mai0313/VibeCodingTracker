@@ -1,0 +1,4 @@
+# *.md linguist-detectable=false
+# *.sh linguist-detectable=false
+# Makefile linguist-detectable=false
+# .devcontainer/* linguist-detectable=false

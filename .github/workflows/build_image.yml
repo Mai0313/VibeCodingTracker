@@ -1,0 +1,89 @@
+# This workflow uses actions that are not certified by GitHub.
+# They are provided by a third-party and are governed by
+# separate terms of service, privacy policy, and support
+# documentation.
+
+# GitHub recommends pinning actions to a commit SHA.
+# To get a newer version, you will need to update the SHA.
+# You can also reference a tag or branch, but the action may change without warning.
+
+name: Publish Docker image
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - v*
+
+permissions: write-all
+
+jobs:
+  build_images:
+    name: Build and Push Images
+    runs-on: ubuntu-latest
+    # container: catthehacker/ubuntu:act-22.04  # Uncomment it if you use it on Gitea
+
+    strategy:
+      matrix:
+        target:
+          - name: Build and Push Images (Latest / Release)
+            target_step: prod
+            tag: ghcr.io/${{ github.repository }}
+
+    steps:
+      - name: Disable SSL Verify
+        run: git config --global http.sslVerify false
+
+      # - name: Setup MTK Certification
+      #   uses: https://gitea.mediatek.inc/actions/mtk-cert-action@v1.2.0
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to the Container registry
+        uses: docker/login-action@v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup docker context for buildx
+        run: |
+          docker context create builders || docker context use builders
+
+      - name: Set up Docker BuildX
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ matrix.target.tag }}
+          tags: |
+            latest
+            type=ref,event=tag
+
+      - name: Extract Image Name
+        id: extracted_name
+        run: |
+          IMAGE_NAME=$(echo "${{ steps.meta.outputs.tags }}" | head -n1 | cut -d':' -f1)
+          echo "name=$IMAGE_NAME" >> $GITHUB_OUTPUT
+
+      - name: ${{ matrix.target.name }}
+        uses: docker/build-push-action@v6
+        with:
+          push: true
+          context: .
+          file: ./docker/Dockerfile
+          target: ${{ matrix.target.target_step }}
+          tags: |
+            ${{ steps.meta.outputs.tags }}
+          sbom: false
+          provenance: false
+          cache-from: type=registry,ref=${{ steps.extracted_name.outputs.name }}:buildcache
+          cache-to: type=registry,ref=${{ steps.extracted_name.outputs.name }}:buildcache,image-manifest=true,oci-mediatypes=true,mode=max

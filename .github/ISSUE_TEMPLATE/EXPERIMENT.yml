@@ -1,0 +1,67 @@
+name: 🧪 Experiment Report
+description: Report the results and process of experiments
+title: "[EXP] <title>"
+labels: ["experiment", "research"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## 🧪 Experiment Report
+        Thank you for taking the time to report your experimental findings. Please fill in the following sections to provide details about your experiment and its outcomes.
+
+  - type: textarea
+    id: experiment-description
+    attributes:
+      label: Experiment Description
+      description: Provide a detailed description of the experiment.
+      placeholder: "The purpose of this experiment is to..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: experiment-results
+    attributes:
+      label: Experiment Results
+      description: Describe the results of the experiment.
+      placeholder: "The experiment showed that..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: experiment-conclusions
+    attributes:
+      label: Conclusions
+      description: What conclusions can be drawn from the experiment?
+      placeholder: "Based on the results, we can conclude that..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional-notes
+    attributes:
+      label: Additional Notes
+      description: Any additional notes, observations, or comments.
+      placeholder: "It is also worth noting that..."
+    validations:
+      required: false
+
+  - type: textarea
+    id: reproduction-steps
+    attributes:
+      label: Steps to Reproduce
+      description: Steps to reproduce the experiment (if applicable).
+      placeholder: |
+        1. Set up the environment...
+        2. Execute the following commands...
+        3. Observe the output...
+    validations:
+      required: false
+
+  - type: textarea
+    id: code-snippets
+    attributes:
+      label: Code Snippets or Links
+      description: Include any relevant code snippets or links to code, datasets, or notebooks used in the experiment.
+      placeholder: "The following code snippet was used to..."
+    validations:
+      required: false

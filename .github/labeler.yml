@@ -1,0 +1,143 @@
+# 🏷️ Auto Labeler Configuration
+# 這個檔案會自動為 PR 添加標籤，基於分支名稱和檔案變更路徑
+# 設計來支援 Rust 專案，與 release-drafter.yml 完全對應
+
+# 主要標籤會被 release-drafter.yml 用於：
+# 1. 自動分類到對應的 changelog 區段
+# 2. 決定版本號 (Major/Minor/Patch)
+# 3. 生成 release notes
+
+# ===============================
+# 🎯 Main Labels (對應 release-drafter categories)
+# ===============================
+
+# 💥 Breaking Changes
+breaking:
+  - head-branch:
+      - "^breaking/.*"
+      - "^major/.*"
+      - "^BREAKING/.*"
+
+# ✨ Features
+feature:
+  - head-branch:
+      - "^feat/.*"
+      - "^feature/.*"
+      - "^add/.*"
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/**/*.rs"
+          - "lib/**/*.rs"
+          - "build.rs"
+
+# 🐛 Bug Fixes
+bugfix:
+  - head-branch:
+      - "^fix/.*"
+      - "^bug/.*"
+      - "^bugfix/.*"
+      - "^hotfix/.*"
+
+# 🧰 Maintenance
+chore:
+  - head-branch:
+      - "^chore/.*"
+      - "^maintenance/.*"
+      - "^config/.*"
+      - "^update/.*"
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/**"
+          - "Makefile"
+          - "Dockerfile"
+          - "docker/**"
+          - ".devcontainer/**"
+          - ".editorconfig"
+          - "rust-toolchain*"
+          - "rustfmt.toml"
+          - ".rustfmt.toml"
+          - "clippy.toml"
+          - "Clippy.toml"
+
+# 📦 Dependencies
+dependencies:
+  - head-branch:
+      - "^dep/.*"
+      - "^deps/.*"
+      - "^dependencies/.*"
+      - "^dependabot/.*"
+  - changed-files:
+      - any-glob-to-any-file:
+          - "Cargo.toml"
+          - "Cargo.lock"
+
+# 📝 Documentation
+documentation:
+  - head-branch:
+      - "^docs/.*"
+      - "^doc/.*"
+      - "^documentation/.*"
+  - changed-files:
+      - any-glob-to-any-file:
+          - "docs/**/*"
+          - "**/*.md"
+          - "**/*.rst"
+          - "**/*.ipynb"
+          - "notebooks/**/*"
+          - "notebook/**/*"
+          - "mkdocs.yml"
+          - "README*"
+          - "CHANGELOG*"
+
+# 🧪 Tests
+unit-test:
+  - head-branch:
+      - "^test/.*"
+      - "^tests/.*"
+  - changed-files:
+      - any-glob-to-any-file:
+          - "tests/**/*.rs"
+          - "examples/**/*.rs"
+
+# ⚡️ Performance Improvements
+perf:
+  - head-branch:
+      - "^perf/.*"
+      - "^performance/.*"
+      - "^optimize/.*"
+  - changed-files:
+      - any-glob-to-any-file:
+          - "benches/**/*.rs"
+
+# 🔒️ Security Fixes
+security:
+  - head-branch:
+      - "^security/.*"
+      - "^sec/.*"
+
+# ♻️ Code Refactoring
+refactor:
+  - head-branch:
+      - "^refactor/.*"
+      - "^cleanup/.*"
+      - "^restructure/.*"
+
+# 🎨 Code Style & Formatting
+style:
+  - head-branch:
+      - "^style/.*"
+      - "^format/.*"
+      - "^lint/.*"
+  - changed-files:
+      - any-glob-to-any-file:
+          - "rustfmt.toml"
+          - ".rustfmt.toml"
+          - "clippy.toml"
+          - "Clippy.toml"
+          - ".editorconfig"
+
+# 🔙 Reverts
+revert:
+  - head-branch:
+      - "^revert/.*"
+      - "^rollback/.*"

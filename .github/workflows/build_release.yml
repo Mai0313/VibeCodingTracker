@@ -1,0 +1,151 @@
+# Release workflow for codex-rs.
+# To release, follow a workflow like:
+# ```
+# git tag -a rust-v0.1.0 -m "Release 0.1.0"
+# git push origin rust-v0.1.0
+# ```
+
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - v*
+  workflow_dispatch:
+
+permissions: write-all
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.runner }} - ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            friendly_id: macos-arm64
+          - runner: macos-14
+            target: x86_64-apple-darwin
+            friendly_id: macos-x64
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            friendly_id: linux-x64-gnu
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            friendly_id: linux-x64-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            friendly_id: linux-arm64-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            friendly_id: linux-arm64-musl
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            friendly_id: windows-x64
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            friendly_id: windows-arm64
+
+    steps:
+      - name: Disable SSL Verify
+        run: git config --global http.sslVerify false
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Build Tools
+        if: ${{ contains(matrix.target, 'musl') && startsWith(matrix.runner, 'ubuntu') }}
+        run: |
+          sudo apt install -y musl-tools pkg-config
+
+      - name: Cargo build (release)
+        run: |
+          cargo build --target ${{ matrix.target }} --release --locked --bin ${{ github.event.repository.name }}
+
+      - name: Stage Artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          dest="dist/${{ matrix.target }}"
+          mkdir -p "$dest"
+          bin_dir="target/${{ matrix.target }}/release"
+          bin="${{ github.event.repository.name }}"
+          if [[ "${{ matrix.runner }}" == windows* ]]; then
+            bin="${bin}.exe"
+          fi
+          # Copy only the binary to avoid uploading sidecar files like *.d
+          cp "${bin_dir}/${bin}" "${dest}/${bin}"
+
+      - name: Create .zip (Windows)
+        shell: powershell
+        if: ${{ startsWith(matrix.runner, 'windows') }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dest = "dist/${{ matrix.target }}"
+          $version = "${env:GITHUB_REF_NAME}".Substring(1)
+          $bin = "${{ github.event.repository.name }}.exe"
+          $zip = "${{ github.event.repository.name }}-v$version-${{ matrix.friendly_id }}.zip"
+          Compress-Archive -Path "$dest\$bin" -DestinationPath "$dest\$zip" -Force
+
+      - name: Create .tar.gz (all platforms)
+        shell: bash
+        if: ${{ !startsWith(matrix.runner, 'windows') }}
+        run: |
+          set -euo pipefail
+          dest="dist/${{ matrix.target }}"
+          version="${GITHUB_REF_NAME#v}"
+          bin="${{ github.event.repository.name }}"
+          archive="${{ github.event.repository.name }}-v${version}-${{ matrix.friendly_id }}.tar.gz"
+          # Try to include .exe if present, otherwise fall back to unix name
+          tar -C "$dest" -czf "$dest/${archive}" "${bin}" "${bin}.exe" 2>/dev/null || \
+          tar -C "$dest" -czf "$dest/${archive}" "${bin}"
+          # Remove raw binaries after archiving to avoid accidental upload
+          rm -f "$dest/${bin}" "$dest/${bin}.exe" || true
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: ${{ matrix.friendly_id }}
+          path: dist/${{ matrix.target }}/*
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6
+          overwrite: true
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List packaged files
+        run: ls -R dist/ | cat
+
+      - name: Upload Release Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/**/*
