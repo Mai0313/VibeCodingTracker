@@ -41,9 +41,6 @@ fn main() -> Result<()> {
             let version_info = get_version_info();
             println!("{} v{}", PKG_NAME, version_info.version);
             println!("{}", PKG_DESCRIPTION);
-            println!();
-            println!("Build Time: {}", version_info.build_time);
-            println!("Git Commit: {}", version_info.git_commit);
         }
     }
 

@@ -19,8 +19,6 @@ pub const PKG_DESCRIPTION: &str = env!("CARGO_PKG_DESCRIPTION");
 pub fn get_version_info() -> VersionInfo {
     VersionInfo {
         version: VERSION.to_string(),
-        build_time: option_env!("BUILD_TIME").unwrap_or("unknown").to_string(),
-        git_commit: option_env!("GIT_COMMIT").unwrap_or("unknown").to_string(),
     }
 }
 
@@ -28,6 +26,4 @@ pub fn get_version_info() -> VersionInfo {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VersionInfo {
     pub version: String,
-    pub build_time: String,
-    pub git_commit: String,
 }
