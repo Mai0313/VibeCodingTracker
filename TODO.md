@@ -10,7 +10,7 @@
 
 # TODO: Codex Usage
 
-請透過 Crossterm 和 Ratatui 幫我完成以下功能
+請參考 `./parser_example.go` 並透過 Crossterm 和 Ratatui 幫我完成以下功能
 
 ## 分析某個 conversation (此功能已完成)
 
