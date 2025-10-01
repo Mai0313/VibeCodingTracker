@@ -8,11 +8,19 @@ TUI的部分可以使用 https://github.com/vadimdemedes/ink 來完成
 
 ```bash
 ./target/debug/codex_usage analysis --path examples/test_conversation.jsonl
-./target/debug/codex_usage analysis --path examples/test_conversation.jsonl --output examples/claude_code_log.json
+./target/debug/codex_usage analysis --path examples/test_conversation.jsonl --output examples/analysis_claude_code.json
 ./target/debug/codex_usage analysis --path examples/test_conversation_oai.jsonl
-./target/debug/codex_usage analysis --path examples/test_conversation_oai.jsonl --output examples/claude_code_log_oai.json
+./target/debug/codex_usage analysis --path examples/test_conversation_oai.jsonl --output examples/analysis_codex.json
+./target/debug/codex_usage analysis --path examples/test_conversation_gemini.jsonl
+./target/debug/codex_usage analysis --path examples/test_conversation_gemini.jsonl --output examples/analysis_gemini.json
+./target/debug/codex_usage version
+./target/debug/codex_usage version --json
+./target/debug/codex_usage version --text
+./target/debug/codex_usage update
 ./target/debug/codex_usage usage
 ./target/debug/codex_usage usage --json
+./target/debug/codex_usage check
+./target/debug/codex_usage help
 ```
 
 ## 這裡是關於兩個套件的使用想法 請參考這個想法 幫我設計 TUI
