@@ -1,17 +1,3 @@
-# TODO: Translate from Golang to Rust
-
-請參考以下檔案 並幫我原封不動整理到 `./parser_example.go`, 他必須是可以讀立運行
-- `core/telemetry/input.go`
-- `core/telemetry/parser.go`
-- `core/telemetry/usage.go`
-
-但請無視發送 analysis 資訊到 API 的部分
-所有 commands / subcommands 請完整保留, 你可以參考 `./cmd/coding-cli-helper/main.go`
-
-# TODO: Codex Usage
-
-請參考 `./parser_example.go` 並透過 Crossterm 和 Ratatui 幫我完成以下功能
-
 ## 分析某個 conversation (此功能已完成)
 
 ```bash
