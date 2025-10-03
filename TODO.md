@@ -1,11 +1,24 @@
-## 分析某個 conversation (此功能已完成)
+## 新增額外分析功能
 
+目前這些功能已完成並且可以順利運作
 ```bash
 ./target/debug/vibe_coding_tracker analysis --path examples/test_conversation.jsonl
 ./target/debug/vibe_coding_tracker analysis --path examples/test_conversation.jsonl --output examples/analysis_claude_code.json
 ./target/debug/vibe_coding_tracker analysis --path examples/test_conversation_oai.jsonl
 ./target/debug/vibe_coding_tracker analysis --path examples/test_conversation_oai.jsonl --output examples/analysis_codex.json
 ```
+
+我希望新增一個新功能是 `./target/debug/vibe_coding_tracker analysis`
+這個功能會將 `~/.codex/sessions` 和 `~/.claude/projects` 裡面的所有 `jsonl` 全部進行分析
+最後組成一個 list dict 的 json文件
+
+我可以透過指定 `--output` 去輸出到某一份 `json` 中
+
+但是當我沒指定 `--output` 的時候, 就需要透過 `ratatui` 製作一個 interative table
+但是上面我想顯示的是
+`Date`, `Model`, `Edit Lines`, `Read Lines`, `Write Lines`, `Bash`, `Edit`, `Read`, `TodoWrite`, `Write`
+這些資訊在 parse 完畢以後都會出現, 只是需要分模型與日期進行加總
+完成後請更新文檔
 
 ## 查看版本資訊
 ```bash
