@@ -13,10 +13,6 @@ repository = "https://github.com/Mai0313/VibeCodingTracker"
 name = "vibe_coding_tracker"
 path = "src/main.rs"
 
-[[bin]]
-name = "vct"
-path = "src/main.rs"
-
 [dependencies]
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }
