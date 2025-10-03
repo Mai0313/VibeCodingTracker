@@ -94,3 +94,5 @@
 而不是單純顯示 token 使用量
 
 我希望欄位有 `Date`, `Model`, `Input`, `Output`, `Cache Read`, `Cache Creation`, `Total Tokens` 和 `Cost (USD)`
+
+這個功能 `--json` 模式下也要支援, 並且 usage 請幫我新增一個 `--text` 功能
