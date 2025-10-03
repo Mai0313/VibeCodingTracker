@@ -114,3 +114,9 @@ repo 連結未來會改為 `https://github.com/Mai0313/VibeCodingTracker`
 專案縮寫是 `vct` 方便調用或紀錄
 
 這個任務已經由其他助理完成 請幫我檢查是否有遺漏
+
+## 發布到 `npm`
+
+請參考這份文件 `https://github.com/openai/codex/raw/refs/heads/main/.github/workflows/rust-release.yml` 幫我設計一個發佈到 `npm` 的 action
+
+我希望大家可以透過 `npm install -g ...` 來下載我的套件並使用
