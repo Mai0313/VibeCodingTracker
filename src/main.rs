@@ -1,7 +1,7 @@
 use anyhow::Result;
 use codex_usage::cli::{Cli, Commands};
 use codex_usage::pricing::{calculate_cost, fetch_model_pricing, get_model_pricing};
-use codex_usage::usage::{display_usage_table, display_usage_text, get_usage_from_directories};
+use codex_usage::usage::{display_usage_interactive, display_usage_table, display_usage_text, get_usage_from_directories};
 use codex_usage::{analyze_jsonl_file, get_version_info};
 use comfy_table::{presets::UTF8_FULL, Cell, CellAlignment, Color, ContentArrangement, Table};
 use owo_colors::OwoColorize;
@@ -29,10 +29,9 @@ fn main() -> Result<()> {
             }
         }
 
-        Commands::Usage { json, text } => {
-            let usage_data = get_usage_from_directories()?;
-
+        Commands::Usage { json, text, table } => {
             if json {
+                let usage_data = get_usage_from_directories()?;
                 // Fetch pricing data for JSON output with costs
                 let pricing_map = fetch_model_pricing().unwrap_or_default();
 
@@ -134,11 +133,14 @@ fn main() -> Result<()> {
                 let json_str = serde_json::to_string_pretty(&enriched_data)?;
                 println!("{}", json_str);
             } else if text {
-                // Display plain text
+                let usage_data = get_usage_from_directories()?;
                 display_usage_text(&usage_data);
-            } else {
-                // Display table
+            } else if table {
+                let usage_data = get_usage_from_directories()?;
                 display_usage_table(&usage_data);
+            } else {
+                // Default: Display interactive table
+                display_usage_interactive()?;
             }
         }
 

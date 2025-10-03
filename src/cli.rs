@@ -32,6 +32,10 @@ pub enum Commands {
         /// Output as plain text
         #[arg(long)]
         text: bool,
+
+        /// Output as static table
+        #[arg(long)]
+        table: bool,
     },
 
     /// Display version information

@@ -2,8 +2,163 @@ use crate::models::DateUsageResult;
 use crate::pricing::{calculate_cost, fetch_model_pricing, get_model_pricing, ModelPricing};
 use comfy_table::{presets::UTF8_FULL, Cell, CellAlignment, Color, Table};
 use owo_colors::OwoColorize;
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::Constraint,
+    style::{Modifier, Style},
+    widgets::{Block, Borders, Row as RatatuiRow, Table as RatatuiTable},
+    Terminal,
+};
+use crossterm::{
+    event::{self, Event, KeyCode},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::io;
+use std::time::{Duration, Instant};
+
+/// Display usage data as an interactive table that refreshes every 5 seconds
+pub fn display_usage_interactive() -> anyhow::Result<()> {
+    // Setup terminal
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let mut last_refresh = Instant::now();
+    let refresh_interval = Duration::from_secs(5);
+
+    loop {
+        // Get usage data
+        let usage_data = match crate::usage::get_usage_from_directories() {
+            Ok(data) => data,
+            Err(_) => HashMap::new(),
+        };
+
+        // Fetch pricing data
+        let pricing_map = fetch_model_pricing().unwrap_or_default();
+
+        // Collect and sort dates
+        let mut dates: Vec<String> = usage_data.keys().cloned().collect();
+        dates.sort();
+
+        // Collect rows
+        let mut rows_data = Vec::new();
+        let mut totals = UsageRow::default();
+
+        for date in &dates {
+            if let Some(date_usage) = usage_data.get(date) {
+                let mut models: Vec<String> = date_usage.keys().cloned().collect();
+                models.sort();
+
+                for model in models {
+                    if let Some(usage) = date_usage.get(&model) {
+                        let row = extract_usage_row(date, &model, usage, &pricing_map);
+                        totals.input_tokens += row.input_tokens;
+                        totals.output_tokens += row.output_tokens;
+                        totals.cache_read += row.cache_read;
+                        totals.cache_creation += row.cache_creation;
+                        totals.total += row.total;
+                        totals.cost += row.cost;
+                        rows_data.push(row);
+                    }
+                }
+            }
+        }
+
+        // Render
+        terminal.draw(|f| {
+            let area = f.area();
+
+            let header = vec![
+                "Date",
+                "Model",
+                "Input",
+                "Output",
+                "Cache Read",
+                "Cache Creation",
+                "Total Tokens",
+                "Cost (USD)",
+            ];
+
+            let mut rows: Vec<RatatuiRow> = rows_data
+                .iter()
+                .map(|row| {
+                    RatatuiRow::new(vec![
+                        row.date.clone(),
+                        row.display_model.clone(),
+                        format_number(row.input_tokens),
+                        format_number(row.output_tokens),
+                        format_number(row.cache_read),
+                        format_number(row.cache_creation),
+                        format_number(row.total),
+                        format!("${:.2}", row.cost),
+                    ])
+                })
+                .collect();
+
+            // Add totals row
+            rows.push(RatatuiRow::new(vec![
+                "".to_string(),
+                "TOTAL".to_string(),
+                format_number(totals.input_tokens),
+                format_number(totals.output_tokens),
+                format_number(totals.cache_read),
+                format_number(totals.cache_creation),
+                format_number(totals.total),
+                format!("${:.2}", totals.cost),
+            ]).style(Style::default().add_modifier(Modifier::BOLD)));
+
+            let widths = [
+                Constraint::Length(12),
+                Constraint::Min(20),
+                Constraint::Length(12),
+                Constraint::Length(12),
+                Constraint::Length(12),
+                Constraint::Length(16),
+                Constraint::Length(14),
+                Constraint::Length(12),
+            ];
+
+            let table = RatatuiTable::new(rows, widths)
+                .header(
+                    RatatuiRow::new(header)
+                        .style(Style::default().add_modifier(Modifier::BOLD))
+                )
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("📊 Token Usage Statistics (Press 'q' to quit, refreshes every 5s)")
+                );
+
+            f.render_widget(table, area);
+        })?;
+
+        // Handle input with timeout
+        if event::poll(Duration::from_millis(100))? {
+            if let Event::Key(key) = event::read()? {
+                if key.code == KeyCode::Char('q') || key.code == KeyCode::Esc {
+                    break;
+                }
+            }
+        }
+
+        // Check if we need to refresh
+        if last_refresh.elapsed() >= refresh_interval {
+            last_refresh = Instant::now();
+        }
+    }
+
+    // Restore terminal
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    Ok(())
+}
 
 /// Display usage data as a table
 pub fn display_usage_table(usage_data: &DateUsageResult) {
@@ -110,7 +265,7 @@ pub fn display_usage_table(usage_data: &DateUsageResult) {
             Cell::new(format_number(row.total))
                 .fg(Color::Magenta)
                 .set_alignment(CellAlignment::Right),
-            Cell::new(format!("${:.6}", row.cost))
+            Cell::new(format!("${:.2}", row.cost))
                 .fg(Color::Cyan)
                 .set_alignment(CellAlignment::Right),
         ]);
@@ -139,7 +294,7 @@ pub fn display_usage_table(usage_data: &DateUsageResult) {
         Cell::new(format_number(totals.total))
             .fg(Color::Red)
             .set_alignment(CellAlignment::Right),
-        Cell::new(format!("${:.6}", totals.cost))
+        Cell::new(format!("${:.2}", totals.cost))
             .fg(Color::Red)
             .set_alignment(CellAlignment::Right),
     ]);
@@ -259,9 +414,6 @@ pub fn display_usage_text(usage_data: &DateUsageResult) {
     let mut dates: Vec<&String> = usage_data.keys().collect();
     dates.sort();
 
-    // Collect rows
-    let mut totals = UsageRow::default();
-
     for date in &dates {
         if let Some(date_usage) = usage_data.get(*date) {
             // Sort models
@@ -271,41 +423,11 @@ pub fn display_usage_text(usage_data: &DateUsageResult) {
             for model in models {
                 if let Some(usage) = date_usage.get(model) {
                     let row = extract_usage_row(date, model, usage, &pricing_map);
-
-                    println!(
-                        "Date: {} | Model: {} | Input: {} | Output: {} | Cache Read: {} | Cache Creation: {} | Total: {} | Cost: ${:.6}",
-                        row.date,
-                        row.display_model,
-                        row.input_tokens,
-                        row.output_tokens,
-                        row.cache_read,
-                        row.cache_creation,
-                        row.total,
-                        row.cost
-                    );
-
-                    // Accumulate totals
-                    totals.input_tokens += row.input_tokens;
-                    totals.output_tokens += row.output_tokens;
-                    totals.cache_read += row.cache_read;
-                    totals.cache_creation += row.cache_creation;
-                    totals.total += row.total;
-                    totals.cost += row.cost;
+                    println!("{} > {}: ${:.6}", row.date, row.display_model, row.cost);
                 }
             }
         }
     }
-
-    // Print totals
-    println!(
-        "TOTAL | Input: {} | Output: {} | Cache Read: {} | Cache Creation: {} | Total: {} | Cost: ${:.6}",
-        totals.input_tokens,
-        totals.output_tokens,
-        totals.cache_read,
-        totals.cache_creation,
-        totals.total,
-        totals.cost
-    );
 }
 
 fn format_number(n: i64) -> String {
