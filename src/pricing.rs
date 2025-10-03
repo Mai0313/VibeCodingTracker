@@ -265,8 +265,8 @@ fn normalize_model_name(name: &str) -> String {
 
     // Remove common date patterns (e.g., "-20231201", "-20240320")
     if let Some(idx) = normalized.rfind("-20") {
-        if normalized[idx + 1..].len() == 9 {
-            // "-20YYMMDD" pattern
+        if normalized[idx + 1..].len() == 8 {
+            // "-20YYMMDD" pattern (8 digits: 20YYMMDD)
             normalized = normalized[..idx].to_string();
         }
     }
