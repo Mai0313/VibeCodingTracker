@@ -23,8 +23,8 @@
     "analytics"
   ],
   "bin": {
-    "vct": "./bin/vct.js",
-    "vibe-coding-tracker": "./bin/vct.js"
+    "vct": "bin/vct.js",
+    "vibe-coding-tracker": "bin/vct.js"
   },
   "scripts": {
     "postinstall": "node install.js"
