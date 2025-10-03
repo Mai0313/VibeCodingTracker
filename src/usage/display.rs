@@ -1,7 +1,9 @@
 use crate::models::DateUsageResult;
+use crate::pricing::{calculate_cost, fetch_model_pricing, get_model_pricing, ModelPricing};
 use comfy_table::{presets::UTF8_FULL, Cell, CellAlignment, Color, Table};
 use owo_colors::OwoColorize;
 use serde_json::Value;
+use std::collections::HashMap;
 
 /// Display usage data as a table
 pub fn display_usage_table(usage_data: &DateUsageResult) {
@@ -12,6 +14,16 @@ pub fn display_usage_table(usage_data: &DateUsageResult) {
 
     println!("{}", "📊 Token Usage Statistics".bright_cyan().bold());
     println!();
+
+    // Fetch pricing data
+    let pricing_map = match fetch_model_pricing() {
+        Ok(map) => map,
+        Err(e) => {
+            eprintln!("⚠️  Warning: Failed to fetch pricing data: {}", e);
+            eprintln!("   Costs will be shown as $0.00");
+            HashMap::new()
+        }
+    };
 
     // Collect and sort dates
     let mut dates: Vec<&String> = usage_data.keys().collect();
@@ -29,7 +41,7 @@ pub fn display_usage_table(usage_data: &DateUsageResult) {
 
             for model in models {
                 if let Some(usage) = date_usage.get(model) {
-                    let row = extract_usage_row(date, model, usage);
+                    let row = extract_usage_row(date, model, usage, &pricing_map);
 
                     // Accumulate totals
                     totals.input_tokens += row.input_tokens;
@@ -37,6 +49,7 @@ pub fn display_usage_table(usage_data: &DateUsageResult) {
                     totals.cache_read += row.cache_read;
                     totals.cache_creation += row.cache_creation;
                     totals.total += row.total;
+                    totals.cost += row.cost;
 
                     rows.push(row);
                 }
@@ -53,10 +66,10 @@ pub fn display_usage_table(usage_data: &DateUsageResult) {
         Cell::new("Model")
             .fg(Color::Yellow)
             .set_alignment(CellAlignment::Left),
-        Cell::new("Input Tokens")
+        Cell::new("Input")
             .fg(Color::Yellow)
             .set_alignment(CellAlignment::Right),
-        Cell::new("Output Tokens")
+        Cell::new("Output")
             .fg(Color::Yellow)
             .set_alignment(CellAlignment::Right),
         Cell::new("Cache Read")
@@ -65,7 +78,10 @@ pub fn display_usage_table(usage_data: &DateUsageResult) {
         Cell::new("Cache Creation")
             .fg(Color::Yellow)
             .set_alignment(CellAlignment::Right),
-        Cell::new("Total")
+        Cell::new("Total Tokens")
+            .fg(Color::Yellow)
+            .set_alignment(CellAlignment::Right),
+        Cell::new("Cost (USD)")
             .fg(Color::Yellow)
             .set_alignment(CellAlignment::Right),
     ]);
@@ -76,7 +92,7 @@ pub fn display_usage_table(usage_data: &DateUsageResult) {
             Cell::new(&row.date)
                 .fg(Color::Cyan)
                 .set_alignment(CellAlignment::Left),
-            Cell::new(&row.model)
+            Cell::new(&row.display_model)
                 .fg(Color::Green)
                 .set_alignment(CellAlignment::Left),
             Cell::new(format_number(row.input_tokens))
@@ -93,6 +109,9 @@ pub fn display_usage_table(usage_data: &DateUsageResult) {
                 .set_alignment(CellAlignment::Right),
             Cell::new(format_number(row.total))
                 .fg(Color::Magenta)
+                .set_alignment(CellAlignment::Right),
+            Cell::new(format!("${:.6}", row.cost))
+                .fg(Color::Cyan)
                 .set_alignment(CellAlignment::Right),
         ]);
     }
@@ -120,6 +139,9 @@ pub fn display_usage_table(usage_data: &DateUsageResult) {
         Cell::new(format_number(totals.total))
             .fg(Color::Red)
             .set_alignment(CellAlignment::Right),
+        Cell::new(format!("${:.6}", totals.cost))
+            .fg(Color::Red)
+            .set_alignment(CellAlignment::Right),
     ]);
 
     println!("{table}");
@@ -129,18 +151,23 @@ pub fn display_usage_table(usage_data: &DateUsageResult) {
 #[derive(Default)]
 struct UsageRow {
     date: String,
-    model: String,
+    display_model: String, // Model name with matched model in parentheses if fuzzy matched
     input_tokens: i64,
     output_tokens: i64,
     cache_read: i64,
     cache_creation: i64,
     total: i64,
+    cost: f64,
 }
 
-fn extract_usage_row(date: &str, model: &str, usage: &Value) -> UsageRow {
+fn extract_usage_row(
+    date: &str,
+    model: &str,
+    usage: &Value,
+    pricing_map: &HashMap<String, ModelPricing>,
+) -> UsageRow {
     let mut row = UsageRow {
         date: date.to_string(),
-        model: model.to_string(),
         ..Default::default()
     };
 
@@ -195,7 +222,90 @@ fn extract_usage_row(date: &str, model: &str, usage: &Value) -> UsageRow {
         }
     }
 
+    // Calculate cost with fuzzy matching
+    let pricing_result = get_model_pricing(model, pricing_map);
+    row.cost = calculate_cost(
+        row.input_tokens,
+        row.output_tokens,
+        row.cache_read,
+        row.cache_creation,
+        &pricing_result.pricing,
+    );
+
+    // Set display model name with matched model in parentheses if fuzzy matched
+    row.display_model = if let Some(matched) = &pricing_result.matched_model {
+        format!("{} ({})", model, matched)
+    } else {
+        model.to_string()
+    };
+
     row
+}
+
+/// Display usage data as plain text
+pub fn display_usage_text(usage_data: &DateUsageResult) {
+    if usage_data.is_empty() {
+        println!("No usage data found");
+        return;
+    }
+
+    // Fetch pricing data
+    let pricing_map = match fetch_model_pricing() {
+        Ok(map) => map,
+        Err(_) => HashMap::new(),
+    };
+
+    // Collect and sort dates
+    let mut dates: Vec<&String> = usage_data.keys().collect();
+    dates.sort();
+
+    // Collect rows
+    let mut totals = UsageRow::default();
+
+    for date in &dates {
+        if let Some(date_usage) = usage_data.get(*date) {
+            // Sort models
+            let mut models: Vec<&String> = date_usage.keys().collect();
+            models.sort();
+
+            for model in models {
+                if let Some(usage) = date_usage.get(model) {
+                    let row = extract_usage_row(date, model, usage, &pricing_map);
+
+                    println!(
+                        "Date: {} | Model: {} | Input: {} | Output: {} | Cache Read: {} | Cache Creation: {} | Total: {} | Cost: ${:.6}",
+                        row.date,
+                        row.display_model,
+                        row.input_tokens,
+                        row.output_tokens,
+                        row.cache_read,
+                        row.cache_creation,
+                        row.total,
+                        row.cost
+                    );
+
+                    // Accumulate totals
+                    totals.input_tokens += row.input_tokens;
+                    totals.output_tokens += row.output_tokens;
+                    totals.cache_read += row.cache_read;
+                    totals.cache_creation += row.cache_creation;
+                    totals.total += row.total;
+                    totals.cost += row.cost;
+                }
+            }
+        }
+    }
+
+    // Print totals
+    println!(
+        "TOTAL | Input: {} | Output: {} | Cache Read: {} | Cache Creation: {} | Total: {} | Cost: ${:.6}",
+        totals.input_tokens,
+        totals.output_tokens,
+        totals.cache_read,
+        totals.cache_creation,
+        totals.total,
+        totals.cost
+    );
 }
 
 fn format_number(n: i64) -> String {

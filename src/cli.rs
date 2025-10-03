@@ -28,6 +28,10 @@ pub enum Commands {
         /// Output raw JSON instead of table view
         #[arg(long)]
         json: bool,
+
+        /// Output as plain text
+        #[arg(long)]
+        text: bool,
     },
 
     /// Display version information

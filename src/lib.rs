@@ -2,6 +2,7 @@
 pub mod analysis;
 pub mod cli;
 pub mod models;
+pub mod pricing;
 pub mod usage;
 pub mod utils;
 
