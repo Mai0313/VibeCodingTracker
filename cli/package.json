@@ -1,0 +1,53 @@
+{
+  "name": "vibe-coding-tracker",
+  "version": "0.1.0",
+  "description": "Vibe Coding Tracker - AI coding assistant telemetry/usage parser, aggregate JSONL events into CodeAnalysis results",
+  "author": "Wei Lee <mai@mai0313.com>",
+  "license": "MIT",
+  "homepage": "https://github.com/Mai0313/VibeCodingTracker",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Mai0313/VibeCodingTracker.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Mai0313/VibeCodingTracker/issues"
+  },
+  "keywords": [
+    "cli",
+    "ai",
+    "coding-assistant",
+    "telemetry",
+    "claude",
+    "codex",
+    "usage-tracker",
+    "analytics"
+  ],
+  "bin": {
+    "vct": "./bin/vct.js",
+    "vibe-coding-tracker": "./bin/vct.js"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "files": [
+    "bin/",
+    "install.js",
+    "README.md"
+  ],
+  "dependencies": {
+    "adm-zip": "^0.5.10",
+    "tar": "^7.4.3"
+  }
+}
