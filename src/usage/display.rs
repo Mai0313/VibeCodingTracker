@@ -11,7 +11,7 @@ use ratatui::{
     Terminal,
 };
 use crossterm::{
-    event::{self, Event, KeyCode},
+    event::{self, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -205,8 +205,10 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
                 Line::from(vec![
                     Span::styled("Press ", Style::default().fg(RatatuiColor::DarkGray)),
                     Span::styled("'q'", Style::default().fg(RatatuiColor::Red).bold()),
-                    Span::styled(" or ", Style::default().fg(RatatuiColor::DarkGray)),
+                    Span::styled(", ", Style::default().fg(RatatuiColor::DarkGray)),
                     Span::styled("'Esc'", Style::default().fg(RatatuiColor::Red).bold()),
+                    Span::styled(", or ", Style::default().fg(RatatuiColor::DarkGray)),
+                    Span::styled("'Ctrl+C'", Style::default().fg(RatatuiColor::Red).bold()),
                     Span::styled(" to quit  |  ", Style::default().fg(RatatuiColor::DarkGray)),
                     Span::styled("⏱️  Next refresh in: ", Style::default().fg(RatatuiColor::Gray)),
                     Span::styled(format!("{}s", next_refresh), Style::default().fg(RatatuiColor::Cyan).bold()),
@@ -219,7 +221,10 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
         // Handle input with timeout
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
-                if key.code == KeyCode::Char('q') || key.code == KeyCode::Esc {
+                if key.code == KeyCode::Char('q')
+                    || key.code == KeyCode::Esc
+                    || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+                {
                     break;
                 }
             }
