@@ -92,3 +92,5 @@
 ```
 我希望計算usage 的時候 可以先從這裡取得價格, 最後做計算
 而不是單純顯示 token 使用量
+
+我希望欄位有 `Date`, `Model`, `Input`, `Output`, `Cache Read`, `Cache Creation`, `Total Tokens` 和 `Cost (USD)`
