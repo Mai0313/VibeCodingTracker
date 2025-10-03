@@ -38,6 +38,10 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
     let mut sys = System::new_all();
     let pid = sysinfo::get_current_pid().unwrap();
 
+    // Track last update time for each row (date + model as key)
+    let mut last_update_times: HashMap<String, Instant> = HashMap::new();
+    let mut previous_data: HashMap<String, (i64, i64, i64, i64)> = HashMap::new();
+
     loop {
         // Update system information
         sys.refresh_processes(sysinfo::ProcessesToUpdate::All, false);
@@ -66,6 +70,22 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
                 for model in models {
                     if let Some(usage) = date_usage.get(&model) {
                         let row = extract_usage_row(date, &model, usage, &pricing_map);
+
+                        // Check if data has changed
+                        let row_key = format!("{}:{}", date, model);
+                        let current_data = (row.input_tokens, row.output_tokens, row.cache_read, row.cache_creation);
+
+                        if let Some(prev_data) = previous_data.get(&row_key) {
+                            if prev_data != &current_data {
+                                // Data changed, update timestamp
+                                last_update_times.insert(row_key.clone(), Instant::now());
+                            }
+                        } else {
+                            // New row, mark as updated
+                            last_update_times.insert(row_key.clone(), Instant::now());
+                        }
+                        previous_data.insert(row_key, current_data);
+
                         totals.input_tokens += row.input_tokens;
                         totals.output_tokens += row.output_tokens;
                         totals.cache_read += row.cache_read;
@@ -118,11 +138,24 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
             ];
 
             let today = Local::now().format("%Y-%m-%d").to_string();
+            let now = Instant::now();
+            let highlight_duration = Duration::from_millis(1000);
 
             let mut rows: Vec<RatatuiRow> = rows_data
                 .iter()
                 .map(|row| {
-                    let style = if row.date == today {
+                    let row_key = format!("{}:{}", row.date, row.model);
+
+                    // Check if this row was recently updated
+                    let is_recently_updated = last_update_times
+                        .get(&row_key)
+                        .map(|update_time| now.duration_since(*update_time) < highlight_duration)
+                        .unwrap_or(false);
+
+                    let style = if is_recently_updated {
+                        // Highlight recently updated rows with a brighter background
+                        Style::default().bg(RatatuiColor::Rgb(60, 80, 60)).bold()
+                    } else if row.date == today {
                         Style::default().bg(RatatuiColor::Rgb(32, 32, 32))
                     } else {
                         Style::default()
@@ -401,6 +434,7 @@ pub fn display_usage_table(usage_data: &DateUsageResult) {
 #[derive(Default)]
 struct UsageRow {
     date: String,
+    model: String, // Original model name
     display_model: String, // Model name with matched model in parentheses if fuzzy matched
     input_tokens: i64,
     output_tokens: i64,
@@ -418,6 +452,7 @@ fn extract_usage_row(
 ) -> UsageRow {
     let mut row = UsageRow {
         date: date.to_string(),
+        model: model.to_string(),
         ..Default::default()
     };
 

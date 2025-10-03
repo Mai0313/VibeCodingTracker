@@ -18,7 +18,7 @@ fmt: ## Format code with rustfmt and Lint with clippy
 build: ## Build release binary
 	cargo build
 
-build-release: ## Build release binary
+release: ## Build release binary
 	cargo build --release --locked
 
 package: ## Build crate package (.crate)

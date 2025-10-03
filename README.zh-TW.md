@@ -42,7 +42,7 @@
 make fmt            # 格式化 + clippy
 make test           # 測試（詳細輸出）
 make build          # 建置
-make build-release  # 發布建置（release）
+make release        # 發布建置（release）
 make package        # 產生 .crate 套件
 ```
 

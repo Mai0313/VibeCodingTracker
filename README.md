@@ -42,7 +42,7 @@ Prerequisites: Rust toolchain (rustup), Docker optional
 make fmt            # rustfmt + clippy
 make test           # cargo test (verbose)
 make build          # cargo build
-make build-release  # cargo build --release
+make release        # cargo build --release
 make package        # build .crate package
 ```
 

@@ -42,7 +42,7 @@
 make fmt            # 格式化 + clippy
 make test           # 测试（详细输出）
 make build          # 构建
-make build-release  # 发布构建（release）
+make release        # 发布构建（release）
 make package        # 生成 .crate 包
 ```
 

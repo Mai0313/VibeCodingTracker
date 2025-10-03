@@ -102,7 +102,7 @@ cargo test --verbose
 
 # Building
 make build         # Debug build
-make build-release # Release build
+make release       # Release build
 cargo build --release
 
 # Running
