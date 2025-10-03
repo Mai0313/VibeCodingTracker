@@ -19,6 +19,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::io;
 use std::time::{Duration, Instant};
+use chrono::Local;
+use sysinfo::System;
 
 /// Display usage data as an interactive table that refreshes every 5 seconds
 pub fn display_usage_interactive() -> anyhow::Result<()> {
@@ -30,9 +32,15 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut last_refresh = Instant::now();
-    let refresh_interval = Duration::from_secs(5);
+    let refresh_interval = Duration::from_secs(1);
+
+    // Initialize system for memory monitoring
+    let mut sys = System::new_all();
+    let pid = sysinfo::get_current_pid().unwrap();
 
     loop {
+        // Update system information
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, false);
         // Get usage data
         let usage_data = match crate::usage::get_usage_from_directories() {
             Ok(data) => data,
@@ -69,8 +77,6 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
                 }
             }
         }
-
-        let next_refresh = refresh_interval.saturating_sub(last_refresh.elapsed()).as_secs();
 
         // Render
         terminal.draw(|f| {
@@ -111,14 +117,15 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
                 "Cost (USD)",
             ];
 
+            let today = Local::now().format("%Y-%m-%d").to_string();
+
             let mut rows: Vec<RatatuiRow> = rows_data
                 .iter()
-                .enumerate()
-                .map(|(idx, row)| {
-                    let style = if idx % 2 == 0 {
-                        Style::default()
+                .map(|row| {
+                    let style = if row.date == today {
+                        Style::default().bg(RatatuiColor::Rgb(32, 32, 32))
                     } else {
-                        Style::default().bg(RatatuiColor::DarkGray)
+                        Style::default()
                     };
 
                     RatatuiRow::new(vec![
@@ -179,6 +186,9 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
 
             f.render_widget(table, chunks[1]);
 
+            // Get memory usage
+            let memory_mb = sys.process(pid).map_or(0.0, |p| p.memory() as f64 / 1024.0 / 1024.0);
+
             // Summary
             let summary = Paragraph::new(vec![
                 Line::from(vec![
@@ -190,6 +200,9 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
                     Span::raw("  |  "),
                     Span::styled("📅 Entries: ", Style::default().fg(RatatuiColor::Blue).bold()),
                     Span::styled(format!("{}", rows_data.len()), Style::default().fg(RatatuiColor::White).bold()),
+                    Span::raw("  |  "),
+                    Span::styled("🧠 Memory: ", Style::default().fg(RatatuiColor::LightRed).bold()),
+                    Span::styled(format!("{:.1} MB", memory_mb), Style::default().fg(RatatuiColor::LightYellow).bold()),
                 ]),
             ])
             .block(
@@ -209,9 +222,7 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
                     Span::styled("'Esc'", Style::default().fg(RatatuiColor::Red).bold()),
                     Span::styled(", or ", Style::default().fg(RatatuiColor::DarkGray)),
                     Span::styled("'Ctrl+C'", Style::default().fg(RatatuiColor::Red).bold()),
-                    Span::styled(" to quit  |  ", Style::default().fg(RatatuiColor::DarkGray)),
-                    Span::styled("⏱️  Next refresh in: ", Style::default().fg(RatatuiColor::Gray)),
-                    Span::styled(format!("{}s", next_refresh), Style::default().fg(RatatuiColor::Cyan).bold()),
+                    Span::styled(" to quit", Style::default().fg(RatatuiColor::DarkGray)),
                 ]),
             ])
             .centered();
