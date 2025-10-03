@@ -156,7 +156,7 @@ docker run --rm codex_usage:latest
 ## 命名
 
 - crate/二进制：`codex_usage`
-- 仓库链接：`https://github.com/<owner>/codex-usage`
+- 仓库链接：`https://github.com/Mai0313/codex_usage`
 - CI 已固定使用 `codex_usage` 作为二进制名称，避免与 repo 名称绑定
 
 ## 许可证

@@ -156,7 +156,7 @@ docker run --rm codex_usage:latest
 ## 命名
 
 - crate/二進位：`codex_usage`
-- 儲存庫連結：`https://github.com/<owner>/codex-usage`
+- 儲存庫連結：`https://github.com/Mai0313/codex_usage`
 - CI 已固定使用 `codex_usage` 作為二進位名稱，避免與 repo 名稱綁定
 
 ## 授權
