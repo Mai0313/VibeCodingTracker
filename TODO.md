@@ -108,6 +108,6 @@
 
 ## 更新專案名稱
 
-我想把專案名稱改成 Vibe Coding Usage
+我想把專案名稱改成 Vibe Coding Tracker
 但這個改動可能會涉及到很多名稱 例如 `codex-usage`, `codex_usage`, `CodexUsage`, etc...
-repo 連結未來會改為 `https://github.com/Mai0313/VibeCodingUsage`
+repo 連結未來會改為 `https://github.com/Mai0313/VibeCodingTracker`
