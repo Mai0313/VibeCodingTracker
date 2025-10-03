@@ -15,17 +15,35 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Analysis { path, output } => {
-            // Analyze the JSONL file
-            let result = analyze_jsonl_file(&path)?;
+            match path {
+                Some(file_path) => {
+                    // Single file analysis
+                    let result = analyze_jsonl_file(&file_path)?;
 
-            // Save to output file if specified
-            if let Some(output_path) = output {
-                vibe_coding_tracker::utils::save_json_pretty(&output_path, &result)?;
-                println!("✅ Analysis result saved to: {}", output_path.display());
-            } else {
-                // Print to stdout if no output file specified
-                let json_str = serde_json::to_string_pretty(&result)?;
-                println!("{}", json_str);
+                    // Save to output file if specified
+                    if let Some(output_path) = output {
+                        vibe_coding_tracker::utils::save_json_pretty(&output_path, &result)?;
+                        println!("✅ Analysis result saved to: {}", output_path.display());
+                    } else {
+                        // Print to stdout if no output file specified
+                        let json_str = serde_json::to_string_pretty(&result)?;
+                        println!("{}", json_str);
+                    }
+                }
+                None => {
+                    // Batch analysis of all sessions
+                    let analysis_data = vibe_coding_tracker::analysis::analyze_all_sessions()?;
+
+                    if let Some(output_path) = output {
+                        // Save to JSON file
+                        let json_value = serde_json::to_value(&analysis_data)?;
+                        vibe_coding_tracker::utils::save_json_pretty(&output_path, &json_value)?;
+                        println!("✅ Analysis result saved to: {}", output_path.display());
+                    } else {
+                        // Display interactive table
+                        vibe_coding_tracker::analysis::display_analysis_interactive(&analysis_data)?;
+                    }
+                }
             }
         }
 

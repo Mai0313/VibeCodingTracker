@@ -12,11 +12,11 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Analyze a JSONL conversation file
+    /// Analyze JSONL conversation files (single file or all sessions)
     Analysis {
-        /// Path to the JSONL file to analyze
+        /// Path to the JSONL file to analyze (if not provided, analyzes all sessions)
         #[arg(short, long)]
-        path: PathBuf,
+        path: Option<PathBuf>,
 
         /// Optional output path to save analysis result as JSON
         #[arg(short, long)]

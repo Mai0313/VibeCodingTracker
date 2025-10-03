@@ -18,7 +18,8 @@
 但是上面我想顯示的是
 `Date`, `Model`, `Edit Lines`, `Read Lines`, `Write Lines`, `Bash`, `Edit`, `Read`, `TodoWrite`, `Write`
 這些資訊在 parse 完畢以後都會出現, 只是需要分模型與日期進行加總
-完成後請更新文檔
+
+此次任務已完成 請更新 README.md README.zh-CN.md README.zh-TW.md 並將所有輸出寫成範例包含在裡面
 
 ## 查看版本資訊
 ```bash

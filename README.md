@@ -250,28 +250,41 @@ vct usage --json
 
 ## 📊 Analysis Command
 
-**Deep dive into specific conversation files.**
+**Deep dive into conversation files - single file or batch analysis.**
 
 ### Basic Usage
 
 ```bash
-# Analyze and display
+# Single file: Analyze and display
 vct analysis --path ~/.claude/projects/session.jsonl
 
-# Save to file
+# Single file: Save to file
 vct analysis --path ~/.claude/projects/session.jsonl --output report.json
+
+# Batch: Analyze all sessions with interactive table (default)
+vct analysis
+
+# Batch: Save aggregated results to JSON
+vct analysis --output batch_report.json
 ```
 
 ### What You Get
 
-Detailed JSON report including:
+**Single File Analysis**:
 - **Token Usage**: Input, output, and cache statistics by model
 - **File Operations**: Every read, write, and edit with full details
 - **Command History**: All shell commands executed
 - **Tool Usage**: Counts of each tool type used
 - **Metadata**: User, machine ID, Git repo, timestamps
 
-### Sample Output
+**Batch Analysis**:
+- **Aggregated Metrics**: Grouped by date and model
+- **Line Counts**: Edit, read, and write operations
+- **Tool Statistics**: Bash, Edit, Read, TodoWrite, Write counts
+- **Interactive Display**: Real-time TUI table (default)
+- **JSON Export**: Structured data for further processing
+
+### Sample Output - Single File
 
 ```json
 {
@@ -306,12 +319,73 @@ Detailed JSON report including:
 }
 ```
 
+### Sample Output - Batch Analysis
+
+**Interactive Table** (default when running `vct analysis`):
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                  🔍 Analysis Statistics                           │
+└──────────────────────────────────────────────────────────────────┘
+┌────────────┬────────────────────┬────────────┬────────────┬────────────┬──────┬──────┬──────┬───────────┬───────┐
+│ Date       │ Model              │ Edit Lines │ Read Lines │ Write Lines│ Bash │ Edit │ Read │ TodoWrite │ Write │
+├────────────┼────────────────────┼────────────┼────────────┼────────────┼──────┼──────┼──────┼───────────┼───────┤
+│ 2025-10-02 │ claude-sonnet-4-5…│ 901        │ 11,525     │ 53         │ 13   │ 26   │ 27   │ 10        │ 1     │
+│ 2025-10-03 │ claude-sonnet-4-5…│ 574        │ 10,057     │ 1,415      │ 53   │ 87   │ 78   │ 30        │ 8     │
+│ 2025-10-03 │ gpt-5-codex        │ 0          │ 1,323      │ 0          │ 75   │ 0    │ 20   │ 0         │ 0     │
+│            │ TOTAL              │ 1,475      │ 22,905     │ 1,468      │ 141  │ 113  │ 125  │ 40        │ 9     │
+└────────────┴────────────────────┴────────────┴────────────┴────────────┴──────┴──────┴──────┴───────────┴───────┘
+┌────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ 📝 Total Lines: 25,848  |  🔧 Total Tools: 428  |  📅 Entries: 3  |  🧠 Memory: 8.2 MB                         │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+Press 'q', 'Esc', or 'Ctrl+C' to quit
+```
+
+**JSON Export** (with `--output`):
+
+```json
+[
+  {
+    "date": "2025-10-02",
+    "model": "claude-sonnet-4-5-20250929",
+    "editLines": 901,
+    "readLines": 11525,
+    "writeLines": 53,
+    "bashCount": 13,
+    "editCount": 26,
+    "readCount": 27,
+    "todoWriteCount": 10,
+    "writeCount": 1
+  },
+  {
+    "date": "2025-10-03",
+    "model": "claude-sonnet-4-5-20250929",
+    "editLines": 574,
+    "readLines": 10057,
+    "writeLines": 1415,
+    "bashCount": 53,
+    "editCount": 87,
+    "readCount": 78,
+    "todoWriteCount": 30,
+    "writeCount": 8
+  }
+]
+```
+
 ### 💡 Use Cases
 
+**Single File Analysis**:
 - **Usage Auditing**: Track what the AI did in each session
 - **Cost Attribution**: Calculate costs per project or feature
 - **Compliance**: Export detailed activity logs
 - **Analysis**: Understand coding patterns and tool usage
+
+**Batch Analysis**:
+- **Productivity Tracking**: Monitor coding activity over time
+- **Tool Usage Patterns**: Identify most-used tools across sessions
+- **Model Comparison**: Compare efficiency between different AI models
+- **Historical Analysis**: Track trends in code operations by date
 
 ---
 

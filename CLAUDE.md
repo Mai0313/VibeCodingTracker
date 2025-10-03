@@ -59,6 +59,12 @@ vct usage --json
 # Analyze specific conversation file
 vct analysis --path <file.jsonl> [--output <output.json>]
 
+# Batch analyze all sessions (interactive table by default)
+vct analysis
+
+# Batch analyze and save to JSON
+vct analysis --output <output.json>
+
 # Version info
 vct version [--json|--text]
 ```
@@ -80,6 +86,8 @@ src/
 │   └── codex.rs         # Codex/OpenAI types
 ├── analysis/            # JSONL analysis pipeline
 │   ├── analyzer.rs      # Main entry: analyze_jsonl_file()
+│   ├── batch_analyzer.rs # Batch analysis: analyze_all_sessions()
+│   ├── display.rs       # Interactive TUI and table display for analysis
 │   ├── detector.rs      # Detect Claude vs Codex format
 │   ├── claude_analyzer.rs
 │   └── codex_analyzer.rs
@@ -108,11 +116,24 @@ src/
   - JSON includes full precision costs
 
 **2. Analysis Command (`vct analysis`):**
+
+**Single File Mode** (with `--path`):
 - `main.rs::Commands::Analysis` → `analysis/analyzer.rs::analyze_jsonl_file()`
   - `detector.rs` determines Claude vs Codex format (checks `parentUuid` field)
   - Routes to `claude_analyzer.rs` or `codex_analyzer.rs`
   - Extracts: conversation usage, tool call counts, file operations, Git info
 - Outputs detailed JSON with metadata (user, machineId, Git remote, etc.)
+
+**Batch Mode** (without `--path`):
+- `main.rs::Commands::Analysis` → `analysis/batch_analyzer.rs::analyze_all_sessions()`
+  - Scans `~/.claude/projects/*.jsonl` and `~/.codex/sessions/*.jsonl`
+  - Analyzes each file and aggregates by date and model
+  - Groups metrics: edit/read/write lines, tool call counts (Bash, Edit, Read, TodoWrite, Write)
+- `analysis/display.rs::display_analysis_interactive()` → Interactive TUI (default)
+  - Ratatui-based table with 1-second refresh
+  - Columns: Date, Model, Edit Lines, Read Lines, Write Lines, Bash, Edit, Read, TodoWrite, Write
+  - Shows totals row and memory usage
+- With `--output`: Saves aggregated results as JSON array
 
 **3. Pricing System:**
 - URL: `https://github.com/BerriAI/litellm/raw/refs/heads/main/model_prices_and_context_window.json`
@@ -235,13 +256,13 @@ ls -la ~/.codex/sessions/
 
 ## Output Examples
 
-**Text format:**
+**Usage Text format:**
 ```
 2025-10-01 > claude-sonnet-4-20250514: $2.154230
 2025-10-02 > gpt-4-turbo: $0.250000
 ```
 
-**JSON format:**
+**Usage JSON format:**
 ```json
 {
   "2025-10-01": [
@@ -258,6 +279,36 @@ ls -la ~/.codex/sessions/
     }
   ]
 }
+```
+
+**Batch Analysis JSON format:**
+```json
+[
+  {
+    "date": "2025-10-02",
+    "model": "claude-sonnet-4-5-20250929",
+    "editLines": 901,
+    "readLines": 11525,
+    "writeLines": 53,
+    "bashCount": 13,
+    "editCount": 26,
+    "readCount": 27,
+    "todoWriteCount": 10,
+    "writeCount": 1
+  },
+  {
+    "date": "2025-10-03",
+    "model": "claude-sonnet-4-5-20250929",
+    "editLines": 574,
+    "readLines": 10057,
+    "writeLines": 1415,
+    "bashCount": 53,
+    "editCount": 87,
+    "readCount": 78,
+    "todoWriteCount": 30,
+    "writeCount": 8
+  }
+]
 ```
 
 ## Release Profile
