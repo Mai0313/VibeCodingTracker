@@ -96,3 +96,12 @@
 我希望欄位有 `Date`, `Model`, `Input`, `Output`, `Cache Read`, `Cache Creation`, `Total Tokens` 和 `Cost (USD)`
 
 這個功能 `--json` 模式下也要支援, 並且 usage 請幫我新增一個 `--text` 功能
+
+## 新增 interactive table
+
+幫我把 `./target/debug/codex_usage usage` 的輸出改成 實時更新的 interactive table, 每五秒更新一次
+可以用 Ratatui 這個 library
+然後將當前 `./target/debug/codex_usage usage` 顯示出來的 table 改放到 `./target/debug/codex_usage usage --table`
+
+`--text` 功能請幫我將它改成單純的 `Date > model name: cost` 這樣的格式
+另外 table 的 cost 取小數點兩位 四捨五入即可, `--json`, `--text` 則是按照現在的狀態 不要進行四捨五入
