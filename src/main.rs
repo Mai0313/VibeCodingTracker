@@ -1,7 +1,7 @@
 use anyhow::Result;
 use codex_usage::cli::{Cli, Commands};
 use codex_usage::usage::{display_usage_table, get_usage_from_directories};
-use codex_usage::{analyze_jsonl_file, get_version_info, PKG_DESCRIPTION, PKG_NAME};
+use codex_usage::{analyze_jsonl_file, get_version_info};
 
 fn main() -> Result<()> {
     env_logger::init();
@@ -37,10 +37,34 @@ fn main() -> Result<()> {
             }
         }
 
-        Commands::Version => {
+        Commands::Version { json, text } => {
             let version_info = get_version_info();
-            println!("{} v{}", PKG_NAME, version_info.version);
-            println!("{}", PKG_DESCRIPTION);
+
+            if json {
+                // JSON format
+                let json_output = serde_json::json!({
+                    "Version": version_info.version,
+                    "Rust Version": version_info.rust_version,
+                    "Cargo Version": version_info.cargo_version
+                });
+                println!("{}", serde_json::to_string_pretty(&json_output)?);
+            } else if text {
+                // Plain text format
+                println!("Version: {}", version_info.version);
+                println!("Rust Version: {}", version_info.rust_version);
+                println!("Cargo Version: {}", version_info.cargo_version);
+            } else {
+                // Default pretty format with ASCII box
+                println!("🚀 Coding CLI Helper");
+                println!();
+                println!("╭────────────────────────────────────╮");
+                println!("│                                    │");
+                println!("│  Version:    {:<21} │", version_info.version);
+                println!("│  Rust Version: {:<18} │", version_info.rust_version);
+                println!("│  Cargo Version: {:<17} │", version_info.cargo_version);
+                println!("│                                    │");
+                println!("╰────────────────────────────────────╯");
+            }
         }
     }
 

@@ -31,7 +31,15 @@ pub enum Commands {
     },
 
     /// Display version information
-    Version,
+    Version {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Output as plain text
+        #[arg(long)]
+        text: bool,
+    },
 }
 
 impl Cli {

@@ -19,11 +19,53 @@ pub const PKG_DESCRIPTION: &str = env!("CARGO_PKG_DESCRIPTION");
 pub fn get_version_info() -> VersionInfo {
     VersionInfo {
         version: VERSION.to_string(),
+        rust_version: get_rust_version(),
+        cargo_version: get_cargo_version(),
     }
+}
+
+/// Get Rust version by running rustc --version
+fn get_rust_version() -> String {
+    std::process::Command::new("rustc")
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|output| {
+            String::from_utf8(output.stdout)
+                .ok()
+                .and_then(|s| {
+                    // Extract version number from "rustc 1.28.2 (xxxxx)"
+                    s.split_whitespace()
+                        .nth(1)
+                        .map(|v| v.to_string())
+                })
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Get Cargo version by running cargo --version
+fn get_cargo_version() -> String {
+    std::process::Command::new("cargo")
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|output| {
+            String::from_utf8(output.stdout)
+                .ok()
+                .and_then(|s| {
+                    // Extract version number from "cargo 1.89.0 (xxxxx)"
+                    s.split_whitespace()
+                        .nth(1)
+                        .map(|v| v.to_string())
+                })
+        })
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// Version information structure
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VersionInfo {
     pub version: String,
+    pub rust_version: String,
+    pub cargo_version: String,
 }
