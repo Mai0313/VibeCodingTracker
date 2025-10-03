@@ -58,7 +58,17 @@
 
 ### 安装
 
-**前提条件**：[Rust 工具链](https://rustup.rs/)（1.70+）
+**前提条件**:
+- [Rust 工具链](https://rustup.rs/) (1.70+) 用于从源码构建
+- [Node.js](https://nodejs.org/) (v18+) 用于 `npm` 安装
+
+#### 从 `npm` (推荐)
+
+```bash
+npm install -g vibe-coding-tracker
+```
+
+#### 从源码
 
 ```bash
 # 克隆和构建

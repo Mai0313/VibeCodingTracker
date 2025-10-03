@@ -58,7 +58,17 @@
 
 ### 安裝
 
-**前置條件**：[Rust 工具鏈](https://rustup.rs/)（1.70+）
+**前置條件**:
+- [Rust 工具鏈](https://rustup.rs/) (1.70+) 用於從源碼建置
+- [Node.js](https://nodejs.org/) (v18+) 用於 `npm` 安裝
+
+#### 從 `npm` (推薦)
+
+```bash
+npm install -g vibe-coding-tracker
+```
+
+#### 從源碼
 
 ```bash
 # 複製和建置

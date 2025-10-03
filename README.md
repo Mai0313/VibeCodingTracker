@@ -58,7 +58,17 @@ Automatically detects and processes logs from both Claude Code and Codex. No set
 
 ### Installation
 
-**Prerequisites**: [Rust toolchain](https://rustup.rs/) (1.70+)
+**Prerequisites**:
+- [Rust toolchain](https://rustup.rs/) (1.70+) for building from source
+- [Node.js](https://nodejs.org/) (v18+) for `npm` installation
+
+#### From `npm` (Recommended)
+
+```bash
+npm install -g vibe-coding-tracker
+```
+
+#### From Source
 
 ```bash
 # Clone and build
