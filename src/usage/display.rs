@@ -4,9 +4,10 @@ use comfy_table::{presets::UTF8_FULL, Cell, CellAlignment, Color, Table};
 use owo_colors::OwoColorize;
 use ratatui::{
     backend::CrosstermBackend,
-    layout::Constraint,
-    style::{Modifier, Style},
-    widgets::{Block, Borders, Row as RatatuiRow, Table as RatatuiTable},
+    layout::{Constraint, Direction, Layout as RatatuiLayout},
+    style::{Color as RatatuiColor, Style, Stylize},
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph, Row as RatatuiRow, Table as RatatuiTable},
     Terminal,
 };
 use crossterm::{
@@ -69,24 +70,57 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
             }
         }
 
+        let next_refresh = refresh_interval.saturating_sub(last_refresh.elapsed()).as_secs();
+
         // Render
         terminal.draw(|f| {
-            let area = f.area();
+            let chunks = RatatuiLayout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),  // Title
+                    Constraint::Min(10),    // Table
+                    Constraint::Length(3),  // Summary
+                    Constraint::Length(2),  // Controls
+                ])
+                .split(f.area());
 
+            // Title
+            let title = Paragraph::new(vec![
+                Line::from(vec![
+                    Span::styled("📊 ", Style::default().fg(RatatuiColor::Cyan)),
+                    Span::styled("Token Usage Statistics", Style::default().fg(RatatuiColor::Cyan).bold()),
+                ]),
+            ])
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(RatatuiColor::Cyan))
+            )
+            .centered();
+            f.render_widget(title, chunks[0]);
+
+            // Table
             let header = vec![
                 "Date",
                 "Model",
                 "Input",
                 "Output",
                 "Cache Read",
-                "Cache Creation",
-                "Total Tokens",
+                "Cache Create",
+                "Total",
                 "Cost (USD)",
             ];
 
             let mut rows: Vec<RatatuiRow> = rows_data
                 .iter()
-                .map(|row| {
+                .enumerate()
+                .map(|(idx, row)| {
+                    let style = if idx % 2 == 0 {
+                        Style::default()
+                    } else {
+                        Style::default().bg(RatatuiColor::DarkGray)
+                    };
+
                     RatatuiRow::new(vec![
                         row.date.clone(),
                         row.display_model.clone(),
@@ -97,6 +131,7 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
                         format_number(row.total),
                         format!("${:.2}", row.cost),
                     ])
+                    .style(style)
                 })
                 .collect();
 
@@ -110,7 +145,11 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
                 format_number(totals.cache_creation),
                 format_number(totals.total),
                 format!("${:.2}", totals.cost),
-            ]).style(Style::default().add_modifier(Modifier::BOLD)));
+            ])
+            .style(Style::default()
+                .fg(RatatuiColor::Yellow)
+                .bold()
+                .bg(RatatuiColor::DarkGray)));
 
             let widths = [
                 Constraint::Length(12),
@@ -118,23 +157,63 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
                 Constraint::Length(12),
                 Constraint::Length(12),
                 Constraint::Length(12),
-                Constraint::Length(16),
                 Constraint::Length(14),
+                Constraint::Length(12),
                 Constraint::Length(12),
             ];
 
             let table = RatatuiTable::new(rows, widths)
                 .header(
                     RatatuiRow::new(header)
-                        .style(Style::default().add_modifier(Modifier::BOLD))
+                        .style(Style::default()
+                            .fg(RatatuiColor::Black)
+                            .bg(RatatuiColor::Green)
+                            .bold())
+                        .bottom_margin(1)
                 )
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title("📊 Token Usage Statistics (Press 'q' to quit, refreshes every 5s)")
+                        .border_style(Style::default().fg(RatatuiColor::Green))
                 );
 
-            f.render_widget(table, area);
+            f.render_widget(table, chunks[1]);
+
+            // Summary
+            let summary = Paragraph::new(vec![
+                Line::from(vec![
+                    Span::styled("💰 Total Cost: ", Style::default().fg(RatatuiColor::Yellow).bold()),
+                    Span::styled(format!("${:.2}", totals.cost), Style::default().fg(RatatuiColor::Green).bold()),
+                    Span::raw("  |  "),
+                    Span::styled("🔢 Total Tokens: ", Style::default().fg(RatatuiColor::Cyan).bold()),
+                    Span::styled(format_number(totals.total), Style::default().fg(RatatuiColor::Magenta).bold()),
+                    Span::raw("  |  "),
+                    Span::styled("📅 Entries: ", Style::default().fg(RatatuiColor::Blue).bold()),
+                    Span::styled(format!("{}", rows_data.len()), Style::default().fg(RatatuiColor::White).bold()),
+                ]),
+            ])
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(RatatuiColor::Yellow))
+            )
+            .centered();
+            f.render_widget(summary, chunks[2]);
+
+            // Controls
+            let controls = Paragraph::new(vec![
+                Line::from(vec![
+                    Span::styled("Press ", Style::default().fg(RatatuiColor::DarkGray)),
+                    Span::styled("'q'", Style::default().fg(RatatuiColor::Red).bold()),
+                    Span::styled(" or ", Style::default().fg(RatatuiColor::DarkGray)),
+                    Span::styled("'Esc'", Style::default().fg(RatatuiColor::Red).bold()),
+                    Span::styled(" to quit  |  ", Style::default().fg(RatatuiColor::DarkGray)),
+                    Span::styled("⏱️  Next refresh in: ", Style::default().fg(RatatuiColor::Gray)),
+                    Span::styled(format!("{}s", next_refresh), Style::default().fg(RatatuiColor::Cyan).bold()),
+                ]),
+            ])
+            .centered();
+            f.render_widget(controls, chunks[3]);
         })?;
 
         // Handle input with timeout
