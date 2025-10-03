@@ -64,14 +64,6 @@ fn main() -> Result<()> {
                 table
                     .load_preset(UTF8_FULL)
                     .set_content_arrangement(ContentArrangement::Dynamic)
-                    .set_header(vec![
-                        Cell::new("Property")
-                            .fg(Color::Yellow)
-                            .set_alignment(CellAlignment::Left),
-                        Cell::new("Value")
-                            .fg(Color::Yellow)
-                            .set_alignment(CellAlignment::Left),
-                    ])
                     .add_row(vec![
                         Cell::new("Version")
                             .fg(Color::Green)
