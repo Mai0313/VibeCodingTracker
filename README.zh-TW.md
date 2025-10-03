@@ -1,6 +1,6 @@
 <center>
 
-# VibeCodingTracker — AI 程式設計助手使用量追蹤器
+# Vibe Coding Tracker — AI 程式設計助手使用量追蹤器
 
 [![rust](https://img.shields.io/badge/Rust-stable-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![tests](https://github.com/Mai0313/VibeCodingTracker/actions/workflows/test.yml/badge.svg)](https://github.com/Mai0313/VibeCodingTracker/actions/workflows/test.yml)
@@ -10,13 +10,13 @@
 
 </center>
 
-**即時追蹤您的 AI 程式設計成本。** VibeCodingTracker 是一個強大的 CLI 工具，幫助您監控和分析 Claude Code 和 Codex 的使用情況，提供詳細的成本分解、token 統計和程式碼操作洞察。
+**即時追蹤您的 AI 程式設計成本。** Vibe Coding Tracker 是一個強大的 CLI 工具，幫助您監控和分析 Claude Code 和 Codex 的使用情況，提供詳細的成本分解、token 統計和程式碼操作洞察。
 
 [English](README.md) | [繁體中文](README.zh-TW.md) | [简体中文](README.zh-CN.md)
 
 ---
 
-## 🎯 為什麼選擇 VibeCodingTracker？
+## 🎯 為什麼選擇 Vibe Coding Tracker？
 
 ### 💰 了解您的成本
 不再疑惑您的 AI 程式設計會話花費多少。透過 [LiteLLM](https://github.com/BerriAI/litellm) 自動更新定價，獲取**即時成本追蹤**。
@@ -464,8 +464,8 @@ vct usage --table
 ## 📚 了解更多
 
 - **開發者文件**：參見 [.github/copilot-instructions.md](.github/copilot-instructions.md)
-- **報告問題**：[GitHub Issues](https://github.com/Mai0313/vibe_coding_tracker/issues)
-- **原始碼**：[GitHub 儲存庫](https://github.com/Mai0313/vibe_coding_tracker)
+- **報告問題**：[GitHub Issues](https://github.com/Mai0313/VibeCodingTracker/issues)
+- **原始碼**：[GitHub 儲存庫](https://github.com/Mai0313/VibeCodingTracker)
 
 ---
 
@@ -500,7 +500,7 @@ MIT 授權 - 詳見 [LICENSE](LICENSE)。
 
 **省錢。追蹤使用量。更智慧地編寫程式。**
 
-如果您覺得有用，請[⭐ Star 這個專案](https://github.com/Mai0313/vibe_coding_tracker)！
+如果您覺得有用，請[⭐ Star 這個專案](https://github.com/Mai0313/VibeCodingTracker)！
 
 使用 🦀 Rust 製作
 

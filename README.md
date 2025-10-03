@@ -1,6 +1,6 @@
 <center>
 
-# VibeCodingTracker — AI Coding Assistant Usage Tracker
+# Vibe Coding Tracker — AI Coding Assistant Usage Tracker
 
 [![rust](https://img.shields.io/badge/Rust-stable-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![tests](https://github.com/Mai0313/VibeCodingTracker/actions/workflows/test.yml/badge.svg)](https://github.com/Mai0313/VibeCodingTracker/actions/workflows/test.yml)
@@ -10,13 +10,13 @@
 
 </center>
 
-**Track your AI coding costs in real-time.** VibeCodingTracker is a powerful CLI tool that helps you monitor and analyze your Claude Code and Codex usage, providing detailed cost breakdowns, token statistics, and code operation insights.
+**Track your AI coding costs in real-time.** Vibe Coding Tracker is a powerful CLI tool that helps you monitor and analyze your Claude Code and Codex usage, providing detailed cost breakdowns, token statistics, and code operation insights.
 
 [English](README.md) | [繁體中文](README.zh-TW.md) | [简体中文](README.zh-CN.md)
 
 ---
 
-## 🎯 Why VibeCodingTracker?
+## 🎯 Why Vibe Coding Tracker?
 
 ### 💰 Know Your Costs
 Stop wondering how much your AI coding sessions cost. Get **real-time cost tracking** with automatic pricing updates from [LiteLLM](https://github.com/BerriAI/litellm).
