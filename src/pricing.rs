@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
+use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
 use strsim::jaro_winkler;
 
 const LITELLM_PRICING_URL: &str =
@@ -39,14 +42,135 @@ impl Default for ModelPricing {
     }
 }
 
-/// Fetch model pricing from LiteLLM repository
+/// Get cache directory path
+fn get_cache_dir() -> Result<PathBuf> {
+    let home_dir = home::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Unable to resolve user home directory"))?;
+    let cache_dir = home_dir.join(".codex-usage");
+
+    // Create directory if it doesn't exist
+    if !cache_dir.exists() {
+        fs::create_dir_all(&cache_dir)
+            .context("Failed to create cache directory")?;
+    }
+
+    Ok(cache_dir)
+}
+
+/// Get current date string (YYYY-MM-DD)
+fn get_current_date() -> String {
+    Local::now().format("%Y-%m-%d").to_string()
+}
+
+/// Get cache file path for today
+fn get_today_cache_path() -> Result<PathBuf> {
+    let cache_dir = get_cache_dir()?;
+    let date_str = get_current_date();
+    Ok(cache_dir.join(format!("model_pricing_{}.json", date_str)))
+}
+
+/// Find existing cache file for today
+fn find_today_cache() -> Option<PathBuf> {
+    let Ok(cache_dir) = get_cache_dir() else {
+        return None;
+    };
+
+    let today = get_current_date();
+    let today_cache = cache_dir.join(format!("model_pricing_{}.json", today));
+
+    if today_cache.exists() {
+        Some(today_cache)
+    } else {
+        None
+    }
+}
+
+/// Clean up old cache files (keep only today's)
+fn cleanup_old_cache() {
+    let Ok(cache_dir) = get_cache_dir() else {
+        return;
+    };
+
+    let Ok(entries) = fs::read_dir(&cache_dir) else {
+        return;
+    };
+
+    let today = get_current_date();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+            // Match pattern: model_pricing_YYYY-MM-DD.json
+            if filename.starts_with("model_pricing_") && filename.ends_with(".json") {
+                if !filename.contains(&today) {
+                    // Delete old cache file
+                    let _ = fs::remove_file(&path);
+                    log::debug!("Removed old cache file: {:?}", path);
+                }
+            }
+        }
+    }
+}
+
+/// Load pricing from cache
+fn load_from_cache() -> Result<HashMap<String, ModelPricing>> {
+    let cache_path = find_today_cache()
+        .ok_or_else(|| anyhow::anyhow!("No cache file found for today"))?;
+
+    let content = fs::read_to_string(&cache_path)
+        .context("Failed to read cached pricing file")?;
+    let pricing: HashMap<String, ModelPricing> = serde_json::from_str(&content)
+        .context("Failed to parse cached pricing JSON")?;
+    Ok(pricing)
+}
+
+/// Save pricing to cache
+fn save_to_cache(pricing: &HashMap<String, ModelPricing>) -> Result<()> {
+    let cache_path = get_today_cache_path()?;
+
+    // Save pricing data with today's date in filename
+    let pricing_json = serde_json::to_string_pretty(pricing)
+        .context("Failed to serialize pricing data")?;
+    fs::write(&cache_path, pricing_json)
+        .context("Failed to write pricing cache file")?;
+
+    // Clean up old cache files
+    cleanup_old_cache();
+
+    Ok(())
+}
+
+/// Fetch model pricing from LiteLLM repository (with caching)
 pub fn fetch_model_pricing() -> Result<HashMap<String, ModelPricing>> {
+    // Check if today's cache exists
+    if find_today_cache().is_some() {
+        // Load from cache
+        match load_from_cache() {
+            Ok(pricing) => {
+                log::debug!("Loaded model pricing from today's cache");
+                return Ok(pricing);
+            }
+            Err(e) => {
+                log::warn!("Failed to load from cache: {}, fetching from remote", e);
+            }
+        }
+    }
+
+    // Fetch from remote
+    log::info!("Fetching model pricing from remote...");
     let response = reqwest::blocking::get(LITELLM_PRICING_URL)
         .context("Failed to fetch model pricing from LiteLLM")?;
 
     let pricing: HashMap<String, ModelPricing> = response
         .json()
         .context("Failed to parse model pricing JSON")?;
+
+    // Save to cache with today's date
+    if let Err(e) = save_to_cache(&pricing) {
+        log::warn!("Failed to save pricing to cache: {}", e);
+    } else {
+        log::debug!("Saved model pricing to cache with today's date");
+    }
 
     Ok(pricing)
 }
