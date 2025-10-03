@@ -1,15 +1,15 @@
 ## 分析某個 conversation (此功能已完成)
 
 ```bash
-./target/debug/codex_usage analysis --path examples/test_conversation.jsonl
-./target/debug/codex_usage analysis --path examples/test_conversation.jsonl --output examples/analysis_claude_code.json
-./target/debug/codex_usage analysis --path examples/test_conversation_oai.jsonl
-./target/debug/codex_usage analysis --path examples/test_conversation_oai.jsonl --output examples/analysis_codex.json
+./target/debug/vibe_coding_tracker analysis --path examples/test_conversation.jsonl
+./target/debug/vibe_coding_tracker analysis --path examples/test_conversation.jsonl --output examples/analysis_claude_code.json
+./target/debug/vibe_coding_tracker analysis --path examples/test_conversation_oai.jsonl
+./target/debug/vibe_coding_tracker analysis --path examples/test_conversation_oai.jsonl --output examples/analysis_codex.json
 ```
 
 ## 查看版本資訊
 ```bash
-./target/debug/codex_usage version
+./target/debug/vibe_coding_tracker version
 # 🚀 Coding CLI Helper
 #
 # ╭────────────────────────────────────╮
@@ -20,13 +20,13 @@
 # │                                    │
 # ╰────────────────────────────────────╯
 #
-./target/debug/codex_usage version --json
+./target/debug/vibe_coding_tracker version --json
 # {
 #     "Version": "5.0.6",
 #     "Rust Version": "1.28.2",
 #     "Cargo Version": "1.89.0"
 # }
-./target/debug/codex_usage version --text
+./target/debug/vibe_coding_tracker version --text
 # Version: 5.0.6
 # Rust Version: 1.28.2
 # Cargo Version: 1.89.0
@@ -34,13 +34,13 @@
 
 ## 查看使用狀況
 ```bash
-./target/debug/codex_usage update
+./target/debug/vibe_coding_tracker update
 # 先不用完成 忽略
-./target/debug/codex_usage usage
+./target/debug/vibe_coding_tracker usage
 # 目前功能正確 但請透過 `Ratatui` 美化輸出的 Table
-./target/debug/codex_usage usage --json
+./target/debug/vibe_coding_tracker usage --json
 # 目前功能正確 忽略
-./target/debug/codex_usage help
+./target/debug/vibe_coding_tracker help
 # 目前功能正確 忽略
 ```
 
@@ -99,9 +99,9 @@
 
 ## 新增 interactive table
 
-幫我把 `./target/debug/codex_usage usage` 的輸出改成 實時更新的 interactive table, 每五秒更新一次
+幫我把 `./target/debug/vibe_coding_tracker usage` 的輸出改成 實時更新的 interactive table, 每五秒更新一次
 可以用 Ratatui 這個 library
-然後將當前 `./target/debug/codex_usage usage` 顯示出來的 table 改放到 `./target/debug/codex_usage usage --table`
+然後將當前 `./target/debug/vibe_coding_tracker usage` 顯示出來的 table 改放到 `./target/debug/vibe_coding_tracker usage --table`
 
 `--text` 功能請幫我將它改成單純的 `Date > model name: cost` 這樣的格式
 另外 table 的 cost 取小數點兩位 四捨五入即可, `--json`, `--text` 則是按照現在的狀態 不要進行四捨五入
@@ -109,5 +109,8 @@
 ## 更新專案名稱
 
 我想把專案名稱改成 Vibe Coding Tracker
-但這個改動可能會涉及到很多名稱 例如 `codex-usage`, `codex_usage`, `CodexUsage`, etc...
+但這個改動可能會涉及到很多名稱 例如 `codex-usage`, `vibe_coding_tracker`, `CodexUsage`, etc...
 repo 連結未來會改為 `https://github.com/Mai0313/VibeCodingTracker`
+專案縮寫是 `vct` 方便調用或紀錄
+
+這個任務已經由其他助理完成 請幫我檢查是否有遺漏

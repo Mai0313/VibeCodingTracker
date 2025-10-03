@@ -1,6 +1,6 @@
 // Tests for utils::time module
 
-use codex_usage::utils::time::parse_iso_timestamp;
+use vibe_coding_tracker::utils::time::parse_iso_timestamp;
 
 #[test]
 fn test_parse_iso_timestamp_standard_format() {

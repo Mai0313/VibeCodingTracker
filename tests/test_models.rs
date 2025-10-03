@@ -1,6 +1,6 @@
 // Tests for models module
 
-use codex_usage::models::*;
+use vibe_coding_tracker::models::*;
 
 #[test]
 fn test_extension_type_display() {

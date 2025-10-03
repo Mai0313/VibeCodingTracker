@@ -1,6 +1,6 @@
 // Tests for utils::git module
 
-use codex_usage::utils::git::get_git_remote_url;
+use vibe_coding_tracker::utils::git::get_git_remote_url;
 use std::fs;
 use std::io::Write;
 use std::process::Command;

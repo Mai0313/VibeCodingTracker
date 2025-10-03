@@ -1,8 +1,8 @@
-# CodexUsage - Developer Instructions
+# VibeCodingTracker - Developer Instructions
 
 ## Project Overview
 
-CodexUsage is a Rust-based CLI tool that parses and analyzes JSONL event logs from **Claude Code** and **Codex**, producing aggregated usage statistics and detailed code analysis reports. This is a complete Rust translation of the original Go implementation.
+VibeCodingTracker is a Rust-based CLI tool that parses and analyzes JSONL event logs from **Claude Code** and **Codex**, producing aggregated usage statistics and detailed code analysis reports. This is a complete Rust translation of the original Go implementation.
 
 ### Key Features
 
@@ -24,13 +24,13 @@ CodexUsage is a Rust-based CLI tool that parses and analyzes JSONL event logs fr
 
 ```bash
 # Analyze and output to stdout
-codex_usage analysis --path examples/test_conversation.jsonl
+vibe_coding_tracker analysis --path examples/test_conversation.jsonl
 
 # Analyze and save to file
-codex_usage analysis --path examples/test_conversation.jsonl --output result.json
+vibe_coding_tracker analysis --path examples/test_conversation.jsonl --output result.json
 
 # Analyze Codex logs
-codex_usage analysis --path examples/test_conversation_oai.jsonl
+vibe_coding_tracker analysis --path examples/test_conversation_oai.jsonl
 ```
 
 #### Implementation Details
@@ -120,16 +120,16 @@ CodeAnalysisRecord {
 
 ```bash
 # Display interactive table (default, refreshes every 1 second)
-codex_usage usage
+vibe_coding_tracker usage
 
 # Display static table
-codex_usage usage --table
+vibe_coding_tracker usage --table
 
 # Display plain text
-codex_usage usage --text
+vibe_coding_tracker usage --text
 
 # Display JSON with full precision costs
-codex_usage usage --json
+vibe_coding_tracker usage --json
 ```
 
 #### Implementation Details
@@ -190,7 +190,7 @@ codex_usage usage --json
    - Contains pricing for all major LLM models
 
 2. **Caching Mechanism** (`pricing.rs:45-141`)
-   - Cache directory: `~/.codex-usage/`
+   - Cache directory: `~/.vibe-coding-tracker/`
    - Cache filename pattern: `model_pricing_YYYY-MM-DD.json`
    - Cache lifetime: **Daily** (one cache file per day)
    - Old cache cleanup: Automatically removes cache files from previous days
@@ -292,19 +292,19 @@ codex_usage usage --json
 
 ### 3. Version Command
 
-**Purpose**: Displays version information about the CodexUsage binary and build environment.
+**Purpose**: Displays version information about the VibeCodingTracker binary and build environment.
 
 #### Usage
 
 ```bash
 # Display formatted table (default)
-codex_usage version
+vibe_coding_tracker version
 
 # Display as JSON
-codex_usage version --json
+vibe_coding_tracker version --json
 
 # Display as plain text
-codex_usage version --text
+vibe_coding_tracker version --text
 ```
 
 #### Implementation Details
@@ -335,7 +335,7 @@ codex_usage version --text
 1. **Default (Table)** (`main.rs:164-198`)
    - Formatted table using `comfy-table`
    - Colored output (green labels, white values)
-   - Title: "🚀 Codex Usage Analyzer" (bright cyan, bold)
+   - Title: "🚀 Vibe Coding Tracker" (bright cyan, bold)
    - UTF8 borders
 
 2. **JSON Format** (`main.rs:150-157`)
@@ -577,8 +577,8 @@ Modify `src/pricing.rs`:
 
 2. **Check Cache**
    ```bash
-   ls -la ~/.codex-usage/
-   cat ~/.codex-usage/model_pricing_$(date +%Y-%m-%d).json
+   ls -la ~/.vibe-coding-tracker/
+   cat ~/.vibe-coding-tracker/model_pricing_$(date +%Y-%m-%d).json
    ```
 
 3. **Test with Examples**
@@ -610,7 +610,7 @@ For developers familiar with the original Go implementation:
 | `getGitRemoteOriginURL` | `get_git_remote_url` | `utils::git` |
 | `detectExtensionType` | `detect_extension_type` | `analysis::detector` |
 | `processClaudeUsageData` | `process_claude_usage_data` | `usage::calculator` |
-| `processCodexUsageData` | `process_codex_usage_data` | `usage::calculator` |
+| `processVibeCodingTrackerData` | `process_vibe_coding_tracker_data` | `usage::calculator` |
 | `displayStaticTable` | `display_usage_table` | `usage::display` |
 
 ---
@@ -624,7 +624,7 @@ For developers familiar with the original Go implementation:
 
 ### Cache Management
 
-- **Location**: `~/.codex-usage/`
+- **Location**: `~/.vibe-coding-tracker/`
 - **Pattern**: `model_pricing_YYYY-MM-DD.json`
 - **Lifetime**: Daily (automatically cleaned)
 - **Size**: ~500KB per file
@@ -660,10 +660,10 @@ The fuzzy matching algorithm is **case-insensitive** and uses **Jaro-Winkler sim
 
 ```bash
 # Check cache
-ls -la ~/.codex-usage/
+ls -la ~/.vibe-coding-tracker/
 
 # Clear cache and refetch
-rm -rf ~/.codex-usage/
+rm -rf ~/.vibe-coding-tracker/
 cargo run -- usage
 
 # Enable debug logging

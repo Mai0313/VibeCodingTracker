@@ -1,22 +1,22 @@
 <center>
 
-# CodexUsage — AI 编程助手使用量追踪器
+# VibeCodingTracker — AI 编程助手使用量追踪器
 
 [![rust](https://img.shields.io/badge/Rust-stable-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![tests](https://github.com/Mai0313/codex_usage/actions/workflows/test.yml/badge.svg)](https://github.com/Mai0313/codex_usage/actions/workflows/test.yml)
-[![code-quality](https://github.com/Mai0313/codex_usage/actions/workflows/code-quality-check.yml/badge.svg)](https://github.com/Mai0313/codex_usage/actions/workflows/code-quality-check.yml)
-[![license](https://img.shields.io/badge/License-MIT-green.svg?labelColor=gray)](https://github.com/Mai0313/codex_usage/tree/master?tab=License-1-ov-file)
-[![PRs](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/Mai0313/codex_usage/pulls)
+[![tests](https://github.com/Mai0313/VibeCodingTracker/actions/workflows/test.yml/badge.svg)](https://github.com/Mai0313/VibeCodingTracker/actions/workflows/test.yml)
+[![code-quality](https://github.com/Mai0313/VibeCodingTracker/actions/workflows/code-quality-check.yml/badge.svg)](https://github.com/Mai0313/VibeCodingTracker/actions/workflows/code-quality-check.yml)
+[![license](https://img.shields.io/badge/License-MIT-green.svg?labelColor=gray)](https://github.com/Mai0313/VibeCodingTracker/tree/master?tab=License-1-ov-file)
+[![PRs](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/Mai0313/VibeCodingTracker/pulls)
 
 </center>
 
-**实时追踪您的 AI 编程成本。** CodexUsage 是一个强大的 CLI 工具，帮助您监控和分析 Claude Code 和 Codex 的使用情况，提供详细的成本分解、token 统计和代码操作洞察。
+**实时追踪您的 AI 编程成本。** VibeCodingTracker 是一个强大的 CLI 工具，帮助您监控和分析 Claude Code 和 Codex 的使用情况，提供详细的成本分解、token 统计和代码操作洞察。
 
 [English](README.md) | [繁體中文](README.zh-TW.md) | [简体中文](README.zh-CN.md)
 
 ---
 
-## 🎯 为什么选择 CodexUsage？
+## 🎯 为什么选择 VibeCodingTracker？
 
 ### 💰 了解您的成本
 不再疑惑您的 AI 编程会话花费多少。通过 [LiteLLM](https://github.com/BerriAI/litellm) 自动更新定价，获取**实时成本追踪**。
@@ -62,22 +62,29 @@
 
 ```bash
 # 克隆和构建
-git clone https://github.com/Mai0313/codex_usage.git
-cd CodexUsage
+git clone https://github.com/Mai0313/VibeCodingTracker.git
+cd VibeCodingTracker
 cargo build --release
 
-# 二进制文件位置：./target/release/codex_usage
+# 二进制文件位置：
+# - ./target/release/vibe_coding_tracker (完整名称)
+# - ./target/release/vct (短别名)
 ```
 
 ### 首次运行
 
 ```bash
-# 使用交互式仪表板查看使用量
-./target/release/codex_usage usage
+# 使用交互式仪表板查看使用量（使用短别名）
+./target/release/vct usage
 
-# 或分析特定对话
-./target/release/codex_usage analysis --path ~/.claude/projects/session.jsonl
+# 或使用完整名称
+./target/release/vibe_coding_tracker usage
+
+# 分析特定对话
+./target/release/vct analysis --path ~/.claude/projects/session.jsonl
 ```
+
+> 💡 **提示**：使用 `vct` 作为 `vibe_coding_tracker` 的短别名，节省输入时间！
 
 ---
 
@@ -86,7 +93,7 @@ cargo build --release
 ### 🔍 快速参考
 
 ```bash
-codex_usage <命令> [选项]
+vibe_coding_tracker <命令> [选项]
 
 命令：
   usage       显示 token 使用量和成本（默认：交互式）
@@ -105,16 +112,16 @@ codex_usage <命令> [选项]
 
 ```bash
 # 交互式仪表板（推荐）
-codex_usage usage
+vct usage
 
 # 静态表格，适合报表
-codex_usage usage --table
+vct usage --table
 
 # 纯文本，适合脚本
-codex_usage usage --text
+vct usage --text
 
 # JSON，适合数据处理
-codex_usage usage --json
+vct usage --json
 ```
 
 ### 您将获得什么
@@ -161,7 +168,7 @@ codex_usage usage --json
 **非常适合文档和报表**
 
 ```bash
-codex_usage usage --table
+vct usage --table
 ```
 
 ```
@@ -182,7 +189,7 @@ codex_usage usage --table
 **非常适合脚本和解析**
 
 ```bash
-codex_usage usage --text
+vct usage --text
 ```
 
 ```
@@ -197,7 +204,7 @@ codex_usage usage --text
 **完整精度，用于财务核算和集成**
 
 ```bash
-codex_usage usage --json
+vct usage --json
 ```
 
 ```json
@@ -249,10 +256,10 @@ codex_usage usage --json
 
 ```bash
 # 分析并显示
-codex_usage analysis --path ~/.claude/projects/session.jsonl
+vct analysis --path ~/.claude/projects/session.jsonl
 
 # 保存到文件
-codex_usage analysis --path ~/.claude/projects/session.jsonl --output report.json
+vct analysis --path ~/.claude/projects/session.jsonl --output report.json
 ```
 
 ### 您将获得什么
@@ -314,19 +321,19 @@ codex_usage analysis --path ~/.claude/projects/session.jsonl --output report.jso
 
 ```bash
 # 格式化输出
-codex_usage version
+vct version
 
 # JSON 格式
-codex_usage version --json
+vct version --json
 
 # 纯文本
-codex_usage version --text
+vct version --text
 ```
 
 ### 输出
 
 ```
-🚀 Codex Usage Analyzer
+🚀 Vibe Coding Tracker
 
 ╔════════════════╦═════════╗
 ║ 版本           ║ 0.1.0   ║
@@ -344,7 +351,7 @@ codex_usage version --text
 ### 工作原理
 
 1. **自动更新**：每天从 [LiteLLM](https://github.com/BerriAI/litellm) 获取定价
-2. **智能缓存**：在 `~/.codex-usage/` 中存储定价 24 小时
+2. **智能缓存**：在 `~/.vibe-coding-tracker/` 中存储定价 24 小时
 3. **模糊匹配**：即使对于自定义模型名称也能找到最佳匹配
 4. **始终准确**：确保您获得最新的定价
 
@@ -372,13 +379,13 @@ codex_usage version --text
 
 ```bash
 # 构建镜像
-docker build -f docker/Dockerfile --target prod -t codex_usage:latest .
+docker build -f docker/Dockerfile --target prod -t vibe_coding_tracker:latest .
 
 # 使用您的会话运行
 docker run --rm \
   -v ~/.claude:/root/.claude \
   -v ~/.codex:/root/.codex \
-  codex_usage:latest usage
+  vibe_coding_tracker:latest usage
 ```
 
 ---
@@ -389,14 +396,14 @@ docker run --rm \
 
 ```bash
 # 检查缓存
-ls -la ~/.codex-usage/
+ls -la ~/.vibe-coding-tracker/
 
 # 强制刷新
-rm -rf ~/.codex-usage/
-codex_usage usage
+rm -rf ~/.vibe-coding-tracker/
+vct usage
 
 # 调试模式
-RUST_LOG=debug codex_usage usage
+RUST_LOG=debug vct usage
 ```
 
 ### 没有显示使用数据
@@ -421,7 +428,7 @@ jq empty < your-file.jsonl
 ls -la your-file.jsonl
 
 # 使用调试输出运行
-RUST_LOG=debug codex_usage analysis --path your-file.jsonl
+RUST_LOG=debug vct analysis --path your-file.jsonl
 ```
 
 ### 交互式模式问题
@@ -434,7 +441,7 @@ reset
 echo $TERM  # 应该是 xterm-256color 或兼容
 
 # 使用静态表格作为后备
-codex_usage usage --table
+vct usage --table
 ```
 
 ---
@@ -457,8 +464,8 @@ codex_usage usage --table
 ## 📚 了解更多
 
 - **开发者文档**：参见 [.github/copilot-instructions.md](.github/copilot-instructions.md)
-- **报告问题**：[GitHub Issues](https://github.com/Mai0313/codex_usage/issues)
-- **源代码**：[GitHub 仓库](https://github.com/Mai0313/codex_usage)
+- **报告问题**：[GitHub Issues](https://github.com/Mai0313/vibe_coding_tracker/issues)
+- **源代码**：[GitHub 仓库](https://github.com/Mai0313/vibe_coding_tracker)
 
 ---
 
@@ -493,7 +500,7 @@ MIT 许可证 - 详见 [LICENSE](LICENSE)。
 
 **省钱。追踪使用量。更智能地编程。**
 
-如果您觉得有用，请[⭐ Star 这个项目](https://github.com/Mai0313/codex_usage)！
+如果您觉得有用，请[⭐ Star 这个项目](https://github.com/Mai0313/vibe_coding_tracker)！
 
 使用 🦀 Rust 制作
 

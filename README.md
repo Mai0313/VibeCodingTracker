@@ -1,22 +1,22 @@
 <center>
 
-# CodexUsage — AI Coding Assistant Usage Tracker
+# VibeCodingTracker — AI Coding Assistant Usage Tracker
 
 [![rust](https://img.shields.io/badge/Rust-stable-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![tests](https://github.com/Mai0313/codex_usage/actions/workflows/test.yml/badge.svg)](https://github.com/Mai0313/codex_usage/actions/workflows/test.yml)
-[![code-quality](https://github.com/Mai0313/codex_usage/actions/workflows/code-quality-check.yml/badge.svg)](https://github.com/Mai0313/codex_usage/actions/workflows/code-quality-check.yml)
-[![license](https://img.shields.io/badge/License-MIT-green.svg?labelColor=gray)](https://github.com/Mai0313/codex_usage/tree/master?tab=License-1-ov-file)
-[![PRs](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/Mai0313/codex_usage/pulls)
+[![tests](https://github.com/Mai0313/VibeCodingTracker/actions/workflows/test.yml/badge.svg)](https://github.com/Mai0313/VibeCodingTracker/actions/workflows/test.yml)
+[![code-quality](https://github.com/Mai0313/VibeCodingTracker/actions/workflows/code-quality-check.yml/badge.svg)](https://github.com/Mai0313/VibeCodingTracker/actions/workflows/code-quality-check.yml)
+[![license](https://img.shields.io/badge/License-MIT-green.svg?labelColor=gray)](https://github.com/Mai0313/VibeCodingTracker/tree/master?tab=License-1-ov-file)
+[![PRs](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/Mai0313/VibeCodingTracker/pulls)
 
 </center>
 
-**Track your AI coding costs in real-time.** CodexUsage is a powerful CLI tool that helps you monitor and analyze your Claude Code and Codex usage, providing detailed cost breakdowns, token statistics, and code operation insights.
+**Track your AI coding costs in real-time.** VibeCodingTracker is a powerful CLI tool that helps you monitor and analyze your Claude Code and Codex usage, providing detailed cost breakdowns, token statistics, and code operation insights.
 
 [English](README.md) | [繁體中文](README.zh-TW.md) | [简体中文](README.zh-CN.md)
 
 ---
 
-## 🎯 Why CodexUsage?
+## 🎯 Why VibeCodingTracker?
 
 ### 💰 Know Your Costs
 Stop wondering how much your AI coding sessions cost. Get **real-time cost tracking** with automatic pricing updates from [LiteLLM](https://github.com/BerriAI/litellm).
@@ -62,22 +62,29 @@ Automatically detects and processes logs from both Claude Code and Codex. No set
 
 ```bash
 # Clone and build
-git clone https://github.com/Mai0313/codex_usage.git
-cd CodexUsage
+git clone https://github.com/Mai0313/VibeCodingTracker.git
+cd VibeCodingTracker
 cargo build --release
 
-# Binary location: ./target/release/codex_usage
+# Binary locations:
+# - ./target/release/vibe_coding_tracker (full name)
+# - ./target/release/vct (short alias)
 ```
 
 ### First Run
 
 ```bash
-# View your usage with interactive dashboard
-./target/release/codex_usage usage
+# View your usage with interactive dashboard (using short alias)
+./target/release/vct usage
 
-# Or analyze a specific conversation
-./target/release/codex_usage analysis --path ~/.claude/projects/session.jsonl
+# Or use the full name
+./target/release/vct usage
+
+# Analyze a specific conversation
+./target/release/vct analysis --path ~/.claude/projects/session.jsonl
 ```
+
+> 💡 **Tip**: Use `vct` as a short alias for `vibe_coding_tracker` to save typing!
 
 ---
 
@@ -86,7 +93,7 @@ cargo build --release
 ### 🔍 Quick Reference
 
 ```bash
-codex_usage <COMMAND> [OPTIONS]
+vct <COMMAND> [OPTIONS]
 
 Commands:
   usage       Show token usage and costs (default: interactive)
@@ -105,16 +112,16 @@ Commands:
 
 ```bash
 # Interactive dashboard (recommended)
-codex_usage usage
+vct usage
 
 # Static table for reports
-codex_usage usage --table
+vct usage --table
 
 # Plain text for scripts
-codex_usage usage --text
+vct usage --text
 
 # JSON for data processing
-codex_usage usage --json
+vct usage --json
 ```
 
 ### What You Get
@@ -161,7 +168,7 @@ Press 'q', 'Esc', or 'Ctrl+C' to quit
 **Perfect for documentation and reports**
 
 ```bash
-codex_usage usage --table
+vct usage --table
 ```
 
 ```
@@ -182,7 +189,7 @@ codex_usage usage --table
 **Ideal for scripting and parsing**
 
 ```bash
-codex_usage usage --text
+vct usage --text
 ```
 
 ```
@@ -197,7 +204,7 @@ codex_usage usage --text
 **Full precision for accounting and integration**
 
 ```bash
-codex_usage usage --json
+vct usage --json
 ```
 
 ```json
@@ -249,10 +256,10 @@ codex_usage usage --json
 
 ```bash
 # Analyze and display
-codex_usage analysis --path ~/.claude/projects/session.jsonl
+vct analysis --path ~/.claude/projects/session.jsonl
 
 # Save to file
-codex_usage analysis --path ~/.claude/projects/session.jsonl --output report.json
+vct analysis --path ~/.claude/projects/session.jsonl --output report.json
 ```
 
 ### What You Get
@@ -314,19 +321,19 @@ Detailed JSON report including:
 
 ```bash
 # Formatted output
-codex_usage version
+vct version
 
 # JSON format
-codex_usage version --json
+vct version --json
 
 # Plain text
-codex_usage version --text
+vct version --text
 ```
 
 ### Output
 
 ```
-🚀 Codex Usage Analyzer
+🚀 Vibe Coding Tracker
 
 ╔════════════════╦═════════╗
 ║ Version        ║ 0.1.0   ║
@@ -344,7 +351,7 @@ codex_usage version --text
 ### How It Works
 
 1. **Automatic Updates**: Fetches pricing from [LiteLLM](https://github.com/BerriAI/litellm) daily
-2. **Smart Caching**: Stores pricing in `~/.codex-usage/` for 24 hours
+2. **Smart Caching**: Stores pricing in `~/.vibe-coding-tracker/` for 24 hours
 3. **Fuzzy Matching**: Finds best match even for custom model names
 4. **Always Accurate**: Ensures you get the latest pricing
 
@@ -372,13 +379,13 @@ Total Cost = (Input Tokens × Input Cost) +
 
 ```bash
 # Build image
-docker build -f docker/Dockerfile --target prod -t codex_usage:latest .
+docker build -f docker/Dockerfile --target prod -t vct:latest .
 
 # Run with your sessions
 docker run --rm \
   -v ~/.claude:/root/.claude \
   -v ~/.codex:/root/.codex \
-  codex_usage:latest usage
+  vct:latest usage
 ```
 
 ---
@@ -389,14 +396,14 @@ docker run --rm \
 
 ```bash
 # Check cache
-ls -la ~/.codex-usage/
+ls -la ~/.vibe-coding-tracker/
 
 # Force refresh
-rm -rf ~/.codex-usage/
-codex_usage usage
+rm -rf ~/.vibe-coding-tracker/
+vct usage
 
 # Debug mode
-RUST_LOG=debug codex_usage usage
+RUST_LOG=debug vct usage
 ```
 
 ### No Usage Data Shown
@@ -421,7 +428,7 @@ jq empty < your-file.jsonl
 ls -la your-file.jsonl
 
 # Run with debug output
-RUST_LOG=debug codex_usage analysis --path your-file.jsonl
+RUST_LOG=debug vct analysis --path your-file.jsonl
 ```
 
 ### Interactive Mode Issues
@@ -434,7 +441,7 @@ reset
 echo $TERM  # Should be xterm-256color or compatible
 
 # Use static table as fallback
-codex_usage usage --table
+vct usage --table
 ```
 
 ---
@@ -457,8 +464,8 @@ Built with Rust for **speed** and **reliability**:
 ## 📚 Learn More
 
 - **Developer Docs**: See [.github/copilot-instructions.md](.github/copilot-instructions.md)
-- **Report Issues**: [GitHub Issues](https://github.com/Mai0313/codex_usage/issues)
-- **Source Code**: [GitHub Repository](https://github.com/Mai0313/codex_usage)
+- **Report Issues**: [GitHub Issues](https://github.com/Mai0313/VibeCodingTracker/issues)
+- **Source Code**: [GitHub Repository](https://github.com/Mai0313/VibeCodingTracker)
 
 ---
 
@@ -493,7 +500,7 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 **Save money. Track usage. Code smarter.**
 
-[⭐ Star this project](https://github.com/Mai0313/codex_usage) if you find it useful!
+[⭐ Star this project](https://github.com/Mai0313/VibeCodingTracker) if you find it useful!
 
 Made with 🦀 Rust
 

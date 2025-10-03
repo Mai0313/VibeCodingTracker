@@ -1,13 +1,21 @@
 [package]
-name = "codex_usage"
+name = "vibe_coding_tracker"
 version = "0.1.0"
 edition = "2021"
 authors = ["Wei Lee <mai@mai0313.com>"]
-description = "Codex and Claude Code telemetry/usage parser, aggregate JSONL events into CodeAnalysis results"
+description = "Vibe Coding Tracker - AI coding assistant telemetry/usage parser, aggregate JSONL events into CodeAnalysis results"
 license = "MIT"
 readme = "README.md"
-homepage = "https://github.com/Mai0313/codex_usage"
-repository = "https://github.com/Mai0313/codex_usage"
+homepage = "https://github.com/Mai0313/VibeCodingTracker"
+repository = "https://github.com/Mai0313/VibeCodingTracker"
+
+[[bin]]
+name = "vibe_coding_tracker"
+path = "src/main.rs"
+
+[[bin]]
+name = "vct"
+path = "src/main.rs"
 
 [dependencies]
 # CLI

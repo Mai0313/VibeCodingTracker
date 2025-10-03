@@ -1,4 +1,4 @@
-# Release workflow for codex-rs.
+# Release workflow for vibe-coding-tracker.
 # To release, follow a workflow like:
 # ```
 # git tag -a rust-v0.1.0 -m "Release 0.1.0"

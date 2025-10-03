@@ -1,8 +1,8 @@
 use anyhow::Result;
-use codex_usage::cli::{Cli, Commands};
-use codex_usage::pricing::{calculate_cost, fetch_model_pricing, get_model_pricing};
-use codex_usage::usage::{display_usage_interactive, display_usage_table, display_usage_text, get_usage_from_directories};
-use codex_usage::{analyze_jsonl_file, get_version_info};
+use vibe_coding_tracker::cli::{Cli, Commands};
+use vibe_coding_tracker::pricing::{calculate_cost, fetch_model_pricing, get_model_pricing};
+use vibe_coding_tracker::usage::{display_usage_interactive, display_usage_table, display_usage_text, get_usage_from_directories};
+use vibe_coding_tracker::{analyze_jsonl_file, get_version_info};
 use comfy_table::{presets::UTF8_FULL, Cell, CellAlignment, Color, ContentArrangement, Table};
 use owo_colors::OwoColorize;
 use serde_json::json;
@@ -20,7 +20,7 @@ fn main() -> Result<()> {
 
             // Save to output file if specified
             if let Some(output_path) = output {
-                codex_usage::utils::save_json_pretty(&output_path, &result)?;
+                vibe_coding_tracker::utils::save_json_pretty(&output_path, &result)?;
                 println!("✅ Analysis result saved to: {}", output_path.display());
             } else {
                 // Print to stdout if no output file specified
@@ -162,7 +162,7 @@ fn main() -> Result<()> {
                 println!("Cargo Version: {}", version_info.cargo_version);
             } else {
                 // Default pretty format with table
-                println!("{}", "🚀 Codex Usage Analyzer".bright_cyan().bold());
+                println!("{}", "🚀 Vibe Coding Tracker".bright_cyan().bold());
                 println!();
 
                 let mut table = Table::new();

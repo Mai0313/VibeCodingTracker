@@ -1,9 +1,9 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-/// Codex and Claude Code usage analyzer
+/// Vibe Coding Tracker - AI coding assistant usage analyzer
 #[derive(Parser, Debug)]
-#[command(name = "codex_usage")]
+#[command(name = "vibe_coding_tracker")]
 #[command(author, version, about, long_about = None)]
 pub struct Cli {
     #[command(subcommand)]

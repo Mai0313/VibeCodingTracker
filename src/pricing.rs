@@ -46,7 +46,7 @@ impl Default for ModelPricing {
 fn get_cache_dir() -> Result<PathBuf> {
     let home_dir = home::home_dir()
         .ok_or_else(|| anyhow::anyhow!("Unable to resolve user home directory"))?;
-    let cache_dir = home_dir.join(".codex-usage");
+    let cache_dir = home_dir.join(".vibe-coding-tracker");
 
     // Create directory if it doesn't exist
     if !cache_dir.exists() {

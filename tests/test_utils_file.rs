@@ -1,6 +1,6 @@
 // Tests for utils::file module
 
-use codex_usage::utils::file::{count_lines, read_jsonl, save_json_pretty};
+use vibe_coding_tracker::utils::file::{count_lines, read_jsonl, save_json_pretty};
 use serde_json::json;
 use std::fs;
 use std::io::Write;

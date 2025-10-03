@@ -1,6 +1,6 @@
 // Integration tests for analysis functionality
 
-use codex_usage::analysis::analyzer::analyze_jsonl_file;
+use vibe_coding_tracker::analysis::analyzer::analyze_jsonl_file;
 use std::path::PathBuf;
 
 #[test]

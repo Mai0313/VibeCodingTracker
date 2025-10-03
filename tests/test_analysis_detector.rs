@@ -1,7 +1,7 @@
 // Tests for analysis::detector module
 
-use codex_usage::analysis::detector::detect_extension_type;
-use codex_usage::models::ExtensionType;
+use vibe_coding_tracker::analysis::detector::detect_extension_type;
+use vibe_coding_tracker::models::ExtensionType;
 use serde_json::json;
 
 #[test]

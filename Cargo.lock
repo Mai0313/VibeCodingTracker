@@ -234,32 +234,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b94f61472cee1439c0b966b47e3aca9ae07e45d070759512cd390ea2bebc6675"
 
 [[package]]
-name = "codex_usage"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "comfy-table",
- "crossterm 0.28.1",
- "env_logger",
- "home",
- "hostname",
- "log",
- "owo-colors",
- "ratatui",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "strsim",
- "sysinfo",
- "tempfile",
- "thiserror",
- "walkdir",
-]
-
-[[package]]
 name = "colorchoice"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2042,6 +2016,32 @@ name = "vcpkg"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
+
+[[package]]
+name = "vibe_coding_tracker"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "comfy-table",
+ "crossterm 0.28.1",
+ "env_logger",
+ "home",
+ "hostname",
+ "log",
+ "owo-colors",
+ "ratatui",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "strsim",
+ "sysinfo",
+ "tempfile",
+ "thiserror",
+ "walkdir",
+]
 
 [[package]]
 name = "walkdir"

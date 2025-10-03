@@ -1,6 +1,6 @@
 // Tests for utils::paths module
 
-use codex_usage::utils::paths::{get_current_user, get_machine_id, resolve_paths};
+use vibe_coding_tracker::utils::paths::{get_current_user, get_machine_id, resolve_paths};
 
 #[test]
 fn test_resolve_paths() {
