@@ -1,4 +1,6 @@
 use crate::models::DateUsageResult;
+use comfy_table::{presets::UTF8_FULL, Cell, CellAlignment, Color, Table};
+use owo_colors::OwoColorize;
 use serde_json::Value;
 
 /// Display usage data as a table
@@ -7,6 +9,9 @@ pub fn display_usage_table(usage_data: &DateUsageResult) {
         println!("⚠️  No usage data found in Claude Code or Codex sessions");
         return;
     }
+
+    println!("{}", "📊 Token Usage Statistics".bright_cyan().bold());
+    println!();
 
     // Collect and sort dates
     let mut dates: Vec<&String> = usage_data.keys().collect();
@@ -39,16 +44,85 @@ pub fn display_usage_table(usage_data: &DateUsageResult) {
         }
     }
 
-    // Print table
-    print_table_header();
-    print_table_separator();
+    // Create table
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL).set_header(vec![
+        Cell::new("Date")
+            .fg(Color::Yellow)
+            .set_alignment(CellAlignment::Left),
+        Cell::new("Model")
+            .fg(Color::Yellow)
+            .set_alignment(CellAlignment::Left),
+        Cell::new("Input Tokens")
+            .fg(Color::Yellow)
+            .set_alignment(CellAlignment::Right),
+        Cell::new("Output Tokens")
+            .fg(Color::Yellow)
+            .set_alignment(CellAlignment::Right),
+        Cell::new("Cache Read")
+            .fg(Color::Yellow)
+            .set_alignment(CellAlignment::Right),
+        Cell::new("Cache Creation")
+            .fg(Color::Yellow)
+            .set_alignment(CellAlignment::Right),
+        Cell::new("Total")
+            .fg(Color::Yellow)
+            .set_alignment(CellAlignment::Right),
+    ]);
 
+    // Add data rows
     for row in rows {
-        print_table_row(&row);
+        table.add_row(vec![
+            Cell::new(&row.date)
+                .fg(Color::Cyan)
+                .set_alignment(CellAlignment::Left),
+            Cell::new(&row.model)
+                .fg(Color::Green)
+                .set_alignment(CellAlignment::Left),
+            Cell::new(format_number(row.input_tokens))
+                .fg(Color::White)
+                .set_alignment(CellAlignment::Right),
+            Cell::new(format_number(row.output_tokens))
+                .fg(Color::White)
+                .set_alignment(CellAlignment::Right),
+            Cell::new(format_number(row.cache_read))
+                .fg(Color::White)
+                .set_alignment(CellAlignment::Right),
+            Cell::new(format_number(row.cache_creation))
+                .fg(Color::White)
+                .set_alignment(CellAlignment::Right),
+            Cell::new(format_number(row.total))
+                .fg(Color::Magenta)
+                .set_alignment(CellAlignment::Right),
+        ]);
     }
 
-    print_table_separator();
-    print_table_totals(&totals);
+    // Add totals row
+    table.add_row(vec![
+        Cell::new("")
+            .fg(Color::White)
+            .set_alignment(CellAlignment::Left),
+        Cell::new("TOTAL")
+            .fg(Color::Red)
+            .set_alignment(CellAlignment::Left),
+        Cell::new(format_number(totals.input_tokens))
+            .fg(Color::Red)
+            .set_alignment(CellAlignment::Right),
+        Cell::new(format_number(totals.output_tokens))
+            .fg(Color::Red)
+            .set_alignment(CellAlignment::Right),
+        Cell::new(format_number(totals.cache_read))
+            .fg(Color::Red)
+            .set_alignment(CellAlignment::Right),
+        Cell::new(format_number(totals.cache_creation))
+            .fg(Color::Red)
+            .set_alignment(CellAlignment::Right),
+        Cell::new(format_number(totals.total))
+            .fg(Color::Red)
+            .set_alignment(CellAlignment::Right),
+    ]);
+
+    println!("{table}");
     println!();
 }
 
@@ -122,43 +196,6 @@ fn extract_usage_row(date: &str, model: &str, usage: &Value) -> UsageRow {
     }
 
     row
-}
-
-fn print_table_header() {
-    println!(
-        "{:<12} {:<40} {:>15} {:>15} {:>15} {:>15} {:>15}",
-        "Date", "Model", "Input Tokens", "Output Tokens", "Cache Read", "Cache Creation", "Total"
-    );
-}
-
-fn print_table_separator() {
-    println!("{}", "━".repeat(152));
-}
-
-fn print_table_row(row: &UsageRow) {
-    println!(
-        "{:<12} {:<40} {:>15} {:>15} {:>15} {:>15} {:>15}",
-        row.date,
-        row.model,
-        format_number(row.input_tokens),
-        format_number(row.output_tokens),
-        format_number(row.cache_read),
-        format_number(row.cache_creation),
-        format_number(row.total),
-    );
-}
-
-fn print_table_totals(totals: &UsageRow) {
-    println!(
-        "{:<12} {:<40} {:>15} {:>15} {:>15} {:>15} {:>15}",
-        "",
-        "TOTAL",
-        format_number(totals.input_tokens),
-        format_number(totals.output_tokens),
-        format_number(totals.cache_read),
-        format_number(totals.cache_creation),
-        format_number(totals.total),
-    );
 }
 
 fn format_number(n: i64) -> String {

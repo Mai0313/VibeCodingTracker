@@ -2,6 +2,8 @@ use anyhow::Result;
 use codex_usage::cli::{Cli, Commands};
 use codex_usage::usage::{display_usage_table, get_usage_from_directories};
 use codex_usage::{analyze_jsonl_file, get_version_info};
+use comfy_table::{presets::UTF8_FULL, Cell, CellAlignment, Color, ContentArrangement, Table};
+use owo_colors::OwoColorize;
 
 fn main() -> Result<()> {
     env_logger::init();
@@ -54,16 +56,48 @@ fn main() -> Result<()> {
                 println!("Rust Version: {}", version_info.rust_version);
                 println!("Cargo Version: {}", version_info.cargo_version);
             } else {
-                // Default pretty format with ASCII box
-                println!("🚀 Coding CLI Helper");
+                // Default pretty format with table
+                println!("{}", "🚀 Codex Usage Analyzer".bright_cyan().bold());
                 println!();
-                println!("╭────────────────────────────────────╮");
-                println!("│                                    │");
-                println!("│  Version:    {:<21} │", version_info.version);
-                println!("│  Rust Version: {:<18} │", version_info.rust_version);
-                println!("│  Cargo Version: {:<17} │", version_info.cargo_version);
-                println!("│                                    │");
-                println!("╰────────────────────────────────────╯");
+
+                let mut table = Table::new();
+                table
+                    .load_preset(UTF8_FULL)
+                    .set_content_arrangement(ContentArrangement::Dynamic)
+                    .set_header(vec![
+                        Cell::new("Property")
+                            .fg(Color::Yellow)
+                            .set_alignment(CellAlignment::Left),
+                        Cell::new("Value")
+                            .fg(Color::Yellow)
+                            .set_alignment(CellAlignment::Left),
+                    ])
+                    .add_row(vec![
+                        Cell::new("Version")
+                            .fg(Color::Green)
+                            .set_alignment(CellAlignment::Left),
+                        Cell::new(&version_info.version)
+                            .fg(Color::White)
+                            .set_alignment(CellAlignment::Left),
+                    ])
+                    .add_row(vec![
+                        Cell::new("Rust Version")
+                            .fg(Color::Green)
+                            .set_alignment(CellAlignment::Left),
+                        Cell::new(&version_info.rust_version)
+                            .fg(Color::White)
+                            .set_alignment(CellAlignment::Left),
+                    ])
+                    .add_row(vec![
+                        Cell::new("Cargo Version")
+                            .fg(Color::Green)
+                            .set_alignment(CellAlignment::Left),
+                        Cell::new(&version_info.cargo_version)
+                            .fg(Color::White)
+                            .set_alignment(CellAlignment::Left),
+                    ]);
+
+                println!("{table}");
             }
         }
     }
