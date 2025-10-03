@@ -53,7 +53,7 @@ ratatui = "0.28"
 crossterm = "0.28"
 
 # HTTP client
-reqwest = { version = "0.12", features = ["blocking", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 
 # String similarity
 strsim = "0.11"

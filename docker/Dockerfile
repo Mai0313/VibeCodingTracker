@@ -7,7 +7,7 @@ LABEL maintainer="Wei Lee <mai@mai0313.com>" \
     com.centurylinklabs.watchtower.stop-signal="SIGINT"
 
 # Install musl-dev for linking dependencies
-RUN apk add --no-cache musl-dev pkgconfig openssl-dev openssl-libs-static
+RUN apk add --no-cache musl-dev
 
 WORKDIR /app
 COPY . .
