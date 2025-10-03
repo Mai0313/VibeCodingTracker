@@ -105,3 +105,9 @@
 
 `--text` 功能請幫我將它改成單純的 `Date > model name: cost` 這樣的格式
 另外 table 的 cost 取小數點兩位 四捨五入即可, `--json`, `--text` 則是按照現在的狀態 不要進行四捨五入
+
+## 更新專案名稱
+
+我想把專案名稱改成 Vibe Coding Usage
+但這個改動可能會涉及到很多名稱 例如 `codex-usage`, `codex_usage`, `CodexUsage`, etc...
+repo 連結未來會改為 `https://github.com/Mai0313/VibeCodingUsage`
