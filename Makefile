@@ -32,8 +32,7 @@ test-verbose: ## Run all tests with verbose output
 
 coverage: ## Generate test coverage report (requires cargo-llvm-cov)
 	@cargo install cargo-llvm-cov
-	@cargo llvm-cov --workspace --lcov --output-path lcov.info --quiet
-	@cargo llvm-cov report
+	@cargo llvm-cov --workspace
 
 run: ## Run the application
 	cargo run --release
