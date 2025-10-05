@@ -3,9 +3,9 @@
 目前這些功能已完成並且可以順利運作
 ```bash
 ./target/debug/vibe_coding_tracker analysis --path examples/test_conversation.jsonl
-./target/debug/vibe_coding_tracker analysis --path examples/test_conversation.jsonl --output examples/analysis_claude_code.json
+./target/debug/vibe_coding_tracker analysis --path examples/test_conversation.jsonl --output examples/analysis_result.json
 ./target/debug/vibe_coding_tracker analysis --path examples/test_conversation_oai.jsonl
-./target/debug/vibe_coding_tracker analysis --path examples/test_conversation_oai.jsonl --output examples/analysis_codex.json
+./target/debug/vibe_coding_tracker analysis --path examples/test_conversation_oai.jsonl --output examples/analysis_result_oai.json
 ```
 
 我希望新增一個新功能是 `./target/debug/vibe_coding_tracker analysis`
