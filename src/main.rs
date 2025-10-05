@@ -1,18 +1,23 @@
 use anyhow::Result;
-use vibe_coding_tracker::cli::{Cli, Commands};
-use vibe_coding_tracker::pricing::{calculate_cost, fetch_model_pricing, get_model_pricing, ModelPricing};
-use vibe_coding_tracker::usage::{display_usage_interactive, display_usage_table, display_usage_text, get_usage_from_directories};
-use vibe_coding_tracker::utils::extract_token_counts;
-use vibe_coding_tracker::{analyze_jsonl_file, get_version_info, DateUsageResult};
+use clap::Parser;
 use comfy_table::{presets::UTF8_FULL, Cell, CellAlignment, Color, ContentArrangement, Table};
 use owo_colors::OwoColorize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use vibe_coding_tracker::cli::{Cli, Commands};
+use vibe_coding_tracker::pricing::{
+    calculate_cost, fetch_model_pricing, get_model_pricing, ModelPricing,
+};
+use vibe_coding_tracker::usage::{
+    display_usage_interactive, display_usage_table, display_usage_text, get_usage_from_directories,
+};
+use vibe_coding_tracker::utils::extract_token_counts;
+use vibe_coding_tracker::{analyze_jsonl_file, get_version_info, DateUsageResult};
 
 fn main() -> Result<()> {
     env_logger::init();
 
-    let cli = Cli::parse_args();
+    let cli = Cli::parse();
 
     match cli.command {
         Commands::Analysis { path, output } => {
@@ -42,7 +47,9 @@ fn main() -> Result<()> {
                         println!("✅ Analysis result saved to: {}", output_path.display());
                     } else {
                         // Display interactive table
-                        vibe_coding_tracker::analysis::display_analysis_interactive(&analysis_data)?;
+                        vibe_coding_tracker::analysis::display_analysis_interactive(
+                            &analysis_data,
+                        )?;
                     }
                 }
             }
@@ -51,7 +58,16 @@ fn main() -> Result<()> {
         Commands::Usage { json, text, table } => {
             if json {
                 let usage_data = get_usage_from_directories()?;
-                let pricing_map = fetch_model_pricing().unwrap_or_default();
+                let pricing_map = match fetch_model_pricing() {
+                    Ok(map) => map,
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: Failed to fetch pricing data: {}. Costs will be unavailable.",
+                            e
+                        );
+                        HashMap::new()
+                    }
+                };
                 let enriched_data = build_enriched_json(&usage_data, &pricing_map)?;
                 let json_str = serde_json::to_string_pretty(&enriched_data)?;
                 println!("{}", json_str);

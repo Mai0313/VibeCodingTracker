@@ -1,8 +1,10 @@
 // Integration tests for usage statistics functionality
 
-use vibe_coding_tracker::usage::calculator::{calculate_usage_from_jsonl, get_usage_from_directories};
-use vibe_coding_tracker::utils::paths::resolve_paths;
 use std::path::PathBuf;
+use vibe_coding_tracker::usage::calculator::{
+    calculate_usage_from_jsonl, get_usage_from_directories,
+};
+use vibe_coding_tracker::utils::paths::resolve_paths;
 
 #[test]
 fn test_calculate_usage_from_jsonl_claude() {

@@ -60,9 +60,3 @@ pub enum Commands {
         force: bool,
     },
 }
-
-impl Cli {
-    pub fn parse_args() -> Self {
-        Self::parse()
-    }
-}

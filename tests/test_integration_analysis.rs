@@ -1,7 +1,7 @@
 // Integration tests for analysis functionality
 
-use vibe_coding_tracker::analysis::analyzer::analyze_jsonl_file;
 use std::path::PathBuf;
+use vibe_coding_tracker::analysis::analyzer::analyze_jsonl_file;
 
 #[test]
 fn test_analyze_claude_code_conversation() {

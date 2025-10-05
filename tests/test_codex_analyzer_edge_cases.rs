@@ -44,8 +44,7 @@ fn test_codex_analyzer_with_session_meta() {
         "Should extract task ID"
     );
     assert_eq!(
-        analysis.records[0].git_remote_url,
-        "https://github.com/user/repo.git",
+        analysis.records[0].git_remote_url, "https://github.com/user/repo.git",
         "Should extract git remote URL"
     );
 }
@@ -440,19 +439,17 @@ fn test_codex_analyzer_empty_cat_output() {
 
 #[test]
 fn test_codex_analyzer_unknown_shell_function() {
-    let logs = vec![
-        CodexLog {
-            timestamp: "2025-10-05T10:00:00.000Z".to_string(),
-            log_type: "response_item".to_string(),
-            payload: serde_json::from_value(json!({
-                "type": "function_call",
-                "name": "unknown_function",
-                "call_id": "call-123",
-                "arguments": "{}"
-            }))
-            .unwrap(),
-        },
-    ];
+    let logs = vec![CodexLog {
+        timestamp: "2025-10-05T10:00:00.000Z".to_string(),
+        log_type: "response_item".to_string(),
+        payload: serde_json::from_value(json!({
+            "type": "function_call",
+            "name": "unknown_function",
+            "call_id": "call-123",
+            "arguments": "{}"
+        }))
+        .unwrap(),
+    }];
 
     let result = analyze_codex_conversations(&logs);
     assert!(result.is_ok());

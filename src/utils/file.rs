@@ -37,8 +37,12 @@ pub fn read_json<P: AsRef<Path>>(path: P) -> Result<Vec<Value>> {
     file.read_to_string(&mut contents)
         .with_context(|| format!("Failed to read file: {}", path.as_ref().display()))?;
 
-    let obj: Value = serde_json::from_str(&contents)
-        .with_context(|| format!("Failed to parse JSON from file: {}", path.as_ref().display()))?;
+    let obj: Value = serde_json::from_str(&contents).with_context(|| {
+        format!(
+            "Failed to parse JSON from file: {}",
+            path.as_ref().display()
+        )
+    })?;
 
     Ok(vec![obj])
 }

@@ -1,10 +1,10 @@
 // Tests for utils::git module
 
-use vibe_coding_tracker::utils::git::get_git_remote_url;
 use std::fs;
 use std::io::Write;
 use std::process::Command;
 use tempfile::TempDir;
+use vibe_coding_tracker::utils::git::get_git_remote_url;
 
 #[test]
 fn test_get_git_remote_url_with_git_repo() {

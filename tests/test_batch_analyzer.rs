@@ -64,11 +64,26 @@ fn test_aggregated_analysis_row_serialization() {
 
     // Test serialization
     let json = serde_json::to_string(&row).unwrap();
-    assert!(json.contains("editLines"), "Should use camelCase for edit_lines");
-    assert!(json.contains("readLines"), "Should use camelCase for read_lines");
-    assert!(json.contains("writeLines"), "Should use camelCase for write_lines");
-    assert!(json.contains("bashCount"), "Should use camelCase for bash_count");
-    assert!(json.contains("todoWriteCount"), "Should use camelCase for todo_write_count");
+    assert!(
+        json.contains("editLines"),
+        "Should use camelCase for edit_lines"
+    );
+    assert!(
+        json.contains("readLines"),
+        "Should use camelCase for read_lines"
+    );
+    assert!(
+        json.contains("writeLines"),
+        "Should use camelCase for write_lines"
+    );
+    assert!(
+        json.contains("bashCount"),
+        "Should use camelCase for bash_count"
+    );
+    assert!(
+        json.contains("todoWriteCount"),
+        "Should use camelCase for todo_write_count"
+    );
 
     // Test deserialization
     let deserialized: AggregatedAnalysisRow = serde_json::from_str(&json).unwrap();

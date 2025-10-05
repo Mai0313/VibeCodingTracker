@@ -1,5 +1,5 @@
 use crate::models::*;
-use crate::utils::{count_lines, get_git_remote_url, parse_iso_timestamp};
+use crate::utils::{count_lines, get_git_remote_url, parse_iso_timestamp, process_codex_usage};
 use anyhow::Result;
 use regex::Regex;
 use serde_json::Value;
@@ -124,58 +124,6 @@ pub fn analyze_codex_conversations(logs: &[CodexLog]) -> Result<CodeAnalysis> {
         machine_id: String::new(),
         records: vec![record],
     })
-}
-
-/// Process Codex usage data
-fn process_codex_usage(conversation_usage: &mut HashMap<String, Value>, model: &str, info: &Value) {
-    let info_obj = match info.as_object() {
-        Some(obj) => obj,
-        None => return,
-    };
-
-    let existing = conversation_usage
-        .entry(model.to_string())
-        .or_insert_with(|| {
-            serde_json::json!({
-                "total_token_usage": {},
-                "last_token_usage": {},
-                "model_context_window": null
-            })
-        });
-
-    let existing_obj = existing.as_object_mut().unwrap();
-
-    // Process total_token_usage
-    if let Some(total_usage) = info_obj
-        .get("total_token_usage")
-        .and_then(|v| v.as_object())
-    {
-        let existing_total = existing_obj
-            .entry("total_token_usage".to_string())
-            .or_insert_with(|| serde_json::json!({}));
-
-        if let Some(existing_total_obj) = existing_total.as_object_mut() {
-            for (key, value) in total_usage {
-                if let Some(v) = value.as_i64() {
-                    let current = existing_total_obj
-                        .get(key)
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
-                    existing_total_obj.insert(key.clone(), (current + v).into());
-                }
-            }
-        }
-    }
-
-    // Process last_token_usage
-    if let Some(last_usage) = info_obj.get("last_token_usage") {
-        existing_obj.insert("last_token_usage".to_string(), last_usage.clone());
-    }
-
-    // Handle model_context_window
-    if let Some(context_window) = info_obj.get("model_context_window") {
-        existing_obj.insert("model_context_window".to_string(), context_window.clone());
-    }
 }
 
 struct CodexAnalysisState {
@@ -538,7 +486,9 @@ fn extract_patch_strings(lines: &[String]) -> (String, String) {
             continue;
         }
 
-        let first_char = line.chars().next().unwrap();
+        let Some(first_char) = line.chars().next() else {
+            continue;
+        };
         match first_char {
             '+' => {
                 new_str.push_str(&line[1..]);

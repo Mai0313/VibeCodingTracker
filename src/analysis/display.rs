@@ -1,5 +1,5 @@
 use crate::analysis::AggregatedAnalysisRow;
-use chrono::Local;
+use crate::utils::{format_number, get_current_date};
 use comfy_table::{presets::UTF8_FULL, Cell, CellAlignment, Color, Table};
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
@@ -20,6 +20,9 @@ use std::io;
 use std::time::{Duration, Instant};
 use sysinfo::System;
 
+// Type alias for analysis data snapshot: (edit_lines, read_lines, write_lines, bash_count, edit_count, read_count, todo_write_count, write_count)
+type AnalysisDataSnapshot = (usize, usize, usize, usize, usize, usize, usize, usize);
+
 /// Display analysis data as an interactive table
 pub fn display_analysis_interactive(data: &[AggregatedAnalysisRow]) -> anyhow::Result<()> {
     if data.is_empty() {
@@ -39,28 +42,50 @@ pub fn display_analysis_interactive(data: &[AggregatedAnalysisRow]) -> anyhow::R
 
     // Initialize system for memory monitoring
     let mut sys = System::new_all();
-    let pid = sysinfo::get_current_pid().unwrap();
+    let pid =
+        sysinfo::get_current_pid().expect("Failed to get current process ID for memory monitoring");
 
     // Track last update times
     let mut last_update_times: HashMap<String, Instant> = HashMap::new();
-    let mut previous_data: HashMap<String, (usize, usize, usize, usize, usize, usize, usize, usize)> =
-        HashMap::new();
+    let mut previous_data: HashMap<String, AnalysisDataSnapshot> = HashMap::new();
 
     loop {
         // Update system information
         sys.refresh_processes(sysinfo::ProcessesToUpdate::All, false);
 
-        // Fetch fresh data
+        // Only refresh data if interval has elapsed
+        if last_refresh.elapsed() < refresh_interval {
+            // Handle input without refreshing data
+            if event::poll(Duration::from_millis(100))? {
+                if let Event::Key(key) = event::read()? {
+                    if key.code == KeyCode::Char('q')
+                        || key.code == KeyCode::Esc
+                        || (key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL))
+                    {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+
+        last_refresh = Instant::now();
+
+        // Fetch fresh data with error logging
         let current_data = match crate::analysis::analyze_all_sessions() {
             Ok(data) => data,
-            Err(_) => data.to_vec(),
+            Err(e) => {
+                log::warn!("Failed to analyze sessions: {}", e);
+                data.to_vec()
+            }
         };
 
         // Calculate totals
         let mut totals = AnalysisRow::default();
         let mut rows_data = Vec::new();
 
-        let today = Local::now().format("%Y-%m-%d").to_string();
+        let today = get_current_date();
 
         for row in &current_data {
             let analysis_row = AnalysisRow {
@@ -115,10 +140,10 @@ pub fn display_analysis_interactive(data: &[AggregatedAnalysisRow]) -> anyhow::R
             let chunks = RatatuiLayout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(3),  // Title
-                    Constraint::Min(10),    // Table
-                    Constraint::Length(3),  // Summary
-                    Constraint::Length(2),  // Controls
+                    Constraint::Length(3), // Title
+                    Constraint::Min(10),   // Table
+                    Constraint::Length(3), // Summary
+                    Constraint::Length(2), // Controls
                 ])
                 .split(f.area());
 
@@ -327,11 +352,6 @@ pub fn display_analysis_interactive(data: &[AggregatedAnalysisRow]) -> anyhow::R
                 }
             }
         }
-
-        // Check if we need to refresh
-        if last_refresh.elapsed() >= refresh_interval {
-            last_refresh = Instant::now();
-        }
     }
 
     // Restore terminal
@@ -482,21 +502,4 @@ struct AnalysisRow {
     read_count: usize,
     todo_write_count: usize,
     write_count: usize,
-}
-
-fn format_number(n: usize) -> String {
-    if n == 0 {
-        "0".to_string()
-    } else {
-        let s = n.to_string();
-        let mut result = String::new();
-        let chars: Vec<char> = s.chars().collect();
-        for (i, c) in chars.iter().enumerate() {
-            if i > 0 && (chars.len() - i) % 3 == 0 {
-                result.push(',');
-            }
-            result.push(*c);
-        }
-        result
-    }
 }

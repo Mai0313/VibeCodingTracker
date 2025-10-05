@@ -5,7 +5,6 @@ use std::path::PathBuf;
 #[derive(Debug, Clone)]
 pub struct HelperPaths {
     pub home_dir: PathBuf,
-    pub helper_dir: PathBuf,
     pub codex_dir: PathBuf,
     pub codex_session_dir: PathBuf,
     pub claude_dir: PathBuf,
@@ -19,7 +18,6 @@ pub fn resolve_paths() -> Result<HelperPaths> {
     let home_dir =
         home::home_dir().ok_or_else(|| anyhow::anyhow!("Unable to resolve user home directory"))?;
 
-    let helper_dir = home_dir.join(".cchelper");
     let codex_dir = home_dir.join(".codex");
     let codex_session_dir = codex_dir.join("sessions");
     let claude_dir = home_dir.join(".claude");
@@ -29,7 +27,6 @@ pub fn resolve_paths() -> Result<HelperPaths> {
 
     Ok(HelperPaths {
         home_dir,
-        helper_dir,
         codex_dir,
         codex_session_dir,
         claude_dir,

@@ -1,10 +1,10 @@
 // Tests for utils::file module
 
-use vibe_coding_tracker::utils::file::{count_lines, read_jsonl, save_json_pretty};
 use serde_json::json;
 use std::fs;
 use std::io::Write;
 use tempfile::TempDir;
+use vibe_coding_tracker::utils::file::{count_lines, read_jsonl, save_json_pretty};
 
 #[test]
 fn test_count_lines_empty() {
@@ -154,7 +154,14 @@ fn test_read_jsonl_large_file() {
     // Create a larger JSONL file
     let mut file = fs::File::create(&file_path).unwrap();
     for i in 0..100 {
-        writeln!(file, r#"{{"id":{}, "name":"item{}", "value":{}}}"#, i, i, i * 10).unwrap();
+        writeln!(
+            file,
+            r#"{{"id":{}, "name":"item{}", "value":{}}}"#,
+            i,
+            i,
+            i * 10
+        )
+        .unwrap();
     }
 
     let result = read_jsonl(&file_path);

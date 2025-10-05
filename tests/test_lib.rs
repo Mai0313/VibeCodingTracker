@@ -1,10 +1,13 @@
-use vibe_coding_tracker::{get_version_info, VersionInfo, VERSION, PKG_NAME, PKG_DESCRIPTION};
+use vibe_coding_tracker::{get_version_info, VersionInfo, PKG_DESCRIPTION, PKG_NAME, VERSION};
 
 #[test]
 fn test_version_constants() {
     assert!(!VERSION.is_empty(), "VERSION should not be empty");
     assert!(!PKG_NAME.is_empty(), "PKG_NAME should not be empty");
-    assert!(!PKG_DESCRIPTION.is_empty(), "PKG_DESCRIPTION should not be empty");
+    assert!(
+        !PKG_DESCRIPTION.is_empty(),
+        "PKG_DESCRIPTION should not be empty"
+    );
 
     // Verify package name
     assert_eq!(PKG_NAME, "vibe_coding_tracker");

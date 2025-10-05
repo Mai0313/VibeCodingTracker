@@ -65,7 +65,8 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
         }
 
         // Calculate total if not provided
-        counts.total = counts.input_tokens + counts.output_tokens + counts.cache_read + counts.cache_creation;
+        counts.total =
+            counts.input_tokens + counts.output_tokens + counts.cache_read + counts.cache_creation;
     }
 
     counts

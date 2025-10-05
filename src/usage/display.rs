@@ -1,7 +1,12 @@
 use crate::models::DateUsageResult;
 use crate::pricing::{calculate_cost, fetch_model_pricing, get_model_pricing, ModelPricing};
-use crate::utils::extract_token_counts;
+use crate::utils::{extract_token_counts, format_number, get_current_date};
 use comfy_table::{presets::UTF8_FULL, Cell, CellAlignment, Color, Table};
+use crossterm::{
+    event::{self, Event, KeyCode, KeyModifiers},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
 use owo_colors::OwoColorize;
 use ratatui::{
     backend::CrosstermBackend,
@@ -11,16 +16,10 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Row as RatatuiRow, Table as RatatuiTable},
     Terminal,
 };
-use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io;
 use std::time::{Duration, Instant};
-use chrono::Local;
 use sysinfo::System;
 
 /// Display usage data as an interactive table that refreshes every 5 seconds
@@ -37,7 +36,8 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
 
     // Initialize system for memory monitoring
     let mut sys = System::new_all();
-    let pid = sysinfo::get_current_pid().unwrap();
+    let pid =
+        sysinfo::get_current_pid().expect("Failed to get current process ID for memory monitoring");
 
     // Track last update time for each row (date + model as key)
     let mut last_update_times: HashMap<String, Instant> = HashMap::new();
@@ -46,14 +46,43 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
     loop {
         // Update system information
         sys.refresh_processes(sysinfo::ProcessesToUpdate::All, false);
-        // Get usage data
+
+        // Only refresh data if interval has elapsed
+        if last_refresh.elapsed() < refresh_interval {
+            // Handle input and render with existing data
+            if event::poll(Duration::from_millis(100))? {
+                if let Event::Key(key) = event::read()? {
+                    if key.code == KeyCode::Char('q')
+                        || key.code == KeyCode::Esc
+                        || (key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL))
+                    {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+
+        last_refresh = Instant::now();
+
+        // Get usage data with error logging
         let usage_data = match crate::usage::get_usage_from_directories() {
             Ok(data) => data,
-            Err(_) => HashMap::new(),
+            Err(e) => {
+                log::warn!("Failed to get usage data: {}", e);
+                DateUsageResult::new()
+            }
         };
 
-        // Fetch pricing data
-        let pricing_map = fetch_model_pricing().unwrap_or_default();
+        // Fetch pricing data with error logging
+        let pricing_map = match fetch_model_pricing() {
+            Ok(map) => map,
+            Err(e) => {
+                log::warn!("Failed to fetch pricing: {}", e);
+                HashMap::new()
+            }
+        };
 
         // Collect and sort dates
         let mut dates: Vec<String> = usage_data.keys().cloned().collect();
@@ -74,7 +103,12 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
 
                         // Check if data has changed
                         let row_key = format!("{}:{}", date, model);
-                        let current_data = (row.input_tokens, row.output_tokens, row.cache_read, row.cache_creation);
+                        let current_data = (
+                            row.input_tokens,
+                            row.output_tokens,
+                            row.cache_read,
+                            row.cache_creation,
+                        );
 
                         if let Some(prev_data) = previous_data.get(&row_key) {
                             if prev_data != &current_data {
@@ -104,24 +138,25 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
             let chunks = RatatuiLayout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(3),  // Title
-                    Constraint::Min(10),    // Table
-                    Constraint::Length(3),  // Summary
-                    Constraint::Length(2),  // Controls
+                    Constraint::Length(3), // Title
+                    Constraint::Min(10),   // Table
+                    Constraint::Length(3), // Summary
+                    Constraint::Length(2), // Controls
                 ])
                 .split(f.area());
 
             // Title
-            let title = Paragraph::new(vec![
-                Line::from(vec![
-                    Span::styled("📊 ", Style::default().fg(RatatuiColor::Cyan)),
-                    Span::styled("Token Usage Statistics", Style::default().fg(RatatuiColor::Cyan).bold()),
-                ]),
-            ])
+            let title = Paragraph::new(vec![Line::from(vec![
+                Span::styled("📊 ", Style::default().fg(RatatuiColor::Cyan)),
+                Span::styled(
+                    "Token Usage Statistics",
+                    Style::default().fg(RatatuiColor::Cyan).bold(),
+                ),
+            ])])
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(RatatuiColor::Cyan))
+                    .border_style(Style::default().fg(RatatuiColor::Cyan)),
             )
             .centered();
             f.render_widget(title, chunks[0]);
@@ -138,7 +173,7 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
                 "Cost (USD)",
             ];
 
-            let today = Local::now().format("%Y-%m-%d").to_string();
+            let today = get_current_date();
             let now = Instant::now();
             let highlight_duration = Duration::from_millis(1000);
 
@@ -177,20 +212,24 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
                 .collect();
 
             // Add totals row
-            rows.push(RatatuiRow::new(vec![
-                "".to_string(),
-                "TOTAL".to_string(),
-                format_number(totals.input_tokens),
-                format_number(totals.output_tokens),
-                format_number(totals.cache_read),
-                format_number(totals.cache_creation),
-                format_number(totals.total),
-                format!("${:.2}", totals.cost),
-            ])
-            .style(Style::default()
-                .fg(RatatuiColor::Yellow)
-                .bold()
-                .bg(RatatuiColor::DarkGray)));
+            rows.push(
+                RatatuiRow::new(vec![
+                    "".to_string(),
+                    "TOTAL".to_string(),
+                    format_number(totals.input_tokens),
+                    format_number(totals.output_tokens),
+                    format_number(totals.cache_read),
+                    format_number(totals.cache_creation),
+                    format_number(totals.total),
+                    format!("${:.2}", totals.cost),
+                ])
+                .style(
+                    Style::default()
+                        .fg(RatatuiColor::Yellow)
+                        .bold()
+                        .bg(RatatuiColor::DarkGray),
+                ),
+            );
 
             let widths = [
                 Constraint::Length(12),
@@ -206,59 +245,83 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
             let table = RatatuiTable::new(rows, widths)
                 .header(
                     RatatuiRow::new(header)
-                        .style(Style::default()
-                            .fg(RatatuiColor::Black)
-                            .bg(RatatuiColor::Green)
-                            .bold())
-                        .bottom_margin(1)
+                        .style(
+                            Style::default()
+                                .fg(RatatuiColor::Black)
+                                .bg(RatatuiColor::Green)
+                                .bold(),
+                        )
+                        .bottom_margin(1),
                 )
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(RatatuiColor::Green))
+                        .border_style(Style::default().fg(RatatuiColor::Green)),
                 );
 
             f.render_widget(table, chunks[1]);
 
             // Get memory usage
-            let memory_mb = sys.process(pid).map_or(0.0, |p| p.memory() as f64 / 1024.0 / 1024.0);
+            let memory_mb = sys
+                .process(pid)
+                .map_or(0.0, |p| p.memory() as f64 / 1024.0 / 1024.0);
 
             // Summary
-            let summary = Paragraph::new(vec![
-                Line::from(vec![
-                    Span::styled("💰 Total Cost: ", Style::default().fg(RatatuiColor::Yellow).bold()),
-                    Span::styled(format!("${:.2}", totals.cost), Style::default().fg(RatatuiColor::Green).bold()),
-                    Span::raw("  |  "),
-                    Span::styled("🔢 Total Tokens: ", Style::default().fg(RatatuiColor::Cyan).bold()),
-                    Span::styled(format_number(totals.total), Style::default().fg(RatatuiColor::Magenta).bold()),
-                    Span::raw("  |  "),
-                    Span::styled("📅 Entries: ", Style::default().fg(RatatuiColor::Blue).bold()),
-                    Span::styled(format!("{}", rows_data.len()), Style::default().fg(RatatuiColor::White).bold()),
-                    Span::raw("  |  "),
-                    Span::styled("🧠 Memory: ", Style::default().fg(RatatuiColor::LightRed).bold()),
-                    Span::styled(format!("{:.1} MB", memory_mb), Style::default().fg(RatatuiColor::LightYellow).bold()),
-                ]),
-            ])
+            let summary = Paragraph::new(vec![Line::from(vec![
+                Span::styled(
+                    "💰 Total Cost: ",
+                    Style::default().fg(RatatuiColor::Yellow).bold(),
+                ),
+                Span::styled(
+                    format!("${:.2}", totals.cost),
+                    Style::default().fg(RatatuiColor::Green).bold(),
+                ),
+                Span::raw("  |  "),
+                Span::styled(
+                    "🔢 Total Tokens: ",
+                    Style::default().fg(RatatuiColor::Cyan).bold(),
+                ),
+                Span::styled(
+                    format_number(totals.total),
+                    Style::default().fg(RatatuiColor::Magenta).bold(),
+                ),
+                Span::raw("  |  "),
+                Span::styled(
+                    "📅 Entries: ",
+                    Style::default().fg(RatatuiColor::Blue).bold(),
+                ),
+                Span::styled(
+                    format!("{}", rows_data.len()),
+                    Style::default().fg(RatatuiColor::White).bold(),
+                ),
+                Span::raw("  |  "),
+                Span::styled(
+                    "🧠 Memory: ",
+                    Style::default().fg(RatatuiColor::LightRed).bold(),
+                ),
+                Span::styled(
+                    format!("{:.1} MB", memory_mb),
+                    Style::default().fg(RatatuiColor::LightYellow).bold(),
+                ),
+            ])])
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(RatatuiColor::Yellow))
+                    .border_style(Style::default().fg(RatatuiColor::Yellow)),
             )
             .centered();
             f.render_widget(summary, chunks[2]);
 
             // Controls
-            let controls = Paragraph::new(vec![
-                Line::from(vec![
-                    Span::styled("Press ", Style::default().fg(RatatuiColor::DarkGray)),
-                    Span::styled("'q'", Style::default().fg(RatatuiColor::Red).bold()),
-                    Span::styled(", ", Style::default().fg(RatatuiColor::DarkGray)),
-                    Span::styled("'Esc'", Style::default().fg(RatatuiColor::Red).bold()),
-                    Span::styled(", or ", Style::default().fg(RatatuiColor::DarkGray)),
-                    Span::styled("'Ctrl+C'", Style::default().fg(RatatuiColor::Red).bold()),
-                    Span::styled(" to quit", Style::default().fg(RatatuiColor::DarkGray)),
-                ]),
-            ])
+            let controls = Paragraph::new(vec![Line::from(vec![
+                Span::styled("Press ", Style::default().fg(RatatuiColor::DarkGray)),
+                Span::styled("'q'", Style::default().fg(RatatuiColor::Red).bold()),
+                Span::styled(", ", Style::default().fg(RatatuiColor::DarkGray)),
+                Span::styled("'Esc'", Style::default().fg(RatatuiColor::Red).bold()),
+                Span::styled(", or ", Style::default().fg(RatatuiColor::DarkGray)),
+                Span::styled("'Ctrl+C'", Style::default().fg(RatatuiColor::Red).bold()),
+                Span::styled(" to quit", Style::default().fg(RatatuiColor::DarkGray)),
+            ])])
             .centered();
             f.render_widget(controls, chunks[3]);
         })?;
@@ -268,16 +331,12 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
             if let Event::Key(key) = event::read()? {
                 if key.code == KeyCode::Char('q')
                     || key.code == KeyCode::Esc
-                    || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+                    || (key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL))
                 {
                     break;
                 }
             }
-        }
-
-        // Check if we need to refresh
-        if last_refresh.elapsed() >= refresh_interval {
-            last_refresh = Instant::now();
         }
     }
 
@@ -435,7 +494,7 @@ pub fn display_usage_table(usage_data: &DateUsageResult) {
 #[derive(Default)]
 struct UsageRow {
     date: String,
-    model: String, // Original model name
+    model: String,         // Original model name
     display_model: String, // Model name with matched model in parentheses if fuzzy matched
     input_tokens: i64,
     output_tokens: i64,
@@ -493,10 +552,7 @@ pub fn display_usage_text(usage_data: &DateUsageResult) {
     }
 
     // Fetch pricing data
-    let pricing_map = match fetch_model_pricing() {
-        Ok(map) => map,
-        Err(_) => HashMap::new(),
-    };
+    let pricing_map = fetch_model_pricing().unwrap_or_default();
 
     // Collect and sort dates
     let mut dates: Vec<&String> = usage_data.keys().collect();
@@ -515,22 +571,5 @@ pub fn display_usage_text(usage_data: &DateUsageResult) {
                 }
             }
         }
-    }
-}
-
-fn format_number(n: i64) -> String {
-    if n == 0 {
-        "0".to_string()
-    } else {
-        let s = n.to_string();
-        let mut result = String::new();
-        let chars: Vec<char> = s.chars().collect();
-        for (i, c) in chars.iter().enumerate() {
-            if i > 0 && (chars.len() - i) % 3 == 0 {
-                result.push(',');
-            }
-            result.push(*c);
-        }
-        result
     }
 }

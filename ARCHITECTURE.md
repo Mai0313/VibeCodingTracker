@@ -104,9 +104,7 @@ Defines core data structures with serde serialization:
 
 **claude.rs**
 
-- `ClaudeMessage`: Claude Code message format
-- `ClaudeContent`: Content block types (text, tool_use, tool_result)
-- `ClaudeUsage`: Token usage with cache fields
+- `ClaudeCodeLog`: Claude Code session log format
 
 **codex.rs**
 

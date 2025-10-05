@@ -1,5 +1,5 @@
+use crate::utils::get_current_date;
 use anyhow::{Context, Result};
-use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -12,7 +12,7 @@ const LITELLM_PRICING_URL: &str =
 // Similarity threshold for fuzzy matching (0.0 to 1.0)
 const SIMILARITY_THRESHOLD: f64 = 0.7;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ModelPricing {
     #[serde(default)]
     pub input_cost_per_token: f64,
@@ -44,22 +44,16 @@ impl Default for ModelPricing {
 
 /// Get cache directory path
 fn get_cache_dir() -> Result<PathBuf> {
-    let home_dir = home::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Unable to resolve user home directory"))?;
+    let home_dir =
+        home::home_dir().ok_or_else(|| anyhow::anyhow!("Unable to resolve user home directory"))?;
     let cache_dir = home_dir.join(".vibe-coding-tracker");
 
     // Create directory if it doesn't exist
     if !cache_dir.exists() {
-        fs::create_dir_all(&cache_dir)
-            .context("Failed to create cache directory")?;
+        fs::create_dir_all(&cache_dir).context("Failed to create cache directory")?;
     }
 
     Ok(cache_dir)
-}
-
-/// Get current date string (YYYY-MM-DD)
-fn get_current_date() -> String {
-    Local::now().format("%Y-%m-%d").to_string()
 }
 
 /// Get cache file path for today
@@ -101,12 +95,13 @@ fn cleanup_old_cache() {
         let path = entry.path();
         if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
             // Match pattern: model_pricing_YYYY-MM-DD.json
-            if filename.starts_with("model_pricing_") && filename.ends_with(".json") {
-                if !filename.contains(&today) {
-                    // Delete old cache file
-                    let _ = fs::remove_file(&path);
-                    log::debug!("Removed old cache file: {:?}", path);
-                }
+            if filename.starts_with("model_pricing_")
+                && filename.ends_with(".json")
+                && !filename.contains(&today)
+            {
+                // Delete old cache file
+                let _ = fs::remove_file(&path);
+                log::debug!("Removed old cache file: {:?}", path);
             }
         }
     }
@@ -114,13 +109,12 @@ fn cleanup_old_cache() {
 
 /// Load pricing from cache
 fn load_from_cache() -> Result<HashMap<String, ModelPricing>> {
-    let cache_path = find_today_cache()
-        .ok_or_else(|| anyhow::anyhow!("No cache file found for today"))?;
+    let cache_path =
+        find_today_cache().ok_or_else(|| anyhow::anyhow!("No cache file found for today"))?;
 
-    let content = fs::read_to_string(&cache_path)
-        .context("Failed to read cached pricing file")?;
-    let pricing: HashMap<String, ModelPricing> = serde_json::from_str(&content)
-        .context("Failed to parse cached pricing JSON")?;
+    let content = fs::read_to_string(&cache_path).context("Failed to read cached pricing file")?;
+    let pricing: HashMap<String, ModelPricing> =
+        serde_json::from_str(&content).context("Failed to parse cached pricing JSON")?;
     Ok(pricing)
 }
 
@@ -129,10 +123,9 @@ fn save_to_cache(pricing: &HashMap<String, ModelPricing>) -> Result<()> {
     let cache_path = get_today_cache_path()?;
 
     // Save pricing data with today's date in filename
-    let pricing_json = serde_json::to_string_pretty(pricing)
-        .context("Failed to serialize pricing data")?;
-    fs::write(&cache_path, pricing_json)
-        .context("Failed to write pricing cache file")?;
+    let pricing_json =
+        serde_json::to_string_pretty(pricing).context("Failed to serialize pricing data")?;
+    fs::write(&cache_path, pricing_json).context("Failed to write pricing cache file")?;
 
     // Clean up old cache files
     cleanup_old_cache();
@@ -200,7 +193,7 @@ pub fn get_model_pricing(
     // Try exact match first
     if let Some(pricing) = pricing_map.get(model_name) {
         return ModelPricingResult {
-            pricing: pricing.clone(),
+            pricing: *pricing,
             matched_model: None,
         };
     }
@@ -209,36 +202,43 @@ pub fn get_model_pricing(
     let normalized_name = normalize_model_name(model_name);
     if let Some(pricing) = pricing_map.get(&normalized_name) {
         return ModelPricingResult {
-            pricing: pricing.clone(),
+            pricing: *pricing,
             matched_model: Some(normalized_name),
         };
     }
 
-    // Try to find a partial match (substring)
-    for (key, pricing) in pricing_map {
-        if model_name.contains(key) || key.contains(model_name) {
-            return ModelPricingResult {
-                pricing: pricing.clone(),
-                matched_model: Some(key.clone()),
-            };
+    // Pre-compute lowercase model name for comparisons
+    let model_lower = model_name.to_lowercase();
+
+    // Try to find a partial match (substring) - use lowercase for case-insensitive matching
+    // Build a lowercase cache for the pricing map keys to avoid repeated conversions
+    let key_cache: Vec<(&String, String)> =
+        pricing_map.keys().map(|k| (k, k.to_lowercase())).collect();
+
+    for (key, key_lower) in &key_cache {
+        if model_lower.contains(key_lower) || key_lower.contains(&model_lower) {
+            if let Some(pricing) = pricing_map.get(*key) {
+                return ModelPricingResult {
+                    pricing: *pricing,
+                    matched_model: Some((*key).clone()),
+                };
+            }
         }
     }
 
     // Try fuzzy matching based on string similarity
     let mut best_match: Option<(String, f64)> = None;
-    let model_lower = model_name.to_lowercase();
 
-    for key in pricing_map.keys() {
-        let key_lower = key.to_lowercase();
-        let similarity = jaro_winkler(&model_lower, &key_lower);
+    for (key, key_lower) in &key_cache {
+        let similarity = jaro_winkler(&model_lower, key_lower);
 
         if similarity >= SIMILARITY_THRESHOLD {
             if let Some((_, best_similarity)) = &best_match {
                 if similarity > *best_similarity {
-                    best_match = Some((key.clone(), similarity));
+                    best_match = Some(((*key).clone(), similarity));
                 }
             } else {
-                best_match = Some((key.clone(), similarity));
+                best_match = Some(((*key).clone(), similarity));
             }
         }
     }
@@ -246,7 +246,7 @@ pub fn get_model_pricing(
     if let Some((matched_key, _)) = best_match {
         if let Some(pricing) = pricing_map.get(&matched_key) {
             return ModelPricingResult {
-                pricing: pricing.clone(),
+                pricing: *pricing,
                 matched_model: Some(matched_key),
             };
         }
@@ -295,7 +295,10 @@ mod tests {
             "claude-3-sonnet"
         );
         assert_eq!(normalize_model_name("gpt-4-v1.0"), "gpt-4");
-        assert_eq!(normalize_model_name("bedrock/claude-3-opus"), "claude-3-opus");
+        assert_eq!(
+            normalize_model_name("bedrock/claude-3-opus"),
+            "claude-3-opus"
+        );
     }
 
     #[test]

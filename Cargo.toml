@@ -1,7 +1,8 @@
 [package]
 name = "vibe_coding_tracker"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+rust-version = "1.84"
 authors = ["Wei Lee <mai@mai0313.com>"]
 description = "Vibe Coding Tracker - AI coding assistant telemetry/usage parser, aggregate JSONL events into CodeAnalysis results"
 license = "MIT"
@@ -23,7 +24,6 @@ serde_json = "1.0"
 
 # Error handling
 anyhow = "1.0"
-thiserror = "1.0"
 
 # Time and date
 chrono = { version = "0.4", features = ["serde"] }

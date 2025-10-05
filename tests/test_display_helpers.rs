@@ -2,10 +2,10 @@
 // Note: Full TUI interactive tests are difficult to test in CI
 // These tests focus on testable components
 
-use vibe_coding_tracker::analysis::AggregatedAnalysisRow;
-use vibe_coding_tracker::models::DateUsageResult;
 use serde_json::json;
 use std::collections::HashMap;
+use vibe_coding_tracker::analysis::AggregatedAnalysisRow;
+use vibe_coding_tracker::models::DateUsageResult;
 
 #[test]
 fn test_analysis_display_table_with_data() {

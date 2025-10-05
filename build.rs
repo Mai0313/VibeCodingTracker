@@ -10,6 +10,12 @@ fn main() {
     // Set the version as an environment variable for the build
     println!("cargo:rustc-env=BUILD_VERSION={}", git_version);
 
+    // Get Rust and Cargo versions at build time
+    let rust_version = get_rust_version();
+    let cargo_version = get_cargo_version();
+    println!("cargo:rustc-env=BUILD_RUST_VERSION={}", rust_version);
+    println!("cargo:rustc-env=BUILD_CARGO_VERSION={}", cargo_version);
+
     // Re-run build script if git state changes
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/index");
@@ -35,8 +41,8 @@ fn get_git_version(base_version: &str) -> String {
     let mut version_parts = vec![version];
 
     // Get commit count from latest tag (or from start if no tag)
-    let commit_count = if latest_tag.is_some() {
-        get_commit_count_from_tag(&latest_tag.as_ref().unwrap())
+    let commit_count = if let Some(ref tag) = latest_tag {
+        get_commit_count_from_tag(tag)
     } else {
         get_total_commit_count()
     };
@@ -146,4 +152,32 @@ fn is_working_directory_dirty() -> bool {
             }
         })
         .unwrap_or(false)
+}
+
+fn get_rust_version() -> String {
+    Command::new("rustc")
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|output| {
+            String::from_utf8(output.stdout).ok().and_then(|s| {
+                // Extract version number from "rustc 1.28.2 (xxxxx)"
+                s.split_whitespace().nth(1).map(|v| v.to_string())
+            })
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn get_cargo_version() -> String {
+    Command::new("cargo")
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|output| {
+            String::from_utf8(output.stdout).ok().and_then(|s| {
+                // Extract version number from "cargo 1.89.0 (xxxxx)"
+                s.split_whitespace().nth(1).map(|v| v.to_string())
+            })
+        })
+        .unwrap_or_else(|| "unknown".to_string())
 }

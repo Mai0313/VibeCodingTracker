@@ -1,18 +1,14 @@
 // Tests for analysis::detector module
 
+use serde_json::json;
 use vibe_coding_tracker::analysis::detector::detect_extension_type;
 use vibe_coding_tracker::models::ExtensionType;
-use serde_json::json;
 
 #[test]
 fn test_detect_extension_type_empty_data() {
     let data = vec![];
     let result = detect_extension_type(&data);
-    assert_eq!(
-        result,
-        ExtensionType::Codex,
-        "Empty data should default to Codex"
-    );
+    assert!(result.is_err(), "Empty data should return an error");
 }
 
 #[test]
@@ -31,7 +27,7 @@ fn test_detect_extension_type_claude_code() {
         }),
     ];
 
-    let result = detect_extension_type(&data);
+    let result = detect_extension_type(&data).unwrap();
     assert_eq!(
         result,
         ExtensionType::ClaudeCode,
@@ -54,7 +50,7 @@ fn test_detect_extension_type_codex() {
         }),
     ];
 
-    let result = detect_extension_type(&data);
+    let result = detect_extension_type(&data).unwrap();
     assert_eq!(
         result,
         ExtensionType::Codex,
@@ -76,7 +72,7 @@ fn test_detect_extension_type_mixed_data() {
         }),
     ];
 
-    let result = detect_extension_type(&data);
+    let result = detect_extension_type(&data).unwrap();
     // Should detect as Claude Code because at least one record has parentUuid
     assert_eq!(result, ExtensionType::ClaudeCode);
 }
@@ -89,7 +85,7 @@ fn test_detect_extension_type_single_claude_record() {
         "message": "test"
     })];
 
-    let result = detect_extension_type(&data);
+    let result = detect_extension_type(&data).unwrap();
     assert_eq!(result, ExtensionType::ClaudeCode);
 }
 
@@ -98,6 +94,6 @@ fn test_detect_extension_type_non_object_records() {
     // Test with non-object records (should default to Codex)
     let data = vec![json!("string value"), json!(123), json!([1, 2, 3])];
 
-    let result = detect_extension_type(&data);
+    let result = detect_extension_type(&data).unwrap();
     assert_eq!(result, ExtensionType::Codex);
 }

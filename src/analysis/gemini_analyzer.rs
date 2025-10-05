@@ -1,11 +1,11 @@
 use crate::models::*;
-use crate::utils::{get_git_remote_url, parse_iso_timestamp};
+use crate::utils::{get_git_remote_url, parse_iso_timestamp, process_gemini_usage};
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;
 
 /// Analyze Gemini conversations
-pub fn analyze_gemini_conversations(data: &[Value]) -> Result<CodeAnalysis> {
+pub fn analyze_gemini_conversations(mut data: Vec<Value>) -> Result<CodeAnalysis> {
     if data.is_empty() {
         return Ok(CodeAnalysis {
             user: String::new(),
@@ -17,7 +17,7 @@ pub fn analyze_gemini_conversations(data: &[Value]) -> Result<CodeAnalysis> {
     }
 
     // Parse the Gemini session
-    let session: GeminiSession = serde_json::from_value(data[0].clone())?;
+    let session: GeminiSession = serde_json::from_value(data.remove(0))?;
 
     let mut conversation_usage: HashMap<String, Value> = HashMap::new();
     let mut last_timestamp = 0i64;
@@ -70,88 +70,4 @@ pub fn analyze_gemini_conversations(data: &[Value]) -> Result<CodeAnalysis> {
         machine_id: String::new(),
         records: vec![record],
     })
-}
-
-/// Process Gemini token usage
-fn process_gemini_usage(
-    conversation_usage: &mut HashMap<String, Value>,
-    model: &str,
-    tokens: &GeminiTokens,
-) {
-    // Get or create usage entry
-    let existing = conversation_usage
-        .entry(model.to_string())
-        .or_insert_with(|| {
-            serde_json::json!({
-                "input_tokens": 0,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0,
-                "output_tokens": 0,
-                "thoughts_tokens": 0,
-                "tool_tokens": 0,
-                "total_tokens": 0,
-            })
-        });
-
-    let existing_obj = existing.as_object_mut().unwrap();
-
-    // Add input tokens
-    let current_input = existing_obj
-        .get("input_tokens")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    existing_obj.insert(
-        "input_tokens".to_string(),
-        (current_input + tokens.input).into(),
-    );
-
-    // Add cached tokens as cache_read_input_tokens
-    let current_cached = existing_obj
-        .get("cache_read_input_tokens")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    existing_obj.insert(
-        "cache_read_input_tokens".to_string(),
-        (current_cached + tokens.cached).into(),
-    );
-
-    // Add output tokens
-    let current_output = existing_obj
-        .get("output_tokens")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    existing_obj.insert(
-        "output_tokens".to_string(),
-        (current_output + tokens.output).into(),
-    );
-
-    // Add thoughts tokens (Gemini-specific)
-    let current_thoughts = existing_obj
-        .get("thoughts_tokens")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    existing_obj.insert(
-        "thoughts_tokens".to_string(),
-        (current_thoughts + tokens.thoughts).into(),
-    );
-
-    // Add tool tokens (Gemini-specific)
-    let current_tool = existing_obj
-        .get("tool_tokens")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    existing_obj.insert(
-        "tool_tokens".to_string(),
-        (current_tool + tokens.tool).into(),
-    );
-
-    // Add total tokens
-    let current_total = existing_obj
-        .get("total_tokens")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    existing_obj.insert(
-        "total_tokens".to_string(),
-        (current_total + tokens.total).into(),
-    );
 }

@@ -1,4 +1,6 @@
-use vibe_coding_tracker::update::{extract_semver_version, get_asset_pattern, GitHubAsset, GitHubRelease};
+use vibe_coding_tracker::update::{
+    extract_semver_version, get_asset_pattern, GitHubAsset, GitHubRelease,
+};
 
 #[test]
 fn test_github_release_deserialization() {

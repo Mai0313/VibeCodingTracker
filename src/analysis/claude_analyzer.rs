@@ -1,11 +1,11 @@
 use crate::models::*;
-use crate::utils::{count_lines, get_git_remote_url, parse_iso_timestamp};
+use crate::utils::{count_lines, get_git_remote_url, parse_iso_timestamp, process_claude_usage};
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
 /// Analyze Claude Code conversations
-pub fn analyze_claude_conversations(records: &[Value]) -> Result<CodeAnalysis> {
+pub fn analyze_claude_conversations(records: Vec<Value>) -> Result<CodeAnalysis> {
     let mut write_details = Vec::new();
     let mut read_details = Vec::new();
     let mut edit_details = Vec::new();
@@ -27,7 +27,7 @@ pub fn analyze_claude_conversations(records: &[Value]) -> Result<CodeAnalysis> {
     let mut last_timestamp = 0i64;
 
     for record in records {
-        let log: ClaudeCodeLog = match serde_json::from_value(record.clone()) {
+        let log: ClaudeCodeLog = match serde_json::from_value(record) {
             Ok(log) => log,
             Err(_) => continue,
         };
@@ -57,52 +57,55 @@ pub fn analyze_claude_conversations(records: &[Value]) -> Result<CodeAnalysis> {
                     // Count tool calls
                     if let Some(content_array) = msg_obj.get("content").and_then(|c| c.as_array()) {
                         for item in content_array {
-                            if let Some(item_obj) = item.as_object() {
-                                if let Some(item_type) =
-                                    item_obj.get("type").and_then(|t| t.as_str())
-                                {
-                                    if item_type == "tool_use" {
-                                        if let Some(name) =
-                                            item_obj.get("name").and_then(|n| n.as_str())
-                                        {
-                                            match name {
-                                                "Read" => tool_counts.read += 1,
-                                                "Write" => tool_counts.write += 1,
-                                                "Edit" => tool_counts.edit += 1,
-                                                "TodoWrite" => tool_counts.todo_write += 1,
-                                                "Bash" => {
-                                                    tool_counts.bash += 1;
-                                                    if let Some(input) = item_obj.get("input") {
-                                                        let command = input
-                                                            .get("command")
-                                                            .and_then(|c| c.as_str())
-                                                            .unwrap_or("")
-                                                            .to_string();
-                                                        let description = input
-                                                            .get("description")
-                                                            .and_then(|d| d.as_str())
-                                                            .unwrap_or("")
-                                                            .to_string();
+                            let Some(item_obj) = item.as_object() else {
+                                continue;
+                            };
 
-                                                        run_details.push(
-                                                            CodeAnalysisRunCommandDetail {
-                                                                base: CodeAnalysisDetailBase {
-                                                                    file_path: log.cwd.clone(),
-                                                                    line_count: 0,
-                                                                    character_count: command.len(),
-                                                                    timestamp: ts,
-                                                                },
-                                                                command,
-                                                                description,
-                                                            },
-                                                        );
-                                                    }
-                                                }
-                                                _ => {}
-                                            }
-                                        }
+                            let Some(item_type) = item_obj.get("type").and_then(|t| t.as_str())
+                            else {
+                                continue;
+                            };
+
+                            if item_type != "tool_use" {
+                                continue;
+                            }
+
+                            let Some(name) = item_obj.get("name").and_then(|n| n.as_str()) else {
+                                continue;
+                            };
+
+                            match name {
+                                "Read" => tool_counts.read += 1,
+                                "Write" => tool_counts.write += 1,
+                                "Edit" => tool_counts.edit += 1,
+                                "TodoWrite" => tool_counts.todo_write += 1,
+                                "Bash" => {
+                                    tool_counts.bash += 1;
+                                    if let Some(input) = item_obj.get("input") {
+                                        let command = input
+                                            .get("command")
+                                            .and_then(|c| c.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let description = input
+                                            .get("description")
+                                            .and_then(|d| d.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+
+                                        run_details.push(CodeAnalysisRunCommandDetail {
+                                            base: CodeAnalysisDetailBase {
+                                                file_path: log.cwd.clone(),
+                                                line_count: 0,
+                                                character_count: command.len(),
+                                                timestamp: ts,
+                                            },
+                                            command,
+                                            description,
+                                        });
                                     }
                                 }
+                                _ => {}
                             }
                         }
                     }
@@ -234,104 +237,4 @@ pub fn analyze_claude_conversations(records: &[Value]) -> Result<CodeAnalysis> {
         machine_id: String::new(),
         records: vec![record],
     })
-}
-
-/// Process Claude usage data
-fn process_claude_usage(
-    conversation_usage: &mut HashMap<String, Value>,
-    model: &str,
-    usage: &Value,
-) {
-    let usage_obj = match usage.as_object() {
-        Some(obj) => obj,
-        None => return,
-    };
-
-    // Get or create usage entry
-    let existing = conversation_usage
-        .entry(model.to_string())
-        .or_insert_with(|| {
-            serde_json::json!({
-                "input_tokens": 0,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0,
-                "cache_creation": {},
-                "output_tokens": 0,
-                "service_tier": ""
-            })
-        });
-
-    let existing_obj = existing.as_object_mut().unwrap();
-
-    // Add numeric fields
-    if let Some(input_tokens) = usage_obj.get("input_tokens").and_then(|v| v.as_i64()) {
-        let current = existing_obj
-            .get("input_tokens")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        existing_obj.insert("input_tokens".to_string(), (current + input_tokens).into());
-    }
-
-    if let Some(cache_creation) = usage_obj
-        .get("cache_creation_input_tokens")
-        .and_then(|v| v.as_i64())
-    {
-        let current = existing_obj
-            .get("cache_creation_input_tokens")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        existing_obj.insert(
-            "cache_creation_input_tokens".to_string(),
-            (current + cache_creation).into(),
-        );
-    }
-
-    if let Some(cache_read) = usage_obj
-        .get("cache_read_input_tokens")
-        .and_then(|v| v.as_i64())
-    {
-        let current = existing_obj
-            .get("cache_read_input_tokens")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        existing_obj.insert(
-            "cache_read_input_tokens".to_string(),
-            (current + cache_read).into(),
-        );
-    }
-
-    if let Some(output_tokens) = usage_obj.get("output_tokens").and_then(|v| v.as_i64()) {
-        let current = existing_obj
-            .get("output_tokens")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        existing_obj.insert(
-            "output_tokens".to_string(),
-            (current + output_tokens).into(),
-        );
-    }
-
-    // Handle service_tier
-    if let Some(service_tier) = usage_obj.get("service_tier").and_then(|v| v.as_str()) {
-        existing_obj.insert("service_tier".to_string(), service_tier.into());
-    }
-
-    // Handle cache_creation nested object
-    if let Some(cache_creation) = usage_obj.get("cache_creation").and_then(|v| v.as_object()) {
-        let existing_cache = existing_obj
-            .entry("cache_creation".to_string())
-            .or_insert_with(|| serde_json::json!({}));
-
-        if let Some(existing_cache_obj) = existing_cache.as_object_mut() {
-            for (key, value) in cache_creation {
-                if let Some(v) = value.as_i64() {
-                    let current = existing_cache_obj
-                        .get(key)
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
-                    existing_cache_obj.insert(key.clone(), (current + v).into());
-                }
-            }
-        }
-    }
 }

@@ -1,7 +1,5 @@
 use std::collections::HashMap;
-use vibe_coding_tracker::pricing::{
-    calculate_cost, get_model_pricing, ModelPricing,
-};
+use vibe_coding_tracker::pricing::{calculate_cost, get_model_pricing, ModelPricing};
 
 #[test]
 fn test_model_pricing_default() {
@@ -65,7 +63,10 @@ fn test_get_model_pricing_exact_match() {
 
     let result = get_model_pricing("claude-3-opus", &pricing_map);
     assert_eq!(result.pricing.input_cost_per_token, 0.000015);
-    assert_eq!(result.matched_model, None, "Exact match should not set matched_model");
+    assert_eq!(
+        result.matched_model, None,
+        "Exact match should not set matched_model"
+    );
 }
 
 #[test]
@@ -208,7 +209,10 @@ fn test_model_pricing_serialization() {
     let json = serde_json::to_string(&pricing).unwrap();
     let deserialized: ModelPricing = serde_json::from_str(&json).unwrap();
 
-    assert_eq!(deserialized.input_cost_per_token, pricing.input_cost_per_token);
+    assert_eq!(
+        deserialized.input_cost_per_token,
+        pricing.input_cost_per_token
+    );
     assert_eq!(
         deserialized.output_cost_per_token,
         pricing.output_cost_per_token
@@ -231,7 +235,10 @@ fn test_model_pricing_partial_deserialization() {
 
     assert_eq!(pricing.input_cost_per_token, 0.000003);
     assert_eq!(pricing.output_cost_per_token, 0.0, "Should use default");
-    assert_eq!(pricing.cache_read_input_token_cost, 0.0, "Should use default");
+    assert_eq!(
+        pricing.cache_read_input_token_cost, 0.0,
+        "Should use default"
+    );
     assert_eq!(
         pricing.cache_creation_input_token_cost, 0.0,
         "Should use default"
@@ -246,7 +253,7 @@ mod cache_tests {
     fn test_model_pricing_result_debug() {
         let pricing = ModelPricing::default();
         let result = vibe_coding_tracker::pricing::ModelPricingResult {
-            pricing: pricing.clone(),
+            pricing,
             matched_model: Some("test-model".to_string()),
         };
 
@@ -259,13 +266,16 @@ mod cache_tests {
     fn test_model_pricing_result_clone() {
         let pricing = ModelPricing::default();
         let result = vibe_coding_tracker::pricing::ModelPricingResult {
-            pricing: pricing.clone(),
+            pricing,
             matched_model: Some("test-model".to_string()),
         };
 
         let cloned = result.clone();
         assert_eq!(cloned.matched_model, result.matched_model);
-        assert_eq!(cloned.pricing.input_cost_per_token, result.pricing.input_cost_per_token);
+        assert_eq!(
+            cloned.pricing.input_cost_per_token,
+            result.pricing.input_cost_per_token
+        );
     }
 
     #[test]
@@ -383,11 +393,17 @@ mod cache_tests {
             cache_creation_input_token_cost: 0.00000375,
         };
 
-        let cloned = pricing.clone();
+        let cloned = pricing;
         assert_eq!(cloned.input_cost_per_token, pricing.input_cost_per_token);
         assert_eq!(cloned.output_cost_per_token, pricing.output_cost_per_token);
-        assert_eq!(cloned.cache_read_input_token_cost, pricing.cache_read_input_token_cost);
-        assert_eq!(cloned.cache_creation_input_token_cost, pricing.cache_creation_input_token_cost);
+        assert_eq!(
+            cloned.cache_read_input_token_cost,
+            pricing.cache_read_input_token_cost
+        );
+        assert_eq!(
+            cloned.cache_creation_input_token_cost,
+            pricing.cache_creation_input_token_cost
+        );
     }
 
     #[test]

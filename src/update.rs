@@ -46,8 +46,10 @@ pub fn extract_semver_version(build_version: &str) -> &str {
 fn get_current_version() -> Result<(String, Version)> {
     let full_version = crate::VERSION;
     let semver_str = extract_semver_version(full_version);
-    let semver_version = Version::parse(semver_str)
-        .context(format!("Failed to parse version from BUILD_VERSION: {}", semver_str))?;
+    let semver_version = Version::parse(semver_str).context(format!(
+        "Failed to parse version from BUILD_VERSION: {}",
+        semver_str
+    ))?;
 
     Ok((full_version.to_string(), semver_version))
 }
@@ -67,8 +69,14 @@ pub fn get_asset_pattern(version: &str) -> Result<String> {
     };
 
     let pattern = match os {
-        "linux" => format!("vibe_coding_tracker-v{}-linux-{}-gnu.tar.gz", version, arch_name),
-        "macos" => format!("vibe_coding_tracker-v{}-macos-{}.tar.gz", version, arch_name),
+        "linux" => format!(
+            "vibe_coding_tracker-v{}-linux-{}-gnu.tar.gz",
+            version, arch_name
+        ),
+        "macos" => format!(
+            "vibe_coding_tracker-v{}-macos-{}.tar.gz",
+            version, arch_name
+        ),
         "windows" => format!("vibe_coding_tracker-v{}-windows-{}.zip", version, arch_name),
         _ => {
             anyhow::bail!("Unsupported platform: {}-{}", os, arch);
@@ -91,10 +99,7 @@ fn fetch_latest_release() -> Result<GitHubRelease> {
         .context("Failed to fetch release information from GitHub")?;
 
     if !response.status().is_success() {
-        anyhow::bail!(
-            "GitHub API returned error status: {}",
-            response.status()
-        );
+        anyhow::bail!("GitHub API returned error status: {}", response.status());
     }
 
     let release: GitHubRelease = response
@@ -113,17 +118,14 @@ fn download_file(url: &str, dest: &Path) -> Result<()> {
         .build()
         .context("Failed to create HTTP client")?;
 
-    let mut response = client
-        .get(url)
-        .send()
-        .context("Failed to download file")?;
+    let mut response = client.get(url).send().context("Failed to download file")?;
 
     if !response.status().is_success() {
         anyhow::bail!("Download failed with status: {}", response.status());
     }
 
-    let mut file = File::create(dest)
-        .context(format!("Failed to create file: {}", dest.display()))?;
+    let mut file =
+        File::create(dest).context(format!("Failed to create file: {}", dest.display()))?;
 
     response
         .copy_to(&mut file)
@@ -137,13 +139,29 @@ fn download_file(url: &str, dest: &Path) -> Result<()> {
 fn extract_targz(archive_path: &Path, extract_to: &Path) -> Result<std::path::PathBuf> {
     println!("📦 Extracting archive...");
 
-    let tar_gz = File::open(archive_path)
-        .context("Failed to open archive file")?;
+    let tar_gz = File::open(archive_path).context("Failed to open archive file")?;
     let tar = GzDecoder::new(tar_gz);
     let mut archive = Archive::new(tar);
 
-    archive.unpack(extract_to)
-        .context("Failed to extract archive")?;
+    // Manually extract with path validation to prevent path traversal attacks
+    for entry in archive
+        .entries()
+        .context("Failed to read archive entries")?
+    {
+        let mut entry = entry.context("Failed to read archive entry")?;
+        let path = entry.path().context("Failed to get entry path")?;
+
+        // Validate that the extracted path stays within extract_to directory
+        let full_path = extract_to.join(&path);
+        if !full_path.starts_with(extract_to) {
+            anyhow::bail!(
+                "Archive contains invalid path that attempts to escape extraction directory: {:?}",
+                path
+            );
+        }
+
+        entry.unpack(&full_path).context("Failed to unpack entry")?;
+    }
 
     // Find the binary in the extracted files (should be vibe_coding_tracker or vct)
     let binary_names = ["vibe_coding_tracker", "vct"];
@@ -171,13 +189,33 @@ fn extract_targz(archive_path: &Path, extract_to: &Path) -> Result<std::path::Pa
 fn extract_zip(archive_path: &Path, extract_to: &Path) -> Result<std::path::PathBuf> {
     println!("📦 Extracting archive...");
 
-    let file = File::open(archive_path)
-        .context("Failed to open archive file")?;
-    let mut archive = ZipArchive::new(file)
-        .context("Failed to read zip archive")?;
+    let file = File::open(archive_path).context("Failed to open archive file")?;
+    let mut archive = ZipArchive::new(file).context("Failed to read zip archive")?;
 
-    archive.extract(extract_to)
-        .context("Failed to extract archive")?;
+    // Manually extract with path validation to prevent path traversal attacks
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i).context("Failed to read zip entry")?;
+        let file_path = file.name();
+
+        // Validate that the extracted path stays within extract_to directory
+        let full_path = extract_to.join(file_path);
+        if !full_path.starts_with(extract_to) {
+            anyhow::bail!(
+                "Archive contains invalid path that attempts to escape extraction directory: {}",
+                file_path
+            );
+        }
+
+        if file.is_dir() {
+            fs::create_dir_all(&full_path).context("Failed to create directory")?;
+        } else {
+            if let Some(parent) = full_path.parent() {
+                fs::create_dir_all(parent).context("Failed to create parent directory")?;
+            }
+            let mut outfile = File::create(&full_path).context("Failed to create file")?;
+            std::io::copy(&mut file, &mut outfile).context("Failed to write file")?;
+        }
+    }
 
     // Find the binary in the extracted files
     let binary_names = ["vibe_coding_tracker.exe", "vct.exe"];
@@ -199,16 +237,17 @@ fn perform_update_unix(current_exe: &Path, new_binary: &Path) -> Result<()> {
 
     // Rename current binary to .old
     if current_exe.exists() {
-        fs::rename(current_exe, &backup_path)
-            .context("Failed to backup current binary")?;
+        fs::rename(current_exe, &backup_path).context("Failed to backup current binary")?;
         println!("📦 Backed up current binary to: {}", backup_path.display());
     }
 
     // Move new binary to current location
-    fs::rename(new_binary, current_exe)
-        .context("Failed to replace binary with new version")?;
+    fs::rename(new_binary, current_exe).context("Failed to replace binary with new version")?;
 
-    println!("✅ Successfully updated binary at: {}", current_exe.display());
+    println!(
+        "✅ Successfully updated binary at: {}",
+        current_exe.display()
+    );
     println!("📝 Old version backed up at: {}", backup_path.display());
     println!();
     println!("🎉 Update complete! Please restart the application.");
@@ -226,8 +265,7 @@ fn perform_update_windows(current_exe: &Path, new_binary: &Path) -> Result<()> {
     let batch_path = current_exe.with_file_name("update_vct.bat");
 
     // Move downloaded file to .new
-    fs::rename(new_binary, &new_path)
-        .context("Failed to move new binary to .new extension")?;
+    fs::rename(new_binary, &new_path).context("Failed to move new binary to .new extension")?;
 
     // Create batch script
     let batch_script = format!(
@@ -246,9 +284,10 @@ del "%~f0"
         new = new_path.display()
     );
 
-    let mut batch_file = fs::File::create(&batch_path)
-        .context("Failed to create update batch script")?;
-    batch_file.write_all(batch_script.as_bytes())
+    let mut batch_file =
+        fs::File::create(&batch_path).context("Failed to create update batch script")?;
+    batch_file
+        .write_all(batch_script.as_bytes())
         .context("Failed to write batch script")?;
 
     println!("✅ Update prepared!");
@@ -267,15 +306,16 @@ del "%~f0"
 pub fn check_update() -> Result<Option<String>> {
     println!("🔍 Checking for updates...");
 
-    let release = fetch_latest_release()
-        .context("Failed to fetch latest release information")?;
+    let release = fetch_latest_release().context("Failed to fetch latest release information")?;
 
     let (current_version_display, current_version) = get_current_version()?;
 
     // Remove 'v' prefix if present and parse as semver
     let latest_version_str = release.tag_name.trim_start_matches('v');
-    let latest_version = Version::parse(latest_version_str)
-        .context(format!("Failed to parse latest version: {}", latest_version_str))?;
+    let latest_version = Version::parse(latest_version_str).context(format!(
+        "Failed to parse latest version: {}",
+        latest_version_str
+    ))?;
 
     println!("📌 Current version: {}", current_version_display);
     println!("📌 Latest version:  v{}", latest_version);
@@ -299,15 +339,16 @@ pub fn perform_update() -> Result<()> {
     println!();
 
     // Fetch release information
-    let release = fetch_latest_release()
-        .context("Failed to fetch latest release information")?;
+    let release = fetch_latest_release().context("Failed to fetch latest release information")?;
 
     let (current_version_display, current_version) = get_current_version()?;
 
     // Remove 'v' prefix if present and parse as semver
     let latest_version_str = release.tag_name.trim_start_matches('v');
-    let latest_version = Version::parse(latest_version_str)
-        .context(format!("Failed to parse latest version: {}", latest_version_str))?;
+    let latest_version = Version::parse(latest_version_str).context(format!(
+        "Failed to parse latest version: {}",
+        latest_version_str
+    ))?;
 
     println!("📌 Current version: {}", current_version_display);
     println!("📌 Latest version:  v{}", latest_version);
@@ -334,8 +375,7 @@ pub fn perform_update() -> Result<()> {
     println!();
 
     // Get current executable path
-    let current_exe = env::current_exe()
-        .context("Failed to get current executable path")?;
+    let current_exe = env::current_exe().context("Failed to get current executable path")?;
 
     // Download to temporary location
     let temp_dir = env::temp_dir();
@@ -350,8 +390,7 @@ pub fn perform_update() -> Result<()> {
         fs::remove_dir_all(&extract_dir)
             .context("Failed to clean up previous extraction directory")?;
     }
-    fs::create_dir_all(&extract_dir)
-        .context("Failed to create extraction directory")?;
+    fs::create_dir_all(&extract_dir).context("Failed to create extraction directory")?;
 
     let new_binary = if asset.name.ends_with(".tar.gz") {
         extract_targz(&archive_path, &extract_dir)?

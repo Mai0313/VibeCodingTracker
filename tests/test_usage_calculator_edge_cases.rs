@@ -29,7 +29,7 @@ fn test_calculate_usage_with_synthetic_model() {
     let temp_file = temp_dir.join("synthetic_model_test.jsonl");
 
     // Create test data with synthetic model
-    let data = vec![
+    let data = [
         json!({
             "type": "assistant",
             "message": {
@@ -67,7 +67,9 @@ fn test_calculate_usage_with_synthetic_model() {
     let usage = result.unwrap();
     // Synthetic model should be skipped
     assert!(
-        !usage.conversation_usage.contains_key("<synthetic>test-model"),
+        !usage
+            .conversation_usage
+            .contains_key("<synthetic>test-model"),
         "Synthetic model should be skipped"
     );
     assert!(
@@ -84,7 +86,7 @@ fn test_calculate_usage_with_cache_creation() {
     let temp_dir = std::env::temp_dir();
     let temp_file = temp_dir.join("cache_creation_test.jsonl");
 
-    let data = vec![json!({
+    let data = [json!({
         "type": "assistant",
         "message": {
             "model": "claude-3-opus",
@@ -116,7 +118,9 @@ fn test_calculate_usage_with_cache_creation() {
     let claude_usage = usage.conversation_usage.get("claude-3-opus").unwrap();
 
     assert_eq!(
-        claude_usage["cache_creation_input_tokens"].as_i64().unwrap(),
+        claude_usage["cache_creation_input_tokens"]
+            .as_i64()
+            .unwrap(),
         1000
     );
     assert_eq!(
@@ -138,7 +142,7 @@ fn test_calculate_usage_codex_with_reasoning_tokens() {
     let temp_dir = std::env::temp_dir();
     let temp_file = temp_dir.join("codex_reasoning_test.jsonl");
 
-    let data = vec![
+    let data = [
         json!({
             "type": "turn_context",
             "payload": {
@@ -178,7 +182,9 @@ fn test_calculate_usage_codex_with_reasoning_tokens() {
     assert_eq!(total_token_usage["input_tokens"].as_i64().unwrap(), 1000);
     assert_eq!(total_token_usage["output_tokens"].as_i64().unwrap(), 500);
     assert_eq!(
-        total_token_usage["reasoning_output_tokens"].as_i64().unwrap(),
+        total_token_usage["reasoning_output_tokens"]
+            .as_i64()
+            .unwrap(),
         200
     );
 
@@ -191,7 +197,7 @@ fn test_calculate_usage_tool_call_counts() {
     let temp_dir = std::env::temp_dir();
     let temp_file = temp_dir.join("tool_calls_test.jsonl");
 
-    let data = vec![json!({
+    let data = [json!({
         "type": "assistant",
         "message": {
             "model": "claude-3-opus",
@@ -255,7 +261,7 @@ fn test_calculate_usage_codex_shell_calls() {
     let temp_dir = std::env::temp_dir();
     let temp_file = temp_dir.join("codex_shell_test.jsonl");
 
-    let data = vec![
+    let data = [
         json!({
             "type": "turn_context",
             "payload": {
@@ -304,7 +310,7 @@ fn test_calculate_usage_mixed_models() {
     let temp_dir = std::env::temp_dir();
     let temp_file = temp_dir.join("mixed_models_test.jsonl");
 
-    let data = vec![
+    let data = [
         json!({
             "type": "assistant",
             "message": {
@@ -371,7 +377,7 @@ fn test_calculate_usage_non_assistant_messages() {
     let temp_dir = std::env::temp_dir();
     let temp_file = temp_dir.join("non_assistant_test.jsonl");
 
-    let data = vec![
+    let data = [
         json!({
             "type": "user",
             "message": {

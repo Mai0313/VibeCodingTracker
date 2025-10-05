@@ -1,6 +1,9 @@
 use crate::analysis::detector::detect_extension_type;
 use crate::models::{DateUsageResult, ExtensionType, GeminiSession, UsageResult};
-use crate::utils::{collect_files_with_dates, is_gemini_chat_file, is_json_file, read_json, read_jsonl, resolve_paths};
+use crate::utils::{
+    collect_files_with_dates, is_gemini_chat_file, is_json_file, process_claude_usage,
+    process_codex_usage, process_gemini_usage, read_json, read_jsonl, resolve_paths,
+};
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -21,7 +24,7 @@ pub fn calculate_usage_from_jsonl<P: AsRef<Path>>(file_path: P) -> Result<UsageR
         });
     }
 
-    let ext_type = detect_extension_type(&data);
+    let ext_type = detect_extension_type(&data)?;
 
     match ext_type {
         ExtensionType::ClaudeCode => calculate_claude_usage(&data),
@@ -53,7 +56,6 @@ pub fn get_usage_from_directories() -> Result<DateUsageResult> {
     Ok(result)
 }
 
-
 fn calculate_claude_usage(data: &[Value]) -> Result<UsageResult> {
     let mut conversation_usage: HashMap<String, Value> = HashMap::new();
     let mut tool_counts: HashMap<String, usize> = HashMap::new();
@@ -68,11 +70,7 @@ fn calculate_claude_usage(data: &[Value]) -> Result<UsageResult> {
                             (message.get("model"), message.get("usage"))
                         {
                             if let Some(model_str) = model.as_str() {
-                                process_claude_usage_data(
-                                    &mut conversation_usage,
-                                    model_str,
-                                    usage,
-                                );
+                                process_claude_usage(&mut conversation_usage, model_str, usage);
                             }
                         }
 
@@ -133,7 +131,7 @@ fn calculate_codex_usage(data: &[Value]) -> Result<UsageResult> {
                         if let Some(payload_type) = payload.get("type").and_then(|t| t.as_str()) {
                             if payload_type == "token_count" && !current_model.is_empty() {
                                 if let Some(info) = payload.get("info") {
-                                    process_codex_usage_data(
+                                    process_codex_usage(
                                         &mut conversation_usage,
                                         &current_model,
                                         info,
@@ -187,7 +185,7 @@ fn calculate_gemini_usage(data: &[Value]) -> Result<UsageResult> {
         // Only process gemini messages (not user messages)
         if message.message_type == "gemini" {
             if let (Some(tokens), Some(model)) = (&message.tokens, &message.model) {
-                process_gemini_usage_data(&mut conversation_usage, model, tokens);
+                process_gemini_usage(&mut conversation_usage, model, tokens);
             }
         }
     }
@@ -196,218 +194,6 @@ fn calculate_gemini_usage(data: &[Value]) -> Result<UsageResult> {
         tool_call_counts: tool_counts,
         conversation_usage,
     })
-}
-
-fn process_claude_usage_data(
-    conversation_usage: &mut HashMap<String, Value>,
-    model: &str,
-    usage: &Value,
-) {
-    // Skip synthetic models
-    if model.contains("<synthetic>") {
-        return;
-    }
-
-    let usage_obj = match usage.as_object() {
-        Some(obj) => obj,
-        None => return,
-    };
-
-    let existing = conversation_usage
-        .entry(model.to_string())
-        .or_insert_with(|| {
-            serde_json::json!({
-                "input_tokens": 0,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0,
-                "cache_creation": {},
-                "output_tokens": 0,
-                "service_tier": ""
-            })
-        });
-
-    let existing_obj = existing.as_object_mut().unwrap();
-
-    // Add numeric fields
-    for field in &[
-        "input_tokens",
-        "cache_creation_input_tokens",
-        "cache_read_input_tokens",
-        "output_tokens",
-    ] {
-        if let Some(value) = usage_obj.get(*field).and_then(|v| v.as_i64()) {
-            let current = existing_obj
-                .get(*field)
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            existing_obj.insert(field.to_string(), (current + value).into());
-        }
-    }
-
-    // Handle service_tier
-    if let Some(service_tier) = usage_obj.get("service_tier").and_then(|v| v.as_str()) {
-        existing_obj.insert("service_tier".to_string(), service_tier.into());
-    }
-
-    // Handle cache_creation nested object
-    if let Some(cache_creation) = usage_obj.get("cache_creation").and_then(|v| v.as_object()) {
-        let existing_cache = existing_obj
-            .entry("cache_creation".to_string())
-            .or_insert_with(|| serde_json::json!({}));
-
-        if let Some(existing_cache_obj) = existing_cache.as_object_mut() {
-            for (key, value) in cache_creation {
-                if let Some(v) = value.as_i64() {
-                    let current = existing_cache_obj
-                        .get(key)
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
-                    existing_cache_obj.insert(key.clone(), (current + v).into());
-                }
-            }
-        }
-    }
-}
-
-fn process_codex_usage_data(
-    conversation_usage: &mut HashMap<String, Value>,
-    model: &str,
-    info: &Value,
-) {
-    // Skip synthetic models
-    if model.contains("<synthetic>") {
-        return;
-    }
-
-    let info_obj = match info.as_object() {
-        Some(obj) => obj,
-        None => return,
-    };
-
-    let existing = conversation_usage
-        .entry(model.to_string())
-        .or_insert_with(|| {
-            serde_json::json!({
-                "total_token_usage": {},
-                "last_token_usage": {},
-                "model_context_window": null
-            })
-        });
-
-    let existing_obj = existing.as_object_mut().unwrap();
-
-    // Process total_token_usage
-    if let Some(total_usage) = info_obj
-        .get("total_token_usage")
-        .and_then(|v| v.as_object())
-    {
-        let existing_total = existing_obj
-            .entry("total_token_usage".to_string())
-            .or_insert_with(|| serde_json::json!({}));
-
-        if let Some(existing_total_obj) = existing_total.as_object_mut() {
-            for (key, value) in total_usage {
-                if let Some(v) = value.as_i64() {
-                    let current = existing_total_obj
-                        .get(key)
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
-                    existing_total_obj.insert(key.clone(), (current + v).into());
-                }
-            }
-        }
-    }
-
-    // Process last_token_usage
-    if let Some(last_usage) = info_obj.get("last_token_usage") {
-        existing_obj.insert("last_token_usage".to_string(), last_usage.clone());
-    }
-
-    // Handle model_context_window
-    if let Some(context_window) = info_obj.get("model_context_window") {
-        existing_obj.insert("model_context_window".to_string(), context_window.clone());
-    }
-}
-
-fn process_gemini_usage_data(
-    conversation_usage: &mut HashMap<String, Value>,
-    model: &str,
-    tokens: &crate::models::GeminiTokens,
-) {
-    let existing = conversation_usage
-        .entry(model.to_string())
-        .or_insert_with(|| {
-            serde_json::json!({
-                "input_tokens": 0,
-                "cache_read_input_tokens": 0,
-                "output_tokens": 0,
-                "thoughts_tokens": 0,
-                "tool_tokens": 0,
-                "total_tokens": 0,
-            })
-        });
-
-    let existing_obj = existing.as_object_mut().unwrap();
-
-    // Add input tokens
-    let current_input = existing_obj
-        .get("input_tokens")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    existing_obj.insert(
-        "input_tokens".to_string(),
-        (current_input + tokens.input).into(),
-    );
-
-    // Add cached tokens as cache_read_input_tokens
-    let current_cached = existing_obj
-        .get("cache_read_input_tokens")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    existing_obj.insert(
-        "cache_read_input_tokens".to_string(),
-        (current_cached + tokens.cached).into(),
-    );
-
-    // Add output tokens
-    let current_output = existing_obj
-        .get("output_tokens")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    existing_obj.insert(
-        "output_tokens".to_string(),
-        (current_output + tokens.output).into(),
-    );
-
-    // Add thoughts tokens (Gemini-specific)
-    let current_thoughts = existing_obj
-        .get("thoughts_tokens")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    existing_obj.insert(
-        "thoughts_tokens".to_string(),
-        (current_thoughts + tokens.thoughts).into(),
-    );
-
-    // Add tool tokens (Gemini-specific)
-    let current_tool = existing_obj
-        .get("tool_tokens")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    existing_obj.insert(
-        "tool_tokens".to_string(),
-        (current_tool + tokens.tool).into(),
-    );
-
-    // Add total tokens
-    let current_total = existing_obj
-        .get("total_tokens")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    existing_obj.insert(
-        "total_tokens".to_string(),
-        (current_total + tokens.total).into(),
-    );
 }
 
 fn process_directory<P: AsRef<Path>>(dir: P, result: &mut DateUsageResult) -> Result<()> {
