@@ -48,6 +48,17 @@ pub enum Commands {
         #[arg(long)]
         text: bool,
     },
+
+    /// Update to the latest version from GitHub releases
+    Update {
+        /// Check for updates without installing
+        #[arg(long)]
+        check: bool,
+
+        /// Force update without confirmation prompt
+        #[arg(long, short)]
+        force: bool,
+    },
 }
 
 impl Cli {

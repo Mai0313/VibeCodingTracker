@@ -120,6 +120,16 @@ fn main() -> Result<()> {
                 println!("{table}");
             }
         }
+
+        Commands::Update { check, force } => {
+            if check {
+                // Only check for updates without installing
+                vibe_coding_tracker::update::check_update()?;
+            } else {
+                // Perform update with optional force flag
+                vibe_coding_tracker::update::update_interactive(force)?;
+            }
+        }
     }
 
     Ok(())

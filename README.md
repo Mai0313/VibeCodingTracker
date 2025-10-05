@@ -124,6 +124,7 @@ Commands:
 usage       Show token usage and costs (default: interactive)
 analysis    Analyze conversation files and export data
 version     Display version information
+update      Update to the latest version from GitHub releases
 help        Show help information
 ```
 
@@ -449,6 +450,54 @@ vct version --text
 ║ Cargo Version  ║ 1.89.0  ║
 ╚════════════════╩═════════╝
 ```
+
+---
+
+## 🔄 Update Command
+
+**Keep your installation up-to-date automatically.**
+
+The update command checks GitHub releases and downloads the latest version for your platform.
+
+### Basic Usage
+
+```bash
+# Interactive update with confirmation
+vct update
+
+# Check for updates without installing
+vct update --check
+
+# Force update without confirmation prompt
+vct update --force
+```
+
+### How It Works
+
+1. **Check Latest Version**: Fetches the latest release from GitHub API
+2. **Compare Versions**: Compares current version with the latest available
+3. **Download Binary**: Downloads the appropriate binary for your platform (Linux/macOS/Windows)
+4. **Smart Replacement**:
+   - **Linux/macOS**: Automatically replaces the binary (backs up old version to `.old`)
+   - **Windows**: Downloads as `.new` and creates a batch script for safe replacement
+
+### Platform Support
+
+The update command automatically detects your platform and downloads the correct archive:
+
+- **Linux**: `vibe_coding_tracker-v{version}-linux-x64-gnu.tar.gz`, `vibe_coding_tracker-v{version}-linux-arm64-gnu.tar.gz`
+- **macOS**: `vibe_coding_tracker-v{version}-macos-x64.tar.gz`, `vibe_coding_tracker-v{version}-macos-arm64.tar.gz`
+- **Windows**: `vibe_coding_tracker-v{version}-windows-x64.zip`, `vibe_coding_tracker-v{version}-windows-arm64.zip`
+
+### Windows Update Process
+
+On Windows, the binary cannot be replaced while running. The update command:
+
+1. Downloads the new version as `vct.new`
+2. Creates an update script (`update_vct.bat`)
+3. Displays instructions to complete the update
+
+Run the batch script after closing the application to finish the update.
 
 ---
 

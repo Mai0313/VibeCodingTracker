@@ -124,6 +124,7 @@ vct <命令> [选项]
 usage       显示 token 使用量和成本（默认：交互式）
 analysis    分析对话文件并导出数据
 version     显示版本信息
+update      从 GitHub releases 更新到最新版本
 help        显示帮助信息
 ```
 
@@ -449,6 +450,54 @@ vct version --text
 ║ Cargo 版本     ║ 1.89.0  ║
 ╚════════════════╩═════════╝
 ```
+
+---
+
+## 🔄 Update 命令
+
+**自动保持安装版本为最新。**
+
+update 命令会检查 GitHub releases 并为您的平台下载最新版本。
+
+### 基本用法
+
+```bash
+# 交互式更新（会询问确认）
+vct update
+
+# 仅检查更新而不安装
+vct update --check
+
+# 强制更新，不显示确认提示
+vct update --force
+```
+
+### 工作原理
+
+1. **检查最新版本**：从 GitHub API 获取最新 release
+2. **比较版本**：比较当前版本与最新可用版本
+3. **下载二进制文件**：下载适合您平台的二进制文件（Linux/macOS/Windows）
+4. **智能替换**：
+   - **Linux/macOS**：自动替换二进制文件（将旧版本备份为 `.old`）
+   - **Windows**：下载为 `.new` 并创建批处理脚本以安全替换
+
+### 平台支持
+
+update 命令会自动检测您的平台并下载正确的压缩文件：
+
+- **Linux**：`vibe_coding_tracker-v{版本}-linux-x64-gnu.tar.gz`、`vibe_coding_tracker-v{版本}-linux-arm64-gnu.tar.gz`
+- **macOS**：`vibe_coding_tracker-v{版本}-macos-x64.tar.gz`、`vibe_coding_tracker-v{版本}-macos-arm64.tar.gz`
+- **Windows**：`vibe_coding_tracker-v{版本}-windows-x64.zip`、`vibe_coding_tracker-v{版本}-windows-arm64.zip`
+
+### Windows 更新流程
+
+在 Windows 上，无法在程序运行时替换二进制文件。update 命令会：
+
+1. 将新版本下载为 `vct.new`
+2. 创建更新脚本（`update_vct.bat`）
+3. 显示完成更新的说明
+
+关闭应用程序后运行批处理脚本以完成更新。
 
 ---
 

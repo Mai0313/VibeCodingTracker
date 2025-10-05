@@ -68,6 +68,11 @@ vct analysis --output <output.json>
 
 # Version info
 vct version [--json|--text]
+
+# Update to latest version from GitHub releases
+vct update                # Interactive update with confirmation
+vct update --force        # Force update without confirmation
+vct update --check        # Only check for updates without installing
 ```
 
 ## Code Architecture
@@ -80,6 +85,7 @@ src/
 ├── lib.rs               # Library exports, version info
 ├── cli.rs               # Clap CLI definitions
 ├── pricing.rs           # LiteLLM pricing fetch, caching, fuzzy matching
+├── update.rs            # Self-update functionality from GitHub releases
 ├── models/              # Data structures
 │   ├── analysis.rs      # CodeAnalysis struct
 │   ├── usage.rs         # UsageResult, DateUsageResult
@@ -153,6 +159,30 @@ src/
   5. Fallback to $0.00
 - Cost calculation: `(input × input_cost) + (output × output_cost) + (cache_read × cache_cost) + (cache_creation × creation_cost)`
 
+**4. Update Command (`vct update`):**
+
+- `main.rs::Commands::Update` → `update.rs::update_interactive()` or `check_update()`
+  - Fetches latest release from GitHub API: `https://api.github.com/repos/Mai0313/VibeCodingTracker/releases/latest`
+  - Uses `semver` crate for semantic version comparison (not string comparison)
+  - Compares current version (from `CARGO_PKG_VERSION`) with latest tag version
+  - Downloads platform-specific compressed archive from release assets
+  - Extracts the archive (`.tar.gz` for Unix, `.zip` for Windows)
+  - **Linux/macOS**: 
+    - Extracts `.tar.gz` archive
+    - Renames current binary to `.old` (backup)
+    - Replaces with new binary directly
+    - User can restart immediately
+  - **Windows**: 
+    - Extracts `.zip` archive
+    - Downloads new binary with `.new` extension
+    - Creates batch script (`update_vct.bat`) to replace after exit
+    - User must run batch script to complete update
+- Platform detection uses `env::consts::OS` and `env::consts::ARCH`
+- Asset naming convention: `vibe_coding_tracker-v{version}-{os}-{arch}[-gnu].{ext}`
+  - Linux: `vibe_coding_tracker-v0.1.6-linux-x64-gnu.tar.gz`, `vibe_coding_tracker-v0.1.6-linux-arm64-gnu.tar.gz`
+  - macOS: `vibe_coding_tracker-v0.1.6-macos-x64.tar.gz`, `vibe_coding_tracker-v0.1.6-macos-arm64.tar.gz`
+  - Windows: `vibe_coding_tracker-v0.1.6-windows-x64.zip`, `vibe_coding_tracker-v0.1.6-windows-arm64.zip`
+
 ### Data Format Detection
 
 **Claude Code format:**
@@ -221,10 +251,14 @@ docker run --rm \
 
 - `anyhow`, `thiserror` - Error handling
 - `chrono` - Date/time
-- `reqwest` (rustls-tls) - HTTP client for pricing fetch
+- `reqwest` (rustls-tls) - HTTP client for pricing fetch and update downloads
 - `walkdir` - Directory traversal
 - `regex` - Pattern matching
 - `strsim` - Fuzzy string matching (Jaro-Winkler)
+- `semver` - Semantic version parsing and comparison (for update command)
+- `flate2` - Gzip decompression (for .tar.gz archives)
+- `tar` - Tar archive extraction
+- `zip` - Zip archive extraction
 - `home` - Home directory resolution
 - `hostname` - System hostname
 - `sysinfo` - Memory/system stats

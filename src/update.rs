@@ -1,0 +1,385 @@
+use anyhow::{Context, Result};
+use flate2::read::GzDecoder;
+use semver::Version;
+use serde::{Deserialize, Serialize};
+use std::env;
+use std::fs::{self, File};
+use std::path::Path;
+use tar::Archive;
+use zip::ZipArchive;
+
+const GITHUB_API_RELEASES_URL: &str =
+    "https://api.github.com/repos/Mai0313/VibeCodingTracker/releases/latest";
+const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
+
+#[derive(Debug, Deserialize, Serialize)]
+struct GitHubRelease {
+    tag_name: String,
+    name: String,
+    body: Option<String>,
+    assets: Vec<GitHubAsset>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct GitHubAsset {
+    name: String,
+    browser_download_url: String,
+    size: u64,
+}
+
+/// Determine the asset name pattern based on current platform and version
+/// Returns (asset_name_pattern, is_compressed)
+fn get_asset_pattern(version: &str) -> Result<String> {
+    let os = env::consts::OS;
+    let arch = env::consts::ARCH;
+
+    // Map Rust arch names to release asset arch names
+    let arch_name = match arch {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+
+    let pattern = match os {
+        "linux" => format!("vibe_coding_tracker-v{}-linux-{}-gnu.tar.gz", version, arch_name),
+        "macos" => format!("vibe_coding_tracker-v{}-macos-{}.tar.gz", version, arch_name),
+        "windows" => format!("vibe_coding_tracker-v{}-windows-{}.zip", version, arch_name),
+        _ => {
+            anyhow::bail!("Unsupported platform: {}-{}", os, arch);
+        }
+    };
+
+    Ok(pattern)
+}
+
+/// Fetch the latest release information from GitHub
+fn fetch_latest_release() -> Result<GitHubRelease> {
+    let client = reqwest::blocking::Client::builder()
+        .user_agent(USER_AGENT)
+        .build()
+        .context("Failed to create HTTP client")?;
+
+    let response = client
+        .get(GITHUB_API_RELEASES_URL)
+        .send()
+        .context("Failed to fetch release information from GitHub")?;
+
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "GitHub API returned error status: {}",
+            response.status()
+        );
+    }
+
+    let release: GitHubRelease = response
+        .json()
+        .context("Failed to parse GitHub release JSON")?;
+
+    Ok(release)
+}
+
+/// Download a file from URL to specified path
+fn download_file(url: &str, dest: &Path) -> Result<()> {
+    println!("📥 Downloading from: {}", url);
+
+    let client = reqwest::blocking::Client::builder()
+        .user_agent(USER_AGENT)
+        .build()
+        .context("Failed to create HTTP client")?;
+
+    let mut response = client
+        .get(url)
+        .send()
+        .context("Failed to download file")?;
+
+    if !response.status().is_success() {
+        anyhow::bail!("Download failed with status: {}", response.status());
+    }
+
+    let mut file = File::create(dest)
+        .context(format!("Failed to create file: {}", dest.display()))?;
+
+    response
+        .copy_to(&mut file)
+        .context("Failed to write downloaded content to file")?;
+
+    println!("✅ Downloaded to: {}", dest.display());
+    Ok(())
+}
+
+/// Extract tar.gz archive and return the path to the binary
+fn extract_targz(archive_path: &Path, extract_to: &Path) -> Result<std::path::PathBuf> {
+    println!("📦 Extracting archive...");
+
+    let tar_gz = File::open(archive_path)
+        .context("Failed to open archive file")?;
+    let tar = GzDecoder::new(tar_gz);
+    let mut archive = Archive::new(tar);
+
+    archive.unpack(extract_to)
+        .context("Failed to extract archive")?;
+
+    // Find the binary in the extracted files (should be vibe_coding_tracker or vct)
+    let binary_names = ["vibe_coding_tracker", "vct"];
+    for name in &binary_names {
+        let binary_path = extract_to.join(name);
+        if binary_path.exists() {
+            // Make executable on Unix-like systems
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = fs::metadata(&binary_path)?.permissions();
+                perms.set_mode(0o755);
+                fs::set_permissions(&binary_path, perms)?;
+            }
+            
+            println!("✅ Extracted binary: {}", binary_path.display());
+            return Ok(binary_path);
+        }
+    }
+
+    anyhow::bail!("Binary not found in archive")
+}
+
+/// Extract zip archive and return the path to the binary
+fn extract_zip(archive_path: &Path, extract_to: &Path) -> Result<std::path::PathBuf> {
+    println!("📦 Extracting archive...");
+
+    let file = File::open(archive_path)
+        .context("Failed to open archive file")?;
+    let mut archive = ZipArchive::new(file)
+        .context("Failed to read zip archive")?;
+
+    archive.extract(extract_to)
+        .context("Failed to extract archive")?;
+
+    // Find the binary in the extracted files
+    let binary_names = ["vibe_coding_tracker.exe", "vct.exe"];
+    for name in &binary_names {
+        let binary_path = extract_to.join(name);
+        if binary_path.exists() {
+            println!("✅ Extracted binary: {}", binary_path.display());
+            return Ok(binary_path);
+        }
+    }
+
+    anyhow::bail!("Binary not found in archive")
+}
+
+/// Perform the update for Unix-like systems (Linux, macOS)
+#[cfg(unix)]
+fn perform_update_unix(current_exe: &Path, new_binary: &Path) -> Result<()> {
+    let backup_path = current_exe.with_extension("old");
+
+    // Rename current binary to .old
+    if current_exe.exists() {
+        fs::rename(current_exe, &backup_path)
+            .context("Failed to backup current binary")?;
+        println!("📦 Backed up current binary to: {}", backup_path.display());
+    }
+
+    // Move new binary to current location
+    fs::rename(new_binary, current_exe)
+        .context("Failed to replace binary with new version")?;
+
+    println!("✅ Successfully updated binary at: {}", current_exe.display());
+    println!("📝 Old version backed up at: {}", backup_path.display());
+    println!();
+    println!("🎉 Update complete! Please restart the application.");
+
+    Ok(())
+}
+
+/// Perform the update for Windows
+#[cfg(windows)]
+fn perform_update_windows(current_exe: &Path, new_binary: &Path) -> Result<()> {
+    // On Windows, we can't replace the running executable directly
+    // Strategy: download as .new, create a batch script to replace after exit
+
+    let new_path = current_exe.with_extension("new");
+    let batch_path = current_exe.with_file_name("update_vct.bat");
+
+    // Move downloaded file to .new
+    fs::rename(new_binary, &new_path)
+        .context("Failed to move new binary to .new extension")?;
+
+    // Create batch script
+    let batch_script = format!(
+        r#"@echo off
+echo Waiting for application to exit...
+timeout /t 2 /nobreak >nul
+echo Applying update...
+del /F "{old}"
+move /Y "{new}" "{old}"
+echo Update complete!
+echo Starting new version...
+start "" "{old}"
+del "%~f0"
+"#,
+        old = current_exe.display(),
+        new = new_path.display()
+    );
+
+    let mut batch_file = fs::File::create(&batch_path)
+        .context("Failed to create update batch script")?;
+    batch_file.write_all(batch_script.as_bytes())
+        .context("Failed to write batch script")?;
+
+    println!("✅ Update prepared!");
+    println!("📝 New version downloaded to: {}", new_path.display());
+    println!("📝 Update script created at: {}", batch_path.display());
+    println!();
+    println!("🎉 To complete the update:");
+    println!("   1. Close this application");
+    println!("   2. Run: {}", batch_path.display());
+    println!("   OR simply run the batch script now (it will restart the app)");
+
+    Ok(())
+}
+
+/// Check for updates and return version information
+pub fn check_update() -> Result<Option<String>> {
+    println!("🔍 Checking for updates...");
+
+    let release = fetch_latest_release()
+        .context("Failed to fetch latest release information")?;
+
+    let current_version_str = env!("CARGO_PKG_VERSION");
+    let current_version = Version::parse(current_version_str)
+        .context("Failed to parse current version")?;
+
+    // Remove 'v' prefix if present and parse as semver
+    let latest_version_str = release.tag_name.trim_start_matches('v');
+    let latest_version = Version::parse(latest_version_str)
+        .context(format!("Failed to parse latest version: {}", latest_version_str))?;
+
+    println!("📌 Current version: v{}", current_version);
+    println!("📌 Latest version:  v{}", latest_version);
+
+    if latest_version <= current_version {
+        println!("✅ You are already on the latest version!");
+        return Ok(None);
+    }
+
+    println!("🆕 New version available: v{}", latest_version);
+    if let Some(body) = &release.body {
+        println!("\nRelease Notes:\n{}", body);
+    }
+
+    Ok(Some(release.tag_name.clone()))
+}
+
+/// Perform the update process
+pub fn perform_update() -> Result<()> {
+    println!("🚀 Starting update process...");
+    println!();
+
+    // Fetch release information
+    let release = fetch_latest_release()
+        .context("Failed to fetch latest release information")?;
+
+    let current_version_str = env!("CARGO_PKG_VERSION");
+    let current_version = Version::parse(current_version_str)
+        .context("Failed to parse current version")?;
+
+    // Remove 'v' prefix if present and parse as semver
+    let latest_version_str = release.tag_name.trim_start_matches('v');
+    let latest_version = Version::parse(latest_version_str)
+        .context(format!("Failed to parse latest version: {}", latest_version_str))?;
+
+    println!("📌 Current version: v{}", current_version);
+    println!("📌 Latest version:  v{}", latest_version);
+    println!();
+
+    if latest_version <= current_version {
+        println!("✅ You are already on the latest version!");
+        return Ok(());
+    }
+
+    // Find the asset for current platform
+    let asset_pattern = get_asset_pattern(&latest_version.to_string())?;
+    let asset = release
+        .assets
+        .iter()
+        .find(|a| a.name == asset_pattern)
+        .context(format!(
+            "No binary found for platform: {} (looking for: {})",
+            env::consts::OS,
+            asset_pattern
+        ))?;
+
+    println!("📦 Found asset: {} ({} bytes)", asset.name, asset.size);
+    println!();
+
+    // Get current executable path
+    let current_exe = env::current_exe()
+        .context("Failed to get current executable path")?;
+
+    // Download to temporary location
+    let temp_dir = env::temp_dir();
+    let archive_path = temp_dir.join(&asset.name);
+
+    download_file(&asset.browser_download_url, &archive_path)?;
+    println!();
+
+    // Extract the archive
+    let extract_dir = temp_dir.join("vct_update");
+    if extract_dir.exists() {
+        fs::remove_dir_all(&extract_dir)
+            .context("Failed to clean up previous extraction directory")?;
+    }
+    fs::create_dir_all(&extract_dir)
+        .context("Failed to create extraction directory")?;
+
+    let new_binary = if asset.name.ends_with(".tar.gz") {
+        extract_targz(&archive_path, &extract_dir)?
+    } else if asset.name.ends_with(".zip") {
+        extract_zip(&archive_path, &extract_dir)?
+    } else {
+        anyhow::bail!("Unknown archive format: {}", asset.name);
+    };
+
+    println!();
+
+    // Perform platform-specific update
+    #[cfg(unix)]
+    perform_update_unix(&current_exe, &new_binary)?;
+
+    #[cfg(windows)]
+    perform_update_windows(&current_exe, &new_binary)?;
+
+    // Clean up
+    let _ = fs::remove_file(&archive_path);
+    let _ = fs::remove_dir_all(&extract_dir);
+
+    Ok(())
+}
+
+/// Interactive update with confirmation
+pub fn update_interactive(force: bool) -> Result<()> {
+    if !force {
+        // Check first
+        match check_update()? {
+            Some(version) => {
+                println!();
+                println!("❓ Do you want to update to {}? (y/N): ", version);
+                
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                
+                if !input.trim().eq_ignore_ascii_case("y") {
+                    println!("❌ Update cancelled.");
+                    return Ok(());
+                }
+                
+                println!();
+            }
+            None => {
+                return Ok(());
+            }
+        }
+    }
+
+    perform_update()
+}
+
