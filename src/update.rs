@@ -4,10 +4,12 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs::{self, File};
-use std::io::Write;
 use std::path::Path;
 use tar::Archive;
 use zip::ZipArchive;
+
+#[cfg(windows)]
+use std::io::Write;
 
 const GITHUB_API_RELEASES_URL: &str =
     "https://api.github.com/repos/Mai0313/VibeCodingTracker/releases/latest";
