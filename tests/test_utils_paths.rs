@@ -87,3 +87,72 @@ fn test_helper_paths_debug() {
     // Debug output should contain "HelperPaths"
     assert!(debug_str.contains("HelperPaths"));
 }
+
+#[test]
+fn test_get_machine_id_on_linux() {
+    let machine_id = get_machine_id();
+    assert!(!machine_id.is_empty(), "Machine ID should not be empty on Linux");
+
+    // On Linux, machine ID should either be from /etc/machine-id or hostname
+    // Just verify it's not the fallback value
+    assert_ne!(machine_id, "", "Machine ID should have a value");
+}
+
+#[test]
+fn test_paths_are_absolute() {
+    let paths = resolve_paths().unwrap();
+
+    assert!(paths.home_dir.is_absolute(), "Home dir should be absolute");
+    assert!(paths.helper_dir.is_absolute(), "Helper dir should be absolute");
+    assert!(paths.codex_dir.is_absolute(), "Codex dir should be absolute");
+    assert!(paths.codex_session_dir.is_absolute(), "Codex session dir should be absolute");
+    assert!(paths.claude_dir.is_absolute(), "Claude dir should be absolute");
+    assert!(paths.claude_session_dir.is_absolute(), "Claude session dir should be absolute");
+}
+
+#[test]
+fn test_helper_dir_name() {
+    let paths = resolve_paths().unwrap();
+    let helper_name = paths.helper_dir.file_name().unwrap().to_str().unwrap();
+    assert_eq!(helper_name, ".cchelper", "Helper dir should be named .cchelper");
+}
+
+#[test]
+fn test_codex_dir_name() {
+    let paths = resolve_paths().unwrap();
+    let codex_name = paths.codex_dir.file_name().unwrap().to_str().unwrap();
+    assert_eq!(codex_name, ".codex", "Codex dir should be named .codex");
+}
+
+#[test]
+fn test_claude_dir_name() {
+    let paths = resolve_paths().unwrap();
+    let claude_name = paths.claude_dir.file_name().unwrap().to_str().unwrap();
+    assert_eq!(claude_name, ".claude", "Claude dir should be named .claude");
+}
+
+#[test]
+fn test_session_subdirs() {
+    let paths = resolve_paths().unwrap();
+
+    let codex_session_name = paths.codex_session_dir.file_name().unwrap().to_str().unwrap();
+    assert_eq!(codex_session_name, "sessions", "Codex session dir should be named 'sessions'");
+
+    let claude_session_name = paths.claude_session_dir.file_name().unwrap().to_str().unwrap();
+    assert_eq!(claude_session_name, "projects", "Claude session dir should be named 'projects'");
+}
+
+#[test]
+fn test_get_current_user_with_env() {
+    // This test verifies that get_current_user() returns a user
+    let user = get_current_user();
+
+    // Should either match USER or USERNAME env var, or be "unknown"
+    let env_user = std::env::var("USER").or_else(|_| std::env::var("USERNAME"));
+
+    if let Ok(env_val) = env_user {
+        assert_eq!(user, env_val, "Should match environment variable");
+    } else {
+        assert_eq!(user, "unknown", "Should be 'unknown' if env vars not set");
+    }
+}
