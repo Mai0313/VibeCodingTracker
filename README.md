@@ -482,14 +482,14 @@ Total Cost = (Input Tokens × Input Cost) +
 
 ```bash
 # Build image
-docker build -f docker/Dockerfile --target prod -t vct:latest .
+docker build -f docker/Dockerfile --target prod -t vibe_coding_tracker:latest .
 
 # Run with your sessions
 docker run --rm \
     -v ~/.claude:/root/.claude \
     -v ~/.codex:/root/.codex \
     -v ~/.gemini:/root/.gemini \
-    vct:latest usage
+    vibe_coding_tracker:latest usage
 ```
 
 ---

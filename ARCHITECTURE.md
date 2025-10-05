@@ -205,6 +205,14 @@ cost = (input × input_cost_per_token) +
   - Reasoning tokens
   - Total token usage
 
+**gemini_analyzer.rs**
+
+- Parses Gemini JSON format
+- Extracts:
+  - Token usage from session messages
+  - Message content and metadata
+  - Session-level statistics
+
 **display.rs**
 
 - `display_analysis_interactive()`: Ratatui TUI for batch analysis
