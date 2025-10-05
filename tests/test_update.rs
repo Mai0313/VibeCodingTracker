@@ -1,4 +1,4 @@
-use vibe_coding_tracker::update::{get_asset_pattern, GitHubAsset, GitHubRelease};
+use vibe_coding_tracker::update::{extract_semver_version, get_asset_pattern, GitHubAsset, GitHubRelease};
 
 #[test]
 fn test_github_release_deserialization() {
@@ -218,4 +218,40 @@ fn test_asset_pattern_format_consistency() {
 
     #[cfg(not(target_os = "windows"))]
     assert!(pattern.ends_with(".tar.gz"));
+}
+
+#[test]
+fn test_extract_semver_version_clean() {
+    // Clean version (on a tag, no changes)
+    assert_eq!(extract_semver_version("0.1.6"), "0.1.6");
+}
+
+#[test]
+fn test_extract_semver_version_with_commits() {
+    // Version with commits after tag
+    assert_eq!(extract_semver_version("0.1.6-5-g1234567"), "0.1.6");
+}
+
+#[test]
+fn test_extract_semver_version_with_dirty() {
+    // Version with uncommitted changes
+    assert_eq!(extract_semver_version("0.1.6-5-g1234567-dirty"), "0.1.6");
+}
+
+#[test]
+fn test_extract_semver_version_only_dirty() {
+    // Edge case: just dirty marker (shouldn't happen in practice)
+    assert_eq!(extract_semver_version("0.1.6-dirty"), "0.1.6");
+}
+
+#[test]
+fn test_extract_semver_version_complex() {
+    // Complex version string
+    assert_eq!(extract_semver_version("1.2.3-15-gabcdef0-dirty"), "1.2.3");
+}
+
+#[test]
+fn test_extract_semver_version_with_prerelease() {
+    // Prerelease version (though not used in our build.rs currently)
+    assert_eq!(extract_semver_version("0.1.6-alpha.1"), "0.1.6");
 }

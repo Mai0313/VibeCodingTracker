@@ -32,6 +32,26 @@ pub struct GitHubAsset {
     pub size: u64,
 }
 
+/// Extract semver-compatible version from BUILD_VERSION
+/// BUILD_VERSION format: "0.1.6" or "0.1.6-5-g1234567" or "0.1.6-5-g1234567-dirty"
+/// Returns: "0.1.6"
+#[doc(hidden)]
+pub fn extract_semver_version(build_version: &str) -> &str {
+    // Split by '-' and take the first part (the base version)
+    build_version.split('-').next().unwrap_or(build_version)
+}
+
+/// Get the current version information
+/// Returns (full_version_display, semver_version_for_comparison)
+fn get_current_version() -> Result<(String, Version)> {
+    let full_version = crate::VERSION;
+    let semver_str = extract_semver_version(full_version);
+    let semver_version = Version::parse(semver_str)
+        .context(format!("Failed to parse version from BUILD_VERSION: {}", semver_str))?;
+
+    Ok((full_version.to_string(), semver_version))
+}
+
 /// Determine the asset name pattern based on current platform and version
 /// Returns (asset_name_pattern, is_compressed)
 #[doc(hidden)]
@@ -250,16 +270,14 @@ pub fn check_update() -> Result<Option<String>> {
     let release = fetch_latest_release()
         .context("Failed to fetch latest release information")?;
 
-    let current_version_str = env!("CARGO_PKG_VERSION");
-    let current_version = Version::parse(current_version_str)
-        .context("Failed to parse current version")?;
+    let (current_version_display, current_version) = get_current_version()?;
 
     // Remove 'v' prefix if present and parse as semver
     let latest_version_str = release.tag_name.trim_start_matches('v');
     let latest_version = Version::parse(latest_version_str)
         .context(format!("Failed to parse latest version: {}", latest_version_str))?;
 
-    println!("📌 Current version: v{}", current_version);
+    println!("📌 Current version: {}", current_version_display);
     println!("📌 Latest version:  v{}", latest_version);
 
     if latest_version <= current_version {
@@ -284,16 +302,14 @@ pub fn perform_update() -> Result<()> {
     let release = fetch_latest_release()
         .context("Failed to fetch latest release information")?;
 
-    let current_version_str = env!("CARGO_PKG_VERSION");
-    let current_version = Version::parse(current_version_str)
-        .context("Failed to parse current version")?;
+    let (current_version_display, current_version) = get_current_version()?;
 
     // Remove 'v' prefix if present and parse as semver
     let latest_version_str = release.tag_name.trim_start_matches('v');
     let latest_version = Version::parse(latest_version_str)
         .context(format!("Failed to parse latest version: {}", latest_version_str))?;
 
-    println!("📌 Current version: v{}", current_version);
+    println!("📌 Current version: {}", current_version_display);
     println!("📌 Latest version:  v{}", latest_version);
     println!();
 
