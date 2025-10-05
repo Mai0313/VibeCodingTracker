@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 /// Read JSONL file and return all JSON objects
@@ -26,6 +26,21 @@ pub fn read_jsonl<P: AsRef<Path>>(path: P) -> Result<Vec<Value>> {
     }
 
     Ok(results)
+}
+
+/// Read JSON file and return as a single-element vector
+pub fn read_json<P: AsRef<Path>>(path: P) -> Result<Vec<Value>> {
+    let mut file = File::open(path.as_ref())
+        .with_context(|| format!("Failed to open file: {}", path.as_ref().display()))?;
+
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .with_context(|| format!("Failed to read file: {}", path.as_ref().display()))?;
+
+    let obj: Value = serde_json::from_str(&contents)
+        .with_context(|| format!("Failed to parse JSON from file: {}", path.as_ref().display()))?;
+
+    Ok(vec![obj])
 }
 
 /// Count lines in text

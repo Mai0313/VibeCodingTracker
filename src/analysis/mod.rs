@@ -4,8 +4,10 @@ pub mod claude_analyzer;
 pub mod codex_analyzer;
 pub mod detector;
 pub mod display;
+pub mod gemini_analyzer;
 
 pub use analyzer::*;
 pub use batch_analyzer::*;
 pub use detector::*;
 pub use display::*;
+pub use gemini_analyzer::*;

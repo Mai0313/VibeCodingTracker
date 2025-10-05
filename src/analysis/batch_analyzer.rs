@@ -22,7 +22,7 @@ pub struct AggregatedAnalysisRow {
     pub write_count: usize,
 }
 
-/// Analyze all JSONL files from both directories and aggregate by date and model
+/// Analyze all JSONL/JSON files from all directories and aggregate by date and model
 pub fn analyze_all_sessions() -> Result<Vec<AggregatedAnalysisRow>> {
     let paths = crate::utils::resolve_paths()?;
     let mut aggregated: HashMap<String, AggregatedAnalysisRow> = HashMap::new();
@@ -35,6 +35,11 @@ pub fn analyze_all_sessions() -> Result<Vec<AggregatedAnalysisRow>> {
     // Process Codex directory
     if paths.codex_session_dir.exists() {
         process_directory_for_analysis(&paths.codex_session_dir, &mut aggregated)?;
+    }
+
+    // Process Gemini directory (special structure: ~/.gemini/tmp/<hash>/chats/*.json)
+    if paths.gemini_session_dir.exists() {
+        process_gemini_directory_for_analysis(&paths.gemini_session_dir, &mut aggregated)?;
     }
 
     // Convert HashMap to sorted Vec
@@ -66,7 +71,46 @@ fn process_directory_for_analysis<P: AsRef<Path>>(
 
         let path = entry.path();
         if let Some(ext) = path.extension() {
-            if ext == "jsonl" {
+            if ext == "jsonl" || ext == "json" {
+                // Get file modification time for date grouping
+                if let Ok(metadata) = std::fs::metadata(path) {
+                    if let Ok(modified) = metadata.modified() {
+                        let datetime: chrono::DateTime<chrono::Utc> = modified.into();
+                        let date_key = datetime.format("%Y-%m-%d").to_string();
+
+                        // Analyze the file
+                        if let Ok(analysis) = analyze_jsonl_file(path) {
+                            aggregate_analysis_result(aggregated, &date_key, &analysis);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Process Gemini directory structure: ~/.gemini/tmp/<hash>/chats/*.json
+fn process_gemini_directory_for_analysis<P: AsRef<Path>>(
+    dir: P,
+    aggregated: &mut HashMap<String, AggregatedAnalysisRow>,
+) -> Result<()> {
+    if !dir.as_ref().exists() {
+        return Ok(());
+    }
+
+    // Walk through ~/.gemini/tmp/<hash>/chats/ directories
+    for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        let path = entry.path();
+
+        // Check if file is in a "chats" directory and has .json extension
+        if let (Some(parent), Some(ext)) = (path.parent(), path.extension()) {
+            if parent.file_name() == Some(std::ffi::OsStr::new("chats")) && ext == "json" {
                 // Get file modification time for date grouping
                 if let Ok(metadata) = std::fs::metadata(path) {
                     if let Ok(modified) = metadata.modified() {

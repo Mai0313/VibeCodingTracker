@@ -98,6 +98,7 @@ pub struct CodeAnalysis {
 pub enum ExtensionType {
     ClaudeCode,
     Codex,
+    Gemini,
 }
 
 impl std::fmt::Display for ExtensionType {
@@ -105,6 +106,7 @@ impl std::fmt::Display for ExtensionType {
         match self {
             ExtensionType::ClaudeCode => write!(f, "Claude-Code"),
             ExtensionType::Codex => write!(f, "Codex"),
+            ExtensionType::Gemini => write!(f, "Gemini"),
         }
     }
 }

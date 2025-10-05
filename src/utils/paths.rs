@@ -10,6 +10,8 @@ pub struct HelperPaths {
     pub codex_session_dir: PathBuf,
     pub claude_dir: PathBuf,
     pub claude_session_dir: PathBuf,
+    pub gemini_dir: PathBuf,
+    pub gemini_session_dir: PathBuf,
 }
 
 /// Resolve application paths
@@ -22,6 +24,8 @@ pub fn resolve_paths() -> Result<HelperPaths> {
     let codex_session_dir = codex_dir.join("sessions");
     let claude_dir = home_dir.join(".claude");
     let claude_session_dir = claude_dir.join("projects");
+    let gemini_dir = home_dir.join(".gemini");
+    let gemini_session_dir = gemini_dir.join("tmp");
 
     Ok(HelperPaths {
         home_dir,
@@ -30,6 +34,8 @@ pub fn resolve_paths() -> Result<HelperPaths> {
         codex_session_dir,
         claude_dir,
         claude_session_dir,
+        gemini_dir,
+        gemini_session_dir,
     })
 }
 

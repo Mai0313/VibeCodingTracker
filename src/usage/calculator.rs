@@ -1,14 +1,18 @@
-use crate::models::{DateUsageResult, UsageResult};
-use crate::utils::{read_jsonl, resolve_paths};
+use crate::models::{DateUsageResult, GeminiSession, UsageResult};
+use crate::utils::{read_json, read_jsonl, resolve_paths};
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
 use walkdir::WalkDir;
 
-/// Calculate usage from a single JSONL file
+/// Calculate usage from a single JSONL or JSON file
 pub fn calculate_usage_from_jsonl<P: AsRef<Path>>(file_path: P) -> Result<UsageResult> {
-    let data = read_jsonl(file_path)?;
+    // Try reading as JSONL first, then as JSON
+    let data = match read_jsonl(&file_path) {
+        Ok(data) => data,
+        Err(_) => read_json(&file_path)?,
+    };
 
     if data.is_empty() {
         return Ok(UsageResult {
@@ -19,10 +23,10 @@ pub fn calculate_usage_from_jsonl<P: AsRef<Path>>(file_path: P) -> Result<UsageR
 
     let ext_type = detect_extension_type(&data);
 
-    if ext_type == "Claude-Code" {
-        calculate_claude_usage(&data)
-    } else {
-        calculate_codex_usage(&data)
+    match ext_type {
+        "Claude-Code" => calculate_claude_usage(&data),
+        "Gemini" => calculate_gemini_usage(&data),
+        _ => calculate_codex_usage(&data),
     }
 }
 
@@ -41,12 +45,29 @@ pub fn get_usage_from_directories() -> Result<DateUsageResult> {
         process_directory(&paths.codex_session_dir, &mut result)?;
     }
 
+    // Process Gemini directory (special structure: ~/.gemini/tmp/<hash>/chats/*.json)
+    if paths.gemini_session_dir.exists() {
+        process_gemini_directory(&paths.gemini_session_dir, &mut result)?;
+    }
+
     Ok(result)
 }
 
 fn detect_extension_type(data: &[Value]) -> &'static str {
     if data.is_empty() {
         return "Codex";
+    }
+
+    // Check for Gemini specific fields (single session object)
+    if data.len() == 1 {
+        if let Some(obj) = data[0].as_object() {
+            if obj.contains_key("sessionId")
+                && obj.contains_key("projectHash")
+                && obj.contains_key("messages")
+            {
+                return "Gemini";
+            }
+        }
     }
 
     for record in data {
@@ -164,6 +185,36 @@ fn calculate_codex_usage(data: &[Value]) -> Result<UsageResult> {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    Ok(UsageResult {
+        tool_call_counts: tool_counts,
+        conversation_usage,
+    })
+}
+
+fn calculate_gemini_usage(data: &[Value]) -> Result<UsageResult> {
+    let mut conversation_usage: HashMap<String, Value> = HashMap::new();
+    let tool_counts: HashMap<String, usize> = HashMap::new();
+
+    if data.is_empty() {
+        return Ok(UsageResult {
+            tool_call_counts: tool_counts,
+            conversation_usage,
+        });
+    }
+
+    // Parse the Gemini session
+    let session: GeminiSession = serde_json::from_value(data[0].clone())?;
+
+    // Process messages to extract token usage
+    for message in &session.messages {
+        // Only process gemini messages (not user messages)
+        if message.message_type == "gemini" {
+            if let (Some(tokens), Some(model)) = (&message.tokens, &message.model) {
+                process_gemini_usage_data(&mut conversation_usage, model, tokens);
             }
         }
     }
@@ -305,6 +356,87 @@ fn process_codex_usage_data(
     }
 }
 
+fn process_gemini_usage_data(
+    conversation_usage: &mut HashMap<String, Value>,
+    model: &str,
+    tokens: &crate::models::GeminiTokens,
+) {
+    let existing = conversation_usage
+        .entry(model.to_string())
+        .or_insert_with(|| {
+            serde_json::json!({
+                "input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "output_tokens": 0,
+                "thoughts_tokens": 0,
+                "tool_tokens": 0,
+                "total_tokens": 0,
+            })
+        });
+
+    let existing_obj = existing.as_object_mut().unwrap();
+
+    // Add input tokens
+    let current_input = existing_obj
+        .get("input_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    existing_obj.insert(
+        "input_tokens".to_string(),
+        (current_input + tokens.input).into(),
+    );
+
+    // Add cached tokens as cache_read_input_tokens
+    let current_cached = existing_obj
+        .get("cache_read_input_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    existing_obj.insert(
+        "cache_read_input_tokens".to_string(),
+        (current_cached + tokens.cached).into(),
+    );
+
+    // Add output tokens
+    let current_output = existing_obj
+        .get("output_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    existing_obj.insert(
+        "output_tokens".to_string(),
+        (current_output + tokens.output).into(),
+    );
+
+    // Add thoughts tokens (Gemini-specific)
+    let current_thoughts = existing_obj
+        .get("thoughts_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    existing_obj.insert(
+        "thoughts_tokens".to_string(),
+        (current_thoughts + tokens.thoughts).into(),
+    );
+
+    // Add tool tokens (Gemini-specific)
+    let current_tool = existing_obj
+        .get("tool_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    existing_obj.insert(
+        "tool_tokens".to_string(),
+        (current_tool + tokens.tool).into(),
+    );
+
+    // Add total tokens
+    let current_total = existing_obj
+        .get("total_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    existing_obj.insert(
+        "total_tokens".to_string(),
+        (current_total + tokens.total).into(),
+    );
+}
+
 fn process_directory<P: AsRef<Path>>(dir: P, result: &mut DateUsageResult) -> Result<()> {
     if !dir.as_ref().exists() {
         return Ok(());
@@ -317,7 +449,53 @@ fn process_directory<P: AsRef<Path>>(dir: P, result: &mut DateUsageResult) -> Re
 
         let path = entry.path();
         if let Some(ext) = path.extension() {
-            if ext == "jsonl" {
+            if ext == "jsonl" || ext == "json" {
+                // Get file modification time for date grouping
+                if let Ok(metadata) = std::fs::metadata(path) {
+                    if let Ok(modified) = metadata.modified() {
+                        let datetime: chrono::DateTime<chrono::Utc> = modified.into();
+                        let date_key = datetime.format("%Y-%m-%d").to_string();
+
+                        // Calculate usage for this file
+                        if let Ok(usage) = calculate_usage_from_jsonl(path) {
+                            // Initialize date entry if it doesn't exist
+                            let date_entry = result.entry(date_key).or_default();
+
+                            // Merge usage data
+                            for (model, usage_value) in usage.conversation_usage {
+                                if let Some(existing) = date_entry.get_mut(&model) {
+                                    merge_usage_values(existing, &usage_value);
+                                } else {
+                                    date_entry.insert(model, usage_value);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Process Gemini directory structure: ~/.gemini/tmp/<hash>/chats/*.json
+fn process_gemini_directory<P: AsRef<Path>>(dir: P, result: &mut DateUsageResult) -> Result<()> {
+    if !dir.as_ref().exists() {
+        return Ok(());
+    }
+
+    // Walk through ~/.gemini/tmp/<hash>/chats/ directories
+    for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        let path = entry.path();
+
+        // Check if file is in a "chats" directory and has .json extension
+        if let (Some(parent), Some(ext)) = (path.parent(), path.extension()) {
+            if parent.file_name() == Some(std::ffi::OsStr::new("chats")) && ext == "json" {
                 // Get file modification time for date grouping
                 if let Ok(metadata) = std::fs::metadata(path) {
                     if let Ok(modified) = metadata.modified() {
@@ -349,14 +527,17 @@ fn process_directory<P: AsRef<Path>>(dir: P, result: &mut DateUsageResult) -> Re
 
 fn merge_usage_values(existing: &mut Value, new: &Value) {
     if let (Some(existing_obj), Some(new_obj)) = (existing.as_object_mut(), new.as_object()) {
-        // Check if it's Claude usage or Codex usage
+        // Check if it's Claude/Gemini usage or Codex usage
         if existing_obj.contains_key("input_tokens") {
-            // Claude usage
+            // Claude or Gemini usage
             for field in &[
                 "input_tokens",
                 "cache_creation_input_tokens",
                 "cache_read_input_tokens",
                 "output_tokens",
+                "thoughts_tokens",
+                "tool_tokens",
+                "total_tokens",
             ] {
                 if let Some(new_value) = new_obj.get(*field).and_then(|v| v.as_i64()) {
                     let current = existing_obj
