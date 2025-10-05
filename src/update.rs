@@ -4,6 +4,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs::{self, File};
+use std::io::Write;
 use std::path::Path;
 use tar::Archive;
 use zip::ZipArchive;
