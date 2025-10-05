@@ -51,5 +51,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.git-cliff-tag.outputs.content }}
+          name: ${{ steps.git-cliff-tag.outputs.content }} 🌈
           body: ${{ steps.git-cliff-changelog.outputs.content }}
           draft: true
