@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Vibe Coding Tracker** is a Rust CLI tool that analyzes AI coding assistant usage (Claude Code and Codex) by parsing JSONL session files, calculating token usage, computing costs via LiteLLM pricing data, and presenting insights through multiple output formats (interactive TUI, static tables, JSON, text).
+**Vibe Coding Tracker** is a Rust CLI tool that analyzes AI coding assistant usage (Claude Code, Codex, and Gemini) by parsing JSONL session files, calculating token usage, computing costs via LiteLLM pricing data, and presenting insights through multiple output formats (interactive TUI, static tables, JSON, text).
 
 **Binary names:**
 
@@ -84,23 +84,24 @@ src/
 │   ├── analysis.rs      # CodeAnalysis struct
 │   ├── usage.rs         # UsageResult, DateUsageResult
 │   ├── claude.rs        # Claude-specific types
-│   └── codex.rs         # Codex/OpenAI types
+│   ├── codex.rs         # Codex/OpenAI types
+│   └── gemini.rs        # Gemini-specific types
 ├── analysis/            # JSONL analysis pipeline
 │   ├── analyzer.rs      # Main entry: analyze_jsonl_file()
 │   ├── batch_analyzer.rs # Batch analysis: analyze_all_sessions()
 │   ├── display.rs       # Interactive TUI and table display for analysis
-│   ├── detector.rs      # Detect Claude vs Codex format
+│   ├── detector.rs      # Detect Claude vs Codex vs Gemini format
 │   ├── claude_analyzer.rs
-│   └── codex_analyzer.rs
+│   ├── codex_analyzer.rs
+│   └── gemini_analyzer.rs
 ├── usage/               # Usage aggregation & display
 │   ├── calculator.rs    # get_usage_from_directories(), per-file aggregation
 │   └── display.rs       # Interactive TUI, table, text, JSON formatters
-├── utils/               # Helper utilities
-│   ├── file.rs          # read_jsonl, save_json_pretty
-│   ├── paths.rs         # resolve_paths (Claude/Codex dirs)
-│   ├── git.rs           # Git remote detection
-│   └── time.rs          # Date formatting
-└── tui/                 # Terminal UI components (Ratatui)
+└── utils/               # Helper utilities
+    ├── file.rs          # read_jsonl, save_json_pretty
+    ├── paths.rs         # resolve_paths (Claude/Codex/Gemini dirs)
+    ├── git.rs           # Git remote detection
+    └── time.rs          # Date formatting
 ```
 
 ### Key Flows
@@ -108,7 +109,7 @@ src/
 **1. Usage Command (`vct usage`):**
 
 - `main.rs::Commands::Usage` → `usage/calculator.rs::get_usage_from_directories()`
-  - Scans `~/.claude/projects/*.jsonl` and `~/.codex/sessions/*.jsonl`
+  - Scans `~/.claude/projects/*.jsonl`, `~/.codex/sessions/*.jsonl`, and `~/.gemini/tmp/*.jsonl`
   - Aggregates token usage by date and model
 - `pricing.rs::fetch_model_pricing()` → fetches/caches LiteLLM pricing daily
 - `usage/display.rs::display_usage_*()` → formats output (interactive/table/text/JSON)
@@ -122,15 +123,15 @@ src/
 **Single File Mode** (with `--path`):
 
 - `main.rs::Commands::Analysis` → `analysis/analyzer.rs::analyze_jsonl_file()`
-  - `detector.rs` determines Claude vs Codex format (checks `parentUuid` field)
-  - Routes to `claude_analyzer.rs` or `codex_analyzer.rs`
+  - `detector.rs` determines Claude vs Codex vs Gemini format (checks `parentUuid` for Claude, `sessionId` for Gemini)
+  - Routes to `claude_analyzer.rs`, `codex_analyzer.rs`, or `gemini_analyzer.rs`
   - Extracts: conversation usage, tool call counts, file operations, Git info
 - Outputs detailed JSON with metadata (user, machineId, Git remote, etc.)
 
 **Batch Mode** (without `--path`):
 
 - `main.rs::Commands::Analysis` → `analysis/batch_analyzer.rs::analyze_all_sessions()`
-  - Scans `~/.claude/projects/*.jsonl` and `~/.codex/sessions/*.jsonl`
+  - Scans `~/.claude/projects/*.jsonl`, `~/.codex/sessions/*.jsonl`, and `~/.gemini/tmp/*.jsonl`
   - Analyzes each file and aggregates by date and model
   - Groups metrics: edit/read/write lines, tool call counts (Bash, Edit, Read, TodoWrite, Write)
 - `analysis/display.rs::display_analysis_interactive()` → Interactive TUI (default)
@@ -164,6 +165,12 @@ src/
 - OpenAI-style structure
 - Fields: `completion_response.usage`, `total_token_usage`, `reasoning_output_tokens`
 
+**Gemini format:**
+
+- Single session object structure
+- Presence of `sessionId`, `projectHash`, and `messages` fields
+- Fields: `messages[].tokens` (input, output, cached, thoughts, tool, total)
+
 ## Testing
 
 ```bash
@@ -179,6 +186,7 @@ cargo test --all --verbose
 # Example conversation files for testing
 examples/test_conversation.jsonl          # Claude Code format
 examples/test_conversation_oai.jsonl       # Codex format
+examples/test_conversation_gemini.json     # Gemini format
 ```
 
 ## Docker
@@ -191,6 +199,7 @@ docker build -f docker/Dockerfile --target prod -t vct:latest .
 docker run --rm \
     -v ~/.claude:/root/.claude \
     -v ~/.codex:/root/.codex \
+    -v ~/.gemini:/root/.gemini \
     vct:latest usage
 ```
 
@@ -243,12 +252,13 @@ docker run --rm \
 
 - Always use fuzzy matching when looking up pricing
 - Store matched model name for transparency
-- Handle both Claude (`claude-sonnet-4-20250514`) and OpenAI (`gpt-4-turbo`) formats
+- Handle multiple formats: Claude (`claude-sonnet-4-20250514`), OpenAI (`gpt-4-turbo`), and Gemini (`gemini-2.0-flash-exp`)
 
 ## Session File Locations
 
 - **Claude Code:** `~/.claude/projects/*.jsonl`
 - **Codex:** `~/.codex/sessions/*.jsonl`
+- **Gemini:** `~/.gemini/tmp/*.jsonl`
 
 ## Troubleshooting Commands
 
@@ -266,6 +276,7 @@ vct usage
 # Verify session directories
 ls -la ~/.claude/projects/
 ls -la ~/.codex/sessions/
+ls -la ~/.gemini/tmp/
 ```
 
 ## Output Examples
