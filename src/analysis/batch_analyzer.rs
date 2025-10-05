@@ -61,7 +61,7 @@ fn process_directory_for_analysis<P: AsRef<Path>>(
     aggregated: &mut HashMap<String, AggregatedAnalysisRow>,
 ) -> Result<()> {
     let files = collect_files_with_dates(&dir, is_json_file)?;
-    
+
     for file_info in files {
         // Analyze the file
         if let Ok(analysis) = analyze_jsonl_file(&file_info.path) {
@@ -78,7 +78,7 @@ fn process_gemini_directory_for_analysis<P: AsRef<Path>>(
     aggregated: &mut HashMap<String, AggregatedAnalysisRow>,
 ) -> Result<()> {
     let files = collect_files_with_dates(&dir, is_gemini_chat_file)?;
-    
+
     for file_info in files {
         // Analyze the file
         if let Ok(analysis) = analyze_jsonl_file(&file_info.path) {

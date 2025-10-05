@@ -9,11 +9,11 @@ pub struct FileInfo {
 }
 
 /// Process directory and collect files with their modification dates
-/// 
+///
 /// # Arguments
 /// * `dir` - Directory to process
 /// * `filter_fn` - Function to determine if a file should be included
-/// 
+///
 /// Returns a vector of FileInfo structs for matching files
 pub fn collect_files_with_dates<P, F>(dir: P, filter_fn: F) -> Result<Vec<FileInfo>>
 where
@@ -32,7 +32,7 @@ where
         }
 
         let path = entry.path();
-        
+
         // Apply filter
         if !filter_fn(path) {
             continue;
@@ -43,7 +43,7 @@ where
             if let Ok(modified) = metadata.modified() {
                 let datetime: chrono::DateTime<chrono::Utc> = modified.into();
                 let date_key = datetime.format("%Y-%m-%d").to_string();
-                
+
                 results.push(FileInfo {
                     path: path.to_path_buf(),
                     modified_date: date_key,
@@ -72,4 +72,3 @@ pub fn is_gemini_chat_file(path: &Path) -> bool {
         false
     }
 }
-

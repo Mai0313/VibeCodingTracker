@@ -132,7 +132,7 @@ fn extract_targz(archive_path: &Path, extract_to: &Path) -> Result<std::path::Pa
                 perms.set_mode(0o755);
                 fs::set_permissions(&binary_path, perms)?;
             }
-            
+
             println!("✅ Extracted binary: {}", binary_path.display());
             return Ok(binary_path);
         }
@@ -363,15 +363,15 @@ pub fn update_interactive(force: bool) -> Result<()> {
             Some(version) => {
                 println!();
                 println!("❓ Do you want to update to {}? (y/N): ", version);
-                
+
                 let mut input = String::new();
                 std::io::stdin().read_line(&mut input)?;
-                
+
                 if !input.trim().eq_ignore_ascii_case("y") {
                     println!("❌ Update cancelled.");
                     return Ok(());
                 }
-                
+
                 println!();
             }
             None => {
@@ -382,4 +382,3 @@ pub fn update_interactive(force: bool) -> Result<()> {
 
     perform_update()
 }
-

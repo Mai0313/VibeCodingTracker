@@ -412,7 +412,7 @@ fn process_gemini_usage_data(
 
 fn process_directory<P: AsRef<Path>>(dir: P, result: &mut DateUsageResult) -> Result<()> {
     let files = collect_files_with_dates(&dir, is_json_file)?;
-    
+
     for file_info in files {
         // Calculate usage for this file
         if let Ok(usage) = calculate_usage_from_jsonl(&file_info.path) {
@@ -436,7 +436,7 @@ fn process_directory<P: AsRef<Path>>(dir: P, result: &mut DateUsageResult) -> Re
 /// Process Gemini directory structure: ~/.gemini/tmp/<hash>/chats/*.json
 fn process_gemini_directory<P: AsRef<Path>>(dir: P, result: &mut DateUsageResult) -> Result<()> {
     let files = collect_files_with_dates(&dir, is_gemini_chat_file)?;
-    
+
     for file_info in files {
         // Calculate usage for this file
         if let Ok(usage) = calculate_usage_from_jsonl(&file_info.path) {

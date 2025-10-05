@@ -70,4 +70,3 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
 
     counts
 }
-
