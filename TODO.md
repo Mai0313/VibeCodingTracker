@@ -149,3 +149,5 @@
 看起來 `Version` 應該是透過 `Cargo.toml` 裡面直接取得
 經過我自己的追蹤 我發現版本獲取是從 `src/lib.rs` 裡面的 `CARGO_PKG_VERSION` 取得的
 但我不知道如何做到像是 dunamai 那種工具一樣會有 `0.1.6-dirty-...` 之類的版本號
+讓 `Version` 可以變成動態取得的感覺, 在 golang 專案的時候我好像是透過 `LDFLAGS` 來注入版本資訊的
+這裡我不知道怎麼處理
