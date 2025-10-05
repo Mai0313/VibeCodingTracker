@@ -1,0 +1,59 @@
+name: Pre-commit auto-update
+
+on:
+  # every day at midnight
+  schedule:
+    - cron: "0 0 * * *"
+  # manually trigger a workflow_dispatch event
+  workflow_dispatch:
+
+permissions: write-all
+
+jobs:
+  auto-update:
+    runs-on: ubuntu-latest
+    # container: catthehacker/ubuntu:act-20.04  # Uncomment it if you use it on Gitea
+
+    steps:
+      - name: Disable SSL Verify
+        run: git config --global http.sslVerify false
+
+      # - name: Setup MTK Certification
+      #   uses: https://gitea.mediatek.inc/actions/mtk-cert-action@v1.2.0
+
+      - name: Checkout
+        uses: actions/checkout@v5.0.0
+        with:
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6.6.1
+        with:
+          version: "latest"
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Pre-Commit
+        run: |
+          uv tool install pre-commit
+          uv tool run pre-commit autoupdate
+          uv tool run pre-commit run -a
+
+      - name: Create Pull Request
+        id: create-pr
+        uses: peter-evans/create-pull-request@v7.0.8
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: chore/pre-commit-hooks  # push from this branch
+          title: "chore: Update pre-commit hooks"
+          body: "Update versions of pre-commit hooks to latest version."
+          commit-message: "chore: update pre-commit hooks"
+          delete-branch: true
+
+      - name: Auto Merge Pull Request
+        continue-on-error: true
+        if: ${{ steps.create-pr.outputs.pull-request-number }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr merge --merge chore/pre-commit-hooks

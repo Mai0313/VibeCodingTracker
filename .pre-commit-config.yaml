@@ -1,0 +1,85 @@
+default_language_version:
+  rust: 1.28.2
+
+default_install_hook_types:
+  - pre-commit
+  - post-checkout
+  - post-merge
+  - post-rewrite
+
+default_stages:
+  - pre-commit
+  - post-checkout
+  - post-merge
+  - post-rewrite
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      # list of supported hooks: https://pre-commit.com/hooks.html
+      - id: check-added-large-files
+        exclude: poetry.lock|uv.lock
+      - id: check-ast
+      - id: check-yaml
+        exclude: mkdocs.yml
+        args:
+          - --allow-multiple-documents
+      - id: check-toml
+      - id: check-json
+        exclude: .vscode/launch.json
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: destroyed-symlinks
+      - id: detect-private-key
+      - id: end-of-file-fixer
+      # - id: no-commit-to-branch
+      - id: trailing-whitespace
+      - id: fix-byte-order-marker
+        exclude: docs/CNAME
+      - id: mixed-line-ending
+        args:
+          - --fix=lf
+      - id: check-docstring-first
+      - id: debug-statements
+      - id: check-symlinks
+
+  # shell script linter
+  - repo: https://github.com/koalaman/shellcheck-precommit
+    rev: v0.11.0
+    hooks:
+      - id: shellcheck
+
+  # md formatting
+  - repo: https://github.com/executablebooks/mdformat
+    rev: 0.7.22
+    hooks:
+      - id: mdformat
+        args:
+          - --number
+          - --no-validate
+        additional_dependencies:
+          - mdformat-gfm
+          - mdformat-web
+          - mdformat-ruff
+          - mdformat-config
+          - mdformat-tables
+          - mdformat-footnote
+          - mdformat-wikilink
+          - mdformat-beautysh
+          - mdformat-pyproject
+          - mdformat_frontmatter
+          - mdformat-simple-breaks
+          - setuptools<80
+
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.4.1
+    hooks:
+      - id: codespell
+        additional_dependencies:
+          - tomli
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.28.0
+    hooks:
+      - id: gitleaks

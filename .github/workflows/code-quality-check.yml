@@ -24,11 +24,22 @@ jobs:
           fetch-depth: 1
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6.6.1
+        with:
+          version: "latest"
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
           components: rustfmt, clippy
+
+      - name: Run pre-commits
+        run: |
+          uv tool install pre-commit
+          uv tool run pre-commit run -a
 
       - name: rustfmt (check)
         run: |
