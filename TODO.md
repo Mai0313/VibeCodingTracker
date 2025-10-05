@@ -1,6 +1,7 @@
 ## 新增額外分析功能
 
 目前這些功能已完成並且可以順利運作
+
 ```bash
 ./target/debug/vibe_coding_tracker analysis --path examples/test_conversation.jsonl
 ./target/debug/vibe_coding_tracker analysis --path examples/test_conversation.jsonl --output examples/analysis_result.json
@@ -22,6 +23,7 @@
 此次任務已完成 請更新 README.md README.zh-CN.md README.zh-TW.md 並將所有輸出寫成範例包含在裡面
 
 ## 查看版本資訊
+
 ```bash
 ./target/debug/vibe_coding_tracker version
 # 🚀 Coding CLI Helper
@@ -47,6 +49,7 @@
 ```
 
 ## 查看使用狀況
+
 ```bash
 ./target/debug/vibe_coding_tracker update
 # 先不用完成 忽略
@@ -62,48 +65,50 @@
 
 這裡有所有模型的價格 `https://github.com/BerriAI/litellm/raw/refs/heads/main/model_prices_and_context_window.json`
 他的格式大概是這樣的
+
 ```json
 {
-    "gpt-5": {
-        "cache_read_input_token_cost": 1.25e-07,
-        "cache_read_input_token_cost_flex": 6.25e-08,
-        "cache_read_input_token_cost_priority": 2.5e-07,
-        "input_cost_per_token": 1.25e-06,
-        "input_cost_per_token_flex": 6.25e-07,
-        "input_cost_per_token_priority": 2.5e-06,
-        "litellm_provider": "openai",
-        "max_input_tokens": 272000,
-        "max_output_tokens": 128000,
-        "max_tokens": 128000,
-        "mode": "chat",
-        "output_cost_per_token": 1e-05,
-        "output_cost_per_token_flex": 5e-06,
-        "output_cost_per_token_priority": 2e-05,
-        "supported_endpoints": [
-            "/v1/chat/completions",
-            "/v1/batch",
-            "/v1/responses"
-        ],
-        "supported_modalities": [
-            "text",
-            "image"
-        ],
-        "supported_output_modalities": [
-            "text"
-        ],
-        "supports_function_calling": true,
-        "supports_native_streaming": true,
-        "supports_parallel_function_calling": true,
-        "supports_pdf_input": true,
-        "supports_prompt_caching": true,
-        "supports_reasoning": true,
-        "supports_response_schema": true,
-        "supports_system_messages": true,
-        "supports_tool_choice": true,
-        "supports_vision": true
-    }
+  "gpt-5": {
+    "cache_read_input_token_cost": 1.25e-07,
+    "cache_read_input_token_cost_flex": 6.25e-08,
+    "cache_read_input_token_cost_priority": 2.5e-07,
+    "input_cost_per_token": 1.25e-06,
+    "input_cost_per_token_flex": 6.25e-07,
+    "input_cost_per_token_priority": 2.5e-06,
+    "litellm_provider": "openai",
+    "max_input_tokens": 272000,
+    "max_output_tokens": 128000,
+    "max_tokens": 128000,
+    "mode": "chat",
+    "output_cost_per_token": 1e-05,
+    "output_cost_per_token_flex": 5e-06,
+    "output_cost_per_token_priority": 2e-05,
+    "supported_endpoints": [
+      "/v1/chat/completions",
+      "/v1/batch",
+      "/v1/responses"
+    ],
+    "supported_modalities": [
+      "text",
+      "image"
+    ],
+    "supported_output_modalities": [
+      "text"
+    ],
+    "supports_function_calling": true,
+    "supports_native_streaming": true,
+    "supports_parallel_function_calling": true,
+    "supports_pdf_input": true,
+    "supports_prompt_caching": true,
+    "supports_reasoning": true,
+    "supports_response_schema": true,
+    "supports_system_messages": true,
+    "supports_tool_choice": true,
+    "supports_vision": true
+  }
 }
 ```
+
 我希望計算usage 的時候 可以先從這裡取得價格, 最後做計算
 而不是單純顯示 token 使用量
 
@@ -133,6 +138,7 @@ repo 連結未來會改為 `https://github.com/Mai0313/VibeCodingTracker`
 
 請透過 `cargo llvm-cov --workspace` 查看當前覆蓋率 並幫我完全所有代碼測試
 這裡是目前狀態
+
 ```
 Filename                        Regions    Missed Regions     Cover   Functions  Missed Functions  Executed       Lines      Missed Lines     Cover    Branches   Missed Branches     Cover
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------

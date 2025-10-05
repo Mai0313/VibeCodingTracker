@@ -7,6 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **Vibe Coding Tracker** is a Rust CLI tool that analyzes AI coding assistant usage (Claude Code and Codex) by parsing JSONL session files, calculating token usage, computing costs via LiteLLM pricing data, and presenting insights through multiple output formats (interactive TUI, static tables, JSON, text).
 
 **Binary names:**
+
 - Full: `vibe_coding_tracker`
 - Short alias: `vct`
 
@@ -105,6 +106,7 @@ src/
 ### Key Flows
 
 **1. Usage Command (`vct usage`):**
+
 - `main.rs::Commands::Usage` → `usage/calculator.rs::get_usage_from_directories()`
   - Scans `~/.claude/projects/*.jsonl` and `~/.codex/sessions/*.jsonl`
   - Aggregates token usage by date and model
@@ -118,6 +120,7 @@ src/
 **2. Analysis Command (`vct analysis`):**
 
 **Single File Mode** (with `--path`):
+
 - `main.rs::Commands::Analysis` → `analysis/analyzer.rs::analyze_jsonl_file()`
   - `detector.rs` determines Claude vs Codex format (checks `parentUuid` field)
   - Routes to `claude_analyzer.rs` or `codex_analyzer.rs`
@@ -125,6 +128,7 @@ src/
 - Outputs detailed JSON with metadata (user, machineId, Git remote, etc.)
 
 **Batch Mode** (without `--path`):
+
 - `main.rs::Commands::Analysis` → `analysis/batch_analyzer.rs::analyze_all_sessions()`
   - Scans `~/.claude/projects/*.jsonl` and `~/.codex/sessions/*.jsonl`
   - Analyzes each file and aggregates by date and model
@@ -136,6 +140,7 @@ src/
 - With `--output`: Saves aggregated results as JSON array
 
 **3. Pricing System:**
+
 - URL: `https://github.com/BerriAI/litellm/raw/refs/heads/main/model_prices_and_context_window.json`
 - Cache location: `~/.vibe-coding-tracker/model_pricing_YYYY-MM-DD.json`
 - Cache TTL: 24 hours (by date)
@@ -150,10 +155,12 @@ src/
 ### Data Format Detection
 
 **Claude Code format:**
+
 - Presence of `parentUuid` field in records
 - Fields: `type`, `message.model`, `message.usage`, `message.content` (with tool_use blocks)
 
 **Codex format:**
+
 - OpenAI-style structure
 - Fields: `completion_response.usage`, `total_token_usage`, `reasoning_output_tokens`
 
@@ -182,24 +189,27 @@ docker build -f docker/Dockerfile --target prod -t vct:latest .
 
 # Run with session directories mounted
 docker run --rm \
-  -v ~/.claude:/root/.claude \
-  -v ~/.codex:/root/.codex \
-  vct:latest usage
+    -v ~/.claude:/root/.claude \
+    -v ~/.codex:/root/.codex \
+    vct:latest usage
 ```
 
 ## Dependencies
 
 **CLI & Serialization:**
+
 - `clap` (derive) - CLI parsing
 - `serde`, `serde_json` - JSON handling
 
 **TUI:**
+
 - `ratatui` - Terminal UI framework
 - `crossterm` - Terminal control
 - `comfy-table` - Static table rendering
 - `owo-colors` - Color output
 
 **Core:**
+
 - `anyhow`, `thiserror` - Error handling
 - `chrono` - Date/time
 - `reqwest` (rustls-tls) - HTTP client for pricing fetch
@@ -213,20 +223,24 @@ docker run --rm \
 ## Important Patterns
 
 **1. Cost Rounding:**
+
 - Interactive/table mode: round to 2 decimals (`$2.15`)
 - JSON/text mode: full precision (`2.1542304567890123`)
 
 **2. Date Aggregation:**
+
 - Group usage by date (YYYY-MM-DD format)
 - Display totals row in tables
 
 **3. Interactive TUI:**
+
 - Auto-refresh every 1 second
 - Highlight today's entries
 - Show memory usage and summary stats
 - Exit keys: `q`, `Esc`, `Ctrl+C`
 
 **4. Model Name Handling:**
+
 - Always use fuzzy matching when looking up pricing
 - Store matched model name for transparency
 - Handle both Claude (`claude-sonnet-4-20250514`) and OpenAI (`gpt-4-turbo`) formats
@@ -257,12 +271,14 @@ ls -la ~/.codex/sessions/
 ## Output Examples
 
 **Usage Text format:**
+
 ```
 2025-10-01 > claude-sonnet-4-20250514: $2.154230
 2025-10-02 > gpt-4-turbo: $0.250000
 ```
 
 **Usage JSON format:**
+
 ```json
 {
   "2025-10-01": [
@@ -274,7 +290,7 @@ ls -la ~/.codex/sessions/
         "cache_read_input_tokens": 230500,
         "cache_creation_input_tokens": 50000
       },
-      "cost_usd": 2.1542304567890123,
+      "cost_usd": 2.1542304567890125,
       "matched_model": "claude-sonnet-4"
     }
   ]
@@ -282,6 +298,7 @@ ls -la ~/.codex/sessions/
 ```
 
 **Batch Analysis JSON format:**
+
 ```json
 [
   {
@@ -314,6 +331,7 @@ ls -la ~/.codex/sessions/
 ## Release Profile
 
 The release build uses aggressive optimizations:
+
 - LTO: thin
 - Codegen units: 1
 - Stripped symbols

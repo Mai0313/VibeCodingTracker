@@ -19,19 +19,24 @@
 ## 🎯 Why Vibe Coding Tracker?
 
 ### 💰 Know Your Costs
+
 Stop wondering how much your AI coding sessions cost. Get **real-time cost tracking** with automatic pricing updates from [LiteLLM](https://github.com/BerriAI/litellm).
 
 ### 📊 Beautiful Visualizations
+
 Choose your preferred view:
+
 - **Interactive Dashboard**: Auto-refreshing terminal UI with live updates
 - **Static Reports**: Professional tables for documentation
 - **Script-Friendly**: Plain text and JSON for automation
 - **Full Precision**: Export exact costs for accounting
 
 ### 🚀 Zero Configuration
+
 Automatically detects and processes logs from both Claude Code and Codex. No setup required—just run and analyze.
 
 ### 🎨 Rich Insights
+
 - Token usage by model and date
 - Cost breakdown by cache types
 - File operations tracking
@@ -42,15 +47,15 @@ Automatically detects and processes logs from both Claude Code and Codex. No set
 
 ## ✨ Key Features
 
-| Feature | Description |
-|---------|-------------|
-| 🤖 **Auto-Detection** | Intelligently identifies Claude Code or Codex logs |
-| 💵 **Smart Pricing** | Fuzzy model matching + daily cache for speed |
-| 🎨 **4 Display Modes** | Interactive, Table, Text, and JSON outputs |
-| 📈 **Comprehensive Stats** | Tokens, costs, file ops, and tool calls |
-| ⚡ **High Performance** | Built with Rust for speed and reliability |
-| 🔄 **Live Updates** | Real-time dashboard refreshes every second |
-| 💾 **Efficient Caching** | Smart daily cache reduces API calls |
+| Feature                    | Description                                        |
+| -------------------------- | -------------------------------------------------- |
+| 🤖 **Auto-Detection**      | Intelligently identifies Claude Code or Codex logs |
+| 💵 **Smart Pricing**       | Fuzzy model matching + daily cache for speed       |
+| 🎨 **4 Display Modes**     | Interactive, Table, Text, and JSON outputs         |
+| 📈 **Comprehensive Stats** | Tokens, costs, file ops, and tool calls            |
+| ⚡ **High Performance**    | Built with Rust for speed and reliability          |
+| 🔄 **Live Updates**        | Real-time dashboard refreshes every second         |
+| 💾 **Efficient Caching**   | Smart daily cache reduces API calls                |
 
 ---
 
@@ -59,6 +64,7 @@ Automatically detects and processes logs from both Claude Code and Codex. No set
 ### Installation
 
 **Prerequisites**:
+
 - [Rust toolchain](https://rustup.rs/) (1.70+) for building from source
 - [Node.js](https://nodejs.org/) (v18+) for `npm` installation
 
@@ -106,10 +112,10 @@ cargo build --release
 vct <COMMAND> [OPTIONS]
 
 Commands:
-  usage       Show token usage and costs (default: interactive)
-  analysis    Analyze conversation files and export data
-  version     Display version information
-  help        Show help information
+usage       Show token usage and costs (default: interactive)
+analysis    Analyze conversation files and export data
+version     Display version information
+help        Show help information
 ```
 
 ---
@@ -137,6 +143,7 @@ vct usage --json
 ### What You Get
 
 The tool scans these directories automatically:
+
 - `~/.claude/projects/*.jsonl` (Claude Code)
 - `~/.codex/sessions/*.jsonl` (Codex)
 
@@ -165,6 +172,7 @@ Press 'q', 'Esc', or 'Ctrl+C' to quit
 ```
 
 **Features**:
+
 - ✨ Auto-refreshes every second
 - 🎯 Highlights today's entries
 - 🔄 Shows recently updated rows
@@ -232,7 +240,7 @@ vct usage --json
         },
         "service_tier": "standard"
       },
-      "cost_usd": 2.1542304567890123
+      "cost_usd": 2.1542304567890125
     }
   ]
 }
@@ -240,13 +248,13 @@ vct usage --json
 
 ### 🔍 Output Comparison
 
-| Feature | Interactive | Table | Text | JSON |
-|---------|-------------|-------|------|------|
-| **Best For** | Monitoring | Reports | Scripts | Integration |
-| **Cost Format** | $2.15 | $2.15 | $2.154230 | 2.1542304567890123 |
-| **Updates** | Real-time | Static | Static | Static |
-| **Colors** | ✅ | ✅ | ❌ | ❌ |
-| **Parseable** | ❌ | ❌ | ✅ | ✅ |
+| Feature         | Interactive | Table   | Text      | JSON               |
+| --------------- | ----------- | ------- | --------- | ------------------ |
+| **Best For**    | Monitoring  | Reports | Scripts   | Integration        |
+| **Cost Format** | $2.15       | $2.15   | $2.154230 | 2.1542304567890123 |
+| **Updates**     | Real-time   | Static  | Static    | Static             |
+| **Colors**      | ✅          | ✅      | ❌        | ❌                 |
+| **Parseable**   | ❌          | ❌      | ✅        | ✅                 |
 
 ### 💡 Use Cases
 
@@ -281,6 +289,7 @@ vct analysis --output batch_report.json
 ### What You Get
 
 **Single File Analysis**:
+
 - **Token Usage**: Input, output, and cache statistics by model
 - **File Operations**: Every read, write, and edit with full details
 - **Command History**: All shell commands executed
@@ -288,6 +297,7 @@ vct analysis --output batch_report.json
 - **Metadata**: User, machine ID, Git repo, timestamps
 
 **Batch Analysis**:
+
 - **Aggregated Metrics**: Grouped by date and model
 - **Line Counts**: Edit, read, and write operations
 - **Tool Statistics**: Bash, Edit, Read, TodoWrite, Write counts
@@ -386,12 +396,14 @@ Press 'q', 'Esc', or 'Ctrl+C' to quit
 ### 💡 Use Cases
 
 **Single File Analysis**:
+
 - **Usage Auditing**: Track what the AI did in each session
 - **Cost Attribution**: Calculate costs per project or feature
 - **Compliance**: Export detailed activity logs
 - **Analysis**: Understand coding patterns and tool usage
 
 **Batch Analysis**:
+
 - **Productivity Tracking**: Monitor coding activity over time
 - **Tool Usage Patterns**: Identify most-used tools across sessions
 - **Model Comparison**: Compare efficiency between different AI models
@@ -442,6 +454,7 @@ vct version --text
 ### Model Matching
 
 **Priority Order**:
+
 1. ✅ **Exact Match**: `claude-sonnet-4` → `claude-sonnet-4`
 2. 🔄 **Normalized**: `claude-sonnet-4-20250514` → `claude-sonnet-4`
 3. 🔍 **Substring**: `custom-gpt-4` → `gpt-4`
@@ -467,9 +480,9 @@ docker build -f docker/Dockerfile --target prod -t vct:latest .
 
 # Run with your sessions
 docker run --rm \
-  -v ~/.claude:/root/.claude \
-  -v ~/.codex:/root/.codex \
-  vct:latest usage
+    -v ~/.claude:/root/.claude \
+    -v ~/.codex:/root/.codex \
+    vct:latest usage
 ```
 
 ---
@@ -534,12 +547,12 @@ vct usage --table
 
 Built with Rust for **speed** and **reliability**:
 
-| Operation | Time |
-|-----------|------|
-| Parse 10MB JSONL | ~320ms |
-| Analyze 1000 events | ~45ms |
-| Load cached pricing | ~2ms |
-| Interactive refresh | ~30ms |
+| Operation           | Time   |
+| ------------------- | ------ |
+| Parse 10MB JSONL    | ~320ms |
+| Analyze 1000 events | ~45ms  |
+| Load cached pricing | ~2ms   |
+| Interactive refresh | ~30ms  |
 
 **Binary Size**: ~3-5 MB (stripped)
 

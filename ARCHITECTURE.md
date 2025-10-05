@@ -65,16 +65,19 @@ Vibe Coding Tracker is a Rust-based CLI tool designed to analyze AI coding assis
 #### 1. Entry Points (`main.rs`, `lib.rs`, `cli.rs`)
 
 **main.rs**
+
 - Application entry point
 - Command routing to usage/analysis pipelines
 - Error handling and exit codes
 
 **lib.rs**
+
 - Library exports for external use
 - Version information (`get_version()`)
 - Public API surface
 
 **cli.rs**
+
 - Clap-based CLI definitions
 - Commands: `usage`, `analysis`, `version`
 - Argument parsing and validation
@@ -84,10 +87,12 @@ Vibe Coding Tracker is a Rust-based CLI tool designed to analyze AI coding assis
 Defines core data structures with serde serialization:
 
 **usage.rs**
+
 - `UsageResult`: Per-model token usage and cost
 - `DateUsageResult`: Date-indexed usage map
 
 **analysis.rs**
+
 - `CodeAnalysis`: Comprehensive conversation metadata
   - User info (username, hostname, machineId)
   - Git metadata (remote URL, commit hash)
@@ -96,11 +101,13 @@ Defines core data structures with serde serialization:
   - File operation counts
 
 **claude.rs**
+
 - `ClaudeMessage`: Claude Code message format
 - `ClaudeContent`: Content block types (text, tool_use, tool_result)
 - `ClaudeUsage`: Token usage with cache fields
 
 **codex.rs**
+
 - `CodexMessage`: OpenAI/Codex message format
 - `CompletionResponse`: Response with usage data
 - `ReasoningTokens`: Reasoning output token tracking
@@ -108,11 +115,13 @@ Defines core data structures with serde serialization:
 #### 3. Pricing System (`pricing.rs`)
 
 **Responsibilities:**
+
 - Fetch LiteLLM pricing data from GitHub
 - Cache pricing with 24-hour TTL (daily cache files)
 - Fuzzy model name matching (Jaro-Winkler algorithm)
 
 **Matching Strategy (Priority Order):**
+
 1. **Exact match**: Direct string equality
 2. **Normalized match**: Strip version suffixes (e.g., `-20250514`)
 3. **Substring match**: Check if model name contains pricing key
@@ -120,11 +129,13 @@ Defines core data structures with serde serialization:
 5. **Fallback**: Return $0.00 if no match found
 
 **Cache Location:**
+
 ```
 ~/.vibe-coding-tracker/model_pricing_YYYY-MM-DD.json
 ```
 
 **Cost Calculation:**
+
 ```rust
 cost = (input × input_cost_per_token) +
        (output × output_cost_per_token) +
@@ -135,6 +146,7 @@ cost = (input × input_cost_per_token) +
 #### 4. Usage Analysis Module (`src/usage/`)
 
 **calculator.rs**
+
 - `get_usage_from_directories()`: Main aggregation function
   - Scans `~/.claude/projects/*.jsonl`
   - Scans `~/.codex/sessions/*.jsonl`
@@ -142,6 +154,7 @@ cost = (input × input_cost_per_token) +
   - Calculates costs via pricing system
 
 **display.rs**
+
 - `display_usage_interactive()`: Ratatui-based TUI with 1s refresh
 - `display_usage_table()`: Static comfy-table output (UTF8_FULL preset)
 - `display_usage_text()`: Plain text format (`Date > model: cost`)
@@ -150,20 +163,24 @@ cost = (input × input_cost_per_token) +
 #### 5. Analysis Module (`src/analysis/`)
 
 **analyzer.rs**
+
 - `analyze_jsonl_file()`: Single file analysis entry point
 - Routes to Claude/Codex analyzers based on detection
 
 **batch_analyzer.rs**
+
 - `analyze_all_sessions()`: Batch processing for all sessions
 - Aggregates metrics by date and model:
   - Edit/Read/Write line counts
   - Tool call counts (Bash, Edit, Read, TodoWrite, Write)
 
 **detector.rs**
+
 - `detect_format()`: Determines Claude vs Codex format
 - Detection logic: Checks for `parentUuid` field (Claude-specific)
 
 **claude_analyzer.rs**
+
 - Parses Claude Code JSONL format
 - Extracts:
   - Tool usage (tool_use blocks in content)
@@ -172,6 +189,7 @@ cost = (input × input_cost_per_token) +
   - Conversation metrics
 
 **codex_analyzer.rs**
+
 - Parses Codex/OpenAI JSONL format
 - Extracts:
   - Token usage from `completion_response.usage`
@@ -179,6 +197,7 @@ cost = (input × input_cost_per_token) +
   - Total token usage
 
 **display.rs**
+
 - `display_analysis_interactive()`: Ratatui TUI for batch analysis
   - Columns: Date, Model, Edit Lines, Read Lines, Write Lines, Tool Counts
   - Auto-refresh, totals row, memory usage
@@ -187,24 +206,29 @@ cost = (input × input_cost_per_token) +
 #### 6. Utilities Module (`src/utils/`)
 
 **file.rs**
+
 - `read_jsonl()`: Line-by-line JSONL parsing
 - `save_json_pretty()`: Pretty-printed JSON output
 
 **paths.rs**
+
 - `resolve_paths()`: Resolves Claude/Codex session directories
 - Handles `~` expansion via `home` crate
 
 **git.rs**
+
 - `get_git_remote()`: Extracts Git remote URL from repository
 - Uses `git config --get remote.origin.url`
 
 **time.rs**
+
 - `format_timestamp()`: ISO 8601 date formatting
 - Date aggregation utilities
 
 #### 7. TUI Module (`src/tui/`)
 
 Terminal UI components built with Ratatui:
+
 - Widgets: Tables, borders, styled text
 - Layout: Constraints-based responsive design
 - Event handling: Keyboard input (q, Esc, Ctrl+C)
@@ -332,6 +356,7 @@ analysis/batch_analyzer.rs::analyze_all_sessions()
 **Location:** `analysis/detector.rs`
 
 **Logic:**
+
 ```rust
 fn detect_format(line: &str) -> Result<FileFormat> {
     let value: serde_json::Value = serde_json::from_str(line)?;
@@ -351,11 +376,13 @@ fn detect_format(line: &str) -> Result<FileFormat> {
 ### 2. Pricing Cache System
 
 **Design Goals:**
+
 - Minimize network requests
 - Daily pricing updates
 - Offline capability (stale cache acceptable)
 
 **Implementation:**
+
 ```rust
 // Cache file naming: model_pricing_YYYY-MM-DD.json
 let cache_path = format!("{}/model_pricing_{}.json", cache_dir, today);
@@ -372,6 +399,7 @@ if cache_path.exists() {
 **Framework:** Ratatui (formerly tui-rs)
 
 **Event Loop:**
+
 ```rust
 loop {
     terminal.draw(|f| {
@@ -392,6 +420,7 @@ loop {
 ```
 
 **Benefits:**
+
 - Real-time updates
 - Keyboard navigation
 - Responsive layout
@@ -404,6 +433,7 @@ loop {
 **Threshold:** 0.7 similarity score
 
 **Example Matches:**
+
 ```
 User model: "claude-sonnet-4-20250514"
 Pricing DB: "claude-sonnet-4"
@@ -423,6 +453,7 @@ Match: Fuzzy (0.85 similarity)
 ### 1. Pipeline Architecture
 
 Each analysis flow follows a clear pipeline:
+
 ```
 Input → Detection → Parsing → Aggregation → Display → Output
 ```
@@ -430,6 +461,7 @@ Input → Detection → Parsing → Aggregation → Display → Output
 ### 2. Strategy Pattern (Display Modes)
 
 Multiple display strategies for same data:
+
 - `display_usage_interactive()`
 - `display_usage_table()`
 - `display_usage_text()`
@@ -438,12 +470,14 @@ Multiple display strategies for same data:
 ### 3. Repository Pattern (Data Access)
 
 Centralized file access through `utils/file.rs`:
+
 - `read_jsonl()`: Streaming JSONL reader
 - `save_json_pretty()`: Formatted JSON writer
 
 ### 4. Factory Pattern (Format Detection)
 
 `detector.rs` acts as factory, routing to appropriate analyzer:
+
 ```rust
 match detect_format(line)? {
     FileFormat::Claude => claude_analyzer::analyze(),
@@ -454,10 +488,12 @@ match detect_format(line)? {
 ### 5. Error Handling Strategy
 
 **Libraries:**
+
 - `anyhow`: Application-level errors (main.rs, high-level logic)
 - `thiserror`: Library-level errors (custom error types)
 
 **Approach:**
+
 - Propagate errors with `?` operator
 - Context-aware error messages
 - Graceful degradation (e.g., $0.00 for unknown models)
@@ -467,44 +503,53 @@ match detect_format(line)? {
 ### Critical Dependencies
 
 **CLI & Serialization:**
+
 - `clap` (4.x): Derive-based CLI parsing
 - `serde` + `serde_json`: Serialization framework
 
 **TUI:**
+
 - `ratatui`: Terminal UI framework
 - `crossterm`: Cross-platform terminal control
 - `comfy-table`: Static table rendering
 
 **HTTP & Data:**
+
 - `reqwest` (rustls-tls): Async HTTP client
 - `chrono`: Date/time manipulation
 
 **File System:**
+
 - `walkdir`: Recursive directory traversal
 - `home`: Platform-agnostic home directory
 
 **Algorithms:**
+
 - `strsim`: Fuzzy string matching
 - `regex`: Pattern matching
 
 **System:**
+
 - `sysinfo`: Memory and system stats
 - `hostname`: Machine hostname retrieval
 
 ### Dependency Rationale
 
 **Why Ratatui over alternatives?**
+
 - Active maintenance
 - Rich widget library
 - Flexible layout system
 - Efficient rendering
 
 **Why rustls-tls for reqwest?**
+
 - Smaller binary size than native-tls
 - Pure Rust implementation
 - Better cross-compilation
 
 **Why comfy-table?**
+
 - UTF-8 box drawing
 - Flexible styling
 - Column auto-sizing
@@ -516,11 +561,13 @@ match detect_format(line)? {
 **Approach:** Line-by-line parsing instead of loading entire file
 
 **Benefits:**
+
 - Constant memory usage
 - Early error detection
 - Handles large files (>100MB)
 
 **Implementation:**
+
 ```rust
 for line in BufReader::new(file).lines() {
     let line = line?;
@@ -531,16 +578,19 @@ for line in BufReader::new(file).lines() {
 ### 2. Caching Strategy
 
 **Pricing Cache:**
+
 - Daily TTL reduces network requests
 - Local file cache (no database overhead)
 
 **No Session Cache:**
+
 - Always read fresh data (session files change frequently)
 - Acceptable trade-off for CLI tool
 
 ### 3. Aggregation Efficiency
 
 **Data Structures:**
+
 ```rust
 HashMap<String, HashMap<String, UsageResult>>
 // Outer key: Date (YYYY-MM-DD)
@@ -554,6 +604,7 @@ HashMap<String, HashMap<String, UsageResult>>
 **Interval:** 1 second
 
 **Rationale:**
+
 - Balance between responsiveness and CPU usage
 - Session files updated infrequently (minutes/hours)
 - Minimal overhead for re-aggregation
@@ -561,11 +612,12 @@ HashMap<String, HashMap<String, UsageResult>>
 ### 5. Binary Size Optimization
 
 **Release Profile:**
+
 ```toml
 [profile.release]
-lto = "thin"           # Link-time optimization
-codegen-units = 1      # Better optimization
-strip = true           # Remove debug symbols
+lto = "thin"      # Link-time optimization
+codegen-units = 1 # Better optimization
+strip = true      # Remove debug symbols
 ```
 
 **Result:** ~3-5 MB binary
@@ -587,11 +639,17 @@ strip = true           # Remove debug symbols
       "cache_creation_input_tokens": 500
     },
     "content": [
-      {"type": "text", "text": "..."},
+      {
+        "type": "text",
+        "text": "..."
+      },
       {
         "type": "tool_use",
         "name": "Edit",
-        "input": {"old_string": "...", "new_string": "..."}
+        "input": {
+          "old_string": "...",
+          "new_string": "..."
+        }
       }
     ]
   }
@@ -636,6 +694,7 @@ strip = true           # Remove debug symbols
 ### Adding New AI Platforms
 
 1. **Add model to `src/models/`**:
+
    ```rust
    // src/models/newplatform.rs
    #[derive(Deserialize)]
@@ -643,6 +702,7 @@ strip = true           # Remove debug symbols
    ```
 
 2. **Update detector**:
+
    ```rust
    // src/analysis/detector.rs
    pub enum FileFormat {
@@ -653,12 +713,14 @@ strip = true           # Remove debug symbols
    ```
 
 3. **Implement analyzer**:
+
    ```rust
    // src/analysis/newplatform_analyzer.rs
    pub fn analyze_newplatform(lines: Vec<String>) -> Result<CodeAnalysis>
    ```
 
 4. **Update router**:
+
    ```rust
    // src/analysis/analyzer.rs
    match format {
@@ -670,6 +732,7 @@ strip = true           # Remove debug symbols
 ### Adding New Display Formats
 
 Implement trait-based abstraction:
+
 ```rust
 trait DisplayFormatter {
     fn format(&self, data: &UsageResult) -> String;
@@ -719,10 +782,12 @@ struct JsonFormatter;
 ### Integration Tests
 
 Located in `tests/`:
+
 - `test_integration_usage.rs`: End-to-end usage command
 - `test_integration_analysis.rs`: End-to-end analysis command
 
 **Test Fixtures:**
+
 - `examples/test_conversation.jsonl`: Claude format
 - `examples/test_conversation_oai.jsonl`: Codex format
 
@@ -756,15 +821,18 @@ cargo run -- usage --invalid-flag
 ### Scalability
 
 **Current Limits:**
+
 - File count: ~1000 sessions (tested)
 - File size: Up to 1GB per file (streaming parser)
-- Memory: <50MB typical usage
+- Memory: \<50MB typical usage
 
 **Bottlenecks:**
+
 - Aggregation is O(n) where n = total lines across all files
 - No indexing or incremental updates
 
 **Solutions for Scale:**
+
 - Incremental aggregation (track last-processed line)
 - SQLite index on (date, model)
 - Parallel file processing (Rayon)
