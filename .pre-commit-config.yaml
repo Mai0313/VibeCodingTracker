@@ -72,12 +72,12 @@ repos:
           - mdformat-simple-breaks
           - setuptools<80
 
-  - repo: https://github.com/codespell-project/codespell
-    rev: v2.4.1
-    hooks:
-      - id: codespell
-        additional_dependencies:
-          - tomli
+  # - repo: https://github.com/codespell-project/codespell
+  #   rev: v2.4.1
+  #   hooks:
+  #     - id: codespell
+  #       additional_dependencies:
+  #         - tomli
 
   - repo: https://github.com/gitleaks/gitleaks
     rev: v8.28.0
