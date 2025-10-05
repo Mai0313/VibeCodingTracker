@@ -14,6 +14,8 @@
 
 [English](README.md) | [繁體中文](README.zh-TW.md) | [简体中文](README.zh-CN.md)
 
+> 注意：文中的 CLI 示例默认使用短别名 `vct`。如果你是从源码构建的，生成的二进制名称是 `vibe_coding_tracker`，可以手动创建别名，或在执行命令时把 `vct` 替换为完整名称。
+
 ---
 
 ## 🎯 为什么选择 Vibe Coding Tracker？
@@ -82,25 +84,27 @@ git clone https://github.com/Mai0313/VibeCodingTracker.git
 cd VibeCodingTracker
 cargo build --release
 
-# 二进制文件位置：
-# - ./target/release/vibe_coding_tracker (完整名称)
-# - ./target/release/vct (短别名)
+# 二进制文件位置
+./target/release/vibe_coding_tracker
+
+# （可选）创建短别名（请按需调整路径）
+ln -sf "$(pwd)/target/release/vibe_coding_tracker" ~/.local/bin/vct
 ```
 
 ### 首次运行
 
 ```bash
-# 使用交互式仪表板查看使用量（使用短别名）
-./target/release/vct usage
+# 使用交互式仪表板查看使用量（已配置短别名时）
+vct usage
 
 # 或使用完整名称
 ./target/release/vibe_coding_tracker usage
 
 # 分析特定对话
-./target/release/vct analysis --path ~/.claude/projects/session.jsonl
+./target/release/vibe_coding_tracker analysis --path ~/.claude/projects/session.jsonl
 ```
 
-> 💡 **提示**：使用 `vct` 作为 `vibe_coding_tracker` 的短别名，节省输入时间！
+> 💡 **提示**：使用 `vct` 作为 `vibe_coding_tracker` 的短别名，节省输入时间——可以通过 `ln -sf "$(pwd)/target/release/vibe_coding_tracker" ~/.local/bin/vct` 手动创建。
 
 ---
 
@@ -109,7 +113,8 @@ cargo build --release
 ### 🔍 快速参考
 
 ```bash
-vibe_coding_tracker <命令> [选项]
+vct <命令> [选项]
+# 如果未配置别名，请改用 `vibe_coding_tracker`
 
 命令：
 usage       显示 token 使用量和成本（默认：交互式）

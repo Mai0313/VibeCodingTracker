@@ -14,7 +14,7 @@ This document provides a comprehensive overview of the Vibe Coding Tracker's arc
 
 ## System Overview
 
-Vibe Coding Tracker is a Rust-based CLI tool designed to analyze AI coding assistant usage across multiple platforms (Claude Code and Codex). The system employs a modular architecture with clear separation of concerns:
+Vibe Coding Tracker is a Rust-based CLI tool designed to analyze AI coding assistant usage across multiple platforms (Claude Code, Codex, and Gemini). The system employs a modular architecture with clear separation of concerns:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -34,11 +34,12 @@ Vibe Coding Tracker is a Rust-based CLI tool designed to analyze AI coding assis
          ▼         ▼                         ▼
 ┌─────────────────────┐          ┌──────────────────────────┐
 │   Pricing System    │          │   Format Detection       │
-│   - fetch_model_    │          │   - Claude/Codex         │
+│   - fetch_model_    │          │   - Claude/Codex/Gemini  │
 │     pricing()       │          │   - detector.rs          │
 │   - fuzzy matching  │          │   - claude_analyzer.rs   │
 │   - caching         │          │   - codex_analyzer.rs    │
-└─────────────────────┘          └──────────────────────────┘
+└─────────────────────┘          │   - gemini_analyzer.rs   │
+                                 └──────────────────────────┘
          │                                   │
          └───────────┬───────────────────────┘
                      ▼
@@ -46,7 +47,8 @@ Vibe Coding Tracker is a Rust-based CLI tool designed to analyze AI coding assis
          │   Data Models         │
          │   - UsageResult       │
          │   - CodeAnalysis      │
-         │   - Claude/Codex      │
+         │   - Claude/Codex/     │
+         │     Gemini            │
          └───────────────────────┘
                      │
                      ▼
@@ -112,6 +114,12 @@ Defines core data structures with serde serialization:
 - `CompletionResponse`: Response with usage data
 - `ReasoningTokens`: Reasoning output token tracking
 
+**gemini.rs**
+
+- `GeminiMessage`: Gemini message format
+- `GeminiUsage`: Token usage tracking for Gemini
+- `GeminiContent`: Content types for Gemini API
+
 #### 3. Pricing System (`pricing.rs`)
 
 **Responsibilities:**
@@ -150,6 +158,7 @@ cost = (input × input_cost_per_token) +
 - `get_usage_from_directories()`: Main aggregation function
   - Scans `~/.claude/projects/*.jsonl`
   - Scans `~/.codex/sessions/*.jsonl`
+  - Scans `~/.gemini/tmp/<project_hash>/chats/*.json`
   - Aggregates tokens by date and model
   - Calculates costs via pricing system
 
@@ -176,7 +185,7 @@ cost = (input × input_cost_per_token) +
 
 **detector.rs**
 
-- `detect_format()`: Determines Claude vs Codex format
+- `detect_format()`: Determines Claude, Codex, or Gemini format
 - Detection logic: Checks for `parentUuid` field (Claude-specific)
 
 **claude_analyzer.rs**
@@ -212,7 +221,7 @@ cost = (input × input_cost_per_token) +
 
 **paths.rs**
 
-- `resolve_paths()`: Resolves Claude/Codex session directories
+- `resolve_paths()`: Resolves Claude, Codex, and Gemini session directories
 - Handles `~` expansion via `home` crate
 
 **git.rs**
@@ -225,7 +234,7 @@ cost = (input × input_cost_per_token) +
 - `format_timestamp()`: ISO 8601 date formatting
 - Date aggregation utilities
 
-#### 7. TUI Module (`src/tui/`)
+#### 7. TUI Components (`src/usage/display.rs`, `src/analysis/display.rs`)
 
 Terminal UI components built with Ratatui:
 
@@ -251,7 +260,7 @@ User runs: vct usage [--table|--text|--json]
 usage/calculator.rs::get_usage_from_directories()
                 │
                 ├─> utils/paths.rs::resolve_paths()
-                │   └─> Returns ~/.claude/projects, ~/.codex/sessions
+                │   └─> Returns ~/.claude/projects, ~/.codex/sessions, ~/.gemini/tmp
                 │
                 ├─> walkdir scans *.jsonl files
                 │
@@ -296,7 +305,7 @@ analysis/analyzer.rs::analyze_jsonl_file()
                 ├─> utils/file.rs::read_jsonl()
                 │
                 ├─> analysis/detector.rs::detect_format()
-                │   └─> Check for 'parentUuid' field
+                │   └─> Identify Gemini (sessionId/projectHash/messages) or Claude (`parentUuid`)
                 │
                 ├─> Route to analyzer:
                 │   ├─> Claude: claude_analyzer.rs
@@ -306,10 +315,13 @@ analysis/analyzer.rs::analyze_jsonl_file()
                 │   │   ├─> Extract Git info
                 │   │   └─> Aggregate tool call counts
                 │   │
-                │   └─> Codex: codex_analyzer.rs
+                │   ├─> Codex: codex_analyzer.rs
                 │       ├─> Parse CodexMessage structs
                 │       ├─> Extract completion_response.usage
                 │       └─> Handle reasoning tokens
+                │
+                │   └─> Gemini: gemini_analyzer.rs
+                │       └─> Parse session JSON (messages, tokens)
                 │
                 ▼
         Build CodeAnalysis struct
@@ -358,20 +370,35 @@ analysis/batch_analyzer.rs::analyze_all_sessions()
 **Logic:**
 
 ```rust
-fn detect_format(line: &str) -> Result<FileFormat> {
-    let value: serde_json::Value = serde_json::from_str(line)?;
-
-    if value.get("parentUuid").is_some() {
-        Ok(FileFormat::Claude)
-    } else if value.get("completion_response").is_some() {
-        Ok(FileFormat::Codex)
-    } else {
-        Err(anyhow!("Unknown format"))
+fn detect_format(records: &[Value]) -> FileFormat {
+    if records.is_empty() {
+        return FileFormat::Codex;
     }
+
+    if records.len() == 1 {
+        if let Some(obj) = records[0].as_object() {
+            if obj.contains_key("sessionId")
+                && obj.contains_key("projectHash")
+                && obj.contains_key("messages")
+            {
+                return FileFormat::Gemini;
+            }
+        }
+    }
+
+    for record in records {
+        if let Some(obj) = record.as_object() {
+            if obj.contains_key("parentUuid") {
+                return FileFormat::Claude;
+            }
+        }
+    }
+
+    FileFormat::Codex
 }
 ```
 
-**Rationale:** Claude Code includes `parentUuid` for conversation threading, while Codex uses OpenAI's standard format.
+**Rationale:** Gemini exports wrap a session in a single JSON object with `sessionId`/`projectHash`, Claude Code records contain `parentUuid`, and Codex defaults to the OpenAI event log structure.
 
 ### 2. Pricing Cache System
 
@@ -482,6 +509,7 @@ Centralized file access through `utils/file.rs`:
 match detect_format(line)? {
     FileFormat::Claude => claude_analyzer::analyze(),
     FileFormat::Codex => codex_analyzer::analyze(),
+    FileFormat::Gemini => gemini_analyzer::analyze(),
 }
 ```
 
@@ -685,6 +713,13 @@ strip = true      # Remove debug symbols
     ├── session-1.jsonl
     └── session-2.jsonl
 
+~/.gemini/
+└── tmp/
+    └── <project-hash>/
+        └── chats/
+            ├── session-1.json
+            └── session-2.json
+
 ~/.vibe-coding-tracker/
 └── model_pricing_2025-10-05.json  # Daily cache
 ```
@@ -708,6 +743,7 @@ strip = true      # Remove debug symbols
    pub enum FileFormat {
        Claude,
        Codex,
+       Gemini,
        NewPlatform,  // Add here
    }
    ```
@@ -753,7 +789,7 @@ struct JsonFormatter;
 
 ### File Access
 
-- Only reads from known directories (`~/.claude`, `~/.codex`)
+- Only reads from known directories (`~/.claude`, `~/.codex`, `~/.gemini`)
 - No arbitrary file write (output only to user-specified paths)
 - No command execution in parsed data
 

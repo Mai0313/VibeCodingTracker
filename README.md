@@ -14,6 +14,8 @@
 
 [English](README.md) | [繁體中文](README.zh-TW.md) | [简体中文](README.zh-CN.md)
 
+> Note: CLI examples use the short alias `vct`. If you built from source, the compiled binary is named `vibe_coding_tracker`; create an alias or replace `vct` with the full name when running commands.
+
 ---
 
 ## 🎯 Why Vibe Coding Tracker?
@@ -82,25 +84,27 @@ git clone https://github.com/Mai0313/VibeCodingTracker.git
 cd VibeCodingTracker
 cargo build --release
 
-# Binary locations:
-# - ./target/release/vibe_coding_tracker (full name)
-# - ./target/release/vct (short alias)
+# Binary location
+./target/release/vibe_coding_tracker
+
+# Optional: create a short alias (adjust the paths as needed)
+ln -sf "$(pwd)/target/release/vibe_coding_tracker" ~/.local/bin/vct
 ```
 
 ### First Run
 
 ```bash
-# View your usage with interactive dashboard (using short alias)
-./target/release/vct usage
+# View your usage with the short alias (if available)
+vct usage
 
-# Or use the full name
-./target/release/vct usage
+# Or run the binary built by Cargo
+./target/release/vibe_coding_tracker usage
 
 # Analyze a specific conversation
-./target/release/vct analysis --path ~/.claude/projects/session.jsonl
+./target/release/vibe_coding_tracker analysis --path ~/.claude/projects/session.jsonl
 ```
 
-> 💡 **Tip**: Use `vct` as a short alias for `vibe_coding_tracker` to save typing!
+> 💡 **Tip**: Use `vct` as a short alias for `vibe_coding_tracker` to save typing—create it manually with `ln -sf ./target/release/vibe_coding_tracker ~/.local/bin/vct` (or any path you prefer).
 
 ---
 
@@ -110,6 +114,7 @@ cargo build --release
 
 ```bash
 vct <COMMAND> [OPTIONS]
+# Replace with `vibe_coding_tracker` if you are using the full binary name
 
 Commands:
 usage       Show token usage and costs (default: interactive)
