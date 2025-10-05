@@ -68,14 +68,6 @@ jobs:
         run: |
           cargo build --target ${{ matrix.target }} --release --locked --bin vibe_coding_tracker
 
-      - name: Generate a changelog
-        uses: orhun/git-cliff-action@v4
-        with:
-          config: cliff.toml
-          args: --latest
-        env:
-          OUTPUT: ./dist/CHANGELOG.md
-
       - name: Stage Artifact
         shell: bash
         run: |
@@ -138,15 +130,6 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Generate a changelog
-        uses: orhun/git-cliff-action@v4
-        id: git-cliff
-        with:
-          config: cliff.toml
-          args: --latest
-        env:
-          OUTPUT: CHANGELOG.md
-
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -159,7 +142,6 @@ jobs:
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v2
         with:
-          body: ${{ steps.git-cliff.outputs.content }}
           files: |
             dist/**/*
 
