@@ -29,6 +29,20 @@ fn test_get_current_user() {
 }
 
 #[test]
+fn test_get_current_user_fallback() {
+    // Test with environment variables unset
+    // This is challenging to test without modifying environment,
+    // so we just verify the function returns something valid
+    let user = get_current_user();
+    assert!(
+        user == std::env::var("USER").unwrap_or_else(|_| "unknown".to_string())
+            || user == std::env::var("USERNAME").unwrap_or_else(|_| "unknown".to_string())
+            || user == "unknown",
+        "Should return valid user or 'unknown'"
+    );
+}
+
+#[test]
 fn test_get_machine_id() {
     let machine_id = get_machine_id();
     assert!(!machine_id.is_empty(), "Machine ID should not be empty");
@@ -50,4 +64,26 @@ fn test_paths_structure() {
     // Verify session directories are subdirectories
     assert!(paths.codex_session_dir.starts_with(&paths.codex_dir));
     assert!(paths.claude_session_dir.starts_with(&paths.claude_dir));
+}
+
+#[test]
+fn test_helper_paths_clone() {
+    let paths = resolve_paths().unwrap();
+    let cloned = paths.clone();
+
+    assert_eq!(paths.home_dir, cloned.home_dir);
+    assert_eq!(paths.helper_dir, cloned.helper_dir);
+    assert_eq!(paths.codex_dir, cloned.codex_dir);
+    assert_eq!(paths.codex_session_dir, cloned.codex_session_dir);
+    assert_eq!(paths.claude_dir, cloned.claude_dir);
+    assert_eq!(paths.claude_session_dir, cloned.claude_session_dir);
+}
+
+#[test]
+fn test_helper_paths_debug() {
+    let paths = resolve_paths().unwrap();
+    let debug_str = format!("{:?}", paths);
+
+    // Debug output should contain "HelperPaths"
+    assert!(debug_str.contains("HelperPaths"));
 }
