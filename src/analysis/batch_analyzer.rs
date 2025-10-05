@@ -104,6 +104,11 @@ fn aggregate_analysis_result(
                     .and_then(|c| c.as_object())
                 {
                     for (model, _usage) in conv_usage {
+                        // Skip synthetic models
+                        if model.contains("<synthetic>") {
+                            continue;
+                        }
+
                         // Create unique key for date + model
                         let key = format!("{}:{}", date, model);
 

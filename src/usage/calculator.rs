@@ -179,6 +179,11 @@ fn process_claude_usage_data(
     model: &str,
     usage: &Value,
 ) {
+    // Skip synthetic models
+    if model.contains("<synthetic>") {
+        return;
+    }
+
     let usage_obj = match usage.as_object() {
         Some(obj) => obj,
         None => return,
@@ -245,6 +250,11 @@ fn process_codex_usage_data(
     model: &str,
     info: &Value,
 ) {
+    // Skip synthetic models
+    if model.contains("<synthetic>") {
+        return;
+    }
+
     let info_obj = match info.as_object() {
         Some(obj) => obj,
         None => return,
