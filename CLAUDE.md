@@ -167,12 +167,12 @@ src/
   - Compares current version (from `CARGO_PKG_VERSION`) with latest tag version
   - Downloads platform-specific compressed archive from release assets
   - Extracts the archive (`.tar.gz` for Unix, `.zip` for Windows)
-  - **Linux/macOS**: 
+  - **Linux/macOS**:
     - Extracts `.tar.gz` archive
     - Renames current binary to `.old` (backup)
     - Replaces with new binary directly
     - User can restart immediately
-  - **Windows**: 
+  - **Windows**:
     - Extracts `.zip` archive
     - Downloads new binary with `.new` extension
     - Creates batch script (`update_vct.bat`) to replace after exit

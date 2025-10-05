@@ -35,22 +35,21 @@ jobs:
 
       - name: Generate a changelog
         uses: orhun/git-cliff-action@v4
-        id: git-cliff
+        id: git-cliff-changelog
+        with:
+          config: cliff.toml
+          args: --unreleased
+
+      - name: Generate a tag
+        uses: orhun/git-cliff-action@v4
+        id: git-cliff-tag
         with:
           config: cliff.toml
           args: --bumped-version
 
-      - name: Check tags
-        run: |
-          echo '${{ steps.git-cliff.outputs.version }}'
-
-      - name: Check Version
-        run: |
-          echo '${{ steps.git-cliff.outputs.content }}'
-
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.git-cliff.outputs.version }}
-          body: ${{ steps.git-cliff.outputs.content }}
+          tag_name: ${{ steps.git-cliff-tag.outputs.content }}
+          body: ${{ steps.git-cliff-changelog.outputs.content }}
           draft: true
