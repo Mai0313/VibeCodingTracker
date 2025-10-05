@@ -1,5 +1,6 @@
 use crate::models::DateUsageResult;
 use crate::pricing::{calculate_cost, fetch_model_pricing, get_model_pricing, ModelPricing};
+use crate::utils::extract_token_counts;
 use comfy_table::{presets::UTF8_FULL, Cell, CellAlignment, Color, Table};
 use owo_colors::OwoColorize;
 use ratatui::{
@@ -450,62 +451,19 @@ fn extract_usage_row(
     usage: &Value,
     pricing_map: &HashMap<String, ModelPricing>,
 ) -> UsageRow {
+    // Extract token counts using utility function
+    let counts = extract_token_counts(usage);
+
     let mut row = UsageRow {
         date: date.to_string(),
         model: model.to_string(),
+        input_tokens: counts.input_tokens,
+        output_tokens: counts.output_tokens,
+        cache_read: counts.cache_read,
+        cache_creation: counts.cache_creation,
+        total: counts.total,
         ..Default::default()
     };
-
-    if let Some(usage_obj) = usage.as_object() {
-        // Claude usage
-        if let Some(input) = usage_obj.get("input_tokens").and_then(|v| v.as_i64()) {
-            row.input_tokens = input;
-        }
-        if let Some(output) = usage_obj.get("output_tokens").and_then(|v| v.as_i64()) {
-            row.output_tokens = output;
-        }
-        if let Some(cache_read) = usage_obj
-            .get("cache_read_input_tokens")
-            .and_then(|v| v.as_i64())
-        {
-            row.cache_read = cache_read;
-        }
-        if let Some(cache_creation) = usage_obj
-            .get("cache_creation_input_tokens")
-            .and_then(|v| v.as_i64())
-        {
-            row.cache_creation = cache_creation;
-        }
-        row.total = row.input_tokens + row.output_tokens + row.cache_read + row.cache_creation;
-
-        // Codex usage
-        if let Some(total_usage) = usage_obj
-            .get("total_token_usage")
-            .and_then(|v| v.as_object())
-        {
-            if let Some(input) = total_usage.get("input_tokens").and_then(|v| v.as_i64()) {
-                row.input_tokens = input;
-            }
-            if let Some(output) = total_usage.get("output_tokens").and_then(|v| v.as_i64()) {
-                row.output_tokens += output;
-            }
-            if let Some(reasoning) = total_usage
-                .get("reasoning_output_tokens")
-                .and_then(|v| v.as_i64())
-            {
-                row.output_tokens += reasoning;
-            }
-            if let Some(cache_read) = total_usage
-                .get("cached_input_tokens")
-                .and_then(|v| v.as_i64())
-            {
-                row.cache_read = cache_read;
-            }
-            if let Some(total) = total_usage.get("total_tokens").and_then(|v| v.as_i64()) {
-                row.total = total;
-            }
-        }
-    }
 
     // Calculate cost with fuzzy matching
     let pricing_result = get_model_pricing(model, pricing_map);

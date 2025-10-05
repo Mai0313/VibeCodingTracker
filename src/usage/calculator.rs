@@ -1,10 +1,10 @@
-use crate::models::{DateUsageResult, GeminiSession, UsageResult};
-use crate::utils::{read_json, read_jsonl, resolve_paths};
+use crate::analysis::detector::detect_extension_type;
+use crate::models::{DateUsageResult, ExtensionType, GeminiSession, UsageResult};
+use crate::utils::{collect_files_with_dates, is_gemini_chat_file, is_json_file, read_json, read_jsonl, resolve_paths};
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
-use walkdir::WalkDir;
 
 /// Calculate usage from a single JSONL or JSON file
 pub fn calculate_usage_from_jsonl<P: AsRef<Path>>(file_path: P) -> Result<UsageResult> {
@@ -24,9 +24,9 @@ pub fn calculate_usage_from_jsonl<P: AsRef<Path>>(file_path: P) -> Result<UsageR
     let ext_type = detect_extension_type(&data);
 
     match ext_type {
-        "Claude-Code" => calculate_claude_usage(&data),
-        "Gemini" => calculate_gemini_usage(&data),
-        _ => calculate_codex_usage(&data),
+        ExtensionType::ClaudeCode => calculate_claude_usage(&data),
+        ExtensionType::Gemini => calculate_gemini_usage(&data),
+        ExtensionType::Codex => calculate_codex_usage(&data),
     }
 }
 
@@ -53,33 +53,6 @@ pub fn get_usage_from_directories() -> Result<DateUsageResult> {
     Ok(result)
 }
 
-fn detect_extension_type(data: &[Value]) -> &'static str {
-    if data.is_empty() {
-        return "Codex";
-    }
-
-    // Check for Gemini specific fields (single session object)
-    if data.len() == 1 {
-        if let Some(obj) = data[0].as_object() {
-            if obj.contains_key("sessionId")
-                && obj.contains_key("projectHash")
-                && obj.contains_key("messages")
-            {
-                return "Gemini";
-            }
-        }
-    }
-
-    for record in data {
-        if let Some(obj) = record.as_object() {
-            if obj.contains_key("parentUuid") {
-                return "Claude-Code";
-            }
-        }
-    }
-
-    "Codex"
-}
 
 fn calculate_claude_usage(data: &[Value]) -> Result<UsageResult> {
     let mut conversation_usage: HashMap<String, Value> = HashMap::new();
@@ -438,39 +411,20 @@ fn process_gemini_usage_data(
 }
 
 fn process_directory<P: AsRef<Path>>(dir: P, result: &mut DateUsageResult) -> Result<()> {
-    if !dir.as_ref().exists() {
-        return Ok(());
-    }
+    let files = collect_files_with_dates(&dir, is_json_file)?;
+    
+    for file_info in files {
+        // Calculate usage for this file
+        if let Ok(usage) = calculate_usage_from_jsonl(&file_info.path) {
+            // Initialize date entry if it doesn't exist
+            let date_entry = result.entry(file_info.modified_date).or_default();
 
-    for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-
-        let path = entry.path();
-        if let Some(ext) = path.extension() {
-            if ext == "jsonl" || ext == "json" {
-                // Get file modification time for date grouping
-                if let Ok(metadata) = std::fs::metadata(path) {
-                    if let Ok(modified) = metadata.modified() {
-                        let datetime: chrono::DateTime<chrono::Utc> = modified.into();
-                        let date_key = datetime.format("%Y-%m-%d").to_string();
-
-                        // Calculate usage for this file
-                        if let Ok(usage) = calculate_usage_from_jsonl(path) {
-                            // Initialize date entry if it doesn't exist
-                            let date_entry = result.entry(date_key).or_default();
-
-                            // Merge usage data
-                            for (model, usage_value) in usage.conversation_usage {
-                                if let Some(existing) = date_entry.get_mut(&model) {
-                                    merge_usage_values(existing, &usage_value);
-                                } else {
-                                    date_entry.insert(model, usage_value);
-                                }
-                            }
-                        }
-                    }
+            // Merge usage data
+            for (model, usage_value) in usage.conversation_usage {
+                if let Some(existing) = date_entry.get_mut(&model) {
+                    merge_usage_values(existing, &usage_value);
+                } else {
+                    date_entry.insert(model, usage_value);
                 }
             }
         }
@@ -481,42 +435,20 @@ fn process_directory<P: AsRef<Path>>(dir: P, result: &mut DateUsageResult) -> Re
 
 /// Process Gemini directory structure: ~/.gemini/tmp/<hash>/chats/*.json
 fn process_gemini_directory<P: AsRef<Path>>(dir: P, result: &mut DateUsageResult) -> Result<()> {
-    if !dir.as_ref().exists() {
-        return Ok(());
-    }
+    let files = collect_files_with_dates(&dir, is_gemini_chat_file)?;
+    
+    for file_info in files {
+        // Calculate usage for this file
+        if let Ok(usage) = calculate_usage_from_jsonl(&file_info.path) {
+            // Initialize date entry if it doesn't exist
+            let date_entry = result.entry(file_info.modified_date).or_default();
 
-    // Walk through ~/.gemini/tmp/<hash>/chats/ directories
-    for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-
-        let path = entry.path();
-
-        // Check if file is in a "chats" directory and has .json extension
-        if let (Some(parent), Some(ext)) = (path.parent(), path.extension()) {
-            if parent.file_name() == Some(std::ffi::OsStr::new("chats")) && ext == "json" {
-                // Get file modification time for date grouping
-                if let Ok(metadata) = std::fs::metadata(path) {
-                    if let Ok(modified) = metadata.modified() {
-                        let datetime: chrono::DateTime<chrono::Utc> = modified.into();
-                        let date_key = datetime.format("%Y-%m-%d").to_string();
-
-                        // Calculate usage for this file
-                        if let Ok(usage) = calculate_usage_from_jsonl(path) {
-                            // Initialize date entry if it doesn't exist
-                            let date_entry = result.entry(date_key).or_default();
-
-                            // Merge usage data
-                            for (model, usage_value) in usage.conversation_usage {
-                                if let Some(existing) = date_entry.get_mut(&model) {
-                                    merge_usage_values(existing, &usage_value);
-                                } else {
-                                    date_entry.insert(model, usage_value);
-                                }
-                            }
-                        }
-                    }
+            // Merge usage data
+            for (model, usage_value) in usage.conversation_usage {
+                if let Some(existing) = date_entry.get_mut(&model) {
+                    merge_usage_values(existing, &usage_value);
+                } else {
+                    date_entry.insert(model, usage_value);
                 }
             }
         }
