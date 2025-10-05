@@ -10,7 +10,7 @@
 
 </center>
 
-**实时追踪您的 AI 编程成本。** Vibe Coding Tracker 是一个强大的 CLI 工具，帮助您监控和分析 Claude Code 和 Codex 的使用情况，提供详细的成本分解、token 统计和代码操作洞察。
+**实时追踪您的 AI 编程成本。** Vibe Coding Tracker 是一个强大的 CLI 工具，帮助您监控和分析 Claude Code、Codex 和 Gemini 的使用情况，提供详细的成本分解、token 统计和代码操作洞察。
 
 [English](README.md) | [繁體中文](README.zh-TW.md) | [简体中文](README.zh-CN.md)
 
@@ -33,7 +33,7 @@
 
 ### 🚀 零配置
 
-自动检测并处理 Claude Code 和 Codex 的日志。无需设置——只需运行和分析。
+自动检测并处理 Claude Code、Codex 和 Gemini 的日志。无需设置——只需运行和分析。
 
 ### 🎨 丰富的洞察
 
@@ -49,7 +49,7 @@
 
 | 特性                | 描述                               |
 | ------------------- | ---------------------------------- |
-| 🤖 **自动检测**     | 智能识别 Claude Code 或 Codex 日志 |
+| 🤖 **自动检测**     | 智能识别 Claude Code、Codex 或 Gemini 日志 |
 | 💵 **智能定价**     | 模糊模型匹配 + 每日缓存以提高速度  |
 | 🎨 **4 种显示模式** | 交互式、表格、文本和 JSON 输出     |
 | 📈 **全面统计**     | Token、成本、文件操作和工具调用    |
@@ -146,6 +146,7 @@ vct usage --json
 
 - `~/.claude/projects/*.jsonl`（Claude Code）
 - `~/.codex/sessions/*.jsonl`（Codex）
+- `~/.gemini/tmp/<project_hash>/chats/*.json`（Gemini）
 
 ### 🎨 交互式模式（默认）
 
@@ -482,6 +483,7 @@ docker build -f docker/Dockerfile --target prod -t vibe_coding_tracker:latest .
 docker run --rm \
     -v ~/.claude:/root/.claude \
     -v ~/.codex:/root/.codex \
+    -v ~/.gemini:/root/.gemini \
     vibe_coding_tracker:latest usage
 ```
 
@@ -509,10 +511,12 @@ RUST_LOG=debug vct usage
 # 验证会话目录
 ls -la ~/.claude/projects/
 ls -la ~/.codex/sessions/
+ls -la ~/.gemini/tmp/
 
-# 统计 JSONL 文件
+# 统计会话文件
 find ~/.claude/projects -name "*.jsonl" | wc -l
 find ~/.codex/sessions -name "*.jsonl" | wc -l
+find ~/.gemini/tmp -name "*.json" | wc -l
 ```
 
 ### Analysis 命令失败
@@ -588,7 +592,7 @@ MIT 许可证 - 详见 [LICENSE](LICENSE)。
 ## 🙏 鸣谢
 
 - [LiteLLM](https://github.com/BerriAI/litellm) 提供模型定价数据
-- Claude Code 和 Codex 团队创建了出色的 AI 编程助手
+- Claude Code、Codex 和 Gemini 团队创建了出色的 AI 编程助手
 - Rust 社区提供了优秀的工具
 
 ---
