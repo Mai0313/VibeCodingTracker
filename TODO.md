@@ -133,7 +133,19 @@
 ## 更新版本取得邏輯
 
 我有點不確定我目前 `version` 功能中的 的 Version 這一欄位是如何取得的, 因為他每一次都是顯示 `0.1.0`
-我懷疑她是直接從 `Cargo.toml` 取得的, 這樣做法我覺得不對, 應該要更加 Semantic Versioning
-我以為她會依照我的 git tag 來決定這個版本, 然後像是 dunamai 那種工具一樣會有 0.1.6-dirty-.... 之類的版本號
+例如
+```bash
+❯ ./target/debug/vibe_coding_tracker version
+🚀 Vibe Coding Tracker
 
-這件事情沒處理好的話 update應該也會壞掉
+┌───────────────┬────────┐
+│ Version       ┆ 0.1.0  │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┤
+│ Rust Version  ┆ 1.89.0 │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┤
+│ Cargo Version ┆ 1.89.0 │
+└───────────────┴────────┘
+```
+看起來 `Version` 應該是透過 `Cargo.toml` 裡面直接取得
+經過我自己的追蹤 我發現版本獲取是從 `src/lib.rs` 裡面的 `CARGO_PKG_VERSION` 取得的
+但我不知道如何做到像是 dunamai 那種工具一樣會有 `0.1.6-dirty-...` 之類的版本號
