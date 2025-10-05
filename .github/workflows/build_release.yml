@@ -166,7 +166,14 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5.0.0
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Update npm
+        run: |
+          npm update -g
 
       - name: Extract version from tag
         id: version
@@ -193,10 +200,6 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN }}
         run: |
-          # Dry run first to verify
-          npm publish --dry-run --provenance --access public
-
-          # Actual publish
           npm publish --provenance --access public
 
       - name: Verify publication
