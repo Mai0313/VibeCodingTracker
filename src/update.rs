@@ -16,23 +16,26 @@ const GITHUB_API_RELEASES_URL: &str =
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug, Deserialize, Serialize)]
-struct GitHubRelease {
-    tag_name: String,
-    name: String,
-    body: Option<String>,
-    assets: Vec<GitHubAsset>,
+#[doc(hidden)]
+pub struct GitHubRelease {
+    pub tag_name: String,
+    pub name: String,
+    pub body: Option<String>,
+    pub assets: Vec<GitHubAsset>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct GitHubAsset {
-    name: String,
-    browser_download_url: String,
-    size: u64,
+#[doc(hidden)]
+pub struct GitHubAsset {
+    pub name: String,
+    pub browser_download_url: String,
+    pub size: u64,
 }
 
 /// Determine the asset name pattern based on current platform and version
 /// Returns (asset_name_pattern, is_compressed)
-fn get_asset_pattern(version: &str) -> Result<String> {
+#[doc(hidden)]
+pub fn get_asset_pattern(version: &str) -> Result<String> {
     let os = env::consts::OS;
     let arch = env::consts::ARCH;
 
