@@ -33,19 +33,19 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Generate a changelog
-        uses: orhun/git-cliff-action@v4
-        id: git-cliff-changelog
-        with:
-          config: cliff.toml
-          args: --unreleased
-
       - name: Generate a tag
         uses: orhun/git-cliff-action@v4
         id: git-cliff-tag
         with:
-          config: cliff.toml
+          config: ./.github/cliff.toml
           args: --bumped-version
+
+      - name: Generate a changelog
+        uses: orhun/git-cliff-action@v4
+        id: git-cliff-changelog
+        with:
+          config: ./.github/cliff.toml
+          args: --bump --unreleased
 
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v2

@@ -90,3 +90,6 @@ topo_order_commits = true
 sort_commits = "oldest"
 # Process submodules commits
 recurse_submodules = false
+
+[bump]
+initial_tag = "v0.1.0"
