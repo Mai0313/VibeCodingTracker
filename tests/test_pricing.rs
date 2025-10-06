@@ -24,6 +24,7 @@ fn test_calculate_cost_only_input() {
         output_cost_per_token: 0.0,
         cache_read_input_token_cost: 0.0,
         cache_creation_input_token_cost: 0.0,
+        ..Default::default()
     };
     let cost = calculate_cost(1000, 0, 0, 0, &pricing);
     assert_eq!(cost, 0.003);
@@ -36,6 +37,7 @@ fn test_calculate_cost_with_cache() {
         output_cost_per_token: 0.000015,
         cache_read_input_token_cost: 0.0000003,
         cache_creation_input_token_cost: 0.00000375,
+        ..Default::default()
     };
 
     // Test with all token types
@@ -58,6 +60,7 @@ fn test_get_model_pricing_exact_match() {
             output_cost_per_token: 0.000075,
             cache_read_input_token_cost: 0.0000015,
             cache_creation_input_token_cost: 0.000018,
+            ..Default::default()
         },
     );
 
@@ -79,6 +82,7 @@ fn test_get_model_pricing_normalized_match() {
             output_cost_per_token: 0.000015,
             cache_read_input_token_cost: 0.0,
             cache_creation_input_token_cost: 0.0,
+            ..Default::default()
         },
     );
 
@@ -102,6 +106,7 @@ fn test_get_model_pricing_substring_match() {
             output_cost_per_token: 0.00006,
             cache_read_input_token_cost: 0.0,
             cache_creation_input_token_cost: 0.0,
+            ..Default::default()
         },
     );
 
@@ -125,6 +130,7 @@ fn test_get_model_pricing_fuzzy_match() {
             output_cost_per_token: 0.000015,
             cache_read_input_token_cost: 0.0,
             cache_creation_input_token_cost: 0.0,
+            ..Default::default()
         },
     );
 
@@ -157,6 +163,7 @@ fn test_get_model_pricing_with_provider_prefix() {
             output_cost_per_token: 0.000075,
             cache_read_input_token_cost: 0.0,
             cache_creation_input_token_cost: 0.0,
+            ..Default::default()
         },
     );
 
@@ -179,6 +186,7 @@ fn test_get_model_pricing_prefers_better_match() {
             output_cost_per_token: 0.00006,
             cache_read_input_token_cost: 0.0,
             cache_creation_input_token_cost: 0.0,
+            ..Default::default()
         },
     );
     pricing_map.insert(
@@ -188,6 +196,7 @@ fn test_get_model_pricing_prefers_better_match() {
             output_cost_per_token: 0.00003,
             cache_read_input_token_cost: 0.0,
             cache_creation_input_token_cost: 0.0,
+            ..Default::default()
         },
     );
 
@@ -204,6 +213,7 @@ fn test_model_pricing_serialization() {
         output_cost_per_token: 0.000015,
         cache_read_input_token_cost: 0.0000003,
         cache_creation_input_token_cost: 0.00000375,
+        ..Default::default()
     };
 
     let json = serde_json::to_string(&pricing).unwrap();
@@ -285,6 +295,7 @@ mod cache_tests {
             output_cost_per_token: 0.000002,
             cache_read_input_token_cost: 0.0000001,
             cache_creation_input_token_cost: 0.0000005,
+            ..Default::default()
         };
 
         // Test with negative values (should handle gracefully)
@@ -299,6 +310,7 @@ mod cache_tests {
             output_cost_per_token: 0.000002,
             cache_read_input_token_cost: 0.0000001,
             cache_creation_input_token_cost: 0.0000005,
+            ..Default::default()
         };
 
         // Test with very large token counts
@@ -326,6 +338,7 @@ mod cache_tests {
                 output_cost_per_token: 0.000002,
                 cache_read_input_token_cost: 0.0,
                 cache_creation_input_token_cost: 0.0,
+                ..Default::default()
             },
         );
 
@@ -344,6 +357,7 @@ mod cache_tests {
                 output_cost_per_token: 0.00006,
                 cache_read_input_token_cost: 0.0,
                 cache_creation_input_token_cost: 0.0,
+                ..Default::default()
             },
         );
 
@@ -366,6 +380,7 @@ mod cache_tests {
                 output_cost_per_token: 0.000075,
                 cache_read_input_token_cost: 0.0,
                 cache_creation_input_token_cost: 0.0,
+                ..Default::default()
             },
         );
         pricing_map.insert(
@@ -375,6 +390,7 @@ mod cache_tests {
                 output_cost_per_token: 0.000050,
                 cache_read_input_token_cost: 0.0,
                 cache_creation_input_token_cost: 0.0,
+                ..Default::default()
             },
         );
 
@@ -391,6 +407,7 @@ mod cache_tests {
             output_cost_per_token: 0.000015,
             cache_read_input_token_cost: 0.0000003,
             cache_creation_input_token_cost: 0.00000375,
+            ..Default::default()
         };
 
         let cloned = pricing;
@@ -413,6 +430,7 @@ mod cache_tests {
             output_cost_per_token: 0.000015,
             cache_read_input_token_cost: 0.0000003,
             cache_creation_input_token_cost: 0.00000375,
+            ..Default::default()
         };
 
         let debug_str = format!("{:?}", pricing);
