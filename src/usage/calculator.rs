@@ -10,19 +10,15 @@ use std::path::Path;
 fn extract_conversation_usage_from_analysis(analysis: &Value) -> HashMap<String, Value> {
     let mut conversation_usage = HashMap::new();
 
-    // Extract records array from CodeAnalysis
     if let Some(records) = analysis.get("records").and_then(|r| r.as_array()) {
         for record in records {
             if let Some(record_obj) = record.as_object() {
-                // Extract conversationUsage object
                 if let Some(conv_usage) = record_obj
                     .get("conversationUsage")
                     .and_then(|c| c.as_object())
                 {
-                    // Merge all models into the result
                     for (model, usage) in conv_usage {
                         if let Some(existing_usage) = conversation_usage.get_mut(model) {
-                            // Merge usage values
                             merge_usage_values(existing_usage, usage);
                         } else {
                             conversation_usage.insert(model.clone(), usage.clone());
@@ -41,24 +37,20 @@ pub fn get_usage_from_directories() -> Result<DateUsageResult> {
     let paths = resolve_paths()?;
     let mut result = DateUsageResult::new();
 
-    // Process Claude directory
     if paths.claude_session_dir.exists() {
         process_usage_directory(&paths.claude_session_dir, &mut result, is_json_file)?;
     }
 
-    // Process Codex directory
     if paths.codex_session_dir.exists() {
         process_usage_directory(&paths.codex_session_dir, &mut result, is_json_file)?;
     }
 
-    // Process Gemini directory (special structure: ~/.gemini/tmp/<hash>/chats/*.json)
     if paths.gemini_session_dir.exists() {
         process_usage_directory(&paths.gemini_session_dir, &mut result, is_gemini_chat_file)?;
     }
 
     Ok(result)
 }
-
 
 fn process_usage_directory<P, F>(dir: P, result: &mut DateUsageResult, filter_fn: F) -> Result<()>
 where
@@ -69,16 +61,11 @@ where
     let files = collect_files_with_dates(dir, filter_fn)?;
 
     for file_info in files {
-        // Analyze file using unified parser
         match analyze_jsonl_file(&file_info.path) {
             Ok(analysis) => {
-                // Extract conversation usage from CodeAnalysis result
                 let conversation_usage = extract_conversation_usage_from_analysis(&analysis);
-
-                // Initialize date entry if it doesn't exist
                 let date_entry = result.entry(file_info.modified_date).or_default();
 
-                // Merge usage data
                 for (model, usage_value) in conversation_usage {
                     if let Some(existing) = date_entry.get_mut(&model) {
                         merge_usage_values(existing, &usage_value);
@@ -102,9 +89,7 @@ where
 
 fn merge_usage_values(existing: &mut Value, new: &Value) {
     if let (Some(existing_obj), Some(new_obj)) = (existing.as_object_mut(), new.as_object()) {
-        // Check if it's Claude/Gemini usage or Codex usage
         if existing_obj.contains_key("input_tokens") {
-            // Claude or Gemini usage
             for field in &[
                 "input_tokens",
                 "cache_creation_input_tokens",
@@ -123,7 +108,6 @@ fn merge_usage_values(existing: &mut Value, new: &Value) {
                 }
             }
 
-            // Merge cache_creation
             if let Some(new_cache) = new_obj.get("cache_creation").and_then(|v| v.as_object()) {
                 let existing_cache = existing_obj
                     .entry("cache_creation".to_string())
@@ -142,7 +126,6 @@ fn merge_usage_values(existing: &mut Value, new: &Value) {
                 }
             }
         } else if existing_obj.contains_key("total_token_usage") {
-            // Codex usage
             if let Some(new_total) = new_obj.get("total_token_usage").and_then(|v| v.as_object()) {
                 let existing_total = existing_obj
                     .entry("total_token_usage".to_string())

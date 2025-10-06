@@ -11,7 +11,6 @@ use std::path::Path;
 
 /// Analyze a JSONL or JSON file and return CodeAnalysis result
 pub fn analyze_jsonl_file<P: AsRef<Path>>(path: P) -> Result<Value> {
-    // Try reading as JSONL first, then as JSON
     let data = match read_jsonl(&path) {
         Ok(data) => data,
         Err(_) => read_json(&path)?,
@@ -27,7 +26,6 @@ pub fn analyze_jsonl_file<P: AsRef<Path>>(path: P) -> Result<Value> {
     Ok(analysis)
 }
 
-/// Analyze a set of records and return structured result
 fn analyze_record_set(data: Vec<Value>, ext_type: ExtensionType) -> Result<Value> {
     let mut analysis = match ext_type {
         ExtensionType::ClaudeCode => analyze_claude_conversations(data)?,
@@ -41,14 +39,11 @@ fn analyze_record_set(data: Vec<Value>, ext_type: ExtensionType) -> Result<Value
         ExtensionType::Gemini => analyze_gemini_conversations(data)?,
     };
 
-    // Fill in metadata
     analysis.user = get_current_user();
     analysis.extension_name = ext_type.to_string();
     analysis.machine_id = get_machine_id();
     analysis.insights_version = VERSION.to_string();
 
-    // Convert to JSON Value
     let result = serde_json::to_value(&analysis)?;
-
     Ok(result)
 }

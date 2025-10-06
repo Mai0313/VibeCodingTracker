@@ -8,7 +8,6 @@ pub fn detect_extension_type(data: &[Value]) -> Result<ExtensionType> {
         bail!("Cannot detect extension type from empty data");
     }
 
-    // Check for Gemini specific fields (single session object)
     if data.len() == 1 {
         if let Some(obj) = data[0].as_object() {
             if obj.contains_key("sessionId")
@@ -20,7 +19,6 @@ pub fn detect_extension_type(data: &[Value]) -> Result<ExtensionType> {
         }
     }
 
-    // Check for Claude Code specific fields
     for record in data {
         if let Some(obj) = record.as_object() {
             if obj.contains_key("parentUuid") {
@@ -29,6 +27,5 @@ pub fn detect_extension_type(data: &[Value]) -> Result<ExtensionType> {
         }
     }
 
-    // Default to Codex if no specific markers found
     Ok(ExtensionType::Codex)
 }

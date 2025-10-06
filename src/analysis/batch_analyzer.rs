@@ -27,17 +27,14 @@ pub fn analyze_all_sessions() -> Result<Vec<AggregatedAnalysisRow>> {
     let paths = crate::utils::resolve_paths()?;
     let mut aggregated: HashMap<String, AggregatedAnalysisRow> = HashMap::new();
 
-    // Process Claude directory
     if paths.claude_session_dir.exists() {
         process_analysis_directory(&paths.claude_session_dir, &mut aggregated, is_json_file)?;
     }
 
-    // Process Codex directory
     if paths.codex_session_dir.exists() {
         process_analysis_directory(&paths.codex_session_dir, &mut aggregated, is_json_file)?;
     }
 
-    // Process Gemini directory (special structure: ~/.gemini/tmp/<hash>/chats/*.json)
     if paths.gemini_session_dir.exists() {
         process_analysis_directory(
             &paths.gemini_session_dir,
@@ -46,7 +43,6 @@ pub fn analyze_all_sessions() -> Result<Vec<AggregatedAnalysisRow>> {
         )?;
     }
 
-    // Convert HashMap to sorted Vec
     let mut results: Vec<AggregatedAnalysisRow> = aggregated.into_values().collect();
     results.sort_by(|a, b| {
         let date_cmp = a.date.cmp(&b.date);
@@ -73,7 +69,6 @@ where
     let files = collect_files_with_dates(dir, filter_fn)?;
 
     for file_info in files {
-        // Analyze the file
         match analyze_jsonl_file(&file_info.path) {
             Ok(analysis) => {
                 aggregate_analysis_result(aggregated, &file_info.modified_date, &analysis);
@@ -96,22 +91,18 @@ fn aggregate_analysis_result(
     date: &str,
     analysis: &Value,
 ) {
-    // Extract records array
     if let Some(records) = analysis.get("records").and_then(|r| r.as_array()) {
         for record in records {
             if let Some(record_obj) = record.as_object() {
-                // Extract model from conversation_usage
                 if let Some(conv_usage) = record_obj
                     .get("conversationUsage")
                     .and_then(|c| c.as_object())
                 {
                     for (model, _usage) in conv_usage {
-                        // Skip synthetic models
                         if model.contains("<synthetic>") {
                             continue;
                         }
 
-                        // Create unique key for date + model
                         let key = format!("{}:{}", date, model);
 
                         let entry =
@@ -130,7 +121,6 @@ fn aggregate_analysis_result(
                                     write_count: 0,
                                 });
 
-                        // Aggregate line counts
                         if let Some(edit_lines) =
                             record_obj.get("totalEditLines").and_then(|v| v.as_u64())
                         {
@@ -147,7 +137,6 @@ fn aggregate_analysis_result(
                             entry.write_lines += write_lines as usize;
                         }
 
-                        // Aggregate tool call counts
                         if let Some(tool_calls) =
                             record_obj.get("toolCallCounts").and_then(|t| t.as_object())
                         {

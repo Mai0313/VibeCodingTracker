@@ -42,11 +42,9 @@ pub fn analyze_claude_conversations(records: Vec<Value>) -> Result<CodeAnalysis>
             last_timestamp = ts;
         }
 
-        // Process assistant messages
         if log.log_type == "assistant" {
             if let Some(message) = &log.message {
                 if let Some(msg_obj) = message.as_object() {
-                    // Process usage data
                     if let (Some(model), Some(usage)) = (msg_obj.get("model"), msg_obj.get("usage"))
                     {
                         if let Some(model_str) = model.as_str() {
@@ -54,7 +52,6 @@ pub fn analyze_claude_conversations(records: Vec<Value>) -> Result<CodeAnalysis>
                         }
                     }
 
-                    // Count tool calls
                     if let Some(content_array) = msg_obj.get("content").and_then(|c| c.as_array()) {
                         for item in content_array {
                             let Some(item_obj) = item.as_object() else {
@@ -113,7 +110,6 @@ pub fn analyze_claude_conversations(records: Vec<Value>) -> Result<CodeAnalysis>
             }
         }
 
-        // Process tool use results
         if let Some(tur) = &log.tool_use_result {
             if let Some(tur_obj) = tur.as_object() {
                 let tur_type = tur_obj.get("type").and_then(|t| t.as_str()).unwrap_or("");

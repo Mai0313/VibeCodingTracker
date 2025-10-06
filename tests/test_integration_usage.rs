@@ -57,10 +57,7 @@ fn test_analyze_jsonl_file_codex() {
     }
 
     let result = analyze_jsonl_file(&example_file);
-    assert!(
-        result.is_ok(),
-        "Should successfully analyze Codex file"
-    );
+    assert!(result.is_ok(), "Should successfully analyze Codex file");
 }
 
 #[test]

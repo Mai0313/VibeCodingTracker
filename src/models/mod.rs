@@ -1,4 +1,3 @@
-// Data models for the application
 pub mod analysis;
 pub mod claude;
 pub mod codex;

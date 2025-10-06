@@ -20,43 +20,32 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Analysis { path, output } => {
-            match path {
-                Some(file_path) => {
-                    // Single file analysis
-                    let result = analyze_jsonl_file(&file_path)?;
+        Commands::Analysis { path, output } => match path {
+            Some(file_path) => {
+                let result = analyze_jsonl_file(&file_path)?;
 
-                    // Save to output file if specified
-                    if let Some(output_path) = output {
-                        vibe_coding_tracker::utils::save_json_pretty(&output_path, &result)?;
-                        println!("✅ Analysis result saved to: {}", output_path.display());
-                    } else {
-                        // Print to stdout if no output file specified
-                        let json_str = serde_json::to_string_pretty(&result)?;
-                        println!("{}", json_str);
-                    }
-                }
-                None => {
-                    // Batch analysis of all sessions
-                    let analysis_data = vibe_coding_tracker::analysis::analyze_all_sessions()?;
-
-                    if let Some(output_path) = output {
-                        // Save to JSON file
-                        let json_value = serde_json::to_value(&analysis_data)?;
-                        vibe_coding_tracker::utils::save_json_pretty(&output_path, &json_value)?;
-                        println!("✅ Analysis result saved to: {}", output_path.display());
-                    } else {
-                        // Display interactive table
-                        vibe_coding_tracker::analysis::display_analysis_interactive(
-                            &analysis_data,
-                        )?;
-                    }
+                if let Some(output_path) = output {
+                    vibe_coding_tracker::utils::save_json_pretty(&output_path, &result)?;
+                    println!("✅ Analysis result saved to: {}", output_path.display());
+                } else {
+                    let json_str = serde_json::to_string_pretty(&result)?;
+                    println!("{}", json_str);
                 }
             }
-        }
+            None => {
+                let analysis_data = vibe_coding_tracker::analysis::analyze_all_sessions()?;
+
+                if let Some(output_path) = output {
+                    let json_value = serde_json::to_value(&analysis_data)?;
+                    vibe_coding_tracker::utils::save_json_pretty(&output_path, &json_value)?;
+                    println!("✅ Analysis result saved to: {}", output_path.display());
+                } else {
+                    vibe_coding_tracker::analysis::display_analysis_interactive(&analysis_data)?;
+                }
+            }
+        },
 
         Commands::Usage { json, text, table } => {
-            // For non-interactive modes, fetch data once and reuse
             if json || text || table {
                 let usage_data = get_usage_from_directories()?;
 
@@ -80,7 +69,6 @@ fn main() -> Result<()> {
                     display_usage_table(&usage_data);
                 }
             } else {
-                // Default: Display interactive table
                 display_usage_interactive()?;
             }
         }
@@ -89,7 +77,6 @@ fn main() -> Result<()> {
             let version_info = get_version_info();
 
             if json {
-                // JSON format
                 let json_output = serde_json::json!({
                     "Version": version_info.version,
                     "Rust Version": version_info.rust_version,
@@ -97,12 +84,10 @@ fn main() -> Result<()> {
                 });
                 println!("{}", serde_json::to_string_pretty(&json_output)?);
             } else if text {
-                // Plain text format
                 println!("Version: {}", version_info.version);
                 println!("Rust Version: {}", version_info.rust_version);
                 println!("Cargo Version: {}", version_info.cargo_version);
             } else {
-                // Default pretty format with table
                 println!("{}", "🚀 Vibe Coding Tracker".bright_cyan().bold());
                 println!();
 
@@ -141,10 +126,8 @@ fn main() -> Result<()> {
 
         Commands::Update { check, force } => {
             if check {
-                // Only check for updates without installing
                 vibe_coding_tracker::update::check_update()?;
             } else {
-                // Perform update with optional force flag
                 vibe_coding_tracker::update::update_interactive(force)?;
             }
         }
@@ -153,7 +136,6 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Build enriched JSON output with costs for usage data
 fn build_enriched_json(
     usage_data: &DateUsageResult,
     pricing_map: &HashMap<String, ModelPricing>,
@@ -169,7 +151,6 @@ fn build_enriched_json(
                 "usage": usage
             });
 
-            // Extract token counts and calculate cost
             let counts = extract_token_counts(usage);
             let pricing_result = get_model_pricing(model, pricing_map);
             let cost = calculate_cost(

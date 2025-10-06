@@ -181,4 +181,3 @@ fn test_code_analysis_full_serialization() {
     assert_eq!(json["machineId"], "test-machine");
     assert!(json["records"].is_array());
 }
-
