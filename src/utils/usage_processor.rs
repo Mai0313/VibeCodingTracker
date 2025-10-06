@@ -2,7 +2,11 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 /// Helper function to accumulate integer fields from source to target
-pub fn accumulate_i64_fields(target: &mut serde_json::Map<String, Value>, source: &serde_json::Map<String, Value>, fields: &[&str]) {
+pub fn accumulate_i64_fields(
+    target: &mut serde_json::Map<String, Value>,
+    source: &serde_json::Map<String, Value>,
+    fields: &[&str],
+) {
     for field in fields {
         if let Some(value) = source.get(*field).and_then(|v| v.as_i64()) {
             let current = target.get(*field).and_then(|v| v.as_i64()).unwrap_or(0);
@@ -12,7 +16,11 @@ pub fn accumulate_i64_fields(target: &mut serde_json::Map<String, Value>, source
 }
 
 /// Helper function to accumulate all i64 fields from a nested object
-pub fn accumulate_nested_object(target_obj: &mut serde_json::Map<String, Value>, field_name: &str, source_nested: &serde_json::Map<String, Value>) {
+pub fn accumulate_nested_object(
+    target_obj: &mut serde_json::Map<String, Value>,
+    field_name: &str,
+    source_nested: &serde_json::Map<String, Value>,
+) {
     let target_nested = target_obj
         .entry(field_name.to_string())
         .or_insert_with(|| serde_json::json!({}));
@@ -20,7 +28,10 @@ pub fn accumulate_nested_object(target_obj: &mut serde_json::Map<String, Value>,
     if let Some(target_nested_obj) = target_nested.as_object_mut() {
         for (key, value) in source_nested {
             if let Some(v) = value.as_i64() {
-                let current = target_nested_obj.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
+                let current = target_nested_obj
+                    .get(key)
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
                 target_nested_obj.insert(key.clone(), (current + v).into());
             }
         }
@@ -115,7 +126,10 @@ pub fn process_codex_usage(
     };
 
     // Process total_token_usage
-    if let Some(total_usage) = info_obj.get("total_token_usage").and_then(|v| v.as_object()) {
+    if let Some(total_usage) = info_obj
+        .get("total_token_usage")
+        .and_then(|v| v.as_object())
+    {
         accumulate_nested_object(existing_obj, "total_token_usage", total_usage);
     }
 

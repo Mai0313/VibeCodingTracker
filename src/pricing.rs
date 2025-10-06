@@ -159,9 +159,18 @@ fn normalize_pricing(mut pricing: HashMap<String, ModelPricing>) -> HashMap<Stri
         }
 
         normalize_field!(input_cost_per_token_above_200k_tokens, input_cost_per_token);
-        normalize_field!(output_cost_per_token_above_200k_tokens, output_cost_per_token);
-        normalize_field!(cache_read_input_token_cost_above_200k_tokens, cache_read_input_token_cost);
-        normalize_field!(cache_creation_input_token_cost_above_200k_tokens, cache_creation_input_token_cost);
+        normalize_field!(
+            output_cost_per_token_above_200k_tokens,
+            output_cost_per_token
+        );
+        normalize_field!(
+            cache_read_input_token_cost_above_200k_tokens,
+            cache_read_input_token_cost
+        );
+        normalize_field!(
+            cache_creation_input_token_cost_above_200k_tokens,
+            cache_creation_input_token_cost
+        );
     }
     pricing
 }
