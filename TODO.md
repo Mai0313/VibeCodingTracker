@@ -152,3 +152,8 @@
 經過我自己的追蹤 我發現版本獲取是從 `src/lib.rs` 裡面的 `CARGO_PKG_VERSION` 取得的
 但我不知道如何做到像是 dunamai 那種工具一樣會有 `0.1.6-dirty-...` 之類的版本號
 看有沒有辦法透過編譯時注入的方式來完成
+
+## 簡化 `usage` 和 `analysis` 的 parsing
+
+請幫我檢查一下目前 `usage`, `analysis`, 和透過 `--path` 選擇文件 的 parsing 邏輯是否屬於同一套
+都是先從 examples/test_conversation_gemini.json examples/test_conversation_oai.jsonl examples/test_conversation.jsonl 這種文件中先 parse 完畢以後才取所需資訊顯示成table
