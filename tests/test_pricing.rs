@@ -452,8 +452,14 @@ mod cache_tests {
 
         assert_eq!(pricing.input_cost_per_token_above_200k_tokens, 0.000002);
         assert_eq!(pricing.output_cost_per_token_above_200k_tokens, 0.000004);
-        assert_eq!(pricing.cache_read_input_token_cost_above_200k_tokens, 0.0000002);
-        assert_eq!(pricing.cache_creation_input_token_cost_above_200k_tokens, 0.000001);
+        assert_eq!(
+            pricing.cache_read_input_token_cost_above_200k_tokens,
+            0.0000002
+        );
+        assert_eq!(
+            pricing.cache_creation_input_token_cost_above_200k_tokens,
+            0.000001
+        );
     }
 
     #[test]

@@ -100,8 +100,8 @@ fn test_claude_code_analysis_matches_expected() {
     }
 
     // Read expected result
-    let expected_content = std::fs::read_to_string(&expected_file)
-        .expect("Failed to read expected result file");
+    let expected_content =
+        std::fs::read_to_string(&expected_file).expect("Failed to read expected result file");
     let expected_json: Value =
         serde_json::from_str(&expected_content).expect("Failed to parse expected result JSON");
 
@@ -124,7 +124,8 @@ fn test_claude_code_analysis_matches_expected() {
         eprintln!("\n=== ACTUAL OUTPUT ===");
         eprintln!(
             "{}",
-            serde_json::to_string_pretty(&actual_json).unwrap_or_else(|_| "Invalid JSON".to_string())
+            serde_json::to_string_pretty(&actual_json)
+                .unwrap_or_else(|_| "Invalid JSON".to_string())
         );
         eprintln!("\n=== EXPECTED OUTPUT ===");
         eprintln!(
@@ -157,8 +158,8 @@ fn test_codex_analysis_matches_expected() {
     }
 
     // Read expected result
-    let expected_content = std::fs::read_to_string(&expected_file)
-        .expect("Failed to read expected result file");
+    let expected_content =
+        std::fs::read_to_string(&expected_file).expect("Failed to read expected result file");
     let expected_json: Value =
         serde_json::from_str(&expected_content).expect("Failed to parse expected result JSON");
 
@@ -181,7 +182,8 @@ fn test_codex_analysis_matches_expected() {
         eprintln!("\n=== ACTUAL OUTPUT ===");
         eprintln!(
             "{}",
-            serde_json::to_string_pretty(&actual_json).unwrap_or_else(|_| "Invalid JSON".to_string())
+            serde_json::to_string_pretty(&actual_json)
+                .unwrap_or_else(|_| "Invalid JSON".to_string())
         );
         eprintln!("\n=== EXPECTED OUTPUT ===");
         eprintln!(
@@ -214,8 +216,8 @@ fn test_gemini_analysis_matches_expected() {
     }
 
     // Read expected result
-    let expected_content = std::fs::read_to_string(&expected_file)
-        .expect("Failed to read expected result file");
+    let expected_content =
+        std::fs::read_to_string(&expected_file).expect("Failed to read expected result file");
     let expected_json: Value =
         serde_json::from_str(&expected_content).expect("Failed to parse expected result JSON");
 
@@ -238,7 +240,8 @@ fn test_gemini_analysis_matches_expected() {
         eprintln!("\n=== ACTUAL OUTPUT ===");
         eprintln!(
             "{}",
-            serde_json::to_string_pretty(&actual_json).unwrap_or_else(|_| "Invalid JSON".to_string())
+            serde_json::to_string_pretty(&actual_json)
+                .unwrap_or_else(|_| "Invalid JSON".to_string())
         );
         eprintln!("\n=== EXPECTED OUTPUT ===");
         eprintln!(

@@ -260,12 +260,12 @@ fn test_extract_semver_version_with_prerelease() {
 
 #[cfg(test)]
 mod archive_tests {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
     use std::fs::{self, File};
     use std::io::Write;
     use std::path::PathBuf;
     use tar::Builder;
-    use flate2::write::GzEncoder;
-    use flate2::Compression;
     use tempfile::TempDir;
 
     fn create_test_targz(content: &str, binary_name: &str) -> (TempDir, PathBuf) {
@@ -282,7 +282,8 @@ mod archive_tests {
         let tar_gz = File::create(&archive_path).unwrap();
         let enc = GzEncoder::new(tar_gz, Compression::default());
         let mut tar = Builder::new(enc);
-        tar.append_path_with_name(&binary_path, binary_name).unwrap();
+        tar.append_path_with_name(&binary_path, binary_name)
+            .unwrap();
         tar.finish().unwrap();
 
         (temp_dir, archive_path)
@@ -338,14 +339,17 @@ mod archive_tests {
         let result = extract_targz(&archive_path, extract_dir.path());
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Binary not found in archive"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Binary not found in archive"));
     }
 
     #[cfg(unix)]
     #[test]
     fn test_extract_targz_permissions() {
-        use vibe_coding_tracker::update::extract_targz;
         use std::os::unix::fs::PermissionsExt;
+        use vibe_coding_tracker::update::extract_targz;
 
         let content = "#!/bin/bash\necho 'test'";
         let (_temp_dir, archive_path) = create_test_targz(content, "vct");
@@ -370,8 +374,8 @@ mod archive_tests {
         let file = File::create(&archive_path).unwrap();
         let mut zip = ZipWriter::new(file);
 
-        let options = SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
         zip.start_file(binary_name, options).unwrap();
         zip.write_all(content.as_bytes()).unwrap();
         zip.finish().unwrap();
@@ -427,7 +431,10 @@ mod archive_tests {
         let result = extract_zip(&archive_path, extract_dir.path());
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Binary not found in archive"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Binary not found in archive"));
     }
 }
 
@@ -461,12 +468,16 @@ fn test_github_release_with_multiple_assets() {
     assert_eq!(release.assets.len(), 3);
 
     // Find specific asset
-    let linux_asset = release.assets.iter()
+    let linux_asset = release
+        .assets
+        .iter()
         .find(|a| a.name.contains("linux"))
         .unwrap();
     assert!(linux_asset.name.ends_with(".tar.gz"));
 
-    let windows_asset = release.assets.iter()
+    let windows_asset = release
+        .assets
+        .iter()
         .find(|a| a.name.contains("windows"))
         .unwrap();
     assert!(windows_asset.name.ends_with(".zip"));

@@ -404,7 +404,7 @@ mod tests {
         let expected = 250_000.0 * 0.000002  // input with above_200k price
             + 250_000.0 * 0.000004           // output with above_200k price
             + 250_000.0 * 0.0000002          // cache_read with above_200k price
-            + 250_000.0 * 0.000001;          // cache_creation with above_200k price
+            + 250_000.0 * 0.000001; // cache_creation with above_200k price
         assert_eq!(cost_above, expected);
     }
 
@@ -413,12 +413,12 @@ mod tests {
         // Test: Each token type is checked INDEPENDENTLY against 200K
         // 不是總和超過 200K，而是單一類型超過 200K 就用該類型的 above_200k 價格
         let pricing = ModelPricing {
-            input_cost_per_token: 0.000003,           // base: $3 per million
-            output_cost_per_token: 0.000015,          // base: $15 per million
-            cache_read_input_token_cost: 0.0000003,   // base: $0.3 per million
+            input_cost_per_token: 0.000003,              // base: $3 per million
+            output_cost_per_token: 0.000015,             // base: $15 per million
+            cache_read_input_token_cost: 0.0000003,      // base: $0.3 per million
             cache_creation_input_token_cost: 0.00000375, // base: $3.75 per million
-            input_cost_per_token_above_200k_tokens: 0.000006,    // above: $6 per million (2x)
-            output_cost_per_token_above_200k_tokens: 0.0000225,  // above: $22.5 per million (1.5x)
+            input_cost_per_token_above_200k_tokens: 0.000006, // above: $6 per million (2x)
+            output_cost_per_token_above_200k_tokens: 0.0000225, // above: $22.5 per million (1.5x)
             cache_read_input_token_cost_above_200k_tokens: 0.0000006, // above: $0.6 per million (2x)
             cache_creation_input_token_cost_above_200k_tokens: 0.0000075, // above: $7.5 per million (2x)
         };
@@ -432,7 +432,7 @@ mod tests {
         let expected1 = 250_000.0 * 0.000006      // input: above_200k
             + 100_000.0 * 0.000015                // output: base
             + 150_000.0 * 0.0000003               // cache_read: base
-            + 50_000.0 * 0.00000375;              // cache_creation: base
+            + 50_000.0 * 0.00000375; // cache_creation: base
         assert_eq!(cost1, expected1);
 
         // Case 2: Only output_tokens exceeds 200K
@@ -440,7 +440,7 @@ mod tests {
         let expected2 = 100_000.0 * 0.000003      // input: base
             + 250_000.0 * 0.0000225               // output: above_200k
             + 150_000.0 * 0.0000003               // cache_read: base
-            + 50_000.0 * 0.00000375;              // cache_creation: base
+            + 50_000.0 * 0.00000375; // cache_creation: base
         assert_eq!(cost2, expected2);
 
         // Case 3: input and cache_read exceed 200K, others don't
@@ -448,7 +448,7 @@ mod tests {
         let expected3 = 300_000.0 * 0.000006      // input: above_200k
             + 100_000.0 * 0.000015                // output: base
             + 250_000.0 * 0.0000006               // cache_read: above_200k
-            + 50_000.0 * 0.00000375;              // cache_creation: base
+            + 50_000.0 * 0.00000375; // cache_creation: base
         assert_eq!(cost3, expected3);
 
         // Case 4: Total > 200K but each type < 200K → all use base price
@@ -458,7 +458,7 @@ mod tests {
         let expected4 = 50_000.0 * 0.000003       // input: base (< 200K)
             + 80_000.0 * 0.000015                 // output: base (< 200K)
             + 60_000.0 * 0.0000003                // cache_read: base (< 200K)
-            + 40_000.0 * 0.00000375;              // cache_creation: base (< 200K)
+            + 40_000.0 * 0.00000375; // cache_creation: base (< 200K)
         assert_eq!(cost4, expected4);
     }
 
@@ -481,7 +481,7 @@ mod tests {
         let expected = 200_000.0 * 0.000001      // base price (not > 200K)
             + 200_000.0 * 0.000002               // base price
             + 200_000.0 * 0.0000001              // base price
-            + 200_000.0 * 0.0000005;             // base price
+            + 200_000.0 * 0.0000005; // base price
         assert_eq!(cost_exact, expected);
 
         // 200K + 1 should use above_200k price
@@ -489,7 +489,7 @@ mod tests {
         let expected_above = 200_001.0 * 0.000002  // above_200k price (> 200K)
             + 200_001.0 * 0.000004                 // above_200k price
             + 200_001.0 * 0.0000002                // above_200k price
-            + 200_001.0 * 0.000001;                // above_200k price
+            + 200_001.0 * 0.000001; // above_200k price
         assert_eq!(cost_above, expected_above);
     }
 
@@ -508,8 +508,7 @@ mod tests {
         // Simulate normalization: fill above_200k with base prices
         pricing.input_cost_per_token_above_200k_tokens = pricing.input_cost_per_token;
         pricing.output_cost_per_token_above_200k_tokens = pricing.output_cost_per_token;
-        pricing.cache_read_input_token_cost_above_200k_tokens =
-            pricing.cache_read_input_token_cost;
+        pricing.cache_read_input_token_cost_above_200k_tokens = pricing.cache_read_input_token_cost;
         pricing.cache_creation_input_token_cost_above_200k_tokens =
             pricing.cache_creation_input_token_cost;
 
@@ -518,7 +517,7 @@ mod tests {
         let expected = 250_000.0 * 0.000001  // input with base price
             + 250_000.0 * 0.000002           // output with base price
             + 250_000.0 * 0.0000001          // cache_read with base price
-            + 250_000.0 * 0.0000005;         // cache_creation with base price
+            + 250_000.0 * 0.0000005; // cache_creation with base price
         assert_eq!(cost, expected);
     }
 
