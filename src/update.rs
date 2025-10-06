@@ -136,7 +136,8 @@ fn download_file(url: &str, dest: &Path) -> Result<()> {
 }
 
 /// Extract tar.gz archive and return the path to the binary
-fn extract_targz(archive_path: &Path, extract_to: &Path) -> Result<std::path::PathBuf> {
+#[doc(hidden)]
+pub fn extract_targz(archive_path: &Path, extract_to: &Path) -> Result<std::path::PathBuf> {
     println!("📦 Extracting archive...");
 
     let tar_gz = File::open(archive_path).context("Failed to open archive file")?;
@@ -186,7 +187,8 @@ fn extract_targz(archive_path: &Path, extract_to: &Path) -> Result<std::path::Pa
 }
 
 /// Extract zip archive and return the path to the binary
-fn extract_zip(archive_path: &Path, extract_to: &Path) -> Result<std::path::PathBuf> {
+#[doc(hidden)]
+pub fn extract_zip(archive_path: &Path, extract_to: &Path) -> Result<std::path::PathBuf> {
     println!("📦 Extracting archive...");
 
     let file = File::open(archive_path).context("Failed to open archive file")?;

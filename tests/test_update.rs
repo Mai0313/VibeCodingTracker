@@ -257,3 +257,294 @@ fn test_extract_semver_version_with_prerelease() {
     // Prerelease version (though not used in our build.rs currently)
     assert_eq!(extract_semver_version("0.1.6-alpha.1"), "0.1.6");
 }
+
+#[cfg(test)]
+mod archive_tests {
+    use std::fs::{self, File};
+    use std::io::Write;
+    use std::path::PathBuf;
+    use tar::Builder;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use tempfile::TempDir;
+
+    fn create_test_targz(content: &str, binary_name: &str) -> (TempDir, PathBuf) {
+        let temp_dir = TempDir::new().unwrap();
+        let archive_path = temp_dir.path().join("test.tar.gz");
+
+        // Create a temporary binary file
+        let binary_dir = TempDir::new().unwrap();
+        let binary_path = binary_dir.path().join(binary_name);
+        let mut file = File::create(&binary_path).unwrap();
+        file.write_all(content.as_bytes()).unwrap();
+
+        // Create tar.gz
+        let tar_gz = File::create(&archive_path).unwrap();
+        let enc = GzEncoder::new(tar_gz, Compression::default());
+        let mut tar = Builder::new(enc);
+        tar.append_path_with_name(&binary_path, binary_name).unwrap();
+        tar.finish().unwrap();
+
+        (temp_dir, archive_path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_extract_targz_with_vibe_coding_tracker() {
+        use vibe_coding_tracker::update::extract_targz;
+
+        let content = "#!/bin/bash\necho 'test binary'";
+        let (_temp_dir, archive_path) = create_test_targz(content, "vibe_coding_tracker");
+
+        let extract_dir = TempDir::new().unwrap();
+        let result = extract_targz(&archive_path, extract_dir.path());
+
+        assert!(result.is_ok());
+        let binary_path = result.unwrap();
+        assert!(binary_path.exists());
+        assert_eq!(binary_path.file_name().unwrap(), "vibe_coding_tracker");
+
+        // Verify content
+        let extracted_content = fs::read_to_string(&binary_path).unwrap();
+        assert_eq!(extracted_content, content);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_extract_targz_with_vct() {
+        use vibe_coding_tracker::update::extract_targz;
+
+        let content = "#!/bin/bash\necho 'test binary'";
+        let (_temp_dir, archive_path) = create_test_targz(content, "vct");
+
+        let extract_dir = TempDir::new().unwrap();
+        let result = extract_targz(&archive_path, extract_dir.path());
+
+        assert!(result.is_ok());
+        let binary_path = result.unwrap();
+        assert!(binary_path.exists());
+        assert_eq!(binary_path.file_name().unwrap(), "vct");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_extract_targz_binary_not_found() {
+        use vibe_coding_tracker::update::extract_targz;
+
+        let content = "some content";
+        let (_temp_dir, archive_path) = create_test_targz(content, "other_binary");
+
+        let extract_dir = TempDir::new().unwrap();
+        let result = extract_targz(&archive_path, extract_dir.path());
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Binary not found in archive"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_extract_targz_permissions() {
+        use vibe_coding_tracker::update::extract_targz;
+        use std::os::unix::fs::PermissionsExt;
+
+        let content = "#!/bin/bash\necho 'test'";
+        let (_temp_dir, archive_path) = create_test_targz(content, "vct");
+
+        let extract_dir = TempDir::new().unwrap();
+        let binary_path = extract_targz(&archive_path, extract_dir.path()).unwrap();
+
+        // Check that binary is executable
+        let metadata = fs::metadata(&binary_path).unwrap();
+        let permissions = metadata.permissions();
+        assert_eq!(permissions.mode() & 0o111, 0o111); // Check execute bits
+    }
+
+    #[cfg(windows)]
+    fn create_test_zip(content: &str, binary_name: &str) -> (TempDir, PathBuf) {
+        use zip::write::SimpleFileOptions;
+        use zip::ZipWriter;
+
+        let temp_dir = TempDir::new().unwrap();
+        let archive_path = temp_dir.path().join("test.zip");
+
+        let file = File::create(&archive_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+
+        let options = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file(binary_name, options).unwrap();
+        zip.write_all(content.as_bytes()).unwrap();
+        zip.finish().unwrap();
+
+        (temp_dir, archive_path)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_extract_zip_with_exe() {
+        use vibe_coding_tracker::update::extract_zip;
+
+        let content = "test binary content";
+        let (temp_dir, archive_path) = create_test_zip(content, "vibe_coding_tracker.exe");
+
+        let extract_dir = TempDir::new().unwrap();
+        let result = extract_zip(&archive_path, extract_dir.path());
+
+        assert!(result.is_ok());
+        let binary_path = result.unwrap();
+        assert!(binary_path.exists());
+        assert_eq!(binary_path.file_name().unwrap(), "vibe_coding_tracker.exe");
+
+        let extracted_content = fs::read_to_string(&binary_path).unwrap();
+        assert_eq!(extracted_content, content);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_extract_zip_with_vct_exe() {
+        use vibe_coding_tracker::update::extract_zip;
+
+        let content = "test binary content";
+        let (temp_dir, archive_path) = create_test_zip(content, "vct.exe");
+
+        let extract_dir = TempDir::new().unwrap();
+        let result = extract_zip(&archive_path, extract_dir.path());
+
+        assert!(result.is_ok());
+        let binary_path = result.unwrap();
+        assert_eq!(binary_path.file_name().unwrap(), "vct.exe");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_extract_zip_binary_not_found() {
+        use vibe_coding_tracker::update::extract_zip;
+
+        let content = "test content";
+        let (temp_dir, archive_path) = create_test_zip(content, "other.exe");
+
+        let extract_dir = TempDir::new().unwrap();
+        let result = extract_zip(&archive_path, extract_dir.path());
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Binary not found in archive"));
+    }
+}
+
+#[test]
+fn test_github_release_with_multiple_assets() {
+    let json = r#"{
+        "tag_name": "v1.0.0",
+        "name": "Major Release",
+        "body": "First stable release",
+        "assets": [
+            {
+                "name": "vibe_coding_tracker-v1.0.0-linux-x64-gnu.tar.gz",
+                "browser_download_url": "https://example.com/linux.tar.gz",
+                "size": 5000000
+            },
+            {
+                "name": "vibe_coding_tracker-v1.0.0-macos-arm64.tar.gz",
+                "browser_download_url": "https://example.com/macos.tar.gz",
+                "size": 4500000
+            },
+            {
+                "name": "vibe_coding_tracker-v1.0.0-windows-x64.zip",
+                "browser_download_url": "https://example.com/windows.zip",
+                "size": 4000000
+            }
+        ]
+    }"#;
+
+    let release: GitHubRelease = serde_json::from_str(json).unwrap();
+
+    assert_eq!(release.assets.len(), 3);
+
+    // Find specific asset
+    let linux_asset = release.assets.iter()
+        .find(|a| a.name.contains("linux"))
+        .unwrap();
+    assert!(linux_asset.name.ends_with(".tar.gz"));
+
+    let windows_asset = release.assets.iter()
+        .find(|a| a.name.contains("windows"))
+        .unwrap();
+    assert!(windows_asset.name.ends_with(".zip"));
+}
+
+#[test]
+fn test_asset_finding_logic() {
+    let assets = vec![
+        GitHubAsset {
+            name: "vibe_coding_tracker-v0.1.6-linux-x64-gnu.tar.gz".to_string(),
+            browser_download_url: "https://example.com/linux.tar.gz".to_string(),
+            size: 5000000,
+        },
+        GitHubAsset {
+            name: "vibe_coding_tracker-v0.1.6-macos-arm64.tar.gz".to_string(),
+            browser_download_url: "https://example.com/macos.tar.gz".to_string(),
+            size: 4500000,
+        },
+        GitHubAsset {
+            name: "vibe_coding_tracker-v0.1.6-windows-x64.zip".to_string(),
+            browser_download_url: "https://example.com/windows.zip".to_string(),
+            size: 4000000,
+        },
+    ];
+
+    let release = GitHubRelease {
+        tag_name: "v0.1.6".to_string(),
+        name: "Release v0.1.6".to_string(),
+        body: None,
+        assets,
+    };
+
+    #[cfg(target_os = "linux")]
+    {
+        let pattern = get_asset_pattern("0.1.6").unwrap();
+        let asset = release.assets.iter().find(|a| a.name == pattern);
+        assert!(asset.is_some());
+        assert!(asset.unwrap().name.contains("linux"));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let pattern = get_asset_pattern("0.1.6").unwrap();
+        let asset = release.assets.iter().find(|a| a.name == pattern);
+        assert!(asset.is_some());
+        assert!(asset.unwrap().name.contains("macos"));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let pattern = get_asset_pattern("0.1.6").unwrap();
+        let asset = release.assets.iter().find(|a| a.name == pattern);
+        assert!(asset.is_some());
+        assert!(asset.unwrap().name.contains("windows"));
+    }
+}
+
+#[test]
+fn test_version_comparison_edge_cases() {
+    use semver::Version;
+
+    // Test major version differences
+    let v1 = Version::parse("2.0.0").unwrap();
+    let v2 = Version::parse("1.9.9").unwrap();
+    assert!(v1 > v2);
+
+    // Test minor version differences
+    let v3 = Version::parse("1.2.0").unwrap();
+    let v4 = Version::parse("1.1.9").unwrap();
+    assert!(v3 > v4);
+
+    // Test patch version differences
+    let v5 = Version::parse("1.0.2").unwrap();
+    let v6 = Version::parse("1.0.1").unwrap();
+    assert!(v5 > v6);
+
+    // Test equality
+    let v7 = Version::parse("1.0.0").unwrap();
+    let v8 = Version::parse("1.0.0").unwrap();
+    assert_eq!(v7, v8);
+}

@@ -436,4 +436,49 @@ mod cache_tests {
         let debug_str = format!("{:?}", pricing);
         assert!(debug_str.contains("ModelPricing"));
     }
+
+    #[test]
+    fn test_above_200k_pricing_fields() {
+        let pricing = ModelPricing {
+            input_cost_per_token: 0.000001,
+            output_cost_per_token: 0.000002,
+            cache_read_input_token_cost: 0.0000001,
+            cache_creation_input_token_cost: 0.0000005,
+            input_cost_per_token_above_200k_tokens: 0.000002,
+            output_cost_per_token_above_200k_tokens: 0.000004,
+            cache_read_input_token_cost_above_200k_tokens: 0.0000002,
+            cache_creation_input_token_cost_above_200k_tokens: 0.000001,
+        };
+
+        assert_eq!(pricing.input_cost_per_token_above_200k_tokens, 0.000002);
+        assert_eq!(pricing.output_cost_per_token_above_200k_tokens, 0.000004);
+        assert_eq!(pricing.cache_read_input_token_cost_above_200k_tokens, 0.0000002);
+        assert_eq!(pricing.cache_creation_input_token_cost_above_200k_tokens, 0.000001);
+    }
+
+    #[test]
+    fn test_model_pricing_serialization_with_above_200k() {
+        let pricing = ModelPricing {
+            input_cost_per_token: 0.000003,
+            output_cost_per_token: 0.000015,
+            cache_read_input_token_cost: 0.0000003,
+            cache_creation_input_token_cost: 0.00000375,
+            input_cost_per_token_above_200k_tokens: 0.000006,
+            output_cost_per_token_above_200k_tokens: 0.00003,
+            cache_read_input_token_cost_above_200k_tokens: 0.0000006,
+            cache_creation_input_token_cost_above_200k_tokens: 0.0000075,
+        };
+
+        let json = serde_json::to_string(&pricing).unwrap();
+        let deserialized: ModelPricing = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(
+            deserialized.input_cost_per_token_above_200k_tokens,
+            pricing.input_cost_per_token_above_200k_tokens
+        );
+        assert_eq!(
+            deserialized.output_cost_per_token_above_200k_tokens,
+            pricing.output_cost_per_token_above_200k_tokens
+        );
+    }
 }
