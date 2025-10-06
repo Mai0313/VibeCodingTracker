@@ -156,7 +156,7 @@
 ## 簡化 `usage` 和 `analysis` 的 parsing
 
 請幫我檢查一下目前 `usage`, `analysis`, 和透過 `--path` 選擇文件 的 parsing 邏輯是否屬於同一套
-都是先從 examples/test_conversation_gemini.json examples/test_conversation_oai.jsonl examples/test_conversation.jsonl 這種文件中先 parse 完畢以後才取所需資訊顯示成table
+我覺得三種功能應該使用同一套流程, 都是先從 examples/test_conversation_gemini.json examples/test_conversation_oai.jsonl examples/test_conversation.jsonl 這種文件中先 parse 完畢以後, 再去取得 並 依照對應方式來顯示結果
 
 ## 幫我新增 `--all` 功能到 `analysis`
 
