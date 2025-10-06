@@ -148,24 +148,20 @@ fn save_to_cache(pricing: &HashMap<String, ModelPricing>) -> Result<()> {
 
 /// Normalize pricing data: fill above_200k prices with base prices if they are 0
 fn normalize_pricing(mut pricing: HashMap<String, ModelPricing>) -> HashMap<String, ModelPricing> {
-    for model_pricing in pricing.values_mut() {
-        // If above_200k price is 0, use base price as fallback
-        if model_pricing.input_cost_per_token_above_200k_tokens == 0.0 {
-            model_pricing.input_cost_per_token_above_200k_tokens =
-                model_pricing.input_cost_per_token;
+    for p in pricing.values_mut() {
+        // Macro to reduce repetition: if above_200k price is 0, use base price
+        macro_rules! normalize_field {
+            ($above_200k:ident, $base:ident) => {
+                if p.$above_200k == 0.0 {
+                    p.$above_200k = p.$base;
+                }
+            };
         }
-        if model_pricing.output_cost_per_token_above_200k_tokens == 0.0 {
-            model_pricing.output_cost_per_token_above_200k_tokens =
-                model_pricing.output_cost_per_token;
-        }
-        if model_pricing.cache_read_input_token_cost_above_200k_tokens == 0.0 {
-            model_pricing.cache_read_input_token_cost_above_200k_tokens =
-                model_pricing.cache_read_input_token_cost;
-        }
-        if model_pricing.cache_creation_input_token_cost_above_200k_tokens == 0.0 {
-            model_pricing.cache_creation_input_token_cost_above_200k_tokens =
-                model_pricing.cache_creation_input_token_cost;
-        }
+
+        normalize_field!(input_cost_per_token_above_200k_tokens, input_cost_per_token);
+        normalize_field!(output_cost_per_token_above_200k_tokens, output_cost_per_token);
+        normalize_field!(cache_read_input_token_cost_above_200k_tokens, cache_read_input_token_cost);
+        normalize_field!(cache_creation_input_token_cost_above_200k_tokens, cache_creation_input_token_cost);
     }
     pricing
 }

@@ -163,39 +163,39 @@ fn build_enriched_json(
     usage_data: &DateUsageResult,
     pricing_map: &HashMap<String, ModelPricing>,
 ) -> Result<HashMap<String, Vec<Value>>> {
-    let mut enriched_data: HashMap<String, Vec<Value>> = HashMap::new();
+    let enriched_data = usage_data
+        .iter()
+        .map(|(date, models)| {
+            let date_entries = models
+                .iter()
+                .map(|(model, usage)| {
+                    let counts = extract_token_counts(usage);
+                    let pricing_result = get_model_pricing(model, pricing_map);
+                    let cost = calculate_cost(
+                        counts.input_tokens,
+                        counts.output_tokens,
+                        counts.cache_read,
+                        counts.cache_creation,
+                        &pricing_result.pricing,
+                    );
 
-    for (date, models) in usage_data {
-        let mut date_entries = Vec::new();
+                    let mut entry = json!({
+                        "model": model,
+                        "usage": usage,
+                        "cost_usd": cost
+                    });
 
-        for (model, usage) in models {
-            let mut entry = json!({
-                "model": model,
-                "usage": usage
-            });
+                    if let Some(matched) = &pricing_result.matched_model {
+                        entry["matched_model"] = json!(matched);
+                    }
 
-            let counts = extract_token_counts(usage);
-            let pricing_result = get_model_pricing(model, pricing_map);
-            let cost = calculate_cost(
-                counts.input_tokens,
-                counts.output_tokens,
-                counts.cache_read,
-                counts.cache_creation,
-                &pricing_result.pricing,
-            );
+                    entry
+                })
+                .collect();
 
-            if let Some(entry_obj) = entry.as_object_mut() {
-                entry_obj.insert("cost_usd".to_string(), json!(cost));
-                if let Some(matched) = &pricing_result.matched_model {
-                    entry_obj.insert("matched_model".to_string(), json!(matched));
-                }
-            }
-
-            date_entries.push(entry);
-        }
-
-        enriched_data.insert(date.clone(), date_entries);
-    }
+            (date.clone(), date_entries)
+        })
+        .collect();
 
     Ok(enriched_data)
 }

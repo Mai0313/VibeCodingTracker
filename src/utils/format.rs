@@ -4,18 +4,27 @@ use chrono::Local;
 pub fn format_number<T: ToString>(n: T) -> String {
     let s = n.to_string();
 
-    if s == "0" {
-        return "0".to_string();
+    if s.len() <= 3 {
+        return s;
     }
 
-    let mut result = String::new();
-    let chars: Vec<char> = s.chars().collect();
+    let mut result = String::with_capacity(s.len() + (s.len() - 1) / 3);
+    let remainder = s.len() % 3;
 
-    for (i, c) in chars.iter().enumerate() {
-        if i > 0 && (chars.len() - i) % 3 == 0 {
+    // Handle first group (which might be 1, 2, or 3 digits)
+    if remainder > 0 {
+        result.push_str(&s[..remainder]);
+        if s.len() > remainder {
             result.push(',');
         }
-        result.push(*c);
+    }
+
+    // Handle remaining groups of 3
+    for (i, chunk) in s[remainder..].as_bytes().chunks(3).enumerate() {
+        if i > 0 {
+            result.push(',');
+        }
+        result.push_str(std::str::from_utf8(chunk).unwrap());
     }
 
     result
@@ -37,6 +46,40 @@ mod tests {
         assert_eq!(format_number(1234), "1,234");
         assert_eq!(format_number(1234567), "1,234,567");
         assert_eq!(format_number(1234567890), "1,234,567,890");
+    }
+
+    #[test]
+    fn test_format_number_edge_cases() {
+        // Single digit
+        assert_eq!(format_number(1), "1");
+        assert_eq!(format_number(9), "9");
+
+        // Two digits
+        assert_eq!(format_number(10), "10");
+        assert_eq!(format_number(99), "99");
+
+        // Three digits (boundary - no comma needed)
+        assert_eq!(format_number(100), "100");
+        assert_eq!(format_number(999), "999");
+
+        // Four digits (boundary - first comma appears)
+        assert_eq!(format_number(1000), "1,000");
+        assert_eq!(format_number(9999), "9,999");
+
+        // Exact multiples of 1000
+        assert_eq!(format_number(10000), "10,000");
+        assert_eq!(format_number(100000), "100,000");
+        assert_eq!(format_number(1000000), "1,000,000");
+
+        // Large numbers
+        assert_eq!(format_number(12345678901_i64), "12,345,678,901");
+        assert_eq!(format_number(999999999999_i64), "999,999,999,999");
+    }
+
+    #[test]
+    fn test_format_number_with_string_input() {
+        assert_eq!(format_number("12345"), "12,345");
+        assert_eq!(format_number("999"), "999");
     }
 
     #[test]

@@ -88,60 +88,33 @@ where
 }
 
 fn merge_usage_values(existing: &mut Value, new: &Value) {
+    use crate::utils::{accumulate_i64_fields, accumulate_nested_object};
+
     if let (Some(existing_obj), Some(new_obj)) = (existing.as_object_mut(), new.as_object()) {
+        // Handle Claude/Gemini format (has input_tokens)
         if existing_obj.contains_key("input_tokens") {
-            for field in &[
-                "input_tokens",
-                "cache_creation_input_tokens",
-                "cache_read_input_tokens",
-                "output_tokens",
-                "thoughts_tokens",
-                "tool_tokens",
-                "total_tokens",
-            ] {
-                if let Some(new_value) = new_obj.get(*field).and_then(|v| v.as_i64()) {
-                    let current = existing_obj
-                        .get(*field)
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
-                    existing_obj.insert(field.to_string(), (current + new_value).into());
-                }
-            }
+            accumulate_i64_fields(
+                existing_obj,
+                new_obj,
+                &[
+                    "input_tokens",
+                    "cache_creation_input_tokens",
+                    "cache_read_input_tokens",
+                    "output_tokens",
+                    "thoughts_tokens",
+                    "tool_tokens",
+                    "total_tokens",
+                ],
+            );
 
             if let Some(new_cache) = new_obj.get("cache_creation").and_then(|v| v.as_object()) {
-                let existing_cache = existing_obj
-                    .entry("cache_creation".to_string())
-                    .or_insert_with(|| serde_json::json!({}));
-
-                if let Some(existing_cache_obj) = existing_cache.as_object_mut() {
-                    for (key, value) in new_cache {
-                        if let Some(v) = value.as_i64() {
-                            let current = existing_cache_obj
-                                .get(key)
-                                .and_then(|v| v.as_i64())
-                                .unwrap_or(0);
-                            existing_cache_obj.insert(key.clone(), (current + v).into());
-                        }
-                    }
-                }
+                accumulate_nested_object(existing_obj, "cache_creation", new_cache);
             }
-        } else if existing_obj.contains_key("total_token_usage") {
+        }
+        // Handle Codex format (has total_token_usage)
+        else if existing_obj.contains_key("total_token_usage") {
             if let Some(new_total) = new_obj.get("total_token_usage").and_then(|v| v.as_object()) {
-                let existing_total = existing_obj
-                    .entry("total_token_usage".to_string())
-                    .or_insert_with(|| serde_json::json!({}));
-
-                if let Some(existing_total_obj) = existing_total.as_object_mut() {
-                    for (key, value) in new_total {
-                        if let Some(v) = value.as_i64() {
-                            let current = existing_total_obj
-                                .get(key)
-                                .and_then(|v| v.as_i64())
-                                .unwrap_or(0);
-                            existing_total_obj.insert(key.clone(), (current + v).into());
-                        }
-                    }
-                }
+                accumulate_nested_object(existing_obj, "total_token_usage", new_total);
             }
         }
     }

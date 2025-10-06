@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 /// Helper paths for application directories
 #[derive(Debug, Clone)]
@@ -43,19 +44,26 @@ pub fn get_current_user() -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
-/// Get machine ID (simplified version)
+// Cache for machine ID (initialized once)
+static MACHINE_ID_CACHE: OnceLock<String> = OnceLock::new();
+
+/// Get machine ID (cached after first call)
 pub fn get_machine_id() -> String {
-    // Try to read /etc/machine-id on Linux
-    if let Ok(id) = std::fs::read_to_string("/etc/machine-id") {
-        return id.trim().to_string();
-    }
+    MACHINE_ID_CACHE
+        .get_or_init(|| {
+            // Try to read /etc/machine-id on Linux
+            if let Ok(id) = std::fs::read_to_string("/etc/machine-id") {
+                return id.trim().to_string();
+            }
 
-    // Fallback to hostname
-    if let Ok(hostname) = hostname::get() {
-        if let Some(hostname_str) = hostname.to_str() {
-            return hostname_str.to_string();
-        }
-    }
+            // Fallback to hostname
+            if let Ok(hostname) = hostname::get() {
+                if let Some(hostname_str) = hostname.to_str() {
+                    return hostname_str.to_string();
+                }
+            }
 
-    "unknown-machine-id".to_string()
+            "unknown-machine-id".to_string()
+        })
+        .clone()
 }
