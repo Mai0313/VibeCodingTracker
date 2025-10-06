@@ -45,7 +45,7 @@ Vibe Coding Tracker is a Rust-based CLI tool designed to analyze AI coding assis
                      ▼
          ┌───────────────────────┐
          │   Data Models         │
-         │   - UsageResult       │
+         │   - DateUsageResult   │
          │   - CodeAnalysis      │
          │   - Claude/Codex/     │
          │     Gemini            │
@@ -90,8 +90,7 @@ Defines core data structures with serde serialization:
 
 **usage.rs**
 
-- `UsageResult`: Per-model token usage and cost
-- `DateUsageResult`: Date-indexed usage map
+- `DateUsageResult`: Date-indexed usage map (maps date → model → usage data)
 
 **analysis.rs**
 
@@ -626,9 +625,10 @@ for line in BufReader::new(file).lines() {
 **Data Structures:**
 
 ```rust
-HashMap<String, HashMap<String, UsageResult>>
+type DateUsageResult = HashMap<String, HashMap<String, serde_json::Value>>;
 // Outer key: Date (YYYY-MM-DD)
 // Inner key: Model name
+// Value: Token usage data (varies by extension type)
 ```
 
 **Complexity:** O(1) insertion, O(n) iteration for display
@@ -777,7 +777,7 @@ Implement trait-based abstraction:
 
 ```rust
 trait DisplayFormatter {
-    fn format(&self, data: &UsageResult) -> String;
+    fn format(&self, data: &DateUsageResult) -> String;
 }
 
 struct TableFormatter;

@@ -1,13 +1,36 @@
 // Integration tests for usage statistics functionality
 
 use std::path::PathBuf;
-use vibe_coding_tracker::usage::calculator::{
-    calculate_usage_from_jsonl, get_usage_from_directories,
-};
+use vibe_coding_tracker::analysis::analyze_jsonl_file;
+use vibe_coding_tracker::usage::calculator::get_usage_from_directories;
 use vibe_coding_tracker::utils::paths::resolve_paths;
 
+/// Helper function to extract conversation_usage from CodeAnalysis result
+fn extract_conversation_usage_from_analysis(
+    analysis: &serde_json::Value,
+) -> std::collections::HashMap<String, serde_json::Value> {
+    let mut conversation_usage = std::collections::HashMap::new();
+
+    if let Some(records) = analysis.get("records").and_then(|r| r.as_array()) {
+        for record in records {
+            if let Some(record_obj) = record.as_object() {
+                if let Some(conv_usage) = record_obj
+                    .get("conversationUsage")
+                    .and_then(|c| c.as_object())
+                {
+                    for (model, usage) in conv_usage {
+                        conversation_usage.insert(model.clone(), usage.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    conversation_usage
+}
+
 #[test]
-fn test_calculate_usage_from_jsonl_claude() {
+fn test_analyze_jsonl_file_claude() {
     let example_file = PathBuf::from("examples/test_conversation.jsonl");
 
     if !example_file.exists() {
@@ -15,17 +38,17 @@ fn test_calculate_usage_from_jsonl_claude() {
         return;
     }
 
-    let result = calculate_usage_from_jsonl(&example_file);
-    assert!(result.is_ok(), "Should successfully calculate usage");
+    let result = analyze_jsonl_file(&example_file);
+    assert!(result.is_ok(), "Should successfully analyze file");
 
-    let usage_result = result.unwrap();
+    let analysis = result.unwrap();
+    let conversation_usage = extract_conversation_usage_from_analysis(&analysis);
     // Should return usage data structure
-    // conversation_usage is a HashMap which always has len() >= 0
-    let _ = usage_result.conversation_usage.len();
+    let _ = conversation_usage.len();
 }
 
 #[test]
-fn test_calculate_usage_from_jsonl_codex() {
+fn test_analyze_jsonl_file_codex() {
     let example_file = PathBuf::from("examples/test_conversation_oai.jsonl");
 
     if !example_file.exists() {
@@ -33,16 +56,16 @@ fn test_calculate_usage_from_jsonl_codex() {
         return;
     }
 
-    let result = calculate_usage_from_jsonl(&example_file);
+    let result = analyze_jsonl_file(&example_file);
     assert!(
         result.is_ok(),
-        "Should successfully calculate usage from Codex file"
+        "Should successfully analyze Codex file"
     );
 }
 
 #[test]
-fn test_calculate_usage_nonexistent_file() {
-    let result = calculate_usage_from_jsonl("/nonexistent/file.jsonl");
+fn test_analyze_jsonl_file_nonexistent() {
+    let result = analyze_jsonl_file("/nonexistent/file.jsonl");
     assert!(result.is_err(), "Should fail for nonexistent file");
 }
 
@@ -86,11 +109,13 @@ fn test_usage_data_aggregation() {
         return;
     }
 
-    let result = calculate_usage_from_jsonl(&example_file);
+    let result = analyze_jsonl_file(&example_file);
 
-    if let Ok(usage_result) = result {
+    if let Ok(analysis) = result {
+        let conversation_usage = extract_conversation_usage_from_analysis(&analysis);
+
         // Verify each model usage entry has valid data
-        for (model, usage_value) in usage_result.conversation_usage.iter() {
+        for (model, usage_value) in conversation_usage.iter() {
             assert!(!model.is_empty(), "Model name should not be empty");
 
             // Check if it has expected fields

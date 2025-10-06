@@ -182,20 +182,3 @@ fn test_code_analysis_full_serialization() {
     assert!(json["records"].is_array());
 }
 
-#[test]
-fn test_usage_result_serialization() {
-    use std::collections::HashMap;
-
-    let mut tool_calls = HashMap::new();
-    tool_calls.insert("Read".to_string(), 5);
-    tool_calls.insert("Write".to_string(), 3);
-
-    let usage_result = UsageResult {
-        tool_call_counts: tool_calls,
-        conversation_usage: HashMap::new(),
-    };
-
-    let json = serde_json::to_value(&usage_result).unwrap();
-    assert_eq!(json["toolCallCounts"]["Read"], 5);
-    assert_eq!(json["toolCallCounts"]["Write"], 3);
-}

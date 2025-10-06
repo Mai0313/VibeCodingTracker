@@ -88,7 +88,7 @@ src/
 ├── update.rs            # Self-update functionality from GitHub releases
 ├── models/              # Data structures
 │   ├── analysis.rs      # CodeAnalysis struct
-│   ├── usage.rs         # UsageResult, DateUsageResult
+│   ├── usage.rs         # DateUsageResult
 │   ├── claude.rs        # Claude-specific types
 │   ├── codex.rs         # Codex/OpenAI types
 │   └── gemini.rs        # Gemini-specific types
@@ -116,7 +116,9 @@ src/
 
 - `main.rs::Commands::Usage` → `usage/calculator.rs::get_usage_from_directories()`
   - Scans `~/.claude/projects/*.jsonl`, `~/.codex/sessions/*.jsonl`, and `~/.gemini/tmp/*.jsonl`
-  - Aggregates token usage by date and model
+  - For each file, calls `analysis/analyzer.rs::analyze_jsonl_file()` for unified parsing
+  - Extracts `conversationUsage` from `CodeAnalysis` result
+  - Aggregates token usage by date and model into `DateUsageResult`
 - `pricing.rs::fetch_model_pricing()` → fetches/caches LiteLLM pricing daily
 - `usage/display.rs::display_usage_*()` → formats output (interactive/table/text/JSON)
   - Interactive mode uses Ratatui with 1-second refresh
@@ -138,7 +140,8 @@ src/
 
 - `main.rs::Commands::Analysis` → `analysis/batch_analyzer.rs::analyze_all_sessions()`
   - Scans `~/.claude/projects/*.jsonl`, `~/.codex/sessions/*.jsonl`, and `~/.gemini/tmp/*.jsonl`
-  - Analyzes each file and aggregates by date and model
+  - For each file, calls `analyze_jsonl_file()` (same as Usage command)
+  - Extracts metrics from `CodeAnalysis` results and aggregates by date and model
   - Groups metrics: edit/read/write lines, tool call counts (Bash, Edit, Read, TodoWrite, Write)
 - `analysis/display.rs::display_analysis_interactive()` → Interactive TUI (default)
   - Ratatui-based table with 1-second refresh
@@ -265,24 +268,34 @@ docker run --rm \
 
 ## Important Patterns
 
-**1. Cost Rounding:**
+**1. Unified Parsing Architecture:**
+
+- **Single Source of Truth**: All commands (`usage`, `analysis --path`, and `analysis`) use the same parsing pipeline via `analyze_jsonl_file()`
+- **Format Detection**: `detector.rs` automatically identifies Claude/Codex/Gemini format
+- **Parser Routing**: Routes to appropriate analyzer (`claude_analyzer`, `codex_analyzer`, `gemini_analyzer`)
+- **Data Extraction**: 
+  - `usage` command extracts only `conversationUsage` from `CodeAnalysis`
+  - `analysis` command uses full `CodeAnalysis` including file operations and tool calls
+- **Benefits**: Eliminates code duplication, ensures consistency, and simplifies maintenance
+
+**2. Cost Rounding:**
 
 - Interactive/table mode: round to 2 decimals (`$2.15`)
 - JSON/text mode: full precision (`2.1542304567890123`)
 
-**2. Date Aggregation:**
+**3. Date Aggregation:**
 
 - Group usage by date (YYYY-MM-DD format)
 - Display totals row in tables
 
-**3. Interactive TUI:**
+**4. Interactive TUI:**
 
 - Auto-refresh every 1 second
 - Highlight today's entries
 - Show memory usage and summary stats
 - Exit keys: `q`, `Esc`, `Ctrl+C`
 
-**4. Model Name Handling:**
+**5. Model Name Handling:**
 
 - Always use fuzzy matching when looking up pricing
 - Store matched model name for transparency
