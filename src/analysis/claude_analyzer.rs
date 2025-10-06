@@ -134,18 +134,19 @@ pub fn analyze_claude_conversations(records: Vec<Value>) -> Result<CodeAnalysis>
                             .get("numLines")
                             .and_then(|n| n.as_u64())
                             .unwrap_or(0) as usize;
+                        let char_count = content.chars().count();
 
                         read_details.push(CodeAnalysisReadDetail {
                             base: CodeAnalysisDetailBase {
                                 file_path: file_path.clone(),
                                 line_count: num_lines,
-                                character_count: content.chars().count(),
+                                character_count: char_count,
                                 timestamp: ts,
                             },
                         });
 
                         unique_files.insert(file_path);
-                        total_read_characters += content.chars().count();
+                        total_read_characters += char_count;
                         total_read_lines += num_lines;
                     }
                 }
@@ -163,12 +164,13 @@ pub fn analyze_claude_conversations(records: Vec<Value>) -> Result<CodeAnalysis>
                         .unwrap_or("")
                         .to_string();
                     let line_count = count_lines(&content);
+                    let char_count = content.chars().count();
 
                     write_details.push(CodeAnalysisWriteDetail {
                         base: CodeAnalysisDetailBase {
                             file_path: file_path.clone(),
                             line_count,
-                            character_count: content.chars().count(),
+                            character_count: char_count,
                             timestamp: ts,
                         },
                         content: content.clone(),
@@ -176,7 +178,7 @@ pub fn analyze_claude_conversations(records: Vec<Value>) -> Result<CodeAnalysis>
 
                     unique_files.insert(file_path);
                     total_write_lines += line_count;
-                    total_write_characters += content.chars().count();
+                    total_write_characters += char_count;
                 }
 
                 // Edit operations
@@ -187,12 +189,13 @@ pub fn analyze_claude_conversations(records: Vec<Value>) -> Result<CodeAnalysis>
                             .and_then(|s| s.as_str())
                             .unwrap_or("");
                         let line_count = count_lines(new_string);
+                        let char_count = new_string.chars().count();
 
                         edit_details.push(CodeAnalysisApplyDiffDetail {
                             base: CodeAnalysisDetailBase {
                                 file_path: file_path.to_string(),
                                 line_count,
-                                character_count: new_string.chars().count(),
+                                character_count: char_count,
                                 timestamp: ts,
                             },
                             old_string: old_string.to_string(),
@@ -200,7 +203,7 @@ pub fn analyze_claude_conversations(records: Vec<Value>) -> Result<CodeAnalysis>
                         });
 
                         unique_files.insert(file_path.to_string());
-                        total_edit_characters += new_string.chars().count();
+                        total_edit_characters += char_count;
                         total_edit_lines += line_count;
                     }
                 }

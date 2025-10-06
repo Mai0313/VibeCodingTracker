@@ -40,17 +40,17 @@ pub fn get_usage_from_directories() -> Result<DateUsageResult> {
 
     // Process Claude directory
     if paths.claude_session_dir.exists() {
-        process_directory(&paths.claude_session_dir, &mut result)?;
+        process_usage_directory(&paths.claude_session_dir, &mut result, is_json_file)?;
     }
 
     // Process Codex directory
     if paths.codex_session_dir.exists() {
-        process_directory(&paths.codex_session_dir, &mut result)?;
+        process_usage_directory(&paths.codex_session_dir, &mut result, is_json_file)?;
     }
 
     // Process Gemini directory (special structure: ~/.gemini/tmp/<hash>/chats/*.json)
     if paths.gemini_session_dir.exists() {
-        process_gemini_directory(&paths.gemini_session_dir, &mut result)?;
+        process_usage_directory(&paths.gemini_session_dir, &mut result, is_gemini_chat_file)?;
     }
 
     Ok(result)
@@ -196,32 +196,13 @@ fn calculate_gemini_usage(data: &[Value]) -> Result<UsageResult> {
     })
 }
 
-fn process_directory<P: AsRef<Path>>(dir: P, result: &mut DateUsageResult) -> Result<()> {
-    let files = collect_files_with_dates(&dir, is_json_file)?;
-
-    for file_info in files {
-        // Calculate usage for this file
-        if let Ok(usage) = calculate_usage_from_jsonl(&file_info.path) {
-            // Initialize date entry if it doesn't exist
-            let date_entry = result.entry(file_info.modified_date).or_default();
-
-            // Merge usage data
-            for (model, usage_value) in usage.conversation_usage {
-                if let Some(existing) = date_entry.get_mut(&model) {
-                    merge_usage_values(existing, &usage_value);
-                } else {
-                    date_entry.insert(model, usage_value);
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Process Gemini directory structure: ~/.gemini/tmp/<hash>/chats/*.json
-fn process_gemini_directory<P: AsRef<Path>>(dir: P, result: &mut DateUsageResult) -> Result<()> {
-    let files = collect_files_with_dates(&dir, is_gemini_chat_file)?;
+fn process_usage_directory<P, F>(dir: P, result: &mut DateUsageResult, filter_fn: F) -> Result<()>
+where
+    P: AsRef<Path>,
+    F: Copy + Fn(&Path) -> bool,
+{
+    let dir = dir.as_ref();
+    let files = collect_files_with_dates(dir, filter_fn)?;
 
     for file_info in files {
         // Calculate usage for this file

@@ -56,27 +56,29 @@ fn main() -> Result<()> {
         }
 
         Commands::Usage { json, text, table } => {
-            if json {
+            // For non-interactive modes, fetch data once and reuse
+            if json || text || table {
                 let usage_data = get_usage_from_directories()?;
-                let pricing_map = match fetch_model_pricing() {
-                    Ok(map) => map,
-                    Err(e) => {
-                        eprintln!(
-                            "Warning: Failed to fetch pricing data: {}. Costs will be unavailable.",
-                            e
-                        );
-                        HashMap::new()
-                    }
-                };
-                let enriched_data = build_enriched_json(&usage_data, &pricing_map)?;
-                let json_str = serde_json::to_string_pretty(&enriched_data)?;
-                println!("{}", json_str);
-            } else if text {
-                let usage_data = get_usage_from_directories()?;
-                display_usage_text(&usage_data);
-            } else if table {
-                let usage_data = get_usage_from_directories()?;
-                display_usage_table(&usage_data);
+
+                if json {
+                    let pricing_map = match fetch_model_pricing() {
+                        Ok(map) => map,
+                        Err(e) => {
+                            eprintln!(
+                                "Warning: Failed to fetch pricing data: {}. Costs will be unavailable.",
+                                e
+                            );
+                            HashMap::new()
+                        }
+                    };
+                    let enriched_data = build_enriched_json(&usage_data, &pricing_map)?;
+                    let json_str = serde_json::to_string_pretty(&enriched_data)?;
+                    println!("{}", json_str);
+                } else if text {
+                    display_usage_text(&usage_data);
+                } else {
+                    display_usage_table(&usage_data);
+                }
             } else {
                 // Default: Display interactive table
                 display_usage_interactive()?;

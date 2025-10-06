@@ -29,17 +29,21 @@ pub fn analyze_all_sessions() -> Result<Vec<AggregatedAnalysisRow>> {
 
     // Process Claude directory
     if paths.claude_session_dir.exists() {
-        process_directory_for_analysis(&paths.claude_session_dir, &mut aggregated)?;
+        process_analysis_directory(&paths.claude_session_dir, &mut aggregated, is_json_file)?;
     }
 
     // Process Codex directory
     if paths.codex_session_dir.exists() {
-        process_directory_for_analysis(&paths.codex_session_dir, &mut aggregated)?;
+        process_analysis_directory(&paths.codex_session_dir, &mut aggregated, is_json_file)?;
     }
 
     // Process Gemini directory (special structure: ~/.gemini/tmp/<hash>/chats/*.json)
     if paths.gemini_session_dir.exists() {
-        process_gemini_directory_for_analysis(&paths.gemini_session_dir, &mut aggregated)?;
+        process_analysis_directory(
+            &paths.gemini_session_dir,
+            &mut aggregated,
+            is_gemini_chat_file,
+        )?;
     }
 
     // Convert HashMap to sorted Vec
@@ -56,37 +60,17 @@ pub fn analyze_all_sessions() -> Result<Vec<AggregatedAnalysisRow>> {
     Ok(results)
 }
 
-fn process_directory_for_analysis<P: AsRef<Path>>(
+fn process_analysis_directory<P, F>(
     dir: P,
     aggregated: &mut HashMap<String, AggregatedAnalysisRow>,
-) -> Result<()> {
-    let files = collect_files_with_dates(&dir, is_json_file)?;
-
-    for file_info in files {
-        // Analyze the file
-        match analyze_jsonl_file(&file_info.path) {
-            Ok(analysis) => {
-                aggregate_analysis_result(aggregated, &file_info.modified_date, &analysis);
-            }
-            Err(e) => {
-                eprintln!(
-                    "Warning: Failed to analyze {}: {}",
-                    file_info.path.display(),
-                    e
-                );
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Process Gemini directory structure: ~/.gemini/tmp/<hash>/chats/*.json
-fn process_gemini_directory_for_analysis<P: AsRef<Path>>(
-    dir: P,
-    aggregated: &mut HashMap<String, AggregatedAnalysisRow>,
-) -> Result<()> {
-    let files = collect_files_with_dates(&dir, is_gemini_chat_file)?;
+    filter_fn: F,
+) -> Result<()>
+where
+    P: AsRef<Path>,
+    F: Copy + Fn(&Path) -> bool,
+{
+    let dir = dir.as_ref();
+    let files = collect_files_with_dates(dir, filter_fn)?;
 
     for file_info in files {
         // Analyze the file

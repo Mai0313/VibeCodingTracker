@@ -302,10 +302,9 @@ del "%~f0"
     Ok(())
 }
 
-/// Check for updates and return version information
-pub fn check_update() -> Result<Option<String>> {
-    println!("🔍 Checking for updates...");
-
+/// Get version comparison information
+/// Returns: (current_version_display, current_version, latest_version, release)
+fn get_version_comparison() -> Result<Option<(String, Version, Version, GitHubRelease)>> {
     let release = fetch_latest_release().context("Failed to fetch latest release information")?;
 
     let (current_version_display, current_version) = get_current_version()?;
@@ -325,12 +324,28 @@ pub fn check_update() -> Result<Option<String>> {
         return Ok(None);
     }
 
-    println!("🆕 New version available: v{}", latest_version);
-    if let Some(body) = &release.body {
-        println!("\nRelease Notes:\n{}", body);
-    }
+    Ok(Some((
+        current_version_display,
+        current_version,
+        latest_version,
+        release,
+    )))
+}
 
-    Ok(Some(release.tag_name.clone()))
+/// Check for updates and return version information
+pub fn check_update() -> Result<Option<String>> {
+    println!("🔍 Checking for updates...");
+
+    match get_version_comparison()? {
+        Some((_, _, latest_version, release)) => {
+            println!("🆕 New version available: v{}", latest_version);
+            if let Some(body) = &release.body {
+                println!("\nRelease Notes:\n{}", body);
+            }
+            Ok(Some(release.tag_name))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Perform the update process
@@ -338,26 +353,13 @@ pub fn perform_update() -> Result<()> {
     println!("🚀 Starting update process...");
     println!();
 
-    // Fetch release information
-    let release = fetch_latest_release().context("Failed to fetch latest release information")?;
-
-    let (current_version_display, current_version) = get_current_version()?;
-
-    // Remove 'v' prefix if present and parse as semver
-    let latest_version_str = release.tag_name.trim_start_matches('v');
-    let latest_version = Version::parse(latest_version_str).context(format!(
-        "Failed to parse latest version: {}",
-        latest_version_str
-    ))?;
-
-    println!("📌 Current version: {}", current_version_display);
-    println!("📌 Latest version:  v{}", latest_version);
-    println!();
-
-    if latest_version <= current_version {
-        println!("✅ You are already on the latest version!");
+    // Get version comparison
+    let Some((_, _, latest_version, release)) = get_version_comparison()? else {
+        // Already on latest version
         return Ok(());
-    }
+    };
+
+    println!();
 
     // Find the asset for current platform
     let asset_pattern = get_asset_pattern(&latest_version.to_string())?;

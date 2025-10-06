@@ -210,40 +210,49 @@ pub fn get_model_pricing(
     // Pre-compute lowercase model name for comparisons
     let model_lower = model_name.to_lowercase();
 
-    // Try to find a partial match (substring) - use lowercase for case-insensitive matching
     // Build a lowercase cache for the pricing map keys to avoid repeated conversions
     let key_cache: Vec<(&String, String)> =
         pricing_map.keys().map(|k| (k, k.to_lowercase())).collect();
 
+    // Single-pass matching: try substring and fuzzy matching in one loop
+    let mut substring_match: Option<String> = None;
+    let mut best_fuzzy_match: Option<(String, f64)> = None;
+
     for (key, key_lower) in &key_cache {
-        if model_lower.contains(key_lower) || key_lower.contains(&model_lower) {
-            if let Some(pricing) = pricing_map.get(*key) {
-                return ModelPricingResult {
-                    pricing: *pricing,
-                    matched_model: Some((*key).clone()),
-                };
-            }
+        // Try substring matching first (higher priority)
+        if substring_match.is_none()
+            && (model_lower.contains(key_lower) || key_lower.contains(&model_lower))
+        {
+            substring_match = Some((*key).clone());
+            // Don't break - continue to find best fuzzy match as fallback
         }
-    }
 
-    // Try fuzzy matching based on string similarity
-    let mut best_match: Option<(String, f64)> = None;
-
-    for (key, key_lower) in &key_cache {
+        // Calculate fuzzy matching in parallel
         let similarity = jaro_winkler(&model_lower, key_lower);
-
         if similarity >= SIMILARITY_THRESHOLD {
-            if let Some((_, best_similarity)) = &best_match {
-                if similarity > *best_similarity {
-                    best_match = Some(((*key).clone(), similarity));
+            match &best_fuzzy_match {
+                Some((_, best_similarity)) if similarity > *best_similarity => {
+                    best_fuzzy_match = Some(((*key).clone(), similarity));
                 }
-            } else {
-                best_match = Some(((*key).clone(), similarity));
+                None => {
+                    best_fuzzy_match = Some(((*key).clone(), similarity));
+                }
+                _ => {}
             }
         }
     }
 
-    if let Some((matched_key, _)) = best_match {
+    // Return substring match first (higher priority), then fuzzy match
+    if let Some(matched_key) = substring_match {
+        if let Some(pricing) = pricing_map.get(&matched_key) {
+            return ModelPricingResult {
+                pricing: *pricing,
+                matched_model: Some(matched_key),
+            };
+        }
+    }
+
+    if let Some((matched_key, _)) = best_fuzzy_match {
         if let Some(pricing) = pricing_map.get(&matched_key) {
             return ModelPricingResult {
                 pricing: *pricing,
