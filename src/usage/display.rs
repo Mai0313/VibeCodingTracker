@@ -1,5 +1,7 @@
 use crate::models::DateUsageResult;
-use crate::pricing::{calculate_cost, fetch_model_pricing, get_model_pricing, ModelPricing};
+use crate::pricing::{
+    calculate_cost, fetch_model_pricing, get_model_pricing, ModelPricing, ModelPricingResult,
+};
 use crate::utils::{extract_token_counts, format_number, get_current_date};
 use comfy_table::{presets::UTF8_FULL, Cell, CellAlignment, Color, Table};
 use crossterm::{
@@ -22,34 +24,47 @@ use std::io;
 use std::time::{Duration, Instant};
 use sysinfo::System;
 
-/// Display usage data as an interactive table that refreshes every 5 seconds
+const USAGE_REFRESH_SECS: u64 = 5;
+const PRICING_REFRESH_SECS: u64 = 300;
+
+/// Display usage data as an interactive table with periodic refresh
 pub fn display_usage_interactive() -> anyhow::Result<()> {
-    // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut last_refresh = Instant::now();
-    let refresh_interval = Duration::from_secs(1);
+    let refresh_interval = Duration::from_secs(USAGE_REFRESH_SECS);
+    let pricing_refresh_interval = Duration::from_secs(PRICING_REFRESH_SECS);
+    let mut last_refresh = Instant::now() - refresh_interval;
+    let mut force_refresh = true;
 
-    // Initialize system for memory monitoring
     let mut sys = System::new_all();
     let pid =
         sysinfo::get_current_pid().expect("Failed to get current process ID for memory monitoring");
 
-    // Track last update time for each row (date + model as key)
+    let mut pricing_map = match fetch_model_pricing() {
+        Ok(map) => map,
+        Err(e) => {
+            log::warn!("Failed to fetch pricing: {}", e);
+            HashMap::new()
+        }
+    };
+    let mut pricing_lookup_cache: HashMap<String, ModelPricingResult> = HashMap::new();
+    let mut last_pricing_refresh = Instant::now();
+    if pricing_map.is_empty() {
+        last_pricing_refresh = Instant::now() - pricing_refresh_interval;
+    }
+
+    let mut usage_data = DateUsageResult::new();
+    let mut has_usage_data = false;
+
     let mut last_update_times: HashMap<String, Instant> = HashMap::new();
     let mut previous_data: HashMap<String, (i64, i64, i64, i64)> = HashMap::new();
 
     loop {
-        // Update system information
-        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, false);
-
-        // Only refresh data if interval has elapsed
-        if last_refresh.elapsed() < refresh_interval {
-            // Handle input and render with existing data
+        if !force_refresh && last_refresh.elapsed() < refresh_interval {
             if event::poll(Duration::from_millis(100))? {
                 if let Event::Key(key) = event::read()? {
                     if key.code == KeyCode::Char('q')
@@ -59,36 +74,51 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
                     {
                         break;
                     }
+                    if key.code == KeyCode::Char('r') || key.code == KeyCode::Char('R') {
+                        force_refresh = true;
+                    }
                 }
             }
             continue;
         }
 
         last_refresh = Instant::now();
+        force_refresh = false;
 
-        // Get usage data with error logging
-        let usage_data = match crate::usage::get_usage_from_directories() {
-            Ok(data) => data,
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, false);
+
+        if last_pricing_refresh.elapsed() >= pricing_refresh_interval || pricing_map.is_empty() {
+            match fetch_model_pricing() {
+                Ok(map) => {
+                    pricing_map = map;
+                    pricing_lookup_cache.clear();
+                    last_pricing_refresh = Instant::now();
+                }
+                Err(e) => {
+                    log::warn!("Failed to fetch pricing: {}", e);
+                    if pricing_map.is_empty() {
+                        last_pricing_refresh = Instant::now() - pricing_refresh_interval;
+                    }
+                }
+            }
+        }
+
+        match crate::usage::get_usage_from_directories() {
+            Ok(data) => {
+                usage_data = data;
+                has_usage_data = true;
+            }
             Err(e) => {
                 log::warn!("Failed to get usage data: {}", e);
-                DateUsageResult::new()
+                if !has_usage_data {
+                    usage_data.clear();
+                }
             }
-        };
+        }
 
-        // Fetch pricing data with error logging
-        let pricing_map = match fetch_model_pricing() {
-            Ok(map) => map,
-            Err(e) => {
-                log::warn!("Failed to fetch pricing: {}", e);
-                HashMap::new()
-            }
-        };
-
-        // Collect and sort dates
         let mut dates: Vec<String> = usage_data.keys().cloned().collect();
         dates.sort();
 
-        // Collect rows
         let mut rows_data = Vec::new();
         let mut totals = UsageRow::default();
 
@@ -99,9 +129,14 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
 
                 for model in models {
                     if let Some(usage) = date_usage.get(&model) {
-                        let row = extract_usage_row(date, &model, usage, &pricing_map);
+                        let row = extract_usage_row(
+                            date,
+                            &model,
+                            usage,
+                            &pricing_map,
+                            &mut pricing_lookup_cache,
+                        );
 
-                        // Check if data has changed
                         let row_key = format!("{}:{}", date, model);
                         let current_data = (
                             row.input_tokens,
@@ -112,11 +147,9 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
 
                         if let Some(prev_data) = previous_data.get(&row_key) {
                             if prev_data != &current_data {
-                                // Data changed, update timestamp
                                 last_update_times.insert(row_key.clone(), Instant::now());
                             }
                         } else {
-                            // New row, mark as updated
                             last_update_times.insert(row_key.clone(), Instant::now());
                         }
                         previous_data.insert(row_key, current_data);
@@ -133,19 +166,17 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
             }
         }
 
-        // Render
         terminal.draw(|f| {
             let chunks = RatatuiLayout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(3), // Title
-                    Constraint::Min(10),   // Table
-                    Constraint::Length(3), // Summary
-                    Constraint::Length(2), // Controls
+                    Constraint::Length(3),
+                    Constraint::Min(10),
+                    Constraint::Length(3),
+                    Constraint::Length(2),
                 ])
                 .split(f.area());
 
-            // Title
             let title = Paragraph::new(vec![Line::from(vec![
                 Span::styled("📊 ", Style::default().fg(RatatuiColor::Cyan)),
                 Span::styled(
@@ -161,7 +192,6 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
             .centered();
             f.render_widget(title, chunks[0]);
 
-            // Table
             let header = vec![
                 "Date",
                 "Model",
@@ -182,14 +212,12 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
                 .map(|row| {
                     let row_key = format!("{}:{}", row.date, row.model);
 
-                    // Check if this row was recently updated
                     let is_recently_updated = last_update_times
                         .get(&row_key)
                         .map(|update_time| now.duration_since(*update_time) < highlight_duration)
                         .unwrap_or(false);
 
                     let style = if is_recently_updated {
-                        // Highlight recently updated rows with a brighter background
                         Style::default().bg(RatatuiColor::Rgb(60, 80, 60)).bold()
                     } else if row.date == today {
                         Style::default().bg(RatatuiColor::Rgb(32, 32, 32))
@@ -211,7 +239,6 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
                 })
                 .collect();
 
-            // Add totals row
             rows.push(
                 RatatuiRow::new(vec![
                     "".to_string(),
@@ -261,12 +288,10 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
 
             f.render_widget(table, chunks[1]);
 
-            // Get memory usage
             let memory_mb = sys
                 .process(pid)
                 .map_or(0.0, |p| p.memory() as f64 / 1024.0 / 1024.0);
 
-            // Summary
             let summary = Paragraph::new(vec![Line::from(vec![
                 Span::styled(
                     "💰 Total Cost: ",
@@ -312,21 +337,23 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
             .centered();
             f.render_widget(summary, chunks[2]);
 
-            // Controls
             let controls = Paragraph::new(vec![Line::from(vec![
                 Span::styled("Press ", Style::default().fg(RatatuiColor::DarkGray)),
                 Span::styled("'q'", Style::default().fg(RatatuiColor::Red).bold()),
                 Span::styled(", ", Style::default().fg(RatatuiColor::DarkGray)),
                 Span::styled("'Esc'", Style::default().fg(RatatuiColor::Red).bold()),
-                Span::styled(", or ", Style::default().fg(RatatuiColor::DarkGray)),
+                Span::styled(", ", Style::default().fg(RatatuiColor::DarkGray)),
                 Span::styled("'Ctrl+C'", Style::default().fg(RatatuiColor::Red).bold()),
                 Span::styled(" to quit", Style::default().fg(RatatuiColor::DarkGray)),
+                Span::styled(
+                    "  |  Press 'r' to refresh",
+                    Style::default().fg(RatatuiColor::DarkGray),
+                ),
             ])])
             .centered();
             f.render_widget(controls, chunks[3]);
         })?;
 
-        // Handle input with timeout
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if key.code == KeyCode::Char('q')
@@ -336,11 +363,13 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
                 {
                     break;
                 }
+                if key.code == KeyCode::Char('r') || key.code == KeyCode::Char('R') {
+                    force_refresh = true;
+                }
             }
         }
     }
 
-    // Restore terminal
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
@@ -375,6 +404,7 @@ pub fn display_usage_table(usage_data: &DateUsageResult) {
     // Collect rows
     let mut rows = Vec::new();
     let mut totals = UsageRow::default();
+    let mut pricing_cache: HashMap<String, ModelPricingResult> = HashMap::new();
 
     for date in &dates {
         if let Some(date_usage) = usage_data.get(*date) {
@@ -384,7 +414,8 @@ pub fn display_usage_table(usage_data: &DateUsageResult) {
 
             for model in models {
                 if let Some(usage) = date_usage.get(model) {
-                    let row = extract_usage_row(date, model, usage, &pricing_map);
+                    let row =
+                        extract_usage_row(date, model, usage, &pricing_map, &mut pricing_cache);
 
                     // Accumulate totals
                     totals.input_tokens += row.input_tokens;
@@ -509,6 +540,7 @@ fn extract_usage_row(
     model: &str,
     usage: &Value,
     pricing_map: &HashMap<String, ModelPricing>,
+    pricing_cache: &mut HashMap<String, ModelPricingResult>,
 ) -> UsageRow {
     // Extract token counts using utility function
     let counts = extract_token_counts(usage);
@@ -525,7 +557,9 @@ fn extract_usage_row(
     };
 
     // Calculate cost with fuzzy matching
-    let pricing_result = get_model_pricing(model, pricing_map);
+    let pricing_result = pricing_cache
+        .entry(model.to_string())
+        .or_insert_with(|| get_model_pricing(model, pricing_map));
     row.cost = calculate_cost(
         row.input_tokens,
         row.output_tokens,
@@ -553,6 +587,7 @@ pub fn display_usage_text(usage_data: &DateUsageResult) {
 
     // Fetch pricing data
     let pricing_map = fetch_model_pricing().unwrap_or_default();
+    let mut pricing_cache: HashMap<String, ModelPricingResult> = HashMap::new();
 
     // Collect and sort dates
     let mut dates: Vec<&String> = usage_data.keys().collect();
@@ -566,7 +601,8 @@ pub fn display_usage_text(usage_data: &DateUsageResult) {
 
             for model in models {
                 if let Some(usage) = date_usage.get(model) {
-                    let row = extract_usage_row(date, model, usage, &pricing_map);
+                    let row =
+                        extract_usage_row(date, model, usage, &pricing_map, &mut pricing_cache);
                     println!("{} > {}: ${:.6}", row.date, row.display_model, row.cost);
                 }
             }

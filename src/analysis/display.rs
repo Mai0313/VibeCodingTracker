@@ -20,6 +20,8 @@ use std::io;
 use std::time::{Duration, Instant};
 use sysinfo::System;
 
+const ANALYSIS_REFRESH_SECS: u64 = 10;
+
 // Type alias for analysis data snapshot: (edit_lines, read_lines, write_lines, bash_count, edit_count, read_count, todo_write_count, write_count)
 type AnalysisDataSnapshot = (usize, usize, usize, usize, usize, usize, usize, usize);
 
@@ -37,8 +39,9 @@ pub fn display_analysis_interactive(data: &[AggregatedAnalysisRow]) -> anyhow::R
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut last_refresh = Instant::now();
-    let refresh_interval = Duration::from_secs(1);
+    let refresh_interval = Duration::from_secs(ANALYSIS_REFRESH_SECS);
+    let mut last_refresh = Instant::now() - refresh_interval;
+    let mut force_refresh = true;
 
     // Initialize system for memory monitoring
     let mut sys = System::new_all();
@@ -48,14 +51,10 @@ pub fn display_analysis_interactive(data: &[AggregatedAnalysisRow]) -> anyhow::R
     // Track last update times
     let mut last_update_times: HashMap<String, Instant> = HashMap::new();
     let mut previous_data: HashMap<String, AnalysisDataSnapshot> = HashMap::new();
+    let mut current_data = data.to_vec();
 
     loop {
-        // Update system information
-        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, false);
-
-        // Only refresh data if interval has elapsed
-        if last_refresh.elapsed() < refresh_interval {
-            // Handle input without refreshing data
+        if !force_refresh && last_refresh.elapsed() < refresh_interval {
             if event::poll(Duration::from_millis(100))? {
                 if let Event::Key(key) = event::read()? {
                     if key.code == KeyCode::Char('q')
@@ -65,21 +64,29 @@ pub fn display_analysis_interactive(data: &[AggregatedAnalysisRow]) -> anyhow::R
                     {
                         break;
                     }
+                    if key.code == KeyCode::Char('r') || key.code == KeyCode::Char('R') {
+                        force_refresh = true;
+                    }
                 }
             }
             continue;
         }
 
         last_refresh = Instant::now();
+        force_refresh = false;
+
+        // Update system information
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, false);
 
         // Fetch fresh data with error logging
-        let current_data = match crate::analysis::analyze_all_sessions() {
-            Ok(data) => data,
+        match crate::analysis::analyze_all_sessions() {
+            Ok(data) => {
+                current_data = data;
+            }
             Err(e) => {
                 log::warn!("Failed to analyze sessions: {}", e);
-                data.to_vec()
             }
-        };
+        }
 
         // Calculate totals
         let mut totals = AnalysisRow::default();
@@ -335,6 +342,10 @@ pub fn display_analysis_interactive(data: &[AggregatedAnalysisRow]) -> anyhow::R
                 Span::styled(", or ", Style::default().fg(RatatuiColor::DarkGray)),
                 Span::styled("'Ctrl+C'", Style::default().fg(RatatuiColor::Red).bold()),
                 Span::styled(" to quit", Style::default().fg(RatatuiColor::DarkGray)),
+                Span::styled(
+                    "  |  Press 'r' to refresh",
+                    Style::default().fg(RatatuiColor::DarkGray),
+                ),
             ])])
             .centered();
             f.render_widget(controls, chunks[3]);
@@ -349,6 +360,9 @@ pub fn display_analysis_interactive(data: &[AggregatedAnalysisRow]) -> anyhow::R
                         && key.modifiers.contains(KeyModifiers::CONTROL))
                 {
                     break;
+                }
+                if key.code == KeyCode::Char('r') || key.code == KeyCode::Char('R') {
+                    force_refresh = true;
                 }
             }
         }

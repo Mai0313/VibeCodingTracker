@@ -23,7 +23,8 @@ fn main() -> Result<()> {
         Commands::Analysis { path, output, all } => {
             if all {
                 // Handle --all flag: group by provider and output as JSON
-                let grouped_data = vibe_coding_tracker::analysis::analyze_all_sessions_by_provider()?;
+                let grouped_data =
+                    vibe_coding_tracker::analysis::analyze_all_sessions_by_provider()?;
 
                 if let Some(output_path) = output {
                     let json_value = serde_json::to_value(&grouped_data)?;
@@ -52,15 +53,20 @@ fn main() -> Result<()> {
 
                         if let Some(output_path) = output {
                             let json_value = serde_json::to_value(&analysis_data)?;
-                            vibe_coding_tracker::utils::save_json_pretty(&output_path, &json_value)?;
+                            vibe_coding_tracker::utils::save_json_pretty(
+                                &output_path,
+                                &json_value,
+                            )?;
                             println!("✅ Analysis result saved to: {}", output_path.display());
                         } else {
-                            vibe_coding_tracker::analysis::display_analysis_interactive(&analysis_data)?;
+                            vibe_coding_tracker::analysis::display_analysis_interactive(
+                                &analysis_data,
+                            )?;
                         }
                     }
                 }
             }
-        },
+        }
 
         Commands::Usage { json, text, table } => {
             if json || text || table {

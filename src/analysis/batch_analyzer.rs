@@ -78,12 +78,20 @@ pub fn analyze_all_sessions_by_provider() -> Result<ProviderGroupedAnalysis> {
 
     // Process Claude sessions
     if paths.claude_session_dir.exists() {
-        process_full_analysis_directory(&paths.claude_session_dir, &mut claude_results, is_json_file)?;
+        process_full_analysis_directory(
+            &paths.claude_session_dir,
+            &mut claude_results,
+            is_json_file,
+        )?;
     }
 
     // Process Codex sessions
     if paths.codex_session_dir.exists() {
-        process_full_analysis_directory(&paths.codex_session_dir, &mut codex_results, is_json_file)?;
+        process_full_analysis_directory(
+            &paths.codex_session_dir,
+            &mut codex_results,
+            is_json_file,
+        )?;
     }
 
     // Process Gemini sessions

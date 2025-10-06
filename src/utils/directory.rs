@@ -39,16 +39,18 @@ where
         }
 
         // Get file modification time for date grouping
-        if let Ok(metadata) = std::fs::metadata(path) {
-            if let Ok(modified) = metadata.modified() {
-                let datetime: chrono::DateTime<chrono::Utc> = modified.into();
-                let date_key = datetime.format("%Y-%m-%d").to_string();
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
 
-                results.push(FileInfo {
-                    path: path.to_path_buf(),
-                    modified_date: date_key,
-                });
-            }
+        if let Ok(modified) = metadata.modified() {
+            let datetime: chrono::DateTime<chrono::Utc> = modified.into();
+            let date_key = datetime.format("%Y-%m-%d").to_string();
+
+            results.push(FileInfo {
+                path: path.to_path_buf(),
+                modified_date: date_key,
+            });
         }
     }
 

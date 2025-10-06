@@ -210,32 +210,30 @@ pub fn get_model_pricing(
     // Pre-compute lowercase model name for comparisons
     let model_lower = model_name.to_lowercase();
 
-    // Build a lowercase cache for the pricing map keys to avoid repeated conversions
-    let key_cache: Vec<(&String, String)> =
-        pricing_map.keys().map(|k| (k, k.to_lowercase())).collect();
-
     // Single-pass matching: try substring and fuzzy matching in one loop
     let mut substring_match: Option<String> = None;
     let mut best_fuzzy_match: Option<(String, f64)> = None;
 
-    for (key, key_lower) in &key_cache {
+    for key in pricing_map.keys() {
+        let key_lower = key.to_lowercase();
+
         // Try substring matching first (higher priority)
         if substring_match.is_none()
-            && (model_lower.contains(key_lower) || key_lower.contains(&model_lower))
+            && (model_lower.contains(&key_lower) || key_lower.contains(&model_lower))
         {
-            substring_match = Some((*key).clone());
+            substring_match = Some(key.clone());
             // Don't break - continue to find best fuzzy match as fallback
         }
 
         // Calculate fuzzy matching in parallel
-        let similarity = jaro_winkler(&model_lower, key_lower);
+        let similarity = jaro_winkler(&model_lower, &key_lower);
         if similarity >= SIMILARITY_THRESHOLD {
             match &best_fuzzy_match {
                 Some((_, best_similarity)) if similarity > *best_similarity => {
-                    best_fuzzy_match = Some(((*key).clone(), similarity));
+                    best_fuzzy_match = Some((key.clone(), similarity));
                 }
                 None => {
-                    best_fuzzy_match = Some(((*key).clone(), similarity));
+                    best_fuzzy_match = Some((key.clone(), similarity));
                 }
                 _ => {}
             }

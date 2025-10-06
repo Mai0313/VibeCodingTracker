@@ -230,6 +230,9 @@ cargo test --all
 # Run specific test file
 cargo test --test test_integration_usage
 
+# Run expected output validation tests
+cargo test --test test_analysis_expected_output
+
 # Run with verbose output
 cargo test --all --verbose
 
@@ -237,6 +240,28 @@ cargo test --all --verbose
 examples/test_conversation.jsonl          # Claude Code format
 examples/test_conversation_oai.jsonl       # Codex format
 examples/test_conversation_gemini.json     # Gemini format
+
+# Expected analysis output files for validation
+examples/analysis_result.json              # Expected Claude Code output
+examples/analysis_result_oai.json          # Expected Codex output
+examples/analysis_result_gemini.json       # Expected Gemini output
+```
+
+### Expected Output Validation Tests
+
+The `test_analysis_expected_output.rs` test suite validates that `analysis --path` produces consistent output:
+
+- **Purpose**: Ensure analysis output matches expected results for all three formats (Claude Code, Codex, Gemini)
+- **Ignored Fields**: `insightsVersion`, `machineId`, `user` (environment-specific)
+- **Test Cases**:
+  - `test_claude_code_analysis_matches_expected`: Validates Claude Code analysis
+  - `test_codex_analysis_matches_expected`: Validates Codex/OpenAI analysis
+  - `test_gemini_analysis_matches_expected`: Validates Gemini analysis
+- **Helper Function**: `compare_json_ignore_fields()` recursively compares JSON while ignoring specific fields
+
+Run these tests to verify that changes to the analysis logic haven't altered the output format:
+```bash
+cargo test --test test_analysis_expected_output -- --nocapture
 ```
 
 ## Docker
