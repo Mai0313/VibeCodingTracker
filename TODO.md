@@ -157,3 +157,7 @@
 
 請幫我檢查一下目前 `usage`, `analysis`, 和透過 `--path` 選擇文件 的 parsing 邏輯是否屬於同一套
 都是先從 examples/test_conversation_gemini.json examples/test_conversation_oai.jsonl examples/test_conversation.jsonl 這種文件中先 parse 完畢以後才取所需資訊顯示成table
+
+## 幫我新增一個功能 到 `analysis`
+假設我在 analysis 功能下 如果我沒給 `--path`, 但有給 `--output`, 她就會自動從 gemini / codex / claude code 資料夾中parse所有數據並存檔
+但存法就要變成 gemini / codex / claude code 當作 key, 對應的 value 則是各自的 `list[dict]`
