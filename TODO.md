@@ -163,3 +163,9 @@
 當我透過 `analysis --all` 呼叫時, 腳本自動從 gemini / codex / claude code 資料夾中parse所有數據並印出
 假設我有給 `analysis --all --output`, 則要存起來
 印出來與存入的資料都是變成 gemini / codex / claude code 當作 key, 對應的 value 則是各自的 `list[dict]`
+
+## 幫我更新一下 usage 的計算
+token 價格的資訊有可能包含這些key, 所以計算的部分可能要修改讓她更精確
+```text
+"input_cost_per_token", "output_cost_per_token", "cache_creation_input_token_cost", "cache_read_input_token_cost", "input_cost_per_token_above_200k_tokens", "output_cost_per_token_above_200k_tokens", "cache_creation_input_token_cost_above_200k_tokens", "cache_read_input_token_cost_above_200k_tokens", "cache_creation_input_audio_token_cost", "input_cost_per_audio_token", "output_cost_per_audio_token", "cache_read_input_audio_token_cost", "input_cost_per_token_batches", "output_cost_per_token_batches", "cache_creation_input_token_cost_above_1hr", "output_cost_per_reasoning_token", "input_dbu_cost_per_token", "output_dbu_cost_per_token", "output_db_cost_per_token", "input_cost_per_token_cache_hit", "input_cost_per_audio_per_second_above_128k_tokens", "input_cost_per_character_above_128k_tokens", "input_cost_per_image_above_128k_tokens", "input_cost_per_token_above_128k_tokens", "input_cost_per_video_per_second_above_128k_tokens", "output_cost_per_character_above_128k_tokens", "output_cost_per_token_above_128k_tokens", "cache_read_input_token_cost_priority", "input_cost_per_token_priority", "output_cost_per_token_priority", "cache_read_input_token_cost_flex", "input_cost_per_token_flex", "output_cost_per_token_flex", "citation_cost_per_token", "computer_use_input_cost_per_1k_tokens", "computer_use_output_cost_per_1k_tokens", "input_cost_per_token_batch_requests"
+```
