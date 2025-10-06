@@ -33,6 +33,7 @@ repos:
       - id: destroyed-symlinks
       - id: detect-private-key
       - id: end-of-file-fixer
+        exclude: examples
       # - id: no-commit-to-branch
       - id: trailing-whitespace
       - id: fix-byte-order-marker

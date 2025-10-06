@@ -260,6 +260,7 @@ The `test_analysis_expected_output.rs` test suite validates that `analysis --pat
 - **Helper Function**: `compare_json_ignore_fields()` recursively compares JSON while ignoring specific fields
 
 Run these tests to verify that changes to the analysis logic haven't altered the output format:
+
 ```bash
 cargo test --test test_analysis_expected_output -- --nocapture
 ```
@@ -315,7 +316,7 @@ docker run --rm \
 - **Single Source of Truth**: All commands (`usage`, `analysis --path`, and `analysis`) use the same parsing pipeline via `analyze_jsonl_file()`
 - **Format Detection**: `detector.rs` automatically identifies Claude/Codex/Gemini format
 - **Parser Routing**: Routes to appropriate analyzer (`claude_analyzer`, `codex_analyzer`, `gemini_analyzer`)
-- **Data Extraction**: 
+- **Data Extraction**:
   - `usage` command extracts only `conversationUsage` from `CodeAnalysis`
   - `analysis` command uses full `CodeAnalysis` including file operations and tool calls
 - **Benefits**: Eliminates code duplication, ensures consistency, and simplifies maintenance
