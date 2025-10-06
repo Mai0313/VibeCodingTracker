@@ -21,6 +21,10 @@ pub enum Commands {
         /// Optional output path to save analysis result as JSON
         #[arg(short, long)]
         output: Option<PathBuf>,
+
+        /// Group results by provider (claude/codex/gemini)
+        #[arg(long)]
+        all: bool,
     },
 
     /// Display token usage statistics

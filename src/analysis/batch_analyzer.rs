@@ -56,6 +56,82 @@ pub fn analyze_all_sessions() -> Result<Vec<AggregatedAnalysisRow>> {
     Ok(results)
 }
 
+/// Result structure for provider-grouped analysis with full records
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderGroupedAnalysis {
+    #[serde(rename = "Claude-Code")]
+    pub claude: Vec<Value>,
+    #[serde(rename = "Codex")]
+    pub codex: Vec<Value>,
+    #[serde(rename = "Gemini")]
+    pub gemini: Vec<Value>,
+}
+
+/// Analyze all JSONL/JSON files grouped by provider (claude/codex/gemini)
+/// Returns full CodeAnalysis results for each provider
+pub fn analyze_all_sessions_by_provider() -> Result<ProviderGroupedAnalysis> {
+    let paths = crate::utils::resolve_paths()?;
+
+    let mut claude_results: Vec<Value> = Vec::new();
+    let mut codex_results: Vec<Value> = Vec::new();
+    let mut gemini_results: Vec<Value> = Vec::new();
+
+    // Process Claude sessions
+    if paths.claude_session_dir.exists() {
+        process_full_analysis_directory(&paths.claude_session_dir, &mut claude_results, is_json_file)?;
+    }
+
+    // Process Codex sessions
+    if paths.codex_session_dir.exists() {
+        process_full_analysis_directory(&paths.codex_session_dir, &mut codex_results, is_json_file)?;
+    }
+
+    // Process Gemini sessions
+    if paths.gemini_session_dir.exists() {
+        process_full_analysis_directory(
+            &paths.gemini_session_dir,
+            &mut gemini_results,
+            is_gemini_chat_file,
+        )?;
+    }
+
+    Ok(ProviderGroupedAnalysis {
+        claude: claude_results,
+        codex: codex_results,
+        gemini: gemini_results,
+    })
+}
+
+fn process_full_analysis_directory<P, F>(
+    dir: P,
+    results: &mut Vec<Value>,
+    filter_fn: F,
+) -> Result<()>
+where
+    P: AsRef<Path>,
+    F: Copy + Fn(&Path) -> bool,
+{
+    let dir = dir.as_ref();
+    let files = collect_files_with_dates(dir, filter_fn)?;
+
+    for file_info in files {
+        match analyze_jsonl_file(&file_info.path) {
+            Ok(analysis) => {
+                results.push(analysis);
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: Failed to analyze {}: {}",
+                    file_info.path.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn process_analysis_directory<P, F>(
     dir: P,
     aggregated: &mut HashMap<String, AggregatedAnalysisRow>,

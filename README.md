@@ -295,6 +295,12 @@ vct analysis
 
 # Batch: Save aggregated results to JSON
 vct analysis --output batch_report.json
+
+# Batch with provider grouping: Output complete records grouped by provider (JSON format)
+vct analysis --all
+
+# Save the grouped results to a file
+vct analysis --all --output grouped_report.json
 ```
 
 ### What You Get

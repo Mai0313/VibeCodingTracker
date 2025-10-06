@@ -295,6 +295,12 @@ vct analysis
 
 # 批次：將彙總結果儲存為 JSON
 vct analysis --output batch_report.json
+
+# 批次並依提供者分組：輸出完整的 records，依提供者分組（JSON 格式）
+vct analysis --all
+
+# 將分組結果儲存到檔案
+vct analysis --all --output grouped_report.json
 ```
 
 ### 您將獲得什麼

@@ -66,6 +66,12 @@ vct analysis
 # Batch analyze and save to JSON
 vct analysis --output <output.json>
 
+# Batch analyze all sessions grouped by provider (claude/codex/gemini)
+vct analysis --all
+
+# Batch analyze grouped by provider and save to JSON
+vct analysis --all --output <output.json>
+
 # Version info
 vct version [--json|--text]
 
@@ -148,6 +154,17 @@ src/
   - Columns: Date, Model, Edit Lines, Read Lines, Write Lines, Bash, Edit, Read, TodoWrite, Write
   - Shows totals row and memory usage
 - With `--output`: Saves aggregated results as JSON array
+
+**Batch Mode with Provider Grouping** (with `--all`):
+
+- `main.rs::Commands::Analysis` → `analysis/batch_analyzer.rs::analyze_all_sessions_by_provider()`
+  - Scans and processes each provider directory separately
+  - Returns `ProviderGroupedAnalysis` struct with complete CodeAnalysis records for each provider
+  - Output includes full records with all conversation usage, file operations, and tool call details
+- Default behavior: Outputs JSON directly to stdout
+  - Keys: "Claude-Code", "Codex", "Gemini"
+  - Values: Arrays of complete CodeAnalysis objects with full records
+- With `--output`: Saves the JSON to the specified file path
 
 **3. Pricing System:**
 
@@ -384,6 +401,53 @@ ls -la ~/.gemini/tmp/
     "writeCount": 8
   }
 ]
+```
+
+**Batch Analysis with --all (Provider Grouped) JSON format:**
+
+```json
+{
+  "Claude-Code": [
+    {
+      "extensionName": "Claude-Code",
+      "insightsVersion": "0.1.9",
+      "machineId": "18f309cbbb654be69eff5ff79d2f3fa6",
+      "records": [
+        {
+          "conversationUsage": {
+            "claude-sonnet-4-20250514": {
+              "input_tokens": 252,
+              "output_tokens": 3921,
+              "cache_read_input_tokens": 1298818,
+              "cache_creation_input_tokens": 124169
+            }
+          },
+          "editFileDetails": [...],
+          "readFileDetails": [...],
+          "writeFileDetails": [...],
+          "runCommandDetails": [...],
+          "toolCallCounts": {
+            "Bash": 1,
+            "Edit": 3,
+            "Read": 2,
+            "TodoWrite": 14,
+            "Write": 3
+          },
+          "totalEditLines": 2,
+          "totalReadLines": 42,
+          "totalWriteLines": 441,
+          "taskId": "b162b1ae-97bc-475f-9b5f-ffbf55ca5b3f",
+          "timestamp": 1756386827562,
+          "folderPath": "/home/wei/repo/claude-code",
+          "gitRemoteUrl": "https://github.com/Mai0313/claude-code"
+        }
+      ],
+      "user": "wei"
+    }
+  ],
+  "Codex": [...],
+  "Gemini": [...]
+}
 ```
 
 ## Release Profile

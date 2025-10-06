@@ -20,27 +20,44 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Analysis { path, output } => match path {
-            Some(file_path) => {
-                let result = analyze_jsonl_file(&file_path)?;
+        Commands::Analysis { path, output, all } => {
+            if all {
+                // Handle --all flag: group by provider and output as JSON
+                let grouped_data = vibe_coding_tracker::analysis::analyze_all_sessions_by_provider()?;
 
                 if let Some(output_path) = output {
-                    vibe_coding_tracker::utils::save_json_pretty(&output_path, &result)?;
-                    println!("✅ Analysis result saved to: {}", output_path.display());
-                } else {
-                    let json_str = serde_json::to_string_pretty(&result)?;
-                    println!("{}", json_str);
-                }
-            }
-            None => {
-                let analysis_data = vibe_coding_tracker::analysis::analyze_all_sessions()?;
-
-                if let Some(output_path) = output {
-                    let json_value = serde_json::to_value(&analysis_data)?;
+                    let json_value = serde_json::to_value(&grouped_data)?;
                     vibe_coding_tracker::utils::save_json_pretty(&output_path, &json_value)?;
                     println!("✅ Analysis result saved to: {}", output_path.display());
                 } else {
-                    vibe_coding_tracker::analysis::display_analysis_interactive(&analysis_data)?;
+                    // Output as JSON by default
+                    let json_str = serde_json::to_string_pretty(&grouped_data)?;
+                    println!("{}", json_str);
+                }
+            } else {
+                match path {
+                    Some(file_path) => {
+                        let result = analyze_jsonl_file(&file_path)?;
+
+                        if let Some(output_path) = output {
+                            vibe_coding_tracker::utils::save_json_pretty(&output_path, &result)?;
+                            println!("✅ Analysis result saved to: {}", output_path.display());
+                        } else {
+                            let json_str = serde_json::to_string_pretty(&result)?;
+                            println!("{}", json_str);
+                        }
+                    }
+                    None => {
+                        let analysis_data = vibe_coding_tracker::analysis::analyze_all_sessions()?;
+
+                        if let Some(output_path) = output {
+                            let json_value = serde_json::to_value(&analysis_data)?;
+                            vibe_coding_tracker::utils::save_json_pretty(&output_path, &json_value)?;
+                            println!("✅ Analysis result saved to: {}", output_path.display());
+                        } else {
+                            vibe_coding_tracker::analysis::display_analysis_interactive(&analysis_data)?;
+                        }
+                    }
                 }
             }
         },
