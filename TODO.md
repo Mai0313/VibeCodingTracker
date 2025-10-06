@@ -166,10 +166,56 @@
 
 ## 幫我更新一下 usage 的計算
 
-token 價格的資訊有可能包含這些key, 所以計算的部分可能要修改讓她更精確
-```text
-"input_cost_per_token", "output_cost_per_token", "cache_creation_input_token_cost", "cache_read_input_token_cost", "input_cost_per_token_above_200k_tokens", "output_cost_per_token_above_200k_tokens", "cache_creation_input_token_cost_above_200k_tokens", "cache_read_input_token_cost_above_200k_tokens", "cache_creation_input_audio_token_cost", "input_cost_per_audio_token", "output_cost_per_audio_token", "cache_read_input_audio_token_cost", "input_cost_per_token_batches", "output_cost_per_token_batches", "cache_creation_input_token_cost_above_1hr", "output_cost_per_reasoning_token", "input_dbu_cost_per_token", "output_dbu_cost_per_token", "output_db_cost_per_token", "input_cost_per_token_cache_hit", "input_cost_per_audio_per_second_above_128k_tokens", "input_cost_per_character_above_128k_tokens", "input_cost_per_image_above_128k_tokens", "input_cost_per_token_above_128k_tokens", "input_cost_per_video_per_second_above_128k_tokens", "output_cost_per_character_above_128k_tokens", "output_cost_per_token_above_128k_tokens", "cache_read_input_token_cost_priority", "input_cost_per_token_priority", "output_cost_per_token_priority", "cache_read_input_token_cost_flex", "input_cost_per_token_flex", "output_cost_per_token_flex", "citation_cost_per_token", "computer_use_input_cost_per_1k_tokens", "computer_use_output_cost_per_1k_tokens", "input_cost_per_token_batch_requests"
+token 價格的資訊需要修改一下讓他更精確 因為每一個模型的計算方式不同 所以計算時需要取不同的 key
+
+Claude Code 的 Usage:
+
+```json
+"usage":{"input_tokens":12,"cache_creation_input_tokens":1541,"cache_read_input_tokens":15247,"cache_creation":{"ephemeral_5m_input_tokens":1541,"ephemeral_1h_input_tokens":0},"output_tokens":2,"service_tier":"standard"}
 ```
+需要從 `https://github.com/BerriAI/litellm/raw/refs/heads/main/model_prices_and_context_window.json` 取得以下資訊
+"cache_creation_input_token_cost": 3.75e-06
+"cache_read_input_token_cost": 3e-07
+"input_cost_per_token": 3e-06
+"output_cost_per_token": 1.5e-05
+# 如果 token 超出 200K (請注意 這裡不是總和 而是當次):
+"cache_creation_input_token_cost_above_200k_tokens": 7.5e-06
+"cache_read_input_token_cost_above_200k_tokens": 6e-07
+"input_cost_per_token_above_200k_tokens": 6e-06
+"output_cost_per_token_above_200k_tokens": 2.25e-05
+
+Codex 的 Usage:
+
+```json
+"payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":58619,"cached_input_tokens":19840,"output_tokens":6589,"reasoning_output_tokens":5824,"total_tokens":65208},"last_token_usage":{"input_tokens":13061,"cached_input_tokens":5248,"output_tokens":1444,"reasoning_output_tokens":1280,"total_tokens":14505},"model_context_window":null}}
+```
+需要從 `https://github.com/BerriAI/litellm/raw/refs/heads/main/model_prices_and_context_window.json` 取得以下資訊
+"cache_read_input_token_cost": 1.25e-07
+"input_cost_per_token": 1.25e-06
+"output_cost_per_token": 1e-05
+
+Gemini 的 Usage:
+
+```json
+"tokens": {
+  "input": 7228,
+  "output": 94,
+  "cached": 0,
+  "thoughts": 2659,
+  "tool": 0,
+  "total": 9981
+},
+```
+需要從 `https://github.com/BerriAI/litellm/raw/refs/heads/main/model_prices_and_context_window.json` 取得以下資訊
+"input_cost_per_token": 1.25e-06
+"output_cost_per_token": 1e-05
+"cache_read_input_token_cost": 3.125e-07
+# 如果 token 超出 200K (請注意 這裡不是總和 而是當次):
+"input_cost_per_token_above_200k_tokens": 2.5e-06
+"output_cost_per_token_above_200k_tokens": 1.5e-05
+
+我覺得邏輯可以較為簡單得做成
+先假設每一個模型都會有 `above_200k`, 如果沒有的話就透過原價當作預設直來計算
 
 ## 請幫我檢查所有代碼 查看一下有沒有地方是需要優化或冗餘代碼
 
