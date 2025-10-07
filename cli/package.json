@@ -43,9 +43,5 @@
     "bin/",
     "binaries/",
     "README.md"
-  ],
-  "dependencies": {
-    "adm-zip": "^0.5.10",
-    "tar": "^7.4.3"
-  }
+  ]
 }

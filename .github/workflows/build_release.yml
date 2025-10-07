@@ -172,19 +172,53 @@ jobs:
           echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
           echo "Publishing version: ${VERSION}"
 
-      - name: Download release binaries
+      - name: Download and extract release binaries
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          mkdir -p cli/binaries/temp
           gh release download ${{ github.ref_name }} \
             --pattern "*.tar.gz" \
             --pattern "*.zip" \
-            --dir cli/binaries
+            --dir cli/binaries/temp
 
-      - name: List downloaded binaries
-        run: |
-          echo "Downloaded binaries:"
-          ls -lh cli/binaries/
+          echo "Downloaded archives:"
+          ls -lh cli/binaries/temp/
+
+          # Extract each archive to its own subdirectory
+          cd cli/binaries/temp
+
+          # Extract .tar.gz files (Linux/macOS)
+          for archive in *.tar.gz; do
+            if [ -f "$archive" ]; then
+              # Extract platform identifier from filename
+              # e.g., vibe_coding_tracker-v0.2.2-linux-x64-gnu.tar.gz -> linux-x64-gnu
+              platform=$(echo "$archive" | sed 's/vibe_coding_tracker-v[0-9.]*-\(.*\)\.tar\.gz/\1/')
+              echo "Extracting $archive to $platform/..."
+              mkdir -p "../$platform"
+              tar -xzf "$archive" -C "../$platform"
+            fi
+          done
+
+          # Extract .zip files (Windows)
+          for archive in *.zip; do
+            if [ -f "$archive" ]; then
+              # Extract platform identifier from filename
+              # e.g., vibe_coding_tracker-v0.2.2-windows-x64.zip -> windows-x64
+              platform=$(echo "$archive" | sed 's/vibe_coding_tracker-v[0-9.]*-\(.*\)\.zip/\1/')
+              echo "Extracting $archive to $platform/..."
+              mkdir -p "../$platform"
+              unzip -q "$archive" -d "../$platform"
+            fi
+          done
+
+          # Go back and clean up
+          cd ../../../
+          rm -rf cli/binaries/temp
+
+          echo ""
+          echo "Extracted binaries structure:"
+          ls -lhR cli/binaries/
 
       - name: Update package.json version and name
         working-directory: cli

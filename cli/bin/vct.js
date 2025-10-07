@@ -3,25 +3,24 @@
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
-const os = require('os');
 
-// Determine platform-specific binary name and archive format
+// Determine platform-specific directory and binary name
 function getPlatformInfo() {
   const platform = process.platform;
   const arch = process.arch;
 
   const platformMap = {
     darwin: {
-      x64: { friendlyId: 'macos-x64', ext: 'tar.gz' },
-      arm64: { friendlyId: 'macos-arm64', ext: 'tar.gz' },
+      x64: { dir: 'macos-x64', binary: 'vibe_coding_tracker' },
+      arm64: { dir: 'macos-arm64', binary: 'vibe_coding_tracker' },
     },
     linux: {
-      x64: { friendlyId: 'linux-x64-gnu', ext: 'tar.gz' },
-      arm64: { friendlyId: 'linux-arm64-gnu', ext: 'tar.gz' },
+      x64: { dir: 'linux-x64-gnu', binary: 'vibe_coding_tracker' },
+      arm64: { dir: 'linux-arm64-gnu', binary: 'vibe_coding_tracker' },
     },
     win32: {
-      x64: { friendlyId: 'windows-x64', ext: 'zip' },
-      arm64: { friendlyId: 'windows-arm64', ext: 'zip' },
+      x64: { dir: 'windows-x64', binary: 'vibe_coding_tracker.exe' },
+      arm64: { dir: 'windows-arm64', binary: 'vibe_coding_tracker.exe' },
     },
   };
 
@@ -30,25 +29,12 @@ function getPlatformInfo() {
     process.exit(1);
   }
 
-  const info = platformMap[platform][arch];
-  return {
-    binaryName: platform === 'win32' ? 'vibe_coding_tracker.exe' : 'vibe_coding_tracker',
-    ...info
-  };
+  return platformMap[platform][arch];
 }
 
-// Extract binary from archive on first run
-function extractBinary() {
-  const info = getPlatformInfo();
-  const binDir = path.join(__dirname);
-  const binaryPath = path.join(binDir, info.binaryName);
-
-  // If binary already exists, return its path
-  if (fs.existsSync(binaryPath)) {
-    return binaryPath;
-  }
-
-  // Find the archive in binaries directory
+// Find the binary for current platform
+function findBinary() {
+  const platformInfo = getPlatformInfo();
   const packageRoot = path.join(__dirname, '..');
   const binariesDir = path.join(packageRoot, 'binaries');
 
@@ -58,48 +44,30 @@ function extractBinary() {
     process.exit(1);
   }
 
-  // Find matching archive
-  const files = fs.readdirSync(binariesDir);
-  const archivePattern = `${info.friendlyId}.${info.ext}`;
-  const archiveFile = files.find(f => f.includes(info.friendlyId) && f.endsWith(info.ext));
+  // Look for the binary in platform-specific subdirectory
+  const platformDir = path.join(binariesDir, platformInfo.dir);
+  const binaryPath = path.join(platformDir, platformInfo.binary);
 
-  if (!archiveFile) {
-    console.error(`Error: Binary archive not found for ${archivePattern}`);
+  if (!fs.existsSync(binaryPath)) {
+    console.error(`Error: Binary not found for your platform: ${platformInfo.dir}/${platformInfo.binary}`);
     console.error('Please reinstall the package.');
     process.exit(1);
   }
 
-  const archivePath = path.join(binariesDir, archiveFile);
-
-  // Extract binary
-  try {
-    if (info.ext === 'tar.gz') {
-      const tar = require('tar');
-      tar.extract({
-        file: archivePath,
-        cwd: binDir,
-        sync: true,
-      });
-    } else if (info.ext === 'zip') {
-      const AdmZip = require('adm-zip');
-      const zip = new AdmZip(archivePath);
-      zip.extractEntryTo(info.binaryName, binDir, false, true);
-    }
-
-    // Make binary executable on Unix-like systems
-    if (process.platform !== 'win32') {
+  // Make binary executable on Unix-like systems
+  if (process.platform !== 'win32') {
+    try {
       fs.chmodSync(binaryPath, 0o755);
+    } catch (err) {
+      // Ignore error if already executable
     }
-  } catch (err) {
-    console.error('Failed to extract binary:', err);
-    process.exit(1);
   }
 
   return binaryPath;
 }
 
-// Get or extract binary
-const binaryPath = extractBinary();
+// Get binary path
+const binaryPath = findBinary();
 
 // Forward all arguments to the binary
 const args = process.argv.slice(2);
