@@ -1,19 +1,19 @@
 use crate::analysis::AggregatedAnalysisRow;
 use crate::utils::{format_number, get_current_date};
-use comfy_table::{presets::UTF8_FULL, Cell, CellAlignment, Color, Table};
+use comfy_table::{Cell, CellAlignment, Color, Table, presets::UTF8_FULL};
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use owo_colors::OwoColorize;
 use ratatui::{
+    Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout as RatatuiLayout},
     style::{Color as RatatuiColor, Style, Stylize},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Row as RatatuiRow, Table as RatatuiTable},
-    Terminal,
 };
 use std::collections::HashMap;
 use std::io;

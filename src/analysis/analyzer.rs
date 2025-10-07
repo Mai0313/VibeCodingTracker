@@ -1,10 +1,10 @@
+use crate::VERSION;
 use crate::analysis::claude_analyzer::analyze_claude_conversations;
 use crate::analysis::codex_analyzer::analyze_codex_conversations;
 use crate::analysis::detector::detect_extension_type;
 use crate::analysis::gemini_analyzer::analyze_gemini_conversations;
 use crate::models::{CodexLog, ExtensionType};
 use crate::utils::{get_current_user, get_machine_id, read_json, read_jsonl};
-use crate::VERSION;
 use anyhow::Result;
 use serde_json::Value;
 use std::path::Path;

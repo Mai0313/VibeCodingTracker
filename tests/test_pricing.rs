@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use vibe_coding_tracker::pricing::{calculate_cost, ModelPricing, ModelPricingMap};
+use vibe_coding_tracker::pricing::{ModelPricing, ModelPricingMap, calculate_cost};
 
 #[test]
 fn test_model_pricing_default() {
