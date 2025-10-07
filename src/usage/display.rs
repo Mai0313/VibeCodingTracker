@@ -1,7 +1,5 @@
 use crate::models::DateUsageResult;
-use crate::pricing::{
-    calculate_cost, fetch_model_pricing, ModelPricingMap, ModelPricingResult,
-};
+use crate::pricing::{calculate_cost, fetch_model_pricing, ModelPricingMap, ModelPricingResult};
 use crate::utils::{extract_token_counts, format_number, get_current_date};
 use comfy_table::{presets::UTF8_FULL, Cell, CellAlignment, Color, Table};
 use crossterm::{
@@ -87,7 +85,9 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
 
         sys.refresh_processes(sysinfo::ProcessesToUpdate::All, false);
 
-        if last_pricing_refresh.elapsed() >= pricing_refresh_interval || pricing_map.raw().is_empty() {
+        if last_pricing_refresh.elapsed() >= pricing_refresh_interval
+            || pricing_map.raw().is_empty()
+        {
             match fetch_model_pricing() {
                 Ok(map) => {
                     pricing_map = map;
@@ -341,14 +341,10 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
             f.render_widget(summary, chunks[2]);
 
             // Daily Averages section
-            let mut avg_lines = vec![
-                Line::from(vec![
-                    Span::styled(
-                        "📈 Daily Averages",
-                        Style::default().fg(RatatuiColor::Magenta).bold(),
-                    ),
-                ])
-            ];
+            let mut avg_lines = vec![Line::from(vec![Span::styled(
+                "📈 Daily Averages",
+                Style::default().fg(RatatuiColor::Magenta).bold(),
+            )])];
 
             if daily_averages.claude.days_count > 0 {
                 avg_lines.push(Line::from(vec![
@@ -396,7 +392,10 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
             }
 
             avg_lines.push(Line::from(vec![
-                Span::styled("  Overall: ", Style::default().fg(RatatuiColor::Magenta).bold()),
+                Span::styled(
+                    "  Overall: ",
+                    Style::default().fg(RatatuiColor::Magenta).bold(),
+                ),
                 Span::styled(
                     format_number(daily_averages.overall_avg_tokens() as i64),
                     Style::default().fg(RatatuiColor::White).bold(),
@@ -408,12 +407,11 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
                 ),
             ]));
 
-            let averages_widget = Paragraph::new(avg_lines)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(RatatuiColor::Magenta)),
-                );
+            let averages_widget = Paragraph::new(avg_lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(RatatuiColor::Magenta)),
+            );
             f.render_widget(averages_widget, chunks[3]);
 
             let controls = Paragraph::new(vec![Line::from(vec![
@@ -603,7 +601,10 @@ pub fn display_usage_table(usage_data: &DateUsageResult) {
     // Calculate and display daily averages
     let daily_averages = calculate_daily_averages(&rows);
 
-    println!("{}", "📈 Daily Averages (by Provider)".bright_magenta().bold());
+    println!(
+        "{}",
+        "📈 Daily Averages (by Provider)".bright_magenta().bold()
+    );
     println!();
 
     let mut avg_table = Table::new();
@@ -794,7 +795,8 @@ fn detect_provider(model: &str) -> &'static str {
         "claude"
     } else if model_lower.starts_with("gpt")
         || model_lower.starts_with("o1")
-        || model_lower.starts_with("o3") {
+        || model_lower.starts_with("o3")
+    {
         "codex"
     } else if model_lower.starts_with("gemini") {
         "gemini"
@@ -917,7 +919,8 @@ pub fn display_usage_text(usage_data: &DateUsageResult) {
     }
 
     // Fetch pricing data
-    let pricing_map = fetch_model_pricing().unwrap_or_else(|_| ModelPricingMap::new(HashMap::new()));
+    let pricing_map =
+        fetch_model_pricing().unwrap_or_else(|_| ModelPricingMap::new(HashMap::new()));
     let mut pricing_cache: HashMap<String, ModelPricingResult> = HashMap::new();
 
     // Collect and sort dates
