@@ -35,14 +35,14 @@ jobs:
 
       - name: Generate a tag
         uses: orhun/git-cliff-action@v4
-        id: tag
+        id: git-cliff-tag
         with:
           config: ./.github/cliff.toml
           args: --bumped-version
 
       - name: Generate a changelog
         uses: orhun/git-cliff-action@v4
-        id: cliff
+        id: git-cliff-changelog
         with:
           config: ./.github/cliff.toml
           args: --bump --unreleased
@@ -50,7 +50,7 @@ jobs:
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.content }}
-          name: ${{ steps.tag.outputs.content }} 🌈
-          body: ${{ steps.cliff.outputs.content }}
+          tag_name: ${{ steps.git-cliff-tag.outputs.content }}
+          name: ${{ steps.git-cliff-tag.outputs.content }} 🌈
+          body: ${{ steps.git-cliff-changelog.outputs.content }}
           draft: true
