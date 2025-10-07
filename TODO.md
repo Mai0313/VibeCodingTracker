@@ -221,7 +221,11 @@ Gemini 的 Usage:
 
 發佈到npm的時候 改成直接將檔案下載下來一起放到 npm
 你可以參考這段 [action](https://github.com/openai/codex/raw/refs/heads/main/.github/workflows/rust-release.yml)
-另外 我希望可以新增scope, 也就是我的用戶名 `@mai0313/vibe-coding-tracker`, 但同時也發佈到 `vibe-coding-tracker` 和 `@mai0313/vct`
+我希望可以發佈三種名稱的包到 `https://registry.npmjs.org` 和 `https://npm.pkg.github.com`
+- `@mai0313/vibe-coding-tracker` (新增 scope)
+- `vibe-coding-tracker` (已存在)
+- `@mai0313/vct` (scope + short name)
+
 完成後請更新文檔
 
 ## 請幫我檢查所有代碼 查看一下有沒有地方是需要優化或冗餘代碼
