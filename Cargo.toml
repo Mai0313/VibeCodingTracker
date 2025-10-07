@@ -29,7 +29,7 @@ anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 
 # Regular expressions
-regex = "1.10"
+regex = "1.11"
 
 # File system and path handling
 walkdir = "2.5"
@@ -43,10 +43,10 @@ log = "0.4"
 hostname = "0.4"
 
 # Terminal UI and styling
-owo-colors = "4.0"
-comfy-table = "7.1"
-ratatui = "0.28"
-crossterm = "0.28"
+owo-colors = "4.2"
+comfy-table = "7.2"
+ratatui = "0.29"
+crossterm = "0.29"
 
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
@@ -55,18 +55,18 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 strsim = "0.11"
 
 # System information
-sysinfo = "0.32"
+sysinfo = "0.36"
 
 # Semantic versioning
 semver = "1.0"
 
 # Archive extraction for update functionality
-flate2 = "1.0"
+flate2 = "1.1"
 tar = "0.4"
-zip = "2.2"
+zip = "5.1"
 
 [dev-dependencies]
-tempfile = "3.15"
+tempfile = "3.23"
 assert_cmd = "2.0"
 predicates = "3.1"
 
