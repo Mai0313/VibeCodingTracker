@@ -123,9 +123,6 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: List packaged files
-        run: ls -R dist/ | cat
-
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v2
         with:
