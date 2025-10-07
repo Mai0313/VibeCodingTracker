@@ -19,15 +19,13 @@
     "telemetry",
     "claude",
     "codex",
+    "gemini",
     "usage-tracker",
     "analytics"
   ],
   "bin": {
     "vct": "bin/vct.js",
     "vibe-coding-tracker": "bin/vct.js"
-  },
-  "scripts": {
-    "postinstall": "node install.js"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -43,7 +41,7 @@
   ],
   "files": [
     "bin/",
-    "install.js",
+    "binaries/",
     "README.md"
   ],
   "dependencies": {

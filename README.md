@@ -76,9 +76,20 @@ Automatically detects and processes logs from Claude Code, Codex, and Gemini. No
 
 #### From `npm` (Recommended)
 
+Choose any of the following package names (all are identical):
+
 ```bash
+# Main package
 npm install -g vibe-coding-tracker
+
+# Short alias with scope
+npm install -g @mai0313/vct
+
+# Full name with scope
+npm install -g @mai0313/vibe-coding-tracker
 ```
+
+All packages include pre-compiled binaries for your platform - no build step required!
 
 #### From Source
 

@@ -133,12 +133,23 @@ jobs:
             dist/**/*
 
   npm-publish:
-    name: Publish to npm
+    name: Publish to npm - ${{ matrix.scope && format('{0}/', matrix.scope) || '' }}${{ matrix.name }}
     needs: release
     runs-on: ubuntu-latest
 
     permissions:
       id-token: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: vibe-coding-tracker
+            scope: "@mai0313"
+          - name: vct
+            scope: "@mai0313"
+          - name: vibe-coding-tracker
+            scope: ""
 
     steps:
       - name: Checkout
@@ -164,15 +175,43 @@ jobs:
           echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
           echo "Publishing version: ${VERSION}"
 
-      - name: Update package.json version
+      - name: Download release binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download ${{ github.ref_name }} \
+            --pattern "*.tar.gz" \
+            --pattern "*.zip" \
+            --dir cli/binaries
+
+      - name: List downloaded binaries
+        run: |
+          echo "Downloaded binaries:"
+          ls -lh cli/binaries/
+
+      - name: Update package.json version and name
         working-directory: cli
         run: |
-          npm version ${{ steps.version.outputs.VERSION }} --no-git-tag-version
-          cat package.json
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          PACKAGE_NAME="${{ matrix.name }}"
+          SCOPE="${{ matrix.scope }}"
 
-      - name: Install dependencies
-        working-directory: cli
-        run: npm install
+          # Update version
+          npm version ${VERSION} --no-git-tag-version
+
+          # Update package name with scope if present
+          if [ -n "${SCOPE}" ]; then
+            FULL_NAME="${SCOPE}/${PACKAGE_NAME}"
+          else
+            FULL_NAME="${PACKAGE_NAME}"
+          fi
+
+          # Use jq to update package name
+          cat package.json | jq --arg name "${FULL_NAME}" '.name = $name' > package.json.tmp
+          mv package.json.tmp package.json
+
+          echo "Updated package.json:"
+          cat package.json
 
       - name: Copy README for npm
         run: cp README.md cli/README.md
@@ -188,18 +227,25 @@ jobs:
         working-directory: cli
         run: |
           VERSION="${{ steps.version.outputs.VERSION }}"
-          PACKAGE_NAME="vibe-coding-tracker"
+          PACKAGE_NAME="${{ matrix.name }}"
+          SCOPE="${{ matrix.scope }}"
+
+          if [ -n "${SCOPE}" ]; then
+            FULL_NAME="${SCOPE}/${PACKAGE_NAME}"
+          else
+            FULL_NAME="${PACKAGE_NAME}"
+          fi
 
           echo "Waiting for npm registry to update..."
           sleep 10
 
           # Check if version is available
-          PUBLISHED_VERSION=$(npm view ${PACKAGE_NAME}@${VERSION} version 2>/dev/null || echo "")
+          PUBLISHED_VERSION=$(npm view ${FULL_NAME}@${VERSION} version 2>/dev/null || echo "")
 
           if [ "${PUBLISHED_VERSION}" = "${VERSION}" ]; then
-            echo "✓ Successfully published ${PACKAGE_NAME}@${VERSION}"
-            echo "Install with: npm install -g ${PACKAGE_NAME}"
+            echo "✓ Successfully published ${FULL_NAME}@${VERSION}"
+            echo "Install with: npm install -g ${FULL_NAME}"
           else
             echo "Warning: Could not immediately verify publication"
-            echo "Please check: https://www.npmjs.com/package/${PACKAGE_NAME}"
+            echo "Please check: https://www.npmjs.com/package/${FULL_NAME}"
           fi

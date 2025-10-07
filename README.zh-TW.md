@@ -76,9 +76,20 @@
 
 #### 從 `npm` (推薦)
 
+選擇以下任一套件名稱（三者完全相同）：
+
 ```bash
+# 主要套件
 npm install -g vibe-coding-tracker
+
+# 帶 scope 的短別名
+npm install -g @mai0313/vct
+
+# 帶 scope 的完整名稱
+npm install -g @mai0313/vibe-coding-tracker
 ```
+
+所有套件都包含針對您平台預編譯的二進位檔案 — 無需建置步驟！
 
 #### 從源碼
 
