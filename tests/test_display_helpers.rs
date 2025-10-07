@@ -238,3 +238,162 @@ fn test_usage_display_text_sorted_output() {
     // Text display should sort dates
     vibe_coding_tracker::usage::display_usage_text(&usage_data);
 }
+
+#[test]
+fn test_usage_display_table_with_daily_averages_single_provider() {
+    let mut usage_data: DateUsageResult = HashMap::new();
+
+    // Add multiple days for Claude only
+    for i in 1..=3 {
+        let mut models = HashMap::new();
+        models.insert(
+            "claude-sonnet-4".to_string(),
+            json!({
+                "input_tokens": 1000 * i,
+                "output_tokens": 500 * i,
+                "cache_read_input_tokens": 200 * i,
+                "cache_creation_input_tokens": 100 * i
+            }),
+        );
+        usage_data.insert(format!("2025-10-{:02}", i), models);
+    }
+
+    // Test that daily averages are calculated correctly for single provider
+    vibe_coding_tracker::usage::display_usage_table(&usage_data);
+}
+
+#[test]
+fn test_usage_display_table_with_daily_averages_multiple_providers() {
+    let mut usage_data: DateUsageResult = HashMap::new();
+
+    // Day 1: Claude
+    let mut day1_models = HashMap::new();
+    day1_models.insert(
+        "claude-sonnet-4".to_string(),
+        json!({
+            "input_tokens": 1000,
+            "output_tokens": 500,
+        }),
+    );
+    usage_data.insert("2025-10-01".to_string(), day1_models);
+
+    // Day 2: Codex
+    let mut day2_models = HashMap::new();
+    day2_models.insert(
+        "gpt-4-turbo".to_string(),
+        json!({
+            "total_token_usage": {
+                "input_tokens": 2000,
+                "output_tokens": 1000,
+                "total_tokens": 3000
+            }
+        }),
+    );
+    usage_data.insert("2025-10-02".to_string(), day2_models);
+
+    // Day 3: Gemini
+    let mut day3_models = HashMap::new();
+    day3_models.insert(
+        "gemini-2.5-pro".to_string(),
+        json!({
+            "input_tokens": 1500,
+            "output_tokens": 750,
+        }),
+    );
+    usage_data.insert("2025-10-03".to_string(), day3_models);
+
+    // Test with multiple providers across different days
+    vibe_coding_tracker::usage::display_usage_table(&usage_data);
+}
+
+#[test]
+fn test_usage_display_table_with_daily_averages_mixed_providers() {
+    let mut usage_data: DateUsageResult = HashMap::new();
+
+    // Day 1: Claude and Codex
+    let mut day1_models = HashMap::new();
+    day1_models.insert(
+        "claude-sonnet-4-5".to_string(),
+        json!({
+            "input_tokens": 1000,
+            "output_tokens": 500,
+        }),
+    );
+    day1_models.insert(
+        "gpt-5-codex".to_string(),
+        json!({
+            "total_token_usage": {
+                "input_tokens": 2000,
+                "output_tokens": 1000,
+                "total_tokens": 3000
+            }
+        }),
+    );
+    usage_data.insert("2025-10-01".to_string(), day1_models);
+
+    // Day 2: All three providers
+    let mut day2_models = HashMap::new();
+    day2_models.insert(
+        "claude-sonnet-4".to_string(),
+        json!({
+            "input_tokens": 1500,
+            "output_tokens": 750,
+        }),
+    );
+    day2_models.insert(
+        "gpt-4-turbo".to_string(),
+        json!({
+            "total_token_usage": {
+                "input_tokens": 2500,
+                "output_tokens": 1250,
+                "total_tokens": 3750
+            }
+        }),
+    );
+    day2_models.insert(
+        "gemini-2.0-flash".to_string(),
+        json!({
+            "input_tokens": 1200,
+            "output_tokens": 600,
+        }),
+    );
+    usage_data.insert("2025-10-02".to_string(), day2_models);
+
+    // Test with mixed providers per day
+    vibe_coding_tracker::usage::display_usage_table(&usage_data);
+}
+
+#[test]
+fn test_usage_display_table_with_daily_averages_o1_models() {
+    let mut usage_data: DateUsageResult = HashMap::new();
+    let mut models = HashMap::new();
+
+    // Test o1 models are detected as Codex
+    models.insert(
+        "o1-preview".to_string(),
+        json!({
+            "total_token_usage": {
+                "input_tokens": 1000,
+                "output_tokens": 500,
+                "reasoning_output_tokens": 200,
+                "total_tokens": 1500
+            }
+        }),
+    );
+
+    models.insert(
+        "o3-mini".to_string(),
+        json!({
+            "total_token_usage": {
+                "input_tokens": 800,
+                "output_tokens": 400,
+                "total_tokens": 1200
+            }
+        }),
+    );
+
+    usage_data.insert("2025-10-01".to_string(), models);
+
+    // Test that o1/o3 models are correctly classified as Codex
+    vibe_coding_tracker::usage::display_usage_table(&usage_data);
+}

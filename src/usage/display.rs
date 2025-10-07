@@ -166,6 +166,8 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
             }
         }
 
+        let daily_averages = calculate_daily_averages(&rows_data);
+
         terminal.draw(|f| {
             let chunks = RatatuiLayout::default()
                 .direction(Direction::Vertical)
@@ -173,6 +175,7 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
                     Constraint::Length(3),
                     Constraint::Min(10),
                     Constraint::Length(3),
+                    Constraint::Length(7),
                     Constraint::Length(2),
                 ])
                 .split(f.area());
@@ -337,6 +340,82 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
             .centered();
             f.render_widget(summary, chunks[2]);
 
+            // Daily Averages section
+            let mut avg_lines = vec![
+                Line::from(vec![
+                    Span::styled(
+                        "📈 Daily Averages",
+                        Style::default().fg(RatatuiColor::Magenta).bold(),
+                    ),
+                ])
+            ];
+
+            if daily_averages.claude.days_count > 0 {
+                avg_lines.push(Line::from(vec![
+                    Span::styled("  Claude Code: ", Style::default().fg(RatatuiColor::Cyan)),
+                    Span::styled(
+                        format_number(daily_averages.claude_avg_tokens() as i64),
+                        Style::default().fg(RatatuiColor::White),
+                    ),
+                    Span::raw(" tokens/day  |  "),
+                    Span::styled(
+                        format!("${:.2}/day", daily_averages.claude_avg_cost()),
+                        Style::default().fg(RatatuiColor::Green),
+                    ),
+                ]));
+            }
+
+            if daily_averages.codex.days_count > 0 {
+                avg_lines.push(Line::from(vec![
+                    Span::styled("  Codex: ", Style::default().fg(RatatuiColor::Yellow)),
+                    Span::styled(
+                        format_number(daily_averages.codex_avg_tokens() as i64),
+                        Style::default().fg(RatatuiColor::White),
+                    ),
+                    Span::raw(" tokens/day  |  "),
+                    Span::styled(
+                        format!("${:.2}/day", daily_averages.codex_avg_cost()),
+                        Style::default().fg(RatatuiColor::Green),
+                    ),
+                ]));
+            }
+
+            if daily_averages.gemini.days_count > 0 {
+                avg_lines.push(Line::from(vec![
+                    Span::styled("  Gemini: ", Style::default().fg(RatatuiColor::LightBlue)),
+                    Span::styled(
+                        format_number(daily_averages.gemini_avg_tokens() as i64),
+                        Style::default().fg(RatatuiColor::White),
+                    ),
+                    Span::raw(" tokens/day  |  "),
+                    Span::styled(
+                        format!("${:.2}/day", daily_averages.gemini_avg_cost()),
+                        Style::default().fg(RatatuiColor::Green),
+                    ),
+                ]));
+            }
+
+            avg_lines.push(Line::from(vec![
+                Span::styled("  Overall: ", Style::default().fg(RatatuiColor::Magenta).bold()),
+                Span::styled(
+                    format_number(daily_averages.overall_avg_tokens() as i64),
+                    Style::default().fg(RatatuiColor::White).bold(),
+                ),
+                Span::raw(" tokens/day  |  "),
+                Span::styled(
+                    format!("${:.2}/day", daily_averages.overall_avg_cost()),
+                    Style::default().fg(RatatuiColor::Green).bold(),
+                ),
+            ]));
+
+            let averages_widget = Paragraph::new(avg_lines)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(RatatuiColor::Magenta)),
+                );
+            f.render_widget(averages_widget, chunks[3]);
+
             let controls = Paragraph::new(vec![Line::from(vec![
                 Span::styled("Press ", Style::default().fg(RatatuiColor::DarkGray)),
                 Span::styled("'q'", Style::default().fg(RatatuiColor::Red).bold()),
@@ -351,7 +430,7 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
                 ),
             ])])
             .centered();
-            f.render_widget(controls, chunks[3]);
+            f.render_widget(controls, chunks[4]);
         })?;
 
         if event::poll(Duration::from_millis(100))? {
@@ -461,7 +540,7 @@ pub fn display_usage_table(usage_data: &DateUsageResult) {
     ]);
 
     // Add data rows
-    for row in rows {
+    for row in &rows {
         table.add_row(vec![
             Cell::new(&row.date)
                 .fg(Color::Cyan)
@@ -520,6 +599,98 @@ pub fn display_usage_table(usage_data: &DateUsageResult) {
 
     println!("{table}");
     println!();
+
+    // Calculate and display daily averages
+    let daily_averages = calculate_daily_averages(&rows);
+
+    println!("{}", "📈 Daily Averages (by Provider)".bright_magenta().bold());
+    println!();
+
+    let mut avg_table = Table::new();
+    avg_table.load_preset(UTF8_FULL).set_header(vec![
+        Cell::new("Provider")
+            .fg(Color::Magenta)
+            .set_alignment(CellAlignment::Left),
+        Cell::new("Avg Tokens/Day")
+            .fg(Color::Magenta)
+            .set_alignment(CellAlignment::Right),
+        Cell::new("Avg Cost/Day")
+            .fg(Color::Magenta)
+            .set_alignment(CellAlignment::Right),
+        Cell::new("Days")
+            .fg(Color::Magenta)
+            .set_alignment(CellAlignment::Right),
+    ]);
+
+    if daily_averages.claude.days_count > 0 {
+        avg_table.add_row(vec![
+            Cell::new("Claude Code")
+                .fg(Color::Cyan)
+                .set_alignment(CellAlignment::Left),
+            Cell::new(format_number(daily_averages.claude_avg_tokens() as i64))
+                .fg(Color::White)
+                .set_alignment(CellAlignment::Right),
+            Cell::new(format!("${:.2}", daily_averages.claude_avg_cost()))
+                .fg(Color::Green)
+                .set_alignment(CellAlignment::Right),
+            Cell::new(format!("{}", daily_averages.claude.days_count))
+                .fg(Color::White)
+                .set_alignment(CellAlignment::Right),
+        ]);
+    }
+
+    if daily_averages.codex.days_count > 0 {
+        avg_table.add_row(vec![
+            Cell::new("Codex")
+                .fg(Color::Yellow)
+                .set_alignment(CellAlignment::Left),
+            Cell::new(format_number(daily_averages.codex_avg_tokens() as i64))
+                .fg(Color::White)
+                .set_alignment(CellAlignment::Right),
+            Cell::new(format!("${:.2}", daily_averages.codex_avg_cost()))
+                .fg(Color::Green)
+                .set_alignment(CellAlignment::Right),
+            Cell::new(format!("{}", daily_averages.codex.days_count))
+                .fg(Color::White)
+                .set_alignment(CellAlignment::Right),
+        ]);
+    }
+
+    if daily_averages.gemini.days_count > 0 {
+        avg_table.add_row(vec![
+            Cell::new("Gemini")
+                .fg(Color::Blue)
+                .set_alignment(CellAlignment::Left),
+            Cell::new(format_number(daily_averages.gemini_avg_tokens() as i64))
+                .fg(Color::White)
+                .set_alignment(CellAlignment::Right),
+            Cell::new(format!("${:.2}", daily_averages.gemini_avg_cost()))
+                .fg(Color::Green)
+                .set_alignment(CellAlignment::Right),
+            Cell::new(format!("{}", daily_averages.gemini.days_count))
+                .fg(Color::White)
+                .set_alignment(CellAlignment::Right),
+        ]);
+    }
+
+    // Overall average
+    avg_table.add_row(vec![
+        Cell::new("OVERALL")
+            .fg(Color::Magenta)
+            .set_alignment(CellAlignment::Left),
+        Cell::new(format_number(daily_averages.overall_avg_tokens() as i64))
+            .fg(Color::Magenta)
+            .set_alignment(CellAlignment::Right),
+        Cell::new(format!("${:.2}", daily_averages.overall_avg_cost()))
+            .fg(Color::Magenta)
+            .set_alignment(CellAlignment::Right),
+        Cell::new(format!("{}", daily_averages.overall.days_count))
+            .fg(Color::Magenta)
+            .set_alignment(CellAlignment::Right),
+    ]);
+
+    println!("{avg_table}");
+    println!();
 }
 
 #[derive(Default)]
@@ -533,6 +704,166 @@ struct UsageRow {
     cache_creation: i64,
     total: i64,
     cost: f64,
+}
+
+#[derive(Default, Clone)]
+struct ProviderStats {
+    total_tokens: i64,
+    total_cost: f64,
+    days_count: usize,
+}
+
+#[derive(Default)]
+struct DailyAverages {
+    claude: ProviderStats,
+    codex: ProviderStats,
+    gemini: ProviderStats,
+    overall: ProviderStats,
+}
+
+impl DailyAverages {
+    fn claude_avg_tokens(&self) -> f64 {
+        if self.claude.days_count > 0 {
+            self.claude.total_tokens as f64 / self.claude.days_count as f64
+        } else {
+            0.0
+        }
+    }
+
+    fn claude_avg_cost(&self) -> f64 {
+        if self.claude.days_count > 0 {
+            self.claude.total_cost / self.claude.days_count as f64
+        } else {
+            0.0
+        }
+    }
+
+    fn codex_avg_tokens(&self) -> f64 {
+        if self.codex.days_count > 0 {
+            self.codex.total_tokens as f64 / self.codex.days_count as f64
+        } else {
+            0.0
+        }
+    }
+
+    fn codex_avg_cost(&self) -> f64 {
+        if self.codex.days_count > 0 {
+            self.codex.total_cost / self.codex.days_count as f64
+        } else {
+            0.0
+        }
+    }
+
+    fn gemini_avg_tokens(&self) -> f64 {
+        if self.gemini.days_count > 0 {
+            self.gemini.total_tokens as f64 / self.gemini.days_count as f64
+        } else {
+            0.0
+        }
+    }
+
+    fn gemini_avg_cost(&self) -> f64 {
+        if self.gemini.days_count > 0 {
+            self.gemini.total_cost / self.gemini.days_count as f64
+        } else {
+            0.0
+        }
+    }
+
+    fn overall_avg_tokens(&self) -> f64 {
+        if self.overall.days_count > 0 {
+            self.overall.total_tokens as f64 / self.overall.days_count as f64
+        } else {
+            0.0
+        }
+    }
+
+    fn overall_avg_cost(&self) -> f64 {
+        if self.overall.days_count > 0 {
+            self.overall.total_cost / self.overall.days_count as f64
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Detect provider from model name
+fn detect_provider(model: &str) -> &'static str {
+    let model_lower = model.to_lowercase();
+    if model_lower.starts_with("claude") {
+        "claude"
+    } else if model_lower.starts_with("gpt")
+        || model_lower.starts_with("o1")
+        || model_lower.starts_with("o3") {
+        "codex"
+    } else if model_lower.starts_with("gemini") {
+        "gemini"
+    } else {
+        "unknown"
+    }
+}
+
+/// Calculate daily averages grouped by provider
+fn calculate_daily_averages(rows: &[UsageRow]) -> DailyAverages {
+    let mut averages = DailyAverages::default();
+    let mut date_provider_map: HashMap<String, std::collections::HashSet<&str>> = HashMap::new();
+
+    // Group by date and provider to count unique days per provider
+    for row in rows {
+        let provider = detect_provider(&row.model);
+        date_provider_map
+            .entry(row.date.clone())
+            .or_default()
+            .insert(provider);
+    }
+
+    // Count days per provider
+    let mut claude_days = std::collections::HashSet::new();
+    let mut codex_days = std::collections::HashSet::new();
+    let mut gemini_days = std::collections::HashSet::new();
+    let mut overall_days = std::collections::HashSet::new();
+
+    for (date, providers) in &date_provider_map {
+        if providers.contains("claude") {
+            claude_days.insert(date.clone());
+        }
+        if providers.contains("codex") {
+            codex_days.insert(date.clone());
+        }
+        if providers.contains("gemini") {
+            gemini_days.insert(date.clone());
+        }
+        overall_days.insert(date.clone());
+    }
+
+    averages.claude.days_count = claude_days.len();
+    averages.codex.days_count = codex_days.len();
+    averages.gemini.days_count = gemini_days.len();
+    averages.overall.days_count = overall_days.len();
+
+    // Accumulate totals
+    for row in rows {
+        let provider = detect_provider(&row.model);
+        match provider {
+            "claude" => {
+                averages.claude.total_tokens += row.total;
+                averages.claude.total_cost += row.cost;
+            }
+            "codex" => {
+                averages.codex.total_tokens += row.total;
+                averages.codex.total_cost += row.cost;
+            }
+            "gemini" => {
+                averages.gemini.total_tokens += row.total;
+                averages.gemini.total_cost += row.cost;
+            }
+            _ => {}
+        }
+        averages.overall.total_tokens += row.total;
+        averages.overall.total_cost += row.cost;
+    }
+
+    averages
 }
 
 fn extract_usage_row(

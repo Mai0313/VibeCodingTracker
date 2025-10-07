@@ -344,6 +344,27 @@ docker run --rm \
 - Store matched model name for transparency
 - Handle multiple formats: Claude (`claude-sonnet-4-20250514`), OpenAI (`gpt-4-turbo`), and Gemini (`gemini-2.0-flash-exp`)
 
+**6. Daily Averages Calculation:**
+
+- **Provider Detection**: Automatically detects provider from model name prefix:
+  - `claude*` → Claude Code
+  - `gpt*`, `o1*`, `o3*` → Codex
+  - `gemini*` → Gemini
+- **Smart Day Counting**: Only counts days where each provider has actual data (no zero-padding)
+- **Metrics Tracked**:
+  - Average tokens per day (per provider and overall)
+  - Average cost per day (per provider and overall)
+  - Total days with data (per provider and overall)
+- **Display Modes**:
+  - **Interactive TUI**: Dedicated "Daily Averages" panel below summary statistics
+  - **Static Table**: Separate table displayed after main usage table
+  - Provider-specific rows (Claude Code, Codex, Gemini) + OVERALL row
+- **Implementation Location**: `src/usage/display.rs`
+  - `ProviderStats` struct: tracks total tokens, cost, and day count per provider
+  - `DailyAverages` struct: aggregates all provider statistics with calculation methods
+  - `detect_provider()`: identifies provider from model name
+  - `calculate_daily_averages()`: computes averages from usage rows
+
 ## Session File Locations
 
 - **Claude Code:** `~/.claude/projects/*.jsonl`
@@ -376,6 +397,30 @@ ls -la ~/.gemini/tmp/
 ```
 2025-10-01 > claude-sonnet-4-20250514: $2.154230
 2025-10-02 > gpt-4-turbo: $0.250000
+```
+
+**Usage Table format with Daily Averages:**
+
+```
+📊 Token Usage Statistics
+
+┌────────────┬────────────────────────┬────────┬────────┬────────────┬────────────────┬────────────┬────────────┐
+│ Date       │ Model                  │ Input  │ Output │ Cache Read │ Cache Creation │ Total      │ Cost (USD) │
+├────────────┼────────────────────────┼────────┼────────┼────────────┼────────────────┼────────────┼────────────┤
+│ 2025-10-01 │ claude-sonnet-4-20...  │ 45,230 │ 12,450 │ 230,500    │ 50,000         │ 338,180    │ $2.15      │
+│ 2025-10-02 │ gpt-4-turbo            │ 15,000 │ 5,000  │ 0          │ 0              │ 20,000     │ $0.25      │
+│            │ TOTAL                  │ 60,230 │ 17,450 │ 230,500    │ 50,000         │ 358,180    │ $2.40      │
+└────────────┴────────────────────────┴────────┴────────┴────────────┴────────────────┴────────────┴────────────┘
+
+📈 Daily Averages (by Provider)
+
+┌─────────────┬────────────────┬──────────────┬──────┐
+│ Provider    │ Avg Tokens/Day │ Avg Cost/Day │ Days │
+├─────────────┼────────────────┼──────────────┼──────┤
+│ Claude Code │ 338,180        │ $2.15        │ 1    │
+│ Codex       │ 20,000         │ $0.25        │ 1    │
+│ OVERALL     │ 179,090        │ $1.20        │ 2    │
+└─────────────┴────────────────┴──────────────┴──────┘
 ```
 
 **Usage JSON format:**
