@@ -226,6 +226,20 @@ Gemini 的 Usage:
 - `vibe-coding-tracker` (已存在)
 
 取得所有安裝包的方式可以透過 `gh release download` 指令來完成 可能會更好一點
+且包名 與 scope 可以用 `strategy` `matrix` 來完成
+例如
+```
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: vibe-coding-tracker
+            scope: @mai0313
+          - name: vct
+            scope: @mai0313
+          - name: vibe-coding-tracker
+            scope: ""
+```
 
 另外我不確定 `update` 功能的邏輯是否需要修改 請順便檢查 我認為不用 因為我記得我是 `inplace` 的方式去更新
 但我確定經過這次改動以後 `./cli` 裡面可以大幅簡化
