@@ -131,7 +131,7 @@ jobs:
 
   npm-publish:
     name: Publish to npm - ${{ matrix.scope && format('{0}/', matrix.scope) || '' }}${{ matrix.name }}
-    needs: release
+    needs: build
     runs-on: ubuntu-latest
 
     permissions:
@@ -172,53 +172,34 @@ jobs:
           echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
           echo "Publishing version: ${VERSION}"
 
-      - name: Download and extract release binaries
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Download and extract build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: cli/binaries/temp
+          merge-multiple: true
+
+      - name: Extract binaries from archives
+        working-directory: cli/binaries/temp
         run: |
-          mkdir -p cli/binaries/temp
-          gh release download ${{ github.ref_name }} \
-            --pattern "*.tar.gz" \
-            --pattern "*.zip" \
-            --dir cli/binaries/temp
-
-          echo "Downloaded archives:"
-          ls -lh cli/binaries/temp/
-
-          # Extract each archive to its own subdirectory
-          cd cli/binaries/temp
-
-          # Extract .tar.gz files (Linux/macOS)
-          for archive in *.tar.gz; do
-            if [ -f "$archive" ]; then
-              # Extract platform identifier from filename
-              # e.g., vibe_coding_tracker-v0.2.2-linux-x64-gnu.tar.gz -> linux-x64-gnu
-              platform=$(echo "$archive" | sed 's/vibe_coding_tracker-v[0-9.]*-\(.*\)\.tar\.gz/\1/')
-              echo "Extracting $archive to $platform/..."
-              mkdir -p "../$platform"
-              tar -xzf "$archive" -C "../$platform"
-            fi
+          for archive in *; do
+            # Extract platform from filename: vibe_coding_tracker-v0.2.2-<platform>.<ext>
+            platform="${archive#*-*-*-}"
+            platform="${platform%.tar.gz}"
+            platform="${platform%.zip}"
+            
+            echo "Extracting $archive to $platform/"
+            mkdir -p "../$platform"
+            
+            case "$archive" in
+              *.tar.gz) tar -xzf "$archive" -C "../$platform" ;;
+              *.zip)    unzip -q "$archive" -d "../$platform" ;;
+            esac
           done
 
-          # Extract .zip files (Windows)
-          for archive in *.zip; do
-            if [ -f "$archive" ]; then
-              # Extract platform identifier from filename
-              # e.g., vibe_coding_tracker-v0.2.2-windows-x64.zip -> windows-x64
-              platform=$(echo "$archive" | sed 's/vibe_coding_tracker-v[0-9.]*-\(.*\)\.zip/\1/')
-              echo "Extracting $archive to $platform/..."
-              mkdir -p "../$platform"
-              unzip -q "$archive" -d "../$platform"
-            fi
-          done
-
-          # Go back and clean up
-          cd ../../../
+      - name: Cleanup and verify
+        run: |
           rm -rf cli/binaries/temp
-
-          echo ""
-          echo "Extracted binaries structure:"
-          ls -lhR cli/binaries/
+          echo "Extracted binaries:" && ls -lhR cli/binaries/
 
       - name: Update package.json version and name
         working-directory: cli
