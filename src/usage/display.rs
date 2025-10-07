@@ -17,13 +17,101 @@ use ratatui::{
     Terminal,
 };
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::time::{Duration, Instant};
 use sysinfo::System;
 
 const USAGE_REFRESH_SECS: u64 = 5;
 const PRICING_REFRESH_SECS: u64 = 300;
+
+#[derive(Default)]
+struct UsageRow {
+    date: String,
+    model: String,         // 原始模型名稱
+    display_model: String, // 可能含 fuzzy match 提示的顯示名稱
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read: i64,
+    cache_creation: i64,
+    total: i64,
+    cost: f64,
+}
+
+#[derive(Default)]
+struct UsageTotals {
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read: i64,
+    cache_creation: i64,
+    total: i64,
+    cost: f64,
+}
+
+impl UsageTotals {
+    fn accumulate(&mut self, row: &UsageRow) {
+        self.input_tokens += row.input_tokens;
+        self.output_tokens += row.output_tokens;
+        self.cache_read += row.cache_read;
+        self.cache_creation += row.cache_creation;
+        self.total += row.total;
+        self.cost += row.cost;
+    }
+}
+
+#[derive(Default)]
+struct UsageSummary {
+    rows: Vec<UsageRow>,
+    totals: UsageTotals,
+    daily_averages: DailyAverages,
+}
+
+#[derive(Default, Clone)]
+struct ProviderStats {
+    total_tokens: i64,
+    total_cost: f64,
+    days_count: usize,
+}
+
+#[derive(Default)]
+struct DailyAverages {
+    claude: ProviderStats,
+    codex: ProviderStats,
+    gemini: ProviderStats,
+    overall: ProviderStats,
+}
+
+fn build_usage_summary(
+    usage_data: &DateUsageResult,
+    pricing_map: &ModelPricingMap,
+    pricing_cache: &mut HashMap<String, ModelPricingResult>,
+) -> UsageSummary {
+    if usage_data.is_empty() {
+        return UsageSummary::default();
+    }
+
+    let mut summary = UsageSummary::default();
+    let mut dates: Vec<&String> = usage_data.keys().collect();
+    dates.sort();
+
+    for date in dates {
+        if let Some(date_usage) = usage_data.get(date) {
+            let mut models: Vec<&String> = date_usage.keys().collect();
+            models.sort();
+
+            for model in models {
+                if let Some(usage) = date_usage.get(model) {
+                    let row = extract_usage_row(date, model, usage, pricing_map, pricing_cache);
+                    summary.totals.accumulate(&row);
+                    summary.rows.push(row);
+                }
+            }
+        }
+    }
+
+    summary.daily_averages = calculate_daily_averages(&summary.rows);
+    summary
+}
 
 /// Display usage data as an interactive table with periodic refresh
 pub fn display_usage_interactive() -> anyhow::Result<()> {
@@ -116,57 +204,38 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
             }
         }
 
-        let mut dates: Vec<String> = usage_data.keys().cloned().collect();
-        dates.sort();
+        let summary = build_usage_summary(&usage_data, &pricing_map, &mut pricing_lookup_cache);
+        let rows_data = &summary.rows;
+        let totals = &summary.totals;
+        let daily_averages = &summary.daily_averages;
 
-        let mut rows_data = Vec::new();
-        let mut totals = UsageRow::default();
+        let current_row_keys: HashSet<String> = rows_data
+            .iter()
+            .map(|row| format!("{}:{}", row.date, row.model))
+            .collect();
+        previous_data.retain(|key, _| current_row_keys.contains(key));
+        last_update_times.retain(|key, _| current_row_keys.contains(key));
 
-        for date in &dates {
-            if let Some(date_usage) = usage_data.get(date) {
-                let mut models: Vec<String> = date_usage.keys().cloned().collect();
-                models.sort();
+        for row in rows_data {
+            let row_key = format!("{}:{}", row.date, row.model);
+            let current_data = (
+                row.input_tokens,
+                row.output_tokens,
+                row.cache_read,
+                row.cache_creation,
+            );
 
-                for model in models {
-                    if let Some(usage) = date_usage.get(&model) {
-                        let row = extract_usage_row(
-                            date,
-                            &model,
-                            usage,
-                            &pricing_map,
-                            &mut pricing_lookup_cache,
-                        );
+            let entry_changed = match previous_data.get(&row_key) {
+                Some(prev) => prev != &current_data,
+                None => true,
+            };
 
-                        let row_key = format!("{}:{}", date, model);
-                        let current_data = (
-                            row.input_tokens,
-                            row.output_tokens,
-                            row.cache_read,
-                            row.cache_creation,
-                        );
-
-                        if let Some(prev_data) = previous_data.get(&row_key) {
-                            if prev_data != &current_data {
-                                last_update_times.insert(row_key.clone(), Instant::now());
-                            }
-                        } else {
-                            last_update_times.insert(row_key.clone(), Instant::now());
-                        }
-                        previous_data.insert(row_key, current_data);
-
-                        totals.input_tokens += row.input_tokens;
-                        totals.output_tokens += row.output_tokens;
-                        totals.cache_read += row.cache_read;
-                        totals.cache_creation += row.cache_creation;
-                        totals.total += row.total;
-                        totals.cost += row.cost;
-                        rows_data.push(row);
-                    }
-                }
+            if entry_changed {
+                last_update_times.insert(row_key.clone(), Instant::now());
             }
-        }
 
-        let daily_averages = calculate_daily_averages(&rows_data);
+            previous_data.insert(row_key, current_data);
+        }
 
         terminal.draw(|f| {
             let chunks = RatatuiLayout::default()
@@ -474,39 +543,16 @@ pub fn display_usage_table(usage_data: &DateUsageResult) {
         }
     };
 
-    // Collect and sort dates
-    let mut dates: Vec<&String> = usage_data.keys().collect();
-    dates.sort();
-
-    // Collect rows
-    let mut rows = Vec::new();
-    let mut totals = UsageRow::default();
     let mut pricing_cache: HashMap<String, ModelPricingResult> = HashMap::new();
+    let summary = build_usage_summary(usage_data, &pricing_map, &mut pricing_cache);
 
-    for date in &dates {
-        if let Some(date_usage) = usage_data.get(*date) {
-            // Sort models
-            let mut models: Vec<&String> = date_usage.keys().collect();
-            models.sort();
-
-            for model in models {
-                if let Some(usage) = date_usage.get(model) {
-                    let row =
-                        extract_usage_row(date, model, usage, &pricing_map, &mut pricing_cache);
-
-                    // Accumulate totals
-                    totals.input_tokens += row.input_tokens;
-                    totals.output_tokens += row.output_tokens;
-                    totals.cache_read += row.cache_read;
-                    totals.cache_creation += row.cache_creation;
-                    totals.total += row.total;
-                    totals.cost += row.cost;
-
-                    rows.push(row);
-                }
-            }
-        }
+    if summary.rows.is_empty() {
+        println!("⚠️  No usage data found in Claude Code or Codex sessions");
+        return;
     }
+
+    let rows = &summary.rows;
+    let totals = &summary.totals;
 
     // Create table
     let mut table = Table::new();
@@ -538,7 +584,7 @@ pub fn display_usage_table(usage_data: &DateUsageResult) {
     ]);
 
     // Add data rows
-    for row in &rows {
+    for row in rows {
         table.add_row(vec![
             Cell::new(&row.date)
                 .fg(Color::Cyan)
@@ -599,7 +645,7 @@ pub fn display_usage_table(usage_data: &DateUsageResult) {
     println!();
 
     // Calculate and display daily averages
-    let daily_averages = calculate_daily_averages(&rows);
+    let daily_averages = &summary.daily_averages;
 
     println!(
         "{}",
@@ -694,34 +740,6 @@ pub fn display_usage_table(usage_data: &DateUsageResult) {
     println!();
 }
 
-#[derive(Default)]
-struct UsageRow {
-    date: String,
-    model: String,         // Original model name
-    display_model: String, // Model name with matched model in parentheses if fuzzy matched
-    input_tokens: i64,
-    output_tokens: i64,
-    cache_read: i64,
-    cache_creation: i64,
-    total: i64,
-    cost: f64,
-}
-
-#[derive(Default, Clone)]
-struct ProviderStats {
-    total_tokens: i64,
-    total_cost: f64,
-    days_count: usize,
-}
-
-#[derive(Default)]
-struct DailyAverages {
-    claude: ProviderStats,
-    codex: ProviderStats,
-    gemini: ProviderStats,
-    overall: ProviderStats,
-}
-
 impl DailyAverages {
     fn claude_avg_tokens(&self) -> f64 {
         if self.claude.days_count > 0 {
@@ -808,7 +826,7 @@ fn detect_provider(model: &str) -> &'static str {
 /// Calculate daily averages grouped by provider
 fn calculate_daily_averages(rows: &[UsageRow]) -> DailyAverages {
     let mut averages = DailyAverages::default();
-    let mut date_provider_map: HashMap<String, std::collections::HashSet<&str>> = HashMap::new();
+    let mut date_provider_map: HashMap<String, HashSet<&str>> = HashMap::new();
 
     // Group by date and provider to count unique days per provider
     for row in rows {
@@ -820,10 +838,10 @@ fn calculate_daily_averages(rows: &[UsageRow]) -> DailyAverages {
     }
 
     // Count days per provider
-    let mut claude_days = std::collections::HashSet::new();
-    let mut codex_days = std::collections::HashSet::new();
-    let mut gemini_days = std::collections::HashSet::new();
-    let mut overall_days = std::collections::HashSet::new();
+    let mut claude_days = HashSet::new();
+    let mut codex_days = HashSet::new();
+    let mut gemini_days = HashSet::new();
+    let mut overall_days = HashSet::new();
 
     for (date, providers) in &date_provider_map {
         if providers.contains("claude") {
@@ -923,23 +941,14 @@ pub fn display_usage_text(usage_data: &DateUsageResult) {
         fetch_model_pricing().unwrap_or_else(|_| ModelPricingMap::new(HashMap::new()));
     let mut pricing_cache: HashMap<String, ModelPricingResult> = HashMap::new();
 
-    // Collect and sort dates
-    let mut dates: Vec<&String> = usage_data.keys().collect();
-    dates.sort();
+    let summary = build_usage_summary(usage_data, &pricing_map, &mut pricing_cache);
 
-    for date in &dates {
-        if let Some(date_usage) = usage_data.get(*date) {
-            // Sort models
-            let mut models: Vec<&String> = date_usage.keys().collect();
-            models.sort();
+    if summary.rows.is_empty() {
+        println!("No usage data found");
+        return;
+    }
 
-            for model in models {
-                if let Some(usage) = date_usage.get(model) {
-                    let row =
-                        extract_usage_row(date, model, usage, &pricing_map, &mut pricing_cache);
-                    println!("{} > {}: ${:.6}", row.date, row.display_model, row.cost);
-                }
-            }
-        }
+    for row in &summary.rows {
+        println!("{} > {}: ${:.6}", row.date, row.display_model, row.cost);
     }
 }
