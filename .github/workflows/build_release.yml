@@ -182,14 +182,13 @@ jobs:
         working-directory: cli/binaries/temp
         run: |
           for archive in *; do
-            # Extract platform from filename: vibe_coding_tracker-v0.2.2-<platform>.<ext>
-            platform="${archive#*-*-*-}"
+            platform=$(echo "$archive" | sed -E 's/^vibe_coding_tracker-v[0-9]+\.[0-9]+\.[0-9]+-//')
             platform="${platform%.tar.gz}"
             platform="${platform%.zip}"
-            
+
             echo "Extracting $archive to $platform/"
             mkdir -p "../$platform"
-            
+
             case "$archive" in
               *.tar.gz) tar -xzf "$archive" -C "../$platform" ;;
               *.zip)    unzip -q "$archive" -d "../$platform" ;;
