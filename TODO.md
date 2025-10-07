@@ -230,18 +230,6 @@ Gemini 的 Usage:
 - `vibe-coding-tracker` (已存在)
 
 取得所有安裝包的方式可以透過 `gh release download` 指令來完成 可能會更好一點
-例如
-
-```bash
-set -euo pipefail
-version="${{ needs.release.outputs.version }}"
-tag="${{ needs.release.outputs.tag }}"
-gh release download "$tag" \
-    --repo ... \
-    --pattern ... \
-    --dir dist/npm
-```
-
 但要注意我上傳到 github release 的包名稱是類似下面這種格式
 
 ```
@@ -257,16 +245,16 @@ vibe_coding_tracker-v0.2.2-windows-x64.zip
 例如
 
 ```
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: vibe-coding-tracker
-            scope: @mai0313
-          - name: vct
-            scope: @mai0313
-          - name: vibe-coding-tracker
-            scope: ""
+strategy:
+  fail-fast: false
+  matrix:
+    include:
+      - name: vibe-coding-tracker
+        scope: @mai0313
+      - name: vct
+        scope: @mai0313
+      - name: vibe-coding-tracker
+        scope: ""
 ```
 
 另外我不確定 `update` 功能的邏輯是否需要修改 請順便檢查 我認為不用 因為我記得我是 `inplace` 的方式去更新
