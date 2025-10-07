@@ -1,13 +1,14 @@
+use crate::analysis::common_state::AnalysisState;
 use crate::models::*;
-use crate::utils::{count_lines, get_git_remote_url, parse_iso_timestamp, process_codex_usage};
+use crate::utils::{get_git_remote_url, parse_iso_timestamp, process_codex_usage};
 use anyhow::Result;
 use regex::Regex;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// Analyze Codex conversations
 pub fn analyze_codex_conversations(logs: &[CodexLog]) -> Result<CodeAnalysis> {
-    let mut state = CodexAnalysisState::new();
+    let mut state = AnalysisState::new();
     let mut conversation_usage: HashMap<String, Value> = HashMap::new();
     let mut current_model = String::new();
     let mut shell_calls: HashMap<String, CodexShellCall> = HashMap::new();
@@ -126,47 +127,14 @@ pub fn analyze_codex_conversations(logs: &[CodexLog]) -> Result<CodeAnalysis> {
     })
 }
 
-struct CodexAnalysisState {
-    write_details: Vec<CodeAnalysisWriteDetail>,
-    read_details: Vec<CodeAnalysisReadDetail>,
-    edit_details: Vec<CodeAnalysisApplyDiffDetail>,
-    run_details: Vec<CodeAnalysisRunCommandDetail>,
-    tool_counts: CodeAnalysisToolCalls,
-    unique_files: HashSet<String>,
-    total_write_lines: usize,
-    total_read_lines: usize,
-    total_edit_lines: usize,
-    total_write_characters: usize,
-    total_read_characters: usize,
-    total_edit_characters: usize,
-    folder_path: String,
-    git_remote: String,
-    task_id: String,
-    last_ts: i64,
+// Codex-specific extension methods for AnalysisState
+trait CodexAnalysisExt {
+    fn handle_shell_call(&mut self, call: CodexShellCall, output: CodexShellOutput);
+    fn handle_patch(&mut self, patch: CodexPatch, ts: i64);
+    fn record_run_command(&mut self, call: CodexShellCall);
 }
 
-impl CodexAnalysisState {
-    fn new() -> Self {
-        Self {
-            write_details: Vec::new(),
-            read_details: Vec::new(),
-            edit_details: Vec::new(),
-            run_details: Vec::new(),
-            tool_counts: CodeAnalysisToolCalls::default(),
-            unique_files: HashSet::new(),
-            total_write_lines: 0,
-            total_read_lines: 0,
-            total_edit_lines: 0,
-            total_write_characters: 0,
-            total_read_characters: 0,
-            total_edit_characters: 0,
-            folder_path: String::new(),
-            git_remote: String::new(),
-            task_id: String::new(),
-            last_ts: 0,
-        }
-    }
-
+impl CodexAnalysisExt for AnalysisState {
     fn handle_shell_call(&mut self, call: CodexShellCall, output: CodexShellOutput) {
         // Check for applypatch script
         if call.script.contains("applypatch") {
@@ -193,35 +161,6 @@ impl CodexAnalysisState {
         self.record_run_command(call);
     }
 
-    fn add_read_detail(&mut self, path: &str, content: &str, ts: i64) {
-        let trimmed = content.trim_end_matches('\n');
-        if trimmed.is_empty() {
-            return;
-        }
-
-        let line_count = count_lines(trimmed);
-        let char_count = trimmed.chars().count();
-        let resolved = self.normalize_path(path);
-
-        if resolved.is_empty() {
-            return;
-        }
-
-        self.read_details.push(CodeAnalysisReadDetail {
-            base: CodeAnalysisDetailBase {
-                file_path: resolved.clone(),
-                line_count,
-                character_count: char_count,
-                timestamp: ts,
-            },
-        });
-
-        self.unique_files.insert(resolved);
-        self.total_read_lines += line_count;
-        self.total_read_characters += char_count;
-        self.tool_counts.read += 1;
-    }
-
     fn handle_patch(&mut self, patch: CodexPatch, ts: i64) {
         if patch.file_path.is_empty() {
             return;
@@ -233,162 +172,31 @@ impl CodexAnalysisState {
         }
 
         let (old_str, new_str) = extract_patch_strings(&patch.lines);
-        self.unique_files.insert(resolved.clone());
 
         match patch.action.as_str() {
             "add" => {
-                let content = new_str.trim_end_matches('\n');
-                let line_count = count_lines(content);
-                let char_count = content.chars().count();
-
-                self.write_details.push(CodeAnalysisWriteDetail {
-                    base: CodeAnalysisDetailBase {
-                        file_path: resolved,
-                        line_count,
-                        character_count: char_count,
-                        timestamp: ts,
-                    },
-                    content: content.to_string(),
-                });
-
-                self.tool_counts.write += 1;
-                self.total_write_lines += line_count;
-                self.total_write_characters += char_count;
+                self.add_write_detail(&resolved, &new_str, ts);
             }
             "delete" => {
                 let content = old_str.trim_end_matches('\n');
-                if content.is_empty() {
-                    return;
+                if !content.is_empty() {
+                    self.add_edit_detail(&resolved, content, "", ts);
                 }
-
-                let line_count = count_lines(content);
-                let char_count = content.chars().count();
-
-                self.edit_details.push(CodeAnalysisApplyDiffDetail {
-                    base: CodeAnalysisDetailBase {
-                        file_path: resolved,
-                        line_count,
-                        character_count: char_count,
-                        timestamp: ts,
-                    },
-                    old_string: content.to_string(),
-                    new_string: String::new(),
-                });
-
-                self.tool_counts.edit += 1;
-                self.total_edit_lines += line_count;
-                self.total_edit_characters += char_count;
             }
             _ => {
-                let content = new_str.trim_end_matches('\n');
-                let line_count = count_lines(content);
-                let char_count = content.chars().count();
-
-                let trimmed_old = old_str.trim_end_matches('\n');
-
-                if trimmed_old.is_empty() && !content.is_empty() {
-                    // New file creation
-                    self.write_details.push(CodeAnalysisWriteDetail {
-                        base: CodeAnalysisDetailBase {
-                            file_path: resolved,
-                            line_count,
-                            character_count: char_count,
-                            timestamp: ts,
-                        },
-                        content: content.to_string(),
-                    });
-
-                    self.tool_counts.write += 1;
-                    self.total_write_lines += line_count;
-                    self.total_write_characters += char_count;
-                } else {
-                    // File modification
-                    self.edit_details.push(CodeAnalysisApplyDiffDetail {
-                        base: CodeAnalysisDetailBase {
-                            file_path: resolved,
-                            line_count,
-                            character_count: char_count,
-                            timestamp: ts,
-                        },
-                        old_string: trimmed_old.to_string(),
-                        new_string: content.to_string(),
-                    });
-
-                    self.tool_counts.edit += 1;
-                    self.total_edit_lines += line_count;
-                    self.total_edit_characters += char_count;
-                }
+                self.add_edit_detail(&resolved, &old_str, &new_str, ts);
             }
         }
     }
 
     fn record_run_command(&mut self, call: CodexShellCall) {
         let command_str = if call.full_command.is_empty() {
-            call.script.trim().to_string()
+            call.script.trim()
         } else {
-            call.full_command.join(" ").trim().to_string()
+            &call.full_command.join(" ")
         };
 
-        if command_str.is_empty() {
-            return;
-        }
-
-        let command_chars = command_str.chars().count();
-
-        self.run_details.push(CodeAnalysisRunCommandDetail {
-            base: CodeAnalysisDetailBase {
-                file_path: self.folder_path.clone(),
-                line_count: 0,
-                character_count: command_chars,
-                timestamp: call.timestamp,
-            },
-            command: command_str,
-            description: String::new(),
-        });
-
-        self.tool_counts.bash += 1;
-    }
-
-    fn normalize_path(&self, path: &str) -> String {
-        if path.is_empty() {
-            return String::new();
-        }
-
-        let path_buf = std::path::PathBuf::from(path);
-        if path_buf.is_absolute() {
-            return path.to_string();
-        }
-
-        if self.folder_path.is_empty() {
-            return path.to_string();
-        }
-
-        std::path::PathBuf::from(&self.folder_path)
-            .join(path)
-            .to_string_lossy()
-            .to_string()
-    }
-
-    fn into_record(self, conversation_usage: HashMap<String, Value>) -> CodeAnalysisRecord {
-        CodeAnalysisRecord {
-            total_unique_files: self.unique_files.len(),
-            total_write_lines: self.total_write_lines,
-            total_read_lines: self.total_read_lines,
-            total_edit_lines: self.total_edit_lines,
-            total_write_characters: self.total_write_characters,
-            total_read_characters: self.total_read_characters,
-            total_edit_characters: self.total_edit_characters,
-            write_file_details: self.write_details,
-            read_file_details: self.read_details,
-            edit_file_details: self.edit_details,
-            run_command_details: self.run_details,
-            tool_call_counts: self.tool_counts,
-            conversation_usage,
-            task_id: self.task_id,
-            timestamp: self.last_ts,
-            folder_path: self.folder_path,
-            git_remote_url: self.git_remote,
-        }
+        self.add_run_command(command_str, "", call.timestamp);
     }
 }
 

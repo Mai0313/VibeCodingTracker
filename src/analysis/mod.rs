@@ -2,6 +2,7 @@ pub mod analyzer;
 pub mod batch_analyzer;
 pub mod claude_analyzer;
 pub mod codex_analyzer;
+pub mod common_state;
 pub mod detector;
 pub mod display;
 pub mod gemini_analyzer;

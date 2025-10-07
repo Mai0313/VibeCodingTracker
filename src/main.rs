@@ -5,9 +5,7 @@ use owo_colors::OwoColorize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use vibe_coding_tracker::cli::{Cli, Commands};
-use vibe_coding_tracker::pricing::{
-    calculate_cost, fetch_model_pricing, get_model_pricing, ModelPricing,
-};
+use vibe_coding_tracker::pricing::{calculate_cost, fetch_model_pricing, ModelPricingMap};
 use vibe_coding_tracker::usage::{
     display_usage_interactive, display_usage_table, display_usage_text, get_usage_from_directories,
 };
@@ -80,7 +78,7 @@ fn main() -> Result<()> {
                                 "Warning: Failed to fetch pricing data: {}. Costs will be unavailable.",
                                 e
                             );
-                            HashMap::new()
+                            ModelPricingMap::new(HashMap::new())
                         }
                     };
                     let enriched_data = build_enriched_json(&usage_data, &pricing_map)?;
@@ -161,7 +159,7 @@ fn main() -> Result<()> {
 
 fn build_enriched_json(
     usage_data: &DateUsageResult,
-    pricing_map: &HashMap<String, ModelPricing>,
+    pricing_map: &ModelPricingMap,
 ) -> Result<HashMap<String, Vec<Value>>> {
     let enriched_data = usage_data
         .iter()
@@ -170,7 +168,7 @@ fn build_enriched_json(
                 .iter()
                 .map(|(model, usage)| {
                     let counts = extract_token_counts(usage);
-                    let pricing_result = get_model_pricing(model, pricing_map);
+                    let pricing_result = pricing_map.get(model);
                     let cost = calculate_cost(
                         counts.input_tokens,
                         counts.output_tokens,

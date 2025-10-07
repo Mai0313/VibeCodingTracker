@@ -1,30 +1,14 @@
+use crate::analysis::common_state::AnalysisState;
 use crate::models::*;
-use crate::utils::{count_lines, get_git_remote_url, parse_iso_timestamp, process_claude_usage};
+use crate::utils::{get_git_remote_url, parse_iso_timestamp, process_claude_usage};
 use anyhow::Result;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// Analyze Claude Code conversations
 pub fn analyze_claude_conversations(records: Vec<Value>) -> Result<CodeAnalysis> {
-    let mut write_details = Vec::new();
-    let mut read_details = Vec::new();
-    let mut edit_details = Vec::new();
-    let mut run_details = Vec::new();
-
-    let mut tool_counts = CodeAnalysisToolCalls::default();
+    let mut state = AnalysisState::new();
     let mut conversation_usage: HashMap<String, Value> = HashMap::new();
-    let mut unique_files = HashSet::new();
-
-    let mut total_write_lines = 0;
-    let mut total_read_lines = 0;
-    let mut total_read_characters = 0;
-    let mut total_write_characters = 0;
-    let mut total_edit_characters = 0;
-    let mut total_edit_lines = 0;
-
-    let mut folder_path = String::new();
-    let mut task_id = String::new();
-    let mut last_timestamp = 0i64;
 
     for record in records {
         let log: ClaudeCodeLog = match serde_json::from_value(record) {
@@ -32,14 +16,14 @@ pub fn analyze_claude_conversations(records: Vec<Value>) -> Result<CodeAnalysis>
             Err(_) => continue,
         };
 
-        if folder_path.is_empty() {
-            folder_path = log.cwd.clone();
+        if state.folder_path.is_empty() {
+            state.folder_path = log.cwd.clone();
         }
-        task_id = log.session_id.clone();
+        state.task_id = log.session_id.clone();
 
         let ts = parse_iso_timestamp(&log.timestamp);
-        if ts > last_timestamp {
-            last_timestamp = ts;
+        if ts > state.last_ts {
+            state.last_ts = ts;
         }
 
         if log.log_type == "assistant" {
@@ -72,34 +56,22 @@ pub fn analyze_claude_conversations(records: Vec<Value>) -> Result<CodeAnalysis>
                             };
 
                             match name {
-                                "Read" => tool_counts.read += 1,
-                                "Write" => tool_counts.write += 1,
-                                "Edit" => tool_counts.edit += 1,
-                                "TodoWrite" => tool_counts.todo_write += 1,
+                                "Read" => state.tool_counts.read += 1,
+                                "Write" => state.tool_counts.write += 1,
+                                "Edit" => state.tool_counts.edit += 1,
+                                "TodoWrite" => state.tool_counts.todo_write += 1,
                                 "Bash" => {
-                                    tool_counts.bash += 1;
                                     if let Some(input) = item_obj.get("input") {
                                         let command = input
                                             .get("command")
                                             .and_then(|c| c.as_str())
-                                            .unwrap_or("")
-                                            .to_string();
+                                            .unwrap_or("");
                                         let description = input
                                             .get("description")
                                             .and_then(|d| d.as_str())
-                                            .unwrap_or("")
-                                            .to_string();
+                                            .unwrap_or("");
 
-                                        run_details.push(CodeAnalysisRunCommandDetail {
-                                            base: CodeAnalysisDetailBase {
-                                                file_path: log.cwd.clone(),
-                                                line_count: 0,
-                                                character_count: command.len(),
-                                                timestamp: ts,
-                                            },
-                                            command,
-                                            description,
-                                        });
+                                        state.add_run_command(command, description, ts);
                                     }
                                 }
                                 _ => {}
@@ -120,30 +92,13 @@ pub fn analyze_claude_conversations(records: Vec<Value>) -> Result<CodeAnalysis>
                         let file_path = file_map
                             .get("filePath")
                             .and_then(|p| p.as_str())
-                            .unwrap_or("")
-                            .to_string();
+                            .unwrap_or("");
                         let content = file_map
                             .get("content")
                             .and_then(|c| c.as_str())
                             .unwrap_or("");
-                        let num_lines = file_map
-                            .get("numLines")
-                            .and_then(|n| n.as_u64())
-                            .unwrap_or(0) as usize;
-                        let char_count = content.chars().count();
 
-                        read_details.push(CodeAnalysisReadDetail {
-                            base: CodeAnalysisDetailBase {
-                                file_path: file_path.clone(),
-                                line_count: num_lines,
-                                character_count: char_count,
-                                timestamp: ts,
-                            },
-                        });
-
-                        unique_files.insert(file_path);
-                        total_read_characters += char_count;
-                        total_read_lines += num_lines;
+                        state.add_read_detail(file_path, content, ts);
                     }
                 }
 
@@ -152,29 +107,13 @@ pub fn analyze_claude_conversations(records: Vec<Value>) -> Result<CodeAnalysis>
                     let file_path = tur_obj
                         .get("filePath")
                         .and_then(|p| p.as_str())
-                        .unwrap_or("")
-                        .to_string();
+                        .unwrap_or("");
                     let content = tur_obj
                         .get("content")
                         .and_then(|c| c.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let line_count = count_lines(&content);
-                    let char_count = content.chars().count();
+                        .unwrap_or("");
 
-                    write_details.push(CodeAnalysisWriteDetail {
-                        base: CodeAnalysisDetailBase {
-                            file_path: file_path.clone(),
-                            line_count,
-                            character_count: char_count,
-                            timestamp: ts,
-                        },
-                        content: content.clone(),
-                    });
-
-                    unique_files.insert(file_path);
-                    total_write_lines += line_count;
-                    total_write_characters += char_count;
+                    state.add_write_detail(file_path, content, ts);
                 }
 
                 // Edit operations
@@ -184,50 +123,19 @@ pub fn analyze_claude_conversations(records: Vec<Value>) -> Result<CodeAnalysis>
                             .get("oldString")
                             .and_then(|s| s.as_str())
                             .unwrap_or("");
-                        let line_count = count_lines(new_string);
-                        let char_count = new_string.chars().count();
 
-                        edit_details.push(CodeAnalysisApplyDiffDetail {
-                            base: CodeAnalysisDetailBase {
-                                file_path: file_path.to_string(),
-                                line_count,
-                                character_count: char_count,
-                                timestamp: ts,
-                            },
-                            old_string: old_string.to_string(),
-                            new_string: new_string.to_string(),
-                        });
-
-                        unique_files.insert(file_path.to_string());
-                        total_edit_characters += char_count;
-                        total_edit_lines += line_count;
+                        state.add_edit_detail(file_path, old_string, new_string, ts);
                     }
                 }
             }
         }
     }
 
-    let git_remote_url = get_git_remote_url(&folder_path);
+    if state.git_remote.is_empty() {
+        state.git_remote = get_git_remote_url(&state.folder_path);
+    }
 
-    let record = CodeAnalysisRecord {
-        total_unique_files: unique_files.len(),
-        total_write_lines,
-        total_read_lines,
-        total_read_characters,
-        total_write_characters,
-        total_edit_characters,
-        total_edit_lines,
-        write_file_details: write_details,
-        read_file_details: read_details,
-        edit_file_details: edit_details,
-        run_command_details: run_details,
-        tool_call_counts: tool_counts,
-        conversation_usage,
-        task_id,
-        timestamp: last_timestamp,
-        folder_path,
-        git_remote_url,
-    };
+    let record = state.into_record(conversation_usage);
 
     Ok(CodeAnalysis {
         user: String::new(),

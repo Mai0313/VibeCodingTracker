@@ -1,7 +1,7 @@
 {
   "extensionName": "Claude-Code",
-  "insightsVersion": "0.1.9-10-ge9e8b53-dirty",
-  "machineId": "18f309cbbb654be69eff5ff79d2f3fa6",
+  "insightsVersion": "0.2.1-1-g222f6a1-dirty",
+  "machineId": "5b0dfa41ada84d5180a514698f67bd80",
   "records": [
     {
       "conversationUsage": {
@@ -36,18 +36,18 @@
         }
       ],
       "folderPath": "/home/wei/repo/claude-code",
-      "gitRemoteUrl": "https://github.com/Mai0313/claude-code",
+      "gitRemoteUrl": "",
       "readFileDetails": [
         {
-          "characterCount": 1344,
+          "characterCount": 1343,
           "filePath": "/home/wei/repo/claude-code/go.mod",
-          "lineCount": 40,
+          "lineCount": 39,
           "timestamp": 1756385853529
         },
         {
-          "characterCount": 5,
+          "characterCount": 4,
           "filePath": "/home/wei/repo/claude-code/.python-version",
-          "lineCount": 2,
+          "lineCount": 1,
           "timestamp": 1756385853529
         }
       ],
@@ -65,15 +65,15 @@
       "timestamp": 1756386827562,
       "toolCallCounts": {
         "Bash": 1,
-        "Edit": 3,
-        "Read": 2,
+        "Edit": 5,
+        "Read": 4,
         "TodoWrite": 14,
-        "Write": 3
+        "Write": 6
       },
       "totalEditCharacters": 11,
       "totalEditLines": 2,
-      "totalReadCharacters": 1349,
-      "totalReadLines": 42,
+      "totalReadCharacters": 1347,
+      "totalReadLines": 40,
       "totalUniqueFiles": 5,
       "totalWriteCharacters": 9045,
       "totalWriteLines": 441,
@@ -102,5 +102,5 @@
       ]
     }
   ],
-  "user": "wei"
+  "user": "ds906659"
 }

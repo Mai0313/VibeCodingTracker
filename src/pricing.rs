@@ -40,6 +40,122 @@ pub struct ModelPricingResult {
     pub matched_model: Option<String>,
 }
 
+/// Optimized pricing map with precomputed indices for fast lookups
+#[derive(Debug, Clone)]
+pub struct ModelPricingMap {
+    // Original pricing data
+    raw: HashMap<String, ModelPricing>,
+    // Precomputed normalized keys for fast matching
+    normalized_index: HashMap<String, String>, // normalized_key -> original_key
+    // Precomputed lowercase keys for substring/fuzzy matching
+    lowercase_keys: Vec<(String, String)>, // (lowercase_key, original_key)
+}
+
+impl ModelPricingMap {
+    /// Create a new ModelPricingMap with precomputed indices
+    pub fn new(raw: HashMap<String, ModelPricing>) -> Self {
+        let mut normalized_index = HashMap::new();
+        let mut lowercase_keys = Vec::new();
+
+        for key in raw.keys() {
+            // Precompute normalized key
+            let normalized = normalize_model_name(key);
+            if normalized != *key {
+                normalized_index.insert(normalized, key.clone());
+            }
+
+            // Precompute lowercase key for substring/fuzzy matching
+            lowercase_keys.push((key.to_lowercase(), key.clone()));
+        }
+
+        Self {
+            raw,
+            normalized_index,
+            lowercase_keys,
+        }
+    }
+
+    /// Get pricing for a specific model with optimized matching
+    pub fn get(&self, model_name: &str) -> ModelPricingResult {
+        // Fast path 1: Exact match
+        if let Some(pricing) = self.raw.get(model_name) {
+            return ModelPricingResult {
+                pricing: *pricing,
+                matched_model: None,
+            };
+        }
+
+        // Fast path 2: Normalized match
+        let normalized_name = normalize_model_name(model_name);
+        if let Some(original_key) = self.normalized_index.get(&normalized_name) {
+            if let Some(pricing) = self.raw.get(original_key) {
+                return ModelPricingResult {
+                    pricing: *pricing,
+                    matched_model: Some(original_key.clone()),
+                };
+            }
+        }
+
+        // Slow path: Substring and fuzzy matching (but with precomputed lowercase keys)
+        let model_lower = model_name.to_lowercase();
+        let mut substring_match: Option<String> = None;
+        let mut best_fuzzy_match: Option<(String, f64)> = None;
+
+        for (key_lower, original_key) in &self.lowercase_keys {
+            // Substring matching
+            if substring_match.is_none()
+                && (model_lower.contains(key_lower) || key_lower.contains(&model_lower))
+            {
+                substring_match = Some(original_key.clone());
+            }
+
+            // Fuzzy matching
+            let similarity = jaro_winkler(&model_lower, key_lower);
+            if similarity >= SIMILARITY_THRESHOLD {
+                match &best_fuzzy_match {
+                    Some((_, best_similarity)) if similarity > *best_similarity => {
+                        best_fuzzy_match = Some((original_key.clone(), similarity));
+                    }
+                    None => {
+                        best_fuzzy_match = Some((original_key.clone(), similarity));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Return substring match first, then fuzzy match
+        if let Some(matched_key) = substring_match {
+            if let Some(pricing) = self.raw.get(&matched_key) {
+                return ModelPricingResult {
+                    pricing: *pricing,
+                    matched_model: Some(matched_key),
+                };
+            }
+        }
+
+        if let Some((matched_key, _)) = best_fuzzy_match {
+            if let Some(pricing) = self.raw.get(&matched_key) {
+                return ModelPricingResult {
+                    pricing: *pricing,
+                    matched_model: Some(matched_key),
+                };
+            }
+        }
+
+        // Return default (zero costs) if no match found
+        ModelPricingResult {
+            pricing: ModelPricing::default(),
+            matched_model: None,
+        }
+    }
+
+    /// Get the raw pricing map (for backward compatibility)
+    pub fn raw(&self) -> &HashMap<String, ModelPricing> {
+        &self.raw
+    }
+}
+
 impl Default for ModelPricing {
     fn default() -> Self {
         Self {
@@ -176,14 +292,15 @@ fn normalize_pricing(mut pricing: HashMap<String, ModelPricing>) -> HashMap<Stri
 }
 
 /// Fetch model pricing from LiteLLM repository (with caching)
-pub fn fetch_model_pricing() -> Result<HashMap<String, ModelPricing>> {
+/// Returns an optimized ModelPricingMap with precomputed indices
+pub fn fetch_model_pricing() -> Result<ModelPricingMap> {
     // Check if today's cache exists
     if find_today_cache().is_some() {
         // Load from cache
         match load_from_cache() {
             Ok(pricing) => {
                 log::debug!("Loaded model pricing from today's cache");
-                return Ok(pricing);
+                return Ok(ModelPricingMap::new(pricing));
             }
             Err(e) => {
                 log::warn!("Failed to load from cache: {}, fetching from remote", e);
@@ -210,7 +327,7 @@ pub fn fetch_model_pricing() -> Result<HashMap<String, ModelPricing>> {
         log::debug!("Saved model pricing to cache with today's date");
     }
 
-    Ok(normalized_pricing)
+    Ok(ModelPricingMap::new(normalized_pricing))
 }
 
 /// Calculate cost based on token usage and model pricing
@@ -262,87 +379,6 @@ pub fn calculate_cost(
     let cache_creation_cost = cache_creation_tokens as f64 * cache_creation_price;
 
     input_cost + output_cost + cache_read_cost + cache_creation_cost
-}
-
-/// Get pricing for a specific model, with fallback handling
-pub fn get_model_pricing(
-    model_name: &str,
-    pricing_map: &HashMap<String, ModelPricing>,
-) -> ModelPricingResult {
-    // Try exact match first
-    if let Some(pricing) = pricing_map.get(model_name) {
-        return ModelPricingResult {
-            pricing: *pricing,
-            matched_model: None,
-        };
-    }
-
-    // Try to find a match by removing version suffixes or provider prefixes
-    let normalized_name = normalize_model_name(model_name);
-    if let Some(pricing) = pricing_map.get(&normalized_name) {
-        return ModelPricingResult {
-            pricing: *pricing,
-            matched_model: Some(normalized_name),
-        };
-    }
-
-    // Pre-compute lowercase model name for comparisons
-    let model_lower = model_name.to_lowercase();
-
-    // Single-pass matching: try substring and fuzzy matching in one loop
-    let mut substring_match: Option<String> = None;
-    let mut best_fuzzy_match: Option<(String, f64)> = None;
-
-    for key in pricing_map.keys() {
-        let key_lower = key.to_lowercase();
-
-        // Try substring matching first (higher priority)
-        if substring_match.is_none()
-            && (model_lower.contains(&key_lower) || key_lower.contains(&model_lower))
-        {
-            substring_match = Some(key.clone());
-            // Don't break - continue to find best fuzzy match as fallback
-        }
-
-        // Calculate fuzzy matching in parallel
-        let similarity = jaro_winkler(&model_lower, &key_lower);
-        if similarity >= SIMILARITY_THRESHOLD {
-            match &best_fuzzy_match {
-                Some((_, best_similarity)) if similarity > *best_similarity => {
-                    best_fuzzy_match = Some((key.clone(), similarity));
-                }
-                None => {
-                    best_fuzzy_match = Some((key.clone(), similarity));
-                }
-                _ => {}
-            }
-        }
-    }
-
-    // Return substring match first (higher priority), then fuzzy match
-    if let Some(matched_key) = substring_match {
-        if let Some(pricing) = pricing_map.get(&matched_key) {
-            return ModelPricingResult {
-                pricing: *pricing,
-                matched_model: Some(matched_key),
-            };
-        }
-    }
-
-    if let Some((matched_key, _)) = best_fuzzy_match {
-        if let Some(pricing) = pricing_map.get(&matched_key) {
-            return ModelPricingResult {
-                pricing: *pricing,
-                matched_model: Some(matched_key),
-            };
-        }
-    }
-
-    // Return default (zero costs) if no match found
-    ModelPricingResult {
-        pricing: ModelPricing::default(),
-        matched_model: None,
-    }
 }
 
 /// Normalize model name by removing common version suffixes and prefixes

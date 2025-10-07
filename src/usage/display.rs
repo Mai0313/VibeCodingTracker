@@ -1,6 +1,6 @@
 use crate::models::DateUsageResult;
 use crate::pricing::{
-    calculate_cost, fetch_model_pricing, get_model_pricing, ModelPricing, ModelPricingResult,
+    calculate_cost, fetch_model_pricing, ModelPricingMap, ModelPricingResult,
 };
 use crate::utils::{extract_token_counts, format_number, get_current_date};
 use comfy_table::{presets::UTF8_FULL, Cell, CellAlignment, Color, Table};
@@ -48,12 +48,12 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
         Ok(map) => map,
         Err(e) => {
             log::warn!("Failed to fetch pricing: {}", e);
-            HashMap::new()
+            ModelPricingMap::new(HashMap::new())
         }
     };
     let mut pricing_lookup_cache: HashMap<String, ModelPricingResult> = HashMap::new();
     let mut last_pricing_refresh = Instant::now();
-    if pricing_map.is_empty() {
+    if pricing_map.raw().is_empty() {
         last_pricing_refresh = Instant::now() - pricing_refresh_interval;
     }
 
@@ -87,7 +87,7 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
 
         sys.refresh_processes(sysinfo::ProcessesToUpdate::All, false);
 
-        if last_pricing_refresh.elapsed() >= pricing_refresh_interval || pricing_map.is_empty() {
+        if last_pricing_refresh.elapsed() >= pricing_refresh_interval || pricing_map.raw().is_empty() {
             match fetch_model_pricing() {
                 Ok(map) => {
                     pricing_map = map;
@@ -96,7 +96,7 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
                 }
                 Err(e) => {
                     log::warn!("Failed to fetch pricing: {}", e);
-                    if pricing_map.is_empty() {
+                    if pricing_map.raw().is_empty() {
                         last_pricing_refresh = Instant::now() - pricing_refresh_interval;
                     }
                 }
@@ -393,7 +393,7 @@ pub fn display_usage_table(usage_data: &DateUsageResult) {
         Err(e) => {
             eprintln!("⚠️  Warning: Failed to fetch pricing data: {}", e);
             eprintln!("   Costs will be shown as $0.00");
-            HashMap::new()
+            ModelPricingMap::new(HashMap::new())
         }
     };
 
@@ -539,7 +539,7 @@ fn extract_usage_row(
     date: &str,
     model: &str,
     usage: &Value,
-    pricing_map: &HashMap<String, ModelPricing>,
+    pricing_map: &ModelPricingMap,
     pricing_cache: &mut HashMap<String, ModelPricingResult>,
 ) -> UsageRow {
     // Extract token counts using utility function
@@ -559,7 +559,7 @@ fn extract_usage_row(
     // Calculate cost with fuzzy matching
     let pricing_result = pricing_cache
         .entry(model.to_string())
-        .or_insert_with(|| get_model_pricing(model, pricing_map));
+        .or_insert_with(|| pricing_map.get(model));
     row.cost = calculate_cost(
         row.input_tokens,
         row.output_tokens,
@@ -586,7 +586,7 @@ pub fn display_usage_text(usage_data: &DateUsageResult) {
     }
 
     // Fetch pricing data
-    let pricing_map = fetch_model_pricing().unwrap_or_default();
+    let pricing_map = fetch_model_pricing().unwrap_or_else(|_| ModelPricingMap::new(HashMap::new()));
     let mut pricing_cache: HashMap<String, ModelPricingResult> = HashMap::new();
 
     // Collect and sort dates

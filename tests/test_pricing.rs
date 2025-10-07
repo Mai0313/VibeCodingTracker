@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use vibe_coding_tracker::pricing::{calculate_cost, get_model_pricing, ModelPricing};
+use vibe_coding_tracker::pricing::{calculate_cost, ModelPricing, ModelPricingMap};
 
 #[test]
 fn test_model_pricing_default() {
@@ -52,8 +52,8 @@ fn test_calculate_cost_with_cache() {
 
 #[test]
 fn test_get_model_pricing_exact_match() {
-    let mut pricing_map = HashMap::new();
-    pricing_map.insert(
+    let mut raw_map = HashMap::new();
+    raw_map.insert(
         "claude-3-opus".to_string(),
         ModelPricing {
             input_cost_per_token: 0.000015,
@@ -63,8 +63,9 @@ fn test_get_model_pricing_exact_match() {
             ..Default::default()
         },
     );
+    let pricing_map = ModelPricingMap::new(raw_map);
 
-    let result = get_model_pricing("claude-3-opus", &pricing_map);
+    let result = pricing_map.get("claude-3-opus");
     assert_eq!(result.pricing.input_cost_per_token, 0.000015);
     assert_eq!(
         result.matched_model, None,
@@ -74,8 +75,8 @@ fn test_get_model_pricing_exact_match() {
 
 #[test]
 fn test_get_model_pricing_normalized_match() {
-    let mut pricing_map = HashMap::new();
-    pricing_map.insert(
+    let mut raw_map = HashMap::new();
+    raw_map.insert(
         "claude-3-sonnet".to_string(),
         ModelPricing {
             input_cost_per_token: 0.000003,
@@ -85,9 +86,10 @@ fn test_get_model_pricing_normalized_match() {
             ..Default::default()
         },
     );
+    let pricing_map = ModelPricingMap::new(raw_map);
 
     // Test with version suffix
-    let result = get_model_pricing("claude-3-sonnet-20240229", &pricing_map);
+    let result = pricing_map.get("claude-3-sonnet-20240229");
     assert_eq!(result.pricing.input_cost_per_token, 0.000003);
     assert_eq!(
         result.matched_model,
@@ -98,8 +100,8 @@ fn test_get_model_pricing_normalized_match() {
 
 #[test]
 fn test_get_model_pricing_substring_match() {
-    let mut pricing_map = HashMap::new();
-    pricing_map.insert(
+    let mut raw_map = HashMap::new();
+    raw_map.insert(
         "gpt-4".to_string(),
         ModelPricing {
             input_cost_per_token: 0.00003,
@@ -109,9 +111,10 @@ fn test_get_model_pricing_substring_match() {
             ..Default::default()
         },
     );
+    let pricing_map = ModelPricingMap::new(raw_map);
 
     // Test substring matching
-    let result = get_model_pricing("gpt-4-turbo", &pricing_map);
+    let result = pricing_map.get("gpt-4-turbo");
     assert_eq!(result.pricing.input_cost_per_token, 0.00003);
     assert_eq!(
         result.matched_model,
@@ -122,8 +125,8 @@ fn test_get_model_pricing_substring_match() {
 
 #[test]
 fn test_get_model_pricing_fuzzy_match() {
-    let mut pricing_map = HashMap::new();
-    pricing_map.insert(
+    let mut raw_map = HashMap::new();
+    raw_map.insert(
         "claude-3-5-sonnet".to_string(),
         ModelPricing {
             input_cost_per_token: 0.000003,
@@ -133,9 +136,10 @@ fn test_get_model_pricing_fuzzy_match() {
             ..Default::default()
         },
     );
+    let pricing_map = ModelPricingMap::new(raw_map);
 
     // Test fuzzy matching with slightly different name
-    let result = get_model_pricing("claude-35-sonnet", &pricing_map);
+    let result = pricing_map.get("claude-35-sonnet");
     // Should find a fuzzy match since similarity is high
     assert!(
         result.matched_model.is_some() || result.pricing.input_cost_per_token == 0.0,
@@ -145,9 +149,10 @@ fn test_get_model_pricing_fuzzy_match() {
 
 #[test]
 fn test_get_model_pricing_no_match() {
-    let pricing_map = HashMap::new();
+    let raw_map = HashMap::new();
+    let pricing_map = ModelPricingMap::new(raw_map);
 
-    let result = get_model_pricing("unknown-model", &pricing_map);
+    let result = pricing_map.get("unknown-model");
     assert_eq!(result.pricing.input_cost_per_token, 0.0);
     assert_eq!(result.pricing.output_cost_per_token, 0.0);
     assert_eq!(result.matched_model, None, "No match should return None");
@@ -155,8 +160,8 @@ fn test_get_model_pricing_no_match() {
 
 #[test]
 fn test_get_model_pricing_with_provider_prefix() {
-    let mut pricing_map = HashMap::new();
-    pricing_map.insert(
+    let mut raw_map = HashMap::new();
+    raw_map.insert(
         "claude-3-opus".to_string(),
         ModelPricing {
             input_cost_per_token: 0.000015,
@@ -166,9 +171,10 @@ fn test_get_model_pricing_with_provider_prefix() {
             ..Default::default()
         },
     );
+    let pricing_map = ModelPricingMap::new(raw_map);
 
     // Test with provider prefix (should be normalized)
-    let result = get_model_pricing("bedrock/claude-3-opus-20240229", &pricing_map);
+    let result = pricing_map.get("bedrock/claude-3-opus-20240229");
     // After normalization: bedrock/claude-3-opus-20240229 -> claude-3-opus
     assert!(
         result.pricing.input_cost_per_token > 0.0 || result.matched_model.is_some(),
@@ -178,8 +184,8 @@ fn test_get_model_pricing_with_provider_prefix() {
 
 #[test]
 fn test_get_model_pricing_prefers_better_match() {
-    let mut pricing_map = HashMap::new();
-    pricing_map.insert(
+    let mut raw_map = HashMap::new();
+    raw_map.insert(
         "gpt-4".to_string(),
         ModelPricing {
             input_cost_per_token: 0.00003,
@@ -189,7 +195,7 @@ fn test_get_model_pricing_prefers_better_match() {
             ..Default::default()
         },
     );
-    pricing_map.insert(
+    raw_map.insert(
         "gpt-4-turbo".to_string(),
         ModelPricing {
             input_cost_per_token: 0.00001,
@@ -199,9 +205,10 @@ fn test_get_model_pricing_prefers_better_match() {
             ..Default::default()
         },
     );
+    let pricing_map = ModelPricingMap::new(raw_map);
 
     // When searching for "gpt-4-turbo", it should prefer exact or better matches
-    let result = get_model_pricing("gpt-4-turbo", &pricing_map);
+    let result = pricing_map.get("gpt-4-turbo");
     // Should find exact match for gpt-4-turbo
     assert_eq!(result.pricing.input_cost_per_token, 0.00001);
 }
@@ -321,8 +328,9 @@ mod cache_tests {
 
     #[test]
     fn test_get_model_pricing_empty_string() {
-        let pricing_map = HashMap::new();
-        let result = get_model_pricing("", &pricing_map);
+        let raw_map = HashMap::new();
+        let pricing_map = ModelPricingMap::new(raw_map);
+        let result = pricing_map.get("");
 
         assert_eq!(result.pricing.input_cost_per_token, 0.0);
         assert_eq!(result.matched_model, None);
@@ -330,8 +338,8 @@ mod cache_tests {
 
     #[test]
     fn test_get_model_pricing_special_characters() {
-        let mut pricing_map = HashMap::new();
-        pricing_map.insert(
+        let mut raw_map = HashMap::new();
+        raw_map.insert(
             "model-with-special_chars.123".to_string(),
             ModelPricing {
                 input_cost_per_token: 0.000001,
@@ -341,16 +349,17 @@ mod cache_tests {
                 ..Default::default()
             },
         );
+        let pricing_map = ModelPricingMap::new(raw_map);
 
-        let result = get_model_pricing("model-with-special_chars.123", &pricing_map);
+        let result = pricing_map.get("model-with-special_chars.123");
         assert_eq!(result.pricing.input_cost_per_token, 0.000001);
         assert_eq!(result.matched_model, None); // Exact match
     }
 
     #[test]
     fn test_get_model_pricing_case_sensitivity() {
-        let mut pricing_map = HashMap::new();
-        pricing_map.insert(
+        let mut raw_map = HashMap::new();
+        raw_map.insert(
             "GPT-4".to_string(),
             ModelPricing {
                 input_cost_per_token: 0.00003,
@@ -360,9 +369,10 @@ mod cache_tests {
                 ..Default::default()
             },
         );
+        let pricing_map = ModelPricingMap::new(raw_map);
 
         // Test with different case - should still match via fuzzy matching
-        let result = get_model_pricing("gpt-4", &pricing_map);
+        let result = pricing_map.get("gpt-4");
         // Should find via fuzzy match or exact match depending on implementation
         assert!(
             result.pricing.input_cost_per_token > 0.0 || result.matched_model.is_some(),
@@ -372,8 +382,8 @@ mod cache_tests {
 
     #[test]
     fn test_get_model_pricing_multiple_versions() {
-        let mut pricing_map = HashMap::new();
-        pricing_map.insert(
+        let mut raw_map = HashMap::new();
+        raw_map.insert(
             "claude-3-opus-20240229".to_string(),
             ModelPricing {
                 input_cost_per_token: 0.000015,
@@ -383,7 +393,7 @@ mod cache_tests {
                 ..Default::default()
             },
         );
-        pricing_map.insert(
+        raw_map.insert(
             "claude-3-opus".to_string(),
             ModelPricing {
                 input_cost_per_token: 0.000010,
@@ -393,9 +403,10 @@ mod cache_tests {
                 ..Default::default()
             },
         );
+        let pricing_map = ModelPricingMap::new(raw_map);
 
         // Exact match should take precedence
-        let result = get_model_pricing("claude-3-opus", &pricing_map);
+        let result = pricing_map.get("claude-3-opus");
         assert_eq!(result.pricing.input_cost_per_token, 0.000010);
         assert_eq!(result.matched_model, None);
     }
