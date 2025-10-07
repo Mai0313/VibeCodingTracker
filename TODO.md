@@ -220,11 +220,12 @@ Gemini 的 Usage:
 ## 請檢查一下 .github/workflows/build_release.yml 這裡的流程 我希望做以下改動
 
 發佈到npm的時候 改成直接將檔案下載下來一起放到 npm
-你可以參考這段 [action](https://github.com/openai/codex/raw/refs/heads/main/.github/workflows/rust-release.yml)
 我希望可以發佈三種名稱的包到 `https://registry.npmjs.org`
 - `@mai0313/vibe-coding-tracker` (新增 scope)
 - `@mai0313/vct` (新增 scope + short name)
 - `vibe-coding-tracker` (已存在)
+
+取得所有安裝包的方式可以透過 `gh release download` 指令來完成 可能會更好一點
 
 有一點比較特別 因為 scope 就是我的用戶名 我認為可以透過 `${{ github.actor }}` 來解決 但我不確定會不會有大小寫問題
 
