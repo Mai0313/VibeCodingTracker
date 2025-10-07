@@ -217,6 +217,13 @@ Gemini 的 Usage:
 我覺得邏輯可以較為簡單得做成
 先假設每一個模型都會有 `above_200k`, 如果沒有的話就透過原價當作預設直來計算
 
+## 請檢查一下 .github/workflows/build_release.yml 這裡的流程 我希望做以下改動
+
+發佈到npm的時候 改成直接將檔案下載下來一起放到 npm
+你可以參考這段 [action](https://github.com/openai/codex/raw/refs/heads/main/.github/workflows/rust-release.yml)
+另外 我希望可以新增scope, 也就是我的用戶名 `@mai0313/vibe-coding-tracker`, 但同時也發佈到 `vibe-coding-tracker` 和 `@mai0313/vct`
+完成後請更新文檔
+
 ## 請幫我檢查所有代碼 查看一下有沒有地方是需要優化或冗餘代碼
 
 這個專案經過了多輪跌代 我擔心會有一些影響效能的邏輯出現 或 重複邏輯出現 或 為了向後兼容產生的代碼 這些都請你幫我重構
