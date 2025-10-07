@@ -221,12 +221,12 @@ Gemini 的 Usage:
 
 發佈到npm的時候 改成直接將檔案下載下來一起放到 npm
 你可以參考這段 [action](https://github.com/openai/codex/raw/refs/heads/main/.github/workflows/rust-release.yml)
-我希望可以發佈三種名稱的包到 `https://registry.npmjs.org` 和 `https://npm.pkg.github.com`
+我希望可以發佈三種名稱的包到 `https://registry.npmjs.org`
 - `@mai0313/vibe-coding-tracker` (新增 scope)
+- `@mai0313/vct` (新增 scope + short name)
 - `vibe-coding-tracker` (已存在)
-- `@mai0313/vct` (scope + short name)
 
-完成後請更新文檔
+但是我不確定 `update` 功能的邏輯是否需要修改 請順便檢查 我認為不用 因為我記得我是 inplace 的方式去更新
 
 ## 請幫我檢查所有代碼 查看一下有沒有地方是需要優化或冗餘代碼
 
