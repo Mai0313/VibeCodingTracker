@@ -226,7 +226,29 @@ Gemini 的 Usage:
 - `vibe-coding-tracker` (已存在)
 
 取得所有安裝包的方式可以透過 `gh release download` 指令來完成 可能會更好一點
-且包名 與 scope 可以用 `strategy` `matrix` 來完成
+例如
+```bash
+set -euo pipefail
+version="${{ needs.release.outputs.version }}"
+tag="${{ needs.release.outputs.tag }}"
+gh release download "$tag" \
+  --repo "${GITHUB_REPOSITORY}" \
+  --pattern "codex-npm-${version}.tgz" \
+  --dir dist/npm
+```
+
+但要注意我上傳到 github release 的包名稱是類似下面這種格式
+
+```
+vibe_coding_tracker-v0.2.2-linux-arm64-gnu.tar.gz
+vibe_coding_tracker-v0.2.2-linux-x64-gnu.tar.gz
+vibe_coding_tracker-v0.2.2-macos-arm64.tar.gz
+vibe_coding_tracker-v0.2.2-macos-x64.tar.gz
+vibe_coding_tracker-v0.2.2-windows-arm64.zip
+vibe_coding_tracker-v0.2.2-windows-x64.zip
+```
+
+另外 發布的名稱 與 scope 可以用 `strategy` `matrix` 來完成
 例如
 ```
     strategy:
