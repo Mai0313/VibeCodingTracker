@@ -25,7 +25,10 @@ pub fn get_git_remote_url<P: AsRef<Path>>(cwd: P) -> String {
 
         // Look for url in origin section
         if in_origin_section && trimmed.starts_with("url = ") {
-            return trimmed.trim_start_matches("url = ").trim().to_string();
+            let url = trimmed.trim_start_matches("url = ").trim();
+            // Remove .git suffix if present
+            let url = url.strip_suffix(".git").unwrap_or(url);
+            return url.to_string();
         }
     }
 

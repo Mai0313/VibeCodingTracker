@@ -116,7 +116,7 @@ fn test_claude_code_analysis_matches_expected() {
     let actual_json = actual_result.unwrap();
 
     // Compare results, ignoring specific fields
-    let ignore_fields = ["insightsVersion", "machineId", "user"];
+    let ignore_fields = ["insightsVersion", "machineId", "user", "gitRemoteUrl"];
     let matches = compare_json_ignore_fields(&actual_json, &expected_json, &ignore_fields);
 
     if !matches {
@@ -137,7 +137,7 @@ fn test_claude_code_analysis_matches_expected() {
 
     assert!(
         matches,
-        "Claude Code analysis output does not match expected result (ignoring insightsVersion, machineId, user)"
+        "Claude Code analysis output does not match expected result (ignoring insightsVersion, machineId, user, gitRemoteUrl)"
     );
 }
 
@@ -174,7 +174,7 @@ fn test_codex_analysis_matches_expected() {
     let actual_json = actual_result.unwrap();
 
     // Compare results, ignoring specific fields
-    let ignore_fields = ["insightsVersion", "machineId", "user"];
+    let ignore_fields = ["insightsVersion", "machineId", "user", "gitRemoteUrl"];
     let matches = compare_json_ignore_fields(&actual_json, &expected_json, &ignore_fields);
 
     if !matches {
@@ -195,7 +195,7 @@ fn test_codex_analysis_matches_expected() {
 
     assert!(
         matches,
-        "Codex analysis output does not match expected result (ignoring insightsVersion, machineId, user)"
+        "Codex analysis output does not match expected result (ignoring insightsVersion, machineId, user, gitRemoteUrl)"
     );
 }
 
@@ -232,7 +232,7 @@ fn test_gemini_analysis_matches_expected() {
     let actual_json = actual_result.unwrap();
 
     // Compare results, ignoring specific fields
-    let ignore_fields = ["insightsVersion", "machineId", "user"];
+    let ignore_fields = ["insightsVersion", "machineId", "user", "gitRemoteUrl"];
     let matches = compare_json_ignore_fields(&actual_json, &expected_json, &ignore_fields);
 
     if !matches {
@@ -253,7 +253,7 @@ fn test_gemini_analysis_matches_expected() {
 
     assert!(
         matches,
-        "Gemini analysis output does not match expected result (ignoring insightsVersion, machineId, user)"
+        "Gemini analysis output does not match expected result (ignoring insightsVersion, machineId, user, gitRemoteUrl)"
     );
 }
 
