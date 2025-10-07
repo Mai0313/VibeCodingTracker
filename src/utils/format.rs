@@ -20,7 +20,7 @@ pub fn format_number<T: ToString>(n: T) -> String {
     }
 
     // Handle remaining groups of 3
-    for (i, chunk) in s[remainder..].as_bytes().chunks(3).enumerate() {
+    for (i, chunk) in s.as_bytes()[remainder..].chunks(3).enumerate() {
         if i > 0 {
             result.push(',');
         }
