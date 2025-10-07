@@ -1,6 +1,6 @@
 {
   "extensionName": "Codex",
-  "insightsVersion": "0.1.9-10-ge9e8b53-dirty",
+  "insightsVersion": "0.2.7-2-g07863b1-dirty",
   "machineId": "18f309cbbb654be69eff5ff79d2f3fa6",
   "records": [
     {
@@ -15,11 +15,11 @@
           },
           "model_context_window": null,
           "total_token_usage": {
-            "cached_input_tokens": 932608,
-            "input_tokens": 2167953,
-            "output_tokens": 140890,
-            "reasoning_output_tokens": 114432,
-            "total_tokens": 2308843
+            "cached_input_tokens": 136832,
+            "input_tokens": 270530,
+            "output_tokens": 12551,
+            "reasoning_output_tokens": 9536,
+            "total_tokens": 283081
           }
         }
       },

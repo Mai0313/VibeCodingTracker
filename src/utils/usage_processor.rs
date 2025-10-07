@@ -125,12 +125,9 @@ pub fn process_codex_usage(
         return;
     };
 
-    // Process total_token_usage
-    if let Some(total_usage) = info_obj
-        .get("total_token_usage")
-        .and_then(|v| v.as_object())
-    {
-        accumulate_nested_object(existing_obj, "total_token_usage", total_usage);
+    // Process total_token_usage (replace, not accumulate - Codex already accumulates)
+    if let Some(total_usage) = info_obj.get("total_token_usage") {
+        existing_obj.insert("total_token_usage".to_string(), total_usage.clone());
     }
 
     // Process last_token_usage
