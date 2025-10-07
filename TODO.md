@@ -173,12 +173,13 @@ Claude Code 的 Usage:
 ```json
 "usage":{"input_tokens":12,"cache_creation_input_tokens":1541,"cache_read_input_tokens":15247,"cache_creation":{"ephemeral_5m_input_tokens":1541,"ephemeral_1h_input_tokens":0},"output_tokens":2,"service_tier":"standard"}
 ```
+
 需要從 `https://github.com/BerriAI/litellm/raw/refs/heads/main/model_prices_and_context_window.json` 取得以下資訊
 "cache_creation_input_token_cost": 3.75e-06
 "cache_read_input_token_cost": 3e-07
 "input_cost_per_token": 3e-06
 "output_cost_per_token": 1.5e-05
-# 如果 token 超出 200K (請注意 這裡不是總和 而是當次):
+**如果 token 超出 200K (請注意 這裡不是總和 而是當次)**
 "cache_creation_input_token_cost_above_200k_tokens": 7.5e-06
 "cache_read_input_token_cost_above_200k_tokens": 6e-07
 "input_cost_per_token_above_200k_tokens": 6e-06
@@ -189,6 +190,7 @@ Codex 的 Usage:
 ```json
 "payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":58619,"cached_input_tokens":19840,"output_tokens":6589,"reasoning_output_tokens":5824,"total_tokens":65208},"last_token_usage":{"input_tokens":13061,"cached_input_tokens":5248,"output_tokens":1444,"reasoning_output_tokens":1280,"total_tokens":14505},"model_context_window":null}}
 ```
+
 需要從 `https://github.com/BerriAI/litellm/raw/refs/heads/main/model_prices_and_context_window.json` 取得以下資訊
 "cache_read_input_token_cost": 1.25e-07
 "input_cost_per_token": 1.25e-06
@@ -206,11 +208,12 @@ Gemini 的 Usage:
   "total": 9981
 },
 ```
+
 需要從 `https://github.com/BerriAI/litellm/raw/refs/heads/main/model_prices_and_context_window.json` 取得以下資訊
 "input_cost_per_token": 1.25e-06
 "output_cost_per_token": 1e-05
 "cache_read_input_token_cost": 3.125e-07
-# 如果 token 超出 200K (請注意 這裡不是總和 而是當次):
+**如果 token 超出 200K (請注意 這裡不是總和 而是當次)**
 "input_cost_per_token_above_200k_tokens": 2.5e-06
 "output_cost_per_token_above_200k_tokens": 1.5e-05
 
@@ -221,20 +224,22 @@ Gemini 的 Usage:
 
 發佈到npm的時候 改成直接將檔案下載下來一起放到 npm
 我希望可以發佈三種名稱的包到 `https://registry.npmjs.org`
+
 - `@mai0313/vibe-coding-tracker` (新增 scope)
 - `@mai0313/vct` (新增 scope + short name)
 - `vibe-coding-tracker` (已存在)
 
 取得所有安裝包的方式可以透過 `gh release download` 指令來完成 可能會更好一點
 例如
+
 ```bash
 set -euo pipefail
 version="${{ needs.release.outputs.version }}"
 tag="${{ needs.release.outputs.tag }}"
 gh release download "$tag" \
-  --repo "${GITHUB_REPOSITORY}" \
-  --pattern "codex-npm-${version}.tgz" \
-  --dir dist/npm
+    --repo ... \
+    --pattern ... \
+    --dir dist/npm
 ```
 
 但要注意我上傳到 github release 的包名稱是類似下面這種格式
@@ -250,6 +255,7 @@ vibe_coding_tracker-v0.2.2-windows-x64.zip
 
 另外 發布的名稱 與 scope 可以用 `strategy` `matrix` 來完成
 例如
+
 ```
     strategy:
       fail-fast: false
