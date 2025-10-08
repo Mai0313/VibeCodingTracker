@@ -233,7 +233,8 @@ Gemini 的 Usage:
 ## 請參考 `.github/workflows/build_release.yml` 的 `publish-npm`, 幫我新增套件發佈管道
 
 我希望新增 `publish-pypi` 將腳本發佈到 pypi
-基本流程是參考 `publish-npm` 的做法, 將可執行檔案分門別類下載後解壓, 然後上傳到對應的地方
+基本流程是參考 `publish-npm` 的做法, 將可執行檔案分門別類下載後解壓, 然後上傳 `pypi`
+
 `pypi` 的部分我希望可以透過 `uv` 這個套件來完成 這樣做會較為簡單 因為可以透過 `uv publish` 來做
 
 例如
@@ -247,9 +248,9 @@ Gemini 的 Usage:
       uv publish
 ```
 
-但我不確定這種情況應該使用 `uv init --lib` 還是 `uv init --package`
-詳細你可以透過 `uv init --help` 來確認
-
+但我不確定這種情況應該使用 `uv init --lib` 還是 `uv init --package`, 你可以透過 `uv init --help` 來確認
+你也可以參考 cli 裡面的做法, 你可以看到 cli 裡面其實只有做類似判定平台來選擇特定的二進制文件
+我理想中的做法可以參考 `cli` 和 `publish-npm`
 
 ## 請幫我檢查所有代碼 查看一下有沒有地方是需要優化或冗餘代碼
 
