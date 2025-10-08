@@ -110,9 +110,61 @@ jobs:
           compression-level: 6
           overwrite: true
 
+  package:
+    name: Package Crate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Disable SSL Verify
+        run: git config --global http.sslVerify false
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Derive version from tag and update Cargo.toml
+        id: version
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          echo "Version from tag: ${VERSION}"
+          cargo install cargo-edit --locked
+          cargo set-version "${VERSION}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Build crate package (.crate)
+        run: |
+          cargo package --locked --allow-dirty
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          cargo publish --allow-dirty
+
+      - name: Upload .crate artifact
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          path: target/package/*.crate
+          name: crate
+          if-no-files-found: ignore
+          retention-days: 7
+          compression-level: 6
+          overwrite: true
+
   release:
     name: Create GitHub Release
-    needs: build
+    needs:
+      - build
+      - package
     runs-on: ubuntu-latest
 
     steps:
@@ -121,6 +173,11 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+
+      - name: List downloaded artifacts
+        run: |
+          echo "Downloaded artifact contents:"
+          ls -alR dist
 
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v2
