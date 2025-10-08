@@ -564,15 +564,18 @@ The release build uses aggressive optimizations:
 The project uses GitHub Actions for CI/CD:
 
 1. **Tests** (`.github/workflows/test.yml`): Runs on every push and PR
+
    - Executes `cargo test --all` across platforms
    - Validates code correctness
 
 2. **Code Quality** (`.github/workflows/code-quality-check.yml`): Runs on every push and PR
+
    - Executes `cargo fmt --all --check`
    - Executes `cargo clippy --all-targets --all-features`
    - Enforces code style and best practices
 
 3. **Build and Release** (`.github/workflows/build.yml` or similar): Triggered on version tags
+
    - Builds binaries for all platforms (Linux/macOS/Windows, x64/ARM64)
    - Creates compressed archives (`.tar.gz` for Unix, `.zip` for Windows)
    - Publishes to GitHub Releases
