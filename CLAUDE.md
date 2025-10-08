@@ -11,21 +11,40 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Full: `vibe_coding_tracker`
 - Short alias: `vct`
 
+**Installation Methods:**
+
+- **npm** (recommended): `npm install -g vibe-coding-tracker` or `npm install -g @mai0313/vct`
+- **PyPI**: `pip install vibe_coding_tracker` or `uv pip install vibe_coding_tracker`
+- **crates.io**: `cargo install vibe_coding_tracker`
+- **Build from source**: Clone repo and `cargo build --release`
+
 ## Build & Development Commands
 
 ```bash
 # Build (debug mode)
 cargo build
+# or
+make build
 
 # Build release
-cargo build --release
+cargo build --release --locked
 # or
 make release
+
+# Build crate package
+cargo package --locked --allow-dirty
+# or
+make package
 
 # Run tests
 cargo test --all
 # or
 make test
+
+# Run tests with verbose output
+cargo test --all --verbose
+# or
+make test-verbose
 
 # Format and lint
 cargo fmt --all
@@ -39,7 +58,15 @@ make fmt
 ./target/release/vct <command>
 
 # Coverage (requires cargo-llvm-cov)
+cargo llvm-cov --workspace
+# or
 make coverage
+
+# Clean build artifacts and caches
+make clean
+
+# Show all Makefile targets
+make help
 ```
 
 ## CLI Commands
@@ -529,3 +556,44 @@ The release build uses aggressive optimizations:
 - Codegen units: 1
 - Stripped symbols
 - Target binary size: ~3-5 MB
+
+## GitHub Workflows and Release Process
+
+### Automated Workflows
+
+The project uses GitHub Actions for CI/CD:
+
+1. **Tests** (`.github/workflows/test.yml`): Runs on every push and PR
+   - Executes `cargo test --all` across platforms
+   - Validates code correctness
+
+2. **Code Quality** (`.github/workflows/code-quality-check.yml`): Runs on every push and PR
+   - Executes `cargo fmt --all --check`
+   - Executes `cargo clippy --all-targets --all-features`
+   - Enforces code style and best practices
+
+3. **Build and Release** (`.github/workflows/build.yml` or similar): Triggered on version tags
+   - Builds binaries for all platforms (Linux/macOS/Windows, x64/ARM64)
+   - Creates compressed archives (`.tar.gz` for Unix, `.zip` for Windows)
+   - Publishes to GitHub Releases
+   - Asset naming: `vibe_coding_tracker-v{version}-{os}-{arch}[-gnu].{ext}`
+
+### Release Checklist
+
+When preparing a new release:
+
+1. Update version in `Cargo.toml`
+2. Update `CARGO_PKG_VERSION` references if needed
+3. Run tests: `make test` or `cargo test --all`
+4. Run quality checks: `make fmt`
+5. Build release locally: `make release`
+6. Test the release binary with real session files
+7. Create git tag: `git tag -a v0.1.x -m "Release v0.1.x"`
+8. Push tag: `git push origin v0.1.x`
+9. GitHub Actions will automatically build and publish
+
+### Version Tagging Convention
+
+- Format: `v{MAJOR}.{MINOR}.{PATCH}` (e.g., `v0.1.6`)
+- Follows semantic versioning
+- Tags trigger automated release builds
