@@ -228,6 +228,7 @@ Gemini 的 Usage:
 
 我希望有一個 action是 `build` 但透過 `.github/workflows/build_package.yml` 新增一個 `package` 的 job
 最後透過 release 一次上傳到 Release Assets
+完成後刪除 `.github/workflows/build_package.yml`
 
 ## 請參考 `.github/workflows/build_release.yml` 的 `publish-npm`, 幫我新增套件發佈管道
 
