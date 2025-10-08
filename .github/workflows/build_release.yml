@@ -58,7 +58,7 @@ jobs:
 
       - name: Cargo build (release)
         run: |
-          cargo build --target ${{ matrix.target }} --release --locked --bin vibe_coding_tracker
+          cargo build --target ${{ matrix.target }} --release --locked
 
       - name: Stage Artifact
         shell: bash
