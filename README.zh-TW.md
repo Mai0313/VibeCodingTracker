@@ -69,12 +69,11 @@
 
 ### 安裝
 
-**前置條件**:
+選擇最適合您的安裝方式：
 
-- [Rust 工具鏈](https://rustup.rs/) (1.70+) 用於從源碼建置
-- [Node.js](https://nodejs.org/) (v18+) 用於 `npm` 安裝
+#### 方式 1: 從 npm 安裝 (推薦 ✨)
 
-#### 從 `npm` (推薦)
+**最簡單的安裝方式** - 包含針對您平台預編譯的二進位檔案，無需建置步驟！
 
 選擇以下任一套件名稱（三者完全相同）：
 
@@ -89,22 +88,50 @@ npm install -g @mai0313/vct
 npm install -g @mai0313/vibe-coding-tracker
 ```
 
-所有套件都包含針對您平台預編譯的二進位檔案 — 無需建置步驟！
+**前置條件**: [Node.js](https://nodejs.org/) v22 或更高版本
 
-#### 從源碼
+**支援平台**:
+
+- Linux (x64, ARM64)
+- macOS (x64, ARM64)
+- Windows (x64, ARM64)
+
+#### 方式 2: 從 crates.io 安裝
+
+使用 Cargo 從 Rust 官方套件庫安裝：
 
 ```bash
-# 複製和建置
+cargo install vibe_coding_tracker
+```
+
+**前置條件**: [Rust 工具鏈](https://rustup.rs/) 1.70 或更高版本
+
+#### 方式 3: 從原始碼編譯
+
+適合想要自訂建置或貢獻開發的使用者：
+
+```bash
+# 1. 複製儲存庫
 git clone https://github.com/Mai0313/VibeCodingTracker.git
 cd VibeCodingTracker
+
+# 2. 建置 release 版本
 cargo build --release
 
-# 二進位檔案位置
+# 3. 二進位檔案位置
 ./target/release/vibe_coding_tracker
 
-# （可選）建立短別名（請視需求調整路徑）
+# 4. （可選）建立短別名
+# Linux/macOS:
+sudo ln -sf "$(pwd)/target/release/vibe_coding_tracker" /usr/local/bin/vct
+
+# 或安裝到使用者目錄:
+mkdir -p ~/.local/bin
 ln -sf "$(pwd)/target/release/vibe_coding_tracker" ~/.local/bin/vct
+# 確保 ~/.local/bin 在您的 PATH 中
 ```
+
+**前置條件**: [Rust 工具鏈](https://rustup.rs/) 1.70 或更高版本
 
 ### 首次執行
 

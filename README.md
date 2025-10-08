@@ -69,12 +69,11 @@ Automatically detects and processes logs from Claude Code, Codex, and Gemini. No
 
 ### Installation
 
-**Prerequisites**:
+Choose the installation method that works best for you:
 
-- [Rust toolchain](https://rustup.rs/) (1.70+) for building from source
-- [Node.js](https://nodejs.org/) (v18+) for `npm` installation
+#### Method 1: Install from npm (Recommended ✨)
 
-#### From `npm` (Recommended)
+**The easiest way to install** - includes pre-compiled binaries for your platform, no build step required!
 
 Choose any of the following package names (all are identical):
 
@@ -89,22 +88,50 @@ npm install -g @mai0313/vct
 npm install -g @mai0313/vibe-coding-tracker
 ```
 
-All packages include pre-compiled binaries for your platform - no build step required!
+**Prerequisites**: [Node.js](https://nodejs.org/) v22 or higher
 
-#### From Source
+**Supported Platforms**:
+
+- Linux (x64, ARM64)
+- macOS (x64, ARM64)
+- Windows (x64, ARM64)
+
+#### Method 2: Install from crates.io
+
+Install using Cargo from the official Rust package registry:
 
 ```bash
-# Clone and build
+cargo install vibe_coding_tracker
+```
+
+**Prerequisites**: [Rust toolchain](https://rustup.rs/) 1.70 or higher
+
+#### Method 3: Build from Source
+
+For users who want to customize the build or contribute to development:
+
+```bash
+# 1. Clone the repository
 git clone https://github.com/Mai0313/VibeCodingTracker.git
 cd VibeCodingTracker
+
+# 2. Build release version
 cargo build --release
 
-# Binary location
+# 3. Binary location
 ./target/release/vibe_coding_tracker
 
-# Optional: create a short alias (adjust the paths as needed)
+# 4. Optional: create a short alias
+# Linux/macOS:
+sudo ln -sf "$(pwd)/target/release/vibe_coding_tracker" /usr/local/bin/vct
+
+# Or install to user directory:
+mkdir -p ~/.local/bin
 ln -sf "$(pwd)/target/release/vibe_coding_tracker" ~/.local/bin/vct
+# Make sure ~/.local/bin is in your PATH
 ```
+
+**Prerequisites**: [Rust toolchain](https://rustup.rs/) 1.70 or higher
 
 ### First Run
 
