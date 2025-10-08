@@ -51,6 +51,11 @@ pub fn get_current_user() -> String {
 // Cache for machine ID (initialized once)
 static MACHINE_ID_CACHE: OnceLock<String> = OnceLock::new();
 
+/// Get home directory with error handling
+fn get_home_dir() -> Result<PathBuf> {
+    home::home_dir().ok_or_else(|| anyhow::anyhow!("Unable to resolve user home directory"))
+}
+
 /// Get machine ID (cached after first call)
 pub fn get_machine_id() -> String {
     MACHINE_ID_CACHE
@@ -74,8 +79,7 @@ pub fn get_machine_id() -> String {
 
 /// Get cache directory path (creates it if it doesn't exist)
 pub fn get_cache_dir() -> Result<PathBuf> {
-    let home_dir =
-        home::home_dir().ok_or_else(|| anyhow::anyhow!("Unable to resolve user home directory"))?;
+    let home_dir = get_home_dir()?;
     let cache_dir = home_dir.join(".vibe-coding-tracker");
 
     // Create directory if it doesn't exist
@@ -84,4 +88,43 @@ pub fn get_cache_dir() -> Result<PathBuf> {
     }
 
     Ok(cache_dir)
+}
+
+/// Get pricing cache file path for a specific date
+/// Returns: ~/.vibe-coding-tracker/model_pricing_YYYY-MM-DD.json
+pub fn get_pricing_cache_path(date: &str) -> Result<PathBuf> {
+    let cache_dir = get_cache_dir()?;
+    Ok(cache_dir.join(format!("model_pricing_{}.json", date)))
+}
+
+/// Find pricing cache file for a specific date
+/// Returns Some(path) if the cache file exists, None otherwise
+pub fn find_pricing_cache_for_date(date: &str) -> Option<PathBuf> {
+    let cache_path = get_pricing_cache_path(date).ok()?;
+    if cache_path.exists() {
+        Some(cache_path)
+    } else {
+        None
+    }
+}
+
+/// List all pricing cache files in the cache directory
+/// Returns vector of (filename, PathBuf) tuples
+pub fn list_pricing_cache_files() -> Result<Vec<(String, PathBuf)>> {
+    let cache_dir = get_cache_dir()?;
+    let mut cache_files = Vec::new();
+
+    if let Ok(entries) = fs::read_dir(&cache_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                // Match pattern: model_pricing_YYYY-MM-DD.json
+                if filename.starts_with("model_pricing_") && filename.ends_with(".json") {
+                    cache_files.push((filename.to_string(), path));
+                }
+            }
+        }
+    }
+
+    Ok(cache_files)
 }

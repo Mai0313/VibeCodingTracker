@@ -1,9 +1,10 @@
-use crate::utils::{get_cache_dir, get_current_date};
+use crate::utils::{
+    find_pricing_cache_for_date, get_current_date, get_pricing_cache_path, list_pricing_cache_files,
+};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
 use strsim::jaro_winkler;
 
 const LITELLM_PRICING_URL: &str =
@@ -171,61 +172,28 @@ impl Default for ModelPricing {
     }
 }
 
-/// Get cache file path for today
-fn get_today_cache_path() -> Result<PathBuf> {
-    let cache_dir = get_cache_dir()?;
-    let date_str = get_current_date();
-    Ok(cache_dir.join(format!("model_pricing_{}.json", date_str)))
-}
-
-/// Find existing cache file for today
-fn find_today_cache() -> Option<PathBuf> {
-    let Ok(cache_dir) = get_cache_dir() else {
-        return None;
-    };
-
-    let today = get_current_date();
-    let today_cache = cache_dir.join(format!("model_pricing_{}.json", today));
-
-    if today_cache.exists() {
-        Some(today_cache)
-    } else {
-        None
-    }
-}
-
 /// Clean up old cache files (keep only today's)
 fn cleanup_old_cache() {
-    let Ok(cache_dir) = get_cache_dir() else {
-        return;
-    };
-
-    let Ok(entries) = fs::read_dir(&cache_dir) else {
+    let Ok(cache_files) = list_pricing_cache_files() else {
         return;
     };
 
     let today = get_current_date();
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-            // Match pattern: model_pricing_YYYY-MM-DD.json
-            if filename.starts_with("model_pricing_")
-                && filename.ends_with(".json")
-                && !filename.contains(&today)
-            {
-                // Delete old cache file
-                let _ = fs::remove_file(&path);
-                log::debug!("Removed old cache file: {:?}", path);
-            }
+    for (filename, path) in cache_files {
+        // Delete if not today's cache
+        if !filename.contains(&today) {
+            let _ = fs::remove_file(&path);
+            log::debug!("Removed old cache file: {:?}", path);
         }
     }
 }
 
 /// Load pricing from cache
 fn load_from_cache() -> Result<HashMap<String, ModelPricing>> {
-    let cache_path =
-        find_today_cache().ok_or_else(|| anyhow::anyhow!("No cache file found for today"))?;
+    let today = get_current_date();
+    let cache_path = find_pricing_cache_for_date(&today)
+        .ok_or_else(|| anyhow::anyhow!("No cache file found for today"))?;
 
     let content = fs::read_to_string(&cache_path).context("Failed to read cached pricing file")?;
     let pricing: HashMap<String, ModelPricing> =
@@ -235,7 +203,8 @@ fn load_from_cache() -> Result<HashMap<String, ModelPricing>> {
 
 /// Save pricing to cache
 fn save_to_cache(pricing: &HashMap<String, ModelPricing>) -> Result<()> {
-    let cache_path = get_today_cache_path()?;
+    let today = get_current_date();
+    let cache_path = get_pricing_cache_path(&today)?;
 
     // Save pricing data with today's date in filename
     let pricing_json =
@@ -280,8 +249,10 @@ fn normalize_pricing(mut pricing: HashMap<String, ModelPricing>) -> HashMap<Stri
 /// Fetch model pricing from LiteLLM repository (with caching)
 /// Returns an optimized ModelPricingMap with precomputed indices
 pub fn fetch_model_pricing() -> Result<ModelPricingMap> {
+    let today = get_current_date();
+
     // Check if today's cache exists
-    if find_today_cache().is_some() {
+    if find_pricing_cache_for_date(&today).is_some() {
         // Load from cache
         match load_from_cache() {
             Ok(pricing) => {
