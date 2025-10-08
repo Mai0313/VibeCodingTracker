@@ -224,11 +224,11 @@ jobs:
       - name: Download and extract build artifacts
         uses: actions/download-artifact@v4
         with:
-          path: cli/binaries/temp
+          path: cli/nodejs/binaries/temp
           merge-multiple: true
 
       - name: Extract binaries from archives
-        working-directory: cli/binaries/temp
+        working-directory: cli/nodejs/binaries/temp
         run: |
           for archive in *; do
             platform=$(echo "$archive" | sed -E 's/^vibe_coding_tracker-v[0-9]+\.[0-9]+\.[0-9]+-//')
@@ -246,11 +246,11 @@ jobs:
 
       - name: Cleanup and verify
         run: |
-          rm -rf cli/binaries/temp
-          echo "Extracted binaries:" && ls -lhR cli/binaries/
+          rm -rf cli/nodejs/binaries/temp
+          echo "Extracted binaries:" && ls -lhR cli/nodejs/binaries/
 
       - name: Update package.json version and name
-        working-directory: cli
+        working-directory: cli/nodejs
         run: |
           VERSION="${{ steps.version.outputs.VERSION }}"
           PACKAGE_NAME="${{ matrix.name }}"
@@ -272,17 +272,17 @@ jobs:
 
       - name: Copy README for npm
         run: |
-          cp README.md cli/README.md
+          cp README.md cli/nodejs/README.md
 
       - name: Publish to npm with provenance
-        working-directory: cli
+        working-directory: cli/nodejs
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN }}
         run: |
           npm publish --provenance --access public
 
       - name: Verify publication
-        working-directory: cli
+        working-directory: cli/nodejs
         run: |
           VERSION="${{ steps.version.outputs.VERSION }}"
           PACKAGE_NAME="${{ matrix.name }}"
@@ -339,11 +339,11 @@ jobs:
       - name: Download and extract build artifacts
         uses: actions/download-artifact@v4
         with:
-          path: python_cli/src/vibe_coding_tracker/binaries/temp
+          path: cli/python/src/vibe_coding_tracker/binaries/temp
           merge-multiple: true
 
       - name: Extract binaries from archives
-        working-directory: python_cli/src/vibe_coding_tracker/binaries/temp
+        working-directory: cli/python/src/vibe_coding_tracker/binaries/temp
         run: |
           for archive in *; do
             platform=$(echo "$archive" | sed -E 's/^vibe_coding_tracker-v[0-9]+\.[0-9]+\.[0-9]+-//')
@@ -361,32 +361,32 @@ jobs:
 
       - name: Cleanup and verify
         run: |
-          rm -rf python_cli/src/vibe_coding_tracker/binaries/temp
-          echo "Extracted binaries:" && ls -lhR python_cli/src/vibe_coding_tracker/binaries/
+          rm -rf cli/python/src/vibe_coding_tracker/binaries/temp
+          echo "Extracted binaries:" && ls -lhR cli/python/src/vibe_coding_tracker/binaries/
 
       - name: Update pyproject.toml version
-        working-directory: python_cli
+        working-directory: cli/python
         run: |
           uv version ${{ steps.version.outputs.VERSION }} --frozen
 
       - name: Copy README for PyPI
         run: |
-          cp README.md python_cli/README.md
+          cp README.md cli/python/README.md
 
       - name: Build package
-        working-directory: python_cli
+        working-directory: cli/python
         run: |
           uv build
 
       - name: Publish to PyPI
-        working-directory: python_cli
+        working-directory: cli/python
         env:
           UV_PUBLISH_TOKEN: ${{ secrets.UV_PUBLISH_TOKEN }}
         run: |
           uv publish
 
       - name: Verify publication
-        working-directory: python_cli
+        working-directory: cli/python
         run: |
           VERSION="${{ steps.version.outputs.VERSION }}"
           PACKAGE_NAME="vibe-coding-tracker"
