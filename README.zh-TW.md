@@ -6,6 +6,8 @@
 [![Crates.io Downloads](https://img.shields.io/crates/d/vibe_coding_tracker?logo=rust&style=flat-square)](https://crates.io/crates/vibe_coding_tracker)
 [![npm version](https://img.shields.io/npm/v/vibe-coding-tracker?logo=npm&style=flat-square&color=CB3837)](https://www.npmjs.com/package/vibe-coding-tracker)
 [![npm downloads](https://img.shields.io/npm/dt/vibe-coding-tracker?logo=npm&style=flat-square)](https://www.npmjs.com/package/vibe-coding-tracker)
+[![PyPI version](https://img.shields.io/pypi/v/vibe-coding-tracker?logo=python&style=flat-square&color=3776AB)](https://pypi.org/project/vibe-coding-tracker/)
+[![PyPI downloads](https://img.shields.io/pypi/dm/vibe-coding-tracker?logo=python&style=flat-square)](https://pypi.org/project/vibe-coding-tracker/)
 [![rust](https://img.shields.io/badge/Rust-stable-orange?logo=rust&logoColor=white&style=flat-square)](https://www.rust-lang.org/)
 [![tests](https://img.shields.io/github/actions/workflow/status/Mai0313/VibeCodingTracker/test.yml?label=tests&logo=github&style=flat-square)](https://github.com/Mai0313/VibeCodingTracker/actions/workflows/test.yml)
 [![code-quality](https://img.shields.io/github/actions/workflow/status/Mai0313/VibeCodingTracker/code-quality-check.yml?label=code-quality&logo=github&style=flat-square)](https://github.com/Mai0313/VibeCodingTracker/actions/workflows/code-quality-check.yml)
@@ -96,7 +98,27 @@ npm install -g @mai0313/vibe-coding-tracker
 - macOS (x64, ARM64)
 - Windows (x64, ARM64)
 
-#### 方式 2: 從 crates.io 安裝
+#### 方式 2: 從 PyPI 安裝
+
+**適合 Python 使用者** - 包含針對您平台預編譯的二進位檔案，無需建置步驟！
+
+```bash
+# 使用 pip 安裝
+pip install vibe-coding-tracker
+
+# 使用 uv 安裝（推薦，安裝速度更快）
+uv pip install vibe-coding-tracker
+```
+
+**前置條件**: Python 3.8 或更高版本
+
+**支援平台**:
+
+- Linux (x64, ARM64)
+- macOS (x64, ARM64)
+- Windows (x64, ARM64)
+
+#### 方式 3: 從 crates.io 安裝
 
 使用 Cargo 從 Rust 官方套件庫安裝：
 
@@ -106,7 +128,7 @@ cargo install vibe_coding_tracker
 
 **前置條件**: [Rust 工具鏈](https://rustup.rs/) 1.70 或更高版本
 
-#### 方式 3: 從原始碼編譯
+#### 方式 4: 從原始碼編譯
 
 適合想要自訂建置或貢獻開發的使用者：
 

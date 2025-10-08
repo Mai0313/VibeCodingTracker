@@ -6,6 +6,8 @@
 [![Crates.io Downloads](https://img.shields.io/crates/d/vibe_coding_tracker?logo=rust&style=flat-square)](https://crates.io/crates/vibe_coding_tracker)
 [![npm version](https://img.shields.io/npm/v/vibe-coding-tracker?logo=npm&style=flat-square&color=CB3837)](https://www.npmjs.com/package/vibe-coding-tracker)
 [![npm downloads](https://img.shields.io/npm/dt/vibe-coding-tracker?logo=npm&style=flat-square)](https://www.npmjs.com/package/vibe-coding-tracker)
+[![PyPI version](https://img.shields.io/pypi/v/vibe-coding-tracker?logo=python&style=flat-square&color=3776AB)](https://pypi.org/project/vibe-coding-tracker/)
+[![PyPI downloads](https://img.shields.io/pypi/dm/vibe-coding-tracker?logo=python&style=flat-square)](https://pypi.org/project/vibe-coding-tracker/)
 [![rust](https://img.shields.io/badge/Rust-stable-orange?logo=rust&logoColor=white&style=flat-square)](https://www.rust-lang.org/)
 [![tests](https://img.shields.io/github/actions/workflow/status/Mai0313/VibeCodingTracker/test.yml?label=tests&logo=github&style=flat-square)](https://github.com/Mai0313/VibeCodingTracker/actions/workflows/test.yml)
 [![code-quality](https://img.shields.io/github/actions/workflow/status/Mai0313/VibeCodingTracker/code-quality-check.yml?label=code-quality&logo=github&style=flat-square)](https://github.com/Mai0313/VibeCodingTracker/actions/workflows/code-quality-check.yml)
@@ -96,7 +98,27 @@ npm install -g @mai0313/vibe-coding-tracker
 - macOS (x64, ARM64)
 - Windows (x64, ARM64)
 
-#### 方式 2: 从 crates.io 安装
+#### 方式 2: 从 PyPI 安装
+
+**适合 Python 用户** - 包含针对您平台预编译的二进制文件，无需构建步骤！
+
+```bash
+# 使用 pip 安装
+pip install vibe-coding-tracker
+
+# 使用 uv 安装（推荐，安装速度更快）
+uv pip install vibe-coding-tracker
+```
+
+**前提条件**: Python 3.8 或更高版本
+
+**支持平台**:
+
+- Linux (x64, ARM64)
+- macOS (x64, ARM64)
+- Windows (x64, ARM64)
+
+#### 方式 3: 从 crates.io 安装
 
 使用 Cargo 从 Rust 官方包注册表安装：
 
@@ -106,7 +128,7 @@ cargo install vibe_coding_tracker
 
 **前提条件**: [Rust 工具链](https://rustup.rs/) 1.70 或更高版本
 
-#### 方式 3: 从源码编译
+#### 方式 4: 从源码编译
 
 适合希望自定义构建或贡献开发的用户：
 

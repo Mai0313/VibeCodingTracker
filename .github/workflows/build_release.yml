@@ -94,10 +94,8 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           bin="vibe_coding_tracker"
           archive="vibe_coding_tracker-v${version}-${{ matrix.friendly_id }}.tar.gz"
-          # Try to include .exe if present, otherwise fall back to unix name
           tar -C "$dest" -czf "$dest/${archive}" "${bin}" "${bin}.exe" 2>/dev/null || \
           tar -C "$dest" -czf "$dest/${archive}" "${bin}"
-          # Remove raw binaries after archiving to avoid accidental upload
           rm -f "$dest/${bin}" "$dest/${bin}.exe" || true
 
       - name: Upload Artifacts
@@ -194,7 +192,6 @@ jobs:
       id-token: write
 
     strategy:
-      fail-fast: false
       matrix:
         include:
           - name: vibe-coding-tracker
@@ -216,10 +213,6 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
-
-      - name: Update npm
-        run: |
-          npm update -g
 
       - name: Extract version from tag
         id: version
@@ -277,11 +270,9 @@ jobs:
           cat package.json | jq --arg name "${FULL_NAME}" '.name = $name' > package.json.tmp
           mv package.json.tmp package.json
 
-          echo "Updated package.json:"
-          cat package.json
-
       - name: Copy README for npm
-        run: cp README.md cli/README.md
+        run: |
+          cp README.md cli/README.md
 
       - name: Publish to npm with provenance
         working-directory: cli
@@ -315,4 +306,101 @@ jobs:
           else
             echo "Warning: Could not immediately verify publication"
             echo "Please check: https://www.npmjs.com/package/${FULL_NAME}"
+          fi
+
+  publish-pypi:
+    name: Publish to pypi
+    needs: build
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Publishing version: ${VERSION}"
+
+      - name: Download and extract build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: python_cli/src/vibe_coding_tracker/binaries/temp
+          merge-multiple: true
+
+      - name: Extract binaries from archives
+        working-directory: python_cli/src/vibe_coding_tracker/binaries/temp
+        run: |
+          for archive in *; do
+            platform=$(echo "$archive" | sed -E 's/^vibe_coding_tracker-v[0-9]+\.[0-9]+\.[0-9]+-//')
+            platform="${platform%.tar.gz}"
+            platform="${platform%.zip}"
+
+            echo "Extracting $archive to $platform/"
+            mkdir -p "../$platform"
+
+            case "$archive" in
+              *.tar.gz) tar -xzf "$archive" -C "../$platform" ;;
+              *.zip)    unzip -q "$archive" -d "../$platform" ;;
+            esac
+          done
+
+      - name: Cleanup and verify
+        run: |
+          rm -rf python_cli/src/vibe_coding_tracker/binaries/temp
+          echo "Extracted binaries:" && ls -lhR python_cli/src/vibe_coding_tracker/binaries/
+
+      - name: Update pyproject.toml version
+        working-directory: python_cli
+        run: |
+          uv version ${{ steps.version.outputs.VERSION }} --frozen
+
+      - name: Copy README for PyPI
+        run: |
+          cp README.md python_cli/README.md
+
+      - name: Build package
+        working-directory: python_cli
+        run: |
+          uv build
+
+      - name: Publish to PyPI
+        working-directory: python_cli
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.UV_PUBLISH_TOKEN }}
+        run: |
+          uv publish
+
+      - name: Verify publication
+        working-directory: python_cli
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          PACKAGE_NAME="vibe-coding-tracker"
+
+          echo "Waiting for PyPI registry to update..."
+          sleep 15
+
+          # Check if version is available
+          PUBLISHED_VERSION=$(pip index versions ${PACKAGE_NAME} 2>/dev/null | grep "Available versions:" | grep -o "${VERSION}" || echo "")
+
+          if [ "${PUBLISHED_VERSION}" = "${VERSION}" ]; then
+            echo "✓ Successfully published ${PACKAGE_NAME}==${VERSION}"
+            echo "Install with: pip install ${PACKAGE_NAME}"
+          else
+            echo "Warning: Could not immediately verify publication"
+            echo "Please check: https://pypi.org/project/${PACKAGE_NAME}/"
           fi
