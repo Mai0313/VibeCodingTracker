@@ -129,7 +129,7 @@ jobs:
           files: |
             dist/**/*
 
-  npm-publish:
+  publish-npm:
     name: Publish to npm - ${{ matrix.scope && format('{0}/', matrix.scope) || '' }}${{ matrix.name }}
     needs: build
     runs-on: ubuntu-latest
