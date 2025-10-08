@@ -224,48 +224,8 @@ Gemini 的 Usage:
 
 我希望你幫我重新設計一下 TUI, 可以繼續使用 `ratatui`, 只是我希望有更多風格
 
-## 幫我把 `.github/workflows/build_package.yml` 合併進去 `.github/workflows/build_release.yml`
-
-我希望有一個 action是 `build` 但透過 `.github/workflows/build_package.yml` 新增一個 `package` 的 job
-最後透過 release 一次上傳到 Release Assets
-完成後刪除 `.github/workflows/build_package.yml`
-
-## 請參考 `.github/workflows/build_release.yml` 的 `publish-npm`, 幫我新增套件發佈管道
-
-我希望新增 `publish-pypi` 將腳本發佈到 pypi
-基本流程是參考 `publish-npm` 的做法, 將可執行檔案分門別類下載後解壓, 然後上傳 `pypi`
-
-`pypi` 的部分我希望可以透過 `uv` 這個套件來完成 這樣做會較為簡單 因為可以透過 `uv publish` 來做
-
-例如
-
-```yaml
-  - name: Publish Package
-    continue-on-error: true
-    env:
-      UV_PUBLISH_TOKEN: ${{ secrets.UV_PUBLISH_TOKEN }}
-    run: |
-      uv publish
-```
-
-但我不確定這種情況應該使用 `uv init --lib` 還是 `uv init --package`, 你可以透過 `uv init --help` 來確認
-你也可以參考 cli 裡面的做法, 你可以看到 cli 裡面其實只有做類似判定平台來選擇特定的二進制文件
-我理想中的做法可以參考 `cli` 和 `publish-npm`
-
 ## 請幫我檢查所有代碼 查看一下有沒有地方是需要優化或冗餘代碼
 
 這個專案經過了多輪跌代 我擔心會有一些影響效能的邏輯出現 或 重複邏輯出現 或 為了向後兼容產生的代碼 這些都請你幫我重構
 你不需要考慮像後兼容, 可以大幅度改動 只要功能能正常運作即可
 請使用繁體中文
-
-## 重新規劃一下 `./cli` 資料夾
-
-目前我有發佈我的工具到 `npm` 和 `pypi`, 目前散落在 `./cli` 和 `./python_cli` 資料夾, 最後透過 `./.github/workflows/build_release.yml` 來建置發佈
-
-我希望將資料夾結構改成
-./cli/pypi
-./cli/npmjs
-
-然後對應更新 `./.github/workflows/build_release.yml`
-
-你覺得這樣做會比較好嗎?
