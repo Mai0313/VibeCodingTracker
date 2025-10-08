@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use sysinfo::System;
 
 const ANALYSIS_REFRESH_SECS: u64 = 10;
+const MAX_TRACKED_ANALYSIS_ROWS: usize = 100; // Limit memory for update tracking
 
 // Type alias for analysis data snapshot: (edit_lines, read_lines, write_lines, bash_count, edit_count, read_count, todo_write_count, write_count)
 type AnalysisDataSnapshot = (usize, usize, usize, usize, usize, usize, usize, usize);
@@ -129,6 +130,19 @@ pub fn display_analysis_interactive(data: &[AggregatedAnalysisRow]) -> anyhow::R
                 last_update_times.insert(row_key.clone(), Instant::now());
             }
             previous_data.insert(row_key, current_tuple);
+
+            // Memory optimization: Limit tracked rows to prevent unbounded growth
+            if previous_data.len() > MAX_TRACKED_ANALYSIS_ROWS {
+                let keys_to_remove: Vec<_> = previous_data
+                    .keys()
+                    .take(previous_data.len() - MAX_TRACKED_ANALYSIS_ROWS)
+                    .cloned()
+                    .collect();
+                for key in keys_to_remove {
+                    previous_data.remove(&key);
+                    last_update_times.remove(&key);
+                }
+            }
 
             totals.edit_lines += analysis_row.edit_lines;
             totals.read_lines += analysis_row.read_lines;

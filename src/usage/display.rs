@@ -1,4 +1,4 @@
-use crate::models::DateUsageResult;
+use crate::models::{DateUsageResult, Provider};
 use crate::pricing::{ModelPricingMap, ModelPricingResult, calculate_cost, fetch_model_pricing};
 use crate::utils::{extract_token_counts, format_number, get_current_date};
 use comfy_table::{Attribute, Cell, CellAlignment, Color, Table, presets::UTF8_FULL};
@@ -17,13 +17,15 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Row as RatatuiRow, Table as RatatuiTable},
 };
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::time::{Duration, Instant};
 use sysinfo::System;
 
 const USAGE_REFRESH_SECS: u64 = 5;
 const PRICING_REFRESH_SECS: u64 = 300;
+const MAX_TRACKED_ROWS: usize = 100; // Limit memory for update tracking
 
 #[derive(Default)]
 struct UsageRow {
@@ -118,21 +120,21 @@ fn build_usage_summary(
     }
 
     let mut summary = UsageSummary::default();
-    let mut dates: Vec<&String> = usage_data.keys().collect();
-    dates.sort();
 
-    for date in dates {
-        if let Some(date_usage) = usage_data.get(date) {
-            let mut models: Vec<&String> = date_usage.keys().collect();
-            models.sort();
+    // Pre-allocate rows vector with estimated capacity
+    let estimated_size: usize = usage_data.values().map(|m| m.len()).sum();
+    summary.rows.reserve(estimated_size);
 
-            for model in models {
-                if let Some(usage) = date_usage.get(model) {
-                    let row = extract_usage_row(date, model, usage, pricing_map, pricing_cache);
-                    summary.totals.accumulate(&row);
-                    summary.rows.push(row);
-                }
-            }
+    // Sort dates using BTreeMap iteration (already sorted)
+    for (date, date_usage) in usage_data.iter() {
+        // Collect and sort models
+        let mut models: Vec<_> = date_usage.iter().collect();
+        models.sort_by_key(|(model, _)| *model);
+
+        for (model, usage) in models {
+            let row = extract_usage_row(date, model, usage, pricing_map, pricing_cache);
+            summary.totals.accumulate(&row);
+            summary.rows.push(row);
         }
     }
 
@@ -237,12 +239,28 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
         let daily_averages = &summary.daily_averages;
         let provider_rows = build_provider_average_rows(daily_averages);
 
+        // Memory optimization: Limit tracked rows to prevent unbounded growth
         let current_row_keys: HashSet<String> = rows_data
             .iter()
             .map(|row| format!("{}:{}", row.date, row.model))
             .collect();
+
+        // Clean up old entries
         previous_data.retain(|key, _| current_row_keys.contains(key));
         last_update_times.retain(|key, _| current_row_keys.contains(key));
+
+        // If we exceed MAX_TRACKED_ROWS, keep only the most recent entries
+        if previous_data.len() > MAX_TRACKED_ROWS {
+            let keys_to_remove: Vec<_> = previous_data
+                .keys()
+                .take(previous_data.len() - MAX_TRACKED_ROWS)
+                .cloned()
+                .collect();
+            for key in keys_to_remove {
+                previous_data.remove(&key);
+                last_update_times.remove(&key);
+            }
+        }
 
         for row in rows_data {
             let row_key = format!("{}:{}", row.date, row.model);
@@ -717,30 +735,15 @@ pub fn display_usage_table(usage_data: &DateUsageResult) {
     println!();
 }
 
-/// Detect provider from model name
-fn detect_provider(model: &str) -> &'static str {
-    let model_lower = model.to_lowercase();
-    if model_lower.starts_with("claude") {
-        "claude"
-    } else if model_lower.starts_with("gpt")
-        || model_lower.starts_with("o1")
-        || model_lower.starts_with("o3")
-    {
-        "codex"
-    } else if model_lower.starts_with("gemini") {
-        "gemini"
-    } else {
-        "unknown"
-    }
-}
+// Removed: Now using Provider enum from models module
 
 fn build_provider_average_rows<'a>(averages: &'a DailyAverages) -> Vec<ProviderAverage<'a>> {
-    let mut rows = Vec::new();
+    let mut rows = Vec::with_capacity(4); // Pre-allocate: max 3 providers + overall
 
     if averages.claude.days_count > 0 {
         rows.push(ProviderAverage {
-            label: "Claude Code",
-            icon: "🤖",
+            label: Provider::ClaudeCode.display_name(),
+            icon: Provider::ClaudeCode.icon(),
             tui_color: RatatuiColor::Cyan,
             table_color: Color::Cyan,
             stats: &averages.claude,
@@ -750,8 +753,8 @@ fn build_provider_average_rows<'a>(averages: &'a DailyAverages) -> Vec<ProviderA
 
     if averages.codex.days_count > 0 {
         rows.push(ProviderAverage {
-            label: "OpenAI Codex",
-            icon: "🧠",
+            label: Provider::Codex.display_name(),
+            icon: Provider::Codex.icon(),
             tui_color: RatatuiColor::Yellow,
             table_color: Color::Yellow,
             stats: &averages.codex,
@@ -761,8 +764,8 @@ fn build_provider_average_rows<'a>(averages: &'a DailyAverages) -> Vec<ProviderA
 
     if averages.gemini.days_count > 0 {
         rows.push(ProviderAverage {
-            label: "Gemini",
-            icon: "✨",
+            label: Provider::Gemini.display_name(),
+            icon: Provider::Gemini.icon(),
             tui_color: RatatuiColor::LightBlue,
             table_color: Color::Blue,
             stats: &averages.gemini,
@@ -796,61 +799,61 @@ fn format_tokens_per_day(value: f64) -> String {
     }
 }
 
-/// Calculate daily averages grouped by provider
+/// Calculate daily averages grouped by provider (optimized with BTreeMap)
 fn calculate_daily_averages(rows: &[UsageRow]) -> DailyAverages {
     let mut averages = DailyAverages::default();
-    let mut date_provider_map: HashMap<String, HashSet<&str>> = HashMap::new();
+
+    // Use BTreeMap for date storage (already sorted, no String cloning for keys)
+    let mut date_provider_map: BTreeMap<&str, HashSet<Provider>> = BTreeMap::new();
 
     // Group by date and provider to count unique days per provider
     for row in rows {
-        let provider = detect_provider(&row.model);
+        let provider = Provider::from_model_name(&row.model);
         date_provider_map
-            .entry(row.date.clone())
-            .or_default()
+            .entry(&row.date)
+            .or_insert_with(|| HashSet::with_capacity(3)) // Max 3 providers
             .insert(provider);
     }
 
-    // Count days per provider
-    let mut claude_days = HashSet::new();
-    let mut codex_days = HashSet::new();
-    let mut gemini_days = HashSet::new();
-    let mut overall_days = HashSet::new();
+    // Count days per provider using BTreeMap (avoids HashSet cloning)
+    let mut claude_days = 0;
+    let mut codex_days = 0;
+    let mut gemini_days = 0;
 
-    for (date, providers) in &date_provider_map {
-        if providers.contains("claude") {
-            claude_days.insert(date.clone());
+    for providers in date_provider_map.values() {
+        if providers.contains(&Provider::ClaudeCode) {
+            claude_days += 1;
         }
-        if providers.contains("codex") {
-            codex_days.insert(date.clone());
+        if providers.contains(&Provider::Codex) {
+            codex_days += 1;
         }
-        if providers.contains("gemini") {
-            gemini_days.insert(date.clone());
+        if providers.contains(&Provider::Gemini) {
+            gemini_days += 1;
         }
-        overall_days.insert(date.clone());
     }
 
-    averages.claude.days_count = claude_days.len();
-    averages.codex.days_count = codex_days.len();
-    averages.gemini.days_count = gemini_days.len();
-    averages.overall.days_count = overall_days.len();
+    averages.claude.days_count = claude_days;
+    averages.codex.days_count = codex_days;
+    averages.gemini.days_count = gemini_days;
+    averages.overall.days_count = date_provider_map.len();
 
     // Accumulate totals
     for row in rows {
-        let provider = detect_provider(&row.model);
+        let provider = Provider::from_model_name(&row.model);
         match provider {
-            "claude" => {
+            Provider::ClaudeCode => {
                 averages.claude.total_tokens += row.total;
                 averages.claude.total_cost += row.cost;
             }
-            "codex" => {
+            Provider::Codex => {
                 averages.codex.total_tokens += row.total;
                 averages.codex.total_cost += row.cost;
             }
-            "gemini" => {
+            Provider::Gemini => {
                 averages.gemini.total_tokens += row.total;
                 averages.gemini.total_cost += row.cost;
             }
-            _ => {}
+            Provider::Unknown => {}
         }
         averages.overall.total_tokens += row.total;
         averages.overall.total_cost += row.cost;
@@ -869,37 +872,37 @@ fn extract_usage_row(
     // Extract token counts using utility function
     let counts = extract_token_counts(usage);
 
-    let mut row = UsageRow {
+    // Calculate cost with fuzzy matching (using entry API to avoid double lookup)
+    let pricing_result = pricing_cache
+        .entry(model.to_string())
+        .or_insert_with(|| pricing_map.get(model));
+
+    let cost = calculate_cost(
+        counts.input_tokens,
+        counts.output_tokens,
+        counts.cache_read,
+        counts.cache_creation,
+        &pricing_result.pricing,
+    );
+
+    // Use Cow<str> for display_model to avoid allocation when no fuzzy match
+    let display_model = if let Some(matched) = &pricing_result.matched_model {
+        Cow::Owned(format!("{} ({})", model, matched))
+    } else {
+        Cow::Borrowed(model)
+    };
+
+    UsageRow {
         date: date.to_string(),
         model: model.to_string(),
+        display_model: display_model.into_owned(),
         input_tokens: counts.input_tokens,
         output_tokens: counts.output_tokens,
         cache_read: counts.cache_read,
         cache_creation: counts.cache_creation,
         total: counts.total,
-        ..Default::default()
-    };
-
-    // Calculate cost with fuzzy matching
-    let pricing_result = pricing_cache
-        .entry(model.to_string())
-        .or_insert_with(|| pricing_map.get(model));
-    row.cost = calculate_cost(
-        row.input_tokens,
-        row.output_tokens,
-        row.cache_read,
-        row.cache_creation,
-        &pricing_result.pricing,
-    );
-
-    // Set display model name with matched model in parentheses if fuzzy matched
-    row.display_model = if let Some(matched) = &pricing_result.matched_model {
-        format!("{} ({})", model, matched)
-    } else {
-        model.to_string()
-    };
-
-    row
+        cost,
+    }
 }
 
 /// Display usage data as plain text

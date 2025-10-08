@@ -25,7 +25,8 @@ pub struct AggregatedAnalysisRow {
 /// Analyze all JSONL/JSON files from all directories and aggregate by date and model
 pub fn analyze_all_sessions() -> Result<Vec<AggregatedAnalysisRow>> {
     let paths = crate::utils::resolve_paths()?;
-    let mut aggregated: HashMap<String, AggregatedAnalysisRow> = HashMap::new();
+    // Pre-allocate HashMap with estimated capacity (typical: ~100 date-model combinations)
+    let mut aggregated: HashMap<String, AggregatedAnalysisRow> = HashMap::with_capacity(100);
 
     if paths.claude_session_dir.exists() {
         process_analysis_directory(&paths.claude_session_dir, &mut aggregated, is_json_file)?;
@@ -44,14 +45,9 @@ pub fn analyze_all_sessions() -> Result<Vec<AggregatedAnalysisRow>> {
     }
 
     let mut results: Vec<AggregatedAnalysisRow> = aggregated.into_values().collect();
-    results.sort_by(|a, b| {
-        let date_cmp = a.date.cmp(&b.date);
-        if date_cmp == std::cmp::Ordering::Equal {
-            a.model.cmp(&b.model)
-        } else {
-            date_cmp
-        }
-    });
+
+    // Use unstable_sort for better performance (order of equal elements doesn't matter)
+    results.sort_unstable_by(|a, b| a.date.cmp(&b.date).then_with(|| a.model.cmp(&b.model)));
 
     Ok(results)
 }
@@ -175,75 +171,75 @@ fn aggregate_analysis_result(
     date: &str,
     analysis: &Value,
 ) {
-    if let Some(records) = analysis.get("records").and_then(|r| r.as_array()) {
-        for record in records {
-            if let Some(record_obj) = record.as_object() {
-                if let Some(conv_usage) = record_obj
-                    .get("conversationUsage")
-                    .and_then(|c| c.as_object())
-                {
-                    for (model, _usage) in conv_usage {
-                        if model.contains("<synthetic>") {
-                            continue;
-                        }
+    let Some(records) = analysis.get("records").and_then(|r| r.as_array()) else {
+        return;
+    };
 
-                        let key = format!("{}:{}", date, model);
+    for record in records {
+        let Some(record_obj) = record.as_object() else {
+            continue;
+        };
 
-                        let entry =
-                            aggregated
-                                .entry(key)
-                                .or_insert_with(|| AggregatedAnalysisRow {
-                                    date: date.to_string(),
-                                    model: model.clone(),
-                                    edit_lines: 0,
-                                    read_lines: 0,
-                                    write_lines: 0,
-                                    bash_count: 0,
-                                    edit_count: 0,
-                                    read_count: 0,
-                                    todo_write_count: 0,
-                                    write_count: 0,
-                                });
+        let Some(conv_usage) = record_obj
+            .get("conversationUsage")
+            .and_then(|c| c.as_object())
+        else {
+            continue;
+        };
 
-                        if let Some(edit_lines) =
-                            record_obj.get("totalEditLines").and_then(|v| v.as_u64())
-                        {
-                            entry.edit_lines += edit_lines as usize;
-                        }
-                        if let Some(read_lines) =
-                            record_obj.get("totalReadLines").and_then(|v| v.as_u64())
-                        {
-                            entry.read_lines += read_lines as usize;
-                        }
-                        if let Some(write_lines) =
-                            record_obj.get("totalWriteLines").and_then(|v| v.as_u64())
-                        {
-                            entry.write_lines += write_lines as usize;
-                        }
+        for (model, _usage) in conv_usage {
+            if model.contains("<synthetic>") {
+                continue;
+            }
 
-                        if let Some(tool_calls) =
-                            record_obj.get("toolCallCounts").and_then(|t| t.as_object())
-                        {
-                            if let Some(bash) = tool_calls.get("Bash").and_then(|v| v.as_u64()) {
-                                entry.bash_count += bash as usize;
-                            }
-                            if let Some(edit) = tool_calls.get("Edit").and_then(|v| v.as_u64()) {
-                                entry.edit_count += edit as usize;
-                            }
-                            if let Some(read) = tool_calls.get("Read").and_then(|v| v.as_u64()) {
-                                entry.read_count += read as usize;
-                            }
-                            if let Some(todo_write) =
-                                tool_calls.get("TodoWrite").and_then(|v| v.as_u64())
-                            {
-                                entry.todo_write_count += todo_write as usize;
-                            }
-                            if let Some(write) = tool_calls.get("Write").and_then(|v| v.as_u64()) {
-                                entry.write_count += write as usize;
-                            }
-                        }
-                    }
-                }
+            let key = format!("{}:{}", date, model);
+
+            // Use entry API to avoid multiple lookups
+            let entry = aggregated
+                .entry(key)
+                .or_insert_with(|| AggregatedAnalysisRow {
+                    date: date.to_string(),
+                    model: model.clone(),
+                    edit_lines: 0,
+                    read_lines: 0,
+                    write_lines: 0,
+                    bash_count: 0,
+                    edit_count: 0,
+                    read_count: 0,
+                    todo_write_count: 0,
+                    write_count: 0,
+                });
+
+            // Extract line counts
+            entry.edit_lines += record_obj
+                .get("totalEditLines")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            entry.read_lines += record_obj
+                .get("totalReadLines")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            entry.write_lines += record_obj
+                .get("totalWriteLines")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+
+            // Extract tool call counts
+            if let Some(tool_calls) = record_obj.get("toolCallCounts").and_then(|t| t.as_object()) {
+                entry.bash_count +=
+                    tool_calls.get("Bash").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                entry.edit_count +=
+                    tool_calls.get("Edit").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                entry.read_count +=
+                    tool_calls.get("Read").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                entry.todo_write_count += tool_calls
+                    .get("TodoWrite")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+                entry.write_count += tool_calls
+                    .get("Write")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
             }
         }
     }

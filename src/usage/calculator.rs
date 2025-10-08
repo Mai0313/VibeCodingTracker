@@ -8,24 +8,31 @@ use std::path::Path;
 
 /// Extract conversation usage from CodeAnalysis result
 fn extract_conversation_usage_from_analysis(analysis: &Value) -> HashMap<String, Value> {
-    let mut conversation_usage = HashMap::new();
+    let Some(records) = analysis.get("records").and_then(|r| r.as_array()) else {
+        return HashMap::new();
+    };
 
-    if let Some(records) = analysis.get("records").and_then(|r| r.as_array()) {
-        for record in records {
-            if let Some(record_obj) = record.as_object() {
-                if let Some(conv_usage) = record_obj
-                    .get("conversationUsage")
-                    .and_then(|c| c.as_object())
-                {
-                    for (model, usage) in conv_usage {
-                        if let Some(existing_usage) = conversation_usage.get_mut(model) {
-                            merge_usage_values(existing_usage, usage);
-                        } else {
-                            conversation_usage.insert(model.clone(), usage.clone());
-                        }
-                    }
-                }
-            }
+    // Pre-allocate HashMap with estimated capacity (typical: 1-3 models per session)
+    let mut conversation_usage = HashMap::with_capacity(3);
+
+    for record in records {
+        let Some(record_obj) = record.as_object() else {
+            continue;
+        };
+
+        let Some(conv_usage) = record_obj
+            .get("conversationUsage")
+            .and_then(|c| c.as_object())
+        else {
+            continue;
+        };
+
+        for (model, usage) in conv_usage {
+            // Use entry API to avoid double lookup
+            conversation_usage
+                .entry(model.clone())
+                .and_modify(|existing_usage| merge_usage_values(existing_usage, usage))
+                .or_insert_with(|| usage.clone());
         }
     }
 
@@ -35,7 +42,8 @@ fn extract_conversation_usage_from_analysis(analysis: &Value) -> HashMap<String,
 /// Calculate usage from all directories
 pub fn get_usage_from_directories() -> Result<DateUsageResult> {
     let paths = resolve_paths()?;
-    let mut result = DateUsageResult::new();
+    // Pre-allocate HashMap with estimated capacity (typical: ~30 dates)
+    let mut result = HashMap::with_capacity(30);
 
     if paths.claude_session_dir.exists() {
         process_usage_directory(&paths.claude_session_dir, &mut result, is_json_file)?;
@@ -64,14 +72,18 @@ where
         match analyze_jsonl_file(&file_info.path) {
             Ok(analysis) => {
                 let conversation_usage = extract_conversation_usage_from_analysis(&analysis);
-                let date_entry = result.entry(file_info.modified_date).or_default();
+
+                // Use entry API to avoid double lookup
+                let date_entry = result
+                    .entry(file_info.modified_date)
+                    .or_insert_with(|| HashMap::with_capacity(3)); // typical: 1-3 models per date
 
                 for (model, usage_value) in conversation_usage {
-                    if let Some(existing) = date_entry.get_mut(&model) {
-                        merge_usage_values(existing, &usage_value);
-                    } else {
-                        date_entry.insert(model, usage_value);
-                    }
+                    // Use entry API to avoid double lookup
+                    date_entry
+                        .entry(model)
+                        .and_modify(|existing| merge_usage_values(existing, &usage_value))
+                        .or_insert(usage_value);
                 }
             }
             Err(e) => {

@@ -55,8 +55,10 @@ pub struct ModelPricingMap {
 impl ModelPricingMap {
     /// Create a new ModelPricingMap with precomputed indices
     pub fn new(raw: HashMap<String, ModelPricing>) -> Self {
-        let mut normalized_index = HashMap::new();
-        let mut lowercase_keys = Vec::new();
+        // Pre-allocate with exact capacity
+        let capacity = raw.len();
+        let mut normalized_index = HashMap::with_capacity(capacity);
+        let mut lowercase_keys = Vec::with_capacity(capacity);
 
         for key in raw.keys() {
             // Precompute normalized key
@@ -68,6 +70,9 @@ impl ModelPricingMap {
             // Precompute lowercase key for substring/fuzzy matching
             lowercase_keys.push((key.to_lowercase(), key.clone()));
         }
+
+        // Sort lowercase_keys for potential binary search optimization
+        lowercase_keys.sort_by(|a, b| a.0.cmp(&b.0));
 
         Self {
             raw,
@@ -97,45 +102,39 @@ impl ModelPricingMap {
             }
         }
 
-        // Slow path: Substring and fuzzy matching (but with precomputed lowercase keys)
+        // Slow path: Substring and fuzzy matching (optimized)
         let model_lower = model_name.to_lowercase();
-        let mut substring_match: Option<String> = None;
-        let mut best_fuzzy_match: Option<(String, f64)> = None;
+        let mut best_match: Option<(String, f64, bool)> = None; // (key, score, is_substring)
 
         for (key_lower, original_key) in &self.lowercase_keys {
-            // Substring matching
-            if substring_match.is_none()
-                && (model_lower.contains(key_lower) || key_lower.contains(&model_lower))
+            // Substring matching (higher priority, score = 1.0)
+            if (model_lower.contains(key_lower) || key_lower.contains(&model_lower))
+                && (best_match.is_none() || !best_match.as_ref().unwrap().2)
             {
-                substring_match = Some(original_key.clone());
+                best_match = Some((original_key.clone(), 1.0, true));
+                // Early exit if exact substring match found
+                if model_lower == *key_lower {
+                    break;
+                }
             }
 
-            // Fuzzy matching
-            let similarity = jaro_winkler(&model_lower, key_lower);
-            if similarity >= SIMILARITY_THRESHOLD {
-                match &best_fuzzy_match {
-                    Some((_, best_similarity)) if similarity > *best_similarity => {
-                        best_fuzzy_match = Some((original_key.clone(), similarity));
+            // Fuzzy matching (only if no substring match yet)
+            if best_match.is_none() || best_match.as_ref().unwrap().1 < 1.0 {
+                let similarity = jaro_winkler(&model_lower, key_lower);
+                if similarity >= SIMILARITY_THRESHOLD {
+                    if let Some((_, best_score, is_sub)) = &best_match {
+                        if !is_sub && similarity > *best_score {
+                            best_match = Some((original_key.clone(), similarity, false));
+                        }
+                    } else {
+                        best_match = Some((original_key.clone(), similarity, false));
                     }
-                    None => {
-                        best_fuzzy_match = Some((original_key.clone(), similarity));
-                    }
-                    _ => {}
                 }
             }
         }
 
-        // Return substring match first, then fuzzy match
-        if let Some(matched_key) = substring_match {
-            if let Some(pricing) = self.raw.get(&matched_key) {
-                return ModelPricingResult {
-                    pricing: *pricing,
-                    matched_model: Some(matched_key),
-                };
-            }
-        }
-
-        if let Some((matched_key, _)) = best_fuzzy_match {
+        // Return best match if found
+        if let Some((matched_key, _, _)) = best_match {
             if let Some(pricing) = self.raw.get(&matched_key) {
                 return ModelPricingResult {
                     pricing: *pricing,
