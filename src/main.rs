@@ -5,7 +5,9 @@ use owo_colors::OwoColorize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use vibe_coding_tracker::cli::{Cli, Commands};
-use vibe_coding_tracker::pricing::{ModelPricingMap, calculate_cost, fetch_model_pricing};
+use vibe_coding_tracker::pricing::{
+    ModelPricingMap, ModelPricingResult, calculate_cost, fetch_model_pricing,
+};
 use vibe_coding_tracker::usage::{
     display_usage_interactive, display_usage_table, display_usage_text, get_usage_from_directories,
 };
@@ -161,39 +163,46 @@ fn build_enriched_json(
     usage_data: &DateUsageResult,
     pricing_map: &ModelPricingMap,
 ) -> Result<HashMap<String, Vec<Value>>> {
-    let enriched_data = usage_data
-        .iter()
-        .map(|(date, models)| {
-            let date_entries = models
-                .iter()
-                .map(|(model, usage)| {
-                    let counts = extract_token_counts(usage);
-                    let pricing_result = pricing_map.get(model);
-                    let cost = calculate_cost(
-                        counts.input_tokens,
-                        counts.output_tokens,
-                        counts.cache_read,
-                        counts.cache_creation,
-                        &pricing_result.pricing,
-                    );
+    // Pre-allocate HashMap with estimated capacity
+    let mut enriched_data = HashMap::with_capacity(usage_data.len());
 
-                    let mut entry = json!({
-                        "model": model,
-                        "usage": usage,
-                        "cost_usd": cost
-                    });
+    // Use pricing cache to avoid repeated lookups
+    let mut pricing_cache: HashMap<String, ModelPricingResult> = HashMap::with_capacity(32);
 
-                    if let Some(matched) = &pricing_result.matched_model {
-                        entry["matched_model"] = json!(matched);
-                    }
+    for (date, models) in usage_data.iter() {
+        let mut date_entries = Vec::with_capacity(models.len());
 
-                    entry
-                })
-                .collect();
+        for (model, usage) in models.iter() {
+            let counts = extract_token_counts(usage);
 
-            (date.clone(), date_entries)
-        })
-        .collect();
+            // Use pricing cache with entry API
+            let pricing_result = pricing_cache
+                .entry(model.clone())
+                .or_insert_with(|| pricing_map.get(model));
+
+            let cost = calculate_cost(
+                counts.input_tokens,
+                counts.output_tokens,
+                counts.cache_read,
+                counts.cache_creation,
+                &pricing_result.pricing,
+            );
+
+            let mut entry = json!({
+                "model": model,
+                "usage": usage,
+                "cost_usd": cost
+            });
+
+            if let Some(matched) = &pricing_result.matched_model {
+                entry["matched_model"] = json!(matched);
+            }
+
+            date_entries.push(entry);
+        }
+
+        enriched_data.insert(date.clone(), date_entries);
+    }
 
     Ok(enriched_data)
 }
