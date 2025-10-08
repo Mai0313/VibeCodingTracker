@@ -27,7 +27,7 @@ pub fn resolve_paths() -> Result<HelperPaths> {
     let claude_session_dir = claude_dir.join("projects");
     let gemini_dir = home_dir.join(".gemini");
     let gemini_session_dir = gemini_dir.join("tmp");
-    let cache_dir = home_dir.join(".vibe-coding-tracker");
+    let cache_dir = home_dir.join(".vibe_coding_tracker");
 
     Ok(HelperPaths {
         home_dir,
@@ -80,7 +80,7 @@ pub fn get_machine_id() -> String {
 /// Get cache directory path (creates it if it doesn't exist)
 pub fn get_cache_dir() -> Result<PathBuf> {
     let home_dir = get_home_dir()?;
-    let cache_dir = home_dir.join(".vibe-coding-tracker");
+    let cache_dir = home_dir.join(".vibe_coding_tracker");
 
     // Create directory if it doesn't exist
     if !cache_dir.exists() {
@@ -91,7 +91,7 @@ pub fn get_cache_dir() -> Result<PathBuf> {
 }
 
 /// Get pricing cache file path for a specific date
-/// Returns: ~/.vibe-coding-tracker/model_pricing_YYYY-MM-DD.json
+/// Returns: ~/.vibe_coding_tracker/model_pricing_YYYY-MM-DD.json
 pub fn get_pricing_cache_path(date: &str) -> Result<PathBuf> {
     let cache_dir = get_cache_dir()?;
     Ok(cache_dir.join(format!("model_pricing_{}.json", date)))

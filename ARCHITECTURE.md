@@ -136,7 +136,7 @@ Defines core data structures with serde serialization:
 **Cache Location:**
 
 ```
-~/.vibe-coding-tracker/model_pricing_YYYY-MM-DD.json
+~/.vibe_coding_tracker/model_pricing_YYYY-MM-DD.json
 ```
 
 **Cost Calculation:**
@@ -277,7 +277,7 @@ usage/calculator.rs::get_usage_from_directories()
                 ▼
         pricing.rs::fetch_model_pricing()
                 │
-                ├─> Check cache: ~/.vibe-coding-tracker/model_pricing_YYYY-MM-DD.json
+                ├─> Check cache: ~/.vibe_coding_tracker/model_pricing_YYYY-MM-DD.json
                 ├─> If expired: fetch from GitHub
                 └─> Fuzzy match model names
                 │
@@ -726,7 +726,7 @@ strip = true      # Remove debug symbols
             ├── session-1.json
             └── session-2.json
 
-~/.vibe-coding-tracker/
+~/.vibe_coding_tracker/
 └── model_pricing_2025-10-05.json  # Daily cache
 ```
 

@@ -4,10 +4,10 @@
 
 [![Crates.io](https://img.shields.io/crates/v/vibe_coding_tracker?logo=rust&style=flat-square&color=E05D44)](https://crates.io/crates/vibe_coding_tracker)
 [![Crates.io Downloads](https://img.shields.io/crates/d/vibe_coding_tracker?logo=rust&style=flat-square)](https://crates.io/crates/vibe_coding_tracker)
-[![npm version](https://img.shields.io/npm/v/vibe-coding-tracker?logo=npm&style=flat-square&color=CB3837)](https://www.npmjs.com/package/vibe-coding-tracker)
-[![npm downloads](https://img.shields.io/npm/dt/vibe-coding-tracker?logo=npm&style=flat-square)](https://www.npmjs.com/package/vibe-coding-tracker)
-[![PyPI version](https://img.shields.io/pypi/v/vibe-coding-tracker?logo=python&style=flat-square&color=3776AB)](https://pypi.org/project/vibe-coding-tracker/)
-[![PyPI downloads](https://img.shields.io/pypi/dm/vibe-coding-tracker?logo=python&style=flat-square)](https://pypi.org/project/vibe-coding-tracker/)
+[![npm version](https://img.shields.io/npm/v/vibe_coding_tracker?logo=npm&style=flat-square&color=CB3837)](https://www.npmjs.com/package/vibe_coding_tracker)
+[![npm downloads](https://img.shields.io/npm/dt/vibe_coding_tracker?logo=npm&style=flat-square)](https://www.npmjs.com/package/vibe_coding_tracker)
+[![PyPI version](https://img.shields.io/pypi/v/vibe_coding_tracker?logo=python&style=flat-square&color=3776AB)](https://pypi.org/project/vibe_coding_tracker/)
+[![PyPI downloads](https://img.shields.io/pypi/dm/vibe_coding_tracker?logo=python&style=flat-square)](https://pypi.org/project/vibe_coding_tracker/)
 [![rust](https://img.shields.io/badge/Rust-stable-orange?logo=rust&logoColor=white&style=flat-square)](https://www.rust-lang.org/)
 [![tests](https://img.shields.io/github/actions/workflow/status/Mai0313/VibeCodingTracker/test.yml?label=tests&logo=github&style=flat-square)](https://github.com/Mai0313/VibeCodingTracker/actions/workflows/test.yml)
 [![code-quality](https://img.shields.io/github/actions/workflow/status/Mai0313/VibeCodingTracker/code-quality-check.yml?label=code-quality&logo=github&style=flat-square)](https://github.com/Mai0313/VibeCodingTracker/actions/workflows/code-quality-check.yml)
@@ -81,13 +81,13 @@
 
 ```bash
 # 主要包
-npm install -g vibe-coding-tracker
+npm install -g vibe_coding_tracker
 
 # 带 scope 的短别名
 npm install -g @mai0313/vct
 
 # 带 scope 的完整名称
-npm install -g @mai0313/vibe-coding-tracker
+npm install -g @mai0313/vibe_coding_tracker
 ```
 
 **前提条件**: [Node.js](https://nodejs.org/) v22 或更高版本
@@ -104,10 +104,10 @@ npm install -g @mai0313/vibe-coding-tracker
 
 ```bash
 # 使用 pip 安装
-pip install vibe-coding-tracker
+pip install vibe_coding_tracker
 
 # 使用 uv 安装（推荐，安装速度更快）
-uv pip install vibe-coding-tracker
+uv pip install vibe_coding_tracker
 ```
 
 **前提条件**: Python 3.8 或更高版本
@@ -593,7 +593,7 @@ update 命令会自动检测您的平台并下载正确的压缩文件：
 ### 工作原理
 
 1. **自动更新**：每天从 [LiteLLM](https://github.com/BerriAI/litellm) 获取定价
-2. **智能缓存**：在 `~/.vibe-coding-tracker/` 中存储定价 24 小时
+2. **智能缓存**：在 `~/.vibe_coding_tracker/` 中存储定价 24 小时
 3. **模糊匹配**：即使对于自定义模型名称也能找到最佳匹配
 4. **始终准确**：确保您获得最新的定价
 
@@ -640,10 +640,10 @@ docker run --rm \
 
 ```bash
 # 检查缓存
-ls -la ~/.vibe-coding-tracker/
+ls -la ~/.vibe_coding_tracker/
 
 # 强制刷新
-rm -rf ~/.vibe-coding-tracker/
+rm -rf ~/.vibe_coding_tracker/
 vct usage
 
 # 调试模式

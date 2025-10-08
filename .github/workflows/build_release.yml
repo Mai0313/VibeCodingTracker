@@ -194,11 +194,11 @@ jobs:
     strategy:
       matrix:
         include:
-          - name: vibe-coding-tracker
+          - name: vibe_coding_tracker
             scope: "@mai0313"
           - name: vct
             scope: "@mai0313"
-          - name: vibe-coding-tracker
+          - name: vibe_coding_tracker
             scope: ""
 
     steps:
@@ -389,7 +389,7 @@ jobs:
         working-directory: cli/python
         run: |
           VERSION="${{ steps.version.outputs.VERSION }}"
-          PACKAGE_NAME="vibe-coding-tracker"
+          PACKAGE_NAME="vibe_coding_tracker"
 
           echo "Waiting for PyPI registry to update..."
           sleep 15

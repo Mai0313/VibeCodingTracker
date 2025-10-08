@@ -169,7 +169,7 @@ src/
 **3. Pricing System:**
 
 - URL: `https://github.com/BerriAI/litellm/raw/refs/heads/main/model_prices_and_context_window.json`
-- Cache location: `~/.vibe-coding-tracker/model_pricing_YYYY-MM-DD.json`
+- Cache location: `~/.vibe_coding_tracker/model_pricing_YYYY-MM-DD.json`
 - Cache TTL: 24 hours (by date)
 - Matching strategy (priority order):
   1. Exact match
@@ -378,10 +378,10 @@ docker run --rm \
 RUST_LOG=debug vct usage
 
 # Check cache
-ls -la ~/.vibe-coding-tracker/
+ls -la ~/.vibe_coding_tracker/
 
 # Force pricing refresh
-rm -rf ~/.vibe-coding-tracker/
+rm -rf ~/.vibe_coding_tracker/
 vct usage
 
 # Verify session directories
