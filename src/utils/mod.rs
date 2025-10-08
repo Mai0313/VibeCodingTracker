@@ -12,7 +12,7 @@ pub use directory::{collect_files_with_dates, is_gemini_chat_file, is_json_file}
 pub use file::{count_lines, read_json, read_jsonl, save_json_pretty};
 pub use format::{format_number, get_current_date};
 pub use git::get_git_remote_url;
-pub use paths::{get_current_user, get_machine_id, resolve_paths};
+pub use paths::{get_cache_dir, get_current_user, get_machine_id, resolve_paths};
 pub use time::parse_iso_timestamp;
 pub use token_extractor::extract_token_counts;
 pub use usage_processor::{

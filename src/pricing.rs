@@ -1,4 +1,4 @@
-use crate::utils::get_current_date;
+use crate::utils::{get_cache_dir, get_current_date};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -169,20 +169,6 @@ impl Default for ModelPricing {
             cache_creation_input_token_cost_above_200k_tokens: 0.0,
         }
     }
-}
-
-/// Get cache directory path
-fn get_cache_dir() -> Result<PathBuf> {
-    let home_dir =
-        home::home_dir().ok_or_else(|| anyhow::anyhow!("Unable to resolve user home directory"))?;
-    let cache_dir = home_dir.join(".vibe-coding-tracker");
-
-    // Create directory if it doesn't exist
-    if !cache_dir.exists() {
-        fs::create_dir_all(&cache_dir).context("Failed to create cache directory")?;
-    }
-
-    Ok(cache_dir)
 }
 
 /// Get cache file path for today
