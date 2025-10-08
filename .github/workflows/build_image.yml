@@ -32,6 +32,10 @@ jobs:
             target_step: prod
             tag: ghcr.io/${{ github.repository }}
 
+          - name: Build and Push Images for Alt name (Latest / Release)
+            target_step: prod
+            tag: ghcr.io/${{ github.actor }}/vct
+
     steps:
       - name: Disable SSL Verify
         run: git config --global http.sslVerify false
