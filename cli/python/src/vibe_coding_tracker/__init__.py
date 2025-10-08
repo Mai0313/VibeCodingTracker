@@ -1,5 +1,3 @@
-"""Vibe Coding Tracker - AI coding assistant telemetry/usage parser."""
-
 import os
 import platform
 import subprocess
