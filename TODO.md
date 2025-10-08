@@ -257,3 +257,15 @@ Gemini 的 Usage:
 這個專案經過了多輪跌代 我擔心會有一些影響效能的邏輯出現 或 重複邏輯出現 或 為了向後兼容產生的代碼 這些都請你幫我重構
 你不需要考慮像後兼容, 可以大幅度改動 只要功能能正常運作即可
 請使用繁體中文
+
+## 重新規劃一下 `./cli` 資料夾
+
+目前我有發佈我的工具到 `npm` 和 `pypi`, 目前散落在 `./cli` 和 `./python_cli` 資料夾, 最後透過 `./.github/workflows/build_release.yml` 來建置發佈
+
+我希望將資料夾結構改成
+./cli/pypi
+./cli/npmjs
+
+然後對應更新 `./.github/workflows/build_release.yml`
+
+你覺得這樣做會比較好嗎?
