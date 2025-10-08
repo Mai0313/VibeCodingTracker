@@ -81,13 +81,13 @@ Choose any of the following package names (all are identical):
 
 ```bash
 # Main package
-npm install -g vibe_coding_tracker
+npm install -g vibe-coding-tracker
 
 # Short alias with scope
 npm install -g @mai0313/vct
 
 # Full name with scope
-npm install -g @mai0313/vibe_coding_tracker
+npm install -g @mai0313/vibe-coding-tracker
 ```
 
 **Prerequisites**: [Node.js](https://nodejs.org/) v22 or higher

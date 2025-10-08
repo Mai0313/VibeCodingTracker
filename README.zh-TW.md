@@ -81,13 +81,13 @@
 
 ```bash
 # 主要套件
-npm install -g vibe_coding_tracker
+npm install -g vibe-coding-tracker
 
 # 帶 scope 的短別名
 npm install -g @mai0313/vct
 
 # 帶 scope 的完整名稱
-npm install -g @mai0313/vibe_coding_tracker
+npm install -g @mai0313/vibe-coding-tracker
 ```
 
 **前置條件**: [Node.js](https://nodejs.org/) v22 或更高版本

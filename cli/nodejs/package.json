@@ -1,5 +1,5 @@
 {
-  "name": "vibe_coding_tracker",
+  "name": "vibe-coding-tracker",
   "version": "0.1.0",
   "description": "Vibe Coding Tracker - AI coding assistant telemetry/usage parser, aggregate JSONL events into CodeAnalysis results",
   "author": "Wei Lee <mai@mai0313.com>",
@@ -25,7 +25,7 @@
   ],
   "bin": {
     "vct": "bin/vct.js",
-    "vibe_coding_tracker": "bin/vct.js"
+    "vibe-coding-tracker": "bin/vct.js"
   },
   "engines": {
     "node": ">=18.0.0"

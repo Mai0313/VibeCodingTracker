@@ -194,11 +194,11 @@ jobs:
     strategy:
       matrix:
         include:
-          - name: vibe_coding_tracker
+          - name: vibe-coding-tracker
             scope: "@mai0313"
           - name: vct
             scope: "@mai0313"
-          - name: vibe_coding_tracker
+          - name: vibe-coding-tracker
             scope: ""
 
     steps:
