@@ -224,6 +224,28 @@ Gemini 的 Usage:
 
 我希望你幫我重新設計一下 TUI, 可以繼續使用 `ratatui`, 只是我希望有更多風格
 
+## 幫我把 `.github/workflows/build_package.yml` 合併進去 `.github/workflows/build_release.yml`
+
+我希望有一個 action是 `build` 但透過 `.github/workflows/build_package.yml` 新增一個 `package` 的 job
+最後透過 release 一次上傳到 Release Assets
+
+## 請參考 `.github/workflows/build_release.yml` 的 `publish-npm`, 幫我新增套件發佈管道
+
+我希望新增 `publish-pypi`, `publish-homebrew`, 和 `publish-winget` 將腳本發佈到 pypi / homebrew / winget
+基本流程是參考 `publish-npm` 的做法, 將可執行檔案分門別類下載後解壓, 然後上傳到對應的地方
+`pypi` 的部分我希望可以透過 `uv` 這個套件來完成 這樣做會較為簡單 因為可以透過 `uv publish` 來做
+
+例如
+
+```yaml
+  - name: Publish Package
+    continue-on-error: true
+    env:
+      UV_PUBLISH_TOKEN: ${{ secrets.UV_PUBLISH_TOKEN }}
+    run: |
+      uv publish
+```
+
 ## 請幫我檢查所有代碼 查看一下有沒有地方是需要優化或冗餘代碼
 
 這個專案經過了多輪跌代 我擔心會有一些影響效能的邏輯出現 或 重複邏輯出現 或 為了向後兼容產生的代碼 這些都請你幫我重構
