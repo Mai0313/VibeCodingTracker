@@ -79,6 +79,7 @@ pub fn display_analysis_interactive(data: &[AggregatedAnalysisRow]) -> anyhow::R
 
         // Update system information
         sys.refresh_processes(sysinfo::ProcessesToUpdate::All, false);
+        sys.refresh_cpu_all();
 
         // Fetch fresh data with error logging
         match crate::analysis::analyze_all_sessions() {
@@ -391,6 +392,10 @@ pub fn display_analysis_interactive(data: &[AggregatedAnalysisRow]) -> anyhow::R
                 .process(pid)
                 .map_or(0.0, |p| p.memory() as f64 / 1024.0 / 1024.0);
 
+            let cpu_usage = sys
+                .process(pid)
+                .map_or(0.0, |p| p.cpu_usage());
+
             // Summary
             let summary = Paragraph::new(vec![Line::from(vec![
                 Span::styled(
@@ -424,6 +429,15 @@ pub fn display_analysis_interactive(data: &[AggregatedAnalysisRow]) -> anyhow::R
                 Span::styled(
                     format!("{}", rows_data.len()),
                     Style::default().fg(RatatuiColor::White).bold(),
+                ),
+                Span::raw("  |  "),
+                Span::styled(
+                    "⚡ CPU: ",
+                    Style::default().fg(RatatuiColor::LightGreen).bold(),
+                ),
+                Span::styled(
+                    format!("{:.1}%", cpu_usage),
+                    Style::default().fg(RatatuiColor::LightCyan).bold(),
                 ),
                 Span::raw("  |  "),
                 Span::styled(

@@ -201,6 +201,7 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
         force_refresh = false;
 
         sys.refresh_processes(sysinfo::ProcessesToUpdate::All, false);
+        sys.refresh_cpu_all();
 
         if last_pricing_refresh.elapsed() >= pricing_refresh_interval
             || pricing_map.raw().is_empty()
@@ -475,6 +476,10 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
                 .process(pid)
                 .map_or(0.0, |p| p.memory() as f64 / 1024.0 / 1024.0);
 
+            let cpu_usage = sys
+                .process(pid)
+                .map_or(0.0, |p| p.cpu_usage());
+
             let summary = Paragraph::new(vec![Line::from(vec![
                 Span::styled(
                     "💰 Total Cost: ",
@@ -501,6 +506,15 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
                 Span::styled(
                     format!("{}", rows_data.len()),
                     Style::default().fg(RatatuiColor::White).bold(),
+                ),
+                Span::raw("  |  "),
+                Span::styled(
+                    "⚡ CPU: ",
+                    Style::default().fg(RatatuiColor::LightGreen).bold(),
+                ),
+                Span::styled(
+                    format!("{:.1}%", cpu_usage),
+                    Style::default().fg(RatatuiColor::LightCyan).bold(),
                 ),
                 Span::raw("  |  "),
                 Span::styled(
