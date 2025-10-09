@@ -1,148 +1,91 @@
-# Vibe Coding Tracker Installer for Windows
-# This script downloads and installs the latest version of vibe_coding_tracker
-
 $ErrorActionPreference = "Stop"
 
-# GitHub repository information
 $Repo = "Mai0313/VibeCodingTracker"
 $BinaryName = "vibe_coding_tracker"
 
-# Disable SSL certificate validation
-[System.Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}
 [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
-
-function Write-ColorOutput {
-    param(
-        [string]$Message,
-        [string]$Color = "White"
-    )
-    Write-Host $Message -ForegroundColor $Color
-}
+[System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
 
 function Get-Architecture {
-    $arch = $env:PROCESSOR_ARCHITECTURE
-    switch ($arch) {
-        "AMD64" { return "x64" }
-        "ARM64" { return "arm64" }
+    switch ($env:PROCESSOR_ARCHITECTURE) {
+        "AMD64" { "x64"; return }
+        "ARM64" { "arm64"; return }
         default {
-            Write-ColorOutput "Error: Unsupported architecture $arch" "Red"
+            Write-Error "Unsupported architecture: $($env:PROCESSOR_ARCHITECTURE)"
             exit 1
         }
     }
 }
 
 function Get-LatestVersion {
-    Write-ColorOutput "Fetching latest release version..." "Yellow"
-
-    try {
-        $response = Invoke-WebRequest -Uri "https://api.github.com/repos/$Repo/releases/latest" -UseBasicParsing
-        $json = $response.Content | ConvertFrom-Json
-        $version = $json.tag_name
-
-        if (-not $version) {
-            throw "Version not found in response"
-        }
-
-        return $version
-    }
-    catch {
-        Write-ColorOutput "Error: Failed to fetch latest version - $($_.Exception.Message)" "Red"
+    $response = Invoke-WebRequest -Uri "https://api.github.com/repos/$Repo/releases/latest" -UseBasicParsing
+    $tag = ($response.Content | ConvertFrom-Json).tag_name
+    if (-not $tag) {
+        Write-Error "Failed to determine latest release."
         exit 1
     }
+    return $tag
+}
+
+function Get-InstallDirectory {
+    return (Join-Path $env:LOCALAPPDATA "Programs\VibeCodingTracker")
 }
 
 function Install-Binary {
     param(
-        [string]$Arch,
-        [string]$Version
+        [string]$Version,
+        [string]$Arch
     )
 
-    # Construct download URL
-    $filename = "${BinaryName}-${Version}-windows-${Arch}.zip"
-    $downloadUrl = "https://github.com/$Repo/releases/download/$Version/$filename"
+    $filename = "$BinaryName-$Version-windows-$Arch.zip"
+    $url = "https://github.com/$Repo/releases/download/$Version/$filename"
 
-    Write-ColorOutput "Downloading $filename..." "Yellow"
-
-    # Create temporary directory
-    $tempDir = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [System.Guid]::NewGuid().ToString())
+    $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid())
     New-Item -ItemType Directory -Path $tempDir | Out-Null
 
-    $archivePath = Join-Path $tempDir $filename
-
     try {
-        # Download file
-        Invoke-WebRequest -Uri $downloadUrl -OutFile $archivePath -UseBasicParsing
+        $archive = Join-Path $tempDir $filename
+        Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing
 
-        # Extract archive
-        Write-ColorOutput "Extracting archive..." "Yellow"
-        Expand-Archive -Path $archivePath -DestinationPath $tempDir -Force
-
-        # Find binary
-        $binaryPath = Get-ChildItem -Path $tempDir -Recurse -Filter "$BinaryName.exe" | Select-Object -First 1
-
-        if (-not $binaryPath) {
-            throw "Binary not found in archive"
+        Expand-Archive -Path $archive -DestinationPath $tempDir -Force
+        $binary = Get-ChildItem -Path $tempDir -Filter "$BinaryName.exe" -Recurse | Select-Object -First 1
+        if (-not $binary) {
+            throw "Binary not found in archive."
         }
 
-        # Determine install directory
-        $installDir = Join-Path $env:LOCALAPPDATA "Programs\VibeCodingTracker"
-
-        # Create install directory if it doesn't exist
+        $installDir = Get-InstallDirectory
         if (-not (Test-Path $installDir)) {
-            New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+            New-Item -ItemType Directory -Path $installDir | Out-Null
         }
 
-        # Install binary
-        Write-ColorOutput "Installing to $installDir..." "Yellow"
-        $targetPath = Join-Path $installDir "$BinaryName.exe"
-        Copy-Item -Path $binaryPath.FullName -Destination $targetPath -Force
+        $target = Join-Path $installDir "$BinaryName.exe"
+        Copy-Item -Path $binary.FullName -Destination $target -Force
+        Copy-Item -Path $target -Destination (Join-Path $installDir "vct.exe") -Force
 
-        # Create short alias (vct.exe)
-        $vctPath = Join-Path $installDir "vct.exe"
-        Copy-Item -Path $targetPath -Destination $vctPath -Force
-
-        # Add to PATH if not already present
-        $currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
-        if ($currentPath -notlike "*$installDir*") {
-            Write-ColorOutput "Adding to PATH..." "Yellow"
-            [Environment]::SetEnvironmentVariable(
-                "Path",
-                "$currentPath;$installDir",
-                "User"
-            )
-            $env:Path = "$env:Path;$installDir"
+        Write-Host "Installed $BinaryName $Version to $installDir"
+        if ($env:Path -notlike "*$installDir*") {
+            Write-Host "Add $installDir to your PATH if the command is not found."
         }
-
-        # Clean up
-        Remove-Item -Path $tempDir -Recurse -Force
-
-        Write-ColorOutput "" "Green"
-        Write-ColorOutput "✓ Installation complete!" "Green"
-        Write-ColorOutput "Run 'vct --help' or 'vibe_coding_tracker --help' to get started" "Green"
-        Write-ColorOutput "" "Yellow"
-        Write-ColorOutput "Note: You may need to restart your terminal for PATH changes to take effect" "Yellow"
     }
     catch {
-        Write-ColorOutput "Error: Installation failed - $($_.Exception.Message)" "Red"
-        Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Error "Installation failed: $($_.Exception.Message)"
         exit 1
+    }
+    finally {
+        Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
-# Main installation flow
 function Main {
-    Write-ColorOutput "Vibe Coding Tracker Installer" "Green"
-    Write-ColorOutput "" "White"
+    Write-Host "Vibe Coding Tracker Installer"
 
     $arch = Get-Architecture
-    Write-ColorOutput "Detected architecture: $arch" "Green"
+    Write-Host "Detected architecture: $arch"
 
     $version = Get-LatestVersion
-    Write-ColorOutput "Latest version: $version" "Green"
-    Write-ColorOutput "" "White"
+    Write-Host "Latest version: $version"
 
-    Install-Binary -Arch $arch -Version $version
+    Install-Binary -Version $version -Arch $arch
 }
 
-# Run installer
 Main
