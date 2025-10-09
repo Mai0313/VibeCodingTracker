@@ -116,39 +116,74 @@ vct update --check        # Only check for updates without installing
 
 ```
 src/
-├── main.rs              # CLI entry point, command routing, startup update check
+├── main.rs              # CLI entry point, command routing, background startup update check
 ├── lib.rs               # Library exports, version info
 ├── cli.rs               # Clap CLI definitions
-├── pricing.rs           # LiteLLM pricing fetch, caching, fuzzy matching
+├── cache/               # Global file parsing cache (performance optimization)
+│   ├── mod.rs           # Global cache singleton, public API
+│   └── file_cache.rs    # FileParseCache implementation with modification-time tracking
+├── pricing/             # LiteLLM pricing fetch, caching, fuzzy matching
+│   ├── mod.rs           # Public API and re-exports
+│   ├── cache.rs         # Pricing data caching (24h TTL)
+│   ├── calculation.rs   # Cost calculation functions
+│   └── matching.rs      # Fuzzy model name matching (Jaro-Winkler)
 ├── update/              # Self-update functionality from GitHub releases
 │   ├── mod.rs           # Update command entry point, version comparison
 │   ├── github.rs        # GitHub API interaction, release fetching
 │   ├── platform.rs      # Platform-specific update logic (Unix/Windows)
 │   ├── archive.rs       # Archive extraction (.tar.gz, .zip)
 │   ├── installation.rs  # Installation method detection (npm/pip/cargo/manual)
-│   └── startup_check.rs # Automatic update notification on startup (24h cache)
+│   └── startup_check.rs # Automatic update notification on startup (24h cache, non-blocking)
 ├── models/              # Data structures
+│   ├── mod.rs           # Re-exports
 │   ├── analysis.rs      # CodeAnalysis struct
 │   ├── usage.rs         # DateUsageResult
+│   ├── provider.rs      # Provider enum (Claude/Codex/Gemini)
 │   ├── claude.rs        # Claude-specific types
 │   ├── codex.rs         # Codex/OpenAI types
 │   └── gemini.rs        # Gemini-specific types
 ├── analysis/            # JSONL analysis pipeline
+│   ├── mod.rs           # Public API
 │   ├── analyzer.rs      # Main entry: analyze_jsonl_file()
 │   ├── batch_analyzer.rs # Batch analysis: analyze_all_sessions()
-│   ├── display.rs       # Interactive TUI and table display for analysis
 │   ├── detector.rs      # Detect Claude vs Codex vs Gemini format
+│   ├── common_state.rs  # Shared state for analyzers
 │   ├── claude_analyzer.rs
 │   ├── codex_analyzer.rs
 │   └── gemini_analyzer.rs
-├── usage/               # Usage aggregation & display
-│   ├── calculator.rs    # get_usage_from_directories(), per-file aggregation
-│   └── display.rs       # Interactive TUI, table, text, JSON formatters
+├── display/             # Output formatting (interactive TUI, tables, text, JSON)
+│   ├── mod.rs           # Public API
+│   ├── common/          # Shared display utilities
+│   │   ├── mod.rs
+│   │   ├── traits.rs    # Common display traits
+│   │   ├── table.rs     # Table formatting helpers
+│   │   ├── tui.rs       # TUI utilities
+│   │   ├── provider.rs  # Provider detection and formatting
+│   │   └── averages.rs  # Daily averages calculation
+│   ├── usage/           # Usage command display
+│   │   ├── mod.rs
+│   │   ├── interactive.rs # Live TUI dashboard
+│   │   ├── table.rs     # Static table output
+│   │   ├── text.rs      # Plain text output
+│   │   └── averages.rs  # Usage-specific averages
+│   └── analysis/        # Analysis command display
+│       ├── mod.rs
+│       ├── interactive.rs # Live TUI dashboard
+│       ├── table.rs     # Static table output
+│       └── averages.rs  # Analysis-specific averages
+├── usage/               # Usage aggregation & calculation
+│   ├── mod.rs           # Public API
+│   └── calculator.rs    # get_usage_from_directories(), per-file aggregation
 └── utils/               # Helper utilities
+    ├── mod.rs           # Public API
     ├── file.rs          # read_jsonl, save_json_pretty
     ├── paths.rs         # resolve_paths (Claude/Codex/Gemini dirs)
+    ├── directory.rs     # Directory traversal utilities
     ├── git.rs           # Git remote detection
-    └── time.rs          # Date formatting
+    ├── time.rs          # Date formatting
+    ├── format.rs        # Number and string formatting
+    ├── token_extractor.rs   # Token count extraction
+    └── usage_processor.rs   # Usage data processing
 ```
 
 ### Key Flows
@@ -241,11 +276,12 @@ src/
 
 **5. Automatic Update Notifications (Startup Check):**
 
-- `main.rs::main()` → `update/startup_check.rs::check_update_on_startup()`
-  - **Runs automatically on every startup** before command execution
+- `main.rs::main()` → spawns background thread → `update/startup_check.rs::check_update_on_startup()`
+  - **Runs automatically on every startup** in a separate thread (non-blocking)
   - Checks for updates every 24 hours (uses date-based caching)
   - Cache location: `~/.vibe_coding_tracker/update_check.json`
   - **Silent failure**: Network errors don't disrupt main functionality
+  - **Non-blocking**: Update check runs in background thread, CLI remains responsive
   - **Installation method detection**: `update/installation.rs::detect_installation_method()`
     - Analyzes executable path to determine installation method
     - Detection patterns:
@@ -263,6 +299,41 @@ src/
     - Prevents version conflicts (users update via same method they installed)
     - Reduces support burden (correct update commands shown automatically)
     - Ensures users stay on latest version with security fixes and features
+
+**6. Global File Parsing Cache:**
+
+- **Location**: `cache/file_cache.rs::FileParseCache` with global singleton in `cache/mod.rs::GLOBAL_FILE_CACHE`
+- **Purpose**: Eliminate redundant I/O and JSON parsing operations across all commands
+- **Architecture**:
+  - Thread-safe singleton using `once_cell::sync::Lazy`
+  - Uses `Arc<Value>` for zero-cost cloning of cached results
+  - Modification-time tracking for cache invalidation
+  - RwLock for concurrent read access with occasional write updates
+- **Cache Strategy**:
+  - Key: file path (PathBuf)
+  - Value: CachedFile { modified_time, Arc<Value> }
+  - Cache hit: Returns Arc::clone() if file hasn't been modified (zero allocation)
+  - Cache miss: Calls `analyze_jsonl_file()`, stores result, returns Arc
+- **Benefits**:
+  - Avoids re-parsing unchanged session files across multiple commands
+  - Reduces memory footprint (Arc sharing vs. full clones)
+  - Improves responsiveness for repeated queries
+  - Automatic invalidation when files are modified
+- **API**:
+  - `global_cache()`: Get reference to global cache singleton
+  - `get_or_parse(path)`: Get cached result or parse file if needed
+  - `clear()`: Clear all cached entries
+  - `cleanup_stale()`: Remove entries for deleted files
+  - `stats()`: Get cache statistics (entry count, estimated memory)
+  - `invalidate(path)`: Remove specific file from cache
+- **Usage Pattern**:
+  ```rust
+  use vibe_coding_tracker::cache::global_cache;
+
+  // Get or parse file with automatic caching
+  let analysis = global_cache().get_or_parse(&file_path)?;
+  // analysis is Arc<Value> - cheap to clone, shared with cache
+  ```
 
 ### Data Format Detection
 
@@ -344,31 +415,51 @@ docker run --rm \
 
 **CLI & Serialization:**
 
-- `clap` (derive) - CLI parsing
+- `clap` (derive) - CLI parsing with environment variable support
 - `serde`, `serde_json` - JSON handling
 
 **TUI:**
 
-- `ratatui` - Terminal UI framework
-- `crossterm` - Terminal control
-- `comfy-table` - Static table rendering
-- `owo-colors` - Color output
+- `ratatui` - Terminal UI framework for interactive dashboards
+- `crossterm` - Terminal control (keyboard, mouse, colors)
+- `comfy-table` - Static table rendering with UTF8 borders
+- `owo-colors` - Color output for terminal
 
 **Core:**
 
-- `anyhow`, `thiserror` - Error handling
-- `chrono` - Date/time
+- `anyhow` - Error handling with context
+- `chrono` (serde) - Date/time handling with serialization
 - `reqwest` (rustls-tls) - HTTP client for pricing fetch and update downloads
 - `walkdir` - Directory traversal
 - `regex` - Pattern matching
-- `strsim` - Fuzzy string matching (Jaro-Winkler)
+- `strsim` - Fuzzy string matching (Jaro-Winkler) for model name matching
 - `semver` - Semantic version parsing and comparison (for update command)
-- `flate2` - Gzip decompression (for .tar.gz archives)
-- `tar` - Tar archive extraction
-- `zip` - Zip archive extraction
 - `home` - Home directory resolution
-- `hostname` - System hostname
-- `sysinfo` - Memory/system stats
+- `hostname` - System hostname detection
+- `sysinfo` - Memory/system stats for monitoring
+- `env_logger`, `log` - Logging infrastructure
+
+**Performance:**
+
+- `mimalloc` - High-performance memory allocator (global allocator)
+- `rayon` - Parallel processing for file operations
+- `bytecount` - Fast byte counting for line counting optimization
+- `memchr` - Fast string search operations
+- `itoa` - Fast integer formatting
+- `once_cell` - Lazy static initialization for singletons
+
+**Archive Handling:**
+
+- `flate2` - Gzip decompression (for .tar.gz archives)
+- `tar` - Tar archive extraction (Linux/macOS)
+- `zip` - Zip archive extraction (Windows)
+
+**Development:**
+
+- `tempfile` - Temporary file/directory creation for tests
+- `assert_cmd` - CLI testing utilities
+- `predicates` - Assertion predicates for tests
+- `criterion` - Benchmarking framework with HTML reports
 
 ## Important Patterns
 
@@ -455,11 +546,26 @@ docker run --rm \
   - **Interactive TUI**: Dedicated "Daily Averages" panel below summary statistics
   - **Static Table**: Separate table displayed after main usage table
   - Provider-specific rows (Claude Code, Codex, Gemini) + OVERALL row
-- **Implementation Location**: `src/usage/display.rs`
+- **Implementation Location**: `src/display/common/averages.rs` and `src/display/usage/averages.rs`
   - `ProviderStats` struct: tracks total tokens, cost, and day count per provider
   - `DailyAverages` struct: aggregates all provider statistics with calculation methods
   - `detect_provider()`: identifies provider from model name
   - `calculate_daily_averages()`: computes averages from usage rows
+
+**7. Performance Optimization with Global Cache:**
+
+- **File Parsing Cache**: Use `cache::global_cache()` to avoid redundant I/O and JSON parsing
+  - Automatically checks file modification time before re-parsing
+  - Returns `Arc<Value>` for zero-cost cloning of cached results
+  - Thread-safe singleton accessible from any part of the application
+- **Memory Allocator**: Uses `mimalloc` as global allocator for faster memory operations
+  - Configured in `main.rs` with `#[global_allocator]`
+  - Reduces allocation overhead compared to system allocator
+- **Parallel Processing**: Uses `rayon` for parallel file processing where applicable
+- **Fast String Operations**: Uses `bytecount` and `memchr` for optimized string/byte operations
+- **Cache Statistics**: Monitor cache performance with `global_cache().stats()`
+  - Returns entry count and estimated memory usage
+  - Useful for debugging and performance tuning
 
 ## Session File Locations
 
@@ -617,14 +723,48 @@ ls -la ~/.gemini/tmp/
 }
 ```
 
-## Release Profile
+## Build Configuration
+
+### Release Profile
 
 The release build uses aggressive optimizations:
 
-- LTO: thin
-- Codegen units: 1
-- Stripped symbols
+- `opt-level = 3`: Maximum optimization
+- `lto = "thin"`: Link-time optimization (thin mode for balance)
+- `codegen-units = 1`: Better optimization at cost of compile time
+- `strip = "symbols"`: Strip debug symbols for smaller binary
+- `panic = "abort"`: Faster panic handling, smaller binary
+- `overflow-checks = false`: Disable overflow checks in release (faster)
 - Target binary size: ~3-5 MB
+
+### Distribution Profile
+
+For maximum performance in distribution builds:
+
+```bash
+cargo build --profile dist
+```
+
+- Inherits from release profile
+- `lto = "fat"`: Full LTO for maximum performance (slower compile)
+- Same optimization settings as release
+
+### Benchmarking
+
+The project includes a benchmark suite using Criterion:
+
+```bash
+# Run all benchmarks
+cargo bench
+
+# Run specific benchmark
+cargo bench --bench benchmarks
+
+# Generate HTML reports (in target/criterion/)
+cargo bench -- --save-baseline main
+```
+
+Benchmark location: `benches/benchmarks.rs`
 
 ## GitHub Workflows and Release Process
 
