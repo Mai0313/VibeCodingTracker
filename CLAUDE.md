@@ -20,6 +20,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **PowerShell** (Windows): `powershell -ExecutionPolicy ByPass -c "[System.Net.ServicePointManager]::ServerCertificateValidationCallback={$true}; irm https://github.com/Mai0313/VibeCodingTracker/raw/main/scripts/install.ps1 | iex"`
 - **Build from source**: Clone repo and `cargo build --release`
 
+## Requirements
+
+**Rust Version**: 1.85 or higher (required)
+**Rust Edition**: 2024 (configured in `Cargo.toml`)
+
+This project uses Rust 2024 edition features and requires Rust 1.85+. Make sure your Rust toolchain is up to date:
+
+```bash
+rustc --version  # Should be 1.85.0 or higher
+rustup update    # Update if needed
+```
+
 ## Build & Development Commands
 
 ```bash

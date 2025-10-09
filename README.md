@@ -126,7 +126,9 @@ Install using Cargo from the official Rust package registry:
 cargo install vibe_coding_tracker
 ```
 
-**Prerequisites**: [Rust toolchain](https://rustup.rs/) 1.80 or higher
+**Prerequisites**: [Rust toolchain](https://rustup.rs/) 1.85 or higher
+
+> **Note**: This project uses **Rust 2024 edition** and requires Rust 1.85+. Update your toolchain with `rustup update` if needed.
 
 #### Method 4: Build from Source
 
@@ -153,7 +155,9 @@ ln -sf "$(pwd)/target/release/vibe_coding_tracker" ~/.local/bin/vct
 # Make sure ~/.local/bin is in your PATH
 ```
 
-**Prerequisites**: [Rust toolchain](https://rustup.rs/) 1.80 or higher
+**Prerequisites**: [Rust toolchain](https://rustup.rs/) 1.85 or higher
+
+> **Note**: This project uses **Rust 2024 edition** and requires Rust 1.85+. Update your toolchain with `rustup update` if needed.
 
 #### Method 5: Quick Install via Curl (Linux/macOS)
 
