@@ -2382,6 +2382,7 @@ dependencies = [
  "flate2",
  "home",
  "hostname",
+ "itoa",
  "log",
  "owo-colors",
  "predicates",

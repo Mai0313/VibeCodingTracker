@@ -1,9 +1,9 @@
-use crate::display::common::ProviderAverage;
+use crate::display::common::{DailyAverageRow, ProviderAverage, ProviderStatistics};
 use crate::models::Provider;
 use crate::utils::format_number;
 use serde_json::Value;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::HashMap;
 
 /// Data structure for a usage row
 #[derive(Default)]
@@ -41,7 +41,7 @@ impl UsageTotals {
     }
 }
 
-/// Provider-specific statistics
+/// Provider-specific statistics for usage
 #[derive(Default, Clone)]
 pub struct ProviderStats {
     pub total_tokens: i64,
@@ -67,14 +67,29 @@ impl ProviderStats {
     }
 }
 
-/// Daily averages grouped by provider
-#[derive(Default)]
-pub struct DailyAverages {
-    pub claude: ProviderStats,
-    pub codex: ProviderStats,
-    pub gemini: ProviderStats,
-    pub overall: ProviderStats,
+impl ProviderStatistics<UsageRow> for ProviderStats {
+    fn accumulate(&mut self, row: &UsageRow, _provider: Provider) {
+        self.total_tokens += row.total;
+        self.total_cost += row.cost;
+    }
+
+    fn set_days(&mut self, days: usize) {
+        self.days_count = days;
+    }
 }
+
+impl DailyAverageRow for UsageRow {
+    fn date(&self) -> &str {
+        &self.date
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+}
+
+/// Type alias for daily averages with usage statistics
+pub type DailyAverages = crate::display::common::DailyAverages<UsageRow, ProviderStats>;
 
 /// Summary of usage data
 #[derive(Default)]
@@ -84,67 +99,9 @@ pub struct UsageSummary {
     pub daily_averages: DailyAverages,
 }
 
-/// Calculate daily averages grouped by provider (optimized with BTreeMap)
+/// Calculate daily averages grouped by provider (uses generic implementation)
 pub fn calculate_daily_averages(rows: &[UsageRow]) -> DailyAverages {
-    let mut averages = DailyAverages::default();
-
-    // Use BTreeMap for date storage (already sorted, no String cloning for keys)
-    let mut date_provider_map: BTreeMap<&str, HashSet<Provider>> = BTreeMap::new();
-
-    // Group by date and provider to count unique days per provider
-    for row in rows {
-        let provider = Provider::from_model_name(&row.model);
-        date_provider_map
-            .entry(&row.date)
-            .or_insert_with(|| HashSet::with_capacity(3)) // Max 3 providers
-            .insert(provider);
-    }
-
-    // Count days per provider using BTreeMap (avoids HashSet cloning)
-    let mut claude_days = 0;
-    let mut codex_days = 0;
-    let mut gemini_days = 0;
-
-    for providers in date_provider_map.values() {
-        if providers.contains(&Provider::ClaudeCode) {
-            claude_days += 1;
-        }
-        if providers.contains(&Provider::Codex) {
-            codex_days += 1;
-        }
-        if providers.contains(&Provider::Gemini) {
-            gemini_days += 1;
-        }
-    }
-
-    averages.claude.days_count = claude_days;
-    averages.codex.days_count = codex_days;
-    averages.gemini.days_count = gemini_days;
-    averages.overall.days_count = date_provider_map.len();
-
-    // Accumulate totals
-    for row in rows {
-        let provider = Provider::from_model_name(&row.model);
-        match provider {
-            Provider::ClaudeCode => {
-                averages.claude.total_tokens += row.total;
-                averages.claude.total_cost += row.cost;
-            }
-            Provider::Codex => {
-                averages.codex.total_tokens += row.total;
-                averages.codex.total_cost += row.cost;
-            }
-            Provider::Gemini => {
-                averages.gemini.total_tokens += row.total;
-                averages.gemini.total_cost += row.cost;
-            }
-            Provider::Unknown => {}
-        }
-        averages.overall.total_tokens += row.total;
-        averages.overall.total_cost += row.cost;
-    }
-
-    averages
+    crate::display::common::calculate_daily_averages(rows)
 }
 
 /// Build provider average rows for display
