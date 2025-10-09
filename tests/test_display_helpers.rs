@@ -3,7 +3,7 @@
 // These tests focus on testable components
 
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use vibe_coding_tracker::analysis::AggregatedAnalysisRow;
 use vibe_coding_tracker::models::DateUsageResult;
 
@@ -50,7 +50,7 @@ fn test_analysis_display_table_empty() {
 
 #[test]
 fn test_usage_display_table_with_data() {
-    let mut usage_data: DateUsageResult = HashMap::new();
+    let mut usage_data: DateUsageResult = BTreeMap::new();
     let mut models = HashMap::new();
 
     models.insert(
@@ -71,7 +71,7 @@ fn test_usage_display_table_with_data() {
 
 #[test]
 fn test_usage_display_table_empty() {
-    let usage_data: DateUsageResult = HashMap::new();
+    let usage_data: DateUsageResult = BTreeMap::new();
 
     // Test that display_usage_table handles empty data gracefully
     vibe_coding_tracker::usage::display_usage_table(&usage_data);
@@ -79,7 +79,7 @@ fn test_usage_display_table_empty() {
 
 #[test]
 fn test_usage_display_text_with_data() {
-    let mut usage_data: DateUsageResult = HashMap::new();
+    let mut usage_data: DateUsageResult = BTreeMap::new();
     let mut models = HashMap::new();
 
     models.insert(
@@ -100,7 +100,7 @@ fn test_usage_display_text_with_data() {
 
 #[test]
 fn test_usage_display_text_empty() {
-    let usage_data: DateUsageResult = HashMap::new();
+    let usage_data: DateUsageResult = BTreeMap::new();
 
     // Test that display_usage_text handles empty data gracefully
     vibe_coding_tracker::usage::display_usage_text(&usage_data);
@@ -108,7 +108,7 @@ fn test_usage_display_text_empty() {
 
 #[test]
 fn test_usage_display_text_multiple_models() {
-    let mut usage_data: DateUsageResult = HashMap::new();
+    let mut usage_data: DateUsageResult = BTreeMap::new();
     let mut models = HashMap::new();
 
     models.insert(
@@ -138,7 +138,7 @@ fn test_usage_display_text_multiple_models() {
 
 #[test]
 fn test_usage_display_table_codex_format() {
-    let mut usage_data: DateUsageResult = HashMap::new();
+    let mut usage_data: DateUsageResult = BTreeMap::new();
     let mut models = HashMap::new();
 
     models.insert(
@@ -181,7 +181,7 @@ fn test_analysis_display_table_large_numbers() {
 
 #[test]
 fn test_usage_display_table_multiple_dates() {
-    let mut usage_data: DateUsageResult = HashMap::new();
+    let mut usage_data: DateUsageResult = BTreeMap::new();
 
     for i in 1..=5 {
         let mut models = HashMap::new();
@@ -220,7 +220,7 @@ fn test_analysis_display_table_zero_values() {
 
 #[test]
 fn test_usage_display_text_sorted_output() {
-    let mut usage_data: DateUsageResult = HashMap::new();
+    let mut usage_data: DateUsageResult = BTreeMap::new();
 
     // Insert dates out of order
     for date in ["2025-10-03", "2025-10-01", "2025-10-02"] {
@@ -241,7 +241,7 @@ fn test_usage_display_text_sorted_output() {
 
 #[test]
 fn test_usage_display_table_with_daily_averages_single_provider() {
-    let mut usage_data: DateUsageResult = HashMap::new();
+    let mut usage_data: DateUsageResult = BTreeMap::new();
 
     // Add multiple days for Claude only
     for i in 1..=3 {
@@ -264,7 +264,7 @@ fn test_usage_display_table_with_daily_averages_single_provider() {
 
 #[test]
 fn test_usage_display_table_with_daily_averages_multiple_providers() {
-    let mut usage_data: DateUsageResult = HashMap::new();
+    let mut usage_data: DateUsageResult = BTreeMap::new();
 
     // Day 1: Claude
     let mut day1_models = HashMap::new();
@@ -308,7 +308,7 @@ fn test_usage_display_table_with_daily_averages_multiple_providers() {
 
 #[test]
 fn test_usage_display_table_with_daily_averages_mixed_providers() {
-    let mut usage_data: DateUsageResult = HashMap::new();
+    let mut usage_data: DateUsageResult = BTreeMap::new();
 
     // Day 1: Claude and Codex
     let mut day1_models = HashMap::new();
@@ -365,7 +365,7 @@ fn test_usage_display_table_with_daily_averages_mixed_providers() {
 
 #[test]
 fn test_usage_display_table_with_daily_averages_o1_models() {
-    let mut usage_data: DateUsageResult = HashMap::new();
+    let mut usage_data: DateUsageResult = BTreeMap::new();
     let mut models = HashMap::new();
 
     // Test o1 models are detected as Codex

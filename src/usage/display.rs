@@ -125,7 +125,7 @@ fn build_usage_summary(
     let estimated_size: usize = usage_data.values().map(|m| m.len()).sum();
     summary.rows.reserve(estimated_size);
 
-    // Sort dates using BTreeMap iteration (already sorted)
+    // Iterate in chronological order (BTreeMap is automatically sorted by date)
     for (date, date_usage) in usage_data.iter() {
         // Collect and sort models
         let mut models: Vec<_> = date_usage.iter().collect();

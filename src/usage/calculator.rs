@@ -3,7 +3,7 @@ use crate::models::DateUsageResult;
 use crate::utils::{collect_files_with_dates, is_gemini_chat_file, is_json_file, resolve_paths};
 use anyhow::Result;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 /// Extract conversation usage from CodeAnalysis result
@@ -42,8 +42,8 @@ fn extract_conversation_usage_from_analysis(analysis: &Value) -> HashMap<String,
 /// Calculate usage from all directories
 pub fn get_usage_from_directories() -> Result<DateUsageResult> {
     let paths = resolve_paths()?;
-    // Pre-allocate HashMap with estimated capacity (typical: ~30 dates)
-    let mut result = HashMap::with_capacity(30);
+    // Use BTreeMap for automatic chronological sorting by date
+    let mut result = BTreeMap::new();
 
     if paths.claude_session_dir.exists() {
         process_usage_directory(&paths.claude_session_dir, &mut result, is_json_file)?;
