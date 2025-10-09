@@ -169,8 +169,8 @@ pub fn display_analysis_interactive(data: &[AggregatedAnalysisRow]) -> anyhow::R
                 .constraints([
                     Constraint::Length(3),      // Title
                     Constraint::Min(10),        // Table
-                    Constraint::Length(3),      // Summary
                     Constraint::Length(avg_height), // Daily Averages
+                    Constraint::Length(3),      // Summary
                     Constraint::Length(2),      // Controls
                 ])
                 .split(f.area());
@@ -297,63 +297,6 @@ pub fn display_analysis_interactive(data: &[AggregatedAnalysisRow]) -> anyhow::R
 
             f.render_widget(table, chunks[1]);
 
-            // Get memory usage
-            let memory_mb = sys
-                .process(pid)
-                .map_or(0.0, |p| p.memory() as f64 / 1024.0 / 1024.0);
-
-            // Summary
-            let summary = Paragraph::new(vec![Line::from(vec![
-                Span::styled(
-                    "📝 Total Lines: ",
-                    Style::default().fg(RatatuiColor::Yellow).bold(),
-                ),
-                Span::styled(
-                    format_number(totals.edit_lines + totals.read_lines + totals.write_lines),
-                    Style::default().fg(RatatuiColor::Green).bold(),
-                ),
-                Span::raw("  |  "),
-                Span::styled(
-                    "🔧 Total Tools: ",
-                    Style::default().fg(RatatuiColor::Cyan).bold(),
-                ),
-                Span::styled(
-                    format_number(
-                        totals.bash_count
-                            + totals.edit_count
-                            + totals.read_count
-                            + totals.todo_write_count
-                            + totals.write_count,
-                    ),
-                    Style::default().fg(RatatuiColor::Magenta).bold(),
-                ),
-                Span::raw("  |  "),
-                Span::styled(
-                    "📅 Entries: ",
-                    Style::default().fg(RatatuiColor::Blue).bold(),
-                ),
-                Span::styled(
-                    format!("{}", rows_data.len()),
-                    Style::default().fg(RatatuiColor::White).bold(),
-                ),
-                Span::raw("  |  "),
-                Span::styled(
-                    "🧠 Memory: ",
-                    Style::default().fg(RatatuiColor::LightRed).bold(),
-                ),
-                Span::styled(
-                    format!("{:.1} MB", memory_mb),
-                    Style::default().fg(RatatuiColor::LightYellow).bold(),
-                ),
-            ])])
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(RatatuiColor::Yellow)),
-            )
-            .centered();
-            f.render_widget(summary, chunks[2]);
-
             // Daily Averages Table
             let mut avg_rows: Vec<RatatuiRow> = provider_rows
                 .iter()
@@ -441,7 +384,64 @@ pub fn display_analysis_interactive(data: &[AggregatedAnalysisRow]) -> anyhow::R
                         .border_style(Style::default().fg(RatatuiColor::Magenta)),
                 );
 
-            f.render_widget(average_table, chunks[3]);
+            f.render_widget(average_table, chunks[2]);
+
+            // Get memory usage
+            let memory_mb = sys
+                .process(pid)
+                .map_or(0.0, |p| p.memory() as f64 / 1024.0 / 1024.0);
+
+            // Summary
+            let summary = Paragraph::new(vec![Line::from(vec![
+                Span::styled(
+                    "📝 Total Lines: ",
+                    Style::default().fg(RatatuiColor::Yellow).bold(),
+                ),
+                Span::styled(
+                    format_number(totals.edit_lines + totals.read_lines + totals.write_lines),
+                    Style::default().fg(RatatuiColor::Green).bold(),
+                ),
+                Span::raw("  |  "),
+                Span::styled(
+                    "🔧 Total Tools: ",
+                    Style::default().fg(RatatuiColor::Cyan).bold(),
+                ),
+                Span::styled(
+                    format_number(
+                        totals.bash_count
+                            + totals.edit_count
+                            + totals.read_count
+                            + totals.todo_write_count
+                            + totals.write_count,
+                    ),
+                    Style::default().fg(RatatuiColor::Magenta).bold(),
+                ),
+                Span::raw("  |  "),
+                Span::styled(
+                    "📅 Entries: ",
+                    Style::default().fg(RatatuiColor::Blue).bold(),
+                ),
+                Span::styled(
+                    format!("{}", rows_data.len()),
+                    Style::default().fg(RatatuiColor::White).bold(),
+                ),
+                Span::raw("  |  "),
+                Span::styled(
+                    "🧠 Memory: ",
+                    Style::default().fg(RatatuiColor::LightRed).bold(),
+                ),
+                Span::styled(
+                    format!("{:.1} MB", memory_mb),
+                    Style::default().fg(RatatuiColor::LightYellow).bold(),
+                ),
+            ])])
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(RatatuiColor::Yellow)),
+            )
+            .centered();
+            f.render_widget(summary, chunks[3]);
 
             // Controls
             let controls = Paragraph::new(vec![Line::from(vec![

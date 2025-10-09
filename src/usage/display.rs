@@ -290,8 +290,8 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
                 .constraints([
                     Constraint::Length(3),
                     Constraint::Min(10),
-                    Constraint::Length(3),
                     Constraint::Length(avg_height),
+                    Constraint::Length(3),
                     Constraint::Length(2),
                 ])
                 .split(f.area());
@@ -407,55 +407,6 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
 
             f.render_widget(table, chunks[1]);
 
-            let memory_mb = sys
-                .process(pid)
-                .map_or(0.0, |p| p.memory() as f64 / 1024.0 / 1024.0);
-
-            let summary = Paragraph::new(vec![Line::from(vec![
-                Span::styled(
-                    "💰 Total Cost: ",
-                    Style::default().fg(RatatuiColor::Yellow).bold(),
-                ),
-                Span::styled(
-                    format!("${:.2}", totals.cost),
-                    Style::default().fg(RatatuiColor::Green).bold(),
-                ),
-                Span::raw("  |  "),
-                Span::styled(
-                    "🔢 Total Tokens: ",
-                    Style::default().fg(RatatuiColor::Cyan).bold(),
-                ),
-                Span::styled(
-                    format_number(totals.total),
-                    Style::default().fg(RatatuiColor::Magenta).bold(),
-                ),
-                Span::raw("  |  "),
-                Span::styled(
-                    "📅 Entries: ",
-                    Style::default().fg(RatatuiColor::Blue).bold(),
-                ),
-                Span::styled(
-                    format!("{}", rows_data.len()),
-                    Style::default().fg(RatatuiColor::White).bold(),
-                ),
-                Span::raw("  |  "),
-                Span::styled(
-                    "🧠 Memory: ",
-                    Style::default().fg(RatatuiColor::LightRed).bold(),
-                ),
-                Span::styled(
-                    format!("{:.1} MB", memory_mb),
-                    Style::default().fg(RatatuiColor::LightYellow).bold(),
-                ),
-            ])])
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(RatatuiColor::Yellow)),
-            )
-            .centered();
-            f.render_widget(summary, chunks[2]);
-
             let mut avg_rows: Vec<RatatuiRow> = provider_rows
                 .iter()
                 .map(|row| {
@@ -518,7 +469,56 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
                         .border_style(Style::default().fg(RatatuiColor::Magenta)),
                 );
 
-            f.render_widget(average_table, chunks[3]);
+            f.render_widget(average_table, chunks[2]);
+
+            let memory_mb = sys
+                .process(pid)
+                .map_or(0.0, |p| p.memory() as f64 / 1024.0 / 1024.0);
+
+            let summary = Paragraph::new(vec![Line::from(vec![
+                Span::styled(
+                    "💰 Total Cost: ",
+                    Style::default().fg(RatatuiColor::Yellow).bold(),
+                ),
+                Span::styled(
+                    format!("${:.2}", totals.cost),
+                    Style::default().fg(RatatuiColor::Green).bold(),
+                ),
+                Span::raw("  |  "),
+                Span::styled(
+                    "🔢 Total Tokens: ",
+                    Style::default().fg(RatatuiColor::Cyan).bold(),
+                ),
+                Span::styled(
+                    format_number(totals.total),
+                    Style::default().fg(RatatuiColor::Magenta).bold(),
+                ),
+                Span::raw("  |  "),
+                Span::styled(
+                    "📅 Entries: ",
+                    Style::default().fg(RatatuiColor::Blue).bold(),
+                ),
+                Span::styled(
+                    format!("{}", rows_data.len()),
+                    Style::default().fg(RatatuiColor::White).bold(),
+                ),
+                Span::raw("  |  "),
+                Span::styled(
+                    "🧠 Memory: ",
+                    Style::default().fg(RatatuiColor::LightRed).bold(),
+                ),
+                Span::styled(
+                    format!("{:.1} MB", memory_mb),
+                    Style::default().fg(RatatuiColor::LightYellow).bold(),
+                ),
+            ])])
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(RatatuiColor::Yellow)),
+            )
+            .centered();
+            f.render_widget(summary, chunks[3]);
 
             let controls = Paragraph::new(vec![Line::from(vec![
                 Span::styled("Press ", Style::default().fg(RatatuiColor::DarkGray)),
