@@ -126,7 +126,7 @@ uv pip install vibe_coding_tracker
 cargo install vibe_coding_tracker
 ```
 
-**前提条件**: [Rust 工具链](https://rustup.rs/) 1.70 或更高版本
+**前提条件**: [Rust 工具链](https://rustup.rs/) 1.80 或更高版本
 
 #### 方式 4: 从源码编译
 
@@ -153,7 +153,7 @@ ln -sf "$(pwd)/target/release/vibe_coding_tracker" ~/.local/bin/vct
 # 确保 ~/.local/bin 在您的 PATH 中
 ```
 
-**前提条件**: [Rust 工具链](https://rustup.rs/) 1.70 或更高版本
+**前提条件**: [Rust 工具链](https://rustup.rs/) 1.80 或更高版本
 
 #### 方式 5: 通过 Curl 快速安装 (Linux/macOS)
 
