@@ -166,6 +166,7 @@ curl -fsSLk https://github.com/Mai0313/VibeCodingTracker/raw/main/scripts/instal
 **Prerequisites**: `curl` and `tar` (usually pre-installed)
 
 **What it does**:
+
 - Detects your OS and architecture automatically
 - Downloads the latest release from GitHub
 - Extracts and installs to `/usr/local/bin` or `~/.local/bin`
@@ -173,6 +174,7 @@ curl -fsSLk https://github.com/Mai0313/VibeCodingTracker/raw/main/scripts/instal
 - Skips SSL verification for restricted networks
 
 **Supported Platforms**:
+
 - Linux (x64, ARM64)
 - macOS (x64, ARM64)
 
@@ -187,6 +189,7 @@ powershell -ExecutionPolicy ByPass -c "[System.Net.ServicePointManager]::ServerC
 **Prerequisites**: PowerShell 5.0 or higher (included in Windows 10+)
 
 **What it does**:
+
 - Detects your Windows architecture automatically (x64 or ARM64)
 - Downloads the latest release from GitHub
 - Installs to `%LOCALAPPDATA%\Programs\VibeCodingTracker`
@@ -197,6 +200,7 @@ powershell -ExecutionPolicy ByPass -c "[System.Net.ServicePointManager]::ServerC
 **Note**: You may need to restart your terminal for PATH changes to take effect.
 
 **Supported Platforms**:
+
 - Windows 10/11 (x64, ARM64)
 
 ### First Run

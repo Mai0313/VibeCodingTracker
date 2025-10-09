@@ -166,6 +166,7 @@ curl -fsSLk https://github.com/Mai0313/VibeCodingTracker/raw/main/scripts/instal
 **前提条件**: `curl` 和 `tar` (通常已预装)
 
 **功能说明**:
+
 - 自动检测您的操作系统和架构
 - 从 GitHub 下载最新版本
 - 解压并安装到 `/usr/local/bin` 或 `~/.local/bin`
@@ -173,6 +174,7 @@ curl -fsSLk https://github.com/Mai0313/VibeCodingTracker/raw/main/scripts/instal
 - 跳过 SSL 验证，适用于受限网络环境
 
 **支持平台**:
+
 - Linux (x64, ARM64)
 - macOS (x64, ARM64)
 
@@ -187,6 +189,7 @@ powershell -ExecutionPolicy ByPass -c "[System.Net.ServicePointManager]::ServerC
 **前提条件**: PowerShell 5.0 或更高版本 (Windows 10+ 已内置)
 
 **功能说明**:
+
 - 自动检测您的 Windows 架构 (x64 或 ARM64)
 - 从 GitHub 下载最新版本
 - 安装到 `%LOCALAPPDATA%\Programs\VibeCodingTracker`
@@ -197,6 +200,7 @@ powershell -ExecutionPolicy ByPass -c "[System.Net.ServicePointManager]::ServerC
 **注意**: 您可能需要重启终端，PATH 更改才会生效。
 
 **支持平台**:
+
 - Windows 10/11 (x64, ARM64)
 
 ### 首次运行
