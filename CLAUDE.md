@@ -151,8 +151,8 @@ src/
 
 - `main.rs::Commands::Usage` → `usage/calculator.rs::get_usage_from_directories()`
   - Scans `~/.claude/projects/*.jsonl`, `~/.codex/sessions/*.jsonl`, and `~/.gemini/tmp/*.jsonl`
-  - For each file, calls `analysis/analyzer.rs::analyze_jsonl_file()` for unified parsing
-  - Extracts `conversationUsage` from `CodeAnalysis` result
+  - For each file, calls `analysis/analyzer.rs::analyze_jsonl_file()` for unified parsing (same function used by analysis command)
+  - Extracts only `conversationUsage` from `CodeAnalysis` result (post-processing: focuses on token usage)
   - Aggregates token usage by date and model into `DateUsageResult`
 - `pricing.rs::fetch_model_pricing()` → fetches/caches LiteLLM pricing daily
 - `usage/display.rs::display_usage_*()` → formats output (interactive/table/text/JSON)
@@ -174,10 +174,10 @@ src/
 **Batch Mode** (without `--path`):
 
 - `main.rs::Commands::Analysis` → `analysis/batch_analyzer.rs::analyze_all_sessions()`
-  - Scans `~/.claude/projects/*.jsonl`, `~/.codex/sessions/*.jsonl`, and `~/.gemini/tmp/*.jsonl`
-  - For each file, calls `analyze_jsonl_file()` (same as Usage command)
-  - Extracts metrics from `CodeAnalysis` results and aggregates by date and model
-  - Groups metrics: edit/read/write lines, tool call counts (Bash, Edit, Read, TodoWrite, Write)
+  - Scans `~/.claude/projects/*.jsonl`, `~/.codex/sessions/*.jsonl`, and `~/.gemini/tmp/*.jsonl` (same directories as usage command)
+  - For each file, calls `analyze_jsonl_file()` (same unified parsing function as usage command)
+  - Extracts different metrics from `CodeAnalysis` results (post-processing: focuses on file operations and tool calls)
+  - Aggregates metrics by date and model: edit/read/write lines, tool call counts (Bash, Edit, Read, TodoWrite, Write)
 - `analysis/display.rs::display_analysis_interactive()` → Interactive TUI (default)
   - Ratatui-based table with 1-second refresh
   - Columns: Date, Model, Edit Lines, Read Lines, Write Lines, Bash, Edit, Read, TodoWrite, Write
@@ -187,7 +187,8 @@ src/
 **Batch Mode with Provider Grouping** (with `--all`):
 
 - `main.rs::Commands::Analysis` → `analysis/batch_analyzer.rs::analyze_all_sessions_by_provider()`
-  - Scans and processes each provider directory separately
+  - Scans same directories as other commands: `~/.claude/projects/*.jsonl`, `~/.codex/sessions/*.jsonl`, `~/.gemini/tmp/*.jsonl`
+  - For each file, calls `analyze_jsonl_file()` (same unified parsing function)
   - Returns `ProviderGroupedAnalysis` struct with complete CodeAnalysis records for each provider
   - Output includes full records with all conversation usage, file operations, and tool call details
 - Default behavior: Outputs JSON directly to stdout
@@ -343,12 +344,47 @@ docker run --rm \
 **1. Unified Parsing Architecture:**
 
 - **Single Source of Truth**: All commands (`usage`, `analysis --path`, and `analysis`) use the same parsing pipeline via `analyze_jsonl_file()`
+- **Consistent File Scanning**: Both `usage` and `analysis` commands scan identical directories:
+  - `~/.claude/projects/*.jsonl` (Claude Code)
+  - `~/.codex/sessions/*.jsonl` (Codex)
+  - `~/.gemini/tmp/*.jsonl` (Gemini)
 - **Format Detection**: `detector.rs` automatically identifies Claude/Codex/Gemini format
 - **Parser Routing**: Routes to appropriate analyzer (`claude_analyzer`, `codex_analyzer`, `gemini_analyzer`)
-- **Data Extraction**:
-  - `usage` command extracts only `conversationUsage` from `CodeAnalysis`
-  - `analysis` command uses full `CodeAnalysis` including file operations and tool calls
-- **Benefits**: Eliminates code duplication, ensures consistency, and simplifies maintenance
+- **Data Extraction** (Post-processing differences):
+  - `usage` command: Extracts only `conversationUsage` from `CodeAnalysis` for token usage and cost calculation
+  - `analysis` command: Uses full `CodeAnalysis` including file operations, tool call counts, and detailed metrics
+- **Architecture Benefits**:
+  - Eliminates code duplication (single parsing logic for all commands)
+  - Ensures consistency (all commands see the same parsed data)
+  - Simplifies maintenance (changes to parsing logic automatically apply to all commands)
+  - Easy to extend (new features can extract different fields from the same `CodeAnalysis` result)
+
+**Data Flow Diagram:**
+
+```
+                    File Scanning
+    ┌─────────────────────────────────────┐
+    │ ~/.claude/projects/*.jsonl          │
+    │ ~/.codex/sessions/*.jsonl           │
+    │ ~/.gemini/tmp/*.jsonl                │
+    └─────────────────────────────────────┘
+                      │
+                      ▼
+              analyze_jsonl_file()
+            (Unified parsing pipeline)
+                      │
+                      ▼
+                CodeAnalysis
+              (Complete analysis result)
+                      │
+           ┌──────────┴──────────┐
+           │                     │
+        usage command         analysis command
+           │                     │
+    Extract conversationUsage  Extract all metrics
+           │                     │
+      Calculate cost/display   Display detailed analysis
+```
 
 **2. Cost Rounding:**
 
