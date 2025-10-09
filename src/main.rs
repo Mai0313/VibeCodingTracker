@@ -5,6 +5,10 @@ use owo_colors::OwoColorize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use vibe_coding_tracker::cli::{Cli, Commands};
+
+// Use mimalloc as the global allocator for better performance
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use vibe_coding_tracker::display::usage::{
     display_usage_interactive, display_usage_table, display_usage_text,
 };

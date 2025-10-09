@@ -220,7 +220,8 @@ fn parse_apply_patch_script(script: &str) -> Vec<CodexPatch> {
 
     let segment = &script[start..];
     let lines: Vec<&str> = segment.lines().collect();
-    let mut patches = Vec::new();
+    // Pre-allocate capacity based on typical patch count (1-5 patches)
+    let mut patches = Vec::with_capacity(3);
     let mut current: Option<CodexPatch> = None;
 
     for line in lines {
@@ -244,7 +245,7 @@ fn parse_apply_patch_script(script: &str) -> Vec<CodexPatch> {
             current = Some(CodexPatch {
                 action: "update".to_string(),
                 file_path,
-                lines: Vec::new(),
+                lines: Vec::with_capacity(20), // typical: 10-30 lines per patch
             });
         } else if line.starts_with("*** Add File:") {
             if let Some(patch) = current.take() {
@@ -254,7 +255,7 @@ fn parse_apply_patch_script(script: &str) -> Vec<CodexPatch> {
             current = Some(CodexPatch {
                 action: "add".to_string(),
                 file_path,
-                lines: Vec::new(),
+                lines: Vec::with_capacity(20),
             });
         } else if line.starts_with("*** Delete File:") {
             if let Some(patch) = current.take() {
@@ -267,7 +268,7 @@ fn parse_apply_patch_script(script: &str) -> Vec<CodexPatch> {
             current = Some(CodexPatch {
                 action: "delete".to_string(),
                 file_path,
-                lines: Vec::new(),
+                lines: Vec::with_capacity(20),
             });
         } else if let Some(ref mut patch) = current {
             patch.lines.push(line.to_string());
@@ -349,11 +350,12 @@ fn extract_cat_read(script: &str, output: &str) -> Option<(String, String)> {
 
         let path = fields[1].trim_matches(|c| c == '"' || c == '\'');
 
-        let mut clean_output = output.to_string();
-        if let Some(idx) = clean_output.find("\n---") {
-            clean_output = clean_output[..idx].to_string();
-        }
-        clean_output = clean_output.trim_end_matches('\n').to_string();
+        // Optimize: avoid multiple allocations
+        let clean_output = if let Some(idx) = output.find("\n---") {
+            output[..idx].trim_end_matches('\n').to_string()
+        } else {
+            output.trim_end_matches('\n').to_string()
+        };
 
         return Some((path.to_string(), clean_output));
     }

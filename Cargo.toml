@@ -72,6 +72,9 @@ bytecount = "0.6"
 # Fast memchr for string operations
 memchr = "2.7"
 
+# High-performance memory allocator
+mimalloc = { version = "0.1", default-features = false }
+
 # Archive extraction for update functionality
 flate2 = "1.1"
 tar = "0.4"
@@ -81,6 +84,11 @@ zip = "5.1"
 tempfile = "3.23"
 assert_cmd = "2.0"
 predicates = "3.1"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "benchmarks"
+harness = false
 
 [profile.release]
 opt-level = 3              # Maximum optimization

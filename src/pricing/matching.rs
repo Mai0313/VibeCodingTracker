@@ -185,28 +185,36 @@ pub fn clear_pricing_cache() {
 }
 
 /// Normalize model name by removing common version suffixes and prefixes
+/// Optimized to minimize allocations
 pub fn normalize_model_name(name: &str) -> String {
-    let mut normalized = name.to_string();
+    let mut start = 0;
+    let mut end = name.len();
+
+    // Remove provider prefixes (e.g., "bedrock/", "openai/") - do this first
+    if let Some(idx) = name.find('/') {
+        start = idx + 1;
+    }
+
+    // Work with the slice after removing prefix
+    let working_slice = &name[start..end];
 
     // Remove common date patterns (e.g., "-20231201", "-20240320")
-    if let Some(idx) = normalized.rfind("-20") {
-        if normalized[idx + 1..].len() == 8 {
-            // "-20YYMMDD" pattern (8 digits: 20YYMMDD)
-            normalized = normalized[..idx].to_string();
+    if let Some(idx) = working_slice.rfind("-20") {
+        let suffix_start = idx + 1; // Points to '2' in "-20..."
+        if working_slice.len() - suffix_start == 8 {
+            // "-20YYMMDD" pattern (8 chars: 20YYMMDD)
+            end = start + idx;
         }
     }
 
     // Remove version patterns (e.g., "-v1.0", "-v2")
-    if let Some(idx) = normalized.rfind("-v") {
-        normalized = normalized[..idx].to_string();
+    let working_slice2 = &name[start..end];
+    if let Some(idx) = working_slice2.rfind("-v") {
+        end = start + idx;
     }
 
-    // Remove provider prefixes (e.g., "bedrock/", "openai/")
-    if let Some(idx) = normalized.find('/') {
-        normalized = normalized[idx + 1..].to_string();
-    }
-
-    normalized
+    // Only allocate once at the end
+    name[start..end].to_string()
 }
 
 #[cfg(test)]
