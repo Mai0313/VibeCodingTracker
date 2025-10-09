@@ -37,7 +37,7 @@ fn test_analysis_display_table_with_data() {
     ];
 
     // Test that display_analysis_table doesn't panic with valid data
-    vibe_coding_tracker::analysis::display_analysis_table(&data);
+    vibe_coding_tracker::display::analysis::display_analysis_table(&data);
 }
 
 #[test]
@@ -45,7 +45,7 @@ fn test_analysis_display_table_empty() {
     let data: Vec<AggregatedAnalysisRow> = vec![];
 
     // Test that display_analysis_table handles empty data gracefully
-    vibe_coding_tracker::analysis::display_analysis_table(&data);
+    vibe_coding_tracker::display::analysis::display_analysis_table(&data);
 }
 
 #[test]
@@ -66,7 +66,7 @@ fn test_usage_display_table_with_data() {
     usage_data.insert("2025-10-01".to_string(), models);
 
     // Test that display_usage_table doesn't panic with valid data
-    vibe_coding_tracker::usage::display_usage_table(&usage_data);
+    vibe_coding_tracker::display::usage::display_usage_table(&usage_data);
 }
 
 #[test]
@@ -74,7 +74,7 @@ fn test_usage_display_table_empty() {
     let usage_data: DateUsageResult = BTreeMap::new();
 
     // Test that display_usage_table handles empty data gracefully
-    vibe_coding_tracker::usage::display_usage_table(&usage_data);
+    vibe_coding_tracker::display::usage::display_usage_table(&usage_data);
 }
 
 #[test]
@@ -95,7 +95,7 @@ fn test_usage_display_text_with_data() {
     usage_data.insert("2025-10-01".to_string(), models);
 
     // Test that display_usage_text doesn't panic with valid data
-    vibe_coding_tracker::usage::display_usage_text(&usage_data);
+    vibe_coding_tracker::display::usage::display_usage_text(&usage_data);
 }
 
 #[test]
@@ -103,7 +103,7 @@ fn test_usage_display_text_empty() {
     let usage_data: DateUsageResult = BTreeMap::new();
 
     // Test that display_usage_text handles empty data gracefully
-    vibe_coding_tracker::usage::display_usage_text(&usage_data);
+    vibe_coding_tracker::display::usage::display_usage_text(&usage_data);
 }
 
 #[test]
@@ -133,7 +133,7 @@ fn test_usage_display_text_multiple_models() {
     usage_data.insert("2025-10-01".to_string(), models);
 
     // Test with multiple models
-    vibe_coding_tracker::usage::display_usage_text(&usage_data);
+    vibe_coding_tracker::display::usage::display_usage_text(&usage_data);
 }
 
 #[test]
@@ -157,7 +157,7 @@ fn test_usage_display_table_codex_format() {
     usage_data.insert("2025-10-02".to_string(), models);
 
     // Test with Codex format
-    vibe_coding_tracker::usage::display_usage_table(&usage_data);
+    vibe_coding_tracker::display::usage::display_usage_table(&usage_data);
 }
 
 #[test]
@@ -176,7 +176,7 @@ fn test_analysis_display_table_large_numbers() {
     }];
 
     // Test with large numbers (should format with commas)
-    vibe_coding_tracker::analysis::display_analysis_table(&data);
+    vibe_coding_tracker::display::analysis::display_analysis_table(&data);
 }
 
 #[test]
@@ -196,7 +196,7 @@ fn test_usage_display_table_multiple_dates() {
     }
 
     // Test with multiple dates
-    vibe_coding_tracker::usage::display_usage_table(&usage_data);
+    vibe_coding_tracker::display::usage::display_usage_table(&usage_data);
 }
 
 #[test]
@@ -215,7 +215,7 @@ fn test_analysis_display_table_zero_values() {
     }];
 
     // Test with all zero values
-    vibe_coding_tracker::analysis::display_analysis_table(&data);
+    vibe_coding_tracker::display::analysis::display_analysis_table(&data);
 }
 
 #[test]
@@ -236,7 +236,7 @@ fn test_usage_display_text_sorted_output() {
     }
 
     // Text display should sort dates
-    vibe_coding_tracker::usage::display_usage_text(&usage_data);
+    vibe_coding_tracker::display::usage::display_usage_text(&usage_data);
 }
 
 #[test]
@@ -259,7 +259,7 @@ fn test_usage_display_table_with_daily_averages_single_provider() {
     }
 
     // Test that daily averages are calculated correctly for single provider
-    vibe_coding_tracker::usage::display_usage_table(&usage_data);
+    vibe_coding_tracker::display::usage::display_usage_table(&usage_data);
 }
 
 #[test]
@@ -303,7 +303,7 @@ fn test_usage_display_table_with_daily_averages_multiple_providers() {
     usage_data.insert("2025-10-03".to_string(), day3_models);
 
     // Test with multiple providers across different days
-    vibe_coding_tracker::usage::display_usage_table(&usage_data);
+    vibe_coding_tracker::display::usage::display_usage_table(&usage_data);
 }
 
 #[test]
@@ -360,7 +360,7 @@ fn test_usage_display_table_with_daily_averages_mixed_providers() {
     usage_data.insert("2025-10-02".to_string(), day2_models);
 
     // Test with mixed providers per day
-    vibe_coding_tracker::usage::display_usage_table(&usage_data);
+    vibe_coding_tracker::display::usage::display_usage_table(&usage_data);
 }
 
 #[test]
@@ -395,5 +395,5 @@ fn test_usage_display_table_with_daily_averages_o1_models() {
     usage_data.insert("2025-10-01".to_string(), models);
 
     // Test that o1/o3 models are correctly classified as Codex
-    vibe_coding_tracker::usage::display_usage_table(&usage_data);
+    vibe_coding_tracker::display::usage::display_usage_table(&usage_data);
 }

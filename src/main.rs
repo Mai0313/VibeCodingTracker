@@ -5,12 +5,13 @@ use owo_colors::OwoColorize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use vibe_coding_tracker::cli::{Cli, Commands};
+use vibe_coding_tracker::display::usage::{
+    display_usage_interactive, display_usage_table, display_usage_text,
+};
 use vibe_coding_tracker::pricing::{
     ModelPricingMap, ModelPricingResult, calculate_cost, fetch_model_pricing,
 };
-use vibe_coding_tracker::usage::{
-    display_usage_interactive, display_usage_table, display_usage_text, get_usage_from_directories,
-};
+use vibe_coding_tracker::usage::get_usage_from_directories;
 use vibe_coding_tracker::utils::extract_token_counts;
 use vibe_coding_tracker::{DateUsageResult, analyze_jsonl_file, get_version_info};
 
@@ -64,9 +65,11 @@ fn main() -> Result<()> {
                             )?;
                             println!("✅ Analysis result saved to: {}", output_path.display());
                         } else if table {
-                            vibe_coding_tracker::analysis::display_analysis_table(&analysis_data);
+                            vibe_coding_tracker::display::analysis::display_analysis_table(
+                                &analysis_data,
+                            );
                         } else {
-                            vibe_coding_tracker::analysis::display_analysis_interactive(
+                            vibe_coding_tracker::display::analysis::display_analysis_interactive(
                                 &analysis_data,
                             )?;
                         }
