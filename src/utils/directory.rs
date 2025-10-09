@@ -20,11 +20,12 @@ where
     P: AsRef<Path>,
     F: Fn(&Path) -> bool,
 {
-    let mut results = Vec::new();
-
     if !dir.as_ref().exists() {
-        return Ok(results);
+        return Ok(Vec::new());
     }
+
+    // Pre-allocate Vec with estimated capacity (typical: 10-50 session files)
+    let mut results = Vec::with_capacity(20);
 
     for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
         if !entry.file_type().is_file() {

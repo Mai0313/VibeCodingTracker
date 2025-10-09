@@ -2,6 +2,7 @@ use crate::analysis::analyze_jsonl_file;
 use crate::models::DateUsageResult;
 use crate::utils::{collect_files_with_dates, is_gemini_chat_file, is_json_file, resolve_paths};
 use anyhow::Result;
+use rayon::prelude::*;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -63,36 +64,45 @@ pub fn get_usage_from_directories() -> Result<DateUsageResult> {
 fn process_usage_directory<P, F>(dir: P, result: &mut DateUsageResult, filter_fn: F) -> Result<()>
 where
     P: AsRef<Path>,
-    F: Copy + Fn(&Path) -> bool,
+    F: Copy + Fn(&Path) -> bool + Sync + Send,
 {
     let dir = dir.as_ref();
     let files = collect_files_with_dates(dir, filter_fn)?;
 
-    for file_info in files {
-        match analyze_jsonl_file(&file_info.path) {
-            Ok(analysis) => {
-                let conversation_usage = extract_conversation_usage_from_analysis(&analysis);
-
-                // Use entry API to avoid double lookup
-                let date_entry = result
-                    .entry(file_info.modified_date)
-                    .or_insert_with(|| HashMap::with_capacity(3)); // typical: 1-3 models per date
-
-                for (model, usage_value) in conversation_usage {
-                    // Use entry API to avoid double lookup
-                    date_entry
-                        .entry(model)
-                        .and_modify(|existing| merge_usage_values(existing, &usage_value))
-                        .or_insert(usage_value);
+    // Process files in parallel for better performance
+    let file_results: Vec<(String, HashMap<String, Value>)> = files
+        .par_iter()
+        .filter_map(|file_info| {
+            match analyze_jsonl_file(&file_info.path) {
+                Ok(analysis) => {
+                    let conversation_usage = extract_conversation_usage_from_analysis(&analysis);
+                    Some((file_info.modified_date.clone(), conversation_usage))
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Failed to analyze {}: {}",
+                        file_info.path.display(),
+                        e
+                    );
+                    None
                 }
             }
-            Err(e) => {
-                eprintln!(
-                    "Warning: Failed to analyze {}: {}",
-                    file_info.path.display(),
-                    e
-                );
-            }
+        })
+        .collect();
+
+    // Merge parallel results sequentially (this part is fast)
+    for (date, conversation_usage) in file_results {
+        // Use entry API to avoid double lookup
+        let date_entry = result
+            .entry(date)
+            .or_insert_with(|| HashMap::with_capacity(3)); // typical: 1-3 models per date
+
+        for (model, usage_value) in conversation_usage {
+            // Use entry API to avoid double lookup
+            date_entry
+                .entry(model)
+                .and_modify(|existing| merge_usage_values(existing, &usage_value))
+                .or_insert(usage_value);
         }
     }
 

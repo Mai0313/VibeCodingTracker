@@ -19,7 +19,8 @@ pub fn analyze_gemini_conversations(mut data: Vec<Value>) -> Result<CodeAnalysis
     // Parse the Gemini session
     let session: GeminiSession = serde_json::from_value(data.remove(0))?;
 
-    let mut conversation_usage: HashMap<String, Value> = HashMap::new();
+    // Pre-allocate HashMap with typical capacity (1-3 models per conversation)
+    let mut conversation_usage: HashMap<String, Value> = HashMap::with_capacity(3);
     let mut last_timestamp = 0i64;
     let folder_path = String::new();
 
@@ -57,7 +58,7 @@ pub fn analyze_gemini_conversations(mut data: Vec<Value>) -> Result<CodeAnalysis
         run_command_details: vec![],
         tool_call_counts: tool_counts,
         conversation_usage,
-        task_id: session.session_id.clone(),
+        task_id: session.session_id,  // Consume session instead of cloning
         timestamp: last_timestamp,
         folder_path,
         git_remote_url,

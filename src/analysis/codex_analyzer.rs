@@ -23,18 +23,18 @@ pub fn analyze_codex_conversations(logs: &[CodexLog]) -> Result<CodeAnalysis> {
             "session_meta" => {
                 if state.folder_path.is_empty() {
                     if let Some(cwd) = &entry.payload.cwd {
-                        state.folder_path = cwd.clone();
+                        state.folder_path.clone_from(cwd);  // More efficient than clone()
                     }
                 }
                 if state.task_id.is_empty() {
                     if let Some(id) = &entry.payload.id {
-                        state.task_id = id.clone();
+                        state.task_id.clone_from(id);
                     }
                 }
                 if state.git_remote.is_empty() {
                     if let Some(git) = &entry.payload.git {
                         if let Some(url) = &git.repository_url {
-                            state.git_remote = url.clone();
+                            state.git_remote.clone_from(url);
                         }
                     }
                 }
@@ -42,11 +42,11 @@ pub fn analyze_codex_conversations(logs: &[CodexLog]) -> Result<CodeAnalysis> {
             "turn_context" => {
                 if state.folder_path.is_empty() {
                     if let Some(cwd) = &entry.payload.cwd {
-                        state.folder_path = cwd.clone();
+                        state.folder_path.clone_from(cwd);
                     }
                 }
                 if let Some(model) = &entry.payload.model {
-                    current_model = model.clone();
+                    current_model.clone_from(model);  // Reuse existing allocation
                 }
             }
             "event_msg" => {

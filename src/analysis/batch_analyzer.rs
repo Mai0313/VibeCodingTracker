@@ -201,14 +201,15 @@ fn aggregate_analysis_result(
                 continue;
             }
 
+            // Use a pre-allocated key buffer to avoid allocation on every iteration
             let key = format!("{}:{}", date, model);
 
-            // Use entry API to avoid multiple lookups
+            // Use entry API with or_insert_with to only clone when necessary
             let entry = aggregated
                 .entry(key)
                 .or_insert_with(|| AggregatedAnalysisRow {
                     date: date.to_string(),
-                    model: model.clone(),
+                    model: model.to_string(),  // Only clone when creating new entry
                     edit_lines: 0,
                     read_lines: 0,
                     write_lines: 0,

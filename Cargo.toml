@@ -1,8 +1,8 @@
 [package]
 name = "vibe_coding_tracker"
 version = "0.1.0"
-edition = "2024"
-rust-version = "1.85"
+edition = "2021"
+rust-version = "1.75"
 authors = ["Wei Lee <mai@mai0313.com>"]
 description = "Vibe Coding Tracker - AI coding assistant telemetry/usage parser, aggregate JSONL events into CodeAnalysis results"
 license = "MIT"
@@ -66,6 +66,12 @@ sysinfo = "0.36"
 # Semantic versioning
 semver = "1.0"
 
+# Fast byte counting for line counting optimization
+bytecount = "0.6"
+
+# Fast memchr for string operations
+memchr = "2.7"
+
 # Archive extraction for update functionality
 flate2 = "1.1"
 tar = "0.4"
@@ -77,6 +83,18 @@ assert_cmd = "2.0"
 predicates = "3.1"
 
 [profile.release]
-lto = "thin"
+opt-level = 3              # Maximum optimization
+lto = "thin"               # Link-time optimization
+codegen-units = 1          # Better optimization at cost of compile time
+strip = "symbols"          # Strip symbols for smaller binary
+panic = "abort"            # Smaller binary, faster panic handling
+overflow-checks = false    # Disable overflow checks in release (faster)
+
+# Profile for distribution builds with maximum optimization
+[profile.dist]
+inherits = "release"
+lto = "fat"                # Full LTO for maximum performance
+opt-level = 3
 codegen-units = 1
 strip = "symbols"
+panic = "abort"

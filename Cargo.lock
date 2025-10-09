@@ -199,6 +199,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "46c5e41b57b8bba42a04676d81cb89e9ee8e859a1a66f80a5a72e1cb76b34d43"
 
 [[package]]
+name = "bytecount"
+version = "0.6.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "175812e0be2bccb6abe50bb8d566126198344f707e304f45c648fd8f2cc0365e"
+
+[[package]]
 name = "bytes"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2419,6 +2425,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
+ "bytecount",
  "chrono",
  "clap",
  "comfy-table",
@@ -2429,6 +2436,7 @@ dependencies = [
  "hostname",
  "itoa",
  "log",
+ "memchr",
  "owo-colors",
  "predicates",
  "ratatui",

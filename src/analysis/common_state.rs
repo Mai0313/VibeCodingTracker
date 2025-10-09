@@ -25,13 +25,15 @@ pub struct AnalysisState {
 
 impl AnalysisState {
     pub fn new() -> Self {
+        // Pre-allocate Vecs with reasonable capacity estimates based on typical session sizes
+        // This significantly reduces allocations and memory fragmentation
         Self {
-            write_details: Vec::new(),
-            read_details: Vec::new(),
-            edit_details: Vec::new(),
-            run_details: Vec::new(),
+            write_details: Vec::with_capacity(10),     // typical: 5-15 write operations
+            read_details: Vec::with_capacity(20),      // typical: 10-30 read operations
+            edit_details: Vec::with_capacity(15),      // typical: 10-20 edit operations
+            run_details: Vec::with_capacity(10),       // typical: 5-15 bash commands
             tool_counts: CodeAnalysisToolCalls::default(),
-            unique_files: HashSet::new(),
+            unique_files: HashSet::with_capacity(20),  // typical: 10-30 unique files
             total_write_lines: 0,
             total_read_lines: 0,
             total_edit_lines: 0,

@@ -67,12 +67,19 @@ pub fn read_json<P: AsRef<Path>>(path: P) -> Result<Vec<Value>> {
     Ok(vec![obj])
 }
 
-/// Count lines in text
+/// Count lines in text using fast byte counting
 pub fn count_lines(text: &str) -> usize {
     if text.is_empty() {
         return 0;
     }
-    text.lines().count()
+    // Use bytecount for much faster line counting (SIMD-accelerated)
+    // Count newlines and add 1 if text doesn't end with newline
+    let newline_count = bytecount::count(text.as_bytes(), b'\n');
+    if text.ends_with('\n') {
+        newline_count
+    } else {
+        newline_count + 1
+    }
 }
 
 /// Save JSON to file with pretty formatting

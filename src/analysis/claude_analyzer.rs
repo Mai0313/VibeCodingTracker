@@ -8,7 +8,8 @@ use std::collections::HashMap;
 /// Analyze Claude Code conversations
 pub fn analyze_claude_conversations(records: Vec<Value>) -> Result<CodeAnalysis> {
     let mut state = AnalysisState::new();
-    let mut conversation_usage: HashMap<String, Value> = HashMap::new();
+    // Pre-allocate HashMap with typical capacity (1-3 models per conversation)
+    let mut conversation_usage: HashMap<String, Value> = HashMap::with_capacity(3);
 
     for record in records {
         let log: ClaudeCodeLog = match serde_json::from_value(record) {
@@ -17,9 +18,9 @@ pub fn analyze_claude_conversations(records: Vec<Value>) -> Result<CodeAnalysis>
         };
 
         if state.folder_path.is_empty() {
-            state.folder_path = log.cwd.clone();
+            state.folder_path.clone_from(&log.cwd);  // More efficient than assignment + clone
         }
-        state.task_id = log.session_id.clone();
+        state.task_id.clone_from(&log.session_id);  // Reuse existing allocation
 
         let ts = parse_iso_timestamp(&log.timestamp);
         if ts > state.last_ts {
