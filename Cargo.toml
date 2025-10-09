@@ -2,7 +2,7 @@
 name = "vibe_coding_tracker"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.80"
+rust-version = "1.85"
 authors = ["Wei Lee <mai@mai0313.com>"]
 description = "Vibe Coding Tracker - AI coding assistant telemetry/usage parser, aggregate JSONL events into CodeAnalysis results"
 license = "MIT"

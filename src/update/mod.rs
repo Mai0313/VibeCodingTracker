@@ -11,7 +11,7 @@ use std::fs;
 
 // Re-export public types for backward compatibility
 pub use github::{GitHubAsset, GitHubRelease};
-pub use installation::{detect_installation_method, InstallationMethod};
+pub use installation::{InstallationMethod, detect_installation_method};
 pub use startup_check::check_update_on_startup;
 
 /// Extract semver-compatible version from BUILD_VERSION

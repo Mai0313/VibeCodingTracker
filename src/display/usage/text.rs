@@ -1,6 +1,6 @@
 use crate::display::usage::averages::build_usage_summary;
 use crate::models::DateUsageResult;
-use crate::pricing::{fetch_model_pricing, ModelPricingMap};
+use crate::pricing::{ModelPricingMap, fetch_model_pricing};
 use std::collections::HashMap;
 
 /// Display usage data as plain text

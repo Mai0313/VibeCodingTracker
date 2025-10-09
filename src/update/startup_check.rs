@@ -1,5 +1,5 @@
 use super::github::fetch_latest_release;
-use super::installation::{detect_installation_method, InstallationMethod};
+use super::installation::{InstallationMethod, detect_installation_method};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use owo_colors::OwoColorize;

@@ -1,13 +1,13 @@
 use crate::analysis::AggregatedAnalysisRow;
 use crate::display::analysis::averages::{
-    build_analysis_provider_rows, calculate_analysis_daily_averages, convert_to_analysis_rows,
-    format_lines_per_day, AnalysisRow,
+    AnalysisRow, build_analysis_provider_rows, calculate_analysis_daily_averages,
+    convert_to_analysis_rows, format_lines_per_day,
 };
 use crate::display::common::table::{
     create_controls, create_provider_row, create_ratatui_table, create_summary, create_title,
 };
 use crate::display::common::tui::{
-    handle_input, restore_terminal, setup_terminal, InputAction, RefreshState, UpdateTracker,
+    InputAction, RefreshState, UpdateTracker, handle_input, restore_terminal, setup_terminal,
 };
 use crate::utils::{format_number, get_current_date};
 use ratatui::{

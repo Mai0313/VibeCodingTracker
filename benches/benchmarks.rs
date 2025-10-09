@@ -1,6 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use std::collections::HashMap;
-use vibe_coding_tracker::pricing::{normalize_model_name, ModelPricingMap};
+use vibe_coding_tracker::pricing::{ModelPricingMap, normalize_model_name};
 
 fn benchmark_normalize_model_name(c: &mut Criterion) {
     c.bench_function("normalize_model_name simple", |b| {

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use vibe_coding_tracker::pricing::{
-    calculate_cost, clear_pricing_cache, ModelPricing, ModelPricingMap,
+    ModelPricing, ModelPricingMap, calculate_cost, clear_pricing_cache,
 };
 
 #[test]

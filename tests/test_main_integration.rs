@@ -215,8 +215,8 @@ fn test_update_help() {
 #[test]
 fn test_build_enriched_json_empty_data() {
     use std::collections::{BTreeMap, HashMap};
-    use vibe_coding_tracker::pricing::ModelPricing;
     use vibe_coding_tracker::DateUsageResult;
+    use vibe_coding_tracker::pricing::ModelPricing;
 
     // Import the function if it's public, otherwise skip this test
     // Since build_enriched_json is private in main.rs, we'll test it via integration

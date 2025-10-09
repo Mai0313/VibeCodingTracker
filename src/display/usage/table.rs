@@ -5,9 +5,9 @@ use crate::display::usage::averages::{
     build_provider_average_rows, build_usage_summary, format_tokens_per_day,
 };
 use crate::models::DateUsageResult;
-use crate::pricing::{fetch_model_pricing, ModelPricingMap};
+use crate::pricing::{ModelPricingMap, fetch_model_pricing};
 use crate::utils::format_number;
-use comfy_table::{presets::UTF8_FULL, Cell, CellAlignment, Color, Table};
+use comfy_table::{Cell, CellAlignment, Color, Table, presets::UTF8_FULL};
 use owo_colors::OwoColorize;
 use std::collections::HashMap;
 

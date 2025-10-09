@@ -174,17 +174,25 @@ mod tests {
 
     #[test]
     fn test_update_commands() {
-        assert!(InstallationMethod::Npm
-            .update_command()
-            .contains("npm update"));
-        assert!(InstallationMethod::Pip
-            .update_command()
-            .contains("pip install --upgrade"));
-        assert!(InstallationMethod::Cargo
-            .update_command()
-            .contains("cargo install"));
-        assert!(InstallationMethod::Manual
-            .update_command()
-            .contains("vct update"));
+        assert!(
+            InstallationMethod::Npm
+                .update_command()
+                .contains("npm update")
+        );
+        assert!(
+            InstallationMethod::Pip
+                .update_command()
+                .contains("pip install --upgrade")
+        );
+        assert!(
+            InstallationMethod::Cargo
+                .update_command()
+                .contains("cargo install")
+        );
+        assert!(
+            InstallationMethod::Manual
+                .update_command()
+                .contains("vct update")
+        );
     }
 }
