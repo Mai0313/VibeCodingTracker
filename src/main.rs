@@ -20,7 +20,12 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Analysis { path, output, all } => {
+        Commands::Analysis {
+            path,
+            output,
+            all,
+            table,
+        } => {
             if all {
                 // Handle --all flag: group by provider and output as JSON
                 let grouped_data =
@@ -58,6 +63,8 @@ fn main() -> Result<()> {
                                 &json_value,
                             )?;
                             println!("✅ Analysis result saved to: {}", output_path.display());
+                        } else if table {
+                            vibe_coding_tracker::analysis::display_analysis_table(&analysis_data);
                         } else {
                             vibe_coding_tracker::analysis::display_analysis_interactive(
                                 &analysis_data,

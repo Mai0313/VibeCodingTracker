@@ -25,6 +25,10 @@ pub enum Commands {
         /// Group results by provider (claude/codex/gemini)
         #[arg(long)]
         all: bool,
+
+        /// Output as static table (instead of interactive TUI)
+        #[arg(long)]
+        table: bool,
     },
 
     /// Display token usage statistics
