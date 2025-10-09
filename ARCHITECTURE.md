@@ -533,6 +533,7 @@ Match: Fuzzy (0.85 similarity)
 **Components:**
 
 **startup_check.rs:**
+
 - Runs on every application startup (before command execution)
 - 24-hour cache to minimize GitHub API requests
 - Cache location: `~/.vibe_coding_tracker/update_check.json`
@@ -540,6 +541,7 @@ Match: Fuzzy (0.85 similarity)
 - Displays colorful box notification when update available
 
 **installation.rs:**
+
 - Detects installation method by analyzing executable path
 - Detection patterns:
   - npm: `/npm/`, `/.npm`, `/node_modules/`
