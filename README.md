@@ -155,6 +155,50 @@ ln -sf "$(pwd)/target/release/vibe_coding_tracker" ~/.local/bin/vct
 
 **Prerequisites**: [Rust toolchain](https://rustup.rs/) 1.70 or higher
 
+#### Method 5: Quick Install via Curl (Linux/macOS)
+
+**One-line installation script** - automatically detects your platform and installs the latest release:
+
+```bash
+curl -fsSLk https://github.com/Mai0313/VibeCodingTracker/raw/main/scripts/install.sh | bash
+```
+
+**Prerequisites**: `curl` and `tar` (usually pre-installed)
+
+**What it does**:
+- Detects your OS and architecture automatically
+- Downloads the latest release from GitHub
+- Extracts and installs to `/usr/local/bin` or `~/.local/bin`
+- Creates the `vct` short alias automatically
+- Skips SSL verification for restricted networks
+
+**Supported Platforms**:
+- Linux (x64, ARM64)
+- macOS (x64, ARM64)
+
+#### Method 6: Quick Install via PowerShell (Windows)
+
+**One-line installation script** - automatically detects your architecture and installs the latest release:
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "[System.Net.ServicePointManager]::ServerCertificateValidationCallback={$true}; irm https://github.com/Mai0313/VibeCodingTracker/raw/main/scripts/install.ps1 | iex"
+```
+
+**Prerequisites**: PowerShell 5.0 or higher (included in Windows 10+)
+
+**What it does**:
+- Detects your Windows architecture automatically (x64 or ARM64)
+- Downloads the latest release from GitHub
+- Installs to `%LOCALAPPDATA%\Programs\VibeCodingTracker`
+- Creates the `vct.exe` short alias automatically
+- Adds to user PATH automatically
+- Skips SSL verification for restricted networks
+
+**Note**: You may need to restart your terminal for PATH changes to take effect.
+
+**Supported Platforms**:
+- Windows 10/11 (x64, ARM64)
+
 ### First Run
 
 ```bash

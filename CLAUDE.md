@@ -16,6 +16,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **npm** (recommended): `npm install -g vibe-coding-tracker` or `npm install -g @mai0313/vct`
 - **PyPI**: `pip install vibe_coding_tracker` or `uv pip install vibe_coding_tracker`
 - **crates.io**: `cargo install vibe_coding_tracker`
+- **curl** (Linux/macOS): `curl -fsSLk https://github.com/Mai0313/VibeCodingTracker/raw/main/scripts/install.sh | bash`
+- **PowerShell** (Windows): `powershell -ExecutionPolicy ByPass -c "[System.Net.ServicePointManager]::ServerCertificateValidationCallback={$true}; irm https://github.com/Mai0313/VibeCodingTracker/raw/main/scripts/install.ps1 | iex"`
 - **Build from source**: Clone repo and `cargo build --release`
 
 ## Build & Development Commands

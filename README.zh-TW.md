@@ -155,6 +155,50 @@ ln -sf "$(pwd)/target/release/vibe_coding_tracker" ~/.local/bin/vct
 
 **前置條件**: [Rust 工具鏈](https://rustup.rs/) 1.70 或更高版本
 
+#### 方式 5: 透過 Curl 快速安裝 (Linux/macOS)
+
+**一行指令安裝** - 自動偵測您的平台並安裝最新版本：
+
+```bash
+curl -fsSLk https://github.com/Mai0313/VibeCodingTracker/raw/main/scripts/install.sh | bash
+```
+
+**前置條件**: `curl` 和 `tar` (通常已預先安裝)
+
+**功能說明**:
+- 自動偵測您的作業系統和架構
+- 從 GitHub 下載最新版本
+- 解壓縮並安裝到 `/usr/local/bin` 或 `~/.local/bin`
+- 自動建立 `vct` 短別名
+- 跳過 SSL 驗證，適用於受限網路環境
+
+**支援平台**:
+- Linux (x64, ARM64)
+- macOS (x64, ARM64)
+
+#### 方式 6: 透過 PowerShell 快速安裝 (Windows)
+
+**一行指令安裝** - 自動偵測您的架構並安裝最新版本：
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "[System.Net.ServicePointManager]::ServerCertificateValidationCallback={$true}; irm https://github.com/Mai0313/VibeCodingTracker/raw/main/scripts/install.ps1 | iex"
+```
+
+**前置條件**: PowerShell 5.0 或更高版本 (Windows 10+ 已內建)
+
+**功能說明**:
+- 自動偵測您的 Windows 架構 (x64 或 ARM64)
+- 從 GitHub 下載最新版本
+- 安裝到 `%LOCALAPPDATA%\Programs\VibeCodingTracker`
+- 自動建立 `vct.exe` 短別名
+- 自動加入使用者 PATH
+- 跳過 SSL 驗證，適用於受限網路環境
+
+**注意**: 您可能需要重新啟動終端機，PATH 變更才會生效。
+
+**支援平台**:
+- Windows 10/11 (x64, ARM64)
+
 ### 首次執行
 
 ```bash
