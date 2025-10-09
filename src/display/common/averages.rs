@@ -85,7 +85,12 @@ fn count_provider_days(
         }
     }
 
-    (claude_days, codex_days, gemini_days, date_provider_map.len())
+    (
+        claude_days,
+        codex_days,
+        gemini_days,
+        date_provider_map.len(),
+    )
 }
 
 /// Generic daily averages structure

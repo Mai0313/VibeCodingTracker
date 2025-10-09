@@ -678,6 +678,19 @@ update 命令會自動偵測您的平台並下載正確的壓縮檔：
 
 關閉應用程式後執行批次腳本以完成更新。
 
+### 自動更新通知
+
+**自動取得新版本通知。**
+
+啟動 `vct` 時，程式會每 24 小時自動檢查一次更新，如果有新版本可用會顯示通知。通知會智慧偵測您的安裝方式並顯示對應的更新指令：
+
+- **npm**: `npm update -g @mai0313/vct`
+- **pip**: `pip install --upgrade vibe_coding_tracker`
+- **cargo**: `cargo install vibe_coding_tracker --force`
+- **manual**: `vct update` 或重新執行安裝腳本
+
+這確保您始終使用正確的更新方式，避免版本衝突。檢查在背景靜默執行，不會影響您的正常使用。
+
 ---
 
 ## 💡 智慧定價系統

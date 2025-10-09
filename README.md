@@ -678,6 +678,19 @@ On Windows, the binary cannot be replaced while running. The update command:
 
 Run the batch script after closing the application to finish the update.
 
+### Automatic Update Notifications
+
+**Stay informed of new releases automatically.**
+
+When you start `vct`, it automatically checks for updates once every 24 hours and displays a notification if a new version is available. The notification intelligently detects your installation method and shows the appropriate update command:
+
+- **npm**: `npm update -g @mai0313/vct`
+- **pip**: `pip install --upgrade vibe_coding_tracker`
+- **cargo**: `cargo install vibe_coding_tracker --force`
+- **manual**: `vct update` or re-run installation script
+
+This ensures you always use the correct update method and prevents version conflicts. The check runs silently in the background and won't disrupt your workflow if updates aren't available.
+
 ---
 
 ## 💡 Smart Pricing System

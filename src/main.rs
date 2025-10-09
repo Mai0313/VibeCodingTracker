@@ -20,6 +20,9 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // Check for updates on startup (silently fails if there are errors)
+    vibe_coding_tracker::update::check_update_on_startup();
+
     match cli.command {
         Commands::Analysis {
             path,

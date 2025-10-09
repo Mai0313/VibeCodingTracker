@@ -116,11 +116,17 @@ vct update --check        # Only check for updates without installing
 
 ```
 src/
-├── main.rs              # CLI entry point, command routing
+├── main.rs              # CLI entry point, command routing, startup update check
 ├── lib.rs               # Library exports, version info
 ├── cli.rs               # Clap CLI definitions
 ├── pricing.rs           # LiteLLM pricing fetch, caching, fuzzy matching
-├── update.rs            # Self-update functionality from GitHub releases
+├── update/              # Self-update functionality from GitHub releases
+│   ├── mod.rs           # Update command entry point, version comparison
+│   ├── github.rs        # GitHub API interaction, release fetching
+│   ├── platform.rs      # Platform-specific update logic (Unix/Windows)
+│   ├── archive.rs       # Archive extraction (.tar.gz, .zip)
+│   ├── installation.rs  # Installation method detection (npm/pip/cargo/manual)
+│   └── startup_check.rs # Automatic update notification on startup (24h cache)
 ├── models/              # Data structures
 │   ├── analysis.rs      # CodeAnalysis struct
 │   ├── usage.rs         # DateUsageResult
@@ -232,6 +238,31 @@ src/
   - Linux: `vibe_coding_tracker-v0.1.6-linux-x64-gnu.tar.gz`, `vibe_coding_tracker-v0.1.6-linux-arm64-gnu.tar.gz`
   - macOS: `vibe_coding_tracker-v0.1.6-macos-x64.tar.gz`, `vibe_coding_tracker-v0.1.6-macos-arm64.tar.gz`
   - Windows: `vibe_coding_tracker-v0.1.6-windows-x64.zip`, `vibe_coding_tracker-v0.1.6-windows-arm64.zip`
+
+**5. Automatic Update Notifications (Startup Check):**
+
+- `main.rs::main()` → `update/startup_check.rs::check_update_on_startup()`
+  - **Runs automatically on every startup** before command execution
+  - Checks for updates every 24 hours (uses date-based caching)
+  - Cache location: `~/.vibe_coding_tracker/update_check.json`
+  - **Silent failure**: Network errors don't disrupt main functionality
+  - **Installation method detection**: `update/installation.rs::detect_installation_method()`
+    - Analyzes executable path to determine installation method
+    - Detection patterns:
+      - **npm**: `/npm/`, `/.npm`, `/node_modules/`
+      - **pip**: `/site-packages/`, `/python`, `/Scripts/`, `/.local/bin/` (with Python context)
+      - **cargo**: `/.cargo/bin/`
+      - **manual**: All other paths (curl, PowerShell, source build)
+  - **Smart update commands**: Shows installation-specific update instructions
+    - npm: `npm update -g @mai0313/vct`
+    - pip: `pip install --upgrade vibe_coding_tracker`
+    - cargo: `cargo install vibe_coding_tracker --force`
+    - manual: `vct update` or re-run installation script
+  - **User-friendly display**: Colorful box notification with update information
+  - **Benefits**:
+    - Prevents version conflicts (users update via same method they installed)
+    - Reduces support burden (correct update commands shown automatically)
+    - Ensures users stay on latest version with security fixes and features
 
 ### Data Format Detection
 

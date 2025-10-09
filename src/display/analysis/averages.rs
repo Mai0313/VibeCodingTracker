@@ -126,7 +126,8 @@ impl ProviderStatistics<AnalysisRow> for AnalysisProviderStats {
 }
 
 /// Type alias for daily averages with analysis statistics
-pub type AnalysisDailyAverages = crate::display::common::DailyAverages<AnalysisRow, AnalysisProviderStats>;
+pub type AnalysisDailyAverages =
+    crate::display::common::DailyAverages<AnalysisRow, AnalysisProviderStats>;
 
 /// Calculate daily averages for analysis data, grouped by provider (uses generic implementation)
 pub fn calculate_analysis_daily_averages(rows: &[AnalysisRow]) -> AnalysisDailyAverages {
