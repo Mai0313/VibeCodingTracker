@@ -58,7 +58,7 @@ pub fn analyze_gemini_conversations(mut data: Vec<Value>) -> Result<CodeAnalysis
         run_command_details: vec![],
         tool_call_counts: tool_counts,
         conversation_usage,
-        task_id: session.session_id,  // Consume session instead of cloning
+        task_id: session.session_id, // Consume session instead of cloning
         timestamp: last_timestamp,
         folder_path,
         git_remote_url,

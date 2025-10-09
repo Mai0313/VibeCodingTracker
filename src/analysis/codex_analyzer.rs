@@ -23,7 +23,7 @@ pub fn analyze_codex_conversations(logs: &[CodexLog]) -> Result<CodeAnalysis> {
             "session_meta" => {
                 if state.folder_path.is_empty() {
                     if let Some(cwd) = &entry.payload.cwd {
-                        state.folder_path.clone_from(cwd);  // More efficient than clone()
+                        state.folder_path.clone_from(cwd); // More efficient than clone()
                     }
                 }
                 if state.task_id.is_empty() {
@@ -46,7 +46,7 @@ pub fn analyze_codex_conversations(logs: &[CodexLog]) -> Result<CodeAnalysis> {
                     }
                 }
                 if let Some(model) = &entry.payload.model {
-                    current_model.clone_from(model);  // Reuse existing allocation
+                    current_model.clone_from(model); // Reuse existing allocation
                 }
             }
             "event_msg" => {

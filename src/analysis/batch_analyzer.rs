@@ -220,7 +220,7 @@ fn aggregate_analysis_result(
                 .entry(key)
                 .or_insert_with(|| AggregatedAnalysisRow {
                     date: date.to_string(),
-                    model: model.to_string(),  // Only clone when creating new entry
+                    model: model.to_string(), // Only clone when creating new entry
                     edit_lines: 0,
                     read_lines: 0,
                     write_lines: 0,

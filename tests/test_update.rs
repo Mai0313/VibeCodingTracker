@@ -1,5 +1,5 @@
 use vibe_coding_tracker::update::{
-    GitHubAsset, GitHubRelease, extract_semver_version, get_asset_pattern,
+    extract_semver_version, get_asset_pattern, GitHubAsset, GitHubRelease,
 };
 
 #[test]
@@ -260,8 +260,8 @@ fn test_extract_semver_version_with_prerelease() {
 
 #[cfg(test)]
 mod archive_tests {
-    use flate2::Compression;
     use flate2::write::GzEncoder;
+    use flate2::Compression;
     use std::fs::{self, File};
     use std::io::Write;
     use std::path::PathBuf;
@@ -339,12 +339,10 @@ mod archive_tests {
         let result = extract_targz(&archive_path, extract_dir.path());
 
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Binary not found in archive")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Binary not found in archive"));
     }
 
     #[cfg(unix)]
@@ -367,8 +365,8 @@ mod archive_tests {
 
     #[cfg(windows)]
     fn create_test_zip(content: &str, binary_name: &str) -> (TempDir, PathBuf) {
-        use zip::ZipWriter;
         use zip::write::SimpleFileOptions;
+        use zip::ZipWriter;
 
         let temp_dir = TempDir::new().unwrap();
         let archive_path = temp_dir.path().join("test.zip");
@@ -433,12 +431,10 @@ mod archive_tests {
         let result = extract_zip(&archive_path, extract_dir.path());
 
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Binary not found in archive")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Binary not found in archive"));
     }
 }
 

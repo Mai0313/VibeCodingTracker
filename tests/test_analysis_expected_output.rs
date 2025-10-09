@@ -6,7 +6,7 @@
 // - machineId: machine-specific identifier
 // - user: username may differ
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::path::PathBuf;
 use vibe_coding_tracker::analysis::analyzer::analyze_jsonl_file;
 

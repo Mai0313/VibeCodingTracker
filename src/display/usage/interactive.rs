@@ -2,13 +2,13 @@ use crate::display::common::table::{
     create_controls, create_provider_row, create_ratatui_table, create_summary, create_title,
 };
 use crate::display::common::tui::{
-    InputAction, RefreshState, UpdateTracker, handle_input, restore_terminal, setup_terminal,
+    handle_input, restore_terminal, setup_terminal, InputAction, RefreshState, UpdateTracker,
 };
 use crate::display::usage::averages::{
     build_provider_average_rows, build_usage_summary, format_tokens_per_day,
 };
 use crate::models::DateUsageResult;
-use crate::pricing::{ModelPricingMap, fetch_model_pricing};
+use crate::pricing::{fetch_model_pricing, ModelPricingMap};
 use crate::utils::{format_number, get_current_date};
 use ratatui::{
     layout::{Constraint, Direction, Layout as RatatuiLayout},

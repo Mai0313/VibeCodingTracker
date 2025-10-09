@@ -1,4 +1,4 @@
-use vibe_coding_tracker::{PKG_DESCRIPTION, PKG_NAME, VERSION, VersionInfo, get_version_info};
+use vibe_coding_tracker::{get_version_info, VersionInfo, PKG_DESCRIPTION, PKG_NAME, VERSION};
 
 #[test]
 fn test_version_constants() {

@@ -1,4 +1,4 @@
-use comfy_table::{Attribute, Cell, CellAlignment, Color, Table, presets::UTF8_FULL};
+use comfy_table::{presets::UTF8_FULL, Attribute, Cell, CellAlignment, Color, Table};
 use ratatui::{
     layout::Constraint,
     style::{Color as RatatuiColor, Modifier, Style, Stylize},

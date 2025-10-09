@@ -13,7 +13,7 @@ const LITELLM_PRICING_URL: &str =
 pub use cache::ModelPricing;
 pub use calculation::calculate_cost;
 pub use matching::{
-    ModelPricingMap, ModelPricingResult, clear_pricing_cache, normalize_model_name,
+    clear_pricing_cache, normalize_model_name, ModelPricingMap, ModelPricingResult,
 };
 
 /// Fetch model pricing from LiteLLM repository (with caching)

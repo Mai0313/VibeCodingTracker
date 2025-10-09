@@ -1,5 +1,5 @@
 use crate::models::ExtensionType;
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use serde_json::Value;
 
 /// Detect whether the log is from Claude Code, Codex, or Gemini

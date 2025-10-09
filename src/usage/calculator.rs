@@ -76,7 +76,8 @@ where
             match global_cache().get_or_parse(&file_info.path) {
                 Ok(analysis_arc) => {
                     // Use Arc to avoid deep cloning the entire analysis
-                    let conversation_usage = extract_conversation_usage_from_analysis(&analysis_arc);
+                    let conversation_usage =
+                        extract_conversation_usage_from_analysis(&analysis_arc);
                     Some((file_info.modified_date.clone(), conversation_usage))
                 }
                 Err(e) => {

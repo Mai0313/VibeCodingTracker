@@ -113,7 +113,7 @@ impl ModelPricingMap {
                 && (best_match.is_none() || !best_match.as_ref().unwrap().2)
             {
                 best_match = Some((original_key.clone(), 1.0, true)); // Clone Rc is cheap (just inc ref count)
-                // Early exit if exact substring match found
+                                                                      // Early exit if exact substring match found
                 if model_lower == *key_lower {
                     break;
                 }

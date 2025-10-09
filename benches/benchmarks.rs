@@ -50,7 +50,9 @@ fn benchmark_pricing_lookup(c: &mut Criterion) {
 fn benchmark_line_counting(c: &mut Criterion) {
     let short_text = "line1\nline2\nline3\n";
     let medium_text = (0..100).map(|i| format!("line{}\n", i)).collect::<String>();
-    let long_text = (0..10000).map(|i| format!("line{}\n", i)).collect::<String>();
+    let long_text = (0..10000)
+        .map(|i| format!("line{}\n", i))
+        .collect::<String>();
 
     c.bench_function("count_lines short (3 lines)", |b| {
         b.iter(|| vibe_coding_tracker::utils::count_lines(black_box(short_text)))

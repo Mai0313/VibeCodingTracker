@@ -18,9 +18,9 @@ pub fn analyze_claude_conversations(records: Vec<Value>) -> Result<CodeAnalysis>
         };
 
         if state.folder_path.is_empty() {
-            state.folder_path.clone_from(&log.cwd);  // More efficient than assignment + clone
+            state.folder_path.clone_from(&log.cwd); // More efficient than assignment + clone
         }
-        state.task_id.clone_from(&log.session_id);  // Reuse existing allocation
+        state.task_id.clone_from(&log.session_id); // Reuse existing allocation
 
         let ts = parse_iso_timestamp(&log.timestamp);
         if ts > state.last_ts {

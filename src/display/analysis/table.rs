@@ -1,13 +1,13 @@
 use crate::analysis::AggregatedAnalysisRow;
 use crate::display::analysis::averages::{
-    AnalysisRow, build_analysis_provider_rows, calculate_analysis_daily_averages,
-    convert_to_analysis_rows, format_lines_per_day,
+    build_analysis_provider_rows, calculate_analysis_daily_averages, convert_to_analysis_rows,
+    format_lines_per_day, AnalysisRow,
 };
 use crate::display::common::table::{
     add_totals_row, create_comfy_table, create_metric_cell, create_provider_cell,
 };
 use crate::utils::format_number;
-use comfy_table::{Cell, CellAlignment, Color, Table, presets::UTF8_FULL};
+use comfy_table::{presets::UTF8_FULL, Cell, CellAlignment, Color, Table};
 use owo_colors::OwoColorize;
 
 /// Display analysis data as a static table
