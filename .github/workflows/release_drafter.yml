@@ -33,25 +33,12 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Setup uv
-        uses: astral-sh/setup-uv@v7
+      - name: Generate a tag
+        uses: orhun/git-cliff-action@v4
+        id: git-cliff-tag
         with:
-          version: "latest"
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Update Version
-        id: version
-        run: |
-          VERSION=v$(uvx dunamai from git --bump --style semver)
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-
-      # - name: Generate a tag
-      #   uses: orhun/git-cliff-action@v4
-      #   id: version
-      #   with:
-      #     config: ./.github/cliff.toml
-      #     args: --bumped-version
+          config: ./.github/cliff.toml
+          args: --bumped-version
 
       - name: Generate a changelog
         uses: orhun/git-cliff-action@v4
@@ -63,7 +50,7 @@ jobs:
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.version }}
-          name: ${{ steps.version.outputs.version }} 🌈
+          tag_name: ${{ steps.git-cliff-tag.outputs.content }}
+          name: ${{ steps.git-cliff-tag.outputs.content }} 🌈
           body: ${{ steps.git-cliff-changelog.outputs.content }}
           draft: true
