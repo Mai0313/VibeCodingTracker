@@ -1,10 +1,16 @@
 use super::cache::ModelPricing;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::{LazyLock, RwLock};
 use strsim::jaro_winkler;
 
 // Similarity threshold for fuzzy matching (0.0 to 1.0)
 const SIMILARITY_THRESHOLD: f64 = 0.7;
+
+// Global cache for pricing match results (thread-safe)
+// This dramatically improves performance for repeated model lookups
+static MATCH_CACHE: LazyLock<RwLock<HashMap<String, ModelPricingResult>>> =
+    LazyLock::new(|| RwLock::new(HashMap::with_capacity(50)));
 
 /// Result of model pricing lookup with optional matched model name
 #[derive(Debug, Clone)]
@@ -61,22 +67,39 @@ impl ModelPricingMap {
 
     /// Get pricing for a specific model with optimized matching
     pub fn get(&self, model_name: &str) -> ModelPricingResult {
+        // Ultra-fast path: Check cache first
+        if let Ok(cache) = MATCH_CACHE.read() {
+            if let Some(cached_result) = cache.get(model_name) {
+                return cached_result.clone();
+            }
+        }
+
         // Fast path 1: Exact match
         if let Some(pricing) = self.raw.get(model_name) {
-            return ModelPricingResult {
+            let result = ModelPricingResult {
                 pricing: *pricing,
                 matched_model: None,
             };
+            // Cache the exact match result
+            if let Ok(mut cache) = MATCH_CACHE.write() {
+                cache.insert(model_name.to_string(), result.clone());
+            }
+            return result;
         }
 
         // Fast path 2: Normalized match
         let normalized_name = normalize_model_name(model_name);
         if let Some(original_key) = self.normalized_index.get(&normalized_name) {
             if let Some(pricing) = self.raw.get(original_key.as_ref()) {
-                return ModelPricingResult {
+                let result = ModelPricingResult {
                     pricing: *pricing,
                     matched_model: Some(original_key.to_string()), // Convert Rc to String only when needed
                 };
+                // Cache the normalized match result
+                if let Ok(mut cache) = MATCH_CACHE.write() {
+                    cache.insert(model_name.to_string(), result.clone());
+                }
+                return result;
             }
         }
 
@@ -114,18 +137,28 @@ impl ModelPricingMap {
         // Return best match if found
         if let Some((matched_key, _, _)) = best_match {
             if let Some(pricing) = self.raw.get(matched_key.as_ref()) {
-                return ModelPricingResult {
+                let result = ModelPricingResult {
                     pricing: *pricing,
                     matched_model: Some(matched_key.to_string()), // Convert to String only when needed
                 };
+                // Cache the fuzzy match result
+                if let Ok(mut cache) = MATCH_CACHE.write() {
+                    cache.insert(model_name.to_string(), result.clone());
+                }
+                return result;
             }
         }
 
         // Return default (zero costs) if no match found
-        ModelPricingResult {
+        let result = ModelPricingResult {
             pricing: ModelPricing::default(),
             matched_model: None,
+        };
+        // Cache the "no match" result to avoid repeated expensive fuzzy searches
+        if let Ok(mut cache) = MATCH_CACHE.write() {
+            cache.insert(model_name.to_string(), result.clone());
         }
+        result
     }
 
     /// Check if the pricing map is empty
@@ -137,6 +170,17 @@ impl ModelPricingMap {
     /// Note: Returns HashMap<Rc<str>, ModelPricing> instead of HashMap<String, ModelPricing>
     pub fn raw(&self) -> &HashMap<Rc<str>, ModelPricing> {
         &self.raw
+    }
+}
+
+/// Clear the global pricing match cache
+///
+/// **Note**: This function is primarily intended for testing to ensure test isolation.
+/// In production code, the cache helps improve performance by avoiding repeated
+/// expensive fuzzy matching operations.
+pub fn clear_pricing_cache() {
+    if let Ok(mut cache) = MATCH_CACHE.write() {
+        cache.clear();
     }
 }
 

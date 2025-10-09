@@ -9,8 +9,19 @@ pub fn read_jsonl<P: AsRef<Path>>(path: P) -> Result<Vec<Value>> {
     let file = File::open(path.as_ref())
         .with_context(|| format!("Failed to open file: {}", path.as_ref().display()))?;
 
-    let reader = BufReader::new(file);
-    let mut results = Vec::new();
+    // Pre-allocate Vec capacity based on estimated line count
+    // This reduces allocations and improves performance significantly
+    let file_size = file.metadata().ok().map(|m| m.len() as usize).unwrap_or(0);
+    let estimated_lines = if file_size > 0 {
+        // Assume average line size of 200 bytes (conservative estimate)
+        file_size / 200
+    } else {
+        10 // Default minimum capacity
+    };
+    let mut results = Vec::with_capacity(estimated_lines);
+
+    // Use larger buffer for BufReader to reduce system calls
+    let reader = BufReader::with_capacity(64 * 1024, file);
 
     for (index, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("Failed to read line {}", index + 1))?;
@@ -25,16 +36,25 @@ pub fn read_jsonl<P: AsRef<Path>>(path: P) -> Result<Vec<Value>> {
         results.push(obj);
     }
 
+    // Shrink capacity to actual size to free excess memory
+    results.shrink_to_fit();
+
     Ok(results)
 }
 
 /// Read JSON file and return as a single-element vector
 pub fn read_json<P: AsRef<Path>>(path: P) -> Result<Vec<Value>> {
-    let mut file = File::open(path.as_ref())
+    let file = File::open(path.as_ref())
         .with_context(|| format!("Failed to open file: {}", path.as_ref().display()))?;
 
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)
+    // Pre-allocate String capacity based on file size to reduce allocations
+    let file_size = file.metadata().ok().map(|m| m.len() as usize).unwrap_or(0);
+    let mut contents = String::with_capacity(file_size);
+
+    // Use BufReader with larger buffer for better I/O performance
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    reader
+        .read_to_string(&mut contents)
         .with_context(|| format!("Failed to read file: {}", path.as_ref().display()))?;
 
     let obj: Value = serde_json::from_str(&contents).with_context(|| {

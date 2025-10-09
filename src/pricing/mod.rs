@@ -12,7 +12,9 @@ const LITELLM_PRICING_URL: &str =
 // Re-export public types and functions
 pub use cache::ModelPricing;
 pub use calculation::calculate_cost;
-pub use matching::{ModelPricingMap, ModelPricingResult, normalize_model_name};
+pub use matching::{
+    ModelPricingMap, ModelPricingResult, clear_pricing_cache, normalize_model_name,
+};
 
 /// Fetch model pricing from LiteLLM repository (with caching)
 /// Returns an optimized ModelPricingMap with precomputed indices

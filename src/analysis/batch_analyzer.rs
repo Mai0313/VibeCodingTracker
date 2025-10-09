@@ -1,6 +1,7 @@
 use crate::analysis::analyzer::analyze_jsonl_file;
 use crate::utils::{collect_files_with_dates, is_gemini_chat_file, is_json_file};
 use anyhow::Result;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -113,26 +114,28 @@ fn process_full_analysis_directory<P, F>(
 ) -> Result<()>
 where
     P: AsRef<Path>,
-    F: Copy + Fn(&Path) -> bool,
+    F: Copy + Fn(&Path) -> bool + Sync + Send,
 {
     let dir = dir.as_ref();
     let files = collect_files_with_dates(dir, filter_fn)?;
 
-    for file_info in files {
-        match analyze_jsonl_file(&file_info.path) {
-            Ok(analysis) => {
-                results.push(analysis);
-            }
+    // Process files in parallel for better performance
+    let analyzed: Vec<Value> = files
+        .par_iter()
+        .filter_map(|file_info| match analyze_jsonl_file(&file_info.path) {
+            Ok(analysis) => Some(analysis),
             Err(e) => {
                 eprintln!(
                     "Warning: Failed to analyze {}: {}",
                     file_info.path.display(),
                     e
                 );
+                None
             }
-        }
-    }
+        })
+        .collect();
 
+    results.extend(analyzed);
     Ok(())
 }
 
@@ -143,24 +146,30 @@ fn process_analysis_directory<P, F>(
 ) -> Result<()>
 where
     P: AsRef<Path>,
-    F: Copy + Fn(&Path) -> bool,
+    F: Copy + Fn(&Path) -> bool + Sync + Send,
 {
     let dir = dir.as_ref();
     let files = collect_files_with_dates(dir, filter_fn)?;
 
-    for file_info in files {
-        match analyze_jsonl_file(&file_info.path) {
-            Ok(analysis) => {
-                aggregate_analysis_result(aggregated, &file_info.modified_date, &analysis);
-            }
+    // Process files in parallel and collect per-file aggregations
+    let file_aggregations: Vec<(String, Value)> = files
+        .par_iter()
+        .filter_map(|file_info| match analyze_jsonl_file(&file_info.path) {
+            Ok(analysis) => Some((file_info.modified_date.clone(), analysis)),
             Err(e) => {
                 eprintln!(
                     "Warning: Failed to analyze {}: {}",
                     file_info.path.display(),
                     e
                 );
+                None
             }
-        }
+        })
+        .collect();
+
+    // Merge parallel results sequentially (this part is fast)
+    for (date, analysis) in file_aggregations {
+        aggregate_analysis_result(aggregated, &date, &analysis);
     }
 
     Ok(())

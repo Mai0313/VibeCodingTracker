@@ -1,5 +1,7 @@
 use std::collections::HashMap;
-use vibe_coding_tracker::pricing::{ModelPricing, ModelPricingMap, calculate_cost};
+use vibe_coding_tracker::pricing::{
+    ModelPricing, ModelPricingMap, calculate_cost, clear_pricing_cache,
+};
 
 #[test]
 fn test_model_pricing_default() {
@@ -52,6 +54,9 @@ fn test_calculate_cost_with_cache() {
 
 #[test]
 fn test_get_model_pricing_exact_match() {
+    // Clear cache to ensure test isolation
+    clear_pricing_cache();
+
     let mut raw_map = HashMap::new();
     raw_map.insert(
         "claude-3-opus".to_string(),
@@ -100,6 +105,9 @@ fn test_get_model_pricing_normalized_match() {
 
 #[test]
 fn test_get_model_pricing_substring_match() {
+    // Clear cache to ensure test isolation
+    clear_pricing_cache();
+
     let mut raw_map = HashMap::new();
     raw_map.insert(
         "gpt-4".to_string(),
@@ -184,6 +192,9 @@ fn test_get_model_pricing_with_provider_prefix() {
 
 #[test]
 fn test_get_model_pricing_prefers_better_match() {
+    // Clear cache to ensure test isolation
+    clear_pricing_cache();
+
     let mut raw_map = HashMap::new();
     raw_map.insert(
         "gpt-4".to_string(),

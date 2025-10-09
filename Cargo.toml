@@ -54,6 +54,9 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 # String similarity
 strsim = "0.11"
 
+# Parallel processing
+rayon = "1.10"
+
 # Fast integer formatting
 itoa = "1.0"
 
