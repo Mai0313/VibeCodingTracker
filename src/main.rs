@@ -13,7 +13,7 @@ use vibe_coding_tracker::display::usage::{
     display_usage_interactive, display_usage_table, display_usage_text,
 };
 use vibe_coding_tracker::pricing::{
-    ModelPricingMap, ModelPricingResult, calculate_cost, fetch_model_pricing,
+    ModelPricingMap, calculate_cost, fetch_model_pricing,
 };
 use vibe_coding_tracker::usage::get_usage_from_directories;
 use vibe_coding_tracker::utils::extract_token_counts;
@@ -186,8 +186,8 @@ fn build_enriched_json(
     // Pre-allocate HashMap with estimated capacity
     let mut enriched_data = HashMap::with_capacity(usage_data.len());
 
-    // Use pricing cache to avoid repeated lookups
-    let mut pricing_cache: HashMap<String, ModelPricingResult> = HashMap::with_capacity(32);
+    // Note: Removed local pricing_cache - ModelPricingMap.get() already uses
+    // a global MATCH_CACHE internally, so local caching is redundant
 
     for (date, models) in usage_data.iter() {
         let mut date_entries = Vec::with_capacity(models.len());
@@ -195,10 +195,8 @@ fn build_enriched_json(
         for (model, usage) in models.iter() {
             let counts = extract_token_counts(usage);
 
-            // Use pricing cache with entry API
-            let pricing_result = pricing_cache
-                .entry(model.clone())
-                .or_insert_with(|| pricing_map.get(model));
+            // Direct call - no local cache needed (uses global MATCH_CACHE)
+            let pricing_result = pricing_map.get(model);
 
             let cost = calculate_cost(
                 counts.input_tokens,

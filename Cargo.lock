@@ -2620,6 +2620,7 @@ dependencies = [
  "log",
  "memchr",
  "mimalloc",
+ "once_cell",
  "owo-colors",
  "predicates",
  "ratatui",

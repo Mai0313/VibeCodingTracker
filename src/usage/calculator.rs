@@ -1,4 +1,4 @@
-use crate::analysis::analyze_jsonl_file;
+use crate::cache::global_cache;
 use crate::models::DateUsageResult;
 use crate::utils::{collect_files_with_dates, is_gemini_chat_file, is_json_file, resolve_paths};
 use anyhow::Result;
@@ -69,13 +69,14 @@ where
     let dir = dir.as_ref();
     let files = collect_files_with_dates(dir, filter_fn)?;
 
-    // Process files in parallel for better performance
+    // Process files in parallel with caching for better performance
     let file_results: Vec<(String, HashMap<String, Value>)> = files
         .par_iter()
         .filter_map(|file_info| {
-            match analyze_jsonl_file(&file_info.path) {
-                Ok(analysis) => {
-                    let conversation_usage = extract_conversation_usage_from_analysis(&analysis);
+            match global_cache().get_or_parse(&file_info.path) {
+                Ok(analysis_arc) => {
+                    // Use Arc to avoid deep cloning the entire analysis
+                    let conversation_usage = extract_conversation_usage_from_analysis(&analysis_arc);
                     Some((file_info.modified_date.clone(), conversation_usage))
                 }
                 Err(e) => {

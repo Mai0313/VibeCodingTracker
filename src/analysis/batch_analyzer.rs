@@ -1,4 +1,4 @@
-use crate::analysis::analyzer::analyze_jsonl_file;
+use crate::cache::global_cache;
 use crate::utils::{collect_files_with_dates, is_gemini_chat_file, is_json_file};
 use anyhow::Result;
 use rayon::prelude::*;
@@ -119,18 +119,24 @@ where
     let dir = dir.as_ref();
     let files = collect_files_with_dates(dir, filter_fn)?;
 
-    // Process files in parallel for better performance
+    // Process files in parallel with caching for better performance
+    // Use global_cache to avoid re-parsing unchanged files
     let analyzed: Vec<Value> = files
         .par_iter()
-        .filter_map(|file_info| match analyze_jsonl_file(&file_info.path) {
-            Ok(analysis) => Some(analysis),
-            Err(e) => {
-                eprintln!(
-                    "Warning: Failed to analyze {}: {}",
-                    file_info.path.display(),
-                    e
-                );
-                None
+        .filter_map(|file_info| {
+            match global_cache().get_or_parse(&file_info.path) {
+                Ok(analysis_arc) => {
+                    // Clone the Arc's inner Value (cheap Arc clone, not deep copy)
+                    Some((*analysis_arc).clone())
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Failed to analyze {}: {}",
+                        file_info.path.display(),
+                        e
+                    );
+                    None
+                }
             }
         })
         .collect();
@@ -151,18 +157,23 @@ where
     let dir = dir.as_ref();
     let files = collect_files_with_dates(dir, filter_fn)?;
 
-    // Process files in parallel and collect per-file aggregations
+    // Process files in parallel with caching and collect per-file aggregations
     let file_aggregations: Vec<(String, Value)> = files
         .par_iter()
-        .filter_map(|file_info| match analyze_jsonl_file(&file_info.path) {
-            Ok(analysis) => Some((file_info.modified_date.clone(), analysis)),
-            Err(e) => {
-                eprintln!(
-                    "Warning: Failed to analyze {}: {}",
-                    file_info.path.display(),
-                    e
-                );
-                None
+        .filter_map(|file_info| {
+            match global_cache().get_or_parse(&file_info.path) {
+                Ok(analysis_arc) => {
+                    // Clone the Arc's inner Value (cheap Arc clone, not deep copy)
+                    Some((file_info.modified_date.clone(), (*analysis_arc).clone()))
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Failed to analyze {}: {}",
+                        file_info.path.display(),
+                        e
+                    );
+                    None
+                }
             }
         })
         .collect();

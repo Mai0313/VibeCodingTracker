@@ -3,7 +3,6 @@ use crate::models::Provider;
 use crate::utils::format_number;
 use serde_json::Value;
 use std::borrow::Cow;
-use std::collections::HashMap;
 
 /// Data structure for a usage row
 #[derive(Default)]
@@ -155,10 +154,10 @@ pub fn format_tokens_per_day(value: f64) -> String {
 }
 
 /// Build a summary from raw usage data
+/// Note: Removed pricing_cache parameter - ModelPricingMap uses global MATCH_CACHE internally
 pub fn build_usage_summary(
     usage_data: &crate::models::DateUsageResult,
     pricing_map: &crate::pricing::ModelPricingMap,
-    pricing_cache: &mut HashMap<String, crate::pricing::ModelPricingResult>,
 ) -> UsageSummary {
     if usage_data.is_empty() {
         return UsageSummary::default();
@@ -177,7 +176,7 @@ pub fn build_usage_summary(
         models.sort_by_key(|(model, _)| *model);
 
         for (model, usage) in models {
-            let row = extract_usage_row(date, model, usage, pricing_map, pricing_cache);
+            let row = extract_usage_row(date, model, usage, pricing_map);
             summary.totals.accumulate(&row);
             summary.rows.push(row);
         }
@@ -192,7 +191,6 @@ fn extract_usage_row(
     model: &str,
     usage: &Value,
     pricing_map: &crate::pricing::ModelPricingMap,
-    pricing_cache: &mut HashMap<String, crate::pricing::ModelPricingResult>,
 ) -> UsageRow {
     use crate::pricing::calculate_cost;
     use crate::utils::extract_token_counts;
@@ -200,10 +198,8 @@ fn extract_usage_row(
     // Extract token counts using utility function
     let counts = extract_token_counts(usage);
 
-    // Calculate cost with fuzzy matching (using entry API to avoid double lookup)
-    let pricing_result = pricing_cache
-        .entry(model.to_string())
-        .or_insert_with(|| pricing_map.get(model));
+    // Direct call - no local cache needed (uses global MATCH_CACHE)
+    let pricing_result = pricing_map.get(model);
 
     let cost = calculate_cost(
         counts.input_tokens,

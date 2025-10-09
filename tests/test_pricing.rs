@@ -109,8 +109,9 @@ fn test_get_model_pricing_substring_match() {
     clear_pricing_cache();
 
     let mut raw_map = HashMap::new();
+    // Use unique model names to avoid cache pollution from other tests
     raw_map.insert(
-        "gpt-4".to_string(),
+        "test-model-base".to_string(),
         ModelPricing {
             input_cost_per_token: 0.00003,
             output_cost_per_token: 0.00006,
@@ -122,11 +123,11 @@ fn test_get_model_pricing_substring_match() {
     let pricing_map = ModelPricingMap::new(raw_map);
 
     // Test substring matching
-    let result = pricing_map.get("gpt-4-turbo");
+    let result = pricing_map.get("test-model-base-extended");
     assert_eq!(result.pricing.input_cost_per_token, 0.00003);
     assert_eq!(
         result.matched_model,
-        Some("gpt-4".to_string()),
+        Some("test-model-base".to_string()),
         "Should match via substring"
     );
 }

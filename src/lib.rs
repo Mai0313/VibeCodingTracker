@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod cache;
 pub mod cli;
 pub mod display;
 pub mod models;

@@ -8,7 +8,7 @@ use crate::display::usage::averages::{
     build_provider_average_rows, build_usage_summary, format_tokens_per_day,
 };
 use crate::models::DateUsageResult;
-use crate::pricing::{ModelPricingMap, ModelPricingResult, fetch_model_pricing};
+use crate::pricing::{ModelPricingMap, fetch_model_pricing};
 use crate::utils::{format_number, get_current_date};
 use ratatui::{
     layout::{Constraint, Direction, Layout as RatatuiLayout},
@@ -39,7 +39,7 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
             ModelPricingMap::new(HashMap::new())
         }
     };
-    let mut pricing_lookup_cache: HashMap<String, ModelPricingResult> = HashMap::new();
+    // Note: Removed pricing_lookup_cache - ModelPricingMap uses global MATCH_CACHE internally
     let mut last_pricing_refresh = std::time::Instant::now();
     if pricing_map.raw().is_empty() {
         last_pricing_refresh =
@@ -72,7 +72,7 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
             match fetch_model_pricing() {
                 Ok(map) => {
                     pricing_map = map;
-                    pricing_lookup_cache.clear();
+                    // No need to clear local cache - we're using global MATCH_CACHE
                     last_pricing_refresh = std::time::Instant::now();
                 }
                 Err(e) => {
@@ -98,7 +98,7 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
             }
         }
 
-        let summary = build_usage_summary(&usage_data, &pricing_map, &mut pricing_lookup_cache);
+        let summary = build_usage_summary(&usage_data, &pricing_map);
         let rows_data = &summary.rows;
         let totals = &summary.totals;
         let daily_averages = &summary.daily_averages;
