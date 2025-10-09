@@ -1,4 +1,5 @@
-use chrono::Local;
+use chrono::{Local, NaiveDate};
+use std::sync::RwLock;
 
 /// Format a number with thousand separators (e.g., 1234567 -> "1,234,567")
 pub fn format_number<T: ToString>(n: T) -> String {
@@ -30,9 +31,31 @@ pub fn format_number<T: ToString>(n: T) -> String {
     result
 }
 
-/// Get current date in YYYY-MM-DD format
+// Cache for current date (updated once per day)
+static DATE_CACHE: RwLock<Option<(NaiveDate, String)>> = RwLock::new(None);
+
+/// Get current date in YYYY-MM-DD format (cached for performance)
 pub fn get_current_date() -> String {
-    Local::now().format("%Y-%m-%d").to_string()
+    let today = Local::now().date_naive();
+
+    // Fast path: read lock to check if cache is valid
+    {
+        if let Ok(cache) = DATE_CACHE.read() {
+            if let Some((cached_date, cached_string)) = cache.as_ref() {
+                if *cached_date == today {
+                    return cached_string.clone();
+                }
+            }
+        }
+    }
+
+    // Slow path: write lock to update cache
+    let date_string = today.format("%Y-%m-%d").to_string();
+    if let Ok(mut cache) = DATE_CACHE.write() {
+        *cache = Some((today, date_string.clone()));
+    }
+
+    date_string
 }
 
 #[cfg(test)]

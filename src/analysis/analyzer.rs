@@ -41,7 +41,7 @@ fn analyze_record_set(data: Vec<Value>, ext_type: ExtensionType) -> Result<Value
 
     analysis.user = get_current_user();
     analysis.extension_name = ext_type.to_string();
-    analysis.machine_id = get_machine_id();
+    analysis.machine_id = get_machine_id().to_string();
     analysis.insights_version = VERSION.to_string();
 
     let result = serde_json::to_value(&analysis)?;

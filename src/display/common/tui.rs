@@ -88,32 +88,36 @@ impl RefreshState {
     }
 }
 
-/// Update tracking for row highlighting
-pub struct UpdateTracker<T> {
+/// Update tracking for row highlighting (optimized to use hashes instead of full data clones)
+pub struct UpdateTracker {
     last_update_times: std::collections::HashMap<String, Instant>,
-    previous_data: std::collections::HashMap<String, T>,
+    previous_hashes: std::collections::HashMap<String, u64>,
     max_tracked: usize,
     highlight_duration: Duration,
 }
 
-impl<T> UpdateTracker<T>
-where
-    T: PartialEq + Clone,
-{
+impl UpdateTracker {
     /// Create a new update tracker
     pub fn new(max_tracked: usize, highlight_duration_millis: u64) -> Self {
         Self {
             last_update_times: std::collections::HashMap::new(),
-            previous_data: std::collections::HashMap::new(),
+            previous_hashes: std::collections::HashMap::new(),
             max_tracked,
             highlight_duration: Duration::from_millis(highlight_duration_millis),
         }
     }
 
-    /// Track an update for a given key and data
-    pub fn track_update(&mut self, key: String, data: T) {
-        let entry_changed = match self.previous_data.get(&key) {
-            Some(prev) => prev != &data,
+    /// Track an update for a given key and data (using hash for comparison)
+    pub fn track_update<T: std::hash::Hash>(&mut self, key: String, data: &T) {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::Hasher;
+
+        let mut hasher = DefaultHasher::new();
+        data.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        let entry_changed = match self.previous_hashes.get(&key) {
+            Some(&prev_hash) => prev_hash != hash,
             None => true,
         };
 
@@ -121,7 +125,7 @@ where
             self.last_update_times.insert(key.clone(), Instant::now());
         }
 
-        self.previous_data.insert(key, data);
+        self.previous_hashes.insert(key, hash);
     }
 
     /// Clean up old entries based on current row keys
@@ -131,21 +135,21 @@ where
     {
         let current_keys: std::collections::HashSet<String> = current_keys.into_iter().collect();
 
-        self.previous_data
+        self.previous_hashes
             .retain(|key, _| current_keys.contains(key));
         self.last_update_times
             .retain(|key, _| current_keys.contains(key));
 
         // If we exceed max_tracked, keep only the most recent entries
-        if self.previous_data.len() > self.max_tracked {
+        if self.previous_hashes.len() > self.max_tracked {
             let keys_to_remove: Vec<_> = self
-                .previous_data
+                .previous_hashes
                 .keys()
-                .take(self.previous_data.len() - self.max_tracked)
+                .take(self.previous_hashes.len() - self.max_tracked)
                 .cloned()
                 .collect();
             for key in keys_to_remove {
-                self.previous_data.remove(&key);
+                self.previous_hashes.remove(&key);
                 self.last_update_times.remove(&key);
             }
         }

@@ -1,5 +1,6 @@
 use super::cache::ModelPricing;
 use std::collections::HashMap;
+use std::rc::Rc;
 use strsim::jaro_winkler;
 
 // Similarity threshold for fuzzy matching (0.0 to 1.0)
@@ -15,12 +16,12 @@ pub struct ModelPricingResult {
 /// Optimized pricing map with precomputed indices for fast lookups
 #[derive(Debug, Clone)]
 pub struct ModelPricingMap {
-    // Original pricing data
-    raw: HashMap<String, ModelPricing>,
+    // Original pricing data (use Rc<str> to avoid cloning keys)
+    raw: HashMap<Rc<str>, ModelPricing>,
     // Precomputed normalized keys for fast matching
-    normalized_index: HashMap<String, String>, // normalized_key -> original_key
+    normalized_index: HashMap<String, Rc<str>>, // normalized_key -> original_key (Rc)
     // Precomputed lowercase keys for substring/fuzzy matching
-    lowercase_keys: Vec<(String, String)>, // (lowercase_key, original_key)
+    lowercase_keys: Vec<(String, Rc<str>)>, // (lowercase_key, original_key as Rc)
 }
 
 impl ModelPricingMap {
@@ -30,23 +31,29 @@ impl ModelPricingMap {
         let capacity = raw.len();
         let mut normalized_index = HashMap::with_capacity(capacity);
         let mut lowercase_keys = Vec::with_capacity(capacity);
+        let mut rc_raw = HashMap::with_capacity(capacity);
 
-        for key in raw.keys() {
+        // Convert keys to Rc<str> to avoid cloning
+        for (key, pricing) in raw {
+            let rc_key: Rc<str> = key.as_str().into();
+
             // Precompute normalized key
-            let normalized = normalize_model_name(key);
-            if normalized != *key {
-                normalized_index.insert(normalized, key.clone());
+            let normalized = normalize_model_name(&key);
+            if normalized != key {
+                normalized_index.insert(normalized, rc_key.clone());
             }
 
             // Precompute lowercase key for substring/fuzzy matching
-            lowercase_keys.push((key.to_lowercase(), key.clone()));
+            lowercase_keys.push((key.to_lowercase(), rc_key.clone()));
+
+            rc_raw.insert(rc_key, pricing);
         }
 
         // Sort lowercase_keys for potential binary search optimization
         lowercase_keys.sort_by(|a, b| a.0.cmp(&b.0));
 
         Self {
-            raw,
+            raw: rc_raw,
             normalized_index,
             lowercase_keys,
         }
@@ -65,24 +72,24 @@ impl ModelPricingMap {
         // Fast path 2: Normalized match
         let normalized_name = normalize_model_name(model_name);
         if let Some(original_key) = self.normalized_index.get(&normalized_name) {
-            if let Some(pricing) = self.raw.get(original_key) {
+            if let Some(pricing) = self.raw.get(original_key.as_ref()) {
                 return ModelPricingResult {
                     pricing: *pricing,
-                    matched_model: Some(original_key.clone()),
+                    matched_model: Some(original_key.to_string()), // Convert Rc to String only when needed
                 };
             }
         }
 
         // Slow path: Substring and fuzzy matching (optimized)
         let model_lower = model_name.to_lowercase();
-        let mut best_match: Option<(String, f64, bool)> = None; // (key, score, is_substring)
+        let mut best_match: Option<(Rc<str>, f64, bool)> = None; // (Rc key, score, is_substring)
 
         for (key_lower, original_key) in &self.lowercase_keys {
             // Substring matching (higher priority, score = 1.0)
             if (model_lower.contains(key_lower) || key_lower.contains(&model_lower))
                 && (best_match.is_none() || !best_match.as_ref().unwrap().2)
             {
-                best_match = Some((original_key.clone(), 1.0, true));
+                best_match = Some((original_key.clone(), 1.0, true)); // Clone Rc is cheap (just inc ref count)
                 // Early exit if exact substring match found
                 if model_lower == *key_lower {
                     break;
@@ -106,10 +113,10 @@ impl ModelPricingMap {
 
         // Return best match if found
         if let Some((matched_key, _, _)) = best_match {
-            if let Some(pricing) = self.raw.get(&matched_key) {
+            if let Some(pricing) = self.raw.get(matched_key.as_ref()) {
                 return ModelPricingResult {
                     pricing: *pricing,
-                    matched_model: Some(matched_key),
+                    matched_model: Some(matched_key.to_string()), // Convert to String only when needed
                 };
             }
         }
@@ -121,8 +128,14 @@ impl ModelPricingMap {
         }
     }
 
+    /// Check if the pricing map is empty
+    pub fn is_empty(&self) -> bool {
+        self.raw.is_empty()
+    }
+
     /// Get the raw pricing map (for backward compatibility)
-    pub fn raw(&self) -> &HashMap<String, ModelPricing> {
+    /// Note: Returns HashMap<Rc<str>, ModelPricing> instead of HashMap<String, ModelPricing>
+    pub fn raw(&self) -> &HashMap<Rc<str>, ModelPricing> {
         &self.raw
     }
 }

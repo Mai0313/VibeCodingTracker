@@ -20,9 +20,6 @@ use sysinfo::System;
 const ANALYSIS_REFRESH_SECS: u64 = 10;
 const MAX_TRACKED_ANALYSIS_ROWS: usize = 100;
 
-// Type alias for analysis data snapshot: (edit_lines, read_lines, write_lines, bash_count, edit_count, read_count, todo_write_count, write_count)
-type AnalysisDataSnapshot = (usize, usize, usize, usize, usize, usize, usize, usize);
-
 /// Display analysis data as an interactive table
 pub fn display_analysis_interactive(data: &[AggregatedAnalysisRow]) -> anyhow::Result<()> {
     if data.is_empty() {
@@ -40,8 +37,7 @@ pub fn display_analysis_interactive(data: &[AggregatedAnalysisRow]) -> anyhow::R
         sysinfo::get_current_pid().expect("Failed to get current process ID for memory monitoring");
 
     // Track updates
-    let mut update_tracker: UpdateTracker<AnalysisDataSnapshot> =
-        UpdateTracker::new(MAX_TRACKED_ANALYSIS_ROWS, 1000);
+    let mut update_tracker = UpdateTracker::new(MAX_TRACKED_ANALYSIS_ROWS, 1000);
     let mut current_data = data.to_vec();
 
     loop {
@@ -90,7 +86,7 @@ pub fn display_analysis_interactive(data: &[AggregatedAnalysisRow]) -> anyhow::R
                 row.write_count,
             );
 
-            update_tracker.track_update(row_key, current_tuple);
+            update_tracker.track_update(row_key, &current_tuple);
 
             totals.edit_lines += row.edit_lines;
             totals.read_lines += row.read_lines;

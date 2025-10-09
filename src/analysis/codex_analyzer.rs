@@ -9,9 +9,9 @@ use std::collections::HashMap;
 /// Analyze Codex conversations
 pub fn analyze_codex_conversations(logs: &[CodexLog]) -> Result<CodeAnalysis> {
     let mut state = AnalysisState::new();
-    let mut conversation_usage: HashMap<String, Value> = HashMap::new();
+    let mut conversation_usage: HashMap<String, Value> = HashMap::with_capacity(5);
     let mut current_model = String::new();
-    let mut shell_calls: HashMap<String, CodexShellCall> = HashMap::new();
+    let mut shell_calls: HashMap<String, CodexShellCall> = HashMap::with_capacity(50);
 
     for entry in logs {
         let ts = parse_iso_timestamp(&entry.timestamp);
@@ -282,8 +282,10 @@ fn parse_apply_patch_script(script: &str) -> Vec<CodexPatch> {
 }
 
 fn extract_patch_strings(lines: &[String]) -> (String, String) {
-    let mut old_str = String::new();
-    let mut new_str = String::new();
+    // Pre-allocate with estimated capacity
+    let estimated_size = lines.iter().map(|l| l.len()).sum::<usize>();
+    let mut old_str = String::with_capacity(estimated_size / 2);
+    let mut new_str = String::with_capacity(estimated_size / 2);
 
     for line in lines {
         if line.is_empty() {
@@ -311,14 +313,19 @@ fn extract_patch_strings(lines: &[String]) -> (String, String) {
         }
     }
 
-    (
-        old_str.trim_end_matches('\n').to_string(),
-        new_str.trim_end_matches('\n').to_string(),
-    )
+    // Trim in-place instead of allocating new strings
+    let old_len = old_str.trim_end_matches('\n').len();
+    old_str.truncate(old_len);
+    let new_len = new_str.trim_end_matches('\n').len();
+    new_str.truncate(new_len);
+
+    (old_str, new_str)
 }
 
 fn extract_sed_file_path(script: &str) -> Option<String> {
-    let re = Regex::new(r"sed\s+-n\s+'[^']*'\s+([^\s]+)").ok()?;
+    use std::sync::OnceLock;
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"sed\s+-n\s+'[^']*'\s+([^\s]+)").unwrap());
     let caps = re.captures(script)?;
     Some(
         caps.get(1)?

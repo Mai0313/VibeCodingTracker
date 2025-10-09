@@ -57,24 +57,22 @@ fn get_home_dir() -> Result<PathBuf> {
 }
 
 /// Get machine ID (cached after first call)
-pub fn get_machine_id() -> String {
-    MACHINE_ID_CACHE
-        .get_or_init(|| {
-            // Try to read /etc/machine-id on Linux
-            if let Ok(id) = std::fs::read_to_string("/etc/machine-id") {
-                return id.trim().to_string();
-            }
+pub fn get_machine_id() -> &'static str {
+    MACHINE_ID_CACHE.get_or_init(|| {
+        // Try to read /etc/machine-id on Linux
+        if let Ok(id) = std::fs::read_to_string("/etc/machine-id") {
+            return id.trim().to_string();
+        }
 
-            // Fallback to hostname
-            if let Ok(hostname) = hostname::get() {
-                if let Some(hostname_str) = hostname.to_str() {
-                    return hostname_str.to_string();
-                }
+        // Fallback to hostname
+        if let Ok(hostname) = hostname::get() {
+            if let Some(hostname_str) = hostname.to_str() {
+                return hostname_str.to_string();
             }
+        }
 
-            "unknown-machine-id".to_string()
-        })
-        .clone()
+        "unknown-machine-id".to_string()
+    })
 }
 
 /// Get cache directory path (creates it if it doesn't exist)

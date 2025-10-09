@@ -49,8 +49,7 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
     let mut usage_data = DateUsageResult::new();
     let mut has_usage_data = false;
 
-    let mut update_tracker: UpdateTracker<(i64, i64, i64, i64)> =
-        UpdateTracker::new(MAX_TRACKED_ROWS, 1000);
+    let mut update_tracker = UpdateTracker::new(MAX_TRACKED_ROWS, 1000);
 
     loop {
         if !refresh_state.should_refresh() {
@@ -121,7 +120,7 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
                 row.cache_read,
                 row.cache_creation,
             );
-            update_tracker.track_update(row_key, current_data);
+            update_tracker.track_update(row_key, &current_data);
         }
 
         terminal.draw(|f| {
