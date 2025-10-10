@@ -22,12 +22,6 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Check for updates on startup in background thread (non-blocking)
-    // This ensures the CLI remains responsive and doesn't delay command execution
-    std::thread::spawn(|| {
-        vibe_coding_tracker::update::check_update_on_startup();
-    });
-
     match cli.command {
         Commands::Analysis {
             path,

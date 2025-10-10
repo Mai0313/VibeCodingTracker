@@ -2,7 +2,6 @@ mod archive;
 mod github;
 mod installation;
 mod platform;
-mod startup_check;
 
 use anyhow::{Context, Result};
 use semver::Version;
@@ -12,7 +11,6 @@ use std::fs;
 // Re-export public types for backward compatibility
 pub use github::{GitHubAsset, GitHubRelease};
 pub use installation::{InstallationMethod, detect_installation_method};
-pub use startup_check::check_update_on_startup;
 
 /// Extracts clean semver version from BUILD_VERSION string
 ///
