@@ -1,5 +1,7 @@
 use super::cache::ModelPricing;
+use lru::LruCache;
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::{LazyLock, RwLock};
 use strsim::jaro_winkler;
@@ -7,10 +9,17 @@ use strsim::jaro_winkler;
 // Similarity threshold for fuzzy matching (0.0 to 1.0)
 const SIMILARITY_THRESHOLD: f64 = 0.7;
 
-// Global cache for pricing match results (thread-safe)
-// This dramatically improves performance for repeated model lookups
-static MATCH_CACHE: LazyLock<RwLock<HashMap<String, ModelPricingResult>>> =
-    LazyLock::new(|| RwLock::new(HashMap::with_capacity(50)));
+// Maximum number of cached pricing lookups (prevents unbounded memory growth)
+const PRICING_MATCH_CACHE_SIZE: usize = 200;
+
+// Global LRU cache for pricing match results (thread-safe, bounded capacity)
+// This dramatically improves performance for repeated model lookups while
+// preventing memory leaks from unbounded growth
+static MATCH_CACHE: LazyLock<RwLock<LruCache<String, ModelPricingResult>>> = LazyLock::new(|| {
+    // SAFETY: PRICING_MATCH_CACHE_SIZE is a const > 0
+    let capacity = NonZeroUsize::new(PRICING_MATCH_CACHE_SIZE).unwrap();
+    RwLock::new(LruCache::new(capacity))
+});
 
 /// Result of a model pricing lookup including the matched model name for transparency
 #[derive(Debug, Clone)]
@@ -80,9 +89,9 @@ impl ModelPricingMap {
     ///
     /// Results are cached globally for performance.
     pub fn get(&self, model_name: &str) -> ModelPricingResult {
-        // Ultra-fast path: Check cache first
-        if let Ok(cache) = MATCH_CACHE.read() {
-            if let Some(cached_result) = cache.get(model_name) {
+        // Ultra-fast path: Check LRU cache first (with peek to avoid write lock)
+        if let Ok(cache_read) = MATCH_CACHE.read() {
+            if let Some(cached_result) = cache_read.peek(model_name) {
                 return cached_result.clone();
             }
         }
@@ -93,9 +102,9 @@ impl ModelPricingMap {
                 pricing: *pricing,
                 matched_model: None,
             };
-            // Cache the exact match result
-            if let Ok(mut cache) = MATCH_CACHE.write() {
-                cache.insert(model_name.to_string(), result.clone());
+            // Cache the exact match result (LRU will auto-evict if at capacity)
+            if let Ok(mut cache_write) = MATCH_CACHE.write() {
+                cache_write.put(model_name.to_string(), result.clone());
             }
             return result;
         }
@@ -108,9 +117,9 @@ impl ModelPricingMap {
                     pricing: *pricing,
                     matched_model: Some(original_key.to_string()), // Convert Rc to String only when needed
                 };
-                // Cache the normalized match result
-                if let Ok(mut cache) = MATCH_CACHE.write() {
-                    cache.insert(model_name.to_string(), result.clone());
+                // Cache the normalized match result (LRU will auto-evict if at capacity)
+                if let Ok(mut cache_write) = MATCH_CACHE.write() {
+                    cache_write.put(model_name.to_string(), result.clone());
                 }
                 return result;
             }
@@ -154,9 +163,9 @@ impl ModelPricingMap {
                     pricing: *pricing,
                     matched_model: Some(matched_key.to_string()), // Convert to String only when needed
                 };
-                // Cache the fuzzy match result
-                if let Ok(mut cache) = MATCH_CACHE.write() {
-                    cache.insert(model_name.to_string(), result.clone());
+                // Cache the fuzzy match result (LRU will auto-evict if at capacity)
+                if let Ok(mut cache_write) = MATCH_CACHE.write() {
+                    cache_write.put(model_name.to_string(), result.clone());
                 }
                 return result;
             }
@@ -168,8 +177,9 @@ impl ModelPricingMap {
             matched_model: None,
         };
         // Cache the "no match" result to avoid repeated expensive fuzzy searches
-        if let Ok(mut cache) = MATCH_CACHE.write() {
-            cache.insert(model_name.to_string(), result.clone());
+        // LRU will auto-evict if at capacity (keeps frequently-used models cached)
+        if let Ok(mut cache_write) = MATCH_CACHE.write() {
+            cache_write.put(model_name.to_string(), result.clone());
         }
         result
     }
@@ -185,13 +195,14 @@ impl ModelPricingMap {
     }
 }
 
-/// Clears the global pricing match cache
+/// Clears the global pricing match LRU cache
 ///
-/// Primarily used in tests for isolation. In production, the cache significantly
-/// improves performance by avoiding repeated expensive fuzzy matching operations.
+/// Primarily used in tests for isolation. In production, the LRU cache significantly
+/// improves performance by avoiding repeated expensive fuzzy matching operations while
+/// maintaining bounded memory usage (max 200 entries).
 pub fn clear_pricing_cache() {
-    if let Ok(mut cache) = MATCH_CACHE.write() {
-        cache.clear();
+    if let Ok(mut cache_write) = MATCH_CACHE.write() {
+        cache_write.clear();
     }
 }
 

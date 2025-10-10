@@ -1,12 +1,12 @@
 use crate::cache::global_cache;
-use crate::constants::capacity;
+use crate::constants::{FastHashMap, capacity};
 use crate::utils::{collect_files_with_dates, is_gemini_chat_file, is_json_file};
 use anyhow::Result;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 /// Single row of aggregated metrics grouped by date and model
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,9 +30,9 @@ pub struct AggregatedAnalysisRow {
 /// and line counts by date and model, then returns sorted results.
 pub fn analyze_all_sessions() -> Result<Vec<AggregatedAnalysisRow>> {
     let paths = crate::utils::resolve_paths()?;
-    // Pre-allocate HashMap using centralized capacity constant
-    let mut aggregated: HashMap<String, AggregatedAnalysisRow> =
-        HashMap::with_capacity(capacity::DATE_MODEL_COMBINATIONS);
+    // Pre-allocate FastHashMap using centralized capacity constant
+    let mut aggregated: FastHashMap<String, AggregatedAnalysisRow> =
+        FastHashMap::with_capacity(capacity::DATE_MODEL_COMBINATIONS);
 
     if paths.claude_session_dir.exists() {
         process_analysis_directory(&paths.claude_session_dir, &mut aggregated, is_json_file)?;
@@ -127,15 +127,12 @@ where
     let files = collect_files_with_dates(dir, filter_fn)?;
 
     // Process files in parallel with caching for better performance
-    // Use global_cache to avoid re-parsing unchanged files
-    let analyzed: Vec<Value> = files
+    // Use Arc directly to avoid deep cloning large JSON values
+    let analyzed: Vec<Arc<Value>> = files
         .par_iter()
-        .filter_map(|file_info| {
-            match global_cache().get_or_parse(&file_info.path) {
-                Ok(analysis_arc) => {
-                    // Clone the Arc's inner Value (cheap Arc clone, not deep copy)
-                    Some((*analysis_arc).clone())
-                }
+        .filter_map(
+            |file_info| match global_cache().get_or_parse(&file_info.path) {
+                Ok(analysis_arc) => Some(analysis_arc),
                 Err(e) => {
                     eprintln!(
                         "Warning: Failed to analyze {}: {}",
@@ -144,17 +141,18 @@ where
                     );
                     None
                 }
-            }
-        })
+            },
+        )
         .collect();
 
-    results.extend(analyzed);
+    // Only clone when serializing (unavoidable, but done once at the end)
+    results.extend(analyzed.iter().map(|arc| (**arc).clone()));
     Ok(())
 }
 
 fn process_analysis_directory<P, F>(
     dir: P,
-    aggregated: &mut HashMap<String, AggregatedAnalysisRow>,
+    aggregated: &mut FastHashMap<String, AggregatedAnalysisRow>,
     filter_fn: F,
 ) -> Result<()>
 where
@@ -165,14 +163,12 @@ where
     let files = collect_files_with_dates(dir, filter_fn)?;
 
     // Process files in parallel with caching and collect per-file aggregations
-    let file_aggregations: Vec<(String, Value)> = files
+    // Use Arc to avoid deep cloning - we only need to read fields
+    let file_aggregations: Vec<(String, Arc<Value>)> = files
         .par_iter()
-        .filter_map(|file_info| {
-            match global_cache().get_or_parse(&file_info.path) {
-                Ok(analysis_arc) => {
-                    // Clone the Arc's inner Value (cheap Arc clone, not deep copy)
-                    Some((file_info.modified_date.clone(), (*analysis_arc).clone()))
-                }
+        .filter_map(
+            |file_info| match global_cache().get_or_parse(&file_info.path) {
+                Ok(analysis_arc) => Some((file_info.modified_date.clone(), analysis_arc)),
                 Err(e) => {
                     eprintln!(
                         "Warning: Failed to analyze {}: {}",
@@ -181,20 +177,20 @@ where
                     );
                     None
                 }
-            }
-        })
+            },
+        )
         .collect();
 
     // Merge parallel results sequentially (this part is fast)
-    for (date, analysis) in file_aggregations {
-        aggregate_analysis_result(aggregated, &date, &analysis);
+    for (date, analysis_arc) in file_aggregations {
+        aggregate_analysis_result(aggregated, &date, &analysis_arc);
     }
 
     Ok(())
 }
 
 fn aggregate_analysis_result(
-    aggregated: &mut HashMap<String, AggregatedAnalysisRow>,
+    aggregated: &mut FastHashMap<String, AggregatedAnalysisRow>,
     date: &str,
     analysis: &Value,
 ) {

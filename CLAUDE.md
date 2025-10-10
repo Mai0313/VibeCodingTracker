@@ -144,6 +144,10 @@ The codebase includes several performance optimizations for efficient operation:
 - Prevents unbounded memory growth in long-running sessions
 - Cache invalidation based on file modification time
 - Thread-safe with `Arc<Value>` for zero-cost cloning
+- **Optimized lock strategy** (2025-01-10 update):
+  - Uses `peek()` for read-only cache checks (avoids write lock contention)
+  - Write lock only acquired when updating LRU position or inserting new entries
+  - Significantly reduces lock contention in parallel workloads
 
 ### 3. **Optimized File I/O** (`src/utils/file.rs`)
 
@@ -157,12 +161,37 @@ The codebase includes several performance optimizations for efficient operation:
 - Uses `mimalloc` as global allocator for better performance
 - Configured in `main.rs` with `#[global_allocator]`
 
-### 5. **Future Optimization Opportunities**
+### 5. **Fast HashMap with ahash** (Implemented 2025-01-10)
 
-- `ahash` dependency included for potential HashMap improvements
-  - Currently using std HashMap for Serialize/Deserialize compatibility
-  - Can use `FastHashMap<K,V>` type alias for internal-only data structures
-- String clone reduction opportunities (44 occurrences identified)
+- Replaced std `HashMap` with `ahash::AHashMap` throughout the codebase
+- Uses `FastHashMap<K,V>` type alias defined in `src/constants.rs`
+- **Performance benefits**:
+  - ~10-20% faster hash operations compared to std HashMap's SipHash
+  - Zero-cost abstraction (same API as std HashMap)
+  - Fully compatible with serde Serialize/Deserialize (via `ahash` feature flag)
+- **Applied locations**:
+  - `DateUsageResult`: Date-indexed usage aggregation
+  - `CodeAnalysisRecord.conversation_usage`: Per-model token usage
+  - All analyzer conversation_usage maps (Claude, Codex, Gemini)
+  - Batch analysis aggregation maps
+  - Usage calculator temporary maps
+
+### 6. **Bounded Global Caches** (2025-01-10 update)
+
+- **Pricing Match Cache** (`src/pricing/matching.rs`):
+  - Uses LRU cache for model name → pricing lookups
+  - Maximum 200 entries (prevents unbounded growth)
+  - Caches expensive fuzzy matching results
+  - Automatic eviction of least-recently-used entries
+  - Reduces repeated Jaro-Winkler similarity calculations
+
+### 7. **Zero-Copy Optimizations** (2025-01-10 update)
+
+- **Arc-based data sharing** in `batch_analyzer.rs`:
+  - Parallel file processing returns `Arc<Value>` instead of owned Value
+  - Avoids deep cloning large JSON structures during aggregation
+  - Only clones when serializing final output (unavoidable)
+  - Significantly reduces memory allocations in batch operations
 
 ## Code Architecture
 
@@ -508,8 +537,10 @@ docker run --rm \
 - `memchr` - Fast string search operations
 - `itoa` - Fast integer formatting
 - `once_cell` - Lazy static initialization for singletons
-- `ahash` - Fast HashMap implementation (for potential future internal use)
-- `lru` - LRU cache for bounded memory usage in file parsing cache
+- `ahash` (serde feature) - Fast HashMap implementation with Serialize/Deserialize support
+  - Replaces std HashMap throughout codebase for ~10-20% faster operations
+  - Type alias `FastHashMap<K, V>` in `constants.rs`
+- `lru` - LRU cache for bounded memory usage in file parsing cache and pricing lookups
 
 **Archive Handling:**
 

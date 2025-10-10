@@ -1,5 +1,5 @@
+use crate::constants::FastHashMap;
 use serde_json::Value;
-use std::collections::HashMap;
 
 /// Helper function to accumulate integer fields from source to target
 pub fn accumulate_i64_fields(
@@ -40,7 +40,7 @@ pub fn accumulate_nested_object(
 
 /// Process Claude usage data and merge into conversation_usage map
 pub fn process_claude_usage(
-    conversation_usage: &mut HashMap<String, Value>,
+    conversation_usage: &mut FastHashMap<String, Value>,
     model: &str,
     usage: &Value,
 ) {
@@ -97,7 +97,7 @@ pub fn process_claude_usage(
 
 /// Process Codex usage data and merge into conversation_usage map
 pub fn process_codex_usage(
-    conversation_usage: &mut HashMap<String, Value>,
+    conversation_usage: &mut FastHashMap<String, Value>,
     model: &str,
     info: &Value,
 ) {
@@ -143,7 +143,7 @@ pub fn process_codex_usage(
 
 /// Process Gemini usage data and merge into conversation_usage map
 pub fn process_gemini_usage(
-    conversation_usage: &mut HashMap<String, Value>,
+    conversation_usage: &mut FastHashMap<String, Value>,
     model: &str,
     tokens: &crate::models::GeminiTokens,
 ) {
@@ -315,7 +315,7 @@ mod tests {
 
     #[test]
     fn test_process_claude_usage_basic() {
-        let mut conversation_usage = HashMap::new();
+        let mut conversation_usage = FastHashMap::default();
         let model = "claude-3-sonnet";
         let usage = json!({
             "input_tokens": 100,
@@ -335,7 +335,7 @@ mod tests {
 
     #[test]
     fn test_process_claude_usage_accumulation() {
-        let mut conversation_usage = HashMap::new();
+        let mut conversation_usage = FastHashMap::default();
         let model = "claude-3-sonnet";
 
         let usage1 = json!({
@@ -357,7 +357,7 @@ mod tests {
 
     #[test]
     fn test_process_claude_usage_skip_synthetic() {
-        let mut conversation_usage = HashMap::new();
+        let mut conversation_usage = FastHashMap::default();
         let model = "claude-3-sonnet<synthetic>";
         let usage = json!({
             "input_tokens": 100,
@@ -371,7 +371,7 @@ mod tests {
 
     #[test]
     fn test_process_codex_usage_basic() {
-        let mut conversation_usage = HashMap::new();
+        let mut conversation_usage = FastHashMap::default();
         let model = "gpt-4";
         let info = json!({
             "total_token_usage": {
@@ -394,7 +394,7 @@ mod tests {
 
     #[test]
     fn test_process_gemini_usage_basic() {
-        let mut conversation_usage = HashMap::new();
+        let mut conversation_usage = FastHashMap::default();
         let model = "gemini-2.0-flash";
         let tokens = crate::models::GeminiTokens {
             input: 100,

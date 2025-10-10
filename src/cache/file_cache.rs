@@ -39,27 +39,37 @@ impl FileParseCache {
     /// Retrieves cached analysis or parses the file if needed
     ///
     /// Workflow:
-    /// 1. Check cache hit and validate modification time
-    /// 2. If valid, return cached Arc (promotes entry to front)
+    /// 1. Check cache hit with read-only peek (no lock contention)
+    /// 2. If valid, promote entry to front with write lock
     /// 3. If miss/stale, parse file and cache result (may evict LRU entry)
     ///
-    /// Uses modification time tracking to automatically invalidate stale caches.
+    /// Optimized to minimize write lock contention in parallel workloads.
     pub fn get_or_parse<P: AsRef<Path>>(&self, path: P) -> Result<Arc<Value>> {
         let path = path.as_ref();
+        let path_buf = path.to_path_buf();
 
         // Get file metadata (modification time)
         let metadata = fs::metadata(path)?;
         let modified = metadata.modified()?;
 
-        // Try to get from cache (read lock first for concurrent reads)
+        // Fast path: Check cache with read lock (no contention)
         {
-            if let Ok(mut cache_write) = self.cache.write() {
-                // LRU.get() requires &mut self (promotes entry to front)
-                if let Some(cached) = cache_write.get(&path.to_path_buf()) {
+            if let Ok(cache_read) = self.cache.read() {
+                // Use peek() instead of get() to avoid requiring write lock
+                if let Some(cached) = cache_read.peek(&path_buf) {
                     // Check if the cached version is still valid
                     if cached.modified >= modified {
                         log::trace!("LRU cache hit for {}", path.display());
-                        return Ok(Arc::clone(&cached.analysis));
+                        let result = Arc::clone(&cached.analysis);
+                        // Release read lock before acquiring write lock
+                        drop(cache_read);
+
+                        // Promote entry to front (requires write lock but quick operation)
+                        if let Ok(mut cache_write) = self.cache.write() {
+                            cache_write.get(&path_buf); // Updates LRU position
+                        }
+
+                        return Ok(result);
                     }
                 }
             }
@@ -73,7 +83,7 @@ impl FileParseCache {
         // Update cache (write lock) - LRU will auto-evict if at capacity
         if let Ok(mut cache_write) = self.cache.write() {
             cache_write.put(
-                path.to_path_buf(),
+                path_buf,
                 CachedFile {
                     modified,
                     analysis: Arc::clone(&arc_analysis),

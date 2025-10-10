@@ -1,17 +1,17 @@
 use crate::analysis::common_state::AnalysisState;
+use crate::constants::FastHashMap;
 use crate::models::*;
 use crate::utils::{get_git_remote_url, parse_iso_timestamp, process_codex_usage};
 use anyhow::Result;
 use regex::Regex;
 use serde_json::Value;
-use std::collections::HashMap;
 
 /// Analyze Codex conversations
 pub fn analyze_codex_conversations(logs: &[CodexLog]) -> Result<CodeAnalysis> {
     let mut state = AnalysisState::new();
-    let mut conversation_usage: HashMap<String, Value> = HashMap::with_capacity(5);
+    let mut conversation_usage: FastHashMap<String, Value> = FastHashMap::with_capacity(5);
     let mut current_model = String::new();
-    let mut shell_calls: HashMap<String, CodexShellCall> = HashMap::with_capacity(50);
+    let mut shell_calls: FastHashMap<String, CodexShellCall> = FastHashMap::with_capacity(50);
 
     for entry in logs {
         let ts = parse_iso_timestamp(&entry.timestamp);

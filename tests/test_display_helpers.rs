@@ -3,8 +3,9 @@
 // These tests focus on testable components
 
 use serde_json::json;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use vibe_coding_tracker::analysis::AggregatedAnalysisRow;
+use vibe_coding_tracker::constants::FastHashMap;
 use vibe_coding_tracker::models::DateUsageResult;
 
 #[test]
@@ -51,7 +52,7 @@ fn test_analysis_display_table_empty() {
 #[test]
 fn test_usage_display_table_with_data() {
     let mut usage_data: DateUsageResult = BTreeMap::new();
-    let mut models = HashMap::new();
+    let mut models = FastHashMap::default();
 
     models.insert(
         "claude-sonnet-4".to_string(),
@@ -80,7 +81,7 @@ fn test_usage_display_table_empty() {
 #[test]
 fn test_usage_display_text_with_data() {
     let mut usage_data: DateUsageResult = BTreeMap::new();
-    let mut models = HashMap::new();
+    let mut models = FastHashMap::default();
 
     models.insert(
         "claude-sonnet-4".to_string(),
@@ -109,7 +110,7 @@ fn test_usage_display_text_empty() {
 #[test]
 fn test_usage_display_text_multiple_models() {
     let mut usage_data: DateUsageResult = BTreeMap::new();
-    let mut models = HashMap::new();
+    let mut models = FastHashMap::default();
 
     models.insert(
         "claude-sonnet-4".to_string(),
@@ -139,7 +140,7 @@ fn test_usage_display_text_multiple_models() {
 #[test]
 fn test_usage_display_table_codex_format() {
     let mut usage_data: DateUsageResult = BTreeMap::new();
-    let mut models = HashMap::new();
+    let mut models = FastHashMap::default();
 
     models.insert(
         "gpt-4-turbo".to_string(),
@@ -184,7 +185,7 @@ fn test_usage_display_table_multiple_dates() {
     let mut usage_data: DateUsageResult = BTreeMap::new();
 
     for i in 1..=5 {
-        let mut models = HashMap::new();
+        let mut models = FastHashMap::default();
         models.insert(
             "claude-sonnet-4".to_string(),
             json!({
@@ -224,7 +225,7 @@ fn test_usage_display_text_sorted_output() {
 
     // Insert dates out of order
     for date in ["2025-10-03", "2025-10-01", "2025-10-02"] {
-        let mut models = HashMap::new();
+        let mut models = FastHashMap::default();
         models.insert(
             "claude-sonnet-4".to_string(),
             json!({
@@ -245,7 +246,7 @@ fn test_usage_display_table_with_daily_averages_single_provider() {
 
     // Add multiple days for Claude only
     for i in 1..=3 {
-        let mut models = HashMap::new();
+        let mut models = FastHashMap::default();
         models.insert(
             "claude-sonnet-4".to_string(),
             json!({
@@ -267,7 +268,7 @@ fn test_usage_display_table_with_daily_averages_multiple_providers() {
     let mut usage_data: DateUsageResult = BTreeMap::new();
 
     // Day 1: Claude
-    let mut day1_models = HashMap::new();
+    let mut day1_models = FastHashMap::default();
     day1_models.insert(
         "claude-sonnet-4".to_string(),
         json!({
@@ -278,7 +279,7 @@ fn test_usage_display_table_with_daily_averages_multiple_providers() {
     usage_data.insert("2025-10-01".to_string(), day1_models);
 
     // Day 2: Codex
-    let mut day2_models = HashMap::new();
+    let mut day2_models = FastHashMap::default();
     day2_models.insert(
         "gpt-4-turbo".to_string(),
         json!({
@@ -292,7 +293,7 @@ fn test_usage_display_table_with_daily_averages_multiple_providers() {
     usage_data.insert("2025-10-02".to_string(), day2_models);
 
     // Day 3: Gemini
-    let mut day3_models = HashMap::new();
+    let mut day3_models = FastHashMap::default();
     day3_models.insert(
         "gemini-2.5-pro".to_string(),
         json!({
@@ -311,7 +312,7 @@ fn test_usage_display_table_with_daily_averages_mixed_providers() {
     let mut usage_data: DateUsageResult = BTreeMap::new();
 
     // Day 1: Claude and Codex
-    let mut day1_models = HashMap::new();
+    let mut day1_models = FastHashMap::default();
     day1_models.insert(
         "claude-sonnet-4-5".to_string(),
         json!({
@@ -332,7 +333,7 @@ fn test_usage_display_table_with_daily_averages_mixed_providers() {
     usage_data.insert("2025-10-01".to_string(), day1_models);
 
     // Day 2: All three providers
-    let mut day2_models = HashMap::new();
+    let mut day2_models = FastHashMap::default();
     day2_models.insert(
         "claude-sonnet-4".to_string(),
         json!({
@@ -366,7 +367,7 @@ fn test_usage_display_table_with_daily_averages_mixed_providers() {
 #[test]
 fn test_usage_display_table_with_daily_averages_o1_models() {
     let mut usage_data: DateUsageResult = BTreeMap::new();
-    let mut models = HashMap::new();
+    let mut models = FastHashMap::default();
 
     // Test o1 models are detected as Codex
     models.insert(

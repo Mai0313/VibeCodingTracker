@@ -1,5 +1,5 @@
+use crate::constants::FastHashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 /// Base metadata for file operations captured during analysis
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,7 +75,7 @@ pub struct CodeAnalysisRecord {
     pub edit_file_details: Vec<CodeAnalysisApplyDiffDetail>,
     pub run_command_details: Vec<CodeAnalysisRunCommandDetail>,
     pub tool_call_counts: CodeAnalysisToolCalls,
-    pub conversation_usage: HashMap<String, serde_json::Value>,
+    pub conversation_usage: FastHashMap<String, serde_json::Value>,
     pub task_id: String,
     pub timestamp: i64,
     pub folder_path: String,

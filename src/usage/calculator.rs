@@ -1,21 +1,21 @@
 use crate::cache::global_cache;
-use crate::constants::capacity;
+use crate::constants::{FastHashMap, capacity};
 use crate::models::DateUsageResult;
 use crate::utils::{collect_files_with_dates, is_gemini_chat_file, is_json_file, resolve_paths};
 use anyhow::Result;
 use rayon::prelude::*;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// Extracts token usage data from CodeAnalysis records
-fn extract_conversation_usage_from_analysis(analysis: &Value) -> HashMap<String, Value> {
+fn extract_conversation_usage_from_analysis(analysis: &Value) -> FastHashMap<String, Value> {
     let Some(records) = analysis.get("records").and_then(|r| r.as_array()) else {
-        return HashMap::new();
+        return FastHashMap::default();
     };
 
     // Pre-allocate HashMap using centralized capacity constant
-    let mut conversation_usage = HashMap::with_capacity(capacity::MODELS_PER_SESSION);
+    let mut conversation_usage = FastHashMap::with_capacity(capacity::MODELS_PER_SESSION);
 
     for record in records {
         let Some(record_obj) = record.as_object() else {
@@ -74,7 +74,7 @@ where
     let files = collect_files_with_dates(dir, filter_fn)?;
 
     // Process files in parallel with caching for better performance
-    let file_results: Vec<(String, HashMap<String, Value>)> = files
+    let file_results: Vec<(String, FastHashMap<String, Value>)> = files
         .par_iter()
         .filter_map(|file_info| {
             match global_cache().get_or_parse(&file_info.path) {
@@ -101,7 +101,7 @@ where
         // Use entry API to avoid double lookup
         let date_entry = result
             .entry(date)
-            .or_insert_with(|| HashMap::with_capacity(capacity::MODELS_PER_SESSION));
+            .or_insert_with(|| FastHashMap::with_capacity(capacity::MODELS_PER_SESSION));
 
         for (model, usage_value) in conversation_usage {
             // Use entry API to avoid double lookup

@@ -1,7 +1,8 @@
+use crate::constants::FastHashMap;
 use crate::models::*;
 use crate::utils::count_lines;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 /// Common analysis state shared by all analyzers (Claude, Codex, Gemini)
 pub struct AnalysisState {
@@ -186,7 +187,7 @@ impl AnalysisState {
     }
 
     /// Convert state into a CodeAnalysisRecord
-    pub fn into_record(self, conversation_usage: HashMap<String, Value>) -> CodeAnalysisRecord {
+    pub fn into_record(self, conversation_usage: FastHashMap<String, Value>) -> CodeAnalysisRecord {
         CodeAnalysisRecord {
             total_unique_files: self.unique_files.len(),
             total_write_lines: self.total_write_lines,

@@ -1,8 +1,8 @@
+use crate::constants::FastHashMap;
 use crate::models::*;
 use crate::utils::{get_git_remote_url, parse_iso_timestamp, process_gemini_usage};
 use anyhow::Result;
 use serde_json::Value;
-use std::collections::HashMap;
 
 /// Analyze Gemini conversations
 pub fn analyze_gemini_conversations(mut data: Vec<Value>) -> Result<CodeAnalysis> {
@@ -19,8 +19,8 @@ pub fn analyze_gemini_conversations(mut data: Vec<Value>) -> Result<CodeAnalysis
     // Parse the Gemini session
     let session: GeminiSession = serde_json::from_value(data.remove(0))?;
 
-    // Pre-allocate HashMap with typical capacity (1-3 models per conversation)
-    let mut conversation_usage: HashMap<String, Value> = HashMap::with_capacity(3);
+    // Pre-allocate FastHashMap with typical capacity (1-3 models per conversation)
+    let mut conversation_usage: FastHashMap<String, Value> = FastHashMap::with_capacity(3);
     let mut last_timestamp = 0i64;
     let folder_path = String::new();
 
