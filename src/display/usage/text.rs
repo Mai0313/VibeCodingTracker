@@ -3,7 +3,7 @@ use crate::models::DateUsageResult;
 use crate::pricing::{ModelPricingMap, fetch_model_pricing};
 use std::collections::HashMap;
 
-/// Display usage data as plain text
+/// Displays token usage data as plain text (Date > model: cost format)
 pub fn display_usage_text(usage_data: &DateUsageResult) {
     if usage_data.is_empty() {
         println!("No usage data found");

@@ -11,7 +11,7 @@ use comfy_table::{Cell, CellAlignment, Color, Table, presets::UTF8_FULL};
 use owo_colors::OwoColorize;
 use std::collections::HashMap;
 
-/// Display usage data as a table
+/// Displays token usage data as a static table
 pub fn display_usage_table(usage_data: &DateUsageResult) {
     if usage_data.is_empty() {
         println!("⚠️  No usage data found in Claude Code or Codex sessions");

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-/// Update check cache structure
+/// Cached update check result with 24-hour TTL
 #[derive(Debug, Serialize, Deserialize)]
 struct UpdateCheckCache {
     last_check: DateTime<Utc>,
@@ -17,7 +17,7 @@ struct UpdateCheckCache {
 }
 
 impl UpdateCheckCache {
-    /// Check if the cache is still valid (less than 24 hours old)
+    /// Returns whether the cache is less than 24 hours old
     fn is_valid(&self) -> bool {
         let now = Utc::now();
         let age = now.signed_duration_since(self.last_check);
@@ -25,7 +25,7 @@ impl UpdateCheckCache {
     }
 }
 
-/// Get the cache file path
+/// Returns the update check cache file path
 fn get_cache_path() -> Result<PathBuf> {
     let home = home::home_dir().context("Failed to get home directory")?;
     let cache_dir = home.join(".vibe_coding_tracker");
@@ -37,7 +37,7 @@ fn get_cache_path() -> Result<PathBuf> {
     Ok(cache_dir.join("update_check.json"))
 }
 
-/// Load the cache from disk
+/// Loads the update check cache from disk
 fn load_cache() -> Option<UpdateCheckCache> {
     let cache_path = get_cache_path().ok()?;
 
@@ -49,7 +49,7 @@ fn load_cache() -> Option<UpdateCheckCache> {
     serde_json::from_str(&content).ok()
 }
 
-/// Save the cache to disk
+/// Saves the update check cache to disk
 fn save_cache(cache: &UpdateCheckCache) -> Result<()> {
     let cache_path = get_cache_path()?;
     let content = serde_json::to_string_pretty(cache)?;
@@ -57,7 +57,7 @@ fn save_cache(cache: &UpdateCheckCache) -> Result<()> {
     Ok(())
 }
 
-/// Check for updates and return version information if update is available
+/// Checks for updates and returns version information if available
 fn check_for_update_internal() -> Result<Option<(String, InstallationMethod)>> {
     // Get current version
     let current_version_str = super::extract_semver_version(crate::VERSION);
@@ -84,7 +84,7 @@ fn check_for_update_internal() -> Result<Option<(String, InstallationMethod)>> {
     }
 }
 
-/// Display the update notification
+/// Displays a colorful update notification box with installation-specific instructions
 fn display_update_notification(latest_version: &str, install_method: InstallationMethod) {
     println!(
         "{}",
@@ -141,13 +141,15 @@ fn display_update_notification(latest_version: &str, install_method: Installatio
     println!();
 }
 
-/// Check for updates on startup (with caching)
-/// This function is designed to be called at the start of the application
-/// It will:
-/// 1. Check the cache first (valid for 24 hours)
-/// 2. If cache is invalid or doesn't exist, perform an actual check
-/// 3. Display a notification if an update is available
-/// 4. Silently fail if there are any errors (to not disrupt the main application)
+/// Checks for updates on application startup with 24-hour caching
+///
+/// This non-blocking background check:
+/// 1. Checks cache first (24-hour TTL)
+/// 2. Performs actual GitHub check if cache invalid/missing
+/// 3. Displays notification if update available
+/// 4. Fails silently to avoid disrupting the application
+///
+/// Detects installation method and shows appropriate update command.
 pub fn check_update_on_startup() {
     // Try to load from cache first
     if let Some(cache) = load_cache() {

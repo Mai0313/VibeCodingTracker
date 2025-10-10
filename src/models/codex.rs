@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Codex log entry
+/// Single log entry from Codex/OpenAI session file
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodexLog {
     pub timestamp: String,
@@ -10,7 +10,7 @@ pub struct CodexLog {
     pub payload: CodexPayload,
 }
 
-/// Codex payload
+/// Payload data containing event-specific information within a Codex log entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodexPayload {
     #[serde(rename = "type")]
@@ -34,7 +34,7 @@ pub struct CodexPayload {
     pub git: Option<CodexGitInfo>,
 }
 
-/// Codex content
+/// Message content block in Codex format
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodexContent {
     #[serde(rename = "type")]
@@ -42,7 +42,7 @@ pub struct CodexContent {
     pub text: Option<String>,
 }
 
-/// Codex git information
+/// Git repository metadata captured during a Codex session
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodexGitInfo {
     pub commit_hash: Option<String>,
@@ -50,20 +50,20 @@ pub struct CodexGitInfo {
     pub repository_url: Option<String>,
 }
 
-/// Codex shell arguments
+/// Shell command arguments structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodexShellArguments {
     pub command: Vec<String>,
 }
 
-/// Codex shell output
+/// Shell command execution result including output and metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodexShellOutput {
     pub output: String,
     pub metadata: Option<CodexShellMetadata>,
 }
 
-/// Codex shell metadata
+/// Execution metadata for shell commands
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodexShellMetadata {
     pub exit_code: i32,

@@ -3,7 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-/// Helper paths for application directories
+/// Resolved paths for AI provider session directories and cache
 #[derive(Debug, Clone)]
 pub struct HelperPaths {
     pub home_dir: PathBuf,
@@ -16,7 +16,7 @@ pub struct HelperPaths {
     pub cache_dir: PathBuf,
 }
 
-/// Resolve application paths
+/// Resolves all application paths including session directories for all AI providers
 pub fn resolve_paths() -> Result<HelperPaths> {
     let home_dir =
         home::home_dir().ok_or_else(|| anyhow::anyhow!("Unable to resolve user home directory"))?;
@@ -41,22 +41,23 @@ pub fn resolve_paths() -> Result<HelperPaths> {
     })
 }
 
-/// Get current user name
+/// Returns the current username from environment variables
 pub fn get_current_user() -> String {
     std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
-// Cache for machine ID (initialized once)
 static MACHINE_ID_CACHE: OnceLock<String> = OnceLock::new();
 
-/// Get home directory with error handling
+/// Returns the user's home directory
 fn get_home_dir() -> Result<PathBuf> {
     home::home_dir().ok_or_else(|| anyhow::anyhow!("Unable to resolve user home directory"))
 }
 
-/// Get machine ID (cached after first call)
+/// Returns a unique machine identifier (cached after first call)
+///
+/// Tries `/etc/machine-id` on Linux, falls back to hostname, then to a placeholder.
 pub fn get_machine_id() -> &'static str {
     MACHINE_ID_CACHE.get_or_init(|| {
         // Try to read /etc/machine-id on Linux
@@ -75,7 +76,7 @@ pub fn get_machine_id() -> &'static str {
     })
 }
 
-/// Get cache directory path (creates it if it doesn't exist)
+/// Returns the cache directory path, creating it if necessary
 pub fn get_cache_dir() -> Result<PathBuf> {
     let home_dir = get_home_dir()?;
     let cache_dir = home_dir.join(".vibe_coding_tracker");
@@ -88,15 +89,15 @@ pub fn get_cache_dir() -> Result<PathBuf> {
     Ok(cache_dir)
 }
 
-/// Get pricing cache file path for a specific date
-/// Returns: ~/.vibe_coding_tracker/model_pricing_YYYY-MM-DD.json
+/// Returns the pricing cache file path for a specific date
+///
+/// Format: `~/.vibe_coding_tracker/model_pricing_YYYY-MM-DD.json`
 pub fn get_pricing_cache_path(date: &str) -> Result<PathBuf> {
     let cache_dir = get_cache_dir()?;
     Ok(cache_dir.join(format!("model_pricing_{}.json", date)))
 }
 
-/// Find pricing cache file for a specific date
-/// Returns Some(path) if the cache file exists, None otherwise
+/// Finds the pricing cache file for a specific date if it exists
 pub fn find_pricing_cache_for_date(date: &str) -> Option<PathBuf> {
     let cache_path = get_pricing_cache_path(date).ok()?;
     if cache_path.exists() {
@@ -106,8 +107,7 @@ pub fn find_pricing_cache_for_date(date: &str) -> Option<PathBuf> {
     }
 }
 
-/// List all pricing cache files in the cache directory
-/// Returns vector of (filename, PathBuf) tuples
+/// Lists all pricing cache files in the cache directory
 pub fn list_pricing_cache_files() -> Result<Vec<(String, PathBuf)>> {
     let cache_dir = get_cache_dir()?;
     let mut cache_files = Vec::new();

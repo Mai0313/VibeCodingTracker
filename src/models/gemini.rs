@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// Gemini session structure
+/// Complete Gemini coding session with metadata and message history
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GeminiSession {
@@ -11,7 +11,7 @@ pub struct GeminiSession {
     pub messages: Vec<GeminiMessage>,
 }
 
-/// Gemini message structure
+/// Single message within a Gemini session
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GeminiMessage {
@@ -26,7 +26,7 @@ pub struct GeminiMessage {
     pub model: Option<String>,
 }
 
-/// Gemini thought structure
+/// AI reasoning step captured during Gemini's thought process
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeminiThought {
     pub subject: String,
@@ -34,7 +34,7 @@ pub struct GeminiThought {
     pub timestamp: String,
 }
 
-/// Gemini token usage structure
+/// Token usage breakdown for a single Gemini message
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeminiTokens {
     pub input: i64,

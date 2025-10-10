@@ -9,7 +9,11 @@ use anyhow::Result;
 use serde_json::Value;
 use std::path::Path;
 
-/// Analyze a JSONL or JSON file and return CodeAnalysis result
+/// Analyzes a session file (JSONL or JSON) and returns unified CodeAnalysis result
+///
+/// This is the main entry point for parsing conversation files from any provider.
+/// It automatically detects the format (Claude Code, Codex, or Gemini) and routes
+/// to the appropriate analyzer.
 pub fn analyze_jsonl_file<P: AsRef<Path>>(path: P) -> Result<Value> {
     let data = match read_jsonl(&path) {
         Ok(data) => data,

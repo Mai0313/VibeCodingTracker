@@ -1,31 +1,31 @@
 pub type FastHashMap<K, V> = ahash::AHashMap<K, V>;
 
-/// Capacity hints for various data structures
+/// Pre-allocated capacity constants for data structures to minimize reallocation overhead
 pub mod capacity {
-    /// Typical number of models per conversation session (Claude/Codex/Gemini)
+    /// Expected number of AI models per conversation session
     pub const MODELS_PER_SESSION: usize = 3;
 
-    /// Typical number of date entries in usage tracking
+    /// Expected number of unique dates in usage tracking
     pub const DATES_IN_USAGE: usize = 30;
 
-    /// Typical number of date-model combinations in analysis
+    /// Expected number of date-model combinations in batch analysis
     pub const DATE_MODEL_COMBINATIONS: usize = 100;
 
-    /// Typical number of session files per directory
+    /// Expected number of session files per directory
     pub const SESSION_FILES: usize = 50;
 
-    /// LRU cache size for parsed files (number of entries)
+    /// Maximum number of parsed files to cache in LRU cache
     pub const FILE_CACHE_SIZE: usize = 100;
 
-    /// Initial capacity for token fields in usage data
+    /// Expected number of token fields per usage entry
     pub const TOKEN_FIELDS: usize = 8;
 }
 
-/// Buffer sizes for I/O operations
+/// Buffer size constants for optimized I/O operations
 pub mod buffer {
-    /// Buffer size for file reading (128KB for better throughput)
+    /// File read buffer size in bytes (128KB optimized for throughput)
     pub const FILE_READ_BUFFER: usize = 128 * 1024;
 
-    /// Estimated average line size for JSONL files
+    /// Estimated average size per line in JSONL files for capacity pre-allocation
     pub const AVG_JSONL_LINE_SIZE: usize = 500;
 }

@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 
+/// Pricing data for a single AI model including base and high-volume rates
+///
+/// Costs are in USD per token. Fields with "above_200k" suffix apply when
+/// token counts exceed 200,000. If above_200k fields are 0, base prices are used.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ModelPricing {
     #[serde(default)]
@@ -16,7 +20,6 @@ pub struct ModelPricing {
     pub cache_read_input_token_cost: f64,
     #[serde(default)]
     pub cache_creation_input_token_cost: f64,
-    // Above 200K pricing (optional, fallback to base price if not available)
     #[serde(default)]
     pub input_cost_per_token_above_200k_tokens: f64,
     #[serde(default)]
@@ -42,7 +45,7 @@ impl Default for ModelPricing {
     }
 }
 
-/// Clean up old cache files (keep only today's)
+/// Removes outdated pricing cache files, keeping only today's cache
 pub fn cleanup_old_cache() {
     let Ok(cache_files) = list_pricing_cache_files() else {
         return;
@@ -59,7 +62,7 @@ pub fn cleanup_old_cache() {
     }
 }
 
-/// Load pricing from cache
+/// Loads pricing data from today's cache file
 pub fn load_from_cache() -> Result<HashMap<String, ModelPricing>> {
     let today = get_current_date();
     let cache_path = find_pricing_cache_for_date(&today)
@@ -71,7 +74,7 @@ pub fn load_from_cache() -> Result<HashMap<String, ModelPricing>> {
     Ok(pricing)
 }
 
-/// Save pricing to cache
+/// Saves pricing data to today's cache file and cleans up old caches
 pub fn save_to_cache(pricing: &HashMap<String, ModelPricing>) -> Result<()> {
     let today = get_current_date();
     let cache_path = get_pricing_cache_path(&today)?;
@@ -87,7 +90,9 @@ pub fn save_to_cache(pricing: &HashMap<String, ModelPricing>) -> Result<()> {
     Ok(())
 }
 
-/// Normalize pricing data: fill above_200k prices with base prices if they are 0
+/// Normalizes pricing data by copying base prices to above_200k fields when they are zero
+///
+/// This ensures all models have valid above_200k pricing, using base prices as fallback.
 pub fn normalize_pricing(
     mut pricing: HashMap<String, ModelPricing>,
 ) -> HashMap<String, ModelPricing> {

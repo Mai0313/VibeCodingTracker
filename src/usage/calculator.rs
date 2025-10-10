@@ -8,7 +8,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-/// Extract conversation usage from CodeAnalysis result
+/// Extracts token usage data from CodeAnalysis records
 fn extract_conversation_usage_from_analysis(analysis: &Value) -> HashMap<String, Value> {
     let Some(records) = analysis.get("records").and_then(|r| r.as_array()) else {
         return HashMap::new();
@@ -41,7 +41,10 @@ fn extract_conversation_usage_from_analysis(analysis: &Value) -> HashMap<String,
     conversation_usage
 }
 
-/// Calculate usage from all directories
+/// Aggregates token usage from all AI provider session directories
+///
+/// Scans Claude Code, Codex, and Gemini session files, extracts token usage,
+/// and aggregates by date and model. Returns a BTreeMap sorted chronologically.
 pub fn get_usage_from_directories() -> Result<DateUsageResult> {
     let paths = resolve_paths()?;
     // Use BTreeMap for automatic chronological sorting by date

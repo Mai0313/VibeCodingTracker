@@ -12,14 +12,14 @@ const SIMILARITY_THRESHOLD: f64 = 0.7;
 static MATCH_CACHE: LazyLock<RwLock<HashMap<String, ModelPricingResult>>> =
     LazyLock::new(|| RwLock::new(HashMap::with_capacity(50)));
 
-/// Result of model pricing lookup with optional matched model name
+/// Result of a model pricing lookup including the matched model name for transparency
 #[derive(Debug, Clone)]
 pub struct ModelPricingResult {
     pub pricing: ModelPricing,
     pub matched_model: Option<String>,
 }
 
-/// Optimized pricing map with precomputed indices for fast lookups
+/// Optimized pricing map with precomputed indices for O(1) exact matches and fast fuzzy matching
 #[derive(Debug, Clone)]
 pub struct ModelPricingMap {
     // Original pricing data (use Rc<str> to avoid cloning keys)
@@ -31,7 +31,11 @@ pub struct ModelPricingMap {
 }
 
 impl ModelPricingMap {
-    /// Create a new ModelPricingMap with precomputed indices
+    /// Creates a new pricing map with precomputed indices for optimized lookups
+    ///
+    /// This constructor processes the raw pricing data to build:
+    /// - Normalized key index for version-agnostic matching
+    /// - Lowercase key list for substring and fuzzy matching
     pub fn new(raw: HashMap<String, ModelPricing>) -> Self {
         // Pre-allocate with exact capacity
         let capacity = raw.len();
@@ -65,7 +69,16 @@ impl ModelPricingMap {
         }
     }
 
-    /// Get pricing for a specific model with optimized matching
+    /// Retrieves pricing for a model using multi-tier matching strategy
+    ///
+    /// Matching strategy (in order of priority):
+    /// 1. Exact match (O(1) hash lookup)
+    /// 2. Normalized match (removes version suffixes)
+    /// 3. Substring match (bidirectional contains check)
+    /// 4. Fuzzy match (Jaro-Winkler ≥ 0.7 threshold)
+    /// 5. Default (zero cost) if no match found
+    ///
+    /// Results are cached globally for performance.
     pub fn get(&self, model_name: &str) -> ModelPricingResult {
         // Ultra-fast path: Check cache first
         if let Ok(cache) = MATCH_CACHE.read() {
@@ -161,31 +174,35 @@ impl ModelPricingMap {
         result
     }
 
-    /// Check if the pricing map is empty
+    /// Returns whether the pricing map contains no models
     pub fn is_empty(&self) -> bool {
         self.raw.is_empty()
     }
 
-    /// Get the raw pricing map (for backward compatibility)
-    /// Note: Returns `HashMap<Rc<str>, ModelPricing>` instead of `HashMap<String, ModelPricing>`
+    /// Returns the raw pricing data with reference-counted keys
     pub fn raw(&self) -> &HashMap<Rc<str>, ModelPricing> {
         &self.raw
     }
 }
 
-/// Clear the global pricing match cache
+/// Clears the global pricing match cache
 ///
-/// **Note**: This function is primarily intended for testing to ensure test isolation.
-/// In production code, the cache helps improve performance by avoiding repeated
-/// expensive fuzzy matching operations.
+/// Primarily used in tests for isolation. In production, the cache significantly
+/// improves performance by avoiding repeated expensive fuzzy matching operations.
 pub fn clear_pricing_cache() {
     if let Ok(mut cache) = MATCH_CACHE.write() {
         cache.clear();
     }
 }
 
-/// Normalize model name by removing common version suffixes and prefixes
-/// Optimized to minimize allocations
+/// Normalizes model names by removing provider prefixes and version suffixes
+///
+/// Removes patterns like:
+/// - Provider prefixes: `bedrock/`, `openai/`
+/// - Date suffixes: `-20231201`, `-20240320`
+/// - Version suffixes: `-v1.0`, `-v2`
+///
+/// Optimized to minimize string allocations.
 pub fn normalize_model_name(name: &str) -> String {
     let mut start = 0;
     let mut end = name.len();

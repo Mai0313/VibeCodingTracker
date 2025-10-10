@@ -2,8 +2,11 @@ use super::cache::ModelPricing;
 
 const TOKEN_THRESHOLD: i64 = 200_000;
 
-/// Calculate cost based on token usage and model pricing
-/// Automatically uses above_200k pricing when tokens exceed 200K threshold
+/// Calculates total cost based on token usage and model pricing
+///
+/// Each token type (input, output, cache_read, cache_creation) is evaluated independently
+/// against the 200K threshold. If a type exceeds 200K tokens, the corresponding above_200k
+/// price is used; otherwise, the base price applies.
 pub fn calculate_cost(
     input_tokens: i64,
     output_tokens: i64,

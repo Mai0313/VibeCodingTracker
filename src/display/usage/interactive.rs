@@ -23,7 +23,13 @@ const USAGE_REFRESH_SECS: u64 = 5;
 const PRICING_REFRESH_SECS: u64 = 300;
 const MAX_TRACKED_ROWS: usize = 100;
 
-/// Display usage data as an interactive table with periodic refresh
+/// Displays token usage data in an interactive TUI with auto-refresh
+///
+/// Features:
+/// - Auto-refresh every 5 seconds (usage data) and 5 minutes (pricing)
+/// - Real-time memory monitoring
+/// - Provider-grouped daily averages
+/// - Keyboard controls: `q`, `Esc`, or `Ctrl+C` to exit
 pub fn display_usage_interactive() -> anyhow::Result<()> {
     let mut terminal = setup_terminal()?;
     let mut refresh_state = RefreshState::new(USAGE_REFRESH_SECS);

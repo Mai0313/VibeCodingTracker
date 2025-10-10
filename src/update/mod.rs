@@ -14,9 +14,10 @@ pub use github::{GitHubAsset, GitHubRelease};
 pub use installation::{InstallationMethod, detect_installation_method};
 pub use startup_check::check_update_on_startup;
 
-/// Extract semver-compatible version from BUILD_VERSION
-/// BUILD_VERSION format: "0.1.6" or "0.1.6-5-g1234567" or "0.1.6-5-g1234567-dirty"
-/// Returns: "0.1.6"
+/// Extracts clean semver version from BUILD_VERSION string
+///
+/// BUILD_VERSION may include git metadata: `"0.1.6-5-g1234567-dirty"`
+/// This function returns just the base version: `"0.1.6"`
 pub fn extract_semver_version(build_version: &str) -> &str {
     // Split by '-' and take the first part (the base version)
     build_version.split('-').next().unwrap_or(build_version)
@@ -35,8 +36,9 @@ fn get_current_version() -> Result<(String, Version)> {
     Ok((full_version.to_string(), semver_version))
 }
 
-/// Get version comparison information
-/// Returns: (current_version_display, current_version, latest_version, release)
+/// Fetches and compares current version with latest GitHub release
+///
+/// Returns `Some` if an update is available, `None` if already on latest version.
 fn get_version_comparison() -> Result<Option<(String, Version, Version, GitHubRelease)>> {
     let release =
         github::fetch_latest_release().context("Failed to fetch latest release information")?;
@@ -66,7 +68,7 @@ fn get_version_comparison() -> Result<Option<(String, Version, Version, GitHubRe
     )))
 }
 
-/// Check for updates and return version information
+/// Checks for available updates and displays release notes
 pub fn check_update() -> Result<Option<String>> {
     println!("🔍 Checking for updates...");
 
@@ -82,7 +84,7 @@ pub fn check_update() -> Result<Option<String>> {
     }
 }
 
-/// Perform the update process
+/// Downloads and installs the latest version from GitHub releases
 pub fn perform_update() -> Result<()> {
     println!("🚀 Starting update process...");
     println!();
@@ -152,7 +154,9 @@ pub fn perform_update() -> Result<()> {
     Ok(())
 }
 
-/// Interactive update with confirmation
+/// Interactive update process with user confirmation prompt
+///
+/// If `force` is true, skips confirmation and updates immediately.
 pub fn update_interactive(force: bool) -> Result<()> {
     if !force {
         // Check first

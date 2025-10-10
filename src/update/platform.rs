@@ -6,7 +6,7 @@ use std::path::Path;
 #[cfg(windows)]
 use std::io::Write;
 
-/// Determine the asset name pattern based on current platform and version
+/// Returns the GitHub release asset name for the current platform and version
 pub fn get_asset_pattern(version: &str) -> Result<String> {
     let os = env::consts::OS;
     let arch = env::consts::ARCH;
@@ -36,7 +36,9 @@ pub fn get_asset_pattern(version: &str) -> Result<String> {
     Ok(pattern)
 }
 
-/// Perform the update for Unix-like systems (Linux, macOS)
+/// Performs the update on Unix-like systems by renaming binaries
+///
+/// Strategy: Rename current binary to `.old` backup, then move new binary to current location.
 #[cfg(unix)]
 pub fn perform_update_unix(current_exe: &Path, new_binary: &Path) -> Result<()> {
     let backup_path = current_exe.with_extension("old");
@@ -61,7 +63,10 @@ pub fn perform_update_unix(current_exe: &Path, new_binary: &Path) -> Result<()> 
     Ok(())
 }
 
-/// Perform the update for Windows
+/// Performs the update on Windows using a batch script
+///
+/// Strategy: Save new binary as `.new`, create a batch script that replaces the binary
+/// after the current process exits. User must run the batch script to complete update.
 #[cfg(windows)]
 pub fn perform_update_windows(current_exe: &Path, new_binary: &Path) -> Result<()> {
     // On Windows, we can't replace the running executable directly

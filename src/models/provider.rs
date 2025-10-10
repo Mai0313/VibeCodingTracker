@@ -10,7 +10,10 @@ pub enum Provider {
 }
 
 impl Provider {
-    /// Detect provider from model name (const function for compile-time optimization)
+    /// Detects the AI provider from a model name using byte-level pattern matching
+    ///
+    /// This const function enables compile-time optimization and uses efficient byte
+    /// comparison to identify Claude, Gemini, or Codex models.
     pub const fn from_model_name(model: &str) -> Self {
         // Use byte comparison for better performance
         let bytes = model.as_bytes();
@@ -51,7 +54,7 @@ impl Provider {
         Self::Unknown
     }
 
-    /// Get provider display name
+    /// Returns the human-readable name of the provider
     pub const fn display_name(&self) -> &'static str {
         match self {
             Self::ClaudeCode => "Claude Code",
@@ -61,7 +64,7 @@ impl Provider {
         }
     }
 
-    /// Get provider icon
+    /// Returns the emoji icon representing the provider
     pub const fn icon(&self) -> &'static str {
         match self {
             Self::ClaudeCode => "🤖",

@@ -2,7 +2,12 @@ use crate::models::ExtensionType;
 use anyhow::{Result, bail};
 use serde_json::Value;
 
-/// Detect whether the log is from Claude Code, Codex, or Gemini
+/// Detects the AI provider format by analyzing distinctive fields in the session data
+///
+/// Detection strategy:
+/// - Gemini: Single object with `sessionId`, `projectHash`, and `messages` fields
+/// - Claude Code: Contains `parentUuid` field in log entries
+/// - Codex: Default fallback if no other markers found
 pub fn detect_extension_type(data: &[Value]) -> Result<ExtensionType> {
     if data.is_empty() {
         bail!("Cannot detect extension type from empty data");

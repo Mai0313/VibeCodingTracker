@@ -20,7 +20,7 @@ pub struct GitHubAsset {
     pub size: u64,
 }
 
-/// Fetch the latest release information from GitHub
+/// Fetches the latest release information from GitHub API
 pub fn fetch_latest_release() -> Result<GitHubRelease> {
     let client = reqwest::blocking::Client::builder()
         .user_agent(USER_AGENT)
@@ -43,7 +43,7 @@ pub fn fetch_latest_release() -> Result<GitHubRelease> {
     Ok(release)
 }
 
-/// Download a file from URL to specified path
+/// Downloads a file from URL to the specified destination path
 pub fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
     println!("📥 Downloading from: {}", url);
 

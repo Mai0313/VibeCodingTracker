@@ -16,8 +16,10 @@ pub use matching::{
     ModelPricingMap, ModelPricingResult, clear_pricing_cache, normalize_model_name,
 };
 
-/// Fetch model pricing from LiteLLM repository (with caching)
-/// Returns an optimized ModelPricingMap with precomputed indices
+/// Fetches AI model pricing data from LiteLLM repository with automatic caching
+///
+/// Returns an optimized pricing map with precomputed indices for fast lookups.
+/// Pricing is cached locally for 24 hours (one file per date) to minimize API calls.
 pub fn fetch_model_pricing() -> Result<ModelPricingMap> {
     let today = get_current_date();
 

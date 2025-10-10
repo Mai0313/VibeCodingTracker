@@ -19,7 +19,7 @@ pub const PKG_DESCRIPTION: &str = env!("CARGO_PKG_DESCRIPTION");
 pub const RUST_VERSION: &str = env!("BUILD_RUST_VERSION");
 pub const CARGO_VERSION: &str = env!("BUILD_CARGO_VERSION");
 
-/// Get version info struct
+/// Returns the version information including binary version, Rust toolchain, and Cargo version
 pub fn get_version_info() -> VersionInfo {
     VersionInfo {
         version: VERSION.to_string(),
@@ -28,7 +28,7 @@ pub fn get_version_info() -> VersionInfo {
     }
 }
 
-/// Version information structure
+/// Version information structure containing build metadata
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VersionInfo {
     pub version: String,

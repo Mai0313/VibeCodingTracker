@@ -8,26 +8,26 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
-/// Cached parsed file with metadata
+/// Cached file entry with modification time tracking for invalidation
 #[derive(Debug, Clone)]
 struct CachedFile {
-    /// Last modified time of the file when it was parsed
     modified: SystemTime,
-    /// Parsed analysis result (shared via Arc for zero-cost cloning)
     analysis: Arc<Value>,
 }
 
-/// Global file parsing cache to avoid redundant I/O and JSON parsing
-/// Uses LRU eviction to prevent unbounded memory growth
-/// This is the single source of truth for all file parsing operations
+/// Thread-safe LRU cache for parsed session files with automatic eviction
+///
+/// This cache:
+/// - Eliminates redundant file I/O and JSON parsing across commands
+/// - Uses LRU eviction to maintain bounded memory usage (max 100 entries)
+/// - Tracks file modification times for automatic invalidation
+/// - Shares cached results via Arc for zero-cost cloning
 pub struct FileParseCache {
-    /// LRU cache: file_path -> cached_data
-    /// Automatically evicts least recently used entries when capacity is reached
     cache: RwLock<LruCache<PathBuf, CachedFile>>,
 }
 
 impl FileParseCache {
-    /// Create a new empty LRU cache with bounded capacity
+    /// Creates a new LRU cache with capacity from `constants::capacity::FILE_CACHE_SIZE`
     pub fn new() -> Self {
         // SAFETY: FILE_CACHE_SIZE is a const > 0
         let cache_size = NonZeroUsize::new(capacity::FILE_CACHE_SIZE).unwrap();
@@ -36,12 +36,14 @@ impl FileParseCache {
         }
     }
 
-    /// Get or parse a file with caching based on modification time
+    /// Retrieves cached analysis or parses the file if needed
     ///
-    /// This function:
-    /// 1. Checks if the file exists in LRU cache and hasn't been modified
-    /// 2. If yes, returns the cached `Arc<Value>` (zero-cost clone) and promotes entry
-    /// 3. If no, parses the file and caches the result (may evict LRU entry)
+    /// Workflow:
+    /// 1. Check cache hit and validate modification time
+    /// 2. If valid, return cached Arc (promotes entry to front)
+    /// 3. If miss/stale, parse file and cache result (may evict LRU entry)
+    ///
+    /// Uses modification time tracking to automatically invalidate stale caches.
     pub fn get_or_parse<P: AsRef<Path>>(&self, path: P) -> Result<Arc<Value>> {
         let path = path.as_ref();
 
@@ -82,15 +84,17 @@ impl FileParseCache {
         Ok(arc_analysis)
     }
 
-    /// Clear all cached entries
+    /// Clears all entries from the cache
     pub fn clear(&self) {
         if let Ok(mut cache) = self.cache.write() {
             cache.clear();
         }
     }
 
-    /// Remove stale entries (files that no longer exist)
-    /// Note: With LRU cache, stale entries will naturally be evicted over time
+    /// Removes entries for non-existent files (manual cleanup)
+    ///
+    /// With LRU eviction, stale entries are naturally removed over time, so this
+    /// is typically not needed in production.
     pub fn cleanup_stale(&self) {
         if let Ok(mut cache) = self.cache.write() {
             // LRU cache doesn't have retain(), so we collect keys first
@@ -106,7 +110,7 @@ impl FileParseCache {
         }
     }
 
-    /// Get cache statistics (for monitoring)
+    /// Returns cache statistics for monitoring and debugging
     pub fn stats(&self) -> CacheStats {
         if let Ok(cache) = self.cache.write() {
             CacheStats {
@@ -118,14 +122,14 @@ impl FileParseCache {
         }
     }
 
-    /// Invalidate a specific file in the cache
+    /// Removes a specific file from the cache
     pub fn invalidate<P: AsRef<Path>>(&self, path: P) {
         if let Ok(mut cache) = self.cache.write() {
             cache.pop(&path.as_ref().to_path_buf());
         }
     }
 
-    /// Get all cached file paths
+    /// Returns all currently cached file paths
     pub fn get_cached_paths(&self) -> Vec<PathBuf> {
         if let Ok(cache) = self.cache.write() {
             cache.iter().map(|(path, _)| path.clone()).collect()
@@ -141,7 +145,7 @@ impl Default for FileParseCache {
     }
 }
 
-/// Statistics about cache usage
+/// Cache usage statistics for monitoring
 #[derive(Debug, Default, Clone)]
 pub struct CacheStats {
     pub entry_count: usize,

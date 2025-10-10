@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-/// Extracted token counts from usage data
+/// Normalized token counts extracted from provider-specific usage data
 #[derive(Debug, Default)]
 pub struct TokenCounts {
     pub input_tokens: i64,
@@ -10,7 +10,13 @@ pub struct TokenCounts {
     pub total: i64,
 }
 
-/// Extract token counts from usage value (supports Claude, Codex, and Gemini formats)
+/// Extracts token counts from usage data in any provider format
+///
+/// Supports three formats:
+/// - Claude/Gemini: Direct fields like `input_tokens`, `output_tokens`
+/// - Codex: Nested `total_token_usage` object with different field names
+///
+/// Returns normalized TokenCounts structure.
 pub fn extract_token_counts(usage: &Value) -> TokenCounts {
     let mut counts = TokenCounts::default();
 

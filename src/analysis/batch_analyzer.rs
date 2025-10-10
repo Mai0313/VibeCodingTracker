@@ -8,7 +8,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
 
-/// Aggregated analysis result grouped by date and model
+/// Single row of aggregated metrics grouped by date and model
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AggregatedAnalysisRow {
@@ -24,7 +24,10 @@ pub struct AggregatedAnalysisRow {
     pub write_count: usize,
 }
 
-/// Analyze all JSONL/JSON files from all directories and aggregate by date and model
+/// Analyzes all session files across providers and aggregates file operation metrics
+///
+/// Scans Claude, Codex, and Gemini session directories, aggregates tool call counts
+/// and line counts by date and model, then returns sorted results.
 pub fn analyze_all_sessions() -> Result<Vec<AggregatedAnalysisRow>> {
     let paths = crate::utils::resolve_paths()?;
     // Pre-allocate HashMap using centralized capacity constant
@@ -55,7 +58,7 @@ pub fn analyze_all_sessions() -> Result<Vec<AggregatedAnalysisRow>> {
     Ok(results)
 }
 
-/// Result structure for provider-grouped analysis with full records
+/// Complete CodeAnalysis results organized by AI provider
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderGroupedAnalysis {
     #[serde(rename = "Claude-Code")]
@@ -66,8 +69,10 @@ pub struct ProviderGroupedAnalysis {
     pub gemini: Vec<Value>,
 }
 
-/// Analyze all JSONL/JSON files grouped by provider (claude/codex/gemini)
-/// Returns full CodeAnalysis results for each provider
+/// Analyzes all session files and returns complete records grouped by provider
+///
+/// Unlike `analyze_all_sessions()` which aggregates metrics, this function preserves
+/// full CodeAnalysis records for each session file.
 pub fn analyze_all_sessions_by_provider() -> Result<ProviderGroupedAnalysis> {
     let paths = crate::utils::resolve_paths()?;
 

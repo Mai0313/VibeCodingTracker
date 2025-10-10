@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Base detail model for code analysis
+/// Base metadata for file operations captured during analysis
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeAnalysisDetailBase {
@@ -11,7 +11,7 @@ pub struct CodeAnalysisDetailBase {
     pub timestamp: i64,
 }
 
-/// Write file details
+/// Details of a file write operation including full content
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeAnalysisWriteDetail {
@@ -20,7 +20,7 @@ pub struct CodeAnalysisWriteDetail {
     pub content: String,
 }
 
-/// Read file details
+/// Details of a file read operation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeAnalysisReadDetail {
@@ -28,7 +28,7 @@ pub struct CodeAnalysisReadDetail {
     pub base: CodeAnalysisDetailBase,
 }
 
-/// Edit file details (diff)
+/// Details of a file edit operation showing before and after content
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeAnalysisApplyDiffDetail {
@@ -38,7 +38,7 @@ pub struct CodeAnalysisApplyDiffDetail {
     pub new_string: String,
 }
 
-/// Run command details
+/// Details of a shell command execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeAnalysisRunCommandDetail {
@@ -48,7 +48,7 @@ pub struct CodeAnalysisRunCommandDetail {
     pub description: String,
 }
 
-/// Tool call counters
+/// Counters for each type of tool call made during a coding session
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct CodeAnalysisToolCalls {
@@ -59,7 +59,7 @@ pub struct CodeAnalysisToolCalls {
     pub bash: usize,
 }
 
-/// Aggregated analysis record
+/// Aggregated metrics and details for a single coding session
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeAnalysisRecord {
@@ -82,7 +82,7 @@ pub struct CodeAnalysisRecord {
     pub git_remote_url: String,
 }
 
-/// Top-level analysis payload
+/// Top-level analysis result containing metadata and session records
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeAnalysis {
@@ -93,7 +93,7 @@ pub struct CodeAnalysis {
     pub records: Vec<CodeAnalysisRecord>,
 }
 
-/// Extension type enum
+/// AI coding assistant extension types (Claude Code, Codex, or Gemini)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtensionType {
     ClaudeCode,

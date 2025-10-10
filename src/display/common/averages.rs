@@ -1,24 +1,25 @@
 use crate::models::Provider;
 use std::collections::{BTreeMap, HashSet};
 
-/// Trait for rows that can provide date and model information
+/// Trait for data rows that provide date and model information for averaging
 pub trait DailyAverageRow {
     fn date(&self) -> &str;
     fn model(&self) -> &str;
 }
 
-/// Generic provider statistics that can accumulate values
-/// The Row type parameter allows type-safe accumulation
+/// Trait for provider-specific statistics that can accumulate metrics
 pub trait ProviderStatistics<Row: DailyAverageRow>: Default {
-    /// Accumulate values from a row for a specific provider
+    /// Accumulates metrics from a row into provider statistics
     fn accumulate(&mut self, row: &Row, provider: Provider);
 
-    /// Set the number of days for this provider
+    /// Sets the number of active days for this provider
     fn set_days(&mut self, days: usize);
 }
 
-/// Calculate daily averages grouped by provider (generic implementation)
-/// This eliminates the 100+ lines of duplicated code between usage and analysis
+/// Calculates daily averages grouped by AI provider
+///
+/// Generic implementation used by both usage and analysis commands to avoid code duplication.
+/// Groups rows by provider, counts unique days per provider, and accumulates metrics.
 pub fn calculate_daily_averages<R, S>(rows: &[R]) -> DailyAverages<R, S>
 where
     R: DailyAverageRow,
@@ -65,7 +66,7 @@ where
     averages
 }
 
-/// Count days per provider from the date-provider map
+/// Counts the number of unique days each provider was active
 fn count_provider_days(
     date_provider_map: &BTreeMap<&str, HashSet<Provider>>,
 ) -> (usize, usize, usize, usize) {
@@ -93,7 +94,7 @@ fn count_provider_days(
     )
 }
 
-/// Generic daily averages structure
+/// Daily averages organized by provider with generic statistics type
 pub struct DailyAverages<R: DailyAverageRow, S: ProviderStatistics<R>> {
     pub claude: S,
     pub codex: S,
