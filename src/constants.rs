@@ -1,12 +1,3 @@
-//! Centralized constants for capacity hints and configuration
-//!
-//! This module provides consistent capacity hints throughout the application
-//! to optimize memory allocations and reduce reallocations.
-
-/// Type alias for high-performance HashMap using ahash (for internal use only)
-///
-/// Note: Only use this for internal data structures that don't need Serialize/Deserialize.
-/// For public APIs and serializable types, use std::collections::HashMap.
 pub type FastHashMap<K, V> = ahash::AHashMap<K, V>;
 
 /// Capacity hints for various data structures
