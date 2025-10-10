@@ -12,6 +12,7 @@
 [![tests](https://img.shields.io/github/actions/workflow/status/Mai0313/VibeCodingTracker/test.yml?label=tests&logo=github&style=flat-square)](https://github.com/Mai0313/VibeCodingTracker/actions/workflows/test.yml)
 [![code-quality](https://img.shields.io/github/actions/workflow/status/Mai0313/VibeCodingTracker/code-quality-check.yml?label=code-quality&logo=github&style=flat-square)](https://github.com/Mai0313/VibeCodingTracker/actions/workflows/code-quality-check.yml)
 [![license](https://img.shields.io/badge/License-MIT-green.svg?labelColor=gray&style=flat-square)](https://github.com/Mai0313/VibeCodingTracker/tree/master?tab=License-1-ov-file)
+[![Star on GitHub](https://img.shields.io/github/stars/Mai0313/VibeCodingTracker?style=social&label=Star)](https://github.com/Mai0313/VibeCodingTracker)
 [![PRs](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat-square)](https://github.com/Mai0313/VibeCodingTracker/pulls)
 
 </center>
@@ -651,18 +652,35 @@ vct update --check
 # 互動式更新（會詢問確認）
 vct update
 
-# 強制更新，不顯示確認提示
+# 強制更新 - 總是下載最新版本（即使已是最新版本）
 vct update --force
 ```
 
 ### ✨ 運作原理
 
 1. **檢查最新版本**：從 GitHub API 取得最新 release
-2. **比較版本**：比較目前版本與最新可用版本
+2. **比較版本**：比較目前版本與最新可用版本（使用 `--force` 時跳過）
 3. **下載二進位檔**：下載適合您平台的二進位檔（Linux/macOS/Windows）
 4. **智慧替換**：
    - **Linux/macOS**：自動替換二進位檔（將舊版本備份為 `.old`）
    - **Windows**：下載為 `.new` 並建立批次腳本以安全替換
+
+### 🔄 強制更新模式
+
+`--force` 旗標會略過版本檢查，**總是下載**最新版本：
+
+```bash
+# 強制重新安裝最新版本（適用於二進位檔損壞時）
+vct update --force
+```
+
+**使用情境**：
+
+- 二進位檔損壞後重新安裝
+- 強制下載最新版本而不檢查版本
+- 排除安裝問題
+
+**只有在以下情況才會失敗**：找不到您平台（作業系統/架構）的二進位檔
 
 ### 🎯 適用於所有安裝方式
 
@@ -677,7 +695,7 @@ $ vct update --check
 🆕 New version available: v0.1.7
 
 💡 To update, run:
-   vct update
+vct update
 ```
 
 **為什麼可以這樣做？** 所有安裝方式（npm/pip/cargo/manual）都使用**相同的預編譯二進位檔**，這些檔案都來自 GitHub releases。update 命令只是下載最新的二進位檔並替換您目前的安裝。

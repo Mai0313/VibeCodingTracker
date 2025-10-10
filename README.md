@@ -12,6 +12,7 @@
 [![tests](https://img.shields.io/github/actions/workflow/status/Mai0313/VibeCodingTracker/test.yml?label=tests&logo=github&style=flat-square)](https://github.com/Mai0313/VibeCodingTracker/actions/workflows/test.yml)
 [![code-quality](https://img.shields.io/github/actions/workflow/status/Mai0313/VibeCodingTracker/code-quality-check.yml?label=code-quality&logo=github&style=flat-square)](https://github.com/Mai0313/VibeCodingTracker/actions/workflows/code-quality-check.yml)
 [![license](https://img.shields.io/badge/License-MIT-green.svg?labelColor=gray&style=flat-square)](https://github.com/Mai0313/VibeCodingTracker/tree/master?tab=License-1-ov-file)
+[![Star on GitHub](https://img.shields.io/github/stars/Mai0313/VibeCodingTracker?style=social&label=Star)](https://github.com/Mai0313/VibeCodingTracker)
 [![PRs](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat-square)](https://github.com/Mai0313/VibeCodingTracker/pulls)
 
 </center>
@@ -651,18 +652,35 @@ vct update --check
 # Interactive update with confirmation
 vct update
 
-# Force update without confirmation
+# Force update - always downloads latest version (even if already up-to-date)
 vct update --force
 ```
 
 ### ✨ How It Works
 
 1. **Check Latest Version**: Fetches the latest release from GitHub API
-2. **Compare Versions**: Compares current version with the latest available
+2. **Compare Versions**: Compares current version with the latest available (skipped with `--force`)
 3. **Download Binary**: Downloads the appropriate binary for your platform (Linux/macOS/Windows)
 4. **Smart Replacement**:
    - **Linux/macOS**: Automatically replaces the binary (backs up old version to `.old`)
    - **Windows**: Downloads as `.new` and creates a batch script for safe replacement
+
+### 🔄 Force Update Mode
+
+The `--force` flag bypasses version checking and **always downloads** the latest release:
+
+```bash
+# Force reinstall the latest version (useful for corrupted installations)
+vct update --force
+```
+
+**Use cases**:
+
+- Reinstall after corrupted binary
+- Force download latest release without version check
+- Troubleshooting installation issues
+
+**Only fails if**: No binary is found for your platform (OS/architecture)
 
 ### 🎯 Works for All Installation Methods
 
@@ -677,7 +695,7 @@ $ vct update --check
 🆕 New version available: v0.1.7
 
 💡 To update, run:
-   vct update
+vct update
 ```
 
 **Why does this work?** All installation methods (npm/pip/cargo/manual) use the **same pre-compiled binaries** from GitHub releases. The update command simply downloads the latest binary and replaces your current installation.
