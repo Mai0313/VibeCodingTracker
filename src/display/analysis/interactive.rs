@@ -4,7 +4,8 @@ use crate::display::analysis::averages::{
     convert_to_analysis_rows, format_lines_per_day,
 };
 use crate::display::common::table::{
-    create_controls, create_provider_row, create_ratatui_table, create_summary, create_title,
+    create_controls, create_provider_row, create_ratatui_table, create_star_hint, create_summary,
+    create_title,
 };
 use crate::display::common::tui::{
     InputAction, RefreshState, UpdateTracker, handle_input, restore_terminal, setup_terminal,
@@ -120,6 +121,7 @@ pub fn display_analysis_interactive(data: &[AggregatedAnalysisRow]) -> anyhow::R
                     Constraint::Length(avg_height), // Daily Averages
                     Constraint::Length(3),          // Summary
                     Constraint::Length(2),          // Controls
+                    Constraint::Length(1),          // Star Hint
                 ])
                 .split(f.area());
 
@@ -314,6 +316,10 @@ pub fn display_analysis_interactive(data: &[AggregatedAnalysisRow]) -> anyhow::R
             // Controls
             let controls = create_controls();
             f.render_widget(controls, chunks[4]);
+
+            // Star Hint
+            let star_hint = create_star_hint();
+            f.render_widget(star_hint, chunks[5]);
         })?;
 
         // Handle input with timeout

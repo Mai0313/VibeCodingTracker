@@ -94,6 +94,22 @@ pub fn create_controls() -> Paragraph<'static> {
     .centered()
 }
 
+/// Create a star hint paragraph for the TUI
+pub fn create_star_hint() -> Paragraph<'static> {
+    Paragraph::new(vec![Line::from(vec![
+        Span::styled("⭐ ", Style::default().fg(RatatuiColor::Yellow)),
+        Span::styled(
+            "If you like this tool, please star us on GitHub: ",
+            Style::default().fg(RatatuiColor::Gray),
+        ),
+        Span::styled(
+            "https://github.com/Mai0313/VibeCodingTracker",
+            Style::default().fg(RatatuiColor::Cyan).underlined(),
+        ),
+    ])])
+    .centered()
+}
+
 /// Create a Ratatui table with standard styling
 pub fn create_ratatui_table<'a>(
     rows: Vec<RatatuiRow<'a>>,

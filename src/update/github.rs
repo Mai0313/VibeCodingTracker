@@ -45,8 +45,6 @@ pub fn fetch_latest_release() -> Result<GitHubRelease> {
 
 /// Downloads a file from URL to the specified destination path
 pub fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
-    println!("📥 Downloading from: {}", url);
-
     let client = reqwest::blocking::Client::builder()
         .user_agent(USER_AGENT)
         .build()
@@ -65,6 +63,5 @@ pub fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
         .copy_to(&mut file)
         .context("Failed to write downloaded content to file")?;
 
-    println!("✅ Downloaded to: {}", dest.display());
     Ok(())
 }

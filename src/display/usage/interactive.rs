@@ -1,5 +1,6 @@
 use crate::display::common::table::{
-    create_controls, create_provider_row, create_ratatui_table, create_summary, create_title,
+    create_controls, create_provider_row, create_ratatui_table, create_star_hint, create_summary,
+    create_title,
 };
 use crate::display::common::tui::{
     InputAction, RefreshState, UpdateTracker, handle_input, restore_terminal, setup_terminal,
@@ -139,6 +140,7 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
                     Constraint::Length(avg_height),
                     Constraint::Length(3),
                     Constraint::Length(2),
+                    Constraint::Length(1),
                 ])
                 .split(f.area());
 
@@ -283,6 +285,9 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
 
             let controls = create_controls();
             f.render_widget(controls, chunks[4]);
+
+            let star_hint = create_star_hint();
+            f.render_widget(star_hint, chunks[5]);
         })?;
 
         match handle_input()? {

@@ -7,8 +7,6 @@ use zip::ZipArchive;
 
 /// Extract tar.gz archive and return the path to the binary
 pub fn extract_targz(archive_path: &Path, extract_to: &Path) -> Result<std::path::PathBuf> {
-    println!("📦 Extracting archive...");
-
     let tar_gz = File::open(archive_path).context("Failed to open archive file")?;
     let tar = GzDecoder::new(tar_gz);
     let mut archive = Archive::new(tar);
@@ -38,8 +36,6 @@ pub fn extract_targz(archive_path: &Path, extract_to: &Path) -> Result<std::path
 
 /// Extract zip archive and return the path to the binary
 pub fn extract_zip(archive_path: &Path, extract_to: &Path) -> Result<std::path::PathBuf> {
-    println!("📦 Extracting archive...");
-
     let file = File::open(archive_path).context("Failed to open archive file")?;
     let mut archive = ZipArchive::new(file).context("Failed to read zip archive")?;
 
@@ -92,7 +88,6 @@ fn find_binary_in_directory(extract_to: &Path) -> Result<std::path::PathBuf> {
                 fs::set_permissions(&binary_path, perms)?;
             }
 
-            println!("✅ Extracted binary: {}", binary_path.display());
             return Ok(binary_path);
         }
     }

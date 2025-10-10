@@ -46,19 +46,10 @@ pub fn perform_update_unix(current_exe: &Path, new_binary: &Path) -> Result<()> 
     // Rename current binary to .old
     if current_exe.exists() {
         fs::rename(current_exe, &backup_path).context("Failed to backup current binary")?;
-        println!("📦 Backed up current binary to: {}", backup_path.display());
     }
 
     // Move new binary to current location
     fs::rename(new_binary, current_exe).context("Failed to replace binary with new version")?;
-
-    println!(
-        "✅ Successfully updated binary at: {}",
-        current_exe.display()
-    );
-    println!("📝 Old version backed up at: {}", backup_path.display());
-    println!();
-    println!("🎉 Update complete! Please restart the application.");
 
     Ok(())
 }
@@ -101,14 +92,10 @@ del "%~f0"
         .write_all(batch_script.as_bytes())
         .context("Failed to write batch script")?;
 
-    println!("✅ Update prepared!");
-    println!("📝 New version downloaded to: {}", new_path.display());
-    println!("📝 Update script created at: {}", batch_path.display());
     println!();
-    println!("🎉 To complete the update:");
+    println!("📝 To complete the update on Windows:");
     println!("   1. Close this application");
     println!("   2. Run: {}", batch_path.display());
-    println!("   OR simply run the batch script now (it will restart the app)");
 
     Ok(())
 }
