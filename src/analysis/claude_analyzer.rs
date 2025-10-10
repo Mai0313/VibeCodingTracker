@@ -1,4 +1,5 @@
 use crate::analysis::common_state::AnalysisState;
+use crate::constants::capacity;
 use crate::models::*;
 use crate::utils::{get_git_remote_url, parse_iso_timestamp, process_claude_usage};
 use anyhow::Result;
@@ -8,8 +9,9 @@ use std::collections::HashMap;
 /// Analyze Claude Code conversations
 pub fn analyze_claude_conversations(records: Vec<Value>) -> Result<CodeAnalysis> {
     let mut state = AnalysisState::new();
-    // Pre-allocate HashMap with typical capacity (1-3 models per conversation)
-    let mut conversation_usage: HashMap<String, Value> = HashMap::with_capacity(3);
+    // Pre-allocate HashMap using centralized capacity constant
+    let mut conversation_usage: HashMap<String, Value> =
+        HashMap::with_capacity(capacity::MODELS_PER_SESSION);
 
     for record in records {
         let log: ClaudeCodeLog = match serde_json::from_value(record) {

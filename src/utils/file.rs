@@ -1,3 +1,4 @@
+use crate::constants::buffer;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::fs::File;
@@ -13,15 +14,15 @@ pub fn read_jsonl<P: AsRef<Path>>(path: P) -> Result<Vec<Value>> {
     // This reduces allocations and improves performance significantly
     let file_size = file.metadata().ok().map(|m| m.len() as usize).unwrap_or(0);
     let estimated_lines = if file_size > 0 {
-        // Assume average line size of 200 bytes (conservative estimate)
-        file_size / 200
+        // Use centralized constant for average line size estimation
+        file_size / buffer::AVG_JSONL_LINE_SIZE
     } else {
         10 // Default minimum capacity
     };
     let mut results = Vec::with_capacity(estimated_lines);
 
-    // Use larger buffer for BufReader to reduce system calls
-    let reader = BufReader::with_capacity(64 * 1024, file);
+    // Use centralized buffer size constant for optimal I/O performance
+    let reader = BufReader::with_capacity(buffer::FILE_READ_BUFFER, file);
 
     for (index, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("Failed to read line {}", index + 1))?;
@@ -51,8 +52,8 @@ pub fn read_json<P: AsRef<Path>>(path: P) -> Result<Vec<Value>> {
     let file_size = file.metadata().ok().map(|m| m.len() as usize).unwrap_or(0);
     let mut contents = String::with_capacity(file_size);
 
-    // Use BufReader with larger buffer for better I/O performance
-    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    // Use centralized buffer size constant for optimal I/O performance
+    let mut reader = BufReader::with_capacity(buffer::FILE_READ_BUFFER, file);
     reader
         .read_to_string(&mut contents)
         .with_context(|| format!("Failed to read file: {}", path.as_ref().display()))?;

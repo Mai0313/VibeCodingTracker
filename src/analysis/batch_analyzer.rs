@@ -1,4 +1,5 @@
 use crate::cache::global_cache;
+use crate::constants::capacity;
 use crate::utils::{collect_files_with_dates, is_gemini_chat_file, is_json_file};
 use anyhow::Result;
 use rayon::prelude::*;
@@ -26,8 +27,9 @@ pub struct AggregatedAnalysisRow {
 /// Analyze all JSONL/JSON files from all directories and aggregate by date and model
 pub fn analyze_all_sessions() -> Result<Vec<AggregatedAnalysisRow>> {
     let paths = crate::utils::resolve_paths()?;
-    // Pre-allocate HashMap with estimated capacity (typical: ~100 date-model combinations)
-    let mut aggregated: HashMap<String, AggregatedAnalysisRow> = HashMap::with_capacity(100);
+    // Pre-allocate HashMap using centralized capacity constant
+    let mut aggregated: HashMap<String, AggregatedAnalysisRow> =
+        HashMap::with_capacity(capacity::DATE_MODEL_COMBINATIONS);
 
     if paths.claude_session_dir.exists() {
         process_analysis_directory(&paths.claude_session_dir, &mut aggregated, is_json_file)?;

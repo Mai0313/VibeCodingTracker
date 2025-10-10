@@ -1,7 +1,9 @@
+use crate::constants::capacity;
 use anyhow::Result;
+use lru::LruCache;
 use serde_json::Value;
-use std::collections::HashMap;
 use std::fs;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
@@ -16,26 +18,30 @@ struct CachedFile {
 }
 
 /// Global file parsing cache to avoid redundant I/O and JSON parsing
+/// Uses LRU eviction to prevent unbounded memory growth
 /// This is the single source of truth for all file parsing operations
 pub struct FileParseCache {
-    /// Map: file_path -> cached_data
-    cache: RwLock<HashMap<PathBuf, CachedFile>>,
+    /// LRU cache: file_path -> cached_data
+    /// Automatically evicts least recently used entries when capacity is reached
+    cache: RwLock<LruCache<PathBuf, CachedFile>>,
 }
 
 impl FileParseCache {
-    /// Create a new empty cache
+    /// Create a new empty LRU cache with bounded capacity
     pub fn new() -> Self {
+        // SAFETY: FILE_CACHE_SIZE is a const > 0
+        let cache_size = NonZeroUsize::new(capacity::FILE_CACHE_SIZE).unwrap();
         Self {
-            cache: RwLock::new(HashMap::with_capacity(100)),
+            cache: RwLock::new(LruCache::new(cache_size)),
         }
     }
 
     /// Get or parse a file with caching based on modification time
     ///
     /// This function:
-    /// 1. Checks if the file exists in cache and hasn't been modified
-    /// 2. If yes, returns the cached Arc<Value> (zero-cost clone)
-    /// 3. If no, parses the file and caches the result
+    /// 1. Checks if the file exists in LRU cache and hasn't been modified
+    /// 2. If yes, returns the cached Arc<Value> (zero-cost clone) and promotes entry
+    /// 3. If no, parses the file and caches the result (may evict LRU entry)
     pub fn get_or_parse<P: AsRef<Path>>(&self, path: P) -> Result<Arc<Value>> {
         let path = path.as_ref();
 
@@ -43,13 +49,14 @@ impl FileParseCache {
         let metadata = fs::metadata(path)?;
         let modified = metadata.modified()?;
 
-        // Try to get from cache (read lock)
+        // Try to get from cache (read lock first for concurrent reads)
         {
-            if let Ok(cache_read) = self.cache.read() {
-                if let Some(cached) = cache_read.get(path) {
+            if let Ok(mut cache_write) = self.cache.write() {
+                // LRU.get() requires &mut self (promotes entry to front)
+                if let Some(cached) = cache_write.get(&path.to_path_buf()) {
                     // Check if the cached version is still valid
                     if cached.modified >= modified {
-                        log::trace!("Cache hit for {}", path.display());
+                        log::trace!("LRU cache hit for {}", path.display());
                         return Ok(Arc::clone(&cached.analysis));
                     }
                 }
@@ -57,13 +64,13 @@ impl FileParseCache {
         }
 
         // Cache miss or outdated - need to parse
-        log::debug!("Cache miss for {}, parsing...", path.display());
+        log::debug!("LRU cache miss for {}, parsing...", path.display());
         let analysis = crate::analysis::analyze_jsonl_file(path)?;
         let arc_analysis = Arc::new(analysis);
 
-        // Update cache (write lock)
+        // Update cache (write lock) - LRU will auto-evict if at capacity
         if let Ok(mut cache_write) = self.cache.write() {
-            cache_write.insert(
+            cache_write.put(
                 path.to_path_buf(),
                 CachedFile {
                     modified,
@@ -83,15 +90,25 @@ impl FileParseCache {
     }
 
     /// Remove stale entries (files that no longer exist)
+    /// Note: With LRU cache, stale entries will naturally be evicted over time
     pub fn cleanup_stale(&self) {
         if let Ok(mut cache) = self.cache.write() {
-            cache.retain(|path, _| path.exists());
+            // LRU cache doesn't have retain(), so we collect keys first
+            let stale_keys: Vec<PathBuf> = cache
+                .iter()
+                .filter(|(path, _)| !path.exists())
+                .map(|(path, _)| path.clone())
+                .collect();
+
+            for key in stale_keys {
+                cache.pop(&key);
+            }
         }
     }
 
     /// Get cache statistics (for monitoring)
     pub fn stats(&self) -> CacheStats {
-        if let Ok(cache) = self.cache.read() {
+        if let Ok(cache) = self.cache.write() {
             CacheStats {
                 entry_count: cache.len(),
                 estimated_memory_kb: cache.len() * 50, // Rough estimate: ~50KB per entry
@@ -104,14 +121,14 @@ impl FileParseCache {
     /// Invalidate a specific file in the cache
     pub fn invalidate<P: AsRef<Path>>(&self, path: P) {
         if let Ok(mut cache) = self.cache.write() {
-            cache.remove(path.as_ref());
+            cache.pop(&path.as_ref().to_path_buf());
         }
     }
 
     /// Get all cached file paths
     pub fn get_cached_paths(&self) -> Vec<PathBuf> {
-        if let Ok(cache) = self.cache.read() {
-            cache.keys().cloned().collect()
+        if let Ok(cache) = self.cache.write() {
+            cache.iter().map(|(path, _)| path.clone()).collect()
         } else {
             Vec::new()
         }

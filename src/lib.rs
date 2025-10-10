@@ -1,6 +1,7 @@
 pub mod analysis;
 pub mod cache;
 pub mod cli;
+pub mod constants;
 pub mod display;
 pub mod models;
 pub mod pricing;

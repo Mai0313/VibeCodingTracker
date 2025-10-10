@@ -1,4 +1,5 @@
 use crate::cache::global_cache;
+use crate::constants::capacity;
 use crate::models::DateUsageResult;
 use crate::utils::{collect_files_with_dates, is_gemini_chat_file, is_json_file, resolve_paths};
 use anyhow::Result;
@@ -13,8 +14,8 @@ fn extract_conversation_usage_from_analysis(analysis: &Value) -> HashMap<String,
         return HashMap::new();
     };
 
-    // Pre-allocate HashMap with estimated capacity (typical: 1-3 models per session)
-    let mut conversation_usage = HashMap::with_capacity(3);
+    // Pre-allocate HashMap using centralized capacity constant
+    let mut conversation_usage = HashMap::with_capacity(capacity::MODELS_PER_SESSION);
 
     for record in records {
         let Some(record_obj) = record.as_object() else {
@@ -97,7 +98,7 @@ where
         // Use entry API to avoid double lookup
         let date_entry = result
             .entry(date)
-            .or_insert_with(|| HashMap::with_capacity(3)); // typical: 1-3 models per date
+            .or_insert_with(|| HashMap::with_capacity(capacity::MODELS_PER_SESSION));
 
         for (model, usage_value) in conversation_usage {
             // Use entry API to avoid double lookup
