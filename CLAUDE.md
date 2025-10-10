@@ -215,9 +215,7 @@ src/
 │   ├── mod.rs           # Update command entry point, version comparison
 │   ├── github.rs        # GitHub API interaction, release fetching
 │   ├── platform.rs      # Platform-specific update logic (Unix/Windows)
-│   ├── archive.rs       # Archive extraction (.tar.gz, .zip)
-│   ├── installation.rs  # Installation method detection (npm/pip/cargo/manual)
-│   └── startup_check.rs # Automatic update notification on startup (24h cache, non-blocking)
+│   └── archive.rs       # Archive extraction (.tar.gz, .zip)
 ├── models/              # Data structures
 │   ├── mod.rs           # Re-exports
 │   ├── analysis.rs      # CodeAnalysis struct
@@ -358,33 +356,7 @@ src/
   - macOS: `vibe_coding_tracker-v0.1.6-macos-x64.tar.gz`, `vibe_coding_tracker-v0.1.6-macos-arm64.tar.gz`
   - Windows: `vibe_coding_tracker-v0.1.6-windows-x64.zip`, `vibe_coding_tracker-v0.1.6-windows-arm64.zip`
 
-**5. Automatic Update Notifications (Startup Check):**
-
-- `main.rs::main()` → spawns background thread → `update/startup_check.rs::check_update_on_startup()`
-  - **Runs automatically on every startup** in a separate thread (non-blocking)
-  - Checks for updates every 24 hours (uses date-based caching)
-  - Cache location: `~/.vibe_coding_tracker/update_check.json`
-  - **Silent failure**: Network errors don't disrupt main functionality
-  - **Non-blocking**: Update check runs in background thread, CLI remains responsive
-  - **Installation method detection**: `update/installation.rs::detect_installation_method()`
-    - Analyzes executable path to determine installation method
-    - Detection patterns:
-      - **npm**: `/npm/`, `/.npm`, `/node_modules/`
-      - **pip**: `/site-packages/`, `/python`, `/Scripts/`, `/.local/bin/` (with Python context)
-      - **cargo**: `/.cargo/bin/`
-      - **manual**: All other paths (curl, PowerShell, source build)
-  - **Smart update commands**: Shows installation-specific update instructions
-    - npm: `npm update -g @mai0313/vct`
-    - pip: `pip install --upgrade vibe_coding_tracker`
-    - cargo: `cargo install vibe_coding_tracker --force`
-    - manual: `vct update` or re-run installation script
-  - **User-friendly display**: Colorful box notification with update information
-  - **Benefits**:
-    - Prevents version conflicts (users update via same method they installed)
-    - Reduces support burden (correct update commands shown automatically)
-    - Ensures users stay on latest version with security fixes and features
-
-**6. LRU File Parsing Cache (Bounded Memory):**
+**5. LRU File Parsing Cache (Bounded Memory):**
 
 - **Location**: `cache/file_cache.rs::FileParseCache` with global singleton in `cache/mod.rs::GLOBAL_FILE_CACHE`
 - **Purpose**: Eliminate redundant I/O and JSON parsing operations across all commands while preventing unbounded memory growth
@@ -646,7 +618,7 @@ docker run --rm \
   - `detect_provider()`: identifies provider from model name
   - `calculate_daily_averages()`: computes averages from usage rows
 
-**7. Performance Optimization with Global Cache:**
+**6. Performance Optimization with Global Cache:**
 
 - **File Parsing Cache**: Use `cache::global_cache()` to avoid redundant I/O and JSON parsing
   - Automatically checks file modification time before re-parsing

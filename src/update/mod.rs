@@ -1,6 +1,5 @@
 mod archive;
 mod github;
-mod installation;
 mod platform;
 
 use anyhow::{Context, Result};
@@ -10,7 +9,6 @@ use std::fs;
 
 // Re-export public types for backward compatibility
 pub use github::{GitHubAsset, GitHubRelease};
-pub use installation::{InstallationMethod, detect_installation_method};
 
 /// Extracts clean semver version from BUILD_VERSION string
 ///
@@ -50,11 +48,8 @@ fn get_version_comparison() -> Result<Option<(String, Version, Version, GitHubRe
         latest_version_str
     ))?;
 
-    println!("📌 Current version: {}", current_version_display);
-    println!("📌 Latest version:  v{}", latest_version);
-
     if latest_version <= current_version {
-        println!("✅ You are already on the latest version!");
+        println!("✅ Already on the latest version (v{})", current_version);
         return Ok(None);
     }
 
@@ -68,14 +63,12 @@ fn get_version_comparison() -> Result<Option<(String, Version, Version, GitHubRe
 
 /// Checks for available updates and displays release notes
 pub fn check_update() -> Result<Option<String>> {
-    println!("🔍 Checking for updates...");
-
     match get_version_comparison()? {
-        Some((_, _, latest_version, release)) => {
-            println!("🆕 New version available: v{}", latest_version);
-            if let Some(body) = &release.body {
-                println!("\nRelease Notes:\n{}", body);
-            }
+        Some((current_version, _, latest_version, release)) => {
+            println!("🆕 Update available: v{} → v{}", 
+                extract_semver_version(&current_version), 
+                latest_version
+            );
             Ok(Some(release.tag_name))
         }
         None => Ok(None),
@@ -83,17 +76,20 @@ pub fn check_update() -> Result<Option<String>> {
 }
 
 /// Downloads and installs the latest version from GitHub releases
+/// 
+/// This function works for all installation methods (npm/pip/cargo/manual)
+/// since all packages use the same pre-compiled binaries from GitHub releases.
 pub fn perform_update() -> Result<()> {
-    println!("🚀 Starting update process...");
-    println!();
-
     // Get version comparison
-    let Some((_, _, latest_version, release)) = get_version_comparison()? else {
+    let Some((current_version, _, latest_version, release)) = get_version_comparison()? else {
         // Already on latest version
         return Ok(());
     };
 
-    println!();
+    println!("⬆️  Updating: v{} → v{}", 
+        extract_semver_version(&current_version), 
+        latest_version
+    );
 
     // Find the asset for current platform
     let asset_pattern = platform::get_asset_pattern(&latest_version.to_string())?;
@@ -102,52 +98,53 @@ pub fn perform_update() -> Result<()> {
         .iter()
         .find(|a| a.name == asset_pattern)
         .context(format!(
-            "No binary found for platform: {} (looking for: {})",
+            "Update failed: No binary found for {} ({})",
             env::consts::OS,
-            asset_pattern
+            std::env::consts::ARCH
         ))?;
 
-    println!("📦 Found asset: {} ({} bytes)", asset.name, asset.size);
-    println!();
-
     // Get current executable path
-    let current_exe = env::current_exe().context("Failed to get current executable path")?;
+    let current_exe = env::current_exe().context("Update failed: Cannot locate current executable")?;
 
     // Download to temporary location
     let temp_dir = env::temp_dir();
     let archive_path = temp_dir.join(&asset.name);
 
-    github::download_file(&asset.browser_download_url, &archive_path)?;
-    println!();
+    github::download_file(&asset.browser_download_url, &archive_path)
+        .context("Update failed: Download error")?;
 
     // Extract the archive
     let extract_dir = temp_dir.join("vct_update");
     if extract_dir.exists() {
         fs::remove_dir_all(&extract_dir)
-            .context("Failed to clean up previous extraction directory")?;
+            .context("Update failed: Cannot clean temporary directory")?;
     }
-    fs::create_dir_all(&extract_dir).context("Failed to create extraction directory")?;
+    fs::create_dir_all(&extract_dir).context("Update failed: Cannot create temporary directory")?;
 
     let new_binary = if asset.name.ends_with(".tar.gz") {
-        archive::extract_targz(&archive_path, &extract_dir)?
+        archive::extract_targz(&archive_path, &extract_dir)
+            .context("Update failed: Cannot extract archive")?
     } else if asset.name.ends_with(".zip") {
-        archive::extract_zip(&archive_path, &extract_dir)?
+        archive::extract_zip(&archive_path, &extract_dir)
+            .context("Update failed: Cannot extract archive")?
     } else {
-        anyhow::bail!("Unknown archive format: {}", asset.name);
+        anyhow::bail!("Update failed: Unsupported archive format");
     };
-
-    println!();
 
     // Perform platform-specific update
     #[cfg(unix)]
-    platform::perform_update_unix(&current_exe, &new_binary)?;
+    platform::perform_update_unix(&current_exe, &new_binary)
+        .context("Update failed: Cannot replace binary")?;
 
     #[cfg(windows)]
-    platform::perform_update_windows(&current_exe, &new_binary)?;
+    platform::perform_update_windows(&current_exe, &new_binary)
+        .context("Update failed: Cannot replace binary")?;
 
     // Clean up
     let _ = fs::remove_file(&archive_path);
     let _ = fs::remove_dir_all(&extract_dir);
+
+    println!("✅ Update completed successfully");
 
     Ok(())
 }
@@ -155,27 +152,25 @@ pub fn perform_update() -> Result<()> {
 /// Interactive update process with user confirmation prompt
 ///
 /// If `force` is true, skips confirmation and updates immediately.
+/// 
+/// This function works for all installation methods (npm/pip/cargo/manual)
+/// since all packages use the same pre-compiled binaries from GitHub releases.
 pub fn update_interactive(force: bool) -> Result<()> {
     if !force {
-        // Check first
-        match check_update()? {
-            Some(version) => {
-                println!();
-                println!("❓ Do you want to update to {}? (y/N): ", version);
+        // Check first and prompt for confirmation
+        if check_update()?.is_some() {
+            print!("Continue? (y/N): ");
+            std::io::Write::flush(&mut std::io::stdout())?;
 
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input)?;
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
 
-                if !input.trim().eq_ignore_ascii_case("y") {
-                    println!("❌ Update cancelled.");
-                    return Ok(());
-                }
-
-                println!();
-            }
-            None => {
+            if !input.trim().eq_ignore_ascii_case("y") {
+                println!("Cancelled");
                 return Ok(());
             }
+        } else {
+            return Ok(());
         }
     }
 

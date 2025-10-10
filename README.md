@@ -640,22 +640,22 @@ vct version --text
 
 **Keep your installation up-to-date automatically.**
 
-The update command checks GitHub releases and downloads the latest version for your platform.
+The update command works for **all installation methods** (npm/pip/cargo/manual) by directly downloading and replacing the binary from GitHub releases.
 
 ### Basic Usage
 
 ```bash
+# Check for updates
+vct update --check
+
 # Interactive update with confirmation
 vct update
 
-# Check for updates without installing
-vct update --check
-
-# Force update without confirmation prompt
+# Force update without confirmation
 vct update --force
 ```
 
-### How It Works
+### ✨ How It Works
 
 1. **Check Latest Version**: Fetches the latest release from GitHub API
 2. **Compare Versions**: Compares current version with the latest available
@@ -663,6 +663,24 @@ vct update --force
 4. **Smart Replacement**:
    - **Linux/macOS**: Automatically replaces the binary (backs up old version to `.old`)
    - **Windows**: Downloads as `.new` and creates a batch script for safe replacement
+
+### 🎯 Works for All Installation Methods
+
+Whether you installed via **npm**, **pip**, **cargo**, or **manually**, `vct update` will work the same way:
+
+```bash
+$ vct update --check
+🔍 Checking for updates...
+📌 Current version: 0.1.6
+📌 Latest version:  v0.1.7
+
+🆕 New version available: v0.1.7
+
+💡 To update, run:
+   vct update
+```
+
+**Why does this work?** All installation methods (npm/pip/cargo/manual) use the **same pre-compiled binaries** from GitHub releases. The update command simply downloads the latest binary and replaces your current installation.
 
 ### Platform Support
 
@@ -681,19 +699,6 @@ On Windows, the binary cannot be replaced while running. The update command:
 3. Displays instructions to complete the update
 
 Run the batch script after closing the application to finish the update.
-
-### Automatic Update Notifications
-
-**Stay informed of new releases automatically.**
-
-When you start `vct`, it automatically checks for updates once every 24 hours and displays a notification if a new version is available. The notification intelligently detects your installation method and shows the appropriate update command:
-
-- **npm**: `npm update -g @mai0313/vct`
-- **pip**: `pip install --upgrade vibe_coding_tracker`
-- **cargo**: `cargo install vibe_coding_tracker --force`
-- **manual**: `vct update` or re-run installation script
-
-This ensures you always use the correct update method and prevents version conflicts. The check runs silently in the background and won't disrupt your workflow if updates aren't available.
 
 ---
 

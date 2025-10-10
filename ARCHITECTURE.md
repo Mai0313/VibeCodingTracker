@@ -250,19 +250,6 @@ cost = (input × input_cost_per_token) +
 - `extract_targz()`: Extract `.tar.gz` archives (Unix)
 - `extract_zip()`: Extract `.zip` archives (Windows)
 
-**installation.rs**
-
-- `detect_installation_method()`: Analyze executable path
-- `InstallationMethod` enum: Npm, Pip, Cargo, Manual
-- Path pattern matching for each installation method
-
-**startup_check.rs**
-
-- `check_update_on_startup()`: Automatic startup check
-- Cache management (24-hour TTL)
-- Display update notifications with installation-specific commands
-- Silent failure on network errors
-
 #### 7. Utilities Module (`src/utils/`)
 
 **file.rs**
@@ -525,72 +512,6 @@ User model: "anthropic.claude-3-sonnet"
 Pricing DB: "claude-3-sonnet"
 Match: Fuzzy (0.85 similarity)
 ```
-
-### 5. Automatic Update System
-
-**Location:** `src/update/`
-
-**Components:**
-
-**startup_check.rs:**
-
-- Runs on every application startup (before command execution)
-- 24-hour cache to minimize GitHub API requests
-- Cache location: `~/.vibe_coding_tracker/update_check.json`
-- Silent failure (network errors don't disrupt main functionality)
-- Displays colorful box notification when update available
-
-**installation.rs:**
-
-- Detects installation method by analyzing executable path
-- Detection patterns:
-  - npm: `/npm/`, `/.npm`, `/node_modules/`
-  - pip: `/site-packages/`, `/python`, `/Scripts/`, `/.local/bin/` (with Python context)
-  - cargo: `/.cargo/bin/`
-  - manual: All other paths (curl, PowerShell, source build)
-- Provides installation-specific update commands
-
-**Cache Structure:**
-
-```json
-{
-  "last_check": "2025-10-09T12:34:56.789Z",
-  "latest_version": "v0.1.7",
-  "has_update": true
-}
-```
-
-**User Experience Flow:**
-
-```
-Application Start
-       │
-       ▼
-Load cache (~/.vibe_coding_tracker/update_check.json)
-       │
-       ├─> Cache valid (<24h)
-       │   ├─> has_update = true
-       │   │   └─> Display notification
-       │   └─> has_update = false
-       │       └─> Silent (no output)
-       │
-       └─> Cache invalid or missing
-           └─> Check GitHub API
-               ├─> Update available
-               │   ├─> Detect installation method
-               │   ├─> Display notification with update command
-               │   └─> Save cache
-               └─> No update
-                   └─> Save cache (has_update = false)
-```
-
-**Benefits:**
-
-- **Prevents version conflicts**: Users update via same method they installed
-- **Reduces support burden**: Correct update commands shown automatically
-- **Non-disruptive**: Silent failure on errors, doesn't block main commands
-- **Performance**: 24-hour cache minimizes network requests
-- **User-friendly**: Clear, actionable update instructions
 
 ## Design Patterns
 

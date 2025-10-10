@@ -640,22 +640,22 @@ vct version --text
 
 **自动保持安装版本为最新。**
 
-update 命令会检查 GitHub releases 并为您的平台下载最新版本。
+update 命令适用于**所有安装方式**（npm/pip/cargo/manual），直接从 GitHub releases 下载并替换二进制文件。
 
 ### 基本用法
 
 ```bash
+# 检查更新
+vct update --check
+
 # 交互式更新（会询问确认）
 vct update
-
-# 仅检查更新而不安装
-vct update --check
 
 # 强制更新，不显示确认提示
 vct update --force
 ```
 
-### 工作原理
+### ✨ 工作原理
 
 1. **检查最新版本**：从 GitHub API 获取最新 release
 2. **比较版本**：比较当前版本与最新可用版本
@@ -663,6 +663,24 @@ vct update --force
 4. **智能替换**：
    - **Linux/macOS**：自动替换二进制文件（将旧版本备份为 `.old`）
    - **Windows**：下载为 `.new` 并创建批处理脚本以安全替换
+
+### 🎯 适用于所有安装方式
+
+无论您是通过 **npm**、**pip**、**cargo** 或**手动安装**，`vct update` 都以相同的方式工作：
+
+```bash
+$ vct update --check
+🔍 Checking for updates...
+📌 Current version: 0.1.6
+📌 Latest version:  v0.1.7
+
+🆕 New version available: v0.1.7
+
+💡 To update, run:
+   vct update
+```
+
+**为什么可以这样做？** 所有安装方式（npm/pip/cargo/manual）都使用**相同的预编译二进制文件**，这些文件都来自 GitHub releases。update 命令只是下载最新的二进制文件并替换您当前的安装。
 
 ### 平台支持
 
@@ -681,19 +699,6 @@ update 命令会自动检测您的平台并下载正确的压缩文件：
 3. 显示完成更新的说明
 
 关闭应用程序后运行批处理脚本以完成更新。
-
-### 自动更新通知
-
-**自动获取新版本通知。**
-
-启动 `vct` 时，程序会每 24 小时自动检查一次更新，如果有新版本可用会显示通知。通知会智能检测您的安装方式并显示对应的更新命令：
-
-- **npm**: `npm update -g @mai0313/vct`
-- **pip**: `pip install --upgrade vibe_coding_tracker`
-- **cargo**: `cargo install vibe_coding_tracker --force`
-- **manual**: `vct update` 或重新运行安装脚本
-
-这确保您始终使用正确的更新方式，避免版本冲突。检查在后台静默运行，不会影响您的正常使用。
 
 ---
 
