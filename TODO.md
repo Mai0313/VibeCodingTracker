@@ -20,13 +20,12 @@
 假設使用者原本是使用 `pip` 安裝, 直接透過 `npm` 安裝肯定是錯誤的 因為會更新到錯誤的文件
 我不確定是否可以取得當前運行的目錄, 我覺得應該可以透過這個資訊來判斷安裝來源
 
-## 請幫我在我的 analysis / usage TUI 新增兩個小提示
+## 請幫我在我的 analysis TUI / usage TUI / update command 新增兩個小提示
 
 1. 如果有問題 可以submit ticket
 2. 如果喜歡 幫我點 star
 
-這裡是我的 repo
-https://github.com/Mai0313/VibeCodingTracker
+這裡是我的 repo: https://github.com/Mai0313/VibeCodingTracker
 我不確定超連結要如何顯示在TUI上
 
-同時 當自動更新完成時 希望也可以提示用戶 如果喜歡的話給一個星星之類的
+自動更新完成時 希望也可以提示用戶 如果喜歡的話給一個星星之類的
