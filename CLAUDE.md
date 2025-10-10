@@ -127,6 +127,7 @@ vct update --check        # Only check for updates without installing
 The codebase includes several performance optimizations for efficient operation:
 
 ### 1. **Centralized Capacity Constants** (`src/constants.rs`)
+
 - Defines standard capacity hints for all data structures
 - Key constants:
   - `MODELS_PER_SESSION = 3`: Typical models per conversation
@@ -137,6 +138,7 @@ The codebase includes several performance optimizations for efficient operation:
 - Benefits: Consistent memory allocation, reduced reallocations, easier tuning
 
 ### 2. **LRU Cache for Bounded Memory** (`src/cache/file_cache.rs`)
+
 - Uses `lru` crate for automatic eviction of least-recently-used entries
 - Maximum capacity: 100 parsed files (configurable via `FILE_CACHE_SIZE`)
 - Prevents unbounded memory growth in long-running sessions
@@ -144,16 +146,19 @@ The codebase includes several performance optimizations for efficient operation:
 - Thread-safe with `Arc<Value>` for zero-cost cloning
 
 ### 3. **Optimized File I/O** (`src/utils/file.rs`)
+
 - Buffer size: 128KB (2x increase from default 64KB)
 - Pre-allocated Vec capacity based on file size estimation
 - Uses `bytecount` for SIMD-accelerated line counting (~2.9% faster)
 - Reduces system calls and memory allocations
 
 ### 4. **Memory Allocator**
+
 - Uses `mimalloc` as global allocator for better performance
 - Configured in `main.rs` with `#[global_allocator]`
 
 ### 5. **Future Optimization Opportunities**
+
 - `ahash` dependency included for potential HashMap improvements
   - Currently using std HashMap for Serialize/Deserialize compatibility
   - Can use `FastHashMap<K,V>` type alias for internal-only data structures
