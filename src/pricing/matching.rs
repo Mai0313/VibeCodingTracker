@@ -167,7 +167,7 @@ impl ModelPricingMap {
     }
 
     /// Get the raw pricing map (for backward compatibility)
-    /// Note: Returns HashMap<Rc<str>, ModelPricing> instead of HashMap<String, ModelPricing>
+    /// Note: Returns `HashMap<Rc<str>, ModelPricing>` instead of `HashMap<String, ModelPricing>`
     pub fn raw(&self) -> &HashMap<Rc<str>, ModelPricing> {
         &self.raw
     }

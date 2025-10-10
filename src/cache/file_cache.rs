@@ -40,7 +40,7 @@ impl FileParseCache {
     ///
     /// This function:
     /// 1. Checks if the file exists in LRU cache and hasn't been modified
-    /// 2. If yes, returns the cached Arc<Value> (zero-cost clone) and promotes entry
+    /// 2. If yes, returns the cached `Arc<Value>` (zero-cost clone) and promotes entry
     /// 3. If no, parses the file and caches the result (may evict LRU entry)
     pub fn get_or_parse<P: AsRef<Path>>(&self, path: P) -> Result<Arc<Value>> {
         let path = path.as_ref();
