@@ -6,7 +6,7 @@ help: # Show this help message
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
 
 clean: ## Clean build artifacts and caches
-	@rm -rf target dist tmp .cache
+	@rm -rf tmp .cache
 	@find . -type f -name "*.DS_Store" -ls -delete
 	@git fetch --prune
 	@git gc --prune=now --aggressive
