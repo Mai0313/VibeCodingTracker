@@ -20,6 +20,7 @@ These tests verify end-to-end functionality of the application, excluding TUI co
 - `usage_tests.rs` - Usage calculation and aggregation logic
 
 **Run all integration tests:**
+
 ```bash
 cargo test --test integration_tests
 ```
@@ -38,10 +39,17 @@ These tests verify individual functions and modules in isolation.
 - `test_utils_file.rs` - File reading and line counting utilities (`src/utils/file.rs`)
 - `test_utils_time.rs` - Timestamp parsing utilities (`src/utils/time.rs`)
 - `test_utils_paths.rs` - Path resolution and machine identification (`src/utils/paths.rs`)
+- `test_utils_directory.rs` - Directory traversal and file filtering (`src/utils/directory.rs`)
+- `test_utils_git.rs` - Git remote URL detection (`src/utils/git.rs`)
 
 #### Pricing Module Tests
 
 - `test_pricing_matching.rs` - Model pricing matching logic (`src/pricing/matching.rs`)
+- `test_pricing_cache.rs` - Model pricing data structures and serialization (`src/pricing/cache.rs`)
+
+#### Cache Module Tests
+
+- `test_cache_global.rs` - Global cache singleton operations (`src/cache/mod.rs`)
 
 #### Models Module Tests
 
@@ -52,11 +60,13 @@ These tests verify individual functions and modules in isolation.
 - `test_update_version.rs` - Version extraction and comparison logic (`src/update/mod.rs`)
 
 **Run all unit tests:**
+
 ```bash
 cargo test --tests --lib
 ```
 
 **Run specific unit test:**
+
 ```bash
 cargo test --test test_detector
 cargo test --test test_common_state
@@ -67,45 +77,58 @@ cargo test --test test_utils_file
 ## Test Statistics
 
 ### Integration Tests
+
 - **Total Tests:** 95
 - **Coverage:** All functionality except TUI components
 
 ### Unit Tests
-- **Total Tests:** 127
+
+- **Total Tests:** 202 (12 test files)
 - **Coverage:** Individual functions in core modules
 
+### Library Tests
+
+- **Total Tests:** 26 (in source code)
+
 ### Total
-- **All Tests:** 222+ (including lib tests)
+
+- **All Tests:** 323 tests across 15 test suites ✅
 
 ## Running Tests
 
 ### Run All Tests
+
 ```bash
 cargo test
 ```
 
 ### Run Tests Quietly
+
 ```bash
 cargo test --quiet
 ```
 
 ### Run Tests with Output
+
 ```bash
 cargo test -- --nocapture
 ```
 
 ### Run Tests Sequentially
+
 ```bash
 cargo test -- --test-threads=1
 ```
 
 ### Run Specific Test Module
+
 ```bash
 cargo test --test integration_tests integrations::parser_tests
 cargo test --test test_detector
 ```
 
 ### Run Specific Test
+
 ```bash
 cargo test test_claude_code_parser
 cargo test test_exact_match
@@ -122,14 +145,18 @@ cargo test test_exact_match
 ## Adding New Tests
 
 ### For Integration Tests
+
 Add tests to the appropriate file in `tests/integrations/`:
+
 - Analysis operations → `analysis_tests.rs`
 - CLI commands → `cli_tests.rs`
 - Parsing logic → `parser_tests.rs`
 - etc.
 
 ### For Unit Tests
+
 Create a new test file or add to existing ones:
+
 1. Name the file `test_<module_name>.rs`
 2. Place it in the `tests/` directory
 3. Import necessary items from `vibe_coding_tracker::<module>`
@@ -139,8 +166,8 @@ Create a new test file or add to existing ones:
 ## CI/CD Integration
 
 All tests are designed to run in CI/CD pipelines:
+
 - No manual interaction required
 - Graceful handling of missing test data
 - Fast execution (typically < 10 seconds for all tests)
 - Parallel-safe (tests don't interfere with each other)
-
