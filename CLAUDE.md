@@ -836,20 +836,87 @@ cargo build --profile dist
 
 ### Benchmarking
 
-The project includes a benchmark suite using Criterion:
+The project includes a comprehensive benchmark suite using Criterion to measure performance of critical operations:
 
 ```bash
 # Run all benchmarks
 cargo bench
 
-# Run specific benchmark
-cargo bench --bench benchmarks
+# Run specific benchmark group
+cargo bench --bench benchmarks -- "normalize_model"
+cargo bench --bench benchmarks -- "cache"
+cargo bench --bench benchmarks -- "hashmap"
+
+# Run benchmarks for specific category
+cargo bench --bench benchmarks -- "file_parsing"
+cargo bench --bench benchmarks -- "format_detection"
+cargo bench --bench benchmarks -- "batch_analysis"
 
 # Generate HTML reports (in target/criterion/)
 cargo bench -- --save-baseline main
+
+# Compare benchmarks against baseline
+cargo bench -- --baseline main
 ```
 
-Benchmark location: `benches/benchmarks.rs`
+**Benchmark Categories** (`benches/benchmarks.rs`):
+
+1. **Pricing & String Operations**
+   - `benchmark_normalize_model_name`: Model name normalization (simple, prefix, complex)
+   - `benchmark_pricing_lookup`: Pricing map lookups (exact, normalized, fuzzy)
+   - `benchmark_line_counting`: Line counting operations (short, medium, long texts)
+
+2. **File Parsing** (`benchmark_file_parsing`)
+   - Claude Code format parsing
+   - Codex/OpenAI format parsing
+   - Copilot CLI format parsing
+   - Gemini format parsing
+   - Uses real test files from `examples/` directory
+
+3. **Format Detection** (`benchmark_format_detection`)
+   - Claude Code format detection
+   - Codex format detection
+   - Copilot format detection
+   - Gemini format detection
+
+4. **Cache Performance** (`benchmark_cache_operations`)
+   - Cache hit (warm cache) - measures Arc cloning overhead
+   - Cache miss (cold cache) - measures full file parsing + caching
+   - Cache stats retrieval
+
+5. **HashMap Performance** (`benchmark_hashmap_performance`)
+   - FastHashMap (ahash) vs std HashMap insertion (1000 items)
+   - FastHashMap (ahash) vs std HashMap lookup (1000 items)
+   - Validates ~10-20% performance improvement with ahash
+
+6. **Usage Aggregation** (`benchmark_usage_aggregation`)
+   - Aggregating usage data across 100 dates
+   - Tests BTreeMap + FastHashMap performance
+
+7. **Batch Analysis** (`benchmark_batch_analysis`)
+   - Batch processing all 4 format types
+   - Simulates real-world multi-file analysis
+
+8. **JSON Serialization** (`benchmark_json_serialization`)
+   - Compact JSON serialization
+   - Pretty-printed JSON serialization
+
+**Performance Baseline Expectations:**
+
+Based on typical hardware (Intel i7/AMD Ryzen 7, 16GB RAM):
+- File parsing: ~1-5ms per file (Claude/Codex/Copilot/Gemini)
+- Cache hits: <1μs (Arc clone is nearly free)
+- Cache misses: ~1-5ms (full file I/O + JSON parse)
+- Format detection: <10μs (quick field checks)
+- HashMap operations: FastHashMap ~10-20% faster than std HashMap
+
+**Viewing Benchmark Results:**
+
+After running `cargo bench`, open `target/criterion/report/index.html` in a browser to view:
+- Performance graphs over time
+- Statistical analysis (mean, median, std dev)
+- Comparison charts (if using baselines)
+- Detailed timing distributions
 
 ## GitHub Workflows and Release Process
 
