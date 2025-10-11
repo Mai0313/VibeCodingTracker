@@ -16,7 +16,6 @@
 你主要需要新增的是一個 `parser`, 後續 `analysis` 和 `usage` 功能都會掉用相同的 `funcion` 來執行
 你需要注意的地方可以從 `timeline` 這個 `key` 開始 (`chatMessages` 可以直接忽略), 裡面是整個 `conversation` 的細節流程 (`list[dict]`)
 然後依照 `toolTitle` 和 `arguments` 的值去分類出類似於 `examples/analysis_result.json` 的資訊
-模型名稱似乎只能從 `~/.copilot/config.json` 的 `model` 取得, 但這方法不太好 先暫時寫死 `copilot` 就好 以後再處理
 
 - `toolTitle` 分為以下幾種:
     - str_replace_editor
@@ -32,6 +31,7 @@
 `writeFileDetails`: `command` 為 `create`, 裡面有 `path` 和 `file_text` 可以直接使用
 
 `usage` 的部分目前好像沒辦法知道 所以全部當做 0 就好
+模型名稱暫時寫死 `copilot`, 未來等 copilot cli 更新再去看有沒有其他方式可以處理 因為目前沒有其他方式可以取得
 
 ## 提示自動更新
 
