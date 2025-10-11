@@ -49,7 +49,11 @@ ratatui = "0.29"
 crossterm = "0.29"
 
 # HTTP client
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "json",
+    "rustls-tls",
+] }
 
 # String similarity
 strsim = "0.11"
@@ -100,17 +104,17 @@ name = "benchmarks"
 harness = false
 
 [profile.release]
-opt-level = 3              # Maximum optimization
-lto = "thin"               # Link-time optimization
-codegen-units = 1          # Better optimization at cost of compile time
-strip = "symbols"          # Strip symbols for smaller binary
-panic = "abort"            # Smaller binary, faster panic handling
-overflow-checks = false    # Disable overflow checks in release (faster)
+opt-level = 3           # Maximum optimization
+lto = "thin"            # Link-time optimization
+codegen-units = 1       # Better optimization at cost of compile time
+strip = "symbols"       # Strip symbols for smaller binary
+panic = "abort"         # Smaller binary, faster panic handling
+overflow-checks = false # Disable overflow checks in release (faster)
 
 # Profile for distribution builds with maximum optimization
 [profile.dist]
 inherits = "release"
-lto = "fat"                # Full LTO for maximum performance
+lto = "fat"          # Full LTO for maximum performance
 opt-level = 3
 codegen-units = 1
 strip = "symbols"
