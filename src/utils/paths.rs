@@ -28,7 +28,7 @@ pub fn resolve_paths() -> Result<HelperPaths> {
     let claude_dir = home_dir.join(".claude");
     let claude_session_dir = claude_dir.join("projects");
     let copilot_dir = home_dir.join(".copilot");
-    let copilot_session_dir = copilot_dir.join("sessions");
+    let copilot_session_dir = copilot_dir.join("history-session-state");
     let gemini_dir = home_dir.join(".gemini");
     let gemini_session_dir = gemini_dir.join("tmp");
     let cache_dir = home_dir.join(".vibe_coding_tracker");

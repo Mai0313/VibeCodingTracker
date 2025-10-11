@@ -269,7 +269,7 @@ The tool scans these directories automatically:
 
 - `~/.claude/projects/*.jsonl` (Claude Code)
 - `~/.codex/sessions/*.jsonl` (Codex)
-- `~/.copilot/sessions/*.json` (Copilot)
+- `~/.copilot/history-session-state/*.json` (Copilot)
 - `~/.gemini/tmp/<project_hash>/chats/*.json` (Gemini)
 
 ### 🎨 Interactive Mode (Default)

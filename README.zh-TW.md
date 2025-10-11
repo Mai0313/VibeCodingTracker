@@ -269,7 +269,7 @@ vct usage --json
 
 - `~/.claude/projects/*.jsonl`（Claude Code）
 - `~/.codex/sessions/*.jsonl`（Codex）
-- `~/.copilot/sessions/*.json`（Copilot）
+- `~/.copilot/history-session-state/*.json`（Copilot）
 - `~/.gemini/tmp/<project_hash>/chats/*.json`（Gemini）
 
 ### 🎨 互動式模式（預設）
@@ -793,7 +793,7 @@ RUST_LOG=debug vct usage
 # 驗證會話目錄
 ls -la ~/.claude/projects/
 ls -la ~/.codex/sessions/
-ls -la ~/.copilot/sessions/
+ls -la ~/.copilot/history-session-state/
 ls -la ~/.gemini/tmp/
 
 # 統計會話檔案

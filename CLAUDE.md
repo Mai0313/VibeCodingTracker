@@ -275,7 +275,7 @@ src/
 **1. Usage Command (`vct usage`):**
 
 - `main.rs::Commands::Usage` → `usage/calculator.rs::get_usage_from_directories()`
-  - Scans `~/.claude/projects/*.jsonl`, `~/.codex/sessions/*.jsonl`, `~/.copilot/sessions/*.json`, and `~/.gemini/tmp/*.jsonl`
+  - Scans `~/.claude/projects/*.jsonl`, `~/.codex/sessions/*.jsonl`, `~/.copilot/history-session-state/*.json`, and `~/.gemini/tmp/*.jsonl`
   - For each file, calls `analysis/analyzer.rs::analyze_jsonl_file()` for unified parsing (same function used by analysis command)
   - Extracts only `conversationUsage` from `CodeAnalysis` result (post-processing: focuses on token usage)
   - Aggregates token usage by date and model into `DateUsageResult`
@@ -299,7 +299,7 @@ src/
 **Batch Mode** (without `--path`):
 
 - `main.rs::Commands::Analysis` → `analysis/batch_analyzer.rs::analyze_all_sessions()`
-  - Scans `~/.claude/projects/*.jsonl`, `~/.codex/sessions/*.jsonl`, `~/.copilot/sessions/*.json`, and `~/.gemini/tmp/*.jsonl` (same directories as usage command)
+  - Scans `~/.claude/projects/*.jsonl`, `~/.codex/sessions/*.jsonl`, `~/.copilot/history-session-state/*.json`, and `~/.gemini/tmp/*.jsonl` (same directories as usage command)
   - For each file, calls `analyze_jsonl_file()` (same unified parsing function as usage command)
   - Extracts different metrics from `CodeAnalysis` results (post-processing: focuses on file operations and tool calls)
   - Aggregates metrics by date and model: edit/read/write lines, tool call counts (Bash, Edit, Read, TodoWrite, Write)
@@ -312,7 +312,7 @@ src/
 **Batch Mode with Provider Grouping** (with `--all`):
 
 - `main.rs::Commands::Analysis` → `analysis/batch_analyzer.rs::analyze_all_sessions_by_provider()`
-  - Scans same directories as other commands: `~/.claude/projects/*.jsonl`, `~/.codex/sessions/*.jsonl`, `~/.copilot/sessions/*.json`, `~/.gemini/tmp/*.jsonl`
+  - Scans same directories as other commands: `~/.claude/projects/*.jsonl`, `~/.codex/sessions/*.jsonl`, `~/.copilot/history-session-state/*.json`, `~/.gemini/tmp/*.jsonl`
   - For each file, calls `analyze_jsonl_file()` (same unified parsing function)
   - Returns `ProviderGroupedAnalysis` struct with complete CodeAnalysis records for each provider
   - Output includes full records with all conversation usage, file operations, and tool call details
@@ -548,7 +548,7 @@ docker run --rm \
 - **Consistent File Scanning**: Both `usage` and `analysis` commands scan identical directories:
   - `~/.claude/projects/*.jsonl` (Claude Code)
   - `~/.codex/sessions/*.jsonl` (Codex)
-  - `~/.copilot/sessions/*.json` (Copilot)
+  - `~/.copilot/history-session-state/*.json` (Copilot)
   - `~/.gemini/tmp/*.jsonl` (Gemini)
 - **Format Detection**: `detector.rs` automatically identifies Claude/Codex/Copilot/Gemini format
 - **Parser Routing**: Routes to appropriate analyzer (`claude_analyzer`, `codex_analyzer`, `copilot_analyzer`, `gemini_analyzer`)
@@ -568,7 +568,7 @@ docker run --rm \
     ┌─────────────────────────────────────┐
     │ ~/.claude/projects/*.jsonl          │
     │ ~/.codex/sessions/*.jsonl           │
-    │ ~/.copilot/sessions/*.json          │
+    │ ~/.copilot/history-session-state/*.json          │
     │ ~/.gemini/tmp/*.jsonl                │
     └─────────────────────────────────────┘
                       │
@@ -653,7 +653,7 @@ docker run --rm \
 
 - **Claude Code:** `~/.claude/projects/*.jsonl`
 - **Codex:** `~/.codex/sessions/*.jsonl`
-- **Copilot:** `~/.copilot/sessions/*.json`
+- **Copilot:** `~/.copilot/history-session-state/*.json`
 - **Gemini:** `~/.gemini/tmp/*.jsonl`
 
 ## Troubleshooting Commands
@@ -672,7 +672,7 @@ vct usage
 # Verify session directories
 ls -la ~/.claude/projects/
 ls -la ~/.codex/sessions/
-ls -la ~/.copilot/sessions/
+ls -la ~/.copilot/history-session-state/
 ls -la ~/.gemini/tmp/
 ```
 

@@ -20,7 +20,7 @@ fn test_resolve_paths() {
     assert!(paths.gemini_dir.ends_with(".gemini"));
     assert!(paths.codex_session_dir.ends_with("sessions"));
     assert!(paths.claude_session_dir.ends_with("projects"));
-    assert!(paths.copilot_session_dir.ends_with("sessions"));
+    assert!(paths.copilot_session_dir.ends_with("history-session-state"));
     assert!(paths.gemini_session_dir.ends_with("tmp"));
 }
 
@@ -206,8 +206,8 @@ fn test_session_subdirs() {
         .to_str()
         .unwrap();
     assert_eq!(
-        copilot_session_name, "sessions",
-        "Copilot session dir should be named 'sessions'"
+        copilot_session_name, "history-session-state",
+        "Copilot session dir should be named 'history-session-state'"
     );
 }
 
