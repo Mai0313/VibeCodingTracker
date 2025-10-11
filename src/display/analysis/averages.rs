@@ -138,7 +138,7 @@ pub fn calculate_analysis_daily_averages(rows: &[AnalysisRow]) -> AnalysisDailyA
 pub fn build_analysis_provider_rows(
     averages: &AnalysisDailyAverages,
 ) -> Vec<ProviderAverage<'_, AnalysisProviderStats>> {
-    let mut rows = Vec::with_capacity(4); // Pre-allocate: max 3 providers + overall
+    let mut rows = Vec::with_capacity(5); // Pre-allocate: max 4 providers + overall
 
     if averages.claude.days_count > 0 {
         rows.push(ProviderAverage::new(
@@ -152,6 +152,14 @@ pub fn build_analysis_provider_rows(
         rows.push(ProviderAverage::new(
             Provider::Codex,
             &averages.codex,
+            false,
+        ));
+    }
+
+    if averages.copilot.days_count > 0 {
+        rows.push(ProviderAverage::new(
+            Provider::Copilot,
+            &averages.copilot,
             false,
         ));
     }
