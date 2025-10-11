@@ -18,17 +18,19 @@
 然後依照 `toolTitle` 和 `arguments` 的值去分類出類似於 `examples/analysis_result.json` 的資訊
 
 - `toolTitle` 分為以下幾種:
-    - str_replace_editor
-        - 可能是 `readFileDetails`, `editFileDetails`, 或 `writeFileDetails` 請查看後續分類方式
-    - bash
-        - 只會是 `runCommandDetails`
+
+  - str_replace_editor
+    - 可能是 `readFileDetails`, `editFileDetails`, 或 `writeFileDetails` 請查看後續分類方式
+  - bash
+    - 只會是 `runCommandDetails`
 
 - `readFileDetails`: `arguments` 的 `command` 為 `view`, `path` 就會是讀取的檔案, `view_range` 可能會沒有
-    - 假設有 `view_range` 他會是由開始的 line 到 結束的 line 來記錄
-    - 假設沒有 `view_range` 表示他是讀取整份文件
-`editFileDetails`: `arguments` 裡面有 `command` 為 `str_replace` 的資訊 裡面也有提供 `path` `old_str` `new_str` 可以直接使用
-`runCommandDetails`: `toolTitle` 為 `bash` 就是我們要記錄的 runCommand 了, 這邊的 command 內容就不用再細分了
-`writeFileDetails`: `command` 為 `create`, 裡面有 `path` 和 `file_text` 可以直接使用
+
+  - 假設有 `view_range` 他會是由開始的 line 到 結束的 line 來記錄
+  - 假設沒有 `view_range` 表示他是讀取整份文件
+    `editFileDetails`: `arguments` 裡面有 `command` 為 `str_replace` 的資訊 裡面也有提供 `path` `old_str` `new_str` 可以直接使用
+    `runCommandDetails`: `toolTitle` 為 `bash` 就是我們要記錄的 runCommand 了, 這邊的 command 內容就不用再細分了
+    `writeFileDetails`: `command` 為 `create`, 裡面有 `path` 和 `file_text` 可以直接使用
 
 `usage` 的部分目前好像沒辦法知道 所以全部當做 0 就好
 模型名稱暫時寫死 `copilot`, 未來等 copilot cli 更新再去看有沒有其他方式可以處理 因為目前沒有其他方式可以取得
