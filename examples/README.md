@@ -16,16 +16,19 @@
 ### 改動範例
 
 **修改前**（cli.rs 第 4 行）：
+
 ```rust
 /// Vibe Coding Tracker - AI coding assistant usage analyzer
 ```
 
 **修改後**：
+
 ```rust
 /// Vibe Code Tracker - AI coding assistant usage analyzer
 ```
 
 **新增的 CHANGELOG_DEMO.md**：
+
 ```markdown
 # 專案名稱變更記錄
 
