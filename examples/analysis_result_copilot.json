@@ -1,0 +1,137 @@
+{
+  "extensionName": "Copilot-CLI",
+  "insightsVersion": "0.5.5-5-gbcec23f-dirty",
+  "machineId": "18f309cbbb654be69eff5ff79d2f3fa6",
+  "records": [
+    {
+      "conversationUsage": {
+        "copilot": {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "input_tokens": 0,
+          "output_tokens": 0
+        }
+      },
+      "editFileDetails": [
+        {
+          "characterCount": 58,
+          "filePath": "/home/wei/repo/VibeCodingTracker/src/cli.rs",
+          "lineCount": 1,
+          "newString": "/// Vibe Code Tracker - AI coding assistant usage analyzer",
+          "oldString": "/// Vibe Coding Tracker - AI coding assistant usage analyzer",
+          "timestamp": 1760187327622
+        },
+        {
+          "characterCount": 128,
+          "filePath": "/home/wei/repo/VibeCodingTracker/Cargo.toml",
+          "lineCount": 1,
+          "newString": "description = \"Vibe Code Tracker - AI coding assistant telemetry/usage parser, aggregate JSONL events into CodeAnalysis results\"",
+          "oldString": "description = \"Vibe Coding Tracker - AI coding assistant telemetry/usage parser, aggregate JSONL events into CodeAnalysis results\"",
+          "timestamp": 1760187327622
+        },
+        {
+          "characterCount": 55,
+          "filePath": "/home/wei/repo/VibeCodingTracker/README.md",
+          "lineCount": 1,
+          "newString": "# Vibe Code Tracker — AI Coding Assistant Usage Tracker",
+          "oldString": "# Vibe Coding Tracker — AI Coding Assistant Usage Tracker",
+          "timestamp": 1760187327622
+        },
+        {
+          "characterCount": 246,
+          "filePath": "/home/wei/repo/VibeCodingTracker/README.md",
+          "lineCount": 1,
+          "newString": "**Track your AI coding costs in real-time.** Vibe Code Tracker is a powerful CLI tool that helps you monitor and analyze your Claude Code, Codex, and Gemini usage, providing detailed cost breakdowns, token statistics, and code operation insights.",
+          "oldString": "**Track your AI coding costs in real-time.** Vibe Coding Tracker is a powerful CLI tool that helps you monitor and analyze your Claude Code, Codex, and Gemini usage, providing detailed cost breakdowns, token statistics, and code operation insights.",
+          "timestamp": 1760187327622
+        },
+        {
+          "characterCount": 27,
+          "filePath": "/home/wei/repo/VibeCodingTracker/README.md",
+          "lineCount": 1,
+          "newString": "## 🎯 Why Vibe Code Tracker?",
+          "oldString": "## 🎯 Why Vibe Coding Tracker?",
+          "timestamp": 1760187327622
+        },
+        {
+          "characterCount": 19,
+          "filePath": "/home/wei/repo/VibeCodingTracker/README.md",
+          "lineCount": 1,
+          "newString": "🚀 Vibe Code Tracker",
+          "oldString": "🚀 Vibe Coding Tracker",
+          "timestamp": 1760187327622
+        }
+      ],
+      "folderPath": "",
+      "gitRemoteUrl": "https://github.com/Mai0313/VibeCodingTracker",
+      "readFileDetails": [
+        {
+          "characterCount": 31782,
+          "filePath": "/home/wei/repo/VibeCodingTracker/README.md",
+          "lineCount": 892,
+          "timestamp": 1760187303589
+        }
+      ],
+      "runCommandDetails": [
+        {
+          "characterCount": 83,
+          "command": "cd /home/wei/repo/VibeCodingTracker && grep -n \"Vibe.*Tracker\" src/cli.rs | head -5",
+          "description": "Verify cli.rs modification",
+          "filePath": "",
+          "lineCount": 0,
+          "timestamp": 1760187334497
+        },
+        {
+          "characterCount": 66,
+          "command": "cd /home/wei/repo/VibeCodingTracker && cargo check 2>&1 | head -20",
+          "description": "Run cargo check to ensure no syntax errors",
+          "filePath": "",
+          "lineCount": 0,
+          "timestamp": 1760187334497
+        },
+        {
+          "characterCount": 60,
+          "command": "cd /home/wei/repo/VibeCodingTracker && cat CHANGELOG_DEMO.md",
+          "description": "View the new CHANGELOG_DEMO.md",
+          "filePath": "",
+          "lineCount": 0,
+          "timestamp": 1760187346100
+        },
+        {
+          "characterCount": 83,
+          "command": "cd /home/wei/repo/VibeCodingTracker && grep -n \"Vibe.*Tracker\" README.md | head -10",
+          "description": "Verify README modifications",
+          "filePath": "",
+          "lineCount": 0,
+          "timestamp": 1760187346101
+        }
+      ],
+      "taskId": "0b2a81da-02cf-4cbb-ae14-07c597b84f4e",
+      "timestamp": 1760187346101,
+      "toolCallCounts": {
+        "Bash": 8,
+        "Edit": 12,
+        "Read": 4,
+        "TodoWrite": 0,
+        "Write": 2
+      },
+      "totalEditCharacters": 533,
+      "totalEditLines": 6,
+      "totalReadCharacters": 31782,
+      "totalReadLines": 892,
+      "totalUniqueFiles": 4,
+      "totalWriteCharacters": 73,
+      "totalWriteLines": 3,
+      "writeFileDetails": [
+        {
+          "characterCount": 73,
+          "content": "# 專案名稱變更記錄\n\n- 2025-10-11: 將 \"Vibe Coding Tracker\" 簡化為 \"Vibe Code Tracker\"",
+          "filePath": "/home/wei/repo/VibeCodingTracker/CHANGELOG_DEMO.md",
+          "lineCount": 3,
+          "timestamp": 1760187327622
+        }
+      ]
+    }
+  ],
+  "user": "wei"
+}
