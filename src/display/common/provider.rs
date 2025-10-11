@@ -28,6 +28,12 @@ impl<'a, T> ProviderAverage<'a, T> {
                 RatatuiColor::Yellow,
                 TableColor::Yellow,
             ),
+            Provider::Copilot => (
+                Provider::Copilot.display_name(),
+                Provider::Copilot.icon(),
+                RatatuiColor::Green,
+                TableColor::Green,
+            ),
             Provider::Gemini => (
                 Provider::Gemini.display_name(),
                 Provider::Gemini.icon(),

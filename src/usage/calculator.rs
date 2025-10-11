@@ -43,7 +43,7 @@ fn extract_conversation_usage_from_analysis(analysis: &Value) -> FastHashMap<Str
 
 /// Aggregates token usage from all AI provider session directories
 ///
-/// Scans Claude Code, Codex, and Gemini session files, extracts token usage,
+/// Scans Claude Code, Codex, Copilot, and Gemini session files, extracts token usage,
 /// and aggregates by date and model. Returns a BTreeMap sorted chronologically.
 pub fn get_usage_from_directories() -> Result<DateUsageResult> {
     let paths = resolve_paths()?;
@@ -56,6 +56,10 @@ pub fn get_usage_from_directories() -> Result<DateUsageResult> {
 
     if paths.codex_session_dir.exists() {
         process_usage_directory(&paths.codex_session_dir, &mut result, is_json_file)?;
+    }
+
+    if paths.copilot_session_dir.exists() {
+        process_usage_directory(&paths.copilot_session_dir, &mut result, is_json_file)?;
     }
 
     if paths.gemini_session_dir.exists() {

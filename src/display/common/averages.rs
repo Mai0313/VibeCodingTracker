@@ -40,11 +40,12 @@ where
     }
 
     // Count days per provider
-    let (claude_days, codex_days, gemini_days, total_days) =
+    let (claude_days, codex_days, copilot_days, gemini_days, total_days) =
         count_provider_days(&date_provider_map);
 
     averages.claude.set_days(claude_days);
     averages.codex.set_days(codex_days);
+    averages.copilot.set_days(copilot_days);
     averages.gemini.set_days(gemini_days);
     averages.overall.set_days(total_days);
 
@@ -55,6 +56,7 @@ where
         match provider {
             Provider::ClaudeCode => averages.claude.accumulate(row, provider),
             Provider::Codex => averages.codex.accumulate(row, provider),
+            Provider::Copilot => averages.copilot.accumulate(row, provider),
             Provider::Gemini => averages.gemini.accumulate(row, provider),
             Provider::Unknown => {}
         }
@@ -69,9 +71,10 @@ where
 /// Counts the number of unique days each provider was active
 fn count_provider_days(
     date_provider_map: &BTreeMap<&str, HashSet<Provider>>,
-) -> (usize, usize, usize, usize) {
+) -> (usize, usize, usize, usize, usize) {
     let mut claude_days = 0;
     let mut codex_days = 0;
+    let mut copilot_days = 0;
     let mut gemini_days = 0;
 
     for providers in date_provider_map.values() {
@@ -81,6 +84,9 @@ fn count_provider_days(
         if providers.contains(&Provider::Codex) {
             codex_days += 1;
         }
+        if providers.contains(&Provider::Copilot) {
+            copilot_days += 1;
+        }
         if providers.contains(&Provider::Gemini) {
             gemini_days += 1;
         }
@@ -89,6 +95,7 @@ fn count_provider_days(
     (
         claude_days,
         codex_days,
+        copilot_days,
         gemini_days,
         date_provider_map.len(),
     )
@@ -98,6 +105,7 @@ fn count_provider_days(
 pub struct DailyAverages<R: DailyAverageRow, S: ProviderStatistics<R>> {
     pub claude: S,
     pub codex: S,
+    pub copilot: S,
     pub gemini: S,
     pub overall: S,
     _phantom: std::marker::PhantomData<R>,
@@ -108,6 +116,7 @@ impl<R: DailyAverageRow, S: ProviderStatistics<R>> Default for DailyAverages<R, 
         Self {
             claude: S::default(),
             codex: S::default(),
+            copilot: S::default(),
             gemini: S::default(),
             overall: S::default(),
             _phantom: std::marker::PhantomData,
@@ -121,6 +130,7 @@ impl<R: DailyAverageRow, S: ProviderStatistics<R>> DailyAverages<R, S> {
         match provider {
             Provider::ClaudeCode => &self.claude,
             Provider::Codex => &self.codex,
+            Provider::Copilot => &self.copilot,
             Provider::Gemini => &self.gemini,
             Provider::Unknown => &self.overall,
         }
@@ -131,6 +141,7 @@ impl<R: DailyAverageRow, S: ProviderStatistics<R>> DailyAverages<R, S> {
         match provider {
             Provider::ClaudeCode => &mut self.claude,
             Provider::Codex => &mut self.codex,
+            Provider::Copilot => &mut self.copilot,
             Provider::Gemini => &mut self.gemini,
             Provider::Unknown => &mut self.overall,
         }

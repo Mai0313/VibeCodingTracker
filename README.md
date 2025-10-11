@@ -17,7 +17,7 @@
 
 </center>
 
-**Track your AI coding costs in real-time.** Vibe Coding Tracker is a powerful CLI tool that helps you monitor and analyze your Claude Code, Codex, and Gemini usage, providing detailed cost breakdowns, token statistics, and code operation insights.
+**Track your AI coding costs in real-time.** Vibe Coding Tracker is a powerful CLI tool that helps you monitor and analyze your Claude Code, Codex, Copilot, and Gemini usage, providing detailed cost breakdowns, token statistics, and code operation insights.
 
 [English](README.md) | [繁體中文](README.zh-TW.md) | [简体中文](README.zh-CN.md)
 
@@ -42,7 +42,7 @@ Choose your preferred view:
 
 ### 🚀 Zero Configuration
 
-Automatically detects and processes logs from Claude Code, Codex, and Gemini. No setup required—just run and analyze.
+Automatically detects and processes logs from Claude Code, Codex, Copilot, and Gemini. No setup required—just run and analyze.
 
 ### 🎨 Rich Insights
 
@@ -58,7 +58,7 @@ Automatically detects and processes logs from Claude Code, Codex, and Gemini. No
 
 | Feature                    | Description                                                 |
 | -------------------------- | ----------------------------------------------------------- |
-| 🤖 **Auto-Detection**      | Intelligently identifies Claude Code, Codex, or Gemini logs |
+| 🤖 **Auto-Detection**      | Intelligently identifies Claude Code, Codex, Copilot, or Gemini logs |
 | 💵 **Smart Pricing**       | Fuzzy model matching + daily cache for speed                |
 | 🎨 **4 Display Modes**     | Interactive, Table, Text, and JSON outputs                  |
 | 📈 **Comprehensive Stats** | Tokens, costs, file ops, and tool calls                     |
@@ -269,6 +269,7 @@ The tool scans these directories automatically:
 
 - `~/.claude/projects/*.jsonl` (Claude Code)
 - `~/.codex/sessions/*.jsonl` (Codex)
+- `~/.copilot/sessions/*.json` (Copilot)
 - `~/.gemini/tmp/<project_hash>/chats/*.json` (Gemini)
 
 ### 🎨 Interactive Mode (Default)
@@ -296,7 +297,8 @@ The tool scans these directories automatically:
 │                                                                                                                   │
 │  Claude Code: 266,667 tokens/day  |  $1.68/day                                                                   │
 │  Codex: 20,000 tokens/day  |  $0.25/day                                                                          │
-│  Overall: 204,975 tokens/day  |  $1.33/day                                                                       │
+│  Copilot: 15,000 tokens/day  |  $0.18/day                                                                        │
+│  Overall: 179,090 tokens/day  |  $1.20/day                                                                       │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 
 Press 'q', 'Esc', or 'Ctrl+C' to quit
@@ -309,7 +311,7 @@ Press 'q', 'Esc', or 'Ctrl+C' to quit
 - 🔄 Shows recently updated rows
 - 💾 Displays memory usage
 - 📊 Summary statistics
-- 📈 Daily averages by provider (Claude Code, Codex, Gemini)
+- 📈 Daily averages by provider (Claude Code, Codex, Copilot, Gemini)
 
 **Controls**: Press `q`, `Esc`, or `Ctrl+C` to exit
 
@@ -343,7 +345,9 @@ vct usage --table
 ╠═════════════╬════════════════╬══════════════╬══════╣
 ║ Codex       ║ 20,000         ║ $0.25        ║ 1    ║
 ╠═════════════╬════════════════╬══════════════╬══════╣
-║ OVERALL     ║ 204,975        ║ $1.33        ║ 4    ║
+║ Copilot     ║ 15,000         ║ $0.18        ║ 1    ║
+╠═════════════╬════════════════╬══════════════╬══════╣
+║ OVERALL     ║ 179,090        ║ $1.20        ║ 5    ║
 ╚═════════════╩════════════════╩══════════════╩══════╝
 ```
 
@@ -760,6 +764,7 @@ docker build -f docker/Dockerfile --target prod -t vibe_coding_tracker:latest .
 docker run --rm \
     -v ~/.claude:/root/.claude \
     -v ~/.codex:/root/.codex \
+    -v ~/.copilot:/root/.copilot \
     -v ~/.gemini:/root/.gemini \
     vibe_coding_tracker:latest usage
 ```
@@ -788,11 +793,13 @@ RUST_LOG=debug vct usage
 # Verify session directories
 ls -la ~/.claude/projects/
 ls -la ~/.codex/sessions/
+ls -la ~/.copilot/sessions/
 ls -la ~/.gemini/tmp/
 
 # Count session files
 find ~/.claude/projects -name "*.jsonl" | wc -l
 find ~/.codex/sessions -name "*.jsonl" | wc -l
+find ~/.copilot/sessions -name "*.json" | wc -l
 find ~/.gemini/tmp -name "*.json" | wc -l
 ```
 
@@ -869,7 +876,7 @@ MIT License - see [LICENSE](LICENSE) for details.
 ## 🙏 Credits
 
 - [LiteLLM](https://github.com/BerriAI/litellm) for model pricing data
-- Claude Code, Codex, and Gemini teams for creating amazing AI coding assistants
+- Claude Code, Codex, Copilot, and Gemini teams for creating amazing AI coding assistants
 - The Rust community for excellent tooling
 
 ---

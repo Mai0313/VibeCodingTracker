@@ -11,6 +11,8 @@ pub struct HelperPaths {
     pub codex_session_dir: PathBuf,
     pub claude_dir: PathBuf,
     pub claude_session_dir: PathBuf,
+    pub copilot_dir: PathBuf,
+    pub copilot_session_dir: PathBuf,
     pub gemini_dir: PathBuf,
     pub gemini_session_dir: PathBuf,
     pub cache_dir: PathBuf,
@@ -25,6 +27,8 @@ pub fn resolve_paths() -> Result<HelperPaths> {
     let codex_session_dir = codex_dir.join("sessions");
     let claude_dir = home_dir.join(".claude");
     let claude_session_dir = claude_dir.join("projects");
+    let copilot_dir = home_dir.join(".copilot");
+    let copilot_session_dir = copilot_dir.join("sessions");
     let gemini_dir = home_dir.join(".gemini");
     let gemini_session_dir = gemini_dir.join("tmp");
     let cache_dir = home_dir.join(".vibe_coding_tracker");
@@ -35,6 +39,8 @@ pub fn resolve_paths() -> Result<HelperPaths> {
         codex_session_dir,
         claude_dir,
         claude_session_dir,
+        copilot_dir,
+        copilot_session_dir,
         gemini_dir,
         gemini_session_dir,
         cache_dir,

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Vibe Coding Tracker** is a Rust CLI tool that analyzes AI coding assistant usage (Claude Code, Codex, and Gemini) by parsing JSONL session files, calculating token usage, computing costs via LiteLLM pricing data, and presenting insights through multiple output formats (interactive TUI, static tables, JSON, text).
+**Vibe Coding Tracker** is a Rust CLI tool that analyzes AI coding assistant usage (Claude Code, Codex, Copilot, and Gemini) by parsing JSONL session files, calculating token usage, computing costs via LiteLLM pricing data, and presenting insights through multiple output formats (interactive TUI, static tables, JSON, text).
 
 **Binary names:**
 
@@ -107,7 +107,7 @@ vct analysis
 # Batch analyze and save to JSON
 vct analysis --output <output.json>
 
-# Batch analyze all sessions grouped by provider (claude/codex/gemini)
+# Batch analyze all sessions grouped by provider (claude/codex/copilot/gemini)
 vct analysis --all
 
 # Batch analyze grouped by provider and save to JSON
@@ -220,18 +220,20 @@ src/
 │   ├── mod.rs           # Re-exports
 │   ├── analysis.rs      # CodeAnalysis struct
 │   ├── usage.rs         # DateUsageResult
-│   ├── provider.rs      # Provider enum (Claude/Codex/Gemini)
+│   ├── provider.rs      # Provider enum (Claude/Codex/Copilot/Gemini)
 │   ├── claude.rs        # Claude-specific types
 │   ├── codex.rs         # Codex/OpenAI types
+│   ├── copilot.rs       # Copilot CLI types
 │   └── gemini.rs        # Gemini-specific types
 ├── analysis/            # JSONL analysis pipeline
 │   ├── mod.rs           # Public API
 │   ├── analyzer.rs      # Main entry: analyze_jsonl_file()
 │   ├── batch_analyzer.rs # Batch analysis: analyze_all_sessions()
-│   ├── detector.rs      # Detect Claude vs Codex vs Gemini format
+│   ├── detector.rs      # Detect Claude vs Codex vs Copilot vs Gemini format
 │   ├── common_state.rs  # Shared state for analyzers
 │   ├── claude_analyzer.rs
 │   ├── codex_analyzer.rs
+│   ├── copilot_analyzer.rs
 │   └── gemini_analyzer.rs
 ├── display/             # Output formatting (interactive TUI, tables, text, JSON)
 │   ├── mod.rs           # Public API
@@ -273,7 +275,7 @@ src/
 **1. Usage Command (`vct usage`):**
 
 - `main.rs::Commands::Usage` → `usage/calculator.rs::get_usage_from_directories()`
-  - Scans `~/.claude/projects/*.jsonl`, `~/.codex/sessions/*.jsonl`, and `~/.gemini/tmp/*.jsonl`
+  - Scans `~/.claude/projects/*.jsonl`, `~/.codex/sessions/*.jsonl`, `~/.copilot/sessions/*.json`, and `~/.gemini/tmp/*.jsonl`
   - For each file, calls `analysis/analyzer.rs::analyze_jsonl_file()` for unified parsing (same function used by analysis command)
   - Extracts only `conversationUsage` from `CodeAnalysis` result (post-processing: focuses on token usage)
   - Aggregates token usage by date and model into `DateUsageResult`
@@ -289,15 +291,15 @@ src/
 **Single File Mode** (with `--path`):
 
 - `main.rs::Commands::Analysis` → `analysis/analyzer.rs::analyze_jsonl_file()`
-  - `detector.rs` determines Claude vs Codex vs Gemini format (checks `parentUuid` for Claude, `sessionId` for Gemini)
-  - Routes to `claude_analyzer.rs`, `codex_analyzer.rs`, or `gemini_analyzer.rs`
+  - `detector.rs` determines Claude vs Codex vs Copilot vs Gemini format (checks `parentUuid` for Claude, `sessionId` + `timeline` for Copilot, `sessionId` + `messages` for Gemini)
+  - Routes to `claude_analyzer.rs`, `codex_analyzer.rs`, `copilot_analyzer.rs`, or `gemini_analyzer.rs`
   - Extracts: conversation usage, tool call counts, file operations, Git info
 - Outputs detailed JSON with metadata (user, machineId, Git remote, etc.)
 
 **Batch Mode** (without `--path`):
 
 - `main.rs::Commands::Analysis` → `analysis/batch_analyzer.rs::analyze_all_sessions()`
-  - Scans `~/.claude/projects/*.jsonl`, `~/.codex/sessions/*.jsonl`, and `~/.gemini/tmp/*.jsonl` (same directories as usage command)
+  - Scans `~/.claude/projects/*.jsonl`, `~/.codex/sessions/*.jsonl`, `~/.copilot/sessions/*.json`, and `~/.gemini/tmp/*.jsonl` (same directories as usage command)
   - For each file, calls `analyze_jsonl_file()` (same unified parsing function as usage command)
   - Extracts different metrics from `CodeAnalysis` results (post-processing: focuses on file operations and tool calls)
   - Aggregates metrics by date and model: edit/read/write lines, tool call counts (Bash, Edit, Read, TodoWrite, Write)
@@ -310,12 +312,12 @@ src/
 **Batch Mode with Provider Grouping** (with `--all`):
 
 - `main.rs::Commands::Analysis` → `analysis/batch_analyzer.rs::analyze_all_sessions_by_provider()`
-  - Scans same directories as other commands: `~/.claude/projects/*.jsonl`, `~/.codex/sessions/*.jsonl`, `~/.gemini/tmp/*.jsonl`
+  - Scans same directories as other commands: `~/.claude/projects/*.jsonl`, `~/.codex/sessions/*.jsonl`, `~/.copilot/sessions/*.json`, `~/.gemini/tmp/*.jsonl`
   - For each file, calls `analyze_jsonl_file()` (same unified parsing function)
   - Returns `ProviderGroupedAnalysis` struct with complete CodeAnalysis records for each provider
   - Output includes full records with all conversation usage, file operations, and tool call details
 - Default behavior: Outputs JSON directly to stdout
-  - Keys: "Claude-Code", "Codex", "Gemini"
+  - Keys: "Claude-Code", "Codex", "Copilot-CLI", "Gemini"
   - Values: Arrays of complete CodeAnalysis objects with full records
 - With `--output`: Saves the JSON to the specified file path
 
@@ -409,6 +411,13 @@ src/
 - OpenAI-style structure
 - Fields: `completion_response.usage`, `total_token_usage`, `reasoning_output_tokens`
 
+**Copilot format:**
+
+- GitHub Copilot CLI structure
+- Presence of `sessionId`, `startTime`, and `timeline` fields
+- Fields: `timeline[].type`, `timeline[].toolTitle`, `timeline[].arguments`, `timeline[].result`
+- Tools: `str_replace_editor`, `bash`, and other CLI operations
+
 **Gemini format:**
 
 - Single session object structure
@@ -433,11 +442,13 @@ cargo test --all --verbose
 # Example conversation files for testing
 examples/test_conversation.jsonl          # Claude Code format
 examples/test_conversation_oai.jsonl       # Codex format
+examples/test_conversation_copilot.json    # Copilot format
 examples/test_conversation_gemini.json     # Gemini format
 
 # Expected analysis output files for validation
 examples/analysis_result.json              # Expected Claude Code output
 examples/analysis_result_oai.json          # Expected Codex output
+examples/analysis_result_copilot.json      # Expected Copilot output
 examples/analysis_result_gemini.json       # Expected Gemini output
 ```
 
@@ -445,11 +456,12 @@ examples/analysis_result_gemini.json       # Expected Gemini output
 
 The `test_analysis_expected_output.rs` test suite validates that `analysis --path` produces consistent output:
 
-- **Purpose**: Ensure analysis output matches expected results for all three formats (Claude Code, Codex, Gemini)
+- **Purpose**: Ensure analysis output matches expected results for all four formats (Claude Code, Codex, Copilot, Gemini)
 - **Ignored Fields**: `insightsVersion`, `machineId`, `user` (environment-specific)
 - **Test Cases**:
   - `test_claude_code_analysis_matches_expected`: Validates Claude Code analysis
   - `test_codex_analysis_matches_expected`: Validates Codex/OpenAI analysis
+  - `test_copilot_analysis_matches_expected`: Validates Copilot CLI analysis
   - `test_gemini_analysis_matches_expected`: Validates Gemini analysis
 - **Helper Function**: `compare_json_ignore_fields()` recursively compares JSON while ignoring specific fields
 
@@ -469,6 +481,7 @@ docker build -f docker/Dockerfile --target prod -t vct:latest .
 docker run --rm \
     -v ~/.claude:/root/.claude \
     -v ~/.codex:/root/.codex \
+    -v ~/.copilot:/root/.copilot \
     -v ~/.gemini:/root/.gemini \
     vct:latest usage
 ```
@@ -535,9 +548,10 @@ docker run --rm \
 - **Consistent File Scanning**: Both `usage` and `analysis` commands scan identical directories:
   - `~/.claude/projects/*.jsonl` (Claude Code)
   - `~/.codex/sessions/*.jsonl` (Codex)
+  - `~/.copilot/sessions/*.json` (Copilot)
   - `~/.gemini/tmp/*.jsonl` (Gemini)
-- **Format Detection**: `detector.rs` automatically identifies Claude/Codex/Gemini format
-- **Parser Routing**: Routes to appropriate analyzer (`claude_analyzer`, `codex_analyzer`, `gemini_analyzer`)
+- **Format Detection**: `detector.rs` automatically identifies Claude/Codex/Copilot/Gemini format
+- **Parser Routing**: Routes to appropriate analyzer (`claude_analyzer`, `codex_analyzer`, `copilot_analyzer`, `gemini_analyzer`)
 - **Data Extraction** (Post-processing differences):
   - `usage` command: Extracts only `conversationUsage` from `CodeAnalysis` for token usage and cost calculation
   - `analysis` command: Uses full `CodeAnalysis` including file operations, tool call counts, and detailed metrics
@@ -554,6 +568,7 @@ docker run --rm \
     ┌─────────────────────────────────────┐
     │ ~/.claude/projects/*.jsonl          │
     │ ~/.codex/sessions/*.jsonl           │
+    │ ~/.copilot/sessions/*.json          │
     │ ~/.gemini/tmp/*.jsonl                │
     └─────────────────────────────────────┘
                       │
@@ -595,13 +610,14 @@ docker run --rm \
 
 - Always use fuzzy matching when looking up pricing
 - Store matched model name for transparency
-- Handle multiple formats: Claude (`claude-sonnet-4-20250514`), OpenAI (`gpt-4-turbo`), and Gemini (`gemini-2.0-flash-exp`)
+- Handle multiple formats: Claude (`claude-sonnet-4-20250514`), OpenAI (`gpt-4-turbo`), Copilot (`copilot-gpt-4`), and Gemini (`gemini-2.0-flash-exp`)
 
 **6. Daily Averages Calculation:**
 
 - **Provider Detection**: Automatically detects provider from model name prefix:
   - `claude*` → Claude Code
   - `gpt*`, `o1*`, `o3*` → Codex
+  - `copilot*` → Copilot
   - `gemini*` → Gemini
 - **Smart Day Counting**: Only counts days where each provider has actual data (no zero-padding)
 - **Metrics Tracked**:
@@ -611,7 +627,7 @@ docker run --rm \
 - **Display Modes**:
   - **Interactive TUI**: Dedicated "Daily Averages" panel below summary statistics
   - **Static Table**: Separate table displayed after main usage table
-  - Provider-specific rows (Claude Code, Codex, Gemini) + OVERALL row
+  - Provider-specific rows (Claude Code, Codex, Copilot, Gemini) + OVERALL row
 - **Implementation Location**: `src/display/common/averages.rs` and `src/display/usage/averages.rs`
   - `ProviderStats` struct: tracks total tokens, cost, and day count per provider
   - `DailyAverages` struct: aggregates all provider statistics with calculation methods
@@ -637,6 +653,7 @@ docker run --rm \
 
 - **Claude Code:** `~/.claude/projects/*.jsonl`
 - **Codex:** `~/.codex/sessions/*.jsonl`
+- **Copilot:** `~/.copilot/sessions/*.json`
 - **Gemini:** `~/.gemini/tmp/*.jsonl`
 
 ## Troubleshooting Commands
@@ -655,6 +672,7 @@ vct usage
 # Verify session directories
 ls -la ~/.claude/projects/
 ls -la ~/.codex/sessions/
+ls -la ~/.copilot/sessions/
 ls -la ~/.gemini/tmp/
 ```
 
@@ -785,6 +803,7 @@ ls -la ~/.gemini/tmp/
     }
   ],
   "Codex": [...],
+  "Copilot-CLI": [...],
   "Gemini": [...]
 }
 ```

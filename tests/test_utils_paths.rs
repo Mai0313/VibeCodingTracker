@@ -16,9 +16,11 @@ fn test_resolve_paths() {
     // Check that helper directories are constructed correctly
     assert!(paths.codex_dir.ends_with(".codex"));
     assert!(paths.claude_dir.ends_with(".claude"));
+    assert!(paths.copilot_dir.ends_with(".copilot"));
     assert!(paths.gemini_dir.ends_with(".gemini"));
     assert!(paths.codex_session_dir.ends_with("sessions"));
     assert!(paths.claude_session_dir.ends_with("projects"));
+    assert!(paths.copilot_session_dir.ends_with("sessions"));
     assert!(paths.gemini_session_dir.ends_with("tmp"));
 }
 
@@ -60,11 +62,13 @@ fn test_paths_structure() {
     // Verify that all paths are under home directory
     assert!(paths.codex_dir.starts_with(&paths.home_dir));
     assert!(paths.claude_dir.starts_with(&paths.home_dir));
+    assert!(paths.copilot_dir.starts_with(&paths.home_dir));
     assert!(paths.gemini_dir.starts_with(&paths.home_dir));
 
     // Verify session directories are subdirectories
     assert!(paths.codex_session_dir.starts_with(&paths.codex_dir));
     assert!(paths.claude_session_dir.starts_with(&paths.claude_dir));
+    assert!(paths.copilot_session_dir.starts_with(&paths.copilot_dir));
     assert!(paths.gemini_session_dir.starts_with(&paths.gemini_dir));
 }
 
@@ -78,6 +82,8 @@ fn test_helper_paths_clone() {
     assert_eq!(paths.codex_session_dir, cloned.codex_session_dir);
     assert_eq!(paths.claude_dir, cloned.claude_dir);
     assert_eq!(paths.claude_session_dir, cloned.claude_session_dir);
+    assert_eq!(paths.copilot_dir, cloned.copilot_dir);
+    assert_eq!(paths.copilot_session_dir, cloned.copilot_session_dir);
     assert_eq!(paths.gemini_dir, cloned.gemini_dir);
     assert_eq!(paths.gemini_session_dir, cloned.gemini_session_dir);
 }
@@ -126,6 +132,14 @@ fn test_paths_are_absolute() {
         "Claude session dir should be absolute"
     );
     assert!(
+        paths.copilot_dir.is_absolute(),
+        "Copilot dir should be absolute"
+    );
+    assert!(
+        paths.copilot_session_dir.is_absolute(),
+        "Copilot session dir should be absolute"
+    );
+    assert!(
         paths.gemini_dir.is_absolute(),
         "Gemini dir should be absolute"
     );
@@ -147,6 +161,16 @@ fn test_claude_dir_name() {
     let paths = resolve_paths().unwrap();
     let claude_name = paths.claude_dir.file_name().unwrap().to_str().unwrap();
     assert_eq!(claude_name, ".claude", "Claude dir should be named .claude");
+}
+
+#[test]
+fn test_copilot_dir_name() {
+    let paths = resolve_paths().unwrap();
+    let copilot_name = paths.copilot_dir.file_name().unwrap().to_str().unwrap();
+    assert_eq!(
+        copilot_name, ".copilot",
+        "Copilot dir should be named .copilot"
+    );
 }
 
 #[test]
@@ -173,6 +197,17 @@ fn test_session_subdirs() {
     assert_eq!(
         claude_session_name, "projects",
         "Claude session dir should be named 'projects'"
+    );
+
+    let copilot_session_name = paths
+        .copilot_session_dir
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert_eq!(
+        copilot_session_name, "sessions",
+        "Copilot session dir should be named 'sessions'"
     );
 }
 

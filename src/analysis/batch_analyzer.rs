@@ -26,7 +26,7 @@ pub struct AggregatedAnalysisRow {
 
 /// Analyzes all session files across providers and aggregates file operation metrics
 ///
-/// Scans Claude, Codex, and Gemini session directories, aggregates tool call counts
+/// Scans Claude, Codex, Copilot, and Gemini session directories, aggregates tool call counts
 /// and line counts by date and model, then returns sorted results.
 pub fn analyze_all_sessions() -> Result<Vec<AggregatedAnalysisRow>> {
     let paths = crate::utils::resolve_paths()?;
@@ -40,6 +40,10 @@ pub fn analyze_all_sessions() -> Result<Vec<AggregatedAnalysisRow>> {
 
     if paths.codex_session_dir.exists() {
         process_analysis_directory(&paths.codex_session_dir, &mut aggregated, is_json_file)?;
+    }
+
+    if paths.copilot_session_dir.exists() {
+        process_analysis_directory(&paths.copilot_session_dir, &mut aggregated, is_json_file)?;
     }
 
     if paths.gemini_session_dir.exists() {
@@ -65,6 +69,8 @@ pub struct ProviderGroupedAnalysis {
     pub claude: Vec<Value>,
     #[serde(rename = "Codex")]
     pub codex: Vec<Value>,
+    #[serde(rename = "Copilot-CLI")]
+    pub copilot: Vec<Value>,
     #[serde(rename = "Gemini")]
     pub gemini: Vec<Value>,
 }
@@ -78,6 +84,7 @@ pub fn analyze_all_sessions_by_provider() -> Result<ProviderGroupedAnalysis> {
 
     let mut claude_results: Vec<Value> = Vec::new();
     let mut codex_results: Vec<Value> = Vec::new();
+    let mut copilot_results: Vec<Value> = Vec::new();
     let mut gemini_results: Vec<Value> = Vec::new();
 
     // Process Claude sessions
@@ -98,6 +105,15 @@ pub fn analyze_all_sessions_by_provider() -> Result<ProviderGroupedAnalysis> {
         )?;
     }
 
+    // Process Copilot sessions
+    if paths.copilot_session_dir.exists() {
+        process_full_analysis_directory(
+            &paths.copilot_session_dir,
+            &mut copilot_results,
+            is_json_file,
+        )?;
+    }
+
     // Process Gemini sessions
     if paths.gemini_session_dir.exists() {
         process_full_analysis_directory(
@@ -110,6 +126,7 @@ pub fn analyze_all_sessions_by_provider() -> Result<ProviderGroupedAnalysis> {
     Ok(ProviderGroupedAnalysis {
         claude: claude_results,
         codex: codex_results,
+        copilot: copilot_results,
         gemini: gemini_results,
     })
 }

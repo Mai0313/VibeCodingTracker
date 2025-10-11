@@ -5,6 +5,7 @@ use std::fmt;
 pub enum Provider {
     ClaudeCode,
     Codex,
+    Copilot,
     Gemini,
     Unknown,
 }
@@ -13,7 +14,7 @@ impl Provider {
     /// Detects the AI provider from a model name using byte-level pattern matching
     ///
     /// This const function enables compile-time optimization and uses efficient byte
-    /// comparison to identify Claude, Gemini, or Codex models.
+    /// comparison to identify Claude, Gemini, Copilot, or Codex models.
     pub const fn from_model_name(model: &str) -> Self {
         // Use byte comparison for better performance
         let bytes = model.as_bytes();
@@ -29,6 +30,19 @@ impl Provider {
             {
                 return Self::ClaudeCode;
             }
+        }
+
+        // Check for "copilot" prefix
+        if bytes.len() >= 7
+            && bytes[0] == b'c'
+            && bytes[1] == b'o'
+            && bytes[2] == b'p'
+            && bytes[3] == b'i'
+            && bytes[4] == b'l'
+            && bytes[5] == b'o'
+            && bytes[6] == b't'
+        {
+            return Self::Copilot;
         }
 
         if bytes.len() >= 6
@@ -59,6 +73,7 @@ impl Provider {
         match self {
             Self::ClaudeCode => "Claude Code",
             Self::Codex => "OpenAI Codex",
+            Self::Copilot => "GitHub Copilot",
             Self::Gemini => "Gemini",
             Self::Unknown => "Unknown",
         }
@@ -69,6 +84,7 @@ impl Provider {
         match self {
             Self::ClaudeCode => "🤖",
             Self::Codex => "🧠",
+            Self::Copilot => "🐙",
             Self::Gemini => "✨",
             Self::Unknown => "❓",
         }
@@ -99,6 +115,11 @@ mod tests {
         assert_eq!(Provider::from_model_name("gpt-3.5"), Provider::Codex);
         assert_eq!(Provider::from_model_name("o1-preview"), Provider::Codex);
         assert_eq!(Provider::from_model_name("o3-mini"), Provider::Codex);
+        assert_eq!(Provider::from_model_name("copilot"), Provider::Copilot);
+        assert_eq!(
+            Provider::from_model_name("copilot-gpt-4"),
+            Provider::Copilot
+        );
         assert_eq!(Provider::from_model_name("gemini-pro"), Provider::Gemini);
         assert_eq!(
             Provider::from_model_name("gemini-2.0-flash"),
@@ -114,6 +135,7 @@ mod tests {
     fn test_provider_display() {
         assert_eq!(Provider::ClaudeCode.display_name(), "Claude Code");
         assert_eq!(Provider::Codex.display_name(), "OpenAI Codex");
+        assert_eq!(Provider::Copilot.display_name(), "GitHub Copilot");
         assert_eq!(Provider::Gemini.display_name(), "Gemini");
         assert_eq!(Provider::Unknown.display_name(), "Unknown");
     }
@@ -122,6 +144,7 @@ mod tests {
     fn test_provider_icon() {
         assert_eq!(Provider::ClaudeCode.icon(), "🤖");
         assert_eq!(Provider::Codex.icon(), "🧠");
+        assert_eq!(Provider::Copilot.icon(), "🐙");
         assert_eq!(Provider::Gemini.icon(), "✨");
         assert_eq!(Provider::Unknown.icon(), "❓");
     }

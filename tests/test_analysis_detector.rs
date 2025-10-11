@@ -147,6 +147,26 @@ fn test_detect_extension_type_optimization_sample_size() {
 }
 
 #[test]
+fn test_detect_extension_type_copilot_format() {
+    // Test Copilot CLI format detection (single session object)
+    let data = vec![json!({
+        "sessionId": "0b2a81da-02cf-4cbb-ae14-07c597b84f4e",
+        "startTime": "2025-10-11T12:54:52.206Z",
+        "timeline": [
+            {"type": "info", "text": "Connected to GitHub MCP Server"},
+            {"type": "tool_call_completed", "toolTitle": "str_replace_editor"}
+        ]
+    })];
+
+    let result = detect_extension_type(&data).unwrap();
+    assert_eq!(
+        result,
+        ExtensionType::Copilot,
+        "Should detect Copilot format with sessionId, startTime, and timeline"
+    );
+}
+
+#[test]
 fn test_detect_extension_type_gemini_format() {
     // Test Gemini format detection (single session object)
     let data = vec![json!({

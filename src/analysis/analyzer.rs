@@ -1,9 +1,10 @@
 use crate::VERSION;
 use crate::analysis::claude_analyzer::analyze_claude_conversations;
 use crate::analysis::codex_analyzer::analyze_codex_conversations;
+use crate::analysis::copilot_analyzer::analyze_copilot_conversations;
 use crate::analysis::detector::detect_extension_type;
 use crate::analysis::gemini_analyzer::analyze_gemini_conversations;
-use crate::models::{CodexLog, ExtensionType};
+use crate::models::{CodexLog, CopilotSession, ExtensionType};
 use crate::utils::{get_current_user, get_machine_id, read_json, read_jsonl};
 use anyhow::Result;
 use serde_json::Value;
@@ -39,6 +40,11 @@ fn analyze_record_set(data: Vec<Value>, ext_type: ExtensionType) -> Result<Value
                 .filter_map(|v| serde_json::from_value(v).ok())
                 .collect();
             analyze_codex_conversations(&logs)?
+        }
+        ExtensionType::Copilot => {
+            // Copilot format is a single JSON object
+            let session: CopilotSession = serde_json::from_value(data[0].clone())?;
+            analyze_copilot_conversations(session)?
         }
         ExtensionType::Gemini => analyze_gemini_conversations(data)?,
     };

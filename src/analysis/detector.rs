@@ -6,6 +6,7 @@ use serde_json::Value;
 ///
 /// Detection strategy:
 /// - Gemini: Single object with `sessionId`, `projectHash`, and `messages` fields
+/// - Copilot: Single object with `sessionId`, `startTime`, and `timeline` fields
 /// - Claude Code: Contains `parentUuid` field in log entries
 /// - Codex: Default fallback if no other markers found
 pub fn detect_extension_type(data: &[Value]) -> Result<ExtensionType> {
@@ -13,14 +14,23 @@ pub fn detect_extension_type(data: &[Value]) -> Result<ExtensionType> {
         bail!("Cannot detect extension type from empty data");
     }
 
-    // Quick check for Gemini format (single session object)
+    // Quick check for single object formats (Gemini or Copilot)
     if data.len() == 1 {
         if let Some(obj) = data[0].as_object() {
+            // Check for Gemini format
             if obj.contains_key("sessionId")
                 && obj.contains_key("projectHash")
                 && obj.contains_key("messages")
             {
                 return Ok(ExtensionType::Gemini);
+            }
+
+            // Check for Copilot CLI format
+            if obj.contains_key("sessionId")
+                && obj.contains_key("startTime")
+                && obj.contains_key("timeline")
+            {
+                return Ok(ExtensionType::Copilot);
             }
         }
     }

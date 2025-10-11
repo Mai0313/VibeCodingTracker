@@ -93,11 +93,12 @@ pub struct CodeAnalysis {
     pub records: Vec<CodeAnalysisRecord>,
 }
 
-/// AI coding assistant extension types (Claude Code, Codex, or Gemini)
+/// AI coding assistant extension types (Claude Code, Codex, Copilot, or Gemini)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtensionType {
     ClaudeCode,
     Codex,
+    Copilot,
     Gemini,
 }
 
@@ -106,6 +107,7 @@ impl std::fmt::Display for ExtensionType {
         match self {
             ExtensionType::ClaudeCode => write!(f, "Claude-Code"),
             ExtensionType::Codex => write!(f, "Codex"),
+            ExtensionType::Copilot => write!(f, "Copilot-CLI"),
             ExtensionType::Gemini => write!(f, "Gemini"),
         }
     }
