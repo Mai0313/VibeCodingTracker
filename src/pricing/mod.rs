@@ -39,7 +39,14 @@ pub fn fetch_model_pricing() -> Result<ModelPricingMap> {
 
     // Fetch from remote
     log::info!("Fetching model pricing from remote...");
-    let response = reqwest::blocking::get(LITELLM_PRICING_URL)
+    let client = reqwest::blocking::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .context("Failed to create HTTP client")?;
+
+    let response = client
+        .get(LITELLM_PRICING_URL)
+        .send()
         .context("Failed to fetch model pricing from LiteLLM")?;
 
     let pricing: HashMap<String, ModelPricing> = response

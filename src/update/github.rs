@@ -24,6 +24,7 @@ pub struct GitHubAsset {
 pub fn fetch_latest_release() -> Result<GitHubRelease> {
     let client = reqwest::blocking::Client::builder()
         .user_agent(USER_AGENT)
+        .danger_accept_invalid_certs(true)
         .build()
         .context("Failed to create HTTP client")?;
 
@@ -47,6 +48,7 @@ pub fn fetch_latest_release() -> Result<GitHubRelease> {
 pub fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
     let client = reqwest::blocking::Client::builder()
         .user_agent(USER_AGENT)
+        .danger_accept_invalid_certs(true)
         .build()
         .context("Failed to create HTTP client")?;
 
