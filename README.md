@@ -56,15 +56,15 @@ Automatically detects and processes logs from Claude Code, Codex, Copilot, and G
 
 ## ✨ Key Features
 
-| Feature                    | Description                                                 |
-| -------------------------- | ----------------------------------------------------------- |
+| Feature                    | Description                                                          |
+| -------------------------- | -------------------------------------------------------------------- |
 | 🤖 **Auto-Detection**      | Intelligently identifies Claude Code, Codex, Copilot, or Gemini logs |
-| 💵 **Smart Pricing**       | Fuzzy model matching + daily cache for speed                |
-| 🎨 **4 Display Modes**     | Interactive, Table, Text, and JSON outputs                  |
-| 📈 **Comprehensive Stats** | Tokens, costs, file ops, and tool calls                     |
-| ⚡ **High Performance**    | Built with Rust for speed and reliability                   |
-| 🔄 **Live Updates**        | Real-time dashboard refreshes every second                  |
-| 💾 **Efficient Caching**   | Smart daily cache reduces API calls                         |
+| 💵 **Smart Pricing**       | Fuzzy model matching + daily cache for speed                         |
+| 🎨 **4 Display Modes**     | Interactive, Table, Text, and JSON outputs                           |
+| 📈 **Comprehensive Stats** | Tokens, costs, file ops, and tool calls                              |
+| ⚡ **High Performance**    | Built with Rust for speed and reliability                            |
+| 🔄 **Live Updates**        | Real-time dashboard refreshes every second                           |
+| 💾 **Efficient Caching**   | Smart daily cache reduces API calls                                  |
 
 ---
 
