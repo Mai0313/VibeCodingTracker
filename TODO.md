@@ -33,7 +33,10 @@
     `writeFileDetails`: `command` 為 `create`, 裡面有 `path` 和 `file_text` 可以直接使用
 
 `usage` 的部分目前好像沒辦法知道 所以全部當做 0 就好
-模型名稱暫時寫死 `copilot`, 未來等 copilot cli 更新再去看有沒有其他方式可以處理 因為目前沒有其他方式可以取得
+模型名稱暫時寫死 `copilot`, 未來等 `copilot cli` 更新再去看有沒有其他方式可以處理 因為目前沒有其他方式可以取得
+
+以上任務已完成 但我發現好像還沒完成 TUI 的顯示, 我不確定 `--all` 指令是否有完成 可能是我剛剛忘了告訴你 `Copilot CLI` 文件會在哪出現
+`Copilot CLI` 會將文件存在 `~/.copilot/history-session-state/*.json`
 
 ## 提示自動更新
 
