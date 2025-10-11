@@ -93,9 +93,20 @@ pub fn save_to_cache(pricing: &HashMap<String, ModelPricing>) -> Result<()> {
 /// Normalizes pricing data by copying base prices to above_200k fields when they are zero
 ///
 /// This ensures all models have valid above_200k pricing, using base prices as fallback.
+/// Also filters out models where all pricing fields are 0.0 (free/unknown models).
 pub fn normalize_pricing(
     mut pricing: HashMap<String, ModelPricing>,
 ) -> HashMap<String, ModelPricing> {
+    // First, filter out models where all costs are 0.0
+    pricing.retain(|_model_name, p| {
+        // Keep model only if at least one cost field is non-zero
+        p.input_cost_per_token != 0.0
+            || p.output_cost_per_token != 0.0
+            || p.cache_read_input_token_cost != 0.0
+            || p.cache_creation_input_token_cost != 0.0
+    });
+
+    // Then normalize the remaining models
     for p in pricing.values_mut() {
         // Macro to reduce repetition: if above_200k price is 0, use base price
         macro_rules! normalize_field {

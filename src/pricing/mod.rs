@@ -46,7 +46,7 @@ pub fn fetch_model_pricing() -> Result<ModelPricingMap> {
         .json()
         .context("Failed to parse model pricing JSON")?;
 
-    // Normalize pricing: fill above_200k prices with base prices if they are 0
+    // Normalize pricing: filter out models with all 0 costs, and fill above_200k prices with base prices
     let normalized_pricing = cache::normalize_pricing(pricing);
 
     // Save to cache with today's date
@@ -102,5 +102,46 @@ mod tests {
             test_pricing.cache_creation_input_token_cost_above_200k_tokens,
             0.0000005
         );
+    }
+
+    #[test]
+    fn test_normalize_pricing_filters_zero_cost_models() {
+        let mut pricing_map = HashMap::new();
+        
+        // Add a valid model with non-zero costs
+        pricing_map.insert(
+            "valid-model".to_string(),
+            ModelPricing {
+                input_cost_per_token: 0.000001,
+                output_cost_per_token: 0.000002,
+                ..Default::default()
+            },
+        );
+        
+        // Add a model with all zero costs - should be filtered out
+        pricing_map.insert(
+            "zero-cost-model".to_string(),
+            ModelPricing::default(),
+        );
+        
+        // Add another model with all zero costs
+        pricing_map.insert(
+            "another-zero-model".to_string(),
+            ModelPricing {
+                input_cost_per_token: 0.0,
+                output_cost_per_token: 0.0,
+                cache_read_input_token_cost: 0.0,
+                cache_creation_input_token_cost: 0.0,
+                ..Default::default()
+            },
+        );
+
+        let normalized = cache::normalize_pricing(pricing_map);
+        
+        // Only the valid model should remain
+        assert_eq!(normalized.len(), 1);
+        assert!(normalized.contains_key("valid-model"));
+        assert!(!normalized.contains_key("zero-cost-model"));
+        assert!(!normalized.contains_key("another-zero-model"));
     }
 }
