@@ -430,9 +430,6 @@ src/
 # Run all tests
 cargo test --all
 
-# Run specific test file
-cargo test --test test_integration_usage
-
 # Run expected output validation tests
 cargo test --test test_analysis_expected_output
 
