@@ -1,237 +1,212 @@
-// Tests for utils::file module
+// Unit tests for utils/file.rs
+//
+// Tests file reading and line counting utilities
 
+use vibe_coding_tracker::utils::file::{count_lines, read_json, read_jsonl};
 use serde_json::json;
-use std::fs;
+use std::fs::File;
 use std::io::Write;
-use tempfile::TempDir;
-use vibe_coding_tracker::utils::file::{count_lines, read_jsonl, save_json_pretty};
+use tempfile::tempdir;
 
 #[test]
 fn test_count_lines_empty() {
-    let result = count_lines("");
-    assert_eq!(result, 0, "Empty string should have 0 lines");
+    // Test counting lines in empty string
+    assert_eq!(count_lines(""), 0);
 }
 
 #[test]
-fn test_count_lines_single() {
-    let result = count_lines("single line");
-    assert_eq!(result, 1, "Single line should count as 1");
+fn test_count_lines_single_line_no_newline() {
+    // Test single line without trailing newline
+    assert_eq!(count_lines("hello"), 1);
 }
 
 #[test]
-fn test_count_lines_multiple() {
-    let text = "line 1\nline 2\nline 3";
-    let result = count_lines(text);
-    assert_eq!(result, 3, "Should count 3 lines");
+fn test_count_lines_single_line_with_newline() {
+    // Test single line with trailing newline
+    assert_eq!(count_lines("hello\n"), 1);
 }
 
 #[test]
-fn test_count_lines_with_trailing_newline() {
-    let text = "line 1\nline 2\n";
-    let result = count_lines(text);
-    assert_eq!(
-        result, 2,
-        "Should count lines correctly with trailing newline"
-    );
+fn test_count_lines_multiple_lines() {
+    // Test multiple lines without trailing newline
+    assert_eq!(count_lines("line1\nline2\nline3"), 3);
 }
 
 #[test]
-fn test_read_jsonl_valid_file() {
-    let temp_dir = TempDir::new().unwrap();
-    let file_path = temp_dir.path().join("test.jsonl");
+fn test_count_lines_multiple_lines_with_newline() {
+    // Test multiple lines with trailing newline
+    assert_eq!(count_lines("line1\nline2\nline3\n"), 3);
+}
 
-    // Create a test JSONL file
-    let mut file = fs::File::create(&file_path).unwrap();
-    writeln!(file, r#"{{"name":"test1","value":1}}"#).unwrap();
-    writeln!(file, r#"{{"name":"test2","value":2}}"#).unwrap();
+#[test]
+fn test_count_lines_empty_lines() {
+    // Test with empty lines in between
+    assert_eq!(count_lines("line1\n\nline3"), 3);
+    assert_eq!(count_lines("\n\n\n"), 3);
+}
 
-    let result = read_jsonl(&file_path);
-    assert!(result.is_ok(), "Should successfully read JSONL file");
-
-    let data = result.unwrap();
-    assert_eq!(data.len(), 2, "Should read 2 JSON objects");
-    assert_eq!(data[0]["name"], "test1");
-    assert_eq!(data[1]["value"], 2);
+#[test]
+fn test_read_jsonl_valid() {
+    // Test reading valid JSONL file
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("test.jsonl");
+    
+    let mut file = File::create(&file_path).unwrap();
+    writeln!(file, r#"{{"key1": "value1"}}"#).unwrap();
+    writeln!(file, r#"{{"key2": "value2"}}"#).unwrap();
+    writeln!(file, r#"{{"key3": "value3"}}"#).unwrap();
+    
+    let result = read_jsonl(&file_path).unwrap();
+    assert_eq!(result.len(), 3);
+    assert_eq!(result[0]["key1"], "value1");
+    assert_eq!(result[1]["key2"], "value2");
+    assert_eq!(result[2]["key3"], "value3");
 }
 
 #[test]
 fn test_read_jsonl_with_empty_lines() {
-    let temp_dir = TempDir::new().unwrap();
-    let file_path = temp_dir.path().join("test.jsonl");
-
-    // Create a test JSONL file with empty lines
-    let mut file = fs::File::create(&file_path).unwrap();
-    writeln!(file, r#"{{"name":"test1"}}"#).unwrap();
-    writeln!(file).unwrap(); // Empty line
-    writeln!(file, r#"{{"name":"test2"}}"#).unwrap();
-
-    let result = read_jsonl(&file_path);
-    assert!(result.is_ok(), "Should skip empty lines");
-
-    let data = result.unwrap();
-    assert_eq!(data.len(), 2, "Should read 2 non-empty JSON objects");
+    // Test reading JSONL with empty lines (should skip them)
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("test.jsonl");
+    
+    let mut file = File::create(&file_path).unwrap();
+    writeln!(file, r#"{{"key1": "value1"}}"#).unwrap();
+    writeln!(file, "").unwrap();
+    writeln!(file, r#"{{"key2": "value2"}}"#).unwrap();
+    writeln!(file, "   ").unwrap();
+    writeln!(file, r#"{{"key3": "value3"}}"#).unwrap();
+    
+    let result = read_jsonl(&file_path).unwrap();
+    assert_eq!(result.len(), 3);
 }
 
 #[test]
-fn test_read_jsonl_nonexistent_file() {
-    let result = read_jsonl("/nonexistent/file.jsonl");
-    assert!(result.is_err(), "Should fail for nonexistent file");
+fn test_read_jsonl_empty_file() {
+    // Test reading empty JSONL file
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("empty.jsonl");
+    
+    File::create(&file_path).unwrap();
+    
+    let result = read_jsonl(&file_path).unwrap();
+    assert_eq!(result.len(), 0);
 }
 
 #[test]
 fn test_read_jsonl_invalid_json() {
-    let temp_dir = TempDir::new().unwrap();
-    let file_path = temp_dir.path().join("test.jsonl");
-
-    // Create a file with invalid JSON
-    let mut file = fs::File::create(&file_path).unwrap();
-    writeln!(file, r#"{{"name":"test1"}}"#).unwrap();
+    // Test reading JSONL with invalid JSON
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("invalid.jsonl");
+    
+    let mut file = File::create(&file_path).unwrap();
     writeln!(file, "not valid json").unwrap();
-
+    
     let result = read_jsonl(&file_path);
-    assert!(result.is_err(), "Should fail for invalid JSON");
+    assert!(result.is_err());
 }
 
 #[test]
-fn test_save_json_pretty() {
-    let temp_dir = TempDir::new().unwrap();
-    let file_path = temp_dir.path().join("output.json");
+fn test_read_jsonl_nonexistent_file() {
+    // Test reading non-existent file
+    let result = read_jsonl("/nonexistent/path/file.jsonl");
+    assert!(result.is_err());
+}
 
-    let test_data = json!({
-        "name": "test",
-        "value": 123,
+#[test]
+fn test_read_json_valid() {
+    // Test reading valid JSON file
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("test.json");
+    
+    let mut file = File::create(&file_path).unwrap();
+    write!(file, r#"{{"key": "value", "number": 42}}"#).unwrap();
+    
+    let result = read_json(&file_path).unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0]["key"], "value");
+    assert_eq!(result[0]["number"], 42);
+}
+
+#[test]
+fn test_read_json_array() {
+    // Test reading JSON array (wrapped in single-element vector)
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("array.json");
+    
+    let mut file = File::create(&file_path).unwrap();
+    write!(file, r#"[1, 2, 3, 4, 5]"#).unwrap();
+    
+    let result = read_json(&file_path).unwrap();
+    assert_eq!(result.len(), 1);
+    assert!(result[0].is_array());
+    assert_eq!(result[0].as_array().unwrap().len(), 5);
+}
+
+#[test]
+fn test_read_json_invalid() {
+    // Test reading invalid JSON
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("invalid.json");
+    
+    let mut file = File::create(&file_path).unwrap();
+    write!(file, "not valid json").unwrap();
+    
+    let result = read_json(&file_path);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_read_json_nonexistent_file() {
+    // Test reading non-existent file
+    let result = read_json("/nonexistent/path/file.json");
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_count_lines_unicode() {
+    // Test counting lines with unicode characters
+    assert_eq!(count_lines("こんにちは"), 1);
+    assert_eq!(count_lines("line1 😀\nline2 🎉\nline3 🚀"), 3);
+}
+
+#[test]
+fn test_count_lines_windows_line_endings() {
+    // Test with Windows-style line endings (\r\n)
+    // Note: count_lines counts \n, so \r\n will work correctly
+    assert_eq!(count_lines("line1\r\nline2\r\nline3"), 3);
+}
+
+#[test]
+fn test_read_jsonl_large_objects() {
+    // Test reading JSONL with larger objects
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("large.jsonl");
+    
+    let mut file = File::create(&file_path).unwrap();
+    let large_obj = json!({
+        "field1": "value1",
+        "field2": "value2",
         "nested": {
-            "key": "value"
+            "a": 1,
+            "b": 2,
+            "c": [1, 2, 3, 4, 5]
         }
     });
-
-    let result = save_json_pretty(&file_path, &test_data);
-    assert!(result.is_ok(), "Should successfully save JSON");
-
-    // Verify file was created and contains valid JSON
-    let content = fs::read_to_string(&file_path).unwrap();
-    assert!(content.contains("\"name\""));
-    assert!(content.contains("\"test\""));
-
-    // Verify it's pretty-printed (contains newlines)
-    assert!(content.contains('\n'));
+    writeln!(file, "{}", serde_json::to_string(&large_obj).unwrap()).unwrap();
+    
+    let result = read_jsonl(&file_path).unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0]["field1"], "value1");
+    assert_eq!(result[0]["nested"]["c"].as_array().unwrap().len(), 5);
 }
 
 #[test]
-fn test_save_json_pretty_overwrites() {
-    let temp_dir = TempDir::new().unwrap();
-    let file_path = temp_dir.path().join("output.json");
-
-    // Write first time
-    let data1 = json!({"version": 1});
-    save_json_pretty(&file_path, &data1).unwrap();
-
-    // Write second time (should overwrite)
-    let data2 = json!({"version": 2});
-    save_json_pretty(&file_path, &data2).unwrap();
-
-    // Verify only second data remains
-    let content = fs::read_to_string(&file_path).unwrap();
-    assert!(content.contains("\"version\""));
-    assert!(content.contains("2"));
-    assert!(!content.contains("1"));
-}
-
-#[test]
-fn test_save_json_pretty_invalid_path() {
-    let invalid_path = "/nonexistent_directory/subdir/output.json";
-    let data = json!({"test": "data"});
-
-    let result = save_json_pretty(invalid_path, &data);
-    assert!(result.is_err(), "Should fail for invalid path");
-}
-
-#[test]
-fn test_read_jsonl_large_file() {
-    let temp_dir = TempDir::new().unwrap();
-    let file_path = temp_dir.path().join("large.jsonl");
-
-    // Create a larger JSONL file
-    let mut file = fs::File::create(&file_path).unwrap();
-    for i in 0..100 {
-        writeln!(
-            file,
-            r#"{{"id":{}, "name":"item{}", "value":{}}}"#,
-            i,
-            i,
-            i * 10
-        )
-        .unwrap();
-    }
-
-    let result = read_jsonl(&file_path);
-    assert!(result.is_ok(), "Should successfully read large JSONL file");
-
-    let data = result.unwrap();
-    assert_eq!(data.len(), 100, "Should read all 100 lines");
-    assert_eq!(data[0]["id"], 0);
-    assert_eq!(data[99]["id"], 99);
-}
-
-#[test]
-fn test_count_lines_windows_newlines() {
-    let text = "line 1\r\nline 2\r\nline 3";
-    let result = count_lines(text);
-    assert_eq!(result, 3, "Should handle Windows-style newlines");
-}
-
-#[test]
-fn test_count_lines_mixed_newlines() {
-    let text = "line 1\nline 2\r\nline 3\rline 4";
-    let result = count_lines(text);
-    assert!(result > 0, "Should handle mixed newline styles");
-}
-
-#[test]
-fn test_read_jsonl_whitespace_only_lines() {
-    let temp_dir = TempDir::new().unwrap();
-    let file_path = temp_dir.path().join("test.jsonl");
-
-    // Create a file with whitespace-only lines
-    let mut file = fs::File::create(&file_path).unwrap();
-    writeln!(file, r#"{{"name":"test1"}}"#).unwrap();
-    writeln!(file, "   ").unwrap(); // Whitespace line
-    writeln!(file, "\t").unwrap(); // Tab line
-    writeln!(file, r#"{{"name":"test2"}}"#).unwrap();
-
-    let result = read_jsonl(&file_path);
-    assert!(result.is_ok(), "Should skip whitespace-only lines");
-
-    let data = result.unwrap();
-    assert_eq!(data.len(), 2, "Should read only valid JSON lines");
-}
-
-#[test]
-fn test_save_json_pretty_array() {
-    let temp_dir = TempDir::new().unwrap();
-    let file_path = temp_dir.path().join("array.json");
-
-    let test_data = json!([
-        {"id": 1, "name": "item1"},
-        {"id": 2, "name": "item2"},
-        {"id": 3, "name": "item3"}
-    ]);
-
-    let result = save_json_pretty(&file_path, &test_data);
-    assert!(result.is_ok(), "Should successfully save JSON array");
-
-    let content = fs::read_to_string(&file_path).unwrap();
-    assert!(content.contains("\"id\""));
-    assert!(content.contains("\"name\""));
-    assert!(content.contains("item1"));
-}
-
-#[test]
-fn test_save_json_pretty_nested_structure() {
-    let temp_dir = TempDir::new().unwrap();
-    let file_path = temp_dir.path().join("nested.json");
-
-    let test_data = json!({
+fn test_read_json_nested_structure() {
+    // Test reading JSON with deeply nested structure
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("nested.json");
+    
+    let nested = json!({
         "level1": {
             "level2": {
                 "level3": {
@@ -240,31 +215,27 @@ fn test_save_json_pretty_nested_structure() {
             }
         }
     });
-
-    let result = save_json_pretty(&file_path, &test_data);
-    assert!(result.is_ok(), "Should handle nested structures");
-
-    let content = fs::read_to_string(&file_path).unwrap();
-    assert!(content.contains("level1"));
-    assert!(content.contains("level2"));
-    assert!(content.contains("level3"));
-    assert!(content.contains("deep"));
+    
+    let mut file = File::create(&file_path).unwrap();
+    write!(file, "{}", serde_json::to_string(&nested).unwrap()).unwrap();
+    
+    let result = read_json(&file_path).unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0]["level1"]["level2"]["level3"]["value"], "deep");
 }
 
 #[test]
-fn test_read_jsonl_unicode() {
-    let temp_dir = TempDir::new().unwrap();
-    let file_path = temp_dir.path().join("unicode.jsonl");
-
-    let mut file = fs::File::create(&file_path).unwrap();
-    writeln!(file, r#"{{"text":"Hello 世界 🌍"}}"#).unwrap();
-    writeln!(file, r#"{{"emoji":"😀🎉"}}"#).unwrap();
-
-    let result = read_jsonl(&file_path);
-    assert!(result.is_ok(), "Should handle Unicode characters");
-
-    let data = result.unwrap();
-    assert_eq!(data.len(), 2);
-    assert_eq!(data[0]["text"], "Hello 世界 🌍");
-    assert_eq!(data[1]["emoji"], "😀🎉");
+fn test_count_lines_only_newlines() {
+    // Test string with only newlines
+    assert_eq!(count_lines("\n"), 1);
+    assert_eq!(count_lines("\n\n"), 2);
+    assert_eq!(count_lines("\n\n\n"), 3);
 }
+
+#[test]
+fn test_count_lines_mixed_content() {
+    // Test mixed content with spaces and newlines
+    assert_eq!(count_lines("a\n  \nc"), 3);
+    assert_eq!(count_lines("  hello  \n  world  "), 2);
+}
+
