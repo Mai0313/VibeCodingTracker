@@ -124,4 +124,3 @@ fn test_extract_semver_version_patch_zero() {
     assert_eq!(extract_semver_version("1.5.0"), "1.5.0");
     assert_eq!(extract_semver_version("2.0.0-rc1"), "2.0.0");
 }
-

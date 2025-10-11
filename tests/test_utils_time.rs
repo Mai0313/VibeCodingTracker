@@ -10,7 +10,7 @@ fn test_parse_iso_timestamp_rfc3339() {
     let ts = "2024-01-15T10:30:45.123Z";
     let result = parse_iso_timestamp(ts);
     assert!(result > 0);
-    
+
     // Should parse to a valid timestamp (2024)
     assert!(result > 1_700_000_000_000); // After 2023
     assert!(result < 1_800_000_000_000); // Before 2027
@@ -38,12 +38,12 @@ fn test_parse_iso_timestamp_fallback_formats() {
     let ts1 = "2024-01-15T10:30:45.123Z";
     let result1 = parse_iso_timestamp(ts1);
     assert!(result1 > 0);
-    
+
     // Test fallback format with fractional seconds
     let ts2 = "2024-01-15T10:30:45.123456Z";
     let result2 = parse_iso_timestamp(ts2);
     assert!(result2 > 0);
-    
+
     // Test fallback format without fractional seconds
     let ts3 = "2024-01-15T10:30:45Z";
     let result3 = parse_iso_timestamp(ts3);
@@ -62,10 +62,10 @@ fn test_parse_iso_timestamp_invalid() {
     // Test parsing invalid format
     let result = parse_iso_timestamp("not a timestamp");
     assert_eq!(result, 0);
-    
+
     let result = parse_iso_timestamp("2024-13-45");
     assert_eq!(result, 0);
-    
+
     let result = parse_iso_timestamp("invalid-date-time");
     assert_eq!(result, 0);
 }
@@ -75,10 +75,10 @@ fn test_parse_iso_timestamp_different_years() {
     // Test different years to ensure parsing is consistent
     let ts_2020 = "2020-06-15T12:00:00Z";
     let ts_2024 = "2024-06-15T12:00:00Z";
-    
+
     let result_2020 = parse_iso_timestamp(ts_2020);
     let result_2024 = parse_iso_timestamp(ts_2024);
-    
+
     assert!(result_2020 > 0);
     assert!(result_2024 > 0);
     assert!(result_2024 > result_2020);
@@ -89,10 +89,10 @@ fn test_parse_iso_timestamp_milliseconds_precision() {
     // Test that milliseconds are preserved
     let ts1 = "2024-01-15T10:30:45.000Z";
     let ts2 = "2024-01-15T10:30:45.999Z";
-    
+
     let result1 = parse_iso_timestamp(ts1);
     let result2 = parse_iso_timestamp(ts2);
-    
+
     assert!(result1 > 0);
     assert!(result2 > 0);
     // Should be ~999ms apart
@@ -106,25 +106,25 @@ fn test_parse_iso_timestamp_same_time() {
     let ts = "2024-01-15T10:30:45.123Z";
     let result1 = parse_iso_timestamp(ts);
     let result2 = parse_iso_timestamp(ts);
-    
+
     assert_eq!(result1, result2);
 }
 
 #[test]
 fn test_parse_iso_timestamp_edge_cases() {
     // Test edge cases
-    
+
     // Beginning of year
     let ts1 = "2024-01-01T00:00:00Z";
     let result1 = parse_iso_timestamp(ts1);
     assert!(result1 > 0);
-    
+
     // End of year
     let ts2 = "2024-12-31T23:59:59Z";
     let result2 = parse_iso_timestamp(ts2);
     assert!(result2 > 0);
     assert!(result2 > result1);
-    
+
     // Leap year day
     let ts3 = "2024-02-29T12:00:00Z";
     let result3 = parse_iso_timestamp(ts3);
@@ -167,7 +167,7 @@ fn test_parse_iso_timestamp_partial() {
     // Test partial timestamps (invalid)
     let result = parse_iso_timestamp("2024-01-15");
     assert_eq!(result, 0);
-    
+
     let result = parse_iso_timestamp("2024-01-15T10:30");
     assert_eq!(result, 0);
 }
@@ -181,18 +181,17 @@ fn test_parse_iso_timestamp_ordering() {
         "2024-01-15T12:00:00Z",
         "2024-01-15T13:00:00Z",
     ];
-    
+
     let results: Vec<i64> = timestamps
         .iter()
         .map(|ts| parse_iso_timestamp(ts))
         .collect();
-    
+
     // All should be non-zero
     assert!(results.iter().all(|&r| r > 0));
-    
+
     // Should be in ascending order
     for i in 1..results.len() {
         assert!(results[i] > results[i - 1]);
     }
 }
-
