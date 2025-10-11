@@ -9,6 +9,30 @@
 我希望你把 LRU cache, 和所有緩存相關的全部刪除
 現代電腦做這些計算其實根本不消耗什麼資源, 可以把 `usage` / `analysis` 改成每十秒掃一次
 
+## 新增 `copilot cli` 支援
+
+這裡是 `copilot cli` 的範例 log 文件 `examples/test_conversation_copilot.json`
+請注意 他是 `json` 格式, 我希望他可以支援 `analysis` 和 `usage` 的功能
+你主要需要新增的是一個 `parser`, 後續 `analysis` 和 `usage` 功能都會掉用相同的 `funcion` 來執行
+你需要注意的地方可以從 `timeline` 這個 `key` 開始 (`chatMessages` 可以直接忽略), 裡面是整個 `conversation` 的細節流程 (`list[dict]`)
+然後依照 `toolTitle` 和 `arguments` 的值去分類出類似於 `examples/analysis_result.json` 的資訊
+模型名稱似乎只能從 `~/.copilot/config.json` 的 `model` 取得, 但這方法不太好 先暫時寫死 `copilot` 就好 以後再處理
+
+- `toolTitle` 分為以下幾種:
+    - str_replace_editor
+        - 可能是 `readFileDetails`, `editFileDetails`, 或 `writeFileDetails` 請查看後續分類方式
+    - bash
+        - 只會是 `runCommandDetails`
+
+- `readFileDetails`: `arguments` 的 `command` 為 `view`, `path` 就會是讀取的檔案, `view_range` 可能會沒有
+    - 假設有 `view_range` 他會是由開始的 line 到 結束的 line 來記錄
+    - 假設沒有 `view_range` 表示他是讀取整份文件
+`editFileDetails`: `arguments` 裡面有 `command` 為 `str_replace` 的資訊 裡面也有提供 `path` `old_str` `new_str` 可以直接使用
+`runCommandDetails`: `toolTitle` 為 `bash` 就是我們要記錄的 runCommand 了, 這邊的 command 內容就不用再細分了
+`writeFileDetails`: `command` 為 `create`, 裡面有 `path` 和 `file_text` 可以直接使用
+
+`usage` 的部分目前好像沒辦法知道 所以全部當做 0 就好
+
 ## 提示自動更新
 
 請幫我把提示更新的功能完整刪除 當作這功能從來沒出現過
