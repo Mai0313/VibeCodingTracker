@@ -107,7 +107,7 @@ mod tests {
     #[test]
     fn test_normalize_pricing_filters_zero_cost_models() {
         let mut pricing_map = HashMap::new();
-        
+
         // Add a valid model with non-zero costs
         pricing_map.insert(
             "valid-model".to_string(),
@@ -117,13 +117,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        
+
         // Add a model with all zero costs - should be filtered out
-        pricing_map.insert(
-            "zero-cost-model".to_string(),
-            ModelPricing::default(),
-        );
-        
+        pricing_map.insert("zero-cost-model".to_string(), ModelPricing::default());
+
         // Add another model with all zero costs
         pricing_map.insert(
             "another-zero-model".to_string(),
@@ -137,7 +134,7 @@ mod tests {
         );
 
         let normalized = cache::normalize_pricing(pricing_map);
-        
+
         // Only the valid model should remain
         assert_eq!(normalized.len(), 1);
         assert!(normalized.contains_key("valid-model"));
