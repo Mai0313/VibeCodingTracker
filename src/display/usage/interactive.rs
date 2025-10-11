@@ -20,14 +20,14 @@ use std::collections::HashMap;
 use std::time::Duration;
 use sysinfo::System;
 
-const USAGE_REFRESH_SECS: u64 = 5;
+const USAGE_REFRESH_SECS: u64 = 10;
 const PRICING_REFRESH_SECS: u64 = 300;
 const MAX_TRACKED_ROWS: usize = 100;
 
 /// Displays token usage data in an interactive TUI with auto-refresh
 ///
 /// Features:
-/// - Auto-refresh every 5 seconds (usage data) and 5 minutes (pricing)
+/// - Auto-refresh every 10 seconds (usage data) and 5 minutes (pricing)
 /// - Real-time memory monitoring
 /// - Provider-grouped daily averages
 /// - Keyboard controls: `q`, `Esc`, or `Ctrl+C` to exit
@@ -106,6 +106,14 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
         }
 
         let summary = build_usage_summary(&usage_data, &pricing_map);
+
+        // Clear raw usage data after processing to free memory
+        // TUI only needs the aggregated summary
+        usage_data.clear();
+
+        // Clear file cache and pricing cache to release memory
+        crate::cache::clear_global_cache();
+        crate::pricing::clear_pricing_cache();
         let rows_data = &summary.rows;
         let totals = &summary.totals;
         let daily_averages = &summary.daily_averages;

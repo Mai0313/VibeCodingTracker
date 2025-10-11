@@ -71,6 +71,10 @@ pub fn display_analysis_interactive(data: &[AggregatedAnalysisRow]) -> anyhow::R
         let mut totals = AnalysisRow::default();
         let rows_data = convert_to_analysis_rows(&current_data);
 
+        // Clear file cache after processing to release memory
+        // TUI only needs the aggregated analysis data
+        crate::cache::clear_global_cache();
+
         let today = get_current_date();
 
         // Track updates
