@@ -39,7 +39,6 @@ pub fn display_analysis_interactive(data: &[AggregatedAnalysisRow]) -> anyhow::R
 
     // Track updates
     let mut update_tracker = UpdateTracker::new(MAX_TRACKED_ANALYSIS_ROWS, 1000);
-    let mut current_data = data.to_vec();
 
     loop {
         if !refresh_state.should_refresh() {
@@ -57,19 +56,21 @@ pub fn display_analysis_interactive(data: &[AggregatedAnalysisRow]) -> anyhow::R
         sys.refresh_processes(sysinfo::ProcessesToUpdate::All, false);
         sys.refresh_cpu_all();
 
-        // Fetch fresh data with error logging
-        match crate::analysis::analyze_all_sessions() {
-            Ok(data) => {
-                current_data = data;
-            }
+        // Fetch fresh data with error logging - create new Vec each iteration to minimize memory
+        let current_data = match crate::analysis::analyze_all_sessions() {
+            Ok(data) => data,
             Err(e) => {
                 log::warn!("Failed to analyze sessions: {}", e);
+                Vec::new() // Empty vec on error
             }
-        }
+        };
 
-        // Calculate totals
+        // Calculate totals and extract display data
         let mut totals = AnalysisRow::default();
         let rows_data = convert_to_analysis_rows(&current_data);
+
+        // Drop current_data immediately after conversion to free memory
+        drop(current_data);
 
         // Clear file cache after processing to release memory
         // TUI only needs the aggregated analysis data
@@ -325,6 +326,11 @@ pub fn display_analysis_interactive(data: &[AggregatedAnalysisRow]) -> anyhow::R
             let star_hint = create_star_hint();
             f.render_widget(star_hint, chunks[5]);
         })?;
+
+        // Drop heavy data structures after rendering to free memory immediately
+        drop(rows_data);
+        drop(provider_rows);
+        // daily_averages and totals don't implement Drop, they will be freed automatically
 
         // Handle input with timeout
         match handle_input()? {

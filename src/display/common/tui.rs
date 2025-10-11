@@ -153,6 +153,10 @@ impl UpdateTracker {
                 self.last_update_times.remove(&key);
             }
         }
+
+        // Release excess capacity to reduce memory footprint
+        self.previous_hashes.shrink_to_fit();
+        self.last_update_times.shrink_to_fit();
     }
 
     /// Check if a key was recently updated

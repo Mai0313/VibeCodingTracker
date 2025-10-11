@@ -39,16 +39,14 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
     let pid =
         sysinfo::get_current_pid().expect("Failed to get current process ID for memory monitoring");
 
-    let mut pricing_map = match fetch_model_pricing() {
-        Ok(map) => map,
-        Err(e) => {
-            log::warn!("Failed to fetch pricing: {}", e);
-            ModelPricingMap::new(HashMap::new())
-        }
-    };
-    // Note: Removed pricing_lookup_cache - ModelPricingMap uses global MATCH_CACHE internally
     let mut last_pricing_refresh = std::time::Instant::now();
-    if pricing_map.raw().is_empty() {
+    let mut pricing_map_is_empty = false;
+
+    // Check if we need to fetch pricing immediately
+    let initial_pricing_result = fetch_model_pricing();
+    if let Err(e) = &initial_pricing_result {
+        log::warn!("Failed to fetch initial pricing: {}", e);
+        pricing_map_is_empty = true;
         last_pricing_refresh =
             std::time::Instant::now() - Duration::from_secs(PRICING_REFRESH_SECS);
     }
@@ -73,18 +71,20 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
         sys.refresh_processes(sysinfo::ProcessesToUpdate::All, false);
         sys.refresh_cpu_all();
 
-        if last_pricing_refresh.elapsed() >= Duration::from_secs(PRICING_REFRESH_SECS)
-            || pricing_map.raw().is_empty()
-        {
+        // Check if we need to refresh pricing data
+        let should_refresh_pricing = last_pricing_refresh.elapsed()
+            >= Duration::from_secs(PRICING_REFRESH_SECS)
+            || pricing_map_is_empty;
+
+        if should_refresh_pricing {
             match fetch_model_pricing() {
-                Ok(map) => {
-                    pricing_map = map;
-                    // No need to clear local cache - we're using global MATCH_CACHE
+                Ok(_) => {
+                    pricing_map_is_empty = false;
                     last_pricing_refresh = std::time::Instant::now();
                 }
                 Err(e) => {
                     log::warn!("Failed to fetch pricing: {}", e);
-                    if pricing_map.raw().is_empty() {
+                    if pricing_map_is_empty {
                         last_pricing_refresh =
                             std::time::Instant::now() - Duration::from_secs(PRICING_REFRESH_SECS);
                     }
@@ -105,7 +105,25 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
             }
         }
 
+        // Fetch pricing map on-demand for this refresh cycle only
+        let pricing_map = match fetch_model_pricing() {
+            Ok(map) => map,
+            Err(e) => {
+                log::warn!("Failed to fetch pricing for calculation: {}", e);
+                ModelPricingMap::new(HashMap::new())
+            }
+        };
+
         let summary = build_usage_summary(&usage_data, &pricing_map);
+
+        // Drop pricing_map immediately after use to free memory (it can be 100+ MB)
+        drop(pricing_map);
+
+        // Extract only the data needed for rendering to minimize memory usage
+        let rows_data = summary.rows;
+        let totals = summary.totals;
+        let daily_averages = summary.daily_averages;
+        // summary is automatically dropped here after extracting all fields
 
         // Clear raw usage data after processing to free memory
         // TUI only needs the aggregated summary
@@ -114,10 +132,8 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
         // Clear file cache and pricing cache to release memory
         crate::cache::clear_global_cache();
         crate::pricing::clear_pricing_cache();
-        let rows_data = &summary.rows;
-        let totals = &summary.totals;
-        let daily_averages = &summary.daily_averages;
-        let provider_rows = build_provider_average_rows(daily_averages);
+
+        let provider_rows = build_provider_average_rows(&daily_averages);
 
         // Track updates
         let current_row_keys: Vec<String> = rows_data
@@ -127,7 +143,7 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
 
         update_tracker.cleanup(current_row_keys.clone());
 
-        for row in rows_data {
+        for row in &rows_data {
             let row_key = format!("{}:{}", row.date, row.model);
             let current_data = (
                 row.input_tokens,
@@ -297,6 +313,11 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
             let star_hint = create_star_hint();
             f.render_widget(star_hint, chunks[5]);
         })?;
+
+        // Drop heavy data structures after rendering to free memory immediately
+        drop(rows_data);
+        drop(provider_rows);
+        // daily_averages doesn't implement Drop, it will be freed automatically
 
         match handle_input()? {
             InputAction::Quit => break,

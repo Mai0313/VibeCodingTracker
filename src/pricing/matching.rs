@@ -10,7 +10,7 @@ use strsim::jaro_winkler;
 const SIMILARITY_THRESHOLD: f64 = 0.7;
 
 // Maximum number of cached pricing lookups (prevents unbounded memory growth)
-const PRICING_MATCH_CACHE_SIZE: usize = 50;
+const PRICING_MATCH_CACHE_SIZE: usize = 20;
 
 // Global LRU cache for pricing match results (thread-safe, bounded capacity)
 // This dramatically improves performance for repeated model lookups while
