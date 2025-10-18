@@ -125,7 +125,8 @@ impl FileParseCache {
         if let Ok(cache) = self.cache.write() {
             CacheStats {
                 entry_count: cache.len(),
-                estimated_memory_kb: cache.len() * 50, // Rough estimate: ~50KB per entry
+                // Rough estimate: ~200KB per entry (more realistic for parsed JSON with details)
+                estimated_memory_kb: cache.len() * 200,
             }
         } else {
             CacheStats::default()

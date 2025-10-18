@@ -125,11 +125,13 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
         let daily_averages = summary.daily_averages;
         // summary is automatically dropped here after extracting all fields
 
-        // Clear raw usage data after processing to free memory
+        // Clear raw usage data immediately after processing to free memory
         // TUI only needs the aggregated summary
+        // clear() releases all elements; BTreeMap will be recreated fresh next iteration
         usage_data.clear();
 
         // Clear file cache and pricing cache to release memory
+        // This is crucial to prevent memory accumulation across TUI refresh cycles
         crate::cache::clear_global_cache();
         crate::pricing::clear_pricing_cache();
 
@@ -317,7 +319,12 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
         // Drop heavy data structures after rendering to free memory immediately
         drop(rows_data);
         drop(provider_rows);
-        // daily_averages doesn't implement Drop, it will be freed automatically
+        // daily_averages and totals don't implement Drop, so they'll be dropped automatically
+
+        // Force release of any remaining references by clearing caches again
+        // This ensures minimal memory retention between refresh cycles
+        crate::cache::clear_global_cache();
+        crate::pricing::clear_pricing_cache();
 
         match handle_input()? {
             InputAction::Quit => break,

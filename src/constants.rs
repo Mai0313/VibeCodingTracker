@@ -15,7 +15,8 @@ pub mod capacity {
     pub const SESSION_FILES: usize = 50;
 
     /// Maximum number of parsed files to cache in LRU cache
-    pub const FILE_CACHE_SIZE: usize = 15;
+    /// Reduced from 15 to 5 to minimize memory usage in TUI mode
+    pub const FILE_CACHE_SIZE: usize = 5;
 
     /// Expected number of token fields per usage entry
     pub const TOKEN_FIELDS: usize = 8;

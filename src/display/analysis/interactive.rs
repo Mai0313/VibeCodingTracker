@@ -66,14 +66,17 @@ pub fn display_analysis_interactive(data: &[AggregatedAnalysisRow]) -> anyhow::R
         };
 
         // Calculate totals and extract display data
+        // Only keep minimal fields needed for TUI display
         let mut totals = AnalysisRow::default();
         let rows_data = convert_to_analysis_rows(&current_data);
 
         // Drop current_data immediately after conversion to free memory
+        // This releases all detailed file operation data (write_file_details, etc.)
         drop(current_data);
 
         // Clear file cache after processing to release memory
-        // TUI only needs the aggregated analysis data
+        // TUI only needs the aggregated analysis data (totals and line counts)
+        // All detailed records can be discarded
         crate::cache::clear_global_cache();
 
         let today = get_current_date();
@@ -330,7 +333,11 @@ pub fn display_analysis_interactive(data: &[AggregatedAnalysisRow]) -> anyhow::R
         // Drop heavy data structures after rendering to free memory immediately
         drop(rows_data);
         drop(provider_rows);
-        // daily_averages and totals don't implement Drop, they will be freed automatically
+        // daily_averages and totals don't implement Drop, so they'll be dropped automatically
+
+        // Force release of any remaining references by clearing caches again
+        // This ensures minimal memory retention between refresh cycles
+        crate::cache::clear_global_cache();
 
         // Handle input with timeout
         match handle_input()? {
