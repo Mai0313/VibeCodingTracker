@@ -160,15 +160,15 @@ vct usage
 ### 🔍 快速參考
 
 ```bash
-vct <命令> [選項]
+vct <命令 >[選項]
 # 若未設定別名，請改用 `vibe_coding_tracker`完整二進位名稱
 
 命令：
-analysis    分析對話檔案並匯出資料（支援單檔案或所有會話）
-usage       顯示 token 使用量統計
-version     顯示版本資訊
-update      從 GitHub releases 更新到最新版本
-help        顯示此訊息或給定子命令的說明
+analysis 分析對話檔案並匯出資料（支援單檔案或所有會話）
+usage 顯示 token 使用量統計
+version 顯示版本資訊
+update 從 GitHub releases 更新到最新版本
+help 顯示此訊息或給定子命令的說明
 ```
 
 ---
@@ -285,9 +285,9 @@ docker build -f docker/Dockerfile --target prod -t vibe_coding_tracker:latest .
 
 # 使用您的會話執行
 docker run --rm \
-    -v ~/.claude:/root/.claude \
-    -v ~/.codex:/root/.codex \
-    -v ~/.copilot:/root/.copilot \
-    -v ~/.gemini:/root/.gemini \
-    vibe_coding_tracker:latest usage
+	-v ~/.claude:/root/.claude \
+	-v ~/.codex:/root/.codex \
+	-v ~/.copilot:/root/.copilot \
+	-v ~/.gemini:/root/.gemini \
+	vibe_coding_tracker:latest usage
 ```

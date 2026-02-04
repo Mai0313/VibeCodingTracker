@@ -101,7 +101,8 @@ ln -sf "$(pwd)/target/release/vibe_coding_tracker" ~/.local/bin/vct
 
 **Prerequisites**: [Rust toolchain](https://rustup.rs/) 1.85 or higher
 
-> **Note**: This project uses **Rust 2024 edition** and requires Rust 1.85+. Update your toolchain with `rustup update` if needed.
+> [!NOTE]
+> This project uses **Rust 2024 edition** and requires Rust 1.85+. Update your toolchain with `rustup update` if needed.
 
 #### Method 2: Install from crates.io
 
@@ -285,9 +286,9 @@ docker build -f docker/Dockerfile --target prod -t vibe_coding_tracker:latest .
 
 # Run with your sessions
 docker run --rm \
-    -v ~/.claude:/root/.claude \
-    -v ~/.codex:/root/.codex \
-    -v ~/.copilot:/root/.copilot \
-    -v ~/.gemini:/root/.gemini \
-    vibe_coding_tracker:latest usage
+	-v ~/.claude:/root/.claude \
+	-v ~/.codex:/root/.codex \
+	-v ~/.copilot:/root/.copilot \
+	-v ~/.gemini:/root/.gemini \
+	vibe_coding_tracker:latest usage
 ```

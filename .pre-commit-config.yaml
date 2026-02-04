@@ -28,12 +28,13 @@ repos:
       - id: check-toml
       - id: check-json
         exclude: .vscode/launch.json
+      - id: pretty-format-json
+        args: ["--autofix", "--indent=2", "--no-ensure-ascii", "--no-sort-keys"]
       - id: check-merge-conflict
       - id: check-case-conflict
       - id: destroyed-symlinks
       - id: detect-private-key
       - id: end-of-file-fixer
-        exclude: examples
       # - id: no-commit-to-branch
       - id: trailing-whitespace
       - id: fix-byte-order-marker
@@ -60,18 +61,32 @@ repos:
           - --number
           - --no-validate
         additional_dependencies:
-          - mdformat-gfm
-          - mdformat-web
-          - mdformat-ruff
-          - mdformat-config
-          - mdformat-tables
-          - mdformat-footnote
-          - mdformat-wikilink
-          - mdformat-beautysh
-          - mdformat-pyproject
-          - mdformat_frontmatter
-          - mdformat-simple-breaks
-          - setuptools<80
+          # https://mdformat.readthedocs.io/en/stable/users/plugins.html
+          # Code formatter plugins
+          - mdformat-beautysh  # bash, sh
+          # - mdformat-black  # python
+          - mdformat-config  # json, toml, yaml
+          # - mdformat-gofmt  # go
+          # - mdformat-ruff  # python
+          - mdformat-rustfmt  # rust
+          - mdformat-shfmt  # bash, sh
+          - mdformat-web  # javascript, js, css, html, xml
+          # Parser extension plugins
+          # - mdformat-admon  # admonitions
+          # - mdformat-deflist  # definition lists
+          - mdformat-footnote  # footnotes
+          - mdformat-frontmatter  # front matter
+          - mdformat-gfm  # GitHub Flavored Markdown (includes tables)
+          - mdformat-gfm-alerts  # GFM alerts
+          - mdformat-mkdocs  # MKDocs
+          # - mdformat-myst  # MyST
+          # - mdformat-toc  # table of contents
+          # Other misc plugins
+          - mdformat-pyproject  # load options from pyproject.toml
+          - mdformat-simple-breaks  # three dashes for breaks
+          # Legacy/Additional
+          - mdformat-tables  # deprecated, use mdformat-gfm
+          - mdformat-wikilink  # wikilinks
 
   # - repo: https://github.com/codespell-project/codespell
   #   rev: v2.4.1
@@ -81,6 +96,6 @@ repos:
   #         - tomli
 
   - repo: https://github.com/gitleaks/gitleaks
-    rev: v8.28.0
+    rev: v8.30.0
     hooks:
       - id: gitleaks
