@@ -49,17 +49,17 @@ The project uses `cargo` for building and testing, with a `Makefile` for conveni
 ## Project Structure
 
 - `src/`: Source code.
-  - `main.rs`: Entry point.
-  - `lib.rs`: Library definition.
-  - `cli.rs`: Command-line argument parsing.
-  - `analysis/`: Logic for parsing conversation files (JSONL).
-  - `usage/`: Logic for aggregating usage from log directories.
-  - `pricing/`: Pricing fetcher and calculator.
-  - `display/`: TUI and output formatting.
-  - `models/`: Data structures for different providers.
+    - `main.rs`: Entry point.
+    - `lib.rs`: Library definition.
+    - `cli.rs`: Command-line argument parsing.
+    - `analysis/`: Logic for parsing conversation files (JSONL).
+    - `usage/`: Logic for aggregating usage from log directories.
+    - `pricing/`: Pricing fetcher and calculator.
+    - `display/`: TUI and output formatting.
+    - `models/`: Data structures for different providers.
 - `cli/`: Wrappers for other package managers.
-  - `nodejs/`: NPM package wrapper.
-  - `python/`: PyPI package wrapper.
+    - `nodejs/`: NPM package wrapper.
+    - `python/`: PyPI package wrapper.
 - `tests/`: Integration tests.
 - `benches/`: Benchmarks.
 - `examples/`: Sample data for testing analysis.
