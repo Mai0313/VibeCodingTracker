@@ -1,4 +1,4 @@
-<center>
+<div align="center" markdown="1">
 
 # Vibe Coding Tracker — AI 程式設計助手使用量追蹤器
 
@@ -15,7 +15,7 @@
 [![Star on GitHub](https://img.shields.io/github/stars/Mai0313/VibeCodingTracker?style=social&label=Star)](https://github.com/Mai0313/VibeCodingTracker)
 [![PRs](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat-square)](https://github.com/Mai0313/VibeCodingTracker/pulls)
 
-</center>
+</div>
 
 **即時追蹤您的 AI 程式設計成本。** Vibe Coding Tracker 是一個強大的 CLI 工具，幫助您監控和分析 Claude Code、Codex、Copilot 和 Gemini 的使用情況，提供詳細的成本分解、token 統計和程式碼操作洞察。
 

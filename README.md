@@ -1,4 +1,4 @@
-<center>
+<div align="center" markdown="1">
 
 # Vibe Coding Tracker — AI Coding Assistant Usage Tracker
 
@@ -15,7 +15,7 @@
 [![Star on GitHub](https://img.shields.io/github/stars/Mai0313/VibeCodingTracker?style=social&label=Star)](https://github.com/Mai0313/VibeCodingTracker)
 [![PRs](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat-square)](https://github.com/Mai0313/VibeCodingTracker/pulls)
 
-</center>
+</div>
 
 **Track your AI coding costs in real-time.** Vibe Coding Tracker is a powerful CLI tool that helps you monitor and analyze your Claude Code, Codex, Copilot, and Gemini usage, providing detailed cost breakdowns, token statistics, and code operation insights.
 
