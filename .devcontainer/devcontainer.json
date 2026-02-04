@@ -1,35 +1,35 @@
 {
-    "customizations":  {
-        "vscode": {
-            "extensions": [
-                "rust-lang.rust-analyzer",
-                "vadimcn.vscode-lldb",
-                "tamasfe.even-better-toml",
-                "eamodio.gitlens",
-                "redhat.vscode-yaml",
-                "ryu1kn.partial-diff",
-                "oderwat.indent-rainbow",
-                "cweijan.dbclient-jdbc",
-                "tamasfe.even-better-toml",
-                "github.copilot",
-                "github.copilot-chat",
-                "ms-azuretools.vscode-docker"
-            ],
-            "settings": {
-                "terminal.integrated.profiles.linux": {
-                    "bash": {
-                        "path": "/bin/bash"
-                    }
-                },
-                "terminal.integrated.defaultProfile.linux": "bash"
-            }
-        }
-    },
-    "dockerFile": "Dockerfile",
-    "updateContentCommand": "rustup update && rustup component add clippy rustfmt && cargo fetch",
-    "mounts": [
-        "source=${localEnv:HOME}/.gitconfig,target=/root/.gitconfig,type=bind,consistency=cached,ro",
-        "source=${localEnv:HOME}/.ssh,target=/root/.ssh,type=bind,consistency=cached,ro",
-        "source=${localEnv:HOME}/.p10k.zsh,target=/root/.p10k.zsh,type=bind,consistency=cached,ro"
-    ]
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "vadimcn.vscode-lldb",
+        "tamasfe.even-better-toml",
+        "eamodio.gitlens",
+        "redhat.vscode-yaml",
+        "ryu1kn.partial-diff",
+        "oderwat.indent-rainbow",
+        "cweijan.dbclient-jdbc",
+        "tamasfe.even-better-toml",
+        "github.copilot",
+        "github.copilot-chat",
+        "ms-azuretools.vscode-docker"
+      ],
+      "settings": {
+        "terminal.integrated.profiles.linux": {
+          "bash": {
+            "path": "/bin/bash"
+          }
+        },
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
+    }
+  },
+  "dockerFile": "Dockerfile",
+  "updateContentCommand": "rustup update && rustup component add clippy rustfmt && cargo fetch",
+  "mounts": [
+    "source=${localEnv:HOME}/.gitconfig,target=/root/.gitconfig,type=bind,consistency=cached,ro",
+    "source=${localEnv:HOME}/.ssh,target=/root/.ssh,type=bind,consistency=cached,ro",
+    "source=${localEnv:HOME}/.p10k.zsh,target=/root/.p10k.zsh,type=bind,consistency=cached,ro"
+  ]
 }
