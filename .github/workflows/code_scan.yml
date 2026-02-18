@@ -89,7 +89,7 @@ jobs:
         uses: aquasecurity/setup-trivy@v0.2.3
 
       - name: Trivy Scanning
-        uses: aquasecurity/trivy-action@0.32.0
+        uses: aquasecurity/trivy-action@0.34.0
         with:
           scan-type: fs
           ignore-unfixed: true
@@ -100,7 +100,7 @@ jobs:
           skip-setup-trivy: true
 
       - name: Trivy Scanning Result
-        uses: aquasecurity/trivy-action@0.32.0
+        uses: aquasecurity/trivy-action@0.34.0
         with:
           scan-type: fs
           ignore-unfixed: true
