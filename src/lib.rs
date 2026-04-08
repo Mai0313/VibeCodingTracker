@@ -10,6 +10,7 @@ pub mod usage;
 pub mod utils;
 
 pub use analysis::analyzer::analyze_jsonl_file;
+pub use cli::TimeRange;
 pub use models::*;
 pub use usage::calculator::{UsageData, get_usage_from_directories};
 

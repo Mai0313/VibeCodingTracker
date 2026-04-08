@@ -1,3 +1,4 @@
+use crate::cli::TimeRange;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -13,9 +14,14 @@ pub struct FileInfo {
 /// # Arguments
 /// * `dir` - Directory to process
 /// * `filter_fn` - Function to determine if a file should be included
+/// * `time_range` - Time range filter to apply
 ///
 /// Returns a vector of FileInfo structs for matching files
-pub fn collect_files_with_dates<P, F>(dir: P, filter_fn: F) -> Result<Vec<FileInfo>>
+pub fn collect_files_with_dates<P, F>(
+    dir: P,
+    filter_fn: F,
+    time_range: TimeRange,
+) -> Result<Vec<FileInfo>>
 where
     P: AsRef<Path>,
     F: Fn(&Path) -> bool,
@@ -23,6 +29,10 @@ where
     if !dir.as_ref().exists() {
         return Ok(Vec::new());
     }
+
+    let cutoff = time_range
+        .cutoff_date()
+        .map(|d| d.format("%Y-%m-%d").to_string());
 
     // Pre-allocate Vec with estimated capacity (typical: 10-50 session files)
     let mut results = Vec::with_capacity(20);
@@ -45,8 +55,15 @@ where
         };
 
         if let Ok(modified) = metadata.modified() {
-            let datetime: chrono::DateTime<chrono::Utc> = modified.into();
+            let datetime: chrono::DateTime<chrono::Local> = modified.into();
             let date_key = datetime.format("%Y-%m-%d").to_string();
+
+            // Apply time range filter
+            if let Some(ref cutoff_str) = cutoff {
+                if date_key.as_str() < cutoff_str.as_str() {
+                    continue;
+                }
+            }
 
             results.push(FileInfo {
                 path: path.to_path_buf(),

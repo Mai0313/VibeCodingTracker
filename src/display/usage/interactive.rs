@@ -31,7 +31,7 @@ const MAX_TRACKED_ROWS: usize = 100;
 /// - Real-time memory monitoring
 /// - Provider-grouped daily averages
 /// - Keyboard controls: `q`, `Esc`, or `Ctrl+C` to exit
-pub fn display_usage_interactive() -> anyhow::Result<()> {
+pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::Result<()> {
     let mut terminal = setup_terminal()?;
     let mut refresh_state = RefreshState::new(USAGE_REFRESH_SECS);
 
@@ -93,7 +93,7 @@ pub fn display_usage_interactive() -> anyhow::Result<()> {
             }
         }
 
-        match crate::usage::get_usage_from_directories() {
+        match crate::usage::get_usage_from_directories(time_range) {
             Ok(data) => {
                 usage_data = data.models;
                 provider_days = data.provider_days;

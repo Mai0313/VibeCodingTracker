@@ -22,7 +22,10 @@ const ANALYSIS_REFRESH_SECS: u64 = 10;
 const MAX_TRACKED_ANALYSIS_ROWS: usize = 100;
 
 /// Display analysis data as an interactive table
-pub fn display_analysis_interactive(initial_data: &AnalysisData) -> anyhow::Result<()> {
+pub fn display_analysis_interactive(
+    initial_data: &AnalysisData,
+    time_range: crate::cli::TimeRange,
+) -> anyhow::Result<()> {
     if initial_data.rows.is_empty() {
         println!("⚠️  No analysis data found");
         return Ok(());
@@ -57,7 +60,7 @@ pub fn display_analysis_interactive(initial_data: &AnalysisData) -> anyhow::Resu
         sys.refresh_cpu_all();
 
         // Fetch fresh data with error logging
-        let current_data = match crate::analysis::analyze_all_sessions() {
+        let current_data = match crate::analysis::analyze_all_sessions(time_range) {
             Ok(data) => data,
             Err(e) => {
                 log::warn!("Failed to analyze sessions: {}", e);

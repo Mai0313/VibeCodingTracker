@@ -8,6 +8,7 @@ use vibe_coding_tracker::analysis::analyzer::analyze_jsonl_file;
 use vibe_coding_tracker::analysis::batch_analyzer::{
     analyze_all_sessions, analyze_all_sessions_by_provider,
 };
+use vibe_coding_tracker::cli::TimeRange;
 
 #[test]
 fn test_single_file_analysis_claude() {
@@ -224,7 +225,7 @@ fn test_analysis_file_operations() {
 #[test]
 fn test_batch_analysis_basic() {
     // Test batch analysis with default directories
-    let result = analyze_all_sessions();
+    let result = analyze_all_sessions(TimeRange::All);
     assert!(result.is_ok(), "Batch analysis should not fail");
 
     if let Ok(data) = result {
@@ -241,7 +242,7 @@ fn test_batch_analysis_basic() {
 
 #[test]
 fn test_batch_analysis_sorting() {
-    let result = analyze_all_sessions();
+    let result = analyze_all_sessions(TimeRange::All);
 
     if let Ok(data) = result {
         if data.rows.len() > 1 {
@@ -304,7 +305,7 @@ fn test_batch_analysis_serialization() {
 #[test]
 fn test_batch_analysis_by_provider() {
     // Test provider-grouped analysis
-    let result = analyze_all_sessions_by_provider();
+    let result = analyze_all_sessions_by_provider(TimeRange::All);
     assert!(result.is_ok(), "Provider-grouped analysis should not fail");
 
     if let Ok(grouped) = result {
@@ -356,7 +357,7 @@ fn test_analysis_with_invalid_json() {
 #[test]
 fn test_batch_analysis_model_grouping() {
     // Test that batch analysis groups data by model
-    let result = analyze_all_sessions();
+    let result = analyze_all_sessions(TimeRange::All);
 
     if let Ok(data) = result {
         for row in data.rows.iter() {

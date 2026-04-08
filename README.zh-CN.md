@@ -166,6 +166,12 @@ vct usage --text
 
 # JSON for data processing
 vct usage --json
+
+# 按时间范围筛选（默认：--all）
+vct usage --daily      # 仅显示今天
+vct usage --weekly     # 本周
+vct usage --monthly    # 本月
+vct usage --table --weekly  # 可与输出格式组合使用
 ```
 
 ### 预览：交互式面板（`vct usage`）
@@ -226,10 +232,16 @@ vct analysis --path ~/.claude/projects/session.jsonl
 vct analysis --output report.json
 
 # Group results by provider
-vct analysis --all
+vct analysis --by-provider
 
 # Save grouped results
-vct analysis --all --output grouped_report.json
+vct analysis --by-provider --output grouped_report.json
+
+# 按时间范围筛选（默认：--all）
+vct analysis --daily       # 仅显示今天
+vct analysis --weekly      # 本周
+vct analysis --monthly     # 本月
+vct analysis --table --weekly  # 可与输出格式组合使用
 ```
 
 ### 预览：交互式面板（`vct analysis`）

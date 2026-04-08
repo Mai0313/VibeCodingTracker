@@ -1,6 +1,46 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+/// Time range filter for data queries
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum TimeRange {
+    Daily,
+    Weekly,
+    Monthly,
+    #[default]
+    All,
+}
+
+impl TimeRange {
+    /// Returns the cutoff date (inclusive) for filtering, or None for All
+    pub fn cutoff_date(&self) -> Option<chrono::NaiveDate> {
+        use chrono::{Datelike, Local};
+        let today = Local::now().date_naive();
+        match self {
+            TimeRange::All => None,
+            TimeRange::Daily => Some(today),
+            TimeRange::Weekly => {
+                let days_since_monday = today.weekday().num_days_from_monday() as i64;
+                Some(today - chrono::Duration::days(days_since_monday))
+            }
+            TimeRange::Monthly => Some(today.with_day(1).unwrap()),
+        }
+    }
+}
+
+/// Resolve time range from CLI flags (default: All)
+pub fn resolve_time_range(daily: bool, weekly: bool, monthly: bool) -> TimeRange {
+    if daily {
+        TimeRange::Daily
+    } else if weekly {
+        TimeRange::Weekly
+    } else if monthly {
+        TimeRange::Monthly
+    } else {
+        TimeRange::All
+    }
+}
+
 /// Vibe Coding Tracker - AI coding assistant usage analyzer
 #[derive(Parser, Debug)]
 #[command(name = "vibe_coding_tracker")]
@@ -24,11 +64,27 @@ pub enum Commands {
 
         /// Group results by provider (claude/codex/gemini)
         #[arg(long)]
-        all: bool,
+        by_provider: bool,
 
         /// Output as static table (instead of interactive TUI)
         #[arg(long)]
         table: bool,
+
+        /// Show only today's data
+        #[arg(long, group = "period")]
+        daily: bool,
+
+        /// Show only this week's data
+        #[arg(long, group = "period")]
+        weekly: bool,
+
+        /// Show only this month's data
+        #[arg(long, group = "period")]
+        monthly: bool,
+
+        /// Show all data (default)
+        #[arg(long, group = "period")]
+        all: bool,
     },
 
     /// Display token usage statistics
@@ -44,6 +100,22 @@ pub enum Commands {
         /// Output as static table
         #[arg(long)]
         table: bool,
+
+        /// Show only today's data
+        #[arg(long, group = "period")]
+        daily: bool,
+
+        /// Show only this week's data
+        #[arg(long, group = "period")]
+        weekly: bool,
+
+        /// Show only this month's data
+        #[arg(long, group = "period")]
+        monthly: bool,
+
+        /// Show all data (default)
+        #[arg(long, group = "period")]
+        all: bool,
     },
 
     /// Display version information

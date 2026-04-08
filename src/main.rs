@@ -4,7 +4,7 @@ use comfy_table::{Cell, CellAlignment, Color, ContentArrangement, Table, presets
 use owo_colors::OwoColorize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use vibe_coding_tracker::cli::{Cli, Commands};
+use vibe_coding_tracker::cli::{Cli, Commands, resolve_time_range};
 
 // Use mimalloc as the global allocator for better performance
 #[global_allocator]
@@ -27,13 +27,19 @@ fn main() -> Result<()> {
         Commands::Analysis {
             path,
             output,
-            all,
+            by_provider,
             table,
+            daily,
+            weekly,
+            monthly,
+            ..
         } => {
-            if all {
-                // Handle --all flag: group by provider and output as JSON
+            let time_range = resolve_time_range(daily, weekly, monthly);
+
+            if by_provider {
+                // Handle --by-provider flag: group by provider and output as JSON
                 let grouped_data =
-                    vibe_coding_tracker::analysis::analyze_all_sessions_by_provider()?;
+                    vibe_coding_tracker::analysis::analyze_all_sessions_by_provider(time_range)?;
 
                 if let Some(output_path) = output {
                     let json_value = serde_json::to_value(&grouped_data)?;
@@ -58,7 +64,8 @@ fn main() -> Result<()> {
                         }
                     }
                     None => {
-                        let analysis_data = vibe_coding_tracker::analysis::analyze_all_sessions()?;
+                        let analysis_data =
+                            vibe_coding_tracker::analysis::analyze_all_sessions(time_range)?;
 
                         if let Some(output_path) = output {
                             let json_value = serde_json::to_value(&analysis_data.rows)?;
@@ -74,6 +81,7 @@ fn main() -> Result<()> {
                         } else {
                             vibe_coding_tracker::display::analysis::display_analysis_interactive(
                                 &analysis_data,
+                                time_range,
                             )?;
                         }
                     }
@@ -81,9 +89,19 @@ fn main() -> Result<()> {
             }
         }
 
-        Commands::Usage { json, text, table } => {
+        Commands::Usage {
+            json,
+            text,
+            table,
+            daily,
+            weekly,
+            monthly,
+            ..
+        } => {
+            let time_range = resolve_time_range(daily, weekly, monthly);
+
             if json || text || table {
-                let usage_data = get_usage_from_directories()?;
+                let usage_data = get_usage_from_directories(time_range)?;
 
                 if json {
                     let pricing_map = match fetch_model_pricing() {
@@ -105,7 +123,7 @@ fn main() -> Result<()> {
                     display_usage_table(&usage_data.models, &usage_data.provider_days);
                 }
             } else {
-                display_usage_interactive()?;
+                display_usage_interactive(time_range)?;
             }
         }
 

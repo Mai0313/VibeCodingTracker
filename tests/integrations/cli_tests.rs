@@ -131,7 +131,7 @@ fn test_analysis_batch_mode_with_output() {
 #[test]
 fn test_analysis_all_providers() {
     let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
-    cmd.arg("analysis").arg("--all");
+    cmd.arg("analysis").arg("--by-provider");
 
     cmd.assert().success().stdout(
         predicate::str::contains("Claude-Code")
@@ -149,7 +149,7 @@ fn test_analysis_all_providers_with_output() {
 
     let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
     cmd.arg("analysis")
-        .arg("--all")
+        .arg("--by-provider")
         .arg("--output")
         .arg(output_file.to_str().unwrap());
 
@@ -252,12 +252,12 @@ fn test_invalid_command() {
 
 #[test]
 fn test_analysis_conflicting_flags() {
-    // Test that --path and --all are mutually exclusive
+    // Test that --path and --by-provider are mutually exclusive
     let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
     cmd.arg("analysis")
         .arg("--path")
         .arg("test.jsonl")
-        .arg("--all");
+        .arg("--by-provider");
 
     // Should either succeed (if validation is lax) or fail
     // The behavior depends on CLI implementation

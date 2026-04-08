@@ -166,6 +166,12 @@ vct usage --text
 
 # JSON for data processing
 vct usage --json
+
+# Filter by time range (default: --all)
+vct usage --daily      # Today only
+vct usage --weekly     # This week
+vct usage --monthly    # This month
+vct usage --table --weekly  # Combine with output format
 ```
 
 ### Preview: Interactive Dashboard (`vct usage`)
@@ -226,10 +232,16 @@ vct analysis --path ~/.claude/projects/session.jsonl
 vct analysis --output report.json
 
 # Group results by provider
-vct analysis --all
+vct analysis --by-provider
 
 # Save grouped results
-vct analysis --all --output grouped_report.json
+vct analysis --by-provider --output grouped_report.json
+
+# Filter by time range (default: --all)
+vct analysis --daily       # Today only
+vct analysis --weekly      # This week
+vct analysis --monthly     # This month
+vct analysis --table --weekly  # Combine with output format
 ```
 
 ### Preview: Interactive Dashboard (`vct analysis`)

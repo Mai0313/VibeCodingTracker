@@ -2,13 +2,14 @@
 //
 // These tests verify the usage calculation and aggregation logic
 
+use vibe_coding_tracker::cli::TimeRange;
 use vibe_coding_tracker::usage::calculator::get_usage_from_directories;
 
 #[test]
 fn test_get_usage_from_empty_directories() {
     // Test that get_usage_from_directories works
     // This will use default directories which may or may not have data
-    let result = get_usage_from_directories();
+    let result = get_usage_from_directories(TimeRange::All);
     assert!(result.is_ok(), "Should handle directories");
 
     // Result may be empty or contain data depending on the system
@@ -18,7 +19,7 @@ fn test_get_usage_from_empty_directories() {
 #[test]
 fn test_get_usage_from_directories_structure() {
     // Test with default directories
-    let result = get_usage_from_directories();
+    let result = get_usage_from_directories(TimeRange::All);
 
     if let Ok(usage) = result {
         // Verify that the result has valid structure

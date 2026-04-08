@@ -5,6 +5,7 @@
 use std::fs::{self, File};
 use std::io::Write;
 use tempfile::tempdir;
+use vibe_coding_tracker::cli::TimeRange;
 use vibe_coding_tracker::utils::directory::{
     collect_files_with_dates, is_gemini_chat_file, is_json_file,
 };
@@ -77,14 +78,15 @@ fn test_collect_files_with_dates_empty_dir() {
     // Test collecting files from empty directory
     let dir = tempdir().unwrap();
 
-    let results = collect_files_with_dates(dir.path(), is_json_file).unwrap();
+    let results = collect_files_with_dates(dir.path(), is_json_file, TimeRange::All).unwrap();
     assert_eq!(results.len(), 0);
 }
 
 #[test]
 fn test_collect_files_with_dates_nonexistent_dir() {
     // Test collecting files from non-existent directory
-    let results = collect_files_with_dates("/nonexistent/path", is_json_file).unwrap();
+    let results =
+        collect_files_with_dates("/nonexistent/path", is_json_file, TimeRange::All).unwrap();
     assert_eq!(results.len(), 0);
 }
 
@@ -98,7 +100,7 @@ fn test_collect_files_with_dates_with_files() {
     File::create(dir.path().join("file2.jsonl")).unwrap();
     File::create(dir.path().join("file3.txt")).unwrap(); // Should be filtered out
 
-    let results = collect_files_with_dates(dir.path(), is_json_file).unwrap();
+    let results = collect_files_with_dates(dir.path(), is_json_file, TimeRange::All).unwrap();
     assert_eq!(results.len(), 2);
 
     // Check that date fields are set
@@ -121,7 +123,7 @@ fn test_collect_files_with_dates_nested_directories() {
     File::create(dir.path().join("subdir1/file2.json")).unwrap();
     File::create(dir.path().join("subdir2/file3.jsonl")).unwrap();
 
-    let results = collect_files_with_dates(dir.path(), is_json_file).unwrap();
+    let results = collect_files_with_dates(dir.path(), is_json_file, TimeRange::All).unwrap();
     assert_eq!(results.len(), 3);
 }
 
@@ -135,9 +137,12 @@ fn test_collect_files_with_dates_filter_function() {
     File::create(dir.path().join("file3.txt")).unwrap();
 
     // Custom filter: only .txt files
-    let results =
-        collect_files_with_dates(dir.path(), |p| p.extension().is_some_and(|e| e == "txt"))
-            .unwrap();
+    let results = collect_files_with_dates(
+        dir.path(),
+        |p| p.extension().is_some_and(|e| e == "txt"),
+        TimeRange::All,
+    )
+    .unwrap();
 
     assert_eq!(results.len(), 1);
 }
@@ -150,7 +155,7 @@ fn test_collect_files_with_dates_no_matching_files() {
     File::create(dir.path().join("file1.txt")).unwrap();
     File::create(dir.path().join("file2.md")).unwrap();
 
-    let results = collect_files_with_dates(dir.path(), is_json_file).unwrap();
+    let results = collect_files_with_dates(dir.path(), is_json_file, TimeRange::All).unwrap();
     assert_eq!(results.len(), 0);
 }
 
@@ -161,7 +166,7 @@ fn test_file_info_path() {
     let file_path = dir.path().join("test.json");
     File::create(&file_path).unwrap();
 
-    let results = collect_files_with_dates(dir.path(), is_json_file).unwrap();
+    let results = collect_files_with_dates(dir.path(), is_json_file, TimeRange::All).unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].path, file_path);
 }
@@ -172,7 +177,7 @@ fn test_file_info_date_format() {
     let dir = tempdir().unwrap();
     File::create(dir.path().join("test.json")).unwrap();
 
-    let results = collect_files_with_dates(dir.path(), is_json_file).unwrap();
+    let results = collect_files_with_dates(dir.path(), is_json_file, TimeRange::All).unwrap();
     assert_eq!(results.len(), 1);
 
     let date = &results[0].modified_date;
@@ -191,7 +196,7 @@ fn test_collect_files_ignores_directories() {
     // Create an actual file
     File::create(dir.path().join("real.json")).unwrap();
 
-    let results = collect_files_with_dates(dir.path(), is_json_file).unwrap();
+    let results = collect_files_with_dates(dir.path(), is_json_file, TimeRange::All).unwrap();
     assert_eq!(results.len(), 1); // Only the file, not the directory
 }
 
@@ -221,7 +226,7 @@ fn test_collect_files_with_content() {
     let mut file = File::create(&file_path).unwrap();
     writeln!(file, r#"{{"key": "value"}}"#).unwrap();
 
-    let results = collect_files_with_dates(dir.path(), is_json_file).unwrap();
+    let results = collect_files_with_dates(dir.path(), is_json_file, TimeRange::All).unwrap();
     assert_eq!(results.len(), 1);
     assert!(results[0].path.exists());
 }

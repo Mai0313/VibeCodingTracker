@@ -1,4 +1,5 @@
 use crate::cache::global_cache;
+use crate::cli::TimeRange;
 use crate::constants::{FastHashMap, capacity};
 use crate::models::{ProviderActiveDays, UsageResult};
 use crate::utils::{collect_files_with_dates, is_gemini_chat_file, is_json_file, resolve_paths};
@@ -51,7 +52,7 @@ fn extract_conversation_usage_from_analysis(analysis: &Value) -> FastHashMap<Str
 ///
 /// Scans Claude Code, Codex, Copilot, and Gemini session files, extracts token usage,
 /// and aggregates by model. Returns usage data with provider active day counts.
-pub fn get_usage_from_directories() -> Result<UsageData> {
+pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
     let paths = resolve_paths()?;
     let mut result = FastHashMap::with_capacity(capacity::MODEL_COMBINATIONS);
 
@@ -66,6 +67,7 @@ pub fn get_usage_from_directories() -> Result<UsageData> {
             &mut result,
             &mut claude_dates,
             is_json_file,
+            time_range,
         )?;
     }
 
@@ -75,6 +77,7 @@ pub fn get_usage_from_directories() -> Result<UsageData> {
             &mut result,
             &mut codex_dates,
             is_json_file,
+            time_range,
         )?;
     }
 
@@ -84,6 +87,7 @@ pub fn get_usage_from_directories() -> Result<UsageData> {
             &mut result,
             &mut copilot_dates,
             is_json_file,
+            time_range,
         )?;
     }
 
@@ -93,6 +97,7 @@ pub fn get_usage_from_directories() -> Result<UsageData> {
             &mut result,
             &mut gemini_dates,
             is_gemini_chat_file,
+            time_range,
         )?;
     }
 
@@ -121,13 +126,14 @@ fn process_usage_directory<P, F>(
     result: &mut UsageResult,
     unique_dates: &mut HashSet<String>,
     filter_fn: F,
+    time_range: TimeRange,
 ) -> Result<()>
 where
     P: AsRef<Path>,
     F: Copy + Fn(&Path) -> bool + Sync + Send,
 {
     let dir = dir.as_ref();
-    let files = collect_files_with_dates(dir, filter_fn)?;
+    let files = collect_files_with_dates(dir, filter_fn, time_range)?;
 
     // Process files in parallel with caching for better performance
     let file_results: Vec<(String, FastHashMap<String, Value>)> = files

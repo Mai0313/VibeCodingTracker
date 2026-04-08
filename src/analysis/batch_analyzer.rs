@@ -1,4 +1,5 @@
 use crate::cache::global_cache;
+use crate::cli::TimeRange;
 use crate::constants::{FastHashMap, capacity};
 use crate::models::ProviderActiveDays;
 use crate::utils::{collect_files_with_dates, is_gemini_chat_file, is_json_file};
@@ -35,7 +36,7 @@ pub struct AnalysisData {
 ///
 /// Scans Claude, Codex, Copilot, and Gemini session directories, aggregates tool call counts
 /// and line counts by model, then returns sorted results with provider active day counts.
-pub fn analyze_all_sessions() -> Result<AnalysisData> {
+pub fn analyze_all_sessions(time_range: TimeRange) -> Result<AnalysisData> {
     let paths = crate::utils::resolve_paths()?;
     let mut aggregated: FastHashMap<String, AggregatedAnalysisRow> =
         FastHashMap::with_capacity(capacity::MODEL_COMBINATIONS);
@@ -51,6 +52,7 @@ pub fn analyze_all_sessions() -> Result<AnalysisData> {
             &mut aggregated,
             &mut claude_dates,
             is_json_file,
+            time_range,
         )?;
     }
 
@@ -60,6 +62,7 @@ pub fn analyze_all_sessions() -> Result<AnalysisData> {
             &mut aggregated,
             &mut codex_dates,
             is_json_file,
+            time_range,
         )?;
     }
 
@@ -69,6 +72,7 @@ pub fn analyze_all_sessions() -> Result<AnalysisData> {
             &mut aggregated,
             &mut copilot_dates,
             is_json_file,
+            time_range,
         )?;
     }
 
@@ -78,6 +82,7 @@ pub fn analyze_all_sessions() -> Result<AnalysisData> {
             &mut aggregated,
             &mut gemini_dates,
             is_gemini_chat_file,
+            time_range,
         )?;
     }
 
@@ -121,7 +126,7 @@ pub struct ProviderGroupedAnalysis {
 ///
 /// Unlike `analyze_all_sessions()` which aggregates metrics, this function preserves
 /// full CodeAnalysis records for each session file.
-pub fn analyze_all_sessions_by_provider() -> Result<ProviderGroupedAnalysis> {
+pub fn analyze_all_sessions_by_provider(time_range: TimeRange) -> Result<ProviderGroupedAnalysis> {
     let paths = crate::utils::resolve_paths()?;
 
     let mut claude_results: Vec<Value> = Vec::new();
@@ -135,6 +140,7 @@ pub fn analyze_all_sessions_by_provider() -> Result<ProviderGroupedAnalysis> {
             &paths.claude_session_dir,
             &mut claude_results,
             is_json_file,
+            time_range,
         )?;
     }
 
@@ -144,6 +150,7 @@ pub fn analyze_all_sessions_by_provider() -> Result<ProviderGroupedAnalysis> {
             &paths.codex_session_dir,
             &mut codex_results,
             is_json_file,
+            time_range,
         )?;
     }
 
@@ -153,6 +160,7 @@ pub fn analyze_all_sessions_by_provider() -> Result<ProviderGroupedAnalysis> {
             &paths.copilot_session_dir,
             &mut copilot_results,
             is_json_file,
+            time_range,
         )?;
     }
 
@@ -162,6 +170,7 @@ pub fn analyze_all_sessions_by_provider() -> Result<ProviderGroupedAnalysis> {
             &paths.gemini_session_dir,
             &mut gemini_results,
             is_gemini_chat_file,
+            time_range,
         )?;
     }
 
@@ -177,13 +186,14 @@ fn process_full_analysis_directory<P, F>(
     dir: P,
     results: &mut Vec<Value>,
     filter_fn: F,
+    time_range: TimeRange,
 ) -> Result<()>
 where
     P: AsRef<Path>,
     F: Copy + Fn(&Path) -> bool + Sync + Send,
 {
     let dir = dir.as_ref();
-    let files = collect_files_with_dates(dir, filter_fn)?;
+    let files = collect_files_with_dates(dir, filter_fn, time_range)?;
 
     // Process files in parallel with caching for better performance
     // Use Arc directly to avoid deep cloning large JSON values
@@ -214,13 +224,14 @@ fn process_analysis_directory<P, F>(
     aggregated: &mut FastHashMap<String, AggregatedAnalysisRow>,
     unique_dates: &mut HashSet<String>,
     filter_fn: F,
+    time_range: TimeRange,
 ) -> Result<()>
 where
     P: AsRef<Path>,
     F: Copy + Fn(&Path) -> bool + Sync + Send,
 {
     let dir = dir.as_ref();
-    let files = collect_files_with_dates(dir, filter_fn)?;
+    let files = collect_files_with_dates(dir, filter_fn, time_range)?;
 
     // Process files in parallel with caching and collect per-file aggregations
     // Use Arc to avoid deep cloning - we only need to read fields
