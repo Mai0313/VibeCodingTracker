@@ -174,14 +174,22 @@ pub fn build_usage_summary(
     // Pre-allocate rows vector
     summary.rows.reserve(usage_data.len());
 
-    // Collect and sort models
-    let mut models: Vec<_> = usage_data.iter().collect();
-    models.sort_by_key(|(model, _)| *model);
-
-    for (model, usage) in models {
+    // Extract rows first so we can sort by cost
+    for (model, usage) in usage_data.iter() {
         let row = extract_usage_row(model, usage, pricing_map);
-        summary.totals.accumulate(&row);
         summary.rows.push(row);
+    }
+
+    // Sort by cost ascending (higher cost at the bottom); tie-break by model name for stability
+    summary.rows.sort_by(|a, b| {
+        a.cost
+            .partial_cmp(&b.cost)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.model.cmp(&b.model))
+    });
+
+    for row in &summary.rows {
+        summary.totals.accumulate(row);
     }
 
     summary.daily_averages = calculate_daily_averages(&summary.rows, provider_days);
