@@ -148,12 +148,12 @@ Commands:
 
 Time range flags (shared by `usage` and `analysis`, mutually exclusive, default `--all`):
 
-| Flag        | Window                                    |
-| ----------- | ----------------------------------------- |
-| `--daily`   | Sessions modified today                   |
-| `--weekly`  | Current ISO week (Monday → today)         |
-| `--monthly` | Current calendar month                    |
-| `--all`     | Every session on disk (default)           |
+| Flag        | Window                            |
+| ----------- | --------------------------------- |
+| `--daily`   | Sessions modified today           |
+| `--weekly`  | Current ISO week (Monday → today) |
+| `--monthly` | Current calendar month            |
+| `--all`     | Every session on disk (default)   |
 
 ---
 
@@ -163,13 +163,13 @@ Time range flags (shared by `usage` and `analysis`, mutually exclusive, default 
 
 ### Flags
 
-| Flag                                           | Purpose                              |
-| ---------------------------------------------- | ------------------------------------ |
-| *(none)*                                       | Interactive TUI dashboard (default)  |
-| `--table`                                      | Static table, no TUI                 |
-| `--text`                                       | Plain text, script-friendly          |
-| `--json`                                       | JSON with enriched pricing metadata  |
-| `--daily` / `--weekly` / `--monthly` / `--all` | Time range filter (see table above)  |
+| Flag                                           | Purpose                             |
+| ---------------------------------------------- | ----------------------------------- |
+| *(none)*                                       | Interactive TUI dashboard (default) |
+| `--table`                                      | Static table, no TUI                |
+| `--text`                                       | Plain text, script-friendly         |
+| `--json`                                       | JSON with enriched pricing metadata |
+| `--daily` / `--weekly` / `--monthly` / `--all` | Time range filter (see table above) |
 
 ### Basic Usage
 
@@ -236,14 +236,14 @@ The tool automatically scans these directories:
 
 ### Flags
 
-| Flag                                           | Purpose                                                             |
-| ---------------------------------------------- | ------------------------------------------------------------------- |
-| *(none)*                                       | Interactive TUI dashboard over all sessions                         |
-| `--path <FILE>`                                | Analyze a single JSONL/JSON conversation file (prints JSON)         |
-| `--table`                                      | Static table with per-provider daily averages                       |
-| `--output <FILE>`                              | Save results as pretty-printed JSON                                 |
-| `--by-provider`                                | Group rows by provider (claude / codex / copilot / gemini) as JSON  |
-| `--daily` / `--weekly` / `--monthly` / `--all` | Time range filter (see table above)                                 |
+| Flag                                           | Purpose                                                            |
+| ---------------------------------------------- | ------------------------------------------------------------------ |
+| *(none)*                                       | Interactive TUI dashboard over all sessions                        |
+| `--path <FILE>`                                | Analyze a single JSONL/JSON conversation file (prints JSON)        |
+| `--table`                                      | Static table with per-provider daily averages                      |
+| `--output <FILE>`                              | Save results as pretty-printed JSON                                |
+| `--by-provider`                                | Group rows by provider (claude / codex / copilot / gemini) as JSON |
+| `--daily` / `--weekly` / `--monthly` / `--all` | Time range filter (see table above)                                |
 
 See [`examples/`](examples/) for sample inputs and matching JSON outputs for all four providers.
 

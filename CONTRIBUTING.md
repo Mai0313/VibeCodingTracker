@@ -120,15 +120,15 @@ Two release profiles are defined in `Cargo.toml`:
 
 Common Makefile shortcuts (`make help` to list all):
 
-| Target          | Description                                          |
-| --------------- | ---------------------------------------------------- |
-| `make build`    | Debug build (`cargo build`)                          |
-| `make release`  | Locked release build (`cargo build --release --locked`) |
-| `make package`  | `cargo package --locked --allow-dirty`               |
-| `make test`     | Run the full `cargo test --all` suite                |
+| Target          | Description                                                     |
+| --------------- | --------------------------------------------------------------- |
+| `make build`    | Debug build (`cargo build`)                                     |
+| `make release`  | Locked release build (`cargo build --release --locked`)         |
+| `make package`  | `cargo package --locked --allow-dirty`                          |
+| `make test`     | Run the full `cargo test --all` suite                           |
 | `make fmt`      | `cargo fmt --all` + `cargo clippy --all-targets --all-features` |
-| `make coverage` | Install & run `cargo-llvm-cov` for workspace coverage |
-| `make clean`    | Remove build artifacts and prune git objects         |
+| `make coverage` | Install & run `cargo-llvm-cov` for workspace coverage           |
+| `make clean`    | Remove build artifacts and prune git objects                    |
 
 #### Running Tests
 
