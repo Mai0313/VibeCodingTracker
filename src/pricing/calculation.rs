@@ -26,40 +26,48 @@ pub fn calculate_cost(
 ) -> f64 {
     let total_cache_creation = cache_creation_5m_tokens + cache_creation_1h_tokens;
 
-    if let Some(ranges) = &pricing.ranges {
-        // Range-based pricing is Qwen-only; it doesn't have a 1hr concept, so
-        // collapse both TTL buckets into the total for rate selection.
-        return calculate_cost_ranges(input_tokens, output_tokens, cache_read_tokens, ranges);
-    }
-
-    let total_input_context = input_tokens + cache_read_tokens + total_cache_creation;
-    let active_tier = pricing
-        .tiers
-        .iter()
-        .rev()
-        .find(|t| total_input_context > t.threshold_tokens);
-
+    // Pick the primary price source (input/output/cache_read) based on strategy.
+    // cache_creation prices always come from base level in the range-based branch
+    // because TierRange carries no cache_creation fields (LiteLLM doesn't publish
+    // them for Qwen / doubao); for tier + flat they come from the active level.
     let (input_price, output_price, cache_read_price, cc_5m_price, cc_1h_price_raw) =
-        match active_tier {
-            Some(t) => (
-                t.input_cost_per_token,
-                t.output_cost_per_token,
-                t.cache_read_input_token_cost,
-                t.cache_creation_input_token_cost,
-                t.cache_creation_input_token_cost_above_1hr,
-            ),
-            None => (
-                pricing.input_cost_per_token,
-                pricing.output_cost_per_token,
-                pricing.cache_read_input_token_cost,
+        if let Some(ranges) = &pricing.ranges {
+            let r = select_range(ranges, input_tokens);
+            (
+                r.map(|r| r.input_cost_per_token).unwrap_or(0.0),
+                r.map(|r| r.output_cost_per_token).unwrap_or(0.0),
+                r.map(|r| r.cache_read_input_token_cost).unwrap_or(0.0),
                 pricing.cache_creation_input_token_cost,
                 pricing.cache_creation_input_token_cost_above_1hr,
-            ),
+            )
+        } else {
+            let total_input_context = input_tokens + cache_read_tokens + total_cache_creation;
+            let active_tier = pricing
+                .tiers
+                .iter()
+                .rev()
+                .find(|t| total_input_context > t.threshold_tokens);
+            match active_tier {
+                Some(t) => (
+                    t.input_cost_per_token,
+                    t.output_cost_per_token,
+                    t.cache_read_input_token_cost,
+                    t.cache_creation_input_token_cost,
+                    t.cache_creation_input_token_cost_above_1hr,
+                ),
+                None => (
+                    pricing.input_cost_per_token,
+                    pricing.output_cost_per_token,
+                    pricing.cache_read_input_token_cost,
+                    pricing.cache_creation_input_token_cost,
+                    pricing.cache_creation_input_token_cost_above_1hr,
+                ),
+            }
         };
 
-    // If the model doesn't publish a 1hr price, bill 1h tokens at the 5m rate
-    // (safer to under-bill than fabricate a rate — and matches legacy behaviour
-    // for models / providers with no TTL split).
+    // If the active level doesn't publish a 1hr price, bill 1h tokens at the 5m
+    // rate (safer to under-bill than fabricate; also matches providers with no
+    // TTL split where cc_5m_price already covers the whole cache_creation bucket).
     let cc_1h_price = if cc_1h_price_raw > 0.0 {
         cc_1h_price_raw
     } else {
@@ -73,30 +81,20 @@ pub fn calculate_cost(
         + cache_creation_1h_tokens as f64 * cc_1h_price
 }
 
-/// Range-based pricing: `input_tokens` selects the matching `TierRange`.
+/// Selects a `TierRange` for range-based pricing.
 ///
-/// Falls back to the last (highest) range for over-cap usage so e.g. a Qwen
-/// call beyond the advertised max still gets charged the top-tier rate rather
-/// than silently priced at $0.
-fn calculate_cost_ranges(
-    input_tokens: i64,
-    output_tokens: i64,
-    cache_read_tokens: i64,
-    ranges: &[TierRange],
-) -> f64 {
-    let range = ranges
+/// Ranges are sorted by `min_tokens` ascending at parse time, so the **last**
+/// range whose `min_tokens <= input_tokens` is the right match — this naturally
+/// handles both in-range hits and over-cap inputs (where `input_tokens` exceeds
+/// every defined `max_tokens`) with a single pass. Inputs below the lowest
+/// range's `min_tokens` (unexpected for LiteLLM data, which starts at 0) fall
+/// back to the first range so we still bill rather than silently return $0.
+fn select_range(ranges: &[TierRange], input_tokens: i64) -> Option<&TierRange> {
+    ranges
         .iter()
-        .find(|r| input_tokens >= r.min_tokens && input_tokens < r.max_tokens)
-        .or_else(|| ranges.last());
-
-    match range {
-        Some(r) => {
-            input_tokens as f64 * r.input_cost_per_token
-                + output_tokens as f64 * r.output_cost_per_token
-                + cache_read_tokens as f64 * r.cache_read_input_token_cost
-        }
-        None => 0.0,
-    }
+        .rev()
+        .find(|r| r.min_tokens <= input_tokens)
+        .or_else(|| ranges.first())
 }
 
 #[cfg(test)]

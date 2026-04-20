@@ -62,7 +62,13 @@ pub struct TierRange {
 ///    token types switch to that tier's prices. Used by Claude Sonnet 4.x,
 ///    Gemini 2.5 Pro, Gemini 1.5 (128k), GPT-5.x (272k), etc.
 /// 3. **Flat** (neither set): base prices apply to every request.
+///
+/// `deny_unknown_fields` forces `load_from_cache` to fail on pre-Phase-1 cache
+/// files (which carried `*_above_200k_tokens` fields) so a stale same-day cache
+/// is rejected and refetched — otherwise serde would silently drop the removed
+/// fields and under-price tiered models for the rest of the day.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelPricing {
     #[serde(default)]
     pub input_cost_per_token: f64,
@@ -223,11 +229,25 @@ pub fn parse_litellm_entry(value: &serde_json::Value) -> ModelPricing {
             cache_creation_input_token_cost: *tier_cache_creation
                 .get(&th)
                 .unwrap_or(&pricing.cache_creation_input_token_cost),
-            cache_creation_input_token_cost_above_1hr: *tier_cache_creation_1hr
+            // Intentionally do NOT inherit base 1hr into the tier: if LiteLLM
+            // doesn't publish a tier-specific 1hr price, leaving this at 0 lets
+            // `calculate_cost` fall back to the tier's own 5m rate. Inheriting
+            // base 1hr could produce a tier 1hr price BELOW the tier 5m price
+            // (nonsensical) whenever the 200K tier substantially marks up the
+            // 5m rate but the base 1hr stays at its unmarked level.
+            cache_creation_input_token_cost_above_1hr: tier_cache_creation_1hr
                 .get(&th)
-                .unwrap_or(&pricing.cache_creation_input_token_cost_above_1hr),
+                .copied()
+                .unwrap_or(0.0),
         })
         .collect();
+
+    // Range-based models: sort by min_tokens ascending so selection can assume
+    // ordering (LiteLLM data is already sorted, but being explicit makes the
+    // `calculate_cost` dispatch logic simpler to reason about).
+    if let Some(ranges) = pricing.ranges.as_mut() {
+        ranges.sort_by_key(|r| r.min_tokens);
+    }
 
     pricing
 }
@@ -287,9 +307,14 @@ pub fn save_to_cache(pricing: &HashMap<String, ModelPricing>) -> Result<()> {
 
 /// Filters out models whose every pricing field is zero (unpriced / free).
 ///
-/// A model is kept if any base price is non-zero OR it has non-empty range
-/// pricing. Tiers alone are not sufficient to keep a model: tiers without base
-/// prices (or non-zero tier prices) are effectively unpriced.
+/// A model is kept if **any** of the following yields a non-zero price:
+/// - The base-level per-token costs.
+/// - Any tier entry (`ThresholdTier`) with at least one non-zero field.
+/// - Any range entry (`TierRange`) with at least one non-zero field.
+///
+/// Models are dropped only when every strategy they publish is entirely zero;
+/// this preserves synthetic models that ship tier or range data without base
+/// prices, while still excluding free / placeholder entries from LiteLLM.
 pub fn normalize_pricing(
     mut pricing: HashMap<String, ModelPricing>,
 ) -> HashMap<String, ModelPricing> {
@@ -298,14 +323,26 @@ pub fn normalize_pricing(
             || p.output_cost_per_token != 0.0
             || p.cache_read_input_token_cost != 0.0
             || p.cache_creation_input_token_cost != 0.0;
-        let has_ranges = p.ranges.as_ref().map(|r| !r.is_empty()).unwrap_or(false);
         let has_nonzero_tier = p.tiers.iter().any(|t| {
             t.input_cost_per_token != 0.0
                 || t.output_cost_per_token != 0.0
                 || t.cache_read_input_token_cost != 0.0
                 || t.cache_creation_input_token_cost != 0.0
+                || t.cache_creation_input_token_cost_above_1hr != 0.0
         });
-        has_base || has_ranges || has_nonzero_tier
+        let has_nonzero_range = p
+            .ranges
+            .as_ref()
+            .map(|rs| {
+                rs.iter().any(|r| {
+                    r.input_cost_per_token != 0.0
+                        || r.output_cost_per_token != 0.0
+                        || r.cache_read_input_token_cost != 0.0
+                        || r.output_cost_per_reasoning_token != 0.0
+                })
+            })
+            .unwrap_or(false);
+        has_base || has_nonzero_tier || has_nonzero_range
     });
     pricing
 }
@@ -438,6 +475,84 @@ mod parser_tests {
         });
         let p = parse_litellm_entry(&raw);
         assert!(p.ranges.is_none());
+    }
+
+    #[test]
+    fn parses_combined_1hr_plus_200k_tier() {
+        // Claude 3.5 Sonnet-like: has both `_above_1hr` (base) and
+        // `_above_1hr_above_200k_tokens` (tiered 1hr). Verify the tiered 1hr
+        // price lands on the right tier entry, not inherited from base.
+        let raw = json!({
+            "input_cost_per_token": 3e-6,
+            "output_cost_per_token": 1.5e-5,
+            "cache_creation_input_token_cost": 3.75e-6,
+            "cache_creation_input_token_cost_above_1hr": 7.5e-6,
+            "input_cost_per_token_above_200k_tokens": 6e-6,
+            "output_cost_per_token_above_200k_tokens": 2.25e-5,
+            "cache_creation_input_token_cost_above_200k_tokens": 7.5e-6,
+            "cache_creation_input_token_cost_above_1hr_above_200k_tokens": 1.5e-5
+        });
+        let p = parse_litellm_entry(&raw);
+        assert_eq!(p.cache_creation_input_token_cost_above_1hr, 7.5e-6);
+        assert_eq!(p.tiers.len(), 1);
+        let t = &p.tiers[0];
+        assert_eq!(t.threshold_tokens, 200_000);
+        assert_eq!(t.cache_creation_input_token_cost, 7.5e-6);
+        // The tiered 1hr price must be $15/M (from `_above_1hr_above_200k_tokens`),
+        // NOT the base 1hr $7.5/M.
+        assert_eq!(t.cache_creation_input_token_cost_above_1hr, 1.5e-5);
+    }
+
+    #[test]
+    fn tier_1hr_left_zero_when_missing_so_calculate_cost_can_fall_back() {
+        // If LiteLLM publishes a 200K tier but omits the 1hr-tiered field, the
+        // parser must NOT inherit base 1hr (that could yield tier_1hr < tier_5m).
+        let raw = json!({
+            "input_cost_per_token": 3e-6,
+            "cache_creation_input_token_cost": 3.75e-6,
+            "cache_creation_input_token_cost_above_1hr": 6e-6,
+            "cache_creation_input_token_cost_above_200k_tokens": 7.5e-6
+        });
+        let p = parse_litellm_entry(&raw);
+        assert_eq!(p.cache_creation_input_token_cost_above_1hr, 6e-6);
+        let t = &p.tiers[0];
+        assert_eq!(t.cache_creation_input_token_cost, 7.5e-6);
+        assert_eq!(t.cache_creation_input_token_cost_above_1hr, 0.0);
+    }
+
+    #[test]
+    fn old_cache_format_is_rejected_by_deny_unknown_fields() {
+        // A pre-Phase-1 cache entry had `input_cost_per_token_above_200k_tokens`
+        // as a flat field. With `deny_unknown_fields` on ModelPricing, parsing
+        // MUST fail so `load_from_cache` returns Err → caller refetches.
+        let old_format = r#"{
+            "input_cost_per_token": 3e-6,
+            "output_cost_per_token": 1.5e-5,
+            "input_cost_per_token_above_200k_tokens": 6e-6
+        }"#;
+        let result: Result<ModelPricing, _> = serde_json::from_str(old_format);
+        assert!(
+            result.is_err(),
+            "stale cache entry with removed fields must be rejected"
+        );
+    }
+
+    #[test]
+    fn ranges_are_sorted_by_min_tokens_after_parse() {
+        // Feed intentionally-unsorted ranges; parser should sort ascending.
+        let raw = json!({
+            "tiered_pricing": [
+                {"range": [128_000, 256_000], "input_cost_per_token": 3e-6},
+                {"range": [0, 32_000],        "input_cost_per_token": 1e-6},
+                {"range": [32_000, 128_000],  "input_cost_per_token": 2e-6}
+            ]
+        });
+        let p = parse_litellm_entry(&raw);
+        let ranges = p.ranges.expect("ranges");
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(ranges[0].min_tokens, 0);
+        assert_eq!(ranges[1].min_tokens, 32_000);
+        assert_eq!(ranges[2].min_tokens, 128_000);
     }
 
     #[test]
