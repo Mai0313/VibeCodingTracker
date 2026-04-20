@@ -192,6 +192,9 @@ vct usage --table --monthly
 vct usage --json --daily
 ```
 
+> [!NOTE]
+> Model rows are sorted by cost in ascending order, so the highest-spending model sits right above the `TOTAL` row. This applies to the interactive dashboard, `--table`, and `--text` output; `--json` preserves the same order.
+
 ### Preview: Interactive Dashboard (`vct usage`)
 
 ```
@@ -201,9 +204,9 @@ vct usage --json --daily
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
 │ Model                              Input     Output    Cache Read  Cache Create  Total Cost │
 │                                                                                             │
+│ gemini-3.1-pro-preview             129,115   10,339    67,385      0             $0.40      │
 │ claude-haiku-4-5-20251001          5,567     19,769    4,627,938   619,816       $1.34      │
 │ claude-opus-4-6                    25,651    179,066   40,830,154  2,572,258     $77.59     │
-│ gemini-3.1-pro-preview             129,115   10,339    67,385      0             $0.40      │
 │ TOTAL                              160,333   209,174   45,525,477  3,192,074     $79.33     │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐

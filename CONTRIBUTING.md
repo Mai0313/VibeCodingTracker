@@ -80,7 +80,7 @@ Unsure where to begin contributing? You can start by looking through `good first
 │   ├── analysis/     # JSONL parsers (claude / codex / copilot / gemini) + detector
 │   ├── cache/        # LRU + pricing cache
 │   ├── cli.rs        # clap definitions (commands, flags, TimeRange enum)
-│   ├── display/      # TUI dashboards, static tables, plain-text renderers
+│   ├── display/      # TUI dashboards, static tables, plain-text renderers (usage rows sorted by cost ascending)
 │   ├── pricing/      # LiteLLM fetch, fuzzy model matching, cost calculation
 │   ├── update/       # Self-update via GitHub releases (archive extraction)
 │   ├── usage/        # Per-provider token aggregation
