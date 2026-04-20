@@ -4,13 +4,12 @@ mod matching;
 
 use crate::utils::get_current_date;
 use anyhow::{Context, Result};
-use std::collections::HashMap;
 
 const LITELLM_PRICING_URL: &str =
     "https://github.com/BerriAI/litellm/raw/refs/heads/main/model_prices_and_context_window.json";
 
 // Re-export public types and functions
-pub use cache::ModelPricing;
+pub use cache::{ModelPricing, ThresholdTier, TierRange};
 pub use calculation::calculate_cost;
 pub use matching::{
     ModelPricingMap, ModelPricingResult, clear_pricing_cache, normalize_model_name,
@@ -48,11 +47,12 @@ pub fn fetch_model_pricing() -> Result<ModelPricingMap> {
         .send()
         .context("Failed to fetch model pricing from LiteLLM")?;
 
-    let pricing: HashMap<String, ModelPricing> = response
+    let raw: serde_json::Value = response
         .json()
         .context("Failed to parse model pricing JSON")?;
+    let pricing = cache::parse_litellm_pricing_map(raw);
 
-    // Normalize pricing: filter out models with all 0 costs, and fill above_200k prices with base prices
+    // Filter out models with entirely zero pricing (free / unpriced entries).
     let normalized_pricing = cache::normalize_pricing(pricing);
 
     // Save to cache with today's date
@@ -72,9 +72,12 @@ pub use cache::normalize_pricing;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
-    fn test_normalize_pricing() {
+    fn test_normalize_pricing_preserves_valid_model() {
+        // normalize_pricing no longer mutates prices — it only drops zero-cost
+        // entries. Verify a model with valid base prices survives unchanged.
         let mut pricing_map = HashMap::new();
         pricing_map.insert(
             "test-model".to_string(),
@@ -83,31 +86,19 @@ mod tests {
                 output_cost_per_token: 0.000002,
                 cache_read_input_token_cost: 0.0000001,
                 cache_creation_input_token_cost: 0.0000005,
-                // above_200k prices are 0.0
                 ..Default::default()
             },
         );
 
         let normalized = cache::normalize_pricing(pricing_map);
-        let test_pricing = normalized.get("test-model").unwrap();
+        let p = normalized.get("test-model").unwrap();
 
-        // Verify above_200k prices were filled with base prices
-        assert_eq!(
-            test_pricing.input_cost_per_token_above_200k_tokens,
-            0.000001
-        );
-        assert_eq!(
-            test_pricing.output_cost_per_token_above_200k_tokens,
-            0.000002
-        );
-        assert_eq!(
-            test_pricing.cache_read_input_token_cost_above_200k_tokens,
-            0.0000001
-        );
-        assert_eq!(
-            test_pricing.cache_creation_input_token_cost_above_200k_tokens,
-            0.0000005
-        );
+        assert_eq!(p.input_cost_per_token, 0.000001);
+        assert_eq!(p.output_cost_per_token, 0.000002);
+        assert_eq!(p.cache_read_input_token_cost, 0.0000001);
+        assert_eq!(p.cache_creation_input_token_cost, 0.0000005);
+        assert!(p.tiers.is_empty());
+        assert!(p.ranges.is_none());
     }
 
     #[test]
