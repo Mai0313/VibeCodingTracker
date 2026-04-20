@@ -146,11 +146,30 @@ Commands:
   help        Print this message or the help of the given subcommand(s)
 ```
 
+Time range flags (shared by `usage` and `analysis`, mutually exclusive, default `--all`):
+
+| Flag        | Window                                    |
+| ----------- | ----------------------------------------- |
+| `--daily`   | Sessions modified today                   |
+| `--weekly`  | Current ISO week (Monday → today)         |
+| `--monthly` | Current calendar month                    |
+| `--all`     | Every session on disk (default)           |
+
 ---
 
 ## 💰 Usage Command
 
 **Track your spending across all AI coding sessions.**
+
+### Flags
+
+| Flag                                           | Purpose                              |
+| ---------------------------------------------- | ------------------------------------ |
+| *(none)*                                       | Interactive TUI dashboard (default)  |
+| `--table`                                      | Static table, no TUI                 |
+| `--text`                                       | Plain text, script-friendly          |
+| `--json`                                       | JSON with enriched pricing metadata  |
+| `--daily` / `--weekly` / `--monthly` / `--all` | Time range filter (see table above)  |
 
 ### Basic Usage
 
@@ -164,14 +183,13 @@ vct usage --table
 # Plain text for scripts
 vct usage --text
 
-# JSON for data processing
+# JSON for data processing (includes cost_usd and matched_model fields)
 vct usage --json
 
-# Filter by time range (default: --all)
-vct usage --daily      # Today only
-vct usage --weekly     # This week
-vct usage --monthly    # This month
-vct usage --table --weekly  # Combine with output format
+# Combine time range with output format
+vct usage --weekly
+vct usage --table --monthly
+vct usage --json --daily
 ```
 
 ### Preview: Interactive Dashboard (`vct usage`)
@@ -216,6 +234,19 @@ The tool automatically scans these directories:
 
 **Deep dive into code operations — see exactly what your AI assistant did.**
 
+### Flags
+
+| Flag                                           | Purpose                                                             |
+| ---------------------------------------------- | ------------------------------------------------------------------- |
+| *(none)*                                       | Interactive TUI dashboard over all sessions                         |
+| `--path <FILE>`                                | Analyze a single JSONL/JSON conversation file (prints JSON)         |
+| `--table`                                      | Static table with per-provider daily averages                       |
+| `--output <FILE>`                              | Save results as pretty-printed JSON                                 |
+| `--by-provider`                                | Group rows by provider (claude / codex / copilot / gemini) as JSON  |
+| `--daily` / `--weekly` / `--monthly` / `--all` | Time range filter (see table above)                                 |
+
+See [`examples/`](examples/) for sample inputs and matching JSON outputs for all four providers.
+
 ### Basic Usage
 
 ```bash
@@ -225,7 +256,7 @@ vct analysis
 # Static table output with daily averages
 vct analysis --table
 
-# Analyze a single conversation file
+# Analyze a single conversation file → stdout JSON
 vct analysis --path ~/.claude/projects/session.jsonl
 
 # Save results to JSON
@@ -237,11 +268,10 @@ vct analysis --by-provider
 # Save grouped results
 vct analysis --by-provider --output grouped_report.json
 
-# Filter by time range (default: --all)
-vct analysis --daily       # Today only
-vct analysis --weekly      # This week
-vct analysis --monthly     # This month
-vct analysis --table --weekly  # Combine with output format
+# Combine time range with output format
+vct analysis --weekly
+vct analysis --table --monthly
+vct analysis --by-provider --daily --output today.json
 ```
 
 ### Preview: Interactive Dashboard (`vct analysis`)
@@ -299,6 +329,20 @@ vct update --force
 🔍 Checking for latest release...
 ✅ Latest version: v0.5.10 — you are up to date!
 ```
+
+---
+
+## 🏷️ Version Command
+
+Report the embedded build metadata (binary version, Rust toolchain, Cargo version):
+
+```bash
+vct version          # Pretty table
+vct version --text   # One-field-per-line, script-friendly
+vct version --json   # Machine-readable JSON
+```
+
+The binary version is produced at build time by `build.rs` from `git describe`, so development builds include commit count + short SHA + `dirty` suffix when applicable.
 
 ---
 

@@ -12,9 +12,16 @@ All types of contributions are encouraged and valued. See the [Table of Contents
     - [Suggesting Enhancements](#suggesting-enhancements)
     - [Your First Code Contribution](#your-first-code-contribution)
     - [Development Guide](#development-guide)
+        - [Prerequisites](#prerequisites)
+        - [Project Layout](#project-layout)
         - [Building from Source](#building-from-source)
         - [Running Tests](#running-tests)
+        - [Benchmarks](#benchmarks)
         - [Code Quality](#code-quality)
+        - [Pre-commit Hooks](#pre-commit-hooks)
+        - [Commit Convention](#commit-convention)
+        - [Pull Requests](#pull-requests)
+        - [Release & Packaging](#release--packaging)
 
 ## I Have a Question
 
@@ -24,7 +31,7 @@ If you then still feel the need to ask a question and need clarification, we rec
 
 - Open an [Issue](https://github.com/Mai0313/VibeCodingTracker/issues/new).
 - Provide as much context as you can about what you're running into.
-- Provide project and platform versions (nodejs, mac, linux, rust, etc), depending on what seems relevant.
+- Provide project and platform versions (Rust toolchain, OS, Node.js, Python, etc.), depending on what seems relevant.
 
 ## I Want To Contribute
 
@@ -32,9 +39,10 @@ If you then still feel the need to ask a question and need clarification, we rec
 
 A good bug report shouldn't leave others needing to chase you up for more information. Therefore, we ask you to investigate carefully, collect information and describe the issue in detail in your report.
 
-- Make sure that you are using the latest version.
-- Determine if your bug is really a bug and not an error on your side e.g. using incompatible environment components/versions (Make sure that you have read the [documentation](README.md)).
-- Check if other users have experienced (and potentially already solved) the same issue you are having. Check if there is not already a bug report existing for your bug or error in the [bug tracker](https://github.com/Mai0313/VibeCodingTracker/issues).
+- Make sure that you are using the latest version (`vct update --check`).
+- Determine if your bug is really a bug and not an error on your side, e.g. using incompatible environment components/versions (make sure that you have read the [documentation](README.md)).
+- Check if other users have experienced (and potentially already solved) the same issue in the [bug tracker](https://github.com/Mai0313/VibeCodingTracker/issues).
+- Include the `vct version --json` output, the exact command you ran, and any relevant JSONL snippet (scrubbed of secrets) so we can reproduce it.
 
 ### Suggesting Enhancements
 
@@ -51,52 +59,175 @@ Unsure where to begin contributing? You can start by looking through `good first
 
 ### Development Guide
 
-#### Building from Source
+#### Prerequisites
 
-For users who want to customize the build or contribute to development:
+- [Rust toolchain](https://rustup.rs/) **1.85 or higher** — this project targets the **Rust 2024 edition**. Update with `rustup update` if needed.
+- `rustfmt` and `clippy` components (installed by default with `rustup`).
+- Optional: [`pre-commit`](https://pre-commit.com/), [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov) for coverage, and Docker if you plan to touch the image build.
+
+> [!NOTE]
+> `build.rs` embeds the git describe output into the binary as the version string. Building outside a git worktree falls back to the `Cargo.toml` version.
+
+#### Project Layout
+
+```
+.
+├── benches/          # Criterion benchmarks (pricing, parsing, aggregation)
+├── cli/              # npm and PyPI wrapper packages (nodejs/, python/)
+├── docker/           # Multi-stage Dockerfile (builder → ubuntu:24.04 prod)
+├── examples/         # Sample session files and analysis outputs
+├── src/
+│   ├── analysis/     # JSONL parsers (claude / codex / copilot / gemini) + detector
+│   ├── cache/        # LRU + pricing cache
+│   ├── cli.rs        # clap definitions (commands, flags, TimeRange enum)
+│   ├── display/      # TUI dashboards, static tables, plain-text renderers
+│   ├── pricing/      # LiteLLM fetch, fuzzy model matching, cost calculation
+│   ├── update/       # Self-update via GitHub releases (archive extraction)
+│   ├── usage/        # Per-provider token aggregation
+│   └── utils/        # Path resolution, directory walking, time helpers
+└── tests/            # Integration suite + per-module unit tests
+```
+
+#### Building from Source
 
 ```bash
 # 1. Clone the repository
 git clone https://github.com/Mai0313/VibeCodingTracker.git
 cd VibeCodingTracker
 
-# 2. Build release version
-cargo build --release
+# 2. Debug build (fast iteration)
+cargo build
 
-# 3. Binary location
-./target/release/vibe_coding_tracker
+# 3. Release build (recommended for benchmarking / dogfooding)
+cargo build --release --locked
 
-# 4. Optional: create a short alias
+# 4. Binary location
+./target/release/vibe_coding_tracker --help
+
+# 5. Optional: create a short alias
 # Linux/macOS:
 sudo ln -sf "$(pwd)/target/release/vibe_coding_tracker" /usr/local/bin/vct
 
-# Or install to user directory:
+# Or install to user directory (make sure ~/.local/bin is in PATH):
 mkdir -p ~/.local/bin
 ln -sf "$(pwd)/target/release/vibe_coding_tracker" ~/.local/bin/vct
-# Make sure ~/.local/bin is in your PATH
 ```
 
-**Prerequisites**: [Rust toolchain](https://rustup.rs/) 1.85 or higher
+Two release profiles are defined in `Cargo.toml`:
 
-> [!NOTE]
-> This project uses **Rust 2024 edition** and requires Rust 1.85+. Update your toolchain with `rustup update` if needed.
+- `release` — thin LTO, good default for local release builds.
+- `dist` — fat LTO, single codegen unit; used for distribution artifacts. Invoke via `cargo build --profile dist --locked`.
+
+Common Makefile shortcuts (`make help` to list all):
+
+| Target          | Description                                          |
+| --------------- | ---------------------------------------------------- |
+| `make build`    | Debug build (`cargo build`)                          |
+| `make release`  | Locked release build (`cargo build --release --locked`) |
+| `make package`  | `cargo package --locked --allow-dirty`               |
+| `make test`     | Run the full `cargo test --all` suite                |
+| `make fmt`      | `cargo fmt --all` + `cargo clippy --all-targets --all-features` |
+| `make coverage` | Install & run `cargo-llvm-cov` for workspace coverage |
+| `make clean`    | Remove build artifacts and prune git objects         |
 
 #### Running Tests
 
-Before submitting a pull request, ensure all tests pass:
+The tests are organized into three tiers. See [`tests/README.md`](tests/README.md) for the full breakdown.
 
 ```bash
-cargo test
+# Everything (library + integration + per-module unit tests)
+cargo test --all
+
+# Integration tests only (end-to-end, no TUI)
+cargo test --test integration_tests
+
+# A specific unit test file
+cargo test --test test_detector
+cargo test --test test_pricing_matching
+
+# Run a single test by name
+cargo test test_exact_match -- --nocapture
+
+# Run sequentially (useful when debugging flaky parallel tests)
+cargo test -- --test-threads=1
 ```
+
+Before opening a PR, please ensure `cargo test --all` passes locally.
+
+#### Benchmarks
+
+Performance-sensitive code paths (pricing lookup, JSONL parsing, aggregation) have Criterion benchmarks in `benches/benchmarks.rs`:
+
+```bash
+cargo bench
+# Reports are written to target/criterion/*/report/index.html
+```
+
+When optimizing, include before/after numbers in the PR description.
 
 #### Code Quality
 
-We use `rustfmt` and `clippy` to ensure code quality. Please run the following commands to check your code before submitting a pull request:
+We use `rustfmt` and `clippy` to ensure code quality. The CI (`.github/workflows/code-quality-check.yml`) runs both with `-D warnings`, so please run them locally before submitting:
 
 ```bash
 # Format your code
 cargo fmt --all
 
-# Run linting checks
+# Check formatting without modifying files (same as CI)
+cargo fmt --all -- --check
+
+# Run linting checks (warnings are errors in CI)
 cargo clippy --all-targets --all-features -- -D warnings
 ```
+
+#### Pre-commit Hooks
+
+The repository ships a `.pre-commit-config.yaml` covering whitespace/EOL fixes, JSON/YAML/TOML linting, `mdformat` for Markdown, `gitleaks` for secret scanning, and `shellcheck`. Install once:
+
+```bash
+# Install the pre-commit tool itself
+pipx install pre-commit            # or: uv tool install pre-commit
+
+# Install the git hooks into .git/hooks/
+pre-commit install --install-hooks
+
+# Run against all files (what CI does)
+pre-commit run --all-files
+```
+
+#### Commit Convention
+
+All commit messages must be written in **English** and follow the [Conventional Commits](https://www.conventionalcommits.org/) specification. The `semantic-pull-request` workflow enforces this on PR titles, and `git-cliff` consumes these prefixes to generate release notes.
+
+Accepted types (see `Cargo.toml` → `package.metadata.git-cliff.git.commit_parsers` for the full list):
+
+- `feat:` — a new feature
+- `fix:` — a bug fix
+- `docs:` — documentation-only changes
+- `perf:` — performance improvement
+- `refactor:` — code restructuring without behavior change
+- `style:` — formatting / whitespace
+- `test:` — adding or adjusting tests
+- `chore:` / `ci:` — tooling, dependencies, CI
+
+Example:
+
+```
+feat(usage): add --weekly time range filter
+
+Aggregate sessions whose modified date falls within the current ISO week.
+```
+
+#### Pull Requests
+
+1. Fork the repository and create a topic branch (`feat/...`, `fix/...`, `docs/...`).
+2. Make focused commits following the convention above.
+3. Ensure `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all` pass.
+4. Update the relevant README files (`README.md`, `README.zh-CN.md`, `README.zh-TW.md`) when behavior or flags change — all three languages should stay in sync.
+5. Open the PR against `main`. The title must satisfy the semantic-pull-request check.
+
+#### Release & Packaging
+
+- **Crates.io**: `cargo package --locked --allow-dirty` locally; publishing is automated via `.github/workflows/build_release.yml`.
+- **npm / PyPI**: wrapper packages live under `cli/nodejs` and `cli/python`. They download the matching GitHub release binary at install time.
+- **Docker**: `docker build -f docker/Dockerfile --target prod -t vibe_coding_tracker:latest .` produces an `ubuntu:24.04`-based image that runs the release binary as `ENTRYPOINT`.

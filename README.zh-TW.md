@@ -146,11 +146,30 @@ Commands:
   help        Print this message or the help of the given subcommand(s)
 ```
 
+時間範圍 flag（`usage` 與 `analysis` 共用，互斥，預設 `--all`）：
+
+| Flag        | 範圍                                     |
+| ----------- | ---------------------------------------- |
+| `--daily`   | 今天更新過的 session                     |
+| `--weekly`  | 本 ISO 週（週一 → 今天）                 |
+| `--monthly` | 本自然月                                 |
+| `--all`     | 磁碟上所有 session（預設）               |
+
 ---
 
 ## 💰 Usage 指令
 
 **追蹤你在所有 AI 程式設計工作階段的花費。**
+
+### Flag 一覽
+
+| Flag                                           | 用途                                    |
+| ---------------------------------------------- | --------------------------------------- |
+| *(不帶參數)*                                   | 互動式 TUI 儀表板（預設）               |
+| `--table`                                      | 靜態表格，不啟動 TUI                    |
+| `--text`                                       | 純文字，適合腳本處理                    |
+| `--json`                                       | JSON 輸出，附帶 pricing 資訊            |
+| `--daily` / `--weekly` / `--monthly` / `--all` | 時間範圍篩選（見上方表格）              |
 
 ### 基本用法
 
@@ -164,14 +183,13 @@ vct usage --table
 # Plain text for scripts
 vct usage --text
 
-# JSON for data processing
+# JSON 輸出，包含 cost_usd 與 matched_model 欄位
 vct usage --json
 
-# 依時間範圍篩選（預設：--all）
-vct usage --daily      # 僅顯示今天
-vct usage --weekly     # 本週
-vct usage --monthly    # 本月
-vct usage --table --weekly  # 可與輸出格式組合使用
+# 時間範圍與輸出格式可自由組合
+vct usage --weekly
+vct usage --table --monthly
+vct usage --json --daily
 ```
 
 ### 預覽：互動式儀表板（`vct usage`）
@@ -216,6 +234,19 @@ vct usage --table --weekly  # 可與輸出格式組合使用
 
 **深入分析程式碼操作——精確掌握你的 AI 助手做了哪些事。**
 
+### Flag 一覽
+
+| Flag                                           | 用途                                                                |
+| ---------------------------------------------- | ------------------------------------------------------------------- |
+| *(不帶參數)*                                   | 互動式 TUI 儀表板，涵蓋所有 session                                 |
+| `--path <FILE>`                                | 分析單一 JSONL/JSON 對話檔案（stdout 輸出 JSON）                    |
+| `--table`                                      | 靜態表格，附帶每日平均值                                            |
+| `--output <FILE>`                              | 將結果以格式化 JSON 存成檔案                                        |
+| `--by-provider`                                | 依 provider（claude / codex / copilot / gemini）分組並輸出 JSON     |
+| `--daily` / `--weekly` / `--monthly` / `--all` | 時間範圍篩選（見上方表格）                                          |
+
+請參考 [`examples/`](examples/) 目錄，裡面有四種 provider 的範例輸入與對應的 JSON 輸出。
+
 ### 基本用法
 
 ```bash
@@ -225,7 +256,7 @@ vct analysis
 # Static table output with daily averages
 vct analysis --table
 
-# Analyze a single conversation file
+# 分析單一對話檔案 → stdout JSON
 vct analysis --path ~/.claude/projects/session.jsonl
 
 # Save results to JSON
@@ -237,11 +268,10 @@ vct analysis --by-provider
 # Save grouped results
 vct analysis --by-provider --output grouped_report.json
 
-# 依時間範圍篩選（預設：--all）
-vct analysis --daily       # 僅顯示今天
-vct analysis --weekly      # 本週
-vct analysis --monthly     # 本月
-vct analysis --table --weekly  # 可與輸出格式組合使用
+# 時間範圍與輸出格式可自由組合
+vct analysis --weekly
+vct analysis --table --monthly
+vct analysis --by-provider --daily --output today.json
 ```
 
 ### 預覽：互動式儀表板（`vct analysis`）
@@ -299,6 +329,20 @@ vct update --force
 🔍 Checking for latest release...
 ✅ Latest version: v0.5.10 — you are up to date!
 ```
+
+---
+
+## 🏷️ Version 指令
+
+檢視內建的建置資訊（binary version、Rust toolchain、Cargo version）：
+
+```bash
+vct version          # 彩色表格
+vct version --text   # 每行一個欄位，適合腳本
+vct version --json   # 機器可讀的 JSON
+```
+
+Binary version 由 `build.rs` 在編譯期透過 `git describe` 寫入，開發版本會附上 commit 數、short SHA 與 `dirty` 後綴。
 
 ---
 
