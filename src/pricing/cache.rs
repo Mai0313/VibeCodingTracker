@@ -173,7 +173,8 @@ pub fn parse_litellm_entry(value: &serde_json::Value) -> ModelPricing {
                     if let Some(th) = parse_threshold_suffix(suffix) {
                         tier_output.insert(th, num_value);
                     }
-                } else if let Some(suffix) = key.strip_prefix("cache_read_input_token_cost_above_") {
+                } else if let Some(suffix) = key.strip_prefix("cache_read_input_token_cost_above_")
+                {
                     if let Some(th) = parse_threshold_suffix(suffix) {
                         tier_cache_read.insert(th, num_value);
                     }
@@ -212,9 +213,7 @@ pub fn parse_litellm_entry(value: &serde_json::Value) -> ModelPricing {
         .into_iter()
         .map(|th| ThresholdTier {
             threshold_tokens: th,
-            input_cost_per_token: *tier_input
-                .get(&th)
-                .unwrap_or(&pricing.input_cost_per_token),
+            input_cost_per_token: *tier_input.get(&th).unwrap_or(&pricing.input_cost_per_token),
             output_cost_per_token: *tier_output
                 .get(&th)
                 .unwrap_or(&pricing.output_cost_per_token),
@@ -284,6 +283,31 @@ pub fn save_to_cache(pricing: &HashMap<String, ModelPricing>) -> Result<()> {
 
     cleanup_old_cache();
     Ok(())
+}
+
+/// Filters out models whose every pricing field is zero (unpriced / free).
+///
+/// A model is kept if any base price is non-zero OR it has non-empty range
+/// pricing. Tiers alone are not sufficient to keep a model: tiers without base
+/// prices (or non-zero tier prices) are effectively unpriced.
+pub fn normalize_pricing(
+    mut pricing: HashMap<String, ModelPricing>,
+) -> HashMap<String, ModelPricing> {
+    pricing.retain(|_name, p| {
+        let has_base = p.input_cost_per_token != 0.0
+            || p.output_cost_per_token != 0.0
+            || p.cache_read_input_token_cost != 0.0
+            || p.cache_creation_input_token_cost != 0.0;
+        let has_ranges = p.ranges.as_ref().map(|r| !r.is_empty()).unwrap_or(false);
+        let has_nonzero_tier = p.tiers.iter().any(|t| {
+            t.input_cost_per_token != 0.0
+                || t.output_cost_per_token != 0.0
+                || t.cache_read_input_token_cost != 0.0
+                || t.cache_creation_input_token_cost != 0.0
+        });
+        has_base || has_ranges || has_nonzero_tier
+    });
+    pricing
 }
 
 #[cfg(test)]
@@ -433,33 +457,4 @@ mod parser_tests {
         assert!(p.tiers.is_empty());
         assert!(p.ranges.is_none());
     }
-}
-
-/// Filters out models whose every pricing field is zero (unpriced / free).
-///
-/// A model is kept if any base price is non-zero OR it has non-empty range
-/// pricing. Tiers alone are not sufficient to keep a model: tiers without base
-/// prices (or non-zero tier prices) are effectively unpriced.
-pub fn normalize_pricing(
-    mut pricing: HashMap<String, ModelPricing>,
-) -> HashMap<String, ModelPricing> {
-    pricing.retain(|_name, p| {
-        let has_base = p.input_cost_per_token != 0.0
-            || p.output_cost_per_token != 0.0
-            || p.cache_read_input_token_cost != 0.0
-            || p.cache_creation_input_token_cost != 0.0;
-        let has_ranges = p
-            .ranges
-            .as_ref()
-            .map(|r| !r.is_empty())
-            .unwrap_or(false);
-        let has_nonzero_tier = p.tiers.iter().any(|t| {
-            t.input_cost_per_token != 0.0
-                || t.output_cost_per_token != 0.0
-                || t.cache_read_input_token_cost != 0.0
-                || t.cache_creation_input_token_cost != 0.0
-        });
-        has_base || has_ranges || has_nonzero_tier
-    });
-    pricing
 }

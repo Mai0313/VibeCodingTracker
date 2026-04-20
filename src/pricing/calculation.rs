@@ -29,12 +29,7 @@ pub fn calculate_cost(
     if let Some(ranges) = &pricing.ranges {
         // Range-based pricing is Qwen-only; it doesn't have a 1hr concept, so
         // collapse both TTL buckets into the total for rate selection.
-        return calculate_cost_ranges(
-            input_tokens,
-            output_tokens,
-            cache_read_tokens,
-            ranges,
-        );
+        return calculate_cost_ranges(input_tokens, output_tokens, cache_read_tokens, ranges);
     }
 
     let total_input_context = input_tokens + cache_read_tokens + total_cache_creation;
@@ -106,8 +101,8 @@ fn calculate_cost_ranges(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::cache::ThresholdTier;
+    use super::*;
 
     fn flat_pricing() -> ModelPricing {
         ModelPricing {
@@ -144,10 +139,8 @@ mod tests {
         let p = flat_pricing();
         // 200 of cache_creation goes into the 5m bucket (no TTL split available).
         let cost = calculate_cost(1000, 500, 200, 100, 0, &p);
-        let expected = 1000.0 * 0.000003
-            + 500.0 * 0.000015
-            + 200.0 * 0.0000003
-            + 100.0 * 0.00000375;
+        let expected =
+            1000.0 * 0.000003 + 500.0 * 0.000015 + 200.0 * 0.0000003 + 100.0 * 0.00000375;
         assert_eq!(cost, expected);
     }
 
@@ -156,10 +149,8 @@ mod tests {
         let p = sonnet_like_pricing();
         // Total input context = 1000 + 200 + 100 = 1300 ≤ 200K → base prices
         let cost = calculate_cost(1000, 500, 200, 100, 0, &p);
-        let expected = 1000.0 * 0.000003
-            + 500.0 * 0.000015
-            + 200.0 * 0.0000003
-            + 100.0 * 0.00000375;
+        let expected =
+            1000.0 * 0.000003 + 500.0 * 0.000015 + 200.0 * 0.0000003 + 100.0 * 0.00000375;
         assert_eq!(cost, expected);
     }
 
