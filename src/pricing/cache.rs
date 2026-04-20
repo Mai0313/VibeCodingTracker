@@ -13,6 +13,11 @@ use std::fs;
 /// for ALL token types on the model. Matches the Anthropic / Google "above Nk
 /// tokens" model where the entire request switches to a higher rate once the
 /// prompt crosses a size threshold.
+///
+/// `cache_creation_input_token_cost_above_1hr` is the price for cache writes
+/// with Anthropic's extended (1 hour) TTL. A value of `0.0` means the model
+/// doesn't offer 1hr cached writes at this tier — callers should fall back to
+/// the 5-minute (`cache_creation_input_token_cost`) price.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct ThresholdTier {
     pub threshold_tokens: i64,
@@ -24,6 +29,8 @@ pub struct ThresholdTier {
     pub cache_read_input_token_cost: f64,
     #[serde(default)]
     pub cache_creation_input_token_cost: f64,
+    #[serde(default)]
+    pub cache_creation_input_token_cost_above_1hr: f64,
 }
 
 /// A single range for range-based tiered pricing (Qwen / doubao style).
@@ -66,6 +73,12 @@ pub struct ModelPricing {
     #[serde(default)]
     pub cache_creation_input_token_cost: f64,
 
+    /// Price per token for cache writes using Anthropic's extended (1 hour) TTL.
+    /// `0.0` means the model doesn't support 1hr cached writes — callers fall
+    /// back to `cache_creation_input_token_cost` (5-minute TTL price).
+    #[serde(default)]
+    pub cache_creation_input_token_cost_above_1hr: f64,
+
     /// Threshold-based tiers, sorted ascending by `threshold_tokens`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tiers: Vec<ThresholdTier>,
@@ -107,9 +120,9 @@ fn parse_tier_range(value: &serde_json::Value) -> Option<TierRange> {
 ///
 /// Extracts base prices, consolidates all `*_above_Nk_tokens` fields into
 /// `ThresholdTier` rows keyed by the numeric threshold, and parses
-/// `tiered_pricing` arrays into `TierRange` rows. Unsupported fields
-/// (batch / priority / audio / computer_use / above_1hr cache duration) are
-/// ignored — they are tracked as known gaps for future work.
+/// `tiered_pricing` arrays into `TierRange` rows. `cache_creation_input_token_cost_above_1hr`
+/// is captured as a separate 1-hour TTL price (base and per-tier). Unsupported
+/// fields (batch / priority / audio / computer_use) are ignored.
 pub fn parse_litellm_entry(value: &serde_json::Value) -> ModelPricing {
     let obj = match value.as_object() {
         Some(o) => o,
@@ -121,6 +134,8 @@ pub fn parse_litellm_entry(value: &serde_json::Value) -> ModelPricing {
     let mut tier_output: HashMap<i64, f64> = HashMap::new();
     let mut tier_cache_read: HashMap<i64, f64> = HashMap::new();
     let mut tier_cache_creation: HashMap<i64, f64> = HashMap::new();
+    // 1-hour TTL variants: a threshold of 0 means the base (non-tiered) 1hr price.
+    let mut tier_cache_creation_1hr: HashMap<i64, f64> = HashMap::new();
 
     for (key, raw_val) in obj {
         if key == "tiered_pricing" {
@@ -142,7 +157,13 @@ pub fn parse_litellm_entry(value: &serde_json::Value) -> ModelPricing {
             "input_cost_per_token" => pricing.input_cost_per_token = num_value,
             "output_cost_per_token" => pricing.output_cost_per_token = num_value,
             "cache_read_input_token_cost" => pricing.cache_read_input_token_cost = num_value,
-            "cache_creation_input_token_cost" => pricing.cache_creation_input_token_cost = num_value,
+            "cache_creation_input_token_cost" => {
+                pricing.cache_creation_input_token_cost = num_value
+            }
+            "cache_creation_input_token_cost_above_1hr" => {
+                // Base (non-tiered) 1hr TTL price.
+                pricing.cache_creation_input_token_cost_above_1hr = num_value;
+            }
             _ => {
                 if let Some(suffix) = key.strip_prefix("input_cost_per_token_above_") {
                     if let Some(th) = parse_threshold_suffix(suffix) {
@@ -159,8 +180,14 @@ pub fn parse_litellm_entry(value: &serde_json::Value) -> ModelPricing {
                 } else if let Some(suffix) =
                     key.strip_prefix("cache_creation_input_token_cost_above_")
                 {
-                    // Skip `above_1hr` — it is cache TTL, not context size tier.
-                    if !suffix.starts_with("1hr") {
+                    // Two possible shapes:
+                    //   "200k_tokens"           → context-size tier at 200K
+                    //   "1hr_above_200k_tokens" → 1hr TTL variant of the 200K tier
+                    if let Some(inner) = suffix.strip_prefix("1hr_above_") {
+                        if let Some(th) = parse_threshold_suffix(inner) {
+                            tier_cache_creation_1hr.insert(th, num_value);
+                        }
+                    } else if !suffix.starts_with("1hr") {
                         if let Some(th) = parse_threshold_suffix(suffix) {
                             tier_cache_creation.insert(th, num_value);
                         }
@@ -175,6 +202,7 @@ pub fn parse_litellm_entry(value: &serde_json::Value) -> ModelPricing {
         .chain(tier_output.keys())
         .chain(tier_cache_read.keys())
         .chain(tier_cache_creation.keys())
+        .chain(tier_cache_creation_1hr.keys())
         .copied()
         .collect();
     thresholds.sort();
@@ -196,6 +224,9 @@ pub fn parse_litellm_entry(value: &serde_json::Value) -> ModelPricing {
             cache_creation_input_token_cost: *tier_cache_creation
                 .get(&th)
                 .unwrap_or(&pricing.cache_creation_input_token_cost),
+            cache_creation_input_token_cost_above_1hr: *tier_cache_creation_1hr
+                .get(&th)
+                .unwrap_or(&pricing.cache_creation_input_token_cost_above_1hr),
         })
         .collect();
 

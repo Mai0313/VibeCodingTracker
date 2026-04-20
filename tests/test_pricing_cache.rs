@@ -32,8 +32,10 @@ fn test_model_pricing_serialization() {
             output_cost_per_token: 0.000004,
             cache_read_input_token_cost: 0.0000002,
             cache_creation_input_token_cost: 0.000001,
+            ..Default::default()
         }],
         ranges: None,
+        ..Default::default()
     };
 
     let json = serde_json::to_string(&pricing).unwrap();
@@ -138,7 +140,9 @@ fn test_model_pricing_all_fields() {
             output_cost_per_token: 6.0,
             cache_read_input_token_cost: 7.0,
             cache_creation_input_token_cost: 8.0,
+            cache_creation_input_token_cost_above_1hr: 12.0,
         }],
+        cache_creation_input_token_cost_above_1hr: 10.0,
         ranges: Some(vec![TierRange {
             min_tokens: 0,
             max_tokens: 32_000,

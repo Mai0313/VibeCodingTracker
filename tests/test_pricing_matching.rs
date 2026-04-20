@@ -18,8 +18,10 @@ fn create_test_pricing() -> ModelPricing {
             output_cost_per_token: 0.000004,
             cache_read_input_token_cost: 0.0000002,
             cache_creation_input_token_cost: 0.000001,
+            ..Default::default()
         }],
         ranges: None,
+        ..Default::default()
     }
 }
 

@@ -172,11 +172,12 @@ fn test_calculate_cost_basic() {
         ..Default::default()
     };
 
-    let cost = calculate_cost(1000, 500, 10000, 2000, &pricing);
+    // 2000 cache_creation tokens at default (5 minute) TTL.
+    let cost = calculate_cost(1000, 500, 10000, 2000, 0, &pricing);
     // input: 1000 * 0.000003 = 0.003
     // output: 500 * 0.000015 = 0.0075
     // cache_read: 10000 * 0.0000003 = 0.003
-    // cache_creation: 2000 * 0.00000375 = 0.0075
+    // cache_creation (5m): 2000 * 0.00000375 = 0.0075
     // total: 0.021
     assert_eq!(cost, 0.021);
 }
@@ -184,7 +185,7 @@ fn test_calculate_cost_basic() {
 #[test]
 fn test_calculate_cost_zero_tokens() {
     let pricing = ModelPricing::default();
-    let cost = calculate_cost(0, 0, 0, 0, &pricing);
+    let cost = calculate_cost(0, 0, 0, 0, 0, &pricing);
     assert_eq!(cost, 0.0);
 }
 
@@ -196,7 +197,7 @@ fn test_calculate_cost_no_cache() {
         ..Default::default()
     };
 
-    let cost = calculate_cost(1000, 500, 0, 0, &pricing);
+    let cost = calculate_cost(1000, 500, 0, 0, 0, &pricing);
     // input: 1000 * 0.000003 = 0.003
     // output: 500 * 0.000015 = 0.0075
     // total: 0.0105
@@ -214,7 +215,7 @@ fn test_calculate_cost_large_numbers() {
         ..Default::default()
     };
 
-    let cost = calculate_cost(1_000_000, 500_000, 100_000, 50_000, &pricing);
+    let cost = calculate_cost(1_000_000, 500_000, 100_000, 50_000, 0, &pricing);
     assert!(cost > 0.0);
     assert!(cost.is_finite());
 }
@@ -373,11 +374,11 @@ fn test_pricing_above_200k_tokens_via_tier() {
     };
 
     // Below 200K: base prices.
-    let below = calculate_cost(100_000, 50_000, 0, 0, &pricing);
+    let below = calculate_cost(100_000, 50_000, 0, 0, 0, &pricing);
     assert_eq!(below, 100_000.0 * 0.000001 + 50_000.0 * 0.000002);
 
     // Above 200K: tier prices for all tokens.
-    let above = calculate_cost(300_000, 50_000, 0, 0, &pricing);
+    let above = calculate_cost(300_000, 50_000, 0, 0, 0, &pricing);
     assert_eq!(above, 300_000.0 * 0.000002 + 50_000.0 * 0.000004);
 }
 
@@ -405,10 +406,10 @@ fn test_pricing_range_based() {
         ..Default::default()
     };
 
-    let low = calculate_cost(10_000, 1000, 0, 0, &pricing);
+    let low = calculate_cost(10_000, 1000, 0, 0, 0, &pricing);
     assert_eq!(low, 10_000.0 * 0.000001 + 1000.0 * 0.000005);
 
-    let high = calculate_cost(100_000, 1000, 0, 0, &pricing);
+    let high = calculate_cost(100_000, 1000, 0, 0, 0, &pricing);
     assert_eq!(high, 100_000.0 * 0.0000018 + 1000.0 * 0.000009);
 }
 
