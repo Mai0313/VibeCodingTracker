@@ -2,7 +2,9 @@ use crate::cache::global_cache;
 use crate::cli::TimeRange;
 use crate::constants::{FastHashMap, capacity};
 use crate::models::ProviderActiveDays;
-use crate::utils::{collect_files_with_dates, is_gemini_chat_file, is_json_file};
+use crate::utils::{
+    collect_files_with_dates, is_claude_session_file, is_gemini_chat_file, is_json_file,
+};
 use anyhow::Result;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -51,7 +53,7 @@ pub fn analyze_all_sessions(time_range: TimeRange) -> Result<AnalysisData> {
             &paths.claude_session_dir,
             &mut aggregated,
             &mut claude_dates,
-            is_json_file,
+            is_claude_session_file,
             time_range,
         )?;
     }
@@ -139,7 +141,7 @@ pub fn analyze_all_sessions_by_provider(time_range: TimeRange) -> Result<Provide
         process_full_analysis_directory(
             &paths.claude_session_dir,
             &mut claude_results,
-            is_json_file,
+            is_claude_session_file,
             time_range,
         )?;
     }

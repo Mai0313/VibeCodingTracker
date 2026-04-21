@@ -1,5 +1,6 @@
 use crate::cli::TimeRange;
 use anyhow::Result;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -73,6 +74,65 @@ where
     }
 
     Ok(results)
+}
+
+fn is_jsonl_file(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext == OsStr::new("jsonl"))
+}
+
+fn is_claude_log_filename(file_name: &OsStr) -> bool {
+    let file_name = file_name.to_string_lossy();
+    file_name.ends_with(".jsonl")
+        && !file_name.ends_with(".meta.json")
+        && !file_name.ends_with(".meta.jsonl")
+}
+
+/// Filter for Claude Code session and subagent files.
+///
+/// Accepts these layouts under `~/.claude/projects`:
+/// - `*.jsonl`
+/// - `*/*.jsonl`
+/// - `*/*/subagents/*.jsonl`
+///
+/// Explicitly excludes Claude metadata files such as `*.meta.json`.
+pub fn is_claude_session_file(path: &Path) -> bool {
+    if !is_jsonl_file(path) {
+        return false;
+    }
+
+    let components: Vec<OsString> = path
+        .components()
+        .map(|component| component.as_os_str().to_os_string())
+        .collect();
+
+    let Some(projects_index) = components
+        .iter()
+        .rposition(|component| component == OsStr::new("projects"))
+    else {
+        return false;
+    };
+
+    let Some(claude_index) = projects_index.checked_sub(1) else {
+        return false;
+    };
+
+    if components[claude_index] != OsStr::new(".claude") {
+        return false;
+    }
+
+    match &components[projects_index + 1..] {
+        [file] => is_claude_log_filename(file.as_os_str()),
+        [project, file] => {
+            project != OsStr::new("memory") && is_claude_log_filename(file.as_os_str())
+        }
+        [project, _session, subagents, file] => {
+            project != OsStr::new("memory")
+                && subagents == OsStr::new("subagents")
+                && is_claude_log_filename(file.as_os_str())
+        }
+        _ => false,
+    }
 }
 
 /// Standard filter for JSONL and JSON files

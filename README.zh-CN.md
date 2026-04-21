@@ -226,7 +226,8 @@ vct usage --json --daily
 
 该工具会自动扫描以下目录：
 
-- `~/.claude/projects/*.jsonl`（Claude Code）
+- `~/.claude/projects/*/*.jsonl`（Claude Code 主 session）
+- `~/.claude/projects/*/*/subagents/*.jsonl`（Claude Code subagents；会忽略 `*.meta.json`）
 - `~/.codex/sessions/*.jsonl`（Codex）
 - `~/.copilot/history-session-state/*.json`（Copilot）
 - `~/.gemini/tmp/<project_hash>/chats/*.json`（Gemini）
@@ -260,7 +261,7 @@ vct analysis
 vct analysis --table
 
 # 分析单一对话文件 → stdout JSON
-vct analysis --path ~/.claude/projects/session.jsonl
+vct analysis --path ~/.claude/projects/<project>/<session>.jsonl
 
 # Save results to JSON
 vct analysis --output report.json

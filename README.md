@@ -226,7 +226,8 @@ vct usage --json --daily
 
 The tool automatically scans these directories:
 
-- `~/.claude/projects/*.jsonl` (Claude Code)
+- `~/.claude/projects/*/*.jsonl` (Claude Code main sessions)
+- `~/.claude/projects/*/*/subagents/*.jsonl` (Claude Code subagents; `*.meta.json` is ignored)
 - `~/.codex/sessions/*.jsonl` (Codex)
 - `~/.copilot/history-session-state/*.json` (Copilot)
 - `~/.gemini/tmp/<project_hash>/chats/*.json` (Gemini)
@@ -260,7 +261,7 @@ vct analysis
 vct analysis --table
 
 # Analyze a single conversation file → stdout JSON
-vct analysis --path ~/.claude/projects/session.jsonl
+vct analysis --path ~/.claude/projects/<project>/<session>.jsonl
 
 # Save results to JSON
 vct analysis --output report.json

@@ -7,7 +7,7 @@ use std::io::Write;
 use tempfile::tempdir;
 use vibe_coding_tracker::cli::TimeRange;
 use vibe_coding_tracker::utils::directory::{
-    collect_files_with_dates, is_gemini_chat_file, is_json_file,
+    collect_files_with_dates, is_claude_session_file, is_gemini_chat_file, is_json_file,
 };
 
 #[test]
@@ -43,6 +43,40 @@ fn test_is_json_file_uppercase() {
     // Test uppercase extension
     let path = std::path::Path::new("test.JSON");
     assert!(!is_json_file(path)); // Case-sensitive
+}
+
+#[test]
+fn test_is_claude_session_file_root_level_jsonl() {
+    let path = std::path::Path::new("/home/user/.claude/projects/session.jsonl");
+    assert!(is_claude_session_file(path));
+}
+
+#[test]
+fn test_is_claude_session_file_project_session_jsonl() {
+    let path = std::path::Path::new("/home/user/.claude/projects/my-project/session.jsonl");
+    assert!(is_claude_session_file(path));
+}
+
+#[test]
+fn test_is_claude_session_file_subagent_jsonl() {
+    let path = std::path::Path::new(
+        "/home/user/.claude/projects/my-project/session/subagents/agent.jsonl",
+    );
+    assert!(is_claude_session_file(path));
+}
+
+#[test]
+fn test_is_claude_session_file_rejects_meta_json() {
+    let path = std::path::Path::new(
+        "/home/user/.claude/projects/my-project/session/subagents/agent.meta.json",
+    );
+    assert!(!is_claude_session_file(path));
+}
+
+#[test]
+fn test_is_claude_session_file_rejects_memory_jsonl() {
+    let path = std::path::Path::new("/home/user/.claude/projects/memory/session.jsonl");
+    assert!(!is_claude_session_file(path));
 }
 
 #[test]
@@ -125,6 +159,38 @@ fn test_collect_files_with_dates_nested_directories() {
 
     let results = collect_files_with_dates(dir.path(), is_json_file, TimeRange::All).unwrap();
     assert_eq!(results.len(), 3);
+}
+
+#[test]
+fn test_collect_files_with_dates_claude_filter_includes_subagents_and_skips_meta() {
+    let dir = tempdir().unwrap();
+    let projects_dir = dir.path().join(".claude/projects");
+    let project_dir = projects_dir.join("my-project");
+    let session_file = project_dir.join("session.jsonl");
+    let subagent_file = project_dir.join("session/subagents/agent.jsonl");
+    let meta_file = project_dir.join("session/subagents/agent.meta.json");
+    let memory_file = projects_dir.join("memory/session.jsonl");
+
+    fs::create_dir_all(subagent_file.parent().unwrap()).unwrap();
+    fs::create_dir_all(memory_file.parent().unwrap()).unwrap();
+
+    File::create(&session_file).unwrap();
+    File::create(&subagent_file).unwrap();
+    File::create(&meta_file).unwrap();
+    File::create(&memory_file).unwrap();
+
+    let mut collected_paths: Vec<_> =
+        collect_files_with_dates(&projects_dir, is_claude_session_file, TimeRange::All)
+            .unwrap()
+            .into_iter()
+            .map(|file_info| file_info.path)
+            .collect();
+    collected_paths.sort();
+
+    let mut expected_paths = vec![session_file, subagent_file];
+    expected_paths.sort();
+
+    assert_eq!(collected_paths, expected_paths);
 }
 
 #[test]

@@ -2,7 +2,10 @@ use crate::cache::global_cache;
 use crate::cli::TimeRange;
 use crate::constants::{FastHashMap, capacity};
 use crate::models::{ProviderActiveDays, UsageResult};
-use crate::utils::{collect_files_with_dates, is_gemini_chat_file, is_json_file, resolve_paths};
+use crate::utils::{
+    collect_files_with_dates, is_claude_session_file, is_gemini_chat_file, is_json_file,
+    resolve_paths,
+};
 use anyhow::Result;
 use rayon::prelude::*;
 use serde_json::Value;
@@ -66,7 +69,7 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
             &paths.claude_session_dir,
             &mut result,
             &mut claude_dates,
-            is_json_file,
+            is_claude_session_file,
             time_range,
         )?;
     }
