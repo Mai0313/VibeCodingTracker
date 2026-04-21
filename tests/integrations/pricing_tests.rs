@@ -4,7 +4,8 @@
 
 use std::collections::HashMap;
 use vibe_coding_tracker::pricing::{
-    ModelPricing, ModelPricingMap, calculate_cost, clear_pricing_cache, fetch_model_pricing,
+    ModelPricing, ModelPricingMap, ThresholdTier, TierRange, calculate_cost, clear_pricing_cache,
+    fetch_model_pricing,
 };
 
 #[test]
@@ -171,11 +172,12 @@ fn test_calculate_cost_basic() {
         ..Default::default()
     };
 
-    let cost = calculate_cost(1000, 500, 10000, 2000, &pricing);
+    // 2000 cache_creation tokens at default (5 minute) TTL.
+    let cost = calculate_cost(1000, 500, 10000, 2000, 0, &pricing);
     // input: 1000 * 0.000003 = 0.003
     // output: 500 * 0.000015 = 0.0075
     // cache_read: 10000 * 0.0000003 = 0.003
-    // cache_creation: 2000 * 0.00000375 = 0.0075
+    // cache_creation (5m): 2000 * 0.00000375 = 0.0075
     // total: 0.021
     assert_eq!(cost, 0.021);
 }
@@ -183,7 +185,7 @@ fn test_calculate_cost_basic() {
 #[test]
 fn test_calculate_cost_zero_tokens() {
     let pricing = ModelPricing::default();
-    let cost = calculate_cost(0, 0, 0, 0, &pricing);
+    let cost = calculate_cost(0, 0, 0, 0, 0, &pricing);
     assert_eq!(cost, 0.0);
 }
 
@@ -195,7 +197,7 @@ fn test_calculate_cost_no_cache() {
         ..Default::default()
     };
 
-    let cost = calculate_cost(1000, 500, 0, 0, &pricing);
+    let cost = calculate_cost(1000, 500, 0, 0, 0, &pricing);
     // input: 1000 * 0.000003 = 0.003
     // output: 500 * 0.000015 = 0.0075
     // total: 0.0105
@@ -204,20 +206,16 @@ fn test_calculate_cost_no_cache() {
 
 #[test]
 fn test_calculate_cost_large_numbers() {
+    // Flat pricing (no tiers): every request uses base prices regardless of size.
     let pricing = ModelPricing {
         input_cost_per_token: 0.000001,
         output_cost_per_token: 0.000002,
         cache_read_input_token_cost: 0.0000001,
         cache_creation_input_token_cost: 0.0000005,
-        // Simulate normalize_pricing(): above_200k fields fallback to base prices
-        input_cost_per_token_above_200k_tokens: 0.000001,
-        output_cost_per_token_above_200k_tokens: 0.000002,
-        cache_read_input_token_cost_above_200k_tokens: 0.0000001,
-        cache_creation_input_token_cost_above_200k_tokens: 0.0000005,
+        ..Default::default()
     };
 
-    // Total input context = 1M + 100K + 50K = 1.15M > 200K → above_200k prices
-    let cost = calculate_cost(1_000_000, 500_000, 100_000, 50_000, &pricing);
+    let cost = calculate_cost(1_000_000, 500_000, 100_000, 50_000, 0, &pricing);
     assert!(cost > 0.0);
     assert!(cost.is_finite());
 }
@@ -362,17 +360,57 @@ fn test_pricing_cache_expiration() {
 }
 
 #[test]
-fn test_pricing_above_200k_tokens() {
+fn test_pricing_above_200k_tokens_via_tier() {
     let pricing = ModelPricing {
         input_cost_per_token: 0.000001,
         output_cost_per_token: 0.000002,
-        input_cost_per_token_above_200k_tokens: 0.000002,
-        output_cost_per_token_above_200k_tokens: 0.000004,
+        tiers: vec![ThresholdTier {
+            threshold_tokens: 200_000,
+            input_cost_per_token: 0.000002,
+            output_cost_per_token: 0.000004,
+            ..Default::default()
+        }],
         ..Default::default()
     };
 
-    assert_eq!(pricing.input_cost_per_token_above_200k_tokens, 0.000002);
-    assert_eq!(pricing.output_cost_per_token_above_200k_tokens, 0.000004);
+    // Below 200K: base prices.
+    let below = calculate_cost(100_000, 50_000, 0, 0, 0, &pricing);
+    assert_eq!(below, 100_000.0 * 0.000001 + 50_000.0 * 0.000002);
+
+    // Above 200K: tier prices for all tokens.
+    let above = calculate_cost(300_000, 50_000, 0, 0, 0, &pricing);
+    assert_eq!(above, 300_000.0 * 0.000002 + 50_000.0 * 0.000004);
+}
+
+#[test]
+fn test_pricing_range_based() {
+    // Mimics Qwen-style range-based pricing selected by input_tokens.
+    let pricing = ModelPricing {
+        input_cost_per_token: 999.0, // Should be ignored — ranges takes priority.
+        ranges: Some(vec![
+            TierRange {
+                min_tokens: 0,
+                max_tokens: 32_000,
+                input_cost_per_token: 0.000001,
+                output_cost_per_token: 0.000005,
+                ..Default::default()
+            },
+            TierRange {
+                min_tokens: 32_000,
+                max_tokens: 128_000,
+                input_cost_per_token: 0.0000018,
+                output_cost_per_token: 0.000009,
+                ..Default::default()
+            },
+        ]),
+        ..Default::default()
+    };
+
+    let low = calculate_cost(10_000, 1000, 0, 0, 0, &pricing);
+    assert_eq!(low, 10_000.0 * 0.000001 + 1000.0 * 0.000005);
+
+    let high = calculate_cost(100_000, 1000, 0, 0, 0, &pricing);
+    assert_eq!(high, 100_000.0 * 0.0000018 + 1000.0 * 0.000009);
 }
 
 #[test]

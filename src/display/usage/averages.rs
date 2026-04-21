@@ -214,7 +214,8 @@ fn extract_usage_row(
         counts.input_tokens,
         counts.output_tokens,
         counts.cache_read,
-        counts.cache_creation,
+        counts.cache_creation_5m,
+        counts.cache_creation_1h,
         &pricing_result.pricing,
     );
 

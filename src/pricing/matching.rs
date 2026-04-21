@@ -100,7 +100,7 @@ impl ModelPricingMap {
         // Fast path 1: Exact match
         if let Some(pricing) = self.raw.get(model_name) {
             let result = ModelPricingResult {
-                pricing: *pricing,
+                pricing: pricing.clone(),
                 matched_model: None,
             };
             // Cache the exact match result (LRU will auto-evict if at capacity)
@@ -115,7 +115,7 @@ impl ModelPricingMap {
         if let Some(original_key) = self.normalized_index.get(&normalized_name) {
             if let Some(pricing) = self.raw.get(original_key.as_ref()) {
                 let result = ModelPricingResult {
-                    pricing: *pricing,
+                    pricing: pricing.clone(),
                     matched_model: Some(original_key.to_string()), // Convert Rc to String only when needed
                 };
                 // Cache the normalized match result (LRU will auto-evict if at capacity)
@@ -161,7 +161,7 @@ impl ModelPricingMap {
         if let Some((matched_key, _, _)) = best_match {
             if let Some(pricing) = self.raw.get(matched_key.as_ref()) {
                 let result = ModelPricingResult {
-                    pricing: *pricing,
+                    pricing: pricing.clone(),
                     matched_model: Some(matched_key.to_string()), // Convert to String only when needed
                 };
                 // Cache the fuzzy match result (LRU will auto-evict if at capacity)

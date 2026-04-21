@@ -3,7 +3,7 @@
 // Tests pricing cache operations
 
 use std::collections::HashMap;
-use vibe_coding_tracker::pricing::ModelPricing;
+use vibe_coding_tracker::pricing::{ModelPricing, ThresholdTier, TierRange};
 
 #[test]
 fn test_model_pricing_default() {
@@ -14,27 +14,28 @@ fn test_model_pricing_default() {
     assert_eq!(pricing.output_cost_per_token, 0.0);
     assert_eq!(pricing.cache_read_input_token_cost, 0.0);
     assert_eq!(pricing.cache_creation_input_token_cost, 0.0);
-    assert_eq!(pricing.input_cost_per_token_above_200k_tokens, 0.0);
-    assert_eq!(pricing.output_cost_per_token_above_200k_tokens, 0.0);
-    assert_eq!(pricing.cache_read_input_token_cost_above_200k_tokens, 0.0);
-    assert_eq!(
-        pricing.cache_creation_input_token_cost_above_200k_tokens,
-        0.0
-    );
+    assert!(pricing.tiers.is_empty());
+    assert!(pricing.ranges.is_none());
 }
 
 #[test]
 fn test_model_pricing_serialization() {
-    // Test ModelPricing can be serialized and deserialized
+    // Test ModelPricing can be serialized and deserialized with a threshold tier
     let pricing = ModelPricing {
         input_cost_per_token: 0.000001,
         output_cost_per_token: 0.000002,
         cache_read_input_token_cost: 0.0000001,
         cache_creation_input_token_cost: 0.0000005,
-        input_cost_per_token_above_200k_tokens: 0.000002,
-        output_cost_per_token_above_200k_tokens: 0.000004,
-        cache_read_input_token_cost_above_200k_tokens: 0.0000002,
-        cache_creation_input_token_cost_above_200k_tokens: 0.000001,
+        tiers: vec![ThresholdTier {
+            threshold_tokens: 200_000,
+            input_cost_per_token: 0.000002,
+            output_cost_per_token: 0.000004,
+            cache_read_input_token_cost: 0.0000002,
+            cache_creation_input_token_cost: 0.000001,
+            ..Default::default()
+        }],
+        ranges: None,
+        ..Default::default()
     };
 
     let json = serde_json::to_string(&pricing).unwrap();
@@ -44,22 +45,21 @@ fn test_model_pricing_serialization() {
         deserialized.input_cost_per_token,
         pricing.input_cost_per_token
     );
-    assert_eq!(
-        deserialized.output_cost_per_token,
-        pricing.output_cost_per_token
-    );
+    assert_eq!(deserialized.tiers.len(), 1);
+    assert_eq!(deserialized.tiers[0].threshold_tokens, 200_000);
+    assert_eq!(deserialized.tiers[0].input_cost_per_token, 0.000002);
 }
 
 #[test]
 fn test_model_pricing_clone() {
-    // Test ModelPricing can be cloned
+    // Vec means ModelPricing is no longer Copy — explicit clone is required.
     let pricing1 = ModelPricing {
         input_cost_per_token: 0.000001,
         output_cost_per_token: 0.000002,
         ..Default::default()
     };
 
-    let pricing2 = pricing1;
+    let pricing2 = pricing1.clone();
 
     assert_eq!(pricing1.input_cost_per_token, pricing2.input_cost_per_token);
     assert_eq!(
@@ -128,16 +128,29 @@ fn test_model_pricing_hashmap_serialization() {
 
 #[test]
 fn test_model_pricing_all_fields() {
-    // Test all fields are properly serialized/deserialized
+    // Verify base prices + tiers + ranges all survive round-trip serialization.
     let pricing = ModelPricing {
         input_cost_per_token: 1.0,
         output_cost_per_token: 2.0,
         cache_read_input_token_cost: 3.0,
         cache_creation_input_token_cost: 4.0,
-        input_cost_per_token_above_200k_tokens: 5.0,
-        output_cost_per_token_above_200k_tokens: 6.0,
-        cache_read_input_token_cost_above_200k_tokens: 7.0,
-        cache_creation_input_token_cost_above_200k_tokens: 8.0,
+        tiers: vec![ThresholdTier {
+            threshold_tokens: 200_000,
+            input_cost_per_token: 5.0,
+            output_cost_per_token: 6.0,
+            cache_read_input_token_cost: 7.0,
+            cache_creation_input_token_cost: 8.0,
+            cache_creation_input_token_cost_above_1hr: 12.0,
+        }],
+        cache_creation_input_token_cost_above_1hr: 10.0,
+        ranges: Some(vec![TierRange {
+            min_tokens: 0,
+            max_tokens: 32_000,
+            input_cost_per_token: 0.1,
+            output_cost_per_token: 0.2,
+            cache_read_input_token_cost: 0.01,
+            output_cost_per_reasoning_token: 0.5,
+        }]),
     };
 
     let json = serde_json::to_string(&pricing).unwrap();
@@ -147,16 +160,16 @@ fn test_model_pricing_all_fields() {
     assert_eq!(deserialized.output_cost_per_token, 2.0);
     assert_eq!(deserialized.cache_read_input_token_cost, 3.0);
     assert_eq!(deserialized.cache_creation_input_token_cost, 4.0);
-    assert_eq!(deserialized.input_cost_per_token_above_200k_tokens, 5.0);
-    assert_eq!(deserialized.output_cost_per_token_above_200k_tokens, 6.0);
-    assert_eq!(
-        deserialized.cache_read_input_token_cost_above_200k_tokens,
-        7.0
-    );
-    assert_eq!(
-        deserialized.cache_creation_input_token_cost_above_200k_tokens,
-        8.0
-    );
+    assert_eq!(deserialized.tiers.len(), 1);
+    assert_eq!(deserialized.tiers[0].threshold_tokens, 200_000);
+    assert_eq!(deserialized.tiers[0].input_cost_per_token, 5.0);
+    assert_eq!(deserialized.tiers[0].output_cost_per_token, 6.0);
+    assert_eq!(deserialized.tiers[0].cache_read_input_token_cost, 7.0);
+    assert_eq!(deserialized.tiers[0].cache_creation_input_token_cost, 8.0);
+    let ranges = deserialized.ranges.unwrap();
+    assert_eq!(ranges.len(), 1);
+    assert_eq!(ranges[0].max_tokens, 32_000);
+    assert_eq!(ranges[0].output_cost_per_reasoning_token, 0.5);
 }
 
 #[test]

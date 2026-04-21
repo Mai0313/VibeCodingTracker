@@ -6,15 +6,22 @@ use std::collections::HashMap;
 use vibe_coding_tracker::pricing::{ModelPricing, ModelPricingMap, clear_pricing_cache};
 
 fn create_test_pricing() -> ModelPricing {
+    use vibe_coding_tracker::pricing::ThresholdTier;
     ModelPricing {
         input_cost_per_token: 0.000001,
         output_cost_per_token: 0.000002,
         cache_read_input_token_cost: 0.0000001,
         cache_creation_input_token_cost: 0.0000005,
-        input_cost_per_token_above_200k_tokens: 0.000002,
-        output_cost_per_token_above_200k_tokens: 0.000004,
-        cache_read_input_token_cost_above_200k_tokens: 0.0000002,
-        cache_creation_input_token_cost_above_200k_tokens: 0.000001,
+        tiers: vec![ThresholdTier {
+            threshold_tokens: 200_000,
+            input_cost_per_token: 0.000002,
+            output_cost_per_token: 0.000004,
+            cache_read_input_token_cost: 0.0000002,
+            cache_creation_input_token_cost: 0.000001,
+            ..Default::default()
+        }],
+        ranges: None,
+        ..Default::default()
     }
 }
 
