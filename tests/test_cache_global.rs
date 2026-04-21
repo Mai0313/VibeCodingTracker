@@ -9,7 +9,7 @@ use tempfile::tempdir;
 use vibe_coding_tracker::cache::{clear_global_cache, global_cache};
 
 #[test]
-#[serial]
+#[serial(global_cache)]
 fn test_global_cache_exists() {
     // Test that global cache can be accessed
     let cache = global_cache();
@@ -19,7 +19,7 @@ fn test_global_cache_exists() {
 }
 
 #[test]
-#[serial]
+#[serial(global_cache)]
 fn test_global_cache_singleton() {
     // Test that global_cache returns the same instance
     let cache1 = global_cache();
@@ -30,7 +30,7 @@ fn test_global_cache_singleton() {
 }
 
 #[test]
-#[serial]
+#[serial(global_cache)]
 fn test_global_cache_clear() {
     // Test clearing global cache
     let cache = global_cache();
@@ -54,7 +54,7 @@ fn test_global_cache_clear() {
 }
 
 #[test]
-#[serial]
+#[serial(global_cache)]
 fn test_global_cache_persistence_across_calls() {
     // Test that cache persists across function calls
     let cache = global_cache();
@@ -80,7 +80,7 @@ fn test_global_cache_persistence_across_calls() {
 }
 
 #[test]
-#[serial]
+#[serial(global_cache)]
 fn test_global_cache_stats() {
     // Test that cache stats are accessible
     clear_global_cache();
@@ -93,7 +93,7 @@ fn test_global_cache_stats() {
 }
 
 #[test]
-#[serial]
+#[serial(global_cache)]
 fn test_clear_global_cache_multiple_times() {
     // Test that clearing cache multiple times works
     clear_global_cache();
@@ -107,7 +107,7 @@ fn test_clear_global_cache_multiple_times() {
 }
 
 #[test]
-#[serial]
+#[serial(global_cache)]
 fn test_global_cache_thread_safety() {
     // Test that global cache can be accessed from multiple threads
     use std::thread;
@@ -133,7 +133,7 @@ fn test_global_cache_thread_safety() {
 }
 
 #[test]
-#[serial]
+#[serial(global_cache)]
 fn test_global_cache_with_operations() {
     // Test global cache with actual operations
     clear_global_cache();
