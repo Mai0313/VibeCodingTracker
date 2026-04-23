@@ -74,8 +74,8 @@ fn test_usage_calculation_cost_accuracy() {
         ..Default::default()
     };
 
-    // 2000 cache_creation tokens, all default (5 minute) TTL.
-    let cost = calculate_cost(1000, 500, 10000, 2000, 0, &pricing);
+    // 2000 cache_creation tokens, all default (5 minute) TTL, no reasoning.
+    let cost = calculate_cost(1000, 500, 0, 10000, 2000, 0, &pricing);
 
     // input: 1000 * 0.000003 = 0.003
     // output: 500 * 0.000015 = 0.0075

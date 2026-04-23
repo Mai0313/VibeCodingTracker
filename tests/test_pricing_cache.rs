@@ -134,6 +134,7 @@ fn test_model_pricing_all_fields() {
         output_cost_per_token: 2.0,
         cache_read_input_token_cost: 3.0,
         cache_creation_input_token_cost: 4.0,
+        output_cost_per_reasoning_token: 11.0,
         tiers: vec![ThresholdTier {
             threshold_tokens: 200_000,
             input_cost_per_token: 5.0,
@@ -160,6 +161,7 @@ fn test_model_pricing_all_fields() {
     assert_eq!(deserialized.output_cost_per_token, 2.0);
     assert_eq!(deserialized.cache_read_input_token_cost, 3.0);
     assert_eq!(deserialized.cache_creation_input_token_cost, 4.0);
+    assert_eq!(deserialized.output_cost_per_reasoning_token, 11.0);
     assert_eq!(deserialized.tiers.len(), 1);
     assert_eq!(deserialized.tiers[0].threshold_tokens, 200_000);
     assert_eq!(deserialized.tiers[0].input_cost_per_token, 5.0);
