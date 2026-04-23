@@ -104,13 +104,57 @@ pub fn is_claude_session_file(path: &Path) -> bool {
     path.extension().is_some_and(|ext| ext == "jsonl")
 }
 
-/// Filter for Gemini files (must be in chats directory and be .json)
+/// Filter for Gemini files (must be in a `chats/` directory)
+///
+/// Gemini CLI went through a format change: historical exports were a single
+/// pretty-printed JSON object stored as `chats/<session>.json`, while current
+/// Gemini CLI versions stream each event as a JSONL line into
+/// `chats/session-*.jsonl`. Accept both extensions so old and new sessions
+/// coexist. The parent-directory check still scopes us to the `chats/`
+/// subfolder, so sibling artifacts like `discordbot/logs.json` or the
+/// `bin/rg` binary living under `~/.gemini/tmp/` do not get picked up.
 pub fn is_gemini_chat_file(path: &Path) -> bool {
     if let (Some(parent), Some(ext)) = (path.parent(), path.extension()) {
-        parent.file_name() == Some(std::ffi::OsStr::new("chats")) && ext == "json"
+        parent.file_name() == Some(std::ffi::OsStr::new("chats"))
+            && (ext == "json" || ext == "jsonl")
     } else {
         false
     }
+}
+
+/// Filter for Copilot CLI session files
+///
+/// Modern Copilot CLI stores each session as a directory under
+/// `~/.copilot/session-state/<sessionId>/` containing the event log
+/// (`events.jsonl`) plus sibling subdirectories for file snapshots
+/// (`rewind-snapshots/`, `files/`, `research/`, `checkpoints/`) and a
+/// per-workspace YAML file. Only `events.jsonl` carries the conversation
+/// stream we want to analyze — if we fell back to the generic JSON filter,
+/// `rewind-snapshots/index.json` would be mis-picked up as a session log
+/// and fail to parse.
+///
+/// The historical single-file layout
+/// (`~/.copilot/history-session-state/<sessionId>.json`) is **not** matched
+/// by this filter — it lives under a different directory and is no longer
+/// produced by recent Copilot CLI versions. If you still have old dumps to
+/// analyze, run `vct analysis --path <file>` directly.
+pub fn is_copilot_session_file(path: &Path) -> bool {
+    // Must be named exactly `events.jsonl`
+    let is_events_jsonl = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| name == "events.jsonl");
+    if !is_events_jsonl {
+        return false;
+    }
+
+    // Must sit one level under `session-state/<sessionId>/events.jsonl` —
+    // reject anything that just happens to be called `events.jsonl` in a
+    // nested subfolder (e.g. `rewind-snapshots/events.jsonl`).
+    path.parent()
+        .and_then(|p| p.parent())
+        .and_then(|pp| pp.file_name())
+        .is_some_and(|name| name == "session-state")
 }
 
 /// Returns true if the path is a Claude Code meta sidecar file

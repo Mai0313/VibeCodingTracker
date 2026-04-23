@@ -10,7 +10,8 @@ pub mod usage_processor;
 
 // Public API exports (commonly used across modules)
 pub use directory::{
-    collect_files_with_dates, is_claude_session_file, is_gemini_chat_file, is_json_file,
+    collect_files_with_dates, is_claude_session_file, is_copilot_session_file,
+    is_gemini_chat_file, is_json_file,
 };
 pub use file::{count_lines, read_json, read_jsonl, save_json_pretty};
 pub use format::{format_number, get_current_date};

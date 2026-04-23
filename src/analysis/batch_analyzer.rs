@@ -5,7 +5,8 @@ use crate::cli::TimeRange;
 use crate::constants::{FastHashMap, capacity};
 use crate::models::{CodeAnalysis, ExtensionType, ProviderActiveDays};
 use crate::utils::{
-    collect_files_with_dates, is_claude_session_file, is_gemini_chat_file, is_json_file,
+    collect_files_with_dates, is_claude_session_file, is_copilot_session_file,
+    is_gemini_chat_file, is_json_file,
 };
 use anyhow::Result;
 use rayon::prelude::*;
@@ -79,7 +80,7 @@ pub fn analyze_all_sessions(time_range: TimeRange) -> Result<AnalysisData> {
             ExtensionType::Copilot,
             &mut aggregated,
             &mut copilot_dates,
-            is_json_file,
+            is_copilot_session_file,
             time_range,
         )?;
     }
@@ -178,7 +179,7 @@ pub fn analyze_all_sessions_by_provider(time_range: TimeRange) -> Result<Provide
             &paths.copilot_session_dir,
             ExtensionType::Copilot,
             &mut copilot_results,
-            is_json_file,
+            is_copilot_session_file,
             time_range,
         )?;
     }

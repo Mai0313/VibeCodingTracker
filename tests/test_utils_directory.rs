@@ -7,7 +7,8 @@ use std::io::Write;
 use tempfile::tempdir;
 use vibe_coding_tracker::cli::TimeRange;
 use vibe_coding_tracker::utils::directory::{
-    collect_files_with_dates, is_claude_session_file, is_gemini_chat_file, is_json_file,
+    collect_files_with_dates, is_claude_session_file, is_copilot_session_file,
+    is_gemini_chat_file, is_json_file,
 };
 
 #[test]
@@ -47,8 +48,16 @@ fn test_is_json_file_uppercase() {
 
 #[test]
 fn test_is_gemini_chat_file_valid() {
-    // Test valid Gemini chat file
+    // Legacy single-object export: `chats/<session>.json`
     let path = std::path::Path::new("/home/user/.gemini/tmp/hash/chats/chat.json");
+    assert!(is_gemini_chat_file(path));
+}
+
+#[test]
+fn test_is_gemini_chat_file_accepts_jsonl() {
+    // Current Gemini CLI writes each event as a JSONL line under `chats/`.
+    let path =
+        std::path::Path::new("/home/user/.gemini/tmp/proj/chats/session-2026-04-23T12-52.jsonl");
     assert!(is_gemini_chat_file(path));
 }
 
@@ -71,6 +80,68 @@ fn test_is_gemini_chat_file_no_parent() {
     // Test file without parent
     let path = std::path::Path::new("file.json");
     assert!(!is_gemini_chat_file(path));
+}
+
+#[test]
+fn test_is_gemini_chat_file_excludes_sibling_dirs() {
+    // `tmp/discordbot/logs.json` lives next to the `chats/` folder but
+    // must not be picked up because its parent is not `chats`.
+    let sibling = std::path::Path::new("/home/user/.gemini/tmp/discordbot/logs.json");
+    assert!(!is_gemini_chat_file(sibling));
+
+    // The `bin/rg` binary that Gemini CLI drops alongside session data has no
+    // JSON extension at all.
+    let binary = std::path::Path::new("/home/user/.gemini/tmp/bin/rg");
+    assert!(!is_gemini_chat_file(binary));
+}
+
+#[test]
+fn test_is_copilot_session_file_accepts_events_jsonl() {
+    // Current layout: `session-state/<sessionId>/events.jsonl`
+    let path = std::path::Path::new(
+        "/home/user/.copilot/session-state/d2e098d0-e0d6-4d6b-914b-c4c5543b17e3/events.jsonl",
+    );
+    assert!(is_copilot_session_file(path));
+}
+
+#[test]
+fn test_is_copilot_session_file_rejects_snapshots() {
+    // Rewind snapshots also emit JSON files; they must not be picked up as
+    // session logs.
+    let snapshot_index = std::path::Path::new(
+        "/home/user/.copilot/session-state/d2e098d0/rewind-snapshots/index.json",
+    );
+    assert!(!is_copilot_session_file(snapshot_index));
+
+    let snapshot_backup = std::path::Path::new(
+        "/home/user/.copilot/session-state/d2e098d0/rewind-snapshots/backups/2ee575c19132c8bd-1776949007337",
+    );
+    assert!(!is_copilot_session_file(snapshot_backup));
+
+    let workspace =
+        std::path::Path::new("/home/user/.copilot/session-state/d2e098d0/workspace.yaml");
+    assert!(!is_copilot_session_file(workspace));
+}
+
+#[test]
+fn test_is_copilot_session_file_rejects_nested_events_jsonl() {
+    // A stray `events.jsonl` inside a rewind snapshot must not count as a
+    // session log — the parent of the parent must be `session-state`.
+    let nested = std::path::Path::new(
+        "/home/user/.copilot/session-state/d2e098d0/rewind-snapshots/events.jsonl",
+    );
+    assert!(!is_copilot_session_file(nested));
+}
+
+#[test]
+fn test_is_copilot_session_file_rejects_other_files() {
+    // Plain JSON / JSONL files outside the `session-state/<uuid>/` layout
+    // should never pass.
+    let path1 = std::path::Path::new("/tmp/events.jsonl");
+    assert!(!is_copilot_session_file(path1));
+
+    let path2 = std::path::Path::new("/home/user/.copilot/logs.json");
+    assert!(!is_copilot_session_file(path2));
 }
 
 #[test]
