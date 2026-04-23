@@ -61,7 +61,7 @@ fn test_detect_gemini_jsonl_meta_header() {
 
 #[test]
 fn test_detect_copilot_format() {
-    // Test Copilot format detection with sessionId, startTime, and timeline
+    // Legacy single-object dump with sessionId, startTime, and timeline
     let data = vec![json!({
         "sessionId": "test-session",
         "startTime": 1234567890,
@@ -70,6 +70,59 @@ fn test_detect_copilot_format() {
 
     let result = detect_extension_type(&data).unwrap();
     assert_eq!(result, ExtensionType::Copilot);
+}
+
+#[test]
+fn test_detect_copilot_jsonl_session_start() {
+    // Modern Copilot CLI writes one event per line; the first event is always
+    // `type == "session.start"` with `data.producer == "copilot-agent"`.
+    let data = vec![
+        json!({
+            "type": "session.start",
+            "data": {
+                "sessionId": "d2e098d0-e0d6-4d6b-914b-c4c5543b17e3",
+                "version": 1,
+                "producer": "copilot-agent",
+                "copilotVersion": "1.0.34",
+                "startTime": "2026-04-23T12:56:32.850Z",
+                "context": {
+                    "cwd": "/home/wei/repo/VibeCodingTracker",
+                    "gitRoot": "/home/wei/repo/VibeCodingTracker",
+                    "branch": "main",
+                    "repository": "Mai0313/VibeCodingTracker",
+                    "hostType": "github",
+                    "repositoryHost": "github.com"
+                }
+            },
+            "id": "eac2d9cb-d62b-4c32-9178-ac8e83d5dfad",
+            "timestamp": "2026-04-23T12:56:32.876Z",
+            "parentId": null
+        }),
+        json!({
+            "type": "session.mode_changed",
+            "data": {"previousMode": "interactive", "newMode": "autopilot"}
+        }),
+    ];
+
+    let result = detect_extension_type(&data).unwrap();
+    assert_eq!(result, ExtensionType::Copilot);
+}
+
+#[test]
+fn test_detect_copilot_jsonl_rejects_non_copilot_producer() {
+    // A `session.start` event without a copilot producer tag should not
+    // trigger the Copilot branch — guards against false positives if
+    // another provider ever adopts the same discriminator name.
+    let data = vec![json!({
+        "type": "session.start",
+        "data": {
+            "sessionId": "abc",
+            "producer": "some-other-tool"
+        }
+    })];
+
+    let result = detect_extension_type(&data).unwrap();
+    assert_ne!(result, ExtensionType::Copilot);
 }
 
 #[test]

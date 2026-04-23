@@ -54,6 +54,31 @@ pub fn detect_extension_type(data: &[Value]) -> Result<ExtensionType> {
         return Ok(ExtensionType::Gemini);
     }
 
+    // JSONL stream: Copilot CLI `events.jsonl` session-start record.
+    //
+    // The modern Copilot CLI writes one event per line under
+    // `session-state/<sessionId>/events.jsonl`. The very first line is a
+    // `type == "session.start"` event whose `data.producer` field reads
+    // `"copilot-agent"` — distinct enough from Codex / Claude event
+    // streams to use as a classification key. Accept any of the typical
+    // producer tags (some dev builds emit `"copilot-cli"`) so we stay
+    // forward-compatible across minor CLI releases.
+    if let Some(first) = data.first().and_then(|v| v.as_object())
+        && first
+            .get("type")
+            .and_then(|v| v.as_str())
+            .is_some_and(|t| t == "session.start")
+    {
+        let producer = first
+            .get("data")
+            .and_then(|d| d.get("producer"))
+            .and_then(|p| p.as_str())
+            .unwrap_or("");
+        if producer.starts_with("copilot") {
+            return Ok(ExtensionType::Copilot);
+        }
+    }
+
     // Single-pass detection for Claude Code or Codex.
     //
     // The caller decides how much to pass in (the streaming auto-detect path

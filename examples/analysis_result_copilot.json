@@ -1,6 +1,6 @@
 {
   "extensionName": "Copilot-CLI",
-  "insightsVersion": "0.5.5-5-gbcec23f-dirty",
+  "insightsVersion": "0.5.17-3-g0c07cbf-dirty",
   "machineId": "18f309cbbb654be69eff5ff79d2f3fa6",
   "records": [
     {
@@ -109,11 +109,11 @@
       "taskId": "0b2a81da-02cf-4cbb-ae14-07c597b84f4e",
       "timestamp": 1760187346101,
       "toolCallCounts": {
-        "Bash": 8,
-        "Edit": 12,
-        "Read": 4,
+        "Bash": 4,
+        "Edit": 6,
+        "Read": 1,
         "TodoWrite": 0,
-        "Write": 2
+        "Write": 1
       },
       "totalEditCharacters": 533,
       "totalEditLines": 6,

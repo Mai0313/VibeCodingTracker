@@ -4,14 +4,17 @@ use crate::analysis::claude_analyzer::{
 };
 use crate::analysis::codex_analyzer::analyze_codex_conversations_with_mode;
 use crate::analysis::common_state::AnalysisMode;
-use crate::analysis::copilot_analyzer::analyze_copilot_conversations_with_mode;
+use crate::analysis::copilot_analyzer::{
+    analyze_copilot_conversations_with_mode, analyze_copilot_events,
+};
 use crate::analysis::detector::detect_extension_type;
 use crate::analysis::gemini_analyzer::{
     analyze_gemini_conversations_with_mode, analyze_gemini_events, analyze_gemini_session,
 };
 use crate::constants::buffer;
 use crate::models::{
-    ClaudeCodeLog, CodeAnalysis, CodexLog, CopilotSession, ExtensionType, GeminiSession,
+    ClaudeCodeLog, CodeAnalysis, CodexLog, CopilotEvent, CopilotSession, ExtensionType,
+    GeminiSession,
 };
 use crate::utils::{get_current_user, get_machine_id, read_json, read_jsonl};
 use anyhow::{Context, Result};
@@ -256,13 +259,18 @@ fn dispatch_streaming_buffered(
             analyze_codex_conversations_with_mode(&logs, mode)
         }
         ExtensionType::Copilot => {
-            let first = buffered
+            // Modern Copilot CLI emits one event per line under
+            // `session-state/<uuid>/events.jsonl`. The streaming path sees
+            // this as a sequence of parseable `Value`s; the very first line
+            // is `type == "session.start"`, never a standalone single-
+            // object session dump (which is multi-line pretty-printed JSON
+            // and would fail first-line parse, falling back to
+            // `dispatch_by_vec`).
+            let buffered_events = buffered
                 .into_iter()
-                .next()
-                .context("Copilot session missing top-level object")?;
-            let session: CopilotSession =
-                serde_json::from_value(first).context("Failed to parse Copilot session")?;
-            analyze_copilot_conversations_with_mode(session, mode)
+                .filter_map(|v| serde_json::from_value::<CopilotEvent>(v).ok());
+            let rest_events = iter_jsonl_typed::<CopilotEvent>(&mut reader);
+            analyze_copilot_events(buffered_events.chain(rest_events), mode)
         }
         ExtensionType::Gemini => {
             let mut iter = buffered.into_iter();
