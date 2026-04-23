@@ -1,14 +1,14 @@
-// Unit tests for analysis/common_state.rs
+// Unit tests for parser/common_state.rs
 //
-// Tests the common analysis state shared by all analyzers
+// Tests the common parser state shared by all provider parsers
 
-use vibe_coding_tracker::analysis::common_state::AnalysisState;
 use vibe_coding_tracker::constants::FastHashMap;
+use vibe_coding_tracker::parser::common_state::ParserState;
 
 #[test]
-fn test_analysis_state_new() {
-    // Test creating a new AnalysisState
-    let state = AnalysisState::new();
+fn test_parser_state_new() {
+    // Test creating a new ParserState
+    let state = ParserState::new();
 
     assert_eq!(state.total_write_lines, 0);
     assert_eq!(state.total_read_lines, 0);
@@ -23,7 +23,7 @@ fn test_analysis_state_new() {
 #[test]
 fn test_add_read_detail() {
     // Test adding a read operation
-    let mut state = AnalysisState::new();
+    let mut state = ParserState::new();
     state.folder_path = "/test/folder".to_string();
 
     state.add_read_detail("test.rs", "line1\nline2\nline3", 1234567890);
@@ -37,7 +37,7 @@ fn test_add_read_detail() {
 #[test]
 fn test_add_read_detail_ignores_empty() {
     // Test that empty content is ignored
-    let mut state = AnalysisState::new();
+    let mut state = ParserState::new();
 
     state.add_read_detail("test.rs", "", 1234567890);
 
@@ -49,7 +49,7 @@ fn test_add_read_detail_ignores_empty() {
 #[test]
 fn test_add_write_detail() {
     // Test adding a write operation
-    let mut state = AnalysisState::new();
+    let mut state = ParserState::new();
     state.folder_path = "/test/folder".to_string();
 
     state.add_write_detail("output.txt", "content line 1\ncontent line 2", 1234567890);
@@ -63,7 +63,7 @@ fn test_add_write_detail() {
 #[test]
 fn test_add_edit_detail() {
     // Test adding an edit operation
-    let mut state = AnalysisState::new();
+    let mut state = ParserState::new();
     state.folder_path = "/test".to_string();
 
     state.add_edit_detail(
@@ -82,7 +82,7 @@ fn test_add_edit_detail() {
 #[test]
 fn test_add_edit_detail_empty_old_becomes_write() {
     // Test that edit with empty old content becomes a write
-    let mut state = AnalysisState::new();
+    let mut state = ParserState::new();
     state.folder_path = "/test".to_string();
 
     state.add_edit_detail("new_file.rs", "", "new content", 1234567890);
@@ -97,7 +97,7 @@ fn test_add_edit_detail_empty_old_becomes_write() {
 #[test]
 fn test_add_run_command() {
     // Test adding a run command
-    let mut state = AnalysisState::new();
+    let mut state = ParserState::new();
     state.folder_path = "/workspace".to_string();
 
     state.add_run_command("cargo test", "Running tests", 1234567890);
@@ -110,7 +110,7 @@ fn test_add_run_command() {
 #[test]
 fn test_add_run_command_ignores_empty() {
     // Test that empty commands are ignored
-    let mut state = AnalysisState::new();
+    let mut state = ParserState::new();
 
     state.add_run_command("", "description", 1234567890);
     state.add_run_command("   ", "description", 1234567890);
@@ -122,7 +122,7 @@ fn test_add_run_command_ignores_empty() {
 #[test]
 fn test_normalize_path_absolute() {
     // Test normalizing absolute paths
-    let mut state = AnalysisState::new();
+    let mut state = ParserState::new();
     state.folder_path = "/workspace".to_string();
 
     let result = state.normalize_path("/absolute/path/file.rs");
@@ -132,7 +132,7 @@ fn test_normalize_path_absolute() {
 #[test]
 fn test_normalize_path_relative() {
     // Test normalizing relative paths
-    let mut state = AnalysisState::new();
+    let mut state = ParserState::new();
     state.folder_path = "/workspace".to_string();
 
     let result = state.normalize_path("relative/file.rs");
@@ -142,7 +142,7 @@ fn test_normalize_path_relative() {
 #[test]
 fn test_normalize_path_empty_folder() {
     // Test normalizing when folder_path is empty
-    let state = AnalysisState::new();
+    let state = ParserState::new();
 
     let result = state.normalize_path("file.rs");
     assert_eq!(result, "file.rs");
@@ -151,7 +151,7 @@ fn test_normalize_path_empty_folder() {
 #[test]
 fn test_normalize_path_empty_input() {
     // Test normalizing empty path
-    let mut state = AnalysisState::new();
+    let mut state = ParserState::new();
     state.folder_path = "/workspace".to_string();
 
     let result = state.normalize_path("");
@@ -161,7 +161,7 @@ fn test_normalize_path_empty_input() {
 #[test]
 fn test_unique_files_tracking() {
     // Test that unique files are tracked correctly
-    let mut state = AnalysisState::new();
+    let mut state = ParserState::new();
     state.folder_path = "/project".to_string();
 
     // Add operations on same file
@@ -180,7 +180,7 @@ fn test_unique_files_tracking() {
 #[test]
 fn test_character_counting() {
     // Test that character counts are correct
-    let mut state = AnalysisState::new();
+    let mut state = ParserState::new();
 
     state.add_read_detail("file.txt", "hello", 1);
     assert_eq!(state.total_read_characters, 5);
@@ -195,7 +195,7 @@ fn test_character_counting() {
 #[test]
 fn test_into_record() {
     // Test converting state into a record
-    let mut state = AnalysisState::new();
+    let mut state = ParserState::new();
     state.folder_path = "/test".to_string();
     state.git_remote = "https://github.com/test/repo".to_string();
     state.task_id = "task-123".to_string();
@@ -219,7 +219,7 @@ fn test_into_record() {
 #[test]
 fn test_default_trait() {
     // Test Default trait implementation
-    let state = AnalysisState::default();
+    let state = ParserState::default();
 
     assert_eq!(state.total_write_lines, 0);
     assert_eq!(state.total_read_lines, 0);
@@ -229,7 +229,7 @@ fn test_default_trait() {
 #[test]
 fn test_multiple_operations() {
     // Test handling multiple operations
-    let mut state = AnalysisState::new();
+    let mut state = ParserState::new();
     state.folder_path = "/workspace".to_string();
 
     // Multiple reads

@@ -17,7 +17,7 @@
 
 </div>
 
-**即時追蹤你的 AI 程式設計花費。** Vibe Coding Tracker 是一款以 Rust 打造的輕量、高效能 CLI 工具，能監控與分析你在 Claude Code、Codex、Copilot 及 Gemini 的使用狀況——提供詳細的費用明細、token 統計資料與程式碼操作分析，同時維持極低的記憶體使用量。
+**即時追蹤你的 AI 程式設計花費。** Vibe Coding Tracker 是一款以 Rust 打造的輕量、高效能 CLI 工具,監控你在 Claude Code、Codex、Copilot 及 Gemini 的使用狀況——提供詳細的費用明細與 token 統計資料,同時維持極低的記憶體使用量。
 
 [English](README.md) | [繁體中文](README.zh-TW.md) | [简体中文](README.zh-CN.md)
 
@@ -46,14 +46,12 @@
 
 ### 🚀 零設定
 
-自動偵測並處理 Claude Code、Codex、Copilot 及 Gemini 的日誌檔。不需要任何設定——直接執行就能分析。
+自動偵測並處理 Claude Code、Codex、Copilot 及 Gemini 的日誌檔。不需要任何設定——直接執行即可。
 
 ### 🎨 豐富洞察
 
 - 依模型與日期分類的 token 使用量
-- 依 cache 類型（讀取 / 建立）的費用明細
-- 檔案操作追蹤（編輯、讀取、寫入行數）
-- 工具呼叫歷史（Bash、Edit、Read、Write、TodoWrite）
+- 依 cache 類型(讀取 / 建立)的費用明細
 - 每個供應商的每日平均值
 
 ---
@@ -65,7 +63,6 @@
 | 🤖 **多供應商支援** | Claude Code、Codex、Copilot 及 Gemini——一站整合           |
 | 💵 **智慧定價**     | 模糊模型比對 + 每日從 LiteLLM cache 更新                  |
 | 🎨 **4 種顯示模式** | 互動式 TUI、靜態表格、純文字及 JSON                       |
-| 📈 **雙重分析**     | Token / 費用統計（`usage`）+ 程式碼操作統計（`analysis`） |
 | 🪶 **超輕量**       | TUI 常駐記憶體 ~50 MB 以內、串流 JSONL 解析——以 Rust 打造 |
 | 🔄 **即時更新**     | 即時儀表板每秒自動刷新                                    |
 | 💾 **高效快取**     | 智慧每日 cache 減少 API 呼叫次數                          |
@@ -123,9 +120,6 @@ vct usage
 
 # Or run the binary built by Cargo/pip
 vibe_coding_tracker usage
-
-# Analyze code operations across all sessions
-vct analysis
 ```
 
 ---
@@ -139,14 +133,13 @@ vct <COMMAND> [OPTIONS]
 # Replace with `vibe_coding_tracker` if you are using the full binary name
 
 Commands:
-  analysis    Analyze JSONL conversation files (single file or all sessions)
   usage       Display token usage statistics
   version     Display version information
   update      Update to the latest version from GitHub releases
   help        Print this message or the help of the given subcommand(s)
 ```
 
-時間範圍 flag（`usage` 與 `analysis` 共用，互斥，預設 `--all`）：
+時間範圍 flag(適用於 `usage`,互斥,預設 `--all`):
 
 | Flag        | 範圍                       |
 | ----------- | -------------------------- |
@@ -230,79 +223,6 @@ vct usage --json --daily
 - `~/.codex/sessions/*.jsonl`（Codex）
 - `~/.copilot/history-session-state/*.json`（Copilot）
 - `~/.gemini/tmp/<project_hash>/chats/*.json`（Gemini）
-
----
-
-## 📊 Analysis 指令
-
-**深入分析程式碼操作——精確掌握你的 AI 助手做了哪些事。**
-
-### Flag 一覽
-
-| Flag                                           | 用途                                                            |
-| ---------------------------------------------- | --------------------------------------------------------------- |
-| *(不帶參數)*                                   | 互動式 TUI 儀表板，涵蓋所有 session                             |
-| `--path <FILE>`                                | 分析單一 JSONL/JSON 對話檔案（stdout 輸出 JSON）                |
-| `--table`                                      | 靜態表格，附帶每日平均值                                        |
-| `--output <FILE>`                              | 將結果以格式化 JSON 存成檔案                                    |
-| `--by-provider`                                | 依 provider（claude / codex / copilot / gemini）分組並輸出 JSON |
-| `--daily` / `--weekly` / `--monthly` / `--all` | 時間範圍篩選（見上方表格）                                      |
-
-請參考 [`examples/`](examples/) 目錄，裡面有四種 provider 的範例輸入與對應的 JSON 輸出。
-
-### 基本用法
-
-```bash
-# Interactive dashboard for all sessions (default)
-vct analysis
-
-# Static table output with daily averages
-vct analysis --table
-
-# 分析單一對話檔案 → stdout JSON
-vct analysis --path ~/.claude/projects/session.jsonl
-
-# Save results to JSON
-vct analysis --output report.json
-
-# Group results by provider
-vct analysis --by-provider
-
-# Save grouped results
-vct analysis --by-provider --output grouped_report.json
-
-# 時間範圍與輸出格式可自由組合
-vct analysis --weekly
-vct analysis --table --monthly
-vct analysis --by-provider --daily --output today.json
-```
-
-### 預覽：互動式儀表板（`vct analysis`）
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                    🔍 Analysis Statistics                                   │
-└─────────────────────────────────────────────────────────────────────────────────────────────┘
-┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Model                        Edit Lines  Read Lines  Write Lines  Bash  Edit  Read  Write  │
-│                                                                                             │
-│ claude-haiku-4-5-20251001    0           0           0            43    0     59    0       │
-│ claude-opus-4-6              1,280       13,264      1,575        82    146   209   62      │
-│ gemini-3.1-pro-preview       0           0           0            0     0     0     0       │
-│ TOTAL                        1,280       13,264      1,575        125   146   268   62      │
-└─────────────────────────────────────────────────────────────────────────────────────────────┘
-┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Provider          EditL/Day ReadL/Day WriteL/Day Bash/Day Edit/Day Read/Day Write/Day Days  │
-│                                                                                             │
-│ 🤖 Claude Code    426.7     4421.3    525.0      41.7     48.7     89.3     20.7      3    │
-│ ✨ Gemini         0         0         0          0.0      0.0      0.0      0.0       1    │
-│ ⭐ All Providers  426.7     4421.3    525.0      41.7     48.7     89.3     20.7      3    │
-└─────────────────────────────────────────────────────────────────────────────────────────────┘
-┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│  📝 Lines: 16,119  |  🔧 Tools: 601  |  📊 Models: 3  |  🧠 Memory: 41.2 MB                │
-└─────────────────────────────────────────────────────────────────────────────────────────────┘
-                          Press 'q', 'Esc', 'Ctrl+C' to quit | Press 'r' to refresh
-```
 
 ---
 

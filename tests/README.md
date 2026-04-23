@@ -12,11 +12,8 @@ This directory contains all tests for the Vibe Coding Tracker project.
 
 These tests verify end-to-end functionality of the application, excluding TUI components. They test the complete workflow from parsing session files to generating usage reports.
 
-- `analysis_tests.rs` - Single-file and batch analysis operations
-- `cache_tests.rs` - LRU file parsing cache and pricing cache
-- `cli_tests.rs` - Command-line interface operations
-- `parser_tests.rs` - Parsing functionality for all AI assistant formats
-- `pricing_tests.rs` - Pricing system functionality
+- `cli_tests.rs` - Command-line interface operations (`usage`, `version`, `update`, help)
+- `pricing_tests.rs` - Pricing system functionality (fetch, cache, matching, cost)
 - `usage_tests.rs` - Usage calculation and aggregation logic
 
 **Run all integration tests:**
@@ -29,10 +26,9 @@ cargo test --test integration_tests
 
 These tests verify individual functions and modules in isolation.
 
-#### Analysis Module Tests
+#### Parser Module Tests
 
-- `test_detector.rs` - AI provider format detection (`src/analysis/detector.rs`)
-- `test_common_state.rs` - Common analysis state shared by all analyzers (`src/analysis/common_state.rs`)
+- `test_common_state.rs` - Common parser state shared by all provider parsers (`src/parser/common_state.rs`)
 
 #### Utils Module Tests
 
@@ -46,10 +42,6 @@ These tests verify individual functions and modules in isolation.
 
 - `test_pricing_matching.rs` - Model pricing matching logic (`src/pricing/matching.rs`)
 - `test_pricing_cache.rs` - Model pricing data structures and serialization (`src/pricing/cache.rs`)
-
-#### Cache Module Tests
-
-- `test_cache_global.rs` - Global cache singleton operations (`src/cache/mod.rs`)
 
 #### Models Module Tests
 
@@ -68,31 +60,10 @@ cargo test --tests --lib
 **Run specific unit test:**
 
 ```bash
-cargo test --test test_detector
 cargo test --test test_common_state
 cargo test --test test_utils_file
 # ... etc
 ```
-
-## Test Statistics
-
-### Integration Tests
-
-- **Total Tests:** 95
-- **Coverage:** All functionality except TUI components
-
-### Unit Tests
-
-- **Total Tests:** 202 (12 test files)
-- **Coverage:** Individual functions in core modules
-
-### Library Tests
-
-- **Total Tests:** 26 (in source code)
-
-### Total
-
-- **All Tests:** 323 tests across 15 test suites ✅
 
 ## Running Tests
 
@@ -123,14 +94,14 @@ cargo test -- --test-threads=1
 ### Run Specific Test Module
 
 ```bash
-cargo test --test integration_tests integrations::parser_tests
-cargo test --test test_detector
+cargo test --test integration_tests integrations::usage_tests
+cargo test --test test_common_state
 ```
 
 ### Run Specific Test
 
 ```bash
-cargo test test_claude_code_parser
+cargo test test_parser_state_new
 cargo test test_exact_match
 ```
 
@@ -148,10 +119,9 @@ cargo test test_exact_match
 
 Add tests to the appropriate file in `tests/integrations/`:
 
-- Analysis operations → `analysis_tests.rs`
 - CLI commands → `cli_tests.rs`
-- Parsing logic → `parser_tests.rs`
-- etc.
+- Usage aggregation → `usage_tests.rs`
+- Pricing logic → `pricing_tests.rs`
 
 ### For Unit Tests
 

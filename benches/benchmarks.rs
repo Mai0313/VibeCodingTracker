@@ -2,6 +2,8 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::path::PathBuf;
 use vibe_coding_tracker::constants::FastHashMap;
+use vibe_coding_tracker::models::ExtensionType;
+use vibe_coding_tracker::parser::{ParseMode, analyze_session_file_typed_as};
 use vibe_coding_tracker::pricing::{ModelPricingMap, normalize_model_name};
 
 // ========== Pricing & String Operations ==========
@@ -82,97 +84,53 @@ fn benchmark_line_counting(c: &mut Criterion) {
 fn benchmark_file_parsing(c: &mut Criterion) {
     let mut group = c.benchmark_group("file_parsing");
 
-    // Test files paths
+    // (name, path, provider) — provider is known from the directory layout
     let test_files = vec![
-        ("claude", "examples/test_conversation.jsonl"),
-        ("codex", "examples/test_conversation_oai.jsonl"),
-        ("copilot", "examples/test_conversation_copilot.json"),
-        ("gemini", "examples/test_conversation_gemini.json"),
+        (
+            "claude",
+            "examples/test_conversation.jsonl",
+            ExtensionType::ClaudeCode,
+        ),
+        (
+            "codex",
+            "examples/test_conversation_oai.jsonl",
+            ExtensionType::Codex,
+        ),
+        (
+            "copilot",
+            "examples/test_conversation_copilot.json",
+            ExtensionType::Copilot,
+        ),
+        (
+            "gemini",
+            "examples/test_conversation_gemini.json",
+            ExtensionType::Gemini,
+        ),
     ];
 
-    for (name, path) in test_files {
+    for (name, path, provider) in test_files {
         let path_buf = PathBuf::from(path);
         if path_buf.exists() {
             group.bench_with_input(
-                BenchmarkId::new("analyze_jsonl_file", name),
-                &path_buf,
-                |b, p| b.iter(|| vibe_coding_tracker::analysis::analyze_jsonl_file(black_box(p))),
+                BenchmarkId::new("analyze_session_file_typed_as/full", name),
+                &(path_buf.clone(), provider),
+                |b, (p, prov)| {
+                    b.iter(|| analyze_session_file_typed_as(black_box(p), *prov, ParseMode::Full))
+                },
+            );
+            group.bench_with_input(
+                BenchmarkId::new("analyze_session_file_typed_as/usage_only", name),
+                &(path_buf, provider),
+                |b, (p, prov)| {
+                    b.iter(|| {
+                        analyze_session_file_typed_as(black_box(p), *prov, ParseMode::UsageOnly)
+                    })
+                },
             );
         }
     }
 
     group.finish();
-}
-
-// ========== Format Detection Benchmarks ==========
-
-fn benchmark_format_detection(c: &mut Criterion) {
-    use serde_json::json;
-    use vibe_coding_tracker::analysis::detector::detect_extension_type;
-
-    let claude_data = vec![
-        json!({"parentUuid": null, "type": "user", "message": {"role": "user"}}),
-        json!({"parentUuid": "abc", "type": "assistant", "message": {"role": "assistant"}}),
-    ];
-
-    let codex_data = vec![
-        json!({"completion_response": {"usage": {}}, "total_token_usage": {}}),
-        json!({"completion_response": {"usage": {}}}),
-    ];
-
-    let copilot_data = vec![json!({"sessionId": "test", "startTime": 123, "timeline": []})];
-
-    let gemini_data = vec![json!({"sessionId": "test", "projectHash": "abc", "messages": []})];
-
-    c.bench_function("detect_format claude", |b| {
-        b.iter(|| detect_extension_type(black_box(&claude_data)))
-    });
-
-    c.bench_function("detect_format codex", |b| {
-        b.iter(|| detect_extension_type(black_box(&codex_data)))
-    });
-
-    c.bench_function("detect_format copilot", |b| {
-        b.iter(|| detect_extension_type(black_box(&copilot_data)))
-    });
-
-    c.bench_function("detect_format gemini", |b| {
-        b.iter(|| detect_extension_type(black_box(&gemini_data)))
-    });
-}
-
-// ========== Cache Performance Benchmarks ==========
-
-fn benchmark_cache_operations(c: &mut Criterion) {
-    use std::path::PathBuf;
-    use vibe_coding_tracker::cache::global_cache;
-
-    let test_path = PathBuf::from("examples/test_conversation.jsonl");
-
-    if !test_path.exists() {
-        return;
-    }
-
-    // Warm up cache
-    let _ = global_cache().get_or_parse(&test_path);
-
-    c.bench_function("cache hit (warm)", |b| {
-        b.iter(|| global_cache().get_or_parse(black_box(&test_path)))
-    });
-
-    c.bench_function("cache miss (cold)", |b| {
-        b.iter_batched(
-            || {
-                // Clear cache before each iteration
-                global_cache().invalidate(&test_path);
-                test_path.clone()
-            },
-            |path| global_cache().get_or_parse(&path),
-            criterion::BatchSize::SmallInput,
-        )
-    });
-
-    c.bench_function("cache stats", |b| b.iter(|| global_cache().stats()));
 }
 
 // ========== HashMap Performance Benchmarks ==========
@@ -263,43 +221,6 @@ fn benchmark_usage_aggregation(c: &mut Criterion) {
     });
 }
 
-// ========== Batch Analysis Benchmarks ==========
-
-fn benchmark_batch_analysis(c: &mut Criterion) {
-    use std::path::PathBuf;
-
-    // Only run if example files exist
-    let claude_path = PathBuf::from("examples/test_conversation.jsonl");
-    let codex_path = PathBuf::from("examples/test_conversation_oai.jsonl");
-    let copilot_path = PathBuf::from("examples/test_conversation_copilot.json");
-    let gemini_path = PathBuf::from("examples/test_conversation_gemini.json");
-
-    if !claude_path.exists()
-        || !codex_path.exists()
-        || !copilot_path.exists()
-        || !gemini_path.exists()
-    {
-        return;
-    }
-
-    c.bench_function("batch analyze all formats", |b| {
-        b.iter(|| {
-            // Create temporary directory paths for testing
-            let paths = vec![
-                (claude_path.clone(), "claude"),
-                (codex_path.clone(), "codex"),
-                (copilot_path.clone(), "copilot"),
-                (gemini_path.clone(), "gemini"),
-            ];
-
-            // Simulate batch processing
-            for (path, _name) in paths {
-                let _ = vibe_coding_tracker::analysis::analyze_jsonl_file(black_box(&path));
-            }
-        })
-    });
-}
-
 // ========== JSON Serialization Benchmarks ==========
 
 fn benchmark_json_serialization(c: &mut Criterion) {
@@ -338,11 +259,8 @@ criterion_group!(
     benchmark_pricing_lookup,
     benchmark_line_counting,
     benchmark_file_parsing,
-    benchmark_format_detection,
-    benchmark_cache_operations,
     benchmark_hashmap_performance,
     benchmark_usage_aggregation,
-    benchmark_batch_analysis,
     benchmark_json_serialization,
 );
 criterion_main!(benches);

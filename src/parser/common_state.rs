@@ -4,25 +4,22 @@ use crate::utils::count_lines;
 use serde_json::Value;
 use std::collections::HashSet;
 
-/// Controls how much per-operation detail the analyzer retains.
+/// Controls how much per-operation detail the parser retains.
 ///
-/// `Full` keeps everything that ends up in the public JSON output
-/// (file contents on `Write`, old/new strings on `Edit`, command text on
-/// `Bash`). `UsageOnly` skips those allocations — counts and totals are
-/// still accurate, but the per-detail `Vec`s stay empty. Callers that only
-/// consume `conversation_usage` / `tool_call_counts` / `total_*_lines`
-/// (the `usage` command, the aggregated `analysis` path) should pick
-/// `UsageOnly` to avoid pulling entire file bodies into memory on every
-/// session parse.
+/// `Full` keeps everything (file contents on `Write`, old/new strings on
+/// `Edit`, command text on `Bash`). `UsageOnly` skips those allocations —
+/// counts and totals are still accurate, but the per-detail `Vec`s stay
+/// empty. The `usage` command uses `UsageOnly` to avoid pulling entire
+/// file bodies into memory on every session parse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AnalysisMode {
+pub enum ParseMode {
     Full,
     UsageOnly,
 }
 
-/// Common analysis state shared by all analyzers (Claude, Codex, Gemini)
-pub struct AnalysisState {
-    pub mode: AnalysisMode,
+/// Common parser state shared by all provider parsers (Claude, Codex, Copilot, Gemini)
+pub struct ParserState {
+    pub mode: ParseMode,
     pub write_details: Vec<CodeAnalysisWriteDetail>,
     pub read_details: Vec<CodeAnalysisReadDetail>,
     pub edit_details: Vec<CodeAnalysisApplyDiffDetail>,
@@ -41,16 +38,16 @@ pub struct AnalysisState {
     pub last_ts: i64,
 }
 
-impl AnalysisState {
+impl ParserState {
     pub fn new() -> Self {
-        Self::with_mode(AnalysisMode::Full)
+        Self::with_mode(ParseMode::Full)
     }
 
-    pub fn with_mode(mode: AnalysisMode) -> Self {
+    pub fn with_mode(mode: ParseMode) -> Self {
         // Pre-allocate Vecs with reasonable capacity estimates based on
         // typical session sizes. In `UsageOnly` mode we skip the
         // pre-allocation because the vecs stay empty.
-        let pre = matches!(mode, AnalysisMode::Full);
+        let pre = matches!(mode, ParseMode::Full);
         Self {
             mode,
             write_details: if pre {
@@ -104,7 +101,7 @@ impl AnalysisState {
             return;
         }
 
-        if matches!(self.mode, AnalysisMode::Full) {
+        if matches!(self.mode, ParseMode::Full) {
             self.read_details.push(CodeAnalysisReadDetail {
                 base: CodeAnalysisDetailBase {
                     file_path: resolved.clone(),
@@ -132,7 +129,7 @@ impl AnalysisState {
             return;
         }
 
-        if matches!(self.mode, AnalysisMode::Full) {
+        if matches!(self.mode, ParseMode::Full) {
             self.write_details.push(CodeAnalysisWriteDetail {
                 base: CodeAnalysisDetailBase {
                     file_path: resolved.clone(),
@@ -169,7 +166,7 @@ impl AnalysisState {
             return;
         }
 
-        if matches!(self.mode, AnalysisMode::Full) {
+        if matches!(self.mode, ParseMode::Full) {
             self.edit_details.push(CodeAnalysisApplyDiffDetail {
                 base: CodeAnalysisDetailBase {
                     file_path: resolved.clone(),
@@ -197,7 +194,7 @@ impl AnalysisState {
 
         let command_chars = command.chars().count();
 
-        if matches!(self.mode, AnalysisMode::Full) {
+        if matches!(self.mode, ParseMode::Full) {
             self.run_details.push(CodeAnalysisRunCommandDetail {
                 base: CodeAnalysisDetailBase {
                     file_path: self.folder_path.clone(),
@@ -258,7 +255,7 @@ impl AnalysisState {
     }
 }
 
-impl Default for AnalysisState {
+impl Default for ParserState {
     fn default() -> Self {
         Self::new()
     }

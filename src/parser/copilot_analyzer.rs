@@ -1,4 +1,4 @@
-use crate::analysis::common_state::{AnalysisMode, AnalysisState};
+use crate::parser::common_state::{ParseMode, ParserState};
 use crate::constants::{FastHashMap, capacity};
 use crate::models::*;
 use crate::utils::{get_git_remote_url, parse_iso_timestamp};
@@ -7,14 +7,14 @@ use serde_json::{Value, json};
 
 /// Analyze Copilot CLI conversations
 pub fn analyze_copilot_conversations(session: CopilotSession) -> Result<CodeAnalysis> {
-    analyze_copilot_conversations_with_mode(session, AnalysisMode::Full)
+    analyze_copilot_conversations_with_mode(session, ParseMode::Full)
 }
 
 pub fn analyze_copilot_conversations_with_mode(
     session: CopilotSession,
-    mode: AnalysisMode,
+    mode: ParseMode,
 ) -> Result<CodeAnalysis> {
-    let mut state = AnalysisState::with_mode(mode);
+    let mut state = ParserState::with_mode(mode);
 
     // Pre-allocate FastHashMap using centralized capacity constant
     // Copilot usage is currently unknown, so we initialize an empty map

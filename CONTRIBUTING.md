@@ -76,12 +76,11 @@ Unsure where to begin contributing? You can start by looking through `good first
 ├── benches/          # Criterion benchmarks (pricing, parsing, aggregation)
 ├── cli/              # npm and PyPI wrapper packages (nodejs/, python/)
 ├── docker/           # Multi-stage Dockerfile (builder → ubuntu:24.04 prod)
-├── examples/         # Sample session files and analysis outputs
+├── examples/         # Sample session files for each provider
 ├── src/
-│   ├── analysis/     # JSONL parsers (claude / codex / copilot / gemini) + detector
-│   ├── cache/        # LRU + pricing cache
 │   ├── cli.rs        # clap definitions (commands, flags, TimeRange enum)
-│   ├── display/      # TUI dashboards, static tables, plain-text renderers (usage rows sorted by cost ascending)
+│   ├── display/      # TUI dashboard, static table, plain-text renderer (usage rows sorted by cost ascending)
+│   ├── parser/       # JSONL parsers (claude / codex / copilot / gemini) + shared state
 │   ├── pricing/      # LiteLLM fetch, fuzzy model matching, cost calculation
 │   ├── update/       # Self-update via GitHub releases (archive extraction)
 │   ├── usage/        # Per-provider token aggregation
@@ -123,8 +122,8 @@ Two release profiles are defined in `Cargo.toml`:
 
 `Cargo.toml` exposes a small set of optional features; the defaults are tuned for long-running TUI sessions.
 
-- **System allocator (default)** — the build links against glibc's `malloc`. Combined with the `mallopt` tuning applied at startup (see `src/utils/heap.rs`) and the per-refresh `malloc_trim(0)` call, this keeps `usage` / `analysis` TUI RSS roughly flat (~30–50 MB) even over hours of refreshes. Use this for anything you plan to leave open.
-- **`mimalloc` (opt-in)** — enable with `cargo build --release --features mimalloc`. Links Microsoft's mimalloc as the global allocator. Startup / one-shot commands (`vct usage --json`, `vct analysis --path file.jsonl`) are slightly faster, but mimalloc's lazy purge retains freed pages — on a 219-session directory the TUI RSS was ~11× higher than the default build in our measurements. Prefer this only for scripted, short-lived invocations.
+- **System allocator (default)** — the build links against glibc's `malloc`. Combined with the `mallopt` tuning applied at startup (see `src/utils/heap.rs`) and the per-refresh `malloc_trim(0)` call, this keeps `usage` TUI RSS roughly flat (~30–50 MB) even over hours of refreshes. Use this for anything you plan to leave open.
+- **`mimalloc` (opt-in)** — enable with `cargo build --release --features mimalloc`. Links Microsoft's mimalloc as the global allocator. Startup / one-shot commands (`vct usage --json`) are slightly faster, but mimalloc's lazy purge retains freed pages — on a 219-session directory the TUI RSS was ~11× higher than the default build in our measurements. Prefer this only for scripted, short-lived invocations.
 
 On Linux/glibc the main binary also calls `mallopt(M_ARENA_MAX, 2)` + `mallopt(M_TRIM_THRESHOLD, 128 KiB)` at start. These cap the number of per-thread allocator arenas (so Rayon workers can't multiply arena-side fragmentation across cores) and pin the trim threshold. The calls are no-ops on other platforms / allocators.
 

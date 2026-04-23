@@ -16,7 +16,6 @@ pub trait ProviderStatistics<Row: DailyAverageRow>: Default {
 
 /// Calculates daily averages grouped by AI provider
 ///
-/// Generic implementation used by both usage and analysis commands to avoid code duplication.
 /// Groups rows by provider, uses externally-provided day counts, and accumulates metrics.
 pub fn calculate_daily_averages<R, S>(
     rows: &[R],

@@ -17,7 +17,7 @@
 
 </div>
 
-**Track your AI coding costs in real-time.** Vibe Coding Tracker is a lightweight, high-performance CLI tool built in Rust that monitors and analyzes your Claude Code, Codex, Copilot, and Gemini usage — with detailed cost breakdowns, token statistics, and code operation insights, all while keeping the memory footprint minimal.
+**Track your AI coding costs in real-time.** Vibe Coding Tracker is a lightweight, high-performance CLI tool built in Rust that monitors your Claude Code, Codex, Copilot, and Gemini usage — with detailed cost breakdowns and token statistics, all while keeping the memory footprint minimal.
 
 [English](README.md) | [繁體中文](README.zh-TW.md) | [简体中文](README.zh-CN.md)
 
@@ -46,14 +46,12 @@ Choose your preferred view:
 
 ### 🚀 Zero Configuration
 
-Automatically detects and processes logs from Claude Code, Codex, Copilot, and Gemini. No setup required — just run and analyze.
+Automatically detects and processes logs from Claude Code, Codex, Copilot, and Gemini. No setup required — just run.
 
 ### 🎨 Rich Insights
 
 - Token usage by model and date
 - Cost breakdown by cache types (read / create)
-- File operations tracking (edit, read, write lines)
-- Tool call history (Bash, Edit, Read, Write, TodoWrite)
 - Per-provider daily averages
 
 ---
@@ -65,7 +63,6 @@ Automatically detects and processes logs from Claude Code, Codex, Copilot, and G
 | 🤖 **Multi-Provider**    | Claude Code, Codex, Copilot, and Gemini — all in one place           |
 | 💵 **Smart Pricing**     | Fuzzy model matching + daily cache from LiteLLM                      |
 | 🎨 **4 Display Modes**   | Interactive TUI, static table, plain text, and JSON                  |
-| 📈 **Dual Analysis**     | Token/cost stats (`usage`) + code operation stats (`analysis`)       |
 | 🪶 **Ultra-Lightweight** | Under ~50 MB RSS in the TUI, streaming JSONL parse — built with Rust |
 | 🔄 **Live Updates**      | Real-time dashboard refreshes every second                           |
 | 💾 **Efficient Caching** | Smart daily cache reduces API calls                                  |
@@ -123,9 +120,6 @@ vct usage
 
 # Or run the binary built by Cargo/pip
 vibe_coding_tracker usage
-
-# Analyze code operations across all sessions
-vct analysis
 ```
 
 ---
@@ -139,14 +133,13 @@ vct <COMMAND> [OPTIONS]
 # Replace with `vibe_coding_tracker` if you are using the full binary name
 
 Commands:
-  analysis    Analyze JSONL conversation files (single file or all sessions)
   usage       Display token usage statistics
   version     Display version information
   update      Update to the latest version from GitHub releases
   help        Print this message or the help of the given subcommand(s)
 ```
 
-Time range flags (shared by `usage` and `analysis`, mutually exclusive, default `--all`):
+Time range flags (applicable to `usage`, mutually exclusive, default `--all`):
 
 | Flag        | Window                            |
 | ----------- | --------------------------------- |
@@ -230,79 +223,6 @@ The tool automatically scans these directories:
 - `~/.codex/sessions/*.jsonl` (Codex)
 - `~/.copilot/history-session-state/*.json` (Copilot)
 - `~/.gemini/tmp/<project_hash>/chats/*.json` (Gemini)
-
----
-
-## 📊 Analysis Command
-
-**Deep dive into code operations — see exactly what your AI assistant did.**
-
-### Flags
-
-| Flag                                           | Purpose                                                            |
-| ---------------------------------------------- | ------------------------------------------------------------------ |
-| *(none)*                                       | Interactive TUI dashboard over all sessions                        |
-| `--path <FILE>`                                | Analyze a single JSONL/JSON conversation file (prints JSON)        |
-| `--table`                                      | Static table with per-provider daily averages                      |
-| `--output <FILE>`                              | Save results as pretty-printed JSON                                |
-| `--by-provider`                                | Group rows by provider (claude / codex / copilot / gemini) as JSON |
-| `--daily` / `--weekly` / `--monthly` / `--all` | Time range filter (see table above)                                |
-
-See [`examples/`](examples/) for sample inputs and matching JSON outputs for all four providers.
-
-### Basic Usage
-
-```bash
-# Interactive dashboard for all sessions (default)
-vct analysis
-
-# Static table output with daily averages
-vct analysis --table
-
-# Analyze a single conversation file → stdout JSON
-vct analysis --path ~/.claude/projects/session.jsonl
-
-# Save results to JSON
-vct analysis --output report.json
-
-# Group results by provider
-vct analysis --by-provider
-
-# Save grouped results
-vct analysis --by-provider --output grouped_report.json
-
-# Combine time range with output format
-vct analysis --weekly
-vct analysis --table --monthly
-vct analysis --by-provider --daily --output today.json
-```
-
-### Preview: Interactive Dashboard (`vct analysis`)
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                    🔍 Analysis Statistics                                   │
-└─────────────────────────────────────────────────────────────────────────────────────────────┘
-┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Model                        Edit Lines  Read Lines  Write Lines  Bash  Edit  Read  Write  │
-│                                                                                             │
-│ claude-haiku-4-5-20251001    0           0           0            43    0     59    0       │
-│ claude-opus-4-6              1,280       13,264      1,575        82    146   209   62      │
-│ gemini-3.1-pro-preview       0           0           0            0     0     0     0       │
-│ TOTAL                        1,280       13,264      1,575        125   146   268   62      │
-└─────────────────────────────────────────────────────────────────────────────────────────────┘
-┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Provider          EditL/Day ReadL/Day WriteL/Day Bash/Day Edit/Day Read/Day Write/Day Days  │
-│                                                                                             │
-│ 🤖 Claude Code    426.7     4421.3    525.0      41.7     48.7     89.3     20.7      3    │
-│ ✨ Gemini         0         0         0          0.0      0.0      0.0      0.0       1    │
-│ ⭐ All Providers  426.7     4421.3    525.0      41.7     48.7     89.3     20.7      3    │
-└─────────────────────────────────────────────────────────────────────────────────────────────┘
-┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│  📝 Lines: 16,119  |  🔧 Tools: 601  |  📊 Models: 3  |  🧠 Memory: 41.2 MB                │
-└─────────────────────────────────────────────────────────────────────────────────────────────┘
-                          Press 'q', 'Esc', 'Ctrl+C' to quit | Press 'r' to refresh
-```
 
 ---
 

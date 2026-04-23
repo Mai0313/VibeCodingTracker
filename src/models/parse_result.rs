@@ -1,7 +1,7 @@
 use crate::constants::FastHashMap;
 use serde::{Deserialize, Serialize};
 
-/// Base metadata for file operations captured during analysis
+/// Base metadata for file operations captured during session parsing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeAnalysisDetailBase {
@@ -82,7 +82,7 @@ pub struct CodeAnalysisRecord {
     pub git_remote_url: String,
 }
 
-/// Top-level analysis result containing metadata and session records
+/// Top-level parse result containing metadata and session records
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeAnalysis {

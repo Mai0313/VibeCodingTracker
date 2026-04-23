@@ -1,5 +1,4 @@
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
 
 /// Time range filter for data queries
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -41,7 +40,7 @@ pub fn resolve_time_range(daily: bool, weekly: bool, monthly: bool) -> TimeRange
     }
 }
 
-/// Vibe Coding Tracker - AI coding assistant usage analyzer
+/// Vibe Coding Tracker - AI coding assistant token usage tracker
 #[derive(Parser, Debug)]
 #[command(name = "vibe_coding_tracker")]
 #[command(author, version, about, long_about = None)]
@@ -52,41 +51,6 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Analyze JSONL conversation files (single file or all sessions)
-    Analysis {
-        /// Path to the JSONL file to analyze (if not provided, analyzes all sessions)
-        #[arg(short, long)]
-        path: Option<PathBuf>,
-
-        /// Optional output path to save analysis result as JSON
-        #[arg(short, long)]
-        output: Option<PathBuf>,
-
-        /// Group results by provider (claude/codex/gemini)
-        #[arg(long)]
-        by_provider: bool,
-
-        /// Output as static table (instead of interactive TUI)
-        #[arg(long)]
-        table: bool,
-
-        /// Show only today's data
-        #[arg(long, group = "period")]
-        daily: bool,
-
-        /// Show only this week's data
-        #[arg(long, group = "period")]
-        weekly: bool,
-
-        /// Show only this month's data
-        #[arg(long, group = "period")]
-        monthly: bool,
-
-        /// Show all data (default)
-        #[arg(long, group = "period")]
-        all: bool,
-    },
-
     /// Display token usage statistics
     Usage {
         /// Output raw JSON instead of table view

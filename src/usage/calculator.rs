@@ -1,7 +1,7 @@
-use crate::analysis::{AnalysisMode, analyze_session_file_typed_as};
 use crate::cli::TimeRange;
 use crate::constants::{FastHashMap, capacity};
 use crate::models::{CodeAnalysis, ExtensionType, ProviderActiveDays, UsageResult};
+use crate::parser::{ParseMode, analyze_session_file_typed_as};
 use crate::utils::{
     collect_files_with_dates, is_claude_session_file, is_gemini_chat_file, is_json_file,
     resolve_paths,
@@ -144,7 +144,7 @@ where
     let file_results: Vec<(String, FastHashMap<String, Value>)> = files
         .par_iter()
         .filter_map(|file_info| {
-            match analyze_session_file_typed_as(&file_info.path, provider, AnalysisMode::UsageOnly)
+            match analyze_session_file_typed_as(&file_info.path, provider, ParseMode::UsageOnly)
             {
                 Ok(analysis) => {
                     let conversation_usage = extract_conversation_usage_from_analysis(&analysis);

@@ -8,15 +8,11 @@ pub mod capacity {
     /// Expected number of unique dates in usage tracking
     pub const DATES_IN_USAGE: usize = 30;
 
-    /// Expected number of unique models in batch analysis
+    /// Expected number of unique models across the aggregated usage map
     pub const MODEL_COMBINATIONS: usize = 20;
 
     /// Expected number of session files per directory
     pub const SESSION_FILES: usize = 50;
-
-    /// Maximum number of parsed files to cache in LRU cache
-    /// Reduced from 15 to 5 to minimize memory usage in TUI mode
-    pub const FILE_CACHE_SIZE: usize = 5;
 
     /// Expected number of token fields per usage entry
     pub const TOKEN_FIELDS: usize = 8;
