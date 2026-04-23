@@ -226,10 +226,10 @@ vct usage --json --daily
 
 The tool automatically scans these directories:
 
-- `~/.claude/projects/*.jsonl` (Claude Code)
-- `~/.codex/sessions/*.jsonl` (Codex)
-- `~/.copilot/history-session-state/*.json` (Copilot)
-- `~/.gemini/tmp/<project_hash>/chats/*.json` (Gemini)
+- `~/.claude/projects/**/*.jsonl` (Claude Code)
+- `~/.codex/sessions/**/*.jsonl` (Codex)
+- `~/.copilot/session-state/<sessionId>/events.jsonl` (Copilot CLI)
+- `~/.gemini/tmp/<project_hash>/chats/*.jsonl` (Gemini CLI)
 
 ---
 
