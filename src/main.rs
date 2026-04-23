@@ -6,7 +6,13 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use vibe_coding_tracker::cli::{Cli, Commands, resolve_time_range};
 
-// Use mimalloc as the global allocator for better performance
+// mimalloc is opt-in behind the `mimalloc` cargo feature. The default build
+// uses the system allocator because mimalloc's lazy purge retains freed
+// pages — the RSS difference on the TUI loops (repeated parse of session
+// directories) was roughly 10× in favour of the system allocator. Users who
+// want mimalloc's speed for short one-shot runs can rebuild with
+// `--features mimalloc`.
+#[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use vibe_coding_tracker::display::usage::{

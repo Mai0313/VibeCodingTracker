@@ -79,8 +79,10 @@ bytecount = "0.6"
 # Fast memchr for string operations
 memchr = "2.7"
 
-# High-performance memory allocator
-mimalloc = { version = "0.1", default-features = false }
+# High-performance memory allocator — opt-in. Disabled by default because
+# mimalloc's lazy purge keeps freed pages resident, which inflates RSS ~10×
+# on the TUI refresh loops. Build with `--features mimalloc` to re-enable.
+mimalloc = { version = "0.1", default-features = false, optional = true }
 
 # Archive extraction for update functionality
 flate2 = "1.1"
@@ -95,6 +97,13 @@ ahash = { version = "0.8", features = ["serde"] }
 
 # LRU cache for bounded memory usage
 lru = "0.17"
+
+[features]
+default = []
+# Opt-in: link mimalloc as the global allocator. Faster for short one-shot
+# commands but retains freed pages (RSS ~10× higher on the TUI refresh
+# loops). See src/main.rs for details.
+mimalloc = ["dep:mimalloc"]
 
 [dev-dependencies]
 tempfile = "3.23"
