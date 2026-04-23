@@ -48,7 +48,11 @@ pub fn analyze_gemini_session(session: GeminiSession, mode: AnalysisMode) -> Res
         process_gemini_message(&mut state, &mut conversation_usage, message);
     }
 
-    Ok(finalize_record(state, conversation_usage, session.session_id))
+    Ok(finalize_record(
+        state,
+        conversation_usage,
+        session.session_id,
+    ))
 }
 
 /// Analyze Gemini conversations from the modern JSONL event stream.
@@ -90,7 +94,11 @@ where
         process_gemini_message(&mut state, &mut conversation_usage, &message);
     }
 
-    Ok(finalize_record(state, conversation_usage, session.session_id))
+    Ok(finalize_record(
+        state,
+        conversation_usage,
+        session.session_id,
+    ))
 }
 
 fn finalize_record(

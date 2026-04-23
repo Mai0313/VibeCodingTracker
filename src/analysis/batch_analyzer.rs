@@ -5,8 +5,8 @@ use crate::cli::TimeRange;
 use crate::constants::{FastHashMap, capacity};
 use crate::models::{CodeAnalysis, ExtensionType, ProviderActiveDays};
 use crate::utils::{
-    collect_files_with_dates, is_claude_session_file, is_copilot_session_file,
-    is_gemini_chat_file, is_json_file,
+    collect_files_with_dates, is_claude_session_file, is_copilot_session_file, is_gemini_chat_file,
+    is_json_file,
 };
 use anyhow::Result;
 use rayon::prelude::*;

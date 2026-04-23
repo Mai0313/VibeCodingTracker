@@ -7,8 +7,8 @@ use std::io::Write;
 use tempfile::tempdir;
 use vibe_coding_tracker::cli::TimeRange;
 use vibe_coding_tracker::utils::directory::{
-    collect_files_with_dates, is_claude_session_file, is_copilot_session_file,
-    is_gemini_chat_file, is_json_file,
+    collect_files_with_dates, is_claude_session_file, is_copilot_session_file, is_gemini_chat_file,
+    is_json_file,
 };
 
 #[test]

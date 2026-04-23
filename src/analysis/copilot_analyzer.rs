@@ -189,7 +189,8 @@ where
                             }
                         }
                         if state.git_remote.is_empty() {
-                            state.git_remote = build_remote_url(&ctx.repository_host, &ctx.repository);
+                            state.git_remote =
+                                build_remote_url(&ctx.repository_host, &ctx.repository);
                         }
                     }
                 }
@@ -205,7 +206,8 @@ where
                 }
             }
             "session.shutdown" => {
-                if let Ok(data) = serde_json::from_value::<CopilotShutdownData>(event.data.clone()) {
+                if let Ok(data) = serde_json::from_value::<CopilotShutdownData>(event.data.clone())
+                {
                     for (model, metric) in data.model_metrics {
                         if model.is_empty() {
                             continue;
@@ -246,8 +248,7 @@ where
                 }
             }
             "tool.execution_start" => {
-                if let Ok(data) =
-                    serde_json::from_value::<CopilotToolStartData>(event.data.clone())
+                if let Ok(data) = serde_json::from_value::<CopilotToolStartData>(event.data.clone())
                     && !data.tool_call_id.is_empty()
                 {
                     pending_tools.insert(
