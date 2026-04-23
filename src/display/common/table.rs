@@ -41,22 +41,11 @@ pub fn create_summary<'a>(
         spans.push(Span::styled(*value, Style::default().fg(*color).bold()));
     }
 
-    // Add memory and CPU usage
+    // Add memory usage for this process
     let memory_mb = sys
         .process(pid)
         .map_or(0.0, |p| p.memory() as f64 / 1024.0 / 1024.0);
 
-    let cpu_usage = sys.process(pid).map_or(0.0, |p| p.cpu_usage());
-
-    spans.push(Span::raw("  |  "));
-    spans.push(Span::styled(
-        "⚡ CPU: ",
-        Style::default().fg(RatatuiColor::LightGreen).bold(),
-    ));
-    spans.push(Span::styled(
-        format!("{:.1}%", cpu_usage),
-        Style::default().fg(RatatuiColor::LightCyan).bold(),
-    ));
     spans.push(Span::raw("  |  "));
     spans.push(Span::styled(
         "🧠 Memory: ",
