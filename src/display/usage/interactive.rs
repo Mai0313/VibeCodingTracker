@@ -17,17 +17,15 @@ use ratatui::{
     widgets::Row as RatatuiRow,
 };
 use std::collections::HashMap;
-use std::time::Duration;
 use sysinfo::System;
 
 const USAGE_REFRESH_SECS: u64 = 10;
-const PRICING_REFRESH_SECS: u64 = 300;
 const MAX_TRACKED_ROWS: usize = 100;
 
 /// Displays token usage data in an interactive TUI with auto-refresh
 ///
 /// Features:
-/// - Auto-refresh every 10 seconds (usage data) and 5 minutes (pricing)
+/// - Auto-refresh every 10 seconds (usage + pricing)
 /// - Real-time memory monitoring
 /// - Provider-grouped daily averages
 /// - Keyboard controls: `q`, `Esc`, or `Ctrl+C` to exit
@@ -35,21 +33,15 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
     let mut terminal = setup_terminal()?;
     let mut refresh_state = RefreshState::new(USAGE_REFRESH_SECS);
 
-    let mut sys = System::new_all();
     let pid =
         sysinfo::get_current_pid().expect("Failed to get current process ID for memory monitoring");
-
-    let mut last_pricing_refresh = std::time::Instant::now();
-    let mut pricing_map_is_empty = false;
-
-    // Check if we need to fetch pricing immediately
-    let initial_pricing_result = fetch_model_pricing();
-    if let Err(e) = &initial_pricing_result {
-        log::warn!("Failed to fetch initial pricing: {}", e);
-        pricing_map_is_empty = true;
-        last_pricing_refresh =
-            std::time::Instant::now() - Duration::from_secs(PRICING_REFRESH_SECS);
-    }
+    // `System::new_all` would load every process, disk and network on the
+    // machine (tens of MB on a busy host). We only read our own process
+    // stats, so start from an empty `System` and populate it with just our
+    // pid on every refresh. `remove_dead_processes: true` ensures no stale
+    // entries linger across refreshes.
+    let mut sys = System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
 
     let mut usage_data = UsageResult::default();
     let mut provider_days = ProviderActiveDays::default();
@@ -69,29 +61,11 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
 
         refresh_state.mark_refreshed();
 
-        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, false);
-        sys.refresh_cpu_all();
-
-        // Check if we need to refresh pricing data
-        let should_refresh_pricing = last_pricing_refresh.elapsed()
-            >= Duration::from_secs(PRICING_REFRESH_SECS)
-            || pricing_map_is_empty;
-
-        if should_refresh_pricing {
-            match fetch_model_pricing() {
-                Ok(_) => {
-                    pricing_map_is_empty = false;
-                    last_pricing_refresh = std::time::Instant::now();
-                }
-                Err(e) => {
-                    log::warn!("Failed to fetch pricing: {}", e);
-                    if pricing_map_is_empty {
-                        last_pricing_refresh =
-                            std::time::Instant::now() - Duration::from_secs(PRICING_REFRESH_SECS);
-                    }
-                }
-            }
-        }
+        // Only refresh our own process entry and prune any that have died.
+        // Per-process CPU usage is updated as part of `refresh_processes`, so
+        // the former `refresh_cpu_all()` (which scans every CPU system-wide)
+        // is not needed here.
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
 
         match crate::usage::get_usage_from_directories(time_range) {
             Ok(data) => {
@@ -107,7 +81,12 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
             }
         }
 
-        // Fetch pricing map on-demand for this refresh cycle only
+        // One pricing fetch per refresh cycle. `fetch_model_pricing` checks
+        // its own on-disk 24h cache internally, so repeat calls on the same
+        // day just re-parse the dated JSON file — the previous code
+        // effectively did that twice (once to tick a "last refresh" timer
+        // whose result was discarded, once for real), doubling the parse
+        // cost and churn.
         let pricing_map = match fetch_model_pricing() {
             Ok(map) => map,
             Err(e) => {
