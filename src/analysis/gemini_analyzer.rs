@@ -5,7 +5,11 @@ use crate::utils::{get_git_remote_url, parse_iso_timestamp, process_gemini_usage
 use anyhow::Result;
 use serde_json::Value;
 
-/// Analyze Gemini conversations
+/// Analyze Gemini conversations from a pre-parsed `Vec<Value>`.
+///
+/// Thin wrapper around [`analyze_gemini_session`] kept for the
+/// `analyze_jsonl_file` dispatch path that still materialises the full file as
+/// `Vec<Value>` when the input is pretty-printed JSON.
 pub fn analyze_gemini_conversations(mut data: Vec<Value>) -> Result<CodeAnalysis> {
     if data.is_empty() {
         return Ok(CodeAnalysis {
@@ -19,7 +23,14 @@ pub fn analyze_gemini_conversations(mut data: Vec<Value>) -> Result<CodeAnalysis
 
     // Parse the Gemini session
     let session: GeminiSession = serde_json::from_value(data.remove(0))?;
+    analyze_gemini_session(session)
+}
 
+/// Analyze Gemini conversations from an already-deserialised [`GeminiSession`].
+///
+/// This is the entry point used by the streaming JSONL path — it skips the
+/// `Vec<Value>` intermediate and runs straight off the typed shape.
+pub fn analyze_gemini_session(session: GeminiSession) -> Result<CodeAnalysis> {
     let mut state = AnalysisState::new();
     // Pre-allocate FastHashMap with typical capacity (1-3 models per conversation)
     let mut conversation_usage: FastHashMap<String, Value> = FastHashMap::with_capacity(3);
