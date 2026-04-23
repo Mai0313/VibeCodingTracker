@@ -1,7 +1,7 @@
 use crate::cache::global_cache;
 use crate::cli::TimeRange;
 use crate::constants::{FastHashMap, capacity};
-use crate::models::{ProviderActiveDays, UsageResult};
+use crate::models::{CodeAnalysis, ProviderActiveDays, UsageResult};
 use crate::utils::{
     collect_files_with_dates, is_claude_session_file, is_gemini_chat_file, is_json_file,
     resolve_paths,
@@ -18,29 +18,18 @@ pub struct UsageData {
     pub provider_days: ProviderActiveDays,
 }
 
-/// Extracts token usage data from CodeAnalysis records
-fn extract_conversation_usage_from_analysis(analysis: &Value) -> FastHashMap<String, Value> {
-    let Some(records) = analysis.get("records").and_then(|r| r.as_array()) else {
-        return FastHashMap::default();
-    };
-
-    // Pre-allocate HashMap using centralized capacity constant
+/// Extracts token usage data from a typed `CodeAnalysis`.
+///
+/// Reads directly from the typed `conversation_usage` map instead of walking
+/// `Value` via `.get(...)`, so no intermediate `serde_json::Value` tree is
+/// built or retained here.
+fn extract_conversation_usage_from_analysis(
+    analysis: &CodeAnalysis,
+) -> FastHashMap<String, Value> {
     let mut conversation_usage = FastHashMap::with_capacity(capacity::MODELS_PER_SESSION);
 
-    for record in records {
-        let Some(record_obj) = record.as_object() else {
-            continue;
-        };
-
-        let Some(conv_usage) = record_obj
-            .get("conversationUsage")
-            .and_then(|c| c.as_object())
-        else {
-            continue;
-        };
-
-        for (model, usage) in conv_usage {
-            // Use entry API to avoid double lookup
+    for record in &analysis.records {
+        for (model, usage) in &record.conversation_usage {
             conversation_usage
                 .entry(model.clone())
                 .and_modify(|existing_usage| merge_usage_values(existing_usage, usage))

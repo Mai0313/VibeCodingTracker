@@ -15,18 +15,30 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-/// Analyzes a session file (JSONL or JSON) and returns a unified `CodeAnalysis` result.
+/// Analyzes a session file (JSONL or JSON) and returns the result as a
+/// `serde_json::Value` (the CLI single-file dump path).
 ///
-/// The happy path streams JSONL line-by-line, deserialising each record straight
-/// into a lean typed struct so the full raw `Value` tree is never materialised.
-/// Pretty-printed single-object JSON files (Gemini/Copilot dumps) fall back to
-/// the original `read_jsonl`/`read_json` dispatch for format compatibility.
+/// Internally this is a thin wrapper over [`analyze_jsonl_file_typed`]; the
+/// conversion to `Value` happens once at the edge here rather than inside the
+/// cache, which keeps long sessions from being duplicated between typed and
+/// `Value` forms when multiple commands run against the same file.
 pub fn analyze_jsonl_file<P: AsRef<Path>>(path: P) -> Result<Value> {
+    let analysis = analyze_jsonl_file_typed(path)?;
+    if analysis.records.is_empty() && analysis.extension_name.is_empty() {
+        // Preserve historical behaviour: empty input → `{}` rather than a
+        // fully-populated but empty `CodeAnalysis` object.
+        return Ok(serde_json::json!({}));
+    }
+    Ok(serde_json::to_value(&analysis)?)
+}
+
+/// Typed entry point used by the global file cache and any caller that wants
+/// to read aggregate fields without paying for a `Value` round-trip.
+pub fn analyze_jsonl_file_typed<P: AsRef<Path>>(path: P) -> Result<CodeAnalysis> {
     let path = path.as_ref();
 
     if let Some(analysis) = stream_analyze_jsonl(path)? {
-        let value = serde_json::to_value(&analysis)?;
-        return Ok(value);
+        return Ok(analysis);
     }
 
     // Fallback: pretty-printed single-object JSON (Gemini/Copilot) or anything
@@ -37,12 +49,17 @@ pub fn analyze_jsonl_file<P: AsRef<Path>>(path: P) -> Result<Value> {
     };
 
     if data.is_empty() {
-        return Ok(serde_json::json!({}));
+        return Ok(CodeAnalysis {
+            user: String::new(),
+            extension_name: String::new(),
+            insights_version: String::new(),
+            machine_id: String::new(),
+            records: Vec::new(),
+        });
     }
 
     let ext_type = detect_extension_type(&data)?;
-    let analysis = dispatch_by_vec(data, ext_type)?;
-    Ok(serde_json::to_value(&analysis)?)
+    dispatch_by_vec(data, ext_type)
 }
 
 /// Peeks the first JSON record to detect format, then routes to a type-driven

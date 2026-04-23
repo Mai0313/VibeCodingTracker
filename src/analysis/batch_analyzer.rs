@@ -1,14 +1,13 @@
 use crate::cache::global_cache;
 use crate::cli::TimeRange;
 use crate::constants::{FastHashMap, capacity};
-use crate::models::ProviderActiveDays;
+use crate::models::{CodeAnalysis, ProviderActiveDays};
 use crate::utils::{
     collect_files_with_dates, is_claude_session_file, is_gemini_chat_file, is_json_file,
 };
 use anyhow::Result;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
@@ -115,22 +114,22 @@ pub fn analyze_all_sessions(time_range: TimeRange) -> Result<AnalysisData> {
 
 /// Complete CodeAnalysis results organized by AI provider.
 ///
-/// Each record is stored as an `Arc<Value>` so the parsed analysis is shared
-/// with the global file cache — we never deep-clone the whole tree to ferry
-/// results out of the worker pool. `serde_json` serialises `Arc<Value>` as
-/// the underlying value, so the emitted JSON is unchanged. The struct is
-/// output-only, which is why it does not derive `Deserialize` (that would
-/// require serde's `rc` feature and is not needed here).
+/// Each record is stored as an `Arc<CodeAnalysis>` — the same typed struct
+/// held by the global file cache — so no deep-clone happens to ferry results
+/// out of the worker pool, and no intermediate `Value` is materialised.
+/// serde's `rc` feature lets `Arc<CodeAnalysis>` serialise as the underlying
+/// struct, so the emitted JSON is unchanged. The struct is output-only, which
+/// is why it does not derive `Deserialize`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProviderGroupedAnalysis {
     #[serde(rename = "Claude-Code")]
-    pub claude: Vec<Arc<Value>>,
+    pub claude: Vec<Arc<CodeAnalysis>>,
     #[serde(rename = "Codex")]
-    pub codex: Vec<Arc<Value>>,
+    pub codex: Vec<Arc<CodeAnalysis>>,
     #[serde(rename = "Copilot-CLI")]
-    pub copilot: Vec<Arc<Value>>,
+    pub copilot: Vec<Arc<CodeAnalysis>>,
     #[serde(rename = "Gemini")]
-    pub gemini: Vec<Arc<Value>>,
+    pub gemini: Vec<Arc<CodeAnalysis>>,
 }
 
 /// Analyzes all session files and returns complete records grouped by provider
@@ -140,10 +139,10 @@ pub struct ProviderGroupedAnalysis {
 pub fn analyze_all_sessions_by_provider(time_range: TimeRange) -> Result<ProviderGroupedAnalysis> {
     let paths = crate::utils::resolve_paths()?;
 
-    let mut claude_results: Vec<Arc<Value>> = Vec::new();
-    let mut codex_results: Vec<Arc<Value>> = Vec::new();
-    let mut copilot_results: Vec<Arc<Value>> = Vec::new();
-    let mut gemini_results: Vec<Arc<Value>> = Vec::new();
+    let mut claude_results: Vec<Arc<CodeAnalysis>> = Vec::new();
+    let mut codex_results: Vec<Arc<CodeAnalysis>> = Vec::new();
+    let mut copilot_results: Vec<Arc<CodeAnalysis>> = Vec::new();
+    let mut gemini_results: Vec<Arc<CodeAnalysis>> = Vec::new();
 
     // Process Claude sessions (including subagents/ sublogs)
     if paths.claude_session_dir.exists() {
@@ -195,7 +194,7 @@ pub fn analyze_all_sessions_by_provider(time_range: TimeRange) -> Result<Provide
 
 fn process_full_analysis_directory<P, F>(
     dir: P,
-    results: &mut Vec<Arc<Value>>,
+    results: &mut Vec<Arc<CodeAnalysis>>,
     filter_fn: F,
     time_range: TimeRange,
 ) -> Result<()>
@@ -207,8 +206,8 @@ where
     let files = collect_files_with_dates(dir, filter_fn, time_range)?;
 
     // Parallel parse through the global cache; each worker hands back an
-    // `Arc<Value>` pointing at the shared analysis — no deep clone needed.
-    let analyzed: Vec<Arc<Value>> = files
+    // `Arc<CodeAnalysis>` pointing at the shared typed analysis.
+    let analyzed: Vec<Arc<CodeAnalysis>> = files
         .par_iter()
         .filter_map(
             |file_info| match global_cache().get_or_parse(&file_info.path) {
@@ -245,7 +244,7 @@ where
 
     // Process files in parallel with caching and collect per-file aggregations
     // Use Arc to avoid deep cloning - we only need to read fields
-    let file_aggregations: Vec<(String, Arc<Value>)> = files
+    let file_aggregations: Vec<(String, Arc<CodeAnalysis>)> = files
         .par_iter()
         .filter_map(
             |file_info| match global_cache().get_or_parse(&file_info.path) {
@@ -273,34 +272,19 @@ where
 
 fn aggregate_analysis_result(
     aggregated: &mut FastHashMap<String, AggregatedAnalysisRow>,
-    analysis: &Value,
+    analysis: &CodeAnalysis,
 ) {
-    let Some(records) = analysis.get("records").and_then(|r| r.as_array()) else {
-        return;
-    };
-
-    for record in records {
-        let Some(record_obj) = record.as_object() else {
-            continue;
-        };
-
-        let Some(conv_usage) = record_obj
-            .get("conversationUsage")
-            .and_then(|c| c.as_object())
-        else {
-            continue;
-        };
-
-        for (model, _usage) in conv_usage {
+    for record in &analysis.records {
+        for model in record.conversation_usage.keys() {
             if model.contains("<synthetic>") {
                 continue;
             }
 
             let entry =
                 aggregated
-                    .entry(model.to_string())
+                    .entry(model.clone())
                     .or_insert_with(|| AggregatedAnalysisRow {
-                        model: model.to_string(),
+                        model: model.clone(),
                         edit_lines: 0,
                         read_lines: 0,
                         write_lines: 0,
@@ -311,37 +295,15 @@ fn aggregate_analysis_result(
                         write_count: 0,
                     });
 
-            // Extract line counts
-            entry.edit_lines += record_obj
-                .get("totalEditLines")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as usize;
-            entry.read_lines += record_obj
-                .get("totalReadLines")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as usize;
-            entry.write_lines += record_obj
-                .get("totalWriteLines")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as usize;
+            entry.edit_lines += record.total_edit_lines;
+            entry.read_lines += record.total_read_lines;
+            entry.write_lines += record.total_write_lines;
 
-            // Extract tool call counts
-            if let Some(tool_calls) = record_obj.get("toolCallCounts").and_then(|t| t.as_object()) {
-                entry.bash_count +=
-                    tool_calls.get("Bash").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                entry.edit_count +=
-                    tool_calls.get("Edit").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                entry.read_count +=
-                    tool_calls.get("Read").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                entry.todo_write_count += tool_calls
-                    .get("TodoWrite")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as usize;
-                entry.write_count += tool_calls
-                    .get("Write")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as usize;
-            }
+            entry.bash_count += record.tool_call_counts.bash;
+            entry.edit_count += record.tool_call_counts.edit;
+            entry.read_count += record.tool_call_counts.read;
+            entry.todo_write_count += record.tool_call_counts.todo_write;
+            entry.write_count += record.tool_call_counts.write;
         }
     }
 }
