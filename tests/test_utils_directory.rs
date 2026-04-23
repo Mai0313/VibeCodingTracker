@@ -245,9 +245,8 @@ fn test_is_json_file_excludes_meta_sidecars() {
 
     // Pre-emptive defense: reject `.meta.jsonl` too, in case Claude Code ever
     // switches the sidecar format to line-delimited JSON.
-    let meta_jsonl = std::path::Path::new(
-        "/home/user/.claude/projects/proj/sess/subagents/agent-x.meta.jsonl",
-    );
+    let meta_jsonl =
+        std::path::Path::new("/home/user/.claude/projects/proj/sess/subagents/agent-x.meta.jsonl");
     assert!(!is_json_file(meta_jsonl));
 }
 
