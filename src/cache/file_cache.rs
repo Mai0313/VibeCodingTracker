@@ -8,11 +8,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
-/// Cached file entry with modification time tracking for invalidation
+/// Cached file entry with modification time tracking for invalidation.
+///
+/// `size_bytes` is captured once at insertion via [`estimate_value_bytes`]
+/// so the `stats()` path can report a realistic memory footprint without
+/// walking the JSON tree on every call.
 #[derive(Debug, Clone)]
 struct CachedFile {
     modified: SystemTime,
     analysis: Arc<Value>,
+    size_bytes: usize,
 }
 
 /// Thread-safe LRU cache for parsed session files with automatic eviction
@@ -79,6 +84,7 @@ impl FileParseCache {
         log::debug!("LRU cache miss for {}, parsing...", path.display());
         let analysis = crate::analysis::analyze_jsonl_file(path)?;
         let arc_analysis = Arc::new(analysis);
+        let size_bytes = estimate_value_bytes(arc_analysis.as_ref());
 
         // Update cache (write lock) - LRU will auto-evict if at capacity
         if let Ok(mut cache_write) = self.cache.write() {
@@ -87,6 +93,7 @@ impl FileParseCache {
                 CachedFile {
                     modified,
                     analysis: Arc::clone(&arc_analysis),
+                    size_bytes,
                 },
             );
         }
@@ -120,13 +127,18 @@ impl FileParseCache {
         }
     }
 
-    /// Returns cache statistics for monitoring and debugging
+    /// Returns cache statistics for monitoring and debugging.
+    ///
+    /// `estimated_memory_kb` is a real sum of per-entry sizes captured by
+    /// [`estimate_value_bytes`] at insertion time — previously this was a
+    /// fixed 200 KB/entry constant that badly under-reported long sessions
+    /// (a Claude Code log with file-write content can exceed several MB).
     pub fn stats(&self) -> CacheStats {
         if let Ok(cache) = self.cache.write() {
+            let total_bytes: usize = cache.iter().map(|(_, c)| c.size_bytes).sum();
             CacheStats {
                 entry_count: cache.len(),
-                // Rough estimate: ~200KB per entry (more realistic for parsed JSON with details)
-                estimated_memory_kb: cache.len() * 200,
+                estimated_memory_kb: total_bytes / 1024,
             }
         } else {
             CacheStats::default()
@@ -161,6 +173,37 @@ impl Default for FileParseCache {
 pub struct CacheStats {
     pub entry_count: usize,
     pub estimated_memory_kb: usize,
+}
+
+/// Walk a `serde_json::Value` tree and return a best-effort byte estimate of
+/// its heap footprint. This is intentionally a heuristic — `Value` nodes are
+/// variable-sized enums with hidden allocator overhead — but it tracks real
+/// payload growth far better than a flat per-entry constant.
+fn estimate_value_bytes(v: &Value) -> usize {
+    use std::mem::size_of;
+
+    const NODE_OVERHEAD: usize = size_of::<Value>();
+
+    match v {
+        Value::Null | Value::Bool(_) | Value::Number(_) => NODE_OVERHEAD,
+        Value::String(s) => NODE_OVERHEAD + s.capacity(),
+        Value::Array(arr) => {
+            NODE_OVERHEAD
+                + arr.capacity() * size_of::<Value>()
+                + arr.iter().map(estimate_value_bytes).sum::<usize>()
+        }
+        Value::Object(map) => {
+            // `serde_json::Map` is backed by `BTreeMap` or `IndexMap` depending
+            // on features; both allocate the key `String` inline plus per-node
+            // overhead. Approximating as key capacity + value estimate is
+            // close enough for a diagnostic display.
+            NODE_OVERHEAD
+                + map
+                    .iter()
+                    .map(|(k, val)| k.capacity() + estimate_value_bytes(val))
+                    .sum::<usize>()
+        }
+    }
 }
 
 #[cfg(test)]
