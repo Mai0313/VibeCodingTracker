@@ -107,9 +107,30 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
             .get("total_token_usage")
             .and_then(|v| v.as_object())
         {
-            if let Some(input) = total_usage.get("input_tokens").and_then(|v| v.as_i64()) {
-                counts.input_tokens = input;
-            }
+            // Codex follows OpenAI's convention: `input_tokens` is the
+            // full prompt size and `cached_input_tokens` is the subset
+            // that hit the prompt cache. LiteLLM, in contrast, prices
+            // non-cached input (`input_cost_per_token`) and cached reads
+            // (`cache_read_input_token_cost`) *separately*. Forwarding
+            // Codex's raw `input_tokens` to `calculate_cost` alongside
+            // the same `cached_input_tokens` would charge every cached
+            // token twice — once at the full input rate, then again at
+            // the cache read rate — inflating Codex cost reports by
+            // ~130% on heavy-cache sessions.
+            //
+            // Subtract cached from raw input so each token is billed
+            // exactly once, at the right rate.
+            let raw_input = total_usage
+                .get("input_tokens")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let cached = total_usage
+                .get("cached_input_tokens")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            counts.input_tokens = (raw_input - cached).max(0);
+            counts.cache_read = cached;
+
             if let Some(output) = total_usage.get("output_tokens").and_then(|v| v.as_i64()) {
                 // Codex already accumulates across turns, so replace instead
                 // of adding — the value is the running total for the session.
@@ -121,19 +142,12 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
             {
                 counts.reasoning_tokens = reasoning;
             }
-            if let Some(cache_read) = total_usage
-                .get("cached_input_tokens")
-                .and_then(|v| v.as_i64())
-            {
-                counts.cache_read = cache_read;
-            }
             if let Some(total) = total_usage.get("total_tokens").and_then(|v| v.as_i64()) {
-                // Codex `total_tokens` = input + output and excludes
-                // `reasoning_output_tokens` — the provider bills reasoning
-                // separately, so the published total understates the
-                // amount of tokens the caller is actually paying for. Add
-                // reasoning here so the summary row stays consistent with
-                // what `calculate_cost` charges for.
+                // Codex `total_tokens` = input (incl. cached) + output and
+                // excludes `reasoning_output_tokens`. We already split
+                // input / cached above, so the numeric total the user sees
+                // still matches: (non_cached_input + cached) + output +
+                // reasoning == Codex's `total_tokens` + reasoning.
                 counts.total = total + counts.reasoning_tokens;
                 return counts;
             }
@@ -226,7 +240,7 @@ mod tests {
                 "input_tokens": 1000,
                 "output_tokens": 500,
                 "cached_input_tokens": 200,
-                "total_tokens": 1700
+                "total_tokens": 1500
             }
         });
         let c = extract_token_counts(&usage);
@@ -234,6 +248,51 @@ mod tests {
         assert_eq!(c.cache_creation_5m, 0);
         assert_eq!(c.cache_creation_1h, 0);
         assert_eq!(c.cache_read, 200);
+        // Codex `input_tokens` includes `cached_input_tokens`; the extractor
+        // must subtract cached so the two buckets don't overlap.
+        assert_eq!(c.input_tokens, 800);
+    }
+
+    #[test]
+    fn codex_input_tokens_excludes_cached_bucket() {
+        // Taken from a real Codex session: input=576_145 includes
+        // cached=408_832. The extractor must split the two so
+        // `calculate_cost` doesn't bill every cached token twice.
+        let usage = json!({
+            "total_token_usage": {
+                "input_tokens": 576_145,
+                "cached_input_tokens": 408_832,
+                "output_tokens": 13_156,
+                "reasoning_output_tokens": 8_591,
+                "total_tokens": 589_301
+            }
+        });
+        let c = extract_token_counts(&usage);
+        assert_eq!(c.input_tokens, 576_145 - 408_832);
+        assert_eq!(c.cache_read, 408_832);
+        assert_eq!(c.output_tokens, 13_156);
+        assert_eq!(c.reasoning_tokens, 8_591);
+        // Published total + reasoning. Equivalent to
+        // (input_tokens + cache_read) + output_tokens + reasoning_tokens.
+        assert_eq!(c.total, 589_301 + 8_591);
+    }
+
+    #[test]
+    fn codex_cached_exceeding_input_clamps_to_zero() {
+        // Defensive: never emit a negative `input_tokens` even if the
+        // provider ever misreports cached > input. Better to undercount
+        // than to panic via integer overflow downstream.
+        let usage = json!({
+            "total_token_usage": {
+                "input_tokens": 100,
+                "cached_input_tokens": 500,
+                "output_tokens": 50,
+                "total_tokens": 150
+            }
+        });
+        let c = extract_token_counts(&usage);
+        assert_eq!(c.input_tokens, 0);
+        assert_eq!(c.cache_read, 500);
     }
 
     #[test]
@@ -271,7 +330,7 @@ mod tests {
             }
         });
         let c = extract_token_counts(&usage);
-        assert_eq!(c.input_tokens, 5_645);
+        assert_eq!(c.input_tokens, 5_645 - 5_504);
         assert_eq!(c.cache_read, 5_504);
         assert_eq!(
             c.output_tokens, 810,
