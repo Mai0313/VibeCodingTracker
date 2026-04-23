@@ -87,7 +87,7 @@ mimalloc = { version = "0.1", default-features = false, optional = true }
 # Archive extraction for update functionality
 flate2 = "1.1"
 tar = "0.4"
-zip = "5.1"
+zip = "7.2"
 
 # Lazy static initialization
 once_cell = "1.20"
