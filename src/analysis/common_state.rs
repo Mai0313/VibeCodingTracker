@@ -53,10 +53,26 @@ impl AnalysisState {
         let pre = matches!(mode, AnalysisMode::Full);
         Self {
             mode,
-            write_details: if pre { Vec::with_capacity(10) } else { Vec::new() },
-            read_details: if pre { Vec::with_capacity(20) } else { Vec::new() },
-            edit_details: if pre { Vec::with_capacity(15) } else { Vec::new() },
-            run_details: if pre { Vec::with_capacity(10) } else { Vec::new() },
+            write_details: if pre {
+                Vec::with_capacity(10)
+            } else {
+                Vec::new()
+            },
+            read_details: if pre {
+                Vec::with_capacity(20)
+            } else {
+                Vec::new()
+            },
+            edit_details: if pre {
+                Vec::with_capacity(15)
+            } else {
+                Vec::new()
+            },
+            run_details: if pre {
+                Vec::with_capacity(10)
+            } else {
+                Vec::new()
+            },
             tool_counts: CodeAnalysisToolCalls::default(),
             unique_files: HashSet::with_capacity(if pre { 20 } else { 0 }),
             total_write_lines: 0,

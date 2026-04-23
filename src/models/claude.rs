@@ -126,9 +126,7 @@ where
 /// some user turns (e.g. `"Caveat: ..."`). Non-array shapes carry nothing the
 /// analyzer needs, so we consume them via `IgnoredAny` and return an empty
 /// `Vec` rather than failing the whole record.
-fn deserialize_content_items<'de, D>(
-    deserializer: D,
-) -> Result<Vec<ClaudeContentItem>, D::Error>
+fn deserialize_content_items<'de, D>(deserializer: D) -> Result<Vec<ClaudeContentItem>, D::Error>
 where
     D: Deserializer<'de>,
 {

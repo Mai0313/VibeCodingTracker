@@ -284,20 +284,19 @@ fn aggregate_analysis_result(
                 continue;
             }
 
-            let entry =
-                aggregated
-                    .entry(model.clone())
-                    .or_insert_with(|| AggregatedAnalysisRow {
-                        model: model.clone(),
-                        edit_lines: 0,
-                        read_lines: 0,
-                        write_lines: 0,
-                        bash_count: 0,
-                        edit_count: 0,
-                        read_count: 0,
-                        todo_write_count: 0,
-                        write_count: 0,
-                    });
+            let entry = aggregated
+                .entry(model.clone())
+                .or_insert_with(|| AggregatedAnalysisRow {
+                    model: model.clone(),
+                    edit_lines: 0,
+                    read_lines: 0,
+                    write_lines: 0,
+                    bash_count: 0,
+                    edit_count: 0,
+                    read_count: 0,
+                    todo_write_count: 0,
+                    write_count: 0,
+                });
 
             entry.edit_lines += record.total_edit_lines;
             entry.read_lines += record.total_read_lines;

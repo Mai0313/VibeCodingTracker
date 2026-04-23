@@ -83,8 +83,8 @@ pub fn analyze_jsonl_file_typed_with_mode<P: AsRef<Path>>(
 /// streaming analyzer. Returns `Ok(None)` when the input cannot be parsed as
 /// JSONL (e.g. pretty-printed JSON) so the caller can fall back.
 fn stream_analyze_jsonl(path: &Path, mode: AnalysisMode) -> Result<Option<CodeAnalysis>> {
-    let file = File::open(path)
-        .with_context(|| format!("Failed to open file: {}", path.display()))?;
+    let file =
+        File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
     let mut reader = BufReader::with_capacity(buffer::FILE_READ_BUFFER, file);
 
     let first_line = match peek_first_non_empty_line(&mut reader)? {
@@ -172,13 +172,13 @@ fn dispatch_streaming(
             analyze_codex_conversations_with_mode(&logs, mode)
         }
         ExtensionType::Copilot => {
-            let session: CopilotSession = serde_json::from_value(first_value)
-                .context("Failed to parse Copilot session")?;
+            let session: CopilotSession =
+                serde_json::from_value(first_value).context("Failed to parse Copilot session")?;
             analyze_copilot_conversations_with_mode(session, mode)
         }
         ExtensionType::Gemini => {
-            let session: GeminiSession = serde_json::from_value(first_value)
-                .context("Failed to parse Gemini session")?;
+            let session: GeminiSession =
+                serde_json::from_value(first_value).context("Failed to parse Gemini session")?;
             analyze_gemini_session(session, mode)
         }
     }
@@ -187,9 +187,7 @@ fn dispatch_streaming(
 /// Iterator that yields `T` values, one per non-empty line in the reader.
 /// Lines that fail to deserialise into `T` are silently skipped, matching the
 /// legacy `from_value(...).ok()` behaviour the analyzers already tolerate.
-fn iter_jsonl_typed<'a, T>(
-    reader: &'a mut BufReader<File>,
-) -> impl Iterator<Item = T> + 'a
+fn iter_jsonl_typed<'a, T>(reader: &'a mut BufReader<File>) -> impl Iterator<Item = T> + 'a
 where
     T: serde::de::DeserializeOwned + 'a,
 {

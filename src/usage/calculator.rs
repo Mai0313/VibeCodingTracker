@@ -23,9 +23,7 @@ pub struct UsageData {
 /// Reads directly from the typed `conversation_usage` map instead of walking
 /// `Value` via `.get(...)`, so no intermediate `serde_json::Value` tree is
 /// built or retained here.
-fn extract_conversation_usage_from_analysis(
-    analysis: &CodeAnalysis,
-) -> FastHashMap<String, Value> {
+fn extract_conversation_usage_from_analysis(analysis: &CodeAnalysis) -> FastHashMap<String, Value> {
     let mut conversation_usage = FastHashMap::with_capacity(capacity::MODELS_PER_SESSION);
 
     for record in &analysis.records {
