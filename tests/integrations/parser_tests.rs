@@ -202,7 +202,7 @@ fn test_codex_parser() {
 
 #[test]
 fn test_copilot_parser() {
-    let input_file = PathBuf::from("examples/test_conversation_copilot.json");
+    let input_file = PathBuf::from("examples/test_conversation_copilot.jsonl");
     let expected_file = PathBuf::from("examples/analysis_result_copilot.json");
 
     // Skip test if files don't exist
@@ -260,7 +260,7 @@ fn test_copilot_parser() {
 
 #[test]
 fn test_gemini_parser() {
-    let input_file = PathBuf::from("examples/test_conversation_gemini.json");
+    let input_file = PathBuf::from("examples/test_conversation_gemini.jsonl");
     let expected_file = PathBuf::from("examples/analysis_result_gemini.json");
 
     // Skip test if files don't exist
@@ -290,8 +290,18 @@ fn test_gemini_parser() {
 
     let actual_json = actual_result.unwrap();
 
-    // Compare results, ignoring specific fields
-    let ignore_fields = ["insightsVersion", "machineId", "user", "gitRemoteUrl"];
+    // Compare results, ignoring specific fields. `folderPath` is included
+    // because Gemini session logs do not carry a cwd in the meta record, so
+    // the analyzer leaves it empty and the git-remote lookup falls back to
+    // the current working directory — both of which are environment-
+    // specific and will differ between CI and a local developer machine.
+    let ignore_fields = [
+        "insightsVersion",
+        "machineId",
+        "user",
+        "gitRemoteUrl",
+        "folderPath",
+    ];
     let matches = compare_json_ignore_fields(&actual_json, &expected_json, &ignore_fields);
 
     if !matches {
@@ -312,8 +322,59 @@ fn test_gemini_parser() {
 
     assert!(
         matches,
-        "Gemini analysis output does not match expected result (ignoring insightsVersion, machineId, user, gitRemoteUrl)"
+        "Gemini analysis output does not match expected result (ignoring insightsVersion, machineId, user, gitRemoteUrl, folderPath)"
     );
+}
+
+/// Inline-fixture smoke test for the Gemini JSONL parser.
+///
+/// Complements `test_gemini_parser` (which uses a real-world session dump)
+/// by exercising narrow edge cases that the real fixture may not hit:
+/// ignored `user` / `info` events, a `$set` meta-update line the analyzer
+/// must silently skip, and one assistant `gemini` event carrying token
+/// usage plus a `toolCalls[]` entry for a `replace` edit.
+#[test]
+fn test_gemini_parser_jsonl() {
+    use std::io::Write;
+
+    let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+    // `is_gemini_session_file` requires the parent directory to be named
+    // `chats`, so honour that even for the inline fixture.
+    let chats_dir = tempdir.path().join("project-hash").join("chats");
+    std::fs::create_dir_all(&chats_dir).expect("failed to mkdir -p chats");
+    let input_file = chats_dir.join("session-fixture.jsonl");
+
+    let fixture = r#"{"sessionId":"fixture-session","projectHash":"abc","startTime":"2026-04-23T00:00:00.000Z","lastUpdated":"2026-04-23T00:00:10.000Z","kind":"main"}
+{"id":"i1","timestamp":"2026-04-23T00:00:01.000Z","type":"info","content":"kicked off"}
+{"id":"u1","timestamp":"2026-04-23T00:00:02.000Z","type":"user","content":[{"text":"hi"}]}
+{"$set":{"lastUpdated":"2026-04-23T00:00:02.500Z"}}
+{"id":"g1","timestamp":"2026-04-23T00:00:05.000Z","type":"gemini","model":"gemini-3-flash-preview","tokens":{"input":100,"output":50,"cached":10,"thoughts":5,"tool":0,"total":165},"content":"done","toolCalls":[{"id":"t1","name":"replace","args":{"file_path":"README.md","old_string":"old","new_string":"new"}}]}
+"#;
+
+    {
+        let mut f = std::fs::File::create(&input_file).expect("failed to create fixture");
+        f.write_all(fixture.as_bytes())
+            .expect("failed to write fixture");
+    }
+
+    let actual = analyze_jsonl_file(&input_file).expect("analyze Gemini fixture");
+
+    assert_eq!(actual["extensionName"], "Gemini");
+    let record = &actual["records"][0];
+    assert_eq!(record["taskId"], "fixture-session");
+
+    // Token usage attributed to the sole assistant model in the fixture.
+    let usage = &record["conversationUsage"]["gemini-3-flash-preview"];
+    assert_eq!(usage["input_tokens"], 100);
+    assert_eq!(usage["output_tokens"], 50);
+    assert_eq!(usage["cache_read_input_tokens"], 10);
+    assert_eq!(usage["thoughts_tokens"], 5);
+    assert_eq!(usage["total_tokens"], 165);
+
+    // `replace` tool call should land in edit_file_details.
+    assert_eq!(record["editFileDetails"][0]["oldString"], "old");
+    assert_eq!(record["editFileDetails"][0]["newString"], "new");
+    assert_eq!(record["toolCallCounts"]["Edit"], 1);
 }
 
 #[cfg(test)]

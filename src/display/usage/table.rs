@@ -4,17 +4,17 @@ use crate::display::common::table::{
 use crate::display::usage::averages::{
     build_provider_average_rows, build_usage_summary, format_tokens_per_day,
 };
-use crate::models::{ProviderActiveDays, UsageResult};
 use crate::pricing::{ModelPricingMap, fetch_model_pricing};
+use crate::usage::UsageData;
 use crate::utils::format_number;
 use comfy_table::{Cell, CellAlignment, Color, Table, presets::UTF8_FULL};
 use owo_colors::OwoColorize;
 use std::collections::HashMap;
 
 /// Displays token usage data as a static table
-pub fn display_usage_table(usage_data: &UsageResult, provider_days: &ProviderActiveDays) {
-    if usage_data.is_empty() {
-        println!("⚠️  No usage data found in Claude Code or Codex sessions");
+pub fn display_usage_table(usage_data: &UsageData) {
+    if usage_data.models.is_empty() {
+        println!("⚠️  No usage data found in Claude Code, Codex, Copilot, or Gemini sessions");
         return;
     }
 
@@ -31,10 +31,15 @@ pub fn display_usage_table(usage_data: &UsageResult, provider_days: &ProviderAct
         }
     };
 
-    let summary = build_usage_summary(usage_data, provider_days, &pricing_map);
+    let summary = build_usage_summary(
+        &usage_data.models,
+        &usage_data.per_provider,
+        &usage_data.provider_days,
+        &pricing_map,
+    );
 
     if summary.rows.is_empty() {
-        println!("⚠️  No usage data found in Claude Code or Codex sessions");
+        println!("⚠️  No usage data found in Claude Code, Codex, Copilot, or Gemini sessions");
         return;
     }
 

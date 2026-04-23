@@ -5,140 +5,167 @@ use crate::utils::{get_git_remote_url, parse_iso_timestamp, process_gemini_usage
 use anyhow::Result;
 use serde_json::Value;
 
-/// Analyze Gemini conversations from a pre-parsed `Vec<Value>`.
+/// Analyze Gemini conversations from the JSONL event stream.
 ///
-/// Thin wrapper around [`analyze_gemini_session`] kept for the
-/// `analyze_jsonl_file` dispatch path that still materialises the full file as
-/// `Vec<Value>` when the input is pretty-printed JSON.
-pub fn analyze_gemini_conversations(data: Vec<Value>) -> Result<CodeAnalysis> {
-    analyze_gemini_conversations_with_mode(data, AnalysisMode::Full)
-}
-
-pub fn analyze_gemini_conversations_with_mode(
-    mut data: Vec<Value>,
+/// `session` carries the first-line meta record (`sessionId` etc.), and
+/// `events` yields one parsed JSON value per subsequent line. The analyzer
+/// filters down to `type == "gemini"` events and deserialises those into
+/// [`GeminiMessage`] individually; everything else (`type == "user"`,
+/// `"info"`, `$set` meta-update records, …) is silently skipped.
+///
+/// This is the only supported Gemini entry point — legacy single-object
+/// exports (`chats/<session>.json` with an inline `messages` array) are no
+/// longer handled.
+pub fn analyze_gemini_events<I>(
+    session: GeminiSession,
+    events: I,
     mode: AnalysisMode,
-) -> Result<CodeAnalysis> {
-    if data.is_empty() {
-        return Ok(CodeAnalysis {
-            user: String::new(),
-            extension_name: String::new(),
-            insights_version: String::new(),
-            machine_id: String::new(),
-            records: vec![],
-        });
-    }
-
-    // Parse the Gemini session
-    let session: GeminiSession = serde_json::from_value(data.remove(0))?;
-    analyze_gemini_session(session, mode)
-}
-
-/// Analyze Gemini conversations from an already-deserialised [`GeminiSession`].
-///
-/// This is the entry point used by the streaming JSONL path — it skips the
-/// `Vec<Value>` intermediate and runs straight off the typed shape.
-pub fn analyze_gemini_session(session: GeminiSession, mode: AnalysisMode) -> Result<CodeAnalysis> {
+) -> Result<CodeAnalysis>
+where
+    I: IntoIterator<Item = Value>,
+{
     let mut state = AnalysisState::with_mode(mode);
-    // Pre-allocate FastHashMap with typical capacity (1-3 models per conversation)
     let mut conversation_usage: FastHashMap<String, Value> = FastHashMap::with_capacity(3);
-    let mut last_timestamp = 0i64;
-    let folder_path = String::new();
 
-    // Process messages to extract token usage and tool call details
-    for message in &session.messages {
-        let ts = parse_iso_timestamp(&message.timestamp);
-        if ts > last_timestamp {
-            last_timestamp = ts;
-        }
+    for event in events {
+        // Skip lines without a type tag (e.g. `{"$set": {...}}` meta updates
+        // that Gemini CLI interleaves to keep `lastUpdated` fresh).
+        let Some(event_type) = event.get("type").and_then(|t| t.as_str()) else {
+            continue;
+        };
 
-        // Only process gemini messages (not user messages)
-        if message.message_type != "gemini" {
+        if event_type != "gemini" {
             continue;
         }
 
-        if let (Some(tokens), Some(model)) = (&message.tokens, &message.model) {
-            process_gemini_usage(&mut conversation_usage, model, tokens);
-        }
+        // Parse only the assistant events into the typed shape — cheaper
+        // than eagerly typing every line, and resilient to new event types
+        // that may be added in future Gemini CLI releases.
+        let Ok(message) = serde_json::from_value::<GeminiMessage>(event) else {
+            continue;
+        };
 
-        // Process tool calls to extract file operations
-        for tool_call in &message.tool_calls {
-            let Some(name) = tool_call.get("name").and_then(|n| n.as_str()) else {
-                continue;
-            };
-
-            let args = tool_call.get("args");
-
-            match name {
-                "read_file" => {
-                    let file_path = args
-                        .and_then(|a| a.get("file_path"))
-                        .and_then(|p| p.as_str())
-                        .unwrap_or("");
-
-                    // Extract content from result[].functionResponse.response.output
-                    let content = extract_tool_result_output(tool_call);
-                    state.add_read_detail(file_path, &content, ts);
-                }
-                "write_file" | "create_file" => {
-                    let file_path = args
-                        .and_then(|a| a.get("file_path"))
-                        .and_then(|p| p.as_str())
-                        .unwrap_or("");
-                    let content = args
-                        .and_then(|a| a.get("content"))
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("");
-
-                    state.add_write_detail(file_path, content, ts);
-                }
-                "edit_file" | "replace_in_file" => {
-                    let file_path = args
-                        .and_then(|a| a.get("file_path"))
-                        .and_then(|p| p.as_str())
-                        .unwrap_or("");
-                    let old_string = args
-                        .and_then(|a| a.get("old_string").or_else(|| a.get("old_text")))
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("");
-                    let new_string = args
-                        .and_then(|a| a.get("new_string").or_else(|| a.get("new_text")))
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("");
-
-                    state.add_edit_detail(file_path, old_string, new_string, ts);
-                }
-                "run_command" | "execute_command" | "shell" => {
-                    let command = args
-                        .and_then(|a| a.get("command").or_else(|| a.get("cmd")))
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("");
-                    let description = args
-                        .and_then(|a| a.get("description"))
-                        .and_then(|d| d.as_str())
-                        .unwrap_or("");
-
-                    state.add_run_command(command, description, ts);
-                }
-                _ => {}
-            }
-        }
+        process_gemini_message(&mut state, &mut conversation_usage, &message);
     }
 
-    // Try to get git remote URL from current directory
-    let git_remote_url = get_git_remote_url(&folder_path);
+    Ok(finalize_record(
+        state,
+        conversation_usage,
+        session.session_id,
+    ))
+}
 
+fn finalize_record(
+    mut state: AnalysisState,
+    conversation_usage: FastHashMap<String, Value>,
+    session_id: String,
+) -> CodeAnalysis {
+    // Gemini CLI does not record the invoking `cwd` in its log format today;
+    // fall back to querying git from the process's current dir so the usage
+    // report still stamps a remote URL when running inside a repo.
+    if state.git_remote.is_empty() {
+        state.git_remote = get_git_remote_url(&state.folder_path);
+    }
+
+    let last_ts = state.last_ts;
     let mut record = state.into_record(conversation_usage);
-    record.task_id = session.session_id;
-    record.git_remote_url = git_remote_url;
-    record.timestamp = last_timestamp;
+    record.task_id = session_id;
+    record.timestamp = last_ts;
 
-    Ok(CodeAnalysis {
+    CodeAnalysis {
         user: String::new(),
         extension_name: String::new(),
         insights_version: String::new(),
         machine_id: String::new(),
         records: vec![record],
-    })
+    }
+}
+
+fn process_gemini_message(
+    state: &mut AnalysisState,
+    conversation_usage: &mut FastHashMap<String, Value>,
+    message: &GeminiMessage,
+) {
+    let ts = parse_iso_timestamp(&message.timestamp);
+    if ts > state.last_ts {
+        state.last_ts = ts;
+    }
+
+    if message.message_type != "gemini" {
+        return;
+    }
+
+    if let (Some(tokens), Some(model)) = (&message.tokens, &message.model) {
+        process_gemini_usage(conversation_usage, model, tokens);
+    }
+
+    for tool_call in &message.tool_calls {
+        let Some(name) = tool_call.get("name").and_then(|n| n.as_str()) else {
+            continue;
+        };
+
+        let args = tool_call.get("args");
+
+        match name {
+            "read_file" => {
+                let file_path = args
+                    .and_then(|a| a.get("file_path"))
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("");
+
+                // Content sits at result[0].functionResponse.response.output
+                let content = extract_tool_result_output(tool_call);
+                state.add_read_detail(file_path, &content, ts);
+            }
+            "write_file" | "create_file" => {
+                let file_path = args
+                    .and_then(|a| a.get("file_path"))
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("");
+                let content = args
+                    .and_then(|a| a.get("content"))
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("");
+
+                state.add_write_detail(file_path, content, ts);
+            }
+            // Current Gemini CLI emits `replace`; `edit_file` /
+            // `replace_in_file` were the historical names and are kept
+            // here as best-effort aliases in case older sessions are
+            // still being replayed through `vct analysis --path`.
+            "edit_file" | "replace_in_file" | "replace" => {
+                let file_path = args
+                    .and_then(|a| a.get("file_path"))
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("");
+                let old_string = args
+                    .and_then(|a| a.get("old_string").or_else(|| a.get("old_text")))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
+                let new_string = args
+                    .and_then(|a| a.get("new_string").or_else(|| a.get("new_text")))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
+
+                state.add_edit_detail(file_path, old_string, new_string, ts);
+            }
+            "run_command" | "execute_command" | "shell" => {
+                let command = args
+                    .and_then(|a| a.get("command").or_else(|| a.get("cmd")))
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("");
+                let description = args
+                    .and_then(|a| a.get("description"))
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("");
+
+                state.add_run_command(command, description, ts);
+            }
+            // Meta tools like `update_topic` / `task_complete` carry no
+            // file-operation data; ignore them silently.
+            _ => {}
+        }
+    }
 }
 
 /// Extract output text from Gemini tool call result

@@ -1,7 +1,7 @@
 use crate::analysis::AnalysisData;
 use crate::display::analysis::averages::{
-    AnalysisRow, build_analysis_provider_rows, calculate_analysis_daily_averages,
-    convert_to_analysis_rows, format_lines_per_day,
+    AnalysisRow, build_analysis_provider_rows, calculate_analysis_daily_averages_from_per_provider,
+    format_lines_per_day,
 };
 use crate::display::common::table::{
     add_totals_row, create_comfy_table, create_metric_cell, create_provider_cell,
@@ -99,10 +99,13 @@ pub fn display_analysis_table(analysis: &AnalysisData) {
     println!("{table}");
     println!();
 
-    // Calculate and display daily averages
-    let rows_for_averages = convert_to_analysis_rows(data);
-    let daily_averages =
-        calculate_analysis_daily_averages(&rows_for_averages, &analysis.provider_days);
+    // Calculate daily averages from the per-provider aggregated rows the
+    // batch analyzer produced (no model-name guessing — each row is already
+    // scoped to a known source directory).
+    let daily_averages = calculate_analysis_daily_averages_from_per_provider(
+        &analysis.per_provider,
+        &analysis.provider_days,
+    );
     let provider_rows = build_analysis_provider_rows(&daily_averages);
 
     println!(

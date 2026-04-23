@@ -180,8 +180,8 @@ fn test_file_cache_multiple_files() {
     let files = vec![
         "examples/test_conversation.jsonl",
         "examples/test_conversation_oai.jsonl",
-        "examples/test_conversation_copilot.json",
-        "examples/test_conversation_gemini.json",
+        "examples/test_conversation_copilot.jsonl",
+        "examples/test_conversation_gemini.jsonl",
     ];
 
     let mut successful_parses = 0;

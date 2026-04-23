@@ -34,7 +34,7 @@ fn test_resolve_paths() {
         // Verify session directories
         assert!(paths.codex_session_dir.ends_with("sessions"));
         assert!(paths.claude_session_dir.ends_with("projects"));
-        assert!(paths.copilot_session_dir.ends_with("history-session-state"));
+        assert!(paths.copilot_session_dir.ends_with("session-state"));
         assert!(paths.gemini_session_dir.ends_with("tmp"));
     }
 }
@@ -94,7 +94,7 @@ fn test_paths_structure() {
     // Copilot paths
     assert_eq!(
         paths.copilot_session_dir,
-        paths.copilot_dir.join("history-session-state")
+        paths.copilot_dir.join("session-state")
     );
 
     // Gemini paths

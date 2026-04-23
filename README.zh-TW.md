@@ -228,8 +228,8 @@ vct usage --json --daily
 
 - `~/.claude/projects/*.jsonl`（Claude Code）
 - `~/.codex/sessions/*.jsonl`（Codex）
-- `~/.copilot/history-session-state/*.json`（Copilot）
-- `~/.gemini/tmp/<project_hash>/chats/*.json`（Gemini）
+- `~/.copilot/session-state/<sessionId>/events.jsonl`（Copilot CLI）
+- `~/.gemini/tmp/<project_hash>/chats/*.jsonl`（Gemini CLI）
 
 ---
 

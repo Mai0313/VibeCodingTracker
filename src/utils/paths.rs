@@ -28,7 +28,13 @@ pub fn resolve_paths() -> Result<HelperPaths> {
     let claude_dir = home_dir.join(".claude");
     let claude_session_dir = claude_dir.join("projects");
     let copilot_dir = home_dir.join(".copilot");
-    let copilot_session_dir = copilot_dir.join("history-session-state");
+    // Copilot CLI writes each session as a directory under
+    // `session-state/<sessionId>/`, with the event log at `events.jsonl`
+    // plus sibling folders (`rewind-snapshots/`, `checkpoints/`, `files/`).
+    // The per-session filter (see `is_copilot_session_file`) is responsible
+    // for picking only the `events.jsonl` file from each session tree and
+    // ignoring the snapshot/checkpoint artifacts.
+    let copilot_session_dir = copilot_dir.join("session-state");
     let gemini_dir = home_dir.join(".gemini");
     let gemini_session_dir = gemini_dir.join("tmp");
     let cache_dir = home_dir.join(".vibe_coding_tracker");

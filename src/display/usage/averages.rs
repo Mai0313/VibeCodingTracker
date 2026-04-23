@@ -1,5 +1,5 @@
 use crate::display::common::{DailyAverageRow, ProviderAverage, ProviderStatistics};
-use crate::models::{Provider, ProviderActiveDays, UsageResult};
+use crate::models::{PerProviderUsage, Provider, ProviderActiveDays, UsageResult};
 use crate::utils::format_number;
 use serde_json::Value;
 use std::borrow::Cow;
@@ -93,12 +93,67 @@ pub struct UsageSummary {
     pub daily_averages: DailyAverages,
 }
 
-/// Calculate daily averages grouped by provider (uses generic implementation)
-pub fn calculate_daily_averages(
-    rows: &[UsageRow],
+/// Calculate daily averages grouped by provider, using **source-directory**
+/// attribution instead of model-name heuristics.
+///
+/// The previous implementation ran `Provider::from_model_name(row.model())`
+/// over each merged per-model row, which misattributed every Copilot
+/// session to Claude Code the moment the Copilot parser started emitting
+/// real model names (e.g. `claude-sonnet-4-6`) instead of the historical
+/// sentinel string `"copilot"`. Token aggregation is now fed directly
+/// from the `per_provider` map that `usage::calculator` populates from
+/// each session's source directory, so the provider assignment is exact
+/// regardless of what model name the session happens to carry.
+pub fn calculate_daily_averages_from_per_provider(
+    per_provider: &PerProviderUsage,
     provider_days: &ProviderActiveDays,
+    pricing_map: &crate::pricing::ModelPricingMap,
 ) -> DailyAverages {
-    crate::display::common::calculate_daily_averages(rows, provider_days)
+    let mut averages = DailyAverages::default();
+
+    averages.claude.set_days(provider_days.claude);
+    averages.codex.set_days(provider_days.codex);
+    averages.copilot.set_days(provider_days.copilot);
+    averages.gemini.set_days(provider_days.gemini);
+    averages.overall.set_days(provider_days.total);
+
+    accumulate_provider(&mut averages.claude, &per_provider.claude, pricing_map);
+    accumulate_provider(&mut averages.codex, &per_provider.codex, pricing_map);
+    accumulate_provider(&mut averages.copilot, &per_provider.copilot, pricing_map);
+    accumulate_provider(&mut averages.gemini, &per_provider.gemini, pricing_map);
+
+    // "All Providers" row sums every provider's totals directly rather
+    // than reusing the cross-provider merged `UsageData.models` map.
+    // That merged map de-duplicates a shared model like `claude-sonnet-4-6`
+    // (used by both Claude Code and Copilot CLI) into a single row, so
+    // the underlying tokens are *not* double-counted — but we lose the
+    // provider attribution needed to populate per-provider cost columns
+    // on the same table, and the single merged row would price with one
+    // model-lookup where summing per-provider already-priced stats keeps
+    // cost consistent with each provider's own row above.
+    averages.overall.total_tokens = averages.claude.total_tokens
+        + averages.codex.total_tokens
+        + averages.copilot.total_tokens
+        + averages.gemini.total_tokens;
+    averages.overall.total_cost = averages.claude.total_cost
+        + averages.codex.total_cost
+        + averages.copilot.total_cost
+        + averages.gemini.total_cost;
+
+    averages
+}
+
+fn accumulate_provider(
+    stats: &mut ProviderStats,
+    usage: &UsageResult,
+    pricing_map: &crate::pricing::ModelPricingMap,
+) {
+    for (model, raw_usage) in usage {
+        let row = extract_usage_row(model, raw_usage, pricing_map);
+        // Provider is ignored by the usage impl of `accumulate`, but we
+        // still pass a value to satisfy the trait contract.
+        stats.accumulate(&row, Provider::Unknown);
+    }
 }
 
 /// Build provider average rows for display
@@ -159,9 +214,16 @@ pub fn format_tokens_per_day(value: f64) -> String {
     }
 }
 
-/// Build a summary from raw usage data
+/// Build a summary from raw usage data.
+///
+/// `usage_data` is the cross-provider merged map (drives the per-model
+/// table); `per_provider` is the source-directory-scoped map (drives the
+/// per-provider footer). Keeping the two aggregations independent is what
+/// lets Copilot-originated Claude tokens stay attributed to Copilot even
+/// though they share a row with Claude Code tokens in the main table.
 pub fn build_usage_summary(
     usage_data: &UsageResult,
+    per_provider: &PerProviderUsage,
     provider_days: &ProviderActiveDays,
     pricing_map: &crate::pricing::ModelPricingMap,
 ) -> UsageSummary {
@@ -192,7 +254,8 @@ pub fn build_usage_summary(
         summary.totals.accumulate(row);
     }
 
-    summary.daily_averages = calculate_daily_averages(&summary.rows, provider_days);
+    summary.daily_averages =
+        calculate_daily_averages_from_per_provider(per_provider, provider_days, pricing_map);
     summary
 }
 

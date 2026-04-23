@@ -10,8 +10,8 @@ Tests the parsing functionality for all supported AI assistant formats:
 
 - **Claude Code Parser**: Validates parsing of Claude Code session files (`.jsonl`)
 - **Codex Parser**: Validates parsing of Codex/OpenAI session files (`.jsonl`)
-- **Copilot Parser**: Validates parsing of GitHub Copilot CLI session files (`.json`)
-- **Gemini Parser**: Validates parsing of Gemini session files (`.json`)
+- **Copilot Parser**: Validates parsing of GitHub Copilot CLI session files (`.jsonl`)
+- **Gemini Parser**: Validates parsing of Gemini session files (`.jsonl`)
 
 Each parser test compares the actual output against expected results from example files, ignoring environment-specific fields (`insightsVersion`, `machineId`, `user`, `gitRemoteUrl`).
 
@@ -19,8 +19,8 @@ Each parser test compares the actual output against expected results from exampl
 
 - `examples/test_conversation.jsonl` → `examples/analysis_result.json`
 - `examples/test_conversation_oai.jsonl` → `examples/analysis_result_oai.json`
-- `examples/test_conversation_copilot.json` → `examples/analysis_result_copilot.json`
-- `examples/test_conversation_gemini.json` → `examples/analysis_result_gemini.json`
+- `examples/test_conversation_copilot.jsonl` → `examples/analysis_result_copilot.json`
+- `examples/test_conversation_gemini.jsonl` → `examples/analysis_result_gemini.json`
 
 ### 2. Usage Tests (`usage_tests.rs`)
 
