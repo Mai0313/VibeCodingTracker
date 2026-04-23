@@ -437,6 +437,9 @@ fn write_claude_fixture_with_sentinel_prelude(path: &std::path::Path, sentinel_t
         "file-history-snapshot" => {
             r#"{"type":"file-history-snapshot","messageId":"m1","isSnapshotUpdate":false,"snapshot":{}}"#
         }
+        "queue-operation" => {
+            r#"{"type":"queue-operation","operation":"enqueue","sessionId":"sess-1","content":"x","timestamp":"2026-04-23T00:00:00.000Z"}"#
+        }
         _ => unreachable!(),
     };
 
@@ -497,6 +500,37 @@ fn test_provider_known_extracts_usage_when_first_line_is_file_history_snapshot()
     assert!(
         record.conversation_usage.contains_key("claude-opus-4-7"),
         "claude-opus-4-7 usage should be recorded even when first line is file-history-snapshot"
+    );
+}
+
+#[test]
+fn test_provider_known_extracts_usage_when_first_line_is_queue_operation() {
+    let tmp = TempDir::new().unwrap();
+    let file = tmp.path().join("session.jsonl");
+    write_claude_fixture_with_sentinel_prelude(&file, "queue-operation");
+
+    let analysis =
+        analyze_session_file_typed_as(&file, ExtensionType::ClaudeCode, AnalysisMode::UsageOnly)
+            .expect("provider-known path should accept the sentinel prelude");
+
+    let record = &analysis.records[0];
+    assert!(
+        record.conversation_usage.contains_key("claude-opus-4-7"),
+        "claude-opus-4-7 usage should be recorded even when first line is queue-operation"
+    );
+}
+
+#[test]
+fn test_autodetect_sees_past_queue_operation_prelude() {
+    let tmp = TempDir::new().unwrap();
+    let file = tmp.path().join("session.jsonl");
+    write_claude_fixture_with_sentinel_prelude(&file, "queue-operation");
+
+    let analysis = analyze_jsonl_file(&file).expect("auto-detect should handle the prelude");
+    assert_eq!(analysis["extensionName"], "Claude-Code");
+    assert_eq!(
+        usage_input_tokens_for_model(&analysis, "claude-opus-4-7"),
+        100,
     );
 }
 
