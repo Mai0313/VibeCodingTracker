@@ -12,6 +12,7 @@ clean: ## Clean build artifacts and caches
 	@git gc --prune=now --aggressive
 
 fmt: ## Format code with rustfmt and auto-fix clippy warnings
+	uvx pre-commit run -a
 	cargo fmt --all
 	cargo clippy --all-targets --all-features --fix --allow-dirty --allow-staged
 	cargo clippy --all-targets --all-features -- -D warnings
