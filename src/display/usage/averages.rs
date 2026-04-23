@@ -122,13 +122,15 @@ pub fn calculate_daily_averages_from_per_provider(
     accumulate_provider(&mut averages.copilot, &per_provider.copilot, pricing_map);
     accumulate_provider(&mut averages.gemini, &per_provider.gemini, pricing_map);
 
-    // "All Providers" row sums every provider's totals directly. We
-    // cannot reuse the cross-provider merged `UsageData.models` map
-    // because that would double-count models like `claude-sonnet-4-6`
-    // that appear in both Claude Code and Copilot CLI sessions — the
-    // pricing matcher would see the summed tokens once and emit a
-    // single cost that excludes the inter-provider tokens. Summing
-    // per-provider stats keeps the overall total == Σ providers.
+    // "All Providers" row sums every provider's totals directly rather
+    // than reusing the cross-provider merged `UsageData.models` map.
+    // That merged map de-duplicates a shared model like `claude-sonnet-4-6`
+    // (used by both Claude Code and Copilot CLI) into a single row, so
+    // the underlying tokens are *not* double-counted — but we lose the
+    // provider attribution needed to populate per-provider cost columns
+    // on the same table, and the single merged row would price with one
+    // model-lookup where summing per-provider already-priced stats keeps
+    // cost consistent with each provider's own row above.
     averages.overall.total_tokens = averages.claude.total_tokens
         + averages.codex.total_tokens
         + averages.copilot.total_tokens

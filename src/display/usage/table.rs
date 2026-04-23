@@ -14,7 +14,7 @@ use std::collections::HashMap;
 /// Displays token usage data as a static table
 pub fn display_usage_table(usage_data: &UsageData) {
     if usage_data.models.is_empty() {
-        println!("⚠️  No usage data found in Claude Code or Codex sessions");
+        println!("⚠️  No usage data found in Claude Code, Codex, Copilot, or Gemini sessions");
         return;
     }
 
@@ -39,7 +39,7 @@ pub fn display_usage_table(usage_data: &UsageData) {
     );
 
     if summary.rows.is_empty() {
-        println!("⚠️  No usage data found in Claude Code or Codex sessions");
+        println!("⚠️  No usage data found in Claude Code, Codex, Copilot, or Gemini sessions");
         return;
     }
 

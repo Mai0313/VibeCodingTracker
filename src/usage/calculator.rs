@@ -220,9 +220,10 @@ where
 }
 
 impl UsageData {
-    /// Returns the per-provider usage slice for `provider`, or an empty
-    /// map when the provider is `Unknown` (the display layer's fallthrough
-    /// bucket is fed by the global `models` map instead).
+    /// Returns the per-provider usage slice for `provider`, or `None`
+    /// when the provider has no dedicated bucket (e.g. `Provider::Unknown`
+    /// — the display layer's fallthrough view is fed by the global
+    /// `models` map instead).
     pub fn provider_usage(&self, provider: Provider) -> Option<&UsageResult> {
         self.per_provider.get(provider)
     }
