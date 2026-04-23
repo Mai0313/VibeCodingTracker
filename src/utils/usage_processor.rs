@@ -164,14 +164,28 @@ pub fn process_gemini_usage(
         return;
     };
 
-    // Add input tokens
+    // Gemini's `tokens.input` is the full promptTokenCount (mirrors
+    // Google's API), which already includes the cached subset reported
+    // as `tokens.cached`. LiteLLM prices the two independently — if we
+    // accumulated `tokens.input` verbatim, every cached token would be
+    // billed at both `input_cost_per_token` and
+    // `cache_read_input_token_cost`, inflating Gemini cost reports.
+    //
+    // Subtract cached from input before accumulating so downstream
+    // bookkeeping matches the Claude convention (input ⊥ cache_read).
+    // We verify this against the Gemini CLI event stream: every
+    // observed record satisfies `total == input + output + thoughts`
+    // with `cached` *not* added — i.e. cached is already folded into
+    // `input`, not stored alongside it.
+    let input_non_cached = (tokens.input - tokens.cached).max(0);
+
     let current_input = existing_obj
         .get("input_tokens")
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
     existing_obj.insert(
         "input_tokens".to_string(),
-        (current_input + tokens.input).into(),
+        (current_input + input_non_cached).into(),
     );
 
     // Add cached tokens as cache_read_input_tokens
@@ -396,23 +410,50 @@ mod tests {
     fn test_process_gemini_usage_basic() {
         let mut conversation_usage = FastHashMap::default();
         let model = "gemini-2.0-flash";
+        // Use a realistic shape: `input` (300) includes `cached` (200),
+        // so non-cached input is 100.
         let tokens = crate::models::GeminiTokens {
-            input: 100,
+            input: 300,
             output: 50,
             cached: 200,
             thoughts: 10,
             tool: 5,
-            total: 365,
+            total: 360,
         };
 
         process_gemini_usage(&mut conversation_usage, model, &tokens);
 
         let result = conversation_usage.get(model).unwrap();
-        assert_eq!(result["input_tokens"].as_i64().unwrap(), 100);
+        assert_eq!(
+            result["input_tokens"].as_i64().unwrap(),
+            100,
+            "input must be stored as non-cached (input - cached) to match Claude semantics"
+        );
         assert_eq!(result["output_tokens"].as_i64().unwrap(), 50);
         assert_eq!(result["cache_read_input_tokens"].as_i64().unwrap(), 200);
         assert_eq!(result["thoughts_tokens"].as_i64().unwrap(), 10);
         assert_eq!(result["tool_tokens"].as_i64().unwrap(), 5);
-        assert_eq!(result["total_tokens"].as_i64().unwrap(), 365);
+        assert_eq!(result["total_tokens"].as_i64().unwrap(), 360);
+    }
+
+    #[test]
+    fn test_process_gemini_usage_no_cache() {
+        // Sanity check: a record with `cached: 0` must not alter input.
+        let mut conversation_usage = FastHashMap::default();
+        let model = "gemini-2.0-flash";
+        let tokens = crate::models::GeminiTokens {
+            input: 13_906,
+            output: 185,
+            cached: 0,
+            thoughts: 306,
+            tool: 0,
+            total: 14_397,
+        };
+
+        process_gemini_usage(&mut conversation_usage, model, &tokens);
+
+        let result = conversation_usage.get(model).unwrap();
+        assert_eq!(result["input_tokens"].as_i64().unwrap(), 13_906);
+        assert_eq!(result["cache_read_input_tokens"].as_i64().unwrap(), 0);
     }
 }
