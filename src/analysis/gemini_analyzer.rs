@@ -5,63 +5,17 @@ use crate::utils::{get_git_remote_url, parse_iso_timestamp, process_gemini_usage
 use anyhow::Result;
 use serde_json::Value;
 
-/// Analyze Gemini conversations from a pre-parsed `Vec<Value>`.
+/// Analyze Gemini conversations from the JSONL event stream.
 ///
-/// Used by the legacy single-object JSON path (`chats/<session>.json`),
-/// where the entire file is one pretty-printed object that ends up as the
-/// first and only element of the vec.
-pub fn analyze_gemini_conversations(data: Vec<Value>) -> Result<CodeAnalysis> {
-    analyze_gemini_conversations_with_mode(data, AnalysisMode::Full)
-}
-
-pub fn analyze_gemini_conversations_with_mode(
-    mut data: Vec<Value>,
-    mode: AnalysisMode,
-) -> Result<CodeAnalysis> {
-    if data.is_empty() {
-        return Ok(CodeAnalysis {
-            user: String::new(),
-            extension_name: String::new(),
-            insights_version: String::new(),
-            machine_id: String::new(),
-            records: vec![],
-        });
-    }
-
-    // Parse the Gemini session
-    let session: GeminiSession = serde_json::from_value(data.remove(0))?;
-    analyze_gemini_session(session, mode)
-}
-
-/// Analyze Gemini conversations from a fully-populated [`GeminiSession`].
+/// `session` carries the first-line meta record (`sessionId` etc.), and
+/// `events` yields one parsed JSON value per subsequent line. The analyzer
+/// filters down to `type == "gemini"` events and deserialises those into
+/// [`GeminiMessage`] individually; everything else (`type == "user"`,
+/// `"info"`, `$set` meta-update records, …) is silently skipped.
 ///
-/// This is the entry point for the legacy format where `session.messages`
-/// already contains every assistant turn. The modern JSONL stream uses
-/// [`analyze_gemini_events`] instead — the meta header is still parsed as
-/// a [`GeminiSession`] (with an empty `messages` field), and the per-line
-/// assistant events are passed in separately.
-pub fn analyze_gemini_session(session: GeminiSession, mode: AnalysisMode) -> Result<CodeAnalysis> {
-    let mut state = AnalysisState::with_mode(mode);
-    let mut conversation_usage: FastHashMap<String, Value> = FastHashMap::with_capacity(3);
-
-    for message in &session.messages {
-        process_gemini_message(&mut state, &mut conversation_usage, message);
-    }
-
-    Ok(finalize_record(
-        state,
-        conversation_usage,
-        session.session_id,
-    ))
-}
-
-/// Analyze Gemini conversations from the modern JSONL event stream.
-///
-/// `session` carries the first-line meta record (`sessionId` etc.). `events`
-/// yields one parsed JSON value per subsequent line; the analyzer filters
-/// down to the `type == "gemini"` events and deserialises those into
-/// [`GeminiMessage`] individually. Everything else (`type == "user"`,
-/// `"info"`, `$set` meta-update records) is silently skipped.
+/// This is the only supported Gemini entry point — legacy single-object
+/// exports (`chats/<session>.json` with an inline `messages` array) are no
+/// longer handled.
 pub fn analyze_gemini_events<I>(
     session: GeminiSession,
     events: I,
@@ -175,10 +129,10 @@ fn process_gemini_message(
 
                 state.add_write_detail(file_path, content, ts);
             }
-            // Gemini CLI used `edit_file` / `replace_in_file` historically;
-            // the current releases emit `replace` with the same
-            // `file_path` / `old_string` / `new_string` shape. Accept all
-            // three so replays of old sessions keep working.
+            // Current Gemini CLI emits `replace`; `edit_file` /
+            // `replace_in_file` were the historical names and are kept
+            // here as best-effort aliases in case older sessions are
+            // still being replayed through `vct analysis --path`.
             "edit_file" | "replace_in_file" | "replace" => {
                 let file_path = args
                     .and_then(|a| a.get("file_path"))

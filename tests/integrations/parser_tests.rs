@@ -258,62 +258,56 @@ fn test_copilot_parser() {
     );
 }
 
+/// End-to-end smoke test for the Gemini JSONL parser using an inline fixture.
+///
+/// The legacy single-object format (`chats/<session>.json` with an inline
+/// `messages` array) is no longer supported; we build a minimal JSONL stream
+/// on disk that exercises the modern event-stream code path — session meta
+/// line, ignored `user` / `info` events, a `$set` meta-update line the
+/// analyzer must silently skip, and one assistant `gemini` event carrying
+/// token usage plus a `toolCalls[]` entry for a `replace` edit.
 #[test]
-fn test_gemini_parser() {
-    let input_file = PathBuf::from("examples/test_conversation_gemini.json");
-    let expected_file = PathBuf::from("examples/analysis_result_gemini.json");
+fn test_gemini_parser_jsonl() {
+    use std::io::Write;
 
-    // Skip test if files don't exist
-    if !input_file.exists() {
-        eprintln!("Input file not found: {:?}", input_file);
-        return;
+    let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+    // `is_gemini_session_file` requires the parent directory to be named
+    // `chats`, so honour that even for the inline fixture.
+    let chats_dir = tempdir.path().join("project-hash").join("chats");
+    std::fs::create_dir_all(&chats_dir).expect("failed to mkdir -p chats");
+    let input_file = chats_dir.join("session-fixture.jsonl");
+
+    let fixture = r#"{"sessionId":"fixture-session","projectHash":"abc","startTime":"2026-04-23T00:00:00.000Z","lastUpdated":"2026-04-23T00:00:10.000Z","kind":"main"}
+{"id":"i1","timestamp":"2026-04-23T00:00:01.000Z","type":"info","content":"kicked off"}
+{"id":"u1","timestamp":"2026-04-23T00:00:02.000Z","type":"user","content":[{"text":"hi"}]}
+{"$set":{"lastUpdated":"2026-04-23T00:00:02.500Z"}}
+{"id":"g1","timestamp":"2026-04-23T00:00:05.000Z","type":"gemini","model":"gemini-3-flash-preview","tokens":{"input":100,"output":50,"cached":10,"thoughts":5,"tool":0,"total":165},"content":"done","toolCalls":[{"id":"t1","name":"replace","args":{"file_path":"README.md","old_string":"old","new_string":"new"}}]}
+"#;
+
+    {
+        let mut f = std::fs::File::create(&input_file).expect("failed to create fixture");
+        f.write_all(fixture.as_bytes())
+            .expect("failed to write fixture");
     }
 
-    if !expected_file.exists() {
-        eprintln!("Expected result file not found: {:?}", expected_file);
-        return;
-    }
+    let actual = analyze_jsonl_file(&input_file).expect("analyze Gemini fixture");
 
-    // Read expected result
-    let expected_content =
-        std::fs::read_to_string(&expected_file).expect("Failed to read expected result file");
-    let expected_json: Value =
-        serde_json::from_str(&expected_content).expect("Failed to parse expected result JSON");
+    assert_eq!(actual["extensionName"], "Gemini");
+    let record = &actual["records"][0];
+    assert_eq!(record["taskId"], "fixture-session");
 
-    // Analyze the input file
-    let actual_result = analyze_jsonl_file(&input_file);
-    assert!(
-        actual_result.is_ok(),
-        "Failed to analyze Gemini conversation: {:?}",
-        actual_result.err()
-    );
+    // Token usage attributed to the sole assistant model in the fixture.
+    let usage = &record["conversationUsage"]["gemini-3-flash-preview"];
+    assert_eq!(usage["input_tokens"], 100);
+    assert_eq!(usage["output_tokens"], 50);
+    assert_eq!(usage["cache_read_input_tokens"], 10);
+    assert_eq!(usage["thoughts_tokens"], 5);
+    assert_eq!(usage["total_tokens"], 165);
 
-    let actual_json = actual_result.unwrap();
-
-    // Compare results, ignoring specific fields
-    let ignore_fields = ["insightsVersion", "machineId", "user", "gitRemoteUrl"];
-    let matches = compare_json_ignore_fields(&actual_json, &expected_json, &ignore_fields);
-
-    if !matches {
-        // Print detailed comparison for debugging
-        eprintln!("\n=== ACTUAL OUTPUT ===");
-        eprintln!(
-            "{}",
-            serde_json::to_string_pretty(&actual_json)
-                .unwrap_or_else(|_| "Invalid JSON".to_string())
-        );
-        eprintln!("\n=== EXPECTED OUTPUT ===");
-        eprintln!(
-            "{}",
-            serde_json::to_string_pretty(&expected_json)
-                .unwrap_or_else(|_| "Invalid JSON".to_string())
-        );
-    }
-
-    assert!(
-        matches,
-        "Gemini analysis output does not match expected result (ignoring insightsVersion, machineId, user, gitRemoteUrl)"
-    );
+    // `replace` tool call should land in edit_file_details.
+    assert_eq!(record["editFileDetails"][0]["oldString"], "old");
+    assert_eq!(record["editFileDetails"][0]["newString"], "new");
+    assert_eq!(record["toolCallCounts"]["Edit"], 1);
 }
 
 #[cfg(test)]

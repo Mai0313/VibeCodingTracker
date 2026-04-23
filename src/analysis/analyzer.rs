@@ -8,9 +8,7 @@ use crate::analysis::copilot_analyzer::{
     analyze_copilot_conversations_with_mode, analyze_copilot_events,
 };
 use crate::analysis::detector::detect_extension_type;
-use crate::analysis::gemini_analyzer::{
-    analyze_gemini_conversations_with_mode, analyze_gemini_events, analyze_gemini_session,
-};
+use crate::analysis::gemini_analyzer::analyze_gemini_events;
 use crate::constants::buffer;
 use crate::models::{
     ClaudeCodeLog, CodeAnalysis, CodexLog, CopilotEvent, CopilotSession, ExtensionType,
@@ -273,30 +271,17 @@ fn dispatch_streaming_buffered(
             analyze_copilot_events(buffered_events.chain(rest_events), mode)
         }
         ExtensionType::Gemini => {
+            // Gemini sessions are line-delimited event streams: the first
+            // line is a session-meta record carrying `sessionId` etc.,
+            // and every subsequent line is an individual event. Feed the
+            // already-buffered lines plus the rest of the reader into
+            // `analyze_gemini_events`.
             let mut iter = buffered.into_iter();
             let first = iter
                 .next()
                 .context("Gemini session missing top-level object")?;
             let session: GeminiSession =
                 serde_json::from_value(first).context("Failed to parse Gemini session")?;
-
-            // Streaming path sees two Gemini shapes in practice:
-            // 1. Modern JSONL stream — the first line is a meta record with
-            //    no `messages` field; subsequent lines are per-event values
-            //    consumed by `analyze_gemini_events` below.
-            // 2. Legacy single-object file that happens to be on one line —
-            //    `messages` is fully populated; hand it straight to
-            //    `analyze_gemini_session`. Any *additional* buffered or
-            //    streamed events are discarded by this early return, which
-            //    is safe because legacy exports are a single JSON object
-            //    and never carry extra trailing records. A malformed
-            //    "hybrid" file mixing the two formats would have its
-            //    post-object content dropped here; we consider that
-            //    intentional since such a file is not produced by any
-            //    known Gemini CLI version.
-            if !session.messages.is_empty() {
-                return analyze_gemini_session(session, mode);
-            }
 
             let rest_events = iter_jsonl_values(&mut reader);
             analyze_gemini_events(session, iter.chain(rest_events), mode)
@@ -355,10 +340,20 @@ fn dispatch_by_vec(
             analyze_codex_conversations_with_mode(&logs, mode)?
         }
         ExtensionType::Copilot => {
+            // Legacy single-object Copilot dumps (`history-session-state/<id>.json`)
+            // reach this path when the streaming parser bails on a
+            // pretty-printed file. Modern `events.jsonl` sessions always
+            // stay on the streaming path.
             let session: CopilotSession = serde_json::from_value(data[0].clone())?;
             analyze_copilot_conversations_with_mode(session, mode)?
         }
-        ExtensionType::Gemini => analyze_gemini_conversations_with_mode(data, mode)?,
+        ExtensionType::Gemini => {
+            // Gemini only supports the JSONL event stream. A pretty-printed
+            // single-object file would reach this branch, but there is no
+            // analyzer for that shape anymore — return an empty analysis
+            // instead of silently mis-parsing.
+            empty_analysis()
+        }
     };
     Ok(finalize(analysis, ext_type))
 }

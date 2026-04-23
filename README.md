@@ -229,7 +229,7 @@ The tool automatically scans these directories:
 - `~/.claude/projects/**/*.jsonl` (Claude Code)
 - `~/.codex/sessions/**/*.jsonl` (Codex)
 - `~/.copilot/session-state/<sessionId>/events.jsonl` (Copilot CLI)
-- `~/.gemini/tmp/<project_hash>/chats/*.{json,jsonl}` (Gemini CLI — legacy `.json` single-object exports and current `.jsonl` event streams are both scanned)
+- `~/.gemini/tmp/<project_hash>/chats/*.jsonl` (Gemini CLI)
 
 ---
 

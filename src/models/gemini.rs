@@ -1,21 +1,22 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
-/// Top-level session metadata for a Gemini CLI chat log.
+/// Top-level session metadata line of a Gemini CLI chat log.
 ///
-/// Two Gemini file formats are in the wild:
+/// Current Gemini CLI writes chats as JSONL event streams under
+/// `~/.gemini/tmp/<project>/chats/session-*.jsonl`. The very first line is a
+/// pure session-meta record:
 ///
-/// - **Legacy single-object JSON** (`chats/<session>.json`): one big
-///   pretty-printed object with all messages inlined in the `messages` array.
-/// - **Current JSONL event stream** (`chats/session-*.jsonl`): the first line
-///   is a pure session-meta record (`{sessionId, projectHash, startTime,
-///   lastUpdated, kind}`) with **no** `messages` field, followed by one
-///   event per line.
+/// ```json
+/// {"sessionId":"...","projectHash":"...","startTime":"...","lastUpdated":"...","kind":"main"}
+/// ```
 ///
-/// We deserialise both into the same struct: every non-identifier field is
-/// `#[serde(default)]` so a meta-only line still parses, and `messages`
-/// stays empty for the JSONL case (the analyzer walks the rest of the
-/// stream line-by-line instead of relying on this vec).
+/// Subsequent lines are individual assistant / user / info events that the
+/// analyzer parses one-by-one as plain `Value`s (see
+/// `analyze_gemini_events`), so this struct only needs to capture the
+/// identifiers found on that opening meta line. Legacy single-object
+/// exports (`chats/<session>.json` with an inline `messages` array) are no
+/// longer supported — the filesystem filter ignores `.json` entirely.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GeminiSession {
@@ -26,14 +27,10 @@ pub struct GeminiSession {
     pub start_time: String,
     #[serde(default)]
     pub last_updated: String,
-    /// Present on JSONL session-meta records (e.g. `"main"`); absent on
-    /// legacy single-object exports.
+    /// Present on JSONL session-meta records (e.g. `"main"`), but not
+    /// required — older CLI builds occasionally omit it.
     #[serde(default)]
     pub kind: Option<String>,
-    /// Populated by the legacy single-object format; always empty for the
-    /// JSONL event stream (events come on subsequent lines).
-    #[serde(default)]
-    pub messages: Vec<GeminiMessage>,
 }
 
 /// Single message within a Gemini session

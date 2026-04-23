@@ -152,17 +152,19 @@ pub fn is_claude_session_file(path: &Path) -> bool {
 
 /// Filter for Gemini CLI session files
 ///
-/// Gemini CLI went through a format change: historical exports were a single
-/// pretty-printed JSON object stored as `chats/<session>.json`, while current
-/// Gemini CLI versions stream each event as a JSONL line into
-/// `chats/session-*.jsonl`. Accept both extensions so old and new sessions
-/// coexist. The parent-directory check still scopes us to the `chats/`
-/// subfolder, so sibling artifacts like `discordbot/logs.json` or the
-/// `bin/rg` binary living under `~/.gemini/tmp/` do not get picked up.
+/// Current Gemini CLI stores each chat as a line-delimited event stream at
+/// `~/.gemini/tmp/<project>/chats/session-*.jsonl`. Only `.jsonl` files
+/// directly under a `chats/` directory are accepted — sibling artifacts
+/// (`discordbot/logs.json`, the `bin/rg` binary, `.project_root`) are
+/// rejected by the parent-directory check.
+///
+/// Legacy single-object exports (`chats/<session>.json`) are intentionally
+/// not matched: the JSONL format is the only shape the analyzer understands
+/// today, and silently scanning `.json` files we can no longer parse just
+/// yields `Warning: Failed to analyze ...` noise on every run.
 pub fn is_gemini_session_file(path: &Path) -> bool {
     if let (Some(parent), Some(ext)) = (path.parent(), path.extension()) {
-        parent.file_name() == Some(std::ffi::OsStr::new("chats"))
-            && (ext == "json" || ext == "jsonl")
+        parent.file_name() == Some(std::ffi::OsStr::new("chats")) && ext == "jsonl"
     } else {
         false
     }

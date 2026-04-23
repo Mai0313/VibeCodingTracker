@@ -47,10 +47,11 @@ fn test_is_codex_session_file_uppercase() {
 }
 
 #[test]
-fn test_is_gemini_session_file_valid() {
-    // Legacy single-object export: `chats/<session>.json`
+fn test_is_gemini_session_file_rejects_legacy_json() {
+    // Legacy single-object exports (`chats/<session>.json`) are intentionally
+    // no longer matched — the analyzer only handles the JSONL event stream.
     let path = std::path::Path::new("/home/user/.gemini/tmp/hash/chats/chat.json");
-    assert!(is_gemini_session_file(path));
+    assert!(!is_gemini_session_file(path));
 }
 
 #[test]
@@ -335,8 +336,9 @@ fn test_is_codex_session_file_with_dots_in_name() {
 
 #[test]
 fn test_is_gemini_session_file_multiple_levels() {
-    // Test with multiple directory levels
-    let path = std::path::Path::new("/a/b/c/d/chats/file.json");
+    // Depth of the enclosing directory does not matter as long as the
+    // *immediate* parent is `chats/` and the extension is `.jsonl`.
+    let path = std::path::Path::new("/a/b/c/d/chats/file.jsonl");
     assert!(is_gemini_session_file(path));
 }
 

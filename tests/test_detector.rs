@@ -7,24 +7,11 @@ use vibe_coding_tracker::analysis::detector::detect_extension_type;
 use vibe_coding_tracker::models::ExtensionType;
 
 #[test]
-fn test_detect_gemini_format() {
-    // Legacy single-object export with sessionId, projectHash, and messages
-    let data = vec![json!({
-        "sessionId": "test-session",
-        "projectHash": "abc123",
-        "messages": []
-    })];
-
-    let result = detect_extension_type(&data).unwrap();
-    assert_eq!(result, ExtensionType::Gemini);
-}
-
-#[test]
 fn test_detect_gemini_jsonl_meta_header() {
-    // Modern Gemini CLI writes one event per line under `chats/`. The first
-    // line is a pure session-meta record tagged with `kind` (no `messages`
-    // array) — the detector must recognise it even when further event lines
-    // follow in the same slice.
+    // Gemini CLI writes one event per line under `chats/`. The first
+    // line is a pure session-meta record carrying `sessionId` +
+    // `projectHash` and *no* `messages` array — the detector must
+    // recognise it even when further event lines follow in the same slice.
     let data = vec![
         json!({
             "sessionId": "0ab84937-9fe7-4284-986a-33c832af0b6a",
@@ -57,6 +44,23 @@ fn test_detect_gemini_jsonl_meta_header() {
 
     let result = detect_extension_type(&data).unwrap();
     assert_eq!(result, ExtensionType::Gemini);
+}
+
+#[test]
+fn test_detect_gemini_rejects_legacy_single_object() {
+    // Legacy Gemini single-object exports used to be detected as Gemini, but
+    // the analyzer no longer supports that shape. We explicitly guard
+    // against mis-classifying a record with an inline `messages` array as
+    // Gemini so it falls through to Codex (and fails clearly) instead of
+    // silently producing an empty analysis.
+    let data = vec![json!({
+        "sessionId": "test-session",
+        "projectHash": "abc123",
+        "messages": []
+    })];
+
+    let result = detect_extension_type(&data).unwrap();
+    assert_ne!(result, ExtensionType::Gemini);
 }
 
 #[test]
@@ -217,11 +221,14 @@ fn test_detect_multiple_objects_without_markers() {
 
 #[test]
 fn test_detect_gemini_with_extra_fields() {
-    // Test that Gemini detection works even with extra fields
+    // Unknown extra fields on the Gemini JSONL meta-header must not stop
+    // detection — the analyzer relies on `sessionId` + `projectHash` + the
+    // absence of a `messages` array and ignores everything else.
     let data = vec![json!({
         "sessionId": "test",
         "projectHash": "hash",
-        "messages": [],
+        "startTime": "2026-04-23T00:00:00Z",
+        "kind": "main",
         "extraField": "extra"
     })];
 
@@ -245,15 +252,19 @@ fn test_detect_copilot_with_extra_fields() {
 
 #[test]
 fn test_detect_partial_gemini_fields() {
-    // Test that partial Gemini fields don't trigger false positive
-    let data = vec![json!({
-        "sessionId": "test",
-        "projectHash": "hash"
-        // missing "messages" field
+    // A record missing either `sessionId` or `projectHash` must not be
+    // classified as Gemini even when it looks superficially similar.
+    let without_project_hash = vec![json!({
+        "sessionId": "test"
     })];
+    let result = detect_extension_type(&without_project_hash).unwrap();
+    assert_eq!(result, ExtensionType::Codex);
 
-    let result = detect_extension_type(&data).unwrap();
-    assert_eq!(result, ExtensionType::Codex); // Should default to Codex
+    let without_session_id = vec![json!({
+        "projectHash": "hash"
+    })];
+    let result = detect_extension_type(&without_session_id).unwrap();
+    assert_eq!(result, ExtensionType::Codex);
 }
 
 #[test]
