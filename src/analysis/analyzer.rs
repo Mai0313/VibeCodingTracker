@@ -7,7 +7,7 @@ use crate::analysis::common_state::AnalysisMode;
 use crate::analysis::copilot_analyzer::analyze_copilot_conversations_with_mode;
 use crate::analysis::detector::detect_extension_type;
 use crate::analysis::gemini_analyzer::{
-    analyze_gemini_conversations_with_mode, analyze_gemini_session,
+    analyze_gemini_conversations_with_mode, analyze_gemini_events, analyze_gemini_session,
 };
 use crate::constants::buffer;
 use crate::models::{
@@ -265,15 +265,46 @@ fn dispatch_streaming_buffered(
             analyze_copilot_conversations_with_mode(session, mode)
         }
         ExtensionType::Gemini => {
-            let first = buffered
-                .into_iter()
+            let mut iter = buffered.into_iter();
+            let first = iter
                 .next()
                 .context("Gemini session missing top-level object")?;
             let session: GeminiSession =
                 serde_json::from_value(first).context("Failed to parse Gemini session")?;
-            analyze_gemini_session(session, mode)
+
+            // Streaming path sees three situations for Gemini:
+            // 1. Modern JSONL stream — the first line is a meta record with
+            //    no `messages` field; subsequent lines are per-event values.
+            // 2. Legacy single-object file that happens to be on one line —
+            //    `messages` is fully populated and the event iterator is
+            //    empty; hand it to the single-object analyzer.
+            // 3. Hybrid (should not happen in the wild) — treat it as
+            //    JSONL, the legacy messages still get processed via
+            //    `analyze_gemini_session` first.
+            if !session.messages.is_empty() {
+                return analyze_gemini_session(session, mode);
+            }
+
+            let rest_events = iter_jsonl_values(&mut reader);
+            analyze_gemini_events(session, iter.chain(rest_events), mode)
         }
     }
+}
+
+/// Iterator that yields raw [`Value`]s, one per non-empty line in the reader.
+///
+/// Used by analyzers (Gemini / Copilot) that need to dispatch per-event on a
+/// runtime-typed shape before committing to a strongly-typed struct, since
+/// different event types carry completely different payloads.
+fn iter_jsonl_values<'a>(reader: &'a mut BufReader<File>) -> impl Iterator<Item = Value> + 'a {
+    reader.lines().filter_map(|line| {
+        let line = line.ok()?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        serde_json::from_str::<Value>(trimmed).ok()
+    })
 }
 
 /// Iterator that yields `T` values, one per non-empty line in the reader.

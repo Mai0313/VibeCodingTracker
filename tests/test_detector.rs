@@ -8,12 +8,52 @@ use vibe_coding_tracker::models::ExtensionType;
 
 #[test]
 fn test_detect_gemini_format() {
-    // Test Gemini format detection with sessionId, projectHash, and messages
+    // Legacy single-object export with sessionId, projectHash, and messages
     let data = vec![json!({
         "sessionId": "test-session",
         "projectHash": "abc123",
         "messages": []
     })];
+
+    let result = detect_extension_type(&data).unwrap();
+    assert_eq!(result, ExtensionType::Gemini);
+}
+
+#[test]
+fn test_detect_gemini_jsonl_meta_header() {
+    // Modern Gemini CLI writes one event per line under `chats/`. The first
+    // line is a pure session-meta record tagged with `kind` (no `messages`
+    // array) — the detector must recognise it even when further event lines
+    // follow in the same slice.
+    let data = vec![
+        json!({
+            "sessionId": "0ab84937-9fe7-4284-986a-33c832af0b6a",
+            "projectHash": "9da8b3dfb8655182ac1f0e66601c367e34f8d18447a29759eeba4d7e45dc60ea",
+            "startTime": "2026-04-23T12:52:52.759Z",
+            "lastUpdated": "2026-04-23T12:52:52.759Z",
+            "kind": "main"
+        }),
+        json!({
+            "id": "0cf1a565-3230-4426-bdfc-d4d7af19f867",
+            "timestamp": "2026-04-23T12:53:02.597Z",
+            "type": "info",
+            "content": "Empty GEMINI.md created."
+        }),
+        json!({
+            "id": "8828dd6a-d778-464f-8160-eb2e1604a122",
+            "timestamp": "2026-04-23T12:53:05.283Z",
+            "type": "gemini",
+            "model": "gemini-3-flash-preview",
+            "tokens": {
+                "input": 13906,
+                "output": 185,
+                "cached": 0,
+                "thoughts": 306,
+                "tool": 0,
+                "total": 14397
+            }
+        }),
+    ];
 
     let result = detect_extension_type(&data).unwrap();
     assert_eq!(result, ExtensionType::Gemini);
