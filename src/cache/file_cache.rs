@@ -1,27 +1,36 @@
 use crate::constants::capacity;
+use crate::models::{
+    CodeAnalysis, CodeAnalysisApplyDiffDetail, CodeAnalysisReadDetail, CodeAnalysisRecord,
+    CodeAnalysisRunCommandDetail, CodeAnalysisWriteDetail,
+};
 use anyhow::Result;
 use lru::LruCache;
-use serde_json::Value;
 use std::fs;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
-/// Cached file entry with modification time tracking for invalidation
+/// Cached file entry with modification time tracking for invalidation.
+///
+/// `size_bytes` is captured once at insertion via [`estimate_analysis_bytes`]
+/// so the `stats()` path can report a realistic memory footprint without
+/// walking the analysis on every call.
 #[derive(Debug, Clone)]
 struct CachedFile {
     modified: SystemTime,
-    analysis: Arc<Value>,
+    analysis: Arc<CodeAnalysis>,
+    size_bytes: usize,
 }
 
-/// Thread-safe LRU cache for parsed session files with automatic eviction
+/// Thread-safe LRU cache for parsed session analyses with automatic eviction.
 ///
-/// This cache:
-/// - Eliminates redundant file I/O and JSON parsing across commands
-/// - Uses LRU eviction to maintain bounded memory usage (max 100 entries)
-/// - Tracks file modification times for automatic invalidation
-/// - Shares cached results via Arc for zero-cost cloning
+/// Entries are held as `Arc<CodeAnalysis>` (the typed struct). We deliberately
+/// avoid caching `Arc<serde_json::Value>` because `serde_json::to_value` deep-
+/// clones every string and adds per-node `Value` enum overhead on top — for
+/// long Claude sessions that roughly doubles the working set. Callers that
+/// need a `Value` (CLI single-file dump) serialise on demand from the typed
+/// form, which only happens once per request rather than once per cache entry.
 pub struct FileParseCache {
     cache: RwLock<LruCache<PathBuf, CachedFile>>,
 }
@@ -36,7 +45,7 @@ impl FileParseCache {
         }
     }
 
-    /// Retrieves cached analysis or parses the file if needed
+    /// Retrieves cached analysis or parses the file if needed.
     ///
     /// Workflow:
     /// 1. Check cache hit with read-only peek (no lock contention)
@@ -44,7 +53,7 @@ impl FileParseCache {
     /// 3. If miss/stale, parse file and cache result (may evict LRU entry)
     ///
     /// Optimized to minimize write lock contention in parallel workloads.
-    pub fn get_or_parse<P: AsRef<Path>>(&self, path: P) -> Result<Arc<Value>> {
+    pub fn get_or_parse<P: AsRef<Path>>(&self, path: P) -> Result<Arc<CodeAnalysis>> {
         let path = path.as_ref();
         let path_buf = path.to_path_buf();
 
@@ -75,10 +84,11 @@ impl FileParseCache {
             }
         }
 
-        // Cache miss or outdated - need to parse
+        // Cache miss or outdated - need to parse.
         log::debug!("LRU cache miss for {}, parsing...", path.display());
-        let analysis = crate::analysis::analyze_jsonl_file(path)?;
+        let analysis = crate::analysis::analyze_jsonl_file_typed(path)?;
         let arc_analysis = Arc::new(analysis);
+        let size_bytes = estimate_analysis_bytes(arc_analysis.as_ref());
 
         // Update cache (write lock) - LRU will auto-evict if at capacity
         if let Ok(mut cache_write) = self.cache.write() {
@@ -87,6 +97,7 @@ impl FileParseCache {
                 CachedFile {
                     modified,
                     analysis: Arc::clone(&arc_analysis),
+                    size_bytes,
                 },
             );
         }
@@ -120,13 +131,16 @@ impl FileParseCache {
         }
     }
 
-    /// Returns cache statistics for monitoring and debugging
+    /// Returns cache statistics for monitoring and debugging.
+    ///
+    /// `estimated_memory_kb` is a real sum of per-entry sizes captured by
+    /// [`estimate_analysis_bytes`] at insertion time.
     pub fn stats(&self) -> CacheStats {
         if let Ok(cache) = self.cache.write() {
+            let total_bytes: usize = cache.iter().map(|(_, c)| c.size_bytes).sum();
             CacheStats {
                 entry_count: cache.len(),
-                // Rough estimate: ~200KB per entry (more realistic for parsed JSON with details)
-                estimated_memory_kb: cache.len() * 200,
+                estimated_memory_kb: total_bytes / 1024,
             }
         } else {
             CacheStats::default()
@@ -161,6 +175,65 @@ impl Default for FileParseCache {
 pub struct CacheStats {
     pub entry_count: usize,
     pub estimated_memory_kb: usize,
+}
+
+/// Best-effort byte estimate of a [`CodeAnalysis`]'s heap footprint.
+///
+/// Counts the inline struct + every owned `String` capacity reachable from
+/// the records. Ignores allocator padding, `HashMap` bucket overhead, and the
+/// `serde_json::Value` payload inside `conversation_usage` (we only count the
+/// keys) — still more honest than a flat constant and vastly cheaper than
+/// `serde_json::to_vec(...).len()`.
+fn estimate_analysis_bytes(analysis: &CodeAnalysis) -> usize {
+    use std::mem::size_of;
+
+    let mut bytes = size_of::<CodeAnalysis>();
+    bytes += analysis.user.capacity();
+    bytes += analysis.extension_name.capacity();
+    bytes += analysis.insights_version.capacity();
+    bytes += analysis.machine_id.capacity();
+    bytes += analysis.records.capacity() * size_of::<CodeAnalysisRecord>();
+
+    for record in &analysis.records {
+        bytes += record.task_id.capacity();
+        bytes += record.folder_path.capacity();
+        bytes += record.git_remote_url.capacity();
+
+        bytes += record.write_file_details.capacity() * size_of::<CodeAnalysisWriteDetail>();
+        for detail in &record.write_file_details {
+            bytes += detail.base.file_path.capacity();
+            bytes += detail.content.capacity();
+        }
+
+        bytes += record.read_file_details.capacity() * size_of::<CodeAnalysisReadDetail>();
+        for detail in &record.read_file_details {
+            bytes += detail.base.file_path.capacity();
+        }
+
+        bytes += record.edit_file_details.capacity() * size_of::<CodeAnalysisApplyDiffDetail>();
+        for detail in &record.edit_file_details {
+            bytes += detail.base.file_path.capacity();
+            bytes += detail.old_string.capacity();
+            bytes += detail.new_string.capacity();
+        }
+
+        bytes += record.run_command_details.capacity() * size_of::<CodeAnalysisRunCommandDetail>();
+        for detail in &record.run_command_details {
+            bytes += detail.base.file_path.capacity();
+            bytes += detail.command.capacity();
+            bytes += detail.description.capacity();
+        }
+
+        // conversation_usage: FastHashMap<String, serde_json::Value>
+        for (k, _) in &record.conversation_usage {
+            bytes += k.capacity();
+            // Values are small token-count objects; approximate at 256 B each
+            // rather than walking Value trees on every insertion.
+            bytes += 256;
+        }
+    }
+
+    bytes
 }
 
 #[cfg(test)]

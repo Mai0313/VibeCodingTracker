@@ -2705,6 +2705,7 @@ dependencies = [
  "home",
  "hostname",
  "itoa",
+ "libc",
  "log",
  "lru 0.17.0",
  "memchr",

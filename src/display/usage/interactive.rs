@@ -17,17 +17,21 @@ use ratatui::{
     widgets::Row as RatatuiRow,
 };
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use sysinfo::System;
 
 const USAGE_REFRESH_SECS: u64 = 10;
+/// How often to rebuild the LiteLLM pricing map. The underlying data only
+/// changes when the upstream JSON is updated (daily at most), so rebuilding
+/// a fresh ~500 KB `HashMap<Rc<str>, ModelPricing>` every 10 s just churned
+/// the allocator and left heap fragmentation behind on long sessions.
 const PRICING_REFRESH_SECS: u64 = 300;
 const MAX_TRACKED_ROWS: usize = 100;
 
 /// Displays token usage data in an interactive TUI with auto-refresh
 ///
 /// Features:
-/// - Auto-refresh every 10 seconds (usage data) and 5 minutes (pricing)
+/// - Auto-refresh every 10 seconds (usage + pricing)
 /// - Real-time memory monitoring
 /// - Provider-grouped daily averages
 /// - Keyboard controls: `q`, `Esc`, or `Ctrl+C` to exit
@@ -35,25 +39,33 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
     let mut terminal = setup_terminal()?;
     let mut refresh_state = RefreshState::new(USAGE_REFRESH_SECS);
 
-    let mut sys = System::new_all();
     let pid =
         sysinfo::get_current_pid().expect("Failed to get current process ID for memory monitoring");
-
-    let mut last_pricing_refresh = std::time::Instant::now();
-    let mut pricing_map_is_empty = false;
-
-    // Check if we need to fetch pricing immediately
-    let initial_pricing_result = fetch_model_pricing();
-    if let Err(e) = &initial_pricing_result {
-        log::warn!("Failed to fetch initial pricing: {}", e);
-        pricing_map_is_empty = true;
-        last_pricing_refresh =
-            std::time::Instant::now() - Duration::from_secs(PRICING_REFRESH_SECS);
-    }
+    // `System::new_all` would load every process, disk and network on the
+    // machine (tens of MB on a busy host). We only read our own process
+    // stats, so start from an empty `System` and populate it with just our
+    // pid on every refresh. `remove_dead_processes: true` ensures no stale
+    // entries linger across refreshes.
+    let mut sys = System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
 
     let mut usage_data = UsageResult::default();
     let mut provider_days = ProviderActiveDays::default();
     let mut has_usage_data = false;
+
+    // Pricing map is large (~500 KB / ~400 models) but changes at most once
+    // per day upstream, so build it once and reuse across refresh cycles.
+    // We only rebuild when `PRICING_REFRESH_SECS` has elapsed — otherwise a
+    // 10 s refresh interval would allocate and drop a fresh hashmap six
+    // times a minute, leaving the glibc heap fragmented on long sessions.
+    let mut pricing_map = match fetch_model_pricing() {
+        Ok(map) => map,
+        Err(e) => {
+            log::warn!("Failed to fetch initial pricing: {}", e);
+            ModelPricingMap::new(HashMap::new())
+        }
+    };
+    let mut last_pricing_refresh = Instant::now();
 
     let mut update_tracker = UpdateTracker::new(MAX_TRACKED_ROWS, 1000);
 
@@ -69,29 +81,11 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
 
         refresh_state.mark_refreshed();
 
-        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, false);
-        sys.refresh_cpu_all();
-
-        // Check if we need to refresh pricing data
-        let should_refresh_pricing = last_pricing_refresh.elapsed()
-            >= Duration::from_secs(PRICING_REFRESH_SECS)
-            || pricing_map_is_empty;
-
-        if should_refresh_pricing {
-            match fetch_model_pricing() {
-                Ok(_) => {
-                    pricing_map_is_empty = false;
-                    last_pricing_refresh = std::time::Instant::now();
-                }
-                Err(e) => {
-                    log::warn!("Failed to fetch pricing: {}", e);
-                    if pricing_map_is_empty {
-                        last_pricing_refresh =
-                            std::time::Instant::now() - Duration::from_secs(PRICING_REFRESH_SECS);
-                    }
-                }
-            }
-        }
+        // Only refresh our own process entry and prune any that have died.
+        // Per-process CPU usage is updated as part of `refresh_processes`, so
+        // the former `refresh_cpu_all()` (which scans every CPU system-wide)
+        // is not needed here.
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
 
         match crate::usage::get_usage_from_directories(time_range) {
             Ok(data) => {
@@ -107,19 +101,20 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
             }
         }
 
-        // Fetch pricing map on-demand for this refresh cycle only
-        let pricing_map = match fetch_model_pricing() {
-            Ok(map) => map,
-            Err(e) => {
-                log::warn!("Failed to fetch pricing for calculation: {}", e);
-                ModelPricingMap::new(HashMap::new())
+        // Refresh the pricing map at most once every `PRICING_REFRESH_SECS`.
+        if last_pricing_refresh.elapsed() >= Duration::from_secs(PRICING_REFRESH_SECS)
+            || pricing_map.is_empty()
+        {
+            match fetch_model_pricing() {
+                Ok(map) => {
+                    pricing_map = map;
+                    last_pricing_refresh = Instant::now();
+                }
+                Err(e) => log::warn!("Failed to refresh pricing: {}", e),
             }
-        };
+        }
 
         let summary = build_usage_summary(&usage_data, &provider_days, &pricing_map);
-
-        // Drop pricing_map immediately after use to free memory (it can be 100+ MB)
-        drop(pricing_map);
 
         // Extract only the data needed for rendering to minimize memory usage
         let rows_data = summary.rows;
@@ -129,9 +124,13 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
         // Clear raw usage data immediately after processing to free memory
         usage_data.clear();
 
-        // Clear file cache and pricing cache to release memory
-        crate::cache::clear_global_cache();
-        crate::pricing::clear_pricing_cache();
+        // NOTE: we intentionally do NOT clear the global file cache or the
+        // pricing cache here. The usage path already bypasses the file cache
+        // (runs in `AnalysisMode::UsageOnly` and drops each analysis after
+        // extraction), so wiping it would only nuke entries populated by
+        // other commands. The pricing cache is a single sub-MB hashmap
+        // backed by a dated on-disk file — clearing it just forces another
+        // file-parse on the next refresh.
 
         let provider_rows = build_provider_average_rows(&daily_averages);
 
@@ -307,9 +306,12 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
         drop(rows_data);
         drop(provider_rows);
 
-        // Force release of any remaining references by clearing caches again
-        crate::cache::clear_global_cache();
-        crate::pricing::clear_pricing_cache();
+        // Hand any arena-held free pages back to the OS. The refresh cycle
+        // just allocated and dropped a lot of small objects (per-file parse
+        // buffers, per-model hashmaps, ratatui row vectors); without this
+        // call glibc keeps them as internal free lists and RSS climbs by
+        // ~6 MB every refresh on a 219-session directory.
+        crate::utils::release_freed_heap();
 
         match handle_input()? {
             InputAction::Quit => break,

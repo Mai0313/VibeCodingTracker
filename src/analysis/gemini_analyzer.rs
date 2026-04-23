@@ -1,12 +1,23 @@
-use crate::analysis::common_state::AnalysisState;
+use crate::analysis::common_state::{AnalysisMode, AnalysisState};
 use crate::constants::FastHashMap;
 use crate::models::*;
 use crate::utils::{get_git_remote_url, parse_iso_timestamp, process_gemini_usage};
 use anyhow::Result;
 use serde_json::Value;
 
-/// Analyze Gemini conversations
-pub fn analyze_gemini_conversations(mut data: Vec<Value>) -> Result<CodeAnalysis> {
+/// Analyze Gemini conversations from a pre-parsed `Vec<Value>`.
+///
+/// Thin wrapper around [`analyze_gemini_session`] kept for the
+/// `analyze_jsonl_file` dispatch path that still materialises the full file as
+/// `Vec<Value>` when the input is pretty-printed JSON.
+pub fn analyze_gemini_conversations(data: Vec<Value>) -> Result<CodeAnalysis> {
+    analyze_gemini_conversations_with_mode(data, AnalysisMode::Full)
+}
+
+pub fn analyze_gemini_conversations_with_mode(
+    mut data: Vec<Value>,
+    mode: AnalysisMode,
+) -> Result<CodeAnalysis> {
     if data.is_empty() {
         return Ok(CodeAnalysis {
             user: String::new(),
@@ -19,8 +30,15 @@ pub fn analyze_gemini_conversations(mut data: Vec<Value>) -> Result<CodeAnalysis
 
     // Parse the Gemini session
     let session: GeminiSession = serde_json::from_value(data.remove(0))?;
+    analyze_gemini_session(session, mode)
+}
 
-    let mut state = AnalysisState::new();
+/// Analyze Gemini conversations from an already-deserialised [`GeminiSession`].
+///
+/// This is the entry point used by the streaming JSONL path — it skips the
+/// `Vec<Value>` intermediate and runs straight off the typed shape.
+pub fn analyze_gemini_session(session: GeminiSession, mode: AnalysisMode) -> Result<CodeAnalysis> {
+    let mut state = AnalysisState::with_mode(mode);
     // Pre-allocate FastHashMap with typical capacity (1-3 models per conversation)
     let mut conversation_usage: FastHashMap<String, Value> = FastHashMap::with_capacity(3);
     let mut last_timestamp = 0i64;

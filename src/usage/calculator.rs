@@ -1,7 +1,7 @@
-use crate::cache::global_cache;
+use crate::analysis::{AnalysisMode, analyze_jsonl_file_typed_with_mode};
 use crate::cli::TimeRange;
 use crate::constants::{FastHashMap, capacity};
-use crate::models::{ProviderActiveDays, UsageResult};
+use crate::models::{CodeAnalysis, ProviderActiveDays, UsageResult};
 use crate::utils::{
     collect_files_with_dates, is_claude_session_file, is_gemini_chat_file, is_json_file,
     resolve_paths,
@@ -18,29 +18,16 @@ pub struct UsageData {
     pub provider_days: ProviderActiveDays,
 }
 
-/// Extracts token usage data from CodeAnalysis records
-fn extract_conversation_usage_from_analysis(analysis: &Value) -> FastHashMap<String, Value> {
-    let Some(records) = analysis.get("records").and_then(|r| r.as_array()) else {
-        return FastHashMap::default();
-    };
-
-    // Pre-allocate HashMap using centralized capacity constant
+/// Extracts token usage data from a typed `CodeAnalysis`.
+///
+/// Reads directly from the typed `conversation_usage` map instead of walking
+/// `Value` via `.get(...)`, so no intermediate `serde_json::Value` tree is
+/// built or retained here.
+fn extract_conversation_usage_from_analysis(analysis: &CodeAnalysis) -> FastHashMap<String, Value> {
     let mut conversation_usage = FastHashMap::with_capacity(capacity::MODELS_PER_SESSION);
 
-    for record in records {
-        let Some(record_obj) = record.as_object() else {
-            continue;
-        };
-
-        let Some(conv_usage) = record_obj
-            .get("conversationUsage")
-            .and_then(|c| c.as_object())
-        else {
-            continue;
-        };
-
-        for (model, usage) in conv_usage {
-            // Use entry API to avoid double lookup
+    for record in &analysis.records {
+        for (model, usage) in &record.conversation_usage {
             conversation_usage
                 .entry(model.clone())
                 .and_modify(|existing_usage| merge_usage_values(existing_usage, usage))
@@ -140,15 +127,17 @@ where
     let dir = dir.as_ref();
     let files = collect_files_with_dates(dir, filter_fn, time_range)?;
 
-    // Process files in parallel with caching for better performance
+    // Parse each file directly in `UsageOnly` mode, extract the small
+    // per-model usage map, then drop the analysis. We deliberately bypass the
+    // global file cache here: the `usage` path never needs the heavy
+    // `write_file_details` / `edit_file_details` payloads, so caching the
+    // full analysis would waste the memory win from `UsageOnly`.
     let file_results: Vec<(String, FastHashMap<String, Value>)> = files
         .par_iter()
         .filter_map(|file_info| {
-            match global_cache().get_or_parse(&file_info.path) {
-                Ok(analysis_arc) => {
-                    // Use Arc to avoid deep cloning the entire analysis
-                    let conversation_usage =
-                        extract_conversation_usage_from_analysis(&analysis_arc);
+            match analyze_jsonl_file_typed_with_mode(&file_info.path, AnalysisMode::UsageOnly) {
+                Ok(analysis) => {
+                    let conversation_usage = extract_conversation_usage_from_analysis(&analysis);
                     Some((file_info.modified_date.clone(), conversation_usage))
                 }
                 Err(e) => {

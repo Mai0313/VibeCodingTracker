@@ -17,7 +17,7 @@
 
 </div>
 
-**Track your AI coding costs in real-time.** Vibe Coding Tracker is a lightweight, high-performance CLI tool built in Rust that monitors and analyzes your Claude Code, Codex, Copilot, and Gemini usage — with detailed cost breakdowns, token statistics, and code operation insights, all while keeping CPU and memory usage minimal.
+**Track your AI coding costs in real-time.** Vibe Coding Tracker is a lightweight, high-performance CLI tool built in Rust that monitors and analyzes your Claude Code, Codex, Copilot, and Gemini usage — with detailed cost breakdowns, token statistics, and code operation insights, all while keeping the memory footprint minimal.
 
 [English](README.md) | [繁體中文](README.zh-TW.md) | [简体中文](README.zh-CN.md)
 
@@ -33,7 +33,7 @@ Stop wondering how much your AI coding sessions cost. Get **real-time cost track
 
 ### 🪶 Ultra-Lightweight
 
-Built with Rust for minimal resource footprint. The interactive TUI dashboard runs at **~3-5% CPU** and **~140 MB memory** even while processing millions of tokens across multiple providers — no Electron, no bloated runtimes.
+Built with Rust for minimal resource footprint. The interactive TUI dashboard typically sits at **under ~50 MB of resident memory** once the first refresh is done, even with hundreds of long-context sessions on disk — no Electron, no bloated runtimes. The usage path parses each session file in a lean usage-only mode and bypasses the cache, and we tune glibc's arena count at startup to keep long-running RSS honest.
 
 ### 📊 Beautiful Visualizations
 
@@ -60,15 +60,15 @@ Automatically detects and processes logs from Claude Code, Codex, Copilot, and G
 
 ## ✨ Key Features
 
-| Feature                  | Description                                                    |
-| ------------------------ | -------------------------------------------------------------- |
-| 🤖 **Multi-Provider**    | Claude Code, Codex, Copilot, and Gemini — all in one place     |
-| 💵 **Smart Pricing**     | Fuzzy model matching + daily cache from LiteLLM                |
-| 🎨 **4 Display Modes**   | Interactive TUI, static table, plain text, and JSON            |
-| 📈 **Dual Analysis**     | Token/cost stats (`usage`) + code operation stats (`analysis`) |
-| 🪶 **Ultra-Lightweight** | ~3-5% CPU, ~140 MB RAM — built with Rust                       |
-| 🔄 **Live Updates**      | Real-time dashboard refreshes every second                     |
-| 💾 **Efficient Caching** | Smart daily cache reduces API calls                            |
+| Feature                  | Description                                                          |
+| ------------------------ | -------------------------------------------------------------------- |
+| 🤖 **Multi-Provider**    | Claude Code, Codex, Copilot, and Gemini — all in one place           |
+| 💵 **Smart Pricing**     | Fuzzy model matching + daily cache from LiteLLM                      |
+| 🎨 **4 Display Modes**   | Interactive TUI, static table, plain text, and JSON                  |
+| 📈 **Dual Analysis**     | Token/cost stats (`usage`) + code operation stats (`analysis`)       |
+| 🪶 **Ultra-Lightweight** | Under ~50 MB RSS in the TUI, streaming JSONL parse — built with Rust |
+| 🔄 **Live Updates**      | Real-time dashboard refreshes every second                           |
+| 💾 **Efficient Caching** | Smart daily cache reduces API calls                                  |
 
 ---
 
@@ -217,7 +217,7 @@ vct usage --json --daily
 │ ⭐ All Providers      16,362,353       $26.44         3                                    │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│   💰 Total: $79.33 | 🔢 Tokens: 49,087,058 | 📊 Models: 3 | ⚡ CPU: 4.6% | 🧠 Mem: 148 MB │
+│   💰 Total: $79.33  |  🔢 Tokens: 49,087,058  |  📊 Models: 3  |  🧠 Memory: 42.8 MB        │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
                           Press 'q', 'Esc', 'Ctrl+C' to quit | Press 'r' to refresh
 ```
@@ -299,7 +299,7 @@ vct analysis --by-provider --daily --output today.json
 │ ⭐ All Providers  426.7     4421.3    525.0      41.7     48.7     89.3     20.7      3    │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│  📝 Lines: 16,119 | 🔧 Tools: 601 | 📊 Models: 3 | ⚡ CPU: 3.6% | 🧠 Mem: 140 MB         │
+│  📝 Lines: 16,119  |  🔧 Tools: 601  |  📊 Models: 3  |  🧠 Memory: 41.2 MB                │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
                           Press 'q', 'Esc', 'Ctrl+C' to quit | Press 'r' to refresh
 ```

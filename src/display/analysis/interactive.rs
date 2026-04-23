@@ -35,10 +35,13 @@ pub fn display_analysis_interactive(
     let mut terminal = setup_terminal()?;
     let mut refresh_state = RefreshState::new(ANALYSIS_REFRESH_SECS);
 
-    // Initialize system for memory monitoring
-    let mut sys = System::new_all();
+    // Initialize system for memory monitoring. We only read our own process
+    // stats, so start from an empty `System` to avoid loading the machine's
+    // entire process table, disks, and network adapters.
     let pid =
         sysinfo::get_current_pid().expect("Failed to get current process ID for memory monitoring");
+    let mut sys = System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
 
     // Track updates
     let mut update_tracker = UpdateTracker::new(MAX_TRACKED_ANALYSIS_ROWS, 1000);
@@ -55,9 +58,10 @@ pub fn display_analysis_interactive(
 
         refresh_state.mark_refreshed();
 
-        // Update system information
-        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, false);
-        sys.refresh_cpu_all();
+        // Refresh only our own process; `remove_dead_processes: true` keeps
+        // the `System` from accumulating state for PIDs that come and go on
+        // the host over long TUI sessions.
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
 
         // Fetch fresh data with error logging
         let current_data = match crate::analysis::analyze_all_sessions(time_range) {
@@ -79,8 +83,9 @@ pub fn display_analysis_interactive(
         // Drop current_data immediately after conversion to free memory
         drop(current_data);
 
-        // Clear file cache after processing to release memory
-        crate::cache::clear_global_cache();
+        // `analyze_all_sessions` now bypasses the file cache for aggregated
+        // metrics (runs each file in `AnalysisMode::UsageOnly` and drops
+        // immediately), so there is nothing useful to clear here.
 
         // Track updates
         for row in &rows_data {
@@ -326,8 +331,8 @@ pub fn display_analysis_interactive(
         drop(rows_data);
         drop(provider_rows);
 
-        // Force release of any remaining references by clearing caches again
-        crate::cache::clear_global_cache();
+        // Return arena free lists to the OS — see `release_freed_heap` docs.
+        crate::utils::release_freed_heap();
 
         // Handle input with timeout
         match handle_input()? {

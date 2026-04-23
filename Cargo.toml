@@ -19,7 +19,10 @@ path = "src/main.rs"
 clap = { version = "4.5", features = ["derive", "env"] }
 
 # Serialization
-serde = { version = "1.0", features = ["derive"] }
+# The `rc` feature enables `Arc<T>: Serialize`, which lets us ship parsed
+# analyses out of the worker pool (batch_analyzer::ProviderGroupedAnalysis)
+# without deep-cloning the JSON tree that's already shared with the file cache.
+serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 
 # Error handling
@@ -76,8 +79,10 @@ bytecount = "0.6"
 # Fast memchr for string operations
 memchr = "2.7"
 
-# High-performance memory allocator
-mimalloc = { version = "0.1", default-features = false }
+# High-performance memory allocator — opt-in. Disabled by default because
+# mimalloc's lazy purge keeps freed pages resident, which inflates RSS ~10×
+# on the TUI refresh loops. Build with `--features mimalloc` to re-enable.
+mimalloc = { version = "0.1", default-features = false, optional = true }
 
 # Archive extraction for update functionality
 flate2 = "1.1"
@@ -87,11 +92,26 @@ zip = "5.1"
 # Lazy static initialization
 once_cell = "1.20"
 
+# For libc::malloc_trim on Linux — the TUI refresh loop churns a lot of
+# short-lived small allocations (219-file JSONL re-parse every 10 s), and
+# glibc's default heap shrink policy leaves ~6 MB of arena-side fragmentation
+# behind every cycle. Calling `malloc_trim(0)` at the end of a refresh
+# returns those unused pages to the OS and stabilises RSS.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 # Fast HashMap implementation with serde support
 ahash = { version = "0.8", features = ["serde"] }
 
 # LRU cache for bounded memory usage
 lru = "0.17"
+
+[features]
+default = []
+# Opt-in: link mimalloc as the global allocator. Faster for short one-shot
+# commands but retains freed pages (RSS ~10× higher on the TUI refresh
+# loops). See src/main.rs for details.
+mimalloc = ["dep:mimalloc"]
 
 [dev-dependencies]
 tempfile = "3.23"

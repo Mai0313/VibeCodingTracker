@@ -4,8 +4,25 @@ use crate::utils::count_lines;
 use serde_json::Value;
 use std::collections::HashSet;
 
+/// Controls how much per-operation detail the analyzer retains.
+///
+/// `Full` keeps everything that ends up in the public JSON output
+/// (file contents on `Write`, old/new strings on `Edit`, command text on
+/// `Bash`). `UsageOnly` skips those allocations — counts and totals are
+/// still accurate, but the per-detail `Vec`s stay empty. Callers that only
+/// consume `conversation_usage` / `tool_call_counts` / `total_*_lines`
+/// (the `usage` command, the aggregated `analysis` path) should pick
+/// `UsageOnly` to avoid pulling entire file bodies into memory on every
+/// session parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalysisMode {
+    Full,
+    UsageOnly,
+}
+
 /// Common analysis state shared by all analyzers (Claude, Codex, Gemini)
 pub struct AnalysisState {
+    pub mode: AnalysisMode,
     pub write_details: Vec<CodeAnalysisWriteDetail>,
     pub read_details: Vec<CodeAnalysisReadDetail>,
     pub edit_details: Vec<CodeAnalysisApplyDiffDetail>,
@@ -26,15 +43,38 @@ pub struct AnalysisState {
 
 impl AnalysisState {
     pub fn new() -> Self {
-        // Pre-allocate Vecs with reasonable capacity estimates based on typical session sizes
-        // This significantly reduces allocations and memory fragmentation
+        Self::with_mode(AnalysisMode::Full)
+    }
+
+    pub fn with_mode(mode: AnalysisMode) -> Self {
+        // Pre-allocate Vecs with reasonable capacity estimates based on
+        // typical session sizes. In `UsageOnly` mode we skip the
+        // pre-allocation because the vecs stay empty.
+        let pre = matches!(mode, AnalysisMode::Full);
         Self {
-            write_details: Vec::with_capacity(10), // typical: 5-15 write operations
-            read_details: Vec::with_capacity(20),  // typical: 10-30 read operations
-            edit_details: Vec::with_capacity(15),  // typical: 10-20 edit operations
-            run_details: Vec::with_capacity(10),   // typical: 5-15 bash commands
+            mode,
+            write_details: if pre {
+                Vec::with_capacity(10)
+            } else {
+                Vec::new()
+            },
+            read_details: if pre {
+                Vec::with_capacity(20)
+            } else {
+                Vec::new()
+            },
+            edit_details: if pre {
+                Vec::with_capacity(15)
+            } else {
+                Vec::new()
+            },
+            run_details: if pre {
+                Vec::with_capacity(10)
+            } else {
+                Vec::new()
+            },
             tool_counts: CodeAnalysisToolCalls::default(),
-            unique_files: HashSet::with_capacity(20), // typical: 10-30 unique files
+            unique_files: HashSet::with_capacity(if pre { 20 } else { 0 }),
             total_write_lines: 0,
             total_read_lines: 0,
             total_edit_lines: 0,
@@ -64,16 +104,18 @@ impl AnalysisState {
             return;
         }
 
-        self.read_details.push(CodeAnalysisReadDetail {
-            base: CodeAnalysisDetailBase {
-                file_path: resolved.clone(),
-                line_count,
-                character_count: char_count,
-                timestamp: ts,
-            },
-        });
+        if matches!(self.mode, AnalysisMode::Full) {
+            self.read_details.push(CodeAnalysisReadDetail {
+                base: CodeAnalysisDetailBase {
+                    file_path: resolved.clone(),
+                    line_count,
+                    character_count: char_count,
+                    timestamp: ts,
+                },
+            });
+            self.unique_files.insert(resolved);
+        }
 
-        self.unique_files.insert(resolved);
         self.total_read_lines += line_count;
         self.total_read_characters += char_count;
         self.tool_counts.read += 1;
@@ -90,17 +132,19 @@ impl AnalysisState {
             return;
         }
 
-        self.write_details.push(CodeAnalysisWriteDetail {
-            base: CodeAnalysisDetailBase {
-                file_path: resolved.clone(),
-                line_count,
-                character_count: char_count,
-                timestamp: ts,
-            },
-            content: trimmed.to_string(),
-        });
+        if matches!(self.mode, AnalysisMode::Full) {
+            self.write_details.push(CodeAnalysisWriteDetail {
+                base: CodeAnalysisDetailBase {
+                    file_path: resolved.clone(),
+                    line_count,
+                    character_count: char_count,
+                    timestamp: ts,
+                },
+                content: trimmed.to_string(),
+            });
+            self.unique_files.insert(resolved);
+        }
 
-        self.unique_files.insert(resolved);
         self.total_write_lines += line_count;
         self.total_write_characters += char_count;
         self.tool_counts.write += 1;
@@ -125,18 +169,20 @@ impl AnalysisState {
             return;
         }
 
-        self.edit_details.push(CodeAnalysisApplyDiffDetail {
-            base: CodeAnalysisDetailBase {
-                file_path: resolved.clone(),
-                line_count,
-                character_count: char_count,
-                timestamp: ts,
-            },
-            old_string: trimmed_old.to_string(),
-            new_string: trimmed_new.to_string(),
-        });
+        if matches!(self.mode, AnalysisMode::Full) {
+            self.edit_details.push(CodeAnalysisApplyDiffDetail {
+                base: CodeAnalysisDetailBase {
+                    file_path: resolved.clone(),
+                    line_count,
+                    character_count: char_count,
+                    timestamp: ts,
+                },
+                old_string: trimmed_old.to_string(),
+                new_string: trimmed_new.to_string(),
+            });
+            self.unique_files.insert(resolved);
+        }
 
-        self.unique_files.insert(resolved);
         self.total_edit_lines += line_count;
         self.total_edit_characters += char_count;
         self.tool_counts.edit += 1;
@@ -151,16 +197,18 @@ impl AnalysisState {
 
         let command_chars = command.chars().count();
 
-        self.run_details.push(CodeAnalysisRunCommandDetail {
-            base: CodeAnalysisDetailBase {
-                file_path: self.folder_path.clone(),
-                line_count: 0,
-                character_count: command_chars,
-                timestamp: ts,
-            },
-            command: command.to_string(),
-            description: description.to_string(),
-        });
+        if matches!(self.mode, AnalysisMode::Full) {
+            self.run_details.push(CodeAnalysisRunCommandDetail {
+                base: CodeAnalysisDetailBase {
+                    file_path: self.folder_path.clone(),
+                    line_count: 0,
+                    character_count: command_chars,
+                    timestamp: ts,
+                },
+                command: command.to_string(),
+                description: description.to_string(),
+            });
+        }
 
         self.tool_counts.bash += 1;
     }
