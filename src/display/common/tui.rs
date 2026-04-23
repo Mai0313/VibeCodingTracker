@@ -29,17 +29,17 @@ pub fn restore_terminal(
 
 /// Handle keyboard input and return whether to quit
 pub fn handle_input() -> anyhow::Result<InputAction> {
-    if event::poll(Duration::from_millis(100))? {
-        if let Event::Key(key) = event::read()? {
-            if key.code == KeyCode::Char('q')
-                || key.code == KeyCode::Esc
-                || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
-            {
-                return Ok(InputAction::Quit);
-            }
-            if key.code == KeyCode::Char('r') || key.code == KeyCode::Char('R') {
-                return Ok(InputAction::Refresh);
-            }
+    if event::poll(Duration::from_millis(100))?
+        && let Event::Key(key) = event::read()?
+    {
+        if key.code == KeyCode::Char('q')
+            || key.code == KeyCode::Esc
+            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            return Ok(InputAction::Quit);
+        }
+        if key.code == KeyCode::Char('r') || key.code == KeyCode::Char('R') {
+            return Ok(InputAction::Refresh);
         }
     }
     Ok(InputAction::Continue)

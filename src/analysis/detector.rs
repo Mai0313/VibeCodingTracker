@@ -15,23 +15,23 @@ pub fn detect_extension_type(data: &[Value]) -> Result<ExtensionType> {
     }
 
     // Quick check for single object formats (Gemini or Copilot)
-    if data.len() == 1 {
-        if let Some(obj) = data[0].as_object() {
-            // Check for Gemini format
-            if obj.contains_key("sessionId")
-                && obj.contains_key("projectHash")
-                && obj.contains_key("messages")
-            {
-                return Ok(ExtensionType::Gemini);
-            }
+    if data.len() == 1
+        && let Some(obj) = data[0].as_object()
+    {
+        // Check for Gemini format
+        if obj.contains_key("sessionId")
+            && obj.contains_key("projectHash")
+            && obj.contains_key("messages")
+        {
+            return Ok(ExtensionType::Gemini);
+        }
 
-            // Check for Copilot CLI format
-            if obj.contains_key("sessionId")
-                && obj.contains_key("startTime")
-                && obj.contains_key("timeline")
-            {
-                return Ok(ExtensionType::Copilot);
-            }
+        // Check for Copilot CLI format
+        if obj.contains_key("sessionId")
+            && obj.contains_key("startTime")
+            && obj.contains_key("timeline")
+        {
+            return Ok(ExtensionType::Copilot);
         }
     }
 

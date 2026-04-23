@@ -21,10 +21,10 @@ pub fn get_git_remote_url<P: AsRef<Path>>(cwd: P) -> String {
         .unwrap_or_else(|| cwd.as_ref().to_string_lossy().to_string());
 
     // Check cache first
-    if let Ok(cache) = GIT_URL_CACHE.read() {
-        if let Some(url) = cache.get(&canonical_path) {
-            return url.clone();
-        }
+    if let Ok(cache) = GIT_URL_CACHE.read()
+        && let Some(url) = cache.get(&canonical_path)
+    {
+        return url.clone();
     }
 
     // Cache miss - perform actual lookup

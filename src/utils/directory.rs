@@ -59,10 +59,10 @@ where
             let date_key = datetime.format("%Y-%m-%d").to_string();
 
             // Apply time range filter
-            if let Some(ref cutoff_str) = cutoff {
-                if date_key.as_str() < cutoff_str.as_str() {
-                    continue;
-                }
+            if let Some(ref cutoff_str) = cutoff
+                && date_key.as_str() < cutoff_str.as_str()
+            {
+                continue;
             }
 
             results.push(FileInfo {

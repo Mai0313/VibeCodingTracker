@@ -246,15 +246,15 @@ fn test_batch_analysis_basic() {
 fn test_batch_analysis_sorting() {
     let result = analyze_all_sessions(TimeRange::All);
 
-    if let Ok(data) = result {
-        if data.rows.len() > 1 {
-            // Verify sorting: models should be in alphabetical order
-            for i in 0..data.rows.len() - 1 {
-                assert!(
-                    data.rows[i].model <= data.rows[i + 1].model,
-                    "Models should be sorted alphabetically"
-                );
-            }
+    if let Ok(data) = result
+        && data.rows.len() > 1
+    {
+        // Verify sorting: models should be in alphabetical order
+        for i in 0..data.rows.len() - 1 {
+            assert!(
+                data.rows[i].model <= data.rows[i + 1].model,
+                "Models should be sorted alphabetically"
+            );
         }
     }
 }

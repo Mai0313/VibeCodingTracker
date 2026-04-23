@@ -202,10 +202,10 @@ fn merge_usage_values(existing: &mut Value, new: &Value) {
             }
         }
         // Handle Codex format (has total_token_usage)
-        else if existing_obj.contains_key("total_token_usage") {
-            if let Some(new_total) = new_obj.get("total_token_usage").and_then(|v| v.as_object()) {
-                accumulate_nested_object(existing_obj, "total_token_usage", new_total);
-            }
+        else if existing_obj.contains_key("total_token_usage")
+            && let Some(new_total) = new_obj.get("total_token_usage").and_then(|v| v.as_object())
+        {
+            accumulate_nested_object(existing_obj, "total_token_usage", new_total);
         }
     }
 }
