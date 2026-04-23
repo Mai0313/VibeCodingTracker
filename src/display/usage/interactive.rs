@@ -17,9 +17,15 @@ use ratatui::{
     widgets::Row as RatatuiRow,
 };
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use sysinfo::System;
 
 const USAGE_REFRESH_SECS: u64 = 10;
+/// How often to rebuild the LiteLLM pricing map. The underlying data only
+/// changes when the upstream JSON is updated (daily at most), so rebuilding
+/// a fresh ~500 KB `HashMap<Rc<str>, ModelPricing>` every 10 s just churned
+/// the allocator and left heap fragmentation behind on long sessions.
+const PRICING_REFRESH_SECS: u64 = 300;
 const MAX_TRACKED_ROWS: usize = 100;
 
 /// Displays token usage data in an interactive TUI with auto-refresh
@@ -46,6 +52,20 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
     let mut usage_data = UsageResult::default();
     let mut provider_days = ProviderActiveDays::default();
     let mut has_usage_data = false;
+
+    // Pricing map is large (~500 KB / ~400 models) but changes at most once
+    // per day upstream, so build it once and reuse across refresh cycles.
+    // We only rebuild when `PRICING_REFRESH_SECS` has elapsed — otherwise a
+    // 10 s refresh interval would allocate and drop a fresh hashmap six
+    // times a minute, leaving the glibc heap fragmented on long sessions.
+    let mut pricing_map = match fetch_model_pricing() {
+        Ok(map) => map,
+        Err(e) => {
+            log::warn!("Failed to fetch initial pricing: {}", e);
+            ModelPricingMap::new(HashMap::new())
+        }
+    };
+    let mut last_pricing_refresh = Instant::now();
 
     let mut update_tracker = UpdateTracker::new(MAX_TRACKED_ROWS, 1000);
 
@@ -81,24 +101,20 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
             }
         }
 
-        // One pricing fetch per refresh cycle. `fetch_model_pricing` checks
-        // its own on-disk 24h cache internally, so repeat calls on the same
-        // day just re-parse the dated JSON file — the previous code
-        // effectively did that twice (once to tick a "last refresh" timer
-        // whose result was discarded, once for real), doubling the parse
-        // cost and churn.
-        let pricing_map = match fetch_model_pricing() {
-            Ok(map) => map,
-            Err(e) => {
-                log::warn!("Failed to fetch pricing for calculation: {}", e);
-                ModelPricingMap::new(HashMap::new())
+        // Refresh the pricing map at most once every `PRICING_REFRESH_SECS`.
+        if last_pricing_refresh.elapsed() >= Duration::from_secs(PRICING_REFRESH_SECS)
+            || pricing_map.is_empty()
+        {
+            match fetch_model_pricing() {
+                Ok(map) => {
+                    pricing_map = map;
+                    last_pricing_refresh = Instant::now();
+                }
+                Err(e) => log::warn!("Failed to refresh pricing: {}", e),
             }
-        };
+        }
 
         let summary = build_usage_summary(&usage_data, &provider_days, &pricing_map);
-
-        // Drop pricing_map immediately after use to free memory (it can be 100+ MB)
-        drop(pricing_map);
 
         // Extract only the data needed for rendering to minimize memory usage
         let rows_data = summary.rows;
@@ -289,6 +305,13 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
         // Drop heavy data structures after rendering to free memory immediately
         drop(rows_data);
         drop(provider_rows);
+
+        // Hand any arena-held free pages back to the OS. The refresh cycle
+        // just allocated and dropped a lot of small objects (per-file parse
+        // buffers, per-model hashmaps, ratatui row vectors); without this
+        // call glibc keeps them as internal free lists and RSS climbs by
+        // ~6 MB every refresh on a 219-session directory.
+        crate::utils::release_freed_heap();
 
         match handle_input()? {
             InputAction::Quit => break,

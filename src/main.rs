@@ -25,6 +25,11 @@ use vibe_coding_tracker::utils::extract_token_counts;
 use vibe_coding_tracker::{analyze_jsonl_file, get_version_info};
 
 fn main() -> Result<()> {
+    // Cap per-thread glibc arenas and pin the trim threshold before any
+    // allocation happens under a Rayon worker. See `tune_system_allocator`
+    // for why this matters on long TUI sessions.
+    vibe_coding_tracker::utils::tune_system_allocator();
+
     env_logger::init();
 
     let cli = Cli::parse();

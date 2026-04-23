@@ -92,6 +92,14 @@ zip = "5.1"
 # Lazy static initialization
 once_cell = "1.20"
 
+# For libc::malloc_trim on Linux — the TUI refresh loop churns a lot of
+# short-lived small allocations (219-file JSONL re-parse every 10 s), and
+# glibc's default heap shrink policy leaves ~6 MB of arena-side fragmentation
+# behind every cycle. Calling `malloc_trim(0)` at the end of a refresh
+# returns those unused pages to the OS and stabilises RSS.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 # Fast HashMap implementation with serde support
 ahash = { version = "0.8", features = ["serde"] }
 

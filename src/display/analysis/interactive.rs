@@ -331,6 +331,9 @@ pub fn display_analysis_interactive(
         drop(rows_data);
         drop(provider_rows);
 
+        // Return arena free lists to the OS — see `release_freed_heap` docs.
+        crate::utils::release_freed_heap();
+
         // Handle input with timeout
         match handle_input()? {
             InputAction::Quit => break,
