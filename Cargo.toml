@@ -62,7 +62,7 @@ reqwest = { version = "0.12", default-features = false, features = [
 strsim = "0.11"
 
 # Parallel processing
-rayon = "1.10"
+rayon = "1.12"
 
 # Fast integer formatting
 itoa = "1.0"
