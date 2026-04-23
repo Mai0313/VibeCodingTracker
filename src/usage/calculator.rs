@@ -233,7 +233,7 @@ fn merge_usage_values(existing: &mut Value, new: &Value) {
     use crate::utils::{accumulate_i64_fields, accumulate_nested_object};
 
     if let (Some(existing_obj), Some(new_obj)) = (existing.as_object_mut(), new.as_object()) {
-        // Handle Claude/Gemini format (has input_tokens)
+        // Handle Claude/Gemini/Copilot format (has input_tokens)
         if existing_obj.contains_key("input_tokens") {
             accumulate_i64_fields(
                 existing_obj,
@@ -243,7 +243,14 @@ fn merge_usage_values(existing: &mut Value, new: &Value) {
                     "cache_creation_input_tokens",
                     "cache_read_input_tokens",
                     "output_tokens",
+                    // Gemini `thoughts_tokens` and Copilot's normalised
+                    // `reasoning_output_tokens` both carry the same
+                    // reasoning-budget semantics and must accumulate so
+                    // cross-provider aggregation in `usage` doesn't drop
+                    // the thinking-time tokens the model was actually
+                    // billed for.
                     "thoughts_tokens",
+                    "reasoning_output_tokens",
                     "tool_tokens",
                     "total_tokens",
                 ],

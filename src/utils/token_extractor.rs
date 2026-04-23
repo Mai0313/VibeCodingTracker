@@ -10,10 +10,18 @@ use serde_json::Value;
 ///
 /// Invariant: `cache_creation == cache_creation_5m + cache_creation_1h` when
 /// the split data is available.
+///
+/// `reasoning_tokens` carries the model's "thinking" budget emitted as part
+/// of the assistant turn but billed separately from user-visible output.
+/// Populated by Gemini (`thoughts_tokens`), Codex
+/// (`reasoning_output_tokens`), and Copilot (`reasoning_output_tokens`
+/// after `copilot_analyzer` normalises it). Claude has no equivalent and
+/// leaves this at 0.
 #[derive(Debug, Default)]
 pub struct TokenCounts {
     pub input_tokens: i64,
     pub output_tokens: i64,
+    pub reasoning_tokens: i64,
     pub cache_read: i64,
     pub cache_creation: i64,
     pub cache_creation_5m: i64,
@@ -24,15 +32,22 @@ pub struct TokenCounts {
 /// Extracts token counts from usage data in any provider format
 ///
 /// Supports three formats:
-/// - Claude/Gemini: Direct fields like `input_tokens`, `output_tokens`
+/// - Claude/Gemini/Copilot: Direct fields like `input_tokens`, `output_tokens`
 /// - Codex: Nested `total_token_usage` object with different field names
+///
+/// Reasoning tokens (Gemini `thoughts_tokens`, Codex
+/// `reasoning_output_tokens`, Copilot `reasoning_output_tokens`) are no
+/// longer folded into `output_tokens`. Keeping them separate is what lets
+/// `calculate_cost` bill them at `output_cost_per_reasoning_token` for
+/// providers that publish a distinct reasoning rate (e.g. Gemini 2.5
+/// Flash, Perplexity Sonar Deep Research, dashscope/qwen-turbo).
 ///
 /// Returns normalized TokenCounts structure.
 pub fn extract_token_counts(usage: &Value) -> TokenCounts {
     let mut counts = TokenCounts::default();
 
     if let Some(usage_obj) = usage.as_object() {
-        // Claude/Gemini usage format
+        // Claude/Gemini/Copilot usage format (flat fields)
         if let Some(input) = usage_obj.get("input_tokens").and_then(|v| v.as_i64()) {
             counts.input_tokens = input;
         }
@@ -50,6 +65,20 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
             .and_then(|v| v.as_i64())
         {
             counts.cache_creation = cache_creation;
+        }
+
+        // Gemini writes reasoning budget as `thoughts_tokens`; Copilot's
+        // shutdown usage is normalised to `reasoning_output_tokens` by
+        // `copilot_analyzer::analyze_copilot_events`. Either key feeds the
+        // same bucket — we never see both on the same record.
+        if let Some(thoughts) = usage_obj.get("thoughts_tokens").and_then(|v| v.as_i64()) {
+            counts.reasoning_tokens = thoughts;
+        }
+        if let Some(reasoning) = usage_obj
+            .get("reasoning_output_tokens")
+            .and_then(|v| v.as_i64())
+        {
+            counts.reasoning_tokens = reasoning;
         }
 
         // Claude Code records cache_creation split by TTL:
@@ -82,13 +111,15 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
                 counts.input_tokens = input;
             }
             if let Some(output) = total_usage.get("output_tokens").and_then(|v| v.as_i64()) {
-                counts.output_tokens += output;
+                // Codex already accumulates across turns, so replace instead
+                // of adding — the value is the running total for the session.
+                counts.output_tokens = output;
             }
             if let Some(reasoning) = total_usage
                 .get("reasoning_output_tokens")
                 .and_then(|v| v.as_i64())
             {
-                counts.output_tokens += reasoning;
+                counts.reasoning_tokens = reasoning;
             }
             if let Some(cache_read) = total_usage
                 .get("cached_input_tokens")
@@ -97,14 +128,23 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
                 counts.cache_read = cache_read;
             }
             if let Some(total) = total_usage.get("total_tokens").and_then(|v| v.as_i64()) {
-                counts.total = total;
-                return counts; // If total is available, use it directly
+                // Codex `total_tokens` = input + output and excludes
+                // `reasoning_output_tokens` — the provider bills reasoning
+                // separately, so the published total understates the
+                // amount of tokens the caller is actually paying for. Add
+                // reasoning here so the summary row stays consistent with
+                // what `calculate_cost` charges for.
+                counts.total = total + counts.reasoning_tokens;
+                return counts;
             }
         }
 
         // Calculate total if not provided
-        counts.total =
-            counts.input_tokens + counts.output_tokens + counts.cache_read + counts.cache_creation;
+        counts.total = counts.input_tokens
+            + counts.output_tokens
+            + counts.reasoning_tokens
+            + counts.cache_read
+            + counts.cache_creation;
     }
 
     counts
@@ -194,5 +234,68 @@ mod tests {
         assert_eq!(c.cache_creation_5m, 0);
         assert_eq!(c.cache_creation_1h, 0);
         assert_eq!(c.cache_read, 200);
+    }
+
+    #[test]
+    fn gemini_thoughts_tokens_populate_reasoning_bucket() {
+        // Drives Gemini 2.5 flash pricing — thoughts_tokens must reach the
+        // reasoning bucket instead of being silently dropped or bundled
+        // into output.
+        let usage = json!({
+            "input_tokens": 13_906,
+            "output_tokens": 185,
+            "cache_read_input_tokens": 0,
+            "thoughts_tokens": 306,
+            "tool_tokens": 0,
+            "total_tokens": 14_397
+        });
+        let c = extract_token_counts(&usage);
+        assert_eq!(c.input_tokens, 13_906);
+        assert_eq!(c.output_tokens, 185);
+        assert_eq!(c.reasoning_tokens, 306);
+        // Our recomputed total includes reasoning (tool_tokens are not
+        // accounted for — we never bill against them).
+        assert_eq!(c.total, 13_906 + 185 + 306);
+    }
+
+    #[test]
+    fn codex_reasoning_is_separated_from_output() {
+        // Mimics a real Codex `event_msg` record mid-session.
+        let usage = json!({
+            "total_token_usage": {
+                "input_tokens": 5_645,
+                "cached_input_tokens": 5_504,
+                "output_tokens": 810,
+                "reasoning_output_tokens": 640,
+                "total_tokens": 6_455
+            }
+        });
+        let c = extract_token_counts(&usage);
+        assert_eq!(c.input_tokens, 5_645);
+        assert_eq!(c.cache_read, 5_504);
+        assert_eq!(
+            c.output_tokens, 810,
+            "reasoning must no longer fold into output_tokens"
+        );
+        assert_eq!(c.reasoning_tokens, 640);
+        // Codex `total_tokens` excludes reasoning, so `total` ≥ published total.
+        assert_eq!(c.total, 6_455 + 640);
+    }
+
+    #[test]
+    fn copilot_reasoning_output_tokens_populate_reasoning_bucket() {
+        // After `copilot_analyzer` normalisation, Copilot sessions use the
+        // same flat `reasoning_output_tokens` key as Codex's nested one.
+        let usage = json!({
+            "input_tokens": 2_000,
+            "output_tokens": 300,
+            "cache_read_input_tokens": 100,
+            "cache_creation_input_tokens": 0,
+            "reasoning_output_tokens": 150
+        });
+        let c = extract_token_counts(&usage);
+        assert_eq!(c.output_tokens, 300);
+        assert_eq!(c.reasoning_tokens, 150);
+        assert_eq!(c.total, 2_000 + 300 + 150 + 100);
     }
 }
