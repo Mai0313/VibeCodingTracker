@@ -1,9 +1,9 @@
-use crate::analysis::analyzer::analyze_jsonl_file_typed_with_mode;
+use crate::analysis::analyzer::analyze_session_file_typed_as;
 use crate::analysis::common_state::AnalysisMode;
 use crate::cache::global_cache;
 use crate::cli::TimeRange;
 use crate::constants::{FastHashMap, capacity};
-use crate::models::{CodeAnalysis, ProviderActiveDays};
+use crate::models::{CodeAnalysis, ExtensionType, ProviderActiveDays};
 use crate::utils::{
     collect_files_with_dates, is_claude_session_file, is_gemini_chat_file, is_json_file,
 };
@@ -54,6 +54,7 @@ pub fn analyze_all_sessions(time_range: TimeRange) -> Result<AnalysisData> {
         // and `<session>/subagents/agent-*.jsonl` logs are both collected here.
         process_analysis_directory(
             &paths.claude_session_dir,
+            ExtensionType::ClaudeCode,
             &mut aggregated,
             &mut claude_dates,
             is_claude_session_file,
@@ -64,6 +65,7 @@ pub fn analyze_all_sessions(time_range: TimeRange) -> Result<AnalysisData> {
     if paths.codex_session_dir.exists() {
         process_analysis_directory(
             &paths.codex_session_dir,
+            ExtensionType::Codex,
             &mut aggregated,
             &mut codex_dates,
             is_json_file,
@@ -74,6 +76,7 @@ pub fn analyze_all_sessions(time_range: TimeRange) -> Result<AnalysisData> {
     if paths.copilot_session_dir.exists() {
         process_analysis_directory(
             &paths.copilot_session_dir,
+            ExtensionType::Copilot,
             &mut aggregated,
             &mut copilot_dates,
             is_json_file,
@@ -84,6 +87,7 @@ pub fn analyze_all_sessions(time_range: TimeRange) -> Result<AnalysisData> {
     if paths.gemini_session_dir.exists() {
         process_analysis_directory(
             &paths.gemini_session_dir,
+            ExtensionType::Gemini,
             &mut aggregated,
             &mut gemini_dates,
             is_gemini_chat_file,
@@ -150,6 +154,7 @@ pub fn analyze_all_sessions_by_provider(time_range: TimeRange) -> Result<Provide
     if paths.claude_session_dir.exists() {
         process_full_analysis_directory(
             &paths.claude_session_dir,
+            ExtensionType::ClaudeCode,
             &mut claude_results,
             is_claude_session_file,
             time_range,
@@ -160,6 +165,7 @@ pub fn analyze_all_sessions_by_provider(time_range: TimeRange) -> Result<Provide
     if paths.codex_session_dir.exists() {
         process_full_analysis_directory(
             &paths.codex_session_dir,
+            ExtensionType::Codex,
             &mut codex_results,
             is_json_file,
             time_range,
@@ -170,6 +176,7 @@ pub fn analyze_all_sessions_by_provider(time_range: TimeRange) -> Result<Provide
     if paths.copilot_session_dir.exists() {
         process_full_analysis_directory(
             &paths.copilot_session_dir,
+            ExtensionType::Copilot,
             &mut copilot_results,
             is_json_file,
             time_range,
@@ -180,6 +187,7 @@ pub fn analyze_all_sessions_by_provider(time_range: TimeRange) -> Result<Provide
     if paths.gemini_session_dir.exists() {
         process_full_analysis_directory(
             &paths.gemini_session_dir,
+            ExtensionType::Gemini,
             &mut gemini_results,
             is_gemini_chat_file,
             time_range,
@@ -196,6 +204,7 @@ pub fn analyze_all_sessions_by_provider(time_range: TimeRange) -> Result<Provide
 
 fn process_full_analysis_directory<P, F>(
     dir: P,
+    provider: ExtensionType,
     results: &mut Vec<Arc<CodeAnalysis>>,
     filter_fn: F,
     time_range: TimeRange,
@@ -207,12 +216,13 @@ where
     let dir = dir.as_ref();
     let files = collect_files_with_dates(dir, filter_fn, time_range)?;
 
-    // Parallel parse through the global cache; each worker hands back an
-    // `Arc<CodeAnalysis>` pointing at the shared typed analysis.
+    // Parallel parse through the global cache. The provider is fixed by the
+    // source directory, so the cache dispatches to the right analyzer without
+    // re-inspecting the file's contents.
     let analyzed: Vec<Arc<CodeAnalysis>> = files
         .par_iter()
         .filter_map(
-            |file_info| match global_cache().get_or_parse(&file_info.path) {
+            |file_info| match global_cache().get_or_parse_as(&file_info.path, provider) {
                 Ok(analysis_arc) => Some(analysis_arc),
                 Err(e) => {
                     eprintln!(
@@ -232,6 +242,7 @@ where
 
 fn process_analysis_directory<P, F>(
     dir: P,
+    provider: ExtensionType,
     aggregated: &mut FastHashMap<String, AggregatedAnalysisRow>,
     unique_dates: &mut HashSet<String>,
     filter_fn: F,
@@ -247,11 +258,12 @@ where
     // Aggregated analysis only reads counters — no need for `write_file_details`
     // bodies or `edit_file_details` strings. Run in `UsageOnly` and skip the
     // global cache so each file's analysis drops as soon as we've scraped the
-    // tool counts and usage totals.
+    // tool counts and usage totals. Provider is fixed by the source directory.
     let file_aggregations: Vec<(String, CodeAnalysis)> = files
         .par_iter()
         .filter_map(|file_info| {
-            match analyze_jsonl_file_typed_with_mode(&file_info.path, AnalysisMode::UsageOnly) {
+            match analyze_session_file_typed_as(&file_info.path, provider, AnalysisMode::UsageOnly)
+            {
                 Ok(analysis) => Some((file_info.modified_date.clone(), analysis)),
                 Err(e) => {
                     eprintln!(

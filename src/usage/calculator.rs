@@ -1,7 +1,7 @@
-use crate::analysis::{AnalysisMode, analyze_jsonl_file_typed_with_mode};
+use crate::analysis::{AnalysisMode, analyze_session_file_typed_as};
 use crate::cli::TimeRange;
 use crate::constants::{FastHashMap, capacity};
-use crate::models::{CodeAnalysis, ProviderActiveDays, UsageResult};
+use crate::models::{CodeAnalysis, ExtensionType, ProviderActiveDays, UsageResult};
 use crate::utils::{
     collect_files_with_dates, is_claude_session_file, is_gemini_chat_file, is_json_file,
     resolve_paths,
@@ -56,6 +56,7 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
         // and `<session>/subagents/agent-*.jsonl` logs are both collected here.
         process_usage_directory(
             &paths.claude_session_dir,
+            ExtensionType::ClaudeCode,
             &mut result,
             &mut claude_dates,
             is_claude_session_file,
@@ -66,6 +67,7 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
     if paths.codex_session_dir.exists() {
         process_usage_directory(
             &paths.codex_session_dir,
+            ExtensionType::Codex,
             &mut result,
             &mut codex_dates,
             is_json_file,
@@ -76,6 +78,7 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
     if paths.copilot_session_dir.exists() {
         process_usage_directory(
             &paths.copilot_session_dir,
+            ExtensionType::Copilot,
             &mut result,
             &mut copilot_dates,
             is_json_file,
@@ -86,6 +89,7 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
     if paths.gemini_session_dir.exists() {
         process_usage_directory(
             &paths.gemini_session_dir,
+            ExtensionType::Gemini,
             &mut result,
             &mut gemini_dates,
             is_gemini_chat_file,
@@ -115,6 +119,7 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
 
 fn process_usage_directory<P, F>(
     dir: P,
+    provider: ExtensionType,
     result: &mut UsageResult,
     unique_dates: &mut HashSet<String>,
     filter_fn: F,
@@ -128,14 +133,19 @@ where
     let files = collect_files_with_dates(dir, filter_fn, time_range)?;
 
     // Parse each file directly in `UsageOnly` mode, extract the small
-    // per-model usage map, then drop the analysis. We deliberately bypass the
-    // global file cache here: the `usage` path never needs the heavy
-    // `write_file_details` / `edit_file_details` payloads, so caching the
-    // full analysis would waste the memory win from `UsageOnly`.
+    // per-model usage map, then drop the analysis. The provider is fixed by
+    // the source directory — we do not re-detect from file contents, which
+    // would mis-classify Claude sessions whose first line is a metadata
+    // sentinel (`permission-mode`, `file-history-snapshot`) and silently drop
+    // their usage. We also deliberately bypass the global file cache here:
+    // the `usage` path never needs the heavy `write_file_details` /
+    // `edit_file_details` payloads, so caching the full analysis would waste
+    // the memory win from `UsageOnly`.
     let file_results: Vec<(String, FastHashMap<String, Value>)> = files
         .par_iter()
         .filter_map(|file_info| {
-            match analyze_jsonl_file_typed_with_mode(&file_info.path, AnalysisMode::UsageOnly) {
+            match analyze_session_file_typed_as(&file_info.path, provider, AnalysisMode::UsageOnly)
+            {
                 Ok(analysis) => {
                     let conversation_usage = extract_conversation_usage_from_analysis(&analysis);
                     Some((file_info.modified_date.clone(), conversation_usage))
