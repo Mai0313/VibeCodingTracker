@@ -113,17 +113,24 @@ pub fn analyze_all_sessions(time_range: TimeRange) -> Result<AnalysisData> {
     })
 }
 
-/// Complete CodeAnalysis results organized by AI provider
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Complete CodeAnalysis results organized by AI provider.
+///
+/// Each record is stored as an `Arc<Value>` so the parsed analysis is shared
+/// with the global file cache — we never deep-clone the whole tree to ferry
+/// results out of the worker pool. `serde_json` serialises `Arc<Value>` as
+/// the underlying value, so the emitted JSON is unchanged. The struct is
+/// output-only, which is why it does not derive `Deserialize` (that would
+/// require serde's `rc` feature and is not needed here).
+#[derive(Debug, Clone, Serialize)]
 pub struct ProviderGroupedAnalysis {
     #[serde(rename = "Claude-Code")]
-    pub claude: Vec<Value>,
+    pub claude: Vec<Arc<Value>>,
     #[serde(rename = "Codex")]
-    pub codex: Vec<Value>,
+    pub codex: Vec<Arc<Value>>,
     #[serde(rename = "Copilot-CLI")]
-    pub copilot: Vec<Value>,
+    pub copilot: Vec<Arc<Value>>,
     #[serde(rename = "Gemini")]
-    pub gemini: Vec<Value>,
+    pub gemini: Vec<Arc<Value>>,
 }
 
 /// Analyzes all session files and returns complete records grouped by provider
@@ -133,10 +140,10 @@ pub struct ProviderGroupedAnalysis {
 pub fn analyze_all_sessions_by_provider(time_range: TimeRange) -> Result<ProviderGroupedAnalysis> {
     let paths = crate::utils::resolve_paths()?;
 
-    let mut claude_results: Vec<Value> = Vec::new();
-    let mut codex_results: Vec<Value> = Vec::new();
-    let mut copilot_results: Vec<Value> = Vec::new();
-    let mut gemini_results: Vec<Value> = Vec::new();
+    let mut claude_results: Vec<Arc<Value>> = Vec::new();
+    let mut codex_results: Vec<Arc<Value>> = Vec::new();
+    let mut copilot_results: Vec<Arc<Value>> = Vec::new();
+    let mut gemini_results: Vec<Arc<Value>> = Vec::new();
 
     // Process Claude sessions (including subagents/ sublogs)
     if paths.claude_session_dir.exists() {
@@ -188,7 +195,7 @@ pub fn analyze_all_sessions_by_provider(time_range: TimeRange) -> Result<Provide
 
 fn process_full_analysis_directory<P, F>(
     dir: P,
-    results: &mut Vec<Value>,
+    results: &mut Vec<Arc<Value>>,
     filter_fn: F,
     time_range: TimeRange,
 ) -> Result<()>
@@ -199,8 +206,8 @@ where
     let dir = dir.as_ref();
     let files = collect_files_with_dates(dir, filter_fn, time_range)?;
 
-    // Process files in parallel with caching for better performance
-    // Use Arc directly to avoid deep cloning large JSON values
+    // Parallel parse through the global cache; each worker hands back an
+    // `Arc<Value>` pointing at the shared analysis — no deep clone needed.
     let analyzed: Vec<Arc<Value>> = files
         .par_iter()
         .filter_map(
@@ -218,8 +225,7 @@ where
         )
         .collect();
 
-    // Only clone when serializing (unavoidable, but done once at the end)
-    results.extend(analyzed.iter().map(|arc| (**arc).clone()));
+    results.extend(analyzed);
     Ok(())
 }
 
