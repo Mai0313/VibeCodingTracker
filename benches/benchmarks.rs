@@ -1,4 +1,5 @@
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 use std::path::PathBuf;
 use vibe_coding_tracker::constants::FastHashMap;
 use vibe_coding_tracker::pricing::{ModelPricingMap, normalize_model_name};
