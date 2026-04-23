@@ -4,15 +4,12 @@ use crate::analysis::claude_analyzer::{
 };
 use crate::analysis::codex_analyzer::analyze_codex_conversations_with_mode;
 use crate::analysis::common_state::AnalysisMode;
-use crate::analysis::copilot_analyzer::{
-    analyze_copilot_conversations_with_mode, analyze_copilot_events,
-};
+use crate::analysis::copilot_analyzer::analyze_copilot_events;
 use crate::analysis::detector::{classify_records, detect_extension_type};
 use crate::analysis::gemini_analyzer::analyze_gemini_events;
 use crate::constants::buffer;
 use crate::models::{
-    ClaudeCodeLog, CodeAnalysis, CodexLog, CopilotEvent, CopilotSession, ExtensionType,
-    GeminiSession,
+    ClaudeCodeLog, CodeAnalysis, CodexLog, CopilotEvent, ExtensionType, GeminiSession,
 };
 use crate::utils::{get_current_user, get_machine_id, read_json, read_jsonl};
 use anyhow::{Context, Result};
@@ -64,8 +61,9 @@ pub fn analyze_jsonl_file_typed_with_mode<P: AsRef<Path>>(
         return Ok(analysis);
     }
 
-    // Fallback: pretty-printed single-object JSON (Gemini/Copilot) or anything
-    // the streaming path could not peek. Keeps legacy behaviour intact.
+    // Fallback for anything the streaming path could not peek (e.g. a
+    // hand-edited file whose first line is not valid JSON). Every provider
+    // we support writes JSONL today, so this path is rarely exercised.
     let data = match read_jsonl(path) {
         Ok(data) => data,
         Err(_) => read_json(path)?,
@@ -99,7 +97,8 @@ pub fn analyze_session_file_typed_as<P: AsRef<Path>>(
         return Ok(analysis);
     }
 
-    // Pretty-printed JSON dumps (Gemini/Copilot exports) or empty files.
+    // Fallback for empty files or anything the streaming peek could not
+    // parse on line one.
     let data = match read_jsonl(path) {
         Ok(data) => data,
         Err(_) => read_json(path)?,
@@ -235,12 +234,9 @@ fn read_next_non_empty_line<R: BufRead>(reader: &mut R) -> Result<Option<String>
 
 /// Streams the rest of the file, prepending any already-parsed records.
 ///
-/// Claude/Codex paths feed the buffered records through the typed shape and
-/// then chain the remainder of the reader. Copilot/Gemini are pretty-printed
-/// single-object formats — they should never reach this path in practice
-/// (their first line fails JSONL parse, sending the caller down the
-/// `read_json` fallback), but the arms are kept for completeness so a hand-
-/// crafted one-line JSON fixture still works.
+/// Every supported provider today writes a line-delimited JSONL stream, so
+/// all four arms feed the buffered records through the typed shape and
+/// then chain the remainder of the reader.
 fn dispatch_streaming_buffered(
     ext: ExtensionType,
     buffered: Vec<Value>,
@@ -270,13 +266,10 @@ fn dispatch_streaming_buffered(
             analyze_codex_conversations_with_mode(&logs, mode)
         }
         ExtensionType::Copilot => {
-            // Modern Copilot CLI emits one event per line under
+            // Copilot CLI emits one event per line under
             // `session-state/<uuid>/events.jsonl`. The streaming path sees
-            // this as a sequence of parseable `Value`s; the very first line
-            // is `type == "session.start"`, never a standalone single-
-            // object session dump (which is multi-line pretty-printed JSON
-            // and would fail first-line parse, falling back to
-            // `dispatch_by_vec`).
+            // this as a sequence of parseable `Value`s whose very first
+            // line is `type == "session.start"`.
             let buffered_events = buffered
                 .into_iter()
                 .filter_map(|v| serde_json::from_value::<CopilotEvent>(v).ok());
@@ -352,19 +345,11 @@ fn dispatch_by_vec(
                 .collect();
             analyze_codex_conversations_with_mode(&logs, mode)?
         }
-        ExtensionType::Copilot => {
-            // Legacy single-object Copilot dumps (`history-session-state/<id>.json`)
-            // reach this path when the streaming parser bails on a
-            // pretty-printed file. Modern `events.jsonl` sessions always
-            // stay on the streaming path.
-            let session: CopilotSession = serde_json::from_value(data[0].clone())?;
-            analyze_copilot_conversations_with_mode(session, mode)?
-        }
-        ExtensionType::Gemini => {
-            // Gemini only supports the JSONL event stream. A pretty-printed
-            // single-object file would reach this branch, but there is no
-            // analyzer for that shape anymore — return an empty analysis
-            // instead of silently mis-parsing.
+        ExtensionType::Copilot | ExtensionType::Gemini => {
+            // Both providers only support the JSONL event stream. A file
+            // that falls through to this branch (e.g. a stray pretty-
+            // printed export) has no analyzer for its shape — return an
+            // empty analysis instead of silently mis-parsing.
             empty_analysis()
         }
     };

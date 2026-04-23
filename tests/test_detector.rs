@@ -64,8 +64,12 @@ fn test_detect_gemini_rejects_legacy_single_object() {
 }
 
 #[test]
-fn test_detect_copilot_format() {
-    // Legacy single-object dump with sessionId, startTime, and timeline
+fn test_detect_copilot_rejects_legacy_single_object() {
+    // Older Copilot CLI releases wrote a single-object dump with
+    // `sessionId` + `startTime` + `timeline`. We no longer support that
+    // shape — the detector should fall through to the default (Codex)
+    // rather than mis-routing the file to the JSONL analyzer, which
+    // would silently produce an empty analysis.
     let data = vec![json!({
         "sessionId": "test-session",
         "startTime": 1234567890,
@@ -73,7 +77,7 @@ fn test_detect_copilot_format() {
     })];
 
     let result = detect_extension_type(&data).unwrap();
-    assert_eq!(result, ExtensionType::Copilot);
+    assert_ne!(result, ExtensionType::Copilot);
 }
 
 #[test]
@@ -310,12 +314,19 @@ fn test_detect_gemini_with_extra_fields() {
 
 #[test]
 fn test_detect_copilot_with_extra_fields() {
-    // Test that Copilot detection works even with extra fields
+    // Unknown extra fields on the Copilot `session.start` event must not
+    // stop detection — the classifier only relies on
+    // `type == "session.start"` + `data.producer` starting with `copilot`.
     let data = vec![json!({
-        "sessionId": "test",
-        "startTime": 123,
-        "timeline": [],
-        "extraField": "extra"
+        "type": "session.start",
+        "data": {
+            "sessionId": "test",
+            "producer": "copilot-agent",
+            "extraField": "extra"
+        },
+        "id": "abc",
+        "timestamp": "2026-04-23T00:00:00Z",
+        "extraTop": 42
     })];
 
     let result = detect_extension_type(&data).unwrap();
@@ -341,11 +352,15 @@ fn test_detect_partial_gemini_fields() {
 
 #[test]
 fn test_detect_partial_copilot_fields() {
-    // Test that partial Copilot fields don't trigger false positive
+    // A `session.start` event without a copilot-flavoured producer must
+    // not be classified as Copilot — guards against false positives when
+    // other providers ever adopt the same discriminator.
     let data = vec![json!({
-        "sessionId": "test",
-        "startTime": 123
-        // missing "timeline" field
+        "type": "session.start",
+        "data": {
+            "sessionId": "test"
+            // no `producer` field at all
+        }
     })];
 
     let result = detect_extension_type(&data).unwrap();

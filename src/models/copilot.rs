@@ -3,80 +3,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 // =============================================================================
-// Legacy single-object Copilot CLI format
-// =============================================================================
-//
-// Older Copilot CLI releases wrote each session as a single pretty-printed
-// JSON object under `~/.copilot/history-session-state/<sessionId>.json`.
-// These types describe that legacy shape; they are still used when callers
-// hand `analyze_jsonl_file` an old dump directly. See the *modern* layout
-// below for the current event-stream format.
-
-/// Top-level structure for legacy Copilot CLI session file
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CopilotSession {
-    pub session_id: String,
-    pub start_time: String,
-    #[serde(default)]
-    pub chat_messages: Vec<Value>,
-    #[serde(default)]
-    pub timeline: Vec<TimelineEvent>,
-}
-
-/// Individual event in the legacy timeline
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TimelineEvent {
-    pub id: String,
-    pub timestamp: String,
-    #[serde(rename = "type")]
-    pub event_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub call_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_title: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub intention_summary: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub arguments: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<Value>,
-}
-
-/// Helper struct for parsing `str_replace_editor` arguments in the legacy format
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StrReplaceEditorArgs {
-    pub command: String,
-    pub path: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub view_range: Option<Vec<i64>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub old_str: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub new_str: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub file_text: Option<String>,
-}
-
-/// Helper struct for parsing legacy `bash` arguments
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BashArgs {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub command: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-}
-
-// =============================================================================
-// Modern Copilot CLI `events.jsonl` format
+// Copilot CLI `events.jsonl` format
 // =============================================================================
 //
 // Current Copilot CLI writes `~/.copilot/session-state/<sessionId>/events.jsonl`
@@ -85,8 +12,12 @@ pub struct BashArgs {
 // `session.start`, model switches from `session.model_change`, tool calls
 // from the `tool.execution_start` / `tool.execution_complete` pair, and
 // authoritative per-model token usage from `session.shutdown.modelMetrics`.
+//
+// Earlier Copilot CLI releases wrote a single pretty-printed JSON object
+// under `~/.copilot/history-session-state/<sessionId>.json` with no token
+// accounting at all; that layout is no longer supported.
 
-/// Single line of the modern Copilot `events.jsonl` stream.
+/// Single line of the Copilot `events.jsonl` stream.
 ///
 /// `data` intentionally stays as raw [`Value`] — every event type has a
 /// different payload, so the analyzer branches on `event_type` and then

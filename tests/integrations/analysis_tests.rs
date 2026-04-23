@@ -55,7 +55,7 @@ fn test_single_file_analysis_codex() {
 
 #[test]
 fn test_single_file_analysis_copilot() {
-    let input_file = PathBuf::from("examples/test_conversation_copilot.json");
+    let input_file = PathBuf::from("examples/test_conversation_copilot.jsonl");
 
     if !input_file.exists() {
         eprintln!("Skipping test: example file not found");
@@ -72,7 +72,7 @@ fn test_single_file_analysis_copilot() {
 
 #[test]
 fn test_single_file_analysis_gemini() {
-    let input_file = PathBuf::from("examples/test_conversation_gemini.json");
+    let input_file = PathBuf::from("examples/test_conversation_gemini.jsonl");
 
     if !input_file.exists() {
         eprintln!("Skipping test: example file not found");

@@ -8,11 +8,10 @@ use serde_json::Value;
 /// - Gemini: first line is a session-meta record with `sessionId` and
 ///   `projectHash` fields but *no* `messages` array (legacy single-object
 ///   Gemini exports are no longer supported)
-/// - Copilot (legacy single-object): object with `sessionId`, `startTime`,
-///   and `timeline` fields
-/// - Copilot (current JSONL stream): first line is a
-///   `type == "session.start"` event whose `data.producer` field identifies
-///   a Copilot agent (e.g. `copilot-agent`, `copilot-cli`)
+/// - Copilot: first line is a `type == "session.start"` event whose
+///   `data.producer` field identifies a Copilot agent (e.g.
+///   `copilot-agent`, `copilot-cli`). Legacy single-object dumps under
+///   `~/.copilot/history-session-state/` are no longer supported.
 /// - Claude Code: contains `parentUuid` field in log entries
 /// - Codex: contains a record whose `type` is one of `session_meta`,
 ///   `turn_context`, `event_msg`, or `response_item` — **or** as a final
@@ -48,18 +47,6 @@ pub fn detect_extension_type(data: &[Value]) -> Result<ExtensionType> {
 /// a positive signal appears, so there is no arbitrary limit to the
 /// preamble length we tolerate.
 pub fn classify_records(data: &[Value]) -> Option<ExtensionType> {
-    // Legacy Copilot CLI single-object dump
-    // (`history-session-state/<id>.json`). Kept for backward compatibility
-    // with old user dumps; no recent Copilot CLI version writes this shape.
-    if data.len() == 1
-        && let Some(obj) = data[0].as_object()
-        && obj.contains_key("sessionId")
-        && obj.contains_key("startTime")
-        && obj.contains_key("timeline")
-    {
-        return Some(ExtensionType::Copilot);
-    }
-
     // JSONL stream: Gemini session-meta header line.
     //
     // Gemini CLI writes one event per line under `chats/`; the very first

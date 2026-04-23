@@ -172,7 +172,7 @@ pub fn is_gemini_session_file(path: &Path) -> bool {
 
 /// Filter for Copilot CLI session files
 ///
-/// Modern Copilot CLI stores each session as a directory under
+/// Copilot CLI stores each session as a directory under
 /// `~/.copilot/session-state/<sessionId>/` containing the event log
 /// (`events.jsonl`) plus sibling subdirectories for file snapshots
 /// (`rewind-snapshots/`, `files/`, `research/`, `checkpoints/`) and a
@@ -182,10 +182,8 @@ pub fn is_gemini_session_file(path: &Path) -> bool {
 /// and fail to parse.
 ///
 /// The historical single-file layout
-/// (`~/.copilot/history-session-state/<sessionId>.json`) is **not** matched
-/// by this filter — it lives under a different directory and is no longer
-/// produced by recent Copilot CLI versions. If you still have old dumps to
-/// analyze, run `vct analysis --path <file>` directly.
+/// (`~/.copilot/history-session-state/<sessionId>.json`) is not matched
+/// and no longer supported by the analyzer at all.
 pub fn is_copilot_session_file(path: &Path) -> bool {
     // Compare raw `OsStr` rather than going through `to_str()` so paths with
     // non-UTF-8 bytes elsewhere in the tree do not silently reject the file.

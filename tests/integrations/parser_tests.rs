@@ -202,7 +202,7 @@ fn test_codex_parser() {
 
 #[test]
 fn test_copilot_parser() {
-    let input_file = PathBuf::from("examples/test_conversation_copilot.json");
+    let input_file = PathBuf::from("examples/test_conversation_copilot.jsonl");
     let expected_file = PathBuf::from("examples/analysis_result_copilot.json");
 
     // Skip test if files don't exist
@@ -258,14 +258,81 @@ fn test_copilot_parser() {
     );
 }
 
-/// End-to-end smoke test for the Gemini JSONL parser using an inline fixture.
+#[test]
+fn test_gemini_parser() {
+    let input_file = PathBuf::from("examples/test_conversation_gemini.jsonl");
+    let expected_file = PathBuf::from("examples/analysis_result_gemini.json");
+
+    // Skip test if files don't exist
+    if !input_file.exists() {
+        eprintln!("Input file not found: {:?}", input_file);
+        return;
+    }
+
+    if !expected_file.exists() {
+        eprintln!("Expected result file not found: {:?}", expected_file);
+        return;
+    }
+
+    // Read expected result
+    let expected_content =
+        std::fs::read_to_string(&expected_file).expect("Failed to read expected result file");
+    let expected_json: Value =
+        serde_json::from_str(&expected_content).expect("Failed to parse expected result JSON");
+
+    // Analyze the input file
+    let actual_result = analyze_jsonl_file(&input_file);
+    assert!(
+        actual_result.is_ok(),
+        "Failed to analyze Gemini conversation: {:?}",
+        actual_result.err()
+    );
+
+    let actual_json = actual_result.unwrap();
+
+    // Compare results, ignoring specific fields. `folderPath` is included
+    // because Gemini session logs do not carry a cwd in the meta record, so
+    // the analyzer leaves it empty and the git-remote lookup falls back to
+    // the current working directory — both of which are environment-
+    // specific and will differ between CI and a local developer machine.
+    let ignore_fields = [
+        "insightsVersion",
+        "machineId",
+        "user",
+        "gitRemoteUrl",
+        "folderPath",
+    ];
+    let matches = compare_json_ignore_fields(&actual_json, &expected_json, &ignore_fields);
+
+    if !matches {
+        // Print detailed comparison for debugging
+        eprintln!("\n=== ACTUAL OUTPUT ===");
+        eprintln!(
+            "{}",
+            serde_json::to_string_pretty(&actual_json)
+                .unwrap_or_else(|_| "Invalid JSON".to_string())
+        );
+        eprintln!("\n=== EXPECTED OUTPUT ===");
+        eprintln!(
+            "{}",
+            serde_json::to_string_pretty(&expected_json)
+                .unwrap_or_else(|_| "Invalid JSON".to_string())
+        );
+    }
+
+    assert!(
+        matches,
+        "Gemini analysis output does not match expected result (ignoring insightsVersion, machineId, user, gitRemoteUrl, folderPath)"
+    );
+}
+
+/// Inline-fixture smoke test for the Gemini JSONL parser.
 ///
-/// The legacy single-object format (`chats/<session>.json` with an inline
-/// `messages` array) is no longer supported; we build a minimal JSONL stream
-/// on disk that exercises the modern event-stream code path — session meta
-/// line, ignored `user` / `info` events, a `$set` meta-update line the
-/// analyzer must silently skip, and one assistant `gemini` event carrying
-/// token usage plus a `toolCalls[]` entry for a `replace` edit.
+/// Complements `test_gemini_parser` (which uses a real-world session dump)
+/// by exercising narrow edge cases that the real fixture may not hit:
+/// ignored `user` / `info` events, a `$set` meta-update line the analyzer
+/// must silently skip, and one assistant `gemini` event carrying token
+/// usage plus a `toolCalls[]` entry for a `replace` edit.
 #[test]
 fn test_gemini_parser_jsonl() {
     use std::io::Write;

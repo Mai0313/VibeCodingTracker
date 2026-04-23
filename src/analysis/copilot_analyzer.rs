@@ -6,127 +6,10 @@ use anyhow::Result;
 use serde_json::{Value, json};
 
 // =============================================================================
-// Legacy single-object Copilot CLI sessions
+// Copilot CLI `events.jsonl` streaming parser
 // =============================================================================
 //
-// Historical `~/.copilot/history-session-state/<sessionId>.json` dumps have
-// a flat `timeline` of tool-call events and no token accounting at all.
-// The code below preserves that pipeline for backward compatibility — the
-// streaming parser for modern `events.jsonl` files lives further down.
-
-/// Analyze Copilot CLI conversations from a legacy single-object dump
-pub fn analyze_copilot_conversations(session: CopilotSession) -> Result<CodeAnalysis> {
-    analyze_copilot_conversations_with_mode(session, AnalysisMode::Full)
-}
-
-pub fn analyze_copilot_conversations_with_mode(
-    session: CopilotSession,
-    mode: AnalysisMode,
-) -> Result<CodeAnalysis> {
-    let mut state = AnalysisState::with_mode(mode);
-
-    // The legacy format carries no token accounting; seed a zero-usage
-    // entry under the generic `copilot` model so downstream pricing logic
-    // still has a row to attach to.
-    let mut conversation_usage: FastHashMap<String, Value> =
-        FastHashMap::with_capacity(capacity::MODELS_PER_SESSION);
-    conversation_usage.insert(
-        "copilot".to_string(),
-        json!({
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "cache_read_input_tokens": 0,
-            "cache_creation_input_tokens": 0
-        }),
-    );
-
-    for event in session.timeline {
-        if event.event_type != "tool_call_completed" {
-            continue;
-        }
-
-        let Some(tool_title) = &event.tool_title else {
-            continue;
-        };
-        let Some(arguments) = &event.arguments else {
-            continue;
-        };
-
-        let ts = parse_iso_timestamp(&event.timestamp);
-        if ts > state.last_ts {
-            state.last_ts = ts;
-        }
-
-        match tool_title.as_str() {
-            "str_replace_editor" => {
-                if let Ok(args) = serde_json::from_value::<StrReplaceEditorArgs>(arguments.clone())
-                {
-                    match args.command.as_str() {
-                        "view" => {
-                            let content = if let Some(view_range) = args.view_range {
-                                // Synthesize a newline-only string whose line
-                                // count matches the requested range so the
-                                // read-line counter gets a plausible value.
-                                let start = view_range.first().copied().unwrap_or(0);
-                                let end = view_range.get(1).copied().unwrap_or(0);
-                                let line_count = (end - start + 1).max(0) as usize;
-                                "\n".repeat(line_count.saturating_sub(1))
-                            } else if let Some(result) = &event.result
-                                && let Some(log) = result.get("log").and_then(|l| l.as_str())
-                            {
-                                log.to_string()
-                            } else {
-                                String::new()
-                            };
-
-                            state.add_read_detail(&args.path, &content, ts);
-                        }
-                        "str_replace" => {
-                            let old_str = args.old_str.as_deref().unwrap_or("");
-                            let new_str = args.new_str.as_deref().unwrap_or("");
-                            state.add_edit_detail(&args.path, old_str, new_str, ts);
-                        }
-                        "create" => {
-                            let content = args.file_text.as_deref().unwrap_or("");
-                            state.add_write_detail(&args.path, content, ts);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            "bash" => {
-                if let Ok(args) = serde_json::from_value::<BashArgs>(arguments.clone()) {
-                    let command = args.command.as_deref().unwrap_or("");
-                    let description = args.description.as_deref().unwrap_or("");
-                    state.add_run_command(command, description, ts);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    state.task_id = session.session_id;
-
-    if state.git_remote.is_empty() {
-        state.git_remote = get_git_remote_url(&state.folder_path);
-    }
-
-    let record = state.into_record(conversation_usage);
-
-    Ok(CodeAnalysis {
-        user: String::new(),
-        extension_name: String::from("Copilot-CLI"),
-        insights_version: String::new(),
-        machine_id: String::new(),
-        records: vec![record],
-    })
-}
-
-// =============================================================================
-// Modern Copilot CLI `events.jsonl` streaming parser
-// =============================================================================
-//
-// The new layout stores every session as
+// Copilot CLI stores every session as
 // `~/.copilot/session-state/<sessionId>/events.jsonl`. Each line is a single
 // `CopilotEvent` whose `event_type` decides how to interpret `data`:
 //
@@ -140,8 +23,13 @@ pub fn analyze_copilot_conversations_with_mode(
 //   assistant.turn_start/end → turn bookkeeping; ignored
 //   tool.execution_start     → paired with the matching complete event
 //   tool.execution_complete  → fires the analyzer's file-op handlers
+//
+// Legacy single-object dumps under `~/.copilot/history-session-state/` are
+// not supported — users with old dumps will see them fall through to the
+// Codex default in `detect_extension_type` and fail cleanly rather than
+// being mis-parsed.
 
-/// Analyze Copilot CLI conversations from the modern JSONL event stream.
+/// Analyze Copilot CLI conversations from the JSONL event stream.
 pub fn analyze_copilot_events<I>(events: I, mode: AnalysisMode) -> Result<CodeAnalysis>
 where
     I: IntoIterator<Item = CopilotEvent>,
@@ -336,8 +224,8 @@ fn dispatch_tool(
 
     match pending.tool_name.as_str() {
         // Current Copilot CLI exposes `view` for reads. Historical versions
-        // used `str_replace_editor` with `command == "view"` — that path is
-        // still handled by the legacy analyzer above.
+        // used `str_replace_editor` with `command == "view"`, which we no
+        // longer attempt to parse.
         "view" | "read_file" => {
             let Some(path) = args.get("path").and_then(|p| p.as_str()) else {
                 return;
