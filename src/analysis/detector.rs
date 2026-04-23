@@ -14,12 +14,40 @@ use serde_json::Value;
 ///   `type == "session.start"` event whose `data.producer` field identifies
 ///   a Copilot agent (e.g. `copilot-agent`, `copilot-cli`)
 /// - Claude Code: contains `parentUuid` field in log entries
-/// - Codex: default fallback if no other markers found
+/// - Codex: contains a record whose `type` is one of `session_meta`,
+///   `turn_context`, `event_msg`, or `response_item` — **or** as a final
+///   fallback when no other marker is present
+///
+/// Callers walking a streaming source should prefer
+/// [`classify_records`] instead: it returns `None` when the records seen
+/// so far are indeterminate, letting the caller decide whether to read more
+/// before committing to a provider (see `analyzer::stream_analyze_autodetect`).
 pub fn detect_extension_type(data: &[Value]) -> Result<ExtensionType> {
     if data.is_empty() {
         bail!("Cannot detect extension type from empty data");
     }
 
+    Ok(classify_records(data).unwrap_or(ExtensionType::Codex))
+}
+
+/// Streaming-friendly classifier that only commits to a provider when the
+/// records carry a distinctive marker.
+///
+/// Returns `None` when every record seen so far is indeterminate (a Claude
+/// metadata preamble, an empty record, a record without any recognised
+/// `type` discriminator, …). The streaming auto-detect path uses the
+/// `None` signal to decide whether to peek one more JSONL line before
+/// falling back to the default.
+///
+/// Why this matters: the previous design buffered a fixed `AUTODETECT_PEEK_LINES`
+/// (8) records and then called [`detect_extension_type`], which silently
+/// committed to Codex (the default) once that buffer was exhausted. A Claude
+/// session whose `parentUuid`-bearing record sat past a long metadata
+/// prelude could then be mis-classified as Codex and have its usage
+/// silently dropped. With this function the caller can keep reading until
+/// a positive signal appears, so there is no arbitrary limit to the
+/// preamble length we tolerate.
+pub fn classify_records(data: &[Value]) -> Option<ExtensionType> {
     // Legacy Copilot CLI single-object dump
     // (`history-session-state/<id>.json`). Kept for backward compatibility
     // with old user dumps; no recent Copilot CLI version writes this shape.
@@ -29,7 +57,7 @@ pub fn detect_extension_type(data: &[Value]) -> Result<ExtensionType> {
         && obj.contains_key("startTime")
         && obj.contains_key("timeline")
     {
-        return Ok(ExtensionType::Copilot);
+        return Some(ExtensionType::Copilot);
     }
 
     // JSONL stream: Gemini session-meta header line.
@@ -44,7 +72,7 @@ pub fn detect_extension_type(data: &[Value]) -> Result<ExtensionType> {
         && first.contains_key("projectHash")
         && !first.contains_key("messages")
     {
-        return Ok(ExtensionType::Gemini);
+        return Some(ExtensionType::Gemini);
     }
 
     // JSONL stream: Copilot CLI `events.jsonl` session-start record.
@@ -68,27 +96,39 @@ pub fn detect_extension_type(data: &[Value]) -> Result<ExtensionType> {
             .and_then(|p| p.as_str())
             .unwrap_or("");
         if producer.starts_with("copilot") {
-            return Ok(ExtensionType::Copilot);
+            return Some(ExtensionType::Copilot);
         }
     }
 
-    // Single-pass detection for Claude Code or Codex.
-    //
-    // The caller decides how much to pass in (the streaming auto-detect path
-    // buffers up to 8 records), so we scan the whole slice here — previously
-    // this was capped at 5 records, which silently missed Claude sessions
-    // whose `parentUuid`-bearing record sat past a 6+-line metadata prelude
-    // (e.g. `permission-mode` followed by several `file-history-snapshot`
-    // records).
+    // Walk every record looking for Claude Code / Codex positive markers.
+    // Either one counts — whichever shows up first wins. This scan has no
+    // arbitrary upper bound: the caller decides how much data to supply,
+    // and the streaming auto-detect path keeps peeking lines until a
+    // marker is seen or the file ends.
     for record in data {
-        if let Some(obj) = record.as_object() {
-            // Claude Code has parentUuid field
-            if obj.contains_key("parentUuid") {
-                return Ok(ExtensionType::ClaudeCode);
-            }
+        let Some(obj) = record.as_object() else {
+            continue;
+        };
+
+        // Claude Code sessions key off the `parentUuid` field, which Claude
+        // writes on every assistant / user record but nothing else in this
+        // codebase relies on.
+        if obj.contains_key("parentUuid") {
+            return Some(ExtensionType::ClaudeCode);
+        }
+
+        // Codex rollout logs use a `type` field with one of a small set of
+        // enum-like values. Matching any of these is a definitive signal —
+        // none of them overlap with Claude / Gemini / Copilot shapes.
+        if let Some(t) = obj.get("type").and_then(|v| v.as_str())
+            && matches!(
+                t,
+                "session_meta" | "turn_context" | "event_msg" | "response_item"
+            )
+        {
+            return Some(ExtensionType::Codex);
         }
     }
 
-    // Default to Codex if no distinctive markers found
-    Ok(ExtensionType::Codex)
+    None
 }

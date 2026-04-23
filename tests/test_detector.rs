@@ -3,7 +3,7 @@
 // Tests the AI provider format detection logic
 
 use serde_json::{Value, json};
-use vibe_coding_tracker::analysis::detector::detect_extension_type;
+use vibe_coding_tracker::analysis::detector::{classify_records, detect_extension_type};
 use vibe_coding_tracker::models::ExtensionType;
 
 #[test]
@@ -177,14 +177,15 @@ fn test_detect_claude_code_in_first_few_records() {
 }
 
 #[test]
-fn test_detect_claude_code_past_fifth_record() {
-    // Regression: the streaming auto-detect path buffers up to 8 records and
-    // hands them all to `detect_extension_type`. Earlier versions capped the
-    // scan at 5 records, so a Claude session with a 6+-line metadata prelude
-    // (e.g. `permission-mode` followed by several `file-history-snapshot`
-    // entries) silently fell through to Codex. The detector must now scan the
-    // full slice the caller supplies.
-    let mut data: Vec<Value> = (0..7)
+fn test_detect_claude_code_past_long_preamble() {
+    // Regression guard: Claude Code sessions can carry an arbitrary
+    // number of metadata preamble records (`permission-mode`,
+    // `file-history-snapshot`, `queue-operation`, …) before the first
+    // `parentUuid`-bearing line. The detector has no upper bound — it
+    // scans the entire slice the caller hands it. A previous
+    // implementation capped the scan at 5 records and silently
+    // mis-classified long-preamble sessions as Codex.
+    let mut data: Vec<Value> = (0..50)
         .map(|i| json!({"type": "file-history-snapshot", "idx": i}))
         .collect();
     data.push(json!({
@@ -194,6 +195,77 @@ fn test_detect_claude_code_past_fifth_record() {
 
     let result = detect_extension_type(&data).unwrap();
     assert_eq!(result, ExtensionType::ClaudeCode);
+}
+
+// ============================================================================
+// classify_records — the streaming-friendly variant
+// ============================================================================
+
+#[test]
+fn test_classify_returns_none_on_indeterminate_records() {
+    // A Claude metadata preamble with no `parentUuid` yet has no
+    // distinctive marker on any provider — `classify_records` must return
+    // `None` so the streaming auto-detect loop keeps reading more lines
+    // instead of committing to a default too early.
+    let preamble: Vec<Value> = (0..5)
+        .map(|i| json!({"type": "file-history-snapshot", "idx": i}))
+        .collect();
+    assert!(classify_records(&preamble).is_none());
+}
+
+#[test]
+fn test_classify_commits_when_claude_marker_arrives() {
+    // Streaming behaviour: once the caller appends a record containing
+    // `parentUuid`, classification flips from `None` to `Some(ClaudeCode)`.
+    let mut buffer: Vec<Value> = (0..3)
+        .map(|i| json!({"type": "file-history-snapshot", "idx": i}))
+        .collect();
+    assert!(classify_records(&buffer).is_none());
+
+    buffer.push(json!({"parentUuid": "abc-123", "type": "user"}));
+    assert_eq!(classify_records(&buffer), Some(ExtensionType::ClaudeCode));
+}
+
+#[test]
+fn test_classify_commits_on_codex_type_marker() {
+    // Codex rollout logs use a small set of `type` enum values on each
+    // record — any one of them is a positive signal.
+    for codex_type in ["session_meta", "turn_context", "event_msg", "response_item"] {
+        let data = vec![json!({
+            "type": codex_type,
+            "timestamp": "2026-04-23T00:00:00Z",
+            "payload": {}
+        })];
+        assert_eq!(
+            classify_records(&data),
+            Some(ExtensionType::Codex),
+            "type={} should classify as Codex",
+            codex_type
+        );
+    }
+}
+
+#[test]
+fn test_classify_gemini_meta_header_first_line() {
+    // Gemini's first-line meta record is enough to commit without needing
+    // any subsequent event lines.
+    let data = vec![json!({
+        "sessionId": "s",
+        "projectHash": "p",
+        "kind": "main"
+    })];
+    assert_eq!(classify_records(&data), Some(ExtensionType::Gemini));
+}
+
+#[test]
+fn test_classify_copilot_jsonl_first_line() {
+    // Modern Copilot CLI's first line is `type: "session.start"` with a
+    // copilot producer — one line is enough.
+    let data = vec![json!({
+        "type": "session.start",
+        "data": {"sessionId": "s", "producer": "copilot-agent"}
+    })];
+    assert_eq!(classify_records(&data), Some(ExtensionType::Copilot));
 }
 
 #[test]

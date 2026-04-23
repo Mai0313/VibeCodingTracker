@@ -7,7 +7,7 @@ use crate::analysis::common_state::AnalysisMode;
 use crate::analysis::copilot_analyzer::{
     analyze_copilot_conversations_with_mode, analyze_copilot_events,
 };
-use crate::analysis::detector::detect_extension_type;
+use crate::analysis::detector::{classify_records, detect_extension_type};
 use crate::analysis::gemini_analyzer::analyze_gemini_events;
 use crate::constants::buffer;
 use crate::models::{
@@ -20,15 +20,6 @@ use serde_json::Value;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-
-/// How many JSONL records the auto-detect path may pre-parse before deciding
-/// which provider the file belongs to. Claude Code can prefix a session file
-/// with a handful of metadata sentinel records (`permission-mode`,
-/// `file-history-snapshot`, `queue-operation`) that don't carry the
-/// `parentUuid` field the detector keys on, so looking at only the first line
-/// misclassifies the file as Codex and silently drops its usage. Eight lines
-/// is comfortably larger than any sentinel prelude Claude writes today.
-const AUTODETECT_PEEK_LINES: usize = 8;
 
 /// Analyzes a session file (JSONL or JSON) and returns the result as a
 /// `serde_json::Value` (the CLI single-file dump path).
@@ -152,20 +143,30 @@ fn stream_analyze_known(
 
 /// Streaming path when the provider is unknown.
 ///
-/// Pre-buffers up to [`AUTODETECT_PEEK_LINES`] records so that content-based
-/// detection sees past any Claude metadata preamble (which doesn't carry the
-/// `parentUuid` marker). The pre-parsed records are then handed to the
-/// dispatcher alongside the remainder of the reader so no record is read
-/// twice.
+/// Reads JSONL records one line at a time and asks `classify_records` to
+/// commit to a provider as soon as any of them carry a distinctive marker.
+/// Because the classifier returns `None` when it has not seen a positive
+/// signal yet, we simply keep peeking until one appears (or EOF). There is
+/// no arbitrary upper bound on how long a Claude metadata preamble may
+/// be — previously a 7+ line preamble silently mis-classified the whole
+/// session as Codex because the 8-record peek window ran out before the
+/// first `parentUuid` record was read.
+///
+/// If the entire file is consumed without any marker firing, the default
+/// is Codex: Codex rollout logs usually contain one of the recognised
+/// `type` values (`session_meta`, `turn_context`, …) so a synthetic file
+/// with no markers is most likely a deliberately-empty Codex fixture
+/// rather than a silently-broken Claude log.
 fn stream_analyze_autodetect(path: &Path, mode: AnalysisMode) -> Result<Option<CodeAnalysis>> {
     let file =
         File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
     let mut reader = BufReader::with_capacity(buffer::FILE_READ_BUFFER, file);
 
-    let mut buffered: Vec<Value> = Vec::with_capacity(AUTODETECT_PEEK_LINES);
+    let mut buffered: Vec<Value> = Vec::with_capacity(8);
     let mut first_line_was_json = None::<bool>;
+    let mut ext: Option<ExtensionType> = None;
 
-    while buffered.len() < AUTODETECT_PEEK_LINES {
+    loop {
         let line = match read_next_non_empty_line(&mut reader)? {
             Some(line) => line,
             None => break,
@@ -175,12 +176,21 @@ fn stream_analyze_autodetect(path: &Path, mode: AnalysisMode) -> Result<Option<C
             Ok(v) => {
                 first_line_was_json.get_or_insert(true);
                 buffered.push(v);
+                // Try to classify after every new record. As soon as we
+                // have a confident verdict we stop peeking and hand both
+                // the buffer and the remaining reader to the dispatcher.
+                if let Some(found) = classify_records(&buffered) {
+                    ext = Some(found);
+                    break;
+                }
             }
             Err(_) => {
-                // If we've already buffered at least one valid JSONL record,
-                // stop buffering and let the dispatcher handle what we have.
-                // If this is the very first line, the whole file is likely
-                // pretty-printed JSON — bail so the caller falls back.
+                // A non-JSON line on the very first record means the file
+                // is a pretty-printed single-object dump (Copilot legacy
+                // shape or similar); let the caller fall through to
+                // `read_json`. Otherwise we have buffered at least one
+                // valid record already — stop peeking and let the
+                // dispatcher decide.
                 if buffered.is_empty() {
                     first_line_was_json = Some(false);
                 }
@@ -197,7 +207,10 @@ fn stream_analyze_autodetect(path: &Path, mode: AnalysisMode) -> Result<Option<C
         return Ok(None);
     }
 
-    let ext = detect_extension_type(&buffered)?;
+    // If the whole file was consumed without any distinctive marker, fall
+    // back to Codex — a JSONL file with no Claude / Gemini / Copilot
+    // markers is almost certainly a Codex log (or a synthetic fixture).
+    let ext = ext.unwrap_or(ExtensionType::Codex);
     let analysis = dispatch_streaming_buffered(ext, buffered, reader, mode)?;
     Ok(Some(finalize(analysis, ext)))
 }
