@@ -47,12 +47,11 @@ pub fn get_current_date() -> String {
 
     // Fast path: read lock to check if cache is valid
     {
-        if let Ok(cache) = DATE_CACHE.read() {
-            if let Some((cached_date, cached_string)) = cache.as_ref() {
-                if *cached_date == today {
-                    return cached_string.clone();
-                }
-            }
+        if let Ok(cache) = DATE_CACHE.read()
+            && let Some((cached_date, cached_string)) = cache.as_ref()
+            && *cached_date == today
+        {
+            return cached_string.clone();
         }
     }
 

@@ -194,10 +194,10 @@ pub fn parse_litellm_entry(value: &serde_json::Value) -> ModelPricing {
                         if let Some(th) = parse_threshold_suffix(inner) {
                             tier_cache_creation_1hr.insert(th, num_value);
                         }
-                    } else if !suffix.starts_with("1hr") {
-                        if let Some(th) = parse_threshold_suffix(suffix) {
-                            tier_cache_creation.insert(th, num_value);
-                        }
+                    } else if !suffix.starts_with("1hr")
+                        && let Some(th) = parse_threshold_suffix(suffix)
+                    {
+                        tier_cache_creation.insert(th, num_value);
                     }
                 }
             }

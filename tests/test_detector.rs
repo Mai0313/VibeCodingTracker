@@ -80,6 +80,26 @@ fn test_detect_claude_code_in_first_few_records() {
 }
 
 #[test]
+fn test_detect_claude_code_past_fifth_record() {
+    // Regression: the streaming auto-detect path buffers up to 8 records and
+    // hands them all to `detect_extension_type`. Earlier versions capped the
+    // scan at 5 records, so a Claude session with a 6+-line metadata prelude
+    // (e.g. `permission-mode` followed by several `file-history-snapshot`
+    // entries) silently fell through to Codex. The detector must now scan the
+    // full slice the caller supplies.
+    let mut data: Vec<Value> = (0..7)
+        .map(|i| json!({"type": "file-history-snapshot", "idx": i}))
+        .collect();
+    data.push(json!({
+        "parentUuid": "deep-uuid",
+        "type": "user"
+    }));
+
+    let result = detect_extension_type(&data).unwrap();
+    assert_eq!(result, ExtensionType::ClaudeCode);
+}
+
+#[test]
 fn test_detect_empty_data_error() {
     // Test that empty data returns an error
     let data: Vec<Value> = vec![];

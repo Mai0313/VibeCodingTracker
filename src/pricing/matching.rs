@@ -91,10 +91,10 @@ impl ModelPricingMap {
     /// Results are cached globally for performance.
     pub fn get(&self, model_name: &str) -> ModelPricingResult {
         // Ultra-fast path: Check LRU cache first (with peek to avoid write lock)
-        if let Ok(cache_read) = MATCH_CACHE.read() {
-            if let Some(cached_result) = cache_read.peek(model_name) {
-                return cached_result.clone();
-            }
+        if let Ok(cache_read) = MATCH_CACHE.read()
+            && let Some(cached_result) = cache_read.peek(model_name)
+        {
+            return cached_result.clone();
         }
 
         // Fast path 1: Exact match
@@ -112,18 +112,18 @@ impl ModelPricingMap {
 
         // Fast path 2: Normalized match
         let normalized_name = normalize_model_name(model_name);
-        if let Some(original_key) = self.normalized_index.get(&normalized_name) {
-            if let Some(pricing) = self.raw.get(original_key.as_ref()) {
-                let result = ModelPricingResult {
-                    pricing: pricing.clone(),
-                    matched_model: Some(original_key.to_string()), // Convert Rc to String only when needed
-                };
-                // Cache the normalized match result (LRU will auto-evict if at capacity)
-                if let Ok(mut cache_write) = MATCH_CACHE.write() {
-                    cache_write.put(model_name.to_string(), result.clone());
-                }
-                return result;
+        if let Some(original_key) = self.normalized_index.get(&normalized_name)
+            && let Some(pricing) = self.raw.get(original_key.as_ref())
+        {
+            let result = ModelPricingResult {
+                pricing: pricing.clone(),
+                matched_model: Some(original_key.to_string()), // Convert Rc to String only when needed
+            };
+            // Cache the normalized match result (LRU will auto-evict if at capacity)
+            if let Ok(mut cache_write) = MATCH_CACHE.write() {
+                cache_write.put(model_name.to_string(), result.clone());
             }
+            return result;
         }
 
         // Slow path: Substring and fuzzy matching (optimized)
@@ -158,18 +158,18 @@ impl ModelPricingMap {
         }
 
         // Return best match if found
-        if let Some((matched_key, _, _)) = best_match {
-            if let Some(pricing) = self.raw.get(matched_key.as_ref()) {
-                let result = ModelPricingResult {
-                    pricing: pricing.clone(),
-                    matched_model: Some(matched_key.to_string()), // Convert to String only when needed
-                };
-                // Cache the fuzzy match result (LRU will auto-evict if at capacity)
-                if let Ok(mut cache_write) = MATCH_CACHE.write() {
-                    cache_write.put(model_name.to_string(), result.clone());
-                }
-                return result;
+        if let Some((matched_key, _, _)) = best_match
+            && let Some(pricing) = self.raw.get(matched_key.as_ref())
+        {
+            let result = ModelPricingResult {
+                pricing: pricing.clone(),
+                matched_model: Some(matched_key.to_string()), // Convert to String only when needed
+            };
+            // Cache the fuzzy match result (LRU will auto-evict if at capacity)
+            if let Ok(mut cache_write) = MATCH_CACHE.write() {
+                cache_write.put(model_name.to_string(), result.clone());
             }
+            return result;
         }
 
         // Return default (zero costs) if no match found

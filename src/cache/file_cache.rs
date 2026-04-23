@@ -1,7 +1,8 @@
+use crate::analysis::AnalysisMode;
 use crate::constants::capacity;
 use crate::models::{
     CodeAnalysis, CodeAnalysisApplyDiffDetail, CodeAnalysisReadDetail, CodeAnalysisRecord,
-    CodeAnalysisRunCommandDetail, CodeAnalysisWriteDetail,
+    CodeAnalysisRunCommandDetail, CodeAnalysisWriteDetail, ExtensionType,
 };
 use anyhow::Result;
 use lru::LruCache;
@@ -45,7 +46,12 @@ impl FileParseCache {
         }
     }
 
-    /// Retrieves cached analysis or parses the file if needed.
+    /// Retrieves cached analysis or parses the file if needed, auto-detecting
+    /// the provider from file contents.
+    ///
+    /// Prefer [`Self::get_or_parse_as`] whenever the caller already knows which
+    /// provider the file belongs to (e.g. walking a specific session
+    /// directory). Content detection is only safe for ad-hoc single-file paths.
     ///
     /// Workflow:
     /// 1. Check cache hit with read-only peek (no lock contention)
@@ -54,7 +60,27 @@ impl FileParseCache {
     ///
     /// Optimized to minimize write lock contention in parallel workloads.
     pub fn get_or_parse<P: AsRef<Path>>(&self, path: P) -> Result<Arc<CodeAnalysis>> {
-        let path = path.as_ref();
+        self.get_or_parse_inner(path.as_ref(), None)
+    }
+
+    /// Same as [`Self::get_or_parse`] but the caller specifies which provider
+    /// the file belongs to — the analyzer skips content-based detection, so
+    /// metadata sentinels at the top of a Claude session (`permission-mode`,
+    /// `file-history-snapshot`) cannot cause the file to be mis-filed under a
+    /// different provider.
+    pub fn get_or_parse_as<P: AsRef<Path>>(
+        &self,
+        path: P,
+        provider: ExtensionType,
+    ) -> Result<Arc<CodeAnalysis>> {
+        self.get_or_parse_inner(path.as_ref(), Some(provider))
+    }
+
+    fn get_or_parse_inner(
+        &self,
+        path: &Path,
+        provider: Option<ExtensionType>,
+    ) -> Result<Arc<CodeAnalysis>> {
         let path_buf = path.to_path_buf();
 
         // Get file metadata (modification time)
@@ -86,7 +112,10 @@ impl FileParseCache {
 
         // Cache miss or outdated - need to parse.
         log::debug!("LRU cache miss for {}, parsing...", path.display());
-        let analysis = crate::analysis::analyze_jsonl_file_typed(path)?;
+        let analysis = match provider {
+            Some(p) => crate::analysis::analyze_session_file_typed_as(path, p, AnalysisMode::Full)?,
+            None => crate::analysis::analyze_jsonl_file_typed(path)?,
+        };
         let arc_analysis = Arc::new(analysis);
         let size_bytes = estimate_analysis_bytes(arc_analysis.as_ref());
 

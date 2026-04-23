@@ -72,10 +72,10 @@ pub fn get_machine_id() -> &'static str {
         }
 
         // Fallback to hostname
-        if let Ok(hostname) = hostname::get() {
-            if let Some(hostname_str) = hostname.to_str() {
-                return hostname_str.to_string();
-            }
+        if let Ok(hostname) = hostname::get()
+            && let Some(hostname_str) = hostname.to_str()
+        {
+            return hostname_str.to_string();
         }
 
         "unknown-machine-id".to_string()

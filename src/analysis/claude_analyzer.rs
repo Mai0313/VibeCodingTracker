@@ -49,31 +49,31 @@ where
             state.last_ts = ts;
         }
 
-        if log.log_type == "assistant" {
-            if let Some(message) = &log.message {
-                if let (Some(model), Some(usage)) = (&message.model, &message.usage) {
-                    process_claude_usage(&mut conversation_usage, model, usage);
-                }
+        if log.log_type == "assistant"
+            && let Some(message) = &log.message
+        {
+            if let (Some(model), Some(usage)) = (&message.model, &message.usage) {
+                process_claude_usage(&mut conversation_usage, model, usage);
+            }
 
-                for item in &message.content {
-                    let ClaudeContentItem::ToolUse { name, input } = item else {
-                        continue;
-                    };
+            for item in &message.content {
+                let ClaudeContentItem::ToolUse { name, input } = item else {
+                    continue;
+                };
 
-                    match name.as_str() {
-                        "Read" => state.tool_counts.read += 1,
-                        "Write" => state.tool_counts.write += 1,
-                        "Edit" => state.tool_counts.edit += 1,
-                        "TodoWrite" => state.tool_counts.todo_write += 1,
-                        "Bash" => {
-                            if let Some(input) = input {
-                                let command = input.command.as_deref().unwrap_or("");
-                                let description = input.description.as_deref().unwrap_or("");
-                                state.add_run_command(command, description, ts);
-                            }
+                match name.as_str() {
+                    "Read" => state.tool_counts.read += 1,
+                    "Write" => state.tool_counts.write += 1,
+                    "Edit" => state.tool_counts.edit += 1,
+                    "TodoWrite" => state.tool_counts.todo_write += 1,
+                    "Bash" => {
+                        if let Some(input) = input {
+                            let command = input.command.as_deref().unwrap_or("");
+                            let description = input.description.as_deref().unwrap_or("");
+                            state.add_run_command(command, description, ts);
                         }
-                        _ => {}
                     }
+                    _ => {}
                 }
             }
         }
@@ -81,12 +81,12 @@ where
         if let Some(tur) = &log.tool_use_result {
             let tur_type = tur.result_type.as_deref().unwrap_or("");
 
-            if tur_type == "text" {
-                if let Some(file) = &tur.file {
-                    let file_path = file.file_path.as_deref().unwrap_or("");
-                    let content = file.content.as_deref().unwrap_or("");
-                    state.add_read_detail(file_path, content, ts);
-                }
+            if tur_type == "text"
+                && let Some(file) = &tur.file
+            {
+                let file_path = file.file_path.as_deref().unwrap_or("");
+                let content = file.content.as_deref().unwrap_or("");
+                state.add_read_detail(file_path, content, ts);
             }
 
             if tur_type == "create" {
@@ -95,11 +95,11 @@ where
                 state.add_write_detail(file_path, content, ts);
             }
 
-            if let Some(file_path) = tur.file_path.as_deref() {
-                if let Some(new_string) = tur.new_string.as_deref() {
-                    let old_string = tur.old_string.as_deref().unwrap_or("");
-                    state.add_edit_detail(file_path, old_string, new_string, ts);
-                }
+            if let Some(file_path) = tur.file_path.as_deref()
+                && let Some(new_string) = tur.new_string.as_deref()
+            {
+                let old_string = tur.old_string.as_deref().unwrap_or("");
+                state.add_edit_detail(file_path, old_string, new_string, ts);
             }
         }
     }

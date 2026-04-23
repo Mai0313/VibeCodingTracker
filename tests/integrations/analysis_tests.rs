@@ -4,11 +4,13 @@
 
 use std::path::PathBuf;
 use tempfile::TempDir;
-use vibe_coding_tracker::analysis::analyzer::analyze_jsonl_file;
+use vibe_coding_tracker::analysis::analyzer::{analyze_jsonl_file, analyze_session_file_typed_as};
 use vibe_coding_tracker::analysis::batch_analyzer::{
     analyze_all_sessions, analyze_all_sessions_by_provider,
 };
+use vibe_coding_tracker::analysis::common_state::AnalysisMode;
 use vibe_coding_tracker::cli::TimeRange;
+use vibe_coding_tracker::models::ExtensionType;
 
 #[test]
 fn test_single_file_analysis_claude() {
@@ -244,15 +246,15 @@ fn test_batch_analysis_basic() {
 fn test_batch_analysis_sorting() {
     let result = analyze_all_sessions(TimeRange::All);
 
-    if let Ok(data) = result {
-        if data.rows.len() > 1 {
-            // Verify sorting: models should be in alphabetical order
-            for i in 0..data.rows.len() - 1 {
-                assert!(
-                    data.rows[i].model <= data.rows[i + 1].model,
-                    "Models should be sorted alphabetically"
-                );
-            }
+    if let Ok(data) = result
+        && data.rows.len() > 1
+    {
+        // Verify sorting: models should be in alphabetical order
+        for i in 0..data.rows.len() - 1 {
+            assert!(
+                data.rows[i].model <= data.rows[i + 1].model,
+                "Models should be sorted alphabetically"
+            );
         }
     }
 }
@@ -417,4 +419,136 @@ fn test_analysis_aggregation_logic() {
     assert_eq!(total_edit_lines, 100);
     assert_eq!(total_read_lines, 200);
     assert_eq!(total_write_lines, 50);
+}
+
+/// Regression for the silent usage drop that happened when a Claude session
+/// started with a metadata sentinel (`permission-mode`, `file-history-snapshot`,
+/// `queue-operation`). Those records don't carry `parentUuid`, so the old
+/// streaming detector — which only looked at the first line — classified the
+/// whole file as Codex and the assistant `usage` entries never landed in the
+/// Claude totals. This test writes a fixture with a `permission-mode` prelude
+/// and asserts both the provider-known entry point and the auto-detect entry
+/// point return the Claude model usage.
+fn write_claude_fixture_with_sentinel_prelude(path: &std::path::Path, sentinel_type: &str) {
+    let sentinel = match sentinel_type {
+        "permission-mode" => {
+            r#"{"type":"permission-mode","permissionMode":"default","sessionId":"sess-1"}"#
+        }
+        "file-history-snapshot" => {
+            r#"{"type":"file-history-snapshot","messageId":"m1","isSnapshotUpdate":false,"snapshot":{}}"#
+        }
+        "queue-operation" => {
+            r#"{"type":"queue-operation","operation":"enqueue","sessionId":"sess-1","content":"x","timestamp":"2026-04-23T00:00:00.000Z"}"#
+        }
+        _ => unreachable!(),
+    };
+
+    // Minimal assistant message with the fields the analyzer reads:
+    // model + usage. No <synthetic> — those are intentionally skipped.
+    let assistant = r#"{"type":"assistant","sessionId":"sess-1","parentUuid":"pu","timestamp":"2026-04-23T00:00:00.000Z","message":{"model":"claude-opus-4-7","usage":{"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":10,"cache_read_input_tokens":20,"service_tier":"standard","cache_creation":{"ephemeral_5m_input_tokens":10}},"content":[]}}"#;
+
+    let body = format!("{sentinel}\n{assistant}\n");
+    std::fs::write(path, body).unwrap();
+}
+
+fn usage_input_tokens_for_model(analysis: &serde_json::Value, model: &str) -> i64 {
+    analysis["records"]
+        .as_array()
+        .and_then(|records| records.first())
+        .and_then(|r| r.get("conversationUsage"))
+        .and_then(|cu| cu.get(model))
+        .and_then(|u| u.get("input_tokens"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(-1)
+}
+
+#[test]
+fn test_provider_known_extracts_usage_when_first_line_is_permission_mode() {
+    let tmp = TempDir::new().unwrap();
+    let file = tmp.path().join("session.jsonl");
+    write_claude_fixture_with_sentinel_prelude(&file, "permission-mode");
+
+    let analysis =
+        analyze_session_file_typed_as(&file, ExtensionType::ClaudeCode, AnalysisMode::UsageOnly)
+            .expect("provider-known path should accept the sentinel prelude");
+
+    assert_eq!(analysis.extension_name, "Claude-Code");
+    assert_eq!(analysis.records.len(), 1);
+
+    let record = &analysis.records[0];
+    let usage = record
+        .conversation_usage
+        .get("claude-opus-4-7")
+        .expect("claude-opus-4-7 usage should be recorded despite the permission-mode prelude");
+    assert_eq!(usage["input_tokens"], 100);
+    assert_eq!(usage["output_tokens"], 50);
+    assert_eq!(usage["cache_creation_input_tokens"], 10);
+    assert_eq!(usage["cache_read_input_tokens"], 20);
+}
+
+#[test]
+fn test_provider_known_extracts_usage_when_first_line_is_file_history_snapshot() {
+    let tmp = TempDir::new().unwrap();
+    let file = tmp.path().join("session.jsonl");
+    write_claude_fixture_with_sentinel_prelude(&file, "file-history-snapshot");
+
+    let analysis =
+        analyze_session_file_typed_as(&file, ExtensionType::ClaudeCode, AnalysisMode::UsageOnly)
+            .expect("provider-known path should accept the sentinel prelude");
+
+    let record = &analysis.records[0];
+    assert!(
+        record.conversation_usage.contains_key("claude-opus-4-7"),
+        "claude-opus-4-7 usage should be recorded even when first line is file-history-snapshot"
+    );
+}
+
+#[test]
+fn test_provider_known_extracts_usage_when_first_line_is_queue_operation() {
+    let tmp = TempDir::new().unwrap();
+    let file = tmp.path().join("session.jsonl");
+    write_claude_fixture_with_sentinel_prelude(&file, "queue-operation");
+
+    let analysis =
+        analyze_session_file_typed_as(&file, ExtensionType::ClaudeCode, AnalysisMode::UsageOnly)
+            .expect("provider-known path should accept the sentinel prelude");
+
+    let record = &analysis.records[0];
+    assert!(
+        record.conversation_usage.contains_key("claude-opus-4-7"),
+        "claude-opus-4-7 usage should be recorded even when first line is queue-operation"
+    );
+}
+
+#[test]
+fn test_autodetect_sees_past_queue_operation_prelude() {
+    let tmp = TempDir::new().unwrap();
+    let file = tmp.path().join("session.jsonl");
+    write_claude_fixture_with_sentinel_prelude(&file, "queue-operation");
+
+    let analysis = analyze_jsonl_file(&file).expect("auto-detect should handle the prelude");
+    assert_eq!(analysis["extensionName"], "Claude-Code");
+    assert_eq!(
+        usage_input_tokens_for_model(&analysis, "claude-opus-4-7"),
+        100,
+    );
+}
+
+#[test]
+fn test_autodetect_sees_past_sentinel_prelude() {
+    // The auto-detect path (used by the CLI `vct analysis <file>` form) should
+    // peek enough records to spot the Claude-shaped assistant row sitting
+    // behind the metadata preamble.
+    let tmp = TempDir::new().unwrap();
+    let file = tmp.path().join("session.jsonl");
+    write_claude_fixture_with_sentinel_prelude(&file, "permission-mode");
+
+    let analysis = analyze_jsonl_file(&file).expect("auto-detect should handle the prelude");
+
+    assert_eq!(analysis["extensionName"], "Claude-Code");
+    assert_eq!(
+        usage_input_tokens_for_model(&analysis, "claude-opus-4-7"),
+        100,
+        "auto-detect should extract the assistant record's usage, not drop the whole file"
+    );
 }

@@ -28,87 +28,82 @@ pub fn analyze_codex_conversations_with_mode(
 
         match entry.log_type.as_str() {
             "session_meta" => {
-                if state.folder_path.is_empty() {
-                    if let Some(cwd) = &entry.payload.cwd {
-                        state.folder_path.clone_from(cwd); // More efficient than clone()
-                    }
+                if state.folder_path.is_empty()
+                    && let Some(cwd) = &entry.payload.cwd
+                {
+                    state.folder_path.clone_from(cwd); // More efficient than clone()
                 }
-                if state.task_id.is_empty() {
-                    if let Some(id) = &entry.payload.id {
-                        state.task_id.clone_from(id);
-                    }
+                if state.task_id.is_empty()
+                    && let Some(id) = &entry.payload.id
+                {
+                    state.task_id.clone_from(id);
                 }
-                if state.git_remote.is_empty() {
-                    if let Some(git) = &entry.payload.git {
-                        if let Some(url) = &git.repository_url {
-                            state.git_remote.clone_from(url);
-                        }
-                    }
+                if state.git_remote.is_empty()
+                    && let Some(git) = &entry.payload.git
+                    && let Some(url) = &git.repository_url
+                {
+                    state.git_remote.clone_from(url);
                 }
             }
             "turn_context" => {
-                if state.folder_path.is_empty() {
-                    if let Some(cwd) = &entry.payload.cwd {
-                        state.folder_path.clone_from(cwd);
-                    }
+                if state.folder_path.is_empty()
+                    && let Some(cwd) = &entry.payload.cwd
+                {
+                    state.folder_path.clone_from(cwd);
                 }
                 if let Some(model) = &entry.payload.model {
                     current_model.clone_from(model); // Reuse existing allocation
                 }
             }
             "event_msg" => {
-                if let Some(payload_type) = &entry.payload.payload_type {
-                    if payload_type == "token_count" && !current_model.is_empty() {
-                        if let Some(info) = &entry.payload.info {
-                            process_codex_usage(&mut conversation_usage, &current_model, info);
-                        }
-                    }
+                if let Some(payload_type) = &entry.payload.payload_type
+                    && payload_type == "token_count"
+                    && !current_model.is_empty()
+                    && let Some(info) = &entry.payload.info
+                {
+                    process_codex_usage(&mut conversation_usage, &current_model, info);
                 }
             }
             "response_item" => {
                 if let Some(payload_type) = &entry.payload.payload_type {
                     match payload_type.as_str() {
                         "function_call" => {
-                            if let Some(name) = &entry.payload.name {
-                                if name == "shell" {
-                                    if let Some(args_str) = &entry.payload.arguments {
-                                        if let Ok(args) =
-                                            serde_json::from_str::<CodexShellArguments>(args_str)
-                                        {
-                                            let script =
-                                                args.command.last().cloned().unwrap_or_default();
-                                            if let Some(call_id) = &entry.payload.call_id {
-                                                shell_calls.insert(
-                                                    call_id.clone(),
-                                                    CodexShellCall {
-                                                        timestamp: ts,
-                                                        script: script.clone(),
-                                                        full_command: args.command,
-                                                    },
-                                                );
-                                            }
-                                        }
-                                    }
+                            if let Some(name) = &entry.payload.name
+                                && name == "shell"
+                                && let Some(args_str) = &entry.payload.arguments
+                                && let Ok(args) =
+                                    serde_json::from_str::<CodexShellArguments>(args_str)
+                            {
+                                let script = args.command.last().cloned().unwrap_or_default();
+                                if let Some(call_id) = &entry.payload.call_id {
+                                    shell_calls.insert(
+                                        call_id.clone(),
+                                        CodexShellCall {
+                                            timestamp: ts,
+                                            script: script.clone(),
+                                            full_command: args.command,
+                                        },
+                                    );
                                 }
                             }
                         }
                         "function_call_output" => {
-                            if let Some(call_id) = &entry.payload.call_id {
-                                if let Some(call) = shell_calls.remove(call_id) {
-                                    let output = if let Some(output_str) = &entry.payload.output {
-                                        serde_json::from_str::<CodexShellOutput>(output_str)
-                                            .unwrap_or_else(|_| CodexShellOutput {
-                                                output: output_str.clone(),
-                                                metadata: None,
-                                            })
-                                    } else {
-                                        CodexShellOutput {
-                                            output: String::new(),
+                            if let Some(call_id) = &entry.payload.call_id
+                                && let Some(call) = shell_calls.remove(call_id)
+                            {
+                                let output = if let Some(output_str) = &entry.payload.output {
+                                    serde_json::from_str::<CodexShellOutput>(output_str)
+                                        .unwrap_or_else(|_| CodexShellOutput {
+                                            output: output_str.clone(),
                                             metadata: None,
-                                        }
-                                    };
-                                    state.handle_shell_call(call, output);
-                                }
+                                        })
+                                } else {
+                                    CodexShellOutput {
+                                        output: String::new(),
+                                        metadata: None,
+                                    }
+                                };
+                                state.handle_shell_call(call, output);
                             }
                         }
                         _ => {}

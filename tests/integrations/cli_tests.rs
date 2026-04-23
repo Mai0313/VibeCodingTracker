@@ -119,12 +119,13 @@ fn test_analysis_batch_mode_with_output() {
     // May timeout on slow systems or large session directories
     let output = cmd.output();
 
-    if let Ok(output) = output {
-        if output.status.success() && output_file.exists() {
-            let content = std::fs::read_to_string(&output_file).unwrap();
-            let json: serde_json::Value = serde_json::from_str(&content).unwrap();
-            assert!(json.is_array(), "Batch output should be JSON array");
-        }
+    if let Ok(output) = output
+        && output.status.success()
+        && output_file.exists()
+    {
+        let content = std::fs::read_to_string(&output_file).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(json.is_array(), "Batch output should be JSON array");
     }
 }
 
