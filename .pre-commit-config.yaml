@@ -67,7 +67,7 @@ repos:
           # - mdformat-black  # python
           - mdformat-config  # json, toml, yaml
           # - mdformat-gofmt  # go
-          # - mdformat-ruff  # python
+          - mdformat-ruff  # python
           - mdformat-rustfmt  # rust
           # - mdformat-shfmt  # bash, sh
           # - mdformat-web  # javascript, js, css, html, xml
