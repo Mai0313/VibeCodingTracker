@@ -27,8 +27,6 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
-        toolchain:
-          - stable
 
     steps:
       - name: Disable SSL Verify
@@ -41,10 +39,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: ${{ matrix.toolchain }}
-          components: clippy, rustfmt
+        uses: dtolnay/rust-toolchain@master
 
       - name: Build
         run: |
