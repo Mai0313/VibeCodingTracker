@@ -76,12 +76,31 @@ where
 }
 
 /// Standard filter for JSONL and JSON files
+///
+/// Excludes `*.meta.json` sidecar files that Claude Code writes alongside
+/// subagent session logs — those are not conversation logs and have no usage data.
 pub fn is_json_file(path: &Path) -> bool {
+    if is_meta_json_file(path) {
+        return false;
+    }
     if let Some(ext) = path.extension() {
         ext == "jsonl" || ext == "json"
     } else {
         false
     }
+}
+
+/// Filter for Claude Code session files (`.jsonl` only)
+///
+/// Matches both top-level sessions (`~/.claude/projects/<project>/<session>.jsonl`)
+/// and subagent sessions (`~/.claude/projects/<project>/<session>/subagents/agent-*.jsonl`).
+/// Rejects the `*.meta.json` sidecar files and any non-JSONL artifact that ends
+/// up under the projects directory (e.g. screenshots pasted into prompts).
+pub fn is_claude_session_file(path: &Path) -> bool {
+    if is_meta_json_file(path) {
+        return false;
+    }
+    path.extension().is_some_and(|ext| ext == "jsonl")
 }
 
 /// Filter for Gemini files (must be in chats directory and be .json)
@@ -91,4 +110,15 @@ pub fn is_gemini_chat_file(path: &Path) -> bool {
     } else {
         false
     }
+}
+
+/// Returns true if the path ends with `.meta.json`
+///
+/// Claude Code writes these sidecars next to subagent session logs with
+/// metadata like `agentType` / `description`. They have no usage data and
+/// would otherwise be mis-detected as Codex logs.
+fn is_meta_json_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| name.ends_with(".meta.json"))
 }

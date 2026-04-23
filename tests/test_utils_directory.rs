@@ -7,7 +7,7 @@ use std::io::Write;
 use tempfile::tempdir;
 use vibe_coding_tracker::cli::TimeRange;
 use vibe_coding_tracker::utils::directory::{
-    collect_files_with_dates, is_gemini_chat_file, is_json_file,
+    collect_files_with_dates, is_claude_session_file, is_gemini_chat_file, is_json_file,
 };
 
 #[test]
@@ -229,4 +229,80 @@ fn test_collect_files_with_content() {
     let results = collect_files_with_dates(dir.path(), is_json_file, TimeRange::All).unwrap();
     assert_eq!(results.len(), 1);
     assert!(results[0].path.exists());
+}
+
+#[test]
+fn test_is_json_file_excludes_meta_json() {
+    // *.meta.json sidecars live next to Claude Code subagent sessions and must not
+    // be picked up by the generic json filter (they would otherwise be parsed and
+    // mis-detected as Codex logs).
+    let path = std::path::Path::new("agent-afda1991051a0eb93.meta.json");
+    assert!(!is_json_file(path));
+
+    let nested =
+        std::path::Path::new("/home/user/.claude/projects/proj/sess/subagents/agent-x.meta.json");
+    assert!(!is_json_file(nested));
+}
+
+#[test]
+fn test_is_claude_session_file_accepts_jsonl() {
+    // Top-level Claude session logs
+    let top_level = std::path::Path::new("/home/user/.claude/projects/proj/sess.jsonl");
+    assert!(is_claude_session_file(top_level));
+
+    // Subagent session logs sit one extra level deeper
+    let subagent = std::path::Path::new(
+        "/home/user/.claude/projects/proj/sess/subagents/agent-afda1991051a0eb93.jsonl",
+    );
+    assert!(is_claude_session_file(subagent));
+}
+
+#[test]
+fn test_is_claude_session_file_rejects_non_jsonl() {
+    // Metadata sidecars
+    let meta = std::path::Path::new(
+        "/home/user/.claude/projects/proj/sess/subagents/agent-afda1991051a0eb93.meta.json",
+    );
+    assert!(!is_claude_session_file(meta));
+
+    // Plain .json files (not something Claude Code writes in this tree)
+    let plain_json = std::path::Path::new("/home/user/.claude/projects/proj/notes.json");
+    assert!(!is_claude_session_file(plain_json));
+
+    // Other pasted artifacts
+    let image = std::path::Path::new("/home/user/.claude/projects/proj/sess/paste.png");
+    assert!(!is_claude_session_file(image));
+}
+
+#[test]
+fn test_collect_claude_session_files_includes_subagents() {
+    // Simulates the `~/.claude/projects/<project>/<session>/subagents/` layout:
+    //   projects/<project>/
+    //     sess-a.jsonl                          <- top-level session
+    //     sess-a/subagents/agent-one.jsonl      <- subagent session
+    //     sess-a/subagents/agent-one.meta.json  <- metadata sidecar (ignored)
+    //     sess-a/screenshot.png                 <- pasted artifact (ignored)
+    let dir = tempdir().unwrap();
+    let project = dir.path().join("-home-user-repo");
+    let session_subdir = project.join("sess-a");
+    let subagents = session_subdir.join("subagents");
+    fs::create_dir_all(&subagents).unwrap();
+
+    File::create(project.join("sess-a.jsonl")).unwrap();
+    File::create(subagents.join("agent-one.jsonl")).unwrap();
+    File::create(subagents.join("agent-one.meta.json")).unwrap();
+    File::create(session_subdir.join("screenshot.png")).unwrap();
+
+    let results =
+        collect_files_with_dates(dir.path(), is_claude_session_file, TimeRange::All).unwrap();
+    let names: Vec<String> = results
+        .iter()
+        .filter_map(|f| f.path.file_name()?.to_str().map(String::from))
+        .collect();
+
+    assert_eq!(results.len(), 2, "collected: {:?}", names);
+    assert!(names.contains(&"sess-a.jsonl".to_string()));
+    assert!(names.contains(&"agent-one.jsonl".to_string()));
+    assert!(!names.iter().any(|n| n.ends_with(".meta.json")));
+    assert!(!names.iter().any(|n| n.ends_with(".png")));
 }
