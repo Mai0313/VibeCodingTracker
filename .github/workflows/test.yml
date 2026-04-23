@@ -39,7 +39,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Rust Toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: actions-rust-lang/setup-rust-toolchain@v1.16.0
 
       - name: Build
         run: |

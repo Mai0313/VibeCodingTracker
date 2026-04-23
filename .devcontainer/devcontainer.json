@@ -43,7 +43,7 @@
     }
   },
   "dockerFile": "Dockerfile",
-  "updateContentCommand": "rustup update && rustup component add clippy rustfmt && cargo fetch",
+  "updateContentCommand": "cargo fetch",
   "mounts": [
     "source=${localEnv:HOME}/.gitconfig,target=${containerEnv:HOME}/.gitconfig,type=bind,consistency=cached,ro",
     "source=${localEnv:HOME}/.ssh,target=${containerEnv:HOME}/.ssh,type=bind,consistency=cached,ro",

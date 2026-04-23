@@ -6,18 +6,27 @@
 
 version: 2
 updates:
-  # # Cargo (Rust)
-  # - package-ecosystem: "cargo"
-  #   directory: "/"
-  #   schedule:
-  #     interval: "weekly"
-  #   commit-message:
-  #     prefix: "chore"
-  #     include: "scope"
+  # Cargo (Rust)
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
 
   # Rust toolchain (rust-toolchain.toml)
   - package-ecosystem: "rust-toolchain"
     directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  # Docker (Dockerfile base image)
+  - package-ecosystem: "docker"
+    directory: "/docker"
     schedule:
       interval: "weekly"
     commit-message:

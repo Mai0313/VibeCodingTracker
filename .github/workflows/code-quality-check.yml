@@ -32,10 +32,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-          components: rustfmt, clippy
+        uses: actions-rust-lang/setup-rust-toolchain@v1.16.0
 
       - name: Run pre-commits
         run: |
