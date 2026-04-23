@@ -115,7 +115,7 @@ mimalloc = ["dep:mimalloc"]
 
 [dev-dependencies]
 tempfile = "3.23"
-assert_cmd = "2.0"
+assert_cmd = "2.2"
 predicates = "3.1"
 criterion = { version = "0.5", features = ["html_reports"] }
 serial_test = "3.2"
