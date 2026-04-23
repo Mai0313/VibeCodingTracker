@@ -79,8 +79,9 @@ pub fn display_analysis_interactive(
         // Drop current_data immediately after conversion to free memory
         drop(current_data);
 
-        // Clear file cache after processing to release memory
-        crate::cache::clear_global_cache();
+        // `analyze_all_sessions` now bypasses the file cache for aggregated
+        // metrics (runs each file in `AnalysisMode::UsageOnly` and drops
+        // immediately), so there is nothing useful to clear here.
 
         // Track updates
         for row in &rows_data {
@@ -325,9 +326,6 @@ pub fn display_analysis_interactive(
         // Drop heavy data structures after rendering to free memory immediately
         drop(rows_data);
         drop(provider_rows);
-
-        // Force release of any remaining references by clearing caches again
-        crate::cache::clear_global_cache();
 
         // Handle input with timeout
         match handle_input()? {

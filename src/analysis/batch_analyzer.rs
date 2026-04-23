@@ -1,3 +1,5 @@
+use crate::analysis::analyzer::analyze_jsonl_file_typed_with_mode;
+use crate::analysis::common_state::AnalysisMode;
 use crate::cache::global_cache;
 use crate::cli::TimeRange;
 use crate::constants::{FastHashMap, capacity};
@@ -242,13 +244,15 @@ where
     let dir = dir.as_ref();
     let files = collect_files_with_dates(dir, filter_fn, time_range)?;
 
-    // Process files in parallel with caching and collect per-file aggregations
-    // Use Arc to avoid deep cloning - we only need to read fields
-    let file_aggregations: Vec<(String, Arc<CodeAnalysis>)> = files
+    // Aggregated analysis only reads counters — no need for `write_file_details`
+    // bodies or `edit_file_details` strings. Run in `UsageOnly` and skip the
+    // global cache so each file's analysis drops as soon as we've scraped the
+    // tool counts and usage totals.
+    let file_aggregations: Vec<(String, CodeAnalysis)> = files
         .par_iter()
-        .filter_map(
-            |file_info| match global_cache().get_or_parse(&file_info.path) {
-                Ok(analysis_arc) => Some((file_info.modified_date.clone(), analysis_arc)),
+        .filter_map(|file_info| {
+            match analyze_jsonl_file_typed_with_mode(&file_info.path, AnalysisMode::UsageOnly) {
+                Ok(analysis) => Some((file_info.modified_date.clone(), analysis)),
                 Err(e) => {
                     eprintln!(
                         "Warning: Failed to analyze {}: {}",
@@ -257,14 +261,14 @@ where
                     );
                     None
                 }
-            },
-        )
+            }
+        })
         .collect();
 
     // Merge parallel results sequentially (this part is fast)
-    for (date, analysis_arc) in file_aggregations {
+    for (date, analysis) in file_aggregations {
         unique_dates.insert(date);
-        aggregate_analysis_result(aggregated, &analysis_arc);
+        aggregate_analysis_result(aggregated, &analysis);
     }
 
     Ok(())

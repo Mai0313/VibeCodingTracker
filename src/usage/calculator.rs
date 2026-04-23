@@ -1,4 +1,4 @@
-use crate::cache::global_cache;
+use crate::analysis::{AnalysisMode, analyze_jsonl_file_typed_with_mode};
 use crate::cli::TimeRange;
 use crate::constants::{FastHashMap, capacity};
 use crate::models::{CodeAnalysis, ProviderActiveDays, UsageResult};
@@ -129,15 +129,17 @@ where
     let dir = dir.as_ref();
     let files = collect_files_with_dates(dir, filter_fn, time_range)?;
 
-    // Process files in parallel with caching for better performance
+    // Parse each file directly in `UsageOnly` mode, extract the small
+    // per-model usage map, then drop the analysis. We deliberately bypass the
+    // global file cache here: the `usage` path never needs the heavy
+    // `write_file_details` / `edit_file_details` payloads, so caching the
+    // full analysis would waste the memory win from `UsageOnly`.
     let file_results: Vec<(String, FastHashMap<String, Value>)> = files
         .par_iter()
         .filter_map(|file_info| {
-            match global_cache().get_or_parse(&file_info.path) {
-                Ok(analysis_arc) => {
-                    // Use Arc to avoid deep cloning the entire analysis
-                    let conversation_usage =
-                        extract_conversation_usage_from_analysis(&analysis_arc);
+            match analyze_jsonl_file_typed_with_mode(&file_info.path, AnalysisMode::UsageOnly) {
+                Ok(analysis) => {
+                    let conversation_usage = extract_conversation_usage_from_analysis(&analysis);
                     Some((file_info.modified_date.clone(), conversation_usage))
                 }
                 Err(e) => {

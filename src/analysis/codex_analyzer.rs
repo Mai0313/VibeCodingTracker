@@ -1,4 +1,4 @@
-use crate::analysis::common_state::AnalysisState;
+use crate::analysis::common_state::{AnalysisMode, AnalysisState};
 use crate::constants::FastHashMap;
 use crate::models::*;
 use crate::utils::{get_git_remote_url, parse_iso_timestamp, process_codex_usage};
@@ -8,7 +8,14 @@ use serde_json::Value;
 
 /// Analyze Codex conversations
 pub fn analyze_codex_conversations(logs: &[CodexLog]) -> Result<CodeAnalysis> {
-    let mut state = AnalysisState::new();
+    analyze_codex_conversations_with_mode(logs, AnalysisMode::Full)
+}
+
+pub fn analyze_codex_conversations_with_mode(
+    logs: &[CodexLog],
+    mode: AnalysisMode,
+) -> Result<CodeAnalysis> {
+    let mut state = AnalysisState::with_mode(mode);
     let mut conversation_usage: FastHashMap<String, Value> = FastHashMap::with_capacity(5);
     let mut current_model = String::new();
     let mut shell_calls: FastHashMap<String, CodexShellCall> = FastHashMap::with_capacity(50);

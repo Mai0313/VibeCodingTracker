@@ -9,6 +9,7 @@ pub mod gemini_analyzer;
 
 pub use analyzer::*;
 pub use batch_analyzer::*;
+pub use common_state::AnalysisMode;
 pub use copilot_analyzer::*;
 pub use detector::*;
 pub use gemini_analyzer::*;

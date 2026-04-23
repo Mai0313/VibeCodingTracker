@@ -129,9 +129,13 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
         // Clear raw usage data immediately after processing to free memory
         usage_data.clear();
 
-        // Clear file cache and pricing cache to release memory
-        crate::cache::clear_global_cache();
-        crate::pricing::clear_pricing_cache();
+        // NOTE: we intentionally do NOT clear the global file cache or the
+        // pricing cache here. The usage path already bypasses the file cache
+        // (runs in `AnalysisMode::UsageOnly` and drops each analysis after
+        // extraction), so wiping it would only nuke entries populated by
+        // other commands. The pricing cache is a single sub-MB hashmap
+        // backed by a dated on-disk file — clearing it just forces another
+        // file-parse on the next refresh.
 
         let provider_rows = build_provider_average_rows(&daily_averages);
 
@@ -306,10 +310,6 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
         // Drop heavy data structures after rendering to free memory immediately
         drop(rows_data);
         drop(provider_rows);
-
-        // Force release of any remaining references by clearing caches again
-        crate::cache::clear_global_cache();
-        crate::pricing::clear_pricing_cache();
 
         match handle_input()? {
             InputAction::Quit => break,

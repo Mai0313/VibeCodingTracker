@@ -1,9 +1,14 @@
 use crate::VERSION;
-use crate::analysis::claude_analyzer::{analyze_claude_conversations, analyze_claude_logs};
-use crate::analysis::codex_analyzer::analyze_codex_conversations;
-use crate::analysis::copilot_analyzer::analyze_copilot_conversations;
+use crate::analysis::claude_analyzer::{
+    analyze_claude_conversations_with_mode, analyze_claude_logs,
+};
+use crate::analysis::codex_analyzer::analyze_codex_conversations_with_mode;
+use crate::analysis::common_state::AnalysisMode;
+use crate::analysis::copilot_analyzer::analyze_copilot_conversations_with_mode;
 use crate::analysis::detector::detect_extension_type;
-use crate::analysis::gemini_analyzer::{analyze_gemini_conversations, analyze_gemini_session};
+use crate::analysis::gemini_analyzer::{
+    analyze_gemini_conversations_with_mode, analyze_gemini_session,
+};
 use crate::constants::buffer;
 use crate::models::{
     ClaudeCodeLog, CodeAnalysis, CodexLog, CopilotSession, ExtensionType, GeminiSession,
@@ -34,10 +39,22 @@ pub fn analyze_jsonl_file<P: AsRef<Path>>(path: P) -> Result<Value> {
 
 /// Typed entry point used by the global file cache and any caller that wants
 /// to read aggregate fields without paying for a `Value` round-trip.
+///
+/// Parses in [`AnalysisMode::Full`] — for callers that only consume tool
+/// counts and token usage (usage / aggregated analysis), use
+/// [`analyze_jsonl_file_typed_with_mode`] with [`AnalysisMode::UsageOnly`]
+/// to avoid allocating `write_file_details`/`edit_file_details` bodies.
 pub fn analyze_jsonl_file_typed<P: AsRef<Path>>(path: P) -> Result<CodeAnalysis> {
+    analyze_jsonl_file_typed_with_mode(path, AnalysisMode::Full)
+}
+
+pub fn analyze_jsonl_file_typed_with_mode<P: AsRef<Path>>(
+    path: P,
+    mode: AnalysisMode,
+) -> Result<CodeAnalysis> {
     let path = path.as_ref();
 
-    if let Some(analysis) = stream_analyze_jsonl(path)? {
+    if let Some(analysis) = stream_analyze_jsonl(path, mode)? {
         return Ok(analysis);
     }
 
@@ -59,13 +76,13 @@ pub fn analyze_jsonl_file_typed<P: AsRef<Path>>(path: P) -> Result<CodeAnalysis>
     }
 
     let ext_type = detect_extension_type(&data)?;
-    dispatch_by_vec(data, ext_type)
+    dispatch_by_vec(data, ext_type, mode)
 }
 
 /// Peeks the first JSON record to detect format, then routes to a type-driven
 /// streaming analyzer. Returns `Ok(None)` when the input cannot be parsed as
 /// JSONL (e.g. pretty-printed JSON) so the caller can fall back.
-fn stream_analyze_jsonl(path: &Path) -> Result<Option<CodeAnalysis>> {
+fn stream_analyze_jsonl(path: &Path, mode: AnalysisMode) -> Result<Option<CodeAnalysis>> {
     let file = File::open(path)
         .with_context(|| format!("Failed to open file: {}", path.display()))?;
     let mut reader = BufReader::with_capacity(buffer::FILE_READ_BUFFER, file);
@@ -81,7 +98,7 @@ fn stream_analyze_jsonl(path: &Path) -> Result<Option<CodeAnalysis>> {
     };
 
     let ext = detect_from_first_value(&first_value);
-    let analysis = dispatch_streaming(ext, first_value, reader)?;
+    let analysis = dispatch_streaming(ext, first_value, reader, mode)?;
     Ok(Some(finalize(analysis, ext)))
 }
 
@@ -132,6 +149,7 @@ fn dispatch_streaming(
     ext: ExtensionType,
     first_value: Value,
     mut reader: BufReader<File>,
+    mode: AnalysisMode,
 ) -> Result<CodeAnalysis> {
     match ext {
         ExtensionType::ClaudeCode => {
@@ -141,7 +159,7 @@ fn dispatch_streaming(
                 .ok()
                 .into_iter();
             let rest = iter_jsonl_typed::<ClaudeCodeLog>(&mut reader);
-            analyze_claude_logs(first_iter.chain(rest))
+            analyze_claude_logs(first_iter.chain(rest), mode)
         }
         ExtensionType::Codex => {
             let mut logs: Vec<CodexLog> = Vec::with_capacity(64);
@@ -151,17 +169,17 @@ fn dispatch_streaming(
             for log in iter_jsonl_typed::<CodexLog>(&mut reader) {
                 logs.push(log);
             }
-            analyze_codex_conversations(&logs)
+            analyze_codex_conversations_with_mode(&logs, mode)
         }
         ExtensionType::Copilot => {
             let session: CopilotSession = serde_json::from_value(first_value)
                 .context("Failed to parse Copilot session")?;
-            analyze_copilot_conversations(session)
+            analyze_copilot_conversations_with_mode(session, mode)
         }
         ExtensionType::Gemini => {
             let session: GeminiSession = serde_json::from_value(first_value)
                 .context("Failed to parse Gemini session")?;
-            analyze_gemini_session(session)
+            analyze_gemini_session(session, mode)
         }
     }
 }
@@ -188,21 +206,25 @@ where
 /// Legacy dispatch used by the pretty-printed JSON fallback. Operates on an
 /// already-materialised `Vec<Value>` — preferred to be avoided in the hot
 /// path, but needed for Gemini/Copilot dumps that span multiple lines.
-fn dispatch_by_vec(data: Vec<Value>, ext_type: ExtensionType) -> Result<CodeAnalysis> {
+fn dispatch_by_vec(
+    data: Vec<Value>,
+    ext_type: ExtensionType,
+    mode: AnalysisMode,
+) -> Result<CodeAnalysis> {
     let analysis = match ext_type {
-        ExtensionType::ClaudeCode => analyze_claude_conversations(data)?,
+        ExtensionType::ClaudeCode => analyze_claude_conversations_with_mode(data, mode)?,
         ExtensionType::Codex => {
             let logs: Vec<CodexLog> = data
                 .into_iter()
                 .filter_map(|v| serde_json::from_value(v).ok())
                 .collect();
-            analyze_codex_conversations(&logs)?
+            analyze_codex_conversations_with_mode(&logs, mode)?
         }
         ExtensionType::Copilot => {
             let session: CopilotSession = serde_json::from_value(data[0].clone())?;
-            analyze_copilot_conversations(session)?
+            analyze_copilot_conversations_with_mode(session, mode)?
         }
-        ExtensionType::Gemini => analyze_gemini_conversations(data)?,
+        ExtensionType::Gemini => analyze_gemini_conversations_with_mode(data, mode)?,
     };
     Ok(finalize(analysis, ext_type))
 }
