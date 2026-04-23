@@ -6,7 +6,7 @@ use crate::models::{
 };
 use crate::utils::{
     COPILOT_SESSION_MAX_DEPTH, collect_files_with_max_depth, is_claude_session_file,
-    is_copilot_session_file, is_gemini_chat_file, is_json_file, resolve_paths,
+    is_codex_session_file, is_copilot_session_file, is_gemini_session_file, resolve_paths,
 };
 use anyhow::Result;
 use rayon::prelude::*;
@@ -87,7 +87,7 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
             &mut result,
             &mut per_provider.codex,
             &mut codex_dates,
-            is_json_file,
+            is_codex_session_file,
             time_range,
             None,
         )?;
@@ -118,7 +118,7 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
             &mut result,
             &mut per_provider.gemini,
             &mut gemini_dates,
-            is_gemini_chat_file,
+            is_gemini_session_file,
             time_range,
             None,
         )?;

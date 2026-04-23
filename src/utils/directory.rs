@@ -113,12 +113,20 @@ where
 /// per session just to have `is_copilot_session_file` reject them.
 pub const COPILOT_SESSION_MAX_DEPTH: usize = 2;
 
-/// Standard filter for JSONL and JSON files
+/// Filter for Codex session files under `~/.codex/sessions/YYYY/MM/DD/`.
 ///
-/// Excludes `*.meta.json` / `*.meta.jsonl` sidecar files that Claude Code writes
-/// alongside subagent session logs — those are not conversation logs and have
-/// no usage data.
-pub fn is_json_file(path: &Path) -> bool {
+/// Codex writes `rollout-*.jsonl` files directly into the dated sub-folders.
+/// We also accept `.json` defensively in case an older dump ever gets dropped
+/// into the tree, but reject Claude Code's `*.meta.json` / `*.meta.jsonl`
+/// subagent sidecar files (those live under `~/.claude/projects/` in
+/// practice, but the filter still guards against the unlikely collision).
+///
+/// Intentionally separated from the other per-provider filters
+/// (`is_claude_session_file`, `is_copilot_session_file`,
+/// `is_gemini_session_file`) even though the body is currently trivial:
+/// keeping one filter per provider means future format changes on one
+/// provider do not require teasing apart a shared implementation.
+pub fn is_codex_session_file(path: &Path) -> bool {
     if is_meta_sidecar_file(path) {
         return false;
     }
@@ -142,7 +150,7 @@ pub fn is_claude_session_file(path: &Path) -> bool {
     path.extension().is_some_and(|ext| ext == "jsonl")
 }
 
-/// Filter for Gemini files (must be in a `chats/` directory)
+/// Filter for Gemini CLI session files
 ///
 /// Gemini CLI went through a format change: historical exports were a single
 /// pretty-printed JSON object stored as `chats/<session>.json`, while current
@@ -151,7 +159,7 @@ pub fn is_claude_session_file(path: &Path) -> bool {
 /// coexist. The parent-directory check still scopes us to the `chats/`
 /// subfolder, so sibling artifacts like `discordbot/logs.json` or the
 /// `bin/rg` binary living under `~/.gemini/tmp/` do not get picked up.
-pub fn is_gemini_chat_file(path: &Path) -> bool {
+pub fn is_gemini_session_file(path: &Path) -> bool {
     if let (Some(parent), Some(ext)) = (path.parent(), path.extension()) {
         parent.file_name() == Some(std::ffi::OsStr::new("chats"))
             && (ext == "json" || ext == "jsonl")
@@ -181,7 +189,7 @@ pub fn is_copilot_session_file(path: &Path) -> bool {
     // non-UTF-8 bytes elsewhere in the tree do not silently reject the file.
     // The chosen constants (`events.jsonl`, `session-state`) are pure ASCII,
     // so the comparison is safe on every platform we care about and keeps
-    // the style consistent with `is_gemini_chat_file`'s `OsStr::new("chats")`
+    // the style consistent with `is_gemini_session_file`'s `OsStr::new("chats")`
     // check above.
     if path.file_name() != Some(std::ffi::OsStr::new("events.jsonl")) {
         return false;

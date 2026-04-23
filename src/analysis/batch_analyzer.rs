@@ -6,7 +6,7 @@ use crate::constants::{FastHashMap, capacity};
 use crate::models::{CodeAnalysis, ExtensionType, ProviderActiveDays};
 use crate::utils::{
     COPILOT_SESSION_MAX_DEPTH, collect_files_with_max_depth, is_claude_session_file,
-    is_copilot_session_file, is_gemini_chat_file, is_json_file,
+    is_codex_session_file, is_copilot_session_file, is_gemini_session_file,
 };
 use anyhow::Result;
 use rayon::prelude::*;
@@ -100,7 +100,7 @@ pub fn analyze_all_sessions(time_range: TimeRange) -> Result<AnalysisData> {
             &mut aggregated,
             &mut codex_aggregated,
             &mut codex_dates,
-            is_json_file,
+            is_codex_session_file,
             time_range,
             None,
         )?;
@@ -128,7 +128,7 @@ pub fn analyze_all_sessions(time_range: TimeRange) -> Result<AnalysisData> {
             &mut aggregated,
             &mut gemini_aggregated,
             &mut gemini_dates,
-            is_gemini_chat_file,
+            is_gemini_session_file,
             time_range,
             None,
         )?;
@@ -221,7 +221,7 @@ pub fn analyze_all_sessions_by_provider(time_range: TimeRange) -> Result<Provide
             &paths.codex_session_dir,
             ExtensionType::Codex,
             &mut codex_results,
-            is_json_file,
+            is_codex_session_file,
             time_range,
             None,
         )?;
@@ -246,7 +246,7 @@ pub fn analyze_all_sessions_by_provider(time_range: TimeRange) -> Result<Provide
             &paths.gemini_session_dir,
             ExtensionType::Gemini,
             &mut gemini_results,
-            is_gemini_chat_file,
+            is_gemini_session_file,
             time_range,
             None,
         )?;
