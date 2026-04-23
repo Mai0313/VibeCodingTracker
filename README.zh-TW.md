@@ -229,7 +229,7 @@ vct usage --json --daily
 - `~/.claude/projects/*.jsonl`（Claude Code）
 - `~/.codex/sessions/*.jsonl`（Codex）
 - `~/.copilot/session-state/<sessionId>/events.jsonl`（Copilot CLI）
-- `~/.gemini/tmp/<project_hash>/chats/*.jsonl`（Gemini CLI）
+- `~/.gemini/tmp/<project_hash>/chats/*.{json,jsonl}`（Gemini CLI — 同時支援舊版 `.json` 單一物件匯出與現行的 `.jsonl` event stream）
 
 ---
 

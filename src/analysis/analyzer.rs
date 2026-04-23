@@ -280,15 +280,20 @@ fn dispatch_streaming_buffered(
             let session: GeminiSession =
                 serde_json::from_value(first).context("Failed to parse Gemini session")?;
 
-            // Streaming path sees three situations for Gemini:
+            // Streaming path sees two Gemini shapes in practice:
             // 1. Modern JSONL stream — the first line is a meta record with
-            //    no `messages` field; subsequent lines are per-event values.
+            //    no `messages` field; subsequent lines are per-event values
+            //    consumed by `analyze_gemini_events` below.
             // 2. Legacy single-object file that happens to be on one line —
-            //    `messages` is fully populated and the event iterator is
-            //    empty; hand it to the single-object analyzer.
-            // 3. Hybrid (should not happen in the wild) — treat it as
-            //    JSONL, the legacy messages still get processed via
-            //    `analyze_gemini_session` first.
+            //    `messages` is fully populated; hand it straight to
+            //    `analyze_gemini_session`. Any *additional* buffered or
+            //    streamed events are discarded by this early return, which
+            //    is safe because legacy exports are a single JSON object
+            //    and never carry extra trailing records. A malformed
+            //    "hybrid" file mixing the two formats would have its
+            //    post-object content dropped here; we consider that
+            //    intentional since such a file is not produced by any
+            //    known Gemini CLI version.
             if !session.messages.is_empty() {
                 return analyze_gemini_session(session, mode);
             }

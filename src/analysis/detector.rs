@@ -9,7 +9,11 @@ use serde_json::Value;
 ///   and `messages` fields
 /// - Gemini (current JSONL stream): first line is a session-meta record with
 ///   `sessionId`, `projectHash`, and `kind` fields (no `messages`)
-/// - Copilot: single object with `sessionId`, `startTime`, and `timeline` fields
+/// - Copilot (legacy single-object): object with `sessionId`, `startTime`,
+///   and `timeline` fields
+/// - Copilot (current JSONL stream): first line is a
+///   `type == "session.start"` event whose `data.producer` field identifies
+///   a Copilot agent (e.g. `copilot-agent`, `copilot-cli`)
 /// - Claude Code: contains `parentUuid` field in log entries
 /// - Codex: default fallback if no other markers found
 pub fn detect_extension_type(data: &[Value]) -> Result<ExtensionType> {
