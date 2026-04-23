@@ -151,9 +151,13 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
 
         for row in &rows_data {
             let row_key = row.model.clone();
+            // Include reasoning in the change fingerprint so Gemini
+            // sessions whose only delta lands in `thoughts_tokens` still
+            // trigger a highlight; otherwise the row would look idle
+            // while its cost silently grew.
             let current_data = (
                 row.input_tokens,
-                row.output_tokens,
+                row.output_with_reasoning(),
                 row.cache_read,
                 row.cache_creation,
             );
@@ -203,7 +207,7 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
                     RatatuiRow::new(vec![
                         row.display_model.clone(),
                         format_number(row.input_tokens),
-                        format_number(row.output_tokens),
+                        format_number(row.output_with_reasoning()),
                         format_number(row.cache_read),
                         format_number(row.cache_creation),
                         format_number(row.total),
@@ -217,7 +221,7 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
                 RatatuiRow::new(vec![
                     "TOTAL".to_string(),
                     format_number(totals.input_tokens),
-                    format_number(totals.output_tokens),
+                    format_number(totals.output_with_reasoning()),
                     format_number(totals.cache_read),
                     format_number(totals.cache_creation),
                     format_number(totals.total),

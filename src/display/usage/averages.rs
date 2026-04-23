@@ -4,17 +4,37 @@ use crate::utils::format_number;
 use serde_json::Value;
 use std::borrow::Cow;
 
-/// Data structure for a usage row
+/// Data structure for a usage row.
+///
+/// `output_tokens` is the user-visible response the model emitted;
+/// `reasoning_tokens` is the separately-billed "thinking" budget (Gemini
+/// `thoughts_tokens`, Codex `reasoning_output_tokens`, Copilot
+/// `reasoningTokens`). Display layers typically present their sum in a
+/// single "Output" column via `output_with_reasoning()` so the per-row
+/// numbers reconcile with `total`, while `cost` is computed against the
+/// per-token reasoning rate (when the model publishes one) via
+/// `calculate_cost`.
 #[derive(Default)]
 pub struct UsageRow {
     pub model: String,         // 原始模型名稱
     pub display_model: String, // 可能含 fuzzy match 提示的顯示名稱
     pub input_tokens: i64,
     pub output_tokens: i64,
+    pub reasoning_tokens: i64,
     pub cache_read: i64,
     pub cache_creation: i64,
     pub total: i64,
     pub cost: f64,
+}
+
+impl UsageRow {
+    /// Sum of output and reasoning tokens — the "total model-emitted
+    /// tokens" figure most display tables want to show in an Output
+    /// column so the row adds up to `total`.
+    #[inline]
+    pub fn output_with_reasoning(&self) -> i64 {
+        self.output_tokens + self.reasoning_tokens
+    }
 }
 
 /// Totals for all usage rows
@@ -22,6 +42,7 @@ pub struct UsageRow {
 pub struct UsageTotals {
     pub input_tokens: i64,
     pub output_tokens: i64,
+    pub reasoning_tokens: i64,
     pub cache_read: i64,
     pub cache_creation: i64,
     pub total: i64,
@@ -32,10 +53,17 @@ impl UsageTotals {
     pub fn accumulate(&mut self, row: &UsageRow) {
         self.input_tokens += row.input_tokens;
         self.output_tokens += row.output_tokens;
+        self.reasoning_tokens += row.reasoning_tokens;
         self.cache_read += row.cache_read;
         self.cache_creation += row.cache_creation;
         self.total += row.total;
         self.cost += row.cost;
+    }
+
+    /// Same helper as [`UsageRow::output_with_reasoning`] for totals.
+    #[inline]
+    pub fn output_with_reasoning(&self) -> i64 {
+        self.output_tokens + self.reasoning_tokens
     }
 }
 
@@ -295,6 +323,7 @@ fn extract_usage_row(
         display_model: display_model.into_owned(),
         input_tokens: counts.input_tokens,
         output_tokens: counts.output_tokens,
+        reasoning_tokens: counts.reasoning_tokens,
         cache_read: counts.cache_read,
         cache_creation: counts.cache_creation,
         total: counts.total,
