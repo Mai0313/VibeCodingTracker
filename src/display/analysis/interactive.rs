@@ -1,6 +1,6 @@
-use crate::analysis::AnalysisData;
+use crate::analysis::{AnalysisData, PerProviderAnalysisRows};
 use crate::display::analysis::averages::{
-    AnalysisRow, build_analysis_provider_rows, calculate_analysis_daily_averages,
+    AnalysisRow, build_analysis_provider_rows, calculate_analysis_daily_averages_from_per_provider,
     convert_to_analysis_rows, format_lines_per_day,
 };
 use crate::display::common::table::{
@@ -70,6 +70,7 @@ pub fn display_analysis_interactive(
                 log::warn!("Failed to analyze sessions: {}", e);
                 AnalysisData {
                     rows: Vec::new(),
+                    per_provider: PerProviderAnalysisRows::default(),
                     provider_days: Default::default(),
                 }
             }
@@ -79,6 +80,7 @@ pub fn display_analysis_interactive(
         let mut totals = AnalysisRow::default();
         let rows_data = convert_to_analysis_rows(&current_data.rows);
         let provider_days = current_data.provider_days.clone();
+        let per_provider = current_data.per_provider.clone();
 
         // Drop current_data immediately after conversion to free memory
         drop(current_data);
@@ -117,8 +119,11 @@ pub fn display_analysis_interactive(
         let current_row_keys: Vec<String> = rows_data.iter().map(|row| row.model.clone()).collect();
         update_tracker.cleanup(current_row_keys);
 
-        // Calculate daily averages
-        let daily_averages = calculate_analysis_daily_averages(&rows_data, &provider_days);
+        // Calculate daily averages directly from the per-provider aggregated
+        // rows produced by the batch analyzer, so Copilot sessions cannot be
+        // mis-attributed to Claude Code based on their (now real) model name.
+        let daily_averages =
+            calculate_analysis_daily_averages_from_per_provider(&per_provider, &provider_days);
         let provider_rows = build_analysis_provider_rows(&daily_averages);
 
         // Render

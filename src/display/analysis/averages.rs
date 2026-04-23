@@ -1,4 +1,4 @@
-use crate::analysis::AggregatedAnalysisRow;
+use crate::analysis::{AggregatedAnalysisRow, PerProviderAnalysisRows};
 use crate::display::common::{DailyAverageRow, ProviderAverage, ProviderStatistics};
 use crate::models::{Provider, ProviderActiveDays};
 use crate::utils::format_number;
@@ -124,12 +124,90 @@ impl ProviderStatistics<AnalysisRow> for AnalysisProviderStats {
 pub type AnalysisDailyAverages =
     crate::display::common::DailyAverages<AnalysisRow, AnalysisProviderStats>;
 
-/// Calculate daily averages for analysis data, grouped by provider (uses generic implementation)
+/// Calculate daily averages for analysis data, grouped by provider (uses generic implementation).
+///
+/// Only used for the legacy single-file analysis path where there is no
+/// per-provider breakdown; the per-model rows are inspected and guessed-at
+/// by name. For batch analysis prefer
+/// [`calculate_analysis_daily_averages_from_per_provider`] which uses
+/// source-directory attribution instead.
 pub fn calculate_analysis_daily_averages(
     rows: &[AnalysisRow],
     provider_days: &ProviderActiveDays,
 ) -> AnalysisDailyAverages {
     crate::display::common::calculate_daily_averages(rows, provider_days)
+}
+
+/// Calculate daily averages for analysis data using **source-directory**
+/// attribution, matching the usage command's approach.
+///
+/// Consuming `PerProviderAnalysisRows` directly means same-named models
+/// that appear in multiple providers (e.g. `claude-sonnet-4-6` recorded
+/// both by Claude Code and Copilot CLI after the recent Copilot refactor)
+/// are attributed correctly to each source directory rather than being
+/// lumped under whichever provider the model name happens to look like.
+pub fn calculate_analysis_daily_averages_from_per_provider(
+    per_provider: &PerProviderAnalysisRows,
+    provider_days: &ProviderActiveDays,
+) -> AnalysisDailyAverages {
+    let mut averages = AnalysisDailyAverages::default();
+
+    averages.claude.set_days(provider_days.claude);
+    averages.codex.set_days(provider_days.codex);
+    averages.copilot.set_days(provider_days.copilot);
+    averages.gemini.set_days(provider_days.gemini);
+    averages.overall.set_days(provider_days.total);
+
+    accumulate_analysis_provider(&mut averages.claude, &per_provider.claude);
+    accumulate_analysis_provider(&mut averages.codex, &per_provider.codex);
+    accumulate_analysis_provider(&mut averages.copilot, &per_provider.copilot);
+    accumulate_analysis_provider(&mut averages.gemini, &per_provider.gemini);
+
+    // "All Providers" row is the sum of every provider's totals, matching
+    // the usage command. Summing per-provider stats keeps the overall
+    // total == Σ providers even when a model appears under more than one
+    // provider.
+    averages.overall.total_edit_lines = averages.claude.total_edit_lines
+        + averages.codex.total_edit_lines
+        + averages.copilot.total_edit_lines
+        + averages.gemini.total_edit_lines;
+    averages.overall.total_read_lines = averages.claude.total_read_lines
+        + averages.codex.total_read_lines
+        + averages.copilot.total_read_lines
+        + averages.gemini.total_read_lines;
+    averages.overall.total_write_lines = averages.claude.total_write_lines
+        + averages.codex.total_write_lines
+        + averages.copilot.total_write_lines
+        + averages.gemini.total_write_lines;
+    averages.overall.total_bash_count = averages.claude.total_bash_count
+        + averages.codex.total_bash_count
+        + averages.copilot.total_bash_count
+        + averages.gemini.total_bash_count;
+    averages.overall.total_edit_count = averages.claude.total_edit_count
+        + averages.codex.total_edit_count
+        + averages.copilot.total_edit_count
+        + averages.gemini.total_edit_count;
+    averages.overall.total_read_count = averages.claude.total_read_count
+        + averages.codex.total_read_count
+        + averages.copilot.total_read_count
+        + averages.gemini.total_read_count;
+    averages.overall.total_todo_write_count = averages.claude.total_todo_write_count
+        + averages.codex.total_todo_write_count
+        + averages.copilot.total_todo_write_count
+        + averages.gemini.total_todo_write_count;
+    averages.overall.total_write_count = averages.claude.total_write_count
+        + averages.codex.total_write_count
+        + averages.copilot.total_write_count
+        + averages.gemini.total_write_count;
+
+    averages
+}
+
+fn accumulate_analysis_provider(stats: &mut AnalysisProviderStats, rows: &[AggregatedAnalysisRow]) {
+    let analysis_rows = convert_to_analysis_rows(rows);
+    for row in &analysis_rows {
+        stats.accumulate(row, Provider::Unknown);
+    }
 }
 
 /// Build provider average rows for display

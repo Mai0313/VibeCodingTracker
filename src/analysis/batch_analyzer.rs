@@ -32,8 +32,27 @@ pub struct AggregatedAnalysisRow {
 
 /// Analysis results with provider active day counts for daily averages
 pub struct AnalysisData {
+    /// Rows aggregated across *all* providers, keyed by model name.
+    ///
+    /// Drives the main per-model table. Same-named models from different
+    /// providers (e.g. Copilot CLI + Claude Code both using
+    /// `claude-sonnet-4-6`) share a single row here.
     pub rows: Vec<AggregatedAnalysisRow>,
+    /// Same aggregation, but partitioned by **source directory** rather
+    /// than by model name. Drives the per-provider summary footer so
+    /// Copilot-originated sessions cannot be mis-attributed to Claude Code
+    /// just because their model name starts with `claude-`.
+    pub per_provider: PerProviderAnalysisRows,
     pub provider_days: ProviderActiveDays,
+}
+
+/// Per-provider aggregated analysis rows, keyed by source directory.
+#[derive(Debug, Default, Clone)]
+pub struct PerProviderAnalysisRows {
+    pub claude: Vec<AggregatedAnalysisRow>,
+    pub codex: Vec<AggregatedAnalysisRow>,
+    pub copilot: Vec<AggregatedAnalysisRow>,
+    pub gemini: Vec<AggregatedAnalysisRow>,
 }
 
 /// Analyzes all session files across providers and aggregates file operation metrics
@@ -44,6 +63,15 @@ pub fn analyze_all_sessions(time_range: TimeRange) -> Result<AnalysisData> {
     let paths = crate::utils::resolve_paths()?;
     let mut aggregated: FastHashMap<String, AggregatedAnalysisRow> =
         FastHashMap::with_capacity(capacity::MODEL_COMBINATIONS);
+
+    let mut claude_aggregated: FastHashMap<String, AggregatedAnalysisRow> =
+        FastHashMap::with_capacity(capacity::MODELS_PER_SESSION);
+    let mut codex_aggregated: FastHashMap<String, AggregatedAnalysisRow> =
+        FastHashMap::with_capacity(capacity::MODELS_PER_SESSION);
+    let mut copilot_aggregated: FastHashMap<String, AggregatedAnalysisRow> =
+        FastHashMap::with_capacity(capacity::MODELS_PER_SESSION);
+    let mut gemini_aggregated: FastHashMap<String, AggregatedAnalysisRow> =
+        FastHashMap::with_capacity(capacity::MODELS_PER_SESSION);
 
     let mut claude_dates: HashSet<String> = HashSet::new();
     let mut codex_dates: HashSet<String> = HashSet::new();
@@ -57,6 +85,7 @@ pub fn analyze_all_sessions(time_range: TimeRange) -> Result<AnalysisData> {
             &paths.claude_session_dir,
             ExtensionType::ClaudeCode,
             &mut aggregated,
+            &mut claude_aggregated,
             &mut claude_dates,
             is_claude_session_file,
             time_range,
@@ -68,6 +97,7 @@ pub fn analyze_all_sessions(time_range: TimeRange) -> Result<AnalysisData> {
             &paths.codex_session_dir,
             ExtensionType::Codex,
             &mut aggregated,
+            &mut codex_aggregated,
             &mut codex_dates,
             is_json_file,
             time_range,
@@ -79,6 +109,7 @@ pub fn analyze_all_sessions(time_range: TimeRange) -> Result<AnalysisData> {
             &paths.copilot_session_dir,
             ExtensionType::Copilot,
             &mut aggregated,
+            &mut copilot_aggregated,
             &mut copilot_dates,
             is_copilot_session_file,
             time_range,
@@ -90,6 +121,7 @@ pub fn analyze_all_sessions(time_range: TimeRange) -> Result<AnalysisData> {
             &paths.gemini_session_dir,
             ExtensionType::Gemini,
             &mut aggregated,
+            &mut gemini_aggregated,
             &mut gemini_dates,
             is_gemini_chat_file,
             time_range,
@@ -113,10 +145,24 @@ pub fn analyze_all_sessions(time_range: TimeRange) -> Result<AnalysisData> {
     let mut results: Vec<AggregatedAnalysisRow> = aggregated.into_values().collect();
     results.sort_unstable_by(|a, b| a.model.cmp(&b.model));
 
+    let per_provider = PerProviderAnalysisRows {
+        claude: into_sorted_rows(claude_aggregated),
+        codex: into_sorted_rows(codex_aggregated),
+        copilot: into_sorted_rows(copilot_aggregated),
+        gemini: into_sorted_rows(gemini_aggregated),
+    };
+
     Ok(AnalysisData {
         rows: results,
+        per_provider,
         provider_days,
     })
+}
+
+fn into_sorted_rows(map: FastHashMap<String, AggregatedAnalysisRow>) -> Vec<AggregatedAnalysisRow> {
+    let mut v: Vec<AggregatedAnalysisRow> = map.into_values().collect();
+    v.sort_unstable_by(|a, b| a.model.cmp(&b.model));
+    v
 }
 
 /// Complete CodeAnalysis results organized by AI provider.
@@ -245,6 +291,7 @@ fn process_analysis_directory<P, F>(
     dir: P,
     provider: ExtensionType,
     aggregated: &mut FastHashMap<String, AggregatedAnalysisRow>,
+    provider_aggregated: &mut FastHashMap<String, AggregatedAnalysisRow>,
     unique_dates: &mut HashSet<String>,
     filter_fn: F,
     time_range: TimeRange,
@@ -278,10 +325,16 @@ where
         })
         .collect();
 
-    // Merge parallel results sequentially (this part is fast)
+    // Merge parallel results sequentially (this part is fast). Every
+    // per-model row is accumulated into *both* the cross-provider
+    // `aggregated` map (drives the main table) and the per-provider
+    // `provider_aggregated` map (drives the per-provider footer) so
+    // the display layer does not have to infer provenance from the
+    // model name.
     for (date, analysis) in file_aggregations {
         unique_dates.insert(date);
         aggregate_analysis_result(aggregated, &analysis);
+        aggregate_analysis_result(provider_aggregated, &analysis);
     }
 
     Ok(())

@@ -129,9 +129,9 @@ fn main() -> Result<()> {
                     let json_str = serde_json::to_string_pretty(&enriched_data)?;
                     println!("{}", json_str);
                 } else if text {
-                    display_usage_text(&usage_data.models, &usage_data.provider_days);
+                    display_usage_text(&usage_data);
                 } else {
-                    display_usage_table(&usage_data.models, &usage_data.provider_days);
+                    display_usage_table(&usage_data);
                 }
             } else {
                 display_usage_interactive(time_range)?;

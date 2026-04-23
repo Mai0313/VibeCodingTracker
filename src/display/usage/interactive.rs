@@ -8,7 +8,7 @@ use crate::display::common::tui::{
 use crate::display::usage::averages::{
     build_provider_average_rows, build_usage_summary, format_tokens_per_day,
 };
-use crate::models::{ProviderActiveDays, UsageResult};
+use crate::models::{PerProviderUsage, ProviderActiveDays, UsageResult};
 use crate::pricing::{ModelPricingMap, fetch_model_pricing};
 use crate::utils::format_number;
 use ratatui::{
@@ -50,6 +50,7 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
     sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
 
     let mut usage_data = UsageResult::default();
+    let mut per_provider_usage = PerProviderUsage::default();
     let mut provider_days = ProviderActiveDays::default();
     let mut has_usage_data = false;
 
@@ -90,6 +91,7 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
         match crate::usage::get_usage_from_directories(time_range) {
             Ok(data) => {
                 usage_data = data.models;
+                per_provider_usage = data.per_provider;
                 provider_days = data.provider_days;
                 has_usage_data = true;
             }
@@ -97,6 +99,7 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
                 log::warn!("Failed to get usage data: {}", e);
                 if !has_usage_data {
                     usage_data.clear();
+                    per_provider_usage = PerProviderUsage::default();
                 }
             }
         }
@@ -114,15 +117,22 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
             }
         }
 
-        let summary = build_usage_summary(&usage_data, &provider_days, &pricing_map);
+        let summary = build_usage_summary(
+            &usage_data,
+            &per_provider_usage,
+            &provider_days,
+            &pricing_map,
+        );
 
         // Extract only the data needed for rendering to minimize memory usage
         let rows_data = summary.rows;
         let totals = summary.totals;
         let daily_averages = summary.daily_averages;
 
-        // Clear raw usage data immediately after processing to free memory
+        // Clear raw usage data immediately after processing to free memory.
+        // Per-provider map is reset on the next refresh when new data arrives.
         usage_data.clear();
+        per_provider_usage = PerProviderUsage::default();
 
         // NOTE: we intentionally do NOT clear the global file cache or the
         // pricing cache here. The usage path already bypasses the file cache
