@@ -202,7 +202,7 @@ where
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                 {
-                    current_model = new_model.to_string();
+                    current_model = canonicalize_model_name(new_model);
                 }
             }
             "session.shutdown" => {
@@ -228,7 +228,7 @@ where
                             "cache_read_input_tokens": usage.cache_read_tokens,
                             "cache_creation_input_tokens": usage.cache_write_tokens,
                         });
-                        conversation_usage.insert(model, usage_json);
+                        conversation_usage.insert(canonicalize_model_name(&model), usage_json);
                     }
                     shutdown_seen = true;
                 }
@@ -438,4 +438,67 @@ fn build_remote_url(host: &str, repository: &str) -> String {
         return String::new();
     }
     format!("https://{}/{}", host.trim(), repository.trim())
+}
+
+/// Canonicalise a Copilot-supplied model name.
+///
+/// Copilot CLI writes Anthropic model names with **dot-separated** minor
+/// versions (e.g. `claude-sonnet-4.6`, `claude-opus-4.7`), while the
+/// LiteLLM pricing table and every other CLI in this tool (Claude Code,
+/// Codex) use the **dash-separated** form (`claude-sonnet-4-6`,
+/// `claude-opus-4-7`).
+///
+/// If we leave the Copilot names as-is, two things go wrong:
+///
+/// 1. `merge_usage_values` keeps Copilot's `claude-sonnet-4.6` separate
+///    from Claude Code's `claude-sonnet-4-6`, splitting a single model's
+///    usage across two rows.
+/// 2. The pricing matcher's substring/fuzzy tier finds no exact key for
+///    `claude-sonnet-4.6` and picks the *only* dot-named variant it has
+///    — `openrouter/anthropic/claude-sonnet-4.6` — which is an OpenRouter
+///    proxy entry with different per-token rates, not the Anthropic
+///    native rate the Copilot caller is actually being billed against.
+///
+/// We limit the rewrite to names starting with `claude-` so OpenAI /
+/// Google models whose native form legitimately contains dots (e.g.
+/// `gpt-5.1`, `gemini-1.5-pro`) are left untouched.
+fn canonicalize_model_name(name: &str) -> String {
+    if name.starts_with("claude-") {
+        name.replace('.', "-")
+    } else {
+        name.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonicalize_model_name;
+
+    #[test]
+    fn claude_dot_version_rewrites_to_dash() {
+        assert_eq!(
+            canonicalize_model_name("claude-sonnet-4.6"),
+            "claude-sonnet-4-6"
+        );
+        assert_eq!(
+            canonicalize_model_name("claude-opus-4.7"),
+            "claude-opus-4-7"
+        );
+    }
+
+    #[test]
+    fn claude_dash_version_is_unchanged() {
+        assert_eq!(
+            canonicalize_model_name("claude-sonnet-4-6"),
+            "claude-sonnet-4-6"
+        );
+    }
+
+    #[test]
+    fn non_claude_models_keep_dots() {
+        // OpenAI / Azure model names use dots natively; do not touch them.
+        assert_eq!(canonicalize_model_name("gpt-5.1"), "gpt-5.1");
+        assert_eq!(canonicalize_model_name("gpt-4.1-mini"), "gpt-4.1-mini");
+        assert_eq!(canonicalize_model_name("gemini-1.5-pro"), "gemini-1.5-pro");
+    }
 }
