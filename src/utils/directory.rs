@@ -77,10 +77,11 @@ where
 
 /// Standard filter for JSONL and JSON files
 ///
-/// Excludes `*.meta.json` sidecar files that Claude Code writes alongside
-/// subagent session logs — those are not conversation logs and have no usage data.
+/// Excludes `*.meta.json` / `*.meta.jsonl` sidecar files that Claude Code writes
+/// alongside subagent session logs — those are not conversation logs and have
+/// no usage data.
 pub fn is_json_file(path: &Path) -> bool {
-    if is_meta_json_file(path) {
+    if is_meta_sidecar_file(path) {
         return false;
     }
     if let Some(ext) = path.extension() {
@@ -94,10 +95,10 @@ pub fn is_json_file(path: &Path) -> bool {
 ///
 /// Matches both top-level sessions (`~/.claude/projects/<project>/<session>.jsonl`)
 /// and subagent sessions (`~/.claude/projects/<project>/<session>/subagents/agent-*.jsonl`).
-/// Rejects the `*.meta.json` sidecar files and any non-JSONL artifact that ends
-/// up under the projects directory (e.g. screenshots pasted into prompts).
+/// Rejects meta sidecars (`*.meta.json` / `*.meta.jsonl`) and any non-JSONL artifact
+/// that ends up under the projects directory (e.g. screenshots pasted into prompts).
 pub fn is_claude_session_file(path: &Path) -> bool {
-    if is_meta_json_file(path) {
+    if is_meta_sidecar_file(path) {
         return false;
     }
     path.extension().is_some_and(|ext| ext == "jsonl")
@@ -112,13 +113,14 @@ pub fn is_gemini_chat_file(path: &Path) -> bool {
     }
 }
 
-/// Returns true if the path ends with `.meta.json`
+/// Returns true if the path is a Claude Code meta sidecar file
 ///
-/// Claude Code writes these sidecars next to subagent session logs with
-/// metadata like `agentType` / `description`. They have no usage data and
-/// would otherwise be mis-detected as Codex logs.
-fn is_meta_json_file(path: &Path) -> bool {
+/// Claude Code writes these next to subagent session logs with metadata like
+/// `agentType` / `description`. Today they're `*.meta.json`; we also reject
+/// `*.meta.jsonl` pre-emptively so the filter stays correct if the format
+/// ever switches to line-delimited JSON.
+fn is_meta_sidecar_file(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
-        .is_some_and(|name| name.ends_with(".meta.json"))
+        .is_some_and(|name| name.ends_with(".meta.json") || name.ends_with(".meta.jsonl"))
 }

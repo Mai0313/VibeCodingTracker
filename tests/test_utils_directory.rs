@@ -232,7 +232,7 @@ fn test_collect_files_with_content() {
 }
 
 #[test]
-fn test_is_json_file_excludes_meta_json() {
+fn test_is_json_file_excludes_meta_sidecars() {
     // *.meta.json sidecars live next to Claude Code subagent sessions and must not
     // be picked up by the generic json filter (they would otherwise be parsed and
     // mis-detected as Codex logs).
@@ -242,6 +242,13 @@ fn test_is_json_file_excludes_meta_json() {
     let nested =
         std::path::Path::new("/home/user/.claude/projects/proj/sess/subagents/agent-x.meta.json");
     assert!(!is_json_file(nested));
+
+    // Pre-emptive defense: reject `.meta.jsonl` too, in case Claude Code ever
+    // switches the sidecar format to line-delimited JSON.
+    let meta_jsonl = std::path::Path::new(
+        "/home/user/.claude/projects/proj/sess/subagents/agent-x.meta.jsonl",
+    );
+    assert!(!is_json_file(meta_jsonl));
 }
 
 #[test]
@@ -259,11 +266,18 @@ fn test_is_claude_session_file_accepts_jsonl() {
 
 #[test]
 fn test_is_claude_session_file_rejects_non_jsonl() {
-    // Metadata sidecars
+    // Metadata sidecars — current format (`.meta.json`)
     let meta = std::path::Path::new(
         "/home/user/.claude/projects/proj/sess/subagents/agent-afda1991051a0eb93.meta.json",
     );
     assert!(!is_claude_session_file(meta));
+
+    // Metadata sidecars — hypothetical future format (`.meta.jsonl`). Has `.jsonl`
+    // extension, so without the sidecar check it would slip through.
+    let meta_jsonl = std::path::Path::new(
+        "/home/user/.claude/projects/proj/sess/subagents/agent-afda1991051a0eb93.meta.jsonl",
+    );
+    assert!(!is_claude_session_file(meta_jsonl));
 
     // Plain .json files (not something Claude Code writes in this tree)
     let plain_json = std::path::Path::new("/home/user/.claude/projects/proj/notes.json");
@@ -291,6 +305,7 @@ fn test_collect_claude_session_files_includes_subagents() {
     File::create(project.join("sess-a.jsonl")).unwrap();
     File::create(subagents.join("agent-one.jsonl")).unwrap();
     File::create(subagents.join("agent-one.meta.json")).unwrap();
+    File::create(subagents.join("agent-two.meta.jsonl")).unwrap();
     File::create(session_subdir.join("screenshot.png")).unwrap();
 
     let results =
@@ -303,6 +318,6 @@ fn test_collect_claude_session_files_includes_subagents() {
     assert_eq!(results.len(), 2, "collected: {:?}", names);
     assert!(names.contains(&"sess-a.jsonl".to_string()));
     assert!(names.contains(&"agent-one.jsonl".to_string()));
-    assert!(!names.iter().any(|n| n.ends_with(".meta.json")));
+    assert!(!names.iter().any(|n| n.contains(".meta.")));
     assert!(!names.iter().any(|n| n.ends_with(".png")));
 }
