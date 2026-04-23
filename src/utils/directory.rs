@@ -26,6 +26,28 @@ where
     P: AsRef<Path>,
     F: Fn(&Path) -> bool,
 {
+    collect_files_with_max_depth(dir, filter_fn, time_range, None)
+}
+
+/// Same as [`collect_files_with_dates`] but with an optional traversal depth cap.
+///
+/// `max_depth` is counted from the root directory: `None` walks the whole
+/// tree, `Some(2)` only descends two levels. Callers that know the exact
+/// nesting of the file they want (e.g. Copilot's
+/// `session-state/<sessionId>/events.jsonl` is always at depth 2) can use
+/// this to avoid paying the cost of `WalkDir` visiting large sibling
+/// subtrees such as `rewind-snapshots/backups/` that never contain a
+/// match but can hold hundreds of files per session.
+pub fn collect_files_with_max_depth<P, F>(
+    dir: P,
+    filter_fn: F,
+    time_range: TimeRange,
+    max_depth: Option<usize>,
+) -> Result<Vec<FileInfo>>
+where
+    P: AsRef<Path>,
+    F: Fn(&Path) -> bool,
+{
     if !dir.as_ref().exists() {
         return Ok(Vec::new());
     }
@@ -37,7 +59,12 @@ where
     // Pre-allocate Vec with estimated capacity (typical: 10-50 session files)
     let mut results = Vec::with_capacity(20);
 
-    for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+    let mut walker = WalkDir::new(dir);
+    if let Some(depth) = max_depth {
+        walker = walker.max_depth(depth);
+    }
+
+    for entry in walker.into_iter().filter_map(|e| e.ok()) {
         if !entry.file_type().is_file() {
             continue;
         }
@@ -74,6 +101,17 @@ where
 
     Ok(results)
 }
+
+/// Maximum traversal depth for Copilot CLI session scans.
+///
+/// Copilot writes `~/.copilot/session-state/<sessionId>/events.jsonl`, so
+/// the event log is always exactly two directory levels below
+/// `session-state/`. Anything deeper belongs to companion subtrees we
+/// intentionally ignore (`rewind-snapshots/backups/`, `checkpoints/`,
+/// `files/`, `research/`) — some of which can hold dozens of files per
+/// session and would otherwise make `WalkDir` visit hundreds of entries
+/// per session just to have `is_copilot_session_file` reject them.
+pub const COPILOT_SESSION_MAX_DEPTH: usize = 2;
 
 /// Standard filter for JSONL and JSON files
 ///
@@ -139,12 +177,13 @@ pub fn is_gemini_chat_file(path: &Path) -> bool {
 /// produced by recent Copilot CLI versions. If you still have old dumps to
 /// analyze, run `vct analysis --path <file>` directly.
 pub fn is_copilot_session_file(path: &Path) -> bool {
-    // Must be named exactly `events.jsonl`
-    let is_events_jsonl = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|name| name == "events.jsonl");
-    if !is_events_jsonl {
+    // Compare raw `OsStr` rather than going through `to_str()` so paths with
+    // non-UTF-8 bytes elsewhere in the tree do not silently reject the file.
+    // The chosen constants (`events.jsonl`, `session-state`) are pure ASCII,
+    // so the comparison is safe on every platform we care about and keeps
+    // the style consistent with `is_gemini_chat_file`'s `OsStr::new("chats")`
+    // check above.
+    if path.file_name() != Some(std::ffi::OsStr::new("events.jsonl")) {
         return false;
     }
 
@@ -153,8 +192,8 @@ pub fn is_copilot_session_file(path: &Path) -> bool {
     // nested subfolder (e.g. `rewind-snapshots/events.jsonl`).
     path.parent()
         .and_then(|p| p.parent())
-        .and_then(|pp| pp.file_name())
-        .is_some_and(|name| name == "session-state")
+        .map(|pp| pp.file_name() == Some(std::ffi::OsStr::new("session-state")))
+        .unwrap_or(false)
 }
 
 /// Returns true if the path is a Claude Code meta sidecar file

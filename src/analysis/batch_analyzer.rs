@@ -5,8 +5,8 @@ use crate::cli::TimeRange;
 use crate::constants::{FastHashMap, capacity};
 use crate::models::{CodeAnalysis, ExtensionType, ProviderActiveDays};
 use crate::utils::{
-    collect_files_with_dates, is_claude_session_file, is_copilot_session_file, is_gemini_chat_file,
-    is_json_file,
+    COPILOT_SESSION_MAX_DEPTH, collect_files_with_max_depth, is_claude_session_file,
+    is_copilot_session_file, is_gemini_chat_file, is_json_file,
 };
 use anyhow::Result;
 use rayon::prelude::*;
@@ -89,6 +89,7 @@ pub fn analyze_all_sessions(time_range: TimeRange) -> Result<AnalysisData> {
             &mut claude_dates,
             is_claude_session_file,
             time_range,
+            None,
         )?;
     }
 
@@ -101,10 +102,13 @@ pub fn analyze_all_sessions(time_range: TimeRange) -> Result<AnalysisData> {
             &mut codex_dates,
             is_json_file,
             time_range,
+            None,
         )?;
     }
 
     if paths.copilot_session_dir.exists() {
+        // `events.jsonl` always lives exactly two levels under
+        // `session-state/`; see the rationale in `usage::calculator`.
         process_analysis_directory(
             &paths.copilot_session_dir,
             ExtensionType::Copilot,
@@ -113,6 +117,7 @@ pub fn analyze_all_sessions(time_range: TimeRange) -> Result<AnalysisData> {
             &mut copilot_dates,
             is_copilot_session_file,
             time_range,
+            Some(COPILOT_SESSION_MAX_DEPTH),
         )?;
     }
 
@@ -125,6 +130,7 @@ pub fn analyze_all_sessions(time_range: TimeRange) -> Result<AnalysisData> {
             &mut gemini_dates,
             is_gemini_chat_file,
             time_range,
+            None,
         )?;
     }
 
@@ -205,6 +211,7 @@ pub fn analyze_all_sessions_by_provider(time_range: TimeRange) -> Result<Provide
             &mut claude_results,
             is_claude_session_file,
             time_range,
+            None,
         )?;
     }
 
@@ -216,10 +223,12 @@ pub fn analyze_all_sessions_by_provider(time_range: TimeRange) -> Result<Provide
             &mut codex_results,
             is_json_file,
             time_range,
+            None,
         )?;
     }
 
-    // Process Copilot sessions
+    // Process Copilot sessions — bounded walk so sibling snapshot trees
+    // (`rewind-snapshots/`, `files/`, …) do not slow the scan down.
     if paths.copilot_session_dir.exists() {
         process_full_analysis_directory(
             &paths.copilot_session_dir,
@@ -227,6 +236,7 @@ pub fn analyze_all_sessions_by_provider(time_range: TimeRange) -> Result<Provide
             &mut copilot_results,
             is_copilot_session_file,
             time_range,
+            Some(COPILOT_SESSION_MAX_DEPTH),
         )?;
     }
 
@@ -238,6 +248,7 @@ pub fn analyze_all_sessions_by_provider(time_range: TimeRange) -> Result<Provide
             &mut gemini_results,
             is_gemini_chat_file,
             time_range,
+            None,
         )?;
     }
 
@@ -255,13 +266,14 @@ fn process_full_analysis_directory<P, F>(
     results: &mut Vec<Arc<CodeAnalysis>>,
     filter_fn: F,
     time_range: TimeRange,
+    max_depth: Option<usize>,
 ) -> Result<()>
 where
     P: AsRef<Path>,
     F: Copy + Fn(&Path) -> bool + Sync + Send,
 {
     let dir = dir.as_ref();
-    let files = collect_files_with_dates(dir, filter_fn, time_range)?;
+    let files = collect_files_with_max_depth(dir, filter_fn, time_range, max_depth)?;
 
     // Parallel parse through the global cache. The provider is fixed by the
     // source directory, so the cache dispatches to the right analyzer without
@@ -287,6 +299,7 @@ where
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // per-provider helper; struct-wrapping the args would hurt readability
 fn process_analysis_directory<P, F>(
     dir: P,
     provider: ExtensionType,
@@ -295,13 +308,14 @@ fn process_analysis_directory<P, F>(
     unique_dates: &mut HashSet<String>,
     filter_fn: F,
     time_range: TimeRange,
+    max_depth: Option<usize>,
 ) -> Result<()>
 where
     P: AsRef<Path>,
     F: Copy + Fn(&Path) -> bool + Sync + Send,
 {
     let dir = dir.as_ref();
-    let files = collect_files_with_dates(dir, filter_fn, time_range)?;
+    let files = collect_files_with_max_depth(dir, filter_fn, time_range, max_depth)?;
 
     // Aggregated analysis only reads counters — no need for `write_file_details`
     // bodies or `edit_file_details` strings. Run in `UsageOnly` and skip the

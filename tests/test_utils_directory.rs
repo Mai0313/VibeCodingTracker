@@ -7,8 +7,8 @@ use std::io::Write;
 use tempfile::tempdir;
 use vibe_coding_tracker::cli::TimeRange;
 use vibe_coding_tracker::utils::directory::{
-    collect_files_with_dates, is_claude_session_file, is_copilot_session_file, is_gemini_chat_file,
-    is_json_file,
+    collect_files_with_dates, collect_files_with_max_depth, is_claude_session_file,
+    is_copilot_session_file, is_gemini_chat_file, is_json_file,
 };
 
 #[test]
@@ -142,6 +142,50 @@ fn test_is_copilot_session_file_rejects_other_files() {
 
     let path2 = std::path::Path::new("/home/user/.copilot/logs.json");
     assert!(!is_copilot_session_file(path2));
+}
+
+#[test]
+fn test_collect_files_with_max_depth_respects_bound() {
+    // Layout mirrors a real Copilot `session-state/` tree: `events.jsonl` sits
+    // at depth 2 and must be collected, while snapshot artifacts deeper in
+    // the tree (`rewind-snapshots/backups/<hash>`) must be skipped entirely
+    // by a max_depth(2) walk so they never even hit `is_copilot_session_file`.
+    let dir = tempdir().unwrap();
+    let session = dir.path().join("session-state").join("sess-abc");
+    let backups = session.join("rewind-snapshots").join("backups");
+    fs::create_dir_all(&backups).unwrap();
+
+    File::create(session.join("events.jsonl")).unwrap();
+    File::create(backups.join("deadbeef-123")).unwrap();
+    File::create(backups.join("events.jsonl")).unwrap(); // still valid JSONL
+    File::create(session.join("workspace.yaml")).unwrap();
+
+    // Unbounded walk picks up every file whose filter passes...
+    let unbounded = collect_files_with_dates(
+        dir.path().join("session-state"),
+        is_copilot_session_file,
+        TimeRange::All,
+    )
+    .unwrap();
+    let unbounded_names: Vec<&str> = unbounded
+        .iter()
+        .filter_map(|f| f.path.file_name()?.to_str())
+        .collect();
+    // `rewind-snapshots/backups/events.jsonl` fails the filter (parent-of-parent
+    // is `rewind-snapshots`, not `session-state`), so the filter already blocks
+    // it. But we must have picked up the real one at depth 2.
+    assert!(unbounded_names.contains(&"events.jsonl"));
+
+    // Bounded walk (depth 2) must not even descend into backups/.
+    let bounded = collect_files_with_max_depth(
+        dir.path().join("session-state"),
+        is_copilot_session_file,
+        TimeRange::All,
+        Some(2),
+    )
+    .unwrap();
+    assert_eq!(bounded.len(), 1);
+    assert!(bounded[0].path.ends_with("sess-abc/events.jsonl"));
 }
 
 #[test]

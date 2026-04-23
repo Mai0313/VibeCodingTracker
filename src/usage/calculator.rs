@@ -5,8 +5,8 @@ use crate::models::{
     CodeAnalysis, ExtensionType, PerProviderUsage, Provider, ProviderActiveDays, UsageResult,
 };
 use crate::utils::{
-    collect_files_with_dates, is_claude_session_file, is_copilot_session_file, is_gemini_chat_file,
-    is_json_file, resolve_paths,
+    COPILOT_SESSION_MAX_DEPTH, collect_files_with_max_depth, is_claude_session_file,
+    is_copilot_session_file, is_gemini_chat_file, is_json_file, resolve_paths,
 };
 use anyhow::Result;
 use rayon::prelude::*;
@@ -76,6 +76,7 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
             &mut claude_dates,
             is_claude_session_file,
             time_range,
+            None,
         )?;
     }
 
@@ -88,10 +89,16 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
             &mut codex_dates,
             is_json_file,
             time_range,
+            None,
         )?;
     }
 
     if paths.copilot_session_dir.exists() {
+        // `events.jsonl` always lives exactly two levels under
+        // `session-state/`. Bounding the walk here keeps per-session
+        // snapshot subtrees (`rewind-snapshots/backups/*`, `files/*`, …)
+        // out of the `WalkDir` iteration entirely, so the scan cost stays
+        // linear in the number of sessions rather than total artifacts.
         process_usage_directory(
             &paths.copilot_session_dir,
             ExtensionType::Copilot,
@@ -100,6 +107,7 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
             &mut copilot_dates,
             is_copilot_session_file,
             time_range,
+            Some(COPILOT_SESSION_MAX_DEPTH),
         )?;
     }
 
@@ -112,6 +120,7 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
             &mut gemini_dates,
             is_gemini_chat_file,
             time_range,
+            None,
         )?;
     }
 
@@ -136,6 +145,7 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
     })
 }
 
+#[allow(clippy::too_many_arguments)] // per-provider helper; struct-wrapping the args would hurt readability
 fn process_usage_directory<P, F>(
     dir: P,
     provider: ExtensionType,
@@ -144,13 +154,14 @@ fn process_usage_directory<P, F>(
     unique_dates: &mut HashSet<String>,
     filter_fn: F,
     time_range: TimeRange,
+    max_depth: Option<usize>,
 ) -> Result<()>
 where
     P: AsRef<Path>,
     F: Copy + Fn(&Path) -> bool + Sync + Send,
 {
     let dir = dir.as_ref();
-    let files = collect_files_with_dates(dir, filter_fn, time_range)?;
+    let files = collect_files_with_max_depth(dir, filter_fn, time_range, max_depth)?;
 
     // Parse each file directly in `UsageOnly` mode, extract the small
     // per-model usage map, then drop the analysis. The provider is fixed by
