@@ -39,7 +39,7 @@ jobs:
           args: --bump --unreleased
 
       - name: Upload Release Assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.git-cliff-tag.outputs.content }}
           name: ${{ steps.git-cliff-tag.outputs.content }} 🌈
