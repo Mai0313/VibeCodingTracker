@@ -36,8 +36,7 @@ jobs:
 
       - name: Run pre-commits
         run: |
-          uv tool install pre-commit
-          uv tool run pre-commit run -a
+          uvx pre-commit run -a
 
       - name: rustfmt (check)
         run: |

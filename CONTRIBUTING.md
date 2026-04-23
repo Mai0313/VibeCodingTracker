@@ -195,15 +195,14 @@ cargo clippy --all-targets --all-features -- -D warnings
 The repository ships a `.pre-commit-config.yaml` covering whitespace/EOL fixes, JSON/YAML/TOML linting, `mdformat` for Markdown, `gitleaks` for secret scanning, and `shellcheck`. Install once:
 
 ```bash
-# Install the pre-commit tool itself
-pipx install pre-commit            # or: uv tool install pre-commit
-
-# Install the git hooks into .git/hooks/
-pre-commit install --install-hooks
+# Install the git hooks into .git/hooks/ (uvx fetches pre-commit on demand)
+uvx pre-commit install --install-hooks
 
 # Run against all files (what CI does)
-pre-commit run --all-files
+uvx pre-commit run --all-files
 ```
+
+Prefer a persistent install? `pipx install pre-commit` (or `uv tool install pre-commit`) works too — after that you can drop the `uvx` prefix.
 
 #### Commit Convention
 
