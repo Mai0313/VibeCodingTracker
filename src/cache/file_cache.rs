@@ -64,7 +64,7 @@ impl FileParseCache {
     }
 
     /// Same as [`Self::get_or_parse`] but the caller specifies which provider
-    /// the file belongs to — the analyzer skips content-based detection, so
+    /// the file belongs to — the parser skips content-based detection, so
     /// metadata sentinels at the top of a Claude session (`permission-mode`,
     /// `file-history-snapshot`) cannot cause the file to be mis-filed under a
     /// different provider.

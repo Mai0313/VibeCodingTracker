@@ -2,11 +2,11 @@
 //!
 //! Every supported provider (Claude Code, Codex, Copilot CLI, Gemini CLI)
 //! writes its session history to disk in a provider-specific JSONL shape.
-//! This module owns the "turn raw bytes into a typed [`CodeAnalysis`]"
-//! boundary so both of the features that consume session files —
-//! [`crate::analysis`] (aggregated tool-call metrics) and [`crate::usage`]
-//! (aggregated token counts) — share the same parsers and intermediate
-//! shape instead of one feature reaching into the other.
+//! This module owns the "turn raw bytes into a typed
+//! [`crate::CodeAnalysis`]" boundary so both of the features that consume
+//! session files — [`crate::analysis`] (aggregated tool-call metrics) and
+//! [`crate::usage`] (aggregated token counts) — share the same parsers
+//! and intermediate shape instead of one feature reaching into the other.
 pub mod claude;
 pub mod codex;
 pub mod copilot;

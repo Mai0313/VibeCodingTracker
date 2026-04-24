@@ -357,7 +357,7 @@ fn test_gemini_parser_jsonl() {
             .expect("failed to write fixture");
     }
 
-    let actual = parse_session_file(&input_file).expect("analyze Gemini fixture");
+    let actual = parse_session_file(&input_file).expect("parse Gemini fixture session file");
 
     assert_eq!(actual["extensionName"], "Gemini");
     let record = &actual["records"][0];
