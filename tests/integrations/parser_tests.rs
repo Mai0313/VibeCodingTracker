@@ -144,8 +144,8 @@ fn test_claude_code_parser() {
 
 #[test]
 fn test_codex_parser() {
-    let input_file = PathBuf::from("examples/test_conversation_oai.jsonl");
-    let expected_file = PathBuf::from("examples/analysis_result_oai.json");
+    let input_file = PathBuf::from("examples/test_conversation_codex.jsonl");
+    let expected_file = PathBuf::from("examples/analysis_result_codex.json");
 
     // Skip test if files don't exist
     if !input_file.exists() {

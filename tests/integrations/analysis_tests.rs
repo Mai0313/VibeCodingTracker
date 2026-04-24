@@ -38,7 +38,7 @@ fn test_single_file_analysis_claude() {
 
 #[test]
 fn test_single_file_analysis_codex() {
-    let input_file = PathBuf::from("examples/test_conversation_oai.jsonl");
+    let input_file = PathBuf::from("examples/test_conversation_codex.jsonl");
 
     if !input_file.exists() {
         eprintln!("Skipping test: example file not found");
