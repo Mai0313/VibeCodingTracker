@@ -22,7 +22,7 @@ fn test_file_cache_basic_operations() {
 
 #[test]
 fn test_file_cache_get_or_parse() {
-    let example_file = PathBuf::from("examples/test_conversation.jsonl");
+    let example_file = PathBuf::from("examples/test_conversation_claude_code.jsonl");
 
     if !example_file.exists() {
         eprintln!("Skipping test: example file not found");
@@ -83,7 +83,7 @@ fn test_file_cache_clear() {
     let cache = global_cache();
 
     // Add some entries
-    let example_file = PathBuf::from("examples/test_conversation.jsonl");
+    let example_file = PathBuf::from("examples/test_conversation_claude_code.jsonl");
     if example_file.exists() {
         let _ = cache.get_or_parse(&example_file);
     }
@@ -104,7 +104,7 @@ fn test_file_cache_stats() {
     assert_eq!(initial_stats.entry_count, 0);
 
     // Add an entry
-    let example_file = PathBuf::from("examples/test_conversation.jsonl");
+    let example_file = PathBuf::from("examples/test_conversation_claude_code.jsonl");
     if example_file.exists() {
         let _ = cache.get_or_parse(&example_file);
 
@@ -146,7 +146,7 @@ fn test_file_cache_concurrent_access() {
     use std::sync::Arc;
     use std::thread;
 
-    let example_file = PathBuf::from("examples/test_conversation.jsonl");
+    let example_file = PathBuf::from("examples/test_conversation_claude_code.jsonl");
 
     if !example_file.exists() {
         eprintln!("Skipping test: example file not found");
@@ -178,7 +178,7 @@ fn test_file_cache_multiple_files() {
     let cache = global_cache();
 
     let files = vec![
-        "examples/test_conversation.jsonl",
+        "examples/test_conversation_claude_code.jsonl",
         "examples/test_conversation_oai.jsonl",
         "examples/test_conversation_copilot.jsonl",
         "examples/test_conversation_gemini.jsonl",
@@ -208,7 +208,7 @@ fn test_file_cache_lru_eviction() {
     // This test verifies that LRU eviction works (implicitly through capacity limits)
     // The actual LRU capacity is set in constants.rs
 
-    let example_file = PathBuf::from("examples/test_conversation.jsonl");
+    let example_file = PathBuf::from("examples/test_conversation_claude_code.jsonl");
 
     if !example_file.exists() {
         eprintln!("Skipping test: example file not found");
@@ -238,7 +238,7 @@ fn test_pricing_cache_clear() {
 
 #[test]
 fn test_file_cache_invalidate_specific_file() {
-    let example_file = PathBuf::from("examples/test_conversation.jsonl");
+    let example_file = PathBuf::from("examples/test_conversation_claude_code.jsonl");
 
     if !example_file.exists() {
         eprintln!("Skipping test: example file not found");
@@ -283,7 +283,7 @@ fn test_cache_memory_estimation() {
     let cache = global_cache();
     cache.clear();
 
-    let example_file = PathBuf::from("examples/test_conversation.jsonl");
+    let example_file = PathBuf::from("examples/test_conversation_claude_code.jsonl");
 
     if !example_file.exists() {
         eprintln!("Skipping test: example file not found");
@@ -304,7 +304,7 @@ fn test_cache_memory_estimation() {
 fn test_cache_arc_sharing() {
     use std::sync::Arc;
 
-    let example_file = PathBuf::from("examples/test_conversation.jsonl");
+    let example_file = PathBuf::from("examples/test_conversation_claude_code.jsonl");
 
     if !example_file.exists() {
         eprintln!("Skipping test: example file not found");

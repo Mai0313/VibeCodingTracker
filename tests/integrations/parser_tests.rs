@@ -86,8 +86,8 @@ fn compare_json_ignore_fields(actual: &Value, expected: &Value, ignore_fields: &
 
 #[test]
 fn test_claude_code_parser() {
-    let input_file = PathBuf::from("examples/test_conversation.jsonl");
-    let expected_file = PathBuf::from("examples/analysis_result.json");
+    let input_file = PathBuf::from("examples/test_conversation_claude_code.jsonl");
+    let expected_file = PathBuf::from("examples/analysis_result_claude_code.json");
 
     // Skip test if files don't exist
     if !input_file.exists() {

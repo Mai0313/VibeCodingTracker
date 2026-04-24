@@ -84,7 +84,7 @@ fn benchmark_file_parsing(c: &mut Criterion) {
 
     // Test files paths
     let test_files = vec![
-        ("claude", "examples/test_conversation.jsonl"),
+        ("claude", "examples/test_conversation_claude_code.jsonl"),
         ("codex", "examples/test_conversation_oai.jsonl"),
         ("copilot", "examples/test_conversation_copilot.json"),
         ("gemini", "examples/test_conversation_gemini.json"),
@@ -147,7 +147,7 @@ fn benchmark_cache_operations(c: &mut Criterion) {
     use std::path::PathBuf;
     use vibe_coding_tracker::cache::global_cache;
 
-    let test_path = PathBuf::from("examples/test_conversation.jsonl");
+    let test_path = PathBuf::from("examples/test_conversation_claude_code.jsonl");
 
     if !test_path.exists() {
         return;
@@ -269,7 +269,7 @@ fn benchmark_batch_analysis(c: &mut Criterion) {
     use std::path::PathBuf;
 
     // Only run if example files exist
-    let claude_path = PathBuf::from("examples/test_conversation.jsonl");
+    let claude_path = PathBuf::from("examples/test_conversation_claude_code.jsonl");
     let codex_path = PathBuf::from("examples/test_conversation_oai.jsonl");
     let copilot_path = PathBuf::from("examples/test_conversation_copilot.json");
     let gemini_path = PathBuf::from("examples/test_conversation_gemini.json");
