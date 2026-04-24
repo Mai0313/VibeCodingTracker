@@ -69,7 +69,7 @@ pub struct ClaudeBashInput {
 }
 
 /// Object form of `toolUseResult`. String-shaped values (user-rejection error
-/// messages, etc.) are swallowed by [`deserialize_tool_use_result`] without
+/// messages, etc.) are swallowed by `deserialize_tool_use_result` without
 /// allocating their body.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]

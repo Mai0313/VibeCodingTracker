@@ -163,7 +163,7 @@ impl FileParseCache {
     /// Returns cache statistics for monitoring and debugging.
     ///
     /// `estimated_memory_kb` is a real sum of per-entry sizes captured by
-    /// [`estimate_analysis_bytes`] at insertion time.
+    /// `estimate_analysis_bytes` at insertion time.
     pub fn stats(&self) -> CacheStats {
         if let Ok(cache) = self.cache.write() {
             let total_bytes: usize = cache.iter().map(|(_, c)| c.size_bytes).sum();
