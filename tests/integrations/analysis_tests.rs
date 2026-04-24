@@ -14,7 +14,7 @@ use vibe_coding_tracker::session::state::ParseMode;
 
 #[test]
 fn test_single_file_analysis_claude() {
-    let input_file = PathBuf::from("examples/test_conversation.jsonl");
+    let input_file = PathBuf::from("examples/test_conversation_claude_code.jsonl");
 
     if !input_file.exists() {
         eprintln!("Skipping test: example file not found");
@@ -38,7 +38,7 @@ fn test_single_file_analysis_claude() {
 
 #[test]
 fn test_single_file_analysis_codex() {
-    let input_file = PathBuf::from("examples/test_conversation_oai.jsonl");
+    let input_file = PathBuf::from("examples/test_conversation_codex.jsonl");
 
     if !input_file.exists() {
         eprintln!("Skipping test: example file not found");
@@ -89,7 +89,7 @@ fn test_single_file_analysis_gemini() {
 
 #[test]
 fn test_analysis_record_structure() {
-    let input_file = PathBuf::from("examples/test_conversation.jsonl");
+    let input_file = PathBuf::from("examples/test_conversation_claude_code.jsonl");
 
     if !input_file.exists() {
         eprintln!("Skipping test: example file not found");
@@ -120,7 +120,7 @@ fn test_analysis_record_structure() {
 
 #[test]
 fn test_analysis_conversation_usage() {
-    let input_file = PathBuf::from("examples/test_conversation.jsonl");
+    let input_file = PathBuf::from("examples/test_conversation_claude_code.jsonl");
 
     if !input_file.exists() {
         eprintln!("Skipping test: example file not found");
@@ -159,7 +159,7 @@ fn test_analysis_conversation_usage() {
 
 #[test]
 fn test_analysis_tool_call_counts() {
-    let input_file = PathBuf::from("examples/test_conversation.jsonl");
+    let input_file = PathBuf::from("examples/test_conversation_claude_code.jsonl");
 
     if !input_file.exists() {
         eprintln!("Skipping test: example file not found");
@@ -187,7 +187,7 @@ fn test_analysis_tool_call_counts() {
 
 #[test]
 fn test_analysis_file_operations() {
-    let input_file = PathBuf::from("examples/test_conversation.jsonl");
+    let input_file = PathBuf::from("examples/test_conversation_claude_code.jsonl");
 
     if !input_file.exists() {
         eprintln!("Skipping test: example file not found");

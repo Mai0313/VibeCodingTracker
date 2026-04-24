@@ -39,7 +39,7 @@ fn test_version_command_text() {
 
 #[test]
 fn test_analysis_command_with_example_file() {
-    let example_file = PathBuf::from("examples/test_conversation.jsonl");
+    let example_file = PathBuf::from("examples/test_conversation_claude_code.jsonl");
 
     if !example_file.exists() {
         eprintln!("Skipping test: example file not found");
@@ -59,7 +59,7 @@ fn test_analysis_command_with_example_file() {
 
 #[test]
 fn test_analysis_command_with_output_file() {
-    let example_file = PathBuf::from("examples/test_conversation.jsonl");
+    let example_file = PathBuf::from("examples/test_conversation_claude_code.jsonl");
     let temp_dir = TempDir::new().unwrap();
     let output_file = temp_dir.path().join("output.json");
 
@@ -294,7 +294,7 @@ fn test_analysis_output_directory_creation() {
     std::fs::create_dir_all(&nested_dir).unwrap();
     let nested_output = nested_dir.join("output.json");
 
-    let example_file = PathBuf::from("examples/test_conversation.jsonl");
+    let example_file = PathBuf::from("examples/test_conversation_claude_code.jsonl");
 
     if !example_file.exists() {
         eprintln!("Skipping test: example file not found");
@@ -363,7 +363,7 @@ fn test_cli_handles_unicode_paths() {
     let temp_dir = TempDir::new().unwrap();
     let unicode_path = temp_dir.path().join("測試_test_файл.json");
 
-    let example_file = PathBuf::from("examples/test_conversation.jsonl");
+    let example_file = PathBuf::from("examples/test_conversation_claude_code.jsonl");
     if example_file.exists() {
         std::fs::copy(&example_file, &unicode_path).ok();
 
@@ -382,7 +382,7 @@ fn test_cli_handles_spaces_in_paths() {
     let temp_dir = TempDir::new().unwrap();
     let space_path = temp_dir.path().join("file with spaces.jsonl");
 
-    let example_file = PathBuf::from("examples/test_conversation.jsonl");
+    let example_file = PathBuf::from("examples/test_conversation_claude_code.jsonl");
     if example_file.exists() {
         std::fs::copy(&example_file, &space_path).ok();
 
