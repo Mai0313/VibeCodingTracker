@@ -86,7 +86,7 @@ Unsure where to begin contributing? You can start by looking through `good first
 │   ├── update/       # Self-update via GitHub releases (archive extraction)
 │   ├── usage/        # Per-provider token aggregation
 │   └── utils/        # Path resolution, directory walking, time helpers
-└── tests/            # Integration suite + per-module unit tests
+└── tests/            # Integration test suite (unit tests live inline in src/)
 ```
 
 #### Building from Source
@@ -142,20 +142,20 @@ Common Makefile shortcuts (`make help` to list all):
 
 #### Running Tests
 
-The tests are organized into three tiers. See [`tests/README.md`](tests/README.md) for the full breakdown.
+Tests follow the Rust Book's [ch11-03 organization](https://doc.rust-lang.org/book/ch11-03-test-organization.html): unit tests live inline in `src/` inside `#[cfg(test)] mod tests`, integration tests live under `tests/integrations/` and share the single `integration_tests` binary.
 
 ```bash
-# Everything (library + integration + per-module unit tests)
+# Everything (library unit tests + integration tests + doctests)
 cargo test --all
 
 # Integration tests only (end-to-end, no TUI)
 cargo test --test integration_tests
 
-# A specific unit test file
-cargo test --test test_detector
-cargo test --test test_pricing_matching
+# Unit tests for a specific src module (path mirrors the module path)
+cargo test --lib analysis::detector
+cargo test --lib pricing::matching
 
-# Run a single test by name
+# Run a single test by name (works across all binaries)
 cargo test test_exact_match -- --nocapture
 
 # Run sequentially (useful when debugging flaky parallel tests)
