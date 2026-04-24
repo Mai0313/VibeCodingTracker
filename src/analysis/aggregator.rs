@@ -331,8 +331,7 @@ where
     let file_aggregations: Vec<(String, CodeAnalysis)> = files
         .par_iter()
         .filter_map(|file_info| {
-            match parse_session_file_as(&file_info.path, provider, ParseMode::UsageOnly)
-            {
+            match parse_session_file_as(&file_info.path, provider, ParseMode::UsageOnly) {
                 Ok(analysis) => Some((file_info.modified_date.clone(), analysis)),
                 Err(e) => {
                     eprintln!(

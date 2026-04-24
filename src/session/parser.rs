@@ -1,14 +1,14 @@
 use crate::VERSION;
 use crate::constants::buffer;
+use crate::models::{
+    ClaudeCodeLog, CodeAnalysis, CodexLog, CopilotEvent, ExtensionType, GeminiSession,
+};
 use crate::session::claude::{parse_claude_log_values, parse_claude_logs};
 use crate::session::codex::parse_codex_logs;
 use crate::session::copilot::parse_copilot_events;
 use crate::session::detector::{classify_records, detect_extension_type};
 use crate::session::gemini::parse_gemini_events;
 use crate::session::state::ParseMode;
-use crate::models::{
-    ClaudeCodeLog, CodeAnalysis, CodexLog, CopilotEvent, ExtensionType, GeminiSession,
-};
 use crate::utils::{get_current_user, get_machine_id, read_json, read_jsonl};
 use anyhow::{Context, Result};
 use serde_json::Value;

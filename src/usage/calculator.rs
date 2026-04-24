@@ -175,8 +175,7 @@ where
     let file_results: Vec<(String, FastHashMap<String, Value>)> = files
         .par_iter()
         .filter_map(|file_info| {
-            match parse_session_file_as(&file_info.path, provider, ParseMode::UsageOnly)
-            {
+            match parse_session_file_as(&file_info.path, provider, ParseMode::UsageOnly) {
                 Ok(analysis) => {
                     let conversation_usage = extract_conversation_usage_from_analysis(&analysis);
                     Some((file_info.modified_date.clone(), conversation_usage))

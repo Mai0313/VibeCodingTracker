@@ -468,9 +468,8 @@ fn test_provider_known_extracts_usage_when_first_line_is_permission_mode() {
     let file = tmp.path().join("session.jsonl");
     write_claude_fixture_with_sentinel_prelude(&file, "permission-mode");
 
-    let analysis =
-        parse_session_file_as(&file, ExtensionType::ClaudeCode, ParseMode::UsageOnly)
-            .expect("provider-known path should accept the sentinel prelude");
+    let analysis = parse_session_file_as(&file, ExtensionType::ClaudeCode, ParseMode::UsageOnly)
+        .expect("provider-known path should accept the sentinel prelude");
 
     assert_eq!(analysis.extension_name, "Claude-Code");
     assert_eq!(analysis.records.len(), 1);
@@ -492,9 +491,8 @@ fn test_provider_known_extracts_usage_when_first_line_is_file_history_snapshot()
     let file = tmp.path().join("session.jsonl");
     write_claude_fixture_with_sentinel_prelude(&file, "file-history-snapshot");
 
-    let analysis =
-        parse_session_file_as(&file, ExtensionType::ClaudeCode, ParseMode::UsageOnly)
-            .expect("provider-known path should accept the sentinel prelude");
+    let analysis = parse_session_file_as(&file, ExtensionType::ClaudeCode, ParseMode::UsageOnly)
+        .expect("provider-known path should accept the sentinel prelude");
 
     let record = &analysis.records[0];
     assert!(
@@ -509,9 +507,8 @@ fn test_provider_known_extracts_usage_when_first_line_is_queue_operation() {
     let file = tmp.path().join("session.jsonl");
     write_claude_fixture_with_sentinel_prelude(&file, "queue-operation");
 
-    let analysis =
-        parse_session_file_as(&file, ExtensionType::ClaudeCode, ParseMode::UsageOnly)
-            .expect("provider-known path should accept the sentinel prelude");
+    let analysis = parse_session_file_as(&file, ExtensionType::ClaudeCode, ParseMode::UsageOnly)
+        .expect("provider-known path should accept the sentinel prelude");
 
     let record = &analysis.records[0];
     assert!(

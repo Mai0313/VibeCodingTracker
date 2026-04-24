@@ -78,9 +78,7 @@ fn main() -> Result<()> {
                     }
                     None => {
                         let analysis_data =
-                            vibe_coding_tracker::analysis::aggregate_sessions_by_model(
-                                time_range,
-                            )?;
+                            vibe_coding_tracker::analysis::aggregate_sessions_by_model(time_range)?;
 
                         if let Some(output_path) = output {
                             let json_value = serde_json::to_value(&analysis_data.rows)?;
