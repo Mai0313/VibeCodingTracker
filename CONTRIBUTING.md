@@ -142,7 +142,7 @@ Common Makefile shortcuts (`make help` to list all):
 
 #### Running Tests
 
-Tests follow the Rust Book's organization (unit tests inline in `src/`, integration tests under `tests/`). See [`tests/README.md`](tests/README.md) for the full breakdown.
+Tests follow the Rust Book's [ch11-03 organization](https://doc.rust-lang.org/book/ch11-03-test-organization.html): unit tests live inline in `src/` inside `#[cfg(test)] mod tests`, integration tests live under `tests/integrations/` and share the single `integration_tests` binary.
 
 ```bash
 # Everything (library unit tests + integration tests + doctests)
