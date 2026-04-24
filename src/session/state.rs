@@ -269,7 +269,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_analysis_state_new() {
+    fn test_session_parse_state_new() {
         // Test creating a new SessionParseState
         let state = SessionParseState::new();
 

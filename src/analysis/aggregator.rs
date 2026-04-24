@@ -283,7 +283,7 @@ where
     let files = collect_files_with_max_depth(dir, filter_fn, time_range, max_depth)?;
 
     // Parallel parse through the global cache. The provider is fixed by the
-    // source directory, so the cache dispatches to the right analyzer without
+    // source directory, so the cache dispatches to the right parser without
     // re-inspecting the file's contents.
     let analyzed: Vec<Arc<CodeAnalysis>> = files
         .par_iter()
@@ -292,7 +292,7 @@ where
                 Ok(analysis_arc) => Some(analysis_arc),
                 Err(e) => {
                     eprintln!(
-                        "Warning: Failed to analyze {}: {}",
+                        "Warning: Failed to parse {}: {}",
                         file_info.path.display(),
                         e
                     );
@@ -335,7 +335,7 @@ where
                 Ok(analysis) => Some((file_info.modified_date.clone(), analysis)),
                 Err(e) => {
                     eprintln!(
-                        "Warning: Failed to analyze {}: {}",
+                        "Warning: Failed to parse {}: {}",
                         file_info.path.display(),
                         e
                     );
