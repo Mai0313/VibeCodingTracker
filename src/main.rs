@@ -50,7 +50,9 @@ fn main() -> Result<()> {
             if by_provider {
                 // Handle --by-provider flag: group by provider and output as JSON
                 let grouped_data =
-                    vibe_coding_tracker::analysis::analyze_all_sessions_by_provider(time_range)?;
+                    vibe_coding_tracker::analysis::collect_sessions_grouped_by_provider(
+                        time_range,
+                    )?;
 
                 if let Some(output_path) = output {
                     let json_value = serde_json::to_value(&grouped_data)?;
@@ -76,7 +78,9 @@ fn main() -> Result<()> {
                     }
                     None => {
                         let analysis_data =
-                            vibe_coding_tracker::analysis::analyze_all_sessions(time_range)?;
+                            vibe_coding_tracker::analysis::aggregate_sessions_by_model(
+                                time_range,
+                            )?;
 
                         if let Some(output_path) = output {
                             let json_value = serde_json::to_value(&analysis_data.rows)?;

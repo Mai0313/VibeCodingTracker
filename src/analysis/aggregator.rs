@@ -55,11 +55,14 @@ pub struct PerProviderAnalysisRows {
     pub gemini: Vec<AggregatedAnalysisRow>,
 }
 
-/// Analyzes all session files across providers and aggregates file operation metrics
+/// Aggregate file-operation metrics across every provider's session files,
+/// keyed by model.
 ///
-/// Scans Claude, Codex, Copilot, and Gemini session directories, aggregates tool call counts
-/// and line counts by model, then returns sorted results with provider active day counts.
-pub fn analyze_all_sessions(time_range: TimeRange) -> Result<AnalysisData> {
+/// Scans Claude, Codex, Copilot, and Gemini session directories, aggregates
+/// tool-call counts and line counts by model, and returns sorted results
+/// with provider active-day counts. Complements [`collect_sessions_grouped_by_provider`]
+/// which preserves full records instead of aggregating.
+pub fn aggregate_sessions_by_model(time_range: TimeRange) -> Result<AnalysisData> {
     let paths = crate::utils::resolve_paths()?;
     let mut aggregated: FastHashMap<String, AggregatedAnalysisRow> =
         FastHashMap::with_capacity(capacity::MODEL_COMBINATIONS);
@@ -81,7 +84,7 @@ pub fn analyze_all_sessions(time_range: TimeRange) -> Result<AnalysisData> {
     if paths.claude_session_dir.exists() {
         // Walks the projects tree recursively, so top-level `<session>.jsonl` logs
         // and `<session>/subagents/agent-*.jsonl` logs are both collected here.
-        process_analysis_directory(
+        aggregate_sessions_in_directory(
             &paths.claude_session_dir,
             ExtensionType::ClaudeCode,
             &mut aggregated,
@@ -94,7 +97,7 @@ pub fn analyze_all_sessions(time_range: TimeRange) -> Result<AnalysisData> {
     }
 
     if paths.codex_session_dir.exists() {
-        process_analysis_directory(
+        aggregate_sessions_in_directory(
             &paths.codex_session_dir,
             ExtensionType::Codex,
             &mut aggregated,
@@ -109,7 +112,7 @@ pub fn analyze_all_sessions(time_range: TimeRange) -> Result<AnalysisData> {
     if paths.copilot_session_dir.exists() {
         // `events.jsonl` always lives exactly two levels under
         // `session-state/`; see the rationale in `usage::calculator`.
-        process_analysis_directory(
+        aggregate_sessions_in_directory(
             &paths.copilot_session_dir,
             ExtensionType::Copilot,
             &mut aggregated,
@@ -122,7 +125,7 @@ pub fn analyze_all_sessions(time_range: TimeRange) -> Result<AnalysisData> {
     }
 
     if paths.gemini_session_dir.exists() {
-        process_analysis_directory(
+        aggregate_sessions_in_directory(
             &paths.gemini_session_dir,
             ExtensionType::Gemini,
             &mut aggregated,
@@ -191,11 +194,15 @@ pub struct ProviderGroupedAnalysis {
     pub gemini: Vec<Arc<CodeAnalysis>>,
 }
 
-/// Analyzes all session files and returns complete records grouped by provider
+/// Collect every parsed session grouped by provider, without aggregating.
 ///
-/// Unlike `analyze_all_sessions()` which aggregates metrics, this function preserves
-/// full CodeAnalysis records for each session file.
-pub fn analyze_all_sessions_by_provider(time_range: TimeRange) -> Result<ProviderGroupedAnalysis> {
+/// Returns each provider's full `CodeAnalysis` records as emitted by the
+/// session parser (via the global file cache). Use
+/// [`aggregate_sessions_by_model`] when you only need per-model metrics
+/// rather than the per-session detail.
+pub fn collect_sessions_grouped_by_provider(
+    time_range: TimeRange,
+) -> Result<ProviderGroupedAnalysis> {
     let paths = crate::utils::resolve_paths()?;
 
     let mut claude_results: Vec<Arc<CodeAnalysis>> = Vec::new();
@@ -205,7 +212,7 @@ pub fn analyze_all_sessions_by_provider(time_range: TimeRange) -> Result<Provide
 
     // Process Claude sessions (including subagents/ sublogs)
     if paths.claude_session_dir.exists() {
-        process_full_analysis_directory(
+        collect_sessions_in_directory(
             &paths.claude_session_dir,
             ExtensionType::ClaudeCode,
             &mut claude_results,
@@ -217,7 +224,7 @@ pub fn analyze_all_sessions_by_provider(time_range: TimeRange) -> Result<Provide
 
     // Process Codex sessions
     if paths.codex_session_dir.exists() {
-        process_full_analysis_directory(
+        collect_sessions_in_directory(
             &paths.codex_session_dir,
             ExtensionType::Codex,
             &mut codex_results,
@@ -230,7 +237,7 @@ pub fn analyze_all_sessions_by_provider(time_range: TimeRange) -> Result<Provide
     // Process Copilot sessions — bounded walk so sibling snapshot trees
     // (`rewind-snapshots/`, `files/`, …) do not slow the scan down.
     if paths.copilot_session_dir.exists() {
-        process_full_analysis_directory(
+        collect_sessions_in_directory(
             &paths.copilot_session_dir,
             ExtensionType::Copilot,
             &mut copilot_results,
@@ -242,7 +249,7 @@ pub fn analyze_all_sessions_by_provider(time_range: TimeRange) -> Result<Provide
 
     // Process Gemini sessions
     if paths.gemini_session_dir.exists() {
-        process_full_analysis_directory(
+        collect_sessions_in_directory(
             &paths.gemini_session_dir,
             ExtensionType::Gemini,
             &mut gemini_results,
@@ -260,7 +267,7 @@ pub fn analyze_all_sessions_by_provider(time_range: TimeRange) -> Result<Provide
     })
 }
 
-fn process_full_analysis_directory<P, F>(
+fn collect_sessions_in_directory<P, F>(
     dir: P,
     provider: ExtensionType,
     results: &mut Vec<Arc<CodeAnalysis>>,
@@ -300,7 +307,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)] // per-provider helper; struct-wrapping the args would hurt readability
-fn process_analysis_directory<P, F>(
+fn aggregate_sessions_in_directory<P, F>(
     dir: P,
     provider: ExtensionType,
     aggregated: &mut FastHashMap<String, AggregatedAnalysisRow>,
