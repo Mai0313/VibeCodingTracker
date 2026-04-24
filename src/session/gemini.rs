@@ -1,14 +1,14 @@
-use crate::analysis::common_state::{AnalysisMode, AnalysisState};
 use crate::constants::FastHashMap;
 use crate::models::*;
+use crate::session::state::{ParseMode, SessionParseState};
 use crate::utils::{get_git_remote_url, parse_iso_timestamp, process_gemini_usage};
 use anyhow::Result;
 use serde_json::Value;
 
-/// Analyze Gemini conversations from the JSONL event stream.
+/// Parse Gemini CLI session events from the JSONL event stream.
 ///
 /// `session` carries the first-line meta record (`sessionId` etc.), and
-/// `events` yields one parsed JSON value per subsequent line. The analyzer
+/// `events` yields one parsed JSON value per subsequent line. The parser
 /// filters down to `type == "gemini"` events and deserialises those into
 /// [`GeminiMessage`] individually; everything else (`type == "user"`,
 /// `"info"`, `$set` meta-update records, …) is silently skipped.
@@ -16,15 +16,15 @@ use serde_json::Value;
 /// This is the only supported Gemini entry point — legacy single-object
 /// exports (`chats/<session>.json` with an inline `messages` array) are no
 /// longer handled.
-pub fn analyze_gemini_events<I>(
+pub fn parse_gemini_events<I>(
     session: GeminiSession,
     events: I,
-    mode: AnalysisMode,
+    mode: ParseMode,
 ) -> Result<CodeAnalysis>
 where
     I: IntoIterator<Item = Value>,
 {
-    let mut state = AnalysisState::with_mode(mode);
+    let mut state = SessionParseState::with_mode(mode);
     let mut conversation_usage: FastHashMap<String, Value> = FastHashMap::with_capacity(3);
 
     for event in events {
@@ -56,7 +56,7 @@ where
 }
 
 fn finalize_record(
-    mut state: AnalysisState,
+    mut state: SessionParseState,
     conversation_usage: FastHashMap<String, Value>,
     session_id: String,
 ) -> CodeAnalysis {
@@ -82,7 +82,7 @@ fn finalize_record(
 }
 
 fn process_gemini_message(
-    state: &mut AnalysisState,
+    state: &mut SessionParseState,
     conversation_usage: &mut FastHashMap<String, Value>,
     message: &GeminiMessage,
 ) {

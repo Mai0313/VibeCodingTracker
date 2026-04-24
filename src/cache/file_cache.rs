@@ -1,9 +1,9 @@
-use crate::analysis::AnalysisMode;
 use crate::constants::capacity;
 use crate::models::{
     CodeAnalysis, CodeAnalysisApplyDiffDetail, CodeAnalysisReadDetail, CodeAnalysisRecord,
     CodeAnalysisRunCommandDetail, CodeAnalysisWriteDetail, ExtensionType,
 };
+use crate::session::ParseMode;
 use anyhow::Result;
 use lru::LruCache;
 use std::fs;
@@ -64,7 +64,7 @@ impl FileParseCache {
     }
 
     /// Same as [`Self::get_or_parse`] but the caller specifies which provider
-    /// the file belongs to — the analyzer skips content-based detection, so
+    /// the file belongs to — the parser skips content-based detection, so
     /// metadata sentinels at the top of a Claude session (`permission-mode`,
     /// `file-history-snapshot`) cannot cause the file to be mis-filed under a
     /// different provider.
@@ -113,8 +113,8 @@ impl FileParseCache {
         // Cache miss or outdated - need to parse.
         log::debug!("LRU cache miss for {}, parsing...", path.display());
         let analysis = match provider {
-            Some(p) => crate::analysis::analyze_session_file_typed_as(path, p, AnalysisMode::Full)?,
-            None => crate::analysis::analyze_jsonl_file_typed(path)?,
+            Some(p) => crate::session::parse_session_file_as(path, p, ParseMode::Full)?,
+            None => crate::session::parse_session_file_typed(path)?,
         };
         let arc_analysis = Arc::new(analysis);
         let size_bytes = estimate_analysis_bytes(arc_analysis.as_ref());

@@ -4,13 +4,13 @@
 
 use std::path::PathBuf;
 use tempfile::TempDir;
-use vibe_coding_tracker::analysis::analyzer::{analyze_jsonl_file, analyze_session_file_typed_as};
-use vibe_coding_tracker::analysis::batch_analyzer::{
-    analyze_all_sessions, analyze_all_sessions_by_provider,
+use vibe_coding_tracker::analysis::aggregator::{
+    aggregate_sessions_by_model, collect_sessions_grouped_by_provider,
 };
-use vibe_coding_tracker::analysis::common_state::AnalysisMode;
 use vibe_coding_tracker::cli::TimeRange;
 use vibe_coding_tracker::models::ExtensionType;
+use vibe_coding_tracker::session::parser::{parse_session_file, parse_session_file_as};
+use vibe_coding_tracker::session::state::ParseMode;
 
 #[test]
 fn test_single_file_analysis_claude() {
@@ -21,7 +21,7 @@ fn test_single_file_analysis_claude() {
         return;
     }
 
-    let result = analyze_jsonl_file(&input_file);
+    let result = parse_session_file(&input_file);
     assert!(result.is_ok(), "Should successfully analyze Claude file");
 
     let analysis = result.unwrap();
@@ -45,7 +45,7 @@ fn test_single_file_analysis_codex() {
         return;
     }
 
-    let result = analyze_jsonl_file(&input_file);
+    let result = parse_session_file(&input_file);
     assert!(result.is_ok(), "Should successfully analyze Codex file");
 
     let analysis = result.unwrap();
@@ -62,7 +62,7 @@ fn test_single_file_analysis_copilot() {
         return;
     }
 
-    let result = analyze_jsonl_file(&input_file);
+    let result = parse_session_file(&input_file);
     assert!(result.is_ok(), "Should successfully analyze Copilot file");
 
     let analysis = result.unwrap();
@@ -79,7 +79,7 @@ fn test_single_file_analysis_gemini() {
         return;
     }
 
-    let result = analyze_jsonl_file(&input_file);
+    let result = parse_session_file(&input_file);
     assert!(result.is_ok(), "Should successfully analyze Gemini file");
 
     let analysis = result.unwrap();
@@ -96,7 +96,7 @@ fn test_analysis_record_structure() {
         return;
     }
 
-    let result = analyze_jsonl_file(&input_file);
+    let result = parse_session_file(&input_file);
     if let Ok(analysis) = result {
         let records = &analysis["records"];
         if let Some(first_record) = records.as_array().and_then(|arr| arr.first()) {
@@ -127,7 +127,7 @@ fn test_analysis_conversation_usage() {
         return;
     }
 
-    let result = analyze_jsonl_file(&input_file);
+    let result = parse_session_file(&input_file);
     if let Ok(analysis) = result {
         let records = &analysis["records"];
         if let Some(first_record) = records.as_array().and_then(|arr| arr.first()) {
@@ -166,7 +166,7 @@ fn test_analysis_tool_call_counts() {
         return;
     }
 
-    let result = analyze_jsonl_file(&input_file);
+    let result = parse_session_file(&input_file);
     if let Ok(analysis) = result {
         let records = &analysis["records"];
         if let Some(first_record) = records.as_array().and_then(|arr| arr.first()) {
@@ -194,7 +194,7 @@ fn test_analysis_file_operations() {
         return;
     }
 
-    let result = analyze_jsonl_file(&input_file);
+    let result = parse_session_file(&input_file);
     if let Ok(analysis) = result {
         let records = &analysis["records"];
         if let Some(first_record) = records.as_array().and_then(|arr| arr.first()) {
@@ -227,7 +227,7 @@ fn test_analysis_file_operations() {
 #[test]
 fn test_batch_analysis_basic() {
     // Test batch analysis with default directories
-    let result = analyze_all_sessions(TimeRange::All);
+    let result = aggregate_sessions_by_model(TimeRange::All);
     assert!(result.is_ok(), "Batch analysis should not fail");
 
     if let Ok(data) = result {
@@ -244,7 +244,7 @@ fn test_batch_analysis_basic() {
 
 #[test]
 fn test_batch_analysis_sorting() {
-    let result = analyze_all_sessions(TimeRange::All);
+    let result = aggregate_sessions_by_model(TimeRange::All);
 
     if let Ok(data) = result
         && data.rows.len() > 1
@@ -261,7 +261,7 @@ fn test_batch_analysis_sorting() {
 
 #[test]
 fn test_batch_analysis_serialization() {
-    use vibe_coding_tracker::analysis::batch_analyzer::AggregatedAnalysisRow;
+    use vibe_coding_tracker::analysis::aggregator::AggregatedAnalysisRow;
 
     let row = AggregatedAnalysisRow {
         model: "claude-sonnet-4".to_string(),
@@ -307,7 +307,7 @@ fn test_batch_analysis_serialization() {
 #[test]
 fn test_batch_analysis_by_provider() {
     // Test provider-grouped analysis
-    let result = analyze_all_sessions_by_provider(TimeRange::All);
+    let result = collect_sessions_grouped_by_provider(TimeRange::All);
     assert!(result.is_ok(), "Provider-grouped analysis should not fail");
 
     if let Ok(grouped) = result {
@@ -336,7 +336,7 @@ fn test_analysis_with_empty_file() {
     let empty_file = temp_dir.path().join("empty.jsonl");
     std::fs::write(&empty_file, "").unwrap();
 
-    let result = analyze_jsonl_file(&empty_file);
+    let result = parse_session_file(&empty_file);
     // Should either succeed with empty result or fail gracefully
     assert!(
         result.is_ok() || result.is_err(),
@@ -351,7 +351,7 @@ fn test_analysis_with_invalid_json() {
     let invalid_file = temp_dir.path().join("invalid.jsonl");
     std::fs::write(&invalid_file, "not valid json\n{incomplete").unwrap();
 
-    let result = analyze_jsonl_file(&invalid_file);
+    let result = parse_session_file(&invalid_file);
     // Should fail with error
     assert!(result.is_err(), "Should fail on invalid JSON");
 }
@@ -359,7 +359,7 @@ fn test_analysis_with_invalid_json() {
 #[test]
 fn test_batch_analysis_model_grouping() {
     // Test that batch analysis groups data by model
-    let result = analyze_all_sessions(TimeRange::All);
+    let result = aggregate_sessions_by_model(TimeRange::All);
 
     if let Ok(data) = result {
         for row in data.rows.iter() {
@@ -384,7 +384,7 @@ fn test_batch_analysis_model_grouping() {
 #[test]
 fn test_analysis_aggregation_logic() {
     // Test that analysis properly aggregates data
-    use vibe_coding_tracker::analysis::batch_analyzer::AggregatedAnalysisRow;
+    use vibe_coding_tracker::analysis::aggregator::AggregatedAnalysisRow;
 
     let rows = [
         AggregatedAnalysisRow {
@@ -468,9 +468,8 @@ fn test_provider_known_extracts_usage_when_first_line_is_permission_mode() {
     let file = tmp.path().join("session.jsonl");
     write_claude_fixture_with_sentinel_prelude(&file, "permission-mode");
 
-    let analysis =
-        analyze_session_file_typed_as(&file, ExtensionType::ClaudeCode, AnalysisMode::UsageOnly)
-            .expect("provider-known path should accept the sentinel prelude");
+    let analysis = parse_session_file_as(&file, ExtensionType::ClaudeCode, ParseMode::UsageOnly)
+        .expect("provider-known path should accept the sentinel prelude");
 
     assert_eq!(analysis.extension_name, "Claude-Code");
     assert_eq!(analysis.records.len(), 1);
@@ -492,9 +491,8 @@ fn test_provider_known_extracts_usage_when_first_line_is_file_history_snapshot()
     let file = tmp.path().join("session.jsonl");
     write_claude_fixture_with_sentinel_prelude(&file, "file-history-snapshot");
 
-    let analysis =
-        analyze_session_file_typed_as(&file, ExtensionType::ClaudeCode, AnalysisMode::UsageOnly)
-            .expect("provider-known path should accept the sentinel prelude");
+    let analysis = parse_session_file_as(&file, ExtensionType::ClaudeCode, ParseMode::UsageOnly)
+        .expect("provider-known path should accept the sentinel prelude");
 
     let record = &analysis.records[0];
     assert!(
@@ -509,9 +507,8 @@ fn test_provider_known_extracts_usage_when_first_line_is_queue_operation() {
     let file = tmp.path().join("session.jsonl");
     write_claude_fixture_with_sentinel_prelude(&file, "queue-operation");
 
-    let analysis =
-        analyze_session_file_typed_as(&file, ExtensionType::ClaudeCode, AnalysisMode::UsageOnly)
-            .expect("provider-known path should accept the sentinel prelude");
+    let analysis = parse_session_file_as(&file, ExtensionType::ClaudeCode, ParseMode::UsageOnly)
+        .expect("provider-known path should accept the sentinel prelude");
 
     let record = &analysis.records[0];
     assert!(
@@ -526,7 +523,7 @@ fn test_autodetect_sees_past_queue_operation_prelude() {
     let file = tmp.path().join("session.jsonl");
     write_claude_fixture_with_sentinel_prelude(&file, "queue-operation");
 
-    let analysis = analyze_jsonl_file(&file).expect("auto-detect should handle the prelude");
+    let analysis = parse_session_file(&file).expect("auto-detect should handle the prelude");
     assert_eq!(analysis["extensionName"], "Claude-Code");
     assert_eq!(
         usage_input_tokens_for_model(&analysis, "claude-opus-4-7"),
@@ -543,7 +540,7 @@ fn test_autodetect_sees_past_sentinel_prelude() {
     let file = tmp.path().join("session.jsonl");
     write_claude_fixture_with_sentinel_prelude(&file, "permission-mode");
 
-    let analysis = analyze_jsonl_file(&file).expect("auto-detect should handle the prelude");
+    let analysis = parse_session_file(&file).expect("auto-detect should handle the prelude");
 
     assert_eq!(analysis["extensionName"], "Claude-Code");
     assert_eq!(

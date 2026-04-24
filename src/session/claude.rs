@@ -1,38 +1,35 @@
-use crate::analysis::common_state::{AnalysisMode, AnalysisState};
 use crate::constants::{FastHashMap, capacity};
 use crate::models::*;
+use crate::session::state::{ParseMode, SessionParseState};
 use crate::utils::{get_git_remote_url, parse_iso_timestamp, process_claude_usage};
 use anyhow::Result;
 use serde_json::Value;
 
-/// Analyze Claude Code conversations from pre-parsed `Value` records.
+/// Parse Claude Code session records from a `Vec<Value>` fallback.
 ///
-/// Records are moved into the typed iterator form so that the lean
-/// [`ClaudeCodeLog`] shape drops unused payloads at deserialisation.
-pub fn analyze_claude_conversations(records: Vec<Value>) -> Result<CodeAnalysis> {
-    analyze_claude_conversations_with_mode(records, AnalysisMode::Full)
-}
-
-pub fn analyze_claude_conversations_with_mode(
-    records: Vec<Value>,
-    mode: AnalysisMode,
-) -> Result<CodeAnalysis> {
+/// Used by the pretty-printed single-object JSON fallback path in the
+/// top-level [`parse_session_file_typed`] dispatcher. Records are moved
+/// into the typed iterator form so that the lean [`ClaudeCodeLog`] shape
+/// drops unused payloads at deserialisation.
+///
+/// [`parse_session_file_typed`]: crate::session::parser::parse_session_file_typed
+pub fn parse_claude_log_values(records: Vec<Value>, mode: ParseMode) -> Result<CodeAnalysis> {
     let iter = records
         .into_iter()
         .filter_map(|v| serde_json::from_value::<ClaudeCodeLog>(v).ok());
-    analyze_claude_logs(iter, mode)
+    parse_claude_logs(iter, mode)
 }
 
-/// Analyze Claude Code conversations from any iterator of pre-parsed logs.
+/// Parse Claude Code session records from any iterator of pre-typed logs.
 ///
 /// This is the streaming entry point: callers that read JSONL one line at a
-/// time (see [`crate::analysis::analyzer::analyze_jsonl_file`]) feed records
+/// time (see [`crate::session::parser::parse_session_file`]) feed records
 /// through here without ever materialising a full `Vec<Value>` of raw JSON.
-pub fn analyze_claude_logs<I>(logs: I, mode: AnalysisMode) -> Result<CodeAnalysis>
+pub fn parse_claude_logs<I>(logs: I, mode: ParseMode) -> Result<CodeAnalysis>
 where
     I: IntoIterator<Item = ClaudeCodeLog>,
 {
-    let mut state = AnalysisState::with_mode(mode);
+    let mut state = SessionParseState::with_mode(mode);
     let mut conversation_usage: FastHashMap<String, Value> =
         FastHashMap::with_capacity(capacity::MODELS_PER_SESSION);
 

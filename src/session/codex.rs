@@ -1,21 +1,14 @@
-use crate::analysis::common_state::{AnalysisMode, AnalysisState};
 use crate::constants::FastHashMap;
 use crate::models::*;
+use crate::session::state::{ParseMode, SessionParseState};
 use crate::utils::{get_git_remote_url, parse_iso_timestamp, process_codex_usage};
 use anyhow::Result;
 use regex::Regex;
 use serde_json::Value;
 
-/// Analyze Codex conversations
-pub fn analyze_codex_conversations(logs: &[CodexLog]) -> Result<CodeAnalysis> {
-    analyze_codex_conversations_with_mode(logs, AnalysisMode::Full)
-}
-
-pub fn analyze_codex_conversations_with_mode(
-    logs: &[CodexLog],
-    mode: AnalysisMode,
-) -> Result<CodeAnalysis> {
-    let mut state = AnalysisState::with_mode(mode);
+/// Parse Codex session records from a slice of pre-typed logs.
+pub fn parse_codex_logs(logs: &[CodexLog], mode: ParseMode) -> Result<CodeAnalysis> {
+    let mut state = SessionParseState::with_mode(mode);
     let mut conversation_usage: FastHashMap<String, Value> = FastHashMap::with_capacity(5);
     let mut current_model = String::new();
     let mut shell_calls: FastHashMap<String, CodexShellCall> = FastHashMap::with_capacity(50);
@@ -129,14 +122,14 @@ pub fn analyze_codex_conversations_with_mode(
     })
 }
 
-// Codex-specific extension methods for AnalysisState
+// Codex-specific extension methods for SessionParseState
 trait CodexAnalysisExt {
     fn handle_shell_call(&mut self, call: CodexShellCall, output: CodexShellOutput);
     fn handle_patch(&mut self, patch: CodexPatch, ts: i64);
     fn record_run_command(&mut self, call: CodexShellCall);
 }
 
-impl CodexAnalysisExt for AnalysisState {
+impl CodexAnalysisExt for SessionParseState {
     fn handle_shell_call(&mut self, call: CodexShellCall, output: CodexShellOutput) {
         // Check for applypatch script
         if call.script.contains("applypatch") {

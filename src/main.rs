@@ -22,7 +22,7 @@ use vibe_coding_tracker::models::UsageResult;
 use vibe_coding_tracker::pricing::{ModelPricingMap, calculate_cost, fetch_model_pricing};
 use vibe_coding_tracker::usage::get_usage_from_directories;
 use vibe_coding_tracker::utils::extract_token_counts;
-use vibe_coding_tracker::{analyze_jsonl_file, get_version_info};
+use vibe_coding_tracker::{get_version_info, parse_session_file};
 
 fn main() -> Result<()> {
     // Cap per-thread glibc arenas and pin the trim threshold before any
@@ -50,7 +50,9 @@ fn main() -> Result<()> {
             if by_provider {
                 // Handle --by-provider flag: group by provider and output as JSON
                 let grouped_data =
-                    vibe_coding_tracker::analysis::analyze_all_sessions_by_provider(time_range)?;
+                    vibe_coding_tracker::analysis::collect_sessions_grouped_by_provider(
+                        time_range,
+                    )?;
 
                 if let Some(output_path) = output {
                     let json_value = serde_json::to_value(&grouped_data)?;
@@ -64,7 +66,7 @@ fn main() -> Result<()> {
             } else {
                 match path {
                     Some(file_path) => {
-                        let result = analyze_jsonl_file(&file_path)?;
+                        let result = parse_session_file(&file_path)?;
 
                         if let Some(output_path) = output {
                             vibe_coding_tracker::utils::save_json_pretty(&output_path, &result)?;
@@ -76,7 +78,7 @@ fn main() -> Result<()> {
                     }
                     None => {
                         let analysis_data =
-                            vibe_coding_tracker::analysis::analyze_all_sessions(time_range)?;
+                            vibe_coding_tracker::analysis::aggregate_sessions_by_model(time_range)?;
 
                         if let Some(output_path) = output {
                             let json_value = serde_json::to_value(&analysis_data.rows)?;

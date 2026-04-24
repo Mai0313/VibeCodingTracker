@@ -9,7 +9,7 @@
 
 use serde_json::Value;
 use std::path::PathBuf;
-use vibe_coding_tracker::analysis::analyzer::analyze_jsonl_file;
+use vibe_coding_tracker::session::parser::parse_session_file;
 
 /// Compare two JSON values while ignoring specific fields
 ///
@@ -107,7 +107,7 @@ fn test_claude_code_parser() {
         serde_json::from_str(&expected_content).expect("Failed to parse expected result JSON");
 
     // Analyze the input file
-    let actual_result = analyze_jsonl_file(&input_file);
+    let actual_result = parse_session_file(&input_file);
     assert!(
         actual_result.is_ok(),
         "Failed to analyze Claude Code conversation: {:?}",
@@ -165,7 +165,7 @@ fn test_codex_parser() {
         serde_json::from_str(&expected_content).expect("Failed to parse expected result JSON");
 
     // Analyze the input file
-    let actual_result = analyze_jsonl_file(&input_file);
+    let actual_result = parse_session_file(&input_file);
     assert!(
         actual_result.is_ok(),
         "Failed to analyze Codex conversation: {:?}",
@@ -223,7 +223,7 @@ fn test_copilot_parser() {
         serde_json::from_str(&expected_content).expect("Failed to parse expected result JSON");
 
     // Analyze the input file
-    let actual_result = analyze_jsonl_file(&input_file);
+    let actual_result = parse_session_file(&input_file);
     assert!(
         actual_result.is_ok(),
         "Failed to analyze Copilot conversation: {:?}",
@@ -281,7 +281,7 @@ fn test_gemini_parser() {
         serde_json::from_str(&expected_content).expect("Failed to parse expected result JSON");
 
     // Analyze the input file
-    let actual_result = analyze_jsonl_file(&input_file);
+    let actual_result = parse_session_file(&input_file);
     assert!(
         actual_result.is_ok(),
         "Failed to analyze Gemini conversation: {:?}",
@@ -357,7 +357,7 @@ fn test_gemini_parser_jsonl() {
             .expect("failed to write fixture");
     }
 
-    let actual = analyze_jsonl_file(&input_file).expect("analyze Gemini fixture");
+    let actual = parse_session_file(&input_file).expect("parse Gemini fixture session file");
 
     assert_eq!(actual["extensionName"], "Gemini");
     let record = &actual["records"][0];

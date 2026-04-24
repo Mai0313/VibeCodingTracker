@@ -20,7 +20,7 @@ use serde_json::Value;
 /// Callers walking a streaming source should prefer
 /// [`classify_records`] instead: it returns `None` when the records seen
 /// so far are indeterminate, letting the caller decide whether to read more
-/// before committing to a provider (see `analyzer::stream_analyze_autodetect`).
+/// before committing to a provider (see `parser::stream_parse_autodetect`).
 pub fn detect_extension_type(data: &[Value]) -> Result<ExtensionType> {
     if data.is_empty() {
         bail!("Cannot detect extension type from empty data");

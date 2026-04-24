@@ -24,7 +24,7 @@ pub struct ClaudeCodeLog {
     pub tool_use_result: Option<ClaudeToolUseResult>,
 }
 
-/// Assistant/user message with only the fields `claude_analyzer` inspects.
+/// Assistant/user message with only the fields `session::claude::parse_claude_logs` inspects.
 ///
 /// `content` may appear in the source as either an array of typed blocks
 /// (assistant messages) or a plain string (user messages like `"Caveat: ..."`).

@@ -15,8 +15,8 @@ use serde_json::Value;
 /// of the assistant turn but billed separately from user-visible output.
 /// Populated by Gemini (`thoughts_tokens`), Codex
 /// (`reasoning_output_tokens`), and Copilot (`reasoning_output_tokens`
-/// after `copilot_analyzer` normalises it). Claude has no equivalent and
-/// leaves this at 0.
+/// after `session::copilot::parse_copilot_events` normalises it). Claude
+/// has no equivalent and leaves this at 0.
 #[derive(Debug, Default)]
 pub struct TokenCounts {
     pub input_tokens: i64,
@@ -69,7 +69,7 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
 
         // Gemini writes reasoning budget as `thoughts_tokens`; Copilot's
         // shutdown usage is normalised to `reasoning_output_tokens` by
-        // `copilot_analyzer::analyze_copilot_events`. Either key feeds the
+        // `session::copilot::parse_copilot_events`. Either key feeds the
         // same bucket — we never see both on the same record.
         if let Some(thoughts) = usage_obj.get("thoughts_tokens").and_then(|v| v.as_i64()) {
             counts.reasoning_tokens = thoughts;
@@ -343,8 +343,9 @@ mod tests {
 
     #[test]
     fn copilot_reasoning_output_tokens_populate_reasoning_bucket() {
-        // After `copilot_analyzer` normalisation, Copilot sessions use the
-        // same flat `reasoning_output_tokens` key as Codex's nested one.
+        // After `session::copilot::parse_copilot_events` normalisation,
+        // Copilot sessions use the same flat `reasoning_output_tokens` key
+        // as Codex's nested one.
         let usage = json!({
             "input_tokens": 2_000,
             "output_tokens": 300,

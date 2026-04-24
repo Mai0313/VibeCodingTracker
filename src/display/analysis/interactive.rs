@@ -64,7 +64,7 @@ pub fn display_analysis_interactive(
         sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
 
         // Fetch fresh data with error logging
-        let current_data = match crate::analysis::analyze_all_sessions(time_range) {
+        let current_data = match crate::analysis::aggregate_sessions_by_model(time_range) {
             Ok(data) => data,
             Err(e) => {
                 log::warn!("Failed to analyze sessions: {}", e);
@@ -85,9 +85,9 @@ pub fn display_analysis_interactive(
         // Drop current_data immediately after conversion to free memory
         drop(current_data);
 
-        // `analyze_all_sessions` now bypasses the file cache for aggregated
-        // metrics (runs each file in `AnalysisMode::UsageOnly` and drops
-        // immediately), so there is nothing useful to clear here.
+        // `aggregate_sessions_by_model` now bypasses the file cache for
+        // aggregated metrics (runs each file in `ParseMode::UsageOnly` and
+        // drops immediately), so there is nothing useful to clear here.
 
         // Track updates
         for row in &rows_data {
