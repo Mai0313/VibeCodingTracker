@@ -142,18 +142,20 @@ Common Makefile shortcuts (`make help` to list all):
 
 #### Running Tests
 
-The tests are organized into three tiers. See [`tests/README.md`](tests/README.md) for the full breakdown.
+Unit tests live inline with the code they cover inside `#[cfg(test)] mod tests` blocks in `src/`. End-to-end integration tests live in `tests/integrations/` behind the `tests/integration_tests.rs` entry point. See [`tests/README.md`](tests/README.md) for the full breakdown.
 
 ```bash
-# Everything (library + integration + per-module unit tests)
+# Everything (inline unit tests + integration suite)
 cargo test --all
+
+# Inline unit tests only (compiles just the library)
+cargo test --lib
 
 # Integration tests only (end-to-end, no TUI)
 cargo test --test integration_tests
 
-# A specific unit test file
-cargo test --test test_detector
-cargo test --test test_pricing_matching
+# Tests for a specific module, e.g. the pricing matcher
+cargo test --lib pricing::matching
 
 # Run a single test by name
 cargo test test_exact_match -- --nocapture

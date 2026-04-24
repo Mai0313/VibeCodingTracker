@@ -532,8 +532,7 @@ mod tests {
         let path = Path::new("agent-afda1991051a0eb93.meta.json");
         assert!(!is_codex_session_file(path));
 
-        let nested =
-            Path::new("/home/user/.claude/projects/proj/sess/subagents/agent-x.meta.json");
+        let nested = Path::new("/home/user/.claude/projects/proj/sess/subagents/agent-x.meta.json");
         assert!(!is_codex_session_file(nested));
 
         let meta_jsonl =
