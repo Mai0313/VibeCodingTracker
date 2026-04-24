@@ -67,7 +67,7 @@ pub struct TierRange {
 /// This struct is only ever held in memory — `tiers` / `ranges` are derived
 /// from the raw `*_above_Nk_tokens` / `tiered_pricing` keys of LiteLLM by
 /// `parse_litellm_entry`. Cache files store the raw LiteLLM cost fields
-/// verbatim (see `filter_cost_fields_into_raw`); reloading the cache runs
+/// verbatim (see `filter_cost_fields`); reloading the cache runs
 /// them back through `parse_litellm_entry` so the derived structures are
 /// reconstructed freshly on every launch.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -289,6 +289,11 @@ pub fn parse_litellm_pricing_map(raw: serde_json::Value) -> HashMap<String, Mode
 /// image modalities, reasoning-token splits, …) don't require re-fetching
 /// or a schema migration to gain access to the numbers they need.
 ///
+/// `tiered_pricing` is whitelisted explicitly even though the key name
+/// doesn't contain `cost`: its array values are the **only** source of
+/// range-based pricing (Qwen / doubao / dashscope), so dropping it would
+/// silently zero out those models on every cache reload.
+///
 /// Returns `None` when the entry has no cost-related keys at all; such
 /// models carry nothing we can price against and are skipped at the map
 /// level.
@@ -296,7 +301,7 @@ pub fn filter_cost_fields(value: &Value) -> Option<Value> {
     let obj = value.as_object()?;
     let mut filtered = Map::with_capacity(obj.len());
     for (k, v) in obj {
-        if k.contains("cost") {
+        if k.contains("cost") || k == "tiered_pricing" {
             filtered.insert(k.clone(), v.clone());
         }
     }
@@ -343,13 +348,20 @@ pub fn cleanup_old_cache() {
 
 /// Loads pricing data from today's cache file.
 ///
-/// The cache now stores the raw LiteLLM cost-field subset (see
+/// The cache stores the raw LiteLLM cost-field subset (see
 /// `build_filtered_cost_json`) rather than our derived `ModelPricing`
-/// shape, so we re-run `parse_litellm_entry` here to rebuild `tiers` and
-/// `ranges` on load. Caches written by earlier versions of the tool
-/// (which serialised `ModelPricing` directly) also happen to parse fine
-/// through this path — the derived `tiers` / `ranges` fields we used to
-/// emit aren't cost keys and are simply ignored when re-parsing.
+/// shape, so we re-run `parse_litellm_entry` here to rebuild `tiers`
+/// and `ranges` on load.
+///
+/// Pre-Phase-2 versions serialised the derived `ModelPricing` struct
+/// directly, carrying top-level `tiers` / `ranges` arrays instead of
+/// the raw `*_above_Nk_tokens` / `tiered_pricing` keys.
+/// `parse_litellm_entry` would silently drop those arrays (they aren't
+/// cost-keyed scalars) and under-price every tier- or range-priced
+/// model until the cache rotated the next day. We detect that shape
+/// via `looks_like_legacy_pricing_cache` and return `Err` so
+/// `fetch_model_pricing` falls through to a refetch, which overwrites
+/// the stale cache with the new schema.
 pub fn load_from_cache() -> Result<HashMap<String, ModelPricing>> {
     let today = get_current_date();
     let cache_path = find_pricing_cache_for_date(&today)
@@ -358,7 +370,34 @@ pub fn load_from_cache() -> Result<HashMap<String, ModelPricing>> {
     let content = fs::read_to_string(&cache_path).context("Failed to read cached pricing file")?;
     let raw: Value =
         serde_json::from_str(&content).context("Failed to parse cached pricing JSON")?;
+
+    if looks_like_legacy_pricing_cache(&raw) {
+        log::warn!(
+            "Detected pre-Phase-2 pricing cache format at {:?}; refetching to avoid silent tier/range data loss",
+            cache_path
+        );
+        anyhow::bail!("legacy pricing cache format detected, forcing refetch");
+    }
+
     Ok(parse_litellm_pricing_map(raw))
+}
+
+/// Heuristic: does this cache file look like a pre-Phase-2 serialised
+/// `ModelPricing` map?
+///
+/// The new schema (`build_filtered_cost_json` → `filter_cost_fields`)
+/// only emits keys that either contain `cost` or equal `tiered_pricing`,
+/// so it never produces top-level `tiers` / `ranges` arrays on an
+/// entry. The old schema (`ModelPricing` via derived `Serialize`) did
+/// emit them whenever a model carried tier or range data. Any entry
+/// with such a key is a definitive signal of the old format.
+fn looks_like_legacy_pricing_cache(raw: &Value) -> bool {
+    let Some(obj) = raw.as_object() else {
+        return false;
+    };
+    obj.values()
+        .filter_map(|v| v.as_object())
+        .any(|entry| entry.contains_key("tiers") || entry.contains_key("ranges"))
 }
 
 /// Saves a raw LiteLLM cost-field subset to today's cache file and cleans
@@ -724,5 +763,144 @@ mod parser_tests {
         assert_eq!(p.output_cost_per_token, 2e-6);
         assert!(p.tiers.is_empty());
         assert!(p.ranges.is_none());
+    }
+
+    #[test]
+    fn filter_cost_fields_preserves_tiered_pricing() {
+        // `tiered_pricing` is the only source of range-based pricing
+        // (Qwen / doubao / dashscope). Its key name doesn't contain
+        // "cost", so without an explicit whitelist the filter would
+        // silently drop range data on every cache rotation.
+        let raw = json!({
+            "input_cost_per_token": 0.0,
+            "tiered_pricing": [
+                {
+                    "range": [0, 32000],
+                    "input_cost_per_token": 1e-6,
+                    "output_cost_per_token": 5e-6
+                },
+                {
+                    "range": [32000, 128000],
+                    "input_cost_per_token": 1.8e-6,
+                    "output_cost_per_token": 9e-6
+                }
+            ],
+            "max_input_tokens": 1_000_000,
+            "litellm_provider": "dashscope"
+        });
+        let filtered = filter_cost_fields(&raw).expect("has cost keys");
+        let obj = filtered.as_object().unwrap();
+        assert!(
+            obj.contains_key("tiered_pricing"),
+            "tiered_pricing must survive the filter — it carries range-based pricing data"
+        );
+        let ranges = obj["tiered_pricing"].as_array().expect("array preserved");
+        assert_eq!(ranges.len(), 2);
+        assert!(!obj.contains_key("max_input_tokens"));
+        assert!(!obj.contains_key("litellm_provider"));
+    }
+
+    #[test]
+    fn cache_roundtrip_preserves_range_priced_models() {
+        // Full-pipeline regression: a range-priced model goes through
+        // `build_filtered_cost_json` (what `save_to_cache` writes) and
+        // back through `parse_litellm_pricing_map` (what
+        // `load_from_cache` reads). `ranges` must survive end-to-end —
+        // earlier iterations of the filter dropped `tiered_pricing` as
+        // a non-cost key, zeroing every Qwen / doubao model.
+        let upstream = json!({
+            "qwen3-coder-plus": {
+                "tiered_pricing": [
+                    {
+                        "range": [0, 32000],
+                        "input_cost_per_token": 1e-6,
+                        "output_cost_per_token": 5e-6
+                    },
+                    {
+                        "range": [32000, 128000],
+                        "input_cost_per_token": 1.8e-6,
+                        "output_cost_per_token": 9e-6
+                    }
+                ],
+                "max_input_tokens": 1_000_000,
+                "litellm_provider": "dashscope"
+            }
+        });
+
+        let filtered = build_filtered_cost_json(&upstream);
+        let reloaded = parse_litellm_pricing_map(filtered);
+
+        let p = reloaded
+            .get("qwen3-coder-plus")
+            .expect("model must survive roundtrip");
+        let ranges = p.ranges.as_ref().expect("ranges must be rebuilt on reload");
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0].min_tokens, 0);
+        assert_eq!(ranges[0].max_tokens, 32_000);
+        assert_eq!(ranges[0].input_cost_per_token, 1e-6);
+        assert_eq!(ranges[1].min_tokens, 32_000);
+        assert_eq!(ranges[1].input_cost_per_token, 1.8e-6);
+    }
+
+    #[test]
+    fn looks_like_legacy_pricing_cache_flags_tiers_array() {
+        // Pre-Phase-2 cache format: serialised `ModelPricing` with a
+        // top-level `tiers` array. The new format never emits this key
+        // at the entry level (the filter drops it), so its presence
+        // unambiguously signals the old shape.
+        let legacy = json!({
+            "claude-sonnet-4-6": {
+                "input_cost_per_token": 3e-6,
+                "output_cost_per_token": 1.5e-5,
+                "tiers": [
+                    {
+                        "threshold_tokens": 200_000,
+                        "input_cost_per_token": 6e-6,
+                        "output_cost_per_token": 2.25e-5
+                    }
+                ]
+            }
+        });
+        assert!(looks_like_legacy_pricing_cache(&legacy));
+    }
+
+    #[test]
+    fn looks_like_legacy_pricing_cache_flags_ranges_field() {
+        let legacy = json!({
+            "qwen-plus": {
+                "ranges": [
+                    {
+                        "min_tokens": 0,
+                        "max_tokens": 32_000,
+                        "input_cost_per_token": 1e-6
+                    }
+                ]
+            }
+        });
+        assert!(looks_like_legacy_pricing_cache(&legacy));
+    }
+
+    #[test]
+    fn looks_like_legacy_pricing_cache_accepts_new_format() {
+        // New format keeps only cost-named keys plus `tiered_pricing`
+        // and never emits top-level `tiers` or `ranges` arrays on an
+        // entry, so a fresh cache file must not trip the detector.
+        let new_format = json!({
+            "claude-sonnet-4-6": {
+                "input_cost_per_token": 3e-6,
+                "output_cost_per_token": 1.5e-5,
+                "input_cost_per_token_above_200k_tokens": 6e-6,
+                "output_cost_per_token_above_200k_tokens": 2.25e-5
+            },
+            "qwen3-coder-plus": {
+                "tiered_pricing": [
+                    {
+                        "range": [0, 32000],
+                        "input_cost_per_token": 1e-6
+                    }
+                ]
+            }
+        });
+        assert!(!looks_like_legacy_pricing_cache(&new_format));
     }
 }
