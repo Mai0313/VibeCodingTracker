@@ -17,7 +17,7 @@ pub mod state;
 
 pub use detector::{classify_records, detect_extension_type};
 pub use parser::{
-    analyze_jsonl_file, analyze_jsonl_file_typed, analyze_jsonl_file_typed_with_mode,
-    analyze_session_file_typed_as,
+    parse_session_file, parse_session_file_as, parse_session_file_typed,
+    parse_session_file_typed_with_mode,
 };
 pub use state::{ParseMode, SessionParseState};

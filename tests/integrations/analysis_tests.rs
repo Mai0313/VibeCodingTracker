@@ -9,7 +9,7 @@ use vibe_coding_tracker::analysis::batch_analyzer::{
 };
 use vibe_coding_tracker::cli::TimeRange;
 use vibe_coding_tracker::models::ExtensionType;
-use vibe_coding_tracker::session::parser::{analyze_jsonl_file, analyze_session_file_typed_as};
+use vibe_coding_tracker::session::parser::{parse_session_file, parse_session_file_as};
 use vibe_coding_tracker::session::state::ParseMode;
 
 #[test]
@@ -21,7 +21,7 @@ fn test_single_file_analysis_claude() {
         return;
     }
 
-    let result = analyze_jsonl_file(&input_file);
+    let result = parse_session_file(&input_file);
     assert!(result.is_ok(), "Should successfully analyze Claude file");
 
     let analysis = result.unwrap();
@@ -45,7 +45,7 @@ fn test_single_file_analysis_codex() {
         return;
     }
 
-    let result = analyze_jsonl_file(&input_file);
+    let result = parse_session_file(&input_file);
     assert!(result.is_ok(), "Should successfully analyze Codex file");
 
     let analysis = result.unwrap();
@@ -62,7 +62,7 @@ fn test_single_file_analysis_copilot() {
         return;
     }
 
-    let result = analyze_jsonl_file(&input_file);
+    let result = parse_session_file(&input_file);
     assert!(result.is_ok(), "Should successfully analyze Copilot file");
 
     let analysis = result.unwrap();
@@ -79,7 +79,7 @@ fn test_single_file_analysis_gemini() {
         return;
     }
 
-    let result = analyze_jsonl_file(&input_file);
+    let result = parse_session_file(&input_file);
     assert!(result.is_ok(), "Should successfully analyze Gemini file");
 
     let analysis = result.unwrap();
@@ -96,7 +96,7 @@ fn test_analysis_record_structure() {
         return;
     }
 
-    let result = analyze_jsonl_file(&input_file);
+    let result = parse_session_file(&input_file);
     if let Ok(analysis) = result {
         let records = &analysis["records"];
         if let Some(first_record) = records.as_array().and_then(|arr| arr.first()) {
@@ -127,7 +127,7 @@ fn test_analysis_conversation_usage() {
         return;
     }
 
-    let result = analyze_jsonl_file(&input_file);
+    let result = parse_session_file(&input_file);
     if let Ok(analysis) = result {
         let records = &analysis["records"];
         if let Some(first_record) = records.as_array().and_then(|arr| arr.first()) {
@@ -166,7 +166,7 @@ fn test_analysis_tool_call_counts() {
         return;
     }
 
-    let result = analyze_jsonl_file(&input_file);
+    let result = parse_session_file(&input_file);
     if let Ok(analysis) = result {
         let records = &analysis["records"];
         if let Some(first_record) = records.as_array().and_then(|arr| arr.first()) {
@@ -194,7 +194,7 @@ fn test_analysis_file_operations() {
         return;
     }
 
-    let result = analyze_jsonl_file(&input_file);
+    let result = parse_session_file(&input_file);
     if let Ok(analysis) = result {
         let records = &analysis["records"];
         if let Some(first_record) = records.as_array().and_then(|arr| arr.first()) {
@@ -336,7 +336,7 @@ fn test_analysis_with_empty_file() {
     let empty_file = temp_dir.path().join("empty.jsonl");
     std::fs::write(&empty_file, "").unwrap();
 
-    let result = analyze_jsonl_file(&empty_file);
+    let result = parse_session_file(&empty_file);
     // Should either succeed with empty result or fail gracefully
     assert!(
         result.is_ok() || result.is_err(),
@@ -351,7 +351,7 @@ fn test_analysis_with_invalid_json() {
     let invalid_file = temp_dir.path().join("invalid.jsonl");
     std::fs::write(&invalid_file, "not valid json\n{incomplete").unwrap();
 
-    let result = analyze_jsonl_file(&invalid_file);
+    let result = parse_session_file(&invalid_file);
     // Should fail with error
     assert!(result.is_err(), "Should fail on invalid JSON");
 }
@@ -469,7 +469,7 @@ fn test_provider_known_extracts_usage_when_first_line_is_permission_mode() {
     write_claude_fixture_with_sentinel_prelude(&file, "permission-mode");
 
     let analysis =
-        analyze_session_file_typed_as(&file, ExtensionType::ClaudeCode, ParseMode::UsageOnly)
+        parse_session_file_as(&file, ExtensionType::ClaudeCode, ParseMode::UsageOnly)
             .expect("provider-known path should accept the sentinel prelude");
 
     assert_eq!(analysis.extension_name, "Claude-Code");
@@ -493,7 +493,7 @@ fn test_provider_known_extracts_usage_when_first_line_is_file_history_snapshot()
     write_claude_fixture_with_sentinel_prelude(&file, "file-history-snapshot");
 
     let analysis =
-        analyze_session_file_typed_as(&file, ExtensionType::ClaudeCode, ParseMode::UsageOnly)
+        parse_session_file_as(&file, ExtensionType::ClaudeCode, ParseMode::UsageOnly)
             .expect("provider-known path should accept the sentinel prelude");
 
     let record = &analysis.records[0];
@@ -510,7 +510,7 @@ fn test_provider_known_extracts_usage_when_first_line_is_queue_operation() {
     write_claude_fixture_with_sentinel_prelude(&file, "queue-operation");
 
     let analysis =
-        analyze_session_file_typed_as(&file, ExtensionType::ClaudeCode, ParseMode::UsageOnly)
+        parse_session_file_as(&file, ExtensionType::ClaudeCode, ParseMode::UsageOnly)
             .expect("provider-known path should accept the sentinel prelude");
 
     let record = &analysis.records[0];
@@ -526,7 +526,7 @@ fn test_autodetect_sees_past_queue_operation_prelude() {
     let file = tmp.path().join("session.jsonl");
     write_claude_fixture_with_sentinel_prelude(&file, "queue-operation");
 
-    let analysis = analyze_jsonl_file(&file).expect("auto-detect should handle the prelude");
+    let analysis = parse_session_file(&file).expect("auto-detect should handle the prelude");
     assert_eq!(analysis["extensionName"], "Claude-Code");
     assert_eq!(
         usage_input_tokens_for_model(&analysis, "claude-opus-4-7"),
@@ -543,7 +543,7 @@ fn test_autodetect_sees_past_sentinel_prelude() {
     let file = tmp.path().join("session.jsonl");
     write_claude_fixture_with_sentinel_prelude(&file, "permission-mode");
 
-    let analysis = analyze_jsonl_file(&file).expect("auto-detect should handle the prelude");
+    let analysis = parse_session_file(&file).expect("auto-detect should handle the prelude");
 
     assert_eq!(analysis["extensionName"], "Claude-Code");
     assert_eq!(

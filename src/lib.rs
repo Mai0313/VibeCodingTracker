@@ -11,7 +11,7 @@ pub mod usage;
 pub mod utils;
 
 pub use cli::TimeRange;
-pub use session::parser::{analyze_jsonl_file, analyze_jsonl_file_typed};
+pub use session::parser::{parse_session_file, parse_session_file_typed};
 pub use models::*;
 pub use usage::calculator::{UsageData, get_usage_from_directories};
 

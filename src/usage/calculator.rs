@@ -3,7 +3,7 @@ use crate::constants::{FastHashMap, capacity};
 use crate::models::{
     CodeAnalysis, ExtensionType, PerProviderUsage, Provider, ProviderActiveDays, UsageResult,
 };
-use crate::session::{ParseMode, analyze_session_file_typed_as};
+use crate::session::{ParseMode, parse_session_file_as};
 use crate::utils::{
     COPILOT_SESSION_MAX_DEPTH, collect_files_with_max_depth, is_claude_session_file,
     is_codex_session_file, is_copilot_session_file, is_gemini_session_file, resolve_paths,
@@ -175,7 +175,7 @@ where
     let file_results: Vec<(String, FastHashMap<String, Value>)> = files
         .par_iter()
         .filter_map(|file_info| {
-            match analyze_session_file_typed_as(&file_info.path, provider, ParseMode::UsageOnly)
+            match parse_session_file_as(&file_info.path, provider, ParseMode::UsageOnly)
             {
                 Ok(analysis) => {
                     let conversation_usage = extract_conversation_usage_from_analysis(&analysis);

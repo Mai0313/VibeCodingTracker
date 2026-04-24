@@ -26,7 +26,7 @@ pub fn analyze_claude_conversations_with_mode(
 /// Analyze Claude Code conversations from any iterator of pre-parsed logs.
 ///
 /// This is the streaming entry point: callers that read JSONL one line at a
-/// time (see [`crate::session::parser::analyze_jsonl_file`]) feed records
+/// time (see [`crate::session::parser::parse_session_file`]) feed records
 /// through here without ever materialising a full `Vec<Value>` of raw JSON.
 pub fn analyze_claude_logs<I>(logs: I, mode: ParseMode) -> Result<CodeAnalysis>
 where

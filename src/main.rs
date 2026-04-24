@@ -22,7 +22,7 @@ use vibe_coding_tracker::models::UsageResult;
 use vibe_coding_tracker::pricing::{ModelPricingMap, calculate_cost, fetch_model_pricing};
 use vibe_coding_tracker::usage::get_usage_from_directories;
 use vibe_coding_tracker::utils::extract_token_counts;
-use vibe_coding_tracker::{analyze_jsonl_file, get_version_info};
+use vibe_coding_tracker::{get_version_info, parse_session_file};
 
 fn main() -> Result<()> {
     // Cap per-thread glibc arenas and pin the trim threshold before any
@@ -64,7 +64,7 @@ fn main() -> Result<()> {
             } else {
                 match path {
                     Some(file_path) => {
-                        let result = analyze_jsonl_file(&file_path)?;
+                        let result = parse_session_file(&file_path)?;
 
                         if let Some(output_path) = output {
                             vibe_coding_tracker::utils::save_json_pretty(&output_path, &result)?;

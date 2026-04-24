@@ -113,8 +113,8 @@ impl FileParseCache {
         // Cache miss or outdated - need to parse.
         log::debug!("LRU cache miss for {}, parsing...", path.display());
         let analysis = match provider {
-            Some(p) => crate::session::analyze_session_file_typed_as(path, p, ParseMode::Full)?,
-            None => crate::session::analyze_jsonl_file_typed(path)?,
+            Some(p) => crate::session::parse_session_file_as(path, p, ParseMode::Full)?,
+            None => crate::session::parse_session_file_typed(path)?,
         };
         let arc_analysis = Arc::new(analysis);
         let size_bytes = estimate_analysis_bytes(arc_analysis.as_ref());

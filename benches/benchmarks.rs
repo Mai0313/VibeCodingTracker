@@ -94,9 +94,9 @@ fn benchmark_file_parsing(c: &mut Criterion) {
         let path_buf = PathBuf::from(path);
         if path_buf.exists() {
             group.bench_with_input(
-                BenchmarkId::new("analyze_jsonl_file", name),
+                BenchmarkId::new("parse_session_file", name),
                 &path_buf,
-                |b, p| b.iter(|| vibe_coding_tracker::session::analyze_jsonl_file(black_box(p))),
+                |b, p| b.iter(|| vibe_coding_tracker::session::parse_session_file(black_box(p))),
             );
         }
     }
@@ -294,7 +294,7 @@ fn benchmark_batch_analysis(c: &mut Criterion) {
 
             // Simulate batch processing
             for (path, _name) in paths {
-                let _ = vibe_coding_tracker::session::analyze_jsonl_file(black_box(&path));
+                let _ = vibe_coding_tracker::session::parse_session_file(black_box(&path));
             }
         })
     });

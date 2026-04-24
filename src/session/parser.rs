@@ -19,12 +19,12 @@ use std::path::Path;
 /// Analyzes a session file (JSONL or JSON) and returns the result as a
 /// `serde_json::Value` (the CLI single-file dump path).
 ///
-/// Internally this is a thin wrapper over [`analyze_jsonl_file_typed`]; the
+/// Internally this is a thin wrapper over [`parse_session_file_typed`]; the
 /// conversion to `Value` happens once at the edge here rather than inside the
 /// cache, which keeps long sessions from being duplicated between typed and
 /// `Value` forms when multiple commands run against the same file.
-pub fn analyze_jsonl_file<P: AsRef<Path>>(path: P) -> Result<Value> {
-    let analysis = analyze_jsonl_file_typed(path)?;
+pub fn parse_session_file<P: AsRef<Path>>(path: P) -> Result<Value> {
+    let analysis = parse_session_file_typed(path)?;
     if analysis.records.is_empty() && analysis.extension_name.is_empty() {
         // Preserve historical behaviour: empty input → `{}` rather than a
         // fully-populated but empty `CodeAnalysis` object.
@@ -35,7 +35,7 @@ pub fn analyze_jsonl_file<P: AsRef<Path>>(path: P) -> Result<Value> {
 
 /// Typed entry point that auto-detects the provider from file contents.
 ///
-/// Prefer [`analyze_session_file_typed_as`] whenever the caller already knows
+/// Prefer [`parse_session_file_as`] whenever the caller already knows
 /// which provider the file belongs to (e.g. when walking
 /// `~/.claude/projects/*.jsonl` vs `~/.codex/sessions/*.jsonl`). Content-based
 /// detection is only intended for the CLI single-file path where the user
@@ -43,19 +43,19 @@ pub fn analyze_jsonl_file<P: AsRef<Path>>(path: P) -> Result<Value> {
 ///
 /// Parses in [`ParseMode::Full`] — for callers that only consume tool
 /// counts and token usage (usage / aggregated analysis), use
-/// [`analyze_jsonl_file_typed_with_mode`] with [`ParseMode::UsageOnly`]
+/// [`parse_session_file_typed_with_mode`] with [`ParseMode::UsageOnly`]
 /// to avoid allocating `write_file_details`/`edit_file_details` bodies.
-pub fn analyze_jsonl_file_typed<P: AsRef<Path>>(path: P) -> Result<CodeAnalysis> {
-    analyze_jsonl_file_typed_with_mode(path, ParseMode::Full)
+pub fn parse_session_file_typed<P: AsRef<Path>>(path: P) -> Result<CodeAnalysis> {
+    parse_session_file_typed_with_mode(path, ParseMode::Full)
 }
 
-pub fn analyze_jsonl_file_typed_with_mode<P: AsRef<Path>>(
+pub fn parse_session_file_typed_with_mode<P: AsRef<Path>>(
     path: P,
     mode: ParseMode,
 ) -> Result<CodeAnalysis> {
     let path = path.as_ref();
 
-    if let Some(analysis) = stream_analyze_autodetect(path, mode)? {
+    if let Some(analysis) = stream_parse_autodetect(path, mode)? {
         return Ok(analysis);
     }
 
@@ -77,21 +77,21 @@ pub fn analyze_jsonl_file_typed_with_mode<P: AsRef<Path>>(
 
 /// Typed entry point when the caller already knows the provider.
 ///
-/// Directory scanners should use this instead of [`analyze_jsonl_file_typed`]
+/// Directory scanners should use this instead of [`parse_session_file_typed`]
 /// so that provider classification follows the source path — `~/.claude/projects`
 /// is always [`ExtensionType::ClaudeCode`], `~/.codex/sessions` is always
 /// [`ExtensionType::Codex`], and so on. This eliminates a whole class of bug
 /// where a metadata sentinel record at the top of a session (`permission-mode`,
 /// `file-history-snapshot`) leads the content-based detector to mis-file the
 /// log under another provider and silently drop its usage totals.
-pub fn analyze_session_file_typed_as<P: AsRef<Path>>(
+pub fn parse_session_file_as<P: AsRef<Path>>(
     path: P,
     provider: ExtensionType,
     mode: ParseMode,
 ) -> Result<CodeAnalysis> {
     let path = path.as_ref();
 
-    if let Some(analysis) = stream_analyze_known(path, provider, mode)? {
+    if let Some(analysis) = stream_parse_known(path, provider, mode)? {
         return Ok(analysis);
     }
 
@@ -115,7 +115,7 @@ pub fn analyze_session_file_typed_as<P: AsRef<Path>>(
 /// is a record) from a pretty-printed single-object JSON (which parses as a
 /// multi-line block and therefore fails `from_str` on line one). No detection
 /// happens here — the provider was decided by the path the file came from.
-fn stream_analyze_known(
+fn stream_parse_known(
     path: &Path,
     provider: ExtensionType,
     mode: ParseMode,
@@ -154,7 +154,7 @@ fn stream_analyze_known(
 /// `type` values (`session_meta`, `turn_context`, …) so a synthetic file
 /// with no markers is most likely a deliberately-empty Codex fixture
 /// rather than a silently-broken Claude log.
-fn stream_analyze_autodetect(path: &Path, mode: ParseMode) -> Result<Option<CodeAnalysis>> {
+fn stream_parse_autodetect(path: &Path, mode: ParseMode) -> Result<Option<CodeAnalysis>> {
     let file =
         File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
     let mut reader = BufReader::with_capacity(buffer::FILE_READ_BUFFER, file);
