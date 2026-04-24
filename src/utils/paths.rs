@@ -138,3 +138,204 @@ pub fn list_pricing_cache_files() -> Result<Vec<(String, PathBuf)>> {
 
     Ok(cache_files)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_paths() {
+        let result = resolve_paths();
+        assert!(result.is_ok());
+
+        if let Ok(paths) = result {
+            assert!(paths.home_dir.exists());
+
+            assert!(paths.home_dir.is_absolute());
+            assert!(paths.codex_dir.is_absolute());
+            assert!(paths.claude_dir.is_absolute());
+            assert!(paths.copilot_dir.is_absolute());
+            assert!(paths.gemini_dir.is_absolute());
+            assert!(paths.cache_dir.is_absolute());
+
+            assert!(paths.codex_dir.ends_with(".codex"));
+            assert!(paths.claude_dir.ends_with(".claude"));
+            assert!(paths.copilot_dir.ends_with(".copilot"));
+            assert!(paths.gemini_dir.ends_with(".gemini"));
+            assert!(paths.cache_dir.ends_with(".vibe_coding_tracker"));
+
+            assert!(paths.codex_session_dir.ends_with("sessions"));
+            assert!(paths.claude_session_dir.ends_with("projects"));
+            assert!(paths.copilot_session_dir.ends_with("session-state"));
+            assert!(paths.gemini_session_dir.ends_with("tmp"));
+        }
+    }
+
+    #[test]
+    fn test_get_current_user() {
+        let user = get_current_user();
+
+        assert!(!user.is_empty());
+        assert!(!user.contains('\0'));
+        assert!(user.len() < 256);
+    }
+
+    #[test]
+    fn test_get_machine_id() {
+        let machine_id = get_machine_id();
+
+        assert!(!machine_id.is_empty());
+        assert!(!machine_id.contains('\0'));
+        assert!(machine_id.len() < 1024);
+    }
+
+    #[test]
+    fn test_get_machine_id_cached() {
+        let id1 = get_machine_id();
+        let id2 = get_machine_id();
+        let id3 = get_machine_id();
+
+        assert_eq!(id1, id2);
+        assert_eq!(id2, id3);
+    }
+
+    #[test]
+    fn test_paths_structure() {
+        let paths = resolve_paths().unwrap();
+
+        assert_eq!(paths.codex_session_dir, paths.codex_dir.join("sessions"));
+        assert_eq!(paths.claude_session_dir, paths.claude_dir.join("projects"));
+        assert_eq!(
+            paths.copilot_session_dir,
+            paths.copilot_dir.join("session-state")
+        );
+        assert_eq!(paths.gemini_session_dir, paths.gemini_dir.join("tmp"));
+    }
+
+    #[test]
+    fn test_paths_all_under_home() {
+        let paths = resolve_paths().unwrap();
+
+        assert!(paths.codex_dir.starts_with(&paths.home_dir));
+        assert!(paths.claude_dir.starts_with(&paths.home_dir));
+        assert!(paths.copilot_dir.starts_with(&paths.home_dir));
+        assert!(paths.gemini_dir.starts_with(&paths.home_dir));
+        assert!(paths.cache_dir.starts_with(&paths.home_dir));
+    }
+
+    #[test]
+    fn test_cache_dir_name() {
+        let paths = resolve_paths().unwrap();
+        let cache_name = paths.cache_dir.file_name().unwrap();
+
+        assert_eq!(cache_name, ".vibe_coding_tracker");
+    }
+
+    #[test]
+    fn test_session_dirs_are_subdirs() {
+        let paths = resolve_paths().unwrap();
+
+        assert!(paths.codex_session_dir.starts_with(&paths.codex_dir));
+        assert!(paths.claude_session_dir.starts_with(&paths.claude_dir));
+        assert!(paths.copilot_session_dir.starts_with(&paths.copilot_dir));
+        assert!(paths.gemini_session_dir.starts_with(&paths.gemini_dir));
+    }
+
+    #[test]
+    fn test_get_current_user_not_empty() {
+        let user = get_current_user();
+        assert!(!user.is_empty());
+    }
+
+    #[test]
+    fn test_get_machine_id_not_empty() {
+        let machine_id = get_machine_id();
+        assert!(!machine_id.is_empty());
+    }
+
+    #[test]
+    fn test_paths_debug_format() {
+        let paths = resolve_paths().unwrap();
+        let debug_str = format!("{:?}", paths);
+
+        assert!(debug_str.contains("home_dir"));
+        assert!(debug_str.contains("cache_dir"));
+    }
+
+    #[test]
+    fn test_paths_clone() {
+        let paths1 = resolve_paths().unwrap();
+        let paths2 = paths1.clone();
+
+        assert_eq!(paths1.home_dir, paths2.home_dir);
+        assert_eq!(paths1.cache_dir, paths2.cache_dir);
+        assert_eq!(paths1.codex_dir, paths2.codex_dir);
+    }
+
+    #[test]
+    fn test_resolve_paths_deterministic() {
+        let paths1 = resolve_paths().unwrap();
+        let paths2 = resolve_paths().unwrap();
+
+        assert_eq!(paths1.home_dir, paths2.home_dir);
+        assert_eq!(paths1.codex_dir, paths2.codex_dir);
+        assert_eq!(paths1.claude_dir, paths2.claude_dir);
+        assert_eq!(paths1.copilot_dir, paths2.copilot_dir);
+        assert_eq!(paths1.gemini_dir, paths2.gemini_dir);
+        assert_eq!(paths1.cache_dir, paths2.cache_dir);
+    }
+
+    #[test]
+    fn test_get_cache_dir() {
+        let result = get_cache_dir();
+        assert!(result.is_ok());
+
+        let cache_dir = result.unwrap();
+        assert!(cache_dir.ends_with(".vibe_coding_tracker"));
+        assert!(cache_dir.exists());
+    }
+
+    #[test]
+    fn test_get_pricing_cache_path() {
+        let date = "2024-01-15";
+        let result = get_pricing_cache_path(date);
+
+        assert!(result.is_ok());
+        let path = result.unwrap();
+
+        let filename = path.file_name().unwrap().to_str().unwrap();
+        assert!(filename.contains("2024-01-15"));
+        assert!(filename.starts_with("model_pricing_"));
+        assert!(filename.ends_with(".json"));
+    }
+
+    #[test]
+    fn test_get_pricing_cache_path_format() {
+        let dates = vec!["2024-01-01", "2024-12-31", "2023-06-15"];
+
+        for date in dates {
+            let path = get_pricing_cache_path(date).unwrap();
+            let filename = path.file_name().unwrap().to_str().unwrap();
+            assert_eq!(filename, format!("model_pricing_{}.json", date));
+        }
+    }
+
+    #[test]
+    fn test_find_pricing_cache_for_date_nonexistent() {
+        let result = find_pricing_cache_for_date("1900-01-01");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_list_pricing_cache_files() {
+        let result = list_pricing_cache_files();
+        assert!(result.is_ok());
+
+        let cache_files = result.unwrap();
+        for (filename, path) in cache_files {
+            assert!(filename.starts_with("model_pricing_"));
+            assert!(filename.ends_with(".json"));
+            assert!(path.exists());
+        }
+    }
+}

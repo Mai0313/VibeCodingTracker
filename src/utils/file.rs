@@ -97,3 +97,221 @@ pub fn save_json_pretty<P: AsRef<Path>>(path: P, value: &Value) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::fs::File;
+    use std::io::Write;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_count_lines_empty() {
+        assert_eq!(count_lines(""), 0);
+    }
+
+    #[test]
+    fn test_count_lines_single_line_no_newline() {
+        assert_eq!(count_lines("hello"), 1);
+    }
+
+    #[test]
+    fn test_count_lines_single_line_with_newline() {
+        assert_eq!(count_lines("hello\n"), 1);
+    }
+
+    #[test]
+    fn test_count_lines_multiple_lines() {
+        assert_eq!(count_lines("line1\nline2\nline3"), 3);
+    }
+
+    #[test]
+    fn test_count_lines_multiple_lines_with_newline() {
+        assert_eq!(count_lines("line1\nline2\nline3\n"), 3);
+    }
+
+    #[test]
+    fn test_count_lines_empty_lines() {
+        assert_eq!(count_lines("line1\n\nline3"), 3);
+        assert_eq!(count_lines("\n\n\n"), 3);
+    }
+
+    #[test]
+    fn test_read_jsonl_valid() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test.jsonl");
+
+        let mut file = File::create(&file_path).unwrap();
+        writeln!(file, r#"{{"key1": "value1"}}"#).unwrap();
+        writeln!(file, r#"{{"key2": "value2"}}"#).unwrap();
+        writeln!(file, r#"{{"key3": "value3"}}"#).unwrap();
+
+        let result = read_jsonl(&file_path).unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0]["key1"], "value1");
+        assert_eq!(result[1]["key2"], "value2");
+        assert_eq!(result[2]["key3"], "value3");
+    }
+
+    #[test]
+    fn test_read_jsonl_with_empty_lines() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test.jsonl");
+
+        let mut file = File::create(&file_path).unwrap();
+        writeln!(file, r#"{{"key1": "value1"}}"#).unwrap();
+        writeln!(file).unwrap();
+        writeln!(file, r#"{{"key2": "value2"}}"#).unwrap();
+        writeln!(file, "   ").unwrap();
+        writeln!(file, r#"{{"key3": "value3"}}"#).unwrap();
+
+        let result = read_jsonl(&file_path).unwrap();
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn test_read_jsonl_empty_file() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("empty.jsonl");
+
+        File::create(&file_path).unwrap();
+
+        let result = read_jsonl(&file_path).unwrap();
+        assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn test_read_jsonl_invalid_json() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("invalid.jsonl");
+
+        let mut file = File::create(&file_path).unwrap();
+        writeln!(file, "not valid json").unwrap();
+
+        let result = read_jsonl(&file_path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_read_jsonl_nonexistent_file() {
+        let result = read_jsonl("/nonexistent/path/file.jsonl");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_read_json_valid() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test.json");
+
+        let mut file = File::create(&file_path).unwrap();
+        write!(file, r#"{{"key": "value", "number": 42}}"#).unwrap();
+
+        let result = read_json(&file_path).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["key"], "value");
+        assert_eq!(result[0]["number"], 42);
+    }
+
+    #[test]
+    fn test_read_json_array() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("array.json");
+
+        let mut file = File::create(&file_path).unwrap();
+        write!(file, r#"[1, 2, 3, 4, 5]"#).unwrap();
+
+        let result = read_json(&file_path).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].is_array());
+        assert_eq!(result[0].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn test_read_json_invalid() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("invalid.json");
+
+        let mut file = File::create(&file_path).unwrap();
+        write!(file, "not valid json").unwrap();
+
+        let result = read_json(&file_path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_read_json_nonexistent_file() {
+        let result = read_json("/nonexistent/path/file.json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_count_lines_unicode() {
+        assert_eq!(count_lines("こんにちは"), 1);
+        assert_eq!(count_lines("line1 😀\nline2 🎉\nline3 🚀"), 3);
+    }
+
+    #[test]
+    fn test_count_lines_windows_line_endings() {
+        assert_eq!(count_lines("line1\r\nline2\r\nline3"), 3);
+    }
+
+    #[test]
+    fn test_read_jsonl_large_objects() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("large.jsonl");
+
+        let mut file = File::create(&file_path).unwrap();
+        let large_obj = json!({
+            "field1": "value1",
+            "field2": "value2",
+            "nested": {
+                "a": 1,
+                "b": 2,
+                "c": [1, 2, 3, 4, 5]
+            }
+        });
+        writeln!(file, "{}", serde_json::to_string(&large_obj).unwrap()).unwrap();
+
+        let result = read_jsonl(&file_path).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["field1"], "value1");
+        assert_eq!(result[0]["nested"]["c"].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn test_read_json_nested_structure() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("nested.json");
+
+        let nested = json!({
+            "level1": {
+                "level2": {
+                    "level3": {
+                        "value": "deep"
+                    }
+                }
+            }
+        });
+
+        let mut file = File::create(&file_path).unwrap();
+        write!(file, "{}", serde_json::to_string(&nested).unwrap()).unwrap();
+
+        let result = read_json(&file_path).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["level1"]["level2"]["level3"]["value"], "deep");
+    }
+
+    #[test]
+    fn test_count_lines_only_newlines() {
+        assert_eq!(count_lines("\n"), 1);
+        assert_eq!(count_lines("\n\n"), 2);
+        assert_eq!(count_lines("\n\n\n"), 3);
+    }
+
+    #[test]
+    fn test_count_lines_mixed_content() {
+        assert_eq!(count_lines("a\n  \nc"), 3);
+        assert_eq!(count_lines("  hello  \n  world  "), 2);
+    }
+}

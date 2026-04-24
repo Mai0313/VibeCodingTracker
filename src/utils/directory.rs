@@ -215,3 +215,388 @@ fn is_meta_sidecar_file(path: &Path) -> bool {
         .and_then(|n| n.to_str())
         .is_some_and(|name| name.ends_with(".meta.json") || name.ends_with(".meta.jsonl"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::{self, File};
+    use std::io::Write;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_is_codex_session_file_jsonl() {
+        let path = Path::new("test.jsonl");
+        assert!(is_codex_session_file(path));
+    }
+
+    #[test]
+    fn test_is_codex_session_file_json() {
+        let path = Path::new("test.json");
+        assert!(is_codex_session_file(path));
+    }
+
+    #[test]
+    fn test_is_codex_session_file_txt() {
+        let path = Path::new("test.txt");
+        assert!(!is_codex_session_file(path));
+    }
+
+    #[test]
+    fn test_is_codex_session_file_no_extension() {
+        let path = Path::new("test");
+        assert!(!is_codex_session_file(path));
+    }
+
+    #[test]
+    fn test_is_codex_session_file_uppercase() {
+        let path = Path::new("test.JSON");
+        assert!(!is_codex_session_file(path));
+    }
+
+    #[test]
+    fn test_is_gemini_session_file_rejects_legacy_json() {
+        // Legacy single-object exports (`chats/<session>.json`) are intentionally
+        // no longer matched — the analyzer only handles the JSONL event stream.
+        let path = Path::new("/home/user/.gemini/tmp/hash/chats/chat.json");
+        assert!(!is_gemini_session_file(path));
+    }
+
+    #[test]
+    fn test_is_gemini_session_file_accepts_jsonl() {
+        let path = Path::new("/home/user/.gemini/tmp/proj/chats/session-2026-04-23T12-52.jsonl");
+        assert!(is_gemini_session_file(path));
+    }
+
+    #[test]
+    fn test_is_gemini_session_file_wrong_parent() {
+        let path = Path::new("/home/user/.gemini/tmp/hash/other/file.json");
+        assert!(!is_gemini_session_file(path));
+    }
+
+    #[test]
+    fn test_is_gemini_session_file_wrong_extension() {
+        let path = Path::new("/home/user/.gemini/tmp/hash/chats/file.txt");
+        assert!(!is_gemini_session_file(path));
+    }
+
+    #[test]
+    fn test_is_gemini_session_file_no_parent() {
+        let path = Path::new("file.json");
+        assert!(!is_gemini_session_file(path));
+    }
+
+    #[test]
+    fn test_is_gemini_session_file_excludes_sibling_dirs() {
+        // `tmp/discordbot/logs.json` lives next to the `chats/` folder but
+        // must not be picked up because its parent is not `chats`.
+        let sibling = Path::new("/home/user/.gemini/tmp/discordbot/logs.json");
+        assert!(!is_gemini_session_file(sibling));
+
+        let binary = Path::new("/home/user/.gemini/tmp/bin/rg");
+        assert!(!is_gemini_session_file(binary));
+    }
+
+    #[test]
+    fn test_is_copilot_session_file_accepts_events_jsonl() {
+        let path = Path::new(
+            "/home/user/.copilot/session-state/d2e098d0-e0d6-4d6b-914b-c4c5543b17e3/events.jsonl",
+        );
+        assert!(is_copilot_session_file(path));
+    }
+
+    #[test]
+    fn test_is_copilot_session_file_rejects_snapshots() {
+        let snapshot_index =
+            Path::new("/home/user/.copilot/session-state/d2e098d0/rewind-snapshots/index.json");
+        assert!(!is_copilot_session_file(snapshot_index));
+
+        let snapshot_backup = Path::new(
+            "/home/user/.copilot/session-state/d2e098d0/rewind-snapshots/backups/2ee575c19132c8bd-1776949007337",
+        );
+        assert!(!is_copilot_session_file(snapshot_backup));
+
+        let workspace = Path::new("/home/user/.copilot/session-state/d2e098d0/workspace.yaml");
+        assert!(!is_copilot_session_file(workspace));
+    }
+
+    #[test]
+    fn test_is_copilot_session_file_rejects_nested_events_jsonl() {
+        // A stray `events.jsonl` inside a rewind snapshot must not count as a
+        // session log — the parent of the parent must be `session-state`.
+        let nested =
+            Path::new("/home/user/.copilot/session-state/d2e098d0/rewind-snapshots/events.jsonl");
+        assert!(!is_copilot_session_file(nested));
+    }
+
+    #[test]
+    fn test_is_copilot_session_file_rejects_other_files() {
+        let path1 = Path::new("/tmp/events.jsonl");
+        assert!(!is_copilot_session_file(path1));
+
+        let path2 = Path::new("/home/user/.copilot/logs.json");
+        assert!(!is_copilot_session_file(path2));
+    }
+
+    #[test]
+    fn test_collect_files_with_max_depth_respects_bound() {
+        // Layout mirrors a real Copilot `session-state/` tree: `events.jsonl` sits
+        // at depth 2 and must be collected, while snapshot artifacts deeper in
+        // the tree (`rewind-snapshots/backups/<hash>`) must be skipped entirely
+        // by a max_depth(2) walk so they never even hit `is_copilot_session_file`.
+        let dir = tempdir().unwrap();
+        let session = dir.path().join("session-state").join("sess-abc");
+        let backups = session.join("rewind-snapshots").join("backups");
+        fs::create_dir_all(&backups).unwrap();
+
+        File::create(session.join("events.jsonl")).unwrap();
+        File::create(backups.join("deadbeef-123")).unwrap();
+        File::create(backups.join("events.jsonl")).unwrap();
+        File::create(session.join("workspace.yaml")).unwrap();
+
+        let unbounded = collect_files_with_dates(
+            dir.path().join("session-state"),
+            is_copilot_session_file,
+            TimeRange::All,
+        )
+        .unwrap();
+        let unbounded_names: Vec<&str> = unbounded
+            .iter()
+            .filter_map(|f| f.path.file_name()?.to_str())
+            .collect();
+        assert!(unbounded_names.contains(&"events.jsonl"));
+
+        let bounded = collect_files_with_max_depth(
+            dir.path().join("session-state"),
+            is_copilot_session_file,
+            TimeRange::All,
+            Some(2),
+        )
+        .unwrap();
+        assert_eq!(bounded.len(), 1);
+        assert!(bounded[0].path.ends_with("sess-abc/events.jsonl"));
+    }
+
+    #[test]
+    fn test_collect_files_with_dates_empty_dir() {
+        let dir = tempdir().unwrap();
+
+        let results =
+            collect_files_with_dates(dir.path(), is_codex_session_file, TimeRange::All).unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_collect_files_with_dates_nonexistent_dir() {
+        let results =
+            collect_files_with_dates("/nonexistent/path", is_codex_session_file, TimeRange::All)
+                .unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_collect_files_with_dates_with_files() {
+        let dir = tempdir().unwrap();
+
+        File::create(dir.path().join("file1.json")).unwrap();
+        File::create(dir.path().join("file2.jsonl")).unwrap();
+        File::create(dir.path().join("file3.txt")).unwrap();
+
+        let results =
+            collect_files_with_dates(dir.path(), is_codex_session_file, TimeRange::All).unwrap();
+        assert_eq!(results.len(), 2);
+
+        for file_info in &results {
+            assert!(!file_info.modified_date.is_empty());
+            assert!(file_info.modified_date.contains('-'));
+        }
+    }
+
+    #[test]
+    fn test_collect_files_with_dates_nested_directories() {
+        let dir = tempdir().unwrap();
+
+        fs::create_dir_all(dir.path().join("subdir1")).unwrap();
+        fs::create_dir_all(dir.path().join("subdir2")).unwrap();
+
+        File::create(dir.path().join("file1.json")).unwrap();
+        File::create(dir.path().join("subdir1/file2.json")).unwrap();
+        File::create(dir.path().join("subdir2/file3.jsonl")).unwrap();
+
+        let results =
+            collect_files_with_dates(dir.path(), is_codex_session_file, TimeRange::All).unwrap();
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn test_collect_files_with_dates_filter_function() {
+        let dir = tempdir().unwrap();
+
+        File::create(dir.path().join("file1.json")).unwrap();
+        File::create(dir.path().join("file2.jsonl")).unwrap();
+        File::create(dir.path().join("file3.txt")).unwrap();
+
+        let results = collect_files_with_dates(
+            dir.path(),
+            |p| p.extension().is_some_and(|e| e == "txt"),
+            TimeRange::All,
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_collect_files_with_dates_no_matching_files() {
+        let dir = tempdir().unwrap();
+
+        File::create(dir.path().join("file1.txt")).unwrap();
+        File::create(dir.path().join("file2.md")).unwrap();
+
+        let results =
+            collect_files_with_dates(dir.path(), is_codex_session_file, TimeRange::All).unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_file_info_path() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test.json");
+        File::create(&file_path).unwrap();
+
+        let results =
+            collect_files_with_dates(dir.path(), is_codex_session_file, TimeRange::All).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, file_path);
+    }
+
+    #[test]
+    fn test_file_info_date_format() {
+        let dir = tempdir().unwrap();
+        File::create(dir.path().join("test.json")).unwrap();
+
+        let results =
+            collect_files_with_dates(dir.path(), is_codex_session_file, TimeRange::All).unwrap();
+        assert_eq!(results.len(), 1);
+
+        let date = &results[0].modified_date;
+        assert_eq!(date.len(), 10);
+        assert_eq!(date.chars().filter(|&c| c == '-').count(), 2);
+    }
+
+    #[test]
+    fn test_collect_files_ignores_directories() {
+        let dir = tempdir().unwrap();
+
+        fs::create_dir(dir.path().join("test.json")).unwrap();
+        File::create(dir.path().join("real.json")).unwrap();
+
+        let results =
+            collect_files_with_dates(dir.path(), is_codex_session_file, TimeRange::All).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_is_codex_session_file_with_dots_in_name() {
+        let path = Path::new("my.test.file.json");
+        assert!(is_codex_session_file(path));
+
+        let path2 = Path::new("my.test.file.jsonl");
+        assert!(is_codex_session_file(path2));
+    }
+
+    #[test]
+    fn test_is_gemini_session_file_multiple_levels() {
+        let path = Path::new("/a/b/c/d/chats/file.jsonl");
+        assert!(is_gemini_session_file(path));
+    }
+
+    #[test]
+    fn test_collect_files_with_content() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test.json");
+
+        let mut file = File::create(&file_path).unwrap();
+        writeln!(file, r#"{{"key": "value"}}"#).unwrap();
+
+        let results =
+            collect_files_with_dates(dir.path(), is_codex_session_file, TimeRange::All).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].path.exists());
+    }
+
+    #[test]
+    fn test_is_codex_session_file_excludes_meta_sidecars() {
+        // *.meta.json sidecars live next to Claude Code subagent sessions and must not
+        // be picked up by the generic json filter (they would otherwise be parsed and
+        // mis-detected as Codex logs).
+        let path = Path::new("agent-afda1991051a0eb93.meta.json");
+        assert!(!is_codex_session_file(path));
+
+        let nested =
+            Path::new("/home/user/.claude/projects/proj/sess/subagents/agent-x.meta.json");
+        assert!(!is_codex_session_file(nested));
+
+        let meta_jsonl =
+            Path::new("/home/user/.claude/projects/proj/sess/subagents/agent-x.meta.jsonl");
+        assert!(!is_codex_session_file(meta_jsonl));
+    }
+
+    #[test]
+    fn test_is_claude_session_file_accepts_jsonl() {
+        let top_level = Path::new("/home/user/.claude/projects/proj/sess.jsonl");
+        assert!(is_claude_session_file(top_level));
+
+        let subagent = Path::new(
+            "/home/user/.claude/projects/proj/sess/subagents/agent-afda1991051a0eb93.jsonl",
+        );
+        assert!(is_claude_session_file(subagent));
+    }
+
+    #[test]
+    fn test_is_claude_session_file_rejects_non_jsonl() {
+        let meta = Path::new(
+            "/home/user/.claude/projects/proj/sess/subagents/agent-afda1991051a0eb93.meta.json",
+        );
+        assert!(!is_claude_session_file(meta));
+
+        let meta_jsonl = Path::new(
+            "/home/user/.claude/projects/proj/sess/subagents/agent-afda1991051a0eb93.meta.jsonl",
+        );
+        assert!(!is_claude_session_file(meta_jsonl));
+
+        let plain_json = Path::new("/home/user/.claude/projects/proj/notes.json");
+        assert!(!is_claude_session_file(plain_json));
+
+        let image = Path::new("/home/user/.claude/projects/proj/sess/paste.png");
+        assert!(!is_claude_session_file(image));
+    }
+
+    #[test]
+    fn test_collect_claude_session_files_includes_subagents() {
+        // Simulates the `~/.claude/projects/<project>/<session>/subagents/` layout.
+        let dir = tempdir().unwrap();
+        let project = dir.path().join("-home-user-repo");
+        let session_subdir = project.join("sess-a");
+        let subagents = session_subdir.join("subagents");
+        fs::create_dir_all(&subagents).unwrap();
+
+        File::create(project.join("sess-a.jsonl")).unwrap();
+        File::create(subagents.join("agent-one.jsonl")).unwrap();
+        File::create(subagents.join("agent-one.meta.json")).unwrap();
+        File::create(subagents.join("agent-two.meta.jsonl")).unwrap();
+        File::create(session_subdir.join("screenshot.png")).unwrap();
+
+        let results =
+            collect_files_with_dates(dir.path(), is_claude_session_file, TimeRange::All).unwrap();
+        let names: Vec<String> = results
+            .iter()
+            .filter_map(|f| f.path.file_name()?.to_str().map(String::from))
+            .collect();
+
+        assert_eq!(results.len(), 2, "collected: {:?}", names);
+        assert!(names.contains(&"sess-a.jsonl".to_string()));
+        assert!(names.contains(&"agent-one.jsonl".to_string()));
+        assert!(!names.iter().any(|n| n.contains(".meta.")));
+        assert!(!names.iter().any(|n| n.ends_with(".png")));
+    }
+}
