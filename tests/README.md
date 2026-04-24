@@ -6,9 +6,9 @@ Rust Book's test organization guidance
 ([ch11-03](https://doc.rust-lang.org/book/ch11-03-test-organization.html)):
 
 - **Unit tests** exercise individual functions in isolation and can reach private items.
-  They belong with their module inside `src/`.
+    They belong with their module inside `src/`.
 - **Integration tests** exercise the library through its public API — parsing real session
-  files, driving the CLI, round-tripping the cache. They live here, in `tests/`.
+    files, driving the CLI, round-tripping the cache. They live here, in `tests/`.
 
 ## Layout
 
@@ -58,19 +58,19 @@ cargo test -- --test-threads=1
 ## Writing new tests
 
 - **Testing a single function or struct?** Add a `#[test]` inside (or next to) that
-  module's `#[cfg(test)] mod tests` block. No new files, no new test crates.
-  Private items are visible via `use super::*;`.
+    module's `#[cfg(test)] mod tests` block. No new files, no new test crates.
+    Private items are visible via `use super::*;`.
 - **Testing end-to-end behavior through the public API?** Add the test to the appropriate
-  module under `tests/integrations/`:
-  - Analysis workflows → `analysis_tests.rs`
-  - CLI subcommands → `cli_tests.rs`
-  - Parsers (any provider) → `parser_tests.rs`
-  - Pricing logic → `pricing_tests.rs`
-  - Usage aggregation → `usage_tests.rs`
-  - Caching (file parse cache, pricing cache) → `cache_tests.rs`
+    module under `tests/integrations/`:
+    - Analysis workflows → `analysis_tests.rs`
+    - CLI subcommands → `cli_tests.rs`
+    - Parsers (any provider) → `parser_tests.rs`
+    - Pricing logic → `pricing_tests.rs`
+    - Usage aggregation → `usage_tests.rs`
+    - Caching (file parse cache, pricing cache) → `cache_tests.rs`
 - Ignore environment-specific fields (`insightsVersion`, `machineId`, `user`,
-  `gitRemoteUrl`) when comparing analyzer output against fixtures — `parser_tests.rs`
-  has a `compare_json_ignore_fields` helper that does this.
+    `gitRemoteUrl`) when comparing analyzer output against fixtures — `parser_tests.rs`
+    has a `compare_json_ignore_fields` helper that does this.
 - Tests that touch `global_cache()` must be `#[serial(global_cache)]` (see
-  `serial_test`) so the singleton isn't clobbered by a parallel test.
+    `serial_test`) so the singleton isn't clobbered by a parallel test.
 - TUI rendering code is intentionally not covered by automated tests.
