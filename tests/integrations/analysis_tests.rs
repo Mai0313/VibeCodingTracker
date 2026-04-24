@@ -4,13 +4,13 @@
 
 use std::path::PathBuf;
 use tempfile::TempDir;
-use vibe_coding_tracker::analysis::analyzer::{analyze_jsonl_file, analyze_session_file_typed_as};
 use vibe_coding_tracker::analysis::batch_analyzer::{
     analyze_all_sessions, analyze_all_sessions_by_provider,
 };
-use vibe_coding_tracker::analysis::common_state::AnalysisMode;
 use vibe_coding_tracker::cli::TimeRange;
 use vibe_coding_tracker::models::ExtensionType;
+use vibe_coding_tracker::session::parser::{analyze_jsonl_file, analyze_session_file_typed_as};
+use vibe_coding_tracker::session::state::AnalysisMode;
 
 #[test]
 fn test_single_file_analysis_claude() {

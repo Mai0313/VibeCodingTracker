@@ -1,15 +1,8 @@
-pub mod analyzer;
+//! Aggregation of already-parsed session files into per-model metrics.
+//!
+//! The actual file-parsing logic lives in [`crate::session`] — this module
+//! only consumes [`crate::models::CodeAnalysis`] records and rolls them up
+//! into the tables the CLI renders.
 pub mod batch_analyzer;
-pub mod claude_analyzer;
-pub mod codex_analyzer;
-pub mod common_state;
-pub mod copilot_analyzer;
-pub mod detector;
-pub mod gemini_analyzer;
 
-pub use analyzer::*;
 pub use batch_analyzer::*;
-pub use common_state::AnalysisMode;
-pub use copilot_analyzer::*;
-pub use detector::*;
-pub use gemini_analyzer::*;

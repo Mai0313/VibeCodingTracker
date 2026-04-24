@@ -1,6 +1,6 @@
-use crate::analysis::common_state::{AnalysisMode, AnalysisState};
 use crate::constants::{FastHashMap, capacity};
 use crate::models::*;
+use crate::session::state::{AnalysisMode, AnalysisState};
 use crate::utils::{get_git_remote_url, parse_iso_timestamp, process_claude_usage};
 use anyhow::Result;
 use serde_json::Value;
@@ -26,7 +26,7 @@ pub fn analyze_claude_conversations_with_mode(
 /// Analyze Claude Code conversations from any iterator of pre-parsed logs.
 ///
 /// This is the streaming entry point: callers that read JSONL one line at a
-/// time (see [`crate::analysis::analyzer::analyze_jsonl_file`]) feed records
+/// time (see [`crate::session::parser::analyze_jsonl_file`]) feed records
 /// through here without ever materialising a full `Vec<Value>` of raw JSON.
 pub fn analyze_claude_logs<I>(logs: I, mode: AnalysisMode) -> Result<CodeAnalysis>
 where

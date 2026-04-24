@@ -1,12 +1,10 @@
 use crate::VERSION;
-use crate::analysis::claude_analyzer::{
-    analyze_claude_conversations_with_mode, analyze_claude_logs,
-};
-use crate::analysis::codex_analyzer::analyze_codex_conversations_with_mode;
-use crate::analysis::common_state::AnalysisMode;
-use crate::analysis::copilot_analyzer::analyze_copilot_events;
-use crate::analysis::detector::{classify_records, detect_extension_type};
-use crate::analysis::gemini_analyzer::analyze_gemini_events;
+use crate::session::claude::{analyze_claude_conversations_with_mode, analyze_claude_logs};
+use crate::session::codex::analyze_codex_conversations_with_mode;
+use crate::session::copilot::analyze_copilot_events;
+use crate::session::detector::{classify_records, detect_extension_type};
+use crate::session::gemini::analyze_gemini_events;
+use crate::session::state::AnalysisMode;
 use crate::constants::buffer;
 use crate::models::{
     ClaudeCodeLog, CodeAnalysis, CodexLog, CopilotEvent, ExtensionType, GeminiSession,

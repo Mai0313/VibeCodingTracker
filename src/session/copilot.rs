@@ -1,6 +1,6 @@
-use crate::analysis::common_state::{AnalysisMode, AnalysisState};
 use crate::constants::{FastHashMap, capacity};
 use crate::models::*;
+use crate::session::state::{AnalysisMode, AnalysisState};
 use crate::utils::{get_git_remote_url, parse_iso_timestamp};
 use anyhow::Result;
 use serde_json::{Value, json};

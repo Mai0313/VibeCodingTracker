@@ -9,7 +9,7 @@
 
 use serde_json::Value;
 use std::path::PathBuf;
-use vibe_coding_tracker::analysis::analyzer::analyze_jsonl_file;
+use vibe_coding_tracker::session::parser::analyze_jsonl_file;
 
 /// Compare two JSON values while ignoring specific fields
 ///

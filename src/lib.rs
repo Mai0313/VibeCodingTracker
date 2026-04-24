@@ -5,12 +5,13 @@ pub mod constants;
 pub mod display;
 pub mod models;
 pub mod pricing;
+pub mod session;
 pub mod update;
 pub mod usage;
 pub mod utils;
 
-pub use analysis::analyzer::{analyze_jsonl_file, analyze_jsonl_file_typed};
 pub use cli::TimeRange;
+pub use session::parser::{analyze_jsonl_file, analyze_jsonl_file_typed};
 pub use models::*;
 pub use usage::calculator::{UsageData, get_usage_from_directories};
 

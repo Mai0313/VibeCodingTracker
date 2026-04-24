@@ -1,9 +1,9 @@
-use crate::analysis::analyzer::analyze_session_file_typed_as;
-use crate::analysis::common_state::AnalysisMode;
 use crate::cache::global_cache;
 use crate::cli::TimeRange;
 use crate::constants::{FastHashMap, capacity};
 use crate::models::{CodeAnalysis, ExtensionType, ProviderActiveDays};
+use crate::session::parser::analyze_session_file_typed_as;
+use crate::session::state::AnalysisMode;
 use crate::utils::{
     COPILOT_SESSION_MAX_DEPTH, collect_files_with_max_depth, is_claude_session_file,
     is_codex_session_file, is_copilot_session_file, is_gemini_session_file,
