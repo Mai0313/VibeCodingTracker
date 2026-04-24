@@ -578,14 +578,16 @@ mod tests {
         let path = std::path::Path::new("agent-afda1991051a0eb93.meta.json");
         assert!(!is_codex_session_file(path));
 
-        let nested =
-            std::path::Path::new("/home/user/.claude/projects/proj/sess/subagents/agent-x.meta.json");
+        let nested = std::path::Path::new(
+            "/home/user/.claude/projects/proj/sess/subagents/agent-x.meta.json",
+        );
         assert!(!is_codex_session_file(nested));
 
         // Pre-emptive defense: reject `.meta.jsonl` too, in case Claude Code ever
         // switches the sidecar format to line-delimited JSON.
-        let meta_jsonl =
-            std::path::Path::new("/home/user/.claude/projects/proj/sess/subagents/agent-x.meta.jsonl");
+        let meta_jsonl = std::path::Path::new(
+            "/home/user/.claude/projects/proj/sess/subagents/agent-x.meta.jsonl",
+        );
         assert!(!is_codex_session_file(meta_jsonl));
     }
 
