@@ -227,3 +227,112 @@ pub fn update_interactive(force: bool) -> Result<()> {
 pub use archive::{extract_targz, extract_zip};
 #[doc(hidden)]
 pub use platform::get_asset_pattern;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_semver_version_clean() {
+        let version = "0.1.6";
+        assert_eq!(extract_semver_version(version), "0.1.6");
+    }
+
+    #[test]
+    fn test_extract_semver_version_with_git_metadata() {
+        let version = "0.1.6-5-g1234567";
+        assert_eq!(extract_semver_version(version), "0.1.6");
+    }
+
+    #[test]
+    fn test_extract_semver_version_with_dirty_flag() {
+        let version = "0.1.6-5-g1234567-dirty";
+        assert_eq!(extract_semver_version(version), "0.1.6");
+    }
+
+    #[test]
+    fn test_extract_semver_version_rc() {
+        let version = "1.0.0-rc.1";
+        assert_eq!(extract_semver_version(version), "1.0.0");
+    }
+
+    #[test]
+    fn test_extract_semver_version_beta() {
+        let version = "2.3.4-beta.2";
+        assert_eq!(extract_semver_version(version), "2.3.4");
+    }
+
+    #[test]
+    fn test_extract_semver_version_alpha() {
+        let version = "0.5.0-alpha";
+        assert_eq!(extract_semver_version(version), "0.5.0");
+    }
+
+    #[test]
+    fn test_extract_semver_version_complex() {
+        let version = "1.2.3-45-gabcdef0-modified";
+        assert_eq!(extract_semver_version(version), "1.2.3");
+    }
+
+    #[test]
+    fn test_extract_semver_version_single_digit() {
+        assert_eq!(extract_semver_version("1.0.0"), "1.0.0");
+        assert_eq!(extract_semver_version("0.0.1"), "0.0.1");
+    }
+
+    #[test]
+    fn test_extract_semver_version_large_numbers() {
+        assert_eq!(extract_semver_version("10.20.30"), "10.20.30");
+        assert_eq!(extract_semver_version("100.200.300-1-g123"), "100.200.300");
+    }
+
+    #[test]
+    fn test_extract_semver_version_empty() {
+        assert_eq!(extract_semver_version(""), "");
+    }
+
+    #[test]
+    fn test_extract_semver_version_no_dashes() {
+        let version = "2.4.8";
+        assert_eq!(extract_semver_version(version), "2.4.8");
+    }
+
+    #[test]
+    fn test_extract_semver_version_multiple_dashes() {
+        let version = "1.0.0-pre-release-candidate";
+        assert_eq!(extract_semver_version(version), "1.0.0");
+    }
+
+    #[test]
+    fn test_extract_semver_version_only_major_minor() {
+        let version = "1.2";
+        assert_eq!(extract_semver_version(version), "1.2");
+    }
+
+    #[test]
+    fn test_extract_semver_version_with_v_prefix() {
+        // `v` is not stripped here — that's the caller's job.
+        let version = "v1.2.3-dirty";
+        assert_eq!(extract_semver_version(version), "v1.2.3");
+    }
+
+    #[test]
+    fn test_extract_semver_version_consistency() {
+        let version = "3.1.4-15-g926535-dirty";
+        let result1 = extract_semver_version(version);
+        let result2 = extract_semver_version(version);
+        assert_eq!(result1, result2);
+    }
+
+    #[test]
+    fn test_extract_semver_version_zero_version() {
+        assert_eq!(extract_semver_version("0.0.0"), "0.0.0");
+        assert_eq!(extract_semver_version("0.0.0-dev"), "0.0.0");
+    }
+
+    #[test]
+    fn test_extract_semver_version_patch_zero() {
+        assert_eq!(extract_semver_version("1.5.0"), "1.5.0");
+        assert_eq!(extract_semver_version("2.0.0-rc1"), "2.0.0");
+    }
+}
