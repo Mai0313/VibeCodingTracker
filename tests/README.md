@@ -8,17 +8,17 @@ Per-module unit tests live in `#[cfg(test)] mod tests` blocks inside the source 
 
 Examples of where to find them:
 
-| Module                       | Tests inside                                                           |
-| ---------------------------- | ---------------------------------------------------------------------- |
-| `src/analysis/detector.rs`   | Provider-format auto-detection (ClaudeCode / Codex / Copilot / Gemini) |
-| `src/analysis/common_state.rs` | Shared analyzer state / path normalization / record conversion       |
-| `src/cache/mod.rs`           | Global file-parse cache singleton behaviour                            |
-| `src/cache/file_cache.rs`    | LRU eviction + entry invalidation                                      |
-| `src/models/analysis.rs`     | `CodeAnalysis*` (de)serialization + camel/PascalCase round-trips       |
-| `src/pricing/matching.rs`    | Model-name matching (exact / normalized / substring / fuzzy)           |
-| `src/pricing/cache.rs`       | LiteLLM payload parsing + `ModelPricing` round-trips                   |
-| `src/update/mod.rs`          | `extract_semver_version` parsing                                       |
-| `src/utils/*.rs`             | file I/O, timestamps, paths, directory walking, git remote lookup      |
+| Module                         | Tests inside                                                           |
+| ------------------------------ | ---------------------------------------------------------------------- |
+| `src/analysis/detector.rs`     | Provider-format auto-detection (ClaudeCode / Codex / Copilot / Gemini) |
+| `src/analysis/common_state.rs` | Shared analyzer state / path normalization / record conversion         |
+| `src/cache/mod.rs`             | Global file-parse cache singleton behaviour                            |
+| `src/cache/file_cache.rs`      | LRU eviction + entry invalidation                                      |
+| `src/models/analysis.rs`       | `CodeAnalysis*` (de)serialization + camel/PascalCase round-trips       |
+| `src/pricing/matching.rs`      | Model-name matching (exact / normalized / substring / fuzzy)           |
+| `src/pricing/cache.rs`         | LiteLLM payload parsing + `ModelPricing` round-trips                   |
+| `src/update/mod.rs`            | `extract_semver_version` parsing                                       |
+| `src/utils/*.rs`               | file I/O, timestamps, paths, directory walking, git remote lookup      |
 
 Run them all with:
 
