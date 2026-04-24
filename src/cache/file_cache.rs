@@ -3,7 +3,7 @@ use crate::models::{
     CodeAnalysis, CodeAnalysisApplyDiffDetail, CodeAnalysisReadDetail, CodeAnalysisRecord,
     CodeAnalysisRunCommandDetail, CodeAnalysisWriteDetail, ExtensionType,
 };
-use crate::session::AnalysisMode;
+use crate::session::ParseMode;
 use anyhow::Result;
 use lru::LruCache;
 use std::fs;
@@ -113,7 +113,7 @@ impl FileParseCache {
         // Cache miss or outdated - need to parse.
         log::debug!("LRU cache miss for {}, parsing...", path.display());
         let analysis = match provider {
-            Some(p) => crate::session::analyze_session_file_typed_as(path, p, AnalysisMode::Full)?,
+            Some(p) => crate::session::analyze_session_file_typed_as(path, p, ParseMode::Full)?,
             None => crate::session::analyze_jsonl_file_typed(path)?,
         };
         let arc_analysis = Arc::new(analysis);

@@ -4,7 +4,7 @@ use crate::utils::count_lines;
 use serde_json::Value;
 use std::collections::HashSet;
 
-/// Controls how much per-operation detail the analyzer retains.
+/// Controls how much per-operation detail the session parser retains.
 ///
 /// `Full` keeps everything that ends up in the public JSON output
 /// (file contents on `Write`, old/new strings on `Edit`, command text on
@@ -15,14 +15,14 @@ use std::collections::HashSet;
 /// `UsageOnly` to avoid pulling entire file bodies into memory on every
 /// session parse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AnalysisMode {
+pub enum ParseMode {
     Full,
     UsageOnly,
 }
 
-/// Common analysis state shared by all analyzers (Claude, Codex, Gemini)
-pub struct AnalysisState {
-    pub mode: AnalysisMode,
+/// Common parse state shared by all per-provider session parsers.
+pub struct SessionParseState {
+    pub mode: ParseMode,
     pub write_details: Vec<CodeAnalysisWriteDetail>,
     pub read_details: Vec<CodeAnalysisReadDetail>,
     pub edit_details: Vec<CodeAnalysisApplyDiffDetail>,
@@ -41,16 +41,16 @@ pub struct AnalysisState {
     pub last_ts: i64,
 }
 
-impl AnalysisState {
+impl SessionParseState {
     pub fn new() -> Self {
-        Self::with_mode(AnalysisMode::Full)
+        Self::with_mode(ParseMode::Full)
     }
 
-    pub fn with_mode(mode: AnalysisMode) -> Self {
+    pub fn with_mode(mode: ParseMode) -> Self {
         // Pre-allocate Vecs with reasonable capacity estimates based on
         // typical session sizes. In `UsageOnly` mode we skip the
         // pre-allocation because the vecs stay empty.
-        let pre = matches!(mode, AnalysisMode::Full);
+        let pre = matches!(mode, ParseMode::Full);
         Self {
             mode,
             write_details: if pre {
@@ -104,7 +104,7 @@ impl AnalysisState {
             return;
         }
 
-        if matches!(self.mode, AnalysisMode::Full) {
+        if matches!(self.mode, ParseMode::Full) {
             self.read_details.push(CodeAnalysisReadDetail {
                 base: CodeAnalysisDetailBase {
                     file_path: resolved.clone(),
@@ -132,7 +132,7 @@ impl AnalysisState {
             return;
         }
 
-        if matches!(self.mode, AnalysisMode::Full) {
+        if matches!(self.mode, ParseMode::Full) {
             self.write_details.push(CodeAnalysisWriteDetail {
                 base: CodeAnalysisDetailBase {
                     file_path: resolved.clone(),
@@ -169,7 +169,7 @@ impl AnalysisState {
             return;
         }
 
-        if matches!(self.mode, AnalysisMode::Full) {
+        if matches!(self.mode, ParseMode::Full) {
             self.edit_details.push(CodeAnalysisApplyDiffDetail {
                 base: CodeAnalysisDetailBase {
                     file_path: resolved.clone(),
@@ -197,7 +197,7 @@ impl AnalysisState {
 
         let command_chars = command.chars().count();
 
-        if matches!(self.mode, AnalysisMode::Full) {
+        if matches!(self.mode, ParseMode::Full) {
             self.run_details.push(CodeAnalysisRunCommandDetail {
                 base: CodeAnalysisDetailBase {
                     file_path: self.folder_path.clone(),
@@ -258,7 +258,7 @@ impl AnalysisState {
     }
 }
 
-impl Default for AnalysisState {
+impl Default for SessionParseState {
     fn default() -> Self {
         Self::new()
     }
@@ -270,8 +270,8 @@ mod tests {
 
     #[test]
     fn test_analysis_state_new() {
-        // Test creating a new AnalysisState
-        let state = AnalysisState::new();
+        // Test creating a new SessionParseState
+        let state = SessionParseState::new();
 
         assert_eq!(state.total_write_lines, 0);
         assert_eq!(state.total_read_lines, 0);
@@ -286,7 +286,7 @@ mod tests {
     #[test]
     fn test_add_read_detail() {
         // Test adding a read operation
-        let mut state = AnalysisState::new();
+        let mut state = SessionParseState::new();
         state.folder_path = "/test/folder".to_string();
 
         state.add_read_detail("test.rs", "line1\nline2\nline3", 1234567890);
@@ -300,7 +300,7 @@ mod tests {
     #[test]
     fn test_add_read_detail_ignores_empty() {
         // Test that empty content is ignored
-        let mut state = AnalysisState::new();
+        let mut state = SessionParseState::new();
 
         state.add_read_detail("test.rs", "", 1234567890);
 
@@ -312,7 +312,7 @@ mod tests {
     #[test]
     fn test_add_write_detail() {
         // Test adding a write operation
-        let mut state = AnalysisState::new();
+        let mut state = SessionParseState::new();
         state.folder_path = "/test/folder".to_string();
 
         state.add_write_detail("output.txt", "content line 1\ncontent line 2", 1234567890);
@@ -326,7 +326,7 @@ mod tests {
     #[test]
     fn test_add_edit_detail() {
         // Test adding an edit operation
-        let mut state = AnalysisState::new();
+        let mut state = SessionParseState::new();
         state.folder_path = "/test".to_string();
 
         state.add_edit_detail(
@@ -345,7 +345,7 @@ mod tests {
     #[test]
     fn test_add_edit_detail_empty_old_becomes_write() {
         // Test that edit with empty old content becomes a write
-        let mut state = AnalysisState::new();
+        let mut state = SessionParseState::new();
         state.folder_path = "/test".to_string();
 
         state.add_edit_detail("new_file.rs", "", "new content", 1234567890);
@@ -360,7 +360,7 @@ mod tests {
     #[test]
     fn test_add_run_command() {
         // Test adding a run command
-        let mut state = AnalysisState::new();
+        let mut state = SessionParseState::new();
         state.folder_path = "/workspace".to_string();
 
         state.add_run_command("cargo test", "Running tests", 1234567890);
@@ -373,7 +373,7 @@ mod tests {
     #[test]
     fn test_add_run_command_ignores_empty() {
         // Test that empty commands are ignored
-        let mut state = AnalysisState::new();
+        let mut state = SessionParseState::new();
 
         state.add_run_command("", "description", 1234567890);
         state.add_run_command("   ", "description", 1234567890);
@@ -385,7 +385,7 @@ mod tests {
     #[test]
     fn test_normalize_path_absolute() {
         // Test normalizing absolute paths
-        let mut state = AnalysisState::new();
+        let mut state = SessionParseState::new();
         state.folder_path = "/workspace".to_string();
 
         let result = state.normalize_path("/absolute/path/file.rs");
@@ -395,7 +395,7 @@ mod tests {
     #[test]
     fn test_normalize_path_relative() {
         // Test normalizing relative paths
-        let mut state = AnalysisState::new();
+        let mut state = SessionParseState::new();
         state.folder_path = "/workspace".to_string();
 
         let result = state.normalize_path("relative/file.rs");
@@ -405,7 +405,7 @@ mod tests {
     #[test]
     fn test_normalize_path_empty_folder() {
         // Test normalizing when folder_path is empty
-        let state = AnalysisState::new();
+        let state = SessionParseState::new();
 
         let result = state.normalize_path("file.rs");
         assert_eq!(result, "file.rs");
@@ -414,7 +414,7 @@ mod tests {
     #[test]
     fn test_normalize_path_empty_input() {
         // Test normalizing empty path
-        let mut state = AnalysisState::new();
+        let mut state = SessionParseState::new();
         state.folder_path = "/workspace".to_string();
 
         let result = state.normalize_path("");
@@ -424,7 +424,7 @@ mod tests {
     #[test]
     fn test_unique_files_tracking() {
         // Test that unique files are tracked correctly
-        let mut state = AnalysisState::new();
+        let mut state = SessionParseState::new();
         state.folder_path = "/project".to_string();
 
         // Add operations on same file
@@ -443,7 +443,7 @@ mod tests {
     #[test]
     fn test_character_counting() {
         // Test that character counts are correct
-        let mut state = AnalysisState::new();
+        let mut state = SessionParseState::new();
 
         state.add_read_detail("file.txt", "hello", 1);
         assert_eq!(state.total_read_characters, 5);
@@ -458,7 +458,7 @@ mod tests {
     #[test]
     fn test_into_record() {
         // Test converting state into a record
-        let mut state = AnalysisState::new();
+        let mut state = SessionParseState::new();
         state.folder_path = "/test".to_string();
         state.git_remote = "https://github.com/test/repo".to_string();
         state.task_id = "task-123".to_string();
@@ -482,7 +482,7 @@ mod tests {
     #[test]
     fn test_default_trait() {
         // Test Default trait implementation
-        let state = AnalysisState::default();
+        let state = SessionParseState::default();
 
         assert_eq!(state.total_write_lines, 0);
         assert_eq!(state.total_read_lines, 0);
@@ -492,7 +492,7 @@ mod tests {
     #[test]
     fn test_multiple_operations() {
         // Test handling multiple operations
-        let mut state = AnalysisState::new();
+        let mut state = SessionParseState::new();
         state.folder_path = "/workspace".to_string();
 
         // Multiple reads

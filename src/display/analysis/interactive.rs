@@ -86,7 +86,7 @@ pub fn display_analysis_interactive(
         drop(current_data);
 
         // `analyze_all_sessions` now bypasses the file cache for aggregated
-        // metrics (runs each file in `AnalysisMode::UsageOnly` and drops
+        // metrics (runs each file in `ParseMode::UsageOnly` and drops
         // immediately), so there is nothing useful to clear here.
 
         // Track updates

@@ -1,6 +1,6 @@
 use crate::constants::FastHashMap;
 use crate::models::*;
-use crate::session::state::{AnalysisMode, AnalysisState};
+use crate::session::state::{ParseMode, SessionParseState};
 use crate::utils::{get_git_remote_url, parse_iso_timestamp, process_gemini_usage};
 use anyhow::Result;
 use serde_json::Value;
@@ -19,12 +19,12 @@ use serde_json::Value;
 pub fn analyze_gemini_events<I>(
     session: GeminiSession,
     events: I,
-    mode: AnalysisMode,
+    mode: ParseMode,
 ) -> Result<CodeAnalysis>
 where
     I: IntoIterator<Item = Value>,
 {
-    let mut state = AnalysisState::with_mode(mode);
+    let mut state = SessionParseState::with_mode(mode);
     let mut conversation_usage: FastHashMap<String, Value> = FastHashMap::with_capacity(3);
 
     for event in events {
@@ -56,7 +56,7 @@ where
 }
 
 fn finalize_record(
-    mut state: AnalysisState,
+    mut state: SessionParseState,
     conversation_usage: FastHashMap<String, Value>,
     session_id: String,
 ) -> CodeAnalysis {
@@ -82,7 +82,7 @@ fn finalize_record(
 }
 
 fn process_gemini_message(
-    state: &mut AnalysisState,
+    state: &mut SessionParseState,
     conversation_usage: &mut FastHashMap<String, Value>,
     message: &GeminiMessage,
 ) {

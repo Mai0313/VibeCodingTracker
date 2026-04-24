@@ -1,6 +1,6 @@
 use crate::constants::{FastHashMap, capacity};
 use crate::models::*;
-use crate::session::state::{AnalysisMode, AnalysisState};
+use crate::session::state::{ParseMode, SessionParseState};
 use crate::utils::{get_git_remote_url, parse_iso_timestamp, process_claude_usage};
 use anyhow::Result;
 use serde_json::Value;
@@ -10,12 +10,12 @@ use serde_json::Value;
 /// Records are moved into the typed iterator form so that the lean
 /// [`ClaudeCodeLog`] shape drops unused payloads at deserialisation.
 pub fn analyze_claude_conversations(records: Vec<Value>) -> Result<CodeAnalysis> {
-    analyze_claude_conversations_with_mode(records, AnalysisMode::Full)
+    analyze_claude_conversations_with_mode(records, ParseMode::Full)
 }
 
 pub fn analyze_claude_conversations_with_mode(
     records: Vec<Value>,
-    mode: AnalysisMode,
+    mode: ParseMode,
 ) -> Result<CodeAnalysis> {
     let iter = records
         .into_iter()
@@ -28,11 +28,11 @@ pub fn analyze_claude_conversations_with_mode(
 /// This is the streaming entry point: callers that read JSONL one line at a
 /// time (see [`crate::session::parser::analyze_jsonl_file`]) feed records
 /// through here without ever materialising a full `Vec<Value>` of raw JSON.
-pub fn analyze_claude_logs<I>(logs: I, mode: AnalysisMode) -> Result<CodeAnalysis>
+pub fn analyze_claude_logs<I>(logs: I, mode: ParseMode) -> Result<CodeAnalysis>
 where
     I: IntoIterator<Item = ClaudeCodeLog>,
 {
-    let mut state = AnalysisState::with_mode(mode);
+    let mut state = SessionParseState::with_mode(mode);
     let mut conversation_usage: FastHashMap<String, Value> =
         FastHashMap::with_capacity(capacity::MODELS_PER_SESSION);
 

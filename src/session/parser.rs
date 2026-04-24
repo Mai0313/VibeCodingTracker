@@ -4,7 +4,7 @@ use crate::session::codex::analyze_codex_conversations_with_mode;
 use crate::session::copilot::analyze_copilot_events;
 use crate::session::detector::{classify_records, detect_extension_type};
 use crate::session::gemini::analyze_gemini_events;
-use crate::session::state::AnalysisMode;
+use crate::session::state::ParseMode;
 use crate::constants::buffer;
 use crate::models::{
     ClaudeCodeLog, CodeAnalysis, CodexLog, CopilotEvent, ExtensionType, GeminiSession,
@@ -41,17 +41,17 @@ pub fn analyze_jsonl_file<P: AsRef<Path>>(path: P) -> Result<Value> {
 /// detection is only intended for the CLI single-file path where the user
 /// hands us an arbitrary path.
 ///
-/// Parses in [`AnalysisMode::Full`] — for callers that only consume tool
+/// Parses in [`ParseMode::Full`] — for callers that only consume tool
 /// counts and token usage (usage / aggregated analysis), use
-/// [`analyze_jsonl_file_typed_with_mode`] with [`AnalysisMode::UsageOnly`]
+/// [`analyze_jsonl_file_typed_with_mode`] with [`ParseMode::UsageOnly`]
 /// to avoid allocating `write_file_details`/`edit_file_details` bodies.
 pub fn analyze_jsonl_file_typed<P: AsRef<Path>>(path: P) -> Result<CodeAnalysis> {
-    analyze_jsonl_file_typed_with_mode(path, AnalysisMode::Full)
+    analyze_jsonl_file_typed_with_mode(path, ParseMode::Full)
 }
 
 pub fn analyze_jsonl_file_typed_with_mode<P: AsRef<Path>>(
     path: P,
-    mode: AnalysisMode,
+    mode: ParseMode,
 ) -> Result<CodeAnalysis> {
     let path = path.as_ref();
 
@@ -87,7 +87,7 @@ pub fn analyze_jsonl_file_typed_with_mode<P: AsRef<Path>>(
 pub fn analyze_session_file_typed_as<P: AsRef<Path>>(
     path: P,
     provider: ExtensionType,
-    mode: AnalysisMode,
+    mode: ParseMode,
 ) -> Result<CodeAnalysis> {
     let path = path.as_ref();
 
@@ -118,7 +118,7 @@ pub fn analyze_session_file_typed_as<P: AsRef<Path>>(
 fn stream_analyze_known(
     path: &Path,
     provider: ExtensionType,
-    mode: AnalysisMode,
+    mode: ParseMode,
 ) -> Result<Option<CodeAnalysis>> {
     let file =
         File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
@@ -154,7 +154,7 @@ fn stream_analyze_known(
 /// `type` values (`session_meta`, `turn_context`, …) so a synthetic file
 /// with no markers is most likely a deliberately-empty Codex fixture
 /// rather than a silently-broken Claude log.
-fn stream_analyze_autodetect(path: &Path, mode: AnalysisMode) -> Result<Option<CodeAnalysis>> {
+fn stream_analyze_autodetect(path: &Path, mode: ParseMode) -> Result<Option<CodeAnalysis>> {
     let file =
         File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
     let mut reader = BufReader::with_capacity(buffer::FILE_READ_BUFFER, file);
@@ -239,7 +239,7 @@ fn dispatch_streaming_buffered(
     ext: ExtensionType,
     buffered: Vec<Value>,
     mut reader: BufReader<File>,
-    mode: AnalysisMode,
+    mode: ParseMode,
 ) -> Result<CodeAnalysis> {
     match ext {
         ExtensionType::ClaudeCode => {
@@ -332,7 +332,7 @@ where
 fn dispatch_by_vec(
     data: Vec<Value>,
     ext_type: ExtensionType,
-    mode: AnalysisMode,
+    mode: ParseMode,
 ) -> Result<CodeAnalysis> {
     let analysis = match ext_type {
         ExtensionType::ClaudeCode => analyze_claude_conversations_with_mode(data, mode)?,

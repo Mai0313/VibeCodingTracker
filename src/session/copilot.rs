@@ -1,6 +1,6 @@
 use crate::constants::{FastHashMap, capacity};
 use crate::models::*;
-use crate::session::state::{AnalysisMode, AnalysisState};
+use crate::session::state::{ParseMode, SessionParseState};
 use crate::utils::{get_git_remote_url, parse_iso_timestamp};
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -30,11 +30,11 @@ use serde_json::{Value, json};
 // being mis-parsed.
 
 /// Analyze Copilot CLI conversations from the JSONL event stream.
-pub fn analyze_copilot_events<I>(events: I, mode: AnalysisMode) -> Result<CodeAnalysis>
+pub fn analyze_copilot_events<I>(events: I, mode: ParseMode) -> Result<CodeAnalysis>
 where
     I: IntoIterator<Item = CopilotEvent>,
 {
-    let mut state = AnalysisState::with_mode(mode);
+    let mut state = SessionParseState::with_mode(mode);
     let mut conversation_usage: FastHashMap<String, Value> =
         FastHashMap::with_capacity(capacity::MODELS_PER_SESSION);
     // Pending tool calls indexed by `toolCallId` — each `tool.execution_start`
@@ -217,7 +217,7 @@ struct PendingTool {
 }
 
 fn dispatch_tool(
-    state: &mut AnalysisState,
+    state: &mut SessionParseState,
     pending: &PendingTool,
     complete: &CopilotToolCompleteData,
 ) {

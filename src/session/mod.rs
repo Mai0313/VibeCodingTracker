@@ -20,4 +20,4 @@ pub use parser::{
     analyze_jsonl_file, analyze_jsonl_file_typed, analyze_jsonl_file_typed_with_mode,
     analyze_session_file_typed_as,
 };
-pub use state::{AnalysisMode, AnalysisState};
+pub use state::{ParseMode, SessionParseState};

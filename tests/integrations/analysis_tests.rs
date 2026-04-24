@@ -10,7 +10,7 @@ use vibe_coding_tracker::analysis::batch_analyzer::{
 use vibe_coding_tracker::cli::TimeRange;
 use vibe_coding_tracker::models::ExtensionType;
 use vibe_coding_tracker::session::parser::{analyze_jsonl_file, analyze_session_file_typed_as};
-use vibe_coding_tracker::session::state::AnalysisMode;
+use vibe_coding_tracker::session::state::ParseMode;
 
 #[test]
 fn test_single_file_analysis_claude() {
@@ -469,7 +469,7 @@ fn test_provider_known_extracts_usage_when_first_line_is_permission_mode() {
     write_claude_fixture_with_sentinel_prelude(&file, "permission-mode");
 
     let analysis =
-        analyze_session_file_typed_as(&file, ExtensionType::ClaudeCode, AnalysisMode::UsageOnly)
+        analyze_session_file_typed_as(&file, ExtensionType::ClaudeCode, ParseMode::UsageOnly)
             .expect("provider-known path should accept the sentinel prelude");
 
     assert_eq!(analysis.extension_name, "Claude-Code");
@@ -493,7 +493,7 @@ fn test_provider_known_extracts_usage_when_first_line_is_file_history_snapshot()
     write_claude_fixture_with_sentinel_prelude(&file, "file-history-snapshot");
 
     let analysis =
-        analyze_session_file_typed_as(&file, ExtensionType::ClaudeCode, AnalysisMode::UsageOnly)
+        analyze_session_file_typed_as(&file, ExtensionType::ClaudeCode, ParseMode::UsageOnly)
             .expect("provider-known path should accept the sentinel prelude");
 
     let record = &analysis.records[0];
@@ -510,7 +510,7 @@ fn test_provider_known_extracts_usage_when_first_line_is_queue_operation() {
     write_claude_fixture_with_sentinel_prelude(&file, "queue-operation");
 
     let analysis =
-        analyze_session_file_typed_as(&file, ExtensionType::ClaudeCode, AnalysisMode::UsageOnly)
+        analyze_session_file_typed_as(&file, ExtensionType::ClaudeCode, ParseMode::UsageOnly)
             .expect("provider-known path should accept the sentinel prelude");
 
     let record = &analysis.records[0];
