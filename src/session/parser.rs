@@ -16,7 +16,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-/// Analyzes a session file (JSONL or JSON) and returns the result as a
+/// Parses a session file (JSONL or JSON) and returns the result as a
 /// `serde_json::Value` (the CLI single-file dump path).
 ///
 /// Internally this is a thin wrapper over [`parse_session_file_typed`]; the
