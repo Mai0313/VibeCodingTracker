@@ -215,6 +215,7 @@ fn build_enriched_json(
         let cost = calculate_cost(
             counts.input_tokens,
             counts.output_tokens,
+            counts.reasoning_tokens,
             counts.cache_read,
             counts.cache_creation_5m,
             counts.cache_creation_1h,

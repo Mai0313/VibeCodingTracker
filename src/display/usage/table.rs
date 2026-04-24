@@ -60,7 +60,10 @@ pub fn display_usage_table(usage_data: &UsageData) {
         Color::Yellow,
     );
 
-    // Add data rows
+    // Add data rows. The "Output" column folds `reasoning_tokens` back
+    // into the displayed number so each row still adds up to `Total`
+    // — costs are already calculated against the separated buckets via
+    // `calculate_cost`.
     for row in rows {
         table.add_row(vec![
             Cell::new(&row.display_model)
@@ -69,7 +72,7 @@ pub fn display_usage_table(usage_data: &UsageData) {
             Cell::new(format_number(row.input_tokens))
                 .fg(Color::White)
                 .set_alignment(CellAlignment::Right),
-            Cell::new(format_number(row.output_tokens))
+            Cell::new(format_number(row.output_with_reasoning()))
                 .fg(Color::White)
                 .set_alignment(CellAlignment::Right),
             Cell::new(format_number(row.cache_read))
@@ -93,7 +96,7 @@ pub fn display_usage_table(usage_data: &UsageData) {
         vec![
             "TOTAL".to_string(),
             format_number(totals.input_tokens),
-            format_number(totals.output_tokens),
+            format_number(totals.output_with_reasoning()),
             format_number(totals.cache_read),
             format_number(totals.cache_creation),
             format_number(totals.total),

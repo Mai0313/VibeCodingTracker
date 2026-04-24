@@ -50,17 +50,29 @@ pub fn fetch_model_pricing() -> Result<ModelPricingMap> {
     let raw: serde_json::Value = response
         .json()
         .context("Failed to parse model pricing JSON")?;
-    let pricing = cache::parse_litellm_pricing_map(raw);
 
-    // Filter out models with entirely zero pricing (free / unpriced entries).
-    let normalized_pricing = cache::normalize_pricing(pricing);
+    // Project the upstream JSON down to just the cost-related keys before
+    // anything else. Doing the filter first guarantees the on-disk cache
+    // and the in-memory `ModelPricing` are derived from the *same* view of
+    // the data — so nothing we price against can differ from what the
+    // cache preserves for future calculation strategies.
+    let filtered_raw = cache::build_filtered_cost_json(&raw);
 
-    // Save to cache with today's date
-    if let Err(e) = cache::save_to_cache(&normalized_pricing) {
+    // Save the filtered raw JSON to cache. We deliberately persist the raw
+    // cost keys (rather than our derived `ModelPricing` shape) so
+    // priority / flex / batch / audio / image tiers that `calculate_cost`
+    // doesn't consume yet are still available to future versions without
+    // a re-fetch.
+    if let Err(e) = cache::save_to_cache(&filtered_raw) {
         log::warn!("Failed to save pricing to cache: {}", e);
     } else {
         log::debug!("Saved model pricing to cache with today's date");
     }
+
+    let pricing = cache::parse_litellm_pricing_map(filtered_raw);
+
+    // Filter out models with entirely zero pricing (free / unpriced entries).
+    let normalized_pricing = cache::normalize_pricing(pricing);
 
     Ok(ModelPricingMap::new(normalized_pricing))
 }

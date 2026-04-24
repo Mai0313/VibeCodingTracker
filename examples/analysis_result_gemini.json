@@ -7,7 +7,7 @@
       "conversationUsage": {
         "gemini-3-flash-preview": {
           "cache_read_input_tokens": 89744,
-          "input_tokens": 284574,
+          "input_tokens": 194830,
           "output_tokens": 3683,
           "thoughts_tokens": 3030,
           "tool_tokens": 0,

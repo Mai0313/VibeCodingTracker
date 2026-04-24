@@ -12,13 +12,23 @@ use super::cache::{ModelPricing, TierRange};
 ///    semantics where prompt size promotes the entire request to a higher rate.
 /// 3. Otherwise, uses flat base prices for every token type.
 ///
+/// `reasoning_tokens` covers the model's "thinking" budget (Gemini
+/// `thoughts_tokens`, Codex `reasoning_output_tokens`, Copilot
+/// `reasoningTokens`). When the active price level publishes
+/// `output_cost_per_reasoning_token`, reasoning is billed at that rate;
+/// otherwise it falls back to the active `output_cost_per_token` rate so
+/// providers that don't split reasoning (all Anthropic models, GPT-5.x,
+/// Grok, …) continue to bill correctly.
+///
 /// `cache_creation_5m_tokens` and `cache_creation_1h_tokens` are priced
 /// separately (5-minute default TTL vs 1-hour extended TTL). When a model
 /// doesn't publish a 1hr price (value is 0.0), the 5m price is used for both
 /// buckets — matching current behaviour for providers that don't split TTL.
+#[allow(clippy::too_many_arguments)] // pricing dispatch; grouping into a struct costs clarity here
 pub fn calculate_cost(
     input_tokens: i64,
     output_tokens: i64,
+    reasoning_tokens: i64,
     cache_read_tokens: i64,
     cache_creation_5m_tokens: i64,
     cache_creation_1h_tokens: i64,
@@ -26,44 +36,73 @@ pub fn calculate_cost(
 ) -> f64 {
     let total_cache_creation = cache_creation_5m_tokens + cache_creation_1h_tokens;
 
-    // Pick the primary price source (input/output/cache_read) based on strategy.
-    // cache_creation prices always come from base level in the range-based branch
-    // because TierRange carries no cache_creation fields (LiteLLM doesn't publish
-    // them for Qwen / doubao); for tier + flat they come from the active level.
-    let (input_price, output_price, cache_read_price, cc_5m_price, cc_1h_price_raw) =
-        if let Some(ranges) = &pricing.ranges {
-            let r = select_range(ranges, input_tokens);
-            (
-                r.map(|r| r.input_cost_per_token).unwrap_or(0.0),
-                r.map(|r| r.output_cost_per_token).unwrap_or(0.0),
-                r.map(|r| r.cache_read_input_token_cost).unwrap_or(0.0),
+    // Pick the primary price source (input/output/reasoning/cache_read)
+    // based on strategy. `reasoning_price_raw = 0.0` signals "no dedicated
+    // reasoning rate published at this level" — the fallback below maps
+    // that to the active output price so we keep billing reasoning tokens
+    // at the provider's actual output rate rather than silently pricing
+    // them at $0.
+    //
+    // cache_creation prices always come from base level in the range-based
+    // branch because `TierRange` carries no cache_creation fields (LiteLLM
+    // doesn't publish them for Qwen / doubao); for tier + flat they come
+    // from the active level.
+    let (
+        input_price,
+        output_price,
+        reasoning_price_raw,
+        cache_read_price,
+        cc_5m_price,
+        cc_1h_price_raw,
+    ) = if let Some(ranges) = &pricing.ranges {
+        let r = select_range(ranges, input_tokens);
+        (
+            r.map(|r| r.input_cost_per_token).unwrap_or(0.0),
+            r.map(|r| r.output_cost_per_token).unwrap_or(0.0),
+            // Qwen / doubao publish per-range reasoning rates directly on
+            // the `TierRange` struct; use them when available.
+            r.map(|r| r.output_cost_per_reasoning_token).unwrap_or(0.0),
+            r.map(|r| r.cache_read_input_token_cost).unwrap_or(0.0),
+            pricing.cache_creation_input_token_cost,
+            pricing.cache_creation_input_token_cost_above_1hr,
+        )
+    } else {
+        let total_input_context = input_tokens + cache_read_tokens + total_cache_creation;
+        let active_tier = pricing
+            .tiers
+            .iter()
+            .rev()
+            .find(|t| total_input_context > t.threshold_tokens);
+        match active_tier {
+            Some(t) => (
+                t.input_cost_per_token,
+                t.output_cost_per_token,
+                // LiteLLM does not publish a tier-specific
+                // `output_cost_per_reasoning_token_above_Nk_tokens` field
+                // yet, so fall back to the active tier's output price —
+                // this avoids silently billing reasoning against base
+                // rates when a prompt crosses the 200K / 272K threshold.
+                0.0,
+                t.cache_read_input_token_cost,
+                t.cache_creation_input_token_cost,
+                t.cache_creation_input_token_cost_above_1hr,
+            ),
+            None => (
+                pricing.input_cost_per_token,
+                pricing.output_cost_per_token,
+                pricing.output_cost_per_reasoning_token,
+                pricing.cache_read_input_token_cost,
                 pricing.cache_creation_input_token_cost,
                 pricing.cache_creation_input_token_cost_above_1hr,
-            )
-        } else {
-            let total_input_context = input_tokens + cache_read_tokens + total_cache_creation;
-            let active_tier = pricing
-                .tiers
-                .iter()
-                .rev()
-                .find(|t| total_input_context > t.threshold_tokens);
-            match active_tier {
-                Some(t) => (
-                    t.input_cost_per_token,
-                    t.output_cost_per_token,
-                    t.cache_read_input_token_cost,
-                    t.cache_creation_input_token_cost,
-                    t.cache_creation_input_token_cost_above_1hr,
-                ),
-                None => (
-                    pricing.input_cost_per_token,
-                    pricing.output_cost_per_token,
-                    pricing.cache_read_input_token_cost,
-                    pricing.cache_creation_input_token_cost,
-                    pricing.cache_creation_input_token_cost_above_1hr,
-                ),
-            }
-        };
+            ),
+        }
+    };
+
+    let reasoning_price = if reasoning_price_raw > 0.0 {
+        reasoning_price_raw
+    } else {
+        output_price
+    };
 
     // If the active level doesn't publish a 1hr price, bill 1h tokens at the 5m
     // rate (safer to under-bill than fabricate; also matches providers with no
@@ -76,6 +115,7 @@ pub fn calculate_cost(
 
     input_tokens as f64 * input_price
         + output_tokens as f64 * output_price
+        + reasoning_tokens as f64 * reasoning_price
         + cache_read_tokens as f64 * cache_read_price
         + cache_creation_5m_tokens as f64 * cc_5m_price
         + cache_creation_1h_tokens as f64 * cc_1h_price
@@ -136,7 +176,7 @@ mod tests {
     fn test_flat_pricing_applies_base() {
         let p = flat_pricing();
         // 200 of cache_creation goes into the 5m bucket (no TTL split available).
-        let cost = calculate_cost(1000, 500, 200, 100, 0, &p);
+        let cost = calculate_cost(1000, 500, 0, 200, 100, 0, &p);
         let expected =
             1000.0 * 0.000003 + 500.0 * 0.000015 + 200.0 * 0.0000003 + 100.0 * 0.00000375;
         assert_eq!(cost, expected);
@@ -146,7 +186,7 @@ mod tests {
     fn test_threshold_tier_below_threshold_uses_base() {
         let p = sonnet_like_pricing();
         // Total input context = 1000 + 200 + 100 = 1300 ≤ 200K → base prices
-        let cost = calculate_cost(1000, 500, 200, 100, 0, &p);
+        let cost = calculate_cost(1000, 500, 0, 200, 100, 0, &p);
         let expected =
             1000.0 * 0.000003 + 500.0 * 0.000015 + 200.0 * 0.0000003 + 100.0 * 0.00000375;
         assert_eq!(cost, expected);
@@ -156,7 +196,7 @@ mod tests {
     fn test_threshold_tier_above_threshold_applies_tier() {
         let p = sonnet_like_pricing();
         // Total input context = 250K + 250K + 250K = 750K > 200K → tier prices for ALL types
-        let cost = calculate_cost(250_000, 250_000, 250_000, 250_000, 0, &p);
+        let cost = calculate_cost(250_000, 250_000, 0, 250_000, 250_000, 0, &p);
         let expected = 250_000.0 * 0.000006
             + 250_000.0 * 0.0000225
             + 250_000.0 * 0.0000006
@@ -168,7 +208,7 @@ mod tests {
     fn test_threshold_uses_total_input_context_not_output() {
         let p = sonnet_like_pricing();
         // Small input context (50K) but massive output (500K) → still base prices
-        let cost = calculate_cost(50_000, 500_000, 0, 0, 0, &p);
+        let cost = calculate_cost(50_000, 500_000, 0, 0, 0, 0, &p);
         let expected = 50_000.0 * 0.000003 + 500_000.0 * 0.000015;
         assert_eq!(cost, expected);
     }
@@ -176,10 +216,10 @@ mod tests {
     #[test]
     fn test_exact_200k_stays_on_base() {
         let p = sonnet_like_pricing();
-        let cost_exact = calculate_cost(200_000, 50_000, 0, 0, 0, &p);
+        let cost_exact = calculate_cost(200_000, 50_000, 0, 0, 0, 0, &p);
         assert_eq!(cost_exact, 200_000.0 * 0.000003 + 50_000.0 * 0.000015);
 
-        let cost_above = calculate_cost(200_001, 50_000, 0, 0, 0, &p);
+        let cost_above = calculate_cost(200_001, 50_000, 0, 0, 0, 0, &p);
         assert_eq!(cost_above, 200_001.0 * 0.000006 + 50_000.0 * 0.0000225);
     }
 
@@ -207,15 +247,15 @@ mod tests {
         };
 
         // 100K: below both tiers → base prices
-        let c1 = calculate_cost(100_000, 10_000, 0, 0, 0, &p);
+        let c1 = calculate_cost(100_000, 10_000, 0, 0, 0, 0, &p);
         assert_eq!(c1, 100_000.0 * 0.000001 + 10_000.0 * 0.000002);
 
         // 200K: above 128k, below 272k → first tier
-        let c2 = calculate_cost(200_000, 10_000, 0, 0, 0, &p);
+        let c2 = calculate_cost(200_000, 10_000, 0, 0, 0, 0, &p);
         assert_eq!(c2, 200_000.0 * 0.000002 + 10_000.0 * 0.000004);
 
         // 300K: above both → second (highest) tier
-        let c3 = calculate_cost(300_000, 10_000, 0, 0, 0, &p);
+        let c3 = calculate_cost(300_000, 10_000, 0, 0, 0, 0, &p);
         assert_eq!(c3, 300_000.0 * 0.000004 + 10_000.0 * 0.000008);
     }
 
@@ -259,10 +299,10 @@ mod tests {
             ..Default::default()
         };
 
-        let c_low = calculate_cost(20_000, 5_000, 0, 0, 0, &p);
+        let c_low = calculate_cost(20_000, 5_000, 0, 0, 0, 0, &p);
         assert_eq!(c_low, 20_000.0 * 0.000001 + 5_000.0 * 0.000005);
 
-        let c_hi = calculate_cost(500_000, 5_000, 0, 0, 0, &p);
+        let c_hi = calculate_cost(500_000, 5_000, 0, 0, 0, 0, &p);
         assert_eq!(c_hi, 500_000.0 * 0.000006 + 5_000.0 * 0.00006);
     }
 
@@ -280,14 +320,14 @@ mod tests {
         };
 
         // 200K exceeds every defined range — fall back to the last one.
-        let cost = calculate_cost(200_000, 0, 0, 0, 0, &p);
+        let cost = calculate_cost(200_000, 0, 0, 0, 0, 0, &p);
         assert_eq!(cost, 200_000.0 * 0.000001);
     }
 
     #[test]
     fn test_zero_tokens() {
         let p = sonnet_like_pricing();
-        assert_eq!(calculate_cost(0, 0, 0, 0, 0, &p), 0.0);
+        assert_eq!(calculate_cost(0, 0, 0, 0, 0, 0, &p), 0.0);
     }
 
     #[test]
@@ -303,11 +343,11 @@ mod tests {
         };
 
         // 10_000 tokens at 1hr TTL should cost the extended rate, not the 5m rate.
-        let cost = calculate_cost(0, 0, 0, 0, 10_000, &p);
+        let cost = calculate_cost(0, 0, 0, 0, 0, 10_000, &p);
         assert_eq!(cost, 10_000.0 * 1e-5);
 
         // Mixed: 1_000 at 5m + 10_000 at 1h.
-        let cost_mixed = calculate_cost(0, 0, 0, 1_000, 10_000, &p);
+        let cost_mixed = calculate_cost(0, 0, 0, 0, 1_000, 10_000, &p);
         assert_eq!(cost_mixed, 1_000.0 * 6.25e-6 + 10_000.0 * 1e-5);
     }
 
@@ -321,7 +361,7 @@ mod tests {
             ..Default::default()
         };
 
-        let cost = calculate_cost(0, 0, 0, 0, 10_000, &p);
+        let cost = calculate_cost(0, 0, 0, 0, 0, 10_000, &p);
         assert_eq!(cost, 10_000.0 * 6.25e-6);
     }
 
@@ -344,8 +384,92 @@ mod tests {
 
         // Input context = 250K → tier applies.
         // 5_000 @ 5m tier, 5_000 @ 1hr tier.
-        let cost = calculate_cost(250_000, 0, 0, 5_000, 5_000, &p);
+        let cost = calculate_cost(250_000, 0, 0, 0, 5_000, 5_000, &p);
         let expected = 250_000.0 * 6e-6 + 5_000.0 * 7.5e-6 + 5_000.0 * 1.2e-5;
+        assert_eq!(cost, expected);
+    }
+
+    #[test]
+    fn test_reasoning_billed_at_dedicated_rate_when_published() {
+        // Gemini 2.5 flash-lite publishes a dedicated
+        // `output_cost_per_reasoning_token` that happens to match its
+        // output rate; perplexity/sonar-deep-research pays $3/M for
+        // reasoning vs $8/M for output. Use the synthetic latter shape
+        // to prove the reasoning price is not being silently coerced
+        // back to the output rate.
+        let p = ModelPricing {
+            input_cost_per_token: 1e-6,
+            output_cost_per_token: 8e-6,
+            output_cost_per_reasoning_token: 3e-6,
+            ..Default::default()
+        };
+
+        let cost = calculate_cost(1_000, 200, 500, 0, 0, 0, &p);
+        let expected = 1_000.0 * 1e-6 + 200.0 * 8e-6 + 500.0 * 3e-6;
+        assert_eq!(cost, expected);
+    }
+
+    #[test]
+    fn test_reasoning_falls_back_to_output_rate_when_not_published() {
+        // Claude has no reasoning price published at all. Sessions that
+        // still report reasoning tokens (e.g. Copilot driving a Claude
+        // model) should bill them at the output rate rather than $0.
+        let p = ModelPricing {
+            input_cost_per_token: 3e-6,
+            output_cost_per_token: 1.5e-5,
+            ..Default::default()
+        };
+
+        let cost = calculate_cost(1_000, 500, 200, 0, 0, 0, &p);
+        let expected = 1_000.0 * 3e-6 + 500.0 * 1.5e-5 + 200.0 * 1.5e-5;
+        assert_eq!(cost, expected);
+    }
+
+    #[test]
+    fn test_reasoning_uses_active_tier_output_rate_when_threshold_crossed() {
+        // When a prompt promotes the request into the 200K tier,
+        // reasoning tokens should track the tier's output rate, not the
+        // base rate. This matches current Anthropic / Google semantics
+        // where "once you're in the tier, everything is more expensive."
+        let p = ModelPricing {
+            input_cost_per_token: 3e-6,
+            output_cost_per_token: 1.5e-5,
+            output_cost_per_reasoning_token: 0.0,
+            tiers: vec![ThresholdTier {
+                threshold_tokens: 200_000,
+                input_cost_per_token: 6e-6,
+                output_cost_per_token: 2.25e-5,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        // 250K prompt → tier applies; reasoning uses tier output rate.
+        let cost = calculate_cost(250_000, 1_000, 500, 0, 0, 0, &p);
+        let expected = 250_000.0 * 6e-6 + 1_000.0 * 2.25e-5 + 500.0 * 2.25e-5;
+        assert_eq!(cost, expected);
+    }
+
+    #[test]
+    fn test_reasoning_uses_range_reasoning_rate_when_published() {
+        // dashscope qwen-plus ships a per-range reasoning rate ($4/M)
+        // that's substantially higher than the per-range output rate
+        // ($1.2/M). The range-based path must route reasoning through
+        // that field.
+        let p = ModelPricing {
+            ranges: Some(vec![TierRange {
+                min_tokens: 0,
+                max_tokens: 32_000,
+                input_cost_per_token: 8e-7,
+                output_cost_per_token: 1.2e-6,
+                output_cost_per_reasoning_token: 4e-6,
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        let cost = calculate_cost(10_000, 500, 200, 0, 0, 0, &p);
+        let expected = 10_000.0 * 8e-7 + 500.0 * 1.2e-6 + 200.0 * 4e-6;
         assert_eq!(cost, expected);
     }
 }

@@ -364,8 +364,12 @@ fn test_gemini_parser_jsonl() {
     assert_eq!(record["taskId"], "fixture-session");
 
     // Token usage attributed to the sole assistant model in the fixture.
+    // Gemini's `tokens.input` (100) is the full prompt including the
+    // cached subset (10), so `process_gemini_usage` stores it as
+    // non-cached (90) — mirroring Claude's "input ⊥ cache_read"
+    // convention and preventing `calculate_cost` from double-billing.
     let usage = &record["conversationUsage"]["gemini-3-flash-preview"];
-    assert_eq!(usage["input_tokens"], 100);
+    assert_eq!(usage["input_tokens"], 90);
     assert_eq!(usage["output_tokens"], 50);
     assert_eq!(usage["cache_read_input_tokens"], 10);
     assert_eq!(usage["thoughts_tokens"], 5);

@@ -103,16 +103,18 @@ where
                         let Some(usage) = metric.usage else {
                             continue;
                         };
-                        // Copilot's `reasoningTokens` is a subset of the
-                        // "thinking" budget a model burns before emitting
-                        // visible tokens. Other providers fold it into the
-                        // output bucket, so we do the same here for
-                        // consistency (see
-                        // `utils::token_extractor::extract_token_counts`
-                        // for Codex's treatment of `reasoning_output_tokens`).
+                        // Copilot's `reasoningTokens` is the model's
+                        // thinking budget emitted before the visible
+                        // response. Surface it as its own field so
+                        // `calculate_cost` can charge it against the
+                        // model's published reasoning rate (when present)
+                        // via `output_cost_per_reasoning_token`, instead
+                        // of folding it into `output_tokens` and billing
+                        // every thinking token at the flat output rate.
                         let usage_json = json!({
                             "input_tokens": usage.input_tokens,
-                            "output_tokens": usage.output_tokens + usage.reasoning_tokens,
+                            "output_tokens": usage.output_tokens,
+                            "reasoning_output_tokens": usage.reasoning_tokens,
                             "cache_read_input_tokens": usage.cache_read_tokens,
                             "cache_creation_input_tokens": usage.cache_write_tokens,
                         });
