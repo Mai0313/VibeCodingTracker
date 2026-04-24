@@ -5,10 +5,10 @@ use crate::utils::{get_git_remote_url, parse_iso_timestamp, process_gemini_usage
 use anyhow::Result;
 use serde_json::Value;
 
-/// Analyze Gemini conversations from the JSONL event stream.
+/// Parse Gemini CLI session events from the JSONL event stream.
 ///
 /// `session` carries the first-line meta record (`sessionId` etc.), and
-/// `events` yields one parsed JSON value per subsequent line. The analyzer
+/// `events` yields one parsed JSON value per subsequent line. The parser
 /// filters down to `type == "gemini"` events and deserialises those into
 /// [`GeminiMessage`] individually; everything else (`type == "user"`,
 /// `"info"`, `$set` meta-update records, …) is silently skipped.
@@ -16,7 +16,7 @@ use serde_json::Value;
 /// This is the only supported Gemini entry point — legacy single-object
 /// exports (`chats/<session>.json` with an inline `messages` array) are no
 /// longer handled.
-pub fn analyze_gemini_events<I>(
+pub fn parse_gemini_events<I>(
     session: GeminiSession,
     events: I,
     mode: ParseMode,

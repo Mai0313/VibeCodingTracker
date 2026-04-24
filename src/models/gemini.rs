@@ -12,8 +12,8 @@ use serde_json::Value;
 /// ```
 ///
 /// Subsequent lines are individual assistant / user / info events that the
-/// analyzer parses one-by-one as plain `Value`s (see
-/// `analyze_gemini_events`), so this struct only needs to capture the
+/// parser handles one-by-one as plain `Value`s (see
+/// `parse_gemini_events`), so this struct only needs to capture the
 /// identifiers found on that opening meta line. Legacy single-object
 /// exports (`chats/<session>.json` with an inline `messages` array) are no
 /// longer supported — the filesystem filter ignores `.json` entirely.

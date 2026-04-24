@@ -29,8 +29,8 @@ use serde_json::{Value, json};
 // Codex default in `detect_extension_type` and fail cleanly rather than
 // being mis-parsed.
 
-/// Analyze Copilot CLI conversations from the JSONL event stream.
-pub fn analyze_copilot_events<I>(events: I, mode: ParseMode) -> Result<CodeAnalysis>
+/// Parse Copilot CLI session events from the JSONL event stream.
+pub fn parse_copilot_events<I>(events: I, mode: ParseMode) -> Result<CodeAnalysis>
 where
     I: IntoIterator<Item = CopilotEvent>,
 {

@@ -6,15 +6,8 @@ use anyhow::Result;
 use regex::Regex;
 use serde_json::Value;
 
-/// Analyze Codex conversations
-pub fn analyze_codex_conversations(logs: &[CodexLog]) -> Result<CodeAnalysis> {
-    analyze_codex_conversations_with_mode(logs, ParseMode::Full)
-}
-
-pub fn analyze_codex_conversations_with_mode(
-    logs: &[CodexLog],
-    mode: ParseMode,
-) -> Result<CodeAnalysis> {
+/// Parse Codex session records from a slice of pre-typed logs.
+pub fn parse_codex_logs(logs: &[CodexLog], mode: ParseMode) -> Result<CodeAnalysis> {
     let mut state = SessionParseState::with_mode(mode);
     let mut conversation_usage: FastHashMap<String, Value> = FastHashMap::with_capacity(5);
     let mut current_model = String::new();

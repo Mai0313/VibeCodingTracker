@@ -1,11 +1,11 @@
 use crate::VERSION;
-use crate::session::claude::{analyze_claude_conversations_with_mode, analyze_claude_logs};
-use crate::session::codex::analyze_codex_conversations_with_mode;
-use crate::session::copilot::analyze_copilot_events;
-use crate::session::detector::{classify_records, detect_extension_type};
-use crate::session::gemini::analyze_gemini_events;
-use crate::session::state::ParseMode;
 use crate::constants::buffer;
+use crate::session::claude::{parse_claude_log_values, parse_claude_logs};
+use crate::session::codex::parse_codex_logs;
+use crate::session::copilot::parse_copilot_events;
+use crate::session::detector::{classify_records, detect_extension_type};
+use crate::session::gemini::parse_gemini_events;
+use crate::session::state::ParseMode;
 use crate::models::{
     ClaudeCodeLog, CodeAnalysis, CodexLog, CopilotEvent, ExtensionType, GeminiSession,
 };
@@ -249,7 +249,7 @@ fn dispatch_streaming_buffered(
                 .into_iter()
                 .filter_map(|v| serde_json::from_value::<ClaudeCodeLog>(v).ok());
             let rest = iter_jsonl_typed::<ClaudeCodeLog>(&mut reader);
-            analyze_claude_logs(buffered_iter.chain(rest), mode)
+            parse_claude_logs(buffered_iter.chain(rest), mode)
         }
         ExtensionType::Codex => {
             let mut logs: Vec<CodexLog> = Vec::with_capacity(64);
@@ -261,7 +261,7 @@ fn dispatch_streaming_buffered(
             for log in iter_jsonl_typed::<CodexLog>(&mut reader) {
                 logs.push(log);
             }
-            analyze_codex_conversations_with_mode(&logs, mode)
+            parse_codex_logs(&logs, mode)
         }
         ExtensionType::Copilot => {
             // Copilot CLI emits one event per line under
@@ -272,14 +272,14 @@ fn dispatch_streaming_buffered(
                 .into_iter()
                 .filter_map(|v| serde_json::from_value::<CopilotEvent>(v).ok());
             let rest_events = iter_jsonl_typed::<CopilotEvent>(&mut reader);
-            analyze_copilot_events(buffered_events.chain(rest_events), mode)
+            parse_copilot_events(buffered_events.chain(rest_events), mode)
         }
         ExtensionType::Gemini => {
             // Gemini sessions are line-delimited event streams: the first
             // line is a session-meta record carrying `sessionId` etc.,
             // and every subsequent line is an individual event. Feed the
             // already-buffered lines plus the rest of the reader into
-            // `analyze_gemini_events`.
+            // `parse_gemini_events`.
             let mut iter = buffered.into_iter();
             let first = iter
                 .next()
@@ -288,14 +288,14 @@ fn dispatch_streaming_buffered(
                 serde_json::from_value(first).context("Failed to parse Gemini session")?;
 
             let rest_events = iter_jsonl_values(&mut reader);
-            analyze_gemini_events(session, iter.chain(rest_events), mode)
+            parse_gemini_events(session, iter.chain(rest_events), mode)
         }
     }
 }
 
 /// Iterator that yields raw [`Value`]s, one per non-empty line in the reader.
 ///
-/// Used by analyzers (Gemini / Copilot) that need to dispatch per-event on a
+/// Used by parsers (Gemini / Copilot) that need to dispatch per-event on a
 /// runtime-typed shape before committing to a strongly-typed struct, since
 /// different event types carry completely different payloads.
 fn iter_jsonl_values<'a>(reader: &'a mut BufReader<File>) -> impl Iterator<Item = Value> + 'a {
@@ -311,7 +311,7 @@ fn iter_jsonl_values<'a>(reader: &'a mut BufReader<File>) -> impl Iterator<Item 
 
 /// Iterator that yields `T` values, one per non-empty line in the reader.
 /// Lines that fail to deserialise into `T` are silently skipped, matching the
-/// legacy `from_value(...).ok()` behaviour the analyzers already tolerate.
+/// legacy `from_value(...).ok()` behaviour the parsers already tolerate.
 fn iter_jsonl_typed<'a, T>(reader: &'a mut BufReader<File>) -> impl Iterator<Item = T> + 'a
 where
     T: serde::de::DeserializeOwned + 'a,
@@ -335,18 +335,18 @@ fn dispatch_by_vec(
     mode: ParseMode,
 ) -> Result<CodeAnalysis> {
     let analysis = match ext_type {
-        ExtensionType::ClaudeCode => analyze_claude_conversations_with_mode(data, mode)?,
+        ExtensionType::ClaudeCode => parse_claude_log_values(data, mode)?,
         ExtensionType::Codex => {
             let logs: Vec<CodexLog> = data
                 .into_iter()
                 .filter_map(|v| serde_json::from_value(v).ok())
                 .collect();
-            analyze_codex_conversations_with_mode(&logs, mode)?
+            parse_codex_logs(&logs, mode)?
         }
         ExtensionType::Copilot | ExtensionType::Gemini => {
             // Both providers only support the JSONL event stream. A file
             // that falls through to this branch (e.g. a stray pretty-
-            // printed export) has no analyzer for its shape — return an
+            // printed export) has no parser for its shape — return an
             // empty analysis instead of silently mis-parsing.
             empty_analysis()
         }

@@ -69,7 +69,7 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
 
         // Gemini writes reasoning budget as `thoughts_tokens`; Copilot's
         // shutdown usage is normalised to `reasoning_output_tokens` by
-        // `copilot_analyzer::analyze_copilot_events`. Either key feeds the
+        // `session::copilot::parse_copilot_events`. Either key feeds the
         // same bucket — we never see both on the same record.
         if let Some(thoughts) = usage_obj.get("thoughts_tokens").and_then(|v| v.as_i64()) {
             counts.reasoning_tokens = thoughts;
