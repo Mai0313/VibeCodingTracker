@@ -465,7 +465,7 @@ pub fn normalize_pricing(
 }
 
 #[cfg(test)]
-mod parser_tests {
+mod tests {
     use super::*;
     use serde_json::json;
 
@@ -902,5 +902,223 @@ mod parser_tests {
             }
         });
         assert!(!looks_like_legacy_pricing_cache(&new_format));
+    }
+
+    #[test]
+    fn test_model_pricing_default() {
+        let pricing = ModelPricing::default();
+
+        assert_eq!(pricing.input_cost_per_token, 0.0);
+        assert_eq!(pricing.output_cost_per_token, 0.0);
+        assert_eq!(pricing.cache_read_input_token_cost, 0.0);
+        assert_eq!(pricing.cache_creation_input_token_cost, 0.0);
+        assert!(pricing.tiers.is_empty());
+        assert!(pricing.ranges.is_none());
+    }
+
+    #[test]
+    fn test_model_pricing_serialization() {
+        let pricing = ModelPricing {
+            input_cost_per_token: 0.000001,
+            output_cost_per_token: 0.000002,
+            cache_read_input_token_cost: 0.0000001,
+            cache_creation_input_token_cost: 0.0000005,
+            tiers: vec![ThresholdTier {
+                threshold_tokens: 200_000,
+                input_cost_per_token: 0.000002,
+                output_cost_per_token: 0.000004,
+                cache_read_input_token_cost: 0.0000002,
+                cache_creation_input_token_cost: 0.000001,
+                ..Default::default()
+            }],
+            ranges: None,
+            ..Default::default()
+        };
+
+        let serialized = serde_json::to_string(&pricing).unwrap();
+        let deserialized: ModelPricing = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(
+            deserialized.input_cost_per_token,
+            pricing.input_cost_per_token
+        );
+        assert_eq!(deserialized.tiers.len(), 1);
+        assert_eq!(deserialized.tiers[0].threshold_tokens, 200_000);
+        assert_eq!(deserialized.tiers[0].input_cost_per_token, 0.000002);
+    }
+
+    #[test]
+    fn test_model_pricing_clone() {
+        // Vec means ModelPricing is no longer Copy — explicit clone is required.
+        let pricing1 = ModelPricing {
+            input_cost_per_token: 0.000001,
+            output_cost_per_token: 0.000002,
+            ..Default::default()
+        };
+
+        let pricing2 = pricing1.clone();
+
+        assert_eq!(pricing1.input_cost_per_token, pricing2.input_cost_per_token);
+        assert_eq!(
+            pricing1.output_cost_per_token,
+            pricing2.output_cost_per_token
+        );
+    }
+
+    #[test]
+    fn test_model_pricing_debug() {
+        let pricing = ModelPricing::default();
+        let debug_str = format!("{:?}", pricing);
+
+        assert!(debug_str.contains("ModelPricing"));
+    }
+
+    #[test]
+    fn test_model_pricing_with_partial_data() {
+        let raw = r#"{"input_cost_per_token": 0.000001}"#;
+        let pricing: ModelPricing = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(pricing.input_cost_per_token, 0.000001);
+        assert_eq!(pricing.output_cost_per_token, 0.0);
+    }
+
+    #[test]
+    fn test_model_pricing_empty_json() {
+        let raw = "{}";
+        let pricing: ModelPricing = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(pricing.input_cost_per_token, 0.0);
+        assert_eq!(pricing.output_cost_per_token, 0.0);
+    }
+
+    #[test]
+    fn test_model_pricing_hashmap_serialization() {
+        let mut pricing_map = HashMap::new();
+        pricing_map.insert(
+            "gpt-4".to_string(),
+            ModelPricing {
+                input_cost_per_token: 0.000030,
+                output_cost_per_token: 0.000060,
+                ..Default::default()
+            },
+        );
+        pricing_map.insert(
+            "claude-3".to_string(),
+            ModelPricing {
+                input_cost_per_token: 0.000015,
+                output_cost_per_token: 0.000075,
+                ..Default::default()
+            },
+        );
+
+        let serialized = serde_json::to_string(&pricing_map).unwrap();
+        let deserialized: HashMap<String, ModelPricing> =
+            serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(deserialized.len(), 2);
+        assert!(deserialized.contains_key("gpt-4"));
+        assert!(deserialized.contains_key("claude-3"));
+    }
+
+    #[test]
+    fn test_model_pricing_all_fields() {
+        let pricing = ModelPricing {
+            input_cost_per_token: 1.0,
+            output_cost_per_token: 2.0,
+            cache_read_input_token_cost: 3.0,
+            cache_creation_input_token_cost: 4.0,
+            output_cost_per_reasoning_token: 11.0,
+            tiers: vec![ThresholdTier {
+                threshold_tokens: 200_000,
+                input_cost_per_token: 5.0,
+                output_cost_per_token: 6.0,
+                cache_read_input_token_cost: 7.0,
+                cache_creation_input_token_cost: 8.0,
+                cache_creation_input_token_cost_above_1hr: 12.0,
+            }],
+            cache_creation_input_token_cost_above_1hr: 10.0,
+            ranges: Some(vec![TierRange {
+                min_tokens: 0,
+                max_tokens: 32_000,
+                input_cost_per_token: 0.1,
+                output_cost_per_token: 0.2,
+                cache_read_input_token_cost: 0.01,
+                output_cost_per_reasoning_token: 0.5,
+            }]),
+        };
+
+        let serialized = serde_json::to_string(&pricing).unwrap();
+        let deserialized: ModelPricing = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(deserialized.input_cost_per_token, 1.0);
+        assert_eq!(deserialized.output_cost_per_token, 2.0);
+        assert_eq!(deserialized.cache_read_input_token_cost, 3.0);
+        assert_eq!(deserialized.cache_creation_input_token_cost, 4.0);
+        assert_eq!(deserialized.output_cost_per_reasoning_token, 11.0);
+        assert_eq!(deserialized.tiers.len(), 1);
+        assert_eq!(deserialized.tiers[0].threshold_tokens, 200_000);
+        assert_eq!(deserialized.tiers[0].input_cost_per_token, 5.0);
+        assert_eq!(deserialized.tiers[0].output_cost_per_token, 6.0);
+        assert_eq!(deserialized.tiers[0].cache_read_input_token_cost, 7.0);
+        assert_eq!(deserialized.tiers[0].cache_creation_input_token_cost, 8.0);
+        let ranges = deserialized.ranges.unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].max_tokens, 32_000);
+        assert_eq!(ranges[0].output_cost_per_reasoning_token, 0.5);
+    }
+
+    #[test]
+    fn test_model_pricing_zero_values() {
+        let pricing = ModelPricing::default();
+        let serialized = serde_json::to_string(&pricing).unwrap();
+        let deserialized: ModelPricing = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(deserialized.input_cost_per_token, 0.0);
+        assert_eq!(deserialized.output_cost_per_token, 0.0);
+    }
+
+    #[test]
+    fn test_model_pricing_negative_values() {
+        let pricing = ModelPricing {
+            input_cost_per_token: -0.000001,
+            output_cost_per_token: -0.000002,
+            ..Default::default()
+        };
+
+        let serialized = serde_json::to_string(&pricing).unwrap();
+        let deserialized: ModelPricing = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(deserialized.input_cost_per_token, -0.000001);
+        assert_eq!(deserialized.output_cost_per_token, -0.000002);
+    }
+
+    #[test]
+    fn test_model_pricing_very_small_values() {
+        let pricing = ModelPricing {
+            input_cost_per_token: 1e-10,
+            output_cost_per_token: 1e-15,
+            ..Default::default()
+        };
+
+        let serialized = serde_json::to_string(&pricing).unwrap();
+        let deserialized: ModelPricing = serde_json::from_str(&serialized).unwrap();
+
+        assert!((deserialized.input_cost_per_token - 1e-10).abs() < 1e-20);
+        assert!((deserialized.output_cost_per_token - 1e-15).abs() < 1e-25);
+    }
+
+    #[test]
+    fn test_model_pricing_large_values() {
+        let pricing = ModelPricing {
+            input_cost_per_token: 1000000.0,
+            output_cost_per_token: 9999999.99,
+            ..Default::default()
+        };
+
+        let serialized = serde_json::to_string(&pricing).unwrap();
+        let deserialized: ModelPricing = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(deserialized.input_cost_per_token, 1000000.0);
+        assert_eq!(deserialized.output_cost_per_token, 9999999.99);
     }
 }
