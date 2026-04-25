@@ -142,14 +142,17 @@ Common Makefile shortcuts (`make help` to list all):
 
 #### Running Tests
 
-Tests follow the Rust Book's [ch11-03 organization](https://doc.rust-lang.org/book/ch11-03-test-organization.html): unit tests live inline in `src/` inside `#[cfg(test)] mod tests`, integration tests live under `tests/integrations/` and share the single `integration_tests` binary.
+Tests follow the Rust Book's [ch11-03 organization](https://doc.rust-lang.org/book/ch11-03-test-organization.html): unit tests live inline in `src/` inside `#[cfg(test)] mod tests`, and each integration test file under `tests/*.rs` builds as its own Cargo test binary.
 
 ```bash
 # Everything (library unit tests + integration tests + doctests)
 cargo test --all
 
-# Integration tests only (end-to-end, no TUI)
-cargo test --test integration_tests
+# Integration tests only (each file under tests/ is a separate test binary)
+cargo test --tests
+
+# A specific integration test crate
+cargo test --test analysis
 
 # Unit tests for a specific src module (path mirrors the module path)
 cargo test --lib analysis::detector
