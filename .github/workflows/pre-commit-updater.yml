@@ -15,9 +15,6 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Disable SSL Verify
-        run: git config --global http.sslVerify false
-
       - name: Checkout
         uses: actions/checkout@v6
         with:
@@ -37,7 +34,7 @@ jobs:
 
       - name: Create Pull Request
         id: create-pr
-        uses: peter-evans/create-pull-request@v8.1.1
+        uses: peter-evans/create-pull-request@v8.1.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           branch: chore/pre-commit-hooks  # push from this branch
@@ -52,4 +49,4 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh pr merge --squash --auto --delete-branch "${{ steps.create-pr.outputs.pull-request-url }}"
+          gh pr merge --squash --delete-branch "${{ steps.create-pr.outputs.pull-request-url }}"
