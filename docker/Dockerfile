@@ -12,6 +12,6 @@ RUN cargo build --release --locked
 
 ########################################################################################
 
-FROM ubuntu:24.04 AS prod
+FROM ubuntu:26.04 AS prod
 COPY --from=builder /app/target/release/vibe_coding_tracker /usr/local/bin/vibe_coding_tracker
 ENTRYPOINT ["vibe_coding_tracker"]
