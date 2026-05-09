@@ -63,15 +63,15 @@ pub enum Commands {
         output: Option<PathBuf>,
 
         /// Output raw JSON instead of table view
-        #[arg(long)]
+        #[arg(long, group = "analysis_format")]
         json: bool,
 
         /// Output as plain text
-        #[arg(long)]
+        #[arg(long, group = "analysis_format")]
         text: bool,
 
         /// Output as static table (instead of interactive TUI)
-        #[arg(long)]
+        #[arg(long, group = "analysis_format")]
         table: bool,
 
         /// Show only today's data
@@ -94,15 +94,15 @@ pub enum Commands {
     /// Display token usage statistics
     Usage {
         /// Output raw JSON instead of table view
-        #[arg(long)]
+        #[arg(long, group = "usage_format")]
         json: bool,
 
         /// Output as plain text
-        #[arg(long)]
+        #[arg(long, group = "usage_format")]
         text: bool,
 
         /// Output as static table
-        #[arg(long)]
+        #[arg(long, group = "usage_format")]
         table: bool,
 
         /// Show only today's data

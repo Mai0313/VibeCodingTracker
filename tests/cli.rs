@@ -285,13 +285,34 @@ fn test_invalid_command() {
 
 #[test]
 fn test_usage_multiple_output_formats() {
-    // Test that multiple output format flags can't be used together
-    // (behavior depends on CLI implementation)
-    let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
-    cmd.arg("usage").arg("--json").arg("--text");
+    // --json/--text/--table belong to a single clap group and must be
+    // mutually exclusive.
+    for combo in [
+        ["--json", "--text"],
+        ["--json", "--table"],
+        ["--text", "--table"],
+    ] {
+        let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
+        cmd.arg("usage").args(combo);
+        cmd.assert()
+            .failure()
+            .stderr(predicate::str::contains("cannot be used with"));
+    }
+}
 
-    // Should handle gracefully
-    let _ = cmd.output();
+#[test]
+fn test_analysis_multiple_output_formats() {
+    for combo in [
+        ["--json", "--text"],
+        ["--json", "--table"],
+        ["--text", "--table"],
+    ] {
+        let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
+        cmd.arg("analysis").args(combo);
+        cmd.assert()
+            .failure()
+            .stderr(predicate::str::contains("cannot be used with"));
+    }
 }
 
 #[test]
