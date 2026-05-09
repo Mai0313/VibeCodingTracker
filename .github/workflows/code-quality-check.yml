@@ -16,9 +16,6 @@ jobs:
   code-quality-check:
     runs-on: ubuntu-latest
     steps:
-      - name: Disable SSL Verify
-        run: git config --global http.sslVerify false
-
       - name: Checkout
         uses: actions/checkout@v6
         with:
