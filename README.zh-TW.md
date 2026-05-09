@@ -239,14 +239,15 @@ vct usage --json --daily
 
 ### Flag 一覽
 
-| Flag                                           | 用途                                                            |
-| ---------------------------------------------- | --------------------------------------------------------------- |
-| *(不帶參數)*                                   | 互動式 TUI 儀表板，涵蓋所有 session                             |
-| `--path <FILE>`                                | 分析單一 JSONL/JSON 對話檔案（stdout 輸出 JSON）                |
-| `--table`                                      | 靜態表格，附帶每日平均值                                        |
-| `--output <FILE>`                              | 將結果以格式化 JSON 存成檔案                                    |
-| `--by-provider`                                | 依 provider（claude / codex / copilot / gemini）分組並輸出 JSON |
-| `--daily` / `--weekly` / `--monthly` / `--all` | 時間範圍篩選（見上方表格）                                      |
+| Flag                                           | 用途                                             |
+| ---------------------------------------------- | ------------------------------------------------ |
+| *(不帶參數)*                                   | 互動式 TUI 儀表板，涵蓋所有 session              |
+| `--path <FILE>`                                | 分析單一 JSONL/JSON 對話檔案（stdout 輸出 JSON） |
+| `--table`                                      | 靜態表格，附帶每日平均值                         |
+| `--text`                                       | 純文字，方便腳本處理                             |
+| `--json`                                       | 將聚合 row 以 JSON 陣列輸出到 stdout             |
+| `--output <FILE>`                              | 將結果以格式化 JSON 存成檔案                     |
+| `--daily` / `--weekly` / `--monthly` / `--all` | 時間範圍篩選（見上方表格）                       |
 
 請參考 [`examples/`](examples/) 目錄，裡面有四種 provider 的範例輸入與對應的 JSON 輸出。
 
@@ -259,22 +260,23 @@ vct analysis
 # Static table output with daily averages
 vct analysis --table
 
+# 純文字輸出，方便腳本處理
+vct analysis --text
+
+# 聚合資料以 JSON 輸出，方便後續處理
+vct analysis --json
+
 # 分析單一對話檔案 → stdout JSON
 vct analysis --path ~/.claude/projects/session.jsonl
 
 # Save results to JSON
 vct analysis --output report.json
 
-# Group results by provider
-vct analysis --by-provider
-
-# Save grouped results
-vct analysis --by-provider --output grouped_report.json
-
 # 時間範圍與輸出格式可自由組合
 vct analysis --weekly
 vct analysis --table --monthly
-vct analysis --by-provider --daily --output today.json
+vct analysis --json --daily
+vct analysis --output today.json --daily
 ```
 
 ### 預覽：互動式儀表板（`vct analysis`）

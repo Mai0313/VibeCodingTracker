@@ -55,19 +55,23 @@ pub enum Commands {
     /// Analyze JSONL conversation files (single file or all sessions)
     Analysis {
         /// Path to the JSONL file to analyze (if not provided, analyzes all sessions)
-        #[arg(short, long)]
+        #[arg(short, long, conflicts_with_all = ["json", "text", "table"])]
         path: Option<PathBuf>,
 
         /// Optional output path to save analysis result as JSON
         #[arg(short, long)]
         output: Option<PathBuf>,
 
-        /// Group results by provider (claude/codex/gemini)
-        #[arg(long)]
-        by_provider: bool,
+        /// Output raw JSON instead of table view
+        #[arg(long, group = "analysis_format")]
+        json: bool,
+
+        /// Output as plain text
+        #[arg(long, group = "analysis_format")]
+        text: bool,
 
         /// Output as static table (instead of interactive TUI)
-        #[arg(long)]
+        #[arg(long, group = "analysis_format")]
         table: bool,
 
         /// Show only today's data
@@ -90,15 +94,15 @@ pub enum Commands {
     /// Display token usage statistics
     Usage {
         /// Output raw JSON instead of table view
-        #[arg(long)]
+        #[arg(long, group = "usage_format")]
         json: bool,
 
         /// Output as plain text
-        #[arg(long)]
+        #[arg(long, group = "usage_format")]
         text: bool,
 
         /// Output as static table
-        #[arg(long)]
+        #[arg(long, group = "usage_format")]
         table: bool,
 
         /// Show only today's data

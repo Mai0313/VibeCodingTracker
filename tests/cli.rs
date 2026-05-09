@@ -130,37 +130,68 @@ fn test_analysis_batch_mode_with_output() {
 }
 
 #[test]
-fn test_analysis_all_providers() {
-    let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
-    cmd.arg("analysis").arg("--by-provider");
-
-    cmd.assert().success().stdout(
-        predicate::str::contains("Claude-Code")
-            .or(predicate::str::contains("Codex"))
-            .or(predicate::str::contains("Copilot-CLI"))
-            .or(predicate::str::contains("Gemini"))
-            .or(predicate::str::contains("{}")),
-    ); // Empty result is also valid
-}
-
-#[test]
-fn test_analysis_all_providers_with_output() {
-    let temp_dir = TempDir::new().unwrap();
-    let output_file = temp_dir.path().join("providers_output.json");
+fn test_analysis_command_json() {
+    use std::time::Duration;
 
     let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
     cmd.arg("analysis")
-        .arg("--by-provider")
-        .arg("--output")
-        .arg(output_file.to_str().unwrap());
+        .arg("--json")
+        .timeout(Duration::from_secs(10));
 
-    cmd.assert().success();
+    let output = cmd.output().expect("failed to spawn vct binary");
 
-    if output_file.exists() {
-        let content = std::fs::read_to_string(&output_file).unwrap();
-        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert!(json.is_object(), "Provider output should be JSON object");
+    // Allow timeout (env-dependent on session-directory size) but not other
+    // failures — a non-zero exit means a regression in the --json path.
+    if output.status.code().is_none() {
+        return;
     }
+    assert!(
+        output.status.success(),
+        "vct analysis --json failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("--json output should be valid JSON");
+    assert!(
+        json.is_array(),
+        "--json output should be a JSON array of aggregated rows"
+    );
+}
+
+#[test]
+fn test_analysis_command_text() {
+    use std::time::Duration;
+
+    let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
+    cmd.arg("analysis")
+        .arg("--text")
+        .timeout(Duration::from_secs(10));
+
+    let output = cmd.output().expect("failed to spawn vct binary");
+    assert!(
+        output.status.success() || output.status.code().is_none(),
+        "vct analysis --text failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_analysis_command_table() {
+    use std::time::Duration;
+
+    let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
+    cmd.arg("analysis")
+        .arg("--table")
+        .timeout(Duration::from_secs(10));
+
+    let output = cmd.output().expect("failed to spawn vct binary");
+    assert!(
+        output.status.success() || output.status.code().is_none(),
+        "vct analysis --table failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -168,16 +199,17 @@ fn test_usage_command_json() {
     let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
     cmd.arg("usage").arg("--json");
 
-    // Should succeed and output valid JSON
-    let output = cmd.output().unwrap();
+    let output = cmd.output().expect("failed to spawn vct binary");
+    assert!(
+        output.status.success(),
+        "vct usage --json failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if !stdout.trim().is_empty() {
-            let json: Result<serde_json::Value, _> = serde_json::from_str(&stdout);
-            assert!(json.is_ok(), "Output should be valid JSON");
-        }
-    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("--json output should be valid JSON");
+    assert!(json.is_array(), "--json output should be a JSON array");
 }
 
 #[test]
@@ -252,28 +284,35 @@ fn test_invalid_command() {
 }
 
 #[test]
-fn test_analysis_conflicting_flags() {
-    // Test that --path and --by-provider are mutually exclusive
-    let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
-    cmd.arg("analysis")
-        .arg("--path")
-        .arg("test.jsonl")
-        .arg("--by-provider");
-
-    // Should either succeed (if validation is lax) or fail
-    // The behavior depends on CLI implementation
-    let _ = cmd.output();
+fn test_usage_multiple_output_formats() {
+    // --json/--text/--table belong to a single clap group and must be
+    // mutually exclusive.
+    for combo in [
+        ["--json", "--text"],
+        ["--json", "--table"],
+        ["--text", "--table"],
+    ] {
+        let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
+        cmd.arg("usage").args(combo);
+        cmd.assert()
+            .failure()
+            .stderr(predicate::str::contains("cannot be used with"));
+    }
 }
 
 #[test]
-fn test_usage_multiple_output_formats() {
-    // Test that multiple output format flags can't be used together
-    // (behavior depends on CLI implementation)
-    let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
-    cmd.arg("usage").arg("--json").arg("--text");
-
-    // Should handle gracefully
-    let _ = cmd.output();
+fn test_analysis_multiple_output_formats() {
+    for combo in [
+        ["--json", "--text"],
+        ["--json", "--table"],
+        ["--text", "--table"],
+    ] {
+        let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
+        cmd.arg("analysis").args(combo);
+        cmd.assert()
+            .failure()
+            .stderr(predicate::str::contains("cannot be used with"));
+    }
 }
 
 #[test]
