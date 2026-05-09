@@ -15,33 +15,38 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Disable SSL Verify
-        run: git config --global http.sslVerify false
-
       - name: Checkout
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Generate a tag
-        id: git-cliff-tag
-        uses: orhun/git-cliff-action@v4
-        with:
-          config: ./.github/cliff.toml
-          args: --bumped-version
-
-      - name: Generate a changelog
-        id: git-cliff-changelog
-        uses: orhun/git-cliff-action@v4
+      - name: Generate changelog
+        id: git-cliff
+        uses: orhun/git-cliff-action@v4.8.0
         with:
           config: ./.github/cliff.toml
           args: --bump --unreleased
 
-      - name: Upload Release Assets
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ steps.git-cliff-tag.outputs.content }}
-          name: ${{ steps.git-cliff-tag.outputs.content }} 🌈
-          body: ${{ steps.git-cliff-changelog.outputs.content }}
-          draft: true
+      - name: Upsert draft release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.git-cliff.outputs.version }}
+          NOTES_FILE: ${{ steps.git-cliff.outputs.changelog }}
+        run: |
+          set -euo pipefail
+
+          # Remove stale drafts whose tag no longer matches the bumped version,
+          # otherwise every minor/major bump leaves an orphan draft behind.
+          while IFS= read -r tag; do
+            if [[ -n "$tag" && "$tag" != "$VERSION" ]]; then
+              echo "Removing stale draft: $tag"
+              gh release delete "$tag" --yes
+            fi
+          done < <(gh release list --limit 100 --json tagName,isDraft --jq '.[] | select(.isDraft) | .tagName')
+
+          if [[ "$(gh release view "$VERSION" --json isDraft --jq '.isDraft' 2>/dev/null || true)" == "true" ]]; then
+            gh release edit "$VERSION" --draft=true --notes-file "$NOTES_FILE"
+          else
+            gh release create "$VERSION" --draft --title "$VERSION" --notes-file "$NOTES_FILE"
+          fi
