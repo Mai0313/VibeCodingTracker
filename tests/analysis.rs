@@ -4,9 +4,7 @@
 
 use std::path::PathBuf;
 use tempfile::TempDir;
-use vibe_coding_tracker::analysis::aggregator::{
-    aggregate_sessions_by_model, collect_sessions_grouped_by_provider,
-};
+use vibe_coding_tracker::analysis::aggregator::aggregate_sessions_by_model;
 use vibe_coding_tracker::cli::TimeRange;
 use vibe_coding_tracker::models::ExtensionType;
 use vibe_coding_tracker::session::parser::{parse_session_file, parse_session_file_as};
@@ -302,31 +300,6 @@ fn test_batch_analysis_serialization() {
     let deserialized: AggregatedAnalysisRow = serde_json::from_str(&json).unwrap();
     assert_eq!(deserialized.model, row.model);
     assert_eq!(deserialized.edit_lines, row.edit_lines);
-}
-
-#[test]
-fn test_batch_analysis_by_provider() {
-    // Test provider-grouped analysis
-    let result = collect_sessions_grouped_by_provider(TimeRange::All);
-    assert!(result.is_ok(), "Provider-grouped analysis should not fail");
-
-    if let Ok(grouped) = result {
-        // Verify structure - check if any provider has data
-        let has_data = !grouped.claude.is_empty()
-            || !grouped.codex.is_empty()
-            || !grouped.copilot.is_empty()
-            || !grouped.gemini.is_empty();
-
-        // At least one provider should have data or all should be empty (valid states)
-        assert!(
-            has_data
-                || (grouped.claude.is_empty()
-                    && grouped.codex.is_empty()
-                    && grouped.copilot.is_empty()
-                    && grouped.gemini.is_empty()),
-            "Provider grouping should be valid"
-        );
-    }
 }
 
 #[test]

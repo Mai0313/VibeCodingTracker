@@ -62,9 +62,13 @@ pub enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
 
-        /// Group results by provider (claude/codex/gemini)
+        /// Output raw JSON instead of table view
         #[arg(long)]
-        by_provider: bool,
+        json: bool,
+
+        /// Output as plain text
+        #[arg(long)]
+        text: bool,
 
         /// Output as static table (instead of interactive TUI)
         #[arg(long)]

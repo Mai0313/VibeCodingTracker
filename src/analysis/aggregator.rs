@@ -1,4 +1,3 @@
-use crate::cache::global_cache;
 use crate::cli::TimeRange;
 use crate::constants::{FastHashMap, capacity};
 use crate::models::{CodeAnalysis, ExtensionType, ProviderActiveDays};
@@ -13,7 +12,6 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Arc;
 
 /// Single row of aggregated metrics grouped by model
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,8 +58,7 @@ pub struct PerProviderAnalysisRows {
 ///
 /// Scans Claude, Codex, Copilot, and Gemini session directories, aggregates
 /// tool-call counts and line counts by model, and returns sorted results
-/// with provider active-day counts. Complements [`collect_sessions_grouped_by_provider`]
-/// which preserves full records instead of aggregating.
+/// with provider active-day counts.
 pub fn aggregate_sessions_by_model(time_range: TimeRange) -> Result<AnalysisData> {
     let paths = crate::utils::resolve_paths()?;
     let mut aggregated: FastHashMap<String, AggregatedAnalysisRow> =
@@ -172,138 +169,6 @@ fn into_sorted_rows(map: FastHashMap<String, AggregatedAnalysisRow>) -> Vec<Aggr
     let mut v: Vec<AggregatedAnalysisRow> = map.into_values().collect();
     v.sort_unstable_by(|a, b| a.model.cmp(&b.model));
     v
-}
-
-/// Complete CodeAnalysis results organized by AI provider.
-///
-/// Each record is stored as an `Arc<CodeAnalysis>` — the same typed struct
-/// held by the global file cache — so no deep-clone happens to ferry results
-/// out of the worker pool, and no intermediate `Value` is materialised.
-/// serde's `rc` feature lets `Arc<CodeAnalysis>` serialise as the underlying
-/// struct, so the emitted JSON is unchanged. The struct is output-only, which
-/// is why it does not derive `Deserialize`.
-#[derive(Debug, Clone, Serialize)]
-pub struct ProviderGroupedAnalysis {
-    #[serde(rename = "Claude-Code")]
-    pub claude: Vec<Arc<CodeAnalysis>>,
-    #[serde(rename = "Codex")]
-    pub codex: Vec<Arc<CodeAnalysis>>,
-    #[serde(rename = "Copilot-CLI")]
-    pub copilot: Vec<Arc<CodeAnalysis>>,
-    #[serde(rename = "Gemini")]
-    pub gemini: Vec<Arc<CodeAnalysis>>,
-}
-
-/// Collect every parsed session grouped by provider, without aggregating.
-///
-/// Returns each provider's full `CodeAnalysis` records as emitted by the
-/// session parser (via the global file cache). Use
-/// [`aggregate_sessions_by_model`] when you only need per-model metrics
-/// rather than the per-session detail.
-pub fn collect_sessions_grouped_by_provider(
-    time_range: TimeRange,
-) -> Result<ProviderGroupedAnalysis> {
-    let paths = crate::utils::resolve_paths()?;
-
-    let mut claude_results: Vec<Arc<CodeAnalysis>> = Vec::new();
-    let mut codex_results: Vec<Arc<CodeAnalysis>> = Vec::new();
-    let mut copilot_results: Vec<Arc<CodeAnalysis>> = Vec::new();
-    let mut gemini_results: Vec<Arc<CodeAnalysis>> = Vec::new();
-
-    // Process Claude sessions (including subagents/ sublogs)
-    if paths.claude_session_dir.exists() {
-        collect_sessions_in_directory(
-            &paths.claude_session_dir,
-            ExtensionType::ClaudeCode,
-            &mut claude_results,
-            is_claude_session_file,
-            time_range,
-            None,
-        )?;
-    }
-
-    // Process Codex sessions
-    if paths.codex_session_dir.exists() {
-        collect_sessions_in_directory(
-            &paths.codex_session_dir,
-            ExtensionType::Codex,
-            &mut codex_results,
-            is_codex_session_file,
-            time_range,
-            None,
-        )?;
-    }
-
-    // Process Copilot sessions — bounded walk so sibling snapshot trees
-    // (`rewind-snapshots/`, `files/`, …) do not slow the scan down.
-    if paths.copilot_session_dir.exists() {
-        collect_sessions_in_directory(
-            &paths.copilot_session_dir,
-            ExtensionType::Copilot,
-            &mut copilot_results,
-            is_copilot_session_file,
-            time_range,
-            Some(COPILOT_SESSION_MAX_DEPTH),
-        )?;
-    }
-
-    // Process Gemini sessions
-    if paths.gemini_session_dir.exists() {
-        collect_sessions_in_directory(
-            &paths.gemini_session_dir,
-            ExtensionType::Gemini,
-            &mut gemini_results,
-            is_gemini_session_file,
-            time_range,
-            None,
-        )?;
-    }
-
-    Ok(ProviderGroupedAnalysis {
-        claude: claude_results,
-        codex: codex_results,
-        copilot: copilot_results,
-        gemini: gemini_results,
-    })
-}
-
-fn collect_sessions_in_directory<P, F>(
-    dir: P,
-    provider: ExtensionType,
-    results: &mut Vec<Arc<CodeAnalysis>>,
-    filter_fn: F,
-    time_range: TimeRange,
-    max_depth: Option<usize>,
-) -> Result<()>
-where
-    P: AsRef<Path>,
-    F: Copy + Fn(&Path) -> bool + Sync + Send,
-{
-    let dir = dir.as_ref();
-    let files = collect_files_with_max_depth(dir, filter_fn, time_range, max_depth)?;
-
-    // Parallel parse through the global cache. The provider is fixed by the
-    // source directory, so the cache dispatches to the right parser without
-    // re-inspecting the file's contents.
-    let analyzed: Vec<Arc<CodeAnalysis>> = files
-        .par_iter()
-        .filter_map(
-            |file_info| match global_cache().get_or_parse_as(&file_info.path, provider) {
-                Ok(analysis_arc) => Some(analysis_arc),
-                Err(e) => {
-                    eprintln!(
-                        "Warning: Failed to parse {}: {}",
-                        file_info.path.display(),
-                        e
-                    );
-                    None
-                }
-            },
-        )
-        .collect();
-
-    results.extend(analyzed);
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)] // per-provider helper; struct-wrapping the args would hurt readability

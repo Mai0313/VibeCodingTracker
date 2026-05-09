@@ -38,7 +38,8 @@ fn main() -> Result<()> {
         Commands::Analysis {
             path,
             output,
-            by_provider,
+            json,
+            text,
             table,
             daily,
             weekly,
@@ -47,56 +48,42 @@ fn main() -> Result<()> {
         } => {
             let time_range = resolve_time_range(daily, weekly, monthly);
 
-            if by_provider {
-                // Handle --by-provider flag: group by provider and output as JSON
-                let grouped_data =
-                    vibe_coding_tracker::analysis::collect_sessions_grouped_by_provider(
-                        time_range,
-                    )?;
+            match path {
+                Some(file_path) => {
+                    let result = parse_session_file(&file_path)?;
 
-                if let Some(output_path) = output {
-                    let json_value = serde_json::to_value(&grouped_data)?;
-                    vibe_coding_tracker::utils::save_json_pretty(&output_path, &json_value)?;
-                    println!("✅ Analysis result saved to: {}", output_path.display());
-                } else {
-                    // Output as JSON by default
-                    let json_str = serde_json::to_string_pretty(&grouped_data)?;
-                    println!("{}", json_str);
-                }
-            } else {
-                match path {
-                    Some(file_path) => {
-                        let result = parse_session_file(&file_path)?;
-
-                        if let Some(output_path) = output {
-                            vibe_coding_tracker::utils::save_json_pretty(&output_path, &result)?;
-                            println!("✅ Analysis result saved to: {}", output_path.display());
-                        } else {
-                            let json_str = serde_json::to_string_pretty(&result)?;
-                            println!("{}", json_str);
-                        }
+                    if let Some(output_path) = output {
+                        vibe_coding_tracker::utils::save_json_pretty(&output_path, &result)?;
+                        println!("✅ Analysis result saved to: {}", output_path.display());
+                    } else {
+                        let json_str = serde_json::to_string_pretty(&result)?;
+                        println!("{}", json_str);
                     }
-                    None => {
-                        let analysis_data =
-                            vibe_coding_tracker::analysis::aggregate_sessions_by_model(time_range)?;
+                }
+                None => {
+                    let analysis_data =
+                        vibe_coding_tracker::analysis::aggregate_sessions_by_model(time_range)?;
 
-                        if let Some(output_path) = output {
-                            let json_value = serde_json::to_value(&analysis_data.rows)?;
-                            vibe_coding_tracker::utils::save_json_pretty(
-                                &output_path,
-                                &json_value,
-                            )?;
-                            println!("✅ Analysis result saved to: {}", output_path.display());
-                        } else if table {
-                            vibe_coding_tracker::display::analysis::display_analysis_table(
-                                &analysis_data,
-                            );
-                        } else {
-                            vibe_coding_tracker::display::analysis::display_analysis_interactive(
-                                &analysis_data,
-                                time_range,
-                            )?;
-                        }
+                    if let Some(output_path) = output {
+                        let json_value = serde_json::to_value(&analysis_data.rows)?;
+                        vibe_coding_tracker::utils::save_json_pretty(&output_path, &json_value)?;
+                        println!("✅ Analysis result saved to: {}", output_path.display());
+                    } else if json {
+                        let json_str = serde_json::to_string_pretty(&analysis_data.rows)?;
+                        println!("{}", json_str);
+                    } else if text {
+                        vibe_coding_tracker::display::analysis::display_analysis_text(
+                            &analysis_data,
+                        );
+                    } else if table {
+                        vibe_coding_tracker::display::analysis::display_analysis_table(
+                            &analysis_data,
+                        );
+                    } else {
+                        vibe_coding_tracker::display::analysis::display_analysis_interactive(
+                            &analysis_data,
+                            time_range,
+                        )?;
                     }
                 }
             }

@@ -239,14 +239,15 @@ The tool automatically scans these directories:
 
 ### Flags
 
-| Flag                                           | Purpose                                                            |
-| ---------------------------------------------- | ------------------------------------------------------------------ |
-| *(none)*                                       | Interactive TUI dashboard over all sessions                        |
-| `--path <FILE>`                                | Analyze a single JSONL/JSON conversation file (prints JSON)        |
-| `--table`                                      | Static table with per-provider daily averages                      |
-| `--output <FILE>`                              | Save results as pretty-printed JSON                                |
-| `--by-provider`                                | Group rows by provider (claude / codex / copilot / gemini) as JSON |
-| `--daily` / `--weekly` / `--monthly` / `--all` | Time range filter (see table above)                                |
+| Flag                                           | Purpose                                                     |
+| ---------------------------------------------- | ----------------------------------------------------------- |
+| *(none)*                                       | Interactive TUI dashboard over all sessions                 |
+| `--path <FILE>`                                | Analyze a single JSONL/JSON conversation file (prints JSON) |
+| `--table`                                      | Static table with per-provider daily averages               |
+| `--text`                                       | Plain text, script-friendly                                 |
+| `--json`                                       | JSON array of aggregated rows printed to stdout             |
+| `--output <FILE>`                              | Save results as pretty-printed JSON                         |
+| `--daily` / `--weekly` / `--monthly` / `--all` | Time range filter (see table above)                         |
 
 See [`examples/`](examples/) for sample inputs and matching JSON outputs for all four providers.
 
@@ -259,22 +260,23 @@ vct analysis
 # Static table output with daily averages
 vct analysis --table
 
+# Plain text for scripts
+vct analysis --text
+
+# JSON of aggregated rows for data processing
+vct analysis --json
+
 # Analyze a single conversation file → stdout JSON
 vct analysis --path ~/.claude/projects/session.jsonl
 
 # Save results to JSON
 vct analysis --output report.json
 
-# Group results by provider
-vct analysis --by-provider
-
-# Save grouped results
-vct analysis --by-provider --output grouped_report.json
-
 # Combine time range with output format
 vct analysis --weekly
 vct analysis --table --monthly
-vct analysis --by-provider --daily --output today.json
+vct analysis --json --daily
+vct analysis --output today.json --daily
 ```
 
 ### Preview: Interactive Dashboard (`vct analysis`)
