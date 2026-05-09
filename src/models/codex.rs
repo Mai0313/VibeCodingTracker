@@ -50,10 +50,23 @@ pub struct CodexGitInfo {
     pub repository_url: Option<String>,
 }
 
-/// Shell command arguments structure
+/// Shell command arguments structure (legacy `name == "shell"` function call).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodexShellArguments {
     pub command: Vec<String>,
+}
+
+/// Arguments for the current `name == "exec_command"` function call.
+///
+/// Codex CLI replaced the legacy `shell` function (whose arguments were a
+/// `["bash", "-lc", "<script>"]` array) with a flat `{cmd, workdir, ...}`
+/// object. The analyzer normalises both into the same `CodexShellCall`
+/// downstream so the patch / sed / cat detection can stay shared.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexExecCommandArguments {
+    pub cmd: String,
+    #[serde(default)]
+    pub workdir: String,
 }
 
 /// Shell command execution result including output and metadata

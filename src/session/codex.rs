@@ -61,23 +61,13 @@ pub fn parse_codex_logs(logs: &[CodexLog], mode: ParseMode) -> Result<CodeAnalys
                 if let Some(payload_type) = &entry.payload.payload_type {
                     match payload_type.as_str() {
                         "function_call" => {
-                            if let Some(name) = &entry.payload.name
-                                && name == "shell"
-                                && let Some(args_str) = &entry.payload.arguments
-                                && let Ok(args) =
-                                    serde_json::from_str::<CodexShellArguments>(args_str)
+                            if let (Some(name), Some(args_str), Some(call_id)) = (
+                                entry.payload.name.as_deref(),
+                                entry.payload.arguments.as_deref(),
+                                entry.payload.call_id.as_deref(),
+                            ) && let Some(call) = parse_function_call(name, args_str, ts)
                             {
-                                let script = args.command.last().cloned().unwrap_or_default();
-                                if let Some(call_id) = &entry.payload.call_id {
-                                    shell_calls.insert(
-                                        call_id.clone(),
-                                        CodexShellCall {
-                                            timestamp: ts,
-                                            script: script.clone(),
-                                            full_command: args.command,
-                                        },
-                                    );
-                                }
+                                shell_calls.insert(call_id.to_string(), call);
                             }
                         }
                         "function_call_output" => {
@@ -120,6 +110,38 @@ pub fn parse_codex_logs(logs: &[CodexLog], mode: ParseMode) -> Result<CodeAnalys
         machine_id: String::new(),
         records: vec![record],
     })
+}
+
+/// Build a `CodexShellCall` from either the legacy `shell` function or the
+/// current `exec_command` function.
+///
+/// Returns `None` when the function name is unrelated (e.g. `update_plan`,
+/// MCP tool calls) or when the arguments fail to deserialize. Both shapes
+/// collapse to the same downstream representation so the patch / sed / cat
+/// dispatch in `handle_shell_call` does not need to branch on the source
+/// function name.
+fn parse_function_call(name: &str, args_str: &str, ts: i64) -> Option<CodexShellCall> {
+    match name {
+        "shell" => {
+            let args = serde_json::from_str::<CodexShellArguments>(args_str).ok()?;
+            let script = args.command.last().cloned().unwrap_or_default();
+            Some(CodexShellCall {
+                timestamp: ts,
+                script,
+                full_command: args.command,
+            })
+        }
+        "exec_command" => {
+            let args = serde_json::from_str::<CodexExecCommandArguments>(args_str).ok()?;
+            let cmd = args.cmd;
+            Some(CodexShellCall {
+                timestamp: ts,
+                script: cmd.clone(),
+                full_command: vec![cmd],
+            })
+        }
+        _ => None,
+    }
 }
 
 // Codex-specific extension methods for SessionParseState
@@ -356,4 +378,46 @@ fn extract_cat_read(script: &str, output: &str) -> Option<(String, String)> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_shell_function_parses_into_call() {
+        // Old schema: arguments = {"command": ["bash", "-lc", "<script>"]}
+        let args = r#"{"command":["bash","-lc","ls -la"]}"#;
+        let call = parse_function_call("shell", args, 42).expect("shell call should parse");
+        assert_eq!(call.timestamp, 42);
+        assert_eq!(call.script, "ls -la");
+        assert_eq!(call.full_command, vec!["bash", "-lc", "ls -la"]);
+    }
+
+    #[test]
+    fn current_exec_command_function_parses_into_call() {
+        // Current schema: arguments = {"cmd":"...","workdir":"...","yield_time_ms":...}
+        let args =
+            r#"{"cmd":"sed -n '1,260p' src/main.rs","workdir":"/repo","yield_time_ms":1000}"#;
+        let call =
+            parse_function_call("exec_command", args, 99).expect("exec_command should parse");
+        assert_eq!(call.timestamp, 99);
+        assert_eq!(call.script, "sed -n '1,260p' src/main.rs");
+        // `full_command` collapses to the single cmd string so
+        // `record_run_command`'s `join(" ")` produces the verbatim command.
+        assert_eq!(call.full_command, vec!["sed -n '1,260p' src/main.rs"]);
+    }
+
+    #[test]
+    fn unrelated_function_names_are_ignored() {
+        // MCP tool calls, `update_plan`, etc. must not be treated as shell.
+        assert!(parse_function_call("update_plan", "{}", 0).is_none());
+        assert!(parse_function_call("_fetch_pr", "{}", 0).is_none());
+    }
+
+    #[test]
+    fn malformed_arguments_yield_none_instead_of_panicking() {
+        assert!(parse_function_call("shell", "not json", 0).is_none());
+        assert!(parse_function_call("exec_command", "not json", 0).is_none());
+    }
 }
