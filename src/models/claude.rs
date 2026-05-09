@@ -22,6 +22,15 @@ pub struct ClaudeCodeLog {
     pub message: Option<ClaudeMessage>,
     #[serde(default, deserialize_with = "deserialize_tool_use_result")]
     pub tool_use_result: Option<ClaudeToolUseResult>,
+    /// `true` for records inside a subagent JSONL
+    /// (`<session>/subagents/agent-*.jsonl`). Subagent records do not carry
+    /// the top-level `toolUseResult` field, so the analyzer falls back to
+    /// scanning `message.content[].tool_result` for them. Main-session
+    /// records (`isSidechain == false` or missing) skip the fallback to
+    /// avoid double-counting tool results that already arrived via
+    /// `toolUseResult`.
+    #[serde(default)]
+    pub is_sidechain: bool,
 }
 
 /// Assistant/user message with only the fields `session::claude::parse_claude_logs` inspects.
@@ -40,32 +49,80 @@ pub struct ClaudeMessage {
     pub content: Vec<ClaudeContentItem>,
 }
 
-/// One element of a message's `content` array. Non-`tool_use` items collapse
-/// to `Other` so their payload (text blocks, tool_result bodies, thinking
-/// traces) is discarded at parse time.
+/// One element of a message's `content` array.
+///
+/// `ToolUse` carries the assistant-side invocation. `ToolResult` carries the
+/// matching result block from the *user*-role record — used as a fallback
+/// when the legacy top-level `toolUseResult` field is absent (Claude Code
+/// subagent JSONL files under `<session>/subagents/agent-*.jsonl` only
+/// embed results inside `message.content[].tool_result` blocks). Anything
+/// else (text, thinking traces, images, …) collapses to `Other` and is
+/// discarded at parse time.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClaudeContentItem {
     ToolUse {
         #[serde(default)]
+        id: String,
+        #[serde(default)]
         name: String,
         #[serde(default)]
-        input: Option<ClaudeBashInput>,
+        input: Option<ClaudeToolInput>,
+    },
+    ToolResult {
+        #[serde(default)]
+        tool_use_id: String,
+        #[serde(default, deserialize_with = "deserialize_tool_result_content")]
+        content: String,
     },
     #[serde(other)]
     Other,
 }
 
-/// Bash tool input. Other tools share the same `input` slot but with
-/// different shapes — serde silently ignores unknown fields, so non-Bash
-/// inputs deserialize into an all-`None` value that the analyzer treats as
-/// "no command to record".
+/// Tool input across all tools we care about. Each tool only populates a
+/// subset of fields; serde silently ignores unknown fields and unset fields
+/// stay `None`. Unrelated tools (Glob, Grep, WebSearch, …) deserialize into
+/// an all-`None` value that the analyzer treats as a no-op.
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct ClaudeBashInput {
+pub struct ClaudeToolInput {
+    // Bash
     #[serde(default)]
     pub command: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+    // Read / Write / Edit share `file_path`
+    #[serde(default)]
+    pub file_path: Option<String>,
+    // Write
+    #[serde(default)]
+    pub content: Option<String>,
+    // Edit
+    #[serde(default)]
+    pub old_string: Option<String>,
+    #[serde(default)]
+    pub new_string: Option<String>,
+}
+
+/// Tool-result `content` can be either a plain string or an array of typed
+/// blocks (e.g. `[{"type":"text","text":"..."}]`). Both shapes flatten to a
+/// single `String` for the analyzer's line-counting helpers.
+fn deserialize_tool_result_content<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::String(s) => Ok(s),
+        Value::Array(arr) => {
+            let texts: Vec<&str> = arr
+                .iter()
+                .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+                .collect();
+            Ok(texts.join("\n"))
+        }
+        Value::Null => Ok(String::new()),
+        _ => Ok(value.to_string()),
+    }
 }
 
 /// Object form of `toolUseResult`. String-shaped values (user-rejection error
