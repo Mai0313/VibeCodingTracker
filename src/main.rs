@@ -54,7 +54,7 @@ fn main() -> Result<()> {
 
                     if let Some(output_path) = output {
                         vibe_coding_tracker::utils::save_json_pretty(&output_path, &result)?;
-                        println!("✅ Analysis result saved to: {}", output_path.display());
+                        println!("Analysis result saved to: {}", output_path.display());
                     } else {
                         let json_str = serde_json::to_string_pretty(&result)?;
                         println!("{}", json_str);
@@ -67,7 +67,7 @@ fn main() -> Result<()> {
                     if let Some(output_path) = output {
                         let json_value = serde_json::to_value(&analysis_data.rows)?;
                         vibe_coding_tracker::utils::save_json_pretty(&output_path, &json_value)?;
-                        println!("✅ Analysis result saved to: {}", output_path.display());
+                        println!("Analysis result saved to: {}", output_path.display());
                     } else if json {
                         let json_str = serde_json::to_string_pretty(&analysis_data.rows)?;
                         println!("{}", json_str);
@@ -142,7 +142,7 @@ fn main() -> Result<()> {
                 println!("Rust Version: {}", version_info.rust_version);
                 println!("Cargo Version: {}", version_info.cargo_version);
             } else {
-                println!("{}", "🚀 Vibe Coding Tracker".bright_cyan().bold());
+                println!("{}", "Vibe Coding Tracker".bright_cyan().bold());
                 println!();
 
                 let mut table = Table::new();

@@ -1,69 +1,21 @@
-use crate::models::{Provider, ProviderActiveDays};
+use crate::models::Provider;
 
-/// Trait for data rows that provide model information for provider grouping
-pub trait DailyAverageRow {
-    fn model(&self) -> &str;
-}
-
-/// Trait for provider-specific statistics that can accumulate metrics
-pub trait ProviderStatistics<Row: DailyAverageRow>: Default {
-    /// Accumulates metrics from a row into provider statistics
-    fn accumulate(&mut self, row: &Row, provider: Provider);
-
-    /// Sets the number of active days for this provider
-    fn set_days(&mut self, days: usize);
-}
-
-/// Calculates daily averages grouped by AI provider
+/// Per-provider totals organized by AI provider.
 ///
-/// Generic implementation used by both usage and analysis commands to avoid code duplication.
-/// Groups rows by provider, uses externally-provided day counts, and accumulates metrics.
-pub fn calculate_daily_averages<R, S>(
-    rows: &[R],
-    provider_days: &ProviderActiveDays,
-) -> DailyAverages<R, S>
-where
-    R: DailyAverageRow,
-    S: ProviderStatistics<R>,
-{
-    let mut averages: DailyAverages<R, S> = DailyAverages::default();
-
-    averages.claude.set_days(provider_days.claude);
-    averages.codex.set_days(provider_days.codex);
-    averages.copilot.set_days(provider_days.copilot);
-    averages.gemini.set_days(provider_days.gemini);
-    averages.overall.set_days(provider_days.total);
-
-    // Accumulate totals
-    for row in rows {
-        let provider = Provider::from_model_name(row.model());
-
-        match provider {
-            Provider::ClaudeCode => averages.claude.accumulate(row, provider),
-            Provider::Codex => averages.codex.accumulate(row, provider),
-            Provider::Copilot => averages.copilot.accumulate(row, provider),
-            Provider::Gemini => averages.gemini.accumulate(row, provider),
-            Provider::Unknown => {}
-        }
-
-        // Always accumulate to overall
-        averages.overall.accumulate(row, Provider::Unknown);
-    }
-
-    averages
-}
-
-/// Daily averages organized by provider with generic statistics type
-pub struct DailyAverages<R: DailyAverageRow, S: ProviderStatistics<R>> {
+/// Replaces the previous `DailyAverages<R, S>` generic — the display layer
+/// no longer renders per-day rates, so this just keeps each provider's
+/// running totals alongside an `overall` "All Providers" bucket. The `S`
+/// parameter is the per-provider stats type each command supplies (e.g.
+/// `ProviderStats` for usage, `AnalysisProviderStats` for analysis).
+pub struct ProviderTotals<S> {
     pub claude: S,
     pub codex: S,
     pub copilot: S,
     pub gemini: S,
     pub overall: S,
-    _phantom: std::marker::PhantomData<R>,
 }
 
-impl<R: DailyAverageRow, S: ProviderStatistics<R>> Default for DailyAverages<R, S> {
+impl<S: Default> Default for ProviderTotals<S> {
     fn default() -> Self {
         Self {
             claude: S::default(),
@@ -71,13 +23,11 @@ impl<R: DailyAverageRow, S: ProviderStatistics<R>> Default for DailyAverages<R, 
             copilot: S::default(),
             gemini: S::default(),
             overall: S::default(),
-            _phantom: std::marker::PhantomData,
         }
     }
 }
 
-impl<R: DailyAverageRow, S: ProviderStatistics<R>> DailyAverages<R, S> {
-    /// Get stats for a specific provider
+impl<S> ProviderTotals<S> {
     pub fn get_stats(&self, provider: Provider) -> &S {
         match provider {
             Provider::ClaudeCode => &self.claude,
@@ -88,7 +38,6 @@ impl<R: DailyAverageRow, S: ProviderStatistics<R>> DailyAverages<R, S> {
         }
     }
 
-    /// Get mutable stats for a specific provider
     pub fn get_stats_mut(&mut self, provider: Provider) -> &mut S {
         match provider {
             Provider::ClaudeCode => &mut self.claude,

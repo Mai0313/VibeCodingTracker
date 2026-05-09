@@ -8,11 +8,11 @@ use ratatui::{
 use sysinfo::System;
 
 /// Create a title paragraph for the TUI
-pub fn create_title<'a>(title_text: &'a str, icon: &'a str, color: RatatuiColor) -> Paragraph<'a> {
-    Paragraph::new(vec![Line::from(vec![
-        Span::styled(format!("{} ", icon), Style::default().fg(color)),
-        Span::styled(title_text, Style::default().fg(color).bold()),
-    ])])
+pub fn create_title(title_text: &str, color: RatatuiColor) -> Paragraph<'_> {
+    Paragraph::new(vec![Line::from(vec![Span::styled(
+        title_text,
+        Style::default().fg(color).bold(),
+    )])])
     .block(
         Block::default()
             .borders(Borders::ALL)
@@ -48,7 +48,7 @@ pub fn create_summary<'a>(
 
     spans.push(Span::raw("  |  "));
     spans.push(Span::styled(
-        "🧠 Memory: ",
+        "Memory: ",
         Style::default().fg(RatatuiColor::LightRed).bold(),
     ));
     spans.push(Span::styled(
@@ -86,7 +86,6 @@ pub fn create_controls() -> Paragraph<'static> {
 /// Create a star hint paragraph for the TUI
 pub fn create_star_hint() -> Paragraph<'static> {
     Paragraph::new(vec![Line::from(vec![
-        Span::styled("⭐ ", Style::default().fg(RatatuiColor::Yellow)),
         Span::styled(
             "If you like this tool, please star us on GitHub: ",
             Style::default().fg(RatatuiColor::Gray),

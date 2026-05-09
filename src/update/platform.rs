@@ -93,7 +93,7 @@ del "%~f0"
         .context("Failed to write batch script")?;
 
     println!();
-    println!("📝 To complete the update on Windows:");
+    println!("To complete the update on Windows:");
     println!("   1. Close this application");
     println!("   2. Run: {}", batch_path.display());
 

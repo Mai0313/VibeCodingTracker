@@ -49,7 +49,7 @@ fn get_version_comparison() -> Result<Option<(String, Version, Version, GitHubRe
     ))?;
 
     if latest_version <= current_version {
-        println!("✅ Already on the latest version (v{})", current_version);
+        println!("Already on the latest version (v{})", current_version);
         return Ok(None);
     }
 
@@ -149,7 +149,7 @@ fn perform_installation(
         release.tag_name
     );
     println!(
-        "⭐ If you like this tool, please star us on GitHub: https://github.com/Mai0313/VibeCodingTracker"
+        "If you like this tool, please star us on GitHub: https://github.com/Mai0313/VibeCodingTracker"
     );
 
     Ok(())

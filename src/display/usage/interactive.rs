@@ -5,9 +5,7 @@ use crate::display::common::table::{
 use crate::display::common::tui::{
     InputAction, RefreshState, UpdateTracker, handle_input, restore_terminal, setup_terminal,
 };
-use crate::display::usage::averages::{
-    build_provider_average_rows, build_usage_summary, format_tokens_per_day,
-};
+use crate::display::usage::averages::{build_provider_total_rows, build_usage_summary};
 use crate::models::{PerProviderUsage, ProviderActiveDays, UsageResult};
 use crate::pricing::{ModelPricingMap, fetch_model_pricing};
 use crate::utils::format_number;
@@ -33,7 +31,7 @@ const MAX_TRACKED_ROWS: usize = 100;
 /// Features:
 /// - Auto-refresh every 10 seconds (usage + pricing)
 /// - Real-time memory monitoring
-/// - Provider-grouped daily averages
+/// - Provider-grouped totals
 /// - Keyboard controls: `q`, `Esc`, or `Ctrl+C` to exit
 pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::Result<()> {
     let mut terminal = setup_terminal()?;
@@ -127,7 +125,7 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
         // Extract only the data needed for rendering to minimize memory usage
         let rows_data = summary.rows;
         let totals = summary.totals;
-        let daily_averages = summary.daily_averages;
+        let provider_totals = summary.provider_totals;
 
         // Clear raw usage data immediately after processing to free memory.
         // Per-provider map is reset on the next refresh when new data arrives.
@@ -142,7 +140,7 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
         // backed by a dated on-disk file — clearing it just forces another
         // file-parse on the next refresh.
 
-        let provider_rows = build_provider_average_rows(&daily_averages);
+        let provider_rows = build_provider_total_rows(&provider_totals);
 
         // Track updates
         let current_row_keys: Vec<String> = rows_data.iter().map(|row| row.model.clone()).collect();
@@ -165,20 +163,20 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
         }
 
         terminal.draw(|f| {
-            let avg_height = (provider_rows.len() as u16).saturating_add(4).max(4);
+            let totals_height = (provider_rows.len() as u16).saturating_add(4).max(4);
             let chunks = RatatuiLayout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(3),
                     Constraint::Min(10),
-                    Constraint::Length(avg_height),
+                    Constraint::Length(totals_height),
                     Constraint::Length(3),
                     Constraint::Length(2),
                     Constraint::Length(1),
                 ])
                 .split(f.area());
 
-            let title = create_title("Token Usage Statistics", "📊", RatatuiColor::Cyan);
+            let title = create_title("Token Usage Statistics", RatatuiColor::Cyan);
             f.render_widget(title, chunks[0]);
 
             let header = vec![
@@ -248,14 +246,14 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
             let table = create_ratatui_table(rows, header, &widths, RatatuiColor::Green);
             f.render_widget(table, chunks[1]);
 
-            let mut avg_rows: Vec<RatatuiRow> = provider_rows
+            let mut totals_rows: Vec<RatatuiRow> = provider_rows
                 .iter()
                 .map(|row| {
                     create_provider_row(
                         vec![
                             format!("{} {}", row.icon, row.label),
-                            format_tokens_per_day(row.stats.avg_tokens()),
-                            format!("${:.2}", row.stats.avg_cost()),
+                            format_number(row.stats.total_tokens),
+                            format!("${:.2}", row.stats.total_cost),
                             format_number(row.stats.days_count as i64),
                         ],
                         row.tui_color,
@@ -264,8 +262,8 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
                 })
                 .collect();
 
-            if avg_rows.is_empty() {
-                avg_rows.push(
+            if totals_rows.is_empty() {
+                totals_rows.push(
                     RatatuiRow::new(vec![
                         "No provider data yet".to_string(),
                         "-".to_string(),
@@ -276,34 +274,34 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
                 );
             }
 
-            let avg_header = vec!["Provider", "Tokens / Day", "Cost / Day", "Active Days"];
-            let avg_widths = [
+            let totals_header = vec!["Provider", "Tokens", "Cost", "Active Days"];
+            let totals_widths = [
                 Constraint::Min(20),
                 Constraint::Length(16),
                 Constraint::Length(14),
                 Constraint::Length(14),
             ];
 
-            let average_table =
-                create_ratatui_table(avg_rows, avg_header, &avg_widths, RatatuiColor::Magenta);
-            f.render_widget(average_table, chunks[2]);
+            let totals_table = create_ratatui_table(
+                totals_rows,
+                totals_header,
+                &totals_widths,
+                RatatuiColor::Magenta,
+            );
+            f.render_widget(totals_table, chunks[2]);
 
             let total_cost_str = format!("${:.2}", totals.cost);
             let total_tokens_str = format_number(totals.total);
             let entries_str = format!("{}", rows_data.len());
 
             let summary_items = vec![
+                ("Total Cost:", total_cost_str.as_str(), RatatuiColor::Yellow),
                 (
-                    "💰 Total Cost:",
-                    total_cost_str.as_str(),
-                    RatatuiColor::Yellow,
-                ),
-                (
-                    "🔢 Total Tokens:",
+                    "Total Tokens:",
                     total_tokens_str.as_str(),
                     RatatuiColor::Cyan,
                 ),
-                ("📊 Models:", entries_str.as_str(), RatatuiColor::Blue),
+                ("Models:", entries_str.as_str(), RatatuiColor::Blue),
             ];
 
             let summary = create_summary(summary_items, &sys, pid);

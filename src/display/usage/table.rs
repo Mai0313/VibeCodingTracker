@@ -1,9 +1,7 @@
 use crate::display::common::table::{
     add_totals_row, create_comfy_table, create_metric_cell, create_provider_cell,
 };
-use crate::display::usage::averages::{
-    build_provider_average_rows, build_usage_summary, format_tokens_per_day,
-};
+use crate::display::usage::averages::{build_provider_total_rows, build_usage_summary};
 use crate::pricing::{ModelPricingMap, fetch_model_pricing};
 use crate::usage::UsageData;
 use crate::utils::format_number;
@@ -14,19 +12,19 @@ use std::collections::HashMap;
 /// Displays token usage data as a static table
 pub fn display_usage_table(usage_data: &UsageData) {
     if usage_data.models.is_empty() {
-        println!("⚠️  No usage data found in Claude Code, Codex, Copilot, or Gemini sessions");
+        println!("No usage data found in Claude Code, Codex, Copilot, or Gemini sessions");
         return;
     }
 
-    println!("{}", "📊 Token Usage Statistics".bright_cyan().bold());
+    println!("{}", "Token Usage Statistics".bright_cyan().bold());
     println!();
 
     // Fetch pricing data
     let pricing_map = match fetch_model_pricing() {
         Ok(map) => map,
         Err(e) => {
-            eprintln!("⚠️  Warning: Failed to fetch pricing data: {}", e);
-            eprintln!("   Costs will be shown as $0.00");
+            eprintln!("Warning: Failed to fetch pricing data: {}", e);
+            eprintln!("Costs will be shown as $0.00");
             ModelPricingMap::new(HashMap::new())
         }
     };
@@ -39,7 +37,7 @@ pub fn display_usage_table(usage_data: &UsageData) {
     );
 
     if summary.rows.is_empty() {
-        println!("⚠️  No usage data found in Claude Code, Codex, Copilot, or Gemini sessions");
+        println!("No usage data found in Claude Code, Codex, Copilot, or Gemini sessions");
         return;
     }
 
@@ -108,24 +106,23 @@ pub fn display_usage_table(usage_data: &UsageData) {
     println!("{table}");
     println!();
 
-    // Calculate and display daily averages
-    let provider_rows = build_provider_average_rows(&summary.daily_averages);
+    // Display per-provider totals (the active-day count comes along so
+    // readers can see how many days these totals span without converting
+    // back to a daily average).
+    let provider_rows = build_provider_total_rows(&summary.provider_totals);
 
-    println!(
-        "{}",
-        "📈 Daily Averages (by Provider)".bright_magenta().bold()
-    );
+    println!("{}", "Totals (by Provider)".bright_magenta().bold());
     println!();
 
-    let mut avg_table = Table::new();
-    avg_table.load_preset(UTF8_FULL).set_header(vec![
+    let mut totals_table = Table::new();
+    totals_table.load_preset(UTF8_FULL).set_header(vec![
         Cell::new("Provider")
             .fg(Color::Magenta)
             .set_alignment(CellAlignment::Left),
-        Cell::new("Tokens/Day")
+        Cell::new("Tokens")
             .fg(Color::Magenta)
             .set_alignment(CellAlignment::Right),
-        Cell::new("Cost/Day")
+        Cell::new("Cost")
             .fg(Color::Magenta)
             .set_alignment(CellAlignment::Right),
         Cell::new("Active Days")
@@ -137,12 +134,12 @@ pub fn display_usage_table(usage_data: &UsageData) {
         let name = format!("{} {}", row.icon, row.label);
         let name_cell = create_provider_cell(name, row.table_color, row.emphasize);
         let tokens_cell = create_metric_cell(
-            format_tokens_per_day(row.stats.avg_tokens()),
+            format_number(row.stats.total_tokens),
             row.table_color,
             row.emphasize,
         );
         let cost_cell = create_metric_cell(
-            format!("${:.2}", row.stats.avg_cost()),
+            format!("${:.2}", row.stats.total_cost),
             row.table_color,
             row.emphasize,
         );
@@ -152,9 +149,9 @@ pub fn display_usage_table(usage_data: &UsageData) {
             row.emphasize,
         );
 
-        avg_table.add_row(vec![name_cell, tokens_cell, cost_cell, days_cell]);
+        totals_table.add_row(vec![name_cell, tokens_cell, cost_cell, days_cell]);
     }
 
-    println!("{avg_table}");
+    println!("{totals_table}");
     println!();
 }

@@ -1,7 +1,6 @@
 use crate::analysis::{AggregatedAnalysisRow, PerProviderAnalysisRows};
-use crate::display::common::{DailyAverageRow, ProviderAverage, ProviderStatistics};
+use crate::display::common::ProviderTotal;
 use crate::models::{Provider, ProviderActiveDays};
-use crate::utils::format_number;
 
 /// Data structure for an analysis row (internal use)
 #[derive(Default)]
@@ -17,7 +16,9 @@ pub struct AnalysisRow {
     pub write_count: usize,
 }
 
-/// Provider-specific statistics for analysis
+/// Per-provider totals for analysis. `days_count` records how many distinct
+/// days contributed to the totals so the display layer can show the spread
+/// without computing a rate.
 #[derive(Default, Clone)]
 pub struct AnalysisProviderStats {
     pub total_edit_lines: usize,
@@ -32,79 +33,7 @@ pub struct AnalysisProviderStats {
 }
 
 impl AnalysisProviderStats {
-    pub fn avg_edit_lines(&self) -> f64 {
-        if self.days_count > 0 {
-            self.total_edit_lines as f64 / self.days_count as f64
-        } else {
-            0.0
-        }
-    }
-
-    pub fn avg_read_lines(&self) -> f64 {
-        if self.days_count > 0 {
-            self.total_read_lines as f64 / self.days_count as f64
-        } else {
-            0.0
-        }
-    }
-
-    pub fn avg_write_lines(&self) -> f64 {
-        if self.days_count > 0 {
-            self.total_write_lines as f64 / self.days_count as f64
-        } else {
-            0.0
-        }
-    }
-
-    pub fn avg_bash_count(&self) -> f64 {
-        if self.days_count > 0 {
-            self.total_bash_count as f64 / self.days_count as f64
-        } else {
-            0.0
-        }
-    }
-
-    pub fn avg_edit_count(&self) -> f64 {
-        if self.days_count > 0 {
-            self.total_edit_count as f64 / self.days_count as f64
-        } else {
-            0.0
-        }
-    }
-
-    pub fn avg_read_count(&self) -> f64 {
-        if self.days_count > 0 {
-            self.total_read_count as f64 / self.days_count as f64
-        } else {
-            0.0
-        }
-    }
-
-    pub fn avg_todo_write_count(&self) -> f64 {
-        if self.days_count > 0 {
-            self.total_todo_write_count as f64 / self.days_count as f64
-        } else {
-            0.0
-        }
-    }
-
-    pub fn avg_write_count(&self) -> f64 {
-        if self.days_count > 0 {
-            self.total_write_count as f64 / self.days_count as f64
-        } else {
-            0.0
-        }
-    }
-}
-
-impl DailyAverageRow for AnalysisRow {
-    fn model(&self) -> &str {
-        &self.model
-    }
-}
-
-impl ProviderStatistics<AnalysisRow> for AnalysisProviderStats {
-    fn accumulate(&mut self, row: &AnalysisRow, _provider: Provider) {
+    fn accumulate_row(&mut self, row: &AnalysisRow) {
         self.total_edit_lines += row.edit_lines;
         self.total_read_lines += row.read_lines;
         self.total_write_lines += row.write_lines;
@@ -114,31 +43,12 @@ impl ProviderStatistics<AnalysisRow> for AnalysisProviderStats {
         self.total_todo_write_count += row.todo_write_count;
         self.total_write_count += row.write_count;
     }
-
-    fn set_days(&mut self, days: usize) {
-        self.days_count = days;
-    }
 }
 
-/// Type alias for daily averages with analysis statistics
-pub type AnalysisDailyAverages =
-    crate::display::common::DailyAverages<AnalysisRow, AnalysisProviderStats>;
+/// Type alias for analysis totals grouped by provider.
+pub type AnalysisProviderTotals = crate::display::common::ProviderTotals<AnalysisProviderStats>;
 
-/// Calculate daily averages for analysis data, grouped by provider (uses generic implementation).
-///
-/// Only used for the legacy single-file analysis path where there is no
-/// per-provider breakdown; the per-model rows are inspected and guessed-at
-/// by name. For batch analysis prefer
-/// [`calculate_analysis_daily_averages_from_per_provider`] which uses
-/// source-directory attribution instead.
-pub fn calculate_analysis_daily_averages(
-    rows: &[AnalysisRow],
-    provider_days: &ProviderActiveDays,
-) -> AnalysisDailyAverages {
-    crate::display::common::calculate_daily_averages(rows, provider_days)
-}
-
-/// Calculate daily averages for analysis data using **source-directory**
+/// Calculate per-provider analysis totals using **source-directory**
 /// attribution, matching the usage command's approach.
 ///
 /// Consuming `PerProviderAnalysisRows` directly means same-named models
@@ -146,126 +56,105 @@ pub fn calculate_analysis_daily_averages(
 /// both by Claude Code and Copilot CLI after the recent Copilot refactor)
 /// are attributed correctly to each source directory rather than being
 /// lumped under whichever provider the model name happens to look like.
-pub fn calculate_analysis_daily_averages_from_per_provider(
+pub fn calculate_analysis_provider_totals_from_per_provider(
     per_provider: &PerProviderAnalysisRows,
     provider_days: &ProviderActiveDays,
-) -> AnalysisDailyAverages {
-    let mut averages = AnalysisDailyAverages::default();
+) -> AnalysisProviderTotals {
+    let mut totals = AnalysisProviderTotals::default();
 
-    averages.claude.set_days(provider_days.claude);
-    averages.codex.set_days(provider_days.codex);
-    averages.copilot.set_days(provider_days.copilot);
-    averages.gemini.set_days(provider_days.gemini);
-    averages.overall.set_days(provider_days.total);
+    totals.claude.days_count = provider_days.claude;
+    totals.codex.days_count = provider_days.codex;
+    totals.copilot.days_count = provider_days.copilot;
+    totals.gemini.days_count = provider_days.gemini;
+    totals.overall.days_count = provider_days.total;
 
-    accumulate_analysis_provider(&mut averages.claude, &per_provider.claude);
-    accumulate_analysis_provider(&mut averages.codex, &per_provider.codex);
-    accumulate_analysis_provider(&mut averages.copilot, &per_provider.copilot);
-    accumulate_analysis_provider(&mut averages.gemini, &per_provider.gemini);
+    accumulate_analysis_provider(&mut totals.claude, &per_provider.claude);
+    accumulate_analysis_provider(&mut totals.codex, &per_provider.codex);
+    accumulate_analysis_provider(&mut totals.copilot, &per_provider.copilot);
+    accumulate_analysis_provider(&mut totals.gemini, &per_provider.gemini);
 
     // "All Providers" row is the sum of every provider's totals, matching
     // the usage command. Summing per-provider stats keeps the overall
     // total == Σ providers even when a model appears under more than one
     // provider.
-    averages.overall.total_edit_lines = averages.claude.total_edit_lines
-        + averages.codex.total_edit_lines
-        + averages.copilot.total_edit_lines
-        + averages.gemini.total_edit_lines;
-    averages.overall.total_read_lines = averages.claude.total_read_lines
-        + averages.codex.total_read_lines
-        + averages.copilot.total_read_lines
-        + averages.gemini.total_read_lines;
-    averages.overall.total_write_lines = averages.claude.total_write_lines
-        + averages.codex.total_write_lines
-        + averages.copilot.total_write_lines
-        + averages.gemini.total_write_lines;
-    averages.overall.total_bash_count = averages.claude.total_bash_count
-        + averages.codex.total_bash_count
-        + averages.copilot.total_bash_count
-        + averages.gemini.total_bash_count;
-    averages.overall.total_edit_count = averages.claude.total_edit_count
-        + averages.codex.total_edit_count
-        + averages.copilot.total_edit_count
-        + averages.gemini.total_edit_count;
-    averages.overall.total_read_count = averages.claude.total_read_count
-        + averages.codex.total_read_count
-        + averages.copilot.total_read_count
-        + averages.gemini.total_read_count;
-    averages.overall.total_todo_write_count = averages.claude.total_todo_write_count
-        + averages.codex.total_todo_write_count
-        + averages.copilot.total_todo_write_count
-        + averages.gemini.total_todo_write_count;
-    averages.overall.total_write_count = averages.claude.total_write_count
-        + averages.codex.total_write_count
-        + averages.copilot.total_write_count
-        + averages.gemini.total_write_count;
+    totals.overall.total_edit_lines = totals.claude.total_edit_lines
+        + totals.codex.total_edit_lines
+        + totals.copilot.total_edit_lines
+        + totals.gemini.total_edit_lines;
+    totals.overall.total_read_lines = totals.claude.total_read_lines
+        + totals.codex.total_read_lines
+        + totals.copilot.total_read_lines
+        + totals.gemini.total_read_lines;
+    totals.overall.total_write_lines = totals.claude.total_write_lines
+        + totals.codex.total_write_lines
+        + totals.copilot.total_write_lines
+        + totals.gemini.total_write_lines;
+    totals.overall.total_bash_count = totals.claude.total_bash_count
+        + totals.codex.total_bash_count
+        + totals.copilot.total_bash_count
+        + totals.gemini.total_bash_count;
+    totals.overall.total_edit_count = totals.claude.total_edit_count
+        + totals.codex.total_edit_count
+        + totals.copilot.total_edit_count
+        + totals.gemini.total_edit_count;
+    totals.overall.total_read_count = totals.claude.total_read_count
+        + totals.codex.total_read_count
+        + totals.copilot.total_read_count
+        + totals.gemini.total_read_count;
+    totals.overall.total_todo_write_count = totals.claude.total_todo_write_count
+        + totals.codex.total_todo_write_count
+        + totals.copilot.total_todo_write_count
+        + totals.gemini.total_todo_write_count;
+    totals.overall.total_write_count = totals.claude.total_write_count
+        + totals.codex.total_write_count
+        + totals.copilot.total_write_count
+        + totals.gemini.total_write_count;
 
-    averages
+    totals
 }
 
 fn accumulate_analysis_provider(stats: &mut AnalysisProviderStats, rows: &[AggregatedAnalysisRow]) {
     let analysis_rows = convert_to_analysis_rows(rows);
     for row in &analysis_rows {
-        stats.accumulate(row, Provider::Unknown);
+        stats.accumulate_row(row);
     }
 }
 
-/// Build provider average rows for display
+/// Build provider total rows for display.
 pub fn build_analysis_provider_rows(
-    averages: &AnalysisDailyAverages,
-) -> Vec<ProviderAverage<'_, AnalysisProviderStats>> {
-    let mut rows = Vec::with_capacity(5); // Pre-allocate: max 4 providers + overall
+    totals: &AnalysisProviderTotals,
+) -> Vec<ProviderTotal<'_, AnalysisProviderStats>> {
+    let mut rows = Vec::with_capacity(5); // max 4 providers + overall
 
-    if averages.claude.days_count > 0 {
-        rows.push(ProviderAverage::new(
+    if totals.claude.days_count > 0 {
+        rows.push(ProviderTotal::new(
             Provider::ClaudeCode,
-            &averages.claude,
+            &totals.claude,
             false,
         ));
     }
 
-    if averages.codex.days_count > 0 {
-        rows.push(ProviderAverage::new(
-            Provider::Codex,
-            &averages.codex,
-            false,
-        ));
+    if totals.codex.days_count > 0 {
+        rows.push(ProviderTotal::new(Provider::Codex, &totals.codex, false));
     }
 
-    if averages.copilot.days_count > 0 {
-        rows.push(ProviderAverage::new(
+    if totals.copilot.days_count > 0 {
+        rows.push(ProviderTotal::new(
             Provider::Copilot,
-            &averages.copilot,
+            &totals.copilot,
             false,
         ));
     }
 
-    if averages.gemini.days_count > 0 {
-        rows.push(ProviderAverage::new(
-            Provider::Gemini,
-            &averages.gemini,
-            false,
-        ));
+    if totals.gemini.days_count > 0 {
+        rows.push(ProviderTotal::new(Provider::Gemini, &totals.gemini, false));
     }
 
-    if averages.overall.days_count > 0 || rows.is_empty() {
-        rows.push(ProviderAverage::new_overall(&averages.overall));
+    if totals.overall.days_count > 0 || rows.is_empty() {
+        rows.push(ProviderTotal::new_overall(&totals.overall));
     }
 
     rows
-}
-
-/// Format lines per day for display
-pub fn format_lines_per_day(value: f64) -> String {
-    if value >= 9_999.5 {
-        format_number(value.round() as i64)
-    } else if value >= 1.0 {
-        format!("{:.1}", value)
-    } else if value > 0.0 {
-        format!("{:.2}", value)
-    } else {
-        "0".to_string()
-    }
 }
 
 /// Convert AggregatedAnalysisRow to AnalysisRow

@@ -2,8 +2,8 @@ use crate::models::Provider;
 use comfy_table::Color as TableColor;
 use ratatui::style::Color as RatatuiColor;
 
-/// Provider-specific display configuration
-pub struct ProviderAverage<'a, T> {
+/// Per-provider display configuration paired with the provider's totals.
+pub struct ProviderTotal<'a, T> {
     pub label: &'static str,
     pub icon: &'static str,
     pub tui_color: RatatuiColor,
@@ -12,8 +12,8 @@ pub struct ProviderAverage<'a, T> {
     pub emphasize: bool,
 }
 
-impl<'a, T> ProviderAverage<'a, T> {
-    /// Create a new provider average display configuration
+impl<'a, T> ProviderTotal<'a, T> {
+    /// Create a new per-provider total row.
     pub fn new(provider: Provider, stats: &'a T, emphasize: bool) -> Self {
         let (label, icon, tui_color, table_color) = match provider {
             Provider::ClaudeCode => (
@@ -53,7 +53,7 @@ impl<'a, T> ProviderAverage<'a, T> {
         }
     }
 
-    /// Create an "overall" provider average (for all providers combined)
+    /// Create the "overall" total row (sum across all providers).
     pub fn new_overall(stats: &'a T) -> Self {
         Self {
             label: "All Providers",

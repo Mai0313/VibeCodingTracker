@@ -1,7 +1,6 @@
 use crate::analysis::AnalysisData;
 use crate::display::analysis::averages::{
-    AnalysisRow, build_analysis_provider_rows, calculate_analysis_daily_averages_from_per_provider,
-    format_lines_per_day,
+    AnalysisRow, build_analysis_provider_rows, calculate_analysis_provider_totals_from_per_provider,
 };
 use crate::display::common::table::{
     add_totals_row, create_comfy_table, create_metric_cell, create_provider_cell,
@@ -14,11 +13,11 @@ use owo_colors::OwoColorize;
 pub fn display_analysis_table(analysis: &AnalysisData) {
     let data = &analysis.rows;
     if data.is_empty() {
-        println!("⚠️  No analysis data found");
+        println!("No analysis data found");
         return;
     }
 
-    println!("{}", "🔍 Analysis Statistics".bright_cyan().bold());
+    println!("{}", "Analysis Statistics".bright_cyan().bold());
     println!();
 
     let mut table = create_comfy_table(
@@ -99,48 +98,45 @@ pub fn display_analysis_table(analysis: &AnalysisData) {
     println!("{table}");
     println!();
 
-    // Calculate daily averages from the per-provider aggregated rows the
-    // batch analyzer produced (no model-name guessing — each row is already
-    // scoped to a known source directory).
-    let daily_averages = calculate_analysis_daily_averages_from_per_provider(
+    // Compute per-provider totals directly from the per-provider aggregated
+    // rows the batch analyzer produced (no model-name guessing — each row
+    // is already scoped to a known source directory).
+    let provider_totals = calculate_analysis_provider_totals_from_per_provider(
         &analysis.per_provider,
         &analysis.provider_days,
     );
-    let provider_rows = build_analysis_provider_rows(&daily_averages);
+    let provider_rows = build_analysis_provider_rows(&provider_totals);
 
-    println!(
-        "{}",
-        "📈 Daily Averages (by Provider)".bright_magenta().bold()
-    );
+    println!("{}", "Totals (by Provider)".bright_magenta().bold());
     println!();
 
-    let mut avg_table = Table::new();
-    avg_table.load_preset(UTF8_FULL).set_header(vec![
+    let mut totals_table = Table::new();
+    totals_table.load_preset(UTF8_FULL).set_header(vec![
         Cell::new("Provider")
             .fg(Color::Magenta)
             .set_alignment(CellAlignment::Left),
-        Cell::new("EditL/Day")
+        Cell::new("Edit Lines")
             .fg(Color::Magenta)
             .set_alignment(CellAlignment::Right),
-        Cell::new("ReadL/Day")
+        Cell::new("Read Lines")
             .fg(Color::Magenta)
             .set_alignment(CellAlignment::Right),
-        Cell::new("WriteL/Day")
+        Cell::new("Write Lines")
             .fg(Color::Magenta)
             .set_alignment(CellAlignment::Right),
-        Cell::new("Bash/Day")
+        Cell::new("Bash")
             .fg(Color::Magenta)
             .set_alignment(CellAlignment::Right),
-        Cell::new("Edit/Day")
+        Cell::new("Edit")
             .fg(Color::Magenta)
             .set_alignment(CellAlignment::Right),
-        Cell::new("Read/Day")
+        Cell::new("Read")
             .fg(Color::Magenta)
             .set_alignment(CellAlignment::Right),
-        Cell::new("Todo/Day")
+        Cell::new("TodoWrite")
             .fg(Color::Magenta)
             .set_alignment(CellAlignment::Right),
-        Cell::new("Write/Day")
+        Cell::new("Write")
             .fg(Color::Magenta)
             .set_alignment(CellAlignment::Right),
         Cell::new("Days")
@@ -151,45 +147,45 @@ pub fn display_analysis_table(analysis: &AnalysisData) {
     for row in &provider_rows {
         let name = format!("{} {}", row.icon, row.label);
 
-        avg_table.add_row(vec![
+        totals_table.add_row(vec![
             create_provider_cell(name, row.table_color, row.emphasize),
             create_metric_cell(
-                format_lines_per_day(row.stats.avg_edit_lines()),
+                format_number(row.stats.total_edit_lines as i64),
                 row.table_color,
                 row.emphasize,
             ),
             create_metric_cell(
-                format_lines_per_day(row.stats.avg_read_lines()),
+                format_number(row.stats.total_read_lines as i64),
                 row.table_color,
                 row.emphasize,
             ),
             create_metric_cell(
-                format_lines_per_day(row.stats.avg_write_lines()),
+                format_number(row.stats.total_write_lines as i64),
                 row.table_color,
                 row.emphasize,
             ),
             create_metric_cell(
-                format!("{:.1}", row.stats.avg_bash_count()),
+                format_number(row.stats.total_bash_count as i64),
                 row.table_color,
                 row.emphasize,
             ),
             create_metric_cell(
-                format!("{:.1}", row.stats.avg_edit_count()),
+                format_number(row.stats.total_edit_count as i64),
                 row.table_color,
                 row.emphasize,
             ),
             create_metric_cell(
-                format!("{:.1}", row.stats.avg_read_count()),
+                format_number(row.stats.total_read_count as i64),
                 row.table_color,
                 row.emphasize,
             ),
             create_metric_cell(
-                format!("{:.1}", row.stats.avg_todo_write_count()),
+                format_number(row.stats.total_todo_write_count as i64),
                 row.table_color,
                 row.emphasize,
             ),
             create_metric_cell(
-                format!("{:.1}", row.stats.avg_write_count()),
+                format_number(row.stats.total_write_count as i64),
                 row.table_color,
                 row.emphasize,
             ),
@@ -201,6 +197,6 @@ pub fn display_analysis_table(analysis: &AnalysisData) {
         ]);
     }
 
-    println!("{avg_table}");
+    println!("{totals_table}");
     println!();
 }

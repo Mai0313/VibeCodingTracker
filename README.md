@@ -25,17 +25,17 @@
 
 ---
 
-## 🎯 Why Vibe Coding Tracker?
+## Why Vibe Coding Tracker?
 
-### 💰 Know Your Costs
+### Know Your Costs
 
 Stop wondering how much your AI coding sessions cost. Get **real-time cost tracking** with automatic pricing updates from [LiteLLM](https://github.com/BerriAI/litellm).
 
-### 🪶 Ultra-Lightweight
+### Ultra-Lightweight
 
 Built with Rust for minimal resource footprint. The interactive TUI dashboard typically sits at **under ~50 MB of resident memory** once the first refresh is done, even with hundreds of long-context sessions on disk — no Electron, no bloated runtimes. The usage path parses each session file in a lean usage-only mode and bypasses the cache, and we tune glibc's arena count at startup to keep long-running RSS honest.
 
-### 📊 Beautiful Visualizations
+### Beautiful Visualizations
 
 Choose your preferred view:
 
@@ -44,41 +44,41 @@ Choose your preferred view:
 - **Script-Friendly**: Plain text and JSON for automation
 - **Full Precision**: Export exact costs for accounting
 
-### 🚀 Zero Configuration
+### Zero Configuration
 
 Automatically detects and processes logs from Claude Code, Codex, Copilot, and Gemini. No setup required — just run and analyze.
 
-### 🎨 Rich Insights
+### Rich Insights
 
 - Token usage by model and date
 - Cost breakdown by cache types (read / create)
 - File operations tracking (edit, read, write lines)
 - Tool call history (Bash, Edit, Read, Write, TodoWrite)
-- Per-provider daily averages
+- Per-provider totals
 
 ---
 
-## ✨ Key Features
+## Key Features
 
-| Feature                  | Description                                                          |
-| ------------------------ | -------------------------------------------------------------------- |
-| 🤖 **Multi-Provider**    | Claude Code, Codex, Copilot, and Gemini — all in one place           |
-| 💵 **Smart Pricing**     | Fuzzy model matching + daily cache from LiteLLM                      |
-| 🎨 **4 Display Modes**   | Interactive TUI, static table, plain text, and JSON                  |
-| 📈 **Dual Analysis**     | Token/cost stats (`usage`) + code operation stats (`analysis`)       |
-| 🪶 **Ultra-Lightweight** | Under ~50 MB RSS in the TUI, streaming JSONL parse — built with Rust |
-| 🔄 **Live Updates**      | Real-time dashboard refreshes every second                           |
-| 💾 **Efficient Caching** | Smart daily cache reduces API calls                                  |
+| Feature               | Description                                                          |
+| --------------------- | -------------------------------------------------------------------- |
+| **Multi-Provider**    | Claude Code, Codex, Copilot, and Gemini — all in one place           |
+| **Smart Pricing**     | Fuzzy model matching + daily cache from LiteLLM                      |
+| **4 Display Modes**   | Interactive TUI, static table, plain text, and JSON                  |
+| **Dual Analysis**     | Token/cost stats (`usage`) + code operation stats (`analysis`)       |
+| **Ultra-Lightweight** | Under ~50 MB RSS in the TUI, streaming JSONL parse — built with Rust |
+| **Live Updates**      | Real-time dashboard refreshes every second                           |
+| **Efficient Caching** | Smart daily cache reduces API calls                                  |
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Installation
 
 Choose the installation method that works best for you:
 
-> 👨‍💻 **Developers**: If you want to build from source or contribute to development, please see [CONTRIBUTING.md](CONTRIBUTING.md).
+> **Developers**: If you want to build from source or contribute to development, please see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 #### Method 1: Install from npm
 
@@ -130,9 +130,9 @@ vct analysis
 
 ---
 
-## 📖 Command Guide
+## Command Guide
 
-### 🔍 Quick Reference
+### Quick Reference
 
 ```
 vct <COMMAND> [OPTIONS]
@@ -157,7 +157,7 @@ Time range flags (shared by `usage` and `analysis`, mutually exclusive, default 
 
 ---
 
-## 💰 Usage Command
+## Usage Command
 
 **Track your spending across all AI coding sessions.**
 
@@ -199,7 +199,7 @@ vct usage --json --daily
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                    📊 Token Usage Statistics                                │
+│                                    Token Usage Statistics                                   │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
 │ Model                              Input     Output    Cache Read  Cache Create  Total Cost │
@@ -210,14 +210,14 @@ vct usage --json --daily
 │ TOTAL                              160,333   209,174   45,525,477  3,192,074     $79.33     │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Provider              Tokens / Day     Cost / Day     Active Days                           │
+│ Provider                  Tokens         Cost         Active Days                           │
 │                                                                                             │
-│ 🤖 Claude Code        16,293,406       $26.31         3                                    │
-│ ✨ Gemini             206,839          $0.40          1                                     │
-│ ⭐ All Providers      16,362,353       $26.44         3                                    │
+│ 🤖 Claude Code            48,880,218     $78.93       3                                     │
+│ ✨ Gemini                 206,839        $0.40        1                                     │
+│ ⭐ All Providers          49,087,057     $79.33       3                                     │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│   💰 Total: $79.33  |  🔢 Tokens: 49,087,058  |  📊 Models: 3  |  🧠 Memory: 42.8 MB        │
+│   Total Cost: $79.33  |  Total Tokens: 49,087,058  |  Models: 3  |  Memory: 42.8 MB         │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
                           Press 'q', 'Esc', 'Ctrl+C' to quit | Press 'r' to refresh
 ```
@@ -233,7 +233,7 @@ The tool automatically scans these directories:
 
 ---
 
-## 📊 Analysis Command
+## Analysis Command
 
 **Deep dive into code operations — see exactly what your AI assistant did.**
 
@@ -243,7 +243,7 @@ The tool automatically scans these directories:
 | ---------------------------------------------- | ----------------------------------------------------------- |
 | *(none)*                                       | Interactive TUI dashboard over all sessions                 |
 | `--path <FILE>`                                | Analyze a single JSONL/JSON conversation file (prints JSON) |
-| `--table`                                      | Static table with per-provider daily averages               |
+| `--table`                                      | Static table with per-provider totals                       |
 | `--text`                                       | Plain text, script-friendly                                 |
 | `--json`                                       | JSON array of aggregated rows printed to stdout             |
 | `--output <FILE>`                              | Save results as pretty-printed JSON                         |
@@ -257,7 +257,7 @@ See [`examples/`](examples/) for sample inputs and matching JSON outputs for all
 # Interactive dashboard for all sessions (default)
 vct analysis
 
-# Static table output with daily averages
+# Static table output with per-provider totals
 vct analysis --table
 
 # Plain text for scripts
@@ -283,7 +283,7 @@ vct analysis --output today.json --daily
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                    🔍 Analysis Statistics                                   │
+│                                    Analysis Statistics                                      │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
 │ Model                        Edit Lines  Read Lines  Write Lines  Bash  Edit  Read  Write  │
@@ -294,21 +294,21 @@ vct analysis --output today.json --daily
 │ TOTAL                        1,280       13,264      1,575        125   146   268   62      │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Provider          EditL/Day ReadL/Day WriteL/Day Bash/Day Edit/Day Read/Day Write/Day Days  │
+│ Provider          Edit Lines Read Lines Write Lines Bash Edit Read TodoWrite Write Days     │
 │                                                                                             │
-│ 🤖 Claude Code    426.7     4421.3    525.0      41.7     48.7     89.3     20.7      3    │
-│ ✨ Gemini         0         0         0          0.0      0.0      0.0      0.0       1    │
-│ ⭐ All Providers  426.7     4421.3    525.0      41.7     48.7     89.3     20.7      3    │
+│ 🤖 Claude Code    1,280      13,264     1,575       125  146  268  18        62    3        │
+│ ✨ Gemini         0          0          0           0    0    0    0         0     1        │
+│ ⭐ All Providers  1,280      13,264     1,575       125  146  268  18        62    3        │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│  📝 Lines: 16,119  |  🔧 Tools: 601  |  📊 Models: 3  |  🧠 Memory: 41.2 MB                │
+│  Total Lines: 16,119  |  Total Tools: 619  |  Models: 3  |  Memory: 41.2 MB                 │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
                           Press 'q', 'Esc', 'Ctrl+C' to quit | Press 'r' to refresh
 ```
 
 ---
 
-## 🔄 Update Command
+## Update Command
 
 **Keep your installation up-to-date automatically.**
 
@@ -330,14 +330,14 @@ vct update --force
 ### Preview (`vct update --check`)
 
 ```
-📋 Current version: v0.5.10
-🔍 Checking for latest release...
-✅ Latest version: v0.5.10 — you are up to date!
+Current version: v0.5.10
+Checking for latest release...
+Latest version: v0.5.10 — you are up to date!
 ```
 
 ---
 
-## 🏷️ Version Command
+## Version Command
 
 Report the embedded build metadata (binary version, Rust toolchain, Cargo version):
 
@@ -351,7 +351,7 @@ The binary version is produced at build time by `build.rs` from `git describe`, 
 
 ---
 
-## 💡 Smart Pricing System
+## Smart Pricing System
 
 ### How It Works
 
@@ -364,15 +364,15 @@ The binary version is produced at build time by `build.rs` from `git describe`, 
 
 **Priority Order**:
 
-1. ✅ **Exact Match**: `claude-sonnet-4` → `claude-sonnet-4`
-2. 🔄 **Normalized**: `claude-sonnet-4-20250514` → `claude-sonnet-4`
-3. 🔍 **Substring**: `custom-gpt-4` → `gpt-4`
-4. 🎯 **Fuzzy (AI-powered)**: Uses Jaro-Winkler similarity (70% threshold)
-5. 💵 **Fallback**: Shows $0.00 if no match found
+1. **Exact Match**: `claude-sonnet-4` → `claude-sonnet-4`
+2. **Normalized**: `claude-sonnet-4-20250514` → `claude-sonnet-4`
+3. **Substring**: `custom-gpt-4` → `gpt-4`
+4. **Fuzzy (AI-powered)**: Uses Jaro-Winkler similarity (70% threshold)
+5. **Fallback**: Shows $0.00 if no match found
 
 ---
 
-## 🐳 Docker Support
+## Docker Support
 
 ```bash
 # Build image

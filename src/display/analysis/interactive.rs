@@ -1,7 +1,7 @@
 use crate::analysis::{AnalysisData, PerProviderAnalysisRows};
 use crate::display::analysis::averages::{
-    AnalysisRow, build_analysis_provider_rows, calculate_analysis_daily_averages_from_per_provider,
-    convert_to_analysis_rows, format_lines_per_day,
+    AnalysisRow, build_analysis_provider_rows,
+    calculate_analysis_provider_totals_from_per_provider, convert_to_analysis_rows,
 };
 use crate::display::common::table::{
     create_controls, create_provider_row, create_ratatui_table, create_star_hint, create_summary,
@@ -27,7 +27,7 @@ pub fn display_analysis_interactive(
     time_range: crate::cli::TimeRange,
 ) -> anyhow::Result<()> {
     if initial_data.rows.is_empty() {
-        println!("⚠️  No analysis data found");
+        println!("No analysis data found");
         return Ok(());
     }
 
@@ -119,30 +119,31 @@ pub fn display_analysis_interactive(
         let current_row_keys: Vec<String> = rows_data.iter().map(|row| row.model.clone()).collect();
         update_tracker.cleanup(current_row_keys);
 
-        // Calculate daily averages directly from the per-provider aggregated
-        // rows produced by the batch analyzer, so Copilot sessions cannot be
-        // mis-attributed to Claude Code based on their (now real) model name.
-        let daily_averages =
-            calculate_analysis_daily_averages_from_per_provider(&per_provider, &provider_days);
-        let provider_rows = build_analysis_provider_rows(&daily_averages);
+        // Compute per-provider totals directly from the per-provider
+        // aggregated rows produced by the batch analyzer, so Copilot sessions
+        // cannot be mis-attributed to Claude Code based on their (now real)
+        // model name.
+        let provider_totals =
+            calculate_analysis_provider_totals_from_per_provider(&per_provider, &provider_days);
+        let provider_rows = build_analysis_provider_rows(&provider_totals);
 
         // Render
         terminal.draw(|f| {
-            let avg_height = (provider_rows.len() as u16).saturating_add(4).max(4);
+            let totals_height = (provider_rows.len() as u16).saturating_add(4).max(4);
             let chunks = RatatuiLayout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(3),          // Title
-                    Constraint::Min(10),            // Table
-                    Constraint::Length(avg_height), // Daily Averages
-                    Constraint::Length(3),          // Summary
-                    Constraint::Length(2),          // Controls
-                    Constraint::Length(1),          // Star Hint
+                    Constraint::Length(3),             // Title
+                    Constraint::Min(10),               // Table
+                    Constraint::Length(totals_height), // Per-provider totals
+                    Constraint::Length(3),             // Summary
+                    Constraint::Length(2),             // Controls
+                    Constraint::Length(1),             // Star Hint
                 ])
                 .split(f.area());
 
             // Title
-            let title = create_title("Analysis Statistics", "🔍", RatatuiColor::Cyan);
+            let title = create_title("Analysis Statistics", RatatuiColor::Cyan);
             f.render_widget(title, chunks[0]);
 
             // Table
@@ -223,21 +224,21 @@ pub fn display_analysis_interactive(
             let table = create_ratatui_table(rows, header, &widths, RatatuiColor::Green);
             f.render_widget(table, chunks[1]);
 
-            // Daily Averages Table
-            let mut avg_rows: Vec<RatatuiRow> = provider_rows
+            // Per-provider totals table
+            let mut totals_rows: Vec<RatatuiRow> = provider_rows
                 .iter()
                 .map(|row| {
                     create_provider_row(
                         vec![
                             format!("{} {}", row.icon, row.label),
-                            format_lines_per_day(row.stats.avg_edit_lines()),
-                            format_lines_per_day(row.stats.avg_read_lines()),
-                            format_lines_per_day(row.stats.avg_write_lines()),
-                            format!("{:.1}", row.stats.avg_bash_count()),
-                            format!("{:.1}", row.stats.avg_edit_count()),
-                            format!("{:.1}", row.stats.avg_read_count()),
-                            format!("{:.1}", row.stats.avg_todo_write_count()),
-                            format!("{:.1}", row.stats.avg_write_count()),
+                            format_number(row.stats.total_edit_lines as i64),
+                            format_number(row.stats.total_read_lines as i64),
+                            format_number(row.stats.total_write_lines as i64),
+                            format_number(row.stats.total_bash_count as i64),
+                            format_number(row.stats.total_edit_count as i64),
+                            format_number(row.stats.total_read_count as i64),
+                            format_number(row.stats.total_todo_write_count as i64),
+                            format_number(row.stats.total_write_count as i64),
                             format_number(row.stats.days_count as i64),
                         ],
                         row.tui_color,
@@ -246,8 +247,8 @@ pub fn display_analysis_interactive(
                 })
                 .collect();
 
-            if avg_rows.is_empty() {
-                avg_rows.push(
+            if totals_rows.is_empty() {
+                totals_rows.push(
                     RatatuiRow::new(vec![
                         "No provider data yet".to_string(),
                         "-".to_string(),
@@ -264,35 +265,39 @@ pub fn display_analysis_interactive(
                 );
             }
 
-            let avg_header = vec![
+            let totals_header = vec![
                 "Provider",
-                "EditL/Day",
-                "ReadL/Day",
-                "WriteL/Day",
-                "Bash/Day",
-                "Edit/Day",
-                "Read/Day",
-                "Todo/Day",
-                "Write/Day",
+                "Edit Lines",
+                "Read Lines",
+                "Write Lines",
+                "Bash",
+                "Edit",
+                "Read",
+                "TodoWrite",
+                "Write",
                 "Days",
             ];
 
-            let avg_widths = [
+            let totals_widths = [
                 Constraint::Min(15),    // Provider
-                Constraint::Length(10), // Edit/Day
-                Constraint::Length(10), // Read/Day
-                Constraint::Length(10), // Write/Day
-                Constraint::Length(10), // Bash/Day
-                Constraint::Length(10), // Edit/Day
-                Constraint::Length(10), // Read/Day
-                Constraint::Length(10), // Todo/Day
-                Constraint::Length(10), // Write/Day
+                Constraint::Length(11), // Edit Lines
+                Constraint::Length(11), // Read Lines
+                Constraint::Length(12), // Write Lines
+                Constraint::Length(8),  // Bash
+                Constraint::Length(8),  // Edit
+                Constraint::Length(8),  // Read
+                Constraint::Length(11), // TodoWrite
+                Constraint::Length(8),  // Write
                 Constraint::Length(8),  // Days
             ];
 
-            let average_table =
-                create_ratatui_table(avg_rows, avg_header, &avg_widths, RatatuiColor::Magenta);
-            f.render_widget(average_table, chunks[2]);
+            let totals_table = create_ratatui_table(
+                totals_rows,
+                totals_header,
+                &totals_widths,
+                RatatuiColor::Magenta,
+            );
+            f.render_widget(totals_table, chunks[2]);
 
             // Summary
             let total_lines_str =
@@ -308,16 +313,12 @@ pub fn display_analysis_interactive(
 
             let summary_items = vec![
                 (
-                    "📝 Total Lines:",
+                    "Total Lines:",
                     total_lines_str.as_str(),
                     RatatuiColor::Yellow,
                 ),
-                (
-                    "🔧 Total Tools:",
-                    total_tools_str.as_str(),
-                    RatatuiColor::Cyan,
-                ),
-                ("📊 Models:", entries_str.as_str(), RatatuiColor::Blue),
+                ("Total Tools:", total_tools_str.as_str(), RatatuiColor::Cyan),
+                ("Models:", entries_str.as_str(), RatatuiColor::Blue),
             ];
 
             let summary = create_summary(summary_items, &sys, pid);

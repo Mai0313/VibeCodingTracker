@@ -1,6 +1,5 @@
-use crate::display::common::{DailyAverageRow, ProviderAverage, ProviderStatistics};
+use crate::display::common::ProviderTotal;
 use crate::models::{PerProviderUsage, Provider, ProviderActiveDays, UsageResult};
-use crate::utils::format_number;
 use serde_json::Value;
 use std::borrow::Cow;
 
@@ -67,7 +66,9 @@ impl UsageTotals {
     }
 }
 
-/// Provider-specific statistics for usage
+/// Per-provider totals for usage. `days_count` records how many distinct
+/// days contributed to these totals so the display layer can show readers
+/// the spread without computing a rate.
 #[derive(Default, Clone)]
 pub struct ProviderStats {
     pub total_tokens: i64,
@@ -76,79 +77,48 @@ pub struct ProviderStats {
 }
 
 impl ProviderStats {
-    pub fn avg_tokens(&self) -> f64 {
-        if self.days_count > 0 {
-            self.total_tokens as f64 / self.days_count as f64
-        } else {
-            0.0
-        }
-    }
-
-    pub fn avg_cost(&self) -> f64 {
-        if self.days_count > 0 {
-            self.total_cost / self.days_count as f64
-        } else {
-            0.0
-        }
-    }
-}
-
-impl ProviderStatistics<UsageRow> for ProviderStats {
-    fn accumulate(&mut self, row: &UsageRow, _provider: Provider) {
+    fn accumulate_row(&mut self, row: &UsageRow) {
         self.total_tokens += row.total;
         self.total_cost += row.cost;
     }
-
-    fn set_days(&mut self, days: usize) {
-        self.days_count = days;
-    }
 }
 
-impl DailyAverageRow for UsageRow {
-    fn model(&self) -> &str {
-        &self.model
-    }
-}
-
-/// Type alias for daily averages with usage statistics
-pub type DailyAverages = crate::display::common::DailyAverages<UsageRow, ProviderStats>;
+/// Type alias for usage totals grouped by provider.
+pub type UsageProviderTotals = crate::display::common::ProviderTotals<ProviderStats>;
 
 /// Summary of usage data
 #[derive(Default)]
 pub struct UsageSummary {
     pub rows: Vec<UsageRow>,
     pub totals: UsageTotals,
-    pub daily_averages: DailyAverages,
+    pub provider_totals: UsageProviderTotals,
 }
 
-/// Calculate daily averages grouped by provider, using **source-directory**
-/// attribution instead of model-name heuristics.
+/// Calculate per-provider totals using **source-directory** attribution.
 ///
-/// The previous implementation ran `Provider::from_model_name(row.model())`
-/// over each merged per-model row, which misattributed every Copilot
-/// session to Claude Code the moment the Copilot parser started emitting
-/// real model names (e.g. `claude-sonnet-4-6`) instead of the historical
-/// sentinel string `"copilot"`. Token aggregation is now fed directly
-/// from the `per_provider` map that `usage::calculator` populates from
-/// each session's source directory, so the provider assignment is exact
-/// regardless of what model name the session happens to carry.
-pub fn calculate_daily_averages_from_per_provider(
+/// Token aggregation is fed directly from the `per_provider` map that
+/// `usage::calculator` populates from each session's source directory, so the
+/// provider assignment is exact regardless of what model name the session
+/// happens to carry. The previous "averages" variant divided by
+/// `provider_days` to render a per-day rate; the structure is otherwise
+/// identical.
+pub fn calculate_provider_totals_from_per_provider(
     per_provider: &PerProviderUsage,
     provider_days: &ProviderActiveDays,
     pricing_map: &crate::pricing::ModelPricingMap,
-) -> DailyAverages {
-    let mut averages = DailyAverages::default();
+) -> UsageProviderTotals {
+    let mut totals = UsageProviderTotals::default();
 
-    averages.claude.set_days(provider_days.claude);
-    averages.codex.set_days(provider_days.codex);
-    averages.copilot.set_days(provider_days.copilot);
-    averages.gemini.set_days(provider_days.gemini);
-    averages.overall.set_days(provider_days.total);
+    totals.claude.days_count = provider_days.claude;
+    totals.codex.days_count = provider_days.codex;
+    totals.copilot.days_count = provider_days.copilot;
+    totals.gemini.days_count = provider_days.gemini;
+    totals.overall.days_count = provider_days.total;
 
-    accumulate_provider(&mut averages.claude, &per_provider.claude, pricing_map);
-    accumulate_provider(&mut averages.codex, &per_provider.codex, pricing_map);
-    accumulate_provider(&mut averages.copilot, &per_provider.copilot, pricing_map);
-    accumulate_provider(&mut averages.gemini, &per_provider.gemini, pricing_map);
+    accumulate_provider(&mut totals.claude, &per_provider.claude, pricing_map);
+    accumulate_provider(&mut totals.codex, &per_provider.codex, pricing_map);
+    accumulate_provider(&mut totals.copilot, &per_provider.copilot, pricing_map);
+    accumulate_provider(&mut totals.gemini, &per_provider.gemini, pricing_map);
 
     // "All Providers" row sums every provider's totals directly rather
     // than reusing the cross-provider merged `UsageData.models` map.
@@ -159,16 +129,16 @@ pub fn calculate_daily_averages_from_per_provider(
     // on the same table, and the single merged row would price with one
     // model-lookup where summing per-provider already-priced stats keeps
     // cost consistent with each provider's own row above.
-    averages.overall.total_tokens = averages.claude.total_tokens
-        + averages.codex.total_tokens
-        + averages.copilot.total_tokens
-        + averages.gemini.total_tokens;
-    averages.overall.total_cost = averages.claude.total_cost
-        + averages.codex.total_cost
-        + averages.copilot.total_cost
-        + averages.gemini.total_cost;
+    totals.overall.total_tokens = totals.claude.total_tokens
+        + totals.codex.total_tokens
+        + totals.copilot.total_tokens
+        + totals.gemini.total_tokens;
+    totals.overall.total_cost = totals.claude.total_cost
+        + totals.codex.total_cost
+        + totals.copilot.total_cost
+        + totals.gemini.total_cost;
 
-    averages
+    totals
 }
 
 fn accumulate_provider(
@@ -178,68 +148,45 @@ fn accumulate_provider(
 ) {
     for (model, raw_usage) in usage {
         let row = extract_usage_row(model, raw_usage, pricing_map);
-        // Provider is ignored by the usage impl of `accumulate`, but we
-        // still pass a value to satisfy the trait contract.
-        stats.accumulate(&row, Provider::Unknown);
+        stats.accumulate_row(&row);
     }
 }
 
-/// Build provider average rows for display
-pub fn build_provider_average_rows(
-    averages: &DailyAverages,
-) -> Vec<ProviderAverage<'_, ProviderStats>> {
-    let mut rows = Vec::with_capacity(5); // Pre-allocate: max 4 providers + overall
+/// Build provider total rows for display.
+pub fn build_provider_total_rows(
+    totals: &UsageProviderTotals,
+) -> Vec<ProviderTotal<'_, ProviderStats>> {
+    let mut rows = Vec::with_capacity(5); // max 4 providers + overall
 
-    if averages.claude.days_count > 0 {
-        rows.push(ProviderAverage::new(
+    if totals.claude.days_count > 0 {
+        rows.push(ProviderTotal::new(
             Provider::ClaudeCode,
-            &averages.claude,
+            &totals.claude,
             false,
         ));
     }
 
-    if averages.codex.days_count > 0 {
-        rows.push(ProviderAverage::new(
-            Provider::Codex,
-            &averages.codex,
-            false,
-        ));
+    if totals.codex.days_count > 0 {
+        rows.push(ProviderTotal::new(Provider::Codex, &totals.codex, false));
     }
 
-    if averages.copilot.days_count > 0 {
-        rows.push(ProviderAverage::new(
+    if totals.copilot.days_count > 0 {
+        rows.push(ProviderTotal::new(
             Provider::Copilot,
-            &averages.copilot,
+            &totals.copilot,
             false,
         ));
     }
 
-    if averages.gemini.days_count > 0 {
-        rows.push(ProviderAverage::new(
-            Provider::Gemini,
-            &averages.gemini,
-            false,
-        ));
+    if totals.gemini.days_count > 0 {
+        rows.push(ProviderTotal::new(Provider::Gemini, &totals.gemini, false));
     }
 
-    if averages.overall.days_count > 0 || rows.is_empty() {
-        rows.push(ProviderAverage::new_overall(&averages.overall));
+    if totals.overall.days_count > 0 || rows.is_empty() {
+        rows.push(ProviderTotal::new_overall(&totals.overall));
     }
 
     rows
-}
-
-/// Format tokens per day for display
-pub fn format_tokens_per_day(value: f64) -> String {
-    if value >= 9_999.5 {
-        format_number(value.round() as i64)
-    } else if value >= 1.0 {
-        format!("{:.1}", value)
-    } else if value > 0.0 {
-        format!("{:.2}", value)
-    } else {
-        "0".to_string()
-    }
 }
 
 /// Build a summary from raw usage data.
@@ -282,8 +229,8 @@ pub fn build_usage_summary(
         summary.totals.accumulate(row);
     }
 
-    summary.daily_averages =
-        calculate_daily_averages_from_per_provider(per_provider, provider_days, pricing_map);
+    summary.provider_totals =
+        calculate_provider_totals_from_per_provider(per_provider, provider_days, pricing_map);
     summary
 }
 
