@@ -55,7 +55,7 @@ pub enum Commands {
     /// Analyze JSONL conversation files (single file or all sessions)
     Analysis {
         /// Path to the JSONL file to analyze (if not provided, analyzes all sessions)
-        #[arg(short, long)]
+        #[arg(short, long, conflicts_with_all = ["json", "text", "table"])]
         path: Option<PathBuf>,
 
         /// Optional output path to save analysis result as JSON

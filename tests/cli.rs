@@ -138,19 +138,26 @@ fn test_analysis_command_json() {
         .arg("--json")
         .timeout(Duration::from_secs(10));
 
-    let output = cmd.output().unwrap();
+    let output = cmd.output().expect("failed to spawn vct binary");
 
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if !stdout.trim().is_empty() {
-            let json: Result<serde_json::Value, _> = serde_json::from_str(&stdout);
-            assert!(json.is_ok(), "--json output should be valid JSON");
-            assert!(
-                json.unwrap().is_array(),
-                "--json output should be a JSON array of aggregated rows"
-            );
-        }
+    // Allow timeout (env-dependent on session-directory size) but not other
+    // failures — a non-zero exit means a regression in the --json path.
+    if output.status.code().is_none() {
+        return;
     }
+    assert!(
+        output.status.success(),
+        "vct analysis --json failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("--json output should be valid JSON");
+    assert!(
+        json.is_array(),
+        "--json output should be a JSON array of aggregated rows"
+    );
 }
 
 #[test]
@@ -162,7 +169,12 @@ fn test_analysis_command_text() {
         .arg("--text")
         .timeout(Duration::from_secs(10));
 
-    let _ = cmd.output();
+    let output = cmd.output().expect("failed to spawn vct binary");
+    assert!(
+        output.status.success() || output.status.code().is_none(),
+        "vct analysis --text failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -174,7 +186,12 @@ fn test_analysis_command_table() {
         .arg("--table")
         .timeout(Duration::from_secs(10));
 
-    let _ = cmd.output();
+    let output = cmd.output().expect("failed to spawn vct binary");
+    assert!(
+        output.status.success() || output.status.code().is_none(),
+        "vct analysis --table failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -182,16 +199,17 @@ fn test_usage_command_json() {
     let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
     cmd.arg("usage").arg("--json");
 
-    // Should succeed and output valid JSON
-    let output = cmd.output().unwrap();
+    let output = cmd.output().expect("failed to spawn vct binary");
+    assert!(
+        output.status.success(),
+        "vct usage --json failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if !stdout.trim().is_empty() {
-            let json: Result<serde_json::Value, _> = serde_json::from_str(&stdout);
-            assert!(json.is_ok(), "Output should be valid JSON");
-        }
-    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("--json output should be valid JSON");
+    assert!(json.is_array(), "--json output should be a JSON array");
 }
 
 #[test]
