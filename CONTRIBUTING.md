@@ -62,7 +62,7 @@ Unsure where to begin contributing? You can start by looking through `good first
 
 #### Prerequisites
 
-- [Rust toolchain](https://rustup.rs/) **1.85 or higher** — this project targets the **Rust 2024 edition**. Update with `rustup update` if needed.
+- [Rust toolchain](https://rustup.rs/) **1.95 or higher** — pinned in `rust-toolchain.toml` (channel `1.95.0`) and required by `Cargo.toml` (`rust-version = "1.95"`); this project targets the **Rust 2024 edition**. Update with `rustup update` if needed.
 - `rustfmt` and `clippy` components (installed by default with `rustup`).
 - Optional: [`pre-commit`](https://pre-commit.com/), [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov) for coverage, and Docker if you plan to touch the image build.
 
@@ -75,18 +75,21 @@ Unsure where to begin contributing? You can start by looking through `good first
 .
 ├── benches/          # Criterion benchmarks (pricing, parsing, aggregation)
 ├── cli/              # npm and PyPI wrapper packages (nodejs/, python/)
-├── docker/           # Multi-stage Dockerfile (builder → ubuntu:24.04 prod)
-├── examples/         # Sample session files and analysis outputs
+├── docker/           # Multi-stage Dockerfile (rust:1.95-bookworm builder → ubuntu:26.04 prod)
+├── examples/         # Sample session files and golden analysis outputs (one pair per provider)
 ├── src/
-│   ├── analysis/     # JSONL parsers (claude / codex / copilot / gemini) + detector
-│   ├── cache/        # LRU + pricing cache
+│   ├── analysis/     # Roll up parsed CodeAnalysis records into per-model AggregatedAnalysisRow
+│   ├── cache/        # LRU file-parse cache (Arc<CodeAnalysis>, mtime-keyed; capacity 5)
 │   ├── cli.rs        # clap definitions (commands, flags, TimeRange enum)
+│   ├── constants.rs  # Capacity / buffer-size tuning constants + FastHashMap alias
 │   ├── display/      # TUI dashboards, static tables, plain-text renderers (usage rows sorted by cost ascending)
-│   ├── pricing/      # LiteLLM fetch, fuzzy model matching, cost calculation
+│   ├── models/       # Typed structs (CodeAnalysis, Provider, ExtensionType, per-provider log shapes)
+│   ├── pricing/      # LiteLLM fetch, daily on-disk cache, fuzzy model matching, cost calculation
+│   ├── session/      # Per-provider JSONL parsers (claude / codex / copilot / gemini) + detector + ParseMode
 │   ├── update/       # Self-update via GitHub releases (archive extraction)
-│   ├── usage/        # Per-provider token aggregation
-│   └── utils/        # Path resolution, directory walking, time helpers
-└── tests/            # Integration test suite (unit tests live inline in src/)
+│   ├── usage/        # Roll up parsed CodeAnalysis records into per-model token totals + per-provider days
+│   └── utils/        # Path resolution, directory walking, allocator tuning, time helpers
+└── tests/            # Integration test suite (one binary per file; unit tests live inline in src/)
 ```
 
 #### Building from Source
@@ -242,4 +245,4 @@ Aggregate sessions whose modified date falls within the current ISO week.
 
 - **Crates.io**: `cargo package --locked --allow-dirty` locally; publishing is automated via `.github/workflows/build_release.yml`.
 - **npm / PyPI**: wrapper packages live under `cli/nodejs` and `cli/python`. They download the matching GitHub release binary at install time.
-- **Docker**: `docker build -f docker/Dockerfile --target prod -t vibe_coding_tracker:latest .` produces an `ubuntu:24.04`-based image that runs the release binary as `ENTRYPOINT`.
+- **Docker**: `docker build -f docker/Dockerfile --target prod -t vibe_coding_tracker:latest .` produces an `ubuntu:26.04`-based image that runs the release binary as `ENTRYPOINT`.

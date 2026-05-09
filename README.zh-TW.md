@@ -226,8 +226,8 @@ vct usage --json --daily
 
 此工具會自動掃描以下目錄：
 
-- `~/.claude/projects/*.jsonl`（Claude Code）
-- `~/.codex/sessions/*.jsonl`（Codex）
+- `~/.claude/projects/**/*.jsonl`（Claude Code，遞迴包含 subagent 日誌）
+- `~/.codex/sessions/**/*.jsonl`（Codex，遞迴包含每日子目錄）
 - `~/.copilot/session-state/<sessionId>/events.jsonl`（Copilot CLI）
 - `~/.gemini/tmp/<project_hash>/chats/*.jsonl`（Gemini CLI）
 
