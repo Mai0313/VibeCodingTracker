@@ -112,6 +112,33 @@ pub fn parse_codex_logs(logs: &[CodexLog], mode: ParseMode) -> Result<CodeAnalys
     })
 }
 
+/// Strip the metadata header that current Codex (`exec_command`) prepends
+/// to every shell output. Format observed in the wild:
+///
+/// ```text
+/// Chunk ID: <hex>
+/// Wall time: <num> seconds
+/// Process exited with code <num>
+/// Original token count: <num>
+/// Output:
+/// <actual stdout>
+/// ```
+///
+/// Without stripping, sed/cat read-detail extraction over-counts the file
+/// by 5 lines (the prefix). Legacy `shell` outputs do not include the
+/// header, so the search returns the original slice unchanged when no
+/// `\nOutput:\n` marker is found.
+fn strip_exec_command_metadata_prefix(output: &str) -> &str {
+    const MARKER: &str = "\nOutput:\n";
+    if let Some(idx) = output.find(MARKER) {
+        &output[idx + MARKER.len()..]
+    } else if let Some(rest) = output.strip_prefix("Output:\n") {
+        rest
+    } else {
+        output
+    }
+}
+
 /// Build a `CodexShellCall` from either the legacy `shell` function or the
 /// current `exec_command` function.
 ///
@@ -162,14 +189,20 @@ impl CodexAnalysisExt for SessionParseState {
             return;
         }
 
+        // The legacy `shell` function returned just the raw command output
+        // in `output`. The current `exec_command` function wraps that
+        // output with a metadata header — strip it so line counting sees
+        // only what the model actually saw as the file body.
+        let output_body = strip_exec_command_metadata_prefix(&output.output);
+
         // Check for sed command
         if let Some(path) = extract_sed_file_path(&call.script) {
-            self.add_read_detail(&path, &output.output, call.timestamp);
+            self.add_read_detail(&path, output_body, call.timestamp);
             return;
         }
 
         // Check for cat command
-        if let Some((path, content)) = extract_cat_read(&call.script, &output.output) {
+        if let Some((path, content)) = extract_cat_read(&call.script, output_body) {
             self.add_read_detail(&path, &content, call.timestamp);
             return;
         }
@@ -419,5 +452,40 @@ mod tests {
     fn malformed_arguments_yield_none_instead_of_panicking() {
         assert!(parse_function_call("shell", "not json", 0).is_none());
         assert!(parse_function_call("exec_command", "not json", 0).is_none());
+    }
+
+    #[test]
+    fn exec_command_metadata_prefix_is_stripped() {
+        // Real-world Codex `exec_command` output wraps actual stdout with
+        // a 5-line header; without stripping, the analyzer over-counts
+        // file reads by 5 lines per sed/cat invocation.
+        let raw = "Chunk ID: deadbeef\n\
+                   Wall time: 0.0000 seconds\n\
+                   Process exited with code 0\n\
+                   Original token count: 100\n\
+                   Output:\n\
+                   line one\n\
+                   line two\n";
+        assert_eq!(
+            strip_exec_command_metadata_prefix(raw),
+            "line one\nline two\n"
+        );
+    }
+
+    #[test]
+    fn legacy_shell_output_passes_through_unchanged() {
+        // Legacy `shell` function output has no metadata header; the
+        // helper must leave non-prefixed strings exactly as-is so the
+        // existing fixture-based tests keep matching.
+        let raw = "line one\nline two\n";
+        assert_eq!(strip_exec_command_metadata_prefix(raw), raw);
+    }
+
+    #[test]
+    fn output_starting_with_marker_handles_no_leading_newline() {
+        // Defensive: if a future Codex variant drops the leading newline
+        // before the `Output:` marker, still strip it cleanly.
+        let raw = "Output:\nthe content";
+        assert_eq!(strip_exec_command_metadata_prefix(raw), "the content");
     }
 }

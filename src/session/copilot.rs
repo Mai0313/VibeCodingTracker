@@ -293,9 +293,10 @@ fn dispatch_tool(
 /// Callers can pass us two sources:
 ///
 /// 1. `arguments.view_range` — inclusive `[start, end]` line numbers. When
-///    present we synthesise a newline-only placeholder so `count_lines`
-///    still gets the right number of lines; the actual content is not
-///    needed because we only care about the line count.
+///    present we synthesise a `line_count`-line placeholder using a
+///    non-newline character so `add_read_detail`'s `trim_end_matches('\n')`
+///    cannot collapse it back to zero. The actual content is not needed
+///    because we only care about the line count.
 /// 2. `complete.result.content` — the string the model actually received.
 ///    Preferred when available and when no `view_range` was supplied.
 fn extract_view_content(arguments: &Value, result: &Value) -> String {
@@ -305,7 +306,16 @@ fn extract_view_content(arguments: &Value, result: &Value) -> String {
         let start = range.first().and_then(|v| v.as_i64()).unwrap_or(0);
         let end = range.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
         let line_count = (end - start + 1).max(0) as usize;
-        return "\n".repeat(line_count.saturating_sub(1));
+        if line_count == 0 {
+            return String::new();
+        }
+        // A pure-newline placeholder ("\n".repeat(N - 1)) would survive
+        // `count_lines` on its own, but `add_read_detail` first trims
+        // trailing newlines and then the whole thing collapses to an
+        // empty string — so the line tally would silently come back as
+        // zero. Use single-char "lines" joined by '\n' so the trim is a
+        // no-op and `count_lines` recovers exactly `line_count`.
+        return vec!["-"; line_count].join("\n");
     }
 
     result
@@ -362,7 +372,51 @@ fn canonicalize_model_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::canonicalize_model_name;
+    use super::{canonicalize_model_name, extract_view_content};
+    use serde_json::json;
+
+    fn count_lines_after_trim(s: &str) -> usize {
+        // Mirror src/session/state.rs count_lines + add_read_detail's
+        // trim_end_matches('\n') so the test reflects the actual line
+        // tally the analyzer would record.
+        let trimmed = s.trim_end_matches('\n');
+        if trimmed.is_empty() {
+            0
+        } else {
+            trimmed.chars().filter(|c| *c == '\n').count() + 1
+        }
+    }
+
+    #[test]
+    fn view_range_placeholder_survives_trim_end() {
+        // view_range [1, 5] → 5 logical lines. The synthesised
+        // placeholder must yield 5 from `count_lines` even after
+        // `trim_end_matches('\n')` runs in `add_read_detail`.
+        let args = json!({ "view_range": [1, 5], "path": "/tmp/foo" });
+        let result = json!({});
+        let placeholder = extract_view_content(&args, &result);
+        assert_eq!(
+            count_lines_after_trim(&placeholder),
+            5,
+            "view_range [1,5] must count as 5 lines after add_read_detail's trim"
+        );
+    }
+
+    #[test]
+    fn view_range_with_zero_span_returns_empty() {
+        // Edge case: empty range produces an empty placeholder so the
+        // upstream early-return in `add_read_detail` skips it cleanly.
+        let args = json!({ "view_range": [5, 4], "path": "/tmp/foo" });
+        let result = json!({});
+        assert_eq!(extract_view_content(&args, &result), "");
+    }
+
+    #[test]
+    fn view_without_range_uses_result_content() {
+        let args = json!({ "path": "/tmp/foo" });
+        let result = json!({ "content": "alpha\nbeta\ngamma" });
+        assert_eq!(extract_view_content(&args, &result), "alpha\nbeta\ngamma");
+    }
 
     #[test]
     fn claude_dot_version_rewrites_to_dash() {
