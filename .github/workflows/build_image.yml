@@ -78,5 +78,9 @@ jobs:
             ${{ steps.meta.outputs.tags }}
           sbom: false
           provenance: false
-          cache-from: type=registry,ref=${{ steps.extracted_name.outputs.name }}:buildcache
-          cache-to: type=registry,ref=${{ steps.extracted_name.outputs.name }}:buildcache,image-manifest=true,oci-mediatypes=true,mode=max
+          cache-from: |
+            type=gha
+            type=registry,ref=${{ steps.extracted_name.outputs.name }}:buildcache
+          cache-to: |
+            type=gha,mode=max
+            type=registry,ref=${{ steps.extracted_name.outputs.name }}:buildcache,image-manifest=true,oci-mediatypes=true,mode=max
