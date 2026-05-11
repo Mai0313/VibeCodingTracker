@@ -19,20 +19,17 @@ The toolchain is pinned to `rust-toolchain.toml` (1.95.0, edition 2024). On this
 export PATH="$HOME/.cargo/bin:$PATH"
 ```
 
+Standard `cargo build` / `cargo test` / `cargo bench` work as usual. Project-specific entries:
+
 | Command                                     | What it does                                                                          |
 | ------------------------------------------- | ------------------------------------------------------------------------------------- |
-| `cargo build`                               | Debug build                                                                           |
-| `cargo build --release --locked`            | Release build (used for benchmarking / dogfooding)                                    |
 | `cargo build --profile dist --locked`       | Distribution build (fat LTO, single codegen unit) — used by release artifacts         |
 | `cargo build --release --features mimalloc` | Opt-in mimalloc allocator (faster one-shot, ~10× higher RSS in TUI loops)             |
 | `make fmt`                                  | `cargo fmt --all` + `cargo clippy --fix` + clippy with `-D warnings`                  |
-| `cargo test --all`                          | Full test suite (lib unit tests + every integration test binary)                      |
-| `cargo test --test <name>`                  | A single integration crate (one file under `tests/` = one binary)                     |
-| `cargo test --lib <module::path>`           | Unit tests in a specific src module (e.g. `--lib pricing::matching`)                  |
-| `cargo test <test_name> -- --nocapture`     | A single test by name across all binaries                                             |
-| `cargo bench`                               | Criterion benchmarks (`benches/benchmarks.rs`); reports in `target/criterion`         |
 | `uvx pre-commit run --all-files`            | Run all pre-commit hooks (whitespace, JSON/YAML/TOML, mdformat, gitleaks, shellcheck) |
 | `uvx pre-commit install --install-hooks`    | Install the git hooks once after cloning                                              |
+
+Criterion benchmarks live at `benches/benchmarks.rs`; reports land in `target/criterion`.
 
 **Before every commit / PR**, always run `make fmt` and `uvx pre-commit run -a`. CI runs both with `-D warnings`, and the pre-commit hooks gate-keep the repo (gitleaks, mdformat, etc.).
 
