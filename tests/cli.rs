@@ -6,6 +6,7 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use std::path::PathBuf;
 use tempfile::TempDir;
+use vibe_coding_tracker::VERSION;
 
 #[test]
 fn test_version_command() {
@@ -15,6 +16,26 @@ fn test_version_command() {
     cmd.assert()
         .success()
         .stdout(predicate::str::contains("Version"));
+}
+
+#[test]
+fn test_version_flag_outputs_build_version_only() {
+    let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
+    cmd.arg("--version");
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::eq(format!("{VERSION}\n")));
+}
+
+#[test]
+fn test_short_version_flag_outputs_build_version_only() {
+    let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
+    cmd.arg("-V");
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::eq(format!("{VERSION}\n")));
 }
 
 #[test]

@@ -44,7 +44,7 @@ pub fn resolve_time_range(daily: bool, weekly: bool, monthly: bool) -> TimeRange
 /// Vibe Coding Tracker - AI coding assistant usage analyzer
 #[derive(Parser, Debug)]
 #[command(name = "vibe_coding_tracker")]
-#[command(author, version, about, long_about = None)]
+#[command(author, version = crate::VERSION, about, long_about = None)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,

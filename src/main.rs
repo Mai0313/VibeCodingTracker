@@ -32,6 +32,14 @@ fn main() -> Result<()> {
 
     env_logger::init();
 
+    if matches!(
+        std::env::args_os().nth(1).and_then(|arg| arg.into_string().ok()),
+        Some(arg) if arg == "--version" || arg == "-V"
+    ) {
+        println!("{}", vibe_coding_tracker::VERSION);
+        return Ok(());
+    }
+
     let cli = Cli::parse();
 
     match cli.command {
