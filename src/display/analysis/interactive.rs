@@ -230,7 +230,7 @@ pub fn display_analysis_interactive(
                 .map(|row| {
                     create_provider_row(
                         vec![
-                            format!("{} {}", row.icon, row.label),
+                            row.label.to_string(),
                             format_number(row.stats.total_edit_lines as i64),
                             format_number(row.stats.total_read_lines as i64),
                             format_number(row.stats.total_write_lines as i64),

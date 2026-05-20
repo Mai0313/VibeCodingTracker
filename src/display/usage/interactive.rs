@@ -251,7 +251,7 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
                 .map(|row| {
                     create_provider_row(
                         vec![
-                            format!("{} {}", row.icon, row.label),
+                            row.label.to_string(),
                             format_number(row.stats.total_tokens),
                             format!("${:.2}", row.stats.total_cost),
                             format_number(row.stats.days_count as i64),

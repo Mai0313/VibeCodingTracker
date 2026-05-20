@@ -131,8 +131,7 @@ pub fn display_usage_table(usage_data: &UsageData) {
     ]);
 
     for row in &provider_rows {
-        let name = format!("{} {}", row.icon, row.label);
-        let name_cell = create_provider_cell(name, row.table_color, row.emphasize);
+        let name_cell = create_provider_cell(row.label.to_string(), row.table_color, row.emphasize);
         let tokens_cell = create_metric_cell(
             format_number(row.stats.total_tokens),
             row.table_color,

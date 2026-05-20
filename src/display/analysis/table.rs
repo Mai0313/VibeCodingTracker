@@ -145,10 +145,8 @@ pub fn display_analysis_table(analysis: &AnalysisData) {
     ]);
 
     for row in &provider_rows {
-        let name = format!("{} {}", row.icon, row.label);
-
         totals_table.add_row(vec![
-            create_provider_cell(name, row.table_color, row.emphasize),
+            create_provider_cell(row.label.to_string(), row.table_color, row.emphasize),
             create_metric_cell(
                 format_number(row.stats.total_edit_lines as i64),
                 row.table_color,

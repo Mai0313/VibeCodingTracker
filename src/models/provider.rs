@@ -78,17 +78,6 @@ impl Provider {
             Self::Unknown => "Unknown",
         }
     }
-
-    /// Returns the emoji icon representing the provider
-    pub const fn icon(&self) -> &'static str {
-        match self {
-            Self::ClaudeCode => "🤖",
-            Self::Codex => "🧠",
-            Self::Copilot => "🐙",
-            Self::Gemini => "✨",
-            Self::Unknown => "❓",
-        }
-    }
 }
 
 impl fmt::Display for Provider {
@@ -138,14 +127,5 @@ mod tests {
         assert_eq!(Provider::Copilot.display_name(), "GitHub Copilot");
         assert_eq!(Provider::Gemini.display_name(), "Gemini");
         assert_eq!(Provider::Unknown.display_name(), "Unknown");
-    }
-
-    #[test]
-    fn test_provider_icon() {
-        assert_eq!(Provider::ClaudeCode.icon(), "🤖");
-        assert_eq!(Provider::Codex.icon(), "🧠");
-        assert_eq!(Provider::Copilot.icon(), "🐙");
-        assert_eq!(Provider::Gemini.icon(), "✨");
-        assert_eq!(Provider::Unknown.icon(), "❓");
     }
 }
