@@ -11,6 +11,8 @@ Rust CLI (`vibe_coding_tracker`, short alias `vct`) that scans on-disk JSONL ses
 
 Both subcommands support four output modes (interactive TUI / static table / plain text / JSON) and four time-range filters (`--daily` / `--weekly` / `--monthly` / `--all`). The interactive TUI is the default when no output flag is given.
 
+Two auxiliary subcommands round out the CLI: `vct version` prints build/toolchain info (table default, plus `--json` / `--text`), and `vct update` self-replaces the binary from the matching GitHub release asset (`--check` to inspect availability only, `--force` to skip the confirmation prompt).
+
 ## Common commands
 
 The toolchain is pinned to `rust-toolchain.toml` (1.95.0, edition 2024). On this machine `cargo` is **not** on the default `PATH`; export it before invoking any cargo command:
@@ -62,10 +64,12 @@ src/display/        ← TUI / table / text / JSON renderers
 - **Claude Code** — any record carrying a `parentUuid` field
 - **Codex** — any record whose `type` is one of `session_meta` / `turn_context` / `event_msg` / `response_item`, or default fallback when no other marker is found
 
-Two entry points:
+Four parser entry points live in `src/session/parser.rs`:
 
-- `parse_session_file_typed(path)` — content-based auto-detection. **Only** for the CLI single-file path (`vct analysis --path ...`).
-- `parse_session_file_as(path, provider, mode)` — caller already knows the provider from the source directory. Use this from every directory walker — it eliminates the "metadata sentinel mis-classifies a Claude session as Codex" bug class.
+- `parse_session_file(path) -> serde_json::Value` — untyped JSON wrapper used by `vct analysis --path` in `main.rs`. Returns the same shape as the golden fixtures under `examples/`.
+- `parse_session_file_typed(path) -> CodeAnalysis` — typed, content-based auto-detection. **Only** for the CLI single-file path when no provider is known up front.
+- `parse_session_file_typed_with_mode(path, mode)` — same as above but lets the caller choose `ParseMode::Full` vs `UsageOnly`.
+- `parse_session_file_as(path, provider, mode)` — caller already knows the provider from the source directory. Use this from every directory walker — it eliminates the "metadata sentinel mis-classifies a Claude session as Codex" bug class. `provider` is the `Provider` enum defined in `src/models/provider.rs`.
 
 `classify_records()` is the streaming-friendly variant that returns `None` on indeterminate records and lets callers keep peeking until a marker arrives — there is **no fixed peek window**, which is critical because a Claude metadata preamble (`permission-mode`, `file-history-snapshot`, …) can be arbitrarily long.
 
@@ -104,10 +108,22 @@ Global singleton `GLOBAL_FILE_CACHE` (capacity = 5 in `constants::capacity::FILE
 
 `BUILD_VERSION` is generated from `git describe` (latest tag + commits since + short SHA + `-dirty` suffix when applicable). Outside a git worktree it falls back to `Cargo.toml`. `BUILD_RUST_VERSION` and `BUILD_CARGO_VERSION` come from `rustc --version` / `cargo --version` at build time. All three are exposed via `vct version`.
 
+`src/main.rs` also short-circuits the top-level `--version` / `-V` flag *before* `Cli::parse()`, by inspecting `std::env::args_os().nth(1)` and printing `VERSION` directly. This keeps the conventional `vct --version` flag working in parallel with the `vct version` subcommand — preserve this branch if you touch the entry point.
+
+### Self-update (`src/update/`)
+
+`vct update` resolves the current host's `(os, arch, libc)` tuple via `platform.rs`, fetches the matching asset from the latest GitHub Releases tag, extracts the archive (zip on Windows, tar.gz elsewhere) via `archive.rs`, then atomically replaces the running binary. `mod.rs` exposes `check_update()` (no-op probe) and `update_interactive(force)` (the path `--force` skips the confirmation prompt). `extract_semver_version()` strips the `git describe` suffix so the freshness comparison only looks at the SemVer tag.
+
 ## Conventions
 
 - **Commit messages** are English-only and follow [Conventional Commits](https://www.conventionalcommits.org/) (`feat:` / `fix:` / `docs:` / `perf:` / `refactor:` / `style:` / `test:` / `chore:` / `ci:`). The `semantic-pull-request` workflow enforces this on PR titles, and `git-cliff` consumes them for release notes.
 - When CLI behavior or flags change, update **all three** READMEs (`README.md`, `README.zh-CN.md`, `README.zh-TW.md`) in the same PR — they must stay in sync.
 - The wrapper packages under `cli/nodejs/` and `cli/python/` download the matching GitHub release binary at install time; they're not built from source via `cargo`.
-- Test layout follows [Rust Book ch11-03](https://doc.rust-lang.org/book/ch11-03-test-organization.html): unit tests inline in `src/<module>/*.rs` inside `#[cfg(test)] mod tests`; each file under `tests/` compiles to its own binary.
-- Sample fixtures and golden outputs for all four providers live in `examples/`. The `tests/parser.rs` integration test compares actual analyzer output to the golden JSON while ignoring environment-specific fields (`insightsVersion`, `machineId`, `user`, `gitRemoteUrl`).
+- Test layout follows [Rust Book ch11-03](https://doc.rust-lang.org/book/ch11-03-test-organization.html): unit tests inline in `src/<module>/*.rs` inside `#[cfg(test)] mod tests`; each file under `tests/` compiles to its own binary. The integration-test split is one-file-per-subsystem:
+    - `tests/cli.rs` — `assert_cmd`-driven end-to-end checks of the built binary (subcommand wiring, flag conflicts, exit codes)
+    - `tests/parser.rs` — golden-output comparison against `examples/analysis_result_*.json`, ignoring environment-specific fields (`insightsVersion`, `machineId`, `user`, `gitRemoteUrl`)
+    - `tests/analysis.rs` — `aggregate_sessions_by_model` rollup logic
+    - `tests/usage.rs` — `get_usage_from_directories` aggregation
+    - `tests/pricing.rs` — `ModelPricingMap` lookup priority + tiered pricing math
+    - `tests/cache.rs` — LRU file cache + pricing cache invalidation
+- Sample fixtures and golden outputs for all four providers live in `examples/` (one `test_conversation_<provider>.jsonl` plus one `analysis_result_<provider>.json` per provider).
