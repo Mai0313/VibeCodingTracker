@@ -66,7 +66,7 @@ pub fn check_update() -> Result<Option<String>> {
     match get_version_comparison()? {
         Some((current_version, _, latest_version, release)) => {
             println!(
-                "🆕 Update available: v{} → v{}",
+                "Update available: v{} → v{}",
                 extract_semver_version(&current_version),
                 latest_version
             );
