@@ -76,10 +76,6 @@ protect_breaking_commits = true
 # Assigns commits to groups.
 # Optionally sets the commit's scope and can decide to exclude commits from further processing.
 commit_parsers = [
-  # Skip dependency updates from dependabot
-  { message = "^chore\\(deps(-dev)?\\)", skip = true },
-  # Skip all other scoped chore commits (e.g. chore(ci), chore(release))
-  { message = "^chore\\(", skip = true },
   # Breaking changes: feat!: or feat(scope)!: → always bump major
   { message = "^[a-zA-Z]+(\\(.+\\))?!:", group = "<!-- 00 -->💥 Breaking Changes", increment = "Major" },
   { message = "^feat(\\(.+\\))?:", group = "<!-- 0 -->🚀 Features" },
@@ -90,8 +86,8 @@ commit_parsers = [
   { message = "^perf(\\(.+\\))?:", group = "<!-- 4 -->⚡ Performance" },
   { message = "^style(\\(.+\\))?:", group = "<!-- 5 -->🎨 Styling" },
   { message = "^test(\\(.+\\))?:", group = "<!-- 6 -->🧪 Testing" },
-  # Plain chore: (no scope) and ci: go to Miscellaneous Tasks
-  { message = "^chore:|^ci(\\(.+\\))?:", group = "<!-- 7 -->⚙️ Miscellaneous Tasks" },
+  # All chore: (scoped or not) and ci: go to Miscellaneous Tasks
+  { message = "^chore(\\(.+\\))?:|^ci(\\(.+\\))?:", group = "<!-- 7 -->⚙️ Miscellaneous Tasks" },
   { body = ".*security", group = "<!-- 8 -->🛡️ Security" },
   { message = "^revert", group = "<!-- 9 -->◀️ Revert" },
   { message = ".*", group = "<!-- 10 -->💼 Other" },
