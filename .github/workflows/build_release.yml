@@ -182,6 +182,7 @@ jobs:
     runs-on: ubuntu-latest
 
     permissions:
+      contents: read
       id-token: write
 
     strategy:
@@ -204,8 +205,11 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
+          node-version: lts/*
+
+      - name: Update npm
+        run: |
+          npm install -g npm@latest
 
       - name: Extract version from tag
         id: version
@@ -269,12 +273,10 @@ jobs:
           cp README.zh-CN.md cli/nodejs/README.zh-CN.md
           cp README.zh-TW.md cli/nodejs/README.zh-TW.md
 
-      - name: Publish to npm with provenance
+      - name: Publish to npm
         working-directory: cli/nodejs
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN }}
         run: |
-          npm publish --provenance --access public
+          npm publish --access public
 
       - name: Verify publication
         working-directory: cli/nodejs
