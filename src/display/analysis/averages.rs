@@ -2,17 +2,30 @@ use crate::analysis::{AggregatedAnalysisRow, PerProviderAnalysisRows};
 use crate::display::common::ProviderTotal;
 use crate::models::{Provider, ProviderActiveDays};
 
-/// Data structure for an analysis row (internal use)
+/// Display-side copy of one model's analysis metrics.
+///
+/// Mirrors [`AggregatedAnalysisRow`] but is decoupled from the (de)serializable
+/// aggregator type so the renderers can also use it as a mutable `TOTAL`
+/// accumulator. Construct via [`convert_to_analysis_rows`] or `Default`.
 #[derive(Default)]
 pub struct AnalysisRow {
+    /// Model name the metrics are grouped under.
     pub model: String,
+    /// Total lines changed by `Edit`/`MultiEdit` operations.
     pub edit_lines: usize,
+    /// Total lines returned by `Read` operations.
     pub read_lines: usize,
+    /// Total lines emitted by `Write` operations.
     pub write_lines: usize,
+    /// Number of `Bash` tool calls.
     pub bash_count: usize,
+    /// Number of `Edit` tool calls.
     pub edit_count: usize,
+    /// Number of `Read` tool calls.
     pub read_count: usize,
+    /// Number of `TodoWrite` tool calls.
     pub todo_write_count: usize,
+    /// Number of `Write` tool calls.
     pub write_count: usize,
 }
 
@@ -21,18 +34,28 @@ pub struct AnalysisRow {
 /// without computing a rate.
 #[derive(Default, Clone)]
 pub struct AnalysisProviderStats {
+    /// Sum of `Edit` lines across the provider's models.
     pub total_edit_lines: usize,
+    /// Sum of `Read` lines across the provider's models.
     pub total_read_lines: usize,
+    /// Sum of `Write` lines across the provider's models.
     pub total_write_lines: usize,
+    /// Sum of `Bash` tool calls across the provider's models.
     pub total_bash_count: usize,
+    /// Sum of `Edit` tool calls across the provider's models.
     pub total_edit_count: usize,
+    /// Sum of `Read` tool calls across the provider's models.
     pub total_read_count: usize,
+    /// Sum of `TodoWrite` tool calls across the provider's models.
     pub total_todo_write_count: usize,
+    /// Sum of `Write` tool calls across the provider's models.
     pub total_write_count: usize,
+    /// Number of distinct days that contributed to these totals.
     pub days_count: usize,
 }
 
 impl AnalysisProviderStats {
+    /// Adds one model row's metrics into the running provider totals.
     fn accumulate_row(&mut self, row: &AnalysisRow) {
         self.total_edit_lines += row.edit_lines;
         self.total_read_lines += row.read_lines;
@@ -113,6 +136,7 @@ pub fn calculate_analysis_provider_totals_from_per_provider(
     totals
 }
 
+/// Folds every aggregated row for one provider into its `stats` totals.
 fn accumulate_analysis_provider(stats: &mut AnalysisProviderStats, rows: &[AggregatedAnalysisRow]) {
     let analysis_rows = convert_to_analysis_rows(rows);
     for row in &analysis_rows {
@@ -120,7 +144,12 @@ fn accumulate_analysis_provider(stats: &mut AnalysisProviderStats, rows: &[Aggre
     }
 }
 
-/// Build provider total rows for display.
+/// Build the per-provider total rows for the display layer.
+///
+/// Emits one row per provider that has at least one active day, followed by an
+/// emphasized "All Providers" overall row. The overall row is always appended
+/// when there is overall activity, and also when no provider matched so the
+/// table is never empty.
 pub fn build_analysis_provider_rows(
     totals: &AnalysisProviderTotals,
 ) -> Vec<ProviderTotal<'_, AnalysisProviderStats>> {
@@ -157,7 +186,35 @@ pub fn build_analysis_provider_rows(
     rows
 }
 
-/// Convert AggregatedAnalysisRow to AnalysisRow
+/// Convert aggregator rows into the renderers' [`AnalysisRow`] shape.
+///
+/// A field-for-field copy that decouples the display state from the
+/// (de)serializable [`AggregatedAnalysisRow`]; `model` is cloned, all counters
+/// are carried over verbatim.
+///
+/// # Examples
+///
+/// ```
+/// use vibe_coding_tracker::analysis::AggregatedAnalysisRow;
+/// use vibe_coding_tracker::display::analysis::convert_to_analysis_rows;
+///
+/// let aggregated = vec![AggregatedAnalysisRow {
+///     model: "claude-sonnet-4-6".to_string(),
+///     edit_lines: 12,
+///     read_lines: 34,
+///     write_lines: 5,
+///     bash_count: 2,
+///     edit_count: 3,
+///     read_count: 4,
+///     todo_write_count: 1,
+///     write_count: 1,
+/// }];
+///
+/// let rows = convert_to_analysis_rows(&aggregated);
+/// assert_eq!(rows.len(), 1);
+/// assert_eq!(rows[0].model, "claude-sonnet-4-6");
+/// assert_eq!(rows[0].edit_lines, 12);
+/// ```
 pub fn convert_to_analysis_rows(data: &[AggregatedAnalysisRow]) -> Vec<AnalysisRow> {
     data.iter()
         .map(|row| AnalysisRow {

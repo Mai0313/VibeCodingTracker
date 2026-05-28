@@ -1,3 +1,5 @@
+//! Per-provider totals container shared by the `usage` and `analysis` views.
+
 use crate::models::Provider;
 
 /// Per-provider totals organized by AI provider.
@@ -8,10 +10,15 @@ use crate::models::Provider;
 /// parameter is the per-provider stats type each command supplies (e.g.
 /// `ProviderStats` for usage, `AnalysisProviderStats` for analysis).
 pub struct ProviderTotals<S> {
+    /// Totals for Claude Code sessions.
     pub claude: S,
+    /// Totals for OpenAI Codex sessions.
     pub codex: S,
+    /// Totals for GitHub Copilot CLI sessions.
     pub copilot: S,
+    /// Totals for Gemini CLI sessions.
     pub gemini: S,
+    /// Sum across every provider (the "All Providers" bucket).
     pub overall: S,
 }
 
@@ -28,6 +35,10 @@ impl<S: Default> Default for ProviderTotals<S> {
 }
 
 impl<S> ProviderTotals<S> {
+    /// Borrows the stats bucket for `provider`.
+    ///
+    /// [`Provider::Unknown`] maps to the `overall` bucket, since there is no
+    /// dedicated slot for unclassified providers.
     pub fn get_stats(&self, provider: Provider) -> &S {
         match provider {
             Provider::ClaudeCode => &self.claude,
@@ -38,6 +49,10 @@ impl<S> ProviderTotals<S> {
         }
     }
 
+    /// Mutably borrows the stats bucket for `provider`.
+    ///
+    /// [`Provider::Unknown`] maps to the `overall` bucket, since there is no
+    /// dedicated slot for unclassified providers.
     pub fn get_stats_mut(&mut self, provider: Provider) -> &mut S {
         match provider {
             Provider::ClaudeCode => &mut self.claude,

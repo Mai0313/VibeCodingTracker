@@ -23,6 +23,24 @@ use std::path::Path;
 /// conversion to `Value` happens once at the edge here rather than inside the
 /// cache, which keeps long sessions from being duplicated between typed and
 /// `Value` forms when multiple commands run against the same file.
+///
+/// An empty input yields `{}` (not a populated-but-empty `CodeAnalysis`), to
+/// preserve historical CLI behaviour.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be opened or read, or if the parsed
+/// [`crate::CodeAnalysis`] fails to serialise to a `serde_json::Value`.
+///
+/// # Examples
+///
+/// ```no_run
+/// use vibe_coding_tracker::parse_session_file;
+///
+/// let value = parse_session_file("session.jsonl")?;
+/// assert!(value.is_object());
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 pub fn parse_session_file<P: AsRef<Path>>(path: P) -> Result<Value> {
     let analysis = parse_session_file_typed(path)?;
     if analysis.records.is_empty() && analysis.extension_name.is_empty() {
@@ -45,10 +63,53 @@ pub fn parse_session_file<P: AsRef<Path>>(path: P) -> Result<Value> {
 /// counts and token usage (usage / aggregated analysis), use
 /// [`parse_session_file_typed_with_mode`] with [`ParseMode::UsageOnly`]
 /// to avoid allocating `write_file_details`/`edit_file_details` bodies.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be opened or read; an empty or
+/// unparseable file resolves to an empty [`CodeAnalysis`] rather than an
+/// error.
+///
+/// # Examples
+///
+/// ```no_run
+/// use vibe_coding_tracker::parse_session_file_typed;
+///
+/// let analysis = parse_session_file_typed("session.jsonl")?;
+/// println!("provider: {}", analysis.extension_name);
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 pub fn parse_session_file_typed<P: AsRef<Path>>(path: P) -> Result<CodeAnalysis> {
     parse_session_file_typed_with_mode(path, ParseMode::Full)
 }
 
+/// Content-detecting typed parse with an explicit [`ParseMode`].
+///
+/// Same auto-detection as [`parse_session_file_typed`], but the caller
+/// chooses whether to retain per-operation detail ([`ParseMode::Full`]) or
+/// only counts and totals ([`ParseMode::UsageOnly`]). The streaming path is
+/// tried first; only a file whose first line is not valid JSON (e.g. a
+/// pretty-printed single-object dump) falls back to reading the whole file.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be opened or read, or if the fallback
+/// path is reached and the provider cannot be detected (only possible for a
+/// non-empty, non-JSONL file). Empty input resolves to an empty
+/// [`CodeAnalysis`].
+///
+/// # Examples
+///
+/// ```no_run
+/// use vibe_coding_tracker::session::parse_session_file_typed_with_mode;
+/// use vibe_coding_tracker::session::ParseMode;
+///
+/// let analysis =
+///     parse_session_file_typed_with_mode("session.jsonl", ParseMode::UsageOnly)?;
+/// // UsageOnly skips per-file detail bodies; counts still populate.
+/// assert!(analysis.records.iter().all(|r| r.write_file_details.is_empty()));
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 pub fn parse_session_file_typed_with_mode<P: AsRef<Path>>(
     path: P,
     mode: ParseMode,
@@ -84,6 +145,29 @@ pub fn parse_session_file_typed_with_mode<P: AsRef<Path>>(
 /// where a metadata sentinel record at the top of a session (`permission-mode`,
 /// `file-history-snapshot`) leads the content-based detector to mis-file the
 /// log under another provider and silently drop its usage totals.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be opened or read. No detection error
+/// is possible — `provider` is supplied by the caller. Empty input resolves
+/// to an empty [`CodeAnalysis`].
+///
+/// # Examples
+///
+/// ```no_run
+/// use vibe_coding_tracker::session::parse_session_file_as;
+/// use vibe_coding_tracker::session::ParseMode;
+/// use vibe_coding_tracker::ExtensionType;
+///
+/// // A file walked out of `~/.claude/projects` is known to be Claude Code.
+/// let analysis = parse_session_file_as(
+///     "session.jsonl",
+///     ExtensionType::ClaudeCode,
+///     ParseMode::Full,
+/// )?;
+/// # let _ = analysis;
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 pub fn parse_session_file_as<P: AsRef<Path>>(
     path: P,
     provider: ExtensionType,
@@ -115,6 +199,15 @@ pub fn parse_session_file_as<P: AsRef<Path>>(
 /// is a record) from a pretty-printed single-object JSON (which parses as a
 /// multi-line block and therefore fails `from_str` on line one). No detection
 /// happens here — the provider was decided by the path the file came from.
+///
+/// Returns `Ok(None)` for an empty file or one whose first line is not JSONL,
+/// signalling the caller to use the `read_json` fallback.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be opened or a line cannot be read, or
+/// if the chosen provider's dispatch step fails (the Gemini arm requires a
+/// parseable session-meta first line).
 fn stream_parse_known(
     path: &Path,
     provider: ExtensionType,
@@ -154,6 +247,15 @@ fn stream_parse_known(
 /// `type` values (`session_meta`, `turn_context`, …) so a synthetic file
 /// with no markers is most likely a deliberately-empty Codex fixture
 /// rather than a silently-broken Claude log.
+///
+/// Returns `Ok(None)` when the file is empty or its first line is not JSON
+/// (a pretty-printed dump), signalling the caller to use the `read_json`
+/// fallback.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be opened or a line cannot be read, or
+/// if the resolved provider's dispatch step fails.
 fn stream_parse_autodetect(path: &Path, mode: ParseMode) -> Result<Option<CodeAnalysis>> {
     let file =
         File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
@@ -214,6 +316,11 @@ fn stream_parse_autodetect(path: &Path, mode: ParseMode) -> Result<Option<CodeAn
 
 /// Reads lines from `reader` until it finds a non-empty one. Returns `Ok(None)`
 /// at EOF.
+///
+/// # Errors
+///
+/// Returns an error if the underlying `read_line` fails (e.g. an I/O error or
+/// invalid UTF-8 in the stream).
 fn read_next_non_empty_line<R: BufRead>(reader: &mut R) -> Result<Option<String>> {
     let mut line = String::new();
     loop {

@@ -1,3 +1,10 @@
+//! Platform-specific pieces of the self-updater.
+//!
+//! Derives the release asset file name for the host `(os, arch)` and performs
+//! the OS-specific binary swap. Unix can rename over the running executable;
+//! Windows cannot, so it stages the new binary and writes a batch script that
+//! finishes the replacement after the process exits.
+
 use anyhow::{Context, Result};
 use std::env;
 use std::fs;
@@ -6,7 +13,15 @@ use std::path::Path;
 #[cfg(windows)]
 use std::io::Write;
 
-/// Returns the GitHub release asset name for the current platform and version
+/// Builds the release asset file name for the current platform and `version`.
+///
+/// Maps the running OS and `env::consts::ARCH` to the release naming scheme
+/// (`x86_64` → `x64`, `aarch64` → `arm64`; Linux assets are `-gnu.tar.gz`,
+/// macOS `.tar.gz`, Windows `.zip`).
+///
+/// # Errors
+///
+/// Returns an error if the host OS is not one of linux, macos, or windows.
 pub fn get_asset_pattern(version: &str) -> Result<String> {
     let os = env::consts::OS;
     let arch = env::consts::ARCH;
@@ -36,9 +51,17 @@ pub fn get_asset_pattern(version: &str) -> Result<String> {
     Ok(pattern)
 }
 
-/// Performs the update on Unix-like systems by renaming binaries
+/// Swaps in `new_binary` over `current_exe` on Unix by renaming.
 ///
-/// Strategy: Rename current binary to `.old` backup, then move new binary to current location.
+/// Renames the running binary to a sibling `.old` backup (when it exists), then
+/// renames `new_binary` into its place. On Unix an executable can be replaced
+/// while running, so this takes effect immediately.
+///
+/// # Errors
+///
+/// Returns an error if backing up the current binary fails or if moving the new
+/// binary into place fails (for example, across filesystems where rename is not
+/// atomic).
 #[cfg(unix)]
 pub fn perform_update_unix(current_exe: &Path, new_binary: &Path) -> Result<()> {
     let backup_path = current_exe.with_extension("old");
@@ -54,10 +77,18 @@ pub fn perform_update_unix(current_exe: &Path, new_binary: &Path) -> Result<()> 
     Ok(())
 }
 
-/// Performs the update on Windows using a batch script
+/// Stages `new_binary` and writes a batch script to finish the swap on Windows.
 ///
-/// Strategy: Save new binary as `.new`, create a batch script that replaces the binary
-/// after the current process exits. User must run the batch script to complete update.
+/// Windows will not let a running executable be replaced, so the new binary is
+/// moved to a sibling `.new` file and an `update_vct.bat` is written that, once
+/// the process exits, deletes the old binary, moves `.new` into place, relaunches
+/// it, and deletes itself. The user is told to close the app and run the script;
+/// the replacement does not happen within this call.
+///
+/// # Errors
+///
+/// Returns an error if moving the new binary to the `.new` path fails, or if the
+/// batch script cannot be created or written.
 #[cfg(windows)]
 pub fn perform_update_windows(current_exe: &Path, new_binary: &Path) -> Result<()> {
     // On Windows, we can't replace the running executable directly

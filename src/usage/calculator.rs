@@ -1,3 +1,13 @@
+//! Aggregates per-model token usage across the four provider session trees.
+//!
+//! Each provider directory is walked with the provider fixed by its *source
+//! path* (never re-detected from file contents), parsed in
+//! [`ParseMode::UsageOnly`] to skip the heavy file-operation payloads, and the
+//! small per-model usage maps are merged into a [`UsageData`]. The provider is
+//! tracked twice on purpose — once merged across providers (the per-model
+//! table) and once kept per source directory (the per-provider footer) — see
+//! [`UsageData`] for why.
+
 use crate::cli::TimeRange;
 use crate::constants::{FastHashMap, capacity};
 use crate::models::{
@@ -14,7 +24,27 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::path::Path;
 
-/// Usage results with provider active day counts for daily averages
+/// Aggregated token usage plus the per-provider active-day counts.
+///
+/// Built only by [`get_usage_from_directories`]; all fields are public for the
+/// display layer to read. Token totals are tracked two ways at once because the
+/// two views need different attribution: [`models`](UsageData::models) merges a
+/// shared model (e.g. `claude-sonnet-4-6` emitted by both Claude Code and
+/// Copilot CLI) into one row, while [`per_provider`](UsageData::per_provider)
+/// keeps the same tokens scoped to the source directory so the footer can
+/// attribute them correctly. The shared tokens are merged, not summed, so they
+/// are never double-counted across the two maps.
+///
+/// # Examples
+///
+/// ```no_run
+/// use vibe_coding_tracker::{get_usage_from_directories, TimeRange};
+///
+/// let data = get_usage_from_directories(TimeRange::All)?;
+/// // Total distinct days that contributed any usage, across all providers.
+/// println!("active days: {}", data.provider_days.total);
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 pub struct UsageData {
     /// Tokens aggregated across *all* providers, keyed by model name.
     ///
@@ -28,6 +58,8 @@ pub struct UsageData {
     /// guess a model's provider from its name, which broke once Copilot CLI
     /// started emitting real (Claude / OpenAI / …) model names.
     pub per_provider: PerProviderUsage,
+    /// Count of distinct calendar dates that contributed usage, per provider
+    /// and overall.
     pub provider_days: ProviderActiveDays,
 }
 
@@ -51,10 +83,32 @@ fn extract_conversation_usage_from_analysis(analysis: &CodeAnalysis) -> FastHash
     conversation_usage
 }
 
-/// Aggregates token usage from all AI provider session directories
+/// Aggregates token usage from all AI provider session directories.
 ///
-/// Scans Claude Code, Codex, Copilot, and Gemini session files, extracts token usage,
-/// and aggregates by model. Returns usage data with provider active day counts.
+/// Scans the Claude Code, Codex, Copilot, and Gemini session trees resolved by
+/// [`resolve_paths`], filtered by `time_range`, and rolls every session's
+/// per-model usage into a [`UsageData`]. Missing provider directories are
+/// skipped silently, and a session file that fails to parse logs a warning to
+/// stderr and is excluded rather than aborting the whole scan.
+///
+/// # Errors
+///
+/// Returns an error if [`resolve_paths`] cannot determine the provider
+/// directories (e.g. the home directory is unavailable). Directory traversal
+/// and metadata errors are currently skipped by the walker rather than
+/// propagated.
+///
+/// # Examples
+///
+/// ```no_run
+/// use vibe_coding_tracker::{get_usage_from_directories, TimeRange};
+///
+/// let data = get_usage_from_directories(TimeRange::All)?;
+/// for model in data.models.keys() {
+///     println!("{model}");
+/// }
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
     let paths = resolve_paths()?;
     let mut result = FastHashMap::with_capacity(capacity::MODEL_COMBINATIONS);
@@ -145,6 +199,21 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
     })
 }
 
+/// Walks one provider directory and merges its usage into both result maps.
+///
+/// Files matching `filter_fn` (and within `max_depth`, when set) are parsed in
+/// parallel with the provider fixed to `provider` — never re-detected from
+/// contents — and each session's per-model tokens are merged into both
+/// `global_result` (cross-provider view) and `provider_result` (source-scoped
+/// view). Every contributing session's modified date is inserted into
+/// `unique_dates` for the active-day count. A file that fails to parse logs a
+/// warning and is skipped.
+///
+/// # Errors
+///
+/// Returns an error only if the candidate-file collector returns one. The
+/// current collector skips traversal and metadata errors, and per-file parse
+/// failures are logged and skipped rather than propagated.
 #[allow(clippy::too_many_arguments)] // per-provider helper; struct-wrapping the args would hurt readability
 fn process_usage_directory<P, F>(
     dir: P,
@@ -228,6 +297,13 @@ impl UsageData {
     }
 }
 
+/// Accumulates the token fields of `new` into `existing` in place.
+///
+/// Detects the on-disk usage shape from a marker key and merges accordingly:
+/// the Claude / Gemini / Copilot shape (keyed by `input_tokens`, including the
+/// nested `cache_creation` breakdown) or the Codex shape (keyed by
+/// `total_token_usage`). Values that are not both JSON objects, or that match
+/// neither shape, are left untouched.
 fn merge_usage_values(existing: &mut Value, new: &Value) {
     use crate::utils::{accumulate_i64_fields, accumulate_nested_object};
 

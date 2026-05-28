@@ -1,3 +1,11 @@
+//! Parser for Claude Code session logs (`~/.claude/projects/**/*.jsonl`).
+//!
+//! Claude writes one record per line; assistant records carry token `usage`
+//! and `tool_use` blocks, while the file operation results arrive either in a
+//! top-level `toolUseResult` field (main sessions) or, for subagent JSONL
+//! files that omit it, inside the following user record's
+//! `message.content[].tool_result` block. The parser keys those two shapes
+//! together by `tool_use_id` and routes both to [`SessionParseState`].
 use crate::constants::{FastHashMap, capacity};
 use crate::models::*;
 use crate::session::state::{ParseMode, SessionParseState};
@@ -12,6 +20,15 @@ use serde_json::Value;
 /// into the typed iterator form so that the lean [`ClaudeCodeLog`] shape
 /// drops unused payloads at deserialisation.
 ///
+/// Records that fail to deserialise into [`ClaudeCodeLog`] are skipped rather
+/// than aborting the parse.
+///
+/// # Errors
+///
+/// Returns `Err` only if the underlying [`parse_claude_logs`] does; in
+/// practice the Claude parse never fails (malformed records are dropped),
+/// so this is `Ok` for any input.
+///
 /// [`parse_session_file_typed`]: crate::session::parser::parse_session_file_typed
 pub fn parse_claude_log_values(records: Vec<Value>, mode: ParseMode) -> Result<CodeAnalysis> {
     let iter = records
@@ -25,6 +42,17 @@ pub fn parse_claude_log_values(records: Vec<Value>, mode: ParseMode) -> Result<C
 /// This is the streaming entry point: callers that read JSONL one line at a
 /// time (see [`crate::session::parser::parse_session_file`]) feed records
 /// through here without ever materialising a full `Vec<Value>` of raw JSON.
+///
+/// The returned [`CodeAnalysis`] always holds exactly one record; the
+/// runtime metadata fields (`user`, `extension_name`, …) are left blank here
+/// and filled in by the caller's `finalize` step.
+///
+/// # Errors
+///
+/// Returns `anyhow::Result` for signature uniformity with the other provider
+/// parsers, but the Claude path has no fallible step — every per-record
+/// failure is tolerated by skipping that record — so it returns `Ok` for any
+/// iterator.
 pub fn parse_claude_logs<I>(logs: I, mode: ParseMode) -> Result<CodeAnalysis>
 where
     I: IntoIterator<Item = ClaudeCodeLog>,

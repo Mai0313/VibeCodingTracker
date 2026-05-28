@@ -1,3 +1,8 @@
+//! Plain-text renderer for the `analysis` view.
+//!
+//! Emits one machine-parseable `key=value` line per model, suited for piping
+//! into scripts.
+
 use crate::analysis::AnalysisData;
 
 /// Displays aggregated analysis data as plain text (one model per line, key=value pairs).

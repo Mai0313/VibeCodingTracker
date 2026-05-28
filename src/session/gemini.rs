@@ -1,3 +1,11 @@
+//! Parser for Gemini CLI session logs
+//! (`~/.gemini/tmp/<project_hash>/chats/*.jsonl`).
+//!
+//! The first line is a session-meta record; every subsequent line is an
+//! event. Only `type == "gemini"` (assistant) events carry token usage and
+//! tool calls, so the parser filters to those and ignores `user` / `info` /
+//! `$set` meta-update lines. Gemini does not record the invoking `cwd`, so
+//! the git remote is resolved from the process working directory instead.
 use crate::constants::FastHashMap;
 use crate::models::*;
 use crate::session::state::{ParseMode, SessionParseState};
@@ -16,6 +24,12 @@ use serde_json::Value;
 /// This is the only supported Gemini entry point — legacy single-object
 /// exports (`chats/<session>.json` with an inline `messages` array) are no
 /// longer handled.
+///
+/// # Errors
+///
+/// Returns `anyhow::Result` for parity with the other provider parsers, but
+/// has no fallible step — non-`gemini` events and records that fail to type
+/// as [`GeminiMessage`] are skipped — so it returns `Ok` for any iterator.
 pub fn parse_gemini_events<I>(
     session: GeminiSession,
     events: I,
@@ -55,6 +69,9 @@ where
     ))
 }
 
+/// Converts the accumulated state into a single-record [`CodeAnalysis`],
+/// stamping the `task_id` from the session meta and resolving the git remote
+/// from the process working directory when none was captured.
 fn finalize_record(
     mut state: SessionParseState,
     conversation_usage: FastHashMap<String, Value>,
@@ -81,6 +98,9 @@ fn finalize_record(
     }
 }
 
+/// Folds one assistant `gemini` message into `state`: updates the latest
+/// timestamp, adds its token usage, and dispatches each of its tool calls to
+/// the matching read / write / edit / run-command tally.
 fn process_gemini_message(
     state: &mut SessionParseState,
     conversation_usage: &mut FastHashMap<String, Value>,

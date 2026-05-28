@@ -22,14 +22,16 @@ static MATCH_CACHE: LazyLock<RwLock<LruCache<String, ModelPricingResult>>> = Laz
     RwLock::new(LruCache::new(capacity))
 });
 
-/// Result of a model pricing lookup including the matched model name for transparency
+/// Result of a model pricing lookup, including the matched model name for transparency.
 #[derive(Debug, Clone)]
 pub struct ModelPricingResult {
+    /// Pricing for the matched model, or `ModelPricing::default()` (all zero) on no match.
     pub pricing: ModelPricing,
+    /// The actual model key that matched, or `None` for an exact match or no match.
     pub matched_model: Option<String>,
 }
 
-/// Optimized pricing map with precomputed indices for O(1) exact matches and fast fuzzy matching
+/// Optimized pricing map with precomputed indices for O(1) exact matches and fast fuzzy matching.
 #[derive(Debug, Clone)]
 pub struct ModelPricingMap {
     // Original pricing data (use Rc<str> to avoid cloning keys)
@@ -41,11 +43,23 @@ pub struct ModelPricingMap {
 }
 
 impl ModelPricingMap {
-    /// Creates a new pricing map with precomputed indices for optimized lookups
+    /// Creates a new pricing map with precomputed indices for optimized lookups.
     ///
     /// This constructor processes the raw pricing data to build:
-    /// - Normalized key index for version-agnostic matching
-    /// - Lowercase key list for substring and fuzzy matching
+    /// - Normalized key index for version-agnostic matching.
+    /// - Lowercase key list for substring and fuzzy matching.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    /// use vibe_coding_tracker::pricing::{ModelPricing, ModelPricingMap};
+    ///
+    /// let mut raw = HashMap::new();
+    /// raw.insert("gpt-4".to_string(), ModelPricing::default());
+    /// let map = ModelPricingMap::new(raw);
+    /// assert!(!map.is_empty());
+    /// ```
     pub fn new(raw: HashMap<String, ModelPricing>) -> Self {
         // Pre-allocate with exact capacity
         let capacity = raw.len();
@@ -79,16 +93,40 @@ impl ModelPricingMap {
         }
     }
 
-    /// Retrieves pricing for a model using multi-tier matching strategy
+    /// Retrieves pricing for a model using a multi-tier matching strategy.
     ///
     /// Matching strategy (in order of priority):
-    /// 1. Exact match (O(1) hash lookup)
-    /// 2. Normalized match (removes version suffixes)
-    /// 3. Substring match (bidirectional contains check)
-    /// 4. Fuzzy match (Jaro-Winkler ≥ 0.7 threshold)
-    /// 5. Default (zero cost) if no match found
+    /// 1. Exact match (O(1) hash lookup).
+    /// 2. Normalized match (removes version suffixes).
+    /// 3. Substring match (bidirectional contains check).
+    /// 4. Fuzzy match (Jaro-Winkler ≥ 0.7 threshold).
+    /// 5. Default (zero cost) if no match found.
     ///
-    /// Results are cached globally for performance.
+    /// Results are cached globally (see [`clear_pricing_cache`]) for performance,
+    /// so even the "no match" outcome is memoized to avoid repeated fuzzy scans.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    /// use vibe_coding_tracker::pricing::{ModelPricing, ModelPricingMap};
+    ///
+    /// let mut raw = HashMap::new();
+    /// raw.insert(
+    ///     "gpt-4".to_string(),
+    ///     ModelPricing { input_cost_per_token: 3e-5, ..Default::default() },
+    /// );
+    /// let map = ModelPricingMap::new(raw);
+    ///
+    /// // Exact match: `matched_model` stays `None`.
+    /// let hit = map.get("gpt-4");
+    /// assert_eq!(hit.pricing.input_cost_per_token, 3e-5);
+    /// assert!(hit.matched_model.is_none());
+    ///
+    /// // No match: zero-cost default.
+    /// let miss = map.get("does-not-exist-xyzzy");
+    /// assert_eq!(miss.pricing.input_cost_per_token, 0.0);
+    /// ```
     pub fn get(&self, model_name: &str) -> ModelPricingResult {
         // Ultra-fast path: Check LRU cache first (with peek to avoid write lock)
         if let Ok(cache_read) = MATCH_CACHE.read()
@@ -185,36 +223,47 @@ impl ModelPricingMap {
         result
     }
 
-    /// Returns whether the pricing map contains no models
+    /// Returns whether the pricing map contains no models.
     pub fn is_empty(&self) -> bool {
         self.raw.is_empty()
     }
 
-    /// Returns the raw pricing data with reference-counted keys
+    /// Returns the raw pricing data with reference-counted keys.
     pub fn raw(&self) -> &HashMap<Rc<str>, ModelPricing> {
         &self.raw
     }
 }
 
-/// Clears the global pricing match LRU cache
+/// Clears the global pricing match LRU cache.
 ///
-/// Primarily used in tests for isolation. In production, the LRU cache significantly
-/// improves performance by avoiding repeated expensive fuzzy matching operations while
-/// maintaining bounded memory usage (max 200 entries).
+/// Primarily used in tests for isolation. In production, the LRU cache
+/// significantly improves performance by avoiding repeated expensive fuzzy
+/// matching operations while maintaining bounded memory usage (capacity is
+/// `PRICING_MATCH_CACHE_SIZE` entries).
 pub fn clear_pricing_cache() {
     if let Ok(mut cache_write) = MATCH_CACHE.write() {
         cache_write.clear();
     }
 }
 
-/// Normalizes model names by removing provider prefixes and version suffixes
+/// Normalizes model names by removing provider prefixes and version suffixes.
 ///
 /// Removes patterns like:
-/// - Provider prefixes: `bedrock/`, `openai/`
-/// - Date suffixes: `-20231201`, `-20240320`
-/// - Version suffixes: `-v1.0`, `-v2`
+/// - Provider prefixes: `bedrock/`, `openai/`.
+/// - Date suffixes: `-20231201`, `-20240320` (exactly `-20YYMMDD`, 8 digits).
+/// - Version suffixes: `-v1.0`, `-v2`.
 ///
-/// Optimized to minimize string allocations.
+/// Optimized to minimize string allocations (a single allocation at the end).
+///
+/// # Examples
+///
+/// ```
+/// use vibe_coding_tracker::pricing::normalize_model_name;
+///
+/// assert_eq!(normalize_model_name("claude-3-sonnet-20240229"), "claude-3-sonnet");
+/// assert_eq!(normalize_model_name("gpt-4-v1.0"), "gpt-4");
+/// assert_eq!(normalize_model_name("bedrock/claude-3-opus"), "claude-3-opus");
+/// ```
 pub fn normalize_model_name(name: &str) -> String {
     let mut start = 0;
     let mut end = name.len();

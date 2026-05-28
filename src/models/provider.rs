@@ -1,20 +1,52 @@
 use std::fmt;
 
-/// Supported AI coding assistant providers
+/// Supported AI coding assistant providers.
+///
+/// Used both to tag a parsed session with its source assistant and to route
+/// per-provider usage aggregation. [`Provider::Unknown`] is the fallback when a
+/// model name matches none of the known prefixes.
+///
+/// # Examples
+///
+/// ```
+/// use vibe_coding_tracker::models::Provider;
+///
+/// assert_eq!(Provider::from_model_name("claude-sonnet-4"), Provider::ClaudeCode);
+/// assert_eq!(Provider::ClaudeCode.display_name(), "Claude Code");
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Provider {
+    /// Anthropic Claude Code.
     ClaudeCode,
+    /// OpenAI Codex CLI (also matches raw `gpt-*` / `o1` / `o3` model names).
     Codex,
+    /// GitHub Copilot CLI.
     Copilot,
+    /// Google Gemini CLI.
     Gemini,
+    /// Model name matched no known provider prefix.
     Unknown,
 }
 
 impl Provider {
-    /// Detects the AI provider from a model name using byte-level pattern matching
+    /// Detects the AI provider from a model name using byte-level prefix matching.
     ///
-    /// This const function enables compile-time optimization and uses efficient byte
-    /// comparison to identify Claude, Gemini, Copilot, or Codex models.
+    /// Recognizes the `claude`, `copilot`, and `gemini` prefixes, and treats
+    /// `gpt*` / `o1*` / `o3*` model names as [`Provider::Codex`]. Matching is
+    /// case-sensitive (lowercase) and operates directly on the UTF-8 bytes, so
+    /// it stays `const` and allocation-free. Returns [`Provider::Unknown`] when
+    /// no prefix matches.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use vibe_coding_tracker::models::Provider;
+    ///
+    /// assert_eq!(Provider::from_model_name("gpt-4-turbo"), Provider::Codex);
+    /// assert_eq!(Provider::from_model_name("o3-mini"), Provider::Codex);
+    /// assert_eq!(Provider::from_model_name("gemini-2.0-flash"), Provider::Gemini);
+    /// assert_eq!(Provider::from_model_name("mystery-model"), Provider::Unknown);
+    /// ```
     pub const fn from_model_name(model: &str) -> Self {
         // Use byte comparison for better performance
         let bytes = model.as_bytes();
@@ -68,7 +100,9 @@ impl Provider {
         Self::Unknown
     }
 
-    /// Returns the human-readable name of the provider
+    /// Returns the human-readable display name of the provider.
+    ///
+    /// This is the same string produced by the [`std::fmt::Display`] impl.
     pub const fn display_name(&self) -> &'static str {
         match self {
             Self::ClaudeCode => "Claude Code",

@@ -1,3 +1,16 @@
+//! Self-update: replace the running binary from the matching GitHub release.
+//!
+//! The flow is: resolve the current host's `(os, arch, libc)` tuple, fetch the
+//! latest GitHub Releases tag, pick the asset whose name matches that tuple,
+//! download and extract it (zip on Windows, tar.gz elsewhere), then atomically
+//! swap it in over the current executable. [`check_update`] is a read-only
+//! probe; [`update_interactive`] is the entry point the `vct update`
+//! subcommand calls.
+//!
+//! Submodules: `github` (Releases API + download), `archive` (extraction with
+//! path-traversal guards), and `platform` (asset-name derivation and the
+//! OS-specific binary swap).
+
 mod archive;
 mod github;
 mod platform;
@@ -10,17 +23,35 @@ use std::fs;
 // Re-export public types for backward compatibility
 pub use github::{GitHubAsset, GitHubRelease};
 
-/// Extracts clean semver version from BUILD_VERSION string
+/// Strips git metadata from a `BUILD_VERSION` string, leaving the base semver.
 ///
-/// BUILD_VERSION may include git metadata: `"0.1.6-5-g1234567-dirty"`
-/// This function returns just the base version: `"0.1.6"`
+/// `BUILD_VERSION` may carry a `git describe` suffix such as
+/// `"0.1.6-5-g1234567-dirty"`; this returns just `"0.1.6"` by taking the text
+/// before the first `-`. A `v` prefix is *not* stripped — callers do that
+/// separately when comparing against a release tag.
+///
+/// # Examples
+///
+/// ```
+/// use vibe_coding_tracker::update::extract_semver_version;
+///
+/// assert_eq!(extract_semver_version("0.1.6-5-g1234567-dirty"), "0.1.6");
+/// assert_eq!(extract_semver_version("2.4.8"), "2.4.8");
+/// ```
 pub fn extract_semver_version(build_version: &str) -> &str {
     // Split by '-' and take the first part (the base version)
     build_version.split('-').next().unwrap_or(build_version)
 }
 
-/// Get the current version information
-/// Returns (full_version_display, semver_version_for_comparison)
+/// Returns the running build's version as `(display string, parsed semver)`.
+///
+/// The display string is the raw [`crate::VERSION`] (with any git suffix); the
+/// parsed [`Version`] is the cleaned base version used for comparison.
+///
+/// # Errors
+///
+/// Returns an error if the base version extracted from [`crate::VERSION`] is
+/// not valid semver.
 fn get_current_version() -> Result<(String, Version)> {
     let full_version = crate::VERSION;
     let semver_str = extract_semver_version(full_version);
@@ -32,9 +63,18 @@ fn get_current_version() -> Result<(String, Version)> {
     Ok((full_version.to_string(), semver_version))
 }
 
-/// Fetches and compares current version with latest GitHub release
+/// Fetches the latest release and compares it against the running version.
 ///
-/// Returns `Some` if an update is available, `None` if already on latest version.
+/// Returns `Some((current_display, current, latest, release))` when the latest
+/// tag is strictly newer than the current version, or `None` when already up to
+/// date (also printing a short "already on latest" line in that case). The
+/// release tag's leading `v` is trimmed before parsing.
+///
+/// # Errors
+///
+/// Returns an error if the GitHub release fetch fails, if the current version
+/// cannot be parsed (see `get_current_version`), or if the release tag is not
+/// valid semver.
 fn get_version_comparison() -> Result<Option<(String, Version, Version, GitHubRelease)>> {
     let release =
         github::fetch_latest_release().context("Failed to fetch latest release information")?;
@@ -61,7 +101,16 @@ fn get_version_comparison() -> Result<Option<(String, Version, Version, GitHubRe
     )))
 }
 
-/// Checks for available updates and displays release notes
+/// Probes for a newer release without installing anything.
+///
+/// Prints an "update available" line and returns `Some(tag_name)` when a newer
+/// release exists, or `None` when already current. This is the read-only path
+/// behind `vct update --check`.
+///
+/// # Errors
+///
+/// Returns an error if the version comparison fails — i.e. the GitHub fetch or
+/// any version parse fails (see `get_version_comparison`).
 pub fn check_update() -> Result<Option<String>> {
     match get_version_comparison()? {
         Some((current_version, _, latest_version, release)) => {
@@ -76,9 +125,23 @@ pub fn check_update() -> Result<Option<String>> {
     }
 }
 
-/// Downloads and installs a specific release from GitHub
+/// Downloads, extracts, and installs a specific `release`, no version check.
 ///
-/// This function performs the actual download and installation without version checking.
+/// Selects the asset matching the current platform, downloads it to the temp
+/// dir, extracts it into a freshly recreated `vct_update/` staging directory,
+/// swaps the new binary in over the running executable (Unix rename or the
+/// Windows deferred-batch strategy), and then best-effort cleans up the
+/// downloaded archive and staging dir. `current_version` is the display string
+/// used only in the success message; `latest_version` is what the binary will
+/// become.
+///
+/// # Errors
+///
+/// Returns an error if no release asset matches this `(os, arch)`, if the
+/// current executable path cannot be resolved, if the staging directory cannot
+/// be cleaned or created, if the download fails, if the archive format is
+/// unsupported or extraction fails, or if replacing the binary fails. Cleanup
+/// of the temporary files is best-effort and never surfaced as an error.
 fn perform_installation(
     current_version: &str,
     latest_version: &Version,
@@ -155,10 +218,16 @@ fn perform_installation(
     Ok(())
 }
 
-/// Downloads and installs the latest version from GitHub releases
+/// Installs the latest release, but only if it is newer than the current one.
 ///
-/// This function works for all installation methods (npm/pip/cargo/manual)
-/// since all packages use the same pre-compiled binaries from GitHub releases.
+/// Returns `Ok(())` without doing anything when already up to date. Works
+/// regardless of how the binary was installed (npm/pip/cargo/manual), because
+/// every channel ships the same pre-compiled GitHub release binaries.
+///
+/// # Errors
+///
+/// Returns an error if the version comparison fails (GitHub fetch or version
+/// parse) or if the subsequent install fails (see `perform_installation`).
 pub fn perform_update() -> Result<()> {
     // Get version comparison
     let Some((current_version, _, latest_version, release)) = get_version_comparison()? else {
@@ -169,10 +238,16 @@ pub fn perform_update() -> Result<()> {
     perform_installation(&current_version, &latest_version, &release)
 }
 
-/// Force downloads and installs the latest version from GitHub releases
+/// Installs the latest release unconditionally, skipping the freshness check.
 ///
-/// This function bypasses version checking and always downloads the latest release.
-/// Only fails if no binary is found for the current platform.
+/// Always re-downloads and reinstalls the latest tag even when the current
+/// binary already matches it (useful for repairing a broken install).
+///
+/// # Errors
+///
+/// Returns an error if the GitHub release fetch fails, if the current or
+/// latest version cannot be parsed, or if the install fails (see
+/// `perform_installation` — notably when no asset matches this platform).
 pub fn perform_force_update() -> Result<()> {
     let release =
         github::fetch_latest_release().context("Failed to fetch latest release information")?;
@@ -189,13 +264,18 @@ pub fn perform_force_update() -> Result<()> {
     perform_installation(&current_version_display, &latest_version, &release)
 }
 
-/// Interactive update process with user confirmation prompt
+/// Runs the `vct update` flow, optionally prompting for confirmation.
 ///
-/// If `force` is true, skips version check and confirmation, forces download of latest version.
-/// If `force` is false, checks version and prompts for confirmation.
+/// With `force` set, skips the freshness check and the prompt and reinstalls
+/// the latest release outright. Otherwise it checks for a newer version and,
+/// only if one exists, asks for `y`/`N` confirmation on stdin before
+/// installing — anything other than `y` cancels.
 ///
-/// This function works for all installation methods (npm/pip/cargo/manual)
-/// since all packages use the same pre-compiled binaries from GitHub releases.
+/// # Errors
+///
+/// Returns an error if the update check or install fails (network, version
+/// parse, asset selection, extraction, or binary swap), or if reading the
+/// confirmation from stdin fails.
 pub fn update_interactive(force: bool) -> Result<()> {
     println!("Checking for updates...");
 

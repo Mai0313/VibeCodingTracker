@@ -19,13 +19,21 @@ use serde_json::Value;
 /// has no equivalent and leaves this at 0.
 #[derive(Debug, Default)]
 pub struct TokenCounts {
+    /// Non-cached prompt tokens (cached reads are excluded; see `cache_read`).
     pub input_tokens: i64,
+    /// User-visible completion tokens, excluding reasoning.
     pub output_tokens: i64,
+    /// Model "thinking" tokens, billed separately from `output_tokens`.
     pub reasoning_tokens: i64,
+    /// Prompt tokens served from the provider's prompt cache.
     pub cache_read: i64,
+    /// Total cache-write tokens across all TTL tiers.
     pub cache_creation: i64,
+    /// Cache-write tokens at the default 5-minute TTL.
     pub cache_creation_5m: i64,
+    /// Cache-write tokens at the extended 1-hour TTL.
     pub cache_creation_1h: i64,
+    /// Sum of the billed buckets used for cost and display.
     pub total: i64,
 }
 
@@ -42,7 +50,27 @@ pub struct TokenCounts {
 /// providers that publish a distinct reasoning rate (e.g. Gemini 2.5
 /// Flash, Perplexity Sonar Deep Research, dashscope/qwen-turbo).
 ///
-/// Returns normalized TokenCounts structure.
+/// Returns a normalized [`TokenCounts`]; a non-object `usage` yields the
+/// all-zero default.
+///
+/// # Examples
+///
+/// ```
+/// use serde_json::json;
+/// use vibe_coding_tracker::utils::extract_token_counts;
+///
+/// // Flat (Claude/Gemini/Copilot) shape with no TTL split: every
+/// // cache_creation token lands in the 5-minute bucket.
+/// let counts = extract_token_counts(&json!({
+///     "input_tokens": 100,
+///     "output_tokens": 50,
+///     "cache_read_input_tokens": 200,
+///     "cache_creation_input_tokens": 10_000,
+/// }));
+/// assert_eq!(counts.input_tokens, 100);
+/// assert_eq!(counts.cache_creation_5m, 10_000);
+/// assert_eq!(counts.cache_creation_1h, 0);
+/// ```
 pub fn extract_token_counts(usage: &Value) -> TokenCounts {
     let mut counts = TokenCounts::default();
 

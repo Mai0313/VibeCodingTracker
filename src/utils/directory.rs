@@ -3,20 +3,26 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
-/// Information about a file found during directory traversal
+/// A file matched during directory traversal, paired with its modification date.
 pub struct FileInfo {
+    /// Absolute path to the matched file.
     pub path: PathBuf,
+    /// Local modification date formatted as `YYYY-MM-DD`, used for grouping.
     pub modified_date: String,
 }
 
-/// Process directory and collect files with their modification dates
+/// Recursively collects the files under `dir` that pass `filter_fn`, tagging
+/// each with its modification date.
 ///
-/// # Arguments
-/// * `dir` - Directory to process
-/// * `filter_fn` - Function to determine if a file should be included
-/// * `time_range` - Time range filter to apply
+/// `filter_fn` decides whether a given path is included; `time_range` drops
+/// files whose modification date falls before its cutoff. Equivalent to
+/// [`collect_files_with_max_depth`] with no depth cap.
 ///
-/// Returns a vector of FileInfo structs for matching files
+/// # Errors
+///
+/// Returns `Result` for caller ergonomics, but the current implementation
+/// never produces an error: a missing directory yields an empty list, and
+/// per-entry traversal or metadata failures are silently skipped.
 pub fn collect_files_with_dates<P, F>(
     dir: P,
     filter_fn: F,
@@ -38,6 +44,12 @@ where
 /// this to avoid paying the cost of `WalkDir` visiting large sibling
 /// subtrees such as `rewind-snapshots/backups/` that never contain a
 /// match but can hold hundreds of files per session.
+///
+/// # Errors
+///
+/// Returns `Result` for caller ergonomics, but the current implementation
+/// never produces an error: a missing directory yields an empty list, and
+/// per-entry traversal or metadata failures are silently skipped.
 pub fn collect_files_with_max_depth<P, F>(
     dir: P,
     filter_fn: F,
@@ -137,7 +149,7 @@ pub fn is_codex_session_file(path: &Path) -> bool {
     }
 }
 
-/// Filter for Claude Code session files (`.jsonl` only)
+/// Filter for Claude Code session files (`.jsonl` only).
 ///
 /// Matches both top-level sessions (`~/.claude/projects/<project>/<session>.jsonl`)
 /// and subagent sessions (`~/.claude/projects/<project>/<session>/subagents/agent-*.jsonl`).
@@ -150,7 +162,7 @@ pub fn is_claude_session_file(path: &Path) -> bool {
     path.extension().is_some_and(|ext| ext == "jsonl")
 }
 
-/// Filter for Gemini CLI session files
+/// Filter for Gemini CLI session files.
 ///
 /// Current Gemini CLI stores each chat as a line-delimited event stream at
 /// `~/.gemini/tmp/<project>/chats/session-*.jsonl`. Only `.jsonl` files
@@ -170,7 +182,7 @@ pub fn is_gemini_session_file(path: &Path) -> bool {
     }
 }
 
-/// Filter for Copilot CLI session files
+/// Filter for Copilot CLI session files.
 ///
 /// Copilot CLI stores each session as a directory under
 /// `~/.copilot/session-state/<sessionId>/` containing the event log
@@ -204,7 +216,7 @@ pub fn is_copilot_session_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Returns true if the path is a Claude Code meta sidecar file
+/// Returns true if the path is a Claude Code meta sidecar file.
 ///
 /// Claude Code writes these next to subagent session logs with metadata like
 /// `agentType` / `description`. Today they're `*.meta.json`; we also reject

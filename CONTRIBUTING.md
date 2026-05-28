@@ -75,7 +75,7 @@ Unsure where to begin contributing? You can start by looking through `good first
 .
 ├── benches/          # Criterion benchmarks (pricing, parsing, aggregation)
 ├── cli/              # npm and PyPI wrapper packages (nodejs/, python/)
-├── docker/           # Multi-stage Dockerfile (rust:1.95-bookworm builder → ubuntu:26.04 prod)
+├── docker/           # Multi-stage Dockerfile (rust:1.95.0-bookworm builder → ubuntu:26.04 prod)
 ├── examples/         # Sample session files and golden analysis outputs (one pair per provider)
 ├── src/
 │   ├── analysis/     # Roll up parsed CodeAnalysis records into per-model AggregatedAnalysisRow
@@ -133,15 +133,15 @@ On Linux/glibc the main binary also calls `mallopt(M_ARENA_MAX, 2)` + `mallopt(M
 
 Common Makefile shortcuts (`make help` to list all):
 
-| Target          | Description                                                     |
-| --------------- | --------------------------------------------------------------- |
-| `make build`    | Debug build (`cargo build`)                                     |
-| `make release`  | Locked release build (`cargo build --release --locked`)         |
-| `make package`  | `cargo package --locked --allow-dirty`                          |
-| `make test`     | Run the full `cargo test --all` suite                           |
-| `make fmt`      | `cargo fmt --all` + `cargo clippy --all-targets --all-features` |
-| `make coverage` | Install & run `cargo-llvm-cov` for workspace coverage           |
-| `make clean`    | Remove build artifacts and prune git objects                    |
+| Target          | Description                                                               |
+| --------------- | ------------------------------------------------------------------------- |
+| `make build`    | Debug build (`cargo build`)                                               |
+| `make release`  | Locked release build (`cargo build --release --locked`)                   |
+| `make package`  | `cargo package --locked --allow-dirty`                                    |
+| `make test`     | Run the full `cargo test --all` suite                                     |
+| `make fmt`      | `cargo fmt --all` + clippy auto-fix (`--fix`) + clippy `-D warnings` gate |
+| `make coverage` | Install & run `cargo-llvm-cov` for workspace coverage                     |
+| `make clean`    | Remove build artifacts and prune git objects                              |
 
 #### Running Tests
 

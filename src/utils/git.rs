@@ -9,10 +9,14 @@ use std::sync::{LazyLock, RwLock};
 static GIT_URL_CACHE: LazyLock<RwLock<HashMap<String, String>>> =
     LazyLock::new(|| RwLock::new(HashMap::with_capacity(20)));
 
-/// Get git remote origin URL from a directory (with caching)
+/// Returns the `origin` remote URL for the git repository at `cwd`.
 ///
-/// This function caches results to avoid repeated file I/O operations.
-/// The cache is keyed by canonical path to handle symbolic links correctly.
+/// Results are memoized in a process-global, thread-safe cache keyed by the
+/// canonicalized path, so symlinked or relative variants of the same
+/// directory share one lookup. The returned URL has any trailing `.git`
+/// stripped. Returns an empty `String` when `cwd` is not a git working tree,
+/// has no `origin` remote, or the config cannot be read — callers treat the
+/// empty string as "no remote".
 pub fn get_git_remote_url<P: AsRef<Path>>(cwd: P) -> String {
     // Try to get canonical path for better cache hits
     let canonical_path = std::fs::canonicalize(cwd.as_ref())
@@ -38,7 +42,9 @@ pub fn get_git_remote_url<P: AsRef<Path>>(cwd: P) -> String {
     url
 }
 
-/// Internal implementation of Git remote URL lookup
+/// Parses `<cwd>/.git/config` and returns the `[remote "origin"]` URL,
+/// or an empty string if absent. The uncached inner worker behind
+/// [`get_git_remote_url`].
 fn get_git_remote_url_impl(cwd: &Path) -> String {
     let git_config = cwd.join(".git").join("config");
 

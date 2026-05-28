@@ -1,3 +1,6 @@
+//! Token-usage aggregation types shared between the usage calculator and the
+//! display layer.
+
 use crate::constants::FastHashMap;
 use crate::models::Provider;
 
@@ -16,10 +19,15 @@ pub type UsageResult = FastHashMap<String, serde_json::Value>;
 /// Day counts are derived from file modification dates during processing.
 #[derive(Debug, Clone, Default)]
 pub struct ProviderActiveDays {
+    /// Distinct active days observed for Claude Code.
     pub claude: usize,
+    /// Distinct active days observed for Codex.
     pub codex: usize,
+    /// Distinct active days observed for Copilot CLI.
     pub copilot: usize,
+    /// Distinct active days observed for Gemini CLI.
     pub gemini: usize,
+    /// Distinct active days across all providers combined.
     pub total: usize,
 }
 
@@ -40,13 +48,18 @@ pub struct ProviderActiveDays {
 /// the same time the global merged map is built.
 #[derive(Debug, Default, Clone)]
 pub struct PerProviderUsage {
+    /// Per-model usage attributed to Claude Code.
     pub claude: UsageResult,
+    /// Per-model usage attributed to Codex.
     pub codex: UsageResult,
+    /// Per-model usage attributed to Copilot CLI.
     pub copilot: UsageResult,
+    /// Per-model usage attributed to Gemini CLI.
     pub gemini: UsageResult,
 }
 
 impl PerProviderUsage {
+    /// Returns the usage map for `provider`, or `None` for [`Provider::Unknown`].
     pub fn get(&self, provider: Provider) -> Option<&UsageResult> {
         match provider {
             Provider::ClaudeCode => Some(&self.claude),
@@ -57,6 +70,8 @@ impl PerProviderUsage {
         }
     }
 
+    /// Returns a mutable handle to the usage map for `provider`, or `None` for
+    /// [`Provider::Unknown`].
     pub fn get_mut(&mut self, provider: Provider) -> Option<&mut UsageResult> {
         match provider {
             Provider::ClaudeCode => Some(&mut self.claude),

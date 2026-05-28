@@ -1,24 +1,50 @@
+//! Filesystem path resolution: the per-provider session directories under the
+//! user's home, the tool's own cache directory, and the dated pricing-cache
+//! file naming scheme.
+
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-/// Resolved paths for AI provider session directories and cache
+/// Resolved on-disk locations for every provider's session logs plus the
+/// tool's cache directory.
+///
+/// Construct one with [`resolve_paths`]; the fields are derived from the
+/// user's home directory and are not validated to exist. The `*_session_dir`
+/// fields point at the subtree a directory walker scans for that provider.
 #[derive(Debug, Clone)]
 pub struct HelperPaths {
+    /// The user's home directory, the root for every other path.
     pub home_dir: PathBuf,
+    /// Codex root (`~/.codex`).
     pub codex_dir: PathBuf,
+    /// Codex session logs (`~/.codex/sessions`).
     pub codex_session_dir: PathBuf,
+    /// Claude Code root (`~/.claude`).
     pub claude_dir: PathBuf,
+    /// Claude Code session logs (`~/.claude/projects`).
     pub claude_session_dir: PathBuf,
+    /// Copilot CLI root (`~/.copilot`).
     pub copilot_dir: PathBuf,
+    /// Copilot CLI session state (`~/.copilot/session-state`).
     pub copilot_session_dir: PathBuf,
+    /// Gemini CLI root (`~/.gemini`).
     pub gemini_dir: PathBuf,
+    /// Gemini CLI session logs (`~/.gemini/tmp`).
     pub gemini_session_dir: PathBuf,
+    /// This tool's cache directory (`~/.vibe_coding_tracker`).
     pub cache_dir: PathBuf,
 }
 
-/// Resolves all application paths including session directories for all AI providers
+/// Builds a [`HelperPaths`] from the current user's home directory.
+///
+/// The returned paths are computed by joining well-known suffixes onto the
+/// home directory; none of them are checked for existence here.
+///
+/// # Errors
+///
+/// Returns an error if the user's home directory cannot be determined.
 pub fn resolve_paths() -> Result<HelperPaths> {
     let home_dir =
         home::home_dir().ok_or_else(|| anyhow::anyhow!("Unable to resolve user home directory"))?;
@@ -53,7 +79,10 @@ pub fn resolve_paths() -> Result<HelperPaths> {
     })
 }
 
-/// Returns the current username from environment variables
+/// Returns the current username from the environment.
+///
+/// Reads `USER`, falling back to `USERNAME` (Windows), and finally to the
+/// literal `"unknown"` if neither is set.
 pub fn get_current_user() -> String {
     std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
@@ -62,7 +91,11 @@ pub fn get_current_user() -> String {
 
 static MACHINE_ID_CACHE: OnceLock<String> = OnceLock::new();
 
-/// Returns the user's home directory
+/// Returns the user's home directory.
+///
+/// # Errors
+///
+/// Returns an error if the home directory cannot be determined.
 fn get_home_dir() -> Result<PathBuf> {
     home::home_dir().ok_or_else(|| anyhow::anyhow!("Unable to resolve user home directory"))
 }
@@ -88,7 +121,13 @@ pub fn get_machine_id() -> &'static str {
     })
 }
 
-/// Returns the cache directory path, creating it if necessary
+/// Returns the tool's cache directory (`~/.vibe_coding_tracker`), creating it
+/// (and any missing parents) if it does not already exist.
+///
+/// # Errors
+///
+/// Returns an error if the home directory cannot be determined or if the
+/// cache directory cannot be created.
 pub fn get_cache_dir() -> Result<PathBuf> {
     let home_dir = get_home_dir()?;
     let cache_dir = home_dir.join(".vibe_coding_tracker");
@@ -101,15 +140,24 @@ pub fn get_cache_dir() -> Result<PathBuf> {
     Ok(cache_dir)
 }
 
-/// Returns the pricing cache file path for a specific date
+/// Returns the pricing cache file path for `date`.
 ///
-/// Format: `~/.vibe_coding_tracker/model_pricing_YYYY-MM-DD.json`
+/// The path is `~/.vibe_coding_tracker/model_pricing_<date>.json`, where
+/// `date` is expected in `YYYY-MM-DD` form. As a side effect of resolving the
+/// cache directory, the directory is created if missing.
+///
+/// # Errors
+///
+/// Returns an error if the cache directory cannot be resolved or created.
 pub fn get_pricing_cache_path(date: &str) -> Result<PathBuf> {
     let cache_dir = get_cache_dir()?;
     Ok(cache_dir.join(format!("model_pricing_{}.json", date)))
 }
 
-/// Finds the pricing cache file for a specific date if it exists
+/// Returns the pricing cache path for `date` only if that file exists.
+///
+/// Yields `None` when the file is absent or when the cache directory cannot
+/// be resolved.
 pub fn find_pricing_cache_for_date(date: &str) -> Option<PathBuf> {
     let cache_path = get_pricing_cache_path(date).ok()?;
     if cache_path.exists() {
@@ -119,7 +167,16 @@ pub fn find_pricing_cache_for_date(date: &str) -> Option<PathBuf> {
     }
 }
 
-/// Lists all pricing cache files in the cache directory
+/// Lists every `model_pricing_*.json` file in the cache directory.
+///
+/// Each element is the `(filename, full_path)` pair for a file matching the
+/// `model_pricing_*.json` naming scheme; other directory entries are ignored.
+/// If the directory cannot be read, an empty `Vec` is returned rather than an
+/// error.
+///
+/// # Errors
+///
+/// Returns an error only if the cache directory cannot be resolved or created.
 pub fn list_pricing_cache_files() -> Result<Vec<(String, PathBuf)>> {
     let cache_dir = get_cache_dir()?;
     let mut cache_files = Vec::new();
