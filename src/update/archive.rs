@@ -8,7 +8,7 @@
 use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
 use std::fs::{self, File};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tar::Archive;
 use zip::ZipArchive;
 
@@ -33,18 +33,19 @@ pub fn extract_targz(archive_path: &Path, extract_to: &Path) -> Result<std::path
         .context("Failed to read archive entries")?
     {
         let mut entry = entry.context("Failed to read archive entry")?;
-        let path = entry.path().context("Failed to get entry path")?;
-
-        // Validate that the extracted path stays within extract_to directory
-        let full_path = extract_to.join(&path);
-        if !full_path.starts_with(extract_to) {
+        let path = entry
+            .path()
+            .context("Failed to get entry path")?
+            .into_owned();
+        if !entry
+            .unpack_in(extract_to)
+            .context("Failed to unpack entry")?
+        {
             anyhow::bail!(
                 "Archive contains invalid path that attempts to escape extraction directory: {:?}",
                 path
             );
         }
-
-        entry.unpack(&full_path).context("Failed to unpack entry")?;
     }
 
     find_binary_in_directory(extract_to)
@@ -68,16 +69,14 @@ pub fn extract_zip(archive_path: &Path, extract_to: &Path) -> Result<std::path::
     // Manually extract with path validation to prevent path traversal attacks
     for i in 0..archive.len() {
         let mut file = archive.by_index(i).context("Failed to read zip entry")?;
-        let file_path = file.name();
-
-        // Validate that the extracted path stays within extract_to directory
-        let full_path = extract_to.join(file_path);
-        if !full_path.starts_with(extract_to) {
+        let file_path = file.name().to_string();
+        let Some(enclosed_path) = file.enclosed_name() else {
             anyhow::bail!(
                 "Archive contains invalid path that attempts to escape extraction directory: {}",
                 file_path
             );
-        }
+        };
+        let full_path = extract_to.join(enclosed_path);
 
         if file.is_dir() {
             fs::create_dir_all(&full_path).context("Failed to create directory")?;
@@ -104,7 +103,7 @@ pub fn extract_zip(archive_path: &Path, extract_to: &Path) -> Result<std::path::
 ///
 /// Returns an error if no candidate name is found, or on Unix if reading or
 /// setting the binary's permissions fails.
-fn find_binary_in_directory(extract_to: &Path) -> Result<std::path::PathBuf> {
+fn find_binary_in_directory(extract_to: &Path) -> Result<PathBuf> {
     // Find the binary in the extracted files
     #[cfg(unix)]
     let binary_names = ["vibe_coding_tracker", "vct"];
@@ -129,4 +128,67 @@ fn find_binary_in_directory(extract_to: &Path) -> Result<std::path::PathBuf> {
     }
 
     anyhow::bail!("Binary not found in archive")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+    use tempfile::TempDir;
+    use zip::write::SimpleFileOptions;
+
+    #[test]
+    fn extract_targz_rejects_parent_directory_entries() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let archive_path = temp_dir.path().join("malicious.tar.gz");
+        let extract_dir = temp_dir.path().join("extract");
+        fs::create_dir(&extract_dir)?;
+
+        let data = b"outside";
+        let mut encoder = GzEncoder::new(File::create(&archive_path)?, Compression::default());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(0);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.as_mut_bytes()[..7].copy_from_slice(b"../evil");
+        header.set_cksum();
+
+        encoder.write_all(header.as_bytes())?;
+        encoder.write_all(data)?;
+        encoder.write_all(&[0; 512][..512 - data.len()])?;
+        encoder.write_all(&[0; 1024])?;
+        encoder.finish()?;
+
+        let err =
+            extract_targz(&archive_path, &extract_dir).expect_err("path traversal should fail");
+
+        assert!(err.to_string().contains("invalid path"));
+        assert!(!temp_dir.path().join("evil").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn extract_zip_rejects_parent_directory_entries() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let archive_path = temp_dir.path().join("malicious.zip");
+        let extract_dir = temp_dir.path().join("extract");
+        fs::create_dir(&extract_dir)?;
+
+        let file = File::create(&archive_path)?;
+        let mut writer = zip::ZipWriter::new(file);
+        writer.start_file("../evil", SimpleFileOptions::default())?;
+        writer.write_all(b"outside")?;
+        writer.finish()?;
+
+        let err = extract_zip(&archive_path, &extract_dir).expect_err("path traversal should fail");
+
+        assert!(err.to_string().contains("invalid path"));
+        assert!(!temp_dir.path().join("evil").exists());
+        Ok(())
+    }
 }
