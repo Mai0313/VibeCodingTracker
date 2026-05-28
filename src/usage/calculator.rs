@@ -94,9 +94,9 @@ fn extract_conversation_usage_from_analysis(analysis: &CodeAnalysis) -> FastHash
 /// # Errors
 ///
 /// Returns an error if [`resolve_paths`] cannot determine the provider
-/// directories (e.g. the home directory is unavailable), or if walking any
-/// existing provider directory fails (I/O / permission errors surfaced by the
-/// directory walker).
+/// directories (e.g. the home directory is unavailable). Directory traversal
+/// and metadata errors are currently skipped by the walker rather than
+/// propagated.
 ///
 /// # Examples
 ///
@@ -211,9 +211,9 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
 ///
 /// # Errors
 ///
-/// Returns an error only if collecting the candidate files from `dir` fails
-/// (I/O / permission errors from the directory walker). Per-file parse failures
-/// are logged and skipped, not propagated.
+/// Returns an error only if the candidate-file collector returns one. The
+/// current collector skips traversal and metadata errors, and per-file parse
+/// failures are logged and skipped rather than propagated.
 #[allow(clippy::too_many_arguments)] // per-provider helper; struct-wrapping the args would hurt readability
 fn process_usage_directory<P, F>(
     dir: P,
