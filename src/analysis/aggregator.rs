@@ -13,22 +13,37 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
 
-/// Single row of aggregated metrics grouped by model
+/// Single row of aggregated file-operation metrics for one model.
+///
+/// Counts are summed across every session that used the model in the active
+/// time range. The `*_lines` fields total the lines touched by edit/read/write
+/// operations; the `*_count` fields total how many times each tool was called.
+/// Serializes with camelCase field names to match the `analysis` JSON output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AggregatedAnalysisRow {
+    /// Model name the metrics are grouped under.
     pub model: String,
+    /// Total lines changed by `Edit`/`MultiEdit` operations.
     pub edit_lines: usize,
+    /// Total lines returned by `Read` operations.
     pub read_lines: usize,
+    /// Total lines emitted by `Write` operations.
     pub write_lines: usize,
+    /// Number of `Bash` tool calls.
     pub bash_count: usize,
+    /// Number of `Edit` tool calls.
     pub edit_count: usize,
+    /// Number of `Read` tool calls.
     pub read_count: usize,
+    /// Number of `TodoWrite` tool calls.
     pub todo_write_count: usize,
+    /// Number of `Write` tool calls.
     pub write_count: usize,
 }
 
-/// Analysis results with provider active day counts for daily averages
+/// Bundle of aggregated analysis rows plus the per-provider active-day counts
+/// the display layer needs for daily averages.
 pub struct AnalysisData {
     /// Rows aggregated across *all* providers, keyed by model name.
     ///
@@ -41,24 +56,54 @@ pub struct AnalysisData {
     /// Copilot-originated sessions cannot be mis-attributed to Claude Code
     /// just because their model name starts with `claude-`.
     pub per_provider: PerProviderAnalysisRows,
+    /// Distinct active-day count per provider, used to derive daily averages.
     pub provider_days: ProviderActiveDays,
 }
 
-/// Per-provider aggregated analysis rows, keyed by source directory.
+/// Aggregated analysis rows partitioned by the source directory they came from.
+///
+/// Attribution is by provider directory, not by model name, so a model that
+/// appears under more than one provider (e.g. `claude-sonnet-4-6` recorded by
+/// both Claude Code and Copilot CLI) lands in the correct bucket.
 #[derive(Debug, Default, Clone)]
 pub struct PerProviderAnalysisRows {
+    /// Rows from the Claude Code session directory.
     pub claude: Vec<AggregatedAnalysisRow>,
+    /// Rows from the Codex session directory.
     pub codex: Vec<AggregatedAnalysisRow>,
+    /// Rows from the Copilot CLI session directory.
     pub copilot: Vec<AggregatedAnalysisRow>,
+    /// Rows from the Gemini CLI session directory.
     pub gemini: Vec<AggregatedAnalysisRow>,
 }
 
 /// Aggregate file-operation metrics across every provider's session files,
 /// keyed by model.
 ///
-/// Scans Claude, Codex, Copilot, and Gemini session directories, aggregates
-/// tool-call counts and line counts by model, and returns sorted results
-/// with provider active-day counts.
+/// Scans the Claude, Codex, Copilot, and Gemini session directories, sums
+/// tool-call counts and line counts by model within `time_range`, and returns
+/// rows sorted by model name alongside per-provider active-day counts. Each
+/// file is parsed in [`ParseMode::UsageOnly`] and dropped immediately, so the
+/// global file cache is bypassed. Missing provider directories are skipped, and
+/// files that fail to parse are logged to stderr rather than aborting the scan.
+///
+/// # Errors
+///
+/// Returns an error if the provider paths cannot be resolved, or if walking any
+/// existing provider directory to collect its session files fails.
+///
+/// # Examples
+///
+/// ```no_run
+/// use vibe_coding_tracker::analysis::aggregate_sessions_by_model;
+/// use vibe_coding_tracker::TimeRange;
+///
+/// let data = aggregate_sessions_by_model(TimeRange::All)?;
+/// for row in &data.rows {
+///     println!("{}: {} edit lines", row.model, row.edit_lines);
+/// }
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 pub fn aggregate_sessions_by_model(time_range: TimeRange) -> Result<AnalysisData> {
     let paths = crate::utils::resolve_paths()?;
     let mut aggregated: FastHashMap<String, AggregatedAnalysisRow> =
@@ -165,12 +210,26 @@ pub fn aggregate_sessions_by_model(time_range: TimeRange) -> Result<AnalysisData
     })
 }
 
+/// Drains a model-keyed map into a `Vec` sorted by model name.
 fn into_sorted_rows(map: FastHashMap<String, AggregatedAnalysisRow>) -> Vec<AggregatedAnalysisRow> {
     let mut v: Vec<AggregatedAnalysisRow> = map.into_values().collect();
     v.sort_unstable_by(|a, b| a.model.cmp(&b.model));
     v
 }
 
+/// Parses every session file under one provider directory and folds its
+/// per-model metrics into both the cross-provider `aggregated` map and the
+/// provider-scoped `provider_aggregated` map.
+///
+/// `filter_fn` selects which files belong to `provider`, `time_range` bounds
+/// which files are considered, and `max_depth` caps the directory walk (used to
+/// skip Copilot per-session snapshot subtrees). Each parsed file's modified
+/// date is recorded in `unique_dates` to feed active-day counts. Files that
+/// fail to parse are logged to stderr and skipped, not treated as errors.
+///
+/// # Errors
+///
+/// Returns an error if collecting the candidate files from `dir` fails.
 #[allow(clippy::too_many_arguments)] // per-provider helper; struct-wrapping the args would hurt readability
 fn aggregate_sessions_in_directory<P, F>(
     dir: P,
@@ -225,6 +284,12 @@ where
     Ok(())
 }
 
+/// Folds one parsed session's per-model counters into `aggregated`.
+///
+/// Each model in the session's `conversation_usage` gets (or creates) a row,
+/// and that record's line and tool-call counts are added in. Synthetic models
+/// (model name containing `<synthetic>`) are skipped so placeholder usage does
+/// not pollute the per-model breakdown.
 fn aggregate_analysis_result(
     aggregated: &mut FastHashMap<String, AggregatedAnalysisRow>,
     analysis: &CodeAnalysis,

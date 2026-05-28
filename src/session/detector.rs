@@ -1,8 +1,22 @@
+//! Content-based provider classification for session JSONL records.
+//!
+//! Given the parsed records from a session file, this module decides which
+//! of the four supported assistants wrote it ([`ExtensionType`]). Two entry
+//! points exist for two call shapes: [`detect_extension_type`] commits
+//! eagerly on a fully-materialised slice (the `Vec<Value>` fallback path),
+//! while [`classify_records`] returns `None` on indeterminate input so a
+//! streaming caller can keep peeking lines until a marker appears.
 use crate::models::ExtensionType;
 use anyhow::{Result, bail};
 use serde_json::Value;
 
-/// Detects the AI provider format by analyzing distinctive fields in the session data
+/// Detects the AI provider format by analyzing distinctive fields in the
+/// session data.
+///
+/// Thin eager wrapper over [`classify_records`]: returns whatever marker the
+/// records carry, falling back to [`ExtensionType::Codex`] when none is
+/// found (a marker-less JSONL stream is almost always a Codex log, whose
+/// `type` discriminators just happen to be absent in this slice).
 ///
 /// Detection strategy:
 /// - Gemini: first line is a session-meta record with `sessionId` and
@@ -21,6 +35,22 @@ use serde_json::Value;
 /// [`classify_records`] instead: it returns `None` when the records seen
 /// so far are indeterminate, letting the caller decide whether to read more
 /// before committing to a provider (see `parser::stream_parse_autodetect`).
+///
+/// # Errors
+///
+/// Returns an error when `data` is empty — an empty slice carries no marker
+/// to classify and is treated as a caller bug rather than silently defaulted.
+///
+/// # Examples
+///
+/// ```
+/// use serde_json::json;
+/// use vibe_coding_tracker::session::detector::detect_extension_type;
+/// use vibe_coding_tracker::ExtensionType;
+///
+/// let records = [json!({ "parentUuid": "abc", "type": "user" })];
+/// assert_eq!(detect_extension_type(&records).unwrap(), ExtensionType::ClaudeCode);
+/// ```
 pub fn detect_extension_type(data: &[Value]) -> Result<ExtensionType> {
     if data.is_empty() {
         bail!("Cannot detect extension type from empty data");
@@ -46,6 +76,25 @@ pub fn detect_extension_type(data: &[Value]) -> Result<ExtensionType> {
 /// silently dropped. With this function the caller can keep reading until
 /// a positive signal appears, so there is no arbitrary limit to the
 /// preamble length we tolerate.
+///
+/// # Examples
+///
+/// ```
+/// use serde_json::json;
+/// use vibe_coding_tracker::session::detector::classify_records;
+/// use vibe_coding_tracker::ExtensionType;
+///
+/// // A marker-less Claude metadata preamble stays indeterminate...
+/// let preamble = [json!({ "type": "file-history-snapshot" })];
+/// assert!(classify_records(&preamble).is_none());
+///
+/// // ...until a `parentUuid`-bearing record arrives.
+/// let with_marker = [
+///     json!({ "type": "file-history-snapshot" }),
+///     json!({ "parentUuid": "abc", "type": "user" }),
+/// ];
+/// assert_eq!(classify_records(&with_marker), Some(ExtensionType::ClaudeCode));
+/// ```
 pub fn classify_records(data: &[Value]) -> Option<ExtensionType> {
     // JSONL stream: Gemini session-meta header line.
     //

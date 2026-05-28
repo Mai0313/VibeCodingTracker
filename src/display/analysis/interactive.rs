@@ -1,3 +1,9 @@
+//! Interactive (TUI) renderer for the `analysis` view.
+//!
+//! Runs a ratatui draw loop that periodically re-aggregates the session
+//! directories, highlighting rows whose metrics changed since the last tick and
+//! redrawing on terminal resize without re-aggregating.
+
 use crate::analysis::{AnalysisData, PerProviderAnalysisRows};
 use crate::display::analysis::averages::{
     AnalysisProviderTotals, AnalysisRow, build_analysis_provider_rows,
@@ -21,10 +27,42 @@ use ratatui::{
 use std::io;
 use sysinfo::{Pid, System};
 
+/// Seconds between automatic re-aggregation refreshes of the table.
 const ANALYSIS_REFRESH_SECS: u64 = 10;
+/// Upper bound on the number of rows tracked for the "recently updated"
+/// highlight, capping the tracker's memory footprint.
 const MAX_TRACKED_ANALYSIS_ROWS: usize = 100;
 
-/// Display analysis data as an interactive table
+/// Render the `analysis` view as an interactive, auto-refreshing TUI.
+///
+/// Takes over the terminal and runs a draw loop until the user quits. Every
+/// `ANALYSIS_REFRESH_SECS` it re-aggregates the session directories for
+/// `time_range`, highlights rows whose counters changed, and updates the
+/// process-memory readout. `initial_data` only gates the empty-state shortcut;
+/// the loop always re-fetches its own data. If a refresh fails the error is
+/// logged and the loop continues with empty data rather than tearing down the
+/// TUI. Returns immediately after printing a message if `initial_data` is empty.
+///
+/// # Errors
+///
+/// Returns an error if the terminal cannot be put into / restored from raw
+/// alternate-screen mode, or if drawing a frame or polling for input fails.
+///
+/// # Panics
+///
+/// Panics if the current process ID cannot be obtained for memory monitoring.
+///
+/// # Examples
+///
+/// ```no_run
+/// use vibe_coding_tracker::analysis::aggregate_sessions_by_model;
+/// use vibe_coding_tracker::display::analysis::display_analysis_interactive;
+/// use vibe_coding_tracker::TimeRange;
+///
+/// let data = aggregate_sessions_by_model(TimeRange::All)?;
+/// display_analysis_interactive(&data, TimeRange::All)?;
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 pub fn display_analysis_interactive(
     initial_data: &AnalysisData,
     time_range: crate::cli::TimeRange,
@@ -173,6 +211,10 @@ pub fn display_analysis_interactive(
 /// Shared by the periodic refresh and resize redraw; `provider_rows` is
 /// rebuilt here (cheap) rather than cached, since it borrows from
 /// `provider_totals`.
+///
+/// # Errors
+///
+/// Returns an error if the terminal draw call fails.
 #[allow(clippy::too_many_arguments)]
 fn render_analysis_frame(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,

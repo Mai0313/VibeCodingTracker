@@ -1,3 +1,10 @@
+//! Terminal scaffolding for the interactive TUI.
+//!
+//! Covers entering / leaving raw alternate-screen mode, the polling input
+//! loop ([`handle_input`]), and the state trackers that drive periodic
+//! refreshes ([`RefreshState`]) and recently-changed row highlighting
+//! ([`UpdateTracker`]).
+
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
@@ -7,7 +14,16 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io;
 use std::time::{Duration, Instant};
 
-/// Setup the terminal for TUI mode
+/// Puts the terminal into raw mode and the alternate screen, returning a ready [`Terminal`].
+///
+/// Must be paired with [`restore_terminal`] before the process exits, otherwise
+/// the user's terminal is left in raw / alternate-screen mode.
+///
+/// # Errors
+///
+/// Returns an error if enabling raw mode, switching to the alternate screen, or
+/// constructing the backing [`Terminal`] fails (typically because stdout is not
+/// a TTY or the terminal rejects the control sequences).
 pub fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -17,7 +33,13 @@ pub fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<io::Stdout>>
     Ok(terminal)
 }
 
-/// Restore the terminal to normal mode
+/// Restores the terminal to normal mode (disable raw mode, leave alternate screen, show cursor).
+///
+/// # Errors
+///
+/// Returns an error if disabling raw mode, leaving the alternate screen, or
+/// re-showing the cursor fails. On error the terminal may be left partially
+/// restored.
 pub fn restore_terminal(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
 ) -> anyhow::Result<()> {
@@ -33,6 +55,12 @@ pub fn restore_terminal(
 /// buffered. Draining matters for resize: a window drag emits a burst of
 /// `Resize` events, and collapsing them into a single `Resize` action keeps
 /// the redraw in step with the drag instead of lagging one frame per event.
+/// Returns [`InputAction::Continue`] when the poll times out with no event.
+///
+/// # Errors
+///
+/// Returns an error if polling for or reading a terminal event fails (an
+/// underlying crossterm I/O error on the event source).
 pub fn handle_input() -> anyhow::Result<InputAction> {
     if !event::poll(Duration::from_millis(100))? {
         return Ok(InputAction::Continue);
@@ -69,18 +97,21 @@ pub fn handle_input() -> anyhow::Result<InputAction> {
     }
 }
 
-/// Action to take based on user input
+/// Action the TUI event loop should take in response to user input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputAction {
+    /// User asked to exit (`q`, `Esc`, or `Ctrl+C`).
     Quit,
+    /// User asked to re-fetch and redraw (`r` / `R`).
     Refresh,
     /// Terminal was resized — redraw the current frame at the new size
     /// without re-fetching session data.
     Resize,
+    /// No actionable event; keep the current frame and loop.
     Continue,
 }
 
-/// Refresh state tracker
+/// Tracks when the next periodic data refresh is due, plus a one-shot force flag.
 pub struct RefreshState {
     last_refresh: Instant,
     force_refresh: bool,
@@ -88,7 +119,11 @@ pub struct RefreshState {
 }
 
 impl RefreshState {
-    /// Create a new refresh state with the given interval in seconds
+    /// Creates a refresh state with the given interval in seconds, primed to refresh immediately.
+    ///
+    /// `last_refresh` is backdated by one interval and `force_refresh` is set,
+    /// so the first [`should_refresh`](Self::should_refresh) returns `true` and
+    /// the initial load is not delayed by one interval.
     pub fn new(refresh_secs: u64) -> Self {
         let refresh_interval = Duration::from_secs(refresh_secs);
         Self {
@@ -98,24 +133,29 @@ impl RefreshState {
         }
     }
 
-    /// Check if it's time to refresh
+    /// Returns whether a refresh is due (forced, or the interval has elapsed).
     pub fn should_refresh(&self) -> bool {
         self.force_refresh || self.last_refresh.elapsed() >= self.refresh_interval
     }
 
-    /// Mark that a refresh has occurred
+    /// Records that a refresh just happened, resetting the timer and clearing the force flag.
     pub fn mark_refreshed(&mut self) {
         self.last_refresh = Instant::now();
         self.force_refresh = false;
     }
 
-    /// Force the next refresh
+    /// Forces the next [`should_refresh`](Self::should_refresh) to return `true`.
     pub fn force(&mut self) {
         self.force_refresh = true;
     }
 }
 
-/// Update tracking for row highlighting (optimized to use hashes instead of full data clones)
+/// Tracks per-row changes to drive temporary highlighting of recently-updated rows.
+///
+/// To bound memory it stores a hash of each row's data rather than a clone, and
+/// records the [`Instant`] a row last changed. `max_tracked` caps the number of
+/// retained entries (enforced by [`cleanup`](Self::cleanup), not by
+/// [`track_update`](Self::track_update)).
 pub struct UpdateTracker {
     last_update_times: std::collections::HashMap<String, Instant>,
     previous_hashes: std::collections::HashMap<String, u64>,
@@ -124,7 +164,7 @@ pub struct UpdateTracker {
 }
 
 impl UpdateTracker {
-    /// Create a new update tracker
+    /// Creates a tracker retaining up to `max_tracked` rows and highlighting changes for `highlight_duration_millis`.
     pub fn new(max_tracked: usize, highlight_duration_millis: u64) -> Self {
         Self {
             last_update_times: std::collections::HashMap::new(),
@@ -134,7 +174,12 @@ impl UpdateTracker {
         }
     }
 
-    /// Track an update for a given key and data (using hash for comparison)
+    /// Records `data` for `key`, marking it updated if its hash differs from the previous one.
+    ///
+    /// A first-seen `key` counts as changed and gets a fresh timestamp. Uses
+    /// [`DefaultHasher`](std::collections::hash_map::DefaultHasher) over `data`
+    /// to avoid retaining a full copy. This never evicts entries — call
+    /// [`cleanup`](Self::cleanup) to bound growth.
     pub fn track_update<T: std::hash::Hash>(&mut self, key: String, data: &T) {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::Hasher;
@@ -155,7 +200,11 @@ impl UpdateTracker {
         self.previous_hashes.insert(key, hash);
     }
 
-    /// Clean up old entries based on current row keys
+    /// Drops tracked entries whose key is no longer present, then enforces the `max_tracked` cap.
+    ///
+    /// Entries for keys not in `current_keys` are removed first. If more than
+    /// `max_tracked` remain, an arbitrary subset is then dropped to fit the cap.
+    /// Finally both maps are shrunk to release excess capacity.
     pub fn cleanup<I>(&mut self, current_keys: I)
     where
         I: IntoIterator<Item = String>,
@@ -167,7 +216,8 @@ impl UpdateTracker {
         self.last_update_times
             .retain(|key, _| current_keys.contains(key));
 
-        // If we exceed max_tracked, keep only the most recent entries
+        // If we exceed max_tracked, drop an arbitrary subset to fit the cap.
+        // NOTE: HashMap iteration order is unspecified, so this is not "most recent".
         if self.previous_hashes.len() > self.max_tracked {
             let keys_to_remove: Vec<_> = self
                 .previous_hashes
@@ -186,7 +236,10 @@ impl UpdateTracker {
         self.last_update_times.shrink_to_fit();
     }
 
-    /// Check if a key was recently updated
+    /// Returns whether `key` changed within the configured highlight window.
+    ///
+    /// `false` for keys never tracked or whose last change is older than
+    /// `highlight_duration`.
     pub fn is_recently_updated(&self, key: &str) -> bool {
         self.last_update_times
             .get(key)

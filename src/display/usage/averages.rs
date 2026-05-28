@@ -15,14 +15,24 @@ use std::borrow::Cow;
 /// `calculate_cost`.
 #[derive(Default)]
 pub struct UsageRow {
-    pub model: String,         // 原始模型名稱
+    /// Raw model name as reported by the session (the pricing-lookup key).
+    pub model: String, // 原始模型名稱
+    /// Name shown in the table; appends the fuzzy-matched pricing model in
+    /// parentheses when the lookup was not exact.
     pub display_model: String, // 可能含 fuzzy match 提示的顯示名稱
+    /// Prompt (input) tokens.
     pub input_tokens: i64,
+    /// User-visible response tokens, excluding reasoning.
     pub output_tokens: i64,
+    /// Separately-billed "thinking" tokens.
     pub reasoning_tokens: i64,
+    /// Tokens served from the prompt cache.
     pub cache_read: i64,
+    /// Tokens written to the prompt cache.
     pub cache_creation: i64,
+    /// Sum of all token buckets for this model.
     pub total: i64,
+    /// LiteLLM-priced cost in USD for this model's tokens.
     pub cost: f64,
 }
 
@@ -36,19 +46,27 @@ impl UsageRow {
     }
 }
 
-/// Totals for all usage rows
+/// Column-wise totals across every [`UsageRow`] in a summary.
 #[derive(Default)]
 pub struct UsageTotals {
+    /// Summed prompt (input) tokens.
     pub input_tokens: i64,
+    /// Summed response tokens, excluding reasoning.
     pub output_tokens: i64,
+    /// Summed reasoning ("thinking") tokens.
     pub reasoning_tokens: i64,
+    /// Summed cache-read tokens.
     pub cache_read: i64,
+    /// Summed cache-creation tokens.
     pub cache_creation: i64,
+    /// Summed total tokens.
     pub total: i64,
+    /// Summed cost in USD.
     pub cost: f64,
 }
 
 impl UsageTotals {
+    /// Adds every token bucket and the cost of `row` into these totals.
     pub fn accumulate(&mut self, row: &UsageRow) {
         self.input_tokens += row.input_tokens;
         self.output_tokens += row.output_tokens;
@@ -71,12 +89,16 @@ impl UsageTotals {
 /// the spread without computing a rate.
 #[derive(Default, Clone)]
 pub struct ProviderStats {
+    /// Total tokens attributed to this provider.
     pub total_tokens: i64,
+    /// Total cost in USD attributed to this provider.
     pub total_cost: f64,
+    /// Number of distinct days that contributed to these totals.
     pub days_count: usize,
 }
 
 impl ProviderStats {
+    /// Adds `row`'s total tokens and cost into these stats.
     fn accumulate_row(&mut self, row: &UsageRow) {
         self.total_tokens += row.total;
         self.total_cost += row.cost;
@@ -86,11 +108,14 @@ impl ProviderStats {
 /// Type alias for usage totals grouped by provider.
 pub type UsageProviderTotals = crate::display::common::ProviderTotals<ProviderStats>;
 
-/// Summary of usage data
+/// Fully priced usage view shared by every output mode.
 #[derive(Default)]
 pub struct UsageSummary {
+    /// Per-model rows, sorted by ascending cost (model name as tie-break).
     pub rows: Vec<UsageRow>,
+    /// Column-wise totals across all rows.
     pub totals: UsageTotals,
+    /// Per-provider totals for the summary footer.
     pub provider_totals: UsageProviderTotals,
 }
 
@@ -141,6 +166,7 @@ pub fn calculate_provider_totals_from_per_provider(
     totals
 }
 
+/// Prices every model in `usage` and folds the results into `stats`.
 fn accumulate_provider(
     stats: &mut ProviderStats,
     usage: &UsageResult,
@@ -234,6 +260,12 @@ pub fn build_usage_summary(
     summary
 }
 
+/// Builds one priced [`UsageRow`] from a model's raw usage `Value`.
+///
+/// Token counts come from [`extract_token_counts`](crate::utils::extract_token_counts);
+/// cost is computed against the pricing entry `pricing_map` resolves for
+/// `model`. When that lookup was a fuzzy match, the matched model name is
+/// appended to `display_model` in parentheses.
 fn extract_usage_row(
     model: &str,
     usage: &Value,

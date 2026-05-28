@@ -1,3 +1,10 @@
+//! comfy-table and ratatui cell / table builders shared across both views.
+//!
+//! These are pure widget constructors with no I/O; they encode the common
+//! styling so the static-table and TUI renderers stay visually consistent.
+//! A recurring convention: the first two columns (index 0 and 1) are
+//! left-aligned and every remaining (numeric) column is right-aligned.
+
 use comfy_table::{Attribute, Cell, CellAlignment, Color, Table, presets::UTF8_FULL};
 use ratatui::{
     layout::Constraint,
@@ -7,7 +14,7 @@ use ratatui::{
 };
 use sysinfo::System;
 
-/// Create a title paragraph for the TUI
+/// Builds the bordered, centered title paragraph for the top of a TUI view.
 pub fn create_title(title_text: &str, color: RatatuiColor) -> Paragraph<'_> {
     Paragraph::new(vec![Line::from(vec![Span::styled(
         title_text,
@@ -21,7 +28,13 @@ pub fn create_title(title_text: &str, color: RatatuiColor) -> Paragraph<'_> {
     .centered()
 }
 
-/// Create a summary paragraph for the TUI
+/// Builds the TUI summary bar from caller-supplied items plus a live memory readout.
+///
+/// Each `(icon, value, color)` tuple in `summary_items` becomes a colored,
+/// pipe-separated segment. A `Memory: <n> MB` segment for the current process
+/// `pid` is always appended; it reads `0.0 MB` if `sys` has no entry for `pid`
+/// (e.g. process info was not refreshed). `sys` is expected to have been
+/// refreshed by the caller before this call.
 pub fn create_summary<'a>(
     summary_items: Vec<(&'a str, &'a str, RatatuiColor)>, // (icon, value, color) tuples
     sys: &'a System,
@@ -65,7 +78,7 @@ pub fn create_summary<'a>(
         .centered()
 }
 
-/// Create a controls paragraph for the TUI
+/// Builds the centered key-hint footer (quit / refresh) for a TUI view.
 pub fn create_controls() -> Paragraph<'static> {
     Paragraph::new(vec![Line::from(vec![
         Span::styled("Press ", Style::default().fg(RatatuiColor::DarkGray)),
@@ -83,7 +96,7 @@ pub fn create_controls() -> Paragraph<'static> {
     .centered()
 }
 
-/// Create a star hint paragraph for the TUI
+/// Builds the centered footer line inviting the user to star the project on GitHub.
 pub fn create_star_hint() -> Paragraph<'static> {
     Paragraph::new(vec![Line::from(vec![
         Span::styled(
@@ -98,7 +111,10 @@ pub fn create_star_hint() -> Paragraph<'static> {
     .centered()
 }
 
-/// Create a Ratatui table with standard styling
+/// Builds a ratatui [`Table`](RatatuiTable) with the standard header and border styling.
+///
+/// `widths` sets the per-column constraints; the header row is rendered black-on-green
+/// and bold with a one-line bottom margin.
 pub fn create_ratatui_table<'a>(
     rows: Vec<RatatuiRow<'a>>,
     header: Vec<&'a str>,
@@ -123,7 +139,10 @@ pub fn create_ratatui_table<'a>(
         )
 }
 
-/// Create a comfy table with standard styling
+/// Builds an empty comfy [`Table`] with a colored, UTF-8-bordered header row.
+///
+/// Header cells use the shared alignment convention: indices 0 and 1 are
+/// left-aligned, the rest right-aligned. The returned table has no body rows.
 pub fn create_comfy_table(headers: Vec<&str>, header_color: Color) -> Table {
     let mut table = Table::new();
     table.load_preset(UTF8_FULL).set_header(
@@ -143,7 +162,10 @@ pub fn create_comfy_table(headers: Vec<&str>, header_color: Color) -> Table {
     table
 }
 
-/// Add a totals row to a comfy table
+/// Appends a single colored totals row to `table`.
+///
+/// Cells follow the shared alignment convention: indices 0 and 1 are
+/// left-aligned, the rest right-aligned. Every cell is painted `color`.
 pub fn add_totals_row(table: &mut Table, cells: Vec<String>, color: Color) {
     let colored_cells: Vec<Cell> = cells
         .into_iter()
@@ -161,7 +183,7 @@ pub fn add_totals_row(table: &mut Table, cells: Vec<String>, color: Color) {
     table.add_row(colored_cells);
 }
 
-/// Create a styled provider cell for comfy table
+/// Builds a left-aligned, colored comfy [`Cell`] for a provider name, bolded when `emphasize`.
 pub fn create_provider_cell(name: String, color: Color, emphasize: bool) -> Cell {
     let mut cell = Cell::new(name).fg(color).set_alignment(CellAlignment::Left);
     if emphasize {
@@ -170,7 +192,7 @@ pub fn create_provider_cell(name: String, color: Color, emphasize: bool) -> Cell
     cell
 }
 
-/// Create a styled metric cell for comfy table
+/// Builds a right-aligned, colored comfy [`Cell`] for a metric value, bolded when `emphasize`.
 pub fn create_metric_cell(value: String, color: Color, emphasize: bool) -> Cell {
     let mut cell = Cell::new(value)
         .fg(color)
@@ -181,7 +203,7 @@ pub fn create_metric_cell(value: String, color: Color, emphasize: bool) -> Cell 
     cell
 }
 
-/// Create a Ratatui row for provider averages
+/// Builds a ratatui [`Row`](RatatuiRow) styled in `color`, bolded when `emphasize`.
 pub fn create_provider_row<'a>(
     cells: Vec<String>,
     color: RatatuiColor,

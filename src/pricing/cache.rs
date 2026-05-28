@@ -21,15 +21,21 @@ use std::fs;
 /// the 5-minute (`cache_creation_input_token_cost`) price.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct ThresholdTier {
+    /// Total input context (in tokens) above which this tier's prices take over.
     pub threshold_tokens: i64,
+    /// Input price in USD per token at this tier.
     #[serde(default)]
     pub input_cost_per_token: f64,
+    /// Output price in USD per token at this tier.
     #[serde(default)]
     pub output_cost_per_token: f64,
+    /// Cache-read price in USD per token at this tier.
     #[serde(default)]
     pub cache_read_input_token_cost: f64,
+    /// Cache-write (5-minute TTL) price in USD per token at this tier.
     #[serde(default)]
     pub cache_creation_input_token_cost: f64,
+    /// Cache-write (1-hour TTL) price in USD per token; `0.0` falls back to the 5-minute rate.
     #[serde(default)]
     pub cache_creation_input_token_cost_above_1hr: f64,
 }
@@ -41,14 +47,20 @@ pub struct ThresholdTier {
 /// prices are not used as fallback.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct TierRange {
+    /// Inclusive lower bound of the input-token range this row prices.
     pub min_tokens: i64,
+    /// Exclusive upper bound of the input-token range this row prices.
     pub max_tokens: i64,
+    /// Input price in USD per token within this range.
     #[serde(default)]
     pub input_cost_per_token: f64,
+    /// Output price in USD per token within this range.
     #[serde(default)]
     pub output_cost_per_token: f64,
+    /// Cache-read price in USD per token within this range.
     #[serde(default)]
     pub cache_read_input_token_cost: f64,
+    /// Reasoning-token price in USD per token; `0.0` falls back to `output_cost_per_token`.
     #[serde(default)]
     pub output_cost_per_reasoning_token: f64,
 }
@@ -72,12 +84,16 @@ pub struct TierRange {
 /// reconstructed freshly on every launch.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelPricing {
+    /// Base input price in USD per token.
     #[serde(default)]
     pub input_cost_per_token: f64,
+    /// Base output price in USD per token.
     #[serde(default)]
     pub output_cost_per_token: f64,
+    /// Base cache-read price in USD per token.
     #[serde(default)]
     pub cache_read_input_token_cost: f64,
+    /// Base cache-write (5-minute TTL) price in USD per token.
     #[serde(default)]
     pub cache_creation_input_token_cost: f64,
 
@@ -114,6 +130,10 @@ fn parse_threshold_suffix(suffix: &str) -> Option<i64> {
     num_part.parse::<i64>().ok().map(|n| n * 1000)
 }
 
+/// Parses one LiteLLM `tiered_pricing` array element into a `TierRange`.
+///
+/// Returns `None` unless the element is an object with a two-element `range`
+/// array, which is how non-token tiers (e.g. `max_results_range`) are skipped.
 fn parse_tier_range(value: &serde_json::Value) -> Option<TierRange> {
     let obj = value.as_object()?;
     let range = obj.get("range")?.as_array()?;
@@ -330,7 +350,10 @@ pub fn build_filtered_cost_json(raw: &Value) -> Value {
     Value::Object(filtered_map)
 }
 
-/// Removes outdated pricing cache files, keeping only today's cache
+/// Removes outdated pricing cache files, keeping only today's cache.
+///
+/// Best-effort: a failure to list or delete a file is logged or ignored rather
+/// than propagated, since a stale cache file is harmless and rotates out daily.
 pub fn cleanup_old_cache() {
     let Ok(cache_files) = list_pricing_cache_files() else {
         return;
@@ -362,6 +385,12 @@ pub fn cleanup_old_cache() {
 /// via `looks_like_legacy_pricing_cache` and return `Err` so
 /// `fetch_model_pricing` falls through to a refetch, which overwrites
 /// the stale cache with the new schema.
+///
+/// # Errors
+///
+/// Returns an error if no cache file exists for today, the file cannot be
+/// read, its contents are not valid JSON, or the file is in the pre-Phase-2
+/// legacy schema (deliberately treated as an error to force a refetch).
 pub fn load_from_cache() -> Result<HashMap<String, ModelPricing>> {
     let today = get_current_date();
     let cache_path = find_pricing_cache_for_date(&today)
@@ -408,6 +437,12 @@ fn looks_like_legacy_pricing_cache(raw: &Value) -> bool {
 /// — that keeps the cache file small, diff-able against upstream, and
 /// forward-compatible with calculation strategies that aren't wired up
 /// yet.
+///
+/// # Errors
+///
+/// Returns an error if the cache path cannot be resolved, the JSON cannot be
+/// serialized, or the file cannot be written. Cleanup of old cache files runs
+/// only after a successful write and swallows its own errors.
 pub fn save_to_cache(filtered_raw: &Value) -> Result<()> {
     let today = get_current_date();
     let cache_path = get_pricing_cache_path(&today)?;

@@ -1,3 +1,13 @@
+//! Parser for OpenAI Codex rollout logs (`~/.codex/sessions/**/*.jsonl`).
+//!
+//! Codex records carry a `type` discriminator (`session_meta`,
+//! `turn_context`, `event_msg`, `response_item`). File operations are not
+//! first-class: Codex performs them through shell `function_call` records,
+//! so this parser pairs each `function_call` with its `function_call_output`
+//! by `call_id`, then reverse-engineers the intent from the command text —
+//! `apply_patch` scripts become write/edit details, `sed`/`cat` invocations
+//! become reads, and everything else is recorded as a run command. Both the
+//! legacy `shell` and current `exec_command` function shapes are supported.
 use crate::constants::FastHashMap;
 use crate::models::*;
 use crate::session::state::{ParseMode, SessionParseState};
@@ -7,6 +17,17 @@ use regex::Regex;
 use serde_json::Value;
 
 /// Parse Codex session records from a slice of pre-typed logs.
+///
+/// Walks the records in order, threading shell `function_call`s to their
+/// outputs and folding token usage from `token_count` events. Returns a
+/// single-record [`CodeAnalysis`] with the runtime metadata fields blank
+/// (the caller's `finalize` step fills them).
+///
+/// # Errors
+///
+/// Returns `anyhow::Result` for parity with the other provider parsers, but
+/// has no fallible step: malformed arguments and outputs are tolerated
+/// (skipped or substituted), so it returns `Ok` for any slice.
 pub fn parse_codex_logs(logs: &[CodexLog], mode: ParseMode) -> Result<CodeAnalysis> {
     let mut state = SessionParseState::with_mode(mode);
     let mut conversation_usage: FastHashMap<String, Value> = FastHashMap::with_capacity(5);
@@ -171,10 +192,17 @@ fn parse_function_call(name: &str, args_str: &str, ts: i64) -> Option<CodexShell
     }
 }
 
-// Codex-specific extension methods for SessionParseState
+/// Codex-specific dispatch helpers grafted onto [`SessionParseState`].
+///
+/// Kept as a private extension trait so the generic state type stays free of
+/// Codex's `apply_patch`/`sed`/`cat` heuristics.
 trait CodexAnalysisExt {
+    /// Routes a completed shell call to the read / patch / run-command tally
+    /// based on what its `script` did.
     fn handle_shell_call(&mut self, call: CodexShellCall, output: CodexShellOutput);
+    /// Applies one parsed `apply_patch` hunk as a write, delete, or edit.
     fn handle_patch(&mut self, patch: CodexPatch, ts: i64);
+    /// Records a shell call that was not a file operation as a run command.
     fn record_run_command(&mut self, call: CodexShellCall);
 }
 
@@ -250,18 +278,30 @@ impl CodexAnalysisExt for SessionParseState {
     }
 }
 
+/// A Codex shell invocation awaiting its output, normalized across the
+/// legacy `shell` and current `exec_command` function shapes.
 struct CodexShellCall {
+    /// Event timestamp in epoch milliseconds.
     timestamp: i64,
+    /// The command line actually executed (used for `sed`/`cat`/patch sniffing).
     script: String,
+    /// The full argv as written by the model, for verbatim run-command display.
     full_command: Vec<String>,
 }
 
+/// One file hunk extracted from an `apply_patch` script.
 struct CodexPatch {
+    /// `"add"`, `"delete"`, or `"update"`.
     action: String,
+    /// Target file path as written in the patch header.
     file_path: String,
+    /// Raw diff body lines (with their leading `+`/`-`/context markers).
     lines: Vec<String>,
 }
 
+/// Parses an `apply_patch` script into its constituent per-file hunks.
+///
+/// Returns an empty `Vec` when no `*** Begin Patch` marker is present.
 fn parse_apply_patch_script(script: &str) -> Vec<CodexPatch> {
     let start = match script.find("*** Begin Patch") {
         Some(idx) => idx,
@@ -332,6 +372,11 @@ fn parse_apply_patch_script(script: &str) -> Vec<CodexPatch> {
     patches
 }
 
+/// Splits diff `lines` into the joined `(old, new)` text.
+///
+/// `+`-prefixed lines build the new content, `-`-prefixed lines the old;
+/// `@@` hunk headers and `\` no-newline markers are skipped. Both results
+/// have their trailing newline trimmed.
 fn extract_patch_strings(lines: &[String]) -> (String, String) {
     // Pre-allocate with estimated capacity
     let estimated_size = lines.iter().map(|l| l.len()).sum::<usize>();
@@ -373,6 +418,9 @@ fn extract_patch_strings(lines: &[String]) -> (String, String) {
     (old_str, new_str)
 }
 
+/// Extracts the file path read by a `sed -n '<range>' <path>` command.
+///
+/// Returns `None` when the script is not a recognised `sed -n` read.
 fn extract_sed_file_path(script: &str) -> Option<String> {
     use std::sync::OnceLock;
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -386,6 +434,10 @@ fn extract_sed_file_path(script: &str) -> Option<String> {
     )
 }
 
+/// Extracts the `(path, content)` read by a `cat <path>` command.
+///
+/// `output` is the captured stdout (already metadata-stripped); content after
+/// a `\n---` separator is dropped. Returns `None` when no `cat` line is found.
 fn extract_cat_read(script: &str, output: &str) -> Option<(String, String)> {
     for line in script.lines() {
         let trimmed = line.trim();

@@ -37,7 +37,7 @@ pub struct FileParseCache {
 }
 
 impl FileParseCache {
-    /// Creates a new LRU cache with capacity from `constants::capacity::FILE_CACHE_SIZE`
+    /// Creates a new LRU cache with capacity from `constants::capacity::FILE_CACHE_SIZE`.
     pub fn new() -> Self {
         // SAFETY: FILE_CACHE_SIZE is a const > 0
         let cache_size = NonZeroUsize::new(capacity::FILE_CACHE_SIZE).unwrap();
@@ -59,6 +59,12 @@ impl FileParseCache {
     /// 3. If miss/stale, parse file and cache result (may evict LRU entry)
     ///
     /// Optimized to minimize write lock contention in parallel workloads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file's metadata cannot be read or if parsing the
+    /// session file fails (malformed JSONL, unreadable contents, etc.). A
+    /// poisoned cache lock does not error — it simply forces a reparse.
     pub fn get_or_parse<P: AsRef<Path>>(&self, path: P) -> Result<Arc<CodeAnalysis>> {
         self.get_or_parse_inner(path.as_ref(), None)
     }
@@ -68,6 +74,11 @@ impl FileParseCache {
     /// metadata sentinels at the top of a Claude session (`permission-mode`,
     /// `file-history-snapshot`) cannot cause the file to be mis-filed under a
     /// different provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file's metadata cannot be read or if parsing the
+    /// session file as `provider` fails.
     pub fn get_or_parse_as<P: AsRef<Path>>(
         &self,
         path: P,
@@ -76,6 +87,14 @@ impl FileParseCache {
         self.get_or_parse_inner(path.as_ref(), Some(provider))
     }
 
+    /// Shared cache lookup + parse path behind [`Self::get_or_parse`] and
+    /// [`Self::get_or_parse_as`]; `provider` of `None` triggers content-based
+    /// auto-detection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `fs::metadata` fails for `path` or if the underlying
+    /// session parser rejects the file.
     fn get_or_parse_inner(
         &self,
         path: &Path,
@@ -134,14 +153,14 @@ impl FileParseCache {
         Ok(arc_analysis)
     }
 
-    /// Clears all entries from the cache
+    /// Clears all entries from the cache.
     pub fn clear(&self) {
         if let Ok(mut cache) = self.cache.write() {
             cache.clear();
         }
     }
 
-    /// Removes entries for non-existent files (manual cleanup)
+    /// Removes entries for non-existent files (manual cleanup).
     ///
     /// With LRU eviction, stale entries are naturally removed over time, so this
     /// is typically not needed in production.
@@ -176,14 +195,14 @@ impl FileParseCache {
         }
     }
 
-    /// Removes a specific file from the cache
+    /// Removes a specific file from the cache.
     pub fn invalidate<P: AsRef<Path>>(&self, path: P) {
         if let Ok(mut cache) = self.cache.write() {
             cache.pop(&path.as_ref().to_path_buf());
         }
     }
 
-    /// Returns all currently cached file paths
+    /// Returns all currently cached file paths.
     pub fn get_cached_paths(&self) -> Vec<PathBuf> {
         if let Ok(cache) = self.cache.write() {
             cache.iter().map(|(path, _)| path.clone()).collect()
@@ -199,10 +218,12 @@ impl Default for FileParseCache {
     }
 }
 
-/// Cache usage statistics for monitoring
+/// Cache usage statistics for monitoring.
 #[derive(Debug, Default, Clone)]
 pub struct CacheStats {
+    /// Number of entries currently held in the cache.
     pub entry_count: usize,
+    /// Summed per-entry heap estimate in KiB (see `estimate_analysis_bytes`).
     pub estimated_memory_kb: usize,
 }
 

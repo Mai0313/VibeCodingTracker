@@ -1,3 +1,12 @@
+//! Parser for GitHub Copilot CLI session events
+//! (`~/.copilot/session-state/<sessionId>/events.jsonl`).
+//!
+//! One [`CopilotEvent`] per line, dispatched on `event_type`. Token usage is
+//! taken from the authoritative `session.shutdown` record when present, with
+//! streamed `assistant.message.outputTokens` as a partial fallback for
+//! sessions that never shut down cleanly. File operations are paired across
+//! `tool.execution_start` / `tool.execution_complete` by `toolCallId` and
+//! only counted on success. See the table below for the full event map.
 use crate::constants::{FastHashMap, capacity};
 use crate::models::*;
 use crate::session::state::{ParseMode, SessionParseState};
@@ -30,6 +39,18 @@ use serde_json::{Value, json};
 // being mis-parsed.
 
 /// Parse Copilot CLI session events from the JSONL event stream.
+///
+/// Returns a single-record [`CodeAnalysis`] stamped with the
+/// `"Copilot-CLI"` extension name. When the stream lacks a
+/// `session.shutdown` record, the per-model usage map is grafted from the
+/// streamed output-token fallback and will report `input_tokens: 0` so
+/// callers can detect the partial accounting.
+///
+/// # Errors
+///
+/// Returns `anyhow::Result` for parity with the other provider parsers, but
+/// has no fallible step — events that fail to deserialise into their typed
+/// payload are skipped — so it returns `Ok` for any iterator.
 pub fn parse_copilot_events<I>(events: I, mode: ParseMode) -> Result<CodeAnalysis>
 where
     I: IntoIterator<Item = CopilotEvent>,
@@ -210,12 +231,22 @@ where
     })
 }
 
+/// A `tool.execution_start` event held until its matching
+/// `tool.execution_complete` arrives, keyed by `toolCallId`.
 struct PendingTool {
+    /// Tool name (e.g. `view`, `create`, `str_replace`, `bash`).
     tool_name: String,
+    /// Raw tool arguments object, interpreted lazily by [`dispatch_tool`].
     arguments: Value,
+    /// Start-event timestamp in epoch milliseconds, used for the detail record.
     timestamp: i64,
 }
 
+/// Routes a completed Copilot tool call to the matching file-operation tally.
+///
+/// Branches on `pending.tool_name`; unrecognised tools (e.g. `glob`,
+/// `task_complete`) are silently ignored. Argument field names are probed
+/// with historical aliases for forward compatibility across CLI releases.
 fn dispatch_tool(
     state: &mut SessionParseState,
     pending: &PendingTool,

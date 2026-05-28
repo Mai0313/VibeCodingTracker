@@ -1,7 +1,34 @@
+//! Per-provider usage accumulation: merges the token fields of one session
+//! record into a running per-model map, normalising provider-specific shapes
+//! along the way.
+
 use crate::constants::FastHashMap;
 use serde_json::Value;
 
-/// Helper function to accumulate integer fields from source to target
+/// Adds the named `i64` fields from `source` into `target`, in place.
+///
+/// For each name in `fields`, the matching integer in `source` is added to
+/// the matching integer in `target` (treating a missing target as `0`).
+/// Fields absent from `source`, or present but non-integer, are skipped — so
+/// `target` only ever gains the keys that actually carried a number.
+///
+/// # Examples
+///
+/// ```
+/// use serde_json::{json, Map};
+/// use vibe_coding_tracker::utils::accumulate_i64_fields;
+///
+/// let mut target = Map::new();
+/// target.insert("input".into(), json!(10));
+///
+/// let mut source = Map::new();
+/// source.insert("input".into(), json!(5));
+/// source.insert("output".into(), json!(7));
+///
+/// accumulate_i64_fields(&mut target, &source, &["input", "output"]);
+/// assert_eq!(target["input"], json!(15));
+/// assert_eq!(target["output"], json!(7));
+/// ```
 pub fn accumulate_i64_fields(
     target: &mut serde_json::Map<String, Value>,
     source: &serde_json::Map<String, Value>,
@@ -15,7 +42,31 @@ pub fn accumulate_i64_fields(
     }
 }
 
-/// Helper function to accumulate all i64 fields from a nested object
+/// Adds every `i64` field of `source_nested` into the nested object stored
+/// at `target_obj[field_name]`.
+///
+/// The nested target object is created (as `{}`) if it does not yet exist.
+/// Unlike [`accumulate_i64_fields`], the set of keys is taken from
+/// `source_nested` rather than a fixed list, so any integer key present in
+/// the source is merged. Non-integer source values are ignored.
+///
+/// # Examples
+///
+/// ```
+/// use serde_json::{json, Map};
+/// use vibe_coding_tracker::utils::accumulate_nested_object;
+///
+/// let mut target = Map::new();
+/// target.insert("usage".into(), json!({ "input": 100 }));
+///
+/// let mut nested = Map::new();
+/// nested.insert("input".into(), json!(25));
+/// nested.insert("cached".into(), json!(10));
+///
+/// accumulate_nested_object(&mut target, "usage", &nested);
+/// assert_eq!(target["usage"]["input"], json!(125));
+/// assert_eq!(target["usage"]["cached"], json!(10));
+/// ```
 pub fn accumulate_nested_object(
     target_obj: &mut serde_json::Map<String, Value>,
     field_name: &str,
@@ -38,7 +89,13 @@ pub fn accumulate_nested_object(
     }
 }
 
-/// Process Claude usage data and merge into conversation_usage map
+/// Merges one Claude usage record into `conversation_usage`, keyed by `model`.
+///
+/// Token fields accumulate across calls (the per-model entry is created on
+/// first sight). `service_tier` is overwritten with the latest value rather
+/// than accumulated, and the `cache_creation` TTL split is merged via
+/// [`accumulate_nested_object`]. Records for synthetic models (whose name
+/// contains `<synthetic>`) and non-object `usage` payloads are ignored.
 pub fn process_claude_usage(
     conversation_usage: &mut FastHashMap<String, Value>,
     model: &str,
@@ -95,7 +152,12 @@ pub fn process_claude_usage(
     }
 }
 
-/// Process Codex usage data and merge into conversation_usage map
+/// Merges one Codex usage record into `conversation_usage`, keyed by `model`.
+///
+/// `total_token_usage`, `last_token_usage`, and `model_context_window` are
+/// *replaced* with the incoming values rather than accumulated, because each
+/// Codex record already carries the running session total — adding them would
+/// double-count. Synthetic models and non-object `info` payloads are ignored.
 pub fn process_codex_usage(
     conversation_usage: &mut FastHashMap<String, Value>,
     model: &str,
@@ -141,7 +203,14 @@ pub fn process_codex_usage(
     }
 }
 
-/// Process Gemini usage data and merge into conversation_usage map
+/// Merges one Gemini usage record into `conversation_usage`, keyed by `model`.
+///
+/// All token buckets accumulate across calls. Gemini reports `tokens.input`
+/// as the *full* prompt count (cached subset included), so this function
+/// stores `input - cached` under `input_tokens` and the cached portion under
+/// `cache_read_input_tokens`, mirroring the Claude convention where input and
+/// cache reads are disjoint. The subtraction is clamped at `0` to stay
+/// defensive against a misreport where `cached > input`.
 pub fn process_gemini_usage(
     conversation_usage: &mut FastHashMap<String, Value>,
     model: &str,

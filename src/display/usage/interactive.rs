@@ -1,3 +1,12 @@
+//! Auto-refreshing TUI for the usage view.
+//!
+//! Runs a render loop that re-aggregates the session directories every
+//! [`USAGE_REFRESH_SECS`] seconds, repriced from a pricing map rebuilt at most
+//! every [`PRICING_REFRESH_SECS`], and highlights rows whose tokens changed
+//! since the last tick. The loop holds only the small per-model display state
+//! between frames so a resize repaints instantly without re-aggregating; memory
+//! is trimmed back to the OS after each refresh.
+
 use crate::display::common::table::{
     create_controls, create_provider_row, create_ratatui_table, create_star_hint, create_summary,
     create_title,
@@ -23,21 +32,36 @@ use std::io;
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, System};
 
+/// How often the loop re-aggregates the session directories and repaints.
 const USAGE_REFRESH_SECS: u64 = 10;
 /// How often to rebuild the LiteLLM pricing map. The underlying data only
 /// changes when the upstream JSON is updated (daily at most), so rebuilding
 /// a fresh ~500 KB `HashMap<Rc<str>, ModelPricing>` every 10 s just churned
 /// the allocator and left heap fragmentation behind on long sessions.
 const PRICING_REFRESH_SECS: u64 = 300;
+/// Upper bound on rows the [`UpdateTracker`] remembers for change highlighting.
 const MAX_TRACKED_ROWS: usize = 100;
 
-/// Displays token usage data in an interactive TUI with auto-refresh
+/// Displays token usage data in an interactive TUI with auto-refresh.
+///
+/// Runs until the user quits; `time_range` filters which sessions are scanned.
 ///
 /// Features:
 /// - Auto-refresh every 10 seconds (usage + pricing)
 /// - Real-time memory monitoring
 /// - Provider-grouped totals
 /// - Keyboard controls: `q`, `Esc`, or `Ctrl+C` to exit
+///
+/// # Errors
+///
+/// Returns an error if the terminal cannot be set up or restored, if reading a
+/// terminal input event fails, or if a frame fails to draw. A failure to
+/// aggregate usage or fetch pricing within the loop is logged and the previous
+/// data is kept, not propagated.
+///
+/// # Panics
+///
+/// Panics if the current process ID cannot be obtained for memory monitoring.
 pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::Result<()> {
     let mut terminal = setup_terminal()?;
     let mut refresh_state = RefreshState::new(USAGE_REFRESH_SECS);
@@ -215,6 +239,10 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
 /// terminal resize can paint the latest data; `provider_rows` is rebuilt here
 /// (cheap, at most five borrow wrappers) rather than cached, since it borrows
 /// from `provider_totals`.
+///
+/// # Errors
+///
+/// Returns an error if the underlying terminal draw call fails.
 #[allow(clippy::too_many_arguments)]
 fn render_usage_frame(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,

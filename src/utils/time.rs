@@ -1,6 +1,28 @@
+//! Timestamp parsing helpers for the ISO-8601 / RFC 3339 strings that the
+//! provider session logs embed in each record.
+
 use chrono::DateTime;
 
-/// Parse ISO timestamp to Unix milliseconds
+/// Parses an ISO-8601 / RFC 3339 timestamp into Unix milliseconds.
+///
+/// RFC 3339 is tried first (the common case, with timezone offset or `Z`),
+/// then a small set of explicit UTC fallback patterns covering 3-digit,
+/// arbitrary-precision, and zero-fraction sub-seconds. Surrounding
+/// whitespace is *not* tolerated.
+///
+/// Returns `0` for an empty string or any input that matches none of the
+/// accepted formats; callers treat `0` as "unknown time" rather than the
+/// Unix epoch.
+///
+/// # Examples
+///
+/// ```
+/// use vibe_coding_tracker::utils::parse_iso_timestamp;
+///
+/// assert_eq!(parse_iso_timestamp("1970-01-01T00:00:01Z"), 1_000);
+/// assert_eq!(parse_iso_timestamp(""), 0);
+/// assert_eq!(parse_iso_timestamp("not a timestamp"), 0);
+/// ```
 pub fn parse_iso_timestamp(ts: &str) -> i64 {
     if ts.is_empty() {
         return 0;

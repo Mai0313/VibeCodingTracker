@@ -1,3 +1,13 @@
+//! Binary entry point for the `vibe_coding_tracker` (`vct`) CLI.
+//!
+//! Parses the subcommand with clap and dispatches to the library crate:
+//! `analysis` and `usage` (each with TUI / table / text / JSON output and
+//! a time-range filter), plus `version` and `update`. The heavy lifting
+//! lives in [`vibe_coding_tracker`]; this file is wiring.
+//!
+//! Two things run *before* clap on purpose, and the ordering is
+//! load-bearing — see [`main`].
+
 use anyhow::Result;
 use clap::Parser;
 use comfy_table::{Cell, CellAlignment, Color, ContentArrangement, Table, presets::UTF8_FULL};
@@ -24,6 +34,21 @@ use vibe_coding_tracker::usage::get_usage_from_directories;
 use vibe_coding_tracker::utils::extract_token_counts;
 use vibe_coding_tracker::{get_version_info, parse_session_file};
 
+/// Parses the CLI and runs the selected subcommand.
+///
+/// Two steps run before `Cli::parse()` and must stay in this order:
+/// `tune_system_allocator()` caps glibc arenas before the first allocation
+/// (a Rayon worker), and the `--version` / `-V` branch is handled by hand so
+/// the bare flag prints just [`vibe_coding_tracker::VERSION`] without going
+/// through clap (the `version` *subcommand* still renders the full table).
+///
+/// # Errors
+///
+/// Propagates any failure from the dispatched subcommand: session parsing,
+/// JSON (de)serialization, file writes for `--output`, terminal/TUI errors,
+/// or the network and binary-replacement errors raised by `update`. Pricing
+/// fetch failure in `usage --json` is downgraded to a warning rather than an
+/// error, so costs are reported as unavailable instead of aborting.
 fn main() -> Result<()> {
     // Cap per-thread glibc arenas and pin the trim threshold before any
     // allocation happens under a Rayon worker. See `tune_system_allocator`
@@ -198,6 +223,18 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Builds the `usage --json` payload, joining each model's token counts with
+/// its priced cost.
+///
+/// For every model in `usage_data` it looks the model up in `pricing_map`,
+/// computes the USD cost from the extracted token counts, and emits a JSON
+/// object with `model`, `usage`, `cost_usd`, and (when the price came from a
+/// fuzzy match rather than an exact key) `matched_model`.
+///
+/// # Errors
+///
+/// Returns an error only if a usage value cannot be serialized into the
+/// resulting JSON object.
 fn build_enriched_json(
     usage_data: &UsageResult,
     pricing_map: &ModelPricingMap,

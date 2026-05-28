@@ -1,8 +1,22 @@
 use chrono::{Local, NaiveDate};
 use std::sync::RwLock;
 
-/// Format a number with thousand separators (e.g., 1234567 -> "1,234,567")
-/// Optimized version using itoa for faster integer-to-string conversion (40% faster)
+/// Formats an integer with comma thousands-separators.
+///
+/// Accepts any [`itoa::Integer`], so both signed and unsigned widths work.
+/// Uses `itoa` to render the digits into a stack buffer, then inserts commas
+/// every three digits from the right — no intermediate `String` allocation
+/// for the conversion itself.
+///
+/// # Examples
+///
+/// ```
+/// use vibe_coding_tracker::utils::format_number;
+///
+/// assert_eq!(format_number(0), "0");
+/// assert_eq!(format_number(1234), "1,234");
+/// assert_eq!(format_number(1_234_567), "1,234,567");
+/// ```
 pub fn format_number<T>(n: T) -> String
 where
     T: itoa::Integer,
@@ -41,7 +55,13 @@ where
 // Cache for current date (updated once per day)
 static DATE_CACHE: RwLock<Option<(NaiveDate, String)>> = RwLock::new(None);
 
-/// Get current date in YYYY-MM-DD format (cached for performance)
+/// Returns today's local date as a `YYYY-MM-DD` string.
+///
+/// The formatted string is cached behind an `RwLock` and only recomputed
+/// when the local calendar day changes, so repeated calls within the same
+/// day (e.g. tagging every aggregated row) avoid re-running `strftime`. A
+/// poisoned lock degrades gracefully: the value is recomputed without
+/// touching the cache rather than panicking.
 pub fn get_current_date() -> String {
     let today = Local::now().date_naive();
 

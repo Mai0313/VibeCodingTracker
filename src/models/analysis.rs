@@ -1,104 +1,200 @@
+//! Normalized, cross-provider analysis result types.
+//!
+//! These structs are the analyzer's output shape: every provider parser in
+//! `src/session/` produces a [`CodeAnalysis`] regardless of the source
+//! assistant, and the `analysis` / `usage` roll-up layers consume them. The
+//! `serde` attributes here also define the JSON layout of the golden fixtures
+//! under `examples/` and of `vct analysis --json`.
+
 use crate::constants::FastHashMap;
 use serde::{Deserialize, Serialize};
 
-/// Base metadata for file operations captured during analysis
+/// Fields shared by every per-operation detail record.
+///
+/// `line_count` and `character_count` are measured on the *trimmed* payload,
+/// and `character_count` counts Unicode scalar values (`str::chars`), not
+/// bytes. Serialized with camelCase keys (`filePath`, `lineCount`, …).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeAnalysisDetailBase {
+    /// Absolute path of the file the operation targeted.
     pub file_path: String,
+    /// Number of lines in the operation payload.
     pub line_count: usize,
+    /// Number of Unicode scalar values in the operation payload.
     pub character_count: usize,
+    /// Unix epoch timestamp (milliseconds) when the operation occurred.
     pub timestamp: i64,
 }
 
-/// Details of a file write operation including full content
+/// A single file-write operation, including the full written content.
+///
+/// The `base` fields are flattened into the same JSON object (no nested
+/// `base` key), so the record serializes as `{filePath, lineCount, …, content}`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeAnalysisWriteDetail {
+    /// Shared path / line / character / timestamp metadata, flattened inline.
     #[serde(flatten)]
     pub base: CodeAnalysisDetailBase,
+    /// Full content written to the file.
     pub content: String,
 }
 
-/// Details of a file read operation
+/// A single file-read operation.
+///
+/// Carries only the shared [`CodeAnalysisDetailBase`] metadata; the file body
+/// itself is not retained.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeAnalysisReadDetail {
+    /// Shared path / line / character / timestamp metadata, flattened inline.
     #[serde(flatten)]
     pub base: CodeAnalysisDetailBase,
 }
 
-/// Details of a file edit operation showing before and after content
+/// A single file-edit operation, recording the before/after strings.
+///
+/// `line_count` / `character_count` in `base` describe the new (replacement)
+/// text. Serializes with the `base` fields flattened inline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeAnalysisApplyDiffDetail {
+    /// Shared path / line / character / timestamp metadata, flattened inline.
     #[serde(flatten)]
     pub base: CodeAnalysisDetailBase,
+    /// Text that was replaced.
     pub old_string: String,
+    /// Text that replaced `old_string`.
     pub new_string: String,
 }
 
-/// Details of a shell command execution
+/// A single shell-command execution.
+///
+/// For run-command records `base.file_path` holds the session's working
+/// directory (there is no single target file) and `base.line_count` is `0`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeAnalysisRunCommandDetail {
+    /// Shared metadata; `file_path` is the working directory, `line_count` is 0.
     #[serde(flatten)]
     pub base: CodeAnalysisDetailBase,
+    /// The command line that was executed.
     pub command: String,
+    /// Human-readable description of the command, when the assistant supplied one.
     pub description: String,
 }
 
-/// Counters for each type of tool call made during a coding session
+/// Per-session counters for each tool the analyzer tracks.
+///
+/// Serialized with PascalCase keys (`Read`, `Write`, `Edit`, `TodoWrite`,
+/// `Bash`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct CodeAnalysisToolCalls {
+    /// Number of file-read tool calls.
     pub read: usize,
+    /// Number of file-write tool calls.
     pub write: usize,
+    /// Number of file-edit tool calls.
     pub edit: usize,
+    /// Number of todo-list update tool calls.
     pub todo_write: usize,
+    /// Number of shell-command tool calls.
     pub bash: usize,
 }
 
-/// Aggregated metrics and details for a single coding session
+/// Aggregated metrics and per-operation details for a single coding session.
+///
+/// One record corresponds to one session file. When parsed in
+/// `ParseMode::UsageOnly` the `*_file_details` / `run_command_details` vectors
+/// are left empty to avoid allocating large bodies, while the `total_*`
+/// counters and `conversation_usage` are still populated.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeAnalysisRecord {
+    /// Count of distinct files touched (read, written, or edited) in the session.
     pub total_unique_files: usize,
+    /// Sum of lines written across all write operations.
     pub total_write_lines: usize,
+    /// Sum of lines read across all read operations.
     pub total_read_lines: usize,
+    /// Sum of replacement lines across all edit operations.
     pub total_edit_lines: usize,
+    /// Sum of characters written across all write operations.
     pub total_write_characters: usize,
+    /// Sum of characters read across all read operations.
     pub total_read_characters: usize,
+    /// Sum of replacement characters across all edit operations.
     pub total_edit_characters: usize,
+    /// Per-operation write records (empty in `ParseMode::UsageOnly`).
     pub write_file_details: Vec<CodeAnalysisWriteDetail>,
+    /// Per-operation read records (empty in `ParseMode::UsageOnly`).
     pub read_file_details: Vec<CodeAnalysisReadDetail>,
+    /// Per-operation edit records (empty in `ParseMode::UsageOnly`).
     pub edit_file_details: Vec<CodeAnalysisApplyDiffDetail>,
+    /// Per-command shell execution records (empty in `ParseMode::UsageOnly`).
     pub run_command_details: Vec<CodeAnalysisRunCommandDetail>,
+    /// Tool-call counters for the session.
     pub tool_call_counts: CodeAnalysisToolCalls,
+    /// Token-usage payloads keyed by model name; shape varies by provider
+    /// (see [`crate::models::UsageResult`]).
     pub conversation_usage: FastHashMap<String, serde_json::Value>,
+    /// Session / task identifier from the source log.
     pub task_id: String,
+    /// Unix epoch timestamp (milliseconds) of the session's last activity.
     pub timestamp: i64,
+    /// Working directory the session ran in.
     pub folder_path: String,
+    /// Git remote URL of the project, when one was detected.
     pub git_remote_url: String,
 }
 
-/// Top-level analysis result containing metadata and session records
+/// Top-level analysis result: environment metadata plus one record per session.
+///
+/// This is the shape returned by `parse_session_file_typed` and serialized by
+/// `vct analysis --json`. The `insights_version`, `machine_id`, and `user`
+/// fields are environment-specific and are deliberately ignored by the golden
+/// fixture tests.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeAnalysis {
+    /// OS user name that owned the session.
     pub user: String,
+    /// Source assistant label (e.g. `Claude-Code`), as produced by
+    /// [`ExtensionType`]'s [`std::fmt::Display`].
     pub extension_name: String,
+    /// Version string of the analyzer that produced this result.
     pub insights_version: String,
+    /// Stable machine identifier for the host.
     pub machine_id: String,
+    /// One [`CodeAnalysisRecord`] per parsed session.
     pub records: Vec<CodeAnalysisRecord>,
 }
 
-/// AI coding assistant extension types (Claude Code, Codex, Copilot, or Gemini)
+/// The AI coding assistant a session came from.
+///
+/// Distinct from [`crate::models::Provider`]: `ExtensionType` is the four
+/// concrete assistants the detector resolves a session file to (there is no
+/// `Unknown` variant), and its [`std::fmt::Display`] produces the hyphenated
+/// `extension_name` strings stored in [`CodeAnalysis`].
+///
+/// # Examples
+///
+/// ```
+/// use vibe_coding_tracker::models::ExtensionType;
+///
+/// assert_eq!(ExtensionType::Copilot.to_string(), "Copilot-CLI");
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtensionType {
+    /// Anthropic Claude Code.
     ClaudeCode,
+    /// OpenAI Codex CLI.
     Codex,
+    /// GitHub Copilot CLI.
     Copilot,
+    /// Google Gemini CLI.
     Gemini,
 }
 

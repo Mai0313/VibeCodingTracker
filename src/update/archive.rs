@@ -1,3 +1,10 @@
+//! Archive extraction for downloaded release assets.
+//!
+//! Unpacks tar.gz (Unix/macOS) and zip (Windows) archives into a destination
+//! directory, then locates the `vibe_coding_tracker` / `vct` binary inside it.
+//! Every entry's destination is validated to stay within the target directory,
+//! guarding against path-traversal (Zip Slip) in a malicious archive.
+
 use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
 use std::fs::{self, File};
@@ -5,7 +12,16 @@ use std::path::Path;
 use tar::Archive;
 use zip::ZipArchive;
 
-/// Extract tar.gz archive and return the path to the binary
+/// Extracts a tar.gz archive into `extract_to` and returns the binary path.
+///
+/// Each entry is unpacked only after confirming its joined path stays under
+/// `extract_to`; an entry that would escape aborts the whole extraction.
+///
+/// # Errors
+///
+/// Returns an error if the archive cannot be opened or read, if any entry
+/// attempts to escape `extract_to`, if unpacking an entry fails, or if no
+/// known binary name is found afterward (see `find_binary_in_directory`).
 pub fn extract_targz(archive_path: &Path, extract_to: &Path) -> Result<std::path::PathBuf> {
     let tar_gz = File::open(archive_path).context("Failed to open archive file")?;
     let tar = GzDecoder::new(tar_gz);
@@ -34,7 +50,17 @@ pub fn extract_targz(archive_path: &Path, extract_to: &Path) -> Result<std::path
     find_binary_in_directory(extract_to)
 }
 
-/// Extract zip archive and return the path to the binary
+/// Extracts a zip archive into `extract_to` and returns the binary path.
+///
+/// Recreates directory entries and writes file entries, validating each
+/// destination against `extract_to` before touching the filesystem.
+///
+/// # Errors
+///
+/// Returns an error if the archive cannot be opened or read, if any entry
+/// attempts to escape `extract_to`, if a directory or file cannot be created
+/// or written, or if no known binary name is found afterward (see
+/// `find_binary_in_directory`).
 pub fn extract_zip(archive_path: &Path, extract_to: &Path) -> Result<std::path::PathBuf> {
     let file = File::open(archive_path).context("Failed to open archive file")?;
     let mut archive = ZipArchive::new(file).context("Failed to read zip archive")?;
@@ -67,7 +93,17 @@ pub fn extract_zip(archive_path: &Path, extract_to: &Path) -> Result<std::path::
     find_binary_in_directory(extract_to)
 }
 
-/// Find the binary in the extracted directory
+/// Locates the extracted binary by name and marks it executable on Unix.
+///
+/// Probes the platform-specific candidate names (`vibe_coding_tracker` / `vct`,
+/// with `.exe` on Windows) directly under `extract_to` and returns the first
+/// that exists. On Unix the found binary is `chmod`-ed to `0o755` so it can be
+/// run after the swap.
+///
+/// # Errors
+///
+/// Returns an error if no candidate name is found, or on Unix if reading or
+/// setting the binary's permissions fails.
 fn find_binary_in_directory(extract_to: &Path) -> Result<std::path::PathBuf> {
     // Find the binary in the extracted files
     #[cfg(unix)]

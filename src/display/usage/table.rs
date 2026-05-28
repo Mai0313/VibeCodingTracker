@@ -1,3 +1,5 @@
+//! Static-table renderer for the usage view (per-model table + per-provider footer).
+
 use crate::display::common::table::{
     add_totals_row, create_comfy_table, create_metric_cell, create_provider_cell,
 };
@@ -9,7 +11,14 @@ use comfy_table::{Cell, CellAlignment, Color, Table, presets::UTF8_FULL};
 use owo_colors::OwoColorize;
 use std::collections::HashMap;
 
-/// Displays token usage data as a static table
+/// Prints token usage to stdout as a colored per-model table plus a
+/// per-provider totals footer.
+///
+/// The "Output" column folds `reasoning_tokens` back into the displayed number
+/// so each row reconciles with "Total Tokens", while cost is priced against the
+/// separated buckets. Prints a "no usage data" message when empty. If pricing
+/// cannot be fetched, a warning is written to stderr and costs are shown as
+/// `$0.00`.
 pub fn display_usage_table(usage_data: &UsageData) {
     if usage_data.models.is_empty() {
         println!("No usage data found in Claude Code, Codex, Copilot, or Gemini sessions");

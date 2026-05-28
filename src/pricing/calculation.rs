@@ -24,6 +24,22 @@ use super::cache::{ModelPricing, TierRange};
 /// separately (5-minute default TTL vs 1-hour extended TTL). When a model
 /// doesn't publish a 1hr price (value is 0.0), the 5m price is used for both
 /// buckets — matching current behaviour for providers that don't split TTL.
+///
+/// # Examples
+///
+/// ```
+/// use vibe_coding_tracker::pricing::ModelPricing;
+/// use vibe_coding_tracker::pricing::calculate_cost;
+///
+/// let pricing = ModelPricing {
+///     input_cost_per_token: 3e-6,
+///     output_cost_per_token: 1.5e-5,
+///     ..Default::default()
+/// };
+/// // 1000 input + 500 output tokens, no cache or reasoning.
+/// let cost = calculate_cost(1000, 500, 0, 0, 0, 0, &pricing);
+/// assert_eq!(cost, 1000.0 * 3e-6 + 500.0 * 1.5e-5);
+/// ```
 #[allow(clippy::too_many_arguments)] // pricing dispatch; grouping into a struct costs clarity here
 pub fn calculate_cost(
     input_tokens: i64,

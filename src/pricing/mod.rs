@@ -1,3 +1,15 @@
+//! Model pricing: fetch, cache, match, and cost calculation.
+//!
+//! This module pulls per-model token prices from LiteLLM, caches them on disk
+//! (one file per calendar day), matches a session's model name against that
+//! table, and computes the USD cost of a request. The public surface is the
+//! re-exports below; the `cache` / `calculation` / `matching` submodules are
+//! internal wiring.
+//!
+//! Lookup proceeds exact -> normalized -> substring -> Jaro-Winkler fuzzy
+//! (see [`ModelPricingMap::get`]), and cost is computed by [`calculate_cost`]
+//! across flat, threshold-tiered, and range-tiered pricing shapes.
+
 mod cache;
 mod calculation;
 mod matching;
@@ -15,10 +27,31 @@ pub use matching::{
     ModelPricingMap, ModelPricingResult, clear_pricing_cache, normalize_model_name,
 };
 
-/// Fetches AI model pricing data from LiteLLM repository with automatic caching
+/// Fetches AI model pricing data from the LiteLLM repository with automatic caching.
 ///
 /// Returns an optimized pricing map with precomputed indices for fast lookups.
-/// Pricing is cached locally for 24 hours (one file per date) to minimize API calls.
+/// Pricing is cached locally for 24 hours (one file per date) to minimize
+/// network calls. If today's cache exists and is in the current schema it is
+/// loaded directly; otherwise the upstream JSON is fetched, filtered to its
+/// cost fields, persisted, and parsed. A failure to write the cache is logged
+/// but does not abort the fetch.
+///
+/// # Errors
+///
+/// Returns an error if the HTTP client cannot be built, the LiteLLM request
+/// fails, or the response body is not valid JSON. A corrupt or legacy on-disk
+/// cache does not surface here — it is logged and falls through to a refetch.
+///
+/// # Examples
+///
+/// ```no_run
+/// use vibe_coding_tracker::pricing::fetch_model_pricing;
+///
+/// let pricing = fetch_model_pricing()?;
+/// let opus = pricing.get("claude-opus-4");
+/// assert!(opus.pricing.input_cost_per_token >= 0.0);
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 pub fn fetch_model_pricing() -> Result<ModelPricingMap> {
     let today = get_current_date();
 

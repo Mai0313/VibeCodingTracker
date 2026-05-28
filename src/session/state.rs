@@ -1,3 +1,11 @@
+//! Mutable accumulator shared by every per-provider session parser.
+//!
+//! Each provider parser ([`crate::session::claude`], [`crate::session::codex`],
+//! …) walks its own JSONL shape but funnels the file-operation facts it
+//! extracts through a single [`SessionParseState`], which tallies line /
+//! character counts and (in [`ParseMode::Full`]) accumulates the per-op detail
+//! records. Once the file is consumed the state is converted into one
+//! [`CodeAnalysisRecord`] via [`SessionParseState::into_record`].
 use crate::constants::FastHashMap;
 use crate::models::*;
 use crate::utils::count_lines;
@@ -16,36 +24,82 @@ use std::collections::HashSet;
 /// session parse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseMode {
+    /// Retain everything that ends up in the JSON output, including file
+    /// bodies and old/new edit strings.
     Full,
+    /// Skip per-detail allocations; keep only counts and totals.
     UsageOnly,
 }
 
 /// Common parse state shared by all per-provider session parsers.
+///
+/// Construct with [`SessionParseState::new`] (full detail) or
+/// [`SessionParseState::with_mode`], populate the metadata fields
+/// (`folder_path`, `git_remote`, `task_id`) directly as the provider header
+/// is read, feed file operations through the `add_*` helpers, then call
+/// [`SessionParseState::into_record`] to produce the final
+/// [`CodeAnalysisRecord`]. Not thread-safe; one instance parses one file on
+/// one thread.
 pub struct SessionParseState {
+    /// Detail-retention level chosen at construction.
     pub mode: ParseMode,
+    /// Per-`Write` detail records (empty in [`ParseMode::UsageOnly`]).
     pub write_details: Vec<CodeAnalysisWriteDetail>,
+    /// Per-`Read` detail records (empty in [`ParseMode::UsageOnly`]).
     pub read_details: Vec<CodeAnalysisReadDetail>,
+    /// Per-`Edit`/diff detail records (empty in [`ParseMode::UsageOnly`]).
     pub edit_details: Vec<CodeAnalysisApplyDiffDetail>,
+    /// Per-`Bash`/run-command detail records (empty in [`ParseMode::UsageOnly`]).
     pub run_details: Vec<CodeAnalysisRunCommandDetail>,
+    /// Running per-tool call counts (always tallied, both modes).
     pub tool_counts: CodeAnalysisToolCalls,
+    /// Distinct normalized file paths touched (only populated in [`ParseMode::Full`]).
     pub unique_files: HashSet<String>,
+    /// Sum of lines written across all `Write` operations.
     pub total_write_lines: usize,
+    /// Sum of lines read across all `Read` operations.
     pub total_read_lines: usize,
+    /// Sum of new-content lines across all `Edit` operations.
     pub total_edit_lines: usize,
+    /// Sum of characters written across all `Write` operations.
     pub total_write_characters: usize,
+    /// Sum of characters read across all `Read` operations.
     pub total_read_characters: usize,
+    /// Sum of new-content characters across all `Edit` operations.
     pub total_edit_characters: usize,
+    /// Session working directory; used to resolve relative paths to absolute.
     pub folder_path: String,
+    /// Git remote URL for the session's repository, when known.
     pub git_remote: String,
+    /// Provider-specific session identifier.
     pub task_id: String,
+    /// Latest event timestamp seen, in epoch milliseconds.
     pub last_ts: i64,
 }
 
 impl SessionParseState {
+    /// Creates an empty parse state in [`ParseMode::Full`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use vibe_coding_tracker::session::state::SessionParseState;
+    ///
+    /// let mut state = SessionParseState::new();
+    /// state.folder_path = "/repo".to_string();
+    /// state.add_read_detail("src/main.rs", "fn main() {}\n", 0);
+    /// assert_eq!(state.total_read_lines, 1);
+    /// assert_eq!(state.tool_counts.read, 1);
+    /// ```
     pub fn new() -> Self {
         Self::with_mode(ParseMode::Full)
     }
 
+    /// Creates an empty parse state with the given detail-retention `mode`.
+    ///
+    /// In [`ParseMode::Full`] the detail `Vec`s and `unique_files` set are
+    /// pre-sized to typical session sizes; in [`ParseMode::UsageOnly`] they
+    /// start empty since they stay empty for the whole parse.
     pub fn with_mode(mode: ParseMode) -> Self {
         // Pre-allocate Vecs with reasonable capacity estimates based on
         // typical session sizes. In `UsageOnly` mode we skip the
@@ -88,7 +142,12 @@ impl SessionParseState {
         }
     }
 
-    /// Add a read operation detail
+    /// Records a `Read` operation against `path` with the read `content`.
+    ///
+    /// Trailing newlines are stripped before counting. No-op (and no count
+    /// bump) when the trimmed content is empty or when `path` normalizes to
+    /// an empty string. The detail record and `unique_files` entry are only
+    /// stored in [`ParseMode::Full`]; counts accrue in both modes.
     pub fn add_read_detail(&mut self, path: &str, content: &str, ts: i64) {
         let trimmed = content.trim_end_matches('\n');
         let line_count = count_lines(trimmed);
@@ -121,7 +180,12 @@ impl SessionParseState {
         self.tool_counts.read += 1;
     }
 
-    /// Add a write operation detail
+    /// Records a `Write` operation against `path` with the written `content`.
+    ///
+    /// Trailing newlines are stripped before counting. No-op when `path`
+    /// normalizes to an empty string (an empty body is still counted as a
+    /// zero-line write). The full detail (including `content`) and
+    /// `unique_files` entry are stored only in [`ParseMode::Full`].
     pub fn add_write_detail(&mut self, path: &str, content: &str, ts: i64) {
         let trimmed = content.trim_end_matches('\n');
         let line_count = count_lines(trimmed);
@@ -150,7 +214,14 @@ impl SessionParseState {
         self.tool_counts.write += 1;
     }
 
-    /// Add an edit operation detail
+    /// Records an `Edit` operation against `path`, replacing `old` with `new`.
+    ///
+    /// When `old` is empty but `new` is not, the edit is reclassified as a
+    /// `Write` (a new-file creation expressed as a diff) and forwarded to
+    /// [`SessionParseState::add_write_detail`]. Otherwise the line/character
+    /// tally is taken from the trimmed `new` content. No-op when `path`
+    /// normalizes to an empty string; full detail stored only in
+    /// [`ParseMode::Full`].
     pub fn add_edit_detail(&mut self, path: &str, old: &str, new: &str, ts: i64) {
         let trimmed_new = new.trim_end_matches('\n');
         let trimmed_old = old.trim_end_matches('\n');
@@ -188,7 +259,11 @@ impl SessionParseState {
         self.tool_counts.edit += 1;
     }
 
-    /// Add a run command detail
+    /// Records a `Bash`/run-command invocation with its `command` text.
+    ///
+    /// No-op (and no count bump) when `command` is empty after trimming. The
+    /// detail record (attributed to `folder_path`) is stored only in
+    /// [`ParseMode::Full`]; the `bash` count accrues in both modes.
     pub fn add_run_command(&mut self, command: &str, description: &str, ts: i64) {
         let command = command.trim();
         if command.is_empty() {
@@ -213,7 +288,10 @@ impl SessionParseState {
         self.tool_counts.bash += 1;
     }
 
-    /// Normalize a file path (convert relative to absolute if needed)
+    /// Resolves `path` to an absolute path, joining it onto `folder_path`.
+    ///
+    /// Returns the input unchanged when it is already absolute, when it is
+    /// empty, or when `folder_path` is empty (nothing to join against).
     pub fn normalize_path(&self, path: &str) -> String {
         if path.is_empty() {
             return String::new();
@@ -234,7 +312,10 @@ impl SessionParseState {
             .to_string()
     }
 
-    /// Convert state into a CodeAnalysisRecord
+    /// Consumes the state into a finished [`CodeAnalysisRecord`].
+    ///
+    /// `conversation_usage` is the per-model token map the provider parser
+    /// accumulated separately; it is folded into the record verbatim.
     pub fn into_record(self, conversation_usage: FastHashMap<String, Value>) -> CodeAnalysisRecord {
         CodeAnalysisRecord {
             total_unique_files: self.unique_files.len(),
@@ -259,6 +340,7 @@ impl SessionParseState {
 }
 
 impl Default for SessionParseState {
+    /// Equivalent to [`SessionParseState::new`] ([`ParseMode::Full`]).
     fn default() -> Self {
         Self::new()
     }

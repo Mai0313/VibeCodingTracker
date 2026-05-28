@@ -1,3 +1,11 @@
+//! Leaf helpers shared across the crate: directory walking, JSON/JSONL file
+//! IO, number/date formatting, git remote lookup, glibc heap tuning, path
+//! resolution, ISO timestamp parsing, and token-count extraction.
+//!
+//! The most frequently used items are re-exported at this module's root so
+//! callers can write `utils::format_number` instead of reaching into the
+//! per-concern submodules.
+
 pub mod directory;
 pub mod file;
 pub mod format;

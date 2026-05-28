@@ -1,3 +1,8 @@
+//! Static (non-interactive) table renderer for the `analysis` view.
+//!
+//! Prints two `comfy_table` grids to stdout: the per-model metrics with a
+//! `TOTAL` row, followed by the per-provider totals.
+
 use crate::analysis::AnalysisData;
 use crate::display::analysis::averages::{
     AnalysisRow, build_analysis_provider_rows, calculate_analysis_provider_totals_from_per_provider,
@@ -9,7 +14,11 @@ use crate::utils::format_number;
 use comfy_table::{Cell, CellAlignment, Color, Table, presets::UTF8_FULL};
 use owo_colors::OwoColorize;
 
-/// Display analysis data as a static table
+/// Print the `analysis` data as static, colored tables to stdout.
+///
+/// Renders a per-model metrics table with a `TOTAL` summary row, then a
+/// per-provider totals table. Prints a placeholder line and returns early when
+/// there are no rows.
 pub fn display_analysis_table(analysis: &AnalysisData) {
     let data = &analysis.rows;
     if data.is_empty() {
