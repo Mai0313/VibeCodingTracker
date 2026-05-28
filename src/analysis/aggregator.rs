@@ -89,8 +89,9 @@ pub struct PerProviderAnalysisRows {
 ///
 /// # Errors
 ///
-/// Returns an error if the provider paths cannot be resolved, or if walking any
-/// existing provider directory to collect its session files fails.
+/// Returns an error if the provider paths cannot be resolved. Directory
+/// traversal and metadata errors are currently skipped by the walker rather
+/// than propagated.
 ///
 /// # Examples
 ///
@@ -229,7 +230,8 @@ fn into_sorted_rows(map: FastHashMap<String, AggregatedAnalysisRow>) -> Vec<Aggr
 ///
 /// # Errors
 ///
-/// Returns an error if collecting the candidate files from `dir` fails.
+/// Returns an error only if the candidate-file collector returns one. The
+/// current collector skips traversal and metadata errors.
 #[allow(clippy::too_many_arguments)] // per-provider helper; struct-wrapping the args would hurt readability
 fn aggregate_sessions_in_directory<P, F>(
     dir: P,
