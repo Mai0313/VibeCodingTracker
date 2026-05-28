@@ -5,18 +5,23 @@ use crate::display::common::table::{
 use crate::display::common::tui::{
     InputAction, RefreshState, UpdateTracker, handle_input, restore_terminal, setup_terminal,
 };
-use crate::display::usage::averages::{build_provider_total_rows, build_usage_summary};
+use crate::display::usage::averages::{
+    UsageProviderTotals, UsageRow, UsageTotals, build_provider_total_rows, build_usage_summary,
+};
 use crate::models::{PerProviderUsage, ProviderActiveDays, UsageResult};
 use crate::pricing::{ModelPricingMap, fetch_model_pricing};
 use crate::utils::format_number;
 use ratatui::{
+    Terminal,
+    backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout as RatatuiLayout},
     style::{Color as RatatuiColor, Style, Stylize},
     widgets::Row as RatatuiRow,
 };
 use std::collections::HashMap;
+use std::io;
 use std::time::{Duration, Instant};
-use sysinfo::System;
+use sysinfo::{Pid, System};
 
 const USAGE_REFRESH_SECS: u64 = 10;
 /// How often to rebuild the LiteLLM pricing map. The underlying data only
@@ -68,270 +73,311 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
 
     let mut update_tracker = UpdateTracker::new(MAX_TRACKED_ROWS, 1000);
 
+    // Latest rendered display state, kept across refresh cycles so a terminal
+    // resize can redraw at the new size immediately without re-aggregating the
+    // session directories. These are small per-model summaries, not the heavy
+    // parse buffers, so holding onto them between refreshes is cheap.
+    let mut rows_data: Vec<UsageRow> = Vec::new();
+    let mut totals = UsageTotals::default();
+    let mut provider_totals = UsageProviderTotals::default();
+
     loop {
-        if !refresh_state.should_refresh() {
-            match handle_input()? {
-                InputAction::Quit => break,
-                InputAction::Refresh => refresh_state.force(),
-                InputAction::Continue => continue,
-            }
-            continue;
-        }
+        if refresh_state.should_refresh() {
+            refresh_state.mark_refreshed();
 
-        refresh_state.mark_refreshed();
+            // Only refresh our own process entry and prune any that have died.
+            // Per-process CPU usage is updated as part of `refresh_processes`, so
+            // the former `refresh_cpu_all()` (which scans every CPU system-wide)
+            // is not needed here.
+            sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
 
-        // Only refresh our own process entry and prune any that have died.
-        // Per-process CPU usage is updated as part of `refresh_processes`, so
-        // the former `refresh_cpu_all()` (which scans every CPU system-wide)
-        // is not needed here.
-        sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
-
-        match crate::usage::get_usage_from_directories(time_range) {
-            Ok(data) => {
-                usage_data = data.models;
-                per_provider_usage = data.per_provider;
-                provider_days = data.provider_days;
-                has_usage_data = true;
-            }
-            Err(e) => {
-                log::warn!("Failed to get usage data: {}", e);
-                if !has_usage_data {
-                    usage_data.clear();
-                    per_provider_usage = PerProviderUsage::default();
+            match crate::usage::get_usage_from_directories(time_range) {
+                Ok(data) => {
+                    usage_data = data.models;
+                    per_provider_usage = data.per_provider;
+                    provider_days = data.provider_days;
+                    has_usage_data = true;
+                }
+                Err(e) => {
+                    log::warn!("Failed to get usage data: {}", e);
+                    if !has_usage_data {
+                        usage_data.clear();
+                        per_provider_usage = PerProviderUsage::default();
+                    }
                 }
             }
-        }
 
-        // Refresh the pricing map at most once every `PRICING_REFRESH_SECS`.
-        if last_pricing_refresh.elapsed() >= Duration::from_secs(PRICING_REFRESH_SECS)
-            || pricing_map.is_empty()
-        {
-            match fetch_model_pricing() {
-                Ok(map) => {
-                    pricing_map = map;
-                    last_pricing_refresh = Instant::now();
+            // Refresh the pricing map at most once every `PRICING_REFRESH_SECS`.
+            if last_pricing_refresh.elapsed() >= Duration::from_secs(PRICING_REFRESH_SECS)
+                || pricing_map.is_empty()
+            {
+                match fetch_model_pricing() {
+                    Ok(map) => {
+                        pricing_map = map;
+                        last_pricing_refresh = Instant::now();
+                    }
+                    Err(e) => log::warn!("Failed to refresh pricing: {}", e),
                 }
-                Err(e) => log::warn!("Failed to refresh pricing: {}", e),
             }
-        }
 
-        let summary = build_usage_summary(
-            &usage_data,
-            &per_provider_usage,
-            &provider_days,
-            &pricing_map,
-        );
-
-        // Extract only the data needed for rendering to minimize memory usage
-        let rows_data = summary.rows;
-        let totals = summary.totals;
-        let provider_totals = summary.provider_totals;
-
-        // Clear raw usage data immediately after processing to free memory.
-        // Per-provider map is reset on the next refresh when new data arrives.
-        usage_data.clear();
-        per_provider_usage = PerProviderUsage::default();
-
-        // NOTE: we intentionally do NOT clear the global file cache or the
-        // pricing cache here. The usage path already bypasses the file cache
-        // (runs in `ParseMode::UsageOnly` and drops each analysis after
-        // extraction), so wiping it would only nuke entries populated by
-        // other commands. The pricing cache is a single sub-MB hashmap
-        // backed by a dated on-disk file — clearing it just forces another
-        // file-parse on the next refresh.
-
-        let provider_rows = build_provider_total_rows(&provider_totals);
-
-        // Track updates
-        let current_row_keys: Vec<String> = rows_data.iter().map(|row| row.model.clone()).collect();
-
-        update_tracker.cleanup(current_row_keys.clone());
-
-        for row in &rows_data {
-            let row_key = row.model.clone();
-            // Include reasoning in the change fingerprint so Gemini
-            // sessions whose only delta lands in `thoughts_tokens` still
-            // trigger a highlight; otherwise the row would look idle
-            // while its cost silently grew.
-            let current_data = (
-                row.input_tokens,
-                row.output_with_reasoning(),
-                row.cache_read,
-                row.cache_creation,
-            );
-            update_tracker.track_update(row_key, &current_data);
-        }
-
-        terminal.draw(|f| {
-            let totals_height = (provider_rows.len() as u16).saturating_add(4).max(4);
-            let chunks = RatatuiLayout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(3),
-                    Constraint::Min(10),
-                    Constraint::Length(totals_height),
-                    Constraint::Length(3),
-                    Constraint::Length(2),
-                    Constraint::Length(1),
-                ])
-                .split(f.area());
-
-            let title = create_title("Token Usage Statistics", RatatuiColor::Cyan);
-            f.render_widget(title, chunks[0]);
-
-            let header = vec![
-                "Model",
-                "Input",
-                "Output",
-                "Cache Read",
-                "Cache Create",
-                "Total",
-                "Cost (USD)",
-            ];
-
-            let mut rows: Vec<RatatuiRow> = rows_data
-                .iter()
-                .map(|row| {
-                    let row_key = row.model.clone();
-
-                    let is_recently_updated = update_tracker.is_recently_updated(&row_key);
-
-                    let style = if is_recently_updated {
-                        Style::default().bg(RatatuiColor::Rgb(60, 80, 60)).bold()
-                    } else {
-                        Style::default()
-                    };
-
-                    RatatuiRow::new(vec![
-                        row.display_model.clone(),
-                        format_number(row.input_tokens),
-                        format_number(row.output_with_reasoning()),
-                        format_number(row.cache_read),
-                        format_number(row.cache_creation),
-                        format_number(row.total),
-                        format!("${:.2}", row.cost),
-                    ])
-                    .style(style)
-                })
-                .collect();
-
-            rows.push(
-                RatatuiRow::new(vec![
-                    "TOTAL".to_string(),
-                    format_number(totals.input_tokens),
-                    format_number(totals.output_with_reasoning()),
-                    format_number(totals.cache_read),
-                    format_number(totals.cache_creation),
-                    format_number(totals.total),
-                    format!("${:.2}", totals.cost),
-                ])
-                .style(
-                    Style::default()
-                        .fg(RatatuiColor::Yellow)
-                        .bold()
-                        .bg(RatatuiColor::DarkGray),
-                ),
+            let summary = build_usage_summary(
+                &usage_data,
+                &per_provider_usage,
+                &provider_days,
+                &pricing_map,
             );
 
-            let widths = [
-                Constraint::Min(20),
-                Constraint::Length(12),
-                Constraint::Length(12),
-                Constraint::Length(12),
-                Constraint::Length(14),
-                Constraint::Length(12),
-                Constraint::Length(12),
-            ];
+            // Cache the rendered display state so a resize can redraw without
+            // re-aggregating. These per-model summaries are small; the heavy
+            // raw usage buffers are cleared right below.
+            rows_data = summary.rows;
+            totals = summary.totals;
+            provider_totals = summary.provider_totals;
 
-            let table = create_ratatui_table(rows, header, &widths, RatatuiColor::Green);
-            f.render_widget(table, chunks[1]);
+            // Clear raw usage data immediately after processing to free memory.
+            // Per-provider map is reset on the next refresh when new data arrives.
+            usage_data.clear();
+            per_provider_usage = PerProviderUsage::default();
 
-            let mut totals_rows: Vec<RatatuiRow> = provider_rows
-                .iter()
-                .map(|row| {
-                    create_provider_row(
-                        vec![
-                            row.label.to_string(),
-                            format_number(row.stats.total_tokens),
-                            format!("${:.2}", row.stats.total_cost),
-                            format_number(row.stats.days_count as i64),
-                        ],
-                        row.tui_color,
-                        row.emphasize,
-                    )
-                })
-                .collect();
+            // NOTE: we intentionally do NOT clear the global file cache or the
+            // pricing cache here. The usage path already bypasses the file cache
+            // (runs in `ParseMode::UsageOnly` and drops each analysis after
+            // extraction), so wiping it would only nuke entries populated by
+            // other commands. The pricing cache is a single sub-MB hashmap
+            // backed by a dated on-disk file — clearing it just forces another
+            // file-parse on the next refresh.
 
-            if totals_rows.is_empty() {
-                totals_rows.push(
-                    RatatuiRow::new(vec![
-                        "No provider data yet".to_string(),
-                        "-".to_string(),
-                        "-".to_string(),
-                        "-".to_string(),
-                    ])
-                    .style(Style::default().fg(RatatuiColor::DarkGray)),
+            // Track updates
+            let current_row_keys: Vec<String> =
+                rows_data.iter().map(|row| row.model.clone()).collect();
+
+            update_tracker.cleanup(current_row_keys);
+
+            for row in &rows_data {
+                let row_key = row.model.clone();
+                // Include reasoning in the change fingerprint so Gemini
+                // sessions whose only delta lands in `thoughts_tokens` still
+                // trigger a highlight; otherwise the row would look idle
+                // while its cost silently grew.
+                let current_data = (
+                    row.input_tokens,
+                    row.output_with_reasoning(),
+                    row.cache_read,
+                    row.cache_creation,
                 );
+                update_tracker.track_update(row_key, &current_data);
             }
 
-            let totals_header = vec!["Provider", "Tokens", "Cost", "Active Days"];
-            let totals_widths = [
-                Constraint::Min(20),
-                Constraint::Length(16),
-                Constraint::Length(14),
-                Constraint::Length(14),
-            ];
+            render_usage_frame(
+                &mut terminal,
+                &rows_data,
+                &totals,
+                &provider_totals,
+                &update_tracker,
+                &sys,
+                pid,
+            )?;
 
-            let totals_table = create_ratatui_table(
-                totals_rows,
-                totals_header,
-                &totals_widths,
-                RatatuiColor::Magenta,
-            );
-            f.render_widget(totals_table, chunks[2]);
-
-            let total_cost_str = format!("${:.2}", totals.cost);
-            let total_tokens_str = format_number(totals.total);
-            let entries_str = format!("{}", rows_data.len());
-
-            let summary_items = vec![
-                ("Total Cost:", total_cost_str.as_str(), RatatuiColor::Yellow),
-                (
-                    "Total Tokens:",
-                    total_tokens_str.as_str(),
-                    RatatuiColor::Cyan,
-                ),
-                ("Models:", entries_str.as_str(), RatatuiColor::Blue),
-            ];
-
-            let summary = create_summary(summary_items, &sys, pid);
-            f.render_widget(summary, chunks[3]);
-
-            let controls = create_controls();
-            f.render_widget(controls, chunks[4]);
-
-            let star_hint = create_star_hint();
-            f.render_widget(star_hint, chunks[5]);
-        })?;
-
-        // Drop heavy data structures after rendering to free memory immediately
-        drop(rows_data);
-        drop(provider_rows);
-
-        // Hand any arena-held free pages back to the OS. The refresh cycle
-        // just allocated and dropped a lot of small objects (per-file parse
-        // buffers, per-model hashmaps, ratatui row vectors); without this
-        // call glibc keeps them as internal free lists and RSS climbs by
-        // ~6 MB every refresh on a 219-session directory.
-        crate::utils::release_freed_heap();
+            // Hand any arena-held free pages back to the OS. The refresh cycle
+            // just allocated and dropped a lot of small objects (per-file parse
+            // buffers, per-model hashmaps, ratatui row vectors); without this
+            // call glibc keeps them as internal free lists and RSS climbs by
+            // ~6 MB every refresh on a 219-session directory.
+            crate::utils::release_freed_heap();
+        }
 
         match handle_input()? {
             InputAction::Quit => break,
             InputAction::Refresh => refresh_state.force(),
+            // Redraw the cached frame at the new terminal size without
+            // re-aggregating, so resize tracks the drag instead of waiting
+            // for the next refresh tick.
+            InputAction::Resize => render_usage_frame(
+                &mut terminal,
+                &rows_data,
+                &totals,
+                &provider_totals,
+                &update_tracker,
+                &sys,
+                pid,
+            )?,
             InputAction::Continue => {}
         }
     }
 
     restore_terminal(&mut terminal)?;
+    Ok(())
+}
+
+/// Render a single usage frame from already-aggregated display state.
+///
+/// Kept separate from the refresh loop so both the periodic refresh and a
+/// terminal resize can paint the latest data; `provider_rows` is rebuilt here
+/// (cheap, at most five borrow wrappers) rather than cached, since it borrows
+/// from `provider_totals`.
+#[allow(clippy::too_many_arguments)]
+fn render_usage_frame(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    rows_data: &[UsageRow],
+    totals: &UsageTotals,
+    provider_totals: &UsageProviderTotals,
+    update_tracker: &UpdateTracker,
+    sys: &System,
+    pid: Pid,
+) -> anyhow::Result<()> {
+    let provider_rows = build_provider_total_rows(provider_totals);
+
+    terminal.draw(|f| {
+        let totals_height = (provider_rows.len() as u16).saturating_add(4).max(4);
+        let chunks = RatatuiLayout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(10),
+                Constraint::Length(totals_height),
+                Constraint::Length(3),
+                Constraint::Length(2),
+                Constraint::Length(1),
+            ])
+            .split(f.area());
+
+        let title = create_title("Token Usage Statistics", RatatuiColor::Cyan);
+        f.render_widget(title, chunks[0]);
+
+        let header = vec![
+            "Model",
+            "Input",
+            "Output",
+            "Cache Read",
+            "Cache Create",
+            "Total",
+            "Cost (USD)",
+        ];
+
+        let mut rows: Vec<RatatuiRow> = rows_data
+            .iter()
+            .map(|row| {
+                let row_key = row.model.clone();
+
+                let is_recently_updated = update_tracker.is_recently_updated(&row_key);
+
+                let style = if is_recently_updated {
+                    Style::default().bg(RatatuiColor::Rgb(60, 80, 60)).bold()
+                } else {
+                    Style::default()
+                };
+
+                RatatuiRow::new(vec![
+                    row.display_model.clone(),
+                    format_number(row.input_tokens),
+                    format_number(row.output_with_reasoning()),
+                    format_number(row.cache_read),
+                    format_number(row.cache_creation),
+                    format_number(row.total),
+                    format!("${:.2}", row.cost),
+                ])
+                .style(style)
+            })
+            .collect();
+
+        rows.push(
+            RatatuiRow::new(vec![
+                "TOTAL".to_string(),
+                format_number(totals.input_tokens),
+                format_number(totals.output_with_reasoning()),
+                format_number(totals.cache_read),
+                format_number(totals.cache_creation),
+                format_number(totals.total),
+                format!("${:.2}", totals.cost),
+            ])
+            .style(
+                Style::default()
+                    .fg(RatatuiColor::Yellow)
+                    .bold()
+                    .bg(RatatuiColor::DarkGray),
+            ),
+        );
+
+        let widths = [
+            Constraint::Min(20),
+            Constraint::Length(12),
+            Constraint::Length(12),
+            Constraint::Length(12),
+            Constraint::Length(14),
+            Constraint::Length(12),
+            Constraint::Length(12),
+        ];
+
+        let table = create_ratatui_table(rows, header, &widths, RatatuiColor::Green);
+        f.render_widget(table, chunks[1]);
+
+        let mut totals_rows: Vec<RatatuiRow> = provider_rows
+            .iter()
+            .map(|row| {
+                create_provider_row(
+                    vec![
+                        row.label.to_string(),
+                        format_number(row.stats.total_tokens),
+                        format!("${:.2}", row.stats.total_cost),
+                        format_number(row.stats.days_count as i64),
+                    ],
+                    row.tui_color,
+                    row.emphasize,
+                )
+            })
+            .collect();
+
+        if totals_rows.is_empty() {
+            totals_rows.push(
+                RatatuiRow::new(vec![
+                    "No provider data yet".to_string(),
+                    "-".to_string(),
+                    "-".to_string(),
+                    "-".to_string(),
+                ])
+                .style(Style::default().fg(RatatuiColor::DarkGray)),
+            );
+        }
+
+        let totals_header = vec!["Provider", "Tokens", "Cost", "Active Days"];
+        let totals_widths = [
+            Constraint::Min(20),
+            Constraint::Length(16),
+            Constraint::Length(14),
+            Constraint::Length(14),
+        ];
+
+        let totals_table = create_ratatui_table(
+            totals_rows,
+            totals_header,
+            &totals_widths,
+            RatatuiColor::Magenta,
+        );
+        f.render_widget(totals_table, chunks[2]);
+
+        let total_cost_str = format!("${:.2}", totals.cost);
+        let total_tokens_str = format_number(totals.total);
+        let entries_str = format!("{}", rows_data.len());
+
+        let summary_items = vec![
+            ("Total Cost:", total_cost_str.as_str(), RatatuiColor::Yellow),
+            (
+                "Total Tokens:",
+                total_tokens_str.as_str(),
+                RatatuiColor::Cyan,
+            ),
+            ("Models:", entries_str.as_str(), RatatuiColor::Blue),
+        ];
+
+        let summary = create_summary(summary_items, sys, pid);
+        f.render_widget(summary, chunks[3]);
+
+        let controls = create_controls();
+        f.render_widget(controls, chunks[4]);
+
+        let star_hint = create_star_hint();
+        f.render_widget(star_hint, chunks[5]);
+    })?;
+
     Ok(())
 }

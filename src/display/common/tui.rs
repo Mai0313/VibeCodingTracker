@@ -27,22 +27,46 @@ pub fn restore_terminal(
     Ok(())
 }
 
-/// Handle keyboard input and return whether to quit
+/// Handle terminal events and return the action to take.
+///
+/// Blocks up to 100 ms for the first event, then drains every event already
+/// buffered. Draining matters for resize: a window drag emits a burst of
+/// `Resize` events, and collapsing them into a single `Resize` action keeps
+/// the redraw in step with the drag instead of lagging one frame per event.
 pub fn handle_input() -> anyhow::Result<InputAction> {
-    if event::poll(Duration::from_millis(100))?
-        && let Event::Key(key) = event::read()?
-    {
-        if key.code == KeyCode::Char('q')
-            || key.code == KeyCode::Esc
-            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
-        {
-            return Ok(InputAction::Quit);
+    if !event::poll(Duration::from_millis(100))? {
+        return Ok(InputAction::Continue);
+    }
+
+    let mut resized = false;
+    loop {
+        match event::read()? {
+            Event::Key(key) => {
+                if key.code == KeyCode::Char('q')
+                    || key.code == KeyCode::Esc
+                    || (key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL))
+                {
+                    return Ok(InputAction::Quit);
+                }
+                if key.code == KeyCode::Char('r') || key.code == KeyCode::Char('R') {
+                    return Ok(InputAction::Refresh);
+                }
+            }
+            Event::Resize(_, _) => resized = true,
+            _ => {}
         }
-        if key.code == KeyCode::Char('r') || key.code == KeyCode::Char('R') {
-            return Ok(InputAction::Refresh);
+
+        if !event::poll(Duration::from_millis(0))? {
+            break;
         }
     }
-    Ok(InputAction::Continue)
+
+    if resized {
+        Ok(InputAction::Resize)
+    } else {
+        Ok(InputAction::Continue)
+    }
 }
 
 /// Action to take based on user input
@@ -50,6 +74,9 @@ pub fn handle_input() -> anyhow::Result<InputAction> {
 pub enum InputAction {
     Quit,
     Refresh,
+    /// Terminal was resized — redraw the current frame at the new size
+    /// without re-fetching session data.
+    Resize,
     Continue,
 }
 
