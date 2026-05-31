@@ -2,6 +2,8 @@
 
 # Vibe Coding Tracker — AI 程式設計助手使用量追蹤器
 
+<img src="assets/social-preview.png" alt="Vibe Coding Tracker social preview" width="640">
+
 [![Crates.io](https://img.shields.io/crates/v/vibe_coding_tracker?logo=rust&style=flat-square&color=E05D44)](https://crates.io/crates/vibe_coding_tracker)
 [![Crates.io Downloads](https://img.shields.io/crates/d/vibe_coding_tracker?logo=rust&style=flat-square)](https://crates.io/crates/vibe_coding_tracker)
 [![npm version](https://img.shields.io/npm/v/vibe-coding-tracker?logo=npm&style=flat-square&color=CB3837)](https://www.npmjs.com/package/vibe-coding-tracker)
