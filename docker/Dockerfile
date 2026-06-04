@@ -1,4 +1,4 @@
-FROM rust:1.95.0-bookworm AS builder
+FROM rust:1.96.0-bookworm AS builder
 
 LABEL maintainer="Wei Lee <mai@mai0313.com>" \
     org.label-schema.name="vibe_coding_tracker" \
