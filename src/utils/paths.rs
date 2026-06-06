@@ -33,6 +33,10 @@ pub struct HelperPaths {
     pub gemini_dir: PathBuf,
     /// Gemini CLI session logs (`~/.gemini/tmp`).
     pub gemini_session_dir: PathBuf,
+    /// OpenCode data root (`$XDG_DATA_HOME/opencode` or `~/.local/share/opencode`).
+    pub opencode_dir: PathBuf,
+    /// OpenCode SQLite database (`<opencode_dir>/opencode.db`).
+    pub opencode_db: PathBuf,
     /// This tool's cache directory (`~/.vibe_coding_tracker`).
     pub cache_dir: PathBuf,
 }
@@ -63,6 +67,14 @@ pub fn resolve_paths() -> Result<HelperPaths> {
     let copilot_session_dir = copilot_dir.join("session-state");
     let gemini_dir = home_dir.join(".gemini");
     let gemini_session_dir = gemini_dir.join("tmp");
+    // OpenCode keeps a single SQLite database under the XDG data directory,
+    // honouring `$XDG_DATA_HOME` and falling back to `~/.local/share`.
+    let opencode_dir = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| home_dir.join(".local").join("share"))
+        .join("opencode");
+    let opencode_db = opencode_dir.join("opencode.db");
     let cache_dir = home_dir.join(".vibe_coding_tracker");
 
     Ok(HelperPaths {
@@ -75,6 +87,8 @@ pub fn resolve_paths() -> Result<HelperPaths> {
         copilot_session_dir,
         gemini_dir,
         gemini_session_dir,
+        opencode_dir,
+        opencode_db,
         cache_dir,
     })
 }
@@ -295,6 +309,10 @@ mod tests {
 
         // Gemini paths
         assert_eq!(paths.gemini_session_dir, paths.gemini_dir.join("tmp"));
+
+        // OpenCode paths
+        assert_eq!(paths.opencode_db, paths.opencode_dir.join("opencode.db"));
+        assert!(paths.opencode_dir.ends_with("opencode"));
     }
 
     #[test]

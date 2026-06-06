@@ -138,12 +138,14 @@ pub fn calculate_provider_totals_from_per_provider(
     totals.codex.days_count = provider_days.codex;
     totals.copilot.days_count = provider_days.copilot;
     totals.gemini.days_count = provider_days.gemini;
+    totals.opencode.days_count = provider_days.opencode;
     totals.overall.days_count = provider_days.total;
 
     accumulate_provider(&mut totals.claude, &per_provider.claude, pricing_map);
     accumulate_provider(&mut totals.codex, &per_provider.codex, pricing_map);
     accumulate_provider(&mut totals.copilot, &per_provider.copilot, pricing_map);
     accumulate_provider(&mut totals.gemini, &per_provider.gemini, pricing_map);
+    accumulate_provider(&mut totals.opencode, &per_provider.opencode, pricing_map);
 
     // "All Providers" row sums every provider's totals directly rather
     // than reusing the cross-provider merged `UsageData.models` map.
@@ -157,11 +159,13 @@ pub fn calculate_provider_totals_from_per_provider(
     totals.overall.total_tokens = totals.claude.total_tokens
         + totals.codex.total_tokens
         + totals.copilot.total_tokens
-        + totals.gemini.total_tokens;
+        + totals.gemini.total_tokens
+        + totals.opencode.total_tokens;
     totals.overall.total_cost = totals.claude.total_cost
         + totals.codex.total_cost
         + totals.copilot.total_cost
-        + totals.gemini.total_cost;
+        + totals.gemini.total_cost
+        + totals.opencode.total_cost;
 
     totals
 }
@@ -182,7 +186,7 @@ fn accumulate_provider(
 pub fn build_provider_total_rows(
     totals: &UsageProviderTotals,
 ) -> Vec<ProviderTotal<'_, ProviderStats>> {
-    let mut rows = Vec::with_capacity(5); // max 4 providers + overall
+    let mut rows = Vec::with_capacity(6); // max 5 providers + overall
 
     if totals.claude.days_count > 0 {
         rows.push(ProviderTotal::new(
@@ -206,6 +210,14 @@ pub fn build_provider_total_rows(
 
     if totals.gemini.days_count > 0 {
         rows.push(ProviderTotal::new(Provider::Gemini, &totals.gemini, false));
+    }
+
+    if totals.opencode.days_count > 0 {
+        rows.push(ProviderTotal::new(
+            Provider::OpenCode,
+            &totals.opencode,
+            false,
+        ));
     }
 
     if totals.overall.days_count > 0 || rows.is_empty() {

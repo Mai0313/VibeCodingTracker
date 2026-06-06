@@ -18,6 +18,8 @@ pub struct ProviderTotals<S> {
     pub copilot: S,
     /// Totals for Gemini CLI sessions.
     pub gemini: S,
+    /// Totals for OpenCode sessions.
+    pub opencode: S,
     /// Sum across every provider (the "All Providers" bucket).
     pub overall: S,
 }
@@ -29,6 +31,7 @@ impl<S: Default> Default for ProviderTotals<S> {
             codex: S::default(),
             copilot: S::default(),
             gemini: S::default(),
+            opencode: S::default(),
             overall: S::default(),
         }
     }
@@ -45,6 +48,7 @@ impl<S> ProviderTotals<S> {
             Provider::Codex => &self.codex,
             Provider::Copilot => &self.copilot,
             Provider::Gemini => &self.gemini,
+            Provider::OpenCode => &self.opencode,
             Provider::Unknown => &self.overall,
         }
     }
@@ -59,6 +63,7 @@ impl<S> ProviderTotals<S> {
             Provider::Codex => &mut self.codex,
             Provider::Copilot => &mut self.copilot,
             Provider::Gemini => &mut self.gemini,
+            Provider::OpenCode => &mut self.opencode,
             Provider::Unknown => &mut self.overall,
         }
     }

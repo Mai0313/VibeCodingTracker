@@ -13,7 +13,7 @@ use crate::constants::{FastHashMap, capacity};
 use crate::models::{
     CodeAnalysis, ExtensionType, PerProviderUsage, Provider, ProviderActiveDays, UsageResult,
 };
-use crate::session::{ParseMode, parse_session_file_as};
+use crate::session::{ParseMode, parse_session_file_as, read_opencode_usage};
 use crate::utils::{
     COPILOT_SESSION_MAX_DEPTH, collect_files_with_max_depth, is_claude_session_file,
     is_codex_session_file, is_copilot_session_file, is_gemini_session_file, resolve_paths,
@@ -118,6 +118,7 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
     let mut codex_dates: HashSet<String> = HashSet::new();
     let mut copilot_dates: HashSet<String> = HashSet::new();
     let mut gemini_dates: HashSet<String> = HashSet::new();
+    let mut opencode_dates: HashSet<String> = HashSet::new();
 
     if paths.claude_session_dir.exists() {
         // Walks the projects tree recursively, so top-level `<session>.jsonl` logs
@@ -178,17 +179,31 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
         )?;
     }
 
+    // OpenCode lives in a single SQLite database rather than a session
+    // directory, so it is read directly instead of walked.
+    if paths.opencode_db.exists() {
+        process_opencode_usage(
+            &paths.opencode_db,
+            &mut result,
+            &mut per_provider.opencode,
+            &mut opencode_dates,
+            time_range,
+        )?;
+    }
+
     let mut all_dates: HashSet<&String> = HashSet::new();
     all_dates.extend(claude_dates.iter());
     all_dates.extend(codex_dates.iter());
     all_dates.extend(copilot_dates.iter());
     all_dates.extend(gemini_dates.iter());
+    all_dates.extend(opencode_dates.iter());
 
     let provider_days = ProviderActiveDays {
         claude: claude_dates.len(),
         codex: codex_dates.len(),
         copilot: copilot_dates.len(),
         gemini: gemini_dates.len(),
+        opencode: opencode_dates.len(),
         total: all_dates.len(),
     };
 
@@ -271,6 +286,46 @@ where
     for (date, conversation_usage) in file_results {
         unique_dates.insert(date);
 
+        for (model, usage_value) in conversation_usage {
+            provider_result
+                .entry(model.clone())
+                .and_modify(|existing| merge_usage_values(existing, &usage_value))
+                .or_insert_with(|| usage_value.clone());
+
+            global_result
+                .entry(model)
+                .and_modify(|existing| merge_usage_values(existing, &usage_value))
+                .or_insert(usage_value);
+        }
+    }
+
+    Ok(())
+}
+
+/// Reads OpenCode's SQLite database and merges its per-model usage into both
+/// the global and OpenCode-scoped maps.
+///
+/// Mirrors the tail of [`process_usage_directory`] but sources sessions from
+/// the database (via [`read_opencode_usage`]) instead of a directory walk. Each
+/// session's `time_updated` date is recorded in `unique_dates` for the
+/// active-day count.
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be opened or queried.
+fn process_opencode_usage(
+    db_path: &Path,
+    global_result: &mut UsageResult,
+    provider_result: &mut UsageResult,
+    unique_dates: &mut HashSet<String>,
+    time_range: TimeRange,
+) -> Result<()> {
+    let sessions = read_opencode_usage(db_path, time_range)?;
+
+    for (date, analysis) in sessions {
+        unique_dates.insert(date);
+
+        let conversation_usage = extract_conversation_usage_from_analysis(&analysis);
         for (model, usage_value) in conversation_usage {
             provider_result
                 .entry(model.clone())

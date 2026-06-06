@@ -2,6 +2,7 @@ use crate::cli::TimeRange;
 use crate::constants::{FastHashMap, capacity};
 use crate::models::{CodeAnalysis, ExtensionType, ProviderActiveDays};
 use crate::session::parser::parse_session_file_as;
+use crate::session::read_opencode_analysis;
 use crate::session::state::ParseMode;
 use crate::utils::{
     COPILOT_SESSION_MAX_DEPTH, collect_files_with_max_depth, is_claude_session_file,
@@ -75,6 +76,8 @@ pub struct PerProviderAnalysisRows {
     pub copilot: Vec<AggregatedAnalysisRow>,
     /// Rows from the Gemini CLI session directory.
     pub gemini: Vec<AggregatedAnalysisRow>,
+    /// Rows from the OpenCode database.
+    pub opencode: Vec<AggregatedAnalysisRow>,
 }
 
 /// Aggregate file-operation metrics across every provider's session files,
@@ -119,10 +122,14 @@ pub fn aggregate_sessions_by_model(time_range: TimeRange) -> Result<AnalysisData
     let mut gemini_aggregated: FastHashMap<String, AggregatedAnalysisRow> =
         FastHashMap::with_capacity(capacity::MODELS_PER_SESSION);
 
+    let mut opencode_aggregated: FastHashMap<String, AggregatedAnalysisRow> =
+        FastHashMap::with_capacity(capacity::MODELS_PER_SESSION);
+
     let mut claude_dates: HashSet<String> = HashSet::new();
     let mut codex_dates: HashSet<String> = HashSet::new();
     let mut copilot_dates: HashSet<String> = HashSet::new();
     let mut gemini_dates: HashSet<String> = HashSet::new();
+    let mut opencode_dates: HashSet<String> = HashSet::new();
 
     if paths.claude_session_dir.exists() {
         // Walks the projects tree recursively, so top-level `<session>.jsonl` logs
@@ -180,17 +187,31 @@ pub fn aggregate_sessions_by_model(time_range: TimeRange) -> Result<AnalysisData
         )?;
     }
 
+    // OpenCode lives in a single SQLite database rather than a session
+    // directory, so it is read directly instead of walked.
+    if paths.opencode_db.exists() {
+        aggregate_opencode_sessions(
+            &paths.opencode_db,
+            &mut aggregated,
+            &mut opencode_aggregated,
+            &mut opencode_dates,
+            time_range,
+        )?;
+    }
+
     let mut all_dates: HashSet<&String> = HashSet::new();
     all_dates.extend(claude_dates.iter());
     all_dates.extend(codex_dates.iter());
     all_dates.extend(copilot_dates.iter());
     all_dates.extend(gemini_dates.iter());
+    all_dates.extend(opencode_dates.iter());
 
     let provider_days = ProviderActiveDays {
         claude: claude_dates.len(),
         codex: codex_dates.len(),
         copilot: copilot_dates.len(),
         gemini: gemini_dates.len(),
+        opencode: opencode_dates.len(),
         total: all_dates.len(),
     };
 
@@ -202,6 +223,7 @@ pub fn aggregate_sessions_by_model(time_range: TimeRange) -> Result<AnalysisData
         codex: into_sorted_rows(codex_aggregated),
         copilot: into_sorted_rows(copilot_aggregated),
         gemini: into_sorted_rows(gemini_aggregated),
+        opencode: into_sorted_rows(opencode_aggregated),
     };
 
     Ok(AnalysisData {
@@ -278,6 +300,35 @@ where
     // the display layer does not have to infer provenance from the
     // model name.
     for (date, analysis) in file_aggregations {
+        unique_dates.insert(date);
+        aggregate_analysis_result(aggregated, &analysis);
+        aggregate_analysis_result(provider_aggregated, &analysis);
+    }
+
+    Ok(())
+}
+
+/// Reads OpenCode's SQLite database and folds each session's metrics into both
+/// the cross-provider and OpenCode-scoped aggregation maps.
+///
+/// Mirrors [`aggregate_sessions_in_directory`] but sources sessions from the
+/// database (via [`read_opencode_analysis`] in [`ParseMode::UsageOnly`]) instead
+/// of a directory walk. Each session's `time_updated` date is recorded in
+/// `unique_dates` for the active-day count.
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be opened or queried.
+fn aggregate_opencode_sessions(
+    db_path: &Path,
+    aggregated: &mut FastHashMap<String, AggregatedAnalysisRow>,
+    provider_aggregated: &mut FastHashMap<String, AggregatedAnalysisRow>,
+    unique_dates: &mut HashSet<String>,
+    time_range: TimeRange,
+) -> Result<()> {
+    let sessions = read_opencode_analysis(db_path, time_range, ParseMode::UsageOnly)?;
+
+    for (date, analysis) in sessions {
         unique_dates.insert(date);
         aggregate_analysis_result(aggregated, &analysis);
         aggregate_analysis_result(provider_aggregated, &analysis);

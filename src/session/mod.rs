@@ -12,10 +12,12 @@ pub mod codex;
 pub mod copilot;
 pub mod detector;
 pub mod gemini;
+pub mod opencode;
 pub mod parser;
 pub mod state;
 
 pub use detector::{classify_records, detect_extension_type};
+pub use opencode::{read_opencode_analysis, read_opencode_usage};
 pub use parser::{
     parse_session_file, parse_session_file_as, parse_session_file_typed,
     parse_session_file_typed_with_mode,

@@ -19,7 +19,7 @@
 
 </div>
 
-**Track your AI coding costs in real-time.** Vibe Coding Tracker is a lightweight, high-performance CLI tool built in Rust that monitors and analyzes your Claude Code, Codex, Copilot, and Gemini usage — with detailed cost breakdowns, token statistics, and code operation insights, all while keeping the memory footprint minimal.
+**Track your AI coding costs in real-time.** Vibe Coding Tracker is a lightweight, high-performance CLI tool built in Rust that monitors and analyzes your Claude Code, Codex, Copilot, Gemini, and OpenCode usage — with detailed cost breakdowns, token statistics, and code operation insights, all while keeping the memory footprint minimal.
 
 [English](README.md) | [繁體中文](README.zh-TW.md) | [简体中文](README.zh-CN.md)
 
@@ -48,7 +48,7 @@ Choose your preferred view:
 
 ### Zero Configuration
 
-Automatically detects and processes logs from Claude Code, Codex, Copilot, and Gemini. No setup required — just run and analyze.
+Automatically detects and processes logs from Claude Code, Codex, Copilot, Gemini, and OpenCode. No setup required — just run and analyze.
 
 ### Rich Insights
 
@@ -232,6 +232,7 @@ The tool automatically scans these directories:
 - `~/.codex/sessions/**/*.jsonl` (Codex — recursive, includes daily subdirectories)
 - `~/.copilot/session-state/<sessionId>/events.jsonl` (Copilot CLI)
 - `~/.gemini/tmp/<project_hash>/chats/*.jsonl` (Gemini CLI)
+- `~/.local/share/opencode/opencode.db` (OpenCode — SQLite database; honors `$XDG_DATA_HOME`)
 
 ---
 
@@ -386,5 +387,6 @@ docker run --rm \
     -v ~/.codex:/root/.codex \
     -v ~/.copilot:/root/.copilot \
     -v ~/.gemini:/root/.gemini \
+    -v ~/.local/share/opencode:/root/.local/share/opencode \
     vibe_coding_tracker:latest usage
 ```

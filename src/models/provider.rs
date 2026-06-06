@@ -24,6 +24,8 @@ pub enum Provider {
     Copilot,
     /// Google Gemini CLI.
     Gemini,
+    /// OpenCode.
+    OpenCode,
     /// Model name matched no known provider prefix.
     Unknown,
 }
@@ -109,6 +111,7 @@ impl Provider {
             Self::Codex => "OpenAI Codex",
             Self::Copilot => "GitHub Copilot",
             Self::Gemini => "Gemini",
+            Self::OpenCode => "OpenCode",
             Self::Unknown => "Unknown",
         }
     }
@@ -160,6 +163,7 @@ mod tests {
         assert_eq!(Provider::Codex.display_name(), "OpenAI Codex");
         assert_eq!(Provider::Copilot.display_name(), "GitHub Copilot");
         assert_eq!(Provider::Gemini.display_name(), "Gemini");
+        assert_eq!(Provider::OpenCode.display_name(), "OpenCode");
         assert_eq!(Provider::Unknown.display_name(), "Unknown");
     }
 }
