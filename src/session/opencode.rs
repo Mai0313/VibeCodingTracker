@@ -563,7 +563,8 @@ fn apply_patch_text(state: &mut SessionParseState, patch_text: &str, ts: i64) {
         match patch.action.as_str() {
             "add" => state.add_write_detail(&patch.file_path, &new_str, ts),
             "delete" => state.add_edit_detail(&patch.file_path, &old_str, "", ts),
-            _ => state.add_edit_detail(&patch.file_path, &old_str, &new_str, ts),
+            // Updates target existing files, so insert-only hunks stay edits.
+            _ => state.add_edit_detail_raw(&patch.file_path, &old_str, &new_str, ts),
         }
     }
 }
@@ -1543,6 +1544,38 @@ mod tests {
         assert_eq!(record.tool_call_counts.write, 1);
         assert_eq!(record.total_edit_lines, 2);
         assert_eq!(record.total_write_lines, 1);
+    }
+
+    #[test]
+    fn test_read_analysis_keeps_patch_insertions_as_edits() {
+        let (_dir, db_path) = make_db();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO session (id, model, directory, time_updated) VALUES ('s1', '{\"id\":\"m1\"}', '/repo', 1780757088080)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES ('m1', 's1', ?1)",
+            [assistant_message("m1", 1, 1, 0, 0, 0, 0.01)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES ('p1', 'm1', 's1', ?1)",
+            [r#"{"type":"tool","tool":"apply_patch","state":{"status":"completed","input":{"patchText":"*** Begin Patch\n*** Update File: src/main.rs\n@@\n+inserted\n+lines\n*** End Patch"}}}"#],
+        )
+        .unwrap();
+        drop(conn);
+
+        let rows = read_opencode_analysis(&db_path, TimeRange::All, ParseMode::UsageOnly).unwrap();
+        assert_eq!(rows.len(), 1);
+        let record = &rows[0].1.records[0];
+        // An insert-only update hunk targets an existing file: it must stay an
+        // edit instead of being reclassified as a write.
+        assert_eq!(record.tool_call_counts.edit, 1);
+        assert_eq!(record.tool_call_counts.write, 0);
+        assert_eq!(record.total_edit_lines, 2);
+        assert_eq!(record.total_write_lines, 0);
     }
 
     #[test]
