@@ -268,12 +268,10 @@ pub fn build_usage_summary(
 
     // Extract rows first so we can sort by cost
     for (model, usage) in usage_data.iter() {
-        let row = extract_usage_row(
-            model,
-            usage,
-            pricing_map,
-            opencode_costs.get(model).copied(),
-        );
+        let (cost, matched_model) =
+            resolve_merged_row_cost(model, per_provider, pricing_map, opencode_costs)
+                .unwrap_or_else(|| price_usage(model, usage, pricing_map, None));
+        let row = build_usage_row(model, usage, cost, matched_model);
         summary.rows.push(row);
     }
 
@@ -312,13 +310,74 @@ fn extract_usage_row(
     pricing_map: &crate::pricing::ModelPricingMap,
     opencode_cost: Option<f64>,
 ) -> UsageRow {
+    let (cost, matched_model) = price_usage(model, usage, pricing_map, opencode_cost);
+    build_usage_row(model, usage, cost, matched_model)
+}
+
+/// Prices one raw usage value.
+fn price_usage(
+    model: &str,
+    usage: &Value,
+    pricing_map: &crate::pricing::ModelPricingMap,
+    opencode_cost: Option<f64>,
+) -> (f64, Option<String>) {
     use crate::usage::resolve_model_cost;
     use crate::utils::extract_token_counts;
 
-    // Extract token counts using utility function
     let counts = extract_token_counts(usage);
+    resolve_model_cost(model, &counts, pricing_map, opencode_cost)
+}
 
-    let (cost, matched_model) = resolve_model_cost(model, &counts, pricing_map, opencode_cost);
+/// Prices a merged per-model row from provider-scoped usage pieces.
+fn resolve_merged_row_cost(
+    model: &str,
+    per_provider: &PerProviderUsage,
+    pricing_map: &crate::pricing::ModelPricingMap,
+    opencode_costs: &crate::constants::FastHashMap<String, f64>,
+) -> Option<(f64, Option<String>)> {
+    let mut total_cost = 0.0;
+    let mut matched_model = None;
+    let mut found = false;
+
+    for usage in [
+        &per_provider.claude,
+        &per_provider.codex,
+        &per_provider.copilot,
+        &per_provider.gemini,
+    ] {
+        if let Some(raw_usage) = usage.get(model) {
+            found = true;
+            let (cost, matched) = price_usage(model, raw_usage, pricing_map, None);
+            total_cost += cost;
+            if matched_model.is_none() {
+                matched_model = matched;
+            }
+        }
+    }
+
+    if let Some(raw_usage) = per_provider.opencode.get(model) {
+        found = true;
+        let opencode_cost = opencode_costs.get(model).copied().unwrap_or(0.0);
+        let (cost, matched) = price_usage(model, raw_usage, pricing_map, Some(opencode_cost));
+        total_cost += cost;
+        if matched_model.is_none() {
+            matched_model = matched;
+        }
+    }
+
+    found.then_some((total_cost, matched_model))
+}
+
+/// Builds one display row using an already-resolved cost.
+fn build_usage_row(
+    model: &str,
+    usage: &Value,
+    cost: f64,
+    matched_model: Option<String>,
+) -> UsageRow {
+    use crate::utils::extract_token_counts;
+
+    let counts = extract_token_counts(usage);
 
     // Use Cow<str> for display_model to avoid allocation when no annotation
     let display_model = if let Some(matched) = &matched_model {
@@ -337,5 +396,53 @@ fn extract_usage_row(
         cache_creation: counts.cache_creation,
         total: counts.total,
         cost,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pricing::{ModelPricing, ModelPricingMap, clear_pricing_cache};
+    use serde_json::json;
+
+    #[test]
+    fn merged_rows_price_opencode_fallback_only_for_opencode_tokens() {
+        clear_pricing_cache();
+
+        let mut raw_pricing = std::collections::HashMap::new();
+        raw_pricing.insert(
+            "shared".to_string(),
+            ModelPricing {
+                input_cost_per_token: 0.01,
+                ..Default::default()
+            },
+        );
+        let pricing_map = ModelPricingMap::new(raw_pricing);
+
+        let mut usage_data = UsageResult::default();
+        usage_data.insert("shared-pro".to_string(), json!({"input_tokens": 200}));
+
+        let mut per_provider = PerProviderUsage::default();
+        per_provider
+            .claude
+            .insert("shared-pro".to_string(), json!({"input_tokens": 100}));
+        per_provider
+            .opencode
+            .insert("shared-pro".to_string(), json!({"input_tokens": 100}));
+
+        let mut opencode_costs = crate::constants::FastHashMap::default();
+        opencode_costs.insert("shared-pro".to_string(), 7.0);
+
+        let summary = build_usage_summary(
+            &usage_data,
+            &per_provider,
+            &ProviderActiveDays::default(),
+            &pricing_map,
+            &opencode_costs,
+        );
+
+        assert_eq!(summary.rows.len(), 1);
+        assert!((summary.rows[0].cost - 8.0).abs() < 1e-9);
+        assert_eq!(summary.rows[0].display_model, "shared-pro (shared)");
     }
 }

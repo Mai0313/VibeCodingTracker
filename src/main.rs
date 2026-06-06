@@ -25,11 +25,9 @@ use vibe_coding_tracker::cli::{Cli, Commands, resolve_time_range};
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-use vibe_coding_tracker::constants::FastHashMap;
 use vibe_coding_tracker::display::usage::{
     display_usage_interactive, display_usage_table, display_usage_text,
 };
-use vibe_coding_tracker::models::UsageResult;
 use vibe_coding_tracker::pricing::{ModelPricingMap, fetch_model_pricing};
 use vibe_coding_tracker::usage::{get_usage_from_directories, resolve_model_cost};
 use vibe_coding_tracker::utils::extract_token_counts;
@@ -148,11 +146,7 @@ fn main() -> Result<()> {
                             ModelPricingMap::new(HashMap::new())
                         }
                     };
-                    let enriched_data = build_enriched_json(
-                        &usage_data.models,
-                        &usage_data.opencode_costs,
-                        &pricing_map,
-                    )?;
+                    let enriched_data = build_enriched_json(&usage_data, &pricing_map)?;
                     let json_str = serde_json::to_string_pretty(&enriched_data)?;
                     println!("{}", json_str);
                 } else if text {
@@ -235,29 +229,22 @@ fn main() -> Result<()> {
 /// [`resolve_model_cost`](vibe_coding_tracker::usage::resolve_model_cost) and
 /// emits a JSON object with `model`, `usage`, `cost_usd`, and (when a non-exact
 /// LiteLLM key was used) `matched_model`. OpenCode models without an exact
-/// price report OpenCode's own stored cost from `opencode_costs` rather than a
-/// fuzzy match.
+/// price report OpenCode's own stored cost only for the OpenCode portion of a
+/// merged row rather than applying it to other providers with the same model.
 ///
 /// # Errors
 ///
 /// Returns an error only if a usage value cannot be serialized into the
 /// resulting JSON object.
 fn build_enriched_json(
-    usage_data: &UsageResult,
-    opencode_costs: &FastHashMap<String, f64>,
+    usage_data: &vibe_coding_tracker::UsageData,
     pricing_map: &ModelPricingMap,
 ) -> Result<Vec<Value>> {
-    let mut enriched_data = Vec::with_capacity(usage_data.len());
+    let mut enriched_data = Vec::with_capacity(usage_data.models.len());
 
-    for (model, usage) in usage_data.iter() {
-        let counts = extract_token_counts(usage);
-
-        let (cost, matched_model) = resolve_model_cost(
-            model,
-            &counts,
-            pricing_map,
-            opencode_costs.get(model).copied(),
-        );
+    for (model, usage) in usage_data.models.iter() {
+        let (cost, matched_model) = resolve_enriched_model_cost(model, usage_data, pricing_map)
+            .unwrap_or_else(|| price_usage_value(model, usage, pricing_map, None));
 
         let mut entry = json!({
             "model": model,
@@ -273,4 +260,102 @@ fn build_enriched_json(
     }
 
     Ok(enriched_data)
+}
+
+/// Resolves cost for one merged JSON row from provider-scoped usage pieces.
+fn resolve_enriched_model_cost(
+    model: &str,
+    usage_data: &vibe_coding_tracker::UsageData,
+    pricing_map: &ModelPricingMap,
+) -> Option<(f64, Option<String>)> {
+    let mut total_cost = 0.0;
+    let mut matched_model = None;
+    let mut found = false;
+
+    for usage in [
+        &usage_data.per_provider.claude,
+        &usage_data.per_provider.codex,
+        &usage_data.per_provider.copilot,
+        &usage_data.per_provider.gemini,
+    ] {
+        if let Some(raw_usage) = usage.get(model) {
+            found = true;
+            let (cost, matched) = price_usage_value(model, raw_usage, pricing_map, None);
+            total_cost += cost;
+            if matched_model.is_none() {
+                matched_model = matched;
+            }
+        }
+    }
+
+    if let Some(raw_usage) = usage_data.per_provider.opencode.get(model) {
+        found = true;
+        let opencode_cost = usage_data.opencode_costs.get(model).copied().unwrap_or(0.0);
+        let (cost, matched) = price_usage_value(model, raw_usage, pricing_map, Some(opencode_cost));
+        total_cost += cost;
+        if matched_model.is_none() {
+            matched_model = matched;
+        }
+    }
+
+    found.then_some((total_cost, matched_model))
+}
+
+/// Prices one raw usage value.
+fn price_usage_value(
+    model: &str,
+    usage: &Value,
+    pricing_map: &ModelPricingMap,
+    opencode_cost: Option<f64>,
+) -> (f64, Option<String>) {
+    let counts = extract_token_counts(usage);
+    resolve_model_cost(model, &counts, pricing_map, opencode_cost)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vibe_coding_tracker::models::{PerProviderUsage, ProviderActiveDays, UsageResult};
+    use vibe_coding_tracker::pricing::{ModelPricing, clear_pricing_cache};
+
+    #[test]
+    fn json_rows_price_opencode_fallback_only_for_opencode_tokens() {
+        clear_pricing_cache();
+
+        let mut raw_pricing = HashMap::new();
+        raw_pricing.insert(
+            "shared".to_string(),
+            ModelPricing {
+                input_cost_per_token: 0.01,
+                ..Default::default()
+            },
+        );
+        let pricing_map = ModelPricingMap::new(raw_pricing);
+
+        let mut models = UsageResult::default();
+        models.insert("shared-pro".to_string(), json!({"input_tokens": 200}));
+
+        let mut per_provider = PerProviderUsage::default();
+        per_provider
+            .claude
+            .insert("shared-pro".to_string(), json!({"input_tokens": 100}));
+        per_provider
+            .opencode
+            .insert("shared-pro".to_string(), json!({"input_tokens": 100}));
+
+        let mut opencode_costs = vibe_coding_tracker::constants::FastHashMap::default();
+        opencode_costs.insert("shared-pro".to_string(), 7.0);
+
+        let usage_data = vibe_coding_tracker::UsageData {
+            models,
+            per_provider,
+            provider_days: ProviderActiveDays::default(),
+            opencode_costs,
+        };
+
+        let rows = build_enriched_json(&usage_data, &pricing_map).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["cost_usd"].as_f64().unwrap(), 8.0);
+        assert_eq!(rows[0]["matched_model"].as_str().unwrap(), "shared");
+    }
 }
