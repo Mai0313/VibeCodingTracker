@@ -323,8 +323,9 @@ where
 ///
 /// Mirrors the tail of [`process_usage_directory`] but sources sessions from
 /// the database (via [`read_opencode_usage`]) instead of a directory walk. Each
-/// session's `time_updated` date is recorded in `unique_dates` for the
-/// active-day count.
+/// row's date comes from the assistant message timestamp (falling back to
+/// `session.time_updated` on legacy schemas) and is recorded in `unique_dates`
+/// for the active-day count.
 ///
 /// # Errors
 ///
