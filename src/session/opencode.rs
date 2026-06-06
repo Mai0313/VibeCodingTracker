@@ -863,6 +863,7 @@ fn extract_plain_read_content(output: &str) -> String {
 
     let mut content = Vec::new();
     let mut saw_separator = false;
+    let mut saw_content = false;
     for line in lines {
         if !saw_separator {
             if line.trim_end_matches('\r').is_empty() {
@@ -870,7 +871,13 @@ fn extract_plain_read_content(output: &str) -> String {
             }
             continue;
         }
-        content.push(line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if has_line_number_prefix(line) {
+            content.push(line);
+            saw_content = true;
+        } else if saw_content {
+            break;
+        }
     }
 
     if saw_separator {
@@ -897,18 +904,24 @@ fn strip_numbered_content_lines_from_iter(lines: Vec<&str>) -> String {
     lines.join("\n")
 }
 
-/// Strips a leading `"<digits>: "` line-number prefix, if present.
-fn strip_line_number_prefix(line: &str) -> &str {
+/// Returns whether a line starts with OpenCode's `N: ` read-output prefix.
+fn has_line_number_prefix(line: &str) -> bool {
     let bytes = line.as_bytes();
     let mut i = 0;
     while i < bytes.len() && bytes[i].is_ascii_digit() {
         i += 1;
     }
-    if i > 0 && i + 1 < bytes.len() && bytes[i] == b':' && bytes[i + 1] == b' ' {
-        &line[i + 2..]
-    } else {
-        line
-    }
+    i > 0 && i + 1 < bytes.len() && bytes[i] == b':' && bytes[i + 1] == b' '
+}
+
+/// Strips a leading `"<digits>: "` line-number prefix, if present.
+fn strip_line_number_prefix(line: &str) -> &str {
+    let Some((prefix, content)) = line.split_once(": ") else {
+        return line;
+    };
+    (!prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit()))
+        .then_some(content)
+        .unwrap_or(line)
 }
 
 /// Wraps a single record into a fully-populated [`CodeAnalysis`].
@@ -1129,6 +1142,13 @@ mod tests {
 
         let plain_output = "/a/b.py\nfile\n\n1: import os\n2: \n3: print(1)";
         assert_eq!(extract_read_content(plain_output), "import os\n\nprint(1)");
+
+        let plain_output_with_footer =
+            "/a/b.py\nfile\n\n1: import os\n2: \n3: print(1)\n\n(End of file - total 3 lines)";
+        assert_eq!(
+            extract_read_content(plain_output_with_footer),
+            "import os\n\nprint(1)"
+        );
 
         // Directory listing has no <content> block.
         let dir_output = "<path>/a</path>\n<type>directory</type>\n<entries>\nx.py\n</entries>";
