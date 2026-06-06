@@ -627,6 +627,11 @@ fn parse_apply_patch_text(patch_text: &str) -> Vec<OpenCodePatch> {
                     .to_string(),
                 lines: Vec::with_capacity(20),
             });
+        } else if line.starts_with("*** Move to:") {
+            // Rename/move marker: attribute the hunk to the destination path.
+            if let Some(ref mut patch) = current {
+                patch.file_path = line.trim_start_matches("*** Move to:").trim().to_string();
+            }
         } else if let Some(ref mut patch) = current {
             patch.lines.push(line.to_string());
         }
@@ -1538,6 +1543,19 @@ mod tests {
         assert_eq!(record.tool_call_counts.write, 1);
         assert_eq!(record.total_edit_lines, 2);
         assert_eq!(record.total_write_lines, 1);
+    }
+
+    #[test]
+    fn test_parse_apply_patch_text_handles_move_marker() {
+        let patches = parse_apply_patch_text(
+            "*** Begin Patch\n*** Update File: src/old.rs\n*** Move to: src/new.rs\n@@\n-a\n+b\n*** End Patch",
+        );
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].action, "update");
+        assert_eq!(patches[0].file_path, "src/new.rs");
+        let (old_str, new_str) = extract_patch_strings(&patches[0].lines);
+        assert_eq!(old_str, "a");
+        assert_eq!(new_str, "b");
     }
 
     #[test]
