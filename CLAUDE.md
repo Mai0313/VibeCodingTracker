@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Rust CLI (`vibe_coding_tracker`, short alias `vct`) that scans on-disk JSONL session logs written by four AI coding assistants — Claude Code, OpenAI Codex, GitHub Copilot CLI, and Gemini CLI — and aggregates them into two views:
+Rust CLI (`vibe_coding_tracker`, short alias `vct`) that scans on-disk session logs written by five AI coding assistants — Claude Code, OpenAI Codex, GitHub Copilot CLI, and Gemini CLI (JSONL files), plus OpenCode (a SQLite database) — and aggregates them into two views:
 
 - **`usage`** — per-model token counts and LiteLLM-priced cost
 - **`analysis`** — per-model file-operation and tool-call metrics (read/write/edit lines, Bash/Edit/Read/Write/TodoWrite call counts)
@@ -73,6 +73,10 @@ Four parser entry points live in `src/session/parser.rs`:
 
 `classify_records()` is the streaming-friendly variant that returns `None` on indeterminate records and lets callers keep peeking until a marker arrives — there is **no fixed peek window**, which is critical because a Claude metadata preamble (`permission-mode`, `file-history-snapshot`, …) can be arbitrarily long.
 
+OpenCode does **not** flow through the detector or `parse_session_file_*`: it lives in a single SQLite database, so `src/session/opencode.rs` reads it directly (`read_opencode_usage` from assistant messages with a legacy `session` fallback, `read_opencode_analysis` from `message` + `part`) and produces the same `CodeAnalysis` shape, which the `usage` / `analysis` aggregators fold in alongside the file-based providers. The DB is opened read-only (with a temp-copy fallback) so the user's database is never mutated.
+
+OpenCode cost is a special case: `usage::resolve_model_cost` prices an OpenCode model from tokens only on an **exact** LiteLLM match (`ModelPricingMap::get_exact`); with no exact match it uses the stored assistant-message cost carried in `UsageData::opencode_costs` rather than the normalized/substring/fuzzy fallback the other providers use. This keeps a novel model like `deepseek-v4-pro` from being mis-priced against a loosely-similar name.
+
 ### `ParseMode`
 
 `src/session/state.rs` defines `ParseMode::Full` vs `ParseMode::UsageOnly`. The usage path uses `UsageOnly` to skip allocating the large `write_file_details` / `edit_file_details` bodies — this is a major part of why the TUI sits at ~30–50 MB RSS even on 200+ session directories. Preserve this distinction when adding new fields to `CodeAnalysisRecord`.
@@ -87,6 +91,7 @@ Resolved by `src/utils/paths.rs` (`resolve_paths`):
 | Codex         | `~/.codex/sessions/**/*.jsonl`                                                                                                                 |
 | Copilot CLI   | `~/.copilot/session-state/<sessionId>/events.jsonl` (depth-bounded walk via `COPILOT_SESSION_MAX_DEPTH` to skip per-session snapshot subtrees) |
 | Gemini CLI    | `~/.gemini/tmp/<project_hash>/chats/*.jsonl`                                                                                                   |
+| OpenCode      | `~/.local/share/opencode/opencode.db` (SQLite database, read via `rusqlite`; honors `$XDG_DATA_HOME`)                                          |
 | Pricing cache | `~/.vibe_coding_tracker/model_pricing_YYYY-MM-DD.json`                                                                                         |
 
 ### Pricing (`src/pricing/`)
@@ -126,4 +131,4 @@ Global singleton `GLOBAL_FILE_CACHE` (capacity = 5 in `constants::capacity::FILE
     - `tests/usage.rs` — `get_usage_from_directories` aggregation
     - `tests/pricing.rs` — `ModelPricingMap` lookup priority + tiered pricing math
     - `tests/cache.rs` — LRU file cache + pricing cache invalidation
-- Sample fixtures and golden outputs for all four providers live in `examples/` (one `test_conversation_<provider>.jsonl` plus one `analysis_result_<provider>.json` per provider).
+- Sample fixtures and golden outputs for the four JSONL providers live in `examples/` (one `test_conversation_<provider>.jsonl` plus one `analysis_result_<provider>.json` per provider). OpenCode has no JSONL fixture; its SQLite reader is covered by inline unit tests in `src/session/opencode.rs` that build a temp database.

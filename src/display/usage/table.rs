@@ -43,6 +43,7 @@ pub fn display_usage_table(usage_data: &UsageData) {
         &usage_data.per_provider,
         &usage_data.provider_days,
         &pricing_map,
+        &usage_data.opencode_costs,
     );
 
     if summary.rows.is_empty() {

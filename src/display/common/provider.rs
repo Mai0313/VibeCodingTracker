@@ -52,6 +52,11 @@ impl<'a, T> ProviderTotal<'a, T> {
                 RatatuiColor::LightBlue,
                 TableColor::Blue,
             ),
+            Provider::OpenCode => (
+                Provider::OpenCode.display_name(),
+                RatatuiColor::Red,
+                TableColor::Red,
+            ),
             Provider::Unknown => ("Unknown", RatatuiColor::Gray, TableColor::Grey),
         };
 

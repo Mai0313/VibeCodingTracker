@@ -218,19 +218,28 @@ impl SessionParseState {
     ///
     /// When `old` is empty but `new` is not, the edit is reclassified as a
     /// `Write` (a new-file creation expressed as a diff) and forwarded to
-    /// [`SessionParseState::add_write_detail`]. Otherwise the line/character
-    /// tally is taken from the trimmed `new` content. No-op when `path`
-    /// normalizes to an empty string; full detail stored only in
-    /// [`ParseMode::Full`].
+    /// [`SessionParseState::add_write_detail`]. Otherwise delegates to
+    /// [`SessionParseState::add_edit_detail_raw`].
     pub fn add_edit_detail(&mut self, path: &str, old: &str, new: &str, ts: i64) {
-        let trimmed_new = new.trim_end_matches('\n');
-        let trimmed_old = old.trim_end_matches('\n');
-
         // If old is empty and new has content, treat as write
-        if trimmed_old.is_empty() && !trimmed_new.is_empty() {
+        if old.trim_end_matches('\n').is_empty() && !new.trim_end_matches('\n').is_empty() {
             self.add_write_detail(path, new, ts);
             return;
         }
+
+        self.add_edit_detail_raw(path, old, new, ts);
+    }
+
+    /// Records an `Edit` operation against `path` without the new-file
+    /// reclassification in [`SessionParseState::add_edit_detail`].
+    ///
+    /// Used for patch hunks that update an existing file, where an empty `old`
+    /// just means an insert-only hunk. The line/character tally is taken from
+    /// the trimmed `new` content. No-op when `path` normalizes to an empty
+    /// string; full detail stored only in [`ParseMode::Full`].
+    pub fn add_edit_detail_raw(&mut self, path: &str, old: &str, new: &str, ts: i64) {
+        let trimmed_new = new.trim_end_matches('\n');
+        let trimmed_old = old.trim_end_matches('\n');
 
         let line_count = count_lines(trimmed_new);
         let char_count = trimmed_new.chars().count();

@@ -19,7 +19,7 @@
 
 </div>
 
-**实时追踪你的 AI 编程开销。** Vibe Coding Tracker 是一款基于 Rust 构建的轻量级高性能 CLI 工具，用于监控和分析你在 Claude Code、Codex、Copilot 和 Gemini 上的使用情况——提供详细的费用明细、token 统计和代码操作洞察，同时保持极低的内存占用。
+**实时追踪你的 AI 编程开销。** Vibe Coding Tracker 是一款基于 Rust 构建的轻量级高性能 CLI 工具，用于监控和分析你在 Claude Code、Codex、Copilot、Gemini 和 OpenCode 上的使用情况——提供详细的费用明细、token 统计和代码操作洞察，同时保持极低的内存占用。
 
 [English](README.md) | [繁體中文](README.zh-TW.md) | [简体中文](README.zh-CN.md)
 
@@ -48,7 +48,7 @@
 
 ### 零配置
 
-自动检测并处理来自 Claude Code、Codex、Copilot 和 Gemini 的日志。无需任何设置——直接运行即可分析。
+自动检测并处理来自 Claude Code、Codex、Copilot、Gemini 和 OpenCode 的日志。无需任何设置——直接运行即可分析。
 
 ### 丰富的洞察
 
@@ -62,15 +62,15 @@
 
 ## 核心特性
 
-| 特性             | 说明                                                     |
-| ---------------- | -------------------------------------------------------- |
-| **多供应商支持** | Claude Code、Codex、Copilot 和 Gemini——一站式管理        |
-| **智能定价**     | 模糊模型匹配 + 从 LiteLLM 每日缓存更新                   |
-| **4 种显示模式** | 交互式 TUI、静态表格、纯文本和 JSON                      |
-| **双维度分析**   | token/费用统计（`usage`）+ 代码操作统计（`analysis`）    |
-| **超轻量级**     | TUI 常驻内存 50 MB 以内、流式 JSONL 解析——基于 Rust 构建 |
-| **实时更新**     | 面板每秒自动刷新                                         |
-| **高效缓存**     | 智能每日缓存，减少 API 调用次数                          |
+| 特性             | 说明                                                        |
+| ---------------- | ----------------------------------------------------------- |
+| **多供应商支持** | Claude Code、Codex、Copilot、Gemini 和 OpenCode——一站式管理 |
+| **智能定价**     | 模糊模型匹配 + 从 LiteLLM 每日缓存更新                      |
+| **4 种显示模式** | 交互式 TUI、静态表格、纯文本和 JSON                         |
+| **双维度分析**   | token/费用统计（`usage`）+ 代码操作统计（`analysis`）       |
+| **超轻量级**     | TUI 常驻内存 50 MB 以内、流式 JSONL 解析——基于 Rust 构建    |
+| **实时更新**     | 面板每秒自动刷新                                            |
+| **高效缓存**     | 智能每日缓存，减少 API 调用次数                             |
 
 ---
 
@@ -232,6 +232,7 @@ vct usage --json --daily
 - `~/.codex/sessions/**/*.jsonl`（Codex，递归包含每日子目录）
 - `~/.copilot/session-state/<sessionId>/events.jsonl`（Copilot CLI）
 - `~/.gemini/tmp/<project_hash>/chats/*.jsonl`（Gemini CLI）
+- `~/.local/share/opencode/opencode.db`（OpenCode，SQLite 数据库；遵循 `$XDG_DATA_HOME`）
 
 ---
 
@@ -386,5 +387,6 @@ docker run --rm \
     -v ~/.codex:/root/.codex \
     -v ~/.copilot:/root/.copilot \
     -v ~/.gemini:/root/.gemini \
+    -v ~/.local/share/opencode:/root/.local/share/opencode \
     vibe_coding_tracker:latest usage
 ```

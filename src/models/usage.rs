@@ -27,6 +27,8 @@ pub struct ProviderActiveDays {
     pub copilot: usize,
     /// Distinct active days observed for Gemini CLI.
     pub gemini: usize,
+    /// Distinct active days observed for OpenCode.
+    pub opencode: usize,
     /// Distinct active days across all providers combined.
     pub total: usize,
 }
@@ -56,6 +58,8 @@ pub struct PerProviderUsage {
     pub copilot: UsageResult,
     /// Per-model usage attributed to Gemini CLI.
     pub gemini: UsageResult,
+    /// Per-model usage attributed to OpenCode.
+    pub opencode: UsageResult,
 }
 
 impl PerProviderUsage {
@@ -66,6 +70,7 @@ impl PerProviderUsage {
             Provider::Codex => Some(&self.codex),
             Provider::Copilot => Some(&self.copilot),
             Provider::Gemini => Some(&self.gemini),
+            Provider::OpenCode => Some(&self.opencode),
             Provider::Unknown => None,
         }
     }
@@ -78,6 +83,7 @@ impl PerProviderUsage {
             Provider::Codex => Some(&mut self.codex),
             Provider::Copilot => Some(&mut self.copilot),
             Provider::Gemini => Some(&mut self.gemini),
+            Provider::OpenCode => Some(&mut self.opencode),
             Provider::Unknown => None,
         }
     }

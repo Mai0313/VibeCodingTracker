@@ -30,7 +30,7 @@ pub use paths::{
     get_pricing_cache_path, list_pricing_cache_files, resolve_paths,
 };
 pub use time::parse_iso_timestamp;
-pub use token_extractor::extract_token_counts;
+pub use token_extractor::{TokenCounts, extract_token_counts};
 pub use usage_processor::{
     accumulate_i64_fields, accumulate_nested_object, process_claude_usage, process_codex_usage,
     process_gemini_usage,

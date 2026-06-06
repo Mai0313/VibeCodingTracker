@@ -397,6 +397,9 @@ fn dispatch_streaming_buffered(
             let rest_events = iter_jsonl_values(&mut reader);
             parse_gemini_events(session, iter.chain(rest_events), mode)
         }
+        // OpenCode stores sessions in a SQLite database, not a JSONL file, so
+        // it never flows through the file parser. See `session::opencode`.
+        ExtensionType::OpenCode => Ok(empty_analysis()),
     }
 }
 
@@ -450,10 +453,11 @@ fn dispatch_by_vec(
                 .collect();
             parse_codex_logs(&logs, mode)?
         }
-        ExtensionType::Copilot | ExtensionType::Gemini => {
-            // Both providers only support the JSONL event stream. A file
-            // that falls through to this branch (e.g. a stray pretty-
-            // printed export) has no parser for its shape — return an
+        ExtensionType::Copilot | ExtensionType::Gemini | ExtensionType::OpenCode => {
+            // Copilot/Gemini only support the JSONL event stream, and OpenCode
+            // is read from a SQLite database (see `session::opencode`), not a
+            // file. A file that falls through to this branch (e.g. a stray
+            // pretty-printed export) has no parser for its shape — return an
             // empty analysis instead of silently mis-parsing.
             empty_analysis()
         }

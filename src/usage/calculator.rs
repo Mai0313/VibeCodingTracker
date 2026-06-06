@@ -13,9 +13,10 @@ use crate::constants::{FastHashMap, capacity};
 use crate::models::{
     CodeAnalysis, ExtensionType, PerProviderUsage, Provider, ProviderActiveDays, UsageResult,
 };
-use crate::session::{ParseMode, parse_session_file_as};
+use crate::pricing::{ModelPricingMap, calculate_cost};
+use crate::session::{ParseMode, parse_session_file_as, read_opencode_usage};
 use crate::utils::{
-    COPILOT_SESSION_MAX_DEPTH, collect_files_with_max_depth, is_claude_session_file,
+    COPILOT_SESSION_MAX_DEPTH, TokenCounts, collect_files_with_max_depth, is_claude_session_file,
     is_codex_session_file, is_copilot_session_file, is_gemini_session_file, resolve_paths,
 };
 use anyhow::Result;
@@ -61,6 +62,13 @@ pub struct UsageData {
     /// Count of distinct calendar dates that contributed usage, per provider
     /// and overall.
     pub provider_days: ProviderActiveDays,
+    /// OpenCode's own per-model cost (USD), summed from assistant messages.
+    ///
+    /// OpenCode records authoritative assistant-message costs, so when a model
+    /// has no exact LiteLLM price we display this stored cost instead of
+    /// guessing from a fuzzy match. Keyed by model name; only OpenCode models
+    /// appear.
+    pub opencode_costs: FastHashMap<String, f64>,
 }
 
 /// Extracts token usage data from a typed `CodeAnalysis`.
@@ -88,8 +96,8 @@ fn extract_conversation_usage_from_analysis(analysis: &CodeAnalysis) -> FastHash
 /// Scans the Claude Code, Codex, Copilot, and Gemini session trees resolved by
 /// [`resolve_paths`], filtered by `time_range`, and rolls every session's
 /// per-model usage into a [`UsageData`]. Missing provider directories are
-/// skipped silently, and a session file that fails to parse logs a warning to
-/// stderr and is excluded rather than aborting the whole scan.
+/// skipped silently, and a source file or OpenCode database that fails to parse
+/// logs a warning to stderr and is excluded rather than aborting the whole scan.
 ///
 /// # Errors
 ///
@@ -113,11 +121,13 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
     let paths = resolve_paths()?;
     let mut result = FastHashMap::with_capacity(capacity::MODEL_COMBINATIONS);
     let mut per_provider = PerProviderUsage::default();
+    let mut opencode_costs: FastHashMap<String, f64> = FastHashMap::default();
 
     let mut claude_dates: HashSet<String> = HashSet::new();
     let mut codex_dates: HashSet<String> = HashSet::new();
     let mut copilot_dates: HashSet<String> = HashSet::new();
     let mut gemini_dates: HashSet<String> = HashSet::new();
+    let mut opencode_dates: HashSet<String> = HashSet::new();
 
     if paths.claude_session_dir.exists() {
         // Walks the projects tree recursively, so top-level `<session>.jsonl` logs
@@ -178,17 +188,37 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
         )?;
     }
 
+    // OpenCode lives in a single SQLite database rather than a session
+    // directory, so it is read directly instead of walked.
+    if paths.opencode_db.exists()
+        && let Err(err) = process_opencode_usage(
+            &paths.opencode_db,
+            &mut result,
+            &mut per_provider.opencode,
+            &mut opencode_costs,
+            &mut opencode_dates,
+            time_range,
+        )
+    {
+        eprintln!(
+            "Warning: Failed to read OpenCode DB {}: {err}",
+            paths.opencode_db.display()
+        );
+    }
+
     let mut all_dates: HashSet<&String> = HashSet::new();
     all_dates.extend(claude_dates.iter());
     all_dates.extend(codex_dates.iter());
     all_dates.extend(copilot_dates.iter());
     all_dates.extend(gemini_dates.iter());
+    all_dates.extend(opencode_dates.iter());
 
     let provider_days = ProviderActiveDays {
         claude: claude_dates.len(),
         codex: codex_dates.len(),
         copilot: copilot_dates.len(),
         gemini: gemini_dates.len(),
+        opencode: opencode_dates.len(),
         total: all_dates.len(),
     };
 
@@ -196,6 +226,7 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
         models: result,
         per_provider,
         provider_days,
+        opencode_costs,
     })
 }
 
@@ -287,6 +318,93 @@ where
     Ok(())
 }
 
+/// Reads OpenCode's SQLite database and merges its per-model usage into both
+/// the global and OpenCode-scoped maps.
+///
+/// Mirrors the tail of [`process_usage_directory`] but sources sessions from
+/// the database (via [`read_opencode_usage`]) instead of a directory walk. Each
+/// row's date comes from the assistant message timestamp (falling back to
+/// `session.time_updated` on legacy schemas) and is recorded in `unique_dates`
+/// for the active-day count.
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be opened or queried.
+fn process_opencode_usage(
+    db_path: &Path,
+    global_result: &mut UsageResult,
+    provider_result: &mut UsageResult,
+    opencode_costs: &mut FastHashMap<String, f64>,
+    unique_dates: &mut HashSet<String>,
+    time_range: TimeRange,
+) -> Result<()> {
+    let sessions = read_opencode_usage(db_path, time_range)?;
+
+    for (date, analysis, session_cost) in sessions {
+        unique_dates.insert(date);
+
+        let conversation_usage = extract_conversation_usage_from_analysis(&analysis);
+        for (model, usage_value) in conversation_usage {
+            *opencode_costs.entry(model.clone()).or_insert(0.0) += session_cost;
+
+            provider_result
+                .entry(model.clone())
+                .and_modify(|existing| merge_usage_values(existing, &usage_value))
+                .or_insert_with(|| usage_value.clone());
+
+            global_result
+                .entry(model)
+                .and_modify(|existing| merge_usage_values(existing, &usage_value))
+                .or_insert(usage_value);
+        }
+    }
+
+    Ok(())
+}
+
+/// Resolves the USD cost (and optional matched-model annotation) for one model.
+///
+/// Behavior depends on `opencode_cost`:
+/// - `None` (every provider except OpenCode): the existing LiteLLM lookup,
+///   which includes exact, normalized, substring, and fuzzy matching.
+/// - `Some(stored)` (OpenCode): only an **exact** LiteLLM match is computed
+///   from tokens; otherwise the model's stored OpenCode cost is used verbatim.
+///   No fuzzy/normalized guessing happens, so a novel model like
+///   `deepseek-v4-pro` reports OpenCode's own cost instead of being priced
+///   against a loosely-similar model.
+///
+/// Returns `(cost_usd, matched_model)` where `matched_model` is `Some` only
+/// when a non-exact LiteLLM key was used (for display annotation).
+pub fn resolve_model_cost(
+    model: &str,
+    counts: &TokenCounts,
+    pricing_map: &ModelPricingMap,
+    opencode_cost: Option<f64>,
+) -> (f64, Option<String>) {
+    let priced = |pricing: &crate::pricing::ModelPricing| {
+        calculate_cost(
+            counts.input_tokens,
+            counts.output_tokens,
+            counts.reasoning_tokens,
+            counts.cache_read,
+            counts.cache_creation_5m,
+            counts.cache_creation_1h,
+            pricing,
+        )
+    };
+
+    if let Some(stored) = opencode_cost {
+        // OpenCode: only trust an exact price match; otherwise use its own cost.
+        return match pricing_map.get_exact(model) {
+            Some(pricing) => (priced(&pricing), None),
+            None => (stored, None),
+        };
+    }
+
+    let result = pricing_map.get(model);
+    (priced(&result.pricing), result.matched_model)
+}
+
 impl UsageData {
     /// Returns the per-provider usage slice for `provider`, or `None`
     /// when the provider has no dedicated bucket (e.g. `Provider::Unknown`
@@ -341,5 +459,63 @@ fn merge_usage_values(existing: &mut Value, new: &Value) {
         {
             accumulate_nested_object(existing_obj, "total_token_usage", new_total);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pricing::{ModelPricing, clear_pricing_cache};
+    use std::collections::HashMap;
+
+    fn map_with_gpt4() -> ModelPricingMap {
+        let mut raw = HashMap::new();
+        raw.insert(
+            "gpt-4".to_string(),
+            ModelPricing {
+                input_cost_per_token: 1e-5,
+                ..Default::default()
+            },
+        );
+        ModelPricingMap::new(raw)
+    }
+
+    fn counts(input: i64) -> TokenCounts {
+        TokenCounts {
+            input_tokens: input,
+            total: input,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_opencode_exact_match_computes_from_tokens() {
+        clear_pricing_cache();
+        let map = map_with_gpt4();
+        // Exact LiteLLM price exists -> compute from tokens, ignore stored cost.
+        let (cost, matched) = resolve_model_cost("gpt-4", &counts(1_000_000), &map, Some(99.0));
+        assert!((cost - 10.0).abs() < 1e-6); // 1e6 * 1e-5
+        assert!(matched.is_none());
+    }
+
+    #[test]
+    fn test_opencode_no_exact_match_uses_stored_cost() {
+        clear_pricing_cache();
+        let map = map_with_gpt4();
+        // No exact price; OpenCode must NOT fuzzy match -> use stored cost.
+        let (cost, matched) =
+            resolve_model_cost("deepseek-v4-pro", &counts(1_000_000), &map, Some(99.0));
+        assert!((cost - 99.0).abs() < 1e-9);
+        assert!(matched.is_none());
+    }
+
+    #[test]
+    fn test_non_opencode_keeps_existing_lookup() {
+        clear_pricing_cache();
+        let map = map_with_gpt4();
+        // Non-OpenCode path is unchanged: exact match still computes.
+        let (cost, matched) = resolve_model_cost("gpt-4", &counts(1_000_000), &map, None);
+        assert!((cost - 10.0).abs() < 1e-6);
+        assert!(matched.is_none());
     }
 }

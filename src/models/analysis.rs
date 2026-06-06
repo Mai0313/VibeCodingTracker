@@ -196,6 +196,8 @@ pub enum ExtensionType {
     Copilot,
     /// Google Gemini CLI.
     Gemini,
+    /// OpenCode.
+    OpenCode,
 }
 
 impl std::fmt::Display for ExtensionType {
@@ -205,6 +207,7 @@ impl std::fmt::Display for ExtensionType {
             ExtensionType::Codex => write!(f, "Codex"),
             ExtensionType::Copilot => write!(f, "Copilot-CLI"),
             ExtensionType::Gemini => write!(f, "Gemini"),
+            ExtensionType::OpenCode => write!(f, "OpenCode"),
         }
     }
 }

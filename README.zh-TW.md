@@ -19,7 +19,7 @@
 
 </div>
 
-**即時追蹤你的 AI 程式設計花費。** Vibe Coding Tracker 是一款以 Rust 打造的輕量、高效能 CLI 工具，能監控與分析你在 Claude Code、Codex、Copilot 及 Gemini 的使用狀況——提供詳細的費用明細、token 統計資料與程式碼操作分析，同時維持極低的記憶體使用量。
+**即時追蹤你的 AI 程式設計花費。** Vibe Coding Tracker 是一款以 Rust 打造的輕量、高效能 CLI 工具，能監控與分析你在 Claude Code、Codex、Copilot、Gemini 及 OpenCode 的使用狀況——提供詳細的費用明細、token 統計資料與程式碼操作分析，同時維持極低的記憶體使用量。
 
 [English](README.md) | [繁體中文](README.zh-TW.md) | [简体中文](README.zh-CN.md)
 
@@ -48,7 +48,7 @@
 
 ### 零設定
 
-自動偵測並處理 Claude Code、Codex、Copilot 及 Gemini 的日誌檔。不需要任何設定——直接執行就能分析。
+自動偵測並處理 Claude Code、Codex、Copilot、Gemini 及 OpenCode 的日誌檔。不需要任何設定——直接執行就能分析。
 
 ### 豐富洞察
 
@@ -64,7 +64,7 @@
 
 | 功能             | 說明                                                      |
 | ---------------- | --------------------------------------------------------- |
-| **多供應商支援** | Claude Code、Codex、Copilot 及 Gemini——一站整合           |
+| **多供應商支援** | Claude Code、Codex、Copilot、Gemini 及 OpenCode——一站整合 |
 | **智慧定價**     | 模糊模型比對 + 每日從 LiteLLM cache 更新                  |
 | **4 種顯示模式** | 互動式 TUI、靜態表格、純文字及 JSON                       |
 | **雙重分析**     | Token / 費用統計（`usage`）+ 程式碼操作統計（`analysis`） |
@@ -232,6 +232,7 @@ vct usage --json --daily
 - `~/.codex/sessions/**/*.jsonl`（Codex，遞迴包含每日子目錄）
 - `~/.copilot/session-state/<sessionId>/events.jsonl`（Copilot CLI）
 - `~/.gemini/tmp/<project_hash>/chats/*.jsonl`（Gemini CLI）
+- `~/.local/share/opencode/opencode.db`（OpenCode，SQLite 資料庫；遵循 `$XDG_DATA_HOME`）
 
 ---
 
@@ -386,5 +387,6 @@ docker run --rm \
     -v ~/.codex:/root/.codex \
     -v ~/.copilot:/root/.copilot \
     -v ~/.gemini:/root/.gemini \
+    -v ~/.local/share/opencode:/root/.local/share/opencode \
     vibe_coding_tracker:latest usage
 ```
