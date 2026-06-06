@@ -263,6 +263,9 @@ fn collect_analysis(
 fn apply_tool_part(state: &mut SessionParseState, data: &Value) {
     let tool = data.get("tool").and_then(|v| v.as_str()).unwrap_or("");
     let st = data.get("state");
+    if st.and_then(|s| s.get("status")).and_then(|v| v.as_str()) != Some("completed") {
+        return;
+    }
     let input = st.and_then(|s| s.get("input"));
     let ts = st
         .and_then(|s| s.get("time"))
@@ -647,6 +650,7 @@ mod tests {
             r#"{"type":"tool","tool":"edit","state":{"status":"completed","input":{"filePath":"/repo/a.py","oldString":"one","newString":"uno\ndos"}}}"#,
             r#"{"type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"ls -la","description":"list"}}}"#,
             r#"{"type":"tool","tool":"todowrite","state":{"status":"completed","input":{"todos":[]}}}"#,
+            r#"{"type":"tool","tool":"edit","state":{"status":"error","input":{"filePath":"/repo/a.py","oldString":"one","newString":"failed\nchange"}}}"#,
             r#"{"type":"tool","tool":"grep","state":{"status":"completed","input":{"pattern":"x"}}}"#,
             r#"{"type":"text","text":"ignored"}"#,
         ];
