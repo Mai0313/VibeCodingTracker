@@ -11,7 +11,7 @@
 //! - [`read_opencode_usage`] reads assistant messages for per-model tokens and
 //!   cost, with an older `session`-table fallback.
 //! - [`read_opencode_analysis`] additionally folds the `part` table's tool
-//!   calls (`read`, `edit`, `write`, `bash`, `todowrite`, `patch`) into
+//!   calls (`read`, `edit`, `write`, `bash`, `todowrite`) into
 //!   per-message file-operation metrics.
 //!
 //! Token columns map onto the Claude-style flat usage shape so the existing
@@ -307,18 +307,18 @@ fn collect_session_analysis(
     {
         let sql = match cutoff_ms {
             Some(_) => {
-                "SELECT part.session_id, part.data, part.time_updated \
+                "SELECT part.session_id, part.data \
                  FROM part \
                  JOIN session ON session.id = part.session_id \
-                 WHERE json_extract(part.data, '$.type') IN ('tool', 'patch') \
+                 WHERE json_extract(part.data, '$.type') = 'tool' \
                    AND session.model IS NOT NULL \
                    AND session.model != '' \
                    AND session.time_updated >= ?1"
             }
             None => {
-                "SELECT session_id, data, time_updated \
+                "SELECT session_id, data \
                  FROM part \
-                 WHERE json_extract(data, '$.type') IN ('tool', 'patch')"
+                 WHERE json_extract(data, '$.type') = 'tool'"
             }
         };
         let mut stmt = conn.prepare(sql)?;
@@ -330,7 +330,6 @@ fn collect_session_analysis(
         while let Some(row) = rows.next()? {
             let session_id = row.get::<_, String>(0)?;
             let data_text = row.get::<_, String>(1)?;
-            let part_ts = row.get::<_, i64>(2)?;
             let Some(accum) = sessions.get_mut(&session_id) else {
                 continue;
             };
@@ -339,7 +338,6 @@ fn collect_session_analysis(
             };
             match data.get("type").and_then(|v| v.as_str()) {
                 Some("tool") => apply_tool_part(&mut accum.state, &data),
-                Some("patch") => apply_patch_part(&mut accum.state, &data, part_ts),
                 _ => {}
             }
         }
@@ -430,20 +428,20 @@ fn collect_message_analysis(
     {
         let sql = match cutoff_ms {
             Some(_) => {
-                "SELECT part.message_id, part.data, part.time_updated \
+                "SELECT part.message_id, part.data \
                  FROM part \
                  JOIN message ON message.id = part.message_id \
                  JOIN session ON session.id = part.session_id \
                  WHERE json_extract(message.data, '$.role') = 'assistant' \
-                   AND json_extract(part.data, '$.type') IN ('tool', 'patch') \
+                   AND json_extract(part.data, '$.type') = 'tool' \
                    AND session.time_updated >= ?1"
             }
             None => {
-                "SELECT part.message_id, part.data, part.time_updated \
+                "SELECT part.message_id, part.data \
                  FROM part \
                  JOIN message ON message.id = part.message_id \
                  WHERE json_extract(message.data, '$.role') = 'assistant' \
-                   AND json_extract(part.data, '$.type') IN ('tool', 'patch')"
+                   AND json_extract(part.data, '$.type') = 'tool'"
             }
         };
         let mut stmt = conn.prepare(sql)?;
@@ -455,7 +453,6 @@ fn collect_message_analysis(
         while let Some(row) = rows.next()? {
             let message_id = row.get::<_, String>(0)?;
             let data_text = row.get::<_, String>(1)?;
-            let part_ts = row.get::<_, i64>(2)?;
             let Some(accum) = messages.get_mut(&message_id) else {
                 continue;
             };
@@ -464,7 +461,6 @@ fn collect_message_analysis(
             };
             match data.get("type").and_then(|v| v.as_str()) {
                 Some("tool") => apply_tool_part(&mut accum.state, &data),
-                Some("patch") => apply_patch_part(&mut accum.state, &data, part_ts),
                 _ => {}
             }
         }
@@ -541,17 +537,6 @@ fn apply_tool_part(state: &mut SessionParseState, data: &Value) {
             state.tool_counts.todo_write += 1;
         }
         _ => {}
-    }
-}
-
-/// Records an OpenCode `patch` part as edit work for each touched file.
-fn apply_patch_part(state: &mut SessionParseState, data: &Value, ts: i64) {
-    let Some(files) = data.get("files").and_then(|v| v.as_array()) else {
-        return;
-    };
-
-    for path in files.iter().filter_map(|v| v.as_str()) {
-        state.add_edit_detail(path, "", "", ts);
     }
 }
 
@@ -1184,7 +1169,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_analysis_counts_patch_files() {
+    fn test_read_analysis_ignores_patch_snapshots() {
         let (_dir, db_path) = make_db();
         let conn = Connection::open(&db_path).unwrap();
         conn.execute(
@@ -1207,7 +1192,7 @@ mod tests {
         let rows = read_opencode_analysis(&db_path, TimeRange::All, ParseMode::UsageOnly).unwrap();
         assert_eq!(rows.len(), 1);
         let record = &rows[0].1.records[0];
-        assert_eq!(record.tool_call_counts.edit, 2);
+        assert_eq!(record.tool_call_counts.edit, 0);
         assert_eq!(record.total_edit_lines, 0);
     }
 }
