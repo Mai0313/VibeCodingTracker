@@ -37,9 +37,9 @@ use std::path::{Path, PathBuf};
 /// Each returned tuple is `(local YYYY-MM-DD date, CodeAnalysis, stored_cost)`
 /// where the `CodeAnalysis` holds one assistant message's
 /// `conversation_usage`, keyed by that message's provider-qualified model id,
-/// and `stored_cost` is OpenCode's own cost for that message. The date comes from
-/// `session.time_updated` and is filtered by `time_range`, matching the
-/// file-walker semantics.
+/// and `stored_cost` is OpenCode's own cost for that message. The date comes
+/// from the assistant message timestamp and is filtered by `time_range`,
+/// matching the file-walker semantics.
 ///
 /// # Errors
 ///
@@ -178,7 +178,11 @@ fn collect_message_usage(
              FROM message \
              JOIN session ON session.id = message.session_id \
              WHERE json_extract(message.data, '$.role') = 'assistant' \
-               AND session.time_updated >= ?1"
+               AND COALESCE( \
+                   json_extract(message.data, '$.time.completed'), \
+                   json_extract(message.data, '$.time.created'), \
+                   session.time_updated \
+               ) >= ?1"
         }
         None => {
             "SELECT session.time_updated, message.data \
@@ -197,21 +201,22 @@ fn collect_message_usage(
     while let Some(row) = rows.next()? {
         let session_ts = row.get::<_, i64>(0)?;
         let data_text = row.get::<_, String>(1)?;
-        let Some(date) = ms_to_local_date(session_ts) else {
+        let Some(message) = parse_message_usage(&data_text) else {
+            continue;
+        };
+        let message_ts = message.timestamp.unwrap_or(session_ts);
+        let Some(date) = ms_to_local_date(message_ts) else {
             continue;
         };
         if is_before_cutoff(&date, &cutoff) {
             continue;
         }
-        let Some(message) = parse_message_usage(&data_text) else {
-            continue;
-        };
 
         let mut map = FastHashMap::default();
         map.insert(message.model_id, message.usage);
 
         let mut state = SessionParseState::with_mode(ParseMode::UsageOnly);
-        state.last_ts = message.timestamp.unwrap_or(session_ts);
+        state.last_ts = message_ts;
         out.push((
             date,
             wrap_record(state.into_record(map), &user, &machine),
@@ -376,7 +381,11 @@ fn collect_message_analysis(
                  FROM message \
                  JOIN session ON session.id = message.session_id \
                  WHERE json_extract(message.data, '$.role') = 'assistant' \
-                   AND session.time_updated >= ?1"
+                   AND COALESCE( \
+                       json_extract(message.data, '$.time.completed'), \
+                       json_extract(message.data, '$.time.created'), \
+                       session.time_updated \
+                   ) >= ?1"
             }
             None => {
                 "SELECT message.id, message.session_id, message.data, session.directory, session.time_updated \
@@ -397,20 +406,21 @@ fn collect_message_analysis(
             let data_text = row.get::<_, String>(2)?;
             let directory = row.get::<_, String>(3)?;
             let session_ts = row.get::<_, i64>(4)?;
-            let Some(date) = ms_to_local_date(session_ts) else {
+            let Some(message) = parse_message_usage(&data_text) else {
+                continue;
+            };
+            let message_ts = message.timestamp.unwrap_or(session_ts);
+            let Some(date) = ms_to_local_date(message_ts) else {
                 continue;
             };
             if is_before_cutoff(&date, &cutoff) {
                 continue;
             }
-            let Some(message) = parse_message_usage(&data_text) else {
-                continue;
-            };
 
             let mut state = SessionParseState::with_mode(mode);
             state.folder_path = directory;
             state.task_id = session_id;
-            state.last_ts = message.timestamp.unwrap_or(session_ts);
+            state.last_ts = message_ts;
 
             messages.insert(
                 message_id,
@@ -433,7 +443,11 @@ fn collect_message_analysis(
                  JOIN session ON session.id = part.session_id \
                  WHERE json_extract(message.data, '$.role') = 'assistant' \
                    AND json_extract(part.data, '$.type') = 'tool' \
-                   AND session.time_updated >= ?1"
+                   AND COALESCE( \
+                       json_extract(message.data, '$.time.completed'), \
+                       json_extract(message.data, '$.time.created'), \
+                       session.time_updated \
+                   ) >= ?1"
             }
             None => {
                 "SELECT part.message_id, part.data \
@@ -1019,6 +1033,8 @@ fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
 mod tests {
     use super::*;
 
+    const DEFAULT_MESSAGE_TS: i64 = 1780757089000;
+
     fn make_db() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("opencode.db");
@@ -1077,9 +1093,58 @@ mod tests {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn assistant_message_at(
+        model: &str,
+        timestamp: i64,
+        input: i64,
+        output: i64,
+        reasoning: i64,
+        cache_read: i64,
+        cache_write: i64,
+        cost: f64,
+    ) -> String {
+        assistant_message_with_provider_at(
+            model,
+            None,
+            timestamp,
+            input,
+            output,
+            reasoning,
+            cache_read,
+            cache_write,
+            cost,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn assistant_message_with_provider(
         model: &str,
         provider: Option<&str>,
+        input: i64,
+        output: i64,
+        reasoning: i64,
+        cache_read: i64,
+        cache_write: i64,
+        cost: f64,
+    ) -> String {
+        assistant_message_with_provider_at(
+            model,
+            provider,
+            DEFAULT_MESSAGE_TS,
+            input,
+            output,
+            reasoning,
+            cache_read,
+            cache_write,
+            cost,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assistant_message_with_provider_at(
+        model: &str,
+        provider: Option<&str>,
+        timestamp: i64,
         input: i64,
         output: i64,
         reasoning: i64,
@@ -1101,8 +1166,8 @@ mod tests {
                 },
             },
             "time": {
-                "created": 1780757088080i64,
-                "completed": 1780757089000i64,
+                "created": timestamp.saturating_sub(1000),
+                "completed": timestamp,
             },
         });
         if let Some(provider) = provider {
@@ -1217,7 +1282,7 @@ mod tests {
 	        .unwrap();
         conn.execute(
             "INSERT INTO message (id, session_id, data) VALUES ('recent-msg', 'recent', ?1)",
-            [assistant_message("m1", 10, 0, 0, 0, 0, 0.01)],
+            [assistant_message_at("m1", now_ms, 10, 0, 0, 0, 0, 0.01)],
         )
         .unwrap();
         conn.execute(
@@ -1227,7 +1292,16 @@ mod tests {
 	        .unwrap();
         conn.execute(
             "INSERT INTO message (id, session_id, data) VALUES ('old-msg', 'old', ?1)",
-            [assistant_message("m1", 10, 0, 0, 0, 0, 0.01)],
+            [assistant_message_at(
+                "m1",
+                1000000000000,
+                10,
+                0,
+                0,
+                0,
+                0,
+                0.01,
+            )],
         )
         .unwrap();
         drop(conn);
@@ -1237,6 +1311,73 @@ mod tests {
 
         let daily = read_opencode_usage(&db_path, TimeRange::Daily).unwrap();
         assert_eq!(daily.len(), 1);
+    }
+
+    #[test]
+    fn test_message_time_range_filters_resumed_sessions() {
+        let (_dir, db_path) = make_db();
+        let conn = Connection::open(&db_path).unwrap();
+        let now_ms = chrono::Local::now().timestamp_millis();
+        conn.execute(
+            "INSERT INTO session (id, model, directory, time_updated, tokens_input) VALUES ('resumed', '{\"id\":\"m1\"}', '/repo', ?1, 10)",
+            rusqlite::params![now_ms],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES ('old-msg', 'resumed', ?1)",
+            [assistant_message_at(
+                "old-model",
+                1000000000000,
+                10,
+                0,
+                0,
+                0,
+                0,
+                0.01,
+            )],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES ('recent-msg', 'resumed', ?1)",
+            [assistant_message_at(
+                "recent-model",
+                now_ms,
+                20,
+                0,
+                0,
+                0,
+                0,
+                0.02,
+            )],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES ('old-part', 'old-msg', 'resumed', ?1)",
+            [r#"{"type":"tool","tool":"read","state":{"status":"completed","input":{"filePath":"/repo/old.py"},"output":"<content>\n1: old\n</content>"}}"#],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES ('recent-part', 'recent-msg', 'resumed', ?1)",
+            [r#"{"type":"tool","tool":"read","state":{"status":"completed","input":{"filePath":"/repo/recent.py"},"output":"<content>\n1: recent\n</content>"}}"#],
+        )
+        .unwrap();
+        drop(conn);
+
+        let usage_rows = read_opencode_usage(&db_path, TimeRange::Daily).unwrap();
+        assert_eq!(usage_rows.len(), 1);
+        assert!(
+            usage_rows[0].1.records[0]
+                .conversation_usage
+                .contains_key("recent-model")
+        );
+
+        let analysis_rows =
+            read_opencode_analysis(&db_path, TimeRange::Daily, ParseMode::UsageOnly).unwrap();
+        assert_eq!(analysis_rows.len(), 1);
+        let record = &analysis_rows[0].1.records[0];
+        assert!(record.conversation_usage.contains_key("recent-model"));
+        assert_eq!(record.tool_call_counts.read, 1);
+        assert_eq!(record.total_read_lines, 1);
     }
 
     #[test]
