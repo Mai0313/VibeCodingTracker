@@ -44,6 +44,7 @@ serde_json = "1.0.149"
 strsim = "0.11.1"
 sysinfo = "0.36.1"
 tar = "0.4.46"
+tempfile = "3.27.0"
 walkdir = "2.5.0"
 zip = "7.2.0"
 
@@ -58,7 +59,6 @@ assert_cmd = "2.2.1"
 criterion = { version = "0.7.0", features = ["html_reports"] }
 predicates = "3.1.4"
 serial_test = "3.4.0"
-tempfile = "3.27.0"
 
 [[bench]]
 name = "benchmarks"

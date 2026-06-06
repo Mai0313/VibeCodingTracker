@@ -982,8 +982,12 @@ fn with_connection<T>(db_path: &Path, f: impl FnOnce(&Connection) -> Result<T>) 
 
 /// A private temp-directory copy of the OpenCode database (plus WAL sidecars),
 /// removed on drop.
+///
+/// The directory comes from [`tempfile::TempDir`], so it has an unguessable
+/// name and owner-only permissions: the copied chat database is never exposed
+/// to other local users.
 struct TempDbCopy {
-    dir: PathBuf,
+    _dir: tempfile::TempDir,
     db_path: PathBuf,
 }
 
@@ -992,16 +996,12 @@ impl TempDbCopy {
         let file_name = src
             .file_name()
             .ok_or_else(|| anyhow!("Invalid OpenCode DB path: {}", src.display()))?;
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let dir =
-            std::env::temp_dir().join(format!("vct-opencode-{}-{}", std::process::id(), nanos));
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("Failed to create temp dir {}", dir.display()))?;
+        let dir = tempfile::Builder::new()
+            .prefix("vct-opencode-")
+            .tempdir()
+            .context("Failed to create temp dir for OpenCode DB copy")?;
 
-        let db_path = dir.join(file_name);
+        let db_path = dir.path().join(file_name);
         std::fs::copy(src, &db_path)
             .with_context(|| format!("Failed to copy OpenCode DB from {}", src.display()))?;
 
@@ -1014,13 +1014,7 @@ impl TempDbCopy {
             }
         }
 
-        Ok(Self { dir, db_path })
-    }
-}
-
-impl Drop for TempDbCopy {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+        Ok(Self { _dir: dir, db_path })
     }
 }
 
