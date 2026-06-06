@@ -16,8 +16,8 @@
 //!
 //! Token columns map onto the Claude-style flat usage shape so the existing
 //! `merge_usage_values` / `extract_token_counts` / LiteLLM cost path works
-//! unchanged. Assistant messages carry their own `modelID`, so sessions that
-//! switch model mid-stream are split before aggregation.
+//! unchanged. Assistant messages carry their own `providerID` + `modelID`, so
+//! sessions that switch model mid-stream are split before aggregation.
 
 use crate::VERSION;
 use crate::cli::TimeRange;
@@ -36,8 +36,8 @@ use std::path::{Path, PathBuf};
 ///
 /// Each returned tuple is `(local YYYY-MM-DD date, CodeAnalysis, stored_cost)`
 /// where the `CodeAnalysis` holds one assistant message's
-/// `conversation_usage`, keyed by that message's model id, and `stored_cost`
-/// is OpenCode's own cost for that message. The date comes from
+/// `conversation_usage`, keyed by that message's provider-qualified model id,
+/// and `stored_cost` is OpenCode's own cost for that message. The date comes from
 /// `session.time_updated` and is filtered by `time_range`, matching the
 /// file-walker semantics.
 ///
@@ -677,21 +677,29 @@ fn session_usage_value(
 
 /// Resolves the model name from the `session.model` column.
 ///
-/// Modern OpenCode stores it as a JSON object `{"id", "providerID", ...}`; we
-/// key everything off `id`. Older builds may store a bare model string, which
-/// is used verbatim. Returns `None` when no usable model name is present.
+/// Modern OpenCode stores it as a JSON object `{"id", "providerID", ...}`. When
+/// `providerID` is present, the returned key is `providerID/id` so same-named
+/// models from different backends do not merge. Older builds may store a bare
+/// model string, which is used verbatim. Returns `None` when no usable model
+/// name is present.
 fn parse_model_id(raw: &str) -> Option<String> {
     let raw = raw.trim();
     if raw.is_empty() {
         return None;
     }
     match serde_json::from_str::<Value>(raw) {
-        Ok(Value::Object(map)) => map
-            .get("id")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
+        Ok(Value::Object(map)) => {
+            let model = map.get("id").and_then(|v| v.as_str())?.trim();
+            if model.is_empty() {
+                return None;
+            }
+            Some(provider_qualified_model_id(
+                map.get("providerID")
+                    .or_else(|| map.get("provider_id"))
+                    .and_then(|v| v.as_str()),
+                model,
+            ))
+        }
         Ok(Value::String(s)) => {
             let s = s.trim();
             (!s.is_empty()).then(|| s.to_string())
@@ -743,17 +751,43 @@ fn parse_message_usage(raw: &str) -> Option<MessageUsage> {
 
 /// Resolves the model from an assistant message payload.
 fn message_model_id(data: &Value) -> Option<String> {
-    data.get("modelID")
+    let model = data
+        .get("modelID")
         .or_else(|| data.get("model_id"))
         .and_then(|v| v.as_str())
         .or_else(|| {
             data.get("model")
                 .and_then(|v| v.get("modelID").or_else(|| v.get("id")))
                 .and_then(|v| v.as_str())
-        })
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+        })?
+        .trim();
+    if model.is_empty() {
+        return None;
+    }
+
+    Some(provider_qualified_model_id(
+        data.get("providerID")
+            .or_else(|| data.get("provider_id"))
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                data.get("model")
+                    .and_then(|v| v.get("providerID").or_else(|| v.get("provider_id")))
+                    .and_then(|v| v.as_str())
+            }),
+        model,
+    ))
+}
+
+/// Keeps OpenCode model keys provider-qualified when the payload has provider metadata.
+fn provider_qualified_model_id(provider: Option<&str>, model: &str) -> String {
+    let Some(provider) = provider.map(str::trim).filter(|s| !s.is_empty()) else {
+        return model.to_string();
+    };
+    if model.starts_with(&format!("{provider}/")) {
+        model.to_string()
+    } else {
+        format!("{provider}/{model}")
+    }
 }
 
 /// Converts a millisecond epoch timestamp into a local `YYYY-MM-DD` date.
@@ -1017,7 +1051,30 @@ mod tests {
         cache_write: i64,
         cost: f64,
     ) -> String {
-        serde_json::json!({
+        assistant_message_with_provider(
+            model,
+            None,
+            input,
+            output,
+            reasoning,
+            cache_read,
+            cache_write,
+            cost,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assistant_message_with_provider(
+        model: &str,
+        provider: Option<&str>,
+        input: i64,
+        output: i64,
+        reasoning: i64,
+        cache_read: i64,
+        cache_write: i64,
+        cost: f64,
+    ) -> String {
+        let mut message = serde_json::json!({
             "role": "assistant",
             "modelID": model,
             "cost": cost,
@@ -1034,15 +1091,18 @@ mod tests {
                 "created": 1780757088080i64,
                 "completed": 1780757089000i64,
             },
-        })
-        .to_string()
+        });
+        if let Some(provider) = provider {
+            message["providerID"] = serde_json::Value::String(provider.to_string());
+        }
+        message.to_string()
     }
 
     #[test]
     fn test_parse_model_id() {
         assert_eq!(
             parse_model_id(r#"{"id":"deepseek-v4-pro","providerID":"deepseek"}"#).as_deref(),
-            Some("deepseek-v4-pro")
+            Some("deepseek/deepseek-v4-pro")
         );
         assert_eq!(
             parse_model_id("gemini-3.5-flash").as_deref(),
@@ -1050,6 +1110,16 @@ mod tests {
         );
         assert_eq!(parse_model_id(r#"{"providerID":"x"}"#), None);
         assert_eq!(parse_model_id("   "), None);
+    }
+
+    #[test]
+    fn test_message_model_id_preserves_provider() {
+        let message = serde_json::json!({
+            "role": "assistant",
+            "modelID": "gpt-4.1",
+            "providerID": "azure",
+        });
+        assert_eq!(message_model_id(&message).as_deref(), Some("azure/gpt-4.1"));
     }
 
     #[test]
@@ -1087,8 +1157,9 @@ mod tests {
 	        .unwrap();
         conn.execute(
             "INSERT INTO message (id, session_id, data) VALUES ('m1', 's1', ?1)",
-            [assistant_message(
+            [assistant_message_with_provider(
                 "deepseek-v4-pro",
+                Some("deepseek"),
                 100,
                 50,
                 7,
@@ -1105,7 +1176,7 @@ mod tests {
         let (_date, analysis, cost) = &rows[0];
         assert_eq!(analysis.extension_name, "OpenCode");
         assert!((cost - 0.0375).abs() < 1e-9);
-        let usage = &analysis.records[0].conversation_usage["deepseek-v4-pro"];
+        let usage = &analysis.records[0].conversation_usage["deepseek/deepseek-v4-pro"];
         assert_eq!(usage["input_tokens"], 100);
         assert_eq!(usage["output_tokens"], 50);
         assert_eq!(usage["reasoning_output_tokens"], 7);
