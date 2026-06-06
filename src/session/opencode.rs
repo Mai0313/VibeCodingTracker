@@ -8,16 +8,16 @@
 //!
 //! Two entry points keep the work proportional to what each command needs:
 //!
-//! - [`read_opencode_usage`] reads only the `session` table (model, tokens,
-//!   timestamps). It is enough for the per-model token / cost view.
+//! - [`read_opencode_usage`] reads assistant messages for per-model tokens and
+//!   cost, with an older `session`-table fallback.
 //! - [`read_opencode_analysis`] additionally folds the `part` table's tool
-//!   calls (`read`, `edit`, `write`, `bash`, `todowrite`) into per-session
-//!   file-operation metrics.
+//!   calls (`read`, `edit`, `write`, `bash`, `todowrite`, `patch`) into
+//!   per-message file-operation metrics.
 //!
 //! Token columns map onto the Claude-style flat usage shape so the existing
 //! `merge_usage_values` / `extract_token_counts` / LiteLLM cost path works
-//! unchanged. Sessions are single-model in practice, so each session's totals
-//! are attributed to `session.model.id`.
+//! unchanged. Assistant messages carry their own `modelID`, so sessions that
+//! switch model mid-stream are split before aggregation.
 
 use crate::VERSION;
 use crate::cli::TimeRange;
@@ -35,9 +35,9 @@ use std::path::{Path, PathBuf};
 /// Reads per-session token usage from the OpenCode database.
 ///
 /// Each returned tuple is `(local YYYY-MM-DD date, CodeAnalysis, stored_cost)`
-/// where the `CodeAnalysis` holds exactly one record whose `conversation_usage`
-/// is keyed by the session's model id, and `stored_cost` is OpenCode's own
-/// `session.cost` (USD) for that session. The date comes from
+/// where the `CodeAnalysis` holds one assistant message's
+/// `conversation_usage`, keyed by that message's model id, and `stored_cost`
+/// is OpenCode's own cost for that message. The date comes from
 /// `session.time_updated` and is filtered by `time_range`, matching the
 /// file-walker semantics.
 ///
@@ -70,16 +70,36 @@ pub fn read_opencode_analysis(
     with_connection(db_path, |conn| collect_analysis(conn, time_range, mode))
 }
 
-/// Per-session accumulator used while folding tool parts.
-struct SessionAccum {
+/// Parsed usage for one OpenCode assistant message.
+struct MessageUsage {
+    model_id: String,
+    usage: Value,
+    cost: f64,
+    timestamp: Option<i64>,
+}
+
+/// Per-record accumulator used while folding tool parts.
+struct AnalysisAccum {
     model_id: String,
     date: String,
     usage: Value,
     state: SessionParseState,
 }
 
-/// Collects the `usage` view from the `session` table only.
+/// Collects the `usage` view from assistant messages when available.
 fn collect_usage(
+    conn: &Connection,
+    time_range: TimeRange,
+) -> Result<Vec<(String, CodeAnalysis, f64)>> {
+    if table_exists(conn, "message")? {
+        return collect_message_usage(conn, time_range);
+    }
+
+    collect_session_usage(conn, time_range)
+}
+
+/// Collects the `usage` view from the legacy `session` columns.
+fn collect_session_usage(
     conn: &Connection,
     time_range: TimeRange,
 ) -> Result<Vec<(String, CodeAnalysis, f64)>> {
@@ -134,8 +154,81 @@ fn collect_usage(
     Ok(out)
 }
 
-/// Collects the `analysis` view from `session` + `part`.
+/// Collects the `usage` view from assistant messages.
+fn collect_message_usage(
+    conn: &Connection,
+    time_range: TimeRange,
+) -> Result<Vec<(String, CodeAnalysis, f64)>> {
+    let user = get_current_user();
+    let machine = get_machine_id().to_string();
+    let cutoff = cutoff_string(time_range);
+    let cutoff_ms = cutoff_millis(time_range);
+
+    let sql = match cutoff_ms {
+        Some(_) => {
+            "SELECT session.time_updated, message.data \
+             FROM message \
+             JOIN session ON session.id = message.session_id \
+             WHERE json_extract(message.data, '$.role') = 'assistant' \
+               AND session.time_updated >= ?1"
+        }
+        None => {
+            "SELECT session.time_updated, message.data \
+             FROM message \
+             JOIN session ON session.id = message.session_id \
+             WHERE json_extract(message.data, '$.role') = 'assistant'"
+        }
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows = match cutoff_ms {
+        Some(cutoff_ms) => stmt.query([cutoff_ms])?,
+        None => stmt.query([])?,
+    };
+
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let session_ts = row.get::<_, i64>(0)?;
+        let data_text = row.get::<_, String>(1)?;
+        let Some(date) = ms_to_local_date(session_ts) else {
+            continue;
+        };
+        if is_before_cutoff(&date, &cutoff) {
+            continue;
+        }
+        let Some(message) = parse_message_usage(&data_text) else {
+            continue;
+        };
+
+        let mut map = FastHashMap::default();
+        map.insert(message.model_id, message.usage);
+
+        let mut state = SessionParseState::with_mode(ParseMode::UsageOnly);
+        state.last_ts = message.timestamp.unwrap_or(session_ts);
+        out.push((
+            date,
+            wrap_record(state.into_record(map), &user, &machine),
+            message.cost,
+        ));
+    }
+
+    Ok(out)
+}
+
+/// Collects the `analysis` view from assistant messages + parts when available.
 fn collect_analysis(
+    conn: &Connection,
+    time_range: TimeRange,
+    mode: ParseMode,
+) -> Result<Vec<(String, CodeAnalysis)>> {
+    if table_exists(conn, "message")? {
+        return collect_message_analysis(conn, time_range, mode);
+    }
+
+    collect_session_analysis(conn, time_range, mode)
+}
+
+/// Collects the legacy `analysis` view from `session` + `part`.
+fn collect_session_analysis(
     conn: &Connection,
     time_range: TimeRange,
     mode: ParseMode,
@@ -146,7 +239,7 @@ fn collect_analysis(
     let cutoff_ms = cutoff_millis(time_range);
 
     // 1. Load session metadata and seed one parse state per session.
-    let mut sessions: HashMap<String, SessionAccum> = HashMap::new();
+    let mut sessions: HashMap<String, AnalysisAccum> = HashMap::new();
     {
         let sql = match cutoff_ms {
             Some(_) => {
@@ -192,7 +285,7 @@ fn collect_analysis(
 
             sessions.insert(
                 id,
-                SessionAccum {
+                AnalysisAccum {
                     model_id,
                     date,
                     usage,
@@ -247,6 +340,130 @@ fn collect_analysis(
     // 3. Convert each session into a CodeAnalysis, honouring the time filter.
     let mut out = Vec::with_capacity(sessions.len());
     for (_id, accum) in sessions {
+        if is_before_cutoff(&accum.date, &cutoff) {
+            continue;
+        }
+        let mut usage_map = FastHashMap::default();
+        usage_map.insert(accum.model_id, accum.usage);
+        let record = accum.state.into_record(usage_map);
+        out.push((accum.date, wrap_record(record, &user, &machine)));
+    }
+
+    Ok(out)
+}
+
+/// Collects the `analysis` view from assistant messages and their parts.
+fn collect_message_analysis(
+    conn: &Connection,
+    time_range: TimeRange,
+    mode: ParseMode,
+) -> Result<Vec<(String, CodeAnalysis)>> {
+    let user = get_current_user();
+    let machine = get_machine_id().to_string();
+    let cutoff = cutoff_string(time_range);
+    let cutoff_ms = cutoff_millis(time_range);
+
+    let mut messages: HashMap<String, AnalysisAccum> = HashMap::new();
+    {
+        let sql = match cutoff_ms {
+            Some(_) => {
+                "SELECT message.id, message.session_id, message.data, session.directory, session.time_updated \
+                 FROM message \
+                 JOIN session ON session.id = message.session_id \
+                 WHERE json_extract(message.data, '$.role') = 'assistant' \
+                   AND session.time_updated >= ?1"
+            }
+            None => {
+                "SELECT message.id, message.session_id, message.data, session.directory, session.time_updated \
+                 FROM message \
+                 JOIN session ON session.id = message.session_id \
+                 WHERE json_extract(message.data, '$.role') = 'assistant'"
+            }
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = match cutoff_ms {
+            Some(cutoff_ms) => stmt.query([cutoff_ms])?,
+            None => stmt.query([])?,
+        };
+
+        while let Some(row) = rows.next()? {
+            let message_id = row.get::<_, String>(0)?;
+            let session_id = row.get::<_, String>(1)?;
+            let data_text = row.get::<_, String>(2)?;
+            let directory = row.get::<_, String>(3)?;
+            let session_ts = row.get::<_, i64>(4)?;
+            let Some(date) = ms_to_local_date(session_ts) else {
+                continue;
+            };
+            if is_before_cutoff(&date, &cutoff) {
+                continue;
+            }
+            let Some(message) = parse_message_usage(&data_text) else {
+                continue;
+            };
+
+            let mut state = SessionParseState::with_mode(mode);
+            state.folder_path = directory;
+            state.task_id = session_id;
+            state.last_ts = message.timestamp.unwrap_or(session_ts);
+
+            messages.insert(
+                message_id,
+                AnalysisAccum {
+                    model_id: message.model_id,
+                    date,
+                    usage: message.usage,
+                    state,
+                },
+            );
+        }
+    }
+
+    {
+        let sql = match cutoff_ms {
+            Some(_) => {
+                "SELECT part.message_id, part.data, part.time_updated \
+                 FROM part \
+                 JOIN message ON message.id = part.message_id \
+                 JOIN session ON session.id = part.session_id \
+                 WHERE json_extract(message.data, '$.role') = 'assistant' \
+                   AND json_extract(part.data, '$.type') IN ('tool', 'patch') \
+                   AND session.time_updated >= ?1"
+            }
+            None => {
+                "SELECT part.message_id, part.data, part.time_updated \
+                 FROM part \
+                 JOIN message ON message.id = part.message_id \
+                 WHERE json_extract(message.data, '$.role') = 'assistant' \
+                   AND json_extract(part.data, '$.type') IN ('tool', 'patch')"
+            }
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = match cutoff_ms {
+            Some(cutoff_ms) => stmt.query([cutoff_ms])?,
+            None => stmt.query([])?,
+        };
+
+        while let Some(row) = rows.next()? {
+            let message_id = row.get::<_, String>(0)?;
+            let data_text = row.get::<_, String>(1)?;
+            let part_ts = row.get::<_, i64>(2)?;
+            let Some(accum) = messages.get_mut(&message_id) else {
+                continue;
+            };
+            let Ok(data) = serde_json::from_str::<Value>(&data_text) else {
+                continue;
+            };
+            match data.get("type").and_then(|v| v.as_str()) {
+                Some("tool") => apply_tool_part(&mut accum.state, &data),
+                Some("patch") => apply_patch_part(&mut accum.state, &data, part_ts),
+                _ => {}
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(messages.len());
+    for (_id, accum) in messages {
         if is_before_cutoff(&accum.date, &cutoff) {
             continue;
         }
@@ -377,6 +594,61 @@ fn parse_model_id(raw: &str) -> Option<String> {
     }
 }
 
+/// Parses one assistant `message.data` payload into usage and cost.
+fn parse_message_usage(raw: &str) -> Option<MessageUsage> {
+    let data = serde_json::from_str::<Value>(raw).ok()?;
+    if data.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+        return None;
+    }
+
+    let model_id = message_model_id(&data)?;
+    let tokens = data.get("tokens")?;
+    let cache = tokens.get("cache");
+    let usage = session_usage_value(
+        tokens.get("input").and_then(|v| v.as_i64()).unwrap_or(0),
+        tokens.get("output").and_then(|v| v.as_i64()).unwrap_or(0),
+        tokens
+            .get("reasoning")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0),
+        cache
+            .and_then(|v| v.get("read"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0),
+        cache
+            .and_then(|v| v.get("write"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0),
+    );
+    let cost = data.get("cost").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let timestamp = data
+        .get("time")
+        .and_then(|v| v.get("completed").or_else(|| v.get("created")))
+        .and_then(|v| v.as_i64());
+
+    Some(MessageUsage {
+        model_id,
+        usage,
+        cost,
+        timestamp,
+    })
+}
+
+/// Resolves the model from an assistant message payload.
+fn message_model_id(data: &Value) -> Option<String> {
+    data.get("modelID")
+        .or_else(|| data.get("model_id"))
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            data.get("model")
+                .and_then(|v| v.get("modelID").or_else(|| v.get("id")))
+                .and_then(|v| v.as_str())
+        })
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// Converts a millisecond epoch timestamp into a local `YYYY-MM-DD` date.
 fn ms_to_local_date(ms: i64) -> Option<String> {
     chrono::DateTime::from_timestamp_millis(ms).map(|dt| {
@@ -408,6 +680,16 @@ fn cutoff_millis(time_range: TimeRange) -> Option<i64> {
 /// Returns `true` when `date` is strictly before the cutoff (should be skipped).
 fn is_before_cutoff(date: &str, cutoff: &Option<String>) -> bool {
     matches!(cutoff, Some(c) if date < c.as_str())
+}
+
+/// Returns whether a table exists in the OpenCode database.
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
 }
 
 /// Extracts the file body from an OpenCode `read` tool output.
@@ -557,19 +839,57 @@ mod tests {
                  cost REAL NOT NULL DEFAULT 0,
                  tokens_input INTEGER NOT NULL DEFAULT 0,
                  tokens_output INTEGER NOT NULL DEFAULT 0,
-                 tokens_reasoning INTEGER NOT NULL DEFAULT 0,
-                 tokens_cache_read INTEGER NOT NULL DEFAULT 0,
-                 tokens_cache_write INTEGER NOT NULL DEFAULT 0
-             );
-	             CREATE TABLE part (
+	                 tokens_reasoning INTEGER NOT NULL DEFAULT 0,
+	                 tokens_cache_read INTEGER NOT NULL DEFAULT 0,
+	                 tokens_cache_write INTEGER NOT NULL DEFAULT 0
+	             );
+	             CREATE TABLE message (
 	                 id TEXT PRIMARY KEY,
 	                 session_id TEXT NOT NULL,
+	                 time_created INTEGER NOT NULL DEFAULT 0,
 	                 time_updated INTEGER NOT NULL DEFAULT 0,
 	                 data TEXT NOT NULL
-	             );",
+	             );
+		             CREATE TABLE part (
+		                 id TEXT PRIMARY KEY,
+		                 message_id TEXT NOT NULL DEFAULT '',
+		                 session_id TEXT NOT NULL,
+		                 time_updated INTEGER NOT NULL DEFAULT 0,
+		                 data TEXT NOT NULL
+		             );",
         )
         .unwrap();
         (dir, db_path)
+    }
+
+    fn assistant_message(
+        model: &str,
+        input: i64,
+        output: i64,
+        reasoning: i64,
+        cache_read: i64,
+        cache_write: i64,
+        cost: f64,
+    ) -> String {
+        serde_json::json!({
+            "role": "assistant",
+            "modelID": model,
+            "cost": cost,
+            "tokens": {
+                "input": input,
+                "output": output,
+                "reasoning": reasoning,
+                "cache": {
+                    "read": cache_read,
+                    "write": cache_write,
+                },
+            },
+            "time": {
+                "created": 1780757088080i64,
+                "completed": 1780757089000i64,
+            },
+        })
+        .to_string()
     }
 
     #[test]
@@ -608,9 +928,22 @@ mod tests {
         let (_dir, db_path) = make_db();
         let conn = Connection::open(&db_path).unwrap();
         conn.execute(
-            "INSERT INTO session (id, model, directory, time_updated, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write)
-             VALUES ('s1', '{\"id\":\"deepseek-v4-pro\"}', '/repo', 1780757088080, 0.0375, 100, 50, 7, 200, 25)",
-            [],
+	            "INSERT INTO session (id, model, directory, time_updated, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write)
+	             VALUES ('s1', '{\"id\":\"deepseek-v4-pro\"}', '/repo', 1780757088080, 0.0375, 100, 50, 7, 200, 25)",
+	            [],
+	        )
+	        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES ('m1', 's1', ?1)",
+            [assistant_message(
+                "deepseek-v4-pro",
+                100,
+                50,
+                7,
+                200,
+                25,
+                0.0375,
+            )],
         )
         .unwrap();
         drop(conn);
@@ -635,13 +968,23 @@ mod tests {
         let now_ms = chrono::Local::now().timestamp_millis();
         // One session today, one well in the past.
         conn.execute(
-            "INSERT INTO session (id, model, directory, time_updated, tokens_input) VALUES ('recent', '{\"id\":\"m1\"}', '/repo', ?1, 10)",
-            rusqlite::params![now_ms],
+	            "INSERT INTO session (id, model, directory, time_updated, tokens_input) VALUES ('recent', '{\"id\":\"m1\"}', '/repo', ?1, 10)",
+	            rusqlite::params![now_ms],
+	        )
+	        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES ('recent-msg', 'recent', ?1)",
+            [assistant_message("m1", 10, 0, 0, 0, 0, 0.01)],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO session (id, model, directory, time_updated, tokens_input) VALUES ('old', '{\"id\":\"m1\"}', '/repo', 1000000000000, 10)",
-            [],
+	            "INSERT INTO session (id, model, directory, time_updated, tokens_input) VALUES ('old', '{\"id\":\"m1\"}', '/repo', 1000000000000, 10)",
+	            [],
+	        )
+	        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES ('old-msg', 'old', ?1)",
+            [assistant_message("m1", 10, 0, 0, 0, 0, 0.01)],
         )
         .unwrap();
         drop(conn);
@@ -654,12 +997,81 @@ mod tests {
     }
 
     #[test]
+    fn test_messages_split_usage_and_analysis_by_model() {
+        let (_dir, db_path) = make_db();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+	            "INSERT INTO session (id, model, directory, time_updated) VALUES ('s1', '{\"id\":\"m2\"}', '/repo', 1780757088080)",
+	            [],
+	        )
+	        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES ('m1', 's1', ?1)",
+            [assistant_message("m1", 10, 2, 0, 3, 4, 0.01)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES ('m2', 's1', ?1)",
+            [assistant_message("m2", 20, 4, 1, 6, 8, 0.02)],
+        )
+        .unwrap();
+        conn.execute(
+	            "INSERT INTO part (id, message_id, session_id, data) VALUES ('p1', 'm1', 's1', ?1)",
+	            [r#"{"type":"tool","tool":"read","state":{"status":"completed","input":{"filePath":"/repo/a.py"},"output":"<content>\n1: one\n</content>"}}"#],
+	        )
+	        .unwrap();
+        conn.execute(
+	            "INSERT INTO part (id, message_id, session_id, data) VALUES ('p2', 'm2', 's1', ?1)",
+	            [r#"{"type":"tool","tool":"edit","state":{"status":"completed","input":{"filePath":"/repo/b.py","oldString":"old","newString":"new\nline"}}}"#],
+	        )
+	        .unwrap();
+        drop(conn);
+
+        let usage_rows = read_opencode_usage(&db_path, TimeRange::All).unwrap();
+        assert_eq!(usage_rows.len(), 2);
+        let mut usage_by_model: HashMap<String, (i64, f64)> = HashMap::new();
+        for (_date, analysis, cost) in usage_rows {
+            let (model, usage) = analysis.records[0]
+                .conversation_usage
+                .iter()
+                .next()
+                .unwrap();
+            usage_by_model.insert(
+                model.clone(),
+                (usage["input_tokens"].as_i64().unwrap(), cost),
+            );
+        }
+        assert_eq!(usage_by_model["m1"], (10, 0.01));
+        assert_eq!(usage_by_model["m2"], (20, 0.02));
+
+        let analysis_rows =
+            read_opencode_analysis(&db_path, TimeRange::All, ParseMode::UsageOnly).unwrap();
+        assert_eq!(analysis_rows.len(), 2);
+        let mut counts_by_model: HashMap<String, (usize, usize)> = HashMap::new();
+        for (_date, analysis) in analysis_rows {
+            let record = &analysis.records[0];
+            let model = record.conversation_usage.keys().next().unwrap().clone();
+            counts_by_model.insert(
+                model,
+                (record.tool_call_counts.read, record.tool_call_counts.edit),
+            );
+        }
+        assert_eq!(counts_by_model["m1"], (1, 0));
+        assert_eq!(counts_by_model["m2"], (0, 1));
+    }
+
+    #[test]
     fn test_read_analysis_counts_tools() {
         let (_dir, db_path) = make_db();
         let conn = Connection::open(&db_path).unwrap();
         conn.execute(
-            "INSERT INTO session (id, model, directory, time_updated) VALUES ('s1', '{\"id\":\"m1\"}', '/repo', 1780757088080)",
-            [],
+	            "INSERT INTO session (id, model, directory, time_updated) VALUES ('s1', '{\"id\":\"m1\"}', '/repo', 1780757088080)",
+	            [],
+	        )
+	        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES ('m1', 's1', ?1)",
+            [assistant_message("m1", 1, 1, 0, 0, 0, 0.01)],
         )
         .unwrap();
         let parts = [
@@ -673,7 +1085,7 @@ mod tests {
         ];
         for (i, p) in parts.iter().enumerate() {
             conn.execute(
-                "INSERT INTO part (id, session_id, data) VALUES (?1, 's1', ?2)",
+                "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, 'm1', 's1', ?2)",
                 rusqlite::params![format!("p{i}"), p],
             )
             .unwrap();
@@ -698,14 +1110,19 @@ mod tests {
         let (_dir, db_path) = make_db();
         let conn = Connection::open(&db_path).unwrap();
         conn.execute(
-            "INSERT INTO session (id, model, directory, time_updated) VALUES ('s1', '{\"id\":\"m1\"}', '/repo', 1780757088080)",
-            [],
+	            "INSERT INTO session (id, model, directory, time_updated) VALUES ('s1', '{\"id\":\"m1\"}', '/repo', 1780757088080)",
+	            [],
+	        )
+	        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES ('m1', 's1', ?1)",
+            [assistant_message("m1", 1, 1, 0, 0, 0, 0.01)],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO part (id, session_id, time_updated, data) VALUES ('p1', 's1', 1780757089000, ?1)",
-            [r#"{"type":"patch","files":["/repo/a.py","/repo/b.py"]}"#],
-        )
+	            "INSERT INTO part (id, message_id, session_id, time_updated, data) VALUES ('p1', 'm1', 's1', 1780757089000, ?1)",
+	            [r#"{"type":"patch","files":["/repo/a.py","/repo/b.py"]}"#],
+	        )
         .unwrap();
         drop(conn);
 

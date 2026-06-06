@@ -73,9 +73,9 @@ Four parser entry points live in `src/session/parser.rs`:
 
 `classify_records()` is the streaming-friendly variant that returns `None` on indeterminate records and lets callers keep peeking until a marker arrives — there is **no fixed peek window**, which is critical because a Claude metadata preamble (`permission-mode`, `file-history-snapshot`, …) can be arbitrarily long.
 
-OpenCode does **not** flow through the detector or `parse_session_file_*`: it lives in a single SQLite database, so `src/session/opencode.rs` reads it directly (`read_opencode_usage` from the `session` table, `read_opencode_analysis` from `session` + `part`) and produces the same `CodeAnalysis` shape, which the `usage` / `analysis` aggregators fold in alongside the file-based providers. The DB is opened read-only (with a temp-copy fallback) so the user's database is never mutated.
+OpenCode does **not** flow through the detector or `parse_session_file_*`: it lives in a single SQLite database, so `src/session/opencode.rs` reads it directly (`read_opencode_usage` from assistant messages with a legacy `session` fallback, `read_opencode_analysis` from `message` + `part`) and produces the same `CodeAnalysis` shape, which the `usage` / `analysis` aggregators fold in alongside the file-based providers. The DB is opened read-only (with a temp-copy fallback) so the user's database is never mutated.
 
-OpenCode cost is a special case: `usage::resolve_model_cost` prices an OpenCode model from tokens only on an **exact** LiteLLM match (`ModelPricingMap::get_exact`); with no exact match it uses the stored `session.cost` carried in `UsageData::opencode_costs` rather than the normalized/substring/fuzzy fallback the other providers use. This keeps a novel model like `deepseek-v4-pro` from being mis-priced against a loosely-similar name.
+OpenCode cost is a special case: `usage::resolve_model_cost` prices an OpenCode model from tokens only on an **exact** LiteLLM match (`ModelPricingMap::get_exact`); with no exact match it uses the stored assistant-message cost carried in `UsageData::opencode_costs` rather than the normalized/substring/fuzzy fallback the other providers use. This keeps a novel model like `deepseek-v4-pro` from being mis-priced against a loosely-similar name.
 
 ### `ParseMode`
 

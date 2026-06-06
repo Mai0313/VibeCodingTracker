@@ -62,11 +62,12 @@ pub struct UsageData {
     /// Count of distinct calendar dates that contributed usage, per provider
     /// and overall.
     pub provider_days: ProviderActiveDays,
-    /// OpenCode's own per-model cost (USD), summed from `session.cost`.
+    /// OpenCode's own per-model cost (USD), summed from assistant messages.
     ///
-    /// OpenCode records an authoritative cost per session, so when a model has
-    /// no exact LiteLLM price we display this stored cost instead of guessing
-    /// from a fuzzy match. Keyed by model name; only OpenCode models appear.
+    /// OpenCode records authoritative assistant-message costs, so when a model
+    /// has no exact LiteLLM price we display this stored cost instead of
+    /// guessing from a fuzzy match. Keyed by model name; only OpenCode models
+    /// appear.
     pub opencode_costs: FastHashMap<String, f64>,
 }
 
@@ -337,8 +338,6 @@ fn process_opencode_usage(
         unique_dates.insert(date);
 
         let conversation_usage = extract_conversation_usage_from_analysis(&analysis);
-        // An OpenCode session is single-model, so the whole `session.cost`
-        // belongs to that one model.
         for (model, usage_value) in conversation_usage {
             *opencode_costs.entry(model.clone()).or_insert(0.0) += session_cost;
 
