@@ -336,9 +336,8 @@ fn collect_session_analysis(
             let Ok(data) = serde_json::from_str::<Value>(&data_text) else {
                 continue;
             };
-            match data.get("type").and_then(|v| v.as_str()) {
-                Some("tool") => apply_tool_part(&mut accum.state, &data),
-                _ => {}
+            if let Some("tool") = data.get("type").and_then(|v| v.as_str()) {
+                apply_tool_part(&mut accum.state, &data)
             }
         }
     }
@@ -459,9 +458,8 @@ fn collect_message_analysis(
             let Ok(data) = serde_json::from_str::<Value>(&data_text) else {
                 continue;
             };
-            match data.get("type").and_then(|v| v.as_str()) {
-                Some("tool") => apply_tool_part(&mut accum.state, &data),
-                _ => {}
+            if let Some("tool") = data.get("type").and_then(|v| v.as_str()) {
+                apply_tool_part(&mut accum.state, &data)
             }
         }
     }

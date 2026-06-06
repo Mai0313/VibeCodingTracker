@@ -190,20 +190,20 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
 
     // OpenCode lives in a single SQLite database rather than a session
     // directory, so it is read directly instead of walked.
-    if paths.opencode_db.exists() {
-        if let Err(err) = process_opencode_usage(
+    if paths.opencode_db.exists()
+        && let Err(err) = process_opencode_usage(
             &paths.opencode_db,
             &mut result,
             &mut per_provider.opencode,
             &mut opencode_costs,
             &mut opencode_dates,
             time_range,
-        ) {
-            eprintln!(
-                "Warning: Failed to read OpenCode DB {}: {err}",
-                paths.opencode_db.display()
-            );
-        }
+        )
+    {
+        eprintln!(
+            "Warning: Failed to read OpenCode DB {}: {err}",
+            paths.opencode_db.display()
+        );
     }
 
     let mut all_dates: HashSet<&String> = HashSet::new();

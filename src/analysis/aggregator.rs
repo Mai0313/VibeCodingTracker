@@ -190,19 +190,19 @@ pub fn aggregate_sessions_by_model(time_range: TimeRange) -> Result<AnalysisData
 
     // OpenCode lives in a single SQLite database rather than a session
     // directory, so it is read directly instead of walked.
-    if paths.opencode_db.exists() {
-        if let Err(err) = aggregate_opencode_sessions(
+    if paths.opencode_db.exists()
+        && let Err(err) = aggregate_opencode_sessions(
             &paths.opencode_db,
             &mut aggregated,
             &mut opencode_aggregated,
             &mut opencode_dates,
             time_range,
-        ) {
-            eprintln!(
-                "Warning: Failed to read OpenCode DB {}: {err}",
-                paths.opencode_db.display()
-            );
-        }
+        )
+    {
+        eprintln!(
+            "Warning: Failed to read OpenCode DB {}: {err}",
+            paths.opencode_db.display()
+        );
     }
 
     let mut all_dates: HashSet<&String> = HashSet::new();
