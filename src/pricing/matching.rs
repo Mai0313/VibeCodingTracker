@@ -223,6 +223,18 @@ impl ModelPricingMap {
         result
     }
 
+    /// Returns the pricing for an **exact** model-name match only.
+    ///
+    /// Unlike [`get`](Self::get), this performs no normalization, substring, or
+    /// fuzzy matching: it returns `Some` only when `model_name` is a verbatim
+    /// key in the pricing table, and `None` otherwise. This is the lookup used
+    /// for providers (OpenCode) that carry their own authoritative cost and
+    /// should fall back to that stored cost rather than guess a price from a
+    /// loosely-similar model name.
+    pub fn get_exact(&self, model_name: &str) -> Option<ModelPricing> {
+        self.raw.get(model_name).cloned()
+    }
+
     /// Returns whether the pricing map contains no models.
     pub fn is_empty(&self) -> bool {
         self.raw.is_empty()
@@ -406,6 +418,20 @@ mod tests {
         // This might or might not match depending on Jaro-Winkler score
         // Just verify it returns a result
         assert!(result.pricing.input_cost_per_token >= 0.0);
+    }
+
+    #[test]
+    fn test_get_exact_only_matches_verbatim() {
+        // get_exact must NOT normalize, substring, or fuzzy match.
+        let mut raw = HashMap::new();
+        raw.insert("gpt-4".to_string(), create_test_pricing());
+        let map = ModelPricingMap::new(raw);
+
+        assert!(map.get_exact("gpt-4").is_some());
+        // These all resolve via get() (substring/fuzzy) but must miss get_exact.
+        assert!(map.get_exact("gpt-4-turbo").is_none());
+        assert!(map.get_exact("deepseek-v4-pro").is_none());
+        assert!(map.get_exact("GPT-4").is_none());
     }
 
     #[test]

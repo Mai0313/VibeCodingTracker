@@ -34,10 +34,12 @@ use std::path::{Path, PathBuf};
 
 /// Reads per-session token usage from the OpenCode database.
 ///
-/// Each returned pair is `(local YYYY-MM-DD date, CodeAnalysis)` where the
-/// `CodeAnalysis` holds exactly one record whose `conversation_usage` is keyed
-/// by the session's model id. The date comes from `session.time_updated` and is
-/// filtered by `time_range`, matching the file-walker semantics.
+/// Each returned tuple is `(local YYYY-MM-DD date, CodeAnalysis, stored_cost)`
+/// where the `CodeAnalysis` holds exactly one record whose `conversation_usage`
+/// is keyed by the session's model id, and `stored_cost` is OpenCode's own
+/// `session.cost` (USD) for that session. The date comes from
+/// `session.time_updated` and is filtered by `time_range`, matching the
+/// file-walker semantics.
 ///
 /// # Errors
 ///
@@ -45,7 +47,7 @@ use std::path::{Path, PathBuf};
 pub fn read_opencode_usage(
     db_path: &Path,
     time_range: TimeRange,
-) -> Result<Vec<(String, CodeAnalysis)>> {
+) -> Result<Vec<(String, CodeAnalysis, f64)>> {
     with_connection(db_path, |conn| collect_usage(conn, time_range))
 }
 
@@ -77,14 +79,17 @@ struct SessionAccum {
 }
 
 /// Collects the `usage` view from the `session` table only.
-fn collect_usage(conn: &Connection, time_range: TimeRange) -> Result<Vec<(String, CodeAnalysis)>> {
+fn collect_usage(
+    conn: &Connection,
+    time_range: TimeRange,
+) -> Result<Vec<(String, CodeAnalysis, f64)>> {
     let user = get_current_user();
     let machine = get_machine_id().to_string();
     let cutoff = cutoff_string(time_range);
 
     let mut stmt = conn.prepare(
         "SELECT model, tokens_input, tokens_output, tokens_reasoning, \
-                tokens_cache_read, tokens_cache_write, time_updated \
+                tokens_cache_read, tokens_cache_write, time_updated, cost \
          FROM session WHERE model IS NOT NULL AND model != ''",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -96,12 +101,13 @@ fn collect_usage(conn: &Connection, time_range: TimeRange) -> Result<Vec<(String
             row.get::<_, i64>(4)?,
             row.get::<_, i64>(5)?,
             row.get::<_, i64>(6)?,
+            row.get::<_, f64>(7)?,
         ))
     })?;
 
     let mut out = Vec::new();
     for row in rows {
-        let (model, input, output, reasoning, cache_read, cache_write, time_updated) = row?;
+        let (model, input, output, reasoning, cache_read, cache_write, time_updated, cost) = row?;
         let Some(model_id) = parse_model_id(&model) else {
             continue;
         };
@@ -118,7 +124,11 @@ fn collect_usage(conn: &Connection, time_range: TimeRange) -> Result<Vec<(String
 
         let mut state = SessionParseState::with_mode(ParseMode::UsageOnly);
         state.last_ts = time_updated;
-        out.push((date, wrap_record(state.into_record(map), &user, &machine)));
+        out.push((
+            date,
+            wrap_record(state.into_record(map), &user, &machine),
+            cost,
+        ));
     }
 
     Ok(out)
@@ -488,6 +498,7 @@ mod tests {
                  model TEXT,
                  directory TEXT,
                  time_updated INTEGER NOT NULL,
+                 cost REAL NOT NULL DEFAULT 0,
                  tokens_input INTEGER NOT NULL DEFAULT 0,
                  tokens_output INTEGER NOT NULL DEFAULT 0,
                  tokens_reasoning INTEGER NOT NULL DEFAULT 0,
@@ -540,8 +551,8 @@ mod tests {
         let (_dir, db_path) = make_db();
         let conn = Connection::open(&db_path).unwrap();
         conn.execute(
-            "INSERT INTO session (id, model, directory, time_updated, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write)
-             VALUES ('s1', '{\"id\":\"deepseek-v4-pro\"}', '/repo', 1780757088080, 100, 50, 7, 200, 25)",
+            "INSERT INTO session (id, model, directory, time_updated, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write)
+             VALUES ('s1', '{\"id\":\"deepseek-v4-pro\"}', '/repo', 1780757088080, 0.0375, 100, 50, 7, 200, 25)",
             [],
         )
         .unwrap();
@@ -549,8 +560,9 @@ mod tests {
 
         let rows = read_opencode_usage(&db_path, TimeRange::All).unwrap();
         assert_eq!(rows.len(), 1);
-        let (_date, analysis) = &rows[0];
+        let (_date, analysis, cost) = &rows[0];
         assert_eq!(analysis.extension_name, "OpenCode");
+        assert!((cost - 0.0375).abs() < 1e-9);
         let usage = &analysis.records[0].conversation_usage["deepseek-v4-pro"];
         assert_eq!(usage["input_tokens"], 100);
         assert_eq!(usage["output_tokens"], 50);

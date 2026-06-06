@@ -131,6 +131,7 @@ pub fn calculate_provider_totals_from_per_provider(
     per_provider: &PerProviderUsage,
     provider_days: &ProviderActiveDays,
     pricing_map: &crate::pricing::ModelPricingMap,
+    opencode_costs: &crate::constants::FastHashMap<String, f64>,
 ) -> UsageProviderTotals {
     let mut totals = UsageProviderTotals::default();
 
@@ -141,11 +142,21 @@ pub fn calculate_provider_totals_from_per_provider(
     totals.opencode.days_count = provider_days.opencode;
     totals.overall.days_count = provider_days.total;
 
-    accumulate_provider(&mut totals.claude, &per_provider.claude, pricing_map);
-    accumulate_provider(&mut totals.codex, &per_provider.codex, pricing_map);
-    accumulate_provider(&mut totals.copilot, &per_provider.copilot, pricing_map);
-    accumulate_provider(&mut totals.gemini, &per_provider.gemini, pricing_map);
-    accumulate_provider(&mut totals.opencode, &per_provider.opencode, pricing_map);
+    accumulate_provider(&mut totals.claude, &per_provider.claude, pricing_map, None);
+    accumulate_provider(&mut totals.codex, &per_provider.codex, pricing_map, None);
+    accumulate_provider(
+        &mut totals.copilot,
+        &per_provider.copilot,
+        pricing_map,
+        None,
+    );
+    accumulate_provider(&mut totals.gemini, &per_provider.gemini, pricing_map, None);
+    accumulate_provider(
+        &mut totals.opencode,
+        &per_provider.opencode,
+        pricing_map,
+        Some(opencode_costs),
+    );
 
     // "All Providers" row sums every provider's totals directly rather
     // than reusing the cross-provider merged `UsageData.models` map.
@@ -171,13 +182,18 @@ pub fn calculate_provider_totals_from_per_provider(
 }
 
 /// Prices every model in `usage` and folds the results into `stats`.
+///
+/// `opencode_costs` is `Some` only when accumulating the OpenCode provider, so
+/// that its models price by exact match or fall back to OpenCode's stored cost.
 fn accumulate_provider(
     stats: &mut ProviderStats,
     usage: &UsageResult,
     pricing_map: &crate::pricing::ModelPricingMap,
+    opencode_costs: Option<&crate::constants::FastHashMap<String, f64>>,
 ) {
     for (model, raw_usage) in usage {
-        let row = extract_usage_row(model, raw_usage, pricing_map);
+        let opencode_cost = opencode_costs.map(|m| m.get(model).copied().unwrap_or(0.0));
+        let row = extract_usage_row(model, raw_usage, pricing_map, opencode_cost);
         stats.accumulate_row(&row);
     }
 }
@@ -239,6 +255,7 @@ pub fn build_usage_summary(
     per_provider: &PerProviderUsage,
     provider_days: &ProviderActiveDays,
     pricing_map: &crate::pricing::ModelPricingMap,
+    opencode_costs: &crate::constants::FastHashMap<String, f64>,
 ) -> UsageSummary {
     if usage_data.is_empty() {
         return UsageSummary::default();
@@ -251,7 +268,12 @@ pub fn build_usage_summary(
 
     // Extract rows first so we can sort by cost
     for (model, usage) in usage_data.iter() {
-        let row = extract_usage_row(model, usage, pricing_map);
+        let row = extract_usage_row(
+            model,
+            usage,
+            pricing_map,
+            opencode_costs.get(model).copied(),
+        );
         summary.rows.push(row);
     }
 
@@ -267,43 +289,39 @@ pub fn build_usage_summary(
         summary.totals.accumulate(row);
     }
 
-    summary.provider_totals =
-        calculate_provider_totals_from_per_provider(per_provider, provider_days, pricing_map);
+    summary.provider_totals = calculate_provider_totals_from_per_provider(
+        per_provider,
+        provider_days,
+        pricing_map,
+        opencode_costs,
+    );
     summary
 }
 
 /// Builds one priced [`UsageRow`] from a model's raw usage `Value`.
 ///
 /// Token counts come from [`extract_token_counts`](crate::utils::extract_token_counts);
-/// cost is computed against the pricing entry `pricing_map` resolves for
-/// `model`. When that lookup was a fuzzy match, the matched model name is
-/// appended to `display_model` in parentheses.
+/// cost is resolved by [`resolve_model_cost`](crate::usage::resolve_model_cost).
+/// `opencode_cost` is `Some` only for OpenCode-sourced usage, in which case a
+/// model with no exact LiteLLM price falls back to OpenCode's stored cost
+/// instead of a fuzzy match. When a non-exact LiteLLM key was used, the matched
+/// model name is appended to `display_model` in parentheses.
 fn extract_usage_row(
     model: &str,
     usage: &Value,
     pricing_map: &crate::pricing::ModelPricingMap,
+    opencode_cost: Option<f64>,
 ) -> UsageRow {
-    use crate::pricing::calculate_cost;
+    use crate::usage::resolve_model_cost;
     use crate::utils::extract_token_counts;
 
     // Extract token counts using utility function
     let counts = extract_token_counts(usage);
 
-    // Direct call - no local cache needed (uses global MATCH_CACHE)
-    let pricing_result = pricing_map.get(model);
+    let (cost, matched_model) = resolve_model_cost(model, &counts, pricing_map, opencode_cost);
 
-    let cost = calculate_cost(
-        counts.input_tokens,
-        counts.output_tokens,
-        counts.reasoning_tokens,
-        counts.cache_read,
-        counts.cache_creation_5m,
-        counts.cache_creation_1h,
-        &pricing_result.pricing,
-    );
-
-    // Use Cow<str> for display_model to avoid allocation when no fuzzy match
-    let display_model = if let Some(matched) = &pricing_result.matched_model {
+    // Use Cow<str> for display_model to avoid allocation when no annotation
+    let display_model = if let Some(matched) = &matched_model {
         Cow::Owned(format!("{} ({})", model, matched))
     } else {
         Cow::Borrowed(model)

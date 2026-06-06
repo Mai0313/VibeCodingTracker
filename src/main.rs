@@ -25,12 +25,13 @@ use vibe_coding_tracker::cli::{Cli, Commands, resolve_time_range};
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+use vibe_coding_tracker::constants::FastHashMap;
 use vibe_coding_tracker::display::usage::{
     display_usage_interactive, display_usage_table, display_usage_text,
 };
 use vibe_coding_tracker::models::UsageResult;
-use vibe_coding_tracker::pricing::{ModelPricingMap, calculate_cost, fetch_model_pricing};
-use vibe_coding_tracker::usage::get_usage_from_directories;
+use vibe_coding_tracker::pricing::{ModelPricingMap, fetch_model_pricing};
+use vibe_coding_tracker::usage::{get_usage_from_directories, resolve_model_cost};
 use vibe_coding_tracker::utils::extract_token_counts;
 use vibe_coding_tracker::{get_version_info, parse_session_file};
 
@@ -147,7 +148,11 @@ fn main() -> Result<()> {
                             ModelPricingMap::new(HashMap::new())
                         }
                     };
-                    let enriched_data = build_enriched_json(&usage_data.models, &pricing_map)?;
+                    let enriched_data = build_enriched_json(
+                        &usage_data.models,
+                        &usage_data.opencode_costs,
+                        &pricing_map,
+                    )?;
                     let json_str = serde_json::to_string_pretty(&enriched_data)?;
                     println!("{}", json_str);
                 } else if text {
@@ -226,10 +231,12 @@ fn main() -> Result<()> {
 /// Builds the `usage --json` payload, joining each model's token counts with
 /// its priced cost.
 ///
-/// For every model in `usage_data` it looks the model up in `pricing_map`,
-/// computes the USD cost from the extracted token counts, and emits a JSON
-/// object with `model`, `usage`, `cost_usd`, and (when the price came from a
-/// fuzzy match rather than an exact key) `matched_model`.
+/// For every model it resolves the USD cost via
+/// [`resolve_model_cost`](vibe_coding_tracker::usage::resolve_model_cost) and
+/// emits a JSON object with `model`, `usage`, `cost_usd`, and (when a non-exact
+/// LiteLLM key was used) `matched_model`. OpenCode models without an exact
+/// price report OpenCode's own stored cost from `opencode_costs` rather than a
+/// fuzzy match.
 ///
 /// # Errors
 ///
@@ -237,6 +244,7 @@ fn main() -> Result<()> {
 /// resulting JSON object.
 fn build_enriched_json(
     usage_data: &UsageResult,
+    opencode_costs: &FastHashMap<String, f64>,
     pricing_map: &ModelPricingMap,
 ) -> Result<Vec<Value>> {
     let mut enriched_data = Vec::with_capacity(usage_data.len());
@@ -244,16 +252,11 @@ fn build_enriched_json(
     for (model, usage) in usage_data.iter() {
         let counts = extract_token_counts(usage);
 
-        let pricing_result = pricing_map.get(model);
-
-        let cost = calculate_cost(
-            counts.input_tokens,
-            counts.output_tokens,
-            counts.reasoning_tokens,
-            counts.cache_read,
-            counts.cache_creation_5m,
-            counts.cache_creation_1h,
-            &pricing_result.pricing,
+        let (cost, matched_model) = resolve_model_cost(
+            model,
+            &counts,
+            pricing_map,
+            opencode_costs.get(model).copied(),
         );
 
         let mut entry = json!({
@@ -262,7 +265,7 @@ fn build_enriched_json(
             "cost_usd": cost
         });
 
-        if let Some(matched) = &pricing_result.matched_model {
+        if let Some(matched) = &matched_model {
             entry["matched_model"] = json!(matched);
         }
 

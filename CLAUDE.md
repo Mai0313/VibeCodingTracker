@@ -75,6 +75,8 @@ Four parser entry points live in `src/session/parser.rs`:
 
 OpenCode does **not** flow through the detector or `parse_session_file_*`: it lives in a single SQLite database, so `src/session/opencode.rs` reads it directly (`read_opencode_usage` from the `session` table, `read_opencode_analysis` from `session` + `part`) and produces the same `CodeAnalysis` shape, which the `usage` / `analysis` aggregators fold in alongside the file-based providers. The DB is opened read-only (with a temp-copy fallback) so the user's database is never mutated.
 
+OpenCode cost is a special case: `usage::resolve_model_cost` prices an OpenCode model from tokens only on an **exact** LiteLLM match (`ModelPricingMap::get_exact`); with no exact match it uses the stored `session.cost` carried in `UsageData::opencode_costs` rather than the normalized/substring/fuzzy fallback the other providers use. This keeps a novel model like `deepseek-v4-pro` from being mis-priced against a loosely-similar name.
+
 ### `ParseMode`
 
 `src/session/state.rs` defines `ParseMode::Full` vs `ParseMode::UsageOnly`. The usage path uses `UsageOnly` to skip allocating the large `write_file_details` / `edit_file_details` bodies — this is a major part of why the TUI sits at ~30–50 MB RSS even on 200+ session directories. Preserve this distinction when adding new fields to `CodeAnalysisRecord`.
