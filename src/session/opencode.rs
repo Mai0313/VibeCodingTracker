@@ -106,28 +106,36 @@ fn collect_session_usage(
     let user = get_current_user();
     let machine = get_machine_id().to_string();
     let cutoff = cutoff_string(time_range);
+    let cutoff_ms = cutoff_millis(time_range);
 
-    let mut stmt = conn.prepare(
-        "SELECT model, tokens_input, tokens_output, tokens_reasoning, \
-                tokens_cache_read, tokens_cache_write, time_updated, cost \
-         FROM session WHERE model IS NOT NULL AND model != ''",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, i64>(2)?,
-            row.get::<_, i64>(3)?,
-            row.get::<_, i64>(4)?,
-            row.get::<_, i64>(5)?,
-            row.get::<_, i64>(6)?,
-            row.get::<_, f64>(7)?,
-        ))
-    })?;
+    let sql = match cutoff_ms {
+        Some(_) => {
+            "SELECT model, tokens_input, tokens_output, tokens_reasoning, \
+                    tokens_cache_read, tokens_cache_write, time_updated, cost \
+             FROM session WHERE model IS NOT NULL AND model != '' AND time_updated >= ?1"
+        }
+        None => {
+            "SELECT model, tokens_input, tokens_output, tokens_reasoning, \
+                    tokens_cache_read, tokens_cache_write, time_updated, cost \
+             FROM session WHERE model IS NOT NULL AND model != ''"
+        }
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows = match cutoff_ms {
+        Some(cutoff_ms) => stmt.query([cutoff_ms])?,
+        None => stmt.query([])?,
+    };
 
     let mut out = Vec::new();
-    for row in rows {
-        let (model, input, output, reasoning, cache_read, cache_write, time_updated, cost) = row?;
+    while let Some(row) = rows.next()? {
+        let model = row.get::<_, String>(0)?;
+        let input = row.get::<_, i64>(1)?;
+        let output = row.get::<_, i64>(2)?;
+        let reasoning = row.get::<_, i64>(3)?;
+        let cache_read = row.get::<_, i64>(4)?;
+        let cache_write = row.get::<_, i64>(5)?;
+        let time_updated = row.get::<_, i64>(6)?;
+        let cost = row.get::<_, f64>(7)?;
         let Some(model_id) = parse_model_id(&model) else {
             continue;
         };
@@ -994,6 +1002,31 @@ mod tests {
 
         let daily = read_opencode_usage(&db_path, TimeRange::Daily).unwrap();
         assert_eq!(daily.len(), 1);
+    }
+
+    #[test]
+    fn test_legacy_session_usage_filters_old_sessions() {
+        let (_dir, db_path) = make_db();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute("DROP TABLE message", []).unwrap();
+        conn.execute("DROP TABLE part", []).unwrap();
+
+        let now_ms = chrono::Local::now().timestamp_millis();
+        conn.execute(
+            "INSERT INTO session (id, model, directory, time_updated, cost, tokens_input) VALUES ('recent', '{\"id\":\"m1\"}', '/repo', ?1, 0.01, 10)",
+            rusqlite::params![now_ms],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session (id, model, directory, time_updated, cost, tokens_input) VALUES ('old', '{\"id\":\"m2\"}', '/repo', 1000000000000, 0.02, 20)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let daily = read_opencode_usage(&db_path, TimeRange::Daily).unwrap();
+        assert_eq!(daily.len(), 1);
+        assert!(daily[0].1.records[0].conversation_usage.contains_key("m1"));
     }
 
     #[test]
