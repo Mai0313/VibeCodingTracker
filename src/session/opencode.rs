@@ -701,14 +701,9 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
 }
 
 /// Extracts the file body from an OpenCode `read` tool output.
-///
-/// The output wraps file contents as `<content>\n1: line\n2: line\n</content>`,
-/// each line prefixed with `N: `. This returns the joined lines with the
-/// line-number prefixes stripped. Directory listings (no `<content>` block)
-/// yield an empty string.
 fn extract_read_content(output: &str) -> String {
     let Some(start) = output.find("<content>") else {
-        return String::new();
+        return extract_plain_read_content(output);
     };
     let after = &output[start + "<content>".len()..];
     let inner = match after.find("</content>") {
@@ -717,8 +712,52 @@ fn extract_read_content(output: &str) -> String {
     };
     let inner = inner.strip_prefix('\n').unwrap_or(inner);
 
-    let mut lines: Vec<&str> = inner.split('\n').map(strip_line_number_prefix).collect();
-    // Drop the trailing empty element produced by the newline before </content>.
+    strip_numbered_content_lines(inner)
+}
+
+/// Extracts current OpenCode plain read output: `path\nfile\n\n1: line`.
+fn extract_plain_read_content(output: &str) -> String {
+    let mut lines = output.split('\n');
+    let Some(_path) = lines.next() else {
+        return String::new();
+    };
+    let Some(kind) = lines.next() else {
+        return String::new();
+    };
+    if kind.trim_end_matches('\r') != "file" {
+        return String::new();
+    }
+
+    let mut content = Vec::new();
+    let mut saw_separator = false;
+    for line in lines {
+        if !saw_separator {
+            if line.trim_end_matches('\r').is_empty() {
+                saw_separator = true;
+            }
+            continue;
+        }
+        content.push(line);
+    }
+
+    if saw_separator {
+        strip_numbered_content_lines_from_iter(content)
+    } else {
+        String::new()
+    }
+}
+
+fn strip_numbered_content_lines(inner: &str) -> String {
+    strip_numbered_content_lines_from_iter(inner.split('\n').collect())
+}
+
+fn strip_numbered_content_lines_from_iter(lines: Vec<&str>) -> String {
+    let mut lines: Vec<&str> = lines
+        .into_iter()
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .map(strip_line_number_prefix)
+        .collect();
+
     if lines.last().is_some_and(|l| l.is_empty()) {
         lines.pop();
     }
@@ -919,9 +958,15 @@ mod tests {
         let output = "<path>/a/b.py</path>\n<type>file</type>\n<content>\n1: import os\n2: \n3: print(1)\n</content>";
         assert_eq!(extract_read_content(output), "import os\n\nprint(1)");
 
+        let plain_output = "/a/b.py\nfile\n\n1: import os\n2: \n3: print(1)";
+        assert_eq!(extract_read_content(plain_output), "import os\n\nprint(1)");
+
         // Directory listing has no <content> block.
         let dir_output = "<path>/a</path>\n<type>directory</type>\n<entries>\nx.py\n</entries>";
         assert_eq!(extract_read_content(dir_output), "");
+
+        let plain_dir_output = "/a\ndirectory\n\nx.py";
+        assert_eq!(extract_read_content(plain_dir_output), "");
     }
 
     #[test]
