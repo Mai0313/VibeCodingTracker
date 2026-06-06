@@ -206,18 +206,18 @@ fn collect_analysis(
     {
         let sql = match cutoff_ms {
             Some(_) => {
-                "SELECT part.session_id, part.data \
+                "SELECT part.session_id, part.data, part.time_updated \
                  FROM part \
                  JOIN session ON session.id = part.session_id \
-                 WHERE json_extract(part.data, '$.type') = 'tool' \
+                 WHERE json_extract(part.data, '$.type') IN ('tool', 'patch') \
                    AND session.model IS NOT NULL \
                    AND session.model != '' \
                    AND session.time_updated >= ?1"
             }
             None => {
-                "SELECT session_id, data \
+                "SELECT session_id, data, time_updated \
                  FROM part \
-                 WHERE json_extract(data, '$.type') = 'tool'"
+                 WHERE json_extract(data, '$.type') IN ('tool', 'patch')"
             }
         };
         let mut stmt = conn.prepare(sql)?;
@@ -229,13 +229,18 @@ fn collect_analysis(
         while let Some(row) = rows.next()? {
             let session_id = row.get::<_, String>(0)?;
             let data_text = row.get::<_, String>(1)?;
+            let part_ts = row.get::<_, i64>(2)?;
             let Some(accum) = sessions.get_mut(&session_id) else {
                 continue;
             };
             let Ok(data) = serde_json::from_str::<Value>(&data_text) else {
                 continue;
             };
-            apply_tool_part(&mut accum.state, &data);
+            match data.get("type").and_then(|v| v.as_str()) {
+                Some("tool") => apply_tool_part(&mut accum.state, &data),
+                Some("patch") => apply_patch_part(&mut accum.state, &data, part_ts),
+                _ => {}
+            }
         }
     }
 
@@ -311,6 +316,17 @@ fn apply_tool_part(state: &mut SessionParseState, data: &Value) {
             state.tool_counts.todo_write += 1;
         }
         _ => {}
+    }
+}
+
+/// Records an OpenCode `patch` part as edit work for each touched file.
+fn apply_patch_part(state: &mut SessionParseState, data: &Value, ts: i64) {
+    let Some(files) = data.get("files").and_then(|v| v.as_array()) else {
+        return;
+    };
+
+    for path in files.iter().filter_map(|v| v.as_str()) {
+        state.add_edit_detail(path, "", "", ts);
     }
 }
 
@@ -545,11 +561,12 @@ mod tests {
                  tokens_cache_read INTEGER NOT NULL DEFAULT 0,
                  tokens_cache_write INTEGER NOT NULL DEFAULT 0
              );
-             CREATE TABLE part (
-                 id TEXT PRIMARY KEY,
-                 session_id TEXT NOT NULL,
-                 data TEXT NOT NULL
-             );",
+	             CREATE TABLE part (
+	                 id TEXT PRIMARY KEY,
+	                 session_id TEXT NOT NULL,
+	                 time_updated INTEGER NOT NULL DEFAULT 0,
+	                 data TEXT NOT NULL
+	             );",
         )
         .unwrap();
         (dir, db_path)
@@ -674,5 +691,28 @@ mod tests {
         assert_eq!(record.total_edit_lines, 2);
         // grep / text parts are not tracked.
         assert_eq!(record.tool_call_counts.write, 0);
+    }
+
+    #[test]
+    fn test_read_analysis_counts_patch_files() {
+        let (_dir, db_path) = make_db();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO session (id, model, directory, time_updated) VALUES ('s1', '{\"id\":\"m1\"}', '/repo', 1780757088080)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, session_id, time_updated, data) VALUES ('p1', 's1', 1780757089000, ?1)",
+            [r#"{"type":"patch","files":["/repo/a.py","/repo/b.py"]}"#],
+        )
+        .unwrap();
+        drop(conn);
+
+        let rows = read_opencode_analysis(&db_path, TimeRange::All, ParseMode::UsageOnly).unwrap();
+        assert_eq!(rows.len(), 1);
+        let record = &rows[0].1.records[0];
+        assert_eq!(record.tool_call_counts.edit, 2);
+        assert_eq!(record.total_edit_lines, 0);
     }
 }
