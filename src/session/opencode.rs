@@ -424,12 +424,13 @@ fn with_connection<T>(db_path: &Path, f: impl FnOnce(&Connection) -> Result<T>) 
 
     // Fallback: read from a throwaway copy that includes the WAL sidecars.
     let copy = TempDbCopy::new(db_path)?;
-    let conn = Connection::open(&copy.db_path).with_context(|| {
-        format!(
-            "Failed to open OpenCode DB copy at {}",
-            copy.db_path.display()
-        )
-    })?;
+    let conn = Connection::open_with_flags(&copy.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| {
+            format!(
+                "Failed to open OpenCode DB copy at {}",
+                copy.db_path.display()
+            )
+        })?;
     f(&conn)
 }
 
