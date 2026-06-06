@@ -96,8 +96,8 @@ fn extract_conversation_usage_from_analysis(analysis: &CodeAnalysis) -> FastHash
 /// Scans the Claude Code, Codex, Copilot, and Gemini session trees resolved by
 /// [`resolve_paths`], filtered by `time_range`, and rolls every session's
 /// per-model usage into a [`UsageData`]. Missing provider directories are
-/// skipped silently, and a session file that fails to parse logs a warning to
-/// stderr and is excluded rather than aborting the whole scan.
+/// skipped silently, and a source file or OpenCode database that fails to parse
+/// logs a warning to stderr and is excluded rather than aborting the whole scan.
 ///
 /// # Errors
 ///
@@ -191,14 +191,19 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
     // OpenCode lives in a single SQLite database rather than a session
     // directory, so it is read directly instead of walked.
     if paths.opencode_db.exists() {
-        process_opencode_usage(
+        if let Err(err) = process_opencode_usage(
             &paths.opencode_db,
             &mut result,
             &mut per_provider.opencode,
             &mut opencode_costs,
             &mut opencode_dates,
             time_range,
-        )?;
+        ) {
+            eprintln!(
+                "Warning: Failed to read OpenCode DB {}: {err}",
+                paths.opencode_db.display()
+            );
+        }
     }
 
     let mut all_dates: HashSet<&String> = HashSet::new();

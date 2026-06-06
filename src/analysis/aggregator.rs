@@ -88,7 +88,8 @@ pub struct PerProviderAnalysisRows {
 /// rows sorted by model name alongside per-provider active-day counts. Each
 /// file is parsed in [`ParseMode::UsageOnly`] and dropped immediately, so the
 /// global file cache is bypassed. Missing provider directories are skipped, and
-/// files that fail to parse are logged to stderr rather than aborting the scan.
+/// files or the OpenCode database that fail to parse are logged to stderr rather
+/// than aborting the scan.
 ///
 /// # Errors
 ///
@@ -190,13 +191,18 @@ pub fn aggregate_sessions_by_model(time_range: TimeRange) -> Result<AnalysisData
     // OpenCode lives in a single SQLite database rather than a session
     // directory, so it is read directly instead of walked.
     if paths.opencode_db.exists() {
-        aggregate_opencode_sessions(
+        if let Err(err) = aggregate_opencode_sessions(
             &paths.opencode_db,
             &mut aggregated,
             &mut opencode_aggregated,
             &mut opencode_dates,
             time_range,
-        )?;
+        ) {
+            eprintln!(
+                "Warning: Failed to read OpenCode DB {}: {err}",
+                paths.opencode_db.display()
+            );
+        }
     }
 
     let mut all_dates: HashSet<&String> = HashSet::new();
