@@ -143,32 +143,40 @@ fn collect_analysis(
     let user = get_current_user();
     let machine = get_machine_id().to_string();
     let cutoff = cutoff_string(time_range);
+    let cutoff_ms = cutoff_millis(time_range);
 
     // 1. Load session metadata and seed one parse state per session.
     let mut sessions: HashMap<String, SessionAccum> = HashMap::new();
     {
-        let mut stmt = conn.prepare(
-            "SELECT id, model, directory, time_updated, tokens_input, tokens_output, \
-                    tokens_reasoning, tokens_cache_read, tokens_cache_write \
-             FROM session WHERE model IS NOT NULL AND model != ''",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, i64>(5)?,
-                row.get::<_, i64>(6)?,
-                row.get::<_, i64>(7)?,
-                row.get::<_, i64>(8)?,
-            ))
-        })?;
+        let sql = match cutoff_ms {
+            Some(_) => {
+                "SELECT id, model, directory, time_updated, tokens_input, tokens_output, \
+                        tokens_reasoning, tokens_cache_read, tokens_cache_write \
+                 FROM session \
+                 WHERE model IS NOT NULL AND model != '' AND time_updated >= ?1"
+            }
+            None => {
+                "SELECT id, model, directory, time_updated, tokens_input, tokens_output, \
+                        tokens_reasoning, tokens_cache_read, tokens_cache_write \
+                 FROM session WHERE model IS NOT NULL AND model != ''"
+            }
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = match cutoff_ms {
+            Some(cutoff_ms) => stmt.query([cutoff_ms])?,
+            None => stmt.query([])?,
+        };
 
-        for row in rows {
-            let (id, model, directory, ts, input, output, reasoning, cache_read, cache_write) =
-                row?;
+        while let Some(row) = rows.next()? {
+            let id = row.get::<_, String>(0)?;
+            let model = row.get::<_, String>(1)?;
+            let directory = row.get::<_, String>(2)?;
+            let ts = row.get::<_, i64>(3)?;
+            let input = row.get::<_, i64>(4)?;
+            let output = row.get::<_, i64>(5)?;
+            let reasoning = row.get::<_, i64>(6)?;
+            let cache_read = row.get::<_, i64>(7)?;
+            let cache_write = row.get::<_, i64>(8)?;
             let Some(model_id) = parse_model_id(&model) else {
                 continue;
             };
@@ -196,15 +204,31 @@ fn collect_analysis(
 
     // 2. Fold tool parts into their owning session's parse state.
     {
-        let mut stmt = conn.prepare(
-            "SELECT session_id, data FROM part WHERE json_extract(data, '$.type') = 'tool'",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
+        let sql = match cutoff_ms {
+            Some(_) => {
+                "SELECT part.session_id, part.data \
+                 FROM part \
+                 JOIN session ON session.id = part.session_id \
+                 WHERE json_extract(part.data, '$.type') = 'tool' \
+                   AND session.model IS NOT NULL \
+                   AND session.model != '' \
+                   AND session.time_updated >= ?1"
+            }
+            None => {
+                "SELECT session_id, data \
+                 FROM part \
+                 WHERE json_extract(data, '$.type') = 'tool'"
+            }
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = match cutoff_ms {
+            Some(cutoff_ms) => stmt.query([cutoff_ms])?,
+            None => stmt.query([])?,
+        };
 
-        for row in rows {
-            let (session_id, data_text) = row?;
+        while let Some(row) = rows.next()? {
+            let session_id = row.get::<_, String>(0)?;
+            let data_text = row.get::<_, String>(1)?;
             let Some(accum) = sessions.get_mut(&session_id) else {
                 continue;
             };
@@ -348,6 +372,18 @@ fn cutoff_string(time_range: TimeRange) -> Option<String> {
     time_range
         .cutoff_date()
         .map(|d| d.format("%Y-%m-%d").to_string())
+}
+
+/// Converts the inclusive local-date cutoff into an epoch-millis lower bound.
+fn cutoff_millis(time_range: TimeRange) -> Option<i64> {
+    use chrono::{Datelike, TimeZone};
+
+    time_range.cutoff_date().and_then(|date| {
+        chrono::Local
+            .with_ymd_and_hms(date.year(), date.month(), date.day(), 0, 0, 0)
+            .earliest()
+            .map(|dt| dt.timestamp_millis())
+    })
 }
 
 /// Returns `true` when `date` is strictly before the cutoff (should be skipped).
