@@ -481,9 +481,9 @@ fn collect_message_analysis(
 /// Dispatches a single `part` (type `tool`) onto the session parse state.
 ///
 /// Only the tools the analyzer tracks across providers are folded in
-/// (`read`, `edit`, `write`, `bash`, `todowrite`); auxiliary tools such as
-/// `task`, `grep`, `glob`, `webfetch`, and `question` are ignored to stay
-/// consistent with the other providers' tool-count semantics.
+/// (`read`, `edit`, `write`, `bash`, `todowrite`, `apply_patch`); auxiliary
+/// tools such as `task`, `grep`, `glob`, `webfetch`, and `question` are ignored
+/// to stay consistent with the other providers' tool-count semantics.
 fn apply_tool_part(state: &mut SessionParseState, data: &Value) {
     let tool = data.get("tool").and_then(|v| v.as_str()).unwrap_or("");
     let st = data.get("state");
@@ -534,8 +534,124 @@ fn apply_tool_part(state: &mut SessionParseState, data: &Value) {
         "todowrite" => {
             state.tool_counts.todo_write += 1;
         }
+        "apply_patch" => {
+            apply_patch_text(state, str_in("patchText"), ts);
+        }
         _ => {}
     }
+}
+
+/// Folds an OpenCode `apply_patch` tool input into file-operation counts.
+fn apply_patch_text(state: &mut SessionParseState, patch_text: &str, ts: i64) {
+    for patch in parse_apply_patch_text(patch_text) {
+        let (old_str, new_str) = extract_patch_strings(&patch.lines);
+
+        match patch.action.as_str() {
+            "add" => state.add_write_detail(&patch.file_path, &new_str, ts),
+            "delete" => state.add_edit_detail(&patch.file_path, &old_str, "", ts),
+            _ => state.add_edit_detail(&patch.file_path, &old_str, &new_str, ts),
+        }
+    }
+}
+
+/// One file hunk extracted from an OpenCode `apply_patch` tool call.
+struct OpenCodePatch {
+    action: String,
+    file_path: String,
+    lines: Vec<String>,
+}
+
+/// Parses the `*** Begin Patch` format carried by `state.input.patchText`.
+fn parse_apply_patch_text(patch_text: &str) -> Vec<OpenCodePatch> {
+    let start = match patch_text.find("*** Begin Patch") {
+        Some(idx) => idx,
+        None => return Vec::new(),
+    };
+
+    let mut patches = Vec::with_capacity(3);
+    let mut current: Option<OpenCodePatch> = None;
+    for line in patch_text[start..].lines() {
+        let line = line.trim_end_matches('\r');
+
+        if line.starts_with("*** End Patch") {
+            if let Some(patch) = current.take() {
+                patches.push(patch);
+            }
+            break;
+        } else if line.starts_with("*** Begin Patch") {
+            continue;
+        } else if line.starts_with("*** Update File:") {
+            if let Some(patch) = current.take() {
+                patches.push(patch);
+            }
+            current = Some(OpenCodePatch {
+                action: "update".to_string(),
+                file_path: line
+                    .trim_start_matches("*** Update File:")
+                    .trim()
+                    .to_string(),
+                lines: Vec::with_capacity(20),
+            });
+        } else if line.starts_with("*** Add File:") {
+            if let Some(patch) = current.take() {
+                patches.push(patch);
+            }
+            current = Some(OpenCodePatch {
+                action: "add".to_string(),
+                file_path: line.trim_start_matches("*** Add File:").trim().to_string(),
+                lines: Vec::with_capacity(20),
+            });
+        } else if line.starts_with("*** Delete File:") {
+            if let Some(patch) = current.take() {
+                patches.push(patch);
+            }
+            current = Some(OpenCodePatch {
+                action: "delete".to_string(),
+                file_path: line
+                    .trim_start_matches("*** Delete File:")
+                    .trim()
+                    .to_string(),
+                lines: Vec::with_capacity(20),
+            });
+        } else if let Some(ref mut patch) = current {
+            patch.lines.push(line.to_string());
+        }
+    }
+
+    if let Some(patch) = current {
+        patches.push(patch);
+    }
+    patches
+}
+
+/// Splits diff lines into old and new text, skipping hunk headers.
+fn extract_patch_strings(lines: &[String]) -> (String, String) {
+    let estimated_size = lines.iter().map(|l| l.len()).sum::<usize>();
+    let mut old_str = String::with_capacity(estimated_size / 2);
+    let mut new_str = String::with_capacity(estimated_size / 2);
+
+    for line in lines {
+        if line.is_empty() || line.starts_with("@@") {
+            continue;
+        }
+
+        match line.as_bytes()[0] {
+            b'+' => {
+                new_str.push_str(&line[1..]);
+                new_str.push('\n');
+            }
+            b'-' => {
+                old_str.push_str(&line[1..]);
+                old_str.push('\n');
+            }
+            b'\\' => continue,
+            _ => {}
+        }
+    }
+
+    old_str.truncate(old_str.trim_end_matches('\n').len());
+    new_str.truncate(new_str.trim_end_matches('\n').len());
+    (old_str, new_str)
 }
 
 /// Builds the Claude-style flat usage value from a session's token columns.
@@ -1164,6 +1280,36 @@ mod tests {
         assert_eq!(record.total_edit_lines, 2);
         // grep / text parts are not tracked.
         assert_eq!(record.tool_call_counts.write, 0);
+    }
+
+    #[test]
+    fn test_read_analysis_counts_apply_patch_tool() {
+        let (_dir, db_path) = make_db();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO session (id, model, directory, time_updated) VALUES ('s1', '{\"id\":\"m1\"}', '/repo', 1780757088080)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES ('m1', 's1', ?1)",
+            [assistant_message("m1", 1, 1, 0, 0, 0, 0.01)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES ('p1', 'm1', 's1', ?1)",
+            [r#"{"type":"tool","tool":"apply_patch","state":{"status":"completed","input":{"patchText":"*** Begin Patch\n*** Update File: src/main.rs\n@@\n-old\n+new\n+line\n*** Add File: src/new.rs\n+created\n*** End Patch"}}}"#],
+        )
+        .unwrap();
+        drop(conn);
+
+        let rows = read_opencode_analysis(&db_path, TimeRange::All, ParseMode::UsageOnly).unwrap();
+        assert_eq!(rows.len(), 1);
+        let record = &rows[0].1.records[0];
+        assert_eq!(record.tool_call_counts.edit, 1);
+        assert_eq!(record.tool_call_counts.write, 1);
+        assert_eq!(record.total_edit_lines, 2);
+        assert_eq!(record.total_write_lines, 1);
     }
 
     #[test]
