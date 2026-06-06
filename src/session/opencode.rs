@@ -933,9 +933,11 @@ fn strip_line_number_prefix(line: &str) -> &str {
     let Some((prefix, content)) = line.split_once(": ") else {
         return line;
     };
-    (!prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit()))
-        .then_some(content)
-        .unwrap_or(line)
+    if !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit()) {
+        content
+    } else {
+        line
+    }
 }
 
 /// Wraps a single record into a fully-populated [`CodeAnalysis`].
