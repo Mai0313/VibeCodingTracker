@@ -41,7 +41,7 @@ If you then still feel the need to ask a question and need clarification, we rec
 A good bug report shouldn't leave others needing to chase you up for more information. Therefore, we ask you to investigate carefully, collect information and describe the issue in detail in your report.
 
 - Make sure that you are using the latest version (`vct update --check`).
-- Determine if your bug is really a bug and not an error on your side, e.g. using incompatible environment components/versions (make sure that you have read the [documentation](README.md)).
+- Determine if your bug is really a bug and not an error on your side, e.g. using incompatible environment components/versions (make sure that you have read the [documentation](../README.md)).
 - Check if other users have experienced (and potentially already solved) the same issue in the [bug tracker](https://github.com/Mai0313/VibeCodingTracker/issues).
 - Include the `vct version --json` output, the exact command you ran, and any relevant JSONL snippet (scrubbed of secrets) so we can reproduce it.
 
@@ -50,7 +50,7 @@ A good bug report shouldn't leave others needing to chase you up for more inform
 This section guides you through submitting an enhancement suggestion, including completely new features and minor improvements to existing functionality.
 
 - Make sure that you are using the latest version.
-- Read the [documentation](README.md) carefully and find out if the functionality is already covered, maybe by an individual configuration.
+- Read the [documentation](../README.md) carefully and find out if the functionality is already covered, maybe by an individual configuration.
 - Perform a [search](https://github.com/Mai0313/VibeCodingTracker/issues) to see if the enhancement has already been suggested. If it has, add a comment to the existing issue instead of opening a new one.
 - Find out whether your idea fits with the scope and aims of the project. It's up to you to make a strong case to convince the project's developers of the merits of this feature.
 

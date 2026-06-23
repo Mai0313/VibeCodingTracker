@@ -80,7 +80,7 @@
 
 选择最适合你的安装方式：
 
-> **开发者**：如果你想从源码构建或参与项目开发，请参阅 [CONTRIBUTING.md](CONTRIBUTING.md)。
+> **开发者**：如果你想从源码构建或参与项目开发，请参阅 [CONTRIBUTING.md](.github/CONTRIBUTING.md)。
 
 #### 方式一：通过 npm 安装
 

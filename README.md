@@ -80,7 +80,7 @@ Automatically detects and processes logs from Claude Code, Codex, Copilot, Gemin
 
 Choose the installation method that works best for you:
 
-> **Developers**: If you want to build from source or contribute to development, please see [CONTRIBUTING.md](CONTRIBUTING.md).
+> **Developers**: If you want to build from source or contribute to development, please see [CONTRIBUTING.md](.github/CONTRIBUTING.md).
 
 #### Method 1: Install from npm
 
