@@ -13,6 +13,7 @@ pub mod codex;
 pub mod copilot;
 pub mod gemini;
 pub mod provider;
+pub mod quota;
 pub mod usage;
 
 pub use self::analysis::*;
@@ -21,4 +22,5 @@ pub use self::codex::*;
 pub use self::copilot::*;
 pub use self::gemini::*;
 pub use self::provider::*;
+pub use self::quota::*;
 pub use self::usage::*;

@@ -17,20 +17,34 @@ use crate::display::common::tui::{
 use crate::display::usage::averages::{
     UsageProviderTotals, UsageRow, UsageTotals, build_provider_total_rows, build_usage_summary,
 };
-use crate::models::{PerProviderUsage, ProviderActiveDays, UsageResult};
+use crate::models::{
+    ClaudeRateLimitsCache, CodexQuotaSnapshot, PerProviderUsage, ProviderActiveDays, QuotaSource,
+    QuotaWindow, UsageResult,
+};
 use crate::pricing::{ModelPricingMap, fetch_model_pricing};
-use crate::utils::format_number;
+use crate::quota::{load_claude_rate_limits, load_codex_cache, spawn_codex_quota_worker};
+use crate::utils::{format_duration_until, format_number};
 use ratatui::{
-    Terminal,
+    Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout as RatatuiLayout},
-    style::{Color as RatatuiColor, Style, Stylize},
-    widgets::Row as RatatuiRow,
+    layout::{Constraint, Direction, Layout as RatatuiLayout, Rect},
+    style::{Color as RatatuiColor, Modifier, Style, Stylize},
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph, Row as RatatuiRow},
 };
 use std::collections::HashMap;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, System};
+
+/// Minimum height for the bottom quota panels (border + 2 gauges + labels).
+const QUOTA_PANEL_MIN_HEIGHT: u16 = 7;
+/// Claude brand color for the quota panel border.
+const CLAUDE_COLOR: RatatuiColor = RatatuiColor::Rgb(190, 116, 87);
+/// Codex brand color for the quota panel border.
+const CODEX_COLOR: RatatuiColor = RatatuiColor::Rgb(118, 127, 198);
 
 /// How often the loop re-aggregates the session directories and repaints.
 const USAGE_REFRESH_SECS: u64 = 10;
@@ -65,6 +79,14 @@ const MAX_TRACKED_ROWS: usize = 100;
 pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::Result<()> {
     let mut terminal = setup_terminal()?;
     let mut refresh_state = RefreshState::new(USAGE_REFRESH_SECS);
+
+    // Codex quota is fetched on a background thread so the blocking HTTP call
+    // never stalls the render loop. The panel is seeded from the last-known
+    // cache so it shows immediately on launch.
+    let codex_shared = Arc::new(Mutex::new(load_codex_cache().unwrap_or_default()));
+    let codex_shutdown = Arc::new(AtomicBool::new(false));
+    let _codex_worker =
+        spawn_codex_quota_worker(Arc::clone(&codex_shared), Arc::clone(&codex_shutdown));
 
     let pid =
         sysinfo::get_current_pid().expect("Failed to get current process ID for memory monitoring");
@@ -105,6 +127,10 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
     let mut rows_data: Vec<UsageRow> = Vec::new();
     let mut totals = UsageTotals::default();
     let mut provider_totals = UsageProviderTotals::default();
+    // Quota panel state, cached across frames so a resize repaints without
+    // re-reading the cache / shared snapshot.
+    let mut claude_rl: Option<ClaudeRateLimitsCache> = None;
+    let mut codex_snapshot = CodexQuotaSnapshot::default();
 
     loop {
         if refresh_state.should_refresh() {
@@ -162,6 +188,11 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
             totals = summary.totals;
             provider_totals = summary.provider_totals;
 
+            // Refresh quota panels: Claude from the tiny local ingest cache,
+            // Codex from the background worker's latest snapshot.
+            claude_rl = load_claude_rate_limits();
+            codex_snapshot = codex_shared.lock().map(|g| g.clone()).unwrap_or_default();
+
             // Clear raw usage data immediately after processing to free memory.
             // Per-provider map is reset on the next refresh when new data arrives.
             usage_data.clear();
@@ -204,6 +235,8 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
                 &update_tracker,
                 &sys,
                 pid,
+                claude_rl.as_ref(),
+                &codex_snapshot,
             )?;
 
             // Hand any arena-held free pages back to the OS. The refresh cycle
@@ -215,7 +248,11 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
         }
 
         match handle_input()? {
-            InputAction::Quit => break,
+            InputAction::Quit => {
+                // Signal the detached worker to stop; the OS reclaims it on exit.
+                codex_shutdown.store(true, Ordering::Relaxed);
+                break;
+            }
             InputAction::Refresh => refresh_state.force(),
             // Redraw the cached frame at the new terminal size without
             // re-aggregating, so resize tracks the drag instead of waiting
@@ -228,6 +265,8 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
                 &update_tracker,
                 &sys,
                 pid,
+                claude_rl.as_ref(),
+                &codex_snapshot,
             )?,
             InputAction::Continue => {}
         }
@@ -256,11 +295,15 @@ fn render_usage_frame(
     update_tracker: &UpdateTracker,
     sys: &System,
     pid: Pid,
+    claude_rl: Option<&ClaudeRateLimitsCache>,
+    codex: &CodexQuotaSnapshot,
 ) -> anyhow::Result<()> {
     let provider_rows = build_provider_total_rows(provider_totals);
 
     terminal.draw(|f| {
-        let totals_height = (provider_rows.len() as u16).saturating_add(4).max(4);
+        let totals_height = (provider_rows.len() as u16)
+            .saturating_add(4)
+            .max(QUOTA_PANEL_MIN_HEIGHT);
         let chunks = RatatuiLayout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -385,7 +428,21 @@ fn render_usage_frame(
             &totals_widths,
             RatatuiColor::Magenta,
         );
-        f.render_widget(totals_table, chunks[2]);
+
+        // Split the bottom area into three columns: existing provider stats on
+        // the left, Claude + Codex quota panels side by side on the right.
+        let now = chrono::Local::now().timestamp();
+        let bottom = RatatuiLayout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(46),
+                Constraint::Percentage(27),
+                Constraint::Percentage(27),
+            ])
+            .split(chunks[2]);
+        f.render_widget(totals_table, bottom[0]);
+        render_claude_quota(f, bottom[1], claude_rl, now);
+        render_codex_quota(f, bottom[2], codex, now);
 
         let total_cost_str = format!("${:.2}", totals.cost);
         let total_tokens_str = format_number(totals.total);
@@ -412,4 +469,169 @@ fn render_usage_frame(
     })?;
 
     Ok(())
+}
+
+/// Maps a usage percentage to a traffic-light color (green/yellow/red).
+fn gauge_color(pct: f64) -> RatatuiColor {
+    if pct >= 90.0 {
+        RatatuiColor::Red
+    } else if pct >= 70.0 {
+        RatatuiColor::Yellow
+    } else {
+        RatatuiColor::Green
+    }
+}
+
+/// Renders a 5-segment mini bar like `▰▰▱▱▱` (any usage shows one block).
+fn mini_bar(pct: f64) -> String {
+    let filled = ((pct / 20.0).ceil() as i64).clamp(0, 5) as usize;
+    (0..5).map(|i| if i < filled { '▰' } else { '▱' }).collect()
+}
+
+/// Builds one gauge line: `5h ▰▰▱▱▱  27%  ↻4h13m`.
+fn quota_gauge_line(label: &str, w: &QuotaWindow, now: i64) -> Line<'static> {
+    let pct = w.used_percent;
+    let color = gauge_color(pct);
+    let mut spans = vec![
+        Span::styled(format!("{label} "), Style::default().fg(RatatuiColor::Gray)),
+        Span::styled(mini_bar(pct), Style::default().fg(color)),
+        Span::styled(format!(" {pct:>3.0}%"), Style::default().fg(color)),
+    ];
+    if let Some(reset) = w.resets_at_unix {
+        spans.push(Span::styled(
+            format!("  ↻{}", format_duration_until(reset, now)),
+            Style::default().fg(RatatuiColor::DarkGray),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// Builds the "updated Xm ago" staleness line for the Claude panel.
+///
+/// The Claude cache only refreshes when Claude Code repaints its statusLine, so
+/// staleness is expected; it is dimmed, escalating to yellow past 1h and red
+/// past 6h.
+fn staleness_line(fetched_at: i64, now: i64) -> Line<'static> {
+    if fetched_at <= 0 {
+        return dim_line("updated: never");
+    }
+    let age = (now - fetched_at).max(0);
+    let color = if age > 6 * 3600 {
+        RatatuiColor::Red
+    } else if age > 3600 {
+        RatatuiColor::Yellow
+    } else {
+        RatatuiColor::DarkGray
+    };
+    let ago = format_duration_until(now, fetched_at);
+    let text = if ago == "now" {
+        "updated just now".to_string()
+    } else {
+        format!("updated {ago} ago")
+    };
+    Line::from(Span::styled(text, Style::default().fg(color)))
+}
+
+/// A dim gray line for placeholder / hint text.
+fn dim_line(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        text.to_string(),
+        Style::default().fg(RatatuiColor::DarkGray),
+    ))
+}
+
+/// Renders the Claude quota panel (5h / 7d gauges + staleness).
+fn render_claude_quota(f: &mut Frame, area: Rect, rl: Option<&ClaudeRateLimitsCache>, now: i64) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Claude ")
+        .border_style(Style::default().fg(CLAUDE_COLOR));
+
+    let lines: Vec<Line> = match rl {
+        Some(rl) => {
+            let mut v = Vec::new();
+            if let Some(w) = &rl.five_hour {
+                v.push(quota_gauge_line("5h", w, now));
+            }
+            if let Some(w) = &rl.seven_day {
+                v.push(quota_gauge_line("7d", w, now));
+            }
+            if v.is_empty() {
+                v.push(dim_line("no rate-limit data"));
+            }
+            v.push(staleness_line(rl.fetched_at, now));
+            v
+        }
+        None => vec![
+            dim_line("no statusLine data"),
+            dim_line("add: vct statusline ingest"),
+        ],
+    };
+
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// Renders the Codex quota panel (plan, 5h / 7d gauges, credits).
+fn render_codex_quota(f: &mut Frame, area: Rect, codex: &CodexQuotaSnapshot, now: i64) {
+    let title = match codex.source {
+        QuotaSource::Api => " Codex (API) ",
+        QuotaSource::SessionFallback => " Codex (session) ",
+        QuotaSource::None => " Codex ",
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(CODEX_COLOR));
+
+    let lines: Vec<Line> = if codex.source == QuotaSource::None {
+        vec![
+            dim_line("no Codex quota"),
+            dim_line("(no auth.json / sessions)"),
+        ]
+    } else {
+        let mut v = Vec::new();
+
+        let mut plan_spans = vec![Span::styled(
+            format!("Plan: {}", codex.plan_type.as_deref().unwrap_or("?")),
+            Style::default().fg(RatatuiColor::Gray),
+        )];
+        if codex.limit_reached == Some(true) {
+            plan_spans.push(Span::styled(
+                "  LIMIT",
+                Style::default()
+                    .fg(RatatuiColor::Red)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        v.push(Line::from(plan_spans));
+
+        if let Some(w) = &codex.primary {
+            v.push(quota_gauge_line("5h", w, now));
+        }
+        if let Some(w) = &codex.secondary {
+            v.push(quota_gauge_line("7d", w, now));
+        }
+        v.push(credits_line(codex));
+        v
+    };
+
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// Builds the credits line for the Codex panel.
+fn credits_line(codex: &CodexQuotaSnapshot) -> Line<'static> {
+    let mut s = String::from("Credits: ");
+    if codex.unlimited == Some(true) {
+        s.push_str("unlimited");
+    } else if let Some(bal) = &codex.credits_balance {
+        s.push_str(bal);
+    } else {
+        s.push('-');
+    }
+    if let Some(n) = codex.reset_credits_available
+        && n > 0
+    {
+        s.push_str(&format!("  +{n} reset"));
+    }
+    Line::from(Span::styled(s, Style::default().fg(RatatuiColor::Gray)))
 }

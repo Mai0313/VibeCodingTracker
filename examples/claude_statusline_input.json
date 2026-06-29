@@ -1,0 +1,16 @@
+{
+  "rate_limits": {
+    "five_hour": {
+      "used_percentage": 16,
+      "resets_at": 1782765000
+    },
+    "seven_day": {
+      "used_percentage": 28.0,
+      "resets_at": 1782990000
+    }
+  },
+  "model": {
+    "display_name": "Opus 4.8 (1M context)",
+    "id": "claude-opus-4-8[1m]"
+  }
+}

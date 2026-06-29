@@ -168,6 +168,32 @@ pub fn get_pricing_cache_path(date: &str) -> Result<PathBuf> {
     Ok(cache_dir.join(format!("model_pricing_{}.json", date)))
 }
 
+/// Returns the Claude rate-limits cache path
+/// (`~/.vibe_coding_tracker/claude_rate_limits.json`).
+///
+/// As a side effect of resolving the cache directory, the directory is
+/// created if missing.
+///
+/// # Errors
+///
+/// Returns an error if the cache directory cannot be resolved or created.
+pub fn get_claude_rate_limits_path() -> Result<PathBuf> {
+    Ok(get_cache_dir()?.join("claude_rate_limits.json"))
+}
+
+/// Returns the Codex usage cache path
+/// (`~/.vibe_coding_tracker/codex_usage.json`).
+///
+/// As a side effect of resolving the cache directory, the directory is
+/// created if missing.
+///
+/// # Errors
+///
+/// Returns an error if the cache directory cannot be resolved or created.
+pub fn get_codex_usage_cache_path() -> Result<PathBuf> {
+    Ok(get_cache_dir()?.join("codex_usage.json"))
+}
+
 /// Returns the pricing cache path for `date` only if that file exists.
 ///
 /// Yields `None` when the file is absent or when the cache directory cannot

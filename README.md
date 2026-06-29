@@ -143,6 +143,7 @@ vct <COMMAND> [OPTIONS]
 Commands:
   analysis    Analyze JSONL conversation files (single file or all sessions)
   usage       Display token usage statistics
+  statusline  Cache Claude Code rate limits from a statusLine hook (stdin JSON)
   version     Display version information
   update      Update to the latest version from GitHub releases
   help        Print this message or the help of the given subcommand(s)
@@ -234,6 +235,24 @@ The tool automatically scans these directories:
 - `~/.gemini/tmp/<project_hash>/chats/*.jsonl` (Gemini CLI)
 - `~/.local/share/opencode/opencode.db` (OpenCode — SQLite database; honors `$XDG_DATA_HOME`)
 
+### Live Quota Panels
+
+At the bottom of the interactive dashboard, the per-provider stats sit on the left and two live quota panels sit on the right:
+
+```
+┌ Provider/Tokens/Cost/Days ┬ Claude ────────┬ Codex (API) ────┐
+│ Claude    1.2M  $3.00  4d │ 5h ▰▰▱▱▱  16%   │ Plan: plus      │
+│ Codex      800K $0.00  6d │    ↻ 4h13m      │ 5h ▰▰▱▱▱  27%   │
+│ ...                       │ 7d ▰▰▰▱▱  28%   │ 7d ▱▱▱▱▱   4%   │
+│                           │ updated 2m ago  │ Credits: 0  +2  │
+└───────────────────────────┴────────────────┴─────────────────┘
+```
+
+- **Claude** — 5-hour and weekly rate-limit usage. Claude Code only exposes these limits through its `statusLine` hook, so wire `vct statusline ingest` into your statusLine (see [Statusline Command](#statusline-command)) for this panel to populate.
+- **Codex** — plan tier, 5-hour and weekly usage, and credit balance. Pulled live from the ChatGPT backend (`wham/usage`) using the token in `~/.codex/auth.json` on a background thread; when unavailable it falls back to the newest `rate_limits` in your Codex session logs (the title shows `(API)` vs `(session)`).
+
+Quota panels appear only in the interactive TUI; `--table`, `--text`, and `--json` are unchanged.
+
 ---
 
 ## Analysis Command
@@ -307,6 +326,35 @@ vct analysis --output today.json --daily
 │  Total Lines: 16,119  |  Total Tools: 619  |  Models: 3  |  Memory: 41.2 MB                 │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
                           Press 'q', 'Esc', 'Ctrl+C' to quit | Press 'r' to refresh
+```
+
+---
+
+## Statusline Command
+
+**Feed Claude Code rate limits into the `usage` dashboard.**
+
+Claude Code only exposes its 5-hour / weekly rate limits through the `statusLine` hook's stdin JSON, so `vct` captures them from there and caches them to `~/.vibe_coding_tracker/claude_rate_limits.json` for the Claude quota panel.
+
+### If you already have a statusLine
+
+Add one backgrounded line to your existing statusLine script. It has zero impact on your current display and is isolated, so a vct error can never disturb the statusLine:
+
+```bash
+printf '%s' "$input" | vct statusline ingest >/dev/null 2>&1 &
+```
+
+### If you do not have a statusLine yet
+
+Point Claude Code's `~/.claude/settings.json` straight at vct, which caches the limits and prints a compact one-line status:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "vct statusline"
+  }
+}
 ```
 
 ---

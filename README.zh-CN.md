@@ -143,6 +143,7 @@ vct <COMMAND> [OPTIONS]
 Commands:
   analysis    Analyze JSONL conversation files (single file or all sessions)
   usage       Display token usage statistics
+  statusline  Cache Claude Code rate limits from a statusLine hook (stdin JSON)
   version     Display version information
   update      Update to the latest version from GitHub releases
   help        Print this message or the help of the given subcommand(s)
@@ -234,6 +235,24 @@ vct usage --json --daily
 - `~/.gemini/tmp/<project_hash>/chats/*.jsonl`（Gemini CLI）
 - `~/.local/share/opencode/opencode.db`（OpenCode，SQLite 数据库；遵循 `$XDG_DATA_HOME`）
 
+### 实时额度面板
+
+在交互式仪表盘底部，左侧是各 provider 统计，右侧是两个实时额度面板：
+
+```
+┌ Provider/Tokens/Cost/Days ┬ Claude ────────┬ Codex (API) ────┐
+│ Claude    1.2M  $3.00  4d │ 5h ▰▰▱▱▱  16%   │ Plan: plus      │
+│ Codex      800K $0.00  6d │    ↻ 4h13m      │ 5h ▰▰▱▱▱  27%   │
+│ ...                       │ 7d ▰▰▰▱▱  28%   │ 7d ▱▱▱▱▱   4%   │
+│                           │ updated 2m ago  │ Credits: 0  +2  │
+└───────────────────────────┴────────────────┴─────────────────┘
+```
+
+- **Claude** — 5 小时和每周的额度用量。Claude Code 仅通过 `statusLine` hook 暴露这些额度，需将 `vct statusline ingest` 接入你的 statusLine（见 [Statusline 命令](#statusline-%E5%91%BD%E4%BB%A4)）此面板才会有数据。
+- **Codex** — 套餐类型、5 小时和每周用量、额度余额。后台线程使用 `~/.codex/auth.json` 中的 token 从 ChatGPT 后端（`wham/usage`）实时拉取；不可用时回退到 Codex 会话日志中最新的 `rate_limits`（标题显示 `(API)` 或 `(session)`）。
+
+额度面板仅在交互式 TUI 中显示；`--table`、`--text`、`--json` 不受影响。
+
 ---
 
 ## Analysis 命令
@@ -307,6 +326,35 @@ vct analysis --output today.json --daily
 │  Total Lines: 16,119  |  Total Tools: 619  |  Models: 3  |  Memory: 41.2 MB                 │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
                           Press 'q', 'Esc', 'Ctrl+C' to quit | Press 'r' to refresh
+```
+
+---
+
+## Statusline 命令
+
+**将 Claude Code 的额度信息接入 `usage` 仪表盘。**
+
+Claude Code 仅通过 `statusLine` hook 的 stdin JSON 暴露其 5 小时 / 每周额度，因此 `vct` 从那里捕获并缓存到 `~/.vibe_coding_tracker/claude_rate_limits.json`，供 Claude 额度面板读取。
+
+### 如果你已有 statusLine
+
+在现有 statusLine 脚本中加一行后台命令。它对当前显示零影响，且相互隔离，vct 出错也绝不会干扰 statusLine：
+
+```bash
+printf '%s' "$input" | vct statusline ingest >/dev/null 2>&1 &
+```
+
+### 如果你还没有 statusLine
+
+让 Claude Code 的 `~/.claude/settings.json` 直接指向 vct，它会缓存额度并打印一行简洁状态：
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "vct statusline"
+  }
+}
 ```
 
 ---

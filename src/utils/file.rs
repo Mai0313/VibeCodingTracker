@@ -54,6 +54,35 @@ pub fn read_jsonl<P: AsRef<Path>>(path: P) -> Result<Vec<Value>> {
     Ok(results)
 }
 
+/// Serializes `value` as JSON and writes it to `path` atomically.
+///
+/// Writes to a temporary file in the same directory, fsyncs it, then renames
+/// it over `path`, so a concurrent reader never observes a partially written
+/// file. Used by the statusline ingest (many Claude sessions write the same
+/// cache concurrently) and by the Codex quota worker.
+///
+/// # Errors
+///
+/// Returns an error if the parent directory cannot be created, the temp file
+/// cannot be written, or the final rename fails.
+pub fn write_json_atomic<T, P>(path: P, value: &T) -> Result<()>
+where
+    T: serde::Serialize,
+    P: AsRef<Path>,
+{
+    let path = path.as_ref();
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("Failed to create directory: {}", dir.display()))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)
+        .with_context(|| format!("Failed to create temp file in: {}", dir.display()))?;
+    serde_json::to_writer(&mut tmp, value).context("Failed to serialize JSON")?;
+    tmp.as_file().sync_all().ok();
+    tmp.persist(path)
+        .with_context(|| format!("Failed to persist file: {}", path.display()))?;
+    Ok(())
+}
+
 /// Reads a single JSON document and returns it wrapped in a one-element `Vec`.
 ///
 /// The wrapping keeps the return type identical to [`read_jsonl`] so callers

@@ -14,7 +14,7 @@ use comfy_table::{Cell, CellAlignment, Color, ContentArrangement, Table, presets
 use owo_colors::OwoColorize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use vibe_coding_tracker::cli::{Cli, Commands, resolve_time_range};
+use vibe_coding_tracker::cli::{Cli, Commands, StatuslineCommand, resolve_time_range};
 
 // mimalloc is opt-in behind the `mimalloc` cargo feature. The default build
 // uses the system allocator because mimalloc's lazy purge retains freed
@@ -217,6 +217,11 @@ fn main() -> Result<()> {
                 vibe_coding_tracker::update::update_interactive(force)?;
             }
         }
+
+        Commands::Statusline { command } => match command {
+            Some(StatuslineCommand::Ingest) => vibe_coding_tracker::statusline::run_ingest(),
+            None => vibe_coding_tracker::statusline::run_default()?,
+        },
     }
 
     Ok(())

@@ -84,6 +84,38 @@ pub fn get_current_date() -> String {
     date_string
 }
 
+/// Formats the time remaining until `reset_unix` as a compact human string.
+///
+/// Returns "now" when the reset is in the past or under a minute away
+/// (clamped at 0), otherwise the two most significant units: "13m", "2h13m",
+/// or "4d2h".
+///
+/// # Examples
+///
+/// ```
+/// use vibe_coding_tracker::utils::format_duration_until;
+///
+/// assert_eq!(format_duration_until(100, 100), "now");
+/// assert_eq!(format_duration_until(100 + 13 * 60, 100), "13m");
+/// assert_eq!(format_duration_until(100 + 2 * 3600 + 13 * 60, 100), "2h13m");
+/// assert_eq!(format_duration_until(100 + 4 * 86400 + 2 * 3600, 100), "4d2h");
+/// ```
+pub fn format_duration_until(reset_unix: i64, now_unix: i64) -> String {
+    let secs = (reset_unix - now_unix).max(0);
+    let days = secs / 86400;
+    let hours = (secs % 86400) / 3600;
+    let minutes = (secs % 3600) / 60;
+    if days > 0 {
+        format!("{days}d{hours}h")
+    } else if hours > 0 {
+        format!("{hours}h{minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m")
+    } else {
+        "now".to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
