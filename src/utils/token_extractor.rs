@@ -33,6 +33,10 @@ pub struct TokenCounts {
     pub cache_creation_5m: i64,
     /// Cache-write tokens at the extended 1-hour TTL.
     pub cache_creation_1h: i64,
+    /// Server-side web-search requests (Claude `server_tool_use`). Billed
+    /// per query (not per token) at the model's web-search rate, so it is
+    /// tracked here but excluded from `total`.
+    pub web_search_requests: i64,
     /// Sum of the billed buckets used for cost and display.
     pub total: i64,
 }
@@ -93,6 +97,18 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
             .and_then(|v| v.as_i64())
         {
             counts.cache_creation = cache_creation;
+        }
+
+        // Claude `server_tool_use.web_search_requests`: server-side web search
+        // count, billed per query separately from tokens. Read here in the
+        // flat section so it is captured before the Codex `total_token_usage`
+        // early-return below (Codex never carries this field, so it stays 0).
+        if let Some(server_tool_use) = usage_obj.get("server_tool_use").and_then(|v| v.as_object())
+        {
+            counts.web_search_requests = server_tool_use
+                .get("web_search_requests")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
         }
 
         // Gemini writes reasoning budget as `thoughts_tokens`; Copilot's
@@ -170,13 +186,21 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
             {
                 counts.reasoning_tokens = reasoning;
             }
+            // OpenAI convention: `output_tokens` (completion) already INCLUDES
+            // `reasoning_output_tokens`. Split them into disjoint buckets so
+            // each token is billed exactly once — visible output at the output
+            // rate, reasoning at its dedicated rate (or the output fallback).
+            // Without this subtraction reasoning is billed twice: once inside
+            // output and again as the separate reasoning bucket. Verified
+            // across 21,113 real Codex token_count events: `total_tokens ==
+            // input + output` holds for every one and `reasoning > output`
+            // never occurs, so reasoning is always a subset of output.
+            counts.output_tokens = (counts.output_tokens - counts.reasoning_tokens).max(0);
             if let Some(total) = total_usage.get("total_tokens").and_then(|v| v.as_i64()) {
-                // Codex `total_tokens` = input (incl. cached) + output and
-                // excludes `reasoning_output_tokens`. We already split
-                // input / cached above, so the numeric total the user sees
-                // still matches: (non_cached_input + cached) + output +
-                // reasoning == Codex's `total_tokens` + reasoning.
-                counts.total = total + counts.reasoning_tokens;
+                // `total_tokens == input (incl. cached) + output`, and output
+                // already contains reasoning, so the published total is the
+                // correct each-token-once figure. Use it verbatim.
+                counts.total = total;
                 return counts;
             }
         }
@@ -298,11 +322,12 @@ mod tests {
         let c = extract_token_counts(&usage);
         assert_eq!(c.input_tokens, 576_145 - 408_832);
         assert_eq!(c.cache_read, 408_832);
-        assert_eq!(c.output_tokens, 13_156);
+        // `output_tokens` (completion) already includes reasoning; the
+        // extractor splits them so each token is billed once.
+        assert_eq!(c.output_tokens, 13_156 - 8_591);
         assert_eq!(c.reasoning_tokens, 8_591);
-        // Published total + reasoning. Equivalent to
-        // (input_tokens + cache_read) + output_tokens + reasoning_tokens.
-        assert_eq!(c.total, 589_301 + 8_591);
+        // `total_tokens == input + output` already, so it is used verbatim.
+        assert_eq!(c.total, 589_301);
     }
 
     #[test]
@@ -346,8 +371,11 @@ mod tests {
     }
 
     #[test]
-    fn codex_reasoning_is_separated_from_output() {
-        // Mimics a real Codex `event_msg` record mid-session.
+    fn codex_reasoning_is_split_out_of_output() {
+        // Mimics a real Codex `event_msg` record mid-session. Per OpenAI's
+        // convention `output_tokens` already includes `reasoning_output_tokens`,
+        // so the extractor subtracts reasoning out of output to keep the two
+        // buckets disjoint (each token billed exactly once).
         let usage = json!({
             "total_token_usage": {
                 "input_tokens": 5_645,
@@ -361,12 +389,55 @@ mod tests {
         assert_eq!(c.input_tokens, 5_645 - 5_504);
         assert_eq!(c.cache_read, 5_504);
         assert_eq!(
-            c.output_tokens, 810,
-            "reasoning must no longer fold into output_tokens"
+            c.output_tokens,
+            810 - 640,
+            "reasoning must be subtracted out of output, not double-counted"
         );
         assert_eq!(c.reasoning_tokens, 640);
-        // Codex `total_tokens` excludes reasoning, so `total` ≥ published total.
-        assert_eq!(c.total, 6_455 + 640);
+        // `total_tokens == input + output` (reasoning lives inside output),
+        // so the published total is used verbatim.
+        assert_eq!(c.total, 6_455);
+    }
+
+    #[test]
+    fn codex_real_world_reasoning_subset_of_output() {
+        // The exact `info.total_token_usage` shape from a real session: output
+        // 508 already contains the 255 reasoning tokens; total 73_861 already
+        // equals input + output. Regression guard against re-introducing the
+        // double-count.
+        let usage = json!({
+            "total_token_usage": {
+                "input_tokens": 73_353,
+                "cached_input_tokens": 31_744,
+                "output_tokens": 508,
+                "reasoning_output_tokens": 255,
+                "total_tokens": 73_861
+            }
+        });
+        let c = extract_token_counts(&usage);
+        assert_eq!(c.input_tokens, 73_353 - 31_744);
+        assert_eq!(c.cache_read, 31_744);
+        assert_eq!(c.output_tokens, 508 - 255);
+        assert_eq!(c.reasoning_tokens, 255);
+        assert_eq!(c.total, 73_861);
+    }
+
+    #[test]
+    fn claude_server_tool_use_web_search_is_extracted() {
+        // `server_tool_use.web_search_requests` feeds the per-query web-search
+        // billing path; a missing object leaves the count at 0.
+        let with_search = json!({
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "server_tool_use": {
+                "web_search_requests": 3,
+                "web_fetch_requests": 1
+            }
+        });
+        assert_eq!(extract_token_counts(&with_search).web_search_requests, 3);
+
+        let without = json!({ "input_tokens": 100, "output_tokens": 50 });
+        assert_eq!(extract_token_counts(&without).web_search_requests, 0);
     }
 
     #[test]

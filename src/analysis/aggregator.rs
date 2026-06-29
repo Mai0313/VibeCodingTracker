@@ -386,3 +386,76 @@ fn aggregate_analysis_result(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{CodeAnalysisRecord, CodeAnalysisToolCalls};
+    use serde_json::json;
+
+    fn analysis_with_advisor() -> CodeAnalysis {
+        let mut conversation_usage = FastHashMap::default();
+        conversation_usage.insert("claude-haiku-4-5".to_string(), json!({ "input_tokens": 4 }));
+        let mut advisor_usage = FastHashMap::default();
+        advisor_usage.insert(
+            "claude-opus-4-8".to_string(),
+            json!({ "input_tokens": 47579 }),
+        );
+
+        let record = CodeAnalysisRecord {
+            total_unique_files: 1,
+            total_write_lines: 10,
+            total_read_lines: 20,
+            total_edit_lines: 5,
+            total_write_characters: 0,
+            total_read_characters: 0,
+            total_edit_characters: 0,
+            write_file_details: vec![],
+            read_file_details: vec![],
+            edit_file_details: vec![],
+            run_command_details: vec![],
+            tool_call_counts: CodeAnalysisToolCalls {
+                read: 4,
+                write: 1,
+                edit: 2,
+                todo_write: 1,
+                bash: 3,
+            },
+            conversation_usage,
+            advisor_usage,
+            task_id: String::new(),
+            timestamp: 0,
+            folder_path: String::new(),
+            git_remote_url: String::new(),
+        };
+
+        CodeAnalysis {
+            user: String::new(),
+            extension_name: String::new(),
+            insights_version: String::new(),
+            machine_id: String::new(),
+            records: vec![record],
+        }
+    }
+
+    #[test]
+    fn advisor_model_is_not_credited_with_file_operations() {
+        // Regression guard: advisor-message usage lives in `advisor_usage`, not
+        // `conversation_usage`, so the aggregator must not create a row for the
+        // advisor model or credit it with the main model's tool / line counts.
+        let analysis = analysis_with_advisor();
+        let mut aggregated = FastHashMap::default();
+        aggregate_analysis_result(&mut aggregated, &analysis);
+
+        let main = aggregated
+            .get("claude-haiku-4-5")
+            .expect("main model row must exist");
+        assert_eq!(main.read_lines, 20);
+        assert_eq!(main.bash_count, 3);
+
+        assert!(
+            aggregated.get("claude-opus-4-8").is_none(),
+            "advisor model must not be credited with the main model's file operations"
+        );
+    }
+}
