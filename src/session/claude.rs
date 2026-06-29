@@ -60,6 +60,10 @@ where
     let mut state = SessionParseState::with_mode(mode);
     let mut conversation_usage: FastHashMap<String, Value> =
         FastHashMap::with_capacity(capacity::MODELS_PER_SESSION);
+    // Advisor-message token usage is kept separate from `conversation_usage`
+    // so the `analysis` aggregator never attributes the main model's file-op
+    // counts to an advisor model. The `usage` path merges this in.
+    let mut advisor_usage: FastHashMap<String, Value> = FastHashMap::default();
     // Map `tool_use_id` → `(tool_name, tool_input)` so the user-side
     // tool_result fallback (used by subagent JSONL files that lack the
     // top-level `toolUseResult` field) can recover the original tool name
@@ -90,9 +94,11 @@ where
                 // Claude Code's top-level `usage` is the sum of the
                 // `message`-type entries in `usage.iterations` and EXCLUDES any
                 // `advisor_message` iteration (a secondary inference Claude Code
-                // runs but keeps off its own /cost accounting). Fold those
-                // advisor tokens back in — attributed to the advisor's own model
-                // — so vct reflects every token the model actually consumed.
+                // runs but keeps off its own /cost accounting). Capture those
+                // advisor tokens — under the advisor's own model so they price
+                // correctly — in the separate `advisor_usage` map so the
+                // `usage` cost reflects them without the `analysis` aggregator
+                // crediting the advisor with the main model's file operations.
                 if let Some(iters) = usage.get("iterations").and_then(|v| v.as_array()) {
                     for iter in iters {
                         if iter.get("type").and_then(|t| t.as_str()) == Some("advisor_message") {
@@ -100,7 +106,7 @@ where
                                 .get("model")
                                 .and_then(|m| m.as_str())
                                 .unwrap_or(model.as_str());
-                            process_claude_usage(&mut conversation_usage, adv_model, iter);
+                            process_claude_usage(&mut advisor_usage, adv_model, iter);
                         }
                     }
                 }
@@ -204,7 +210,8 @@ where
         state.git_remote = get_git_remote_url(&state.folder_path);
     }
 
-    let record = state.into_record(conversation_usage);
+    let mut record = state.into_record(conversation_usage);
+    record.advisor_usage = advisor_usage;
 
     Ok(CodeAnalysis {
         user: String::new(),
@@ -361,15 +368,18 @@ mod tests {
     }
 
     #[test]
-    fn advisor_message_iteration_is_counted_under_its_own_model() {
+    fn advisor_message_usage_is_separated_from_conversation_usage() {
         // Top-level usage already sums the `message`-type iterations and omits
-        // the `advisor_message` one; the parser folds the advisor back in,
-        // attributed to the advisor's own model.
+        // the `advisor_message` one. The advisor tokens land in `advisor_usage`
+        // (under the advisor's own model), NOT in `conversation_usage`, so the
+        // analysis aggregator never credits the advisor with the main model's
+        // file operations. The advisor here uses a *different* model than the
+        // main turn to make the separation observable.
         let raw = serde_json::json!({
             "type": "assistant",
             "timestamp": "2025-01-01T00:00:00Z",
             "message": {
-                "model": "claude-opus-4-8",
+                "model": "claude-haiku-4-5",
                 "content": [],
                 "usage": {
                     "input_tokens": 4,
@@ -378,7 +388,7 @@ mod tests {
                     "cache_creation_input_tokens": 18687,
                     "iterations": [
                         { "type": "message", "input_tokens": 2, "output_tokens": 6397 },
-                        { "type": "advisor_message", "model": "advisor-opus",
+                        { "type": "advisor_message", "model": "claude-opus-4-8",
                           "input_tokens": 47579, "output_tokens": 10521 },
                         { "type": "message", "input_tokens": 2, "output_tokens": 1043 }
                     ]
@@ -387,24 +397,28 @@ mod tests {
         });
         let log: ClaudeCodeLog = serde_json::from_value(raw).unwrap();
         let analysis = parse_claude_logs(vec![log], ParseMode::Full).unwrap();
-        let usage = &analysis.records[0].conversation_usage;
+        let record = &analysis.records[0];
 
-        // Main model keeps the top-level (message-iteration) totals untouched.
-        let main = usage.get("claude-opus-4-8").unwrap();
+        // `conversation_usage` (what `analysis` reads) carries only the main
+        // model with its top-level totals — no advisor key.
+        let conv = &record.conversation_usage;
+        assert_eq!(conv.len(), 1);
+        let main = conv.get("claude-haiku-4-5").unwrap();
         assert_eq!(main["input_tokens"].as_i64().unwrap(), 4);
         assert_eq!(main["output_tokens"].as_i64().unwrap(), 7440);
+        assert!(conv.get("claude-opus-4-8").is_none());
 
-        // Advisor iteration is added under its own model, not double-counted
-        // into the main model.
-        let advisor = usage.get("advisor-opus").unwrap();
+        // `advisor_usage` (what `usage` merges) carries the advisor tokens
+        // under its own model for correct pricing.
+        let advisor = record.advisor_usage.get("claude-opus-4-8").unwrap();
         assert_eq!(advisor["input_tokens"].as_i64().unwrap(), 47579);
         assert_eq!(advisor["output_tokens"].as_i64().unwrap(), 10521);
     }
 
     #[test]
-    fn message_only_iterations_do_not_change_usage() {
+    fn message_only_iterations_leave_advisor_usage_empty() {
         // Without an advisor_message iteration, usage equals the top-level
-        // values (no extra accumulation from the message iterations).
+        // values and `advisor_usage` stays empty.
         let raw = serde_json::json!({
             "type": "assistant",
             "timestamp": "2025-01-01T00:00:00Z",
@@ -422,9 +436,10 @@ mod tests {
         });
         let log: ClaudeCodeLog = serde_json::from_value(raw).unwrap();
         let analysis = parse_claude_logs(vec![log], ParseMode::Full).unwrap();
-        let usage = &analysis.records[0].conversation_usage;
-        assert_eq!(usage.len(), 1);
-        let main = usage.get("claude-opus-4-8").unwrap();
+        let record = &analysis.records[0];
+        assert_eq!(record.conversation_usage.len(), 1);
+        assert!(record.advisor_usage.is_empty());
+        let main = record.conversation_usage.get("claude-opus-4-8").unwrap();
         assert_eq!(main["input_tokens"].as_i64().unwrap(), 6527);
         assert_eq!(main["output_tokens"].as_i64().unwrap(), 764);
     }

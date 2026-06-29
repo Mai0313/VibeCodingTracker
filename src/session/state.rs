@@ -340,6 +340,7 @@ impl SessionParseState {
             run_command_details: self.run_details,
             tool_call_counts: self.tool_counts,
             conversation_usage,
+            advisor_usage: FastHashMap::default(),
             task_id: self.task_id,
             timestamp: self.last_ts,
             folder_path: self.folder_path,

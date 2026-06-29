@@ -140,6 +140,16 @@ pub struct CodeAnalysisRecord {
     /// Token-usage payloads keyed by model name; shape varies by provider
     /// (see [`crate::models::UsageResult`]).
     pub conversation_usage: FastHashMap<String, serde_json::Value>,
+    /// Token usage from Claude Code `advisor_message` iterations, keyed by the
+    /// advisor's own model. Kept **out** of `conversation_usage` on purpose:
+    /// the `analysis` aggregator attributes a record's file-operation / tool
+    /// counts to every model in `conversation_usage`, but an advisor model
+    /// never executes tools, so adding it there would mis-attribute the main
+    /// model's metrics to the advisor. The `usage` path merges this in (priced
+    /// at the advisor's own rate); `analysis` ignores it. Not serialized, so
+    /// the `analysis` JSON / golden output is unaffected.
+    #[serde(skip)]
+    pub advisor_usage: FastHashMap<String, serde_json::Value>,
     /// Session / task identifier from the source log.
     pub task_id: String,
     /// Unix epoch timestamp (milliseconds) of the session's last activity.
@@ -454,6 +464,7 @@ mod tests {
             run_command_details: vec![],
             tool_call_counts: CodeAnalysisToolCalls::default(),
             conversation_usage: FastHashMap::default(),
+            advisor_usage: FastHashMap::default(),
             task_id: "task-123".to_string(),
             timestamp: 1234567890,
             folder_path: "/workspace".to_string(),
@@ -486,6 +497,7 @@ mod tests {
             run_command_details: vec![],
             tool_call_counts: CodeAnalysisToolCalls::default(),
             conversation_usage: FastHashMap::default(),
+            advisor_usage: FastHashMap::default(),
             task_id: String::new(),
             timestamp: 0,
             folder_path: String::new(),

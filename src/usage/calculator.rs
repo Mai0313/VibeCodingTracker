@@ -79,12 +79,22 @@ pub struct UsageData {
 fn extract_conversation_usage_from_analysis(analysis: &CodeAnalysis) -> FastHashMap<String, Value> {
     let mut conversation_usage = FastHashMap::with_capacity(capacity::MODELS_PER_SESSION);
 
+    let mut merge_into = |model: &String, usage: &Value| {
+        conversation_usage
+            .entry(model.clone())
+            .and_modify(|existing_usage| merge_usage_values(existing_usage, usage))
+            .or_insert_with(|| usage.clone());
+    };
+
     for record in &analysis.records {
         for (model, usage) in &record.conversation_usage {
-            conversation_usage
-                .entry(model.clone())
-                .and_modify(|existing_usage| merge_usage_values(existing_usage, usage))
-                .or_insert_with(|| usage.clone());
+            merge_into(model, usage);
+        }
+        // Claude advisor-message tokens live in a separate map so the
+        // `analysis` aggregator ignores them; the `usage` path folds them in
+        // here, attributed to the advisor's own model for correct pricing.
+        for (model, usage) in &record.advisor_usage {
+            merge_into(model, usage);
         }
     }
 
