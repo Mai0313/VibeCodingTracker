@@ -382,7 +382,7 @@ pub fn resolve_model_cost(
     opencode_cost: Option<f64>,
 ) -> (f64, Option<String>) {
     let priced = |pricing: &crate::pricing::ModelPricing| {
-        calculate_cost(
+        let token_cost = calculate_cost(
             counts.input_tokens,
             counts.output_tokens,
             counts.reasoning_tokens,
@@ -390,7 +390,11 @@ pub fn resolve_model_cost(
             counts.cache_creation_5m,
             counts.cache_creation_1h,
             pricing,
-        )
+        );
+        // Web search is billed per query (Claude `server_tool_use`),
+        // separately from tokens. `web_search_requests` is 0 for every
+        // non-Claude model, so this term is a no-op for them.
+        token_cost + counts.web_search_requests as f64 * pricing.web_search_cost_per_query
     };
 
     if let Some(stored) = opencode_cost {
@@ -451,6 +455,12 @@ fn merge_usage_values(existing: &mut Value, new: &Value) {
 
             if let Some(new_cache) = new_obj.get("cache_creation").and_then(|v| v.as_object()) {
                 accumulate_nested_object(existing_obj, "cache_creation", new_cache);
+            }
+
+            // Claude server-side tool counts (web_search_requests /
+            // web_fetch_requests) merge across files just like cache_creation.
+            if let Some(new_stu) = new_obj.get("server_tool_use").and_then(|v| v.as_object()) {
+                accumulate_nested_object(existing_obj, "server_tool_use", new_stu);
             }
         }
         // Handle Codex format (has total_token_usage)

@@ -81,6 +81,13 @@ OpenCode cost is a special case: `usage::resolve_model_cost` prices an OpenCode 
 
 `src/session/state.rs` defines `ParseMode::Full` vs `ParseMode::UsageOnly`. The usage path uses `UsageOnly` to skip allocating the large `write_file_details` / `edit_file_details` bodies — this is a major part of why the TUI sits at ~30–50 MB RSS even on 200+ session directories. Preserve this distinction when adding new fields to `CodeAnalysisRecord`.
 
+### Token accounting quirks
+
+`src/utils/token_extractor.rs` (`extract_token_counts`) normalizes provider shapes into disjoint billable buckets. Two provider-specific subtleties:
+
+- **Codex reasoning is a subset of output.** Codex follows OpenAI's convention where `total_token_usage.output_tokens` (completion) already includes `reasoning_output_tokens`, and `total_tokens == input + output`. The Codex branch subtracts reasoning back out of `output_tokens` so each token is billed once, and uses the published `total_tokens` verbatim. Do **not** re-add reasoning to output or total here. (Gemini / Copilot report reasoning *disjoint* from output, so their flat branch keeps the buckets separate without subtracting.)
+- **Claude `advisor_message` iterations are counted.** Claude Code's top-level `usage` equals the sum of the `message`-type entries in `usage.iterations` and excludes any `advisor_message` iteration. `src/session/claude.rs` deliberately folds those advisor tokens back in (attributed to the advisor's own model), so vct's Claude totals run **higher** than Claude Code's own `/cost`.
+
 ### Provider directories
 
 Resolved by `src/utils/paths.rs` (`resolve_paths`):
@@ -100,6 +107,7 @@ Resolved by `src/utils/paths.rs` (`resolve_paths`):
 2. Cached as `~/.vibe_coding_tracker/model_pricing_YYYY-MM-DD.json`. The cache stores the **filtered raw upstream JSON**, not the derived `ModelPricing` shape — so future versions can read tiered/flex/batch pricing without re-fetching.
 3. Lookup priority: exact → normalized (strip version suffix) → substring → Jaro-Winkler fuzzy (≥0.7 threshold) → $0.00 fallback
 4. `ModelPricingMap` precomputes normalized + lowercase indices and uses `Rc<str>` keys to avoid cloning. There is also a small in-process LRU (`MATCH_CACHE`) for repeated lookups during a TUI refresh.
+5. Cost is not token-only: Claude `server_tool_use.web_search_requests` is billed **per query** at `ModelPricing::web_search_cost_per_query` (derived by `parse_litellm_entry` from LiteLLM's nested `search_context_cost_per_query`, a flat $0.01 for Anthropic). `resolve_model_cost` adds it on top of the token cost; it is 0 for every non-Claude model. `web_fetch_requests` is **not** separately billed (its fetched content already counts as input tokens).
 
 ### Memory tuning (Linux glibc only)
 

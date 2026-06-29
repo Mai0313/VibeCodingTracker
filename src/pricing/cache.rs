@@ -112,6 +112,15 @@ pub struct ModelPricing {
     #[serde(default)]
     pub output_cost_per_reasoning_token: f64,
 
+    /// Price in USD for one server-side web-search request
+    /// (`server_tool_use.web_search_requests`), billed per query rather than
+    /// per token. Derived by `parse_litellm_entry` from LiteLLM's nested
+    /// `search_context_cost_per_query` object (Anthropic charges a flat
+    /// $0.01 across its low/medium/high sizes). `0.0` means the model
+    /// publishes no web-search price.
+    #[serde(default)]
+    pub web_search_cost_per_query: f64,
+
     /// Threshold-based tiers, sorted ascending by `threshold_tokens`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tiers: Vec<ThresholdTier>,
@@ -181,6 +190,20 @@ pub fn parse_litellm_entry(value: &serde_json::Value) -> ModelPricing {
                 if !ranges.is_empty() {
                     pricing.ranges = Some(ranges);
                 }
+            }
+            continue;
+        }
+
+        if key == "search_context_cost_per_query" {
+            // Nested object { search_context_size_low/medium/high }. Anthropic
+            // bills a flat rate across sizes, so take the medium tier with the
+            // low/high siblings as fallbacks (handled here, not via as_f64()).
+            if let Some(sc) = raw_val.as_object() {
+                let pick = |k: &str| sc.get(k).and_then(|v| v.as_f64());
+                pricing.web_search_cost_per_query = pick("search_context_size_medium")
+                    .or_else(|| pick("search_context_size_low"))
+                    .or_else(|| pick("search_context_size_high"))
+                    .unwrap_or(0.0);
             }
             continue;
         }
@@ -474,7 +497,8 @@ pub fn normalize_pricing(
             || p.cache_read_input_token_cost != 0.0
             || p.cache_creation_input_token_cost != 0.0
             || p.cache_creation_input_token_cost_above_1hr != 0.0
-            || p.output_cost_per_reasoning_token != 0.0;
+            || p.output_cost_per_reasoning_token != 0.0
+            || p.web_search_cost_per_query != 0.0;
         let has_nonzero_tier = p.tiers.iter().any(|t| {
             t.input_cost_per_token != 0.0
                 || t.output_cost_per_token != 0.0
@@ -523,6 +547,32 @@ mod parser_tests {
         // above_1hr is cache TTL, not a context-size tier — must NOT become a tier.
         assert!(p.tiers.is_empty());
         assert!(p.ranges.is_none());
+    }
+
+    #[test]
+    fn parses_web_search_cost_per_query() {
+        // LiteLLM ships web-search pricing as a nested object; the parser
+        // collapses it to a per-query scalar (medium tier; Anthropic is a flat
+        // $0.01 across sizes). The value is a non-numeric object, so it must be
+        // handled before the `as_f64()` skip.
+        let raw = json!({
+            "input_cost_per_token": 5e-6,
+            "output_cost_per_token": 2.5e-5,
+            "search_context_cost_per_query": {
+                "search_context_size_low": 0.01,
+                "search_context_size_medium": 0.01,
+                "search_context_size_high": 0.01
+            }
+        });
+        let p = parse_litellm_entry(&raw);
+        assert_eq!(p.web_search_cost_per_query, 0.01);
+        assert_eq!(p.input_cost_per_token, 5e-6);
+    }
+
+    #[test]
+    fn web_search_cost_absent_defaults_to_zero() {
+        let raw = json!({ "input_cost_per_token": 5e-6 });
+        assert_eq!(parse_litellm_entry(&raw).web_search_cost_per_query, 0.0);
     }
 
     #[test]
@@ -1075,6 +1125,7 @@ mod serialization_tests {
             cache_read_input_token_cost: 3.0,
             cache_creation_input_token_cost: 4.0,
             output_cost_per_reasoning_token: 11.0,
+            web_search_cost_per_query: 0.01,
             tiers: vec![ThresholdTier {
                 threshold_tokens: 200_000,
                 input_cost_per_token: 5.0,
@@ -1102,6 +1153,7 @@ mod serialization_tests {
         assert_eq!(deserialized.cache_read_input_token_cost, 3.0);
         assert_eq!(deserialized.cache_creation_input_token_cost, 4.0);
         assert_eq!(deserialized.output_cost_per_reasoning_token, 11.0);
+        assert_eq!(deserialized.web_search_cost_per_query, 0.01);
         assert_eq!(deserialized.tiers.len(), 1);
         assert_eq!(deserialized.tiers[0].threshold_tokens, 200_000);
         assert_eq!(deserialized.tiers[0].input_cost_per_token, 5.0);

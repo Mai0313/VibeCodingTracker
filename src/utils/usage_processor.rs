@@ -150,6 +150,13 @@ pub fn process_claude_usage(
     if let Some(cache_creation) = usage_obj.get("cache_creation").and_then(|v| v.as_object()) {
         accumulate_nested_object(existing_obj, "cache_creation", cache_creation);
     }
+
+    // Handle server_tool_use nested object (web_search_requests /
+    // web_fetch_requests). Accumulated so per-query web-search billing sees
+    // the session total.
+    if let Some(server_tool_use) = usage_obj.get("server_tool_use").and_then(|v| v.as_object()) {
+        accumulate_nested_object(existing_obj, "server_tool_use", server_tool_use);
+    }
 }
 
 /// Merges one Codex usage record into `conversation_usage`, keyed by `model`.
@@ -436,6 +443,35 @@ mod tests {
         let result = conversation_usage.get(model).unwrap();
         assert_eq!(result["input_tokens"].as_i64().unwrap(), 175);
         assert_eq!(result["output_tokens"].as_i64().unwrap(), 75);
+    }
+
+    #[test]
+    fn test_process_claude_usage_accumulates_server_tool_use() {
+        let mut conversation_usage = FastHashMap::default();
+        let model = "claude-opus-4-8";
+
+        process_claude_usage(
+            &mut conversation_usage,
+            model,
+            &json!({
+                "input_tokens": 10,
+                "server_tool_use": { "web_search_requests": 2, "web_fetch_requests": 1 }
+            }),
+        );
+        process_claude_usage(
+            &mut conversation_usage,
+            model,
+            &json!({
+                "input_tokens": 5,
+                "server_tool_use": { "web_search_requests": 3, "web_fetch_requests": 0 }
+            }),
+        );
+
+        let stu = conversation_usage.get(model).unwrap()["server_tool_use"]
+            .as_object()
+            .unwrap();
+        assert_eq!(stu["web_search_requests"].as_i64().unwrap(), 5);
+        assert_eq!(stu["web_fetch_requests"].as_i64().unwrap(), 1);
     }
 
     #[test]
