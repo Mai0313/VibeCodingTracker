@@ -147,7 +147,8 @@ fn sorted_subdirs_desc(dir: &Path) -> Vec<PathBuf> {
 ///
 /// Looks at both `payload.rate_limits` and `payload.info.rate_limits`, and
 /// captures `plan_type` from the same object. Records whose `rate_limits`
-/// carries neither window are skipped.
+/// carries neither window, or that belong to a non-`codex` limit family, are
+/// skipped.
 pub fn extract_latest_rate_limits(values: &[Value]) -> Option<CodexQuotaSnapshot> {
     for v in values.iter().rev() {
         let Some(payload) = v.get("payload") else {
@@ -162,6 +163,11 @@ pub fn extract_latest_rate_limits(values: &[Value]) -> Option<CodexQuotaSnapshot
         let Ok(rl) = serde_json::from_value::<CodexSessionRateLimits>(rl_val.clone()) else {
             continue;
         };
+        // Only the main "codex" account limit maps to the 5h/7d panel; skip
+        // other metered families so they are not mislabeled as Codex quota.
+        if rl.limit_id.as_deref().is_some_and(|id| id != "codex") {
+            continue;
+        }
         if rl.primary.is_none() && rl.secondary.is_none() {
             continue;
         }
@@ -222,6 +228,27 @@ mod tests {
     fn returns_none_without_rate_limits() {
         let values = vec![json!({"payload":{"type":"message"}}), json!({"foo":1})];
         assert!(extract_latest_rate_limits(&values).is_none());
+    }
+
+    #[test]
+    fn skips_non_codex_limit_family() {
+        let values = vec![
+            // Older record: the real "codex" account quota.
+            json!({"payload":{"rate_limits":{"limit_id":"codex","primary":{"used_percent":12.0,"resets_at":1},"plan_type":"plus"}}}),
+            // Newest record: a different metered family, must be skipped.
+            json!({"payload":{"rate_limits":{"limit_id":"codex_other","primary":{"used_percent":95.0,"resets_at":2}}}}),
+        ];
+        let snap = extract_latest_rate_limits(&values).unwrap();
+        assert_eq!(snap.primary.unwrap().used_percent, 12.0);
+        assert_eq!(snap.plan_type.as_deref(), Some("plus"));
+    }
+
+    #[test]
+    fn accepts_missing_limit_id() {
+        let values =
+            vec![json!({"payload":{"rate_limits":{"primary":{"used_percent":7.0,"resets_at":1}}}})];
+        let snap = extract_latest_rate_limits(&values).unwrap();
+        assert_eq!(snap.primary.unwrap().used_percent, 7.0);
     }
 
     #[test]

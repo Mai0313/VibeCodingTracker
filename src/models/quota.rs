@@ -176,6 +176,10 @@ impl fmt::Debug for CodexAuthTokens {
 /// The `rate_limits` object embedded in Codex `token_count` events.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CodexSessionRateLimits {
+    /// Limit family this snapshot describes; only the main `codex` account
+    /// quota maps to the 5h/7d panel, so other families are skipped.
+    #[serde(default)]
+    pub limit_id: Option<String>,
     /// Plan tier (e.g. "plus"), alongside the windows.
     #[serde(default)]
     pub plan_type: Option<String>,
