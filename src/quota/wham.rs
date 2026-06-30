@@ -155,6 +155,15 @@ mod tests {
     }
 
     #[test]
+    fn accepts_numeric_credit_balance() {
+        // A numeric `balance` must not fail the whole response (it is stringified).
+        let body = r#"{"plan_type":"plus","credits":{"has_credits":true,"balance":12}}"#;
+        let snap = map_wham_response(body, 1_000).unwrap();
+        assert_eq!(snap.credits_balance.as_deref(), Some("12"));
+        assert_eq!(snap.has_credits, Some(true));
+    }
+
+    #[test]
     fn window_uses_relative_reset_when_no_absolute() {
         let body =
             r#"{"rate_limit":{"primary_window":{"used_percent":10,"reset_after_seconds":100}}}"#;

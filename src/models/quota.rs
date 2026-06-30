@@ -123,8 +123,24 @@ pub struct WhamCredits {
     #[serde(default)]
     pub overage_limit_reached: Option<bool>,
     /// Credit balance, kept as a string to match the API's `"0"`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_string_or_number")]
     pub balance: Option<String>,
+}
+
+/// Deserializes a JSON string or number into `Option<String>`.
+///
+/// The wham/usage `balance` is usually the string `"0"`, but some accounts
+/// return it as a number; accepting both keeps a numeric balance from failing
+/// the entire response. Any other type (or null) becomes `None`.
+fn de_string_or_number<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match Option::<Value>::deserialize(deserializer)? {
+        Some(Value::String(s)) => Some(s),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    })
 }
 
 /// The `rate_limit_reset_credits` object of a wham/usage response.
