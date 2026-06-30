@@ -204,9 +204,12 @@ pub fn extract_latest_rate_limits(values: &[Value], now: i64) -> Option<CodexQuo
     None
 }
 
-/// Whether a window is still current: its reset time is unknown or in the future.
+/// Whether a window is still current: it has a known reset time in the future.
+///
+/// A window with no `resets_at_unix` cannot be proven fresh, so it is treated as
+/// not live rather than rendered as authoritative current quota indefinitely.
 fn is_window_live(w: &QuotaWindow, now: i64) -> bool {
-    w.resets_at_unix.is_none_or(|reset| reset > now)
+    w.resets_at_unix.is_some_and(|reset| reset > now)
 }
 
 /// Maps a Codex session window into the normalized [`QuotaWindow`].
@@ -291,6 +294,15 @@ mod tests {
         let snap = extract_latest_rate_limits(&values, 1000).unwrap();
         assert!(snap.primary.is_none(), "expired 5h window dropped");
         assert_eq!(snap.secondary.unwrap().used_percent, 44.0);
+    }
+
+    #[test]
+    fn drops_window_without_reset_time() {
+        // No resets_at: freshness cannot be established, so it must not render.
+        let values = vec![
+            json!({"payload":{"rate_limits":{"limit_id":"codex","primary":{"used_percent":50.0}}}}),
+        ];
+        assert!(extract_latest_rate_limits(&values, 1000).is_none());
     }
 
     #[test]
