@@ -240,11 +240,11 @@ The tool automatically scans these directories:
 At the bottom of the interactive dashboard, the per-provider stats sit on the left and two live quota panels sit on the right:
 
 ```
-┌ Provider/Tokens/Cost/Days ┬ Claude ────────┬ Codex (API) ────┐
-│ Claude    1.2M  $3.00  4d │ 5h ▰▰▱▱▱  16%   │ Plan: plus      │
-│ Codex      800K $0.00  6d │    ↻ 4h13m      │ 5h ▰▰▱▱▱  27%   │
-│ ...                       │ 7d ▰▰▰▱▱  28%   │ 7d ▱▱▱▱▱   4%   │
-│                           │ updated 2m ago  │ Credits: 0  +2  │
+┌ Provider/Tokens/Cost/Days ┬ Claude ────────┬ Codex ──────────┐
+│ Claude    1.2M  $3.00  4d │ 5h ▰▰▱▱▱  16%  │ Plan: plus      │
+│ Codex      800K $0.00  6d │    ↻ 4h13m     │ 5h ▰▰▱▱▱  27%   │
+│ ...                       │ 7d ▰▰▰▱▱  28%  │ 7d ▱▱▱▱▱   4%   │
+│                           │ updated 2m ago │ Credits: 0  +2  │
 └───────────────────────────┴────────────────┴─────────────────┘
 ```
 

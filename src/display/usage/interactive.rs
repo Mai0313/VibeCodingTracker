@@ -574,7 +574,7 @@ fn render_claude_quota(f: &mut Frame, area: Rect, rl: Option<&ClaudeRateLimitsCa
 /// Renders the Codex quota panel (plan, 5h / 7d gauges, credits).
 fn render_codex_quota(f: &mut Frame, area: Rect, codex: &CodexQuotaSnapshot, now: i64) {
     let title = match codex.source {
-        QuotaSource::Api => " Codex (API) ",
+        QuotaSource::Api => " Codex ",
         QuotaSource::SessionFallback => " Codex (session) ",
         QuotaSource::None => " Codex ",
     };

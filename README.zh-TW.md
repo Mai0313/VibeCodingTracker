@@ -240,11 +240,11 @@ vct usage --json --daily
 在互動式儀表板底部，左側是各 provider 統計，右側是兩個即時額度面板：
 
 ```
-┌ Provider/Tokens/Cost/Days ┬ Claude ────────┬ Codex (API) ────┐
-│ Claude    1.2M  $3.00  4d │ 5h ▰▰▱▱▱  16%   │ Plan: plus      │
-│ Codex      800K $0.00  6d │    ↻ 4h13m      │ 5h ▰▰▱▱▱  27%   │
-│ ...                       │ 7d ▰▰▰▱▱  28%   │ 7d ▱▱▱▱▱   4%   │
-│                           │ updated 2m ago  │ Credits: 0  +2  │
+┌ Provider/Tokens/Cost/Days ┬ Claude ────────┬ Codex ──────────┐
+│ Claude    1.2M  $3.00  4d │ 5h ▰▰▱▱▱  16%  │ Plan: plus      │
+│ Codex      800K $0.00  6d │    ↻ 4h13m     │ 5h ▰▰▱▱▱  27%   │
+│ ...                       │ 7d ▰▰▰▱▱  28%  │ 7d ▱▱▱▱▱   4%   │
+│                           │ updated 2m ago │ Credits: 0  +2  │
 └───────────────────────────┴────────────────┴─────────────────┘
 ```
 
