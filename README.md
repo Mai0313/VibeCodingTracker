@@ -196,7 +196,7 @@ vct usage --json --daily
 ```
 
 > [!NOTE]
-> Model rows are sorted by cost in ascending order, so the highest-spending model is listed last (right above the `TOTAL` row in `--table`). This applies to the interactive dashboard, `--table`, and `--text` output; `--json` preserves the same order.
+> Model rows are sorted by cost in ascending order, so the highest-spending model is listed last (right above the `TOTAL` row in `--table`). This applies to the interactive dashboard, `--table`, and `--text` output; `--json` preserves the same order. The interactive dashboard also hides models with zero usage in the selected range.
 
 ### Preview: Interactive Dashboard (`vct usage`)
 

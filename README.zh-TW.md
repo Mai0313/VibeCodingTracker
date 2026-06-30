@@ -196,7 +196,7 @@ vct usage --json --daily
 ```
 
 > [!NOTE]
-> Model 列會依 cost 由小到大排序，所以花費最高的 model 會排在最後(在 `--table` 中緊鄰 `TOTAL` 列上方)。這個排序會套用到互動式儀表板、`--table` 與 `--text` 三種輸出;`--json` 也會保持相同順序。
+> Model 列會依 cost 由小到大排序，所以花費最高的 model 會排在最後(在 `--table` 中緊鄰 `TOTAL` 列上方)。這個排序會套用到互動式儀表板、`--table` 與 `--text` 三種輸出;`--json` 也會保持相同順序。互動式儀表板也會隱藏在所選範圍內用量為 0 的 model。
 
 ### 預覽：互動式儀表板（`vct usage`）
 
