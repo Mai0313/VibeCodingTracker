@@ -8,11 +8,12 @@
 //! is trimmed back to the OS after each refresh.
 
 use crate::display::common::table::{
-    create_controls, create_provider_row, create_ratatui_table, create_star_hint, create_summary,
-    create_title,
+    create_controls, create_provider_row, create_ratatui_table, create_summary, main_layout,
+    render_scrollable_table, render_too_small, styled_row,
 };
 use crate::display::common::tui::{
-    InputAction, RefreshState, UpdateTracker, handle_input, restore_terminal, setup_terminal,
+    InputAction, RefreshState, ScrollState, UpdateTracker, handle_input, restore_terminal,
+    set_mouse_capture, setup_terminal,
 };
 use crate::display::usage::averages::{
     UsageProviderTotals, UsageRow, UsageTotals, build_provider_total_rows, build_usage_summary,
@@ -23,7 +24,7 @@ use crate::models::{
 };
 use crate::pricing::{ModelPricingMap, fetch_model_pricing};
 use crate::quota::{load_claude_rate_limits, load_codex_cache, spawn_codex_quota_worker};
-use crate::utils::{format_duration_until, format_number};
+use crate::utils::{format_compact, format_cost, format_duration_until};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -56,6 +57,13 @@ const PRICING_REFRESH_SECS: u64 = 300;
 /// Upper bound on rows the [`UpdateTracker`] remembers for change highlighting.
 const MAX_TRACKED_ROWS: usize = 100;
 
+/// Hard minimum terminal width/height; below this only a notice is drawn.
+const USAGE_MIN_W: u16 = 74;
+const USAGE_MIN_H: u16 = 14;
+/// At or above this height the provider/quota band is shown; below it the band
+/// is dropped so the scrollable table keeps a usable height.
+const USAGE_PANELS_MIN_H: u16 = 22;
+
 /// Displays token usage data in an interactive TUI with auto-refresh.
 ///
 /// Runs until the user quits; `time_range` filters which sessions are scanned.
@@ -64,7 +72,9 @@ const MAX_TRACKED_ROWS: usize = 100;
 /// - Auto-refresh every 10 seconds (usage + pricing)
 /// - Real-time memory monitoring
 /// - Provider-grouped totals
-/// - Keyboard controls: `q`, `Esc`, or `Ctrl+C` to exit
+/// - Scrollable model table (arrow keys / `PgUp`/`PgDn` / `g`/`G` / mouse wheel)
+/// - Keyboard controls: `q`, `Esc`, or `Ctrl+C` to exit, `r` to refresh,
+///   `m` to toggle mouse capture
 ///
 /// # Errors
 ///
@@ -119,6 +129,11 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
     let mut last_pricing_refresh = Instant::now();
 
     let mut update_tracker = UpdateTracker::new(MAX_TRACKED_ROWS, 1000);
+
+    // Scroll/selection state for the model table, plus the live mouse-capture
+    // flag toggled by the `m` key.
+    let mut scroll = ScrollState::new();
+    let mut mouse_enabled = true;
 
     // Latest rendered display state, kept across refresh cycles so a terminal
     // resize can redraw at the new size immediately without re-aggregating the
@@ -181,12 +196,23 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
                 &opencode_costs,
             );
 
+            // Remember which model was selected so the highlight can follow it
+            // across a refresh even if rows are reordered or added/removed.
+            let prev_model = scroll
+                .table
+                .selected()
+                .and_then(|i| rows_data.get(i))
+                .map(|row| row.model.clone());
+
             // Cache the rendered display state so a resize can redraw without
             // re-aggregating. These per-model summaries are small; the heavy
             // raw usage buffers are cleared right below.
             rows_data = summary.rows;
             totals = summary.totals;
             provider_totals = summary.provider_totals;
+
+            let model_names: Vec<String> = rows_data.iter().map(|row| row.model.clone()).collect();
+            scroll.sync(prev_model.as_deref(), &model_names);
 
             // Refresh quota panels: Claude from the tiny local ingest cache,
             // Codex from the background worker's latest snapshot.
@@ -237,6 +263,7 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
                 pid,
                 claude_rl.as_ref(),
                 &codex_snapshot,
+                &mut scroll,
             )?;
 
             // Hand any arena-held free pages back to the OS. The refresh cycle
@@ -247,13 +274,35 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
             crate::utils::release_freed_heap();
         }
 
-        match handle_input()? {
+        let action = handle_input()?;
+        match action {
             InputAction::Quit => {
                 // Signal the detached worker to stop; the OS reclaims it on exit.
                 codex_shutdown.store(true, Ordering::Relaxed);
                 break;
             }
             InputAction::Refresh => refresh_state.force(),
+            InputAction::ToggleMouse => {
+                mouse_enabled = !mouse_enabled;
+                set_mouse_capture(&mut terminal, mouse_enabled)?;
+            }
+            // Move the selection / scroll, then repaint the cached frame
+            // without re-aggregating.
+            InputAction::Navigate(nav) => {
+                scroll.apply(nav, rows_data.len());
+                render_usage_frame(
+                    &mut terminal,
+                    &rows_data,
+                    &totals,
+                    &provider_totals,
+                    &update_tracker,
+                    &sys,
+                    pid,
+                    claude_rl.as_ref(),
+                    &codex_snapshot,
+                    &mut scroll,
+                )?;
+            }
             // Redraw the cached frame at the new terminal size without
             // re-aggregating, so resize tracks the drag instead of waiting
             // for the next refresh tick.
@@ -267,6 +316,7 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
                 pid,
                 claude_rl.as_ref(),
                 &codex_snapshot,
+                &mut scroll,
             )?,
             InputAction::Continue => {}
         }
@@ -297,155 +347,162 @@ fn render_usage_frame(
     pid: Pid,
     claude_rl: Option<&ClaudeRateLimitsCache>,
     codex: &CodexQuotaSnapshot,
+    scroll: &mut ScrollState,
 ) -> anyhow::Result<()> {
     let provider_rows = build_provider_total_rows(provider_totals);
 
     terminal.draw(|f| {
+        let area = f.area();
+        if area.width < USAGE_MIN_W || area.height < USAGE_MIN_H {
+            render_too_small(f, USAGE_MIN_W, USAGE_MIN_H);
+            return;
+        }
+
+        // Drop the provider/quota band on short terminals so the scrollable
+        // table keeps a usable height.
         let totals_height = (provider_rows.len() as u16)
             .saturating_add(4)
             .max(QUOTA_PANEL_MIN_HEIGHT);
-        let chunks = RatatuiLayout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Min(10),
-                Constraint::Length(totals_height),
-                Constraint::Length(3),
-                Constraint::Length(2),
-                Constraint::Length(1),
-            ])
-            .split(f.area());
-
-        let title = create_title("Token Usage Statistics", RatatuiColor::Cyan);
-        f.render_widget(title, chunks[0]);
+        let panels_height = (area.height >= USAGE_PANELS_MIN_H).then_some(totals_height);
+        let chunks = main_layout(area, panels_height);
 
         let header = vec![
             "Model",
             "Input",
             "Output",
             "Cache Read",
-            "Cache Create",
+            "Cache Write",
             "Total",
             "Cost (USD)",
         ];
 
+        // Model rows (selectable) followed by a pinned TOTAL row excluded from
+        // selection. Compact K/M/B numbers keep cells inside the columns.
         let mut rows: Vec<RatatuiRow> = rows_data
             .iter()
             .map(|row| {
-                let row_key = row.model.clone();
-
-                let is_recently_updated = update_tracker.is_recently_updated(&row_key);
-
-                let style = if is_recently_updated {
+                let style = if update_tracker.is_recently_updated(&row.model) {
                     Style::default().bg(RatatuiColor::Rgb(60, 80, 60)).bold()
                 } else {
                     Style::default()
                 };
-
-                RatatuiRow::new(vec![
-                    row.display_model.clone(),
-                    format_number(row.input_tokens),
-                    format_number(row.output_with_reasoning()),
-                    format_number(row.cache_read),
-                    format_number(row.cache_creation),
-                    format_number(row.total),
-                    format!("${:.2}", row.cost),
-                ])
-                .style(style)
-            })
-            .collect();
-
-        rows.push(
-            RatatuiRow::new(vec![
-                "TOTAL".to_string(),
-                format_number(totals.input_tokens),
-                format_number(totals.output_with_reasoning()),
-                format_number(totals.cache_read),
-                format_number(totals.cache_creation),
-                format_number(totals.total),
-                format!("${:.2}", totals.cost),
-            ])
-            .style(
-                Style::default()
-                    .fg(RatatuiColor::Yellow)
-                    .bold()
-                    .bg(RatatuiColor::DarkGray),
-            ),
-        );
-
-        let widths = [
-            Constraint::Min(20),
-            Constraint::Length(12),
-            Constraint::Length(12),
-            Constraint::Length(12),
-            Constraint::Length(14),
-            Constraint::Length(12),
-            Constraint::Length(12),
-        ];
-
-        let table = create_ratatui_table(rows, header, &widths, RatatuiColor::Green);
-        f.render_widget(table, chunks[1]);
-
-        let mut totals_rows: Vec<RatatuiRow> = provider_rows
-            .iter()
-            .map(|row| {
-                create_provider_row(
+                styled_row(
                     vec![
-                        row.label.to_string(),
-                        format_number(row.stats.total_tokens),
-                        format!("${:.2}", row.stats.total_cost),
-                        format_number(row.stats.days_count as i64),
+                        row.display_model.clone(),
+                        format_compact(row.input_tokens),
+                        format_compact(row.output_with_reasoning()),
+                        format_compact(row.cache_read),
+                        format_compact(row.cache_creation),
+                        format_compact(row.total),
+                        format_cost(row.cost),
                     ],
-                    row.tui_color,
-                    row.emphasize,
+                    style,
+                    1,
                 )
             })
             .collect();
 
-        if totals_rows.is_empty() {
-            totals_rows.push(
-                RatatuiRow::new(vec![
-                    "No provider data yet".to_string(),
-                    "-".to_string(),
-                    "-".to_string(),
-                    "-".to_string(),
-                ])
-                .style(Style::default().fg(RatatuiColor::DarkGray)),
-            );
-        }
+        rows.push(styled_row(
+            vec![
+                "TOTAL".to_string(),
+                format_compact(totals.input_tokens),
+                format_compact(totals.output_with_reasoning()),
+                format_compact(totals.cache_read),
+                format_compact(totals.cache_creation),
+                format_compact(totals.total),
+                format_cost(totals.cost),
+            ],
+            Style::default()
+                .fg(RatatuiColor::Yellow)
+                .bold()
+                .bg(RatatuiColor::DarkGray),
+            1,
+        ));
 
-        let totals_header = vec!["Provider", "Tokens", "Cost", "Active Days"];
-        let totals_widths = [
-            Constraint::Min(20),
-            Constraint::Length(16),
-            Constraint::Length(14),
-            Constraint::Length(14),
+        let widths = [
+            Constraint::Min(16),
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Length(11),
+            Constraint::Length(11),
+            Constraint::Length(9),
+            Constraint::Length(12),
         ];
 
-        let totals_table = create_ratatui_table(
-            totals_rows,
-            totals_header,
-            &totals_widths,
-            RatatuiColor::Magenta,
+        let row_count = rows.len();
+        render_scrollable_table(
+            f,
+            chunks.table,
+            header,
+            rows,
+            &widths,
+            RatatuiColor::Green,
+            row_count,
+            scroll,
         );
 
-        // Split the bottom area into three columns: existing provider stats on
-        // the left, Claude + Codex quota panels side by side on the right.
-        let now = chrono::Local::now().timestamp();
-        let bottom = RatatuiLayout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(46),
-                Constraint::Percentage(27),
-                Constraint::Percentage(27),
-            ])
-            .split(chunks[2]);
-        f.render_widget(totals_table, bottom[0]);
-        render_claude_quota(f, bottom[1], claude_rl, now);
-        render_codex_quota(f, bottom[2], codex, now);
+        if let Some(panel_area) = chunks.panels {
+            let mut totals_rows: Vec<RatatuiRow> = provider_rows
+                .iter()
+                .map(|row| {
+                    create_provider_row(
+                        vec![
+                            row.label.to_string(),
+                            format_compact(row.stats.total_tokens),
+                            format_cost(row.stats.total_cost),
+                            format_compact(row.stats.days_count as i64),
+                        ],
+                        row.tui_color,
+                        row.emphasize,
+                    )
+                })
+                .collect();
 
-        let total_cost_str = format!("${:.2}", totals.cost);
-        let total_tokens_str = format_number(totals.total);
+            if totals_rows.is_empty() {
+                totals_rows.push(
+                    RatatuiRow::new(vec![
+                        "No provider data yet".to_string(),
+                        "-".to_string(),
+                        "-".to_string(),
+                        "-".to_string(),
+                    ])
+                    .style(Style::default().fg(RatatuiColor::DarkGray)),
+                );
+            }
+
+            let totals_header = vec!["Provider", "Tokens", "Cost", "Active Days"];
+            let totals_widths = [
+                Constraint::Min(20),
+                Constraint::Length(16),
+                Constraint::Length(14),
+                Constraint::Length(14),
+            ];
+
+            let totals_table = create_ratatui_table(
+                totals_rows,
+                totals_header,
+                &totals_widths,
+                RatatuiColor::Magenta,
+            );
+
+            // Split the band into provider stats (left) + Claude / Codex quota
+            // panels (right).
+            let now = chrono::Local::now().timestamp();
+            let bottom = RatatuiLayout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Percentage(46),
+                    Constraint::Percentage(27),
+                    Constraint::Percentage(27),
+                ])
+                .split(panel_area);
+            f.render_widget(totals_table, bottom[0]);
+            render_claude_quota(f, bottom[1], claude_rl, now);
+            render_codex_quota(f, bottom[2], codex, now);
+        }
+
+        let total_cost_str = format_cost(totals.cost);
+        let total_tokens_str = format_compact(totals.total);
         let entries_str = format!("{}", rows_data.len());
 
         let summary_items = vec![
@@ -459,13 +516,9 @@ fn render_usage_frame(
         ];
 
         let summary = create_summary(summary_items, sys, pid);
-        f.render_widget(summary, chunks[3]);
+        f.render_widget(summary, chunks.summary);
 
-        let controls = create_controls();
-        f.render_widget(controls, chunks[4]);
-
-        let star_hint = create_star_hint();
-        f.render_widget(star_hint, chunks[5]);
+        f.render_widget(create_controls(), chunks.controls);
     })?;
 
     Ok(())

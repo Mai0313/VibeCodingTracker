@@ -61,7 +61,7 @@ pub fn display_usage_table(usage_data: &UsageData) {
             "Input",
             "Output",
             "Cache Read",
-            "Cache Creation",
+            "Cache Write",
             "Total Tokens",
             "Cost (USD)",
         ],

@@ -22,7 +22,9 @@ pub use directory::{
     is_claude_session_file, is_codex_session_file, is_copilot_session_file, is_gemini_session_file,
 };
 pub use file::{count_lines, read_json, read_jsonl, save_json_pretty, write_json_atomic};
-pub use format::{format_duration_until, format_number, get_current_date};
+pub use format::{
+    format_compact, format_cost, format_duration_until, format_number, get_current_date,
+};
 pub use git::get_git_remote_url;
 pub use heap::{release_freed_heap, tune_system_allocator};
 pub use paths::{

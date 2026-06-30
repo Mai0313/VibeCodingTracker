@@ -6,11 +6,17 @@
 //! ([`UpdateTracker`]).
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{
+    Terminal,
+    backend::CrosstermBackend,
+    widgets::{ScrollbarState, TableState},
+};
 use std::io;
 use std::time::{Duration, Instant};
 
@@ -27,10 +33,30 @@ use std::time::{Duration, Instant};
 pub fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    // Mouse capture powers wheel scrolling. It also intercepts the terminal's
+    // native drag-to-select; users can hold Shift to bypass it, or press `m` to
+    // toggle capture off at runtime (see `handle_input` / `set_mouse_capture`).
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend)?;
     Ok(terminal)
+}
+
+/// Toggles mouse capture on the live terminal (the `m` key handler).
+///
+/// # Errors
+///
+/// Returns an error if writing the enable/disable control sequence fails.
+pub fn set_mouse_capture(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    enable: bool,
+) -> anyhow::Result<()> {
+    if enable {
+        execute!(terminal.backend_mut(), EnableMouseCapture)?;
+    } else {
+        execute!(terminal.backend_mut(), DisableMouseCapture)?;
+    }
+    Ok(())
 }
 
 /// Restores the terminal to normal mode (disable raw mode, leave alternate screen, show cursor).
@@ -44,7 +70,13 @@ pub fn restore_terminal(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
 ) -> anyhow::Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    // Disable mouse capture unconditionally; leaving it on makes the user's
+    // terminal emit escape sequences on every scroll after we exit.
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -67,6 +99,7 @@ pub fn handle_input() -> anyhow::Result<InputAction> {
     }
 
     let mut resized = false;
+    let mut nav = NavDelta::default();
     loop {
         match event::read()? {
             Event::Key(key) => {
@@ -80,7 +113,26 @@ pub fn handle_input() -> anyhow::Result<InputAction> {
                 if key.code == KeyCode::Char('r') || key.code == KeyCode::Char('R') {
                     return Ok(InputAction::Refresh);
                 }
+                if key.code == KeyCode::Char('m') || key.code == KeyCode::Char('M') {
+                    return Ok(InputAction::ToggleMouse);
+                }
+                // Navigation accumulates across the drained batch so a held key
+                // or a wheel burst collapses into a single net move per tick.
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => nav.lines -= 1,
+                    KeyCode::Down | KeyCode::Char('j') => nav.lines += 1,
+                    KeyCode::PageUp => nav.pages -= 1,
+                    KeyCode::PageDown => nav.pages += 1,
+                    KeyCode::Home | KeyCode::Char('g') => nav.top = true,
+                    KeyCode::End | KeyCode::Char('G') => nav.bottom = true,
+                    _ => {}
+                }
             }
+            Event::Mouse(me) => match me.kind {
+                MouseEventKind::ScrollUp => nav.lines -= 3,
+                MouseEventKind::ScrollDown => nav.lines += 3,
+                _ => {}
+            },
             Event::Resize(_, _) => resized = true,
             _ => {}
         }
@@ -90,10 +142,32 @@ pub fn handle_input() -> anyhow::Result<InputAction> {
         }
     }
 
-    if resized {
+    if nav.is_active() {
+        Ok(InputAction::Navigate(nav))
+    } else if resized {
         Ok(InputAction::Resize)
     } else {
         Ok(InputAction::Continue)
+    }
+}
+
+/// A net navigation move accumulated from one [`handle_input`] batch.
+///
+/// `lines` is single-row steps (arrow keys / wheel notches), `pages` is
+/// page jumps (multiplied by the live viewport height by the consumer), and
+/// `top` / `bottom` jump to the first / last row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NavDelta {
+    pub lines: i64,
+    pub pages: i64,
+    pub top: bool,
+    pub bottom: bool,
+}
+
+impl NavDelta {
+    /// Whether this delta would move the selection at all.
+    pub fn is_active(&self) -> bool {
+        self.lines != 0 || self.pages != 0 || self.top || self.bottom
     }
 }
 
@@ -104,6 +178,10 @@ pub enum InputAction {
     Quit,
     /// User asked to re-fetch and redraw (`r` / `R`).
     Refresh,
+    /// User asked to toggle mouse capture on/off (`m` / `M`).
+    ToggleMouse,
+    /// User scrolled / moved the selection; redraw without re-fetching.
+    Navigate(NavDelta),
     /// Terminal was resized — redraw the current frame at the new size
     /// without re-fetching session data.
     Resize,
@@ -247,5 +325,73 @@ impl UpdateTracker {
                 Instant::now().duration_since(*update_time) < self.highlight_duration
             })
             .unwrap_or(false)
+    }
+}
+
+/// Scroll + selection state for a scrollable TUI table.
+///
+/// Bundles the ratatui [`TableState`] (drives auto-scroll + row highlight) and
+/// [`ScrollbarState`] (drives the side scrollbar) with the last rendered body
+/// height, so page jumps and the scrollbar track the live viewport. The
+/// renderer updates [`viewport_rows`](Self::viewport_rows) on every draw; the
+/// event loop calls [`apply`](Self::apply) / [`sync`](Self::sync) to move and
+/// reconcile the selection.
+#[derive(Debug, Default)]
+pub struct ScrollState {
+    /// Selection + offset, fed to `render_stateful_widget`.
+    pub table: TableState,
+    /// Side scrollbar position/extent.
+    pub scrollbar: ScrollbarState,
+    /// Body rows visible in the last render (used as the page-jump size).
+    pub viewport_rows: u16,
+}
+
+impl ScrollState {
+    /// Creates an empty state with no selection (set on the first `sync`).
+    pub fn new() -> Self {
+        Self {
+            table: TableState::default(),
+            scrollbar: ScrollbarState::default(),
+            viewport_rows: 1,
+        }
+    }
+
+    /// Reconciles the selection with a freshly aggregated row set.
+    ///
+    /// Rows can be reordered or appear/disappear between refreshes, so the
+    /// previously selected `prev_model` is matched by name first; failing that
+    /// the existing index is clamped into range. `models` lists the selectable
+    /// model names (excluding any pinned TOTAL row).
+    pub fn sync(&mut self, prev_model: Option<&str>, models: &[String]) {
+        if models.is_empty() {
+            self.table.select(None);
+            return;
+        }
+        let max = models.len() - 1;
+        let idx = prev_model
+            .and_then(|m| models.iter().position(|x| x == m))
+            .unwrap_or_else(|| self.table.selected().unwrap_or(0).min(max));
+        self.table.select(Some(idx.min(max)));
+    }
+
+    /// Applies a navigation delta, clamping the selection to `[0, selectable-1]`.
+    ///
+    /// `selectable` is the number of selectable rows (model rows, not the
+    /// pinned TOTAL). Page jumps use the last rendered viewport height.
+    pub fn apply(&mut self, nav: NavDelta, selectable: usize) {
+        if selectable == 0 {
+            self.table.select(None);
+            return;
+        }
+        let max = (selectable - 1) as i64;
+        let page = self.viewport_rows.max(1) as i64;
+        let mut next = self.table.selected().unwrap_or(0) as i64 + nav.lines + nav.pages * page;
+        if nav.top {
+            next = 0;
+        }
+        if nav.bottom {
+            next = max;
+        }
+        self.table.select(Some(next.clamp(0, max) as usize));
     }
 }

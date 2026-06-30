@@ -41,7 +41,7 @@ Built with Rust for minimal resource footprint. The interactive TUI dashboard ty
 
 Choose your preferred view:
 
-- **Interactive Dashboard**: Auto-refreshing terminal UI with live updates
+- **Interactive Dashboard**: Auto-refreshing terminal UI with live updates, scrollable model list (arrow keys / mouse wheel), and compact K/M/B number formatting
 - **Static Reports**: Professional tables for documentation
 - **Script-Friendly**: Plain text and JSON for automation
 - **Full Precision**: Export exact costs for accounting
@@ -202,27 +202,24 @@ vct usage --json --daily
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                    Token Usage Statistics                                   │
-└─────────────────────────────────────────────────────────────────────────────────────────────┘
-┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Model                              Input     Output    Cache Read  Cache Create  Total Cost │
+│ Model                         Input   Output  Cache Read  Cache Write    Total  Cost (USD)  │
 │                                                                                             │
-│ gemini-3.1-pro-preview             129,115   10,339    67,385      0             $0.40      │
-│ claude-haiku-4-5-20251001          5,567     19,769    4,627,938   619,816       $1.34      │
-│ claude-opus-4-6                    25,651    179,066   40,830,154  2,572,258     $77.59     │
-│ TOTAL                              160,333   209,174   45,525,477  3,192,074     $79.33     │
+│▶gemini-3.1-pro-preview         129K    10.3K       67.4K            0     207K       $0.40  │
+│ claude-haiku-4-5-20251001     5.57K    19.8K       4.63M         620K    5.27M       $1.34  │
+│ claude-opus-4-6               25.7K     179K       40.8M        2.57M    43.6M      $77.59  │
+│ TOTAL                          160K     209K       45.5M        3.19M    49.3M      $79.33  │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Provider                  Tokens         Cost         Active Days                           │
+│ Provider                      Tokens      Cost   Active Days                                │
 │                                                                                             │
-│ Claude Code            48,880,218     $78.93       3                                     │
-│ Gemini                 206,839        $0.40        1                                     │
-│ All Providers          49,087,057     $79.33       3                                     │
+│ Claude Code                    48.9M    $78.93             3                                │
+│ Gemini                          207K     $0.40             1                                │
+│ All Providers                  49.1M    $79.33             3                                │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│   Total Cost: $79.33  |  Total Tokens: 49,087,058  |  Models: 3  |  Memory: 42.8 MB         │
+│  Total Cost: $79.33  |  Total Tokens: 49.3M  |  Models: 3  |  Memory: 42.8 MB               │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
-                          Press 'q', 'Esc', 'Ctrl+C' to quit | Press 'r' to refresh
+  ↑/↓ scroll  PgUp/PgDn page  g/G top/end  r refresh  m mouse  q quit  |  ★ github.com/Mai0313/VibeCodingTracker
 ```
 
 ### What It Scans
@@ -305,27 +302,24 @@ vct analysis --output today.json --daily
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                    Analysis Statistics                                      │
-└─────────────────────────────────────────────────────────────────────────────────────────────┘
-┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Model                        Edit Lines  Read Lines  Write Lines  Bash  Edit  Read  Write  │
+│ Model                     Edit Lines  Read Lines Write Lines  Bash  Edit  Read  Write       │
 │                                                                                             │
-│ claude-haiku-4-5-20251001    0           0           0            43    0     59    0       │
-│ claude-opus-4-6              1,280       13,264      1,575        82    146   209   62      │
-│ gemini-3.1-pro-preview       0           0           0            0     0     0     0       │
-│ TOTAL                        1,280       13,264      1,575        125   146   268   62      │
+│▶claude-haiku-4-5-20251001           0           0           0    43     0    59      0      │
+│ claude-opus-4-6                1.28K       13.3K       1.58K    82   146   209     62       │
+│ gemini-3.1-pro-preview             0           0           0     0     0     0      0       │
+│ TOTAL                          1.28K       13.3K       1.58K   125   146   268     62       │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Provider          Edit Lines Read Lines Write Lines Bash Edit Read TodoWrite Write Days     │
+│ Provider        Edit Lines Read Lines Write Lines Bash Edit Read TodoWrite Write Days       │
 │                                                                                             │
-│ Claude Code    1,280      13,264     1,575       125  146  268  18        62    3        │
-│ Gemini         0          0          0           0    0    0    0         0     1        │
-│ All Providers  1,280      13,264     1,575       125  146  268  18        62    3        │
+│ Claude Code          1.28K      13.3K       1.58K  125  146  268        18    62    3       │
+│ Gemini                   0          0           0    0    0    0         0     0    1       │
+│ All Providers        1.28K      13.3K       1.58K  125  146  268        18    62    3       │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│  Total Lines: 16,119  |  Total Tools: 619  |  Models: 3  |  Memory: 41.2 MB                 │
+│  Total Lines: 16.1K  |  Total Tools: 619  |  Models: 3  |  Memory: 41.2 MB                  │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
-                          Press 'q', 'Esc', 'Ctrl+C' to quit | Press 'r' to refresh
+  ↑/↓ scroll  PgUp/PgDn page  g/G top/end  r refresh  m mouse  q quit  |  ★ github.com/Mai0313/VibeCodingTracker
 ```
 
 ---
