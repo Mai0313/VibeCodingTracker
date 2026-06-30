@@ -295,9 +295,9 @@ fn render_analysis_frame(
             "Write",
         ];
 
-        // Model rows (selectable) plus a pinned TOTAL row, all with compact
-        // K/M/B numbers so long counts stay inside the columns.
-        let mut rows: Vec<RatatuiRow> = rows_data
+        // One selectable row per model; the grand total lives only in the
+        // summary bar below. Compact K/M/B numbers keep long counts in-column.
+        let rows: Vec<RatatuiRow> = rows_data
             .iter()
             .map(|row| {
                 let style = if update_tracker.is_recently_updated(&row.model) {
@@ -322,25 +322,6 @@ fn render_analysis_frame(
                 )
             })
             .collect();
-
-        rows.push(styled_row(
-            vec![
-                "TOTAL".to_string(),
-                format_compact(totals.edit_lines as i64),
-                format_compact(totals.read_lines as i64),
-                format_compact(totals.write_lines as i64),
-                format_compact(totals.bash_count as i64),
-                format_compact(totals.edit_count as i64),
-                format_compact(totals.read_count as i64),
-                format_compact(totals.todo_write_count as i64),
-                format_compact(totals.write_count as i64),
-            ],
-            Style::default()
-                .fg(RatatuiColor::Yellow)
-                .bold()
-                .bg(RatatuiColor::DarkGray),
-            1,
-        ));
 
         let widths = [
             Constraint::Min(16),    // Model
@@ -367,8 +348,11 @@ fn render_analysis_frame(
         );
 
         if let Some(panel_area) = chunks.panels {
+            // Drop the "All Providers" aggregate; the summary bar already
+            // carries the grand totals.
             let mut totals_rows: Vec<RatatuiRow> = provider_rows
                 .iter()
+                .filter(|row| row.label != "All Providers")
                 .map(|row| {
                     create_provider_row(
                         vec![

@@ -129,8 +129,10 @@ pub fn handle_input() -> anyhow::Result<InputAction> {
                 }
             }
             Event::Mouse(me) => match me.kind {
-                MouseEventKind::ScrollUp => nav.lines -= 3,
-                MouseEventKind::ScrollDown => nav.lines += 3,
+                // One row per wheel notch; the drain loop already collapses a
+                // burst into a single net move.
+                MouseEventKind::ScrollUp => nav.lines -= 1,
+                MouseEventKind::ScrollDown => nav.lines += 1,
                 _ => {}
             },
             Event::Resize(_, _) => resized = true,

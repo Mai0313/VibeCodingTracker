@@ -376,9 +376,9 @@ fn render_usage_frame(
             "Cost (USD)",
         ];
 
-        // Model rows (selectable) followed by a pinned TOTAL row excluded from
-        // selection. Compact K/M/B numbers keep cells inside the columns.
-        let mut rows: Vec<RatatuiRow> = rows_data
+        // One selectable row per model. The grand total lives only in the
+        // summary bar below (it was redundant here and in the provider band).
+        let rows: Vec<RatatuiRow> = rows_data
             .iter()
             .map(|row| {
                 let style = if update_tracker.is_recently_updated(&row.model) {
@@ -401,23 +401,6 @@ fn render_usage_frame(
                 )
             })
             .collect();
-
-        rows.push(styled_row(
-            vec![
-                "TOTAL".to_string(),
-                format_compact(totals.input_tokens),
-                format_compact(totals.output_with_reasoning()),
-                format_compact(totals.cache_read),
-                format_compact(totals.cache_creation),
-                format_compact(totals.total),
-                format_cost(totals.cost),
-            ],
-            Style::default()
-                .fg(RatatuiColor::Yellow)
-                .bold()
-                .bg(RatatuiColor::DarkGray),
-            1,
-        ));
 
         let widths = [
             Constraint::Min(16),
@@ -442,8 +425,11 @@ fn render_usage_frame(
         );
 
         if let Some(panel_area) = chunks.panels {
+            // Drop the "All Providers" aggregate; the summary bar already
+            // carries the grand totals.
             let mut totals_rows: Vec<RatatuiRow> = provider_rows
                 .iter()
+                .filter(|row| row.label != "All Providers")
                 .map(|row| {
                     create_provider_row(
                         vec![

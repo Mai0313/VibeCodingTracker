@@ -13,8 +13,8 @@ use ratatui::{
     style::{Color as RatatuiColor, Modifier, Style, Stylize},
     text::{Line, Span, Text},
     widgets::{
-        Block, Borders, Cell as RatatuiCell, HighlightSpacing, Paragraph, Row as RatatuiRow,
-        Scrollbar, ScrollbarOrientation, ScrollbarState, Table as RatatuiTable,
+        Block, Borders, Cell as RatatuiCell, Paragraph, Row as RatatuiRow, Scrollbar,
+        ScrollbarOrientation, ScrollbarState, Table as RatatuiTable,
     },
 };
 use sysinfo::System;
@@ -211,15 +211,13 @@ pub fn render_scrollable_table(
     let viewport = area.height.saturating_sub(4);
     scroll.viewport_rows = viewport;
 
-    let table = create_ratatui_table(rows, header, widths, border_color)
-        .row_highlight_style(
-            Style::default()
-                .fg(RatatuiColor::Black)
-                .bg(RatatuiColor::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("▶ ")
-        .highlight_spacing(HighlightSpacing::Always);
+    // Selection is shown purely by the row color (no leading symbol / gutter).
+    let table = create_ratatui_table(rows, header, widths, border_color).row_highlight_style(
+        Style::default()
+            .fg(RatatuiColor::Black)
+            .bg(RatatuiColor::Cyan)
+            .add_modifier(Modifier::BOLD),
+    );
 
     f.render_stateful_widget(table, area, &mut scroll.table);
 
