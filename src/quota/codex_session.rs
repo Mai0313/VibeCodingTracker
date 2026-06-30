@@ -17,8 +17,14 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
-/// Number of newest rollout files to scan for a rate_limits snapshot.
-const MAX_FILES: usize = 5;
+/// Maximum number of newest rollout files to scan for a `rate_limits` snapshot.
+///
+/// The scan walks files newest-first and stops at the first one carrying a
+/// snapshot, so the common case costs a single parse. This cap only bites when
+/// many recent sessions ran without rate limits (e.g. API-key mode); it is kept
+/// generous enough to look past a multi-day run of quota-less sessions, yet
+/// bounded so the 10s background refresh never reparses an unbounded history.
+const MAX_FILES: usize = 64;
 
 /// Returns the newest Codex session `rate_limits` as a snapshot, if any.
 ///
@@ -169,6 +175,31 @@ mod tests {
     fn returns_none_without_rate_limits() {
         let values = vec![json!({"payload":{"type":"message"}}), json!({"foo":1})];
         assert!(extract_latest_rate_limits(&values).is_none());
+    }
+
+    #[test]
+    fn newest_files_sorted_newest_first_and_capped() {
+        use std::io::Write;
+        use std::time::{Duration, SystemTime};
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let mut paths = Vec::new();
+        for i in 0..4u64 {
+            let path = dir.path().join(format!("rollout-{i}.jsonl"));
+            let mut file = std::fs::File::create(&path).unwrap();
+            file.write_all(b"{}\n").unwrap();
+            file.set_modified(base + Duration::from_secs(i * 10))
+                .unwrap();
+            paths.push(path);
+        }
+        // A non-Codex file must be ignored by the filter.
+        std::fs::write(dir.path().join("notes.txt"), "x").unwrap();
+
+        let newest = newest_codex_files(dir.path(), 2);
+        assert_eq!(newest.len(), 2, "respects the file cap");
+        assert_eq!(newest[0], paths[3], "newest mtime first");
+        assert_eq!(newest[1], paths[2]);
     }
 
     #[test]
