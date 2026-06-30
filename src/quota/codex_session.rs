@@ -9,9 +9,11 @@
 use crate::models::{
     CodexQuotaSnapshot, CodexSessionRateLimits, CodexSessionWindow, QuotaSource, QuotaWindow,
 };
-use crate::utils::{is_codex_session_file, read_jsonl, resolve_paths};
+use crate::utils::{is_codex_session_file, resolve_paths};
 use anyhow::Result;
 use serde_json::Value;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -23,21 +25,46 @@ const MAX_FILES: usize = 5;
 /// # Errors
 ///
 /// Returns an error only if path resolution fails; a missing sessions dir
-/// yields `Ok(None)` and an unreadable file is skipped.
+/// yields `Ok(None)`. An unreadable file (or a half-written tail line on a
+/// live session) is tolerated rather than aborting the scan.
 pub fn latest_session_rate_limits() -> Result<Option<CodexQuotaSnapshot>> {
     let paths = resolve_paths()?;
     if !paths.codex_session_dir.exists() {
         return Ok(None);
     }
     for file in newest_codex_files(&paths.codex_session_dir, MAX_FILES) {
-        let Ok(values) = read_jsonl(&file) else {
-            continue;
-        };
+        let values = read_jsonl_lenient(&file);
         if let Some(snap) = extract_latest_rate_limits(&values) {
             return Ok(Some(snap));
         }
     }
     Ok(None)
+}
+
+/// Reads a JSONL file leniently, returning one [`Value`] per parseable line.
+///
+/// Unlike the strict `read_jsonl`, a line that fails to read (e.g. a torn tail
+/// on a session being actively appended) or fails to parse is skipped instead
+/// of aborting the whole file, so a live Codex rollout still yields its earlier,
+/// fully written `rate_limits` records.
+fn read_jsonl_lenient(path: &Path) -> Vec<Value> {
+    let Ok(file) = File::open(path) else {
+        return Vec::new();
+    };
+    let mut values = Vec::new();
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+            values.push(value);
+        }
+    }
+    values
 }
 
 /// Collects up to `n` Codex rollout files, newest by mtime first.
@@ -142,5 +169,23 @@ mod tests {
     fn returns_none_without_rate_limits() {
         let values = vec![json!({"payload":{"type":"message"}}), json!({"foo":1})];
         assert!(extract_latest_rate_limits(&values).is_none());
+    }
+
+    #[test]
+    fn lenient_reader_keeps_good_lines_despite_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-live.jsonl");
+        // Two complete records, then a half-written trailing line (mid-append).
+        let body = concat!(
+            "{\"payload\":{\"rate_limits\":{\"primary\":{\"used_percent\":33.0,\"resets_at\":7}}}}\n",
+            "{\"payload\":{\"type\":\"message\"}}\n",
+            "{\"payload\":{\"rate_limits\":{\"primary\":{\"used_per",
+        );
+        std::fs::write(&path, body).unwrap();
+
+        let values = read_jsonl_lenient(&path);
+        assert_eq!(values.len(), 2, "torn tail dropped, complete lines kept");
+        let snap = extract_latest_rate_limits(&values).unwrap();
+        assert_eq!(snap.primary.unwrap().used_percent, 33.0);
     }
 }
