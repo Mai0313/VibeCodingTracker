@@ -73,27 +73,74 @@ fn read_jsonl_lenient(path: &Path) -> Vec<Value> {
     values
 }
 
+/// Maximum number of recent date directories (`YYYY/MM/DD`) to scan.
+///
+/// Codex lays sessions out as `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`.
+/// Restricting the walk to the newest few day directories keeps the 10s
+/// background refresh from re-walking an entire multi-month history every tick
+/// (on top of the `usage` scan the TUI already runs).
+const MAX_DAY_DIRS: usize = 14;
+
 /// Collects up to `n` Codex rollout files, newest by mtime first.
+///
+/// Only the most recent [`MAX_DAY_DIRS`] date directories are visited, so the
+/// walk stays bounded regardless of how much history is on disk.
 fn newest_codex_files(dir: &Path, n: usize) -> Vec<PathBuf> {
     let mut files: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-    for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let path = entry.path();
-        if !is_codex_session_file(path) {
-            continue;
-        }
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        if let Ok(modified) = metadata.modified() {
-            files.push((modified, path.to_path_buf()));
+    for day in recent_day_dirs(dir, MAX_DAY_DIRS) {
+        for entry in WalkDir::new(&day).into_iter().filter_map(|e| e.ok()) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry.path();
+            if !is_codex_session_file(path) {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if let Ok(modified) = metadata.modified() {
+                files.push((modified, path.to_path_buf()));
+            }
         }
     }
     files.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
     files.truncate(n);
     files.into_iter().map(|(_, p)| p).collect()
+}
+
+/// Returns the newest leaf date directories under `sessions`, newest first.
+///
+/// Descends `YYYY` -> `MM` -> `DD` reading only directory entries (sorted by
+/// name descending, which is chronological for zero-padded dates) and stops once
+/// `limit` leaves are gathered, so a deep history is never fully enumerated.
+fn recent_day_dirs(sessions: &Path, limit: usize) -> Vec<PathBuf> {
+    let mut days = Vec::new();
+    for year in sorted_subdirs_desc(sessions) {
+        for month in sorted_subdirs_desc(&year) {
+            for day in sorted_subdirs_desc(&month) {
+                days.push(day);
+                if days.len() >= limit {
+                    return days;
+                }
+            }
+        }
+    }
+    days
+}
+
+/// Immediate subdirectories of `dir`, sorted by file name descending.
+fn sorted_subdirs_desc(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut subdirs: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.path())
+        .collect();
+    subdirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    subdirs
 }
 
 /// Scans `values` in reverse, returning the newest `rate_limits` snapshot.
@@ -178,28 +225,48 @@ mod tests {
     }
 
     #[test]
-    fn newest_files_sorted_newest_first_and_capped() {
+    fn recent_day_dirs_is_bounded_and_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path();
+        for d in 1..=20u32 {
+            std::fs::create_dir_all(sessions.join(format!("2026/06/{d:02}"))).unwrap();
+        }
+        let recent = recent_day_dirs(sessions, 14);
+        assert_eq!(recent.len(), 14, "bounded to the limit, not all 20 days");
+        assert!(recent[0].ends_with("2026/06/20"), "newest day first");
+        assert!(recent[13].ends_with("2026/06/07"), "stops 14 days back");
+    }
+
+    #[test]
+    fn newest_files_within_date_dirs_sorted_and_capped() {
         use std::io::Write;
         use std::time::{Duration, SystemTime};
 
         let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path();
         let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        let mut paths = Vec::new();
-        for i in 0..4u64 {
-            let path = dir.path().join(format!("rollout-{i}.jsonl"));
+        let mk = |rel: &str, secs: u64| {
+            let path = sessions.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             let mut file = std::fs::File::create(&path).unwrap();
             file.write_all(b"{}\n").unwrap();
-            file.set_modified(base + Duration::from_secs(i * 10))
-                .unwrap();
-            paths.push(path);
-        }
-        // A non-Codex file must be ignored by the filter.
-        std::fs::write(dir.path().join("notes.txt"), "x").unwrap();
+            file.set_modified(base + Duration::from_secs(secs)).unwrap();
+            path
+        };
 
-        let newest = newest_codex_files(dir.path(), 2);
-        assert_eq!(newest.len(), 2, "respects the file cap");
-        assert_eq!(newest[0], paths[3], "newest mtime first");
-        assert_eq!(newest[1], paths[2]);
+        let old = mk("2026/06/26/rollout-old.jsonl", 0);
+        let new2 = mk("2026/06/27/rollout-b.jsonl", 10);
+        let new1 = mk("2026/06/27/rollout-a.jsonl", 20);
+        // A non-Codex file must be ignored by the filter.
+        std::fs::write(sessions.join("2026/06/27/notes.txt"), "x").unwrap();
+
+        let newest = newest_codex_files(sessions, 2);
+        assert_eq!(
+            newest,
+            vec![new1, new2],
+            "newest mtime first, cap respected"
+        );
+        assert!(!newest.contains(&old), "older-day file dropped by the cap");
     }
 
     #[test]
