@@ -11,6 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::fmt;
 
 // ---- Claude statusLine ingest ----
 
@@ -145,7 +146,11 @@ pub struct CodexAuthJson {
 }
 
 /// The `tokens` object of `~/.codex/auth.json`.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// `Debug` is implemented by hand to redact both fields: the access token is a
+/// bearer credential and the account id is an identifier, so neither should
+/// reach a log or assertion message. The wham client relies on this guarantee.
+#[derive(Clone, Deserialize)]
 pub struct CodexAuthTokens {
     /// Bearer access token for the ChatGPT backend.
     #[serde(default)]
@@ -153,6 +158,17 @@ pub struct CodexAuthTokens {
     /// Account id sent as the `ChatGPT-Account-Id` header.
     #[serde(default)]
     pub account_id: Option<String>,
+}
+
+impl fmt::Debug for CodexAuthTokens {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Show presence without leaking the values.
+        let redact = |v: &Option<String>| v.as_ref().map(|_| "<redacted>");
+        f.debug_struct("CodexAuthTokens")
+            .field("access_token", &redact(&self.access_token))
+            .field("account_id", &redact(&self.account_id))
+            .finish()
+    }
 }
 
 // ---- Codex session-log fallback ----
@@ -233,4 +249,31 @@ pub struct CodexQuotaSnapshot {
     pub reset_credits_available: Option<i64>,
     /// Whether a rate limit has been reached.
     pub limit_reached: Option<bool>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_tokens_debug_redacts_secrets() {
+        let tokens = CodexAuthTokens {
+            access_token: Some("sk-super-secret-value".into()),
+            account_id: Some("acct-1234567890".into()),
+        };
+        let direct = format!("{tokens:?}");
+        assert!(!direct.contains("sk-super-secret-value"));
+        assert!(!direct.contains("acct-1234567890"));
+        assert!(direct.contains("<redacted>"));
+
+        // The wrapper's derived Debug must inherit the redaction.
+        let wrapped = format!(
+            "{:?}",
+            CodexAuthJson {
+                tokens: Some(tokens)
+            }
+        );
+        assert!(!wrapped.contains("sk-super-secret-value"));
+        assert!(!wrapped.contains("acct-1234567890"));
+    }
 }
