@@ -1,0 +1,48 @@
+{
+  "user_id": "user-EXAMPLE",
+  "account_id": "user-EXAMPLE",
+  "email": "user@example.com",
+  "plan_type": "plus",
+  "rate_limit": {
+    "allowed": true,
+    "limit_reached": false,
+    "primary_window": {
+      "used_percent": 27,
+      "limit_window_seconds": 18000,
+      "reset_after_seconds": 16816,
+      "reset_at": 1782770922
+    },
+    "secondary_window": {
+      "used_percent": 4,
+      "limit_window_seconds": 604800,
+      "reset_after_seconds": 603616,
+      "reset_at": 1783357722
+    }
+  },
+  "code_review_rate_limit": null,
+  "additional_rate_limits": null,
+  "credits": {
+    "has_credits": false,
+    "unlimited": false,
+    "overage_limit_reached": false,
+    "balance": "0",
+    "approx_local_messages": [
+      0,
+      0
+    ],
+    "approx_cloud_messages": [
+      0,
+      0
+    ]
+  },
+  "spend_control": {
+    "reached": false,
+    "individual_limit": null
+  },
+  "rate_limit_reached_type": null,
+  "promo": null,
+  "referral_beacon": null,
+  "rate_limit_reset_credits": {
+    "available_count": 2
+  }
+}
