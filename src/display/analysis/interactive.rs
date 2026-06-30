@@ -141,6 +141,19 @@ pub fn display_analysis_interactive(
             // Calculate totals and extract display data
             totals = AnalysisRow::default();
             rows_data = convert_to_analysis_rows(&current_data.rows);
+            // Hide models with no recorded operations in this range; an all-zero
+            // row carries no information. Totals are summed from the remaining
+            // rows below, and zero rows would add nothing anyway.
+            rows_data.retain(|row| {
+                row.edit_lines != 0
+                    || row.read_lines != 0
+                    || row.write_lines != 0
+                    || row.bash_count != 0
+                    || row.edit_count != 0
+                    || row.read_count != 0
+                    || row.todo_write_count != 0
+                    || row.write_count != 0
+            });
             let provider_days = current_data.provider_days.clone();
             let per_provider = current_data.per_provider.clone();
 

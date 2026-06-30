@@ -208,6 +208,10 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
             // re-aggregating. These per-model summaries are small; the heavy
             // raw usage buffers are cleared right below.
             rows_data = summary.rows;
+            // Hide models with zero tokens in this range; they only add noise.
+            // The grand totals come from `summary.totals`, so dropping zero
+            // rows does not change them.
+            rows_data.retain(|row| row.total != 0);
             totals = summary.totals;
             provider_totals = summary.provider_totals;
 

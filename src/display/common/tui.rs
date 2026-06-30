@@ -6,9 +6,7 @@
 //! ([`UpdateTracker`]).
 
 use crossterm::{
-    event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEventKind,
-    },
+    event::{self, Event, KeyCode, KeyModifiers, MouseEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -17,8 +15,17 @@ use ratatui::{
     backend::CrosstermBackend,
     widgets::{ScrollbarState, TableState},
 };
-use std::io;
+use std::io::{self, Write};
 use std::time::{Duration, Instant};
+
+/// Mouse modes we turn on: 1000 (button press, which carries wheel notches) +
+/// 1006 (SGR extended coordinates). We deliberately leave 1002/1003 (button
+/// drag / any-motion) OFF — crossterm's `EnableMouseCapture` turns those on too,
+/// and mode 1003 emits an event for *every* pixel of mouse movement, flooding
+/// the input loop and causing scroll stutter. Wheel + click is all we need.
+const MOUSE_ENABLE: &str = "\x1b[?1000h\x1b[?1006h";
+/// Disable every mouse-tracking mode we might have toggled, defensively.
+const MOUSE_DISABLE: &str = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
 
 /// Puts the terminal into raw mode and the alternate screen, returning a ready [`Terminal`].
 ///
@@ -33,16 +40,18 @@ use std::time::{Duration, Instant};
 pub fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    // Mouse capture powers wheel scrolling. It also intercepts the terminal's
+    execute!(stdout, EnterAlternateScreen)?;
+    // Wheel scrolling needs mouse reporting. It also intercepts the terminal's
     // native drag-to-select; users can hold Shift to bypass it, or press `m` to
-    // toggle capture off at runtime (see `handle_input` / `set_mouse_capture`).
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // toggle it off at runtime (see `handle_input` / `set_mouse_capture`).
+    write!(stdout, "{MOUSE_ENABLE}")?;
+    stdout.flush()?;
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend)?;
     Ok(terminal)
 }
 
-/// Toggles mouse capture on the live terminal (the `m` key handler).
+/// Toggles mouse reporting on the live terminal (the `m` key handler).
 ///
 /// # Errors
 ///
@@ -51,11 +60,9 @@ pub fn set_mouse_capture(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     enable: bool,
 ) -> anyhow::Result<()> {
-    if enable {
-        execute!(terminal.backend_mut(), EnableMouseCapture)?;
-    } else {
-        execute!(terminal.backend_mut(), DisableMouseCapture)?;
-    }
+    let seq = if enable { MOUSE_ENABLE } else { MOUSE_DISABLE };
+    write!(terminal.backend_mut(), "{seq}")?;
+    terminal.backend_mut().flush()?;
     Ok(())
 }
 
@@ -70,13 +77,10 @@ pub fn restore_terminal(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
 ) -> anyhow::Result<()> {
     disable_raw_mode()?;
-    // Disable mouse capture unconditionally; leaving it on makes the user's
+    // Disable mouse reporting unconditionally; leaving it on makes the user's
     // terminal emit escape sequences on every scroll after we exit.
-    execute!(
-        terminal.backend_mut(),
-        DisableMouseCapture,
-        LeaveAlternateScreen
-    )?;
+    write!(terminal.backend_mut(), "{MOUSE_DISABLE}")?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
 }
