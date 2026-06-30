@@ -38,9 +38,10 @@ pub fn latest_session_rate_limits() -> Result<Option<CodexQuotaSnapshot>> {
     if !paths.codex_session_dir.exists() {
         return Ok(None);
     }
+    let now = chrono::Local::now().timestamp();
     for file in newest_codex_files(&paths.codex_session_dir, MAX_FILES) {
         let values = read_jsonl_lenient(&file);
-        if let Some(snap) = extract_latest_rate_limits(&values) {
+        if let Some(snap) = extract_latest_rate_limits(&values, now) {
             return Ok(Some(snap));
         }
     }
@@ -143,13 +144,16 @@ fn sorted_subdirs_desc(dir: &Path) -> Vec<PathBuf> {
     subdirs
 }
 
-/// Scans `values` in reverse, returning the newest `rate_limits` snapshot.
+/// Scans `values` in reverse, returning the newest usable `rate_limits`
+/// snapshot as of `now`.
 ///
 /// Looks at both `payload.rate_limits` and `payload.info.rate_limits`, and
-/// captures `plan_type` from the same object. Records whose `rate_limits`
-/// carries neither window, or that belong to a non-`codex` limit family, are
-/// skipped.
-pub fn extract_latest_rate_limits(values: &[Value]) -> Option<CodexQuotaSnapshot> {
+/// captures `plan_type` from the same object. A record is skipped when its
+/// `rate_limits` carries no window, belongs to a non-`codex` limit family, or
+/// every window has already passed its `resets_at` (an elapsed window's
+/// percentage no longer reflects current usage). A window that has reset is
+/// dropped individually, so a record can still contribute its live window.
+pub fn extract_latest_rate_limits(values: &[Value], now: i64) -> Option<CodexQuotaSnapshot> {
     for v in values.iter().rev() {
         let Some(payload) = v.get("payload") else {
             continue;
@@ -168,15 +172,28 @@ pub fn extract_latest_rate_limits(values: &[Value]) -> Option<CodexQuotaSnapshot
         if rl.limit_id.as_deref().is_some_and(|id| id != "codex") {
             continue;
         }
-        if rl.primary.is_none() && rl.secondary.is_none() {
+        // Drop windows whose reset time has already passed; their used_percent
+        // is from an elapsed window and no longer reflects reality.
+        let primary = rl
+            .primary
+            .as_ref()
+            .map(map_session_window)
+            .filter(|w| is_window_live(w, now));
+        let secondary = rl
+            .secondary
+            .as_ref()
+            .map(map_session_window)
+            .filter(|w| is_window_live(w, now));
+        if primary.is_none() && secondary.is_none() {
+            // No live window here; older records are even more stale.
             continue;
         }
         return Some(CodexQuotaSnapshot {
             source: QuotaSource::SessionFallback,
-            fetched_at: chrono::Local::now().timestamp(),
+            fetched_at: now,
             plan_type: rl.plan_type,
-            primary: rl.primary.as_ref().map(map_session_window),
-            secondary: rl.secondary.as_ref().map(map_session_window),
+            primary,
+            secondary,
             credits_balance: None,
             has_credits: None,
             unlimited: None,
@@ -185,6 +202,11 @@ pub fn extract_latest_rate_limits(values: &[Value]) -> Option<CodexQuotaSnapshot
         });
     }
     None
+}
+
+/// Whether a window is still current: its reset time is unknown or in the future.
+fn is_window_live(w: &QuotaWindow, now: i64) -> bool {
+    w.resets_at_unix.is_none_or(|reset| reset > now)
 }
 
 /// Maps a Codex session window into the normalized [`QuotaWindow`].
@@ -207,7 +229,7 @@ mod tests {
             json!({"payload":{"type":"message"}}),
             json!({"payload":{"rate_limits":{"primary":{"used_percent":42.0,"window_minutes":300,"resets_at":222},"secondary":{"used_percent":69.0,"window_minutes":10080,"resets_at":333},"plan_type":"plus"}}}),
         ];
-        let snap = extract_latest_rate_limits(&values).unwrap();
+        let snap = extract_latest_rate_limits(&values, 0).unwrap();
         assert_eq!(snap.source, QuotaSource::SessionFallback);
         assert_eq!(snap.primary.as_ref().unwrap().used_percent, 42.0);
         assert_eq!(snap.primary.as_ref().unwrap().resets_at_unix, Some(222));
@@ -220,14 +242,14 @@ mod tests {
         let values = vec![
             json!({"payload":{"info":{"rate_limits":{"primary":{"used_percent":5.0,"resets_at":1}}}}}),
         ];
-        let snap = extract_latest_rate_limits(&values).unwrap();
+        let snap = extract_latest_rate_limits(&values, 0).unwrap();
         assert_eq!(snap.primary.unwrap().used_percent, 5.0);
     }
 
     #[test]
     fn returns_none_without_rate_limits() {
         let values = vec![json!({"payload":{"type":"message"}}), json!({"foo":1})];
-        assert!(extract_latest_rate_limits(&values).is_none());
+        assert!(extract_latest_rate_limits(&values, 0).is_none());
     }
 
     #[test]
@@ -238,7 +260,7 @@ mod tests {
             // Newest record: a different metered family, must be skipped.
             json!({"payload":{"rate_limits":{"limit_id":"codex_other","primary":{"used_percent":95.0,"resets_at":2}}}}),
         ];
-        let snap = extract_latest_rate_limits(&values).unwrap();
+        let snap = extract_latest_rate_limits(&values, 0).unwrap();
         assert_eq!(snap.primary.unwrap().used_percent, 12.0);
         assert_eq!(snap.plan_type.as_deref(), Some("plus"));
     }
@@ -247,8 +269,28 @@ mod tests {
     fn accepts_missing_limit_id() {
         let values =
             vec![json!({"payload":{"rate_limits":{"primary":{"used_percent":7.0,"resets_at":1}}}})];
-        let snap = extract_latest_rate_limits(&values).unwrap();
+        let snap = extract_latest_rate_limits(&values, 0).unwrap();
         assert_eq!(snap.primary.unwrap().used_percent, 7.0);
+    }
+
+    #[test]
+    fn rejects_fully_expired_snapshot() {
+        // Both windows reset before `now` (500 < 1000) -> no usable data.
+        let values = vec![
+            json!({"payload":{"rate_limits":{"limit_id":"codex","primary":{"used_percent":90.0,"resets_at":500},"secondary":{"used_percent":80.0,"resets_at":400}}}}),
+        ];
+        assert!(extract_latest_rate_limits(&values, 1000).is_none());
+    }
+
+    #[test]
+    fn drops_expired_window_keeps_live_one() {
+        // 5h window reset (500 < 1000); 7d window still live (2000 > 1000).
+        let values = vec![
+            json!({"payload":{"rate_limits":{"limit_id":"codex","primary":{"used_percent":90.0,"resets_at":500},"secondary":{"used_percent":44.0,"resets_at":2000}}}}),
+        ];
+        let snap = extract_latest_rate_limits(&values, 1000).unwrap();
+        assert!(snap.primary.is_none(), "expired 5h window dropped");
+        assert_eq!(snap.secondary.unwrap().used_percent, 44.0);
     }
 
     #[test]
@@ -310,7 +352,7 @@ mod tests {
 
         let values = read_jsonl_lenient(&path);
         assert_eq!(values.len(), 2, "torn tail dropped, complete lines kept");
-        let snap = extract_latest_rate_limits(&values).unwrap();
+        let snap = extract_latest_rate_limits(&values, 0).unwrap();
         assert_eq!(snap.primary.unwrap().used_percent, 33.0);
     }
 }
