@@ -38,9 +38,24 @@ const MAX_TRACKED_ANALYSIS_ROWS: usize = 100;
 /// analysis table is wider (9 columns) so it needs more width than usage.
 const ANALYSIS_MIN_W: u16 = 84;
 const ANALYSIS_MIN_H: u16 = 14;
-/// At or above this height the per-provider band is shown; below it the band is
-/// dropped so the scrollable table keeps a usable height.
-const ANALYSIS_PANELS_MIN_H: u16 = 18;
+/// Rows that must fit *below* the provider band before it is worth showing: the
+/// scrollable table (`main_layout` gives it `Min(6)` ≈ 2 body rows after the
+/// border + header + margin) plus the summary bar (3) and controls line (1).
+const ANALYSIS_BELOW_BAND_MIN_H: u16 = 10;
+
+/// Height of the provider band, or `None` when the terminal is too short to
+/// show it without squeezing the table / summary / controls beneath it.
+///
+/// The band is `provider_row_count + 4` rows tall (its own border + header),
+/// floored at 4. Because it scales with the number of providers, gating on a
+/// fixed height would either hide it needlessly (few providers) or render it
+/// truncated (all five providers + overall). We instead require room for the
+/// band *and* everything below it, so it only appears when it fits in full.
+fn analysis_panels_height(area_height: u16, provider_row_count: usize) -> Option<u16> {
+    let totals_height = (provider_row_count as u16).saturating_add(4).max(4);
+    (area_height >= totals_height.saturating_add(ANALYSIS_BELOW_BAND_MIN_H))
+        .then_some(totals_height)
+}
 
 /// Render the `analysis` view as an interactive, auto-refreshing TUI.
 ///
@@ -286,8 +301,7 @@ fn render_analysis_frame(
             return;
         }
 
-        let totals_height = (provider_rows.len() as u16).saturating_add(4).max(4);
-        let panels_height = (area.height >= ANALYSIS_PANELS_MIN_H).then_some(totals_height);
+        let panels_height = analysis_panels_height(area.height, provider_rows.len());
         let chunks = main_layout(area, panels_height);
 
         let header = vec![
@@ -462,4 +476,27 @@ fn render_analysis_frame(
     })?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn band_shown_only_when_it_fits_in_full() {
+        // Five providers + the overall row = 6 band rows -> 10 tall, so the
+        // band needs at least 20 rows of terminal to also fit table+summary+
+        // controls. Below that it is hidden (previously it rendered truncated).
+        assert_eq!(analysis_panels_height(18, 6), None);
+        assert_eq!(analysis_panels_height(19, 6), None);
+        assert_eq!(analysis_panels_height(20, 6), Some(10));
+
+        // The threshold scales down with fewer providers instead of a fixed 18.
+        assert_eq!(analysis_panels_height(14, 1), None);
+        assert_eq!(analysis_panels_height(15, 1), Some(5));
+
+        // No providers still floors the band height at 4 (needs 14 rows).
+        assert_eq!(analysis_panels_height(13, 0), None);
+        assert_eq!(analysis_panels_height(14, 0), Some(4));
+    }
 }
