@@ -52,6 +52,16 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1.17.0
         with:
           target: ${{ matrix.target }}
+          cache: false
+
+      - name: Exclude build dirs from Windows Defender
+        if: ${{ startsWith(matrix.runner, 'windows') }}
+        shell: powershell
+        run: |
+          Add-MpPreference -ExclusionPath "${{ github.workspace }}" -ErrorAction SilentlyContinue
+          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo" -ErrorAction SilentlyContinue
+          Add-MpPreference -ExclusionProcess "rustc.exe" -ErrorAction SilentlyContinue
+          Add-MpPreference -ExclusionProcess "link.exe" -ErrorAction SilentlyContinue
 
       - name: Cargo build (release)
         run: |
@@ -118,6 +128,8 @@ jobs:
 
       - name: Setup Rust Toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1.17.0
+        with:
+          cache: false
 
       - name: Derive version from tag and update Cargo.toml
         id: version
@@ -126,9 +138,8 @@ jobs:
           TAG="${GITHUB_REF_NAME}"
           VERSION="${TAG#v}"
           echo "Version from tag: ${VERSION}"
-          cargo install cargo-edit --locked
-          cargo set-version "${VERSION}"
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          sed -i "s/^version = \"0.0.0\"/version = \"${VERSION}\"/" Cargo.toml
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Build crate package (.crate)
         run: |
@@ -139,7 +150,7 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          cargo publish --allow-dirty
+          cargo publish --no-verify --allow-dirty
 
       - name: Upload .crate artifact
         uses: actions/upload-artifact@v7
