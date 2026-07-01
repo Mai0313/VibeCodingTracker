@@ -2,8 +2,10 @@
 //!
 //! These are pure widget constructors with no I/O; they encode the common
 //! styling so the static-table and TUI renderers stay visually consistent.
-//! A recurring convention: the first two columns (index 0 and 1) are
-//! left-aligned and every remaining (numeric) column is right-aligned.
+//! A recurring convention: the leading label column(s) are left-aligned and
+//! every trailing (numeric) column is right-aligned. The comfy-table helpers
+//! left-align the first two (index 0 and 1); the ratatui `styled_row` helper
+//! takes the number of left-aligned columns as its `left_cols` argument.
 
 use crate::display::common::tui::ScrollState;
 use comfy_table::{Attribute, Cell, CellAlignment, Color, Table, presets::UTF8_FULL};
