@@ -207,11 +207,13 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
             rows_data = summary.rows;
             // Hide models that contributed neither tokens nor cost in this
             // range; they only add noise. A model can have zero tokens but a
-            // non-zero cost (Claude per-query web search, or an OpenCode model
-            // priced from its stored cost), so keep any row that carries cost
-            // too — otherwise it vanishes from the table while its cost still
-            // shows up in the grand total, leaving them inconsistent.
-            rows_data.retain(|row| row.total != 0 || row.cost > 0.0);
+            // nonzero cost (Claude per-query web search, or an OpenCode model
+            // priced from its stored cost or a credit adjustment), so keep any
+            // row that carries cost too. Otherwise it vanishes from the table
+            // while its cost still counts toward the grand total, leaving the
+            // two inconsistent. A negative (credit) cost counts just as much as
+            // a positive one, so match on any nonzero value, not just > 0.
+            rows_data.retain(|row| row.total != 0 || row.cost != 0.0);
             totals = summary.totals;
             provider_totals = summary.provider_totals;
 
