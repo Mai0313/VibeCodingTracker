@@ -41,7 +41,7 @@ Built with Rust for minimal resource footprint. The interactive TUI dashboard ty
 
 Choose your preferred view:
 
-- **Interactive Dashboard**: Auto-refreshing terminal UI with live updates, scrollable model list (arrow keys / mouse wheel), and compact K/M/B number formatting
+- **Interactive Dashboard**: Auto-refreshing terminal UI with live updates, scrollable model list (arrow keys), and compact K/M/B number formatting
 - **Static Reports**: Professional tables for documentation
 - **Script-Friendly**: Plain text and JSON for automation
 - **Full Precision**: Export exact costs for accounting
@@ -217,7 +217,7 @@ vct usage --json --daily
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
 │  Total Cost: $79.33  |  Total Tokens: 49.3M  |  Models: 3  |  Memory: 42.8 MB               │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
-  ↑/↓ scroll  PgUp/PgDn page  g/G top/end  r refresh  m mouse  q quit  |  ★ github.com/Mai0313/VibeCodingTracker
+  ↑/↓ scroll  PgUp/PgDn page  g/G top/end  r refresh  q quit  |  ★ github.com/Mai0313/VibeCodingTracker
 ```
 
 ### What It Scans
@@ -315,7 +315,7 @@ vct analysis --output today.json --daily
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
 │  Total Lines: 16.1K  |  Total Tools: 619  |  Models: 3  |  Memory: 41.2 MB                  │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
-  ↑/↓ scroll  PgUp/PgDn page  g/G top/end  r refresh  m mouse  q quit  |  ★ github.com/Mai0313/VibeCodingTracker
+  ↑/↓ scroll  PgUp/PgDn page  g/G top/end  r refresh  q quit  |  ★ github.com/Mai0313/VibeCodingTracker
 ```
 
 ---

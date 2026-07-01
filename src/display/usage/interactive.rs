@@ -13,7 +13,7 @@ use crate::display::common::table::{
 };
 use crate::display::common::tui::{
     InputAction, RefreshState, ScrollState, UpdateTracker, handle_input, restore_terminal,
-    set_mouse_capture, setup_terminal,
+    setup_terminal,
 };
 use crate::display::usage::averages::{
     UsageProviderTotals, UsageRow, UsageTotals, build_provider_total_rows, build_usage_summary,
@@ -72,9 +72,8 @@ const USAGE_PANELS_MIN_H: u16 = 22;
 /// - Auto-refresh every 10 seconds (usage + pricing)
 /// - Real-time memory monitoring
 /// - Provider-grouped totals
-/// - Scrollable model table (arrow keys / `PgUp`/`PgDn` / `g`/`G` / mouse wheel)
-/// - Keyboard controls: `q`, `Esc`, or `Ctrl+C` to exit, `r` to refresh,
-///   `m` to toggle mouse capture
+/// - Scrollable model table (arrow keys / `PgUp`/`PgDn` / `g`/`G`)
+/// - Keyboard controls: `q`, `Esc`, or `Ctrl+C` to exit, `r` to refresh
 ///
 /// # Errors
 ///
@@ -130,10 +129,8 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
 
     let mut update_tracker = UpdateTracker::new(MAX_TRACKED_ROWS, 1000);
 
-    // Scroll/selection state for the model table, plus the live mouse-capture
-    // flag toggled by the `m` key.
+    // Scroll/selection state for the model table (keyboard-driven).
     let mut scroll = ScrollState::new();
-    let mut mouse_enabled = true;
 
     // Latest rendered display state, kept across refresh cycles so a terminal
     // resize can redraw at the new size immediately without re-aggregating the
@@ -286,10 +283,6 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
                 break;
             }
             InputAction::Refresh => refresh_state.force(),
-            InputAction::ToggleMouse => {
-                mouse_enabled = !mouse_enabled;
-                set_mouse_capture(&mut terminal, mouse_enabled)?;
-            }
             // Move the selection / scroll, then repaint the cached frame
             // without re-aggregating.
             InputAction::Navigate(nav) => {

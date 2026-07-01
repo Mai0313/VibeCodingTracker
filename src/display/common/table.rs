@@ -100,8 +100,6 @@ pub fn create_controls() -> Paragraph<'static> {
         Span::styled(" top/end  ", dim),
         Span::styled("r", key),
         Span::styled(" refresh  ", dim),
-        Span::styled("m", key),
-        Span::styled(" mouse  ", dim),
         Span::styled("q", Style::default().fg(RatatuiColor::Red).bold()),
         Span::styled(" quit", dim),
         Span::styled("  |  ★ ", Style::default().fg(RatatuiColor::Yellow)),

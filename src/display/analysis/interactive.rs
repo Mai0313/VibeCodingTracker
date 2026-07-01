@@ -15,7 +15,7 @@ use crate::display::common::table::{
 };
 use crate::display::common::tui::{
     InputAction, RefreshState, ScrollState, UpdateTracker, handle_input, restore_terminal,
-    set_mouse_capture, setup_terminal,
+    setup_terminal,
 };
 use crate::utils::format_compact;
 use ratatui::{
@@ -96,10 +96,8 @@ pub fn display_analysis_interactive(
     // Track updates
     let mut update_tracker = UpdateTracker::new(MAX_TRACKED_ANALYSIS_ROWS, 1000);
 
-    // Scroll/selection state for the model table, plus the live mouse-capture
-    // flag toggled by the `m` key.
+    // Scroll/selection state for the model table (keyboard-driven).
     let mut scroll = ScrollState::new();
-    let mut mouse_enabled = true;
 
     // Latest rendered display state, kept across refresh cycles so a terminal
     // resize can redraw at the new size immediately without re-aggregating the
@@ -223,10 +221,6 @@ pub fn display_analysis_interactive(
         match action {
             InputAction::Quit => break,
             InputAction::Refresh => refresh_state.force(),
-            InputAction::ToggleMouse => {
-                mouse_enabled = !mouse_enabled;
-                set_mouse_capture(&mut terminal, mouse_enabled)?;
-            }
             // Move the selection / scroll, then repaint without re-aggregating.
             InputAction::Navigate(nav) => {
                 scroll.apply(nav, rows_data.len());

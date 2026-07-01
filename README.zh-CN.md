@@ -41,7 +41,7 @@
 
 选择你喜欢的查看方式：
 
-- **交互式面板**：自动刷新的终端 UI，支持实时更新、可滚动的模型列表（方向键 / 鼠标滚轮），以及 K/M/B 精简数字格式
+- **交互式面板**：自动刷新的终端 UI，支持实时更新、可滚动的模型列表（方向键），以及 K/M/B 精简数字格式
 - **静态报表**：专业的表格，适合文档记录
 - **脚本友好**：纯文本和 JSON 格式，方便自动化
 - **完整精度**：导出精确费用，满足财务核算需求
@@ -217,7 +217,7 @@ vct usage --json --daily
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
 │  Total Cost: $79.33  |  Total Tokens: 49.3M  |  Models: 3  |  Memory: 42.8 MB               │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
-  ↑/↓ scroll  PgUp/PgDn page  g/G top/end  r refresh  m mouse  q quit  |  ★ github.com/Mai0313/VibeCodingTracker
+  ↑/↓ scroll  PgUp/PgDn page  g/G top/end  r refresh  q quit  |  ★ github.com/Mai0313/VibeCodingTracker
 ```
 
 ### 扫描范围
@@ -315,7 +315,7 @@ vct analysis --output today.json --daily
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
 │  Total Lines: 16.1K  |  Total Tools: 619  |  Models: 3  |  Memory: 41.2 MB                  │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
-  ↑/↓ scroll  PgUp/PgDn page  g/G top/end  r refresh  m mouse  q quit  |  ★ github.com/Mai0313/VibeCodingTracker
+  ↑/↓ scroll  PgUp/PgDn page  g/G top/end  r refresh  q quit  |  ★ github.com/Mai0313/VibeCodingTracker
 ```
 
 ---

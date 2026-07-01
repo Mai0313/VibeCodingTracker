@@ -6,7 +6,7 @@
 //! ([`UpdateTracker`]).
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers, MouseEventKind},
+    event::{self, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -15,17 +15,8 @@ use ratatui::{
     backend::CrosstermBackend,
     widgets::{ScrollbarState, TableState},
 };
-use std::io::{self, Write};
+use std::io;
 use std::time::{Duration, Instant};
-
-/// Mouse modes we turn on: 1000 (button press, which carries wheel notches) +
-/// 1006 (SGR extended coordinates). We deliberately leave 1002/1003 (button
-/// drag / any-motion) OFF — crossterm's `EnableMouseCapture` turns those on too,
-/// and mode 1003 emits an event for *every* pixel of mouse movement, flooding
-/// the input loop and causing scroll stutter. Wheel + click is all we need.
-const MOUSE_ENABLE: &str = "\x1b[?1000h\x1b[?1006h";
-/// Disable every mouse-tracking mode we might have toggled, defensively.
-const MOUSE_DISABLE: &str = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
 
 /// Puts the terminal into raw mode and the alternate screen, returning a ready [`Terminal`].
 ///
@@ -40,30 +31,12 @@ const MOUSE_DISABLE: &str = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
 pub fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
+    // We navigate with the keyboard only, so mouse reporting is left OFF. This
+    // also keeps the terminal's native drag-to-select / copy working untouched.
     execute!(stdout, EnterAlternateScreen)?;
-    // Wheel scrolling needs mouse reporting. It also intercepts the terminal's
-    // native drag-to-select; users can hold Shift to bypass it, or press `m` to
-    // toggle it off at runtime (see `handle_input` / `set_mouse_capture`).
-    write!(stdout, "{MOUSE_ENABLE}")?;
-    stdout.flush()?;
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend)?;
     Ok(terminal)
-}
-
-/// Toggles mouse reporting on the live terminal (the `m` key handler).
-///
-/// # Errors
-///
-/// Returns an error if writing the enable/disable control sequence fails.
-pub fn set_mouse_capture(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    enable: bool,
-) -> anyhow::Result<()> {
-    let seq = if enable { MOUSE_ENABLE } else { MOUSE_DISABLE };
-    write!(terminal.backend_mut(), "{seq}")?;
-    terminal.backend_mut().flush()?;
-    Ok(())
 }
 
 /// Restores the terminal to normal mode (disable raw mode, leave alternate screen, show cursor).
@@ -77,9 +50,6 @@ pub fn restore_terminal(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
 ) -> anyhow::Result<()> {
     disable_raw_mode()?;
-    // Disable mouse reporting unconditionally; leaving it on makes the user's
-    // terminal emit escape sequences on every scroll after we exit.
-    write!(terminal.backend_mut(), "{MOUSE_DISABLE}")?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
@@ -117,11 +87,8 @@ pub fn handle_input() -> anyhow::Result<InputAction> {
                 if key.code == KeyCode::Char('r') || key.code == KeyCode::Char('R') {
                     return Ok(InputAction::Refresh);
                 }
-                if key.code == KeyCode::Char('m') || key.code == KeyCode::Char('M') {
-                    return Ok(InputAction::ToggleMouse);
-                }
                 // Navigation accumulates across the drained batch so a held key
-                // or a wheel burst collapses into a single net move per tick.
+                // collapses into a single net move per tick.
                 match key.code {
                     KeyCode::Up | KeyCode::Char('k') => nav.lines -= 1,
                     KeyCode::Down | KeyCode::Char('j') => nav.lines += 1,
@@ -132,13 +99,6 @@ pub fn handle_input() -> anyhow::Result<InputAction> {
                     _ => {}
                 }
             }
-            Event::Mouse(me) => match me.kind {
-                // One row per wheel notch; the drain loop already collapses a
-                // burst into a single net move.
-                MouseEventKind::ScrollUp => nav.lines -= 1,
-                MouseEventKind::ScrollDown => nav.lines += 1,
-                _ => {}
-            },
             Event::Resize(_, _) => resized = true,
             _ => {}
         }
@@ -159,9 +119,9 @@ pub fn handle_input() -> anyhow::Result<InputAction> {
 
 /// A net navigation move accumulated from one [`handle_input`] batch.
 ///
-/// `lines` is single-row steps (arrow keys / wheel notches), `pages` is
-/// page jumps (multiplied by the live viewport height by the consumer), and
-/// `top` / `bottom` jump to the first / last row.
+/// `lines` is single-row steps (arrow keys), `pages` is page jumps (multiplied
+/// by the live viewport height by the consumer), and `top` / `bottom` jump to
+/// the first / last row.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NavDelta {
     pub lines: i64,
@@ -184,8 +144,6 @@ pub enum InputAction {
     Quit,
     /// User asked to re-fetch and redraw (`r` / `R`).
     Refresh,
-    /// User asked to toggle mouse capture on/off (`m` / `M`).
-    ToggleMouse,
     /// User scrolled / moved the selection; redraw without re-fetching.
     Navigate(NavDelta),
     /// Terminal was resized — redraw the current frame at the new size
