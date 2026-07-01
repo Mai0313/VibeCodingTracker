@@ -10,17 +10,18 @@ use crate::display::analysis::averages::{
     calculate_analysis_provider_totals_from_per_provider, convert_to_analysis_rows,
 };
 use crate::display::common::table::{
-    create_controls, create_provider_row, create_ratatui_table, create_star_hint, create_summary,
-    create_title,
+    create_controls, create_provider_row, create_ratatui_table, create_summary, main_layout,
+    render_scrollable_table, render_too_small, styled_row,
 };
 use crate::display::common::tui::{
-    InputAction, RefreshState, UpdateTracker, handle_input, restore_terminal, setup_terminal,
+    InputAction, RefreshState, ScrollState, UpdateTracker, handle_input, restore_terminal,
+    setup_terminal,
 };
-use crate::utils::format_number;
+use crate::utils::format_compact;
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout as RatatuiLayout},
+    layout::Constraint,
     style::{Color as RatatuiColor, Style, Stylize},
     widgets::Row as RatatuiRow,
 };
@@ -32,6 +33,29 @@ const ANALYSIS_REFRESH_SECS: u64 = 10;
 /// Upper bound on the number of rows tracked for the "recently updated"
 /// highlight, capping the tracker's memory footprint.
 const MAX_TRACKED_ANALYSIS_ROWS: usize = 100;
+
+/// Hard minimum terminal width/height; below this only a notice is drawn. The
+/// analysis table is wider (9 columns) so it needs more width than usage.
+const ANALYSIS_MIN_W: u16 = 84;
+const ANALYSIS_MIN_H: u16 = 14;
+/// Rows that must fit *below* the provider band before it is worth showing: the
+/// scrollable table (`main_layout` gives it `Min(6)` ≈ 2 body rows after the
+/// border + header + margin) plus the summary bar (3) and controls line (1).
+const ANALYSIS_BELOW_BAND_MIN_H: u16 = 10;
+
+/// Height of the provider band, or `None` when the terminal is too short to
+/// show it without squeezing the table / summary / controls beneath it.
+///
+/// The band is `provider_row_count + 4` rows tall (its own border + header),
+/// floored at 4. Because it scales with the number of providers, gating on a
+/// fixed height would either hide it needlessly (few providers) or render it
+/// truncated (all five providers + overall). We instead require room for the
+/// band *and* everything below it, so it only appears when it fits in full.
+fn analysis_panels_height(area_height: u16, provider_row_count: usize) -> Option<u16> {
+    let totals_height = (provider_row_count as u16).saturating_add(4).max(4);
+    (area_height >= totals_height.saturating_add(ANALYSIS_BELOW_BAND_MIN_H))
+        .then_some(totals_height)
+}
 
 /// Render the `analysis` view as an interactive, auto-refreshing TUI.
 ///
@@ -87,6 +111,9 @@ pub fn display_analysis_interactive(
     // Track updates
     let mut update_tracker = UpdateTracker::new(MAX_TRACKED_ANALYSIS_ROWS, 1000);
 
+    // Scroll/selection state for the model table (keyboard-driven).
+    let mut scroll = ScrollState::new();
+
     // Latest rendered display state, kept across refresh cycles so a terminal
     // resize can redraw at the new size immediately without re-aggregating the
     // session directories.
@@ -116,9 +143,30 @@ pub fn display_analysis_interactive(
                 }
             };
 
+            // Remember the selected model so the highlight follows it across a
+            // refresh even when rows are reordered or added/removed.
+            let prev_model = scroll
+                .table
+                .selected()
+                .and_then(|i| rows_data.get(i))
+                .map(|row| row.model.clone());
+
             // Calculate totals and extract display data
             totals = AnalysisRow::default();
             rows_data = convert_to_analysis_rows(&current_data.rows);
+            // Hide models with no recorded operations in this range; an all-zero
+            // row carries no information. Totals are summed from the remaining
+            // rows below, and zero rows would add nothing anyway.
+            rows_data.retain(|row| {
+                row.edit_lines != 0
+                    || row.read_lines != 0
+                    || row.write_lines != 0
+                    || row.bash_count != 0
+                    || row.edit_count != 0
+                    || row.read_count != 0
+                    || row.todo_write_count != 0
+                    || row.write_count != 0
+            });
             let provider_days = current_data.provider_days.clone();
             let per_provider = current_data.per_provider.clone();
 
@@ -158,6 +206,7 @@ pub fn display_analysis_interactive(
             // Cleanup old entries
             let current_row_keys: Vec<String> =
                 rows_data.iter().map(|row| row.model.clone()).collect();
+            scroll.sync(prev_model.as_deref(), &current_row_keys);
             update_tracker.cleanup(current_row_keys);
 
             // Compute per-provider totals directly from the per-provider
@@ -175,6 +224,7 @@ pub fn display_analysis_interactive(
                 &update_tracker,
                 &sys,
                 pid,
+                &mut scroll,
             )?;
 
             // Return arena free lists to the OS — see `release_freed_heap` docs.
@@ -182,9 +232,24 @@ pub fn display_analysis_interactive(
         }
 
         // Handle input with timeout
-        match handle_input()? {
+        let action = handle_input()?;
+        match action {
             InputAction::Quit => break,
             InputAction::Refresh => refresh_state.force(),
+            // Move the selection / scroll, then repaint without re-aggregating.
+            InputAction::Navigate(nav) => {
+                scroll.apply(nav, rows_data.len());
+                render_analysis_frame(
+                    &mut terminal,
+                    &rows_data,
+                    &totals,
+                    &provider_totals,
+                    &update_tracker,
+                    &sys,
+                    pid,
+                    &mut scroll,
+                )?;
+            }
             // Redraw the cached frame at the new terminal size without
             // re-aggregating, so resize tracks the drag instead of waiting
             // for the next refresh tick.
@@ -196,6 +261,7 @@ pub fn display_analysis_interactive(
                 &update_tracker,
                 &sys,
                 pid,
+                &mut scroll,
             )?,
             InputAction::Continue => {}
         }
@@ -224,28 +290,20 @@ fn render_analysis_frame(
     update_tracker: &UpdateTracker,
     sys: &System,
     pid: Pid,
+    scroll: &mut ScrollState,
 ) -> anyhow::Result<()> {
     let provider_rows = build_analysis_provider_rows(provider_totals);
 
     terminal.draw(|f| {
-        let totals_height = (provider_rows.len() as u16).saturating_add(4).max(4);
-        let chunks = RatatuiLayout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),             // Title
-                Constraint::Min(10),               // Table
-                Constraint::Length(totals_height), // Per-provider totals
-                Constraint::Length(3),             // Summary
-                Constraint::Length(2),             // Controls
-                Constraint::Length(1),             // Star Hint
-            ])
-            .split(f.area());
+        let area = f.area();
+        if area.width < ANALYSIS_MIN_W || area.height < ANALYSIS_MIN_H {
+            render_too_small(f, ANALYSIS_MIN_W, ANALYSIS_MIN_H);
+            return;
+        }
 
-        // Title
-        let title = create_title("Analysis Statistics", RatatuiColor::Cyan);
-        f.render_widget(title, chunks[0]);
+        let panels_height = analysis_panels_height(area.height, provider_rows.len());
+        let chunks = main_layout(area, panels_height);
 
-        // Table
         let header = vec![
             "Model",
             "Edit Lines",
@@ -258,155 +316,146 @@ fn render_analysis_frame(
             "Write",
         ];
 
-        let mut rows: Vec<RatatuiRow> = rows_data
+        // One selectable row per model; the grand total lives only in the
+        // summary bar below. Compact K/M/B numbers keep long counts in-column.
+        let rows: Vec<RatatuiRow> = rows_data
             .iter()
             .map(|row| {
-                let row_key = row.model.clone();
-
-                // Check if this row was recently updated
-                let is_recently_updated = update_tracker.is_recently_updated(&row_key);
-
-                let style = if is_recently_updated {
+                let style = if update_tracker.is_recently_updated(&row.model) {
                     Style::default().bg(RatatuiColor::Rgb(60, 80, 60)).bold()
                 } else {
                     Style::default()
                 };
-
-                RatatuiRow::new(vec![
-                    row.model.clone(),
-                    format_number(row.edit_lines),
-                    format_number(row.read_lines),
-                    format_number(row.write_lines),
-                    format_number(row.bash_count),
-                    format_number(row.edit_count),
-                    format_number(row.read_count),
-                    format_number(row.todo_write_count),
-                    format_number(row.write_count),
-                ])
-                .style(style)
-            })
-            .collect();
-
-        // Add totals row
-        rows.push(
-            RatatuiRow::new(vec![
-                "TOTAL".to_string(),
-                format_number(totals.edit_lines),
-                format_number(totals.read_lines),
-                format_number(totals.write_lines),
-                format_number(totals.bash_count),
-                format_number(totals.edit_count),
-                format_number(totals.read_count),
-                format_number(totals.todo_write_count),
-                format_number(totals.write_count),
-            ])
-            .style(
-                Style::default()
-                    .fg(RatatuiColor::Yellow)
-                    .bold()
-                    .bg(RatatuiColor::DarkGray),
-            ),
-        );
-
-        let widths = [
-            Constraint::Min(20),    // Model
-            Constraint::Length(12), // Edit Lines
-            Constraint::Length(12), // Read Lines
-            Constraint::Length(12), // Write Lines
-            Constraint::Length(8),  // Bash
-            Constraint::Length(8),  // Edit
-            Constraint::Length(8),  // Read
-            Constraint::Length(12), // TodoWrite
-            Constraint::Length(8),  // Write
-        ];
-
-        let table = create_ratatui_table(rows, header, &widths, RatatuiColor::Green);
-        f.render_widget(table, chunks[1]);
-
-        // Per-provider totals table
-        let mut totals_rows: Vec<RatatuiRow> = provider_rows
-            .iter()
-            .map(|row| {
-                create_provider_row(
+                styled_row(
                     vec![
-                        row.label.to_string(),
-                        format_number(row.stats.total_edit_lines as i64),
-                        format_number(row.stats.total_read_lines as i64),
-                        format_number(row.stats.total_write_lines as i64),
-                        format_number(row.stats.total_bash_count as i64),
-                        format_number(row.stats.total_edit_count as i64),
-                        format_number(row.stats.total_read_count as i64),
-                        format_number(row.stats.total_todo_write_count as i64),
-                        format_number(row.stats.total_write_count as i64),
-                        format_number(row.stats.days_count as i64),
+                        row.model.clone(),
+                        format_compact(row.edit_lines as i64),
+                        format_compact(row.read_lines as i64),
+                        format_compact(row.write_lines as i64),
+                        format_compact(row.bash_count as i64),
+                        format_compact(row.edit_count as i64),
+                        format_compact(row.read_count as i64),
+                        format_compact(row.todo_write_count as i64),
+                        format_compact(row.write_count as i64),
                     ],
-                    row.tui_color,
-                    row.emphasize,
+                    style,
+                    1,
                 )
             })
             .collect();
 
-        if totals_rows.is_empty() {
-            totals_rows.push(
-                RatatuiRow::new(vec![
-                    "No provider data yet".to_string(),
-                    "-".to_string(),
-                    "-".to_string(),
-                    "-".to_string(),
-                    "-".to_string(),
-                    "-".to_string(),
-                    "-".to_string(),
-                    "-".to_string(),
-                    "-".to_string(),
-                    "-".to_string(),
-                ])
-                .style(Style::default().fg(RatatuiColor::DarkGray)),
-            );
-        }
-
-        let totals_header = vec![
-            "Provider",
-            "Edit Lines",
-            "Read Lines",
-            "Write Lines",
-            "Bash",
-            "Edit",
-            "Read",
-            "TodoWrite",
-            "Write",
-            "Days",
-        ];
-
-        let totals_widths = [
-            Constraint::Min(15),    // Provider
+        let widths = [
+            Constraint::Min(16),    // Model
             Constraint::Length(11), // Edit Lines
             Constraint::Length(11), // Read Lines
-            Constraint::Length(12), // Write Lines
-            Constraint::Length(8),  // Bash
-            Constraint::Length(8),  // Edit
-            Constraint::Length(8),  // Read
-            Constraint::Length(11), // TodoWrite
-            Constraint::Length(8),  // Write
-            Constraint::Length(8),  // Days
+            Constraint::Length(11), // Write Lines
+            Constraint::Length(7),  // Bash
+            Constraint::Length(7),  // Edit
+            Constraint::Length(7),  // Read
+            Constraint::Length(10), // TodoWrite
+            Constraint::Length(7),  // Write
         ];
 
-        let totals_table = create_ratatui_table(
-            totals_rows,
-            totals_header,
-            &totals_widths,
-            RatatuiColor::Magenta,
+        let row_count = rows.len();
+        render_scrollable_table(
+            f,
+            chunks.table,
+            header,
+            rows,
+            &widths,
+            RatatuiColor::Green,
+            row_count,
+            scroll,
         );
-        f.render_widget(totals_table, chunks[2]);
+
+        if let Some(panel_area) = chunks.panels {
+            // Drop the "All Providers" aggregate; the summary bar already
+            // carries the grand totals.
+            let mut totals_rows: Vec<RatatuiRow> = provider_rows
+                .iter()
+                .filter(|row| row.label != "All Providers")
+                .map(|row| {
+                    create_provider_row(
+                        vec![
+                            row.label.to_string(),
+                            format_compact(row.stats.total_edit_lines as i64),
+                            format_compact(row.stats.total_read_lines as i64),
+                            format_compact(row.stats.total_write_lines as i64),
+                            format_compact(row.stats.total_bash_count as i64),
+                            format_compact(row.stats.total_edit_count as i64),
+                            format_compact(row.stats.total_read_count as i64),
+                            format_compact(row.stats.total_todo_write_count as i64),
+                            format_compact(row.stats.total_write_count as i64),
+                            format_compact(row.stats.days_count as i64),
+                        ],
+                        row.tui_color,
+                        row.emphasize,
+                    )
+                })
+                .collect();
+
+            if totals_rows.is_empty() {
+                totals_rows.push(
+                    RatatuiRow::new(vec![
+                        "No provider data yet".to_string(),
+                        "-".to_string(),
+                        "-".to_string(),
+                        "-".to_string(),
+                        "-".to_string(),
+                        "-".to_string(),
+                        "-".to_string(),
+                        "-".to_string(),
+                        "-".to_string(),
+                        "-".to_string(),
+                    ])
+                    .style(Style::default().fg(RatatuiColor::DarkGray)),
+                );
+            }
+
+            let totals_header = vec![
+                "Provider",
+                "Edit Lines",
+                "Read Lines",
+                "Write Lines",
+                "Bash",
+                "Edit",
+                "Read",
+                "TodoWrite",
+                "Write",
+                "Days",
+            ];
+
+            let totals_widths = [
+                Constraint::Min(15),    // Provider
+                Constraint::Length(11), // Edit Lines
+                Constraint::Length(11), // Read Lines
+                Constraint::Length(12), // Write Lines
+                Constraint::Length(8),  // Bash
+                Constraint::Length(8),  // Edit
+                Constraint::Length(8),  // Read
+                Constraint::Length(11), // TodoWrite
+                Constraint::Length(8),  // Write
+                Constraint::Length(8),  // Days
+            ];
+
+            let totals_table = create_ratatui_table(
+                totals_rows,
+                totals_header,
+                &totals_widths,
+                RatatuiColor::Magenta,
+            );
+            f.render_widget(totals_table, panel_area);
+        }
 
         // Summary
         let total_lines_str =
-            format_number(totals.edit_lines + totals.read_lines + totals.write_lines);
-        let total_tools_str = format_number(
-            totals.bash_count
+            format_compact((totals.edit_lines + totals.read_lines + totals.write_lines) as i64);
+        let total_tools_str = format_compact(
+            (totals.bash_count
                 + totals.edit_count
                 + totals.read_count
                 + totals.todo_write_count
-                + totals.write_count,
+                + totals.write_count) as i64,
         );
         let entries_str = format!("{}", rows_data.len());
 
@@ -421,16 +470,33 @@ fn render_analysis_frame(
         ];
 
         let summary = create_summary(summary_items, sys, pid);
-        f.render_widget(summary, chunks[3]);
+        f.render_widget(summary, chunks.summary);
 
-        // Controls
-        let controls = create_controls();
-        f.render_widget(controls, chunks[4]);
-
-        // Star Hint
-        let star_hint = create_star_hint();
-        f.render_widget(star_hint, chunks[5]);
+        f.render_widget(create_controls(), chunks.controls);
     })?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn band_shown_only_when_it_fits_in_full() {
+        // Five providers + the overall row = 6 band rows -> 10 tall, so the
+        // band needs at least 20 rows of terminal to also fit table+summary+
+        // controls. Below that it is hidden (previously it rendered truncated).
+        assert_eq!(analysis_panels_height(18, 6), None);
+        assert_eq!(analysis_panels_height(19, 6), None);
+        assert_eq!(analysis_panels_height(20, 6), Some(10));
+
+        // The threshold scales down with fewer providers instead of a fixed 18.
+        assert_eq!(analysis_panels_height(14, 1), None);
+        assert_eq!(analysis_panels_height(15, 1), Some(5));
+
+        // No providers still floors the band height at 4 (needs 14 rows).
+        assert_eq!(analysis_panels_height(13, 0), None);
+        assert_eq!(analysis_panels_height(14, 0), Some(4));
+    }
 }

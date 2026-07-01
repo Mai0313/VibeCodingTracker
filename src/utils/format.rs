@@ -52,6 +52,90 @@ where
     result
 }
 
+/// Formats an integer into a compact human string with a K/M/B/T suffix.
+///
+/// Targets a dense dashboard where column width is scarce: values under 1000
+/// render verbatim, otherwise the largest fitting unit is used with 3
+/// significant figures (2 / 1 / 0 decimals as the scaled value crosses 10 and
+/// 100), so the result stays within ~5 characters. Rounding that would reach
+/// 1000 within a unit is promoted to the next unit, so `999_950` renders as
+/// `"1.00M"` rather than `"1000K"`. Negative values keep a leading `-`.
+///
+/// Only the interactive TUI uses this; the static table, text, and JSON paths
+/// keep [`format_number`] so their numbers stay exact.
+///
+/// # Examples
+///
+/// ```
+/// use vibe_coding_tracker::utils::format_compact;
+///
+/// assert_eq!(format_compact(999), "999");
+/// assert_eq!(format_compact(1_000), "1.00K");
+/// assert_eq!(format_compact(1_234_567), "1.23M");
+/// assert_eq!(format_compact(999_950), "1.00M");
+/// ```
+pub fn format_compact(n: i64) -> String {
+    // Descending so the first match is the largest fitting unit.
+    const UNITS: [(f64, char); 4] = [(1e12, 'T'), (1e9, 'B'), (1e6, 'M'), (1e3, 'K')];
+
+    let abs = n.unsigned_abs() as f64;
+    if abs < 1000.0 {
+        // No suffix needed; render the integer verbatim (keeps the sign).
+        return n.to_string();
+    }
+
+    // Decimals by magnitude, with a tiny epsilon so e.g. 9.999 classifies as
+    // the 1-decimal bucket and renders "10.0K" instead of "10.00K".
+    let decimals = |v: f64| -> usize {
+        if v < 9.995 {
+            2
+        } else if v < 99.95 {
+            1
+        } else {
+            0
+        }
+    };
+
+    let mut idx = UNITS
+        .iter()
+        .position(|&(threshold, _)| abs >= threshold)
+        .unwrap_or(UNITS.len() - 1);
+    let mut scaled = abs / UNITS[idx].0;
+
+    // Rounding can push the scaled value to 1000 (e.g. 999_950 -> "1000K");
+    // promote one unit up so it reads "1.00M".
+    let dec = decimals(scaled);
+    let factor = 10f64.powi(dec as i32);
+    if (scaled * factor).round() / factor >= 1000.0 && idx > 0 {
+        idx -= 1;
+        scaled = abs / UNITS[idx].0;
+    }
+
+    let dec = decimals(scaled);
+    let sign = if n < 0 { "-" } else { "" };
+    format!("{sign}{scaled:.dec$}{suffix}", suffix = UNITS[idx].1)
+}
+
+/// Formats a USD amount as `"$1,234.56"` (comma-grouped dollars, two decimals).
+///
+/// Unlike [`format_compact`], money is never abbreviated to K/M/B — that would
+/// drop the cents — so long totals are kept readable with thousands separators
+/// instead. Negative amounts render as `"-$1.23"`.
+///
+/// # Examples
+///
+/// ```
+/// use vibe_coding_tracker::utils::format_cost;
+///
+/// assert_eq!(format_cost(0.0), "$0.00");
+/// assert_eq!(format_cost(1234.5), "$1,234.50");
+/// ```
+pub fn format_cost(cost: f64) -> String {
+    let cents = (cost.abs() * 100.0).round() as i64;
+    let sign = if cost < 0.0 && cents != 0 { "-" } else { "" };
+    format!("{sign}${}.{:02}", format_number(cents / 100), cents % 100)
+}
+
 // Cache for current date (updated once per day)
 static DATE_CACHE: RwLock<Option<(NaiveDate, String)>> = RwLock::new(None);
 
@@ -161,6 +245,51 @@ mod tests {
     fn test_format_number_with_large_integers() {
         assert_eq!(format_number(12345_i64), "12,345");
         assert_eq!(format_number(999_i32), "999");
+    }
+
+    #[test]
+    fn test_format_compact() {
+        // Below 1000: verbatim, no suffix.
+        assert_eq!(format_compact(0), "0");
+        assert_eq!(format_compact(42), "42");
+        assert_eq!(format_compact(999), "999");
+
+        // K / M / B / T with 3 significant figures.
+        assert_eq!(format_compact(1_000), "1.00K");
+        assert_eq!(format_compact(1_234), "1.23K");
+        assert_eq!(format_compact(12_345), "12.3K");
+        assert_eq!(format_compact(123_456), "123K");
+        assert_eq!(format_compact(1_234_567), "1.23M");
+        assert_eq!(format_compact(1_230_000_000), "1.23B");
+        assert_eq!(format_compact(2_000_000_000_000), "2.00T");
+    }
+
+    #[test]
+    fn test_format_compact_rounding_promotion() {
+        // Rounding that reaches 1000 within a unit promotes to the next unit.
+        // 999_499 rounds to 999K; 999_500 rounds up and promotes to 1.00M.
+        assert_eq!(format_compact(999_499), "999K");
+        assert_eq!(format_compact(999_500), "1.00M");
+        assert_eq!(format_compact(999_999), "1.00M");
+        assert_eq!(format_compact(1_000_000), "1.00M");
+        // 9.999K classifies into the 1-decimal bucket, not "10.00K".
+        assert_eq!(format_compact(9_999), "10.0K");
+    }
+
+    #[test]
+    fn test_format_compact_negative() {
+        assert_eq!(format_compact(-42), "-42");
+        assert_eq!(format_compact(-1_234), "-1.23K");
+        assert_eq!(format_compact(-1_234_567), "-1.23M");
+    }
+
+    #[test]
+    fn test_format_cost() {
+        assert_eq!(format_cost(0.0), "$0.00");
+        assert_eq!(format_cost(1.5), "$1.50");
+        assert_eq!(format_cost(1234.56), "$1,234.56");
+        assert_eq!(format_cost(1_234_567.891), "$1,234,567.89");
+        assert_eq!(format_cost(-5.5), "-$5.50");
     }
 
     #[test]

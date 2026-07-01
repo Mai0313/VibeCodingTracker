@@ -2,15 +2,22 @@
 //!
 //! These are pure widget constructors with no I/O; they encode the common
 //! styling so the static-table and TUI renderers stay visually consistent.
-//! A recurring convention: the first two columns (index 0 and 1) are
-//! left-aligned and every remaining (numeric) column is right-aligned.
+//! A recurring convention: the leading label column(s) are left-aligned and
+//! every trailing (numeric) column is right-aligned. The comfy-table helpers
+//! left-align the first two (index 0 and 1); the ratatui `styled_row` helper
+//! takes the number of left-aligned columns as its `left_cols` argument.
 
+use crate::display::common::tui::ScrollState;
 use comfy_table::{Attribute, Cell, CellAlignment, Color, Table, presets::UTF8_FULL};
 use ratatui::{
-    layout::Constraint,
+    Frame,
+    layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color as RatatuiColor, Modifier, Style, Stylize},
-    text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Row as RatatuiRow, Table as RatatuiTable},
+    text::{Line, Span, Text},
+    widgets::{
+        Block, Borders, Cell as RatatuiCell, Paragraph, Row as RatatuiRow, Scrollbar,
+        ScrollbarOrientation, ScrollbarState, Table as RatatuiTable,
+    },
 };
 use sysinfo::System;
 
@@ -78,37 +85,195 @@ pub fn create_summary<'a>(
         .centered()
 }
 
-/// Builds the centered key-hint footer (quit / refresh) for a TUI view.
+/// Builds the single-line key-hint footer (navigation + the GitHub star link).
+///
+/// Everything is on one line to save vertical space; the star link sits last so
+/// it is the first thing truncated on a narrow terminal, leaving the keys
+/// readable.
 pub fn create_controls() -> Paragraph<'static> {
+    let key = Style::default().fg(RatatuiColor::Cyan).bold();
+    let dim = Style::default().fg(RatatuiColor::DarkGray);
     Paragraph::new(vec![Line::from(vec![
-        Span::styled("Press ", Style::default().fg(RatatuiColor::DarkGray)),
-        Span::styled("'q'", Style::default().fg(RatatuiColor::Red).bold()),
-        Span::styled(", ", Style::default().fg(RatatuiColor::DarkGray)),
-        Span::styled("'Esc'", Style::default().fg(RatatuiColor::Red).bold()),
-        Span::styled(", ", Style::default().fg(RatatuiColor::DarkGray)),
-        Span::styled("'Ctrl+C'", Style::default().fg(RatatuiColor::Red).bold()),
-        Span::styled(" to quit", Style::default().fg(RatatuiColor::DarkGray)),
+        Span::styled("↑/↓", key),
+        Span::styled(" scroll  ", dim),
+        Span::styled("PgUp/PgDn", key),
+        Span::styled(" page  ", dim),
+        Span::styled("g/G", key),
+        Span::styled(" top/end  ", dim),
+        Span::styled("r", key),
+        Span::styled(" refresh  ", dim),
+        Span::styled("q", Style::default().fg(RatatuiColor::Red).bold()),
+        Span::styled(" quit", dim),
+        Span::styled("  |  ★ ", Style::default().fg(RatatuiColor::Yellow)),
         Span::styled(
-            "  |  Press 'r' to refresh",
-            Style::default().fg(RatatuiColor::DarkGray),
+            "github.com/Mai0313/VibeCodingTracker",
+            Style::default().fg(RatatuiColor::Cyan).underlined(),
         ),
     ])])
     .centered()
 }
 
-/// Builds the centered footer line inviting the user to star the project on GitHub.
-pub fn create_star_hint() -> Paragraph<'static> {
-    Paragraph::new(vec![Line::from(vec![
-        Span::styled(
-            "If you like this tool, please star us on GitHub: ",
+/// Vertical chunk rects for an interactive frame.
+pub struct FrameChunks {
+    /// Scrollable main table area.
+    pub table: Rect,
+    /// Provider / quota band, present only when there is room for it.
+    pub panels: Option<Rect>,
+    /// Summary bar area.
+    pub summary: Rect,
+    /// Single-line controls footer area.
+    pub controls: Rect,
+}
+
+/// Splits `area` into the standard interactive-view rows.
+///
+/// When `panels_height` is `Some`, a provider/quota band of that height sits
+/// between the scrollable table and the summary; when `None` (a tight terminal)
+/// the band is dropped and the table absorbs the space. The table always gets
+/// `Min(6)` so at least ~2 body rows survive (border + header + margin eat 4).
+pub fn main_layout(area: Rect, panels_height: Option<u16>) -> FrameChunks {
+    match panels_height {
+        Some(h) => {
+            let c = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(6),
+                    Constraint::Length(h),
+                    Constraint::Length(3),
+                    Constraint::Length(1),
+                ])
+                .split(area);
+            FrameChunks {
+                table: c[0],
+                panels: Some(c[1]),
+                summary: c[2],
+                controls: c[3],
+            }
+        }
+        None => {
+            let c = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(6),
+                    Constraint::Length(3),
+                    Constraint::Length(1),
+                ])
+                .split(area);
+            FrameChunks {
+                table: c[0],
+                panels: None,
+                summary: c[1],
+                controls: c[2],
+            }
+        }
+    }
+}
+
+/// Builds a table row with the first `left_cols` cells left-aligned and the
+/// rest right-aligned, painted with `style`.
+///
+/// Right-aligning the numeric columns keeps variable-width compact values
+/// (`1.23M`, `999K`) flush instead of ragged.
+pub fn styled_row(cells: Vec<String>, style: Style, left_cols: usize) -> RatatuiRow<'static> {
+    let cells: Vec<RatatuiCell> = cells
+        .into_iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let align = if i < left_cols {
+                Alignment::Left
+            } else {
+                Alignment::Right
+            };
+            RatatuiCell::from(Text::from(s).alignment(align))
+        })
+        .collect();
+    RatatuiRow::new(cells).style(style)
+}
+
+/// Renders a scrollable, selectable table plus a side scrollbar into `area`.
+///
+/// `rows` are the already-styled body rows (highlight / TOTAL styling applied by
+/// the caller); `row_count` is the total displayed row count used to size the
+/// scrollbar. Updates `scroll.viewport_rows` to the rendered body height so the
+/// event loop can size page jumps. The block border + header + header margin
+/// consume 4 rows, so the visible body height is `area.height - 4`.
+#[allow(clippy::too_many_arguments)]
+pub fn render_scrollable_table(
+    f: &mut Frame,
+    area: Rect,
+    header: Vec<&str>,
+    rows: Vec<RatatuiRow>,
+    widths: &[Constraint],
+    border_color: RatatuiColor,
+    row_count: usize,
+    scroll: &mut ScrollState,
+) {
+    let viewport = area.height.saturating_sub(4);
+    scroll.viewport_rows = viewport;
+
+    // Selection is shown purely by the row color (no leading symbol / gutter).
+    let table = create_ratatui_table(rows, header, widths, border_color).row_highlight_style(
+        Style::default()
+            .fg(RatatuiColor::Black)
+            .bg(RatatuiColor::Cyan)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    f.render_stateful_widget(table, area, &mut scroll.table);
+
+    // Scrollbar driven by the selected index, inset by one row so it sits
+    // between the block's top/bottom borders instead of over the corners.
+    let selected = scroll.table.selected().unwrap_or(0);
+    scroll.scrollbar = ScrollbarState::new(row_count)
+        .viewport_content_length(viewport as usize)
+        .position(selected);
+    f.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None),
+        area.inner(Margin {
+            vertical: 1,
+            horizontal: 0,
+        }),
+        &mut scroll.scrollbar,
+    );
+}
+
+/// Renders a centered "terminal too small" notice and nothing else.
+///
+/// Used as an early-out when the window is below the view's hard minimum, so the
+/// normal layout never tries to draw into an area that would overlap.
+pub fn render_too_small(f: &mut Frame, min_w: u16, min_h: u16) {
+    let area = f.area();
+    let para = Paragraph::new(vec![
+        Line::from(Span::styled(
+            "Terminal too small",
+            Style::default().fg(RatatuiColor::Red).bold(),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "resize to at least {min_w} x {min_h}  (now {} x {})",
+                area.width, area.height
+            ),
             Style::default().fg(RatatuiColor::Gray),
-        ),
-        Span::styled(
-            "https://github.com/Mai0313/VibeCodingTracker",
-            Style::default().fg(RatatuiColor::Cyan).underlined(),
-        ),
-    ])])
-    .centered()
+        )),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(RatatuiColor::Red)),
+    )
+    .alignment(Alignment::Center);
+
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(4),
+            Constraint::Min(0),
+        ])
+        .split(area);
+    f.render_widget(para, v[1]);
 }
 
 /// Builds a ratatui [`Table`](RatatuiTable) with the standard header and border styling.
