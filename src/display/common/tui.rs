@@ -6,7 +6,7 @@
 //! ([`UpdateTracker`]).
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -76,7 +76,10 @@ pub fn handle_input() -> anyhow::Result<InputAction> {
     let mut nav = NavDelta::default();
     loop {
         match event::read()? {
-            Event::Key(key) => {
+            // Windows emits Press/Repeat/Release for a single keystroke while
+            // Unix only emits Press; drop Release so one keypress isn't counted
+            // twice (which would double every nav step / page jump).
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
                 if key.code == KeyCode::Char('q')
                     || key.code == KeyCode::Esc
                     || (key.code == KeyCode::Char('c')
