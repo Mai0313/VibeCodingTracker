@@ -122,6 +122,7 @@ fn main() -> Result<()> {
         }
 
         Commands::Usage {
+            output,
             json,
             text,
             table,
@@ -132,28 +133,34 @@ fn main() -> Result<()> {
         } => {
             let time_range = resolve_time_range(daily, weekly, monthly);
 
-            if json || text || table {
+            if json || output.is_some() {
                 let usage_data = get_usage_from_directories(time_range)?;
+                let pricing_map = match fetch_model_pricing() {
+                    Ok(map) => map,
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: Failed to fetch pricing data: {}. Costs will be unavailable.",
+                            e
+                        );
+                        ModelPricingMap::new(HashMap::new())
+                    }
+                };
+                let enriched_data = build_enriched_json(&usage_data, &pricing_map)?;
 
-                if json {
-                    let pricing_map = match fetch_model_pricing() {
-                        Ok(map) => map,
-                        Err(e) => {
-                            eprintln!(
-                                "Warning: Failed to fetch pricing data: {}. Costs will be unavailable.",
-                                e
-                            );
-                            ModelPricingMap::new(HashMap::new())
-                        }
-                    };
-                    let enriched_data = build_enriched_json(&usage_data, &pricing_map)?;
+                if let Some(output_path) = output {
+                    let json_value = serde_json::to_value(&enriched_data)?;
+                    vibe_coding_tracker::utils::save_json_pretty(&output_path, &json_value)?;
+                    println!("Usage result saved to: {}", output_path.display());
+                } else {
                     let json_str = serde_json::to_string_pretty(&enriched_data)?;
                     println!("{}", json_str);
-                } else if text {
-                    display_usage_text(&usage_data);
-                } else {
-                    display_usage_table(&usage_data);
                 }
+            } else if text {
+                let usage_data = get_usage_from_directories(time_range)?;
+                display_usage_text(&usage_data);
+            } else if table {
+                let usage_data = get_usage_from_directories(time_range)?;
+                display_usage_table(&usage_data);
             } else {
                 display_usage_interactive(time_range)?;
             }

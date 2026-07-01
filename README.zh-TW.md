@@ -151,12 +151,12 @@ Commands:
 
 時間範圍 flag（`usage` 與 `analysis` 共用，互斥，預設 `--all`）：
 
-| Flag        | 範圍                       |
-| ----------- | -------------------------- |
-| `--daily`   | 今天更新過的 session       |
-| `--weekly`  | 本 ISO 週（週一 → 今天）   |
-| `--monthly` | 本自然月                   |
-| `--all`     | 磁碟上所有 session（預設） |
+| Flag          | 範圍                       |
+| ------------- | -------------------------- |
+| `--daily`     | 今天更新過的 session       |
+| `--weekly`    | 本 ISO 週（週一 → 今天）   |
+| `--monthly`   | 本自然月                   |
+| `-a`, `--all` | 磁碟上所有 session（預設） |
 
 ---
 
@@ -172,6 +172,7 @@ Commands:
 | `--table`                                      | 靜態表格，不啟動 TUI         |
 | `--text`                                       | 純文字，適合腳本處理         |
 | `--json`                                       | JSON 輸出，附帶 pricing 資訊 |
+| `--output <FILE>`                              | 將富化 JSON 存成檔案         |
 | `--daily` / `--weekly` / `--monthly` / `--all` | 時間範圍篩選（見上方表格）   |
 
 ### 基本用法
@@ -188,6 +189,9 @@ vct usage --text
 
 # JSON 輸出，包含 cost_usd 與 matched_model 欄位
 vct usage --json
+
+# 直接把富化 JSON 存成檔案
+vct usage --output report.json
 
 # 時間範圍與輸出格式可自由組合
 vct usage --weekly

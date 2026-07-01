@@ -119,12 +119,16 @@ pub enum Commands {
         monthly: bool,
 
         /// Show all data (default).
-        #[arg(long, group = "period")]
+        #[arg(short, long, group = "period")]
         all: bool,
     },
 
     /// Display token usage statistics.
     Usage {
+        /// Optional output path to save usage result as JSON.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
         /// Output raw JSON instead of table view.
         #[arg(long, group = "usage_format")]
         json: bool,
@@ -150,7 +154,7 @@ pub enum Commands {
         monthly: bool,
 
         /// Show all data (default).
-        #[arg(long, group = "period")]
+        #[arg(short, long, group = "period")]
         all: bool,
     },
 

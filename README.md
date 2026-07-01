@@ -151,12 +151,12 @@ Commands:
 
 Time range flags (shared by `usage` and `analysis`, mutually exclusive, default `--all`):
 
-| Flag        | Window                            |
-| ----------- | --------------------------------- |
-| `--daily`   | Sessions modified today           |
-| `--weekly`  | Current ISO week (Monday → today) |
-| `--monthly` | Current calendar month            |
-| `--all`     | Every session on disk (default)   |
+| Flag          | Window                            |
+| ------------- | --------------------------------- |
+| `--daily`     | Sessions modified today           |
+| `--weekly`    | Current ISO week (Monday → today) |
+| `--monthly`   | Current calendar month            |
+| `-a`, `--all` | Every session on disk (default)   |
 
 ---
 
@@ -172,6 +172,7 @@ Time range flags (shared by `usage` and `analysis`, mutually exclusive, default 
 | `--table`                                      | Static table, no TUI                |
 | `--text`                                       | Plain text, script-friendly         |
 | `--json`                                       | JSON with enriched pricing metadata |
+| `--output <FILE>`                              | Save enriched JSON to a file        |
 | `--daily` / `--weekly` / `--monthly` / `--all` | Time range filter (see table above) |
 
 ### Basic Usage
@@ -188,6 +189,9 @@ vct usage --text
 
 # JSON for data processing (includes cost_usd and matched_model fields)
 vct usage --json
+
+# Save enriched JSON straight to a file
+vct usage --output report.json
 
 # Combine time range with output format
 vct usage --weekly

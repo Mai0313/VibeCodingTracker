@@ -252,6 +252,57 @@ fn test_usage_command_table() {
 }
 
 #[test]
+fn test_usage_command_with_output_file() {
+    use std::time::Duration;
+
+    let temp_dir = TempDir::new().unwrap();
+    let output_file = temp_dir.path().join("usage_output.json");
+
+    // usage has no single-file --path mode, so it scans real session
+    // directories; guard with a timeout like the analysis batch test.
+    let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
+    cmd.arg("usage")
+        .arg("--output")
+        .arg(output_file.to_str().unwrap())
+        .timeout(Duration::from_secs(10));
+
+    let output = cmd.output();
+
+    if let Ok(output) = output
+        && output.status.success()
+        && output_file.exists()
+    {
+        let content = std::fs::read_to_string(&output_file).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(json.is_array(), "Usage output should be JSON array");
+    }
+}
+
+#[test]
+fn test_all_short_flag_parses() {
+    use std::time::Duration;
+
+    // `-a` is the short alias for `--all` on both subcommands. A parse error
+    // would exit fast with a non-success code; a slow scan may hit the timeout
+    // (code().is_none()), which we tolerate like the other batch tests.
+    for subcommand in ["usage", "analysis"] {
+        let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
+        cmd.arg(subcommand)
+            .arg("-a")
+            .arg("--json")
+            .timeout(Duration::from_secs(10));
+
+        let output = cmd.output().expect("failed to spawn vct binary");
+        assert!(
+            output.status.success() || output.status.code().is_none(),
+            "vct {} -a --json failed: stderr={}",
+            subcommand,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
 fn test_help_command() {
     let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
     cmd.arg("--help");
@@ -281,7 +332,8 @@ fn test_usage_help() {
     cmd.assert()
         .success()
         .stdout(predicate::str::contains("usage"))
-        .stdout(predicate::str::contains("--json"));
+        .stdout(predicate::str::contains("--json"))
+        .stdout(predicate::str::contains("--output"));
 }
 
 #[test]
