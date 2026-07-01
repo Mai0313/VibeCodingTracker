@@ -205,10 +205,13 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
             // re-aggregating. These per-model summaries are small; the heavy
             // raw usage buffers are cleared right below.
             rows_data = summary.rows;
-            // Hide models with zero tokens in this range; they only add noise.
-            // The grand totals come from `summary.totals`, so dropping zero
-            // rows does not change them.
-            rows_data.retain(|row| row.total != 0);
+            // Hide models that contributed neither tokens nor cost in this
+            // range; they only add noise. A model can have zero tokens but a
+            // non-zero cost (Claude per-query web search, or an OpenCode model
+            // priced from its stored cost), so keep any row that carries cost
+            // too — otherwise it vanishes from the table while its cost still
+            // shows up in the grand total, leaving them inconsistent.
+            rows_data.retain(|row| row.total != 0 || row.cost > 0.0);
             totals = summary.totals;
             provider_totals = summary.provider_totals;
 
