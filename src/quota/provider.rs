@@ -20,10 +20,13 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-/// How often the workers refresh (matches the usage TUI refresh cadence).
+/// Default worker refresh cadence (Codex). Claude uses a longer interval to
+/// stay under its stricter usage-endpoint rate limit; see [`spawn_quota_worker`].
 pub const REFRESH_SECS: u64 = 10;
 
-/// How long a last-known-good snapshot is kept once no source resolves.
+/// Baseline for how long a last-known-good snapshot is kept once no source
+/// resolves. Scaled up per worker for slower cadences so a single missed poll
+/// never blanks a panel.
 pub const STALE_AFTER_SECS: i64 = 90;
 
 /// A normalized quota snapshot the worker can store, age out, and flag.
@@ -44,7 +47,10 @@ impl QuotaSnapshot for ClaudeQuotaSnapshot {
         self.fetched_at
     }
     fn is_present(&self) -> bool {
-        self.five_hour.is_some() || self.seven_day.is_some() || self.needs_login
+        self.five_hour.is_some()
+            || self.seven_day.is_some()
+            || self.scoped_weekly.is_some()
+            || self.needs_login
     }
     fn set_needs_login(&mut self, value: bool) {
         self.needs_login = value;
@@ -82,7 +88,10 @@ pub enum QuotaOutcome<T> {
 }
 
 /// Spawns a detached background worker that refreshes `shared` (and the on-disk
-/// cache via `save`) every ~10s until `shutdown` is set.
+/// cache via `save`) every `refresh_secs` until `shutdown` is set.
+///
+/// The stale-drop threshold scales with `refresh_secs` (at least 3× the cadence)
+/// so a single missed poll on a slow-polling provider never blanks the panel.
 ///
 /// The worker is panic-isolated and holds the mutex only for the assignment, so
 /// it can never poison the lock. It is not joined on quit — `shutdown` is set as
@@ -91,6 +100,7 @@ pub fn spawn_quota_worker<T, R, S>(
     label: &'static str,
     shared: Arc<Mutex<T>>,
     shutdown: Arc<AtomicBool>,
+    refresh_secs: u64,
     mut resolve: R,
     save: S,
 ) -> JoinHandle<()>
@@ -99,6 +109,7 @@ where
     R: FnMut() -> QuotaOutcome<T> + Send + 'static,
     S: Fn(&T) + Send + 'static,
 {
+    let stale_after = STALE_AFTER_SECS.max(refresh_secs as i64 * 3);
     std::thread::spawn(move || {
         loop {
             if shutdown.load(Ordering::Relaxed) {
@@ -125,7 +136,7 @@ where
                     let now = chrono::Local::now().timestamp();
                     let mut cleared = None;
                     if let Ok(mut guard) = shared.lock()
-                        && should_clear_stale(&*guard, now, STALE_AFTER_SECS)
+                        && should_clear_stale(&*guard, now, stale_after)
                     {
                         *guard = T::default();
                         cleared = Some(T::default());
@@ -137,7 +148,7 @@ where
                 Err(_) => log::warn!("{label} quota worker panicked; keeping last snapshot"),
             }
             // Sleep in 200ms slices so shutdown stays responsive.
-            for _ in 0..(REFRESH_SECS * 5) {
+            for _ in 0..(refresh_secs * 5) {
                 if shutdown.load(Ordering::Relaxed) {
                     break;
                 }

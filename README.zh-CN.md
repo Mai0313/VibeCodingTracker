@@ -238,16 +238,17 @@ vct usage --json --daily
 `vct usage` 会**在仪表盘中直接显示 Claude Code 与 Codex 的实时剩余额度——完全零配置。** 不需要 status-line hook，也不需要配置文件：vct 会读取各 provider 自己的 OAuth 凭证，在后台线程调用其用量 API，并在你工作时保持面板持续更新。
 
 ```
-┌ Provider/Tokens/Cost/Days ┬ Claude ────────┬ Codex ──────────┐
-│ Claude    1.2M  $3.00  4d │ 5h ▰▰▱▱▱  16%  │ Plan: plus      │
-│ Codex      800K $0.00  6d │    ↻ 4h13m     │ 5h ▰▰▱▱▱  27%   │
-│ ...                       │ 7d ▰▰▰▱▱  28%  │ 7d ▱▱▱▱▱   4%   │
-│                           │ updated 2m ago │ Credits: 0  +2  │
-└───────────────────────────┴────────────────┴─────────────────┘
+┌ Provider/Tokens/Cost/Days ┬ Claude ───────────────────┬ Codex ────────────────────┐
+│ Claude    1.2M  $3.00  4d │ 5h     ▰▱▱▱▱  16%  ↻ 2h0m  │ Plan: plus                 │
+│ Codex      800K $0.00  6d │ 7d     ▰▰▱▱▱  41%  ↻ 5d    │ 5h     ▰▰▱▱▱  37%  ↻ 2h33m │
+│ ...                       │ Opus   ▰▰▰▱▱  61%  ↻ 5d    │ 7d     ▰▰▱▱▱  24%  ↻ 3d16h │
+│                           │ Balance: -    $0.00 used   │ Credits: 0  +3 reset       │
+│                           │ updated just now           │ updated just now           │
+└───────────────────────────┴────────────────────────────┴────────────────────────────┘
 ```
 
-- **Claude** — 5 小时和每周用量，来自官方 OAuth 用量 API（`GET /api/oauth/usage`），从 `~/.claude/.credentials.json` 读取。
-- **Codex** — 套餐类型、5 小时和每周用量以及额度余额，使用 `~/.codex/auth.json` 从 ChatGPT 后端（`wham/usage`）获取；API 不可用时回退到 Codex 会话日志中最新的 `rate_limits`（标题显示 `Codex` 或 `Codex (session)`）。
+- **Claude** — 5 小时、每周以及单模型每周用量，来自官方 OAuth 用量 API（`GET /api/oauth/usage`），从 `~/.claude/.credentials.json` 读取，并显示额度余额。约每分钟轮询一次以避开该端点的速率限制；触及上限时标题会出现红色 `LIMIT` 标记。
+- **Codex** — 套餐类型、5 小时和每周用量以及额度余额，使用 `~/.codex/auth.json` 从 ChatGPT 后端（`wham/usage`）获取（在适用时显示大致剩余讯息数 / 消费上限）；API 不可用时回退到 Codex 会话日志中最新的 `rate_limits`（标题显示 `Codex` 或 `Codex (session)`）。
 
 **自动刷新 token。** 对这两个 provider，当 token 接近过期或被拒绝时，vct 会刷新它并把新 token 写回该 provider 自己的凭证文件（采用该 CLI 的原始格式），因此 token 会在多次检查之间复用，而不是每次都重新刷新。如果刷新失败，面板会显示 `run: <provider> auth login` 提示，而不会直接中断。
 

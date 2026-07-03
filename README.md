@@ -238,16 +238,17 @@ The tool automatically scans these directories:
 `vct usage` shows **live remaining quota for Claude Code and Codex right in the dashboard — with zero setup.** No status-line hook, no config file: vct reads each provider's own OAuth credentials, calls its usage API on a background thread, and keeps the panels current while you work.
 
 ```
-┌ Provider/Tokens/Cost/Days ┬ Claude ────────┬ Codex ──────────┐
-│ Claude    1.2M  $3.00  4d │ 5h ▰▰▱▱▱  16%  │ Plan: plus      │
-│ Codex      800K $0.00  6d │    ↻ 4h13m     │ 5h ▰▰▱▱▱  27%   │
-│ ...                       │ 7d ▰▰▰▱▱  28%  │ 7d ▱▱▱▱▱   4%   │
-│                           │ updated 2m ago │ Credits: 0  +2  │
-└───────────────────────────┴────────────────┴─────────────────┘
+┌ Provider/Tokens/Cost/Days ┬ Claude ───────────────────┬ Codex ────────────────────┐
+│ Claude    1.2M  $3.00  4d │ 5h     ▰▱▱▱▱  16%  ↻ 2h0m  │ Plan: plus                 │
+│ Codex      800K $0.00  6d │ 7d     ▰▰▱▱▱  41%  ↻ 5d    │ 5h     ▰▰▱▱▱  37%  ↻ 2h33m │
+│ ...                       │ Opus   ▰▰▰▱▱  61%  ↻ 5d    │ 7d     ▰▰▱▱▱  24%  ↻ 3d16h │
+│                           │ Balance: -    $0.00 used   │ Credits: 0  +3 reset       │
+│                           │ updated just now           │ updated just now           │
+└───────────────────────────┴────────────────────────────┴────────────────────────────┘
 ```
 
-- **Claude** — 5-hour and weekly usage from the official OAuth usage API (`GET /api/oauth/usage`), read from `~/.claude/.credentials.json`.
-- **Codex** — plan tier, 5-hour and weekly usage, and credit balance from the ChatGPT backend (`wham/usage`) using `~/.codex/auth.json`; falls back to the newest `rate_limits` in your Codex session logs when the API is unavailable (the title shows `Codex` vs `Codex (session)`).
+- **Claude** — 5-hour, weekly, and per-model weekly usage from the official OAuth usage API (`GET /api/oauth/usage`), read from `~/.claude/.credentials.json`, plus your credit balance. Polled about once a minute to stay under the endpoint's rate limit; a red `LIMIT` flag appears in the title when a cap is hit.
+- **Codex** — plan tier, 5-hour and weekly usage, and credit balance from the ChatGPT backend (`wham/usage`) using `~/.codex/auth.json` (with approximate remaining messages / spend cap when applicable); falls back to the newest `rate_limits` in your Codex session logs when the API is unavailable (the title shows `Codex` vs `Codex (session)`).
 
 **Automatic token refresh.** For both providers, when a token is near expiry or rejected, vct refreshes it and writes the new token back to the provider's own credential file (in that CLI's exact format), so a token is reused across checks rather than refreshed every time. If a refresh cannot proceed, the panel shows a `run: <provider> auth login` hint instead of breaking.
 

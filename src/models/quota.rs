@@ -24,6 +24,10 @@ fn redact(v: &Option<String>) -> Option<&'static str> {
 // ---- Claude usage API (GET /api/oauth/usage) ----
 
 /// `https://api.anthropic.com/api/oauth/usage` response (subset we read).
+///
+/// The richer `limits` / `spend` fields only appear when the request carries the
+/// `anthropic-beta: oauth-2025-04-20` header; without it they stay empty and the
+/// panel falls back to just the two top-level windows.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClaudeUsageResponse {
     /// 5-hour window.
@@ -32,6 +36,12 @@ pub struct ClaudeUsageResponse {
     /// Weekly window.
     #[serde(default)]
     pub seven_day: Option<ClaudeUsageWindow>,
+    /// Per-scope limit entries (session / weekly_all / weekly_scoped, ...).
+    #[serde(default)]
+    pub limits: Vec<ClaudeLimit>,
+    /// Pay-as-you-go spend / credit balance.
+    #[serde(default)]
+    pub spend: Option<ClaudeSpend>,
 }
 
 /// One Claude usage window.
@@ -43,6 +53,84 @@ pub struct ClaudeUsageWindow {
     /// Absolute reset time as an ISO-8601 string.
     #[serde(default)]
     pub resets_at: Option<String>,
+}
+
+/// One entry of the `limits` array; carries the per-model weekly scope.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClaudeLimit {
+    /// Limit kind, e.g. `session` / `weekly_all` / `weekly_scoped`.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Percent of the window consumed (0..100).
+    #[serde(default)]
+    pub percent: f64,
+    /// Severity, e.g. `normal` / `warning` / `reached`.
+    #[serde(default)]
+    pub severity: Option<String>,
+    /// Absolute reset time as an ISO-8601 string.
+    #[serde(default)]
+    pub resets_at: Option<String>,
+    /// Scope (present for `weekly_scoped`: the model this cap applies to).
+    #[serde(default)]
+    pub scope: Option<ClaudeScope>,
+    /// Whether this limit is the currently active/binding one.
+    #[serde(default)]
+    pub is_active: bool,
+}
+
+/// The `scope` object of a `weekly_scoped` limit.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClaudeScope {
+    /// The model this scoped limit applies to.
+    #[serde(default)]
+    pub model: Option<ClaudeScopeModel>,
+}
+
+/// The `scope.model` object of a `weekly_scoped` limit.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClaudeScopeModel {
+    /// Human-readable model name, e.g. "Opus".
+    #[serde(default)]
+    pub display_name: Option<String>,
+}
+
+/// The `spend` object of a usage response (pay-as-you-go credit / spend).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClaudeSpend {
+    /// Amount spent this period.
+    #[serde(default)]
+    pub used: Option<ClaudeMoney>,
+    /// Remaining prepaid credit balance, when enabled.
+    #[serde(default)]
+    pub balance: Option<ClaudeMoney>,
+    /// Whether pay-as-you-go spend is enabled for this account.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// A money amount in minor units (e.g. cents) with an explicit exponent.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClaudeMoney {
+    /// Amount in minor units (e.g. cents when `exponent == 2`).
+    #[serde(default)]
+    pub amount_minor: i64,
+    /// ISO currency code, e.g. "USD".
+    #[serde(default)]
+    pub currency: Option<String>,
+    /// Power of ten separating minor units from major (2 = cents).
+    #[serde(default)]
+    pub exponent: i32,
+}
+
+impl ClaudeMoney {
+    /// Formats the amount as a currency string, e.g. `$0.00`.
+    pub fn as_display(&self) -> String {
+        let value = self.amount_minor as f64 / 10f64.powi(self.exponent.max(0));
+        match self.currency.as_deref() {
+            Some("USD") | None => format!("${value:.2}"),
+            Some(cur) => format!("{value:.2} {cur}"),
+        }
+    }
 }
 
 // ---- ~/.claude/.credentials.json ----
@@ -130,8 +218,23 @@ pub struct ClaudeQuotaSnapshot {
     pub fetched_at: i64,
     /// 5-hour window.
     pub five_hour: Option<QuotaWindow>,
-    /// Weekly window.
+    /// Weekly window (all models).
     pub seven_day: Option<QuotaWindow>,
+    /// Per-model weekly window (`weekly_scoped`), when present.
+    #[serde(default)]
+    pub scoped_weekly: Option<QuotaWindow>,
+    /// Model label for [`Self::scoped_weekly`], e.g. "Opus".
+    #[serde(default)]
+    pub scoped_label: Option<String>,
+    /// Prepaid credit balance, pre-formatted (e.g. `$5.00`), when enabled.
+    #[serde(default)]
+    pub balance: Option<String>,
+    /// Amount spent this period, pre-formatted (e.g. `$0.00`).
+    #[serde(default)]
+    pub spend_used: Option<String>,
+    /// Whether any window has hit its cap (drives the `LIMIT` flag).
+    #[serde(default)]
+    pub limit_reached: bool,
     /// Credentials present but the token is unusable (expired / refresh
     /// failed / 401); the panel shows a `claude auth login` hint.
     #[serde(default)]
@@ -155,6 +258,20 @@ pub struct WhamUsageResponse {
     /// Rate-limit reset credits.
     #[serde(default)]
     pub rate_limit_reset_credits: Option<WhamResetCredits>,
+    /// Per-account spend cap.
+    #[serde(default)]
+    pub spend_control: Option<WhamSpendControl>,
+}
+
+/// The `spend_control` object of a wham/usage response.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WhamSpendControl {
+    /// Whether the spend cap has been reached.
+    #[serde(default)]
+    pub reached: Option<bool>,
+    /// The configured spend cap, when set.
+    #[serde(default)]
+    pub individual_limit: Option<f64>,
 }
 
 /// The `rate_limit` object of a wham/usage response.
@@ -203,6 +320,12 @@ pub struct WhamCredits {
     /// Credit balance, kept as a string to match the API's `"0"`.
     #[serde(default, deserialize_with = "de_string_or_number")]
     pub balance: Option<String>,
+    /// Approximate `[low, high]` local (CLI) messages the credits still buy.
+    #[serde(default)]
+    pub approx_local_messages: Option<Vec<i64>>,
+    /// Approximate `[low, high]` cloud-task messages the credits still buy.
+    #[serde(default)]
+    pub approx_cloud_messages: Option<Vec<i64>>,
 }
 
 /// Deserializes a JSON string or number into `Option<String>`.
@@ -375,7 +498,13 @@ pub struct CodexQuotaSnapshot {
     pub unlimited: Option<bool>,
     /// Number of rate-limit reset credits available.
     pub reset_credits_available: Option<i64>,
-    /// Whether a rate limit has been reached.
+    /// Approximate `[low, high]` messages the remaining credits still buy.
+    #[serde(default)]
+    pub approx_messages: Option<(i64, i64)>,
+    /// Configured spend cap, when set.
+    #[serde(default)]
+    pub spend_limit: Option<f64>,
+    /// Whether a rate limit (or credit / spend cap) has been reached.
     pub limit_reached: Option<bool>,
     /// Token present but unusable (refresh failed / 401); the panel shows a
     /// `codex auth login` hint alongside any session-fallback data.

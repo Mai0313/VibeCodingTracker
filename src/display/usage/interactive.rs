@@ -45,8 +45,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, System};
 
-/// Minimum height for the bottom quota panels (border + 2 gauges + labels).
-const QUOTA_PANEL_MIN_HEIGHT: u16 = 7;
+/// Minimum height for the bottom quota panels. Sized for the common case
+/// (Claude: 5h/7d/scoped/balance/staleness; Codex: plan/5h/7d/credits/staleness)
+/// plus the border. A rare overlap (extras line + login hint at once) clips the
+/// least-critical bottom line, which `Paragraph` handles without panicking.
+const QUOTA_PANEL_MIN_HEIGHT: u16 = 8;
 /// Claude brand color for the quota panel border.
 const CLAUDE_COLOR: RatatuiColor = RatatuiColor::Rgb(190, 116, 87);
 /// Codex brand color for the quota panel border.
@@ -86,6 +89,10 @@ struct QuotaView<'a> {
 
 /// How often the loop re-aggregates the session directories and repaints.
 const USAGE_REFRESH_SECS: u64 = 10;
+/// Claude quota worker cadence. Longer than Codex's 10s because the Claude
+/// usage endpoint rate-limits frequent polling; quota moves slowly enough that
+/// once a minute stays fresh.
+const CLAUDE_REFRESH_SECS: u64 = 60;
 /// How often to rebuild the LiteLLM pricing map. The underlying data only
 /// changes when the upstream JSON is updated (daily at most), so rebuilding
 /// a fresh ~500 KB `HashMap<Rc<str>, ModelPricing>` every 10 s just churned
@@ -162,6 +169,7 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
                         "claude",
                         shared,
                         sh,
+                        CLAUDE_REFRESH_SECS,
                         move || state.resolve(&c),
                         |s| {
                             let _ = save_claude_cache(s);
@@ -179,6 +187,7 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
                         "codex",
                         shared,
                         sh,
+                        crate::quota::provider::REFRESH_SECS,
                         move || state.resolve(&c),
                         |s| {
                             let _ = save_codex_cache(s);
@@ -631,18 +640,24 @@ fn mini_bar(pct: f64) -> String {
     (0..5).map(|i| if i < filled { '▰' } else { '▱' }).collect()
 }
 
-/// Builds one gauge line: `5h ▰▰▱▱▱  27%  ↻4h13m`.
+/// Builds one gauge line: `5h     ▰▰▱▱▱   27%  ↻ 4h13m`.
+///
+/// The label is padded to a fixed width so the bars line up across `5h` / `7d`
+/// and the longer per-model labels ("Opus" / "Sonnet").
 fn quota_gauge_line(label: &str, w: &QuotaWindow, now: i64) -> Line<'static> {
     let pct = w.used_percent;
     let color = gauge_color(pct);
     let mut spans = vec![
-        Span::styled(format!("{label} "), Style::default().fg(RatatuiColor::Gray)),
+        Span::styled(
+            format!("{label:<6} "),
+            Style::default().fg(RatatuiColor::Gray),
+        ),
         Span::styled(mini_bar(pct), Style::default().fg(color)),
         Span::styled(format!(" {pct:>3.0}%"), Style::default().fg(color)),
     ];
     if let Some(reset) = w.resets_at_unix {
         spans.push(Span::styled(
-            format!("  ↻{}", format_duration_until(reset, now)),
+            format!("  ↻ {}", format_duration_until(reset, now)),
             Style::default().fg(RatatuiColor::DarkGray),
         ));
     }
@@ -706,12 +721,32 @@ fn band_constraints(top_n: usize) -> Vec<Constraint> {
     }
 }
 
-/// Renders the Claude quota panel (5h / 7d gauges + staleness + login hint).
-fn render_claude_quota(f: &mut Frame, area: Rect, claude: &ClaudeQuotaSnapshot, now: i64) {
-    let block = Block::default()
+/// Builds a quota-panel block: provider title on the left, plus a red bold
+/// `LIMIT` flag right-aligned in the top border when a cap is hit. Shared by
+/// both panels so they flag limits identically.
+fn quota_block(title: &str, border: RatatuiColor, limit_reached: bool) -> Block<'static> {
+    let mut block = Block::default()
         .borders(Borders::ALL)
-        .title(" Claude ")
-        .border_style(Style::default().fg(CLAUDE_COLOR));
+        .title(Line::from(title.to_string()))
+        .border_style(Style::default().fg(border));
+    if limit_reached {
+        block = block.title(
+            Line::from(Span::styled(
+                "LIMIT ",
+                Style::default()
+                    .fg(RatatuiColor::Red)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .right_aligned(),
+        );
+    }
+    block
+}
+
+/// Renders the Claude quota panel (5h / 7d / scoped gauges + balance +
+/// staleness + login hint).
+fn render_claude_quota(f: &mut Frame, area: Rect, claude: &ClaudeQuotaSnapshot, now: i64) {
+    let block = quota_block(" Claude ", CLAUDE_COLOR, claude.limit_reached);
 
     let mut lines: Vec<Line> = Vec::new();
     if let Some(w) = &claude.five_hour {
@@ -720,8 +755,13 @@ fn render_claude_quota(f: &mut Frame, area: Rect, claude: &ClaudeQuotaSnapshot, 
     if let Some(w) = &claude.seven_day {
         lines.push(quota_gauge_line("7d", w, now));
     }
+    if let Some(w) = &claude.scoped_weekly {
+        let label = claude.scoped_label.as_deref().unwrap_or("model");
+        lines.push(quota_gauge_line(label, w, now));
+    }
     let has_data = !lines.is_empty();
     if has_data {
+        lines.push(claude_balance_line(claude));
         lines.push(staleness_line(claude.fetched_at, now));
     }
     if claude.needs_login {
@@ -733,17 +773,15 @@ fn render_claude_quota(f: &mut Frame, area: Rect, claude: &ClaudeQuotaSnapshot, 
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-/// Renders the Codex quota panel (plan, 5h / 7d gauges, credits).
+/// Renders the Codex quota panel (plan, 5h / 7d gauges, credits, extras,
+/// staleness).
 fn render_codex_quota(f: &mut Frame, area: Rect, codex: &CodexQuotaSnapshot, now: i64) {
     let title = match codex.source {
         QuotaSource::Api => " Codex ",
         QuotaSource::SessionFallback => " Codex (session) ",
         QuotaSource::None => " Codex ",
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .border_style(Style::default().fg(CODEX_COLOR));
+    let block = quota_block(title, CODEX_COLOR, codex.limit_reached == Some(true));
 
     let lines: Vec<Line> = if codex.source == QuotaSource::None {
         let mut v = vec![dim_line("no Codex quota")];
@@ -754,21 +792,10 @@ fn render_codex_quota(f: &mut Frame, area: Rect, codex: &CodexQuotaSnapshot, now
         }
         v
     } else {
-        let mut v = Vec::new();
-
-        let mut plan_spans = vec![Span::styled(
+        let mut v = vec![Line::from(Span::styled(
             format!("Plan: {}", codex.plan_type.as_deref().unwrap_or("?")),
             Style::default().fg(RatatuiColor::Gray),
-        )];
-        if codex.limit_reached == Some(true) {
-            plan_spans.push(Span::styled(
-                "  LIMIT",
-                Style::default()
-                    .fg(RatatuiColor::Red)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        }
-        v.push(Line::from(plan_spans));
+        ))];
 
         if let Some(w) = &codex.primary {
             v.push(quota_gauge_line("5h", w, now));
@@ -781,7 +808,11 @@ fn render_codex_quota(f: &mut Frame, area: Rect, codex: &CodexQuotaSnapshot, now
             v.push(login_hint_line(CODEX_LOGIN_HINT));
         } else {
             v.push(credits_line(codex));
+            if let Some(extra) = codex_extras_line(codex) {
+                v.push(extra);
+            }
         }
+        v.push(staleness_line(codex.fetched_at, now));
         v
     };
 
@@ -802,6 +833,47 @@ fn credits_line(codex: &CodexQuotaSnapshot) -> Line<'static> {
         && n > 0
     {
         s.push_str(&format!("  +{n} reset"));
+    }
+    Line::from(Span::styled(s, Style::default().fg(RatatuiColor::Gray)))
+}
+
+/// Builds the optional Codex extras line (`~L-H msgs  ·  cap $X`), shown only
+/// when the account has credit-funded messages or a configured spend cap.
+fn codex_extras_line(codex: &CodexQuotaSnapshot) -> Option<Line<'static>> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some((low, high)) = codex.approx_messages {
+        if low == high {
+            parts.push(format!("~{low} msgs"));
+        } else {
+            parts.push(format!("~{low}-{high} msgs"));
+        }
+    }
+    if let Some(cap) = codex.spend_limit {
+        let cap_str = if cap.fract() == 0.0 {
+            format!("${cap:.0}")
+        } else {
+            format!("${cap:.2}")
+        };
+        parts.push(format!("cap {cap_str}"));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(Line::from(Span::styled(
+        parts.join("  ·  "),
+        Style::default().fg(RatatuiColor::DarkGray),
+    )))
+}
+
+/// Builds the balance line for the Claude panel (mirrors Codex's credits line).
+fn claude_balance_line(claude: &ClaudeQuotaSnapshot) -> Line<'static> {
+    let mut s = String::from("Balance: ");
+    match &claude.balance {
+        Some(b) => s.push_str(b),
+        None => s.push('-'),
+    }
+    if let Some(used) = &claude.spend_used {
+        s.push_str(&format!("    {used} used"));
     }
     Line::from(Span::styled(s, Style::default().fg(RatatuiColor::Gray)))
 }
