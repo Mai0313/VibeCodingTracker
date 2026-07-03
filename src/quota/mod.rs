@@ -21,6 +21,7 @@ pub use provider::{QuotaOutcome, QuotaSnapshot, spawn_quota_worker};
 use crate::models::CodexQuotaSnapshot;
 use crate::quota::refresh::{RefreshCooldown, file_mtime};
 use crate::quota::wham::WhamResult;
+use std::time::SystemTime;
 
 /// Login hint shown when Codex refresh fails.
 pub const CODEX_LOGIN_HINT: &str = "run: codex auth login";
@@ -41,7 +42,9 @@ enum CodexFetch {
 /// then it is refreshed (rotating + writing back the refresh token) and retried.
 #[derive(Default)]
 pub struct CodexState {
-    token: Option<String>,
+    /// Cached access token + the `auth.json` mtime it came from, so a re-login /
+    /// account switch (which rewrites the file) drops the stale token.
+    token: Option<(String, Option<SystemTime>)>,
     cooldown: RefreshCooldown,
 }
 
@@ -96,31 +99,37 @@ impl CodexState {
             Ok(x) => x,
             Err(_) => return CodexFetch::Transient,
         };
-        let token = self.token.clone().unwrap_or(file_token);
+        let cur_mtime = file_mtime(auth);
+        // Reuse the cached token only if auth.json hasn't changed since we cached
+        // it; a re-login / account switch rewrites the file and must be picked up.
+        let token = match &self.token {
+            Some((t, m)) if *m == cur_mtime => t.clone(),
+            _ => file_token,
+        };
 
         match wham::call_wham(client, &token, account_id.as_deref(), now) {
             WhamResult::Ok(snap) => {
                 self.cooldown.clear();
-                self.token = Some(token);
+                self.token = Some((token, cur_mtime));
                 CodexFetch::Ok(snap)
             }
             WhamResult::Unauthorized => {
-                let mtime = file_mtime(auth);
-                if self.cooldown.active(now, mtime) {
+                if self.cooldown.active(now, cur_mtime) {
                     self.token = None;
                     return CodexFetch::NeedsLogin;
                 }
-                match wham::refresh_codex(client, auth, mtime) {
+                match wham::refresh_codex(client, auth, cur_mtime) {
                     Ok(new_tok) => {
                         self.cooldown.clear();
-                        self.token = Some(new_tok.clone());
+                        // The successful refresh just rewrote auth.json; key the
+                        // cache + cooldown on the post-write mtime (a stale one
+                        // would never suppress the next tick).
+                        let post_mtime = file_mtime(auth);
+                        self.token = Some((new_tok.clone(), post_mtime));
                         match wham::call_wham(client, &new_tok, account_id.as_deref(), now) {
                             WhamResult::Ok(snap) => CodexFetch::Ok(snap),
-                            // Arm with the CURRENT mtime (re-read): the
-                            // successful refresh just rewrote auth.json, so the
-                            // captured `mtime` is stale and would never suppress.
                             _ => {
-                                self.cooldown.arm(now, file_mtime(auth));
+                                self.cooldown.arm(now, post_mtime);
                                 self.token = None;
                                 CodexFetch::NeedsLogin
                             }
