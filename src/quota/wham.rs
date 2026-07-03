@@ -182,7 +182,7 @@ pub fn refresh_codex(
         .filter(|s| !s.is_empty())
         .context("codex refresh response had no access_token")?;
 
-    let _ = update_json_file_in_place(auth_path, expected_mtime, |root| {
+    let wrote = update_json_file_in_place(auth_path, expected_mtime, |root| {
         let t = root
             .get_mut("tokens")
             .and_then(|v| v.as_object_mut())
@@ -200,7 +200,13 @@ pub fn refresh_codex(
         }
         root["last_refresh"] = json!(now_rfc3339_utc_nanos());
         Ok(())
-    });
+    })?;
+    // The refresh already rotated the refresh token server-side; if we could not
+    // persist the new one, auth.json now holds a stale/invalid refresh token, so
+    // treat it as a refresh failure rather than reporting success.
+    if !wrote {
+        bail!("codex token rotated but the new token could not be persisted");
+    }
     Ok(access)
 }
 

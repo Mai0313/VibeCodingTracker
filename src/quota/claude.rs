@@ -181,7 +181,7 @@ fn refresh_claude(
     // Write the rotated token back, preserving designOauth and any unknown keys.
     let new_refresh = resp.refresh_token.clone();
     let new_scope = resp.scope.clone();
-    let _ = update_json_file_in_place(path, expected_mtime, |root| {
+    let wrote = update_json_file_in_place(path, expected_mtime, |root| {
         let o = root
             .get_mut("claudeAiOauth")
             .and_then(|v| v.as_object_mut())
@@ -200,7 +200,14 @@ fn refresh_claude(
             }
         }
         Ok(())
-    });
+    })?;
+    // The refresh already rotated the refresh token server-side; if we could not
+    // persist the new one, the file now holds a stale/invalid refresh token, so
+    // treat it as a refresh failure (surface needs_login) rather than caching an
+    // ephemeral access token over a broken login.
+    if !wrote {
+        bail!("claude token rotated but the new token could not be persisted");
+    }
     Ok((access, expires_ms))
 }
 
