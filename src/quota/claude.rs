@@ -121,17 +121,17 @@ fn refresh_claude(
     scopes: &[String],
     expected_mtime: Option<SystemTime>,
 ) -> Result<(String, i64)> {
-    let scope = if scopes.is_empty() {
-        "user:inference".to_string()
-    } else {
-        scopes.join(" ")
-    };
-    let body = json!({
+    let mut body = json!({
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
         "client_id": CLAUDE_CLIENT_ID,
-        "scope": scope,
     });
+    // Only re-send the scopes already granted; omit `scope` when the file has
+    // none so the server preserves the original grant, rather than narrowing a
+    // full Claude Code login down to `user:inference`.
+    if !scopes.is_empty() {
+        body["scope"] = json!(scopes.join(" "));
+    }
 
     let urls = claude_token_urls();
     let mut parsed: Option<ClaudeRefreshResponse> = None;
