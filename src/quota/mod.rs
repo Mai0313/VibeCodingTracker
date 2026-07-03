@@ -128,7 +128,10 @@ impl CodexState {
                         self.token = Some((new_tok.clone(), post_mtime));
                         match wham::call_wham(client, &new_tok, account_id.as_deref(), now) {
                             WhamResult::Ok(snap) => CodexFetch::Ok(snap),
-                            _ => {
+                            // A transient retry error keeps the fresh token and
+                            // falls back to session data; only a 401 means login.
+                            WhamResult::Transient => CodexFetch::Transient,
+                            WhamResult::Unauthorized => {
                                 self.cooldown.arm(now, post_mtime);
                                 self.token = None;
                                 CodexFetch::NeedsLogin
