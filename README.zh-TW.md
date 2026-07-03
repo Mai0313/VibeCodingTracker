@@ -143,7 +143,6 @@ vct <COMMAND> [OPTIONS]
 Commands:
   analysis    Analyze JSONL conversation files (single file or all sessions)
   usage       Display token usage statistics
-  statusline  Cache Claude Code rate limits from a statusLine hook (stdin JSON)
   version     Display version information
   update      Update to the latest version from GitHub releases
   help        Print this message or the help of the given subcommand(s)
@@ -236,7 +235,7 @@ vct usage --json --daily
 
 ### 即時額度面板
 
-在互動式儀表板底部，左側是各 provider 統計，右側是兩個即時額度面板：
+`vct usage` 會**在儀表板中直接顯示 Claude Code 與 Codex 的即時剩餘額度——完全零設定。** 不需要 status-line hook，也不需要設定檔：vct 會讀取各 provider 自己的 OAuth 憑證，在背景執行緒呼叫其用量 API，並在你工作時讓面板保持最新。
 
 ```
 ┌ Provider/Tokens/Cost/Days ┬ Claude ────────┬ Codex ──────────┐
@@ -247,10 +246,14 @@ vct usage --json --daily
 └───────────────────────────┴────────────────┴─────────────────┘
 ```
 
-- **Claude** — 5 小時和每週的額度用量。Claude Code 僅透過 `statusLine` hook 暴露這些額度，需將 `vct statusline ingest` 接入你的 statusLine（見 [Statusline 指令](#statusline-%E6%8C%87%E4%BB%A4)）此面板才會有資料。
-- **Codex** — 方案類型、5 小時和每週用量、額度餘額。背景執行緒使用 `~/.codex/auth.json` 中的 token 從 ChatGPT 後端（`wham/usage`）即時拉取；不可用時回退到 Codex 工作階段紀錄中最新的 `rate_limits`（標題顯示 `(API)` 或 `(session)`）。
+- **Claude** — 5 小時和每週用量，來自官方 OAuth 用量 API（`GET /api/oauth/usage`），從 `~/.claude/.credentials.json` 讀取。
+- **Codex** — 方案類型、5 小時和每週用量以及額度餘額，使用 `~/.codex/auth.json` 從 ChatGPT 後端（`wham/usage`）取得；API 無法使用時回退到 Codex 工作階段紀錄中最新的 `rate_limits`（標題顯示 `Codex` 或 `Codex (session)`）。
 
-額度面板僅在互動式 TUI 中顯示；`--table`、`--text`、`--json` 不受影響。
+**自動刷新 token。** 對這兩個 provider，當 token 接近過期或被拒絕時，vct 會刷新它並把新的 token 寫回該 provider 自己的憑證檔案（採用該 CLI 的原始格式），因此 token 會在多次檢查之間重複使用，而不是每次都重新刷新。如果刷新失敗，面板會顯示 `run: <provider> auth login` 提示，而不會直接中斷。
+
+只有在某個 provider 的憑證存在時，才會顯示對應的面板。額度面板僅在互動式 TUI 中顯示；`--table`、`--text`、`--json` 不受影響。
+
+> **平台說明：** 在 macOS 上，Claude Code 會把 OAuth 憑證儲存在系統 Keychain 中，而不是 `~/.claude/.credentials.json`，因此在 macOS 上不會顯示 Claude 面板。
 
 ---
 
@@ -320,35 +323,6 @@ vct analysis --output today.json --daily
 │  Total Lines: 16.1K  |  Total Tools: 619  |  Models: 3  |  Memory: 41.2 MB                  │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
   ↑/↓ scroll  PgUp/PgDn page  g/G top/end  r refresh  q quit  |  ★ github.com/Mai0313/VibeCodingTracker
-```
-
----
-
-## Statusline 指令
-
-**將 Claude Code 的額度資訊接入 `usage` 儀表板。**
-
-Claude Code 僅透過 `statusLine` hook 的 stdin JSON 暴露其 5 小時 / 每週額度，因此 `vct` 從那裡擷取並快取到 `~/.vibe_coding_tracker/claude_rate_limits.json`，供 Claude 額度面板讀取。
-
-### 如果你已有 statusLine
-
-在現有 statusLine 腳本中加一行背景指令。它對目前顯示零影響，且相互隔離，vct 出錯也絕不會干擾 statusLine：
-
-```bash
-printf '%s' "$input" | vct statusline ingest >/dev/null 2>&1 &
-```
-
-### 如果你還沒有 statusLine
-
-讓 Claude Code 的 `~/.claude/settings.json` 直接指向 vct，它會快取額度並印出一行精簡狀態：
-
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "vct statusline"
-  }
-}
 ```
 
 ---

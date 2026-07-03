@@ -1,63 +1,141 @@
 //! Quota / rate-limit data models for the `usage` quota panels.
 //!
-//! Three input shapes feed one normalized output:
-//! - Claude Code statusLine stdin ([`ClaudeStatuslineInput`]) → persisted
-//!   [`ClaudeRateLimitsCache`].
-//! - Codex `wham/usage` API response ([`WhamUsageResponse`]).
-//! - Codex session-log fallback ([`CodexSessionRateLimits`]).
+//! Each provider has a raw wire shape that normalizes into one shared output
+//! ([`QuotaWindow`] / per-provider `*QuotaSnapshot`) so the TUI gauges render
+//! every provider identically:
 //!
-//! All three normalize into [`QuotaWindow`] / [`CodexQuotaSnapshot`] so the TUI
-//! gauges render every provider identically.
+//! - **Claude** — `GET /api/oauth/usage` ([`ClaudeUsageResponse`]) plus the
+//!   OAuth credentials in `~/.claude/.credentials.json` ([`ClaudeCredentials`]).
+//! - **Codex** — `wham/usage` API ([`WhamUsageResponse`]) with a session-log
+//!   fallback ([`CodexSessionRateLimits`]) and `~/.codex/auth.json`.
+//!
+//! Structs holding bearer tokens use a hand-written [`fmt::Debug`] that redacts
+//! the secret so a token can never reach a log or assertion message.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
 
-// ---- Claude statusLine ingest ----
-
-/// Claude Code statusLine stdin payload (only the parts we keep).
-#[derive(Debug, Clone, Deserialize)]
-pub struct ClaudeStatuslineInput {
-    /// Rate-limit windows injected by Claude Code (absent on older versions).
-    #[serde(default)]
-    pub rate_limits: Option<ClaudeRateLimitsIn>,
-    /// Model descriptor, used only by the printed default status line.
-    #[serde(default)]
-    pub model: Option<Value>,
+/// Renders an optional secret as `Some("<redacted>")` / `None` for `Debug`.
+fn redact(v: &Option<String>) -> Option<&'static str> {
+    v.as_ref().map(|_| "<redacted>")
 }
 
-/// The `rate_limits` object from a Claude statusLine payload.
+// ---- Claude usage API (GET /api/oauth/usage) ----
+
+/// `https://api.anthropic.com/api/oauth/usage` response (subset we read).
 #[derive(Debug, Clone, Deserialize)]
-pub struct ClaudeRateLimitsIn {
+pub struct ClaudeUsageResponse {
     /// 5-hour window.
     #[serde(default)]
-    pub five_hour: Option<ClaudeWindowIn>,
+    pub five_hour: Option<ClaudeUsageWindow>,
     /// Weekly window.
     #[serde(default)]
-    pub seven_day: Option<ClaudeWindowIn>,
+    pub seven_day: Option<ClaudeUsageWindow>,
 }
 
-/// One Claude rate-limit window.
+/// One Claude usage window.
 #[derive(Debug, Clone, Deserialize)]
-pub struct ClaudeWindowIn {
-    /// Percent of the window consumed (0..100; integer or float).
+pub struct ClaudeUsageWindow {
+    /// Percent of the window consumed (0..100).
     #[serde(default)]
-    pub used_percentage: f64,
-    /// Absolute reset time, Unix seconds.
+    pub utilization: f64,
+    /// Absolute reset time as an ISO-8601 string.
     #[serde(default)]
-    pub resets_at: i64,
+    pub resets_at: Option<String>,
 }
 
-/// Persisted Claude rate-limit cache
-/// (`~/.vibe_coding_tracker/claude_rate_limits.json`).
+// ---- ~/.claude/.credentials.json ----
+
+/// `~/.claude/.credentials.json` (only the `claudeAiOauth` block; the sibling
+/// `designOauth` and any unknown keys are preserved on write-back).
+#[derive(Clone, Deserialize)]
+pub struct ClaudeCredentials {
+    /// The Claude subscription OAuth token bundle.
+    #[serde(rename = "claudeAiOauth", default)]
+    pub claude_ai_oauth: Option<ClaudeOauth>,
+}
+
+impl fmt::Debug for ClaudeCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClaudeCredentials")
+            .field("claude_ai_oauth", &self.claude_ai_oauth)
+            .finish()
+    }
+}
+
+/// The `claudeAiOauth` object of `~/.claude/.credentials.json`.
+#[derive(Clone, Deserialize)]
+pub struct ClaudeOauth {
+    /// Bearer access token for the OAuth usage API.
+    #[serde(rename = "accessToken", default)]
+    pub access_token: Option<String>,
+    /// Refresh token (rotates on refresh; must be persisted).
+    #[serde(rename = "refreshToken", default)]
+    pub refresh_token: Option<String>,
+    /// Access-token expiry, Unix **milliseconds**.
+    #[serde(rename = "expiresAt", default)]
+    pub expires_at: Option<i64>,
+    /// OAuth scopes, carried back into the refresh request.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+}
+
+impl fmt::Debug for ClaudeOauth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClaudeOauth")
+            .field("access_token", &redact(&self.access_token))
+            .field("refresh_token", &redact(&self.refresh_token))
+            .field("expires_at", &self.expires_at)
+            .field("scopes", &self.scopes)
+            .finish()
+    }
+}
+
+/// `platform.claude.com/v1/oauth/token` refresh response.
+#[derive(Clone, Deserialize)]
+pub struct ClaudeRefreshResponse {
+    /// New bearer access token.
+    #[serde(default)]
+    pub access_token: Option<String>,
+    /// New refresh token (rotates).
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    /// Lifetime of the new access token, in seconds.
+    #[serde(default)]
+    pub expires_in: Option<i64>,
+    /// Space-separated granted scopes.
+    #[serde(default)]
+    pub scope: Option<String>,
+}
+
+impl fmt::Debug for ClaudeRefreshResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClaudeRefreshResponse")
+            .field("access_token", &redact(&self.access_token))
+            .field("refresh_token", &redact(&self.refresh_token))
+            .field("expires_in", &self.expires_in)
+            .field("scope", &self.scope)
+            .finish()
+    }
+}
+
+/// Normalized Claude quota snapshot (worker output + on-disk cache).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ClaudeRateLimitsCache {
-    /// Unix seconds when ingest wrote this snapshot.
+pub struct ClaudeQuotaSnapshot {
+    /// Which source produced this snapshot.
+    #[serde(default)]
+    pub source: QuotaSource,
+    /// Unix seconds when this snapshot was produced.
     pub fetched_at: i64,
     /// 5-hour window.
     pub five_hour: Option<QuotaWindow>,
     /// Weekly window.
     pub seven_day: Option<QuotaWindow>,
+    /// Credentials present but the token is unusable (expired / refresh
+    /// failed / 401); the panel shows a `claude auth login` hint.
+    #[serde(default)]
+    pub needs_login: bool,
 }
 
 // ---- Codex wham/usage API ----
@@ -163,14 +241,20 @@ pub struct CodexAuthJson {
 
 /// The `tokens` object of `~/.codex/auth.json`.
 ///
-/// `Debug` is implemented by hand to redact both fields: the access token is a
-/// bearer credential and the account id is an identifier, so neither should
-/// reach a log or assertion message. The wham client relies on this guarantee.
+/// `Debug` is implemented by hand to redact the secrets: the tokens are bearer
+/// credentials and the account id is an identifier, so none should reach a log
+/// or assertion message. The wham client relies on this guarantee.
 #[derive(Clone, Deserialize)]
 pub struct CodexAuthTokens {
+    /// OIDC id token (JWT); refreshed alongside the access token.
+    #[serde(default)]
+    pub id_token: Option<String>,
     /// Bearer access token for the ChatGPT backend.
     #[serde(default)]
     pub access_token: Option<String>,
+    /// Refresh token (rotates on refresh; must be persisted).
+    #[serde(default)]
+    pub refresh_token: Option<String>,
     /// Account id sent as the `ChatGPT-Account-Id` header.
     #[serde(default)]
     pub account_id: Option<String>,
@@ -178,11 +262,35 @@ pub struct CodexAuthTokens {
 
 impl fmt::Debug for CodexAuthTokens {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Show presence without leaking the values.
-        let redact = |v: &Option<String>| v.as_ref().map(|_| "<redacted>");
         f.debug_struct("CodexAuthTokens")
+            .field("id_token", &redact(&self.id_token))
             .field("access_token", &redact(&self.access_token))
+            .field("refresh_token", &redact(&self.refresh_token))
             .field("account_id", &redact(&self.account_id))
+            .finish()
+    }
+}
+
+/// `https://auth.openai.com/oauth/token` refresh response.
+#[derive(Clone, Deserialize)]
+pub struct CodexRefreshResponse {
+    /// New OIDC id token.
+    #[serde(default)]
+    pub id_token: Option<String>,
+    /// New bearer access token.
+    #[serde(default)]
+    pub access_token: Option<String>,
+    /// New refresh token (rotates).
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+}
+
+impl fmt::Debug for CodexRefreshResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CodexRefreshResponse")
+            .field("id_token", &redact(&self.id_token))
+            .field("access_token", &redact(&self.access_token))
+            .field("refresh_token", &redact(&self.refresh_token))
             .finish()
     }
 }
@@ -223,20 +331,20 @@ pub struct CodexSessionWindow {
 
 // ---- Normalized output (render target + on-disk cache) ----
 
-/// Which source produced a Codex quota snapshot.
+/// Which source produced a quota snapshot.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QuotaSource {
     /// No data available.
     #[default]
     None,
-    /// Live `wham/usage` API.
+    /// Live API (`wham/usage` or Claude usage).
     Api,
     /// Newest Codex session-log `rate_limits`.
     SessionFallback,
 }
 
-/// One normalized rate-limit window, shared by Claude and Codex rendering.
+/// One normalized rate-limit window, shared by every provider's rendering.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QuotaWindow {
     /// Percent of the window consumed (0..100).
@@ -269,6 +377,10 @@ pub struct CodexQuotaSnapshot {
     pub reset_credits_available: Option<i64>,
     /// Whether a rate limit has been reached.
     pub limit_reached: Option<bool>,
+    /// Token present but unusable (refresh failed / 401); the panel shows a
+    /// `codex auth login` hint alongside any session-fallback data.
+    #[serde(default)]
+    pub needs_login: bool,
 }
 
 #[cfg(test)]
@@ -278,11 +390,14 @@ mod tests {
     #[test]
     fn auth_tokens_debug_redacts_secrets() {
         let tokens = CodexAuthTokens {
+            id_token: Some("jwt-header.payload.sig".into()),
             access_token: Some("sk-super-secret-value".into()),
+            refresh_token: Some("rt-super-secret".into()),
             account_id: Some("acct-1234567890".into()),
         };
         let direct = format!("{tokens:?}");
         assert!(!direct.contains("sk-super-secret-value"));
+        assert!(!direct.contains("rt-super-secret"));
         assert!(!direct.contains("acct-1234567890"));
         assert!(direct.contains("<redacted>"));
 
@@ -295,5 +410,46 @@ mod tests {
         );
         assert!(!wrapped.contains("sk-super-secret-value"));
         assert!(!wrapped.contains("acct-1234567890"));
+    }
+
+    #[test]
+    fn claude_oauth_debug_redacts_secrets() {
+        let oauth = ClaudeOauth {
+            access_token: Some("claude-access-secret".into()),
+            refresh_token: Some("claude-refresh-secret".into()),
+            expires_at: Some(1783108188604),
+            scopes: vec!["user:inference".into()],
+        };
+        let s = format!("{oauth:?}");
+        assert!(!s.contains("claude-access-secret"));
+        assert!(!s.contains("claude-refresh-secret"));
+        assert!(s.contains("<redacted>"));
+        // Non-secret fields are still visible.
+        assert!(s.contains("1783108188604"));
+        assert!(s.contains("user:inference"));
+    }
+
+    #[test]
+    fn refresh_responses_debug_redact_secrets() {
+        let c = ClaudeRefreshResponse {
+            access_token: Some("new-access".into()),
+            refresh_token: Some("new-refresh".into()),
+            expires_in: Some(28800),
+            scope: Some("user:inference".into()),
+        };
+        let cs = format!("{c:?}");
+        assert!(!cs.contains("new-access"));
+        assert!(!cs.contains("new-refresh"));
+        assert!(cs.contains("28800"));
+
+        let x = CodexRefreshResponse {
+            id_token: Some("id-secret".into()),
+            access_token: Some("acc-secret".into()),
+            refresh_token: Some("ref-secret".into()),
+        };
+        let xs = format!("{x:?}");
+        assert!(!xs.contains("id-secret"));
+        assert!(!xs.contains("acc-secret"));
+        assert!(!xs.contains("ref-secret"));
     }
 }

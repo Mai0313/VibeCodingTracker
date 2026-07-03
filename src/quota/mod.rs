@@ -1,201 +1,137 @@
-//! Codex quota orchestration: resolve precedence (API → session fallback),
-//! the background refresh worker, shared state, and cache loading. Also exposes
-//! the tiny Claude rate-limits cache reader used directly by the TUI.
+//! Quota orchestration for the `usage` panels.
+//!
+//! Each provider (Claude / Codex) runs its own background worker
+//! ([`provider::spawn_quota_worker`]) that refreshes a shared snapshot every
+//! ~10s, seeded from an on-disk cache. The provider-specific fetch + token
+//! refresh lives in [`claude`] and [`wham`] (+ this module's [`CodexState`]);
+//! the shared HTTP + refresh primitives live in [`http`] and [`refresh`].
 
 pub mod cache;
+pub mod claude;
 pub mod codex_session;
+pub mod http;
+pub mod provider;
+pub mod refresh;
 pub mod wham;
 
-pub use cache::{load_codex_cache, save_codex_cache};
+pub use cache::{load_claude_cache, load_codex_cache, save_claude_cache, save_codex_cache};
+pub use claude::{CLAUDE_LOGIN_HINT, ClaudeState};
+pub use provider::{QuotaOutcome, QuotaSnapshot, spawn_quota_worker};
 
-use crate::models::{ClaudeRateLimitsCache, CodexQuotaSnapshot, QuotaSource};
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
-use std::time::Duration;
+use crate::models::CodexQuotaSnapshot;
+use crate::quota::refresh::{RefreshCooldown, file_mtime};
+use crate::quota::wham::WhamResult;
 
-/// How often the worker refreshes (matches the usage TUI refresh cadence).
-const REFRESH_SECS: u64 = 10;
+/// Login hint shown when Codex refresh fails.
+pub const CODEX_LOGIN_HINT: &str = "run: codex auth login";
 
-/// How long a last-known-good snapshot is kept once no source resolves.
-///
-/// Within this window a `None` result is treated as a transient failure and the
-/// previous value is preserved; past it the snapshot is cleared so a removed
-/// `auth.json` (or an expired token with no session fallback) stops showing
-/// stale quota forever.
-const STALE_AFTER_SECS: i64 = 90;
-
-/// Loads the Claude rate-limits cache written by `vct statusline ingest`.
-///
-/// Returns `None` if absent or corrupt. This is a sub-millisecond local read,
-/// so the TUI calls it on the main thread (no worker needed).
-pub fn load_claude_rate_limits() -> Option<ClaudeRateLimitsCache> {
-    let path = crate::utils::get_claude_rate_limits_path().ok()?;
-    let body = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&body).ok()
+/// Outcome of a Codex wham fetch (with reactive refresh).
+enum CodexFetch {
+    Ok(CodexQuotaSnapshot),
+    /// Token rejected and refresh failed → show login hint (keep session data).
+    NeedsLogin,
+    /// Network / non-auth error → fall back to session logs.
+    Transient,
 }
 
-/// Resolves the Codex quota with API-first, session-fallback precedence.
+/// Per-worker Codex state: an in-memory access token + refresh backoff.
 ///
-/// 1. `~/.codex/auth.json` exists and wham succeeds → [`QuotaSource::Api`].
-/// 2. else newest session `rate_limits` → [`QuotaSource::SessionFallback`].
-/// 3. else an empty snapshot ([`QuotaSource::None`]).
-pub fn resolve_codex_quota(client: &reqwest::blocking::Client) -> CodexQuotaSnapshot {
-    if let Ok(paths) = crate::utils::resolve_paths() {
-        let auth = paths.codex_dir.join("auth.json");
-        if auth.exists() {
-            match wham::fetch_codex_usage(&auth, client) {
-                Ok(snap) => return snap,
-                Err(e) => log::warn!("codex wham/usage failed: {e}; using session fallback"),
+/// Codex `auth.json` carries no explicit expiry, so refresh is **reactive**:
+/// the stored (or in-memory) access token is used until the wham endpoint 401s,
+/// then it is refreshed (rotating + writing back the refresh token) and retried.
+#[derive(Default)]
+pub struct CodexState {
+    token: Option<String>,
+    cooldown: RefreshCooldown,
+}
+
+impl CodexState {
+    /// One worker tick: wham API with reactive refresh, else session fallback.
+    pub fn resolve(
+        &mut self,
+        client: &reqwest::blocking::Client,
+    ) -> QuotaOutcome<CodexQuotaSnapshot> {
+        let now = chrono::Local::now().timestamp();
+        let auth = crate::utils::resolve_paths()
+            .ok()
+            .map(|p| p.codex_dir.join("auth.json"));
+
+        if let Some(auth) = &auth
+            && auth.exists()
+        {
+            match self.fetch_with_refresh(client, auth, now) {
+                CodexFetch::Ok(snap) => return QuotaOutcome::Data(snap),
+                CodexFetch::NeedsLogin => {
+                    // Keep any session-fallback data, flag the login hint (S3).
+                    let mut snap = codex_session::latest_session_rate_limits()
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    snap.needs_login = true;
+                    snap.fetched_at = now;
+                    return QuotaOutcome::Data(snap);
+                }
+                CodexFetch::Transient => { /* fall through to session logs */ }
             }
         }
-    }
-    match codex_session::latest_session_rate_limits() {
-        Ok(Some(snap)) => snap,
-        _ => CodexQuotaSnapshot::default(),
-    }
-}
 
-/// Whether a preserved last-known-good snapshot should be dropped because no
-/// source resolved and it has aged past `max_age_secs`.
-///
-/// A snapshot that is already [`QuotaSource::None`] needs no clearing.
-fn should_clear_stale(current: &CodexQuotaSnapshot, now: i64, max_age_secs: i64) -> bool {
-    current.source != QuotaSource::None && now - current.fetched_at > max_age_secs
-}
-
-/// Spawns a detached background worker that refreshes the Codex quota snapshot
-/// into `shared` (and the on-disk cache) every ~10s until `shutdown` is set.
-///
-/// The worker is panic-isolated (`catch_unwind`) and holds the mutex only for
-/// the assignment, so it can never poison the lock. A resolved snapshot with
-/// [`QuotaSource::None`] keeps the last-known-good value through a transient
-/// failure, but a stale snapshot (older than [`STALE_AFTER_SECS`]) is dropped so
-/// the panel stops showing quota for a source that is gone. It is not joined on
-/// quit — `shutdown` is set as a courtesy and the OS reclaims the thread on
-/// process exit.
-pub fn spawn_codex_quota_worker(
-    shared: Arc<Mutex<CodexQuotaSnapshot>>,
-    shutdown: Arc<AtomicBool>,
-) -> JoinHandle<()> {
-    std::thread::spawn(move || {
-        let client = match wham::build_client() {
-            Ok(c) => c,
-            Err(e) => {
-                log::warn!("codex quota worker: failed to build HTTP client: {e}");
-                return;
-            }
-        };
-        loop {
-            if shutdown.load(Ordering::Relaxed) {
-                break;
-            }
-            match catch_unwind(AssertUnwindSafe(|| resolve_codex_quota(&client))) {
-                Ok(snap) if snap.source != QuotaSource::None => {
-                    if let Ok(mut guard) = shared.lock() {
-                        *guard = snap.clone();
-                    }
-                    let _ = cache::save_codex_cache(&snap);
-                }
-                Ok(_) => {
-                    // No source resolved. Keep the last-known-good value through
-                    // a transient failure, but drop it once stale so a removed
-                    // source stops showing quota indefinitely.
-                    let now = chrono::Local::now().timestamp();
-                    let mut cleared = false;
-                    if let Ok(mut guard) = shared.lock()
-                        && should_clear_stale(&guard, now, STALE_AFTER_SECS)
-                    {
-                        *guard = CodexQuotaSnapshot::default();
-                        cleared = true;
-                    }
-                    if cleared {
-                        let _ = cache::save_codex_cache(&CodexQuotaSnapshot::default());
-                    }
-                }
-                Err(_) => log::warn!("codex quota worker panicked; keeping last snapshot"),
-            }
-            // Sleep in 200ms slices so shutdown stays responsive.
-            for _ in 0..(REFRESH_SECS * 5) {
-                if shutdown.load(Ordering::Relaxed) {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(200));
-            }
+        match codex_session::latest_session_rate_limits() {
+            Ok(Some(snap)) => QuotaOutcome::Data(snap),
+            _ => QuotaOutcome::Transient,
         }
-    })
-}
-
-/// Pure precedence decision used by [`resolve_codex_quota`], factored out for
-/// testing without any I/O.
-///
-/// Returns the source that *would* be selected given whether auth exists, the
-/// API call succeeded, and a session snapshot was found.
-#[cfg(test)]
-fn choose_source(auth_exists: bool, api_ok: bool, session_some: bool) -> QuotaSource {
-    if auth_exists && api_ok {
-        QuotaSource::Api
-    } else if session_some {
-        QuotaSource::SessionFallback
-    } else {
-        QuotaSource::None
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn precedence_api_first() {
-        assert_eq!(choose_source(true, true, true), QuotaSource::Api);
-        assert_eq!(choose_source(true, true, false), QuotaSource::Api);
     }
 
-    #[test]
-    fn precedence_falls_back_to_session() {
-        assert_eq!(
-            choose_source(false, false, true),
-            QuotaSource::SessionFallback
-        );
-        assert_eq!(
-            choose_source(true, false, true),
-            QuotaSource::SessionFallback
-        );
-    }
-
-    #[test]
-    fn precedence_none_when_nothing() {
-        assert_eq!(choose_source(false, false, false), QuotaSource::None);
-        assert_eq!(choose_source(true, false, false), QuotaSource::None);
-    }
-
-    #[test]
-    fn keeps_fresh_snapshot_when_no_source() {
-        let snap = CodexQuotaSnapshot {
-            source: QuotaSource::Api,
-            fetched_at: 1000,
-            ..Default::default()
+    /// wham call with a reactive 401 → refresh → retry-once.
+    fn fetch_with_refresh(
+        &mut self,
+        client: &reqwest::blocking::Client,
+        auth: &std::path::Path,
+        now: i64,
+    ) -> CodexFetch {
+        let body = match std::fs::read_to_string(auth) {
+            Ok(b) => b,
+            Err(_) => return CodexFetch::Transient,
         };
-        // 30s old, within the window: transient failure, keep last-known-good.
-        assert!(!should_clear_stale(&snap, 1030, 90));
-    }
-
-    #[test]
-    fn clears_stale_snapshot_when_no_source() {
-        let snap = CodexQuotaSnapshot {
-            source: QuotaSource::Api,
-            fetched_at: 1000,
-            ..Default::default()
+        let (file_token, account_id) = match wham::parse_auth(&body) {
+            Ok(x) => x,
+            Err(_) => return CodexFetch::Transient,
         };
-        // 200s old: source is gone, drop the stale snapshot.
-        assert!(should_clear_stale(&snap, 1200, 90));
-    }
+        let token = self.token.clone().unwrap_or(file_token);
 
-    #[test]
-    fn never_clears_already_empty_snapshot() {
-        let snap = CodexQuotaSnapshot::default(); // source == None
-        assert!(!should_clear_stale(&snap, i64::MAX, 90));
+        match wham::call_wham(client, &token, account_id.as_deref(), now) {
+            WhamResult::Ok(snap) => {
+                self.cooldown.clear();
+                self.token = Some(token);
+                CodexFetch::Ok(snap)
+            }
+            WhamResult::Unauthorized => {
+                let mtime = file_mtime(auth);
+                if self.cooldown.active(now, mtime) {
+                    self.token = None;
+                    return CodexFetch::NeedsLogin;
+                }
+                match wham::refresh_codex(client, auth, mtime) {
+                    Ok(new_tok) => {
+                        self.cooldown.clear();
+                        self.token = Some(new_tok.clone());
+                        match wham::call_wham(client, &new_tok, account_id.as_deref(), now) {
+                            WhamResult::Ok(snap) => CodexFetch::Ok(snap),
+                            _ => {
+                                self.cooldown.arm(now, mtime);
+                                self.token = None;
+                                CodexFetch::NeedsLogin
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("codex token refresh failed: {e}");
+                        self.cooldown.arm(now, mtime);
+                        self.token = None;
+                        CodexFetch::NeedsLogin
+                    }
+                }
+            }
+            WhamResult::Transient => CodexFetch::Transient,
+        }
     }
 }

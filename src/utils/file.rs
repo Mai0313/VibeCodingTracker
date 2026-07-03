@@ -54,12 +54,12 @@ pub fn read_jsonl<P: AsRef<Path>>(path: P) -> Result<Vec<Value>> {
     Ok(results)
 }
 
-/// Serializes `value` as JSON and writes it to `path` atomically.
+/// Serializes `value` as compact JSON and writes it to `path` atomically.
 ///
 /// Writes to a temporary file in the same directory, fsyncs it, then renames
 /// it over `path`, so a concurrent reader never observes a partially written
-/// file. Used by the statusline ingest (many Claude sessions write the same
-/// cache concurrently) and by the Codex quota worker.
+/// file. Used by the quota-cache writers (the background quota workers each
+/// persist their last-known-good snapshot).
 ///
 /// # Errors
 ///
@@ -70,13 +70,42 @@ where
     T: serde::Serialize,
     P: AsRef<Path>,
 {
-    let path = path.as_ref();
+    write_json_atomic_inner(path.as_ref(), value, false)
+}
+
+/// Like [`write_json_atomic`] but pretty-prints the JSON.
+///
+/// Used for credential write-back so a refreshed token file keeps the
+/// human-readable 2-space layout the provider CLIs write, rather than being
+/// collapsed onto one line.
+///
+/// # Errors
+///
+/// Returns an error if the parent directory cannot be created, the temp file
+/// cannot be written, or the final rename fails.
+pub fn write_json_atomic_pretty<T, P>(path: P, value: &T) -> Result<()>
+where
+    T: serde::Serialize,
+    P: AsRef<Path>,
+{
+    write_json_atomic_inner(path.as_ref(), value, true)
+}
+
+/// Shared atomic-write body: temp file in the same dir, fsync, rename.
+fn write_json_atomic_inner<T>(path: &Path, value: &T, pretty: bool) -> Result<()>
+where
+    T: serde::Serialize,
+{
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir)
         .with_context(|| format!("Failed to create directory: {}", dir.display()))?;
     let mut tmp = tempfile::NamedTempFile::new_in(dir)
         .with_context(|| format!("Failed to create temp file in: {}", dir.display()))?;
-    serde_json::to_writer(&mut tmp, value).context("Failed to serialize JSON")?;
+    if pretty {
+        serde_json::to_writer_pretty(&mut tmp, value).context("Failed to serialize JSON")?;
+    } else {
+        serde_json::to_writer(&mut tmp, value).context("Failed to serialize JSON")?;
+    }
     tmp.as_file().sync_all().ok();
     tmp.persist(path)
         .with_context(|| format!("Failed to persist file: {}", path.display()))?;

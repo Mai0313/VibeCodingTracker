@@ -31,7 +31,6 @@ pub mod models;
 pub mod pricing;
 pub mod quota;
 pub mod session;
-pub mod statusline;
 pub mod update;
 pub mod usage;
 pub mod utils;

@@ -179,18 +179,4 @@ pub enum Commands {
         #[arg(long, short)]
         force: bool,
     },
-
-    /// Capture Claude Code rate limits from a statusLine hook (reads stdin JSON).
-    Statusline {
-        /// Sub-action; with none, caches and prints a one-line status.
-        #[command(subcommand)]
-        command: Option<StatuslineCommand>,
-    },
-}
-
-/// Sub-actions for the `statusline` command.
-#[derive(Subcommand, Debug)]
-pub enum StatuslineCommand {
-    /// Read statusLine JSON from stdin and silently cache the rate limits.
-    Ingest,
 }

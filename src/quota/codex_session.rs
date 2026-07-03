@@ -199,6 +199,7 @@ pub fn extract_latest_rate_limits(values: &[Value], now: i64) -> Option<CodexQuo
             unlimited: None,
             reset_credits_available: None,
             limit_reached: None,
+            needs_login: false,
         });
     }
     None

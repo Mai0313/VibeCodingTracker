@@ -101,6 +101,17 @@ Resolved by `src/utils/paths.rs` (`resolve_paths`):
 | OpenCode      | `~/.local/share/opencode/opencode.db` (SQLite database, read via `rusqlite`; honors `$XDG_DATA_HOME`)                                          |
 | Pricing cache | `~/.vibe_coding_tracker/model_pricing_YYYY-MM-DD.json`                                                                                         |
 
+### Quota panels (`src/quota/`)
+
+The `usage` TUI shows live remaining quota for **Claude / Codex**, each fetched over HTTP on its own background thread (`provider::spawn_quota_worker`, ~10s cadence, seeded from a `~/.vibe_coding_tracker/<provider>_usage.json` cache). There is **no** `statusline` subcommand — the old `vct statusline ingest` mechanism was removed; Claude quota now comes from `GET https://api.anthropic.com/api/oauth/usage`.
+
+- **Credential files read (and written back on refresh):** Claude `~/.claude/.credentials.json` (`claudeAiOauth`), Codex `~/.codex/auth.json` (`tokens`). On macOS Claude stores these in the Keychain, so the Claude panel is absent there.
+- **Token refresh** lives in `src/quota/refresh.rs` (shared primitives) + each fetcher. It only fires when a token is near expiry (Claude `expiresAt` ms) or an API call returns 401 (Codex is reactive-only — `auth.json` has no expiry). A refreshed access token is cached in memory so the worker reuses it instead of refreshing every tick; the new token is also written back **atomically, preserving every other field** (`update_json_file_in_place` mutates a whole `serde_json::Value`, never a narrow struct) in that CLI's exact timestamp format. Both providers' refresh tokens **rotate** (persist the new one) — a re-check of the file mtime just before write aborts the write if a concurrent official CLI rotated first.
+- **Backoff:** a refresh failure arms a per-provider cooldown (`RefreshCooldown`, 5 min) keyed on the credential file mtime, so a revoked token cannot spin the token endpoint; a mtime change (re-login) retries immediately. Persistent failure surfaces a `run: <provider> auth login` hint (`needs_login` is a snapshot field independent of `QuotaSource`, so Codex keeps showing session-fallback data alongside the hint).
+- Panels are **TUI-only** and appear only for a provider whose credentials exist.
+
+**Antigravity (investigated, deferred — not shipped):** a full Antigravity quota implementation was built and then removed. Blocker: its Google OAuth client id/secret live only inside the Antigravity **IDE** language-server binary (`~/.antigravity-ide-server/.../language_server_linux_x64`), not in `~/.gemini/antigravity-cli`, so there is no clean way to obtain them without either committing the (public installed-app) secret or extracting it from that binary at runtime — plus Antigravity is still beta. Endpoints/shapes are captured in the memory note `project_antigravity_quota`.
+
 ### Pricing (`src/pricing/`)
 
 1. Daily pricing fetched from LiteLLM (`https://github.com/BerriAI/litellm/raw/.../model_prices_and_context_window.json`)
