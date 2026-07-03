@@ -111,6 +111,13 @@ pub fn update_json_file_in_place(
         .with_context(|| format!("Failed to read {}", path.display()))?;
     let mut root: Value = serde_json::from_str(&body).context("Failed to parse credential file")?;
     mutate(&mut root)?;
+    // Re-check right before writing: a concurrent official CLI may have rotated
+    // the credential during the read/mutate above. This shrinks the TOCTOU
+    // window to the serialize+rename below (fully closing it would need file
+    // locking).
+    if file_mtime(path) != expected_mtime {
+        return Ok(false);
+    }
     crate::utils::write_json_atomic_pretty(path, &root)?;
     Ok(true)
 }
