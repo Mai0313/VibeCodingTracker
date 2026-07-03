@@ -252,14 +252,17 @@ impl ClaudeState {
                             self.cooldown.clear();
                             QuotaOutcome::Data(snap)
                         }
+                        // Arm with the CURRENT mtime (re-read): a successful
+                        // refresh just rewrote the file, so `mtime` is stale and
+                        // arming with it would never suppress the next tick.
                         _ => {
-                            self.cooldown.arm(now_secs, mtime);
+                            self.cooldown.arm(now_secs, file_mtime(&path));
                             self.token = None;
                             QuotaOutcome::NeedsLogin
                         }
                     },
                     None => {
-                        self.cooldown.arm(now_secs, mtime);
+                        self.cooldown.arm(now_secs, file_mtime(&path));
                         self.token = None;
                         QuotaOutcome::NeedsLogin
                     }
@@ -301,7 +304,8 @@ impl ClaudeState {
             match self.force_refresh(client, path, mtime) {
                 Some(t) => EnsureToken::Token(t),
                 None => {
-                    self.cooldown.arm(now_secs, mtime);
+                    // Re-read: a partial write could have changed the mtime.
+                    self.cooldown.arm(now_secs, file_mtime(path));
                     EnsureToken::NeedsLogin
                 }
             }

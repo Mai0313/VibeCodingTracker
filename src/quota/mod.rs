@@ -116,8 +116,11 @@ impl CodexState {
                         self.token = Some(new_tok.clone());
                         match wham::call_wham(client, &new_tok, account_id.as_deref(), now) {
                             WhamResult::Ok(snap) => CodexFetch::Ok(snap),
+                            // Arm with the CURRENT mtime (re-read): the
+                            // successful refresh just rewrote auth.json, so the
+                            // captured `mtime` is stale and would never suppress.
                             _ => {
-                                self.cooldown.arm(now, mtime);
+                                self.cooldown.arm(now, file_mtime(auth));
                                 self.token = None;
                                 CodexFetch::NeedsLogin
                             }
@@ -125,7 +128,7 @@ impl CodexState {
                     }
                     Err(e) => {
                         log::warn!("codex token refresh failed: {e}");
-                        self.cooldown.arm(now, mtime);
+                        self.cooldown.arm(now, file_mtime(auth));
                         self.token = None;
                         CodexFetch::NeedsLogin
                     }

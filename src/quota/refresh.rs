@@ -1,5 +1,5 @@
-//! Shared OAuth token-refresh primitives used by the Claude / Codex /
-//! Antigravity quota fetchers.
+//! Shared OAuth token-refresh primitives used by the Claude / Codex quota
+//! fetchers.
 //!
 //! The provider-specific request/response shapes live in each fetcher; this
 //! module owns the cross-cutting concerns:

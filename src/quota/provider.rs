@@ -1,4 +1,4 @@
-//! Generic background quota worker, shared by all three providers.
+//! Generic background quota worker, shared by the Claude and Codex providers.
 //!
 //! Each provider gets its own thread (so one provider's slow HTTP never stalls
 //! the others), but they all run the same panic-isolated 10s loop here. A
