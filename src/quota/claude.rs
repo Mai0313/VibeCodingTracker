@@ -214,8 +214,10 @@ enum EnsureToken {
 /// Per-worker Claude state: an in-memory access token + refresh backoff.
 #[derive(Default)]
 pub struct ClaudeState {
-    /// Cached fresh token: `(access_token, expires_at_ms)`.
-    token: Option<(String, i64)>,
+    /// Cached fresh token: `(access_token, expires_at_ms, credential-file mtime)`.
+    /// The mtime pins the cache to the file it came from, so a re-login / account
+    /// switch invalidates it even while the old token is unexpired.
+    token: Option<(String, i64, Option<SystemTime>)>,
     cooldown: RefreshCooldown,
 }
 
@@ -280,9 +282,12 @@ impl ClaudeState {
         now_secs: i64,
         now_ms: i64,
     ) -> EnsureToken {
-        // In-memory token still comfortably valid?
-        if let Some((tok, exp_ms)) = &self.token
+        // In-memory token still valid AND the credential file unchanged since we
+        // cached it? A re-login / account switch rewrites `.credentials.json`, so
+        // the cached token must be dropped even while it is unexpired.
+        if let Some((tok, exp_ms, cred_mtime)) = &self.token
             && exp_ms - now_ms > EXPIRY_SKEW_SECS * 1000
+            && *cred_mtime == file_mtime(path)
         {
             return EnsureToken::Token(tok.clone());
         }
@@ -311,7 +316,11 @@ impl ClaudeState {
             }
         } else {
             let tok = access.expect("access is some when need_refresh is false");
-            self.token = Some((tok.clone(), oauth.expires_at.unwrap_or(now_ms)));
+            self.token = Some((
+                tok.clone(),
+                oauth.expires_at.unwrap_or(now_ms),
+                file_mtime(path),
+            ));
             EnsureToken::Token(tok)
         }
     }
@@ -328,7 +337,7 @@ impl ClaudeState {
         match refresh_claude(client, path, &refresh_token, &oauth.scopes, mtime) {
             Ok((access, expires_ms)) => {
                 self.cooldown.clear();
-                self.token = Some((access.clone(), expires_ms));
+                self.token = Some((access.clone(), expires_ms, file_mtime(path)));
                 Some(access)
             }
             Err(e) => {
