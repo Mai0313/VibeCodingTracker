@@ -239,15 +239,16 @@ vct usage --json --daily
 
 ```
 ┌ Provider/Tokens/Cost/Days ┬ Claude ───────────────────┬ Codex ────────────────────┐
-│ Claude    1.2M  $3.00  4d │ 5h     ▰▱▱▱▱  16%  ↻ 2h0m  │ Plan: plus                 │
-│ Codex      800K $0.00  6d │ 7d     ▰▰▱▱▱  41%  ↻ 5d    │ 5h     ▰▰▱▱▱  37%  ↻ 2h33m │
-│ ...                       │ Opus   ▰▰▰▱▱  61%  ↻ 5d    │ 7d     ▰▰▱▱▱  24%  ↻ 3d16h │
-│                           │ Balance: -    $0.00 used   │ Credits: 0  +3 reset       │
-│                           │ updated just now           │ updated just now           │
+│ Claude    1.2M  $3.00  4d │ Plan: max 20x              │ Plan: plus                 │
+│ Codex      800K $0.00  6d │ 5h     ▰▱▱▱▱  16%  ↻ 2h0m  │ 5h     ▰▰▱▱▱  37%  ↻ 2h33m │
+│ ...                       │ 7d     ▰▰▱▱▱  41%  ↻ 5d    │ 7d     ▰▰▱▱▱  24%  ↻ 3d16h │
+│                           │ Opus   ▰▰▰▱▱  61%  ↻ 5d    │ Credits: 0  +3 reset       │
+│                           │ Balance: -    $0.00 used   │ updated just now           │
+│                           │ updated just now           │                            │
 └───────────────────────────┴────────────────────────────┴────────────────────────────┘
 ```
 
-- **Claude** — 5 小時、每週以及單模型每週用量，來自官方 OAuth 用量 API（`GET /api/oauth/usage`），從 `~/.claude/.credentials.json` 讀取，並顯示額度餘額。約每分鐘輪詢一次以避開該端點的速率限制；觸及上限時標題會出現紅色 `LIMIT` 標記。
+- **Claude** — 方案類型、5 小時、每週以及單模型每週用量，來自官方 OAuth 用量 API（`GET /api/oauth/usage`），從 `~/.claude/.credentials.json` 讀取，並顯示額度餘額。約每分鐘輪詢一次以避開該端點的速率限制；觸及上限時標題會出現紅色 `LIMIT` 標記。單模型每週那一行屬於盡力而為，未回傳該範圍時就自動隱藏。
 - **Codex** — 方案類型、5 小時和每週用量以及額度餘額，使用 `~/.codex/auth.json` 從 ChatGPT 後端（`wham/usage`）取得（在適用時顯示大致剩餘訊息數 / 消費上限）；API 無法使用時回退到 Codex 工作階段紀錄中最新的 `rate_limits`（標題顯示 `Codex` 或 `Codex (session)`）。
 
 **自動刷新 token。** 對這兩個 provider，當 token 接近過期或被拒絕時，vct 會刷新它並把新的 token 寫回該 provider 自己的憑證檔案（採用該 CLI 的原始格式），因此 token 會在多次檢查之間重複使用，而不是每次都重新刷新。如果刷新失敗，面板會顯示 `run: <provider> auth login` 提示，而不會直接中斷。

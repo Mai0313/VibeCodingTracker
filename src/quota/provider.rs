@@ -49,7 +49,9 @@ impl QuotaSnapshot for ClaudeQuotaSnapshot {
     fn is_present(&self) -> bool {
         self.five_hour.is_some()
             || self.seven_day.is_some()
-            || self.scoped_weekly.is_some()
+            // Mirror the render gate: a scoped row needs both the window and its
+            // model label, so a label-less scoped window is not "present" alone.
+            || (self.scoped_weekly.is_some() && self.scoped_label.is_some())
             || self.needs_login
     }
     fn set_needs_login(&mut self, value: bool) {

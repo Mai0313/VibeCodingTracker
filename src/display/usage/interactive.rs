@@ -749,17 +749,25 @@ fn render_claude_quota(f: &mut Frame, area: Rect, claude: &ClaudeQuotaSnapshot, 
     let block = quota_block(" Claude ", CLAUDE_COLOR, claude.limit_reached);
 
     let mut lines: Vec<Line> = Vec::new();
+    if let Some(plan) = &claude.plan_type {
+        lines.push(plan_line(plan));
+    }
+    // Track windows separately so a lone Plan line does not count as "has data".
+    let mut has_data = false;
     if let Some(w) = &claude.five_hour {
         lines.push(quota_gauge_line("5h", w, now));
+        has_data = true;
     }
     if let Some(w) = &claude.seven_day {
         lines.push(quota_gauge_line("7d", w, now));
+        has_data = true;
     }
-    if let Some(w) = &claude.scoped_weekly {
-        let label = claude.scoped_label.as_deref().unwrap_or("model");
+    // The per-model weekly cap (Fable today) is volatile on Anthropic's side, so
+    // it is only drawn when both the window and its model label are present.
+    if let (Some(w), Some(label)) = (&claude.scoped_weekly, &claude.scoped_label) {
         lines.push(quota_gauge_line(label, w, now));
+        has_data = true;
     }
-    let has_data = !lines.is_empty();
     if has_data {
         lines.push(claude_balance_line(claude));
         lines.push(staleness_line(claude.fetched_at, now));
@@ -792,10 +800,7 @@ fn render_codex_quota(f: &mut Frame, area: Rect, codex: &CodexQuotaSnapshot, now
         }
         v
     } else {
-        let mut v = vec![Line::from(Span::styled(
-            format!("Plan: {}", codex.plan_type.as_deref().unwrap_or("?")),
-            Style::default().fg(RatatuiColor::Gray),
-        ))];
+        let mut v = vec![plan_line(codex.plan_type.as_deref().unwrap_or("?"))];
 
         if let Some(w) = &codex.primary {
             v.push(quota_gauge_line("5h", w, now));
@@ -817,6 +822,14 @@ fn render_codex_quota(f: &mut Frame, area: Rect, codex: &CodexQuotaSnapshot, now
     };
 
     f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// Builds the `Plan: <tier>` line shared by both panels.
+fn plan_line(plan: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("Plan: {plan}"),
+        Style::default().fg(RatatuiColor::Gray),
+    ))
 }
 
 /// Builds the credits line for the Codex panel.

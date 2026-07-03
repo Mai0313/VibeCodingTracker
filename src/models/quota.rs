@@ -37,7 +37,8 @@ pub struct ClaudeUsageResponse {
     #[serde(default)]
     pub seven_day: Option<ClaudeUsageWindow>,
     /// Per-scope limit entries (session / weekly_all / weekly_scoped, ...).
-    #[serde(default)]
+    /// Parsed leniently so one malformed / volatile entry never fails the body.
+    #[serde(default, deserialize_with = "de_lenient_limits")]
     pub limits: Vec<ClaudeLimit>,
     /// Pay-as-you-go spend / credit balance.
     #[serde(default)]
@@ -47,8 +48,8 @@ pub struct ClaudeUsageResponse {
 /// One Claude usage window.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClaudeUsageWindow {
-    /// Percent of the window consumed (0..100).
-    #[serde(default)]
+    /// Percent of the window consumed (0..100). Null/wrong-type reads as 0.
+    #[serde(default, deserialize_with = "de_f64_or_zero")]
     pub utilization: f64,
     /// Absolute reset time as an ISO-8601 string.
     #[serde(default)]
@@ -74,7 +75,7 @@ pub struct ClaudeLimit {
     #[serde(default)]
     pub scope: Option<ClaudeScope>,
     /// Whether this limit is the currently active/binding one.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_bool_or_false")]
     pub is_active: bool,
 }
 
@@ -167,6 +168,13 @@ pub struct ClaudeOauth {
     /// OAuth scopes, carried back into the refresh request.
     #[serde(default)]
     pub scopes: Vec<String>,
+    /// Rate-limit tier (e.g. "default_claude_max_20x"), preferred for the Plan
+    /// line because it distinguishes 5x / 20x where `subscription_type` does not.
+    #[serde(rename = "rateLimitTier", default)]
+    pub rate_limit_tier: Option<String>,
+    /// Subscription tier (e.g. "max" / "pro"); Plan-line fallback.
+    #[serde(rename = "subscriptionType", default)]
+    pub subscription_type: Option<String>,
 }
 
 impl fmt::Debug for ClaudeOauth {
@@ -176,6 +184,8 @@ impl fmt::Debug for ClaudeOauth {
             .field("refresh_token", &redact(&self.refresh_token))
             .field("expires_at", &self.expires_at)
             .field("scopes", &self.scopes)
+            .field("rate_limit_tier", &self.rate_limit_tier)
+            .field("subscription_type", &self.subscription_type)
             .finish()
     }
 }
@@ -216,6 +226,9 @@ pub struct ClaudeQuotaSnapshot {
     pub source: QuotaSource,
     /// Unix seconds when this snapshot was produced.
     pub fetched_at: i64,
+    /// Plan tier from the credentials file (e.g. "max 20x"), shown as Plan.
+    #[serde(default)]
+    pub plan_type: Option<String>,
     /// 5-hour window.
     pub five_hour: Option<QuotaWindow>,
     /// Weekly window (all models).
@@ -341,6 +354,48 @@ where
         Some(Value::String(s)) => Some(s),
         Some(Value::Number(n)) => Some(n.to_string()),
         _ => None,
+    })
+}
+
+/// Deserializes a JSON number into `f64`, mapping null / wrong-type to 0.0.
+///
+/// The usage windows are volatile (a scoped tier can appear or vanish); a stray
+/// `null` percent must not fail the whole response, only read as 0.
+fn de_f64_or_zero<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match Option::<Value>::deserialize(deserializer)? {
+        Some(Value::Number(n)) => n.as_f64().unwrap_or(0.0),
+        _ => 0.0,
+    })
+}
+
+/// Deserializes a JSON bool, mapping null / wrong-type to false.
+fn de_bool_or_false<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(matches!(
+        Option::<Value>::deserialize(deserializer)?,
+        Some(Value::Bool(true))
+    ))
+}
+
+/// Deserializes the `limits` array leniently: an element that fails to parse (a
+/// volatile / malformed limit entry) is skipped rather than failing the whole
+/// response, and a non-array value yields an empty list. This keeps a broken
+/// per-model scoped entry from taking down the 5h / 7d / balance rows.
+fn de_lenient_limits<'de, D>(deserializer: D) -> Result<Vec<ClaudeLimit>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match Value::deserialize(deserializer)? {
+        Value::Array(arr) => arr
+            .into_iter()
+            .filter_map(|e| serde_json::from_value(e).ok())
+            .collect(),
+        _ => Vec::new(),
     })
 }
 
@@ -548,6 +603,8 @@ mod tests {
             refresh_token: Some("claude-refresh-secret".into()),
             expires_at: Some(1783108188604),
             scopes: vec!["user:inference".into()],
+            rate_limit_tier: Some("default_claude_max_20x".into()),
+            subscription_type: Some("max".into()),
         };
         let s = format!("{oauth:?}");
         assert!(!s.contains("claude-access-secret"));
