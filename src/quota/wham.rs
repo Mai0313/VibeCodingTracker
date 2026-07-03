@@ -46,7 +46,7 @@ pub fn map_wham_response(body: &str, now: i64) -> Result<CodexQuotaSnapshot> {
     let resp: WhamUsageResponse =
         serde_json::from_str(body).context("Failed to parse wham/usage response")?;
 
-    let (primary, secondary, limit_reached) = match &resp.rate_limit {
+    let (primary, secondary, rate_reached) = match &resp.rate_limit {
         Some(rl) => (
             rl.primary_window.as_ref().map(|w| map_window(w, now)),
             rl.secondary_window.as_ref().map(|w| map_window(w, now)),
@@ -55,10 +55,29 @@ pub fn map_wham_response(body: &str, now: i64) -> Result<CodexQuotaSnapshot> {
         None => (None, None, None),
     };
 
-    let (credits_balance, has_credits, unlimited) = match &resp.credits {
-        Some(c) => (c.balance.clone(), c.has_credits, c.unlimited),
-        None => (None, None, None),
+    let (credits_balance, has_credits, unlimited, overage, approx_messages) = match &resp.credits {
+        Some(c) => (
+            c.balance.clone(),
+            c.has_credits,
+            c.unlimited,
+            c.overage_limit_reached,
+            approx_pair(&c.approx_local_messages),
+        ),
+        None => (None, None, None, None, None),
     };
+
+    let (spend_reached, spend_limit) = match &resp.spend_control {
+        Some(s) => (s.reached, s.individual_limit),
+        None => (None, None),
+    };
+
+    // A limit is "reached" if the rate window, the credit overage, or the spend
+    // cap says so. Stay `None` only when no source reports at all.
+    let reached = [rate_reached, overage, spend_reached];
+    let limit_reached = reached
+        .iter()
+        .any(Option::is_some)
+        .then(|| reached.contains(&Some(true)));
 
     Ok(CodexQuotaSnapshot {
         source: QuotaSource::Api,
@@ -72,9 +91,20 @@ pub fn map_wham_response(body: &str, now: i64) -> Result<CodexQuotaSnapshot> {
         reset_credits_available: resp
             .rate_limit_reset_credits
             .and_then(|r| r.available_count),
+        approx_messages,
+        spend_limit,
         limit_reached,
         needs_login: false,
     })
+}
+
+/// Extracts an `[low, high]` approximate-messages pair, dropping the all-zero
+/// case (no credits → nothing useful to show).
+fn approx_pair(v: &Option<Vec<i64>>) -> Option<(i64, i64)> {
+    let v = v.as_ref()?;
+    let low = *v.first()?;
+    let high = *v.get(1).unwrap_or(&low);
+    (high > 0).then_some((low, high))
 }
 
 /// Parses `~/.codex/auth.json`, returning `(access_token, account_id)` (pure).
@@ -271,5 +301,44 @@ mod tests {
     fn parse_auth_errors_without_token() {
         assert!(parse_auth(r#"{"tokens":{"account_id":"acct"}}"#).is_err());
         assert!(parse_auth(r#"{}"#).is_err());
+    }
+
+    #[test]
+    fn maps_spend_control_and_approx_messages() {
+        let body = r#"{
+          "plan_type": "plus",
+          "credits": { "balance": "12", "has_credits": true, "overage_limit_reached": false,
+                       "approx_local_messages": [120, 150], "approx_cloud_messages": [0, 0] },
+          "spend_control": { "reached": false, "individual_limit": 50.0 }
+        }"#;
+        let snap = map_wham_response(body, 1_000).unwrap();
+        assert_eq!(snap.approx_messages, Some((120, 150)));
+        assert_eq!(snap.spend_limit, Some(50.0));
+        assert_eq!(snap.limit_reached, Some(false));
+    }
+
+    #[test]
+    fn overage_or_spend_trips_limit_reached() {
+        let body = r#"{
+          "rate_limit": { "limit_reached": false, "primary_window": { "used_percent": 10 } },
+          "credits": { "overage_limit_reached": true },
+          "spend_control": { "reached": false }
+        }"#;
+        let snap = map_wham_response(body, 1).unwrap();
+        assert_eq!(snap.limit_reached, Some(true));
+    }
+
+    #[test]
+    fn zero_approx_messages_are_dropped() {
+        let body = r#"{ "credits": { "approx_local_messages": [0, 0] } }"#;
+        let snap = map_wham_response(body, 1).unwrap();
+        assert!(snap.approx_messages.is_none());
+    }
+
+    #[test]
+    fn limit_reached_is_none_when_unreported() {
+        // No rate_limit / credits / spend_control at all → stays None.
+        let snap = map_wham_response(r#"{"plan_type":"plus"}"#, 1).unwrap();
+        assert_eq!(snap.limit_reached, None);
     }
 }

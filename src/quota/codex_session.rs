@@ -198,6 +198,8 @@ pub fn extract_latest_rate_limits(values: &[Value], now: i64) -> Option<CodexQuo
             has_credits: None,
             unlimited: None,
             reset_credits_available: None,
+            approx_messages: None,
+            spend_limit: None,
             limit_reached: None,
             needs_login: false,
         });

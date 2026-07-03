@@ -27,6 +27,8 @@ use std::time::SystemTime;
 
 /// The Claude OAuth usage endpoint.
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+/// OAuth beta header that unlocks the richer usage response (`limits` / `spend`).
+const CLAUDE_OAUTH_BETA: &str = "oauth-2025-04-20";
 /// The Claude Code OAuth client id (public PKCE client).
 const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 /// Current token endpoint host.
@@ -56,6 +58,23 @@ fn read_claude_oauth(path: &Path) -> Option<ClaudeOauth> {
     creds.claude_ai_oauth
 }
 
+/// Reads the plan tier for the Plan line: prefer `rateLimitTier` (it
+/// distinguishes 5x / 20x), fall back to `subscriptionType`, prettified. Returns
+/// `None` when neither is set, so the Plan line is simply omitted.
+fn read_claude_plan(path: &Path) -> Option<String> {
+    let oauth = read_claude_oauth(path)?;
+    let raw = oauth.rate_limit_tier.or(oauth.subscription_type)?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| prettify_tier(trimmed))
+}
+
+/// Cleans a raw tier string for display, e.g. `default_claude_max_20x` -> `max 20x`.
+fn prettify_tier(raw: &str) -> String {
+    raw.trim_start_matches("default_")
+        .trim_start_matches("claude_")
+        .replace('_', " ")
+}
+
 /// Maps a `/api/oauth/usage` body into a [`ClaudeQuotaSnapshot`] (pure).
 ///
 /// # Errors
@@ -68,11 +87,69 @@ pub fn map_claude_usage(body: &str, now: i64) -> Result<ClaudeQuotaSnapshot> {
         used_percent: w.utilization,
         resets_at_unix: w.resets_at.as_deref().and_then(iso_to_unix_secs),
     };
+
+    // The per-model weekly cap (`weekly_scoped`): prefer the active one, else the
+    // highest-percent scoped entry. This scope is volatile on Anthropic's side
+    // (e.g. Fable is subscription-only and time-limited), so it is best-effort:
+    // when it is absent — or present without a usable model label — the whole row
+    // is simply omitted, never an error.
+    let scoped = resp
+        .limits
+        .iter()
+        .filter(|l| l.kind.as_deref() == Some("weekly_scoped"))
+        .max_by(|a, b| {
+            a.is_active.cmp(&b.is_active).then(
+                a.percent
+                    .partial_cmp(&b.percent)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+        });
+    let scoped_label = scoped
+        .and_then(|l| l.scope.as_ref())
+        .and_then(|s| s.model.as_ref())
+        .and_then(|m| m.display_name.as_deref())
+        .filter(|name| !name.is_empty())
+        .map(|name| name.chars().take(6).collect::<String>());
+    // Only surface the window when we also have a model label to name it.
+    let scoped_weekly = scoped
+        .filter(|_| scoped_label.is_some())
+        .map(|l| QuotaWindow {
+            used_percent: l.percent,
+            resets_at_unix: l.resets_at.as_deref().and_then(iso_to_unix_secs),
+        });
+
+    let (balance, spend_used) = match &resp.spend {
+        Some(sp) => (
+            sp.balance.as_ref().map(|m| m.as_display()),
+            sp.used.as_ref().map(|m| m.as_display()),
+        ),
+        None => (None, None),
+    };
+
+    // A cap is hit when any window is at/over 100% or a limit's severity says so.
+    let severity_reached =
+        |s: &Option<String>| matches!(s.as_deref(), Some("reached" | "exceeded" | "blocked"));
+    let limit_reached = [resp.five_hour.as_ref(), resp.seven_day.as_ref()]
+        .into_iter()
+        .flatten()
+        .any(|w| w.utilization >= 100.0)
+        || resp
+            .limits
+            .iter()
+            .any(|l| l.percent >= 100.0 || severity_reached(&l.severity));
+
     Ok(ClaudeQuotaSnapshot {
         source: QuotaSource::Api,
         fetched_at: now,
+        // Set by the worker from the credentials file, not the usage body.
+        plan_type: None,
         five_hour: resp.five_hour.as_ref().map(win),
         seven_day: resp.seven_day.as_ref().map(win),
+        scoped_weekly,
+        scoped_label,
+        balance,
+        spend_used,
+        limit_reached,
         needs_login: false,
     })
 }
@@ -88,7 +165,12 @@ enum FetchResult {
 
 /// Calls the usage API with `token`.
 fn fetch_claude_usage(client: &Client, token: &str, now: i64) -> FetchResult {
-    let resp = match client.get(CLAUDE_USAGE_URL).bearer_auth(token).send() {
+    let resp = match client
+        .get(CLAUDE_USAGE_URL)
+        .header("anthropic-beta", CLAUDE_OAUTH_BETA)
+        .bearer_auth(token)
+        .send()
+    {
         Ok(r) => r,
         Err(_) => return FetchResult::Transient,
     };
@@ -245,8 +327,9 @@ impl ClaudeState {
         };
 
         match fetch_claude_usage(client, &token, now_secs) {
-            FetchResult::Ok(snap) => {
+            FetchResult::Ok(mut snap) => {
                 self.cooldown.clear();
+                snap.plan_type = read_claude_plan(&path);
                 QuotaOutcome::Data(snap)
             }
             FetchResult::Unauthorized => {
@@ -257,8 +340,9 @@ impl ClaudeState {
                 }
                 match self.force_refresh(client, &path) {
                     Some(t) => match fetch_claude_usage(client, &t, now_secs) {
-                        FetchResult::Ok(snap) => {
+                        FetchResult::Ok(mut snap) => {
                             self.cooldown.clear();
+                            snap.plan_type = read_claude_plan(&path);
                             QuotaOutcome::Data(snap)
                         }
                         // A transient retry error keeps the freshly refreshed
@@ -383,5 +467,158 @@ mod tests {
         let snap = map_claude_usage("{}", 5).unwrap();
         assert!(snap.five_hour.is_none());
         assert!(snap.seven_day.is_none());
+        assert!(snap.scoped_weekly.is_none());
+        assert!(snap.balance.is_none());
+        assert!(!snap.limit_reached);
+    }
+
+    // The richer body returned once the `anthropic-beta` header is sent.
+    const FULL: &str = r#"{
+      "five_hour": { "utilization": 15.0, "resets_at": "2026-07-03T22:09:59.594819+00:00" },
+      "seven_day": { "utilization": 40.0, "resets_at": "2026-07-09T10:59:59.594840+00:00" },
+      "limits": [
+        { "kind": "session", "group": "session", "percent": 15, "severity": "normal", "is_active": false },
+        { "kind": "weekly_all", "group": "weekly", "percent": 40, "severity": "normal", "is_active": false },
+        { "kind": "weekly_scoped", "group": "weekly", "percent": 60, "severity": "normal",
+          "resets_at": "2026-07-09T10:59:59.595109+00:00",
+          "scope": { "model": { "id": null, "display_name": "Fable" } }, "is_active": true }
+      ],
+      "spend": {
+        "used": { "amount_minor": 0, "currency": "USD", "exponent": 2 },
+        "limit": null, "enabled": false, "balance": null
+      }
+    }"#;
+
+    #[test]
+    fn maps_scoped_weekly_and_spend() {
+        let snap = map_claude_usage(FULL, 1_000_000).unwrap();
+        // 5h / 7d still come from the top-level windows.
+        assert_eq!(snap.five_hour.as_ref().unwrap().used_percent, 15.0);
+        assert_eq!(snap.seven_day.as_ref().unwrap().used_percent, 40.0);
+        // The per-model weekly cap comes from the active weekly_scoped limit.
+        let scoped = snap.scoped_weekly.as_ref().unwrap();
+        assert_eq!(scoped.used_percent, 60.0);
+        assert!(scoped.resets_at_unix.unwrap() > 0);
+        assert_eq!(snap.scoped_label.as_deref(), Some("Fable"));
+        // Spend disabled: no balance, but the used amount is formatted.
+        assert!(snap.balance.is_none());
+        assert_eq!(snap.spend_used.as_deref(), Some("$0.00"));
+        assert!(!snap.limit_reached);
+    }
+
+    #[test]
+    fn flags_limit_and_balance() {
+        let body = r#"{
+          "five_hour": { "utilization": 100.0 },
+          "limits": [ { "kind": "weekly_scoped", "percent": 30, "severity": "normal",
+                        "scope": { "model": { "display_name": "Opus" } }, "is_active": true } ],
+          "spend": { "balance": { "amount_minor": 500, "currency": "USD", "exponent": 2 }, "enabled": true }
+        }"#;
+        let snap = map_claude_usage(body, 1).unwrap();
+        assert!(snap.limit_reached, "5h at 100% trips the LIMIT flag");
+        assert_eq!(snap.balance.as_deref(), Some("$5.00"));
+        assert_eq!(snap.scoped_label.as_deref(), Some("Opus"));
+    }
+
+    #[test]
+    fn scoped_hidden_without_model_label() {
+        // A weekly_scoped entry with no model name must not render a row (and
+        // must not error): we never assume the scoped window is present.
+        let body = r#"{
+          "limits": [ { "kind": "weekly_scoped", "percent": 55, "is_active": true } ]
+        }"#;
+        let snap = map_claude_usage(body, 1).unwrap();
+        assert!(snap.scoped_weekly.is_none());
+        assert!(snap.scoped_label.is_none());
+    }
+
+    #[test]
+    fn no_scoped_limit_is_silent() {
+        // Fable retired / not returned: 5h and 7d still map, scoped stays empty,
+        // and mapping succeeds without an error.
+        let body = r#"{
+          "five_hour": { "utilization": 10.0 },
+          "seven_day": { "utilization": 20.0 },
+          "limits": [ { "kind": "session", "percent": 10 }, { "kind": "weekly_all", "percent": 20 } ]
+        }"#;
+        let snap = map_claude_usage(body, 1).unwrap();
+        assert!(snap.scoped_weekly.is_none());
+        assert!(snap.scoped_label.is_none());
+        assert!(snap.five_hour.is_some());
+        assert!(snap.seven_day.is_some());
+    }
+
+    #[test]
+    fn scoped_prefers_active_over_higher_percent() {
+        // Two scoped entries: the active one wins even at a lower percent.
+        let body = r#"{
+          "limits": [
+            { "kind": "weekly_scoped", "percent": 90, "scope": { "model": { "display_name": "Haiku" } }, "is_active": false },
+            { "kind": "weekly_scoped", "percent": 20, "scope": { "model": { "display_name": "Opus" } }, "is_active": true }
+          ]
+        }"#;
+        let snap = map_claude_usage(body, 1).unwrap();
+        assert_eq!(snap.scoped_label.as_deref(), Some("Opus"));
+        assert_eq!(snap.scoped_weekly.unwrap().used_percent, 20.0);
+    }
+
+    #[test]
+    fn prettifies_tier() {
+        assert_eq!(prettify_tier("default_claude_max_20x"), "max 20x");
+        assert_eq!(prettify_tier("default_claude_pro"), "pro");
+        assert_eq!(prettify_tier("max"), "max");
+    }
+
+    #[test]
+    fn reads_plan_prefers_rate_limit_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(".credentials.json");
+        std::fs::write(
+            &p,
+            r#"{"claudeAiOauth":{"accessToken":"x","rateLimitTier":"default_claude_max_20x","subscriptionType":"max"}}"#,
+        )
+        .unwrap();
+        assert_eq!(read_claude_plan(&p).as_deref(), Some("max 20x"));
+        // Falls back to subscriptionType when rateLimitTier is absent.
+        std::fs::write(
+            &p,
+            r#"{"claudeAiOauth":{"accessToken":"x","subscriptionType":"pro"}}"#,
+        )
+        .unwrap();
+        assert_eq!(read_claude_plan(&p).as_deref(), Some("pro"));
+        // Neither present -> None (Plan line omitted), no error.
+        std::fs::write(&p, r#"{"claudeAiOauth":{"accessToken":"x"}}"#).unwrap();
+        assert_eq!(read_claude_plan(&p), None);
+    }
+
+    #[test]
+    fn malformed_scoped_never_breaks_the_body() {
+        // A weekly_scoped with null percent plus a null 5h utilization: the body
+        // must still map (scoped dropped, 5h reads 0), never Err.
+        let body = r#"{
+          "five_hour": { "utilization": null, "resets_at": "2026-07-03T22:00:00+00:00" },
+          "seven_day": { "utilization": 40.0 },
+          "limits": [
+            { "kind": "session", "percent": 15 },
+            { "kind": "weekly_scoped", "percent": null, "scope": { "model": { "display_name": "Fable" } } }
+          ]
+        }"#;
+        let snap = map_claude_usage(body, 1).unwrap();
+        assert!(snap.five_hour.is_some());
+        assert_eq!(snap.five_hour.as_ref().unwrap().used_percent, 0.0);
+        assert_eq!(snap.seven_day.as_ref().unwrap().used_percent, 40.0);
+        assert!(
+            snap.scoped_weekly.is_none(),
+            "null-percent scoped entry is dropped, not fatal"
+        );
+    }
+
+    #[test]
+    fn limits_non_array_is_tolerated() {
+        // limits arriving as null / non-array must not fail the body.
+        let snap =
+            map_claude_usage(r#"{"five_hour":{"utilization":5.0},"limits":null}"#, 1).unwrap();
+        assert!(snap.five_hour.is_some());
+        assert!(snap.scoped_weekly.is_none());
     }
 }
