@@ -261,10 +261,13 @@ impl ClaudeState {
                             self.cooldown.clear();
                             QuotaOutcome::Data(snap)
                         }
+                        // A transient retry error keeps the freshly refreshed
+                        // token + last-known-good data; do not nag to re-login.
+                        FetchResult::Transient => QuotaOutcome::Transient,
                         // Arm with the CURRENT mtime (re-read): a successful
-                        // refresh just rewrote the file, so `mtime` is stale and
-                        // arming with it would never suppress the next tick.
-                        _ => {
+                        // refresh just rewrote the file, so a stale mtime would
+                        // never suppress the next tick.
+                        FetchResult::Unauthorized => {
                             self.cooldown.arm(now_secs, file_mtime(&path));
                             self.token = None;
                             QuotaOutcome::NeedsLogin
