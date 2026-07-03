@@ -255,7 +255,7 @@ impl ClaudeState {
                     self.token = None;
                     return QuotaOutcome::NeedsLogin;
                 }
-                match self.force_refresh(client, &path, mtime) {
+                match self.force_refresh(client, &path) {
                     Some(t) => match fetch_claude_usage(client, &t, now_secs) {
                         FetchResult::Ok(snap) => {
                             self.cooldown.clear();
@@ -313,7 +313,7 @@ impl ClaudeState {
             if self.cooldown.active(now_secs, mtime) {
                 return EnsureToken::NeedsLogin;
             }
-            match self.force_refresh(client, path, mtime) {
+            match self.force_refresh(client, path) {
                 Some(t) => EnsureToken::Token(t),
                 None => {
                     // Re-read: a partial write could have changed the mtime.
@@ -332,16 +332,16 @@ impl ClaudeState {
         }
     }
 
-    /// Re-reads the file for the freshest refresh token and refreshes once.
-    fn force_refresh(
-        &mut self,
-        client: &Client,
-        path: &Path,
-        mtime: Option<SystemTime>,
-    ) -> Option<String> {
+    /// Reads the refresh token and refreshes once.
+    ///
+    /// Captures the credential mtime together with the refresh token (same read)
+    /// so the write-back guards on the exact file version we send — otherwise we
+    /// could consume a refresh token the CLI just wrote and then abort its write.
+    fn force_refresh(&mut self, client: &Client, path: &Path) -> Option<String> {
+        let expected_mtime = file_mtime(path);
         let oauth = read_claude_oauth(path)?;
         let refresh_token = oauth.refresh_token.filter(|s| !s.is_empty())?;
-        match refresh_claude(client, path, &refresh_token, &oauth.scopes, mtime) {
+        match refresh_claude(client, path, &refresh_token, &oauth.scopes, expected_mtime) {
             Ok((access, expires_ms)) => {
                 self.cooldown.clear();
                 self.token = Some((access.clone(), expires_ms, file_mtime(path)));
