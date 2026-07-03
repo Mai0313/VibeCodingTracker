@@ -12,11 +12,12 @@ use crate::models::{
     WhamUsageResponse, WhamWindow,
 };
 use crate::quota::http::CODEX_UA;
-use crate::quota::refresh::{now_rfc3339_utc_nanos, send_refresh, update_json_file_in_place};
+use crate::quota::refresh::{
+    file_mtime, now_rfc3339_utc_nanos, send_refresh, update_json_file_in_place,
+};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::path::Path;
-use std::time::SystemTime;
 
 /// The ChatGPT backend usage endpoint.
 const WHAM_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
@@ -146,11 +147,10 @@ pub fn call_wham(
 ///
 /// Returns an error if the auth file has no refresh token, the request fails, or
 /// the status is non-success. The token never appears in an error.
-pub fn refresh_codex(
-    client: &reqwest::blocking::Client,
-    auth_path: &Path,
-    expected_mtime: Option<SystemTime>,
-) -> Result<String> {
+pub fn refresh_codex(client: &reqwest::blocking::Client, auth_path: &Path) -> Result<String> {
+    // Capture the mtime with the refresh token from the same read so the
+    // write-back guards on the exact file version we send.
+    let expected_mtime = file_mtime(auth_path);
     let body = std::fs::read_to_string(auth_path)
         .with_context(|| format!("Failed to read {}", auth_path.display()))?;
     let root: Value = serde_json::from_str(&body).context("Failed to parse auth.json")?;

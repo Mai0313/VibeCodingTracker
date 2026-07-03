@@ -118,7 +118,7 @@ impl CodexState {
                     self.token = None;
                     return CodexFetch::NeedsLogin;
                 }
-                match wham::refresh_codex(client, auth, cur_mtime) {
+                match wham::refresh_codex(client, auth) {
                     Ok(new_tok) => {
                         self.cooldown.clear();
                         // The successful refresh just rewrote auth.json; key the
