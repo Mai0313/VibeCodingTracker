@@ -168,8 +168,8 @@ pub fn get_pricing_cache_path(date: &str) -> Result<PathBuf> {
     Ok(cache_dir.join(format!("model_pricing_{}.json", date)))
 }
 
-/// Returns the Claude rate-limits cache path
-/// (`~/.vibe_coding_tracker/claude_rate_limits.json`).
+/// Returns the Claude usage cache path
+/// (`~/.vibe_coding_tracker/claude_usage.json`).
 ///
 /// As a side effect of resolving the cache directory, the directory is
 /// created if missing.
@@ -177,8 +177,8 @@ pub fn get_pricing_cache_path(date: &str) -> Result<PathBuf> {
 /// # Errors
 ///
 /// Returns an error if the cache directory cannot be resolved or created.
-pub fn get_claude_rate_limits_path() -> Result<PathBuf> {
-    Ok(get_cache_dir()?.join("claude_rate_limits.json"))
+pub fn get_claude_usage_cache_path() -> Result<PathBuf> {
+    Ok(get_cache_dir()?.join("claude_usage.json"))
 }
 
 /// Returns the Codex usage cache path
@@ -192,6 +192,15 @@ pub fn get_claude_rate_limits_path() -> Result<PathBuf> {
 /// Returns an error if the cache directory cannot be resolved or created.
 pub fn get_codex_usage_cache_path() -> Result<PathBuf> {
     Ok(get_cache_dir()?.join("codex_usage.json"))
+}
+
+/// Returns the Claude OAuth credentials path (`~/.claude/.credentials.json`).
+///
+/// # Errors
+///
+/// Returns an error if the user's home directory cannot be determined.
+pub fn get_claude_credentials_path() -> Result<PathBuf> {
+    Ok(resolve_paths()?.claude_dir.join(".credentials.json"))
 }
 
 /// Returns the pricing cache path for `date` only if that file exists.

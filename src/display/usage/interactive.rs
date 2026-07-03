@@ -19,12 +19,17 @@ use crate::display::usage::averages::{
     UsageProviderTotals, UsageRow, UsageTotals, build_provider_total_rows, build_usage_summary,
 };
 use crate::models::{
-    ClaudeRateLimitsCache, CodexQuotaSnapshot, PerProviderUsage, ProviderActiveDays, QuotaSource,
+    ClaudeQuotaSnapshot, CodexQuotaSnapshot, PerProviderUsage, ProviderActiveDays, QuotaSource,
     QuotaWindow, UsageResult,
 };
 use crate::pricing::{ModelPricingMap, fetch_model_pricing};
-use crate::quota::{load_claude_rate_limits, load_codex_cache, spawn_codex_quota_worker};
-use crate::utils::{format_compact, format_cost, format_duration_until};
+use crate::quota::{
+    CLAUDE_LOGIN_HINT, CODEX_LOGIN_HINT, ClaudeState, CodexState, load_claude_cache,
+    load_codex_cache, save_claude_cache, save_codex_cache, spawn_quota_worker,
+};
+use crate::utils::{
+    format_compact, format_cost, format_duration_until, get_claude_credentials_path, resolve_paths,
+};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -46,6 +51,38 @@ const QUOTA_PANEL_MIN_HEIGHT: u16 = 7;
 const CLAUDE_COLOR: RatatuiColor = RatatuiColor::Rgb(190, 116, 87);
 /// Codex brand color for the quota panel border.
 const CODEX_COLOR: RatatuiColor = RatatuiColor::Rgb(118, 127, 198);
+
+/// Which provider quota panels have credentials on this machine.
+#[derive(Clone, Copy, Default)]
+struct QuotaPresence {
+    claude: bool,
+    codex: bool,
+}
+
+impl QuotaPresence {
+    /// Detects presence from each provider's credential file (once at launch).
+    fn detect() -> Self {
+        let claude = get_claude_credentials_path()
+            .map(|p| p.exists())
+            .unwrap_or(false);
+        let codex = resolve_paths()
+            .map(|p| p.codex_dir.join("auth.json").exists() || p.codex_session_dir.exists())
+            .unwrap_or(false);
+        Self { claude, codex }
+    }
+
+    /// Number of provider columns in the band (Claude + Codex).
+    fn count(&self) -> usize {
+        self.claude as usize + self.codex as usize
+    }
+}
+
+/// Borrowed quota state passed to the render frame.
+struct QuotaView<'a> {
+    claude: &'a ClaudeQuotaSnapshot,
+    codex: &'a CodexQuotaSnapshot,
+    present: QuotaPresence,
+}
 
 /// How often the loop re-aggregates the session directories and repaints.
 const USAGE_REFRESH_SECS: u64 = 10;
@@ -89,13 +126,69 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
     let mut terminal = setup_terminal()?;
     let mut refresh_state = RefreshState::new(USAGE_REFRESH_SECS);
 
-    // Codex quota is fetched on a background thread so the blocking HTTP call
-    // never stalls the render loop. The panel is seeded from the last-known
-    // cache so it shows immediately on launch.
-    let codex_shared = Arc::new(Mutex::new(load_codex_cache().unwrap_or_default()));
-    let codex_shutdown = Arc::new(AtomicBool::new(false));
-    let _codex_worker =
-        spawn_codex_quota_worker(Arc::clone(&codex_shared), Arc::clone(&codex_shutdown));
+    // Each provider's quota is fetched on its own background thread so a
+    // blocking (or slow) HTTP call never stalls the render loop or the other
+    // providers. Panels are seeded from the last-known cache so they show
+    // immediately on launch, and a worker is spawned only for a provider whose
+    // credentials are present. All workers share one HTTP client and shutdown
+    // flag.
+    let present = QuotaPresence::detect();
+    let quota_shutdown = Arc::new(AtomicBool::new(false));
+    let claude_shared = Arc::new(Mutex::new(
+        present
+            .claude
+            .then(load_claude_cache)
+            .flatten()
+            .unwrap_or_default(),
+    ));
+    let codex_shared = Arc::new(Mutex::new(
+        present
+            .codex
+            .then(load_codex_cache)
+            .flatten()
+            .unwrap_or_default(),
+    ));
+    if present.claude || present.codex {
+        match crate::quota::http::build_client() {
+            Ok(client) => {
+                if present.claude {
+                    let (c, sh, shared) = (
+                        client.clone(),
+                        Arc::clone(&quota_shutdown),
+                        Arc::clone(&claude_shared),
+                    );
+                    let mut state = ClaudeState::default();
+                    spawn_quota_worker(
+                        "claude",
+                        shared,
+                        sh,
+                        move || state.resolve(&c),
+                        |s| {
+                            let _ = save_claude_cache(s);
+                        },
+                    );
+                }
+                if present.codex {
+                    let (c, sh, shared) = (
+                        client.clone(),
+                        Arc::clone(&quota_shutdown),
+                        Arc::clone(&codex_shared),
+                    );
+                    let mut state = CodexState::default();
+                    spawn_quota_worker(
+                        "codex",
+                        shared,
+                        sh,
+                        move || state.resolve(&c),
+                        |s| {
+                            let _ = save_codex_cache(s);
+                        },
+                    );
+                }
+            }
+            Err(e) => log::warn!("quota workers disabled: failed to build HTTP client: {e}"),
+        }
+    }
 
     let pid =
         sysinfo::get_current_pid().expect("Failed to get current process ID for memory monitoring");
@@ -140,8 +233,8 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
     let mut totals = UsageTotals::default();
     let mut provider_totals = UsageProviderTotals::default();
     // Quota panel state, cached across frames so a resize repaints without
-    // re-reading the cache / shared snapshot.
-    let mut claude_rl: Option<ClaudeRateLimitsCache> = None;
+    // re-reading the shared snapshots.
+    let mut claude_snapshot = ClaudeQuotaSnapshot::default();
     let mut codex_snapshot = CodexQuotaSnapshot::default();
 
     loop {
@@ -220,9 +313,8 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
             let model_names: Vec<String> = rows_data.iter().map(|row| row.model.clone()).collect();
             scroll.sync(prev_model.as_deref(), &model_names);
 
-            // Refresh quota panels: Claude from the tiny local ingest cache,
-            // Codex from the background worker's latest snapshot.
-            claude_rl = load_claude_rate_limits();
+            // Refresh quota panels from each background worker's latest snapshot.
+            claude_snapshot = claude_shared.lock().map(|g| g.clone()).unwrap_or_default();
             codex_snapshot = codex_shared.lock().map(|g| g.clone()).unwrap_or_default();
 
             // Clear raw usage data immediately after processing to free memory.
@@ -267,8 +359,11 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
                 &update_tracker,
                 &sys,
                 pid,
-                claude_rl.as_ref(),
-                &codex_snapshot,
+                &QuotaView {
+                    claude: &claude_snapshot,
+                    codex: &codex_snapshot,
+                    present,
+                },
                 &mut scroll,
             )?;
 
@@ -283,8 +378,8 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
         let action = handle_input()?;
         match action {
             InputAction::Quit => {
-                // Signal the detached worker to stop; the OS reclaims it on exit.
-                codex_shutdown.store(true, Ordering::Relaxed);
+                // Signal the detached workers to stop; the OS reclaims them on exit.
+                quota_shutdown.store(true, Ordering::Relaxed);
                 break;
             }
             InputAction::Refresh => refresh_state.force(),
@@ -300,8 +395,11 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
                     &update_tracker,
                     &sys,
                     pid,
-                    claude_rl.as_ref(),
-                    &codex_snapshot,
+                    &QuotaView {
+                        claude: &claude_snapshot,
+                        codex: &codex_snapshot,
+                        present,
+                    },
                     &mut scroll,
                 )?;
             }
@@ -316,8 +414,11 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
                 &update_tracker,
                 &sys,
                 pid,
-                claude_rl.as_ref(),
-                &codex_snapshot,
+                &QuotaView {
+                    claude: &claude_snapshot,
+                    codex: &codex_snapshot,
+                    present,
+                },
                 &mut scroll,
             )?,
             InputAction::Continue => {}
@@ -347,8 +448,7 @@ fn render_usage_frame(
     update_tracker: &UpdateTracker,
     sys: &System,
     pid: Pid,
-    claude_rl: Option<&ClaudeRateLimitsCache>,
-    codex: &CodexQuotaSnapshot,
+    quota: &QuotaView,
     scroll: &mut ScrollState,
 ) -> anyhow::Result<()> {
     let provider_rows = build_provider_total_rows(provider_totals);
@@ -473,20 +573,22 @@ fn render_usage_frame(
                 RatatuiColor::Magenta,
             );
 
-            // Split the band into provider stats (left) + Claude / Codex quota
-            // panels (right).
+            // Split the band into provider stats (left) + the present
+            // Claude / Codex quota panels.
             let now = chrono::Local::now().timestamp();
-            let bottom = RatatuiLayout::default()
+            let band = RatatuiLayout::default()
                 .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Percentage(46),
-                    Constraint::Percentage(27),
-                    Constraint::Percentage(27),
-                ])
+                .constraints(band_constraints(quota.present.count()))
                 .split(panel_area);
-            f.render_widget(totals_table, bottom[0]);
-            render_claude_quota(f, bottom[1], claude_rl, now);
-            render_codex_quota(f, bottom[2], codex, now);
+            f.render_widget(totals_table, band[0]);
+            let mut idx = 1;
+            if quota.present.claude {
+                render_claude_quota(f, band[idx], quota.claude, now);
+                idx += 1;
+            }
+            if quota.present.codex {
+                render_codex_quota(f, band[idx], quota.codex, now);
+            }
         }
 
         let total_cost_str = format_cost(totals.cost);
@@ -547,11 +649,10 @@ fn quota_gauge_line(label: &str, w: &QuotaWindow, now: i64) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Builds the "updated Xm ago" staleness line for the Claude panel.
+/// Builds the "updated Xm ago" staleness line, from the last successful fetch.
 ///
-/// The Claude cache only refreshes when Claude Code repaints its statusLine, so
-/// staleness is expected; it is dimmed, escalating to yellow past 1h and red
-/// past 6h.
+/// Dimmed by default, escalating to yellow past 1h and red past 6h so a panel
+/// stuck on stale data (e.g. persistent auth failure) reads as such.
 fn staleness_line(fetched_at: i64, now: i64) -> Line<'static> {
     if fetched_at <= 0 {
         return dim_line("updated: never");
@@ -581,33 +682,53 @@ fn dim_line(text: &str) -> Line<'static> {
     ))
 }
 
-/// Renders the Claude quota panel (5h / 7d gauges + staleness).
-fn render_claude_quota(f: &mut Frame, area: Rect, rl: Option<&ClaudeRateLimitsCache>, now: i64) {
+/// A red login-hint line shown when a provider's token needs a re-login.
+fn login_hint_line(hint: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        hint.to_string(),
+        Style::default()
+            .fg(RatatuiColor::Red)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+/// Horizontal constraints for the top band: stats + one column per present
+/// Claude / Codex panel (`top_n` is 0..2).
+fn band_constraints(top_n: usize) -> Vec<Constraint> {
+    match top_n {
+        0 => vec![Constraint::Percentage(100)],
+        1 => vec![Constraint::Percentage(58), Constraint::Percentage(42)],
+        _ => vec![
+            Constraint::Percentage(46),
+            Constraint::Percentage(27),
+            Constraint::Percentage(27),
+        ],
+    }
+}
+
+/// Renders the Claude quota panel (5h / 7d gauges + staleness + login hint).
+fn render_claude_quota(f: &mut Frame, area: Rect, claude: &ClaudeQuotaSnapshot, now: i64) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Claude ")
         .border_style(Style::default().fg(CLAUDE_COLOR));
 
-    let lines: Vec<Line> = match rl {
-        Some(rl) => {
-            let mut v = Vec::new();
-            if let Some(w) = &rl.five_hour {
-                v.push(quota_gauge_line("5h", w, now));
-            }
-            if let Some(w) = &rl.seven_day {
-                v.push(quota_gauge_line("7d", w, now));
-            }
-            if v.is_empty() {
-                v.push(dim_line("no rate-limit data"));
-            }
-            v.push(staleness_line(rl.fetched_at, now));
-            v
-        }
-        None => vec![
-            dim_line("no statusLine data"),
-            dim_line("add: vct statusline ingest"),
-        ],
-    };
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(w) = &claude.five_hour {
+        lines.push(quota_gauge_line("5h", w, now));
+    }
+    if let Some(w) = &claude.seven_day {
+        lines.push(quota_gauge_line("7d", w, now));
+    }
+    let has_data = !lines.is_empty();
+    if has_data {
+        lines.push(staleness_line(claude.fetched_at, now));
+    }
+    if claude.needs_login {
+        lines.push(login_hint_line(CLAUDE_LOGIN_HINT));
+    } else if !has_data {
+        lines.push(dim_line("no rate-limit data"));
+    }
 
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
@@ -625,10 +746,13 @@ fn render_codex_quota(f: &mut Frame, area: Rect, codex: &CodexQuotaSnapshot, now
         .border_style(Style::default().fg(CODEX_COLOR));
 
     let lines: Vec<Line> = if codex.source == QuotaSource::None {
-        vec![
-            dim_line("no Codex quota"),
-            dim_line("(no auth.json / sessions)"),
-        ]
+        let mut v = vec![dim_line("no Codex quota")];
+        if codex.needs_login {
+            v.push(login_hint_line(CODEX_LOGIN_HINT));
+        } else {
+            v.push(dim_line("(no auth.json / sessions)"));
+        }
+        v
     } else {
         let mut v = Vec::new();
 
@@ -652,7 +776,12 @@ fn render_codex_quota(f: &mut Frame, area: Rect, codex: &CodexQuotaSnapshot, now
         if let Some(w) = &codex.secondary {
             v.push(quota_gauge_line("7d", w, now));
         }
-        v.push(credits_line(codex));
+        // Keep session-fallback data visible but flag the re-login (S3).
+        if codex.needs_login {
+            v.push(login_hint_line(CODEX_LOGIN_HINT));
+        } else {
+            v.push(credits_line(codex));
+        }
         v
     };
 

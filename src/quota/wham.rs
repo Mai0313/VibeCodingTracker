@@ -1,20 +1,30 @@
-//! Codex `wham/usage` API client.
+//! Codex `wham/usage` API client + token refresh.
 //!
 //! Reads the bearer token + account id from `~/.codex/auth.json`, calls the
 //! ChatGPT backend usage endpoint, and maps the response into the normalized
-//! [`CodexQuotaSnapshot`]. The token is never logged nor stored in a struct
-//! that gets `Debug`-formatted; only the HTTP status appears in errors.
+//! [`CodexQuotaSnapshot`]. On a 401 the caller refreshes the token via
+//! [`refresh_codex`] (which rotates and writes back the refresh token) and
+//! retries. Tokens are never logged nor stored in a `Debug`-formatted struct;
+//! only the HTTP status appears in errors.
 
 use crate::models::{
-    CodexAuthJson, CodexQuotaSnapshot, QuotaSource, QuotaWindow, WhamUsageResponse, WhamWindow,
+    CodexAuthJson, CodexQuotaSnapshot, CodexRefreshResponse, QuotaSource, QuotaWindow,
+    WhamUsageResponse, WhamWindow,
+};
+use crate::quota::http::CODEX_UA;
+use crate::quota::refresh::{
+    file_mtime, now_rfc3339_utc_nanos, send_refresh, update_json_file_in_place,
 };
 use anyhow::{Context, Result, bail};
+use serde_json::{Value, json};
 use std::path::Path;
 
 /// The ChatGPT backend usage endpoint.
 const WHAM_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
-/// User-Agent the Codex CLI sends; mirrored here.
-const CODEX_UA: &str = "codex-cli";
+/// The Codex OAuth token endpoint.
+const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+/// The Codex OAuth client id (public PKCE client).
+const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 
 /// Maps a wham/usage window into the normalized [`QuotaWindow`].
 fn map_window(w: &WhamWindow, now: i64) -> QuotaWindow {
@@ -63,6 +73,7 @@ pub fn map_wham_response(body: &str, now: i64) -> Result<CodexQuotaSnapshot> {
             .rate_limit_reset_credits
             .and_then(|r| r.available_count),
         limit_reached,
+        needs_login: false,
     })
 }
 
@@ -81,45 +92,122 @@ pub fn parse_auth(body: &str) -> Result<(String, Option<String>)> {
     Ok((access_token, tokens.account_id))
 }
 
-/// Builds the shared blocking HTTP client (UA + 8s timeout).
-///
-/// # Errors
-///
-/// Returns an error if the client cannot be constructed.
-pub fn build_client() -> Result<reqwest::blocking::Client> {
-    reqwest::blocking::Client::builder()
-        .user_agent(CODEX_UA)
-        .timeout(std::time::Duration::from_secs(8))
-        .build()
-        .context("Failed to build HTTP client")
+/// Outcome of a single wham/usage request.
+pub enum WhamResult {
+    /// Mapped snapshot.
+    Ok(CodexQuotaSnapshot),
+    /// 401 → refresh and retry.
+    Unauthorized,
+    /// Network / non-401 error → keep last-known-good.
+    Transient,
 }
 
-/// Fetches Codex usage from the wham endpoint using credentials in `auth_path`.
-///
-/// # Errors
-///
-/// Returns an error if the auth file cannot be read/parsed, the request fails,
-/// the status is non-success, or the body cannot be mapped. The token is never
-/// included in any error or log; only the HTTP status is reported.
-pub fn fetch_codex_usage(
-    auth_path: &Path,
+/// Calls the wham endpoint with an explicit bearer token.
+pub fn call_wham(
     client: &reqwest::blocking::Client,
-) -> Result<CodexQuotaSnapshot> {
-    let body = std::fs::read_to_string(auth_path)
-        .with_context(|| format!("Failed to read {}", auth_path.display()))?;
-    let (token, account_id) = parse_auth(&body)?;
-
-    let mut req = client.get(WHAM_URL).bearer_auth(&token);
+    token: &str,
+    account_id: Option<&str>,
+    now: i64,
+) -> WhamResult {
+    let mut req = client
+        .get(WHAM_URL)
+        .header(reqwest::header::USER_AGENT, CODEX_UA)
+        .bearer_auth(token);
     if let Some(id) = account_id {
         req = req.header("ChatGPT-Account-Id", id);
     }
-    let resp = req.send().context("wham/usage request failed")?;
+    let resp = match req.send() {
+        Ok(r) => r,
+        Err(_) => return WhamResult::Transient,
+    };
     let status = resp.status();
-    if !status.is_success() {
-        bail!("wham/usage returned status {status}");
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return WhamResult::Unauthorized;
     }
-    let text = resp.text().context("Failed to read wham/usage body")?;
-    map_wham_response(&text, chrono::Local::now().timestamp())
+    if !status.is_success() {
+        return WhamResult::Transient;
+    }
+    match resp.text() {
+        Ok(text) => match map_wham_response(&text, now) {
+            Ok(snap) => WhamResult::Ok(snap),
+            Err(_) => WhamResult::Transient,
+        },
+        Err(_) => WhamResult::Transient,
+    }
+}
+
+/// Refreshes the Codex token and writes it back (rotation-safe). Returns the new
+/// access token.
+///
+/// The refresh token rotates: the response's new refresh token must be persisted
+/// or the next refresh reuses the old one and 401s. The write-back re-checks the
+/// file mtime and aborts if a concurrent Codex CLI rotated it first.
+///
+/// # Errors
+///
+/// Returns an error if the auth file has no refresh token, the request fails, or
+/// the status is non-success. The token never appears in an error.
+pub fn refresh_codex(client: &reqwest::blocking::Client, auth_path: &Path) -> Result<String> {
+    // Capture the mtime with the refresh token from the same read so the
+    // write-back guards on the exact file version we send.
+    let expected_mtime = file_mtime(auth_path);
+    let body = std::fs::read_to_string(auth_path)
+        .with_context(|| format!("Failed to read {}", auth_path.display()))?;
+    let root: Value = serde_json::from_str(&body).context("Failed to parse auth.json")?;
+    let refresh_token = root["tokens"]["refresh_token"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .context("auth.json has no tokens.refresh_token")?
+        .to_string();
+
+    let req_body = json!({
+        "client_id": CODEX_CLIENT_ID,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+    });
+    let req = client
+        .post(CODEX_TOKEN_URL)
+        .header(reqwest::header::USER_AGENT, CODEX_UA)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .json(&req_body);
+    let (status, text) = send_refresh(req)?;
+    if !status.is_success() {
+        bail!("codex token refresh returned status {status}");
+    }
+    let parsed: CodexRefreshResponse =
+        serde_json::from_str(&text).context("Failed to parse Codex refresh response")?;
+    let access = parsed
+        .access_token
+        .clone()
+        .filter(|s| !s.is_empty())
+        .context("codex refresh response had no access_token")?;
+
+    let wrote = update_json_file_in_place(auth_path, expected_mtime, |root| {
+        let t = root
+            .get_mut("tokens")
+            .and_then(|v| v.as_object_mut())
+            .context("auth.json missing tokens object")?;
+        t.insert("access_token".into(), json!(access));
+        if let Some(i) = &parsed.id_token
+            && !i.is_empty()
+        {
+            t.insert("id_token".into(), json!(i));
+        }
+        if let Some(r) = &parsed.refresh_token
+            && !r.is_empty()
+        {
+            t.insert("refresh_token".into(), json!(r));
+        }
+        root["last_refresh"] = json!(now_rfc3339_utc_nanos());
+        Ok(())
+    })?;
+    // The refresh already rotated the refresh token server-side; if we could not
+    // persist the new one, auth.json now holds a stale/invalid refresh token, so
+    // treat it as a refresh failure rather than reporting success.
+    if !wrote {
+        bail!("codex token rotated but the new token could not be persisted");
+    }
+    Ok(access)
 }
 
 #[cfg(test)]
@@ -152,11 +240,11 @@ mod tests {
         assert_eq!(snap.has_credits, Some(false));
         assert_eq!(snap.reset_credits_available, Some(2));
         assert_eq!(snap.limit_reached, Some(false));
+        assert!(!snap.needs_login);
     }
 
     #[test]
     fn accepts_numeric_credit_balance() {
-        // A numeric `balance` must not fail the whole response (it is stringified).
         let body = r#"{"plan_type":"plus","credits":{"has_credits":true,"balance":12}}"#;
         let snap = map_wham_response(body, 1_000).unwrap();
         assert_eq!(snap.credits_balance.as_deref(), Some("12"));
