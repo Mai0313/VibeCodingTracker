@@ -11,13 +11,13 @@ use crate::models::{
     CodexAuthJson, CodexQuotaSnapshot, CodexRefreshResponse, QuotaSource, QuotaWindow,
     WhamUsageResponse, WhamWindow,
 };
-use crate::quota::http::CODEX_UA;
 use crate::quota::refresh::{
     file_mtime, now_rfc3339_utc_nanos, send_refresh, update_json_file_in_place,
 };
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::path::Path;
+use std::sync::OnceLock;
 
 /// The ChatGPT backend usage endpoint.
 const WHAM_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
@@ -25,6 +25,33 @@ const WHAM_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 /// The Codex OAuth client id (public PKCE client).
 const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+/// Fallback Codex CLI version for the User-Agent when `codex --version` cannot be
+/// resolved. Bump occasionally.
+const CODEX_FALLBACK_VERSION: &str = "0.142.5";
+/// Codex CLI originator (headless invocation; the TUI reports `codex-tui`). Sent
+/// only for client-identity parity; the ChatGPT usage endpoint does not need it.
+const CODEX_ORIGINATOR: &str = "codex_cli_rs";
+
+/// Builds the Codex CLI request User-Agent, e.g. `codex_cli_rs/0.142.5 (linux; x86_64)`.
+///
+/// The version is detected from the installed CLI (see
+/// [`crate::quota::http::detect_cli_version`]); os/arch come from the build target.
+fn codex_ua() -> &'static str {
+    static UA: OnceLock<String> = OnceLock::new();
+    UA.get_or_init(|| {
+        format!(
+            "codex_cli_rs/{} ({}; {})",
+            crate::quota::http::detect_cli_version(
+                "codex",
+                "codex_version.json",
+                CODEX_FALLBACK_VERSION
+            ),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+        )
+    })
+    .as_str()
+}
 
 /// Maps a wham/usage window into the normalized [`QuotaWindow`].
 fn map_window(w: &WhamWindow, now: i64) -> QuotaWindow {
@@ -141,7 +168,8 @@ pub fn call_wham(
 ) -> WhamResult {
     let mut req = client
         .get(WHAM_URL)
-        .header(reqwest::header::USER_AGENT, CODEX_UA)
+        .header(reqwest::header::USER_AGENT, codex_ua())
+        .header("originator", CODEX_ORIGINATOR)
         .bearer_auth(token);
     if let Some(id) = account_id {
         req = req.header("ChatGPT-Account-Id", id);
@@ -197,7 +225,7 @@ pub fn refresh_codex(client: &reqwest::blocking::Client, auth_path: &Path) -> Re
     });
     let req = client
         .post(CODEX_TOKEN_URL)
-        .header(reqwest::header::USER_AGENT, CODEX_UA)
+        .header(reqwest::header::USER_AGENT, codex_ua())
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .json(&req_body);
     let (status, text) = send_refresh(req)?;

@@ -6,8 +6,64 @@
 
 use anyhow::{Context, Result};
 
-/// Per-request User-Agent for the Codex wham client.
-pub const CODEX_UA: &str = "codex-cli";
+/// Detects an installed CLI's version by running `<bin> --version`, caching the
+/// result under `~/.vibe_coding_tracker/<cache_file>` for the day so it is not
+/// re-run on every launch. Falls back to `fallback` when the CLI is absent or
+/// unreadable, so the User-Agent it feeds is always a plausible client version.
+pub fn detect_cli_version(bin: &str, cache_file: &str, fallback: &str) -> String {
+    if let Some(v) = read_cached_version(cache_file) {
+        return v;
+    }
+    if let Some(v) = run_cli_version(bin) {
+        let _ = write_cached_version(cache_file, &v);
+        return v;
+    }
+    fallback.to_string()
+}
+
+/// Extracts the first version-shaped token (`2.1.201`, `0.142.5`) from a CLI's
+/// `--version` output, tolerating a leading program name (`codex-cli 0.142.5`)
+/// or a trailing label (`2.1.201 (Claude Code)`).
+pub fn parse_version(raw: &str) -> Option<String> {
+    raw.split_whitespace()
+        .find(|t| t.starts_with(|c: char| c.is_ascii_digit()) && t.contains('.'))
+        .map(str::to_string)
+}
+
+/// Reads the `{version, date}` cache, returning the version only if stamped today.
+fn read_cached_version(cache_file: &str) -> Option<String> {
+    let path = crate::utils::get_cache_dir().ok()?.join(cache_file);
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    if v.get("date")?.as_str()? != today() {
+        return None;
+    }
+    v.get("version")?.as_str().map(str::to_string)
+}
+
+/// Persists `version` stamped with today's date (best-effort, atomic).
+fn write_cached_version(cache_file: &str, version: &str) -> Result<()> {
+    let path = crate::utils::get_cache_dir()?.join(cache_file);
+    crate::utils::write_json_atomic(
+        path,
+        &serde_json::json!({ "version": version, "date": today() }),
+    )
+}
+
+/// Runs `<bin> --version` and parses the version token from stdout.
+fn run_cli_version(bin: &str) -> Option<String> {
+    let output = std::process::Command::new(bin)
+        .arg("--version")
+        .output()
+        .ok()?;
+    output.status.success().then_some(())?;
+    parse_version(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Today's local date as `YYYY-MM-DD`.
+fn today() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
 
 /// Builds the shared blocking HTTP client (8s timeout, no default UA).
 ///
@@ -43,5 +99,22 @@ mod tests {
     fn iso_to_unix_secs_handles_bad_input() {
         assert_eq!(iso_to_unix_secs("not-a-date"), None);
         assert!(iso_to_unix_secs("2026-07-03T17:09:59.651608+00:00").unwrap() > 0);
+    }
+
+    #[test]
+    fn parse_version_handles_leading_or_trailing_labels() {
+        // Claude: version first, label after.
+        assert_eq!(
+            parse_version("2.1.201 (Claude Code)").as_deref(),
+            Some("2.1.201")
+        );
+        // Codex: program name first, version after.
+        assert_eq!(
+            parse_version("codex-cli 0.142.5").as_deref(),
+            Some("0.142.5")
+        );
+        assert_eq!(parse_version("  2.0.14\n").as_deref(), Some("2.0.14"));
+        assert_eq!(parse_version(""), None);
+        assert_eq!(parse_version("Claude Code"), None);
     }
 }

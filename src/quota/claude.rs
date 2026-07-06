@@ -23,12 +23,20 @@ use anyhow::{Context, Result, anyhow, bail};
 use reqwest::blocking::Client;
 use serde_json::json;
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::SystemTime;
 
 /// The Claude OAuth usage endpoint.
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 /// OAuth beta header that unlocks the richer usage response (`limits` / `spend`).
 const CLAUDE_OAUTH_BETA: &str = "oauth-2025-04-20";
+/// Fallback Claude Code version for the User-Agent when `claude --version`
+/// cannot be resolved (CLI absent or unreadable). Bump occasionally.
+const CLAUDE_FALLBACK_VERSION: &str = "2.1.201";
+/// `x-app` value the Claude Code CLI sends.
+const CLAUDE_APP: &str = "cli";
+/// Anthropic API version pinned by the Claude Code client.
+const CLAUDE_ANTHROPIC_VERSION: &str = "2023-06-01";
 /// The Claude Code OAuth client id (public PKCE client).
 const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 /// Current token endpoint host.
@@ -37,6 +45,26 @@ const CLAUDE_TOKEN_URL_PRIMARY: &str = "https://platform.claude.com/v1/oauth/tok
 const CLAUDE_TOKEN_URL_LEGACY: &str = "https://console.anthropic.com/v1/oauth/token";
 /// Login hint shown when refresh fails.
 pub const CLAUDE_LOGIN_HINT: &str = "run: claude auth login";
+
+/// Builds Claude Code's request User-Agent, e.g. `claude-cli/2.1.201 (external, cli)`.
+///
+/// The version is detected from the installed CLI (see
+/// [`crate::quota::http::detect_cli_version`]) so the UA tracks the real client
+/// rather than drifting from a hardcoded constant.
+fn claude_ua() -> &'static str {
+    static UA: OnceLock<String> = OnceLock::new();
+    UA.get_or_init(|| {
+        format!(
+            "claude-cli/{} (external, cli)",
+            crate::quota::http::detect_cli_version(
+                "claude",
+                "claude_code_version.json",
+                CLAUDE_FALLBACK_VERSION,
+            )
+        )
+    })
+    .as_str()
+}
 
 /// The token endpoints to try, in order (overridable for testing / drift).
 fn claude_token_urls() -> Vec<String> {
@@ -167,7 +195,11 @@ enum FetchResult {
 fn fetch_claude_usage(client: &Client, token: &str, now: i64) -> FetchResult {
     let resp = match client
         .get(CLAUDE_USAGE_URL)
+        .header(reqwest::header::USER_AGENT, claude_ua())
+        .header("x-app", CLAUDE_APP)
+        .header("anthropic-version", CLAUDE_ANTHROPIC_VERSION)
         .header("anthropic-beta", CLAUDE_OAUTH_BETA)
+        .header("anthropic-dangerous-direct-browser-access", "true")
         .bearer_auth(token)
         .send()
     {
@@ -222,6 +254,7 @@ fn refresh_claude(
         let has_next = i + 1 < urls.len();
         let req = client
             .post(url)
+            .header(reqwest::header::USER_AGENT, claude_ua())
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .json(&body);
         match send_refresh(req) {
