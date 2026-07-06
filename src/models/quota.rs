@@ -567,6 +567,191 @@ pub struct CodexQuotaSnapshot {
     pub needs_login: bool,
 }
 
+// ---- GitHub Copilot usage API (GET /copilot_internal/user) ----
+
+/// `https://api.github.com/copilot_internal/user` response (subset we read).
+///
+/// Field names match the API's snake_case shape directly.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CopilotUserResponse {
+    /// Plan tier, e.g. "individual" / "business".
+    #[serde(default)]
+    pub copilot_plan: Option<String>,
+    /// Quota reset instant (ISO-8601), preferred over the date-only field.
+    #[serde(default)]
+    pub quota_reset_date_utc: Option<String>,
+    /// Quota reset date (`YYYY-MM-DD`), fallback when the UTC instant is absent.
+    #[serde(default)]
+    pub quota_reset_date: Option<String>,
+    /// Per-quota snapshots (premium interactions / chat / completions).
+    #[serde(default)]
+    pub quota_snapshots: Option<CopilotQuotaSnapshots>,
+}
+
+/// The `quota_snapshots` object of a Copilot user response.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CopilotQuotaSnapshots {
+    /// Premium (model) request quota — the headline gauge.
+    #[serde(default)]
+    pub premium_interactions: Option<CopilotQuotaEntry>,
+    /// Chat quota (usually unlimited on paid plans).
+    #[serde(default)]
+    pub chat: Option<CopilotQuotaEntry>,
+    /// Completions quota (usually unlimited on paid plans).
+    #[serde(default)]
+    pub completions: Option<CopilotQuotaEntry>,
+}
+
+/// One Copilot quota snapshot entry.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CopilotQuotaEntry {
+    /// Percent of the quota still available (0..100).
+    #[serde(default)]
+    pub percent_remaining: Option<f64>,
+    /// Absolute remaining request count.
+    #[serde(default)]
+    pub remaining: Option<f64>,
+    /// Total request entitlement for the period.
+    #[serde(default)]
+    pub entitlement: Option<f64>,
+    /// Whether this quota is unlimited.
+    #[serde(default)]
+    pub unlimited: Option<bool>,
+}
+
+// ---- Cursor usage API (GET /api/usage-summary) ----
+
+/// `https://cursor.com/api/usage-summary` response (subset we read).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CursorUsageSummary {
+    /// Plan tier, e.g. "free" / "pro" / "enterprise".
+    #[serde(default)]
+    pub membership_type: Option<String>,
+    /// Whether usage is unlimited.
+    #[serde(default)]
+    pub is_unlimited: Option<bool>,
+    /// Billing cycle end (ISO-8601), used as the reset time for every gauge.
+    #[serde(default)]
+    pub billing_cycle_end: Option<String>,
+    /// Per-user usage breakdown.
+    #[serde(default)]
+    pub individual_usage: Option<CursorIndividualUsage>,
+}
+
+/// The `individualUsage` object of a Cursor usage summary.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CursorIndividualUsage {
+    /// Included-plan usage percentages.
+    #[serde(default)]
+    pub plan: Option<CursorPlanUsage>,
+    /// On-demand (overage) spend.
+    #[serde(default)]
+    pub on_demand: Option<CursorOnDemand>,
+}
+
+/// The `individualUsage.plan` object (percentages are already in percent units).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CursorPlanUsage {
+    /// Auto / Composer usage percent.
+    #[serde(default)]
+    pub auto_percent_used: Option<f64>,
+    /// Named-model (API) usage percent.
+    #[serde(default)]
+    pub api_percent_used: Option<f64>,
+    /// Headline total usage percent.
+    #[serde(default)]
+    pub total_percent_used: Option<f64>,
+}
+
+/// The `individualUsage.onDemand` object.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CursorOnDemand {
+    /// Whether on-demand spend is enabled.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Amount spent this period, in cents.
+    #[serde(default)]
+    pub used: Option<f64>,
+}
+
+// ---- Normalized Copilot / Cursor snapshots (worker output + on-disk cache) ----
+
+/// Normalized Copilot quota snapshot, shared via `Arc<Mutex>` and persisted to
+/// `~/.vibe_coding_tracker/copilot_usage.json`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CopilotQuotaSnapshot {
+    /// Which source produced this snapshot.
+    #[serde(default)]
+    pub source: QuotaSource,
+    /// Unix seconds when this snapshot was produced.
+    pub fetched_at: i64,
+    /// Plan tier (e.g. "individual"), shown as Plan.
+    #[serde(default)]
+    pub plan_type: Option<String>,
+    /// Premium-interactions window (the headline gauge).
+    #[serde(default)]
+    pub premium: Option<QuotaWindow>,
+    /// Remaining premium requests.
+    #[serde(default)]
+    pub premium_remaining: Option<i64>,
+    /// Total premium request entitlement.
+    #[serde(default)]
+    pub premium_entitlement: Option<i64>,
+    /// Whether premium interactions are unlimited.
+    #[serde(default)]
+    pub premium_unlimited: bool,
+    /// Whether chat is unlimited.
+    #[serde(default)]
+    pub chat_unlimited: bool,
+    /// Whether completions are unlimited.
+    #[serde(default)]
+    pub completions_unlimited: bool,
+    /// Whether the premium quota has been exhausted (drives the `LIMIT` flag).
+    #[serde(default)]
+    pub limit_reached: bool,
+    /// Credentials present but the token is unusable (401/403); the panel shows
+    /// a `copilot login` hint.
+    #[serde(default)]
+    pub needs_login: bool,
+}
+
+/// Normalized Cursor quota snapshot, shared via `Arc<Mutex>` and persisted to
+/// `~/.vibe_coding_tracker/cursor_usage.json`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CursorQuotaSnapshot {
+    /// Which source produced this snapshot.
+    #[serde(default)]
+    pub source: QuotaSource,
+    /// Unix seconds when this snapshot was produced.
+    pub fetched_at: i64,
+    /// Plan tier (e.g. "free" / "pro"), shown as Plan.
+    #[serde(default)]
+    pub plan_type: Option<String>,
+    /// Headline total-usage window.
+    #[serde(default)]
+    pub total: Option<QuotaWindow>,
+    /// Auto / Composer usage window.
+    #[serde(default)]
+    pub auto: Option<QuotaWindow>,
+    /// Named-model (API) usage window.
+    #[serde(default)]
+    pub api: Option<QuotaWindow>,
+    /// On-demand spend this period, in USD, when enabled.
+    #[serde(default)]
+    pub on_demand_dollars: Option<f64>,
+    /// Whether the plan usage has hit 100% (drives the `LIMIT` flag).
+    #[serde(default)]
+    pub limit_reached: bool,
+    /// Credentials present but the token is unusable (expired / 401); the panel
+    /// shows a `cursor login` hint.
+    #[serde(default)]
+    pub needs_login: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

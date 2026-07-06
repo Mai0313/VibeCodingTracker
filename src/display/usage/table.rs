@@ -116,9 +116,7 @@ pub fn display_usage_table(usage_data: &UsageData) {
     println!("{table}");
     println!();
 
-    // Display per-provider totals (the active-day count comes along so
-    // readers can see how many days these totals span without converting
-    // back to a daily average).
+    // Display per-provider totals (tokens + cost).
     let provider_rows = build_provider_total_rows(&summary.provider_totals);
 
     println!("{}", "Totals (by Provider)".bright_magenta().bold());
@@ -135,9 +133,6 @@ pub fn display_usage_table(usage_data: &UsageData) {
         Cell::new("Cost")
             .fg(Color::Magenta)
             .set_alignment(CellAlignment::Right),
-        Cell::new("Active Days")
-            .fg(Color::Magenta)
-            .set_alignment(CellAlignment::Right),
     ]);
 
     for row in &provider_rows {
@@ -152,13 +147,8 @@ pub fn display_usage_table(usage_data: &UsageData) {
             row.table_color,
             row.emphasize,
         );
-        let days_cell = create_metric_cell(
-            format_number(row.stats.days_count as i64),
-            row.table_color,
-            row.emphasize,
-        );
 
-        totals_table.add_row(vec![name_cell, tokens_cell, cost_cell, days_cell]);
+        totals_table.add_row(vec![name_cell, tokens_cell, cost_cell]);
     }
 
     println!("{totals_table}");

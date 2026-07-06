@@ -2927,6 +2927,7 @@ dependencies = [
  "ahash",
  "anyhow",
  "assert_cmd",
+ "base64",
  "bytecount",
  "chrono",
  "clap",

@@ -19,16 +19,19 @@ use crate::display::usage::averages::{
     UsageProviderTotals, UsageRow, UsageTotals, build_provider_total_rows, build_usage_summary,
 };
 use crate::models::{
-    ClaudeQuotaSnapshot, CodexQuotaSnapshot, PerProviderUsage, ProviderActiveDays, QuotaSource,
-    QuotaWindow, UsageResult,
+    ClaudeQuotaSnapshot, CodexQuotaSnapshot, CopilotQuotaSnapshot, CursorQuotaSnapshot,
+    PerProviderUsage, ProviderActiveDays, QuotaSource, QuotaWindow, UsageResult,
 };
 use crate::pricing::{ModelPricingMap, fetch_model_pricing};
 use crate::quota::{
-    CLAUDE_LOGIN_HINT, CODEX_LOGIN_HINT, ClaudeState, CodexState, load_claude_cache,
-    load_codex_cache, save_claude_cache, save_codex_cache, spawn_quota_worker,
+    CLAUDE_LOGIN_HINT, CODEX_LOGIN_HINT, COPILOT_LOGIN_HINT, CURSOR_LOGIN_HINT, ClaudeState,
+    CodexState, CopilotState, CursorState, load_claude_cache, load_codex_cache, load_copilot_cache,
+    load_cursor_cache, save_claude_cache, save_codex_cache, save_copilot_cache, save_cursor_cache,
+    spawn_quota_worker,
 };
 use crate::utils::{
-    format_compact, format_cost, format_duration_until, get_claude_credentials_path, resolve_paths,
+    format_compact, format_cost, format_duration_until, get_claude_credentials_path,
+    get_copilot_config_path, get_cursor_auth_path, resolve_paths,
 };
 use ratatui::{
     Frame, Terminal,
@@ -54,12 +57,29 @@ const QUOTA_PANEL_MIN_HEIGHT: u16 = 8;
 const CLAUDE_COLOR: RatatuiColor = RatatuiColor::Rgb(190, 116, 87);
 /// Codex brand color for the quota panel border.
 const CODEX_COLOR: RatatuiColor = RatatuiColor::Rgb(118, 127, 198);
+/// Copilot brand color (GitHub green) for the quota panel border.
+const COPILOT_COLOR: RatatuiColor = RatatuiColor::Rgb(46, 160, 67);
+/// Cursor brand color (teal) for the quota panel border.
+const CURSOR_COLOR: RatatuiColor = RatatuiColor::Rgb(64, 180, 180);
+
+/// Minimum readable width for a single quota panel column (label + bar +
+/// percent + reset). Below this a panel's gauge tail may clip.
+const PANEL_MIN_W: u16 = 28;
+/// Minimum width to keep the (slimmed) Provider Usage table inline in the band.
+/// Matches the table's own column widths (Provider 16 + Tokens 16 + Cost 14)
+/// so it is only kept when it can render without truncating; otherwise the band
+/// drops it and the panels take the full width.
+const BAND_TABLE_MIN_W: u16 = 46;
+/// Terminal height needed to wrap the panels into a two-row grid.
+const PANELS_2ROW_MIN_H: u16 = 26;
 
 /// Which provider quota panels have credentials on this machine.
 #[derive(Clone, Copy, Default)]
 struct QuotaPresence {
     claude: bool,
     codex: bool,
+    copilot: bool,
+    cursor: bool,
 }
 
 impl QuotaPresence {
@@ -71,12 +91,21 @@ impl QuotaPresence {
         let codex = resolve_paths()
             .map(|p| p.codex_dir.join("auth.json").exists() || p.codex_session_dir.exists())
             .unwrap_or(false);
-        Self { claude, codex }
+        let copilot = get_copilot_config_path()
+            .map(|p| p.exists())
+            .unwrap_or(false);
+        let cursor = get_cursor_auth_path().map(|p| p.exists()).unwrap_or(false);
+        Self {
+            claude,
+            codex,
+            copilot,
+            cursor,
+        }
     }
 
-    /// Number of provider columns in the band (Claude + Codex).
+    /// Number of provider quota panels present.
     fn count(&self) -> usize {
-        self.claude as usize + self.codex as usize
+        self.claude as usize + self.codex as usize + self.copilot as usize + self.cursor as usize
     }
 }
 
@@ -84,6 +113,8 @@ impl QuotaPresence {
 struct QuotaView<'a> {
     claude: &'a ClaudeQuotaSnapshot,
     codex: &'a CodexQuotaSnapshot,
+    copilot: &'a CopilotQuotaSnapshot,
+    cursor: &'a CursorQuotaSnapshot,
     present: QuotaPresence,
 }
 
@@ -93,6 +124,12 @@ const USAGE_REFRESH_SECS: u64 = 10;
 /// usage endpoint rate-limits frequent polling; quota moves slowly enough that
 /// once a minute stays fresh.
 const CLAUDE_REFRESH_SECS: u64 = 60;
+/// Copilot quota worker cadence. GitHub's API is not tightly rate-limited here,
+/// but quota moves slowly so a conservative once-a-minute poll is plenty.
+const COPILOT_REFRESH_SECS: u64 = 60;
+/// Cursor quota worker cadence. Re-reads `auth.json` each tick, so 60s keeps it
+/// fresh without hammering cursor.com.
+const CURSOR_REFRESH_SECS: u64 = 60;
 /// How often to rebuild the LiteLLM pricing map. The underlying data only
 /// changes when the upstream JSON is updated (daily at most), so rebuilding
 /// a fresh ~500 KB `HashMap<Rc<str>, ModelPricing>` every 10 s just churned
@@ -155,7 +192,21 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
             .flatten()
             .unwrap_or_default(),
     ));
-    if present.claude || present.codex {
+    let copilot_shared = Arc::new(Mutex::new(
+        present
+            .copilot
+            .then(load_copilot_cache)
+            .flatten()
+            .unwrap_or_default(),
+    ));
+    let cursor_shared = Arc::new(Mutex::new(
+        present
+            .cursor
+            .then(load_cursor_cache)
+            .flatten()
+            .unwrap_or_default(),
+    ));
+    if present.claude || present.codex || present.copilot || present.cursor {
         match crate::quota::http::build_client() {
             Ok(client) => {
                 if present.claude {
@@ -191,6 +242,42 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
                         move || state.resolve(&c),
                         |s| {
                             let _ = save_codex_cache(s);
+                        },
+                    );
+                }
+                if present.copilot {
+                    let (c, sh, shared) = (
+                        client.clone(),
+                        Arc::clone(&quota_shutdown),
+                        Arc::clone(&copilot_shared),
+                    );
+                    let mut state = CopilotState;
+                    spawn_quota_worker(
+                        "copilot",
+                        shared,
+                        sh,
+                        COPILOT_REFRESH_SECS,
+                        move || state.resolve(&c),
+                        |s| {
+                            let _ = save_copilot_cache(s);
+                        },
+                    );
+                }
+                if present.cursor {
+                    let (c, sh, shared) = (
+                        client.clone(),
+                        Arc::clone(&quota_shutdown),
+                        Arc::clone(&cursor_shared),
+                    );
+                    let mut state = CursorState;
+                    spawn_quota_worker(
+                        "cursor",
+                        shared,
+                        sh,
+                        CURSOR_REFRESH_SECS,
+                        move || state.resolve(&c),
+                        |s| {
+                            let _ = save_cursor_cache(s);
                         },
                     );
                 }
@@ -245,6 +332,8 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
     // re-reading the shared snapshots.
     let mut claude_snapshot = ClaudeQuotaSnapshot::default();
     let mut codex_snapshot = CodexQuotaSnapshot::default();
+    let mut copilot_snapshot = CopilotQuotaSnapshot::default();
+    let mut cursor_snapshot = CursorQuotaSnapshot::default();
 
     loop {
         if refresh_state.should_refresh() {
@@ -325,6 +414,8 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
             // Refresh quota panels from each background worker's latest snapshot.
             claude_snapshot = claude_shared.lock().map(|g| g.clone()).unwrap_or_default();
             codex_snapshot = codex_shared.lock().map(|g| g.clone()).unwrap_or_default();
+            copilot_snapshot = copilot_shared.lock().map(|g| g.clone()).unwrap_or_default();
+            cursor_snapshot = cursor_shared.lock().map(|g| g.clone()).unwrap_or_default();
 
             // Clear raw usage data immediately after processing to free memory.
             // Per-provider map is reset on the next refresh when new data arrives.
@@ -371,6 +462,8 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
                 &QuotaView {
                     claude: &claude_snapshot,
                     codex: &codex_snapshot,
+                    copilot: &copilot_snapshot,
+                    cursor: &cursor_snapshot,
                     present,
                 },
                 &mut scroll,
@@ -407,6 +500,8 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
                     &QuotaView {
                         claude: &claude_snapshot,
                         codex: &codex_snapshot,
+                        copilot: &copilot_snapshot,
+                        cursor: &cursor_snapshot,
                         present,
                     },
                     &mut scroll,
@@ -426,6 +521,8 @@ pub fn display_usage_interactive(time_range: crate::cli::TimeRange) -> anyhow::R
                 &QuotaView {
                     claude: &claude_snapshot,
                     codex: &codex_snapshot,
+                    copilot: &copilot_snapshot,
+                    cursor: &cursor_snapshot,
                     present,
                 },
                 &mut scroll,
@@ -471,10 +568,14 @@ fn render_usage_frame(
 
         // Drop the provider/quota band on short terminals so the scrollable
         // table keeps a usable height.
-        let totals_height = (provider_rows.len() as u16)
-            .saturating_add(4)
-            .max(QUOTA_PANEL_MIN_HEIGHT);
-        let panels_height = (area.height >= USAGE_PANELS_MIN_H).then_some(totals_height);
+        // Decide how the band arranges the present quota panels (and whether the
+        // slimmed Provider Usage table shares the row) from the terminal size,
+        // then size the band accordingly. The band spans the full width, so the
+        // arrange decision uses `area.width`.
+        let n = quota.present.count();
+        let arrange = arrange_band(area.width, area.height, n);
+        let panels_height =
+            (area.height >= USAGE_PANELS_MIN_H).then(|| band_height(&arrange, provider_rows.len()));
         let chunks = main_layout(area, panels_height);
 
         let header = vec![
@@ -536,67 +637,75 @@ fn render_usage_frame(
         );
 
         if let Some(panel_area) = chunks.panels {
-            // Drop the "All Providers" aggregate; the summary bar already
-            // carries the grand totals.
-            let mut totals_rows: Vec<RatatuiRow> = provider_rows
-                .iter()
-                .filter(|row| row.label != "All Providers")
-                .map(|row| {
-                    create_provider_row(
-                        vec![
-                            row.label.to_string(),
-                            format_compact(row.stats.total_tokens),
-                            format_cost(row.stats.total_cost),
-                            format_compact(row.stats.days_count as i64),
-                        ],
-                        row.tui_color,
-                        row.emphasize,
-                    )
-                })
-                .collect();
+            let grid = split_band(panel_area, &arrange, n);
 
-            if totals_rows.is_empty() {
-                totals_rows.push(
-                    RatatuiRow::new(vec![
-                        "No provider data yet".to_string(),
-                        "-".to_string(),
-                        "-".to_string(),
-                        "-".to_string(),
-                    ])
-                    .style(Style::default().fg(RatatuiColor::DarkGray)),
+            // The (slimmed) Provider Usage table is only shown when the band
+            // keeps a cell for it; otherwise the panels take the whole band and
+            // the scrollable per-model table above carries the per-provider view.
+            if let Some(table_area) = grid.table {
+                // Drop the "All Providers" aggregate; the summary bar already
+                // carries the grand totals.
+                let mut totals_rows: Vec<RatatuiRow> = provider_rows
+                    .iter()
+                    .filter(|row| row.label != "All Providers")
+                    .map(|row| {
+                        create_provider_row(
+                            vec![
+                                row.label.to_string(),
+                                format_compact(row.stats.total_tokens),
+                                format_cost(row.stats.total_cost),
+                            ],
+                            row.tui_color,
+                            row.emphasize,
+                        )
+                    })
+                    .collect();
+
+                if totals_rows.is_empty() {
+                    totals_rows.push(
+                        RatatuiRow::new(vec![
+                            "No provider data yet".to_string(),
+                            "-".to_string(),
+                            "-".to_string(),
+                        ])
+                        .style(Style::default().fg(RatatuiColor::DarkGray)),
+                    );
+                }
+
+                let totals_header = vec!["Provider", "Tokens", "Cost"];
+                let totals_widths = [
+                    Constraint::Min(16),
+                    Constraint::Length(16),
+                    Constraint::Length(14),
+                ];
+
+                let totals_table = create_ratatui_table(
+                    totals_rows,
+                    totals_header,
+                    &totals_widths,
+                    RatatuiColor::Magenta,
                 );
+                f.render_widget(totals_table, table_area);
             }
 
-            let totals_header = vec!["Provider", "Tokens", "Cost", "Active Days"];
-            let totals_widths = [
-                Constraint::Min(20),
-                Constraint::Length(16),
-                Constraint::Length(14),
-                Constraint::Length(14),
-            ];
-
-            let totals_table = create_ratatui_table(
-                totals_rows,
-                totals_header,
-                &totals_widths,
-                RatatuiColor::Magenta,
-            );
-
-            // Split the band into provider stats (left) + the present
-            // Claude / Codex quota panels.
+            // Render present panels in fixed order (Claude → Codex → Copilot →
+            // Cursor) into the grid cells; a missing provider consumes no cell.
             let now = chrono::Local::now().timestamp();
-            let band = RatatuiLayout::default()
-                .direction(Direction::Horizontal)
-                .constraints(band_constraints(quota.present.count()))
-                .split(panel_area);
-            f.render_widget(totals_table, band[0]);
-            let mut idx = 1;
+            let mut idx = 0;
             if quota.present.claude {
-                render_claude_quota(f, band[idx], quota.claude, now);
+                render_claude_quota(f, grid.panels[idx], quota.claude, now);
                 idx += 1;
             }
             if quota.present.codex {
-                render_codex_quota(f, band[idx], quota.codex, now);
+                render_codex_quota(f, grid.panels[idx], quota.codex, now);
+                idx += 1;
+            }
+            if quota.present.copilot {
+                render_copilot_quota(f, grid.panels[idx], quota.copilot, now);
+                idx += 1;
+            }
+            if quota.present.cursor {
+                render_cursor_quota(f, grid.panels[idx], quota.cursor, now);
             }
         }
 
@@ -707,17 +816,129 @@ fn login_hint_line(hint: &str) -> Line<'static> {
     ))
 }
 
-/// Horizontal constraints for the top band: stats + one column per present
-/// Claude / Codex panel (`top_n` is 0..2).
-fn band_constraints(top_n: usize) -> Vec<Constraint> {
-    match top_n {
-        0 => vec![Constraint::Percentage(100)],
-        1 => vec![Constraint::Percentage(58), Constraint::Percentage(42)],
-        _ => vec![
-            Constraint::Percentage(46),
-            Constraint::Percentage(27),
-            Constraint::Percentage(27),
-        ],
+/// Resolved band arrangement (pure; independent of the band `Rect`).
+enum BandArrange {
+    /// One row: an optional Provider Usage table cell, then the panel cells.
+    SingleRow { table: bool },
+    /// Two rows: `top` panels on the first row, the rest on the second; a
+    /// trailing empty cell on the second row is filled with the table.
+    TwoRow { top: usize, table_in_hole: bool },
+}
+
+/// Decides the band arrangement from band width, terminal height, and the
+/// number of present quota panels.
+///
+/// Preference order: table + all panels in one row → panels-only in one row
+/// (table dropped as redundant with the scrollable table) → a two-row grid →
+/// a last-resort even split that may clip a gauge tail but never panics.
+fn arrange_band(w: u16, area_h: u16, n: usize) -> BandArrange {
+    if n == 0 {
+        return BandArrange::SingleRow { table: true };
+    }
+    let panels_w = PANEL_MIN_W.saturating_mul(n as u16);
+    if w >= BAND_TABLE_MIN_W + panels_w {
+        BandArrange::SingleRow { table: true }
+    } else if w >= panels_w {
+        BandArrange::SingleRow { table: false }
+    } else if area_h >= PANELS_2ROW_MIN_H {
+        let top = n.div_ceil(2);
+        BandArrange::TwoRow {
+            top,
+            table_in_hole: top * 2 > n,
+        }
+    } else {
+        BandArrange::SingleRow { table: false }
+    }
+}
+
+/// The band height fed to `main_layout` (computed before the band `Rect` exists).
+fn band_height(arrange: &BandArrange, provider_rows: usize) -> u16 {
+    match arrange {
+        BandArrange::SingleRow { table: true } => (provider_rows as u16)
+            .saturating_add(4)
+            .max(QUOTA_PANEL_MIN_HEIGHT),
+        BandArrange::SingleRow { table: false } => QUOTA_PANEL_MIN_HEIGHT,
+        BandArrange::TwoRow { .. } => QUOTA_PANEL_MIN_HEIGHT.saturating_mul(2),
+    }
+}
+
+/// The band split into an optional table cell plus one cell per present panel.
+struct BandGrid {
+    table: Option<Rect>,
+    panels: Vec<Rect>,
+}
+
+/// Splits a horizontal rect into `k` equal columns.
+fn split_even(area: Rect, k: usize) -> Vec<Rect> {
+    if k == 0 {
+        return Vec::new();
+    }
+    let cons = vec![Constraint::Ratio(1, k as u32); k];
+    RatatuiLayout::default()
+        .direction(Direction::Horizontal)
+        .constraints(cons)
+        .split(area)
+        .to_vec()
+}
+
+/// Splits the resolved band `Rect` into the table cell + ordered panel cells.
+///
+/// `panels` always has exactly `n` entries so the render dispatch can index it
+/// by present-provider order without bounds concerns.
+fn split_band(band: Rect, arrange: &BandArrange, n: usize) -> BandGrid {
+    match *arrange {
+        BandArrange::SingleRow { table } => {
+            let mut cons: Vec<Constraint> = Vec::new();
+            if table {
+                cons.push(Constraint::Min(BAND_TABLE_MIN_W));
+            }
+            // Give each panel an equal share of whatever the table leaves.
+            let panel_span = if table {
+                band.width.saturating_sub(BAND_TABLE_MIN_W)
+            } else {
+                band.width
+            };
+            let pw = if n > 0 {
+                (panel_span / n as u16).max(PANEL_MIN_W)
+            } else {
+                PANEL_MIN_W
+            };
+            for _ in 0..n {
+                cons.push(Constraint::Length(pw));
+            }
+            let cells = RatatuiLayout::default()
+                .direction(Direction::Horizontal)
+                .constraints(cons)
+                .split(band);
+            let (table_rect, off) = if table {
+                (Some(cells[0]), 1)
+            } else {
+                (None, 0)
+            };
+            BandGrid {
+                table: table_rect,
+                panels: cells[off..off + n].to_vec(),
+            }
+        }
+        BandArrange::TwoRow { top, table_in_hole } => {
+            let rows = RatatuiLayout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(QUOTA_PANEL_MIN_HEIGHT),
+                    Constraint::Length(QUOTA_PANEL_MIN_HEIGHT),
+                ])
+                .split(band);
+            let bottom = n - top;
+            let row0 = split_even(rows[0], top);
+            let row1 = split_even(rows[1], bottom + table_in_hole as usize);
+            let mut panels = row0;
+            panels.extend_from_slice(&row1[..bottom]);
+            let table_rect = table_in_hole.then(|| row1[bottom]);
+            BandGrid {
+                table: table_rect,
+                panels,
+            }
+        }
     }
 }
 
@@ -824,6 +1045,94 @@ fn render_codex_quota(f: &mut Frame, area: Rect, codex: &CodexQuotaSnapshot, now
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// Renders the Copilot quota panel (plan, premium gauge, requests +
+/// chat/completions note, staleness + login hint).
+fn render_copilot_quota(f: &mut Frame, area: Rect, copilot: &CopilotQuotaSnapshot, now: i64) {
+    let block = quota_block(" Copilot ", COPILOT_COLOR, copilot.limit_reached);
+
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(plan) = &copilot.plan_type {
+        lines.push(plan_line(plan));
+    }
+    if let Some(w) = &copilot.premium {
+        lines.push(quota_gauge_line("prem", w, now));
+    } else if copilot.premium_unlimited {
+        lines.push(dim_line("premium: unlimited"));
+    }
+    if let Some(extra) = copilot_extras_line(copilot) {
+        lines.push(extra);
+    }
+    let has_content = !lines.is_empty();
+    if has_content {
+        lines.push(staleness_line(copilot.fetched_at, now));
+    }
+    if copilot.needs_login {
+        lines.push(login_hint_line(COPILOT_LOGIN_HINT));
+    } else if !has_content {
+        lines.push(dim_line("no Copilot quota"));
+    }
+
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// Builds the Copilot extras line (`1464/1500 reqs  ·  chat/compl ∞`), shown
+/// when premium counts or an unlimited chat/completions flag are known.
+fn copilot_extras_line(c: &CopilotQuotaSnapshot) -> Option<Line<'static>> {
+    let mut parts: Vec<String> = Vec::new();
+    if let (Some(r), Some(t)) = (c.premium_remaining, c.premium_entitlement)
+        && t > 0
+    {
+        parts.push(format!("{r}/{t} reqs"));
+    }
+    match (c.chat_unlimited, c.completions_unlimited) {
+        (true, true) => parts.push("chat/compl ∞".to_string()),
+        (true, false) => parts.push("chat ∞".to_string()),
+        (false, true) => parts.push("compl ∞".to_string()),
+        (false, false) => {}
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(Line::from(Span::styled(
+        parts.join("  ·  "),
+        Style::default().fg(RatatuiColor::DarkGray),
+    )))
+}
+
+/// Renders the Cursor quota panel (plan, total / auto / api gauges, optional
+/// on-demand spend, staleness + login hint).
+fn render_cursor_quota(f: &mut Frame, area: Rect, cursor: &CursorQuotaSnapshot, now: i64) {
+    let block = quota_block(" Cursor ", CURSOR_COLOR, cursor.limit_reached);
+
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(plan) = &cursor.plan_type {
+        lines.push(plan_line(plan));
+    }
+    if let Some(w) = &cursor.total {
+        lines.push(quota_gauge_line("total", w, now));
+    }
+    if let Some(w) = &cursor.auto {
+        lines.push(quota_gauge_line("auto", w, now));
+    }
+    if let Some(w) = &cursor.api {
+        lines.push(quota_gauge_line("api", w, now));
+    }
+    if let Some(d) = cursor.on_demand_dollars {
+        lines.push(dim_line(&format!("on-demand: ${d:.2}")));
+    }
+    let has_content = !lines.is_empty();
+    if has_content {
+        lines.push(staleness_line(cursor.fetched_at, now));
+    }
+    if cursor.needs_login {
+        lines.push(login_hint_line(CURSOR_LOGIN_HINT));
+    } else if !has_content {
+        lines.push(dim_line("no Cursor quota"));
+    }
+
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 /// Builds the `Plan: <tier>` line shared by both panels.
 fn plan_line(plan: &str) -> Line<'static> {
     Line::from(Span::styled(
@@ -889,4 +1198,94 @@ fn claude_balance_line(claude: &ClaudeQuotaSnapshot) -> Line<'static> {
         s.push_str(&format!("    {used} used"));
     }
     Line::from(Span::styled(s, Style::default().fg(RatatuiColor::Gray)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arrange_wide_keeps_table_in_one_row() {
+        // Plenty of width for the table + 4 panels.
+        match arrange_band(BAND_TABLE_MIN_W + PANEL_MIN_W * 4, 40, 4) {
+            BandArrange::SingleRow { table } => assert!(table),
+            _ => panic!("expected single row with table"),
+        }
+    }
+
+    #[test]
+    fn arrange_medium_drops_table_but_stays_one_row() {
+        // Enough for 4 panels but not the table alongside them.
+        match arrange_band(PANEL_MIN_W * 4, 40, 4) {
+            BandArrange::SingleRow { table } => assert!(!table),
+            _ => panic!("expected single row without table"),
+        }
+    }
+
+    #[test]
+    fn arrange_narrow_tall_wraps_to_two_rows() {
+        match arrange_band(80, PANELS_2ROW_MIN_H, 4) {
+            BandArrange::TwoRow {
+                top,
+                table_in_hole,
+            } => {
+                assert_eq!(top, 2);
+                assert!(!table_in_hole, "even count fills both rows");
+            }
+            _ => panic!("expected two-row grid"),
+        }
+    }
+
+    #[test]
+    fn arrange_three_panels_fills_hole_with_table() {
+        match arrange_band(80, PANELS_2ROW_MIN_H, 3) {
+            BandArrange::TwoRow {
+                top,
+                table_in_hole,
+            } => {
+                assert_eq!(top, 2);
+                assert!(table_in_hole, "odd count leaves a hole for the table");
+            }
+            _ => panic!("expected two-row grid"),
+        }
+    }
+
+    #[test]
+    fn arrange_narrow_short_falls_back_to_single_row() {
+        // Too narrow for one row and too short for two: last-resort even split.
+        match arrange_band(80, PANELS_2ROW_MIN_H - 1, 4) {
+            BandArrange::SingleRow { table } => assert!(!table),
+            _ => panic!("expected single-row fallback"),
+        }
+    }
+
+    #[test]
+    fn arrange_zero_panels_is_table_only() {
+        match arrange_band(100, 40, 0) {
+            BandArrange::SingleRow { table } => assert!(table),
+            _ => panic!("expected table-only row"),
+        }
+    }
+
+    #[test]
+    fn split_band_always_yields_exactly_n_panels() {
+        let area = Rect::new(0, 0, 200, 16);
+        for n in 0..=4 {
+            let arrange = arrange_band(area.width, area.height, n);
+            let grid = split_band(area, &arrange, n);
+            assert_eq!(grid.panels.len(), n, "n={n}");
+        }
+    }
+
+    #[test]
+    fn split_band_two_row_three_panels_has_table_in_hole() {
+        let area = Rect::new(0, 0, 80, 16);
+        let arrange = BandArrange::TwoRow {
+            top: 2,
+            table_in_hole: true,
+        };
+        let grid = split_band(area, &arrange, 3);
+        assert_eq!(grid.panels.len(), 3);
+        assert!(grid.table.is_some(), "the hole is filled with the table");
+    }
 }

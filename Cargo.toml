@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 ahash = { version = "0.8.12", features = ["serde"] }
 anyhow = "1.0.102"
+base64 = "0.22.1"
 bytecount = "0.6.9"
 chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4.6.1", features = ["derive", "env"] }

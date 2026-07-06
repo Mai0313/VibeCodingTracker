@@ -12,7 +12,9 @@
 //! - [`QuotaOutcome::Transient`] — keep last-known-good, dropping it only once
 //!   it has aged past [`STALE_AFTER_SECS`].
 
-use crate::models::{ClaudeQuotaSnapshot, CodexQuotaSnapshot, QuotaSource};
+use crate::models::{
+    ClaudeQuotaSnapshot, CodexQuotaSnapshot, CopilotQuotaSnapshot, CursorQuotaSnapshot, QuotaSource,
+};
 use serde::Serialize;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -65,6 +67,41 @@ impl QuotaSnapshot for CodexQuotaSnapshot {
     }
     fn is_present(&self) -> bool {
         self.source != QuotaSource::None || self.needs_login
+    }
+    fn set_needs_login(&mut self, value: bool) {
+        self.needs_login = value;
+    }
+}
+
+impl QuotaSnapshot for CopilotQuotaSnapshot {
+    fn fetched_at(&self) -> i64 {
+        self.fetched_at
+    }
+    fn is_present(&self) -> bool {
+        // Mirror the render gate: a premium gauge, an unlimited flag, the plan
+        // label, or a login hint all give the panel something to show.
+        self.premium.is_some()
+            || self.premium_unlimited
+            || self.chat_unlimited
+            || self.completions_unlimited
+            || self.plan_type.is_some()
+            || self.needs_login
+    }
+    fn set_needs_login(&mut self, value: bool) {
+        self.needs_login = value;
+    }
+}
+
+impl QuotaSnapshot for CursorQuotaSnapshot {
+    fn fetched_at(&self) -> i64 {
+        self.fetched_at
+    }
+    fn is_present(&self) -> bool {
+        self.total.is_some()
+            || self.auto.is_some()
+            || self.api.is_some()
+            || self.plan_type.is_some()
+            || self.needs_login
     }
     fn set_needs_login(&mut self, value: bool) {
         self.needs_login = value;

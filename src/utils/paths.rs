@@ -29,6 +29,8 @@ pub struct HelperPaths {
     pub copilot_dir: PathBuf,
     /// Copilot CLI session state (`~/.copilot/session-state`).
     pub copilot_session_dir: PathBuf,
+    /// Cursor CLI config root (`$XDG_CONFIG_HOME/cursor` or `~/.config/cursor`).
+    pub cursor_dir: PathBuf,
     /// Gemini CLI root (`~/.gemini`).
     pub gemini_dir: PathBuf,
     /// Gemini CLI session logs (`~/.gemini/tmp`).
@@ -65,6 +67,13 @@ pub fn resolve_paths() -> Result<HelperPaths> {
     // for picking only the `events.jsonl` file from each session tree and
     // ignoring the snapshot/checkpoint artifacts.
     let copilot_session_dir = copilot_dir.join("session-state");
+    // Cursor keeps its CLI OAuth credentials under the XDG config directory,
+    // honouring `$XDG_CONFIG_HOME` and falling back to `~/.config`.
+    let cursor_dir = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| home_dir.join(".config"))
+        .join("cursor");
     let gemini_dir = home_dir.join(".gemini");
     let gemini_session_dir = gemini_dir.join("tmp");
     // OpenCode keeps a single SQLite database under the XDG data directory,
@@ -85,6 +94,7 @@ pub fn resolve_paths() -> Result<HelperPaths> {
         claude_session_dir,
         copilot_dir,
         copilot_session_dir,
+        cursor_dir,
         gemini_dir,
         gemini_session_dir,
         opencode_dir,
@@ -192,6 +202,54 @@ pub fn get_claude_usage_cache_path() -> Result<PathBuf> {
 /// Returns an error if the cache directory cannot be resolved or created.
 pub fn get_codex_usage_cache_path() -> Result<PathBuf> {
     Ok(get_cache_dir()?.join("codex_usage.json"))
+}
+
+/// Returns the Copilot usage cache path
+/// (`~/.vibe_coding_tracker/copilot_usage.json`).
+///
+/// As a side effect of resolving the cache directory, the directory is
+/// created if missing.
+///
+/// # Errors
+///
+/// Returns an error if the cache directory cannot be resolved or created.
+pub fn get_copilot_usage_cache_path() -> Result<PathBuf> {
+    Ok(get_cache_dir()?.join("copilot_usage.json"))
+}
+
+/// Returns the Cursor usage cache path
+/// (`~/.vibe_coding_tracker/cursor_usage.json`).
+///
+/// As a side effect of resolving the cache directory, the directory is
+/// created if missing.
+///
+/// # Errors
+///
+/// Returns an error if the cache directory cannot be resolved or created.
+pub fn get_cursor_usage_cache_path() -> Result<PathBuf> {
+    Ok(get_cache_dir()?.join("cursor_usage.json"))
+}
+
+/// Returns the Copilot CLI config path (`~/.copilot/config.json`).
+///
+/// This file is JSONC (has `//` comments); callers must strip comments before
+/// parsing it as JSON.
+///
+/// # Errors
+///
+/// Returns an error if the user's home directory cannot be determined.
+pub fn get_copilot_config_path() -> Result<PathBuf> {
+    Ok(resolve_paths()?.copilot_dir.join("config.json"))
+}
+
+/// Returns the Cursor CLI OAuth credentials path
+/// (`$XDG_CONFIG_HOME/cursor/auth.json` or `~/.config/cursor/auth.json`).
+///
+/// # Errors
+///
+/// Returns an error if the user's home directory cannot be determined.
+pub fn get_cursor_auth_path() -> Result<PathBuf> {
+    Ok(resolve_paths()?.cursor_dir.join("auth.json"))
 }
 
 /// Returns the Claude OAuth credentials path (`~/.claude/.credentials.json`).
