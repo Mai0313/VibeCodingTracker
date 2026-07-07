@@ -74,8 +74,13 @@ pub fn map_cursor_usage(body: &str, now: i64) -> Result<CursorQuotaSnapshot> {
         serde_json::from_str(body).context("Failed to parse Cursor usage summary")?;
 
     let reset = resp.billing_cycle_end.as_deref().and_then(iso_to_unix_secs);
-    // Cursor's `*PercentUsed` fields actually report percent REMAINING; invert
-    // so the gauge shows how much has been used, matching the other panels.
+    // NOTE: despite the `*PercentUsed` names, Cursor reports these inversely to
+    // absolute usage. Observed on a fresh free plan: `plan.used == 0` yet
+    // `totalPercentUsed == 94`, so the field is *not* percent used. We invert
+    // (100 - value) so a barely-used account reads as a near-empty gauge and
+    // matches what cursor.com shows, consistent with the other panels. Do not
+    // "simplify" this back to `p` — that regresses the gauge to show ~full for
+    // an unused account.
     let win = |pct: Option<f64>| {
         pct.map(|p| QuotaWindow {
             used_percent: (100.0 - p).clamp(0.0, 100.0),
