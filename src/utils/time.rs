@@ -1,7 +1,16 @@
 //! Timestamp parsing helpers for the ISO-8601 / RFC 3339 strings that the
 //! provider session logs embed in each record.
 
-use chrono::DateTime;
+use chrono::{DateTime, SecondsFormat, Utc};
+
+/// Current UTC time as RFC3339 with nanoseconds and a `Z` suffix
+/// (e.g. `2026-07-07T05:34:50.563606999Z`).
+///
+/// Matches the format Codex writes for `auth.json`'s `last_refresh` and the
+/// stamp the quota version caches / self `version.json` record use.
+pub fn now_rfc3339_utc_nanos() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)
+}
 
 /// Parses an ISO-8601 / RFC 3339 timestamp into Unix milliseconds.
 ///

@@ -14,6 +14,7 @@
 mod archive;
 mod github;
 mod platform;
+mod version_cache;
 
 use anyhow::{Context, Result};
 use semver::Version;
@@ -87,6 +88,10 @@ fn get_version_comparison() -> Result<Option<(String, Version, Version, GitHubRe
         "Failed to parse latest version: {}",
         latest_version_str
     ))?;
+
+    // Record the check for the future auto-update prompt, regardless of whether
+    // a newer version exists. Best-effort: a write failure never blocks update.
+    let _ = version_cache::record_version_check(&latest_version.to_string());
 
     if latest_version <= current_version {
         println!("Already on the latest version (v{})", current_version);
@@ -260,6 +265,8 @@ pub fn perform_force_update() -> Result<()> {
         "Failed to parse latest version: {}",
         latest_version_str
     ))?;
+
+    let _ = version_cache::record_version_check(&latest_version.to_string());
 
     perform_installation(&current_version_display, &latest_version, &release)
 }

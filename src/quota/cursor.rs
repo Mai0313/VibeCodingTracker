@@ -2,27 +2,53 @@
 //!
 //! Reads the WorkOS session JWT from the Cursor CLI's `auth.json`, synthesizes
 //! the `WorkosCursorSessionToken` cookie the way the official client does, and
-//! calls `GET /api/usage-summary`. Cursor needs no client impersonation.
+//! calls `GET /api/usage-summary`, impersonating the Cursor CLI via a
+//! `cursor-agent/<version>` User-Agent (version detected from
+//! `cursor-agent --version`, cached for the day).
 //!
 //! The access token is valid ~60 days and the official Cursor CLI / IDE keeps
 //! `auth.json` fresh in the background, so refresh is **reactive**: the file is
 //! re-read every tick and its token used while the JWT `exp` is still in the
 //! future. We never write the file back. An expired token or a 401/403 surfaces
-//! a `cursor login` hint.
+//! a `cursor-agent login` hint.
 
 use crate::models::{CursorQuotaSnapshot, CursorUsageSummary, QuotaSource, QuotaWindow};
-use crate::quota::http::iso_to_unix_secs;
+use crate::quota::http::{detect_cli_version, iso_to_unix_secs};
 use crate::quota::provider::QuotaOutcome;
 use crate::utils::get_cursor_auth_path;
 use anyhow::{Context, Result};
 use base64::Engine;
 use reqwest::blocking::Client;
+use std::sync::OnceLock;
 
 /// The Cursor usage-summary endpoint.
 const CURSOR_USAGE_URL: &str = "https://cursor.com/api/usage-summary";
+/// Fallback Cursor CLI version for the User-Agent when `cursor-agent --version`
+/// cannot be resolved (CLI absent or unreadable). Bump occasionally.
+const CURSOR_FALLBACK_VERSION: &str = "2026.07.07";
 /// Login hint shown when the Cursor session is expired / rejected. The CLI that
 /// manages `auth.json` is `cursor-agent` (`cursor` is the editor launcher).
 pub const CURSOR_LOGIN_HINT: &str = "run: cursor-agent login";
+
+/// Builds the Cursor CLI's request User-Agent, e.g. `cursor-agent/2026.07.07`.
+///
+/// The version is detected from the installed CLI (see
+/// [`crate::quota::http::detect_cli_version`]) so the UA tracks the real client
+/// rather than drifting from a hardcoded constant.
+fn cursor_ua() -> &'static str {
+    static UA: OnceLock<String> = OnceLock::new();
+    UA.get_or_init(|| {
+        format!(
+            "cursor-agent/{}",
+            detect_cli_version(
+                "cursor-agent",
+                "cursor_version.json",
+                CURSOR_FALLBACK_VERSION
+            )
+        )
+    })
+    .as_str()
+}
 
 /// A usable Cursor session: the synthesized cookie header + the JWT expiry.
 struct CursorSession {
@@ -143,6 +169,7 @@ fn fetch_cursor_usage(client: &Client, cookie: &str, now: i64) -> FetchResult {
         .get(CURSOR_USAGE_URL)
         .header(reqwest::header::COOKIE, cookie)
         .header(reqwest::header::ACCEPT, "application/json")
+        .header(reqwest::header::USER_AGENT, cursor_ua())
         .send()
     {
         Ok(r) => r,

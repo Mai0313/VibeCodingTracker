@@ -7,9 +7,9 @@
 use anyhow::{Context, Result};
 
 /// Detects an installed CLI's version by running `<bin> --version`, caching the
-/// result under `~/.vibe_coding_tracker/<cache_file>` for the day so it is not
-/// re-run on every launch. Falls back to `fallback` when the CLI is absent or
-/// unreadable, so the User-Agent it feeds is always a plausible client version.
+/// result under `~/.vct/<cache_file>` for the day so it is not re-run on every
+/// launch. Falls back to `fallback` when the CLI is absent or unreadable, so the
+/// User-Agent it feeds is always a plausible client version.
 pub fn detect_cli_version(bin: &str, cache_file: &str, fallback: &str) -> String {
     if let Some(v) = read_cached_version(cache_file) {
         return v;
@@ -30,23 +30,27 @@ pub fn parse_version(raw: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Reads the `{version, date}` cache, returning the version only if stamped today.
+/// Reads the `{version, last_checked_at}` cache, returning the version only if
+/// it was stamped earlier on the current UTC day.
 fn read_cached_version(cache_file: &str) -> Option<String> {
     let path = crate::utils::get_cache_dir().ok()?.join(cache_file);
     let text = std::fs::read_to_string(path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    if v.get("date")?.as_str()? != today() {
+    if !is_today_utc(v.get("last_checked_at")?.as_str()?) {
         return None;
     }
     v.get("version")?.as_str().map(str::to_string)
 }
 
-/// Persists `version` stamped with today's date (best-effort, atomic).
+/// Persists `version` stamped with the current UTC time (best-effort, atomic).
 fn write_cached_version(cache_file: &str, version: &str) -> Result<()> {
     let path = crate::utils::get_cache_dir()?.join(cache_file);
     crate::utils::write_json_atomic(
         path,
-        &serde_json::json!({ "version": version, "date": today() }),
+        &serde_json::json!({
+            "version": version,
+            "last_checked_at": crate::utils::now_rfc3339_utc_nanos(),
+        }),
     )
 }
 
@@ -60,9 +64,15 @@ fn run_cli_version(bin: &str) -> Option<String> {
     parse_version(&String::from_utf8_lossy(&output.stdout))
 }
 
-/// Today's local date as `YYYY-MM-DD`.
-fn today() -> String {
-    chrono::Local::now().format("%Y-%m-%d").to_string()
+/// Whether `ts` (an RFC3339 timestamp) falls on the current UTC calendar day.
+///
+/// The version cache stores a full RFC3339 nanosecond stamp but is only
+/// refreshed once per day, so staleness is decided on the UTC date alone. An
+/// unparseable stamp reads as stale so the version is re-detected.
+fn is_today_utc(ts: &str) -> bool {
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .map(|dt| dt.with_timezone(&chrono::Utc).date_naive() == chrono::Utc::now().date_naive())
+        .unwrap_or(false)
 }
 
 /// Builds the shared blocking HTTP client (8s timeout, no default UA).
@@ -99,6 +109,14 @@ mod tests {
     fn iso_to_unix_secs_handles_bad_input() {
         assert_eq!(iso_to_unix_secs("not-a-date"), None);
         assert!(iso_to_unix_secs("2026-07-03T17:09:59.651608+00:00").unwrap() > 0);
+    }
+
+    #[test]
+    fn is_today_utc_matches_now_but_not_a_past_day() {
+        let now = crate::utils::now_rfc3339_utc_nanos();
+        assert!(is_today_utc(&now));
+        assert!(!is_today_utc("2000-01-01T00:00:00Z"));
+        assert!(!is_today_utc("not-a-timestamp"));
     }
 
     #[test]
