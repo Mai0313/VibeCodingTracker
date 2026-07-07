@@ -12,7 +12,7 @@ use std::fmt;
 /// use vibe_coding_tracker::models::Provider;
 ///
 /// assert_eq!(Provider::from_model_name("claude-sonnet-4"), Provider::ClaudeCode);
-/// assert_eq!(Provider::ClaudeCode.display_name(), "Claude Code");
+/// assert_eq!(Provider::ClaudeCode.display_name(), "Claude");
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Provider {
@@ -107,9 +107,9 @@ impl Provider {
     /// This is the same string produced by the [`std::fmt::Display`] impl.
     pub const fn display_name(&self) -> &'static str {
         match self {
-            Self::ClaudeCode => "Claude Code",
-            Self::Codex => "OpenAI Codex",
-            Self::Copilot => "GitHub Copilot",
+            Self::ClaudeCode => "Claude",
+            Self::Codex => "Codex",
+            Self::Copilot => "Copilot",
             Self::Gemini => "Gemini",
             Self::OpenCode => "OpenCode",
             Self::Unknown => "Unknown",
@@ -159,9 +159,9 @@ mod tests {
 
     #[test]
     fn test_provider_display() {
-        assert_eq!(Provider::ClaudeCode.display_name(), "Claude Code");
-        assert_eq!(Provider::Codex.display_name(), "OpenAI Codex");
-        assert_eq!(Provider::Copilot.display_name(), "GitHub Copilot");
+        assert_eq!(Provider::ClaudeCode.display_name(), "Claude");
+        assert_eq!(Provider::Codex.display_name(), "Codex");
+        assert_eq!(Provider::Copilot.display_name(), "Copilot");
         assert_eq!(Provider::Gemini.display_name(), "Gemini");
         assert_eq!(Provider::OpenCode.display_name(), "OpenCode");
         assert_eq!(Provider::Unknown.display_name(), "Unknown");

@@ -7,6 +7,7 @@
 //! between frames so a resize repaints instantly without re-aggregating; memory
 //! is trimmed back to the OS after each refresh.
 
+use crate::display::common::ProviderTotal;
 use crate::display::common::table::{
     create_controls, create_provider_row, create_ratatui_table, create_summary, main_layout,
     render_scrollable_table, render_too_small, styled_row,
@@ -16,7 +17,8 @@ use crate::display::common::tui::{
     setup_terminal,
 };
 use crate::display::usage::averages::{
-    UsageProviderTotals, UsageRow, UsageTotals, build_provider_total_rows, build_usage_summary,
+    ProviderStats, UsageProviderTotals, UsageRow, UsageTotals, build_provider_total_rows,
+    build_usage_summary,
 };
 use crate::models::{
     ClaudeQuotaSnapshot, CodexQuotaSnapshot, CopilotQuotaSnapshot, CursorQuotaSnapshot,
@@ -66,10 +68,10 @@ const CURSOR_COLOR: RatatuiColor = RatatuiColor::Rgb(64, 180, 180);
 /// percent + reset). Below this a panel's gauge tail may clip.
 const PANEL_MIN_W: u16 = 28;
 /// Minimum width to keep the (slimmed) Provider Usage table inline in the band.
-/// Matches the table's own column widths (Provider 16 + Tokens 16 + Cost 14)
-/// so it is only kept when it can render without truncating; otherwise the band
-/// drops it and the panels take the full width.
-const BAND_TABLE_MIN_W: u16 = 46;
+/// Matches the table's own column widths (Provider 9 + Tokens 11 + Cost 11 plus
+/// borders/spacing) so it is only kept when it can render without truncating;
+/// otherwise the band drops it and the panels take the full width.
+const BAND_TABLE_MIN_W: u16 = 38;
 /// Terminal height needed to wrap the panels into a two-row grid.
 const PANELS_2ROW_MIN_H: u16 = 26;
 
@@ -643,6 +645,21 @@ fn render_usage_frame(
             // keeps a cell for it; otherwise the panels take the whole band and
             // the scrollable per-model table above carries the per-provider view.
             if let Some(table_area) = grid.table {
+                // Draw one outer border for the whole cell, then split its inside
+                // into the provider table (top) and a stacked share bar pinned to
+                // the bottom line, so both live inside the same box.
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(RatatuiColor::Magenta));
+                let inner = block.inner(table_area);
+                f.render_widget(block, table_area);
+
+                let cells = RatatuiLayout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(2), Constraint::Length(1)])
+                    .split(inner);
+                let (rows_area, bar_area) = (cells[0], cells[1]);
+
                 // Drop the "All Providers" aggregate; the summary bar already
                 // carries the grand totals.
                 let mut totals_rows: Vec<RatatuiRow> = provider_rows
@@ -674,18 +691,26 @@ fn render_usage_frame(
 
                 let totals_header = vec!["Provider", "Tokens", "Cost"];
                 let totals_widths = [
-                    Constraint::Min(16),
-                    Constraint::Length(16),
-                    Constraint::Length(14),
+                    Constraint::Min(9),
+                    Constraint::Length(11),
+                    Constraint::Length(11),
                 ];
 
+                // Reuse the shared table builder but strip its own border (the
+                // outer block above already draws it) by overriding the block.
                 let totals_table = create_ratatui_table(
                     totals_rows,
                     totals_header,
                     &totals_widths,
                     RatatuiColor::Magenta,
+                )
+                .block(Block::default());
+                f.render_widget(totals_table, rows_area);
+
+                f.render_widget(
+                    Paragraph::new(provider_share_bar(&provider_rows, bar_area.width)),
+                    bar_area,
                 );
-                f.render_widget(totals_table, table_area);
             }
 
             // Render present panels in fixed order (Claude → Codex → Copilot →
@@ -747,6 +772,64 @@ fn gauge_color(pct: f64) -> RatatuiColor {
 fn mini_bar(pct: f64) -> String {
     let filled = ((pct / 20.0).ceil() as i64).clamp(0, 5) as usize;
     (0..5).map(|i| if i < filled { '▰' } else { '▱' }).collect()
+}
+
+/// Builds a horizontal stacked share bar filling `width` columns: one solid
+/// colored segment per provider, sized by its token share of the total.
+///
+/// Each segment reuses the provider's `tui_color` so it lines up with the table
+/// rows above. Segment widths use largest-remainder rounding so they always sum
+/// to exactly `width`. Falls back to a dim placeholder bar when there is no
+/// token data (or zero width).
+fn provider_share_bar(rows: &[ProviderTotal<'_, ProviderStats>], width: u16) -> Line<'static> {
+    let width = width as usize;
+    // Providers that actually contributed tokens (skip the "All Providers"
+    // aggregate and any empty provider).
+    let segments: Vec<(RatatuiColor, i64)> = rows
+        .iter()
+        .filter(|row| row.label != "All Providers" && row.stats.total_tokens > 0)
+        .map(|row| (row.tui_color, row.stats.total_tokens))
+        .collect();
+    let total: i64 = segments.iter().map(|(_, t)| *t).sum();
+
+    if width == 0 || total <= 0 {
+        return Line::from(Span::styled(
+            "░".repeat(width),
+            Style::default().fg(RatatuiColor::DarkGray),
+        ));
+    }
+
+    // Largest-remainder apportionment: floor each share, then hand the leftover
+    // columns to the largest fractional remainders so the bar fills exactly.
+    let mut widths: Vec<usize> = Vec::with_capacity(segments.len());
+    let mut remainders: Vec<(usize, f64)> = Vec::with_capacity(segments.len());
+    let mut used = 0usize;
+    for (i, (_, tokens)) in segments.iter().enumerate() {
+        let exact = *tokens as f64 / total as f64 * width as f64;
+        let floor = exact.floor() as usize;
+        widths.push(floor);
+        remainders.push((i, exact - floor as f64));
+        used += floor;
+    }
+    let mut leftover = width.saturating_sub(used);
+    remainders.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    for (i, _) in remainders {
+        if leftover == 0 {
+            break;
+        }
+        widths[i] += 1;
+        leftover -= 1;
+    }
+
+    let spans: Vec<Span<'static>> = segments
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (color, _))| {
+            let w = widths[i];
+            (w > 0).then(|| Span::styled("█".repeat(w), Style::default().fg(*color)))
+        })
+        .collect();
+    Line::from(spans)
 }
 
 /// Builds one gauge line: `5h     ▰▰▱▱▱   27%  ↻ 4h13m`.
@@ -870,8 +953,9 @@ fn arrange_band(w: u16, area_h: u16, n: usize) -> BandArrange {
 /// The band height fed to `main_layout` (computed before the band `Rect` exists).
 fn band_height(arrange: &BandArrange, provider_rows: usize) -> u16 {
     match arrange {
+        // border(2) + header(1) + header margin(1) + provider rows + share bar(1).
         BandArrange::SingleRow { table: true } => (provider_rows as u16)
-            .saturating_add(4)
+            .saturating_add(5)
             .max(QUOTA_PANEL_MIN_HEIGHT),
         BandArrange::SingleRow { table: false } => QUOTA_PANEL_MIN_HEIGHT,
         BandArrange::TwoRow { .. } => QUOTA_PANEL_MIN_HEIGHT.saturating_mul(2),
@@ -1204,6 +1288,53 @@ fn claude_balance_line(claude: &ClaudeQuotaSnapshot) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::Provider;
+
+    fn stats(tokens: i64) -> ProviderStats {
+        ProviderStats {
+            total_tokens: tokens,
+            total_cost: 0.0,
+            days_count: 1,
+        }
+    }
+
+    #[test]
+    fn share_bar_fills_exact_width() {
+        let (c, x, p) = (stats(710), stats(210), stats(80));
+        let rows = vec![
+            ProviderTotal::new(Provider::ClaudeCode, &c, false),
+            ProviderTotal::new(Provider::Codex, &x, false),
+            ProviderTotal::new(Provider::Copilot, &p, false),
+        ];
+        let bar = provider_share_bar(&rows, 20);
+        let total: usize = bar.spans.iter().map(|s| s.content.chars().count()).sum();
+        assert_eq!(total, 20, "segments must fill the whole bar width");
+        // Largest share (Claude) gets the widest segment.
+        assert!(bar.spans[0].content.chars().count() >= bar.spans[1].content.chars().count());
+    }
+
+    #[test]
+    fn share_bar_placeholder_when_no_tokens() {
+        let empty = stats(0);
+        let rows = vec![ProviderTotal::new(Provider::ClaudeCode, &empty, false)];
+        let bar = provider_share_bar(&rows, 10);
+        let total: usize = bar.spans.iter().map(|s| s.content.chars().count()).sum();
+        assert_eq!(total, 10);
+        assert_eq!(
+            bar.spans.len(),
+            1,
+            "no-data bar is a single placeholder span"
+        );
+    }
+
+    #[test]
+    fn share_bar_zero_width_is_empty() {
+        let c = stats(100);
+        let rows = vec![ProviderTotal::new(Provider::ClaudeCode, &c, false)];
+        let bar = provider_share_bar(&rows, 0);
+        let total: usize = bar.spans.iter().map(|s| s.content.chars().count()).sum();
+        assert_eq!(total, 0);
+    }
 
     #[test]
     fn arrange_wide_keeps_table_in_one_row() {
