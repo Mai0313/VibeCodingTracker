@@ -637,6 +637,18 @@ pub struct CursorUsageSummary {
     /// Per-user usage breakdown.
     #[serde(default)]
     pub individual_usage: Option<CursorIndividualUsage>,
+    /// Team / enterprise usage breakdown (on-demand may live here instead).
+    #[serde(default)]
+    pub team_usage: Option<CursorTeamUsage>,
+}
+
+/// The `teamUsage` object of a Cursor usage summary.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CursorTeamUsage {
+    /// Shared team on-demand (overage) spend.
+    #[serde(default)]
+    pub on_demand: Option<CursorOnDemand>,
 }
 
 /// The `individualUsage` object of a Cursor usage summary.

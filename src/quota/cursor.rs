@@ -86,13 +86,20 @@ pub fn map_cursor_usage(body: &str, now: i64) -> Result<CursorQuotaSnapshot> {
     let auto = win(plan.and_then(|p| p.auto_percent_used));
     let api = win(plan.and_then(|p| p.api_percent_used));
 
-    let on_demand_dollars = resp
+    // Prefer the individual on-demand spend; team/enterprise accounts bill it
+    // under `teamUsage.onDemand` while the individual branch is disabled.
+    let individual_od = resp
         .individual_usage
         .as_ref()
         .and_then(|u| u.on_demand.as_ref())
         .filter(|d| d.enabled == Some(true))
-        .and_then(|d| d.used)
-        .map(|cents| cents / 100.0);
+        .and_then(|d| d.used);
+    let team_od = resp
+        .team_usage
+        .as_ref()
+        .and_then(|t| t.on_demand.as_ref())
+        .and_then(|d| d.used);
+    let on_demand_dollars = individual_od.or(team_od).map(|cents| cents / 100.0);
 
     let is_unlimited = resp.is_unlimited.unwrap_or(false);
     let limit_reached = !is_unlimited
@@ -260,6 +267,18 @@ mod tests {
         let body = r#"{ "membershipType": "pro", "individualUsage": { "onDemand": { "enabled": true, "used": 1840 } } }"#;
         let snap = map_cursor_usage(body, 1).unwrap();
         assert_eq!(snap.on_demand_dollars, Some(18.40));
+    }
+
+    #[test]
+    fn on_demand_falls_back_to_team_usage() {
+        // Individual on-demand disabled, but the team pool carries the spend.
+        let body = r#"{
+          "membershipType": "enterprise",
+          "individualUsage": { "onDemand": { "enabled": false } },
+          "teamUsage": { "onDemand": { "used": 5000 } }
+        }"#;
+        let snap = map_cursor_usage(body, 1).unwrap();
+        assert_eq!(snap.on_demand_dollars, Some(50.0));
     }
 
     #[test]
