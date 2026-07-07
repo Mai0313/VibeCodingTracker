@@ -594,12 +594,6 @@ pub struct CopilotQuotaSnapshots {
     /// Premium (model) request quota — the headline gauge.
     #[serde(default)]
     pub premium_interactions: Option<CopilotQuotaEntry>,
-    /// Chat quota (usually unlimited on paid plans).
-    #[serde(default)]
-    pub chat: Option<CopilotQuotaEntry>,
-    /// Completions quota (usually unlimited on paid plans).
-    #[serde(default)]
-    pub completions: Option<CopilotQuotaEntry>,
 }
 
 /// One Copilot quota snapshot entry.
@@ -716,12 +710,6 @@ pub struct CopilotQuotaSnapshot {
     /// Whether premium interactions are unlimited.
     #[serde(default)]
     pub premium_unlimited: bool,
-    /// Whether chat is unlimited.
-    #[serde(default)]
-    pub chat_unlimited: bool,
-    /// Whether completions are unlimited.
-    #[serde(default)]
-    pub completions_unlimited: bool,
     /// Whether the premium quota has been exhausted (drives the `LIMIT` flag).
     #[serde(default)]
     pub limit_reached: bool,
