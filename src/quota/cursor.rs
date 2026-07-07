@@ -167,9 +167,12 @@ impl CursorState {
             Ok(b) => b,
             Err(_) => return QuotaOutcome::Transient,
         };
+        // The file exists but yields no usable session (cleared on logout, no
+        // `accessToken`, or a malformed JWT) — an auth failure, not a network
+        // blip — so nudge login instead of silently showing "no Cursor quota".
         let session = match read_cursor_session(&body) {
             Some(s) => s,
-            None => return QuotaOutcome::Transient,
+            None => return QuotaOutcome::NeedsLogin,
         };
         // The token is expired and we cannot refresh it ourselves; nudge login.
         if session.exp > 0 && session.exp <= now {
