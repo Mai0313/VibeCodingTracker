@@ -141,6 +141,12 @@ pub enum Commands {
         #[arg(long, group = "usage_format")]
         table: bool,
 
+        /// Merge models that share a base name across provider prefixes
+        /// (e.g. `openai/gpt-5.5` + `azure/gpt-5.5`). In the TUI this seeds the
+        /// initial state; press `m` to toggle. Ignored for `--json`.
+        #[arg(long)]
+        merge_providers: bool,
+
         /// Show only today's data.
         #[arg(long, group = "period")]
         daily: bool,

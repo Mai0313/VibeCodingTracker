@@ -90,6 +90,9 @@ pub fn handle_input() -> anyhow::Result<InputAction> {
                 if key.code == KeyCode::Char('r') || key.code == KeyCode::Char('R') {
                     return Ok(InputAction::Refresh);
                 }
+                if key.code == KeyCode::Char('m') || key.code == KeyCode::Char('M') {
+                    return Ok(InputAction::ToggleMerge);
+                }
                 // Navigation accumulates across the drained batch so a held key
                 // collapses into a single net move per tick.
                 match key.code {
@@ -147,6 +150,9 @@ pub enum InputAction {
     Quit,
     /// User asked to re-fetch and redraw (`r` / `R`).
     Refresh,
+    /// User toggled provider-prefix merging (`m` / `M`); usage view only,
+    /// ignored elsewhere.
+    ToggleMerge,
     /// User scrolled / moved the selection; redraw without re-fetching.
     Navigate(NavDelta),
     /// Terminal was resized — redraw the current frame at the new size

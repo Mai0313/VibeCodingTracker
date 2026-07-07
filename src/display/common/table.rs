@@ -89,28 +89,40 @@ pub fn create_summary<'a>(
 ///
 /// Everything is on one line to save vertical space; the star link sits last so
 /// it is the first thing truncated on a narrow terminal, leaving the keys
-/// readable.
-pub fn create_controls() -> Paragraph<'static> {
+/// readable. `extra` inserts view-specific `(key, label)` hints just before
+/// `r refresh` — the usage view passes its `m merge` toggle; other views pass
+/// an empty slice.
+pub fn create_controls(extra: &[(&str, &str)]) -> Paragraph<'static> {
     let key = Style::default().fg(RatatuiColor::Cyan).bold();
     let dim = Style::default().fg(RatatuiColor::DarkGray);
-    Paragraph::new(vec![Line::from(vec![
+    let mut spans = vec![
         Span::styled("↑/↓", key),
         Span::styled(" scroll  ", dim),
         Span::styled("PgUp/PgDn", key),
         Span::styled(" page  ", dim),
         Span::styled("g/G", key),
         Span::styled(" top/end  ", dim),
-        Span::styled("r", key),
-        Span::styled(" refresh  ", dim),
-        Span::styled("q", Style::default().fg(RatatuiColor::Red).bold()),
-        Span::styled(" quit", dim),
-        Span::styled("  |  ★ ", Style::default().fg(RatatuiColor::Yellow)),
-        Span::styled(
-            "github.com/Mai0313/VibeCodingTracker",
-            Style::default().fg(RatatuiColor::Cyan).underlined(),
-        ),
-    ])])
-    .centered()
+    ];
+    for (k, label) in extra {
+        spans.push(Span::styled(k.to_string(), key));
+        spans.push(Span::styled(label.to_string(), dim));
+    }
+    spans.push(Span::styled("r", key));
+    spans.push(Span::styled(" refresh  ", dim));
+    spans.push(Span::styled(
+        "q",
+        Style::default().fg(RatatuiColor::Red).bold(),
+    ));
+    spans.push(Span::styled(" quit", dim));
+    spans.push(Span::styled(
+        "  |  ★ ",
+        Style::default().fg(RatatuiColor::Yellow),
+    ));
+    spans.push(Span::styled(
+        "github.com/Mai0313/VibeCodingTracker",
+        Style::default().fg(RatatuiColor::Cyan).underlined(),
+    ));
+    Paragraph::new(vec![Line::from(spans)]).centered()
 }
 
 /// Vertical chunk rects for an interactive frame.
