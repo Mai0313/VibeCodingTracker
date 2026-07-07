@@ -139,10 +139,17 @@ pub fn map_copilot_user(body: &str, now: i64) -> Result<CopilotQuotaSnapshot> {
     let resp: CopilotUserResponse =
         serde_json::from_str(body).context("Failed to parse Copilot user response")?;
 
+    // Prefer the UTC instant; fall back to the date-only field (midnight UTC)
+    // so the gauge still shows a reset countdown when only that is returned.
     let reset = resp
         .quota_reset_date_utc
         .as_deref()
-        .and_then(iso_to_unix_secs);
+        .and_then(iso_to_unix_secs)
+        .or_else(|| {
+            resp.quota_reset_date
+                .as_deref()
+                .and_then(|d| iso_to_unix_secs(&format!("{d}T00:00:00Z")))
+        });
 
     let snaps = resp.quota_snapshots.as_ref();
     let premium_entry = snaps.and_then(|s| s.premium_interactions.as_ref());
@@ -393,5 +400,19 @@ mod tests {
         assert!(snap.premium.is_none());
         assert_eq!(snap.plan_type.as_deref(), Some("business"));
         assert!(!snap.limit_reached);
+    }
+
+    #[test]
+    fn reset_falls_back_to_date_only_field() {
+        // Only the date-only field is present (no UTC instant).
+        let body = r#"{
+          "quota_reset_date": "2026-08-01",
+          "quota_snapshots": { "premium_interactions": { "percent_remaining": 50, "remaining": 750, "entitlement": 1500 } }
+        }"#;
+        let snap = map_copilot_user(body, 1).unwrap();
+        assert!(
+            snap.premium.as_ref().unwrap().resets_at_unix.unwrap() > 0,
+            "date-only reset should still yield a timestamp"
+        );
     }
 }
