@@ -336,11 +336,12 @@ pub fn display_usage_interactive(
     let mut rows_data: Vec<UsageRow> = Vec::new();
     let mut totals = UsageTotals::default();
     let mut provider_totals = UsageProviderTotals::default();
-    // `rows_data` is the un-merged canonical list; `display_rows` is what the
-    // table actually shows. When merging is on it collapses provider-prefix
-    // duplicates (e.g. `openai/gpt-5.5` + `azure/gpt-5.5`) into one row. Toggling
-    // `m` re-derives `display_rows` from the cached `rows_data`, so it never
-    // re-scans the session directories.
+    // `rows_data` is the un-merged canonical list. `display_rows` holds the
+    // provider-prefix-collapsed rows (e.g. `openai/gpt-5.5` + `azure/gpt-5.5` ->
+    // `gpt-5.5`) and is materialized **only while merging is on**; when off it
+    // stays empty and the table renders `rows_data` directly (see
+    // `current_view`), so the default path keeps a single copy of the rows.
+    // Toggling `m` re-derives from the cached `rows_data`, never re-scanning disk.
     let mut merge_enabled = merge_providers;
     let mut display_rows: Vec<UsageRow> = Vec::new();
     // Quota panel state, cached across frames so a resize repaints without
@@ -401,11 +402,14 @@ pub fn display_usage_interactive(
 
             // Remember which model was selected so the highlight can follow it
             // across a refresh even if rows are reordered or added/removed.
-            let prev_model = scroll
-                .table
-                .selected()
-                .and_then(|i| display_rows.get(i))
-                .map(|row| row.model.clone());
+            let prev_model = {
+                let view = current_view(merge_enabled, &rows_data, &display_rows);
+                scroll
+                    .table
+                    .selected()
+                    .and_then(|i| view.get(i))
+                    .map(|row| row.model.clone())
+            };
 
             // Cache the rendered display state so a resize can redraw without
             // re-aggregating. These per-model summaries are small; the heavy
@@ -423,13 +427,15 @@ pub fn display_usage_interactive(
             totals = summary.totals;
             provider_totals = summary.provider_totals;
 
-            // Derive the displayed rows from the canonical list per the current
-            // merge toggle. Totals stay from `summary` (a row-wise sum is the
-            // same merged or not), so only the table body changes.
-            display_rows = view_rows(&rows_data, merge_enabled);
+            // Materialize the merged view only when merging is on; when off the
+            // table renders `rows_data` directly (no clone). Totals stay from
+            // `summary` (a row-wise sum is the same merged or not).
+            if merge_enabled {
+                display_rows = merge_rows_by_base_model(&rows_data);
+            }
+            let view = current_view(merge_enabled, &rows_data, &display_rows);
 
-            let model_names: Vec<String> =
-                display_rows.iter().map(|row| row.model.clone()).collect();
+            let model_names: Vec<String> = view.iter().map(|row| row.model.clone()).collect();
             scroll.sync(prev_model.as_deref(), &model_names);
 
             // Refresh quota panels from each background worker's latest snapshot.
@@ -452,30 +458,19 @@ pub fn display_usage_interactive(
             // file-parse on the next refresh.
 
             // Track updates against the displayed rows so highlighting keys off
-            // the merged model name when merging is on.
-            let current_row_keys: Vec<String> =
-                display_rows.iter().map(|row| row.model.clone()).collect();
+            // the merged model name when merging is on. See `row_fingerprint`
+            // for why a merged base name highlights on any variant's change.
+            let current_row_keys: Vec<String> = view.iter().map(|row| row.model.clone()).collect();
 
             update_tracker.cleanup(current_row_keys);
 
-            for row in &display_rows {
-                let row_key = row.model.clone();
-                // Include reasoning in the change fingerprint so Gemini
-                // sessions whose only delta lands in `thoughts_tokens` still
-                // trigger a highlight; otherwise the row would look idle
-                // while its cost silently grew.
-                let current_data = (
-                    row.input_tokens,
-                    row.output_with_reasoning(),
-                    row.cache_read,
-                    row.cache_creation,
-                );
-                update_tracker.track_update(row_key, &current_data);
+            for row in view {
+                update_tracker.track_update(row.model.clone(), &row_fingerprint(row));
             }
 
             render_usage_frame(
                 &mut terminal,
-                &display_rows,
+                view,
                 &totals,
                 &provider_totals,
                 &update_tracker,
@@ -512,19 +507,34 @@ pub fn display_usage_interactive(
             // the cached canonical list — no directory re-scan. Keep the current
             // model selected across the collapse/expand when it survives.
             InputAction::ToggleMerge => {
+                let prev_model = {
+                    let view = current_view(merge_enabled, &rows_data, &display_rows);
+                    scroll
+                        .table
+                        .selected()
+                        .and_then(|i| view.get(i))
+                        .map(|row| row.model.clone())
+                };
                 merge_enabled = !merge_enabled;
-                let prev_model = scroll
-                    .table
-                    .selected()
-                    .and_then(|i| display_rows.get(i))
-                    .map(|row| row.model.clone());
-                display_rows = view_rows(&rows_data, merge_enabled);
-                let model_names: Vec<String> =
-                    display_rows.iter().map(|row| row.model.clone()).collect();
+                // Materialize the merged rows when turning on; drop them (freeing
+                // the copy) when turning off.
+                if merge_enabled {
+                    display_rows = merge_rows_by_base_model(&rows_data);
+                } else {
+                    display_rows = Vec::new();
+                }
+                let view = current_view(merge_enabled, &rows_data, &display_rows);
+                let model_names: Vec<String> = view.iter().map(|row| row.model.clone()).collect();
                 scroll.sync(prev_model.as_deref(), &model_names);
+                // Prime the tracker with the relabeled keys so the next refresh
+                // doesn't treat them as first-seen and green-flash the whole
+                // table; a row still highlights later if its tokens actually move.
+                for row in view {
+                    update_tracker.prime(row.model.clone(), &row_fingerprint(row));
+                }
                 render_usage_frame(
                     &mut terminal,
-                    &display_rows,
+                    view,
                     &totals,
                     &provider_totals,
                     &update_tracker,
@@ -544,10 +554,11 @@ pub fn display_usage_interactive(
             // Move the selection / scroll, then repaint the cached frame
             // without re-aggregating.
             InputAction::Navigate(nav) => {
-                scroll.apply(nav, display_rows.len());
+                let view = current_view(merge_enabled, &rows_data, &display_rows);
+                scroll.apply(nav, view.len());
                 render_usage_frame(
                     &mut terminal,
-                    &display_rows,
+                    view,
                     &totals,
                     &provider_totals,
                     &update_tracker,
@@ -567,24 +578,27 @@ pub fn display_usage_interactive(
             // Redraw the cached frame at the new terminal size without
             // re-aggregating, so resize tracks the drag instead of waiting
             // for the next refresh tick.
-            InputAction::Resize => render_usage_frame(
-                &mut terminal,
-                &display_rows,
-                &totals,
-                &provider_totals,
-                &update_tracker,
-                &sys,
-                pid,
-                &QuotaView {
-                    claude: &claude_snapshot,
-                    codex: &codex_snapshot,
-                    copilot: &copilot_snapshot,
-                    cursor: &cursor_snapshot,
-                    present,
-                },
-                &mut scroll,
-                merge_enabled,
-            )?,
+            InputAction::Resize => {
+                let view = current_view(merge_enabled, &rows_data, &display_rows);
+                render_usage_frame(
+                    &mut terminal,
+                    view,
+                    &totals,
+                    &provider_totals,
+                    &update_tracker,
+                    &sys,
+                    pid,
+                    &QuotaView {
+                        claude: &claude_snapshot,
+                        codex: &codex_snapshot,
+                        copilot: &copilot_snapshot,
+                        cursor: &cursor_snapshot,
+                        present,
+                    },
+                    &mut scroll,
+                    merge_enabled,
+                )?;
+            }
             InputAction::Continue => {}
         }
     }
@@ -593,18 +607,42 @@ pub fn display_usage_interactive(
     Ok(())
 }
 
-/// Returns the rows to display for the current merge toggle: the canonical list
-/// verbatim, or provider-prefix duplicates collapsed into one row per base name.
+/// Returns the rows currently on screen without copying: the canonical
+/// `rows_data` when merging is off, or the pre-materialized merged `display_rows`
+/// when it is on.
 ///
-/// The clone on the un-merged path is cheap (a few dozen small rows) and keeps
-/// the caller holding an owned `Vec` either way, so `rows_data` stays the
-/// untouched canonical source that a later toggle can re-derive from.
-fn view_rows(rows: &[UsageRow], merge_enabled: bool) -> Vec<UsageRow> {
+/// Keeping `display_rows` empty in the (default) un-merged case means the loop
+/// holds a single copy of the rows and skips a per-refresh clone; it is only
+/// populated while the merge toggle is on, where the collapsed rows genuinely
+/// differ from the canonical list.
+fn current_view<'a>(
+    merge_enabled: bool,
+    rows_data: &'a [UsageRow],
+    display_rows: &'a [UsageRow],
+) -> &'a [UsageRow] {
     if merge_enabled {
-        merge_rows_by_base_model(rows)
+        display_rows
     } else {
-        rows.to_vec()
+        rows_data
     }
+}
+
+/// The change-highlight fingerprint of a row: the token buckets only (never
+/// cost, so a fuzzy-price shift can't flicker a row).
+///
+/// Reasoning is folded into the second field so a Gemini session whose only
+/// delta lands in `thoughts_tokens` still registers as a change. When merging is
+/// on this is computed over the summed row, so a collapsed base name highlights
+/// whenever **any** of its folded-in provider variants grows — a base name that
+/// looks idle can flash because a hidden variant (a subagent, another provider
+/// prefix, a background session) is being written. That is truthful, not a bug.
+fn row_fingerprint(row: &UsageRow) -> (i64, i64, i64, i64) {
+    (
+        row.input_tokens,
+        row.output_with_reasoning(),
+        row.cache_read,
+        row.cache_creation,
+    )
 }
 
 /// Render a single usage frame from already-aggregated display state.
