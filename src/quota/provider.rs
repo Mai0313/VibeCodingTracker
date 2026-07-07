@@ -79,11 +79,11 @@ impl QuotaSnapshot for CopilotQuotaSnapshot {
     }
     fn is_present(&self) -> bool {
         // Mirror the render gate: a premium gauge, an unlimited flag, the plan
-        // label, or a login hint all give the panel something to show.
+        // label, or a login hint all give the panel something to show. (Chat /
+        // completions unlimited flags are not rendered, so they must not gate
+        // visibility either, or the panel would show "no Copilot quota".)
         self.premium.is_some()
             || self.premium_unlimited
-            || self.chat_unlimited
-            || self.completions_unlimited
             || self.plan_type.is_some()
             || self.needs_login
     }

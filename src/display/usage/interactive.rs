@@ -773,6 +773,22 @@ fn quota_gauge_line(label: &str, w: &QuotaWindow, now: i64) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Like [`quota_gauge_line`] but labels the bar with a caller-supplied value
+/// (e.g. `36/1500`) instead of a percentage, and carries no reset marker. `pct`
+/// still drives the bar fill and its traffic-light color; used for the Copilot
+/// request-count gauge, which shares the `prem` line's reset window.
+fn quota_gauge_line_value(label: &str, pct: f64, value: &str) -> Line<'static> {
+    let color = gauge_color(pct);
+    Line::from(vec![
+        Span::styled(
+            format!("{label:<6} "),
+            Style::default().fg(RatatuiColor::Gray),
+        ),
+        Span::styled(mini_bar(pct), Style::default().fg(color)),
+        Span::styled(format!(" {value}"), Style::default().fg(color)),
+    ])
+}
+
 /// Builds the "updated Xm ago" staleness line, from the last successful fetch.
 ///
 /// Dimmed by default, escalating to yellow past 1h and red past 6h so a panel
@@ -1045,8 +1061,8 @@ fn render_codex_quota(f: &mut Frame, area: Rect, codex: &CodexQuotaSnapshot, now
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-/// Renders the Copilot quota panel (plan, premium gauge, requests +
-/// chat/completions note, staleness + login hint).
+/// Renders the Copilot quota panel (plan, premium percent gauge, premium
+/// request-count gauge, staleness + login hint).
 fn render_copilot_quota(f: &mut Frame, area: Rect, copilot: &CopilotQuotaSnapshot, now: i64) {
     let block = quota_block(" Copilot ", COPILOT_COLOR, copilot.limit_reached);
 
@@ -1056,11 +1072,20 @@ fn render_copilot_quota(f: &mut Frame, area: Rect, copilot: &CopilotQuotaSnapsho
     }
     if let Some(w) = &copilot.premium {
         lines.push(quota_gauge_line("prem", w, now));
+        // A second gauge showing the premium requests as used/total counts.
+        if let (Some(rem), Some(total)) = (copilot.premium_remaining, copilot.premium_entitlement)
+            && total > 0
+        {
+            let used = (total - rem).max(0);
+            let pct = (used as f64 / total as f64) * 100.0;
+            lines.push(quota_gauge_line_value(
+                "reqs",
+                pct,
+                &format!("{used}/{total}"),
+            ));
+        }
     } else if copilot.premium_unlimited {
         lines.push(dim_line("premium: unlimited"));
-    }
-    if let Some(extra) = copilot_extras_line(copilot) {
-        lines.push(extra);
     }
     let has_content = !lines.is_empty();
     if has_content {
@@ -1073,30 +1098,6 @@ fn render_copilot_quota(f: &mut Frame, area: Rect, copilot: &CopilotQuotaSnapsho
     }
 
     f.render_widget(Paragraph::new(lines).block(block), area);
-}
-
-/// Builds the Copilot extras line (`1464/1500 reqs  ·  chat/compl ∞`), shown
-/// when premium counts or an unlimited chat/completions flag are known.
-fn copilot_extras_line(c: &CopilotQuotaSnapshot) -> Option<Line<'static>> {
-    let mut parts: Vec<String> = Vec::new();
-    if let (Some(r), Some(t)) = (c.premium_remaining, c.premium_entitlement)
-        && t > 0
-    {
-        parts.push(format!("{r}/{t} reqs"));
-    }
-    match (c.chat_unlimited, c.completions_unlimited) {
-        (true, true) => parts.push("chat/compl ∞".to_string()),
-        (true, false) => parts.push("chat ∞".to_string()),
-        (false, true) => parts.push("compl ∞".to_string()),
-        (false, false) => {}
-    }
-    if parts.is_empty() {
-        return None;
-    }
-    Some(Line::from(Span::styled(
-        parts.join("  ·  "),
-        Style::default().fg(RatatuiColor::DarkGray),
-    )))
 }
 
 /// Renders the Cursor quota panel (plan, total / auto / api gauges, optional

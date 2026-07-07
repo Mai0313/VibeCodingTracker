@@ -64,13 +64,13 @@ Automatically detects and processes logs from Claude Code, Codex, Copilot, Gemin
 
 | Feature               | Description                                                          |
 | --------------------- | -------------------------------------------------------------------- |
-| **Multi-Provider**    | Claude Code, Codex, Copilot, and Gemini — all in one place           |
+| **Multi-Provider**    | Claude Code, Codex, Copilot, Gemini, and OpenCode — all in one place |
 | **Smart Pricing**     | Fuzzy model matching + daily cache from LiteLLM                      |
 | **4 Display Modes**   | Interactive TUI, static table, plain text, and JSON                  |
 | **Dual Analysis**     | Token/cost stats (`usage`) + code operation stats (`analysis`)       |
+| **Live Quota Panels** | Live remaining quota for Claude, Codex, Copilot, and Cursor          |
 | **Ultra-Lightweight** | Under ~50 MB RSS in the TUI, streaming JSONL parse — built with Rust |
-| **Live Updates**      | Real-time dashboard refreshes every second                           |
-| **Efficient Caching** | Smart daily cache reduces API calls                                  |
+| **Live Updates**      | Auto-refreshing dashboard (every 10s) with change highlighting       |
 
 ---
 
@@ -107,6 +107,9 @@ npm install -g @mai0313/vibe-coding-tracker
 pip install vibe_coding_tracker
 # Or with uv
 uv pip install vibe_coding_tracker
+
+# Run without installing, straight from PyPI (uv)
+uvx vibe_coding_tracker usage
 ```
 
 #### Method 3: Install from crates.io
@@ -205,22 +208,67 @@ vct usage --json --daily
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Model                         Input   Output  Cache Read  Cache Write    Total  Cost (USD)  │
+│ Model                         Input   Output   Cache Read  Cache Write    Total  Cost (USD) │
 │                                                                                             │
-│ gemini-3.1-pro-preview         129K    10.3K       67.4K            0     207K       $0.40  │
-│ claude-haiku-4-5-20251001     5.57K    19.8K       4.63M         620K    5.27M       $1.34  │
-│ claude-opus-4-6               25.7K     179K       40.8M        2.57M    43.6M      $77.59  │
+│ gemini-3.1-pro-preview         129K    10.3K        67.4K            0     207K       $0.40 │
+│ claude-haiku-4-5-20251001     5.57K    19.8K        4.63M         620K    5.27M       $1.34 │
+│ claude-opus-4-8               25.7K     179K        40.8M        2.57M    43.6M      $77.59 │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Provider                      Tokens      Cost   Active Days                                │
+│ Provider                        Tokens        Cost                                          │
 │                                                                                             │
-│ Claude Code                    48.9M    $78.93             3                                │
-│ Gemini                          207K     $0.40             1                                │
+│ Claude Code                      48.9M      $78.93                                          │
+│ Gemini                            207K       $0.40                                          │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│  Total Cost: $79.33  |  Total Tokens: 49.3M  |  Models: 3  |  Memory: 42.8 MB               │
+│ Total Cost: $79.33  |  Total Tokens: 49.3M  |  Models: 3  |  Memory: 42.8 MB                │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
   ↑/↓ scroll  PgUp/PgDn page  g/G top/end  r refresh  q quit  |  ★ github.com/Mai0313/VibeCodingTracker
+```
+
+### Preview: Table & JSON (`vct usage`)
+
+`--table` prints the same numbers as a static report with a per-provider summary; `--json` emits one enriched row per model (each with `cost_usd`) for scripting.
+
+```text
+Token Usage Statistics
+
+┌───────────────────────────┬─────────┬─────────┬─────────────┬─────────────┬──────────────┬────────────┐
+│ Model                     ┆   Input ┆  Output ┆  Cache Read ┆ Cache Write ┆ Total Tokens ┆ Cost (USD) │
+╞═══════════════════════════╪═════════╪═════════╪═════════════╪═════════════╪══════════════╪════════════╡
+│ opencode/gemini-3.5-flash ┆  19,421 ┆     254 ┆           0 ┆           0 ┆       19,675 ┆      $0.03 │
+│ gpt-5.5                   ┆ 242,227 ┆  16,229 ┆   2,406,912 ┆           0 ┆    2,665,368 ┆      $5.56 │
+│ claude-opus-4-8           ┆ 401,937 ┆ 936,186 ┆ 138,099,926 ┆   6,057,836 ┆  145,495,885 ┆    $151.29 │
+│ TOTAL                     ┆ 663,585 ┆ 952,669 ┆ 140,506,838 ┆   6,057,836 ┆  148,180,928 ┆    $156.88 │
+└───────────────────────────┴─────────┴─────────┴─────────────┴─────────────┴──────────────┴────────────┘
+
+Totals (by Provider)
+
+┌───────────────┬─────────────┬─────────┐
+│ Provider      ┆      Tokens ┆    Cost │
+╞═══════════════╪═════════════╪═════════╡
+│ Claude Code   ┆ 145,495,885 ┆ $151.29 │
+│ OpenAI Codex  ┆   2,665,368 ┆   $5.56 │
+│ OpenCode      ┆      19,675 ┆   $0.03 │
+│ All Providers ┆ 148,180,928 ┆ $156.88 │
+└───────────────┴─────────────┴─────────┘
+```
+
+```json
+// vct usage --json  (one model shown; rows are sorted by cost)
+[
+  {
+    "model": "claude-opus-4-8",
+    "cost_usd": 151.29,
+    "usage": {
+      "input_tokens": 401937,
+      "output_tokens": 936186,
+      "cache_read_input_tokens": 138099926,
+      "cache_creation_input_tokens": 6057836,
+      "reasoning_output_tokens": 0
+    }
+  }
+]
 ```
 
 ### What It Scans
@@ -240,17 +288,17 @@ The tool automatically scans these directories:
 ```
 ┌ Claude ─────────────────┐┌ Codex ──────────────────┐┌ Copilot ────────────────┐┌ Cursor ─────────────────┐
 │ Plan: max 20x           ││ Plan: plus              ││ Plan: individual        ││ Plan: free              │
-│ 5h    ▰▱▱▱▱  16% ↻ 2h0m ││ 5h    ▰▰▱▱▱  37% ↻ 2h33m││ prem  ▰▱▱▱▱   2% ↻ 25d   ││ total ▰▰▰▰▰  94% ↻ 17d  │
-│ 7d    ▰▰▱▱▱  41% ↻ 5d   ││ 7d    ▰▰▱▱▱  24% ↻ 3d16h││ 1464/1500 · chat/compl ∞││ auto  ▰▰▰▰▰ 100% ↻ 17d  │
-│ Opus  ▰▰▰▱▱  61% ↻ 5d   ││ Credits: 0  +3 reset    ││ updated just now        ││ api   ▰▰▰▱▱  44% ↻ 17d  │
+│ 5h    ▰▱▱▱▱  13% ↻ 1h42m││ 5h    ▰▰▱▱▱  33% ↻ 12m  ││ prem  ▰▱▱▱▱   3% ↻ 24d  ││ total ▰▱▱▱▱   6% ↻ 16d  │
+│ 7d    ▰▰▰▱▱  58% ↻ 1d23h││ 7d    ▰▰▱▱▱  36% ↻ 1h54m││ reqs  ▰▱▱▱▱ 45/1500     ││ auto  ▱▱▱▱▱   0% ↻ 16d  │
+│ Fable ▰▰▰▰▱  79% ↻ 1d23h││ Credits: 0  +3 reset    ││ updated just now        ││ api   ▰▰▰▱▱  56% ↻ 16d  │
 │ Balance: -   $0.00 used ││ updated just now        ││                         ││ updated just now        │
 └─────────────────────────┘└─────────────────────────┘└─────────────────────────┘└─────────────────────────┘
 ```
 
 - **Claude** — plan tier, 5-hour, weekly, and per-model weekly usage from the official OAuth usage API (`GET /api/oauth/usage`), read from `~/.claude/.credentials.json`, plus your credit balance. Polled about once a minute to stay under the endpoint's rate limit; a red `LIMIT` flag appears in the title when a cap is hit. The per-model weekly row is best-effort and simply hides when that scope is not returned.
 - **Codex** — plan tier, 5-hour and weekly usage, and credit balance from the ChatGPT backend (`wham/usage`) using `~/.codex/auth.json` (with approximate remaining messages / spend cap when applicable); falls back to the newest `rate_limits` in your Codex session logs when the API is unavailable (the title shows `Codex` vs `Codex (session)`).
-- **Copilot** — plan tier, premium-request quota (remaining / entitlement plus a gauge), and unlimited chat / completions from GitHub's Copilot API (`GET /copilot_internal/user`), read from `~/.copilot/config.json`. The request impersonates the Copilot CLI. The token is long-lived, so there is no refresh; a `401` / `403` shows a `run: copilot login` hint.
-- **Cursor** — plan tier, total / auto / API usage percentages, and on-demand spend from cursor.com (`GET /api/usage-summary`), using the session token in `~/.config/cursor/auth.json`. Refresh is reactive: vct re-reads the file each poll and uses the token while it is valid, since the official Cursor client keeps it fresh.
+- **Copilot** — plan tier plus your premium-request quota, shown as two gauges: percent used and the used / total request count (e.g. `45/1500`), from GitHub's Copilot API (`GET /copilot_internal/user`), read from `~/.copilot/config.json`. The request impersonates the Copilot CLI. The token is long-lived, so there is no refresh; a `401` / `403` shows a `run: copilot login` hint.
+- **Cursor** — plan tier, total / auto / API percent **used**, and on-demand spend from cursor.com (`GET /api/usage-summary`), using the session token in `~/.config/cursor/auth.json`. Refresh is reactive: vct re-reads the file each poll and uses the token while it is valid, since the official Cursor client keeps it fresh.
 
 **Automatic token refresh.** For Claude and Codex, when a token is near expiry or rejected, vct refreshes it and writes the new token back to the provider's own credential file (in that CLI's exact format), so a token is reused across checks rather than refreshed every time. If a refresh cannot proceed, the panel shows a `run: <provider> auth login` hint instead of breaking. Copilot (long-lived token) and Cursor (kept fresh by its own client) are read-only — vct never writes their credential files.
 
@@ -309,23 +357,56 @@ vct analysis --output today.json --daily
 ### Preview: Interactive Dashboard (`vct analysis`)
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Model                     Edit Lines  Read Lines Write Lines  Bash  Edit  Read  Write       │
-│                                                                                             │
-│ claude-haiku-4-5-20251001           0           0           0    43     0    59      0      │
-│ claude-opus-4-6                1.28K       13.3K       1.58K    82   146   209     62       │
-│ gemini-3.1-pro-preview             0           0           0     0     0     0      0       │
-└─────────────────────────────────────────────────────────────────────────────────────────────┘
-┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Provider        Edit Lines Read Lines Write Lines Bash Edit Read TodoWrite Write Days       │
-│                                                                                             │
-│ Claude Code          1.28K      13.3K       1.58K  125  146  268        18    62    3       │
-│ Gemini                   0          0           0    0    0    0         0     0    1       │
-└─────────────────────────────────────────────────────────────────────────────────────────────┘
-┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│  Total Lines: 16.1K  |  Total Tools: 619  |  Models: 3  |  Memory: 41.2 MB                  │
-└─────────────────────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ Model                        Edit Lines   Read Lines  Write Lines   Bash   Edit   Read  TodoWrite  Write        │
+│                                                                                                                 │
+│ claude-haiku-4-5-20251001             0            0            0     43      0     59          0      0        │
+│ claude-opus-4-8                   1.28K        13.3K        1.58K     82    146    209         18     62        │
+│ gemini-3.1-pro-preview                0            0            0      0      0      0          0      0        │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ Provider                     Edit Lines   Read Lines  Write Lines   Bash   Edit   Read  TodoWrite  Write   Days │
+│                                                                                                                 │
+│ Claude Code                       1.28K        13.3K        1.58K    125    146    268         18     62      3 │
+│ Gemini                                0            0            0      0      0      0          0      0      1 │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ Total Lines: 16.1K  |  Total Tools: 619  |  Models: 3  |  Memory: 41.2 MB                                       │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
   ↑/↓ scroll  PgUp/PgDn page  g/G top/end  r refresh  q quit  |  ★ github.com/Mai0313/VibeCodingTracker
+```
+
+### Preview: Table & JSON (`vct analysis`)
+
+`--table` renders the per-model breakdown plus a per-provider summary (with an Active Days column); `--json` emits one aggregated row per model.
+
+```text
+Analysis Statistics
+
+┌─────────────────┬────────────┬────────────┬─────────────┬──────┬──────┬──────┬───────────┬───────┐
+│ Model           ┆ Edit Lines ┆ Read Lines ┆ Write Lines ┆ Bash ┆ Edit ┆ Read ┆ TodoWrite ┆ Write │
+╞═════════════════╪════════════╪════════════╪═════════════╪══════╪══════╪══════╪═══════════╪═══════╡
+│ gpt-5.5         ┆          0 ┆      3,087 ┆           0 ┆   25 ┆    0 ┆   10 ┆         0 ┆     0 │
+│ claude-opus-4-8 ┆      1,493 ┆     15,564 ┆         970 ┆  123 ┆  134 ┆  144 ┆         0 ┆    12 │
+│ TOTAL           ┆      1,493 ┆     18,651 ┆         970 ┆  148 ┆  134 ┆  154 ┆         0 ┆    12 │
+└─────────────────┴────────────┴────────────┴─────────────┴──────┴──────┴──────┴───────────┴───────┘
+```
+
+```json
+// vct analysis --json  (one model shown)
+[
+  {
+    "model": "claude-opus-4-8",
+    "editLines": 1493,
+    "readLines": 15564,
+    "writeLines": 970,
+    "bashCount": 124,
+    "editCount": 134,
+    "readCount": 144,
+    "todoWriteCount": 0,
+    "writeCount": 12
+  }
+]
 ```
 
 ---
@@ -352,9 +433,9 @@ vct update --force
 ### Preview (`vct update --check`)
 
 ```
-Current version: v0.10.3
+Current version: v1.3.0
 Checking for latest release...
-Latest version: v0.10.3 — you are up to date!
+Latest version: v1.3.0 — you are up to date!
 ```
 
 ---
@@ -367,6 +448,14 @@ Report the embedded build metadata (binary version, Rust toolchain, Cargo versio
 vct version          # Pretty table
 vct version --text   # One-field-per-line, script-friendly
 vct version --json   # Machine-readable JSON
+```
+
+```text
+┌───────────────┬──────────┐
+│ Version       ┆ 1.3.0    │
+│ Rust Version  ┆ 1.96.0   │
+│ Cargo Version ┆ 1.96.0   │
+└───────────────┴──────────┘
 ```
 
 The binary version is produced at build time by `build.rs` from `git describe`, so development builds include commit count + short SHA + `dirty` suffix when applicable.
@@ -392,6 +481,12 @@ The binary version is produced at build time by `build.rs` from `git describe`, 
 4. **Fuzzy (AI-powered)**: Uses Jaro-Winkler similarity (70% threshold)
 5. **Fallback**: Shows $0.00 if no match found
 
+### Cost Details
+
+- **Beyond tokens**: Claude web-search tool calls (`server_tool_use.web_search_requests`) are billed per query on top of the token cost; every other model's per-query charge is $0.
+- **OpenCode**: a novel model name is priced from its tokens only on an **exact** LiteLLM match; with no exact match, vct trusts the assistant message's own stored cost instead of guessing from a loosely-similar name.
+- **Cache is raw**: the daily cache stores the filtered upstream LiteLLM JSON (not a derived shape), so tiered / batch pricing stays available without re-fetching, and a small in-process LRU keeps repeated lookups cheap during a TUI refresh.
+
 ---
 
 ## Docker Support
@@ -399,13 +494,4 @@ The binary version is produced at build time by `build.rs` from `git describe`, 
 ```bash
 # Build image
 docker build -f docker/Dockerfile --target prod -t vibe_coding_tracker:latest .
-
-# Run with your sessions
-docker run --rm \
-    -v ~/.claude:/root/.claude \
-    -v ~/.codex:/root/.codex \
-    -v ~/.copilot:/root/.copilot \
-    -v ~/.gemini:/root/.gemini \
-    -v ~/.local/share/opencode:/root/.local/share/opencode \
-    vibe_coding_tracker:latest usage
 ```

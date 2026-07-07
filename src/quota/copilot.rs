@@ -211,15 +211,6 @@ pub fn map_copilot_user(body: &str, now: i64) -> Result<CopilotQuotaSnapshot> {
         })
     };
 
-    let chat_unlimited = snaps
-        .and_then(|s| s.chat.as_ref())
-        .and_then(|e| e.unlimited)
-        .unwrap_or(false);
-    let completions_unlimited = snaps
-        .and_then(|s| s.completions.as_ref())
-        .and_then(|e| e.unlimited)
-        .unwrap_or(false);
-
     let limit_reached = !premium_unlimited
         && premium
             .as_ref()
@@ -234,8 +225,6 @@ pub fn map_copilot_user(body: &str, now: i64) -> Result<CopilotQuotaSnapshot> {
         premium_remaining,
         premium_entitlement,
         premium_unlimited,
-        chat_unlimited,
-        completions_unlimited,
         limit_reached,
         needs_login: false,
     })
@@ -423,8 +412,6 @@ mod tests {
         assert!(prem.resets_at_unix.unwrap() > 0);
         assert_eq!(snap.premium_remaining, Some(1464));
         assert_eq!(snap.premium_entitlement, Some(1500));
-        assert!(snap.chat_unlimited);
-        assert!(snap.completions_unlimited);
         assert!(!snap.limit_reached);
         assert!(!snap.needs_login);
     }
