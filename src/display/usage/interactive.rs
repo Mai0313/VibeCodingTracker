@@ -1225,10 +1225,7 @@ mod tests {
     #[test]
     fn arrange_narrow_tall_wraps_to_two_rows() {
         match arrange_band(80, PANELS_2ROW_MIN_H, 4) {
-            BandArrange::TwoRow {
-                top,
-                table_in_hole,
-            } => {
+            BandArrange::TwoRow { top, table_in_hole } => {
                 assert_eq!(top, 2);
                 assert!(!table_in_hole, "even count fills both rows");
             }
@@ -1239,10 +1236,7 @@ mod tests {
     #[test]
     fn arrange_three_panels_fills_hole_with_table() {
         match arrange_band(80, PANELS_2ROW_MIN_H, 3) {
-            BandArrange::TwoRow {
-                top,
-                table_in_hole,
-            } => {
+            BandArrange::TwoRow { top, table_in_hole } => {
                 assert_eq!(top, 2);
                 assert!(table_in_hole, "odd count leaves a hole for the table");
             }

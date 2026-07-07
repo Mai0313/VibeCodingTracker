@@ -110,7 +110,8 @@ fn read_copilot_token(body: &str) -> Option<String> {
     let root: serde_json::Value = serde_json::from_str(&stripped).ok()?;
     let tokens = root.get("copilotTokens")?.as_object()?;
 
-    let token_str = |v: &serde_json::Value| v.as_str().filter(|s| !s.is_empty()).map(str::to_string);
+    let token_str =
+        |v: &serde_json::Value| v.as_str().filter(|s| !s.is_empty()).map(str::to_string);
 
     // The `copilotTokens` keys are `<host>:<login>`; match the last-logged-in
     // account first.
