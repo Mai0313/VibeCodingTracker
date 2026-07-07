@@ -74,9 +74,11 @@ pub fn map_cursor_usage(body: &str, now: i64) -> Result<CursorQuotaSnapshot> {
         serde_json::from_str(body).context("Failed to parse Cursor usage summary")?;
 
     let reset = resp.billing_cycle_end.as_deref().and_then(iso_to_unix_secs);
+    // Cursor's `*PercentUsed` fields actually report percent REMAINING; invert
+    // so the gauge shows how much has been used, matching the other panels.
     let win = |pct: Option<f64>| {
         pct.map(|p| QuotaWindow {
-            used_percent: p.clamp(0.0, 100.0),
+            used_percent: (100.0 - p).clamp(0.0, 100.0),
             resets_at_unix: reset,
         })
     };
@@ -253,9 +255,10 @@ mod tests {
         let snap = map_cursor_usage(SUMMARY, 1_000_000).unwrap();
         assert_eq!(snap.source, QuotaSource::Api);
         assert_eq!(snap.plan_type.as_deref(), Some("free"));
-        assert_eq!(snap.total.as_ref().unwrap().used_percent, 94.0);
-        assert_eq!(snap.auto.as_ref().unwrap().used_percent, 100.0);
-        assert_eq!(snap.api.as_ref().unwrap().used_percent, 44.0);
+        // API reports percent remaining; the gauge shows used (100 - remaining).
+        assert_eq!(snap.total.as_ref().unwrap().used_percent, 6.0);
+        assert_eq!(snap.auto.as_ref().unwrap().used_percent, 0.0);
+        assert_eq!(snap.api.as_ref().unwrap().used_percent, 56.0);
         assert!(snap.total.as_ref().unwrap().resets_at_unix.unwrap() > 0);
         // On-demand disabled → no dollar figure.
         assert!(snap.on_demand_dollars.is_none());
@@ -283,14 +286,18 @@ mod tests {
 
     #[test]
     fn flags_limit_when_total_maxed() {
-        let body = r#"{ "isUnlimited": false, "individualUsage": { "plan": { "totalPercentUsed": 100 } } }"#;
+        // 0% remaining -> 100% used -> limit reached.
+        let body =
+            r#"{ "isUnlimited": false, "individualUsage": { "plan": { "totalPercentUsed": 0 } } }"#;
         let snap = map_cursor_usage(body, 1).unwrap();
         assert!(snap.limit_reached);
     }
 
     #[test]
     fn unlimited_never_flags_limit() {
-        let body = r#"{ "isUnlimited": true, "individualUsage": { "plan": { "totalPercentUsed": 100 } } }"#;
+        // Even at 0% remaining (fully used), the unlimited flag suppresses LIMIT.
+        let body =
+            r#"{ "isUnlimited": true, "individualUsage": { "plan": { "totalPercentUsed": 0 } } }"#;
         let snap = map_cursor_usage(body, 1).unwrap();
         assert!(!snap.limit_reached);
     }
