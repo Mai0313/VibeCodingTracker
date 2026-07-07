@@ -32,8 +32,10 @@ pub use git::get_git_remote_url;
 pub use heap::{release_freed_heap, tune_system_allocator};
 pub use paths::{
     find_pricing_cache_for_date, get_cache_dir, get_claude_credentials_path,
-    get_claude_usage_cache_path, get_codex_usage_cache_path, get_current_user, get_machine_id,
-    get_pricing_cache_path, list_pricing_cache_files, resolve_paths,
+    get_claude_usage_cache_path, get_codex_usage_cache_path, get_copilot_config_path,
+    get_copilot_usage_cache_path, get_current_user, get_cursor_auth_path,
+    get_cursor_usage_cache_path, get_machine_id, get_pricing_cache_path, list_pricing_cache_files,
+    resolve_paths,
 };
 pub use time::parse_iso_timestamp;
 pub use token_extractor::{TokenCounts, extract_token_counts};

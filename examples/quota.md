@@ -131,7 +131,9 @@ Notes:
 
 Credential file `~/.copilot/config.json`:
 `.copilotTokens["https://github.com:<login>"]` holds a long-lived GitHub OAuth
-token (`gho_...`).
+token (`gho_...`). Note this file is **JSONC** (it starts with `//` comment
+lines), so strip comments before parsing it as JSON — string-aware, so the `//`
+inside the `https://github.com:<login>` key survives.
 
 ### Fetch quota
 
@@ -149,9 +151,17 @@ curl -s "https://api.github.com/copilot_internal/user" \
 
 Quota lives under `.quota_snapshots.premium_interactions` (premium requests),
 `.chat`, `.completions`; plan under `.copilot_plan`; reset under
-`.quota_reset_date`. The `Editor-*` / `User-Agent` headers impersonate the VS
-Code Copilot Chat plugin and are what the real client sends. Auth uses the
-legacy `token <t>` scheme, not `Bearer`.
+`.quota_reset_date`. The `Editor-*` / `User-Agent` headers above impersonate the
+VS Code Copilot Chat plugin. Auth uses the legacy `token <t>` scheme, not
+`Bearer`.
+
+Because this token belongs to the **Copilot CLI**, `vct` instead impersonates
+that client (the correct parity): `User-Agent: GitHubCopilotCLI/<version>`
+(version from `copilot --version`, cached daily) plus
+`Copilot-Integration-Id: copilot-cli` — confirmed from the CLI bundle, which
+does **not** send the `Editor-Version` / `copilot-chat` headers. The endpoint
+answers a bare token regardless, so the UA is cosmetic; only the token is
+required.
 
 ### Refresh token
 

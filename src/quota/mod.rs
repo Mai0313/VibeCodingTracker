@@ -9,13 +9,20 @@
 pub mod cache;
 pub mod claude;
 pub mod codex_session;
+pub mod copilot;
+pub mod cursor;
 pub mod http;
 pub mod provider;
 pub mod refresh;
 pub mod wham;
 
-pub use cache::{load_claude_cache, load_codex_cache, save_claude_cache, save_codex_cache};
+pub use cache::{
+    load_claude_cache, load_codex_cache, load_copilot_cache, load_cursor_cache, save_claude_cache,
+    save_codex_cache, save_copilot_cache, save_cursor_cache,
+};
 pub use claude::{CLAUDE_LOGIN_HINT, ClaudeState};
+pub use copilot::{COPILOT_LOGIN_HINT, CopilotState};
+pub use cursor::{CURSOR_LOGIN_HINT, CursorState};
 pub use provider::{QuotaOutcome, QuotaSnapshot, spawn_quota_worker};
 
 use crate::models::CodexQuotaSnapshot;

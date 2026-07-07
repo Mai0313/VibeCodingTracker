@@ -235,27 +235,28 @@ vct usage --json --daily
 
 ### 实时额度面板
 
-`vct usage` 会**在仪表盘中直接显示 Claude Code 与 Codex 的实时剩余额度——完全零配置。** 不需要 status-line hook，也不需要配置文件：vct 会读取各 provider 自己的 OAuth 凭证，在后台线程调用其用量 API，并在你工作时保持面板持续更新。
+`vct usage` 会**在仪表盘中直接显示 Claude Code、Codex、GitHub Copilot 与 Cursor 的实时剩余额度——完全零配置。** 不需要 status-line hook，也不需要配置文件：vct 会读取各 provider 自己的 OAuth 凭证，在后台线程调用其用量 API，并在你工作时保持面板持续更新。
 
 ```
-┌ Provider/Tokens/Cost/Days ┬ Claude ───────────────────┬ Codex ────────────────────┐
-│ Claude    1.2M  $3.00  4d │ Plan: max 20x              │ Plan: plus                 │
-│ Codex      800K $0.00  6d │ 5h     ▰▱▱▱▱  16%  ↻ 2h0m  │ 5h     ▰▰▱▱▱  37%  ↻ 2h33m │
-│ ...                       │ 7d     ▰▰▱▱▱  41%  ↻ 5d    │ 7d     ▰▰▱▱▱  24%  ↻ 3d16h │
-│                           │ Opus   ▰▰▰▱▱  61%  ↻ 5d    │ Credits: 0  +3 reset       │
-│                           │ Balance: -    $0.00 used   │ updated just now           │
-│                           │ updated just now           │                            │
-└───────────────────────────┴────────────────────────────┴────────────────────────────┘
+┌ Claude ─────────────────┐┌ Codex ──────────────────┐┌ Copilot ────────────────┐┌ Cursor ─────────────────┐
+│ Plan: max 20x           ││ Plan: plus              ││ Plan: individual        ││ Plan: free              │
+│ 5h    ▰▱▱▱▱  16% ↻ 2h0m ││ 5h    ▰▰▱▱▱  37% ↻ 2h33m││ prem  ▰▱▱▱▱   2% ↻ 25d   ││ total ▰▰▰▰▰  94% ↻ 17d  │
+│ 7d    ▰▰▱▱▱  41% ↻ 5d   ││ 7d    ▰▰▱▱▱  24% ↻ 3d16h││ 1464/1500 · chat/compl ∞││ auto  ▰▰▰▰▰ 100% ↻ 17d  │
+│ Opus  ▰▰▰▱▱  61% ↻ 5d   ││ Credits: 0  +3 reset    ││ updated just now        ││ api   ▰▰▰▱▱  44% ↻ 17d  │
+│ Balance: -   $0.00 used ││ updated just now        ││                         ││ updated just now        │
+└─────────────────────────┘└─────────────────────────┘└─────────────────────────┘└─────────────────────────┘
 ```
 
 - **Claude** — 方案类型、5 小时、每周以及单模型每周用量，来自官方 OAuth 用量 API（`GET /api/oauth/usage`），从 `~/.claude/.credentials.json` 读取，并显示额度余额。约每分钟轮询一次以避开该端点的速率限制；触及上限时标题会出现红色 `LIMIT` 标记。单模型每周那一行属于尽力而为，未返回该范围时就自动隐藏。
 - **Codex** — 套餐类型、5 小时和每周用量以及额度余额，使用 `~/.codex/auth.json` 从 ChatGPT 后端（`wham/usage`）获取（在适用时显示大致剩余讯息数 / 消费上限）；API 不可用时回退到 Codex 会话日志中最新的 `rate_limits`（标题显示 `Codex` 或 `Codex (session)`）。
+- **Copilot** — 方案类型、premium 请求额度（剩余 / 配额，并附带进度条），以及无限制的 chat / completions，来自 GitHub 的 Copilot API（`GET /copilot_internal/user`），从 `~/.copilot/config.json` 读取。该请求会模拟 Copilot CLI。token 为长期有效，因此不需要刷新；遇到 `401` / `403` 时会显示 `run: copilot login` 提示。
+- **Cursor** — 方案类型、total / auto / API 用量百分比，以及按需消费，来自 cursor.com（`GET /api/usage-summary`），使用 `~/.config/cursor/auth.json` 中的 session token。刷新是被动式的：vct 每次轮询都会重新读取该文件，并在 token 有效期内使用它，因为官方 Cursor 客户端会让它保持最新。
 
-**自动刷新 token。** 对这两个 provider，当 token 接近过期或被拒绝时，vct 会刷新它并把新 token 写回该 provider 自己的凭证文件（采用该 CLI 的原始格式），因此 token 会在多次检查之间复用，而不是每次都重新刷新。如果刷新失败，面板会显示 `run: <provider> auth login` 提示，而不会直接中断。
+**自动刷新 token。** 对 Claude 和 Codex，当 token 接近过期或被拒绝时，vct 会刷新它并把新 token 写回该 provider 自己的凭证文件（采用该 CLI 的原始格式），因此 token 会在多次检查之间复用，而不是每次都重新刷新。如果刷新失败，面板会显示 `run: <provider> auth login` 提示，而不会直接中断。Copilot（长期有效的 token）和 Cursor（由其自身客户端保持最新）为只读——vct 从不写入它们的凭证文件。
 
-只有在某个 provider 的凭证存在时，才会显示对应的面板。额度面板仅在交互式 TUI 中显示；`--table`、`--text`、`--json` 不受影响。
+只有在某个 provider 的凭证存在时，才会显示对应的面板。当四个面板都显示时，Provider Usage 表格会从这一栏中折叠隐藏；在较窄的宽度下，面板会折行成 2×2 网格。额度面板仅在交互式 TUI 中显示；`--table`、`--text`、`--json` 不受影响。
 
-> **平台说明：** 在 macOS 上，Claude Code 会把 OAuth 凭证保存在系统 Keychain 中，而不是 `~/.claude/.credentials.json`，因此在 macOS 上不会显示 Claude 面板。
+> **平台说明：** 在 macOS 上，Claude Code 会把 OAuth 凭证保存在系统 Keychain 中，而不是 `~/.claude/.credentials.json`，因此在 macOS 上不会显示 Claude 面板。Cursor 的 `~/.config/cursor` 凭证路径偏向 Linux。
 
 ---
 
