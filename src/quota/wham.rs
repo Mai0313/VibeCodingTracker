@@ -11,9 +11,8 @@ use crate::models::{
     CodexAuthJson, CodexQuotaSnapshot, CodexRefreshResponse, QuotaSource, QuotaWindow,
     WhamUsageResponse, WhamWindow,
 };
-use crate::quota::refresh::{
-    file_mtime, now_rfc3339_utc_nanos, send_refresh, update_json_file_in_place,
-};
+use crate::quota::refresh::{file_mtime, send_refresh, update_json_file_in_place};
+use crate::utils::now_rfc3339_utc_nanos;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::path::Path;

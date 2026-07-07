@@ -39,7 +39,7 @@ pub struct HelperPaths {
     pub opencode_dir: PathBuf,
     /// OpenCode SQLite database (`<opencode_dir>/opencode.db`).
     pub opencode_db: PathBuf,
-    /// This tool's cache directory (`~/.vibe_coding_tracker`).
+    /// This tool's cache directory (`~/.vct`).
     pub cache_dir: PathBuf,
 }
 
@@ -84,7 +84,7 @@ pub fn resolve_paths() -> Result<HelperPaths> {
         .unwrap_or_else(|| home_dir.join(".local").join("share"))
         .join("opencode");
     let opencode_db = opencode_dir.join("opencode.db");
-    let cache_dir = home_dir.join(".vibe_coding_tracker");
+    let cache_dir = home_dir.join(".vct");
 
     Ok(HelperPaths {
         home_dir,
@@ -145,7 +145,7 @@ pub fn get_machine_id() -> &'static str {
     })
 }
 
-/// Returns the tool's cache directory (`~/.vibe_coding_tracker`), creating it
+/// Returns the tool's cache directory (`~/.vct`), creating it
 /// (and any missing parents) if it does not already exist.
 ///
 /// # Errors
@@ -154,7 +154,7 @@ pub fn get_machine_id() -> &'static str {
 /// cache directory cannot be created.
 pub fn get_cache_dir() -> Result<PathBuf> {
     let home_dir = get_home_dir()?;
-    let cache_dir = home_dir.join(".vibe_coding_tracker");
+    let cache_dir = home_dir.join(".vct");
 
     // Create directory if it doesn't exist
     if !cache_dir.exists() {
@@ -166,7 +166,7 @@ pub fn get_cache_dir() -> Result<PathBuf> {
 
 /// Returns the pricing cache file path for `date`.
 ///
-/// The path is `~/.vibe_coding_tracker/model_pricing_<date>.json`, where
+/// The path is `~/.vct/model_pricing_<date>.json`, where
 /// `date` is expected in `YYYY-MM-DD` form. As a side effect of resolving the
 /// cache directory, the directory is created if missing.
 ///
@@ -179,7 +179,7 @@ pub fn get_pricing_cache_path(date: &str) -> Result<PathBuf> {
 }
 
 /// Returns the Claude usage cache path
-/// (`~/.vibe_coding_tracker/claude_usage.json`).
+/// (`~/.vct/claude_usage.json`).
 ///
 /// As a side effect of resolving the cache directory, the directory is
 /// created if missing.
@@ -192,7 +192,7 @@ pub fn get_claude_usage_cache_path() -> Result<PathBuf> {
 }
 
 /// Returns the Codex usage cache path
-/// (`~/.vibe_coding_tracker/codex_usage.json`).
+/// (`~/.vct/codex_usage.json`).
 ///
 /// As a side effect of resolving the cache directory, the directory is
 /// created if missing.
@@ -205,7 +205,7 @@ pub fn get_codex_usage_cache_path() -> Result<PathBuf> {
 }
 
 /// Returns the Copilot usage cache path
-/// (`~/.vibe_coding_tracker/copilot_usage.json`).
+/// (`~/.vct/copilot_usage.json`).
 ///
 /// As a side effect of resolving the cache directory, the directory is
 /// created if missing.
@@ -218,7 +218,7 @@ pub fn get_copilot_usage_cache_path() -> Result<PathBuf> {
 }
 
 /// Returns the Cursor usage cache path
-/// (`~/.vibe_coding_tracker/cursor_usage.json`).
+/// (`~/.vct/cursor_usage.json`).
 ///
 /// As a side effect of resolving the cache directory, the directory is
 /// created if missing.
@@ -228,6 +228,19 @@ pub fn get_copilot_usage_cache_path() -> Result<PathBuf> {
 /// Returns an error if the cache directory cannot be resolved or created.
 pub fn get_cursor_usage_cache_path() -> Result<PathBuf> {
     Ok(get_cache_dir()?.join("cursor_usage.json"))
+}
+
+/// Returns this tool's own version record path (`~/.vct/version.json`).
+///
+/// Holds `{ latest_version, last_checked_at, dismissed_version }`, written by
+/// the update check as groundwork for a future auto-update prompt. As a side
+/// effect of resolving the cache directory, the directory is created if missing.
+///
+/// # Errors
+///
+/// Returns an error if the cache directory cannot be resolved or created.
+pub fn get_self_version_cache_path() -> Result<PathBuf> {
+    Ok(get_cache_dir()?.join("version.json"))
 }
 
 /// Returns the Copilot CLI config path (`~/.copilot/config.json`).
@@ -332,7 +345,7 @@ mod tests {
             assert!(paths.claude_dir.ends_with(".claude"));
             assert!(paths.copilot_dir.ends_with(".copilot"));
             assert!(paths.gemini_dir.ends_with(".gemini"));
-            assert!(paths.cache_dir.ends_with(".vibe_coding_tracker"));
+            assert!(paths.cache_dir.ends_with(".vct"));
 
             // Verify session directories
             assert!(paths.codex_session_dir.ends_with("sessions"));
@@ -426,7 +439,7 @@ mod tests {
         let paths = resolve_paths().unwrap();
         let cache_name = paths.cache_dir.file_name().unwrap();
 
-        assert_eq!(cache_name, ".vibe_coding_tracker");
+        assert_eq!(cache_name, ".vct");
     }
 
     #[test]
@@ -497,7 +510,7 @@ mod tests {
         assert!(result.is_ok());
 
         let cache_dir = result.unwrap();
-        assert!(cache_dir.ends_with(".vibe_coding_tracker"));
+        assert!(cache_dir.ends_with(".vct"));
 
         // Cache directory should be created
         assert!(cache_dir.exists());

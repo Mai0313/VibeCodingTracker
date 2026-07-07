@@ -532,7 +532,7 @@ pub struct QuotaWindow {
 }
 
 /// Normalized Codex quota snapshot, shared via `Arc<Mutex>` and persisted to
-/// `~/.vibe_coding_tracker/codex_usage.json`.
+/// `~/.vct/codex_usage.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CodexQuotaSnapshot {
     /// Which source produced this snapshot.
@@ -687,7 +687,7 @@ pub struct CursorOnDemand {
 // ---- Normalized Copilot / Cursor snapshots (worker output + on-disk cache) ----
 
 /// Normalized Copilot quota snapshot, shared via `Arc<Mutex>` and persisted to
-/// `~/.vibe_coding_tracker/copilot_usage.json`.
+/// `~/.vct/copilot_usage.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CopilotQuotaSnapshot {
     /// Which source produced this snapshot.
@@ -720,7 +720,7 @@ pub struct CopilotQuotaSnapshot {
 }
 
 /// Normalized Cursor quota snapshot, shared via `Arc<Mutex>` and persisted to
-/// `~/.vibe_coding_tracker/cursor_usage.json`.
+/// `~/.vct/cursor_usage.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CursorQuotaSnapshot {
     /// Which source produced this snapshot.

@@ -122,14 +122,6 @@ pub fn update_json_file_in_place(
     Ok(true)
 }
 
-/// Current UTC time as RFC3339 with nanoseconds and a `Z` suffix.
-///
-/// Matches the format Codex writes for `auth.json`'s `last_refresh`
-/// (e.g. `2026-07-01T17:04:32.132091023Z`).
-pub fn now_rfc3339_utc_nanos() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

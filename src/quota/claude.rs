@@ -58,7 +58,7 @@ fn claude_ua() -> &'static str {
             "claude-cli/{} (external, cli)",
             crate::quota::http::detect_cli_version(
                 "claude",
-                "claude_code_version.json",
+                "claude_version.json",
                 CLAUDE_FALLBACK_VERSION,
             )
         )

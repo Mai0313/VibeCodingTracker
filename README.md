@@ -467,7 +467,7 @@ The binary version is produced at build time by `build.rs` from `git describe`, 
 ### How It Works
 
 1. **Automatic Updates**: Fetches pricing from [LiteLLM](https://github.com/BerriAI/litellm) daily
-2. **Smart Caching**: Stores pricing in `~/.vibe_coding_tracker/` for 24 hours
+2. **Smart Caching**: Stores pricing in `~/.vct/` for 24 hours
 3. **Fuzzy Matching**: Finds best match even for custom model names
 4. **Always Accurate**: Ensures you get the latest pricing
 
