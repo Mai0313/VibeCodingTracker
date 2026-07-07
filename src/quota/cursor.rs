@@ -20,8 +20,9 @@ use reqwest::blocking::Client;
 
 /// The Cursor usage-summary endpoint.
 const CURSOR_USAGE_URL: &str = "https://cursor.com/api/usage-summary";
-/// Login hint shown when the Cursor session is expired / rejected.
-pub const CURSOR_LOGIN_HINT: &str = "run: cursor login";
+/// Login hint shown when the Cursor session is expired / rejected. The CLI that
+/// manages `auth.json` is `cursor-agent` (`cursor` is the editor launcher).
+pub const CURSOR_LOGIN_HINT: &str = "run: cursor-agent login";
 
 /// A usable Cursor session: the synthesized cookie header + the JWT expiry.
 struct CursorSession {
