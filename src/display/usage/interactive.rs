@@ -32,7 +32,7 @@ use crate::quota::{
     spawn_quota_worker,
 };
 use crate::utils::{
-    format_compact, format_cost, format_duration_until, get_claude_credentials_path,
+    format_compact, format_cost_compact, format_duration_until, get_claude_credentials_path,
     get_copilot_config_path, get_cursor_auth_path, resolve_paths,
 };
 use ratatui::{
@@ -679,7 +679,7 @@ fn render_usage_frame(
                         format_compact(row.cache_read),
                         format_compact(row.cache_creation),
                         format_compact(row.total),
-                        format_cost(row.cost),
+                        format_cost_compact(row.cost),
                     ],
                     style,
                     1,
@@ -741,7 +741,7 @@ fn render_usage_frame(
                             vec![
                                 row.label.to_string(),
                                 format_compact(row.stats.total_tokens),
-                                format_cost(row.stats.total_cost),
+                                format_cost_compact(row.stats.total_cost),
                             ],
                             row.tui_color,
                             row.emphasize,
@@ -805,7 +805,7 @@ fn render_usage_frame(
             }
         }
 
-        let total_cost_str = format_cost(totals.cost);
+        let total_cost_str = format_cost_compact(totals.cost);
         let total_tokens_str = format_compact(totals.total);
         let entries_str = format!("{}", rows_data.len());
 
