@@ -236,6 +236,8 @@ pub fn display_analysis_interactive(
         match action {
             InputAction::Quit => break,
             InputAction::Refresh => refresh_state.force(),
+            // Provider-prefix merge is a usage-view feature; nothing to do here.
+            InputAction::ToggleMerge => {}
             // Move the selection / scroll, then repaint without re-aggregating.
             InputAction::Navigate(nav) => {
                 scroll.apply(nav, rows_data.len());
@@ -472,7 +474,7 @@ fn render_analysis_frame(
         let summary = create_summary(summary_items, sys, pid);
         f.render_widget(summary, chunks.summary);
 
-        f.render_widget(create_controls(), chunks.controls);
+        f.render_widget(create_controls(&[]), chunks.controls);
     })?;
 
     Ok(())

@@ -126,6 +126,7 @@ fn main() -> Result<()> {
             json,
             text,
             table,
+            merge_providers,
             daily,
             weekly,
             monthly,
@@ -157,12 +158,12 @@ fn main() -> Result<()> {
                 }
             } else if text {
                 let usage_data = get_usage_from_directories(time_range)?;
-                display_usage_text(&usage_data);
+                display_usage_text(&usage_data, merge_providers);
             } else if table {
                 let usage_data = get_usage_from_directories(time_range)?;
-                display_usage_table(&usage_data);
+                display_usage_table(&usage_data, merge_providers);
             } else {
-                display_usage_interactive(time_range)?;
+                display_usage_interactive(time_range, merge_providers)?;
             }
         }
 

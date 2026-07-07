@@ -168,14 +168,15 @@ Commands:
 
 ### Flag 一覽
 
-| Flag                                           | 用途                         |
-| ---------------------------------------------- | ---------------------------- |
-| *(不帶參數)*                                   | 互動式 TUI 儀表板（預設）    |
-| `--table`                                      | 靜態表格，不啟動 TUI         |
-| `--text`                                       | 純文字，適合腳本處理         |
-| `--json`                                       | JSON 輸出，附帶 pricing 資訊 |
-| `--output <FILE>`                              | 將富化 JSON 存成檔案         |
-| `--daily` / `--weekly` / `--monthly` / `--all` | 時間範圍篩選（見上方表格）   |
+| Flag                                           | 用途                                                                          |
+| ---------------------------------------------- | ----------------------------------------------------------------------------- |
+| *(不帶參數)*                                   | 互動式 TUI 儀表板（預設）                                                     |
+| `--table`                                      | 靜態表格，不啟動 TUI                                                          |
+| `--text`                                       | 純文字，適合腳本處理                                                          |
+| `--json`                                       | JSON 輸出，附帶 pricing 資訊                                                  |
+| `--output <FILE>`                              | 將富化 JSON 存成檔案                                                          |
+| `--merge-providers`                            | 合併共享同一 base 名稱、僅 provider 前綴不同的 model（`--json` 會忽略此選項） |
+| `--daily` / `--weekly` / `--monthly` / `--all` | 時間範圍篩選（見上方表格）                                                    |
 
 ### 基本用法
 
@@ -199,10 +200,17 @@ vct usage --output report.json
 vct usage --weekly
 vct usage --table --monthly
 vct usage --json --daily
+
+# 合併同一 model 在不同 provider 前綴下的多列
+# (例如 openai/gpt-5.5 + azure/gpt-5.5 + gpt-5.5 -> 一列)
+vct usage --table --merge-providers
 ```
 
 > [!NOTE]
 > Model 列會依 cost 由小到大排序，所以花費最高的 model 會排在最後(在 `--table` 中緊鄰 `TOTAL` 列上方)。這個排序會套用到互動式儀表板、`--table` 與 `--text` 三種輸出;`--json` 也會保持相同順序。互動式儀表板也會隱藏在所選範圍內用量為 0 的 model。
+
+> [!TIP]
+> 同一個 model 在不同 provider 前綴下路由時會顯示成多列（`openai/gpt-5.5`、`azure/gpt-5.5`、純 `gpt-5.5`）。`--merge-providers` 會把第一個 `/` 之後 base 名稱相同的列合併（`gpt-5.5` 與 `gpt-5.4` 這類版本不同的仍分開），並把它們已定價的 cost 相加。在互動式儀表板中按 `m` 可即時切換;`--merge-providers` 則讓儀表板一打開就是合併狀態。`--json` 保持為逐一 model 的原始輸出。
 
 ### 預覽：互動式儀表板（`vct usage`）
 
@@ -223,7 +231,7 @@ vct usage --json --daily
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
 │ Total Cost: $79.33  |  Total Tokens: 49.3M  |  Models: 3  |  Memory: 42.8 MB                │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
-  ↑/↓ scroll  PgUp/PgDn page  g/G top/end  r refresh  q quit  |  ★ github.com/Mai0313/VibeCodingTracker
+  ↑/↓ scroll  PgUp/PgDn page  g/G top/end  m merge  r refresh  q quit  |  ★ github.com/Mai0313/VibeCodingTracker
 ```
 
 ### 預覽：表格與 JSON（`vct usage`）

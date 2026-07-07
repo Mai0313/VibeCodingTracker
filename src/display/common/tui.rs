@@ -90,6 +90,9 @@ pub fn handle_input() -> anyhow::Result<InputAction> {
                 if key.code == KeyCode::Char('r') || key.code == KeyCode::Char('R') {
                     return Ok(InputAction::Refresh);
                 }
+                if key.code == KeyCode::Char('m') || key.code == KeyCode::Char('M') {
+                    return Ok(InputAction::ToggleMerge);
+                }
                 // Navigation accumulates across the drained batch so a held key
                 // collapses into a single net move per tick.
                 match key.code {
@@ -147,6 +150,9 @@ pub enum InputAction {
     Quit,
     /// User asked to re-fetch and redraw (`r` / `R`).
     Refresh,
+    /// User toggled provider-prefix merging (`m` / `M`); usage view only,
+    /// ignored elsewhere.
+    ToggleMerge,
     /// User scrolled / moved the selection; redraw without re-fetching.
     Navigate(NavDelta),
     /// Terminal was resized — redraw the current frame at the new size
@@ -208,6 +214,16 @@ pub struct UpdateTracker {
     highlight_duration: Duration,
 }
 
+/// Hashes any `Hash` value with [`DefaultHasher`](std::collections::hash_map::DefaultHasher)
+/// — used to store a compact fingerprint of a row instead of a full clone.
+fn hash_of<T: std::hash::Hash>(data: &T) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::Hasher;
+    let mut hasher = DefaultHasher::new();
+    data.hash(&mut hasher);
+    hasher.finish()
+}
+
 impl UpdateTracker {
     /// Creates a tracker retaining up to `max_tracked` rows and highlighting changes for `highlight_duration_millis`.
     pub fn new(max_tracked: usize, highlight_duration_millis: u64) -> Self {
@@ -226,12 +242,7 @@ impl UpdateTracker {
     /// to avoid retaining a full copy. This never evicts entries — call
     /// [`cleanup`](Self::cleanup) to bound growth.
     pub fn track_update<T: std::hash::Hash>(&mut self, key: String, data: &T) {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::Hasher;
-
-        let mut hasher = DefaultHasher::new();
-        data.hash(&mut hasher);
-        let hash = hasher.finish();
+        let hash = hash_of(data);
 
         let entry_changed = match self.previous_hashes.get(&key) {
             Some(&prev_hash) => prev_hash != hash,
@@ -243,6 +254,18 @@ impl UpdateTracker {
         }
 
         self.previous_hashes.insert(key, hash);
+    }
+
+    /// Records `data`'s hash for `key` as the baseline **without** marking it
+    /// updated.
+    ///
+    /// Used when rows are relabeled but not actually changed — e.g. toggling the
+    /// provider-merge view swaps `openai/gpt-5.5` for `gpt-5.5`. Priming the new
+    /// key means the next [`track_update`](Self::track_update) compares against a
+    /// real baseline instead of treating it as first-seen and green-flashing the
+    /// whole table on the next refresh.
+    pub fn prime<T: std::hash::Hash>(&mut self, key: String, data: &T) {
+        self.previous_hashes.insert(key, hash_of(data));
     }
 
     /// Drops tracked entries whose key is no longer present, then enforces the `max_tracked` cap.

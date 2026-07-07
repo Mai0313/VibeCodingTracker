@@ -168,14 +168,15 @@ Time range flags (shared by `usage` and `analysis`, mutually exclusive, default 
 
 ### Flags
 
-| Flag                                           | Purpose                             |
-| ---------------------------------------------- | ----------------------------------- |
-| *(none)*                                       | Interactive TUI dashboard (default) |
-| `--table`                                      | Static table, no TUI                |
-| `--text`                                       | Plain text, script-friendly         |
-| `--json`                                       | JSON with enriched pricing metadata |
-| `--output <FILE>`                              | Save enriched JSON to a file        |
-| `--daily` / `--weekly` / `--monthly` / `--all` | Time range filter (see table above) |
+| Flag                                           | Purpose                                                                          |
+| ---------------------------------------------- | -------------------------------------------------------------------------------- |
+| *(none)*                                       | Interactive TUI dashboard (default)                                              |
+| `--table`                                      | Static table, no TUI                                                             |
+| `--text`                                       | Plain text, script-friendly                                                      |
+| `--json`                                       | JSON with enriched pricing metadata                                              |
+| `--output <FILE>`                              | Save enriched JSON to a file                                                     |
+| `--merge-providers`                            | Merge models sharing a base name across provider prefixes (ignored for `--json`) |
+| `--daily` / `--weekly` / `--monthly` / `--all` | Time range filter (see table above)                                              |
 
 ### Basic Usage
 
@@ -199,10 +200,17 @@ vct usage --output report.json
 vct usage --weekly
 vct usage --table --monthly
 vct usage --json --daily
+
+# Merge same model reported under different provider prefixes
+# (e.g. openai/gpt-5.5 + azure/gpt-5.5 + gpt-5.5 -> one row)
+vct usage --table --merge-providers
 ```
 
 > [!NOTE]
 > Model rows are sorted by cost in ascending order, so the highest-spending model is listed last (right above the `TOTAL` row in `--table`). This applies to the interactive dashboard, `--table`, and `--text` output; `--json` preserves the same order. The interactive dashboard also hides models with zero usage in the selected range.
+
+> [!TIP]
+> The same model can show up as several rows when it is routed under different provider prefixes (`openai/gpt-5.5`, `azure/gpt-5.5`, plain `gpt-5.5`). `--merge-providers` collapses rows that share the base name after the first `/` (versions like `gpt-5.5` vs `gpt-5.4` stay separate) and sums their already-priced cost. In the interactive dashboard, press `m` to toggle it live; `--merge-providers` opens the dashboard already merged. `--json` is left as the raw per-model export.
 
 ### Preview: Interactive Dashboard (`vct usage`)
 
@@ -223,7 +231,7 @@ vct usage --json --daily
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
 │ Total Cost: $79.33  |  Total Tokens: 49.3M  |  Models: 3  |  Memory: 42.8 MB                │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
-  ↑/↓ scroll  PgUp/PgDn page  g/G top/end  r refresh  q quit  |  ★ github.com/Mai0313/VibeCodingTracker
+  ↑/↓ scroll  PgUp/PgDn page  g/G top/end  m merge  r refresh  q quit  |  ★ github.com/Mai0313/VibeCodingTracker
 ```
 
 ### Preview: Table & JSON (`vct usage`)

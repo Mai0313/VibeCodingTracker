@@ -26,7 +26,8 @@ pub use file::{
     write_json_atomic_pretty,
 };
 pub use format::{
-    format_compact, format_cost, format_duration_until, format_number, get_current_date,
+    format_compact, format_cost, format_cost_compact, format_duration_until, format_number,
+    get_current_date,
 };
 pub use git::get_git_remote_url;
 pub use heap::{release_freed_heap, tune_system_allocator};

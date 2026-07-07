@@ -3,7 +3,9 @@
 use crate::display::common::table::{
     add_totals_row, create_comfy_table, create_metric_cell, create_provider_cell,
 };
-use crate::display::usage::averages::{build_provider_total_rows, build_usage_summary};
+use crate::display::usage::averages::{
+    build_provider_total_rows, build_usage_summary, merge_rows_by_base_model,
+};
 use crate::pricing::{ModelPricingMap, fetch_model_pricing};
 use crate::usage::UsageData;
 use crate::utils::format_number;
@@ -18,8 +20,9 @@ use std::collections::HashMap;
 /// so each row reconciles with "Total Tokens", while cost is priced against the
 /// separated buckets. Prints a "no usage data" message when empty. If pricing
 /// cannot be fetched, a warning is written to stderr and costs are shown as
-/// `$0.00`.
-pub fn display_usage_table(usage_data: &UsageData) {
+/// `$0.00`. When `merge` is set, rows sharing a base model name across provider
+/// prefixes (e.g. `openai/gpt-5.5` + `azure/gpt-5.5`) are collapsed into one.
+pub fn display_usage_table(usage_data: &UsageData, merge: bool) {
     if usage_data.models.is_empty() {
         println!("No usage data found in Claude Code, Codex, Copilot, or Gemini sessions");
         return;
@@ -38,7 +41,7 @@ pub fn display_usage_table(usage_data: &UsageData) {
         }
     };
 
-    let summary = build_usage_summary(
+    let mut summary = build_usage_summary(
         &usage_data.models,
         &usage_data.per_provider,
         &usage_data.provider_days,
@@ -49,6 +52,11 @@ pub fn display_usage_table(usage_data: &UsageData) {
     if summary.rows.is_empty() {
         println!("No usage data found in Claude Code, Codex, Copilot, or Gemini sessions");
         return;
+    }
+
+    // Totals are a row-wise sum, so they are identical merged or not.
+    if merge {
+        summary.rows = merge_rows_by_base_model(&summary.rows);
     }
 
     let rows = &summary.rows;

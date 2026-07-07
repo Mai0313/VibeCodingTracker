@@ -252,6 +252,16 @@ fn test_usage_command_table() {
 }
 
 #[test]
+fn test_usage_command_merge_providers() {
+    // The `--merge-providers` flag must parse and run in the static modes.
+    for format in ["--table", "--text"] {
+        let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
+        cmd.arg("usage").arg(format).arg("--merge-providers");
+        cmd.assert().success();
+    }
+}
+
+#[test]
 fn test_usage_command_with_output_file() {
     use std::time::Duration;
 

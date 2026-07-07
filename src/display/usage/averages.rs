@@ -13,7 +13,7 @@ use std::borrow::Cow;
 /// numbers reconcile with `total`, while `cost` is computed against the
 /// per-token reasoning rate (when the model publishes one) via
 /// `calculate_cost`.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct UsageRow {
     /// Raw model name as reported by the session (the pricing-lookup key).
     pub model: String, // 原始模型名稱
@@ -399,6 +399,66 @@ fn build_usage_row(
     }
 }
 
+/// Returns the base model key used to merge rows across provider-routing
+/// prefixes: everything after the first `/`, or the whole name when there is no
+/// `/`. Unlike [`normalize_model_name`](crate::pricing::normalize_model_name)
+/// this does **not** strip version/date suffixes, so `gpt-5.5` and `gpt-5.4`
+/// stay distinct.
+fn base_model_key(model: &str) -> &str {
+    model.split_once('/').map(|(_, rest)| rest).unwrap_or(model)
+}
+
+/// Collapses rows by [`base_model_key`], summing every token bucket and the
+/// already-resolved cost, and shows every row under its bare base name.
+///
+/// Costs are summed verbatim: each input row was already priced against its
+/// full model name, so a merged `gpt-5.5` correctly adds the differently-priced
+/// `openai/gpt-5.5`, `azure/gpt-5.5`, and bare `gpt-5.5` pieces — re-pricing the
+/// merged token bucket under a single name would be wrong. Every output row is
+/// labeled with just the base name (the provider prefix is dropped even when a
+/// model has no duplicate, e.g. `opencode/big-pickle` -> `big-pickle`) with no
+/// count suffix, so the merged view reads uniformly. The result is re-sorted by
+/// ascending cost, tie-broken by model name, matching [`build_usage_summary`].
+pub fn merge_rows_by_base_model(rows: &[UsageRow]) -> Vec<UsageRow> {
+    use std::collections::HashMap;
+
+    let mut groups: HashMap<&str, Vec<&UsageRow>> = HashMap::new();
+    for row in rows {
+        groups
+            .entry(base_model_key(&row.model))
+            .or_default()
+            .push(row);
+    }
+
+    let mut merged: Vec<UsageRow> = Vec::with_capacity(groups.len());
+    for (key, members) in groups {
+        let mut acc = UsageRow {
+            model: key.to_string(),
+            display_model: key.to_string(),
+            ..UsageRow::default()
+        };
+        for m in members {
+            acc.input_tokens += m.input_tokens;
+            acc.output_tokens += m.output_tokens;
+            acc.reasoning_tokens += m.reasoning_tokens;
+            acc.cache_read += m.cache_read;
+            acc.cache_creation += m.cache_creation;
+            acc.total += m.total;
+            acc.cost += m.cost;
+        }
+        merged.push(acc);
+    }
+
+    // Same ordering as build_usage_summary so the merged view reads identically.
+    merged.sort_by(|a, b| {
+        a.cost
+            .partial_cmp(&b.cost)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.model.cmp(&b.model))
+    });
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,5 +504,97 @@ mod tests {
         assert_eq!(summary.rows.len(), 1);
         assert!((summary.rows[0].cost - 8.0).abs() < 1e-9);
         assert_eq!(summary.rows[0].display_model, "shared-pro (shared)");
+    }
+
+    fn row(model: &str, input: i64, total: i64, cost: f64) -> UsageRow {
+        UsageRow {
+            model: model.to_string(),
+            display_model: model.to_string(),
+            input_tokens: input,
+            total,
+            cost,
+            ..UsageRow::default()
+        }
+    }
+
+    #[test]
+    fn merge_collapses_prefixed_and_bare_names_and_sums() {
+        let rows = vec![
+            row("openai/gpt-5.5", 100, 100, 0.20),
+            row("azure/gpt-5.5", 200, 200, 3.00),
+            row("gpt-5.5", 300, 300, 5.00),
+        ];
+
+        let merged = merge_rows_by_base_model(&rows);
+
+        assert_eq!(merged.len(), 1);
+        let m = &merged[0];
+        assert_eq!(m.model, "gpt-5.5");
+        assert_eq!(m.display_model, "gpt-5.5");
+        assert_eq!(m.input_tokens, 600);
+        assert_eq!(m.total, 600);
+        assert!((m.cost - 8.20).abs() < 1e-9);
+    }
+
+    #[test]
+    fn merge_keeps_different_versions_apart() {
+        // gpt-5.5 has two provider variants (they merge); gpt-5.4 has one. The
+        // key check: the 5.4 tokens never fold into the 5.5 row.
+        let rows = vec![
+            row("openai/gpt-5.5", 10, 10, 1.0),
+            row("azure/gpt-5.5", 30, 30, 3.0),
+            row("openai/gpt-5.4", 20, 20, 2.0),
+        ];
+
+        let merged = merge_rows_by_base_model(&rows);
+
+        assert_eq!(merged.len(), 2);
+        // The two gpt-5.5 rows collapse to one base row; gpt-5.4 stays separate.
+        let five_five = merged.iter().find(|r| r.model == "gpt-5.5").unwrap();
+        assert_eq!(five_five.display_model, "gpt-5.5");
+        assert_eq!(five_five.total, 40);
+        // The lone 5.4 also shows under its bare base name, keeping its tokens.
+        let five_four = merged.iter().find(|r| r.model == "gpt-5.4").unwrap();
+        assert_eq!(five_four.display_model, "gpt-5.4");
+        assert_eq!(five_four.total, 20);
+    }
+
+    #[test]
+    fn merge_strips_prefix_from_single_row() {
+        // Even a model with no duplicate drops its provider prefix (and any
+        // fuzzy-match hint) so the merged view reads uniformly.
+        let mut only = row("deepseek/deepseek-v4-pro", 5, 5, 1.5);
+        only.display_model = "deepseek/deepseek-v4-pro (deepseek-v4)".to_string();
+
+        let merged = merge_rows_by_base_model(std::slice::from_ref(&only));
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].model, "deepseek-v4-pro");
+        assert_eq!(merged[0].display_model, "deepseek-v4-pro");
+        assert_eq!(merged[0].total, 5);
+    }
+
+    #[test]
+    fn merge_only_strips_first_slash_segment() {
+        assert_eq!(base_model_key("a/b/c"), "b/c");
+        assert_eq!(base_model_key("gpt-5.5"), "gpt-5.5");
+        assert_eq!(base_model_key("openai/gpt-5.5"), "gpt-5.5");
+    }
+
+    #[test]
+    fn merge_reorders_by_ascending_cost() {
+        let rows = vec![
+            row("openai/gpt-5.5", 1, 1, 9.0),
+            row("azure/gpt-5.5", 1, 1, 9.0),
+            row("cheap-model", 1, 1, 0.01),
+        ];
+
+        let merged = merge_rows_by_base_model(&rows);
+
+        assert_eq!(merged.len(), 2);
+        // cheap-model (0.01) sorts before the merged gpt-5.5 row (18.0).
+        assert_eq!(merged[0].model, "cheap-model");
+        assert_eq!(merged[1].model, "gpt-5.5");
+        assert!((merged[1].cost - 18.0).abs() < 1e-9);
     }
 }

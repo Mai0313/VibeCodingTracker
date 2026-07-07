@@ -136,6 +136,33 @@ pub fn format_cost(cost: f64) -> String {
     format!("{sign}${}.{:02}", format_number(cents / 100), cents % 100)
 }
 
+/// Formats a USD amount for the dense interactive dashboard, abbreviating large
+/// values with a K/M/B/T suffix.
+///
+/// Amounts under `$1000` keep full cents via [`format_cost`] (`$74.18`); larger
+/// amounts drop to [`format_compact`]'s 3-significant-figure form prefixed with
+/// `$` (`$8.63K`, `$14.2K`). This mirrors how the TUI already abbreviates token
+/// counts — only the interactive view uses it, while the static table, text, and
+/// JSON paths keep [`format_cost`] so their amounts stay exact to the cent.
+///
+/// # Examples
+///
+/// ```
+/// use vibe_coding_tracker::utils::format_cost_compact;
+///
+/// assert_eq!(format_cost_compact(74.18), "$74.18");
+/// assert_eq!(format_cost_compact(4114.28), "$4.11K");
+/// assert_eq!(format_cost_compact(10021.35), "$10.0K");
+/// assert_eq!(format_cost_compact(-1500.0), "-$1.50K");
+/// ```
+pub fn format_cost_compact(cost: f64) -> String {
+    if cost.abs() < 1000.0 {
+        return format_cost(cost);
+    }
+    let sign = if cost < 0.0 { "-" } else { "" };
+    format!("{sign}${}", format_compact(cost.abs().round() as i64))
+}
+
 // Cache for current date (updated once per day)
 static DATE_CACHE: RwLock<Option<(NaiveDate, String)>> = RwLock::new(None);
 
@@ -290,6 +317,26 @@ mod tests {
         assert_eq!(format_cost(1234.56), "$1,234.56");
         assert_eq!(format_cost(1_234_567.891), "$1,234,567.89");
         assert_eq!(format_cost(-5.5), "-$5.50");
+    }
+
+    #[test]
+    fn test_format_cost_compact() {
+        // Under $1000: full cents via format_cost.
+        assert_eq!(format_cost_compact(0.0), "$0.00");
+        assert_eq!(format_cost_compact(2.42), "$2.42");
+        assert_eq!(format_cost_compact(74.18), "$74.18");
+        assert_eq!(format_cost_compact(999.99), "$999.99");
+
+        // $1000 and up: K/M/B/T with 3 significant figures.
+        assert_eq!(format_cost_compact(1000.0), "$1.00K");
+        assert_eq!(format_cost_compact(4114.28), "$4.11K");
+        assert_eq!(format_cost_compact(10021.35), "$10.0K");
+        assert_eq!(format_cost_compact(14212.22), "$14.2K");
+        assert_eq!(format_cost_compact(8_631_270.0), "$8.63M");
+
+        // Negative (credit) amounts keep a leading minus.
+        assert_eq!(format_cost_compact(-50.0), "-$50.00");
+        assert_eq!(format_cost_compact(-1500.0), "-$1.50K");
     }
 
     #[test]
