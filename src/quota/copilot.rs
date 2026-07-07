@@ -100,20 +100,34 @@ fn strip_jsonc_comments(input: &str) -> String {
     out
 }
 
-/// Reads the first `gho_...` GitHub token from the (JSONC) Copilot config.
+/// Reads the `gho_...` GitHub token from the (JSONC) Copilot config.
 ///
-/// Picks the first `copilotTokens` entry whose key names a `https://github.com`
-/// host, matching what the Copilot CLI itself uses.
+/// Prefers the token for `lastLoggedInUser` (`<host>:<login>`) so a config that
+/// still holds several accounts queries the one the user is actually on, then
+/// falls back to the first `https://github.com` entry.
 fn read_copilot_token(body: &str) -> Option<String> {
     let stripped = strip_jsonc_comments(body);
     let root: serde_json::Value = serde_json::from_str(&stripped).ok()?;
     let tokens = root.get("copilotTokens")?.as_object()?;
+
+    let token_str = |v: &serde_json::Value| v.as_str().filter(|s| !s.is_empty()).map(str::to_string);
+
+    // The `copilotTokens` keys are `<host>:<login>`; match the last-logged-in
+    // account first.
+    if let Some(user) = root.get("lastLoggedInUser")
+        && let (Some(host), Some(login)) = (
+            user.get("host").and_then(|v| v.as_str()),
+            user.get("login").and_then(|v| v.as_str()),
+        )
+        && let Some(tok) = tokens.get(&format!("{host}:{login}")).and_then(token_str)
+    {
+        return Some(tok);
+    }
+
     tokens
         .iter()
         .find(|(k, _)| k.starts_with("https://github.com"))
-        .and_then(|(_, v)| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+        .and_then(|(_, v)| token_str(v))
 }
 
 /// Maps a `/copilot_internal/user` body into a [`CopilotQuotaSnapshot`] (pure).
@@ -299,6 +313,24 @@ mod tests {
     fn no_token_returns_none() {
         assert!(read_copilot_token(r#"{ "copilotTokens": {} }"#).is_none());
         assert!(read_copilot_token(r#"{}"#).is_none());
+    }
+
+    #[test]
+    fn prefers_last_logged_in_account_token() {
+        let cfg = r#"{
+            "copilotTokens": {
+                "https://github.com:alice": "gho_ALICE",
+                "https://github.com:bob": "gho_BOB"
+            },
+            "lastLoggedInUser": { "host": "https://github.com", "login": "bob" }
+        }"#;
+        assert_eq!(read_copilot_token(cfg).unwrap(), "gho_BOB");
+    }
+
+    #[test]
+    fn falls_back_to_a_github_token_without_last_user() {
+        let cfg = r#"{ "copilotTokens": { "https://github.com:alice": "gho_ALICE" } }"#;
+        assert_eq!(read_copilot_token(cfg).unwrap(), "gho_ALICE");
     }
 
     const USER: &str = r#"{
