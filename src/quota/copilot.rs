@@ -333,7 +333,10 @@ mod tests {
         assert!(out.contains("https://github.com:octocat"));
         let creds = read_copilot_creds(CONFIG).unwrap();
         assert_eq!(creds.token, "gho_EXAMPLETOKEN");
-        assert_eq!(creds.api_url, "https://api.github.com/copilot_internal/user");
+        assert_eq!(
+            creds.api_url,
+            "https://api.github.com/copilot_internal/user"
+        );
     }
 
     #[test]
@@ -392,7 +395,10 @@ mod tests {
         }"#;
         let creds = read_copilot_creds(cfg).unwrap();
         assert_eq!(creds.token, "gho_GHE");
-        assert_eq!(creds.api_url, "https://api.acme.ghe.com/copilot_internal/user");
+        assert_eq!(
+            creds.api_url,
+            "https://api.acme.ghe.com/copilot_internal/user"
+        );
     }
 
     const USER: &str = r#"{
