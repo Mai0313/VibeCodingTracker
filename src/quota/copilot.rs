@@ -21,8 +21,9 @@ use anyhow::{Context, Result};
 use reqwest::blocking::Client;
 use std::sync::OnceLock;
 
-/// The Copilot internal usage endpoint.
-const COPILOT_USAGE_URL: &str = "https://api.github.com/copilot_internal/user";
+/// Path of the Copilot internal usage endpoint (the host is derived per account
+/// so GHE data-residency logins reach `api.<host>` instead of api.github.com).
+const COPILOT_USAGE_PATH: &str = "/copilot_internal/user";
 /// Fallback Copilot CLI version for the User-Agent when `copilot --version`
 /// cannot be resolved (CLI absent or unreadable). Bump occasionally.
 const COPILOT_FALLBACK_VERSION: &str = "1.0.68";
@@ -100,35 +101,63 @@ fn strip_jsonc_comments(input: &str) -> String {
     out
 }
 
-/// Reads the `gho_...` GitHub token from the (JSONC) Copilot config.
+/// A resolved Copilot credential: the entitlement API URL + the OAuth token.
+struct CopilotCreds {
+    api_url: String,
+    token: String,
+}
+
+/// Reads the `gho_...` GitHub token from the (JSONC) Copilot config and derives
+/// the entitlement API host from the account's login host.
 ///
 /// Prefers the token for `lastLoggedInUser` (`<host>:<login>`) so a config that
 /// still holds several accounts queries the one the user is actually on, then
 /// falls back to the first `https://github.com` entry.
-fn read_copilot_token(body: &str) -> Option<String> {
+fn read_copilot_creds(body: &str) -> Option<CopilotCreds> {
     let stripped = strip_jsonc_comments(body);
     let root: serde_json::Value = serde_json::from_str(&stripped).ok()?;
     let tokens = root.get("copilotTokens")?.as_object()?;
 
-    let token_str =
+    let entry_token =
         |v: &serde_json::Value| v.as_str().filter(|s| !s.is_empty()).map(str::to_string);
 
     // The `copilotTokens` keys are `<host>:<login>`; match the last-logged-in
-    // account first.
-    if let Some(user) = root.get("lastLoggedInUser")
-        && let (Some(host), Some(login)) = (
-            user.get("host").and_then(|v| v.as_str()),
-            user.get("login").and_then(|v| v.as_str()),
-        )
-        && let Some(tok) = tokens.get(&format!("{host}:{login}")).and_then(token_str)
-    {
-        return Some(tok);
-    }
+    // account first, then fall back to the first GitHub entry.
+    let preferred = root.get("lastLoggedInUser").and_then(|user| {
+        let host = user.get("host")?.as_str()?;
+        let login = user.get("login")?.as_str()?;
+        let key = format!("{host}:{login}");
+        let token = tokens.get(&key).and_then(entry_token)?;
+        Some((key, token))
+    });
 
-    tokens
-        .iter()
-        .find(|(k, _)| k.starts_with("https://github.com"))
-        .and_then(|(_, v)| token_str(v))
+    let (key, token) = match preferred {
+        Some(pair) => pair,
+        None => {
+            let (k, v) = tokens
+                .iter()
+                .find(|(k, _)| k.starts_with("https://github.com"))?;
+            (k.clone(), entry_token(v)?)
+        }
+    };
+
+    Some(CopilotCreds {
+        api_url: copilot_api_url(&key),
+        token,
+    })
+}
+
+/// Derives the entitlement API URL from a `copilotTokens` key (`<host>:<login>`).
+///
+/// `https://github.com:me` -> `https://api.github.com/copilot_internal/user`; a
+/// GHE data-residency host (`https://acme.ghe.com:me`) maps to
+/// `https://api.acme.ghe.com/...` so those tokens reach the correct host.
+fn copilot_api_url(key: &str) -> String {
+    let host = key.rsplit_once(':').map(|(h, _)| h).unwrap_or(key);
+    let domain = host
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    format!("https://api.{domain}{COPILOT_USAGE_PATH}")
 }
 
 /// Maps a `/copilot_internal/user` body into a [`CopilotQuotaSnapshot`] (pure).
@@ -222,9 +251,9 @@ enum FetchResult {
 }
 
 /// Calls the Copilot usage API with `token`, impersonating the Copilot CLI.
-fn fetch_copilot_user(client: &Client, token: &str, now: i64) -> FetchResult {
+fn fetch_copilot_user(client: &Client, api_url: &str, token: &str, now: i64) -> FetchResult {
     let resp = match client
-        .get(COPILOT_USAGE_URL)
+        .get(api_url)
         .header(reqwest::header::AUTHORIZATION, format!("token {token}"))
         .header(reqwest::header::ACCEPT, "application/json")
         .header(reqwest::header::USER_AGENT, copilot_ua())
@@ -269,11 +298,11 @@ impl CopilotState {
             Ok(b) => b,
             Err(_) => return QuotaOutcome::Transient,
         };
-        let token = match read_copilot_token(&body) {
-            Some(t) => t,
+        let creds = match read_copilot_creds(&body) {
+            Some(c) => c,
             None => return QuotaOutcome::NeedsLogin,
         };
-        match fetch_copilot_user(client, &token, now) {
+        match fetch_copilot_user(client, &creds.api_url, &creds.token, now) {
             FetchResult::Ok(snap) => QuotaOutcome::Data(snap),
             FetchResult::Unauthorized => QuotaOutcome::NeedsLogin,
             FetchResult::Transient => QuotaOutcome::Transient,
@@ -302,8 +331,9 @@ mod tests {
         assert!(!out.contains("// User settings"));
         // The `//` inside the string value must survive.
         assert!(out.contains("https://github.com:octocat"));
-        let token = read_copilot_token(CONFIG).unwrap();
-        assert_eq!(token, "gho_EXAMPLETOKEN");
+        let creds = read_copilot_creds(CONFIG).unwrap();
+        assert_eq!(creds.token, "gho_EXAMPLETOKEN");
+        assert_eq!(creds.api_url, "https://api.github.com/copilot_internal/user");
     }
 
     #[test]
@@ -319,8 +349,8 @@ mod tests {
 
     #[test]
     fn no_token_returns_none() {
-        assert!(read_copilot_token(r#"{ "copilotTokens": {} }"#).is_none());
-        assert!(read_copilot_token(r#"{}"#).is_none());
+        assert!(read_copilot_creds(r#"{ "copilotTokens": {} }"#).is_none());
+        assert!(read_copilot_creds(r#"{}"#).is_none());
     }
 
     #[test]
@@ -332,13 +362,37 @@ mod tests {
             },
             "lastLoggedInUser": { "host": "https://github.com", "login": "bob" }
         }"#;
-        assert_eq!(read_copilot_token(cfg).unwrap(), "gho_BOB");
+        assert_eq!(read_copilot_creds(cfg).unwrap().token, "gho_BOB");
     }
 
     #[test]
     fn falls_back_to_a_github_token_without_last_user() {
         let cfg = r#"{ "copilotTokens": { "https://github.com:alice": "gho_ALICE" } }"#;
-        assert_eq!(read_copilot_token(cfg).unwrap(), "gho_ALICE");
+        assert_eq!(read_copilot_creds(cfg).unwrap().token, "gho_ALICE");
+    }
+
+    #[test]
+    fn derives_api_host_from_login_host() {
+        assert_eq!(
+            copilot_api_url("https://github.com:me"),
+            "https://api.github.com/copilot_internal/user"
+        );
+        // GHE data-residency host keeps its subdomain.
+        assert_eq!(
+            copilot_api_url("https://acme.ghe.com:me"),
+            "https://api.acme.ghe.com/copilot_internal/user"
+        );
+    }
+
+    #[test]
+    fn ghe_host_creds_target_the_ghe_api() {
+        let cfg = r#"{
+            "copilotTokens": { "https://acme.ghe.com:me": "gho_GHE" },
+            "lastLoggedInUser": { "host": "https://acme.ghe.com", "login": "me" }
+        }"#;
+        let creds = read_copilot_creds(cfg).unwrap();
+        assert_eq!(creds.token, "gho_GHE");
+        assert_eq!(creds.api_url, "https://api.acme.ghe.com/copilot_internal/user");
     }
 
     const USER: &str = r#"{
