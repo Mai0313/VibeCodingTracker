@@ -64,8 +64,8 @@ const CURSOR_HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 /// Primary source is Cursor's dashboard usage-events API (real billing tokens
 /// and Cursor's own cost), cached in `~/.vct`. When the API cannot be reached
 /// and no cache exists, falls back to a local context-occupancy approximation
-/// derived from the chat stores (input-side estimate only, `$0` for models
-/// Cursor prices itself).
+/// derived from the chat stores (the context gauge counted as cache-read tokens,
+/// so it prices at the cache rate or `$0` for models Cursor prices itself).
 ///
 /// Each returned tuple is `(local YYYY-MM-DD, CodeAnalysis, cost_usd)` with the
 /// analysis carrying one model's `conversation_usage`, matching
@@ -81,37 +81,44 @@ pub fn read_cursor_usage(
     time_range: TimeRange,
 ) -> Result<Vec<(String, CodeAnalysis, f64)>> {
     let now = chrono::Local::now().timestamp();
+    let user = get_current_user();
+    let machine = get_machine_id().to_string();
     let cached = load_usage_cache();
 
-    let events = match cached {
-        Some(cache) if now.saturating_sub(cache.fetched_at) < CURSOR_USAGE_CACHE_TTL_SECS => {
-            cache.events
-        }
-        other => match fetch_all_events() {
-            Ok(events) => {
-                let _ = save_usage_cache(&events, now);
-                events
+    // A fresh cache — from a prior API fetch OR a prior offline approximation —
+    // is reused as-is: no HTTP, no store re-scan. This bounds the work to at
+    // most once per TTL even when the API keeps failing, so the usage TUI (which
+    // re-runs this on every refresh) never hammers the endpoint or re-reads
+    // every store.db each tick.
+    if let Some(cache) = &cached
+        && now.saturating_sub(cache.fetched_at) < CURSOR_USAGE_CACHE_TTL_SECS
+    {
+        return Ok(aggregate_events(&cache.events, time_range, &user, &machine));
+    }
+
+    // Cache stale or absent: make exactly one refresh attempt this call.
+    let (events, from_api) = match fetch_all_events() {
+        Ok(events) => (events, true),
+        Err(err) => match cached {
+            // Prefer stale real billing data over the rough approximation.
+            Some(cache) if cache.from_api && !cache.events.is_empty() => {
+                eprintln!("Warning: Cursor usage API unavailable ({err}); using cached usage.");
+                (cache.events, true)
             }
-            Err(err) => match other {
-                // A stale cache still holds real billing data — prefer it over
-                // the rough approximation.
-                Some(cache) => {
-                    eprintln!("Warning: Cursor usage API unavailable ({err}); using cached usage.");
-                    cache.events
-                }
-                None => {
-                    eprintln!(
-                        "Warning: Cursor usage API unavailable ({err}); \
-                         Cursor usage is an approximation from local context data."
-                    );
-                    return local_usage_approximation(chats_dir, tracking_db, time_range);
-                }
-            },
+            _ => {
+                eprintln!(
+                    "Warning: Cursor usage API unavailable ({err}); \
+                     Cursor usage is an approximation from local context data."
+                );
+                (approximation_events(chats_dir, tracking_db)?, false)
+            }
         },
     };
 
-    let user = get_current_user();
-    let machine = get_machine_id().to_string();
+    // Persist the result (API, reused-real, or approximation) with a fresh
+    // timestamp so the next refresh within the TTL is a pure cache read and does
+    // not retry the network or re-scan the stores.
+    let _ = save_usage_cache(&events, now, from_api);
     Ok(aggregate_events(&events, time_range, &user, &machine))
 }
 
@@ -174,6 +181,12 @@ struct CachedEvent {
 struct UsageCache {
     fetched_at: i64,
     events: Vec<CachedEvent>,
+    /// Whether `events` came from the API (real billing data) rather than the
+    /// local approximation. Real data is reused verbatim when the API is down;
+    /// an approximation is recomputed each refresh window so it picks up new
+    /// turns. Defaults to `false` for older caches without the field.
+    #[serde(default)]
+    from_api: bool,
 }
 
 /// Path to the usage-events cache file (`~/.vct/cursor_usage_events.json`).
@@ -190,12 +203,13 @@ fn load_usage_cache() -> Option<UsageCache> {
     serde_json::from_str(&body).ok()
 }
 
-/// Persists the freshly fetched usage events with the current timestamp.
-fn save_usage_cache(events: &[CachedEvent], fetched_at: i64) -> Result<()> {
+/// Persists the usage events with the current timestamp and their source.
+fn save_usage_cache(events: &[CachedEvent], fetched_at: i64, from_api: bool) -> Result<()> {
     let path = usage_cache_path().ok_or_else(|| anyhow!("no cache dir"))?;
     let cache = UsageCache {
         fetched_at,
         events: events.to_vec(),
+        from_api,
     };
     let body = serde_json::to_string(&cache)?;
     std::fs::write(path, body)?;
@@ -378,26 +392,23 @@ fn aggregate_events(
 // usage: offline approximation
 // ===========================================================================
 
-/// Approximates per-model usage from the local context-occupancy gauge when the
-/// dashboard API is unreachable.
+/// Builds all-time usage-approximation events from the local context gauge, for
+/// use when the dashboard API is unreachable.
 ///
 /// Cursor stores only the running context-window size per assistant turn, not
-/// billed tokens. Summing that gauge across a conversation's turns approximates
-/// the input side (each turn re-sends the context); output and cache are
-/// unknown and reported as zero, and cost is `$0` (models Cursor prices itself,
-/// e.g. `composer-*`, have no LiteLLM entry). This is deliberately a rough,
-/// input-only estimate — the real numbers come from the API path above.
-fn local_usage_approximation(
-    chats_dir: &Path,
-    tracking_db: &Path,
-    time_range: TimeRange,
-) -> Result<Vec<(String, CodeAnalysis, f64)>> {
+/// billed tokens. Each turn re-sends (and prompt-cache-reads) the accumulated
+/// context, so summing the gauge across a conversation's turns approximates the
+/// **cache-read** token volume — reported in the cache-read bucket both because
+/// that is the honest bucket and because it is then priced at the much cheaper
+/// cache rate rather than a wildly-inflated full-input rate. Input/output are
+/// unknown (`0`) and the stored cost is `0` (models Cursor prices itself, e.g.
+/// `composer-*`, have no LiteLLM entry and stay `$0`). Deliberately rough — the
+/// real numbers come from the API path. Returns all dates; the caller filters by
+/// time range after caching.
+fn approximation_events(chats_dir: &Path, tracking_db: &Path) -> Result<Vec<CachedEvent>> {
     let conv_models = load_conversation_models(tracking_db);
-    let user = get_current_user();
-    let machine = get_machine_id().to_string();
-    let cutoff = cutoff_string(time_range);
 
-    // (date, model) -> approximate input tokens
+    // (date, model) -> summed context-window gauge
     let mut agg: HashMap<(String, String), i64> = HashMap::new();
     for store_db in cursor_store_dbs(chats_dir) {
         let conv_id = conversation_id_from_path(&store_db);
@@ -408,22 +419,24 @@ fn local_usage_approximation(
             let Some(date) = ms_to_local_date(ts) else {
                 continue;
             };
-            if is_before_cutoff(&date, &cutoff) {
-                continue;
-            }
             *agg.entry((date, model.clone())).or_insert(0) += ctx;
         }
     }
 
-    let mut out = Vec::new();
-    for ((date, model), input) in agg {
-        let usage = cursor_usage_value(input, 0, 0, 0);
-        let mut map = FastHashMap::default();
-        map.insert(model, usage);
-        let record = SessionParseState::with_mode(ParseMode::UsageOnly).into_record(map);
-        out.push((date, wrap_record(record, &user, &machine), 0.0));
-    }
-    Ok(out)
+    Ok(agg
+        .into_iter()
+        .map(|((date, model), ctx)| CachedEvent {
+            date,
+            model,
+            input: 0,
+            output: 0,
+            // Re-sent context is cache-read; priced at the cache rate (or $0 for
+            // Cursor's own models), never the inflated full-input rate.
+            cache_read: ctx,
+            cache_write: 0,
+            cost: 0.0,
+        })
+        .collect())
 }
 
 // ===========================================================================
@@ -528,6 +541,12 @@ fn read_store_analysis(
             let Ok(msg) = serde_json::from_slice::<Value>(msg_bytes) else {
                 continue;
             };
+            // Only assistant turns carry tool calls. Guard before creating a
+            // date bucket so a non-assistant node never emits a zero-metric row
+            // or inflates the Cursor active-day count.
+            if msg.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+                continue;
+            }
             let Some(date) = ms_to_local_date(ts) else {
                 continue;
             };
@@ -626,14 +645,14 @@ fn load_blobs(conn: &Connection) -> Result<Vec<Vec<u8>>> {
 ///
 /// Binary nodes start with `field 1` (`0x0A`) and embed exactly one assistant
 /// message in `field 4`; `field 26` is the epoch-ms timestamp. Non-node blobs
-/// (JSON messages) return `None`.
+/// (JSON messages) return `None`, as do nodes missing the timestamp — an
+/// undateable turn is skipped rather than mis-bucketed to the epoch (1970).
 fn assistant_node(data: &[u8]) -> Option<(&[u8], i64)> {
     if data.first() != Some(&0x0A) {
         return None;
     }
     let node = walk_node(data);
-    let msg = node.msg?;
-    Some((msg, node.ts.unwrap_or(0)))
+    Some((node.msg?, node.ts?))
 }
 
 /// Applies one assistant message's tool calls to `state`.
@@ -1196,6 +1215,98 @@ mod tests {
             analysis.records[0]
                 .conversation_usage
                 .contains_key("claude-sonnet-4.6")
+        );
+    }
+
+    /// Builds a temp `store.db` with the given binary nodes and JSON blobs.
+    fn make_store_db(nodes: &[Vec<u8>], json_blobs: &[&str]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB); \
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);",
+        )
+        .unwrap();
+        for (i, n) in nodes.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO blobs (id, data) VALUES (?1, ?2)",
+                rusqlite::params![format!("n{i}"), n],
+            )
+            .unwrap();
+        }
+        for (i, j) in json_blobs.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO blobs (id, data) VALUES (?1, ?2)",
+                rusqlite::params![format!("j{i}"), j.as_bytes()],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        (dir, path)
+    }
+
+    #[test]
+    fn read_store_analysis_over_real_db_counts_tools_and_ignores_non_assistant() {
+        let assistant = make_node(
+            r#"{"role":"assistant","content":[
+                {"type":"tool-call","toolName":"Write","toolCallId":"a","args":{"path":"/r/x.rs","contents":"l1\nl2"}},
+                {"type":"tool-call","toolName":"Shell","toolCallId":"b","args":{"command":"ls","description":"d"}},
+                {"type":"tool-call","toolName":"Read","toolCallId":"z","args":{"path":"/r/y.rs"}}
+            ]}"#,
+            1_700_000_000_000,
+            Some(50_000),
+        );
+        // A non-assistant node must NOT create a date bucket or an active day.
+        let user_node = make_node(r#"{"role":"user","content":[]}"#, 1_700_000_100_000, None);
+        let tool_result = r#"{"role":"tool","content":[{"type":"tool-result","toolName":"Read","toolCallId":"z","result":"     1|line one\n     2|line two"}]}"#;
+        let (_dir, path) = make_store_db(&[assistant, user_node], &[tool_result]);
+
+        let conv_models = FastHashMap::default();
+        let rows = read_store_analysis(
+            &path,
+            &conv_models,
+            TimeRange::All,
+            ParseMode::Full,
+            "u",
+            "m",
+        )
+        .unwrap();
+
+        // Exactly one assistant turn -> one (date) record; the user node is dropped.
+        assert_eq!(rows.len(), 1);
+        let rec = &rows[0].1.records[0];
+        assert_eq!(rec.tool_call_counts.write, 1);
+        assert_eq!(rec.tool_call_counts.bash, 1);
+        assert_eq!(rec.tool_call_counts.read, 1);
+        assert_eq!(rec.total_write_lines, 2);
+        // Read result lines were recovered and prefix-stripped (2 numbered lines).
+        assert_eq!(rec.total_read_lines, 2);
+        // No tracking DB / meta -> model falls back to "unknown".
+        assert!(rec.conversation_usage.contains_key("unknown"));
+    }
+
+    #[test]
+    fn read_store_context_recovers_gauge_per_turn() {
+        let a = make_node(
+            r#"{"role":"assistant","content":[]}"#,
+            1_700_000_000_000,
+            Some(42_000),
+        );
+        let b = make_node(
+            r#"{"role":"assistant","content":[]}"#,
+            1_700_000_500_000,
+            Some(88_000),
+        );
+        let (_dir, path) = make_store_db(&[a, b], &[]);
+
+        let conv_models = FastHashMap::default();
+        let (model, mut turns) = read_store_context(&path, &conv_models, "conv").unwrap();
+        turns.sort();
+        assert_eq!(model, "unknown");
+        assert_eq!(
+            turns,
+            vec![(1_700_000_000_000, 42_000), (1_700_000_500_000, 88_000)]
         );
     }
 }
