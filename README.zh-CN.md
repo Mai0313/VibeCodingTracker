@@ -148,6 +148,7 @@ Commands:
   usage       Display token usage statistics
   version     Display version information
   update      Update to the latest version from GitHub releases
+  fetch       Fetch a provider's raw quota/usage API response
   help        Print this message or the help of the given subcommand(s)
 ```
 
@@ -467,6 +468,42 @@ vct version --json   # 机读 JSON
 ```
 
 Binary version 由 `build.rs` 在编译期通过 `git describe` 写入，开发版本会附带 commit 计数、short SHA 与 `dirty` 后缀。
+
+---
+
+## Fetch 命令
+
+**打印某个供应商的原始 quota/usage API 响应 — 不解析、不聚合。**
+
+对 `usage` 面板使用的同一个 quota 端点（Claude / Codex / Copilot / Cursor）发一次请求，直接打印原始 body，方便你查看 API 的实际结构或检查凭证是否正常。它读取各供应商已保存的凭证，并且**不会**刷新 token：token 过期时，请用对应供应商自己的 CLI 重新登录（`claude` / `codex` / `copilot` / `cursor-agent`）。
+
+### 参数
+
+| 参数      | 用途                          |
+| --------- | ----------------------------- |
+| *(无)*    | 彩色 JSON（默认）             |
+| `--json`  | 彩色 JSON                     |
+| `--text`  | 摊平成 `key: value`，适合脚本 |
+| `--table` | 摊平成 Field / Value 表格     |
+
+### 基本用法
+
+```bash
+# 原始 JSON（默认）
+vct fetch claude
+vct fetch codex
+vct fetch copilot
+vct fetch cursor
+
+# 摊平成纯文本
+vct fetch codex --text
+
+# 摊平成 key/value 表格
+vct fetch copilot --table
+```
+
+> [!NOTE]
+> 响应 body 会原样打印到 stdout。遇到 HTTP 错误时仍会打印 body 并以非零状态退出；401/403 还会在 stderr 额外打印 `run: <cli> login` 提示。
 
 ---
 

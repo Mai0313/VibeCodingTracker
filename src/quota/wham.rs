@@ -193,6 +193,42 @@ pub fn call_wham(
     }
 }
 
+/// Fetches the raw `wham/usage` response for `vct fetch codex`.
+///
+/// Uses the stored access token verbatim (no refresh, no file writes) and
+/// returns `(status_code, body)`. A non-2xx status is left for the caller to
+/// surface.
+///
+/// # Errors
+///
+/// Returns an error if `auth.json` is missing, has no access token, or the
+/// request cannot be sent.
+pub(crate) fn fetch_codex_raw(client: &reqwest::blocking::Client) -> Result<(u16, String)> {
+    let auth_path = crate::utils::resolve_paths()?.codex_dir.join("auth.json");
+    let body = std::fs::read_to_string(&auth_path).with_context(|| {
+        format!(
+            "no Codex credentials at {} ({})",
+            auth_path.display(),
+            crate::quota::CODEX_LOGIN_HINT
+        )
+    })?;
+    let (access_token, account_id) = parse_auth(&body)?;
+    let mut req = client
+        .get(WHAM_URL)
+        .header(reqwest::header::USER_AGENT, codex_ua())
+        .header("originator", CODEX_ORIGINATOR)
+        .bearer_auth(&access_token);
+    if let Some(id) = &account_id {
+        req = req.header("ChatGPT-Account-Id", id);
+    }
+    let resp = req.send().context("Failed to send Codex usage request")?;
+    let status = resp.status().as_u16();
+    let text = resp
+        .text()
+        .context("Failed to read Codex usage response body")?;
+    Ok((status, text))
+}
+
 /// Refreshes the Codex token and writes it back (rotation-safe). Returns the new
 /// access token.
 ///

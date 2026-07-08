@@ -399,6 +399,56 @@ fn test_analysis_multiple_output_formats() {
 }
 
 #[test]
+fn test_fetch_help() {
+    let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
+    cmd.arg("fetch").arg("--help");
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("claude"))
+        .stdout(predicate::str::contains("codex"))
+        .stdout(predicate::str::contains("copilot"))
+        .stdout(predicate::str::contains("cursor"));
+}
+
+#[test]
+fn test_fetch_requires_provider() {
+    let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
+    cmd.arg("fetch");
+
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("required").or(predicate::str::contains("PROVIDER")));
+}
+
+#[test]
+fn test_fetch_invalid_provider() {
+    let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
+    cmd.arg("fetch").arg("not-a-provider");
+
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid value"));
+}
+
+#[test]
+fn test_fetch_multiple_output_formats() {
+    // --json/--text/--table share a clap group and must be mutually exclusive;
+    // clap rejects the combination before any network call is made.
+    for combo in [
+        ["--json", "--text"],
+        ["--json", "--table"],
+        ["--text", "--table"],
+    ] {
+        let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
+        cmd.arg("fetch").arg("claude").args(combo);
+        cmd.assert()
+            .failure()
+            .stderr(predicate::str::contains("cannot be used with"));
+    }
+}
+
+#[test]
 fn test_cli_with_env_vars() {
     // Test that environment variables are respected if defined
     let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
