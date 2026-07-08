@@ -148,6 +148,7 @@ Commands:
   usage       Display token usage statistics
   version     Display version information
   update      Update to the latest version from GitHub releases
+  fetch       Fetch a provider's raw quota/usage API response
   help        Print this message or the help of the given subcommand(s)
 ```
 
@@ -467,6 +468,42 @@ vct version --json   # Machine-readable JSON
 ```
 
 The binary version is produced at build time by `build.rs` from `git describe`, so development builds include commit count + short SHA + `dirty` suffix when applicable.
+
+---
+
+## Fetch Command
+
+**Print a provider's raw quota/usage API response — no parsing, no aggregation.**
+
+Calls the same quota endpoint the `usage` dashboard uses (Claude / Codex / Copilot / Cursor) exactly once and prints the raw body, so you can inspect the exact API shape or sanity-check your credentials. It reads each provider's stored credentials and does **not** refresh tokens: if a token is expired, re-auth with that provider's own CLI (`claude` / `codex` / `copilot` / `cursor-agent`).
+
+### Flags
+
+| Flag      | Purpose                                       |
+| --------- | --------------------------------------------- |
+| *(none)*  | Pretty JSON (default)                         |
+| `--json`  | Pretty JSON                                   |
+| `--text`  | Flattened `key: value` lines, script-friendly |
+| `--table` | Flattened Field / Value table                 |
+
+### Basic Usage
+
+```bash
+# Raw JSON (default)
+vct fetch claude
+vct fetch codex
+vct fetch copilot
+vct fetch cursor
+
+# Flattened plain text
+vct fetch codex --text
+
+# Flattened key/value table
+vct fetch copilot --table
+```
+
+> [!NOTE]
+> The response body is printed to stdout as-is. On an HTTP error the body is still printed and the process exits non-zero; a 401/403 additionally prints a `run: <cli> login` hint on stderr.
 
 ---
 

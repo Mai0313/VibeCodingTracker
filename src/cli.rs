@@ -6,7 +6,7 @@
 //! mutually-exclusive `--daily` / `--weekly` / `--monthly` / `--all` flags
 //! into a single [`TimeRange`].
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 /// Time window applied when aggregating sessions.
@@ -69,6 +69,19 @@ pub fn resolve_time_range(daily: bool, weekly: bool, monthly: bool) -> TimeRange
     } else {
         TimeRange::All
     }
+}
+
+/// A provider whose raw quota/usage API response `vct fetch` can print.
+#[derive(ValueEnum, Debug, Clone, Copy)]
+pub enum FetchProvider {
+    /// Claude Code (`GET /api/oauth/usage`).
+    Claude,
+    /// OpenAI Codex (ChatGPT `wham/usage`).
+    Codex,
+    /// GitHub Copilot CLI (`GET /copilot_internal/user`).
+    Copilot,
+    /// Cursor CLI (`GET /api/usage-summary`).
+    Cursor,
 }
 
 /// Vibe Coding Tracker - AI coding assistant usage analyzer.
@@ -184,5 +197,23 @@ pub enum Commands {
         /// Force update without confirmation prompt.
         #[arg(long, short)]
         force: bool,
+    },
+
+    /// Fetch a provider's raw quota/usage API response.
+    Fetch {
+        /// Which provider to fetch (claude | codex | copilot | cursor).
+        provider: FetchProvider,
+
+        /// Output as pretty JSON (default).
+        #[arg(long, group = "fetch_format")]
+        json: bool,
+
+        /// Output as flattened plain text.
+        #[arg(long, group = "fetch_format")]
+        text: bool,
+
+        /// Output as a flattened key/value table.
+        #[arg(long, group = "fetch_format")]
+        table: bool,
     },
 }

@@ -191,6 +191,45 @@ fn fetch_cursor_usage(client: &Client, cookie: &str, now: i64) -> FetchResult {
     }
 }
 
+/// Fetches the raw `/api/usage-summary` response for `vct fetch cursor`.
+///
+/// Synthesizes the session cookie from the stored JWT and sends one request. It
+/// does **not** check the JWT `exp` (an expired token just 401s) and never
+/// writes the file back. Returns `(status_code, body)`; a non-2xx status is
+/// left for the caller to surface.
+///
+/// # Errors
+///
+/// Returns an error if `auth.json` is missing, has no usable session, or the
+/// request cannot be sent.
+pub(crate) fn fetch_cursor_raw(client: &Client) -> Result<(u16, String)> {
+    let path = get_cursor_auth_path()?;
+    let body = std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "no Cursor credentials at {} ({CURSOR_LOGIN_HINT})",
+            path.display()
+        )
+    })?;
+    let session = read_cursor_session(&body).with_context(|| {
+        format!(
+            "no usable Cursor session in {} ({CURSOR_LOGIN_HINT})",
+            path.display()
+        )
+    })?;
+    let resp = client
+        .get(CURSOR_USAGE_URL)
+        .header(reqwest::header::COOKIE, session.cookie.as_str())
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header(reqwest::header::USER_AGENT, cursor_ua())
+        .send()
+        .context("Failed to send Cursor usage request")?;
+    let status = resp.status().as_u16();
+    let text = resp
+        .text()
+        .context("Failed to read Cursor usage response body")?;
+    Ok((status, text))
+}
+
 /// Per-worker Cursor state. Refresh is reactive (the official CLI keeps
 /// `auth.json` fresh), so nothing is cached between ticks.
 #[derive(Default)]

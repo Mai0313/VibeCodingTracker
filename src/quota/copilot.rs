@@ -270,6 +270,48 @@ fn fetch_copilot_user(client: &Client, api_url: &str, token: &str, now: i64) -> 
     }
 }
 
+/// Fetches the raw `/copilot_internal/user` response for `vct fetch copilot`.
+///
+/// Uses the stored `gho_` token verbatim (Copilot has no refresh) and returns
+/// `(status_code, body)`. A non-2xx status is left for the caller to surface.
+///
+/// # Errors
+///
+/// Returns an error if the config is missing, has no usable token, or the
+/// request cannot be sent.
+pub(crate) fn fetch_copilot_raw(client: &Client) -> Result<(u16, String)> {
+    let path = get_copilot_config_path()?;
+    let body = std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "no Copilot credentials at {} ({COPILOT_LOGIN_HINT})",
+            path.display()
+        )
+    })?;
+    let creds = read_copilot_creds(&body).with_context(|| {
+        format!(
+            "no usable Copilot token in {} ({COPILOT_LOGIN_HINT})",
+            path.display()
+        )
+    })?;
+    let resp = client
+        .get(creds.api_url.as_str())
+        .header(
+            reqwest::header::AUTHORIZATION,
+            format!("token {}", creds.token),
+        )
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header(reqwest::header::USER_AGENT, copilot_ua())
+        .header("Copilot-Integration-Id", COPILOT_INTEGRATION_ID)
+        .header("X-GitHub-Api-Version", COPILOT_API_VERSION)
+        .send()
+        .context("Failed to send Copilot usage request")?;
+    let status = resp.status().as_u16();
+    let text = resp
+        .text()
+        .context("Failed to read Copilot usage response body")?;
+    Ok((status, text))
+}
+
 /// Per-worker Copilot state. Copilot's token is long-lived with no refresh, so
 /// there is no in-memory token cache or refresh backoff to keep.
 #[derive(Default)]

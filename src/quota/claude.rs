@@ -86,6 +86,44 @@ fn read_claude_oauth(path: &Path) -> Option<ClaudeOauth> {
     creds.claude_ai_oauth
 }
 
+/// Fetches the raw `/api/oauth/usage` response for `vct fetch claude`.
+///
+/// Uses the stored access token verbatim (no refresh, no file writes) and
+/// returns `(status_code, body)`. A non-2xx status is left for the caller to
+/// surface — the body (often a JSON error) is still returned.
+///
+/// # Errors
+///
+/// Returns an error if the credentials file is missing, has no access token, or
+/// the request cannot be sent.
+pub(crate) fn fetch_claude_raw(client: &Client) -> Result<(u16, String)> {
+    let path = get_claude_credentials_path()?;
+    let token = read_claude_oauth(&path)
+        .and_then(|o| o.access_token)
+        .filter(|t| !t.is_empty())
+        .with_context(|| {
+            format!(
+                "no Claude access token in {} ({CLAUDE_LOGIN_HINT})",
+                path.display()
+            )
+        })?;
+    let resp = client
+        .get(CLAUDE_USAGE_URL)
+        .header(reqwest::header::USER_AGENT, claude_ua())
+        .header("x-app", CLAUDE_APP)
+        .header("anthropic-version", CLAUDE_ANTHROPIC_VERSION)
+        .header("anthropic-beta", CLAUDE_OAUTH_BETA)
+        .header("anthropic-dangerous-direct-browser-access", "true")
+        .bearer_auth(&token)
+        .send()
+        .context("Failed to send Claude usage request")?;
+    let status = resp.status().as_u16();
+    let body = resp
+        .text()
+        .context("Failed to read Claude usage response body")?;
+    Ok((status, body))
+}
+
 /// Reads the plan tier for the Plan line: prefer `rateLimitTier` (it
 /// distinguishes 5x / 20x), fall back to `subscriptionType`, prettified. Returns
 /// `None` when neither is set, so the Plan line is simply omitted.

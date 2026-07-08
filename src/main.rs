@@ -225,6 +225,15 @@ fn main() -> Result<()> {
                 vibe_coding_tracker::update::update_interactive(force)?;
             }
         }
+
+        Commands::Fetch {
+            provider,
+            text,
+            table,
+            ..
+        } => {
+            vibe_coding_tracker::fetch::run(provider, text, table)?;
+        }
     }
 
     Ok(())
