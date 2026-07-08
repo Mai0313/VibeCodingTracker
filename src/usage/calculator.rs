@@ -14,7 +14,7 @@ use crate::models::{
     CodeAnalysis, ExtensionType, PerProviderUsage, Provider, ProviderActiveDays, UsageResult,
 };
 use crate::pricing::{ModelPricingMap, calculate_cost};
-use crate::session::{ParseMode, parse_session_file_as, read_opencode_usage};
+use crate::session::{ParseMode, parse_session_file_as, read_cursor_usage, read_opencode_usage};
 use crate::utils::{
     COPILOT_SESSION_MAX_DEPTH, TokenCounts, collect_files_with_max_depth, is_claude_session_file,
     is_codex_session_file, is_copilot_session_file, is_gemini_session_file, resolve_paths,
@@ -62,13 +62,14 @@ pub struct UsageData {
     /// Count of distinct calendar dates that contributed usage, per provider
     /// and overall.
     pub provider_days: ProviderActiveDays,
-    /// OpenCode's own per-model cost (USD), summed from assistant messages.
+    /// Provider-authoritative per-model cost (USD), summed from the source.
     ///
-    /// OpenCode records authoritative assistant-message costs, so when a model
-    /// has no exact LiteLLM price we display this stored cost instead of
-    /// guessing from a fuzzy match. Keyed by model name; only OpenCode models
-    /// appear.
-    pub opencode_costs: FastHashMap<String, f64>,
+    /// OpenCode records assistant-message costs and Cursor reports its billed
+    /// cost per usage event, so when a model has no exact LiteLLM price we
+    /// display this stored cost instead of guessing from a fuzzy match. Keyed by
+    /// model name; only OpenCode / Cursor models appear (their key spaces do not
+    /// collide — OpenCode qualifies models as `providerID/id`).
+    pub stored_costs: FastHashMap<String, f64>,
 }
 
 /// Extracts token usage data from a typed `CodeAnalysis`.
@@ -131,13 +132,14 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
     let paths = resolve_paths()?;
     let mut result = FastHashMap::with_capacity(capacity::MODEL_COMBINATIONS);
     let mut per_provider = PerProviderUsage::default();
-    let mut opencode_costs: FastHashMap<String, f64> = FastHashMap::default();
+    let mut stored_costs: FastHashMap<String, f64> = FastHashMap::default();
 
     let mut claude_dates: HashSet<String> = HashSet::new();
     let mut codex_dates: HashSet<String> = HashSet::new();
     let mut copilot_dates: HashSet<String> = HashSet::new();
     let mut gemini_dates: HashSet<String> = HashSet::new();
     let mut opencode_dates: HashSet<String> = HashSet::new();
+    let mut cursor_dates: HashSet<String> = HashSet::new();
 
     if paths.claude_session_dir.exists() {
         // Walks the projects tree recursively, so top-level `<session>.jsonl` logs
@@ -205,7 +207,7 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
             &paths.opencode_db,
             &mut result,
             &mut per_provider.opencode,
-            &mut opencode_costs,
+            &mut stored_costs,
             &mut opencode_dates,
             time_range,
         )
@@ -216,12 +218,30 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
         );
     }
 
+    // Cursor's usage comes from its dashboard API (billing tokens + cost), with
+    // a local approximation fallback, rather than a walked session directory.
+    // Attempt it whenever either the chat stores or the credentials are present.
+    if (paths.cursor_chats_dir.exists() || paths.cursor_dir.join("auth.json").exists())
+        && let Err(err) = process_cursor_usage(
+            &paths.cursor_chats_dir,
+            &paths.cursor_tracking_db,
+            &mut result,
+            &mut per_provider.cursor,
+            &mut stored_costs,
+            &mut cursor_dates,
+            time_range,
+        )
+    {
+        eprintln!("Warning: Failed to read Cursor usage: {err}");
+    }
+
     let mut all_dates: HashSet<&String> = HashSet::new();
     all_dates.extend(claude_dates.iter());
     all_dates.extend(codex_dates.iter());
     all_dates.extend(copilot_dates.iter());
     all_dates.extend(gemini_dates.iter());
     all_dates.extend(opencode_dates.iter());
+    all_dates.extend(cursor_dates.iter());
 
     let provider_days = ProviderActiveDays {
         claude: claude_dates.len(),
@@ -229,6 +249,7 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
         copilot: copilot_dates.len(),
         gemini: gemini_dates.len(),
         opencode: opencode_dates.len(),
+        cursor: cursor_dates.len(),
         total: all_dates.len(),
     };
 
@@ -236,7 +257,7 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
         models: result,
         per_provider,
         provider_days,
-        opencode_costs,
+        stored_costs,
     })
 }
 
@@ -344,18 +365,62 @@ fn process_opencode_usage(
     db_path: &Path,
     global_result: &mut UsageResult,
     provider_result: &mut UsageResult,
-    opencode_costs: &mut FastHashMap<String, f64>,
+    stored_costs: &mut FastHashMap<String, f64>,
     unique_dates: &mut HashSet<String>,
     time_range: TimeRange,
 ) -> Result<()> {
     let sessions = read_opencode_usage(db_path, time_range)?;
+    fold_stored_cost_sessions(
+        sessions,
+        global_result,
+        provider_result,
+        stored_costs,
+        unique_dates,
+    );
+    Ok(())
+}
 
+/// Reads Cursor's per-model usage (dashboard API, or local approximation) and
+/// merges it into both the global and Cursor-scoped maps.
+///
+/// Mirrors [`process_opencode_usage`]: Cursor reports its own billed cost per
+/// usage event, so it uses the same stored-cost path (exact LiteLLM match or
+/// the reported cost) rather than a fuzzy price guess.
+fn process_cursor_usage(
+    chats_dir: &Path,
+    tracking_db: &Path,
+    global_result: &mut UsageResult,
+    provider_result: &mut UsageResult,
+    stored_costs: &mut FastHashMap<String, f64>,
+    unique_dates: &mut HashSet<String>,
+    time_range: TimeRange,
+) -> Result<()> {
+    let sessions = read_cursor_usage(chats_dir, tracking_db, time_range)?;
+    fold_stored_cost_sessions(
+        sessions,
+        global_result,
+        provider_result,
+        stored_costs,
+        unique_dates,
+    );
+    Ok(())
+}
+
+/// Folds `(date, analysis, cost)` rows from a stored-cost provider (OpenCode /
+/// Cursor) into the global + provider-scoped maps and the stored-cost table.
+fn fold_stored_cost_sessions(
+    sessions: Vec<(String, CodeAnalysis, f64)>,
+    global_result: &mut UsageResult,
+    provider_result: &mut UsageResult,
+    stored_costs: &mut FastHashMap<String, f64>,
+    unique_dates: &mut HashSet<String>,
+) {
     for (date, analysis, session_cost) in sessions {
         unique_dates.insert(date);
 
         let conversation_usage = extract_conversation_usage_from_analysis(&analysis);
         for (model, usage_value) in conversation_usage {
-            *opencode_costs.entry(model.clone()).or_insert(0.0) += session_cost;
+            *stored_costs.entry(model.clone()).or_insert(0.0) += session_cost;
 
             provider_result
                 .entry(model.clone())
@@ -368,20 +433,19 @@ fn process_opencode_usage(
                 .or_insert(usage_value);
         }
     }
-
-    Ok(())
 }
 
 /// Resolves the USD cost (and optional matched-model annotation) for one model.
 ///
-/// Behavior depends on `opencode_cost`:
-/// - `None` (every provider except OpenCode): the existing LiteLLM lookup,
-///   which includes exact, normalized, substring, and fuzzy matching.
-/// - `Some(stored)` (OpenCode): only an **exact** LiteLLM match is computed
-///   from tokens; otherwise the model's stored OpenCode cost is used verbatim.
+/// Behavior depends on `opencode_cost` (the stored provider cost, also used for
+/// Cursor):
+/// - `None` (file-based providers): the existing LiteLLM lookup, which includes
+///   exact, normalized, substring, and fuzzy matching.
+/// - `Some(stored)` (OpenCode / Cursor): only an **exact** LiteLLM match is
+///   computed from tokens; otherwise the model's stored cost is used verbatim.
 ///   No fuzzy/normalized guessing happens, so a novel model like
-///   `deepseek-v4-pro` reports OpenCode's own cost instead of being priced
-///   against a loosely-similar model.
+///   `deepseek-v4-pro` (OpenCode) or `composer-2` (Cursor) reports the
+///   provider's own cost instead of being priced against a loosely-similar model.
 ///
 /// Returns `(cost_usd, matched_model)` where `matched_model` is `Some` only
 /// when a non-exact LiteLLM key was used (for display annotation).

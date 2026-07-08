@@ -131,7 +131,7 @@ pub fn calculate_provider_totals_from_per_provider(
     per_provider: &PerProviderUsage,
     provider_days: &ProviderActiveDays,
     pricing_map: &crate::pricing::ModelPricingMap,
-    opencode_costs: &crate::constants::FastHashMap<String, f64>,
+    stored_costs: &crate::constants::FastHashMap<String, f64>,
 ) -> UsageProviderTotals {
     let mut totals = UsageProviderTotals::default();
 
@@ -140,6 +140,7 @@ pub fn calculate_provider_totals_from_per_provider(
     totals.copilot.days_count = provider_days.copilot;
     totals.gemini.days_count = provider_days.gemini;
     totals.opencode.days_count = provider_days.opencode;
+    totals.cursor.days_count = provider_days.cursor;
     totals.overall.days_count = provider_days.total;
 
     accumulate_provider(&mut totals.claude, &per_provider.claude, pricing_map, None);
@@ -155,7 +156,13 @@ pub fn calculate_provider_totals_from_per_provider(
         &mut totals.opencode,
         &per_provider.opencode,
         pricing_map,
-        Some(opencode_costs),
+        Some(stored_costs),
+    );
+    accumulate_provider(
+        &mut totals.cursor,
+        &per_provider.cursor,
+        pricing_map,
+        Some(stored_costs),
     );
 
     // "All Providers" row sums every provider's totals directly rather
@@ -171,29 +178,32 @@ pub fn calculate_provider_totals_from_per_provider(
         + totals.codex.total_tokens
         + totals.copilot.total_tokens
         + totals.gemini.total_tokens
-        + totals.opencode.total_tokens;
+        + totals.opencode.total_tokens
+        + totals.cursor.total_tokens;
     totals.overall.total_cost = totals.claude.total_cost
         + totals.codex.total_cost
         + totals.copilot.total_cost
         + totals.gemini.total_cost
-        + totals.opencode.total_cost;
+        + totals.opencode.total_cost
+        + totals.cursor.total_cost;
 
     totals
 }
 
 /// Prices every model in `usage` and folds the results into `stats`.
 ///
-/// `opencode_costs` is `Some` only when accumulating the OpenCode provider, so
-/// that its models price by exact match or fall back to OpenCode's stored cost.
+/// `stored_costs` is `Some` only for the stored-cost providers (OpenCode /
+/// Cursor), so their models price by exact match or fall back to the provider's
+/// own stored cost.
 fn accumulate_provider(
     stats: &mut ProviderStats,
     usage: &UsageResult,
     pricing_map: &crate::pricing::ModelPricingMap,
-    opencode_costs: Option<&crate::constants::FastHashMap<String, f64>>,
+    stored_costs: Option<&crate::constants::FastHashMap<String, f64>>,
 ) {
     for (model, raw_usage) in usage {
-        let opencode_cost = opencode_costs.map(|m| m.get(model).copied().unwrap_or(0.0));
-        let row = extract_usage_row(model, raw_usage, pricing_map, opencode_cost);
+        let stored_cost = stored_costs.map(|m| m.get(model).copied().unwrap_or(0.0));
+        let row = extract_usage_row(model, raw_usage, pricing_map, stored_cost);
         stats.accumulate_row(&row);
     }
 }
@@ -202,7 +212,7 @@ fn accumulate_provider(
 pub fn build_provider_total_rows(
     totals: &UsageProviderTotals,
 ) -> Vec<ProviderTotal<'_, ProviderStats>> {
-    let mut rows = Vec::with_capacity(6); // max 5 providers + overall
+    let mut rows = Vec::with_capacity(7); // max 6 providers + overall
 
     if totals.claude.days_count > 0 {
         rows.push(ProviderTotal::new(
@@ -236,6 +246,10 @@ pub fn build_provider_total_rows(
         ));
     }
 
+    if totals.cursor.days_count > 0 {
+        rows.push(ProviderTotal::new(Provider::Cursor, &totals.cursor, false));
+    }
+
     if totals.overall.days_count > 0 || rows.is_empty() {
         rows.push(ProviderTotal::new_overall(&totals.overall));
     }
@@ -255,7 +269,7 @@ pub fn build_usage_summary(
     per_provider: &PerProviderUsage,
     provider_days: &ProviderActiveDays,
     pricing_map: &crate::pricing::ModelPricingMap,
-    opencode_costs: &crate::constants::FastHashMap<String, f64>,
+    stored_costs: &crate::constants::FastHashMap<String, f64>,
 ) -> UsageSummary {
     if usage_data.is_empty() {
         return UsageSummary::default();
@@ -269,7 +283,7 @@ pub fn build_usage_summary(
     // Extract rows first so we can sort by cost
     for (model, usage) in usage_data.iter() {
         let (cost, matched_model) =
-            resolve_merged_row_cost(model, per_provider, pricing_map, opencode_costs)
+            resolve_merged_row_cost(model, per_provider, pricing_map, stored_costs)
                 .unwrap_or_else(|| price_usage(model, usage, pricing_map, None));
         let row = build_usage_row(model, usage, cost, matched_model);
         summary.rows.push(row);
@@ -291,7 +305,7 @@ pub fn build_usage_summary(
         per_provider,
         provider_days,
         pricing_map,
-        opencode_costs,
+        stored_costs,
     );
     summary
 }
@@ -333,7 +347,7 @@ fn resolve_merged_row_cost(
     model: &str,
     per_provider: &PerProviderUsage,
     pricing_map: &crate::pricing::ModelPricingMap,
-    opencode_costs: &crate::constants::FastHashMap<String, f64>,
+    stored_costs: &crate::constants::FastHashMap<String, f64>,
 ) -> Option<(f64, Option<String>)> {
     let mut total_cost = 0.0;
     let mut matched_model = None;
@@ -355,13 +369,17 @@ fn resolve_merged_row_cost(
         }
     }
 
-    if let Some(raw_usage) = per_provider.opencode.get(model) {
-        found = true;
-        let opencode_cost = opencode_costs.get(model).copied().unwrap_or(0.0);
-        let (cost, matched) = price_usage(model, raw_usage, pricing_map, Some(opencode_cost));
-        total_cost += cost;
-        if matched_model.is_none() {
-            matched_model = matched;
+    // OpenCode and Cursor both price via the stored-cost path (exact LiteLLM
+    // match, else the provider's own reported cost).
+    for usage in [&per_provider.opencode, &per_provider.cursor] {
+        if let Some(raw_usage) = usage.get(model) {
+            found = true;
+            let stored_cost = stored_costs.get(model).copied().unwrap_or(0.0);
+            let (cost, matched) = price_usage(model, raw_usage, pricing_map, Some(stored_cost));
+            total_cost += cost;
+            if matched_model.is_none() {
+                matched_model = matched;
+            }
         }
     }
 

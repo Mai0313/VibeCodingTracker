@@ -307,7 +307,7 @@ pub fn display_usage_interactive(
     let mut usage_data = UsageResult::default();
     let mut per_provider_usage = PerProviderUsage::default();
     let mut provider_days = ProviderActiveDays::default();
-    let mut opencode_costs: crate::constants::FastHashMap<String, f64> = Default::default();
+    let mut stored_costs: crate::constants::FastHashMap<String, f64> = Default::default();
     let mut has_usage_data = false;
 
     // Pricing map is large (~500 KB / ~400 models) but changes at most once
@@ -366,7 +366,7 @@ pub fn display_usage_interactive(
                     usage_data = data.models;
                     per_provider_usage = data.per_provider;
                     provider_days = data.provider_days;
-                    opencode_costs = data.opencode_costs;
+                    stored_costs = data.stored_costs;
                     has_usage_data = true;
                 }
                 Err(e) => {
@@ -374,7 +374,7 @@ pub fn display_usage_interactive(
                     if !has_usage_data {
                         usage_data.clear();
                         per_provider_usage = PerProviderUsage::default();
-                        opencode_costs = Default::default();
+                        stored_costs = Default::default();
                     }
                 }
             }
@@ -397,7 +397,7 @@ pub fn display_usage_interactive(
                 &per_provider_usage,
                 &provider_days,
                 &pricing_map,
-                &opencode_costs,
+                &stored_costs,
             );
 
             // Remember which model was selected so the highlight can follow it

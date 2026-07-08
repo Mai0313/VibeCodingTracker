@@ -19,7 +19,7 @@
 
 </div>
 
-**Track your AI coding costs in real-time.** Vibe Coding Tracker is a lightweight, high-performance CLI tool built in Rust that monitors and analyzes your Claude Code, Codex, Copilot, Gemini, and OpenCode usage — with detailed cost breakdowns, token statistics, and code operation insights, all while keeping the memory footprint minimal.
+**Track your AI coding costs in real-time.** Vibe Coding Tracker is a lightweight, high-performance CLI tool built in Rust that monitors and analyzes your Claude Code, Codex, Copilot, Gemini, OpenCode, and Cursor usage — with detailed cost breakdowns, token statistics, and code operation insights, all while keeping the memory footprint minimal.
 
 [English](README.md) | [繁體中文](README.zh-TW.md) | [简体中文](README.zh-CN.md)
 
@@ -48,7 +48,7 @@ Choose your preferred view:
 
 ### Zero Configuration
 
-Automatically detects and processes logs from Claude Code, Codex, Copilot, Gemini, and OpenCode. No setup required — just run and analyze.
+Automatically detects and processes logs from Claude Code, Codex, Copilot, Gemini, OpenCode, and Cursor. No setup required — just run and analyze.
 
 ### Rich Insights
 
@@ -62,15 +62,15 @@ Automatically detects and processes logs from Claude Code, Codex, Copilot, Gemin
 
 ## Key Features
 
-| Feature               | Description                                                          |
-| --------------------- | -------------------------------------------------------------------- |
-| **Multi-Provider**    | Claude Code, Codex, Copilot, Gemini, and OpenCode — all in one place |
-| **Smart Pricing**     | Fuzzy model matching + daily cache from LiteLLM                      |
-| **4 Display Modes**   | Interactive TUI, static table, plain text, and JSON                  |
-| **Dual Analysis**     | Token/cost stats (`usage`) + code operation stats (`analysis`)       |
-| **Live Quota Panels** | Live remaining quota for Claude, Codex, Copilot, and Cursor          |
-| **Ultra-Lightweight** | Under ~50 MB RSS in the TUI, streaming JSONL parse — built with Rust |
-| **Live Updates**      | Auto-refreshing dashboard (every 10s) with change highlighting       |
+| Feature               | Description                                                                  |
+| --------------------- | ---------------------------------------------------------------------------- |
+| **Multi-Provider**    | Claude Code, Codex, Copilot, Gemini, OpenCode, and Cursor — all in one place |
+| **Smart Pricing**     | Fuzzy model matching + daily cache from LiteLLM                              |
+| **4 Display Modes**   | Interactive TUI, static table, plain text, and JSON                          |
+| **Dual Analysis**     | Token/cost stats (`usage`) + code operation stats (`analysis`)               |
+| **Live Quota Panels** | Live remaining quota for Claude, Codex, Copilot, and Cursor                  |
+| **Ultra-Lightweight** | Under ~50 MB RSS in the TUI, streaming JSONL parse — built with Rust         |
+| **Live Updates**      | Auto-refreshing dashboard (every 10s) with change highlighting               |
 
 ---
 
@@ -289,6 +289,7 @@ The tool automatically scans these directories:
 - `~/.copilot/session-state/<sessionId>/events.jsonl` (Copilot CLI)
 - `~/.gemini/tmp/<project_hash>/chats/*.jsonl` (Gemini CLI)
 - `~/.local/share/opencode/opencode.db` (OpenCode — SQLite database; honors `$XDG_DATA_HOME`)
+- `~/.cursor/chats/*/*/store.db` (Cursor — SQLite chat stores, for `analysis`) and Cursor's dashboard usage API (for `usage` tokens + cost, via the local session token; approximated from local context data when offline)
 
 ### Live Quota Panels
 

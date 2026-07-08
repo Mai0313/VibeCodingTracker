@@ -305,13 +305,20 @@ fn resolve_enriched_model_cost(
         }
     }
 
-    if let Some(raw_usage) = usage_data.per_provider.opencode.get(model) {
-        found = true;
-        let opencode_cost = usage_data.opencode_costs.get(model).copied().unwrap_or(0.0);
-        let (cost, matched) = price_usage_value(model, raw_usage, pricing_map, Some(opencode_cost));
-        total_cost += cost;
-        if matched_model.is_none() {
-            matched_model = matched;
+    // OpenCode and Cursor both price via the stored-cost path.
+    for usage in [
+        &usage_data.per_provider.opencode,
+        &usage_data.per_provider.cursor,
+    ] {
+        if let Some(raw_usage) = usage.get(model) {
+            found = true;
+            let stored_cost = usage_data.stored_costs.get(model).copied().unwrap_or(0.0);
+            let (cost, matched) =
+                price_usage_value(model, raw_usage, pricing_map, Some(stored_cost));
+            total_cost += cost;
+            if matched_model.is_none() {
+                matched_model = matched;
+            }
         }
     }
 
@@ -360,14 +367,14 @@ mod tests {
             .opencode
             .insert("shared-pro".to_string(), json!({"input_tokens": 100}));
 
-        let mut opencode_costs = vibe_coding_tracker::constants::FastHashMap::default();
-        opencode_costs.insert("shared-pro".to_string(), 7.0);
+        let mut stored_costs = vibe_coding_tracker::constants::FastHashMap::default();
+        stored_costs.insert("shared-pro".to_string(), 7.0);
 
         let usage_data = vibe_coding_tracker::UsageData {
             models,
             per_provider,
             provider_days: ProviderActiveDays::default(),
-            opencode_costs,
+            stored_costs,
         };
 
         let rows = build_enriched_json(&usage_data, &pricing_map).unwrap();

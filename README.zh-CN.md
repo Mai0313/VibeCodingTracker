@@ -19,7 +19,7 @@
 
 </div>
 
-**实时追踪你的 AI 编程开销。** Vibe Coding Tracker 是一款基于 Rust 构建的轻量级高性能 CLI 工具，用于监控和分析你在 Claude Code、Codex、Copilot、Gemini 和 OpenCode 上的使用情况——提供详细的费用明细、token 统计和代码操作洞察，同时保持极低的内存占用。
+**实时追踪你的 AI 编程开销。** Vibe Coding Tracker 是一款基于 Rust 构建的轻量级高性能 CLI 工具，用于监控和分析你在 Claude Code、Codex、Copilot、Gemini、OpenCode 和 Cursor 上的使用情况——提供详细的费用明细、token 统计和代码操作洞察，同时保持极低的内存占用。
 
 [English](README.md) | [繁體中文](README.zh-TW.md) | [简体中文](README.zh-CN.md)
 
@@ -48,7 +48,7 @@
 
 ### 零配置
 
-自动检测并处理来自 Claude Code、Codex、Copilot、Gemini 和 OpenCode 的日志。无需任何设置——直接运行即可分析。
+自动检测并处理来自 Claude Code、Codex、Copilot、Gemini、OpenCode 和 Cursor 的日志。无需任何设置——直接运行即可分析。
 
 ### 丰富的洞察
 
@@ -62,15 +62,15 @@
 
 ## 核心特性
 
-| 特性             | 说明                                                        |
-| ---------------- | ----------------------------------------------------------- |
-| **多供应商支持** | Claude Code、Codex、Copilot、Gemini 和 OpenCode——一站式管理 |
-| **智能定价**     | 模糊模型匹配 + 从 LiteLLM 每日缓存更新                      |
-| **4 种显示模式** | 交互式 TUI、静态表格、纯文本和 JSON                         |
-| **双维度分析**   | token/费用统计（`usage`）+ 代码操作统计（`analysis`）       |
-| **实时额度面板** | Claude、Codex、Copilot 和 Cursor 的实时剩余额度             |
-| **超轻量级**     | TUI 常驻内存 50 MB 以内、流式 JSONL 解析——基于 Rust 构建    |
-| **实时更新**     | 面板自动刷新（每 10 秒），并高亮变化                        |
+| 特性             | 说明                                                                |
+| ---------------- | ------------------------------------------------------------------- |
+| **多供应商支持** | Claude Code、Codex、Copilot、Gemini、OpenCode 和 Cursor——一站式管理 |
+| **智能定价**     | 模糊模型匹配 + 从 LiteLLM 每日缓存更新                              |
+| **4 种显示模式** | 交互式 TUI、静态表格、纯文本和 JSON                                 |
+| **双维度分析**   | token/费用统计（`usage`）+ 代码操作统计（`analysis`）               |
+| **实时额度面板** | Claude、Codex、Copilot 和 Cursor 的实时剩余额度                     |
+| **超轻量级**     | TUI 常驻内存 50 MB 以内、流式 JSONL 解析——基于 Rust 构建            |
+| **实时更新**     | 面板自动刷新（每 10 秒），并高亮变化                                |
 
 ---
 
@@ -289,6 +289,7 @@ Totals (by Provider)
 - `~/.copilot/session-state/<sessionId>/events.jsonl`（Copilot CLI）
 - `~/.gemini/tmp/<project_hash>/chats/*.jsonl`（Gemini CLI）
 - `~/.local/share/opencode/opencode.db`（OpenCode，SQLite 数据库；遵循 `$XDG_DATA_HOME`）
+- `~/.cursor/chats/*/*/store.db`（Cursor，SQLite 会话库，用于 `analysis`）以及 Cursor 官方 dashboard 用量 API（用于 `usage` 的 token 与费用，凭本地 session token 读取；离线时改用本地 context 数据估算）
 
 ### 实时额度面板
 

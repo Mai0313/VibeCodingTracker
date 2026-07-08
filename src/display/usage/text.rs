@@ -27,7 +27,7 @@ pub fn display_usage_text(usage_data: &UsageData, merge: bool) {
         &usage_data.per_provider,
         &usage_data.provider_days,
         &pricing_map,
-        &usage_data.opencode_costs,
+        &usage_data.stored_costs,
     );
 
     if summary.rows.is_empty() {
