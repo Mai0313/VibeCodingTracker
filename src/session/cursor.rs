@@ -365,15 +365,21 @@ struct EventAcc {
 
 /// The billed cost of one usage event, in USD.
 ///
-/// Prefers the token cost (`tokenUsage.totalCents`, comparable to the LiteLLM
-/// pricing the other providers use) and falls back to the event-level
-/// `chargedCents`.
+/// Prefers the event-level `chargedCents` — what Cursor actually billed,
+/// including request/custom-subscription fees and the Cursor Token Rate, and
+/// `0` for events Cursor doesn't charge (e.g. bring-your-own API key) — so the
+/// reported cost matches the Cursor dashboard. Falls back to the token cost
+/// (`tokenUsage.totalCents`) only when `chargedCents` is absent (some
+/// non-token-based events).
 fn event_cost_usd(ev: &Value) -> f64 {
     let cents = ev
-        .get("tokenUsage")
-        .and_then(|t| t.get("totalCents"))
+        .get("chargedCents")
         .and_then(as_f64_lenient)
-        .or_else(|| ev.get("chargedCents").and_then(as_f64_lenient))
+        .or_else(|| {
+            ev.get("tokenUsage")
+                .and_then(|t| t.get("totalCents"))
+                .and_then(as_f64_lenient)
+        })
         .unwrap_or(0.0);
     cents / 100.0
 }
@@ -1121,10 +1127,15 @@ mod tests {
     }
 
     #[test]
-    fn event_cost_prefers_token_total_cents() {
+    fn event_cost_prefers_charged_cents() {
+        // Actual Cursor charge wins over the token-only cost.
         let ev = json!({"tokenUsage": {"totalCents": 250}, "chargedCents": 999});
-        assert!((event_cost_usd(&ev) - 2.5).abs() < 1e-9);
-        let ev2 = json!({"chargedCents": "120"});
+        assert!((event_cost_usd(&ev) - 9.99).abs() < 1e-9);
+        // A bring-your-own-key event Cursor doesn't charge is $0, not the token value.
+        let byok = json!({"tokenUsage": {"totalCents": 677}, "chargedCents": 0});
+        assert_eq!(event_cost_usd(&byok), 0.0);
+        // No chargedCents field -> fall back to the token cost.
+        let ev2 = json!({"tokenUsage": {"totalCents": "120"}});
         assert!((event_cost_usd(&ev2) - 1.2).abs() < 1e-9);
         assert_eq!(event_cost_usd(&json!({})), 0.0);
     }
