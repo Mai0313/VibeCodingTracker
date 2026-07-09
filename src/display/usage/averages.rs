@@ -1,6 +1,6 @@
 use crate::display::common::ProviderTotal;
 use crate::models::{PerProviderUsage, Provider, ProviderActiveDays, UsageResult};
-use crate::usage::CostSource;
+use crate::usage::{CostSource, StoredCosts};
 use serde_json::Value;
 use std::borrow::Cow;
 
@@ -156,7 +156,7 @@ pub fn calculate_provider_totals_from_per_provider(
     per_provider: &PerProviderUsage,
     provider_days: &ProviderActiveDays,
     pricing_map: &crate::pricing::ModelPricingMap,
-    stored_costs: &crate::constants::FastHashMap<String, f64>,
+    stored_costs: &StoredCosts,
 ) -> UsageProviderTotals {
     let mut totals = UsageProviderTotals::default();
 
@@ -196,13 +196,13 @@ pub fn calculate_provider_totals_from_per_provider(
         &mut totals.opencode,
         &per_provider.opencode,
         pricing_map,
-        ProviderPricing::OpenCode(stored_costs),
+        ProviderPricing::OpenCode(&stored_costs.opencode),
     );
     accumulate_provider(
         &mut totals.cursor,
         &per_provider.cursor,
         pricing_map,
-        ProviderPricing::Cursor(stored_costs),
+        ProviderPricing::Cursor(&stored_costs.cursor),
     );
 
     // "All Providers" row sums every provider's totals directly rather
@@ -305,7 +305,7 @@ pub fn build_usage_summary(
     per_provider: &PerProviderUsage,
     provider_days: &ProviderActiveDays,
     pricing_map: &crate::pricing::ModelPricingMap,
-    stored_costs: &crate::constants::FastHashMap<String, f64>,
+    stored_costs: &StoredCosts,
 ) -> UsageSummary {
     if usage_data.is_empty() {
         return UsageSummary::default();
@@ -382,7 +382,7 @@ fn resolve_merged_row_cost(
     model: &str,
     per_provider: &PerProviderUsage,
     pricing_map: &crate::pricing::ModelPricingMap,
-    stored_costs: &crate::constants::FastHashMap<String, f64>,
+    stored_costs: &StoredCosts,
 ) -> Option<(f64, Option<String>)> {
     let mut total_cost = 0.0;
     let mut matched_model = None;
@@ -406,11 +406,19 @@ fn resolve_merged_row_cost(
 
     // OpenCode and Cursor both carry stored costs, but with different bases:
     // OpenCode prefers an exact LiteLLM match, Cursor uses its dashboard cost
-    // verbatim.
-    let stored = || stored_costs.get(model).copied().unwrap_or(0.0);
+    // verbatim. Their stored costs are kept per provider so a colliding bare
+    // model name cannot cross-contaminate.
+    let stored =
+        |m: &crate::constants::FastHashMap<String, f64>| m.get(model).copied().unwrap_or(0.0);
     for (usage, source) in [
-        (&per_provider.opencode, CostSource::OpenCodeStored(stored())),
-        (&per_provider.cursor, CostSource::CursorStored(stored())),
+        (
+            &per_provider.opencode,
+            CostSource::OpenCodeStored(stored(&stored_costs.opencode)),
+        ),
+        (
+            &per_provider.cursor,
+            CostSource::CursorStored(stored(&stored_costs.cursor)),
+        ),
     ] {
         if let Some(raw_usage) = usage.get(model) {
             found = true;
@@ -547,15 +555,15 @@ mod tests {
             .opencode
             .insert("shared-pro".to_string(), json!({"input_tokens": 100}));
 
-        let mut opencode_costs = crate::constants::FastHashMap::default();
-        opencode_costs.insert("shared-pro".to_string(), 7.0);
+        let mut stored_costs = StoredCosts::default();
+        stored_costs.opencode.insert("shared-pro".to_string(), 7.0);
 
         let summary = build_usage_summary(
             &usage_data,
             &per_provider,
             &ProviderActiveDays::default(),
             &pricing_map,
-            &opencode_costs,
+            &stored_costs,
         );
 
         assert_eq!(summary.rows.len(), 1);
@@ -587,8 +595,10 @@ mod tests {
             .insert("gemini-2.5-pro".to_string(), json!({"input_tokens": 1000}));
 
         // Cursor's dashboard cost for this row.
-        let mut stored_costs = crate::constants::FastHashMap::default();
-        stored_costs.insert("gemini-2.5-pro".to_string(), 0.3425);
+        let mut stored_costs = StoredCosts::default();
+        stored_costs
+            .cursor
+            .insert("gemini-2.5-pro".to_string(), 0.3425);
 
         let summary = build_usage_summary(
             &usage_data,
@@ -601,6 +611,45 @@ mod tests {
         assert_eq!(summary.rows.len(), 1);
         // Uses the dashboard cost (0.3425), NOT LiteLLM's 1000 * 0.01 = 10.0.
         assert!((summary.rows[0].cost - 0.3425).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stored_costs_do_not_cross_contaminate_on_name_collision() {
+        clear_pricing_cache();
+        // Empty pricing: neither provider gets an exact match, so both fall back
+        // to their own stored cost.
+        let pricing_map = ModelPricingMap::new(std::collections::HashMap::new());
+
+        // The same bare model name appears under both OpenCode and Cursor.
+        let mut usage_data = UsageResult::default();
+        usage_data.insert("collide".to_string(), json!({"input_tokens": 10}));
+
+        let mut per_provider = PerProviderUsage::default();
+        per_provider
+            .opencode
+            .insert("collide".to_string(), json!({"input_tokens": 5}));
+        per_provider
+            .cursor
+            .insert("collide".to_string(), json!({"input_tokens": 5}));
+
+        let mut stored_costs = StoredCosts::default();
+        stored_costs.opencode.insert("collide".to_string(), 5.0);
+        stored_costs.cursor.insert("collide".to_string(), 3.0);
+
+        let summary = build_usage_summary(
+            &usage_data,
+            &per_provider,
+            &ProviderActiveDays::default(),
+            &pricing_map,
+            &stored_costs,
+        );
+
+        assert_eq!(summary.rows.len(), 1);
+        // Merged row = OpenCode's 5 + Cursor's 3 = 8, not twice a shared 8.
+        assert!((summary.rows[0].cost - 8.0).abs() < 1e-9);
+        // Each provider footer keeps only its own stored cost.
+        assert!((summary.provider_totals.opencode.total_cost - 5.0).abs() < 1e-9);
+        assert!((summary.provider_totals.cursor.total_cost - 3.0).abs() < 1e-9);
     }
 
     fn row(model: &str, input: i64, total: i64, cost: f64) -> UsageRow {

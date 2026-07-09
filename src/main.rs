@@ -307,16 +307,20 @@ fn resolve_enriched_model_cost(
     }
 
     // OpenCode and Cursor both carry stored costs, but OpenCode prefers an exact
-    // LiteLLM match while Cursor uses its dashboard cost verbatim.
-    let stored = || usage_data.stored_costs.get(model).copied().unwrap_or(0.0);
+    // LiteLLM match while Cursor uses its dashboard cost verbatim. Their stored
+    // costs are kept per provider so a colliding bare model name cannot
+    // cross-contaminate.
+    let stored = |m: &vibe_coding_tracker::constants::FastHashMap<String, f64>| {
+        m.get(model).copied().unwrap_or(0.0)
+    };
     for (usage, source) in [
         (
             &usage_data.per_provider.opencode,
-            CostSource::OpenCodeStored(stored()),
+            CostSource::OpenCodeStored(stored(&usage_data.stored_costs.opencode)),
         ),
         (
             &usage_data.per_provider.cursor,
-            CostSource::CursorStored(stored()),
+            CostSource::CursorStored(stored(&usage_data.stored_costs.cursor)),
         ),
     ] {
         if let Some(raw_usage) = usage.get(model) {
@@ -374,8 +378,8 @@ mod tests {
             .opencode
             .insert("shared-pro".to_string(), json!({"input_tokens": 100}));
 
-        let mut stored_costs = vibe_coding_tracker::constants::FastHashMap::default();
-        stored_costs.insert("shared-pro".to_string(), 7.0);
+        let mut stored_costs = vibe_coding_tracker::usage::StoredCosts::default();
+        stored_costs.opencode.insert("shared-pro".to_string(), 7.0);
 
         let usage_data = vibe_coding_tracker::UsageData {
             models,

@@ -63,13 +63,23 @@ pub struct UsageData {
     /// and overall.
     pub provider_days: ProviderActiveDays,
     /// Provider-authoritative per-model cost (USD), summed from the source.
-    ///
-    /// OpenCode records assistant-message costs and Cursor reports its billed
-    /// cost per usage event, so when a model has no exact LiteLLM price we
-    /// display this stored cost instead of guessing from a fuzzy match. Keyed by
-    /// model name; only OpenCode / Cursor models appear (their key spaces do not
-    /// collide — OpenCode qualifies models as `providerID/id`).
-    pub stored_costs: FastHashMap<String, f64>,
+    pub stored_costs: StoredCosts,
+}
+
+/// Provider-authoritative per-model costs, kept **separate per provider**.
+///
+/// OpenCode records assistant-message costs and Cursor reports its billed cost
+/// per usage event, so when a model has no exact LiteLLM price we display this
+/// stored cost instead of guessing from a fuzzy match. The two are kept apart
+/// (rather than in one model-keyed map) because a legacy OpenCode session can
+/// carry a *bare* model name that collides with a Cursor model of the same name
+/// — a shared map would then cross-contaminate their costs.
+#[derive(Debug, Default, Clone)]
+pub struct StoredCosts {
+    /// OpenCode's per-model stored cost, keyed by model name.
+    pub opencode: FastHashMap<String, f64>,
+    /// Cursor's per-model dashboard cost, keyed by model name.
+    pub cursor: FastHashMap<String, f64>,
 }
 
 /// Extracts token usage data from a typed `CodeAnalysis`.
@@ -132,7 +142,7 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
     let paths = resolve_paths()?;
     let mut result = FastHashMap::with_capacity(capacity::MODEL_COMBINATIONS);
     let mut per_provider = PerProviderUsage::default();
-    let mut stored_costs: FastHashMap<String, f64> = FastHashMap::default();
+    let mut stored_costs = StoredCosts::default();
 
     let mut claude_dates: HashSet<String> = HashSet::new();
     let mut codex_dates: HashSet<String> = HashSet::new();
@@ -207,7 +217,7 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
             &paths.opencode_db,
             &mut result,
             &mut per_provider.opencode,
-            &mut stored_costs,
+            &mut stored_costs.opencode,
             &mut opencode_dates,
             time_range,
         )
@@ -227,7 +237,7 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
             &paths.cursor_tracking_db,
             &mut result,
             &mut per_provider.cursor,
-            &mut stored_costs,
+            &mut stored_costs.cursor,
             &mut cursor_dates,
             time_range,
         )

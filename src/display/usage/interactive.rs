@@ -307,7 +307,7 @@ pub fn display_usage_interactive(
     let mut usage_data = UsageResult::default();
     let mut per_provider_usage = PerProviderUsage::default();
     let mut provider_days = ProviderActiveDays::default();
-    let mut stored_costs: crate::constants::FastHashMap<String, f64> = Default::default();
+    let mut stored_costs = crate::usage::StoredCosts::default();
     let mut has_usage_data = false;
 
     // Pricing map is large (~500 KB / ~400 models) but changes at most once
