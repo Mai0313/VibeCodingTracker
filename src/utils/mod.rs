@@ -36,7 +36,7 @@ pub use paths::{
     get_claude_usage_cache_path, get_codex_usage_cache_path, get_copilot_config_path,
     get_copilot_usage_cache_path, get_current_user, get_cursor_auth_path,
     get_cursor_usage_cache_path, get_machine_id, get_pricing_cache_path,
-    get_self_version_cache_path, list_pricing_cache_files, resolve_paths,
+    get_self_version_cache_path, list_pricing_cache_files, network_disabled, resolve_paths,
 };
 pub use time::{now_rfc3339_utc_nanos, parse_iso_timestamp};
 pub use token_extractor::{TokenCounts, extract_token_counts};

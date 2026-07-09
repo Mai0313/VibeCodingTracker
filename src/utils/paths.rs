@@ -126,6 +126,16 @@ pub fn resolve_paths() -> Result<HelperPaths> {
     })
 }
 
+/// Whether all network access is disabled via `VCT_OFFLINE`.
+///
+/// When set to a non-empty value the tool stays fully offline: the pricing
+/// fetch, the Cursor usage API, and the update check each skip the network and
+/// degrade to a cache/empty/local result. The integration tests set this (plus
+/// an isolated `HOME`) so `cargo test` never reaches an external API.
+pub fn network_disabled() -> bool {
+    std::env::var_os("VCT_OFFLINE").is_some_and(|v| !v.is_empty())
+}
+
 /// Returns the current username from the environment.
 ///
 /// Reads `USER`, falling back to `USERNAME` (Windows), and finally to the

@@ -117,6 +117,10 @@ fn get_version_comparison() -> Result<Option<(String, Version, Version, GitHubRe
 /// Returns an error if the version comparison fails — i.e. the GitHub fetch or
 /// any version parse fails (see `get_version_comparison`).
 pub fn check_update() -> Result<Option<String>> {
+    // Offline mode: skip the GitHub Releases probe entirely.
+    if crate::utils::network_disabled() {
+        return Ok(None);
+    }
     match get_version_comparison()? {
         Some((current_version, _, latest_version, release)) => {
             println!(

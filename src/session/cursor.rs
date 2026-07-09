@@ -226,6 +226,11 @@ fn save_usage_cache(events: &[CachedEvent], fetched_at: i64, from_api: bool) -> 
 /// Fetches the full history (`startDate = 0`) so a single cache serves every
 /// time range; the aggregators filter by date locally.
 fn fetch_all_events() -> Result<Vec<CachedEvent>> {
+    // Offline mode: don't hit the dashboard API; the caller falls back to a
+    // cached or local-approximation result.
+    if crate::utils::network_disabled() {
+        return Err(anyhow!("network disabled (VCT_OFFLINE)"));
+    }
     let auth_path = get_cursor_auth_path()?;
     let body = std::fs::read_to_string(&auth_path)
         .with_context(|| format!("no Cursor credentials at {}", auth_path.display()))?;

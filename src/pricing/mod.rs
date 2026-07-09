@@ -69,6 +69,13 @@ pub fn fetch_model_pricing() -> Result<ModelPricingMap> {
         }
     }
 
+    // Offline mode: never hit the network. Callers already treat a missing
+    // price as $0, so an empty map keeps `usage` working (cost unavailable)
+    // without a fetch. Keeps `cargo test` / offline runs off the network.
+    if crate::utils::network_disabled() {
+        return Ok(ModelPricingMap::new(std::collections::HashMap::new()));
+    }
+
     // Fetch from remote
     log::info!("Fetching model pricing from remote...");
     let client = reqwest::blocking::Client::builder()
