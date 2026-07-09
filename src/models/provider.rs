@@ -26,6 +26,8 @@ pub enum Provider {
     Gemini,
     /// OpenCode.
     OpenCode,
+    /// Cursor CLI / IDE.
+    Cursor,
     /// Model name matched no known provider prefix.
     Unknown,
 }
@@ -112,6 +114,7 @@ impl Provider {
             Self::Copilot => "Copilot",
             Self::Gemini => "Gemini",
             Self::OpenCode => "OpenCode",
+            Self::Cursor => "Cursor",
             Self::Unknown => "Unknown",
         }
     }
@@ -164,6 +167,7 @@ mod tests {
         assert_eq!(Provider::Copilot.display_name(), "Copilot");
         assert_eq!(Provider::Gemini.display_name(), "Gemini");
         assert_eq!(Provider::OpenCode.display_name(), "OpenCode");
+        assert_eq!(Provider::Cursor.display_name(), "Cursor");
         assert_eq!(Provider::Unknown.display_name(), "Unknown");
     }
 }

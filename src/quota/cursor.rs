@@ -35,7 +35,7 @@ pub const CURSOR_LOGIN_HINT: &str = "run: cursor-agent login";
 /// The version is detected from the installed CLI (see
 /// [`crate::quota::http::detect_cli_version`]) so the UA tracks the real client
 /// rather than drifting from a hardcoded constant.
-fn cursor_ua() -> &'static str {
+pub(crate) fn cursor_ua() -> &'static str {
     static UA: OnceLock<String> = OnceLock::new();
     UA.get_or_init(|| {
         format!(
@@ -51,9 +51,12 @@ fn cursor_ua() -> &'static str {
 }
 
 /// A usable Cursor session: the synthesized cookie header + the JWT expiry.
-struct CursorSession {
-    cookie: String,
-    exp: i64,
+///
+/// Shared with the session-data reader (`crate::session::cursor`), which reuses
+/// the same cookie to reach the dashboard usage-events API.
+pub(crate) struct CursorSession {
+    pub(crate) cookie: String,
+    pub(crate) exp: i64,
 }
 
 /// Decodes a JWT payload segment (base64url, no padding) into JSON.
@@ -71,7 +74,7 @@ fn decode_jwt_payload(token: &str) -> Option<serde_json::Value> {
 ///
 /// The cookie value is `<userID>::<accessToken>` with `::` percent-encoded,
 /// where `userID` is the JWT `sub` claim after the final `|`.
-fn read_cursor_session(body: &str) -> Option<CursorSession> {
+pub(crate) fn read_cursor_session(body: &str) -> Option<CursorSession> {
     let root: serde_json::Value = serde_json::from_str(body).ok()?;
     let access = root.get("accessToken")?.as_str()?;
     if access.is_empty() {

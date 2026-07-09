@@ -30,7 +30,21 @@ pub struct HelperPaths {
     /// Copilot CLI session state (`~/.copilot/session-state`).
     pub copilot_session_dir: PathBuf,
     /// Cursor CLI config root (`$XDG_CONFIG_HOME/cursor` or `~/.config/cursor`).
+    ///
+    /// Holds the OAuth credentials (`auth.json`) used by the quota panel. This
+    /// is **not** where Cursor stores session data — that lives under `~/.cursor`
+    /// (see `cursor_tracking_db` / `cursor_chats_dir`).
     pub cursor_dir: PathBuf,
+    /// Cursor AI-code tracking database (`~/.cursor/ai-tracking/ai-code-tracking.db`).
+    ///
+    /// Maps each conversation to the model that authored its code, used for
+    /// per-model attribution in the `analysis` view.
+    pub cursor_tracking_db: PathBuf,
+    /// Cursor chat session stores root (`~/.cursor/chats`).
+    ///
+    /// Each conversation is a `chats/<projectHash>/<conversationId>/store.db`
+    /// SQLite blob store parsed for `analysis` tool metrics.
+    pub cursor_chats_dir: PathBuf,
     /// Gemini CLI root (`~/.gemini`).
     pub gemini_dir: PathBuf,
     /// Gemini CLI session logs (`~/.gemini/tmp`).
@@ -74,6 +88,13 @@ pub fn resolve_paths() -> Result<HelperPaths> {
         .filter(|p| p.is_absolute())
         .unwrap_or_else(|| home_dir.join(".config"))
         .join("cursor");
+    // Cursor session data (distinct from the config dir above) lives under
+    // `~/.cursor`: a global tracking DB plus one blob-store DB per conversation.
+    let cursor_data_dir = home_dir.join(".cursor");
+    let cursor_tracking_db = cursor_data_dir
+        .join("ai-tracking")
+        .join("ai-code-tracking.db");
+    let cursor_chats_dir = cursor_data_dir.join("chats");
     let gemini_dir = home_dir.join(".gemini");
     let gemini_session_dir = gemini_dir.join("tmp");
     // OpenCode keeps a single SQLite database under the XDG data directory,
@@ -95,12 +116,24 @@ pub fn resolve_paths() -> Result<HelperPaths> {
         copilot_dir,
         copilot_session_dir,
         cursor_dir,
+        cursor_tracking_db,
+        cursor_chats_dir,
         gemini_dir,
         gemini_session_dir,
         opencode_dir,
         opencode_db,
         cache_dir,
     })
+}
+
+/// Whether all network access is disabled via `VCT_OFFLINE`.
+///
+/// When set to a non-empty value the tool stays fully offline: the pricing
+/// fetch, the Cursor usage API, and the update check each skip the network and
+/// degrade to a cache/empty/local result. The integration tests set this (plus
+/// an isolated `HOME`) so `cargo test` never reaches an external API.
+pub fn network_disabled() -> bool {
+    std::env::var_os("VCT_OFFLINE").is_some_and(|v| !v.is_empty())
 }
 
 /// Returns the current username from the environment.
@@ -419,6 +452,12 @@ mod tests {
         // OpenCode paths
         assert_eq!(paths.opencode_db, paths.opencode_dir.join("opencode.db"));
         assert!(paths.opencode_dir.ends_with("opencode"));
+
+        // Cursor session-data paths live under `~/.cursor`, not the config dir.
+        assert!(paths.cursor_tracking_db.ends_with("ai-code-tracking.db"));
+        assert!(paths.cursor_chats_dir.ends_with("chats"));
+        assert!(paths.cursor_tracking_db.starts_with(&paths.home_dir));
+        assert!(paths.cursor_chats_dir.starts_with(&paths.home_dir));
     }
 
     #[test]

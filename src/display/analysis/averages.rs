@@ -90,6 +90,7 @@ pub fn calculate_analysis_provider_totals_from_per_provider(
     totals.copilot.days_count = provider_days.copilot;
     totals.gemini.days_count = provider_days.gemini;
     totals.opencode.days_count = provider_days.opencode;
+    totals.cursor.days_count = provider_days.cursor;
     totals.overall.days_count = provider_days.total;
 
     accumulate_analysis_provider(&mut totals.claude, &per_provider.claude);
@@ -97,6 +98,7 @@ pub fn calculate_analysis_provider_totals_from_per_provider(
     accumulate_analysis_provider(&mut totals.copilot, &per_provider.copilot);
     accumulate_analysis_provider(&mut totals.gemini, &per_provider.gemini);
     accumulate_analysis_provider(&mut totals.opencode, &per_provider.opencode);
+    accumulate_analysis_provider(&mut totals.cursor, &per_provider.cursor);
 
     // "All Providers" row is the sum of every provider's totals, matching
     // the usage command. Summing per-provider stats keeps the overall
@@ -106,42 +108,50 @@ pub fn calculate_analysis_provider_totals_from_per_provider(
         + totals.codex.total_edit_lines
         + totals.copilot.total_edit_lines
         + totals.gemini.total_edit_lines
-        + totals.opencode.total_edit_lines;
+        + totals.opencode.total_edit_lines
+        + totals.cursor.total_edit_lines;
     totals.overall.total_read_lines = totals.claude.total_read_lines
         + totals.codex.total_read_lines
         + totals.copilot.total_read_lines
         + totals.gemini.total_read_lines
-        + totals.opencode.total_read_lines;
+        + totals.opencode.total_read_lines
+        + totals.cursor.total_read_lines;
     totals.overall.total_write_lines = totals.claude.total_write_lines
         + totals.codex.total_write_lines
         + totals.copilot.total_write_lines
         + totals.gemini.total_write_lines
-        + totals.opencode.total_write_lines;
+        + totals.opencode.total_write_lines
+        + totals.cursor.total_write_lines;
     totals.overall.total_bash_count = totals.claude.total_bash_count
         + totals.codex.total_bash_count
         + totals.copilot.total_bash_count
         + totals.gemini.total_bash_count
-        + totals.opencode.total_bash_count;
+        + totals.opencode.total_bash_count
+        + totals.cursor.total_bash_count;
     totals.overall.total_edit_count = totals.claude.total_edit_count
         + totals.codex.total_edit_count
         + totals.copilot.total_edit_count
         + totals.gemini.total_edit_count
-        + totals.opencode.total_edit_count;
+        + totals.opencode.total_edit_count
+        + totals.cursor.total_edit_count;
     totals.overall.total_read_count = totals.claude.total_read_count
         + totals.codex.total_read_count
         + totals.copilot.total_read_count
         + totals.gemini.total_read_count
-        + totals.opencode.total_read_count;
+        + totals.opencode.total_read_count
+        + totals.cursor.total_read_count;
     totals.overall.total_todo_write_count = totals.claude.total_todo_write_count
         + totals.codex.total_todo_write_count
         + totals.copilot.total_todo_write_count
         + totals.gemini.total_todo_write_count
-        + totals.opencode.total_todo_write_count;
+        + totals.opencode.total_todo_write_count
+        + totals.cursor.total_todo_write_count;
     totals.overall.total_write_count = totals.claude.total_write_count
         + totals.codex.total_write_count
         + totals.copilot.total_write_count
         + totals.gemini.total_write_count
-        + totals.opencode.total_write_count;
+        + totals.opencode.total_write_count
+        + totals.cursor.total_write_count;
 
     totals
 }
@@ -163,7 +173,7 @@ fn accumulate_analysis_provider(stats: &mut AnalysisProviderStats, rows: &[Aggre
 pub fn build_analysis_provider_rows(
     totals: &AnalysisProviderTotals,
 ) -> Vec<ProviderTotal<'_, AnalysisProviderStats>> {
-    let mut rows = Vec::with_capacity(6); // max 5 providers + overall
+    let mut rows = Vec::with_capacity(7); // max 6 providers + overall
 
     if totals.claude.days_count > 0 {
         rows.push(ProviderTotal::new(
@@ -195,6 +205,10 @@ pub fn build_analysis_provider_rows(
             &totals.opencode,
             false,
         ));
+    }
+
+    if totals.cursor.days_count > 0 {
+        rows.push(ProviderTotal::new(Provider::Cursor, &totals.cursor, false));
     }
 
     if totals.overall.days_count > 0 || rows.is_empty() {

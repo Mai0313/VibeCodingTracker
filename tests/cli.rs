@@ -8,6 +8,22 @@ use std::path::PathBuf;
 use tempfile::TempDir;
 use vibe_coding_tracker::VERSION;
 
+/// Builds a `vct` command with an isolated empty `HOME` (and XDG dirs) plus
+/// `VCT_OFFLINE`, so a subcommand that scans session directories reads no real
+/// data and never reaches an external API — the Cursor dashboard, LiteLLM
+/// pricing, or the GitHub update check. `assert_cmd`'s `.env` only affects the
+/// spawned child, so no `#[serial]` is needed. Returns the temp dir so it
+/// outlives the command run.
+fn offline_cmd() -> (Command, TempDir) {
+    let tmp = TempDir::new().unwrap();
+    let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
+    cmd.env("HOME", tmp.path())
+        .env("XDG_CONFIG_HOME", tmp.path())
+        .env("XDG_DATA_HOME", tmp.path())
+        .env("VCT_OFFLINE", "1");
+    (cmd, tmp)
+}
+
 #[test]
 fn test_version_command() {
     let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
@@ -217,7 +233,7 @@ fn test_analysis_command_table() {
 
 #[test]
 fn test_usage_command_json() {
-    let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
+    let (mut cmd, _tmp) = offline_cmd();
     cmd.arg("usage").arg("--json");
 
     let output = cmd.output().expect("failed to spawn vct binary");
@@ -235,7 +251,7 @@ fn test_usage_command_json() {
 
 #[test]
 fn test_usage_command_text() {
-    let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
+    let (mut cmd, _tmp) = offline_cmd();
     cmd.arg("usage").arg("--text");
 
     // Should succeed
@@ -244,7 +260,7 @@ fn test_usage_command_text() {
 
 #[test]
 fn test_usage_command_table() {
-    let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
+    let (mut cmd, _tmp) = offline_cmd();
     cmd.arg("usage").arg("--table");
 
     // Should succeed
@@ -255,7 +271,7 @@ fn test_usage_command_table() {
 fn test_usage_command_merge_providers() {
     // The `--merge-providers` flag must parse and run in the static modes.
     for format in ["--table", "--text"] {
-        let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
+        let (mut cmd, _tmp) = offline_cmd();
         cmd.arg("usage").arg(format).arg("--merge-providers");
         cmd.assert().success();
     }
@@ -265,12 +281,11 @@ fn test_usage_command_merge_providers() {
 fn test_usage_command_with_output_file() {
     use std::time::Duration;
 
-    let temp_dir = TempDir::new().unwrap();
-    let output_file = temp_dir.path().join("usage_output.json");
+    let (mut cmd, tmp) = offline_cmd();
+    let output_file = tmp.path().join("usage_output.json");
 
     // usage has no single-file --path mode, so it scans real session
-    // directories; guard with a timeout like the analysis batch test.
-    let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
+    // directories; the isolated HOME keeps that scan empty and offline.
     cmd.arg("usage")
         .arg("--output")
         .arg(output_file.to_str().unwrap())
@@ -296,7 +311,7 @@ fn test_all_short_flag_parses() {
     // would exit fast with a non-success code; a slow scan may hit the timeout
     // (code().is_none()), which we tolerate like the other batch tests.
     for subcommand in ["usage", "analysis"] {
-        let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
+        let (mut cmd, _tmp) = offline_cmd();
         cmd.arg(subcommand)
             .arg("-a")
             .arg("--json")
@@ -488,7 +503,7 @@ fn test_analysis_output_directory_creation() {
 
 #[test]
 fn test_update_check_command() {
-    let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
+    let (mut cmd, _tmp) = offline_cmd();
     cmd.arg("update").arg("--check");
 
     // Should succeed (network errors are handled gracefully)

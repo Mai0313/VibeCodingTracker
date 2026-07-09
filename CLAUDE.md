@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Rust CLI (`vibe_coding_tracker`, short alias `vct`) that scans on-disk session logs written by five AI coding assistants — Claude Code, OpenAI Codex, GitHub Copilot CLI, and Gemini CLI (JSONL files), plus OpenCode (a SQLite database) — and aggregates them into two views:
+Rust CLI (`vibe_coding_tracker`, short alias `vct`) that scans on-disk session logs written by six AI coding assistants — Claude Code, OpenAI Codex, GitHub Copilot CLI, and Gemini CLI (JSONL files), OpenCode (a SQLite database), plus Cursor (per-conversation SQLite chat stores for `analysis`, and its dashboard usage API for `usage`) — and aggregates them into two views:
 
 - **`usage`** — per-model token counts and LiteLLM-priced cost
 - **`analysis`** — per-model file-operation and tool-call metrics (read/write/edit lines, Bash/Edit/Read/Write/TodoWrite call counts)
@@ -75,7 +75,12 @@ Four parser entry points live in `src/session/parser.rs`:
 
 OpenCode does **not** flow through the detector or `parse_session_file_*`: it lives in a single SQLite database, so `src/session/opencode.rs` reads it directly (`read_opencode_usage` from assistant messages with a legacy `session` fallback, `read_opencode_analysis` from `message` + `part`) and produces the same `CodeAnalysis` shape, which the `usage` / `analysis` aggregators fold in alongside the file-based providers. The DB is opened read-only (with a temp-copy fallback) so the user's database is never mutated.
 
-OpenCode cost is a special case: `usage::resolve_model_cost` prices an OpenCode model from tokens only on an **exact** LiteLLM match (`ModelPricingMap::get_exact`); with no exact match it uses the stored assistant-message cost carried in `UsageData::opencode_costs` rather than the normalized/substring/fuzzy fallback the other providers use. This keeps a novel model like `deepseek-v4-pro` from being mis-priced against a loosely-similar name.
+OpenCode cost is a special case: `usage::resolve_model_cost` prices an OpenCode model from tokens only on an **exact** LiteLLM match (`ModelPricingMap::get_exact`); with no exact match it uses the stored assistant-message cost carried in `UsageData::stored_costs` rather than the normalized/substring/fuzzy fallback the other providers use. This keeps a novel model like `deepseek-v4-pro` from being mis-priced against a loosely-similar name. Cursor reuses this same stored-cost mechanism but with its own basis — `resolve_model_cost` takes a `CostSource` (`Litellm` / `OpenCodeStored` = exact-match-else-stored / `CursorStored` = the dashboard cost verbatim, never re-priced). The two providers' stored costs live in **separate** per-provider maps (`UsageData::stored_costs` is a `StoredCosts { opencode, cursor }`) so a legacy OpenCode session carrying a bare model name can't cross-contaminate a same-named Cursor model.
+
+Cursor is split across two boundaries and, like OpenCode, bypasses the detector / `parse_session_file_*` — `src/session/cursor.rs` owns it:
+
+- **`analysis`** reads per-conversation blob stores at `~/.cursor/chats/*/*/store.db`. Each store is a content-addressed SQLite blob DAG: assistant turns live in **binary protobuf nodes** (`field 4` = the message JSON, `field 26` = timestamp, `field 5` = a running context-window gauge), while `Read` tool results live in standalone JSON blobs joined back by `toolCallId`. `read_cursor_analysis` decodes only those three fields (never the DAG topology, so it is robust to schema additions) and folds each turn's tool calls (`Write` / `StrReplace`→edit / `Read` / `Shell`→bash / `TodoWrite`) through `SessionParseState`. The conversation's model comes from `~/.cursor/ai-tracking/ai-code-tracking.db` (`conversationId -> model`, one model per conversation in practice), falling back to the store's hex-encoded `meta.lastUsedModel`.
+- **`usage`** does **not** come from local files — Cursor stores only the context gauge, not billing tokens. `read_cursor_usage` fetches real per-model tokens + cost from Cursor's individual dashboard API (`POST cursor.com/api/dashboard/get-filtered-usage-events`, `teamId:0`, `Origin: https://cursor.com`) reusing the quota panel's `WorkosCursorSessionToken` (via `quota::cursor::{read_cursor_session, cursor_ua}`), aggregates events per `(date, model)`, and caches them in `~/.vct/cursor_usage_events.json` (TTL `CURSOR_USAGE_CACHE_TTL_SECS`) so the TUI does not re-hit the endpoint every refresh. When the API is unreachable and no cache exists it falls back to a deliberately-rough, input-only **approximation** from the local context gauge (`$0` cost for models Cursor prices itself). Both Cursor SQLite DBs are opened read-only with the same temp-copy/WAL fallback as OpenCode.
 
 ### `ParseMode`
 
@@ -92,14 +97,15 @@ OpenCode cost is a special case: `usage::resolve_model_cost` prices an OpenCode 
 
 Resolved by `src/utils/paths.rs` (`resolve_paths`):
 
-| Provider      | Source path                                                                                                                                    |
-| ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| Claude Code   | `~/.claude/projects/**/*.jsonl` (recursive — includes subagents)                                                                               |
-| Codex         | `~/.codex/sessions/**/*.jsonl`                                                                                                                 |
-| Copilot CLI   | `~/.copilot/session-state/<sessionId>/events.jsonl` (depth-bounded walk via `COPILOT_SESSION_MAX_DEPTH` to skip per-session snapshot subtrees) |
-| Gemini CLI    | `~/.gemini/tmp/<project_hash>/chats/*.jsonl`                                                                                                   |
-| OpenCode      | `~/.local/share/opencode/opencode.db` (SQLite database, read via `rusqlite`; honors `$XDG_DATA_HOME`)                                          |
-| Pricing cache | `~/.vct/model_pricing_YYYY-MM-DD.json`                                                                                                         |
+| Provider      | Source path                                                                                                                                                      |
+| ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Claude Code   | `~/.claude/projects/**/*.jsonl` (recursive — includes subagents)                                                                                                 |
+| Codex         | `~/.codex/sessions/**/*.jsonl`                                                                                                                                   |
+| Copilot CLI   | `~/.copilot/session-state/<sessionId>/events.jsonl` (depth-bounded walk via `COPILOT_SESSION_MAX_DEPTH` to skip per-session snapshot subtrees)                   |
+| Gemini CLI    | `~/.gemini/tmp/<project_hash>/chats/*.jsonl`                                                                                                                     |
+| OpenCode      | `~/.local/share/opencode/opencode.db` (SQLite database, read via `rusqlite`; honors `$XDG_DATA_HOME`)                                                            |
+| Cursor        | `~/.cursor/chats/*/*/store.db` (SQLite chat stores, `analysis`) + `~/.cursor/ai-tracking/ai-code-tracking.db` (model attribution); `usage` via the dashboard API |
+| Pricing cache | `~/.vct/model_pricing_YYYY-MM-DD.json`                                                                                                                           |
 
 ### Quota panels (`src/quota/`)
 
@@ -156,4 +162,5 @@ Every update check records the result to `~/.vct/version.json` via `version_cach
     - `tests/usage.rs` — `get_usage_from_directories` aggregation
     - `tests/pricing.rs` — `ModelPricingMap` lookup priority + tiered pricing math
     - `tests/cache.rs` — LRU file cache + pricing cache invalidation
+- **Tests must never hit a real external API** (Cursor's rate limit especially): any test that scans session dirs or runs the built binary must isolate `HOME`/XDG to a temp dir and set `VCT_OFFLINE=1` (see `offline_cmd` in `tests/cli.rs` / `IsolatedHome` in `tests/usage.rs`). `VCT_OFFLINE` (checked by `utils::network_disabled`) short-circuits the pricing fetch, the Cursor usage API, and the update check to a cache/empty/local result, so `VCT_OFFLINE=1 cargo test` runs the whole suite fully offline. Keep tests self-contained (e.g. `clear_pricing_cache()` before asserting on the global match-cache) so isolation never makes them fail.
 - Sample fixtures and golden outputs for the four JSONL providers live in `examples/` (one `test_conversation_<provider>.jsonl` plus one `analysis_result_<provider>.json` per provider). OpenCode has no JSONL fixture; its SQLite reader is covered by inline unit tests in `src/session/opencode.rs` that build a temp database.

@@ -29,7 +29,7 @@ use vibe_coding_tracker::display::usage::{
     display_usage_interactive, display_usage_table, display_usage_text,
 };
 use vibe_coding_tracker::pricing::{ModelPricingMap, fetch_model_pricing};
-use vibe_coding_tracker::usage::{get_usage_from_directories, resolve_model_cost};
+use vibe_coding_tracker::usage::{CostSource, get_usage_from_directories, resolve_model_cost};
 use vibe_coding_tracker::utils::extract_token_counts;
 use vibe_coding_tracker::{get_version_info, parse_session_file};
 
@@ -261,7 +261,7 @@ fn build_enriched_json(
 
     for (model, usage) in usage_data.models.iter() {
         let (cost, matched_model) = resolve_enriched_model_cost(model, usage_data, pricing_map)
-            .unwrap_or_else(|| price_usage_value(model, usage, pricing_map, None));
+            .unwrap_or_else(|| price_usage_value(model, usage, pricing_map, CostSource::Litellm));
 
         let mut entry = json!({
             "model": model,
@@ -297,7 +297,8 @@ fn resolve_enriched_model_cost(
     ] {
         if let Some(raw_usage) = usage.get(model) {
             found = true;
-            let (cost, matched) = price_usage_value(model, raw_usage, pricing_map, None);
+            let (cost, matched) =
+                price_usage_value(model, raw_usage, pricing_map, CostSource::Litellm);
             total_cost += cost;
             if matched_model.is_none() {
                 matched_model = matched;
@@ -305,28 +306,45 @@ fn resolve_enriched_model_cost(
         }
     }
 
-    if let Some(raw_usage) = usage_data.per_provider.opencode.get(model) {
-        found = true;
-        let opencode_cost = usage_data.opencode_costs.get(model).copied().unwrap_or(0.0);
-        let (cost, matched) = price_usage_value(model, raw_usage, pricing_map, Some(opencode_cost));
-        total_cost += cost;
-        if matched_model.is_none() {
-            matched_model = matched;
+    // OpenCode and Cursor both carry stored costs, but OpenCode prefers an exact
+    // LiteLLM match while Cursor uses its dashboard cost verbatim. Their stored
+    // costs are kept per provider so a colliding bare model name cannot
+    // cross-contaminate.
+    let stored = |m: &vibe_coding_tracker::constants::FastHashMap<String, f64>| {
+        m.get(model).copied().unwrap_or(0.0)
+    };
+    for (usage, source) in [
+        (
+            &usage_data.per_provider.opencode,
+            CostSource::OpenCodeStored(stored(&usage_data.stored_costs.opencode)),
+        ),
+        (
+            &usage_data.per_provider.cursor,
+            CostSource::CursorStored(stored(&usage_data.stored_costs.cursor)),
+        ),
+    ] {
+        if let Some(raw_usage) = usage.get(model) {
+            found = true;
+            let (cost, matched) = price_usage_value(model, raw_usage, pricing_map, source);
+            total_cost += cost;
+            if matched_model.is_none() {
+                matched_model = matched;
+            }
         }
     }
 
     found.then_some((total_cost, matched_model))
 }
 
-/// Prices one raw usage value.
+/// Prices one raw usage value under `source`.
 fn price_usage_value(
     model: &str,
     usage: &Value,
     pricing_map: &ModelPricingMap,
-    opencode_cost: Option<f64>,
+    source: CostSource,
 ) -> (f64, Option<String>) {
     let counts = extract_token_counts(usage);
-    resolve_model_cost(model, &counts, pricing_map, opencode_cost)
+    resolve_model_cost(model, &counts, pricing_map, source)
 }
 
 #[cfg(test)]
@@ -360,14 +378,14 @@ mod tests {
             .opencode
             .insert("shared-pro".to_string(), json!({"input_tokens": 100}));
 
-        let mut opencode_costs = vibe_coding_tracker::constants::FastHashMap::default();
-        opencode_costs.insert("shared-pro".to_string(), 7.0);
+        let mut stored_costs = vibe_coding_tracker::usage::StoredCosts::default();
+        stored_costs.opencode.insert("shared-pro".to_string(), 7.0);
 
         let usage_data = vibe_coding_tracker::UsageData {
             models,
             per_provider,
             provider_days: ProviderActiveDays::default(),
-            opencode_costs,
+            stored_costs,
         };
 
         let rows = build_enriched_json(&usage_data, &pricing_map).unwrap();

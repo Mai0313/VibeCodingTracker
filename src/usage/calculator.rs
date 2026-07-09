@@ -14,14 +14,14 @@ use crate::models::{
     CodeAnalysis, ExtensionType, PerProviderUsage, Provider, ProviderActiveDays, UsageResult,
 };
 use crate::pricing::{ModelPricingMap, calculate_cost};
-use crate::session::{ParseMode, parse_session_file_as, read_opencode_usage};
+use crate::session::{ParseMode, parse_session_file_as, read_cursor_usage, read_opencode_usage};
 use crate::utils::{
     COPILOT_SESSION_MAX_DEPTH, TokenCounts, collect_files_with_max_depth, is_claude_session_file,
     is_codex_session_file, is_copilot_session_file, is_gemini_session_file, resolve_paths,
 };
 use anyhow::Result;
 use rayon::prelude::*;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -62,13 +62,24 @@ pub struct UsageData {
     /// Count of distinct calendar dates that contributed usage, per provider
     /// and overall.
     pub provider_days: ProviderActiveDays,
-    /// OpenCode's own per-model cost (USD), summed from assistant messages.
-    ///
-    /// OpenCode records authoritative assistant-message costs, so when a model
-    /// has no exact LiteLLM price we display this stored cost instead of
-    /// guessing from a fuzzy match. Keyed by model name; only OpenCode models
-    /// appear.
-    pub opencode_costs: FastHashMap<String, f64>,
+    /// Provider-authoritative per-model cost (USD), summed from the source.
+    pub stored_costs: StoredCosts,
+}
+
+/// Provider-authoritative per-model costs, kept **separate per provider**.
+///
+/// OpenCode records assistant-message costs and Cursor reports its billed cost
+/// per usage event, so when a model has no exact LiteLLM price we display this
+/// stored cost instead of guessing from a fuzzy match. The two are kept apart
+/// (rather than in one model-keyed map) because a legacy OpenCode session can
+/// carry a *bare* model name that collides with a Cursor model of the same name
+/// — a shared map would then cross-contaminate their costs.
+#[derive(Debug, Default, Clone)]
+pub struct StoredCosts {
+    /// OpenCode's per-model stored cost, keyed by model name.
+    pub opencode: FastHashMap<String, f64>,
+    /// Cursor's per-model dashboard cost, keyed by model name.
+    pub cursor: FastHashMap<String, f64>,
 }
 
 /// Extracts token usage data from a typed `CodeAnalysis`.
@@ -131,13 +142,14 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
     let paths = resolve_paths()?;
     let mut result = FastHashMap::with_capacity(capacity::MODEL_COMBINATIONS);
     let mut per_provider = PerProviderUsage::default();
-    let mut opencode_costs: FastHashMap<String, f64> = FastHashMap::default();
+    let mut stored_costs = StoredCosts::default();
 
     let mut claude_dates: HashSet<String> = HashSet::new();
     let mut codex_dates: HashSet<String> = HashSet::new();
     let mut copilot_dates: HashSet<String> = HashSet::new();
     let mut gemini_dates: HashSet<String> = HashSet::new();
     let mut opencode_dates: HashSet<String> = HashSet::new();
+    let mut cursor_dates: HashSet<String> = HashSet::new();
 
     if paths.claude_session_dir.exists() {
         // Walks the projects tree recursively, so top-level `<session>.jsonl` logs
@@ -205,7 +217,7 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
             &paths.opencode_db,
             &mut result,
             &mut per_provider.opencode,
-            &mut opencode_costs,
+            &mut stored_costs.opencode,
             &mut opencode_dates,
             time_range,
         )
@@ -216,12 +228,30 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
         );
     }
 
+    // Cursor's usage comes from its dashboard API (billing tokens + cost), with
+    // a local approximation fallback, rather than a walked session directory.
+    // Attempt it whenever either the chat stores or the credentials are present.
+    if (paths.cursor_chats_dir.exists() || paths.cursor_dir.join("auth.json").exists())
+        && let Err(err) = process_cursor_usage(
+            &paths.cursor_chats_dir,
+            &paths.cursor_tracking_db,
+            &mut result,
+            &mut per_provider.cursor,
+            &mut stored_costs.cursor,
+            &mut cursor_dates,
+            time_range,
+        )
+    {
+        eprintln!("Warning: Failed to read Cursor usage: {err}");
+    }
+
     let mut all_dates: HashSet<&String> = HashSet::new();
     all_dates.extend(claude_dates.iter());
     all_dates.extend(codex_dates.iter());
     all_dates.extend(copilot_dates.iter());
     all_dates.extend(gemini_dates.iter());
     all_dates.extend(opencode_dates.iter());
+    all_dates.extend(cursor_dates.iter());
 
     let provider_days = ProviderActiveDays {
         claude: claude_dates.len(),
@@ -229,6 +259,7 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
         copilot: copilot_dates.len(),
         gemini: gemini_dates.len(),
         opencode: opencode_dates.len(),
+        cursor: cursor_dates.len(),
         total: all_dates.len(),
     };
 
@@ -236,7 +267,7 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
         models: result,
         per_provider,
         provider_days,
-        opencode_costs,
+        stored_costs,
     })
 }
 
@@ -344,18 +375,62 @@ fn process_opencode_usage(
     db_path: &Path,
     global_result: &mut UsageResult,
     provider_result: &mut UsageResult,
-    opencode_costs: &mut FastHashMap<String, f64>,
+    stored_costs: &mut FastHashMap<String, f64>,
     unique_dates: &mut HashSet<String>,
     time_range: TimeRange,
 ) -> Result<()> {
     let sessions = read_opencode_usage(db_path, time_range)?;
+    fold_stored_cost_sessions(
+        sessions,
+        global_result,
+        provider_result,
+        stored_costs,
+        unique_dates,
+    );
+    Ok(())
+}
 
+/// Reads Cursor's per-model usage (dashboard API, or local approximation) and
+/// merges it into both the global and Cursor-scoped maps.
+///
+/// Mirrors [`process_opencode_usage`]: Cursor reports its own billed cost per
+/// usage event, so it uses the same stored-cost path (exact LiteLLM match or
+/// the reported cost) rather than a fuzzy price guess.
+fn process_cursor_usage(
+    chats_dir: &Path,
+    tracking_db: &Path,
+    global_result: &mut UsageResult,
+    provider_result: &mut UsageResult,
+    stored_costs: &mut FastHashMap<String, f64>,
+    unique_dates: &mut HashSet<String>,
+    time_range: TimeRange,
+) -> Result<()> {
+    let sessions = read_cursor_usage(chats_dir, tracking_db, time_range)?;
+    fold_stored_cost_sessions(
+        sessions,
+        global_result,
+        provider_result,
+        stored_costs,
+        unique_dates,
+    );
+    Ok(())
+}
+
+/// Folds `(date, analysis, cost)` rows from a stored-cost provider (OpenCode /
+/// Cursor) into the global + provider-scoped maps and the stored-cost table.
+fn fold_stored_cost_sessions(
+    sessions: Vec<(String, CodeAnalysis, f64)>,
+    global_result: &mut UsageResult,
+    provider_result: &mut UsageResult,
+    stored_costs: &mut FastHashMap<String, f64>,
+    unique_dates: &mut HashSet<String>,
+) {
     for (date, analysis, session_cost) in sessions {
         unique_dates.insert(date);
 
         let conversation_usage = extract_conversation_usage_from_analysis(&analysis);
         for (model, usage_value) in conversation_usage {
-            *opencode_costs.entry(model.clone()).or_insert(0.0) += session_cost;
+            *stored_costs.entry(model.clone()).or_insert(0.0) += session_cost;
 
             provider_result
                 .entry(model.clone())
@@ -368,20 +443,30 @@ fn process_opencode_usage(
                 .or_insert(usage_value);
         }
     }
+}
 
-    Ok(())
+/// How a model's USD cost is resolved.
+///
+/// Different providers carry different authoritative cost sources, so the cost
+/// resolver branches on which one applies.
+#[derive(Debug, Clone, Copy)]
+pub enum CostSource {
+    /// File-based providers: the full LiteLLM lookup (exact → normalized →
+    /// substring → fuzzy).
+    Litellm,
+    /// OpenCode: an **exact** LiteLLM match prices from tokens, otherwise the
+    /// stored assistant-message cost is used verbatim. No fuzzy guessing, so a
+    /// novel model like `deepseek-v4-pro` reports OpenCode's own cost instead of
+    /// being priced against a loosely-similar name.
+    OpenCodeStored(f64),
+    /// Cursor: the dashboard API's own billed cost, used **verbatim** and never
+    /// re-priced from tokens, so a row that has an exact LiteLLM match (e.g.
+    /// `gemini-2.5-pro`) still matches what Cursor actually billed rather than
+    /// the LiteLLM list price.
+    CursorStored(f64),
 }
 
 /// Resolves the USD cost (and optional matched-model annotation) for one model.
-///
-/// Behavior depends on `opencode_cost`:
-/// - `None` (every provider except OpenCode): the existing LiteLLM lookup,
-///   which includes exact, normalized, substring, and fuzzy matching.
-/// - `Some(stored)` (OpenCode): only an **exact** LiteLLM match is computed
-///   from tokens; otherwise the model's stored OpenCode cost is used verbatim.
-///   No fuzzy/normalized guessing happens, so a novel model like
-///   `deepseek-v4-pro` reports OpenCode's own cost instead of being priced
-///   against a loosely-similar model.
 ///
 /// Returns `(cost_usd, matched_model)` where `matched_model` is `Some` only
 /// when a non-exact LiteLLM key was used (for display annotation).
@@ -389,7 +474,7 @@ pub fn resolve_model_cost(
     model: &str,
     counts: &TokenCounts,
     pricing_map: &ModelPricingMap,
-    opencode_cost: Option<f64>,
+    source: CostSource,
 ) -> (f64, Option<String>) {
     let priced = |pricing: &crate::pricing::ModelPricing| {
         let token_cost = calculate_cost(
@@ -407,16 +492,19 @@ pub fn resolve_model_cost(
         token_cost + counts.web_search_requests as f64 * pricing.web_search_cost_per_query
     };
 
-    if let Some(stored) = opencode_cost {
+    match source {
+        // Cursor's dashboard cost is authoritative; never re-price from tokens.
+        CostSource::CursorStored(stored) => (stored, None),
         // OpenCode: only trust an exact price match; otherwise use its own cost.
-        return match pricing_map.get_exact(model) {
+        CostSource::OpenCodeStored(stored) => match pricing_map.get_exact(model) {
             Some(pricing) => (priced(&pricing), None),
             None => (stored, None),
-        };
+        },
+        CostSource::Litellm => {
+            let result = pricing_map.get(model);
+            (priced(&result.pricing), result.matched_model)
+        }
     }
-
-    let result = pricing_map.get(model);
-    (priced(&result.pricing), result.matched_model)
 }
 
 impl UsageData {
@@ -437,7 +525,27 @@ impl UsageData {
 /// `total_token_usage`). Values that are not both JSON objects, or that match
 /// neither shape, are left untouched.
 fn merge_usage_values(existing: &mut Value, new: &Value) {
-    use crate::utils::{accumulate_i64_fields, accumulate_nested_object};
+    use crate::utils::{accumulate_i64_fields, accumulate_nested_object, extract_token_counts};
+
+    let (Some(existing_ro), Some(new_ro)) = (existing.as_object(), new.as_object()) else {
+        return;
+    };
+    let existing_flat = existing_ro.contains_key("input_tokens");
+    let existing_codex = existing_ro.contains_key("total_token_usage");
+    let new_flat = new_ro.contains_key("input_tokens");
+    let new_codex = new_ro.contains_key("total_token_usage");
+
+    // Mixed shapes — e.g. a Codex `total_token_usage` row and a Cursor / Copilot
+    // flat `input_tokens` row that share a model name like `gpt-5`. The
+    // shape-specific branches below only accumulate when both sides carry the
+    // *same* shape, so a mismatch would silently drop the other side's tokens.
+    // Normalize both to disjoint counts and rewrite `existing` as a flat value
+    // that keeps every bucket (and round-trips through `extract_token_counts`).
+    if (existing_flat && new_codex) || (existing_codex && new_flat) {
+        let merged = add_token_counts(&extract_token_counts(existing), &extract_token_counts(new));
+        *existing = token_counts_to_flat_value(&merged);
+        return;
+    }
 
     if let (Some(existing_obj), Some(new_obj)) = (existing.as_object_mut(), new.as_object()) {
         // Handle Claude/Gemini/Copilot format (has input_tokens)
@@ -482,6 +590,54 @@ fn merge_usage_values(existing: &mut Value, new: &Value) {
     }
 }
 
+/// Sums two normalized [`TokenCounts`] field by field.
+fn add_token_counts(a: &TokenCounts, b: &TokenCounts) -> TokenCounts {
+    TokenCounts {
+        input_tokens: a.input_tokens + b.input_tokens,
+        output_tokens: a.output_tokens + b.output_tokens,
+        reasoning_tokens: a.reasoning_tokens + b.reasoning_tokens,
+        cache_read: a.cache_read + b.cache_read,
+        cache_creation: a.cache_creation + b.cache_creation,
+        cache_creation_5m: a.cache_creation_5m + b.cache_creation_5m,
+        cache_creation_1h: a.cache_creation_1h + b.cache_creation_1h,
+        web_search_requests: a.web_search_requests + b.web_search_requests,
+        total: a.total + b.total,
+    }
+}
+
+/// Serializes normalized counts back into the flat usage shape.
+///
+/// The key set is exactly what [`extract_token_counts`] reads for a flat value,
+/// so the result round-trips: re-extracting it yields the same counts. `total`
+/// is intentionally omitted (the extractor recomputes it as the bucket sum).
+fn token_counts_to_flat_value(c: &TokenCounts) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("input_tokens".into(), json!(c.input_tokens));
+    obj.insert("output_tokens".into(), json!(c.output_tokens));
+    obj.insert("reasoning_output_tokens".into(), json!(c.reasoning_tokens));
+    obj.insert("cache_read_input_tokens".into(), json!(c.cache_read));
+    obj.insert(
+        "cache_creation_input_tokens".into(),
+        json!(c.cache_creation),
+    );
+    if c.cache_creation_5m != 0 || c.cache_creation_1h != 0 {
+        obj.insert(
+            "cache_creation".into(),
+            json!({
+                "ephemeral_5m_input_tokens": c.cache_creation_5m,
+                "ephemeral_1h_input_tokens": c.cache_creation_1h,
+            }),
+        );
+    }
+    if c.web_search_requests != 0 {
+        obj.insert(
+            "server_tool_use".into(),
+            json!({ "web_search_requests": c.web_search_requests }),
+        );
+    }
+    Value::Object(obj)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,7 +669,12 @@ mod tests {
         clear_pricing_cache();
         let map = map_with_gpt4();
         // Exact LiteLLM price exists -> compute from tokens, ignore stored cost.
-        let (cost, matched) = resolve_model_cost("gpt-4", &counts(1_000_000), &map, Some(99.0));
+        let (cost, matched) = resolve_model_cost(
+            "gpt-4",
+            &counts(1_000_000),
+            &map,
+            CostSource::OpenCodeStored(99.0),
+        );
         assert!((cost - 10.0).abs() < 1e-6); // 1e6 * 1e-5
         assert!(matched.is_none());
     }
@@ -523,9 +684,29 @@ mod tests {
         clear_pricing_cache();
         let map = map_with_gpt4();
         // No exact price; OpenCode must NOT fuzzy match -> use stored cost.
-        let (cost, matched) =
-            resolve_model_cost("deepseek-v4-pro", &counts(1_000_000), &map, Some(99.0));
+        let (cost, matched) = resolve_model_cost(
+            "deepseek-v4-pro",
+            &counts(1_000_000),
+            &map,
+            CostSource::OpenCodeStored(99.0),
+        );
         assert!((cost - 99.0).abs() < 1e-9);
+        assert!(matched.is_none());
+    }
+
+    #[test]
+    fn test_cursor_stored_cost_ignores_exact_match() {
+        clear_pricing_cache();
+        let map = map_with_gpt4();
+        // Cursor's dashboard cost is authoritative even when an exact LiteLLM
+        // price exists -> use the stored cost, never re-price from tokens.
+        let (cost, matched) = resolve_model_cost(
+            "gpt-4",
+            &counts(1_000_000),
+            &map,
+            CostSource::CursorStored(3.5),
+        );
+        assert!((cost - 3.5).abs() < 1e-9);
         assert!(matched.is_none());
     }
 
@@ -533,9 +714,52 @@ mod tests {
     fn test_non_opencode_keeps_existing_lookup() {
         clear_pricing_cache();
         let map = map_with_gpt4();
-        // Non-OpenCode path is unchanged: exact match still computes.
-        let (cost, matched) = resolve_model_cost("gpt-4", &counts(1_000_000), &map, None);
+        // Litellm path is unchanged: exact match still computes.
+        let (cost, matched) =
+            resolve_model_cost("gpt-4", &counts(1_000_000), &map, CostSource::Litellm);
         assert!((cost - 10.0).abs() < 1e-6);
         assert!(matched.is_none());
+    }
+
+    #[test]
+    fn merge_preserves_tokens_across_mixed_shapes() {
+        use crate::utils::extract_token_counts;
+
+        // A Codex `total_token_usage` value (input 1000 includes 200 cached).
+        let codex = json!({
+            "total_token_usage": {
+                "input_tokens": 1000,
+                "cached_input_tokens": 200,
+                "output_tokens": 500,
+                "total_tokens": 1500
+            }
+        });
+        // A Cursor / flat value for the same model name.
+        let flat = json!({
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_read_input_tokens": 50,
+            "cache_creation_input_tokens": 10
+        });
+
+        // Codex disjoint counts: input 800, cache_read 200, output 500, total 1500.
+        // Flat counts: input 100, output 20, cache_read 50, cache_creation 10.
+        let expect = |c: TokenCounts| {
+            assert_eq!(c.input_tokens, 800 + 100);
+            assert_eq!(c.output_tokens, 500 + 20);
+            assert_eq!(c.cache_read, 200 + 50);
+            assert_eq!(c.cache_creation, 10);
+            // Bucket sum: 1500 (Codex) + 180 (flat) = 1680; no tokens dropped.
+            assert_eq!(c.total, 1680);
+        };
+
+        // Merging is order-independent: neither side's tokens are dropped.
+        let mut existing = codex.clone();
+        merge_usage_values(&mut existing, &flat);
+        expect(extract_token_counts(&existing));
+
+        let mut existing = flat.clone();
+        merge_usage_values(&mut existing, &codex);
+        expect(extract_token_counts(&existing));
     }
 }

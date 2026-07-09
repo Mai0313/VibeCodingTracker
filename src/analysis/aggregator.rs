@@ -2,8 +2,8 @@ use crate::cli::TimeRange;
 use crate::constants::{FastHashMap, capacity};
 use crate::models::{CodeAnalysis, ExtensionType, ProviderActiveDays};
 use crate::session::parser::parse_session_file_as;
-use crate::session::read_opencode_analysis;
 use crate::session::state::ParseMode;
+use crate::session::{read_cursor_analysis, read_opencode_analysis};
 use crate::utils::{
     COPILOT_SESSION_MAX_DEPTH, collect_files_with_max_depth, is_claude_session_file,
     is_codex_session_file, is_copilot_session_file, is_gemini_session_file,
@@ -78,6 +78,8 @@ pub struct PerProviderAnalysisRows {
     pub gemini: Vec<AggregatedAnalysisRow>,
     /// Rows from the OpenCode database.
     pub opencode: Vec<AggregatedAnalysisRow>,
+    /// Rows from the Cursor chat stores.
+    pub cursor: Vec<AggregatedAnalysisRow>,
 }
 
 /// Aggregate file-operation metrics across every provider's session files,
@@ -125,12 +127,15 @@ pub fn aggregate_sessions_by_model(time_range: TimeRange) -> Result<AnalysisData
 
     let mut opencode_aggregated: FastHashMap<String, AggregatedAnalysisRow> =
         FastHashMap::with_capacity(capacity::MODELS_PER_SESSION);
+    let mut cursor_aggregated: FastHashMap<String, AggregatedAnalysisRow> =
+        FastHashMap::with_capacity(capacity::MODELS_PER_SESSION);
 
     let mut claude_dates: HashSet<String> = HashSet::new();
     let mut codex_dates: HashSet<String> = HashSet::new();
     let mut copilot_dates: HashSet<String> = HashSet::new();
     let mut gemini_dates: HashSet<String> = HashSet::new();
     let mut opencode_dates: HashSet<String> = HashSet::new();
+    let mut cursor_dates: HashSet<String> = HashSet::new();
 
     if paths.claude_session_dir.exists() {
         // Walks the projects tree recursively, so top-level `<session>.jsonl` logs
@@ -205,12 +210,28 @@ pub fn aggregate_sessions_by_model(time_range: TimeRange) -> Result<AnalysisData
         );
     }
 
+    // Cursor's per-conversation chat stores live under `~/.cursor/chats`, read
+    // directly like OpenCode rather than walked as a session directory.
+    if paths.cursor_chats_dir.exists()
+        && let Err(err) = aggregate_cursor_sessions(
+            &paths.cursor_chats_dir,
+            &paths.cursor_tracking_db,
+            &mut aggregated,
+            &mut cursor_aggregated,
+            &mut cursor_dates,
+            time_range,
+        )
+    {
+        eprintln!("Warning: Failed to read Cursor stores: {err}");
+    }
+
     let mut all_dates: HashSet<&String> = HashSet::new();
     all_dates.extend(claude_dates.iter());
     all_dates.extend(codex_dates.iter());
     all_dates.extend(copilot_dates.iter());
     all_dates.extend(gemini_dates.iter());
     all_dates.extend(opencode_dates.iter());
+    all_dates.extend(cursor_dates.iter());
 
     let provider_days = ProviderActiveDays {
         claude: claude_dates.len(),
@@ -218,6 +239,7 @@ pub fn aggregate_sessions_by_model(time_range: TimeRange) -> Result<AnalysisData
         copilot: copilot_dates.len(),
         gemini: gemini_dates.len(),
         opencode: opencode_dates.len(),
+        cursor: cursor_dates.len(),
         total: all_dates.len(),
     };
 
@@ -230,6 +252,7 @@ pub fn aggregate_sessions_by_model(time_range: TimeRange) -> Result<AnalysisData
         copilot: into_sorted_rows(copilot_aggregated),
         gemini: into_sorted_rows(gemini_aggregated),
         opencode: into_sorted_rows(opencode_aggregated),
+        cursor: into_sorted_rows(cursor_aggregated),
     };
 
     Ok(AnalysisData {
@@ -334,6 +357,36 @@ fn aggregate_opencode_sessions(
     time_range: TimeRange,
 ) -> Result<()> {
     let sessions = read_opencode_analysis(db_path, time_range, ParseMode::UsageOnly)?;
+
+    for (date, analysis) in sessions {
+        unique_dates.insert(date);
+        aggregate_analysis_result(aggregated, &analysis);
+        aggregate_analysis_result(provider_aggregated, &analysis);
+    }
+
+    Ok(())
+}
+
+/// Aggregates Cursor's chat-store tool metrics into both the cross-provider and
+/// Cursor-scoped maps.
+///
+/// Mirrors [`aggregate_opencode_sessions`] but sources sessions from the Cursor
+/// chat stores (via [`read_cursor_analysis`]), keyed by the assistant turn's
+/// local date.
+///
+/// # Errors
+///
+/// Returns an error only if the reader itself fails; individual unreadable
+/// stores are skipped inside [`read_cursor_analysis`].
+fn aggregate_cursor_sessions(
+    chats_dir: &Path,
+    tracking_db: &Path,
+    aggregated: &mut FastHashMap<String, AggregatedAnalysisRow>,
+    provider_aggregated: &mut FastHashMap<String, AggregatedAnalysisRow>,
+    unique_dates: &mut HashSet<String>,
+    time_range: TimeRange,
+) -> Result<()> {
+    let sessions = read_cursor_analysis(chats_dir, tracking_db, time_range, ParseMode::UsageOnly)?;
 
     for (date, analysis) in sessions {
         unique_dates.insert(date);

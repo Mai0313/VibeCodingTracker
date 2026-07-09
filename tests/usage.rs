@@ -2,23 +2,72 @@
 //
 // These tests verify the usage calculation and aggregation logic
 
+use serial_test::serial;
+use std::ffi::OsString;
 use vibe_coding_tracker::cli::TimeRange;
 use vibe_coding_tracker::usage::calculator::get_usage_from_directories;
 
+/// Redirects `HOME` (and clears the XDG overrides) to an empty temp dir for the
+/// guard's lifetime, restoring the previous env on drop.
+///
+/// `get_usage_from_directories` resolves every provider path off these vars, so
+/// pointing them at an empty dir means the aggregation reads no real session
+/// data — and, importantly, the Cursor branch never reaches its dashboard API
+/// (no `~/.cursor/chats`, no `auth.json`), so tests stay offline, deterministic,
+/// and never touch the user's credentials or `~/.vct` cache. Callers must be
+/// `#[serial]` because it mutates process-global environment.
+struct IsolatedHome {
+    _tmp: tempfile::TempDir,
+    prev: Vec<(&'static str, Option<OsString>)>,
+}
+
+impl IsolatedHome {
+    fn new() -> Self {
+        let tmp = tempfile::tempdir().unwrap();
+        let keys = ["HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME"];
+        let prev = keys.iter().map(|&k| (k, std::env::var_os(k))).collect();
+        // SAFETY: callers guard with `#[serial]`; env is restored on drop.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::remove_var("XDG_CONFIG_HOME");
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+        Self { _tmp: tmp, prev }
+    }
+}
+
+impl Drop for IsolatedHome {
+    fn drop(&mut self) {
+        for (k, v) in &self.prev {
+            // SAFETY: callers guard with `#[serial]`.
+            unsafe {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+}
+
 #[test]
+#[serial]
 fn test_get_usage_from_empty_directories() {
-    // Test that get_usage_from_directories works
-    // This will use default directories which may or may not have data
+    // Isolate HOME so aggregation reads no real data and stays offline.
+    let _home = IsolatedHome::new();
+
     let result = get_usage_from_directories(TimeRange::All);
     assert!(result.is_ok(), "Should handle directories");
 
-    // Result may be empty or contain data depending on the system
+    // With an empty home there is no provider data to aggregate.
     let _usage = result.unwrap();
 }
 
 #[test]
+#[serial]
 fn test_get_usage_from_directories_structure() {
-    // Test with default directories
+    let _home = IsolatedHome::new();
+
     let result = get_usage_from_directories(TimeRange::All);
 
     if let Ok(usage) = result {
