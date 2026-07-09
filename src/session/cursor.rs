@@ -731,7 +731,7 @@ fn apply_assistant_tools(
             "StrReplace" => {
                 state.add_edit_detail(arg("path"), arg("old_string"), arg("new_string"), ts)
             }
-            "Read" => {
+            "Read" | "ReadFile" => {
                 let path = arg("path");
                 let content = c
                     .get("toolCallId")
@@ -776,7 +776,10 @@ fn collect_read_results(blobs: &[Vec<u8>]) -> HashMap<String, String> {
             if c.get("type").and_then(|v| v.as_str()) != Some("tool-result") {
                 continue;
             }
-            if c.get("toolName").and_then(|v| v.as_str()) != Some("Read") {
+            if !matches!(
+                c.get("toolName").and_then(|v| v.as_str()),
+                Some("Read" | "ReadFile")
+            ) {
                 continue;
             }
             let (Some(id), Some(result)) = (
@@ -1214,20 +1217,25 @@ mod tests {
                  "args": {"path": "/repo/z.rs"}},
                 {"type": "tool-call", "toolName": "Grep", "toolCallId": "f",
                  "args": {"pattern": "foo"}},
+                // Cursor also emits the read tool as `ReadFile` in some versions.
+                {"type": "tool-call", "toolName": "ReadFile", "toolCallId": "g",
+                 "args": {"path": "/repo/w.rs"}},
             ]
         });
         let mut reads = HashMap::new();
         reads.insert("e".to_string(), "r1\nr2\nr3".to_string());
+        reads.insert("g".to_string(), "w1\nw2".to_string());
         apply_assistant_tools(&mut state, &msg, &reads, 42);
 
         assert_eq!(state.tool_counts.write, 1);
         assert_eq!(state.tool_counts.edit, 1);
         assert_eq!(state.tool_counts.bash, 1);
         assert_eq!(state.tool_counts.todo_write, 1);
-        assert_eq!(state.tool_counts.read, 1);
+        // Read + ReadFile both count as reads.
+        assert_eq!(state.tool_counts.read, 2);
         assert_eq!(state.total_write_lines, 2);
         assert_eq!(state.total_edit_lines, 2);
-        assert_eq!(state.total_read_lines, 3);
+        assert_eq!(state.total_read_lines, 5);
     }
 
     #[test]
