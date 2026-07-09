@@ -29,7 +29,7 @@ use vibe_coding_tracker::display::usage::{
     display_usage_interactive, display_usage_table, display_usage_text,
 };
 use vibe_coding_tracker::pricing::{ModelPricingMap, fetch_model_pricing};
-use vibe_coding_tracker::usage::{get_usage_from_directories, resolve_model_cost};
+use vibe_coding_tracker::usage::{CostSource, get_usage_from_directories, resolve_model_cost};
 use vibe_coding_tracker::utils::extract_token_counts;
 use vibe_coding_tracker::{get_version_info, parse_session_file};
 
@@ -261,7 +261,7 @@ fn build_enriched_json(
 
     for (model, usage) in usage_data.models.iter() {
         let (cost, matched_model) = resolve_enriched_model_cost(model, usage_data, pricing_map)
-            .unwrap_or_else(|| price_usage_value(model, usage, pricing_map, None));
+            .unwrap_or_else(|| price_usage_value(model, usage, pricing_map, CostSource::Litellm));
 
         let mut entry = json!({
             "model": model,
@@ -297,7 +297,8 @@ fn resolve_enriched_model_cost(
     ] {
         if let Some(raw_usage) = usage.get(model) {
             found = true;
-            let (cost, matched) = price_usage_value(model, raw_usage, pricing_map, None);
+            let (cost, matched) =
+                price_usage_value(model, raw_usage, pricing_map, CostSource::Litellm);
             total_cost += cost;
             if matched_model.is_none() {
                 matched_model = matched;
@@ -305,16 +306,22 @@ fn resolve_enriched_model_cost(
         }
     }
 
-    // OpenCode and Cursor both price via the stored-cost path.
-    for usage in [
-        &usage_data.per_provider.opencode,
-        &usage_data.per_provider.cursor,
+    // OpenCode and Cursor both carry stored costs, but OpenCode prefers an exact
+    // LiteLLM match while Cursor uses its dashboard cost verbatim.
+    let stored = || usage_data.stored_costs.get(model).copied().unwrap_or(0.0);
+    for (usage, source) in [
+        (
+            &usage_data.per_provider.opencode,
+            CostSource::OpenCodeStored(stored()),
+        ),
+        (
+            &usage_data.per_provider.cursor,
+            CostSource::CursorStored(stored()),
+        ),
     ] {
         if let Some(raw_usage) = usage.get(model) {
             found = true;
-            let stored_cost = usage_data.stored_costs.get(model).copied().unwrap_or(0.0);
-            let (cost, matched) =
-                price_usage_value(model, raw_usage, pricing_map, Some(stored_cost));
+            let (cost, matched) = price_usage_value(model, raw_usage, pricing_map, source);
             total_cost += cost;
             if matched_model.is_none() {
                 matched_model = matched;
@@ -325,15 +332,15 @@ fn resolve_enriched_model_cost(
     found.then_some((total_cost, matched_model))
 }
 
-/// Prices one raw usage value.
+/// Prices one raw usage value under `source`.
 fn price_usage_value(
     model: &str,
     usage: &Value,
     pricing_map: &ModelPricingMap,
-    opencode_cost: Option<f64>,
+    source: CostSource,
 ) -> (f64, Option<String>) {
     let counts = extract_token_counts(usage);
-    resolve_model_cost(model, &counts, pricing_map, opencode_cost)
+    resolve_model_cost(model, &counts, pricing_map, source)
 }
 
 #[cfg(test)]
