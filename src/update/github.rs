@@ -45,13 +45,28 @@ pub struct GitHubAsset {
 /// if GitHub responds with a non-success status, or if the response body is
 /// not the expected release JSON.
 pub fn fetch_latest_release() -> Result<GitHubRelease> {
+    fetch_latest_release_from(GITHUB_API_RELEASES_URL)
+}
+
+/// Fetches the latest release from an explicit endpoint URL.
+///
+/// The injectable counterpart of [`fetch_latest_release`]: production passes the
+/// real GitHub endpoint, tests point `url` at a local mock server so no real API
+/// is reached.
+///
+/// # Errors
+///
+/// Returns an error if the HTTP client cannot be built, if the request fails,
+/// if the server responds with a non-success status, or if the response body is
+/// not the expected release JSON.
+pub fn fetch_latest_release_from(url: &str) -> Result<GitHubRelease> {
     let client = reqwest::blocking::Client::builder()
         .user_agent(USER_AGENT)
         .build()
         .context("Failed to create HTTP client")?;
 
     let response = client
-        .get(GITHUB_API_RELEASES_URL)
+        .get(url)
         .send()
         .context("Failed to fetch release information from GitHub")?;
 
@@ -96,4 +111,75 @@ pub fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
         .context("Failed to write downloaded content to file")?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use httpmock::prelude::*;
+    use serde_json::json;
+
+    #[test]
+    fn fetch_latest_release_parses_mock_response() {
+        let server = MockServer::start();
+        let endpoint = server.mock(|when, then| {
+            when.method(GET).path("/releases/latest");
+            then.status(200).json_body(json!({
+                "tag_name": "v1.2.3",
+                "name": "Release 1.2.3",
+                "body": "notes",
+                "assets": [
+                    {
+                        "name": "vct-linux-x64.tar.gz",
+                        "browser_download_url": "https://example.test/vct-linux-x64.tar.gz",
+                        "size": 42
+                    }
+                ]
+            }));
+        });
+
+        let release = fetch_latest_release_from(&server.url("/releases/latest"))
+            .expect("should parse the release JSON");
+        endpoint.assert();
+        assert_eq!(release.tag_name, "v1.2.3");
+        assert_eq!(release.assets.len(), 1);
+        assert_eq!(release.assets[0].name, "vct-linux-x64.tar.gz");
+        assert_eq!(release.assets[0].size, 42);
+    }
+
+    #[test]
+    fn fetch_latest_release_errors_on_non_success() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/releases/latest");
+            then.status(404);
+        });
+        assert!(fetch_latest_release_from(&server.url("/releases/latest")).is_err());
+    }
+
+    #[test]
+    fn download_file_streams_body_to_disk() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/asset.bin");
+            then.status(200).body("binary-contents");
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("asset.bin");
+
+        download_file(&server.url("/asset.bin"), &dest).expect("download should succeed");
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "binary-contents");
+    }
+
+    #[test]
+    fn download_file_errors_on_non_success() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/missing.bin");
+            then.status(500);
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("missing.bin");
+        assert!(download_file(&server.url("/missing.bin"), &dest).is_err());
+    }
 }

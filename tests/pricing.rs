@@ -1,62 +1,90 @@
 // Integration tests for pricing system functionality
 //
-// These tests verify pricing fetch, cache, and calculation logic
+// The fetch/cache path is exercised against a local httpmock server pointed at
+// a temp cache dir, so no real LiteLLM request is ever made and the real
+// `~/.vct` is never touched. The rest are pure lookup / cost-math tests.
 
+use httpmock::prelude::*;
+use serde_json::json;
 use std::collections::HashMap;
+use tempfile::TempDir;
 use vibe_coding_tracker::pricing::{
     ModelPricing, ModelPricingMap, ThresholdTier, TierRange, calculate_cost, clear_pricing_cache,
-    fetch_model_pricing,
+    fetch_model_pricing_with,
 };
+use vibe_coding_tracker::utils::{get_current_date, get_pricing_cache_path_in};
 
 #[test]
-fn test_fetch_model_pricing_basic() {
-    // Test that fetching pricing data works
-    // This is a network test, so it might fail if offline
-    let result = fetch_model_pricing();
+fn fetch_pricing_from_mock_parses_and_caches() {
+    clear_pricing_cache();
+    let server = MockServer::start();
+    let endpoint = server.mock(|when, then| {
+        when.method(GET).path("/pricing");
+        then.status(200).json_body(json!({
+            "claude-sonnet-4-6": {
+                "input_cost_per_token": 3e-6,
+                "output_cost_per_token": 1.5e-5,
+                "input_cost_per_token_above_200k_tokens": 6e-6,
+                "max_input_tokens": 200000,
+                "litellm_provider": "anthropic"
+            },
+            "gpt-5": { "input_cost_per_token": 1e-6, "output_cost_per_token": 2e-6 }
+        }));
+    });
+    let cache_dir = TempDir::new().unwrap();
 
-    if let Ok(pricing_map) = result {
-        // Verify some common models exist
-        let claude_result = pricing_map.get("claude-3-opus");
-        assert!(
-            claude_result.pricing.input_cost_per_token >= 0.0,
-            "Claude pricing should be non-negative"
-        );
+    let map = fetch_model_pricing_with(&server.url("/pricing"), cache_dir.path())
+        .expect("fetch pricing from mock server");
 
-        let gpt4_result = pricing_map.get("gpt-4");
-        assert!(
-            gpt4_result.pricing.input_cost_per_token >= 0.0,
-            "GPT-4 pricing should be non-negative"
-        );
-    } else {
-        eprintln!("Skipping online pricing test: network error");
-    }
+    endpoint.assert(); // the mock endpoint was reached
+
+    let sonnet = map.get("claude-sonnet-4-6");
+    assert_eq!(sonnet.pricing.input_cost_per_token, 3e-6);
+    // The raw `*_above_200k_tokens` key must be rebuilt into a threshold tier.
+    assert_eq!(sonnet.pricing.tiers.len(), 1);
+    assert_eq!(sonnet.pricing.tiers[0].threshold_tokens, 200_000);
+    assert_eq!(map.get("gpt-5").pricing.input_cost_per_token, 1e-6);
+
+    // The cache lands in the temp dir — never the real `~/.vct`.
+    let cache_file = get_pricing_cache_path_in(cache_dir.path(), &get_current_date());
+    assert!(
+        cache_file.exists(),
+        "pricing cache should be written to the temp cache dir"
+    );
 }
 
 #[test]
-fn test_pricing_cache_functionality() {
-    // Clear cache before test
+fn fetch_pricing_prefers_cache_over_network() {
     clear_pricing_cache();
+    let server = MockServer::start();
+    // If today's cache is honored, this endpoint is never hit; it 500s so a
+    // regression that reached the network would fail loudly instead of silently.
+    let endpoint = server.mock(|when, then| {
+        when.method(GET).path("/pricing");
+        then.status(500);
+    });
+    let cache_dir = TempDir::new().unwrap();
 
-    // First fetch (should hit network or disk cache)
-    let result1 = fetch_model_pricing();
+    // Pre-seed today's cache with a cost-fields JSON (current, non-legacy schema).
+    let cache_file = get_pricing_cache_path_in(cache_dir.path(), &get_current_date());
+    std::fs::write(
+        &cache_file,
+        serde_json::to_string(&json!({
+            "cached-model": { "input_cost_per_token": 9e-6 }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 
-    if result1.is_ok() {
-        // Second fetch (should use cache)
-        let result2 = fetch_model_pricing();
-        assert!(result2.is_ok(), "Cached fetch should succeed");
+    let map = fetch_model_pricing_with(&server.url("/pricing"), cache_dir.path())
+        .expect("cache hit should succeed without a request");
 
-        // Results should be equivalent
-        if let (Ok(p1), Ok(p2)) = (result1, result2) {
-            let model = "claude-3-opus";
-            let price1 = p1.get(model);
-            let price2 = p2.get(model);
-
-            assert_eq!(
-                price1.pricing.input_cost_per_token, price2.pricing.input_cost_per_token,
-                "Cached pricing should match original"
-            );
-        }
-    }
+    assert_eq!(
+        endpoint.calls(),
+        0,
+        "a valid today-cache must short-circuit before any network request"
+    );
+    assert_eq!(map.get("cached-model").pricing.input_cost_per_token, 9e-6);
 }
 
 #[test]
@@ -344,23 +372,6 @@ fn test_pricing_with_special_characters() {
 
     let result = pricing_map.get("model-with-special_chars.123");
     assert_eq!(result.pricing.input_cost_per_token, 0.000001);
-}
-
-#[test]
-fn test_pricing_cache_expiration() {
-    // Test that cache expires after 24 hours (implicitly tested by date-based cache)
-    // This is difficult to test directly without mocking time
-    // Just verify that cache operations work
-
-    clear_pricing_cache();
-    let _ = fetch_model_pricing();
-
-    // Should use cache on second call
-    let result = fetch_model_pricing();
-    assert!(
-        result.is_ok() || result.is_err(),
-        "Cache operations should not panic"
-    );
 }
 
 #[test]

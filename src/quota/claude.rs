@@ -66,13 +66,11 @@ fn claude_ua() -> &'static str {
     .as_str()
 }
 
-/// The token endpoints to try, in order (overridable for testing / drift).
-fn claude_token_urls() -> Vec<String> {
-    if let Ok(u) = std::env::var("VCT_CLAUDE_TOKEN_URL")
-        && !u.is_empty()
-    {
-        return vec![u];
-    }
+/// The production token endpoints to try, in order (primary then legacy).
+///
+/// Tests inject their own list via the `token_urls` parameter of
+/// [`refresh_claude`] rather than mutating the environment.
+fn claude_token_urls_default() -> Vec<String> {
     vec![
         CLAUDE_TOKEN_URL_PRIMARY.to_string(),
         CLAUDE_TOKEN_URL_LEGACY.to_string(),
@@ -97,8 +95,20 @@ fn read_claude_oauth(path: &Path) -> Option<ClaudeOauth> {
 /// Returns an error if the credentials file is missing, has no access token, or
 /// the request cannot be sent.
 pub(crate) fn fetch_claude_raw(client: &Client) -> Result<(u16, String)> {
-    let path = get_claude_credentials_path()?;
-    let token = read_claude_oauth(&path)
+    fetch_claude_raw_from(client, CLAUDE_USAGE_URL, &get_claude_credentials_path()?)
+}
+
+/// The injectable core of [`fetch_claude_raw`]: reads the token from an explicit
+/// credentials path and fetches the raw usage body from an explicit `usage_url`.
+/// Production passes [`CLAUDE_USAGE_URL`] + `~/.claude/.credentials.json`; tests
+/// point them at a local mock server and a temp credentials file.
+pub(crate) fn fetch_claude_raw_from(
+    client: &Client,
+    usage_url: &str,
+    creds_path: &Path,
+) -> Result<(u16, String)> {
+    let path = creds_path;
+    let token = read_claude_oauth(path)
         .and_then(|o| o.access_token)
         .filter(|t| !t.is_empty())
         .with_context(|| {
@@ -108,7 +118,7 @@ pub(crate) fn fetch_claude_raw(client: &Client) -> Result<(u16, String)> {
             )
         })?;
     let resp = client
-        .get(CLAUDE_USAGE_URL)
+        .get(usage_url)
         .header(reqwest::header::USER_AGENT, claude_ua())
         .header("x-app", CLAUDE_APP)
         .header("anthropic-version", CLAUDE_ANTHROPIC_VERSION)
@@ -229,10 +239,10 @@ enum FetchResult {
     Transient,
 }
 
-/// Calls the usage API with `token`.
-fn fetch_claude_usage(client: &Client, token: &str, now: i64) -> FetchResult {
+/// Calls the usage API at `usage_url` with `token`.
+fn fetch_claude_usage(client: &Client, token: &str, now: i64, usage_url: &str) -> FetchResult {
     let resp = match client
-        .get(CLAUDE_USAGE_URL)
+        .get(usage_url)
         .header(reqwest::header::USER_AGENT, claude_ua())
         .header("x-app", CLAUDE_APP)
         .header("anthropic-version", CLAUDE_ANTHROPIC_VERSION)
@@ -272,6 +282,7 @@ fn refresh_claude(
     refresh_token: &str,
     scopes: &[String],
     expected_mtime: Option<SystemTime>,
+    token_urls: &[String],
 ) -> Result<(String, i64)> {
     let mut body = json!({
         "grant_type": "refresh_token",
@@ -285,7 +296,7 @@ fn refresh_claude(
         body["scope"] = json!(scopes.join(" "));
     }
 
-    let urls = claude_token_urls();
+    let urls = token_urls;
     let mut parsed: Option<ClaudeRefreshResponse> = None;
     let mut last_err: Option<anyhow::Error> = None;
     for (i, url) in urls.iter().enumerate() {
@@ -397,7 +408,7 @@ impl ClaudeState {
             EnsureToken::Transient => return QuotaOutcome::Transient,
         };
 
-        match fetch_claude_usage(client, &token, now_secs) {
+        match fetch_claude_usage(client, &token, now_secs, CLAUDE_USAGE_URL) {
             FetchResult::Ok(mut snap) => {
                 self.cooldown.clear();
                 snap.plan_type = read_claude_plan(&path);
@@ -410,7 +421,7 @@ impl ClaudeState {
                     return QuotaOutcome::NeedsLogin;
                 }
                 match self.force_refresh(client, &path) {
-                    Some(t) => match fetch_claude_usage(client, &t, now_secs) {
+                    Some(t) => match fetch_claude_usage(client, &t, now_secs, CLAUDE_USAGE_URL) {
                         FetchResult::Ok(mut snap) => {
                             self.cooldown.clear();
                             snap.plan_type = read_claude_plan(&path);
@@ -499,7 +510,14 @@ impl ClaudeState {
         let expected_mtime = file_mtime(path);
         let oauth = read_claude_oauth(path)?;
         let refresh_token = oauth.refresh_token.filter(|s| !s.is_empty())?;
-        match refresh_claude(client, path, &refresh_token, &oauth.scopes, expected_mtime) {
+        match refresh_claude(
+            client,
+            path,
+            &refresh_token,
+            &oauth.scopes,
+            expected_mtime,
+            &claude_token_urls_default(),
+        ) {
             Ok((access, expires_ms)) => {
                 self.cooldown.clear();
                 self.token = Some((access.clone(), expires_ms, file_mtime(path)));
@@ -691,5 +709,101 @@ mod tests {
             map_claude_usage(r#"{"five_hour":{"utilization":5.0},"limits":null}"#, 1).unwrap();
         assert!(snap.five_hour.is_some());
         assert!(snap.scoped_weekly.is_none());
+    }
+
+    // ---- HTTP-layer tests against a local mock server (no real API) ----
+
+    use crate::quota::http::build_client;
+    use httpmock::prelude::*;
+
+    #[test]
+    fn fetch_claude_usage_maps_200_body() {
+        let server = MockServer::start();
+        let endpoint = server.mock(|when, then| {
+            when.method(GET).path("/usage");
+            then.status(200).body(SAMPLE);
+        });
+        let client = build_client().unwrap();
+
+        let result = fetch_claude_usage(&client, "tok", 1_000_000, &server.url("/usage"));
+        endpoint.assert();
+        match result {
+            FetchResult::Ok(snap) => {
+                assert_eq!(snap.five_hour.as_ref().unwrap().used_percent, 5.0);
+                assert_eq!(snap.seven_day.as_ref().unwrap().used_percent, 34.0);
+            }
+            _ => panic!("expected FetchResult::Ok"),
+        }
+    }
+
+    #[test]
+    fn fetch_claude_usage_401_is_unauthorized() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/usage");
+            then.status(401);
+        });
+        let client = build_client().unwrap();
+        let result = fetch_claude_usage(&client, "tok", 0, &server.url("/usage"));
+        assert!(matches!(result, FetchResult::Unauthorized));
+    }
+
+    #[test]
+    fn refresh_claude_falls_back_primary_to_legacy_and_writes_back() {
+        let server = MockServer::start();
+        // Primary host answers 404 (moved) → the fetcher must try the legacy host.
+        let primary = server.mock(|when, then| {
+            when.method(POST).path("/primary");
+            then.status(404);
+        });
+        let legacy = server.mock(|when, then| {
+            when.method(POST).path("/legacy");
+            then.status(200).json_body(serde_json::json!({
+                "access_token": "fresh-access",
+                "refresh_token": "fresh-refresh",
+                "expires_in": 3600
+            }));
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".credentials.json");
+        std::fs::write(
+            &path,
+            r#"{"claudeAiOauth":{"accessToken":"old","refreshToken":"old-refresh","scopes":[]}}"#,
+        )
+        .unwrap();
+
+        let client = build_client().unwrap();
+        let urls = vec![server.url("/primary"), server.url("/legacy")];
+        let (access, expires_ms) =
+            refresh_claude(&client, &path, "old-refresh", &[], file_mtime(&path), &urls)
+                .expect("refresh should fall back to the legacy host");
+
+        primary.assert();
+        legacy.assert();
+        assert_eq!(access, "fresh-access");
+        assert!(expires_ms > 0);
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["claudeAiOauth"]["accessToken"], "fresh-access");
+        assert_eq!(written["claudeAiOauth"]["refreshToken"], "fresh-refresh");
+    }
+
+    #[test]
+    fn fetch_claude_raw_from_reads_creds_and_returns_status_body() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/usage");
+            then.status(200).body(SAMPLE);
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".credentials.json");
+        std::fs::write(&path, r#"{"claudeAiOauth":{"accessToken":"tok"}}"#).unwrap();
+
+        let client = build_client().unwrap();
+        let (status, body) =
+            fetch_claude_raw_from(&client, &server.url("/usage"), &path).expect("raw fetch");
+        assert_eq!(status, 200);
+        assert!(body.contains("five_hour"));
     }
 }

@@ -19,6 +19,7 @@ use crate::utils::get_cursor_auth_path;
 use anyhow::{Context, Result};
 use base64::Engine;
 use reqwest::blocking::Client;
+use std::path::Path;
 use std::sync::OnceLock;
 
 /// The Cursor usage-summary endpoint.
@@ -166,10 +167,10 @@ enum FetchResult {
     Transient,
 }
 
-/// Calls the Cursor usage API with the synthesized session cookie.
-fn fetch_cursor_usage(client: &Client, cookie: &str, now: i64) -> FetchResult {
+/// Calls the Cursor usage API at `usage_url` with the synthesized session cookie.
+fn fetch_cursor_usage(client: &Client, cookie: &str, now: i64, usage_url: &str) -> FetchResult {
     let resp = match client
-        .get(CURSOR_USAGE_URL)
+        .get(usage_url)
         .header(reqwest::header::COOKIE, cookie)
         .header(reqwest::header::ACCEPT, "application/json")
         .header(reqwest::header::USER_AGENT, cursor_ua())
@@ -206,8 +207,20 @@ fn fetch_cursor_usage(client: &Client, cookie: &str, now: i64) -> FetchResult {
 /// Returns an error if `auth.json` is missing, has no usable session, or the
 /// request cannot be sent.
 pub(crate) fn fetch_cursor_raw(client: &Client) -> Result<(u16, String)> {
-    let path = get_cursor_auth_path()?;
-    let body = std::fs::read_to_string(&path).with_context(|| {
+    fetch_cursor_raw_from(client, CURSOR_USAGE_URL, &get_cursor_auth_path()?)
+}
+
+/// The injectable core of [`fetch_cursor_raw`]: reads the session from an
+/// explicit `auth.json` path and fetches the raw usage body from an explicit
+/// `usage_url`. Production passes [`CURSOR_USAGE_URL`] + `~/.config/cursor/auth.json`;
+/// tests point them at a local mock server and a temp auth file.
+pub(crate) fn fetch_cursor_raw_from(
+    client: &Client,
+    usage_url: &str,
+    auth_path: &Path,
+) -> Result<(u16, String)> {
+    let path = auth_path;
+    let body = std::fs::read_to_string(path).with_context(|| {
         format!(
             "no Cursor credentials at {} ({CURSOR_LOGIN_HINT})",
             path.display()
@@ -220,7 +233,7 @@ pub(crate) fn fetch_cursor_raw(client: &Client) -> Result<(u16, String)> {
         )
     })?;
     let resp = client
-        .get(CURSOR_USAGE_URL)
+        .get(usage_url)
         .header(reqwest::header::COOKIE, session.cookie.as_str())
         .header(reqwest::header::ACCEPT, "application/json")
         .header(reqwest::header::USER_AGENT, cursor_ua())
@@ -261,7 +274,7 @@ impl CursorState {
         if session.exp > 0 && session.exp <= now {
             return QuotaOutcome::NeedsLogin;
         }
-        match fetch_cursor_usage(client, &session.cookie, now) {
+        match fetch_cursor_usage(client, &session.cookie, now, CURSOR_USAGE_URL) {
             FetchResult::Ok(snap) => QuotaOutcome::Data(snap),
             FetchResult::Unauthorized => QuotaOutcome::NeedsLogin,
             FetchResult::Transient => QuotaOutcome::Transient,
@@ -383,5 +396,56 @@ mod tests {
         assert!(snap.auto.is_none());
         assert!(snap.api.is_none());
         assert!(!snap.limit_reached);
+    }
+
+    // ---- HTTP-layer tests against a local mock server (no real API) ----
+
+    #[test]
+    fn fetch_cursor_usage_maps_200_and_401() {
+        use crate::quota::http::build_client;
+        use httpmock::prelude::*;
+
+        let server = MockServer::start();
+        let ok = server.mock(|when, then| {
+            when.method(GET).path("/ok");
+            then.status(200).body(SUMMARY);
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/forbidden");
+            then.status(403);
+        });
+        let client = build_client().unwrap();
+
+        match fetch_cursor_usage(&client, "cookie", 1_000_000, &server.url("/ok")) {
+            FetchResult::Ok(snap) => assert_eq!(snap.plan_type.as_deref(), Some("free")),
+            _ => panic!("expected Ok"),
+        }
+        ok.assert();
+        assert!(matches!(
+            fetch_cursor_usage(&client, "cookie", 0, &server.url("/forbidden")),
+            FetchResult::Unauthorized
+        ));
+    }
+
+    #[test]
+    fn fetch_cursor_raw_from_reads_session_and_returns_body() {
+        use crate::quota::http::build_client;
+        use httpmock::prelude::*;
+
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/usage");
+            then.status(200).body(SUMMARY);
+        });
+        let jwt = fake_jwt(&serde_json::json!({ "sub": "github|u1", "exp": 9_999_999_999i64 }));
+        let dir = tempfile::tempdir().unwrap();
+        let auth = dir.path().join("auth.json");
+        std::fs::write(&auth, format!(r#"{{ "accessToken": "{jwt}" }}"#)).unwrap();
+
+        let client = build_client().unwrap();
+        let (status, body) =
+            fetch_cursor_raw_from(&client, &server.url("/usage"), &auth).expect("raw fetch");
+        assert_eq!(status, 200);
+        assert!(body.contains("membershipType"));
     }
 }

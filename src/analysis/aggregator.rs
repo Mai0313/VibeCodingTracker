@@ -5,7 +5,7 @@ use crate::session::parser::parse_session_file_as;
 use crate::session::state::ParseMode;
 use crate::session::{read_cursor_analysis, read_opencode_analysis};
 use crate::utils::{
-    COPILOT_SESSION_MAX_DEPTH, collect_files_with_max_depth, is_claude_session_file,
+    COPILOT_SESSION_MAX_DEPTH, HelperPaths, collect_files_with_max_depth, is_claude_session_file,
     is_codex_session_file, is_copilot_session_file, is_gemini_session_file,
 };
 use anyhow::Result;
@@ -112,7 +112,26 @@ pub struct PerProviderAnalysisRows {
 /// # Ok::<(), anyhow::Error>(())
 /// ```
 pub fn aggregate_sessions_by_model(time_range: TimeRange) -> Result<AnalysisData> {
-    let paths = crate::utils::resolve_paths()?;
+    aggregate_sessions_by_model_from_paths(&crate::utils::resolve_paths()?, time_range)
+}
+
+/// Aggregates file-operation metrics from provider session directories rooted at
+/// an explicit [`HelperPaths`].
+///
+/// The env-free, injectable counterpart of [`aggregate_sessions_by_model`]:
+/// every provider path comes from `paths` rather than the resolved home
+/// directory, so tests can point them at a temp tree and exercise the real
+/// aggregation without mutating process-global `HOME`. See
+/// [`aggregate_sessions_by_model`] for the aggregation semantics.
+///
+/// # Errors
+///
+/// Returns an error only under the same conditions as
+/// [`aggregate_sessions_by_model`].
+pub fn aggregate_sessions_by_model_from_paths(
+    paths: &HelperPaths,
+    time_range: TimeRange,
+) -> Result<AnalysisData> {
     let mut aggregated: FastHashMap<String, AggregatedAnalysisRow> =
         FastHashMap::with_capacity(capacity::MODEL_COMBINATIONS);
 

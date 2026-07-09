@@ -34,12 +34,29 @@ const MAX_FILES: usize = 64;
 /// yields `Ok(None)`. An unreadable file (or a half-written tail line on a
 /// live session) is tolerated rather than aborting the scan.
 pub fn latest_session_rate_limits() -> Result<Option<CodexQuotaSnapshot>> {
-    let paths = resolve_paths()?;
-    if !paths.codex_session_dir.exists() {
+    latest_session_rate_limits_in(&resolve_paths()?.codex_session_dir)
+}
+
+/// Returns the newest Codex session `rate_limits` under an explicit sessions
+/// directory.
+///
+/// The env-free, injectable counterpart of [`latest_session_rate_limits`]: the
+/// directory is passed in rather than resolved from the home directory, so
+/// tests can point it at a temp tree of fixture rollouts without mutating
+/// process-global `HOME`.
+///
+/// # Errors
+///
+/// Never errors on a missing directory (`Ok(None)`); an unreadable file is
+/// tolerated rather than aborting the scan.
+pub fn latest_session_rate_limits_in(
+    codex_session_dir: &Path,
+) -> Result<Option<CodexQuotaSnapshot>> {
+    if !codex_session_dir.exists() {
         return Ok(None);
     }
     let now = chrono::Local::now().timestamp();
-    for file in newest_codex_files(&paths.codex_session_dir, MAX_FILES) {
+    for file in newest_codex_files(codex_session_dir, MAX_FILES) {
         let values = read_jsonl_lenient(&file);
         if let Some(snap) = extract_latest_rate_limits(&values, now) {
             return Ok(Some(snap));

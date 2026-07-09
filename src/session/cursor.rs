@@ -231,8 +231,17 @@ fn fetch_all_events() -> Result<Vec<CachedEvent>> {
     if crate::utils::network_disabled() {
         return Err(anyhow!("network disabled (VCT_OFFLINE)"));
     }
-    let auth_path = get_cursor_auth_path()?;
-    let body = std::fs::read_to_string(&auth_path)
+    fetch_all_events_from(CURSOR_EVENTS_URL, &get_cursor_auth_path()?)
+}
+
+/// The injectable core of [`fetch_all_events`]: posts to an explicit
+/// `events_url`, reading credentials from an explicit `auth_path`.
+///
+/// Production passes [`CURSOR_EVENTS_URL`] + `~/.config/cursor/auth.json`; tests
+/// point them at a local mock server and a temp auth file. Unlike the wrapper it
+/// does **not** consult `VCT_OFFLINE` — it is always given an explicit endpoint.
+fn fetch_all_events_from(events_url: &str, auth_path: &Path) -> Result<Vec<CachedEvent>> {
+    let body = std::fs::read_to_string(auth_path)
         .with_context(|| format!("no Cursor credentials at {}", auth_path.display()))?;
     let session = read_cursor_session(&body)
         .ok_or_else(|| anyhow!("no usable Cursor session in {}", auth_path.display()))?;
@@ -260,7 +269,7 @@ fn fetch_all_events() -> Result<Vec<CachedEvent>> {
             "pageSize": CURSOR_EVENTS_PAGE_SIZE,
         });
         let resp = client
-            .post(CURSOR_EVENTS_URL)
+            .post(events_url)
             .header(reqwest::header::COOKIE, session.cookie.as_str())
             .header(reqwest::header::ACCEPT, "application/json")
             .header(reqwest::header::USER_AGENT, cursor_ua())
@@ -1385,6 +1394,54 @@ mod tests {
         assert_eq!(
             turns,
             vec![(1_700_000_000_000, 42_000), (1_700_000_500_000, 88_000)]
+        );
+    }
+
+    /// The dashboard usage-events fetch, against a local mock server: it reads a
+    /// (temp) `auth.json`, POSTs to the injected URL, and aggregates the returned
+    /// events by `(date, model)`. No real Cursor API is reached.
+    #[test]
+    fn fetch_all_events_from_aggregates_events() {
+        use base64::Engine as _;
+        use httpmock::prelude::*;
+
+        let enc = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+        let payload = serde_json::json!({ "sub": "user|uid123", "exp": 4_000_000_000i64 });
+        let jwt = format!(
+            "{}.{}.{}",
+            enc(b"{}"),
+            enc(payload.to_string().as_bytes()),
+            enc(b"sig")
+        );
+
+        let server = MockServer::start();
+        let endpoint = server.mock(|when, then| {
+            when.method(POST).path("/events");
+            then.status(200).json_body(serde_json::json!({
+                "usageEventsDisplay": [
+                    { "timestamp": 1_700_000_000_000i64, "model": "claude-x",
+                      "tokenUsage": { "inputTokens": 100, "outputTokens": 50 } },
+                    { "timestamp": 1_700_000_000_000i64, "model": "gpt-y",
+                      "tokenUsage": { "inputTokens": 200 } }
+                ],
+                "totalUsageEventsCount": 2
+            }));
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let auth = dir.path().join("auth.json");
+        std::fs::write(&auth, serde_json::json!({ "accessToken": jwt }).to_string()).unwrap();
+
+        let events = fetch_all_events_from(&server.url("/events"), &auth).expect("fetch events");
+        endpoint.assert();
+
+        assert_eq!(events.len(), 2, "one aggregated row per (date, model)");
+        let claude = events.iter().find(|e| e.model == "claude-x").unwrap();
+        assert_eq!(claude.input, 100);
+        assert_eq!(claude.output, 50);
+        assert_eq!(
+            events.iter().find(|e| e.model == "gpt-y").unwrap().input,
+            200
         );
     }
 }

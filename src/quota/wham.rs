@@ -18,10 +18,10 @@ use serde_json::{Value, json};
 use std::path::Path;
 use std::sync::OnceLock;
 
-/// The ChatGPT backend usage endpoint.
-const WHAM_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
-/// The Codex OAuth token endpoint.
-const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+/// The ChatGPT backend usage endpoint (production default; injectable in tests).
+pub(crate) const WHAM_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+/// The Codex OAuth token endpoint (production default; injectable in tests).
+pub(crate) const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 /// The Codex OAuth client id (public PKCE client).
 const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 /// Fallback Codex CLI version for the User-Agent when `codex --version` cannot be
@@ -158,15 +158,16 @@ pub enum WhamResult {
     Transient,
 }
 
-/// Calls the wham endpoint with an explicit bearer token.
+/// Calls the wham endpoint at `wham_url` with an explicit bearer token.
 pub fn call_wham(
     client: &reqwest::blocking::Client,
     token: &str,
     account_id: Option<&str>,
     now: i64,
+    wham_url: &str,
 ) -> WhamResult {
     let mut req = client
-        .get(WHAM_URL)
+        .get(wham_url)
         .header(reqwest::header::USER_AGENT, codex_ua())
         .header("originator", CODEX_ORIGINATOR)
         .bearer_auth(token);
@@ -205,7 +206,19 @@ pub fn call_wham(
 /// request cannot be sent.
 pub(crate) fn fetch_codex_raw(client: &reqwest::blocking::Client) -> Result<(u16, String)> {
     let auth_path = crate::utils::resolve_paths()?.codex_dir.join("auth.json");
-    let body = std::fs::read_to_string(&auth_path).with_context(|| {
+    fetch_codex_raw_from(client, WHAM_URL, &auth_path)
+}
+
+/// The injectable core of [`fetch_codex_raw`]: reads the token from an explicit
+/// `auth.json` path and fetches the raw usage body from an explicit `wham_url`.
+/// Production passes [`WHAM_URL`] + `~/.codex/auth.json`; tests point them at a
+/// local mock server and a temp auth file.
+pub(crate) fn fetch_codex_raw_from(
+    client: &reqwest::blocking::Client,
+    wham_url: &str,
+    auth_path: &Path,
+) -> Result<(u16, String)> {
+    let body = std::fs::read_to_string(auth_path).with_context(|| {
         format!(
             "no Codex credentials at {} ({})",
             auth_path.display(),
@@ -214,7 +227,7 @@ pub(crate) fn fetch_codex_raw(client: &reqwest::blocking::Client) -> Result<(u16
     })?;
     let (access_token, account_id) = parse_auth(&body)?;
     let mut req = client
-        .get(WHAM_URL)
+        .get(wham_url)
         .header(reqwest::header::USER_AGENT, codex_ua())
         .header("originator", CODEX_ORIGINATOR)
         .bearer_auth(&access_token);
@@ -240,7 +253,11 @@ pub(crate) fn fetch_codex_raw(client: &reqwest::blocking::Client) -> Result<(u16
 ///
 /// Returns an error if the auth file has no refresh token, the request fails, or
 /// the status is non-success. The token never appears in an error.
-pub fn refresh_codex(client: &reqwest::blocking::Client, auth_path: &Path) -> Result<String> {
+pub fn refresh_codex(
+    client: &reqwest::blocking::Client,
+    auth_path: &Path,
+    token_url: &str,
+) -> Result<String> {
     // Capture the mtime with the refresh token from the same read so the
     // write-back guards on the exact file version we send.
     let expected_mtime = file_mtime(auth_path);
@@ -259,7 +276,7 @@ pub fn refresh_codex(client: &reqwest::blocking::Client, auth_path: &Path) -> Re
         "refresh_token": refresh_token,
     });
     let req = client
-        .post(CODEX_TOKEN_URL)
+        .post(token_url)
         .header(reqwest::header::USER_AGENT, codex_ua())
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .json(&req_body);
@@ -403,5 +420,32 @@ mod tests {
         // No rate_limit / credits / spend_control at all → stays None.
         let snap = map_wham_response(r#"{"plan_type":"plus"}"#, 1).unwrap();
         assert_eq!(snap.limit_reached, None);
+    }
+
+    // ---- HTTP-layer test against a local mock server (no real API) ----
+
+    #[test]
+    fn fetch_codex_raw_from_reads_auth_and_returns_status_body() {
+        use crate::quota::http::build_client;
+        use httpmock::prelude::*;
+
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/wham");
+            then.status(200).body(SAMPLE);
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let auth = dir.path().join("auth.json");
+        std::fs::write(
+            &auth,
+            r#"{"tokens":{"access_token":"tok","account_id":"acct"}}"#,
+        )
+        .unwrap();
+
+        let client = build_client().unwrap();
+        let (status, body) =
+            fetch_codex_raw_from(&client, &server.url("/wham"), &auth).expect("raw fetch");
+        assert_eq!(status, 200);
+        assert!(body.contains("plan_type"));
     }
 }

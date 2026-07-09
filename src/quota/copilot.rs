@@ -19,6 +19,7 @@ use crate::quota::provider::QuotaOutcome;
 use crate::utils::get_copilot_config_path;
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;
+use std::path::Path;
 use std::sync::OnceLock;
 
 /// Path of the Copilot internal usage endpoint (the host is derived per account
@@ -280,8 +281,15 @@ fn fetch_copilot_user(client: &Client, api_url: &str, token: &str, now: i64) -> 
 /// Returns an error if the config is missing, has no usable token, or the
 /// request cannot be sent.
 pub(crate) fn fetch_copilot_raw(client: &Client) -> Result<(u16, String)> {
-    let path = get_copilot_config_path()?;
-    let body = std::fs::read_to_string(&path).with_context(|| {
+    fetch_copilot_raw_from(client, &get_copilot_config_path()?)
+}
+
+/// The injectable core of [`fetch_copilot_raw`]: reads the token from an explicit
+/// config path (the API host is derived from the token key). Production passes
+/// `~/.copilot/config.json`; tests pass a temp config file.
+pub(crate) fn fetch_copilot_raw_from(client: &Client, config_path: &Path) -> Result<(u16, String)> {
+    let path = config_path;
+    let body = std::fs::read_to_string(path).with_context(|| {
         format!(
             "no Copilot credentials at {} ({COPILOT_LOGIN_HINT})",
             path.display()
@@ -504,5 +512,39 @@ mod tests {
             snap.premium.as_ref().unwrap().resets_at_unix.unwrap() > 0,
             "date-only reset should still yield a timestamp"
         );
+    }
+
+    // ---- HTTP-layer tests against a local mock server (no real API) ----
+    //
+    // `fetch_copilot_user` takes the API URL as a parameter, so it can be pointed
+    // at a local mock. (`fetch_copilot_raw` derives an `https://api.<host>` URL
+    // from the config and is intentionally not driven here to avoid any real
+    // request; its send path is identical to the one exercised below.)
+
+    #[test]
+    fn fetch_copilot_user_maps_200_and_401() {
+        use crate::quota::http::build_client;
+        use httpmock::prelude::*;
+
+        let server = MockServer::start();
+        let ok = server.mock(|when, then| {
+            when.method(GET).path("/user");
+            then.status(200).body(USER);
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/denied");
+            then.status(401);
+        });
+        let client = build_client().unwrap();
+
+        match fetch_copilot_user(&client, &server.url("/user"), "gho_x", 1_000_000) {
+            FetchResult::Ok(snap) => assert!(snap.premium.is_some()),
+            _ => panic!("expected Ok"),
+        }
+        ok.assert();
+        assert!(matches!(
+            fetch_copilot_user(&client, &server.url("/denied"), "gho_x", 0),
+            FetchResult::Unauthorized
+        ));
     }
 }
