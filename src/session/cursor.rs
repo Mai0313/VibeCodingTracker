@@ -26,9 +26,13 @@ use crate::VERSION;
 use crate::cli::TimeRange;
 use crate::constants::FastHashMap;
 use crate::models::{CodeAnalysis, CodeAnalysisRecord, ExtensionType};
+use crate::pricing::{ModelPricingMap, fetch_model_pricing};
 use crate::quota::cursor::{cursor_ua, read_cursor_session};
 use crate::session::state::{ParseMode, SessionParseState};
-use crate::utils::{get_cache_dir, get_current_user, get_cursor_auth_path, get_machine_id};
+use crate::usage::{CostSource, resolve_model_cost};
+use crate::utils::{
+    TokenCounts, get_cache_dir, get_current_user, get_cursor_auth_path, get_machine_id,
+};
 use anyhow::{Context, Result, anyhow};
 use reqwest::blocking::Client;
 use rusqlite::{Connection, OpenFlags};
@@ -416,6 +420,13 @@ fn aggregate_events(
 /// time range after caching.
 fn approximation_events(chats_dir: &Path, tracking_db: &Path) -> Result<Vec<CachedEvent>> {
     let conv_models = load_conversation_models(tracking_db);
+    // Price the approximate cache-read tokens ourselves, since Cursor gives no
+    // cost offline and the display treats a Cursor stored cost as authoritative.
+    // Use the exact-match-or-zero basis (`OpenCodeStored(0.0)`): a Cursor-routed
+    // Claude/GPT model with an exact LiteLLM entry is priced at its cache rate,
+    // while a model Cursor prices itself (`composer-*`) has no entry and stays
+    // `$0` — never the fuzzy path, which would mis-price `composer-*`.
+    let pricing = fetch_model_pricing().unwrap_or_else(|_| ModelPricingMap::new(HashMap::new()));
 
     // (date, model) -> summed context-window gauge
     let mut agg: HashMap<(String, String), i64> = HashMap::new();
@@ -434,16 +445,23 @@ fn approximation_events(chats_dir: &Path, tracking_db: &Path) -> Result<Vec<Cach
 
     Ok(agg
         .into_iter()
-        .map(|((date, model), ctx)| CachedEvent {
-            date,
-            model,
-            input: 0,
-            output: 0,
-            // Re-sent context is cache-read; priced at the cache rate (or $0 for
-            // Cursor's own models), never the inflated full-input rate.
-            cache_read: ctx,
-            cache_write: 0,
-            cost: 0.0,
+        .map(|((date, model), ctx)| {
+            // Re-sent context is cache-read; priced at the cache rate.
+            let counts = TokenCounts {
+                cache_read: ctx,
+                ..Default::default()
+            };
+            let (cost, _) =
+                resolve_model_cost(&model, &counts, &pricing, CostSource::OpenCodeStored(0.0));
+            CachedEvent {
+                date,
+                model,
+                input: 0,
+                output: 0,
+                cache_read: ctx,
+                cache_write: 0,
+                cost,
+            }
         })
         .collect())
 }
