@@ -21,7 +21,7 @@ use crate::utils::{
 };
 use anyhow::Result;
 use rayon::prelude::*;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -525,7 +525,27 @@ impl UsageData {
 /// `total_token_usage`). Values that are not both JSON objects, or that match
 /// neither shape, are left untouched.
 fn merge_usage_values(existing: &mut Value, new: &Value) {
-    use crate::utils::{accumulate_i64_fields, accumulate_nested_object};
+    use crate::utils::{accumulate_i64_fields, accumulate_nested_object, extract_token_counts};
+
+    let (Some(existing_ro), Some(new_ro)) = (existing.as_object(), new.as_object()) else {
+        return;
+    };
+    let existing_flat = existing_ro.contains_key("input_tokens");
+    let existing_codex = existing_ro.contains_key("total_token_usage");
+    let new_flat = new_ro.contains_key("input_tokens");
+    let new_codex = new_ro.contains_key("total_token_usage");
+
+    // Mixed shapes — e.g. a Codex `total_token_usage` row and a Cursor / Copilot
+    // flat `input_tokens` row that share a model name like `gpt-5`. The
+    // shape-specific branches below only accumulate when both sides carry the
+    // *same* shape, so a mismatch would silently drop the other side's tokens.
+    // Normalize both to disjoint counts and rewrite `existing` as a flat value
+    // that keeps every bucket (and round-trips through `extract_token_counts`).
+    if (existing_flat && new_codex) || (existing_codex && new_flat) {
+        let merged = add_token_counts(&extract_token_counts(existing), &extract_token_counts(new));
+        *existing = token_counts_to_flat_value(&merged);
+        return;
+    }
 
     if let (Some(existing_obj), Some(new_obj)) = (existing.as_object_mut(), new.as_object()) {
         // Handle Claude/Gemini/Copilot format (has input_tokens)
@@ -568,6 +588,54 @@ fn merge_usage_values(existing: &mut Value, new: &Value) {
             accumulate_nested_object(existing_obj, "total_token_usage", new_total);
         }
     }
+}
+
+/// Sums two normalized [`TokenCounts`] field by field.
+fn add_token_counts(a: &TokenCounts, b: &TokenCounts) -> TokenCounts {
+    TokenCounts {
+        input_tokens: a.input_tokens + b.input_tokens,
+        output_tokens: a.output_tokens + b.output_tokens,
+        reasoning_tokens: a.reasoning_tokens + b.reasoning_tokens,
+        cache_read: a.cache_read + b.cache_read,
+        cache_creation: a.cache_creation + b.cache_creation,
+        cache_creation_5m: a.cache_creation_5m + b.cache_creation_5m,
+        cache_creation_1h: a.cache_creation_1h + b.cache_creation_1h,
+        web_search_requests: a.web_search_requests + b.web_search_requests,
+        total: a.total + b.total,
+    }
+}
+
+/// Serializes normalized counts back into the flat usage shape.
+///
+/// The key set is exactly what [`extract_token_counts`] reads for a flat value,
+/// so the result round-trips: re-extracting it yields the same counts. `total`
+/// is intentionally omitted (the extractor recomputes it as the bucket sum).
+fn token_counts_to_flat_value(c: &TokenCounts) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("input_tokens".into(), json!(c.input_tokens));
+    obj.insert("output_tokens".into(), json!(c.output_tokens));
+    obj.insert("reasoning_output_tokens".into(), json!(c.reasoning_tokens));
+    obj.insert("cache_read_input_tokens".into(), json!(c.cache_read));
+    obj.insert(
+        "cache_creation_input_tokens".into(),
+        json!(c.cache_creation),
+    );
+    if c.cache_creation_5m != 0 || c.cache_creation_1h != 0 {
+        obj.insert(
+            "cache_creation".into(),
+            json!({
+                "ephemeral_5m_input_tokens": c.cache_creation_5m,
+                "ephemeral_1h_input_tokens": c.cache_creation_1h,
+            }),
+        );
+    }
+    if c.web_search_requests != 0 {
+        obj.insert(
+            "server_tool_use".into(),
+            json!({ "web_search_requests": c.web_search_requests }),
+        );
+    }
+    Value::Object(obj)
 }
 
 #[cfg(test)]
@@ -651,5 +719,47 @@ mod tests {
             resolve_model_cost("gpt-4", &counts(1_000_000), &map, CostSource::Litellm);
         assert!((cost - 10.0).abs() < 1e-6);
         assert!(matched.is_none());
+    }
+
+    #[test]
+    fn merge_preserves_tokens_across_mixed_shapes() {
+        use crate::utils::extract_token_counts;
+
+        // A Codex `total_token_usage` value (input 1000 includes 200 cached).
+        let codex = json!({
+            "total_token_usage": {
+                "input_tokens": 1000,
+                "cached_input_tokens": 200,
+                "output_tokens": 500,
+                "total_tokens": 1500
+            }
+        });
+        // A Cursor / flat value for the same model name.
+        let flat = json!({
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_read_input_tokens": 50,
+            "cache_creation_input_tokens": 10
+        });
+
+        // Codex disjoint counts: input 800, cache_read 200, output 500, total 1500.
+        // Flat counts: input 100, output 20, cache_read 50, cache_creation 10.
+        let expect = |c: TokenCounts| {
+            assert_eq!(c.input_tokens, 800 + 100);
+            assert_eq!(c.output_tokens, 500 + 20);
+            assert_eq!(c.cache_read, 200 + 50);
+            assert_eq!(c.cache_creation, 10);
+            // Bucket sum: 1500 (Codex) + 180 (flat) = 1680; no tokens dropped.
+            assert_eq!(c.total, 1680);
+        };
+
+        // Merging is order-independent: neither side's tokens are dropped.
+        let mut existing = codex.clone();
+        merge_usage_values(&mut existing, &flat);
+        expect(extract_token_counts(&existing));
+
+        let mut existing = flat.clone();
+        merge_usage_values(&mut existing, &codex);
+        expect(extract_token_counts(&existing));
     }
 }
