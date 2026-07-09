@@ -295,24 +295,33 @@ fn fetch_all_events() -> Result<Vec<CachedEvent>> {
                 .unwrap_or("unknown")
                 .to_string();
             let tu = ev.get("tokenUsage");
+            let bucket = |key: &str| {
+                tu.and_then(|t| t.get(key))
+                    .and_then(as_i64_lenient)
+                    .unwrap_or(0)
+            };
+            let e_input = bucket("inputTokens");
+            let e_output = bucket("outputTokens");
+            let e_cache_read = bucket("cacheReadTokens");
+            let e_cache_write = bucket("cacheWriteTokens");
+            let e_cost = event_cost_usd(ev);
+            // Skip empty events (e.g. errored / not-charged interactions): they
+            // would otherwise create 0-token / $0 model rows and count their
+            // date as an active Cursor day.
+            if e_input == 0
+                && e_output == 0
+                && e_cache_read == 0
+                && e_cache_write == 0
+                && e_cost == 0.0
+            {
+                continue;
+            }
             let acc = agg.entry((date, model)).or_default();
-            acc.input += tu
-                .and_then(|t| t.get("inputTokens"))
-                .and_then(as_i64_lenient)
-                .unwrap_or(0);
-            acc.output += tu
-                .and_then(|t| t.get("outputTokens"))
-                .and_then(as_i64_lenient)
-                .unwrap_or(0);
-            acc.cache_read += tu
-                .and_then(|t| t.get("cacheReadTokens"))
-                .and_then(as_i64_lenient)
-                .unwrap_or(0);
-            acc.cache_write += tu
-                .and_then(|t| t.get("cacheWriteTokens"))
-                .and_then(as_i64_lenient)
-                .unwrap_or(0);
-            acc.cost += event_cost_usd(ev);
+            acc.input += e_input;
+            acc.output += e_output;
+            acc.cache_read += e_cache_read;
+            acc.cache_write += e_cache_write;
+            acc.cost += e_cost;
         }
 
         let total = body
