@@ -243,6 +243,10 @@ fn test_pricing_with_provider_prefix() {
 
 #[test]
 fn test_pricing_multiple_models() {
+    // The lookup match-cache is process-global; clear it so a prior test's
+    // (possibly offline / empty) result for these names doesn't bleed in.
+    clear_pricing_cache();
+
     let mut raw_map = HashMap::new();
 
     raw_map.insert(
