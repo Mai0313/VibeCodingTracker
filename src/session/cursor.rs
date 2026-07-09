@@ -593,9 +593,17 @@ fn read_store_context(
                 continue;
             }
             let node = walk_node(data);
-            let (Some(ts), Some(ctx_msg)) = (node.ts, node.ctx_msg) else {
+            let (Some(msg_bytes), Some(ts), Some(ctx_msg)) = (node.msg, node.ts, node.ctx_msg)
+            else {
                 continue;
             };
+            // Only assistant turns represent a real per-request context. Cursor
+            // also stores intermediate DAG nodes that carry the running gauge but
+            // no assistant message; counting those would roughly double the
+            // approximation's tokens and inflate its active-day count.
+            if !message_is_assistant(msg_bytes) {
+                continue;
+            }
             if let Some(ctx) = context_tokens(ctx_msg) {
                 turns.push((ts, ctx));
             }
@@ -653,6 +661,18 @@ fn assistant_node(data: &[u8]) -> Option<(&[u8], i64)> {
     }
     let node = walk_node(data);
     Some((node.msg?, node.ts?))
+}
+
+/// Whether a message JSON blob is an assistant turn.
+fn message_is_assistant(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(bytes)
+        .ok()
+        .and_then(|m| {
+            m.get("role")
+                .and_then(|v| v.as_str())
+                .map(|role| role == "assistant")
+        })
+        .unwrap_or(false)
 }
 
 /// Applies one assistant message's tool calls to `state`.
@@ -1287,7 +1307,7 @@ mod tests {
     }
 
     #[test]
-    fn read_store_context_recovers_gauge_per_turn() {
+    fn read_store_context_recovers_gauge_per_assistant_turn_only() {
         let a = make_node(
             r#"{"role":"assistant","content":[]}"#,
             1_700_000_000_000,
@@ -1298,7 +1318,14 @@ mod tests {
             1_700_000_500_000,
             Some(88_000),
         );
-        let (_dir, path) = make_store_db(&[a, b], &[]);
+        // A gauge-bearing node that is NOT an assistant turn must be excluded so
+        // the offline approximation does not double-count context.
+        let non_assistant = make_node(
+            r#"{"role":"user","content":[]}"#,
+            1_700_000_600_000,
+            Some(99_999),
+        );
+        let (_dir, path) = make_store_db(&[a, b, non_assistant], &[]);
 
         let conv_models = FastHashMap::default();
         let (model, mut turns) = read_store_context(&path, &conv_models, "conv").unwrap();
