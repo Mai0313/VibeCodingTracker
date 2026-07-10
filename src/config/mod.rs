@@ -218,10 +218,12 @@ pub fn save_merge_models(enabled: bool) -> Result<()> {
 pub fn save_merge_models_in(dir: &Path, enabled: bool) -> Result<()> {
     edit_in(dir, |doc| {
         // A hand-edited file could make `usage` a scalar (`usage = "bad"`);
-        // replace any non-table with an empty table so indexing into it below
-        // cannot panic. A valid `[usage]` table is left intact (comments/keys
-        // preserved).
-        if !doc["usage"].is_table() {
+        // replace any non-table-like value with an empty table so indexing into
+        // it below cannot panic. `is_table_like` accepts both the `[usage]`
+        // header form AND an inline table (`usage = { ... }`), so a valid config
+        // in either form is left intact (its keys/comments preserved) — only a
+        // genuine scalar is repaired.
+        if !doc["usage"].is_table_like() {
             doc["usage"] = toml_edit::Item::Table(toml_edit::Table::new());
         }
         doc["usage"]["merge_models"] = value(enabled);

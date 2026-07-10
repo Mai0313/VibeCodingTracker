@@ -95,6 +95,29 @@ fn save_merge_models_survives_malformed_usage_section() {
 }
 
 #[test]
+fn save_merge_models_preserves_an_inline_usage_table() {
+    // A valid inline-table `[usage]` must NOT be wiped by the toggle: its sibling
+    // keys have to survive the write-back (regression — `is_table()` misses inline
+    // tables, so the guard must use `is_table_like()`).
+    let th = TempHome::new();
+    let dir = &th.paths.cache_dir;
+    fs::create_dir_all(dir).unwrap();
+    fs::write(
+        dir.join("config.toml"),
+        "usage = { merge_models = false, quota_panels = [\"claude\"], refresh_interval_secs = 30 }\n",
+    )
+    .unwrap();
+
+    config::save_merge_models_in(dir, true).unwrap();
+
+    let cfg = config::load_in(dir);
+    assert!(cfg.usage.merge_models);
+    // The other inline keys must not be lost / reverted to defaults.
+    assert_eq!(cfg.usage.quota_panels, vec!["claude".to_string()]);
+    assert_eq!(cfg.usage.refresh_interval_secs, 30);
+}
+
+#[test]
 fn existing_file_is_parsed_and_left_in_place() {
     let th = TempHome::new();
     let dir = &th.paths.cache_dir;
