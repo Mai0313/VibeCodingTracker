@@ -140,8 +140,14 @@ pub fn read_cursor_usage(
             let (events, start_ms, from_api) = match fetch_all_events(time_range) {
                 Ok(events) => (events, requested_start_ms, true),
                 Err(err) => match cached {
-                    // Prefer stale real billing data over the rough approximation.
-                    Some(cache) if cache.from_api && !cache.events.is_empty() => {
+                    // Prefer stale real billing data over the rough approximation,
+                    // but only when it spans at least the requested window — a
+                    // `--daily` cache must not answer an offline `--all`.
+                    Some(cache)
+                        if cache.from_api
+                            && !cache.events.is_empty()
+                            && cache.start_ms <= requested_start_ms =>
+                    {
                         eprintln!(
                             "Warning: Cursor usage API unavailable ({err}); using cached usage."
                         );
