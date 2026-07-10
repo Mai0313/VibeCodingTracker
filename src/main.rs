@@ -66,10 +66,6 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Load persistent settings once (also creates ~/.vct/config.toml with
-    // defaults and migrates a legacy version.json on first run).
-    let config = vibe_coding_tracker::config::load();
-
     match cli.command {
         Commands::Analysis {
             path,
@@ -82,14 +78,6 @@ fn main() -> Result<()> {
             monthly,
             all,
         } => {
-            let time_range = resolve_time_range_with_default(
-                daily,
-                weekly,
-                monthly,
-                all,
-                config.general.default_time_range,
-            );
-
             match path {
                 Some(file_path) => {
                     let result = parse_session_file(&file_path)?;
@@ -103,6 +91,17 @@ fn main() -> Result<()> {
                     }
                 }
                 None => {
+                    // Settings are only needed for the batch (all-sessions) path,
+                    // so `analysis --path`, `version`, `fetch`, etc. never read or
+                    // create `~/.vct/config.toml`.
+                    let config = vibe_coding_tracker::config::load();
+                    let time_range = resolve_time_range_with_default(
+                        daily,
+                        weekly,
+                        monthly,
+                        all,
+                        config.general.default_time_range,
+                    );
                     let analysis_data =
                         vibe_coding_tracker::analysis::aggregate_sessions_by_model_with(
                             time_range,
@@ -147,6 +146,7 @@ fn main() -> Result<()> {
             monthly,
             all,
         } => {
+            let config = vibe_coding_tracker::config::load();
             let time_range = resolve_time_range_with_default(
                 daily,
                 weekly,

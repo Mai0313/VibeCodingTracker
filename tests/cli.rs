@@ -537,6 +537,18 @@ fn all_short_flag_parses_for_both_subcommands() {
 }
 
 #[test]
+fn readonly_commands_do_not_create_config() {
+    // `version` (like other settings-free commands) must not materialize
+    // ~/.vct/config.toml as a home-directory side effect.
+    let home = TempHome::new();
+    child_cmd(&home).arg("version").assert().success();
+    assert!(
+        !home.home().join(".vct/config.toml").exists(),
+        "version must not create config.toml"
+    );
+}
+
+#[test]
 fn config_path_prints_config_toml_location() {
     // Uses a per-child HOME so the check never touches the real `~/.vct`.
     let home = TempHome::new();
