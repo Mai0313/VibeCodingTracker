@@ -9,6 +9,7 @@
 //! [`UsageData`] for why.
 
 use crate::cli::TimeRange;
+use crate::config::ProvidersConfig;
 use crate::constants::{FastHashMap, capacity};
 use crate::models::{
     CodeAnalysis, ExtensionType, PerProviderUsage, Provider, ProviderActiveDays, UsageResult,
@@ -140,7 +141,16 @@ fn extract_conversation_usage_from_analysis(analysis: &CodeAnalysis) -> FastHash
 /// # Ok::<(), anyhow::Error>(())
 /// ```
 pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
-    get_usage_from_paths(&resolve_paths()?, time_range)
+    get_usage_from_directories_with(time_range, ProvidersConfig::default())
+}
+
+/// [`get_usage_from_directories`] with explicit per-provider toggles (from
+/// `~/.vct/config.toml`). A disabled provider is skipped entirely.
+pub fn get_usage_from_directories_with(
+    time_range: TimeRange,
+    providers: ProvidersConfig,
+) -> Result<UsageData> {
+    get_usage_from_paths_with(&resolve_paths()?, time_range, providers)
 }
 
 /// Aggregates token usage from provider session directories rooted at an
@@ -157,6 +167,16 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
 /// Returns an error only under the same conditions as
 /// [`get_usage_from_directories`].
 pub fn get_usage_from_paths(paths: &HelperPaths, time_range: TimeRange) -> Result<UsageData> {
+    get_usage_from_paths_with(paths, time_range, ProvidersConfig::default())
+}
+
+/// [`get_usage_from_paths`] with explicit provider toggles (the injectable core
+/// used by the CLI once `config.toml` is loaded).
+pub fn get_usage_from_paths_with(
+    paths: &HelperPaths,
+    time_range: TimeRange,
+    providers: ProvidersConfig,
+) -> Result<UsageData> {
     let mut result = FastHashMap::with_capacity(capacity::MODEL_COMBINATIONS);
     let mut per_provider = PerProviderUsage::default();
     let mut stored_costs = StoredCosts::default();
@@ -168,7 +188,7 @@ pub fn get_usage_from_paths(paths: &HelperPaths, time_range: TimeRange) -> Resul
     let mut opencode_dates: HashSet<String> = HashSet::new();
     let mut cursor_dates: HashSet<String> = HashSet::new();
 
-    if paths.claude_session_dir.exists() {
+    if providers.claude && paths.claude_session_dir.exists() {
         // Walks the projects tree recursively, so top-level `<session>.jsonl` logs
         // and `<session>/subagents/agent-*.jsonl` logs are both collected here.
         process_usage_directory(
@@ -183,7 +203,7 @@ pub fn get_usage_from_paths(paths: &HelperPaths, time_range: TimeRange) -> Resul
         )?;
     }
 
-    if paths.codex_session_dir.exists() {
+    if providers.codex && paths.codex_session_dir.exists() {
         process_usage_directory(
             &paths.codex_session_dir,
             ExtensionType::Codex,
@@ -196,7 +216,7 @@ pub fn get_usage_from_paths(paths: &HelperPaths, time_range: TimeRange) -> Resul
         )?;
     }
 
-    if paths.copilot_session_dir.exists() {
+    if providers.copilot && paths.copilot_session_dir.exists() {
         // `events.jsonl` always lives exactly two levels under
         // `session-state/`. Bounding the walk here keeps per-session
         // snapshot subtrees (`rewind-snapshots/backups/*`, `files/*`, …)
@@ -214,7 +234,7 @@ pub fn get_usage_from_paths(paths: &HelperPaths, time_range: TimeRange) -> Resul
         )?;
     }
 
-    if paths.gemini_session_dir.exists() {
+    if providers.gemini && paths.gemini_session_dir.exists() {
         process_usage_directory(
             &paths.gemini_session_dir,
             ExtensionType::Gemini,
@@ -229,7 +249,8 @@ pub fn get_usage_from_paths(paths: &HelperPaths, time_range: TimeRange) -> Resul
 
     // OpenCode lives in a single SQLite database rather than a session
     // directory, so it is read directly instead of walked.
-    if paths.opencode_db.exists()
+    if providers.opencode
+        && paths.opencode_db.exists()
         && let Err(err) = process_opencode_usage(
             &paths.opencode_db,
             &mut result,
@@ -245,10 +266,11 @@ pub fn get_usage_from_paths(paths: &HelperPaths, time_range: TimeRange) -> Resul
         );
     }
 
-    // Cursor's usage comes from its dashboard API (billing tokens + cost), with
-    // a local approximation fallback, rather than a walked session directory.
-    // Attempt it whenever either the chat stores or the credentials are present.
-    if (paths.cursor_chats_dir.exists() || paths.cursor_dir.join("auth.json").exists())
+    // Cursor's usage is a local estimate from its chat stores (read directly like
+    // OpenCode, not a walked session directory), so it is only attempted when the
+    // chat stores are present — matching the analysis path.
+    if providers.cursor
+        && paths.cursor_chats_dir.exists()
         && let Err(err) = process_cursor_usage(
             &paths.cursor_chats_dir,
             &paths.cursor_tracking_db,
@@ -407,12 +429,11 @@ fn process_opencode_usage(
     Ok(())
 }
 
-/// Reads Cursor's per-model usage (dashboard API, or local approximation) and
+/// Reads Cursor's per-model usage (a local estimate from the chat stores) and
 /// merges it into both the global and Cursor-scoped maps.
 ///
-/// Mirrors [`process_opencode_usage`]: Cursor reports its own billed cost per
-/// usage event, so it uses the same stored-cost path (exact LiteLLM match or
-/// the reported cost) rather than a fuzzy price guess.
+/// Mirrors [`process_opencode_usage`]: the estimate carries its own per-model
+/// cost, so it uses the same stored-cost path rather than a fuzzy price guess.
 fn process_cursor_usage(
     chats_dir: &Path,
     tracking_db: &Path,
@@ -476,10 +497,10 @@ pub enum CostSource {
     /// novel model like `deepseek-v4-pro` reports OpenCode's own cost instead of
     /// being priced against a loosely-similar name.
     OpenCodeStored(f64),
-    /// Cursor: the dashboard API's own billed cost, used **verbatim** and never
-    /// re-priced from tokens, so a row that has an exact LiteLLM match (e.g.
-    /// `gemini-2.5-pro`) still matches what Cursor actually billed rather than
-    /// the LiteLLM list price.
+    /// Cursor: the local estimate's own per-model cost, used **verbatim** and
+    /// never re-priced from tokens (it is already priced when the estimate is
+    /// built), so a merged row can't be re-scored against another provider's
+    /// same-named model.
     CursorStored(f64),
 }
 

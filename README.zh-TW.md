@@ -48,7 +48,7 @@
 
 ### 零設定
 
-自動偵測並處理 Claude Code、Codex、Copilot、Gemini、OpenCode 及 Cursor 的日誌檔。不需要任何設定——直接執行就能分析。
+自動偵測並處理 Claude Code、Codex、Copilot、Gemini、OpenCode 及 Cursor 的日誌檔。不需要任何設定——直接執行就能分析。首次執行時會以合理的預設值建立 `~/.vct/config.toml`，日後若想微調行為即可編輯它（見 [設定](#%E8%A8%AD%E5%AE%9A)）。
 
 ### 豐富洞察
 
@@ -149,6 +149,7 @@ Commands:
   version     Display version information
   update      Update to the latest version from GitHub releases
   fetch       Fetch a provider's raw quota/usage API response
+  config      Show or edit the persistent settings file (~/.vct/config.toml)
   help        Print this message or the help of the given subcommand(s)
 ```
 
@@ -211,7 +212,7 @@ vct usage --table --merge-providers
 > Model 列會依 cost 由小到大排序，所以花費最高的 model 會排在最後(在 `--table` 中緊鄰 `TOTAL` 列上方)。這個排序會套用到互動式儀表板、`--table` 與 `--text` 三種輸出;`--json` 也會保持相同順序。互動式儀表板也會隱藏在所選範圍內用量為 0 的 model。
 
 > [!TIP]
-> 同一個 model 在不同 provider 前綴下路由時會顯示成多列（`openai/gpt-5.5`、`azure/gpt-5.5`、純 `gpt-5.5`）。`--merge-providers` 會把第一個 `/` 之後 base 名稱相同的列合併（`gpt-5.5` 與 `gpt-5.4` 這類版本不同的仍分開），並把它們已定價的 cost 相加。在互動式儀表板中按 `m` 可即時切換;`--merge-providers` 則讓儀表板一打開就是合併狀態。`--json` 保持為逐一 model 的原始輸出。
+> 同一個 model 在不同 provider 前綴下路由時會顯示成多列（`openai/gpt-5.5`、`azure/gpt-5.5`、純 `gpt-5.5`）。`--merge-providers` 會把第一個 `/` 之後 base 名稱相同的列合併（`gpt-5.5` 與 `gpt-5.4` 這類版本不同的仍分開），並把它們已定價的 cost 相加。在互動式儀表板中按 `m` 可即時切換（這個選擇會存進 `~/.vct/config.toml`，所以下次啟動時會記住這個設定）;`--merge-providers` 則讓儀表板一打開就是合併狀態。`--json` 保持為逐一 model 的原始輸出。
 
 ### 預覽：互動式儀表板（`vct usage`）
 
@@ -289,11 +290,11 @@ Totals (by Provider)
 - `~/.copilot/session-state/<sessionId>/events.jsonl`（Copilot CLI）
 - `~/.gemini/tmp/<project_hash>/chats/*.jsonl`（Gemini CLI）
 - `~/.local/share/opencode/opencode.db`（OpenCode，SQLite 資料庫；遵循 `$XDG_DATA_HOME`）
-- `~/.cursor/chats/*/*/store.db`（Cursor，SQLite 對話庫，用於 `analysis`）以及 Cursor 官方 dashboard 用量 API（用於 `usage` 的 token 與費用，以本地 session token 讀取；離線時改用本地 context 資料估算）
+- `~/.cursor/chats/*/*/store.db`（Cursor，SQLite 對話庫，用於 `analysis`，並產生與其他 provider 一致的本地 `usage` 估算）
 
 ### 即時額度面板
 
-`vct usage` 會**在儀表板中直接顯示 Claude Code、Codex、GitHub Copilot 與 Cursor 的即時剩餘額度——完全零設定。** 不需要 status-line hook，也不需要設定檔：vct 會讀取各 provider 自己的 OAuth 憑證，在背景執行緒呼叫其用量 API，並在你工作時讓面板保持最新。
+`vct usage` 會**在儀表板中直接顯示 Claude Code、Codex、GitHub Copilot 與 Cursor 的即時剩餘額度——完全零設定。** 不需要 status-line hook，也不需要手動輸入憑證：vct 會讀取各 provider 自己的 OAuth 憑證，在背景執行緒呼叫其用量 API，並在你工作時讓面板保持最新。（想要更清爽的儀表板嗎？在 [`config.toml`](#%E8%A8%AD%E5%AE%9A) 中精簡 `quota_panels`,或設為 `[]` 隱藏整條。）
 
 ```
 ┌ Claude ─────────────────┐┌ Codex ──────────────────┐┌ Copilot ────────────────┐┌ Cursor ─────────────────┐
@@ -505,6 +506,67 @@ vct fetch copilot --table
 
 > [!NOTE]
 > 回應 body 會原樣印到 stdout。遇到 HTTP 錯誤時仍會印出 body 並以非零狀態結束；401/403 會在 stderr 額外印出 `run: <cli> login` 提示。
+
+---
+
+## 設定
+
+vct 會把使用者設定存放在 `~/.vct/config.toml`。這個檔案會在**首次執行時以預設值自動建立**，所以你完全不必手動撰寫，只有想更改某個預設值時才需要編輯它。
+
+```toml
+[general]
+# 未指定 --daily/--weekly/--monthly/--all flag 時使用的預設時間範圍。
+# 可選值："daily" | "weekly" | "monthly" | "all"
+default_time_range = "all"
+
+[usage]
+# 啟動 usage 儀表板時，是否先把不同 provider 前綴的 model 合併。
+# 可用 `m` 即時切換;最後的狀態會存回這裡。
+merge_models = false
+# 在 usage TUI 中顯示哪些即時額度面板;移除某個名稱即可隱藏該面板,用空列表 ([]) 隱藏整條。
+quota_panels = ["claude", "codex", "copilot", "cursor"]
+# usage TUI 自動刷新的間隔秒數（最少 1）。
+refresh_interval_secs = 10
+
+[analysis]
+# analysis TUI 自動刷新的間隔秒數（最少 1）。
+refresh_interval_secs = 10
+
+[providers]
+# 是否把各 provider 的 session 納入 usage / analysis。把某個 provider 設為 false
+# 就會完全略過它（不掃描目錄，也不呼叫 API）。
+claude = true
+codex = true
+copilot = true
+gemini = true
+opencode = true
+cursor = true
+```
+
+| 設定項                           | 效果                                                                                            |
+| -------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `general.default_time_range`     | 未指定 `--daily/--weekly/--monthly/--all` 時使用的時間範圍。明確指定的 flag 一律優先。          |
+| `usage.merge_models`             | 讓儀表板一開始就是合併狀態;`m` 切換會把你最後的選擇存回這裡。`--merge-providers` 會強制開啟。   |
+| `usage.quota_panels`             | 顯示哪些額度面板（`claude` / `codex` / `copilot` / `cursor`）；移除名稱即可隱藏,`[]` 隱藏整條。 |
+| `usage.refresh_interval_secs`    | `usage` 儀表板自動刷新的間隔（秒）。                                                            |
+| `analysis.refresh_interval_secs` | `analysis` 儀表板自動刷新的間隔（秒）。                                                         |
+| `providers.*`                    | 設為 `false` 時完全略過某個 provider（不掃描、不呼叫 API），沒在用的話很方便。                  |
+
+> [!NOTE]
+> Cursor 的 `usage` 是從對話庫產生的**本地估算**，因此行為與 Claude Code / Codex / Copilot / Gemini 一致（全都是從本地 session 檔案計算），而且不需要連網。這個估算會低估 Cursor 的真實花費，因為其中有很大一部分是以 Cursor 內部的 model 名稱計費，而本地資料無法為這些名稱定價，所以請把 Cursor 的費用視為概估值。
+
+### 管理設定檔
+
+```bash
+# 印出設定檔路徑
+vct config path
+
+# 印出目前的設定
+vct config show
+
+# 用 $VISUAL / $EDITOR 開啟檔案（找不到時回退到 vi / notepad）
+vct config edit
+```
 
 ---
 

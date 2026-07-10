@@ -8,13 +8,13 @@
 //! Two things run *before* clap on purpose, and the ordering is
 //! load-bearing — see [`main`].
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use comfy_table::{Cell, CellAlignment, Color, ContentArrangement, Table, presets::UTF8_FULL};
 use owo_colors::OwoColorize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use vibe_coding_tracker::cli::{Cli, Commands, resolve_time_range};
+use vibe_coding_tracker::cli::{Cli, Commands, ConfigAction, resolve_time_range_with_default};
 
 // mimalloc is opt-in behind the `mimalloc` cargo feature. The default build
 // uses the system allocator because mimalloc's lazy purge retains freed
@@ -29,7 +29,7 @@ use vibe_coding_tracker::display::usage::{
     display_usage_interactive, display_usage_table, display_usage_text,
 };
 use vibe_coding_tracker::pricing::{ModelPricingMap, fetch_model_pricing};
-use vibe_coding_tracker::usage::{CostSource, get_usage_from_directories, resolve_model_cost};
+use vibe_coding_tracker::usage::{CostSource, get_usage_from_directories_with, resolve_model_cost};
 use vibe_coding_tracker::utils::extract_token_counts;
 use vibe_coding_tracker::{get_version_info, parse_session_file};
 
@@ -76,10 +76,8 @@ fn main() -> Result<()> {
             daily,
             weekly,
             monthly,
-            ..
+            all,
         } => {
-            let time_range = resolve_time_range(daily, weekly, monthly);
-
             match path {
                 Some(file_path) => {
                     let result = parse_session_file(&file_path)?;
@@ -93,8 +91,22 @@ fn main() -> Result<()> {
                     }
                 }
                 None => {
+                    // Settings are only needed for the batch (all-sessions) path,
+                    // so `analysis --path`, `version`, `fetch`, etc. never read or
+                    // create `~/.vct/config.toml`.
+                    let config = vibe_coding_tracker::config::load();
+                    let time_range = resolve_time_range_with_default(
+                        daily,
+                        weekly,
+                        monthly,
+                        all,
+                        config.general.default_time_range,
+                    );
                     let analysis_data =
-                        vibe_coding_tracker::analysis::aggregate_sessions_by_model(time_range)?;
+                        vibe_coding_tracker::analysis::aggregate_sessions_by_model_with(
+                            time_range,
+                            config.providers,
+                        )?;
 
                     if let Some(output_path) = output {
                         let json_value = serde_json::to_value(&analysis_data.rows)?;
@@ -113,8 +125,10 @@ fn main() -> Result<()> {
                         );
                     } else {
                         vibe_coding_tracker::display::analysis::display_analysis_interactive(
-                            &analysis_data,
+                            analysis_data,
                             time_range,
+                            config.providers,
+                            config.analysis.refresh_secs(),
                         )?;
                     }
                 }
@@ -130,12 +144,23 @@ fn main() -> Result<()> {
             daily,
             weekly,
             monthly,
-            ..
+            all,
         } => {
-            let time_range = resolve_time_range(daily, weekly, monthly);
+            let config = vibe_coding_tracker::config::load();
+            let time_range = resolve_time_range_with_default(
+                daily,
+                weekly,
+                monthly,
+                all,
+                config.general.default_time_range,
+            );
+            // A `--merge-providers` flag forces merging on; otherwise the saved
+            // preference decides. The TUI's `m` toggle persists back to config.
+            let merge = merge_providers || config.usage.merge_models;
+            let usage_from_dirs = |tr| get_usage_from_directories_with(tr, config.providers);
 
             if json || output.is_some() {
-                let usage_data = get_usage_from_directories(time_range)?;
+                let usage_data = usage_from_dirs(time_range)?;
                 let pricing_map = match fetch_model_pricing() {
                     Ok(map) => map,
                     Err(e) => {
@@ -157,13 +182,23 @@ fn main() -> Result<()> {
                     println!("{}", json_str);
                 }
             } else if text {
-                let usage_data = get_usage_from_directories(time_range)?;
-                display_usage_text(&usage_data, merge_providers);
+                let usage_data = usage_from_dirs(time_range)?;
+                display_usage_text(&usage_data, merge);
             } else if table {
-                let usage_data = get_usage_from_directories(time_range)?;
-                display_usage_table(&usage_data, merge_providers);
+                let usage_data = usage_from_dirs(time_range)?;
+                display_usage_table(&usage_data, merge);
             } else {
-                display_usage_interactive(time_range, merge_providers)?;
+                // `config` is not used after this, so hand the panel list off by
+                // move; read the refresh cadence first so the borrow ends before
+                // the partial move out of `config.usage`.
+                let refresh = config.usage.refresh_secs();
+                display_usage_interactive(
+                    time_range,
+                    merge,
+                    config.usage.quota_panels,
+                    config.providers,
+                    refresh,
+                )?;
             }
         }
 
@@ -234,9 +269,61 @@ fn main() -> Result<()> {
         } => {
             vibe_coding_tracker::fetch::run(provider, text, table)?;
         }
+
+        Commands::Config { action } => {
+            run_config(action.unwrap_or(ConfigAction::Show))?;
+        }
     }
 
     Ok(())
+}
+
+/// Handles the `config` subcommand: print the path, show current settings, or
+/// open the file in the user's editor.
+fn run_config(action: ConfigAction) -> Result<()> {
+    let path = vibe_coding_tracker::utils::get_config_path()?;
+    match action {
+        ConfigAction::Path => println!("{}", path.display()),
+        ConfigAction::Show => {
+            // Ensure the file exists (first-run creation) before reading it back.
+            let _ = vibe_coding_tracker::config::load();
+            let contents = std::fs::read_to_string(&path).unwrap_or_default();
+            println!("{}", "Vibe Coding Tracker settings".bright_cyan().bold());
+            println!("{}", path.display().dimmed());
+            println!();
+            print!("{}", contents);
+        }
+        ConfigAction::Edit => {
+            // Ensure the file exists before handing it to the editor.
+            let _ = vibe_coding_tracker::config::load();
+            let editor = std::env::var("VISUAL")
+                .or_else(|_| std::env::var("EDITOR"))
+                .unwrap_or_else(|_| default_editor().to_string());
+            // `$EDITOR` / `$VISUAL` often carry arguments (`code --wait`, `vim -f`),
+            // so split into program + args rather than treating the whole string as
+            // one executable name.
+            let mut parts = editor.split_whitespace();
+            let program = parts
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("empty editor command"))?;
+            let status = std::process::Command::new(program)
+                .args(parts)
+                .arg(&path)
+                .status()
+                .with_context(|| format!("Failed to launch editor '{}'", editor))?;
+            // Surface an aborted / failed editor as a non-zero CLI exit so scripts
+            // (and users) can tell the edit did not complete cleanly.
+            if !status.success() {
+                anyhow::bail!("Editor '{}' exited with {}", editor, status);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The fallback editor when neither `$VISUAL` nor `$EDITOR` is set.
+fn default_editor() -> &'static str {
+    if cfg!(windows) { "notepad" } else { "vi" }
 }
 
 /// Builds the `usage --json` payload, joining each model's token counts with

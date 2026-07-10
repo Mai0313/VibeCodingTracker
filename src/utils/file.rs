@@ -2,7 +2,7 @@ use crate::constants::buffer;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 
 /// Reads a JSONL file and returns one [`Value`] per non-empty line.
@@ -96,16 +96,44 @@ fn write_json_atomic_inner<T>(path: &Path, value: &T, pretty: bool) -> Result<()
 where
     T: serde::Serialize,
 {
+    persist_atomic(path, |tmp| {
+        if pretty {
+            serde_json::to_writer_pretty(tmp, value).context("Failed to serialize JSON")
+        } else {
+            serde_json::to_writer(tmp, value).context("Failed to serialize JSON")
+        }
+    })
+}
+
+/// Writes `contents` to `path` atomically (temp file in the same dir, fsync,
+/// rename), so a concurrent reader never observes a partial file.
+///
+/// The string counterpart of [`write_json_atomic`], used to persist non-JSON
+/// text such as the `~/.vct/config.toml` settings file.
+///
+/// # Errors
+///
+/// Returns an error if the parent directory cannot be created, the temp file
+/// cannot be written, or the final rename fails.
+pub fn write_string_atomic<P: AsRef<Path>>(path: P, contents: &str) -> Result<()> {
+    persist_atomic(path.as_ref(), |tmp| {
+        tmp.write_all(contents.as_bytes())
+            .context("Failed to write file contents")
+    })
+}
+
+/// Runs `write` against a temp file in `path`'s directory, fsyncs it, then
+/// atomically renames it over `path`.
+fn persist_atomic(
+    path: &Path,
+    write: impl FnOnce(&mut tempfile::NamedTempFile) -> Result<()>,
+) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir)
         .with_context(|| format!("Failed to create directory: {}", dir.display()))?;
     let mut tmp = tempfile::NamedTempFile::new_in(dir)
         .with_context(|| format!("Failed to create temp file in: {}", dir.display()))?;
-    if pretty {
-        serde_json::to_writer_pretty(&mut tmp, value).context("Failed to serialize JSON")?;
-    } else {
-        serde_json::to_writer(&mut tmp, value).context("Failed to serialize JSON")?;
-    }
+    write(&mut tmp)?;
     tmp.as_file().sync_all().ok();
     tmp.persist(path)
         .with_context(|| format!("Failed to persist file: {}", path.display()))?;

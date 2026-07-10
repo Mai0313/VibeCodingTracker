@@ -9,8 +9,11 @@ mod common;
 
 use common::{TempHome, fixture, fixture_str};
 use tempfile::TempDir;
-use vibe_coding_tracker::analysis::aggregator::aggregate_sessions_by_model_from_paths;
+use vibe_coding_tracker::analysis::aggregator::{
+    aggregate_sessions_by_model_from_paths, aggregate_sessions_by_model_from_paths_with,
+};
 use vibe_coding_tracker::cli::TimeRange;
+use vibe_coding_tracker::config::ProvidersConfig;
 use vibe_coding_tracker::models::ExtensionType;
 use vibe_coding_tracker::session::parser::{parse_session_file, parse_session_file_as};
 use vibe_coding_tracker::session::state::ParseMode;
@@ -130,6 +133,41 @@ fn test_analysis_file_operations() {
     assert!(first_record["totalEditLines"].is_number());
     assert!(first_record["totalReadLines"].is_number());
     assert!(first_record["totalWriteLines"].is_number());
+}
+
+#[test]
+fn disabled_provider_is_dropped_from_analysis_rollup() {
+    let home = TempHome::new();
+    home.put_claude_session(
+        "proj",
+        "session.jsonl",
+        &fixture_str("test_conversation_claude_code.jsonl"),
+    );
+    home.put_gemini_session(
+        "proj-hash",
+        "chat.jsonl",
+        &fixture_str("test_conversation_gemini.jsonl"),
+    );
+
+    // Turn Gemini off in `[providers]`: it must be skipped entirely.
+    let providers = ProvidersConfig {
+        gemini: false,
+        ..ProvidersConfig::default()
+    };
+    let data = aggregate_sessions_by_model_from_paths_with(&home.paths, TimeRange::All, providers)
+        .expect("aggregate with gemini disabled");
+
+    assert!(
+        data.rows
+            .iter()
+            .any(|r| r.model == "claude-sonnet-4-20250514"),
+        "the enabled Claude provider is still aggregated"
+    );
+    assert!(
+        !data.rows.iter().any(|r| r.model.starts_with("gemini-3")),
+        "the disabled Gemini provider must not appear, got: {:?}",
+        data.rows.iter().map(|r| &r.model).collect::<Vec<_>>()
+    );
 }
 
 #[test]

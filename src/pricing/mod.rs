@@ -107,7 +107,11 @@ pub fn fetch_model_pricing_with(url: &str, cache_dir: &Path) -> Result<ModelPric
 
     // Fetch from remote
     log::info!("Fetching model pricing from remote...");
+    // Bound the fetch so a slow/blocked network cannot hang the usage TUI's
+    // first frame (which fetches pricing synchronously on the first launch of
+    // the day, before any cache exists).
     let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
         .build()
         .context("Failed to create HTTP client")?;
 

@@ -535,3 +535,109 @@ fn all_short_flag_parses_for_both_subcommands() {
             .success();
     }
 }
+
+#[test]
+fn readonly_commands_do_not_create_config() {
+    // `version` (like other settings-free commands) must not materialize
+    // ~/.vct/config.toml as a home-directory side effect.
+    let home = TempHome::new();
+    child_cmd(&home).arg("version").assert().success();
+    assert!(
+        !home.home().join(".vct/config.toml").exists(),
+        "version must not create config.toml"
+    );
+}
+
+#[test]
+fn config_path_prints_config_toml_location() {
+    // Uses a per-child HOME so the check never touches the real `~/.vct`.
+    let home = TempHome::new();
+    child_cmd(&home)
+        .arg("config")
+        .arg("path")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("config.toml"));
+}
+
+#[test]
+fn config_show_creates_and_prints_settings() {
+    let home = TempHome::new();
+    child_cmd(&home)
+        .arg("config")
+        .arg("show")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[usage]"))
+        .stdout(predicate::str::contains("merge_models"))
+        .stdout(predicate::str::contains("[providers]"))
+        .stdout(predicate::str::contains("quota_panels"));
+
+    // The show path must have materialized the file under the temp home, and it
+    // must not fold in any version.json bookkeeping.
+    let config = home.home().join(".vct/config.toml");
+    assert!(config.exists());
+    let text = std::fs::read_to_string(&config).unwrap();
+    assert!(!text.contains("[update]"));
+}
+
+#[cfg(unix)]
+#[test]
+fn config_edit_splits_a_multi_word_editor_command() {
+    // `$EDITOR` / `$VISUAL` often carry arguments (`code --wait`); the program +
+    // args must be split, with the config path passed as the trailing arg.
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = TempHome::new();
+    let stub = home.home().join("stub-editor.sh");
+    let sentinel = home.home().join("editor-argv.txt");
+    std::fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
+            sentinel.display()
+        ),
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&stub).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&stub, perms).unwrap();
+
+    child_cmd(&home)
+        .env_remove("VISUAL")
+        .env("EDITOR", format!("{} --flag", stub.display()))
+        .arg("config")
+        .arg("edit")
+        .assert()
+        .success();
+
+    let argv = std::fs::read_to_string(&sentinel).expect("stub editor should have run");
+    assert!(argv.contains("--flag"), "the editor's own arg is forwarded");
+    assert!(
+        argv.contains("config.toml"),
+        "the config path is passed as the trailing arg, got: {argv:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn config_edit_propagates_a_failing_editor() {
+    // An editor that exits non-zero must make `vct config edit` exit non-zero, so
+    // scripts can tell the edit was aborted / failed.
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = TempHome::new();
+    let stub = home.home().join("failing-editor.sh");
+    std::fs::write(&stub, "#!/bin/sh\nexit 7\n").unwrap();
+    let mut perms = std::fs::metadata(&stub).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&stub, perms).unwrap();
+
+    child_cmd(&home)
+        .env_remove("VISUAL")
+        .env("EDITOR", stub.display().to_string())
+        .arg("config")
+        .arg("edit")
+        .assert()
+        .failure();
+}

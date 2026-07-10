@@ -7,13 +7,17 @@
 //! into a single [`TimeRange`].
 
 use clap::{Parser, Subcommand, ValueEnum};
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Time window applied when aggregating sessions.
 ///
 /// Each variant maps to a cutoff date via [`TimeRange::cutoff_date`];
-/// [`TimeRange::All`] is the default and disables filtering.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+/// [`TimeRange::All`] is the default and disables filtering. Serializes as a
+/// lowercase string (`"daily"` / `"weekly"` / `"monthly"` / `"all"`) so it can
+/// be reused verbatim as the `config.general.default_time_range` setting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum TimeRange {
     /// Today only.
     Daily,
@@ -60,14 +64,32 @@ impl TimeRange {
 /// exclusive at the clap layer (shared `period` group), so at most one is ever
 /// true here.
 pub fn resolve_time_range(daily: bool, weekly: bool, monthly: bool) -> TimeRange {
+    resolve_time_range_with_default(daily, weekly, monthly, false, TimeRange::All)
+}
+
+/// Collapses the period flags into a [`TimeRange`], falling back to `default`
+/// when the user passed none of them.
+///
+/// An explicit flag always wins (`--all` maps to [`TimeRange::All`]); only when
+/// every flag is unset does `default` (from `config.general.default_time_range`)
+/// apply. The flags share clap's `period` group, so at most one is ever true.
+pub fn resolve_time_range_with_default(
+    daily: bool,
+    weekly: bool,
+    monthly: bool,
+    all: bool,
+    default: TimeRange,
+) -> TimeRange {
     if daily {
         TimeRange::Daily
     } else if weekly {
         TimeRange::Weekly
     } else if monthly {
         TimeRange::Monthly
-    } else {
+    } else if all {
         TimeRange::All
+    } else {
+        default
     }
 }
 
@@ -216,4 +238,22 @@ pub enum Commands {
         #[arg(long, group = "fetch_format")]
         table: bool,
     },
+
+    /// Show or edit the persistent settings file (`~/.vct/config.toml`).
+    Config {
+        /// What to do; defaults to showing the current settings.
+        #[command(subcommand)]
+        action: Option<ConfigAction>,
+    },
+}
+
+/// Actions for the `config` subcommand.
+#[derive(Subcommand, Debug, Clone, Copy)]
+pub enum ConfigAction {
+    /// Print the config file path.
+    Path,
+    /// Print the current settings (default).
+    Show,
+    /// Open the config file in `$VISUAL` / `$EDITOR`.
+    Edit,
 }

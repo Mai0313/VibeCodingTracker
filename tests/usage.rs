@@ -9,7 +9,8 @@ mod common;
 
 use common::{TempHome, fixture_str};
 use vibe_coding_tracker::cli::TimeRange;
-use vibe_coding_tracker::usage::calculator::get_usage_from_paths;
+use vibe_coding_tracker::config::ProvidersConfig;
+use vibe_coding_tracker::usage::calculator::{get_usage_from_paths, get_usage_from_paths_with};
 
 #[test]
 fn empty_home_yields_no_usage() {
@@ -71,6 +72,40 @@ fn merges_multiple_providers_from_paths() {
     );
     assert!(data.provider_days.claude >= 1);
     assert!(data.provider_days.gemini >= 1);
+}
+
+#[test]
+fn disabled_provider_is_dropped_from_usage_rollup() {
+    let home = TempHome::new();
+    home.put_claude_session(
+        "proj",
+        "session.jsonl",
+        &fixture_str("test_conversation_claude_code.jsonl"),
+    );
+    home.put_gemini_session(
+        "proj-hash",
+        "chat.jsonl",
+        &fixture_str("test_conversation_gemini.jsonl"),
+    );
+
+    // Turn Gemini off in `[providers]`: it must be skipped entirely.
+    let providers = ProvidersConfig {
+        gemini: false,
+        ..ProvidersConfig::default()
+    };
+    let data = get_usage_from_paths_with(&home.paths, TimeRange::All, providers)
+        .expect("aggregate with gemini disabled");
+
+    assert!(
+        data.models.contains_key("claude-sonnet-4-20250514"),
+        "the enabled Claude provider is still aggregated"
+    );
+    assert!(
+        !data.models.keys().any(|m| m.starts_with("gemini-3")),
+        "the disabled Gemini provider must not appear, got: {:?}",
+        data.models.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(data.provider_days.gemini, 0, "no active Gemini days");
 }
 
 #[test]

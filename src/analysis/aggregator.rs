@@ -1,4 +1,5 @@
 use crate::cli::TimeRange;
+use crate::config::ProvidersConfig;
 use crate::constants::{FastHashMap, capacity};
 use crate::models::{CodeAnalysis, ExtensionType, ProviderActiveDays};
 use crate::session::parser::parse_session_file_as;
@@ -112,7 +113,20 @@ pub struct PerProviderAnalysisRows {
 /// # Ok::<(), anyhow::Error>(())
 /// ```
 pub fn aggregate_sessions_by_model(time_range: TimeRange) -> Result<AnalysisData> {
-    aggregate_sessions_by_model_from_paths(&crate::utils::resolve_paths()?, time_range)
+    aggregate_sessions_by_model_with(time_range, ProvidersConfig::default())
+}
+
+/// [`aggregate_sessions_by_model`] with explicit per-provider toggles (from
+/// `~/.vct/config.toml`). A disabled provider is skipped entirely.
+pub fn aggregate_sessions_by_model_with(
+    time_range: TimeRange,
+    providers: ProvidersConfig,
+) -> Result<AnalysisData> {
+    aggregate_sessions_by_model_from_paths_with(
+        &crate::utils::resolve_paths()?,
+        time_range,
+        providers,
+    )
 }
 
 /// Aggregates file-operation metrics from provider session directories rooted at
@@ -131,6 +145,16 @@ pub fn aggregate_sessions_by_model(time_range: TimeRange) -> Result<AnalysisData
 pub fn aggregate_sessions_by_model_from_paths(
     paths: &HelperPaths,
     time_range: TimeRange,
+) -> Result<AnalysisData> {
+    aggregate_sessions_by_model_from_paths_with(paths, time_range, ProvidersConfig::default())
+}
+
+/// [`aggregate_sessions_by_model_from_paths`] with explicit provider toggles
+/// (the injectable core used by the CLI once `config.toml` is loaded).
+pub fn aggregate_sessions_by_model_from_paths_with(
+    paths: &HelperPaths,
+    time_range: TimeRange,
+    providers: ProvidersConfig,
 ) -> Result<AnalysisData> {
     let mut aggregated: FastHashMap<String, AggregatedAnalysisRow> =
         FastHashMap::with_capacity(capacity::MODEL_COMBINATIONS);
@@ -156,7 +180,7 @@ pub fn aggregate_sessions_by_model_from_paths(
     let mut opencode_dates: HashSet<String> = HashSet::new();
     let mut cursor_dates: HashSet<String> = HashSet::new();
 
-    if paths.claude_session_dir.exists() {
+    if providers.claude && paths.claude_session_dir.exists() {
         // Walks the projects tree recursively, so top-level `<session>.jsonl` logs
         // and `<session>/subagents/agent-*.jsonl` logs are both collected here.
         aggregate_sessions_in_directory(
@@ -171,7 +195,7 @@ pub fn aggregate_sessions_by_model_from_paths(
         )?;
     }
 
-    if paths.codex_session_dir.exists() {
+    if providers.codex && paths.codex_session_dir.exists() {
         aggregate_sessions_in_directory(
             &paths.codex_session_dir,
             ExtensionType::Codex,
@@ -184,7 +208,7 @@ pub fn aggregate_sessions_by_model_from_paths(
         )?;
     }
 
-    if paths.copilot_session_dir.exists() {
+    if providers.copilot && paths.copilot_session_dir.exists() {
         // `events.jsonl` always lives exactly two levels under
         // `session-state/`; see the rationale in `usage::calculator`.
         aggregate_sessions_in_directory(
@@ -199,7 +223,7 @@ pub fn aggregate_sessions_by_model_from_paths(
         )?;
     }
 
-    if paths.gemini_session_dir.exists() {
+    if providers.gemini && paths.gemini_session_dir.exists() {
         aggregate_sessions_in_directory(
             &paths.gemini_session_dir,
             ExtensionType::Gemini,
@@ -214,7 +238,8 @@ pub fn aggregate_sessions_by_model_from_paths(
 
     // OpenCode lives in a single SQLite database rather than a session
     // directory, so it is read directly instead of walked.
-    if paths.opencode_db.exists()
+    if providers.opencode
+        && paths.opencode_db.exists()
         && let Err(err) = aggregate_opencode_sessions(
             &paths.opencode_db,
             &mut aggregated,
@@ -231,7 +256,8 @@ pub fn aggregate_sessions_by_model_from_paths(
 
     // Cursor's per-conversation chat stores live under `~/.cursor/chats`, read
     // directly like OpenCode rather than walked as a session directory.
-    if paths.cursor_chats_dir.exists()
+    if providers.cursor
+        && paths.cursor_chats_dir.exists()
         && let Err(err) = aggregate_cursor_sessions(
             &paths.cursor_chats_dir,
             &paths.cursor_tracking_db,

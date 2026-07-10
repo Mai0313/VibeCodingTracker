@@ -48,7 +48,7 @@ Choose your preferred view:
 
 ### Zero Configuration
 
-Automatically detects and processes logs from Claude Code, Codex, Copilot, Gemini, OpenCode, and Cursor. No setup required — just run and analyze.
+Automatically detects and processes logs from Claude Code, Codex, Copilot, Gemini, OpenCode, and Cursor. No setup required — just run and analyze. A `~/.vct/config.toml` is created with sensible defaults on first run if you ever want to tweak behavior (see [Configuration](#configuration)).
 
 ### Rich Insights
 
@@ -149,6 +149,7 @@ Commands:
   version     Display version information
   update      Update to the latest version from GitHub releases
   fetch       Fetch a provider's raw quota/usage API response
+  config      Show or edit the persistent settings file (~/.vct/config.toml)
   help        Print this message or the help of the given subcommand(s)
 ```
 
@@ -211,7 +212,7 @@ vct usage --table --merge-providers
 > Model rows are sorted by cost in ascending order, so the highest-spending model is listed last (right above the `TOTAL` row in `--table`). This applies to the interactive dashboard, `--table`, and `--text` output; `--json` preserves the same order. The interactive dashboard also hides models with zero usage in the selected range.
 
 > [!TIP]
-> The same model can show up as several rows when it is routed under different provider prefixes (`openai/gpt-5.5`, `azure/gpt-5.5`, plain `gpt-5.5`). `--merge-providers` collapses rows that share the base name after the first `/` (versions like `gpt-5.5` vs `gpt-5.4` stay separate) and sums their already-priced cost. In the interactive dashboard, press `m` to toggle it live; `--merge-providers` opens the dashboard already merged. `--json` is left as the raw per-model export.
+> The same model can show up as several rows when it is routed under different provider prefixes (`openai/gpt-5.5`, `azure/gpt-5.5`, plain `gpt-5.5`). `--merge-providers` collapses rows that share the base name after the first `/` (versions like `gpt-5.5` vs `gpt-5.4` stay separate) and sums their already-priced cost. In the interactive dashboard, press `m` to toggle it live (the choice is saved to `~/.vct/config.toml`, so the next launch remembers it); `--merge-providers` opens the dashboard already merged. `--json` is left as the raw per-model export.
 
 ### Preview: Interactive Dashboard (`vct usage`)
 
@@ -289,11 +290,11 @@ The tool automatically scans these directories:
 - `~/.copilot/session-state/<sessionId>/events.jsonl` (Copilot CLI)
 - `~/.gemini/tmp/<project_hash>/chats/*.jsonl` (Gemini CLI)
 - `~/.local/share/opencode/opencode.db` (OpenCode — SQLite database; honors `$XDG_DATA_HOME`)
-- `~/.cursor/chats/*/*/store.db` (Cursor — SQLite chat stores, for `analysis`) and Cursor's dashboard usage API (for `usage` tokens + cost, via the local session token; approximated from local context data when offline)
+- `~/.cursor/chats/*/*/store.db` (Cursor — SQLite chat stores, used for `analysis` and a local `usage` estimate consistent with the other providers)
 
 ### Live Quota Panels
 
-`vct usage` shows **live remaining quota for Claude Code, Codex, GitHub Copilot, and Cursor right in the dashboard — with zero setup.** No status-line hook, no config file: vct reads each provider's own credentials, calls its usage API on a background thread, and keeps the panels current while you work.
+`vct usage` shows **live remaining quota for Claude Code, Codex, GitHub Copilot, and Cursor right in the dashboard — with zero setup.** No status-line hook, no credentials to enter: vct reads each provider's own credentials, calls its usage API on a background thread, and keeps the panels current while you work. (Prefer a quieter dashboard? Trim `quota_panels` in [`config.toml`](#configuration), or set it to `[]` to hide the band.)
 
 ```
 ┌ Claude ─────────────────┐┌ Codex ──────────────────┐┌ Copilot ────────────────┐┌ Cursor ─────────────────┐
@@ -505,6 +506,68 @@ vct fetch copilot --table
 
 > [!NOTE]
 > The response body is printed to stdout as-is. On an HTTP error the body is still printed and the process exits non-zero; a 401/403 additionally prints a `run: <cli> login` hint on stderr.
+
+---
+
+## Configuration
+
+vct keeps its user settings in `~/.vct/config.toml`. The file is **created with defaults on first run**, so you never have to write it by hand — edit it only when you want to change a default.
+
+```toml
+[general]
+# Default time range when no --daily/--weekly/--monthly/--all flag is given.
+# one of: "daily" | "weekly" | "monthly" | "all"
+default_time_range = "all"
+
+[usage]
+# Start the usage dashboard with models merged across provider prefixes.
+# Toggled live with `m`; the last state is saved back here.
+merge_models = false
+# Which live quota panels to show in the usage TUI. Remove a name to hide that
+# panel; use an empty list ([]) to hide the whole band.
+quota_panels = ["claude", "codex", "copilot", "cursor"]
+# Seconds between automatic refreshes of the usage TUI (minimum 1).
+refresh_interval_secs = 10
+
+[analysis]
+# Seconds between automatic refreshes of the analysis TUI (minimum 1).
+refresh_interval_secs = 10
+
+[providers]
+# Include each provider's sessions in usage / analysis. Set a provider to false
+# to skip it entirely (no directory scan, no API).
+claude = true
+codex = true
+copilot = true
+gemini = true
+opencode = true
+cursor = true
+```
+
+| Setting                          | Effect                                                                                                                       |
+| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `general.default_time_range`     | Period used when you pass no `--daily/--weekly/--monthly/--all`. An explicit flag always wins.                               |
+| `usage.merge_models`             | Seeds the dashboard merged; the `m` toggle saves your last choice back here. `--merge-providers` forces on.                  |
+| `usage.quota_panels`             | Which quota panels to show (`claude` / `codex` / `copilot` / `cursor`); drop a name to hide it, `[]` to hide the whole band. |
+| `usage.refresh_interval_secs`    | Auto-refresh cadence of the `usage` dashboard (seconds).                                                                     |
+| `analysis.refresh_interval_secs` | Auto-refresh cadence of the `analysis` dashboard (seconds).                                                                  |
+| `providers.*`                    | Skip a provider entirely (no scan, no API) when `false` — handy if you don't use one.                                        |
+
+> [!NOTE]
+> Cursor `usage` is a **local estimate** from the chat stores, so it behaves like Claude Code / Codex / Copilot / Gemini (all computed from local session files) and needs no network. It undercounts Cursor's real spend, because much of it is billed under Cursor-internal model names the local data cannot price — treat Cursor cost as approximate.
+
+### Managing the file
+
+```bash
+# Print the config file path
+vct config path
+
+# Print the current settings
+vct config show
+
+# Open the file in $VISUAL / $EDITOR (falls back to vi / notepad)
+vct config edit
+```
 
 ---
 

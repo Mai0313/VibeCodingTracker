@@ -1,12 +1,14 @@
 //! Auto-refreshing TUI for the usage view.
 //!
 //! Runs a render loop that re-aggregates the session directories every
-//! [`USAGE_REFRESH_SECS`] seconds, repriced from a pricing map rebuilt at most
-//! every [`PRICING_REFRESH_SECS`], and highlights rows whose tokens changed
+//! `refresh_secs` seconds (from `config.toml`), repriced from a pricing map
+//! rebuilt at most every [`PRICING_REFRESH_SECS`], and highlights rows whose
+//! tokens changed
 //! since the last tick. The loop holds only the small per-model display state
 //! between frames so a resize repaints instantly without re-aggregating; memory
 //! is trimmed back to the OS after each refresh.
 
+use crate::config::ProvidersConfig;
 use crate::display::common::ProviderTotal;
 use crate::display::common::table::{
     create_controls, create_provider_row, create_ratatui_table, create_summary, main_layout,
@@ -118,10 +120,12 @@ struct QuotaView<'a> {
     copilot: &'a CopilotQuotaSnapshot,
     cursor: &'a CursorQuotaSnapshot,
     present: QuotaPresence,
+    /// Whether the bottom band is shown at all. `false` when `usage.quota_panels`
+    /// is empty, which drops the whole band (panels *and* the Provider Usage
+    /// table), not just the individual gauges.
+    band_enabled: bool,
 }
 
-/// How often the loop re-aggregates the session directories and repaints.
-const USAGE_REFRESH_SECS: u64 = 10;
 /// Claude quota worker cadence. Longer than Codex's 10s because the Claude
 /// usage endpoint rate-limits frequent polling; quota moves slowly enough that
 /// once a minute stays fresh.
@@ -152,14 +156,18 @@ const USAGE_PANELS_MIN_H: u16 = 22;
 /// Runs until the user quits; `time_range` filters which sessions are scanned.
 ///
 /// Features:
-/// - Auto-refresh every 10 seconds (usage + pricing)
+/// - Auto-refresh on a configurable interval (usage + pricing)
 /// - Real-time memory monitoring
 /// - Provider-grouped totals
 /// - Scrollable model table (arrow keys)
 /// - Keyboard controls: `q`, `Esc`, or `Ctrl+C` to exit, `r` to refresh, `m` to
 ///   toggle merging models that share a base name across provider prefixes
 ///   (e.g. `openai/gpt-5.5` + `azure/gpt-5.5`). `merge_providers` seeds the
-///   initial state.
+///   initial state and the `m` toggle is persisted back to `config.toml`.
+///
+/// `quota_panels` selects which live quota panels to show (by provider name);
+/// an empty list drops the band entirely. `providers` (from the config) selects
+/// which providers are aggregated. `refresh_secs` is the auto-refresh cadence.
 ///
 /// # Errors
 ///
@@ -174,17 +182,36 @@ const USAGE_PANELS_MIN_H: u16 = 22;
 pub fn display_usage_interactive(
     time_range: crate::cli::TimeRange,
     merge_providers: bool,
+    quota_panels: Vec<String>,
+    providers: ProvidersConfig,
+    refresh_secs: u64,
 ) -> anyhow::Result<()> {
     let mut terminal = setup_terminal()?;
-    let mut refresh_state = RefreshState::new(USAGE_REFRESH_SECS);
+    let mut refresh_state = RefreshState::new(refresh_secs.max(1));
 
     // Each provider's quota is fetched on its own background thread so a
     // blocking (or slow) HTTP call never stalls the render loop or the other
     // providers. Panels are seeded from the last-known cache so they show
     // immediately on launch, and a worker is spawned only for a provider whose
     // credentials are present. All workers share one HTTP client and shutdown
-    // flag.
-    let present = QuotaPresence::detect();
+    // flag. With no panels selected, treat every provider as absent so nothing
+    // is probed, no worker spawns, and the band is dropped.
+    let panel_on = |name: &str| crate::config::quota_panel_selected(&quota_panels, name);
+    // An empty `quota_panels` drops the whole bottom band (panels + the Provider
+    // Usage table), not just the gauges — a genuinely quieter dashboard.
+    let band_enabled = !quota_panels.is_empty();
+    let mut present = if band_enabled {
+        QuotaPresence::detect()
+    } else {
+        QuotaPresence::default()
+    };
+    // A panel shows only when it is selected in `usage.quota_panels` AND its
+    // provider is enabled in `[providers]` — a disabled or unselected provider
+    // is skipped entirely (no cache load, no worker, no quota API call).
+    present.claude &= providers.claude && panel_on("claude");
+    present.codex &= providers.codex && panel_on("codex");
+    present.copilot &= providers.copilot && panel_on("copilot");
+    present.cursor &= providers.cursor && panel_on("cursor");
     let quota_shutdown = Arc::new(AtomicBool::new(false));
     let claude_shared = Arc::new(Mutex::new(
         present
@@ -361,7 +388,7 @@ pub fn display_usage_interactive(
             // is not needed here.
             sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
 
-            match crate::usage::get_usage_from_directories(time_range) {
+            match crate::usage::get_usage_from_directories_with(time_range, providers) {
                 Ok(data) => {
                     usage_data = data.models;
                     per_provider_usage = data.per_provider;
@@ -482,6 +509,7 @@ pub fn display_usage_interactive(
                     copilot: &copilot_snapshot,
                     cursor: &cursor_snapshot,
                     present,
+                    band_enabled,
                 },
                 &mut scroll,
                 merge_enabled,
@@ -516,6 +544,9 @@ pub fn display_usage_interactive(
                         .map(|row| row.model.clone())
                 };
                 merge_enabled = !merge_enabled;
+                // Remember the choice for next launch (best-effort; a write
+                // failure must not disrupt the TUI).
+                let _ = crate::config::save_merge_models(merge_enabled);
                 // Materialize the merged rows when turning on; drop them (freeing
                 // the copy) when turning off.
                 if merge_enabled {
@@ -546,6 +577,7 @@ pub fn display_usage_interactive(
                         copilot: &copilot_snapshot,
                         cursor: &cursor_snapshot,
                         present,
+                        band_enabled,
                     },
                     &mut scroll,
                     merge_enabled,
@@ -570,6 +602,7 @@ pub fn display_usage_interactive(
                         copilot: &copilot_snapshot,
                         cursor: &cursor_snapshot,
                         present,
+                        band_enabled,
                     },
                     &mut scroll,
                     merge_enabled,
@@ -594,6 +627,7 @@ pub fn display_usage_interactive(
                         copilot: &copilot_snapshot,
                         cursor: &cursor_snapshot,
                         present,
+                        band_enabled,
                     },
                     &mut scroll,
                     merge_enabled,
@@ -685,8 +719,10 @@ fn render_usage_frame(
         // arrange decision uses `area.width`.
         let n = quota.present.count();
         let arrange = arrange_band(area.width, area.height, n);
-        let panels_height =
-            (area.height >= USAGE_PANELS_MIN_H).then(|| band_height(&arrange, provider_rows.len()));
+        // `band_enabled == false` (empty `quota_panels`) drops the whole band, so
+        // the scrollable table takes the full height — not just the gauges hidden.
+        let panels_height = (quota.band_enabled && area.height >= USAGE_PANELS_MIN_H)
+            .then(|| band_height(&arrange, provider_rows.len()));
         let chunks = main_layout(area, panels_height);
 
         let header = vec![

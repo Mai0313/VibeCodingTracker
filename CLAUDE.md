@@ -11,7 +11,7 @@ Rust CLI (`vibe_coding_tracker`, short alias `vct`) that scans on-disk session l
 
 Both subcommands support four output modes (interactive TUI / static table / plain text / JSON) and four time-range filters (`--daily` / `--weekly` / `--monthly` / `--all`). The interactive TUI is the default when no output flag is given.
 
-Two auxiliary subcommands round out the CLI: `vct version` prints build/toolchain info (table default, plus `--json` / `--text`), and `vct update` self-replaces the binary from the matching GitHub release asset (`--check` to inspect availability only, `--force` to skip the confirmation prompt).
+Three auxiliary subcommands round out the CLI: `vct version` prints build/toolchain info (table default, plus `--json` / `--text`), `vct update` self-replaces the binary from the matching GitHub release asset (`--check` to inspect availability only, `--force` to skip the confirmation prompt), and `vct config` shows/edits the persistent settings file (`path` / `show` / `edit`; see **Persistent config** below).
 
 ## Common commands
 
@@ -80,7 +80,7 @@ OpenCode cost is a special case: `usage::resolve_model_cost` prices an OpenCode 
 Cursor is split across two boundaries and, like OpenCode, bypasses the detector / `parse_session_file_*` — `src/session/cursor.rs` owns it:
 
 - **`analysis`** reads per-conversation blob stores at `~/.cursor/chats/*/*/store.db`. Each store is a content-addressed SQLite blob DAG: assistant turns live in **binary protobuf nodes** (`field 4` = the message JSON, `field 26` = timestamp, `field 5` = a running context-window gauge), while `Read` tool results live in standalone JSON blobs joined back by `toolCallId`. `read_cursor_analysis` decodes only those three fields (never the DAG topology, so it is robust to schema additions) and folds each turn's tool calls (`Write` / `StrReplace`→edit / `Read` / `Shell`→bash / `TodoWrite`) through `SessionParseState`. The conversation's model comes from `~/.cursor/ai-tracking/ai-code-tracking.db` (`conversationId -> model`, one model per conversation in practice), falling back to the store's hex-encoded `meta.lastUsedModel`.
-- **`usage`** does **not** come from local files — Cursor stores only the context gauge, not billing tokens. `read_cursor_usage` fetches real per-model tokens + cost from Cursor's individual dashboard API (`POST cursor.com/api/dashboard/get-filtered-usage-events`, `teamId:0`, `Origin: https://cursor.com`) reusing the quota panel's `WorkosCursorSessionToken` (via `quota::cursor::{read_cursor_session, cursor_ua}`), aggregates events per `(date, model)`, and caches them in `~/.vct/cursor_usage_events.json` (TTL `CURSOR_USAGE_CACHE_TTL_SECS`) so the TUI does not re-hit the endpoint every refresh. When the API is unreachable and no cache exists it falls back to a deliberately-rough, input-only **approximation** from the local context gauge (`$0` cost for models Cursor prices itself). Both Cursor SQLite DBs are opened read-only with the same temp-copy/WAL fallback as OpenCode.
+- **`usage`** is a **local estimate**: `read_cursor_usage` reads each conversation's context gauge from the chat stores (`approximation_events` → `aggregate_events`), counts it as cache-read tokens, and prices it with LiteLLM (a deliberately-rough, input-only approximation, `$0` for models Cursor prices itself), so Cursor behaves like every other provider (all local-file based) and needs no network or credentials. It undercounts Cursor's real spend because much of it is billed under Cursor-internal model names LiteLLM can't price; the numbers are approximate on purpose. There is **no** dashboard-billing-API path here — the `get-filtered-usage-events` fetch (and its `~/.vct/cursor_usage_events.json` cache) was removed as too much surface for the value; the raw endpoint is documented in `examples/quota.md` if it is ever reintroduced. Both Cursor SQLite DBs are opened read-only with the same temp-copy/WAL fallback as OpenCode.
 
 ### `ParseMode`
 
@@ -97,15 +97,16 @@ Cursor is split across two boundaries and, like OpenCode, bypasses the detector 
 
 Resolved by `src/utils/paths.rs` (`resolve_paths`):
 
-| Provider      | Source path                                                                                                                                                      |
-| ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Claude Code   | `~/.claude/projects/**/*.jsonl` (recursive — includes subagents)                                                                                                 |
-| Codex         | `~/.codex/sessions/**/*.jsonl`                                                                                                                                   |
-| Copilot CLI   | `~/.copilot/session-state/<sessionId>/events.jsonl` (depth-bounded walk via `COPILOT_SESSION_MAX_DEPTH` to skip per-session snapshot subtrees)                   |
-| Gemini CLI    | `~/.gemini/tmp/<project_hash>/chats/*.jsonl`                                                                                                                     |
-| OpenCode      | `~/.local/share/opencode/opencode.db` (SQLite database, read via `rusqlite`; honors `$XDG_DATA_HOME`)                                                            |
-| Cursor        | `~/.cursor/chats/*/*/store.db` (SQLite chat stores, `analysis`) + `~/.cursor/ai-tracking/ai-code-tracking.db` (model attribution); `usage` via the dashboard API |
-| Pricing cache | `~/.vct/model_pricing_YYYY-MM-DD.json`                                                                                                                           |
+| Provider      | Source path                                                                                                                                                  |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Claude Code   | `~/.claude/projects/**/*.jsonl` (recursive — includes subagents)                                                                                             |
+| Codex         | `~/.codex/sessions/**/*.jsonl`                                                                                                                               |
+| Copilot CLI   | `~/.copilot/session-state/<sessionId>/events.jsonl` (depth-bounded walk via `COPILOT_SESSION_MAX_DEPTH` to skip per-session snapshot subtrees)               |
+| Gemini CLI    | `~/.gemini/tmp/<project_hash>/chats/*.jsonl`                                                                                                                 |
+| OpenCode      | `~/.local/share/opencode/opencode.db` (SQLite database, read via `rusqlite`; honors `$XDG_DATA_HOME`)                                                        |
+| Cursor        | `~/.cursor/chats/*/*/store.db` (SQLite chat stores, `analysis` + a local `usage` estimate) + `~/.cursor/ai-tracking/ai-code-tracking.db` (model attribution) |
+| Pricing cache | `~/.vct/model_pricing_YYYY-MM-DD.json`                                                                                                                       |
+| User settings | `~/.vct/config.toml`                                                                                                                                         |
 
 ### Quota panels (`src/quota/`)
 
@@ -148,7 +149,11 @@ Global singleton `GLOBAL_FILE_CACHE` (capacity = 5 in `constants::capacity::FILE
 
 `vct update` resolves the current host's `(os, arch, libc)` tuple via `platform.rs`, fetches the matching asset from the latest GitHub Releases tag, extracts the archive (zip on Windows, tar.gz elsewhere) via `archive.rs`, then atomically replaces the running binary. `mod.rs` exposes `check_update()` (no-op probe) and `update_interactive(force)` (the path `--force` skips the confirmation prompt). `extract_semver_version()` strips the `git describe` suffix so the freshness comparison only looks at the SemVer tag.
 
-Every update check records the result to `~/.vct/version.json` via `version_cache::record_version_check` (`SelfVersion { latest_version, last_checked_at, dismissed_version }`) as groundwork for a future auto-update prompt. It preserves any existing `dismissed_version` and stamps `last_checked_at` with `now_rfc3339_utc_nanos()` (RFC3339 UTC nanoseconds, e.g. `2026-07-07T05:34:50.563606999Z`) — the same stamp the per-CLI version caches (`{claude,codex,copilot,cursor}_version.json`, written by `detect_cli_version`) now use for their `last_checked_at` field. All four version caches refresh once per UTC day.
+Every update check records the result to `~/.vct/version.json` via `version_cache::record_version_check` (`SelfVersion { latest_version, last_checked_at, dismissed_version }`) as groundwork for a future auto-update prompt. It preserves any existing `dismissed_version` and stamps `last_checked_at` with `now_rfc3339_utc_nanos()` (RFC3339 UTC nanoseconds, e.g. `2026-07-07T05:34:50.563606999Z`) — the same stamp the per-CLI version caches (`{claude,codex,copilot,cursor}_version.json`, written by `detect_cli_version`) now use for their `last_checked_at` field. All four version caches refresh once per UTC day. This `version.json` record is **separate** from `config.toml` (below) and is not folded into it.
+
+### Persistent config (`src/config/`)
+
+`config::load()` reads `~/.vct/config.toml` into a typed `Config` (`general` / `usage` / `analysis` / `providers` sections), **creating it from a commented template on first run**. Reads are infallible (missing/malformed → `Config::default`); writes go through `toml_edit` so hand-added comments and unknown keys survive (`save_merge_models` is the live-write path for the `m` toggle, and guards against a hand-edited non-table `[usage]` before indexing). `main.rs` loads it lazily — only inside the `usage` and `analysis`-batch branches, so settings-free commands (`version`, `fetch`, `analysis --path`) never read or create `~/.vct/config.toml` — and threads the values down: `default_time_range` via `resolve_time_range_with_default` (an explicit period flag always wins), `providers` (per-provider include toggles) into the `*_with` aggregation entry points (`get_usage_from_directories_with` / `aggregate_sessions_by_model_with`, whose bare wrappers default to all-providers), and `usage.quota_panels` (which quota panels to show) / `refresh_interval_secs` into the two interactive display functions. A disabled provider skips its whole aggregation block (no scan, no API). Adding a setting: extend the section struct + `DEFAULT_TEMPLATE` together (they are asserted equal by a unit test), and thread it through the `_with` seam rather than re-reading the file per refresh tick.
 
 ## Conventions
 
@@ -156,7 +161,8 @@ Every update check records the result to `~/.vct/version.json` via `version_cach
 - When CLI behavior or flags change, update **all three** READMEs (`README.md`, `README.zh-CN.md`, `README.zh-TW.md`) in the same PR — they must stay in sync.
 - The wrapper packages under `cli/nodejs/` and `cli/python/` download the matching GitHub release binary at install time; they're not built from source via `cargo`.
 - Test layout follows [Rust Book ch11-03](https://doc.rust-lang.org/book/ch11-03-test-organization.html): unit tests inline in `src/<module>/*.rs` inside `#[cfg(test)] mod tests`; each file under `tests/` compiles to its own binary, and `tests/common/mod.rs` is the shared helper module (`TempHome`, `fixture`). The integration-test split is one-file-per-subsystem:
-    - `tests/cli.rs` — `assert_cmd`-driven checks of the built binary, in two groups: a zero-env, zero-network group (version / help / `analysis --path` / flag conflicts) and per-child-HOME smoke tests (`usage` / `analysis` batch against an isolated temp HOME seeded with fixtures plus an offline pricing cache)
+    - `tests/cli.rs` — `assert_cmd`-driven checks of the built binary, in two groups: a zero-env, zero-network group (version / help / `analysis --path` / flag conflicts / `vct config path`+`show`) and per-child-HOME smoke tests (`usage` / `analysis` batch against an isolated temp HOME seeded with fixtures plus an offline pricing cache)
+    - `tests/config.rs` — `config::load_in` / `save_merge_models_in` over a `TempHome`'s `~/.vct`: first-run template creation, comment-preserving writes, `default_time_range` precedence, and that an existing `version.json` is left untouched (not folded into `config.toml`)
     - `tests/parser.rs` — golden-output comparison against `examples/analysis_result_*.json`, ignoring environment-specific fields (`insightsVersion`, `machineId`, `user`, `gitRemoteUrl`)
     - `tests/analysis.rs` — `aggregate_sessions_by_model_from_paths` rollup logic over a `TempHome`
     - `tests/usage.rs` — `get_usage_from_paths` aggregation over a `TempHome`

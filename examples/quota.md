@@ -154,6 +154,24 @@ curl -s "https://cursor.com/api/auth/me" \
 
 Usage lives under `.individualUsage.plan` (`autoPercentUsed` / `apiPercentUsed` / `totalPercentUsed`), `.individualUsage.onDemand`, and `.teamUsage`; billing window under `.billingCycleStart` / `.billingCycleEnd`. Monetary `used` / `limit` values are in cents (divide by 100).
 
+### Fetch token usage (dashboard billing)
+
+Real per-model token counts + cost per billing event, distinct from the quota summary above. Reuses the same `$COOKIE` synthesized in **Fetch quota**.
+
+```bash
+NOW_MS=$(( $(date +%s) * 1000 ))
+
+curl -s -X POST "https://cursor.com/api/dashboard/get-filtered-usage-events" \
+    -H "Cookie: $COOKIE" \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json" \
+    -H "Origin: https://cursor.com" \
+    -H "Referer: https://cursor.com/dashboard?tab=usage" \
+    -d "{\"teamId\":0,\"startDate\":0,\"endDate\":${NOW_MS},\"page\":1,\"pageSize\":5}" | jq
+```
+
+Response is `totalUsageEventsCount` + a `usageEventsDisplay[]` page; paginate `page` until you have read that many events. `startDate:0` = full history (set a millis cutoff to date-bound it); `pageSize` caps at ~1000 (HTTP 400 above that). Per event the load-bearing fields are `timestamp`, `model` (Cursor's own billing label, e.g. `default` / `gpt-5-high-fast` / `claude-opus-4-7-thinking-max`), `tokenUsage`, and cost `chargedCents` (fallback `tokenUsage.totalCents`), cents / 100 = USD.
+
 ### Refresh token
 
 Reactive. The `accessToken` is valid ~60 days (`offline_access` scope) and the official Cursor CLI / IDE keeps `auth.json` fresh in the background, so the simplest approach is to re-read the file each poll and use the token while its JWT `exp` is in the future.
