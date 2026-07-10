@@ -294,7 +294,7 @@ Totals (by Provider)
 
 ### 即時額度面板
 
-`vct usage` 會**在儀表板中直接顯示 Claude Code、Codex、GitHub Copilot 與 Cursor 的即時剩餘額度——完全零設定。** 不需要 status-line hook，也不需要手動輸入憑證：vct 會讀取各 provider 自己的 OAuth 憑證，在背景執行緒呼叫其用量 API，並在你工作時讓面板保持最新。（想要更清爽的儀表板嗎？在 [`config.toml`](#%E8%A8%AD%E5%AE%9A) 中設定 `show_quota_panels = false`。）
+`vct usage` 會**在儀表板中直接顯示 Claude Code、Codex、GitHub Copilot 與 Cursor 的即時剩餘額度——完全零設定。** 不需要 status-line hook，也不需要手動輸入憑證：vct 會讀取各 provider 自己的 OAuth 憑證，在背景執行緒呼叫其用量 API，並在你工作時讓面板保持最新。（想要更清爽的儀表板嗎？在 [`config.toml`](#%E8%A8%AD%E5%AE%9A) 中精簡 `quota_panels`,或設為 `[]` 隱藏整條。）
 
 ```
 ┌ Claude ─────────────────┐┌ Codex ──────────────────┐┌ Copilot ────────────────┐┌ Cursor ─────────────────┐
@@ -523,8 +523,8 @@ default_time_range = "all"
 # 啟動 usage 儀表板時，是否先把不同 provider 前綴的 model 合併。
 # 可用 `m` 即時切換;最後的狀態會存回這裡。
 merge_models = false
-# 是否在 usage TUI 中顯示即時額度面板（Claude / Codex / Copilot / Cursor）。
-show_quota_panels = true
+# 在 usage TUI 中顯示哪些即時額度面板;移除某個名稱即可隱藏該面板,用空列表 ([]) 隱藏整條。
+quota_panels = ["claude", "codex", "copilot", "cursor"]
 # usage TUI 自動刷新的間隔秒數（最少 1）。
 refresh_interval_secs = 10
 
@@ -555,7 +555,7 @@ usage_source = "local"
 | -------------------------------- | ----------------------------------------------------------------------------------------------------- |
 | `general.default_time_range`     | 未指定 `--daily/--weekly/--monthly/--all` 時使用的時間範圍。明確指定的 flag 一律優先。                |
 | `usage.merge_models`             | 讓儀表板一開始就是合併狀態;`m` 切換會把你最後的選擇存回這裡。`--merge-providers` 會強制開啟。         |
-| `usage.show_quota_panels`        | 設為 `false` 時隱藏即時額度面板（不探測憑證，也不啟動背景 worker）。                                  |
+| `usage.quota_panels`             | 顯示哪些額度面板（`claude` / `codex` / `copilot` / `cursor`）；移除名稱即可隱藏,`[]` 隱藏整條。       |
 | `usage.refresh_interval_secs`    | `usage` 儀表板自動刷新的間隔（秒）。                                                                  |
 | `analysis.refresh_interval_secs` | `analysis` 儀表板自動刷新的間隔（秒）。                                                               |
 | `providers.*`                    | 設為 `false` 時完全略過某個 provider（不掃描、不呼叫 API），沒在用的話很方便。                        |

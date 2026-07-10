@@ -193,7 +193,7 @@ fn main() -> Result<()> {
                 display_usage_interactive(
                     time_range,
                     merge,
-                    config.usage.show_quota_panels,
+                    config.usage.quota_panels.clone(),
                     config.providers,
                     config.cursor.usage_source,
                     config.usage.refresh_secs(),

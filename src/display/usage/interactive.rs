@@ -161,10 +161,10 @@ const USAGE_PANELS_MIN_H: u16 = 22;
 ///   (e.g. `openai/gpt-5.5` + `azure/gpt-5.5`). `merge_providers` seeds the
 ///   initial state and the `m` toggle is persisted back to `config.toml`.
 ///
-/// `show_quota_panels` gates the live quota band (skips detection / workers /
-/// rendering when false). `providers` / `cursor_source` come from the config and
-/// steer which providers are aggregated and where Cursor usage is read from.
-/// `refresh_secs` is the auto-refresh cadence.
+/// `quota_panels` selects which live quota panels to show (by provider name);
+/// an empty list drops the band entirely. `providers` / `cursor_source` come
+/// from the config and steer which providers are aggregated and where Cursor
+/// usage is read from. `refresh_secs` is the auto-refresh cadence.
 ///
 /// # Errors
 ///
@@ -179,7 +179,7 @@ const USAGE_PANELS_MIN_H: u16 = 22;
 pub fn display_usage_interactive(
     time_range: crate::cli::TimeRange,
     merge_providers: bool,
-    show_quota_panels: bool,
+    quota_panels: Vec<String>,
     providers: ProvidersConfig,
     cursor_source: CursorUsageSource,
     refresh_secs: u64,
@@ -192,19 +192,21 @@ pub fn display_usage_interactive(
     // providers. Panels are seeded from the last-known cache so they show
     // immediately on launch, and a worker is spawned only for a provider whose
     // credentials are present. All workers share one HTTP client and shutdown
-    // flag. When the quota panels are disabled in config, treat every provider
-    // as absent so nothing is probed, no worker spawns, and the band is dropped.
-    let mut present = if show_quota_panels {
-        QuotaPresence::detect()
-    } else {
+    // flag. With no panels selected, treat every provider as absent so nothing
+    // is probed, no worker spawns, and the band is dropped.
+    let panel_on = |name: &str| quota_panels.iter().any(|p| p.eq_ignore_ascii_case(name));
+    let mut present = if quota_panels.is_empty() {
         QuotaPresence::default()
+    } else {
+        QuotaPresence::detect()
     };
-    // A provider disabled in `[providers]` is skipped entirely (no cache load, no
-    // worker, no quota API call), matching its "skip it entirely" contract.
-    present.claude &= providers.claude;
-    present.codex &= providers.codex;
-    present.copilot &= providers.copilot;
-    present.cursor &= providers.cursor;
+    // A panel shows only when it is selected in `usage.quota_panels` AND its
+    // provider is enabled in `[providers]` — a disabled or unselected provider
+    // is skipped entirely (no cache load, no worker, no quota API call).
+    present.claude &= providers.claude && panel_on("claude");
+    present.codex &= providers.codex && panel_on("codex");
+    present.copilot &= providers.copilot && panel_on("copilot");
+    present.cursor &= providers.cursor && panel_on("cursor");
     let quota_shutdown = Arc::new(AtomicBool::new(false));
     let claude_shared = Arc::new(Mutex::new(
         present

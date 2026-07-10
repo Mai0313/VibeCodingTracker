@@ -29,8 +29,9 @@ default_time_range = "all"
 # Start the usage dashboard with models merged across provider prefixes.
 # Toggled live with `m`; the last state is saved back here.
 merge_models = false
-# Show the live quota panels (Claude / Codex / Copilot / Cursor) in the usage TUI.
-show_quota_panels = true
+# Which live quota panels to show in the usage TUI. Remove a name to hide that
+# panel; use an empty list ([]) to hide the whole band.
+quota_panels = ["claude", "codex", "copilot", "cursor"]
 # Seconds between automatic refreshes of the usage TUI (minimum 1).
 refresh_interval_secs = 10
 
@@ -87,9 +88,10 @@ pub struct UsageConfig {
     /// Seed the dashboard with provider-prefix merging on.
     #[serde(default)]
     pub merge_models: bool,
-    /// Show the live quota panels in the usage TUI.
-    #[serde(default = "default_true")]
-    pub show_quota_panels: bool,
+    /// Which live quota panels to show in the usage TUI (by provider name:
+    /// `claude` / `codex` / `copilot` / `cursor`). An empty list hides the band.
+    #[serde(default = "default_quota_panels")]
+    pub quota_panels: Vec<String>,
     /// Seconds between automatic usage-TUI refreshes.
     #[serde(default = "default_refresh_secs")]
     pub refresh_interval_secs: u64,
@@ -99,7 +101,7 @@ impl Default for UsageConfig {
     fn default() -> Self {
         Self {
             merge_models: false,
-            show_quota_panels: true,
+            quota_panels: default_quota_panels(),
             refresh_interval_secs: default_refresh_secs(),
         }
     }
@@ -109,6 +111,13 @@ impl UsageConfig {
     /// The refresh cadence, clamped to a sane minimum so a `0` cannot busy-loop.
     pub fn refresh_secs(&self) -> u64 {
         self.refresh_interval_secs.max(1)
+    }
+
+    /// Whether the quota panel for `provider` is enabled (case-insensitive).
+    pub fn shows_quota_panel(&self, provider: &str) -> bool {
+        self.quota_panels
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(provider))
     }
 }
 
@@ -197,6 +206,13 @@ fn default_refresh_secs() -> u64 {
     10
 }
 
+fn default_quota_panels() -> Vec<String> {
+    ["claude", "codex", "copilot", "cursor"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
 /// Loads settings from `~/.vct/config.toml`, creating it with defaults on first
 /// run.
 ///
@@ -271,7 +287,8 @@ mod tests {
         let cfg: Config = toml_edit::de::from_str(DEFAULT_TEMPLATE).unwrap();
         assert_eq!(cfg, Config::default());
         assert_eq!(cfg.general.default_time_range, TimeRange::All);
-        assert!(cfg.usage.show_quota_panels);
+        assert_eq!(cfg.usage.quota_panels, default_quota_panels());
+        assert!(cfg.usage.shows_quota_panel("cursor"));
         assert!(!cfg.usage.merge_models);
         assert_eq!(cfg.usage.refresh_interval_secs, 10);
         assert_eq!(cfg.analysis.refresh_interval_secs, 10);
@@ -281,11 +298,11 @@ mod tests {
     }
 
     #[test]
-    fn missing_sections_use_true_defaults() {
-        // An empty file must still default the opt-out booleans to true, which
-        // only holds because the section structs impl Default by hand.
+    fn missing_sections_use_defaults() {
+        // An empty file must still default the opt-out settings, which only holds
+        // because the section structs impl Default by hand.
         let cfg: Config = toml_edit::de::from_str("").unwrap();
-        assert!(cfg.usage.show_quota_panels);
+        assert_eq!(cfg.usage.quota_panels, default_quota_panels());
         assert!(cfg.providers.cursor);
         assert_eq!(cfg.cursor.usage_source, CursorUsageSource::Local);
         assert_eq!(cfg.usage.refresh_secs(), 10);
@@ -295,7 +312,18 @@ mod tests {
     fn partial_usage_section_keeps_panel_default() {
         let cfg: Config = toml_edit::de::from_str("[usage]\nmerge_models = true\n").unwrap();
         assert!(cfg.usage.merge_models);
-        assert!(cfg.usage.show_quota_panels);
+        assert_eq!(cfg.usage.quota_panels, default_quota_panels());
+    }
+
+    #[test]
+    fn quota_panels_can_be_narrowed_or_emptied() {
+        let cfg: Config =
+            toml_edit::de::from_str("[usage]\nquota_panels = [\"claude\"]\n").unwrap();
+        assert!(cfg.usage.shows_quota_panel("claude"));
+        assert!(!cfg.usage.shows_quota_panel("cursor"));
+
+        let empty: Config = toml_edit::de::from_str("[usage]\nquota_panels = []\n").unwrap();
+        assert!(!empty.usage.shows_quota_panel("claude"));
     }
 
     #[test]

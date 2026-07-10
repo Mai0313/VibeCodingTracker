@@ -20,7 +20,7 @@ fn load_in_creates_default_commented_file_when_absent() {
 
     assert_eq!(cfg, Config::default());
     assert_eq!(cfg.general.default_time_range, TimeRange::All);
-    assert!(cfg.usage.show_quota_panels);
+    assert!(cfg.usage.shows_quota_panel("cursor"));
     assert!(!cfg.usage.merge_models);
     // New sections default sensibly.
     assert!(cfg.providers.cursor);
@@ -71,12 +71,12 @@ fn save_merge_models_round_trips_and_preserves_comments() {
 
     let cfg = config::load_in(dir);
     assert!(cfg.usage.merge_models);
-    assert!(cfg.usage.show_quota_panels); // untouched
+    assert!(cfg.usage.shows_quota_panel("cursor")); // untouched
 
     let text = fs::read_to_string(dir.join("config.toml")).unwrap();
     assert!(text.contains("merge_models = true"));
     // The edit is format-preserving, so comments stay put.
-    assert!(text.contains("# Show the live quota panels"));
+    assert!(text.contains("# Which live quota panels to show"));
     assert!(text.contains("[cursor]"));
 }
 
@@ -104,14 +104,15 @@ fn existing_file_is_parsed_and_left_in_place() {
     fs::create_dir_all(dir).unwrap();
     fs::write(
         dir.join("config.toml"),
-        "[general]\ndefault_time_range = \"weekly\"\n\n[usage]\nmerge_models = true\nshow_quota_panels = false\n\n[providers]\ncursor = false\n\n[cursor]\nusage_source = \"api\"\n",
+        "[general]\ndefault_time_range = \"weekly\"\n\n[usage]\nmerge_models = true\nquota_panels = [\"claude\"]\n\n[providers]\ncursor = false\n\n[cursor]\nusage_source = \"api\"\n",
     )
     .unwrap();
 
     let cfg = config::load_in(dir);
     assert_eq!(cfg.general.default_time_range, TimeRange::Weekly);
     assert!(cfg.usage.merge_models);
-    assert!(!cfg.usage.show_quota_panels);
+    assert!(cfg.usage.shows_quota_panel("claude"));
+    assert!(!cfg.usage.shows_quota_panel("cursor"));
     // A missing provider key still defaults to true; the given one is honored.
     assert!(!cfg.providers.cursor);
     assert!(cfg.providers.claude);
