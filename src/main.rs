@@ -311,8 +311,10 @@ fn run_config(action: ConfigAction) -> Result<()> {
                 .arg(&path)
                 .status()
                 .with_context(|| format!("Failed to launch editor '{}'", editor))?;
+            // Surface an aborted / failed editor as a non-zero CLI exit so scripts
+            // (and users) can tell the edit did not complete cleanly.
             if !status.success() {
-                eprintln!("Editor exited with status: {}", status);
+                anyhow::bail!("Editor '{}' exited with {}", editor, status);
             }
         }
     }

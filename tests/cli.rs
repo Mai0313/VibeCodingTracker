@@ -618,3 +618,26 @@ fn config_edit_splits_a_multi_word_editor_command() {
         "the config path is passed as the trailing arg, got: {argv:?}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn config_edit_propagates_a_failing_editor() {
+    // An editor that exits non-zero must make `vct config edit` exit non-zero, so
+    // scripts can tell the edit was aborted / failed.
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = TempHome::new();
+    let stub = home.home().join("failing-editor.sh");
+    std::fs::write(&stub, "#!/bin/sh\nexit 7\n").unwrap();
+    let mut perms = std::fs::metadata(&stub).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&stub, perms).unwrap();
+
+    child_cmd(&home)
+        .env_remove("VISUAL")
+        .env("EDITOR", stub.display().to_string())
+        .arg("config")
+        .arg("edit")
+        .assert()
+        .failure();
+}
