@@ -120,6 +120,10 @@ struct QuotaView<'a> {
     copilot: &'a CopilotQuotaSnapshot,
     cursor: &'a CursorQuotaSnapshot,
     present: QuotaPresence,
+    /// Whether the bottom band is shown at all. `false` when `usage.quota_panels`
+    /// is empty, which drops the whole band (panels *and* the Provider Usage
+    /// table), not just the individual gauges.
+    band_enabled: bool,
 }
 
 /// Claude quota worker cadence. Longer than Codex's 10s because the Claude
@@ -193,10 +197,13 @@ pub fn display_usage_interactive(
     // flag. With no panels selected, treat every provider as absent so nothing
     // is probed, no worker spawns, and the band is dropped.
     let panel_on = |name: &str| crate::config::quota_panel_selected(&quota_panels, name);
-    let mut present = if quota_panels.is_empty() {
-        QuotaPresence::default()
-    } else {
+    // An empty `quota_panels` drops the whole bottom band (panels + the Provider
+    // Usage table), not just the gauges — a genuinely quieter dashboard.
+    let band_enabled = !quota_panels.is_empty();
+    let mut present = if band_enabled {
         QuotaPresence::detect()
+    } else {
+        QuotaPresence::default()
     };
     // A panel shows only when it is selected in `usage.quota_panels` AND its
     // provider is enabled in `[providers]` — a disabled or unselected provider
@@ -502,6 +509,7 @@ pub fn display_usage_interactive(
                     copilot: &copilot_snapshot,
                     cursor: &cursor_snapshot,
                     present,
+                    band_enabled,
                 },
                 &mut scroll,
                 merge_enabled,
@@ -569,6 +577,7 @@ pub fn display_usage_interactive(
                         copilot: &copilot_snapshot,
                         cursor: &cursor_snapshot,
                         present,
+                        band_enabled,
                     },
                     &mut scroll,
                     merge_enabled,
@@ -593,6 +602,7 @@ pub fn display_usage_interactive(
                         copilot: &copilot_snapshot,
                         cursor: &cursor_snapshot,
                         present,
+                        band_enabled,
                     },
                     &mut scroll,
                     merge_enabled,
@@ -617,6 +627,7 @@ pub fn display_usage_interactive(
                         copilot: &copilot_snapshot,
                         cursor: &cursor_snapshot,
                         present,
+                        band_enabled,
                     },
                     &mut scroll,
                     merge_enabled,
@@ -708,8 +719,10 @@ fn render_usage_frame(
         // arrange decision uses `area.width`.
         let n = quota.present.count();
         let arrange = arrange_band(area.width, area.height, n);
-        let panels_height =
-            (area.height >= USAGE_PANELS_MIN_H).then(|| band_height(&arrange, provider_rows.len()));
+        // `band_enabled == false` (empty `quota_panels`) drops the whole band, so
+        // the scrollable table takes the full height — not just the gauges hidden.
+        let panels_height = (quota.band_enabled && area.height >= USAGE_PANELS_MIN_H)
+            .then(|| band_height(&arrange, provider_rows.len()));
         let chunks = main_layout(area, panels_height);
 
         let header = vec![
