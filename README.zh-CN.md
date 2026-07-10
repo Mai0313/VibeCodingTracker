@@ -48,7 +48,7 @@
 
 ### 零配置
 
-自动检测并处理来自 Claude Code、Codex、Copilot、Gemini、OpenCode 和 Cursor 的日志。无需任何设置——直接运行即可分析。
+自动检测并处理来自 Claude Code、Codex、Copilot、Gemini、OpenCode 和 Cursor 的日志。无需任何设置——直接运行即可分析。首次运行时会自动生成一个带有合理默认值的 `~/.vct/config.toml`，方便你日后想调整行为时使用（参见 [配置](#%E9%85%8D%E7%BD%AE)）。
 
 ### 丰富的洞察
 
@@ -149,6 +149,7 @@ Commands:
   version     Display version information
   update      Update to the latest version from GitHub releases
   fetch       Fetch a provider's raw quota/usage API response
+  config      Show or edit the persistent settings file (~/.vct/config.toml)
   help        Print this message or the help of the given subcommand(s)
 ```
 
@@ -211,7 +212,7 @@ vct usage --table --merge-providers
 > Model 行会按 cost 升序排序，因此花费最高的 model 会排在最后（在 `--table` 中紧邻 `TOTAL` 行上方）。该排序适用于交互式面板、`--table` 与 `--text` 三种输出；`--json` 也会保持相同顺序。交互式面板还会隐藏在所选范围内用量为 0 的模型。
 
 > [!TIP]
-> 同一个 model 在不同 provider 前缀下路由时会显示成多行（`openai/gpt-5.5`、`azure/gpt-5.5`、纯 `gpt-5.5`）。`--merge-providers` 会把第一个 `/` 之后 base 名称相同的行合并（`gpt-5.5` 与 `gpt-5.4` 这类版本不同的仍分开），并把它们已定价的 cost 相加。在交互式面板中按 `m` 可实时切换；`--merge-providers` 则让面板一打开就是合并状态。`--json` 保持为逐一 model 的原始导出。
+> 同一个 model 在不同 provider 前缀下路由时会显示成多行（`openai/gpt-5.5`、`azure/gpt-5.5`、纯 `gpt-5.5`）。`--merge-providers` 会把第一个 `/` 之后 base 名称相同的行合并（`gpt-5.5` 与 `gpt-5.4` 这类版本不同的仍分开），并把它们已定价的 cost 相加。在交互式面板中按 `m` 可实时切换（该选择会保存到 `~/.vct/config.toml`，因此下次启动会记住它）；`--merge-providers` 则让面板一打开就是合并状态。`--json` 保持为逐一 model 的原始导出。
 
 ### 预览：交互式面板（`vct usage`）
 
@@ -289,11 +290,11 @@ Totals (by Provider)
 - `~/.copilot/session-state/<sessionId>/events.jsonl`（Copilot CLI）
 - `~/.gemini/tmp/<project_hash>/chats/*.jsonl`（Gemini CLI）
 - `~/.local/share/opencode/opencode.db`（OpenCode，SQLite 数据库；遵循 `$XDG_DATA_HOME`）
-- `~/.cursor/chats/*/*/store.db`（Cursor，SQLite 会话库，用于 `analysis`）以及 Cursor 官方 dashboard 用量 API（用于 `usage` 的 token 与费用，凭本地 session token 读取；离线时改用本地 context 数据估算）
+- `~/.cursor/chats/*/*/store.db`（Cursor，SQLite 会话库，用于 `analysis`，并且默认还会给出一个与其他 provider 一致的本地 `usage` 估算；若想改为从 Cursor 官方 dashboard API 拉取真实计费的 token 与费用，请在 [`config.toml`](#%E9%85%8D%E7%BD%AE) 中设置 `cursor.usage_source = "api"`）
 
 ### 实时额度面板
 
-`vct usage` 会**在仪表盘中直接显示 Claude Code、Codex、GitHub Copilot 与 Cursor 的实时剩余额度——完全零配置。** 不需要 status-line hook，也不需要配置文件：vct 会读取各 provider 自己的 OAuth 凭证，在后台线程调用其用量 API，并在你工作时保持面板持续更新。
+`vct usage` 会**在仪表盘中直接显示 Claude Code、Codex、GitHub Copilot 与 Cursor 的实时剩余额度——完全零配置。** 不需要 status-line hook，也无需手动输入任何凭证：vct 会读取各 provider 自己的 OAuth 凭证，在后台线程调用其用量 API，并在你工作时保持面板持续更新。（想要更清爽的面板？在 [`config.toml`](#%E9%85%8D%E7%BD%AE) 中设置 `show_quota_panels = false` 即可。）
 
 ```
 ┌ Claude ─────────────────┐┌ Codex ──────────────────┐┌ Copilot ────────────────┐┌ Cursor ─────────────────┐
@@ -505,6 +506,76 @@ vct fetch copilot --table
 
 > [!NOTE]
 > 响应 body 会原样打印到 stdout。遇到 HTTP 错误时仍会打印 body 并以非零状态退出；401/403 还会在 stderr 额外打印 `run: <cli> login` 提示。
+
+---
+
+## 配置
+
+vct 会把用户设置保存在 `~/.vct/config.toml` 中。该文件会在**首次运行时以默认值自动生成**，因此你完全不必手动编写——只有想修改某个默认值时才编辑它。
+
+```toml
+[general]
+# 未指定 --daily/--weekly/--monthly/--all flag 时使用的默认时间范围
+# 取值之一: "daily" | "weekly" | "monthly" | "all"
+default_time_range = "all"
+
+[usage]
+# 启动 usage 面板时就把跨 provider 前缀的 model 合并显示
+# 可用 `m` 实时切换, 最后一次的状态会保存回这里
+merge_models = false
+# 在 usage TUI 中显示实时额度面板 (Claude / Codex / Copilot / Cursor)
+show_quota_panels = true
+# usage TUI 自动刷新的间隔秒数 (最小为 1)
+refresh_interval_secs = 10
+
+[analysis]
+# analysis TUI 自动刷新的间隔秒数 (最小为 1)
+refresh_interval_secs = 10
+
+[providers]
+# 是否把各 provider 的 session 纳入 usage / analysis, 设为 false
+# 就会完全跳过它 (不扫描目录, 也不调用 API)
+claude = true
+codex = true
+copilot = true
+gemini = true
+opencode = true
+cursor = true
+
+[cursor]
+# Cursor `usage` 的 token/费用数字来自哪里:
+#   "local" — 从本地聊天库估算 (默认; 与其他 provider 一致, 快速且离线,
+#             但会明显低估)
+#   "api"   — Cursor 官方 dashboard 计费 API (真实且精确的 token/费用; 当 API
+#             无法访问时回退到本地估算)
+usage_source = "local"
+```
+
+| 设置项                           | 作用                                                                                                   |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `general.default_time_range`     | 当你没有传入 `--daily/--weekly/--monthly/--all` 时使用的时间范围。显式传入的 flag 始终优先。           |
+| `usage.merge_models`             | 让面板启动时就处于合并状态；`m` 切换会把你上次的选择保存回这里。`--merge-providers` 会强制开启。       |
+| `usage.show_quota_panels`        | 设为 `false` 时隐藏实时额度栏（不探测凭证，也不启动后台线程）。                                        |
+| `usage.refresh_interval_secs`    | `usage` 面板的自动刷新间隔（秒）。                                                                     |
+| `analysis.refresh_interval_secs` | `analysis` 面板的自动刷新间隔（秒）。                                                                  |
+| `providers.*`                    | 设为 `false` 时完全跳过某个 provider（不扫描、不调用 API）——如果你不用某个 provider 会很方便。         |
+| `cursor.usage_source`            | `local`（默认）像其他所有 provider 一样从本地库估算 Cursor 费用；`api` 则拉取真实计费的 token 与费用。 |
+
+> [!NOTE]
+> Cursor 的 `usage` 默认使用**本地估算**，因此它会像 Claude Code / Codex / Copilot / Gemini 一样（都是从本地 session 文件计算得出）无需联网。该估算会低估 Cursor 的真实花费，因为其中很大一部分是以 Cursor 内部的 model 名称计费，本地数据无法为这些名称定价。想要精确的计费数字时，请设置 `cursor.usage_source = "api"`；本地估算则作为离线时的回退方案。
+
+### 管理配置文件
+
+```bash
+# 打印配置文件路径
+vct config path
+
+# 打印当前设置
+vct config show
+
+# 在 $VISUAL / $EDITOR 中打开文件 (回退到 vi / notepad)
+vct config edit
+```
 
 ---
 
