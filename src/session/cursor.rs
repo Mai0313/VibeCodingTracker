@@ -32,7 +32,6 @@ use crate::usage::{CostSource, resolve_model_cost};
 use crate::utils::{TokenCounts, get_current_user, get_machine_id};
 use anyhow::{Context, Result, anyhow};
 use rusqlite::{Connection, OpenFlags};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -109,10 +108,10 @@ pub fn read_cursor_analysis(
 // usage: local estimate
 // ===========================================================================
 
-/// One usage aggregation row keyed by
-/// `(date, model)` so any time range can filter it locally.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CachedEvent {
+/// One usage aggregation row keyed by `(date, model)`, so any time range can
+/// filter it locally. A purely in-memory intermediate — never serialized.
+#[derive(Debug)]
+struct UsageEvent {
     date: String,
     model: String,
     input: i64,
@@ -122,10 +121,10 @@ struct CachedEvent {
     cost: f64,
 }
 
-/// Turns cached usage events into the `(date, CodeAnalysis, cost)` tuples the
+/// Turns the usage events into the `(date, CodeAnalysis, cost)` tuples the
 /// usage aggregator consumes, filtered by `time_range`.
 fn aggregate_events(
-    events: &[CachedEvent],
+    events: &[UsageEvent],
     time_range: TimeRange,
     user: &str,
     machine: &str,
@@ -146,11 +145,10 @@ fn aggregate_events(
 }
 
 // ===========================================================================
-// usage: offline approximation
+// usage: local estimate
 // ===========================================================================
 
-/// Builds all-time usage-approximation events from the local context gauge, for
-/// use when the dashboard API is unreachable.
+/// Builds all-time usage-estimate events from the local context gauge.
 ///
 /// Cursor stores only the running context-window size per assistant turn, not
 /// billed tokens. Each turn re-sends (and prompt-cache-reads) the accumulated
@@ -159,10 +157,9 @@ fn aggregate_events(
 /// that is the honest bucket and because it is then priced at the much cheaper
 /// cache rate rather than a wildly-inflated full-input rate. Input/output are
 /// unknown (`0`) and the stored cost is `0` (models Cursor prices itself, e.g.
-/// `composer-*`, have no LiteLLM entry and stay `$0`). Deliberately rough — the
-/// real numbers come from the API path. Returns all dates; the caller filters by
-/// time range after caching.
-fn approximation_events(chats_dir: &Path, tracking_db: &Path) -> Result<Vec<CachedEvent>> {
+/// `composer-*`, have no LiteLLM entry and stay `$0`). Deliberately rough.
+/// Returns all dates; the caller filters by time range.
+fn approximation_events(chats_dir: &Path, tracking_db: &Path) -> Result<Vec<UsageEvent>> {
     let conv_models = load_conversation_models(tracking_db);
     // Price the approximate cache-read tokens ourselves, since Cursor gives no
     // cost offline and the display treats a Cursor stored cost as authoritative.
@@ -197,7 +194,7 @@ fn approximation_events(chats_dir: &Path, tracking_db: &Path) -> Result<Vec<Cach
             };
             let (cost, _) =
                 resolve_model_cost(&model, &counts, &pricing, CostSource::OpenCodeStored(0.0));
-            CachedEvent {
+            UsageEvent {
                 date,
                 model,
                 input: 0,
@@ -953,7 +950,7 @@ mod tests {
     #[test]
     fn aggregate_events_filters_and_builds_records() {
         let events = vec![
-            CachedEvent {
+            UsageEvent {
                 date: "2999-01-01".to_string(),
                 model: "claude-sonnet-4.6".to_string(),
                 input: 100,
@@ -962,7 +959,7 @@ mod tests {
                 cache_write: 10,
                 cost: 1.5,
             },
-            CachedEvent {
+            UsageEvent {
                 date: "2000-01-01".to_string(),
                 model: "composer-2".to_string(),
                 input: 5,

@@ -266,11 +266,11 @@ pub fn get_usage_from_paths_with(
         );
     }
 
-    // Cursor's usage comes from its dashboard API (billing tokens + cost), with
-    // a local approximation fallback, rather than a walked session directory.
-    // Attempt it whenever either the chat stores or the credentials are present.
+    // Cursor's usage is a local estimate from its chat stores (read directly like
+    // OpenCode, not a walked session directory), so it is only attempted when the
+    // chat stores are present — matching the analysis path.
     if providers.cursor
-        && (paths.cursor_chats_dir.exists() || paths.cursor_dir.join("auth.json").exists())
+        && paths.cursor_chats_dir.exists()
         && let Err(err) = process_cursor_usage(
             &paths.cursor_chats_dir,
             &paths.cursor_tracking_db,
@@ -429,12 +429,11 @@ fn process_opencode_usage(
     Ok(())
 }
 
-/// Reads Cursor's per-model usage (dashboard API, or local approximation) and
+/// Reads Cursor's per-model usage (a local estimate from the chat stores) and
 /// merges it into both the global and Cursor-scoped maps.
 ///
-/// Mirrors [`process_opencode_usage`]: Cursor reports its own billed cost per
-/// usage event, so it uses the same stored-cost path (exact LiteLLM match or
-/// the reported cost) rather than a fuzzy price guess.
+/// Mirrors [`process_opencode_usage`]: the estimate carries its own per-model
+/// cost, so it uses the same stored-cost path rather than a fuzzy price guess.
 fn process_cursor_usage(
     chats_dir: &Path,
     tracking_db: &Path,
@@ -498,10 +497,10 @@ pub enum CostSource {
     /// novel model like `deepseek-v4-pro` reports OpenCode's own cost instead of
     /// being priced against a loosely-similar name.
     OpenCodeStored(f64),
-    /// Cursor: the dashboard API's own billed cost, used **verbatim** and never
-    /// re-priced from tokens, so a row that has an exact LiteLLM match (e.g.
-    /// `gemini-2.5-pro`) still matches what Cursor actually billed rather than
-    /// the LiteLLM list price.
+    /// Cursor: the local estimate's own per-model cost, used **verbatim** and
+    /// never re-priced from tokens (it is already priced when the estimate is
+    /// built), so a merged row can't be re-scored against another provider's
+    /// same-named model.
     CursorStored(f64),
 }
 
