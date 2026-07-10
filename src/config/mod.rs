@@ -232,6 +232,13 @@ pub fn save_merge_models(enabled: bool) -> Result<()> {
 /// [`save_merge_models`] rooted at an explicit directory (test seam).
 pub fn save_merge_models_in(dir: &Path, enabled: bool) -> Result<()> {
     edit_in(dir, |doc| {
+        // A hand-edited file could make `usage` a scalar (`usage = "bad"`);
+        // replace any non-table with an empty table so indexing into it below
+        // cannot panic. A valid `[usage]` table is left intact (comments/keys
+        // preserved).
+        if !doc["usage"].is_table() {
+            doc["usage"] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
         doc["usage"]["merge_models"] = value(enabled);
     })
 }

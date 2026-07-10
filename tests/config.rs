@@ -81,6 +81,23 @@ fn save_merge_models_round_trips_and_preserves_comments() {
 }
 
 #[test]
+fn save_merge_models_survives_malformed_usage_section() {
+    // A hand-edited file where `usage` is a scalar must not panic the best-effort
+    // write from the TUI's `m` toggle; the section is repaired to a table.
+    let th = TempHome::new();
+    let dir = &th.paths.cache_dir;
+    fs::create_dir_all(dir).unwrap();
+    fs::write(dir.join("config.toml"), "usage = \"bad\"\n").unwrap();
+
+    config::save_merge_models_in(dir, true).unwrap();
+
+    let cfg = config::load_in(dir);
+    assert!(cfg.usage.merge_models);
+    let text = fs::read_to_string(dir.join("config.toml")).unwrap();
+    assert!(text.contains("merge_models = true"));
+}
+
+#[test]
 fn existing_file_is_parsed_and_left_in_place() {
     let th = TempHome::new();
     let dir = &th.paths.cache_dir;
