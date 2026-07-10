@@ -9,6 +9,7 @@
 //! [`UsageData`] for why.
 
 use crate::cli::TimeRange;
+use crate::config::{CursorUsageSource, ProvidersConfig};
 use crate::constants::{FastHashMap, capacity};
 use crate::models::{
     CodeAnalysis, ExtensionType, PerProviderUsage, Provider, ProviderActiveDays, UsageResult,
@@ -140,7 +141,22 @@ fn extract_conversation_usage_from_analysis(analysis: &CodeAnalysis) -> FastHash
 /// # Ok::<(), anyhow::Error>(())
 /// ```
 pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
-    get_usage_from_paths(&resolve_paths()?, time_range)
+    get_usage_from_directories_with(
+        time_range,
+        ProvidersConfig::default(),
+        CursorUsageSource::default(),
+    )
+}
+
+/// [`get_usage_from_directories`] with explicit per-provider toggles and Cursor
+/// usage source (from `~/.vct/config.toml`). A disabled provider is skipped
+/// entirely; `cursor_source` selects the local estimate vs the dashboard API.
+pub fn get_usage_from_directories_with(
+    time_range: TimeRange,
+    providers: ProvidersConfig,
+    cursor_source: CursorUsageSource,
+) -> Result<UsageData> {
+    get_usage_from_paths_with(&resolve_paths()?, time_range, providers, cursor_source)
 }
 
 /// Aggregates token usage from provider session directories rooted at an
@@ -157,6 +173,22 @@ pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
 /// Returns an error only under the same conditions as
 /// [`get_usage_from_directories`].
 pub fn get_usage_from_paths(paths: &HelperPaths, time_range: TimeRange) -> Result<UsageData> {
+    get_usage_from_paths_with(
+        paths,
+        time_range,
+        ProvidersConfig::default(),
+        CursorUsageSource::default(),
+    )
+}
+
+/// [`get_usage_from_paths`] with explicit provider toggles and Cursor usage
+/// source (the injectable core used by the CLI once `config.toml` is loaded).
+pub fn get_usage_from_paths_with(
+    paths: &HelperPaths,
+    time_range: TimeRange,
+    providers: ProvidersConfig,
+    cursor_source: CursorUsageSource,
+) -> Result<UsageData> {
     let mut result = FastHashMap::with_capacity(capacity::MODEL_COMBINATIONS);
     let mut per_provider = PerProviderUsage::default();
     let mut stored_costs = StoredCosts::default();
@@ -168,7 +200,7 @@ pub fn get_usage_from_paths(paths: &HelperPaths, time_range: TimeRange) -> Resul
     let mut opencode_dates: HashSet<String> = HashSet::new();
     let mut cursor_dates: HashSet<String> = HashSet::new();
 
-    if paths.claude_session_dir.exists() {
+    if providers.claude && paths.claude_session_dir.exists() {
         // Walks the projects tree recursively, so top-level `<session>.jsonl` logs
         // and `<session>/subagents/agent-*.jsonl` logs are both collected here.
         process_usage_directory(
@@ -183,7 +215,7 @@ pub fn get_usage_from_paths(paths: &HelperPaths, time_range: TimeRange) -> Resul
         )?;
     }
 
-    if paths.codex_session_dir.exists() {
+    if providers.codex && paths.codex_session_dir.exists() {
         process_usage_directory(
             &paths.codex_session_dir,
             ExtensionType::Codex,
@@ -196,7 +228,7 @@ pub fn get_usage_from_paths(paths: &HelperPaths, time_range: TimeRange) -> Resul
         )?;
     }
 
-    if paths.copilot_session_dir.exists() {
+    if providers.copilot && paths.copilot_session_dir.exists() {
         // `events.jsonl` always lives exactly two levels under
         // `session-state/`. Bounding the walk here keeps per-session
         // snapshot subtrees (`rewind-snapshots/backups/*`, `files/*`, …)
@@ -214,7 +246,7 @@ pub fn get_usage_from_paths(paths: &HelperPaths, time_range: TimeRange) -> Resul
         )?;
     }
 
-    if paths.gemini_session_dir.exists() {
+    if providers.gemini && paths.gemini_session_dir.exists() {
         process_usage_directory(
             &paths.gemini_session_dir,
             ExtensionType::Gemini,
@@ -229,7 +261,8 @@ pub fn get_usage_from_paths(paths: &HelperPaths, time_range: TimeRange) -> Resul
 
     // OpenCode lives in a single SQLite database rather than a session
     // directory, so it is read directly instead of walked.
-    if paths.opencode_db.exists()
+    if providers.opencode
+        && paths.opencode_db.exists()
         && let Err(err) = process_opencode_usage(
             &paths.opencode_db,
             &mut result,
@@ -248,7 +281,8 @@ pub fn get_usage_from_paths(paths: &HelperPaths, time_range: TimeRange) -> Resul
     // Cursor's usage comes from its dashboard API (billing tokens + cost), with
     // a local approximation fallback, rather than a walked session directory.
     // Attempt it whenever either the chat stores or the credentials are present.
-    if (paths.cursor_chats_dir.exists() || paths.cursor_dir.join("auth.json").exists())
+    if providers.cursor
+        && (paths.cursor_chats_dir.exists() || paths.cursor_dir.join("auth.json").exists())
         && let Err(err) = process_cursor_usage(
             &paths.cursor_chats_dir,
             &paths.cursor_tracking_db,
@@ -257,6 +291,7 @@ pub fn get_usage_from_paths(paths: &HelperPaths, time_range: TimeRange) -> Resul
             &mut stored_costs.cursor,
             &mut cursor_dates,
             time_range,
+            cursor_source,
         )
     {
         eprintln!("Warning: Failed to read Cursor usage: {err}");
@@ -413,6 +448,7 @@ fn process_opencode_usage(
 /// Mirrors [`process_opencode_usage`]: Cursor reports its own billed cost per
 /// usage event, so it uses the same stored-cost path (exact LiteLLM match or
 /// the reported cost) rather than a fuzzy price guess.
+#[allow(clippy::too_many_arguments)]
 fn process_cursor_usage(
     chats_dir: &Path,
     tracking_db: &Path,
@@ -421,8 +457,9 @@ fn process_cursor_usage(
     stored_costs: &mut FastHashMap<String, f64>,
     unique_dates: &mut HashSet<String>,
     time_range: TimeRange,
+    cursor_source: CursorUsageSource,
 ) -> Result<()> {
-    let sessions = read_cursor_usage(chats_dir, tracking_db, time_range)?;
+    let sessions = read_cursor_usage(chats_dir, tracking_db, time_range, cursor_source)?;
     fold_stored_cost_sessions(
         sessions,
         global_result,

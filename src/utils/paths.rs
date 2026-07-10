@@ -304,6 +304,18 @@ pub fn get_cursor_usage_cache_path() -> Result<PathBuf> {
     Ok(get_cache_dir()?.join("cursor_usage.json"))
 }
 
+/// Returns the persistent settings file path (`~/.vct/config.toml`).
+///
+/// As a side effect of resolving the cache directory, the directory is created
+/// if missing.
+///
+/// # Errors
+///
+/// Returns an error if the cache directory cannot be resolved or created.
+pub fn get_config_path() -> Result<PathBuf> {
+    Ok(get_cache_dir()?.join("config.toml"))
+}
+
 /// Returns this tool's own version record path (`~/.vct/version.json`).
 ///
 /// Holds `{ latest_version, last_checked_at, dismissed_version }`, written by

@@ -5,6 +5,7 @@
 //! redrawing on terminal resize without re-aggregating.
 
 use crate::analysis::{AnalysisData, PerProviderAnalysisRows};
+use crate::config::ProvidersConfig;
 use crate::display::analysis::averages::{
     AnalysisProviderTotals, AnalysisRow, build_analysis_provider_rows,
     calculate_analysis_provider_totals_from_per_provider, convert_to_analysis_rows,
@@ -28,8 +29,6 @@ use ratatui::{
 use std::io;
 use sysinfo::{Pid, System};
 
-/// Seconds between automatic re-aggregation refreshes of the table.
-const ANALYSIS_REFRESH_SECS: u64 = 10;
 /// Upper bound on the number of rows tracked for the "recently updated"
 /// highlight, capping the tracker's memory footprint.
 const MAX_TRACKED_ANALYSIS_ROWS: usize = 100;
@@ -60,12 +59,14 @@ fn analysis_panels_height(area_height: u16, provider_row_count: usize) -> Option
 /// Render the `analysis` view as an interactive, auto-refreshing TUI.
 ///
 /// Takes over the terminal and runs a draw loop until the user quits. Every
-/// `ANALYSIS_REFRESH_SECS` it re-aggregates the session directories for
-/// `time_range`, highlights rows whose counters changed, and updates the
-/// process-memory readout. `initial_data` only gates the empty-state shortcut;
-/// the loop always re-fetches its own data. If a refresh fails the error is
-/// logged and the loop continues with empty data rather than tearing down the
-/// TUI. Returns immediately after printing a message if `initial_data` is empty.
+/// `refresh_secs` it re-aggregates the session directories for `time_range`
+/// (honoring the `providers` toggles), highlights rows whose counters changed,
+/// and updates the process-memory readout. `initial_data` (the aggregation the
+/// caller already performed) is consumed to render the first frame, so the tree
+/// is not walked a second time on launch; every subsequent tick re-aggregates.
+/// If a refresh fails the error is logged and the loop continues with empty data
+/// rather than tearing down the TUI. Returns immediately after printing a message
+/// if `initial_data` is empty.
 ///
 /// # Errors
 ///
@@ -84,12 +85,14 @@ fn analysis_panels_height(area_height: u16, provider_row_count: usize) -> Option
 /// use vibe_coding_tracker::TimeRange;
 ///
 /// let data = aggregate_sessions_by_model(TimeRange::All)?;
-/// display_analysis_interactive(&data, TimeRange::All)?;
+/// display_analysis_interactive(data, TimeRange::All, Default::default(), 10)?;
 /// # Ok::<(), anyhow::Error>(())
 /// ```
 pub fn display_analysis_interactive(
-    initial_data: &AnalysisData,
+    initial_data: AnalysisData,
     time_range: crate::cli::TimeRange,
+    providers: ProvidersConfig,
+    refresh_secs: u64,
 ) -> anyhow::Result<()> {
     if initial_data.rows.is_empty() {
         println!("No analysis data found");
@@ -98,7 +101,7 @@ pub fn display_analysis_interactive(
 
     // Setup terminal
     let mut terminal = setup_terminal()?;
-    let mut refresh_state = RefreshState::new(ANALYSIS_REFRESH_SECS);
+    let mut refresh_state = RefreshState::new(refresh_secs.max(1));
 
     // Initialize system for memory monitoring. We only read our own process
     // stats, so start from an empty `System` to avoid loading the machine's
@@ -121,6 +124,11 @@ pub fn display_analysis_interactive(
     let mut totals = AnalysisRow::default();
     let mut provider_totals = AnalysisProviderTotals::default();
 
+    // The caller already aggregated once to build `initial_data`; reuse it for
+    // the very first frame instead of walking every session tree a second time
+    // on launch. Consumed on the first tick, `None` thereafter.
+    let mut initial_data = Some(initial_data);
+
     loop {
         if refresh_state.should_refresh() {
             refresh_state.mark_refreshed();
@@ -130,15 +138,20 @@ pub fn display_analysis_interactive(
             // the host over long TUI sessions.
             sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
 
-            // Fetch fresh data with error logging
-            let current_data = match crate::analysis::aggregate_sessions_by_model(time_range) {
-                Ok(data) => data,
-                Err(e) => {
-                    log::warn!("Failed to analyze sessions: {}", e);
-                    AnalysisData {
-                        rows: Vec::new(),
-                        per_provider: PerProviderAnalysisRows::default(),
-                        provider_days: Default::default(),
+            // First tick reuses the caller's aggregation; later ticks re-fetch.
+            let current_data = match initial_data.take() {
+                Some(data) => data,
+                None => {
+                    match crate::analysis::aggregate_sessions_by_model_with(time_range, providers) {
+                        Ok(data) => data,
+                        Err(e) => {
+                            log::warn!("Failed to analyze sessions: {}", e);
+                            AnalysisData {
+                                rows: Vec::new(),
+                                per_provider: PerProviderAnalysisRows::default(),
+                                provider_days: Default::default(),
+                            }
+                        }
                     }
                 }
             };

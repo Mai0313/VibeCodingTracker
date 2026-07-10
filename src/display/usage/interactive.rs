@@ -1,12 +1,14 @@
 //! Auto-refreshing TUI for the usage view.
 //!
 //! Runs a render loop that re-aggregates the session directories every
-//! [`USAGE_REFRESH_SECS`] seconds, repriced from a pricing map rebuilt at most
-//! every [`PRICING_REFRESH_SECS`], and highlights rows whose tokens changed
+//! `refresh_secs` seconds (from `config.toml`), repriced from a pricing map
+//! rebuilt at most every [`PRICING_REFRESH_SECS`], and highlights rows whose
+//! tokens changed
 //! since the last tick. The loop holds only the small per-model display state
 //! between frames so a resize repaints instantly without re-aggregating; memory
 //! is trimmed back to the OS after each refresh.
 
+use crate::config::{CursorUsageSource, ProvidersConfig};
 use crate::display::common::ProviderTotal;
 use crate::display::common::table::{
     create_controls, create_provider_row, create_ratatui_table, create_summary, main_layout,
@@ -120,8 +122,6 @@ struct QuotaView<'a> {
     present: QuotaPresence,
 }
 
-/// How often the loop re-aggregates the session directories and repaints.
-const USAGE_REFRESH_SECS: u64 = 10;
 /// Claude quota worker cadence. Longer than Codex's 10s because the Claude
 /// usage endpoint rate-limits frequent polling; quota moves slowly enough that
 /// once a minute stays fresh.
@@ -152,14 +152,19 @@ const USAGE_PANELS_MIN_H: u16 = 22;
 /// Runs until the user quits; `time_range` filters which sessions are scanned.
 ///
 /// Features:
-/// - Auto-refresh every 10 seconds (usage + pricing)
+/// - Auto-refresh on a configurable interval (usage + pricing)
 /// - Real-time memory monitoring
 /// - Provider-grouped totals
 /// - Scrollable model table (arrow keys)
 /// - Keyboard controls: `q`, `Esc`, or `Ctrl+C` to exit, `r` to refresh, `m` to
 ///   toggle merging models that share a base name across provider prefixes
 ///   (e.g. `openai/gpt-5.5` + `azure/gpt-5.5`). `merge_providers` seeds the
-///   initial state.
+///   initial state and the `m` toggle is persisted back to `config.toml`.
+///
+/// `show_quota_panels` gates the live quota band (skips detection / workers /
+/// rendering when false). `providers` / `cursor_source` come from the config and
+/// steer which providers are aggregated and where Cursor usage is read from.
+/// `refresh_secs` is the auto-refresh cadence.
 ///
 /// # Errors
 ///
@@ -174,17 +179,26 @@ const USAGE_PANELS_MIN_H: u16 = 22;
 pub fn display_usage_interactive(
     time_range: crate::cli::TimeRange,
     merge_providers: bool,
+    show_quota_panels: bool,
+    providers: ProvidersConfig,
+    cursor_source: CursorUsageSource,
+    refresh_secs: u64,
 ) -> anyhow::Result<()> {
     let mut terminal = setup_terminal()?;
-    let mut refresh_state = RefreshState::new(USAGE_REFRESH_SECS);
+    let mut refresh_state = RefreshState::new(refresh_secs.max(1));
 
     // Each provider's quota is fetched on its own background thread so a
     // blocking (or slow) HTTP call never stalls the render loop or the other
     // providers. Panels are seeded from the last-known cache so they show
     // immediately on launch, and a worker is spawned only for a provider whose
     // credentials are present. All workers share one HTTP client and shutdown
-    // flag.
-    let present = QuotaPresence::detect();
+    // flag. When the quota panels are disabled in config, treat every provider
+    // as absent so nothing is probed, no worker spawns, and the band is dropped.
+    let present = if show_quota_panels {
+        QuotaPresence::detect()
+    } else {
+        QuotaPresence::default()
+    };
     let quota_shutdown = Arc::new(AtomicBool::new(false));
     let claude_shared = Arc::new(Mutex::new(
         present
@@ -361,7 +375,11 @@ pub fn display_usage_interactive(
             // is not needed here.
             sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
 
-            match crate::usage::get_usage_from_directories(time_range) {
+            match crate::usage::get_usage_from_directories_with(
+                time_range,
+                providers,
+                cursor_source,
+            ) {
                 Ok(data) => {
                     usage_data = data.models;
                     per_provider_usage = data.per_provider;
@@ -516,6 +534,9 @@ pub fn display_usage_interactive(
                         .map(|row| row.model.clone())
                 };
                 merge_enabled = !merge_enabled;
+                // Remember the choice for next launch (best-effort; a write
+                // failure must not disrupt the TUI).
+                let _ = crate::config::save_merge_models(merge_enabled);
                 // Materialize the merged rows when turning on; drop them (freeing
                 // the copy) when turning off.
                 if merge_enabled {

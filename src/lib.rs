@@ -25,6 +25,7 @@
 pub mod analysis;
 pub mod cache;
 pub mod cli;
+pub mod config;
 pub mod constants;
 pub mod display;
 pub mod fetch;
