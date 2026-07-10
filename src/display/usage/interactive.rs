@@ -194,11 +194,17 @@ pub fn display_usage_interactive(
     // credentials are present. All workers share one HTTP client and shutdown
     // flag. When the quota panels are disabled in config, treat every provider
     // as absent so nothing is probed, no worker spawns, and the band is dropped.
-    let present = if show_quota_panels {
+    let mut present = if show_quota_panels {
         QuotaPresence::detect()
     } else {
         QuotaPresence::default()
     };
+    // A provider disabled in `[providers]` is skipped entirely (no cache load, no
+    // worker, no quota API call), matching its "skip it entirely" contract.
+    present.claude &= providers.claude;
+    present.codex &= providers.codex;
+    present.copilot &= providers.copilot;
+    present.cursor &= providers.cursor;
     let quota_shutdown = Arc::new(AtomicBool::new(false));
     let claude_shared = Arc::new(Mutex::new(
         present
