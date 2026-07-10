@@ -219,10 +219,6 @@ jobs:
         with:
           node-version: lts/*
 
-      - name: Update npm
-        run: |
-          npm install -g npm@latest
-
       - name: Extract version from tag
         id: version
         run: |
