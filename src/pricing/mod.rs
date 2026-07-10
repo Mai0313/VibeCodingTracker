@@ -14,8 +14,9 @@ mod cache;
 mod calculation;
 mod matching;
 
-use crate::utils::get_current_date;
+use crate::utils::{find_pricing_cache_for_date_in, get_cache_dir, get_current_date};
 use anyhow::{Context, Result};
+use std::path::Path;
 
 const LITELLM_PRICING_URL: &str =
     "https://github.com/BerriAI/litellm/raw/refs/heads/main/model_prices_and_context_window.json";
@@ -53,12 +54,47 @@ pub use matching::{
 /// # Ok::<(), anyhow::Error>(())
 /// ```
 pub fn fetch_model_pricing() -> Result<ModelPricingMap> {
+    let cache_dir = get_cache_dir()?;
+
+    // Offline mode: never hit the network, but still honour a cache hit.
+    // Callers already treat a missing price as $0, so an empty map keeps
+    // `usage` working (cost unavailable) without a fetch.
+    if crate::utils::network_disabled() {
+        let today = get_current_date();
+        if find_pricing_cache_for_date_in(&cache_dir, &today).is_some()
+            && let Ok(pricing) = cache::load_from_cache_in(&cache_dir)
+        {
+            log::debug!("Loaded model pricing from today's cache (offline)");
+            return Ok(ModelPricingMap::new(pricing));
+        }
+        return Ok(ModelPricingMap::new(std::collections::HashMap::new()));
+    }
+
+    fetch_model_pricing_with(LITELLM_PRICING_URL, &cache_dir)
+}
+
+/// Fetches model pricing from an explicit URL, caching under an explicit dir.
+///
+/// The env-free, injectable counterpart of [`fetch_model_pricing`]: today's
+/// cache under `cache_dir` short-circuits before any request, otherwise `url`
+/// is fetched, filtered to its cost fields, persisted, and parsed. Tests point
+/// `url` at a local mock server and `cache_dir` at a temp directory so no real
+/// API is reached and the real `~/.vct` is never touched. This function does
+/// **not** consult `VCT_OFFLINE` — the offline gate lives in the production
+/// wrapper.
+///
+/// # Errors
+///
+/// Returns an error if the HTTP client cannot be built, the request fails, or
+/// the response body is not valid JSON. A corrupt or legacy on-disk cache is
+/// logged and falls through to a refetch.
+pub fn fetch_model_pricing_with(url: &str, cache_dir: &Path) -> Result<ModelPricingMap> {
     let today = get_current_date();
 
     // Check if today's cache exists
-    if crate::utils::find_pricing_cache_for_date(&today).is_some() {
+    if find_pricing_cache_for_date_in(cache_dir, &today).is_some() {
         // Load from cache
-        match cache::load_from_cache() {
+        match cache::load_from_cache_in(cache_dir) {
             Ok(pricing) => {
                 log::debug!("Loaded model pricing from today's cache");
                 return Ok(ModelPricingMap::new(pricing));
@@ -69,13 +105,6 @@ pub fn fetch_model_pricing() -> Result<ModelPricingMap> {
         }
     }
 
-    // Offline mode: never hit the network. Callers already treat a missing
-    // price as $0, so an empty map keeps `usage` working (cost unavailable)
-    // without a fetch. Keeps `cargo test` / offline runs off the network.
-    if crate::utils::network_disabled() {
-        return Ok(ModelPricingMap::new(std::collections::HashMap::new()));
-    }
-
     // Fetch from remote
     log::info!("Fetching model pricing from remote...");
     let client = reqwest::blocking::Client::builder()
@@ -83,7 +112,7 @@ pub fn fetch_model_pricing() -> Result<ModelPricingMap> {
         .context("Failed to create HTTP client")?;
 
     let response = client
-        .get(LITELLM_PRICING_URL)
+        .get(url)
         .send()
         .context("Failed to fetch model pricing from LiteLLM")?;
 
@@ -103,7 +132,7 @@ pub fn fetch_model_pricing() -> Result<ModelPricingMap> {
     // priority / flex / batch / audio / image tiers that `calculate_cost`
     // doesn't consume yet are still available to future versions without
     // a re-fetch.
-    if let Err(e) = cache::save_to_cache(&filtered_raw) {
+    if let Err(e) = cache::save_to_cache_in(cache_dir, &filtered_raw) {
         log::warn!("Failed to save pricing to cache: {}", e);
     } else {
         log::debug!("Saved model pricing to cache with today's date");

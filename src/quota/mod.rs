@@ -69,7 +69,8 @@ impl CodexState {
         if let Some(auth) = &auth
             && auth.exists()
         {
-            match self.fetch_with_refresh(client, auth, now) {
+            match self.fetch_with_refresh(client, auth, now, wham::WHAM_URL, wham::CODEX_TOKEN_URL)
+            {
                 CodexFetch::Ok(snap) => return QuotaOutcome::Data(snap),
                 CodexFetch::NeedsLogin => {
                     // Keep any session-fallback data, flag the login hint (S3).
@@ -92,11 +93,17 @@ impl CodexState {
     }
 
     /// wham call with a reactive 401 → refresh → retry-once.
+    ///
+    /// `wham_url` / `token_url` are the usage and token endpoints (production
+    /// passes the [`wham`] module constants; tests point them at a local mock
+    /// server so the whole 401 → refresh → retry path runs offline).
     fn fetch_with_refresh(
         &mut self,
         client: &reqwest::blocking::Client,
         auth: &std::path::Path,
         now: i64,
+        wham_url: &str,
+        token_url: &str,
     ) -> CodexFetch {
         let body = match std::fs::read_to_string(auth) {
             Ok(b) => b,
@@ -114,7 +121,7 @@ impl CodexState {
             _ => file_token,
         };
 
-        match wham::call_wham(client, &token, account_id.as_deref(), now) {
+        match wham::call_wham(client, &token, account_id.as_deref(), now, wham_url) {
             WhamResult::Ok(snap) => {
                 self.cooldown.clear();
                 self.token = Some((token, cur_mtime));
@@ -125,7 +132,7 @@ impl CodexState {
                     self.token = None;
                     return CodexFetch::NeedsLogin;
                 }
-                match wham::refresh_codex(client, auth) {
+                match wham::refresh_codex(client, auth, token_url) {
                     Ok(new_tok) => {
                         self.cooldown.clear();
                         // The successful refresh just rewrote auth.json; key the
@@ -133,7 +140,13 @@ impl CodexState {
                         // would never suppress the next tick).
                         let post_mtime = file_mtime(auth);
                         self.token = Some((new_tok.clone(), post_mtime));
-                        match wham::call_wham(client, &new_tok, account_id.as_deref(), now) {
+                        match wham::call_wham(
+                            client,
+                            &new_tok,
+                            account_id.as_deref(),
+                            now,
+                            wham_url,
+                        ) {
                             WhamResult::Ok(snap) => CodexFetch::Ok(snap),
                             // A transient retry error keeps the fresh token and
                             // falls back to session data; only a 401 means login.
@@ -155,5 +168,108 @@ impl CodexState {
             }
             WhamResult::Transient => CodexFetch::Transient,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use httpmock::prelude::*;
+
+    /// The reactive 401 → refresh → retry loop, end-to-end against a mock server.
+    ///
+    /// The first wham call carries the stale token and 401s; the loop then hits
+    /// the (mock) token endpoint, writes the rotated token back to auth.json, and
+    /// retries wham with the fresh token, which succeeds. The two wham mocks are
+    /// distinguished by their `Authorization` header so the ordering is asserted
+    /// structurally rather than by call sequence.
+    #[test]
+    fn fetch_with_refresh_recovers_from_401() {
+        let server = MockServer::start();
+        let stale = server.mock(|when, then| {
+            when.method(GET)
+                .path("/wham")
+                .header("authorization", "Bearer stale");
+            then.status(401);
+        });
+        let fresh = server.mock(|when, then| {
+            when.method(GET)
+                .path("/wham")
+                .header("authorization", "Bearer new-access");
+            then.status(200).body(r#"{"plan_type":"plus"}"#);
+        });
+        let token = server.mock(|when, then| {
+            when.method(POST).path("/token");
+            then.status(200).json_body(serde_json::json!({
+                "access_token": "new-access",
+                "refresh_token": "new-refresh"
+            }));
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let auth = dir.path().join("auth.json");
+        std::fs::write(
+            &auth,
+            r#"{"tokens":{"access_token":"stale","refresh_token":"rt","account_id":"acct"}}"#,
+        )
+        .unwrap();
+
+        let client = crate::quota::http::build_client().unwrap();
+        let mut state = CodexState::default();
+        let result = state.fetch_with_refresh(
+            &client,
+            &auth,
+            1_000_000,
+            &server.url("/wham"),
+            &server.url("/token"),
+        );
+
+        stale.assert();
+        token.assert();
+        fresh.assert();
+        match result {
+            CodexFetch::Ok(snap) => assert_eq!(snap.plan_type.as_deref(), Some("plus")),
+            _ => panic!("expected a recovered snapshot after refresh"),
+        }
+
+        // The rotated token was persisted back to auth.json.
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&auth).unwrap()).unwrap();
+        assert_eq!(written["tokens"]["access_token"], "new-access");
+    }
+
+    /// When refresh itself fails (token endpoint 400), the loop reports
+    /// `NeedsLogin` rather than looping or succeeding.
+    #[test]
+    fn fetch_with_refresh_needs_login_when_refresh_fails() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/wham");
+            then.status(401);
+        });
+        server.mock(|when, then| {
+            when.method(POST).path("/token");
+            then.status(400)
+                .json_body(serde_json::json!({ "error": "invalid_grant" }));
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let auth = dir.path().join("auth.json");
+        std::fs::write(
+            &auth,
+            r#"{"tokens":{"access_token":"stale","refresh_token":"rt"}}"#,
+        )
+        .unwrap();
+
+        let client = crate::quota::http::build_client().unwrap();
+        let mut state = CodexState::default();
+        let result = state.fetch_with_refresh(
+            &client,
+            &auth,
+            1_000_000,
+            &server.url("/wham"),
+            &server.url("/token"),
+        );
+        assert!(matches!(result, CodexFetch::NeedsLogin));
     }
 }

@@ -1,42 +1,38 @@
 //! Integration test for the Codex session-log quota fallback.
 //!
-//! Points `$HOME` at a temp dir holding a fixture rollout and (no `auth.json`)
-//! asserts the resolver finds the newest `rate_limits` as a session fallback.
+//! Drops a fixture rollout into a `TempHome`'s Codex sessions dir and calls the
+//! path-injected resolver directly, so the test needs no `HOME` mutation and no
+//! `#[serial]` — it runs in parallel and reads no machine files.
 
-use serial_test::serial;
-use std::fs;
-use tempfile::tempdir;
+mod common;
+
+use common::{TempHome, fixture_str};
 use vibe_coding_tracker::models::QuotaSource;
-use vibe_coding_tracker::quota::codex_session::latest_session_rate_limits;
+use vibe_coding_tracker::quota::codex_session::latest_session_rate_limits_in;
 
 #[test]
-#[serial]
 fn session_fallback_picks_newest_rate_limits() {
-    let tmp = tempdir().unwrap();
-    let home = tmp.path();
+    let home = TempHome::new();
+    home.put_codex_session(
+        "2026/06/09/rollout-2026-06-09T21-00-00-test.jsonl",
+        &fixture_str("codex_session_rate_limits.jsonl"),
+    );
 
-    let day = home.join(".codex/sessions/2026/06/09");
-    fs::create_dir_all(&day).unwrap();
-    let fixture = fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/examples/codex_session_rate_limits.jsonl"
-    ))
-    .unwrap();
-    fs::write(day.join("rollout-2026-06-09T21-00-00-test.jsonl"), fixture).unwrap();
+    let snap = latest_session_rate_limits_in(&home.paths.codex_session_dir)
+        .unwrap()
+        .expect("should find a rate_limits snapshot");
 
-    let prev = std::env::var_os("HOME");
-    // SAFETY: guarded by `#[serial]`, restored immediately after the call.
-    unsafe { std::env::set_var("HOME", home) };
-    let result = latest_session_rate_limits();
-    match prev {
-        Some(v) => unsafe { std::env::set_var("HOME", v) },
-        None => unsafe { std::env::remove_var("HOME") },
-    }
-
-    let snap = result.unwrap().expect("should find a rate_limits snapshot");
     assert_eq!(snap.source, QuotaSource::SessionFallback);
     // Newest line wins (42%, not the earlier 10%).
     assert_eq!(snap.primary.as_ref().unwrap().used_percent, 42.0);
     assert_eq!(snap.secondary.as_ref().unwrap().used_percent, 69.0);
     assert_eq!(snap.plan_type.as_deref(), Some("plus"));
+}
+
+#[test]
+fn missing_sessions_dir_is_none() {
+    let home = TempHome::new();
+    // No sessions written: the resolver returns Ok(None), never an error.
+    let result = latest_session_rate_limits_in(&home.paths.codex_session_dir).unwrap();
+    assert!(result.is_none());
 }

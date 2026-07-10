@@ -1,10 +1,15 @@
-// Integration tests for analysis command functionality
+// Integration tests for analysis functionality.
 //
-// These tests verify both single-file analysis and batch analysis operations
+// Single-file parsing reads the in-repo `examples/` fixtures via
+// `common::fixture` (an absolute, machine-stable path). Batch aggregation drives
+// `aggregate_sessions_by_model_from_paths` against a `TempHome`, so it reads no
+// real machine session directories and mutates no environment.
 
-use std::path::PathBuf;
+mod common;
+
+use common::{TempHome, fixture, fixture_str};
 use tempfile::TempDir;
-use vibe_coding_tracker::analysis::aggregator::aggregate_sessions_by_model;
+use vibe_coding_tracker::analysis::aggregator::aggregate_sessions_by_model_from_paths;
 use vibe_coding_tracker::cli::TimeRange;
 use vibe_coding_tracker::models::ExtensionType;
 use vibe_coding_tracker::session::parser::{parse_session_file, parse_session_file_as};
@@ -12,249 +17,186 @@ use vibe_coding_tracker::session::state::ParseMode;
 
 #[test]
 fn test_single_file_analysis_claude() {
-    let input_file = PathBuf::from("examples/test_conversation_claude_code.jsonl");
+    let analysis = parse_session_file(fixture("test_conversation_claude_code.jsonl"))
+        .expect("should successfully analyze Claude file");
 
-    if !input_file.exists() {
-        eprintln!("Skipping test: example file not found");
-        return;
-    }
-
-    let result = parse_session_file(&input_file);
-    assert!(result.is_ok(), "Should successfully analyze Claude file");
-
-    let analysis = result.unwrap();
     assert!(analysis.is_object(), "Analysis should be a JSON object");
-
-    // Verify required fields
-    assert!(
-        analysis["extensionName"].is_string(),
-        "Should have extensionName"
-    );
     assert_eq!(analysis["extensionName"], "Claude-Code");
     assert!(analysis["records"].is_array(), "Should have records array");
 }
 
 #[test]
 fn test_single_file_analysis_codex() {
-    let input_file = PathBuf::from("examples/test_conversation_codex.jsonl");
-
-    if !input_file.exists() {
-        eprintln!("Skipping test: example file not found");
-        return;
-    }
-
-    let result = parse_session_file(&input_file);
-    assert!(result.is_ok(), "Should successfully analyze Codex file");
-
-    let analysis = result.unwrap();
-    assert!(analysis.is_object(), "Analysis should be a JSON object");
+    let analysis = parse_session_file(fixture("test_conversation_codex.jsonl"))
+        .expect("should successfully analyze Codex file");
     assert_eq!(analysis["extensionName"], "Codex");
 }
 
 #[test]
 fn test_single_file_analysis_copilot() {
-    let input_file = PathBuf::from("examples/test_conversation_copilot.jsonl");
-
-    if !input_file.exists() {
-        eprintln!("Skipping test: example file not found");
-        return;
-    }
-
-    let result = parse_session_file(&input_file);
-    assert!(result.is_ok(), "Should successfully analyze Copilot file");
-
-    let analysis = result.unwrap();
-    assert!(analysis.is_object(), "Analysis should be a JSON object");
+    let analysis = parse_session_file(fixture("test_conversation_copilot.jsonl"))
+        .expect("should successfully analyze Copilot file");
     assert_eq!(analysis["extensionName"], "Copilot-CLI");
 }
 
 #[test]
 fn test_single_file_analysis_gemini() {
-    let input_file = PathBuf::from("examples/test_conversation_gemini.jsonl");
-
-    if !input_file.exists() {
-        eprintln!("Skipping test: example file not found");
-        return;
-    }
-
-    let result = parse_session_file(&input_file);
-    assert!(result.is_ok(), "Should successfully analyze Gemini file");
-
-    let analysis = result.unwrap();
-    assert!(analysis.is_object(), "Analysis should be a JSON object");
+    let analysis = parse_session_file(fixture("test_conversation_gemini.jsonl"))
+        .expect("should successfully analyze Gemini file");
     assert_eq!(analysis["extensionName"], "Gemini");
 }
 
 #[test]
 fn test_analysis_record_structure() {
-    let input_file = PathBuf::from("examples/test_conversation_claude_code.jsonl");
+    let analysis = parse_session_file(fixture("test_conversation_claude_code.jsonl")).unwrap();
+    let records = &analysis["records"];
+    let first_record = records
+        .as_array()
+        .and_then(|arr| arr.first())
+        .expect("fixture has at least one record");
 
-    if !input_file.exists() {
-        eprintln!("Skipping test: example file not found");
-        return;
-    }
-
-    let result = parse_session_file(&input_file);
-    if let Ok(analysis) = result {
-        let records = &analysis["records"];
-        if let Some(first_record) = records.as_array().and_then(|arr| arr.first()) {
-            // Verify record structure
-            assert!(
-                first_record["conversationUsage"].is_object(),
-                "Should have conversationUsage"
-            );
-            assert!(
-                first_record["toolCallCounts"].is_object(),
-                "Should have toolCallCounts"
-            );
-            assert!(first_record["taskId"].is_string(), "Should have taskId");
-            assert!(
-                first_record["timestamp"].is_number(),
-                "Should have timestamp"
-            );
-        }
-    }
+    assert!(
+        first_record["conversationUsage"].is_object(),
+        "Should have conversationUsage"
+    );
+    assert!(
+        first_record["toolCallCounts"].is_object(),
+        "Should have toolCallCounts"
+    );
+    assert!(first_record["taskId"].is_string(), "Should have taskId");
+    assert!(
+        first_record["timestamp"].is_number(),
+        "Should have timestamp"
+    );
 }
 
 #[test]
 fn test_analysis_conversation_usage() {
-    let input_file = PathBuf::from("examples/test_conversation_claude_code.jsonl");
+    let analysis = parse_session_file(fixture("test_conversation_claude_code.jsonl")).unwrap();
+    let records = &analysis["records"];
+    let first_record = records.as_array().and_then(|arr| arr.first()).unwrap();
+    let usage = &first_record["conversationUsage"];
 
-    if !input_file.exists() {
-        eprintln!("Skipping test: example file not found");
-        return;
-    }
+    assert!(
+        usage.as_object().map(|o| !o.is_empty()).unwrap_or(false),
+        "Should have at least one model in conversationUsage"
+    );
 
-    let result = parse_session_file(&input_file);
-    if let Ok(analysis) = result {
-        let records = &analysis["records"];
-        if let Some(first_record) = records.as_array().and_then(|arr| arr.first()) {
-            let usage = &first_record["conversationUsage"];
-
-            // Verify that we have at least one model
-            assert!(
-                usage.as_object().map(|o| !o.is_empty()).unwrap_or(false),
-                "Should have at least one model in conversationUsage"
-            );
-
-            // Check token structure for each model
-            if let Some(usage_obj) = usage.as_object() {
-                for (model_name, model_usage) in usage_obj {
-                    assert!(!model_name.is_empty(), "Model name should not be empty");
-                    assert!(
-                        model_usage["input_tokens"].is_number(),
-                        "Should have input_tokens"
-                    );
-                    assert!(
-                        model_usage["output_tokens"].is_number(),
-                        "Should have output_tokens"
-                    );
-                }
-            }
-        }
+    for (model_name, model_usage) in usage.as_object().unwrap() {
+        assert!(!model_name.is_empty(), "Model name should not be empty");
+        assert!(
+            model_usage["input_tokens"].is_number(),
+            "Should have input_tokens"
+        );
+        assert!(
+            model_usage["output_tokens"].is_number(),
+            "Should have output_tokens"
+        );
     }
 }
 
 #[test]
 fn test_analysis_tool_call_counts() {
-    let input_file = PathBuf::from("examples/test_conversation_claude_code.jsonl");
+    let analysis = parse_session_file(fixture("test_conversation_claude_code.jsonl")).unwrap();
+    let records = &analysis["records"];
+    let first_record = records.as_array().and_then(|arr| arr.first()).unwrap();
+    let counts = &first_record["toolCallCounts"];
 
-    if !input_file.exists() {
-        eprintln!("Skipping test: example file not found");
-        return;
-    }
-
-    let result = parse_session_file(&input_file);
-    if let Ok(analysis) = result {
-        let records = &analysis["records"];
-        if let Some(first_record) = records.as_array().and_then(|arr| arr.first()) {
-            let counts = &first_record["toolCallCounts"];
-
-            // Verify tool call counts structure
-            assert!(counts.is_object(), "toolCallCounts should be an object");
-
-            if let Some(counts_obj) = counts.as_object() {
-                // Check that all values are numbers
-                for (_tool, count) in counts_obj {
-                    assert!(count.is_number(), "Tool count should be a number");
-                }
-            }
-        }
+    assert!(counts.is_object(), "toolCallCounts should be an object");
+    for (_tool, count) in counts.as_object().unwrap() {
+        assert!(count.is_number(), "Tool count should be a number");
     }
 }
 
 #[test]
 fn test_analysis_file_operations() {
-    let input_file = PathBuf::from("examples/test_conversation_claude_code.jsonl");
+    let analysis = parse_session_file(fixture("test_conversation_claude_code.jsonl")).unwrap();
+    let records = &analysis["records"];
+    let first_record = records.as_array().and_then(|arr| arr.first()).unwrap();
 
-    if !input_file.exists() {
-        eprintln!("Skipping test: example file not found");
-        return;
-    }
+    assert!(
+        first_record["editFileDetails"].is_array() || first_record["editFileDetails"].is_null()
+    );
+    assert!(
+        first_record["readFileDetails"].is_array() || first_record["readFileDetails"].is_null()
+    );
+    assert!(
+        first_record["writeFileDetails"].is_array() || first_record["writeFileDetails"].is_null()
+    );
+    assert!(
+        first_record["runCommandDetails"].is_array() || first_record["runCommandDetails"].is_null()
+    );
 
-    let result = parse_session_file(&input_file);
-    if let Ok(analysis) = result {
-        let records = &analysis["records"];
-        if let Some(first_record) = records.as_array().and_then(|arr| arr.first()) {
-            // Verify file operation fields exist
-            assert!(
-                first_record["editFileDetails"].is_array()
-                    || first_record["editFileDetails"].is_null()
-            );
-            assert!(
-                first_record["readFileDetails"].is_array()
-                    || first_record["readFileDetails"].is_null()
-            );
-            assert!(
-                first_record["writeFileDetails"].is_array()
-                    || first_record["writeFileDetails"].is_null()
-            );
-            assert!(
-                first_record["runCommandDetails"].is_array()
-                    || first_record["runCommandDetails"].is_null()
-            );
-
-            // Verify line/character counts
-            assert!(first_record["totalEditLines"].is_number());
-            assert!(first_record["totalReadLines"].is_number());
-            assert!(first_record["totalWriteLines"].is_number());
-        }
-    }
+    assert!(first_record["totalEditLines"].is_number());
+    assert!(first_record["totalReadLines"].is_number());
+    assert!(first_record["totalWriteLines"].is_number());
 }
 
 #[test]
-fn test_batch_analysis_basic() {
-    // Test batch analysis with default directories
-    let result = aggregate_sessions_by_model(TimeRange::All);
-    assert!(result.is_ok(), "Batch analysis should not fail");
+fn batch_analysis_from_paths_groups_by_model() {
+    let home = TempHome::new();
+    home.put_claude_session(
+        "proj",
+        "session.jsonl",
+        &fixture_str("test_conversation_claude_code.jsonl"),
+    );
+    home.put_gemini_session(
+        "proj-hash",
+        "chat.jsonl",
+        &fixture_str("test_conversation_gemini.jsonl"),
+    );
 
-    if let Ok(data) = result {
-        // Verify each row has required fields
-        for row in data.rows.iter() {
-            assert!(!row.model.is_empty(), "Model should not be empty");
-            // Line counts are usize, so they're always non-negative
-            let _ = row.edit_lines;
-            let _ = row.read_lines;
-            let _ = row.write_lines;
-        }
+    let data = aggregate_sessions_by_model_from_paths(&home.paths, TimeRange::All)
+        .expect("batch aggregation should succeed");
+
+    // Every row has a non-empty model name and rows are sorted.
+    for row in &data.rows {
+        assert!(!row.model.is_empty(), "Model should not be empty");
     }
+    for i in 1..data.rows.len() {
+        assert!(
+            data.rows[i - 1].model <= data.rows[i].model,
+            "Models should be sorted alphabetically"
+        );
+    }
+
+    // The Claude fixture's model is grouped and attributed to the Claude bucket.
+    assert!(
+        data.rows
+            .iter()
+            .any(|r| r.model == "claude-sonnet-4-20250514"),
+        "Claude fixture model should have a row, got: {:?}",
+        data.rows.iter().map(|r| &r.model).collect::<Vec<_>>()
+    );
+    assert!(
+        data.per_provider
+            .claude
+            .iter()
+            .any(|r| r.model == "claude-sonnet-4-20250514")
+    );
+    assert!(
+        data.per_provider
+            .gemini
+            .iter()
+            .any(|r| r.model.starts_with("gemini-3"))
+    );
+
+    let max_provider_days = data
+        .provider_days
+        .claude
+        .max(data.provider_days.codex)
+        .max(data.provider_days.copilot)
+        .max(data.provider_days.gemini);
+    assert!(data.provider_days.total >= max_provider_days);
+    assert!(data.provider_days.claude >= 1 && data.provider_days.gemini >= 1);
 }
 
 #[test]
-fn test_batch_analysis_sorting() {
-    let result = aggregate_sessions_by_model(TimeRange::All);
-
-    if let Ok(data) = result
-        && data.rows.len() > 1
-    {
-        // Verify sorting: models should be in alphabetical order
-        for i in 0..data.rows.len() - 1 {
-            assert!(
-                data.rows[i].model <= data.rows[i + 1].model,
-                "Models should be sorted alphabetically"
-            );
-        }
-    }
+fn batch_analysis_from_empty_paths_is_empty() {
+    let home = TempHome::new();
+    let data = aggregate_sessions_by_model_from_paths(&home.paths, TimeRange::All).unwrap();
+    assert!(data.rows.is_empty(), "no sessions -> no rows");
+    assert_eq!(data.provider_days.total, 0);
 }
 
 #[test]
@@ -273,30 +215,13 @@ fn test_batch_analysis_serialization() {
         write_count: 8,
     };
 
-    // Test serialization
     let json = serde_json::to_string(&row).unwrap();
-    assert!(
-        json.contains("editLines"),
-        "Should use camelCase for edit_lines"
-    );
-    assert!(
-        json.contains("readLines"),
-        "Should use camelCase for read_lines"
-    );
-    assert!(
-        json.contains("writeLines"),
-        "Should use camelCase for write_lines"
-    );
-    assert!(
-        json.contains("bashCount"),
-        "Should use camelCase for bash_count"
-    );
-    assert!(
-        json.contains("todoWriteCount"),
-        "Should use camelCase for todo_write_count"
-    );
+    assert!(json.contains("editLines"));
+    assert!(json.contains("readLines"));
+    assert!(json.contains("writeLines"));
+    assert!(json.contains("bashCount"));
+    assert!(json.contains("todoWriteCount"));
 
-    // Test deserialization
     let deserialized: AggregatedAnalysisRow = serde_json::from_str(&json).unwrap();
     assert_eq!(deserialized.model, row.model);
     assert_eq!(deserialized.edit_lines, row.edit_lines);
@@ -304,59 +229,29 @@ fn test_batch_analysis_serialization() {
 
 #[test]
 fn test_analysis_with_empty_file() {
-    // Test that empty files are handled gracefully
     let temp_dir = TempDir::new().unwrap();
     let empty_file = temp_dir.path().join("empty.jsonl");
     std::fs::write(&empty_file, "").unwrap();
 
     let result = parse_session_file(&empty_file);
-    // Should either succeed with empty result or fail gracefully
     assert!(
         result.is_ok() || result.is_err(),
-        "Should handle empty file"
+        "Should handle empty file without panicking"
     );
 }
 
 #[test]
 fn test_analysis_with_invalid_json() {
-    // Test that invalid JSON is handled gracefully
     let temp_dir = TempDir::new().unwrap();
     let invalid_file = temp_dir.path().join("invalid.jsonl");
     std::fs::write(&invalid_file, "not valid json\n{incomplete").unwrap();
 
     let result = parse_session_file(&invalid_file);
-    // Should fail with error
     assert!(result.is_err(), "Should fail on invalid JSON");
 }
 
 #[test]
-fn test_batch_analysis_model_grouping() {
-    // Test that batch analysis groups data by model
-    let result = aggregate_sessions_by_model(TimeRange::All);
-
-    if let Ok(data) = result {
-        for row in data.rows.iter() {
-            assert!(!row.model.is_empty(), "Model should not be empty");
-        }
-
-        // Verify provider active days are tracked
-        // Total days should be >= max of individual provider days
-        let max_provider_days = data
-            .provider_days
-            .claude
-            .max(data.provider_days.codex)
-            .max(data.provider_days.copilot)
-            .max(data.provider_days.gemini);
-        assert!(
-            data.provider_days.total >= max_provider_days,
-            "Total days should be >= max individual provider days"
-        );
-    }
-}
-
-#[test]
 fn test_analysis_aggregation_logic() {
-    // Test that analysis properly aggregates data
     use vibe_coding_tracker::analysis::aggregator::AggregatedAnalysisRow;
 
     let rows = [
@@ -384,7 +279,6 @@ fn test_analysis_aggregation_logic() {
         },
     ];
 
-    // Calculate totals
     let total_edit_lines: usize = rows.iter().map(|r| r.edit_lines).sum();
     let total_read_lines: usize = rows.iter().map(|r| r.read_lines).sum();
     let total_write_lines: usize = rows.iter().map(|r| r.write_lines).sum();
@@ -399,9 +293,9 @@ fn test_analysis_aggregation_logic() {
 /// `queue-operation`). Those records don't carry `parentUuid`, so the old
 /// streaming detector — which only looked at the first line — classified the
 /// whole file as Codex and the assistant `usage` entries never landed in the
-/// Claude totals. This test writes a fixture with a `permission-mode` prelude
-/// and asserts both the provider-known entry point and the auto-detect entry
-/// point return the Claude model usage.
+/// Claude totals. This test writes a fixture with such a prelude and asserts both
+/// the provider-known entry point and the auto-detect entry point return the
+/// Claude model usage.
 fn write_claude_fixture_with_sentinel_prelude(path: &std::path::Path, sentinel_type: &str) {
     let sentinel = match sentinel_type {
         "permission-mode" => {

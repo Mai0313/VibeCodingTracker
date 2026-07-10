@@ -1,11 +1,13 @@
 use crate::utils::{
-    find_pricing_cache_for_date, get_current_date, get_pricing_cache_path, list_pricing_cache_files,
+    find_pricing_cache_for_date_in, get_current_date, get_pricing_cache_path_in,
+    list_pricing_cache_files_in,
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::fs;
+use std::path::Path;
 
 /// A threshold-based pricing tier.
 ///
@@ -373,18 +375,14 @@ pub fn build_filtered_cost_json(raw: &Value) -> Value {
     Value::Object(filtered_map)
 }
 
-/// Removes outdated pricing cache files, keeping only today's cache.
+/// Removes outdated pricing cache files in `dir`, keeping only today's cache.
 ///
 /// Best-effort: a failure to list or delete a file is logged or ignored rather
 /// than propagated, since a stale cache file is harmless and rotates out daily.
-pub fn cleanup_old_cache() {
-    let Ok(cache_files) = list_pricing_cache_files() else {
-        return;
-    };
-
+pub fn cleanup_old_cache_in(dir: &Path) {
     let today = get_current_date();
 
-    for (filename, path) in cache_files {
+    for (filename, path) in list_pricing_cache_files_in(dir) {
         if !filename.contains(&today) {
             let _ = fs::remove_file(&path);
             log::debug!("Removed old cache file: {:?}", path);
@@ -392,7 +390,7 @@ pub fn cleanup_old_cache() {
     }
 }
 
-/// Loads pricing data from today's cache file.
+/// Loads pricing data from today's cache file under an explicit cache dir.
 ///
 /// The cache stores the raw LiteLLM cost-field subset (see
 /// `build_filtered_cost_json`) rather than our derived `ModelPricing`
@@ -414,9 +412,9 @@ pub fn cleanup_old_cache() {
 /// Returns an error if no cache file exists for today, the file cannot be
 /// read, its contents are not valid JSON, or the file is in the pre-Phase-2
 /// legacy schema (deliberately treated as an error to force a refetch).
-pub fn load_from_cache() -> Result<HashMap<String, ModelPricing>> {
+pub fn load_from_cache_in(dir: &Path) -> Result<HashMap<String, ModelPricing>> {
     let today = get_current_date();
-    let cache_path = find_pricing_cache_for_date(&today)
+    let cache_path = find_pricing_cache_for_date_in(dir, &today)
         .ok_or_else(|| anyhow::anyhow!("No cache file found for today"))?;
 
     let content = fs::read_to_string(&cache_path).context("Failed to read cached pricing file")?;
@@ -452,8 +450,8 @@ fn looks_like_legacy_pricing_cache(raw: &Value) -> bool {
         .any(|entry| entry.contains_key("tiers") || entry.contains_key("ranges"))
 }
 
-/// Saves a raw LiteLLM cost-field subset to today's cache file and cleans
-/// up old caches.
+/// Saves a raw LiteLLM cost-field subset to today's cache file under an explicit
+/// cache dir and cleans up old caches.
 ///
 /// Callers should pass the output of `build_filtered_cost_json` so the
 /// on-disk payload is a cost-only projection of the upstream LiteLLM JSON
@@ -463,18 +461,18 @@ fn looks_like_legacy_pricing_cache(raw: &Value) -> bool {
 ///
 /// # Errors
 ///
-/// Returns an error if the cache path cannot be resolved, the JSON cannot be
-/// serialized, or the file cannot be written. Cleanup of old cache files runs
-/// only after a successful write and swallows its own errors.
-pub fn save_to_cache(filtered_raw: &Value) -> Result<()> {
+/// Returns an error if the JSON cannot be serialized or the file cannot be
+/// written. Cleanup of old cache files runs only after a successful write and
+/// swallows its own errors.
+pub fn save_to_cache_in(dir: &Path, filtered_raw: &Value) -> Result<()> {
     let today = get_current_date();
-    let cache_path = get_pricing_cache_path(&today)?;
+    let cache_path = get_pricing_cache_path_in(dir, &today);
 
     let pricing_json =
         serde_json::to_string_pretty(filtered_raw).context("Failed to serialize pricing data")?;
     fs::write(&cache_path, pricing_json).context("Failed to write pricing cache file")?;
 
-    cleanup_old_cache();
+    cleanup_old_cache_in(dir);
     Ok(())
 }
 

@@ -16,8 +16,9 @@ use crate::models::{
 use crate::pricing::{ModelPricingMap, calculate_cost};
 use crate::session::{ParseMode, parse_session_file_as, read_cursor_usage, read_opencode_usage};
 use crate::utils::{
-    COPILOT_SESSION_MAX_DEPTH, TokenCounts, collect_files_with_max_depth, is_claude_session_file,
-    is_codex_session_file, is_copilot_session_file, is_gemini_session_file, resolve_paths,
+    COPILOT_SESSION_MAX_DEPTH, HelperPaths, TokenCounts, collect_files_with_max_depth,
+    is_claude_session_file, is_codex_session_file, is_copilot_session_file, is_gemini_session_file,
+    resolve_paths,
 };
 use anyhow::Result;
 use rayon::prelude::*;
@@ -139,7 +140,23 @@ fn extract_conversation_usage_from_analysis(analysis: &CodeAnalysis) -> FastHash
 /// # Ok::<(), anyhow::Error>(())
 /// ```
 pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
-    let paths = resolve_paths()?;
+    get_usage_from_paths(&resolve_paths()?, time_range)
+}
+
+/// Aggregates token usage from provider session directories rooted at an
+/// explicit [`HelperPaths`].
+///
+/// The env-free, injectable counterpart of [`get_usage_from_directories`]:
+/// every provider path comes from `paths` rather than the resolved home
+/// directory, so tests can point them at a temp tree and exercise the real
+/// aggregation without mutating process-global `HOME`. See
+/// [`get_usage_from_directories`] for the aggregation semantics.
+///
+/// # Errors
+///
+/// Returns an error only under the same conditions as
+/// [`get_usage_from_directories`].
+pub fn get_usage_from_paths(paths: &HelperPaths, time_range: TimeRange) -> Result<UsageData> {
     let mut result = FastHashMap::with_capacity(capacity::MODEL_COMBINATIONS);
     let mut per_provider = PerProviderUsage::default();
     let mut stored_costs = StoredCosts::default();

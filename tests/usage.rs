@@ -1,82 +1,76 @@
-// Integration tests for usage command functionality
+// Integration tests for usage aggregation.
 //
-// These tests verify the usage calculation and aggregation logic
+// These drive `get_usage_from_paths` against a `TempHome` (fixture session files
+// under a temp directory) so the real aggregation runs hermetically: no
+// process-global env is mutated, no machine files are read, and no external API
+// is reached. The remaining tests are pure in-memory cost / JSON math.
 
-use serial_test::serial;
-use std::ffi::OsString;
+mod common;
+
+use common::{TempHome, fixture_str};
 use vibe_coding_tracker::cli::TimeRange;
-use vibe_coding_tracker::usage::calculator::get_usage_from_directories;
+use vibe_coding_tracker::usage::calculator::get_usage_from_paths;
 
-/// Redirects `HOME` (and clears the XDG overrides) to an empty temp dir for the
-/// guard's lifetime, restoring the previous env on drop.
-///
-/// `get_usage_from_directories` resolves every provider path off these vars, so
-/// pointing them at an empty dir means the aggregation reads no real session
-/// data — and, importantly, the Cursor branch never reaches its dashboard API
-/// (no `~/.cursor/chats`, no `auth.json`), so tests stay offline, deterministic,
-/// and never touch the user's credentials or `~/.vct` cache. Callers must be
-/// `#[serial]` because it mutates process-global environment.
-struct IsolatedHome {
-    _tmp: tempfile::TempDir,
-    prev: Vec<(&'static str, Option<OsString>)>,
-}
-
-impl IsolatedHome {
-    fn new() -> Self {
-        let tmp = tempfile::tempdir().unwrap();
-        let keys = ["HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME"];
-        let prev = keys.iter().map(|&k| (k, std::env::var_os(k))).collect();
-        // SAFETY: callers guard with `#[serial]`; env is restored on drop.
-        unsafe {
-            std::env::set_var("HOME", tmp.path());
-            std::env::remove_var("XDG_CONFIG_HOME");
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-        Self { _tmp: tmp, prev }
-    }
-}
-
-impl Drop for IsolatedHome {
-    fn drop(&mut self) {
-        for (k, v) in &self.prev {
-            // SAFETY: callers guard with `#[serial]`.
-            unsafe {
-                match v {
-                    Some(val) => std::env::set_var(k, val),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
-    }
+#[test]
+fn empty_home_yields_no_usage() {
+    let home = TempHome::new();
+    let data = get_usage_from_paths(&home.paths, TimeRange::All).expect("aggregate empty home");
+    assert!(data.models.is_empty(), "empty home has no models");
+    assert_eq!(data.provider_days.total, 0);
 }
 
 #[test]
-#[serial]
-fn test_get_usage_from_empty_directories() {
-    // Isolate HOME so aggregation reads no real data and stays offline.
-    let _home = IsolatedHome::new();
+fn aggregates_claude_session_from_paths() {
+    let home = TempHome::new();
+    home.put_claude_session(
+        "test-project",
+        "session.jsonl",
+        &fixture_str("test_conversation_claude_code.jsonl"),
+    );
 
-    let result = get_usage_from_directories(TimeRange::All);
-    assert!(result.is_ok(), "Should handle directories");
+    let data = get_usage_from_paths(&home.paths, TimeRange::All).expect("aggregate claude");
 
-    // With an empty home there is no provider data to aggregate.
-    let _usage = result.unwrap();
+    assert!(
+        data.models.contains_key("claude-sonnet-4-20250514"),
+        "the Claude fixture's model should appear in the merged table, got: {:?}",
+        data.models.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        data.per_provider
+            .claude
+            .contains_key("claude-sonnet-4-20250514"),
+        "and be attributed to the Claude provider bucket"
+    );
+    assert!(
+        data.provider_days.claude >= 1,
+        "at least one active Claude day"
+    );
 }
 
 #[test]
-#[serial]
-fn test_get_usage_from_directories_structure() {
-    let _home = IsolatedHome::new();
+fn merges_multiple_providers_from_paths() {
+    let home = TempHome::new();
+    home.put_claude_session(
+        "proj",
+        "session.jsonl",
+        &fixture_str("test_conversation_claude_code.jsonl"),
+    );
+    home.put_gemini_session(
+        "proj-hash",
+        "chat.jsonl",
+        &fixture_str("test_conversation_gemini.jsonl"),
+    );
 
-    let result = get_usage_from_directories(TimeRange::All);
+    let data = get_usage_from_paths(&home.paths, TimeRange::All).expect("aggregate multi");
 
-    if let Ok(usage) = result {
-        // Verify that the result has valid structure
-        for (_model_name, model_data) in usage.models.iter() {
-            // Verify the JSON structure has expected fields
-            assert!(model_data.is_object(), "Model data should be an object");
-        }
-    }
+    assert!(data.models.contains_key("claude-sonnet-4-20250514"));
+    assert!(
+        data.models.keys().any(|m| m.starts_with("gemini-3")),
+        "a Gemini model should be present, got: {:?}",
+        data.models.keys().collect::<Vec<_>>()
+    );
+    assert!(data.provider_days.claude >= 1);
+    assert!(data.provider_days.gemini >= 1);
 }
 
 #[test]
