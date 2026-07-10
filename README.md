@@ -232,7 +232,7 @@ vct usage --table --merge-providers
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
 │ Total Cost: $79.33  |  Total Tokens: 49.3M  |  Models: 3  |  Memory: 42.8 MB                │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
-  ↑/↓ scroll  PgUp/PgDn page  g/G top/end  m merge  r refresh  q quit  |  ★ github.com/Mai0313/VibeCodingTracker
+  ↑/↓ scroll  m merge  r refresh  q quit  |  ★ github.com/Mai0313/VibeCodingTracker
 ```
 
 ### Preview: Table & JSON (`vct usage`)
@@ -383,7 +383,7 @@ vct analysis --output today.json --daily
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ Total Lines: 16.1K  |  Total Tools: 619  |  Models: 3  |  Memory: 41.2 MB                                       │
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-  ↑/↓ scroll  PgUp/PgDn page  g/G top/end  r refresh  q quit  |  ★ github.com/Mai0313/VibeCodingTracker
+  ↑/↓ scroll  r refresh  q quit  |  ★ github.com/Mai0313/VibeCodingTracker
 ```
 
 ### Preview: Table & JSON (`vct analysis`)

@@ -155,7 +155,7 @@ const USAGE_PANELS_MIN_H: u16 = 22;
 /// - Auto-refresh every 10 seconds (usage + pricing)
 /// - Real-time memory monitoring
 /// - Provider-grouped totals
-/// - Scrollable model table (arrow keys / `PgUp`/`PgDn` / `g`/`G`)
+/// - Scrollable model table (arrow keys)
 /// - Keyboard controls: `q`, `Esc`, or `Ctrl+C` to exit, `r` to refresh, `m` to
 ///   toggle merging models that share a base name across provider prefixes
 ///   (e.g. `openai/gpt-5.5` + `azure/gpt-5.5`). `merge_providers` seeds the
