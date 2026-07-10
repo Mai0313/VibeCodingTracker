@@ -9,7 +9,7 @@
 //! [`UsageData`] for why.
 
 use crate::cli::TimeRange;
-use crate::config::{CursorUsageSource, ProvidersConfig};
+use crate::config::ProvidersConfig;
 use crate::constants::{FastHashMap, capacity};
 use crate::models::{
     CodeAnalysis, ExtensionType, PerProviderUsage, Provider, ProviderActiveDays, UsageResult,
@@ -141,22 +141,16 @@ fn extract_conversation_usage_from_analysis(analysis: &CodeAnalysis) -> FastHash
 /// # Ok::<(), anyhow::Error>(())
 /// ```
 pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
-    get_usage_from_directories_with(
-        time_range,
-        ProvidersConfig::default(),
-        CursorUsageSource::default(),
-    )
+    get_usage_from_directories_with(time_range, ProvidersConfig::default())
 }
 
-/// [`get_usage_from_directories`] with explicit per-provider toggles and Cursor
-/// usage source (from `~/.vct/config.toml`). A disabled provider is skipped
-/// entirely; `cursor_source` selects the local estimate vs the dashboard API.
+/// [`get_usage_from_directories`] with explicit per-provider toggles (from
+/// `~/.vct/config.toml`). A disabled provider is skipped entirely.
 pub fn get_usage_from_directories_with(
     time_range: TimeRange,
     providers: ProvidersConfig,
-    cursor_source: CursorUsageSource,
 ) -> Result<UsageData> {
-    get_usage_from_paths_with(&resolve_paths()?, time_range, providers, cursor_source)
+    get_usage_from_paths_with(&resolve_paths()?, time_range, providers)
 }
 
 /// Aggregates token usage from provider session directories rooted at an
@@ -173,21 +167,15 @@ pub fn get_usage_from_directories_with(
 /// Returns an error only under the same conditions as
 /// [`get_usage_from_directories`].
 pub fn get_usage_from_paths(paths: &HelperPaths, time_range: TimeRange) -> Result<UsageData> {
-    get_usage_from_paths_with(
-        paths,
-        time_range,
-        ProvidersConfig::default(),
-        CursorUsageSource::default(),
-    )
+    get_usage_from_paths_with(paths, time_range, ProvidersConfig::default())
 }
 
-/// [`get_usage_from_paths`] with explicit provider toggles and Cursor usage
-/// source (the injectable core used by the CLI once `config.toml` is loaded).
+/// [`get_usage_from_paths`] with explicit provider toggles (the injectable core
+/// used by the CLI once `config.toml` is loaded).
 pub fn get_usage_from_paths_with(
     paths: &HelperPaths,
     time_range: TimeRange,
     providers: ProvidersConfig,
-    cursor_source: CursorUsageSource,
 ) -> Result<UsageData> {
     let mut result = FastHashMap::with_capacity(capacity::MODEL_COMBINATIONS);
     let mut per_provider = PerProviderUsage::default();
@@ -291,7 +279,6 @@ pub fn get_usage_from_paths_with(
             &mut stored_costs.cursor,
             &mut cursor_dates,
             time_range,
-            cursor_source,
         )
     {
         eprintln!("Warning: Failed to read Cursor usage: {err}");
@@ -448,7 +435,6 @@ fn process_opencode_usage(
 /// Mirrors [`process_opencode_usage`]: Cursor reports its own billed cost per
 /// usage event, so it uses the same stored-cost path (exact LiteLLM match or
 /// the reported cost) rather than a fuzzy price guess.
-#[allow(clippy::too_many_arguments)]
 fn process_cursor_usage(
     chats_dir: &Path,
     tracking_db: &Path,
@@ -457,9 +443,8 @@ fn process_cursor_usage(
     stored_costs: &mut FastHashMap<String, f64>,
     unique_dates: &mut HashSet<String>,
     time_range: TimeRange,
-    cursor_source: CursorUsageSource,
 ) -> Result<()> {
-    let sessions = read_cursor_usage(chats_dir, tracking_db, time_range, cursor_source)?;
+    let sessions = read_cursor_usage(chats_dir, tracking_db, time_range)?;
     fold_stored_cost_sessions(
         sessions,
         global_result,

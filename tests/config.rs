@@ -9,7 +9,7 @@ use common::TempHome;
 use std::fs;
 use vibe_coding_tracker::TimeRange;
 use vibe_coding_tracker::cli::resolve_time_range_with_default;
-use vibe_coding_tracker::config::{self, Config, CursorUsageSource};
+use vibe_coding_tracker::config::{self, Config};
 
 #[test]
 fn load_in_creates_default_commented_file_when_absent() {
@@ -24,7 +24,6 @@ fn load_in_creates_default_commented_file_when_absent() {
     assert!(!cfg.usage.merge_models);
     // New sections default sensibly.
     assert!(cfg.providers.cursor);
-    assert_eq!(cfg.cursor.usage_source, CursorUsageSource::Local);
     assert_eq!(cfg.usage.refresh_interval_secs, 10);
     assert_eq!(cfg.analysis.refresh_interval_secs, 10);
 
@@ -33,9 +32,7 @@ fn load_in_creates_default_commented_file_when_absent() {
     let text = fs::read_to_string(&path).unwrap();
     assert!(text.contains("[usage]"));
     assert!(text.contains("[providers]"));
-    assert!(text.contains("[cursor]"));
     assert!(text.contains("merge_models = false"));
-    assert!(text.contains(r#"usage_source = "local""#));
     // A header comment must survive so the file is self-documenting.
     assert!(text.contains("# Toggled live"));
 }
@@ -77,7 +74,7 @@ fn save_merge_models_round_trips_and_preserves_comments() {
     assert!(text.contains("merge_models = true"));
     // The edit is format-preserving, so comments stay put.
     assert!(text.contains("# Which live quota panels to show"));
-    assert!(text.contains("[cursor]"));
+    assert!(text.contains("[providers]"));
 }
 
 #[test]
@@ -104,7 +101,7 @@ fn existing_file_is_parsed_and_left_in_place() {
     fs::create_dir_all(dir).unwrap();
     fs::write(
         dir.join("config.toml"),
-        "[general]\ndefault_time_range = \"weekly\"\n\n[usage]\nmerge_models = true\nquota_panels = [\"claude\"]\n\n[providers]\ncursor = false\n\n[cursor]\nusage_source = \"api\"\n",
+        "[general]\ndefault_time_range = \"weekly\"\n\n[usage]\nmerge_models = true\nquota_panels = [\"claude\"]\n\n[providers]\ncursor = false\n",
     )
     .unwrap();
 
@@ -116,7 +113,6 @@ fn existing_file_is_parsed_and_left_in_place() {
     // A missing provider key still defaults to true; the given one is honored.
     assert!(!cfg.providers.cursor);
     assert!(cfg.providers.claude);
-    assert_eq!(cfg.cursor.usage_source, CursorUsageSource::Api);
 }
 
 #[test]

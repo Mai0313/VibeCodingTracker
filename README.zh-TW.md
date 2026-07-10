@@ -290,7 +290,7 @@ Totals (by Provider)
 - `~/.copilot/session-state/<sessionId>/events.jsonl`（Copilot CLI）
 - `~/.gemini/tmp/<project_hash>/chats/*.jsonl`（Gemini CLI）
 - `~/.local/share/opencode/opencode.db`（OpenCode，SQLite 資料庫；遵循 `$XDG_DATA_HOME`）
-- `~/.cursor/chats/*/*/store.db`（Cursor，SQLite 對話庫，用於 `analysis`，並在預設情況下產生與其他 provider 一致的本地 `usage` 估算；在 [`config.toml`](#%E8%A8%AD%E5%AE%9A) 中設定 `cursor.usage_source = "api"` 即可改為從 Cursor 官方 dashboard API 抓取真實計費的 token 與費用）
+- `~/.cursor/chats/*/*/store.db`（Cursor，SQLite 對話庫，用於 `analysis`，並產生與其他 provider 一致的本地 `usage` 估算）
 
 ### 即時額度面板
 
@@ -541,28 +541,19 @@ copilot = true
 gemini = true
 opencode = true
 cursor = true
-
-[cursor]
-# Cursor `usage` 的 token / 費用數字來源：
-#   "local" — 從本地對話庫估算（預設;與其他 provider 一致，快速又可離線，
-#             但會略為低估）
-#   "api"   — Cursor 官方 dashboard 計費 API（精確的真實 token / 費用;
-#             API 無法連線時會回退到本地估算）
-usage_source = "local"
 ```
 
-| 設定項                           | 效果                                                                                                  |
-| -------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `general.default_time_range`     | 未指定 `--daily/--weekly/--monthly/--all` 時使用的時間範圍。明確指定的 flag 一律優先。                |
-| `usage.merge_models`             | 讓儀表板一開始就是合併狀態;`m` 切換會把你最後的選擇存回這裡。`--merge-providers` 會強制開啟。         |
-| `usage.quota_panels`             | 顯示哪些額度面板（`claude` / `codex` / `copilot` / `cursor`）；移除名稱即可隱藏,`[]` 隱藏整條。       |
-| `usage.refresh_interval_secs`    | `usage` 儀表板自動刷新的間隔（秒）。                                                                  |
-| `analysis.refresh_interval_secs` | `analysis` 儀表板自動刷新的間隔（秒）。                                                               |
-| `providers.*`                    | 設為 `false` 時完全略過某個 provider（不掃描、不呼叫 API），沒在用的話很方便。                        |
-| `cursor.usage_source`            | `local`（預設）像其他 provider 一樣從本地對話庫估算 Cursor 費用;`api` 則抓取真實計費的 token 與費用。 |
+| 設定項                           | 效果                                                                                            |
+| -------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `general.default_time_range`     | 未指定 `--daily/--weekly/--monthly/--all` 時使用的時間範圍。明確指定的 flag 一律優先。          |
+| `usage.merge_models`             | 讓儀表板一開始就是合併狀態;`m` 切換會把你最後的選擇存回這裡。`--merge-providers` 會強制開啟。   |
+| `usage.quota_panels`             | 顯示哪些額度面板（`claude` / `codex` / `copilot` / `cursor`）；移除名稱即可隱藏,`[]` 隱藏整條。 |
+| `usage.refresh_interval_secs`    | `usage` 儀表板自動刷新的間隔（秒）。                                                            |
+| `analysis.refresh_interval_secs` | `analysis` 儀表板自動刷新的間隔（秒）。                                                         |
+| `providers.*`                    | 設為 `false` 時完全略過某個 provider（不掃描、不呼叫 API），沒在用的話很方便。                  |
 
 > [!NOTE]
-> Cursor 的 `usage` 預設採用**本地估算**，讓它的行為與 Claude Code / Codex / Copilot / Gemini 一致（全都是從本地 session 檔案計算），而且不需要連網。這個估算會低估 Cursor 的真實花費，因為其中有很大一部分是以 Cursor 內部的 model 名稱計費，而本地資料無法為這些名稱定價。想要精確的計費數字時，把 `cursor.usage_source` 設為 `"api"`;本地估算則會繼續作為離線時的備援。
+> Cursor 的 `usage` 是從對話庫產生的**本地估算**，因此行為與 Claude Code / Codex / Copilot / Gemini 一致（全都是從本地 session 檔案計算），而且不需要連網。這個估算會低估 Cursor 的真實花費，因為其中有很大一部分是以 Cursor 內部的 model 名稱計費，而本地資料無法為這些名稱定價，所以請把 Cursor 的費用視為概估值。
 
 ### 管理設定檔
 

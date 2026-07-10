@@ -290,7 +290,7 @@ The tool automatically scans these directories:
 - `~/.copilot/session-state/<sessionId>/events.jsonl` (Copilot CLI)
 - `~/.gemini/tmp/<project_hash>/chats/*.jsonl` (Gemini CLI)
 - `~/.local/share/opencode/opencode.db` (OpenCode — SQLite database; honors `$XDG_DATA_HOME`)
-- `~/.cursor/chats/*/*/store.db` (Cursor — SQLite chat stores, used for `analysis` and, by default, a local `usage` estimate consistent with the other providers; set `cursor.usage_source = "api"` in [`config.toml`](#configuration) to pull real billed tokens + cost from Cursor's dashboard API instead)
+- `~/.cursor/chats/*/*/store.db` (Cursor — SQLite chat stores, used for `analysis` and a local `usage` estimate consistent with the other providers)
 
 ### Live Quota Panels
 
@@ -542,28 +542,19 @@ copilot = true
 gemini = true
 opencode = true
 cursor = true
-
-[cursor]
-# Where Cursor `usage` token/cost numbers come from:
-#   "local" — estimate from the local chat stores (default; consistent with the
-#             other providers, fast and offline, but a rough undercount)
-#   "api"   — Cursor's dashboard billing API (accurate real tokens/cost; falls
-#             back to the local estimate when the API is unreachable)
-usage_source = "local"
 ```
 
-| Setting                          | Effect                                                                                                                        |
-| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `general.default_time_range`     | Period used when you pass no `--daily/--weekly/--monthly/--all`. An explicit flag always wins.                                |
-| `usage.merge_models`             | Seeds the dashboard merged; the `m` toggle saves your last choice back here. `--merge-providers` forces on.                   |
-| `usage.quota_panels`             | Which quota panels to show (`claude` / `codex` / `copilot` / `cursor`); drop a name to hide it, `[]` to hide the whole band.  |
-| `usage.refresh_interval_secs`    | Auto-refresh cadence of the `usage` dashboard (seconds).                                                                      |
-| `analysis.refresh_interval_secs` | Auto-refresh cadence of the `analysis` dashboard (seconds).                                                                   |
-| `providers.*`                    | Skip a provider entirely (no scan, no API) when `false` — handy if you don't use one.                                         |
-| `cursor.usage_source`            | `local` (default) estimates Cursor cost from local stores like every other provider; `api` fetches real billed tokens + cost. |
+| Setting                          | Effect                                                                                                                       |
+| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `general.default_time_range`     | Period used when you pass no `--daily/--weekly/--monthly/--all`. An explicit flag always wins.                               |
+| `usage.merge_models`             | Seeds the dashboard merged; the `m` toggle saves your last choice back here. `--merge-providers` forces on.                  |
+| `usage.quota_panels`             | Which quota panels to show (`claude` / `codex` / `copilot` / `cursor`); drop a name to hide it, `[]` to hide the whole band. |
+| `usage.refresh_interval_secs`    | Auto-refresh cadence of the `usage` dashboard (seconds).                                                                     |
+| `analysis.refresh_interval_secs` | Auto-refresh cadence of the `analysis` dashboard (seconds).                                                                  |
+| `providers.*`                    | Skip a provider entirely (no scan, no API) when `false` — handy if you don't use one.                                        |
 
 > [!NOTE]
-> Cursor `usage` defaults to a **local estimate** so it behaves like Claude Code / Codex / Copilot / Gemini (all computed from local session files) and needs no network. The estimate undercounts Cursor's real spend, because much of it is billed under Cursor-internal model names the local data cannot price. Set `cursor.usage_source = "api"` when you want accurate billed numbers; the estimate remains the offline fallback.
+> Cursor `usage` is a **local estimate** from the chat stores, so it behaves like Claude Code / Codex / Copilot / Gemini (all computed from local session files) and needs no network. It undercounts Cursor's real spend, because much of it is billed under Cursor-internal model names the local data cannot price — treat Cursor cost as approximate.
 
 ### Managing the file
 

@@ -8,7 +8,7 @@
 //! between frames so a resize repaints instantly without re-aggregating; memory
 //! is trimmed back to the OS after each refresh.
 
-use crate::config::{CursorUsageSource, ProvidersConfig};
+use crate::config::ProvidersConfig;
 use crate::display::common::ProviderTotal;
 use crate::display::common::table::{
     create_controls, create_provider_row, create_ratatui_table, create_summary, main_layout,
@@ -162,9 +162,8 @@ const USAGE_PANELS_MIN_H: u16 = 22;
 ///   initial state and the `m` toggle is persisted back to `config.toml`.
 ///
 /// `quota_panels` selects which live quota panels to show (by provider name);
-/// an empty list drops the band entirely. `providers` / `cursor_source` come
-/// from the config and steer which providers are aggregated and where Cursor
-/// usage is read from. `refresh_secs` is the auto-refresh cadence.
+/// an empty list drops the band entirely. `providers` (from the config) selects
+/// which providers are aggregated. `refresh_secs` is the auto-refresh cadence.
 ///
 /// # Errors
 ///
@@ -181,7 +180,6 @@ pub fn display_usage_interactive(
     merge_providers: bool,
     quota_panels: Vec<String>,
     providers: ProvidersConfig,
-    cursor_source: CursorUsageSource,
     refresh_secs: u64,
 ) -> anyhow::Result<()> {
     let mut terminal = setup_terminal()?;
@@ -383,11 +381,7 @@ pub fn display_usage_interactive(
             // is not needed here.
             sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
 
-            match crate::usage::get_usage_from_directories_with(
-                time_range,
-                providers,
-                cursor_source,
-            ) {
+            match crate::usage::get_usage_from_directories_with(time_range, providers) {
                 Ok(data) => {
                     usage_data = data.models;
                     per_provider_usage = data.per_provider;

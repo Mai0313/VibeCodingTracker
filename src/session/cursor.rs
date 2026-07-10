@@ -1,4 +1,4 @@
-//! Cursor session reader (SQLite blob stores + dashboard usage API).
+//! Cursor session reader (local SQLite blob stores).
 //!
 //! Cursor keeps session data in two places under `~/.cursor`:
 //!
@@ -12,11 +12,11 @@
 //!   standalone JSON blobs. Parsed for `analysis` tool-call metrics.
 //!
 //! Cursor does **not** persist real billing tokens locally (only the context
-//! gauge), so the `usage` view fetches authoritative per-model tokens + cost
-//! from Cursor's dashboard usage-events API using the same `WorkosCursorSessionToken`
-//! the quota panel already reads, cached briefly in `~/.vct`. When the API is
-//! unreachable it falls back to a clearly-approximate local estimate derived
-//! from the context gauge.
+//! gauge), so the `usage` view is a deliberately-rough **local estimate** from
+//! that gauge (there is no dashboard-API path here; see `examples/quota.md` for
+//! the raw endpoint if it is ever reintroduced), keeping Cursor consistent with
+//! the other providers whose `usage` is likewise computed from local session
+//! data.
 //!
 //! Both entry points return the same `(local YYYY-MM-DD, CodeAnalysis[, cost])`
 //! shape the OpenCode reader produces, so the `usage` / `analysis` aggregators
@@ -24,44 +24,19 @@
 
 use crate::VERSION;
 use crate::cli::TimeRange;
-use crate::config::CursorUsageSource;
 use crate::constants::FastHashMap;
 use crate::models::{CodeAnalysis, CodeAnalysisRecord, ExtensionType};
 use crate::pricing::{ModelPricingMap, fetch_model_pricing};
-use crate::quota::cursor::{cursor_ua, read_cursor_session};
 use crate::session::state::{ParseMode, SessionParseState};
 use crate::usage::{CostSource, resolve_model_cost};
-use crate::utils::{
-    TokenCounts, get_cache_dir, get_current_user, get_cursor_auth_path, get_machine_id,
-};
+use crate::utils::{TokenCounts, get_current_user, get_machine_id};
 use anyhow::{Context, Result, anyhow};
-use reqwest::blocking::Client;
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
-
-/// Cursor's individual (cookie-authed) per-request usage-events endpoint.
-const CURSOR_EVENTS_URL: &str = "https://cursor.com/api/dashboard/get-filtered-usage-events";
-/// `teamId` value that scopes the dashboard API to the individual's own usage.
-const CURSOR_INDIVIDUAL_TEAM_ID: i64 = 0;
-/// Page size for the paginated usage-events fetch. Cursor rejects values above
-/// ~1000 (HTTP 400), so 1000 is the largest usable page — it keeps the whole
-/// history to ~14 sequential requests instead of ~47 at 300.
-const CURSOR_EVENTS_PAGE_SIZE: i64 = 1000;
-/// Hard cap on pages fetched, so a runaway `totalUsageEventsCount` can't spin.
-const CURSOR_EVENTS_MAX_PAGES: i64 = 200;
-/// How long a cached usage-events fetch stays fresh (seconds). Billing events
-/// are immutable history, so a generous TTL keeps the `usage` TUI from
-/// re-fetching (or re-scanning stores in local mode) on every refresh while
-/// staying current enough.
-const CURSOR_USAGE_CACHE_TTL_SECS: i64 = 900;
-/// HTTP timeout for the usage-events request, so an offline `vct usage` fails
-/// fast into the local approximation instead of hanging.
-const CURSOR_HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 
 // ===========================================================================
 // Public entry points
@@ -69,11 +44,11 @@ const CURSOR_HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Reads per-model token usage + cost for Cursor.
 ///
-/// Primary source is Cursor's dashboard usage-events API (real billing tokens
-/// and Cursor's own cost), cached in `~/.vct`. When the API cannot be reached
-/// and no cache exists, falls back to a local context-occupancy approximation
-/// derived from the chat stores (the context gauge counted as cache-read tokens,
-/// so it prices at the cache rate or `$0` for models Cursor prices itself).
+/// Cursor does not persist real billing tokens locally (only a context gauge),
+/// so this is a deliberately-rough estimate from the chat stores: the context
+/// gauge is counted as cache-read tokens and priced with LiteLLM (`$0` for
+/// models Cursor prices itself). It stays consistent with the other providers,
+/// whose `usage` is likewise computed from local session data.
 ///
 /// Each returned tuple is `(local YYYY-MM-DD, CodeAnalysis, cost_usd)` with the
 /// analysis carrying one model's `conversation_usage`, matching
@@ -81,97 +56,16 @@ const CURSOR_HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 ///
 /// # Errors
 ///
-/// Returns an error only if the local approximation fallback itself fails; API
-/// and cache problems degrade rather than propagate.
+/// Returns an error only if reading the local chat stores fails.
 pub fn read_cursor_usage(
     chats_dir: &Path,
     tracking_db: &Path,
     time_range: TimeRange,
-    source: CursorUsageSource,
 ) -> Result<Vec<(String, CodeAnalysis, f64)>> {
-    let now = chrono::Local::now().timestamp();
     let user = get_current_user();
     let machine = get_machine_id().to_string();
-    let requested_start_ms = range_start_ms(time_range);
-    let cached = load_usage_cache();
-    // A cache is only usable for this request when it is fresh AND spans at least
-    // the asked window (`start_ms <= requested_start_ms`) — a date-bounded `api`
-    // fetch for `--monthly` must not be reused to answer `--all`.
-    let cache_covers = |c: &UsageCache| {
-        now.saturating_sub(c.fetched_at) < CURSOR_USAGE_CACHE_TTL_SECS
-            && c.start_ms <= requested_start_ms
-    };
-
-    match source {
-        // Default: estimate from the local chat stores, consistent with every
-        // other provider (whose `usage` also comes from local session files).
-        // Never touches the events API. A fresh *approximation* cache is reused
-        // so the TUI does not re-scan every store.db each refresh tick; a cache
-        // left over from a prior `api` run is ignored so switching to `local`
-        // does not keep showing billing data. The approximation always spans the
-        // full history, so it is saved with `start_ms = 0`.
-        CursorUsageSource::Local => {
-            if let Some(cache) = &cached
-                && !cache.from_api
-                && cache_covers(cache)
-            {
-                return Ok(aggregate_events(&cache.events, time_range, &user, &machine));
-            }
-            let events = approximation_events(chats_dir, tracking_db)?;
-            let _ = save_usage_cache(&events, now, 0, false);
-            Ok(aggregate_events(&events, time_range, &user, &machine))
-        }
-        // Opt-in: authoritative per-model tokens + cost from Cursor's dashboard
-        // billing API, with the local approximation as a fallback.
-        CursorUsageSource::Api => {
-            // A fresh, wide-enough cache — from a prior API fetch OR a prior
-            // offline approximation — is reused as-is: no HTTP, no store re-scan.
-            // This bounds the work to at most once per TTL even when the API keeps
-            // failing, so the usage TUI (which re-runs this on every refresh)
-            // never hammers the endpoint or re-reads every store.db each tick.
-            if let Some(cache) = &cached
-                && cache_covers(cache)
-            {
-                return Ok(aggregate_events(&cache.events, time_range, &user, &machine));
-            }
-
-            // Cache stale or absent: make exactly one refresh attempt this call.
-            // Each source carries the window it covers so the cache records it.
-            let (events, start_ms, from_api) = match fetch_all_events(time_range) {
-                Ok(events) => (events, requested_start_ms, true),
-                Err(err) => match cached {
-                    // Prefer stale real billing data over the rough approximation,
-                    // but only when it spans at least the requested window — a
-                    // `--daily` cache must not answer an offline `--all`.
-                    Some(cache)
-                        if cache.from_api
-                            && !cache.events.is_empty()
-                            && cache.start_ms <= requested_start_ms =>
-                    {
-                        eprintln!(
-                            "Warning: Cursor usage API unavailable ({err}); using cached usage."
-                        );
-                        let start = cache.start_ms;
-                        (cache.events, start, true)
-                    }
-                    _ => {
-                        eprintln!(
-                            "Warning: Cursor usage API unavailable ({err}); \
-                             Cursor usage is an approximation from local context data."
-                        );
-                        // The approximation spans the full history.
-                        (approximation_events(chats_dir, tracking_db)?, 0, false)
-                    }
-                },
-            };
-
-            // Persist the result (API, reused-real, or approximation) with a
-            // fresh timestamp so the next refresh within the TTL is a pure cache
-            // read and does not retry the network or re-scan the stores.
-            let _ = save_usage_cache(&events, now, start_ms, from_api);
-            Ok(aggregate_events(&events, time_range, &user, &machine))
-        }
-    }
+    let events = approximation_events(chats_dir, tracking_db)?;
+    Ok(aggregate_events(&events, time_range, &user, &machine))
 }
 
 /// Reads per-model file-operation metrics for Cursor from the chat stores.
@@ -212,10 +106,10 @@ pub fn read_cursor_analysis(
 }
 
 // ===========================================================================
-// usage: dashboard API
+// usage: local estimate
 // ===========================================================================
 
-/// One usage-events aggregation row, cached in `~/.vct` and keyed by
+/// One usage aggregation row keyed by
 /// `(date, model)` so any time range can filter it locally.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedEvent {
@@ -226,261 +120,6 @@ struct CachedEvent {
     cache_read: i64,
     cache_write: i64,
     cost: f64,
-}
-
-/// The on-disk usage-events cache: the fetch time plus the aggregated rows.
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct UsageCache {
-    fetched_at: i64,
-    /// The earliest event timestamp (local-midnight epoch millis) this cache is
-    /// known to cover; `0` means full history. A date-bounded `api` fetch only
-    /// covers `[start_ms, now]`, so a cache is reused for a request only when
-    /// `start_ms <= requested_start_ms` (it spans at least the asked window).
-    /// Defaults to `0` for older caches without the field.
-    #[serde(default)]
-    start_ms: i64,
-    events: Vec<CachedEvent>,
-    /// Whether `events` came from the API (real billing data) rather than the
-    /// local approximation. Real data is reused verbatim when the API is down;
-    /// an approximation is recomputed each refresh window so it picks up new
-    /// turns. Defaults to `false` for older caches without the field.
-    #[serde(default)]
-    from_api: bool,
-}
-
-/// Path to the usage-events cache file (`~/.vct/cursor_usage_events.json`).
-fn usage_cache_path() -> Option<PathBuf> {
-    get_cache_dir()
-        .ok()
-        .map(|d| d.join("cursor_usage_events.json"))
-}
-
-/// Loads the cached usage events, or `None` when absent/unreadable.
-fn load_usage_cache() -> Option<UsageCache> {
-    let path = usage_cache_path()?;
-    let body = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&body).ok()
-}
-
-/// Persists the usage events with the current timestamp, coverage, and source.
-fn save_usage_cache(
-    events: &[CachedEvent],
-    fetched_at: i64,
-    start_ms: i64,
-    from_api: bool,
-) -> Result<()> {
-    let path = usage_cache_path().ok_or_else(|| anyhow!("no cache dir"))?;
-    let cache = UsageCache {
-        fetched_at,
-        start_ms,
-        events: events.to_vec(),
-        from_api,
-    };
-    let body = serde_json::to_string(&cache)?;
-    std::fs::write(path, body)?;
-    Ok(())
-}
-
-/// The local-midnight epoch-millis cutoff for `time_range`, or `0` for
-/// [`TimeRange::All`] — used both to date-bound the fetch and to record what
-/// window a cache covers.
-fn range_start_ms(time_range: TimeRange) -> i64 {
-    match time_range.cutoff_date() {
-        None => 0,
-        Some(date) => date
-            .and_hms_opt(0, 0, 0)
-            .and_then(|dt| dt.and_local_timezone(chrono::Local).single())
-            .map(|dt| dt.timestamp_millis())
-            .unwrap_or(0),
-    }
-}
-
-/// Fetches usage events for `time_range` from the dashboard API and aggregates
-/// them by `(date, model)`.
-///
-/// Only fetches events on or after the range's cutoff (`startDate`), so the
-/// common daily/weekly/monthly views hit one page instead of the full history;
-/// [`TimeRange::All`] passes `0`. The aggregators still filter by date locally.
-fn fetch_all_events(time_range: TimeRange) -> Result<Vec<CachedEvent>> {
-    // Offline mode: don't hit the dashboard API; the caller falls back to a
-    // cached or local-approximation result.
-    if crate::utils::network_disabled() {
-        return Err(anyhow!("network disabled (VCT_OFFLINE)"));
-    }
-    fetch_all_events_from(
-        CURSOR_EVENTS_URL,
-        &get_cursor_auth_path()?,
-        range_start_ms(time_range),
-    )
-}
-
-/// The injectable core of [`fetch_all_events`]: posts to an explicit
-/// `events_url`, reading credentials from an explicit `auth_path`, fetching
-/// events on or after `start_ms`.
-///
-/// Production passes [`CURSOR_EVENTS_URL`] + `~/.config/cursor/auth.json`; tests
-/// point them at a local mock server and a temp auth file. Unlike the wrapper it
-/// does **not** consult `VCT_OFFLINE` — it is always given an explicit endpoint.
-fn fetch_all_events_from(
-    events_url: &str,
-    auth_path: &Path,
-    start_ms: i64,
-) -> Result<Vec<CachedEvent>> {
-    let body = std::fs::read_to_string(auth_path)
-        .with_context(|| format!("no Cursor credentials at {}", auth_path.display()))?;
-    let session = read_cursor_session(&body)
-        .ok_or_else(|| anyhow!("no usable Cursor session in {}", auth_path.display()))?;
-
-    let now_ms = chrono::Local::now().timestamp_millis();
-    // JWT `exp` is in seconds; bail so the caller can fall back rather than
-    // spamming a request that will only 401.
-    if session.exp > 0 && session.exp.saturating_mul(1000) <= now_ms {
-        return Err(anyhow!(
-            "Cursor session token expired (run: cursor-agent login)"
-        ));
-    }
-
-    let client = Client::builder().timeout(CURSOR_HTTP_TIMEOUT).build()?;
-
-    // (date, model) -> (input, output, cache_read, cache_write, cost_usd)
-    let mut agg: HashMap<(String, String), EventAcc> = HashMap::new();
-    let mut page = 1i64;
-    loop {
-        let payload = json!({
-            "teamId": CURSOR_INDIVIDUAL_TEAM_ID,
-            "startDate": start_ms,
-            "endDate": now_ms,
-            "page": page,
-            "pageSize": CURSOR_EVENTS_PAGE_SIZE,
-        });
-        let resp = client
-            .post(events_url)
-            .header(reqwest::header::COOKIE, session.cookie.as_str())
-            .header(reqwest::header::ACCEPT, "application/json")
-            .header(reqwest::header::USER_AGENT, cursor_ua())
-            .header(reqwest::header::ORIGIN, "https://cursor.com")
-            .header(
-                reqwest::header::REFERER,
-                "https://cursor.com/dashboard?tab=usage",
-            )
-            .json(&payload)
-            .send()
-            .context("Failed to send Cursor usage-events request")?;
-        if !resp.status().is_success() {
-            return Err(anyhow!(
-                "Cursor usage-events API returned {}",
-                resp.status()
-            ));
-        }
-        let body: Value = resp
-            .json()
-            .context("Failed to parse Cursor usage-events response")?;
-
-        let events = body
-            .get("usageEventsDisplay")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        if events.is_empty() {
-            break;
-        }
-        for ev in &events {
-            let Some(ts) = ev.get("timestamp").and_then(as_i64_lenient) else {
-                continue;
-            };
-            let Some(date) = ms_to_local_date(ts) else {
-                continue;
-            };
-            let model = ev
-                .get("model")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .unwrap_or("unknown")
-                .to_string();
-            let tu = ev.get("tokenUsage");
-            let bucket = |key: &str| {
-                tu.and_then(|t| t.get(key))
-                    .and_then(as_i64_lenient)
-                    .unwrap_or(0)
-            };
-            let e_input = bucket("inputTokens");
-            let e_output = bucket("outputTokens");
-            let e_cache_read = bucket("cacheReadTokens");
-            let e_cache_write = bucket("cacheWriteTokens");
-            let e_cost = event_cost_usd(ev);
-            // Skip empty events (e.g. errored / not-charged interactions): they
-            // would otherwise create 0-token / $0 model rows and count their
-            // date as an active Cursor day.
-            if e_input == 0
-                && e_output == 0
-                && e_cache_read == 0
-                && e_cache_write == 0
-                && e_cost == 0.0
-            {
-                continue;
-            }
-            let acc = agg.entry((date, model)).or_default();
-            acc.input += e_input;
-            acc.output += e_output;
-            acc.cache_read += e_cache_read;
-            acc.cache_write += e_cache_write;
-            acc.cost += e_cost;
-        }
-
-        let total = body
-            .get("totalUsageEventsCount")
-            .and_then(as_i64_lenient)
-            .unwrap_or(0);
-        if page.saturating_mul(CURSOR_EVENTS_PAGE_SIZE) >= total || page >= CURSOR_EVENTS_MAX_PAGES
-        {
-            break;
-        }
-        page += 1;
-    }
-
-    Ok(agg
-        .into_iter()
-        .map(|((date, model), acc)| CachedEvent {
-            date,
-            model,
-            input: acc.input,
-            output: acc.output,
-            cache_read: acc.cache_read,
-            cache_write: acc.cache_write,
-            cost: acc.cost,
-        })
-        .collect())
-}
-
-/// Running per-`(date, model)` token/cost accumulator while paginating.
-#[derive(Default)]
-struct EventAcc {
-    input: i64,
-    output: i64,
-    cache_read: i64,
-    cache_write: i64,
-    cost: f64,
-}
-
-/// The billed cost of one usage event, in USD.
-///
-/// Prefers the event-level `chargedCents` — what Cursor actually billed,
-/// including request/custom-subscription fees and the Cursor Token Rate, and
-/// `0` for events Cursor doesn't charge (e.g. bring-your-own API key) — so the
-/// reported cost matches the Cursor dashboard. Falls back to the token cost
-/// (`tokenUsage.totalCents`) only when `chargedCents` is absent (some
-/// non-token-based events).
-fn event_cost_usd(ev: &Value) -> f64 {
-    let cents = ev
-        .get("chargedCents")
-        .and_then(as_f64_lenient)
-        .or_else(|| {
-            ev.get("tokenUsage")
-                .and_then(|t| t.get("totalCents"))
-                .and_then(as_f64_lenient)
-        })
-        .unwrap_or(0.0);
-    cents / 100.0
 }
 
 /// Turns cached usage events into the `(date, CodeAnalysis, cost)` tuples the
@@ -1062,20 +701,6 @@ fn wrap_record(record: CodeAnalysisRecord, user: &str, machine: &str) -> CodeAna
     }
 }
 
-/// Reads a JSON number *or* numeric string as `i64` (the dashboard API returns
-/// token counts as strings on some endpoints).
-fn as_i64_lenient(v: &Value) -> Option<i64> {
-    v.as_i64()
-        .or_else(|| v.as_f64().map(|f| f as i64))
-        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
-}
-
-/// Reads a JSON number *or* numeric string as `f64`.
-fn as_f64_lenient(v: &Value) -> Option<f64> {
-    v.as_f64()
-        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
-}
-
 /// Converts a millisecond epoch timestamp into a local `YYYY-MM-DD` date.
 fn ms_to_local_date(ms: i64) -> Option<String> {
     chrono::DateTime::from_timestamp_millis(ms).map(|dt| {
@@ -1186,29 +811,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn range_start_ms_is_zero_for_all_and_bounded_otherwise() {
-        // `All` fetches full history (startDate 0); the bounded ranges produce a
-        // positive cutoff, and the more recent the range the later (larger) the
-        // cutoff — so a daily cache never claims to cover a monthly request.
-        assert_eq!(range_start_ms(TimeRange::All), 0);
-        let daily = range_start_ms(TimeRange::Daily);
-        let weekly = range_start_ms(TimeRange::Weekly);
-        let monthly = range_start_ms(TimeRange::Monthly);
-        assert!(monthly > 0 && weekly > 0 && daily > 0);
-        assert!(daily >= weekly && weekly >= monthly);
-    }
-
-    #[test]
-    fn usage_cache_start_ms_defaults_to_zero_for_legacy_json() {
-        // A cache written before the `start_ms` field must deserialize as
-        // full-history (0) so it keeps covering every range.
-        let legacy = r#"{"fetched_at":123,"events":[],"from_api":true}"#;
-        let cache: UsageCache = serde_json::from_str(legacy).unwrap();
-        assert_eq!(cache.start_ms, 0);
-        assert!(cache.from_api);
-    }
-
-    #[test]
     fn hex_decode_roundtrips_json() {
         let json = r#"{"lastUsedModel":"composer-2"}"#;
         let hex: String = json.bytes().map(|b| format!("{b:02x}")).collect();
@@ -1237,29 +839,6 @@ mod tests {
         // file's line count.
         let raw = "header without number\n     1|real line";
         assert_eq!(strip_cursor_line_numbers(raw), "real line");
-    }
-
-    #[test]
-    fn lenient_number_parsing() {
-        assert_eq!(as_i64_lenient(&json!(42)), Some(42));
-        assert_eq!(as_i64_lenient(&json!("42")), Some(42));
-        assert_eq!(as_i64_lenient(&json!("  17 ")), Some(17));
-        assert_eq!(as_i64_lenient(&json!("nope")), None);
-        assert_eq!(as_f64_lenient(&json!("3.5")), Some(3.5));
-    }
-
-    #[test]
-    fn event_cost_prefers_charged_cents() {
-        // Actual Cursor charge wins over the token-only cost.
-        let ev = json!({"tokenUsage": {"totalCents": 250}, "chargedCents": 999});
-        assert!((event_cost_usd(&ev) - 9.99).abs() < 1e-9);
-        // A bring-your-own-key event Cursor doesn't charge is $0, not the token value.
-        let byok = json!({"tokenUsage": {"totalCents": 677}, "chargedCents": 0});
-        assert_eq!(event_cost_usd(&byok), 0.0);
-        // No chargedCents field -> fall back to the token cost.
-        let ev2 = json!({"tokenUsage": {"totalCents": "120"}});
-        assert!((event_cost_usd(&ev2) - 1.2).abs() < 1e-9);
-        assert_eq!(event_cost_usd(&json!({})), 0.0);
     }
 
     /// Builds a minimal binary DAG node: `field 4` = message JSON, `field 26` =
@@ -1502,54 +1081,6 @@ mod tests {
         assert_eq!(
             turns,
             vec![(1_700_000_000_000, 42_000), (1_700_000_500_000, 88_000)]
-        );
-    }
-
-    /// The dashboard usage-events fetch, against a local mock server: it reads a
-    /// (temp) `auth.json`, POSTs to the injected URL, and aggregates the returned
-    /// events by `(date, model)`. No real Cursor API is reached.
-    #[test]
-    fn fetch_all_events_from_aggregates_events() {
-        use base64::Engine as _;
-        use httpmock::prelude::*;
-
-        let enc = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
-        let payload = serde_json::json!({ "sub": "user|uid123", "exp": 4_000_000_000i64 });
-        let jwt = format!(
-            "{}.{}.{}",
-            enc(b"{}"),
-            enc(payload.to_string().as_bytes()),
-            enc(b"sig")
-        );
-
-        let server = MockServer::start();
-        let endpoint = server.mock(|when, then| {
-            when.method(POST).path("/events");
-            then.status(200).json_body(serde_json::json!({
-                "usageEventsDisplay": [
-                    { "timestamp": 1_700_000_000_000i64, "model": "claude-x",
-                      "tokenUsage": { "inputTokens": 100, "outputTokens": 50 } },
-                    { "timestamp": 1_700_000_000_000i64, "model": "gpt-y",
-                      "tokenUsage": { "inputTokens": 200 } }
-                ],
-                "totalUsageEventsCount": 2
-            }));
-        });
-
-        let dir = tempfile::tempdir().unwrap();
-        let auth = dir.path().join("auth.json");
-        std::fs::write(&auth, serde_json::json!({ "accessToken": jwt }).to_string()).unwrap();
-
-        let events = fetch_all_events_from(&server.url("/events"), &auth, 0).expect("fetch events");
-        endpoint.assert();
-
-        assert_eq!(events.len(), 2, "one aggregated row per (date, model)");
-        let claude = events.iter().find(|e| e.model == "claude-x").unwrap();
-        assert_eq!(claude.input, 100);
-        assert_eq!(claude.output, 50);
-        assert_eq!(
-            events.iter().find(|e| e.model == "gpt-y").unwrap().input,
-            200
         );
     }
 }

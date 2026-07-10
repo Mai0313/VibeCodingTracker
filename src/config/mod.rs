@@ -49,14 +49,6 @@ copilot = true
 gemini = true
 opencode = true
 cursor = true
-
-[cursor]
-# Where Cursor `usage` token/cost numbers come from:
-#   "local" — estimate from the local chat stores (default; consistent with the
-#             other providers, fast and offline, but a rough undercount)
-#   "api"   — Cursor's dashboard billing API (accurate real tokens/cost; falls
-#             back to the local estimate when the API is unreachable)
-usage_source = "local"
 "#;
 
 /// The full settings document.
@@ -70,8 +62,6 @@ pub struct Config {
     pub analysis: AnalysisConfig,
     #[serde(default)]
     pub providers: ProvidersConfig,
-    #[serde(default)]
-    pub cursor: CursorConfig,
 }
 
 /// `[general]` — settings shared across subcommands.
@@ -177,27 +167,6 @@ impl Default for ProvidersConfig {
     }
 }
 
-/// Where Cursor `usage` token/cost numbers come from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum CursorUsageSource {
-    /// Estimate from the local chat stores (default): consistent with the other
-    /// providers, fast and offline, but a rough undercount.
-    #[default]
-    Local,
-    /// Cursor's dashboard billing API (accurate), with the local estimate as a
-    /// fallback when the API is unreachable.
-    Api,
-}
-
-/// `[cursor]` — Cursor-specific preferences.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct CursorConfig {
-    /// Source for Cursor's `usage` numbers (`local` / `api`).
-    #[serde(default)]
-    pub usage_source: CursorUsageSource,
-}
-
 fn default_true() -> bool {
     true
 }
@@ -294,7 +263,6 @@ mod tests {
         assert_eq!(cfg.analysis.refresh_interval_secs, 10);
         assert_eq!(cfg.providers, ProvidersConfig::default());
         assert!(cfg.providers.cursor);
-        assert_eq!(cfg.cursor.usage_source, CursorUsageSource::Local);
     }
 
     #[test]
@@ -304,7 +272,6 @@ mod tests {
         let cfg: Config = toml_edit::de::from_str("").unwrap();
         assert_eq!(cfg.usage.quota_panels, default_quota_panels());
         assert!(cfg.providers.cursor);
-        assert_eq!(cfg.cursor.usage_source, CursorUsageSource::Local);
         assert_eq!(cfg.usage.refresh_secs(), 10);
     }
 
@@ -324,12 +291,6 @@ mod tests {
 
         let empty: Config = toml_edit::de::from_str("[usage]\nquota_panels = []\n").unwrap();
         assert!(!empty.usage.shows_quota_panel("claude"));
-    }
-
-    #[test]
-    fn cursor_usage_source_parses_api() {
-        let cfg: Config = toml_edit::de::from_str("[cursor]\nusage_source = \"api\"\n").unwrap();
-        assert_eq!(cfg.cursor.usage_source, CursorUsageSource::Api);
     }
 
     #[test]

@@ -157,9 +157,7 @@ fn main() -> Result<()> {
             // A `--merge-providers` flag forces merging on; otherwise the saved
             // preference decides. The TUI's `m` toggle persists back to config.
             let merge = merge_providers || config.usage.merge_models;
-            let usage_from_dirs = |tr| {
-                get_usage_from_directories_with(tr, config.providers, config.cursor.usage_source)
-            };
+            let usage_from_dirs = |tr| get_usage_from_directories_with(tr, config.providers);
 
             if json || output.is_some() {
                 let usage_data = usage_from_dirs(time_range)?;
@@ -195,7 +193,6 @@ fn main() -> Result<()> {
                     merge,
                     config.usage.quota_panels.clone(),
                     config.providers,
-                    config.cursor.usage_source,
                     config.usage.refresh_secs(),
                 )?;
             }
