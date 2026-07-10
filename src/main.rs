@@ -8,7 +8,7 @@
 //! Two things run *before* clap on purpose, and the ordering is
 //! load-bearing — see [`main`].
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use comfy_table::{Cell, CellAlignment, Color, ContentArrangement, Table, presets::UTF8_FULL};
 use owo_colors::OwoColorize;
@@ -298,11 +298,20 @@ fn run_config(action: ConfigAction) -> Result<()> {
             let editor = std::env::var("VISUAL")
                 .or_else(|_| std::env::var("EDITOR"))
                 .unwrap_or_else(|_| default_editor().to_string());
-            let status = std::process::Command::new(&editor).arg(&path).status();
-            match status {
-                Ok(s) if s.success() => {}
-                Ok(s) => eprintln!("Editor exited with status: {}", s),
-                Err(e) => eprintln!("Failed to launch editor '{}': {}", editor, e),
+            // `$EDITOR` / `$VISUAL` often carry arguments (`code --wait`, `vim -f`),
+            // so split into program + args rather than treating the whole string as
+            // one executable name.
+            let mut parts = editor.split_whitespace();
+            let program = parts
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("empty editor command"))?;
+            let status = std::process::Command::new(program)
+                .args(parts)
+                .arg(&path)
+                .status()
+                .with_context(|| format!("Failed to launch editor '{}'", editor))?;
+            if !status.success() {
+                eprintln!("Editor exited with status: {}", status);
             }
         }
     }
