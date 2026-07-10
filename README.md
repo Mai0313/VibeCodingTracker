@@ -48,7 +48,7 @@ Choose your preferred view:
 
 ### Zero Configuration
 
-Automatically detects and processes logs from Claude Code, Codex, Copilot, Gemini, OpenCode, and Cursor. No setup required — just run and analyze.
+Automatically detects and processes logs from Claude Code, Codex, Copilot, Gemini, OpenCode, and Cursor. No setup required — just run and analyze. A `~/.vct/config.toml` is created with sensible defaults on first run if you ever want to tweak behavior (see [Configuration](#configuration)).
 
 ### Rich Insights
 
@@ -149,6 +149,7 @@ Commands:
   version     Display version information
   update      Update to the latest version from GitHub releases
   fetch       Fetch a provider's raw quota/usage API response
+  config      Show or edit the persistent settings file (~/.vct/config.toml)
   help        Print this message or the help of the given subcommand(s)
 ```
 
@@ -211,7 +212,7 @@ vct usage --table --merge-providers
 > Model rows are sorted by cost in ascending order, so the highest-spending model is listed last (right above the `TOTAL` row in `--table`). This applies to the interactive dashboard, `--table`, and `--text` output; `--json` preserves the same order. The interactive dashboard also hides models with zero usage in the selected range.
 
 > [!TIP]
-> The same model can show up as several rows when it is routed under different provider prefixes (`openai/gpt-5.5`, `azure/gpt-5.5`, plain `gpt-5.5`). `--merge-providers` collapses rows that share the base name after the first `/` (versions like `gpt-5.5` vs `gpt-5.4` stay separate) and sums their already-priced cost. In the interactive dashboard, press `m` to toggle it live; `--merge-providers` opens the dashboard already merged. `--json` is left as the raw per-model export.
+> The same model can show up as several rows when it is routed under different provider prefixes (`openai/gpt-5.5`, `azure/gpt-5.5`, plain `gpt-5.5`). `--merge-providers` collapses rows that share the base name after the first `/` (versions like `gpt-5.5` vs `gpt-5.4` stay separate) and sums their already-priced cost. In the interactive dashboard, press `m` to toggle it live (the choice is saved to `~/.vct/config.toml`, so the next launch remembers it); `--merge-providers` opens the dashboard already merged. `--json` is left as the raw per-model export.
 
 ### Preview: Interactive Dashboard (`vct usage`)
 
@@ -232,7 +233,7 @@ vct usage --table --merge-providers
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
 │ Total Cost: $79.33  |  Total Tokens: 49.3M  |  Models: 3  |  Memory: 42.8 MB                │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
-  ↑/↓ scroll  PgUp/PgDn page  g/G top/end  m merge  r refresh  q quit  |  ★ github.com/Mai0313/VibeCodingTracker
+  ↑/↓ scroll  m merge  r refresh  q quit  |  ★ github.com/Mai0313/VibeCodingTracker
 ```
 
 ### Preview: Table & JSON (`vct usage`)
@@ -293,7 +294,7 @@ The tool automatically scans these directories:
 
 ### Live Quota Panels
 
-`vct usage` shows **live remaining quota for Claude Code, Codex, GitHub Copilot, and Cursor right in the dashboard — with zero setup.** No status-line hook, no config file: vct reads each provider's own credentials, calls its usage API on a background thread, and keeps the panels current while you work.
+`vct usage` shows **live remaining quota for Claude Code, Codex, GitHub Copilot, and Cursor right in the dashboard — with zero setup.** No status-line hook, no credentials to enter: vct reads each provider's own credentials, calls its usage API on a background thread, and keeps the panels current while you work. (Prefer a quieter dashboard? Set `show_quota_panels = false` in [`config.toml`](#configuration).)
 
 ```
 ┌ Claude ─────────────────┐┌ Codex ──────────────────┐┌ Copilot ────────────────┐┌ Cursor ─────────────────┐
@@ -383,7 +384,7 @@ vct analysis --output today.json --daily
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ Total Lines: 16.1K  |  Total Tools: 619  |  Models: 3  |  Memory: 41.2 MB                                       │
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-  ↑/↓ scroll  PgUp/PgDn page  g/G top/end  r refresh  q quit  |  ★ github.com/Mai0313/VibeCodingTracker
+  ↑/↓ scroll  r refresh  q quit  |  ★ github.com/Mai0313/VibeCodingTracker
 ```
 
 ### Preview: Table & JSON (`vct analysis`)
@@ -505,6 +506,54 @@ vct fetch copilot --table
 
 > [!NOTE]
 > The response body is printed to stdout as-is. On an HTTP error the body is still printed and the process exits non-zero; a 401/403 additionally prints a `run: <cli> login` hint on stderr.
+
+---
+
+## Configuration
+
+vct keeps its user settings in `~/.vct/config.toml`. The file is **created with defaults on first run** (an older `~/.vct/version.json` is folded into it and removed), so you never have to write it by hand — edit it only when you want to change a default.
+
+```toml
+[general]
+# Default time range when no --daily/--weekly/--monthly/--all flag is given.
+# one of: "daily" | "weekly" | "monthly" | "all"
+default_time_range = "all"
+
+[usage]
+# Start the usage dashboard with models merged across provider prefixes.
+# Toggled live with `m`; the last state is saved back here.
+merge_models = false
+# Show the live quota panels (Claude / Codex / Copilot / Cursor) in the usage TUI.
+show_quota_panels = true
+
+[update]
+# Whether vct performs automatic update checks (explicit `vct update` always runs).
+check_enabled = true
+# --- managed automatically ---
+latest_version = ""
+last_checked_at = ""
+dismissed_version = ""
+```
+
+| Setting                      | Effect                                                                                                      |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `general.default_time_range` | Period used when you pass no `--daily/--weekly/--monthly/--all`. An explicit flag always wins.              |
+| `usage.merge_models`         | Seeds the dashboard merged; the `m` toggle saves your last choice back here. `--merge-providers` forces on. |
+| `usage.show_quota_panels`    | Hide the live quota band (no credential probing, no background workers) when `false`.                       |
+| `update.check_enabled`       | Preference for automatic update checks; explicit `vct update` / `--check` always run.                       |
+
+### Managing the file
+
+```bash
+# Print the config file path
+vct config path
+
+# Print the current settings
+vct config show
+
+# Open the file in $VISUAL / $EDITOR (falls back to vi / notepad)
+vct config edit
+```
 
 ---
 

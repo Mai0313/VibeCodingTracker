@@ -535,3 +535,30 @@ fn all_short_flag_parses_for_both_subcommands() {
             .success();
     }
 }
+
+#[test]
+fn config_path_prints_config_toml_location() {
+    // Uses a per-child HOME so the check never touches the real `~/.vct`.
+    let home = TempHome::new();
+    child_cmd(&home)
+        .arg("config")
+        .arg("path")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("config.toml"));
+}
+
+#[test]
+fn config_show_creates_and_prints_settings() {
+    let home = TempHome::new();
+    child_cmd(&home)
+        .arg("config")
+        .arg("show")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[usage]"))
+        .stdout(predicate::str::contains("merge_models"));
+
+    // The show path must have materialized the file under the temp home.
+    assert!(home.home().join(".vct/config.toml").exists());
+}

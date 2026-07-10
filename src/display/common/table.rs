@@ -95,14 +95,7 @@ pub fn create_summary<'a>(
 pub fn create_controls(extra: &[(&str, &str)]) -> Paragraph<'static> {
     let key = Style::default().fg(RatatuiColor::Cyan).bold();
     let dim = Style::default().fg(RatatuiColor::DarkGray);
-    let mut spans = vec![
-        Span::styled("↑/↓", key),
-        Span::styled(" scroll  ", dim),
-        Span::styled("PgUp/PgDn", key),
-        Span::styled(" page  ", dim),
-        Span::styled("g/G", key),
-        Span::styled(" top/end  ", dim),
-    ];
+    let mut spans = vec![Span::styled("↑/↓", key), Span::styled(" scroll  ", dim)];
     for (k, label) in extra {
         spans.push(Span::styled(k.to_string(), key));
         spans.push(Span::styled(label.to_string(), dim));
@@ -206,9 +199,8 @@ pub fn styled_row(cells: Vec<String>, style: Style, left_cols: usize) -> Ratatui
 ///
 /// `rows` are the already-styled body rows (highlight / TOTAL styling applied by
 /// the caller); `row_count` is the total displayed row count used to size the
-/// scrollbar. Updates `scroll.viewport_rows` to the rendered body height so the
-/// event loop can size page jumps. The block border + header + header margin
-/// consume 4 rows, so the visible body height is `area.height - 4`.
+/// scrollbar. The block border + header + header margin consume 4 rows, so the
+/// visible body height is `area.height - 4`.
 #[allow(clippy::too_many_arguments)]
 pub fn render_scrollable_table(
     f: &mut Frame,
@@ -221,7 +213,6 @@ pub fn render_scrollable_table(
     scroll: &mut ScrollState,
 ) {
     let viewport = area.height.saturating_sub(4);
-    scroll.viewport_rows = viewport;
 
     // Selection is shown purely by the row color (no leading symbol / gutter).
     let table = create_ratatui_table(rows, header, widths, border_color).row_highlight_style(

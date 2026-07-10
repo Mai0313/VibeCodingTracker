@@ -46,6 +46,7 @@ strsim = "0.11.1"
 sysinfo = "0.36.1"
 tar = "0.4.46"
 tempfile = "3.27.0"
+toml_edit = { version = "0.22.24", features = ["serde"] }
 walkdir = "2.5.0"
 zip = "7.2.0"
 

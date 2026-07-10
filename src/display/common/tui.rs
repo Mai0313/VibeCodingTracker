@@ -96,12 +96,8 @@ pub fn handle_input() -> anyhow::Result<InputAction> {
                 // Navigation accumulates across the drained batch so a held key
                 // collapses into a single net move per tick.
                 match key.code {
-                    KeyCode::Up | KeyCode::Char('k') => nav.lines -= 1,
-                    KeyCode::Down | KeyCode::Char('j') => nav.lines += 1,
-                    KeyCode::PageUp => nav.pages -= 1,
-                    KeyCode::PageDown => nav.pages += 1,
-                    KeyCode::Home | KeyCode::Char('g') => nav.top = true,
-                    KeyCode::End | KeyCode::Char('G') => nav.bottom = true,
+                    KeyCode::Up => nav.lines -= 1,
+                    KeyCode::Down => nav.lines += 1,
                     _ => {}
                 }
             }
@@ -125,21 +121,17 @@ pub fn handle_input() -> anyhow::Result<InputAction> {
 
 /// A net navigation move accumulated from one [`handle_input`] batch.
 ///
-/// `lines` is single-row steps (arrow keys), `pages` is page jumps (multiplied
-/// by the live viewport height by the consumer), and `top` / `bottom` jump to
-/// the first / last row.
+/// `lines` is single-row steps from the arrow keys (negative = up), summed
+/// across the drained event batch so a held key collapses into one net move.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NavDelta {
     pub lines: i64,
-    pub pages: i64,
-    pub top: bool,
-    pub bottom: bool,
 }
 
 impl NavDelta {
     /// Whether this delta would move the selection at all.
     pub fn is_active(&self) -> bool {
-        self.lines != 0 || self.pages != 0 || self.top || self.bottom
+        self.lines != 0
     }
 }
 
@@ -321,19 +313,15 @@ impl UpdateTracker {
 /// Scroll + selection state for a scrollable TUI table.
 ///
 /// Bundles the ratatui [`TableState`] (drives auto-scroll + row highlight) and
-/// [`ScrollbarState`] (drives the side scrollbar) with the last rendered body
-/// height, so page jumps and the scrollbar track the live viewport. The
-/// renderer updates [`viewport_rows`](Self::viewport_rows) on every draw; the
-/// event loop calls [`apply`](Self::apply) / [`sync`](Self::sync) to move and
-/// reconcile the selection.
+/// [`ScrollbarState`] (drives the side scrollbar). The event loop calls
+/// [`apply`](Self::apply) / [`sync`](Self::sync) to move and reconcile the
+/// selection.
 #[derive(Debug, Default)]
 pub struct ScrollState {
     /// Selection + offset, fed to `render_stateful_widget`.
     pub table: TableState,
     /// Side scrollbar position/extent.
     pub scrollbar: ScrollbarState,
-    /// Body rows visible in the last render (used as the page-jump size).
-    pub viewport_rows: u16,
 }
 
 impl ScrollState {
@@ -342,7 +330,6 @@ impl ScrollState {
         Self {
             table: TableState::default(),
             scrollbar: ScrollbarState::default(),
-            viewport_rows: 1,
         }
     }
 
@@ -367,21 +354,48 @@ impl ScrollState {
     /// Applies a navigation delta, clamping the selection to `[0, selectable-1]`.
     ///
     /// `selectable` is the number of selectable rows (model rows, not the
-    /// pinned TOTAL). Page jumps use the last rendered viewport height.
+    /// pinned TOTAL).
     pub fn apply(&mut self, nav: NavDelta, selectable: usize) {
         if selectable == 0 {
             self.table.select(None);
             return;
         }
         let max = (selectable - 1) as i64;
-        let page = self.viewport_rows.max(1) as i64;
-        let mut next = self.table.selected().unwrap_or(0) as i64 + nav.lines + nav.pages * page;
-        if nav.top {
-            next = 0;
-        }
-        if nav.bottom {
-            next = max;
-        }
+        let next = self.table.selected().unwrap_or(0) as i64 + nav.lines;
         self.table.select(Some(next.clamp(0, max) as usize));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nav_delta_is_active_only_when_lines_move() {
+        assert!(!NavDelta::default().is_active());
+        assert!(NavDelta { lines: -1 }.is_active());
+        assert!(NavDelta { lines: 2 }.is_active());
+    }
+
+    #[test]
+    fn apply_moves_and_clamps_selection() {
+        let mut scroll = ScrollState::new();
+        scroll.table.select(Some(0));
+
+        // Down one, up past the top (clamps at 0), and up from empty selection.
+        scroll.apply(NavDelta { lines: 1 }, 3);
+        assert_eq!(scroll.table.selected(), Some(1));
+        scroll.apply(NavDelta { lines: -5 }, 3);
+        assert_eq!(scroll.table.selected(), Some(0));
+        scroll.apply(NavDelta { lines: 10 }, 3);
+        assert_eq!(scroll.table.selected(), Some(2));
+    }
+
+    #[test]
+    fn apply_clears_selection_when_no_rows() {
+        let mut scroll = ScrollState::new();
+        scroll.table.select(Some(1));
+        scroll.apply(NavDelta { lines: 1 }, 0);
+        assert_eq!(scroll.table.selected(), None);
     }
 }

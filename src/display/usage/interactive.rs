@@ -155,11 +155,13 @@ const USAGE_PANELS_MIN_H: u16 = 22;
 /// - Auto-refresh every 10 seconds (usage + pricing)
 /// - Real-time memory monitoring
 /// - Provider-grouped totals
-/// - Scrollable model table (arrow keys / `PgUp`/`PgDn` / `g`/`G`)
+/// - Scrollable model table (arrow keys)
 /// - Keyboard controls: `q`, `Esc`, or `Ctrl+C` to exit, `r` to refresh, `m` to
 ///   toggle merging models that share a base name across provider prefixes
 ///   (e.g. `openai/gpt-5.5` + `azure/gpt-5.5`). `merge_providers` seeds the
-///   initial state.
+///   initial state and the `m` toggle is saved back to `config.toml`.
+///   `show_quota_panels` gates the live quota band (skips detection / workers /
+///   rendering when false).
 ///
 /// # Errors
 ///
@@ -174,6 +176,7 @@ const USAGE_PANELS_MIN_H: u16 = 22;
 pub fn display_usage_interactive(
     time_range: crate::cli::TimeRange,
     merge_providers: bool,
+    show_quota_panels: bool,
 ) -> anyhow::Result<()> {
     let mut terminal = setup_terminal()?;
     let mut refresh_state = RefreshState::new(USAGE_REFRESH_SECS);
@@ -184,7 +187,14 @@ pub fn display_usage_interactive(
     // immediately on launch, and a worker is spawned only for a provider whose
     // credentials are present. All workers share one HTTP client and shutdown
     // flag.
-    let present = QuotaPresence::detect();
+    // When quota panels are disabled in config, treat every provider as absent
+    // so no credentials are probed, no worker threads spawn, and the band is
+    // dropped entirely.
+    let present = if show_quota_panels {
+        QuotaPresence::detect()
+    } else {
+        QuotaPresence::default()
+    };
     let quota_shutdown = Arc::new(AtomicBool::new(false));
     let claude_shared = Arc::new(Mutex::new(
         present
@@ -516,6 +526,9 @@ pub fn display_usage_interactive(
                         .map(|row| row.model.clone())
                 };
                 merge_enabled = !merge_enabled;
+                // Remember the choice for next launch (best-effort; a write
+                // failure must not disrupt the TUI).
+                let _ = crate::config::save_merge_models(merge_enabled);
                 // Materialize the merged rows when turning on; drop them (freeing
                 // the copy) when turning off.
                 if merge_enabled {

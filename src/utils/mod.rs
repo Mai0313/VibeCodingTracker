@@ -23,7 +23,7 @@ pub use directory::{
 };
 pub use file::{
     count_lines, read_json, read_jsonl, save_json_pretty, write_json_atomic,
-    write_json_atomic_pretty,
+    write_json_atomic_pretty, write_string_atomic,
 };
 pub use format::{
     format_compact, format_cost, format_cost_compact, format_duration_until, format_number,
@@ -34,9 +34,9 @@ pub use heap::{release_freed_heap, tune_system_allocator};
 pub use paths::{
     HelperPaths, find_pricing_cache_for_date, find_pricing_cache_for_date_in, get_cache_dir,
     get_claude_credentials_path, get_claude_usage_cache_path, get_codex_usage_cache_path,
-    get_copilot_config_path, get_copilot_usage_cache_path, get_current_user, get_cursor_auth_path,
-    get_cursor_usage_cache_path, get_machine_id, get_pricing_cache_path, get_pricing_cache_path_in,
-    get_self_version_cache_path, list_pricing_cache_files, list_pricing_cache_files_in,
+    get_config_path, get_copilot_config_path, get_copilot_usage_cache_path, get_current_user,
+    get_cursor_auth_path, get_cursor_usage_cache_path, get_machine_id, get_pricing_cache_path,
+    get_pricing_cache_path_in, list_pricing_cache_files, list_pricing_cache_files_in,
     network_disabled, resolve_paths, resolve_paths_from_home,
 };
 pub use time::{now_rfc3339_utc_nanos, parse_iso_timestamp};

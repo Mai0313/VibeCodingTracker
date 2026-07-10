@@ -14,7 +14,7 @@ use comfy_table::{Cell, CellAlignment, Color, ContentArrangement, Table, presets
 use owo_colors::OwoColorize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use vibe_coding_tracker::cli::{Cli, Commands, resolve_time_range};
+use vibe_coding_tracker::cli::{Cli, Commands, ConfigAction, resolve_time_range_with_default};
 
 // mimalloc is opt-in behind the `mimalloc` cargo feature. The default build
 // uses the system allocator because mimalloc's lazy purge retains freed
@@ -66,6 +66,10 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // Load persistent settings once (also creates ~/.vct/config.toml with
+    // defaults and migrates a legacy version.json on first run).
+    let config = vibe_coding_tracker::config::load();
+
     match cli.command {
         Commands::Analysis {
             path,
@@ -76,9 +80,15 @@ fn main() -> Result<()> {
             daily,
             weekly,
             monthly,
-            ..
+            all,
         } => {
-            let time_range = resolve_time_range(daily, weekly, monthly);
+            let time_range = resolve_time_range_with_default(
+                daily,
+                weekly,
+                monthly,
+                all,
+                config.general.default_time_range,
+            );
 
             match path {
                 Some(file_path) => {
@@ -130,9 +140,18 @@ fn main() -> Result<()> {
             daily,
             weekly,
             monthly,
-            ..
+            all,
         } => {
-            let time_range = resolve_time_range(daily, weekly, monthly);
+            let time_range = resolve_time_range_with_default(
+                daily,
+                weekly,
+                monthly,
+                all,
+                config.general.default_time_range,
+            );
+            // A `--merge-providers` flag forces merging on; otherwise the saved
+            // preference decides. The TUI's `m` toggle persists back to config.
+            let merge = merge_providers || config.usage.merge_models;
 
             if json || output.is_some() {
                 let usage_data = get_usage_from_directories(time_range)?;
@@ -158,12 +177,12 @@ fn main() -> Result<()> {
                 }
             } else if text {
                 let usage_data = get_usage_from_directories(time_range)?;
-                display_usage_text(&usage_data, merge_providers);
+                display_usage_text(&usage_data, merge);
             } else if table {
                 let usage_data = get_usage_from_directories(time_range)?;
-                display_usage_table(&usage_data, merge_providers);
+                display_usage_table(&usage_data, merge);
             } else {
-                display_usage_interactive(time_range, merge_providers)?;
+                display_usage_interactive(time_range, merge, config.usage.show_quota_panels)?;
             }
         }
 
@@ -234,9 +253,50 @@ fn main() -> Result<()> {
         } => {
             vibe_coding_tracker::fetch::run(provider, text, table)?;
         }
+
+        Commands::Config { action } => {
+            run_config(action.unwrap_or(ConfigAction::Show))?;
+        }
     }
 
     Ok(())
+}
+
+/// Handles the `config` subcommand: print the path, show current settings, or
+/// open the file in the user's editor.
+fn run_config(action: ConfigAction) -> Result<()> {
+    let path = vibe_coding_tracker::utils::get_config_path()?;
+    match action {
+        ConfigAction::Path => println!("{}", path.display()),
+        ConfigAction::Show => {
+            // Ensure the file exists (first-run creation) before reading it back.
+            let _ = vibe_coding_tracker::config::load();
+            let contents = std::fs::read_to_string(&path).unwrap_or_default();
+            println!("{}", "Vibe Coding Tracker settings".bright_cyan().bold());
+            println!("{}", path.display().dimmed());
+            println!();
+            print!("{}", contents);
+        }
+        ConfigAction::Edit => {
+            // Ensure the file exists before handing it to the editor.
+            let _ = vibe_coding_tracker::config::load();
+            let editor = std::env::var("VISUAL")
+                .or_else(|_| std::env::var("EDITOR"))
+                .unwrap_or_else(|_| default_editor().to_string());
+            let status = std::process::Command::new(&editor).arg(&path).status();
+            match status {
+                Ok(s) if s.success() => {}
+                Ok(s) => eprintln!("Editor exited with status: {}", s),
+                Err(e) => eprintln!("Failed to launch editor '{}': {}", editor, e),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The fallback editor when neither `$VISUAL` nor `$EDITOR` is set.
+fn default_editor() -> &'static str {
+    if cfg!(windows) { "notepad" } else { "vi" }
 }
 
 /// Builds the `usage --json` payload, joining each model's token counts with

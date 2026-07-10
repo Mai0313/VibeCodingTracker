@@ -48,7 +48,7 @@
 
 ### 零配置
 
-自动检测并处理来自 Claude Code、Codex、Copilot、Gemini、OpenCode 和 Cursor 的日志。无需任何设置——直接运行即可分析。
+自动检测并处理来自 Claude Code、Codex、Copilot、Gemini、OpenCode 和 Cursor 的日志。无需任何设置——直接运行即可分析。首次运行时会以合理的默认值创建 `~/.vct/config.toml`，方便你日后需要调整行为时使用（参见 [配置](#configuration)）。
 
 ### 丰富的洞察
 
@@ -149,6 +149,7 @@ Commands:
   version     Display version information
   update      Update to the latest version from GitHub releases
   fetch       Fetch a provider's raw quota/usage API response
+  config      Show or edit the persistent settings file (~/.vct/config.toml)
   help        Print this message or the help of the given subcommand(s)
 ```
 
@@ -211,7 +212,7 @@ vct usage --table --merge-providers
 > Model 行会按 cost 升序排序，因此花费最高的 model 会排在最后（在 `--table` 中紧邻 `TOTAL` 行上方）。该排序适用于交互式面板、`--table` 与 `--text` 三种输出；`--json` 也会保持相同顺序。交互式面板还会隐藏在所选范围内用量为 0 的模型。
 
 > [!TIP]
-> 同一个 model 在不同 provider 前缀下路由时会显示成多行（`openai/gpt-5.5`、`azure/gpt-5.5`、纯 `gpt-5.5`）。`--merge-providers` 会把第一个 `/` 之后 base 名称相同的行合并（`gpt-5.5` 与 `gpt-5.4` 这类版本不同的仍分开），并把它们已定价的 cost 相加。在交互式面板中按 `m` 可实时切换；`--merge-providers` 则让面板一打开就是合并状态。`--json` 保持为逐一 model 的原始导出。
+> 同一个 model 在不同 provider 前缀下路由时会显示成多行（`openai/gpt-5.5`、`azure/gpt-5.5`、纯 `gpt-5.5`）。`--merge-providers` 会把第一个 `/` 之后 base 名称相同的行合并（`gpt-5.5` 与 `gpt-5.4` 这类版本不同的仍分开），并把它们已定价的 cost 相加。在交互式面板中按 `m` 可实时切换（该选择会保存到 `~/.vct/config.toml`，因此下次启动会记住上次的状态）；`--merge-providers` 则让面板一打开就是合并状态。`--json` 保持为逐一 model 的原始导出。
 
 ### 预览：交互式面板（`vct usage`）
 
@@ -232,7 +233,7 @@ vct usage --table --merge-providers
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
 │ Total Cost: $79.33  |  Total Tokens: 49.3M  |  Models: 3  |  Memory: 42.8 MB                │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
-  ↑/↓ scroll  PgUp/PgDn page  g/G top/end  m merge  r refresh  q quit  |  ★ github.com/Mai0313/VibeCodingTracker
+  ↑/↓ scroll  m merge  r refresh  q quit  |  ★ github.com/Mai0313/VibeCodingTracker
 ```
 
 ### 预览：表格与 JSON（`vct usage`）
@@ -293,7 +294,7 @@ Totals (by Provider)
 
 ### 实时额度面板
 
-`vct usage` 会**在仪表盘中直接显示 Claude Code、Codex、GitHub Copilot 与 Cursor 的实时剩余额度——完全零配置。** 不需要 status-line hook，也不需要配置文件：vct 会读取各 provider 自己的 OAuth 凭证，在后台线程调用其用量 API，并在你工作时保持面板持续更新。
+`vct usage` 会**在仪表盘中直接显示 Claude Code、Codex、GitHub Copilot 与 Cursor 的实时剩余额度——完全零配置。** 不需要 status-line hook，也无需手动输入任何凭证：vct 会读取各 provider 自己的 OAuth 凭证，在后台线程调用其用量 API，并在你工作时保持面板持续更新。（想要更清爽的仪表盘？在 [`config.toml`](#configuration) 中设置 `show_quota_panels = false` 即可。）
 
 ```
 ┌ Claude ─────────────────┐┌ Codex ──────────────────┐┌ Copilot ────────────────┐┌ Cursor ─────────────────┐
@@ -383,7 +384,7 @@ vct analysis --output today.json --daily
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ Total Lines: 16.1K  |  Total Tools: 619  |  Models: 3  |  Memory: 41.2 MB                                       │
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-  ↑/↓ scroll  PgUp/PgDn page  g/G top/end  r refresh  q quit  |  ★ github.com/Mai0313/VibeCodingTracker
+  ↑/↓ scroll  r refresh  q quit  |  ★ github.com/Mai0313/VibeCodingTracker
 ```
 
 ### 预览：表格与 JSON（`vct analysis`）
@@ -505,6 +506,54 @@ vct fetch copilot --table
 
 > [!NOTE]
 > 响应 body 会原样打印到 stdout。遇到 HTTP 错误时仍会打印 body 并以非零状态退出；401/403 还会在 stderr 额外打印 `run: <cli> login` 提示。
+
+---
+
+## Configuration
+
+vct 会把用户设置保存在 `~/.vct/config.toml` 中。该文件会在**首次运行时以默认值创建**（旧的 `~/.vct/version.json` 会被合并进来并删除），因此你无需手动编写——只有想修改某个默认值时才需要动它。
+
+```toml
+[general]
+# Default time range when no --daily/--weekly/--monthly/--all flag is given.
+# one of: "daily" | "weekly" | "monthly" | "all"
+default_time_range = "all"
+
+[usage]
+# Start the usage dashboard with models merged across provider prefixes.
+# Toggled live with `m`; the last state is saved back here.
+merge_models = false
+# Show the live quota panels (Claude / Codex / Copilot / Cursor) in the usage TUI.
+show_quota_panels = true
+
+[update]
+# Whether vct performs automatic update checks (explicit `vct update` always runs).
+check_enabled = true
+# --- managed automatically ---
+latest_version = ""
+last_checked_at = ""
+dismissed_version = ""
+```
+
+| 设置                         | 效果                                                                                           |
+| ---------------------------- | ---------------------------------------------------------------------------------------------- |
+| `general.default_time_range` | 当你没有传入 `--daily/--weekly/--monthly/--all` 时使用的时间范围。显式 flag 始终优先。         |
+| `usage.merge_models`         | 让面板一打开就是合并状态；`m` 切换会把你上次的选择保存回这里。`--merge-providers` 会强制开启。 |
+| `usage.show_quota_panels`    | 设为 `false` 时隐藏实时额度栏（不再探测凭证，也不再启动后台 worker）。                         |
+| `update.check_enabled`       | 自动更新检查的偏好设置；显式的 `vct update` / `--check` 始终会执行。                           |
+
+### 管理配置文件
+
+```bash
+# Print the config file path
+vct config path
+
+# Print the current settings
+vct config show
+
+# Open the file in $VISUAL / $EDITOR (falls back to vi / notepad)
+vct config edit
+```
 
 ---
 
