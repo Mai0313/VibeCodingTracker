@@ -188,12 +188,16 @@ fn main() -> Result<()> {
                 let usage_data = usage_from_dirs(time_range)?;
                 display_usage_table(&usage_data, merge);
             } else {
+                // `config` is not used after this, so hand the panel list off by
+                // move; read the refresh cadence first so the borrow ends before
+                // the partial move out of `config.usage`.
+                let refresh = config.usage.refresh_secs();
                 display_usage_interactive(
                     time_range,
                     merge,
-                    config.usage.quota_panels.clone(),
+                    config.usage.quota_panels,
                     config.providers,
-                    config.usage.refresh_secs(),
+                    refresh,
                 )?;
             }
         }
