@@ -580,3 +580,41 @@ fn config_show_creates_and_prints_settings() {
     let text = std::fs::read_to_string(&config).unwrap();
     assert!(!text.contains("[update]"));
 }
+
+#[cfg(unix)]
+#[test]
+fn config_edit_splits_a_multi_word_editor_command() {
+    // `$EDITOR` / `$VISUAL` often carry arguments (`code --wait`); the program +
+    // args must be split, with the config path passed as the trailing arg.
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = TempHome::new();
+    let stub = home.home().join("stub-editor.sh");
+    let sentinel = home.home().join("editor-argv.txt");
+    std::fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
+            sentinel.display()
+        ),
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&stub).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&stub, perms).unwrap();
+
+    child_cmd(&home)
+        .env_remove("VISUAL")
+        .env("EDITOR", format!("{} --flag", stub.display()))
+        .arg("config")
+        .arg("edit")
+        .assert()
+        .success();
+
+    let argv = std::fs::read_to_string(&sentinel).expect("stub editor should have run");
+    assert!(argv.contains("--flag"), "the editor's own arg is forwarded");
+    assert!(
+        argv.contains("config.toml"),
+        "the config path is passed as the trailing arg, got: {argv:?}"
+    );
+}
