@@ -105,10 +105,16 @@ impl UsageConfig {
 
     /// Whether the quota panel for `provider` is enabled (case-insensitive).
     pub fn shows_quota_panel(&self, provider: &str) -> bool {
-        self.quota_panels
-            .iter()
-            .any(|p| p.eq_ignore_ascii_case(provider))
+        quota_panel_selected(&self.quota_panels, provider)
     }
+}
+
+/// Whether `name` is one of the selected quota-panel names (case-insensitive).
+///
+/// The single home for the panel-selection rule, shared by
+/// [`UsageConfig::shows_quota_panel`] and the usage TUI's panel masking.
+pub fn quota_panel_selected(panels: &[String], name: &str) -> bool {
+    panels.iter().any(|p| p.eq_ignore_ascii_case(name))
 }
 
 /// `[analysis]` — analysis dashboard preferences.

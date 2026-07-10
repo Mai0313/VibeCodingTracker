@@ -192,7 +192,7 @@ pub fn display_usage_interactive(
     // credentials are present. All workers share one HTTP client and shutdown
     // flag. With no panels selected, treat every provider as absent so nothing
     // is probed, no worker spawns, and the band is dropped.
-    let panel_on = |name: &str| quota_panels.iter().any(|p| p.eq_ignore_ascii_case(name));
+    let panel_on = |name: &str| crate::config::quota_panel_selected(&quota_panels, name);
     let mut present = if quota_panels.is_empty() {
         QuotaPresence::default()
     } else {
