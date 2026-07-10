@@ -24,6 +24,7 @@
 
 use crate::VERSION;
 use crate::cli::TimeRange;
+use crate::config::CursorUsageSource;
 use crate::constants::FastHashMap;
 use crate::models::{CodeAnalysis, CodeAnalysisRecord, ExtensionType};
 use crate::pricing::{ModelPricingMap, fetch_model_pricing};
@@ -47,14 +48,17 @@ use std::time::Duration;
 const CURSOR_EVENTS_URL: &str = "https://cursor.com/api/dashboard/get-filtered-usage-events";
 /// `teamId` value that scopes the dashboard API to the individual's own usage.
 const CURSOR_INDIVIDUAL_TEAM_ID: i64 = 0;
-/// Page size for the paginated usage-events fetch.
-const CURSOR_EVENTS_PAGE_SIZE: i64 = 300;
+/// Page size for the paginated usage-events fetch. Cursor rejects values above
+/// ~1000 (HTTP 400), so 1000 is the largest usable page — it keeps the whole
+/// history to ~14 sequential requests instead of ~47 at 300.
+const CURSOR_EVENTS_PAGE_SIZE: i64 = 1000;
 /// Hard cap on pages fetched, so a runaway `totalUsageEventsCount` can't spin.
 const CURSOR_EVENTS_MAX_PAGES: i64 = 200;
 /// How long a cached usage-events fetch stays fresh (seconds). Billing events
-/// are immutable history, so a short TTL keeps the `usage` TUI from hammering
-/// the endpoint on every refresh while staying current enough.
-const CURSOR_USAGE_CACHE_TTL_SECS: i64 = 120;
+/// are immutable history, so a generous TTL keeps the `usage` TUI from
+/// re-fetching (or re-scanning stores in local mode) on every refresh while
+/// staying current enough.
+const CURSOR_USAGE_CACHE_TTL_SECS: i64 = 900;
 /// HTTP timeout for the usage-events request, so an offline `vct usage` fails
 /// fast into the local approximation instead of hanging.
 const CURSOR_HTTP_TIMEOUT: Duration = Duration::from_secs(15);
@@ -83,47 +87,85 @@ pub fn read_cursor_usage(
     chats_dir: &Path,
     tracking_db: &Path,
     time_range: TimeRange,
+    source: CursorUsageSource,
 ) -> Result<Vec<(String, CodeAnalysis, f64)>> {
     let now = chrono::Local::now().timestamp();
     let user = get_current_user();
     let machine = get_machine_id().to_string();
+    let requested_start_ms = range_start_ms(time_range);
     let cached = load_usage_cache();
-
-    // A fresh cache — from a prior API fetch OR a prior offline approximation —
-    // is reused as-is: no HTTP, no store re-scan. This bounds the work to at
-    // most once per TTL even when the API keeps failing, so the usage TUI (which
-    // re-runs this on every refresh) never hammers the endpoint or re-reads
-    // every store.db each tick.
-    if let Some(cache) = &cached
-        && now.saturating_sub(cache.fetched_at) < CURSOR_USAGE_CACHE_TTL_SECS
-    {
-        return Ok(aggregate_events(&cache.events, time_range, &user, &machine));
-    }
-
-    // Cache stale or absent: make exactly one refresh attempt this call.
-    let (events, from_api) = match fetch_all_events() {
-        Ok(events) => (events, true),
-        Err(err) => match cached {
-            // Prefer stale real billing data over the rough approximation.
-            Some(cache) if cache.from_api && !cache.events.is_empty() => {
-                eprintln!("Warning: Cursor usage API unavailable ({err}); using cached usage.");
-                (cache.events, true)
-            }
-            _ => {
-                eprintln!(
-                    "Warning: Cursor usage API unavailable ({err}); \
-                     Cursor usage is an approximation from local context data."
-                );
-                (approximation_events(chats_dir, tracking_db)?, false)
-            }
-        },
+    // A cache is only usable for this request when it is fresh AND spans at least
+    // the asked window (`start_ms <= requested_start_ms`) — a date-bounded `api`
+    // fetch for `--monthly` must not be reused to answer `--all`.
+    let cache_covers = |c: &UsageCache| {
+        now.saturating_sub(c.fetched_at) < CURSOR_USAGE_CACHE_TTL_SECS
+            && c.start_ms <= requested_start_ms
     };
 
-    // Persist the result (API, reused-real, or approximation) with a fresh
-    // timestamp so the next refresh within the TTL is a pure cache read and does
-    // not retry the network or re-scan the stores.
-    let _ = save_usage_cache(&events, now, from_api);
-    Ok(aggregate_events(&events, time_range, &user, &machine))
+    match source {
+        // Default: estimate from the local chat stores, consistent with every
+        // other provider (whose `usage` also comes from local session files).
+        // Never touches the events API. A fresh *approximation* cache is reused
+        // so the TUI does not re-scan every store.db each refresh tick; a cache
+        // left over from a prior `api` run is ignored so switching to `local`
+        // does not keep showing billing data. The approximation always spans the
+        // full history, so it is saved with `start_ms = 0`.
+        CursorUsageSource::Local => {
+            if let Some(cache) = &cached
+                && !cache.from_api
+                && cache_covers(cache)
+            {
+                return Ok(aggregate_events(&cache.events, time_range, &user, &machine));
+            }
+            let events = approximation_events(chats_dir, tracking_db)?;
+            let _ = save_usage_cache(&events, now, 0, false);
+            Ok(aggregate_events(&events, time_range, &user, &machine))
+        }
+        // Opt-in: authoritative per-model tokens + cost from Cursor's dashboard
+        // billing API, with the local approximation as a fallback.
+        CursorUsageSource::Api => {
+            // A fresh, wide-enough cache — from a prior API fetch OR a prior
+            // offline approximation — is reused as-is: no HTTP, no store re-scan.
+            // This bounds the work to at most once per TTL even when the API keeps
+            // failing, so the usage TUI (which re-runs this on every refresh)
+            // never hammers the endpoint or re-reads every store.db each tick.
+            if let Some(cache) = &cached
+                && cache_covers(cache)
+            {
+                return Ok(aggregate_events(&cache.events, time_range, &user, &machine));
+            }
+
+            // Cache stale or absent: make exactly one refresh attempt this call.
+            // Each source carries the window it covers so the cache records it.
+            let (events, start_ms, from_api) = match fetch_all_events(time_range) {
+                Ok(events) => (events, requested_start_ms, true),
+                Err(err) => match cached {
+                    // Prefer stale real billing data over the rough approximation.
+                    Some(cache) if cache.from_api && !cache.events.is_empty() => {
+                        eprintln!(
+                            "Warning: Cursor usage API unavailable ({err}); using cached usage."
+                        );
+                        let start = cache.start_ms;
+                        (cache.events, start, true)
+                    }
+                    _ => {
+                        eprintln!(
+                            "Warning: Cursor usage API unavailable ({err}); \
+                             Cursor usage is an approximation from local context data."
+                        );
+                        // The approximation spans the full history.
+                        (approximation_events(chats_dir, tracking_db)?, 0, false)
+                    }
+                },
+            };
+
+            // Persist the result (API, reused-real, or approximation) with a
+            // fresh timestamp so the next refresh within the TTL is a pure cache
+            // read and does not retry the network or re-scan the stores.
+            let _ = save_usage_cache(&events, now, start_ms, from_api);
+            Ok(aggregate_events(&events, time_range, &user, &machine))
+        }
+    }
 }
 
 /// Reads per-model file-operation metrics for Cursor from the chat stores.
@@ -184,6 +226,13 @@ struct CachedEvent {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct UsageCache {
     fetched_at: i64,
+    /// The earliest event timestamp (local-midnight epoch millis) this cache is
+    /// known to cover; `0` means full history. A date-bounded `api` fetch only
+    /// covers `[start_ms, now]`, so a cache is reused for a request only when
+    /// `start_ms <= requested_start_ms` (it spans at least the asked window).
+    /// Defaults to `0` for older caches without the field.
+    #[serde(default)]
+    start_ms: i64,
     events: Vec<CachedEvent>,
     /// Whether `events` came from the API (real billing data) rather than the
     /// local approximation. Real data is reused verbatim when the API is down;
@@ -207,11 +256,17 @@ fn load_usage_cache() -> Option<UsageCache> {
     serde_json::from_str(&body).ok()
 }
 
-/// Persists the usage events with the current timestamp and their source.
-fn save_usage_cache(events: &[CachedEvent], fetched_at: i64, from_api: bool) -> Result<()> {
+/// Persists the usage events with the current timestamp, coverage, and source.
+fn save_usage_cache(
+    events: &[CachedEvent],
+    fetched_at: i64,
+    start_ms: i64,
+    from_api: bool,
+) -> Result<()> {
     let path = usage_cache_path().ok_or_else(|| anyhow!("no cache dir"))?;
     let cache = UsageCache {
         fetched_at,
+        start_ms,
         events: events.to_vec(),
         from_api,
     };
@@ -220,27 +275,51 @@ fn save_usage_cache(events: &[CachedEvent], fetched_at: i64, from_api: bool) -> 
     Ok(())
 }
 
-/// Fetches every usage event from the dashboard API and aggregates them by
-/// `(date, model)`.
+/// The local-midnight epoch-millis cutoff for `time_range`, or `0` for
+/// [`TimeRange::All`] — used both to date-bound the fetch and to record what
+/// window a cache covers.
+fn range_start_ms(time_range: TimeRange) -> i64 {
+    match time_range.cutoff_date() {
+        None => 0,
+        Some(date) => date
+            .and_hms_opt(0, 0, 0)
+            .and_then(|dt| dt.and_local_timezone(chrono::Local).single())
+            .map(|dt| dt.timestamp_millis())
+            .unwrap_or(0),
+    }
+}
+
+/// Fetches usage events for `time_range` from the dashboard API and aggregates
+/// them by `(date, model)`.
 ///
-/// Fetches the full history (`startDate = 0`) so a single cache serves every
-/// time range; the aggregators filter by date locally.
-fn fetch_all_events() -> Result<Vec<CachedEvent>> {
+/// Only fetches events on or after the range's cutoff (`startDate`), so the
+/// common daily/weekly/monthly views hit one page instead of the full history;
+/// [`TimeRange::All`] passes `0`. The aggregators still filter by date locally.
+fn fetch_all_events(time_range: TimeRange) -> Result<Vec<CachedEvent>> {
     // Offline mode: don't hit the dashboard API; the caller falls back to a
     // cached or local-approximation result.
     if crate::utils::network_disabled() {
         return Err(anyhow!("network disabled (VCT_OFFLINE)"));
     }
-    fetch_all_events_from(CURSOR_EVENTS_URL, &get_cursor_auth_path()?)
+    fetch_all_events_from(
+        CURSOR_EVENTS_URL,
+        &get_cursor_auth_path()?,
+        range_start_ms(time_range),
+    )
 }
 
 /// The injectable core of [`fetch_all_events`]: posts to an explicit
-/// `events_url`, reading credentials from an explicit `auth_path`.
+/// `events_url`, reading credentials from an explicit `auth_path`, fetching
+/// events on or after `start_ms`.
 ///
 /// Production passes [`CURSOR_EVENTS_URL`] + `~/.config/cursor/auth.json`; tests
 /// point them at a local mock server and a temp auth file. Unlike the wrapper it
 /// does **not** consult `VCT_OFFLINE` — it is always given an explicit endpoint.
-fn fetch_all_events_from(events_url: &str, auth_path: &Path) -> Result<Vec<CachedEvent>> {
+fn fetch_all_events_from(
+    events_url: &str,
+    auth_path: &Path,
+    start_ms: i64,
+) -> Result<Vec<CachedEvent>> {
     let body = std::fs::read_to_string(auth_path)
         .with_context(|| format!("no Cursor credentials at {}", auth_path.display()))?;
     let session = read_cursor_session(&body)
@@ -263,7 +342,7 @@ fn fetch_all_events_from(events_url: &str, auth_path: &Path) -> Result<Vec<Cache
     loop {
         let payload = json!({
             "teamId": CURSOR_INDIVIDUAL_TEAM_ID,
-            "startDate": 0,
+            "startDate": start_ms,
             "endDate": now_ms,
             "page": page,
             "pageSize": CURSOR_EVENTS_PAGE_SIZE,
@@ -1101,6 +1180,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn range_start_ms_is_zero_for_all_and_bounded_otherwise() {
+        // `All` fetches full history (startDate 0); the bounded ranges produce a
+        // positive cutoff, and the more recent the range the later (larger) the
+        // cutoff — so a daily cache never claims to cover a monthly request.
+        assert_eq!(range_start_ms(TimeRange::All), 0);
+        let daily = range_start_ms(TimeRange::Daily);
+        let weekly = range_start_ms(TimeRange::Weekly);
+        let monthly = range_start_ms(TimeRange::Monthly);
+        assert!(monthly > 0 && weekly > 0 && daily > 0);
+        assert!(daily >= weekly && weekly >= monthly);
+    }
+
+    #[test]
+    fn usage_cache_start_ms_defaults_to_zero_for_legacy_json() {
+        // A cache written before the `start_ms` field must deserialize as
+        // full-history (0) so it keeps covering every range.
+        let legacy = r#"{"fetched_at":123,"events":[],"from_api":true}"#;
+        let cache: UsageCache = serde_json::from_str(legacy).unwrap();
+        assert_eq!(cache.start_ms, 0);
+        assert!(cache.from_api);
+    }
+
+    #[test]
     fn hex_decode_roundtrips_json() {
         let json = r#"{"lastUsedModel":"composer-2"}"#;
         let hex: String = json.bytes().map(|b| format!("{b:02x}")).collect();
@@ -1432,7 +1534,7 @@ mod tests {
         let auth = dir.path().join("auth.json");
         std::fs::write(&auth, serde_json::json!({ "accessToken": jwt }).to_string()).unwrap();
 
-        let events = fetch_all_events_from(&server.url("/events"), &auth).expect("fetch events");
+        let events = fetch_all_events_from(&server.url("/events"), &auth, 0).expect("fetch events");
         endpoint.assert();
 
         assert_eq!(events.len(), 2, "one aggregated row per (date, model)");
