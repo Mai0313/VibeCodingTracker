@@ -294,7 +294,7 @@ Totals (by Provider)
 
 ### 即時額度面板
 
-`vct usage` 會**在儀表板中直接顯示 Claude Code、Codex、GitHub Copilot 與 Cursor 的即時剩餘額度——完全零設定。** 不需要 status-line hook，也不需要手動輸入憑證：vct 會讀取各 provider 自己的 OAuth 憑證，在背景執行緒呼叫其用量 API，並在你工作時讓面板保持最新。（想要更清爽的儀表板嗎？在 [`config.toml`](#%E8%A8%AD%E5%AE%9A) 中精簡 `quota_panels`,或設為 `[]` 隱藏整條。）
+`vct usage` 會**在儀表板中直接顯示 Claude Code、Codex、GitHub Copilot 與 Cursor 的即時剩餘額度——完全零設定。** 不需要 status-line hook，也不需要手動輸入憑證：vct 會讀取各 provider 自己的 OAuth 憑證，在背景執行緒呼叫其用量 API，並在你工作時讓面板保持最新。（想要更清爽的儀表板嗎？在 [`config.toml`](#%E8%A8%AD%E5%AE%9A) 中精簡 `[usage.quota]` 下的 `panels`,或設為 `[]` 隱藏整條。）
 
 ```
 ┌ Claude ─────────────────┐┌ Codex ──────────────────┐┌ Copilot ────────────────┐┌ Cursor ─────────────────┐

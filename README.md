@@ -294,7 +294,7 @@ The tool automatically scans these directories:
 
 ### Live Quota Panels
 
-`vct usage` shows **live remaining quota for Claude Code, Codex, GitHub Copilot, and Cursor right in the dashboard — with zero setup.** No status-line hook, no credentials to enter: vct reads each provider's own credentials, calls its usage API on a background thread, and keeps the panels current while you work. (Prefer a quieter dashboard? Trim `quota_panels` in [`config.toml`](#configuration), or set it to `[]` to hide the band.)
+`vct usage` shows **live remaining quota for Claude Code, Codex, GitHub Copilot, and Cursor right in the dashboard — with zero setup.** No status-line hook, no credentials to enter: vct reads each provider's own credentials, calls its usage API on a background thread, and keeps the panels current while you work. (Prefer a quieter dashboard? Trim `panels` under `[usage.quota]` in [`config.toml`](#configuration), or set it to `[]` to hide the band.)
 
 ```
 ┌ Claude ─────────────────┐┌ Codex ──────────────────┐┌ Copilot ────────────────┐┌ Cursor ─────────────────┐
