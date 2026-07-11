@@ -288,7 +288,10 @@ fn run_config(action: ConfigAction) -> Result<()> {
         // resolve (and thereby create) ~/.vct — keep it usable on a read-only home.
         ConfigAction::Schema => print!("{}", vibe_coding_tracker::config::schema_json()),
         ConfigAction::Path => {
-            println!("{}", vibe_coding_tracker::utils::get_config_path()?.display());
+            println!(
+                "{}",
+                vibe_coding_tracker::utils::get_config_path()?.display()
+            );
         }
         ConfigAction::Show => {
             let path = vibe_coding_tracker::utils::get_config_path()?;
