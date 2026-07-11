@@ -79,8 +79,15 @@ fn claude_token_urls_default() -> Vec<String> {
 
 /// Reads the `claudeAiOauth` block from the credentials file.
 fn read_claude_oauth(path: &Path) -> Option<ClaudeOauth> {
-    let body = std::fs::read_to_string(path).ok()?;
-    let creds: ClaudeCredentials = serde_json::from_str(&body).ok()?;
+    parse_claude_oauth(&std::fs::read_to_string(path).ok()?)
+}
+
+/// Parses the OAuth block from a `.credentials.json` body. Split out from the
+/// file read so a worker can tell an unreadable/absent file (transient) apart
+/// from a present-but-unparseable one (an auth failure), matching how the
+/// Cursor and Copilot workers classify their credential files.
+fn parse_claude_oauth(body: &str) -> Option<ClaudeOauth> {
+    let creds: ClaudeCredentials = serde_json::from_str(body).ok()?;
     creds.claude_ai_oauth
 }
 
@@ -468,9 +475,17 @@ impl ClaudeState {
             return EnsureToken::Token(tok.clone());
         }
 
-        let oauth = match read_claude_oauth(path) {
+        // Distinguish an unreadable/absent file (transient — e.g. an atomic
+        // rewrite by the official CLI) from a present-but-unparseable one (an
+        // auth failure that should nudge re-login, not sit on stale data), the
+        // same split the Cursor/Copilot workers make.
+        let body = match std::fs::read_to_string(path) {
+            Ok(b) => b,
+            Err(_) => return EnsureToken::Transient,
+        };
+        let oauth = match parse_claude_oauth(&body) {
             Some(o) => o,
-            None => return EnsureToken::Transient,
+            None => return EnsureToken::NeedsLogin,
         };
         let access = oauth.access_token.clone().filter(|s| !s.is_empty());
         let expires_secs = oauth.expires_at.map(|ms| ms / 1000);
@@ -678,6 +693,35 @@ mod tests {
         // Neither present -> None (Plan line omitted), no error.
         std::fs::write(&p, r#"{"claudeAiOauth":{"accessToken":"x"}}"#).unwrap();
         assert_eq!(read_claude_plan(&p), None);
+    }
+
+    #[test]
+    fn malformed_credentials_need_login_not_transient() {
+        // An existing but unparseable `.credentials.json` is an auth failure
+        // (nudge re-login), not a transient blip that would sit on stale quota.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".credentials.json");
+        std::fs::write(&path, "{ not valid json").unwrap();
+        let client = build_client().unwrap();
+        let mut state = ClaudeState::default();
+        assert!(matches!(
+            state.ensure_token(&client, &path, 1_000_000, 1_000_000_000),
+            EnsureToken::NeedsLogin
+        ));
+    }
+
+    #[test]
+    fn unreadable_credentials_stay_transient() {
+        // An absent/unreadable file is transient (e.g. an atomic rewrite in
+        // flight), so the panel keeps its last-known-good rather than nagging.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.json");
+        let client = build_client().unwrap();
+        let mut state = ClaudeState::default();
+        assert!(matches!(
+            state.ensure_token(&client, &path, 1_000_000, 1_000_000_000),
+            EnsureToken::Transient
+        ));
     }
 
     #[test]

@@ -24,16 +24,20 @@ fn load_in_creates_default_commented_file_when_absent() {
     assert!(!cfg.usage.merge_models);
     // New sections default sensibly.
     assert!(cfg.providers.cursor);
-    assert_eq!(cfg.usage.refresh_interval_secs, 10);
-    assert_eq!(cfg.analysis.refresh_interval_secs, 10);
+    assert_eq!(cfg.usage.refresh_interval, 10);
+    assert_eq!(cfg.usage.quota.refresh_interval, 60);
+    assert_eq!(cfg.analysis.refresh_interval, 10);
 
     let path = dir.join("config.toml");
     assert!(path.exists(), "first run must create config.toml");
     let text = fs::read_to_string(&path).unwrap();
+    // The `#:schema` directive drives editor autocomplete/validation.
+    assert!(text.starts_with("#:schema "));
     assert!(text.contains("[usage]"));
+    assert!(text.contains("[usage.quota]"));
     assert!(text.contains("[providers]"));
     assert!(text.contains("merge_models = false"));
-    // A header comment must survive so the file is self-documenting.
+    // A generated comment must survive so the file is self-documenting.
     assert!(text.contains("# Toggled live"));
 }
 
@@ -75,6 +79,9 @@ fn save_merge_models_round_trips_and_preserves_comments() {
     // The edit is format-preserving, so comments stay put.
     assert!(text.contains("# Which live quota panels to show"));
     assert!(text.contains("[providers]"));
+    // The `#:schema` directive must survive the write-back, or the `m` toggle
+    // would strip editor validation from the file.
+    assert!(text.starts_with("#:schema "));
 }
 
 #[test]
@@ -112,9 +119,11 @@ fn save_merge_models_preserves_an_inline_usage_table() {
 
     let cfg = config::load_in(dir);
     assert!(cfg.usage.merge_models);
-    // The other inline keys must not be lost / reverted to defaults.
-    assert_eq!(cfg.usage.quota_panels, vec!["claude".to_string()]);
-    assert_eq!(cfg.usage.refresh_interval_secs, 30);
+    // The other inline keys must not be lost / reverted to defaults; the legacy
+    // `quota_panels` / `refresh_interval_secs` names are honored via the migration
+    // shim and the serde alias.
+    assert_eq!(cfg.usage.quota.panels, vec!["claude".to_string()]);
+    assert_eq!(cfg.usage.refresh_interval, 30);
 }
 
 #[test]
@@ -124,7 +133,7 @@ fn existing_file_is_parsed_and_left_in_place() {
     fs::create_dir_all(dir).unwrap();
     fs::write(
         dir.join("config.toml"),
-        "[general]\ndefault_time_range = \"weekly\"\n\n[usage]\nmerge_models = true\nquota_panels = [\"claude\"]\n\n[providers]\ncursor = false\n",
+        "[general]\ndefault_time_range = \"weekly\"\n\n[usage]\nmerge_models = true\n\n[usage.quota]\npanels = [\"claude\"]\n\n[providers]\ncursor = false\n",
     )
     .unwrap();
 

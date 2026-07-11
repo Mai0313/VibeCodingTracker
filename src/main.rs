@@ -189,15 +189,17 @@ fn main() -> Result<()> {
                 display_usage_table(&usage_data, merge);
             } else {
                 // `config` is not used after this, so hand the panel list off by
-                // move; read the refresh cadence first so the borrow ends before
-                // the partial move out of `config.usage`.
+                // move; read both cadences first so the borrows end before the
+                // partial move out of `config.usage`.
                 let refresh = config.usage.refresh_secs();
+                let quota_refresh = config.usage.quota_refresh_secs();
                 display_usage_interactive(
                     time_range,
                     merge,
-                    config.usage.quota_panels,
+                    config.usage.quota.panels,
                     config.providers,
                     refresh,
+                    quota_refresh,
                 )?;
             }
         }
@@ -278,13 +280,21 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Handles the `config` subcommand: print the path, show current settings, or
-/// open the file in the user's editor.
+/// Handles the `config` subcommand: print the path, show current settings, open
+/// the file in the user's editor, or print the JSON schema.
 fn run_config(action: ConfigAction) -> Result<()> {
-    let path = vibe_coding_tracker::utils::get_config_path()?;
     match action {
-        ConfigAction::Path => println!("{}", path.display()),
+        // Pure stdout: schema generation needs no config file, so it must not
+        // resolve (and thereby create) ~/.vct — keep it usable on a read-only home.
+        ConfigAction::Schema => print!("{}", vibe_coding_tracker::config::schema_json()),
+        ConfigAction::Path => {
+            println!(
+                "{}",
+                vibe_coding_tracker::utils::get_config_path()?.display()
+            );
+        }
         ConfigAction::Show => {
+            let path = vibe_coding_tracker::utils::get_config_path()?;
             // Ensure the file exists (first-run creation) before reading it back.
             let _ = vibe_coding_tracker::config::load();
             let contents = std::fs::read_to_string(&path).unwrap_or_default();
@@ -294,6 +304,7 @@ fn run_config(action: ConfigAction) -> Result<()> {
             print!("{}", contents);
         }
         ConfigAction::Edit => {
+            let path = vibe_coding_tracker::utils::get_config_path()?;
             // Ensure the file exists before handing it to the editor.
             let _ = vibe_coding_tracker::config::load();
             let editor = std::env::var("VISUAL")

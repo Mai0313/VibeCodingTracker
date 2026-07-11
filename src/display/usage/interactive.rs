@@ -120,22 +120,12 @@ struct QuotaView<'a> {
     copilot: &'a CopilotQuotaSnapshot,
     cursor: &'a CursorQuotaSnapshot,
     present: QuotaPresence,
-    /// Whether the bottom band is shown at all. `false` when `usage.quota_panels`
+    /// Whether the bottom band is shown at all. `false` when `usage.quota.panels`
     /// is empty, which drops the whole band (panels *and* the Provider Usage
     /// table), not just the individual gauges.
     band_enabled: bool,
 }
 
-/// Claude quota worker cadence. Longer than Codex's 10s because the Claude
-/// usage endpoint rate-limits frequent polling; quota moves slowly enough that
-/// once a minute stays fresh.
-const CLAUDE_REFRESH_SECS: u64 = 60;
-/// Copilot quota worker cadence. GitHub's API is not tightly rate-limited here,
-/// but quota moves slowly so a conservative once-a-minute poll is plenty.
-const COPILOT_REFRESH_SECS: u64 = 60;
-/// Cursor quota worker cadence. Re-reads `auth.json` each tick, so 60s keeps it
-/// fresh without hammering cursor.com.
-const CURSOR_REFRESH_SECS: u64 = 60;
 /// How often to rebuild the LiteLLM pricing map. The underlying data only
 /// changes when the upstream JSON is updated (daily at most), so rebuilding
 /// a fresh ~500 KB `HashMap<Rc<str>, ModelPricing>` every 10 s just churned
@@ -167,7 +157,9 @@ const USAGE_PANELS_MIN_H: u16 = 22;
 ///
 /// `quota_panels` selects which live quota panels to show (by provider name);
 /// an empty list drops the band entirely. `providers` (from the config) selects
-/// which providers are aggregated. `refresh_secs` is the auto-refresh cadence.
+/// which providers are aggregated. `refresh_secs` is the TUI re-aggregation
+/// cadence; `quota_refresh_secs` is the shared poll cadence for every live quota
+/// worker.
 ///
 /// # Errors
 ///
@@ -185,6 +177,7 @@ pub fn display_usage_interactive(
     quota_panels: Vec<String>,
     providers: ProvidersConfig,
     refresh_secs: u64,
+    quota_refresh_secs: u64,
 ) -> anyhow::Result<()> {
     let mut terminal = setup_terminal()?;
     let mut refresh_state = RefreshState::new(refresh_secs.max(1));
@@ -205,7 +198,7 @@ pub fn display_usage_interactive(
     } else {
         QuotaPresence::default()
     };
-    // A panel shows only when it is selected in `usage.quota_panels` AND its
+    // A panel shows only when it is selected in `usage.quota.panels` AND its
     // provider is enabled in `[providers]` — a disabled or unselected provider
     // is skipped entirely (no cache load, no worker, no quota API call).
     present.claude &= providers.claude && panel_on("claude");
@@ -255,7 +248,7 @@ pub fn display_usage_interactive(
                         "claude",
                         shared,
                         sh,
-                        CLAUDE_REFRESH_SECS,
+                        quota_refresh_secs,
                         move || state.resolve(&c),
                         |s| {
                             let _ = save_claude_cache(s);
@@ -273,7 +266,7 @@ pub fn display_usage_interactive(
                         "codex",
                         shared,
                         sh,
-                        crate::quota::provider::REFRESH_SECS,
+                        quota_refresh_secs,
                         move || state.resolve(&c),
                         |s| {
                             let _ = save_codex_cache(s);
@@ -291,7 +284,7 @@ pub fn display_usage_interactive(
                         "copilot",
                         shared,
                         sh,
-                        COPILOT_REFRESH_SECS,
+                        quota_refresh_secs,
                         move || state.resolve(&c),
                         |s| {
                             let _ = save_copilot_cache(s);
@@ -309,7 +302,7 @@ pub fn display_usage_interactive(
                         "cursor",
                         shared,
                         sh,
-                        CURSOR_REFRESH_SECS,
+                        quota_refresh_secs,
                         move || state.resolve(&c),
                         |s| {
                             let _ = save_cursor_cache(s);

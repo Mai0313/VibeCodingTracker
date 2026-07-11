@@ -294,7 +294,7 @@ Totals (by Provider)
 
 ### 实时额度面板
 
-`vct usage` 会**在仪表盘中直接显示 Claude Code、Codex、GitHub Copilot 与 Cursor 的实时剩余额度——完全零配置。** 不需要 status-line hook，也无需手动输入任何凭证：vct 会读取各 provider 自己的 OAuth 凭证，在后台线程调用其用量 API，并在你工作时保持面板持续更新。（想要更清爽的面板？在 [`config.toml`](#%E9%85%8D%E7%BD%AE) 中精简 `quota_panels`，或设为 `[]` 隐藏整栏。）
+`vct usage` 会**在仪表盘中直接显示 Claude Code、Codex、GitHub Copilot 与 Cursor 的实时剩余额度——完全零配置。** 不需要 status-line hook，也无需手动输入任何凭证：vct 会读取各 provider 自己的 OAuth 凭证，在后台线程调用其用量 API，并在你工作时保持面板持续更新。（想要更清爽的面板？在 [`config.toml`](#%E9%85%8D%E7%BD%AE) 中精简 `[usage.quota]` 下的 `panels`，或设为 `[]` 隐藏整栏。）
 
 ```
 ┌ Claude ─────────────────┐┌ Codex ──────────────────┐┌ Copilot ────────────────┐┌ Cursor ─────────────────┐
@@ -511,9 +511,11 @@ vct fetch copilot --table
 
 ## 配置
 
-vct 会把用户设置保存在 `~/.vct/config.toml` 中。该文件会在**首次运行时以默认值自动生成**，因此你完全不必手动编写——只有想修改某个默认值时才编辑它。
+vct 会把用户设置保存在 `~/.vct/config.toml` 中。该文件会在**首次运行时以默认值自动生成**，因此你完全不必手动编写——只有想修改某个默认值时才编辑它。它由 vct 的类型化设置生成，并在第一行带有 `#:schema` 指令，因此支持 schema 的 TOML 编辑器（taplo / VS Code 的 "Even Better TOML"）会提供自动补全与校验。你也可以用 `vct config schema` 自行打印该 schema。
 
 ```toml
+#:schema https://raw.githubusercontent.com/Mai0313/VibeCodingTracker/main/vct.schema.json
+
 [general]
 # 未指定 --daily/--weekly/--monthly/--all flag 时使用的默认时间范围
 # 取值之一: "daily" | "weekly" | "monthly" | "all"
@@ -523,14 +525,18 @@ default_time_range = "all"
 # 启动 usage 面板时就把跨 provider 前缀的 model 合并显示
 # 可用 `m` 实时切换, 最后一次的状态会保存回这里
 merge_models = false
-# 在 usage TUI 中显示哪些实时额度面板; 删除某个名称即可隐藏该面板, 用空列表 ([]) 隐藏整栏
-quota_panels = ["claude", "codex", "copilot", "cursor"]
 # usage TUI 自动刷新的间隔秒数 (最小为 1)
-refresh_interval_secs = 10
+refresh_interval = 10
+
+[usage.quota]
+# 显示哪些实时额度面板; 删除某个名称即可隐藏该面板, 用空列表 ([]) 隐藏整栏
+panels = ["claude", "codex", "copilot", "cursor"]
+# 每个 provider 共用的实时额度面板轮询间隔秒数 (最小为 1)
+refresh_interval = 60
 
 [analysis]
 # analysis TUI 自动刷新的间隔秒数 (最小为 1)
-refresh_interval_secs = 10
+refresh_interval = 10
 
 [providers]
 # 是否把各 provider 的 session 纳入 usage / analysis, 设为 false
@@ -543,14 +549,15 @@ opencode = true
 cursor = true
 ```
 
-| 设置项                           | 作用                                                                                             |
-| -------------------------------- | ------------------------------------------------------------------------------------------------ |
-| `general.default_time_range`     | 当你没有传入 `--daily/--weekly/--monthly/--all` 时使用的时间范围。显式传入的 flag 始终优先。     |
-| `usage.merge_models`             | 让面板启动时就处于合并状态；`m` 切换会把你上次的选择保存回这里。`--merge-providers` 会强制开启。 |
-| `usage.quota_panels`             | 显示哪些额度面板（`claude` / `codex` / `copilot` / `cursor`）；删除名称即可隐藏，`[]` 隐藏整栏。 |
-| `usage.refresh_interval_secs`    | `usage` 面板的自动刷新间隔（秒）。                                                               |
-| `analysis.refresh_interval_secs` | `analysis` 面板的自动刷新间隔（秒）。                                                            |
-| `providers.*`                    | 设为 `false` 时完全跳过某个 provider（不扫描、不调用 API）——如果你不用某个 provider 会很方便。   |
+| 设置项                         | 作用                                                                                             |
+| ------------------------------ | ------------------------------------------------------------------------------------------------ |
+| `general.default_time_range`   | 当你没有传入 `--daily/--weekly/--monthly/--all` 时使用的时间范围。显式传入的 flag 始终优先。     |
+| `usage.merge_models`           | 让面板启动时就处于合并状态；`m` 切换会把你上次的选择保存回这里。`--merge-providers` 会强制开启。 |
+| `usage.refresh_interval`       | `usage` 面板的自动刷新间隔（秒）。                                                               |
+| `usage.quota.panels`           | 显示哪些额度面板（`claude` / `codex` / `copilot` / `cursor`）；删除名称即可隐藏，`[]` 隐藏整栏。 |
+| `usage.quota.refresh_interval` | 每个实时额度面板的轮询间隔（秒）；数值越大越不容易触发 provider 的速率限制。                     |
+| `analysis.refresh_interval`    | `analysis` 面板的自动刷新间隔（秒）。                                                            |
+| `providers.*`                  | 设为 `false` 时完全跳过某个 provider（不扫描、不调用 API）——如果你不用某个 provider 会很方便。   |
 
 > [!NOTE]
 > Cursor 的 `usage` 是从聊天库得出的**本地估算**，因此它会像 Claude Code / Codex / Copilot / Gemini 一样（都是从本地 session 文件计算得出）无需联网。该估算会低估 Cursor 的真实花费，因为其中很大一部分是以 Cursor 内部的 model 名称计费，本地数据无法为这些名称定价，所以请把 Cursor 费用视为近似值。
@@ -566,6 +573,9 @@ vct config show
 
 # 在 $VISUAL / $EDITOR 中打开文件 (回退到 vi / notepad)
 vct config edit
+
+# 打印 JSON schema (可用以下命令重新生成: vct config schema > vct.schema.json)
+vct config schema
 ```
 
 ---
