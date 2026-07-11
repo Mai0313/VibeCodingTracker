@@ -571,7 +571,7 @@ fn config_show_creates_and_prints_settings() {
         .stdout(predicate::str::contains("[usage]"))
         .stdout(predicate::str::contains("merge_models"))
         .stdout(predicate::str::contains("[providers]"))
-        .stdout(predicate::str::contains("quota_panels"));
+        .stdout(predicate::str::contains("[usage.quota]"));
 
     // The show path must have materialized the file under the temp home, and it
     // must not fold in any version.json bookkeeping.

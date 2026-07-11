@@ -7,6 +7,7 @@
 //! into a single [`TimeRange`].
 
 use clap::{Parser, Subcommand, ValueEnum};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -16,7 +17,7 @@ use std::path::PathBuf;
 /// [`TimeRange::All`] is the default and disables filtering. Serializes as a
 /// lowercase string (`"daily"` / `"weekly"` / `"monthly"` / `"all"`) so it can
 /// be reused verbatim as the `config.general.default_time_range` setting.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum TimeRange {
     /// Today only.
@@ -256,4 +257,9 @@ pub enum ConfigAction {
     Show,
     /// Open the config file in `$VISUAL` / `$EDITOR`.
     Edit,
+    /// Print the JSON schema for the settings file.
+    ///
+    /// Redirect it to regenerate the committed schema:
+    /// `vct config schema > vct.schema.json`.
+    Schema,
 }

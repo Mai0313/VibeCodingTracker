@@ -189,15 +189,17 @@ fn main() -> Result<()> {
                 display_usage_table(&usage_data, merge);
             } else {
                 // `config` is not used after this, so hand the panel list off by
-                // move; read the refresh cadence first so the borrow ends before
-                // the partial move out of `config.usage`.
+                // move; read both cadences first so the borrows end before the
+                // partial move out of `config.usage`.
                 let refresh = config.usage.refresh_secs();
+                let quota_refresh = config.usage.quota_refresh_secs();
                 display_usage_interactive(
                     time_range,
                     merge,
-                    config.usage.quota_panels,
+                    config.usage.quota.panels,
                     config.providers,
                     refresh,
+                    quota_refresh,
                 )?;
             }
         }
@@ -284,6 +286,7 @@ fn run_config(action: ConfigAction) -> Result<()> {
     let path = vibe_coding_tracker::utils::get_config_path()?;
     match action {
         ConfigAction::Path => println!("{}", path.display()),
+        ConfigAction::Schema => print!("{}", vibe_coding_tracker::config::schema_json()),
         ConfigAction::Show => {
             // Ensure the file exists (first-run creation) before reading it back.
             let _ = vibe_coding_tracker::config::load();

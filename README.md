@@ -511,27 +511,33 @@ vct fetch copilot --table
 
 ## Configuration
 
-vct keeps its user settings in `~/.vct/config.toml`. The file is **created with defaults on first run**, so you never have to write it by hand — edit it only when you want to change a default.
+vct keeps its user settings in `~/.vct/config.toml`. The file is **created with defaults on first run**, so you never have to write it by hand — edit it only when you want to change a default. It is generated from vct's typed settings and carries a `#:schema` directive on the first line, so a schema-aware TOML editor (taplo / VS Code "Even Better TOML") gives you autocomplete and validation. Print the schema yourself with `vct config schema`.
 
 ```toml
+#:schema https://raw.githubusercontent.com/Mai0313/VibeCodingTracker/main/vct.schema.json
+
 [general]
 # Default time range when no --daily/--weekly/--monthly/--all flag is given.
-# one of: "daily" | "weekly" | "monthly" | "all"
+# One of: "daily" | "weekly" | "monthly" | "all".
 default_time_range = "all"
 
 [usage]
 # Start the usage dashboard with models merged across provider prefixes.
 # Toggled live with `m`; the last state is saved back here.
 merge_models = false
-# Which live quota panels to show in the usage TUI. Remove a name to hide that
-# panel; use an empty list ([]) to hide the whole band.
-quota_panels = ["claude", "codex", "copilot", "cursor"]
-# Seconds between automatic refreshes of the usage TUI (minimum 1).
-refresh_interval_secs = 10
+# Seconds between automatic redraws of the usage TUI (minimum 1).
+refresh_interval = 10
+
+[usage.quota]
+# Which live quota panels to show. Remove a name to hide that panel; use an
+# empty list ([]) to hide the whole band.
+panels = ["claude", "codex", "copilot", "cursor"]
+# Seconds between live quota-panel polls, shared by every provider (minimum 1).
+refresh_interval = 60
 
 [analysis]
-# Seconds between automatic refreshes of the analysis TUI (minimum 1).
-refresh_interval_secs = 10
+# Seconds between automatic redraws of the analysis TUI (minimum 1).
+refresh_interval = 10
 
 [providers]
 # Include each provider's sessions in usage / analysis. Set a provider to false
@@ -544,14 +550,15 @@ opencode = true
 cursor = true
 ```
 
-| Setting                          | Effect                                                                                                                       |
-| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `general.default_time_range`     | Period used when you pass no `--daily/--weekly/--monthly/--all`. An explicit flag always wins.                               |
-| `usage.merge_models`             | Seeds the dashboard merged; the `m` toggle saves your last choice back here. `--merge-providers` forces on.                  |
-| `usage.quota_panels`             | Which quota panels to show (`claude` / `codex` / `copilot` / `cursor`); drop a name to hide it, `[]` to hide the whole band. |
-| `usage.refresh_interval_secs`    | Auto-refresh cadence of the `usage` dashboard (seconds).                                                                     |
-| `analysis.refresh_interval_secs` | Auto-refresh cadence of the `analysis` dashboard (seconds).                                                                  |
-| `providers.*`                    | Skip a provider entirely (no scan, no API) when `false` — handy if you don't use one.                                        |
+| Setting                        | Effect                                                                                                                       |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
+| `general.default_time_range`   | Period used when you pass no `--daily/--weekly/--monthly/--all`. An explicit flag always wins.                               |
+| `usage.merge_models`           | Seeds the dashboard merged; the `m` toggle saves your last choice back here. `--merge-providers` forces on.                  |
+| `usage.refresh_interval`       | Redraw cadence of the `usage` dashboard (seconds).                                                                           |
+| `usage.quota.panels`           | Which quota panels to show (`claude` / `codex` / `copilot` / `cursor`); drop a name to hide it, `[]` to hide the whole band. |
+| `usage.quota.refresh_interval` | Poll cadence for every live quota panel (seconds); higher is safer against a provider's rate limits.                         |
+| `analysis.refresh_interval`    | Redraw cadence of the `analysis` dashboard (seconds).                                                                        |
+| `providers.*`                  | Skip a provider entirely (no scan, no API) when `false` — handy if you don't use one.                                        |
 
 > [!NOTE]
 > Cursor `usage` is a **local estimate** from the chat stores, so it behaves like Claude Code / Codex / Copilot / Gemini (all computed from local session files) and needs no network. It undercounts Cursor's real spend, because much of it is billed under Cursor-internal model names the local data cannot price — treat Cursor cost as approximate.
@@ -567,6 +574,9 @@ vct config show
 
 # Open the file in $VISUAL / $EDITOR (falls back to vi / notepad)
 vct config edit
+
+# Print the JSON schema (regenerate with: vct config schema > vct.schema.json)
+vct config schema
 ```
 
 ---

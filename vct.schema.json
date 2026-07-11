@@ -1,0 +1,163 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The full settings document.",
+  "properties": {
+    "analysis": {
+      "default": {
+        "refresh_interval": 10
+      },
+      "description": "`[analysis]` — analysis dashboard preferences.",
+      "properties": {
+        "refresh_interval": {
+          "default": 10,
+          "description": "Seconds between automatic redraws of the analysis TUI (minimum 1).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "general": {
+      "default": {
+        "default_time_range": "all"
+      },
+      "description": "`[general]` — settings shared across subcommands.",
+      "properties": {
+        "default_time_range": {
+          "default": "all",
+          "description": "Default time range when no --daily/--weekly/--monthly/--all flag is given.\nOne of: \"daily\" | \"weekly\" | \"monthly\" | \"all\".",
+          "oneOf": [
+            {
+              "const": "daily",
+              "description": "Today only.",
+              "type": "string"
+            },
+            {
+              "const": "weekly",
+              "description": "The current week, starting Monday.",
+              "type": "string"
+            },
+            {
+              "const": "monthly",
+              "description": "The current calendar month, from the 1st.",
+              "type": "string"
+            },
+            {
+              "const": "all",
+              "description": "No filtering — every session.",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "providers": {
+      "default": {
+        "claude": true,
+        "codex": true,
+        "copilot": true,
+        "cursor": true,
+        "gemini": true,
+        "opencode": true
+      },
+      "description": "`[providers]` — per-provider include toggles.\n\nEach provider defaults to `true`; setting one to `false` skips it entirely\n(no directory scan, no API) in both the usage and analysis roll-ups.",
+      "properties": {
+        "claude": {
+          "default": true,
+          "type": "boolean"
+        },
+        "codex": {
+          "default": true,
+          "type": "boolean"
+        },
+        "copilot": {
+          "default": true,
+          "type": "boolean"
+        },
+        "cursor": {
+          "default": true,
+          "type": "boolean"
+        },
+        "gemini": {
+          "default": true,
+          "type": "boolean"
+        },
+        "opencode": {
+          "default": true,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "usage": {
+      "default": {
+        "merge_models": false,
+        "quota": {
+          "panels": [
+            "claude",
+            "codex",
+            "copilot",
+            "cursor"
+          ],
+          "refresh_interval": 60
+        },
+        "refresh_interval": 10
+      },
+      "description": "`[usage]` — usage dashboard preferences.",
+      "properties": {
+        "merge_models": {
+          "default": false,
+          "description": "Start the usage dashboard with models merged across provider prefixes.\nToggled live with `m`; the last state is saved back here.",
+          "type": "boolean"
+        },
+        "quota": {
+          "default": {
+            "panels": [
+              "claude",
+              "codex",
+              "copilot",
+              "cursor"
+            ],
+            "refresh_interval": 60
+          },
+          "description": "Live quota-panel preferences.",
+          "properties": {
+            "panels": {
+              "default": [
+                "claude",
+                "codex",
+                "copilot",
+                "cursor"
+              ],
+              "description": "Which live quota panels to show in the usage TUI (by provider name:\n`claude` / `codex` / `copilot` / `cursor`). An empty list hides the band.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "refresh_interval": {
+              "default": 60,
+              "description": "Seconds between live quota-panel polls, shared by every provider\n(minimum 1). Higher is safer against a provider's rate limits.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "refresh_interval": {
+          "default": 10,
+          "description": "Seconds between automatic redraws of the usage TUI (minimum 1).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "title": "Config",
+  "type": "object"
+}
