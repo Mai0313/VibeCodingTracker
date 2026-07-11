@@ -11,11 +11,11 @@ Rust CLI (`vibe_coding_tracker`, short alias `vct`) that scans on-disk session l
 
 Both subcommands support four output modes (interactive TUI / static table / plain text / JSON) and four time-range filters (`--daily` / `--weekly` / `--monthly` / `--all`). The interactive TUI is the default when no output flag is given.
 
-Three auxiliary subcommands round out the CLI: `vct version` prints build/toolchain info (table default, plus `--json` / `--text`), `vct update` self-replaces the binary from the matching GitHub release asset (`--check` to inspect availability only, `--force` to skip the confirmation prompt), and `vct config` shows/edits the persistent settings file (`path` / `show` / `edit`; see **Persistent config** below).
+Four auxiliary subcommands round out the CLI: `vct version` prints build/toolchain info (table default, plus `--json` / `--text`), `vct update` self-replaces the binary from the matching GitHub release asset (`--check` to inspect availability only, `--force` to skip the confirmation prompt), `vct fetch <provider>` prints a provider's raw quota/usage API response (`claude` / `codex` / `copilot` / `cursor`; `--json` default, plus `--text` / `--table`), and `vct config` shows/edits the persistent settings file (`path` / `show` / `edit`; see **Persistent config** below).
 
 ## Common commands
 
-The toolchain is pinned to `rust-toolchain.toml` (1.95.0, edition 2024). On this machine `cargo` is **not** on the default `PATH`; export it before invoking any cargo command:
+The toolchain is pinned to `rust-toolchain.toml` (1.96.1, edition 2024). On this machine `cargo` is **not** on the default `PATH`; export it before invoking any cargo command:
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
