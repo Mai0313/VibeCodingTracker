@@ -20,7 +20,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
-use toml_edit::{DocumentMut, Item, Table, value};
+use toml_edit::{DocumentMut, Item, Table, TableLike, value};
 
 /// URL of the published JSON schema, referenced via a `#:schema` directive on
 /// the first line of the generated `config.toml` so schema-aware TOML editors
@@ -58,7 +58,7 @@ pub struct UsageConfig {
     #[serde(default)]
     pub merge_models: bool,
     /// Seconds between automatic redraws of the usage TUI (minimum 1).
-    #[serde(default = "default_refresh_secs", alias = "refresh_interval_secs")]
+    #[serde(default = "default_refresh_secs")]
     pub refresh_interval: u64,
     /// Live quota-panel preferences.
     #[serde(default)]
@@ -127,7 +127,7 @@ pub fn quota_panel_selected(panels: &[String], name: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AnalysisConfig {
     /// Seconds between automatic redraws of the analysis TUI (minimum 1).
-    #[serde(default = "default_refresh_secs", alias = "refresh_interval_secs")]
+    #[serde(default = "default_refresh_secs")]
     pub refresh_interval: u64,
 }
 
@@ -237,22 +237,39 @@ fn migrate_legacy(config: &mut Config, raw: &str) {
     let Ok(doc) = raw.parse::<DocumentMut>() else {
         return;
     };
-    let Some(usage) = doc.get("usage").and_then(Item::as_table_like) else {
-        return;
-    };
-    // A present new key (even `panels = []`) always wins over the legacy one.
-    let has_new = usage
-        .get("quota")
-        .and_then(Item::as_table_like)
-        .is_some_and(|q| q.contains_key("panels"));
-    if has_new {
-        return;
+    if let Some(usage) = doc.get("usage").and_then(Item::as_table_like) {
+        // [usage].quota_panels -> [usage.quota].panels. A present new key (even
+        // `panels = []`) always wins over the legacy one.
+        let has_new_panels = usage
+            .get("quota")
+            .and_then(Item::as_table_like)
+            .is_some_and(|q| q.contains_key("panels"));
+        if !has_new_panels && let Some(legacy) = usage.get("quota_panels").and_then(Item::as_array)
+        {
+            config.usage.quota.panels = legacy
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+        }
+        migrate_refresh_secs(usage, &mut config.usage.refresh_interval);
     }
-    if let Some(legacy) = usage.get("quota_panels").and_then(Item::as_array) {
-        config.usage.quota.panels = legacy
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect();
+    if let Some(analysis) = doc.get("analysis").and_then(Item::as_table_like) {
+        migrate_refresh_secs(analysis, &mut config.analysis.refresh_interval);
+    }
+}
+
+/// Honors a legacy `refresh_interval_secs` when the new `refresh_interval` key
+/// is absent from the section. This replaces a serde `alias`, which would make
+/// serde reject a mid-upgrade file carrying *both* names as a duplicate field
+/// and (via the infallible read) silently reset the whole config to defaults.
+fn migrate_refresh_secs(section: &dyn TableLike, target: &mut u64) {
+    if !section.contains_key("refresh_interval")
+        && let Some(secs) = section
+            .get("refresh_interval_secs")
+            .and_then(Item::as_integer)
+        && let Ok(v) = u64::try_from(secs)
+    {
+        *target = v;
     }
 }
 
@@ -449,14 +466,27 @@ mod tests {
     }
 
     #[test]
-    fn refresh_interval_reads_legacy_secs_alias() {
-        // Old files used `refresh_interval_secs`; the serde alias keeps them working.
-        let cfg: Config = toml_edit::de::from_str(
-            "[usage]\nrefresh_interval_secs = 5\n[analysis]\nrefresh_interval_secs = 7\n",
-        )
-        .unwrap();
+    fn refresh_interval_reads_legacy_secs() {
+        // Old files used `refresh_interval_secs`; the migration shim maps it.
+        let text = "[usage]\nrefresh_interval_secs = 5\n[analysis]\nrefresh_interval_secs = 7\n";
+        let mut cfg: Config = toml_edit::de::from_str(text).unwrap();
+        migrate_legacy(&mut cfg, text);
         assert_eq!(cfg.usage.refresh_secs(), 5);
         assert_eq!(cfg.analysis.refresh_secs(), 7);
+    }
+
+    #[test]
+    fn coexisting_refresh_keys_preserve_the_rest_of_the_config() {
+        // A mid-upgrade file carrying BOTH the new and the legacy key must not
+        // trip serde's duplicate-field error and reset the whole config to
+        // defaults; parsing succeeds, the new key wins, and unrelated sections
+        // survive.
+        let text = "[general]\ndefault_time_range = \"weekly\"\n[usage]\nrefresh_interval = 5\nrefresh_interval_secs = 10\n[providers]\ncursor = false\n";
+        let mut cfg: Config = toml_edit::de::from_str(text).unwrap();
+        migrate_legacy(&mut cfg, text);
+        assert_eq!(cfg.usage.refresh_secs(), 5);
+        assert_eq!(cfg.general.default_time_range, TimeRange::Weekly);
+        assert!(!cfg.providers.cursor);
     }
 
     #[test]
