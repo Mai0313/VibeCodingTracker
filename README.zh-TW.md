@@ -511,7 +511,7 @@ vct fetch copilot --table
 
 ## 設定
 
-vct 會把使用者設定存放在 `~/.vct/config.toml`。這個檔案會在**首次執行時以預設值自動建立**，所以你完全不必手動撰寫，只有想更改某個預設值時才需要編輯它。它由 vct 的型別化設定產生，並在第一行帶有 `#:schema` 指令，因此支援 schema 的 TOML 編輯器（taplo / VS Code 的 "Even Better TOML"）會提供自動補全與驗證。你也可以用 `vct config schema` 自行印出該 schema。
+vct 會把使用者設定存放在 `~/.vct/config.toml`。這個檔案會在**首次執行時以預設值自動建立**，所以你完全不必手動撰寫，只有想更改某個預設值時才需要編輯它。它由 vct 的型別化設定產生，並在第一行帶有 `#:schema` 指令，因此支援 schema 的 TOML 編輯器（taplo / VS Code 的 "Even Better TOML"）會提供自動補全與驗證。你也可以用 `vct config schema` 自行印出該 schema。由舊版 vct 產生的檔案會在下次被 vct 讀取時就地升級到目前的版面(也可用 `vct config migrate` 手動觸發),因此升級後絕不會停留在過時的格式上。
 
 ```toml
 #:schema https://raw.githubusercontent.com/Mai0313/VibeCodingTracker/main/vct.schema.json
@@ -576,6 +576,9 @@ vct config edit
 
 # 印出 JSON schema（可用以下指令重新產生：vct config schema > vct.schema.json）
 vct config schema
+
+# 就地把舊格式檔案升級到目前的版面
+vct config migrate
 ```
 
 ---

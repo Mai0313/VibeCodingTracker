@@ -120,22 +120,21 @@ fn save_merge_models_preserves_an_inline_usage_table() {
     let cfg = config::load_in(dir);
     assert!(cfg.usage.merge_models);
     // The other inline keys must not be lost / reverted to defaults; the legacy
-    // `quota_panels` / `refresh_interval_secs` names are honored via the migration
-    // shim and the serde alias.
+    // `quota_panels` / `refresh_interval_secs` names are honored via the read-time
+    // migration shim (an inline `usage` table is left for it, not restructured).
     assert_eq!(cfg.usage.quota.panels, vec!["claude".to_string()]);
     assert_eq!(cfg.usage.refresh_interval, 30);
 }
 
 #[test]
-fn existing_file_is_parsed_and_left_in_place() {
+fn existing_current_file_is_parsed_and_left_in_place() {
     let th = TempHome::new();
     let dir = &th.paths.cache_dir;
     fs::create_dir_all(dir).unwrap();
-    fs::write(
-        dir.join("config.toml"),
-        "[general]\ndefault_time_range = \"weekly\"\n\n[usage]\nmerge_models = true\n\n[usage.quota]\npanels = [\"claude\"]\n\n[providers]\ncursor = false\n",
-    )
-    .unwrap();
+    // Already in the current format (new keys + `#:schema`), so load must not
+    // rewrite it.
+    let original = "#:schema https://example.test/vct.schema.json\n[general]\ndefault_time_range = \"weekly\"\n\n[usage]\nmerge_models = true\n\n[usage.quota]\npanels = [\"claude\"]\n\n[providers]\ncursor = false\n";
+    fs::write(dir.join("config.toml"), original).unwrap();
 
     let cfg = config::load_in(dir);
     assert_eq!(cfg.general.default_time_range, TimeRange::Weekly);
@@ -145,6 +144,103 @@ fn existing_file_is_parsed_and_left_in_place() {
     // A missing provider key still defaults to true; the given one is honored.
     assert!(!cfg.providers.cursor);
     assert!(cfg.providers.claude);
+    // A current file is byte-for-byte untouched.
+    assert_eq!(
+        fs::read_to_string(dir.join("config.toml")).unwrap(),
+        original
+    );
+}
+
+#[test]
+fn load_in_migrates_a_legacy_file_in_place() {
+    let th = TempHome::new();
+    let dir = &th.paths.cache_dir;
+    fs::create_dir_all(dir).unwrap();
+    let legacy = "[usage]\nmerge_models = false\nquota_panels = [\"claude\"]\nrefresh_interval_secs = 15\n\n[analysis]\nrefresh_interval_secs = 20\n";
+    fs::write(dir.join("config.toml"), legacy).unwrap();
+
+    let cfg = config::load_in(dir);
+    // The user's values are honored through the migration.
+    assert_eq!(cfg.usage.quota.panels, vec!["claude".to_string()]);
+    assert_eq!(cfg.usage.refresh_interval, 15);
+    assert_eq!(cfg.analysis.refresh_interval, 20);
+
+    // The file on disk is upgraded to the current layout.
+    let text = fs::read_to_string(dir.join("config.toml")).unwrap();
+    assert!(text.starts_with("#:schema "));
+    assert!(text.contains("[usage.quota]"));
+    assert!(!text.contains("quota_panels"));
+    assert!(!text.contains("refresh_interval_secs"));
+
+    // A second load leaves the now-current file untouched.
+    config::load_in(dir);
+    assert_eq!(fs::read_to_string(dir.join("config.toml")).unwrap(), text);
+}
+
+#[test]
+fn load_in_does_not_reset_config_on_a_malformed_legacy_refresh_value() {
+    // A legacy `refresh_interval_secs` holding a non-u64 value must not be promoted
+    // into the typed field: doing so would make the migrated file fail to parse and
+    // silently reset EVERY setting. Instead the bad value is dropped, its default
+    // applies, and every other setting survives.
+    let th = TempHome::new();
+    let dir = &th.paths.cache_dir;
+    fs::create_dir_all(dir).unwrap();
+    fs::write(
+        dir.join("config.toml"),
+        "[general]\ndefault_time_range = \"weekly\"\n[usage]\nrefresh_interval_secs = -5\n[providers]\ncursor = false\n",
+    )
+    .unwrap();
+
+    let cfg = config::load_in(dir);
+    assert_eq!(cfg.general.default_time_range, TimeRange::Weekly);
+    assert!(!cfg.providers.cursor);
+    assert_eq!(cfg.usage.refresh_interval, 10); // dropped -> default
+
+    let text = fs::read_to_string(dir.join("config.toml")).unwrap();
+    assert!(!text.contains("refresh_interval = -5"));
+    // The file is now current; a second load does not rewrite it.
+    config::load_in(dir);
+    assert_eq!(fs::read_to_string(dir.join("config.toml")).unwrap(), text);
+}
+
+#[test]
+fn migrate_config_file_reports_status() {
+    use config::MigrationStatus;
+    let th = TempHome::new();
+    let dir = &th.paths.cache_dir;
+    fs::create_dir_all(dir).unwrap();
+    let path = dir.join("config.toml");
+
+    // Absent -> a fresh default is created.
+    assert_eq!(
+        config::migrate_config_file(&path).unwrap(),
+        MigrationStatus::Created
+    );
+    assert!(path.exists());
+    // The generated default is already current.
+    assert_eq!(
+        config::migrate_config_file(&path).unwrap(),
+        MigrationStatus::AlreadyCurrent
+    );
+
+    // A legacy file is migrated once, then reports current.
+    fs::write(
+        &path,
+        "[usage]\nquota_panels = [\"claude\"]\nrefresh_interval_secs = 15\n",
+    )
+    .unwrap();
+    assert_eq!(
+        config::migrate_config_file(&path).unwrap(),
+        MigrationStatus::Migrated
+    );
+    assert_eq!(
+        config::migrate_config_file(&path).unwrap(),
+        MigrationStatus::AlreadyCurrent
+    );
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.starts_with("#:schema "));
+    assert!(text.contains("[usage.quota]"));
 }
 
 #[test]

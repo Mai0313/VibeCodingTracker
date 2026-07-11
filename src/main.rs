@@ -328,6 +328,21 @@ fn run_config(action: ConfigAction) -> Result<()> {
                 anyhow::bail!("Editor '{}' exited with {}", editor, status);
             }
         }
+        ConfigAction::Migrate => {
+            use vibe_coding_tracker::config::MigrationStatus;
+            let path = vibe_coding_tracker::utils::get_config_path()?;
+            match vibe_coding_tracker::config::migrate_config_file(&path)? {
+                MigrationStatus::Created => {
+                    println!("Created a new config at {}", path.display());
+                }
+                MigrationStatus::Migrated => {
+                    println!("Migrated config to the latest format: {}", path.display());
+                }
+                MigrationStatus::AlreadyCurrent => {
+                    println!("Config is already up to date: {}", path.display());
+                }
+            }
+        }
     }
     Ok(())
 }
