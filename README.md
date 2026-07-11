@@ -511,7 +511,7 @@ vct fetch copilot --table
 
 ## Configuration
 
-vct keeps its user settings in `~/.vct/config.toml`. The file is **created with defaults on first run**, so you never have to write it by hand — edit it only when you want to change a default. It is generated from vct's typed settings and carries a `#:schema` directive on the first line, so a schema-aware TOML editor (taplo / VS Code "Even Better TOML") gives you autocomplete and validation. Print the schema yourself with `vct config schema`.
+vct keeps its user settings in `~/.vct/config.toml`. The file is **created with defaults on first run**, so you never have to write it by hand — edit it only when you want to change a default. It is generated from vct's typed settings and carries a `#:schema` directive on the first line, so a schema-aware TOML editor (taplo / VS Code "Even Better TOML") gives you autocomplete and validation. Print the schema yourself with `vct config schema`. A file written by an older vct is upgraded to the current layout in place the next time vct reads it (or on demand with `vct config migrate`), so an upgrade never leaves you on a stale format.
 
 ```toml
 #:schema https://raw.githubusercontent.com/Mai0313/VibeCodingTracker/main/vct.schema.json
@@ -577,6 +577,9 @@ vct config edit
 
 # Print the JSON schema (regenerate with: vct config schema > vct.schema.json)
 vct config schema
+
+# Upgrade a legacy-format file to the current layout in place
+vct config migrate
 ```
 
 ---

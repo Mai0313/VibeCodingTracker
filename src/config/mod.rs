@@ -12,6 +12,16 @@
 //! there is no hand-maintained template to drift. On the first run the generated
 //! file is materialized with a `#:schema` directive pointing at the published
 //! schema so schema-aware editors validate it.
+//!
+//! Files written by an older vct are upgraded through two layers. On load,
+//! [`migrate_document`] rewrites a standard-`[header]`-table file in place —
+//! adding the `#:schema` directive, renaming `refresh_interval_secs` to
+//! `refresh_interval`, and moving `[usage].quota_panels` into the nested
+//! `[usage.quota]` table — so an existing user actually gets the new layout
+//! (`vct config migrate` forces the same pass). A read-time [`migrate_legacy`]
+//! shim then backstops any residual legacy form the structural pass leaves alone
+//! (e.g. a hand-edited inline `usage = { ... }` table), so the returned [`Config`]
+//! is always correct even when the file was not rewritten.
 
 use crate::cli::TimeRange;
 use crate::utils::{get_cache_dir, write_string_atomic};
@@ -20,7 +30,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
-use toml_edit::{DocumentMut, Item, Table, TableLike, value};
+use toml_edit::{Array, DocumentMut, Item, Table, TableLike, value};
 
 /// URL of the published JSON schema, referenced via a `#:schema` directive on
 /// the first line of the generated `config.toml` so schema-aware TOML editors
@@ -217,8 +227,22 @@ pub fn load_in(dir: &Path) -> Config {
         let Ok(text) = std::fs::read_to_string(&path) else {
             return Config::default();
         };
-        let mut config: Config = toml_edit::de::from_str(&text).unwrap_or_default();
-        migrate_legacy(&mut config, &text);
+        // Auto-migrate a legacy-format file in place so existing users pick up the
+        // renamed keys, the `[usage.quota]` nesting, and the `#:schema` directive.
+        // Best-effort: a failed write (e.g. a read-only home) still yields a
+        // correct in-memory Config below. Malformed TOML is never overwritten.
+        let effective = match migrate_text(&text) {
+            Ok(Some(migrated)) => {
+                let _ = write_string_atomic(&path, &migrated);
+                migrated
+            }
+            Ok(None) => text,
+            Err(_) => return Config::default(),
+        };
+        let mut config: Config = toml_edit::de::from_str(&effective).unwrap_or_default();
+        // Backstop for any residual legacy form the structural migration leaves
+        // alone (e.g. an inline `usage = { ... }` table).
+        migrate_legacy(&mut config, &effective);
         return config;
     }
     // First run: materialize the generated commented template.
@@ -227,12 +251,51 @@ pub fn load_in(dir: &Path) -> Config {
     toml_edit::de::from_str(&text).unwrap_or_default()
 }
 
-/// Self-healing migration for config files written before quota settings moved
-/// into `[usage.quota]`: an old `[usage].quota_panels` key is honored when the
-/// new `[usage.quota].panels` key is absent, so upgrading vct never silently
-/// resets a trimmed panel list. The user's file is left untouched (no forced
-/// rewrite); the renamed `refresh_interval` handles its own legacy key via a
-/// serde `alias`.
+/// Outcome of an explicit [`migrate_config_file`] run, surfaced by
+/// `vct config migrate`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationStatus {
+    /// No file existed, so a fresh commented default was written.
+    Created,
+    /// A legacy-format file was rewritten to the current on-disk format.
+    Migrated,
+    /// The file was already current; nothing was written.
+    AlreadyCurrent,
+}
+
+/// Migrates the `config.toml` at `path` to the current on-disk format in place,
+/// creating the commented default when the file is absent. Shared by
+/// `vct config migrate` and the auto-migration in [`load_in`].
+pub fn migrate_config_file(path: &Path) -> Result<MigrationStatus> {
+    if !path.exists() {
+        write_string_atomic(path, &default_document().to_string())?;
+        return Ok(MigrationStatus::Created);
+    }
+    let text = std::fs::read_to_string(path)?;
+    match migrate_text(&text)? {
+        Some(migrated) => {
+            write_string_atomic(path, &migrated)?;
+            Ok(MigrationStatus::Migrated)
+        }
+        None => Ok(MigrationStatus::AlreadyCurrent),
+    }
+}
+
+/// Applies the structural migration to raw config text: `Ok(Some(new))` when it
+/// changed, `Ok(None)` when already current, `Err` when the text is not valid
+/// TOML (so a caller never overwrites an unparseable file with defaults).
+pub fn migrate_text(text: &str) -> Result<Option<String>> {
+    let mut doc: DocumentMut = text.parse()?;
+    Ok(migrate_document(&mut doc).then(|| doc.to_string()))
+}
+
+/// Read-time backstop for config files written before quota settings moved into
+/// `[usage.quota]`: an old `[usage].quota_panels` key is honored when the new
+/// `[usage.quota].panels` key is absent, and a legacy `refresh_interval_secs` is
+/// mapped onto `refresh_interval`. The on-disk file is normally rewritten by
+/// [`migrate_document`] first; this shim only has to cover the forms that pass
+/// leaves alone (e.g. an inline `usage = { ... }` table), keeping the in-memory
+/// [`Config`] correct even when the file itself was not upgraded.
 fn migrate_legacy(config: &mut Config, raw: &str) {
     let Ok(doc) = raw.parse::<DocumentMut>() else {
         return;
@@ -271,6 +334,247 @@ fn migrate_refresh_secs(section: &dyn TableLike, target: &mut u64) {
     {
         *target = v;
     }
+}
+
+/// Structural on-disk migration for a `config.toml` written by an older vct.
+///
+/// Operates on standard `[header]` tables only — an inline `usage = { ... }`
+/// table is left to the read-time [`migrate_legacy`] shim, so this never has to
+/// synthesize a header table inside an inline one. Returns whether anything
+/// changed, so the caller rewrites the file at most once. Idempotent:
+/// re-running on an already-migrated document returns `false`.
+fn migrate_document(doc: &mut DocumentMut) -> bool {
+    let schema = json_schema();
+    let mut changed = false;
+
+    // The `#:schema` directive on the first line drives editor autocomplete.
+    if !has_schema_directive(doc) {
+        changed |= prepend_schema_directive(doc);
+    }
+
+    // `[usage]`: rename the refresh key, then move quota_panels into the nested
+    // `[usage.quota]`. Quota goes last so its `[usage.quota]` header renders
+    // after every leaf key of `[usage]` (a leaf after a sub-table would be
+    // invalid TOML).
+    if doc.get("usage").is_some_and(Item::is_table) {
+        if let Some(usage) = doc.get_mut("usage").and_then(Item::as_table_mut) {
+            changed |= rename_refresh_key(usage, &schema, &["usage", "refresh_interval"]);
+        }
+        changed |= migrate_quota_panels(doc, &schema);
+    }
+
+    // `[analysis]`: rename the refresh key.
+    if let Some(analysis) = doc.get_mut("analysis").and_then(Item::as_table_mut) {
+        changed |= rename_refresh_key(analysis, &schema, &["analysis", "refresh_interval"]);
+    }
+
+    changed
+}
+
+/// Whether the document already carries a `#:schema` directive line.
+fn has_schema_directive(doc: &DocumentMut) -> bool {
+    // Only the first non-blank line can be a real directive; scanning every line
+    // would false-positive on a `#:schema`-prefixed line buried inside a
+    // multi-line string value or a later comment, wrongly skipping the prepend.
+    doc.to_string()
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| line.trim_start().starts_with("#:schema"))
+}
+
+/// Prepends the `#:schema` directive to the document's leading trivia (the
+/// prefix decor of its first element). Returns whether it was added.
+fn prepend_schema_directive(doc: &mut DocumentMut) -> bool {
+    let directive = format!("#:schema {SCHEMA_URL}\n");
+    let root = doc.as_table_mut();
+    let Some(first_key) = root.iter().next().map(|(k, _)| k.to_string()) else {
+        return false;
+    };
+    if let Some(item) = root.get_mut(&first_key)
+        && let Some(table) = item.as_table_mut()
+    {
+        let existing = decor_prefix(table.decor());
+        table
+            .decor_mut()
+            .set_prefix(format!("{directive}{existing}"));
+        return true;
+    }
+    if let Some(mut km) = root.key_mut(&first_key) {
+        let existing = decor_prefix(km.leaf_decor());
+        km.leaf_decor_mut()
+            .set_prefix(format!("{directive}{existing}"));
+        return true;
+    }
+    false
+}
+
+/// The existing prefix text of a decor, or an empty string.
+fn decor_prefix(decor: &toml_edit::Decor) -> String {
+    decor
+        .prefix()
+        .and_then(|p| p.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Within `table`, migrate a legacy `refresh_interval_secs` to the current
+/// `refresh_interval`: rename when only the old key is present, or drop the old
+/// key when both coexist (a mid-upgrade file where the new key already wins).
+///
+/// A malformed legacy value (negative, float, string) is **dropped**, not
+/// promoted: writing it into the typed `refresh_interval` field would make serde
+/// reject the whole migrated file and silently reset every setting to defaults.
+/// Dropping it lets the typed default apply, matching the pre-migration read.
+fn rename_refresh_key(table: &mut Table, schema: &Value, comment_path: &[&str]) -> bool {
+    if !table.contains_key("refresh_interval_secs") {
+        return false;
+    }
+    // Both present: the new key already wins on read, so just drop the stale one.
+    if table.contains_key("refresh_interval") {
+        table.remove("refresh_interval_secs");
+        return true;
+    }
+    let Some((old_key, item)) = table.remove_entry("refresh_interval_secs") else {
+        return false;
+    };
+    if let Some(secs) = item.as_integer().and_then(|n| u64::try_from(n).ok()) {
+        table.insert("refresh_interval", value(secs as i64));
+        // Keep a hand-added comment; otherwise apply the current schema comment.
+        let existing = decor_prefix(old_key.leaf_decor());
+        apply_comment(table, "refresh_interval", &existing, schema, comment_path);
+    }
+    true
+}
+
+/// Moves a legacy top-level `[usage].quota_panels` array into the nested
+/// `[usage.quota].panels`, creating the `[usage.quota]` table (with the current
+/// default `refresh_interval`) when needed. A present `[usage.quota].panels`
+/// wins; the legacy key is removed once handled. An inline `quota = { ... }`
+/// child is left untouched (legacy key preserved) so no data is lost trying to
+/// merge into an inline table.
+fn migrate_quota_panels(doc: &mut DocumentMut, schema: &Value) -> bool {
+    let Some(usage) = doc.get("usage").and_then(Item::as_table) else {
+        return false;
+    };
+    if !usage.contains_key("quota_panels") {
+        return false;
+    }
+    if usage.get("quota").is_some_and(Item::is_inline_table) {
+        return false;
+    }
+    let has_new_panels = usage
+        .get("quota")
+        .and_then(Item::as_table_like)
+        .is_some_and(|q| q.contains_key("panels"));
+
+    let usage = doc
+        .get_mut("usage")
+        .and_then(Item::as_table_mut)
+        .expect("usage table present");
+    let Some((old_key, old_item)) = usage.remove_entry("quota_panels") else {
+        return false;
+    };
+    if has_new_panels {
+        // The new `[usage.quota].panels` already wins; drop the legacy key only.
+        return true;
+    }
+    let legacy_panels: Vec<String> = old_item
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    // Carry the legacy key's comment onto the new `panels` key.
+    let comment = decor_prefix(old_key.leaf_decor());
+
+    if usage.get("quota").and_then(Item::as_table).is_some() {
+        // Existing `[usage.quota]` without a panels key: just add it.
+        let quota = usage
+            .get_mut("quota")
+            .and_then(Item::as_table_mut)
+            .expect("quota table present");
+        quota.insert("panels", value(panels_array(&legacy_panels)));
+        apply_comment(
+            quota,
+            "panels",
+            &comment,
+            schema,
+            &["usage", "quota", "panels"],
+        );
+    } else {
+        usage.insert(
+            "quota",
+            Item::Table(build_quota_table(&legacy_panels, &comment, schema)),
+        );
+    }
+    true
+}
+
+/// A TOML array from a list of panel names.
+fn panels_array(panels: &[String]) -> Array {
+    panels.iter().map(String::as_str).collect()
+}
+
+/// Builds a fresh `[usage.quota]` table from the migrated panels (carrying the
+/// legacy key's comment when it had one) and the current default
+/// `refresh_interval`, which is brand-new so it gets the schema comment.
+fn build_quota_table(panels: &[String], panels_comment: &str, schema: &Value) -> Table {
+    let mut table = Table::new();
+    table.set_implicit(false);
+    if let Some(desc) = schema_description(schema, &["usage", "quota"]) {
+        table
+            .decor_mut()
+            .set_prefix(format!("\n{}", comment_block(&desc)));
+    }
+    table.insert("panels", value(panels_array(panels)));
+    apply_comment(
+        &mut table,
+        "panels",
+        panels_comment,
+        schema,
+        &["usage", "quota", "panels"],
+    );
+    table.insert(
+        "refresh_interval",
+        value(default_quota_refresh_secs() as i64),
+    );
+    apply_comment(
+        &mut table,
+        "refresh_interval",
+        "",
+        schema,
+        &["usage", "quota", "refresh_interval"],
+    );
+    table
+}
+
+/// Attaches a leading `#` comment to `key`, mirroring the leaf styling in
+/// [`annotate_table`]: keeps a non-empty `existing` comment (a hand-added or
+/// carried-over one), otherwise falls back to the field's schema `description`.
+fn apply_comment(table: &mut Table, key: &str, existing: &str, schema: &Value, path: &[&str]) {
+    let prefix = if existing.trim().is_empty() {
+        schema_description(schema, path).map(|desc| format!("\n{}", comment_block(&desc)))
+    } else {
+        Some(existing.to_string())
+    };
+    if let Some(prefix) = prefix
+        && let Some(mut km) = table.key_mut(key)
+    {
+        km.leaf_decor_mut().set_prefix(prefix);
+    }
+}
+
+/// Walks the (inlined) JSON schema to a nested field's `description`.
+fn schema_description(schema: &Value, path: &[&str]) -> Option<String> {
+    let mut cur = schema;
+    for key in path {
+        cur = cur.get("properties")?.get(key)?;
+    }
+    cur.get("description")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 /// Persists the usage dashboard's merge toggle back to the config.
@@ -505,6 +809,145 @@ mod tests {
         let mut cfg: Config = toml_edit::de::from_str(text).unwrap();
         migrate_legacy(&mut cfg, text);
         assert!(cfg.usage.quota.panels.is_empty());
+    }
+
+    #[test]
+    fn migrate_document_upgrades_a_full_legacy_file() {
+        let legacy = "# old header\n\n[usage]\nmerge_models = false\nquota_panels = [\"claude\", \"codex\"]\nrefresh_interval_secs = 15\n\n[analysis]\nrefresh_interval_secs = 20\n";
+        let migrated = migrate_text(legacy).unwrap().expect("legacy file changes");
+        // The `#:schema` directive lands on the first line.
+        assert!(migrated.starts_with("#:schema "));
+        // Legacy keys are gone; the current nested layout is in place.
+        assert!(!migrated.contains("quota_panels"));
+        assert!(!migrated.contains("refresh_interval_secs"));
+        assert!(migrated.contains("[usage.quota]"));
+        assert!(migrated.contains("panels = [\"claude\", \"codex\"]"));
+        // The user's values survive, and the quota default is filled in.
+        let cfg: Config = toml_edit::de::from_str(&migrated).unwrap();
+        assert_eq!(cfg.usage.refresh_interval, 15);
+        assert_eq!(cfg.analysis.refresh_interval, 20);
+        assert_eq!(
+            cfg.usage.quota.panels,
+            vec!["claude".to_string(), "codex".to_string()]
+        );
+        assert_eq!(cfg.usage.quota.refresh_interval, 60);
+    }
+
+    #[test]
+    fn migrate_document_is_idempotent() {
+        let legacy = "[usage]\nquota_panels = [\"claude\"]\nrefresh_interval_secs = 15\n";
+        let once = migrate_text(legacy).unwrap().expect("first pass changes");
+        // A second pass over the migrated text writes nothing.
+        assert!(migrate_text(&once).unwrap().is_none());
+    }
+
+    #[test]
+    fn migrate_document_noops_on_the_generated_default() {
+        let current = default_document().to_string();
+        assert!(migrate_text(&current).unwrap().is_none());
+    }
+
+    #[test]
+    fn migrate_document_adds_only_the_schema_directive_when_keys_are_current() {
+        // New key names + nested quota, but missing the `#:schema` directive.
+        let text = "[usage]\nrefresh_interval = 10\n\n[usage.quota]\npanels = [\"claude\"]\n";
+        let migrated = migrate_text(text).unwrap().expect("adds #:schema");
+        assert!(migrated.starts_with("#:schema "));
+        assert!(migrated.contains("refresh_interval = 10"));
+        assert!(migrated.contains("panels = [\"claude\"]"));
+    }
+
+    #[test]
+    fn migrate_document_drops_stale_refresh_key_when_both_present() {
+        let text = "#:schema x\n[usage]\nrefresh_interval = 5\nrefresh_interval_secs = 10\n";
+        let migrated = migrate_text(text).unwrap().expect("drops the legacy key");
+        assert!(!migrated.contains("refresh_interval_secs"));
+        let cfg: Config = toml_edit::de::from_str(&migrated).unwrap();
+        assert_eq!(cfg.usage.refresh_interval, 5);
+    }
+
+    #[test]
+    fn migrate_document_leaves_an_inline_usage_table_to_the_read_shim() {
+        // An inline `usage = { ... }` table is not restructured (only `#:schema`
+        // is added), so nothing is lost trying to nest into an inline table.
+        let text = "usage = { quota_panels = [\"claude\"], refresh_interval_secs = 30 }\n";
+        let migrated = migrate_text(text).unwrap().expect("adds #:schema");
+        assert!(migrated.starts_with("#:schema "));
+        assert!(migrated.contains("quota_panels"));
+        // Still idempotent for the untouched inline table.
+        assert!(migrate_text(&migrated).unwrap().is_none());
+    }
+
+    #[test]
+    fn migrate_text_errors_on_malformed_toml() {
+        assert!(migrate_text("= not valid").is_err());
+    }
+
+    #[test]
+    fn migrate_document_drops_a_malformed_legacy_refresh_value() {
+        // A non-u64 legacy value must NOT be promoted into the typed field (that
+        // would make serde reject the migrated file and reset every setting); it
+        // is dropped so the default applies, and unrelated settings survive.
+        let text = "[general]\ndefault_time_range = \"weekly\"\n[usage]\nrefresh_interval_secs = -5\n[providers]\ncursor = false\n";
+        let migrated = migrate_text(text).unwrap().expect("legacy file changes");
+        assert!(!migrated.contains("refresh_interval = -5"));
+        assert!(!migrated.contains("refresh_interval_secs"));
+        let cfg: Config = toml_edit::de::from_str(&migrated).unwrap();
+        assert_eq!(cfg.general.default_time_range, TimeRange::Weekly);
+        assert!(!cfg.providers.cursor);
+        assert_eq!(cfg.usage.refresh_interval, 10);
+        // The now-clean file is stable across further passes.
+        assert!(migrate_text(&migrated).unwrap().is_none());
+    }
+
+    #[test]
+    fn migrate_document_preserves_a_hand_added_comment_on_a_renamed_key() {
+        let text = "[usage]\n# keep me\nrefresh_interval_secs = 15\n";
+        let migrated = migrate_text(text).unwrap().expect("legacy file changes");
+        assert!(migrated.contains("# keep me"));
+        assert!(migrated.contains("refresh_interval = 15"));
+    }
+
+    #[test]
+    fn migrate_document_adds_the_directive_despite_a_buried_schema_line() {
+        // A `#:schema`-prefixed line inside a string value must not be mistaken
+        // for the real leading directive and skip the prepend.
+        let text = "[usage]\nquota_panels = [\"claude\"]\nnote = \"\"\"\n#:schema fake\n\"\"\"\n";
+        let migrated = migrate_text(text)
+            .unwrap()
+            .expect("adds the real directive");
+        assert!(migrated.starts_with("#:schema https://"));
+    }
+
+    #[test]
+    fn migrate_document_merges_panels_into_an_existing_quota_table() {
+        // Legacy quota_panels + a `[usage.quota]` that has refresh_interval but no
+        // panels: panels is added and the user's refresh_interval survives.
+        let text = "[usage]\nquota_panels = [\"claude\"]\n\n[usage.quota]\nrefresh_interval = 30\n";
+        let migrated = migrate_text(text).unwrap().expect("legacy file changes");
+        assert!(!migrated.contains("quota_panels"));
+        let cfg: Config = toml_edit::de::from_str(&migrated).unwrap();
+        assert_eq!(cfg.usage.quota.panels, vec!["claude".to_string()]);
+        assert_eq!(cfg.usage.quota.refresh_interval, 30);
+        assert!(migrate_text(&migrated).unwrap().is_none());
+    }
+
+    #[test]
+    fn migrate_document_drops_legacy_quota_panels_when_new_panels_present() {
+        let text = "#:schema x\n[usage]\nquota_panels = [\"gemini\"]\n\n[usage.quota]\npanels = [\"claude\"]\n";
+        let migrated = migrate_text(text).unwrap().expect("drops the legacy key");
+        assert!(!migrated.contains("quota_panels"));
+        let cfg: Config = toml_edit::de::from_str(&migrated).unwrap();
+        assert_eq!(cfg.usage.quota.panels, vec!["claude".to_string()]);
+    }
+
+    #[test]
+    fn migrate_document_skips_an_inline_quota_child() {
+        // An inline `quota = { ... }` under `[usage]` is left untouched (with its
+        // legacy sibling) rather than risk losing data merging into it.
+        let text =
+            "#:schema x\n[usage]\nquota_panels = [\"claude\"]\nquota = { panels = [\"codex\"] }\n";
+        assert!(migrate_text(text).unwrap().is_none());
     }
 
     #[test]

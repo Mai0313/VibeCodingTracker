@@ -262,4 +262,9 @@ pub enum ConfigAction {
     /// Redirect it to regenerate the committed schema:
     /// `vct config schema > vct.schema.json`.
     Schema,
+    /// Rewrite a legacy-format config to the current on-disk layout in place.
+    ///
+    /// Loading the settings already migrates the file automatically; this forces
+    /// the same pass so a schema-aware editor sees the upgraded file right away.
+    Migrate,
 }

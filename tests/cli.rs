@@ -581,6 +581,37 @@ fn config_show_creates_and_prints_settings() {
     assert!(!text.contains("[update]"));
 }
 
+#[test]
+fn config_migrate_upgrades_a_legacy_file() {
+    let home = TempHome::new();
+    // Seed a pre-`[usage.quota]` config with the legacy key names.
+    home.put(
+        ".vct/config.toml",
+        "[usage]\nquota_panels = [\"claude\"]\nrefresh_interval_secs = 15\n",
+    );
+
+    child_cmd(&home)
+        .arg("config")
+        .arg("migrate")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Migrated"));
+
+    let text = std::fs::read_to_string(home.home().join(".vct/config.toml")).unwrap();
+    assert!(text.starts_with("#:schema "));
+    assert!(text.contains("[usage.quota]"));
+    assert!(!text.contains("quota_panels"));
+    assert!(!text.contains("refresh_interval_secs"));
+
+    // Running it again is a no-op.
+    child_cmd(&home)
+        .arg("config")
+        .arg("migrate")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("already up to date"));
+}
+
 #[cfg(unix)]
 #[test]
 fn config_edit_splits_a_multi_word_editor_command() {
