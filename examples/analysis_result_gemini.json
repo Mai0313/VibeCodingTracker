@@ -6,20 +6,20 @@
     {
       "conversationUsage": {
         "gemini-3-flash-preview": {
-          "cache_read_input_tokens": 89744,
-          "input_tokens": 194830,
-          "output_tokens": 3683,
-          "thoughts_tokens": 3030,
+          "cache_read_input_tokens": 48951,
+          "input_tokens": 113397,
+          "output_tokens": 1886,
+          "thoughts_tokens": 1689,
           "tool_tokens": 0,
-          "total_tokens": 291287
+          "total_tokens": 165923
         },
         "gemini-3.1-pro-preview": {
           "cache_read_input_tokens": 0,
-          "input_tokens": 80476,
-          "output_tokens": 532,
-          "thoughts_tokens": 904,
+          "input_tokens": 40238,
+          "output_tokens": 266,
+          "thoughts_tokens": 452,
           "tool_tokens": 0,
-          "total_tokens": 81912
+          "total_tokens": 40956
         }
       },
       "editFileDetails": [

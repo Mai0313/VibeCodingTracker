@@ -62,7 +62,11 @@ fn test_file_cache_invalidation() {
 
     // Create initial file
     let mut file = std::fs::File::create(&test_file).unwrap();
-    writeln!(file, r#"{{"type":"test","value":1}}"#).unwrap();
+    writeln!(
+        file,
+        r#"{{"timestamp":"2026-07-12T00:00:00Z","type":"session_meta","payload":{{"type":"session_meta","id":"one"}}}}"#
+    )
+    .unwrap();
     drop(file);
 
     let cache = global_cache();
@@ -74,7 +78,11 @@ fn test_file_cache_invalidation() {
     // Modify file (change modification time)
     std::thread::sleep(std::time::Duration::from_millis(100));
     let mut file = std::fs::File::create(&test_file).unwrap();
-    writeln!(file, r#"{{"type":"test","value":2}}"#).unwrap();
+    writeln!(
+        file,
+        r#"{{"timestamp":"2026-07-12T00:00:00Z","type":"session_meta","payload":{{"type":"session_meta","id":"two"}}}}"#
+    )
+    .unwrap();
     drop(file);
 
     // Should detect file change and re-parse
@@ -133,10 +141,14 @@ fn test_file_cache_cleanup_stale() {
     let test_file = temp_dir.path().join("temp.jsonl");
 
     // Create and cache a file
-    std::fs::write(&test_file, r#"{"type":"test"}"#).unwrap();
+    std::fs::write(
+        &test_file,
+        r#"{"timestamp":"2026-07-12T00:00:00Z","type":"session_meta","payload":{"type":"session_meta","id":"stale"}}"#,
+    )
+    .unwrap();
 
     let cache = global_cache();
-    let _ = cache.get_or_parse(&test_file);
+    cache.get_or_parse(&test_file).unwrap();
 
     // Delete the file
     std::fs::remove_file(&test_file).ok();

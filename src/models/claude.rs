@@ -97,6 +97,9 @@ pub enum ClaudeContentItem {
         /// Flattened result text (string or joined array blocks).
         #[serde(default, deserialize_with = "deserialize_tool_result_content")]
         content: String,
+        /// Whether Claude rejected the invocation before the tool ran.
+        #[serde(default)]
+        is_error: bool,
     },
     /// Any other content block (text, thinking, image, …); discarded.
     #[serde(other)]

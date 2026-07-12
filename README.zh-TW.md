@@ -176,7 +176,6 @@ Commands:
 | `--table`                                      | 靜態表格，不啟動 TUI                                                          |
 | `--text`                                       | 純文字，適合腳本處理                                                          |
 | `--json`                                       | JSON 輸出，附帶 pricing 資訊                                                  |
-| `--output <FILE>`                              | 將富化 JSON 存成檔案                                                          |
 | `--merge-providers`                            | 合併共享同一 base 名稱、僅 provider 前綴不同的 model（`--json` 會忽略此選項） |
 | `--daily` / `--weekly` / `--monthly` / `--all` | 時間範圍篩選（見上方表格）                                                    |
 
@@ -195,8 +194,8 @@ vct usage --text
 # JSON 輸出，包含 cost_usd 與 matched_model 欄位
 vct usage --json
 
-# 直接把富化 JSON 存成檔案
-vct usage --output report.json
+# 透過 shell redirection 儲存富化 JSON
+vct usage --json > report.json
 
 # 時間範圍與輸出格式可自由組合
 vct usage --weekly
@@ -324,19 +323,18 @@ Totals (by Provider)
 
 **深入分析程式碼操作——精確掌握你的 AI 助手做了哪些事。**
 
-### Flag 一覽
+### 參數與 Flag
 
-| Flag                                           | 用途                                             |
-| ---------------------------------------------- | ------------------------------------------------ |
-| *(不帶參數)*                                   | 互動式 TUI 儀表板，涵蓋所有 session              |
-| `--path <FILE>`                                | 分析單一 JSONL/JSON 對話檔案（stdout 輸出 JSON） |
-| `--table`                                      | 靜態表格，附帶供應商總計                         |
-| `--text`                                       | 純文字，方便腳本處理                             |
-| `--json`                                       | 將聚合 row 以 JSON 陣列輸出到 stdout             |
-| `--output <FILE>`                              | 將結果以格式化 JSON 存成檔案                     |
-| `--daily` / `--weekly` / `--monthly` / `--all` | 時間範圍篩選（見上方表格）                       |
+| 參數 / Flag                                    | 用途                                                                      |
+| ---------------------------------------------- | ------------------------------------------------------------------------- |
+| *(不帶參數)*                                   | 互動式 TUI 儀表板, 涵蓋所有 session                                       |
+| `<FILE>`                                       | 分析單一 JSONL/JSON 對話檔案, 並將完整 `CodeAnalysis` JSON 輸出到 stdout  |
+| `--table`                                      | 靜態摘要表格, 附帶 provider 總計                                          |
+| `--text`                                       | 純文字摘要, 方便腳本處理                                                  |
+| `--json`                                       | 完整 parser 結果. 搭配 `<FILE>` 時為單一 object, 否則為 object 陣列       |
+| `--daily` / `--weekly` / `--monthly` / `--all` | 所有 session 的時間範圍篩選. 不可與 `<FILE>` 同時使用, 其他說明見上方表格 |
 
-請參考 [`examples/`](examples/) 目錄，裡面有四種 provider 的範例輸入與對應的 JSON 輸出。
+請參考 [`examples/`](examples/) 目錄，裡面有四種 JSONL provider 的範例輸入與對應的 JSON 輸出。
 
 ### 基本用法
 
@@ -350,20 +348,24 @@ vct analysis --table
 # 純文字輸出，方便腳本處理
 vct analysis --text
 
-# 聚合資料以 JSON 輸出，方便後續處理
+# 輸出所有 session 的完整 parser 結果
 vct analysis --json
 
-# 分析單一對話檔案 → stdout JSON
-vct analysis --path ~/.claude/projects/session.jsonl
+# 分析單一對話檔案並輸出 JSON
+vct analysis ~/.claude/projects/session.jsonl
 
-# Save results to JSON
-vct analysis --output report.json
+# 只摘要這個對話檔案
+vct analysis ~/.claude/projects/session.jsonl --table
+
+# 透過 shell redirection 儲存完整 JSON
+vct analysis --json > report.json
+vct analysis ~/.claude/projects/session.jsonl > session-analysis.json
 
 # 時間範圍與輸出格式可自由組合
 vct analysis --weekly
 vct analysis --table --monthly
 vct analysis --json --daily
-vct analysis --output today.json --daily
+vct analysis --json --daily > today.json
 ```
 
 ### 預覽：互動式儀表板（`vct analysis`）
@@ -390,7 +392,7 @@ vct analysis --output today.json --daily
 
 ### 預覽：表格與 JSON（`vct analysis`）
 
-`--table` 會呈現每個 model 的明細以及每個供應商的彙總（含 Active Days 欄位）；`--json` 則為每個 model 輸出一列聚合資料。
+`--table` 會顯示各 model 的明細, 並附上各 provider 的摘要, 包含 Active Days 欄位. `--text` 與 `--table` 都是相同 normalized parser records 的精簡 projection. `--json` 會保留完整 records, 包括每次操作的 details 與 token usage. 未提供 `<FILE>` 時, 外層陣列中的每個元素都是一個 session 的 `CodeAnalysis` object. 提供 `<FILE>` 時, stdout 只會輸出該 object, shape 與 [`examples/`](examples/) 中對應的結果相同.
 
 ```text
 Analysis Statistics
@@ -404,22 +406,44 @@ Analysis Statistics
 └─────────────────┴────────────┴────────────┴─────────────┴──────┴──────┴──────┴───────────┴───────┘
 ```
 
-```json
-// vct analysis --json  (one model shown)
+```jsonc
+// vct analysis --json  (one abbreviated session shown)
 [
   {
-    "model": "claude-opus-4-8",
-    "editLines": 1493,
-    "readLines": 15564,
-    "writeLines": 970,
-    "bashCount": 124,
-    "editCount": 134,
-    "readCount": 144,
-    "todoWriteCount": 0,
-    "writeCount": 12
+    "user": "alice",
+    "extensionName": "Claude-Code",
+    "insightsVersion": "...",
+    "machineId": "...",
+    "records": [
+      {
+        "totalUniqueFiles": 3,
+        "totalReadLines": 120,
+        "readFileDetails": [
+          {
+            "filePath": "/repo/src/main.rs",
+            "lineCount": 120,
+            "characterCount": 4102,
+            "timestamp": 1783872000000
+          }
+        ],
+        "toolCallCounts": { "Bash": 1, "Edit": 0, "Read": 1, "TodoWrite": 0, "Write": 0 },
+        "conversationUsage": { "claude-opus-4-8": { "input_tokens": 42, "output_tokens": 18 } }
+      }
+    ]
   }
 ]
 ```
+
+> [!WARNING]
+> 完整 analysis JSON 可能很大, 也可能包含 source text, edit body, shell command, absolute path, repository URL, user name, machine identifier 與 token metadata. 分享前請先檢查內容.
+
+Batch analysis 會讀取 Provider 的即時資料. 如果 assistant 在掃描期間繼續寫入 session, 後續執行可能合理地包含更新資料. 未變動的 input 會產生固定順序的輸出.
+
+如果找到的 source 全部讀取失敗或使用無法辨識的 schema, 非互動式 analysis 會回傳 error. 如果只有部分 source 失敗, 成功結果會保留, warning 會寫入 stderr.
+
+`analysis FILE` 對單一檔案內格式錯誤或不受支援的 record 採用相同行為: 在 stdout 保留已解析的 JSON/text/table 輸出, 並將一般性的 skipped-record warning 寫入 stderr.
+
+Codex code mode session 會提供已完成的 JavaScript `exec` cell, 但沒有 nested tool 的結構化 trace. VCT 會將該 cell 計為一次 Bash call, 並在完整 JSON 中保留 source, 但不會猜測 nested Read/Edit/Write operation.
 
 ---
 

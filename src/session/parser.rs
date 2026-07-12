@@ -3,18 +3,39 @@ use crate::constants::buffer;
 use crate::models::{
     ClaudeCodeLog, CodeAnalysis, CodexLog, CopilotEvent, ExtensionType, GeminiSession,
 };
-use crate::session::claude::{parse_claude_log_values, parse_claude_logs};
-use crate::session::codex::parse_codex_logs;
-use crate::session::copilot::parse_copilot_events;
+use crate::session::claude::parse_claude_logs_with_diagnostics;
+use crate::session::codex::parse_codex_log_iter_with_diagnostics;
+use crate::session::copilot::parse_copilot_events_with_diagnostics;
 use crate::session::detector::{classify_records, detect_extension_type};
-use crate::session::gemini::parse_gemini_events;
+use crate::session::diagnostics::{ParseDiagnostics, ParsedAnalysis};
+use crate::session::gemini::parse_gemini_events_with_diagnostics;
 use crate::session::state::ParseMode;
 use crate::utils::{get_current_user, get_machine_id, read_json, read_jsonl};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
+use std::cell::RefCell;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
+use std::rc::Rc;
+
+/// Content-safe warning summary used by the CLI's single-file path.
+///
+/// This type is public only because Cargo builds `src/main.rs` as a separate
+/// crate from the library. Provider diagnostics remain crate-private.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionFileParseDiagnostics {
+    skipped_records: usize,
+}
+
+impl SessionFileParseDiagnostics {
+    /// Number of malformed, unrecognized, or analyzer-relevant records skipped
+    /// after another record from the same source was recognized successfully.
+    pub fn skipped_records(self) -> usize {
+        self.skipped_records
+    }
+}
 
 /// Parses a session file (JSONL or JSON) and returns the result as a
 /// `serde_json::Value` (the CLI single-file dump path).
@@ -29,8 +50,9 @@ use std::path::Path;
 ///
 /// # Errors
 ///
-/// Returns an error if the file cannot be opened or read, or if the parsed
-/// [`crate::CodeAnalysis`] fails to serialise to a `serde_json::Value`.
+/// Returns an error if the file cannot be opened or read, if a nonempty source
+/// has no supported analyzer payload, or if the parsed [`crate::CodeAnalysis`]
+/// fails to serialise to a `serde_json::Value`.
 ///
 /// # Examples
 ///
@@ -66,9 +88,10 @@ pub fn parse_session_file<P: AsRef<Path>>(path: P) -> Result<Value> {
 ///
 /// # Errors
 ///
-/// Returns an error if the file cannot be opened or read; an empty or
-/// unparseable file resolves to an empty [`CodeAnalysis`] rather than an
-/// error.
+/// Returns an error if the file cannot be opened or read, if no record in a
+/// nonempty source has a recognized provider schema, or if every
+/// analyzer-relevant payload uses an unsupported schema. Empty input resolves
+/// to an empty [`CodeAnalysis`].
 ///
 /// # Examples
 ///
@@ -93,10 +116,10 @@ pub fn parse_session_file_typed<P: AsRef<Path>>(path: P) -> Result<CodeAnalysis>
 ///
 /// # Errors
 ///
-/// Returns an error if the file cannot be opened or read, or if the fallback
-/// path is reached and the provider cannot be detected (only possible for a
-/// non-empty, non-JSONL file). Empty input resolves to an empty
-/// [`CodeAnalysis`].
+/// Returns an error if the file cannot be opened or read, if the fallback path
+/// cannot detect a provider, if no record in a nonempty source has a recognized
+/// provider schema, or if every analyzer-relevant payload uses an unsupported
+/// schema. Empty input resolves to an empty [`CodeAnalysis`].
 ///
 /// # Examples
 ///
@@ -114,10 +137,30 @@ pub fn parse_session_file_typed_with_mode<P: AsRef<Path>>(
     path: P,
     mode: ParseMode,
 ) -> Result<CodeAnalysis> {
-    let path = path.as_ref();
+    Ok(parse_session_file_typed_with_mode_and_diagnostics(path, mode)?.0)
+}
 
-    if let Some(analysis) = stream_parse_autodetect(path, mode)? {
-        return Ok(analysis);
+/// Single-file parse with a content-safe partial-failure summary for the CLI.
+#[doc(hidden)]
+pub fn parse_session_file_typed_with_mode_and_diagnostics<P: AsRef<Path>>(
+    path: P,
+    mode: ParseMode,
+) -> Result<(CodeAnalysis, SessionFileParseDiagnostics)> {
+    let path = path.as_ref();
+    let parsed = parse_session_file_typed_with_mode_internal(path, mode)?;
+    validate_parsed_source(path, &parsed.diagnostics)?;
+    let diagnostics = SessionFileParseDiagnostics {
+        skipped_records: parsed.diagnostics.partial_failure_count(),
+    };
+    Ok((parsed.analysis, diagnostics))
+}
+
+fn parse_session_file_typed_with_mode_internal(
+    path: &Path,
+    mode: ParseMode,
+) -> Result<ParsedAnalysis> {
+    if let Some(parsed) = stream_parse_autodetect(path, mode)? {
+        return Ok(parsed);
     }
 
     // Fallback for anything the streaming path could not peek (e.g. a
@@ -129,7 +172,7 @@ pub fn parse_session_file_typed_with_mode<P: AsRef<Path>>(
     };
 
     if data.is_empty() {
-        return Ok(empty_analysis());
+        return Ok(empty_parsed_analysis());
     }
 
     let ext_type = detect_extension_type(&data)?;
@@ -148,8 +191,9 @@ pub fn parse_session_file_typed_with_mode<P: AsRef<Path>>(
 ///
 /// # Errors
 ///
-/// Returns an error if the file cannot be opened or read. No detection error
-/// is possible — `provider` is supplied by the caller. Empty input resolves
+/// Returns an error if the file cannot be opened or read, if no record in a
+/// nonempty source has a recognized schema for `provider`, or if every
+/// analyzer-relevant payload uses an unsupported schema. Empty input resolves
 /// to an empty [`CodeAnalysis`].
 ///
 /// # Examples
@@ -174,9 +218,18 @@ pub fn parse_session_file_as<P: AsRef<Path>>(
     mode: ParseMode,
 ) -> Result<CodeAnalysis> {
     let path = path.as_ref();
+    let parsed = parse_session_file_as_with_diagnostics(path, provider, mode)?;
+    validate_parsed_source(path, &parsed.diagnostics)?;
+    Ok(parsed.analysis)
+}
 
-    if let Some(analysis) = stream_parse_known(path, provider, mode)? {
-        return Ok(analysis);
+pub(crate) fn parse_session_file_as_with_diagnostics(
+    path: &Path,
+    provider: ExtensionType,
+    mode: ParseMode,
+) -> Result<ParsedAnalysis> {
+    if let Some(parsed) = stream_parse_known(path, provider, mode)? {
+        return Ok(parsed);
     }
 
     // Fallback for empty files or anything the streaming peek could not
@@ -187,7 +240,7 @@ pub fn parse_session_file_as<P: AsRef<Path>>(
     };
 
     if data.is_empty() {
-        return Ok(empty_analysis());
+        return Ok(empty_parsed_analysis());
     }
 
     dispatch_by_vec(data, provider, mode)
@@ -212,7 +265,7 @@ fn stream_parse_known(
     path: &Path,
     provider: ExtensionType,
     mode: ParseMode,
-) -> Result<Option<CodeAnalysis>> {
+) -> Result<Option<ParsedAnalysis>> {
     let file =
         File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
     let mut reader = BufReader::with_capacity(buffer::FILE_READ_BUFFER, file);
@@ -227,8 +280,14 @@ fn stream_parse_known(
         Err(_) => return Ok(None), // not JSONL → caller falls back to read_json
     };
 
-    let analysis = dispatch_streaming_buffered(provider, vec![first_value], reader, mode)?;
-    Ok(Some(finalize(analysis, provider)))
+    let parsed = dispatch_streaming_buffered(
+        provider,
+        vec![first_value],
+        reader,
+        mode,
+        ParseDiagnostics::default(),
+    )?;
+    Ok(Some(finalize(parsed, provider)))
 }
 
 /// Streaming path when the provider is unknown.
@@ -256,7 +315,7 @@ fn stream_parse_known(
 ///
 /// Returns an error if the file cannot be opened or a line cannot be read, or
 /// if the resolved provider's dispatch step fails.
-fn stream_parse_autodetect(path: &Path, mode: ParseMode) -> Result<Option<CodeAnalysis>> {
+fn stream_parse_autodetect(path: &Path, mode: ParseMode) -> Result<Option<ParsedAnalysis>> {
     let file =
         File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
     let mut reader = BufReader::with_capacity(buffer::FILE_READ_BUFFER, file);
@@ -264,6 +323,7 @@ fn stream_parse_autodetect(path: &Path, mode: ParseMode) -> Result<Option<CodeAn
     let mut buffered: Vec<Value> = Vec::with_capacity(8);
     let mut first_line_was_json = None::<bool>;
     let mut ext: Option<ExtensionType> = None;
+    let mut initial_diagnostics = ParseDiagnostics::default();
 
     loop {
         let line = match read_next_non_empty_line(&mut reader)? {
@@ -283,7 +343,7 @@ fn stream_parse_autodetect(path: &Path, mode: ParseMode) -> Result<Option<CodeAn
                     break;
                 }
             }
-            Err(_) => {
+            Err(err) => {
                 // A non-JSON line on the very first record means the file
                 // is a pretty-printed single-object dump (Copilot legacy
                 // shape or similar); let the caller fall through to
@@ -292,8 +352,15 @@ fn stream_parse_autodetect(path: &Path, mode: ParseMode) -> Result<Option<CodeAn
                 // dispatcher decide.
                 if buffered.is_empty() {
                     first_line_was_json = Some(false);
+                    break;
                 }
-                break;
+                log::warn!(
+                    "skipping malformed JSONL record while detecting provider: {} at line {} column {}",
+                    json_error_category(&err),
+                    err.line(),
+                    err.column()
+                );
+                initial_diagnostics.record_malformed();
             }
         }
     }
@@ -310,8 +377,8 @@ fn stream_parse_autodetect(path: &Path, mode: ParseMode) -> Result<Option<CodeAn
     // back to Codex — a JSONL file with no Claude / Gemini / Copilot
     // markers is almost certainly a Codex log (or a synthetic fixture).
     let ext = ext.unwrap_or(ExtensionType::Codex);
-    let analysis = dispatch_streaming_buffered(ext, buffered, reader, mode)?;
-    Ok(Some(finalize(analysis, ext)))
+    let parsed = dispatch_streaming_buffered(ext, buffered, reader, mode, initial_diagnostics)?;
+    Ok(Some(finalize(parsed, ext)))
 }
 
 /// Reads lines from `reader` until it finds a non-empty one. Returns `Ok(None)`
@@ -347,39 +414,38 @@ fn dispatch_streaming_buffered(
     buffered: Vec<Value>,
     mut reader: BufReader<File>,
     mode: ParseMode,
-) -> Result<CodeAnalysis> {
+    initial_diagnostics: ParseDiagnostics,
+) -> Result<ParsedAnalysis> {
+    let extra_diagnostics = Rc::new(RefCell::new(initial_diagnostics));
     match ext {
         ExtensionType::ClaudeCode => {
-            // Match the legacy `filter_map(..., Ok).ok()` behaviour: skip a
-            // malformed record instead of failing the whole file.
-            let buffered_iter = buffered
-                .into_iter()
-                .filter_map(|v| serde_json::from_value::<ClaudeCodeLog>(v).ok());
-            let rest = iter_jsonl_typed::<ClaudeCodeLog>(&mut reader);
-            parse_claude_logs(buffered_iter.chain(rest), mode)
+            let rest = iter_jsonl_values(&mut reader, Rc::clone(&extra_diagnostics));
+            let logs = buffered.into_iter().chain(rest).filter_map(|value| {
+                deserialize_record::<ClaudeCodeLog>(value, ext, &extra_diagnostics)
+            });
+            let parsed = parse_claude_logs_with_diagnostics(logs, mode)?;
+            Ok(merge_extra_diagnostics(parsed, &extra_diagnostics))
         }
         ExtensionType::Codex => {
-            let mut logs: Vec<CodexLog> = Vec::with_capacity(64);
-            for v in buffered {
-                if let Ok(log) = serde_json::from_value::<CodexLog>(v) {
-                    logs.push(log);
-                }
-            }
-            for log in iter_jsonl_typed::<CodexLog>(&mut reader) {
-                logs.push(log);
-            }
-            parse_codex_logs(&logs, mode)
+            let rest = iter_jsonl_values(&mut reader, Rc::clone(&extra_diagnostics));
+            let logs = buffered
+                .into_iter()
+                .chain(rest)
+                .filter_map(|value| deserialize_record::<CodexLog>(value, ext, &extra_diagnostics));
+            let parsed = parse_codex_log_iter_with_diagnostics(logs, mode)?;
+            Ok(merge_extra_diagnostics(parsed, &extra_diagnostics))
         }
         ExtensionType::Copilot => {
             // Copilot CLI emits one event per line under
             // `session-state/<uuid>/events.jsonl`. The streaming path sees
             // this as a sequence of parseable `Value`s whose very first
             // line is `type == "session.start"`.
-            let buffered_events = buffered
-                .into_iter()
-                .filter_map(|v| serde_json::from_value::<CopilotEvent>(v).ok());
-            let rest_events = iter_jsonl_typed::<CopilotEvent>(&mut reader);
-            parse_copilot_events(buffered_events.chain(rest_events), mode)
+            let rest = iter_jsonl_values(&mut reader, Rc::clone(&extra_diagnostics));
+            let events = buffered.into_iter().chain(rest).filter_map(|value| {
+                deserialize_record::<CopilotEvent>(value, ext, &extra_diagnostics)
+            });
+            let parsed = parse_copilot_events_with_diagnostics(events, mode)?;
+            Ok(merge_extra_diagnostics(parsed, &extra_diagnostics))
         }
         ExtensionType::Gemini => {
             // Gemini sessions are line-delimited event streams: the first
@@ -394,19 +460,30 @@ fn dispatch_streaming_buffered(
             let session: GeminiSession =
                 serde_json::from_value(first).context("Failed to parse Gemini session")?;
 
-            let rest_events = iter_jsonl_values(&mut reader);
-            parse_gemini_events(session, iter.chain(rest_events), mode)
+            let rest_events = iter_jsonl_values(&mut reader, Rc::clone(&extra_diagnostics));
+            let parsed =
+                parse_gemini_events_with_diagnostics(session, iter.chain(rest_events), mode)?;
+            Ok(merge_extra_diagnostics(parsed, &extra_diagnostics))
         }
         // OpenCode stores sessions in a SQLite database, not a JSONL file, so
         // it never flows through the file parser. See `session::opencode`.
-        ExtensionType::OpenCode => Ok(empty_analysis()),
+        ExtensionType::OpenCode => Ok(empty_parsed_analysis()),
         // Cursor sessions live in per-conversation SQLite blob stores (analysis)
         // and its billing tokens come from an API (usage), never a JSONL file.
         // See `session::cursor`.
-        ExtensionType::Cursor => Ok(empty_analysis()),
+        ExtensionType::Cursor => Ok(empty_parsed_analysis()),
         // Hermes stores usage in a single SQLite database, not a JSONL file, so
         // it never flows through the file parser. See `session::hermes`.
-        ExtensionType::Hermes => Ok(empty_analysis()),
+        ExtensionType::Hermes => Ok(empty_parsed_analysis()),
+    }
+}
+
+fn json_error_category(error: &serde_json::Error) -> &'static str {
+    match error.classify() {
+        serde_json::error::Category::Io => "I/O error",
+        serde_json::error::Category::Syntax => "syntax error",
+        serde_json::error::Category::Data => "data error",
+        serde_json::error::Category::Eof => "unexpected EOF",
     }
 }
 
@@ -415,32 +492,191 @@ fn dispatch_streaming_buffered(
 /// Used by parsers (Gemini / Copilot) that need to dispatch per-event on a
 /// runtime-typed shape before committing to a strongly-typed struct, since
 /// different event types carry completely different payloads.
-fn iter_jsonl_values<'a>(reader: &'a mut BufReader<File>) -> impl Iterator<Item = Value> + 'a {
-    reader.lines().filter_map(|line| {
-        let line = line.ok()?;
+fn iter_jsonl_values<'a>(
+    reader: &'a mut BufReader<File>,
+    diagnostics: Rc<RefCell<ParseDiagnostics>>,
+) -> impl Iterator<Item = Value> + 'a {
+    reader.lines().enumerate().filter_map(move |(index, line)| {
+        let line = match line {
+            Ok(line) => line,
+            Err(err) => {
+                log::warn!(
+                    "skipping unreadable JSONL record at streamed line {}: {err}",
+                    index + 1
+                );
+                diagnostics.borrow_mut().record_malformed();
+                return None;
+            }
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             return None;
         }
-        serde_json::from_str::<Value>(trimmed).ok()
+        match serde_json::from_str::<Value>(trimmed) {
+            Ok(value) => Some(value),
+            Err(err) => {
+                log::warn!(
+                    "skipping malformed JSONL record at streamed line {}: {} at line {} column {}",
+                    index + 1,
+                    json_error_category(&err),
+                    err.line(),
+                    err.column()
+                );
+                diagnostics.borrow_mut().record_malformed();
+                None
+            }
+        }
     })
 }
 
-/// Iterator that yields `T` values, one per non-empty line in the reader.
-/// Lines that fail to deserialise into `T` are silently skipped, matching the
-/// legacy `from_value(...).ok()` behaviour the parsers already tolerate.
-fn iter_jsonl_typed<'a, T>(reader: &'a mut BufReader<File>) -> impl Iterator<Item = T> + 'a
+fn deserialize_record<T>(
+    value: Value,
+    provider: ExtensionType,
+    diagnostics: &Rc<RefCell<ParseDiagnostics>>,
+) -> Option<T>
 where
-    T: serde::de::DeserializeOwned + 'a,
+    T: serde::de::DeserializeOwned,
 {
-    reader.lines().filter_map(|line| {
-        let line = line.ok()?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            return None;
+    let record_kind = raw_record_kind(provider, &value);
+    match serde_json::from_value::<T>(value) {
+        Ok(record) => Some(record),
+        Err(_) => {
+            let (recognized, relevant) = record_kind;
+            let mut diagnostics = diagnostics.borrow_mut();
+            if recognized {
+                diagnostics.record_recognized_source();
+                if relevant {
+                    diagnostics.record_relevant(false);
+                }
+            } else {
+                diagnostics.record_unrecognized();
+            }
+            log::warn!("skipping {provider} record with unsupported top-level schema");
+            None
         }
-        serde_json::from_str::<T>(trimmed).ok()
-    })
+    }
+}
+
+fn raw_record_kind(provider: ExtensionType, value: &Value) -> (bool, bool) {
+    let record_type = value.get("type").and_then(Value::as_str);
+    match provider {
+        ExtensionType::ClaudeCode => {
+            let recognized = matches!(
+                record_type,
+                Some(
+                    "assistant"
+                        | "user"
+                        | "system"
+                        | "summary"
+                        | "progress"
+                        | "file-history-snapshot"
+                        | "queue-operation"
+                        | "attachment"
+                        | "bridge-session"
+                        | "permission-mode"
+                        | "mode"
+                        | "last-prompt"
+                        | "ai-title"
+                        | "agent-name"
+                        | "pr-link"
+                        | "started"
+                        | "result"
+                        | "agent-setting"
+                        | "frame-link"
+                )
+            ) || value.get("toolUseResult").is_some();
+            let user_tool_result = record_type == Some("user")
+                && value
+                    .pointer("/message/content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| {
+                        items.iter().any(|item| {
+                            item.get("type").and_then(Value::as_str) == Some("tool_result")
+                        })
+                    });
+            let relevant = record_type == Some("assistant")
+                || value.get("toolUseResult").is_some()
+                || user_tool_result;
+            (recognized, relevant)
+        }
+        ExtensionType::Codex => {
+            let recognized = matches!(
+                record_type,
+                Some(
+                    "session_meta"
+                        | "turn_context"
+                        | "event_msg"
+                        | "response_item"
+                        | "inter_agent_communication_metadata"
+                        | "world_state"
+                        | "compacted"
+                )
+            );
+            let payload_type = value.pointer("/payload/type");
+            let relevant = match record_type {
+                Some("event_msg") => payload_type
+                    .is_some_and(|kind| kind.as_str() == Some("token_count") || !kind.is_string()),
+                Some("response_item") => payload_type.is_some_and(|kind| {
+                    matches!(
+                        kind.as_str(),
+                        Some(
+                            "function_call"
+                                | "function_call_output"
+                                | "custom_tool_call"
+                                | "custom_tool_call_output"
+                        )
+                    ) || !kind.is_string()
+                }),
+                _ => false,
+            };
+            (recognized, relevant)
+        }
+        ExtensionType::Copilot => {
+            let recognized = matches!(
+                record_type,
+                Some(
+                    "session.start"
+                        | "session.model_change"
+                        | "session.task_complete"
+                        | "session.shutdown"
+                        | "session.info"
+                        | "session.mode_changed"
+                        | "system.message"
+                        | "user.message"
+                        | "assistant.message"
+                        | "assistant.turn_start"
+                        | "assistant.turn_end"
+                        | "tool.execution_start"
+                        | "tool.execution_complete"
+                        | "hook.start"
+                        | "hook.end"
+                        | "abort"
+                        | "subagent.started"
+                        | "subagent.completed"
+                        | "system.notification"
+                        | "session.resume"
+                )
+            );
+            let relevant = matches!(
+                record_type,
+                Some("session.shutdown" | "tool.execution_start" | "tool.execution_complete")
+            ) || (record_type == Some("assistant.message")
+                && value.pointer("/data/outputTokens").is_some());
+            (recognized, relevant)
+        }
+        ExtensionType::Gemini
+        | ExtensionType::OpenCode
+        | ExtensionType::Cursor
+        | ExtensionType::Hermes => (false, false),
+    }
+}
+
+fn merge_extra_diagnostics(
+    mut parsed: ParsedAnalysis,
+    extra: &Rc<RefCell<ParseDiagnostics>>,
+) -> ParsedAnalysis {
+    parsed.diagnostics.merge(*extra.borrow());
+    parsed
 }
 
 /// Legacy dispatch used by the pretty-printed JSON fallback. Operates on an
@@ -450,18 +686,28 @@ fn dispatch_by_vec(
     data: Vec<Value>,
     ext_type: ExtensionType,
     mode: ParseMode,
-) -> Result<CodeAnalysis> {
-    let analysis = match ext_type {
-        ExtensionType::ClaudeCode => parse_claude_log_values(data, mode)?,
-        ExtensionType::Codex => {
-            let logs: Vec<CodexLog> = data
-                .into_iter()
-                .filter_map(|v| serde_json::from_value(v).ok())
-                .collect();
-            parse_codex_logs(&logs, mode)?
+) -> Result<ParsedAnalysis> {
+    let extra_diagnostics = Rc::new(RefCell::new(ParseDiagnostics::default()));
+    let parsed = match ext_type {
+        ExtensionType::ClaudeCode => {
+            let logs = data.into_iter().filter_map(|value| {
+                deserialize_record::<ClaudeCodeLog>(value, ext_type, &extra_diagnostics)
+            });
+            parse_claude_logs_with_diagnostics(logs, mode)?
         }
-        ExtensionType::Copilot
-        | ExtensionType::Gemini
+        ExtensionType::Codex => {
+            let logs = data.into_iter().filter_map(|value| {
+                deserialize_record::<CodexLog>(value, ext_type, &extra_diagnostics)
+            });
+            parse_codex_log_iter_with_diagnostics(logs, mode)?
+        }
+        ExtensionType::Copilot => {
+            let events = data.into_iter().filter_map(|value| {
+                deserialize_record::<CopilotEvent>(value, ext_type, &extra_diagnostics)
+            });
+            parse_copilot_events_with_diagnostics(events, mode)?
+        }
+        ExtensionType::Gemini
         | ExtensionType::OpenCode
         | ExtensionType::Cursor
         | ExtensionType::Hermes => {
@@ -471,10 +717,17 @@ fn dispatch_by_vec(
             // falls through to this branch (e.g. a stray pretty-printed export)
             // has no parser for its shape — return an empty analysis instead of
             // silently mis-parsing.
-            empty_analysis()
+            let mut diagnostics = ParseDiagnostics::default();
+            for _ in data {
+                diagnostics.record_unrecognized();
+            }
+            ParsedAnalysis::new(empty_analysis(), diagnostics)
         }
     };
-    Ok(finalize(analysis, ext_type))
+    Ok(finalize(
+        merge_extra_diagnostics(parsed, &extra_diagnostics),
+        ext_type,
+    ))
 }
 
 fn empty_analysis() -> CodeAnalysis {
@@ -487,11 +740,35 @@ fn empty_analysis() -> CodeAnalysis {
     }
 }
 
+fn empty_parsed_analysis() -> ParsedAnalysis {
+    ParsedAnalysis::new(empty_analysis(), ParseDiagnostics::default())
+}
+
 /// Attaches runtime metadata (user, machine, version) expected in the output.
-fn finalize(mut analysis: CodeAnalysis, ext_type: ExtensionType) -> CodeAnalysis {
-    analysis.user = get_current_user();
-    analysis.extension_name = ext_type.to_string();
-    analysis.machine_id = get_machine_id().to_string();
-    analysis.insights_version = VERSION.to_string();
-    analysis
+fn finalize(mut parsed: ParsedAnalysis, ext_type: ExtensionType) -> ParsedAnalysis {
+    parsed.analysis.user = get_current_user();
+    parsed.analysis.extension_name = ext_type.to_string();
+    parsed.analysis.machine_id = get_machine_id().to_string();
+    parsed.analysis.insights_version = VERSION.to_string();
+    parsed
+}
+
+fn validate_parsed_source(path: &Path, diagnostics: &ParseDiagnostics) -> Result<()> {
+    if diagnostics.source_records == 0 {
+        return Ok(());
+    }
+    if diagnostics.recognized_records == 0 {
+        bail!(
+            "session file {} contained no recognized provider records",
+            path.display()
+        );
+    }
+    if diagnostics.relevant_records > 0 && diagnostics.normalized_records == 0 {
+        bail!(
+            "session file {} contained {} analyzer-relevant provider records, but none used a supported schema",
+            path.display(),
+            diagnostics.relevant_records
+        );
+    }
+    Ok(())
 }

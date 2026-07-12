@@ -53,7 +53,7 @@ pub struct SessionParseState {
     pub run_details: Vec<CodeAnalysisRunCommandDetail>,
     /// Running per-tool call counts (always tallied, both modes).
     pub tool_counts: CodeAnalysisToolCalls,
-    /// Distinct normalized file paths touched (only populated in [`ParseMode::Full`]).
+    /// Distinct normalized file paths touched (populated in both parse modes).
     pub unique_files: HashSet<String>,
     /// Sum of lines written across all `Write` operations.
     pub total_write_lines: usize,
@@ -97,9 +97,9 @@ impl SessionParseState {
 
     /// Creates an empty parse state with the given detail-retention `mode`.
     ///
-    /// In [`ParseMode::Full`] the detail `Vec`s and `unique_files` set are
-    /// pre-sized to typical session sizes; in [`ParseMode::UsageOnly`] they
-    /// start empty since they stay empty for the whole parse.
+    /// In [`ParseMode::Full`] the detail `Vec`s are pre-sized to typical session
+    /// sizes. `unique_files` is pre-sized in both modes because
+    /// `total_unique_files` is a scalar total that must stay exact.
     pub fn with_mode(mode: ParseMode) -> Self {
         // Pre-allocate Vecs with reasonable capacity estimates based on
         // typical session sizes. In `UsageOnly` mode we skip the
@@ -128,7 +128,7 @@ impl SessionParseState {
                 Vec::new()
             },
             tool_counts: CodeAnalysisToolCalls::default(),
-            unique_files: HashSet::with_capacity(if pre { 20 } else { 0 }),
+            unique_files: HashSet::with_capacity(20),
             total_write_lines: 0,
             total_read_lines: 0,
             total_edit_lines: 0,
@@ -146,8 +146,8 @@ impl SessionParseState {
     ///
     /// Trailing newlines are stripped before counting. No-op (and no count
     /// bump) when the trimmed content is empty or when `path` normalizes to
-    /// an empty string. The detail record and `unique_files` entry are only
-    /// stored in [`ParseMode::Full`]; counts accrue in both modes.
+    /// an empty string. The detail record is only stored in
+    /// [`ParseMode::Full`]; counts and unique-file tracking accrue in both modes.
     pub fn add_read_detail(&mut self, path: &str, content: &str, ts: i64) {
         let trimmed = content.trim_end_matches('\n');
         let line_count = count_lines(trimmed);
@@ -172,20 +172,28 @@ impl SessionParseState {
                     timestamp: ts,
                 },
             });
-            self.unique_files.insert(resolved);
         }
+        self.unique_files.insert(resolved);
 
         self.total_read_lines += line_count;
         self.total_read_characters += char_count;
         self.tool_counts.read += 1;
     }
 
+    /// Records the path of a successful non-text read without inventing lines.
+    pub(crate) fn add_non_text_read_path(&mut self, path: &str) {
+        let resolved = self.normalize_path(path);
+        if !resolved.is_empty() {
+            self.unique_files.insert(resolved);
+        }
+    }
+
     /// Records a `Write` operation against `path` with the written `content`.
     ///
     /// Trailing newlines are stripped before counting. No-op when `path`
     /// normalizes to an empty string (an empty body is still counted as a
-    /// zero-line write). The full detail (including `content`) and
-    /// `unique_files` entry are stored only in [`ParseMode::Full`].
+    /// zero-line write). The full detail (including `content`) is stored only in
+    /// [`ParseMode::Full`]; unique-file tracking remains active in both modes.
     pub fn add_write_detail(&mut self, path: &str, content: &str, ts: i64) {
         let trimmed = content.trim_end_matches('\n');
         let line_count = count_lines(trimmed);
@@ -206,8 +214,8 @@ impl SessionParseState {
                 },
                 content: trimmed.to_string(),
             });
-            self.unique_files.insert(resolved);
         }
+        self.unique_files.insert(resolved);
 
         self.total_write_lines += line_count;
         self.total_write_characters += char_count;
@@ -260,8 +268,8 @@ impl SessionParseState {
                 old_string: trimmed_old.to_string(),
                 new_string: trimmed_new.to_string(),
             });
-            self.unique_files.insert(resolved);
         }
+        self.unique_files.insert(resolved);
 
         self.total_edit_lines += line_count;
         self.total_edit_characters += char_count;
@@ -319,6 +327,45 @@ impl SessionParseState {
             .join(path)
             .to_string_lossy()
             .to_string()
+    }
+
+    /// Merges another accumulator created with the same parse mode.
+    ///
+    /// This is used when a provider must deduplicate message revisions before
+    /// producing one session record. Detail vectors remain empty in
+    /// [`ParseMode::UsageOnly`], while scalar totals and unique paths are
+    /// combined in both modes.
+    pub fn merge(&mut self, mut other: Self) {
+        debug_assert_eq!(self.mode, other.mode);
+        self.write_details.append(&mut other.write_details);
+        self.read_details.append(&mut other.read_details);
+        self.edit_details.append(&mut other.edit_details);
+        self.run_details.append(&mut other.run_details);
+
+        self.tool_counts.read += other.tool_counts.read;
+        self.tool_counts.write += other.tool_counts.write;
+        self.tool_counts.edit += other.tool_counts.edit;
+        self.tool_counts.todo_write += other.tool_counts.todo_write;
+        self.tool_counts.bash += other.tool_counts.bash;
+        self.unique_files.extend(other.unique_files);
+
+        self.total_write_lines += other.total_write_lines;
+        self.total_read_lines += other.total_read_lines;
+        self.total_edit_lines += other.total_edit_lines;
+        self.total_write_characters += other.total_write_characters;
+        self.total_read_characters += other.total_read_characters;
+        self.total_edit_characters += other.total_edit_characters;
+        self.last_ts = self.last_ts.max(other.last_ts);
+
+        if self.folder_path.is_empty() {
+            self.folder_path = other.folder_path;
+        }
+        if self.git_remote.is_empty() {
+            self.git_remote = other.git_remote;
+        }
+        if self.task_id.is_empty() {
+            self.task_id = other.task_id;
+        }
     }
 
     /// Consumes the state into a finished [`CodeAnalysisRecord`].

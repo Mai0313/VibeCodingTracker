@@ -23,6 +23,7 @@ use crate::VERSION;
 use crate::cli::TimeRange;
 use crate::constants::FastHashMap;
 use crate::models::{CodeAnalysis, CodeAnalysisRecord, ExtensionType};
+use crate::session::diagnostics::DatabaseAnalysisRow;
 use crate::session::state::{ParseMode, SessionParseState};
 use crate::utils::{get_current_user, get_machine_id};
 use anyhow::{Context, Result, anyhow};
@@ -57,7 +58,9 @@ pub fn read_opencode_usage(
 /// the `part` table into `tool_call_counts` and the `total_*` line/character
 /// counts. `mode` controls whether the heavy per-operation detail bodies are
 /// retained ([`ParseMode::Full`]) or skipped ([`ParseMode::UsageOnly`]); the
-/// aggregated `analysis` view uses `UsageOnly`.
+/// aggregated `analysis` view uses `UsageOnly`. Message/session metadata and
+/// tool parts are read inside one transaction so a concurrent OpenCode commit
+/// cannot split the result across two SQLite snapshots.
 ///
 /// # Errors
 ///
@@ -67,7 +70,61 @@ pub fn read_opencode_analysis(
     time_range: TimeRange,
     mode: ParseMode,
 ) -> Result<Vec<(String, CodeAnalysis)>> {
-    with_connection(db_path, |conn| collect_analysis(conn, time_range, mode))
+    let result = read_opencode_analysis_with_diagnostics(db_path, time_range, mode)?;
+    if result.expected_records > 0 && result.parsed_records == 0 {
+        return Err(anyhow!(
+            "none of {} OpenCode analysis records used a recognized schema",
+            result.expected_records
+        ));
+    }
+    let failed_records = result
+        .expected_records
+        .saturating_sub(result.parsed_records)
+        + result.failed_tool_parts;
+    if failed_records > 0 {
+        log::warn!(
+            "skipped {} OpenCode analysis records with unsupported schema",
+            failed_records
+        );
+    }
+    Ok(result
+        .rows
+        .into_iter()
+        .map(|row| (row.date, row.analysis))
+        .collect())
+}
+
+/// OpenCode rows plus record-recognition diagnostics for batch collection.
+pub(crate) struct OpenCodeAnalysisRead {
+    /// Successfully normalized assistant/session rows.
+    pub rows: Vec<DatabaseAnalysisRow>,
+    /// Rows selected by the provider's current role/time predicates.
+    pub expected_records: usize,
+    /// Selected rows that produced a normalized `CodeAnalysis`.
+    pub parsed_records: usize,
+    /// Completed known tool parts with unsupported analyzer fields.
+    pub failed_tool_parts: usize,
+}
+
+/// Reads OpenCode analysis while retaining unsupported-record counts.
+pub(crate) fn read_opencode_analysis_with_diagnostics(
+    db_path: &Path,
+    time_range: TimeRange,
+    mode: ParseMode,
+) -> Result<OpenCodeAnalysisRead> {
+    with_connection(db_path, |conn| {
+        let transaction = conn.unchecked_transaction()?;
+        let expected_records = count_analysis_candidates(&transaction, time_range)?;
+        let collected = collect_analysis(&transaction, time_range, mode)?;
+        let parsed_records = collected.rows.len();
+        transaction.commit()?;
+        Ok(OpenCodeAnalysisRead {
+            rows: collected.rows,
+            expected_records,
+            parsed_records,
+            failed_tool_parts: collected.failed_tool_parts,
+        })
+    })
 }
 
 /// Parsed usage for one OpenCode assistant message.
@@ -84,6 +141,54 @@ struct AnalysisAccum {
     date: String,
     usage: Value,
     state: SessionParseState,
+}
+
+struct CollectedAnalysis {
+    rows: Vec<DatabaseAnalysisRow>,
+    failed_tool_parts: usize,
+}
+
+/// Counts rows that should be understood by the current analysis reader.
+fn count_analysis_candidates(conn: &Connection, time_range: TimeRange) -> Result<usize> {
+    let cutoff_ms = cutoff_millis(time_range);
+    let (sql, parameterized) = if table_exists(conn, "message")? {
+        match cutoff_ms {
+            Some(_) => (
+                "SELECT COUNT(*) FROM message \
+                 JOIN session ON session.id = message.session_id \
+                 WHERE json_extract(message.data, '$.role') = 'assistant' \
+                   AND COALESCE( \
+                       json_extract(message.data, '$.time.completed'), \
+                       json_extract(message.data, '$.time.created'), \
+                       session.time_updated \
+                   ) >= ?1",
+                true,
+            ),
+            None => (
+                "SELECT COUNT(*) FROM message \
+                 WHERE json_extract(message.data, '$.role') = 'assistant'",
+                false,
+            ),
+        }
+    } else {
+        match cutoff_ms {
+            Some(_) => (
+                "SELECT COUNT(*) FROM session \
+                 WHERE model IS NOT NULL AND model != '' AND time_updated >= ?1",
+                true,
+            ),
+            None => (
+                "SELECT COUNT(*) FROM session WHERE model IS NOT NULL AND model != ''",
+                false,
+            ),
+        }
+    };
+    let count: i64 = if parameterized {
+        conn.query_row(sql, [cutoff_ms.unwrap_or_default()], |row| row.get(0))?
+    } else {
+        conn.query_row(sql, [], |row| row.get(0))?
+    };
+    Ok(usize::try_from(count).unwrap_or_default())
 }
 
 /// Collects the `usage` view from assistant messages when available.
@@ -232,7 +337,7 @@ fn collect_analysis(
     conn: &Connection,
     time_range: TimeRange,
     mode: ParseMode,
-) -> Result<Vec<(String, CodeAnalysis)>> {
+) -> Result<CollectedAnalysis> {
     if table_exists(conn, "message")? {
         return collect_message_analysis(conn, time_range, mode);
     }
@@ -245,7 +350,7 @@ fn collect_session_analysis(
     conn: &Connection,
     time_range: TimeRange,
     mode: ParseMode,
-) -> Result<Vec<(String, CodeAnalysis)>> {
+) -> Result<CollectedAnalysis> {
     let user = get_current_user();
     let machine = get_machine_id().to_string();
     let cutoff = cutoff_string(time_range);
@@ -309,6 +414,7 @@ fn collect_session_analysis(
     }
 
     // 2. Fold tool parts into their owning session's parse state.
+    let mut failed_tool_parts = 0usize;
     {
         let sql = match cutoff_ms {
             Some(_) => {
@@ -318,12 +424,14 @@ fn collect_session_analysis(
                  WHERE json_extract(part.data, '$.type') = 'tool' \
                    AND session.model IS NOT NULL \
                    AND session.model != '' \
-                   AND session.time_updated >= ?1"
+                   AND session.time_updated >= ?1 \
+                 ORDER BY part.id"
             }
             None => {
                 "SELECT session_id, data \
                  FROM part \
-                 WHERE json_extract(data, '$.type') = 'tool'"
+                 WHERE json_extract(data, '$.type') = 'tool' \
+                 ORDER BY id"
             }
         };
         let mut stmt = conn.prepare(sql)?;
@@ -339,27 +447,37 @@ fn collect_session_analysis(
                 continue;
             };
             let Ok(data) = serde_json::from_str::<Value>(&data_text) else {
+                failed_tool_parts += 1;
                 continue;
             };
-            if let Some("tool") = data.get("type").and_then(|v| v.as_str()) {
-                apply_tool_part(&mut accum.state, &data)
+            if let Some("tool") = data.get("type").and_then(|v| v.as_str())
+                && apply_tool_part(&mut accum.state, &data) == ToolPartOutcome::Unsupported
+            {
+                failed_tool_parts += 1;
             }
         }
     }
 
     // 3. Convert each session into a CodeAnalysis, honouring the time filter.
     let mut out = Vec::with_capacity(sessions.len());
-    for (_id, accum) in sessions {
+    for (id, accum) in sessions {
         if is_before_cutoff(&accum.date, &cutoff) {
             continue;
         }
         let mut usage_map = FastHashMap::default();
         usage_map.insert(accum.model_id, accum.usage);
         let record = accum.state.into_record(usage_map);
-        out.push((accum.date, wrap_record(record, &user, &machine)));
+        out.push(DatabaseAnalysisRow {
+            source_id: id,
+            date: accum.date,
+            analysis: wrap_record(record, &user, &machine),
+        });
     }
 
-    Ok(out)
+    Ok(CollectedAnalysis {
+        rows: out,
+        failed_tool_parts,
+    })
 }
 
 /// Collects the `analysis` view from assistant messages and their parts.
@@ -367,7 +485,7 @@ fn collect_message_analysis(
     conn: &Connection,
     time_range: TimeRange,
     mode: ParseMode,
-) -> Result<Vec<(String, CodeAnalysis)>> {
+) -> Result<CollectedAnalysis> {
     let user = get_current_user();
     let machine = get_machine_id().to_string();
     let cutoff = cutoff_string(time_range);
@@ -434,6 +552,7 @@ fn collect_message_analysis(
         }
     }
 
+    let mut failed_tool_parts = 0usize;
     {
         let sql = match cutoff_ms {
             Some(_) => {
@@ -447,14 +566,16 @@ fn collect_message_analysis(
                        json_extract(message.data, '$.time.completed'), \
                        json_extract(message.data, '$.time.created'), \
                        session.time_updated \
-                   ) >= ?1"
+                   ) >= ?1 \
+                 ORDER BY part.id"
             }
             None => {
                 "SELECT part.message_id, part.data \
                  FROM part \
                  JOIN message ON message.id = part.message_id \
                  WHERE json_extract(message.data, '$.role') = 'assistant' \
-                   AND json_extract(part.data, '$.type') = 'tool'"
+                   AND json_extract(part.data, '$.type') = 'tool' \
+                 ORDER BY part.id"
             }
         };
         let mut stmt = conn.prepare(sql)?;
@@ -470,26 +591,36 @@ fn collect_message_analysis(
                 continue;
             };
             let Ok(data) = serde_json::from_str::<Value>(&data_text) else {
+                failed_tool_parts += 1;
                 continue;
             };
-            if let Some("tool") = data.get("type").and_then(|v| v.as_str()) {
-                apply_tool_part(&mut accum.state, &data)
+            if let Some("tool") = data.get("type").and_then(|v| v.as_str())
+                && apply_tool_part(&mut accum.state, &data) == ToolPartOutcome::Unsupported
+            {
+                failed_tool_parts += 1;
             }
         }
     }
 
     let mut out = Vec::with_capacity(messages.len());
-    for (_id, accum) in messages {
+    for (id, accum) in messages {
         if is_before_cutoff(&accum.date, &cutoff) {
             continue;
         }
         let mut usage_map = FastHashMap::default();
         usage_map.insert(accum.model_id, accum.usage);
         let record = accum.state.into_record(usage_map);
-        out.push((accum.date, wrap_record(record, &user, &machine)));
+        out.push(DatabaseAnalysisRow {
+            source_id: id,
+            date: accum.date,
+            analysis: wrap_record(record, &user, &machine),
+        });
     }
 
-    Ok(out)
+    Ok(CollectedAnalysis {
+        rows: out,
+        failed_tool_parts,
+    })
 }
 
 /// Dispatches a single `part` (type `tool`) onto the session parse state.
@@ -498,35 +629,53 @@ fn collect_message_analysis(
 /// (`read`, `edit`, `write`, `bash`, `todowrite`, `apply_patch`); auxiliary
 /// tools such as `task`, `grep`, `glob`, `webfetch`, and `question` are ignored
 /// to stay consistent with the other providers' tool-count semantics.
-fn apply_tool_part(state: &mut SessionParseState, data: &Value) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToolPartOutcome {
+    Irrelevant,
+    Normalized,
+    Unsupported,
+}
+
+fn apply_tool_part(state: &mut SessionParseState, data: &Value) -> ToolPartOutcome {
     let tool = data.get("tool").and_then(|v| v.as_str()).unwrap_or("");
-    let st = data.get("state");
-    if st.and_then(|s| s.get("status")).and_then(|v| v.as_str()) != Some("completed") {
-        return;
+    if !matches!(
+        tool,
+        "read" | "edit" | "write" | "bash" | "todowrite" | "apply_patch"
+    ) {
+        return ToolPartOutcome::Irrelevant;
     }
-    let input = st.and_then(|s| s.get("input"));
+
+    let Some(st) = data.get("state").and_then(Value::as_object) else {
+        return ToolPartOutcome::Unsupported;
+    };
+    let Some(status) = st.get("status").and_then(Value::as_str) else {
+        return ToolPartOutcome::Unsupported;
+    };
+    match status {
+        "completed" => {}
+        "pending" | "running" | "error" => return ToolPartOutcome::Irrelevant,
+        _ => return ToolPartOutcome::Unsupported,
+    }
+
+    let input = st.get("input").and_then(Value::as_object);
     let ts = st
-        .and_then(|s| s.get("time"))
+        .get("time")
         .and_then(|t| t.get("start"))
         .and_then(|v| v.as_i64())
         .unwrap_or(state.last_ts);
 
-    let str_in = |key: &str| -> &str {
-        input
-            .and_then(|i| i.get(key))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-    };
+    let str_in = |key: &str| -> Option<&str> { input?.get(key)?.as_str() };
 
     match tool {
         "read" => {
-            let path = str_in("filePath");
-            let output = st
-                .and_then(|s| s.get("output"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let (Some(path), Some(output)) = (
+                str_in("filePath").filter(|path| !path.is_empty()),
+                st.get("output").and_then(Value::as_str),
+            ) else {
+                return ToolPartOutcome::Unsupported;
+            };
             let content = extract_read_content(output);
-            if !path.is_empty() && !content.is_empty() {
+            if !content.is_empty() {
                 state.add_read_detail(path, &content, ts);
             } else {
                 // Directory listings (and empty reads) still count as a read
@@ -535,24 +684,50 @@ fn apply_tool_part(state: &mut SessionParseState, data: &Value) {
             }
         }
         "edit" => {
-            let path = str_in("filePath");
-            state.add_edit_detail(path, str_in("oldString"), str_in("newString"), ts);
+            let (Some(path), Some(old), Some(new)) = (
+                str_in("filePath").filter(|path| !path.is_empty()),
+                str_in("oldString"),
+                str_in("newString"),
+            ) else {
+                return ToolPartOutcome::Unsupported;
+            };
+            state.add_edit_detail(path, old, new, ts);
         }
         "write" => {
-            let path = str_in("filePath");
-            state.add_write_detail(path, str_in("content"), ts);
+            let (Some(path), Some(content)) = (
+                str_in("filePath").filter(|path| !path.is_empty()),
+                str_in("content"),
+            ) else {
+                return ToolPartOutcome::Unsupported;
+            };
+            state.add_write_detail(path, content, ts);
         }
         "bash" => {
-            state.add_run_command(str_in("command"), str_in("description"), ts);
+            let Some(command) = str_in("command").filter(|command| !command.trim().is_empty())
+            else {
+                return ToolPartOutcome::Unsupported;
+            };
+            state.add_run_command(command, str_in("description").unwrap_or(""), ts);
         }
         "todowrite" => {
             state.tool_counts.todo_write += 1;
         }
         "apply_patch" => {
-            apply_patch_text(state, str_in("patchText"), ts);
+            let Some(patch_text) = str_in("patchText") else {
+                return ToolPartOutcome::Unsupported;
+            };
+            if !parse_apply_patch_text(patch_text)
+                .iter()
+                .any(|patch| !patch.file_path.is_empty())
+            {
+                return ToolPartOutcome::Unsupported;
+            }
+            apply_patch_text(state, patch_text, ts);
         }
-        _ => {}
+        _ => unreachable!("tracked OpenCode tool was filtered above"),
     }
+
+    ToolPartOutcome::Normalized
 }
 
 /// Folds an OpenCode `apply_patch` tool input into file-operation counts.
@@ -737,24 +912,7 @@ fn parse_message_usage(raw: &str) -> Option<MessageUsage> {
     }
 
     let model_id = message_model_id(&data)?;
-    let tokens = data.get("tokens")?;
-    let cache = tokens.get("cache");
-    let usage = session_usage_value(
-        tokens.get("input").and_then(|v| v.as_i64()).unwrap_or(0),
-        tokens.get("output").and_then(|v| v.as_i64()).unwrap_or(0),
-        tokens
-            .get("reasoning")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0),
-        cache
-            .and_then(|v| v.get("read"))
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0),
-        cache
-            .and_then(|v| v.get("write"))
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0),
-    );
+    let usage = parse_message_tokens(data.get("tokens")?)?;
     let cost = data.get("cost").and_then(|v| v.as_f64()).unwrap_or(0.0);
     let timestamp = data
         .get("time")
@@ -767,6 +925,47 @@ fn parse_message_usage(raw: &str) -> Option<MessageUsage> {
         cost,
         timestamp,
     })
+}
+
+fn parse_message_tokens(tokens: &Value) -> Option<Value> {
+    let tokens = tokens.as_object()?;
+    let read_i64 = |object: &serde_json::Map<String, Value>, key: &str| -> Option<i64> {
+        match object.get(key) {
+            Some(value) => value.as_i64(),
+            None => Some(0),
+        }
+    };
+
+    let has_flat_key = ["input", "output", "reasoning"]
+        .iter()
+        .any(|key| tokens.contains_key(*key));
+    let input = read_i64(tokens, "input")?;
+    let output = read_i64(tokens, "output")?;
+    let reasoning = read_i64(tokens, "reasoning")?;
+
+    let (cache_read, cache_write, has_cache_key) = match tokens.get("cache") {
+        Some(cache) => {
+            let cache = cache.as_object()?;
+            let has_known_cache_key = ["read", "write"].iter().any(|key| cache.contains_key(*key));
+            if !cache.is_empty() && !has_known_cache_key {
+                return None;
+            }
+            (read_i64(cache, "read")?, read_i64(cache, "write")?, true)
+        }
+        None => (0, 0, false),
+    };
+
+    if !tokens.is_empty() && !has_flat_key && !has_cache_key {
+        return None;
+    }
+
+    Some(session_usage_value(
+        input,
+        output,
+        reasoning,
+        cache_read,
+        cache_write,
+    ))
 }
 
 /// Resolves the model from an assistant message payload.
@@ -1272,6 +1471,124 @@ mod tests {
     }
 
     #[test]
+    fn analysis_rejects_assistant_rows_with_completely_unknown_schema() {
+        let (_dir, db_path) = make_db();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO session (id, directory, time_updated) VALUES ('s1', '/repo', 1780757089000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES ('m1', 's1', ?1)",
+            [r#"{"role":"assistant","futureUsage":{"input":10}}"#],
+        )
+        .unwrap();
+        drop(conn);
+
+        let result =
+            read_opencode_analysis_with_diagnostics(&db_path, TimeRange::All, ParseMode::Full)
+                .unwrap();
+        assert_eq!(result.expected_records, 1);
+        assert_eq!(result.parsed_records, 0);
+        assert!(result.rows.is_empty());
+
+        let error = read_opencode_analysis(&db_path, TimeRange::All, ParseMode::Full).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("none of 1 OpenCode analysis records")
+        );
+    }
+
+    #[test]
+    fn analysis_rejects_unknown_only_and_wrong_type_token_objects() {
+        for tokens in [
+            json!({ "prompt": 10, "completion": 2 }),
+            json!({ "input": "10" }),
+            json!({ "cache": { "futureRead": 10 } }),
+        ] {
+            let (_dir, db_path) = make_db();
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO session (id, directory, time_updated) VALUES ('s1', '/repo', 1780757089000)",
+                [],
+            )
+            .unwrap();
+            let message = json!({
+                "role": "assistant",
+                "modelID": "model",
+                "tokens": tokens,
+            })
+            .to_string();
+            conn.execute(
+                "INSERT INTO message (id, session_id, data) VALUES ('m1', 's1', ?1)",
+                [message],
+            )
+            .unwrap();
+            drop(conn);
+
+            let result =
+                read_opencode_analysis_with_diagnostics(&db_path, TimeRange::All, ParseMode::Full)
+                    .unwrap();
+            assert_eq!(result.expected_records, 1);
+            assert_eq!(result.parsed_records, 0);
+            assert!(result.rows.is_empty());
+        }
+    }
+
+    #[test]
+    fn analysis_accepts_zero_and_partial_known_token_objects() {
+        for tokens in [json!({}), json!({ "input": 0 }), json!({ "cache": {} })] {
+            let raw = json!({
+                "role": "assistant",
+                "modelID": "model",
+                "tokens": tokens,
+            })
+            .to_string();
+            let parsed = parse_message_usage(&raw).expect("known zero token shape");
+            assert_eq!(parsed.usage["input_tokens"], 0);
+            assert_eq!(parsed.usage["output_tokens"], 0);
+        }
+    }
+
+    #[test]
+    fn analysis_reports_known_tool_part_schema_drift() {
+        let (_dir, db_path) = make_db();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO session (id, directory, time_updated) VALUES ('s1', '/repo', 1780757089000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES ('m1', 's1', ?1)",
+            [assistant_message("model", 0, 0, 0, 0, 0, 0.0)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES ('p1', 'm1', 's1', ?1)",
+            [r#"{"type":"tool","tool":"write","state":{"status":"completed","input":{"futurePath":"/repo/a","futureContent":"text"}}}"#],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES ('p2', 'm1', 's1', ?1)",
+            [r#"{"type":"tool","tool":"write","state":{"status":"success","input":{"filePath":"/repo/a","content":"text"}}}"#],
+        )
+        .unwrap();
+        drop(conn);
+
+        let result =
+            read_opencode_analysis_with_diagnostics(&db_path, TimeRange::All, ParseMode::Full)
+                .unwrap();
+        assert_eq!(result.expected_records, 1);
+        assert_eq!(result.parsed_records, 1);
+        assert_eq!(result.failed_tool_parts, 2);
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].analysis.records[0].tool_call_counts.write, 0);
+    }
+
+    #[test]
     fn test_time_range_filters_old_sessions() {
         let (_dir, db_path) = make_db();
         let conn = Connection::open(&db_path).unwrap();
@@ -1514,6 +1831,38 @@ mod tests {
         assert_eq!(record.total_edit_lines, 2);
         // grep / text parts are not tracked.
         assert_eq!(record.tool_call_counts.write, 0);
+    }
+
+    #[test]
+    fn test_read_analysis_orders_details_by_part_id() {
+        let (_dir, db_path) = make_db();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO session (id, model, directory, time_updated) VALUES ('s1', '{\"id\":\"m1\"}', '/repo', 1780757088080)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES ('m1', 's1', ?1)",
+            [assistant_message("m1", 1, 1, 0, 0, 0, 0.01)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES ('z', 'm1', 's1', ?1)",
+            [r#"{"type":"tool","tool":"write","state":{"status":"completed","input":{"filePath":"/repo/z.rs","content":"z"}}}"#],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES ('a', 'm1', 's1', ?1)",
+            [r#"{"type":"tool","tool":"write","state":{"status":"completed","input":{"filePath":"/repo/a.rs","content":"a"}}}"#],
+        )
+        .unwrap();
+        drop(conn);
+
+        let rows = read_opencode_analysis(&db_path, TimeRange::All, ParseMode::Full).unwrap();
+        let details = &rows[0].1.records[0].write_file_details;
+        assert_eq!(details[0].base.file_path, "/repo/a.rs");
+        assert_eq!(details[1].base.file_path, "/repo/z.rs");
     }
 
     #[test]

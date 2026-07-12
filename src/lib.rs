@@ -1,11 +1,13 @@
 //! Library crate behind the `vibe_coding_tracker` / `vct` CLI.
 //!
-//! The crate scans on-disk JSONL session logs written by four AI coding
-//! assistants — Claude Code, OpenAI Codex, GitHub Copilot CLI, and Gemini
-//! CLI — and rolls them up into two views:
+//! The crate scans on-disk session logs written by seven AI coding assistants:
+//! JSONL logs from Claude Code, OpenAI Codex, GitHub Copilot CLI, and Gemini
+//! CLI; SQLite data from OpenCode and Cursor; and usage-only SQLite data from
+//! Hermes. It exposes two views:
 //!
 //! - **usage** — per-model token counts and LiteLLM-priced cost
-//! - **analysis** — per-model file-operation and tool-call metrics
+//! - **analysis** — complete per-session data plus compact per-model
+//!   file-operation and tool-call metrics
 //!
 //! # Pipeline
 //!

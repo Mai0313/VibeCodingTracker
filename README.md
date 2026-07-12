@@ -176,7 +176,6 @@ Time range flags (shared by `usage` and `analysis`, mutually exclusive, default 
 | `--table`                                      | Static table, no TUI                                                             |
 | `--text`                                       | Plain text, script-friendly                                                      |
 | `--json`                                       | JSON with enriched pricing metadata                                              |
-| `--output <FILE>`                              | Save enriched JSON to a file                                                     |
 | `--merge-providers`                            | Merge models sharing a base name across provider prefixes (ignored for `--json`) |
 | `--daily` / `--weekly` / `--monthly` / `--all` | Time range filter (see table above)                                              |
 
@@ -195,8 +194,8 @@ vct usage --text
 # JSON for data processing (includes cost_usd and matched_model fields)
 vct usage --json
 
-# Save enriched JSON straight to a file
-vct usage --output report.json
+# Save enriched JSON with shell redirection
+vct usage --json > report.json
 
 # Combine time range with output format
 vct usage --weekly
@@ -324,19 +323,18 @@ A panel appears only for a provider whose credentials are present. When four pan
 
 **Deep dive into code operations — see exactly what your AI assistant did.**
 
-### Flags
+### Arguments and Flags
 
-| Flag                                           | Purpose                                                     |
-| ---------------------------------------------- | ----------------------------------------------------------- |
-| *(none)*                                       | Interactive TUI dashboard over all sessions                 |
-| `--path <FILE>`                                | Analyze a single JSONL/JSON conversation file (prints JSON) |
-| `--table`                                      | Static table with per-provider totals                       |
-| `--text`                                       | Plain text, script-friendly                                 |
-| `--json`                                       | JSON array of aggregated rows printed to stdout             |
-| `--output <FILE>`                              | Save results as pretty-printed JSON                         |
-| `--daily` / `--weekly` / `--monthly` / `--all` | Time range filter (see table above)                         |
+| Argument / Flag                                | Purpose                                                                                  |
+| ---------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| *(none)*                                       | Interactive TUI dashboard over all sessions                                              |
+| `<FILE>`                                       | Analyze one JSONL/JSON conversation file and print its complete `CodeAnalysis` JSON      |
+| `--table`                                      | Static summary table with per-provider totals                                            |
+| `--text`                                       | Plain-text summary, script-friendly                                                      |
+| `--json`                                       | Complete parser results as JSON: one object for `<FILE>`, otherwise an array of objects  |
+| `--daily` / `--weekly` / `--monthly` / `--all` | Time range filter for all-session analysis (see table above; not accepted with `<FILE>`) |
 
-See [`examples/`](examples/) for sample inputs and matching JSON outputs for all four providers.
+See [`examples/`](examples/) for sample inputs and matching JSON outputs for the four JSONL providers represented there.
 
 ### Basic Usage
 
@@ -350,20 +348,24 @@ vct analysis --table
 # Plain text for scripts
 vct analysis --text
 
-# JSON of aggregated rows for data processing
+# Complete parser results for every session
 vct analysis --json
 
 # Analyze a single conversation file → stdout JSON
-vct analysis --path ~/.claude/projects/session.jsonl
+vct analysis ~/.claude/projects/session.jsonl
 
-# Save results to JSON
-vct analysis --output report.json
+# Summarize only that conversation
+vct analysis ~/.claude/projects/session.jsonl --table
+
+# Save complete JSON with shell redirection
+vct analysis --json > report.json
+vct analysis ~/.claude/projects/session.jsonl > session-analysis.json
 
 # Combine time range with output format
 vct analysis --weekly
 vct analysis --table --monthly
 vct analysis --json --daily
-vct analysis --output today.json --daily
+vct analysis --json --daily > today.json
 ```
 
 ### Preview: Interactive Dashboard (`vct analysis`)
@@ -390,7 +392,7 @@ vct analysis --output today.json --daily
 
 ### Preview: Table & JSON (`vct analysis`)
 
-`--table` renders the per-model breakdown plus a per-provider summary (with an Active Days column); `--json` emits one aggregated row per model.
+`--table` renders the per-model breakdown plus a per-provider summary (with an Active Days column). `--text` and `--table` are compact projections of the same normalized parser records. `--json` keeps the complete records, including per-operation details and token usage. With no `<FILE>`, the outer array contains one `CodeAnalysis` object per session; with `<FILE>`, stdout is that single object and matches the corresponding shape under [`examples/`](examples/).
 
 ```text
 Analysis Statistics
@@ -404,22 +406,44 @@ Analysis Statistics
 └─────────────────┴────────────┴────────────┴─────────────┴──────┴──────┴──────┴───────────┴───────┘
 ```
 
-```json
-// vct analysis --json  (one model shown)
+```jsonc
+// vct analysis --json  (one abbreviated session shown)
 [
   {
-    "model": "claude-opus-4-8",
-    "editLines": 1493,
-    "readLines": 15564,
-    "writeLines": 970,
-    "bashCount": 124,
-    "editCount": 134,
-    "readCount": 144,
-    "todoWriteCount": 0,
-    "writeCount": 12
+    "user": "alice",
+    "extensionName": "Claude-Code",
+    "insightsVersion": "...",
+    "machineId": "...",
+    "records": [
+      {
+        "totalUniqueFiles": 3,
+        "totalReadLines": 120,
+        "readFileDetails": [
+          {
+            "filePath": "/repo/src/main.rs",
+            "lineCount": 120,
+            "characterCount": 4102,
+            "timestamp": 1783872000000
+          }
+        ],
+        "toolCallCounts": { "Bash": 1, "Edit": 0, "Read": 1, "TodoWrite": 0, "Write": 0 },
+        "conversationUsage": { "claude-opus-4-8": { "input_tokens": 42, "output_tokens": 18 } }
+      }
+    ]
   }
 ]
 ```
+
+> [!WARNING]
+> Complete analysis JSON can be large and may contain source text, edit bodies, shell commands, absolute paths, repository URLs, user names, machine identifiers, and token metadata. Review it before sharing.
+
+Batch analysis reads live provider stores. If an assistant appends to a session during the scan, later runs can legitimately contain newer data. Unchanged inputs serialize in a deterministic order.
+
+Noninteractive analysis returns an error when every discovered source fails or uses an unrecognized schema. If only some sources fail, successful output is preserved and a warning is written to stderr.
+
+`analysis FILE` follows the same rule for malformed or unsupported records inside one file: parsed JSON/text/table output is preserved on stdout and a generic skipped-record warning is written to stderr.
+
+Codex code-mode sessions expose a completed JavaScript `exec` cell but no structured trace for its nested tools. VCT counts that cell as one Bash call and preserves its source in complete JSON, but does not guess nested Read/Edit/Write operations.
 
 ---
 
