@@ -54,6 +54,7 @@ struct RowSums {
     output: i64,
     cache_read: i64,
     cache_write: i64,
+    reasoning: i64,
     estimated: f64,
     actual: f64,
 }
@@ -139,6 +140,7 @@ fn collect_per_model_rows(
         acc.output += raw_output;
         acc.cache_read += cache_read;
         acc.cache_write += cache_write;
+        acc.reasoning += reasoning;
         acc.estimated += estimated;
         acc.actual += actual;
 
@@ -188,8 +190,8 @@ fn reconcile_session_residuals(
     // somehow absent, the per-model rows already collected are still returned.
     let Ok(mut stmt) = conn.prepare(
         "SELECT id, model, input_tokens, output_tokens, cache_read_tokens, \
-                cache_write_tokens, estimated_cost_usd, actual_cost_usd, \
-                ended_at, started_at \
+                cache_write_tokens, reasoning_tokens, estimated_cost_usd, \
+                actual_cost_usd, ended_at, started_at \
          FROM sessions",
     ) else {
         return Ok(());
@@ -201,21 +203,26 @@ fn reconcile_session_residuals(
         let acc = summed.get(&id);
         let input =
             (row.get::<_, Option<i64>>(2)?.unwrap_or(0) - acc.map_or(0, |a| a.input)).max(0);
-        // Residual output stays raw (reasoning-inclusive) with reasoning 0, the
-        // way Hermes leaves the unattributed remainder.
-        let output =
+        // `sessions.output_tokens` follows the OpenAI convention (includes
+        // reasoning), so split the residual the same way the per-model rows are
+        // split: reasoning goes to its own bucket and is subtracted from output,
+        // keeping the breakdown right and reasoning-rate pricing correct.
+        let raw_output =
             (row.get::<_, Option<i64>>(3)?.unwrap_or(0) - acc.map_or(0, |a| a.output)).max(0);
         let cache_read =
             (row.get::<_, Option<i64>>(4)?.unwrap_or(0) - acc.map_or(0, |a| a.cache_read)).max(0);
         let cache_write =
             (row.get::<_, Option<i64>>(5)?.unwrap_or(0) - acc.map_or(0, |a| a.cache_write)).max(0);
-        let estimated = (row.get::<_, Option<f64>>(6)?.unwrap_or(0.0)
+        let reasoning =
+            (row.get::<_, Option<i64>>(6)?.unwrap_or(0) - acc.map_or(0, |a| a.reasoning)).max(0);
+        let output = (raw_output - reasoning).max(0);
+        let estimated = (row.get::<_, Option<f64>>(7)?.unwrap_or(0.0)
             - acc.map_or(0.0, |a| a.estimated))
         .max(0.0);
         let actual =
-            (row.get::<_, Option<f64>>(7)?.unwrap_or(0.0) - acc.map_or(0.0, |a| a.actual)).max(0.0);
+            (row.get::<_, Option<f64>>(8)?.unwrap_or(0.0) - acc.map_or(0.0, |a| a.actual)).max(0.0);
         if input == 0
-            && output == 0
+            && raw_output == 0
             && cache_read == 0
             && cache_write == 0
             && estimated <= 0.0
@@ -229,8 +236,8 @@ fn reconcile_session_residuals(
             continue;
         }
         let Some(seconds) = row
-            .get::<_, Option<f64>>(8)?
-            .or(row.get::<_, Option<f64>>(9)?)
+            .get::<_, Option<f64>>(9)?
+            .or(row.get::<_, Option<f64>>(10)?)
         else {
             continue;
         };
@@ -246,7 +253,7 @@ fn reconcile_session_residuals(
             &date,
             model,
             (seconds * 1000.0) as i64,
-            session_usage_value(input, output, 0, cache_read, cache_write),
+            session_usage_value(input, output, reasoning, cache_read, cache_write),
             cost,
             user,
             machine,
@@ -455,6 +462,8 @@ mod tests {
         actual: f64,
         last_seen: f64,
     ) {
+        // `reasoning_tokens` is left to its column default (0); tests that need a
+        // non-zero reasoning residual insert the row directly.
         conn.execute(
             "INSERT INTO sessions (id, model, input_tokens, output_tokens, \
                  cache_read_tokens, cache_write_tokens, estimated_cost_usd, \
@@ -855,6 +864,29 @@ mod tests {
         assert_eq!(usage["input_tokens"], 100);
         assert_eq!(usage["output_tokens"], 10);
         assert!((sessions[0].2 - 0.5).abs() < 1e-9);
+        drop(dir);
+    }
+
+    #[test]
+    fn residual_splits_reasoning_out_of_output() {
+        // A residual-only session whose output_tokens (10) includes reasoning (4)
+        // must report output 6 and reasoning 4, not output 10 / reasoning 0.
+        let (dir, db_path) = make_db();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, model, input_tokens, output_tokens, \
+                     reasoning_tokens, estimated_cost_usd, started_at, ended_at) \
+                 VALUES ('s1', 'gpt-x', 100, 10, 4, 0.5, ?1, ?1)",
+                [recent_epoch_secs()],
+            )
+            .unwrap();
+        }
+        let sessions = read_hermes_usage(&db_path, TimeRange::All).unwrap();
+        assert_eq!(sessions.len(), 1);
+        let usage = usage_of(&sessions[0].1, "gpt-x");
+        assert_eq!(usage["output_tokens"], 6);
+        assert_eq!(usage["reasoning_output_tokens"], 4);
         drop(dir);
     }
 }
