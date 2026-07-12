@@ -79,6 +79,37 @@ fn collect_usage(
     let mut out = Vec::new();
     let mut summed: FastHashMap<String, RowSums> = FastHashMap::default();
 
+    // Older Hermes releases predate `session_model_usage`; treat a missing table
+    // as an empty per-model set and let the `sessions` reconciliation below
+    // produce usage from the aggregate (matching Hermes's own fallback).
+    if table_exists(conn, "session_model_usage")? {
+        collect_per_model_rows(conn, &cutoff, &user, &machine, &mut summed, &mut out)?;
+    }
+
+    reconcile_session_residuals(conn, &cutoff, &summed, &user, &machine, &mut out)?;
+    Ok(out)
+}
+
+/// Returns whether `table` exists in the database.
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+/// Emits one contribution per `session_model_usage` row and accumulates the raw
+/// per-session sums used by the residual reconciliation.
+fn collect_per_model_rows(
+    conn: &Connection,
+    cutoff: &Option<String>,
+    user: &str,
+    machine: &str,
+    summed: &mut FastHashMap<String, RowSums>,
+    out: &mut Vec<(String, CodeAnalysis, f64)>,
+) -> Result<()> {
     let mut stmt = conn.prepare(
         "SELECT session_id, model, input_tokens, output_tokens, cache_read_tokens, \
                 cache_write_tokens, reasoning_tokens, estimated_cost_usd, \
@@ -119,7 +150,7 @@ fn collect_usage(
         let Some(date) = ms_to_local_date((seconds * 1000.0) as i64) else {
             continue;
         };
-        if is_before_cutoff(&date, &cutoff) {
+        if is_before_cutoff(&date, cutoff) {
             continue;
         }
 
@@ -135,15 +166,11 @@ fn collect_usage(
             (seconds * 1000.0) as i64,
             session_usage_value(input, output, reasoning, cache_read, cache_write),
             cost,
-            &user,
-            &machine,
+            user,
+            machine,
         ));
     }
-    drop(rows);
-    drop(stmt);
-
-    reconcile_session_residuals(conn, &cutoff, &summed, &user, &machine, &mut out)?;
-    Ok(out)
+    Ok(())
 }
 
 /// Attributes each session's positive residual (aggregate minus the sum of its
@@ -310,9 +337,12 @@ fn is_before_cutoff(date: &str, cutoff: &Option<String>) -> bool {
 /// sidecars into a private temp directory and reading the copy. The temp copy
 /// is removed when `f` returns.
 fn open_readonly<T>(db_path: &Path, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    // Probe `sessions` (the core table present in every Hermes release) rather
+    // than `session_model_usage` (added later), so a pre-migration database
+    // still takes the read-only path instead of falling through to a temp copy.
     if let Ok(conn) = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         && conn
-            .query_row("SELECT count(*) FROM session_model_usage", [], |_| Ok(()))
+            .query_row("SELECT count(*) FROM sessions", [], |_| Ok(()))
             .is_ok()
     {
         return f(&conn);
@@ -778,6 +808,53 @@ mod tests {
         let sessions = read_hermes_usage(&db_path, TimeRange::All).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(total_bucket(&sessions, "gpt-x", "input_tokens"), 100);
+        drop(dir);
+    }
+
+    #[test]
+    fn reads_sessions_when_per_model_table_is_missing() {
+        // A pre-migration Hermes DB has `sessions` but no `session_model_usage`;
+        // usage must still come from the aggregate rather than erroring out.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                     id TEXT PRIMARY KEY,
+                     model TEXT,
+                     billing_provider TEXT,
+                     input_tokens INTEGER DEFAULT 0,
+                     output_tokens INTEGER DEFAULT 0,
+                     cache_read_tokens INTEGER DEFAULT 0,
+                     cache_write_tokens INTEGER DEFAULT 0,
+                     reasoning_tokens INTEGER DEFAULT 0,
+                     estimated_cost_usd REAL DEFAULT 0,
+                     actual_cost_usd REAL DEFAULT 0,
+                     started_at REAL NOT NULL,
+                     ended_at REAL
+                 );",
+            )
+            .unwrap();
+            insert_session(
+                &conn,
+                "s1",
+                "gpt-x",
+                100,
+                10,
+                5,
+                0,
+                0.5,
+                0.0,
+                recent_epoch_secs(),
+            );
+        }
+        let sessions = read_hermes_usage(&db_path, TimeRange::All).unwrap();
+        assert_eq!(sessions.len(), 1);
+        let usage = usage_of(&sessions[0].1, "gpt-x");
+        assert_eq!(usage["input_tokens"], 100);
+        assert_eq!(usage["output_tokens"], 10);
+        assert!((sessions[0].2 - 0.5).abs() < 1e-9);
         drop(dir);
     }
 }
