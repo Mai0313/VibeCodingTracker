@@ -62,6 +62,11 @@ impl<'a, T> ProviderTotal<'a, T> {
                 RatatuiColor::LightMagenta,
                 TableColor::DarkMagenta,
             ),
+            Provider::Hermes => (
+                Provider::Hermes.display_name(),
+                RatatuiColor::LightYellow,
+                TableColor::DarkYellow,
+            ),
             Provider::Unknown => ("Unknown", RatatuiColor::Gray, TableColor::Grey),
         };
 

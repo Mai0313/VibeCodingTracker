@@ -19,7 +19,7 @@
 
 </div>
 
-**实时追踪你的 AI 编程开销。** Vibe Coding Tracker 是一款基于 Rust 构建的轻量级高性能 CLI 工具，用于监控和分析你在 Claude Code、Codex、Copilot、Gemini、OpenCode 和 Cursor 上的使用情况——提供详细的费用明细、token 统计和代码操作洞察，同时保持极低的内存占用。
+**实时追踪你的 AI 编程开销。** Vibe Coding Tracker 是一款基于 Rust 构建的轻量级高性能 CLI 工具，用于监控和分析你在 Claude Code、Codex、Copilot、Gemini、OpenCode、Cursor 和 Hermes 上的使用情况——提供详细的费用明细、token 统计和代码操作洞察，同时保持极低的内存占用。
 
 [English](README.md) | [繁體中文](README.zh-TW.md) | [简体中文](README.zh-CN.md)
 
@@ -48,7 +48,7 @@
 
 ### 零配置
 
-自动检测并处理来自 Claude Code、Codex、Copilot、Gemini、OpenCode 和 Cursor 的日志。无需任何设置——直接运行即可分析。首次运行时会自动生成一个带有合理默认值的 `~/.vct/config.toml`，方便你日后想调整行为时使用（参见 [配置](#%E9%85%8D%E7%BD%AE)）。
+自动检测并处理来自 Claude Code、Codex、Copilot、Gemini、OpenCode、Cursor 和 Hermes 的日志。无需任何设置——直接运行即可分析。首次运行时会自动生成一个带有合理默认值的 `~/.vct/config.toml`，方便你日后想调整行为时使用（参见 [配置](#%E9%85%8D%E7%BD%AE)）。
 
 ### 丰富的洞察
 
@@ -62,15 +62,15 @@
 
 ## 核心特性
 
-| 特性             | 说明                                                                |
-| ---------------- | ------------------------------------------------------------------- |
-| **多供应商支持** | Claude Code、Codex、Copilot、Gemini、OpenCode 和 Cursor——一站式管理 |
-| **智能定价**     | 模糊模型匹配 + 从 LiteLLM 每日缓存更新                              |
-| **4 种显示模式** | 交互式 TUI、静态表格、纯文本和 JSON                                 |
-| **双维度分析**   | token/费用统计（`usage`）+ 代码操作统计（`analysis`）               |
-| **实时额度面板** | Claude、Codex、Copilot 和 Cursor 的实时剩余额度                     |
-| **超轻量级**     | TUI 常驻内存 50 MB 以内、流式 JSONL 解析——基于 Rust 构建            |
-| **实时更新**     | 面板自动刷新（每 10 秒），并高亮变化                                |
+| 特性             | 说明                                                                        |
+| ---------------- | --------------------------------------------------------------------------- |
+| **多供应商支持** | Claude Code、Codex、Copilot、Gemini、OpenCode、Cursor 和 Hermes——一站式管理 |
+| **智能定价**     | 模糊模型匹配 + 从 LiteLLM 每日缓存更新                                      |
+| **4 种显示模式** | 交互式 TUI、静态表格、纯文本和 JSON                                         |
+| **双维度分析**   | token/费用统计（`usage`）+ 代码操作统计（`analysis`）                       |
+| **实时额度面板** | Claude、Codex、Copilot 和 Cursor 的实时剩余额度                             |
+| **超轻量级**     | TUI 常驻内存 50 MB 以内、流式 JSONL 解析——基于 Rust 构建                    |
+| **实时更新**     | 面板自动刷新（每 10 秒），并高亮变化                                        |
 
 ---
 
@@ -291,6 +291,7 @@ Totals (by Provider)
 - `~/.gemini/tmp/<project_hash>/chats/*.jsonl`（Gemini CLI）
 - `~/.local/share/opencode/opencode.db`（OpenCode，SQLite 数据库；遵循 `$XDG_DATA_HOME`）
 - `~/.cursor/chats/*/*/store.db`（Cursor，SQLite 会话库，用于 `analysis`，并给出一个与其他 provider 一致的本地 `usage` 估算）
+- `~/.hermes/state.db`（Hermes，SQLite 数据库，遵循 `$HERMES_HOME`；仅 `usage`）
 
 ### 实时额度面板
 
@@ -606,6 +607,7 @@ vct config migrate
 
 - **不止 token**：Claude 的 web-search 工具调用（`server_tool_use.web_search_requests`）会在 token 费用之外按每次查询计费；其他所有 model 的每次查询费用均为 $0。
 - **OpenCode**：只有在 LiteLLM 上**精确**匹配时，才会根据 token 为一个全新的 model 名称定价；若没有精确匹配，vct 会信任该 assistant message 自身存储的费用，而不是从一个只是大致相似的名称去猜测。
+- **Hermes**：与 OpenCode 相同，LiteLLM 上**精确**匹配时按 token 定价，否则使用 Hermes 自身存储的费用。
 - **缓存为原始数据**：每日缓存存储的是经过筛选的上游 LiteLLM JSON（而非派生后的结构），因此无需重新获取即可保留分层 / 批量定价；此外还有一个小型的进程内 LRU，让 TUI 刷新期间的重复查询保持低开销。
 
 ---

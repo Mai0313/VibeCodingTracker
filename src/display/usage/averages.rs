@@ -13,6 +13,8 @@ enum ProviderPricing<'a> {
     OpenCode(&'a crate::constants::FastHashMap<String, f64>),
     /// Cursor: its dashboard cost verbatim.
     Cursor(&'a crate::constants::FastHashMap<String, f64>),
+    /// Hermes: exact LiteLLM match, else its stored cost.
+    Hermes(&'a crate::constants::FastHashMap<String, f64>),
 }
 
 impl ProviderPricing<'_> {
@@ -24,6 +26,7 @@ impl ProviderPricing<'_> {
             Self::Litellm => CostSource::Litellm,
             Self::OpenCode(m) => CostSource::OpenCodeStored(stored(m)),
             Self::Cursor(m) => CostSource::CursorStored(stored(m)),
+            Self::Hermes(m) => CostSource::HermesStored(stored(m)),
         }
     }
 }
@@ -166,6 +169,7 @@ pub fn calculate_provider_totals_from_per_provider(
     totals.gemini.days_count = provider_days.gemini;
     totals.opencode.days_count = provider_days.opencode;
     totals.cursor.days_count = provider_days.cursor;
+    totals.hermes.days_count = provider_days.hermes;
     totals.overall.days_count = provider_days.total;
 
     accumulate_provider(
@@ -204,6 +208,12 @@ pub fn calculate_provider_totals_from_per_provider(
         pricing_map,
         ProviderPricing::Cursor(&stored_costs.cursor),
     );
+    accumulate_provider(
+        &mut totals.hermes,
+        &per_provider.hermes,
+        pricing_map,
+        ProviderPricing::Hermes(&stored_costs.hermes),
+    );
 
     // "All Providers" row sums every provider's totals directly rather
     // than reusing the cross-provider merged `UsageData.models` map.
@@ -219,13 +229,15 @@ pub fn calculate_provider_totals_from_per_provider(
         + totals.copilot.total_tokens
         + totals.gemini.total_tokens
         + totals.opencode.total_tokens
-        + totals.cursor.total_tokens;
+        + totals.cursor.total_tokens
+        + totals.hermes.total_tokens;
     totals.overall.total_cost = totals.claude.total_cost
         + totals.codex.total_cost
         + totals.copilot.total_cost
         + totals.gemini.total_cost
         + totals.opencode.total_cost
-        + totals.cursor.total_cost;
+        + totals.cursor.total_cost
+        + totals.hermes.total_cost;
 
     totals
 }
@@ -248,7 +260,7 @@ fn accumulate_provider(
 pub fn build_provider_total_rows(
     totals: &UsageProviderTotals,
 ) -> Vec<ProviderTotal<'_, ProviderStats>> {
-    let mut rows = Vec::with_capacity(7); // max 6 providers + overall
+    let mut rows = Vec::with_capacity(8); // max 7 providers + overall
 
     if totals.claude.days_count > 0 {
         rows.push(ProviderTotal::new(
@@ -284,6 +296,10 @@ pub fn build_provider_total_rows(
 
     if totals.cursor.days_count > 0 {
         rows.push(ProviderTotal::new(Provider::Cursor, &totals.cursor, false));
+    }
+
+    if totals.hermes.days_count > 0 {
+        rows.push(ProviderTotal::new(Provider::Hermes, &totals.hermes, false));
     }
 
     if totals.overall.days_count > 0 || rows.is_empty() {
@@ -418,6 +434,10 @@ fn resolve_merged_row_cost(
         (
             &per_provider.cursor,
             CostSource::CursorStored(stored(&stored_costs.cursor)),
+        ),
+        (
+            &per_provider.hermes,
+            CostSource::HermesStored(stored(&stored_costs.hermes)),
         ),
     ] {
         if let Some(raw_usage) = usage.get(model) {

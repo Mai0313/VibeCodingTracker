@@ -60,6 +60,7 @@
         "copilot": true,
         "cursor": true,
         "gemini": true,
+        "hermes": true,
         "opencode": true
       },
       "description": "`[providers]` — per-provider include toggles.\n\nEach provider defaults to `true`; setting one to `false` skips it entirely\n(no directory scan, no API) in both the usage and analysis roll-ups.",
@@ -81,6 +82,10 @@
           "type": "boolean"
         },
         "gemini": {
+          "default": true,
+          "type": "boolean"
+        },
+        "hermes": {
           "default": true,
           "type": "boolean"
         },

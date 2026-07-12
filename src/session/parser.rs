@@ -404,6 +404,9 @@ fn dispatch_streaming_buffered(
         // and its billing tokens come from an API (usage), never a JSONL file.
         // See `session::cursor`.
         ExtensionType::Cursor => Ok(empty_analysis()),
+        // Hermes stores usage in a single SQLite database, not a JSONL file, so
+        // it never flows through the file parser. See `session::hermes`.
+        ExtensionType::Hermes => Ok(empty_analysis()),
     }
 }
 
@@ -460,12 +463,14 @@ fn dispatch_by_vec(
         ExtensionType::Copilot
         | ExtensionType::Gemini
         | ExtensionType::OpenCode
-        | ExtensionType::Cursor => {
-            // Copilot/Gemini only support the JSONL event stream, while OpenCode
-            // and Cursor are read from SQLite (see `session::opencode` /
-            // `session::cursor`), not a file. A file that falls through to this
-            // branch (e.g. a stray pretty-printed export) has no parser for its
-            // shape — return an empty analysis instead of silently mis-parsing.
+        | ExtensionType::Cursor
+        | ExtensionType::Hermes => {
+            // Copilot/Gemini only support the JSONL event stream, while OpenCode,
+            // Cursor, and Hermes are read from SQLite (see `session::opencode` /
+            // `session::cursor` / `session::hermes`), not a file. A file that
+            // falls through to this branch (e.g. a stray pretty-printed export)
+            // has no parser for its shape — return an empty analysis instead of
+            // silently mis-parsing.
             empty_analysis()
         }
     };

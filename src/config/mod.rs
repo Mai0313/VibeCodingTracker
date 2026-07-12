@@ -174,6 +174,8 @@ pub struct ProvidersConfig {
     pub opencode: bool,
     #[serde(default = "default_true")]
     pub cursor: bool,
+    #[serde(default = "default_true")]
+    pub hermes: bool,
 }
 
 impl Default for ProvidersConfig {
@@ -185,6 +187,7 @@ impl Default for ProvidersConfig {
             gemini: true,
             opencode: true,
             cursor: true,
+            hermes: true,
         }
     }
 }
@@ -967,7 +970,7 @@ mod tests {
     #[test]
     fn providers_default_all_enabled() {
         let p = ProvidersConfig::default();
-        assert!(p.claude && p.codex && p.copilot && p.gemini && p.opencode && p.cursor);
+        assert!(p.claude && p.codex && p.copilot && p.gemini && p.opencode && p.cursor && p.hermes);
     }
 
     #[test]

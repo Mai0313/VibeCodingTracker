@@ -15,7 +15,9 @@ use crate::models::{
     CodeAnalysis, ExtensionType, PerProviderUsage, Provider, ProviderActiveDays, UsageResult,
 };
 use crate::pricing::{ModelPricingMap, calculate_cost};
-use crate::session::{ParseMode, parse_session_file_as, read_cursor_usage, read_opencode_usage};
+use crate::session::{
+    ParseMode, parse_session_file_as, read_cursor_usage, read_hermes_usage, read_opencode_usage,
+};
 use crate::utils::{
     COPILOT_SESSION_MAX_DEPTH, HelperPaths, TokenCounts, collect_files_with_max_depth,
     is_claude_session_file, is_codex_session_file, is_copilot_session_file, is_gemini_session_file,
@@ -82,6 +84,8 @@ pub struct StoredCosts {
     pub opencode: FastHashMap<String, f64>,
     /// Cursor's per-model dashboard cost, keyed by model name.
     pub cursor: FastHashMap<String, f64>,
+    /// Hermes's per-model stored cost, keyed by model name.
+    pub hermes: FastHashMap<String, f64>,
 }
 
 /// Extracts token usage data from a typed `CodeAnalysis`.
@@ -187,6 +191,7 @@ pub fn get_usage_from_paths_with(
     let mut gemini_dates: HashSet<String> = HashSet::new();
     let mut opencode_dates: HashSet<String> = HashSet::new();
     let mut cursor_dates: HashSet<String> = HashSet::new();
+    let mut hermes_dates: HashSet<String> = HashSet::new();
 
     if providers.claude && paths.claude_session_dir.exists() {
         // Walks the projects tree recursively, so top-level `<session>.jsonl` logs
@@ -284,6 +289,24 @@ pub fn get_usage_from_paths_with(
         eprintln!("Warning: Failed to read Cursor usage: {err}");
     }
 
+    // Hermes, like OpenCode, is a single SQLite database read directly.
+    if providers.hermes
+        && paths.hermes_db.exists()
+        && let Err(err) = process_hermes_usage(
+            &paths.hermes_db,
+            &mut result,
+            &mut per_provider.hermes,
+            &mut stored_costs.hermes,
+            &mut hermes_dates,
+            time_range,
+        )
+    {
+        eprintln!(
+            "Warning: Failed to read Hermes DB {}: {err}",
+            paths.hermes_db.display()
+        );
+    }
+
     let mut all_dates: HashSet<&String> = HashSet::new();
     all_dates.extend(claude_dates.iter());
     all_dates.extend(codex_dates.iter());
@@ -291,6 +314,7 @@ pub fn get_usage_from_paths_with(
     all_dates.extend(gemini_dates.iter());
     all_dates.extend(opencode_dates.iter());
     all_dates.extend(cursor_dates.iter());
+    all_dates.extend(hermes_dates.iter());
 
     let provider_days = ProviderActiveDays {
         claude: claude_dates.len(),
@@ -299,6 +323,7 @@ pub fn get_usage_from_paths_with(
         gemini: gemini_dates.len(),
         opencode: opencode_dates.len(),
         cursor: cursor_dates.len(),
+        hermes: hermes_dates.len(),
         total: all_dates.len(),
     };
 
@@ -454,6 +479,34 @@ fn process_cursor_usage(
     Ok(())
 }
 
+/// Reads Hermes's per-model usage from its SQLite database and merges it into
+/// both the global and Hermes-scoped maps.
+///
+/// Mirrors [`process_opencode_usage`]: Hermes stores its own per-model cost, so
+/// it uses the same stored-cost path rather than a fuzzy price guess.
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be opened or queried.
+fn process_hermes_usage(
+    db_path: &Path,
+    global_result: &mut UsageResult,
+    provider_result: &mut UsageResult,
+    stored_costs: &mut FastHashMap<String, f64>,
+    unique_dates: &mut HashSet<String>,
+    time_range: TimeRange,
+) -> Result<()> {
+    let sessions = read_hermes_usage(db_path, time_range)?;
+    fold_stored_cost_sessions(
+        sessions,
+        global_result,
+        provider_result,
+        stored_costs,
+        unique_dates,
+    );
+    Ok(())
+}
+
 /// Folds `(date, analysis, cost)` rows from a stored-cost provider (OpenCode /
 /// Cursor) into the global + provider-scoped maps and the stored-cost table.
 fn fold_stored_cost_sessions(
@@ -502,6 +555,12 @@ pub enum CostSource {
     /// built), so a merged row can't be re-scored against another provider's
     /// same-named model.
     CursorStored(f64),
+    /// Hermes: same basis as [`OpenCodeStored`] — an **exact** LiteLLM match
+    /// prices from tokens, otherwise Hermes's own stored cost is used. Hermes
+    /// often bills novel models LiteLLM can't price, so its own number is the
+    /// safest fallback; the map is kept separate so a colliding bare model name
+    /// can't cross-contaminate another provider's cost.
+    HermesStored(f64),
 }
 
 /// Resolves the USD cost (and optional matched-model annotation) for one model.
@@ -533,11 +592,14 @@ pub fn resolve_model_cost(
     match source {
         // Cursor's dashboard cost is authoritative; never re-price from tokens.
         CostSource::CursorStored(stored) => (stored, None),
-        // OpenCode: only trust an exact price match; otherwise use its own cost.
-        CostSource::OpenCodeStored(stored) => match pricing_map.get_exact(model) {
-            Some(pricing) => (priced(&pricing), None),
-            None => (stored, None),
-        },
+        // OpenCode / Hermes: only trust an exact price match; otherwise use the
+        // provider's own stored cost.
+        CostSource::OpenCodeStored(stored) | CostSource::HermesStored(stored) => {
+            match pricing_map.get_exact(model) {
+                Some(pricing) => (priced(&pricing), None),
+                None => (stored, None),
+            }
+        }
         CostSource::Litellm => {
             let result = pricing_map.get(model);
             (priced(&result.pricing), result.matched_model)

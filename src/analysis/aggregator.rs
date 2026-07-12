@@ -285,6 +285,8 @@ pub fn aggregate_sessions_by_model_from_paths_with(
         gemini: gemini_dates.len(),
         opencode: opencode_dates.len(),
         cursor: cursor_dates.len(),
+        // Hermes is a usage-only provider; the analysis view never reads it.
+        hermes: 0,
         total: all_dates.len(),
     };
 

@@ -13,12 +13,14 @@ pub mod copilot;
 pub mod cursor;
 pub mod detector;
 pub mod gemini;
+pub mod hermes;
 pub mod opencode;
 pub mod parser;
 pub mod state;
 
 pub use cursor::{read_cursor_analysis, read_cursor_usage};
 pub use detector::{classify_records, detect_extension_type};
+pub use hermes::read_hermes_usage;
 pub use opencode::{read_opencode_analysis, read_opencode_usage};
 pub use parser::{
     parse_session_file, parse_session_file_as, parse_session_file_typed,

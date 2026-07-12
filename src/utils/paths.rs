@@ -53,6 +53,8 @@ pub struct HelperPaths {
     pub opencode_dir: PathBuf,
     /// OpenCode SQLite database (`<opencode_dir>/opencode.db`).
     pub opencode_db: PathBuf,
+    /// Hermes SQLite database (`~/.hermes/state.db`).
+    pub hermes_db: PathBuf,
     /// This tool's cache directory (`~/.vct`).
     pub cache_dir: PathBuf,
 }
@@ -79,11 +81,51 @@ pub fn resolve_paths() -> Result<HelperPaths> {
         .map(PathBuf::from)
         .filter(|p| p.is_absolute());
 
+    // Hermes honours `$HERMES_HOME`, else the platform-native default
+    // (`%LOCALAPPDATA%\hermes` on Windows, `~/.hermes` on POSIX), matching its
+    // own `get_hermes_home`.
+    let hermes_home_env = std::env::var_os("HERMES_HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty());
+    let local_appdata = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty());
+    let hermes_home = resolve_hermes_home(
+        &home_dir,
+        hermes_home_env.as_deref(),
+        local_appdata.as_deref(),
+        cfg!(target_os = "windows"),
+    );
+
     Ok(build_paths(
         &home_dir,
         xdg_config.as_deref(),
         xdg_data.as_deref(),
+        Some(&hermes_home),
     ))
+}
+
+/// Resolves the Hermes home directory the way Hermes's `get_hermes_home` does:
+/// an explicit `HERMES_HOME` wins, otherwise the platform-native default
+/// (`%LOCALAPPDATA%\hermes` on Windows — falling back to `~/AppData/Local/hermes`
+/// when `LOCALAPPDATA` is unset — and `~/.hermes` on POSIX). Env values are
+/// injected rather than read here so the resolution stays testable.
+fn resolve_hermes_home(
+    home_dir: &Path,
+    hermes_home: Option<&Path>,
+    local_appdata: Option<&Path>,
+    is_windows: bool,
+) -> PathBuf {
+    if let Some(home) = hermes_home {
+        return home.to_path_buf();
+    }
+    if is_windows {
+        return local_appdata
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| home_dir.join("AppData").join("Local"))
+            .join("hermes");
+    }
+    home_dir.join(".hermes")
 }
 
 /// Builds a [`HelperPaths`] rooted at an explicit home directory, ignoring the
@@ -94,16 +136,22 @@ pub fn resolve_paths() -> Result<HelperPaths> {
 /// unset. This is the seam tests use to point every provider path at a temp
 /// directory without mutating process-global `HOME`/`XDG_*` state.
 pub fn resolve_paths_from_home(home_dir: &Path) -> HelperPaths {
-    build_paths(home_dir, None, None)
+    build_paths(home_dir, None, None, None)
 }
 
 /// Pure path composition shared by [`resolve_paths`] and
 /// [`resolve_paths_from_home`].
 ///
 /// `xdg_config` / `xdg_data`, when `Some`, override the base of the Cursor
-/// config dir and the OpenCode data dir respectively; otherwise both derive
-/// from `home_dir`.
-fn build_paths(home_dir: &Path, xdg_config: Option<&Path>, xdg_data: Option<&Path>) -> HelperPaths {
+/// config dir and the OpenCode data dir respectively; `hermes_home`, when
+/// `Some`, is the resolved Hermes home directory. All otherwise derive from
+/// `home_dir` (the Hermes fallback being `~/.hermes`).
+fn build_paths(
+    home_dir: &Path,
+    xdg_config: Option<&Path>,
+    xdg_data: Option<&Path>,
+    hermes_home: Option<&Path>,
+) -> HelperPaths {
     let codex_dir = home_dir.join(".codex");
     let codex_session_dir = codex_dir.join("sessions");
     let claude_dir = home_dir.join(".claude");
@@ -138,6 +186,12 @@ fn build_paths(home_dir: &Path, xdg_config: Option<&Path>, xdg_data: Option<&Pat
         .unwrap_or_else(|| home_dir.join(".local").join("share"))
         .join("opencode");
     let opencode_db = opencode_dir.join("opencode.db");
+    // Hermes keeps a single SQLite database under its home dir (`$HERMES_HOME`
+    // or the platform default), falling back to `~/.hermes`.
+    let hermes_db = hermes_home
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| home_dir.join(".hermes"))
+        .join("state.db");
     let cache_dir = home_dir.join(".vct");
 
     HelperPaths {
@@ -155,6 +209,7 @@ fn build_paths(home_dir: &Path, xdg_config: Option<&Path>, xdg_data: Option<&Pat
         gemini_session_dir,
         opencode_dir,
         opencode_db,
+        hermes_db,
         cache_dir,
     }
 }
@@ -440,6 +495,7 @@ mod tests {
         assert_eq!(p.gemini_session_dir, home.join(".gemini").join("tmp"));
         assert_eq!(p.opencode_db, p.opencode_dir.join("opencode.db"));
         assert!(p.opencode_dir.ends_with("opencode"));
+        assert_eq!(p.hermes_db, home.join(".hermes").join("state.db"));
 
         // Cursor config dir uses the non-XDG default (`~/.config/cursor`); its
         // session data lives under `~/.cursor`.
@@ -458,6 +514,39 @@ mod tests {
         ] {
             assert!(d.starts_with(home), "{d:?} should be under {home:?}");
         }
+    }
+
+    #[test]
+    fn resolve_hermes_home_honors_env_and_platform_defaults() {
+        let home = Path::new("/home/u");
+
+        // HERMES_HOME wins on every platform.
+        let explicit = Path::new("/opt/data/hermes");
+        assert_eq!(
+            resolve_hermes_home(home, Some(explicit), None, false),
+            explicit
+        );
+        assert_eq!(
+            resolve_hermes_home(home, Some(explicit), Some(Path::new("/x")), true),
+            explicit
+        );
+
+        // POSIX default: ~/.hermes.
+        assert_eq!(
+            resolve_hermes_home(home, None, None, false),
+            home.join(".hermes")
+        );
+
+        // Windows default: %LOCALAPPDATA%\hermes, else ~/AppData/Local/hermes.
+        let local = Path::new("/c/Users/u/AppData/Local");
+        assert_eq!(
+            resolve_hermes_home(home, None, Some(local), true),
+            local.join("hermes")
+        );
+        assert_eq!(
+            resolve_hermes_home(home, None, None, true),
+            home.join("AppData").join("Local").join("hermes")
+        );
     }
 
     #[test]
