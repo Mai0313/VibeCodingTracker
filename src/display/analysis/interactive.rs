@@ -15,8 +15,8 @@ use crate::display::common::table::{
     render_scrollable_table, render_too_small, styled_row,
 };
 use crate::display::common::tui::{
-    InputAction, RefreshState, ScrollState, UpdateTracker, handle_input, restore_terminal,
-    setup_terminal,
+    InputAction, RefreshState, ScrollState, UpdateTracker, handle_input, overlay_repo_hyperlink,
+    restore_terminal, setup_terminal,
 };
 use crate::utils::format_compact;
 use ratatui::{
@@ -309,7 +309,7 @@ fn render_analysis_frame(
 ) -> anyhow::Result<()> {
     let provider_rows = build_analysis_provider_rows(provider_totals);
 
-    terminal.draw(|f| {
+    let completed = terminal.draw(|f| {
         let area = f.area();
         if area.width < ANALYSIS_MIN_W || area.height < ANALYSIS_MIN_H {
             render_too_small(f, ANALYSIS_MIN_W, ANALYSIS_MIN_H);
@@ -489,6 +489,10 @@ fn render_analysis_frame(
 
         f.render_widget(create_controls(&[]), chunks.controls);
     })?;
+
+    // ratatui can't embed the OSC 8 escape itself, so hyperlink the repo label
+    // it just drew (a no-op on terminals without hyperlink support).
+    overlay_repo_hyperlink(completed.buffer)?;
 
     Ok(())
 }

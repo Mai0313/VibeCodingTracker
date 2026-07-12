@@ -5,17 +5,20 @@
 //! refreshes ([`RefreshState`]) and recently-changed row highlighting
 //! ([`UpdateTracker`]).
 
+use crate::display::common::table::{REPO_LABEL, REPO_URL};
 use crossterm::{
+    cursor::MoveTo,
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    execute,
+    execute, queue,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
+    buffer::Buffer,
     widgets::{ScrollbarState, TableState},
 };
-use std::io;
+use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
 /// Puts the terminal into raw mode and the alternate screen, returning a ready [`Terminal`].
@@ -53,6 +56,62 @@ pub fn restore_terminal(
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+/// Layers an OSC 8 terminal hyperlink over the repo label the footer just drew.
+///
+/// ratatui's cell buffer can't carry the escape sequence itself (the bytes would
+/// throw off width accounting), so this runs *after* `terminal.draw()`: it finds
+/// the plain [`REPO_LABEL`] on the frame's bottom row and re-emits the identical
+/// glyphs wrapped in OSC 8, pointing at [`REPO_URL`]. The visible text is
+/// unchanged, so terminals without hyperlink support just ignore the wrapper.
+///
+/// It re-applies every frame because a redraw (resize, refresh) repaints the
+/// footer as plain text; writing the same bytes again is cheap and idempotent.
+///
+/// # Errors
+///
+/// Returns an error if writing the escape sequence to stdout fails.
+pub fn overlay_repo_hyperlink(buffer: &Buffer) -> io::Result<()> {
+    let Some((x, y)) = find_label_start(buffer) else {
+        return Ok(());
+    };
+
+    // OSC 8 open (params ; URL, ST-terminated), then cyan + underline to match
+    // the label ratatui drew, then reset, then the empty OSC 8 close.
+    let mut stdout = io::stdout();
+    queue!(stdout, MoveTo(x, y))?;
+    write!(
+        stdout,
+        "\x1b]8;;{REPO_URL}\x1b\\\x1b[36;4m{REPO_LABEL}\x1b[0m\x1b]8;;\x1b\\"
+    )?;
+    stdout.flush()
+}
+
+/// Finds the `(x, y)` of the first cell of [`REPO_LABEL`] on the frame's bottom
+/// row, or `None` when it was truncated off a narrow terminal.
+fn find_label_start(buffer: &Buffer) -> Option<(u16, u16)> {
+    let area = buffer.area;
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    // The controls footer is the bottom-most row of the frame.
+    let y = area.bottom() - 1;
+    // REPO_LABEL is ASCII, so every byte index is a char boundary and each cell
+    // holds exactly one of its characters.
+    let len = REPO_LABEL.len();
+    let last_x = area.right().checked_sub(len as u16)?;
+    for x in area.left()..=last_x {
+        let matches = (0..len).all(|i| {
+            buffer
+                .cell((x + i as u16, y))
+                .is_some_and(|cell| cell.symbol() == &REPO_LABEL[i..=i])
+        });
+        if matches {
+            return Some((x, y));
+        }
+    }
+    None
 }
 
 /// Handle terminal events and return the action to take.
@@ -363,5 +422,36 @@ impl ScrollState {
         let max = (selectable - 1) as i64;
         let next = self.table.selected().unwrap_or(0) as i64 + nav.lines;
         self.table.select(Some(next.clamp(0, max) as usize));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::display::common::table::create_controls;
+    use ratatui::layout::Rect;
+    use ratatui::widgets::Widget;
+
+    #[test]
+    fn find_label_start_locates_repo_label_on_bottom_row() {
+        let area = Rect::new(0, 0, 120, 1);
+        let mut buf = Buffer::empty(area);
+        create_controls(&[("m", " merge  ")]).render(area, &mut buf);
+
+        let (x, y) = find_label_start(&buf).expect("repo label should be present");
+        assert_eq!(y, 0);
+        let got: String = (0..REPO_LABEL.len())
+            .map(|i| buf.cell((x + i as u16, y)).unwrap().symbol())
+            .collect();
+        assert_eq!(got, REPO_LABEL);
+    }
+
+    #[test]
+    fn find_label_start_is_none_when_truncated() {
+        // Too narrow to fit the whole label → nothing to hyperlink.
+        let area = Rect::new(0, 0, 10, 1);
+        let mut buf = Buffer::empty(area);
+        create_controls(&[]).render(area, &mut buf);
+        assert!(find_label_start(&buf).is_none());
     }
 }

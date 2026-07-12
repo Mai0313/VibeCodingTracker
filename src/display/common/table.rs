@@ -85,13 +85,20 @@ pub fn create_summary<'a>(
         .centered()
 }
 
-/// Builds the single-line key-hint footer (navigation + the GitHub star link).
+/// Short call-to-action shown in the footer (also the OSC 8 hyperlink text).
+pub const REPO_LABEL: &str = "Star on GitHub";
+/// URL the footer's repository label points at when clicked.
+pub const REPO_URL: &str = "https://github.com/Mai0313/VibeCodingTracker";
+
+/// Builds the single-line key-hint footer (navigation + the GitHub repo link).
 ///
-/// Everything is on one line to save vertical space; the star link sits last so
+/// Everything is on one line to save vertical space; the repo link sits last so
 /// it is the first thing truncated on a narrow terminal, leaving the keys
 /// readable. `extra` inserts view-specific `(key, label)` hints just before
 /// `r refresh` — the usage view passes its `m merge` toggle; other views pass
-/// an empty slice.
+/// an empty slice. The label is drawn as plain (underlined) text here; a
+/// terminal hyperlink is layered on afterward by
+/// [`overlay_repo_hyperlink`](super::tui::overlay_repo_hyperlink).
 pub fn create_controls(extra: &[(&str, &str)]) -> Paragraph<'static> {
     let key = Style::default().fg(RatatuiColor::Cyan).bold();
     let dim = Style::default().fg(RatatuiColor::DarkGray);
@@ -107,12 +114,9 @@ pub fn create_controls(extra: &[(&str, &str)]) -> Paragraph<'static> {
         Style::default().fg(RatatuiColor::Red).bold(),
     ));
     spans.push(Span::styled(" quit", dim));
+    spans.push(Span::styled("  |  ", dim));
     spans.push(Span::styled(
-        "  |  ★ ",
-        Style::default().fg(RatatuiColor::Yellow),
-    ));
-    spans.push(Span::styled(
-        "github.com/Mai0313/VibeCodingTracker",
+        REPO_LABEL,
         Style::default().fg(RatatuiColor::Cyan).underlined(),
     ));
     Paragraph::new(vec![Line::from(spans)]).centered()
