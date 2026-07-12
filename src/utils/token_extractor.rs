@@ -111,19 +111,21 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
                 .unwrap_or(0);
         }
 
-        // Gemini writes reasoning budget as `thoughts_tokens`; Copilot's
-        // shutdown usage is normalised to `reasoning_output_tokens` by
-        // `session::copilot::parse_copilot_events`. Either key feeds the
-        // same bucket — we never see both on the same record.
-        if let Some(thoughts) = usage_obj.get("thoughts_tokens").and_then(|v| v.as_i64()) {
-            counts.reasoning_tokens = thoughts;
-        }
-        if let Some(reasoning) = usage_obj
+        // Gemini writes reasoning budget as `thoughts_tokens`; the flat
+        // providers (Copilot / OpenCode / Hermes) use `reasoning_output_tokens`.
+        // A single record only carries one of them, but a cross-provider merge
+        // of the same model (e.g. Gemini CLI and Hermes both using `gemini-*`)
+        // keeps both keys, so sum them — an overwrite would drop the other
+        // provider's thinking-time tokens from the merged Output/Total.
+        let thoughts = usage_obj
+            .get("thoughts_tokens")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let reasoning_output = usage_obj
             .get("reasoning_output_tokens")
             .and_then(|v| v.as_i64())
-        {
-            counts.reasoning_tokens = reasoning;
-        }
+            .unwrap_or(0);
+        counts.reasoning_tokens = thoughts + reasoning_output;
 
         // Claude Code records cache_creation split by TTL:
         //   "cache_creation": { ephemeral_5m_input_tokens, ephemeral_1h_input_tokens }
@@ -252,6 +254,26 @@ mod tests {
         assert_eq!(c.cache_creation, 10_338);
         assert_eq!(c.cache_creation_5m, 0);
         assert_eq!(c.cache_creation_1h, 10_338);
+    }
+
+    #[test]
+    fn merged_thoughts_and_reasoning_output_are_summed() {
+        // A single record carries only one reasoning key, but a cross-provider
+        // merge (Gemini `thoughts_tokens` + a flat `reasoning_output_tokens` for
+        // the same model) keeps both — they must add, not overwrite.
+        let gemini_only = json!({ "input_tokens": 10, "thoughts_tokens": 30 });
+        assert_eq!(extract_token_counts(&gemini_only).reasoning_tokens, 30);
+
+        let flat_only = json!({ "input_tokens": 10, "reasoning_output_tokens": 7 });
+        assert_eq!(extract_token_counts(&flat_only).reasoning_tokens, 7);
+
+        let merged = json!({
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "thoughts_tokens": 30,
+            "reasoning_output_tokens": 7,
+        });
+        assert_eq!(extract_token_counts(&merged).reasoning_tokens, 37);
     }
 
     #[test]
