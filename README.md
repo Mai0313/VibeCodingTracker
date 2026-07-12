@@ -19,7 +19,7 @@
 
 </div>
 
-**Track your AI coding costs in real-time.** Vibe Coding Tracker is a lightweight, high-performance CLI tool built in Rust that monitors and analyzes your Claude Code, Codex, Copilot, Gemini, OpenCode, and Cursor usage — with detailed cost breakdowns, token statistics, and code operation insights, all while keeping the memory footprint minimal.
+**Track your AI coding costs in real-time.** Vibe Coding Tracker is a lightweight, high-performance CLI tool built in Rust that monitors and analyzes your Claude Code, Codex, Copilot, Gemini, OpenCode, Cursor, and Hermes usage — with detailed cost breakdowns, token statistics, and code operation insights, all while keeping the memory footprint minimal.
 
 [English](README.md) | [繁體中文](README.zh-TW.md) | [简体中文](README.zh-CN.md)
 
@@ -48,7 +48,7 @@ Choose your preferred view:
 
 ### Zero Configuration
 
-Automatically detects and processes logs from Claude Code, Codex, Copilot, Gemini, OpenCode, and Cursor. No setup required — just run and analyze. A `~/.vct/config.toml` is created with sensible defaults on first run if you ever want to tweak behavior (see [Configuration](#configuration)).
+Automatically detects and processes logs from Claude Code, Codex, Copilot, Gemini, OpenCode, Cursor, and Hermes. No setup required — just run and analyze. A `~/.vct/config.toml` is created with sensible defaults on first run if you ever want to tweak behavior (see [Configuration](#configuration)).
 
 ### Rich Insights
 
@@ -62,15 +62,15 @@ Automatically detects and processes logs from Claude Code, Codex, Copilot, Gemin
 
 ## Key Features
 
-| Feature               | Description                                                                  |
-| --------------------- | ---------------------------------------------------------------------------- |
-| **Multi-Provider**    | Claude Code, Codex, Copilot, Gemini, OpenCode, and Cursor — all in one place |
-| **Smart Pricing**     | Fuzzy model matching + daily cache from LiteLLM                              |
-| **4 Display Modes**   | Interactive TUI, static table, plain text, and JSON                          |
-| **Dual Analysis**     | Token/cost stats (`usage`) + code operation stats (`analysis`)               |
-| **Live Quota Panels** | Live remaining quota for Claude, Codex, Copilot, and Cursor                  |
-| **Ultra-Lightweight** | Under ~50 MB RSS in the TUI, streaming JSONL parse — built with Rust         |
-| **Live Updates**      | Auto-refreshing dashboard (every 10s) with change highlighting               |
+| Feature               | Description                                                                          |
+| --------------------- | ------------------------------------------------------------------------------------ |
+| **Multi-Provider**    | Claude Code, Codex, Copilot, Gemini, OpenCode, Cursor, and Hermes — all in one place |
+| **Smart Pricing**     | Fuzzy model matching + daily cache from LiteLLM                                      |
+| **4 Display Modes**   | Interactive TUI, static table, plain text, and JSON                                  |
+| **Dual Analysis**     | Token/cost stats (`usage`) + code operation stats (`analysis`)                       |
+| **Live Quota Panels** | Live remaining quota for Claude, Codex, Copilot, and Cursor                          |
+| **Ultra-Lightweight** | Under ~50 MB RSS in the TUI, streaming JSONL parse — built with Rust                 |
+| **Live Updates**      | Auto-refreshing dashboard (every 10s) with change highlighting                       |
 
 ---
 
@@ -291,6 +291,7 @@ The tool automatically scans these directories:
 - `~/.gemini/tmp/<project_hash>/chats/*.jsonl` (Gemini CLI)
 - `~/.local/share/opencode/opencode.db` (OpenCode — SQLite database; honors `$XDG_DATA_HOME`)
 - `~/.cursor/chats/*/*/store.db` (Cursor — SQLite chat stores, used for `analysis` and a local `usage` estimate consistent with the other providers)
+- `~/.hermes/state.db` (Hermes — SQLite database; `usage` only)
 
 ### Live Quota Panels
 
@@ -607,6 +608,7 @@ vct config migrate
 
 - **Beyond tokens**: Claude web-search tool calls (`server_tool_use.web_search_requests`) are billed per query on top of the token cost; every other model's per-query charge is $0.
 - **OpenCode**: a novel model name is priced from its tokens only on an **exact** LiteLLM match; with no exact match, vct trusts the assistant message's own stored cost instead of guessing from a loosely-similar name.
+- **Hermes**: priced the same way as OpenCode — an **exact** LiteLLM match prices from tokens, otherwise vct uses Hermes's own stored cost.
 - **Cache is raw**: the daily cache stores the filtered upstream LiteLLM JSON (not a derived shape), so tiered / batch pricing stays available without re-fetching, and a small in-process LRU keeps repeated lookups cheap during a TUI refresh.
 
 ---

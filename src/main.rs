@@ -435,6 +435,10 @@ fn resolve_enriched_model_cost(
             &usage_data.per_provider.cursor,
             CostSource::CursorStored(stored(&usage_data.stored_costs.cursor)),
         ),
+        (
+            &usage_data.per_provider.hermes,
+            CostSource::HermesStored(stored(&usage_data.stored_costs.hermes)),
+        ),
     ] {
         if let Some(raw_usage) = usage.get(model) {
             found = true;

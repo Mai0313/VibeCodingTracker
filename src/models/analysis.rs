@@ -210,6 +210,8 @@ pub enum ExtensionType {
     OpenCode,
     /// Cursor CLI / IDE.
     Cursor,
+    /// Hermes.
+    Hermes,
 }
 
 impl std::fmt::Display for ExtensionType {
@@ -221,6 +223,7 @@ impl std::fmt::Display for ExtensionType {
             ExtensionType::Gemini => write!(f, "Gemini"),
             ExtensionType::OpenCode => write!(f, "OpenCode"),
             ExtensionType::Cursor => write!(f, "Cursor"),
+            ExtensionType::Hermes => write!(f, "Hermes"),
         }
     }
 }

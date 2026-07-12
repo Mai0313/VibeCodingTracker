@@ -22,6 +22,8 @@ pub struct ProviderTotals<S> {
     pub opencode: S,
     /// Totals for Cursor sessions.
     pub cursor: S,
+    /// Totals for Hermes sessions.
+    pub hermes: S,
     /// Sum across every provider (the "All Providers" bucket).
     pub overall: S,
 }
@@ -35,6 +37,7 @@ impl<S: Default> Default for ProviderTotals<S> {
             gemini: S::default(),
             opencode: S::default(),
             cursor: S::default(),
+            hermes: S::default(),
             overall: S::default(),
         }
     }
@@ -53,6 +56,7 @@ impl<S> ProviderTotals<S> {
             Provider::Gemini => &self.gemini,
             Provider::OpenCode => &self.opencode,
             Provider::Cursor => &self.cursor,
+            Provider::Hermes => &self.hermes,
             Provider::Unknown => &self.overall,
         }
     }
@@ -69,6 +73,7 @@ impl<S> ProviderTotals<S> {
             Provider::Gemini => &mut self.gemini,
             Provider::OpenCode => &mut self.opencode,
             Provider::Cursor => &mut self.cursor,
+            Provider::Hermes => &mut self.hermes,
             Provider::Unknown => &mut self.overall,
         }
     }

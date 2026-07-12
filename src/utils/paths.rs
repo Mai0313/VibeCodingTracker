@@ -53,6 +53,8 @@ pub struct HelperPaths {
     pub opencode_dir: PathBuf,
     /// OpenCode SQLite database (`<opencode_dir>/opencode.db`).
     pub opencode_db: PathBuf,
+    /// Hermes SQLite database (`~/.hermes/state.db`).
+    pub hermes_db: PathBuf,
     /// This tool's cache directory (`~/.vct`).
     pub cache_dir: PathBuf,
 }
@@ -138,6 +140,8 @@ fn build_paths(home_dir: &Path, xdg_config: Option<&Path>, xdg_data: Option<&Pat
         .unwrap_or_else(|| home_dir.join(".local").join("share"))
         .join("opencode");
     let opencode_db = opencode_dir.join("opencode.db");
+    // Hermes keeps a single SQLite database directly under the home directory.
+    let hermes_db = home_dir.join(".hermes").join("state.db");
     let cache_dir = home_dir.join(".vct");
 
     HelperPaths {
@@ -155,6 +159,7 @@ fn build_paths(home_dir: &Path, xdg_config: Option<&Path>, xdg_data: Option<&Pat
         gemini_session_dir,
         opencode_dir,
         opencode_db,
+        hermes_db,
         cache_dir,
     }
 }
@@ -440,6 +445,7 @@ mod tests {
         assert_eq!(p.gemini_session_dir, home.join(".gemini").join("tmp"));
         assert_eq!(p.opencode_db, p.opencode_dir.join("opencode.db"));
         assert!(p.opencode_dir.ends_with("opencode"));
+        assert_eq!(p.hermes_db, home.join(".hermes").join("state.db"));
 
         // Cursor config dir uses the non-XDG default (`~/.config/cursor`); its
         // session data lives under `~/.cursor`.
