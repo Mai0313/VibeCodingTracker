@@ -53,6 +53,59 @@
       },
       "type": "object"
     },
+    "logging": {
+      "default": {
+        "level": "warn",
+        "retention_days": 7
+      },
+      "description": "`[logging]` — file logging preferences.\n\nDiagnostics are written to `~/.vct/logs/vct-YYYY-MM-DD.log` (plain text, one\nline per record). Nothing is ever printed to the terminal, so the TUI is\nnever disturbed. The log file is created lazily on the first record, so a\ncommand that logs nothing never touches `~/.vct`.",
+      "properties": {
+        "level": {
+          "default": "warn",
+          "description": "Minimum level written to the log file.\nOne of: \"off\" | \"error\" | \"warn\" | \"info\" | \"debug\" | \"trace\".",
+          "oneOf": [
+            {
+              "const": "off",
+              "description": "Disable file logging entirely.",
+              "type": "string"
+            },
+            {
+              "const": "error",
+              "description": "Only errors.",
+              "type": "string"
+            },
+            {
+              "const": "warn",
+              "description": "Errors and warnings (the default — quiet when healthy, records problems).",
+              "type": "string"
+            },
+            {
+              "const": "info",
+              "description": "Adds high-level informational breadcrumbs.",
+              "type": "string"
+            },
+            {
+              "const": "debug",
+              "description": "Adds verbose diagnostics (per-file parse skips, quota poll detail).",
+              "type": "string"
+            },
+            {
+              "const": "trace",
+              "description": "Everything, including cache-hit traces.",
+              "type": "string"
+            }
+          ]
+        },
+        "retention_days": {
+          "default": 7,
+          "description": "Days of daily log files to keep; older `vct-*.log` files are pruned on\nstartup. `0` keeps every file.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "providers": {
       "default": {
         "claude": true,

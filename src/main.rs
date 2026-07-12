@@ -54,7 +54,9 @@ fn main() -> Result<()> {
     // for why this matters on long TUI sessions.
     vibe_coding_tracker::utils::tune_system_allocator();
 
-    env_logger::init();
+    // Install the file logger (default level `warn`) before anything can log or
+    // panic. It writes only to `~/.vct/logs/`, never the terminal.
+    vibe_coding_tracker::logging::init();
 
     if matches!(
         std::env::args_os().nth(1).and_then(|arg| arg.into_string().ok()),
@@ -64,6 +66,17 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    let result = run();
+    if let Err(error) = &result {
+        // Record the final error before anyhow prints it to stderr and the
+        // process exits — the log file is the durable record of the failure.
+        log::error!("command failed: {error:#}");
+    }
+    result
+}
+
+/// Parses the CLI and dispatches the selected subcommand.
+fn run() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -95,6 +108,7 @@ fn main() -> Result<()> {
                     // so `analysis --path`, `version`, `fetch`, etc. never read or
                     // create `~/.vct/config.toml`.
                     let config = vibe_coding_tracker::config::load();
+                    vibe_coding_tracker::logging::apply(&config.logging);
                     let time_range = resolve_time_range_with_default(
                         daily,
                         weekly,
@@ -147,6 +161,7 @@ fn main() -> Result<()> {
             all,
         } => {
             let config = vibe_coding_tracker::config::load();
+            vibe_coding_tracker::logging::apply(&config.logging);
             let time_range = resolve_time_range_with_default(
                 daily,
                 weekly,
@@ -164,6 +179,7 @@ fn main() -> Result<()> {
                 let pricing_map = match fetch_model_pricing() {
                     Ok(map) => map,
                     Err(e) => {
+                        log::warn!("failed to fetch pricing data: {e}; costs unavailable");
                         eprintln!(
                             "Warning: Failed to fetch pricing data: {}. Costs will be unavailable.",
                             e

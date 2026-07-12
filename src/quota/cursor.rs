@@ -177,21 +177,31 @@ fn fetch_cursor_usage(client: &Client, cookie: &str, now: i64, usage_url: &str) 
         .send()
     {
         Ok(r) => r,
-        Err(_) => return FetchResult::Transient,
+        Err(e) => {
+            log::warn!("cursor quota fetch: request failed: {e}");
+            return FetchResult::Transient;
+        }
     };
     let status = resp.status();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
         return FetchResult::Unauthorized;
     }
     if !status.is_success() {
+        log::warn!("cursor quota fetch: HTTP {status}");
         return FetchResult::Transient;
     }
     match resp.text() {
         Ok(text) => match map_cursor_usage(&text, now) {
             Ok(snap) => FetchResult::Ok(snap),
-            Err(_) => FetchResult::Transient,
+            Err(e) => {
+                log::warn!("cursor quota fetch: failed to parse usage response: {e}");
+                FetchResult::Transient
+            }
         },
-        Err(_) => FetchResult::Transient,
+        Err(e) => {
+            log::warn!("cursor quota fetch: failed to read response body: {e}");
+            FetchResult::Transient
+        }
     }
 }
 

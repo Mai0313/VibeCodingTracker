@@ -259,7 +259,10 @@ fn fetch_claude_usage(client: &Client, token: &str, now: i64, usage_url: &str) -
         .send()
     {
         Ok(r) => r,
-        Err(_) => return FetchResult::Transient,
+        Err(e) => {
+            log::warn!("claude quota fetch: request failed: {e}");
+            return FetchResult::Transient;
+        }
     };
     let status = resp.status();
     if status == reqwest::StatusCode::UNAUTHORIZED {
@@ -267,14 +270,21 @@ fn fetch_claude_usage(client: &Client, token: &str, now: i64, usage_url: &str) -
     }
     if !status.is_success() {
         // 403 and friends are not treated as "needs login" (S9).
+        log::warn!("claude quota fetch: HTTP {status}");
         return FetchResult::Transient;
     }
     match resp.text() {
         Ok(text) => match map_claude_usage(&text, now) {
             Ok(snap) => FetchResult::Ok(snap),
-            Err(_) => FetchResult::Transient,
+            Err(e) => {
+                log::warn!("claude quota fetch: failed to parse usage response: {e}");
+                FetchResult::Transient
+            }
         },
-        Err(_) => FetchResult::Transient,
+        Err(e) => {
+            log::warn!("claude quota fetch: failed to read response body: {e}");
+            FetchResult::Transient
+        }
     }
 }
 

@@ -265,8 +265,8 @@ pub fn get_usage_from_paths_with(
             time_range,
         )
     {
-        eprintln!(
-            "Warning: Failed to read OpenCode DB {}: {err}",
+        log::warn!(
+            "failed to read OpenCode DB {}: {err}",
             paths.opencode_db.display()
         );
     }
@@ -286,7 +286,7 @@ pub fn get_usage_from_paths_with(
             time_range,
         )
     {
-        eprintln!("Warning: Failed to read Cursor usage: {err}");
+        log::warn!("failed to read Cursor usage: {err}");
     }
 
     // Hermes, like OpenCode, is a single SQLite database read directly.
@@ -301,8 +301,8 @@ pub fn get_usage_from_paths_with(
             time_range,
         )
     {
-        eprintln!(
-            "Warning: Failed to read Hermes DB {}: {err}",
+        log::warn!(
+            "failed to read Hermes DB {}: {err}",
             paths.hermes_db.display()
         );
     }
@@ -386,11 +386,7 @@ where
                     Some((file_info.modified_date.clone(), conversation_usage))
                 }
                 Err(e) => {
-                    eprintln!(
-                        "Warning: Failed to analyze {}: {}",
-                        file_info.path.display(),
-                        e
-                    );
+                    log::warn!("failed to analyze {}: {e}", file_info.path.display());
                     None
                 }
             }

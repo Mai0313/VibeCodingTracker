@@ -49,6 +49,8 @@ pub struct Config {
     pub analysis: AnalysisConfig,
     #[serde(default)]
     pub providers: ProvidersConfig,
+    #[serde(default)]
+    pub logging: LoggingConfig,
 }
 
 /// `[general]` — settings shared across subcommands.
@@ -192,8 +194,58 @@ impl Default for ProvidersConfig {
     }
 }
 
+/// `[logging]` — file logging preferences.
+///
+/// Diagnostics are written to `~/.vct/logs/vct-YYYY-MM-DD.log` (plain text, one
+/// line per record). Nothing is ever printed to the terminal, so the TUI is
+/// never disturbed. The log file is created lazily on the first record, so a
+/// command that logs nothing never touches `~/.vct`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct LoggingConfig {
+    /// Minimum level written to the log file.
+    /// One of: "off" | "error" | "warn" | "info" | "debug" | "trace".
+    #[serde(default)]
+    pub level: LogLevel,
+    /// Days of daily log files to keep; older `vct-*.log` files are pruned on
+    /// startup. `0` keeps every file.
+    #[serde(default = "default_log_retention_days")]
+    pub retention_days: u32,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: LogLevel::default(),
+            retention_days: default_log_retention_days(),
+        }
+    }
+}
+
+/// Minimum severity written to the log file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    /// Disable file logging entirely.
+    Off,
+    /// Only errors.
+    Error,
+    /// Errors and warnings (the default — quiet when healthy, records problems).
+    #[default]
+    Warn,
+    /// Adds high-level informational breadcrumbs.
+    Info,
+    /// Adds verbose diagnostics (per-file parse skips, quota poll detail).
+    Debug,
+    /// Everything, including cache-hit traces.
+    Trace,
+}
+
 fn default_true() -> bool {
     true
+}
+
+fn default_log_retention_days() -> u32 {
+    7
 }
 
 fn default_refresh_secs() -> u64 {
@@ -740,6 +792,8 @@ mod tests {
         assert_eq!(cfg.analysis.refresh_interval, 10);
         assert_eq!(cfg.providers, ProvidersConfig::default());
         assert!(cfg.providers.cursor);
+        assert_eq!(cfg.logging.level, LogLevel::Warn);
+        assert_eq!(cfg.logging.retention_days, 7);
     }
 
     #[test]
@@ -751,6 +805,9 @@ mod tests {
         assert!(cfg.providers.cursor);
         assert_eq!(cfg.usage.refresh_secs(), 10);
         assert_eq!(cfg.usage.quota_refresh_secs(), 60);
+        // A file with no [logging] section backfills the whole section default,
+        // which is what keeps the additive section migration-free.
+        assert_eq!(cfg.logging, LoggingConfig::default());
     }
 
     #[test]

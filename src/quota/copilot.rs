@@ -252,7 +252,10 @@ fn fetch_copilot_user(client: &Client, api_url: &str, token: &str, now: i64) -> 
         .send()
     {
         Ok(r) => r,
-        Err(_) => return FetchResult::Transient,
+        Err(e) => {
+            log::warn!("copilot quota fetch: request failed: {e}");
+            return FetchResult::Transient;
+        }
     };
     let status = resp.status();
     // Copilot has no refresh; a logged-out account answers 401 or 403.
@@ -260,14 +263,21 @@ fn fetch_copilot_user(client: &Client, api_url: &str, token: &str, now: i64) -> 
         return FetchResult::Unauthorized;
     }
     if !status.is_success() {
+        log::warn!("copilot quota fetch: HTTP {status}");
         return FetchResult::Transient;
     }
     match resp.text() {
         Ok(text) => match map_copilot_user(&text, now) {
             Ok(snap) => FetchResult::Ok(snap),
-            Err(_) => FetchResult::Transient,
+            Err(e) => {
+                log::warn!("copilot quota fetch: failed to parse user response: {e}");
+                FetchResult::Transient
+            }
         },
-        Err(_) => FetchResult::Transient,
+        Err(e) => {
+            log::warn!("copilot quota fetch: failed to read response body: {e}");
+            FetchResult::Transient
+        }
     }
 }
 

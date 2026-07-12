@@ -27,6 +27,7 @@ fn load_in_creates_default_commented_file_when_absent() {
     assert_eq!(cfg.usage.refresh_interval, 10);
     assert_eq!(cfg.usage.quota.refresh_interval, 60);
     assert_eq!(cfg.analysis.refresh_interval, 10);
+    assert_eq!(cfg.logging.retention_days, 7);
 
     let path = dir.join("config.toml");
     assert!(path.exists(), "first run must create config.toml");
@@ -36,6 +37,7 @@ fn load_in_creates_default_commented_file_when_absent() {
     assert!(text.contains("[usage]"));
     assert!(text.contains("[usage.quota]"));
     assert!(text.contains("[providers]"));
+    assert!(text.contains("[logging]"));
     assert!(text.contains("merge_models = false"));
     // A generated comment must survive so the file is self-documenting.
     assert!(text.contains("# Toggled live"));

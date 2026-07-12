@@ -107,11 +107,17 @@ impl CodexState {
     ) -> CodexFetch {
         let body = match std::fs::read_to_string(auth) {
             Ok(b) => b,
-            Err(_) => return CodexFetch::Transient,
+            Err(e) => {
+                log::warn!("codex quota: failed to read {}: {e}", auth.display());
+                return CodexFetch::Transient;
+            }
         };
         let (file_token, account_id) = match wham::parse_auth(&body) {
             Ok(x) => x,
-            Err(_) => return CodexFetch::Transient,
+            Err(e) => {
+                log::warn!("codex quota: failed to parse auth.json: {e}");
+                return CodexFetch::Transient;
+            }
         };
         let cur_mtime = file_mtime(auth);
         // Reuse the cached token only if auth.json hasn't changed since we cached

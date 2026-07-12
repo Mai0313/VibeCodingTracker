@@ -94,10 +94,9 @@ pub fn read_cursor_analysis(
         match read_store_analysis(&store_db, &conv_models, time_range, mode, &user, &machine) {
             Ok(mut rows) => out.append(&mut rows),
             Err(err) => {
-                eprintln!(
-                    "Warning: Failed to read Cursor store {}: {err}",
-                    store_db.display()
-                );
+                // File-only: this runs during TUI refresh too, so a stderr
+                // write here would corrupt the alternate screen.
+                log::warn!("failed to read Cursor store {}: {err}", store_db.display());
             }
         }
     }
