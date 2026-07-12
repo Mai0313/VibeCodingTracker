@@ -35,6 +35,7 @@ pub fn display_usage_table(usage_data: &UsageData, merge: bool) {
     let pricing_map = match fetch_model_pricing() {
         Ok(map) => map,
         Err(e) => {
+            log::warn!("failed to fetch pricing data: {e}; costs shown as $0.00");
             eprintln!("Warning: Failed to fetch pricing data: {}", e);
             eprintln!("Costs will be shown as $0.00");
             ModelPricingMap::new(HashMap::new())

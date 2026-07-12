@@ -176,21 +176,31 @@ pub fn call_wham(
     }
     let resp = match req.send() {
         Ok(r) => r,
-        Err(_) => return WhamResult::Transient,
+        Err(e) => {
+            log::warn!("codex quota fetch: request failed: {e}");
+            return WhamResult::Transient;
+        }
     };
     let status = resp.status();
     if status == reqwest::StatusCode::UNAUTHORIZED {
         return WhamResult::Unauthorized;
     }
     if !status.is_success() {
+        log::warn!("codex quota fetch: HTTP {status}");
         return WhamResult::Transient;
     }
     match resp.text() {
         Ok(text) => match map_wham_response(&text, now) {
             Ok(snap) => WhamResult::Ok(snap),
-            Err(_) => WhamResult::Transient,
+            Err(e) => {
+                log::warn!("codex quota fetch: failed to parse usage response: {e}");
+                WhamResult::Transient
+            }
         },
-        Err(_) => WhamResult::Transient,
+        Err(e) => {
+            log::warn!("codex quota fetch: failed to read response body: {e}");
+            WhamResult::Transient
+        }
     }
 }
 

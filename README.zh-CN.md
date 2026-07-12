@@ -548,6 +548,13 @@ copilot = true
 gemini = true
 opencode = true
 cursor = true
+
+[logging]
+# 写入 ~/.vct/logs/vct-YYYY-MM-DD.log 的最低日志级别。
+# 取值: "off" | "error" | "warn" | "info" | "debug" | "trace"。
+level = "warn"
+# 保留多少天的每日日志文件; 更旧的文件会在启动时清除。0 表示全部保留。
+retention_days = 7
 ```
 
 | 设置项                         | 作用                                                                                             |
@@ -559,6 +566,11 @@ cursor = true
 | `usage.quota.refresh_interval` | 每个实时额度面板的轮询间隔（秒）；数值越大越不容易触发 provider 的速率限制。                     |
 | `analysis.refresh_interval`    | `analysis` 面板的自动刷新间隔（秒）。                                                            |
 | `providers.*`                  | 设为 `false` 时完全跳过某个 provider（不扫描、不调用 API）——如果你不用某个 provider 会很方便。   |
+| `logging.level`                | 写入日志文件的最低级别（`off`..`trace`）；从不打印到终端。                                       |
+| `logging.retention_days`       | 保留多少天的每日日志文件；更旧的 `vct-*.log` 会在启动时清除（`0` 表示全部保留）。                |
+
+> [!NOTE]
+> vct 会把诊断信息写入 `~/.vct/logs/vct-YYYY-MM-DD.log`（纯文本，仅写文件，绝不显示在面板上）。健康运行时保持安静（默认级别 `warn`），且文件是惰性创建的，所以一次正常运行不会留下任何文件。当额度获取失败或某个 session 被跳过时，原因就记录在这里——需要完整细节时把 `logging.level` 调到 `debug`。
 
 > [!NOTE]
 > Cursor 的 `usage` 是从聊天库得出的**本地估算**，因此它会像 Claude Code / Codex / Copilot / Gemini 一样（都是从本地 session 文件计算得出）无需联网。该估算会低估 Cursor 的真实花费，因为其中很大一部分是以 Cursor 内部的 model 名称计费，本地数据无法为这些名称定价，所以请把 Cursor 费用视为近似值。

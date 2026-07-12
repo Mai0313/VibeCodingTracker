@@ -248,8 +248,8 @@ pub fn aggregate_sessions_by_model_from_paths_with(
             time_range,
         )
     {
-        eprintln!(
-            "Warning: Failed to read OpenCode DB {}: {err}",
+        log::warn!(
+            "failed to read OpenCode DB {}: {err}",
             paths.opencode_db.display()
         );
     }
@@ -267,7 +267,7 @@ pub fn aggregate_sessions_by_model_from_paths_with(
             time_range,
         )
     {
-        eprintln!("Warning: Failed to read Cursor stores: {err}");
+        log::warn!("failed to read Cursor stores: {err}");
     }
 
     let mut all_dates: HashSet<&String> = HashSet::new();
@@ -358,11 +358,7 @@ where
             match parse_session_file_as(&file_info.path, provider, ParseMode::UsageOnly) {
                 Ok(analysis) => Some((file_info.modified_date.clone(), analysis)),
                 Err(e) => {
-                    eprintln!(
-                        "Warning: Failed to parse {}: {}",
-                        file_info.path.display(),
-                        e
-                    );
+                    log::warn!("failed to parse {}: {e}", file_info.path.display());
                     None
                 }
             }

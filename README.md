@@ -549,6 +549,13 @@ copilot = true
 gemini = true
 opencode = true
 cursor = true
+
+[logging]
+# Minimum level written to ~/.vct/logs/vct-YYYY-MM-DD.log.
+# One of: "off" | "error" | "warn" | "info" | "debug" | "trace".
+level = "warn"
+# Days of daily log files to keep; older files are pruned on startup. 0 keeps every file.
+retention_days = 7
 ```
 
 | Setting                        | Effect                                                                                                                       |
@@ -560,9 +567,14 @@ cursor = true
 | `usage.quota.refresh_interval` | Poll cadence for every live quota panel (seconds); higher is safer against a provider's rate limits.                         |
 | `analysis.refresh_interval`    | Redraw cadence of the `analysis` dashboard (seconds).                                                                        |
 | `providers.*`                  | Skip a provider entirely (no scan, no API) when `false` — handy if you don't use one.                                        |
+| `logging.level`                | Minimum severity written to the log file (`off`..`trace`); never printed to the terminal.                                    |
+| `logging.retention_days`       | Days of daily log files to keep; older `vct-*.log` are pruned on startup (`0` keeps all).                                    |
 
 > [!NOTE]
 > Cursor `usage` is a **local estimate** from the chat stores, so it behaves like Claude Code / Codex / Copilot / Gemini (all computed from local session files) and needs no network. It undercounts Cursor's real spend, because much of it is billed under Cursor-internal model names the local data cannot price — treat Cursor cost as approximate.
+
+> [!NOTE]
+> vct writes diagnostics to `~/.vct/logs/vct-YYYY-MM-DD.log` (plain text, file only — never shown in the dashboard). It stays quiet when healthy (default level `warn`) and the file is created lazily, so a healthy run leaves nothing behind. When a quota fetch fails or a session is skipped, that is where the reason is recorded — bump `logging.level` to `debug` for the full detail.
 
 ### Managing the file
 

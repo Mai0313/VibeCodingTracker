@@ -7,7 +7,7 @@
 
 use crate::display::common::table::{REPO_LABEL, REPO_URL};
 use crossterm::{
-    cursor::MoveTo,
+    cursor::{MoveTo, Show},
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute, queue,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -19,7 +19,16 @@ use ratatui::{
     widgets::{ScrollbarState, TableState},
 };
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+/// Whether the alternate-screen TUI currently owns the terminal.
+///
+/// Set while [`setup_terminal`] .. [`restore_terminal`] is active so the panic
+/// hook ([`force_restore_terminal`]) knows whether it must undo raw mode. A
+/// bare atomic (not tied to the `Terminal` handle) is what lets the panic hook,
+/// which has no access to that handle, restore the screen.
+static IN_TUI: AtomicBool = AtomicBool::new(false);
 
 /// Puts the terminal into raw mode and the alternate screen, returning a ready [`Terminal`].
 ///
@@ -39,6 +48,7 @@ pub fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<io::Stdout>>
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend)?;
+    IN_TUI.store(true, Ordering::SeqCst);
     Ok(terminal)
 }
 
@@ -55,7 +65,23 @@ pub fn restore_terminal(
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
+    IN_TUI.store(false, Ordering::SeqCst);
     Ok(())
+}
+
+/// Best-effort terminal restore for the panic hook, when no [`Terminal`] handle
+/// is available.
+///
+/// No-ops unless the TUI currently owns the screen (see [`IN_TUI`]), so calling
+/// it from a panic that fired outside the TUI emits nothing. Every step is
+/// best-effort: a panic hook must never itself panic or early-return, so errors
+/// are ignored and the flag is cleared regardless.
+pub fn force_restore_terminal() {
+    if !IN_TUI.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
 }
 
 /// Layers an OSC 8 terminal hyperlink over the repo label the footer just drew.

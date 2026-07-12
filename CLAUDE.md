@@ -110,6 +110,7 @@ Resolved by `src/utils/paths.rs` (`resolve_paths`):
 | Hermes        | `$HERMES_HOME/state.db` (default `~/.hermes`, or `%LOCALAPPDATA%\hermes` on Windows; SQLite `session_model_usage` table, read via `rusqlite`; `usage` only)  |
 | Pricing cache | `~/.vct/model_pricing_YYYY-MM-DD.json`                                                                                                                       |
 | User settings | `~/.vct/config.toml`                                                                                                                                         |
+| Log files     | `~/.vct/logs/vct-YYYY-MM-DD.log` (daily plain-text diagnostics; created lazily)                                                                              |
 
 ### Quota panels (`src/quota/`)
 
@@ -141,6 +142,12 @@ The `usage` TUI shows live remaining quota for **Claude / Codex / Copilot / Curs
 ### File cache (`src/cache/`)
 
 Global singleton `GLOBAL_FILE_CACHE` (capacity = 5 in `constants::capacity::FILE_CACHE_SIZE`) keyed by `PathBuf`, holding `Arc<CodeAnalysis>` — **typed** form, not `serde_json::Value`, because `to_value` deep-clones every string. Invalidation is by mtime. TUI keeps cache size small to bound RSS; bump deliberately if you change the displayed-sessions horizon.
+
+### Diagnostic logging (`src/logging/`)
+
+The crate keeps the standard `log` facade (every `log::warn!` / `error!` call site is unchanged) but the output backend is a **custom `log::Log` that writes only to a file** — never stdout/stderr, so it is TUI-safe by construction (there is no `env_logger` anymore). Records land in `~/.vct/logs/vct-YYYY-MM-DD.log` (plain text, `<utc-nanos> <LEVEL> <target>  <message>`, the crate's `vibe_coding_tracker::` target shortened to `vct::`; the file name is the **UTC** date so it matches the line timestamps, and rolls over on the first record after UTC midnight). The file is opened behind a `Mutex` shared by the main thread and the ≤4 quota workers, written with a single `write_all` per record and **no user-space buffering** so nothing is lost under `panic = "abort"`, and **created lazily on the first record** — a command that logs nothing (e.g. a successful `vct version`) never touches `~/.vct`, preserving the "settings-free commands don't create `~/.vct`" rule.
+
+`main.rs` calls `logging::init()` **once, before dispatch** (installs the logger at the default level `warn` plus a panic hook) and `logging::apply(&config.logging)` in the `usage` / `analysis`-batch branches after `config::load()` — that reads `[logging]` to set the level via `log::set_max_level` and prunes daily files older than `retention_days` (default 7). Because config load is lazy, subcommands that never load it stay at the `warn` default (still enough to record errors). The panic hook chains to the previous hook after calling `tui::force_restore_terminal()` (gated by the `IN_TUI` atomic set by `setup_terminal`/`restore_terminal`) so a panic during the TUI restores the screen before the default message prints, and `main` logs the final top-level `Err` at ERROR before returning it. **Where errors are recorded:** the quota fetchers log every `Transient`-collapse (network / non-success HTTP status / body-parse failure, previously discarded silently), and the batch-parser / SQLite-reader warnings that used to `eprintln!` (and corrupt the TUI during refresh) now go through `log::warn!` (file only). The two non-TUI pricing warnings still `eprintln!` to the console **and** mirror to the log.
 
 ### Build version (`build.rs`)
 
