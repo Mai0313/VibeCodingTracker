@@ -10,7 +10,9 @@
 //!
 //! Only the `usage` view is supported: the table has no file-operation detail,
 //! so there is no `analysis` reader. Rows are keyed by the bare `model` column,
-//! so a model billed through two providers merges into one model row.
+//! so a model billed through two providers merges into one model row. Each
+//! session is also reconciled against the `sessions` aggregate so partial or
+//! missing per-model rows are not under-counted (see [`collect_usage`]).
 
 use crate::VERSION;
 use crate::cli::TimeRange;
@@ -43,7 +45,29 @@ pub fn read_hermes_usage(
     open_readonly(db_path, |conn| collect_usage(conn, time_range))
 }
 
-/// Collects the `usage` view from `session_model_usage` rows.
+/// Per-session raw column sums, used to reconcile against the `sessions`
+/// aggregate. Kept in raw (reasoning-inclusive) terms so the residual math
+/// matches Hermes, which subtracts raw columns.
+#[derive(Default)]
+struct RowSums {
+    input: i64,
+    output: i64,
+    cache_read: i64,
+    cache_write: i64,
+    estimated: f64,
+    actual: f64,
+}
+
+/// Collects the `usage` view from `session_model_usage`, then reconciles each
+/// session against its `sessions` aggregate.
+///
+/// Hermes attributes tokens and cost per model from `session_model_usage`, but
+/// a session can carry partial or missing per-model rows (legacy data,
+/// interrupted migrations, gateway cumulative updates). Hermes's own insights
+/// view (`agent/insights.py::_compute_model_breakdown`) covers that by
+/// attributing the positive residual (`sessions.<col>` minus the sum of the
+/// session's per-model rows) to the session's recorded model. We mirror that so
+/// vct's totals agree with Hermes instead of under-reporting.
 fn collect_usage(
     conn: &Connection,
     time_range: TimeRange,
@@ -52,24 +76,131 @@ fn collect_usage(
     let machine = get_machine_id().to_string();
     let cutoff = cutoff_string(time_range);
 
+    let mut out = Vec::new();
+    let mut summed: FastHashMap<String, RowSums> = FastHashMap::default();
+
     let mut stmt = conn.prepare(
-        "SELECT model, input_tokens, output_tokens, cache_read_tokens, \
+        "SELECT session_id, model, input_tokens, output_tokens, cache_read_tokens, \
                 cache_write_tokens, reasoning_tokens, estimated_cost_usd, \
                 actual_cost_usd, last_seen, first_seen \
          FROM session_model_usage",
     )?;
     let mut rows = stmt.query([])?;
-
-    let mut out = Vec::new();
     while let Some(row) = rows.next()? {
-        let model: String = row.get(0)?;
+        let session_id: String = row.get(0)?;
+        let model: String = row.get(1)?;
+        let input = row.get::<_, i64>(2)?;
+        let raw_output = row.get::<_, i64>(3)?;
+        let cache_read = row.get::<_, i64>(4)?;
+        let cache_write = row.get::<_, i64>(5)?;
+        let reasoning = row.get::<_, i64>(6)?;
+        let estimated = row.get::<_, f64>(7)?;
+        let actual = row.get::<_, f64>(8)?;
+        // `last_seen` (last activity) drives the date, falling back to `first_seen`.
+        let seconds = row
+            .get::<_, Option<f64>>(9)?
+            .or(row.get::<_, Option<f64>>(10)?);
+
+        // Accumulate raw sums for the residual, even for rows outside the time
+        // window — the residual is a session-level quantity.
+        let acc = summed.entry(session_id).or_default();
+        acc.input += input;
+        acc.output += raw_output;
+        acc.cache_read += cache_read;
+        acc.cache_write += cache_write;
+        acc.estimated += estimated;
+        acc.actual += actual;
+
         let model = model.trim();
         if model.is_empty() {
             continue;
         }
+        let Some(seconds) = seconds else { continue };
+        let Some(date) = ms_to_local_date((seconds * 1000.0) as i64) else {
+            continue;
+        };
+        if is_before_cutoff(&date, &cutoff) {
+            continue;
+        }
 
-        // `last_seen` (last activity) drives the date, falling back to
-        // `first_seen`; a row with neither has no place on the calendar.
+        // Hermes bills through an OpenAI-compatible layer where `output_tokens`
+        // already includes reasoning, so subtract it back out to keep each token
+        // billed once (the flat shape treats the buckets as disjoint).
+        let output = (raw_output - reasoning).max(0);
+        // Prefer the real billed cost; fall back to Hermes's own estimate.
+        let cost = if actual > 0.0 { actual } else { estimated };
+        out.push(build_row(
+            &date,
+            model,
+            (seconds * 1000.0) as i64,
+            session_usage_value(input, output, reasoning, cache_read, cache_write),
+            cost,
+            &user,
+            &machine,
+        ));
+    }
+    drop(rows);
+    drop(stmt);
+
+    reconcile_session_residuals(conn, &cutoff, &summed, &user, &machine, &mut out)?;
+    Ok(out)
+}
+
+/// Attributes each session's positive residual (aggregate minus the sum of its
+/// per-model rows) to the session's recorded model, mirroring Hermes's insights
+/// view so partial or missing per-model rows are not dropped.
+fn reconcile_session_residuals(
+    conn: &Connection,
+    cutoff: &Option<String>,
+    summed: &FastHashMap<String, RowSums>,
+    user: &str,
+    machine: &str,
+    out: &mut Vec<(String, CodeAnalysis, f64)>,
+) -> Result<()> {
+    // The `sessions` table is core to Hermes, but stay defensive: if it is
+    // somehow absent, the per-model rows already collected are still returned.
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT id, model, input_tokens, output_tokens, cache_read_tokens, \
+                cache_write_tokens, estimated_cost_usd, actual_cost_usd, \
+                ended_at, started_at \
+         FROM sessions",
+    ) else {
+        return Ok(());
+    };
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let id: String = row.get(0)?;
+        let model: Option<String> = row.get(1)?;
+        let acc = summed.get(&id);
+        let input =
+            (row.get::<_, Option<i64>>(2)?.unwrap_or(0) - acc.map_or(0, |a| a.input)).max(0);
+        // Residual output stays raw (reasoning-inclusive) with reasoning 0, the
+        // way Hermes leaves the unattributed remainder.
+        let output =
+            (row.get::<_, Option<i64>>(3)?.unwrap_or(0) - acc.map_or(0, |a| a.output)).max(0);
+        let cache_read =
+            (row.get::<_, Option<i64>>(4)?.unwrap_or(0) - acc.map_or(0, |a| a.cache_read)).max(0);
+        let cache_write =
+            (row.get::<_, Option<i64>>(5)?.unwrap_or(0) - acc.map_or(0, |a| a.cache_write)).max(0);
+        let estimated = (row.get::<_, Option<f64>>(6)?.unwrap_or(0.0)
+            - acc.map_or(0.0, |a| a.estimated))
+        .max(0.0);
+        let actual =
+            (row.get::<_, Option<f64>>(7)?.unwrap_or(0.0) - acc.map_or(0.0, |a| a.actual)).max(0.0);
+        if input == 0
+            && output == 0
+            && cache_read == 0
+            && cache_write == 0
+            && estimated <= 0.0
+            && actual <= 0.0
+        {
+            continue;
+        }
+
+        let model = model.as_deref().unwrap_or("").trim();
+        if model.is_empty() {
+            continue;
+        }
         let Some(seconds) = row
             .get::<_, Option<f64>>(8)?
             .or(row.get::<_, Option<f64>>(9)?)
@@ -79,45 +210,43 @@ fn collect_usage(
         let Some(date) = ms_to_local_date((seconds * 1000.0) as i64) else {
             continue;
         };
-        if is_before_cutoff(&date, &cutoff) {
+        if is_before_cutoff(&date, cutoff) {
             continue;
         }
 
-        let input = row.get::<_, i64>(1)?;
-        let output = row.get::<_, i64>(2)?;
-        let cache_read = row.get::<_, i64>(3)?;
-        let cache_write = row.get::<_, i64>(4)?;
-        let reasoning = row.get::<_, i64>(5)?;
-        let estimated_cost = row.get::<_, f64>(6)?;
-        let actual_cost = row.get::<_, f64>(7)?;
-
-        // Hermes bills through an OpenAI-compatible layer where `output_tokens`
-        // already includes reasoning, so subtract it back out to keep each token
-        // billed once (the flat shape below treats the buckets as disjoint).
-        let output = (output - reasoning).max(0);
-        // Prefer the real billed cost; fall back to Hermes's own estimate.
-        let cost = if actual_cost > 0.0 {
-            actual_cost
-        } else {
-            estimated_cost
-        };
-
-        let mut map = FastHashMap::default();
-        map.insert(
-            model.to_string(),
-            session_usage_value(input, output, reasoning, cache_read, cache_write),
-        );
-
-        let mut state = SessionParseState::with_mode(ParseMode::UsageOnly);
-        state.last_ts = (seconds * 1000.0) as i64;
-        out.push((
-            date,
-            wrap_record(state.into_record(map), &user, &machine),
+        let cost = if actual > 0.0 { actual } else { estimated };
+        out.push(build_row(
+            &date,
+            model,
+            (seconds * 1000.0) as i64,
+            session_usage_value(input, output, 0, cache_read, cache_write),
             cost,
+            user,
+            machine,
         ));
     }
+    Ok(())
+}
 
-    Ok(out)
+/// Builds one `(date, CodeAnalysis, cost)` contribution keyed by `model`.
+fn build_row(
+    date: &str,
+    model: &str,
+    ts_ms: i64,
+    usage: Value,
+    cost: f64,
+    user: &str,
+    machine: &str,
+) -> (String, CodeAnalysis, f64) {
+    let mut map = FastHashMap::default();
+    map.insert(model.to_string(), usage);
+    let mut state = SessionParseState::with_mode(ParseMode::UsageOnly);
+    state.last_ts = ts_ms;
+    (
+        date.to_string(),
+        wrap_record(state.into_record(map), user, machine),
+        cost,
+    )
 }
 
 /// Builds the Claude-style flat usage value from a row's token columns.
@@ -241,7 +370,8 @@ fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
 mod tests {
     use super::*;
 
-    /// Builds a temp Hermes database with the `session_model_usage` table.
+    /// Builds a temp Hermes database with the `session_model_usage` and
+    /// `sessions` tables.
     fn make_db() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("state.db");
@@ -260,10 +390,59 @@ mod tests {
                  actual_cost_usd REAL NOT NULL DEFAULT 0,
                  first_seen REAL,
                  last_seen REAL
+             );
+             CREATE TABLE sessions (
+                 id TEXT PRIMARY KEY,
+                 model TEXT,
+                 billing_provider TEXT,
+                 input_tokens INTEGER DEFAULT 0,
+                 output_tokens INTEGER DEFAULT 0,
+                 cache_read_tokens INTEGER DEFAULT 0,
+                 cache_write_tokens INTEGER DEFAULT 0,
+                 reasoning_tokens INTEGER DEFAULT 0,
+                 estimated_cost_usd REAL DEFAULT 0,
+                 actual_cost_usd REAL DEFAULT 0,
+                 started_at REAL NOT NULL,
+                 ended_at REAL
              );",
         )
         .unwrap();
         (dir, db_path)
+    }
+
+    /// Inserts a `sessions` aggregate row (the per-session token/cost totals
+    /// Hermes reconciles per-model rows against).
+    #[allow(clippy::too_many_arguments)]
+    fn insert_session(
+        conn: &Connection,
+        id: &str,
+        model: &str,
+        input: i64,
+        output: i64,
+        cache_read: i64,
+        cache_write: i64,
+        estimated: f64,
+        actual: f64,
+        last_seen: f64,
+    ) {
+        conn.execute(
+            "INSERT INTO sessions (id, model, input_tokens, output_tokens, \
+                 cache_read_tokens, cache_write_tokens, estimated_cost_usd, \
+                 actual_cost_usd, started_at, ended_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+            rusqlite::params![
+                id,
+                model,
+                input,
+                output,
+                cache_read,
+                cache_write,
+                estimated,
+                actual,
+                last_seen
+            ],
+        )
+        .unwrap();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -470,6 +649,135 @@ mod tests {
         assert_eq!(all.len(), 2);
         let daily = read_hermes_usage(&db_path, TimeRange::Daily).unwrap();
         assert_eq!(daily.len(), 1);
+        drop(dir);
+    }
+
+    /// Sums one token bucket across every contribution keyed by `model`.
+    fn total_bucket(sessions: &[(String, CodeAnalysis, f64)], model: &str, key: &str) -> i64 {
+        sessions
+            .iter()
+            .filter_map(|(_, a, _)| a.records[0].conversation_usage.get(model))
+            .filter_map(|u| u[key].as_i64())
+            .sum()
+    }
+
+    fn total_cost(sessions: &[(String, CodeAnalysis, f64)], model: &str) -> f64 {
+        sessions
+            .iter()
+            .filter(|(_, a, _)| a.records[0].conversation_usage.contains_key(model))
+            .map(|(_, _, c)| *c)
+            .sum()
+    }
+
+    #[test]
+    fn residual_covers_session_with_no_per_model_rows() {
+        // A session whose per-model rows were never written (legacy / interrupted
+        // migration) is still counted from its aggregate.
+        let (dir, db_path) = make_db();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            insert_session(
+                &conn,
+                "s1",
+                "gpt-x",
+                100,
+                10,
+                5,
+                0,
+                0.5,
+                0.0,
+                recent_epoch_secs(),
+            );
+        }
+        let sessions = read_hermes_usage(&db_path, TimeRange::All).unwrap();
+        assert_eq!(sessions.len(), 1);
+        let usage = usage_of(&sessions[0].1, "gpt-x");
+        assert_eq!(usage["input_tokens"], 100);
+        assert_eq!(usage["output_tokens"], 10);
+        assert_eq!(usage["cache_read_input_tokens"], 5);
+        assert!((sessions[0].2 - 0.5).abs() < 1e-9);
+        drop(dir);
+    }
+
+    #[test]
+    fn residual_covers_partial_per_model_rows_without_double_counting() {
+        // Per-model rows account for part of the session; the remainder is
+        // attributed to the session's model. The two together equal the
+        // aggregate exactly (no double counting).
+        let (dir, db_path) = make_db();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            insert_row(
+                &conn,
+                "s1",
+                "gpt-x",
+                "openai-api",
+                60,
+                6,
+                0,
+                0,
+                0,
+                0.3,
+                0.0,
+                recent_epoch_secs(),
+            );
+            insert_session(
+                &conn,
+                "s1",
+                "gpt-x",
+                100,
+                10,
+                0,
+                0,
+                0.5,
+                0.0,
+                recent_epoch_secs(),
+            );
+        }
+        let sessions = read_hermes_usage(&db_path, TimeRange::All).unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(total_bucket(&sessions, "gpt-x", "input_tokens"), 100);
+        assert_eq!(total_bucket(&sessions, "gpt-x", "output_tokens"), 10);
+        assert!((total_cost(&sessions, "gpt-x") - 0.5).abs() < 1e-9);
+        drop(dir);
+    }
+
+    #[test]
+    fn no_residual_when_per_model_rows_cover_session() {
+        // Aggregate equals the per-model sum, so no residual contribution.
+        let (dir, db_path) = make_db();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            insert_row(
+                &conn,
+                "s1",
+                "gpt-x",
+                "openai-api",
+                100,
+                10,
+                0,
+                0,
+                0,
+                0.5,
+                0.0,
+                recent_epoch_secs(),
+            );
+            insert_session(
+                &conn,
+                "s1",
+                "gpt-x",
+                100,
+                10,
+                0,
+                0,
+                0.5,
+                0.0,
+                recent_epoch_secs(),
+            );
+        }
+        let sessions = read_hermes_usage(&db_path, TimeRange::All).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(total_bucket(&sessions, "gpt-x", "input_tokens"), 100);
         drop(dir);
     }
 }
