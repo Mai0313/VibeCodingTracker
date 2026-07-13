@@ -551,7 +551,10 @@ where
             } else {
                 diagnostics.record_unrecognized();
             }
-            log::warn!("skipping {provider} record with unsupported top-level schema");
+            drop(diagnostics);
+            if relevant {
+                log::warn!("skipping {provider} analyzer record with unsupported top-level schema");
+            }
             None
         }
     }

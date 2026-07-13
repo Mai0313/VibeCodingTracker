@@ -236,6 +236,35 @@ fn analysis_file_warns_when_only_some_analyzer_payloads_fail() {
 }
 
 #[test]
+fn analysis_file_does_not_log_analyzer_irrelevant_codex_schema_drift() {
+    let home = TempHome::new();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("irrelevant-drift.jsonl");
+    let mut contents = String::from(
+        r#"{"timestamp":"2026-07-12T00:00:00Z","type":"session_meta","payload":{"type":"session_meta","id":"session"}}"#,
+    );
+    contents.push('\n');
+    for _ in 0..100 {
+        contents.push_str(
+            r#"{"timestamp":"2026-07-12T00:00:01Z","type":"response_item","payload":{"type":"message","output":true}}"#,
+        );
+        contents.push('\n');
+    }
+    std::fs::write(&path, contents).unwrap();
+
+    child_cmd(&home)
+        .arg("analysis")
+        .arg(&path)
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+    assert!(
+        !home.home().join(".vct/logs").exists(),
+        "analyzer-irrelevant Codex records must not create diagnostic logs"
+    );
+}
+
+#[test]
 fn usage_output_flag_is_rejected() {
     for flag in ["--output", "-o"] {
         Command::cargo_bin("vibe_coding_tracker")
