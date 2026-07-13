@@ -294,10 +294,8 @@ fn apply_completed_tool(
             true
         }
         "write" => {
-            let Some(path) = call
-                .input
-                .get("file_path")
-                .and_then(Value::as_str)
+            let Some(path) = mutation_output_path(output)
+                .or_else(|| call.input.get("file_path").and_then(Value::as_str))
                 .filter(|path| !path.is_empty())
             else {
                 return false;
@@ -309,14 +307,22 @@ fn apply_completed_tool(
             true
         }
         "search_replace" => {
-            let Some(path) = call
-                .input
-                .get("file_path")
-                .and_then(Value::as_str)
+            let Some(path) = mutation_output_path(output)
+                .or_else(|| call.input.get("file_path").and_then(Value::as_str))
                 .filter(|path| !path.is_empty())
             else {
                 return false;
             };
+            if let Some(details) = search_replace_details(output) {
+                let edit_calls = state.tool_counts.edit;
+                for detail in details {
+                    if let Some((old, new)) = search_replace_detail_strings(detail) {
+                        state.add_edit_detail_raw(path, old, new, timestamp);
+                    }
+                }
+                state.tool_counts.edit = edit_calls.saturating_add(1);
+                return true;
+            }
             let Some(old) = call.input.get("old_string").and_then(Value::as_str) else {
                 return false;
             };
@@ -349,6 +355,28 @@ fn apply_completed_tool(
         }
         _ => false,
     }
+}
+
+fn mutation_output_path(output: &Value) -> Option<&str> {
+    output
+        .pointer("/EditsApplied/absolute_path")
+        .and_then(Value::as_str)
+}
+
+fn search_replace_details(output: &Value) -> Option<&[Value]> {
+    let details = output.pointer("/EditsApplied/edits/details")?.as_array()?;
+    (!details.is_empty()
+        && details
+            .iter()
+            .all(|detail| search_replace_detail_strings(detail).is_some()))
+    .then_some(details)
+}
+
+fn search_replace_detail_strings(detail: &Value) -> Option<(&str, &str)> {
+    Some((
+        detail.get("old_string")?.as_str()?,
+        detail.get("new_string")?.as_str()?,
+    ))
 }
 
 #[cfg(test)]
@@ -406,6 +434,66 @@ mod tests {
         assert_eq!(
             parsed.analysis.records[0].conversation_usage["grok-test"]["cache_read_input_tokens"],
             42
+        );
+    }
+
+    #[test]
+    fn replace_all_uses_each_completed_edit_detail_once() {
+        let mut state = SessionParseState::new();
+        state.folder_path = "/wrong/workspace".to_string();
+        let call = PendingToolCall {
+            name: "search_replace".to_string(),
+            input: json!({
+                "file_path": "src/lib.rs",
+                "old_string": "request old",
+                "new_string": "request new",
+                "replace_all": true
+            }),
+        };
+        let output = json!({
+            "type": "SearchReplace",
+            "EditsApplied": {
+                "absolute_path": "/workspace/demo/src/lib.rs",
+                "edits": {
+                    "details": [
+                        {"old_string": "matched one", "new_string": "first\nline\n"},
+                        {"old_string": "matched two", "new_string": "second"}
+                    ]
+                }
+            }
+        });
+
+        assert!(apply_completed_tool(&mut state, &call, 123, &output));
+        assert_eq!(state.tool_counts.edit, 1);
+        assert_eq!(state.total_edit_lines, 3);
+        assert_eq!(state.edit_details.len(), 2);
+        assert_eq!(
+            state.edit_details[0].base.file_path,
+            "/workspace/demo/src/lib.rs"
+        );
+        assert_eq!(state.edit_details[0].old_string, "matched one");
+        assert_eq!(state.edit_details[1].old_string, "matched two");
+    }
+
+    #[test]
+    fn write_prefers_completed_absolute_path() {
+        let mut state = SessionParseState::new();
+        state.folder_path = "/wrong/workspace".to_string();
+        let call = PendingToolCall {
+            name: "write".to_string(),
+            input: json!({"file_path": "src/new.rs", "content": "new file\n"}),
+        };
+        let output = json!({
+            "type": "SearchReplace",
+            "EditsApplied": {"absolute_path": "/workspace/demo/src/new.rs"}
+        });
+
+        assert!(apply_completed_tool(&mut state, &call, 123, &output));
+        assert_eq!(state.tool_counts.write, 1);
+        assert_eq!(state.write_details.len(), 1);
+        assert_eq!(
+            state.write_details[0].base.file_path,
+            "/workspace/demo/src/new.rs"
         );
     }
 }
