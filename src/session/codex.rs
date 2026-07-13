@@ -55,6 +55,7 @@ where
     let mut state = SessionParseState::with_mode(mode);
     let mut conversation_usage: FastHashMap<String, Value> = FastHashMap::with_capacity(5);
     let mut current_model = String::new();
+    let mut replay_baseline = None;
     let mut shell_calls: FastHashMap<String, PendingCodexShellCall> =
         FastHashMap::with_capacity(50);
     let mut custom_calls: FastHashMap<String, CodexCustomCall> = FastHashMap::with_capacity(32);
@@ -107,7 +108,12 @@ where
                 {
                     state.folder_path.clone_from(cwd);
                 }
-                if let Some(model) = &entry.payload.model {
+                if let Some(model) = entry
+                    .payload
+                    .model
+                    .as_ref()
+                    .filter(|model| !model.is_empty())
+                {
                     current_model.clone_from(model); // Reuse existing allocation
                 }
             }
@@ -116,10 +122,21 @@ where
                     && payload_type == "token_count"
                     && let Some(info) = entry.payload.info.as_ref().filter(|info| !info.is_null())
                 {
-                    let normalized = !current_model.is_empty() && is_supported_codex_usage(info);
-                    diagnostics.record_relevant(normalized);
-                    if normalized {
-                        process_codex_usage(&mut conversation_usage, &current_model, info);
+                    if !is_supported_codex_usage(info) {
+                        diagnostics.record_relevant(false);
+                    } else if current_model.is_empty() {
+                        diagnostics.record_relevant(true);
+                        if let Some(total) = info.get("total_token_usage") {
+                            replay_baseline = Some(total.clone());
+                        }
+                    } else {
+                        diagnostics.record_relevant(true);
+                        if let Some(baseline) = &replay_baseline {
+                            let adjusted = subtract_codex_replay_baseline(info, baseline);
+                            process_codex_usage(&mut conversation_usage, &current_model, &adjusted);
+                        } else {
+                            process_codex_usage(&mut conversation_usage, &current_model, info);
+                        }
                     }
                 }
             }
@@ -217,7 +234,6 @@ where
             diagnostics.record_relevant(false);
         }
     }
-
     if state.git_remote.is_empty() {
         state.git_remote = get_git_remote_url(&state.folder_path);
     }
@@ -259,6 +275,36 @@ fn is_supported_codex_usage(info: &Value) -> bool {
         }
     }
     recognized
+}
+
+fn subtract_codex_replay_baseline(info: &Value, baseline: &Value) -> Value {
+    let mut adjusted = info.clone();
+    let (Some(total), Some(baseline)) = (
+        adjusted
+            .get_mut("total_token_usage")
+            .and_then(Value::as_object_mut),
+        baseline.as_object(),
+    ) else {
+        return adjusted;
+    };
+    for key in [
+        "input_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+        "total_tokens",
+    ] {
+        if let (Some(current), Some(replayed)) = (
+            total.get(key).and_then(Value::as_i64),
+            baseline.get(key).and_then(Value::as_i64),
+        ) {
+            total.insert(
+                key.to_string(),
+                Value::from(current.saturating_sub(replayed).max(0)),
+            );
+        }
+    }
+    adjusted
 }
 
 fn is_supported_codex_token_usage(usage: &Value) -> bool {
@@ -861,7 +907,7 @@ mod tests {
     }
 
     #[test]
-    fn token_count_without_model_context_remains_a_failure() {
+    fn valid_token_count_without_model_context_is_not_schema_failure() {
         let logs: Vec<CodexLog> = [
             serde_json::json!({
                 "timestamp": "2026-07-12T00:00:00Z",
@@ -881,6 +927,140 @@ mod tests {
                 }
             }),
         ]
+        .into_iter()
+        .map(|value| serde_json::from_value(value).unwrap())
+        .collect();
+
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        assert!(!parsed.diagnostics.is_complete_failure());
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
+        assert_eq!(parsed.diagnostics.relevant_records, 1);
+        assert_eq!(parsed.diagnostics.normalized_records, 1);
+        assert_eq!(parsed.diagnostics.failed_relevant_records, 0);
+        assert!(parsed.analysis.records[0].conversation_usage.is_empty());
+    }
+
+    #[test]
+    fn resumed_usage_subtracts_the_pre_context_replay_baseline() {
+        let logs: Vec<CodexLog> = [
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:00Z",
+                "type": "session_meta",
+                "payload": { "id": "resumed-session", "model_provider": "openai" }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 100,
+                            "cached_input_tokens": 20,
+                            "output_tokens": 30,
+                            "reasoning_output_tokens": 10,
+                            "total_tokens": 130
+                        },
+                        "model_context_window": 200000
+                    }
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:02Z",
+                "type": "turn_context",
+                "payload": { "model": "gpt-5.3-codex" }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:03Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 160,
+                            "cached_input_tokens": 25,
+                            "output_tokens": 50,
+                            "reasoning_output_tokens": 15,
+                            "total_tokens": 210
+                        },
+                        "last_token_usage": { "input_tokens": 60, "output_tokens": 20 },
+                        "model_context_window": 200000
+                    }
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:04Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 190,
+                            "cached_input_tokens": 30,
+                            "output_tokens": 60,
+                            "reasoning_output_tokens": 20,
+                            "total_tokens": 250
+                        },
+                        "last_token_usage": { "input_tokens": 30, "output_tokens": 10 },
+                        "model_context_window": 200000
+                    }
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|value| serde_json::from_value(value).unwrap())
+        .collect();
+
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        assert!(!parsed.diagnostics.is_complete_failure());
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
+
+        let usage = &parsed.analysis.records[0].conversation_usage["gpt-5.3-codex"];
+        assert_eq!(usage["total_token_usage"]["input_tokens"], 90);
+        assert_eq!(usage["total_token_usage"]["cached_input_tokens"], 10);
+        assert_eq!(usage["total_token_usage"]["output_tokens"], 30);
+        assert_eq!(usage["total_token_usage"]["reasoning_output_tokens"], 10);
+        assert_eq!(usage["total_token_usage"]["total_tokens"], 120);
+        assert_eq!(usage["last_token_usage"]["output_tokens"], 10);
+        assert_eq!(usage["model_context_window"], 200000);
+    }
+
+    #[test]
+    fn pre_context_usage_is_not_guessed_from_a_later_model() {
+        let logs: Vec<CodexLog> = [
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:00Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": { "total_token_usage": { "input_tokens": 10 } }
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:01Z",
+                "type": "turn_context",
+                "payload": { "model": "gpt-5.3-codex" }
+            }),
+        ]
+        .into_iter()
+        .map(|value| serde_json::from_value(value).unwrap())
+        .collect();
+
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
+        assert!(parsed.analysis.records[0].conversation_usage.is_empty());
+    }
+
+    #[test]
+    fn malformed_pre_context_usage_remains_schema_failure() {
+        let logs: Vec<CodexLog> = [serde_json::json!({
+            "timestamp": "2026-07-12T00:00:00Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": { "total_token_usage": { "input_tokens": "10" } }
+            }
+        })]
         .into_iter()
         .map(|value| serde_json::from_value(value).unwrap())
         .collect();
