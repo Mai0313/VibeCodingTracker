@@ -43,7 +43,7 @@ A good bug report shouldn't leave others needing to chase you up for more inform
 - Make sure that you are using the latest version (`vct update --check`).
 - Determine if your bug is really a bug and not an error on your side, e.g. using incompatible environment components/versions (make sure that you have read the [documentation](../README.md)).
 - Check if other users have experienced (and potentially already solved) the same issue in the [bug tracker](https://github.com/Mai0313/VibeCodingTracker/issues).
-- Include the `vct version --json` output, the exact command you ran, and any relevant JSONL snippet (scrubbed of secrets) so we can reproduce it.
+- Include the `vct version --json` output, the exact command you ran, and any relevant session-data snippet (scrubbed of secrets) so we can reproduce it.
 
 ### Suggesting Enhancements
 
@@ -76,7 +76,7 @@ Unsure where to begin contributing? You can start by looking through `good first
 ├── benches/          # Criterion benchmarks (pricing, parsing, aggregation)
 ├── cli/              # npm and PyPI wrapper packages (nodejs/, python/)
 ├── docker/           # Multi-stage Dockerfile (rust:1.96.1-bookworm builder → ubuntu:26.04 prod)
-├── examples/         # Sample session files and golden analysis outputs (one pair per JSONL provider)
+├── examples/         # Sample session files and golden analysis outputs, plus the Grok session fixture
 ├── src/
 │   ├── analysis/     # Collect canonical AnalysisDataset records and project per-model summaries
 │   ├── cache/        # LRU file-parse cache (Arc<CodeAnalysis>, mtime-keyed; capacity 5)
@@ -85,7 +85,7 @@ Unsure where to begin contributing? You can start by looking through `good first
 │   ├── display/      # TUI dashboards, static tables, plain-text renderers (usage rows sorted by cost ascending)
 │   ├── models/       # Typed structs (CodeAnalysis, Provider, ExtensionType, per-provider log shapes)
 │   ├── pricing/      # LiteLLM fetch, daily on-disk cache, fuzzy model matching, cost calculation
-│   ├── session/      # Per-provider JSONL parsers (claude / codex / copilot / gemini) + detector + ParseMode
+│   ├── session/      # Per-provider parsers (claude / codex / copilot / gemini / grok) + detector + ParseMode
 │   ├── update/       # Self-update via GitHub releases (archive extraction)
 │   ├── usage/        # Roll up parsed CodeAnalysis records into per-model token totals + per-provider days
 │   └── utils/        # Path resolution, directory walking, allocator tuning, time helpers
@@ -172,7 +172,7 @@ Before opening a PR, please ensure `cargo test --all` passes locally.
 
 #### Benchmarks
 
-Performance-sensitive code paths (pricing lookup, JSONL parsing, aggregation) have Criterion benchmarks in `benches/benchmarks.rs`:
+Performance-sensitive code paths (pricing lookup, session parsing, aggregation) have Criterion benchmarks in `benches/benchmarks.rs`:
 
 ```bash
 cargo bench

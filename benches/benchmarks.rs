@@ -88,6 +88,7 @@ fn benchmark_file_parsing(c: &mut Criterion) {
         ("codex", "examples/test_conversation_codex.jsonl"),
         ("copilot", "examples/test_conversation_copilot.jsonl"),
         ("gemini", "examples/test_conversation_gemini.jsonl"),
+        ("grok", "examples/grok_session/signals.json"),
     ];
 
     for (name, path) in test_files {
@@ -273,11 +274,13 @@ fn benchmark_batch_analysis(c: &mut Criterion) {
     let codex_path = PathBuf::from("examples/test_conversation_codex.jsonl");
     let copilot_path = PathBuf::from("examples/test_conversation_copilot.jsonl");
     let gemini_path = PathBuf::from("examples/test_conversation_gemini.jsonl");
+    let grok_path = PathBuf::from("examples/grok_session/signals.json");
 
     if !claude_path.exists()
         || !codex_path.exists()
         || !copilot_path.exists()
         || !gemini_path.exists()
+        || !grok_path.exists()
     {
         return;
     }
@@ -290,6 +293,7 @@ fn benchmark_batch_analysis(c: &mut Criterion) {
                 (codex_path.clone(), "codex"),
                 (copilot_path.clone(), "copilot"),
                 (gemini_path.clone(), "gemini"),
+                (grok_path.clone(), "grok"),
             ];
 
             // Simulate batch processing

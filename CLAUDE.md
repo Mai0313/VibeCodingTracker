@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Rust CLI (`vibe_coding_tracker`, short alias `vct`) that scans on-disk session logs written by seven AI coding assistants — Claude Code, OpenAI Codex, GitHub Copilot CLI, and Gemini CLI (JSONL files), OpenCode (a SQLite database), Cursor (per-conversation SQLite chat stores for `analysis` and a local context-gauge estimate for `usage`), plus Hermes (a SQLite `session_model_usage` table, `usage` only) — and aggregates them into two views:
+Rust CLI (`vibe_coding_tracker`, short alias `vct`) that scans on-disk session logs written by eight AI coding assistants — Claude Code, OpenAI Codex, GitHub Copilot CLI, and Gemini CLI (JSONL files), Grok CLI (`signals.json` plus sibling `updates.jsonl`), OpenCode (a SQLite database), Cursor (per-conversation SQLite chat stores for `analysis` and a local context-gauge estimate for `usage`), plus Hermes (a SQLite `session_model_usage` table, `usage` only) — and aggregates them into two views:
 
 - **`usage`** — per-model token counts and LiteLLM-priced cost
 - **`analysis`** — complete per-session `CodeAnalysis` JSON plus per-model file-operation and tool-call summaries (read/write/edit lines, Bash/Edit/Read/Write/TodoWrite call counts)
@@ -40,7 +40,7 @@ Criterion benchmarks live at `benches/benchmarks.rs`; reports land in `target/cr
 ### Two-stage pipeline
 
 ```
-JSONL session file
+Local session data
         │
         ▼
 src/session/        ← provider detection + per-provider parsers → CodeAnalysis
@@ -57,9 +57,10 @@ src/display/        ← TUI / table / text / JSON renderers
 
 ### Provider classification
 
-`src/session/detector.rs` distinguishes the four providers by JSONL markers:
+`src/session/detector.rs` distinguishes the five file-based providers by JSON / JSONL markers:
 
 - **Gemini** — first line is a session-meta record with `sessionId` + `projectHash` and *no* `messages` array
+- **Grok CLI** — a JSON object with `primaryModelId` + `contextTokensUsed` and either `contextWindowTokens` or `toolsUsed`
 - **Copilot CLI** — first line is `type == "session.start"` with `data.producer` starting with `"copilot"`
 - **Claude Code** — any record carrying a `parentUuid` field
 - **Codex** — any record whose `type` is one of `session_meta` / `turn_context` / `event_msg` / `response_item`, or default fallback when no other marker is found
@@ -79,6 +80,7 @@ Four parser entry points live in `src/session/parser.rs`:
 - **Codex**: Current logs can use `custom_tool_call` / `custom_tool_call_output`, and custom output may be a content-block array rather than a string. A top-level custom `apply_patch` can become file operations only when its paired output explicitly reports success. A JavaScript `exec` cell has no structured trace for nested `tools.*` calls, so record the completed top-level cell as one Bash call and never infer Read/Edit/Write operations from lexical JavaScript.
 - **Copilot CLI**: Current tool names include `show_file`, `rg`, `grep`, `write_bash`, and several `apply_patch` argument shapes. Search tools count as Read invocations but do not invent file paths or line totals when their output cannot be mapped to a single file.
 - **Gemini CLI**: The JSONL file is an append-only event history, not a sequence of independent final messages. Keep the latest revision for each message id and merge `$set.messages` entries by id to avoid double counting. Do not remove historical metrics for `$rewindTo`: it changes the visible conversation but does not refund billed usage or undo tools that already ran.
+- **Grok CLI**: `signals.json` is the scan entry point. Its `contextTokensUsed` is one current local context gauge, mapped to `cache_read_input_tokens` and priced at the model's cache-read rate; it is not cumulative billed usage. The sibling `updates.jsonl` pairs `tool_call` records with final `tool_call_update` records and normalizes only successful `read_file` / `grep` / `write` / `search_replace` / `run_terminal_command` / `todo_write` calls into Read / Write / Edit / Bash / TodoWrite metrics (`grep` exit code 2 remains a failure even when the lifecycle status is `completed`). Grok has no quota panel or `vct fetch` provider.
 
 Batch analysis keeps the same normalized contract. `collect_analysis_sessions_with` / `collect_analysis_sessions_from_paths_with` build an `AnalysisDataset` of provider-tagged `CodeAnalysis` values. `vct analysis --json` collects in `ParseMode::Full` and serializes the dataset as `CodeAnalysis[]`, so every element has the same shape as `vct analysis FILE` and the golden fixtures. TUI / text / table parse in `UsageOnly` and stream the same scalar fields into `AnalysisData`; they discard only the large per-operation detail payloads. Noninteractive collection retains candidate, success, and failure diagnostics: an all-failed scan returns an error instead of a misleading empty result, while a partial failure keeps successful output and writes a warning to stderr. File parsers retain parser-only source, recognized-envelope, analyzer-payload, and successful-normalization counts in an internal `ParsedAnalysis` / `ParseDiagnostics` wrapper outside `CodeAnalysis`, so a nonempty future schema cannot masquerade as a successful all-zero session without changing the public struct or JSON contract; blank in-progress files remain valid. OpenCode counts selected assistant rows and Cursor reports each store independently for the same reason. The TUI remains best-effort and sends failures only to the diagnostic log so terminal rendering stays intact.
 
@@ -117,6 +119,7 @@ Resolved by `src/utils/paths.rs` (`resolve_paths`):
 | OpenCode      | `~/.local/share/opencode/opencode.db` (SQLite database, read via `rusqlite`; honors `$XDG_DATA_HOME`)                                                        |
 | Cursor        | `~/.cursor/chats/*/*/store.db` (SQLite chat stores, `analysis` + a local `usage` estimate) + `~/.cursor/ai-tracking/ai-code-tracking.db` (model attribution) |
 | Hermes        | `$HERMES_HOME/state.db` (default `~/.hermes`, or `%LOCALAPPDATA%\hermes` on Windows; SQLite `session_model_usage` table, read via `rusqlite`; `usage` only)  |
+| Grok CLI      | `$GROK_HOME/sessions/*/*/signals.json` (default `~/.grok`; sibling `summary.json` supplies metadata and `updates.jsonl` supplies `analysis`)                 |
 | Pricing cache | `~/.vct/model_pricing_YYYY-MM-DD.json`                                                                                                                       |
 | User settings | `~/.vct/config.toml`                                                                                                                                         |
 | Log files     | `~/.vct/logs/vct-YYYY-MM-DD.log` (daily plain-text diagnostics; created lazily)                                                                              |
@@ -190,4 +193,4 @@ Every update check records the result to `~/.vct/version.json` via `version_cach
     - `tests/http_mock.rs` — HTTP-layer tests of the public quota fetchers (`call_wham`, `refresh_codex`) against an `httpmock` server
     - `tests/quota.rs` — Codex session-log quota fallback (`latest_session_rate_limits_in`) over a `TempHome` seeded with `codex_session_rate_limits.jsonl`
 - **Tests are hermetic: no real external API, no machine-file reads, no ambient env control.** Isolation comes from dependency injection, not `HOME`/`VCT_OFFLINE` mutation: the `*_from_paths` / `resolve_paths_from_home` / `fetch_model_pricing_with` / cache `*_in` seams take an explicit temp dir (via `TempHome` in `tests/common`), and every network call is pointed at a local `httpmock` server through the injected endpoint parameters. The 401 → refresh → retry loop and each provider's send layer are covered by inline `#[cfg(test)]` tests in their source files (which can reach crate-private items). `VCT_OFFLINE` / `network_disabled()` remain a **production** offline feature but no test depends on them, so `cargo test` passes fully offline **without** any env var — the same way CI runs it. The only env used anywhere is a per-child `HOME` on the handful of `assert_cmd` smoke tests (there is no other way to isolate a separate binary's home). Keep tests self-contained (e.g. `clear_pricing_cache()` before asserting on the global match-cache).
-- Sample fixtures and golden outputs for the four JSONL providers live in `examples/` (one `test_conversation_<provider>.jsonl` plus one `analysis_result_<provider>.json` per provider). OpenCode and Hermes have no JSONL fixture; their SQLite readers are covered by inline unit tests in `src/session/opencode.rs` / `src/session/hermes.rs` that build a temp database.
+- Sample fixtures and golden outputs for the four JSONL providers live in `examples/` (one `test_conversation_<provider>.jsonl` plus one `analysis_result_<provider>.json` per provider); Grok's `signals.json` / `summary.json` / `updates.jsonl` fixture lives in `examples/grok_session/`. OpenCode, Cursor, and Hermes have no JSONL fixture; their SQLite readers are covered by inline unit tests under `src/session/` that build temp databases.

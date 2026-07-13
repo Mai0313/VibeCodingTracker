@@ -19,7 +19,7 @@
 
 </div>
 
-**实时追踪你的 AI 编程开销。** Vibe Coding Tracker 是一款基于 Rust 构建的轻量级高性能 CLI 工具，用于监控和分析你在 Claude Code、Codex、Copilot、Gemini、OpenCode、Cursor 和 Hermes 上的使用情况——提供详细的费用明细、token 统计和代码操作洞察，同时保持极低的内存占用。
+**实时追踪你的 AI 编程开销。** Vibe Coding Tracker 是一款基于 Rust 构建的轻量级高性能 CLI 工具，用于监控和分析你在 Claude Code、Codex、Copilot、Gemini、OpenCode、Cursor、Hermes 和 Grok 上的使用情况——提供详细的费用明细、token 统计和代码操作洞察，同时保持极低的内存占用。
 
 [English](README.md) | [繁體中文](README.zh-TW.md) | [简体中文](README.zh-CN.md)
 
@@ -48,7 +48,7 @@
 
 ### 零配置
 
-自动检测并处理来自 Claude Code、Codex、Copilot、Gemini、OpenCode、Cursor 和 Hermes 的日志。无需任何设置——直接运行即可分析。首次运行时会自动生成一个带有合理默认值的 `~/.vct/config.toml`，方便你日后想调整行为时使用（参见 [配置](#%E9%85%8D%E7%BD%AE)）。
+自动检测并处理来自 Claude Code、Codex、Copilot、Gemini、OpenCode、Cursor、Hermes 和 Grok 的日志。无需任何设置——直接运行即可分析。首次运行时会自动生成一个带有合理默认值的 `~/.vct/config.toml`，方便你日后想调整行为时使用（参见 [配置](#%E9%85%8D%E7%BD%AE)）。
 
 ### 丰富的洞察
 
@@ -62,15 +62,15 @@
 
 ## 核心特性
 
-| 特性             | 说明                                                                        |
-| ---------------- | --------------------------------------------------------------------------- |
-| **多供应商支持** | Claude Code、Codex、Copilot、Gemini、OpenCode、Cursor 和 Hermes——一站式管理 |
-| **智能定价**     | 模糊模型匹配 + 从 LiteLLM 每日缓存更新                                      |
-| **4 种显示模式** | 交互式 TUI、静态表格、纯文本和 JSON                                         |
-| **双维度分析**   | token/费用统计（`usage`）+ 代码操作统计（`analysis`）                       |
-| **实时额度面板** | Claude、Codex、Copilot 和 Cursor 的实时剩余额度                             |
-| **超轻量级**     | TUI 常驻内存 50 MB 以内、流式 JSONL 解析——基于 Rust 构建                    |
-| **实时更新**     | 面板自动刷新（每 10 秒），并高亮变化                                        |
+| 特性             | 说明                                                                  |
+| ---------------- | --------------------------------------------------------------------- |
+| **多供应商支持** | Claude Code、Codex、Copilot、Gemini、OpenCode、Cursor、Hermes 和 Grok |
+| **智能定价**     | 模糊模型匹配 + 从 LiteLLM 每日缓存更新                                |
+| **4 种显示模式** | 交互式 TUI、静态表格、纯文本和 JSON                                   |
+| **双维度分析**   | token/费用统计（`usage`）+ 代码操作统计（`analysis`）                 |
+| **实时额度面板** | Claude、Codex、Copilot 和 Cursor 的实时剩余额度                       |
+| **超轻量级**     | TUI 常驻内存 50 MB 以内、流式 session 解析——基于 Rust 构建            |
+| **实时更新**     | 面板自动刷新（每 10 秒），并高亮变化                                  |
 
 ---
 
@@ -144,7 +144,7 @@ vct <COMMAND> [OPTIONS]
 # Replace with `vibe_coding_tracker` if you are using the full binary name
 
 Commands:
-  analysis    Analyze JSONL conversation files (single file or all sessions)
+  analysis    Analyze local session data (single file or all sessions)
   usage       Display token usage statistics
   version     Display version information
   update      Update to the latest version from GitHub releases
@@ -291,6 +291,9 @@ Totals (by Provider)
 - `~/.local/share/opencode/opencode.db`（OpenCode，SQLite 数据库；遵循 `$XDG_DATA_HOME`）
 - `~/.cursor/chats/*/*/store.db`（Cursor，SQLite 会话库，用于 `analysis`，并给出一个与其他 provider 一致的本地 `usage` 估算）
 - `~/.hermes/state.db`（Hermes，SQLite 数据库，遵循 `$HERMES_HOME`；仅 `usage`）
+- `$GROK_HOME/sessions/*/*/signals.json`（Grok CLI，默认使用 `~/.grok`；同层的 `updates.jsonl` 提供 `analysis` 数据）
+
+Grok 的 `usage` 是单一时点的本地 context 估算：vct 会把 `signals.json` 的 `contextTokensUsed` 记为 cache-read token，并按该 model 的 cache-read 费率估算费用。这不是累计的 billed usage。`analysis` 会从同层的 `updates.jsonl` 还原已完成的 Read / Write / Edit / Bash / TodoWrite 操作。Grok 不支持 quota panel 或 `vct fetch`。
 
 ### 实时额度面板
 
@@ -325,16 +328,16 @@ Totals (by Provider)
 
 ### 参数与 Flag
 
-| 参数 / Flag                                    | 用途                                                                      |
-| ---------------------------------------------- | ------------------------------------------------------------------------- |
-| *(不带参数)*                                   | 互动式 TUI 面板, 覆盖所有 session                                         |
-| `<FILE>`                                       | 分析单一 JSONL/JSON 对话文件, 并将完整 `CodeAnalysis` JSON 输出到 stdout  |
-| `--table`                                      | 静态摘要表格, 附带 provider 汇总                                          |
-| `--text`                                       | 纯文本摘要, 方便脚本处理                                                  |
-| `--json`                                       | 完整 parser 结果. 搭配 `<FILE>` 时为单一 object, 否则为 object 数组       |
-| `--daily` / `--weekly` / `--monthly` / `--all` | 所有 session 的时间范围筛选. 不可与 `<FILE>` 同时使用, 其他说明见上方表格 |
+| 参数 / Flag                                    | 用途                                                                         |
+| ---------------------------------------------- | ---------------------------------------------------------------------------- |
+| *(不带参数)*                                   | 互动式 TUI 面板, 覆盖所有 session                                            |
+| `<FILE>`                                       | 分析单一 JSONL/JSON session 文件, 并将完整 `CodeAnalysis` JSON 输出到 stdout |
+| `--table`                                      | 静态摘要表格, 附带 provider 汇总                                             |
+| `--text`                                       | 纯文本摘要, 方便脚本处理                                                     |
+| `--json`                                       | 完整 parser 结果. 搭配 `<FILE>` 时为单一 object, 否则为 object 数组          |
+| `--daily` / `--weekly` / `--monthly` / `--all` | 所有 session 的时间范围筛选. 不可与 `<FILE>` 同时使用, 其他说明见上方表格    |
 
-参见 [`examples/`](examples/) 目录，其中包含四种 JSONL provider 的示例输入与对应 JSON 输出。
+参见 [`examples/`](examples/) 目录，其中包含四种 JSONL provider 的示例输入与对应 JSON 输出，以及 [`examples/grok_session/`](examples/grok_session/) 下的 Grok session fixture。
 
 ### 基本用法
 
@@ -572,6 +575,8 @@ copilot = true
 gemini = true
 opencode = true
 cursor = true
+hermes = true
+grok = true
 
 [logging]
 # 写入 ~/.vct/logs/vct-YYYY-MM-DD.log 的最低日志级别。
@@ -644,6 +649,7 @@ vct config migrate
 - **不止 token**：Claude 的 web-search 工具调用（`server_tool_use.web_search_requests`）会在 token 费用之外按每次查询计费；其他所有 model 的每次查询费用均为 $0。
 - **OpenCode**：只有在 LiteLLM 上**精确**匹配时，才会根据 token 为一个全新的 model 名称定价；若没有精确匹配，vct 会信任该 assistant message 自身存储的费用，而不是从一个只是大致相似的名称去猜测。
 - **Hermes**：与 OpenCode 相同，LiteLLM 上**精确**匹配时按 token 定价，否则使用 Hermes 自身存储的费用。
+- **Grok**：只会把 `contextTokensUsed` 作为 cache-read token 计价；这是单一时点的本地 context 估算，不是累计的 billed usage。
 - **缓存为原始数据**：每日缓存存储的是经过筛选的上游 LiteLLM JSON（而非派生后的结构），因此无需重新获取即可保留分层 / 批量定价；此外还有一个小型的进程内 LRU，让 TUI 刷新期间的重复查询保持低开销。
 
 ---

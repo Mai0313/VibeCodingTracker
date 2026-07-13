@@ -178,6 +178,8 @@ pub struct ProvidersConfig {
     pub cursor: bool,
     #[serde(default = "default_true")]
     pub hermes: bool,
+    #[serde(default = "default_true")]
+    pub grok: bool,
 }
 
 impl Default for ProvidersConfig {
@@ -190,6 +192,7 @@ impl Default for ProvidersConfig {
             opencode: true,
             cursor: true,
             hermes: true,
+            grok: true,
         }
     }
 }
@@ -792,6 +795,7 @@ mod tests {
         assert_eq!(cfg.analysis.refresh_interval, 10);
         assert_eq!(cfg.providers, ProvidersConfig::default());
         assert!(cfg.providers.cursor);
+        assert!(cfg.providers.grok);
         assert_eq!(cfg.logging.level, LogLevel::Warn);
         assert_eq!(cfg.logging.retention_days, 7);
     }
@@ -803,6 +807,7 @@ mod tests {
         let cfg: Config = toml_edit::de::from_str("").unwrap();
         assert_eq!(cfg.usage.quota.panels, default_quota_panels());
         assert!(cfg.providers.cursor);
+        assert!(cfg.providers.grok);
         assert_eq!(cfg.usage.refresh_secs(), 10);
         assert_eq!(cfg.usage.quota_refresh_secs(), 60);
         // A file with no [logging] section backfills the whole section default,
@@ -1027,7 +1032,16 @@ mod tests {
     #[test]
     fn providers_default_all_enabled() {
         let p = ProvidersConfig::default();
-        assert!(p.claude && p.codex && p.copilot && p.gemini && p.opencode && p.cursor && p.hermes);
+        assert!(
+            p.claude
+                && p.codex
+                && p.copilot
+                && p.gemini
+                && p.opencode
+                && p.cursor
+                && p.hermes
+                && p.grok
+        );
     }
 
     #[test]

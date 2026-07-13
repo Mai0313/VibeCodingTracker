@@ -326,6 +326,40 @@ fn test_gemini_parser() {
     );
 }
 
+#[test]
+fn test_grok_parser() {
+    let input_file = PathBuf::from("examples/grok_session/signals.json");
+    let expected_file = PathBuf::from("examples/analysis_result_grok.json");
+    let expected_json: Value = serde_json::from_str(
+        &std::fs::read_to_string(&expected_file).expect("Failed to read Grok golden result"),
+    )
+    .expect("Failed to parse Grok golden result");
+
+    let actual_json = parse_session_file(&input_file).expect("Failed to analyze Grok session");
+    let ignore_fields = ["insightsVersion", "machineId", "user"];
+    let matches = compare_json_ignore_fields(&actual_json, &expected_json, &ignore_fields);
+
+    if !matches {
+        eprintln!("\n=== ACTUAL OUTPUT ===");
+        eprintln!(
+            "{}",
+            serde_json::to_string_pretty(&actual_json)
+                .unwrap_or_else(|_| "Invalid JSON".to_string())
+        );
+        eprintln!("\n=== EXPECTED OUTPUT ===");
+        eprintln!(
+            "{}",
+            serde_json::to_string_pretty(&expected_json)
+                .unwrap_or_else(|_| "Invalid JSON".to_string())
+        );
+    }
+
+    assert!(
+        matches,
+        "Grok analysis output does not match the golden result (ignoring runtime fields)"
+    );
+}
+
 /// Inline-fixture smoke test for the Gemini JSONL parser.
 ///
 /// Complements `test_gemini_parser` (which uses a real-world session dump)

@@ -120,9 +120,9 @@ pub struct Cli {
 /// Top-level subcommands exposed by the CLI.
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Analyze JSONL conversation files (single file or all sessions).
+    /// Analyze local session data (single file or all sessions).
     Analysis {
-        /// JSONL or JSON conversation file to analyze; prints complete JSON by default.
+        /// JSONL or JSON session file to analyze; prints complete JSON by default.
         #[arg(
             value_name = "FILE",
             conflicts_with_all = ["daily", "weekly", "monthly", "all"]

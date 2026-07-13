@@ -32,6 +32,7 @@ fn providers_only(provider: ExtensionType) -> ProvidersConfig {
         codex: provider == ExtensionType::Codex,
         copilot: provider == ExtensionType::Copilot,
         gemini: provider == ExtensionType::Gemini,
+        grok: provider == ExtensionType::Grok,
         opencode: provider == ExtensionType::OpenCode,
         cursor: provider == ExtensionType::Cursor,
         hermes: provider == ExtensionType::Hermes,
@@ -120,6 +121,64 @@ fn test_single_file_analysis_gemini() {
     let analysis = parse_session_file(fixture("test_conversation_gemini.jsonl"))
         .expect("should successfully analyze Gemini file");
     assert_eq!(analysis["extensionName"], "Gemini");
+}
+
+#[test]
+fn test_single_file_analysis_grok() {
+    let analysis = parse_session_file(fixture("grok_session/signals.json"))
+        .expect("should successfully analyze Grok file");
+    assert_eq!(analysis["extensionName"], "Grok");
+    let record = &analysis["records"][0];
+    assert_eq!(record["conversationUsage"]["grok-test"]["input_tokens"], 0);
+    assert_eq!(
+        record["conversationUsage"]["grok-test"]["cache_read_input_tokens"],
+        12_345
+    );
+    // One read_file plus one successful grep. The completed grep with exit 2
+    // is a semantic failure and must not inflate Read.
+    assert_eq!(record["toolCallCounts"]["Read"], 2);
+    assert_eq!(record["toolCallCounts"]["Write"], 1);
+    assert_eq!(record["toolCallCounts"]["Edit"], 1);
+    assert_eq!(record["toolCallCounts"]["Bash"], 1);
+    assert_eq!(record["toolCallCounts"]["TodoWrite"], 1);
+    assert!(record["conversationUsage"].get("grok-secondary").is_none());
+}
+
+#[test]
+fn batch_analysis_attributes_grok_tools_to_the_grok_provider() {
+    let home = TempHome::new();
+    home.put_grok_fixture_session("workspace", "grok-session");
+
+    let data = aggregate_sessions_by_model_from_paths(&home.paths, TimeRange::All)
+        .expect("aggregate Grok analysis");
+    let row = data
+        .rows
+        .iter()
+        .find(|row| row.model == "grok-test")
+        .expect("Grok model row");
+    assert_eq!(row.read_count, 2);
+    assert_eq!(row.write_count, 1);
+    assert_eq!(row.edit_count, 1);
+    assert_eq!(row.bash_count, 1);
+    assert_eq!(row.todo_write_count, 1);
+    assert_eq!(data.per_provider.grok.len(), 1);
+    assert_eq!(data.provider_days.grok, 1);
+}
+
+#[test]
+fn disabled_grok_provider_is_not_scanned_for_analysis() {
+    let home = TempHome::new();
+    home.put_grok_fixture_session("workspace", "grok-session");
+    let providers = ProvidersConfig {
+        grok: false,
+        ..ProvidersConfig::default()
+    };
+
+    let data = aggregate_sessions_by_model_from_paths_with(&home.paths, TimeRange::All, providers)
+        .expect("aggregate with Grok disabled");
+    assert!(data.rows.is_empty());
+    assert!(data.per_provider.grok.is_empty());
+    assert_eq!(data.provider_days.grok, 0);
 }
 
 #[test]
@@ -221,7 +280,6 @@ fn disabled_provider_is_dropped_from_analysis_rollup() {
         "chat.jsonl",
         &fixture_str("test_conversation_gemini.jsonl"),
     );
-
     // Turn Gemini off in `[providers]`: it must be skipped entirely.
     let providers = ProvidersConfig {
         gemini: false,
@@ -323,6 +381,7 @@ fn canonical_dataset_serializes_as_full_code_analysis_objects_in_provider_order(
         "chat.jsonl",
         &fixture_str("test_conversation_gemini.jsonl"),
     );
+    home.put_grok_fixture_session("workspace", "grok-session");
 
     let dataset = collect_analysis_sessions_from_paths_with(
         &home.paths,
@@ -339,10 +398,10 @@ fn canonical_dataset_serializes_as_full_code_analysis_objects_in_provider_order(
         .collect();
     assert_eq!(
         extensions,
-        ["Claude-Code", "Codex", "Copilot-CLI", "Gemini"]
+        ["Claude-Code", "Codex", "Copilot-CLI", "Gemini", "Grok"]
     );
-    assert_eq!(dataset.diagnostics.candidates, 4);
-    assert_eq!(dataset.diagnostics.parsed, 4);
+    assert_eq!(dataset.diagnostics.candidates, 5);
+    assert_eq!(dataset.diagnostics.parsed, 5);
     assert!(!dataset.diagnostics.has_failures());
 
     let serialized = serde_json::to_value(&dataset).expect("serialize canonical dataset");
@@ -475,6 +534,7 @@ fn full_and_usage_only_modes_have_identical_scalar_analysis() {
         ("test_conversation_codex.jsonl", ExtensionType::Codex),
         ("test_conversation_copilot.jsonl", ExtensionType::Copilot),
         ("test_conversation_gemini.jsonl", ExtensionType::Gemini),
+        ("grok_session/signals.json", ExtensionType::Grok),
     ];
 
     for (name, provider) in fixtures {

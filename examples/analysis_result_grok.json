@@ -1,0 +1,73 @@
+{
+  "extensionName": "Grok",
+  "insightsVersion": "ignored",
+  "machineId": "ignored",
+  "records": [
+    {
+      "conversationUsage": {
+        "grok-test": {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 12345,
+          "input_tokens": 0,
+          "output_tokens": 0
+        }
+      },
+      "editFileDetails": [
+        {
+          "characterCount": 9,
+          "filePath": "/workspace/demo/src/lib.rs",
+          "lineCount": 2,
+          "newString": "new\nvalue",
+          "oldString": "old",
+          "timestamp": 1767225604000
+        }
+      ],
+      "folderPath": "/workspace/demo",
+      "gitRemoteUrl": "https://example.com/demo.git",
+      "readFileDetails": [
+        {
+          "characterCount": 12,
+          "filePath": "/workspace/demo/src/main.rs",
+          "lineCount": 1,
+          "timestamp": 1767225601000
+        }
+      ],
+      "runCommandDetails": [
+        {
+          "characterCount": 10,
+          "command": "cargo test",
+          "description": "Run tests",
+          "filePath": "/workspace/demo",
+          "lineCount": 0,
+          "timestamp": 1767225605000
+        }
+      ],
+      "taskId": "grok-session-test",
+      "timestamp": 1767225610000,
+      "toolCallCounts": {
+        "Bash": 1,
+        "Edit": 1,
+        "Read": 2,
+        "TodoWrite": 1,
+        "Write": 1
+      },
+      "totalEditCharacters": 9,
+      "totalEditLines": 2,
+      "totalReadCharacters": 12,
+      "totalReadLines": 1,
+      "totalUniqueFiles": 3,
+      "totalWriteCharacters": 20,
+      "totalWriteLines": 1,
+      "writeFileDetails": [
+        {
+          "characterCount": 20,
+          "content": "pub fn new_file() {}",
+          "filePath": "/workspace/demo/src/new.rs",
+          "lineCount": 1,
+          "timestamp": 1767225603000
+        }
+      ]
+    }
+  ],
+  "user": "ignored"
+}

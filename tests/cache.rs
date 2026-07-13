@@ -197,31 +197,29 @@ fn test_file_cache_concurrent_access() {
 #[serial(global_cache)]
 fn test_file_cache_multiple_files() {
     let cache = global_cache();
+    cache.clear();
 
-    let files = vec![
+    let files = [
         "examples/test_conversation_claude_code.jsonl",
         "examples/test_conversation_codex.jsonl",
         "examples/test_conversation_copilot.jsonl",
         "examples/test_conversation_gemini.jsonl",
+        "examples/grok_session/signals.json",
     ];
 
-    let mut successful_parses = 0;
+    let mut parsed_providers = Vec::with_capacity(files.len());
 
     for file_path in files {
         let path = PathBuf::from(file_path);
-        if path.exists() {
-            let result = cache.get_or_parse(&path);
-            if result.is_ok() {
-                successful_parses += 1;
-            }
-        }
+        assert!(path.exists(), "missing committed fixture: {file_path}");
+        let analysis = cache
+            .get_or_parse(&path)
+            .unwrap_or_else(|err| panic!("failed to cache {file_path}: {err}"));
+        parsed_providers.push(analysis.extension_name.clone());
     }
 
-    // Verify that all files were successfully parsed
-    assert!(
-        successful_parses > 0,
-        "At least one file should be parsed successfully"
-    );
+    assert_eq!(parsed_providers.len(), files.len());
+    assert!(parsed_providers.iter().any(|provider| provider == "Grok"));
 }
 
 #[test]

@@ -113,6 +113,7 @@
         "copilot": true,
         "cursor": true,
         "gemini": true,
+        "grok": true,
         "hermes": true,
         "opencode": true
       },
@@ -135,6 +136,10 @@
           "type": "boolean"
         },
         "gemini": {
+          "default": true,
+          "type": "boolean"
+        },
+        "grok": {
           "default": true,
           "type": "boolean"
         },

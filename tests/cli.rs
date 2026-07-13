@@ -107,13 +107,14 @@ fn test_version_command_text() {
 }
 
 #[test]
-fn analysis_file_json_matches_typed_parser_for_every_jsonl_provider() {
+fn analysis_file_json_matches_typed_parser_for_every_file_provider() {
     let home = TempHome::new();
     for fixture_name in [
         "test_conversation_claude_code.jsonl",
         "test_conversation_codex.jsonl",
         "test_conversation_copilot.jsonl",
         "test_conversation_gemini.jsonl",
+        "grok_session/signals.json",
     ] {
         let path = fixture(fixture_name);
         let expected = serde_json::to_value(parse_session_file_typed(&path).unwrap()).unwrap();
@@ -478,6 +479,7 @@ fn single_file_summary_projection_is_parse_mode_invariant() {
         "test_conversation_codex.jsonl",
         "test_conversation_copilot.jsonl",
         "test_conversation_gemini.jsonl",
+        "grok_session/signals.json",
     ] {
         let path = fixture(fixture_name);
         let full = parse_session_file_typed_with_mode(&path, ParseMode::Full).unwrap();

@@ -7,6 +7,7 @@
 //! while [`classify_records`] returns `None` on indeterminate input so a
 //! streaming caller can keep peeking lines until a marker appears.
 use crate::models::ExtensionType;
+use crate::session::grok::is_grok_signals;
 use anyhow::{Result, bail};
 use serde_json::Value;
 
@@ -96,6 +97,10 @@ pub fn detect_extension_type(data: &[Value]) -> Result<ExtensionType> {
 /// assert_eq!(classify_records(&with_marker), Some(ExtensionType::ClaudeCode));
 /// ```
 pub fn classify_records(data: &[Value]) -> Option<ExtensionType> {
+    if data.first().is_some_and(is_grok_signals) {
+        return Some(ExtensionType::Grok);
+    }
+
     // JSONL stream: Gemini session-meta header line.
     //
     // Gemini CLI writes one event per line under `chats/`; the very first
@@ -173,6 +178,18 @@ pub fn classify_records(data: &[Value]) -> Option<ExtensionType> {
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    #[test]
+    fn test_detect_grok_signals() {
+        let data = vec![json!({
+            "primaryModelId": "grok-4.5",
+            "contextTokensUsed": 12_345,
+            "contextWindowTokens": 200_000,
+            "toolsUsed": ["read_file"]
+        })];
+
+        assert_eq!(detect_extension_type(&data).unwrap(), ExtensionType::Grok);
+    }
 
     #[test]
     fn test_detect_gemini_jsonl_meta_header() {

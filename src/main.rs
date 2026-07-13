@@ -481,6 +481,7 @@ fn resolve_enriched_model_cost(
         &usage_data.per_provider.codex,
         &usage_data.per_provider.copilot,
         &usage_data.per_provider.gemini,
+        &usage_data.per_provider.grok,
     ] {
         if let Some(raw_usage) = usage.get(model) {
             found = true;
@@ -543,6 +544,39 @@ mod tests {
     use super::*;
     use vibe_coding_tracker::models::{PerProviderUsage, ProviderActiveDays, UsageResult};
     use vibe_coding_tracker::pricing::{ModelPricing, clear_pricing_cache};
+
+    #[test]
+    fn json_rows_include_grok_source_cost() {
+        clear_pricing_cache();
+        let mut raw_pricing = HashMap::new();
+        raw_pricing.insert(
+            "shared-model".to_string(),
+            ModelPricing {
+                input_cost_per_token: 0.01,
+                ..Default::default()
+            },
+        );
+        let pricing_map = ModelPricingMap::new(raw_pricing);
+        let mut models = UsageResult::default();
+        models.insert("shared-model".to_string(), json!({"input_tokens": 200}));
+        let mut per_provider = PerProviderUsage::default();
+        per_provider
+            .claude
+            .insert("shared-model".to_string(), json!({"input_tokens": 100}));
+        per_provider
+            .grok
+            .insert("shared-model".to_string(), json!({"input_tokens": 100}));
+        let usage_data = vibe_coding_tracker::UsageData {
+            models,
+            per_provider,
+            provider_days: ProviderActiveDays::default(),
+            stored_costs: vibe_coding_tracker::usage::StoredCosts::default(),
+        };
+
+        let rows = build_enriched_json(&usage_data, &pricing_map).unwrap();
+
+        assert!((rows[0]["cost_usd"].as_f64().unwrap() - 2.0).abs() < 1e-9);
+    }
 
     #[test]
     fn json_rows_price_opencode_fallback_only_for_opencode_tokens() {

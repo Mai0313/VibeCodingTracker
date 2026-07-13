@@ -1,4 +1,4 @@
-//! Aggregates per-model token usage across the four provider session trees.
+//! Aggregates per-model token usage across the file-backed provider session trees.
 //!
 //! Each provider directory is walked with the provider fixed by its *source
 //! path* (never re-detected from file contents), parsed in
@@ -19,9 +19,9 @@ use crate::session::{
     ParseMode, parse_session_file_as, read_cursor_usage, read_hermes_usage, read_opencode_usage,
 };
 use crate::utils::{
-    COPILOT_SESSION_MAX_DEPTH, HelperPaths, TokenCounts, collect_files_with_max_depth,
-    is_claude_session_file, is_codex_session_file, is_copilot_session_file, is_gemini_session_file,
-    resolve_paths,
+    COPILOT_SESSION_MAX_DEPTH, GROK_SESSION_MAX_DEPTH, HelperPaths, TokenCounts,
+    collect_files_with_max_depth, is_claude_session_file, is_codex_session_file,
+    is_copilot_session_file, is_gemini_session_file, is_grok_session_file, resolve_paths,
 };
 use anyhow::Result;
 use rayon::prelude::*;
@@ -120,8 +120,8 @@ fn extract_conversation_usage_from_analysis(analysis: &CodeAnalysis) -> FastHash
 
 /// Aggregates token usage from all AI provider session directories.
 ///
-/// Scans the Claude Code, Codex, Copilot, and Gemini session trees resolved by
-/// [`resolve_paths`], filtered by `time_range`, and rolls every session's
+/// Scans the file-backed provider session trees resolved by [`resolve_paths`],
+/// filtered by `time_range`, and rolls every session's
 /// per-model usage into a [`UsageData`]. Missing provider directories are
 /// skipped silently, and a source file or OpenCode database that fails to parse
 /// logs a warning to stderr and is excluded rather than aborting the whole scan.
@@ -189,6 +189,7 @@ pub fn get_usage_from_paths_with(
     let mut codex_dates: HashSet<String> = HashSet::new();
     let mut copilot_dates: HashSet<String> = HashSet::new();
     let mut gemini_dates: HashSet<String> = HashSet::new();
+    let mut grok_dates: HashSet<String> = HashSet::new();
     let mut opencode_dates: HashSet<String> = HashSet::new();
     let mut cursor_dates: HashSet<String> = HashSet::new();
     let mut hermes_dates: HashSet<String> = HashSet::new();
@@ -252,6 +253,19 @@ pub fn get_usage_from_paths_with(
         )?;
     }
 
+    if providers.grok && paths.grok_session_dir.exists() {
+        process_usage_directory(
+            &paths.grok_session_dir,
+            ExtensionType::Grok,
+            &mut result,
+            &mut per_provider.grok,
+            &mut grok_dates,
+            is_grok_session_file,
+            time_range,
+            Some(GROK_SESSION_MAX_DEPTH),
+        )?;
+    }
+
     // OpenCode lives in a single SQLite database rather than a session
     // directory, so it is read directly instead of walked.
     if providers.opencode
@@ -312,6 +326,7 @@ pub fn get_usage_from_paths_with(
     all_dates.extend(codex_dates.iter());
     all_dates.extend(copilot_dates.iter());
     all_dates.extend(gemini_dates.iter());
+    all_dates.extend(grok_dates.iter());
     all_dates.extend(opencode_dates.iter());
     all_dates.extend(cursor_dates.iter());
     all_dates.extend(hermes_dates.iter());
@@ -321,6 +336,7 @@ pub fn get_usage_from_paths_with(
         codex: codex_dates.len(),
         copilot: copilot_dates.len(),
         gemini: gemini_dates.len(),
+        grok: grok_dates.len(),
         opencode: opencode_dates.len(),
         cursor: cursor_dates.len(),
         hermes: hermes_dates.len(),

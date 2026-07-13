@@ -24,7 +24,7 @@ use std::collections::HashMap;
 /// prefixes (e.g. `openai/gpt-5.5` + `azure/gpt-5.5`) are collapsed into one.
 pub fn display_usage_table(usage_data: &UsageData, merge: bool) {
     if usage_data.models.is_empty() {
-        println!("No usage data found in Claude Code, Codex, Copilot, or Gemini sessions");
+        println!("No usage data found in enabled provider sessions");
         return;
     }
 
@@ -51,7 +51,7 @@ pub fn display_usage_table(usage_data: &UsageData, merge: bool) {
     );
 
     if summary.rows.is_empty() {
-        println!("No usage data found in Claude Code, Codex, Copilot, or Gemini sessions");
+        println!("No usage data found in enabled provider sessions");
         return;
     }
 

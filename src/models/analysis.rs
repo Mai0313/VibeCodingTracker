@@ -209,7 +209,7 @@ pub struct CodeAnalysis {
 
 /// The AI coding assistant a session came from.
 ///
-/// Distinct from [`crate::models::Provider`]: `ExtensionType` is the four
+/// Distinct from [`crate::models::Provider`]: `ExtensionType` is the
 /// concrete assistants the detector resolves a session file to (there is no
 /// `Unknown` variant), and its [`std::fmt::Display`] produces the hyphenated
 /// `extension_name` strings stored in [`CodeAnalysis`].
@@ -237,6 +237,8 @@ pub enum ExtensionType {
     Cursor,
     /// Hermes.
     Hermes,
+    /// xAI Grok CLI.
+    Grok,
 }
 
 impl std::fmt::Display for ExtensionType {
@@ -249,6 +251,7 @@ impl std::fmt::Display for ExtensionType {
             ExtensionType::OpenCode => write!(f, "OpenCode"),
             ExtensionType::Cursor => write!(f, "Cursor"),
             ExtensionType::Hermes => write!(f, "Hermes"),
+            ExtensionType::Grok => write!(f, "Grok"),
         }
     }
 }
@@ -416,6 +419,7 @@ mod tests {
         assert_eq!(ExtensionType::Codex, ExtensionType::Codex);
         assert_eq!(ExtensionType::Copilot, ExtensionType::Copilot);
         assert_eq!(ExtensionType::Gemini, ExtensionType::Gemini);
+        assert_eq!(ExtensionType::Grok.to_string(), "Grok");
 
         assert_ne!(ExtensionType::ClaudeCode, ExtensionType::Codex);
         assert_ne!(ExtensionType::Copilot, ExtensionType::Gemini);
