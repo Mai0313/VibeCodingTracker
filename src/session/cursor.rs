@@ -393,7 +393,8 @@ fn read_store_analysis(
 
         // Pass 1: index Read tool results by tool-call id so their file lines can
         // be attributed to the matching Read call in pass 2.
-        let (read_contents, mut failed_payloads) = collect_read_results(&blobs);
+        let read_results = collect_read_results(&blobs);
+        let mut failed_payloads = 0usize;
 
         // Pass 2: fold each assistant turn's tool calls into a per-date state.
         let mut per_date: HashMap<String, SessionParseState> = HashMap::new();
@@ -456,7 +457,7 @@ fn read_store_analysis(
                 s
             });
             state.last_ts = ts.max(state.last_ts);
-            match apply_assistant_tools(state, &msg, &read_contents, ts) {
+            match apply_assistant_tools(state, &msg, &read_results, ts) {
                 Ok(tool_failures) => {
                     normalized_messages += 1;
                     failed_payloads += tool_failures;
@@ -590,7 +591,7 @@ fn message_is_assistant(bytes: &[u8]) -> bool {
 fn apply_assistant_tools(
     state: &mut SessionParseState,
     msg: &Value,
-    read_contents: &HashMap<String, String>,
+    read_results: &HashMap<String, CursorReadResult>,
     ts: i64,
 ) -> std::result::Result<usize, ()> {
     if msg.get("role").and_then(|v| v.as_str()) != Some("assistant") {
@@ -645,16 +646,19 @@ fn apply_assistant_tools(
                     failures += 1;
                     continue;
                 };
-                let content = read_contents
-                    .get(tool_call_id)
-                    .map(String::as_str)
-                    .unwrap_or("");
-                if !content.is_empty() {
-                    state.add_read_detail(path, content, ts);
-                } else {
-                    // A read whose result we could not recover still counts as a
-                    // read invocation, matching the OpenCode reader.
-                    state.tool_counts.read += 1;
+                match read_results.get(tool_call_id) {
+                    Some(CursorReadResult::Content(content)) if !content.is_empty() => {
+                        state.add_read_detail(path, content, ts);
+                    }
+                    Some(CursorReadResult::Unsupported) => {
+                        failures += 1;
+                        state.tool_counts.read += 1;
+                    }
+                    _ => {
+                        // A read whose result we could not recover still counts as a
+                        // read invocation, matching the OpenCode reader.
+                        state.tool_counts.read += 1;
+                    }
                 }
             }
             "Shell" => {
@@ -673,11 +677,15 @@ fn apply_assistant_tools(
     Ok(failures)
 }
 
+enum CursorReadResult {
+    Content(String),
+    Unsupported,
+}
+
 /// Indexes `Read` tool results by tool-call id, with line-number prefixes
 /// stripped so the recovered content is the file's own lines.
-fn collect_read_results(blobs: &[Vec<u8>]) -> (HashMap<String, String>, usize) {
+fn collect_read_results(blobs: &[Vec<u8>]) -> HashMap<String, CursorReadResult> {
     let mut map = HashMap::new();
-    let mut failures = 0usize;
     for data in blobs {
         if data.first() != Some(&b'{') {
             continue;
@@ -696,7 +704,6 @@ fn collect_read_results(blobs: &[Vec<u8>]) -> (HashMap<String, String>, usize) {
             continue;
         }
         let Some(content) = msg.get("content").and_then(|v| v.as_array()) else {
-            failures += 1;
             continue;
         };
         for c in content {
@@ -709,19 +716,25 @@ fn collect_read_results(blobs: &[Vec<u8>]) -> (HashMap<String, String>, usize) {
             ) {
                 continue;
             }
-            let (Some(id), Some(result)) = (
-                c.get("toolCallId")
-                    .and_then(|v| v.as_str())
-                    .filter(|id| !id.is_empty()),
-                c.get("result").and_then(|v| v.as_str()),
-            ) else {
-                failures += 1;
+            let Some(id) = c
+                .get("toolCallId")
+                .and_then(|v| v.as_str())
+                .filter(|id| !id.is_empty())
+            else {
                 continue;
             };
-            map.insert(id.to_string(), strip_cursor_line_numbers(result));
+            if let Some(result) = c.get("result").and_then(|v| v.as_str()) {
+                map.insert(
+                    id.to_string(),
+                    CursorReadResult::Content(strip_cursor_line_numbers(result)),
+                );
+            } else {
+                map.entry(id.to_string())
+                    .or_insert(CursorReadResult::Unsupported);
+            }
         }
     }
-    (map, failures)
+    map
 }
 
 /// Strips Cursor's `"<spaces><digits>|"` read-output line prefixes, keeping only
@@ -1154,8 +1167,14 @@ mod tests {
             ]
         });
         let mut reads = HashMap::new();
-        reads.insert("e".to_string(), "r1\nr2\nr3".to_string());
-        reads.insert("g".to_string(), "w1\nw2".to_string());
+        reads.insert(
+            "e".to_string(),
+            CursorReadResult::Content("r1\nr2\nr3".to_string()),
+        );
+        reads.insert(
+            "g".to_string(),
+            CursorReadResult::Content("w1\nw2".to_string()),
+        );
         apply_assistant_tools(&mut state, &msg, &reads, 42).unwrap();
 
         assert_eq!(state.tool_counts.write, 1);
@@ -1408,6 +1427,126 @@ mod tests {
         assert_eq!(result.rows.len(), 1);
         let record = &result.rows[0].analysis.records[0];
         assert_eq!(record.tool_call_counts.write, 0);
+        assert_eq!(record.tool_call_counts.read, 1);
+        assert_eq!(record.total_read_lines, 0);
+    }
+
+    #[test]
+    fn cursor_store_diagnostics_ignore_out_of_range_malformed_read_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let chats = dir.path().join("chats");
+        let store = chats.join("project/conversation/store.db");
+        let old_assistant = make_node(
+            r#"{"role":"assistant","content":[
+                {"type":"tool-call","toolName":"Read","toolCallId":"old","args":{"path":"/repo/old"}}
+            ]}"#,
+            946_684_800_000,
+            None,
+        );
+        let malformed_result = r#"{"role":"tool","content":[{"type":"tool-result","toolName":"Read","toolCallId":"old","futureResult":"text"}]}"#;
+        write_store_db(&store, &[old_assistant], &[malformed_result]);
+
+        let result = read_cursor_analysis_with_diagnostics(
+            &chats,
+            &dir.path().join("tracking.db"),
+            TimeRange::Daily,
+            ParseMode::Full,
+        );
+        assert_eq!(result.candidates, 1);
+        assert_eq!(result.parsed, 1);
+        assert!(result.rows.is_empty());
+        assert!(result.failures.is_empty());
+    }
+
+    #[test]
+    fn out_of_range_malformed_read_result_does_not_taint_current_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let chats = dir.path().join("chats");
+        let store = chats.join("project/conversation/store.db");
+        let old_assistant = make_node(
+            r#"{"role":"assistant","content":[
+                {"type":"tool-call","toolName":"Read","toolCallId":"old","args":{"path":"/repo/old"}}
+            ]}"#,
+            946_684_800_000,
+            None,
+        );
+        let current_assistant = make_node(
+            r#"{"role":"assistant","content":[]}"#,
+            4_102_444_800_000,
+            None,
+        );
+        let malformed_result = r#"{"role":"tool","content":[{"type":"tool-result","toolName":"Read","toolCallId":"old","futureResult":"text"}]}"#;
+        write_store_db(
+            &store,
+            &[old_assistant, current_assistant],
+            &[malformed_result],
+        );
+
+        let result = read_cursor_analysis_with_diagnostics(
+            &chats,
+            &dir.path().join("tracking.db"),
+            TimeRange::Daily,
+            ParseMode::Full,
+        );
+        assert_eq!(result.parsed, 1);
+        assert_eq!(result.rows.len(), 1);
+        assert!(result.failures.is_empty());
+    }
+
+    #[test]
+    fn in_range_malformed_read_result_remains_a_partial_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let chats = dir.path().join("chats");
+        let store = chats.join("project/conversation/store.db");
+        let assistant = make_node(
+            r#"{"role":"assistant","content":[
+                {"type":"tool-call","toolName":"Read","toolCallId":"current","args":{"path":"/repo/current"}}
+            ]}"#,
+            4_102_444_800_000,
+            None,
+        );
+        let malformed_result = r#"{"role":"tool","content":[{"type":"tool-result","toolName":"Read","toolCallId":"current","futureResult":"text"}]}"#;
+        write_store_db(&store, &[assistant], &[malformed_result]);
+
+        let result = read_cursor_analysis_with_diagnostics(
+            &chats,
+            &dir.path().join("tracking.db"),
+            TimeRange::Daily,
+            ParseMode::Full,
+        );
+        assert_eq!(result.parsed, 1);
+        assert_eq!(result.failures.len(), 1);
+        assert!(result.failures[0].error.contains("1 analyzer payload"));
+        let record = &result.rows[0].analysis.records[0];
+        assert_eq!(record.tool_call_counts.read, 1);
+        assert_eq!(record.total_read_lines, 0);
+    }
+
+    #[test]
+    fn unkeyed_tool_blobs_do_not_taint_an_in_range_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let chats = dir.path().join("chats");
+        let store = chats.join("project/conversation/store.db");
+        let assistant = make_node(
+            r#"{"role":"assistant","content":[
+                {"type":"tool-call","toolName":"Read","toolCallId":"missing","args":{"path":"/repo/current"}}
+            ]}"#,
+            4_102_444_800_000,
+            None,
+        );
+        let non_array = r#"{"role":"tool","content":"future"}"#;
+        let missing_id = r#"{"role":"tool","content":[{"type":"tool-result","toolName":"Read","result":"text"}]}"#;
+        write_store_db(&store, &[assistant], &[non_array, missing_id]);
+
+        let result = read_cursor_analysis_with_diagnostics(
+            &chats,
+            &dir.path().join("tracking.db"),
+            TimeRange::Daily,
+            ParseMode::Full,
+        );
+        assert_eq!(result.parsed, 1);
+        assert!(result.failures.is_empty());
+        let record = &result.rows[0].analysis.records[0];
         assert_eq!(record.tool_call_counts.read, 1);
         assert_eq!(record.total_read_lines, 0);
     }
