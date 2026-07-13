@@ -213,12 +213,12 @@ where
                             if let Some(call_id) = entry.payload.call_id.as_deref()
                                 && let Some(call) = custom_calls.remove(call_id)
                             {
-                                diagnostics.record_relevant(true);
-                                dispatch_custom_call(
+                                let normalized = dispatch_custom_call(
                                     &mut state,
                                     call,
                                     entry.payload.output.as_deref(),
                                 );
+                                diagnostics.record_relevant(normalized);
                             }
                         }
                         _ => {}
@@ -464,7 +464,7 @@ fn dispatch_custom_call(
     state: &mut SessionParseState,
     call: CodexCustomCall,
     output: Option<&str>,
-) {
+) -> bool {
     match call {
         CodexCustomCall::Exec { source, timestamp } => {
             // The JavaScript wrapper can contain branches, loops, retries, or
@@ -475,22 +475,46 @@ fn dispatch_custom_call(
             } else {
                 state.tool_counts.bash += 1;
             }
+            true
         }
         CodexCustomCall::ApplyPatch { patches, timestamp } => {
-            if !custom_apply_patch_succeeded(output) {
-                return;
-            }
-            for patch in patches {
-                state.handle_patch(patch, timestamp);
+            match custom_apply_patch_result(output) {
+                CustomApplyPatchResult::Success => {
+                    for patch in patches {
+                        state.handle_patch(patch, timestamp);
+                    }
+                    true
+                }
+                CustomApplyPatchResult::Failure => true,
+                CustomApplyPatchResult::Unknown => false,
             }
         }
     }
 }
 
-fn custom_apply_patch_succeeded(output: Option<&str>) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CustomApplyPatchResult {
+    Success,
+    Failure,
+    Unknown,
+}
+
+fn custom_apply_patch_result(output: Option<&str>) -> CustomApplyPatchResult {
     let output = normalize_custom_output(output);
     let output = output.trim();
-    output == "Done!" || output.starts_with("Success. Updated the following files:")
+    if output == "Done!" || output.starts_with("Success. Updated the following files:") {
+        CustomApplyPatchResult::Success
+    } else if output.starts_with("Failed")
+        || output.starts_with("Error")
+        || output.starts_with("apply_patch verification failed:")
+        || output.starts_with("Invalid patch")
+        || output.starts_with("apply_patch handler received")
+        || output.starts_with("apply_patch is unavailable")
+    {
+        CustomApplyPatchResult::Failure
+    } else {
+        CustomApplyPatchResult::Unknown
+    }
 }
 
 /// Decodes a custom tool's normalized string or `JSON.stringify` result.
@@ -1229,29 +1253,44 @@ mod tests {
             custom_output("patch-failed", Value::String(wire_result)),
         ];
 
-        let analysis = parse_codex_logs(&logs, ParseMode::Full).unwrap();
-        let record = &analysis.records[0];
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        let record = &parsed.analysis.records[0];
         assert_eq!(record.tool_call_counts.edit, 0);
         assert!(record.edit_file_details.is_empty());
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
     }
 
     #[test]
     fn unknown_direct_custom_apply_patch_result_is_skipped() {
         let patch = "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-old\n+new\n*** End Patch";
-        let logs = vec![
-            response_item(serde_json::json!({
-                "type": "custom_tool_call",
-                "name": "apply_patch",
-                "input": patch,
-                "call_id": "patch-unknown"
-            })),
-            custom_output("patch-unknown", serde_json::json!("Patch command finished")),
-        ];
+        for output in [
+            Value::Null,
+            serde_json::json!("Patch command finished"),
+            serde_json::json!({
+                "success": true,
+                "updated_files": ["src/lib.rs"]
+            }),
+        ] {
+            let logs = vec![
+                response_item(serde_json::json!({
+                    "type": "custom_tool_call",
+                    "name": "apply_patch",
+                    "input": patch,
+                    "call_id": "patch-unknown"
+                })),
+                custom_output("patch-unknown", output),
+            ];
 
-        let analysis = parse_codex_logs(&logs, ParseMode::Full).unwrap();
-        let record = &analysis.records[0];
-        assert_eq!(record.tool_call_counts.edit, 0);
-        assert!(record.edit_file_details.is_empty());
+            let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+            let record = &parsed.analysis.records[0];
+            assert_eq!(record.tool_call_counts.edit, 0);
+            assert!(record.edit_file_details.is_empty());
+            assert_eq!(parsed.diagnostics.relevant_records, 2);
+            assert_eq!(parsed.diagnostics.normalized_records, 1);
+            assert_eq!(parsed.diagnostics.failed_relevant_records, 1);
+            assert_eq!(parsed.diagnostics.partial_failure_count(), 1);
+            assert!(!parsed.diagnostics.is_complete_failure());
+        }
     }
 
     #[test]
@@ -1275,7 +1314,10 @@ mod tests {
             normalize_custom_output(output.as_deref()),
             "Success. Updated the following files:\nM src/lib.rs"
         );
-        assert!(custom_apply_patch_succeeded(output.as_deref()));
+        assert_eq!(
+            custom_apply_patch_result(output.as_deref()),
+            CustomApplyPatchResult::Success
+        );
     }
 
     #[test]

@@ -22,6 +22,7 @@ use vibe_coding_tracker::config::ProvidersConfig;
 use vibe_coding_tracker::models::ExtensionType;
 use vibe_coding_tracker::session::parser::{
     parse_session_file, parse_session_file_as, parse_session_file_typed,
+    parse_session_file_typed_with_mode_and_diagnostics,
 };
 use vibe_coding_tracker::session::state::ParseMode;
 
@@ -838,6 +839,39 @@ fn codex_custom_apply_patch_header_drift_is_not_a_false_success() {
 
     let error = parse_session_file_typed(path).unwrap_err();
     assert!(error.to_string().contains("none used a supported schema"));
+}
+
+#[test]
+fn codex_unknown_apply_patch_output_surfaces_source_diagnostics() {
+    let home = TempHome::new();
+    let path = home.put_codex_session(
+        "2026/07/12/unknown-patch-output.jsonl",
+        concat!(
+            r#"{"timestamp":"2026-07-12T00:00:00Z","type":"session_meta","payload":{"type":"session_meta","id":"session"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-07-12T00:00:01Z","type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch","input":"*** Begin Patch\n*** Update File: /repo/a\n@@\n-old\n+new\n*** End Patch","call_id":"call"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-07-12T00:00:02Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call","output":{"success":true,"updated_files":["/repo/a"]}}}"#,
+            "\n"
+        ),
+    );
+
+    let (analysis, diagnostics) =
+        parse_session_file_typed_with_mode_and_diagnostics(&path, ParseMode::Full).unwrap();
+    assert_eq!(analysis.records[0].tool_call_counts.edit, 0);
+    assert_eq!(diagnostics.skipped_records(), 1);
+
+    let dataset = collect_analysis_sessions_from_paths_with(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::Codex),
+        ParseMode::Full,
+    )
+    .unwrap();
+    assert_eq!(dataset.len(), 1);
+    assert_eq!(dataset.diagnostics.failures.len(), 1);
+    assert_eq!(dataset.diagnostics.failures[0].source, path);
+    assert!(dataset.diagnostics.failures[0].error.contains("skipped 1"));
 }
 
 #[test]
