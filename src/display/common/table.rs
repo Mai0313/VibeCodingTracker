@@ -19,26 +19,16 @@ use ratatui::{
         ScrollbarOrientation, ScrollbarState, Table as RatatuiTable,
     },
 };
-use std::sync::OnceLock;
-use std::thread::available_parallelism;
 use sysinfo::System;
 
-/// Logical core count, cached once. Used to normalize a process's summed
-/// per-core CPU usage (sysinfo reports 100% per fully-used core) into a
-/// 0-100% share of the whole machine. Read via `available_parallelism` rather
-/// than sysinfo so we never load the machine's CPU list into `System`.
-fn cpu_cores() -> f32 {
-    static CPU_CORES: OnceLock<f32> = OnceLock::new();
-    *CPU_CORES.get_or_init(|| {
-        available_parallelism()
-            .map(|n| n.get() as f32)
-            .unwrap_or(1.0)
-            .max(1.0)
-    })
-}
-
 /// Normalizes a process's raw (per-core-summed) CPU usage into a 0-100% share
-/// of the machine by dividing by the logical core count.
+/// of the machine by dividing by the CPU count.
+///
+/// `cores` must be the **same basis** sysinfo scales `cpu_usage()` against, i.e.
+/// `sys.cpus().len()` (the host's logical CPUs read from `/proc/stat`). Using
+/// that basis keeps the reading a true machine share even under CPU affinity or
+/// a cgroup CPU quota, where `available_parallelism()` would report a smaller
+/// count and inflate the percentage.
 fn normalized_cpu(raw: f32, cores: f32) -> f32 {
     (raw / cores).clamp(0.0, 100.0)
 }
@@ -46,8 +36,10 @@ fn normalized_cpu(raw: f32, cores: f32) -> f32 {
 /// Refreshes only this process's CPU + memory in `sys` (skipping disk / exe /
 /// tasks), pruning any dead entry. This is the single source of the "our own
 /// process, cheap metrics only" contract shared by every summary-bar refresh —
-/// deliberately narrower than sysinfo's default `refresh_processes` so a fast
-/// metrics tick costs little more than one `/proc/self/stat` read.
+/// deliberately narrower than sysinfo's default `refresh_processes`. On Linux it
+/// reads this process's stat plus `/proc/stat` for the CPU-time delta (a couple
+/// of small reads), cheap enough to run on a fast metrics tick. `.with_cpu()`
+/// also populates `sys.cpus()`, which `create_summary` uses to normalize CPU%.
 pub fn refresh_process_metrics(sys: &mut System, pid: sysinfo::Pid) {
     sys.refresh_processes_specifics(
         sysinfo::ProcessesToUpdate::Some(&[pid]),
@@ -72,7 +64,7 @@ pub fn create_title(title_text: &str, color: RatatuiColor) -> Paragraph<'_> {
     .centered()
 }
 
-/// Builds the TUI summary bar from caller-supplied items plus a live memory readout.
+/// Builds the TUI summary bar from caller-supplied items plus live memory and CPU readouts.
 ///
 /// Each `(icon, value, color)` tuple in `summary_items` becomes a colored,
 /// pipe-separated segment. A `Memory: <n> MB` and a `CPU: <n>%` segment for the
@@ -115,9 +107,13 @@ pub fn create_summary<'a>(
     ));
 
     // Add CPU usage for this process, normalized to a 0-100% machine share.
+    // Divide by `sys.cpus().len()` (populated for free by the `.with_cpu()`
+    // refresh) since that is the exact basis sysinfo scales `cpu_usage()`
+    // against; `.max(1)` guards the pre-refresh empty-CPU-list case.
+    let cores = sys.cpus().len().max(1) as f32;
     let cpu_percent = sys
         .process(pid)
-        .map_or(0.0, |p| normalized_cpu(p.cpu_usage(), cpu_cores()));
+        .map_or(0.0, |p| normalized_cpu(p.cpu_usage(), cores));
 
     spans.push(Span::raw("  |  "));
     spans.push(Span::styled(
