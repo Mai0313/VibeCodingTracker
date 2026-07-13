@@ -6,6 +6,7 @@ use crate::session::diagnostics::{ParseDiagnostics, ParsedAnalysis};
 use crate::session::state::{ParseMode, SessionParseState};
 use crate::utils::parse_iso_timestamp;
 use anyhow::{Context, Result, bail};
+use percent_encoding::percent_decode_str;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -123,7 +124,9 @@ fn apply_metadata(state: &mut SessionParseState, path: &Path, summary: Option<&G
             .unwrap_or_default();
     }
     if state.folder_path.is_empty() {
-        state.folder_path = read_cwd_marker(path).unwrap_or_default();
+        state.folder_path = read_cwd_marker(path)
+            .or_else(|| decode_workspace_dir(path))
+            .unwrap_or_default();
     }
     if state.last_ts == 0 {
         state.last_ts = file_modified_millis(path);
@@ -135,6 +138,14 @@ fn read_cwd_marker(signals_path: &Path) -> Option<String> {
     let cwd = fs::read_to_string(workspace_dir.join(".cwd")).ok()?;
     let cwd = cwd.trim();
     (!cwd.is_empty()).then(|| cwd.to_string())
+}
+
+fn decode_workspace_dir(signals_path: &Path) -> Option<String> {
+    let encoded = signals_path.parent()?.parent()?.file_name()?.to_str()?;
+    let decoded = percent_decode_str(encoded).decode_utf8().ok()?;
+    let decoded = decoded.trim();
+    (!decoded.is_empty() && decoded != encoded && Path::new(decoded).is_absolute())
+        .then(|| decoded.to_string())
 }
 
 fn file_modified_millis(path: &Path) -> i64 {
@@ -495,5 +506,25 @@ mod tests {
             state.write_details[0].base.file_path,
             "/workspace/demo/src/new.rs"
         );
+    }
+
+    #[test]
+    fn encoded_workspace_name_recovers_missing_summary_cwd() {
+        use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+
+        let temp = tempfile::tempdir().unwrap();
+        let expected = temp.path().join("project");
+        let encoded =
+            utf8_percent_encode(expected.to_string_lossy().as_ref(), NON_ALPHANUMERIC).to_string();
+        let session = temp.path().join(encoded).join("session-id");
+        std::fs::create_dir_all(&session).unwrap();
+        let signals = session.join("signals.json");
+        std::fs::write(&signals, "").unwrap();
+
+        let mut state = SessionParseState::new();
+        apply_metadata(&mut state, &signals, None);
+
+        assert_eq!(state.task_id, "session-id");
+        assert_eq!(state.folder_path, expected.to_string_lossy());
     }
 }

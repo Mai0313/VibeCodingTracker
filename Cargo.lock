@@ -3263,6 +3263,7 @@ dependencies = [
  "mimalloc",
  "once_cell",
  "owo-colors",
+ "percent-encoding",
  "predicates",
  "ratatui",
  "rayon",
