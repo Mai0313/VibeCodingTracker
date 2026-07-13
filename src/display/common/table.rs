@@ -50,6 +50,20 @@ pub fn refresh_process_metrics(sys: &mut System, pid: sysinfo::Pid) {
     );
 }
 
+/// One-time init for the summary-bar metrics `System`, called once after
+/// `System::new()` before the refresh loop.
+///
+/// It populates the CPU list (`refresh_cpu_all`) so `create_summary` can read
+/// `sys.cpus().len()` as the CPU% divisor, then primes this process's first
+/// sample. The CPU-list step is **required**: a process-only refresh does not
+/// initialize `sys.cpus()` on macOS, which would leave the divisor at 1 and
+/// over-report CPU%. The list is stable, so it is never refreshed again — the
+/// per-tick path stays [`refresh_process_metrics`].
+pub fn init_process_metrics(sys: &mut System, pid: sysinfo::Pid) {
+    sys.refresh_cpu_all();
+    refresh_process_metrics(sys, pid);
+}
+
 /// Builds the bordered, centered title paragraph for the top of a TUI view.
 pub fn create_title(title_text: &str, color: RatatuiColor) -> Paragraph<'_> {
     Paragraph::new(vec![Line::from(vec![Span::styled(

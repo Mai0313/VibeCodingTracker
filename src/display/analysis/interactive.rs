@@ -11,8 +11,9 @@ use crate::display::analysis::averages::{
     calculate_analysis_provider_totals_from_per_provider, convert_to_analysis_rows,
 };
 use crate::display::common::table::{
-    create_controls, create_provider_row, create_ratatui_table, create_summary, main_layout,
-    refresh_process_metrics, render_scrollable_table, render_too_small, styled_row,
+    create_controls, create_provider_row, create_ratatui_table, create_summary,
+    init_process_metrics, main_layout, refresh_process_metrics, render_scrollable_table,
+    render_too_small, styled_row,
 };
 use crate::display::common::tui::{
     InputAction, RefreshState, ScrollState, UpdateTracker, handle_input, overlay_repo_hyperlink,
@@ -110,7 +111,7 @@ pub fn display_analysis_interactive(
     let pid =
         sysinfo::get_current_pid().expect("Failed to get current process ID for memory monitoring");
     let mut sys = System::new();
-    refresh_process_metrics(&mut sys, pid);
+    init_process_metrics(&mut sys, pid);
     // Lightweight CPU/memory sampling runs on its own fast cadence, decoupled
     // from the heavier session re-aggregation below.
     let metrics_interval = Duration::from_millis(crate::constants::refresh::METRICS_REFRESH_MS);
