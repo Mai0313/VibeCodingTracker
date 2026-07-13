@@ -12,7 +12,7 @@ use crate::display::analysis::averages::{
 };
 use crate::display::common::table::{
     create_controls, create_provider_row, create_ratatui_table, create_summary, main_layout,
-    render_scrollable_table, render_too_small, styled_row,
+    refresh_process_metrics, render_scrollable_table, render_too_small, styled_row,
 };
 use crate::display::common::tui::{
     InputAction, RefreshState, ScrollState, UpdateTracker, handle_input, overlay_repo_hyperlink,
@@ -27,6 +27,7 @@ use ratatui::{
     widgets::Row as RatatuiRow,
 };
 use std::io;
+use std::time::{Duration, Instant};
 use sysinfo::{Pid, System};
 
 /// Upper bound on the number of rows tracked for the "recently updated"
@@ -103,13 +104,17 @@ pub fn display_analysis_interactive(
     let mut terminal = setup_terminal()?;
     let mut refresh_state = RefreshState::new(refresh_secs.max(1));
 
-    // Initialize system for memory monitoring. We only read our own process
+    // Initialize system for CPU/memory monitoring. We only read our own process
     // stats, so start from an empty `System` to avoid loading the machine's
     // entire process table, disks, and network adapters.
     let pid =
         sysinfo::get_current_pid().expect("Failed to get current process ID for memory monitoring");
     let mut sys = System::new();
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+    refresh_process_metrics(&mut sys, pid);
+    // Lightweight CPU/memory sampling runs on its own fast cadence, decoupled
+    // from the heavier session re-aggregation below.
+    let metrics_interval = Duration::from_millis(crate::constants::refresh::METRICS_REFRESH_MS);
+    let mut last_metrics = Instant::now();
 
     // Track updates
     let mut update_tracker = UpdateTracker::new(MAX_TRACKED_ANALYSIS_ROWS, 1000);
@@ -133,10 +138,10 @@ pub fn display_analysis_interactive(
         if refresh_state.should_refresh() {
             refresh_state.mark_refreshed();
 
-            // Refresh only our own process; `remove_dead_processes: true` keeps
-            // the `System` from accumulating state for PIDs that come and go on
-            // the host over long TUI sessions.
-            sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+            // Refresh only our own process (CPU + memory); `remove_dead_processes`
+            // keeps the `System` from accumulating state for PIDs that come and
+            // go on the host over long TUI sessions.
+            refresh_process_metrics(&mut sys, pid);
 
             // First tick reuses the caller's aggregation; later ticks re-fetch.
             let current_data = match initial_data.take() {
@@ -242,6 +247,26 @@ pub fn display_analysis_interactive(
 
             // Return arena free lists to the OS — see `release_freed_heap` docs.
             crate::utils::release_freed_heap();
+
+            // This heavy path already repainted with fresh metrics, so restart
+            // the light-tick timer to avoid an immediate redundant redraw.
+            last_metrics = Instant::now();
+        } else if last_metrics.elapsed() >= metrics_interval {
+            // Lightweight metrics tick: re-sample only our own process (cheap)
+            // and repaint the cached rows so the CPU/memory readout stays live
+            // without re-aggregating any session directory.
+            last_metrics = Instant::now();
+            refresh_process_metrics(&mut sys, pid);
+            render_analysis_frame(
+                &mut terminal,
+                &rows_data,
+                &totals,
+                &provider_totals,
+                &update_tracker,
+                &sys,
+                pid,
+                &mut scroll,
+            )?;
         }
 
         // Handle input with timeout

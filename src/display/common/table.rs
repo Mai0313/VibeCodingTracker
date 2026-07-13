@@ -19,7 +19,44 @@ use ratatui::{
         ScrollbarOrientation, ScrollbarState, Table as RatatuiTable,
     },
 };
+use std::sync::OnceLock;
+use std::thread::available_parallelism;
 use sysinfo::System;
+
+/// Logical core count, cached once. Used to normalize a process's summed
+/// per-core CPU usage (sysinfo reports 100% per fully-used core) into a
+/// 0-100% share of the whole machine. Read via `available_parallelism` rather
+/// than sysinfo so we never load the machine's CPU list into `System`.
+fn cpu_cores() -> f32 {
+    static CPU_CORES: OnceLock<f32> = OnceLock::new();
+    *CPU_CORES.get_or_init(|| {
+        available_parallelism()
+            .map(|n| n.get() as f32)
+            .unwrap_or(1.0)
+            .max(1.0)
+    })
+}
+
+/// Normalizes a process's raw (per-core-summed) CPU usage into a 0-100% share
+/// of the machine by dividing by the logical core count.
+fn normalized_cpu(raw: f32, cores: f32) -> f32 {
+    (raw / cores).clamp(0.0, 100.0)
+}
+
+/// Refreshes only this process's CPU + memory in `sys` (skipping disk / exe /
+/// tasks), pruning any dead entry. This is the single source of the "our own
+/// process, cheap metrics only" contract shared by every summary-bar refresh —
+/// deliberately narrower than sysinfo's default `refresh_processes` so a fast
+/// metrics tick costs little more than one `/proc/self/stat` read.
+pub fn refresh_process_metrics(sys: &mut System, pid: sysinfo::Pid) {
+    sys.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        true,
+        sysinfo::ProcessRefreshKind::nothing()
+            .with_cpu()
+            .with_memory(),
+    );
+}
 
 /// Builds the bordered, centered title paragraph for the top of a TUI view.
 pub fn create_title(title_text: &str, color: RatatuiColor) -> Paragraph<'_> {
@@ -38,10 +75,11 @@ pub fn create_title(title_text: &str, color: RatatuiColor) -> Paragraph<'_> {
 /// Builds the TUI summary bar from caller-supplied items plus a live memory readout.
 ///
 /// Each `(icon, value, color)` tuple in `summary_items` becomes a colored,
-/// pipe-separated segment. A `Memory: <n> MB` segment for the current process
-/// `pid` is always appended; it reads `0.0 MB` if `sys` has no entry for `pid`
-/// (e.g. process info was not refreshed). `sys` is expected to have been
-/// refreshed by the caller before this call.
+/// pipe-separated segment. A `Memory: <n> MB` and a `CPU: <n>%` segment for the
+/// current process `pid` are always appended; they read `0.0` if `sys` has no
+/// entry for `pid` (e.g. process info was not refreshed). CPU is normalized to a
+/// 0-100% share of the machine. `sys` is expected to have been refreshed by the
+/// caller before this call.
 pub fn create_summary<'a>(
     summary_items: Vec<(&'a str, &'a str, RatatuiColor)>, // (icon, value, color) tuples
     sys: &'a System,
@@ -73,6 +111,21 @@ pub fn create_summary<'a>(
     ));
     spans.push(Span::styled(
         format!("{:.1} MB", memory_mb),
+        Style::default().fg(RatatuiColor::LightYellow).bold(),
+    ));
+
+    // Add CPU usage for this process, normalized to a 0-100% machine share.
+    let cpu_percent = sys
+        .process(pid)
+        .map_or(0.0, |p| normalized_cpu(p.cpu_usage(), cpu_cores()));
+
+    spans.push(Span::raw("  |  "));
+    spans.push(Span::styled(
+        "CPU: ",
+        Style::default().fg(RatatuiColor::LightRed).bold(),
+    ));
+    spans.push(Span::styled(
+        format!("{:.1}%", cpu_percent),
         Style::default().fg(RatatuiColor::LightYellow).bold(),
     ));
 
@@ -388,4 +441,19 @@ pub fn create_provider_row<'a>(
     };
 
     RatatuiRow::new(cells).style(style)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalized_cpu;
+
+    #[test]
+    fn normalized_cpu_divides_by_cores_and_clamps() {
+        // Two fully-used cores on a 4-core machine -> 50% of the machine.
+        assert!((normalized_cpu(200.0, 4.0) - 50.0).abs() < f32::EPSILON);
+        // Idle stays at 0%.
+        assert_eq!(normalized_cpu(0.0, 8.0), 0.0);
+        // A transient over-count (all cores summed above 100%) is clamped.
+        assert_eq!(normalized_cpu(410.0, 4.0), 100.0);
+    }
 }

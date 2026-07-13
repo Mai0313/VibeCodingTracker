@@ -41,7 +41,7 @@ Built with Rust for minimal resource footprint. The interactive TUI dashboard ty
 
 Choose your preferred view:
 
-- **Interactive Dashboard**: Auto-refreshing terminal UI with live updates, scrollable model list (arrow keys), and compact K/M/B number formatting
+- **Interactive Dashboard**: Auto-refreshing terminal UI with live updates, scrollable model list (arrow keys), a live per-process CPU/memory readout, and compact K/M/B number formatting
 - **Static Reports**: Professional tables for documentation
 - **Script-Friendly**: Plain text and JSON for automation
 - **Full Precision**: Export exact costs for accounting
@@ -230,7 +230,7 @@ vct usage --table --merge-providers
 │ Gemini                            207K       $0.40                                          │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Total Cost: $79.33  |  Total Tokens: 49.3M  |  Models: 3  |  Memory: 42.8 MB                │
+│ Total Cost: $79.33  |  Total Tokens: 49.3M  |  Models: 3  |  Memory: 42.8 MB  |  CPU: 17.9% │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
   ↑/↓ scroll  m merge  r refresh  q quit  |  Star on GitHub
 ```
@@ -388,7 +388,7 @@ vct analysis --json --daily > today.json
 │ Gemini                                0            0            0      0      0      0          0      0      1 │
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Total Lines: 16.1K  |  Total Tools: 619  |  Models: 3  |  Memory: 41.2 MB                                       │
+│ Total Lines: 16.1K  |  Total Tools: 619  |  Models: 3  |  Memory: 41.2 MB  |  CPU: 17.9%                        │
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
   ↑/↓ scroll  r refresh  q quit  |  Star on GitHub
 ```

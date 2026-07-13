@@ -43,3 +43,12 @@ pub mod buffer {
     /// capacity when reading sessions.
     pub const AVG_JSONL_LINE_SIZE: usize = 500;
 }
+
+/// TUI refresh cadences.
+pub mod refresh {
+    /// Lightweight CPU/memory sampling + redraw cadence for the summary bar,
+    /// decoupled from the heavier session-aggregation refresh. Reading our own
+    /// process stats and repainting cached rows is nearly free, so this can run
+    /// far more often than the data refresh without noticeable overhead.
+    pub const METRICS_REFRESH_MS: u64 = 2000;
+}
