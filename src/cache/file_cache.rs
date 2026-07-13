@@ -19,9 +19,28 @@ use std::time::SystemTime;
 /// walking the analysis on every call.
 #[derive(Debug, Clone)]
 struct CachedFile {
-    modified: SystemTime,
+    fingerprint: FileFingerprint,
     analysis: Arc<CodeAnalysis>,
     size_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    modified: SystemTime,
+    len: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GrokDependencyStamps {
+    summary: Option<FileStamp>,
+    updates: Option<FileStamp>,
+    cwd: Option<FileStamp>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileFingerprint {
+    primary: FileStamp,
+    grok_dependencies: Option<GrokDependencyStamps>,
 }
 
 /// Thread-safe LRU cache for parsed session analyses with automatic eviction.
@@ -102,17 +121,20 @@ impl FileParseCache {
     ) -> Result<Arc<CodeAnalysis>> {
         let path_buf = path.to_path_buf();
 
-        // Get file metadata (modification time)
-        let metadata = fs::metadata(path)?;
-        let modified = metadata.modified()?;
+        let primary = file_stamp(path)?;
 
         // Fast path: Check cache with read lock (no contention)
         {
             if let Ok(cache_read) = self.cache.read() {
                 // Use peek() instead of get() to avoid requiring write lock
                 if let Some(cached) = cache_read.peek(&path_buf) {
-                    // Check if the cached version is still valid
-                    if cached.modified >= modified {
+                    let is_grok = provider == Some(ExtensionType::Grok)
+                        || cached.analysis.extension_name == "Grok";
+                    let fingerprint = FileFingerprint {
+                        primary,
+                        grok_dependencies: is_grok.then(|| grok_dependency_stamps(path)),
+                    };
+                    if cached.fingerprint == fingerprint {
                         log::trace!("LRU cache hit for {}", path.display());
                         let result = Arc::clone(&cached.analysis);
                         // Release read lock before acquiring write lock
@@ -131,6 +153,9 @@ impl FileParseCache {
 
         // Cache miss or outdated - need to parse.
         log::debug!("LRU cache miss for {}, parsing...", path.display());
+        let possible_grok_dependencies = (provider.is_none()
+            || provider == Some(ExtensionType::Grok))
+        .then(|| grok_dependency_stamps(path));
         let analysis = match provider {
             Some(p) => crate::session::parse_session_file_as(path, p, ParseMode::Full)?,
             None => crate::session::parse_session_file_typed(path)?,
@@ -140,10 +165,15 @@ impl FileParseCache {
 
         // Update cache (write lock) - LRU will auto-evict if at capacity
         if let Ok(mut cache_write) = self.cache.write() {
+            let is_grok =
+                provider == Some(ExtensionType::Grok) || arc_analysis.extension_name == "Grok";
             cache_write.put(
                 path_buf,
                 CachedFile {
-                    modified,
+                    fingerprint: FileFingerprint {
+                        primary,
+                        grok_dependencies: is_grok.then_some(possible_grok_dependencies).flatten(),
+                    },
                     analysis: Arc::clone(&arc_analysis),
                     size_bytes,
                 },
@@ -209,6 +239,33 @@ impl FileParseCache {
         } else {
             Vec::new()
         }
+    }
+}
+
+fn file_stamp(path: &Path) -> Result<FileStamp> {
+    let metadata = fs::metadata(path)?;
+    Ok(FileStamp {
+        modified: metadata.modified()?,
+        len: metadata.len(),
+    })
+}
+
+fn optional_file_stamp(path: &Path) -> Option<FileStamp> {
+    let metadata = fs::metadata(path).ok()?;
+    Some(FileStamp {
+        modified: metadata.modified().ok()?,
+        len: metadata.len(),
+    })
+}
+
+fn grok_dependency_stamps(signals_path: &Path) -> GrokDependencyStamps {
+    GrokDependencyStamps {
+        summary: optional_file_stamp(&signals_path.with_file_name("summary.json")),
+        updates: optional_file_stamp(&signals_path.with_file_name("updates.jsonl")),
+        cwd: signals_path
+            .parent()
+            .and_then(Path::parent)
+            .and_then(|workspace| optional_file_stamp(&workspace.join(".cwd"))),
     }
 }
 
