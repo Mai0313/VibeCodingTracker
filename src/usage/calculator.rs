@@ -632,7 +632,7 @@ impl UsageData {
 /// Accumulates the token fields of `new` into `existing` in place.
 ///
 /// Detects the on-disk usage shape from a marker key and merges accordingly:
-/// the Claude / Gemini / Copilot shape (keyed by `input_tokens`, including the
+/// the flat provider shape (keyed by `input_tokens`, including the
 /// nested `cache_creation` breakdown) or the Codex shape (keyed by
 /// `total_token_usage`). Values that are not both JSON objects, or that match
 /// neither shape, are left untouched.
@@ -660,7 +660,7 @@ fn merge_usage_values(existing: &mut Value, new: &Value) {
     }
 
     if let (Some(existing_obj), Some(new_obj)) = (existing.as_object_mut(), new.as_object()) {
-        // Handle Claude/Gemini/Copilot format (has input_tokens)
+        // Handle the flat provider format (has input_tokens)
         if existing_obj.contains_key("input_tokens") {
             accumulate_i64_fields(
                 existing_obj,

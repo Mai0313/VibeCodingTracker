@@ -48,7 +48,7 @@ const ANALYSIS_BELOW_BAND_MIN_H: u16 = 10;
 /// The band is `provider_row_count + 4` rows tall (its own border + header),
 /// floored at 4. Because it scales with the number of providers, gating on a
 /// fixed height would either hide it needlessly (few providers) or render it
-/// truncated (all five providers + overall). We instead require room for the
+/// truncated (all provider rows + overall). We instead require room for the
 /// band *and* everything below it, so it only appears when it fits in full.
 fn analysis_panels_height(area_height: u16, provider_row_count: usize) -> Option<u16> {
     let totals_height = (provider_row_count as u16).saturating_add(4).max(4);
@@ -503,7 +503,7 @@ mod tests {
 
     #[test]
     fn band_shown_only_when_it_fits_in_full() {
-        // Five providers + the overall row = 6 band rows -> 10 tall, so the
+        // Five sample providers + the overall row = 6 band rows -> 10 tall, so the
         // band needs at least 20 rows of terminal to also fit table+summary+
         // controls. Below that it is hidden (previously it rendered truncated).
         assert_eq!(analysis_panels_height(18, 6), None);

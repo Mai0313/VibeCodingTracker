@@ -1,7 +1,7 @@
-//! Content-based provider classification for session JSONL records.
+//! Content-based provider classification for session JSON and JSONL data.
 //!
 //! Given the parsed records from a session file, this module decides which
-//! of the four supported assistants wrote it ([`ExtensionType`]). Two entry
+//! supported assistant wrote it ([`ExtensionType`]). Two entry
 //! points exist for two call shapes: [`detect_extension_type`] commits
 //! eagerly on a fully-materialised slice (the `Vec<Value>` fallback path),
 //! while [`classify_records`] returns `None` on indeterminate input so a
@@ -20,6 +20,8 @@ use serde_json::Value;
 /// `type` discriminators just happen to be absent in this slice).
 ///
 /// Detection strategy:
+/// - Grok: a single object with `primaryModelId` + `contextTokensUsed` and
+///   either `contextWindowTokens` or `toolsUsed`
 /// - Gemini: first line is a session-meta record with `sessionId` and
 ///   `projectHash` fields but *no* `messages` array (legacy single-object
 ///   Gemini exports are no longer supported)
@@ -160,7 +162,7 @@ pub fn classify_records(data: &[Value]) -> Option<ExtensionType> {
 
         // Codex rollout logs use a `type` field with one of a small set of
         // enum-like values. Matching any of these is a definitive signal —
-        // none of them overlap with Claude / Gemini / Copilot shapes.
+        // none of them overlap with the other supported session shapes.
         if let Some(t) = obj.get("type").and_then(|v| v.as_str())
             && matches!(
                 t,

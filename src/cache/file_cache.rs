@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
-/// Cached file entry with modification time tracking for invalidation.
+/// Cached file entry with dependency fingerprint tracking for invalidation.
 ///
 /// `size_bytes` is captured once at insertion via [`estimate_analysis_bytes`]
 /// so the `stats()` path can report a realistic memory footprint without
@@ -82,7 +82,7 @@ impl FileParseCache {
     /// # Errors
     ///
     /// Returns an error if the file's metadata cannot be read or if parsing the
-    /// session file fails (malformed JSONL, unreadable contents, etc.). A
+    /// session file fails (malformed data, unreadable contents, etc.). A
     /// poisoned cache lock does not error — it simply forces a reparse.
     pub fn get_or_parse<P: AsRef<Path>>(&self, path: P) -> Result<Arc<CodeAnalysis>> {
         self.get_or_parse_inner(path.as_ref(), None)

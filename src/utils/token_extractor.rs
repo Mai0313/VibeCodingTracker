@@ -43,8 +43,8 @@ pub struct TokenCounts {
 
 /// Extracts token counts from usage data in any provider format
 ///
-/// Supports three formats:
-/// - Claude/Gemini/Copilot: Direct fields like `input_tokens`, `output_tokens`
+/// Supports two shapes:
+/// - Flat providers: direct fields like `input_tokens`, `output_tokens`
 /// - Codex: Nested `total_token_usage` object with different field names
 ///
 /// Reasoning tokens (Gemini `thoughts_tokens`, Codex
@@ -63,7 +63,7 @@ pub struct TokenCounts {
 /// use serde_json::json;
 /// use vibe_coding_tracker::utils::extract_token_counts;
 ///
-/// // Flat (Claude/Gemini/Copilot) shape with no TTL split: every
+/// // Flat provider shape with no TTL split: every
 /// // cache_creation token lands in the 5-minute bucket.
 /// let counts = extract_token_counts(&json!({
 ///     "input_tokens": 100,
@@ -79,7 +79,7 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
     let mut counts = TokenCounts::default();
 
     if let Some(usage_obj) = usage.as_object() {
-        // Claude/Gemini/Copilot usage format (flat fields)
+        // Flat provider usage format
         if let Some(input) = usage_obj.get("input_tokens").and_then(|v| v.as_i64()) {
             counts.input_tokens = input;
         }

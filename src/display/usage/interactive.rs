@@ -678,7 +678,7 @@ fn row_fingerprint(row: &UsageRow) -> (i64, i64, i64, i64) {
 ///
 /// Kept separate from the refresh loop so both the periodic refresh and a
 /// terminal resize can paint the latest data; `provider_rows` is rebuilt here
-/// (cheap, at most five borrow wrappers) rather than cached, since it borrows
+/// (a small set of borrow wrappers) rather than cached, since it borrows
 /// from `provider_totals`.
 ///
 /// # Errors

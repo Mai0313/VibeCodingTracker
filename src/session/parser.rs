@@ -376,7 +376,7 @@ fn stream_parse_autodetect(path: &Path, mode: ParseMode) -> Result<Option<Parsed
     }
 
     // If the whole file was consumed without any distinctive marker, fall
-    // back to Codex — a JSONL file with no Claude / Gemini / Copilot
+    // back to Codex — a JSONL file with no Claude / Gemini / Copilot / Grok
     // markers is almost certainly a Codex log (or a synthetic fixture).
     let ext = ext.unwrap_or(ExtensionType::Codex);
     let parsed =
