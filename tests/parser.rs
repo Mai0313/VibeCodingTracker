@@ -348,7 +348,7 @@ fn test_gemini_parser_jsonl() {
 {"id":"i1","timestamp":"2026-04-23T00:00:01.000Z","type":"info","content":"kicked off"}
 {"id":"u1","timestamp":"2026-04-23T00:00:02.000Z","type":"user","content":[{"text":"hi"}]}
 {"$set":{"lastUpdated":"2026-04-23T00:00:02.500Z"}}
-{"id":"g1","timestamp":"2026-04-23T00:00:05.000Z","type":"gemini","model":"gemini-3-flash-preview","tokens":{"input":100,"output":50,"cached":10,"thoughts":5,"tool":0,"total":165},"content":"done","toolCalls":[{"id":"t1","name":"replace","args":{"file_path":"README.md","old_string":"old","new_string":"new"}}]}
+{"id":"g1","timestamp":"2026-04-23T00:00:05.000Z","type":"gemini","model":"gemini-3-flash-preview","tokens":{"input":100,"output":50,"cached":10,"thoughts":5,"tool":0,"total":165},"content":"done","toolCalls":[{"id":"t1","name":"replace","args":{"file_path":"README.md","old_string":"old","new_string":"new"},"status":"success"}]}
 "#;
 
     {

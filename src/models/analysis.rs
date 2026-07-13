@@ -4,10 +4,33 @@
 //! `src/session/` produces a [`CodeAnalysis`] regardless of the source
 //! assistant, and the `analysis` / `usage` roll-up layers consume them. The
 //! `serde` attributes here also define the JSON layout of the golden fixtures
-//! under `examples/` and of `vct analysis --json`.
+//! under `examples/`, `vct analysis FILE`, and each element of the batch
+//! `vct analysis --json` array.
 
 use crate::constants::FastHashMap;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer, ser::SerializeMap};
+
+/// Serializes a model-keyed usage map in lexical key order.
+///
+/// [`FastHashMap`] intentionally randomizes iteration order, but analysis JSON
+/// is a persisted public format. Sorting only at this boundary keeps the hot
+/// parser path fast while making repeated serialization byte-for-byte stable.
+fn serialize_conversation_usage<S>(
+    usage: &FastHashMap<String, serde_json::Value>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let mut entries: Vec<_> = usage.iter().collect();
+    entries.sort_unstable_by_key(|(model, _)| *model);
+
+    let mut map = serializer.serialize_map(Some(entries.len()))?;
+    for (model, value) in entries {
+        map.serialize_entry(model, value)?;
+    }
+    map.end()
+}
 
 /// Fields shared by every per-operation detail record.
 ///
@@ -139,6 +162,7 @@ pub struct CodeAnalysisRecord {
     pub tool_call_counts: CodeAnalysisToolCalls,
     /// Token-usage payloads keyed by model name; shape varies by provider
     /// (see [`crate::models::UsageResult`]).
+    #[serde(serialize_with = "serialize_conversation_usage")]
     pub conversation_usage: FastHashMap<String, serde_json::Value>,
     /// Token usage from Claude Code `advisor_message` iterations, keyed by the
     /// advisor's own model. Kept **out** of `conversation_usage` on purpose:
@@ -162,10 +186,11 @@ pub struct CodeAnalysisRecord {
 
 /// Top-level analysis result: environment metadata plus one record per session.
 ///
-/// This is the shape returned by `parse_session_file_typed` and serialized by
-/// `vct analysis --json`. The `insights_version`, `machine_id`, and `user`
-/// fields are environment-specific and are deliberately ignored by the golden
-/// fixture tests.
+/// This is the shape returned by `parse_session_file_typed`, printed directly
+/// by `vct analysis FILE`, and used for every element of the batch
+/// `vct analysis --json` array. The `insights_version`, `machine_id`, and
+/// `user` fields are environment-specific and are deliberately ignored by the
+/// golden fixture tests.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeAnalysis {
@@ -231,6 +256,22 @@ impl std::fmt::Display for ExtensionType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn code_analysis_literal_has_no_parser_diagnostic_field() {
+        let analysis = CodeAnalysis {
+            user: String::new(),
+            extension_name: String::new(),
+            insights_version: String::new(),
+            machine_id: String::new(),
+            records: Vec::new(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(analysis).unwrap()["records"],
+            serde_json::json!([])
+        );
+    }
 
     #[test]
     fn test_code_analysis_tool_calls_serialization() {

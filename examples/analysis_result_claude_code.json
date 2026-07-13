@@ -65,10 +65,10 @@
       "timestamp": 1756386827562,
       "toolCallCounts": {
         "Bash": 1,
-        "Edit": 5,
-        "Read": 4,
+        "Edit": 3,
+        "Read": 2,
         "TodoWrite": 14,
-        "Write": 6
+        "Write": 3
       },
       "totalEditCharacters": 11,
       "totalEditLines": 2,

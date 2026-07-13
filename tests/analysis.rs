@@ -8,15 +8,88 @@
 mod common;
 
 use common::{TempHome, fixture, fixture_str};
+use rusqlite::{Connection, params};
+use serde_json::json;
+use std::path::Path;
 use tempfile::TempDir;
 use vibe_coding_tracker::analysis::aggregator::{
     aggregate_sessions_by_model_from_paths, aggregate_sessions_by_model_from_paths_with,
+    aggregate_sessions_by_model_from_paths_with_diagnostics,
+    collect_analysis_sessions_from_paths_with, project_code_analysis,
 };
 use vibe_coding_tracker::cli::TimeRange;
 use vibe_coding_tracker::config::ProvidersConfig;
 use vibe_coding_tracker::models::ExtensionType;
-use vibe_coding_tracker::session::parser::{parse_session_file, parse_session_file_as};
+use vibe_coding_tracker::session::parser::{
+    parse_session_file, parse_session_file_as, parse_session_file_typed,
+    parse_session_file_typed_with_mode_and_diagnostics,
+};
 use vibe_coding_tracker::session::state::ParseMode;
+
+fn providers_only(provider: ExtensionType) -> ProvidersConfig {
+    ProvidersConfig {
+        claude: provider == ExtensionType::ClaudeCode,
+        codex: provider == ExtensionType::Codex,
+        copilot: provider == ExtensionType::Copilot,
+        gemini: provider == ExtensionType::Gemini,
+        opencode: provider == ExtensionType::OpenCode,
+        cursor: provider == ExtensionType::Cursor,
+        hermes: provider == ExtensionType::Hermes,
+    }
+}
+
+fn seed_opencode_tie_breaker_db(path: &Path) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut conn = Connection::open(path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE session (
+             id TEXT PRIMARY KEY,
+             directory TEXT NOT NULL,
+             time_updated INTEGER NOT NULL
+         );
+         CREATE TABLE message (
+             id TEXT PRIMARY KEY,
+             session_id TEXT NOT NULL,
+             data TEXT NOT NULL
+         );
+         CREATE TABLE part (
+             id TEXT PRIMARY KEY,
+             message_id TEXT NOT NULL,
+             session_id TEXT NOT NULL,
+             data TEXT NOT NULL
+         );
+         INSERT INTO session (id, directory, time_updated)
+         VALUES ('shared-session', '/repo', 1780757089000);",
+    )
+    .unwrap();
+
+    let tx = conn.transaction().unwrap();
+    for input_tokens in [91, 7, 42, 3, 88, 19, 63, 5, 77, 31, 54, 11] {
+        let id = format!("message-{input_tokens}");
+        let data = json!({
+            "role": "assistant",
+            "modelID": "shared-model",
+            "cost": 0,
+            "tokens": {
+                "input": input_tokens,
+                "output": 0,
+                "reasoning": 0,
+                "cache": { "read": 0, "write": 0 }
+            },
+            "time": {
+                "created": 1780757088000_i64,
+                "completed": 1780757089000_i64
+            }
+        })
+        .to_string();
+        tx.execute(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, 'shared-session', ?2)",
+            params![id, data],
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+}
 
 #[test]
 fn test_single_file_analysis_claude() {
@@ -230,11 +303,676 @@ fn batch_analysis_from_paths_groups_by_model() {
 }
 
 #[test]
+fn canonical_dataset_serializes_as_full_code_analysis_objects_in_provider_order() {
+    let home = TempHome::new();
+    home.put_claude_session(
+        "proj",
+        "session.jsonl",
+        &fixture_str("test_conversation_claude_code.jsonl"),
+    );
+    home.put_codex_session(
+        "2026/04/23/rollout.jsonl",
+        &fixture_str("test_conversation_codex.jsonl"),
+    );
+    home.put(
+        ".copilot/session-state/test-session/events.jsonl",
+        &fixture_str("test_conversation_copilot.jsonl"),
+    );
+    home.put_gemini_session(
+        "proj-hash",
+        "chat.jsonl",
+        &fixture_str("test_conversation_gemini.jsonl"),
+    );
+
+    let dataset = collect_analysis_sessions_from_paths_with(
+        &home.paths,
+        TimeRange::All,
+        ProvidersConfig::default(),
+        ParseMode::Full,
+    )
+    .expect("collect canonical analysis dataset");
+
+    let extensions: Vec<&str> = dataset
+        .sessions
+        .iter()
+        .map(|session| session.analysis.extension_name.as_str())
+        .collect();
+    assert_eq!(
+        extensions,
+        ["Claude-Code", "Codex", "Copilot-CLI", "Gemini"]
+    );
+    assert_eq!(dataset.diagnostics.candidates, 4);
+    assert_eq!(dataset.diagnostics.parsed, 4);
+    assert!(!dataset.diagnostics.has_failures());
+
+    let serialized = serde_json::to_value(&dataset).expect("serialize canonical dataset");
+    let expected = serde_json::Value::Array(
+        dataset
+            .sessions
+            .iter()
+            .map(|session| serde_json::to_value(&session.analysis).unwrap())
+            .collect(),
+    );
+    assert_eq!(serialized, expected);
+
+    let sessions = serialized.as_array().unwrap();
+    assert!(sessions.iter().all(|session| session["records"].is_array()));
+    assert!(
+        sessions
+            .iter()
+            .all(|session| session.get("provider").is_none() && session.get("date").is_none())
+    );
+    assert!(sessions.iter().any(|session| {
+        session["records"].as_array().is_some_and(|records| {
+            records.iter().any(|record| {
+                record["writeFileDetails"]
+                    .as_array()
+                    .is_some_and(|details| !details.is_empty())
+            })
+        })
+    }));
+
+    let second = collect_analysis_sessions_from_paths_with(
+        &home.paths,
+        TimeRange::All,
+        ProvidersConfig::default(),
+        ParseMode::Full,
+    )
+    .expect("collect deterministic dataset again");
+    assert_eq!(
+        serde_json::to_string(&second).unwrap(),
+        serde_json::to_string(&dataset).unwrap(),
+        "repeated collection should be byte-for-byte deterministic"
+    );
+}
+
+#[test]
+fn conversation_usage_keys_have_a_stable_serialization_order() {
+    let mut first = parse_session_file_as(
+        fixture("test_conversation_claude_code.jsonl"),
+        ExtensionType::ClaudeCode,
+        ParseMode::Full,
+    )
+    .unwrap();
+    let mut second = first.clone();
+
+    first.records[0].conversation_usage.clear();
+    first.records[0]
+        .conversation_usage
+        .insert("zeta".to_string(), json!(3));
+    first.records[0]
+        .conversation_usage
+        .insert("alpha".to_string(), json!(1));
+    first.records[0]
+        .conversation_usage
+        .insert("middle".to_string(), json!(2));
+
+    second.records[0].conversation_usage.clear();
+    second.records[0]
+        .conversation_usage
+        .insert("middle".to_string(), json!(2));
+    second.records[0]
+        .conversation_usage
+        .insert("zeta".to_string(), json!(3));
+    second.records[0]
+        .conversation_usage
+        .insert("alpha".to_string(), json!(1));
+
+    let first_json = serde_json::to_string(&first).unwrap();
+    let second_json = serde_json::to_string(&second).unwrap();
+    assert_eq!(first_json, second_json);
+    assert!(first_json.contains(r#""conversationUsage":{"alpha":1,"middle":2,"zeta":3}"#));
+}
+
+#[test]
+fn opencode_sessions_use_stable_source_identity_for_ties() {
+    let home = TempHome::new();
+    seed_opencode_tie_breaker_db(&home.paths.opencode_db);
+    let providers = providers_only(ExtensionType::OpenCode);
+
+    let dataset = collect_analysis_sessions_from_paths_with(
+        &home.paths,
+        TimeRange::All,
+        providers,
+        ParseMode::Full,
+    )
+    .unwrap();
+    assert_eq!(dataset.sessions.len(), 12);
+    assert_eq!(dataset.diagnostics.candidates, 1);
+    assert_eq!(dataset.diagnostics.parsed, 1);
+
+    let input_tokens: Vec<i64> = dataset
+        .sessions
+        .iter()
+        .map(|session| {
+            session.analysis.records[0].conversation_usage["shared-model"]["input_tokens"]
+                .as_i64()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(input_tokens, [11, 19, 3, 31, 42, 5, 54, 63, 7, 77, 88, 91]);
+
+    let canonical = serde_json::to_string(&dataset).unwrap();
+    for _ in 0..5 {
+        let next = collect_analysis_sessions_from_paths_with(
+            &home.paths,
+            TimeRange::All,
+            providers,
+            ParseMode::Full,
+        )
+        .unwrap();
+        assert_eq!(serde_json::to_string(&next).unwrap(), canonical);
+    }
+}
+
+#[test]
+fn full_and_usage_only_modes_have_identical_scalar_analysis() {
+    let fixtures = [
+        (
+            "test_conversation_claude_code.jsonl",
+            ExtensionType::ClaudeCode,
+        ),
+        ("test_conversation_codex.jsonl", ExtensionType::Codex),
+        ("test_conversation_copilot.jsonl", ExtensionType::Copilot),
+        ("test_conversation_gemini.jsonl", ExtensionType::Gemini),
+    ];
+
+    for (name, provider) in fixtures {
+        let path = fixture(name);
+        let full = parse_session_file_as(&path, provider, ParseMode::Full).unwrap();
+        let summary = parse_session_file_as(&path, provider, ParseMode::UsageOnly).unwrap();
+        assert_eq!(full.records.len(), summary.records.len(), "fixture={name}");
+
+        for (full, summary) in full.records.iter().zip(&summary.records) {
+            assert_eq!(
+                full.total_unique_files, summary.total_unique_files,
+                "totalUniqueFiles fixture={name}"
+            );
+            assert_eq!(full.total_write_lines, summary.total_write_lines, "{name}");
+            assert_eq!(full.total_read_lines, summary.total_read_lines, "{name}");
+            assert_eq!(full.total_edit_lines, summary.total_edit_lines, "{name}");
+            assert_eq!(
+                full.total_write_characters, summary.total_write_characters,
+                "{name}"
+            );
+            assert_eq!(
+                full.total_read_characters, summary.total_read_characters,
+                "{name}"
+            );
+            assert_eq!(
+                full.total_edit_characters, summary.total_edit_characters,
+                "{name}"
+            );
+            assert_eq!(
+                full.tool_call_counts.read, summary.tool_call_counts.read,
+                "{name}"
+            );
+            assert_eq!(
+                full.tool_call_counts.write, summary.tool_call_counts.write,
+                "{name}"
+            );
+            assert_eq!(
+                full.tool_call_counts.edit, summary.tool_call_counts.edit,
+                "{name}"
+            );
+            assert_eq!(
+                full.tool_call_counts.todo_write, summary.tool_call_counts.todo_write,
+                "{name}"
+            );
+            assert_eq!(
+                full.tool_call_counts.bash, summary.tool_call_counts.bash,
+                "{name}"
+            );
+            assert_eq!(
+                full.conversation_usage, summary.conversation_usage,
+                "{name}"
+            );
+            assert_eq!(full.task_id, summary.task_id, "{name}");
+            assert_eq!(full.timestamp, summary.timestamp, "{name}");
+            assert_eq!(full.folder_path, summary.folder_path, "{name}");
+            assert_eq!(full.git_remote_url, summary.git_remote_url, "{name}");
+            assert!(summary.write_file_details.is_empty(), "{name}");
+            assert!(summary.read_file_details.is_empty(), "{name}");
+            assert!(summary.edit_file_details.is_empty(), "{name}");
+            assert!(summary.run_command_details.is_empty(), "{name}");
+        }
+    }
+}
+
+#[test]
+fn single_code_analysis_uses_the_batch_projection() {
+    let analysis = parse_session_file_as(
+        fixture("test_conversation_claude_code.jsonl"),
+        ExtensionType::ClaudeCode,
+        ParseMode::Full,
+    )
+    .unwrap();
+
+    let projected = project_code_analysis(&analysis);
+    assert!(
+        projected
+            .rows
+            .iter()
+            .any(|row| row.model == "claude-sonnet-4-20250514")
+    );
+    assert_eq!(projected.provider_days.claude, 1);
+    assert_eq!(projected.provider_days.total, 1);
+    assert_eq!(projected.per_provider.claude.len(), projected.rows.len());
+    for (provider, overall) in projected.per_provider.claude.iter().zip(&projected.rows) {
+        assert_eq!(provider.model, overall.model);
+        assert_eq!(provider.read_lines, overall.read_lines);
+        assert_eq!(provider.write_lines, overall.write_lines);
+        assert_eq!(provider.edit_lines, overall.edit_lines);
+    }
+}
+
+#[test]
 fn batch_analysis_from_empty_paths_is_empty() {
     let home = TempHome::new();
     let data = aggregate_sessions_by_model_from_paths(&home.paths, TimeRange::All).unwrap();
     assert!(data.rows.is_empty(), "no sessions -> no rows");
     assert_eq!(data.provider_days.total, 0);
+}
+
+#[test]
+fn collection_diagnostics_distinguish_all_failed_from_no_candidates() {
+    let home = TempHome::new();
+    let invalid = home.put_claude_session("proj", "invalid.jsonl", "not valid json\n");
+    let dataset = collect_analysis_sessions_from_paths_with(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::ClaudeCode),
+        ParseMode::Full,
+    )
+    .unwrap();
+
+    assert!(dataset.is_empty());
+    assert_eq!(dataset.diagnostics.candidates, 1);
+    assert_eq!(dataset.diagnostics.parsed, 0);
+    assert!(dataset.diagnostics.all_failed());
+    assert!(!dataset.diagnostics.partially_failed());
+    assert_eq!(dataset.diagnostics.failures.len(), 1);
+    assert_eq!(dataset.diagnostics.failures[0].source, invalid);
+    assert_eq!(
+        dataset.diagnostics.failures[0].provider,
+        ExtensionType::ClaudeCode
+    );
+
+    let empty = TempHome::new();
+    let no_candidates = collect_analysis_sessions_from_paths_with(
+        &empty.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::ClaudeCode),
+        ParseMode::Full,
+    )
+    .unwrap();
+    assert_eq!(no_candidates.diagnostics.candidates, 0);
+    assert!(!no_candidates.diagnostics.all_failed());
+}
+
+#[test]
+fn collection_diagnostics_reject_completely_unknown_provider_schema() {
+    let home = TempHome::new();
+    home.put_claude_session(
+        "proj",
+        "future.jsonl",
+        r#"{"type":"future.claude.event","timestamp":"2026-07-12T00:00:00Z"}"#,
+    );
+
+    let dataset = collect_analysis_sessions_from_paths_with(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::ClaudeCode),
+        ParseMode::Full,
+    )
+    .unwrap();
+    assert!(dataset.is_empty());
+    assert!(dataset.diagnostics.all_failed());
+    assert_eq!(dataset.diagnostics.failures.len(), 1);
+    assert!(
+        dataset.diagnostics.failures[0]
+            .error
+            .contains("no recognized provider records")
+    );
+}
+
+#[test]
+fn collection_diagnostics_warn_after_a_recognized_header_and_future_event() {
+    let home = TempHome::new();
+    home.put_claude_session(
+        "proj",
+        "future.jsonl",
+        concat!(
+            r#"{"type":"permission-mode","parentUuid":"root","timestamp":"2026-07-12T00:00:00Z"}"#,
+            "\n",
+            r#"{"type":"future.claude.event","timestamp":"2026-07-12T00:00:01Z"}"#,
+            "\n"
+        ),
+    );
+
+    let dataset = collect_analysis_sessions_from_paths_with(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::ClaudeCode),
+        ParseMode::Full,
+    )
+    .unwrap();
+    assert_eq!(dataset.len(), 1);
+    assert_eq!(dataset.diagnostics.parsed, 1);
+    assert!(dataset.diagnostics.partially_failed());
+    assert_eq!(dataset.diagnostics.failures.len(), 1);
+    assert!(dataset.diagnostics.failures[0].error.contains("skipped 1"));
+}
+
+#[test]
+fn collection_diagnostics_accept_blank_in_progress_session() {
+    let home = TempHome::new();
+    home.put_claude_session("proj", "empty.jsonl", "\n");
+
+    let dataset = collect_analysis_sessions_from_paths_with(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::ClaudeCode),
+        ParseMode::Full,
+    )
+    .unwrap();
+    assert!(dataset.is_empty());
+    assert_eq!(dataset.diagnostics.candidates, 1);
+    assert_eq!(dataset.diagnostics.parsed, 1);
+    assert!(!dataset.diagnostics.has_failures());
+}
+
+#[test]
+fn metadata_only_file_sessions_remain_in_canonical_batch_json() {
+    let home = TempHome::new();
+    let claude = home.put_claude_session(
+        "proj",
+        "metadata.jsonl",
+        r#"{"type":"permission-mode","parentUuid":"root","timestamp":"2026-07-12T00:00:00Z"}"#,
+    );
+    let codex = home.put_codex_session(
+        "2026/07/12/metadata.jsonl",
+        r#"{"timestamp":"2026-07-12T00:00:00Z","type":"session_meta","payload":{"type":"session_meta","id":"session","cwd":"/repo"}}"#,
+    );
+    let copilot = home.put(
+        ".copilot/session-state/session/events.jsonl",
+        r#"{"type":"session.start","data":{"sessionId":"session","producer":"copilot-cli"},"timestamp":"2026-07-12T00:00:00Z"}"#,
+    );
+    let gemini = home.put_gemini_session(
+        "proj",
+        "metadata.jsonl",
+        r#"{"sessionId":"session","projectHash":"proj","startTime":"2026-07-12T00:00:00Z"}"#,
+    );
+
+    for (provider, path) in [
+        (ExtensionType::ClaudeCode, claude),
+        (ExtensionType::Codex, codex),
+        (ExtensionType::Copilot, copilot),
+        (ExtensionType::Gemini, gemini),
+    ] {
+        let single = parse_session_file_typed(&path).unwrap();
+        let dataset = collect_analysis_sessions_from_paths_with(
+            &home.paths,
+            TimeRange::All,
+            providers_only(provider),
+            ParseMode::Full,
+        )
+        .unwrap();
+        assert_eq!(dataset.len(), 1, "metadata-only {provider} was omitted");
+        assert_eq!(
+            serde_json::to_value(&dataset.sessions[0].analysis).unwrap(),
+            serde_json::to_value(single).unwrap(),
+            "batch and single-file contracts diverged for {provider}"
+        );
+        assert_eq!(dataset.diagnostics.parsed, 1);
+        assert!(!dataset.diagnostics.has_failures());
+    }
+}
+
+#[test]
+fn analyzer_payload_schema_drift_fails_for_every_file_provider() {
+    let temp = TempDir::new().unwrap();
+    let cases = [
+        (
+            "claude.jsonl",
+            concat!(
+                r#"{"type":"assistant","parentUuid":"root","timestamp":"2026-07-12T00:00:00Z","message":{"model":"claude-sonnet","usage":"future","content":[]}}"#,
+                "\n"
+            ),
+        ),
+        (
+            "codex.jsonl",
+            concat!(
+                r#"{"timestamp":"2026-07-12T00:00:00Z","type":"session_meta","payload":{"type":"session_meta","id":"session"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-07-12T00:00:01Z","type":"response_item","payload":{"type":42}}"#,
+                "\n"
+            ),
+        ),
+        (
+            "copilot.jsonl",
+            concat!(
+                r#"{"type":"session.start","data":{"sessionId":"session","producer":"copilot-cli"},"timestamp":"2026-07-12T00:00:00Z"}"#,
+                "\n",
+                r#"{"type":"session.shutdown","data":{"modelMetrics":"future"},"timestamp":"2026-07-12T00:00:01Z"}"#,
+                "\n"
+            ),
+        ),
+        (
+            "gemini.jsonl",
+            concat!(
+                r#"{"sessionId":"session","projectHash":"proj","startTime":"2026-07-12T00:00:00Z"}"#,
+                "\n",
+                r#"{"id":"message","timestamp":"2026-07-12T00:00:01Z","type":"gemini","model":"gemini","tokens":"future"}"#,
+                "\n"
+            ),
+        ),
+    ];
+
+    for (name, contents) in cases {
+        let path = temp.path().join(name);
+        std::fs::write(&path, contents).unwrap();
+        let error = parse_session_file_typed(&path).unwrap_err();
+        assert!(
+            error.to_string().contains("none used a supported schema"),
+            "unexpected error for {name}: {error}"
+        );
+    }
+}
+
+#[test]
+fn copilot_tracked_tool_argument_drift_is_not_a_false_success() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("copilot-tool.jsonl");
+    std::fs::write(
+        &path,
+        concat!(
+            r#"{"type":"session.start","data":{"sessionId":"session","producer":"copilot-cli"},"timestamp":"2026-07-12T00:00:00Z"}"#,
+            "\n",
+            r#"{"type":"tool.execution_start","data":{"toolCallId":"call","toolName":"show_file","arguments":{"futurePath":"/repo/a"}},"timestamp":"2026-07-12T00:00:01Z"}"#,
+            "\n",
+            r#"{"type":"tool.execution_complete","data":{"toolCallId":"call","success":true,"result":{"content":"text"}},"timestamp":"2026-07-12T00:00:02Z"}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+
+    let error = parse_session_file_typed(path).unwrap_err();
+    assert!(error.to_string().contains("none used a supported schema"));
+}
+
+#[test]
+fn claude_tracked_tool_argument_drift_is_not_a_false_success() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("claude-tool.jsonl");
+    std::fs::write(
+        &path,
+        concat!(
+            r#"{"parentUuid":null,"sessionId":"session","type":"assistant","timestamp":"2026-07-12T00:00:00Z","message":{"content":[{"type":"tool_use","id":"read","name":"Read","input":{"futurePath":"/repo/a"}},{"type":"tool_use","id":"bash","name":"Bash","input":{"futureCommand":"pwd"}}]}}"#,
+            "\n",
+            r#"{"parentUuid":"root","sessionId":"session","type":"user","isSidechain":true,"timestamp":"2026-07-12T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"read","content":"one\ntwo"},{"type":"tool_result","tool_use_id":"bash","content":"ok"}]}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+
+    let error = parse_session_file_typed(path).unwrap_err();
+    assert!(error.to_string().contains("none used a supported schema"));
+}
+
+#[test]
+fn codex_custom_apply_patch_header_drift_is_not_a_false_success() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("codex-patch.jsonl");
+    std::fs::write(
+        &path,
+        concat!(
+            r#"{"timestamp":"2026-07-12T00:00:00Z","type":"session_meta","payload":{"type":"session_meta","id":"session"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-07-12T00:00:01Z","type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch","input":"*** Begin Patch\n*** Future File: /repo/a\n+one\n*** End Patch","call_id":"call"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-07-12T00:00:02Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call","output":"Done!"}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+
+    let error = parse_session_file_typed(path).unwrap_err();
+    assert!(error.to_string().contains("none used a supported schema"));
+}
+
+#[test]
+fn codex_unknown_apply_patch_output_surfaces_source_diagnostics() {
+    let home = TempHome::new();
+    let path = home.put_codex_session(
+        "2026/07/12/unknown-patch-output.jsonl",
+        concat!(
+            r#"{"timestamp":"2026-07-12T00:00:00Z","type":"session_meta","payload":{"type":"session_meta","id":"session"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-07-12T00:00:01Z","type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch","input":"*** Begin Patch\n*** Update File: /repo/a\n@@\n-old\n+new\n*** End Patch","call_id":"call"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-07-12T00:00:02Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call","output":{"success":true,"updated_files":["/repo/a"]}}}"#,
+            "\n"
+        ),
+    );
+
+    let (analysis, diagnostics) =
+        parse_session_file_typed_with_mode_and_diagnostics(&path, ParseMode::Full).unwrap();
+    assert_eq!(analysis.records[0].tool_call_counts.edit, 0);
+    assert_eq!(diagnostics.skipped_records(), 1);
+
+    let dataset = collect_analysis_sessions_from_paths_with(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::Codex),
+        ParseMode::Full,
+    )
+    .unwrap();
+    assert_eq!(dataset.len(), 1);
+    assert_eq!(dataset.diagnostics.failures.len(), 1);
+    assert_eq!(dataset.diagnostics.failures[0].source, path);
+    assert!(dataset.diagnostics.failures[0].error.contains("skipped 1"));
+}
+
+#[test]
+fn collection_diagnostics_reject_unknown_opencode_assistant_schema() {
+    let home = TempHome::new();
+    std::fs::create_dir_all(home.paths.opencode_db.parent().unwrap()).unwrap();
+    let conn = Connection::open(&home.paths.opencode_db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_updated INTEGER); \
+         CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT); \
+         CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT); \
+         INSERT INTO session VALUES ('s1', '/repo', 1780757089000); \
+         INSERT INTO message VALUES ('m1', 's1', \
+             '{\"role\":\"assistant\",\"futureUsage\":{\"input\":10}}');",
+    )
+    .unwrap();
+    drop(conn);
+
+    let dataset = collect_analysis_sessions_from_paths_with(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::OpenCode),
+        ParseMode::Full,
+    )
+    .unwrap();
+    assert!(dataset.is_empty());
+    assert_eq!(dataset.diagnostics.candidates, 1);
+    assert_eq!(dataset.diagnostics.parsed, 0);
+    assert!(dataset.diagnostics.all_failed());
+}
+
+#[test]
+fn streaming_aggregation_retains_partial_failure_diagnostics() {
+    let home = TempHome::new();
+    home.put_claude_session(
+        "proj",
+        "valid.jsonl",
+        &fixture_str("test_conversation_claude_code.jsonl"),
+    );
+    std::fs::create_dir_all(home.paths.opencode_db.parent().unwrap()).unwrap();
+    std::fs::write(&home.paths.opencode_db, "not a SQLite database").unwrap();
+
+    let providers = ProvidersConfig {
+        opencode: true,
+        ..providers_only(ExtensionType::ClaudeCode)
+    };
+
+    let result = aggregate_sessions_by_model_from_paths_with_diagnostics(
+        &home.paths,
+        TimeRange::All,
+        providers,
+    )
+    .unwrap();
+
+    assert!(
+        result
+            .data
+            .rows
+            .iter()
+            .any(|row| row.model == "claude-sonnet-4-20250514")
+    );
+    assert_eq!(result.diagnostics.candidates, 2);
+    assert_eq!(result.diagnostics.parsed, 1);
+    assert!(!result.diagnostics.all_failed());
+    assert!(result.diagnostics.partially_failed());
+    assert_eq!(result.diagnostics.failures.len(), 1);
+    assert_eq!(
+        result.diagnostics.failures[0].provider,
+        ExtensionType::OpenCode
+    );
+    assert_eq!(
+        result.diagnostics.failures[0].source,
+        home.paths.opencode_db
+    );
+}
+
+#[test]
+fn cursor_all_store_failure_is_not_reported_as_parsed() {
+    let home = TempHome::new();
+    home.put(
+        ".cursor/chats/project/conversation/store.db",
+        "not a SQLite database",
+    );
+
+    let dataset = collect_analysis_sessions_from_paths_with(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::Cursor),
+        ParseMode::Full,
+    )
+    .unwrap();
+
+    assert!(dataset.is_empty());
+    assert_eq!(dataset.diagnostics.candidates, 1);
+    assert_eq!(dataset.diagnostics.parsed, 0);
+    assert!(dataset.diagnostics.all_failed());
+    assert_eq!(dataset.diagnostics.failures.len(), 1);
+    assert_eq!(
+        dataset.diagnostics.failures[0].provider,
+        ExtensionType::Cursor
+    );
 }
 
 #[test]
@@ -271,11 +1009,8 @@ fn test_analysis_with_empty_file() {
     let empty_file = temp_dir.path().join("empty.jsonl");
     std::fs::write(&empty_file, "").unwrap();
 
-    let result = parse_session_file(&empty_file);
-    assert!(
-        result.is_ok() || result.is_err(),
-        "Should handle empty file without panicking"
-    );
+    let result = parse_session_file(&empty_file).expect("empty input has a defined JSON shape");
+    assert_eq!(result, json!({}));
 }
 
 #[test]

@@ -1,19 +1,22 @@
 //! Binary entry point for the `vibe_coding_tracker` (`vct`) CLI.
 //!
 //! Parses the subcommand with clap and dispatches to the library crate:
-//! `analysis` and `usage` (each with TUI / table / text / JSON output and
-//! a time-range filter), plus `version` and `update`. The heavy lifting
-//! lives in [`vibe_coding_tracker`]; this file is wiring.
+//! batch `analysis` and `usage` views (TUI / table / text / JSON with a
+//! time-range filter), complete single-file analysis, plus `version` and
+//! `update`. The heavy lifting lives in [`vibe_coding_tracker`]; this file is
+//! wiring.
 //!
 //! Two things run *before* clap on purpose, and the ordering is
 //! load-bearing — see [`main`].
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use comfy_table::{Cell, CellAlignment, Color, ContentArrangement, Table, presets::UTF8_FULL};
 use owo_colors::OwoColorize;
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::io::{self, Write};
 use vibe_coding_tracker::cli::{Cli, Commands, ConfigAction, resolve_time_range_with_default};
 
 // mimalloc is opt-in behind the `mimalloc` cargo feature. The default build
@@ -28,10 +31,11 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use vibe_coding_tracker::display::usage::{
     display_usage_interactive, display_usage_table, display_usage_text,
 };
+use vibe_coding_tracker::get_version_info;
 use vibe_coding_tracker::pricing::{ModelPricingMap, fetch_model_pricing};
+use vibe_coding_tracker::session::{ParseMode, parse_session_file_typed_with_mode_and_diagnostics};
 use vibe_coding_tracker::usage::{CostSource, get_usage_from_directories_with, resolve_model_cost};
 use vibe_coding_tracker::utils::extract_token_counts;
-use vibe_coding_tracker::{get_version_info, parse_session_file};
 
 /// Parses the CLI and runs the selected subcommand.
 ///
@@ -44,8 +48,8 @@ use vibe_coding_tracker::{get_version_info, parse_session_file};
 /// # Errors
 ///
 /// Propagates any failure from the dispatched subcommand: session parsing,
-/// JSON (de)serialization, file writes for `--output`, terminal/TUI errors,
-/// or the network and binary-replacement errors raised by `update`. Pricing
+/// JSON (de)serialization, terminal/TUI errors, or the network and
+/// binary-replacement errors raised by `update`. Pricing
 /// fetch failure in `usage --json` is downgraded to a warning rather than an
 /// error, so costs are reported as unavailable instead of aborting.
 fn main() -> Result<()> {
@@ -81,8 +85,7 @@ fn run() -> Result<()> {
 
     match cli.command {
         Commands::Analysis {
-            path,
-            output,
+            file,
             json,
             text,
             table,
@@ -91,21 +94,38 @@ fn run() -> Result<()> {
             monthly,
             all,
         } => {
-            match path {
+            match file {
                 Some(file_path) => {
-                    let result = parse_session_file(&file_path)?;
-
-                    if let Some(output_path) = output {
-                        vibe_coding_tracker::utils::save_json_pretty(&output_path, &result)?;
-                        println!("Analysis result saved to: {}", output_path.display());
+                    let complete_json = json || (!text && !table);
+                    let mode = if complete_json {
+                        ParseMode::Full
                     } else {
-                        let json_str = serde_json::to_string_pretty(&result)?;
-                        println!("{}", json_str);
+                        ParseMode::UsageOnly
+                    };
+                    let (analysis, diagnostics) =
+                        parse_session_file_typed_with_mode_and_diagnostics(&file_path, mode)?;
+                    if diagnostics.skipped_records() > 0 {
+                        eprintln!(
+                            "Warning: Skipped {} malformed or unsupported analyzer records while parsing {}. Successful results are still shown.",
+                            diagnostics.skipped_records(),
+                            file_path.display()
+                        );
+                    }
+                    if complete_json {
+                        write_pretty_json(&analysis)?;
+                    } else if text {
+                        let projected =
+                            vibe_coding_tracker::analysis::project_code_analysis(&analysis);
+                        vibe_coding_tracker::display::analysis::display_analysis_text(&projected);
+                    } else {
+                        let projected =
+                            vibe_coding_tracker::analysis::project_code_analysis(&analysis);
+                        vibe_coding_tracker::display::analysis::display_analysis_table(&projected);
                     }
                 }
                 None => {
                     // Settings are only needed for the batch (all-sessions) path,
-                    // so `analysis --path`, `version`, `fetch`, etc. never read or
+                    // so `analysis FILE`, `version`, `fetch`, etc. never read or
                     // create `~/.vct/config.toml`.
                     let config = vibe_coding_tracker::config::load();
                     vibe_coding_tracker::logging::apply(&config.logging);
@@ -116,28 +136,37 @@ fn run() -> Result<()> {
                         all,
                         config.general.default_time_range,
                     );
-                    let analysis_data =
-                        vibe_coding_tracker::analysis::aggregate_sessions_by_model_with(
-                            time_range,
-                            config.providers,
-                        )?;
+                    if json {
+                        let dataset =
+                            vibe_coding_tracker::analysis::collect_analysis_sessions_with(
+                                time_range,
+                                config.providers,
+                                ParseMode::Full,
+                            )?;
+                        report_analysis_collection(&dataset.diagnostics)?;
+                        write_pretty_json(&dataset)?;
+                    } else if text || table {
+                        let aggregation = vibe_coding_tracker::analysis::aggregate_sessions_by_model_with_diagnostics(
+                                time_range,
+                                config.providers,
+                            )?;
+                        report_analysis_collection(&aggregation.diagnostics)?;
 
-                    if let Some(output_path) = output {
-                        let json_value = serde_json::to_value(&analysis_data.rows)?;
-                        vibe_coding_tracker::utils::save_json_pretty(&output_path, &json_value)?;
-                        println!("Analysis result saved to: {}", output_path.display());
-                    } else if json {
-                        let json_str = serde_json::to_string_pretty(&analysis_data.rows)?;
-                        println!("{}", json_str);
-                    } else if text {
-                        vibe_coding_tracker::display::analysis::display_analysis_text(
-                            &analysis_data,
-                        );
-                    } else if table {
-                        vibe_coding_tracker::display::analysis::display_analysis_table(
-                            &analysis_data,
-                        );
+                        if text {
+                            vibe_coding_tracker::display::analysis::display_analysis_text(
+                                &aggregation.data,
+                            );
+                        } else {
+                            vibe_coding_tracker::display::analysis::display_analysis_table(
+                                &aggregation.data,
+                            );
+                        }
                     } else {
+                        let analysis_data =
+                            vibe_coding_tracker::analysis::aggregate_sessions_by_model_with(
+                                time_range,
+                                config.providers,
+                            )?;
                         vibe_coding_tracker::display::analysis::display_analysis_interactive(
                             analysis_data,
                             time_range,
@@ -150,7 +179,6 @@ fn run() -> Result<()> {
         }
 
         Commands::Usage {
-            output,
             json,
             text,
             table,
@@ -174,7 +202,7 @@ fn run() -> Result<()> {
             let merge = merge_providers || config.usage.merge_models;
             let usage_from_dirs = |tr| get_usage_from_directories_with(tr, config.providers);
 
-            if json || output.is_some() {
+            if json {
                 let usage_data = usage_from_dirs(time_range)?;
                 let pricing_map = match fetch_model_pricing() {
                     Ok(map) => map,
@@ -188,15 +216,7 @@ fn run() -> Result<()> {
                     }
                 };
                 let enriched_data = build_enriched_json(&usage_data, &pricing_map)?;
-
-                if let Some(output_path) = output {
-                    let json_value = serde_json::to_value(&enriched_data)?;
-                    vibe_coding_tracker::utils::save_json_pretty(&output_path, &json_value)?;
-                    println!("Usage result saved to: {}", output_path.display());
-                } else {
-                    let json_str = serde_json::to_string_pretty(&enriched_data)?;
-                    println!("{}", json_str);
-                }
+                write_pretty_json(&enriched_data)?;
             } else if text {
                 let usage_data = usage_from_dirs(time_range)?;
                 display_usage_text(&usage_data, merge);
@@ -359,6 +379,44 @@ fn run_config(action: ConfigAction) -> Result<()> {
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Writes one pretty-printed JSON value to stdout followed by a newline.
+fn write_pretty_json(value: &impl Serialize) -> Result<()> {
+    let stdout = io::stdout();
+    let mut writer = stdout.lock();
+    serde_json::to_writer_pretty(&mut writer, value)?;
+    writeln!(writer)?;
+    Ok(())
+}
+
+/// Rejects a completely failed noninteractive scan and reports partial data.
+fn report_analysis_collection(
+    diagnostics: &vibe_coding_tracker::analysis::AnalysisCollectionDiagnostics,
+) -> Result<()> {
+    let Some(first) = diagnostics.failures.first() else {
+        return Ok(());
+    };
+    if diagnostics.all_failed() {
+        bail!(
+            "failed to parse all {} analysis sources; first failure: {} {}: {}",
+            diagnostics.candidates,
+            first.provider,
+            first.source.display(),
+            first.error
+        );
+    }
+    if diagnostics.partially_failed() {
+        eprintln!(
+            "Warning: Encountered {} analysis source failures while scanning {} candidates. Successful results are still shown. First failure: {} {}: {}",
+            diagnostics.failures.len(),
+            diagnostics.candidates,
+            first.provider,
+            first.source.display(),
+            first.error
+        );
     }
     Ok(())
 }

@@ -176,7 +176,6 @@ Commands:
 | `--table`                                      | 静态表格，不启动 TUI                                                          |
 | `--text`                                       | 纯文本，适合脚本处理                                                          |
 | `--json`                                       | JSON 输出，附带定价信息                                                       |
-| `--output <FILE>`                              | 将富化 JSON 保存到文件                                                        |
 | `--merge-providers`                            | 合并共享同一 base 名称、仅 provider 前缀不同的 model（`--json` 会忽略此选项） |
 | `--daily` / `--weekly` / `--monthly` / `--all` | 时间范围筛选（见上方表格）                                                    |
 
@@ -195,8 +194,8 @@ vct usage --text
 # JSON 输出，包含 cost_usd 与 matched_model 字段
 vct usage --json
 
-# 直接把富化 JSON 保存到文件
-vct usage --output report.json
+# 通过 shell redirection 保存富化 JSON
+vct usage --json > report.json
 
 # 时间范围与输出格式可自由组合
 vct usage --weekly
@@ -324,19 +323,18 @@ Totals (by Provider)
 
 **深入了解代码操作——查看你的 AI 助手到底做了什么。**
 
-### Flag 一览
+### 参数与 Flag
 
-| Flag                                           | 用途                                             |
-| ---------------------------------------------- | ------------------------------------------------ |
-| *(不带参数)*                                   | 互动式 TUI 面板，覆盖所有 session                |
-| `--path <FILE>`                                | 分析单一 JSONL/JSON 对话文件（stdout 输出 JSON） |
-| `--table`                                      | 静态表格，附带按供应商的总计                     |
-| `--text`                                       | 纯文本，方便脚本处理                             |
-| `--json`                                       | 将聚合 row 以 JSON 数组输出到 stdout             |
-| `--output <FILE>`                              | 将结果以格式化 JSON 保存到文件                   |
-| `--daily` / `--weekly` / `--monthly` / `--all` | 时间范围筛选（见上方表格）                       |
+| 参数 / Flag                                    | 用途                                                                      |
+| ---------------------------------------------- | ------------------------------------------------------------------------- |
+| *(不带参数)*                                   | 互动式 TUI 面板, 覆盖所有 session                                         |
+| `<FILE>`                                       | 分析单一 JSONL/JSON 对话文件, 并将完整 `CodeAnalysis` JSON 输出到 stdout  |
+| `--table`                                      | 静态摘要表格, 附带 provider 汇总                                          |
+| `--text`                                       | 纯文本摘要, 方便脚本处理                                                  |
+| `--json`                                       | 完整 parser 结果. 搭配 `<FILE>` 时为单一 object, 否则为 object 数组       |
+| `--daily` / `--weekly` / `--monthly` / `--all` | 所有 session 的时间范围筛选. 不可与 `<FILE>` 同时使用, 其他说明见上方表格 |
 
-参见 [`examples/`](examples/) 目录，其中包含四种 provider 的示例输入与对应 JSON 输出。
+参见 [`examples/`](examples/) 目录，其中包含四种 JSONL provider 的示例输入与对应 JSON 输出。
 
 ### 基本用法
 
@@ -350,20 +348,24 @@ vct analysis --table
 # 纯文本输出，方便脚本处理
 vct analysis --text
 
-# 聚合数据以 JSON 输出，方便后续处理
+# 输出所有 session 的完整 parser 结果
 vct analysis --json
 
-# 分析单一对话文件 → stdout JSON
-vct analysis --path ~/.claude/projects/session.jsonl
+# 分析单一对话文件并输出 JSON
+vct analysis ~/.claude/projects/session.jsonl
 
-# Save results to JSON
-vct analysis --output report.json
+# 只汇总这个对话文件
+vct analysis ~/.claude/projects/session.jsonl --table
+
+# 通过 shell redirection 保存完整 JSON
+vct analysis --json > report.json
+vct analysis ~/.claude/projects/session.jsonl > session-analysis.json
 
 # 时间范围与输出格式可自由组合
 vct analysis --weekly
 vct analysis --table --monthly
 vct analysis --json --daily
-vct analysis --output today.json --daily
+vct analysis --json --daily > today.json
 ```
 
 ### 预览：交互式面板（`vct analysis`）
@@ -390,7 +392,7 @@ vct analysis --output today.json --daily
 
 ### 预览：表格与 JSON（`vct analysis`）
 
-`--table` 会渲染按 model 细分的数据，并附带按 provider 的汇总（含 Active Days 列）；`--json` 则为每个 model 输出一行聚合数据。
+`--table` 会显示各 model 的明细, 并附上各 provider 的汇总, 包含 Active Days 列. `--text` 与 `--table` 都是相同 normalized parser records 的精简 projection. `--json` 会保留完整 records, 包括每次操作的 details 与 token usage. 未提供 `<FILE>` 时, 外层数组中的每个元素都是一个 session 的 `CodeAnalysis` object. 提供 `<FILE>` 时, stdout 只会输出该 object, shape 与 [`examples/`](examples/) 中对应的结果相同.
 
 ```text
 Analysis Statistics
@@ -404,22 +406,44 @@ Analysis Statistics
 └─────────────────┴────────────┴────────────┴─────────────┴──────┴──────┴──────┴───────────┴───────┘
 ```
 
-```json
-// vct analysis --json  (one model shown)
+```jsonc
+// vct analysis --json  (one abbreviated session shown)
 [
   {
-    "model": "claude-opus-4-8",
-    "editLines": 1493,
-    "readLines": 15564,
-    "writeLines": 970,
-    "bashCount": 124,
-    "editCount": 134,
-    "readCount": 144,
-    "todoWriteCount": 0,
-    "writeCount": 12
+    "user": "alice",
+    "extensionName": "Claude-Code",
+    "insightsVersion": "...",
+    "machineId": "...",
+    "records": [
+      {
+        "totalUniqueFiles": 3,
+        "totalReadLines": 120,
+        "readFileDetails": [
+          {
+            "filePath": "/repo/src/main.rs",
+            "lineCount": 120,
+            "characterCount": 4102,
+            "timestamp": 1783872000000
+          }
+        ],
+        "toolCallCounts": { "Bash": 1, "Edit": 0, "Read": 1, "TodoWrite": 0, "Write": 0 },
+        "conversationUsage": { "claude-opus-4-8": { "input_tokens": 42, "output_tokens": 18 } }
+      }
+    ]
   }
 ]
 ```
+
+> [!WARNING]
+> 完整 analysis JSON 可能很大, 也可能包含 source text, edit body, shell command, absolute path, repository URL, user name, machine identifier 与 token metadata. 分享前请先检查内容.
+
+Batch analysis 会读取 Provider 的实时数据. 如果 assistant 在扫描期间继续写入 session, 后续执行可能合理地包含更新数据. 未变动的 input 会产生固定顺序的输出.
+
+如果找到的 source 全部读取失败或使用无法识别的 schema, 非交互式 analysis 会返回 error. 如果只有部分 source 失败, 成功结果会保留, warning 会写入 stderr.
+
+`analysis FILE` 对单一文件内格式错误或不受支持的 record 采用相同行为: 在 stdout 保留已解析的 JSON/text/table 输出, 并将一般性的 skipped-record warning 写入 stderr.
+
+Codex code mode session 会提供已完成的 JavaScript `exec` cell, 但没有 nested tool 的结构化 trace. VCT 会将该 cell 计为一次 Bash call, 并在完整 JSON 中保留 source, 但不会猜测 nested Read/Edit/Write operation.
 
 ---
 

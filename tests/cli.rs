@@ -1,16 +1,16 @@
 // Integration tests for the built `vct` binary.
 //
 // Two groups:
-//  1. Zero-env, zero-network CLI wiring — version / help / `analysis --path`
-//     (single-file) / flag conflicts / arg parsing. These need no HOME and no
-//     network, so they mutate no environment at all.
+//  1. CLI wiring and single-file behavior. Clap-only checks use the inherited
+//     environment because they stop before runtime dispatch; every command that
+//     can parse, log, or return a runtime error uses an isolated child HOME.
 //  2. Per-child HOME smoke tests — `usage` / `analysis` (batch) run against an
-//     isolated temp HOME (set on the child process only) seeded with fixture
-//     sessions plus an offline pricing cache, so the compiled binary is
-//     exercised end-to-end without touching the real home or any external API.
+//     isolated temp HOME seeded with fixture sessions plus an offline pricing
+//     cache, so the compiled binary is exercised end-to-end without touching
+//     the real home or any external API.
 //
-// Setting HOME on the child is the only way to isolate a separate binary's home
-// directory; it is per-child (no `#[serial]`, no process-global mutation) and
+// Setting the environment on the child is the only way to isolate a separate
+// binary; it is per-child (no `#[serial]`, no process-global mutation) and
 // behaves identically locally and in CI.
 
 mod common;
@@ -19,7 +19,8 @@ use assert_cmd::Command;
 use common::{TempHome, fixture};
 use predicates::prelude::*;
 use serde_json::json;
-use vibe_coding_tracker::VERSION;
+use vibe_coding_tracker::session::{ParseMode, parse_session_file_typed_with_mode};
+use vibe_coding_tracker::{VERSION, parse_session_file_typed};
 
 /// A minimal cost-fields pricing map used to seed the offline cache so `usage`
 /// prices its models without a network fetch.
@@ -34,19 +35,21 @@ fn pricing_seed() -> serde_json::Value {
     })
 }
 
-/// `vct` with an isolated per-child HOME (XDG overrides cleared) so the binary
-/// resolves every provider directory and the `~/.vct` cache under the temp home,
-/// matching `resolve_paths_from_home`.
+/// `vct` with an isolated, offline per-child environment so every provider
+/// directory and `~/.vct` cache resolve under the temp home.
 fn child_cmd(home: &TempHome) -> Command {
     let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
     cmd.env("HOME", home.home())
+        .env("USERPROFILE", home.home())
+        .env("HERMES_HOME", home.home().join(".hermes"))
+        .env("VCT_OFFLINE", "1")
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME");
     cmd
 }
 
 // ============================================================================
-// Group 1: zero-env, zero-network CLI wiring
+// Group 1: CLI wiring and single-file behavior
 // ============================================================================
 
 #[test]
@@ -104,90 +107,190 @@ fn test_version_command_text() {
 }
 
 #[test]
-fn test_analysis_command_with_example_file() {
-    Command::cargo_bin("vibe_coding_tracker")
-        .unwrap()
-        .arg("analysis")
-        .arg("--path")
-        .arg(fixture("test_conversation_claude_code.jsonl"))
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("extensionName"))
-        .stdout(predicate::str::contains("records"));
+fn analysis_file_json_matches_typed_parser_for_every_jsonl_provider() {
+    let home = TempHome::new();
+    for fixture_name in [
+        "test_conversation_claude_code.jsonl",
+        "test_conversation_codex.jsonl",
+        "test_conversation_copilot.jsonl",
+        "test_conversation_gemini.jsonl",
+    ] {
+        let path = fixture(fixture_name);
+        let expected = serde_json::to_value(parse_session_file_typed(&path).unwrap()).unwrap();
+
+        let default_output = child_cmd(&home)
+            .arg("analysis")
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            default_output.status.success(),
+            "default single-file analysis failed for {fixture_name}"
+        );
+        assert!(default_output.stdout.ends_with(b"\n"));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&default_output.stdout).unwrap(),
+            expected,
+            "single-file JSON drifted for {fixture_name}"
+        );
+
+        let explicit_json = child_cmd(&home)
+            .arg("analysis")
+            .arg(&path)
+            .arg("--json")
+            .output()
+            .unwrap();
+        assert!(explicit_json.status.success());
+        assert_eq!(
+            explicit_json.stdout, default_output.stdout,
+            "--json changed the single-file payload for {fixture_name}"
+        );
+    }
 }
 
 #[test]
-fn test_analysis_command_with_output_file() {
-    let temp_dir = tempfile::TempDir::new().unwrap();
-    let output_file = temp_dir.path().join("output.json");
+fn analysis_legacy_path_and_output_flags_are_rejected() {
+    let path = fixture("test_conversation_claude_code.jsonl");
 
-    Command::cargo_bin("vibe_coding_tracker")
-        .unwrap()
-        .arg("analysis")
-        .arg("--path")
-        .arg(fixture("test_conversation_claude_code.jsonl"))
-        .arg("--output")
-        .arg(&output_file)
-        .assert()
-        .success();
+    for flag in ["--path", "-p"] {
+        Command::cargo_bin("vibe_coding_tracker")
+            .unwrap()
+            .arg("analysis")
+            .arg(flag)
+            .arg(&path)
+            .assert()
+            .failure();
+    }
 
-    assert!(output_file.exists(), "Output file should be created");
-    let content = std::fs::read_to_string(&output_file).unwrap();
-    let json: serde_json::Value = serde_json::from_str(&content).unwrap();
-    assert!(json.is_object(), "Output should be valid JSON object");
+    for flag in ["--output", "-o"] {
+        Command::cargo_bin("vibe_coding_tracker")
+            .unwrap()
+            .arg("analysis")
+            .arg(&path)
+            .arg(flag)
+            .arg("output.json")
+            .assert()
+            .failure();
+    }
 }
 
 #[test]
 fn test_analysis_command_with_nonexistent_file() {
-    Command::cargo_bin("vibe_coding_tracker")
-        .unwrap()
+    let home = TempHome::new();
+    child_cmd(&home)
         .arg("analysis")
-        .arg("--path")
         .arg("nonexistent_file.jsonl")
         .assert()
         .failure();
 }
 
 #[test]
-fn test_analysis_output_directory_creation() {
+fn analysis_file_rejects_completely_unknown_provider_schema() {
+    let home = TempHome::new();
     let temp_dir = tempfile::TempDir::new().unwrap();
-    let nested_output = temp_dir
-        .path()
-        .join("nested")
-        .join("dir")
-        .join("output.json");
-    std::fs::create_dir_all(nested_output.parent().unwrap()).unwrap();
+    let path = temp_dir.path().join("future.jsonl");
+    std::fs::write(
+        &path,
+        r#"{"type":"future.provider.event","timestamp":"2026-07-12T00:00:00Z"}"#,
+    )
+    .unwrap();
 
-    Command::cargo_bin("vibe_coding_tracker")
-        .unwrap()
+    child_cmd(&home)
         .arg("analysis")
-        .arg("--path")
-        .arg(fixture("test_conversation_claude_code.jsonl"))
-        .arg("--output")
-        .arg(&nested_output)
+        .arg(&path)
         .assert()
-        .success();
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "contained no recognized provider records",
+        ));
+}
 
-    assert!(nested_output.exists(), "Output file should be created");
+#[test]
+fn analysis_file_warns_when_only_some_analyzer_payloads_fail() {
+    let home = TempHome::new();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("partial.jsonl");
+    std::fs::write(
+        &path,
+        concat!(
+            r#"{"type":"assistant","parentUuid":"root","timestamp":"2026-07-12T00:00:00Z","message":{"model":"claude-sonnet","usage":{"input_tokens":1,"output_tokens":1},"content":[]}}"#,
+            "\n",
+            r#"{"type":"assistant","parentUuid":"root","timestamp":"2026-07-12T00:00:01Z","message":{"model":"claude-sonnet","usage":"future","content":[]}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+
+    let output = child_cmd(&home)
+        .arg("analysis")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap();
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Skipped 1 malformed or unsupported analyzer records")
+    );
+}
+
+#[test]
+fn analysis_file_does_not_log_analyzer_irrelevant_codex_schema_drift() {
+    let home = TempHome::new();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("irrelevant-drift.jsonl");
+    let mut contents = String::from(
+        r#"{"timestamp":"2026-07-12T00:00:00Z","type":"session_meta","payload":{"type":"session_meta","id":"session"}}"#,
+    );
+    contents.push('\n');
+    for _ in 0..100 {
+        contents.push_str(
+            r#"{"timestamp":"2026-07-12T00:00:01Z","type":"response_item","payload":{"type":"message","output":true}}"#,
+        );
+        contents.push('\n');
+    }
+    std::fs::write(&path, contents).unwrap();
+
+    child_cmd(&home)
+        .arg("analysis")
+        .arg(&path)
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+    assert!(
+        !home.home().join(".vct/logs").exists(),
+        "analyzer-irrelevant Codex records must not create diagnostic logs"
+    );
+}
+
+#[test]
+fn usage_output_flag_is_rejected() {
+    for flag in ["--output", "-o"] {
+        Command::cargo_bin("vibe_coding_tracker")
+            .unwrap()
+            .arg("usage")
+            .arg(flag)
+            .arg("output.json")
+            .assert()
+            .failure();
+    }
 }
 
 #[test]
 fn test_analysis_validates_file_extension() {
+    let home = TempHome::new();
     let temp_dir = tempfile::TempDir::new().unwrap();
     let wrong_ext = temp_dir.path().join("test.txt");
     std::fs::write(&wrong_ext, "test content").unwrap();
 
     // Behavior depends on implementation - may succeed or fail; must not panic.
-    let _ = Command::cargo_bin("vibe_coding_tracker")
-        .unwrap()
-        .arg("analysis")
-        .arg("--path")
-        .arg(&wrong_ext)
-        .output();
+    let _ = child_cmd(&home).arg("analysis").arg(&wrong_ext).output();
 }
 
 #[test]
 fn test_cli_handles_unicode_paths() {
+    let home = TempHome::new();
     let temp_dir = tempfile::TempDir::new().unwrap();
     let unicode_path = temp_dir.path().join("測試_test_файл.jsonl");
     std::fs::copy(
@@ -196,10 +299,8 @@ fn test_cli_handles_unicode_paths() {
     )
     .unwrap();
 
-    Command::cargo_bin("vibe_coding_tracker")
-        .unwrap()
+    child_cmd(&home)
         .arg("analysis")
-        .arg("--path")
         .arg(&unicode_path)
         .assert()
         .success();
@@ -207,14 +308,13 @@ fn test_cli_handles_unicode_paths() {
 
 #[test]
 fn test_cli_handles_spaces_in_paths() {
+    let home = TempHome::new();
     let temp_dir = tempfile::TempDir::new().unwrap();
     let space_path = temp_dir.path().join("file with spaces.jsonl");
     std::fs::copy(fixture("test_conversation_claude_code.jsonl"), &space_path).unwrap();
 
-    Command::cargo_bin("vibe_coding_tracker")
-        .unwrap()
+    child_cmd(&home)
         .arg("analysis")
-        .arg("--path")
         .arg(&space_path)
         .assert()
         .success();
@@ -240,7 +340,9 @@ fn test_analysis_help() {
         .assert()
         .success()
         .stdout(predicate::str::contains("analysis"))
-        .stdout(predicate::str::contains("--path"));
+        .stdout(predicate::str::contains("[FILE]"))
+        .stdout(predicate::str::contains("--path").not())
+        .stdout(predicate::str::contains("--output").not());
 }
 
 #[test]
@@ -253,7 +355,7 @@ fn test_usage_help() {
         .success()
         .stdout(predicate::str::contains("usage"))
         .stdout(predicate::str::contains("--json"))
-        .stdout(predicate::str::contains("--output"));
+        .stdout(predicate::str::contains("--output").not());
 }
 
 #[test]
@@ -312,6 +414,7 @@ fn test_usage_multiple_output_formats() {
 
 #[test]
 fn test_analysis_multiple_output_formats() {
+    let path = fixture("test_conversation_claude_code.jsonl");
     for combo in [
         ["--json", "--text"],
         ["--json", "--table"],
@@ -320,10 +423,80 @@ fn test_analysis_multiple_output_formats() {
         Command::cargo_bin("vibe_coding_tracker")
             .unwrap()
             .arg("analysis")
+            .arg(&path)
             .args(combo)
             .assert()
             .failure()
             .stderr(predicate::str::contains("cannot be used with"));
+    }
+}
+
+#[test]
+fn analysis_file_rejects_period_flags() {
+    let path = fixture("test_conversation_claude_code.jsonl");
+
+    for period in ["--daily", "--weekly", "--monthly", "--all", "-a"] {
+        Command::cargo_bin("vibe_coding_tracker")
+            .unwrap()
+            .arg("analysis")
+            .arg(&path)
+            .arg(period)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("cannot be used with"));
+    }
+}
+
+#[test]
+fn analysis_file_text_and_table_use_the_canonical_parse() {
+    let home = TempHome::new();
+    let path = fixture("test_conversation_claude_code.jsonl");
+
+    child_cmd(&home)
+        .arg("analysis")
+        .arg(&path)
+        .arg("--text")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("claude-sonnet-4-20250514"))
+        .stdout(predicate::str::contains("editLines="));
+
+    child_cmd(&home)
+        .arg("analysis")
+        .arg(&path)
+        .arg("--table")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Analysis Statistics"))
+        .stdout(predicate::str::contains("claude-sonnet-4-20250514"));
+}
+
+#[test]
+fn single_file_summary_projection_is_parse_mode_invariant() {
+    for fixture_name in [
+        "test_conversation_claude_code.jsonl",
+        "test_conversation_codex.jsonl",
+        "test_conversation_copilot.jsonl",
+        "test_conversation_gemini.jsonl",
+    ] {
+        let path = fixture(fixture_name);
+        let full = parse_session_file_typed_with_mode(&path, ParseMode::Full).unwrap();
+        let compact = parse_session_file_typed_with_mode(&path, ParseMode::UsageOnly).unwrap();
+
+        assert!(compact.records.iter().all(|record| {
+            record.write_file_details.is_empty()
+                && record.read_file_details.is_empty()
+                && record.edit_file_details.is_empty()
+                && record.run_command_details.is_empty()
+        }));
+
+        let full_rows = vibe_coding_tracker::analysis::project_code_analysis(&full).rows;
+        let compact_rows = vibe_coding_tracker::analysis::project_code_analysis(&compact).rows;
+        assert_eq!(
+            serde_json::to_value(full_rows).unwrap(),
+            serde_json::to_value(compact_rows).unwrap(),
+            "summary scalars drifted between parse modes for {fixture_name}"
+        );
     }
 }
 
@@ -459,24 +632,6 @@ fn usage_merge_providers_flag_smoke() {
 }
 
 #[test]
-fn usage_output_file_smoke() {
-    let home = TempHome::new();
-    home.seed_pricing_cache(&pricing_seed());
-    let out = home.home().join("usage_output.json");
-
-    child_cmd(&home)
-        .arg("usage")
-        .arg("--output")
-        .arg(&out)
-        .assert()
-        .success();
-
-    let content = std::fs::read_to_string(&out).unwrap();
-    let json: serde_json::Value = serde_json::from_str(&content).unwrap();
-    assert!(json.is_array(), "Usage output should be a JSON array");
-}
-
-#[test]
 fn analysis_batch_json_smoke() {
     let home = TempHome::new();
     home.put_claude_session(
@@ -496,11 +651,32 @@ fn analysis_batch_json_smoke() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let rows: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON array");
-    let arr = rows.as_array().expect("analysis --json is an array");
+    assert!(output.stdout.ends_with(b"\n"));
+    let analyses: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("valid JSON array");
+    let arr = analyses.as_array().expect("analysis --json is an array");
+    let claude = arr
+        .iter()
+        .find(|analysis| analysis["extensionName"] == "Claude-Code")
+        .expect("seeded Claude session should retain the canonical analysis shape");
+    let records = claude["records"].as_array().expect("records array");
+    assert!(!records.is_empty());
     assert!(
-        arr.iter().any(|r| r["model"] == "claude-sonnet-4-20250514"),
-        "seeded Claude model should have an aggregated analysis row"
+        records.iter().any(|record| {
+            [
+                "writeFileDetails",
+                "readFileDetails",
+                "editFileDetails",
+                "runCommandDetails",
+            ]
+            .iter()
+            .any(|key| {
+                record[*key]
+                    .as_array()
+                    .is_some_and(|details| !details.is_empty())
+            })
+        }),
+        "batch JSON must retain Full parse details"
     );
 }
 
@@ -518,6 +694,66 @@ fn analysis_batch_text_and_table_smoke() {
             .arg(format)
             .assert()
             .success();
+    }
+}
+
+#[test]
+fn analysis_noninteractive_formats_fail_when_every_candidate_fails() {
+    for format in ["--json", "--text", "--table"] {
+        let home = TempHome::new();
+        home.put_claude_session("broken", "broken.jsonl", "{not json\n");
+
+        child_cmd(&home)
+            .arg("analysis")
+            .arg(format)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "failed to parse all 1 analysis sources",
+            ));
+    }
+}
+
+#[test]
+fn analysis_json_fails_when_provider_schema_is_completely_unknown() {
+    let home = TempHome::new();
+    home.put_claude_session(
+        "future",
+        "future.jsonl",
+        r#"{"type":"future.claude.event","timestamp":"2026-07-12T00:00:00Z"}"#,
+    );
+
+    child_cmd(&home)
+        .arg("analysis")
+        .arg("--json")
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "failed to parse all 1 analysis sources",
+        ));
+}
+
+#[test]
+fn analysis_noninteractive_formats_warn_and_keep_partial_results() {
+    for format in ["--json", "--text", "--table"] {
+        let home = TempHome::new();
+        home.put_claude_session(
+            "valid",
+            "valid.jsonl",
+            &common::fixture_str("test_conversation_claude_code.jsonl"),
+        );
+        home.put_claude_session("broken", "broken.jsonl", "{not json\n");
+
+        child_cmd(&home)
+            .arg("analysis")
+            .arg(format)
+            .assert()
+            .success()
+            .stdout(predicate::str::is_empty().not())
+            .stderr(predicate::str::contains(
+                "Encountered 1 analysis source failures while scanning 2 candidates",
+            ));
     }
 }
 
@@ -545,6 +781,20 @@ fn readonly_commands_do_not_create_config() {
     assert!(
         !home.home().join(".vct/config.toml").exists(),
         "version must not create config.toml"
+    );
+}
+
+#[test]
+fn analysis_file_does_not_create_config() {
+    let home = TempHome::new();
+    child_cmd(&home)
+        .arg("analysis")
+        .arg(fixture("test_conversation_claude_code.jsonl"))
+        .assert()
+        .success();
+    assert!(
+        !home.home().join(".vct/config.toml").exists(),
+        "single-file analysis must not create config.toml"
     );
 }
 

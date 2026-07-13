@@ -122,15 +122,14 @@ pub struct Cli {
 pub enum Commands {
     /// Analyze JSONL conversation files (single file or all sessions).
     Analysis {
-        /// Path to the JSONL file to analyze (if not provided, analyzes all sessions).
-        #[arg(short, long, conflicts_with_all = ["json", "text", "table"])]
-        path: Option<PathBuf>,
+        /// JSONL or JSON conversation file to analyze; prints complete JSON by default.
+        #[arg(
+            value_name = "FILE",
+            conflicts_with_all = ["daily", "weekly", "monthly", "all"]
+        )]
+        file: Option<PathBuf>,
 
-        /// Optional output path to save analysis result as JSON.
-        #[arg(short, long)]
-        output: Option<PathBuf>,
-
-        /// Output raw JSON instead of table view.
+        /// Output complete analysis data as JSON.
         #[arg(long, group = "analysis_format")]
         json: bool,
 
@@ -161,11 +160,7 @@ pub enum Commands {
 
     /// Display token usage statistics.
     Usage {
-        /// Optional output path to save usage result as JSON.
-        #[arg(short, long)]
-        output: Option<PathBuf>,
-
-        /// Output raw JSON instead of table view.
+        /// Output usage data as JSON.
         #[arg(long, group = "usage_format")]
         json: bool,
 

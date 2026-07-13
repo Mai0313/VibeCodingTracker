@@ -12,6 +12,7 @@ pub mod codex;
 pub mod copilot;
 pub mod cursor;
 pub mod detector;
+pub(crate) mod diagnostics;
 pub mod gemini;
 pub mod hermes;
 pub mod opencode;
@@ -23,7 +24,8 @@ pub use detector::{classify_records, detect_extension_type};
 pub use hermes::read_hermes_usage;
 pub use opencode::{read_opencode_analysis, read_opencode_usage};
 pub use parser::{
-    parse_session_file, parse_session_file_as, parse_session_file_typed,
-    parse_session_file_typed_with_mode,
+    SessionFileParseDiagnostics, parse_session_file, parse_session_file_as,
+    parse_session_file_typed, parse_session_file_typed_with_mode,
+    parse_session_file_typed_with_mode_and_diagnostics,
 };
 pub use state::{ParseMode, SessionParseState};

@@ -165,20 +165,24 @@ pub fn is_claude_session_file(path: &Path) -> bool {
 /// Filter for Gemini CLI session files.
 ///
 /// Current Gemini CLI stores each chat as a line-delimited event stream at
-/// `~/.gemini/tmp/<project>/chats/session-*.jsonl`. Only `.jsonl` files
-/// directly under a `chats/` directory are accepted — sibling artifacts
-/// (`discordbot/logs.json`, the `bin/rg` binary, `.project_root`) are
-/// rejected by the parent-directory check.
+/// `~/.gemini/tmp/<project>/chats/session-*.jsonl`. Subagent sessions sit one
+/// level deeper at `chats/<parent-session>/<subagent>.jsonl`. Sibling artifacts
+/// (`discordbot/logs.json`, the `bin/rg` binary, `.project_root`) are rejected.
 ///
 /// Legacy single-object exports (`chats/<session>.json`) are intentionally
 /// not matched: the JSONL format is the only shape the analyzer understands
 /// today, and silently scanning `.json` files we can no longer parse just
 /// yields `Warning: Failed to analyze ...` noise on every run.
 pub fn is_gemini_session_file(path: &Path) -> bool {
-    if let (Some(parent), Some(ext)) = (path.parent(), path.extension()) {
-        parent.file_name() == Some(std::ffi::OsStr::new("chats")) && ext == "jsonl"
-    } else {
+    if path.extension() != Some(std::ffi::OsStr::new("jsonl")) {
         false
+    } else {
+        path.parent().is_some_and(|parent| {
+            parent.file_name() == Some(std::ffi::OsStr::new("chats"))
+                || parent.parent().is_some_and(|grandparent| {
+                    grandparent.file_name() == Some(std::ffi::OsStr::new("chats"))
+                })
+        })
     }
 }
 
@@ -285,6 +289,21 @@ mod tests {
             "/home/user/.gemini/tmp/proj/chats/session-2026-04-23T12-52.jsonl",
         );
         assert!(is_gemini_session_file(path));
+    }
+
+    #[test]
+    fn test_is_gemini_session_file_accepts_nested_subagent() {
+        let path =
+            std::path::Path::new("/home/user/.gemini/tmp/proj/chats/parent-session/subagent.jsonl");
+        assert!(is_gemini_session_file(path));
+    }
+
+    #[test]
+    fn test_is_gemini_session_file_rejects_deeper_jsonl() {
+        let path = std::path::Path::new(
+            "/home/user/.gemini/tmp/proj/chats/parent-session/artifacts/data.jsonl",
+        );
+        assert!(!is_gemini_session_file(path));
     }
 
     #[test]

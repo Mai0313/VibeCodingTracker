@@ -64,7 +64,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test.jsonl");
         let mut file = File::create(&file_path).unwrap();
-        writeln!(file, r#"{{"key": "value"}}"#).unwrap();
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-07-12T00:00:00Z","type":"session_meta","payload":{{"type":"session_meta","id":"clear"}}}}"#
+        )
+        .unwrap();
         drop(file);
 
         // Try to cache it
@@ -88,16 +92,20 @@ mod tests {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test.jsonl");
         let mut file = File::create(&file_path).unwrap();
-        writeln!(file, r#"{{"key": "value"}}"#).unwrap();
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-07-12T00:00:00Z","type":"session_meta","payload":{{"type":"session_meta","id":"persistent"}}}}"#
+        )
+        .unwrap();
         drop(file);
 
         // First access
-        let _ = cache.get_or_parse(&file_path);
+        cache.get_or_parse(&file_path).unwrap();
         let stats1 = cache.stats();
         let count1 = stats1.entry_count;
 
         // Second access (should use cache)
-        let _ = cache.get_or_parse(&file_path);
+        cache.get_or_parse(&file_path).unwrap();
         let stats2 = cache.stats();
 
         // Entry count should be the same (used cached value)
@@ -169,17 +177,25 @@ mod tests {
         // Create test files
         let file1 = dir.path().join("test1.jsonl");
         let mut f = File::create(&file1).unwrap();
-        writeln!(f, r#"{{"a": 1}}"#).unwrap();
+        writeln!(
+            f,
+            r#"{{"timestamp":"2026-07-12T00:00:00Z","type":"session_meta","payload":{{"type":"session_meta","id":"one"}}}}"#
+        )
+        .unwrap();
         drop(f);
 
         let file2 = dir.path().join("test2.jsonl");
         let mut f = File::create(&file2).unwrap();
-        writeln!(f, r#"{{"b": 2}}"#).unwrap();
+        writeln!(
+            f,
+            r#"{{"timestamp":"2026-07-12T00:00:00Z","type":"session_meta","payload":{{"type":"session_meta","id":"two"}}}}"#
+        )
+        .unwrap();
         drop(f);
 
         // Parse files
-        let _ = cache.get_or_parse(&file1);
-        let _ = cache.get_or_parse(&file2);
+        cache.get_or_parse(&file1).unwrap();
+        cache.get_or_parse(&file2).unwrap();
 
         let stats = cache.stats();
         assert!(stats.entry_count >= 2);

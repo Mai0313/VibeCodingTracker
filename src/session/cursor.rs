@@ -27,6 +27,7 @@ use crate::cli::TimeRange;
 use crate::constants::FastHashMap;
 use crate::models::{CodeAnalysis, CodeAnalysisRecord, ExtensionType};
 use crate::pricing::{ModelPricingMap, fetch_model_pricing};
+use crate::session::diagnostics::DatabaseAnalysisRow;
 use crate::session::state::{ParseMode, SessionParseState};
 use crate::usage::{CostSource, resolve_model_cost};
 use crate::utils::{TokenCounts, get_current_user, get_machine_id};
@@ -77,30 +78,122 @@ pub fn read_cursor_usage(
 ///
 /// # Errors
 ///
-/// Never fails the whole scan for one bad store: a store that cannot be read is
-/// logged to stderr and skipped. Returns `Ok` with whatever parsed.
+/// A bad store is logged and skipped when any other store succeeds. Returns an
+/// error when stores exist but none can be read, allowing batch diagnostics to
+/// distinguish total parser failure from an empty Cursor history.
 pub fn read_cursor_analysis(
     chats_dir: &Path,
     tracking_db: &Path,
     time_range: TimeRange,
     mode: ParseMode,
 ) -> Result<Vec<(String, CodeAnalysis)>> {
+    let result = read_cursor_analysis_with_diagnostics(chats_dir, tracking_db, time_range, mode);
+    for failure in &result.failures {
+        log::warn!(
+            "failed to read Cursor store {}: {}",
+            failure.path.display(),
+            failure.error
+        );
+    }
+    if result.candidates > 0 && result.parsed == 0 {
+        return Err(anyhow!(
+            "failed to read all {} Cursor chat stores",
+            result.candidates
+        ));
+    }
+    Ok(result
+        .rows
+        .into_iter()
+        .map(|row| (row.date, row.analysis))
+        .collect())
+}
+
+/// One Cursor store that could not be decoded.
+pub(crate) struct CursorAnalysisFailure {
+    /// Store path used for diagnostics.
+    pub path: PathBuf,
+    /// SQLite or schema error without any chat payload.
+    pub error: String,
+}
+
+/// Per-store Cursor analysis result used by the batch collector.
+pub(crate) struct CursorAnalysisRead {
+    /// Successfully decoded date/session rows.
+    pub rows: Vec<DatabaseAnalysisRow>,
+    /// Number of discovered `store.db` files.
+    pub candidates: usize,
+    /// Number of stores decoded successfully, including valid empty stores.
+    pub parsed: usize,
+    /// Store-level failures retained for noninteractive diagnostics.
+    pub failures: Vec<CursorAnalysisFailure>,
+}
+
+struct CursorStoreAnalysis {
+    rows: Vec<(String, CodeAnalysis)>,
+    normalized_messages: usize,
+    failed_payloads: usize,
+}
+
+/// Reads Cursor stores while retaining one diagnostic per store.
+pub(crate) fn read_cursor_analysis_with_diagnostics(
+    chats_dir: &Path,
+    tracking_db: &Path,
+    time_range: TimeRange,
+    mode: ParseMode,
+) -> CursorAnalysisRead {
     let conv_models = load_conversation_models(tracking_db);
     let user = get_current_user();
     let machine = get_machine_id().to_string();
 
+    let store_dbs = cursor_store_dbs(chats_dir);
+    let candidates = store_dbs.len();
+    let mut parsed = 0usize;
     let mut out = Vec::new();
-    for store_db in cursor_store_dbs(chats_dir) {
+    let mut failures = Vec::new();
+    for store_db in store_dbs {
         match read_store_analysis(&store_db, &conv_models, time_range, mode, &user, &machine) {
-            Ok(mut rows) => out.append(&mut rows),
+            Ok(store) if store.normalized_messages == 0 && store.failed_payloads > 0 => {
+                failures.push(CursorAnalysisFailure {
+                    path: store_db,
+                    error: format!(
+                        "none of {} analyzer payloads used a supported schema",
+                        store.failed_payloads
+                    ),
+                });
+            }
+            Ok(store) => {
+                parsed += 1;
+                for (date, analysis) in store.rows {
+                    out.push(DatabaseAnalysisRow {
+                        source_id: store_db.to_string_lossy().into_owned(),
+                        date,
+                        analysis,
+                    });
+                }
+                if store.failed_payloads > 0 {
+                    failures.push(CursorAnalysisFailure {
+                        path: store_db,
+                        error: format!(
+                            "{} analyzer payloads used an unsupported schema",
+                            store.failed_payloads
+                        ),
+                    });
+                }
+            }
             Err(err) => {
-                // File-only: this runs during TUI refresh too, so a stderr
-                // write here would corrupt the alternate screen.
-                log::warn!("failed to read Cursor store {}: {err}", store_db.display());
+                failures.push(CursorAnalysisFailure {
+                    path: store_db,
+                    error: err.to_string(),
+                });
             }
         }
     }
-    Ok(out)
+    CursorAnalysisRead {
+        rows: out,
+        candidates,
+        parsed,
+        failures,
+    }
 }
 
 // ===========================================================================
@@ -234,6 +327,7 @@ fn cursor_store_dbs(chats_dir: &Path) -> Vec<PathBuf> {
             }
         }
     }
+    dbs.sort_unstable();
     dbs
 }
 
@@ -262,11 +356,12 @@ fn load_conversation_models(tracking_db: &Path) -> FastHashMap<String, String> {
             "SELECT conversationId, model, COUNT(*) AS c FROM ai_code_hashes \
              WHERE conversationId IS NOT NULL AND conversationId != '' \
                AND model IS NOT NULL AND model != '' \
-             GROUP BY conversationId, model ORDER BY c DESC",
+             GROUP BY conversationId, model ORDER BY c DESC, model ASC",
         )?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         let mut m: FastHashMap<String, String> = FastHashMap::default();
-        for row in rows.flatten() {
+        for row in rows {
+            let row = row?;
             // Rows are ordered by descending line count, so the first model seen
             // for a conversation is its dominant one.
             m.entry(row.0).or_insert(row.1);
@@ -287,37 +382,73 @@ fn read_store_analysis(
     mode: ParseMode,
     user: &str,
     machine: &str,
-) -> Result<Vec<(String, CodeAnalysis)>> {
+) -> Result<CursorStoreAnalysis> {
     let conv_id = conversation_id_from_path(store_db);
     let cutoff = cutoff_string(time_range);
 
     open_readonly(store_db, "blobs", |conn| {
-        let model = resolve_store_model(conn, conv_models, &conv_id);
-        let blobs = load_blobs(conn)?;
+        let transaction = conn.unchecked_transaction()?;
+        let model = resolve_store_model(&transaction, conv_models, &conv_id);
+        let blobs = load_blobs(&transaction)?;
 
         // Pass 1: index Read tool results by tool-call id so their file lines can
         // be attributed to the matching Read call in pass 2.
-        let read_contents = collect_read_results(&blobs);
+        let read_results = collect_read_results(&blobs);
+        let mut failed_payloads = 0usize;
 
         // Pass 2: fold each assistant turn's tool calls into a per-date state.
         let mut per_date: HashMap<String, SessionParseState> = HashMap::new();
+        let mut normalized_messages = 0usize;
         for data in &blobs {
-            let Some((msg_bytes, ts)) = assistant_node(data) else {
+            if data.first() != Some(&0x0A) {
+                continue;
+            }
+            let node = walk_node(data);
+            let Some(msg_bytes) = node.msg else {
+                // Cursor also writes aggregate DAG nodes with the normal
+                // context-gauge field and a timestamp but no message. They are
+                // not assistant turns. A timestamped node with neither the
+                // message nor the known gauge remains suspicious schema drift.
+                if node.ctx_msg.is_none()
+                    && let Some(ts) = node.ts
+                    && ms_to_local_date(ts).is_some_and(|date| !is_before_cutoff(&date, &cutoff))
+                {
+                    failed_payloads += 1;
+                }
                 continue;
             };
+            if let Some(ts) = node.ts
+                && ms_to_local_date(ts).is_some_and(|date| is_before_cutoff(&date, &cutoff))
+            {
+                continue;
+            }
             let Ok(msg) = serde_json::from_slice::<Value>(msg_bytes) else {
+                failed_payloads += 1;
+                continue;
+            };
+            let Some(role) = msg.get("role").and_then(Value::as_str) else {
+                failed_payloads += 1;
                 continue;
             };
             // Only assistant turns carry tool calls. Guard before creating a
             // date bucket so a non-assistant node never emits a zero-metric row
             // or inflates the Cursor active-day count.
-            if msg.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+            if role != "assistant" {
                 continue;
             }
+            let Some(ts) = node.ts else {
+                failed_payloads += 1;
+                continue;
+            };
             let Some(date) = ms_to_local_date(ts) else {
+                failed_payloads += 1;
                 continue;
             };
             if is_before_cutoff(&date, &cutoff) {
+                continue;
+            }
+            if msg.get("content").and_then(Value::as_array).is_none() {
+                failed_payloads += 1;
                 continue;
             }
             let state = per_date.entry(date).or_insert_with(|| {
@@ -326,7 +457,13 @@ fn read_store_analysis(
                 s
             });
             state.last_ts = ts.max(state.last_ts);
-            apply_assistant_tools(state, &msg, &read_contents, ts);
+            match apply_assistant_tools(state, &msg, &read_results, ts) {
+                Ok(tool_failures) => {
+                    normalized_messages += 1;
+                    failed_payloads += tool_failures;
+                }
+                Err(()) => failed_payloads += 1,
+            }
         }
 
         let mut out = Vec::with_capacity(per_date.len());
@@ -338,7 +475,12 @@ fn read_store_analysis(
             let record = state.into_record(usage);
             out.push((date, wrap_record(record, user, machine)));
         }
-        Ok(out)
+        transaction.commit()?;
+        Ok(CursorStoreAnalysis {
+            rows: out,
+            normalized_messages,
+            failed_payloads,
+        })
     })
 }
 
@@ -352,8 +494,9 @@ fn read_store_context(
     conv_id: &str,
 ) -> Result<(String, Vec<(i64, i64)>)> {
     open_readonly(store_db, "blobs", |conn| {
-        let model = resolve_store_model(conn, conv_models, conv_id);
-        let blobs = load_blobs(conn)?;
+        let transaction = conn.unchecked_transaction()?;
+        let model = resolve_store_model(&transaction, conv_models, conv_id);
+        let blobs = load_blobs(&transaction)?;
         let mut turns = Vec::new();
         for data in &blobs {
             if data.first() != Some(&0x0A) {
@@ -375,6 +518,7 @@ fn read_store_context(
                 turns.push((ts, ctx));
             }
         }
+        transaction.commit()?;
         Ok((model, turns))
     })
 }
@@ -411,9 +555,9 @@ fn store_meta_model(conn: &Connection) -> Option<String> {
 
 /// Loads every blob's raw bytes from a store.
 fn load_blobs(conn: &Connection) -> Result<Vec<Vec<u8>>> {
-    let mut stmt = conn.prepare("SELECT data FROM blobs")?;
+    let mut stmt = conn.prepare("SELECT data FROM blobs ORDER BY id")?;
     let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
-    Ok(rows.flatten().collect())
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// Returns `(assistant message JSON bytes, timestamp_ms)` for a binary DAG node.
@@ -422,6 +566,7 @@ fn load_blobs(conn: &Connection) -> Result<Vec<Vec<u8>>> {
 /// message in `field 4`; `field 26` is the epoch-ms timestamp. Non-node blobs
 /// (JSON messages) return `None`, as do nodes missing the timestamp — an
 /// undateable turn is skipped rather than mis-bucketed to the epoch (1970).
+#[cfg(test)]
 fn assistant_node(data: &[u8]) -> Option<(&[u8], i64)> {
     if data.first() != Some(&0x0A) {
         return None;
@@ -446,58 +591,100 @@ fn message_is_assistant(bytes: &[u8]) -> bool {
 fn apply_assistant_tools(
     state: &mut SessionParseState,
     msg: &Value,
-    read_contents: &HashMap<String, String>,
+    read_results: &HashMap<String, CursorReadResult>,
     ts: i64,
-) {
+) -> std::result::Result<usize, ()> {
     if msg.get("role").and_then(|v| v.as_str()) != Some("assistant") {
-        return;
+        return Err(());
     }
     let Some(content) = msg.get("content").and_then(|v| v.as_array()) else {
-        return;
+        return Err(());
     };
+    let mut failures = 0usize;
     for c in content {
         if c.get("type").and_then(|v| v.as_str()) != Some("tool-call") {
             continue;
         }
-        let tool = c.get("toolName").and_then(|v| v.as_str()).unwrap_or("");
-        let args = c.get("args");
-        let arg = |key: &str| -> &str {
-            args.and_then(|a| a.get(key))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
+        let Some(tool) = c
+            .get("toolName")
+            .and_then(Value::as_str)
+            .filter(|tool| !tool.is_empty())
+        else {
+            failures += 1;
+            continue;
         };
+        let args = c.get("args").and_then(Value::as_object);
+        let arg = |key: &str| -> Option<&str> { args?.get(key)?.as_str() };
         match tool {
-            "Write" => state.add_write_detail(arg("path"), arg("contents"), ts),
+            "Write" => {
+                let (Some(path), Some(contents)) =
+                    (arg("path").filter(|path| !path.is_empty()), arg("contents"))
+                else {
+                    failures += 1;
+                    continue;
+                };
+                state.add_write_detail(path, contents, ts);
+            }
             "StrReplace" => {
-                state.add_edit_detail(arg("path"), arg("old_string"), arg("new_string"), ts)
+                let (Some(path), Some(old), Some(new)) = (
+                    arg("path").filter(|path| !path.is_empty()),
+                    arg("old_string"),
+                    arg("new_string"),
+                ) else {
+                    failures += 1;
+                    continue;
+                };
+                state.add_edit_detail(path, old, new, ts);
             }
             "Read" | "ReadFile" => {
-                let path = arg("path");
-                let content = c
-                    .get("toolCallId")
-                    .and_then(|v| v.as_str())
-                    .and_then(|id| read_contents.get(id))
-                    .map(String::as_str)
-                    .unwrap_or("");
-                if !path.is_empty() && !content.is_empty() {
-                    state.add_read_detail(path, content, ts);
-                } else {
-                    // A read whose result we could not recover still counts as a
-                    // read invocation, matching the OpenCode reader.
-                    state.tool_counts.read += 1;
+                let (Some(path), Some(tool_call_id)) = (
+                    arg("path").filter(|path| !path.is_empty()),
+                    c.get("toolCallId")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty()),
+                ) else {
+                    failures += 1;
+                    continue;
+                };
+                match read_results.get(tool_call_id) {
+                    Some(CursorReadResult::Content(content)) if !content.is_empty() => {
+                        state.add_read_detail(path, content, ts);
+                    }
+                    Some(CursorReadResult::Unsupported) => {
+                        failures += 1;
+                        state.tool_counts.read += 1;
+                    }
+                    _ => {
+                        // A read whose result we could not recover still counts as a
+                        // read invocation, matching the OpenCode reader.
+                        state.tool_counts.read += 1;
+                    }
                 }
             }
-            "Shell" => state.add_run_command(arg("command"), arg("description"), ts),
+            "Shell" => {
+                let Some(command) = arg("command").filter(|command| !command.trim().is_empty())
+                else {
+                    failures += 1;
+                    continue;
+                };
+                state.add_run_command(command, arg("description").unwrap_or(""), ts);
+            }
             "TodoWrite" => state.tool_counts.todo_write += 1,
             // Grep / Glob / Delete etc. are not part of the tracked tool set.
             _ => {}
         }
     }
+    Ok(failures)
+}
+
+enum CursorReadResult {
+    Content(String),
+    Unsupported,
 }
 
 /// Indexes `Read` tool results by tool-call id, with line-number prefixes
 /// stripped so the recovered content is the file's own lines.
-fn collect_read_results(blobs: &[Vec<u8>]) -> HashMap<String, String> {
+fn collect_read_results(blobs: &[Vec<u8>]) -> HashMap<String, CursorReadResult> {
     let mut map = HashMap::new();
     for data in blobs {
         if data.first() != Some(&b'{') {
@@ -506,7 +693,14 @@ fn collect_read_results(blobs: &[Vec<u8>]) -> HashMap<String, String> {
         let Ok(msg) = serde_json::from_slice::<Value>(data) else {
             continue;
         };
-        if msg.get("role").and_then(|v| v.as_str()) != Some("tool") {
+        let role = msg.get("role").and_then(Value::as_str);
+        // Assistant messages are also stored as standalone content-addressed
+        // JSON blobs and referenced from binary DAG nodes. Pass 2 reads the
+        // dated node, so this undated payload copy is expected and ignored.
+        if role == Some("assistant") {
+            continue;
+        }
+        if role != Some("tool") {
             continue;
         }
         let Some(content) = msg.get("content").and_then(|v| v.as_array()) else {
@@ -522,13 +716,22 @@ fn collect_read_results(blobs: &[Vec<u8>]) -> HashMap<String, String> {
             ) {
                 continue;
             }
-            let (Some(id), Some(result)) = (
-                c.get("toolCallId").and_then(|v| v.as_str()),
-                c.get("result").and_then(|v| v.as_str()),
-            ) else {
+            let Some(id) = c
+                .get("toolCallId")
+                .and_then(|v| v.as_str())
+                .filter(|id| !id.is_empty())
+            else {
                 continue;
             };
-            map.insert(id.to_string(), strip_cursor_line_numbers(result));
+            if let Some(result) = c.get("result").and_then(|v| v.as_str()) {
+                map.insert(
+                    id.to_string(),
+                    CursorReadResult::Content(strip_cursor_line_numbers(result)),
+                );
+            } else {
+                map.entry(id.to_string())
+                    .or_insert(CursorReadResult::Unsupported);
+            }
         }
     }
     map
@@ -909,6 +1112,39 @@ mod tests {
     }
 
     #[test]
+    fn load_blobs_uses_stable_id_order() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB)")
+            .unwrap();
+        conn.execute("INSERT INTO blobs VALUES ('z', X'02')", [])
+            .unwrap();
+        conn.execute("INSERT INTO blobs VALUES ('a', X'01')", [])
+            .unwrap();
+
+        assert_eq!(load_blobs(&conn).unwrap(), vec![vec![1], vec![2]]);
+    }
+
+    #[test]
+    fn dominant_model_ties_use_lexical_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tracking.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ai_code_hashes (conversationId TEXT, model TEXT); \
+             INSERT INTO ai_code_hashes VALUES ('conversation', 'z-model'); \
+             INSERT INTO ai_code_hashes VALUES ('conversation', 'a-model');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let models = load_conversation_models(&path);
+        assert_eq!(
+            models.get("conversation").map(String::as_str),
+            Some("a-model")
+        );
+    }
+
+    #[test]
     fn apply_tools_counts_and_lines() {
         let mut state = SessionParseState::with_mode(ParseMode::Full);
         let msg = json!({
@@ -931,9 +1167,15 @@ mod tests {
             ]
         });
         let mut reads = HashMap::new();
-        reads.insert("e".to_string(), "r1\nr2\nr3".to_string());
-        reads.insert("g".to_string(), "w1\nw2".to_string());
-        apply_assistant_tools(&mut state, &msg, &reads, 42);
+        reads.insert(
+            "e".to_string(),
+            CursorReadResult::Content("r1\nr2\nr3".to_string()),
+        );
+        reads.insert(
+            "g".to_string(),
+            CursorReadResult::Content("w1\nw2".to_string()),
+        );
+        apply_assistant_tools(&mut state, &msg, &reads, 42).unwrap();
 
         assert_eq!(state.tool_counts.write, 1);
         assert_eq!(state.tool_counts.edit, 1);
@@ -985,7 +1227,13 @@ mod tests {
     fn make_store_db(nodes: &[Vec<u8>], json_blobs: &[&str]) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("store.db");
-        let conn = Connection::open(&path).unwrap();
+        write_store_db(&path, nodes, json_blobs);
+        (dir, path)
+    }
+
+    fn write_store_db(path: &Path, nodes: &[Vec<u8>], json_blobs: &[&str]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let conn = Connection::open(path).unwrap();
         conn.execute_batch(
             "CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB); \
              CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);",
@@ -1006,7 +1254,6 @@ mod tests {
             .unwrap();
         }
         drop(conn);
-        (dir, path)
     }
 
     #[test]
@@ -1023,10 +1270,12 @@ mod tests {
         // A non-assistant node must NOT create a date bucket or an active day.
         let user_node = make_node(r#"{"role":"user","content":[]}"#, 1_700_000_100_000, None);
         let tool_result = r#"{"role":"tool","content":[{"type":"tool-result","toolName":"Read","toolCallId":"z","result":"     1|line one\n     2|line two"}]}"#;
-        let (_dir, path) = make_store_db(&[assistant, user_node], &[tool_result]);
+        let assistant_payload = r#"{"role":"assistant","content":[]}"#;
+        let (_dir, path) =
+            make_store_db(&[assistant, user_node], &[tool_result, assistant_payload]);
 
         let conv_models = FastHashMap::default();
-        let rows = read_store_analysis(
+        let store = read_store_analysis(
             &path,
             &conv_models,
             TimeRange::All,
@@ -1037,8 +1286,10 @@ mod tests {
         .unwrap();
 
         // Exactly one assistant turn -> one (date) record; the user node is dropped.
-        assert_eq!(rows.len(), 1);
-        let rec = &rows[0].1.records[0];
+        assert_eq!(store.rows.len(), 1);
+        assert_eq!(store.normalized_messages, 1);
+        assert_eq!(store.failed_payloads, 0);
+        let rec = &store.rows[0].1.records[0];
         assert_eq!(rec.tool_call_counts.write, 1);
         assert_eq!(rec.tool_call_counts.bash, 1);
         assert_eq!(rec.tool_call_counts.read, 1);
@@ -1078,5 +1329,292 @@ mod tests {
             turns,
             vec![(1_700_000_000_000, 42_000), (1_700_000_500_000, 88_000)]
         );
+    }
+
+    #[test]
+    fn cursor_store_diagnostics_reject_undecodable_assistant_messages() {
+        for message in ["not json", r#"{"role":"assistant","futureContent":[]}"#] {
+            let dir = tempfile::tempdir().unwrap();
+            let chats = dir.path().join("chats");
+            let store = chats.join("project/conversation/store.db");
+            let node = make_node(message, 1_700_000_000_000, None);
+            write_store_db(&store, &[node], &[]);
+
+            let result = read_cursor_analysis_with_diagnostics(
+                &chats,
+                &dir.path().join("tracking.db"),
+                TimeRange::All,
+                ParseMode::Full,
+            );
+            assert_eq!(result.candidates, 1);
+            assert_eq!(result.parsed, 0);
+            assert!(result.rows.is_empty());
+            assert_eq!(result.failures.len(), 1);
+            assert!(result.failures[0].error.contains("none of 1"));
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let chats = dir.path().join("chats");
+        let store = chats.join("project/conversation/store.db");
+        let mut unknown_node = make_node(
+            r#"{"role":"assistant","content":[]}"#,
+            1_700_000_000_000,
+            None,
+        );
+        assert_eq!(unknown_node[3], 0x22);
+        unknown_node[3] = 0x32;
+        write_store_db(&store, &[unknown_node], &[]);
+
+        let result = read_cursor_analysis_with_diagnostics(
+            &chats,
+            &dir.path().join("tracking.db"),
+            TimeRange::All,
+            ParseMode::Full,
+        );
+        assert_eq!(result.candidates, 1);
+        assert_eq!(result.parsed, 0);
+        assert_eq!(result.failures.len(), 1);
+    }
+
+    #[test]
+    fn cursor_store_diagnostics_ignore_context_aggregate_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let chats = dir.path().join("chats");
+        let store = chats.join("project/conversation/store.db");
+        let message = r#"{"role":"assistant","content":[]}"#;
+        let mut aggregate = make_node(message, 1_700_000_000_000, Some(42_000));
+        aggregate.drain(3..5 + message.len());
+        write_store_db(&store, &[aggregate], &[]);
+
+        let result = read_cursor_analysis_with_diagnostics(
+            &chats,
+            &dir.path().join("tracking.db"),
+            TimeRange::All,
+            ParseMode::Full,
+        );
+        assert_eq!(result.candidates, 1);
+        assert_eq!(result.parsed, 1);
+        assert!(result.rows.is_empty());
+        assert!(result.failures.is_empty());
+    }
+
+    #[test]
+    fn cursor_store_diagnostics_report_known_tool_schema_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let chats = dir.path().join("chats");
+        let store = chats.join("project/conversation/store.db");
+        let assistant = make_node(
+            r#"{"role":"assistant","content":[
+                {"type":"tool-call","toolName":"Write","toolCallId":"w","args":{"futurePath":"/repo/a","futureContents":"text"}},
+                {"type":"tool-call","toolName":"Read","toolCallId":"r","args":{"path":"/repo/b"}}
+            ]}"#,
+            1_700_000_000_000,
+            None,
+        );
+        let read_result = r#"{"role":"tool","content":[{"type":"tool-result","toolName":"Read","toolCallId":"r","futureResult":"text"}]}"#;
+        write_store_db(&store, &[assistant], &[read_result]);
+
+        let result = read_cursor_analysis_with_diagnostics(
+            &chats,
+            &dir.path().join("tracking.db"),
+            TimeRange::All,
+            ParseMode::Full,
+        );
+        assert_eq!(result.candidates, 1);
+        assert_eq!(result.parsed, 1);
+        assert_eq!(result.failures.len(), 1);
+        assert!(result.failures[0].error.contains("2 analyzer payloads"));
+        assert_eq!(result.rows.len(), 1);
+        let record = &result.rows[0].analysis.records[0];
+        assert_eq!(record.tool_call_counts.write, 0);
+        assert_eq!(record.tool_call_counts.read, 1);
+        assert_eq!(record.total_read_lines, 0);
+    }
+
+    #[test]
+    fn cursor_store_diagnostics_ignore_out_of_range_malformed_read_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let chats = dir.path().join("chats");
+        let store = chats.join("project/conversation/store.db");
+        let old_assistant = make_node(
+            r#"{"role":"assistant","content":[
+                {"type":"tool-call","toolName":"Read","toolCallId":"old","args":{"path":"/repo/old"}}
+            ]}"#,
+            946_684_800_000,
+            None,
+        );
+        let malformed_result = r#"{"role":"tool","content":[{"type":"tool-result","toolName":"Read","toolCallId":"old","futureResult":"text"}]}"#;
+        write_store_db(&store, &[old_assistant], &[malformed_result]);
+
+        let result = read_cursor_analysis_with_diagnostics(
+            &chats,
+            &dir.path().join("tracking.db"),
+            TimeRange::Daily,
+            ParseMode::Full,
+        );
+        assert_eq!(result.candidates, 1);
+        assert_eq!(result.parsed, 1);
+        assert!(result.rows.is_empty());
+        assert!(result.failures.is_empty());
+    }
+
+    #[test]
+    fn out_of_range_malformed_read_result_does_not_taint_current_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let chats = dir.path().join("chats");
+        let store = chats.join("project/conversation/store.db");
+        let old_assistant = make_node(
+            r#"{"role":"assistant","content":[
+                {"type":"tool-call","toolName":"Read","toolCallId":"old","args":{"path":"/repo/old"}}
+            ]}"#,
+            946_684_800_000,
+            None,
+        );
+        let current_assistant = make_node(
+            r#"{"role":"assistant","content":[]}"#,
+            4_102_444_800_000,
+            None,
+        );
+        let malformed_result = r#"{"role":"tool","content":[{"type":"tool-result","toolName":"Read","toolCallId":"old","futureResult":"text"}]}"#;
+        write_store_db(
+            &store,
+            &[old_assistant, current_assistant],
+            &[malformed_result],
+        );
+
+        let result = read_cursor_analysis_with_diagnostics(
+            &chats,
+            &dir.path().join("tracking.db"),
+            TimeRange::Daily,
+            ParseMode::Full,
+        );
+        assert_eq!(result.parsed, 1);
+        assert_eq!(result.rows.len(), 1);
+        assert!(result.failures.is_empty());
+    }
+
+    #[test]
+    fn in_range_malformed_read_result_remains_a_partial_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let chats = dir.path().join("chats");
+        let store = chats.join("project/conversation/store.db");
+        let assistant = make_node(
+            r#"{"role":"assistant","content":[
+                {"type":"tool-call","toolName":"Read","toolCallId":"current","args":{"path":"/repo/current"}}
+            ]}"#,
+            4_102_444_800_000,
+            None,
+        );
+        let malformed_result = r#"{"role":"tool","content":[{"type":"tool-result","toolName":"Read","toolCallId":"current","futureResult":"text"}]}"#;
+        write_store_db(&store, &[assistant], &[malformed_result]);
+
+        let result = read_cursor_analysis_with_diagnostics(
+            &chats,
+            &dir.path().join("tracking.db"),
+            TimeRange::Daily,
+            ParseMode::Full,
+        );
+        assert_eq!(result.parsed, 1);
+        assert_eq!(result.failures.len(), 1);
+        assert!(result.failures[0].error.contains("1 analyzer payload"));
+        let record = &result.rows[0].analysis.records[0];
+        assert_eq!(record.tool_call_counts.read, 1);
+        assert_eq!(record.total_read_lines, 0);
+    }
+
+    #[test]
+    fn unkeyed_tool_blobs_do_not_taint_an_in_range_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let chats = dir.path().join("chats");
+        let store = chats.join("project/conversation/store.db");
+        let assistant = make_node(
+            r#"{"role":"assistant","content":[
+                {"type":"tool-call","toolName":"Read","toolCallId":"missing","args":{"path":"/repo/current"}}
+            ]}"#,
+            4_102_444_800_000,
+            None,
+        );
+        let non_array = r#"{"role":"tool","content":"future"}"#;
+        let missing_id = r#"{"role":"tool","content":[{"type":"tool-result","toolName":"Read","result":"text"}]}"#;
+        write_store_db(&store, &[assistant], &[non_array, missing_id]);
+
+        let result = read_cursor_analysis_with_diagnostics(
+            &chats,
+            &dir.path().join("tracking.db"),
+            TimeRange::Daily,
+            ParseMode::Full,
+        );
+        assert_eq!(result.parsed, 1);
+        assert!(result.failures.is_empty());
+        let record = &result.rows[0].analysis.records[0];
+        assert_eq!(record.tool_call_counts.read, 1);
+        assert_eq!(record.total_read_lines, 0);
+    }
+
+    #[test]
+    fn read_cursor_analysis_errors_when_every_store_is_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let chats = dir.path().join("chats");
+        let store = chats.join("project/conversation/store.db");
+        std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+        let conn = Connection::open(&store).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE blobs (id TEXT PRIMARY KEY, data TEXT); \
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT); \
+             INSERT INTO blobs VALUES ('bad', 'not a blob');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = read_cursor_analysis(
+            &chats,
+            &dir.path().join("tracking.db"),
+            TimeRange::All,
+            ParseMode::Full,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("failed to read all 1 Cursor chat stores")
+        );
+    }
+
+    #[test]
+    fn cursor_store_diagnostics_preserve_partial_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let chats = dir.path().join("chats");
+
+        let valid = chats.join("project/valid/store.db");
+        std::fs::create_dir_all(valid.parent().unwrap()).unwrap();
+        let conn = Connection::open(&valid).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB); \
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let invalid = chats.join("project/invalid/store.db");
+        std::fs::create_dir_all(invalid.parent().unwrap()).unwrap();
+        let conn = Connection::open(&invalid).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE blobs (id TEXT PRIMARY KEY, data TEXT); \
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT); \
+             INSERT INTO blobs VALUES ('bad', 'not a blob');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let result = read_cursor_analysis_with_diagnostics(
+            &chats,
+            &dir.path().join("tracking.db"),
+            TimeRange::All,
+            ParseMode::Full,
+        );
+        assert_eq!(result.candidates, 2);
+        assert_eq!(result.parsed, 1);
+        assert_eq!(result.failures.len(), 1);
+        assert_eq!(result.failures[0].path, invalid);
     }
 }
