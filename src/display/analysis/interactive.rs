@@ -510,7 +510,7 @@ fn render_analysis_frame(
             ("Models:", entries_str.as_str(), RatatuiColor::Blue),
         ];
 
-        let summary = create_summary(summary_items, sys, pid);
+        let summary = create_summary(summary_items, sys, pid, chunks.summary.width);
         f.render_widget(summary, chunks.summary);
 
         f.render_widget(create_controls(&[]), chunks.controls);
