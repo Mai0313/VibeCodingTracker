@@ -1,8 +1,8 @@
 //! Process-wide LRU cache of parsed session analyses.
 //!
 //! Wraps [`FileParseCache`] in a global singleton ([`GLOBAL_FILE_CACHE`]) so
-//! every command shares one bounded, mtime-invalidated cache rather than
-//! reparsing the same JSONL files.
+//! every command shares one bounded, dependency-invalidated cache rather than
+//! reparsing the same session files.
 
 mod file_cache;
 

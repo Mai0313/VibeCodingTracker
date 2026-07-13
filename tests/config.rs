@@ -24,6 +24,7 @@ fn load_in_creates_default_commented_file_when_absent() {
     assert!(!cfg.usage.merge_models);
     // New sections default sensibly.
     assert!(cfg.providers.cursor);
+    assert!(cfg.providers.grok);
     assert_eq!(cfg.usage.refresh_interval, 10);
     assert_eq!(cfg.usage.quota.refresh_interval, 60);
     assert_eq!(cfg.analysis.refresh_interval, 10);
@@ -39,6 +40,7 @@ fn load_in_creates_default_commented_file_when_absent() {
     assert!(text.contains("[providers]"));
     assert!(text.contains("[logging]"));
     assert!(text.contains("merge_models = false"));
+    assert!(text.contains("grok = true"));
     // A generated comment must survive so the file is self-documenting.
     assert!(text.contains("# Toggled live"));
 }
@@ -146,10 +148,28 @@ fn existing_current_file_is_parsed_and_left_in_place() {
     // A missing provider key still defaults to true; the given one is honored.
     assert!(!cfg.providers.cursor);
     assert!(cfg.providers.claude);
+    assert!(cfg.providers.grok);
     // A current file is byte-for-byte untouched.
     assert_eq!(
         fs::read_to_string(dir.join("config.toml")).unwrap(),
         original
+    );
+}
+
+#[test]
+fn generated_schema_exposes_grok_as_an_enabled_non_quota_provider() {
+    let schema: serde_json::Value =
+        serde_json::from_str(&config::schema_json()).expect("generated schema is valid JSON");
+    let providers = &schema["properties"]["providers"];
+
+    assert_eq!(providers["default"]["grok"], true);
+    assert_eq!(providers["properties"]["grok"]["default"], true);
+    assert!(
+        !schema["properties"]["usage"]["properties"]["quota"]["default"]["panels"]
+            .as_array()
+            .expect("quota panels array")
+            .iter()
+            .any(|panel| panel == "grok")
     );
 }
 

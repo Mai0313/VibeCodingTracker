@@ -9,6 +9,7 @@ use crate::session::copilot::parse_copilot_events_with_diagnostics;
 use crate::session::detector::{classify_records, detect_extension_type};
 use crate::session::diagnostics::{ParseDiagnostics, ParsedAnalysis};
 use crate::session::gemini::parse_gemini_events_with_diagnostics;
+use crate::session::grok::{is_grok_signals, parse_grok_session};
 use crate::session::state::ParseMode;
 use crate::utils::{get_current_user, get_machine_id, read_json, read_jsonl};
 use anyhow::{Context, Result, bail};
@@ -164,8 +165,8 @@ fn parse_session_file_typed_with_mode_internal(
     }
 
     // Fallback for anything the streaming path could not peek (e.g. a
-    // hand-edited file whose first line is not valid JSON). Every provider
-    // we support writes JSONL today, so this path is rarely exercised.
+    // hand-edited file whose first line is not valid JSON). This is also the
+    // normal path for Grok's pretty-printed `signals.json` object.
     let data = match read_jsonl(path) {
         Ok(data) => data,
         Err(_) => read_json(path)?,
@@ -176,7 +177,7 @@ fn parse_session_file_typed_with_mode_internal(
     }
 
     let ext_type = detect_extension_type(&data)?;
-    dispatch_by_vec(data, ext_type, mode)
+    dispatch_by_vec(data, ext_type, mode, path)
 }
 
 /// Typed entry point when the caller already knows the provider.
@@ -243,7 +244,7 @@ pub(crate) fn parse_session_file_as_with_diagnostics(
         return Ok(empty_parsed_analysis());
     }
 
-    dispatch_by_vec(data, provider, mode)
+    dispatch_by_vec(data, provider, mode, path)
 }
 
 /// Streaming path when the provider is known from the caller's source.
@@ -286,6 +287,7 @@ fn stream_parse_known(
         reader,
         mode,
         ParseDiagnostics::default(),
+        path,
     )?;
     Ok(Some(finalize(parsed, provider)))
 }
@@ -374,10 +376,11 @@ fn stream_parse_autodetect(path: &Path, mode: ParseMode) -> Result<Option<Parsed
     }
 
     // If the whole file was consumed without any distinctive marker, fall
-    // back to Codex — a JSONL file with no Claude / Gemini / Copilot
+    // back to Codex — a JSONL file with no Claude / Gemini / Copilot / Grok
     // markers is almost certainly a Codex log (or a synthetic fixture).
     let ext = ext.unwrap_or(ExtensionType::Codex);
-    let parsed = dispatch_streaming_buffered(ext, buffered, reader, mode, initial_diagnostics)?;
+    let parsed =
+        dispatch_streaming_buffered(ext, buffered, reader, mode, initial_diagnostics, path)?;
     Ok(Some(finalize(parsed, ext)))
 }
 
@@ -406,15 +409,16 @@ fn read_next_non_empty_line<R: BufRead>(reader: &mut R) -> Result<Option<String>
 
 /// Streams the rest of the file, prepending any already-parsed records.
 ///
-/// Every supported provider today writes a line-delimited JSONL stream, so
-/// all four arms feed the buffered records through the typed shape and
-/// then chain the remainder of the reader.
+/// JSONL providers feed buffered records through their typed shape and chain
+/// the remaining reader. Grok reopens its single aggregate JSON object so its
+/// sibling session files remain available to the provider parser.
 fn dispatch_streaming_buffered(
     ext: ExtensionType,
     buffered: Vec<Value>,
     mut reader: BufReader<File>,
     mode: ParseMode,
     initial_diagnostics: ParseDiagnostics,
+    path: &Path,
 ) -> Result<ParsedAnalysis> {
     let extra_diagnostics = Rc::new(RefCell::new(initial_diagnostics));
     match ext {
@@ -464,6 +468,10 @@ fn dispatch_streaming_buffered(
             let parsed =
                 parse_gemini_events_with_diagnostics(session, iter.chain(rest_events), mode)?;
             Ok(merge_extra_diagnostics(parsed, &extra_diagnostics))
+        }
+        ExtensionType::Grok => {
+            drop(reader);
+            parse_grok_session(path, mode)
         }
         // OpenCode stores sessions in a SQLite database, not a JSONL file, so
         // it never flows through the file parser. See `session::opencode`.
@@ -667,10 +675,9 @@ fn raw_record_kind(provider: ExtensionType, value: &Value) -> (bool, bool) {
                 && value.pointer("/data/outputTokens").is_some());
             (recognized, relevant)
         }
-        ExtensionType::Gemini
-        | ExtensionType::OpenCode
-        | ExtensionType::Cursor
-        | ExtensionType::Hermes => (false, false),
+        ExtensionType::Gemini => (false, false),
+        ExtensionType::Grok => (is_grok_signals(value), is_grok_signals(value)),
+        ExtensionType::OpenCode | ExtensionType::Cursor | ExtensionType::Hermes => (false, false),
     }
 }
 
@@ -689,6 +696,7 @@ fn dispatch_by_vec(
     data: Vec<Value>,
     ext_type: ExtensionType,
     mode: ParseMode,
+    path: &Path,
 ) -> Result<ParsedAnalysis> {
     let extra_diagnostics = Rc::new(RefCell::new(ParseDiagnostics::default()));
     let parsed = match ext_type {
@@ -726,6 +734,7 @@ fn dispatch_by_vec(
             }
             ParsedAnalysis::new(empty_analysis(), diagnostics)
         }
+        ExtensionType::Grok => parse_grok_session(path, mode)?,
     };
     Ok(finalize(
         merge_extra_diagnostics(parsed, &extra_diagnostics),

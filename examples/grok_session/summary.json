@@ -1,0 +1,12 @@
+{
+  "info": {
+    "id": "grok-session-test",
+    "cwd": "/workspace/demo"
+  },
+  "updated_at": "2026-01-01T00:00:10.000000000Z",
+  "last_active_at": "2026-01-01T00:00:10.000000000Z",
+  "current_model_id": "grok",
+  "git_remotes": [
+    "https://example.com/demo.git"
+  ]
+}

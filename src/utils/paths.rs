@@ -49,6 +49,10 @@ pub struct HelperPaths {
     pub gemini_dir: PathBuf,
     /// Gemini CLI session logs (`~/.gemini/tmp`).
     pub gemini_session_dir: PathBuf,
+    /// Grok CLI root (`$GROK_HOME` or `~/.grok`).
+    pub grok_dir: PathBuf,
+    /// Grok CLI session logs (`$GROK_HOME/sessions` or `~/.grok/sessions`).
+    pub grok_session_dir: PathBuf,
     /// OpenCode data root (`$XDG_DATA_HOME/opencode` or `~/.local/share/opencode`).
     pub opencode_dir: PathBuf,
     /// OpenCode SQLite database (`<opencode_dir>/opencode.db`).
@@ -80,6 +84,10 @@ pub fn resolve_paths() -> Result<HelperPaths> {
     let xdg_data = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute());
+    let grok_home_env = std::env::var_os("GROK_HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty());
+    let grok_home = resolve_grok_home(&home_dir, grok_home_env.as_deref());
 
     // Hermes honours `$HERMES_HOME`, else the platform-native default
     // (`%LOCALAPPDATA%\hermes` on Windows, `~/.hermes` on POSIX), matching its
@@ -102,7 +110,16 @@ pub fn resolve_paths() -> Result<HelperPaths> {
         xdg_config.as_deref(),
         xdg_data.as_deref(),
         Some(&hermes_home),
+        Some(&grok_home),
     ))
+}
+
+/// Resolves the Grok CLI home directory. An explicit `GROK_HOME` wins;
+/// otherwise Grok uses `~/.grok`.
+fn resolve_grok_home(home_dir: &Path, grok_home: Option<&Path>) -> PathBuf {
+    grok_home
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| home_dir.join(".grok"))
 }
 
 /// Resolves the Hermes home directory the way Hermes's `get_hermes_home` does:
@@ -136,21 +153,22 @@ fn resolve_hermes_home(
 /// unset. This is the seam tests use to point every provider path at a temp
 /// directory without mutating process-global `HOME`/`XDG_*` state.
 pub fn resolve_paths_from_home(home_dir: &Path) -> HelperPaths {
-    build_paths(home_dir, None, None, None)
+    build_paths(home_dir, None, None, None, None)
 }
 
 /// Pure path composition shared by [`resolve_paths`] and
 /// [`resolve_paths_from_home`].
 ///
 /// `xdg_config` / `xdg_data`, when `Some`, override the base of the Cursor
-/// config dir and the OpenCode data dir respectively; `hermes_home`, when
-/// `Some`, is the resolved Hermes home directory. All otherwise derive from
-/// `home_dir` (the Hermes fallback being `~/.hermes`).
+/// config dir and the OpenCode data dir respectively; `hermes_home` and
+/// `grok_home`, when `Some`, are the resolved provider home directories. All
+/// otherwise derive from `home_dir`.
 fn build_paths(
     home_dir: &Path,
     xdg_config: Option<&Path>,
     xdg_data: Option<&Path>,
     hermes_home: Option<&Path>,
+    grok_home: Option<&Path>,
 ) -> HelperPaths {
     let codex_dir = home_dir.join(".codex");
     let codex_session_dir = codex_dir.join("sessions");
@@ -179,6 +197,8 @@ fn build_paths(
     let cursor_chats_dir = cursor_data_dir.join("chats");
     let gemini_dir = home_dir.join(".gemini");
     let gemini_session_dir = gemini_dir.join("tmp");
+    let grok_dir = resolve_grok_home(home_dir, grok_home);
+    let grok_session_dir = grok_dir.join("sessions");
     // OpenCode keeps a single SQLite database under the XDG data directory,
     // honouring `$XDG_DATA_HOME` and falling back to `~/.local/share`.
     let opencode_dir = xdg_data
@@ -207,6 +227,8 @@ fn build_paths(
         cursor_chats_dir,
         gemini_dir,
         gemini_session_dir,
+        grok_dir,
+        grok_session_dir,
         opencode_dir,
         opencode_db,
         hermes_db,
@@ -484,6 +506,7 @@ mod tests {
         assert!(p.claude_dir.ends_with(".claude"));
         assert!(p.copilot_dir.ends_with(".copilot"));
         assert!(p.gemini_dir.ends_with(".gemini"));
+        assert!(p.grok_dir.ends_with(".grok"));
         assert!(p.cache_dir.ends_with(".vct"));
 
         assert_eq!(p.codex_session_dir, home.join(".codex").join("sessions"));
@@ -493,6 +516,7 @@ mod tests {
             home.join(".copilot").join("session-state")
         );
         assert_eq!(p.gemini_session_dir, home.join(".gemini").join("tmp"));
+        assert_eq!(p.grok_session_dir, home.join(".grok").join("sessions"));
         assert_eq!(p.opencode_db, p.opencode_dir.join("opencode.db"));
         assert!(p.opencode_dir.ends_with("opencode"));
         assert_eq!(p.hermes_db, home.join(".hermes").join("state.db"));
@@ -508,12 +532,22 @@ mod tests {
             &p.claude_dir,
             &p.copilot_dir,
             &p.gemini_dir,
+            &p.grok_dir,
             &p.cache_dir,
             &p.cursor_chats_dir,
             &p.opencode_dir,
         ] {
             assert!(d.starts_with(home), "{d:?} should be under {home:?}");
         }
+    }
+
+    #[test]
+    fn resolve_grok_home_honors_env_and_default() {
+        let home = Path::new("/home/u");
+        let explicit = Path::new("/opt/data/grok");
+
+        assert_eq!(resolve_grok_home(home, Some(explicit)), explicit);
+        assert_eq!(resolve_grok_home(home, None), home.join(".grok"));
     }
 
     #[test]

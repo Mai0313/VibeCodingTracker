@@ -3,9 +3,10 @@
 // These tests verify the LRU file parsing cache and pricing cache
 
 use serial_test::serial;
+use std::io::Write;
 use std::path::PathBuf;
 use tempfile::TempDir;
-use vibe_coding_tracker::cache::global_cache;
+use vibe_coding_tracker::cache::{FileParseCache, global_cache};
 use vibe_coding_tracker::pricing::clear_pricing_cache;
 
 #[test]
@@ -55,8 +56,6 @@ fn test_file_cache_get_or_parse() {
 #[test]
 #[serial(global_cache)]
 fn test_file_cache_invalidation() {
-    use std::io::Write;
-
     let temp_dir = TempDir::new().unwrap();
     let test_file = temp_dir.path().join("test.jsonl");
 
@@ -88,6 +87,69 @@ fn test_file_cache_invalidation() {
     // Should detect file change and re-parse
     let result2 = cache.get_or_parse(&test_file);
     assert!(result2.is_ok());
+}
+
+#[test]
+fn test_grok_cache_tracks_sibling_files() {
+    let temp_dir = TempDir::new().unwrap();
+    let session = temp_dir.path().join("workspace").join("session");
+    std::fs::create_dir_all(&session).unwrap();
+    for name in ["signals.json", "summary.json", "updates.jsonl"] {
+        std::fs::copy(
+            PathBuf::from("examples/grok_session").join(name),
+            session.join(name),
+        )
+        .unwrap();
+    }
+
+    let signals = session.join("signals.json");
+    let updates = session.join("updates.jsonl");
+    let summary = session.join("summary.json");
+    let cache = FileParseCache::new();
+
+    let initial = cache.get_or_parse(&signals).unwrap();
+    assert_eq!(initial.records[0].tool_call_counts.read, 2);
+
+    let mut updates_file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&updates)
+        .unwrap();
+    writeln!(
+        updates_file,
+        r#"{{"method":"session/update","params":{{"update":{{"sessionUpdate":"tool_call","toolCallId":"cache-read","title":"read_file","rawInput":{{"target_file":"src/cache.rs"}},"_meta":{{"x.ai/tool":{{"name":"read_file"}}}}}}}},"timestamp":1767225609}}"#
+    )
+    .unwrap();
+    writeln!(
+        updates_file,
+        r#"{{"method":"session/update","params":{{"update":{{"sessionUpdate":"tool_call_update","toolCallId":"cache-read","status":"completed","rawOutput":{{"type":"ReadFile","FileContent":{{"absolute_path":"/workspace/demo/src/cache.rs","content":"cached\n"}}}}}}}},"timestamp":1767225610}}"#
+    )
+    .unwrap();
+    drop(updates_file);
+
+    let after_updates = cache.get_or_parse(&signals).unwrap();
+    assert_eq!(after_updates.records[0].tool_call_counts.read, 3);
+
+    let mut summary_value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&summary).unwrap()).unwrap();
+    summary_value["info"]["id"] = serde_json::Value::String("cache-refreshed-session".into());
+    std::fs::write(&summary, serde_json::to_vec_pretty(&summary_value).unwrap()).unwrap();
+
+    let after_summary = cache.get_or_parse(&signals).unwrap();
+    assert_eq!(after_summary.records[0].task_id, "cache-refreshed-session");
+
+    summary_value["info"]["cwd"] = serde_json::Value::String(String::new());
+    std::fs::write(&summary, serde_json::to_vec_pretty(&summary_value).unwrap()).unwrap();
+    let without_cwd = cache.get_or_parse(&signals).unwrap();
+    assert!(without_cwd.records[0].folder_path.is_empty());
+
+    let cwd_marker = session.parent().unwrap().join(".cwd");
+    std::fs::write(&cwd_marker, "/workspace/from-marker").unwrap();
+    let with_cwd = cache.get_or_parse(&signals).unwrap();
+    assert_eq!(with_cwd.records[0].folder_path, "/workspace/from-marker");
+
+    std::fs::remove_file(&cwd_marker).unwrap();
+    let after_cwd_removal = cache.get_or_parse(&signals).unwrap();
+    assert!(after_cwd_removal.records[0].folder_path.is_empty());
 }
 
 #[test]
@@ -197,31 +259,29 @@ fn test_file_cache_concurrent_access() {
 #[serial(global_cache)]
 fn test_file_cache_multiple_files() {
     let cache = global_cache();
+    cache.clear();
 
-    let files = vec![
+    let files = [
         "examples/test_conversation_claude_code.jsonl",
         "examples/test_conversation_codex.jsonl",
         "examples/test_conversation_copilot.jsonl",
         "examples/test_conversation_gemini.jsonl",
+        "examples/grok_session/signals.json",
     ];
 
-    let mut successful_parses = 0;
+    let mut parsed_providers = Vec::with_capacity(files.len());
 
     for file_path in files {
         let path = PathBuf::from(file_path);
-        if path.exists() {
-            let result = cache.get_or_parse(&path);
-            if result.is_ok() {
-                successful_parses += 1;
-            }
-        }
+        assert!(path.exists(), "missing committed fixture: {file_path}");
+        let analysis = cache
+            .get_or_parse(&path)
+            .unwrap_or_else(|err| panic!("failed to cache {file_path}: {err}"));
+        parsed_providers.push(analysis.extension_name.clone());
     }
 
-    // Verify that all files were successfully parsed
-    assert!(
-        successful_parses > 0,
-        "At least one file should be parsed successfully"
-    );
+    assert_eq!(parsed_providers.len(), files.len());
+    assert!(parsed_providers.iter().any(|provider| provider == "Grok"));
 }
 
 #[test]

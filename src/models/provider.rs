@@ -30,6 +30,8 @@ pub enum Provider {
     Cursor,
     /// Hermes.
     Hermes,
+    /// xAI Grok CLI.
+    Grok,
     /// Model name matched no known provider prefix.
     Unknown,
 }
@@ -37,11 +39,11 @@ pub enum Provider {
 impl Provider {
     /// Detects the AI provider from a model name using byte-level prefix matching.
     ///
-    /// Recognizes the `claude`, `copilot`, and `gemini` prefixes, and treats
-    /// `gpt*` / `o1*` / `o3*` model names as [`Provider::Codex`]. Matching is
-    /// case-sensitive (lowercase) and operates directly on the UTF-8 bytes, so
-    /// it stays `const` and allocation-free. Returns [`Provider::Unknown`] when
-    /// no prefix matches.
+    /// Recognizes the `claude`, `copilot`, `gemini`, and `grok` prefixes, and
+    /// treats `gpt*` / `o1*` / `o3*` model names as [`Provider::Codex`].
+    /// Matching is case-sensitive (lowercase) and operates directly on the
+    /// UTF-8 bytes, so it stays `const` and allocation-free. Returns
+    /// [`Provider::Unknown`] when no prefix matches.
     ///
     /// # Examples
     ///
@@ -94,6 +96,15 @@ impl Provider {
             return Self::Gemini;
         }
 
+        if bytes.len() >= 4
+            && bytes[0] == b'g'
+            && bytes[1] == b'r'
+            && bytes[2] == b'o'
+            && bytes[3] == b'k'
+        {
+            return Self::Grok;
+        }
+
         // Check for OpenAI/Codex models
         if bytes.len() >= 3 && bytes[0] == b'g' && bytes[1] == b'p' && bytes[2] == b't' {
             return Self::Codex;
@@ -118,6 +129,7 @@ impl Provider {
             Self::OpenCode => "OpenCode",
             Self::Cursor => "Cursor",
             Self::Hermes => "Hermes",
+            Self::Grok => "Grok",
             Self::Unknown => "Unknown",
         }
     }
@@ -157,6 +169,7 @@ mod tests {
             Provider::from_model_name("gemini-2.0-flash"),
             Provider::Gemini
         );
+        assert_eq!(Provider::from_model_name("grok-4.5"), Provider::Grok);
         assert_eq!(
             Provider::from_model_name("unknown-model"),
             Provider::Unknown
@@ -172,6 +185,7 @@ mod tests {
         assert_eq!(Provider::OpenCode.display_name(), "OpenCode");
         assert_eq!(Provider::Cursor.display_name(), "Cursor");
         assert_eq!(Provider::Hermes.display_name(), "Hermes");
+        assert_eq!(Provider::Grok.display_name(), "Grok");
         assert_eq!(Provider::Unknown.display_name(), "Unknown");
     }
 }

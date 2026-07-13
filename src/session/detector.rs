@@ -1,12 +1,13 @@
-//! Content-based provider classification for session JSONL records.
+//! Content-based provider classification for session JSON and JSONL data.
 //!
 //! Given the parsed records from a session file, this module decides which
-//! of the four supported assistants wrote it ([`ExtensionType`]). Two entry
+//! supported assistant wrote it ([`ExtensionType`]). Two entry
 //! points exist for two call shapes: [`detect_extension_type`] commits
 //! eagerly on a fully-materialised slice (the `Vec<Value>` fallback path),
 //! while [`classify_records`] returns `None` on indeterminate input so a
 //! streaming caller can keep peeking lines until a marker appears.
 use crate::models::ExtensionType;
+use crate::session::grok::is_grok_signals;
 use anyhow::{Result, bail};
 use serde_json::Value;
 
@@ -19,6 +20,8 @@ use serde_json::Value;
 /// `type` discriminators just happen to be absent in this slice).
 ///
 /// Detection strategy:
+/// - Grok: a single object with `primaryModelId` + `contextTokensUsed` and
+///   either `contextWindowTokens` or `toolsUsed`
 /// - Gemini: first line is a session-meta record with `sessionId` and
 ///   `projectHash` fields but *no* `messages` array (legacy single-object
 ///   Gemini exports are no longer supported)
@@ -96,6 +99,10 @@ pub fn detect_extension_type(data: &[Value]) -> Result<ExtensionType> {
 /// assert_eq!(classify_records(&with_marker), Some(ExtensionType::ClaudeCode));
 /// ```
 pub fn classify_records(data: &[Value]) -> Option<ExtensionType> {
+    if data.first().is_some_and(is_grok_signals) {
+        return Some(ExtensionType::Grok);
+    }
+
     // JSONL stream: Gemini session-meta header line.
     //
     // Gemini CLI writes one event per line under `chats/`; the very first
@@ -155,7 +162,7 @@ pub fn classify_records(data: &[Value]) -> Option<ExtensionType> {
 
         // Codex rollout logs use a `type` field with one of a small set of
         // enum-like values. Matching any of these is a definitive signal —
-        // none of them overlap with Claude / Gemini / Copilot shapes.
+        // none of them overlap with the other supported session shapes.
         if let Some(t) = obj.get("type").and_then(|v| v.as_str())
             && matches!(
                 t,
@@ -173,6 +180,18 @@ pub fn classify_records(data: &[Value]) -> Option<ExtensionType> {
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    #[test]
+    fn test_detect_grok_signals() {
+        let data = vec![json!({
+            "primaryModelId": "grok-4.5",
+            "contextTokensUsed": 12_345,
+            "contextWindowTokens": 200_000,
+            "toolsUsed": ["read_file"]
+        })];
+
+        assert_eq!(detect_extension_type(&data).unwrap(), ExtensionType::Grok);
+    }
 
     #[test]
     fn test_detect_gemini_jsonl_meta_header() {

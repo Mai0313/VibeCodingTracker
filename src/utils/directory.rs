@@ -125,6 +125,12 @@ where
 /// per session just to have `is_copilot_session_file` reject them.
 pub const COPILOT_SESSION_MAX_DEPTH: usize = 2;
 
+/// Maximum traversal depth for Grok CLI session scans.
+///
+/// Grok writes `$GROK_HOME/sessions/<workspace>/<session>/signals.json`, so
+/// each signals file is exactly three levels below the sessions root.
+pub const GROK_SESSION_MAX_DEPTH: usize = 3;
+
 /// Filter for Codex session files under `~/.codex/sessions/YYYY/MM/DD/`.
 ///
 /// Codex writes `rollout-*.jsonl` files directly into the dated sub-folders.
@@ -218,6 +224,22 @@ pub fn is_copilot_session_file(path: &Path) -> bool {
         .and_then(|p| p.parent())
         .map(|pp| pp.file_name() == Some(std::ffi::OsStr::new("session-state")))
         .unwrap_or(false)
+}
+
+/// Filter for Grok CLI session signal files.
+///
+/// Only `$GROK_HOME/sessions/<workspace>/<session>/signals.json` is a session
+/// entry point. Sibling files such as `summary.json` and `updates.jsonl` are
+/// consumed by the Grok parser after the signals file has been selected.
+pub fn is_grok_session_file(path: &Path) -> bool {
+    if path.file_name() != Some(std::ffi::OsStr::new("signals.json")) {
+        return false;
+    }
+
+    path.parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .is_some_and(|sessions| sessions.file_name() == Some(std::ffi::OsStr::new("sessions")))
 }
 
 /// Returns true if the path is a Claude Code meta sidecar file.
@@ -387,6 +409,50 @@ mod tests {
 
         let path2 = std::path::Path::new("/home/user/.copilot/logs.json");
         assert!(!is_copilot_session_file(path2));
+    }
+
+    #[test]
+    fn test_is_grok_session_file_accepts_exact_layout() {
+        let path =
+            std::path::Path::new("/home/user/.grok/sessions/workspace/session-id/signals.json");
+        assert!(is_grok_session_file(path));
+    }
+
+    #[test]
+    fn test_is_grok_session_file_rejects_siblings_and_nested_files() {
+        let summary =
+            std::path::Path::new("/home/user/.grok/sessions/workspace/session-id/summary.json");
+        let nested = std::path::Path::new(
+            "/home/user/.grok/sessions/workspace/session-id/snapshots/signals.json",
+        );
+        let shallow = std::path::Path::new("/home/user/.grok/sessions/session-id/signals.json");
+
+        assert!(!is_grok_session_file(summary));
+        assert!(!is_grok_session_file(nested));
+        assert!(!is_grok_session_file(shallow));
+    }
+
+    #[test]
+    fn test_grok_max_depth_collects_only_signals_entry_point() {
+        let dir = tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        let session = sessions.join("workspace").join("session-id");
+        let nested = session.join("snapshots");
+        fs::create_dir_all(&nested).unwrap();
+        File::create(session.join("signals.json")).unwrap();
+        File::create(session.join("summary.json")).unwrap();
+        File::create(nested.join("signals.json")).unwrap();
+
+        let files = collect_files_with_max_depth(
+            &sessions,
+            is_grok_session_file,
+            TimeRange::All,
+            Some(GROK_SESSION_MAX_DEPTH),
+        )
+        .unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert!(files[0].path.ends_with("workspace/session-id/signals.json"));
     }
 
     #[test]

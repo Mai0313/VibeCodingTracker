@@ -167,6 +167,7 @@ pub fn calculate_provider_totals_from_per_provider(
     totals.codex.days_count = provider_days.codex;
     totals.copilot.days_count = provider_days.copilot;
     totals.gemini.days_count = provider_days.gemini;
+    totals.grok.days_count = provider_days.grok;
     totals.opencode.days_count = provider_days.opencode;
     totals.cursor.days_count = provider_days.cursor;
     totals.hermes.days_count = provider_days.hermes;
@@ -193,6 +194,12 @@ pub fn calculate_provider_totals_from_per_provider(
     accumulate_provider(
         &mut totals.gemini,
         &per_provider.gemini,
+        pricing_map,
+        ProviderPricing::Litellm,
+    );
+    accumulate_provider(
+        &mut totals.grok,
+        &per_provider.grok,
         pricing_map,
         ProviderPricing::Litellm,
     );
@@ -228,6 +235,7 @@ pub fn calculate_provider_totals_from_per_provider(
         + totals.codex.total_tokens
         + totals.copilot.total_tokens
         + totals.gemini.total_tokens
+        + totals.grok.total_tokens
         + totals.opencode.total_tokens
         + totals.cursor.total_tokens
         + totals.hermes.total_tokens;
@@ -235,6 +243,7 @@ pub fn calculate_provider_totals_from_per_provider(
         + totals.codex.total_cost
         + totals.copilot.total_cost
         + totals.gemini.total_cost
+        + totals.grok.total_cost
         + totals.opencode.total_cost
         + totals.cursor.total_cost
         + totals.hermes.total_cost;
@@ -260,7 +269,7 @@ fn accumulate_provider(
 pub fn build_provider_total_rows(
     totals: &UsageProviderTotals,
 ) -> Vec<ProviderTotal<'_, ProviderStats>> {
-    let mut rows = Vec::with_capacity(8); // max 7 providers + overall
+    let mut rows = Vec::with_capacity(9); // max 8 providers + overall
 
     if totals.claude.days_count > 0 {
         rows.push(ProviderTotal::new(
@@ -284,6 +293,10 @@ pub fn build_provider_total_rows(
 
     if totals.gemini.days_count > 0 {
         rows.push(ProviderTotal::new(Provider::Gemini, &totals.gemini, false));
+    }
+
+    if totals.grok.days_count > 0 {
+        rows.push(ProviderTotal::new(Provider::Grok, &totals.grok, false));
     }
 
     if totals.opencode.days_count > 0 {
@@ -409,6 +422,7 @@ fn resolve_merged_row_cost(
         &per_provider.codex,
         &per_provider.copilot,
         &per_provider.gemini,
+        &per_provider.grok,
     ] {
         if let Some(raw_usage) = usage.get(model) {
             found = true;
@@ -549,6 +563,39 @@ mod tests {
     use super::*;
     use crate::pricing::{ModelPricing, ModelPricingMap, clear_pricing_cache};
     use serde_json::json;
+
+    #[test]
+    fn merged_rows_include_grok_source_cost() {
+        clear_pricing_cache();
+        let mut raw_pricing = std::collections::HashMap::new();
+        raw_pricing.insert(
+            "shared-model".to_string(),
+            ModelPricing {
+                input_cost_per_token: 0.01,
+                ..Default::default()
+            },
+        );
+        let pricing_map = ModelPricingMap::new(raw_pricing);
+        let mut usage_data = UsageResult::default();
+        usage_data.insert("shared-model".to_string(), json!({"input_tokens": 200}));
+        let mut per_provider = PerProviderUsage::default();
+        per_provider
+            .claude
+            .insert("shared-model".to_string(), json!({"input_tokens": 100}));
+        per_provider
+            .grok
+            .insert("shared-model".to_string(), json!({"input_tokens": 100}));
+
+        let summary = build_usage_summary(
+            &usage_data,
+            &per_provider,
+            &ProviderActiveDays::default(),
+            &pricing_map,
+            &StoredCosts::default(),
+        );
+
+        assert!((summary.rows[0].cost - 2.0).abs() < 1e-9);
+    }
 
     #[test]
     fn merged_rows_price_opencode_fallback_only_for_opencode_tokens() {

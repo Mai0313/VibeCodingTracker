@@ -34,7 +34,7 @@ pub fn fixture_str(name: &str) -> String {
 /// A temporary fake home directory plus the [`HelperPaths`] rooted inside it.
 ///
 /// Every provider directory (`.claude`, `.codex`, `.gemini`, `.copilot`,
-/// `.cursor`, `.local/share/opencode`, `.config/cursor`) and the `~/.vct` cache
+/// `.cursor`, `.grok`, `.local/share/opencode`, `.config/cursor`) and the `~/.vct` cache
 /// resolve under `dir`, matching exactly what production would compute for a
 /// user whose `HOME` was this directory.
 pub struct TempHome {
@@ -95,6 +95,38 @@ impl TempHome {
             .join(file);
         Self::write_file(&p, content);
         p
+    }
+
+    /// Drops a Grok session entry point at
+    /// `~/.grok/sessions/<workspace>/<session>/signals.json`.
+    pub fn put_grok_session(&self, workspace: &str, session: &str, content: &str) -> PathBuf {
+        let p = self
+            .paths
+            .grok_session_dir
+            .join(workspace)
+            .join(session)
+            .join("signals.json");
+        Self::write_file(&p, content);
+        p
+    }
+
+    /// Copies the sanitized Grok fixture, including its metadata and update log.
+    pub fn put_grok_fixture_session(&self, workspace: &str, session: &str) -> PathBuf {
+        let signals = self.put_grok_session(
+            workspace,
+            session,
+            &fixture_str("grok_session/signals.json"),
+        );
+        let dir = signals.parent().expect("Grok fixture session directory");
+        Self::write_file(
+            &dir.join("summary.json"),
+            &fixture_str("grok_session/summary.json"),
+        );
+        Self::write_file(
+            &dir.join("updates.jsonl"),
+            &fixture_str("grok_session/updates.jsonl"),
+        );
+        signals
     }
 
     /// Writes an arbitrary file under the fake home (relative to `HOME`).

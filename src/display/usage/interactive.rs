@@ -140,6 +140,8 @@ const USAGE_MIN_H: u16 = 14;
 /// At or above this height the provider/quota band is shown; below it the band
 /// is dropped so the scrollable table keeps a usable height.
 const USAGE_PANELS_MIN_H: u16 = 22;
+/// Minimum combined height reserved for the model table, summary, and controls.
+const USAGE_NON_PANEL_MIN_H: u16 = 10;
 
 /// Displays token usage data in an interactive TUI with auto-refresh.
 ///
@@ -676,7 +678,7 @@ fn row_fingerprint(row: &UsageRow) -> (i64, i64, i64, i64) {
 ///
 /// Kept separate from the refresh loop so both the periodic refresh and a
 /// terminal resize can paint the latest data; `provider_rows` is rebuilt here
-/// (cheap, at most five borrow wrappers) rather than cached, since it borrows
+/// (a small set of borrow wrappers) rather than cached, since it borrows
 /// from `provider_totals`.
 ///
 /// # Errors
@@ -714,8 +716,12 @@ fn render_usage_frame(
         let arrange = arrange_band(area.width, area.height, n);
         // `band_enabled == false` (empty `quota_panels`) drops the whole band, so
         // the scrollable table takes the full height — not just the gauges hidden.
-        let panels_height = (quota.band_enabled && area.height >= USAGE_PANELS_MIN_H)
-            .then(|| band_height(&arrange, provider_rows.len()));
+        let panels_height = visible_band_height(
+            area.height,
+            quota.band_enabled,
+            &arrange,
+            provider_rows.len(),
+        );
         let chunks = main_layout(area, panels_height);
 
         let header = vec![
@@ -1101,13 +1107,28 @@ fn arrange_band(w: u16, area_h: u16, n: usize) -> BandArrange {
 /// The band height fed to `main_layout` (computed before the band `Rect` exists).
 fn band_height(arrange: &BandArrange, provider_rows: usize) -> u16 {
     match arrange {
-        // border(2) + header(1) + header margin(1) + provider rows + share bar(1).
+        // The rendered table omits the overall row already included in
+        // `provider_rows`: border(2) + header/margin(2) + rows(-1) + bar(1).
         BandArrange::SingleRow { table: true } => (provider_rows as u16)
-            .saturating_add(5)
+            .saturating_add(4)
             .max(QUOTA_PANEL_MIN_HEIGHT),
         BandArrange::SingleRow { table: false } => QUOTA_PANEL_MIN_HEIGHT,
         BandArrange::TwoRow { .. } => QUOTA_PANEL_MIN_HEIGHT.saturating_mul(2),
     }
+}
+
+fn visible_band_height(
+    area_height: u16,
+    band_enabled: bool,
+    arrange: &BandArrange,
+    provider_rows: usize,
+) -> Option<u16> {
+    if !band_enabled || area_height < USAGE_PANELS_MIN_H {
+        return None;
+    }
+
+    let height = band_height(arrange, provider_rows);
+    (area_height >= height.saturating_add(USAGE_NON_PANEL_MIN_H)).then_some(height)
 }
 
 /// The band split into an optional table cell plus one cell per present panel.
@@ -1539,6 +1560,21 @@ mod tests {
             BandArrange::SingleRow { table } => assert!(table),
             _ => panic!("expected table-only row"),
         }
+    }
+
+    #[test]
+    fn band_height_preserves_all_provider_rows() {
+        let arrange = BandArrange::SingleRow { table: true };
+
+        assert_eq!(visible_band_height(22, true, &arrange, 8), Some(12));
+        assert_eq!(visible_band_height(22, true, &arrange, 9), None);
+        assert_eq!(visible_band_height(23, true, &arrange, 9), Some(13));
+    }
+
+    #[test]
+    fn disabled_band_stays_hidden() {
+        let arrange = BandArrange::SingleRow { table: true };
+        assert_eq!(visible_band_height(40, false, &arrange, 9), None);
     }
 
     #[test]

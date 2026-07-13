@@ -1,6 +1,6 @@
 //! OpenCode session reader (SQLite, not JSONL).
 //!
-//! Unlike the four file-based providers, OpenCode stores every session in a
+//! Unlike the five file-based providers, OpenCode stores every session in a
 //! single SQLite database at `~/.local/share/opencode/opencode.db` (WAL mode).
 //! This module owns the "SQLite rows -> typed [`CodeAnalysis`]" boundary, so
 //! both the `usage` and `analysis` aggregators consume the same shape the

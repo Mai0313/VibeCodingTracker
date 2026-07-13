@@ -1,0 +1,25 @@
+{
+  "primaryModelId": "grok-test",
+  "modelsUsed": [
+    "grok-test",
+    "grok-secondary"
+  ],
+  "contextTokensUsed": 12345,
+  "contextWindowTokens": 200000,
+  "contextWindowUsage": 6,
+  "totalTokensBeforeCompaction": 90000,
+  "compactionCount": 1,
+  "toolCallCount": 8,
+  "toolFailureCount": 2,
+  "toolsUsed": [
+    "read_file",
+    "grep",
+    "write",
+    "search_replace",
+    "run_terminal_command",
+    "todo_write"
+  ],
+  "futureMetric": {
+    "nested": true
+  }
+}

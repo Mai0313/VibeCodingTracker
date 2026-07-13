@@ -75,6 +75,42 @@ fn merges_multiple_providers_from_paths() {
 }
 
 #[test]
+fn aggregates_grok_context_estimate_without_model_or_compaction_duplication() {
+    let home = TempHome::new();
+    home.put_grok_fixture_session("workspace", "grok-session");
+
+    let data = get_usage_from_paths(&home.paths, TimeRange::All).expect("aggregate Grok");
+    let usage = data.models.get("grok-test").expect("resolved Grok model");
+
+    assert_eq!(usage["input_tokens"], 0);
+    assert_eq!(usage["cache_read_input_tokens"], 12_345);
+    assert!(
+        !data.models.contains_key("grok-secondary"),
+        "session aggregates must not be copied to every model in modelsUsed"
+    );
+    assert_eq!(data.per_provider.grok.get("grok-test"), Some(usage));
+    assert_eq!(data.provider_days.grok, 1);
+    assert_eq!(data.provider_days.total, 1);
+}
+
+#[test]
+fn disabled_grok_provider_is_not_scanned() {
+    let home = TempHome::new();
+    home.put_grok_fixture_session("workspace", "grok-session");
+    let providers = ProvidersConfig {
+        grok: false,
+        ..ProvidersConfig::default()
+    };
+
+    let data = get_usage_from_paths_with(&home.paths, TimeRange::All, providers)
+        .expect("aggregate with Grok disabled");
+
+    assert!(data.models.is_empty());
+    assert!(data.per_provider.grok.is_empty());
+    assert_eq!(data.provider_days.grok, 0);
+}
+
+#[test]
 fn disabled_provider_is_dropped_from_usage_rollup() {
     let home = TempHome::new();
     home.put_claude_session(

@@ -19,7 +19,7 @@
 
 </div>
 
-**Track your AI coding costs in real-time.** Vibe Coding Tracker is a lightweight, high-performance CLI tool built in Rust that monitors and analyzes your Claude Code, Codex, Copilot, Gemini, OpenCode, Cursor, and Hermes usage — with detailed cost breakdowns, token statistics, and code operation insights, all while keeping the memory footprint minimal.
+**Track your AI coding costs in real-time.** Vibe Coding Tracker is a lightweight, high-performance CLI tool built in Rust that monitors and analyzes your Claude Code, Codex, Copilot, Gemini, OpenCode, Cursor, Hermes, and Grok usage — with detailed cost breakdowns, token statistics, and code operation insights, all while keeping the memory footprint minimal.
 
 [English](README.md) | [繁體中文](README.zh-TW.md) | [简体中文](README.zh-CN.md)
 
@@ -48,7 +48,7 @@ Choose your preferred view:
 
 ### Zero Configuration
 
-Automatically detects and processes logs from Claude Code, Codex, Copilot, Gemini, OpenCode, Cursor, and Hermes. No setup required — just run and analyze. A `~/.vct/config.toml` is created with sensible defaults on first run if you ever want to tweak behavior (see [Configuration](#configuration)).
+Automatically detects and processes logs from Claude Code, Codex, Copilot, Gemini, OpenCode, Cursor, Hermes, and Grok. No setup required — just run and analyze. A `~/.vct/config.toml` is created with sensible defaults on first run if you ever want to tweak behavior (see [Configuration](#configuration)).
 
 ### Rich Insights
 
@@ -62,15 +62,15 @@ Automatically detects and processes logs from Claude Code, Codex, Copilot, Gemin
 
 ## Key Features
 
-| Feature               | Description                                                                          |
-| --------------------- | ------------------------------------------------------------------------------------ |
-| **Multi-Provider**    | Claude Code, Codex, Copilot, Gemini, OpenCode, Cursor, and Hermes — all in one place |
-| **Smart Pricing**     | Fuzzy model matching + daily cache from LiteLLM                                      |
-| **4 Display Modes**   | Interactive TUI, static table, plain text, and JSON                                  |
-| **Dual Analysis**     | Token/cost stats (`usage`) + code operation stats (`analysis`)                       |
-| **Live Quota Panels** | Live remaining quota for Claude, Codex, Copilot, and Cursor                          |
-| **Ultra-Lightweight** | Under ~50 MB RSS in the TUI, streaming JSONL parse — built with Rust                 |
-| **Live Updates**      | Auto-refreshing dashboard (every 10s) with change highlighting                       |
+| Feature               | Description                                                             |
+| --------------------- | ----------------------------------------------------------------------- |
+| **Multi-Provider**    | Claude Code, Codex, Copilot, Gemini, OpenCode, Cursor, Hermes, and Grok |
+| **Smart Pricing**     | Fuzzy model matching + daily cache from LiteLLM                         |
+| **4 Display Modes**   | Interactive TUI, static table, plain text, and JSON                     |
+| **Dual Analysis**     | Token/cost stats (`usage`) + code operation stats (`analysis`)          |
+| **Live Quota Panels** | Live remaining quota for Claude, Codex, Copilot, and Cursor             |
+| **Ultra-Lightweight** | Under ~50 MB RSS in the TUI, streaming session parse — built with Rust  |
+| **Live Updates**      | Auto-refreshing dashboard (every 10s) with change highlighting          |
 
 ---
 
@@ -144,7 +144,7 @@ vct <COMMAND> [OPTIONS]
 # Replace with `vibe_coding_tracker` if you are using the full binary name
 
 Commands:
-  analysis    Analyze JSONL conversation files (single file or all sessions)
+  analysis    Analyze local session data (single file or all sessions)
   usage       Display token usage statistics
   version     Display version information
   update      Update to the latest version from GitHub releases
@@ -291,6 +291,9 @@ The tool automatically scans these directories:
 - `~/.local/share/opencode/opencode.db` (OpenCode — SQLite database; honors `$XDG_DATA_HOME`)
 - `~/.cursor/chats/*/*/store.db` (Cursor — SQLite chat stores, used for `analysis` and a local `usage` estimate consistent with the other providers)
 - `~/.hermes/state.db` (Hermes — SQLite database, honors `$HERMES_HOME`; `usage` only)
+- `$GROK_HOME/sessions/*/*/signals.json` (Grok CLI — defaults to `~/.grok`; sibling `updates.jsonl` supplies `analysis` data)
+
+Grok `usage` is one point-in-time local context estimate: vct records `signals.json`'s `contextTokensUsed` as cache-read tokens and estimates cost at the model's cache-read price. It is not cumulative billed usage. `analysis` reconstructs completed Read / Write / Edit / Bash / TodoWrite operations from the sibling `updates.jsonl`. Grok does not support quota panels or `vct fetch`.
 
 ### Live Quota Panels
 
@@ -328,13 +331,13 @@ A panel appears only for a provider whose credentials are present. When four pan
 | Argument / Flag                                | Purpose                                                                                  |
 | ---------------------------------------------- | ---------------------------------------------------------------------------------------- |
 | *(none)*                                       | Interactive TUI dashboard over all sessions                                              |
-| `<FILE>`                                       | Analyze one JSONL/JSON conversation file and print its complete `CodeAnalysis` JSON      |
+| `<FILE>`                                       | Analyze one JSONL/JSON session file and print its complete `CodeAnalysis` JSON           |
 | `--table`                                      | Static summary table with per-provider totals                                            |
 | `--text`                                       | Plain-text summary, script-friendly                                                      |
 | `--json`                                       | Complete parser results as JSON: one object for `<FILE>`, otherwise an array of objects  |
 | `--daily` / `--weekly` / `--monthly` / `--all` | Time range filter for all-session analysis (see table above; not accepted with `<FILE>`) |
 
-See [`examples/`](examples/) for sample inputs and matching JSON outputs for the four JSONL providers represented there.
+See [`examples/`](examples/) for sample inputs and matching JSON outputs for the four JSONL providers, plus the Grok session fixture under [`examples/grok_session/`](examples/grok_session/).
 
 ### Basic Usage
 
@@ -573,6 +576,8 @@ copilot = true
 gemini = true
 opencode = true
 cursor = true
+hermes = true
+grok = true
 
 [logging]
 # Minimum level written to ~/.vct/logs/vct-YYYY-MM-DD.log.
@@ -645,6 +650,7 @@ vct config migrate
 - **Beyond tokens**: Claude web-search tool calls (`server_tool_use.web_search_requests`) are billed per query on top of the token cost; every other model's per-query charge is $0.
 - **OpenCode**: a novel model name is priced from its tokens only on an **exact** LiteLLM match; with no exact match, vct trusts the assistant message's own stored cost instead of guessing from a loosely-similar name.
 - **Hermes**: priced the same way as OpenCode — an **exact** LiteLLM match prices from tokens, otherwise vct uses Hermes's own stored cost.
+- **Grok**: `contextTokensUsed` is priced as cache-read tokens only; this is a point-in-time local context estimate, not cumulative billed usage.
 - **Cache is raw**: the daily cache stores the filtered upstream LiteLLM JSON (not a derived shape), so tiered / batch pricing stays available without re-fetching, and a small in-process LRU keeps repeated lookups cheap during a TUI refresh.
 
 ---

@@ -67,6 +67,11 @@ impl<'a, T> ProviderTotal<'a, T> {
                 RatatuiColor::LightYellow,
                 TableColor::DarkYellow,
             ),
+            Provider::Grok => (
+                Provider::Grok.display_name(),
+                RatatuiColor::LightRed,
+                TableColor::DarkRed,
+            ),
             Provider::Unknown => ("Unknown", RatatuiColor::Gray, TableColor::Grey),
         };
 

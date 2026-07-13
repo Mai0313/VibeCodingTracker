@@ -8,8 +8,9 @@ use crate::session::opencode::read_opencode_analysis_with_diagnostics;
 use crate::session::parser::parse_session_file_as_with_diagnostics;
 use crate::session::state::ParseMode;
 use crate::utils::{
-    COPILOT_SESSION_MAX_DEPTH, HelperPaths, collect_files_with_max_depth, is_claude_session_file,
-    is_codex_session_file, is_copilot_session_file, is_gemini_session_file,
+    COPILOT_SESSION_MAX_DEPTH, GROK_SESSION_MAX_DEPTH, HelperPaths, collect_files_with_max_depth,
+    is_claude_session_file, is_codex_session_file, is_copilot_session_file, is_gemini_session_file,
+    is_grok_session_file,
 };
 use anyhow::Result;
 use rayon::prelude::*;
@@ -94,6 +95,8 @@ pub struct PerProviderAnalysisRows {
     pub copilot: Vec<AggregatedAnalysisRow>,
     /// Rows from the Gemini CLI session directory.
     pub gemini: Vec<AggregatedAnalysisRow>,
+    /// Rows from the Grok CLI session directory.
+    pub grok: Vec<AggregatedAnalysisRow>,
     /// Rows from the OpenCode database.
     pub opencode: Vec<AggregatedAnalysisRow>,
     /// Rows from the Cursor chat stores.
@@ -318,7 +321,7 @@ pub fn aggregate_sessions_by_model_from_paths_with_diagnostics(
 /// Collects the canonical batch-analysis dataset from the current user's home.
 ///
 /// Providers are always appended in this order: Claude, Codex, Copilot,
-/// Gemini, OpenCode, Cursor. `mode` controls only detail retention; every
+/// Gemini, Grok, OpenCode, Cursor. `mode` controls only detail retention; every
 /// scalar counter remains available to downstream projections.
 pub fn collect_analysis_sessions_with(
     time_range: TimeRange,
@@ -422,6 +425,19 @@ where
             is_gemini_session_file,
             time_range,
             None,
+            mode,
+            &mut diagnostics,
+            visitor,
+        )?;
+    }
+
+    if providers.grok && paths.grok_session_dir.exists() {
+        visit_file_sessions(
+            &paths.grok_session_dir,
+            ExtensionType::Grok,
+            is_grok_session_file,
+            time_range,
+            Some(GROK_SESSION_MAX_DEPTH),
             mode,
             &mut diagnostics,
             visitor,
@@ -711,6 +727,7 @@ struct AnalysisProjection {
     codex: FastHashMap<String, AggregatedAnalysisRow>,
     copilot: FastHashMap<String, AggregatedAnalysisRow>,
     gemini: FastHashMap<String, AggregatedAnalysisRow>,
+    grok: FastHashMap<String, AggregatedAnalysisRow>,
     opencode: FastHashMap<String, AggregatedAnalysisRow>,
     cursor: FastHashMap<String, AggregatedAnalysisRow>,
     all_dates: HashSet<String>,
@@ -718,6 +735,7 @@ struct AnalysisProjection {
     codex_dates: HashSet<String>,
     copilot_dates: HashSet<String>,
     gemini_dates: HashSet<String>,
+    grok_dates: HashSet<String>,
     opencode_dates: HashSet<String>,
     cursor_dates: HashSet<String>,
     hermes_dates: HashSet<String>,
@@ -731,6 +749,7 @@ impl AnalysisProjection {
             codex: FastHashMap::with_capacity(capacity::MODELS_PER_SESSION),
             copilot: FastHashMap::with_capacity(capacity::MODELS_PER_SESSION),
             gemini: FastHashMap::with_capacity(capacity::MODELS_PER_SESSION),
+            grok: FastHashMap::with_capacity(capacity::MODELS_PER_SESSION),
             opencode: FastHashMap::with_capacity(capacity::MODELS_PER_SESSION),
             cursor: FastHashMap::with_capacity(capacity::MODELS_PER_SESSION),
             all_dates: HashSet::new(),
@@ -738,6 +757,7 @@ impl AnalysisProjection {
             codex_dates: HashSet::new(),
             copilot_dates: HashSet::new(),
             gemini_dates: HashSet::new(),
+            grok_dates: HashSet::new(),
             opencode_dates: HashSet::new(),
             cursor_dates: HashSet::new(),
             hermes_dates: HashSet::new(),
@@ -756,6 +776,7 @@ impl AnalysisProjection {
             Some(ExtensionType::Codex) => Some(&mut self.codex),
             Some(ExtensionType::Copilot) => Some(&mut self.copilot),
             Some(ExtensionType::Gemini) => Some(&mut self.gemini),
+            Some(ExtensionType::Grok) => Some(&mut self.grok),
             Some(ExtensionType::OpenCode) => Some(&mut self.opencode),
             Some(ExtensionType::Cursor) => Some(&mut self.cursor),
             Some(ExtensionType::Hermes) | None => None,
@@ -780,6 +801,9 @@ impl AnalysisProjection {
             Some(ExtensionType::Gemini) => {
                 self.gemini_dates.insert(date);
             }
+            Some(ExtensionType::Grok) => {
+                self.grok_dates.insert(date);
+            }
             Some(ExtensionType::OpenCode) => {
                 self.opencode_dates.insert(date);
             }
@@ -799,6 +823,7 @@ impl AnalysisProjection {
             codex: self.codex_dates.len(),
             copilot: self.copilot_dates.len(),
             gemini: self.gemini_dates.len(),
+            grok: self.grok_dates.len(),
             opencode: self.opencode_dates.len(),
             cursor: self.cursor_dates.len(),
             hermes: self.hermes_dates.len(),
@@ -811,6 +836,7 @@ impl AnalysisProjection {
                 codex: into_sorted_rows(self.codex),
                 copilot: into_sorted_rows(self.copilot),
                 gemini: into_sorted_rows(self.gemini),
+                grok: into_sorted_rows(self.grok),
                 opencode: into_sorted_rows(self.opencode),
                 cursor: into_sorted_rows(self.cursor),
             },
@@ -825,6 +851,7 @@ fn extension_type_from_name(name: &str) -> Option<ExtensionType> {
         "Codex" => Some(ExtensionType::Codex),
         "Copilot-CLI" => Some(ExtensionType::Copilot),
         "Gemini" => Some(ExtensionType::Gemini),
+        "Grok" => Some(ExtensionType::Grok),
         "OpenCode" => Some(ExtensionType::OpenCode),
         "Cursor" => Some(ExtensionType::Cursor),
         "Hermes" => Some(ExtensionType::Hermes),
