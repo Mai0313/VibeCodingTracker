@@ -21,6 +21,49 @@ use ratatui::{
 };
 use sysinfo::System;
 
+/// Normalizes a process's raw (per-core-summed) CPU usage into a 0-100% share
+/// of the machine by dividing by the CPU count.
+///
+/// `cores` must be the **same basis** sysinfo scales `cpu_usage()` against, i.e.
+/// `sys.cpus().len()` (the host's logical CPUs read from `/proc/stat`). Using
+/// that basis keeps the reading a true machine share even under CPU affinity or
+/// a cgroup CPU quota, where `available_parallelism()` would report a smaller
+/// count and inflate the percentage.
+fn normalized_cpu(raw: f32, cores: f32) -> f32 {
+    (raw / cores).clamp(0.0, 100.0)
+}
+
+/// Refreshes only this process's CPU + memory in `sys` (skipping disk / exe /
+/// tasks), pruning any dead entry. This is the single source of the "our own
+/// process, cheap metrics only" contract shared by every summary-bar refresh —
+/// deliberately narrower than sysinfo's default `refresh_processes`. On Linux it
+/// reads this process's stat plus `/proc/stat` for the CPU-time delta (a couple
+/// of small reads), cheap enough to run on a fast metrics tick. `.with_cpu()`
+/// also populates `sys.cpus()`, which `create_summary` uses to normalize CPU%.
+pub fn refresh_process_metrics(sys: &mut System, pid: sysinfo::Pid) {
+    sys.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        true,
+        sysinfo::ProcessRefreshKind::nothing()
+            .with_cpu()
+            .with_memory(),
+    );
+}
+
+/// One-time init for the summary-bar metrics `System`, called once after
+/// `System::new()` before the refresh loop.
+///
+/// It populates the CPU list (`refresh_cpu_all`) so `create_summary` can read
+/// `sys.cpus().len()` as the CPU% divisor, then primes this process's first
+/// sample. The CPU-list step is **required**: a process-only refresh does not
+/// initialize `sys.cpus()` on macOS, which would leave the divisor at 1 and
+/// over-report CPU%. The list is stable, so it is never refreshed again — the
+/// per-tick path stays [`refresh_process_metrics`].
+pub fn init_process_metrics(sys: &mut System, pid: sysinfo::Pid) {
+    sys.refresh_cpu_all();
+    refresh_process_metrics(sys, pid);
+}
+
 /// Builds the bordered, centered title paragraph for the top of a TUI view.
 pub fn create_title(title_text: &str, color: RatatuiColor) -> Paragraph<'_> {
     Paragraph::new(vec![Line::from(vec![Span::styled(
@@ -35,46 +78,109 @@ pub fn create_title(title_text: &str, color: RatatuiColor) -> Paragraph<'_> {
     .centered()
 }
 
-/// Builds the TUI summary bar from caller-supplied items plus a live memory readout.
+/// Separator drawn between summary-bar segments.
+const SUMMARY_SEP: &str = "  |  ";
+
+/// Display width of an ASCII summary fragment (labels / formatted numbers are
+/// ASCII, so char count equals column count).
+fn seg_width(s: &str) -> usize {
+    s.chars().count()
+}
+
+/// Decides which trailing diagnostic segments fit after the primary items.
+///
+/// `used` is the primary items' width, `available` the content width. Returns
+/// `(show_memory, show_cpu)`: Memory is shown only if it fits, and CPU only if
+/// Memory is also shown and both fit — so on a narrowing bar CPU drops first,
+/// then Memory, and neither is ever clipped mid-word.
+fn fit_diagnostics(
+    used: usize,
+    available: usize,
+    mem_width: usize,
+    cpu_width: usize,
+) -> (bool, bool) {
+    if used + mem_width > available {
+        return (false, false);
+    }
+    (true, used + mem_width + cpu_width <= available)
+}
+
+/// Builds the TUI summary bar from caller-supplied items plus live memory and CPU readouts.
 ///
 /// Each `(icon, value, color)` tuple in `summary_items` becomes a colored,
-/// pipe-separated segment. A `Memory: <n> MB` segment for the current process
-/// `pid` is always appended; it reads `0.0 MB` if `sys` has no entry for `pid`
-/// (e.g. process info was not refreshed). `sys` is expected to have been
+/// pipe-separated segment; these primary items are always rendered. A
+/// `Memory: <n> MB` and a `CPU: <n>%` segment for the current process `pid` are
+/// then appended **only while they fit** within `width` (the summary rect's
+/// width): on a terminal too narrow for the full line the diagnostic segments
+/// degrade gracefully, dropped whole (CPU first, then Memory) instead of
+/// clipped mid-word. They read `0.0` if `sys` has no entry for `pid`. CPU is
+/// normalized to a 0-100% share of the machine. `sys` is expected to have been
 /// refreshed by the caller before this call.
 pub fn create_summary<'a>(
     summary_items: Vec<(&'a str, &'a str, RatatuiColor)>, // (icon, value, color) tuples
     sys: &'a System,
     pid: sysinfo::Pid,
+    width: u16,
 ) -> Paragraph<'a> {
-    let mut spans = Vec::new();
+    // Content sits inside the block's borders, which take one column each side.
+    let available = width.saturating_sub(2) as usize;
 
-    // Add summary items
+    let mut spans = Vec::new();
+    let mut used = 0usize;
+
+    // Primary items are always shown (they clip only on an extremely narrow bar).
     for (i, (icon, value, color)) in summary_items.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::raw("  |  "));
+            spans.push(Span::raw(SUMMARY_SEP));
+            used += seg_width(SUMMARY_SEP);
         }
-        spans.push(Span::styled(
-            format!("{} ", icon),
-            Style::default().fg(*color).bold(),
-        ));
+        let label = format!("{} ", icon);
+        used += seg_width(&label) + seg_width(value);
+        spans.push(Span::styled(label, Style::default().fg(*color).bold()));
         spans.push(Span::styled(*value, Style::default().fg(*color).bold()));
     }
 
-    // Add memory usage for this process
+    // Diagnostic segments for this process. Both are measured up front; how
+    // many actually render is decided by `fit_diagnostics` (CPU drops first).
     let memory_mb = sys
         .process(pid)
         .map_or(0.0, |p| p.memory() as f64 / 1024.0 / 1024.0);
+    let mem_value = format!("{:.1} MB", memory_mb);
+    let mem_width = seg_width(SUMMARY_SEP) + seg_width("Memory: ") + seg_width(&mem_value);
 
-    spans.push(Span::raw("  |  "));
-    spans.push(Span::styled(
-        "Memory: ",
-        Style::default().fg(RatatuiColor::LightRed).bold(),
-    ));
-    spans.push(Span::styled(
-        format!("{:.1} MB", memory_mb),
-        Style::default().fg(RatatuiColor::LightYellow).bold(),
-    ));
+    // CPU normalized to a 0-100% machine share. Divide by `sys.cpus().len()`
+    // (sysinfo's own basis, populated by `init_process_metrics`); `.max(1)`
+    // guards the empty-CPU-list case.
+    let cores = sys.cpus().len().max(1) as f32;
+    let cpu_percent = sys
+        .process(pid)
+        .map_or(0.0, |p| normalized_cpu(p.cpu_usage(), cores));
+    let cpu_value = format!("{:.1}%", cpu_percent);
+    let cpu_width = seg_width(SUMMARY_SEP) + seg_width("CPU: ") + seg_width(&cpu_value);
+
+    let (show_mem, show_cpu) = fit_diagnostics(used, available, mem_width, cpu_width);
+    if show_mem {
+        spans.push(Span::raw(SUMMARY_SEP));
+        spans.push(Span::styled(
+            "Memory: ",
+            Style::default().fg(RatatuiColor::LightRed).bold(),
+        ));
+        spans.push(Span::styled(
+            mem_value,
+            Style::default().fg(RatatuiColor::LightYellow).bold(),
+        ));
+    }
+    if show_cpu {
+        spans.push(Span::raw(SUMMARY_SEP));
+        spans.push(Span::styled(
+            "CPU: ",
+            Style::default().fg(RatatuiColor::LightRed).bold(),
+        ));
+        spans.push(Span::styled(
+            cpu_value,
+            Style::default().fg(RatatuiColor::LightYellow).bold(),
+        ));
+    }
 
     Paragraph::new(vec![Line::from(spans)])
         .block(
@@ -388,4 +494,37 @@ pub fn create_provider_row<'a>(
     };
 
     RatatuiRow::new(cells).style(style)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fit_diagnostics, normalized_cpu};
+
+    #[test]
+    fn normalized_cpu_divides_by_cores_and_clamps() {
+        // Two fully-used cores on a 4-core machine -> 50% of the machine.
+        assert!((normalized_cpu(200.0, 4.0) - 50.0).abs() < f32::EPSILON);
+        // Idle stays at 0%.
+        assert_eq!(normalized_cpu(0.0, 8.0), 0.0);
+        // A transient over-count (all cores summed above 100%) is clamped.
+        assert_eq!(normalized_cpu(410.0, 4.0), 100.0);
+    }
+
+    #[test]
+    fn fit_diagnostics_drops_cpu_before_memory() {
+        let (mem, cpu) = (20usize, 15usize); // realistic segment widths
+        let used = 56; // primary items
+
+        // Wide bar: both fit.
+        assert_eq!(fit_diagnostics(used, 91, mem, cpu), (true, true));
+        // Exactly enough for Memory but not CPU (the common ~80-col case).
+        assert_eq!(fit_diagnostics(used, used + mem, mem, cpu), (true, false));
+        assert_eq!(fit_diagnostics(used, 78, mem, cpu), (true, false));
+        // Too narrow even for Memory: both drop, never a lone CPU.
+        assert_eq!(
+            fit_diagnostics(used, used + mem - 1, mem, cpu),
+            (false, false)
+        );
+        assert_eq!(fit_diagnostics(used, 60, mem, cpu), (false, false));
+    }
 }

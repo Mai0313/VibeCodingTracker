@@ -11,8 +11,9 @@
 use crate::config::ProvidersConfig;
 use crate::display::common::ProviderTotal;
 use crate::display::common::table::{
-    create_controls, create_provider_row, create_ratatui_table, create_summary, main_layout,
-    render_scrollable_table, render_too_small, styled_row,
+    create_controls, create_provider_row, create_ratatui_table, create_summary,
+    init_process_metrics, main_layout, refresh_process_metrics, render_scrollable_table,
+    render_too_small, styled_row,
 };
 use crate::display::common::tui::{
     InputAction, RefreshState, ScrollState, UpdateTracker, handle_input, overlay_repo_hyperlink,
@@ -321,10 +322,14 @@ pub fn display_usage_interactive(
     // `System::new_all` would load every process, disk and network on the
     // machine (tens of MB on a busy host). We only read our own process
     // stats, so start from an empty `System` and populate it with just our
-    // pid on every refresh. `remove_dead_processes: true` ensures no stale
-    // entries linger across refreshes.
+    // pid (CPU + memory only) on every refresh. `remove_dead_processes: true`
+    // ensures no stale entries linger across refreshes.
     let mut sys = System::new();
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+    init_process_metrics(&mut sys, pid);
+    // Lightweight CPU/memory sampling runs on its own fast cadence, decoupled
+    // from the heavier session re-aggregation below.
+    let metrics_interval = Duration::from_millis(crate::constants::refresh::METRICS_REFRESH_MS);
+    let mut last_metrics = Instant::now();
 
     let mut usage_data = UsageResult::default();
     let mut per_provider_usage = PerProviderUsage::default();
@@ -377,11 +382,11 @@ pub fn display_usage_interactive(
         if refresh_state.should_refresh() {
             refresh_state.mark_refreshed();
 
-            // Only refresh our own process entry and prune any that have died.
-            // Per-process CPU usage is updated as part of `refresh_processes`, so
-            // the former `refresh_cpu_all()` (which scans every CPU system-wide)
-            // is not needed here.
-            sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+            // Only refresh our own process entry (CPU + memory) and prune any
+            // that have died. Per-process CPU usage is updated as part of this
+            // refresh, so the former `refresh_cpu_all()` (which scans every CPU
+            // system-wide) is not needed here.
+            refresh_process_metrics(&mut sys, pid);
 
             match crate::usage::get_usage_from_directories_with(time_range, providers) {
                 Ok(data) => {
@@ -516,6 +521,36 @@ pub fn display_usage_interactive(
             // call glibc keeps them as internal free lists and RSS climbs by
             // ~6 MB every refresh on a 219-session directory.
             crate::utils::release_freed_heap();
+
+            // This heavy path already repainted with fresh metrics, so restart
+            // the light-tick timer to avoid an immediate redundant redraw.
+            last_metrics = Instant::now();
+        } else if last_metrics.elapsed() >= metrics_interval {
+            // Lightweight metrics tick: re-sample only our own process (cheap)
+            // and repaint the cached rows so the CPU/memory readout stays live
+            // without re-scanning any session directory.
+            last_metrics = Instant::now();
+            refresh_process_metrics(&mut sys, pid);
+            let view = current_view(merge_enabled, &rows_data, &display_rows);
+            render_usage_frame(
+                &mut terminal,
+                view,
+                &totals,
+                &provider_totals,
+                &update_tracker,
+                &sys,
+                pid,
+                &QuotaView {
+                    claude: &claude_snapshot,
+                    codex: &codex_snapshot,
+                    copilot: &copilot_snapshot,
+                    cursor: &cursor_snapshot,
+                    present,
+                    band_enabled,
+                },
+                &mut scroll,
+                merge_enabled,
+            )?;
         }
 
         let action = handle_input()?;
@@ -892,7 +927,7 @@ fn render_usage_frame(
             ("Models:", entries_str.as_str(), RatatuiColor::Blue),
         ];
 
-        let summary = create_summary(summary_items, sys, pid);
+        let summary = create_summary(summary_items, sys, pid, chunks.summary.width);
         f.render_widget(summary, chunks.summary);
 
         // When merged, the toggle un-merges, so label it "split" to match.
