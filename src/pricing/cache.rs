@@ -1,8 +1,8 @@
 use crate::utils::{
-    find_pricing_cache_for_date_in, get_current_date, get_pricing_cache_path_in,
-    list_pricing_cache_files_in,
+    find_pricing_cache_for_date_in, get_pricing_cache_path_in, list_pricing_cache_files_in,
 };
 use anyhow::{Context, Result};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
@@ -375,12 +375,16 @@ pub fn build_filtered_cost_json(raw: &Value) -> Value {
     Value::Object(filtered_map)
 }
 
+pub(crate) fn pricing_cache_date() -> String {
+    Utc::now().date_naive().format("%Y-%m-%d").to_string()
+}
+
 /// Removes outdated pricing cache files in `dir`, keeping only today's cache.
 ///
 /// Best-effort: a failure to list or delete a file is logged or ignored rather
 /// than propagated, since a stale cache file is harmless and rotates out daily.
 pub fn cleanup_old_cache_in(dir: &Path) {
-    let today = get_current_date();
+    let today = pricing_cache_date();
 
     for (filename, path) in list_pricing_cache_files_in(dir) {
         if !filename.contains(&today) {
@@ -410,16 +414,21 @@ pub fn cleanup_old_cache_in(dir: &Path) {
 /// # Errors
 ///
 /// Returns an error if no cache file exists for today, the file cannot be
-/// read, its contents are not valid JSON, or the file is in the pre-Phase-2
-/// legacy schema (deliberately treated as an error to force a refetch).
+/// read, its contents are not valid JSON, it contains no priced model, or the
+/// file is in the pre-Phase-2 legacy schema (deliberately treated as an error
+/// to force a refetch).
 pub fn load_from_cache_in(dir: &Path) -> Result<HashMap<String, ModelPricing>> {
-    let today = get_current_date();
+    let today = pricing_cache_date();
     let cache_path = find_pricing_cache_for_date_in(dir, &today)
         .ok_or_else(|| anyhow::anyhow!("No cache file found for today"))?;
 
     let content = fs::read_to_string(&cache_path).context("Failed to read cached pricing file")?;
     let raw: Value =
         serde_json::from_str(&content).context("Failed to parse cached pricing JSON")?;
+
+    if !raw.is_object() {
+        anyhow::bail!("cached pricing JSON must be an object");
+    }
 
     if looks_like_legacy_pricing_cache(&raw) {
         log::warn!(
@@ -429,7 +438,15 @@ pub fn load_from_cache_in(dir: &Path) -> Result<HashMap<String, ModelPricing>> {
         anyhow::bail!("legacy pricing cache format detected, forcing refetch");
     }
 
-    Ok(parse_litellm_pricing_map(raw))
+    let parsed = parse_litellm_pricing_map(raw);
+    if !pricing_rates_are_valid(&parsed) {
+        anyhow::bail!("cached pricing JSON contains a negative or non-finite price");
+    }
+    let pricing = normalize_pricing(parsed);
+    if pricing.is_empty() {
+        anyhow::bail!("cached pricing JSON has no priced models");
+    }
+    Ok(pricing)
 }
 
 /// Heuristic: does this cache file look like a pre-Phase-2 serialised
@@ -461,64 +478,95 @@ fn looks_like_legacy_pricing_cache(raw: &Value) -> bool {
 ///
 /// # Errors
 ///
-/// Returns an error if the JSON cannot be serialized or the file cannot be
-/// written. Cleanup of old cache files runs only after a successful write and
-/// swallows its own errors.
+/// Returns an error if the JSON cannot be serialized or atomically written.
+/// Cleanup of old cache files runs only after a successful write and swallows
+/// its own errors.
 pub fn save_to_cache_in(dir: &Path, filtered_raw: &Value) -> Result<()> {
-    let today = get_current_date();
+    let today = pricing_cache_date();
     let cache_path = get_pricing_cache_path_in(dir, &today);
 
-    let pricing_json =
-        serde_json::to_string_pretty(filtered_raw).context("Failed to serialize pricing data")?;
-    fs::write(&cache_path, pricing_json).context("Failed to write pricing cache file")?;
+    crate::utils::write_json_atomic_pretty(&cache_path, filtered_raw)
+        .context("Failed to write pricing cache file")?;
 
     cleanup_old_cache_in(dir);
     Ok(())
 }
 
-/// Filters out models whose every pricing field is zero (unpriced / free).
+/// Filters out models whose every pricing field is zero (unpriced / free) or
+/// whose usable pricing fields contain an invalid rate.
 ///
-/// A model is kept if **any** of the following yields a non-zero price:
+/// A model is kept if **any** of the following yields a positive price:
 /// - The base-level per-token costs.
-/// - Any tier entry (`ThresholdTier`) with at least one non-zero field.
-/// - Any range entry (`TierRange`) with at least one non-zero field.
+/// - Any tier entry (`ThresholdTier`) with at least one positive field.
+/// - Any range entry (`TierRange`) with at least one positive field.
 ///
-/// Models are dropped only when every strategy they publish is entirely zero;
-/// this preserves synthetic models that ship tier or range data without base
-/// prices, while still excluding free / placeholder entries from LiteLLM.
+/// Models are dropped when every strategy they publish is entirely zero or any
+/// usable rate is negative or non-finite. This preserves synthetic models that
+/// ship tier or range data without base prices while excluding invalid, free,
+/// and placeholder entries from LiteLLM.
 pub fn normalize_pricing(
     mut pricing: HashMap<String, ModelPricing>,
 ) -> HashMap<String, ModelPricing> {
     pricing.retain(|_name, p| {
-        let has_base = p.input_cost_per_token != 0.0
-            || p.output_cost_per_token != 0.0
-            || p.cache_read_input_token_cost != 0.0
-            || p.cache_creation_input_token_cost != 0.0
-            || p.cache_creation_input_token_cost_above_1hr != 0.0
-            || p.output_cost_per_reasoning_token != 0.0
-            || p.web_search_cost_per_query != 0.0;
-        let has_nonzero_tier = p.tiers.iter().any(|t| {
-            t.input_cost_per_token != 0.0
-                || t.output_cost_per_token != 0.0
-                || t.cache_read_input_token_cost != 0.0
-                || t.cache_creation_input_token_cost != 0.0
-                || t.cache_creation_input_token_cost_above_1hr != 0.0
+        let has_base = p.input_cost_per_token > 0.0
+            || p.output_cost_per_token > 0.0
+            || p.cache_read_input_token_cost > 0.0
+            || p.cache_creation_input_token_cost > 0.0
+            || p.cache_creation_input_token_cost_above_1hr > 0.0
+            || p.output_cost_per_reasoning_token > 0.0
+            || p.web_search_cost_per_query > 0.0;
+        let has_positive_tier = p.tiers.iter().any(|t| {
+            t.input_cost_per_token > 0.0
+                || t.output_cost_per_token > 0.0
+                || t.cache_read_input_token_cost > 0.0
+                || t.cache_creation_input_token_cost > 0.0
+                || t.cache_creation_input_token_cost_above_1hr > 0.0
         });
-        let has_nonzero_range = p
+        let has_positive_range = p
             .ranges
             .as_ref()
             .map(|rs| {
                 rs.iter().any(|r| {
-                    r.input_cost_per_token != 0.0
-                        || r.output_cost_per_token != 0.0
-                        || r.cache_read_input_token_cost != 0.0
-                        || r.output_cost_per_reasoning_token != 0.0
+                    r.input_cost_per_token > 0.0
+                        || r.output_cost_per_token > 0.0
+                        || r.cache_read_input_token_cost > 0.0
+                        || r.output_cost_per_reasoning_token > 0.0
                 })
             })
             .unwrap_or(false);
-        has_base || has_nonzero_tier || has_nonzero_range
+        model_pricing_rates_are_valid(p) && (has_base || has_positive_tier || has_positive_range)
     });
     pricing
+}
+
+pub(crate) fn pricing_rates_are_valid(pricing: &HashMap<String, ModelPricing>) -> bool {
+    pricing.values().all(model_pricing_rates_are_valid)
+}
+
+fn model_pricing_rates_are_valid(pricing: &ModelPricing) -> bool {
+    let valid = |rate: f64| rate.is_finite() && rate >= 0.0;
+    valid(pricing.input_cost_per_token)
+        && valid(pricing.output_cost_per_token)
+        && valid(pricing.cache_read_input_token_cost)
+        && valid(pricing.cache_creation_input_token_cost)
+        && valid(pricing.cache_creation_input_token_cost_above_1hr)
+        && valid(pricing.output_cost_per_reasoning_token)
+        && valid(pricing.web_search_cost_per_query)
+        && pricing.tiers.iter().all(|tier| {
+            valid(tier.input_cost_per_token)
+                && valid(tier.output_cost_per_token)
+                && valid(tier.cache_read_input_token_cost)
+                && valid(tier.cache_creation_input_token_cost)
+                && valid(tier.cache_creation_input_token_cost_above_1hr)
+        })
+        && pricing.ranges.as_ref().is_none_or(|ranges| {
+            ranges.iter().all(|range| {
+                valid(range.input_cost_per_token)
+                    && valid(range.output_cost_per_token)
+                    && valid(range.cache_read_input_token_cost)
+                    && valid(range.output_cost_per_reasoning_token)
+            })
+        })
 }
 
 #[cfg(test)]
