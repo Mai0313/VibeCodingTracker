@@ -57,6 +57,19 @@ curl -s https://auth.openai.com/oauth/token \
     -d "$(jq -nc --arg rt "$(jq -r .tokens.refresh_token "$AUTH")" '{client_id:"app_EMoamEEZ73f0CkXaXp7hrann", grant_type:"refresh_token", refresh_token:$rt}')" | jq
 ```
 
+### Check reset expired time
+
+```bash
+TOKEN=$(jq -r '.tokens.access_token' ~/.codex/auth.json)
+ACCOUNT_ID=$(jq -r '.tokens.account_id' ~/.codex/auth.json)
+
+curl -s -X GET "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits" \
+    -H "Authorization: Bearer ${TOKEN}" \
+    -H "ChatGPT-Account-Id: ${ACCOUNT_ID}" \
+    -H "originator: codex_cli_rs" \
+    -H "User-Agent: codex_cli_rs/0.142.5 (linux; x86_64)" | jq
+```
+
 Response carries `access_token` / `refresh_token` / `id_token`; write them back into `.tokens`.
 The `refresh_token` rotates. `auth.json` has no expiry field, so refresh is reactive-only (fire on a 401).
 
