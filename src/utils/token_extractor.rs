@@ -207,12 +207,25 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
             }
         }
 
-        // Calculate total if not provided
-        counts.total = counts.input_tokens
+        // Flat providers may publish tool-only tokens that have no separate
+        // LiteLLM billing bucket. Keep them in the displayed/activity total
+        // without assigning them an input or output price. Prefer a larger
+        // provider-published total when present so these sessions do not look
+        // inactive merely because every priced bucket is zero.
+        let tool_tokens = usage_obj
+            .get("tool_tokens")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(0);
+        let derived_total = counts.input_tokens
             + counts.output_tokens
             + counts.reasoning_tokens
             + counts.cache_read
-            + counts.cache_creation;
+            + counts.cache_creation
+            + tool_tokens;
+        counts.total = usage_obj
+            .get("total_tokens")
+            .and_then(|value| value.as_i64())
+            .map_or(derived_total, |published| published.max(derived_total));
     }
 
     counts
@@ -387,9 +400,22 @@ mod tests {
         assert_eq!(c.input_tokens, 13_906);
         assert_eq!(c.output_tokens, 185);
         assert_eq!(c.reasoning_tokens, 306);
-        // Our recomputed total includes reasoning (tool_tokens are not
-        // accounted for — we never bill against them).
-        assert_eq!(c.total, 13_906 + 185 + 306);
+        assert_eq!(c.total, 14_397);
+    }
+
+    #[test]
+    fn gemini_tool_only_usage_remains_active() {
+        let usage = json!({
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "thoughts_tokens": 0,
+            "tool_tokens": 5,
+            "total_tokens": 5
+        });
+        let counts = extract_token_counts(&usage);
+        assert_eq!(counts.total, 5);
+        assert_eq!(counts.input_tokens, 0);
+        assert_eq!(counts.output_tokens, 0);
     }
 
     #[test]

@@ -23,15 +23,19 @@ use crate::VERSION;
 use crate::cli::TimeRange;
 use crate::constants::FastHashMap;
 use crate::models::{CodeAnalysis, CodeAnalysisRecord, ExtensionType};
-use crate::session::diagnostics::DatabaseAnalysisRow;
+use crate::session::diagnostics::{
+    DatabaseAnalysisRow, DatabaseUsageRead, UsageContribution, UsageTokenContribution,
+};
+use crate::session::sqlite::with_readonly_connection;
 use crate::session::state::{ParseMode, SessionParseState};
 use crate::utils::{get_current_user, get_machine_id};
-use anyhow::{Context, Result, anyhow};
-use rusqlite::{Connection, OpenFlags};
-use serde_json::{Value, json};
+use anyhow::{Result, anyhow};
+use rusqlite::Connection;
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use std::collections::HashMap;
-use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Reads per-session token usage from the OpenCode database.
 ///
@@ -49,7 +53,36 @@ pub fn read_opencode_usage(
     db_path: &Path,
     time_range: TimeRange,
 ) -> Result<Vec<(String, CodeAnalysis, f64)>> {
-    with_connection(db_path, |conn| collect_usage(conn, time_range))
+    let user = get_current_user();
+    let machine = get_machine_id().to_string();
+    let read = read_opencode_usage_contributions(db_path, time_range)?;
+    if read.expected_records > 0 && read.parsed_records == 0 {
+        return Err(anyhow!(
+            "none of {} OpenCode usage records used a recognized schema",
+            read.expected_records
+        ));
+    }
+    if read.failed_records() > 0 {
+        log::warn!(
+            "{} OpenCode usage records used an unsupported schema",
+            read.failed_records()
+        );
+    }
+    Ok(read
+        .rows
+        .into_iter()
+        .map(|row| row.into_public_row(ExtensionType::OpenCode, &user, &machine))
+        .collect())
+}
+
+/// Reads compact OpenCode usage rows for the summary aggregation path.
+pub(crate) fn read_opencode_usage_contributions(
+    db_path: &Path,
+    time_range: TimeRange,
+) -> Result<DatabaseUsageRead> {
+    with_readonly_connection(db_path, "session", "vct-opencode-", "OpenCode", |conn| {
+        collect_usage(conn, time_range)
+    })
 }
 
 /// Reads per-session file-operation metrics from the OpenCode database.
@@ -112,7 +145,7 @@ pub(crate) fn read_opencode_analysis_with_diagnostics(
     time_range: TimeRange,
     mode: ParseMode,
 ) -> Result<OpenCodeAnalysisRead> {
-    with_connection(db_path, |conn| {
+    with_readonly_connection(db_path, "session", "vct-opencode-", "OpenCode", |conn| {
         let transaction = conn.unchecked_transaction()?;
         let expected_records = count_analysis_candidates(&transaction, time_range)?;
         let collected = collect_analysis(&transaction, time_range, mode)?;
@@ -130,7 +163,7 @@ pub(crate) fn read_opencode_analysis_with_diagnostics(
 /// Parsed usage for one OpenCode assistant message.
 struct MessageUsage {
     model_id: String,
-    usage: Value,
+    usage: UsageTokenContribution,
     cost: f64,
     timestamp: Option<i64>,
 }
@@ -192,10 +225,7 @@ fn count_analysis_candidates(conn: &Connection, time_range: TimeRange) -> Result
 }
 
 /// Collects the `usage` view from assistant messages when available.
-fn collect_usage(
-    conn: &Connection,
-    time_range: TimeRange,
-) -> Result<Vec<(String, CodeAnalysis, f64)>> {
+fn collect_usage(conn: &Connection, time_range: TimeRange) -> Result<DatabaseUsageRead> {
     if table_exists(conn, "message")? {
         return collect_message_usage(conn, time_range);
     }
@@ -204,12 +234,7 @@ fn collect_usage(
 }
 
 /// Collects the `usage` view from the legacy `session` columns.
-fn collect_session_usage(
-    conn: &Connection,
-    time_range: TimeRange,
-) -> Result<Vec<(String, CodeAnalysis, f64)>> {
-    let user = get_current_user();
-    let machine = get_machine_id().to_string();
+fn collect_session_usage(conn: &Connection, time_range: TimeRange) -> Result<DatabaseUsageRead> {
     let cutoff = cutoff_string(time_range);
     let cutoff_ms = cutoff_millis(time_range);
 
@@ -232,7 +257,9 @@ fn collect_session_usage(
     };
 
     let mut out = Vec::new();
+    let mut expected_records = 0usize;
     while let Some(row) = rows.next()? {
+        expected_records += 1;
         let model = row.get::<_, String>(0)?;
         let input = row.get::<_, i64>(1)?;
         let output = row.get::<_, i64>(2)?;
@@ -251,29 +278,25 @@ fn collect_session_usage(
             continue;
         }
 
-        let usage = session_usage_value(input, output, reasoning, cache_read, cache_write);
-        let mut map = FastHashMap::default();
-        map.insert(model_id, usage);
-
-        let mut state = SessionParseState::with_mode(ParseMode::UsageOnly);
-        state.last_ts = time_updated;
-        out.push((
+        out.push(UsageContribution::single_model(
             date,
-            wrap_record(state.into_record(map), &user, &machine),
+            time_updated,
+            model_id,
+            session_usage_value(input, output, reasoning, cache_read, cache_write),
             cost,
         ));
     }
 
-    Ok(out)
+    let parsed_records = out.len();
+    Ok(DatabaseUsageRead {
+        rows: out,
+        expected_records,
+        parsed_records,
+    })
 }
 
 /// Collects the `usage` view from assistant messages.
-fn collect_message_usage(
-    conn: &Connection,
-    time_range: TimeRange,
-) -> Result<Vec<(String, CodeAnalysis, f64)>> {
-    let user = get_current_user();
-    let machine = get_machine_id().to_string();
+fn collect_message_usage(conn: &Connection, time_range: TimeRange) -> Result<DatabaseUsageRead> {
     let cutoff = cutoff_string(time_range);
     let cutoff_ms = cutoff_millis(time_range);
 
@@ -303,7 +326,9 @@ fn collect_message_usage(
     };
 
     let mut out = Vec::new();
+    let mut expected_records = 0usize;
     while let Some(row) = rows.next()? {
+        expected_records += 1;
         let session_ts = row.get::<_, i64>(0)?;
         let data_text = row.get::<_, String>(1)?;
         let Some(message) = parse_message_usage(&data_text) else {
@@ -317,19 +342,21 @@ fn collect_message_usage(
             continue;
         }
 
-        let mut map = FastHashMap::default();
-        map.insert(message.model_id, message.usage);
-
-        let mut state = SessionParseState::with_mode(ParseMode::UsageOnly);
-        state.last_ts = message_ts;
-        out.push((
+        out.push(UsageContribution::single_model(
             date,
-            wrap_record(state.into_record(map), &user, &machine),
+            message_ts,
+            message.model_id,
+            message.usage,
             message.cost,
         ));
     }
 
-    Ok(out)
+    let parsed_records = out.len();
+    Ok(DatabaseUsageRead {
+        rows: out,
+        expected_records,
+        parsed_records,
+    })
 }
 
 /// Collects the `analysis` view from assistant messages + parts when available.
@@ -395,7 +422,8 @@ fn collect_session_analysis(
                 continue;
             };
 
-            let usage = session_usage_value(input, output, reasoning, cache_read, cache_write);
+            let usage =
+                session_usage_value(input, output, reasoning, cache_read, cache_write).into_value();
             let mut state = SessionParseState::with_mode(mode);
             state.folder_path = directory;
             state.task_id = id.clone();
@@ -545,7 +573,7 @@ fn collect_message_analysis(
                 AnalysisAccum {
                     model_id: message.model_id,
                     date,
-                    usage: message.usage,
+                    usage: message.usage.into_value(),
                     state,
                 },
             );
@@ -860,14 +888,14 @@ fn session_usage_value(
     reasoning: i64,
     cache_read: i64,
     cache_write: i64,
-) -> Value {
-    json!({
-        "input_tokens": input,
-        "output_tokens": output,
-        "cache_read_input_tokens": cache_read,
-        "cache_creation_input_tokens": cache_write,
-        "reasoning_output_tokens": reasoning,
-    })
+) -> UsageTokenContribution {
+    UsageTokenContribution {
+        input_tokens: input,
+        output_tokens: output,
+        reasoning_tokens: reasoning,
+        cache_read_tokens: cache_read,
+        cache_creation_tokens: cache_write,
+    }
 }
 
 /// Resolves the model name from the `session.model` column.
@@ -927,7 +955,7 @@ fn parse_message_usage(raw: &str) -> Option<MessageUsage> {
     })
 }
 
-fn parse_message_tokens(tokens: &Value) -> Option<Value> {
+fn parse_message_tokens(tokens: &Value) -> Option<UsageTokenContribution> {
     let tokens = tokens.as_object()?;
     let read_i64 = |object: &serde_json::Map<String, Value>, key: &str| -> Option<i64> {
         match object.get(key) {
@@ -1156,83 +1184,10 @@ fn wrap_record(record: CodeAnalysisRecord, user: &str, machine: &str) -> CodeAna
     }
 }
 
-/// Opens the OpenCode DB read-only and runs `f` against it.
-///
-/// The primary path opens the database read-only so the user's file is never
-/// mutated. A read-only connection reads a WAL database fine on modern SQLite,
-/// but if that ever fails (e.g. the WAL needs recovery and cannot be locked
-/// read-only) we fall back to copying the database plus its `-wal`/`-shm`
-/// sidecars into a private temp directory and reading the copy. The temp copy
-/// is removed when `f` returns.
-fn with_connection<T>(db_path: &Path, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-    if let Ok(conn) = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        && conn
-            .query_row("SELECT count(*) FROM session", [], |_| Ok(()))
-            .is_ok()
-    {
-        return f(&conn);
-    }
-
-    // Fallback: read from a throwaway copy that includes the WAL sidecars.
-    let copy = TempDbCopy::new(db_path)?;
-    let conn = Connection::open_with_flags(&copy.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| {
-            format!(
-                "Failed to open OpenCode DB copy at {}",
-                copy.db_path.display()
-            )
-        })?;
-    f(&conn)
-}
-
-/// A private temp-directory copy of the OpenCode database (plus WAL sidecars),
-/// removed on drop.
-///
-/// The directory comes from [`tempfile::TempDir`], so it has an unguessable
-/// name and owner-only permissions: the copied chat database is never exposed
-/// to other local users.
-struct TempDbCopy {
-    _dir: tempfile::TempDir,
-    db_path: PathBuf,
-}
-
-impl TempDbCopy {
-    fn new(src: &Path) -> Result<Self> {
-        let file_name = src
-            .file_name()
-            .ok_or_else(|| anyhow!("Invalid OpenCode DB path: {}", src.display()))?;
-        let dir = tempfile::Builder::new()
-            .prefix("vct-opencode-")
-            .tempdir()
-            .context("Failed to create temp dir for OpenCode DB copy")?;
-
-        let db_path = dir.path().join(file_name);
-        std::fs::copy(src, &db_path)
-            .with_context(|| format!("Failed to copy OpenCode DB from {}", src.display()))?;
-
-        // Best-effort copy of the WAL sidecars so recently committed rows are
-        // visible; absence is fine for a checkpointed database.
-        for suffix in ["-wal", "-shm"] {
-            let sidecar = append_suffix(src, suffix);
-            if sidecar.exists() {
-                let _ = std::fs::copy(&sidecar, append_suffix(&db_path, suffix));
-            }
-        }
-
-        Ok(Self { _dir: dir, db_path })
-    }
-}
-
-/// Appends a raw suffix to a path's final component (e.g. `db` -> `db-wal`).
-fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut os: OsString = path.as_os_str().to_owned();
-    os.push(suffix);
-    PathBuf::from(os)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     const DEFAULT_MESSAGE_TS: i64 = 1780757089000;
 
@@ -1547,8 +1502,8 @@ mod tests {
             })
             .to_string();
             let parsed = parse_message_usage(&raw).expect("known zero token shape");
-            assert_eq!(parsed.usage["input_tokens"], 0);
-            assert_eq!(parsed.usage["output_tokens"], 0);
+            assert_eq!(parsed.usage.input_tokens, 0);
+            assert_eq!(parsed.usage.output_tokens, 0);
         }
     }
 

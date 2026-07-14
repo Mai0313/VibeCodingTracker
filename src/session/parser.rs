@@ -6,13 +6,14 @@ use crate::models::{
 use crate::session::claude::parse_claude_logs_with_diagnostics;
 use crate::session::codex::parse_codex_log_iter_with_diagnostics;
 use crate::session::copilot::parse_copilot_events_with_diagnostics;
-use crate::session::detector::{classify_records, detect_extension_type};
+use crate::session::detector::{RecordClassifier, detect_extension_type};
 use crate::session::diagnostics::{ParseDiagnostics, ParsedAnalysis};
 use crate::session::gemini::parse_gemini_events_with_diagnostics;
 use crate::session::grok::{is_grok_signals, parse_grok_session};
 use crate::session::state::ParseMode;
 use crate::utils::{get_current_user, get_machine_id, read_json, read_jsonl};
 use anyhow::{Context, Result, bail};
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::cell::RefCell;
 use std::fs::File;
@@ -35,6 +36,61 @@ impl SessionFileParseDiagnostics {
     /// after another record from the same source was recognized successfully.
     pub fn skipped_records(self) -> usize {
         self.skipped_records
+    }
+}
+
+#[derive(Debug, Default)]
+struct ParseWarningSummary {
+    unreadable_records: usize,
+    malformed_records: usize,
+    unsupported_schema_records: usize,
+    first_reason: Option<String>,
+}
+
+impl ParseWarningSummary {
+    fn record_unreadable(&mut self, line: usize, error: &std::io::Error) {
+        self.unreadable_records += 1;
+        if self.first_reason.is_none() {
+            self.first_reason = Some(format!("unreadable line {line}: {error}"));
+        }
+    }
+
+    fn record_malformed(&mut self, line: usize, error: &serde_json::Error) {
+        self.malformed_records += 1;
+        if self.first_reason.is_none() {
+            self.first_reason = Some(format!(
+                "malformed line {line}: {} at line {} column {}",
+                json_error_category(error),
+                error.line(),
+                error.column()
+            ));
+        }
+    }
+
+    fn record_unsupported_schema(&mut self, provider: ExtensionType, error: &serde_json::Error) {
+        self.unsupported_schema_records += 1;
+        if self.first_reason.is_none() {
+            self.first_reason = Some(format!("unsupported {provider} schema: {error}"));
+        }
+    }
+
+    fn emit(&self, path: &Path) {
+        let total =
+            self.unreadable_records + self.malformed_records + self.unsupported_schema_records;
+        if total == 0 {
+            return;
+        }
+        let first_reason = self
+            .first_reason
+            .as_deref()
+            .unwrap_or("unknown parse failure");
+        log::warn!(
+            "session parser skipped {total} record(s) from {}: unreadable={}, malformed={}, unsupported_schema={}; first failure: {first_reason}",
+            path.display(),
+            self.unreadable_records,
+            self.malformed_records,
+            self.unsupported_schema_records
+        );
     }
 }
 
@@ -267,6 +323,95 @@ fn stream_parse_known(
     provider: ExtensionType,
     mode: ParseMode,
 ) -> Result<Option<ParsedAnalysis>> {
+    match provider {
+        ExtensionType::ClaudeCode => {
+            let Some(mut stream) = prepare_typed_stream::<ClaudeCodeLog>(path, provider)? else {
+                return Ok(None);
+            };
+            let diagnostics = Rc::new(RefCell::new(stream.diagnostics));
+            let warnings = Rc::new(RefCell::new(stream.warnings));
+            let io_failure = Rc::new(RefCell::new(None));
+            let rest = iter_jsonl_typed(
+                &mut stream.reader,
+                provider,
+                Rc::clone(&diagnostics),
+                Rc::clone(&warnings),
+                Rc::clone(&io_failure),
+            );
+            let parsed =
+                parse_claude_logs_with_diagnostics(stream.first.into_iter().chain(rest), mode);
+            warnings.borrow().emit(path);
+            if let Some(error) = io_failure.borrow_mut().take() {
+                bail!("Failed to read session file {}: {error}", path.display());
+            }
+            let parsed = parsed?;
+            Ok(Some(finalize(
+                merge_extra_diagnostics(parsed, &diagnostics),
+                provider,
+            )))
+        }
+        ExtensionType::Codex => {
+            let Some(mut stream) = prepare_typed_stream::<CodexLog>(path, provider)? else {
+                return Ok(None);
+            };
+            let diagnostics = Rc::new(RefCell::new(stream.diagnostics));
+            let warnings = Rc::new(RefCell::new(stream.warnings));
+            let io_failure = Rc::new(RefCell::new(None));
+            let rest = iter_jsonl_typed(
+                &mut stream.reader,
+                provider,
+                Rc::clone(&diagnostics),
+                Rc::clone(&warnings),
+                Rc::clone(&io_failure),
+            );
+            let parsed =
+                parse_codex_log_iter_with_diagnostics(stream.first.into_iter().chain(rest), mode);
+            warnings.borrow().emit(path);
+            if let Some(error) = io_failure.borrow_mut().take() {
+                bail!("Failed to read session file {}: {error}", path.display());
+            }
+            let parsed = parsed?;
+            Ok(Some(finalize(
+                merge_extra_diagnostics(parsed, &diagnostics),
+                provider,
+            )))
+        }
+        ExtensionType::Copilot => {
+            let Some(mut stream) = prepare_typed_stream::<CopilotEvent>(path, provider)? else {
+                return Ok(None);
+            };
+            let diagnostics = Rc::new(RefCell::new(stream.diagnostics));
+            let warnings = Rc::new(RefCell::new(stream.warnings));
+            let io_failure = Rc::new(RefCell::new(None));
+            let rest = iter_jsonl_typed(
+                &mut stream.reader,
+                provider,
+                Rc::clone(&diagnostics),
+                Rc::clone(&warnings),
+                Rc::clone(&io_failure),
+            );
+            let parsed =
+                parse_copilot_events_with_diagnostics(stream.first.into_iter().chain(rest), mode);
+            warnings.borrow().emit(path);
+            if let Some(error) = io_failure.borrow_mut().take() {
+                bail!("Failed to read session file {}: {error}", path.display());
+            }
+            let parsed = parsed?;
+            Ok(Some(finalize(
+                merge_extra_diagnostics(parsed, &diagnostics),
+                provider,
+            )))
+        }
+        _ => stream_parse_known_dynamic(path, provider, mode),
+    }
+}
+
+/// Dynamic streaming path for providers whose event schema stays as `Value`.
+fn stream_parse_known_dynamic(
+    path: &Path,
+    provider: ExtensionType,
+    mode: ParseMode,
+) -> Result<Option<ParsedAnalysis>> {
     let file =
         File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
     let mut reader = BufReader::with_capacity(buffer::FILE_READ_BUFFER, file);
@@ -287,15 +432,71 @@ fn stream_parse_known(
         reader,
         mode,
         ParseDiagnostics::default(),
+        Rc::new(RefCell::new(ParseWarningSummary::default())),
         path,
     )?;
     Ok(Some(finalize(parsed, provider)))
 }
 
+struct TypedStream<T> {
+    first: Option<T>,
+    reader: BufReader<File>,
+    diagnostics: ParseDiagnostics,
+    warnings: ParseWarningSummary,
+}
+
+/// Opens a JSONL source and parses its first record directly into `T`.
+///
+/// A raw `Value` is only materialized after typed deserialization fails, so
+/// successful records avoid building a second JSON tree solely for dispatch.
+fn prepare_typed_stream<T>(path: &Path, provider: ExtensionType) -> Result<Option<TypedStream<T>>>
+where
+    T: DeserializeOwned,
+{
+    let file =
+        File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
+    let mut reader = BufReader::with_capacity(buffer::FILE_READ_BUFFER, file);
+    let mut line = Vec::with_capacity(buffer::AVG_JSONL_LINE_SIZE);
+
+    if !read_next_non_empty_bytes(&mut reader, &mut line)? {
+        return Ok(None);
+    }
+
+    let bytes = trim_ascii_whitespace(&line);
+    let mut diagnostics = ParseDiagnostics::default();
+    let mut warnings = ParseWarningSummary::default();
+    let first = match serde_json::from_slice::<T>(bytes) {
+        Ok(record) => Some(record),
+        Err(typed_error) => match serde_json::from_slice::<Value>(bytes) {
+            Ok(value) => {
+                record_typed_schema_failure(
+                    provider,
+                    &value,
+                    &mut diagnostics,
+                    &mut warnings,
+                    &typed_error,
+                );
+                None
+            }
+            // A first line that is not a complete JSON value indicates a
+            // pretty-printed document. Let the caller use the whole-file
+            // fallback instead of treating it as malformed JSONL.
+            Err(_) => return Ok(None),
+        },
+    };
+
+    Ok(Some(TypedStream {
+        first,
+        reader,
+        diagnostics,
+        warnings,
+    }))
+}
+
 /// Streaming path when the provider is unknown.
 ///
-/// Reads JSONL records one line at a time and asks `classify_records` to
-/// commit to a provider as soon as any of them carry a distinctive marker.
+/// Reads JSONL records one line at a time and feeds a stateful classifier that
+/// commits to a provider as soon as any record carries a distinctive marker.
 /// Because the classifier returns `None` when it has not seen a positive
 /// signal yet, we simply keep peeking until one appears (or EOF). There is
 /// no arbitrary upper bound on how long a Claude metadata preamble may
@@ -326,21 +527,26 @@ fn stream_parse_autodetect(path: &Path, mode: ParseMode) -> Result<Option<Parsed
     let mut first_line_was_json = None::<bool>;
     let mut ext: Option<ExtensionType> = None;
     let mut initial_diagnostics = ParseDiagnostics::default();
+    let mut classifier = RecordClassifier::default();
+    let warnings = Rc::new(RefCell::new(ParseWarningSummary::default()));
+    let mut line_number = 0_usize;
 
     loop {
         let line = match read_next_non_empty_line(&mut reader)? {
             Some(line) => line,
             None => break,
         };
+        line_number += 1;
 
         match serde_json::from_str::<Value>(line.trim()) {
             Ok(v) => {
                 first_line_was_json.get_or_insert(true);
+                let classification = classifier.push(&v);
                 buffered.push(v);
-                // Try to classify after every new record. As soon as we
-                // have a confident verdict we stop peeking and hand both
-                // the buffer and the remaining reader to the dispatcher.
-                if let Some(found) = classify_records(&buffered) {
+                // Each record is inspected once by the stateful classifier.
+                // As soon as it has a confident verdict, hand the buffered
+                // prefix and remaining reader to the dispatcher.
+                if let Some(found) = classification {
                     ext = Some(found);
                     break;
                 }
@@ -356,12 +562,7 @@ fn stream_parse_autodetect(path: &Path, mode: ParseMode) -> Result<Option<Parsed
                     first_line_was_json = Some(false);
                     break;
                 }
-                log::warn!(
-                    "skipping malformed JSONL record while detecting provider: {} at line {} column {}",
-                    json_error_category(&err),
-                    err.line(),
-                    err.column()
-                );
+                warnings.borrow_mut().record_malformed(line_number, &err);
                 initial_diagnostics.record_malformed();
             }
         }
@@ -379,8 +580,15 @@ fn stream_parse_autodetect(path: &Path, mode: ParseMode) -> Result<Option<Parsed
     // back to Codex — a JSONL file with no Claude / Gemini / Copilot / Grok
     // markers is almost certainly a Codex log (or a synthetic fixture).
     let ext = ext.unwrap_or(ExtensionType::Codex);
-    let parsed =
-        dispatch_streaming_buffered(ext, buffered, reader, mode, initial_diagnostics, path)?;
+    let parsed = dispatch_streaming_buffered(
+        ext,
+        buffered,
+        reader,
+        mode,
+        initial_diagnostics,
+        warnings,
+        path,
+    )?;
     Ok(Some(finalize(parsed, ext)))
 }
 
@@ -407,6 +615,34 @@ fn read_next_non_empty_line<R: BufRead>(reader: &mut R) -> Result<Option<String>
     }
 }
 
+/// Reuses `line` while reading through blank lines to the next JSONL record.
+fn read_next_non_empty_bytes<R: BufRead>(reader: &mut R, line: &mut Vec<u8>) -> Result<bool> {
+    loop {
+        line.clear();
+        let count = reader
+            .read_until(b'\n', line)
+            .context("Failed to read line from session file")?;
+        if count == 0 {
+            return Ok(false);
+        }
+        if !trim_ascii_whitespace(line).is_empty() {
+            return Ok(true);
+        }
+    }
+}
+
+fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(start, |index| index + 1);
+    &bytes[start..end]
+}
+
 /// Streams the rest of the file, prepending any already-parsed records.
 ///
 /// JSONL providers feed buffered records through their typed shape and chain
@@ -418,38 +654,54 @@ fn dispatch_streaming_buffered(
     mut reader: BufReader<File>,
     mode: ParseMode,
     initial_diagnostics: ParseDiagnostics,
+    warnings: Rc<RefCell<ParseWarningSummary>>,
     path: &Path,
 ) -> Result<ParsedAnalysis> {
     let extra_diagnostics = Rc::new(RefCell::new(initial_diagnostics));
-    match ext {
+    let io_failure = Rc::new(RefCell::new(None));
+    let parsed = match ext {
         ExtensionType::ClaudeCode => {
-            let rest = iter_jsonl_values(&mut reader, Rc::clone(&extra_diagnostics));
+            let rest = iter_jsonl_values(
+                &mut reader,
+                Rc::clone(&extra_diagnostics),
+                Rc::clone(&warnings),
+                Rc::clone(&io_failure),
+            );
             let logs = buffered.into_iter().chain(rest).filter_map(|value| {
-                deserialize_record::<ClaudeCodeLog>(value, ext, &extra_diagnostics)
+                deserialize_record::<ClaudeCodeLog>(value, ext, &extra_diagnostics, &warnings)
             });
-            let parsed = parse_claude_logs_with_diagnostics(logs, mode)?;
-            Ok(merge_extra_diagnostics(parsed, &extra_diagnostics))
+            parse_claude_logs_with_diagnostics(logs, mode)
+                .map(|parsed| merge_extra_diagnostics(parsed, &extra_diagnostics))
         }
         ExtensionType::Codex => {
-            let rest = iter_jsonl_values(&mut reader, Rc::clone(&extra_diagnostics));
-            let logs = buffered
-                .into_iter()
-                .chain(rest)
-                .filter_map(|value| deserialize_record::<CodexLog>(value, ext, &extra_diagnostics));
-            let parsed = parse_codex_log_iter_with_diagnostics(logs, mode)?;
-            Ok(merge_extra_diagnostics(parsed, &extra_diagnostics))
+            let rest = iter_jsonl_values(
+                &mut reader,
+                Rc::clone(&extra_diagnostics),
+                Rc::clone(&warnings),
+                Rc::clone(&io_failure),
+            );
+            let logs = buffered.into_iter().chain(rest).filter_map(|value| {
+                deserialize_record::<CodexLog>(value, ext, &extra_diagnostics, &warnings)
+            });
+            parse_codex_log_iter_with_diagnostics(logs, mode)
+                .map(|parsed| merge_extra_diagnostics(parsed, &extra_diagnostics))
         }
         ExtensionType::Copilot => {
             // Copilot CLI emits one event per line under
             // `session-state/<uuid>/events.jsonl`. The streaming path sees
             // this as a sequence of parseable `Value`s whose very first
             // line is `type == "session.start"`.
-            let rest = iter_jsonl_values(&mut reader, Rc::clone(&extra_diagnostics));
+            let rest = iter_jsonl_values(
+                &mut reader,
+                Rc::clone(&extra_diagnostics),
+                Rc::clone(&warnings),
+                Rc::clone(&io_failure),
+            );
             let events = buffered.into_iter().chain(rest).filter_map(|value| {
-                deserialize_record::<CopilotEvent>(value, ext, &extra_diagnostics)
+                deserialize_record::<CopilotEvent>(value, ext, &extra_diagnostics, &warnings)
             });
-            let parsed = parse_copilot_events_with_diagnostics(events, mode)?;
-            Ok(merge_extra_diagnostics(parsed, &extra_diagnostics))
+            parse_copilot_events_with_diagnostics(events, mode)
+                .map(|parsed| merge_extra_diagnostics(parsed, &extra_diagnostics))
         }
         ExtensionType::Gemini => {
             // Gemini sessions are line-delimited event streams: the first
@@ -457,17 +709,23 @@ fn dispatch_streaming_buffered(
             // and every subsequent line is an individual event. Feed the
             // already-buffered lines plus the rest of the reader into
             // `parse_gemini_events`.
-            let mut iter = buffered.into_iter();
-            let first = iter
-                .next()
-                .context("Gemini session missing top-level object")?;
-            let session: GeminiSession =
-                serde_json::from_value(first).context("Failed to parse Gemini session")?;
+            (|| {
+                let mut iter = buffered.into_iter();
+                let first = iter
+                    .next()
+                    .context("Gemini session missing top-level object")?;
+                let session: GeminiSession =
+                    serde_json::from_value(first).context("Failed to parse Gemini session")?;
 
-            let rest_events = iter_jsonl_values(&mut reader, Rc::clone(&extra_diagnostics));
-            let parsed =
-                parse_gemini_events_with_diagnostics(session, iter.chain(rest_events), mode)?;
-            Ok(merge_extra_diagnostics(parsed, &extra_diagnostics))
+                let rest_events = iter_jsonl_values(
+                    &mut reader,
+                    Rc::clone(&extra_diagnostics),
+                    Rc::clone(&warnings),
+                    Rc::clone(&io_failure),
+                );
+                parse_gemini_events_with_diagnostics(session, iter.chain(rest_events), mode)
+                    .map(|parsed| merge_extra_diagnostics(parsed, &extra_diagnostics))
+            })()
         }
         ExtensionType::Grok => {
             drop(reader);
@@ -483,7 +741,12 @@ fn dispatch_streaming_buffered(
         // Hermes stores usage in a single SQLite database, not a JSONL file, so
         // it never flows through the file parser. See `session::hermes`.
         ExtensionType::Hermes => Ok(empty_parsed_analysis()),
+    };
+    warnings.borrow().emit(path);
+    if let Some(error) = io_failure.borrow_mut().take() {
+        bail!("Failed to read session file {}: {error}", path.display());
     }
+    parsed
 }
 
 fn json_error_category(error: &serde_json::Error) -> &'static str {
@@ -495,6 +758,65 @@ fn json_error_category(error: &serde_json::Error) -> &'static str {
     }
 }
 
+/// Iterator that deserializes JSONL records directly into the provider model.
+///
+/// The line buffer is retained across iterations. A raw `Value` is only built
+/// when typed deserialization fails and diagnostics need to classify the
+/// unsupported record.
+fn iter_jsonl_typed<'a, T>(
+    reader: &'a mut BufReader<File>,
+    provider: ExtensionType,
+    diagnostics: Rc<RefCell<ParseDiagnostics>>,
+    warnings: Rc<RefCell<ParseWarningSummary>>,
+    io_failure: Rc<RefCell<Option<String>>>,
+) -> impl Iterator<Item = T> + 'a
+where
+    T: DeserializeOwned + 'a,
+{
+    let mut line = Vec::with_capacity(buffer::AVG_JSONL_LINE_SIZE);
+    let mut line_number = 1_usize;
+
+    std::iter::from_fn(move || {
+        loop {
+            line.clear();
+            line_number += 1;
+            match reader.read_until(b'\n', &mut line) {
+                Ok(0) => return None,
+                Ok(_) => {}
+                Err(err) => {
+                    warnings.borrow_mut().record_unreadable(line_number, &err);
+                    *io_failure.borrow_mut() = Some(err.to_string());
+                    return None;
+                }
+            }
+
+            let bytes = trim_ascii_whitespace(&line);
+            if bytes.is_empty() {
+                continue;
+            }
+
+            match serde_json::from_slice::<T>(bytes) {
+                Ok(record) => return Some(record),
+                Err(typed_error) => match serde_json::from_slice::<Value>(bytes) {
+                    Ok(value) => {
+                        record_typed_schema_failure(
+                            provider,
+                            &value,
+                            &mut diagnostics.borrow_mut(),
+                            &mut warnings.borrow_mut(),
+                            &typed_error,
+                        );
+                    }
+                    Err(error) => {
+                        warnings.borrow_mut().record_malformed(line_number, &error);
+                        diagnostics.borrow_mut().record_malformed();
+                    }
+                },
+            }
+        }
+    })
+}
+
 /// Iterator that yields raw [`Value`]s, one per non-empty line in the reader.
 ///
 /// Used by parsers (Gemini / Copilot) that need to dispatch per-event on a
@@ -503,16 +825,15 @@ fn json_error_category(error: &serde_json::Error) -> &'static str {
 fn iter_jsonl_values<'a>(
     reader: &'a mut BufReader<File>,
     diagnostics: Rc<RefCell<ParseDiagnostics>>,
+    warnings: Rc<RefCell<ParseWarningSummary>>,
+    io_failure: Rc<RefCell<Option<String>>>,
 ) -> impl Iterator<Item = Value> + 'a {
     reader.lines().enumerate().filter_map(move |(index, line)| {
         let line = match line {
             Ok(line) => line,
             Err(err) => {
-                log::warn!(
-                    "skipping unreadable JSONL record at streamed line {}: {err}",
-                    index + 1
-                );
-                diagnostics.borrow_mut().record_malformed();
+                warnings.borrow_mut().record_unreadable(index + 1, &err);
+                *io_failure.borrow_mut() = Some(err.to_string());
                 return None;
             }
         };
@@ -523,13 +844,7 @@ fn iter_jsonl_values<'a>(
         match serde_json::from_str::<Value>(trimmed) {
             Ok(value) => Some(value),
             Err(err) => {
-                log::warn!(
-                    "skipping malformed JSONL record at streamed line {}: {} at line {} column {}",
-                    index + 1,
-                    json_error_category(&err),
-                    err.line(),
-                    err.column()
-                );
+                warnings.borrow_mut().record_malformed(index + 1, &err);
                 diagnostics.borrow_mut().record_malformed();
                 None
             }
@@ -541,6 +856,7 @@ fn deserialize_record<T>(
     value: Value,
     provider: ExtensionType,
     diagnostics: &Rc<RefCell<ParseDiagnostics>>,
+    warnings: &Rc<RefCell<ParseWarningSummary>>,
 ) -> Option<T>
 where
     T: serde::de::DeserializeOwned,
@@ -548,23 +864,52 @@ where
     let record_kind = raw_record_kind(provider, &value);
     match serde_json::from_value::<T>(value) {
         Ok(record) => Some(record),
-        Err(_) => {
-            let (recognized, relevant) = record_kind;
-            let mut diagnostics = diagnostics.borrow_mut();
-            if recognized {
-                diagnostics.record_recognized_source();
-                if relevant {
-                    diagnostics.record_relevant(false);
-                }
-            } else {
-                diagnostics.record_unrecognized();
-            }
-            drop(diagnostics);
-            if relevant {
-                log::warn!("skipping {provider} analyzer record with unsupported top-level schema");
-            }
+        Err(error) => {
+            record_typed_schema_failure_kind(
+                provider,
+                record_kind,
+                &mut diagnostics.borrow_mut(),
+                &mut warnings.borrow_mut(),
+                &error,
+            );
             None
         }
+    }
+}
+
+fn record_typed_schema_failure(
+    provider: ExtensionType,
+    value: &Value,
+    diagnostics: &mut ParseDiagnostics,
+    warnings: &mut ParseWarningSummary,
+    error: &serde_json::Error,
+) {
+    record_typed_schema_failure_kind(
+        provider,
+        raw_record_kind(provider, value),
+        diagnostics,
+        warnings,
+        error,
+    );
+}
+
+fn record_typed_schema_failure_kind(
+    provider: ExtensionType,
+    (recognized, relevant): (bool, bool),
+    diagnostics: &mut ParseDiagnostics,
+    warnings: &mut ParseWarningSummary,
+    error: &serde_json::Error,
+) {
+    if recognized {
+        diagnostics.record_recognized_source();
+        if relevant {
+            diagnostics.record_relevant(false);
+        }
+    } else {
+        diagnostics.record_unrecognized();
+    }
+    if relevant {
+        warnings.record_unsupported_schema(provider, error);
     }
 }
 
@@ -699,22 +1044,23 @@ fn dispatch_by_vec(
     path: &Path,
 ) -> Result<ParsedAnalysis> {
     let extra_diagnostics = Rc::new(RefCell::new(ParseDiagnostics::default()));
+    let warnings = Rc::new(RefCell::new(ParseWarningSummary::default()));
     let parsed = match ext_type {
         ExtensionType::ClaudeCode => {
             let logs = data.into_iter().filter_map(|value| {
-                deserialize_record::<ClaudeCodeLog>(value, ext_type, &extra_diagnostics)
+                deserialize_record::<ClaudeCodeLog>(value, ext_type, &extra_diagnostics, &warnings)
             });
             parse_claude_logs_with_diagnostics(logs, mode)?
         }
         ExtensionType::Codex => {
             let logs = data.into_iter().filter_map(|value| {
-                deserialize_record::<CodexLog>(value, ext_type, &extra_diagnostics)
+                deserialize_record::<CodexLog>(value, ext_type, &extra_diagnostics, &warnings)
             });
             parse_codex_log_iter_with_diagnostics(logs, mode)?
         }
         ExtensionType::Copilot => {
             let events = data.into_iter().filter_map(|value| {
-                deserialize_record::<CopilotEvent>(value, ext_type, &extra_diagnostics)
+                deserialize_record::<CopilotEvent>(value, ext_type, &extra_diagnostics, &warnings)
             });
             parse_copilot_events_with_diagnostics(events, mode)?
         }
@@ -736,6 +1082,7 @@ fn dispatch_by_vec(
         }
         ExtensionType::Grok => parse_grok_session(path, mode)?,
     };
+    warnings.borrow().emit(path);
     Ok(finalize(
         merge_extra_diagnostics(parsed, &extra_diagnostics),
         ext_type,
@@ -783,4 +1130,36 @@ fn validate_parsed_source(path: &Path, diagnostics: &ParseDiagnostics) -> Result
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::detector::{record_inspections, reset_record_inspections};
+    use tempfile::TempDir;
+
+    #[test]
+    fn auto_detection_inspects_each_preamble_record_once() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("long-preamble.jsonl");
+        let sentinel = r#"{"type":"file-history-snapshot","messageId":"m1","snapshot":{}}"#;
+        let assistant = r#"{"type":"assistant","sessionId":"session","parentUuid":"parent","timestamp":"2026-07-14T00:00:00Z","message":{"model":"claude-opus-4-7","usage":{"input_tokens":1,"output_tokens":1},"content":[]}}"#;
+        let mut contents =
+            String::with_capacity((sentinel.len() + 1) * 10_000 + assistant.len() + 1);
+        for _ in 0..10_000 {
+            contents.push_str(sentinel);
+            contents.push('\n');
+        }
+        contents.push_str(assistant);
+        contents.push('\n');
+        std::fs::write(&path, contents).unwrap();
+
+        reset_record_inspections();
+        let parsed = stream_parse_autodetect(&path, ParseMode::UsageOnly)
+            .unwrap()
+            .expect("JSONL source should use streaming detection");
+
+        assert_eq!(parsed.analysis.extension_name, "Claude-Code");
+        assert_eq!(record_inspections(), 10_001);
+    }
 }

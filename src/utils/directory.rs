@@ -1,5 +1,6 @@
 use crate::cli::TimeRange;
 use anyhow::Result;
+use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -9,6 +10,23 @@ pub struct FileInfo {
     pub path: PathBuf,
     /// Local modification date formatted as `YYYY-MM-DD`, used for grouping.
     pub modified_date: String,
+}
+
+/// One directory traversal or metadata error encountered during discovery.
+#[derive(Debug)]
+pub(crate) struct FileDiscoveryFailure {
+    /// Path whose directory entry or metadata could not be read.
+    pub path: PathBuf,
+    /// Content-safe error summary.
+    pub error: String,
+}
+
+/// Files discovered successfully plus any partial traversal failures.
+pub(crate) struct FileDiscovery {
+    /// Matched files that could be inspected successfully.
+    pub files: Vec<FileInfo>,
+    /// Traversal, metadata, or mtime failures in deterministic path order.
+    pub failures: Vec<FileDiscoveryFailure>,
 }
 
 /// Recursively collects the files under `dir` that pass `filter_fn`, tagging
@@ -60,8 +78,38 @@ where
     P: AsRef<Path>,
     F: Fn(&Path) -> bool,
 {
-    if !dir.as_ref().exists() {
-        return Ok(Vec::new());
+    Ok(collect_files_with_max_depth_diagnostics(dir, filter_fn, time_range, max_depth).files)
+}
+
+/// Discovers matching files while retaining partial traversal failures.
+pub(crate) fn collect_files_with_max_depth_diagnostics<P, F>(
+    dir: P,
+    filter_fn: F,
+    time_range: TimeRange,
+    max_depth: Option<usize>,
+) -> FileDiscovery
+where
+    P: AsRef<Path>,
+    F: Fn(&Path) -> bool,
+{
+    let dir = dir.as_ref();
+    match fs::metadata(dir) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return FileDiscovery {
+                files: Vec::new(),
+                failures: Vec::new(),
+            };
+        }
+        Err(error) => {
+            return FileDiscovery {
+                files: Vec::new(),
+                failures: vec![FileDiscoveryFailure {
+                    path: dir.to_path_buf(),
+                    error: error.to_string(),
+                }],
+            };
+        }
     }
 
     let cutoff = time_range
@@ -70,13 +118,24 @@ where
 
     // Pre-allocate Vec with estimated capacity (typical: 10-50 session files)
     let mut results = Vec::with_capacity(20);
+    let mut failures = Vec::new();
 
     let mut walker = WalkDir::new(dir);
     if let Some(depth) = max_depth {
         walker = walker.max_depth(depth);
     }
 
-    for entry in walker.into_iter().filter_map(|e| e.ok()) {
+    for entry in walker {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                failures.push(FileDiscoveryFailure {
+                    path: error.path().unwrap_or(dir).to_path_buf(),
+                    error: error.to_string(),
+                });
+                continue;
+            }
+        };
         if !entry.file_type().is_file() {
             continue;
         }
@@ -89,29 +148,52 @@ where
         }
 
         // Get file modification time for date grouping
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-
-        if let Ok(modified) = metadata.modified() {
-            let datetime: chrono::DateTime<chrono::Local> = modified.into();
-            let date_key = datetime.format("%Y-%m-%d").to_string();
-
-            // Apply time range filter
-            if let Some(ref cutoff_str) = cutoff
-                && date_key.as_str() < cutoff_str.as_str()
-            {
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                failures.push(FileDiscoveryFailure {
+                    path: path.to_path_buf(),
+                    error: error.to_string(),
+                });
                 continue;
             }
+        };
 
-            results.push(FileInfo {
-                path: path.to_path_buf(),
-                modified_date: date_key,
-            });
+        let modified = match metadata.modified() {
+            Ok(modified) => modified,
+            Err(error) => {
+                failures.push(FileDiscoveryFailure {
+                    path: path.to_path_buf(),
+                    error: error.to_string(),
+                });
+                continue;
+            }
+        };
+        let datetime: chrono::DateTime<chrono::Local> = modified.into();
+        let date_key = datetime.format("%Y-%m-%d").to_string();
+
+        // Apply time range filter
+        if let Some(ref cutoff_str) = cutoff
+            && date_key.as_str() < cutoff_str.as_str()
+        {
+            continue;
         }
+
+        results.push(FileInfo {
+            path: path.to_path_buf(),
+            modified_date: date_key,
+        });
     }
 
-    Ok(results)
+    failures.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.error.cmp(&right.error))
+    });
+    FileDiscovery {
+        files: results,
+        failures,
+    }
 }
 
 /// Maximum traversal depth for Copilot CLI session scans.

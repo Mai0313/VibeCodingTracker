@@ -2,15 +2,24 @@ use crate::cli::TimeRange;
 use crate::config::ProvidersConfig;
 use crate::constants::{FastHashMap, capacity};
 use crate::models::{CodeAnalysis, ExtensionType, ProviderActiveDays};
-use crate::session::cursor::read_cursor_analysis_with_diagnostics;
+use crate::session::cursor::{
+    discover_cursor_store_dbs, load_conversation_model_snapshot,
+    read_cursor_analysis_with_diagnostics, read_store_analysis,
+};
 use crate::session::diagnostics::DatabaseAnalysisRow;
 use crate::session::opencode::read_opencode_analysis_with_diagnostics;
 use crate::session::parser::parse_session_file_as_with_diagnostics;
+use crate::session::sqlite::is_cacheable_sqlite_failure;
 use crate::session::state::ParseMode;
+use crate::summary_cache::{
+    CachedSourceSummary, CompactSourceSummary, SourceFingerprint, SummaryCacheKey, SummaryKind,
+    SummaryScanCache, provider_scan_rank,
+};
+use crate::utils::directory::{FileInfo, collect_files_with_max_depth_diagnostics};
 use crate::utils::{
-    COPILOT_SESSION_MAX_DEPTH, GROK_SESSION_MAX_DEPTH, HelperPaths, collect_files_with_max_depth,
-    is_claude_session_file, is_codex_session_file, is_copilot_session_file, is_gemini_session_file,
-    is_grok_session_file,
+    COPILOT_SESSION_MAX_DEPTH, GROK_SESSION_MAX_DEPTH, HelperPaths, get_current_user,
+    get_machine_id, is_claude_session_file, is_codex_session_file, is_copilot_session_file,
+    is_gemini_session_file, is_grok_session_file,
 };
 use anyhow::Result;
 use rayon::prelude::*;
@@ -379,7 +388,7 @@ where
 {
     let mut diagnostics = AnalysisCollectionDiagnostics::default();
 
-    if providers.claude && paths.claude_session_dir.exists() {
+    if providers.claude {
         visit_file_sessions(
             &paths.claude_session_dir,
             ExtensionType::ClaudeCode,
@@ -392,7 +401,7 @@ where
         )?;
     }
 
-    if providers.codex && paths.codex_session_dir.exists() {
+    if providers.codex {
         visit_file_sessions(
             &paths.codex_session_dir,
             ExtensionType::Codex,
@@ -405,7 +414,7 @@ where
         )?;
     }
 
-    if providers.copilot && paths.copilot_session_dir.exists() {
+    if providers.copilot {
         visit_file_sessions(
             &paths.copilot_session_dir,
             ExtensionType::Copilot,
@@ -418,7 +427,7 @@ where
         )?;
     }
 
-    if providers.gemini && paths.gemini_session_dir.exists() {
+    if providers.gemini {
         visit_file_sessions(
             &paths.gemini_session_dir,
             ExtensionType::Gemini,
@@ -431,7 +440,7 @@ where
         )?;
     }
 
-    if providers.grok && paths.grok_session_dir.exists() {
+    if providers.grok {
         visit_file_sessions(
             &paths.grok_session_dir,
             ExtensionType::Grok,
@@ -509,6 +518,482 @@ where
     Ok(diagnostics)
 }
 
+/// Incremental compact analysis scan rooted at the current user's paths.
+pub fn aggregate_sessions_by_model_with_cache(
+    time_range: TimeRange,
+    providers: ProvidersConfig,
+    cache: &mut SummaryScanCache,
+) -> Result<AnalysisAggregation> {
+    aggregate_sessions_by_model_from_paths_with_cache(
+        &crate::utils::resolve_paths()?,
+        time_range,
+        providers,
+        cache,
+    )
+}
+
+/// Incremental compact analysis scan rooted at explicit provider paths.
+///
+/// File sources share the same compact cache shape as the usage collector.
+/// Database entries retain only model counters, dates, and source diagnostics.
+pub fn aggregate_sessions_by_model_from_paths_with_cache(
+    paths: &HelperPaths,
+    time_range: TimeRange,
+    providers: ProvidersConfig,
+    cache: &mut SummaryScanCache,
+) -> Result<AnalysisAggregation> {
+    cache.begin_scan();
+    let mut projection = AnalysisProjection::new();
+    let mut diagnostics = AnalysisCollectionDiagnostics::default();
+    let mut seen = HashSet::new();
+
+    if providers.claude {
+        scan_analysis_files(
+            &paths.claude_session_dir,
+            ExtensionType::ClaudeCode,
+            is_claude_session_file,
+            time_range,
+            None,
+            cache,
+            &mut seen,
+            &mut projection,
+            &mut diagnostics,
+        )?;
+    }
+    if providers.codex {
+        scan_analysis_files(
+            &paths.codex_session_dir,
+            ExtensionType::Codex,
+            is_codex_session_file,
+            time_range,
+            None,
+            cache,
+            &mut seen,
+            &mut projection,
+            &mut diagnostics,
+        )?;
+    }
+    if providers.copilot {
+        scan_analysis_files(
+            &paths.copilot_session_dir,
+            ExtensionType::Copilot,
+            is_copilot_session_file,
+            time_range,
+            Some(COPILOT_SESSION_MAX_DEPTH),
+            cache,
+            &mut seen,
+            &mut projection,
+            &mut diagnostics,
+        )?;
+    }
+    if providers.gemini {
+        scan_analysis_files(
+            &paths.gemini_session_dir,
+            ExtensionType::Gemini,
+            is_gemini_session_file,
+            time_range,
+            None,
+            cache,
+            &mut seen,
+            &mut projection,
+            &mut diagnostics,
+        )?;
+    }
+    if providers.grok {
+        scan_analysis_files(
+            &paths.grok_session_dir,
+            ExtensionType::Grok,
+            is_grok_session_file,
+            time_range,
+            Some(GROK_SESSION_MAX_DEPTH),
+            cache,
+            &mut seen,
+            &mut projection,
+            &mut diagnostics,
+        )?;
+    }
+
+    if providers.opencode && paths.opencode_db.exists() {
+        scan_opencode_analysis(
+            paths,
+            time_range,
+            cache,
+            &mut seen,
+            &mut projection,
+            &mut diagnostics,
+        );
+    }
+    if providers.cursor && paths.cursor_chats_dir.exists() {
+        scan_cursor_analysis(
+            paths,
+            time_range,
+            cache,
+            &mut seen,
+            &mut projection,
+            &mut diagnostics,
+        );
+    }
+
+    cache.retain_kinds(&seen, &[SummaryKind::File, SummaryKind::AnalysisDatabase]);
+    diagnostics.failures.sort_by(|left, right| {
+        provider_scan_rank(left.provider)
+            .cmp(&provider_scan_rank(right.provider))
+            .then_with(|| left.source.cmp(&right.source))
+            .then_with(|| left.error.cmp(&right.error))
+    });
+    Ok(AnalysisAggregation {
+        data: projection.finish(),
+        diagnostics,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_analysis_files<F>(
+    dir: &Path,
+    provider: ExtensionType,
+    filter: F,
+    time_range: TimeRange,
+    max_depth: Option<usize>,
+    cache: &mut SummaryScanCache,
+    seen: &mut HashSet<SummaryCacheKey>,
+    projection: &mut AnalysisProjection,
+    diagnostics: &mut AnalysisCollectionDiagnostics,
+) -> Result<()>
+where
+    F: Copy + Fn(&Path) -> bool + Sync + Send,
+{
+    let discovery = collect_files_with_max_depth_diagnostics(dir, filter, time_range, max_depth);
+    if !discovery.failures.is_empty() {
+        cache.preserve_provider_keys(seen, SummaryKind::File, provider);
+    }
+    diagnostics.candidates += discovery.failures.len();
+    for failure in discovery.failures {
+        record_failure(diagnostics, provider, &failure.path, failure.error);
+    }
+
+    let mut files = discovery.files;
+    files.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    diagnostics.candidates += files.len();
+    let mut misses = Vec::new();
+
+    for file in files {
+        let key = SummaryCacheKey::new(SummaryKind::File, provider, &file.path, time_range);
+        seen.insert(key.clone());
+        match SourceFingerprint::file(&file.path, provider) {
+            Ok(fingerprint) => {
+                if let Some(cached) = cache.get(&key, &fingerprint) {
+                    fold_cached_analysis(provider, &file.path, cached, projection, diagnostics);
+                } else {
+                    misses.push((file, key, fingerprint));
+                }
+            }
+            Err(error) => record_failure(diagnostics, provider, &file.path, error.to_string()),
+        }
+    }
+
+    let loaded: Vec<_> = misses
+        .into_par_iter()
+        .map(|(file, key, fingerprint)| {
+            let result = load_analysis_file(&file, provider);
+            (file.path, key, fingerprint, result)
+        })
+        .collect();
+    for (source, key, fingerprint, result) in loaded {
+        cache.record_parse();
+        match result {
+            Ok(loaded) => {
+                fold_loaded_analysis(provider, &source, &loaded, projection, diagnostics);
+                cache.insert(
+                    key,
+                    fingerprint,
+                    loaded.summary,
+                    loaded.parsed,
+                    loaded.failure,
+                );
+            }
+            Err(error) => record_failure(diagnostics, provider, &source, error.to_string()),
+        }
+    }
+    Ok(())
+}
+
+fn load_analysis_file(file: &FileInfo, provider: ExtensionType) -> Result<CachedAnalysisLoad> {
+    let parsed =
+        parse_session_file_as_with_diagnostics(&file.path, provider, ParseMode::UsageOnly)?;
+    if parsed.diagnostics.is_complete_failure() {
+        let error = if parsed.diagnostics.recognized_records == 0 {
+            "source contained no recognized provider records".to_string()
+        } else {
+            format!(
+                "none of {} analyzer-relevant provider records used a supported schema",
+                parsed.diagnostics.relevant_records
+            )
+        };
+        return Ok(CachedAnalysisLoad {
+            summary: CompactSourceSummary::default(),
+            parsed: false,
+            failure: Some(error),
+        });
+    }
+    let emit = parsed.diagnostics.should_emit_session();
+    if emit && parsed.analysis.records.is_empty() {
+        return Ok(CachedAnalysisLoad {
+            summary: CompactSourceSummary::default(),
+            parsed: false,
+            failure: Some("normalized source produced no analysis records".to_string()),
+        });
+    }
+    let partial = parsed.diagnostics.partial_failure_count();
+    Ok(CachedAnalysisLoad {
+        summary: CompactSourceSummary::from_file(parsed.analysis, file.modified_date.clone(), emit),
+        parsed: true,
+        failure: (partial > 0)
+            .then(|| format!("skipped {partial} malformed or unsupported analyzer records")),
+    })
+}
+
+fn scan_opencode_analysis(
+    paths: &HelperPaths,
+    time_range: TimeRange,
+    cache: &mut SummaryScanCache,
+    seen: &mut HashSet<SummaryCacheKey>,
+    projection: &mut AnalysisProjection,
+    diagnostics: &mut AnalysisCollectionDiagnostics,
+) {
+    let provider = ExtensionType::OpenCode;
+    let source = &paths.opencode_db;
+    diagnostics.candidates += 1;
+    let key = SummaryCacheKey::new(SummaryKind::AnalysisDatabase, provider, source, time_range);
+    seen.insert(key.clone());
+    let fingerprint = match SourceFingerprint::sqlite(source, &[]) {
+        Ok(value) => value,
+        Err(error) => {
+            record_failure(diagnostics, provider, source, error.to_string());
+            return;
+        }
+    };
+    if let Some(cached) = cache.get(&key, &fingerprint) {
+        fold_cached_analysis(provider, source, cached, projection, diagnostics);
+        return;
+    }
+
+    cache.record_parse();
+    match read_opencode_analysis_with_diagnostics(source, time_range, ParseMode::UsageOnly) {
+        Ok(result) => {
+            let complete_failure = result.expected_records > 0 && result.parsed_records == 0;
+            let failed = result
+                .expected_records
+                .saturating_sub(result.parsed_records)
+                + result.failed_tool_parts;
+            let failure = if complete_failure {
+                Some(format!(
+                    "none of {} analysis records used a recognized schema",
+                    result.expected_records
+                ))
+            } else if failed > 0 {
+                Some(format!(
+                    "{failed} analysis payloads used an unsupported schema"
+                ))
+            } else {
+                None
+            };
+            let mut summary = CompactSourceSummary::default();
+            for row in result.rows {
+                summary.add_analysis(row.analysis, row.date, 0.0, true);
+            }
+            let loaded = CachedAnalysisLoad {
+                summary,
+                parsed: !complete_failure,
+                failure,
+            };
+            fold_loaded_analysis(provider, source, &loaded, projection, diagnostics);
+            cache.insert(
+                key,
+                fingerprint,
+                loaded.summary,
+                loaded.parsed,
+                loaded.failure,
+            );
+        }
+        Err(error) => {
+            let failure = error.to_string();
+            record_failure(diagnostics, provider, source, failure.clone());
+            if is_cacheable_sqlite_failure(&error) {
+                cache.insert(
+                    key,
+                    fingerprint,
+                    CompactSourceSummary::default(),
+                    false,
+                    Some(failure),
+                );
+            }
+        }
+    }
+}
+
+fn scan_cursor_analysis(
+    paths: &HelperPaths,
+    time_range: TimeRange,
+    cache: &mut SummaryScanCache,
+    seen: &mut HashSet<SummaryCacheKey>,
+    projection: &mut AnalysisProjection,
+    diagnostics: &mut AnalysisCollectionDiagnostics,
+) {
+    let provider = ExtensionType::Cursor;
+    let source = &paths.cursor_chats_dir;
+    let discovery = discover_cursor_store_dbs(source);
+    if !discovery.failures.is_empty() {
+        cache.preserve_provider_keys(seen, SummaryKind::AnalysisDatabase, provider);
+    }
+    for failure in discovery.failures {
+        diagnostics.candidates += 1;
+        record_failure(diagnostics, provider, &failure.path, failure.error);
+    }
+
+    let tracking_db = &paths.cursor_tracking_db;
+    let (conv_models, tracking_fingerprint, tracking_ok) =
+        match load_conversation_model_snapshot(tracking_db) {
+            Ok(snapshot) => (snapshot.models, snapshot.fingerprint, true),
+            Err(error) => {
+                record_failure(diagnostics, provider, tracking_db, error.to_string());
+                (FastHashMap::default(), None, false)
+            }
+        };
+    let user = get_current_user();
+    let machine = get_machine_id().to_string();
+
+    for store in discovery.stores {
+        diagnostics.candidates += 1;
+        let key = SummaryCacheKey::new(SummaryKind::AnalysisDatabase, provider, &store, time_range);
+        seen.insert(key.clone());
+        let fingerprint = if tracking_ok {
+            SourceFingerprint::sqlite_with_dependency(
+                &store,
+                tracking_db,
+                tracking_fingerprint.as_ref(),
+            )
+        } else {
+            SourceFingerprint::sqlite(&store, &[])
+        };
+        let fingerprint = match fingerprint {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                record_failure(diagnostics, provider, &store, error.to_string());
+                continue;
+            }
+        };
+        if tracking_ok && let Some(cached) = cache.get(&key, &fingerprint) {
+            fold_cached_analysis(provider, &store, cached, projection, diagnostics);
+            continue;
+        }
+
+        cache.record_parse();
+        match read_store_analysis(
+            &store,
+            &conv_models,
+            time_range,
+            ParseMode::UsageOnly,
+            &user,
+            &machine,
+        ) {
+            Ok(result) => {
+                let complete_failure =
+                    result.normalized_messages == 0 && result.failed_payloads > 0;
+                let failure = if complete_failure {
+                    Some(format!(
+                        "none of {} analyzer payloads used a supported schema",
+                        result.failed_payloads
+                    ))
+                } else if result.failed_payloads > 0 {
+                    Some(format!(
+                        "{} analyzer payloads used an unsupported schema",
+                        result.failed_payloads
+                    ))
+                } else {
+                    None
+                };
+                let mut summary = CompactSourceSummary::default();
+                for (date, analysis) in result.rows {
+                    summary.add_analysis(analysis, date, 0.0, true);
+                }
+                let loaded = CachedAnalysisLoad {
+                    summary,
+                    parsed: !complete_failure,
+                    failure,
+                };
+                fold_loaded_analysis(provider, &store, &loaded, projection, diagnostics);
+                if tracking_ok {
+                    cache.insert(
+                        key,
+                        fingerprint,
+                        loaded.summary,
+                        loaded.parsed,
+                        loaded.failure,
+                    );
+                }
+            }
+            Err(error) => {
+                let failure = error.to_string();
+                record_failure(diagnostics, provider, &store, failure.clone());
+                if tracking_ok && is_cacheable_sqlite_failure(&error) {
+                    cache.insert(
+                        key,
+                        fingerprint,
+                        CompactSourceSummary::default(),
+                        false,
+                        Some(failure),
+                    );
+                }
+            }
+        }
+    }
+}
+struct CachedAnalysisLoad {
+    summary: CompactSourceSummary,
+    parsed: bool,
+    failure: Option<String>,
+}
+
+fn fold_cached_analysis(
+    provider: ExtensionType,
+    source: &Path,
+    cached: &CachedSourceSummary,
+    projection: &mut AnalysisProjection,
+    diagnostics: &mut AnalysisCollectionDiagnostics,
+) {
+    if cached.parsed {
+        diagnostics.parsed += 1;
+        projection.add_compact(provider, &cached.summary);
+    }
+    if let Some(error) = &cached.failure {
+        diagnostics.failures.push(AnalysisCollectionFailure {
+            provider,
+            source: source.to_path_buf(),
+            error: error.clone(),
+        });
+    }
+}
+
+fn fold_loaded_analysis(
+    provider: ExtensionType,
+    source: &Path,
+    loaded: &CachedAnalysisLoad,
+    projection: &mut AnalysisProjection,
+    diagnostics: &mut AnalysisCollectionDiagnostics,
+) {
+    if loaded.parsed {
+        diagnostics.parsed += 1;
+        projection.add_compact(provider, &loaded.summary);
+    }
+    if let Some(error) = &loaded.failure {
+        diagnostics.failures.push(AnalysisCollectionFailure {
+            provider,
+            source: source.to_path_buf(),
+            error: error.clone(),
+        });
+    }
+}
+
 /// Projects a canonical dataset into the compact model/provider summaries used
 /// by the TUI, text, and table renderers.
 pub fn project_analysis_dataset(dataset: &AnalysisDataset) -> AnalysisData {
@@ -573,22 +1058,26 @@ where
     F: Copy + Fn(&Path) -> bool + Sync + Send,
     V: FnMut(AnalysisSession),
 {
-    let mut files = collect_files_with_max_depth(dir, filter_fn, time_range, max_depth)?;
+    let discovery = collect_files_with_max_depth_diagnostics(dir, filter_fn, time_range, max_depth);
+    diagnostics.candidates += discovery.failures.len();
+    for failure in discovery.failures {
+        record_failure(diagnostics, provider, &failure.path, failure.error);
+    }
+
+    let mut files = discovery.files;
     files.sort_unstable_by(|a, b| a.path.cmp(&b.path));
     diagnostics.candidates += files.len();
 
-    // Carry each source index through parallel parsing, then sort by that index.
-    // This does not rely on Rayon's collection ordering, and collecting errors
-    // before logging keeps diagnostics and log records in source order.
-    let mut outcomes: Vec<(usize, FileSessionOutcome)> = files
-        .par_iter()
-        .enumerate()
-        .map(
-            |(index, file_info)| match parse_session_file_as_with_diagnostics(
-                &file_info.path,
-                provider,
-                mode,
-            ) {
+    // `Vec::into_par_iter` is indexed, so collecting retains the sorted source
+    // order while moving each path/date directly into its outcome.
+    let outcomes: Vec<FileSessionOutcome> = files
+        .into_par_iter()
+        .map(|file_info| {
+            let FileInfo {
+                path,
+                modified_date,
+            } = file_info;
+            match parse_session_file_as_with_diagnostics(&path, provider, mode) {
                 Ok(parsed) if parsed.diagnostics.is_complete_failure() => {
                     let error = if parsed.diagnostics.recognized_records == 0 {
                         "source contained no recognized provider records".to_string()
@@ -598,62 +1087,52 @@ where
                             parsed.diagnostics.relevant_records
                         )
                     };
-                    (
-                        index,
-                        Err(AnalysisCollectionFailure {
-                            provider,
-                            source: file_info.path.clone(),
-                            error,
-                        }),
-                    )
+                    Err(AnalysisCollectionFailure {
+                        provider,
+                        source: path,
+                        error,
+                    })
                 }
                 Ok(parsed)
                     if parsed.diagnostics.should_emit_session()
                         && parsed.analysis.records.is_empty() =>
                 {
-                    (
-                        index,
-                        Err(AnalysisCollectionFailure {
-                            provider,
-                            source: file_info.path.clone(),
-                            error: "normalized source produced no analysis records".to_string(),
-                        }),
-                    )
+                    Err(AnalysisCollectionFailure {
+                        provider,
+                        source: path,
+                        error: "normalized source produced no analysis records".to_string(),
+                    })
                 }
                 Ok(parsed) => {
                     let partial_failure_count = parsed.diagnostics.partial_failure_count();
-                    let partial_failure = (partial_failure_count > 0).then(|| {
+                    let partial_failure = (partial_failure_count > 0).then_some(
                         AnalysisCollectionFailure {
                             provider,
-                            source: file_info.path.clone(),
+                            source: path,
                             error: format!(
                                 "skipped {partial_failure_count} malformed or unsupported analyzer records"
                             ),
-                        }
-                    });
-                    let session = parsed.diagnostics.should_emit_session().then(|| {
+                        },
+                    );
+                    let session = parsed.diagnostics.should_emit_session().then_some({
                         AnalysisSession {
                             provider,
-                            date: file_info.modified_date.clone(),
+                            date: modified_date,
                             analysis: parsed.analysis,
                         }
                     });
-                    (index, Ok((session, partial_failure)))
+                    Ok((session, partial_failure))
                 }
-                Err(err) => (
-                    index,
-                    Err(AnalysisCollectionFailure {
-                        provider,
-                        source: file_info.path.clone(),
-                        error: err.to_string(),
-                    }),
-                ),
-            },
-        )
+                Err(err) => Err(AnalysisCollectionFailure {
+                    provider,
+                    source: path,
+                    error: err.to_string(),
+                }),
+            }
+        })
         .collect();
-    outcomes.sort_unstable_by_key(|(index, _)| *index);
 
-    for (_, outcome) in outcomes {
+    for outcome in outcomes {
         match outcome {
             Ok((session, partial_failure)) => {
                 diagnostics.parsed += 1;
@@ -786,6 +1265,39 @@ impl AnalysisProjection {
         }
     }
 
+    fn add_compact(&mut self, provider: ExtensionType, summary: &CompactSourceSummary) {
+        merge_compact_rows(&mut self.all, &summary.analysis);
+        let provider_rows = match provider {
+            ExtensionType::ClaudeCode => Some(&mut self.claude),
+            ExtensionType::Codex => Some(&mut self.codex),
+            ExtensionType::Copilot => Some(&mut self.copilot),
+            ExtensionType::Gemini => Some(&mut self.gemini),
+            ExtensionType::Grok => Some(&mut self.grok),
+            ExtensionType::OpenCode => Some(&mut self.opencode),
+            ExtensionType::Cursor => Some(&mut self.cursor),
+            ExtensionType::Hermes => None,
+        };
+        if let Some(rows) = provider_rows {
+            merge_compact_rows(rows, &summary.analysis);
+        }
+
+        self.all_dates
+            .extend(summary.analysis_dates.iter().cloned());
+        let dates = match provider {
+            ExtensionType::ClaudeCode => Some(&mut self.claude_dates),
+            ExtensionType::Codex => Some(&mut self.codex_dates),
+            ExtensionType::Copilot => Some(&mut self.copilot_dates),
+            ExtensionType::Gemini => Some(&mut self.gemini_dates),
+            ExtensionType::Grok => Some(&mut self.grok_dates),
+            ExtensionType::OpenCode => Some(&mut self.opencode_dates),
+            ExtensionType::Cursor => Some(&mut self.cursor_dates),
+            ExtensionType::Hermes => Some(&mut self.hermes_dates),
+        };
+        if let Some(dates) = dates {
+            dates.extend(summary.analysis_dates.iter().cloned());
+        }
+    }
+
     fn add_date(&mut self, provider: Option<ExtensionType>, date: String) {
         self.all_dates.insert(date.clone());
         match provider {
@@ -842,6 +1354,35 @@ impl AnalysisProjection {
             },
             provider_days,
         }
+    }
+}
+
+fn merge_compact_rows(
+    target: &mut FastHashMap<String, AggregatedAnalysisRow>,
+    source: &FastHashMap<String, AggregatedAnalysisRow>,
+) {
+    for (model, row) in source {
+        let entry = target
+            .entry(model.clone())
+            .or_insert_with(|| AggregatedAnalysisRow {
+                model: model.clone(),
+                edit_lines: 0,
+                read_lines: 0,
+                write_lines: 0,
+                bash_count: 0,
+                edit_count: 0,
+                read_count: 0,
+                todo_write_count: 0,
+                write_count: 0,
+            });
+        entry.edit_lines += row.edit_lines;
+        entry.read_lines += row.read_lines;
+        entry.write_lines += row.write_lines;
+        entry.bash_count += row.bash_count;
+        entry.edit_count += row.edit_count;
+        entry.read_count += row.read_count;
+        entry.todo_write_count += row.todo_write_count;
+        entry.write_count += row.write_count;
     }
 }
 

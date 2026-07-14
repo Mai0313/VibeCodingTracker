@@ -1,19 +1,16 @@
-//! Process-wide LRU cache of parsed session analyses.
+//! Library-facing LRU cache of parsed session analyses.
 //!
-//! Wraps [`FileParseCache`] in a global singleton ([`GLOBAL_FILE_CACHE`]) so
-//! every command shares one bounded, dependency-invalidated cache rather than
-//! reparsing the same session files.
+//! The global singleton is retained for source compatibility with library
+//! callers. CLI summary scans use the compact process-local cache instead.
 
 mod file_cache;
 
 pub use file_cache::{CacheStats, FileParseCache};
 
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 
-/// Global singleton cache shared across all application commands.
-///
-/// Ensures consistent caching behavior and prevents duplicate memory usage.
-pub static GLOBAL_FILE_CACHE: Lazy<FileParseCache> = Lazy::new(FileParseCache::new);
+/// Global singleton retained for library callers.
+pub static GLOBAL_FILE_CACHE: LazyLock<FileParseCache> = LazyLock::new(FileParseCache::new);
 
 /// Returns a reference to the global file parse cache.
 pub fn global_cache() -> &'static FileParseCache {

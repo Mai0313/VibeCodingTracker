@@ -26,32 +26,33 @@ use crate::VERSION;
 use crate::cli::TimeRange;
 use crate::constants::FastHashMap;
 use crate::models::{CodeAnalysis, CodeAnalysisRecord, ExtensionType};
-use crate::pricing::{ModelPricingMap, fetch_model_pricing};
-use crate::session::diagnostics::DatabaseAnalysisRow;
+use crate::session::diagnostics::{
+    DatabaseAnalysisRow, DatabaseUsageRead, UsageContribution, UsageTokenContribution,
+};
+use crate::session::sqlite::{
+    DatabaseFingerprint, optional_database_fingerprint, with_readonly_connection,
+};
 use crate::session::state::{ParseMode, SessionParseState};
-use crate::usage::{CostSource, resolve_model_cost};
-use crate::utils::{TokenCounts, get_current_user, get_machine_id};
-use anyhow::{Context, Result, anyhow};
-use rusqlite::{Connection, OpenFlags};
+use crate::utils::{get_current_user, get_machine_id};
+use anyhow::{Result, anyhow};
+use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 // ===========================================================================
 // Public entry points
 // ===========================================================================
 
-/// Reads per-model token usage + cost for Cursor.
+/// Reads per-model token usage for Cursor.
 ///
 /// Cursor does not persist real billing tokens locally (only a context gauge),
 /// so this is a deliberately-rough estimate from the chat stores: the context
-/// gauge is counted as cache-read tokens and priced with LiteLLM (`$0` for
-/// models Cursor prices itself). It stays consistent with the other providers,
-/// whose `usage` is likewise computed from local session data.
+/// gauge is counted as cache-read tokens. The caller applies the shared
+/// LiteLLM pricing map so a TUI refresh does not rebuild it per reader call.
 ///
-/// Each returned tuple is `(local YYYY-MM-DD, CodeAnalysis, cost_usd)` with the
-/// analysis carrying one model's `conversation_usage`, matching
+/// Each returned tuple is `(local YYYY-MM-DD, CodeAnalysis, 0.0)` with the
+/// analysis carrying one model's `conversation_usage`, matching the shape of
 /// [`crate::session::read_opencode_usage`].
 ///
 /// # Errors
@@ -62,10 +63,54 @@ pub fn read_cursor_usage(
     tracking_db: &Path,
     time_range: TimeRange,
 ) -> Result<Vec<(String, CodeAnalysis, f64)>> {
+    let result = read_cursor_usage_with_diagnostics(chats_dir, tracking_db, time_range);
+    for failure in &result.failures {
+        log::warn!(
+            "failed to read Cursor usage store {}: {}",
+            failure.path.display(),
+            failure.error
+        );
+    }
+    if result.candidates > 0 && result.parsed == 0 {
+        return Err(anyhow!(
+            "failed to read all {} Cursor usage stores",
+            result.candidates
+        ));
+    }
     let user = get_current_user();
     let machine = get_machine_id().to_string();
-    let events = approximation_events(chats_dir, tracking_db)?;
-    Ok(aggregate_events(&events, time_range, &user, &machine))
+    Ok(result
+        .rows
+        .into_iter()
+        .map(|row| row.into_public_row(ExtensionType::Cursor, &user, &machine))
+        .collect())
+}
+
+/// Per-store Cursor usage result used by diagnostics-aware collection.
+pub(crate) struct CursorUsageRead {
+    /// Successfully aggregated date/model rows.
+    pub rows: Vec<UsageContribution>,
+    /// Number of discovered stores, or one traversal candidate on failure.
+    pub candidates: usize,
+    /// Stores decoded successfully, including valid empty stores.
+    pub parsed: usize,
+    /// Store-level open or decode failures.
+    pub failures: Vec<CursorAnalysisFailure>,
+}
+
+/// Reads Cursor usage while preserving partial store failures.
+pub(crate) fn read_cursor_usage_with_diagnostics(
+    chats_dir: &Path,
+    tracking_db: &Path,
+    time_range: TimeRange,
+) -> CursorUsageRead {
+    let read = approximation_events(chats_dir, tracking_db);
+    CursorUsageRead {
+        rows: aggregate_events(&read.events, time_range),
+        candidates: read.candidates,
+        parsed: read.parsed,
+        failures: read.failures,
+    }
 }
 
 /// Reads per-model file-operation metrics for Cursor from the chat stores.
@@ -116,6 +161,12 @@ pub(crate) struct CursorAnalysisFailure {
     pub error: String,
 }
 
+/// Accessible Cursor stores plus traversal failures discovered beside them.
+pub(crate) struct CursorStoreDiscovery {
+    pub stores: Vec<PathBuf>,
+    pub failures: Vec<CursorAnalysisFailure>,
+}
+
 /// Per-store Cursor analysis result used by the batch collector.
 pub(crate) struct CursorAnalysisRead {
     /// Successfully decoded date/session rows.
@@ -128,10 +179,10 @@ pub(crate) struct CursorAnalysisRead {
     pub failures: Vec<CursorAnalysisFailure>,
 }
 
-struct CursorStoreAnalysis {
-    rows: Vec<(String, CodeAnalysis)>,
-    normalized_messages: usize,
-    failed_payloads: usize,
+pub(crate) struct CursorStoreAnalysis {
+    pub(crate) rows: Vec<(String, CodeAnalysis)>,
+    pub(crate) normalized_messages: usize,
+    pub(crate) failed_payloads: usize,
 }
 
 /// Reads Cursor stores while retaining one diagnostic per store.
@@ -141,16 +192,26 @@ pub(crate) fn read_cursor_analysis_with_diagnostics(
     time_range: TimeRange,
     mode: ParseMode,
 ) -> CursorAnalysisRead {
-    let conv_models = load_conversation_models(tracking_db);
+    let (conv_models, tracking_failure) = match load_conversation_models(tracking_db) {
+        Ok(models) => (models, None),
+        Err(error) => (
+            FastHashMap::default(),
+            Some(CursorAnalysisFailure {
+                path: tracking_db.to_path_buf(),
+                error: error.to_string(),
+            }),
+        ),
+    };
     let user = get_current_user();
     let machine = get_machine_id().to_string();
 
-    let store_dbs = cursor_store_dbs(chats_dir);
-    let candidates = store_dbs.len();
+    let discovery = discover_cursor_store_dbs(chats_dir);
+    let candidates = discovery.stores.len() + discovery.failures.len();
     let mut parsed = 0usize;
     let mut out = Vec::new();
-    let mut failures = Vec::new();
-    for store_db in store_dbs {
+    let mut failures = discovery.failures;
+    failures.extend(tracking_failure);
+    for store_db in discovery.stores {
         match read_store_analysis(&store_db, &conv_models, time_range, mode, &user, &machine) {
             Ok(store) if store.normalized_messages == 0 && store.failed_payloads > 0 => {
                 failures.push(CursorAnalysisFailure {
@@ -205,6 +266,7 @@ pub(crate) fn read_cursor_analysis_with_diagnostics(
 #[derive(Debug)]
 struct UsageEvent {
     date: String,
+    timestamp_ms: i64,
     model: String,
     input: i64,
     output: i64,
@@ -213,27 +275,64 @@ struct UsageEvent {
     cost: f64,
 }
 
-/// Turns the usage events into the `(date, CodeAnalysis, cost)` tuples the
-/// usage aggregator consumes, filtered by `time_range`.
-fn aggregate_events(
-    events: &[UsageEvent],
-    time_range: TimeRange,
-    user: &str,
-    machine: &str,
-) -> Vec<(String, CodeAnalysis, f64)> {
+struct CursorUsageEvents {
+    events: Vec<UsageEvent>,
+    candidates: usize,
+    parsed: usize,
+    failures: Vec<CursorAnalysisFailure>,
+}
+
+/// Turns usage events into compact summary contributions.
+fn aggregate_events(events: &[UsageEvent], time_range: TimeRange) -> Vec<UsageContribution> {
     let cutoff = cutoff_string(time_range);
     let mut out = Vec::new();
     for e in events {
         if is_before_cutoff(&e.date, &cutoff) {
             continue;
         }
-        let usage = cursor_usage_value(e.input, e.output, e.cache_read, e.cache_write);
-        let mut map = FastHashMap::default();
-        map.insert(e.model.clone(), usage);
-        let record = SessionParseState::with_mode(ParseMode::UsageOnly).into_record(map);
-        out.push((e.date.clone(), wrap_record(record, user, machine), e.cost));
+        out.push(UsageContribution::single_model(
+            e.date.clone(),
+            e.timestamp_ms,
+            e.model.clone(),
+            cursor_usage_value(e.input, e.output, e.cache_read, e.cache_write),
+            e.cost,
+        ));
     }
     out
+}
+
+/// Reads one Cursor store into compact usage contributions.
+///
+/// The caller owns discovery and the shared tracking index so an incremental
+/// scan can fingerprint and refresh each store independently.
+pub(crate) fn read_cursor_usage_store(
+    store_db: &Path,
+    conv_models: &FastHashMap<String, String>,
+    time_range: TimeRange,
+) -> Result<DatabaseUsageRead> {
+    let conv_id = conversation_id_from_path(store_db);
+    let read = read_store_context(store_db, conv_models, &conv_id)?;
+    let events = read
+        .turns
+        .into_iter()
+        .filter_map(|(timestamp_ms, cache_read)| {
+            ms_to_local_date(timestamp_ms).map(|date| UsageEvent {
+                date,
+                timestamp_ms,
+                model: read.model.clone(),
+                input: 0,
+                output: 0,
+                cache_read,
+                cache_write: 0,
+                cost: 0.0,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(DatabaseUsageRead {
+        rows: aggregate_events(&events, time_range),
+        expected_records: read.expected_records,
+        parsed_records: read.parsed_records,
+    })
 }
 
 // ===========================================================================
@@ -251,52 +350,86 @@ fn aggregate_events(
 /// unknown (`0`) and the stored cost is `0` (models Cursor prices itself, e.g.
 /// `composer-*`, have no LiteLLM entry and stay `$0`). Deliberately rough.
 /// Returns all dates; the caller filters by time range.
-fn approximation_events(chats_dir: &Path, tracking_db: &Path) -> Result<Vec<UsageEvent>> {
-    let conv_models = load_conversation_models(tracking_db);
-    // Price the approximate cache-read tokens ourselves, since Cursor gives no
-    // cost offline and the display treats a Cursor stored cost as authoritative.
-    // Use the exact-match-or-zero basis (`OpenCodeStored(0.0)`): a Cursor-routed
-    // Claude/GPT model with an exact LiteLLM entry is priced at its cache rate,
-    // while a model Cursor prices itself (`composer-*`) has no entry and stays
-    // `$0` — never the fuzzy path, which would mis-price `composer-*`.
-    let pricing = fetch_model_pricing().unwrap_or_else(|_| ModelPricingMap::new(HashMap::new()));
-
-    // (date, model) -> summed context-window gauge
-    let mut agg: HashMap<(String, String), i64> = HashMap::new();
-    for store_db in cursor_store_dbs(chats_dir) {
+fn approximation_events(chats_dir: &Path, tracking_db: &Path) -> CursorUsageEvents {
+    let (conv_models, tracking_failure) = match load_conversation_models(tracking_db) {
+        Ok(models) => (models, None),
+        Err(error) => (
+            FastHashMap::default(),
+            Some(CursorAnalysisFailure {
+                path: tracking_db.to_path_buf(),
+                error: error.to_string(),
+            }),
+        ),
+    };
+    // (date, model) -> (summed context-window gauge, latest timestamp)
+    let mut agg: HashMap<(String, String), (i64, i64)> = HashMap::new();
+    let discovery = discover_cursor_store_dbs(chats_dir);
+    let candidates = discovery.stores.len() + discovery.failures.len();
+    let mut parsed = 0usize;
+    let mut failures = discovery.failures;
+    failures.extend(tracking_failure);
+    for store_db in discovery.stores {
         let conv_id = conversation_id_from_path(&store_db);
-        let Ok((model, turns)) = read_store_context(&store_db, &conv_models, &conv_id) else {
-            continue;
+        let read = match read_store_context(&store_db, &conv_models, &conv_id) {
+            Ok(read) if read.expected_records > 0 && read.parsed_records == 0 => {
+                failures.push(CursorAnalysisFailure {
+                    path: store_db,
+                    error: format!(
+                        "none of {} Cursor usage payloads used a supported schema",
+                        read.expected_records
+                    ),
+                });
+                continue;
+            }
+            Ok(read) => {
+                parsed += 1;
+                if read.expected_records > read.parsed_records {
+                    failures.push(CursorAnalysisFailure {
+                        path: store_db.clone(),
+                        error: format!(
+                            "{} Cursor usage payloads used an unsupported schema",
+                            read.expected_records - read.parsed_records
+                        ),
+                    });
+                }
+                read
+            }
+            Err(error) => {
+                failures.push(CursorAnalysisFailure {
+                    path: store_db,
+                    error: error.to_string(),
+                });
+                continue;
+            }
         };
-        for (ts, ctx) in turns {
+        for (ts, ctx) in read.turns {
             let Some(date) = ms_to_local_date(ts) else {
                 continue;
             };
-            *agg.entry((date, model.clone())).or_insert(0) += ctx;
+            let entry = agg.entry((date, read.model.clone())).or_insert((0, ts));
+            entry.0 += ctx;
+            entry.1 = entry.1.max(ts);
         }
     }
 
-    Ok(agg
-        .into_iter()
-        .map(|((date, model), ctx)| {
-            // Re-sent context is cache-read; priced at the cache rate.
-            let counts = TokenCounts {
-                cache_read: ctx,
-                ..Default::default()
-            };
-            let (cost, _) =
-                resolve_model_cost(&model, &counts, &pricing, CostSource::OpenCodeStored(0.0));
-            UsageEvent {
+    CursorUsageEvents {
+        events: agg
+            .into_iter()
+            .map(|((date, model), (ctx, timestamp_ms))| UsageEvent {
                 date,
+                timestamp_ms,
                 model,
                 input: 0,
                 output: 0,
                 cache_read: ctx,
                 cache_write: 0,
-                cost,
-            }
-        })
-        .collect())
+                cost: 0.0,
+            })
+            .collect(),
+        candidates,
+        parsed,
+        failures,
+    }
 }
 
 // ===========================================================================
@@ -305,30 +438,93 @@ fn approximation_events(chats_dir: &Path, tracking_db: &Path) -> Result<Vec<Usag
 
 /// Enumerates every `chats/<projectHash>/<conversationId>/store.db` under the
 /// chats root (exactly two directory levels deep).
-fn cursor_store_dbs(chats_dir: &Path) -> Vec<PathBuf> {
+pub(crate) fn discover_cursor_store_dbs(chats_dir: &Path) -> CursorStoreDiscovery {
     let mut dbs = Vec::new();
-    let Ok(projects) = std::fs::read_dir(chats_dir) else {
-        return dbs;
-    };
-    for project in projects.flatten() {
-        if !project.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            continue;
+    let mut failures = Vec::new();
+    let projects = match std::fs::read_dir(chats_dir) {
+        Ok(projects) => projects,
+        Err(error) => {
+            return CursorStoreDiscovery {
+                stores: dbs,
+                failures: vec![CursorAnalysisFailure {
+                    path: chats_dir.to_path_buf(),
+                    error: error.to_string(),
+                }],
+            };
         }
-        let Ok(convs) = std::fs::read_dir(project.path()) else {
-            continue;
-        };
-        for conv in convs.flatten() {
-            if !conv.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+    };
+    for project in projects {
+        let project = match project {
+            Ok(project) => project,
+            Err(error) => {
+                failures.push(CursorAnalysisFailure {
+                    path: chats_dir.to_path_buf(),
+                    error: error.to_string(),
+                });
                 continue;
             }
+        };
+        match project.file_type() {
+            Ok(kind) if !kind.is_dir() => continue,
+            Ok(_) => {}
+            Err(error) => {
+                failures.push(CursorAnalysisFailure {
+                    path: project.path(),
+                    error: error.to_string(),
+                });
+                continue;
+            }
+        }
+        let conversations = match std::fs::read_dir(project.path()) {
+            Ok(conversations) => conversations,
+            Err(error) => {
+                failures.push(CursorAnalysisFailure {
+                    path: project.path(),
+                    error: error.to_string(),
+                });
+                continue;
+            }
+        };
+        for conv in conversations {
+            let conv = match conv {
+                Ok(conv) => conv,
+                Err(error) => {
+                    failures.push(CursorAnalysisFailure {
+                        path: project.path(),
+                        error: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            match conv.file_type() {
+                Ok(kind) if !kind.is_dir() => continue,
+                Ok(_) => {}
+                Err(error) => {
+                    failures.push(CursorAnalysisFailure {
+                        path: conv.path(),
+                        error: error.to_string(),
+                    });
+                    continue;
+                }
+            }
             let db = conv.path().join("store.db");
-            if db.is_file() {
-                dbs.push(db);
+            match std::fs::metadata(&db) {
+                Ok(metadata) if metadata.is_file() => dbs.push(db),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => failures.push(CursorAnalysisFailure {
+                    path: db,
+                    error: error.to_string(),
+                }),
             }
         }
     }
     dbs.sort_unstable();
-    dbs
+    failures.sort_by(|left, right| left.path.cmp(&right.path));
+    CursorStoreDiscovery {
+        stores: dbs,
+        failures,
+    }
 }
 
 /// The conversationId is the store.db's parent directory name.
@@ -344,38 +540,74 @@ fn conversation_id_from_path(store_db: &Path) -> String {
 ///
 /// Each conversation is authored by a single model in practice; when more than
 /// one appears, the one with the most tracked lines wins. Returns an empty map
-/// when the DB is absent or unreadable — callers fall back to the store's
-/// `lastUsedModel`.
-fn load_conversation_models(tracking_db: &Path) -> FastHashMap<String, String> {
-    let mut map = FastHashMap::default();
-    if !tracking_db.exists() {
-        return map;
+/// when the DB is absent; read and schema failures remain retryable errors.
+pub(crate) fn load_conversation_models(tracking_db: &Path) -> Result<FastHashMap<String, String>> {
+    match std::fs::metadata(tracking_db) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(FastHashMap::default());
+        }
+        Err(error) => return Err(error.into()),
     }
-    let loaded = open_readonly(tracking_db, "ai_code_hashes", |conn| {
-        let mut stmt = conn.prepare(
-            "SELECT conversationId, model, COUNT(*) AS c FROM ai_code_hashes \
+    with_readonly_connection(
+        tracking_db,
+        "ai_code_hashes",
+        "vct-cursor-",
+        "Cursor",
+        |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT conversationId, model, COUNT(*) AS c FROM ai_code_hashes \
              WHERE conversationId IS NOT NULL AND conversationId != '' \
                AND model IS NOT NULL AND model != '' \
              GROUP BY conversationId, model ORDER BY c DESC, model ASC",
-        )?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-        let mut m: FastHashMap<String, String> = FastHashMap::default();
-        for row in rows {
-            let row = row?;
-            // Rows are ordered by descending line count, so the first model seen
-            // for a conversation is its dominant one.
-            m.entry(row.0).or_insert(row.1);
+            )?;
+            let rows =
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            let mut m: FastHashMap<String, String> = FastHashMap::default();
+            for row in rows {
+                let row = row?;
+                // Rows are ordered by descending line count, so the first model seen
+                // for a conversation is its dominant one.
+                m.entry(row.0).or_insert(row.1);
+            }
+            Ok(m)
+        },
+    )
+}
+
+/// Model attribution read from one stable tracking-database fingerprint.
+pub(crate) struct ConversationModelSnapshot {
+    pub(crate) models: FastHashMap<String, String>,
+    pub(crate) fingerprint: Option<DatabaseFingerprint>,
+}
+
+/// Loads Cursor model attribution without pairing map A with fingerprint B.
+pub(crate) fn load_conversation_model_snapshot(
+    tracking_db: &Path,
+) -> Result<ConversationModelSnapshot> {
+    const MAX_ATTEMPTS: usize = 3;
+    for attempt in 0..MAX_ATTEMPTS {
+        let before = optional_database_fingerprint(tracking_db)?;
+        let models = load_conversation_models(tracking_db)?;
+        let after = optional_database_fingerprint(tracking_db)?;
+        if before == after {
+            return Ok(ConversationModelSnapshot {
+                models,
+                fingerprint: after,
+            });
         }
-        Ok(m)
-    });
-    if let Ok(m) = loaded {
-        map = m;
+        if attempt + 1 == MAX_ATTEMPTS {
+            anyhow::bail!(
+                "Cursor tracking DB changed while being read after {MAX_ATTEMPTS} attempts: {}",
+                tracking_db.display()
+            );
+        }
     }
-    map
+    unreachable!("tracking snapshot loop always returns")
 }
 
 /// Parses one chat store into per-(date) analysis records for its model.
-fn read_store_analysis(
+pub(crate) fn read_store_analysis(
     store_db: &Path,
     conv_models: &FastHashMap<String, String>,
     time_range: TimeRange,
@@ -386,7 +618,7 @@ fn read_store_analysis(
     let conv_id = conversation_id_from_path(store_db);
     let cutoff = cutoff_string(time_range);
 
-    open_readonly(store_db, "blobs", |conn| {
+    with_readonly_connection(store_db, "blobs", "vct-cursor-", "Cursor", |conn| {
         let transaction = conn.unchecked_transaction()?;
         let model = resolve_store_model(&transaction, conv_models, &conv_id);
         let blobs = load_blobs(&transaction)?;
@@ -488,16 +720,25 @@ fn read_store_analysis(
 ///
 /// Returns the conversation's model plus `(timestamp_ms, context_tokens)` for
 /// every assistant turn that carries the gauge.
+struct CursorStoreContextRead {
+    model: String,
+    turns: Vec<(i64, i64)>,
+    expected_records: usize,
+    parsed_records: usize,
+}
+
 fn read_store_context(
     store_db: &Path,
     conv_models: &FastHashMap<String, String>,
     conv_id: &str,
-) -> Result<(String, Vec<(i64, i64)>)> {
-    open_readonly(store_db, "blobs", |conn| {
+) -> Result<CursorStoreContextRead> {
+    with_readonly_connection(store_db, "blobs", "vct-cursor-", "Cursor", |conn| {
         let transaction = conn.unchecked_transaction()?;
         let model = resolve_store_model(&transaction, conv_models, conv_id);
         let blobs = load_blobs(&transaction)?;
         let mut turns = Vec::new();
+        let mut expected_records = 0usize;
+        let mut parsed_records = 0usize;
         for data in &blobs {
             if data.first() != Some(&0x0A) {
                 continue;
@@ -511,15 +752,26 @@ fn read_store_context(
             // also stores intermediate DAG nodes that carry the running gauge but
             // no assistant message; counting those would roughly double the
             // approximation's tokens and inflate its active-day count.
-            if !message_is_assistant(msg_bytes) {
-                continue;
-            }
-            if let Some(ctx) = context_tokens(ctx_msg) {
-                turns.push((ts, ctx));
+            let role = message_role(msg_bytes);
+            match role.as_deref() {
+                Some("assistant") => {
+                    expected_records += 1;
+                    if let Some(ctx) = context_tokens(ctx_msg) {
+                        turns.push((ts, ctx));
+                        parsed_records += 1;
+                    }
+                }
+                Some("user" | "tool" | "system") => {}
+                Some(_) | None => expected_records += 1,
             }
         }
         transaction.commit()?;
-        Ok((model, turns))
+        Ok(CursorStoreContextRead {
+            model,
+            turns,
+            expected_records,
+            parsed_records,
+        })
     })
 }
 
@@ -576,15 +828,15 @@ fn assistant_node(data: &[u8]) -> Option<(&[u8], i64)> {
 }
 
 /// Whether a message JSON blob is an assistant turn.
-fn message_is_assistant(bytes: &[u8]) -> bool {
+fn message_role(bytes: &[u8]) -> Option<String> {
     serde_json::from_slice::<Value>(bytes)
         .ok()
-        .and_then(|m| {
-            m.get("role")
-                .and_then(|v| v.as_str())
-                .map(|role| role == "assistant")
+        .and_then(|message| {
+            message
+                .get("role")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
         })
-        .unwrap_or(false)
 }
 
 /// Applies one assistant message's tool calls to `state`.
@@ -880,13 +1132,19 @@ fn read_varint(data: &[u8], pos: usize) -> Option<(u64, usize)> {
 // ===========================================================================
 
 /// Builds the Claude-style flat usage value the token extractor understands.
-fn cursor_usage_value(input: i64, output: i64, cache_read: i64, cache_write: i64) -> Value {
-    json!({
-        "input_tokens": input,
-        "output_tokens": output,
-        "cache_read_input_tokens": cache_read,
-        "cache_creation_input_tokens": cache_write,
-    })
+fn cursor_usage_value(
+    input: i64,
+    output: i64,
+    cache_read: i64,
+    cache_write: i64,
+) -> UsageTokenContribution {
+    UsageTokenContribution {
+        input_tokens: input,
+        output_tokens: output,
+        reasoning_tokens: 0,
+        cache_read_tokens: cache_read,
+        cache_creation_tokens: cache_write,
+    }
 }
 
 /// Wraps a record into a Cursor-tagged [`CodeAnalysis`].
@@ -938,71 +1196,6 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
         i += 2;
     }
     Some(out)
-}
-
-/// Opens a Cursor SQLite DB read-only, falling back to a temp copy (with WAL
-/// sidecars) if the read-only open cannot see the data.
-///
-/// `probe` is a table known to exist, used to confirm the connection works.
-/// Mirrors the OpenCode reader's `with_connection`, generalized over the probe.
-fn open_readonly<T>(
-    db_path: &Path,
-    probe: &str,
-    f: impl FnOnce(&Connection) -> Result<T>,
-) -> Result<T> {
-    let probe_sql = format!("SELECT count(*) FROM {probe}");
-    if let Ok(conn) = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        && conn.query_row(&probe_sql, [], |_| Ok(())).is_ok()
-    {
-        return f(&conn);
-    }
-
-    let copy = TempDbCopy::new(db_path)?;
-    let conn = Connection::open_with_flags(&copy.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| {
-            format!(
-                "Failed to open Cursor DB copy at {}",
-                copy.db_path.display()
-            )
-        })?;
-    f(&conn)
-}
-
-/// A private temp-directory copy of a Cursor DB (plus WAL sidecars), removed on
-/// drop. The temp dir has owner-only permissions so the chat data is never
-/// exposed to other local users.
-struct TempDbCopy {
-    _dir: tempfile::TempDir,
-    db_path: PathBuf,
-}
-
-impl TempDbCopy {
-    fn new(src: &Path) -> Result<Self> {
-        let file_name = src
-            .file_name()
-            .ok_or_else(|| anyhow!("Invalid Cursor DB path: {}", src.display()))?;
-        let dir = tempfile::Builder::new()
-            .prefix("vct-cursor-")
-            .tempdir()
-            .context("Failed to create temp dir for Cursor DB copy")?;
-        let db_path = dir.path().join(file_name);
-        std::fs::copy(src, &db_path)
-            .with_context(|| format!("Failed to copy Cursor DB from {}", src.display()))?;
-        for suffix in ["-wal", "-shm"] {
-            let sidecar = append_suffix(src, suffix);
-            if sidecar.exists() {
-                let _ = std::fs::copy(&sidecar, append_suffix(&db_path, suffix));
-            }
-        }
-        Ok(Self { _dir: dir, db_path })
-    }
-}
-
-/// Appends a raw suffix to a path's final component (e.g. `db` -> `db-wal`).
-fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut os: OsString = path.as_os_str().to_owned();
-    os.push(suffix);
-    PathBuf::from(os)
 }
 
 #[cfg(test)]
@@ -1137,7 +1330,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let models = load_conversation_models(&path);
+        let models = load_conversation_models(&path).unwrap();
         assert_eq!(
             models.get("conversation").map(String::as_str),
             Some("a-model")
@@ -1193,6 +1386,7 @@ mod tests {
         let events = vec![
             UsageEvent {
                 date: "2999-01-01".to_string(),
+                timestamp_ms: 32_470_920_000_000,
                 model: "claude-sonnet-4.6".to_string(),
                 input: 100,
                 output: 20,
@@ -1202,6 +1396,7 @@ mod tests {
             },
             UsageEvent {
                 date: "2000-01-01".to_string(),
+                timestamp_ms: 946_684_800_000,
                 model: "composer-2".to_string(),
                 input: 5,
                 output: 5,
@@ -1211,16 +1406,13 @@ mod tests {
             },
         ];
         // Daily cutoff drops the ancient 2000 row but keeps the far-future one.
-        let rows = aggregate_events(&events, TimeRange::Daily, "u", "m");
+        let rows = aggregate_events(&events, TimeRange::Daily);
         assert_eq!(rows.len(), 1);
-        let (date, analysis, cost) = &rows[0];
-        assert_eq!(date, "2999-01-01");
-        assert!((cost - 1.5).abs() < 1e-9);
-        assert!(
-            analysis.records[0]
-                .conversation_usage
-                .contains_key("claude-sonnet-4.6")
-        );
+        let row = &rows[0];
+        assert_eq!(row.date, "2999-01-01");
+        assert_eq!(row.timestamp_ms, 32_470_920_000_000);
+        assert!((row.stored_cost - 1.5).abs() < 1e-9);
+        assert_eq!(row.model, "claude-sonnet-4.6");
     }
 
     /// Builds a temp `store.db` with the given binary nodes and JSON blobs.
@@ -1322,13 +1514,58 @@ mod tests {
         let (_dir, path) = make_store_db(&[a, b, non_assistant], &[]);
 
         let conv_models = FastHashMap::default();
-        let (model, mut turns) = read_store_context(&path, &conv_models, "conv").unwrap();
-        turns.sort();
-        assert_eq!(model, "unknown");
+        let mut read = read_store_context(&path, &conv_models, "conv").unwrap();
+        read.turns.sort();
+        assert_eq!(read.model, "unknown");
         assert_eq!(
-            turns,
+            read.turns,
             vec![(1_700_000_000_000, 42_000), (1_700_000_500_000, 88_000)]
         );
+        assert_eq!(read.expected_records, 2);
+        assert_eq!(read.parsed_records, 2);
+    }
+
+    #[test]
+    fn cursor_usage_reports_unknown_message_schema() {
+        for message in ["not json", r#"{"content":[]}"#] {
+            let dir = tempfile::tempdir().unwrap();
+            let chats = dir.path().join("chats");
+            let store = chats.join("project/conversation/store.db");
+            let node = make_node(message, 1_700_000_000_000, Some(123));
+            write_store_db(&store, &[node], &[]);
+
+            let result = read_cursor_usage_with_diagnostics(
+                &chats,
+                &dir.path().join("tracking.db"),
+                TimeRange::All,
+            );
+            assert_eq!(result.candidates, 1);
+            assert_eq!(result.parsed, 0);
+            assert!(result.rows.is_empty());
+            assert_eq!(result.failures.len(), 1);
+            assert!(result.failures[0].error.contains("none of 1"));
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let chats = dir.path().join("chats");
+        let store = chats.join("project/conversation/store.db");
+        let valid = make_node(
+            r#"{"role":"assistant","content":[]}"#,
+            1_700_000_000_000,
+            Some(123),
+        );
+        let invalid = make_node(r#"{"content":[]}"#, 1_700_000_001_000, Some(456));
+        write_store_db(&store, &[valid, invalid], &[]);
+        let result = read_cursor_usage_with_diagnostics(
+            &chats,
+            &dir.path().join("tracking.db"),
+            TimeRange::All,
+        );
+        assert_eq!(result.candidates, 1);
+        assert_eq!(result.parsed, 1);
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.failures.len(), 1);
+        assert!(result.failures[0].error.contains("1 Cursor usage payload"));
     }
 
     #[test]

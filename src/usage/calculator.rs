@@ -15,9 +15,22 @@ use crate::models::{
     CodeAnalysis, ExtensionType, PerProviderUsage, Provider, ProviderActiveDays, UsageResult,
 };
 use crate::pricing::{ModelPricingMap, calculate_cost};
+use crate::session::cursor::{
+    discover_cursor_store_dbs, load_conversation_model_snapshot, read_cursor_usage_store,
+};
+use crate::session::diagnostics::DatabaseUsageRead;
+use crate::session::hermes::read_hermes_usage_contributions;
+use crate::session::opencode::read_opencode_usage_contributions;
+use crate::session::parser::parse_session_file_as_with_diagnostics;
+use crate::session::sqlite::is_cacheable_sqlite_failure;
 use crate::session::{
     ParseMode, parse_session_file_as, read_cursor_usage, read_hermes_usage, read_opencode_usage,
 };
+use crate::summary_cache::{
+    CachedSourceSummary, CompactSourceSummary, SourceFingerprint, SummaryCacheKey, SummaryKind,
+    SummaryScanCache, provider_scan_rank,
+};
+use crate::utils::directory::{FileInfo, collect_files_with_max_depth_diagnostics};
 use crate::utils::{
     COPILOT_SESSION_MAX_DEPTH, GROK_SESSION_MAX_DEPTH, HelperPaths, TokenCounts,
     collect_files_with_max_depth, is_claude_session_file, is_codex_session_file,
@@ -27,7 +40,7 @@ use anyhow::Result;
 use rayon::prelude::*;
 use serde_json::{Value, json};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Aggregated token usage plus the per-provider active-day counts.
 ///
@@ -70,14 +83,59 @@ pub struct UsageData {
     pub stored_costs: StoredCosts,
 }
 
+/// One independently readable usage source that could not be collected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageCollectionFailure {
+    /// Provider selected from the source directory or database.
+    pub provider: ExtensionType,
+    /// File, database, or Cursor collection root that failed.
+    pub source: PathBuf,
+    /// Content-safe error summary.
+    pub error: String,
+}
+
+/// Candidate, success, and failure counts for a usage scan.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsageCollectionDiagnostics {
+    /// Independently readable sources discovered by the scan.
+    pub candidates: usize,
+    /// Sources parsed or read successfully, including valid blank sources.
+    pub parsed: usize,
+    /// Complete and partial failures in deterministic provider/source order.
+    pub failures: Vec<UsageCollectionFailure>,
+}
+
+impl UsageCollectionDiagnostics {
+    /// Whether at least one source failed or was only partially understood.
+    pub fn has_failures(&self) -> bool {
+        !self.failures.is_empty()
+    }
+
+    /// Whether candidates existed but none could be read successfully.
+    pub fn all_failed(&self) -> bool {
+        self.candidates > 0 && self.parsed == 0
+    }
+
+    /// Whether successful results coexist with one or more failures.
+    pub fn partially_failed(&self) -> bool {
+        self.parsed > 0 && self.has_failures()
+    }
+}
+
+/// Usage data paired with source-collection diagnostics.
+pub struct UsageCollection {
+    /// Successfully collected usage.
+    pub data: UsageData,
+    /// Candidate, success, and failure counts from the scan.
+    pub diagnostics: UsageCollectionDiagnostics,
+}
+
 /// Provider-authoritative per-model costs, kept **separate per provider**.
 ///
-/// OpenCode records assistant-message costs and Cursor reports its billed cost
-/// per usage event, so when a model has no exact LiteLLM price we display this
-/// stored cost instead of guessing from a fuzzy match. The two are kept apart
-/// (rather than in one model-keyed map) because a legacy OpenCode session can
-/// carry a *bare* model name that collides with a Cursor model of the same name
-/// — a shared map would then cross-contaminate their costs.
+/// OpenCode and Hermes record their own costs. The Cursor map is retained for
+/// source compatibility, but the local Cursor estimate now carries zero stored
+/// cost and is priced by an exact LiteLLM match in the display layer. Separate
+/// maps prevent a colliding bare model name from cross-contaminating providers.
 #[derive(Debug, Default, Clone)]
 pub struct StoredCosts {
     /// OpenCode's per-model stored cost, keyed by model name.
@@ -93,24 +151,24 @@ pub struct StoredCosts {
 /// Reads directly from the typed `conversation_usage` map instead of walking
 /// `Value` via `.get(...)`, so no intermediate `serde_json::Value` tree is
 /// built or retained here.
-fn extract_conversation_usage_from_analysis(analysis: &CodeAnalysis) -> FastHashMap<String, Value> {
+fn extract_conversation_usage_from_analysis(analysis: CodeAnalysis) -> FastHashMap<String, Value> {
     let mut conversation_usage = FastHashMap::with_capacity(capacity::MODELS_PER_SESSION);
 
-    let mut merge_into = |model: &String, usage: &Value| {
+    let mut merge_into = |model: String, usage: Value| {
         conversation_usage
-            .entry(model.clone())
-            .and_modify(|existing_usage| merge_usage_values(existing_usage, usage))
-            .or_insert_with(|| usage.clone());
+            .entry(model)
+            .and_modify(|existing_usage| merge_usage_values(existing_usage, &usage))
+            .or_insert(usage);
     };
 
-    for record in &analysis.records {
-        for (model, usage) in &record.conversation_usage {
+    for record in analysis.records {
+        for (model, usage) in record.conversation_usage {
             merge_into(model, usage);
         }
         // Claude advisor-message tokens live in a separate map so the
         // `analysis` aggregator ignores them; the `usage` path folds them in
         // here, attributed to the advisor's own model for correct pricing.
-        for (model, usage) in &record.advisor_usage {
+        for (model, usage) in record.advisor_usage {
             merge_into(model, usage);
         }
     }
@@ -351,6 +409,641 @@ pub fn get_usage_from_paths_with(
     })
 }
 
+/// Diagnostics-aware usage scan rooted at the current user's provider paths.
+pub fn get_usage_from_directories_with_diagnostics(
+    time_range: TimeRange,
+    providers: ProvidersConfig,
+) -> Result<UsageCollection> {
+    let mut cache = SummaryScanCache::new();
+    get_usage_from_paths_with_cache(&resolve_paths()?, time_range, providers, &mut cache)
+}
+
+/// Diagnostics-aware usage scan rooted at explicit provider paths.
+pub fn get_usage_from_paths_with_diagnostics(
+    paths: &HelperPaths,
+    time_range: TimeRange,
+    providers: ProvidersConfig,
+) -> Result<UsageCollection> {
+    let mut cache = SummaryScanCache::new();
+    get_usage_from_paths_with_cache(paths, time_range, providers, &mut cache)
+}
+
+/// Incremental usage scan backed by a process-local compact summary cache.
+///
+/// Reusing `cache` across calls reparses only sources whose fingerprint
+/// changed. Cached schema failures retain their diagnostics, while metadata,
+/// open, and read errors are not inserted and are retried next time.
+pub fn get_usage_from_paths_with_cache(
+    paths: &HelperPaths,
+    time_range: TimeRange,
+    providers: ProvidersConfig,
+    cache: &mut SummaryScanCache,
+) -> Result<UsageCollection> {
+    get_usage_from_paths_with_cache_inner(paths, time_range, providers, cache)
+}
+
+fn get_usage_from_paths_with_cache_inner(
+    paths: &HelperPaths,
+    time_range: TimeRange,
+    providers: ProvidersConfig,
+    cache: &mut SummaryScanCache,
+) -> Result<UsageCollection> {
+    cache.begin_scan();
+    let mut accumulator = UsageAccumulator::default();
+    let mut diagnostics = UsageCollectionDiagnostics::default();
+    let mut seen = HashSet::new();
+
+    if providers.claude {
+        scan_usage_files(
+            &paths.claude_session_dir,
+            ExtensionType::ClaudeCode,
+            is_claude_session_file,
+            time_range,
+            None,
+            cache,
+            &mut seen,
+            &mut accumulator,
+            &mut diagnostics,
+        )?;
+    }
+    if providers.codex {
+        scan_usage_files(
+            &paths.codex_session_dir,
+            ExtensionType::Codex,
+            is_codex_session_file,
+            time_range,
+            None,
+            cache,
+            &mut seen,
+            &mut accumulator,
+            &mut diagnostics,
+        )?;
+    }
+    if providers.copilot {
+        scan_usage_files(
+            &paths.copilot_session_dir,
+            ExtensionType::Copilot,
+            is_copilot_session_file,
+            time_range,
+            Some(COPILOT_SESSION_MAX_DEPTH),
+            cache,
+            &mut seen,
+            &mut accumulator,
+            &mut diagnostics,
+        )?;
+    }
+    if providers.gemini {
+        scan_usage_files(
+            &paths.gemini_session_dir,
+            ExtensionType::Gemini,
+            is_gemini_session_file,
+            time_range,
+            None,
+            cache,
+            &mut seen,
+            &mut accumulator,
+            &mut diagnostics,
+        )?;
+    }
+    if providers.grok {
+        scan_usage_files(
+            &paths.grok_session_dir,
+            ExtensionType::Grok,
+            is_grok_session_file,
+            time_range,
+            Some(GROK_SESSION_MAX_DEPTH),
+            cache,
+            &mut seen,
+            &mut accumulator,
+            &mut diagnostics,
+        )?;
+    }
+
+    if providers.opencode && paths.opencode_db.exists() {
+        scan_usage_database(
+            ExtensionType::OpenCode,
+            &paths.opencode_db,
+            SourceFingerprint::sqlite(&paths.opencode_db, &[]),
+            time_range,
+            cache,
+            &mut seen,
+            &mut accumulator,
+            &mut diagnostics,
+            || read_opencode_usage_contributions(&paths.opencode_db, time_range),
+        );
+    }
+    if providers.cursor && paths.cursor_chats_dir.exists() {
+        scan_cursor_usage_database(
+            &paths.cursor_chats_dir,
+            &paths.cursor_tracking_db,
+            time_range,
+            cache,
+            &mut seen,
+            &mut accumulator,
+            &mut diagnostics,
+        );
+    }
+    if providers.hermes && paths.hermes_db.exists() {
+        scan_usage_database(
+            ExtensionType::Hermes,
+            &paths.hermes_db,
+            SourceFingerprint::sqlite(&paths.hermes_db, &[]),
+            time_range,
+            cache,
+            &mut seen,
+            &mut accumulator,
+            &mut diagnostics,
+            || read_hermes_usage_contributions(&paths.hermes_db, time_range),
+        );
+    }
+
+    cache.retain_kinds(&seen, &[SummaryKind::File, SummaryKind::UsageDatabase]);
+    diagnostics.failures.sort_by(|left, right| {
+        provider_scan_rank(left.provider)
+            .cmp(&provider_scan_rank(right.provider))
+            .then_with(|| left.source.cmp(&right.source))
+            .then_with(|| left.error.cmp(&right.error))
+    });
+    Ok(UsageCollection {
+        data: accumulator.finish(),
+        diagnostics,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_usage_files<F>(
+    dir: &Path,
+    provider: ExtensionType,
+    filter: F,
+    time_range: TimeRange,
+    max_depth: Option<usize>,
+    cache: &mut SummaryScanCache,
+    seen: &mut HashSet<SummaryCacheKey>,
+    accumulator: &mut UsageAccumulator,
+    diagnostics: &mut UsageCollectionDiagnostics,
+) -> Result<()>
+where
+    F: Copy + Fn(&Path) -> bool + Sync + Send,
+{
+    let discovery = collect_files_with_max_depth_diagnostics(dir, filter, time_range, max_depth);
+    if !discovery.failures.is_empty() {
+        cache.preserve_provider_keys(seen, SummaryKind::File, provider);
+    }
+    diagnostics.candidates += discovery.failures.len();
+    for failure in discovery.failures {
+        diagnostics.failures.push(UsageCollectionFailure {
+            provider,
+            source: failure.path,
+            error: failure.error,
+        });
+    }
+
+    let mut files = discovery.files;
+    files.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    diagnostics.candidates += files.len();
+
+    let mut misses = Vec::new();
+    for file in files {
+        let key = SummaryCacheKey::new(SummaryKind::File, provider, &file.path, time_range);
+        seen.insert(key.clone());
+        match SourceFingerprint::file(&file.path, provider) {
+            Ok(fingerprint) => {
+                if let Some(cached) = cache.get(&key, &fingerprint) {
+                    fold_cached_usage(provider, &file.path, cached, accumulator, diagnostics);
+                } else {
+                    misses.push((file, key, fingerprint));
+                }
+            }
+            Err(error) => diagnostics.failures.push(UsageCollectionFailure {
+                provider,
+                source: file.path,
+                error: error.to_string(),
+            }),
+        }
+    }
+
+    let loaded: Vec<_> = misses
+        .into_par_iter()
+        .map(|(file, key, fingerprint)| {
+            let result = load_file_summary(&file, provider);
+            (file.path, key, fingerprint, result)
+        })
+        .collect();
+
+    for (source, key, fingerprint, result) in loaded {
+        cache.record_parse();
+        match result {
+            Ok(loaded) => {
+                fold_loaded_usage(provider, &source, &loaded, accumulator, diagnostics);
+                cache.insert(
+                    key,
+                    fingerprint,
+                    loaded.summary,
+                    loaded.parsed,
+                    loaded.failure,
+                );
+            }
+            Err(error) => diagnostics.failures.push(UsageCollectionFailure {
+                provider,
+                source,
+                error: error.to_string(),
+            }),
+        }
+    }
+    Ok(())
+}
+
+fn load_file_summary(file: &FileInfo, provider: ExtensionType) -> Result<LoadedSummary> {
+    let parsed =
+        parse_session_file_as_with_diagnostics(&file.path, provider, ParseMode::UsageOnly)?;
+    if parsed.diagnostics.is_complete_failure() {
+        let failure = if parsed.diagnostics.recognized_records == 0 {
+            "source contained no recognized provider records".to_string()
+        } else {
+            format!(
+                "none of {} analyzer-relevant provider records used a supported schema",
+                parsed.diagnostics.relevant_records
+            )
+        };
+        return Ok(LoadedSummary {
+            summary: CompactSourceSummary::default(),
+            parsed: false,
+            failure: Some(failure),
+        });
+    }
+
+    let emit = parsed.diagnostics.should_emit_session();
+    if emit && parsed.analysis.records.is_empty() {
+        return Ok(LoadedSummary {
+            summary: CompactSourceSummary::default(),
+            parsed: false,
+            failure: Some("normalized source produced no analysis records".to_string()),
+        });
+    }
+    let partial = parsed.diagnostics.partial_failure_count();
+    Ok(LoadedSummary {
+        summary: CompactSourceSummary::from_file(parsed.analysis, file.modified_date.clone(), emit),
+        parsed: true,
+        failure: (partial > 0)
+            .then(|| format!("skipped {partial} malformed or unsupported analyzer records")),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_usage_database<F>(
+    provider: ExtensionType,
+    source: &Path,
+    fingerprint: Result<SourceFingerprint>,
+    time_range: TimeRange,
+    cache: &mut SummaryScanCache,
+    seen: &mut HashSet<SummaryCacheKey>,
+    accumulator: &mut UsageAccumulator,
+    diagnostics: &mut UsageCollectionDiagnostics,
+    loader: F,
+) where
+    F: FnOnce() -> Result<DatabaseUsageRead>,
+{
+    diagnostics.candidates += 1;
+    let key = SummaryCacheKey::new(SummaryKind::UsageDatabase, provider, source, time_range);
+    seen.insert(key.clone());
+    let fingerprint = match fingerprint {
+        Ok(value) => value,
+        Err(error) => {
+            diagnostics.failures.push(UsageCollectionFailure {
+                provider,
+                source: source.to_path_buf(),
+                error: error.to_string(),
+            });
+            return;
+        }
+    };
+    if let Some(cached) = cache.get(&key, &fingerprint) {
+        fold_cached_usage(provider, source, cached, accumulator, diagnostics);
+        return;
+    }
+
+    cache.record_parse();
+    match loader() {
+        Ok(read) => {
+            let complete_failure = read.expected_records > 0 && read.parsed_records == 0;
+            let failed = read.failed_records();
+            let mut summary = CompactSourceSummary::default();
+            for contribution in read.rows {
+                summary.add_usage_contribution(contribution);
+            }
+            let loaded = LoadedSummary {
+                summary,
+                parsed: !complete_failure,
+                failure: if complete_failure {
+                    Some(format!(
+                        "none of {} usage records used a supported schema",
+                        read.expected_records
+                    ))
+                } else if failed > 0 {
+                    Some(format!("{failed} usage records used an unsupported schema"))
+                } else {
+                    None
+                },
+            };
+            fold_loaded_usage(provider, source, &loaded, accumulator, diagnostics);
+            cache.insert(
+                key,
+                fingerprint,
+                loaded.summary,
+                loaded.parsed,
+                loaded.failure,
+            );
+        }
+        Err(error) => {
+            let failure = error.to_string();
+            diagnostics.failures.push(UsageCollectionFailure {
+                provider,
+                source: source.to_path_buf(),
+                error: failure.clone(),
+            });
+            if is_cacheable_sqlite_failure(&error) {
+                cache.insert(
+                    key,
+                    fingerprint,
+                    CompactSourceSummary::default(),
+                    false,
+                    Some(failure),
+                );
+            }
+        }
+    }
+}
+
+fn scan_cursor_usage_database(
+    chats_dir: &Path,
+    tracking_db: &Path,
+    time_range: TimeRange,
+    cache: &mut SummaryScanCache,
+    seen: &mut HashSet<SummaryCacheKey>,
+    accumulator: &mut UsageAccumulator,
+    diagnostics: &mut UsageCollectionDiagnostics,
+) {
+    let provider = ExtensionType::Cursor;
+    let discovery = discover_cursor_store_dbs(chats_dir);
+    if !discovery.failures.is_empty() {
+        cache.preserve_provider_keys(seen, SummaryKind::UsageDatabase, provider);
+    }
+    for failure in discovery.failures {
+        diagnostics.candidates += 1;
+        diagnostics.failures.push(UsageCollectionFailure {
+            provider,
+            source: failure.path,
+            error: failure.error,
+        });
+    }
+
+    let (conv_models, tracking_fingerprint, tracking_ok) =
+        match load_conversation_model_snapshot(tracking_db) {
+            Ok(snapshot) => (snapshot.models, snapshot.fingerprint, true),
+            Err(error) => {
+                diagnostics.failures.push(UsageCollectionFailure {
+                    provider,
+                    source: tracking_db.to_path_buf(),
+                    error: error.to_string(),
+                });
+                (FastHashMap::default(), None, false)
+            }
+        };
+
+    for store in discovery.stores {
+        diagnostics.candidates += 1;
+        let key = SummaryCacheKey::new(SummaryKind::UsageDatabase, provider, &store, time_range);
+        seen.insert(key.clone());
+        let fingerprint = if tracking_ok {
+            SourceFingerprint::sqlite_with_dependency(
+                &store,
+                tracking_db,
+                tracking_fingerprint.as_ref(),
+            )
+        } else {
+            SourceFingerprint::sqlite(&store, &[])
+        };
+        let fingerprint = match fingerprint {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                diagnostics.failures.push(UsageCollectionFailure {
+                    provider,
+                    source: store,
+                    error: error.to_string(),
+                });
+                continue;
+            }
+        };
+        if tracking_ok && let Some(cached) = cache.get(&key, &fingerprint) {
+            fold_cached_usage(provider, &store, cached, accumulator, diagnostics);
+            continue;
+        }
+
+        cache.record_parse();
+        match read_cursor_usage_store(&store, &conv_models, time_range) {
+            Ok(read) => {
+                let complete_failure = read.expected_records > 0 && read.parsed_records == 0;
+                let failed = read.failed_records();
+                let mut summary = CompactSourceSummary::default();
+                for contribution in read.rows {
+                    summary.add_usage_contribution(contribution);
+                }
+                let loaded = LoadedSummary {
+                    summary,
+                    parsed: !complete_failure,
+                    failure: if complete_failure {
+                        Some(format!(
+                            "none of {} Cursor usage payloads used a supported schema",
+                            read.expected_records
+                        ))
+                    } else if failed > 0 {
+                        Some(format!(
+                            "{failed} Cursor usage payloads used an unsupported schema"
+                        ))
+                    } else {
+                        None
+                    },
+                };
+                fold_loaded_usage(provider, &store, &loaded, accumulator, diagnostics);
+                if tracking_ok {
+                    cache.insert(
+                        key,
+                        fingerprint,
+                        loaded.summary,
+                        loaded.parsed,
+                        loaded.failure,
+                    );
+                }
+            }
+            Err(error) => {
+                let failure = error.to_string();
+                diagnostics.failures.push(UsageCollectionFailure {
+                    provider,
+                    source: store.clone(),
+                    error: failure.clone(),
+                });
+                if tracking_ok && is_cacheable_sqlite_failure(&error) {
+                    cache.insert(
+                        key,
+                        fingerprint,
+                        CompactSourceSummary::default(),
+                        false,
+                        Some(failure),
+                    );
+                }
+            }
+        }
+    }
+}
+struct LoadedSummary {
+    summary: CompactSourceSummary,
+    parsed: bool,
+    failure: Option<String>,
+}
+
+fn fold_cached_usage(
+    provider: ExtensionType,
+    source: &Path,
+    cached: &CachedSourceSummary,
+    accumulator: &mut UsageAccumulator,
+    diagnostics: &mut UsageCollectionDiagnostics,
+) {
+    if cached.parsed {
+        diagnostics.parsed += 1;
+        accumulator.add(provider, &cached.summary);
+    }
+    if let Some(error) = &cached.failure {
+        diagnostics.failures.push(UsageCollectionFailure {
+            provider,
+            source: source.to_path_buf(),
+            error: error.clone(),
+        });
+    }
+}
+
+fn fold_loaded_usage(
+    provider: ExtensionType,
+    source: &Path,
+    loaded: &LoadedSummary,
+    accumulator: &mut UsageAccumulator,
+    diagnostics: &mut UsageCollectionDiagnostics,
+) {
+    if loaded.parsed {
+        diagnostics.parsed += 1;
+        accumulator.add(provider, &loaded.summary);
+    }
+    if let Some(error) = &loaded.failure {
+        diagnostics.failures.push(UsageCollectionFailure {
+            provider,
+            source: source.to_path_buf(),
+            error: error.clone(),
+        });
+    }
+}
+
+#[derive(Default)]
+struct UsageAccumulator {
+    models: UsageResult,
+    per_provider: PerProviderUsage,
+    stored_costs: StoredCosts,
+    claude_dates: HashSet<String>,
+    codex_dates: HashSet<String>,
+    copilot_dates: HashSet<String>,
+    gemini_dates: HashSet<String>,
+    grok_dates: HashSet<String>,
+    opencode_dates: HashSet<String>,
+    cursor_dates: HashSet<String>,
+    hermes_dates: HashSet<String>,
+}
+
+impl UsageAccumulator {
+    fn add(&mut self, provider: ExtensionType, summary: &CompactSourceSummary) {
+        let provider_result = match provider {
+            ExtensionType::ClaudeCode => &mut self.per_provider.claude,
+            ExtensionType::Codex => &mut self.per_provider.codex,
+            ExtensionType::Copilot => &mut self.per_provider.copilot,
+            ExtensionType::Gemini => &mut self.per_provider.gemini,
+            ExtensionType::Grok => &mut self.per_provider.grok,
+            ExtensionType::OpenCode => &mut self.per_provider.opencode,
+            ExtensionType::Cursor => &mut self.per_provider.cursor,
+            ExtensionType::Hermes => &mut self.per_provider.hermes,
+        };
+        for (model, usage) in &summary.usage {
+            provider_result
+                .entry(model.clone())
+                .and_modify(|existing| merge_usage_values(existing, usage))
+                .or_insert_with(|| usage.clone());
+            self.models
+                .entry(model.clone())
+                .and_modify(|existing| merge_usage_values(existing, usage))
+                .or_insert_with(|| usage.clone());
+        }
+        for (model, tokens) in &summary.database_usage {
+            let usage = tokens.into_value();
+            provider_result
+                .entry(model.clone())
+                .and_modify(|existing| merge_usage_values(existing, &usage))
+                .or_insert_with(|| usage.clone());
+            self.models
+                .entry(model.clone())
+                .and_modify(|existing| merge_usage_values(existing, &usage))
+                .or_insert(usage);
+        }
+
+        let stored = match provider {
+            ExtensionType::OpenCode => Some(&mut self.stored_costs.opencode),
+            ExtensionType::Cursor => Some(&mut self.stored_costs.cursor),
+            ExtensionType::Hermes => Some(&mut self.stored_costs.hermes),
+            _ => None,
+        };
+        if let Some(stored) = stored {
+            for (model, cost) in &summary.stored_costs {
+                *stored.entry(model.clone()).or_insert(0.0) += cost;
+            }
+        }
+
+        let dates = match provider {
+            ExtensionType::ClaudeCode => &mut self.claude_dates,
+            ExtensionType::Codex => &mut self.codex_dates,
+            ExtensionType::Copilot => &mut self.copilot_dates,
+            ExtensionType::Gemini => &mut self.gemini_dates,
+            ExtensionType::Grok => &mut self.grok_dates,
+            ExtensionType::OpenCode => &mut self.opencode_dates,
+            ExtensionType::Cursor => &mut self.cursor_dates,
+            ExtensionType::Hermes => &mut self.hermes_dates,
+        };
+        dates.extend(summary.usage_dates.iter().cloned());
+    }
+
+    fn finish(self) -> UsageData {
+        let mut all_dates = HashSet::new();
+        all_dates.extend(self.claude_dates.iter().cloned());
+        all_dates.extend(self.codex_dates.iter().cloned());
+        all_dates.extend(self.copilot_dates.iter().cloned());
+        all_dates.extend(self.gemini_dates.iter().cloned());
+        all_dates.extend(self.grok_dates.iter().cloned());
+        all_dates.extend(self.opencode_dates.iter().cloned());
+        all_dates.extend(self.cursor_dates.iter().cloned());
+        all_dates.extend(self.hermes_dates.iter().cloned());
+        UsageData {
+            models: self.models,
+            per_provider: self.per_provider,
+            provider_days: ProviderActiveDays {
+                claude: self.claude_dates.len(),
+                codex: self.codex_dates.len(),
+                copilot: self.copilot_dates.len(),
+                gemini: self.gemini_dates.len(),
+                grok: self.grok_dates.len(),
+                opencode: self.opencode_dates.len(),
+                cursor: self.cursor_dates.len(),
+                hermes: self.hermes_dates.len(),
+                total: all_dates.len(),
+            },
+            stored_costs: self.stored_costs,
+        }
+    }
+}
+
 /// Walks one provider directory and merges its usage into both result maps.
 ///
 /// Files matching `filter_fn` (and within `max_depth`, when set) are parsed in
@@ -394,12 +1087,12 @@ where
     // `edit_file_details` payloads, so caching the full analysis would waste
     // the memory win from `UsageOnly`.
     let file_results: Vec<(String, FastHashMap<String, Value>)> = files
-        .par_iter()
+        .into_par_iter()
         .filter_map(|file_info| {
             match parse_session_file_as(&file_info.path, provider, ParseMode::UsageOnly) {
                 Ok(analysis) => {
-                    let conversation_usage = extract_conversation_usage_from_analysis(&analysis);
-                    Some((file_info.modified_date.clone(), conversation_usage))
+                    let conversation_usage = extract_conversation_usage_from_analysis(analysis);
+                    Some((file_info.modified_date, conversation_usage))
                 }
                 Err(e) => {
                     log::warn!("failed to analyze {}: {e}", file_info.path.display());
@@ -417,7 +1110,9 @@ where
     //     so the summary footer can attribute them to the right source
     //     directory without having to guess from the model name.
     for (date, conversation_usage) in file_results {
-        unique_dates.insert(date);
+        if usage_map_has_activity(&conversation_usage, 0.0) {
+            unique_dates.insert(date);
+        }
 
         for (model, usage_value) in conversation_usage {
             provider_result
@@ -470,7 +1165,8 @@ fn process_opencode_usage(
 /// merges it into both the global and Cursor-scoped maps.
 ///
 /// Mirrors [`process_opencode_usage`]: the estimate carries its own per-model
-/// cost, so it uses the same stored-cost path rather than a fuzzy price guess.
+/// tuple shape as stored-cost readers. Its zero stored cost lets the display
+/// layer accept only an exact LiteLLM match rather than a fuzzy price guess.
 fn process_cursor_usage(
     chats_dir: &Path,
     tracking_db: &Path,
@@ -529,9 +1225,10 @@ fn fold_stored_cost_sessions(
     unique_dates: &mut HashSet<String>,
 ) {
     for (date, analysis, session_cost) in sessions {
-        unique_dates.insert(date);
-
-        let conversation_usage = extract_conversation_usage_from_analysis(&analysis);
+        let conversation_usage = extract_conversation_usage_from_analysis(analysis);
+        if usage_map_has_activity(&conversation_usage, session_cost) {
+            unique_dates.insert(date);
+        }
         for (model, usage_value) in conversation_usage {
             *stored_costs.entry(model.clone()).or_insert(0.0) += session_cost;
 
@@ -548,6 +1245,22 @@ fn fold_stored_cost_sessions(
     }
 }
 
+fn usage_map_has_activity(usage: &FastHashMap<String, Value>, stored_cost: f64) -> bool {
+    stored_cost != 0.0
+        || usage.values().any(|value| {
+            let counts = crate::utils::extract_token_counts(value);
+            counts.total != 0
+                || counts.input_tokens != 0
+                || counts.output_tokens != 0
+                || counts.reasoning_tokens != 0
+                || counts.cache_read != 0
+                || counts.cache_creation != 0
+                || counts.cache_creation_5m != 0
+                || counts.cache_creation_1h != 0
+                || counts.web_search_requests != 0
+        })
+}
+
 /// How a model's USD cost is resolved.
 ///
 /// Different providers carry different authoritative cost sources, so the cost
@@ -562,10 +1275,9 @@ pub enum CostSource {
     /// novel model like `deepseek-v4-pro` reports OpenCode's own cost instead of
     /// being priced against a loosely-similar name.
     OpenCodeStored(f64),
-    /// Cursor: the local estimate's own per-model cost, used **verbatim** and
-    /// never re-priced from tokens (it is already priced when the estimate is
-    /// built), so a merged row can't be re-scored against another provider's
-    /// same-named model.
+    /// Caller-supplied Cursor cost used verbatim. Retained for source
+    /// compatibility; VCT's local Cursor reader now returns zero stored cost
+    /// and its display path accepts only exact LiteLLM matches.
     CursorStored(f64),
     /// Hermes: same basis as [`OpenCodeStored`] — an **exact** LiteLLM match
     /// prices from tokens, otherwise Hermes's own stored cost is used. Hermes
@@ -636,7 +1348,7 @@ impl UsageData {
 /// nested `cache_creation` breakdown) or the Codex shape (keyed by
 /// `total_token_usage`). Values that are not both JSON objects, or that match
 /// neither shape, are left untouched.
-fn merge_usage_values(existing: &mut Value, new: &Value) {
+pub(crate) fn merge_usage_values(existing: &mut Value, new: &Value) {
     use crate::utils::{accumulate_i64_fields, accumulate_nested_object, extract_token_counts};
 
     let (Some(existing_ro), Some(new_ro)) = (existing.as_object(), new.as_object()) else {

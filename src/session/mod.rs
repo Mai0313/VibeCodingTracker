@@ -18,6 +18,7 @@ pub mod grok;
 pub mod hermes;
 pub mod opencode;
 pub mod parser;
+pub(crate) mod sqlite;
 pub mod state;
 
 pub use cursor::{read_cursor_analysis, read_cursor_usage};

@@ -1,45 +1,73 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, RwLock};
 
 // Global cache for Git remote URLs (thread-safe)
-// Key: canonical path, Value: remote URL
-static GIT_URL_CACHE: LazyLock<RwLock<HashMap<String, String>>> =
+// Key: original absolute or canonical path, Value: remote URL
+static GIT_URL_CACHE: LazyLock<RwLock<HashMap<PathBuf, String>>> =
     LazyLock::new(|| RwLock::new(HashMap::with_capacity(20)));
 
 /// Returns the `origin` remote URL for the git repository at `cwd`.
 ///
-/// Results are memoized in a process-global, thread-safe cache keyed by the
-/// canonicalized path, so symlinked or relative variants of the same
-/// directory share one lookup. The returned URL has any trailing `.git`
-/// stripped. Returns an empty `String` when `cwd` is not a git working tree,
-/// has no `origin` remote, or the config cannot be read — callers treat the
-/// empty string as "no remote".
+/// Results are memoized in a process-global, thread-safe cache under both the
+/// original absolute path and its canonical path. This avoids repeated
+/// canonicalization while still letting symlinked variants share one lookup.
+/// The returned URL has any trailing `.git` stripped. Returns an empty
+/// `String` when `cwd` is empty, is not a git working tree, has no `origin`
+/// remote, or the config cannot be read. Callers treat the empty string as
+/// "no remote".
 pub fn get_git_remote_url<P: AsRef<Path>>(cwd: P) -> String {
-    // Try to get canonical path for better cache hits
-    let canonical_path = std::fs::canonicalize(cwd.as_ref())
-        .ok()
-        .and_then(|p| p.to_str().map(|s| s.to_string()))
-        .unwrap_or_else(|| cwd.as_ref().to_string_lossy().to_string());
+    let cwd = cwd.as_ref();
+    if cwd.as_os_str().is_empty() {
+        return String::new();
+    }
 
-    // Check cache first
-    if let Ok(cache) = GIT_URL_CACHE.read()
-        && let Some(url) = cache.get(&canonical_path)
+    let original_path = cwd.to_path_buf();
+
+    // Provider logs normally carry absolute workspaces. Check that stable key
+    // before doing filesystem work so a hot session never canonicalizes again.
+    if cwd.is_absolute()
+        && let Some(url) = cached_url(cwd)
     {
-        return url.clone();
+        return url;
+    }
+
+    let canonical_path = std::fs::canonicalize(cwd).ok();
+    if let Some(path) = canonical_path.as_deref()
+        && let Some(url) = cached_url(path)
+    {
+        if cwd.is_absolute()
+            && let Ok(mut cache) = GIT_URL_CACHE.write()
+        {
+            cache.insert(original_path, url.clone());
+        }
+        return url;
     }
 
     // Cache miss - perform actual lookup
-    let url = get_git_remote_url_impl(cwd.as_ref());
+    let url = get_git_remote_url_impl(cwd);
 
-    // Cache the result
+    // Keep both aliases. The original absolute path avoids repeated
+    // canonicalization, while the canonical path deduplicates symlinks.
     if let Ok(mut cache) = GIT_URL_CACHE.write() {
-        cache.insert(canonical_path, url.clone());
+        if cwd.is_absolute() || canonical_path.is_none() {
+            cache.insert(original_path, url.clone());
+        }
+        if let Some(path) = canonical_path {
+            cache.insert(path, url.clone());
+        }
     }
 
     url
+}
+
+fn cached_url(path: &Path) -> Option<String> {
+    GIT_URL_CACHE
+        .read()
+        .ok()
+        .and_then(|cache| cache.get(path).cloned())
 }
 
 /// Parses `<cwd>/.git/config` and returns the `[remote "origin"]` URL,
@@ -91,6 +119,11 @@ mod tests {
 
         let url = get_git_remote_url(dir.path());
         assert_eq!(url, "");
+    }
+
+    #[test]
+    fn test_get_git_remote_url_empty_cwd() {
+        assert_eq!(get_git_remote_url(""), "");
     }
 
     #[test]
@@ -193,6 +226,28 @@ mod tests {
 
         assert_eq!(url1, url2);
         assert_eq!(url1, "https://github.com/user/repo");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_absolute_symlink_cache_hit_does_not_recanonicalize() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let alias = dir.path().join("alias");
+        let git_dir = repo.join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+        let mut config = File::create(git_dir.join("config")).unwrap();
+        writeln!(config, "[remote \"origin\"]").unwrap();
+        writeln!(config, "    url = https://github.com/user/cached.git").unwrap();
+        drop(config);
+        symlink(&repo, &alias).unwrap();
+
+        assert_eq!(get_git_remote_url(&alias), "https://github.com/user/cached");
+
+        fs::remove_dir_all(&repo).unwrap();
+        assert_eq!(get_git_remote_url(&alias), "https://github.com/user/cached");
     }
 
     #[test]
