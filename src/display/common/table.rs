@@ -206,6 +206,14 @@ pub const REPO_URL: &str = "https://github.com/Mai0313/VibeCodingTracker";
 /// terminal hyperlink is layered on afterward by
 /// [`overlay_repo_hyperlink`](super::tui::overlay_repo_hyperlink).
 pub fn create_controls(extra: &[(&str, &str)]) -> Paragraph<'static> {
+    create_controls_with_status(extra, None)
+}
+
+/// Builds the controls footer with an optional transient refresh status.
+pub fn create_controls_with_status(
+    extra: &[(&str, &str)],
+    status: Option<&str>,
+) -> Paragraph<'static> {
     let key = Style::default().fg(RatatuiColor::Cyan).bold();
     let dim = Style::default().fg(RatatuiColor::DarkGray);
     let mut spans = vec![Span::styled("↑/↓", key), Span::styled(" scroll  ", dim)];
@@ -220,6 +228,13 @@ pub fn create_controls(extra: &[(&str, &str)]) -> Paragraph<'static> {
         Style::default().fg(RatatuiColor::Red).bold(),
     ));
     spans.push(Span::styled(" quit", dim));
+    if let Some(status) = status {
+        spans.push(Span::styled("  |  ", dim));
+        spans.push(Span::styled(
+            status.to_string(),
+            Style::default().fg(RatatuiColor::Yellow).bold(),
+        ));
+    }
     spans.push(Span::styled("  |  ", dim));
     spans.push(Span::styled(
         REPO_LABEL,

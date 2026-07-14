@@ -1,9 +1,8 @@
 //! Terminal scaffolding for the interactive TUI.
 //!
 //! Covers entering / leaving raw alternate-screen mode, the polling input
-//! loop ([`handle_input`]), and the state trackers that drive periodic
-//! refreshes ([`RefreshState`]) and recently-changed row highlighting
-//! ([`UpdateTracker`]).
+//! loop ([`handle_input`]), the worker that drives periodic refreshes
+//! ([`RefreshWorker`]), and recently-changed row highlighting ([`UpdateTracker`]).
 
 use crate::display::common::table::{REPO_LABEL, REPO_URL};
 use crossterm::{
@@ -13,13 +12,19 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
-    Terminal,
-    backend::CrosstermBackend,
+    Frame, Terminal,
+    backend::{Backend, CrosstermBackend},
     buffer::Buffer,
-    widgets::{ScrollbarState, TableState},
+    layout::{Constraint, Flex, Layout},
+    style::{Color, Style},
+    text::Line,
+    widgets::{Block, Borders, Paragraph, ScrollbarState, TableState},
 };
 use std::io::{self, Write};
+use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::thread;
 use std::time::{Duration, Instant};
 
 /// Whether the alternate-screen TUI currently owns the terminal.
@@ -29,6 +34,10 @@ use std::time::{Duration, Instant};
 /// bare atomic (not tied to the `Terminal` handle) is what lets the panic hook,
 /// which has no access to that handle, restore the screen.
 static IN_TUI: AtomicBool = AtomicBool::new(false);
+static TUI_OWNER: std::sync::Mutex<Option<thread::ThreadId>> = std::sync::Mutex::new(None);
+static TERMINAL_PANIC_HOOK: Once = Once::new();
+const LOADING_SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const MAX_DRAINED_EVENTS: usize = 64;
 
 /// Puts the terminal into raw mode and the alternate screen, returning a ready [`Terminal`].
 ///
@@ -41,15 +50,26 @@ static IN_TUI: AtomicBool = AtomicBool::new(false);
 /// constructing the backing [`Terminal`] fails (typically because stdout is not
 /// a TTY or the terminal rejects the control sequences).
 pub fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<io::Stdout>>> {
+    ensure_terminal_panic_hook();
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     // We navigate with the keyboard only, so mouse reporting is left OFF. This
     // also keeps the terminal's native drag-to-select / copy working untouched.
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let terminal = Terminal::new(backend)?;
+    if let Err(error) = execute!(stdout, EnterAlternateScreen) {
+        let _ = disable_raw_mode();
+        let _ = execute!(stdout, LeaveAlternateScreen, Show);
+        return Err(error.into());
+    }
     IN_TUI.store(true, Ordering::SeqCst);
-    Ok(terminal)
+    set_tui_owner(Some(thread::current().id()));
+    let backend = CrosstermBackend::new(stdout);
+    match Terminal::new(backend) {
+        Ok(terminal) => Ok(terminal),
+        Err(error) => {
+            force_restore_terminal();
+            Err(error.into())
+        }
+    }
 }
 
 /// Restores the terminal to normal mode (disable raw mode, leave alternate screen, show cursor).
@@ -62,11 +82,287 @@ pub fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<io::Stdout>>
 pub fn restore_terminal(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
 ) -> anyhow::Result<()> {
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    let mut failures = Vec::new();
+    if let Err(error) = disable_raw_mode() {
+        failures.push(format!("disable raw mode: {error}"));
+    }
+    if let Err(error) = execute!(terminal.backend_mut(), LeaveAlternateScreen) {
+        failures.push(format!("leave alternate screen: {error}"));
+    }
+    if let Err(error) = terminal.show_cursor() {
+        failures.push(format!("show cursor: {error}"));
+    }
     IN_TUI.store(false, Ordering::SeqCst);
+    set_tui_owner(None);
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(failures.join("; ")))
+    }
+}
+
+/// RAII owner for an active terminal session.
+///
+/// Every exit path attempts all cleanup steps. Explicitly calling
+/// [`Self::close`] surfaces cleanup failures; dropping remains best-effort so
+/// an earlier application error is not replaced during unwinding.
+pub struct TerminalSession {
+    terminal: Option<Terminal<CrosstermBackend<io::Stdout>>>,
+}
+
+impl TerminalSession {
+    /// Enters raw alternate-screen mode with rollback on partial setup failure.
+    pub fn new() -> anyhow::Result<Self> {
+        Ok(Self {
+            terminal: Some(setup_terminal()?),
+        })
+    }
+
+    /// Mutable access to the ratatui terminal.
+    pub fn terminal_mut(&mut self) -> &mut Terminal<CrosstermBackend<io::Stdout>> {
+        self.terminal.as_mut().expect("terminal session is open")
+    }
+
+    /// Restores the terminal now, attempting every cleanup step.
+    pub fn close(&mut self) -> anyhow::Result<()> {
+        let Some(mut terminal) = self.terminal.take() else {
+            return Ok(());
+        };
+        restore_terminal(&mut terminal)
+    }
+
+    /// Restores the terminal and preserves both application and cleanup errors.
+    pub fn finish<T>(&mut self, result: anyhow::Result<T>) -> anyhow::Result<T> {
+        combine_terminal_results(result, self.close())
+    }
+}
+
+fn combine_terminal_results<T>(
+    result: anyhow::Result<T>,
+    cleanup: anyhow::Result<()>,
+) -> anyhow::Result<T> {
+    match (result, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(error), Err(cleanup_error)) => Err(anyhow::anyhow!(
+            "{error:#}; terminal cleanup failed: {cleanup_error:#}"
+        )),
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        if let Some(mut terminal) = self.terminal.take() {
+            let _ = restore_terminal(&mut terminal);
+        }
+    }
+}
+
+enum RefreshCommand {
+    Run,
+    Shutdown,
+}
+
+/// Failure returned by a background refresh worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefreshWorkerError {
+    /// The loader returned an application error and can be retried.
+    Load(String),
+    /// The worker thread exited, so future refresh requests cannot run.
+    Disconnected,
+}
+
+impl std::fmt::Display for RefreshWorkerError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Load(error) => formatter.write_str(error),
+            Self::Disconnected => formatter.write_str("refresh worker disconnected"),
+        }
+    }
+}
+
+/// Single background loader with one active and one coalesced pending refresh.
+pub struct RefreshWorker<T> {
+    command_tx: SyncSender<RefreshCommand>,
+    result_rx: Receiver<std::result::Result<T, RefreshWorkerError>>,
+    shutdown: std::sync::Arc<AtomicBool>,
+    active: bool,
+    pending: bool,
+    disconnected: bool,
+    interval: Duration,
+    next_due: Instant,
+}
+
+impl<T: Send + 'static> RefreshWorker<T> {
+    /// Spawns a detached worker that owns `loader` and all of its mutable cache.
+    pub fn new<F>(refresh_secs: u64, mut loader: F) -> Self
+    where
+        F: FnMut() -> anyhow::Result<T> + Send + 'static,
+    {
+        Self::new_with_init(refresh_secs, move || move || loader())
+    }
+
+    /// Spawns a worker whose stateful loader is constructed inside the thread.
+    ///
+    /// This supports thread-confined state such as `Rc`-backed pricing maps:
+    /// only the Send initializer crosses the thread boundary.
+    pub fn new_with_init<I, F>(refresh_secs: u64, init: I) -> Self
+    where
+        I: FnOnce() -> F + Send + 'static,
+        F: FnMut() -> anyhow::Result<T> + 'static,
+    {
+        let (command_tx, command_rx) = mpsc::sync_channel(1);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let shutdown = std::sync::Arc::new(AtomicBool::new(false));
+        let worker_shutdown = std::sync::Arc::clone(&shutdown);
+        thread::spawn(move || {
+            let mut loader = init();
+            while let Ok(command) = command_rx.recv() {
+                if worker_shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                match command {
+                    RefreshCommand::Run => {
+                        let result =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut loader))
+                                .map_err(|_| {
+                                    RefreshWorkerError::Load("refresh loader panicked".to_string())
+                                })
+                                .and_then(|result| {
+                                    result.map_err(|error| {
+                                        RefreshWorkerError::Load(format!("{error:#}"))
+                                    })
+                                });
+                        if result_tx.send(result).is_err() {
+                            break;
+                        }
+                    }
+                    RefreshCommand::Shutdown => break,
+                }
+            }
+        });
+        Self {
+            command_tx,
+            result_rx,
+            shutdown,
+            active: false,
+            pending: false,
+            disconnected: false,
+            interval: Duration::from_secs(refresh_secs.max(1)),
+            next_due: Instant::now(),
+        }
+    }
+
+    /// Starts the initial load or coalesces a request behind the active load.
+    pub fn request(&mut self) {
+        if self.disconnected {
+            return;
+        }
+        if self.active {
+            self.pending = true;
+            return;
+        }
+        if self.command_tx.send(RefreshCommand::Run).is_ok() {
+            self.active = true;
+        }
+    }
+
+    /// Starts an automatic refresh when the completion-based deadline is due.
+    ///
+    /// Returns `true` only when this call dispatched a new load, allowing the
+    /// event loop to render its refreshing state immediately.
+    pub fn request_if_due(&mut self) -> bool {
+        if !self.disconnected && !self.active && Instant::now() >= self.next_due {
+            self.request();
+            return self.active;
+        }
+        false
+    }
+
+    /// Starts the automatic timer without dispatching a load immediately.
+    pub fn defer_until_interval(&mut self) {
+        self.next_due = Instant::now() + self.interval;
+    }
+
+    /// Returns a completed load without blocking.
+    ///
+    /// The next automatic deadline starts now, after completion. If input was
+    /// coalesced while the job ran, the pending job is dispatched immediately.
+    pub fn try_result(&mut self) -> Option<std::result::Result<T, RefreshWorkerError>> {
+        let result = match self.result_rx.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return None,
+            Err(TryRecvError::Disconnected) if self.disconnected => return None,
+            Err(TryRecvError::Disconnected) => {
+                self.disconnected = true;
+                self.pending = false;
+                Err(RefreshWorkerError::Disconnected)
+            }
+        };
+        self.active = false;
+        self.next_due = Instant::now() + self.interval;
+        if self.pending {
+            self.pending = false;
+            self.request();
+        }
+        Some(result)
+    }
+
+    /// Whether a loader is currently running.
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    #[cfg(test)]
+    fn has_pending(&self) -> bool {
+        self.pending
+    }
+}
+
+/// Draws a centered loading spinner that also works on very small terminals.
+pub fn render_loading_frame(
+    terminal: &mut Terminal<impl Backend>,
+    spinner_index: usize,
+) -> anyhow::Result<()> {
+    terminal.draw(|frame| render_loading(frame, spinner_index, "Loading sessions..."))?;
     Ok(())
+}
+
+/// Resolves the footer status consistently for every redraw path.
+pub fn refresh_status(active: bool, failure_until: Option<Instant>) -> Option<&'static str> {
+    if active {
+        Some("Refreshing...")
+    } else if failure_until.is_some_and(|until| Instant::now() < until) {
+        Some("Refresh failed")
+    } else {
+        None
+    }
+}
+
+fn render_loading(frame: &mut Frame, spinner_index: usize, message: &str) {
+    let area = frame.area();
+    let [middle] = Layout::vertical([Constraint::Length(3)])
+        .flex(Flex::Center)
+        .areas(area);
+    let text = Line::from(format!(
+        "{} {message}",
+        LOADING_SPINNER[spinner_index % LOADING_SPINNER.len()]
+    ));
+    frame.render_widget(
+        Paragraph::new(text)
+            .style(Style::default().fg(Color::Cyan))
+            .centered()
+            .block(Block::default().borders(Borders::ALL)),
+        middle,
+    );
+}
+
+impl<T> Drop for RefreshWorker<T> {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        let _ = self.command_tx.try_send(RefreshCommand::Shutdown);
+    }
 }
 
 /// Best-effort terminal restore for the panic hook, when no [`Terminal`] handle
@@ -80,8 +376,70 @@ pub fn force_restore_terminal() {
     if !IN_TUI.swap(false, Ordering::SeqCst) {
         return;
     }
+    set_tui_owner(None);
     let _ = disable_raw_mode();
     let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+}
+
+/// Whether a TUI currently owns the process terminal.
+pub(crate) fn terminal_session_active() -> bool {
+    IN_TUI.load(Ordering::SeqCst)
+}
+
+/// Whether the current thread owns the active TUI session.
+pub(crate) fn current_thread_owns_terminal() -> bool {
+    let owner = TUI_OWNER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    owner
+        .as_ref()
+        .is_some_and(|owner| *owner == thread::current().id())
+}
+
+/// Decides whether a panic must restore an active terminal session.
+pub(crate) fn panic_requires_terminal_restore(
+    tui_active: bool,
+    owner_thread: bool,
+    aborting: bool,
+) -> bool {
+    tui_active && (aborting || owner_thread)
+}
+
+fn panic_delegates_to_previous(tui_active: bool, restore_terminal: bool) -> bool {
+    !tui_active || restore_terminal
+}
+
+/// Installs terminal panic protection once while preserving the previous hook.
+///
+/// Public display callers do not have to initialize this crate's logger first.
+/// Owner-thread panics restore the terminal before the previous hook runs. A
+/// caught background panic does not delegate while the TUI remains active, so
+/// it cannot print through the alternate screen.
+pub(crate) fn ensure_terminal_panic_hook() {
+    TERMINAL_PANIC_HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let tui_active = terminal_session_active();
+            let restore_terminal = panic_requires_terminal_restore(
+                tui_active,
+                current_thread_owns_terminal(),
+                cfg!(panic = "abort"),
+            );
+            if restore_terminal {
+                force_restore_terminal();
+            }
+            log::error!("{info}");
+            if panic_delegates_to_previous(tui_active, restore_terminal) {
+                previous(info);
+            }
+        }));
+    });
+}
+
+fn set_tui_owner(owner: Option<thread::ThreadId>) {
+    *TUI_OWNER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = owner;
 }
 
 /// Layers an OSC 8 terminal hyperlink over the repo label the footer just drew.
@@ -142,10 +500,9 @@ fn find_label_start(buffer: &Buffer) -> Option<(u16, u16)> {
 
 /// Handle terminal events and return the action to take.
 ///
-/// Blocks up to 100 ms for the first event, then drains every event already
-/// buffered. Draining matters for resize: a window drag emits a burst of
-/// `Resize` events, and collapsing them into a single `Resize` action keeps
-/// the redraw in step with the drag instead of lagging one frame per event.
+/// Blocks up to 100 ms for the first event, then drains a bounded batch of
+/// already-buffered events. Batching collapses resize bursts without allowing a
+/// continuous event stream to postpone redraw indefinitely.
 /// Returns [`InputAction::Continue`] when the poll times out with no event.
 ///
 /// # Errors
@@ -153,14 +510,36 @@ fn find_label_start(buffer: &Buffer) -> Option<(u16, u16)> {
 /// Returns an error if polling for or reading a terminal event fails (an
 /// underlying crossterm I/O error on the event source).
 pub fn handle_input() -> anyhow::Result<InputAction> {
-    if !event::poll(Duration::from_millis(100))? {
+    handle_input_from(&mut CrosstermEventSource)
+}
+
+trait EventSource {
+    fn poll(&mut self, timeout: Duration) -> io::Result<bool>;
+    fn read(&mut self) -> io::Result<Event>;
+}
+
+struct CrosstermEventSource;
+
+impl EventSource for CrosstermEventSource {
+    fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
+        event::poll(timeout)
+    }
+
+    fn read(&mut self) -> io::Result<Event> {
+        event::read()
+    }
+}
+
+fn handle_input_from(source: &mut impl EventSource) -> anyhow::Result<InputAction> {
+    if !source.poll(Duration::from_millis(100))? {
         return Ok(InputAction::Continue);
     }
 
     let mut resized = false;
     let mut nav = NavDelta::default();
+    let mut drained = 0usize;
     loop {
-        match event::read()? {
+        match source.read()? {
             // Windows emits Press/Repeat/Release for a single keystroke while
             // Unix only emits Press; drop Release so one keypress isn't counted
             // twice (which would double every nav step / page jump).
@@ -190,7 +569,8 @@ pub fn handle_input() -> anyhow::Result<InputAction> {
             _ => {}
         }
 
-        if !event::poll(Duration::from_millis(0))? {
+        drained += 1;
+        if drained >= MAX_DRAINED_EVENTS || !source.poll(Duration::from_millis(0))? {
             break;
         }
     }
@@ -457,6 +837,70 @@ mod tests {
     use crate::display::common::table::create_controls;
     use ratatui::layout::Rect;
     use ratatui::widgets::Widget;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::{Arc, mpsc};
+
+    struct FakeEventSource {
+        events: VecDeque<Event>,
+        reads: usize,
+    }
+
+    impl FakeEventSource {
+        fn new(events: impl IntoIterator<Item = Event>) -> Self {
+            Self {
+                events: events.into_iter().collect(),
+                reads: 0,
+            }
+        }
+    }
+
+    impl EventSource for FakeEventSource {
+        fn poll(&mut self, _timeout: Duration) -> io::Result<bool> {
+            Ok(!self.events.is_empty())
+        }
+
+        fn read(&mut self) -> io::Result<Event> {
+            self.reads += 1;
+            self.events
+                .pop_front()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "no fake event"))
+        }
+    }
+
+    #[test]
+    fn background_unwind_panic_keeps_live_tui_owned() {
+        assert!(!panic_requires_terminal_restore(true, false, false));
+        assert!(panic_requires_terminal_restore(true, true, false));
+        assert!(panic_requires_terminal_restore(true, false, true));
+        assert!(!panic_requires_terminal_restore(false, true, true));
+        assert!(!panic_delegates_to_previous(true, false));
+        assert!(panic_delegates_to_previous(true, true));
+        assert!(panic_delegates_to_previous(false, false));
+    }
+
+    #[test]
+    fn terminal_result_preserves_application_and_cleanup_errors() {
+        let error = combine_terminal_results::<()>(
+            Err(anyhow::anyhow!("draw failed")),
+            Err(anyhow::anyhow!("restore failed")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("draw failed"));
+        assert!(error.contains("terminal cleanup failed: restore failed"));
+    }
+
+    #[test]
+    fn active_refresh_takes_precedence_over_recent_failure() {
+        let failure_until = Some(Instant::now() + Duration::from_secs(1));
+        assert_eq!(refresh_status(true, failure_until), Some("Refreshing..."));
+        assert_eq!(refresh_status(false, failure_until), Some("Refresh failed"));
+        assert_eq!(
+            refresh_status(false, Some(Instant::now() - Duration::from_secs(1))),
+            None
+        );
+    }
 
     #[test]
     fn find_label_start_locates_repo_label_on_bottom_row() {
@@ -479,5 +923,146 @@ mod tests {
         let mut buf = Buffer::empty(area);
         create_controls(&[]).render(area, &mut buf);
         assert!(find_label_start(&buf).is_none());
+    }
+
+    #[test]
+    fn refresh_worker_coalesces_repeated_requests() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker_calls = Arc::clone(&calls);
+        let mut worker = RefreshWorker::new(60, move || {
+            let call = worker_calls.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            started_tx.send(call).unwrap();
+            if call == 1 {
+                release_rx.recv().unwrap();
+            }
+            Ok(call)
+        });
+
+        worker.request();
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+        worker.request();
+        worker.request();
+        worker.request();
+        assert!(worker.has_pending());
+        release_tx.send(()).unwrap();
+
+        let first = wait_for_result(&mut worker).unwrap();
+        assert_eq!(first, 1);
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 2);
+        let second = wait_for_result(&mut worker).unwrap();
+        assert_eq!(second, 2);
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    #[test]
+    fn automatic_refresh_reports_when_it_dispatches() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut worker = RefreshWorker::new(60, move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok(1)
+        });
+
+        assert!(worker.request_if_due());
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(worker.is_active());
+        assert!(!worker.request_if_due());
+        release_tx.send(()).unwrap();
+        assert_eq!(wait_for_result(&mut worker), Ok(1));
+    }
+
+    #[test]
+    fn input_drain_is_bounded_during_resize_burst() {
+        let events = (0..MAX_DRAINED_EVENTS + 10).map(|index| {
+            Event::Resize(
+                80 + u16::try_from(index).unwrap(),
+                24 + u16::try_from(index).unwrap(),
+            )
+        });
+        let mut source = FakeEventSource::new(events);
+
+        assert_eq!(handle_input_from(&mut source).unwrap(), InputAction::Resize);
+        assert_eq!(source.reads, MAX_DRAINED_EVENTS);
+        assert_eq!(source.events.len(), 10);
+    }
+
+    #[test]
+    fn active_slow_loader_does_not_block_quit_or_resize_input() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut worker = RefreshWorker::new(60, move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok(1)
+        });
+        worker.request();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let mut resize = FakeEventSource::new([Event::Resize(100, 30)]);
+        assert_eq!(handle_input_from(&mut resize).unwrap(), InputAction::Resize);
+
+        let mut quit = FakeEventSource::new([Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+        ))]);
+        assert_eq!(handle_input_from(&mut quit).unwrap(), InputAction::Quit);
+        assert!(worker.is_active());
+
+        release_tx.send(()).unwrap();
+        assert_eq!(wait_for_result(&mut worker), Ok(1));
+    }
+
+    #[test]
+    fn dropping_worker_cancels_a_queued_initial_load() {
+        let (release_init_tx, release_init_rx) = mpsc::channel();
+        let (called_tx, called_rx) = mpsc::channel();
+        let mut worker = RefreshWorker::new_with_init(60, move || {
+            release_init_rx.recv().unwrap();
+            move || {
+                called_tx.send(()).unwrap();
+                Ok(())
+            }
+        });
+
+        worker.request();
+        drop(worker);
+        release_init_tx.send(()).unwrap();
+        assert!(called_rx.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn loader_panic_is_reported_once_and_worker_can_retry() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker_calls = Arc::clone(&calls);
+        let mut worker = RefreshWorker::new(60, move || {
+            if worker_calls.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                panic!("synthetic loader panic");
+            }
+            Ok(7)
+        });
+
+        worker.request();
+        assert_eq!(
+            wait_for_result(&mut worker),
+            Err(RefreshWorkerError::Load(
+                "refresh loader panicked".to_string()
+            ))
+        );
+        worker.request();
+        assert_eq!(wait_for_result(&mut worker), Ok(7));
+    }
+
+    fn wait_for_result(worker: &mut RefreshWorker<usize>) -> Result<usize, RefreshWorkerError> {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some(result) = worker.try_result() {
+                return result;
+            }
+            assert!(Instant::now() < deadline, "worker result timed out");
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 }

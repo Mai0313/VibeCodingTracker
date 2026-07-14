@@ -4,20 +4,20 @@
 //! directories, highlighting rows whose metrics changed since the last tick and
 //! redrawing on terminal resize without re-aggregating.
 
-use crate::analysis::{AnalysisData, PerProviderAnalysisRows};
+use crate::analysis::AnalysisData;
 use crate::config::ProvidersConfig;
 use crate::display::analysis::averages::{
     AnalysisProviderTotals, AnalysisRow, build_analysis_provider_rows,
     calculate_analysis_provider_totals_from_per_provider, convert_to_analysis_rows,
 };
 use crate::display::common::table::{
-    create_controls, create_provider_row, create_ratatui_table, create_summary,
+    create_controls_with_status, create_provider_row, create_ratatui_table, create_summary,
     init_process_metrics, main_layout, refresh_process_metrics, render_scrollable_table,
     render_too_small, styled_row,
 };
 use crate::display::common::tui::{
-    InputAction, RefreshState, ScrollState, UpdateTracker, handle_input, overlay_repo_hyperlink,
-    restore_terminal, setup_terminal,
+    InputAction, RefreshWorker, RefreshWorkerError, ScrollState, TerminalSession, UpdateTracker,
+    handle_input, overlay_repo_hyperlink, refresh_status, render_loading_frame,
 };
 use crate::utils::format_compact;
 use ratatui::{
@@ -28,6 +28,7 @@ use ratatui::{
     widgets::Row as RatatuiRow,
 };
 use std::io;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, System};
 
@@ -58,17 +59,311 @@ fn analysis_panels_height(area_height: u16, provider_row_count: usize) -> Option
         .then_some(totals_height)
 }
 
+struct AnalysisUiState {
+    rows: Vec<AnalysisRow>,
+    totals: AnalysisRow,
+    provider_totals: AnalysisProviderTotals,
+    update_tracker: UpdateTracker,
+    scroll: ScrollState,
+}
+
+impl AnalysisUiState {
+    fn new() -> Self {
+        Self {
+            rows: Vec::new(),
+            totals: AnalysisRow::default(),
+            provider_totals: AnalysisProviderTotals::default(),
+            update_tracker: UpdateTracker::new(MAX_TRACKED_ANALYSIS_ROWS, 1000),
+            scroll: ScrollState::new(),
+        }
+    }
+
+    fn apply(&mut self, data: AnalysisData) {
+        let previous = self
+            .scroll
+            .table
+            .selected()
+            .and_then(|index| self.rows.get(index))
+            .map(|row| row.model.clone());
+        self.rows = convert_to_analysis_rows(&data.rows);
+        self.rows.retain(|row| {
+            row.edit_lines != 0
+                || row.read_lines != 0
+                || row.write_lines != 0
+                || row.bash_count != 0
+                || row.edit_count != 0
+                || row.read_count != 0
+                || row.todo_write_count != 0
+                || row.write_count != 0
+        });
+        self.totals = AnalysisRow::default();
+        let fingerprints: Vec<_> = self
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    row.model.clone(),
+                    (
+                        row.edit_lines,
+                        row.read_lines,
+                        row.write_lines,
+                        row.bash_count,
+                        row.edit_count,
+                        row.read_count,
+                        row.todo_write_count,
+                        row.write_count,
+                    ),
+                )
+            })
+            .collect();
+        for row in &self.rows {
+            self.totals.edit_lines += row.edit_lines;
+            self.totals.read_lines += row.read_lines;
+            self.totals.write_lines += row.write_lines;
+            self.totals.bash_count += row.bash_count;
+            self.totals.edit_count += row.edit_count;
+            self.totals.read_count += row.read_count;
+            self.totals.todo_write_count += row.todo_write_count;
+            self.totals.write_count += row.write_count;
+        }
+        let models: Vec<_> = fingerprints
+            .iter()
+            .map(|(model, _)| model.clone())
+            .collect();
+        self.scroll.sync(previous.as_deref(), &models);
+        self.update_tracker.cleanup(models);
+        for (model, fingerprint) in fingerprints {
+            self.update_tracker.track_update(model, &fingerprint);
+        }
+        self.provider_totals = calculate_analysis_provider_totals_from_per_provider(
+            &data.per_provider,
+            &data.provider_days,
+        );
+    }
+
+    fn render(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+        sys: &System,
+        pid: Pid,
+        status: Option<&str>,
+    ) -> anyhow::Result<()> {
+        render_analysis_frame_with_status(
+            terminal,
+            &self.rows,
+            &self.totals,
+            &self.provider_totals,
+            &self.update_tracker,
+            sys,
+            pid,
+            &mut self.scroll,
+            status,
+        )
+    }
+}
+
+/// Starts the CLI analysis TUI with its initial scan in the background.
+pub fn display_analysis_interactive_loading(
+    time_range: crate::cli::TimeRange,
+    providers: ProvidersConfig,
+    refresh_secs: u64,
+) -> anyhow::Result<()> {
+    let threads = crate::config::PerformanceConfig::default().resolved_scan_threads();
+    let pool = Arc::new(crate::summary_cache::build_scan_pool(threads)?);
+    display_analysis_interactive_loading_with_pool(time_range, providers, refresh_secs, pool)
+}
+
+/// [`display_analysis_interactive_loading`] with a caller-owned scan pool.
+pub fn display_analysis_interactive_loading_with_pool(
+    time_range: crate::cli::TimeRange,
+    providers: ProvidersConfig,
+    refresh_secs: u64,
+    scan_pool: Arc<rayon::ThreadPool>,
+) -> anyhow::Result<()> {
+    run_analysis_interactive(None, time_range, providers, refresh_secs, scan_pool)
+}
+
+fn run_analysis_interactive(
+    initial_data: Option<AnalysisData>,
+    time_range: crate::cli::TimeRange,
+    providers: ProvidersConfig,
+    refresh_secs: u64,
+    scan_pool: Arc<rayon::ThreadPool>,
+) -> anyhow::Result<()> {
+    let mut terminal = TerminalSession::new()?;
+    let mut show_no_data = false;
+    let result = (|| -> anyhow::Result<()> {
+        let mut spinner_index = 0usize;
+        let mut loaded = initial_data.is_some();
+        if !loaded {
+            render_loading_frame(terminal.terminal_mut(), spinner_index)?;
+        }
+
+        let paths = crate::utils::resolve_paths()?;
+        let worker_paths = paths.clone();
+        let worker_pool = Arc::clone(&scan_pool);
+        let mut worker = RefreshWorker::new_with_init(refresh_secs, move || {
+            let mut cache = crate::summary_cache::SummaryScanCache::new();
+            move || {
+                let aggregation = worker_pool.install(|| {
+                    crate::analysis::aggregate_sessions_by_model_from_paths_with_cache(
+                        &worker_paths,
+                        time_range,
+                        providers,
+                        &mut cache,
+                    )
+                })?;
+                if aggregation.diagnostics.all_failed() {
+                    let first = aggregation
+                        .diagnostics
+                        .failures
+                        .first()
+                        .map(|failure| failure.error.as_str())
+                        .unwrap_or("unknown source failure");
+                    anyhow::bail!(
+                        "failed to parse all {} analysis sources: {first}",
+                        aggregation.diagnostics.candidates
+                    );
+                }
+                if aggregation.diagnostics.partially_failed() {
+                    log::warn!(
+                        "analysis refresh kept partial data after {} source failures",
+                        aggregation.diagnostics.failures.len()
+                    );
+                }
+                Ok(aggregation.data)
+            }
+        });
+
+        let pid = sysinfo::get_current_pid()
+            .expect("Failed to get current process ID for memory monitoring");
+        let mut sys = System::new();
+        init_process_metrics(&mut sys, pid);
+        let metrics_interval = Duration::from_millis(crate::constants::refresh::METRICS_REFRESH_MS);
+        let mut last_metrics = Instant::now();
+        let mut last_spinner = Instant::now();
+        let mut state = AnalysisUiState::new();
+        let mut failure_until = None;
+
+        if let Some(data) = initial_data {
+            state.apply(data);
+            state.render(terminal.terminal_mut(), &sys, pid, None)?;
+            worker.defer_until_interval();
+        } else {
+            worker.request();
+        }
+
+        loop {
+            if let Some(result) = worker.try_result() {
+                match result {
+                    Ok(data) => {
+                        if !loaded && data.rows.is_empty() {
+                            show_no_data = true;
+                            return Ok(());
+                        }
+                        state.apply(data);
+                        loaded = true;
+                        failure_until = None;
+                        refresh_process_metrics(&mut sys, pid);
+                        state.render(
+                            terminal.terminal_mut(),
+                            &sys,
+                            pid,
+                            refresh_status(worker.is_active(), failure_until),
+                        )?;
+                        crate::utils::release_freed_heap();
+                        last_metrics = Instant::now();
+                    }
+                    Err(RefreshWorkerError::Disconnected) => {
+                        return Err(anyhow::anyhow!("refresh worker disconnected"));
+                    }
+                    Err(error) if !loaded => {
+                        return Err(anyhow::anyhow!("initial analysis load failed: {error}"));
+                    }
+                    Err(error) => {
+                        log::warn!("analysis refresh failed: {error}");
+                        failure_until = Some(Instant::now() + Duration::from_secs(3));
+                        state.render(
+                            terminal.terminal_mut(),
+                            &sys,
+                            pid,
+                            refresh_status(worker.is_active(), failure_until),
+                        )?;
+                    }
+                }
+            }
+
+            let auto_refresh_started = worker.request_if_due();
+            if !loaded && last_spinner.elapsed() >= Duration::from_millis(100) {
+                spinner_index = spinner_index.wrapping_add(1);
+                last_spinner = Instant::now();
+                render_loading_frame(terminal.terminal_mut(), spinner_index)?;
+            } else if loaded && (auto_refresh_started || last_metrics.elapsed() >= metrics_interval)
+            {
+                if last_metrics.elapsed() >= metrics_interval {
+                    last_metrics = Instant::now();
+                    refresh_process_metrics(&mut sys, pid);
+                }
+                let status = refresh_status(worker.is_active(), failure_until);
+                state.render(terminal.terminal_mut(), &sys, pid, status)?;
+            }
+
+            match handle_input()? {
+                InputAction::Quit => break,
+                InputAction::Refresh => {
+                    worker.request();
+                    if loaded {
+                        state.render(
+                            terminal.terminal_mut(),
+                            &sys,
+                            pid,
+                            refresh_status(worker.is_active(), failure_until),
+                        )?;
+                    }
+                }
+                InputAction::ToggleMerge => {}
+                InputAction::Navigate(delta) if loaded => {
+                    state.scroll.apply(delta, state.rows.len());
+                    state.render(
+                        terminal.terminal_mut(),
+                        &sys,
+                        pid,
+                        refresh_status(worker.is_active(), failure_until),
+                    )?;
+                }
+                InputAction::Resize if loaded => {
+                    state.render(
+                        terminal.terminal_mut(),
+                        &sys,
+                        pid,
+                        refresh_status(worker.is_active(), failure_until),
+                    )?;
+                }
+                InputAction::Resize => {
+                    render_loading_frame(terminal.terminal_mut(), spinner_index)?;
+                }
+                InputAction::Navigate(_) | InputAction::Continue => {}
+            }
+        }
+
+        Ok(())
+    })();
+    let finished = terminal.finish(result);
+    if finished.is_ok() && show_no_data {
+        println!("No analysis data found");
+    }
+    finished
+}
+
 /// Render the `analysis` view as an interactive, auto-refreshing TUI.
 ///
 /// Takes over the terminal and runs a draw loop until the user quits. Every
-/// `refresh_secs` it re-aggregates the session directories for `time_range`
-/// (honoring the `providers` toggles), highlights rows whose counters changed,
-/// and updates the process-memory readout. `initial_data` (the aggregation the
-/// caller already performed) is consumed to render the first frame, so the tree
-/// is not walked a second time on launch; every subsequent tick re-aggregates.
-/// If a refresh fails the error is logged and the loop continues with empty data
-/// rather than tearing down the TUI. Returns immediately after printing a message
-/// if `initial_data` is empty.
+/// `refresh_secs` a background worker incrementally re-aggregates the session
+/// directories for `time_range`, highlights changed counters, and keeps the
+/// previous rows visible if a refresh fails. `initial_data` renders immediately
+/// for library callers; the CLI-specific loading entry point starts with a
+/// spinner instead. Returns immediately after printing a message if
+/// `initial_data` is empty.
 ///
 /// # Errors
 ///
@@ -100,230 +395,19 @@ pub fn display_analysis_interactive(
         println!("No analysis data found");
         return Ok(());
     }
-
-    // Setup terminal
-    let mut terminal = setup_terminal()?;
-    let mut refresh_state = RefreshState::new(refresh_secs.max(1));
-
-    // Initialize system for CPU/memory monitoring. We only read our own process
-    // stats, so start from an empty `System` to avoid loading the machine's
-    // entire process table, disks, and network adapters.
-    let pid =
-        sysinfo::get_current_pid().expect("Failed to get current process ID for memory monitoring");
-    let mut sys = System::new();
-    init_process_metrics(&mut sys, pid);
-    // Lightweight CPU/memory sampling runs on its own fast cadence, decoupled
-    // from the heavier session re-aggregation below.
-    let metrics_interval = Duration::from_millis(crate::constants::refresh::METRICS_REFRESH_MS);
-    let mut last_metrics = Instant::now();
-
-    // Track updates
-    let mut update_tracker = UpdateTracker::new(MAX_TRACKED_ANALYSIS_ROWS, 1000);
-
-    // Scroll/selection state for the model table (keyboard-driven).
-    let mut scroll = ScrollState::new();
-
-    // Latest rendered display state, kept across refresh cycles so a terminal
-    // resize can redraw at the new size immediately without re-aggregating the
-    // session directories.
-    let mut rows_data: Vec<AnalysisRow> = Vec::new();
-    let mut totals = AnalysisRow::default();
-    let mut provider_totals = AnalysisProviderTotals::default();
-
-    // The caller already aggregated once to build `initial_data`; reuse it for
-    // the very first frame instead of walking every session tree a second time
-    // on launch. Consumed on the first tick, `None` thereafter.
-    let mut initial_data = Some(initial_data);
-
-    loop {
-        if refresh_state.should_refresh() {
-            refresh_state.mark_refreshed();
-
-            // Refresh only our own process (CPU + memory); `remove_dead_processes`
-            // keeps the `System` from accumulating state for PIDs that come and
-            // go on the host over long TUI sessions.
-            refresh_process_metrics(&mut sys, pid);
-
-            // First tick reuses the caller's aggregation; later ticks re-fetch.
-            let current_data = match initial_data.take() {
-                Some(data) => data,
-                None => {
-                    match crate::analysis::aggregate_sessions_by_model_with(time_range, providers) {
-                        Ok(data) => data,
-                        Err(e) => {
-                            log::warn!("Failed to analyze sessions: {}", e);
-                            AnalysisData {
-                                rows: Vec::new(),
-                                per_provider: PerProviderAnalysisRows::default(),
-                                provider_days: Default::default(),
-                            }
-                        }
-                    }
-                }
-            };
-
-            // Remember the selected model so the highlight follows it across a
-            // refresh even when rows are reordered or added/removed.
-            let prev_model = scroll
-                .table
-                .selected()
-                .and_then(|i| rows_data.get(i))
-                .map(|row| row.model.clone());
-
-            // Calculate totals and extract display data
-            totals = AnalysisRow::default();
-            rows_data = convert_to_analysis_rows(&current_data.rows);
-            // Hide models with no recorded operations in this range; an all-zero
-            // row carries no information. Totals are summed from the remaining
-            // rows below, and zero rows would add nothing anyway.
-            rows_data.retain(|row| {
-                row.edit_lines != 0
-                    || row.read_lines != 0
-                    || row.write_lines != 0
-                    || row.bash_count != 0
-                    || row.edit_count != 0
-                    || row.read_count != 0
-                    || row.todo_write_count != 0
-                    || row.write_count != 0
-            });
-            let provider_days = current_data.provider_days.clone();
-            let per_provider = current_data.per_provider.clone();
-
-            // Drop current_data immediately after conversion to free memory
-            drop(current_data);
-
-            // `aggregate_sessions_by_model` now bypasses the file cache for
-            // aggregated metrics (runs each file in `ParseMode::UsageOnly` and
-            // drops immediately), so there is nothing useful to clear here.
-
-            // Track updates
-            for row in &rows_data {
-                let row_key = row.model.clone();
-                let current_tuple = (
-                    row.edit_lines,
-                    row.read_lines,
-                    row.write_lines,
-                    row.bash_count,
-                    row.edit_count,
-                    row.read_count,
-                    row.todo_write_count,
-                    row.write_count,
-                );
-
-                update_tracker.track_update(row_key, &current_tuple);
-
-                totals.edit_lines += row.edit_lines;
-                totals.read_lines += row.read_lines;
-                totals.write_lines += row.write_lines;
-                totals.bash_count += row.bash_count;
-                totals.edit_count += row.edit_count;
-                totals.read_count += row.read_count;
-                totals.todo_write_count += row.todo_write_count;
-                totals.write_count += row.write_count;
-            }
-
-            // Cleanup old entries
-            let current_row_keys: Vec<String> =
-                rows_data.iter().map(|row| row.model.clone()).collect();
-            scroll.sync(prev_model.as_deref(), &current_row_keys);
-            update_tracker.cleanup(current_row_keys);
-
-            // Compute per-provider totals directly from the per-provider
-            // aggregated rows produced by the batch analyzer, so Copilot sessions
-            // cannot be mis-attributed to Claude Code based on their (now real)
-            // model name.
-            provider_totals =
-                calculate_analysis_provider_totals_from_per_provider(&per_provider, &provider_days);
-
-            render_analysis_frame(
-                &mut terminal,
-                &rows_data,
-                &totals,
-                &provider_totals,
-                &update_tracker,
-                &sys,
-                pid,
-                &mut scroll,
-            )?;
-
-            // Return arena free lists to the OS — see `release_freed_heap` docs.
-            crate::utils::release_freed_heap();
-
-            // This heavy path already repainted with fresh metrics, so restart
-            // the light-tick timer to avoid an immediate redundant redraw.
-            last_metrics = Instant::now();
-        } else if last_metrics.elapsed() >= metrics_interval {
-            // Lightweight metrics tick: re-sample only our own process (cheap)
-            // and repaint the cached rows so the CPU/memory readout stays live
-            // without re-aggregating any session directory.
-            last_metrics = Instant::now();
-            refresh_process_metrics(&mut sys, pid);
-            render_analysis_frame(
-                &mut terminal,
-                &rows_data,
-                &totals,
-                &provider_totals,
-                &update_tracker,
-                &sys,
-                pid,
-                &mut scroll,
-            )?;
-        }
-
-        // Handle input with timeout
-        let action = handle_input()?;
-        match action {
-            InputAction::Quit => break,
-            InputAction::Refresh => refresh_state.force(),
-            // Provider-prefix merge is a usage-view feature; nothing to do here.
-            InputAction::ToggleMerge => {}
-            // Move the selection / scroll, then repaint without re-aggregating.
-            InputAction::Navigate(nav) => {
-                scroll.apply(nav, rows_data.len());
-                render_analysis_frame(
-                    &mut terminal,
-                    &rows_data,
-                    &totals,
-                    &provider_totals,
-                    &update_tracker,
-                    &sys,
-                    pid,
-                    &mut scroll,
-                )?;
-            }
-            // Redraw the cached frame at the new terminal size without
-            // re-aggregating, so resize tracks the drag instead of waiting
-            // for the next refresh tick.
-            InputAction::Resize => render_analysis_frame(
-                &mut terminal,
-                &rows_data,
-                &totals,
-                &provider_totals,
-                &update_tracker,
-                &sys,
-                pid,
-                &mut scroll,
-            )?,
-            InputAction::Continue => {}
-        }
-    }
-
-    // Restore terminal
-    restore_terminal(&mut terminal)?;
-    Ok(())
+    let threads = crate::config::PerformanceConfig::default().resolved_scan_threads();
+    let pool = Arc::new(crate::summary_cache::build_scan_pool(threads)?);
+    run_analysis_interactive(
+        Some(initial_data),
+        time_range,
+        providers,
+        refresh_secs,
+        pool,
+    )
 }
 
-/// Render a single analysis frame from already-aggregated display state.
-///
-/// Shared by the periodic refresh and resize redraw; `provider_rows` is
-/// rebuilt here (cheap) rather than cached, since it borrows from
-/// `provider_totals`.
-///
-/// # Errors
-///
-/// Returns an error if the terminal draw call fails.
 #[allow(clippy::too_many_arguments)]
-fn render_analysis_frame(
+fn render_analysis_frame_with_status(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     rows_data: &[AnalysisRow],
     totals: &AnalysisRow,
@@ -332,6 +416,7 @@ fn render_analysis_frame(
     sys: &System,
     pid: Pid,
     scroll: &mut ScrollState,
+    status: Option<&str>,
 ) -> anyhow::Result<()> {
     let provider_rows = build_analysis_provider_rows(provider_totals);
 
@@ -513,7 +598,7 @@ fn render_analysis_frame(
         let summary = create_summary(summary_items, sys, pid, chunks.summary.width);
         f.render_widget(summary, chunks.summary);
 
-        f.render_widget(create_controls(&[]), chunks.controls);
+        f.render_widget(create_controls_with_status(&[], status), chunks.controls);
     })?;
 
     // ratatui can't embed the OSC 8 escape itself, so hyperlink the repo label

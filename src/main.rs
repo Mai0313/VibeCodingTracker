@@ -17,6 +17,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{self, Write};
+use std::sync::Arc;
 use vibe_coding_tracker::cli::{Cli, Commands, ConfigAction, resolve_time_range_with_default};
 
 // mimalloc is opt-in behind the `mimalloc` cargo feature. The default build
@@ -29,12 +30,15 @@ use vibe_coding_tracker::cli::{Cli, Commands, ConfigAction, resolve_time_range_w
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use vibe_coding_tracker::display::usage::{
-    display_usage_interactive, display_usage_table, display_usage_text,
+    display_usage_interactive_with_pool, display_usage_table, display_usage_text,
 };
 use vibe_coding_tracker::get_version_info;
 use vibe_coding_tracker::pricing::{ModelPricingMap, fetch_model_pricing};
 use vibe_coding_tracker::session::{ParseMode, parse_session_file_typed_with_mode_and_diagnostics};
-use vibe_coding_tracker::usage::{CostSource, get_usage_from_directories_with, resolve_model_cost};
+use vibe_coding_tracker::summary_cache::build_scan_pool;
+use vibe_coding_tracker::usage::{
+    CostSource, get_usage_from_directories_with_diagnostics, resolve_model_cost,
+};
 use vibe_coding_tracker::utils::extract_token_counts;
 
 /// Parses the CLI and runs the selected subcommand.
@@ -136,20 +140,25 @@ fn run() -> Result<()> {
                         all,
                         config.general.default_time_range,
                     );
+                    let scan_pool =
+                        Arc::new(build_scan_pool(config.performance.resolved_scan_threads())?);
                     if json {
-                        let dataset =
+                        let dataset = scan_pool.install(|| {
                             vibe_coding_tracker::analysis::collect_analysis_sessions_with(
                                 time_range,
                                 config.providers,
                                 ParseMode::Full,
-                            )?;
+                            )
+                        })?;
                         report_analysis_collection(&dataset.diagnostics)?;
                         write_pretty_json(&dataset)?;
                     } else if text || table {
-                        let aggregation = vibe_coding_tracker::analysis::aggregate_sessions_by_model_with_diagnostics(
+                        let aggregation = scan_pool.install(|| {
+                            vibe_coding_tracker::analysis::aggregate_sessions_by_model_with_diagnostics(
                                 time_range,
                                 config.providers,
-                            )?;
+                            )
+                        })?;
                         report_analysis_collection(&aggregation.diagnostics)?;
 
                         if text {
@@ -162,16 +171,11 @@ fn run() -> Result<()> {
                             );
                         }
                     } else {
-                        let analysis_data =
-                            vibe_coding_tracker::analysis::aggregate_sessions_by_model_with(
-                                time_range,
-                                config.providers,
-                            )?;
-                        vibe_coding_tracker::display::analysis::display_analysis_interactive(
-                            analysis_data,
+                        vibe_coding_tracker::display::analysis::display_analysis_interactive_loading_with_pool(
                             time_range,
                             config.providers,
                             config.analysis.refresh_secs(),
+                            scan_pool,
                         )?;
                     }
                 }
@@ -200,10 +204,15 @@ fn run() -> Result<()> {
             // A `--merge-providers` flag forces merging on; otherwise the saved
             // preference decides. The TUI's `m` toggle persists back to config.
             let merge = merge_providers || config.usage.merge_models;
-            let usage_from_dirs = |tr| get_usage_from_directories_with(tr, config.providers);
+            let scan_pool = Arc::new(build_scan_pool(config.performance.resolved_scan_threads())?);
+            let usage_from_dirs = |tr| {
+                scan_pool
+                    .install(|| get_usage_from_directories_with_diagnostics(tr, config.providers))
+            };
 
             if json {
-                let usage_data = usage_from_dirs(time_range)?;
+                let usage = usage_from_dirs(time_range)?;
+                report_usage_collection(&usage.diagnostics)?;
                 let pricing_map = match fetch_model_pricing() {
                     Ok(map) => map,
                     Err(e) => {
@@ -215,27 +224,30 @@ fn run() -> Result<()> {
                         ModelPricingMap::new(HashMap::new())
                     }
                 };
-                let enriched_data = build_enriched_json(&usage_data, &pricing_map)?;
+                let enriched_data = build_enriched_json(&usage.data, &pricing_map)?;
                 write_pretty_json(&enriched_data)?;
             } else if text {
-                let usage_data = usage_from_dirs(time_range)?;
-                display_usage_text(&usage_data, merge);
+                let usage = usage_from_dirs(time_range)?;
+                report_usage_collection(&usage.diagnostics)?;
+                display_usage_text(&usage.data, merge);
             } else if table {
-                let usage_data = usage_from_dirs(time_range)?;
-                display_usage_table(&usage_data, merge);
+                let usage = usage_from_dirs(time_range)?;
+                report_usage_collection(&usage.diagnostics)?;
+                display_usage_table(&usage.data, merge);
             } else {
                 // `config` is not used after this, so hand the panel list off by
                 // move; read both cadences first so the borrows end before the
                 // partial move out of `config.usage`.
                 let refresh = config.usage.refresh_secs();
                 let quota_refresh = config.usage.quota_refresh_secs();
-                display_usage_interactive(
+                display_usage_interactive_with_pool(
                     time_range,
                     merge,
                     config.usage.quota.panels,
                     config.providers,
                     refresh,
                     quota_refresh,
+                    scan_pool,
                 )?;
             }
         }
@@ -421,6 +433,35 @@ fn report_analysis_collection(
     Ok(())
 }
 
+/// Rejects a completely failed noninteractive usage scan and reports partial data.
+fn report_usage_collection(
+    diagnostics: &vibe_coding_tracker::usage::UsageCollectionDiagnostics,
+) -> Result<()> {
+    let Some(first) = diagnostics.failures.first() else {
+        return Ok(());
+    };
+    if diagnostics.all_failed() {
+        bail!(
+            "failed to read all {} usage sources; first failure: {} {}: {}",
+            diagnostics.candidates,
+            first.provider,
+            first.source.display(),
+            first.error
+        );
+    }
+    if diagnostics.partially_failed() {
+        eprintln!(
+            "Warning: Encountered {} usage source failures while scanning {} candidates. Successful results are still shown. First failure: {} {}: {}",
+            diagnostics.failures.len(),
+            diagnostics.candidates,
+            first.provider,
+            first.source.display(),
+            first.error
+        );
+    }
+    Ok(())
+}
+
 /// The fallback editor when neither `$VISUAL` nor `$EDITOR` is set.
 fn default_editor() -> &'static str {
     if cfg!(windows) { "notepad" } else { "vi" }
@@ -494,10 +535,9 @@ fn resolve_enriched_model_cost(
         }
     }
 
-    // OpenCode and Cursor both carry stored costs, but OpenCode prefers an exact
-    // LiteLLM match while Cursor uses its dashboard cost verbatim. Their stored
-    // costs are kept per provider so a colliding bare model name cannot
-    // cross-contaminate.
+    // OpenCode and Hermes prefer an exact LiteLLM match before their stored
+    // costs. Cursor is a local token estimate, so it uses an exact LiteLLM
+    // price when available and otherwise remains unpriced.
     let stored = |m: &vibe_coding_tracker::constants::FastHashMap<String, f64>| {
         m.get(model).copied().unwrap_or(0.0)
     };
@@ -508,7 +548,7 @@ fn resolve_enriched_model_cost(
         ),
         (
             &usage_data.per_provider.cursor,
-            CostSource::CursorStored(stored(&usage_data.stored_costs.cursor)),
+            CostSource::OpenCodeStored(0.0),
         ),
         (
             &usage_data.per_provider.hermes,

@@ -9,6 +9,9 @@ mod table;
 mod text;
 
 pub use averages::*;
-pub use interactive::display_analysis_interactive;
+pub use interactive::{
+    display_analysis_interactive, display_analysis_interactive_loading,
+    display_analysis_interactive_loading_with_pool,
+};
 pub use table::display_analysis_table;
 pub use text::display_analysis_text;

@@ -171,12 +171,13 @@ fn to_level_filter(level: LogLevel) -> LevelFilter {
 pub fn init() {
     let dir = home::home_dir().map(|home| home.join(".vct").join(LOG_DIR_NAME));
     let logger = LOGGER.get_or_init(|| FileLogger::new(dir, LevelFilter::Warn));
-    // `set_logger` succeeds only on the first install for the whole process;
-    // pair the max-level set and panic hook with that one-time success.
+    // `set_logger` succeeds only on the first install for the whole process.
     if log::set_logger(logger).is_ok() {
         log::set_max_level(LevelFilter::Warn);
-        install_panic_hook();
     }
+    // Terminal safety is independent of logger ownership. This also preserves
+    // a logger or panic hook that an embedding application installed first.
+    crate::display::common::tui::ensure_terminal_panic_hook();
 }
 
 /// Applies the persisted `[logging]` settings: sets the max level and prunes
@@ -188,21 +189,6 @@ pub fn apply(cfg: &LoggingConfig) {
         logger.level.store(filter as usize, Ordering::Relaxed);
     }
     prune_old_logs(cfg.retention_days);
-}
-
-/// Installs a panic hook that restores the terminal (if the TUI owns it) and
-/// records the panic before delegating to the previous hook.
-///
-/// Chaining to the previous hook preserves the default stderr panic message,
-/// which — now that the terminal is restored — lands on the normal screen. This
-/// runs even under `panic = "abort"` (the hook fires before the abort).
-fn install_panic_hook() {
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        crate::display::common::tui::force_restore_terminal();
-        log::error!("{info}");
-        previous(info);
-    }));
 }
 
 /// Prunes daily log files older than `retention_days` from the log directory.

@@ -1,23 +1,22 @@
 //! Auto-refreshing TUI for the usage view.
 //!
-//! Runs a render loop that re-aggregates the session directories every
-//! `refresh_secs` seconds (from `config.toml`), repriced from a pricing map
-//! rebuilt at most every [`PRICING_REFRESH_SECS`], and highlights rows whose
-//! tokens changed
-//! since the last tick. The loop holds only the small per-model display state
+//! Runs a render loop that incrementally re-aggregates the session directories
+//! every `refresh_secs` seconds (from `config.toml`), reusing one pricing map
+//! for the current UTC day and highlighting rows whose tokens changed since
+//! the last tick. The loop holds only the small per-model display state
 //! between frames so a resize repaints instantly without re-aggregating; memory
 //! is trimmed back to the OS after each refresh.
 
 use crate::config::ProvidersConfig;
 use crate::display::common::ProviderTotal;
 use crate::display::common::table::{
-    create_controls, create_provider_row, create_ratatui_table, create_summary,
+    create_controls_with_status, create_provider_row, create_ratatui_table, create_summary,
     init_process_metrics, main_layout, refresh_process_metrics, render_scrollable_table,
     render_too_small, styled_row,
 };
 use crate::display::common::tui::{
-    InputAction, RefreshState, ScrollState, UpdateTracker, handle_input, overlay_repo_hyperlink,
-    restore_terminal, setup_terminal,
+    InputAction, RefreshWorker, RefreshWorkerError, ScrollState, TerminalSession, UpdateTracker,
+    handle_input, overlay_repo_hyperlink, refresh_status, render_loading_frame,
 };
 use crate::display::usage::averages::{
     ProviderStats, UsageProviderTotals, UsageRow, UsageTotals, build_provider_total_rows,
@@ -25,7 +24,7 @@ use crate::display::usage::averages::{
 };
 use crate::models::{
     ClaudeQuotaSnapshot, CodexQuotaSnapshot, CopilotQuotaSnapshot, CursorQuotaSnapshot,
-    PerProviderUsage, ProviderActiveDays, QuotaSource, QuotaWindow, UsageResult,
+    QuotaSource, QuotaWindow,
 };
 use crate::pricing::{ModelPricingMap, fetch_model_pricing};
 use crate::quota::{
@@ -34,13 +33,14 @@ use crate::quota::{
     load_cursor_cache, save_claude_cache, save_codex_cache, save_copilot_cache, save_cursor_cache,
     spawn_quota_worker,
 };
+use crate::summary_cache::{SummaryScanCache, build_scan_pool};
 use crate::utils::{
     format_compact, format_cost, format_cost_compact, format_duration_until,
     get_claude_credentials_path, get_copilot_config_path, get_cursor_auth_path, resolve_paths,
 };
 use ratatui::{
     Frame, Terminal,
-    backend::CrosstermBackend,
+    backend::{Backend, CrosstermBackend, TestBackend},
     layout::{Constraint, Direction, Layout as RatatuiLayout, Rect},
     style::{Color as RatatuiColor, Modifier, Style, Stylize},
     text::{Line, Span},
@@ -127,11 +127,6 @@ struct QuotaView<'a> {
     band_enabled: bool,
 }
 
-/// How often to rebuild the LiteLLM pricing map. The underlying data only
-/// changes when the upstream JSON is updated (daily at most), so rebuilding
-/// a fresh ~500 KB `HashMap<Rc<str>, ModelPricing>` every 10 s just churned
-/// the allocator and left heap fragmentation behind on long sessions.
-const PRICING_REFRESH_SECS: u64 = 300;
 /// Upper bound on rows the [`UpdateTracker`] remembers for change highlighting.
 const MAX_TRACKED_ROWS: usize = 100;
 
@@ -143,6 +138,510 @@ const USAGE_MIN_H: u16 = 14;
 const USAGE_PANELS_MIN_H: u16 = 22;
 /// Minimum combined height reserved for the model table, summary, and controls.
 const USAGE_NON_PANEL_MIN_H: u16 = 10;
+
+struct UsageRefreshPayload {
+    rows: Vec<UsageRow>,
+    merged_rows: Vec<UsageRow>,
+    totals: UsageTotals,
+    provider_totals: UsageProviderTotals,
+}
+
+struct QuotaShutdownGuard {
+    shutdown: Arc<AtomicBool>,
+}
+
+impl Drop for QuotaShutdownGuard {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
+}
+
+struct QuotaRuntime {
+    present: QuotaPresence,
+    band_enabled: bool,
+    claude: Arc<Mutex<ClaudeQuotaSnapshot>>,
+    codex: Arc<Mutex<CodexQuotaSnapshot>>,
+    copilot: Arc<Mutex<CopilotQuotaSnapshot>>,
+    cursor: Arc<Mutex<CursorQuotaSnapshot>>,
+    _guard: QuotaShutdownGuard,
+}
+
+impl QuotaRuntime {
+    fn start(quota_panels: &[String], providers: ProvidersConfig, quota_refresh_secs: u64) -> Self {
+        let panel_on = |name: &str| crate::config::quota_panel_selected(quota_panels, name);
+        let band_enabled = !quota_panels.is_empty();
+        let mut present = if band_enabled {
+            QuotaPresence::detect()
+        } else {
+            QuotaPresence::default()
+        };
+        present.claude &= providers.claude && panel_on("claude");
+        present.codex &= providers.codex && panel_on("codex");
+        present.copilot &= providers.copilot && panel_on("copilot");
+        present.cursor &= providers.cursor && panel_on("cursor");
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let claude = Arc::new(Mutex::new(
+            present
+                .claude
+                .then(load_claude_cache)
+                .flatten()
+                .unwrap_or_default(),
+        ));
+        let codex = Arc::new(Mutex::new(
+            present
+                .codex
+                .then(load_codex_cache)
+                .flatten()
+                .unwrap_or_default(),
+        ));
+        let copilot = Arc::new(Mutex::new(
+            present
+                .copilot
+                .then(load_copilot_cache)
+                .flatten()
+                .unwrap_or_default(),
+        ));
+        let cursor = Arc::new(Mutex::new(
+            present
+                .cursor
+                .then(load_cursor_cache)
+                .flatten()
+                .unwrap_or_default(),
+        ));
+
+        if present.claude || present.codex || present.copilot || present.cursor {
+            match crate::quota::http::build_client() {
+                Ok(client) => {
+                    if present.claude {
+                        let (client, shutdown, shared) =
+                            (client.clone(), Arc::clone(&shutdown), Arc::clone(&claude));
+                        let mut state = ClaudeState::default();
+                        spawn_quota_worker(
+                            "claude",
+                            shared,
+                            shutdown,
+                            quota_refresh_secs,
+                            move || state.resolve(&client),
+                            |snapshot| {
+                                let _ = save_claude_cache(snapshot);
+                            },
+                        );
+                    }
+                    if present.codex {
+                        let (client, shutdown, shared) =
+                            (client.clone(), Arc::clone(&shutdown), Arc::clone(&codex));
+                        let mut state = CodexState::default();
+                        spawn_quota_worker(
+                            "codex",
+                            shared,
+                            shutdown,
+                            quota_refresh_secs,
+                            move || state.resolve(&client),
+                            |snapshot| {
+                                let _ = save_codex_cache(snapshot);
+                            },
+                        );
+                    }
+                    if present.copilot {
+                        let (client, shutdown, shared) =
+                            (client.clone(), Arc::clone(&shutdown), Arc::clone(&copilot));
+                        let mut state = CopilotState;
+                        spawn_quota_worker(
+                            "copilot",
+                            shared,
+                            shutdown,
+                            quota_refresh_secs,
+                            move || state.resolve(&client),
+                            |snapshot| {
+                                let _ = save_copilot_cache(snapshot);
+                            },
+                        );
+                    }
+                    if present.cursor {
+                        let (client, shutdown, shared) =
+                            (client.clone(), Arc::clone(&shutdown), Arc::clone(&cursor));
+                        let mut state = CursorState;
+                        spawn_quota_worker(
+                            "cursor",
+                            shared,
+                            shutdown,
+                            quota_refresh_secs,
+                            move || state.resolve(&client),
+                            |snapshot| {
+                                let _ = save_cursor_cache(snapshot);
+                            },
+                        );
+                    }
+                }
+                Err(error) => {
+                    log::warn!("quota workers disabled: failed to build HTTP client: {error}")
+                }
+            }
+        }
+
+        Self {
+            present,
+            band_enabled,
+            claude,
+            codex,
+            copilot,
+            cursor,
+            _guard: QuotaShutdownGuard { shutdown },
+        }
+    }
+}
+
+struct UsageUiState {
+    rows: Vec<UsageRow>,
+    merged_rows: Vec<UsageRow>,
+    totals: UsageTotals,
+    provider_totals: UsageProviderTotals,
+    update_tracker: UpdateTracker,
+    scroll: ScrollState,
+    merge_enabled: bool,
+    claude: ClaudeQuotaSnapshot,
+    codex: CodexQuotaSnapshot,
+    copilot: CopilotQuotaSnapshot,
+    cursor: CursorQuotaSnapshot,
+}
+
+impl UsageUiState {
+    fn new(merge_enabled: bool) -> Self {
+        Self {
+            rows: Vec::new(),
+            merged_rows: Vec::new(),
+            totals: UsageTotals::default(),
+            provider_totals: UsageProviderTotals::default(),
+            update_tracker: UpdateTracker::new(MAX_TRACKED_ROWS, 1000),
+            scroll: ScrollState::new(),
+            merge_enabled,
+            claude: ClaudeQuotaSnapshot::default(),
+            codex: CodexQuotaSnapshot::default(),
+            copilot: CopilotQuotaSnapshot::default(),
+            cursor: CursorQuotaSnapshot::default(),
+        }
+    }
+
+    fn view(&self) -> &[UsageRow] {
+        current_view(self.merge_enabled, &self.rows, &self.merged_rows)
+    }
+
+    fn apply(&mut self, payload: UsageRefreshPayload) {
+        let previous = self
+            .scroll
+            .table
+            .selected()
+            .and_then(|index| self.view().get(index))
+            .map(|row| row.model.clone());
+        self.rows = payload.rows;
+        self.merged_rows = payload.merged_rows;
+        self.totals = payload.totals;
+        self.provider_totals = payload.provider_totals;
+
+        let fingerprints: Vec<_> = self
+            .view()
+            .iter()
+            .map(|row| (row.model.clone(), row_fingerprint(row)))
+            .collect();
+        let models: Vec<_> = fingerprints
+            .iter()
+            .map(|(model, _)| model.clone())
+            .collect();
+        self.scroll.sync(previous.as_deref(), &models);
+        self.update_tracker.cleanup(models);
+        for (model, fingerprint) in fingerprints {
+            self.update_tracker.track_update(model, &fingerprint);
+        }
+    }
+
+    fn toggle_merge(&mut self) {
+        let previous = self
+            .scroll
+            .table
+            .selected()
+            .and_then(|index| self.view().get(index))
+            .map(|row| row.model.clone());
+        self.merge_enabled = !self.merge_enabled;
+        let _ = crate::config::save_merge_models(self.merge_enabled);
+        let fingerprints: Vec<_> = self
+            .view()
+            .iter()
+            .map(|row| (row.model.clone(), row_fingerprint(row)))
+            .collect();
+        let models: Vec<_> = fingerprints
+            .iter()
+            .map(|(model, _)| model.clone())
+            .collect();
+        self.scroll.sync(previous.as_deref(), &models);
+        self.update_tracker.cleanup(models);
+        for (model, fingerprint) in fingerprints {
+            self.update_tracker.prime(model, &fingerprint);
+        }
+    }
+
+    fn refresh_quota(&mut self, runtime: &QuotaRuntime) {
+        self.claude = runtime
+            .claude
+            .lock()
+            .map(|value| value.clone())
+            .unwrap_or_default();
+        self.codex = runtime
+            .codex
+            .lock()
+            .map(|value| value.clone())
+            .unwrap_or_default();
+        self.copilot = runtime
+            .copilot
+            .lock()
+            .map(|value| value.clone())
+            .unwrap_or_default();
+        self.cursor = runtime
+            .cursor
+            .lock()
+            .map(|value| value.clone())
+            .unwrap_or_default();
+    }
+
+    fn render(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+        sys: &System,
+        pid: Pid,
+        runtime: &QuotaRuntime,
+        status: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.refresh_quota(runtime);
+        let quota = QuotaView {
+            claude: &self.claude,
+            codex: &self.codex,
+            copilot: &self.copilot,
+            cursor: &self.cursor,
+            present: runtime.present,
+            band_enabled: runtime.band_enabled,
+        };
+        let rows = current_view(self.merge_enabled, &self.rows, &self.merged_rows);
+        render_usage_frame_with_status(
+            terminal,
+            rows,
+            &self.totals,
+            &self.provider_totals,
+            &self.update_tracker,
+            sys,
+            pid,
+            &quota,
+            &mut self.scroll,
+            self.merge_enabled,
+            status,
+            true,
+        )
+    }
+}
+
+/// Displays usage with a dedicated scan pool supplied by the CLI.
+#[allow(clippy::too_many_arguments)]
+pub fn display_usage_interactive_with_pool(
+    time_range: crate::cli::TimeRange,
+    merge_providers: bool,
+    quota_panels: Vec<String>,
+    providers: ProvidersConfig,
+    refresh_secs: u64,
+    quota_refresh_secs: u64,
+    scan_pool: Arc<rayon::ThreadPool>,
+) -> anyhow::Result<()> {
+    let mut terminal = TerminalSession::new()?;
+    let result = (|| -> anyhow::Result<()> {
+        let mut spinner_index = 0usize;
+        render_loading_frame(terminal.terminal_mut(), spinner_index)?;
+
+        let paths = resolve_paths()?;
+        let quota = QuotaRuntime::start(&quota_panels, providers, quota_refresh_secs);
+        let worker_paths = paths.clone();
+        let worker_pool = Arc::clone(&scan_pool);
+        let mut worker = RefreshWorker::new_with_init(refresh_secs, move || {
+            let mut cache = SummaryScanCache::new();
+            let mut pricing = ModelPricingMap::new(HashMap::new());
+            let mut loaded_pricing_utc_date = None;
+            move || {
+                let today = chrono::Utc::now().date_naive();
+                if loaded_pricing_utc_date != Some(today) {
+                    match fetch_model_pricing() {
+                        Ok(map) => {
+                            pricing = map;
+                            loaded_pricing_utc_date = Some(today);
+                        }
+                        Err(error) => {
+                            log::warn!("failed to refresh pricing: {error}");
+                        }
+                    }
+                }
+
+                let collection = worker_pool.install(|| {
+                    crate::usage::get_usage_from_paths_with_cache(
+                        &worker_paths,
+                        time_range,
+                        providers,
+                        &mut cache,
+                    )
+                })?;
+                if collection.diagnostics.all_failed() {
+                    let first = collection
+                        .diagnostics
+                        .failures
+                        .first()
+                        .map(|failure| failure.error.as_str())
+                        .unwrap_or("unknown source failure");
+                    anyhow::bail!(
+                        "failed to parse all {} usage sources: {first}",
+                        collection.diagnostics.candidates
+                    );
+                }
+                if collection.diagnostics.partially_failed() {
+                    log::warn!(
+                        "usage refresh kept partial data after {} source failures",
+                        collection.diagnostics.failures.len()
+                    );
+                }
+
+                let mut summary = build_usage_summary(
+                    &collection.data.models,
+                    &collection.data.per_provider,
+                    &collection.data.provider_days,
+                    &pricing,
+                    &collection.data.stored_costs,
+                );
+                summary.rows.retain(|row| row.total != 0 || row.cost != 0.0);
+                let merged_rows = merge_rows_by_base_model(&summary.rows);
+                Ok(UsageRefreshPayload {
+                    rows: summary.rows,
+                    merged_rows,
+                    totals: summary.totals,
+                    provider_totals: summary.provider_totals,
+                })
+            }
+        });
+        worker.request();
+
+        let pid = sysinfo::get_current_pid()
+            .expect("Failed to get current process ID for memory monitoring");
+        let mut sys = System::new();
+        init_process_metrics(&mut sys, pid);
+        let metrics_interval = Duration::from_millis(crate::constants::refresh::METRICS_REFRESH_MS);
+        let mut last_metrics = Instant::now();
+        let mut last_spinner = Instant::now();
+        let mut state = UsageUiState::new(merge_providers);
+        let mut loaded = false;
+        let mut failure_until = None;
+
+        loop {
+            if let Some(result) = worker.try_result() {
+                match result {
+                    Ok(payload) => {
+                        state.apply(payload);
+                        loaded = true;
+                        failure_until = None;
+                        refresh_process_metrics(&mut sys, pid);
+                        state.render(
+                            terminal.terminal_mut(),
+                            &sys,
+                            pid,
+                            &quota,
+                            refresh_status(worker.is_active(), failure_until),
+                        )?;
+                        crate::utils::release_freed_heap();
+                        last_metrics = Instant::now();
+                    }
+                    Err(RefreshWorkerError::Disconnected) => {
+                        return Err(anyhow::anyhow!("refresh worker disconnected"));
+                    }
+                    Err(error) if !loaded => {
+                        return Err(anyhow::anyhow!("initial usage load failed: {error}"));
+                    }
+                    Err(error) => {
+                        log::warn!("usage refresh failed: {error}");
+                        failure_until = Some(Instant::now() + Duration::from_secs(3));
+                        state.render(
+                            terminal.terminal_mut(),
+                            &sys,
+                            pid,
+                            &quota,
+                            refresh_status(worker.is_active(), failure_until),
+                        )?;
+                    }
+                }
+            }
+
+            let auto_refresh_started = worker.request_if_due();
+            if !loaded && last_spinner.elapsed() >= Duration::from_millis(100) {
+                spinner_index = spinner_index.wrapping_add(1);
+                last_spinner = Instant::now();
+                render_loading_frame(terminal.terminal_mut(), spinner_index)?;
+            } else if loaded && (auto_refresh_started || last_metrics.elapsed() >= metrics_interval)
+            {
+                if last_metrics.elapsed() >= metrics_interval {
+                    last_metrics = Instant::now();
+                    refresh_process_metrics(&mut sys, pid);
+                }
+                let status = refresh_status(worker.is_active(), failure_until);
+                state.render(terminal.terminal_mut(), &sys, pid, &quota, status)?;
+            }
+
+            match handle_input()? {
+                InputAction::Quit => break,
+                InputAction::Refresh => {
+                    worker.request();
+                    if loaded {
+                        state.render(
+                            terminal.terminal_mut(),
+                            &sys,
+                            pid,
+                            &quota,
+                            refresh_status(worker.is_active(), failure_until),
+                        )?;
+                    }
+                }
+                InputAction::ToggleMerge => {
+                    state.toggle_merge();
+                    if loaded {
+                        state.render(
+                            terminal.terminal_mut(),
+                            &sys,
+                            pid,
+                            &quota,
+                            refresh_status(worker.is_active(), failure_until),
+                        )?;
+                    }
+                }
+                InputAction::Navigate(delta) if loaded => {
+                    state.scroll.apply(delta, state.view().len());
+                    state.render(
+                        terminal.terminal_mut(),
+                        &sys,
+                        pid,
+                        &quota,
+                        refresh_status(worker.is_active(), failure_until),
+                    )?;
+                }
+                InputAction::Resize if loaded => {
+                    state.render(
+                        terminal.terminal_mut(),
+                        &sys,
+                        pid,
+                        &quota,
+                        refresh_status(worker.is_active(), failure_until),
+                    )?;
+                }
+                InputAction::Resize => {
+                    render_loading_frame(terminal.terminal_mut(), spinner_index)?;
+                }
+                InputAction::Navigate(_) | InputAction::Continue => {}
+            }
+        }
+
+        Ok(())
+    })();
+    terminal.finish(result)
+}
 
 /// Displays token usage data in an interactive TUI with auto-refresh.
 ///
@@ -166,10 +665,9 @@ const USAGE_NON_PANEL_MIN_H: u16 = 10;
 ///
 /// # Errors
 ///
-/// Returns an error if the terminal cannot be set up or restored, if reading a
-/// terminal input event fails, or if a frame fails to draw. A failure to
-/// aggregate usage or fetch pricing within the loop is logged and the previous
-/// data is kept, not propagated.
+/// Returns an error if the terminal cannot be set up or restored, if the initial
+/// usage load fails, if reading a terminal input event fails, or if a frame fails
+/// to draw. A later refresh failure is logged and the previous data is kept.
 ///
 /// # Panics
 ///
@@ -182,503 +680,19 @@ pub fn display_usage_interactive(
     refresh_secs: u64,
     quota_refresh_secs: u64,
 ) -> anyhow::Result<()> {
-    let mut terminal = setup_terminal()?;
-    let mut refresh_state = RefreshState::new(refresh_secs.max(1));
-
-    // Each provider's quota is fetched on its own background thread so a
-    // blocking (or slow) HTTP call never stalls the render loop or the other
-    // providers. Panels are seeded from the last-known cache so they show
-    // immediately on launch, and a worker is spawned only for a provider whose
-    // credentials are present. All workers share one HTTP client and shutdown
-    // flag. With no panels selected, treat every provider as absent so nothing
-    // is probed, no worker spawns, and the band is dropped.
-    let panel_on = |name: &str| crate::config::quota_panel_selected(&quota_panels, name);
-    // An empty `quota_panels` drops the whole bottom band (panels + the Provider
-    // Usage table), not just the gauges — a genuinely quieter dashboard.
-    let band_enabled = !quota_panels.is_empty();
-    let mut present = if band_enabled {
-        QuotaPresence::detect()
-    } else {
-        QuotaPresence::default()
-    };
-    // A panel shows only when it is selected in `usage.quota.panels` AND its
-    // provider is enabled in `[providers]` — a disabled or unselected provider
-    // is skipped entirely (no cache load, no worker, no quota API call).
-    present.claude &= providers.claude && panel_on("claude");
-    present.codex &= providers.codex && panel_on("codex");
-    present.copilot &= providers.copilot && panel_on("copilot");
-    present.cursor &= providers.cursor && panel_on("cursor");
-    let quota_shutdown = Arc::new(AtomicBool::new(false));
-    let claude_shared = Arc::new(Mutex::new(
-        present
-            .claude
-            .then(load_claude_cache)
-            .flatten()
-            .unwrap_or_default(),
-    ));
-    let codex_shared = Arc::new(Mutex::new(
-        present
-            .codex
-            .then(load_codex_cache)
-            .flatten()
-            .unwrap_or_default(),
-    ));
-    let copilot_shared = Arc::new(Mutex::new(
-        present
-            .copilot
-            .then(load_copilot_cache)
-            .flatten()
-            .unwrap_or_default(),
-    ));
-    let cursor_shared = Arc::new(Mutex::new(
-        present
-            .cursor
-            .then(load_cursor_cache)
-            .flatten()
-            .unwrap_or_default(),
-    ));
-    if present.claude || present.codex || present.copilot || present.cursor {
-        match crate::quota::http::build_client() {
-            Ok(client) => {
-                if present.claude {
-                    let (c, sh, shared) = (
-                        client.clone(),
-                        Arc::clone(&quota_shutdown),
-                        Arc::clone(&claude_shared),
-                    );
-                    let mut state = ClaudeState::default();
-                    spawn_quota_worker(
-                        "claude",
-                        shared,
-                        sh,
-                        quota_refresh_secs,
-                        move || state.resolve(&c),
-                        |s| {
-                            let _ = save_claude_cache(s);
-                        },
-                    );
-                }
-                if present.codex {
-                    let (c, sh, shared) = (
-                        client.clone(),
-                        Arc::clone(&quota_shutdown),
-                        Arc::clone(&codex_shared),
-                    );
-                    let mut state = CodexState::default();
-                    spawn_quota_worker(
-                        "codex",
-                        shared,
-                        sh,
-                        quota_refresh_secs,
-                        move || state.resolve(&c),
-                        |s| {
-                            let _ = save_codex_cache(s);
-                        },
-                    );
-                }
-                if present.copilot {
-                    let (c, sh, shared) = (
-                        client.clone(),
-                        Arc::clone(&quota_shutdown),
-                        Arc::clone(&copilot_shared),
-                    );
-                    let mut state = CopilotState;
-                    spawn_quota_worker(
-                        "copilot",
-                        shared,
-                        sh,
-                        quota_refresh_secs,
-                        move || state.resolve(&c),
-                        |s| {
-                            let _ = save_copilot_cache(s);
-                        },
-                    );
-                }
-                if present.cursor {
-                    let (c, sh, shared) = (
-                        client.clone(),
-                        Arc::clone(&quota_shutdown),
-                        Arc::clone(&cursor_shared),
-                    );
-                    let mut state = CursorState;
-                    spawn_quota_worker(
-                        "cursor",
-                        shared,
-                        sh,
-                        quota_refresh_secs,
-                        move || state.resolve(&c),
-                        |s| {
-                            let _ = save_cursor_cache(s);
-                        },
-                    );
-                }
-            }
-            Err(e) => log::warn!("quota workers disabled: failed to build HTTP client: {e}"),
-        }
-    }
-
-    let pid =
-        sysinfo::get_current_pid().expect("Failed to get current process ID for memory monitoring");
-    // `System::new_all` would load every process, disk and network on the
-    // machine (tens of MB on a busy host). We only read our own process
-    // stats, so start from an empty `System` and populate it with just our
-    // pid (CPU + memory only) on every refresh. `remove_dead_processes: true`
-    // ensures no stale entries linger across refreshes.
-    let mut sys = System::new();
-    init_process_metrics(&mut sys, pid);
-    // Lightweight CPU/memory sampling runs on its own fast cadence, decoupled
-    // from the heavier session re-aggregation below.
-    let metrics_interval = Duration::from_millis(crate::constants::refresh::METRICS_REFRESH_MS);
-    let mut last_metrics = Instant::now();
-
-    let mut usage_data = UsageResult::default();
-    let mut per_provider_usage = PerProviderUsage::default();
-    let mut provider_days = ProviderActiveDays::default();
-    let mut stored_costs = crate::usage::StoredCosts::default();
-    let mut has_usage_data = false;
-
-    // Pricing map is large (~500 KB / ~400 models) but changes at most once
-    // per day upstream, so build it once and reuse across refresh cycles.
-    // We only rebuild when `PRICING_REFRESH_SECS` has elapsed — otherwise a
-    // 10 s refresh interval would allocate and drop a fresh hashmap six
-    // times a minute, leaving the glibc heap fragmented on long sessions.
-    let mut pricing_map = match fetch_model_pricing() {
-        Ok(map) => map,
-        Err(e) => {
-            log::warn!("Failed to fetch initial pricing: {}", e);
-            ModelPricingMap::new(HashMap::new())
-        }
-    };
-    let mut last_pricing_refresh = Instant::now();
-
-    let mut update_tracker = UpdateTracker::new(MAX_TRACKED_ROWS, 1000);
-
-    // Scroll/selection state for the model table (keyboard-driven).
-    let mut scroll = ScrollState::new();
-
-    // Latest rendered display state, kept across refresh cycles so a terminal
-    // resize can redraw at the new size immediately without re-aggregating the
-    // session directories. These are small per-model summaries, not the heavy
-    // parse buffers, so holding onto them between refreshes is cheap.
-    let mut rows_data: Vec<UsageRow> = Vec::new();
-    let mut totals = UsageTotals::default();
-    let mut provider_totals = UsageProviderTotals::default();
-    // `rows_data` is the un-merged canonical list. `display_rows` holds the
-    // provider-prefix-collapsed rows (e.g. `openai/gpt-5.5` + `azure/gpt-5.5` ->
-    // `gpt-5.5`) and is materialized **only while merging is on**; when off it
-    // stays empty and the table renders `rows_data` directly (see
-    // `current_view`), so the default path keeps a single copy of the rows.
-    // Toggling `m` re-derives from the cached `rows_data`, never re-scanning disk.
-    let mut merge_enabled = merge_providers;
-    let mut display_rows: Vec<UsageRow> = Vec::new();
-    // Quota panel state, cached across frames so a resize repaints without
-    // re-reading the shared snapshots.
-    let mut claude_snapshot = ClaudeQuotaSnapshot::default();
-    let mut codex_snapshot = CodexQuotaSnapshot::default();
-    let mut copilot_snapshot = CopilotQuotaSnapshot::default();
-    let mut cursor_snapshot = CursorQuotaSnapshot::default();
-
-    loop {
-        if refresh_state.should_refresh() {
-            refresh_state.mark_refreshed();
-
-            // Only refresh our own process entry (CPU + memory) and prune any
-            // that have died. Per-process CPU usage is updated as part of this
-            // refresh, so the former `refresh_cpu_all()` (which scans every CPU
-            // system-wide) is not needed here.
-            refresh_process_metrics(&mut sys, pid);
-
-            match crate::usage::get_usage_from_directories_with(time_range, providers) {
-                Ok(data) => {
-                    usage_data = data.models;
-                    per_provider_usage = data.per_provider;
-                    provider_days = data.provider_days;
-                    stored_costs = data.stored_costs;
-                    has_usage_data = true;
-                }
-                Err(e) => {
-                    log::warn!("Failed to get usage data: {}", e);
-                    if !has_usage_data {
-                        usage_data.clear();
-                        per_provider_usage = PerProviderUsage::default();
-                        stored_costs = Default::default();
-                    }
-                }
-            }
-
-            // Refresh the pricing map at most once every `PRICING_REFRESH_SECS`.
-            if last_pricing_refresh.elapsed() >= Duration::from_secs(PRICING_REFRESH_SECS)
-                || pricing_map.is_empty()
-            {
-                match fetch_model_pricing() {
-                    Ok(map) => {
-                        pricing_map = map;
-                        last_pricing_refresh = Instant::now();
-                    }
-                    Err(e) => log::warn!("Failed to refresh pricing: {}", e),
-                }
-            }
-
-            let summary = build_usage_summary(
-                &usage_data,
-                &per_provider_usage,
-                &provider_days,
-                &pricing_map,
-                &stored_costs,
-            );
-
-            // Remember which model was selected so the highlight can follow it
-            // across a refresh even if rows are reordered or added/removed.
-            let prev_model = {
-                let view = current_view(merge_enabled, &rows_data, &display_rows);
-                scroll
-                    .table
-                    .selected()
-                    .and_then(|i| view.get(i))
-                    .map(|row| row.model.clone())
-            };
-
-            // Cache the rendered display state so a resize can redraw without
-            // re-aggregating. These per-model summaries are small; the heavy
-            // raw usage buffers are cleared right below.
-            rows_data = summary.rows;
-            // Hide models that contributed neither tokens nor cost in this
-            // range; they only add noise. A model can have zero tokens but a
-            // nonzero cost (Claude per-query web search, or an OpenCode model
-            // priced from its stored cost or a credit adjustment), so keep any
-            // row that carries cost too. Otherwise it vanishes from the table
-            // while its cost still counts toward the grand total, leaving the
-            // two inconsistent. A negative (credit) cost counts just as much as
-            // a positive one, so match on any nonzero value, not just > 0.
-            rows_data.retain(|row| row.total != 0 || row.cost != 0.0);
-            totals = summary.totals;
-            provider_totals = summary.provider_totals;
-
-            // Materialize the merged view only when merging is on; when off the
-            // table renders `rows_data` directly (no clone). Totals stay from
-            // `summary` (a row-wise sum is the same merged or not).
-            if merge_enabled {
-                display_rows = merge_rows_by_base_model(&rows_data);
-            }
-            let view = current_view(merge_enabled, &rows_data, &display_rows);
-
-            let model_names: Vec<String> = view.iter().map(|row| row.model.clone()).collect();
-            scroll.sync(prev_model.as_deref(), &model_names);
-
-            // Refresh quota panels from each background worker's latest snapshot.
-            claude_snapshot = claude_shared.lock().map(|g| g.clone()).unwrap_or_default();
-            codex_snapshot = codex_shared.lock().map(|g| g.clone()).unwrap_or_default();
-            copilot_snapshot = copilot_shared.lock().map(|g| g.clone()).unwrap_or_default();
-            cursor_snapshot = cursor_shared.lock().map(|g| g.clone()).unwrap_or_default();
-
-            // Clear raw usage data immediately after processing to free memory.
-            // Per-provider map is reset on the next refresh when new data arrives.
-            usage_data.clear();
-            per_provider_usage = PerProviderUsage::default();
-
-            // NOTE: we intentionally do NOT clear the global file cache or the
-            // pricing cache here. The usage path already bypasses the file cache
-            // (runs in `ParseMode::UsageOnly` and drops each analysis after
-            // extraction), so wiping it would only nuke entries populated by
-            // other commands. The pricing cache is a single sub-MB hashmap
-            // backed by a dated on-disk file — clearing it just forces another
-            // file-parse on the next refresh.
-
-            // Track updates against the displayed rows so highlighting keys off
-            // the merged model name when merging is on. See `row_fingerprint`
-            // for why a merged base name highlights on any variant's change.
-            let current_row_keys: Vec<String> = view.iter().map(|row| row.model.clone()).collect();
-
-            update_tracker.cleanup(current_row_keys);
-
-            for row in view {
-                update_tracker.track_update(row.model.clone(), &row_fingerprint(row));
-            }
-
-            render_usage_frame(
-                &mut terminal,
-                view,
-                &totals,
-                &provider_totals,
-                &update_tracker,
-                &sys,
-                pid,
-                &QuotaView {
-                    claude: &claude_snapshot,
-                    codex: &codex_snapshot,
-                    copilot: &copilot_snapshot,
-                    cursor: &cursor_snapshot,
-                    present,
-                    band_enabled,
-                },
-                &mut scroll,
-                merge_enabled,
-            )?;
-
-            // Hand any arena-held free pages back to the OS. The refresh cycle
-            // just allocated and dropped a lot of small objects (per-file parse
-            // buffers, per-model hashmaps, ratatui row vectors); without this
-            // call glibc keeps them as internal free lists and RSS climbs by
-            // ~6 MB every refresh on a 219-session directory.
-            crate::utils::release_freed_heap();
-
-            // This heavy path already repainted with fresh metrics, so restart
-            // the light-tick timer to avoid an immediate redundant redraw.
-            last_metrics = Instant::now();
-        } else if last_metrics.elapsed() >= metrics_interval {
-            // Lightweight metrics tick: re-sample only our own process (cheap)
-            // and repaint the cached rows so the CPU/memory readout stays live
-            // without re-scanning any session directory.
-            last_metrics = Instant::now();
-            refresh_process_metrics(&mut sys, pid);
-            let view = current_view(merge_enabled, &rows_data, &display_rows);
-            render_usage_frame(
-                &mut terminal,
-                view,
-                &totals,
-                &provider_totals,
-                &update_tracker,
-                &sys,
-                pid,
-                &QuotaView {
-                    claude: &claude_snapshot,
-                    codex: &codex_snapshot,
-                    copilot: &copilot_snapshot,
-                    cursor: &cursor_snapshot,
-                    present,
-                    band_enabled,
-                },
-                &mut scroll,
-                merge_enabled,
-            )?;
-        }
-
-        let action = handle_input()?;
-        match action {
-            InputAction::Quit => {
-                // Signal the detached workers to stop; the OS reclaims them on exit.
-                quota_shutdown.store(true, Ordering::Relaxed);
-                break;
-            }
-            InputAction::Refresh => refresh_state.force(),
-            // Flip provider-prefix merging and re-derive the displayed rows from
-            // the cached canonical list — no directory re-scan. Keep the current
-            // model selected across the collapse/expand when it survives.
-            InputAction::ToggleMerge => {
-                let prev_model = {
-                    let view = current_view(merge_enabled, &rows_data, &display_rows);
-                    scroll
-                        .table
-                        .selected()
-                        .and_then(|i| view.get(i))
-                        .map(|row| row.model.clone())
-                };
-                merge_enabled = !merge_enabled;
-                // Remember the choice for next launch (best-effort; a write
-                // failure must not disrupt the TUI).
-                let _ = crate::config::save_merge_models(merge_enabled);
-                // Materialize the merged rows when turning on; drop them (freeing
-                // the copy) when turning off.
-                if merge_enabled {
-                    display_rows = merge_rows_by_base_model(&rows_data);
-                } else {
-                    display_rows = Vec::new();
-                }
-                let view = current_view(merge_enabled, &rows_data, &display_rows);
-                let model_names: Vec<String> = view.iter().map(|row| row.model.clone()).collect();
-                scroll.sync(prev_model.as_deref(), &model_names);
-                // Prime the tracker with the relabeled keys so the next refresh
-                // doesn't treat them as first-seen and green-flash the whole
-                // table; a row still highlights later if its tokens actually move.
-                for row in view {
-                    update_tracker.prime(row.model.clone(), &row_fingerprint(row));
-                }
-                render_usage_frame(
-                    &mut terminal,
-                    view,
-                    &totals,
-                    &provider_totals,
-                    &update_tracker,
-                    &sys,
-                    pid,
-                    &QuotaView {
-                        claude: &claude_snapshot,
-                        codex: &codex_snapshot,
-                        copilot: &copilot_snapshot,
-                        cursor: &cursor_snapshot,
-                        present,
-                        band_enabled,
-                    },
-                    &mut scroll,
-                    merge_enabled,
-                )?;
-            }
-            // Move the selection / scroll, then repaint the cached frame
-            // without re-aggregating.
-            InputAction::Navigate(nav) => {
-                let view = current_view(merge_enabled, &rows_data, &display_rows);
-                scroll.apply(nav, view.len());
-                render_usage_frame(
-                    &mut terminal,
-                    view,
-                    &totals,
-                    &provider_totals,
-                    &update_tracker,
-                    &sys,
-                    pid,
-                    &QuotaView {
-                        claude: &claude_snapshot,
-                        codex: &codex_snapshot,
-                        copilot: &copilot_snapshot,
-                        cursor: &cursor_snapshot,
-                        present,
-                        band_enabled,
-                    },
-                    &mut scroll,
-                    merge_enabled,
-                )?;
-            }
-            // Redraw the cached frame at the new terminal size without
-            // re-aggregating, so resize tracks the drag instead of waiting
-            // for the next refresh tick.
-            InputAction::Resize => {
-                let view = current_view(merge_enabled, &rows_data, &display_rows);
-                render_usage_frame(
-                    &mut terminal,
-                    view,
-                    &totals,
-                    &provider_totals,
-                    &update_tracker,
-                    &sys,
-                    pid,
-                    &QuotaView {
-                        claude: &claude_snapshot,
-                        codex: &codex_snapshot,
-                        copilot: &copilot_snapshot,
-                        cursor: &cursor_snapshot,
-                        present,
-                        band_enabled,
-                    },
-                    &mut scroll,
-                    merge_enabled,
-                )?;
-            }
-            InputAction::Continue => {}
-        }
-    }
-
-    restore_terminal(&mut terminal)?;
-    Ok(())
+    let threads = crate::config::PerformanceConfig::default().resolved_scan_threads();
+    let pool = Arc::new(build_scan_pool(threads)?);
+    display_usage_interactive_with_pool(
+        time_range,
+        merge_providers,
+        quota_panels,
+        providers,
+        refresh_secs,
+        quota_refresh_secs,
+        pool,
+    )
 }
 
-/// Returns the rows currently on screen without copying: the canonical
-/// `rows_data` when merging is off, or the pre-materialized merged `display_rows`
-/// when it is on.
-///
-/// Keeping `display_rows` empty in the (default) un-merged case means the loop
-/// holds a single copy of the rows and skips a per-refresh clone; it is only
-/// populated while the merge toggle is on, where the collapsed rows genuinely
-/// differ from the canonical list.
 fn current_view<'a>(
     merge_enabled: bool,
     rows_data: &'a [UsageRow],
@@ -709,19 +723,9 @@ fn row_fingerprint(row: &UsageRow) -> (i64, i64, i64, i64) {
     )
 }
 
-/// Render a single usage frame from already-aggregated display state.
-///
-/// Kept separate from the refresh loop so both the periodic refresh and a
-/// terminal resize can paint the latest data; `provider_rows` is rebuilt here
-/// (a small set of borrow wrappers) rather than cached, since it borrows
-/// from `provider_totals`.
-///
-/// # Errors
-///
-/// Returns an error if the underlying terminal draw call fails.
 #[allow(clippy::too_many_arguments)]
-fn render_usage_frame(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+fn render_usage_frame_with_status<B: Backend>(
+    terminal: &mut Terminal<B>,
     rows_data: &[UsageRow],
     totals: &UsageTotals,
     provider_totals: &UsageProviderTotals,
@@ -731,6 +735,8 @@ fn render_usage_frame(
     quota: &QuotaView,
     scroll: &mut ScrollState,
     merge_enabled: bool,
+    status: Option<&str>,
+    write_hyperlink: bool,
 ) -> anyhow::Result<()> {
     let provider_rows = build_provider_total_rows(provider_totals);
 
@@ -936,14 +942,159 @@ fn render_usage_frame(
         } else {
             " merge  "
         };
-        f.render_widget(create_controls(&[("m", merge_hint)]), chunks.controls);
+        f.render_widget(
+            create_controls_with_status(&[("m", merge_hint)], status),
+            chunks.controls,
+        );
     })?;
 
     // ratatui can't embed the OSC 8 escape itself, so hyperlink the repo label
     // it just drew (a no-op on terminals without hyperlink support).
-    overlay_repo_hyperlink(completed.buffer)?;
+    if write_hyperlink {
+        overlay_repo_hyperlink(completed.buffer)?;
+    }
 
     Ok(())
+}
+
+/// Production-shaped usage frame fixture used by Criterion benchmarks.
+///
+/// The fixture owns a [`TestBackend`] so benchmarks exercise the same table,
+/// provider band, quota panels, summary, controls, and terminal diff path as
+/// the interactive renderer without writing control sequences to stdout.
+#[doc(hidden)]
+pub struct UsageFrameBenchmark {
+    terminal: Terminal<TestBackend>,
+    rows: Vec<UsageRow>,
+    totals: UsageTotals,
+    provider_totals: UsageProviderTotals,
+    update_tracker: UpdateTracker,
+    sys: System,
+    pid: Pid,
+    claude: ClaudeQuotaSnapshot,
+    codex: CodexQuotaSnapshot,
+    copilot: CopilotQuotaSnapshot,
+    cursor: CursorQuotaSnapshot,
+    scroll: ScrollState,
+}
+
+impl UsageFrameBenchmark {
+    /// Creates a populated benchmark frame at the requested terminal size.
+    pub fn new(width: u16, height: u16) -> anyhow::Result<Self> {
+        const MODELS: [&str; 8] = [
+            "claude-sonnet-4-6",
+            "gpt-5.5-codex",
+            "copilot/gpt-5.4",
+            "gemini-3.1-pro",
+            "grok-code-fast-1",
+            "opencode/deepseek-v4",
+            "cursor/auto",
+            "hermes/qwen3-coder",
+        ];
+
+        let mut rows = Vec::with_capacity(32);
+        let mut totals = UsageTotals::default();
+        let mut provider_totals = UsageProviderTotals::default();
+        for index in 0..32 {
+            let scale = index as i64 + 1;
+            let input_tokens = 12_000 * scale;
+            let output_tokens = 2_400 * scale;
+            let reasoning_tokens = 600 * scale;
+            let cache_read = 48_000 * scale;
+            let cache_creation = 1_200 * scale;
+            let total =
+                input_tokens + output_tokens + reasoning_tokens + cache_read + cache_creation;
+            let model = format!("{}-{index}", MODELS[index % MODELS.len()]);
+            let row = UsageRow {
+                display_model: model.clone(),
+                model,
+                input_tokens,
+                output_tokens,
+                reasoning_tokens,
+                cache_read,
+                cache_creation,
+                total,
+                cost: scale as f64 * 0.0175,
+            };
+            totals.accumulate(&row);
+            let stats = match index % MODELS.len() {
+                0 => &mut provider_totals.claude,
+                1 => &mut provider_totals.codex,
+                2 => &mut provider_totals.copilot,
+                3 => &mut provider_totals.gemini,
+                4 => &mut provider_totals.grok,
+                5 => &mut provider_totals.opencode,
+                6 => &mut provider_totals.cursor,
+                _ => &mut provider_totals.hermes,
+            };
+            stats.total_tokens += row.total;
+            stats.total_cost += row.cost;
+            stats.days_count = 7;
+            provider_totals.overall.total_tokens += row.total;
+            provider_totals.overall.total_cost += row.cost;
+            rows.push(row);
+        }
+        provider_totals.overall.days_count = 7;
+
+        let models: Vec<_> = rows.iter().map(|row| row.model.clone()).collect();
+        let mut update_tracker = UpdateTracker::new(MAX_TRACKED_ROWS, 0);
+        for row in &rows {
+            update_tracker.prime(row.model.clone(), &row_fingerprint(row));
+        }
+        let mut scroll = ScrollState::new();
+        scroll.sync(None, &models);
+
+        let pid = sysinfo::get_current_pid()
+            .map_err(|error| anyhow::anyhow!("get benchmark process ID: {error}"))?;
+        let mut sys = System::new();
+        init_process_metrics(&mut sys, pid);
+
+        Ok(Self {
+            terminal: Terminal::new(TestBackend::new(width, height))?,
+            rows,
+            totals,
+            provider_totals,
+            update_tracker,
+            sys,
+            pid,
+            claude: ClaudeQuotaSnapshot::default(),
+            codex: CodexQuotaSnapshot::default(),
+            copilot: CopilotQuotaSnapshot::default(),
+            cursor: CursorQuotaSnapshot::default(),
+            scroll,
+        })
+    }
+
+    /// Renders one frame with the supplied footer status.
+    pub fn render(&mut self, status: Option<&str>) -> anyhow::Result<()> {
+        let quota = QuotaView {
+            claude: &self.claude,
+            codex: &self.codex,
+            copilot: &self.copilot,
+            cursor: &self.cursor,
+            present: QuotaPresence {
+                claude: true,
+                codex: true,
+                copilot: true,
+                cursor: true,
+            },
+            band_enabled: true,
+        };
+        render_usage_frame_with_status(
+            &mut self.terminal,
+            &self.rows,
+            &self.totals,
+            &self.provider_totals,
+            &self.update_tracker,
+            &self.sys,
+            self.pid,
+            &quota,
+            &mut self.scroll,
+            false,
+            status,
+            false,
+        )
+    }
 }
 
 /// Maps a usage percentage to a traffic-light color (green/yellow/red).
@@ -1500,6 +1651,15 @@ mod tests {
             total_cost: 0.0,
             days_count: 1,
         }
+    }
+
+    #[test]
+    fn quota_shutdown_guard_never_waits_and_sets_flag() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        drop(QuotaShutdownGuard {
+            shutdown: Arc::clone(&shutdown),
+        });
+        assert!(shutdown.load(Ordering::Relaxed));
     }
 
     #[test]
