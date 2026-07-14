@@ -37,6 +37,7 @@ pub mod models;
 pub mod pricing;
 pub mod quota;
 pub mod session;
+pub mod summary_cache;
 pub mod update;
 pub mod usage;
 pub mod utils;

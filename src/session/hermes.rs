@@ -14,17 +14,17 @@
 //! session is also reconciled against the `sessions` aggregate so partial or
 //! missing per-model rows are not under-counted (see [`collect_usage`]).
 
-use crate::VERSION;
 use crate::cli::TimeRange;
 use crate::constants::FastHashMap;
-use crate::models::{CodeAnalysis, CodeAnalysisRecord, ExtensionType};
-use crate::session::state::{ParseMode, SessionParseState};
+use crate::models::{CodeAnalysis, ExtensionType};
+use crate::session::diagnostics::{DatabaseUsageRead, UsageContribution, UsageTokenContribution};
+use crate::session::sqlite::with_readonly_connection;
 use crate::utils::{get_current_user, get_machine_id};
-use anyhow::{Context, Result, anyhow};
-use rusqlite::{Connection, OpenFlags};
-use serde_json::{Value, json};
-use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use anyhow::Result;
+use rusqlite::Connection;
+#[cfg(test)]
+use serde_json::Value;
+use std::path::Path;
 
 /// Reads per-model token usage from the Hermes database.
 ///
@@ -42,7 +42,23 @@ pub fn read_hermes_usage(
     db_path: &Path,
     time_range: TimeRange,
 ) -> Result<Vec<(String, CodeAnalysis, f64)>> {
-    open_readonly(db_path, |conn| collect_usage(conn, time_range))
+    let user = get_current_user();
+    let machine = get_machine_id().to_string();
+    Ok(read_hermes_usage_contributions(db_path, time_range)?
+        .rows
+        .into_iter()
+        .map(|row| row.into_public_row(ExtensionType::Hermes, &user, &machine))
+        .collect())
+}
+
+/// Reads compact Hermes usage rows for the summary aggregation path.
+pub(crate) fn read_hermes_usage_contributions(
+    db_path: &Path,
+    time_range: TimeRange,
+) -> Result<DatabaseUsageRead> {
+    with_readonly_connection(db_path, "sessions", "vct-hermes-", "Hermes", |conn| {
+        collect_usage(conn, time_range).map(DatabaseUsageRead::complete)
+    })
 }
 
 /// Per-session raw column sums, used to reconcile against the `sessions`
@@ -69,12 +85,7 @@ struct RowSums {
 /// attributing the positive residual (`sessions.<col>` minus the sum of the
 /// session's per-model rows) to the session's recorded model. We mirror that so
 /// vct's totals agree with Hermes instead of under-reporting.
-fn collect_usage(
-    conn: &Connection,
-    time_range: TimeRange,
-) -> Result<Vec<(String, CodeAnalysis, f64)>> {
-    let user = get_current_user();
-    let machine = get_machine_id().to_string();
+fn collect_usage(conn: &Connection, time_range: TimeRange) -> Result<Vec<UsageContribution>> {
     let cutoff = cutoff_string(time_range);
 
     let mut out = Vec::new();
@@ -84,10 +95,10 @@ fn collect_usage(
     // as an empty per-model set and let the `sessions` reconciliation below
     // produce usage from the aggregate (matching Hermes's own fallback).
     if table_exists(conn, "session_model_usage")? {
-        collect_per_model_rows(conn, &cutoff, &user, &machine, &mut summed, &mut out)?;
+        collect_per_model_rows(conn, &cutoff, &mut summed, &mut out)?;
     }
 
-    reconcile_session_residuals(conn, &cutoff, &summed, &user, &machine, &mut out)?;
+    reconcile_session_residuals(conn, &cutoff, &summed, &mut out)?;
     Ok(out)
 }
 
@@ -106,10 +117,8 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
 fn collect_per_model_rows(
     conn: &Connection,
     cutoff: &Option<String>,
-    user: &str,
-    machine: &str,
     summed: &mut FastHashMap<String, RowSums>,
-    out: &mut Vec<(String, CodeAnalysis, f64)>,
+    out: &mut Vec<UsageContribution>,
 ) -> Result<()> {
     let mut stmt = conn.prepare(
         "SELECT session_id, model, input_tokens, output_tokens, cache_read_tokens, \
@@ -162,14 +171,12 @@ fn collect_per_model_rows(
         let output = (raw_output - reasoning).max(0);
         // Prefer the real billed cost; fall back to Hermes's own estimate.
         let cost = if actual > 0.0 { actual } else { estimated };
-        out.push(build_row(
-            &date,
-            model,
+        out.push(UsageContribution::single_model(
+            date,
             (seconds * 1000.0) as i64,
+            model.to_string(),
             session_usage_value(input, output, reasoning, cache_read, cache_write),
             cost,
-            user,
-            machine,
         ));
     }
     Ok(())
@@ -182,9 +189,7 @@ fn reconcile_session_residuals(
     conn: &Connection,
     cutoff: &Option<String>,
     summed: &FastHashMap<String, RowSums>,
-    user: &str,
-    machine: &str,
-    out: &mut Vec<(String, CodeAnalysis, f64)>,
+    out: &mut Vec<UsageContribution>,
 ) -> Result<()> {
     // The `sessions` table is core to Hermes, but stay defensive: if it is
     // somehow absent, the per-model rows already collected are still returned.
@@ -249,38 +254,15 @@ fn reconcile_session_residuals(
         }
 
         let cost = if actual > 0.0 { actual } else { estimated };
-        out.push(build_row(
-            &date,
-            model,
+        out.push(UsageContribution::single_model(
+            date,
             (seconds * 1000.0) as i64,
+            model.to_string(),
             session_usage_value(input, output, reasoning, cache_read, cache_write),
             cost,
-            user,
-            machine,
         ));
     }
     Ok(())
-}
-
-/// Builds one `(date, CodeAnalysis, cost)` contribution keyed by `model`.
-fn build_row(
-    date: &str,
-    model: &str,
-    ts_ms: i64,
-    usage: Value,
-    cost: f64,
-    user: &str,
-    machine: &str,
-) -> (String, CodeAnalysis, f64) {
-    let mut map = FastHashMap::default();
-    map.insert(model.to_string(), usage);
-    let mut state = SessionParseState::with_mode(ParseMode::UsageOnly);
-    state.last_ts = ts_ms;
-    (
-        date.to_string(),
-        wrap_record(state.into_record(map), user, machine),
-        cost,
-    )
 }
 
 /// Builds the Claude-style flat usage value from a row's token columns.
@@ -294,24 +276,13 @@ fn session_usage_value(
     reasoning: i64,
     cache_read: i64,
     cache_write: i64,
-) -> Value {
-    json!({
-        "input_tokens": input,
-        "output_tokens": output,
-        "cache_read_input_tokens": cache_read,
-        "cache_creation_input_tokens": cache_write,
-        "reasoning_output_tokens": reasoning,
-    })
-}
-
-/// Wraps a single record into a fully-populated [`CodeAnalysis`].
-fn wrap_record(record: CodeAnalysisRecord, user: &str, machine: &str) -> CodeAnalysis {
-    CodeAnalysis {
-        user: user.to_string(),
-        extension_name: ExtensionType::Hermes.to_string(),
-        insights_version: VERSION.to_string(),
-        machine_id: machine.to_string(),
-        records: vec![record],
+) -> UsageTokenContribution {
+    UsageTokenContribution {
+        input_tokens: input,
+        output_tokens: output,
+        reasoning_tokens: reasoning,
+        cache_read_tokens: cache_read,
+        cache_creation_tokens: cache_write,
     }
 }
 
@@ -336,76 +307,10 @@ fn is_before_cutoff(date: &str, cutoff: &Option<String>) -> bool {
     matches!(cutoff, Some(c) if date < c.as_str())
 }
 
-/// Opens the Hermes DB read-only and runs `f` against it.
-///
-/// The primary path opens the database read-only so the user's file is never
-/// mutated. If that fails (e.g. a WAL needing recovery that cannot be locked
-/// read-only) we fall back to copying the database plus its `-wal`/`-shm`
-/// sidecars into a private temp directory and reading the copy. The temp copy
-/// is removed when `f` returns.
-fn open_readonly<T>(db_path: &Path, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-    // Probe `sessions` (the core table present in every Hermes release) rather
-    // than `session_model_usage` (added later), so a pre-migration database
-    // still takes the read-only path instead of falling through to a temp copy.
-    if let Ok(conn) = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        && conn
-            .query_row("SELECT count(*) FROM sessions", [], |_| Ok(()))
-            .is_ok()
-    {
-        return f(&conn);
-    }
-
-    let copy = TempDbCopy::new(db_path)?;
-    let conn = Connection::open_with_flags(&copy.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| {
-            format!(
-                "Failed to open Hermes DB copy at {}",
-                copy.db_path.display()
-            )
-        })?;
-    f(&conn)
-}
-
-/// A private temp-directory copy of the Hermes database (plus WAL sidecars),
-/// removed on drop. The temp dir has owner-only permissions so the data is
-/// never exposed to other local users.
-struct TempDbCopy {
-    _dir: tempfile::TempDir,
-    db_path: PathBuf,
-}
-
-impl TempDbCopy {
-    fn new(src: &Path) -> Result<Self> {
-        let file_name = src
-            .file_name()
-            .ok_or_else(|| anyhow!("Invalid Hermes DB path: {}", src.display()))?;
-        let dir = tempfile::Builder::new()
-            .prefix("vct-hermes-")
-            .tempdir()
-            .context("Failed to create temp dir for Hermes DB copy")?;
-        let db_path = dir.path().join(file_name);
-        std::fs::copy(src, &db_path)
-            .with_context(|| format!("Failed to copy Hermes DB from {}", src.display()))?;
-        for suffix in ["-wal", "-shm"] {
-            let sidecar = append_suffix(src, suffix);
-            if sidecar.exists() {
-                let _ = std::fs::copy(&sidecar, append_suffix(&db_path, suffix));
-            }
-        }
-        Ok(Self { _dir: dir, db_path })
-    }
-}
-
-/// Appends a raw suffix to a path's final component (e.g. `db` -> `db-wal`).
-fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut os: OsString = path.as_os_str().to_owned();
-    os.push(suffix);
-    PathBuf::from(os)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     /// Builds a temp Hermes database with the `session_model_usage` and
     /// `sessions` tables.

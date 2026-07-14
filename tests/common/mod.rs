@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
-use vibe_coding_tracker::utils::{HelperPaths, get_current_date, resolve_paths_from_home};
+use vibe_coding_tracker::utils::{HelperPaths, resolve_paths_from_home};
 
 /// Absolute path to a file under the repo's `examples/` directory.
 ///
@@ -29,6 +29,24 @@ pub fn fixture(name: &str) -> PathBuf {
 pub fn fixture_str(name: &str) -> String {
     std::fs::read_to_string(fixture(name))
         .unwrap_or_else(|e| panic!("failed to read fixture {name}: {e}"))
+}
+
+/// Appends a valid standalone JSON blob large enough to change a Cursor store fingerprint.
+pub fn append_cursor_json_blob(path: &Path, id: &str) {
+    let connection = rusqlite::Connection::open(path).expect("open Cursor store");
+    let payload = serde_json::json!({
+        "role": "assistant",
+        "content": [],
+        "padding": "x".repeat(8 * 1024),
+    })
+    .to_string()
+    .into_bytes();
+    connection
+        .execute(
+            "INSERT INTO blobs (id, data) VALUES (?1, ?2)",
+            rusqlite::params![id, payload],
+        )
+        .expect("append Cursor JSON blob");
 }
 
 /// A temporary fake home directory plus the [`HelperPaths`] rooted inside it.
@@ -129,6 +147,79 @@ impl TempHome {
         signals
     }
 
+    /// Seeds one Cursor chat store with an assistant tool call and context gauge.
+    pub fn put_cursor_session(
+        &self,
+        project: &str,
+        conversation: &str,
+        model: &str,
+        timestamp_ms: i64,
+        context_tokens: i64,
+    ) -> PathBuf {
+        fn varint(mut value: u64, out: &mut Vec<u8>) {
+            loop {
+                let mut byte = (value & 0x7f) as u8;
+                value >>= 7;
+                if value != 0 {
+                    byte |= 0x80;
+                }
+                out.push(byte);
+                if value == 0 {
+                    break;
+                }
+            }
+        }
+
+        fn tag(field: u64, wire: u64, out: &mut Vec<u8>) {
+            varint((field << 3) | wire, out);
+        }
+
+        let message = r#"{"role":"assistant","content":[{"type":"tool-call","toolName":"Write","toolCallId":"write","args":{"path":"/repo/output.rs","contents":"first\nsecond"}}]}"#;
+        let mut node = Vec::new();
+        tag(1, 2, &mut node);
+        varint(1, &mut node);
+        node.push(0);
+        tag(4, 2, &mut node);
+        varint(message.len() as u64, &mut node);
+        node.extend_from_slice(message.as_bytes());
+        let mut context = Vec::new();
+        tag(1, 0, &mut context);
+        varint(context_tokens as u64, &mut context);
+        tag(5, 2, &mut node);
+        varint(context.len() as u64, &mut node);
+        node.extend_from_slice(&context);
+        tag(26, 0, &mut node);
+        varint(timestamp_ms as u64, &mut node);
+
+        let path = self
+            .paths
+            .cursor_chats_dir
+            .join(project)
+            .join(conversation)
+            .join("store.db");
+        std::fs::create_dir_all(path.parent().unwrap()).expect("create Cursor store directory");
+        let connection = rusqlite::Connection::open(&path).expect("create Cursor store");
+        connection
+            .execute_batch(
+                "CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB); \
+                 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);",
+            )
+            .expect("create Cursor store schema");
+        connection
+            .execute(
+                "INSERT INTO blobs (id, data) VALUES ('assistant', ?1)",
+                rusqlite::params![node],
+            )
+            .expect("insert Cursor assistant node");
+        connection
+            .execute(
+                "INSERT INTO meta (key, value) VALUES ('metadata', ?1)",
+                rusqlite::params![serde_json::json!({ "lastUsedModel": model }).to_string()],
+            )
+            .expect("insert Cursor metadata");
+        path
+    }
+
     /// Writes an arbitrary file under the fake home (relative to `HOME`).
     pub fn put(&self, rel: &str, content: &str) -> PathBuf {
         let p = self.home().join(rel);
@@ -142,10 +233,10 @@ impl TempHome {
     /// `models` is `{ "<model>": { "<cost_field>": <number>, ... }, ... }`.
     pub fn seed_pricing_cache(&self, models: &serde_json::Value) -> PathBuf {
         std::fs::create_dir_all(&self.paths.cache_dir).expect("create cache dir");
-        let path = self
-            .paths
-            .cache_dir
-            .join(format!("model_pricing_{}.json", get_current_date()));
+        let path = self.paths.cache_dir.join(format!(
+            "model_pricing_{}.json",
+            chrono::Utc::now().date_naive().format("%Y-%m-%d")
+        ));
         std::fs::write(
             &path,
             serde_json::to_string_pretty(models).expect("serialize pricing cache"),

@@ -11,6 +11,21 @@ use crate::session::grok::is_grok_signals;
 use anyhow::{Result, bail};
 use serde_json::Value;
 
+#[cfg(test)]
+std::thread_local! {
+    static RECORD_INSPECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_record_inspections() {
+    RECORD_INSPECTIONS.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn record_inspections() -> usize {
+    RECORD_INSPECTIONS.get()
+}
+
 /// Detects the AI provider format by analyzing distinctive fields in the
 /// session data.
 ///
@@ -99,81 +114,80 @@ pub fn detect_extension_type(data: &[Value]) -> Result<ExtensionType> {
 /// assert_eq!(classify_records(&with_marker), Some(ExtensionType::ClaudeCode));
 /// ```
 pub fn classify_records(data: &[Value]) -> Option<ExtensionType> {
-    if data.first().is_some_and(is_grok_signals) {
-        return Some(ExtensionType::Grok);
-    }
+    let mut classifier = RecordClassifier::default();
+    data.iter().find_map(|record| classifier.push(record))
+}
 
-    // JSONL stream: Gemini session-meta header line.
-    //
-    // Gemini CLI writes one event per line under `chats/`; the very first
-    // line is a pure session-meta record carrying `sessionId` +
-    // `projectHash`. The header does *not* include a `messages` array (an
-    // inline `messages[]` marked the obsolete single-object export shape,
-    // which we deliberately reject here to avoid mis-classifying it).
-    if let Some(first) = data.first().and_then(|v| v.as_object())
-        && first.contains_key("sessionId")
-        && first.contains_key("projectHash")
-        && !first.contains_key("messages")
-    {
-        return Some(ExtensionType::Gemini);
-    }
+/// Stateful provider classifier for a record stream.
+///
+/// Each record is inspected exactly once. This keeps single-file auto
+/// detection linear even when a Claude session has a long metadata preamble.
+#[derive(Debug, Default)]
+pub(crate) struct RecordClassifier {
+    seen_first: bool,
+    classified: Option<ExtensionType>,
+}
 
-    // JSONL stream: Copilot CLI `events.jsonl` session-start record.
-    //
-    // The modern Copilot CLI writes one event per line under
-    // `session-state/<sessionId>/events.jsonl`. The very first line is a
-    // `type == "session.start"` event whose `data.producer` field reads
-    // `"copilot-agent"` — distinct enough from Codex / Claude event
-    // streams to use as a classification key. Accept any of the typical
-    // producer tags (some dev builds emit `"copilot-cli"`) so we stay
-    // forward-compatible across minor CLI releases.
-    if let Some(first) = data.first().and_then(|v| v.as_object())
-        && first
+impl RecordClassifier {
+    /// Adds one record and returns the first confident provider verdict.
+    pub(crate) fn push(&mut self, record: &Value) -> Option<ExtensionType> {
+        if self.classified.is_some() {
+            return self.classified;
+        }
+
+        #[cfg(test)]
+        RECORD_INSPECTIONS.set(RECORD_INSPECTIONS.get() + 1);
+
+        let first = !self.seen_first;
+        self.seen_first = true;
+
+        if first {
+            if is_grok_signals(record) {
+                self.classified = Some(ExtensionType::Grok);
+                return self.classified;
+            }
+
+            if let Some(object) = record.as_object() {
+                if object.contains_key("sessionId")
+                    && object.contains_key("projectHash")
+                    && !object.contains_key("messages")
+                {
+                    self.classified = Some(ExtensionType::Gemini);
+                    return self.classified;
+                }
+
+                if object.get("type").and_then(Value::as_str) == Some("session.start")
+                    && object
+                        .get("data")
+                        .and_then(|data| data.get("producer"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|producer| producer.starts_with("copilot"))
+                {
+                    self.classified = Some(ExtensionType::Copilot);
+                    return self.classified;
+                }
+            }
+        }
+
+        let object = record.as_object()?;
+
+        if object.contains_key("parentUuid") {
+            self.classified = Some(ExtensionType::ClaudeCode);
+        } else if object
             .get("type")
-            .and_then(|v| v.as_str())
-            .is_some_and(|t| t == "session.start")
-    {
-        let producer = first
-            .get("data")
-            .and_then(|d| d.get("producer"))
-            .and_then(|p| p.as_str())
-            .unwrap_or("");
-        if producer.starts_with("copilot") {
-            return Some(ExtensionType::Copilot);
-        }
-    }
-
-    // Walk every record looking for Claude Code / Codex positive markers.
-    // Either one counts — whichever shows up first wins. This scan has no
-    // arbitrary upper bound: the caller decides how much data to supply,
-    // and the streaming auto-detect path keeps peeking lines until a
-    // marker is seen or the file ends.
-    for record in data {
-        let Some(obj) = record.as_object() else {
-            continue;
-        };
-
-        // Claude Code sessions key off the `parentUuid` field, which Claude
-        // writes on every assistant / user record but nothing else in this
-        // codebase relies on.
-        if obj.contains_key("parentUuid") {
-            return Some(ExtensionType::ClaudeCode);
-        }
-
-        // Codex rollout logs use a `type` field with one of a small set of
-        // enum-like values. Matching any of these is a definitive signal —
-        // none of them overlap with the other supported session shapes.
-        if let Some(t) = obj.get("type").and_then(|v| v.as_str())
-            && matches!(
-                t,
-                "session_meta" | "turn_context" | "event_msg" | "response_item"
-            )
+            .and_then(Value::as_str)
+            .is_some_and(|record_type| {
+                matches!(
+                    record_type,
+                    "session_meta" | "turn_context" | "event_msg" | "response_item"
+                )
+            })
         {
-            return Some(ExtensionType::Codex);
+            self.classified = Some(ExtensionType::Codex);
         }
-    }
 
-    None
+        self.classified
+    }
 }
 
 #[cfg(test)]

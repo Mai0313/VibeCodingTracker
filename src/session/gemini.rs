@@ -210,7 +210,6 @@ fn upsert_message(
         Err(_) => {
             let mut message_diagnostics = ParseDiagnostics::default();
             message_diagnostics.record_relevant(false);
-            log::warn!("skipping Gemini message with unsupported schema");
             GeminiMessageAnalysis {
                 state: SessionParseState::with_mode(mode),
                 tokens: None,

@@ -106,6 +106,22 @@
       },
       "type": "object"
     },
+    "performance": {
+      "default": {
+        "scan_threads": 0
+      },
+      "description": "`[performance]` - controls for CPU-bound local scans.",
+      "properties": {
+        "scan_threads": {
+          "default": 0,
+          "description": "Rayon workers used by CLI session scans. `0` selects the measured auto\ndefault; a positive value is capped at the machine's available parallelism.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "providers": {
       "default": {
         "claude": true,

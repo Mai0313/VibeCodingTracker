@@ -79,13 +79,14 @@ Unsure where to begin contributing? You can start by looking through `good first
 ├── examples/         # Sample session files and golden analysis outputs, plus the Grok session fixture
 ├── src/
 │   ├── analysis/     # Collect canonical AnalysisDataset records and project per-model summaries
-│   ├── cache/        # LRU file-parse cache (Arc<CodeAnalysis>, mtime-keyed; capacity 5)
+│   ├── cache/        # Library-facing LRU file-parse compatibility API
 │   ├── cli.rs        # clap definitions (commands, flags, TimeRange enum)
 │   ├── constants.rs  # Capacity / buffer-size tuning constants + FastHashMap alias
 │   ├── display/      # TUI dashboards, static tables, plain-text renderers (usage rows sorted by cost ascending)
 │   ├── models/       # Typed structs (CodeAnalysis, Provider, ExtensionType, per-provider log shapes)
 │   ├── pricing/      # LiteLLM fetch, daily on-disk cache, fuzzy model matching, cost calculation
-│   ├── session/      # Per-provider parsers (claude / codex / copilot / gemini / grok) + detector + ParseMode
+│   ├── session/      # Per-provider parsers, SQLite readers, detector, and ParseMode
+│   ├── summary_cache.rs # Compact process-local cache for incremental CLI summary scans
 │   ├── update/       # Self-update via GitHub releases (archive extraction)
 │   ├── usage/        # Roll up parsed CodeAnalysis records into per-model token totals + per-provider days
 │   └── utils/        # Path resolution, directory walking, allocator tuning, time helpers
@@ -168,11 +169,15 @@ cargo test test_exact_match -- --nocapture
 cargo test -- --test-threads=1
 ```
 
-Before opening a PR, please ensure `cargo test --all` passes locally.
+Before opening a PR, please ensure the full locked, offline test suite passes locally:
+
+```bash
+VCT_OFFLINE=1 cargo test --all-targets --all-features --locked
+```
 
 #### Benchmarks
 
-Performance-sensitive code paths (pricing lookup, session parsing, aggregation) have Criterion benchmarks in `benches/benchmarks.rs`:
+Performance-sensitive code paths (pricing lookup, provider parsing, cold and incremental scans, long-preamble detection, aggregation, and TUI rendering) have Criterion benchmarks in `benches/benchmarks.rs`:
 
 ```bash
 cargo bench
@@ -193,7 +198,7 @@ cargo fmt --all
 cargo fmt --all -- --check
 
 # Run linting checks (warnings are errors in CI)
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets --all-features --locked -- -D warnings
 ```
 
 #### Pre-commit Hooks
@@ -205,7 +210,7 @@ The repository ships a `.pre-commit-config.yaml` covering whitespace/EOL fixes, 
 uvx pre-commit install --install-hooks
 
 # Run against all files (what CI does)
-uvx pre-commit run --all-files
+uvx pre-commit run -a
 ```
 
 Prefer a persistent install? `pipx install pre-commit` (or `uv tool install pre-commit`) works too — after that you can drop the `uvx` prefix.
@@ -237,12 +242,13 @@ Aggregate sessions whose modified date falls within the current ISO week.
 
 1. Fork the repository and create a topic branch (`feat/...`, `fix/...`, `docs/...`).
 2. Make focused commits following the convention above.
-3. Ensure `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all` pass.
+3. Run `make fmt`, `uvx pre-commit run -a`, `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features --locked -- -D warnings`, `VCT_OFFLINE=1 cargo test --all-targets --all-features --locked`, `cargo +1.95.0 check --all-targets --all-features --locked`, and `cargo build --profile dist --locked`.
 4. Update the relevant README files (`README.md`, `README.zh-CN.md`, `README.zh-TW.md`) when behavior or flags change — all three languages should stay in sync.
-5. Open the PR against `main`. The title must satisfy the semantic-pull-request check.
+5. Open a draft PR against `main` with an English title and body. Keep it in draft until every GitHub Actions check passes; the title must satisfy the semantic-pull-request check.
 
 #### Release & Packaging
 
+- **Distribution binaries**: `.github/workflows/build_release.yml` uses `cargo build --profile dist --locked --target <target>` and packages `target/<target>/dist/vibe_coding_tracker`.
 - **Crates.io**: `cargo package --locked --allow-dirty` locally; publishing is automated via `.github/workflows/build_release.yml`.
 - **npm / PyPI**: wrapper packages live under `cli/nodejs` and `cli/python`. They download the matching GitHub release binary at install time.
 - **Docker**: `docker build -f docker/Dockerfile --target prod -t vibe_coding_tracker:latest .` produces an `ubuntu:26.04`-based image that runs the release binary as `ENTRYPOINT`.

@@ -1,4 +1,8 @@
-use crate::models::CodeAnalysis;
+use crate::VERSION;
+use crate::constants::FastHashMap;
+use crate::models::{CodeAnalysis, ExtensionType};
+use crate::session::state::{ParseMode, SessionParseState};
+use serde_json::{Value, json};
 
 /// Parser-only counters used to distinguish valid empty sessions from schema drift.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -77,6 +81,119 @@ pub(crate) struct DatabaseAnalysisRow {
     pub source_id: String,
     pub date: String,
     pub analysis: CodeAnalysis,
+}
+
+/// Typed token buckets produced by database-backed usage readers.
+///
+/// SQLite rows stay in this scalar form through the incremental cache. The
+/// compatibility wrappers materialize the historical JSON object only at the
+/// public API boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct UsageTokenContribution {
+    pub(crate) input_tokens: i64,
+    pub(crate) output_tokens: i64,
+    pub(crate) reasoning_tokens: i64,
+    pub(crate) cache_read_tokens: i64,
+    pub(crate) cache_creation_tokens: i64,
+}
+
+impl UsageTokenContribution {
+    pub(crate) fn into_value(self) -> Value {
+        json!({
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "cache_read_input_tokens": self.cache_read_tokens,
+            "cache_creation_input_tokens": self.cache_creation_tokens,
+            "reasoning_output_tokens": self.reasoning_tokens,
+        })
+    }
+
+    pub(crate) fn has_activity(self) -> bool {
+        self.input_tokens != 0
+            || self.output_tokens != 0
+            || self.reasoning_tokens != 0
+            || self.cache_read_tokens != 0
+            || self.cache_creation_tokens != 0
+    }
+
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.reasoning_tokens += other.reasoning_tokens;
+        self.cache_read_tokens += other.cache_read_tokens;
+        self.cache_creation_tokens += other.cache_creation_tokens;
+    }
+}
+
+/// Compact token contribution produced by a database-backed usage reader.
+#[derive(Debug)]
+pub(crate) struct UsageContribution {
+    pub(crate) date: String,
+    pub(crate) timestamp_ms: i64,
+    pub(crate) model: String,
+    pub(crate) tokens: UsageTokenContribution,
+    pub(crate) stored_cost: f64,
+}
+
+/// Database usage rows plus schema-normalization diagnostics.
+#[derive(Debug)]
+pub(crate) struct DatabaseUsageRead {
+    pub(crate) rows: Vec<UsageContribution>,
+    pub(crate) expected_records: usize,
+    pub(crate) parsed_records: usize,
+}
+
+impl DatabaseUsageRead {
+    pub(crate) fn complete(rows: Vec<UsageContribution>) -> Self {
+        let parsed_records = rows.len();
+        Self {
+            rows,
+            expected_records: parsed_records,
+            parsed_records,
+        }
+    }
+
+    pub(crate) fn failed_records(&self) -> usize {
+        self.expected_records.saturating_sub(self.parsed_records)
+    }
+}
+
+impl UsageContribution {
+    pub(crate) fn single_model(
+        date: String,
+        timestamp_ms: i64,
+        model: String,
+        tokens: UsageTokenContribution,
+        stored_cost: f64,
+    ) -> Self {
+        Self {
+            date,
+            timestamp_ms,
+            model,
+            tokens,
+            stored_cost,
+        }
+    }
+
+    pub(crate) fn into_public_row(
+        self,
+        provider: ExtensionType,
+        user: &str,
+        machine: &str,
+    ) -> (String, CodeAnalysis, f64) {
+        let mut state = SessionParseState::with_mode(ParseMode::UsageOnly);
+        state.last_ts = self.timestamp_ms;
+        let mut usage = FastHashMap::default();
+        usage.insert(self.model, self.tokens.into_value());
+        let analysis = CodeAnalysis {
+            user: user.to_string(),
+            extension_name: provider.to_string(),
+            insights_version: VERSION.to_string(),
+            machine_id: machine.to_string(),
+            records: vec![state.into_record(usage)],
+        };
+        (self.date, analysis, self.stored_cost)
+    }
 }
 
 impl ParsedAnalysis {

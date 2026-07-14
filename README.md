@@ -35,13 +35,13 @@ Stop wondering how much your AI coding sessions cost. Get **real-time cost track
 
 ### Ultra-Lightweight
 
-Built with Rust for minimal resource footprint. The interactive TUI dashboard typically sits at **under ~50 MB of resident memory** once the first refresh is done, even with hundreds of long-context sessions on disk — no Electron, no bloated runtimes. The usage path parses each session file in a lean usage-only mode and bypasses the cache, and we tune glibc's arena count at startup to keep long-running RSS honest.
+Built with Rust for minimal resource footprint. The interactive TUI dashboard typically sits at **under ~50 MB of resident memory** once the first refresh is done, even with hundreds of long-context sessions on disk — no Electron, no bloated runtimes. A compact process-local summary cache reparses only new or changed sources after the first scan, while dedicated scan workers and glibc allocator tuning keep long-running CPU and RSS honest.
 
 ### Beautiful Visualizations
 
 Choose your preferred view:
 
-- **Interactive Dashboard**: Auto-refreshing terminal UI with live updates, scrollable model list (arrow keys), a live per-process CPU/memory readout, and compact K/M/B number formatting
+- **Interactive Dashboard**: Responsive terminal UI with an immediate loading spinner, background incremental refreshes, a scrollable model list (arrow keys), a live per-process CPU/memory readout, and compact K/M/B number formatting
 - **Static Reports**: Professional tables for documentation
 - **Script-Friendly**: Plain text and JSON for automation
 - **Full Precision**: Export exact costs for accounting
@@ -62,15 +62,15 @@ Automatically detects and processes logs from Claude Code, Codex, Copilot, Gemin
 
 ## Key Features
 
-| Feature               | Description                                                             |
-| --------------------- | ----------------------------------------------------------------------- |
-| **Multi-Provider**    | Claude Code, Codex, Copilot, Gemini, OpenCode, Cursor, Hermes, and Grok |
-| **Smart Pricing**     | Fuzzy model matching + daily cache from LiteLLM                         |
-| **4 Display Modes**   | Interactive TUI, static table, plain text, and JSON                     |
-| **Dual Analysis**     | Token/cost stats (`usage`) + code operation stats (`analysis`)          |
-| **Live Quota Panels** | Live remaining quota for Claude, Codex, Copilot, and Cursor             |
-| **Ultra-Lightweight** | Under ~50 MB RSS in the TUI, streaming session parse — built with Rust  |
-| **Live Updates**      | Auto-refreshing dashboard (every 10s) with change highlighting          |
+| Feature               | Description                                                              |
+| --------------------- | ------------------------------------------------------------------------ |
+| **Multi-Provider**    | Claude Code, Codex, Copilot, Gemini, OpenCode, Cursor, Hermes, and Grok  |
+| **Smart Pricing**     | Fuzzy model matching + daily cache from LiteLLM                          |
+| **4 Display Modes**   | Interactive TUI, static table, plain text, and JSON                      |
+| **Dual Analysis**     | Token/cost stats (`usage`) + code operation stats (`analysis`)           |
+| **Live Quota Panels** | Live remaining quota for Claude, Codex, Copilot, and Cursor              |
+| **Ultra-Lightweight** | Under ~50 MB RSS in the TUI, compact incremental scans — built with Rust |
+| **Live Updates**      | Responsive loading and background refreshes with change highlighting     |
 
 ---
 
@@ -235,6 +235,8 @@ vct usage --table --merge-providers
   ↑/↓ scroll  m merge  r refresh  q quit  |  Star on GitHub
 ```
 
+Both interactive dashboards draw a centered `Loading sessions...` spinner as soon as terminal setup finishes. Loading stays responsive to `q`, Ctrl+C, and resize events. Later scans run in one background worker, keep the last successful data visible with a `Refreshing...` footer, and coalesce repeated refresh requests into at most one pending scan. A failed refresh keeps the last-known-good view and retries on the next scheduled or manual refresh.
+
 ### Preview: Table & JSON (`vct usage`)
 
 `--table` prints the same numbers as a static report with a per-provider summary; `--json` emits one enriched row per model (each with `cost_usd`) for scripting.
@@ -294,6 +296,8 @@ The tool automatically scans these directories:
 - `$GROK_HOME/sessions/*/*/signals.json` (Grok CLI — defaults to `~/.grok`; sibling `updates.jsonl` supplies `analysis` data)
 
 Grok `usage` is one point-in-time local context estimate: vct records `signals.json`'s `contextTokensUsed` as cache-read tokens and estimates cost at the model's cache-read price. It is not cumulative billed usage. `analysis` reconstructs completed Read / Write / Edit / Bash / TodoWrite operations from the sibling `updates.jsonl`. Grok does not support quota panels or `vct fetch`.
+
+For noninteractive `usage` and `analysis` scans, vct exits with an error when every discovered source fails. If only some sources fail, it keeps the successful results and prints one diagnostic summary to stderr. The TUI stays best-effort and preserves its last successful payload instead.
 
 ### Live Quota Panels
 
@@ -567,6 +571,11 @@ refresh_interval = 60
 # Seconds between automatic redraws of the analysis TUI (minimum 1).
 refresh_interval = 10
 
+[performance]
+# Rayon workers used by CLI session scans. 0 selects the measured auto default;
+# a positive value is capped at the machine's available parallelism.
+scan_threads = 0
+
 [providers]
 # Include each provider's sessions in usage / analysis. Set a provider to false
 # to skip it entirely (no directory scan, no API).
@@ -595,6 +604,7 @@ retention_days = 7
 | `usage.quota.panels`           | Which quota panels to show (`claude` / `codex` / `copilot` / `cursor`); drop a name to hide it, `[]` to hide the whole band. |
 | `usage.quota.refresh_interval` | Poll cadence for every live quota panel (seconds); higher is safer against a provider's rate limits.                         |
 | `analysis.refresh_interval`    | Redraw cadence of the `analysis` dashboard (seconds).                                                                        |
+| `performance.scan_threads`     | CLI scan workers. `0` uses `RAYON_NUM_THREADS` when positive, otherwise at most two workers; every value is CPU-capped.      |
 | `providers.*`                  | Skip a provider entirely (no scan, no API) when `false` — handy if you don't use one.                                        |
 | `logging.level`                | Minimum severity written to the log file (`off`..`trace`); never printed to the terminal.                                    |
 | `logging.retention_days`       | Days of daily log files to keep; older `vct-*.log` are pruned on startup (`0` keeps all).                                    |
@@ -630,10 +640,10 @@ vct config migrate
 
 ### How It Works
 
-1. **Automatic Updates**: Fetches pricing from [LiteLLM](https://github.com/BerriAI/litellm) daily
-2. **Smart Caching**: Stores pricing in `~/.vct/` for 24 hours
-3. **Fuzzy Matching**: Finds best match even for custom model names
-4. **Always Accurate**: Ensures you get the latest pricing
+1. **Automatic Updates**: Fetches pricing from [LiteLLM](https://github.com/BerriAI/litellm) once per UTC day
+2. **Validated Caching**: Accepts only a successful JSON model map containing real prices, then writes it atomically to `~/.vct/`
+3. **Deterministic Matching**: Finds the most specific model match even for versioned or provider-prefixed names
+4. **Failure Safety**: A failed fetch cannot replace a good cache; vct keeps the previous map and backs off for five minutes before another attempt
 
 ### Model Matching
 
@@ -651,7 +661,7 @@ vct config migrate
 - **OpenCode**: a novel model name is priced from its tokens only on an **exact** LiteLLM match; with no exact match, vct trusts the assistant message's own stored cost instead of guessing from a loosely-similar name.
 - **Hermes**: priced the same way as OpenCode — an **exact** LiteLLM match prices from tokens, otherwise vct uses Hermes's own stored cost.
 - **Grok**: `contextTokensUsed` is priced as cache-read tokens only; this is a point-in-time local context estimate, not cumulative billed usage.
-- **Cache is raw**: the daily cache stores the filtered upstream LiteLLM JSON (not a derived shape), so tiered / batch pricing stays available without re-fetching, and a small in-process LRU keeps repeated lookups cheap during a TUI refresh.
+- **Cache is raw**: the daily cache stores the filtered upstream LiteLLM JSON (not a derived shape), so tiered / batch pricing stays available without re-fetching, and each pricing map owns a small in-process LRU so repeated lookups stay cheap without cross-map contamination.
 
 ---
 

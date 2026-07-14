@@ -16,12 +16,12 @@ on:
     paths-ignore:
       - "**/*.md"
 
-permissions: write-all
+permissions:
+  contents: read
 
 jobs:
   run_tests:
     runs-on: ${{ matrix.os }}
-    if: ${{ !(startsWith(github.head_ref, 'chore/') || startsWith(github.head_ref, 'ci/') || startsWith(github.head_ref, 'docs/')) }}
     strategy:
       fail-fast: false
       matrix:
@@ -59,3 +59,44 @@ jobs:
           path: lcov.info
           if-no-files-found: ignore
           retention-days: 7
+
+  msrv:
+    name: MSRV 1.95
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Rust 1.95
+        uses: actions-rust-lang/setup-rust-toolchain@v1.17.0
+        with:
+          toolchain: 1.95.0
+          cache: false
+
+      - name: Check all targets and features
+        run: |
+          cargo check --all-targets --all-features --locked
+
+  platform-checks:
+    name: ${{ matrix.os }} all targets and features
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+          - windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Rust Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1.17.0
+        with:
+          cache: false
+
+      - name: Check all targets and features
+        run: |
+          cargo check --all-targets --all-features --locked

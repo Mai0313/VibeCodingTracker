@@ -48,9 +48,50 @@ pub struct Config {
     #[serde(default)]
     pub analysis: AnalysisConfig,
     #[serde(default)]
+    pub performance: PerformanceConfig,
+    #[serde(default)]
     pub providers: ProvidersConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+}
+
+/// `[performance]` - controls for CPU-bound local scans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+pub struct PerformanceConfig {
+    /// Rayon workers used by CLI session scans. `0` selects the measured auto
+    /// default; a positive value is capped at the machine's available parallelism.
+    #[serde(default)]
+    pub scan_threads: usize,
+}
+
+impl PerformanceConfig {
+    /// Resolves the CLI scan worker count.
+    ///
+    /// A positive config value wins, followed by a positive
+    /// `RAYON_NUM_THREADS`; otherwise auto mode uses at most two workers. Every
+    /// result is capped at the available parallelism and is at least one.
+    pub fn resolved_scan_threads(&self) -> usize {
+        let available = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1);
+        self.resolved_scan_threads_with(
+            available,
+            std::env::var("RAYON_NUM_THREADS").ok().as_deref(),
+        )
+    }
+
+    fn resolved_scan_threads_with(&self, available: usize, rayon_env: Option<&str>) -> usize {
+        let available = available.max(1);
+        let requested = if self.scan_threads > 0 {
+            self.scan_threads
+        } else {
+            rayon_env
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or_else(|| available.min(2))
+        };
+        requested.clamp(1, available)
+    }
 }
 
 /// `[general]` — settings shared across subcommands.
@@ -793,6 +834,7 @@ mod tests {
         assert_eq!(cfg.usage.refresh_interval, 10);
         assert_eq!(cfg.usage.quota.refresh_interval, 60);
         assert_eq!(cfg.analysis.refresh_interval, 10);
+        assert_eq!(cfg.performance.scan_threads, 0);
         assert_eq!(cfg.providers, ProvidersConfig::default());
         assert!(cfg.providers.cursor);
         assert!(cfg.providers.grok);
@@ -813,6 +855,21 @@ mod tests {
         // A file with no [logging] section backfills the whole section default,
         // which is what keeps the additive section migration-free.
         assert_eq!(cfg.logging, LoggingConfig::default());
+        assert_eq!(cfg.performance, PerformanceConfig::default());
+    }
+
+    #[test]
+    fn scan_threads_resolve_config_then_env_then_auto() {
+        let auto = PerformanceConfig { scan_threads: 0 };
+        assert_eq!(auto.resolved_scan_threads_with(16, None), 2);
+        assert_eq!(auto.resolved_scan_threads_with(1, None), 1);
+        assert_eq!(auto.resolved_scan_threads_with(16, Some("7")), 7);
+        assert_eq!(auto.resolved_scan_threads_with(4, Some("99")), 4);
+        assert_eq!(auto.resolved_scan_threads_with(16, Some("0")), 2);
+        assert_eq!(auto.resolved_scan_threads_with(16, Some("invalid")), 2);
+
+        let configured = PerformanceConfig { scan_threads: 12 };
+        assert_eq!(configured.resolved_scan_threads_with(8, Some("3")), 8);
     }
 
     #[test]

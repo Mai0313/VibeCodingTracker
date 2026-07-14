@@ -7,13 +7,16 @@
 
 mod common;
 
-use common::{TempHome, fixture, fixture_str};
+use common::{TempHome, append_cursor_json_blob, fixture, fixture_str};
 use rusqlite::{Connection, params};
 use serde_json::json;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use tempfile::TempDir;
 use vibe_coding_tracker::analysis::aggregator::{
-    aggregate_sessions_by_model_from_paths, aggregate_sessions_by_model_from_paths_with,
+    AnalysisData, aggregate_sessions_by_model_from_paths,
+    aggregate_sessions_by_model_from_paths_with, aggregate_sessions_by_model_from_paths_with_cache,
     aggregate_sessions_by_model_from_paths_with_diagnostics,
     collect_analysis_sessions_from_paths_with, project_code_analysis,
 };
@@ -25,6 +28,7 @@ use vibe_coding_tracker::session::parser::{
     parse_session_file_typed_with_mode_and_diagnostics,
 };
 use vibe_coding_tracker::session::state::ParseMode;
+use vibe_coding_tracker::summary_cache::SummaryScanCache;
 
 fn providers_only(provider: ExtensionType) -> ProvidersConfig {
     ProvidersConfig {
@@ -90,6 +94,65 @@ fn seed_opencode_tie_breaker_db(path: &Path) {
         .unwrap();
     }
     tx.commit().unwrap();
+}
+
+fn assert_analysis_data_eq(actual: &AnalysisData, expected: &AnalysisData) {
+    assert_eq!(
+        serde_json::to_value(&actual.rows).unwrap(),
+        serde_json::to_value(&expected.rows).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&actual.per_provider.claude).unwrap(),
+        serde_json::to_value(&expected.per_provider.claude).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&actual.per_provider.codex).unwrap(),
+        serde_json::to_value(&expected.per_provider.codex).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&actual.per_provider.copilot).unwrap(),
+        serde_json::to_value(&expected.per_provider.copilot).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&actual.per_provider.gemini).unwrap(),
+        serde_json::to_value(&expected.per_provider.gemini).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&actual.per_provider.grok).unwrap(),
+        serde_json::to_value(&expected.per_provider.grok).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&actual.per_provider.opencode).unwrap(),
+        serde_json::to_value(&expected.per_provider.opencode).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&actual.per_provider.cursor).unwrap(),
+        serde_json::to_value(&expected.per_provider.cursor).unwrap()
+    );
+    assert_eq!(
+        (
+            actual.provider_days.claude,
+            actual.provider_days.codex,
+            actual.provider_days.copilot,
+            actual.provider_days.gemini,
+            actual.provider_days.grok,
+            actual.provider_days.opencode,
+            actual.provider_days.cursor,
+            actual.provider_days.hermes,
+            actual.provider_days.total,
+        ),
+        (
+            expected.provider_days.claude,
+            expected.provider_days.codex,
+            expected.provider_days.copilot,
+            expected.provider_days.gemini,
+            expected.provider_days.grok,
+            expected.provider_days.opencode,
+            expected.provider_days.cursor,
+            expected.provider_days.hermes,
+            expected.provider_days.total,
+        )
+    );
 }
 
 #[test]
@@ -358,6 +421,296 @@ fn batch_analysis_from_paths_groups_by_model() {
         .max(data.provider_days.gemini);
     assert!(data.provider_days.total >= max_provider_days);
     assert!(data.provider_days.claude >= 1 && data.provider_days.gemini >= 1);
+}
+
+#[test]
+fn cached_analysis_matches_uncached_and_reuses_unchanged_sources() {
+    let home = TempHome::new();
+    home.put_claude_session(
+        "proj",
+        "session.jsonl",
+        &fixture_str("test_conversation_claude_code.jsonl"),
+    );
+    home.put_codex_session(
+        "2026/06/06/rollout.jsonl",
+        &fixture_str("test_conversation_codex.jsonl"),
+    );
+    home.put(
+        ".copilot/session-state/copilot-session/events.jsonl",
+        &fixture_str("test_conversation_copilot.jsonl"),
+    );
+    home.put_gemini_session(
+        "proj-hash",
+        "chat.jsonl",
+        &fixture_str("test_conversation_gemini.jsonl"),
+    );
+    home.put_grok_fixture_session("workspace", "grok-session");
+    seed_opencode_tie_breaker_db(&home.paths.opencode_db);
+    home.put_cursor_session(
+        "cursor-project",
+        "cursor-conversation",
+        "cursor-model",
+        1_780_757_089_000,
+        1_234,
+    );
+    let providers = ProvidersConfig::default();
+    let uncached = aggregate_sessions_by_model_from_paths_with_diagnostics(
+        &home.paths,
+        TimeRange::All,
+        providers,
+    )
+    .unwrap();
+
+    let mut cache = SummaryScanCache::new();
+    let cold = aggregate_sessions_by_model_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        providers,
+        &mut cache,
+    )
+    .unwrap();
+    assert_eq!(cache.stats().parsed_sources, 7);
+    assert_eq!(cold.diagnostics.candidates, 7);
+    assert_eq!(cold.diagnostics.parsed, 7);
+    assert!(cold.diagnostics.failures.is_empty());
+    assert_eq!(cold.diagnostics, uncached.diagnostics);
+    assert_analysis_data_eq(&cold.data, &uncached.data);
+    for (provider, rows) in [
+        ("Claude", &cold.data.per_provider.claude),
+        ("Codex", &cold.data.per_provider.codex),
+        ("Copilot", &cold.data.per_provider.copilot),
+        ("Gemini", &cold.data.per_provider.gemini),
+        ("Grok", &cold.data.per_provider.grok),
+        ("OpenCode", &cold.data.per_provider.opencode),
+        ("Cursor", &cold.data.per_provider.cursor),
+    ] {
+        assert!(!rows.is_empty(), "{provider} fixture must contribute a row");
+    }
+    for rows in [
+        &cold.data.rows,
+        &cold.data.per_provider.claude,
+        &cold.data.per_provider.codex,
+        &cold.data.per_provider.copilot,
+        &cold.data.per_provider.gemini,
+        &cold.data.per_provider.grok,
+        &cold.data.per_provider.opencode,
+        &cold.data.per_provider.cursor,
+    ] {
+        assert!(
+            rows.windows(2).all(|pair| pair[0].model <= pair[1].model),
+            "cached rows must retain deterministic model ordering"
+        );
+    }
+
+    let warm = aggregate_sessions_by_model_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        providers,
+        &mut cache,
+    )
+    .unwrap();
+    assert_eq!(cache.stats().parsed_sources, 0);
+    assert_eq!(warm.diagnostics, cold.diagnostics);
+    assert_analysis_data_eq(&warm.data, &uncached.data);
+}
+
+#[cfg(unix)]
+#[test]
+fn analysis_cache_preserves_entries_after_partial_directory_discovery() {
+    let home = TempHome::new();
+    home.put_claude_session(
+        "visible",
+        "session.jsonl",
+        &fixture_str("test_conversation_claude_code.jsonl"),
+    );
+    let hidden_source = home.put_claude_session(
+        "hidden",
+        "session.jsonl",
+        &fixture_str("test_conversation_claude_code.jsonl"),
+    );
+    let hidden_dir = hidden_source.parent().unwrap();
+    let original_permissions = std::fs::metadata(hidden_dir).unwrap().permissions();
+    let providers = providers_only(ExtensionType::ClaudeCode);
+    let mut cache = SummaryScanCache::new();
+
+    let cold = aggregate_sessions_by_model_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        providers,
+        &mut cache,
+    )
+    .unwrap();
+    assert_eq!(cache.stats().entries, 2);
+    assert_eq!(cache.stats().parsed_sources, 2);
+
+    std::fs::set_permissions(hidden_dir, std::fs::Permissions::from_mode(0o0)).unwrap();
+    let partial = aggregate_sessions_by_model_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        providers,
+        &mut cache,
+    );
+    std::fs::set_permissions(hidden_dir, original_permissions).unwrap();
+    let partial = partial.unwrap();
+
+    assert_eq!(partial.diagnostics.candidates, 2);
+    assert_eq!(partial.diagnostics.parsed, 1);
+    assert_eq!(partial.diagnostics.failures.len(), 1);
+    assert!(
+        partial.diagnostics.failures[0]
+            .source
+            .starts_with(hidden_dir)
+    );
+    assert_eq!(cache.stats().parsed_sources, 0);
+    assert_eq!(cache.stats().entries, 2);
+
+    let restored = aggregate_sessions_by_model_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        providers,
+        &mut cache,
+    )
+    .unwrap();
+    assert_eq!(cache.stats().parsed_sources, 0);
+    assert_eq!(cache.stats().entries, 2);
+    assert!(restored.diagnostics.failures.is_empty());
+    assert_analysis_data_eq(&restored.data, &cold.data);
+}
+
+#[test]
+fn deterministic_analysis_sqlite_schema_failure_is_cached() {
+    let home = TempHome::new();
+    std::fs::create_dir_all(home.paths.opencode_db.parent().unwrap()).unwrap();
+    Connection::open(&home.paths.opencode_db)
+        .unwrap()
+        .execute_batch("CREATE TABLE session (id TEXT PRIMARY KEY);")
+        .unwrap();
+    let providers = providers_only(ExtensionType::OpenCode);
+    let mut cache = SummaryScanCache::new();
+
+    let cold = aggregate_sessions_by_model_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        providers,
+        &mut cache,
+    )
+    .unwrap();
+    assert!(cold.diagnostics.all_failed());
+    assert_eq!(cache.stats().parsed_sources, 1);
+
+    let warm = aggregate_sessions_by_model_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        providers,
+        &mut cache,
+    )
+    .unwrap();
+    assert!(warm.diagnostics.all_failed());
+    assert_eq!(warm.diagnostics, cold.diagnostics);
+    assert_eq!(cache.stats().parsed_sources, 0);
+}
+
+#[test]
+fn cursor_tracking_failure_is_not_an_analysis_candidate() {
+    let home = TempHome::new();
+    std::fs::create_dir_all(&home.paths.cursor_chats_dir).unwrap();
+    std::fs::create_dir_all(home.paths.cursor_tracking_db.parent().unwrap()).unwrap();
+    std::fs::write(&home.paths.cursor_tracking_db, "not SQLite").unwrap();
+
+    let result = aggregate_sessions_by_model_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::Cursor),
+        &mut SummaryScanCache::new(),
+    )
+    .unwrap();
+    assert_eq!(result.diagnostics.candidates, 0);
+    assert_eq!(result.diagnostics.parsed, 0);
+    assert_eq!(result.diagnostics.failures.len(), 1);
+    assert!(!result.diagnostics.all_failed());
+}
+
+#[test]
+fn cursor_analysis_cache_invalidates_only_changed_stores() {
+    let home = TempHome::new();
+    let first = home.put_cursor_session("project", "first", "cursor-first", 1_780_757_089_000, 100);
+    let second =
+        home.put_cursor_session("project", "second", "cursor-second", 1_780_757_090_000, 200);
+    let mut cache = SummaryScanCache::new();
+
+    let cold = aggregate_sessions_by_model_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::Cursor),
+        &mut cache,
+    )
+    .unwrap();
+    assert_eq!(cache.stats().parsed_sources, 2);
+    assert_eq!(cache.stats().entries, 2);
+    assert_eq!(cold.diagnostics.candidates, 2);
+    assert_eq!(cold.diagnostics.parsed, 2);
+
+    let warm = aggregate_sessions_by_model_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::Cursor),
+        &mut cache,
+    )
+    .unwrap();
+    assert_eq!(cache.stats().parsed_sources, 0);
+    assert_analysis_data_eq(&warm.data, &cold.data);
+
+    append_cursor_json_blob(&first, "mutation");
+    let changed = aggregate_sessions_by_model_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::Cursor),
+        &mut cache,
+    )
+    .unwrap();
+    assert_eq!(cache.stats().parsed_sources, 1);
+    assert_eq!(cache.stats().entries, 2);
+    assert_analysis_data_eq(&changed.data, &cold.data);
+
+    home.put_cursor_session("project", "third", "cursor-third", 1_780_757_091_000, 300);
+    let added = aggregate_sessions_by_model_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::Cursor),
+        &mut cache,
+    )
+    .unwrap();
+    assert_eq!(cache.stats().parsed_sources, 1);
+    assert_eq!(cache.stats().entries, 3);
+    assert!(
+        added
+            .data
+            .per_provider
+            .cursor
+            .iter()
+            .any(|row| row.model == "cursor-third")
+    );
+
+    std::fs::remove_file(second).unwrap();
+    let deleted = aggregate_sessions_by_model_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::Cursor),
+        &mut cache,
+    )
+    .unwrap();
+    assert_eq!(cache.stats().parsed_sources, 0);
+    assert_eq!(cache.stats().entries, 2);
+    assert_eq!(deleted.diagnostics.candidates, 2);
+    assert_eq!(deleted.diagnostics.parsed, 2);
+    assert!(
+        !deleted
+            .data
+            .per_provider
+            .cursor
+            .iter()
+            .any(|row| row.model == "cursor-second")
+    );
 }
 
 #[test]
@@ -1247,5 +1600,29 @@ fn test_autodetect_sees_past_sentinel_prelude() {
         usage_input_tokens_for_model(&analysis, "claude-opus-4-7"),
         100,
         "auto-detect should extract the assistant record's usage, not drop the whole file"
+    );
+}
+
+#[test]
+fn test_autodetect_handles_ten_thousand_record_preamble() {
+    let tmp = TempDir::new().unwrap();
+    let file = tmp.path().join("session.jsonl");
+    let sentinel = r#"{"type":"file-history-snapshot","messageId":"m1","isSnapshotUpdate":false,"snapshot":{}}"#;
+    let assistant = r#"{"type":"assistant","sessionId":"sess-1","parentUuid":"pu","timestamp":"2026-04-23T00:00:00.000Z","message":{"model":"claude-opus-4-7","usage":{"input_tokens":100,"output_tokens":50},"content":[]}}"#;
+    let mut body = String::with_capacity((sentinel.len() + 1) * 10_000 + assistant.len() + 1);
+    for _ in 0..10_000 {
+        body.push_str(sentinel);
+        body.push('\n');
+    }
+    body.push_str(assistant);
+    body.push('\n');
+    std::fs::write(&file, body).unwrap();
+
+    let analysis = parse_session_file(&file).expect("auto-detect should remain linear");
+
+    assert_eq!(analysis["extensionName"], "Claude-Code");
+    assert_eq!(
+        usage_input_tokens_for_model(&analysis, "claude-opus-4-7"),
+        100
     );
 }

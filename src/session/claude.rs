@@ -32,16 +32,9 @@ use serde_json::Value;
 ///
 /// [`parse_session_file_typed`]: crate::session::parser::parse_session_file_typed
 pub fn parse_claude_log_values(records: Vec<Value>, mode: ParseMode) -> Result<CodeAnalysis> {
-    let iter =
-        records
-            .into_iter()
-            .filter_map(|v| match serde_json::from_value::<ClaudeCodeLog>(v) {
-                Ok(log) => Some(log),
-                Err(_) => {
-                    log::warn!("skipping Claude record with unsupported schema");
-                    None
-                }
-            });
+    let iter = records
+        .into_iter()
+        .filter_map(|value| serde_json::from_value::<ClaudeCodeLog>(value).ok());
     parse_claude_logs(iter, mode)
 }
 

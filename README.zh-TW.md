@@ -35,13 +35,13 @@
 
 ### 超輕量
 
-以 Rust 打造，資源佔用極低。互動式 TUI 儀表板穩定後通常維持在 **~50 MB 以內的常駐記憶體**，即使硬碟上有數百個長 context session 也一樣——不用 Electron，不用臃腫的執行環境。usage 路徑用精簡模式串流 parse 每個 session 檔案並繞過 cache，啟動時也會調整 glibc 的 arena 數量，讓長時間執行的 RSS 保持誠實。
+以 Rust 打造, 資源佔用極低. 互動式 TUI 儀表板完成首次刷新後通常維持在 **~50 MB 以內的常駐記憶體**, 即使硬碟上有數百個長 context session 也一樣. 首次掃描後, 精簡的 process-local summary cache 只會重新解析新增或變更的 source, dedicated scan worker 與 glibc allocator 調整也能讓長時間執行時的 CPU 和 RSS 維持穩定.
 
 ### 精美視覺化
 
 選擇你偏好的檢視方式：
 
-- **互動式儀表板**:自動更新的終端機 UI,即時顯示最新資訊、可捲動的 model 清單(方向鍵)、process 層級的 CPU/記憶體即時讀數,以及 K/M/B 精簡數字格式
+- **互動式儀表板**: 可立即顯示 loading spinner 的響應式終端 UI, 支援背景 incremental refresh, 可捲動的 model 清單 (方向鍵), process 層級的 CPU/記憶體即時讀數, 以及 K/M/B 精簡數字格式
 - **靜態報表**:專業的表格格式,適合撰寫文件
 - **腳本友好**:純文字及 JSON 輸出,方便自動化處理
 - **完整精度**:匯出精確費用供會計使用
@@ -69,8 +69,8 @@
 | **4 種顯示模式** | 互動式 TUI、靜態表格、純文字及 JSON                                   |
 | **雙重分析**     | Token / 費用統計（`usage`）+ 程式碼操作統計（`analysis`）             |
 | **即時額度面板** | 即時顯示 Claude、Codex、Copilot 與 Cursor 的剩餘額度                  |
-| **超輕量**       | TUI 常駐記憶體 ~50 MB 以內、串流 session 解析——以 Rust 打造           |
-| **即時更新**     | 每 10 秒自動刷新的儀表板並突顯變更                                    |
+| **超輕量**       | TUI 常駐記憶體 ~50 MB 以內、精簡的 incremental scan, 以 Rust 打造     |
+| **即時更新**     | 響應式 loading 與背景 refresh, 並突顯變更                             |
 
 ---
 
@@ -80,7 +80,7 @@
 
 選擇最適合你的安裝方式：
 
-> **開發者**：如果你想從原始碼建置或參與開發，請參閱 [CONTRIBUTING.md](.github/CONTRIBUTING.md)。
+> **開發者**: 如果你想從原始碼建置或參與開發, 請參閱 [CONTRIBUTING.md](.github/CONTRIBUTING.md).
 
 #### 方法一：透過 npm 安裝
 
@@ -235,6 +235,8 @@ vct usage --table --merge-providers
   ↑/↓ scroll  m merge  r refresh  q quit  |  Star on GitHub
 ```
 
+兩個互動式儀表板都會在 terminal setup 完成後立即繪製置中的 `Loading sessions...` spinner. Loading 期間仍可處理 `q`, Ctrl+C 與 resize event. 後續掃描由單一 background worker 執行, 並在 `Refreshing...` footer 下保留上一次成功的資料. 重複的 refresh 要求最多只會合併為一個 pending scan. 如果 refresh 失敗, 儀表板會保留 last-known-good view, 並在下次排程或手動刷新時重試.
+
 ### 預覽：表格與 JSON（`vct usage`）
 
 `--table` 會以靜態報表印出相同的數字，並附上每個供應商的彙總；`--json` 則為每個 model 輸出一列富化資料（各自帶有 `cost_usd`），方便腳本處理。
@@ -294,6 +296,8 @@ Totals (by Provider)
 - `$GROK_HOME/sessions/*/*/signals.json`（Grok CLI，預設使用 `~/.grok`；同層的 `updates.jsonl` 提供 `analysis` 資料）
 
 Grok 的 `usage` 是單一當下的本地 context 估算：vct 會把 `signals.json` 的 `contextTokensUsed` 記為 cache-read token，並以該 model 的 cache-read 費率估算費用。這不是累計的 billed usage。`analysis` 會從同層的 `updates.jsonl` 還原已完成的 Read / Write / Edit / Bash / TodoWrite 操作。Grok 不支援 quota panel 或 `vct fetch`。
+
+對於非互動式 `usage` 與 `analysis` 掃描, 如果所有找到的 source 都失敗, vct 會回傳錯誤. 如果只有部分 source 失敗, vct 會保留成功的結果, 並向 stderr 印出一則診斷摘要. TUI 則保持 best-effort, 並保留上一次成功的 payload.
 
 ### 即時額度面板
 
@@ -566,6 +570,11 @@ refresh_interval = 60
 # analysis TUI 自動刷新的間隔秒數（最少 1）。
 refresh_interval = 10
 
+[performance]
+# CLI session scan 使用的 Rayon worker 數. 0 代表實測最佳的 auto 預設值;
+# 正整數會限制在機器的 available parallelism 以內.
+scan_threads = 0
+
 [providers]
 # 是否把各 provider 的 session 納入 usage / analysis。把某個 provider 設為 false
 # 就會完全略過它（不掃描目錄，也不呼叫 API）。
@@ -586,17 +595,18 @@ level = "warn"
 retention_days = 7
 ```
 
-| 設定項                         | 效果                                                                                            |
-| ------------------------------ | ----------------------------------------------------------------------------------------------- |
-| `general.default_time_range`   | 未指定 `--daily/--weekly/--monthly/--all` 時使用的時間範圍。明確指定的 flag 一律優先。          |
-| `usage.merge_models`           | 讓儀表板一開始就是合併狀態;`m` 切換會把你最後的選擇存回這裡。`--merge-providers` 會強制開啟。   |
-| `usage.refresh_interval`       | `usage` 儀表板自動刷新的間隔（秒）。                                                            |
-| `usage.quota.panels`           | 顯示哪些額度面板（`claude` / `codex` / `copilot` / `cursor`）；移除名稱即可隱藏,`[]` 隱藏整條。 |
-| `usage.quota.refresh_interval` | 每個即時額度面板的輪詢間隔（秒）；數值越大越不容易觸發 provider 的速率限制。                    |
-| `analysis.refresh_interval`    | `analysis` 儀表板自動刷新的間隔（秒）。                                                         |
-| `providers.*`                  | 設為 `false` 時完全略過某個 provider（不掃描、不呼叫 API），沒在用的話很方便。                  |
-| `logging.level`                | 寫入日誌檔的最低等級（`off`..`trace`）；絕不會印到終端機。                                      |
-| `logging.retention_days`       | 保留幾天的每日日誌檔；更舊的 `vct-*.log` 會在啟動時清除（`0` 表示全部保留）。                   |
+| 設定項                         | 效果                                                                                                          |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------- |
+| `general.default_time_range`   | 未指定 `--daily/--weekly/--monthly/--all` 時使用的時間範圍。明確指定的 flag 一律優先。                        |
+| `usage.merge_models`           | 讓儀表板一開始就是合併狀態;`m` 切換會把你最後的選擇存回這裡。`--merge-providers` 會強制開啟。                 |
+| `usage.refresh_interval`       | `usage` 儀表板自動刷新的間隔（秒）。                                                                          |
+| `usage.quota.panels`           | 顯示哪些額度面板（`claude` / `codex` / `copilot` / `cursor`）；移除名稱即可隱藏,`[]` 隱藏整條。               |
+| `usage.quota.refresh_interval` | 每個即時額度面板的輪詢間隔（秒）；數值越大越不容易觸發 provider 的速率限制。                                  |
+| `analysis.refresh_interval`    | `analysis` 儀表板自動刷新的間隔（秒）。                                                                       |
+| `performance.scan_threads`     | CLI scan worker 數. `0` 優先採用正數的 `RAYON_NUM_THREADS`, 否則最多使用兩個 worker; 所有值都受 CPU 數量限制. |
+| `providers.*`                  | 設為 `false` 時完全略過某個 provider（不掃描、不呼叫 API），沒在用的話很方便。                                |
+| `logging.level`                | 寫入日誌檔的最低等級（`off`..`trace`）；絕不會印到終端機。                                                    |
+| `logging.retention_days`       | 保留幾天的每日日誌檔；更舊的 `vct-*.log` 會在啟動時清除（`0` 表示全部保留）。                                 |
 
 > [!NOTE]
 > vct 會把診斷訊息寫入 `~/.vct/logs/vct-YYYY-MM-DD.log`（純文字，只寫檔案，絕不顯示在儀表板上）。健康運行時保持安靜（預設等級 `warn`），而且檔案是延遲建立的，所以一次正常執行不會留下任何檔案。當額度抓取失敗或某個 session 被略過時，原因就記錄在這裡——需要完整細節時把 `logging.level` 調到 `debug`。
@@ -629,10 +639,10 @@ vct config migrate
 
 ### 運作方式
 
-1. **自動更新**：每日從 [LiteLLM](https://github.com/BerriAI/litellm) 取得最新價格
-2. **智慧快取**：將價格資料儲存於 `~/.vct/`，有效期 24 小時
-3. **模糊比對**：即使是自訂模型名稱也能找到最佳配對
-4. **始終精準**：確保你取得最新的定價資訊
+1. **自動更新**: 每個 UTC 日期從 [LiteLLM](https://github.com/BerriAI/litellm) 取得一次最新價格
+2. **驗證後 cache**: 只接受成功且包含實際價格的 JSON model map, 再 atomic 寫入 `~/.vct/`
+3. **確定性比對**: 即使 model 名稱含有版本或 provider 前綴, 也會選擇最具體的配對
+4. **失敗保護**: 取得失敗不會覆蓋有效 cache, vct 會保留舊 map, 並在五分鐘 backoff 後才再次嘗試
 
 ### 模型比對
 
@@ -650,7 +660,7 @@ vct config migrate
 - **OpenCode**：只有在 LiteLLM **完全比對**成功時，才會依 token 為新型 model 計價；若沒有完全比對，vct 會採信該 assistant 訊息本身儲存的費用，而不是從名稱相近的 model 去猜測。
 - **Hermes**：與 OpenCode 相同，LiteLLM **完全比對**成功時依 token 計價，否則使用 Hermes 本身儲存的費用。
 - **Grok**：只會把 `contextTokensUsed` 當成 cache-read token 計價；這是單一當下的本地 context 估算，不是累計的 billed usage。
-- **原始 cache**：每日 cache 儲存的是經過篩選的上游 LiteLLM JSON（而非衍生後的結構），因此分層 / 批次定價無需重新抓取即可使用；另外一個小型的行內 LRU 會讓 TUI 刷新期間的重複查詢維持低成本。
+- **原始 cache**: 每日 cache 儲存經過篩選的 LiteLLM 上游原始 JSON (而非衍生結構), 因此 tiered / batch 定價不需重新取得即可使用. 每個 pricing map 各自擁有一個小型 process-local LRU, 重複查詢維持低成本, 也不會在不同 map 之間互相污染.
 
 ---
 

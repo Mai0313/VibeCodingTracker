@@ -1,26 +1,22 @@
 use super::cache::ModelPricing;
 use lru::LruCache;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::rc::Rc;
-use std::sync::{LazyLock, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
 use strsim::jaro_winkler;
 
 // Similarity threshold for fuzzy matching (0.0 to 1.0)
 const SIMILARITY_THRESHOLD: f64 = 0.7;
 
-// Maximum number of cached pricing lookups (prevents unbounded memory growth)
-// Reduced from 20 to 10 to minimize memory usage in TUI mode
-const PRICING_MATCH_CACHE_SIZE: usize = 10;
+// Maximum number of cached pricing lookups per pricing map.
+const PRICING_MATCH_CACHE_SIZE: usize = 64;
 
-// Global LRU cache for pricing match results (thread-safe, bounded capacity)
-// This dramatically improves performance for repeated model lookups while
-// preventing memory leaks from unbounded growth
-static MATCH_CACHE: LazyLock<RwLock<LruCache<String, ModelPricingResult>>> = LazyLock::new(|| {
-    // SAFETY: PRICING_MATCH_CACHE_SIZE is a const > 0
-    let capacity = NonZeroUsize::new(PRICING_MATCH_CACHE_SIZE).unwrap();
-    RwLock::new(LruCache::new(capacity))
-});
+// Incrementing this invalidates the per-instance caches lazily. This keeps the
+// public clear_pricing_cache() API useful without reintroducing a global result
+// cache that can leak matches between unrelated pricing maps.
+static MATCH_CACHE_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Result of a model pricing lookup, including the matched model name for transparency.
 #[derive(Debug, Clone)]
@@ -37,9 +33,29 @@ pub struct ModelPricingMap {
     // Original pricing data (use Rc<str> to avoid cloning keys)
     raw: HashMap<Rc<str>, ModelPricing>,
     // Precomputed normalized keys for fast matching
-    normalized_index: HashMap<String, Rc<str>>, // normalized_key -> original_key (Rc)
+    normalized_index: HashMap<String, Vec<Rc<str>>>,
     // Precomputed lowercase keys for substring/fuzzy matching
     lowercase_keys: Vec<(String, Rc<str>)>, // (lowercase_key, original_key as Rc)
+    // Lookup results belong to this map. A process-global result cache is
+    // incorrect because model names can map to different prices in each map.
+    match_cache: RefCell<MatchCache>,
+}
+
+#[derive(Debug, Clone)]
+struct MatchCache {
+    generation: u64,
+    entries: LruCache<String, ModelPricingResult>,
+}
+
+impl MatchCache {
+    fn new() -> Self {
+        let capacity = NonZeroUsize::new(PRICING_MATCH_CACHE_SIZE)
+            .expect("pricing match cache capacity must be non-zero");
+        Self {
+            generation: MATCH_CACHE_GENERATION.load(Ordering::Acquire),
+            entries: LruCache::new(capacity),
+        }
+    }
 }
 
 impl ModelPricingMap {
@@ -73,9 +89,10 @@ impl ModelPricingMap {
 
             // Precompute normalized key
             let normalized = normalize_model_name(&key);
-            if normalized != key {
-                normalized_index.insert(normalized, rc_key.clone());
-            }
+            normalized_index
+                .entry(normalized)
+                .or_insert_with(Vec::new)
+                .push(rc_key.clone());
 
             // Precompute lowercase key for substring/fuzzy matching
             lowercase_keys.push((key.to_lowercase(), rc_key.clone()));
@@ -85,11 +102,15 @@ impl ModelPricingMap {
 
         // Sort lowercase_keys for potential binary search optimization
         lowercase_keys.sort_by(|a, b| a.0.cmp(&b.0));
+        for candidates in normalized_index.values_mut() {
+            candidates.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+        }
 
         Self {
             raw: rc_raw,
             normalized_index,
             lowercase_keys,
+            match_cache: RefCell::new(MatchCache::new()),
         }
     }
 
@@ -102,8 +123,9 @@ impl ModelPricingMap {
     /// 4. Fuzzy match (Jaro-Winkler ≥ 0.7 threshold).
     /// 5. Default (zero cost) if no match found.
     ///
-    /// Results are cached globally (see [`clear_pricing_cache`]) for performance,
-    /// so even the "no match" outcome is memoized to avoid repeated fuzzy scans.
+    /// Results are cached per map. [`clear_pricing_cache`] invalidates every
+    /// existing map lazily, so even the "no match" outcome can be memoized
+    /// without leaking a result from one pricing table into another.
     ///
     /// # Examples
     ///
@@ -128,11 +150,8 @@ impl ModelPricingMap {
     /// assert_eq!(miss.pricing.input_cost_per_token, 0.0);
     /// ```
     pub fn get(&self, model_name: &str) -> ModelPricingResult {
-        // Ultra-fast path: Check LRU cache first (with peek to avoid write lock)
-        if let Ok(cache_read) = MATCH_CACHE.read()
-            && let Some(cached_result) = cache_read.peek(model_name)
-        {
-            return cached_result.clone();
+        if let Some(cached_result) = self.cached_result(model_name) {
+            return cached_result;
         }
 
         // Fast path 1: Exact match
@@ -141,86 +160,136 @@ impl ModelPricingMap {
                 pricing: pricing.clone(),
                 matched_model: None,
             };
-            // Cache the exact match result (LRU will auto-evict if at capacity)
-            if let Ok(mut cache_write) = MATCH_CACHE.write() {
-                cache_write.put(model_name.to_string(), result.clone());
-            }
+            self.cache_result(model_name, &result);
             return result;
         }
 
         // Fast path 2: Normalized match
         let normalized_name = normalize_model_name(model_name);
-        if let Some(original_key) = self.normalized_index.get(&normalized_name)
+        if let Some(original_key) = self.normalized_match(model_name, &normalized_name)
             && let Some(pricing) = self.raw.get(original_key.as_ref())
         {
             let result = ModelPricingResult {
                 pricing: pricing.clone(),
-                matched_model: Some(original_key.to_string()), // Convert Rc to String only when needed
+                matched_model: Some(original_key.to_string()),
             };
-            // Cache the normalized match result (LRU will auto-evict if at capacity)
-            if let Ok(mut cache_write) = MATCH_CACHE.write() {
-                cache_write.put(model_name.to_string(), result.clone());
-            }
+            self.cache_result(model_name, &result);
             return result;
         }
 
-        // Slow path: Substring and fuzzy matching (optimized)
+        // Slow path 1: inspect every substring candidate and choose the most
+        // specific overlap. Returning the first HashMap-derived candidate can
+        // otherwise price gpt-4o as gpt-4.
         let model_lower = model_name.to_lowercase();
-        let mut best_match: Option<(Rc<str>, f64, bool)> = None; // (Rc key, score, is_substring)
-
-        for (key_lower, original_key) in &self.lowercase_keys {
-            // Substring matching (higher priority, score = 1.0)
-            if (model_lower.contains(key_lower) || key_lower.contains(&model_lower))
-                && (best_match.is_none() || !best_match.as_ref().unwrap().2)
-            {
-                best_match = Some((original_key.clone(), 1.0, true)); // Clone Rc is cheap (just inc ref count)
-                // Early exit if exact substring match found
-                if model_lower == *key_lower {
-                    break;
-                }
-            }
-
-            // Fuzzy matching (only if no substring match yet)
-            if best_match.is_none() || best_match.as_ref().unwrap().1 < 1.0 {
-                let similarity = jaro_winkler(&model_lower, key_lower);
-                if similarity >= SIMILARITY_THRESHOLD {
-                    if let Some((_, best_score, is_sub)) = &best_match {
-                        if !is_sub && similarity > *best_score {
-                            best_match = Some((original_key.clone(), similarity, false));
-                        }
-                    } else {
-                        best_match = Some((original_key.clone(), similarity, false));
-                    }
-                }
-            }
-        }
-
-        // Return best match if found
-        if let Some((matched_key, _, _)) = best_match
+        if let Some(matched_key) = self.substring_match(&model_lower)
             && let Some(pricing) = self.raw.get(matched_key.as_ref())
         {
             let result = ModelPricingResult {
                 pricing: pricing.clone(),
-                matched_model: Some(matched_key.to_string()), // Convert to String only when needed
+                matched_model: Some(matched_key.to_string()),
             };
-            // Cache the fuzzy match result (LRU will auto-evict if at capacity)
-            if let Ok(mut cache_write) = MATCH_CACHE.write() {
-                cache_write.put(model_name.to_string(), result.clone());
-            }
+            self.cache_result(model_name, &result);
             return result;
         }
 
-        // Return default (zero costs) if no match found
+        // Slow path 2: fuzzy matching runs only when normalization and
+        // substring matching found nothing.
+        if let Some(matched_key) = self.fuzzy_match(&model_lower)
+            && let Some(pricing) = self.raw.get(matched_key.as_ref())
+        {
+            let result = ModelPricingResult {
+                pricing: pricing.clone(),
+                matched_model: Some(matched_key.to_string()),
+            };
+            self.cache_result(model_name, &result);
+            return result;
+        }
+
         let result = ModelPricingResult {
             pricing: ModelPricing::default(),
             matched_model: None,
         };
-        // Cache the "no match" result to avoid repeated expensive fuzzy searches
-        // LRU will auto-evict if at capacity (keeps frequently-used models cached)
-        if let Ok(mut cache_write) = MATCH_CACHE.write() {
-            cache_write.put(model_name.to_string(), result.clone());
-        }
+        self.cache_result(model_name, &result);
         result
+    }
+
+    fn cached_result(&self, model_name: &str) -> Option<ModelPricingResult> {
+        let mut cache = self.match_cache.borrow_mut();
+        refresh_cache_generation(&mut cache);
+        cache.entries.get(model_name).cloned()
+    }
+
+    fn cache_result(&self, model_name: &str, result: &ModelPricingResult) {
+        let mut cache = self.match_cache.borrow_mut();
+        refresh_cache_generation(&mut cache);
+        cache.entries.put(model_name.to_string(), result.clone());
+    }
+
+    fn normalized_match(&self, model_name: &str, normalized_name: &str) -> Option<Rc<str>> {
+        let candidates = self.normalized_index.get(normalized_name)?;
+        let query_provider = provider_prefix(model_name);
+
+        candidates
+            .iter()
+            .min_by(|a, b| {
+                normalized_candidate_rank(a, model_name, normalized_name, query_provider).cmp(
+                    &normalized_candidate_rank(b, model_name, normalized_name, query_provider),
+                )
+            })
+            .cloned()
+    }
+
+    fn substring_match(&self, model_lower: &str) -> Option<Rc<str>> {
+        let model_segment = model_without_provider(model_lower);
+        if model_segment.is_empty() {
+            return None;
+        }
+        let query_provider = provider_prefix(model_lower);
+
+        self.lowercase_keys
+            .iter()
+            .filter_map(|(key_lower, original_key)| {
+                let key_segment = model_without_provider(key_lower);
+                if key_segment.is_empty()
+                    || !(model_segment.contains(key_segment) || key_segment.contains(model_segment))
+                {
+                    return None;
+                }
+                let overlap = model_segment.len().min(key_segment.len());
+                let length_difference = model_segment.len().abs_diff(key_segment.len());
+                let provider_rank = substring_provider_rank(query_provider, key_lower);
+                Some((overlap, length_difference, provider_rank, original_key))
+            })
+            .min_by(|a, b| {
+                b.0.cmp(&a.0)
+                    .then_with(|| a.1.cmp(&b.1))
+                    .then_with(|| a.2.cmp(&b.2))
+                    .then_with(|| a.3.as_ref().cmp(b.3.as_ref()))
+            })
+            .map(|(_, _, _, key)| key.clone())
+    }
+
+    fn fuzzy_match(&self, model_lower: &str) -> Option<Rc<str>> {
+        if model_lower.is_empty() {
+            return None;
+        }
+
+        self.lowercase_keys
+            .iter()
+            .filter_map(|(key_lower, original_key)| {
+                let similarity = jaro_winkler(model_lower, key_lower);
+                (similarity >= SIMILARITY_THRESHOLD).then_some((
+                    similarity,
+                    model_lower.len().abs_diff(key_lower.len()),
+                    original_key,
+                ))
+            })
+            .min_by(|a, b| {
+                b.0.total_cmp(&a.0)
+                    .then_with(|| a.1.cmp(&b.1))
+                    .then_with(|| a.2.as_ref().cmp(b.2.as_ref()))
+            })
+            .map(|(_, _, key)| key.clone())
     }
 
     /// Returns the pricing for an **exact** model-name match only.
@@ -246,15 +315,63 @@ impl ModelPricingMap {
     }
 }
 
-/// Clears the global pricing match LRU cache.
+/// Invalidates the lookup cache in every pricing map.
 ///
-/// Primarily used in tests for isolation. In production, the LRU cache
-/// significantly improves performance by avoiding repeated expensive fuzzy
-/// matching operations while maintaining bounded memory usage (capacity is
-/// `PRICING_MATCH_CACHE_SIZE` entries).
+/// Existing maps observe the generation change on their next lookup and clear
+/// their own bounded LRU. No result data is stored globally.
 pub fn clear_pricing_cache() {
-    if let Ok(mut cache_write) = MATCH_CACHE.write() {
-        cache_write.clear();
+    MATCH_CACHE_GENERATION.fetch_add(1, Ordering::AcqRel);
+}
+
+fn refresh_cache_generation(cache: &mut MatchCache) {
+    let generation = MATCH_CACHE_GENERATION.load(Ordering::Acquire);
+    if cache.generation != generation {
+        cache.entries.clear();
+        cache.generation = generation;
+    }
+}
+
+fn provider_prefix(model_name: &str) -> Option<&str> {
+    model_name
+        .split_once('/')
+        .and_then(|(prefix, _)| (!prefix.is_empty()).then_some(prefix))
+}
+
+fn normalized_candidate_rank<'a>(
+    candidate: &'a str,
+    model_name: &str,
+    normalized_name: &str,
+    query_provider: Option<&str>,
+) -> (u8, usize, &'a str) {
+    let same_provider_base = query_provider.is_some()
+        && provider_prefix(candidate) == query_provider
+        && model_without_provider(candidate) == normalized_name;
+    let unprefixed_base = provider_prefix(candidate).is_none() && candidate == normalized_name;
+    let priority = if same_provider_base {
+        0
+    } else if unprefixed_base {
+        1
+    } else {
+        2
+    };
+    (
+        priority,
+        model_name.len().abs_diff(candidate.len()),
+        candidate,
+    )
+}
+
+fn model_without_provider(model_name: &str) -> &str {
+    model_name
+        .split_once('/')
+        .map_or(model_name, |(_, model)| model)
+}
+
+fn substring_provider_rank(query_provider: Option<&str>, candidate: &str) -> u8 {
+    match (query_provider, provider_prefix(candidate)) {
+        (Some(query), Some(candidate)) if query == candidate => 0,
+        (_, None) => 1,
+        _ => 2,
     }
 }
 
@@ -262,7 +379,7 @@ pub fn clear_pricing_cache() {
 ///
 /// Removes patterns like:
 /// - Provider prefixes: `bedrock/`, `openai/`.
-/// - Date suffixes: `-20231201`, `-20240320` (exactly `-20YYMMDD`, 8 digits).
+/// - Date suffixes: `-20231201`, `-12345678` (exactly 8 ASCII digits).
 /// - Version suffixes: `-v1.0`, `-v2`.
 ///
 /// Optimized to minimize string allocations (a single allocation at the end).
@@ -285,26 +402,38 @@ pub fn normalize_model_name(name: &str) -> String {
         start = idx + 1;
     }
 
-    // Work with the slice after removing prefix
-    let working_slice = &name[start..end];
+    loop {
+        let working_slice = &name[start..end];
 
-    // Remove common date patterns (e.g., "-20231201", "-20240320")
-    if let Some(idx) = working_slice.rfind("-20") {
-        let suffix_start = idx + 1; // Points to '2' in "-20..."
-        if working_slice.len() - suffix_start == 8 {
-            // "-20YYMMDD" pattern (8 chars: 20YYMMDD)
-            end = start + idx;
+        // Remove date suffixes only when all eight bytes are ASCII digits.
+        if let Some((base, suffix)) = working_slice.rsplit_once('-')
+            && suffix.len() == 8
+            && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            end = start + base.len();
+            continue;
         }
-    }
 
-    // Remove version patterns (e.g., "-v1.0", "-v2")
-    let working_slice2 = &name[start..end];
-    if let Some(idx) = working_slice2.rfind("-v") {
-        end = start + idx;
+        // Remove version patterns (e.g., "-v1.0", "-v2").
+        if let Some((base, suffix)) = working_slice.rsplit_once("-v")
+            && is_numeric_version_suffix(suffix)
+        {
+            end = start + base.len();
+            continue;
+        }
+
+        break;
     }
 
     // Only allocate once at the end
     name[start..end].to_string()
+}
+
+fn is_numeric_version_suffix(suffix: &str) -> bool {
+    !suffix.is_empty()
+        && suffix
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 #[cfg(test)]
@@ -475,7 +604,6 @@ mod tests {
 
     #[test]
     fn test_empty_model_name() {
-        // Test with empty model name - will match first model due to substring logic
         clear_pricing_cache();
 
         let mut raw = HashMap::new();
@@ -484,8 +612,7 @@ mod tests {
         let map = ModelPricingMap::new(raw);
 
         let result = map.get("");
-        // Empty string will match via substring logic, so it returns a match
-        assert!(result.pricing.input_cost_per_token >= 0.0);
+        assert_eq!(result.pricing.input_cost_per_token, 0.0);
     }
 
     #[test]
@@ -516,6 +643,22 @@ mod tests {
             result1.pricing.input_cost_per_token,
             result2.pricing.input_cost_per_token
         );
+    }
+
+    #[test]
+    fn clear_invalidates_existing_map_cache() {
+        let map = ModelPricingMap::new(HashMap::new());
+        assert_eq!(map.match_cache.borrow().entries.cap().get(), 64);
+        map.get("before-clear");
+        let old_generation = map.match_cache.borrow().generation;
+
+        clear_pricing_cache();
+        map.get("after-clear");
+
+        let cache = map.match_cache.borrow();
+        assert_ne!(cache.generation, old_generation);
+        assert_eq!(cache.entries.len(), 1);
+        assert!(cache.entries.peek("after-clear").is_some());
     }
 
     #[test]

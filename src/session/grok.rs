@@ -10,7 +10,7 @@ use percent_encoding::percent_decode_str;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
@@ -40,19 +40,19 @@ pub(crate) fn parse_grok_session(path: &Path, mode: ParseMode) -> Result<ParsedA
 
     let signals: GrokSignals = serde_json::from_value(signals_value)
         .with_context(|| format!("Failed to normalize Grok signals: {}", path.display()))?;
-    let summary = read_summary(path);
+    let mut diagnostics = ParseDiagnostics::default();
+    diagnostics.record_recognized_source();
+    diagnostics.record_relevant(true);
+
+    let summary = read_summary(path, &mut diagnostics)?;
     let model = resolved_model(&signals, summary.as_ref());
     if model.is_empty() {
         bail!("Grok signals file {} has no model id", path.display());
     }
 
-    let mut diagnostics = ParseDiagnostics::default();
-    diagnostics.record_recognized_source();
-    diagnostics.record_relevant(true);
-
     let mut state = SessionParseState::with_mode(mode);
-    apply_metadata(&mut state, path, summary.as_ref());
-    parse_updates(path, &mut state, &mut diagnostics);
+    apply_metadata(&mut state, path, summary.as_ref())?;
+    parse_updates(path, &mut state, &mut diagnostics)?;
 
     let estimated_tokens = i64::try_from(signals.context_tokens_used).unwrap_or(i64::MAX);
     let mut usage = FastHashMap::default();
@@ -78,14 +78,35 @@ pub(crate) fn parse_grok_session(path: &Path, mode: ParseMode) -> Result<ParsedA
     ))
 }
 
-fn read_summary(signals_path: &Path) -> Option<GrokSummary> {
+fn read_summary(
+    signals_path: &Path,
+    diagnostics: &mut ParseDiagnostics,
+) -> Result<Option<GrokSummary>> {
     let path = signals_path.with_file_name("summary.json");
-    let file = File::open(&path).ok()?;
-    match serde_json::from_reader(file) {
-        Ok(summary) => Some(summary),
-        Err(err) => {
-            log::warn!("failed to parse Grok summary {}: {err}", path.display());
-            None
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to open Grok summary: {}", path.display()));
+        }
+    };
+    parse_summary_reader(file, &path, diagnostics)
+}
+
+fn parse_summary_reader<R: Read>(
+    reader: R,
+    path: &Path,
+    diagnostics: &mut ParseDiagnostics,
+) -> Result<Option<GrokSummary>> {
+    match serde_json::from_reader(reader) {
+        Ok(summary) => Ok(Some(summary)),
+        Err(error) if error.is_io() => {
+            Err(error).with_context(|| format!("Failed to read Grok summary: {}", path.display()))
+        }
+        Err(_) => {
+            diagnostics.record_malformed();
+            Ok(None)
         }
     }
 }
@@ -107,7 +128,11 @@ fn resolved_model(signals: &GrokSignals, summary: Option<&GrokSummary>) -> Strin
         .unwrap_or_default()
 }
 
-fn apply_metadata(state: &mut SessionParseState, path: &Path, summary: Option<&GrokSummary>) {
+fn apply_metadata(
+    state: &mut SessionParseState,
+    path: &Path,
+    summary: Option<&GrokSummary>,
+) -> Result<()> {
     if let Some(summary) = summary {
         state.task_id.clone_from(&summary.info.id);
         state.folder_path.clone_from(&summary.info.cwd);
@@ -124,20 +149,31 @@ fn apply_metadata(state: &mut SessionParseState, path: &Path, summary: Option<&G
             .unwrap_or_default();
     }
     if state.folder_path.is_empty() {
-        state.folder_path = read_cwd_marker(path)
+        state.folder_path = read_cwd_marker(path)?
             .or_else(|| decode_workspace_dir(path))
             .unwrap_or_default();
     }
     if state.last_ts == 0 {
         state.last_ts = file_modified_millis(path);
     }
+    Ok(())
 }
 
-fn read_cwd_marker(signals_path: &Path) -> Option<String> {
-    let workspace_dir = signals_path.parent()?.parent()?;
-    let cwd = fs::read_to_string(workspace_dir.join(".cwd")).ok()?;
+fn read_cwd_marker(signals_path: &Path) -> Result<Option<String>> {
+    let Some(workspace_dir) = signals_path.parent().and_then(Path::parent) else {
+        return Ok(None);
+    };
+    let path = workspace_dir.join(".cwd");
+    let cwd = match fs::read_to_string(&path) {
+        Ok(cwd) => cwd,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to read Grok cwd marker: {}", path.display()));
+        }
+    };
     let cwd = cwd.trim();
-    (!cwd.is_empty()).then(|| cwd.to_string())
+    Ok((!cwd.is_empty()).then(|| cwd.to_string()))
 }
 
 fn decode_workspace_dir(signals_path: &Path) -> Option<String> {
@@ -161,15 +197,14 @@ fn parse_updates(
     signals_path: &Path,
     state: &mut SessionParseState,
     diagnostics: &mut ParseDiagnostics,
-) {
+) -> Result<()> {
     let path = signals_path.with_file_name("updates.jsonl");
     let file = match File::open(&path) {
         Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(err) => {
-            diagnostics.record_malformed();
-            log::warn!("failed to open Grok updates {}: {err}", path.display());
-            return;
+            return Err(err)
+                .with_context(|| format!("Failed to open Grok updates: {}", path.display()));
         }
     };
 
@@ -179,9 +214,13 @@ fn parse_updates(
         let line = match line {
             Ok(line) => line,
             Err(err) => {
-                diagnostics.record_malformed();
-                log::warn!("skipping unreadable Grok update line {}: {err}", index + 1);
-                break;
+                return Err(err).with_context(|| {
+                    format!(
+                        "Failed to read Grok update line {}: {}",
+                        index + 1,
+                        path.display()
+                    )
+                });
             }
         };
         if line.trim().is_empty() {
@@ -189,9 +228,8 @@ fn parse_updates(
         }
         let value: Value = match serde_json::from_str(&line) {
             Ok(value) => value,
-            Err(err) => {
+            Err(_) => {
                 diagnostics.record_malformed();
-                log::warn!("skipping malformed Grok update line {}: {err}", index + 1);
                 continue;
             }
         };
@@ -248,16 +286,11 @@ fn parse_updates(
                 let output = update.get("rawOutput").unwrap_or(&Value::Null);
                 let normalized = apply_completed_tool(state, &call, timestamp, output);
                 diagnostics.record_relevant(normalized);
-                if !normalized {
-                    log::warn!(
-                        "skipping Grok {} tool call with unsupported arguments",
-                        call.name
-                    );
-                }
             }
             _ => {}
         }
     }
+    Ok(())
 }
 
 fn is_tracked_tool(name: &str) -> bool {
@@ -393,6 +426,27 @@ fn search_replace_detail_strings(detail: &Value) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
+
+    struct FailingSummaryReader {
+        bytes: &'static [u8],
+        offset: usize,
+    }
+
+    impl Read for FailingSummaryReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.offset == self.bytes.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "transient summary read failure",
+                ));
+            }
+            let count = buffer.len().min(self.bytes.len() - self.offset);
+            buffer[..count].copy_from_slice(&self.bytes[self.offset..self.offset + count]);
+            self.offset += count;
+            Ok(count)
+        }
+    }
 
     #[test]
     fn detects_only_distinctive_grok_signals() {
@@ -422,7 +476,22 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_updates_do_not_drop_signals_usage() {
+    fn summary_io_failures_remain_retryable() {
+        let mut diagnostics = ParseDiagnostics::default();
+        let reader = FailingSummaryReader {
+            bytes: br#"{"info":{"id":"session""#,
+            offset: 0,
+        };
+
+        let error =
+            parse_summary_reader(reader, Path::new("summary.json"), &mut diagnostics).unwrap_err();
+
+        assert!(error.to_string().contains("Failed to read Grok summary"));
+        assert_eq!(diagnostics, ParseDiagnostics::default());
+    }
+
+    #[test]
+    fn unreadable_updates_surface_a_retryable_source_error() {
         let temp = tempfile::tempdir().unwrap();
         let session = temp.path().join("workspace").join("session-id");
         std::fs::create_dir_all(&session).unwrap();
@@ -440,11 +509,11 @@ mod tests {
         .unwrap();
         std::fs::create_dir(session.join("updates.jsonl")).unwrap();
 
-        let parsed = parse_grok_session(&signals, ParseMode::UsageOnly).unwrap();
-
-        assert_eq!(
-            parsed.analysis.records[0].conversation_usage["grok-test"]["cache_read_input_tokens"],
-            42
+        let error = parse_grok_session(&signals, ParseMode::UsageOnly).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to read Grok update line")
         );
     }
 
@@ -522,7 +591,7 @@ mod tests {
         std::fs::write(&signals, "").unwrap();
 
         let mut state = SessionParseState::new();
-        apply_metadata(&mut state, &signals, None);
+        apply_metadata(&mut state, &signals, None).unwrap();
 
         assert_eq!(state.task_id, "session-id");
         assert_eq!(state.folder_path, expected.to_string_lossy());
