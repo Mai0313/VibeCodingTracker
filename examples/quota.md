@@ -269,8 +269,8 @@ curl -s "https://cli-chat-proxy.grok.com/v1/settings" \
 ```bash
 AUTH=~/.grok/auth.json
 RT=$(jq -r 'to_entries[0].value.refresh_token // to_entries[0].value.refresh' "$AUTH")
-# client id: prefer the entry's oidc_client_id, else the tail after "::" in the entry key, else the CLI default.
-CID=$(jq -r 'to_entries[0] | .value.oidc_client_id // (.key | split("::") | last) // "b1a00492-073a-47ea-816f-4c329264a828"' "$AUTH")
+# client id: the entry's oidc_client_id, else the trailing "::" segment of the entry key (no hardcoded fallback).
+CID=$(jq -r 'to_entries[0] | .value.oidc_client_id // (.key | split("::") | last) // empty' "$AUTH")
 
 curl -s "https://auth.x.ai/oauth2/token" \
     -H "Content-Type: application/x-www-form-urlencoded" \
