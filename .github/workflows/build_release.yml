@@ -65,7 +65,7 @@ jobs:
 
       - name: Cargo build (release)
         run: |
-          cargo build --target ${{ matrix.target }} --release --locked --bin vibe_coding_tracker
+          cargo build --profile dist --locked --target ${{ matrix.target }} --bin vibe_coding_tracker
 
       - name: Stage Artifact
         shell: bash
@@ -73,7 +73,7 @@ jobs:
           set -euo pipefail
           dest="dist/${{ matrix.target }}"
           mkdir -p "$dest"
-          bin_dir="target/${{ matrix.target }}/release"
+          bin_dir="target/${{ matrix.target }}/dist"
           bin="vibe_coding_tracker"
           if [[ "${{ matrix.runner }}" == windows* ]]; then
             bin="${bin}.exe"
