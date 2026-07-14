@@ -12,7 +12,10 @@ use common::fixture_str;
 use httpmock::prelude::*;
 use serde_json::json;
 use vibe_coding_tracker::quota::http::build_client;
-use vibe_coding_tracker::quota::wham::{WhamResult, call_wham, refresh_codex};
+use vibe_coding_tracker::quota::wham::{
+    ResetCreditsResult, WhamResult, call_reset_credit_details, call_wham,
+    call_wham_with_reset_credits, refresh_codex,
+};
 
 #[test]
 fn call_wham_maps_200_response() {
@@ -68,6 +71,97 @@ fn call_wham_500_is_transient() {
 
     let result = call_wham(&client, "tok", None, 0, &server.url("/wham"));
     assert!(matches!(result, WhamResult::Transient));
+}
+
+#[test]
+fn call_wham_with_reset_credits_maps_details() {
+    let server = MockServer::start();
+    let usage = server.mock(|when, then| {
+        when.method(GET).path("/wham");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(fixture_str("wham_usage_response.json"));
+    });
+    let details = server.mock(|when, then| {
+        when.method(GET)
+            .path("/reset-credits")
+            .header("authorization", "Bearer tok")
+            .header("chatgpt-account-id", "acct")
+            .header("originator", "codex_cli_rs");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(fixture_str("wham_rate_limit_reset_credits_response.json"));
+    });
+    let client = build_client().unwrap();
+
+    let result = call_wham_with_reset_credits(
+        &client,
+        "tok",
+        Some("acct"),
+        1_000_000,
+        &server.url("/wham"),
+        &server.url("/reset-credits"),
+    );
+
+    usage.assert();
+    details.assert();
+    match result {
+        WhamResult::Ok(snap) => {
+            assert_eq!(snap.reset_credits_available, Some(5));
+            let expirations = snap.reset_credit_expirations.unwrap();
+            assert_eq!(expirations.len(), 3);
+            assert!(expirations[0].unwrap() < expirations[1].unwrap());
+            assert_eq!(expirations[2], None);
+        }
+        _ => panic!("expected WhamResult::Ok"),
+    }
+}
+
+#[test]
+fn reset_credit_details_failure_preserves_usage_summary() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/wham");
+        then.status(200)
+            .body(fixture_str("wham_usage_response.json"));
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/reset-credits");
+        then.status(500).body("boom");
+    });
+    let client = build_client().unwrap();
+
+    let result = call_wham_with_reset_credits(
+        &client,
+        "tok",
+        Some("acct"),
+        1_000_000,
+        &server.url("/wham"),
+        &server.url("/reset-credits"),
+    );
+
+    match result {
+        WhamResult::Ok(snap) => {
+            assert_eq!(snap.reset_credits_available, Some(2));
+            assert!(snap.reset_credit_expirations.is_none());
+        }
+        _ => panic!("details failure must not fail the usage snapshot"),
+    }
+}
+
+#[test]
+fn reset_credit_details_401_is_unauthorized() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/reset-credits");
+        then.status(401);
+    });
+    let client = build_client().unwrap();
+
+    let result =
+        call_reset_credit_details(&client, "tok", Some("acct"), &server.url("/reset-credits"));
+
+    assert!(matches!(result, ResetCreditsResult::Unauthorized));
 }
 
 #[test]

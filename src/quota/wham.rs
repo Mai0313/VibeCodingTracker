@@ -1,4 +1,4 @@
-//! Codex `wham/usage` API client + token refresh.
+//! Codex `wham/usage` + reset-credit details client and token refresh.
 //!
 //! Reads the bearer token + account id from `~/.codex/auth.json`, calls the
 //! ChatGPT backend usage endpoint, and maps the response into the normalized
@@ -9,7 +9,7 @@
 
 use crate::models::{
     CodexAuthJson, CodexQuotaSnapshot, CodexRefreshResponse, QuotaSource, QuotaWindow,
-    WhamUsageResponse, WhamWindow,
+    WhamResetCreditsDetails, WhamUsageResponse, WhamWindow,
 };
 use crate::quota::refresh::{file_mtime, send_refresh, update_json_file_in_place};
 use crate::utils::now_rfc3339_utc_nanos;
@@ -20,6 +20,9 @@ use std::sync::OnceLock;
 
 /// The ChatGPT backend usage endpoint (production default; injectable in tests).
 pub(crate) const WHAM_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+/// The earned reset-credit details endpoint (production default; injectable in tests).
+pub(crate) const WHAM_RESET_CREDITS_URL: &str =
+    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
 /// The Codex OAuth token endpoint (production default; injectable in tests).
 pub(crate) const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 /// The Codex OAuth client id (public PKCE client).
@@ -50,6 +53,24 @@ fn codex_ua() -> &'static str {
         )
     })
     .as_str()
+}
+
+/// Builds an authenticated Codex backend GET request with the CLI identity.
+fn codex_get(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    token: &str,
+    account_id: Option<&str>,
+) -> reqwest::blocking::RequestBuilder {
+    let req = client
+        .get(url)
+        .header(reqwest::header::USER_AGENT, codex_ua())
+        .header("originator", CODEX_ORIGINATOR)
+        .bearer_auth(token);
+    match account_id {
+        Some(id) => req.header("ChatGPT-Account-Id", id),
+        None => req,
+    }
 }
 
 /// Maps a wham/usage window into the normalized [`QuotaWindow`].
@@ -117,11 +138,45 @@ pub fn map_wham_response(body: &str, now: i64) -> Result<CodexQuotaSnapshot> {
         reset_credits_available: resp
             .rate_limit_reset_credits
             .and_then(|r| r.available_count),
+        reset_credit_expirations: None,
         approx_messages,
         spend_limit,
         limit_reached,
         needs_login: false,
     })
+}
+
+/// Maps reset-credit details into the authoritative count plus sorted expiry
+/// times for credits whose status is `available`.
+///
+/// The expiry list may be shorter than the count because the backend can cap
+/// detail rows. `None` entries sort last and mean the credit never expires.
+///
+/// # Errors
+///
+/// Returns an error when the response shape or an available credit's RFC3339
+/// expiry is malformed.
+pub fn map_reset_credits_response(body: &str) -> Result<(i64, Vec<Option<i64>>)> {
+    let resp: WhamResetCreditsDetails = serde_json::from_str(body)
+        .context("Failed to parse wham/rate-limit-reset-credits response")?;
+    let available_count = resp.available_count.max(0);
+
+    let mut expirations = Vec::new();
+    for credit in resp.credits.into_iter().filter(|c| c.status == "available") {
+        let expires_at = credit
+            .expires_at
+            .as_deref()
+            .map(|timestamp| {
+                chrono::DateTime::parse_from_rfc3339(timestamp)
+                    .with_context(|| format!("invalid expires_at for reset credit `{}`", credit.id))
+                    .map(|parsed| parsed.timestamp())
+            })
+            .transpose()?;
+        expirations.push(expires_at);
+    }
+    expirations.sort_by_key(|expires_at| expires_at.unwrap_or(i64::MAX));
+
+    Ok((available_count, expirations))
 }
 
 /// Extracts an `[low, high]` approximate-messages pair, dropping the all-zero
@@ -158,6 +213,19 @@ pub enum WhamResult {
     Transient,
 }
 
+/// Outcome of the optional reset-credit details request.
+pub enum ResetCreditsResult {
+    /// Authoritative count plus sorted available-credit expirations.
+    Ok {
+        available_count: i64,
+        expirations: Vec<Option<i64>>,
+    },
+    /// 401: the caller may refresh the token and retry once.
+    Unauthorized,
+    /// Network, parse, or other HTTP error: keep the usage summary.
+    Transient,
+}
+
 /// Calls the wham endpoint at `wham_url` with an explicit bearer token.
 pub fn call_wham(
     client: &reqwest::blocking::Client,
@@ -166,15 +234,7 @@ pub fn call_wham(
     now: i64,
     wham_url: &str,
 ) -> WhamResult {
-    let mut req = client
-        .get(wham_url)
-        .header(reqwest::header::USER_AGENT, codex_ua())
-        .header("originator", CODEX_ORIGINATOR)
-        .bearer_auth(token);
-    if let Some(id) = account_id {
-        req = req.header("ChatGPT-Account-Id", id);
-    }
-    let resp = match req.send() {
+    let resp = match codex_get(client, wham_url, token, account_id).send() {
         Ok(r) => r,
         Err(e) => {
             log::warn!("codex quota fetch: request failed: {e}");
@@ -200,6 +260,78 @@ pub fn call_wham(
         Err(e) => {
             log::warn!("codex quota fetch: failed to read response body: {e}");
             WhamResult::Transient
+        }
+    }
+}
+
+/// Calls `wham/usage`, then enriches a successful snapshot with earned reset
+/// credit details. The details request is best-effort: any HTTP or parse error
+/// preserves the count returned by `wham/usage` and does not fail the panel.
+pub fn call_wham_with_reset_credits(
+    client: &reqwest::blocking::Client,
+    token: &str,
+    account_id: Option<&str>,
+    now: i64,
+    wham_url: &str,
+    reset_credits_url: &str,
+) -> WhamResult {
+    let mut snap = match call_wham(client, token, account_id, now, wham_url) {
+        WhamResult::Ok(snap) => snap,
+        WhamResult::Unauthorized => return WhamResult::Unauthorized,
+        WhamResult::Transient => return WhamResult::Transient,
+    };
+
+    match call_reset_credit_details(client, token, account_id, reset_credits_url) {
+        ResetCreditsResult::Ok {
+            available_count,
+            expirations,
+        } => {
+            snap.reset_credits_available = Some(available_count);
+            snap.reset_credit_expirations = Some(expirations);
+        }
+        ResetCreditsResult::Unauthorized | ResetCreditsResult::Transient => {}
+    }
+
+    WhamResult::Ok(snap)
+}
+
+/// Calls and maps the earned reset-credit details endpoint.
+pub fn call_reset_credit_details(
+    client: &reqwest::blocking::Client,
+    token: &str,
+    account_id: Option<&str>,
+    reset_credits_url: &str,
+) -> ResetCreditsResult {
+    let resp = match codex_get(client, reset_credits_url, token, account_id).send() {
+        Ok(resp) => resp,
+        Err(e) => {
+            log::warn!("codex reset-credit details fetch: request failed: {e}");
+            return ResetCreditsResult::Transient;
+        }
+    };
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return ResetCreditsResult::Unauthorized;
+    }
+    if !status.is_success() {
+        log::warn!("codex reset-credit details fetch: HTTP {status}");
+        return ResetCreditsResult::Transient;
+    }
+    let text = match resp.text() {
+        Ok(text) => text,
+        Err(e) => {
+            log::warn!("codex reset-credit details fetch: failed to read response body: {e}");
+            return ResetCreditsResult::Transient;
+        }
+    };
+    match map_reset_credits_response(&text) {
+        Ok((available_count, expirations)) => ResetCreditsResult::Ok {
+            available_count,
+            expirations,
+        },
+        Err(e) => {
+            log::warn!("codex reset-credit details fetch: failed to parse response: {e}");
+            ResetCreditsResult::Transient
         }
     }
 }
@@ -236,15 +368,9 @@ pub(crate) fn fetch_codex_raw_from(
         )
     })?;
     let (access_token, account_id) = parse_auth(&body)?;
-    let mut req = client
-        .get(wham_url)
-        .header(reqwest::header::USER_AGENT, codex_ua())
-        .header("originator", CODEX_ORIGINATOR)
-        .bearer_auth(&access_token);
-    if let Some(id) = &account_id {
-        req = req.header("ChatGPT-Account-Id", id);
-    }
-    let resp = req.send().context("Failed to send Codex usage request")?;
+    let resp = codex_get(client, wham_url, &access_token, account_id.as_deref())
+        .send()
+        .context("Failed to send Codex usage request")?;
     let status = resp.status().as_u16();
     let text = resp
         .text()
@@ -334,6 +460,8 @@ pub fn refresh_codex(
 mod tests {
     use super::*;
 
+    const RESET_CREDITS_SAMPLE: &str =
+        include_str!("../../examples/wham_rate_limit_reset_credits_response.json");
     const SAMPLE: &str = r#"{
       "plan_type": "plus",
       "rate_limit": {
@@ -359,8 +487,33 @@ mod tests {
         assert_eq!(snap.credits_balance.as_deref(), Some("0"));
         assert_eq!(snap.has_credits, Some(false));
         assert_eq!(snap.reset_credits_available, Some(2));
+        assert!(snap.reset_credit_expirations.is_none());
         assert_eq!(snap.limit_reached, Some(false));
         assert!(!snap.needs_login);
+    }
+
+    #[test]
+    fn maps_available_reset_credit_expirations_in_order() {
+        let (count, expirations) = map_reset_credits_response(RESET_CREDITS_SAMPLE).unwrap();
+
+        assert_eq!(count, 5, "top-level count stays authoritative");
+        assert_eq!(expirations.len(), 3, "redeemed credit is excluded");
+        assert!(expirations[0].unwrap() < expirations[1].unwrap());
+        assert_eq!(expirations[2], None, "non-expiring credit sorts last");
+    }
+
+    #[test]
+    fn rejects_malformed_available_credit_expiry() {
+        let body = r#"{
+          "credits": [{
+            "id": "credit-1", "reset_type": "codex_rate_limits",
+            "status": "available", "granted_at": "2026-07-01T00:00:00Z",
+            "expires_at": "not-a-timestamp"
+          }],
+          "available_count": 1
+        }"#;
+
+        assert!(map_reset_credits_response(body).is_err());
     }
 
     #[test]

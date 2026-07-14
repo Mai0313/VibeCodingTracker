@@ -399,12 +399,36 @@ where
     })
 }
 
-/// The `rate_limit_reset_credits` object of a wham/usage response.
+/// The reset-credit summary embedded in a wham/usage response.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WhamResetCredits {
     /// Number of rate-limit reset credits available.
     #[serde(default)]
     pub available_count: Option<i64>,
+}
+
+/// The response from the reset-credit details endpoint.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WhamResetCreditsDetails {
+    /// Per-credit details. The backend may cap this list.
+    pub credits: Vec<WhamResetCreditDetails>,
+    /// Authoritative number of available reset credits.
+    pub available_count: i64,
+}
+
+/// One earned rate-limit reset credit.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WhamResetCreditDetails {
+    /// Stable backend identifier.
+    pub id: String,
+    /// Limit family reset by this credit.
+    pub reset_type: String,
+    /// Lifecycle state, e.g. `available` / `redeeming` / `redeemed`.
+    pub status: String,
+    /// RFC3339 grant time.
+    pub granted_at: String,
+    /// RFC3339 expiry time, or `None` when the credit does not expire.
+    pub expires_at: Option<String>,
 }
 
 // ---- ~/.codex/auth.json ----
@@ -553,6 +577,11 @@ pub struct CodexQuotaSnapshot {
     pub unlimited: Option<bool>,
     /// Number of rate-limit reset credits available.
     pub reset_credits_available: Option<i64>,
+    /// Expiry times for fetched `available` reset-credit details. The outer
+    /// `None` means details were unavailable; an inner `None` never expires.
+    /// The backend may cap this list, so its length is not the total count.
+    #[serde(default)]
+    pub reset_credit_expirations: Option<Vec<Option<i64>>>,
     /// Approximate `[low, high]` messages the remaining credits still buy.
     #[serde(default)]
     pub approx_messages: Option<(i64, i64)>,

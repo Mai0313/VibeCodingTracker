@@ -54,9 +54,9 @@ use std::time::{Duration, Instant};
 use sysinfo::{Pid, System};
 
 /// Minimum height for the bottom quota panels. Sized for the common case
-/// (Claude: 5h/7d/scoped/balance/staleness; Codex: plan/5h/7d/credits/staleness)
-/// plus the border. A rare overlap (extras line + login hint at once) clips the
-/// least-critical bottom line, which `Paragraph` handles without panicking.
+/// (Claude: 5h/7d/scoped/balance/staleness; Codex:
+/// plan/5h/7d/credits/reset-expiry/staleness) plus the border. A rare overlap
+/// clips the least-critical bottom line, which `Paragraph` handles safely.
 const QUOTA_PANEL_MIN_HEIGHT: u16 = 8;
 /// Claude brand color for the quota panel border.
 const CLAUDE_COLOR: RatatuiColor = RatatuiColor::Rgb(190, 116, 87);
@@ -1489,7 +1489,7 @@ fn render_codex_quota(f: &mut Frame, area: Rect, codex: &CodexQuotaSnapshot, now
             v.push(login_hint_line(CODEX_LOGIN_HINT));
         } else {
             v.push(credits_line(codex));
-            if let Some(extra) = codex_extras_line(codex) {
+            if let Some(extra) = codex_extras_line(codex, now) {
                 v.push(extra);
             }
         }
@@ -1599,10 +1599,27 @@ fn credits_line(codex: &CodexQuotaSnapshot) -> Line<'static> {
     Line::from(Span::styled(s, Style::default().fg(RatatuiColor::Gray)))
 }
 
-/// Builds the optional Codex extras line (`~L-H msgs  ·  cap $X`), shown only
-/// when the account has credit-funded messages or a configured spend cap.
-fn codex_extras_line(codex: &CodexQuotaSnapshot) -> Option<Line<'static>> {
+/// Builds the optional Codex extras line (`reset expires X  ·  ~L-H msgs  ·
+/// cap $X`). Reset-credit details lead the line so the expiry stays visible in
+/// a narrow panel even when message and spend metadata are also present.
+fn codex_extras_line(codex: &CodexQuotaSnapshot, now: i64) -> Option<Line<'static>> {
     let mut parts: Vec<String> = Vec::new();
+    if codex.reset_credits_available.is_some_and(|count| count > 0)
+        && let Some(expirations) = &codex.reset_credit_expirations
+    {
+        if let Some(expires_at) = expirations.iter().flatten().min() {
+            parts.push(format!(
+                "reset expires {}",
+                format_duration_until(*expires_at, now)
+            ));
+        } else if codex
+            .reset_credits_available
+            .and_then(|count| usize::try_from(count).ok())
+            .is_some_and(|count| count > 0 && expirations.len() >= count)
+        {
+            parts.push("reset never expires".to_string());
+        }
+    }
     if let Some((low, high)) = codex.approx_messages {
         if low == high {
             parts.push(format!("~{low} msgs"));
@@ -1644,6 +1661,13 @@ fn claude_balance_line(claude: &ClaudeQuotaSnapshot) -> Line<'static> {
 mod tests {
     use super::*;
     use crate::models::Provider;
+
+    fn line_text(line: Line<'_>) -> String {
+        line.spans
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect()
+    }
 
     fn stats(tokens: i64) -> ProviderStats {
         ProviderStats {
@@ -1698,6 +1722,104 @@ mod tests {
         let bar = provider_share_bar(&rows, 0);
         let total: usize = bar.spans.iter().map(|s| s.content.chars().count()).sum();
         assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn codex_extras_shows_earliest_reset_credit_expiry() {
+        let now = 1_000;
+        let codex = CodexQuotaSnapshot {
+            reset_credits_available: Some(5),
+            reset_credit_expirations: Some(vec![
+                Some(now + 4 * 86_400 + 2 * 3_600),
+                None,
+                Some(now + 2 * 3_600 + 13 * 60),
+            ]),
+            approx_messages: Some((120, 150)),
+            spend_limit: Some(50.0),
+            ..Default::default()
+        };
+
+        let line = codex_extras_line(&codex, now).unwrap();
+        assert_eq!(
+            line_text(line),
+            "reset expires 2h13m  ·  ~120-150 msgs  ·  cap $50"
+        );
+    }
+
+    #[test]
+    fn codex_extras_distinguishes_non_expiring_credits() {
+        let codex = CodexQuotaSnapshot {
+            reset_credits_available: Some(2),
+            reset_credit_expirations: Some(vec![None, None]),
+            ..Default::default()
+        };
+
+        let line = codex_extras_line(&codex, 1_000).unwrap();
+        assert_eq!(line_text(line), "reset never expires");
+        assert!("reset never expires".chars().count() <= usize::from(PANEL_MIN_W - 2));
+    }
+
+    #[test]
+    fn codex_extras_omits_expiry_when_details_are_unavailable() {
+        let codex = CodexQuotaSnapshot {
+            reset_credits_available: Some(2),
+            approx_messages: Some((120, 150)),
+            ..Default::default()
+        };
+
+        let line = codex_extras_line(&codex, 1_000).unwrap();
+        assert_eq!(line_text(line), "~120-150 msgs");
+    }
+
+    #[test]
+    fn codex_extras_does_not_infer_no_expiry_from_capped_details() {
+        let codex = CodexQuotaSnapshot {
+            reset_credits_available: Some(3),
+            reset_credit_expirations: Some(vec![None, None]),
+            ..Default::default()
+        };
+
+        assert!(codex_extras_line(&codex, 1_000).is_none());
+    }
+
+    #[test]
+    fn codex_reset_expiry_and_staleness_fit_minimum_panel() {
+        let now = 1_000;
+        let codex = CodexQuotaSnapshot {
+            source: QuotaSource::Api,
+            fetched_at: now,
+            plan_type: Some("plus".to_string()),
+            primary: Some(QuotaWindow {
+                used_percent: 10.0,
+                resets_at_unix: Some(now + 3_600),
+            }),
+            secondary: Some(QuotaWindow {
+                used_percent: 20.0,
+                resets_at_unix: Some(now + 86_400),
+            }),
+            credits_balance: Some("0".to_string()),
+            reset_credits_available: Some(2),
+            reset_credit_expirations: Some(vec![Some(now + 2 * 3_600 + 13 * 60)]),
+            ..Default::default()
+        };
+        let mut terminal =
+            Terminal::new(TestBackend::new(PANEL_MIN_W, QUOTA_PANEL_MIN_HEIGHT)).unwrap();
+
+        terminal
+            .draw(|frame| render_codex_quota(frame, frame.area(), &codex, now))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..QUOTA_PANEL_MIN_HEIGHT)
+            .map(|y| {
+                (0..PANEL_MIN_W)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("reset expires 2h13m"));
+        assert!(rendered.contains("updated just now"));
     }
 
     #[test]

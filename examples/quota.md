@@ -11,7 +11,7 @@ These are minimal examples: they stop at "dump the JSON response". Field extract
 
 | Provider    | Credential file                                     | Quota endpoint                                                         | Refresh model                                    |
 | ----------- | --------------------------------------------------- | ---------------------------------------------------------------------- | ------------------------------------------------ |
-| Codex       | `~/.codex/auth.json`                                | `GET  chatgpt.com/backend-api/wham/usage`                              | `POST auth.openai.com/oauth/token` (rotates)     |
+| Codex       | `~/.codex/auth.json`                                | `GET  chatgpt.com/backend-api/wham/usage` + reset-credit details       | `POST auth.openai.com/oauth/token` (rotates)     |
 | Claude Code | `~/.claude/.credentials.json`                       | `GET  api.anthropic.com/api/oauth/usage`                               | `POST platform.claude.com/v1/oauth/token`        |
 | Copilot     | `~/.copilot/config.json`                            | `GET  api.github.com/copilot_internal/user`                            | none (long-lived `gho_` token)                   |
 | Cursor      | `~/.config/cursor/auth.json`                        | `GET  cursor.com/api/usage-summary`                                    | reactive (official CLI keeps the file fresh)     |
@@ -57,7 +57,10 @@ curl -s https://auth.openai.com/oauth/token \
     -d "$(jq -nc --arg rt "$(jq -r .tokens.refresh_token "$AUTH")" '{client_id:"app_EMoamEEZ73f0CkXaXp7hrann", grant_type:"refresh_token", refresh_token:$rt}')" | jq
 ```
 
-### Check reset expired time
+Response carries `access_token` / `refresh_token` / `id_token`; write them back into `.tokens`.
+The `refresh_token` rotates. `auth.json` has no expiry field, so refresh is reactive-only (fire on a 401).
+
+### Check reset credit expiration
 
 ```bash
 TOKEN=$(jq -r '.tokens.access_token' ~/.codex/auth.json)
@@ -70,8 +73,7 @@ curl -s -X GET "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits" \
     -H "User-Agent: codex_cli_rs/0.142.5 (linux; x86_64)" | jq
 ```
 
-Response carries `access_token` / `refresh_token` / `id_token`; write them back into `.tokens`.
-The `refresh_token` rotates. `auth.json` has no expiry field, so refresh is reactive-only (fire on a 401).
+The response carries an authoritative `available_count` plus a possibly-capped `credits[]` list. Only entries with `status == "available"` are usable; `expires_at` is an RFC3339 timestamp or `null` when that credit does not expire. See [`wham_rate_limit_reset_credits_response.json`](wham_rate_limit_reset_credits_response.json) for a sanitized example.
 
 ## Claude Code
 

@@ -1,0 +1,58 @@
+{
+  "credits": [
+    {
+      "id": "credit-EXAMPLE-1",
+      "reset_type": "codex_rate_limits",
+      "status": "available",
+      "granted_at": "2026-07-13T17:25:30.905125Z",
+      "expires_at": "2026-08-12T17:25:30.905125Z",
+      "redeem_started_at": null,
+      "redeemed_at": null,
+      "profile_image_url": "https://example.test/avatar.png",
+      "profile_user_id": "user-EXAMPLE",
+      "title": "Full reset",
+      "description": "Ready to redeem"
+    },
+    {
+      "id": "credit-EXAMPLE-2",
+      "reset_type": "codex_rate_limits",
+      "status": "redeemed",
+      "granted_at": "2026-06-20T12:00:00Z",
+      "expires_at": "2026-07-20T12:00:00Z",
+      "redeem_started_at": "2026-07-01T12:00:00Z",
+      "redeemed_at": "2026-07-01T12:00:01Z",
+      "profile_image_url": null,
+      "profile_user_id": null,
+      "title": "Full reset",
+      "description": "Redeemed"
+    },
+    {
+      "id": "credit-EXAMPLE-3",
+      "reset_type": "codex_rate_limits",
+      "status": "available",
+      "granted_at": "2026-07-01T19:01:47.408248Z",
+      "expires_at": "2026-07-31T19:01:47.408248Z",
+      "redeem_started_at": null,
+      "redeemed_at": null,
+      "profile_image_url": null,
+      "profile_user_id": null,
+      "title": "Full reset",
+      "description": "Ready to redeem"
+    },
+    {
+      "id": "credit-EXAMPLE-4",
+      "reset_type": "codex_rate_limits",
+      "status": "available",
+      "granted_at": "2026-07-15T00:00:00Z",
+      "expires_at": null,
+      "redeem_started_at": null,
+      "redeemed_at": null,
+      "profile_image_url": null,
+      "profile_user_id": null,
+      "title": "Full reset",
+      "description": "Does not expire"
+    }
+  ],
+  "available_count": 5,
+  "total_earned_count": 7
+}
