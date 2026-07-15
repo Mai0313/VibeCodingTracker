@@ -73,7 +73,7 @@ curl -s -X GET "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits" \
     -H "User-Agent: codex_cli_rs/0.142.5 (linux; x86_64)" | jq
 ```
 
-The response carries an authoritative `available_count` plus a possibly-capped `credits[]` list. Only entries with `status == "available"` are usable; `expires_at` is an RFC3339 timestamp or `null` when that credit does not expire. See [`wham_rate_limit_reset_credits_response.json`](wham_rate_limit_reset_credits_response.json) for a sanitized example.
+The response carries an authoritative `available_count` plus a possibly-capped `credits[]` list. Only entries with `status == "available"` are usable; `expires_at` is an RFC3339 timestamp or `null` when that credit does not expire. See [`wham_rate_limit_reset_credits_response.json`](../tests/fixtures/quota/wham_rate_limit_reset_credits_response.json) for a sanitized example.
 
 ## Claude Code
 

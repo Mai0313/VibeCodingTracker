@@ -198,20 +198,20 @@ fn cached_usage_matches_uncached_for_every_provider_source() {
     home.put_claude_session(
         "project",
         "session.jsonl",
-        &fixture_str("test_conversation_claude_code.jsonl"),
+        &fixture_str("sessions/claude_code.jsonl"),
     );
     home.put_codex_session(
         "2026/06/06/rollout.jsonl",
-        &fixture_str("test_conversation_codex.jsonl"),
+        &fixture_str("sessions/codex.jsonl"),
     );
     home.put(
         ".copilot/session-state/copilot-session/events.jsonl",
-        &fixture_str("test_conversation_copilot.jsonl"),
+        &fixture_str("sessions/copilot.jsonl"),
     );
     home.put_gemini_session(
         "project-hash",
         "chat.jsonl",
-        &fixture_str("test_conversation_gemini.jsonl"),
+        &fixture_str("sessions/gemini.jsonl"),
     );
     home.put_grok_fixture_session("workspace", "grok-session");
     seed_opencode_usage_db(&home.paths.opencode_db);
@@ -265,12 +265,12 @@ fn usage_cache_preserves_entries_after_partial_directory_discovery() {
     home.put_claude_session(
         "visible",
         "session.jsonl",
-        &fixture_str("test_conversation_claude_code.jsonl"),
+        &fixture_str("sessions/claude_code.jsonl"),
     );
     let hidden_source = home.put_claude_session(
         "hidden",
         "session.jsonl",
-        &fixture_str("test_conversation_claude_code.jsonl"),
+        &fixture_str("sessions/claude_code.jsonl"),
     );
     let hidden_dir = hidden_source.parent().unwrap();
     let original_permissions = std::fs::metadata(hidden_dir).unwrap().permissions();
@@ -369,7 +369,7 @@ fn incremental_cache_reuses_unchanged_sources_and_tracks_mutations() {
     let source = home.put_claude_session(
         "proj",
         "session.jsonl",
-        &fixture_str("test_conversation_claude_code.jsonl"),
+        &fixture_str("sessions/claude_code.jsonl"),
     );
     let mut cache = SummaryScanCache::new();
 
@@ -387,7 +387,7 @@ fn incremental_cache_reuses_unchanged_sources_and_tracks_mutations() {
         serde_json::to_value(&warm.data.models).unwrap()
     );
 
-    let mut changed = fixture_str("test_conversation_claude_code.jsonl");
+    let mut changed = fixture_str("sessions/claude_code.jsonl");
     changed.push('\n');
     std::fs::write(&source, changed).unwrap();
     get_usage_from_paths_with_cache(&home.paths, TimeRange::All, claude_only(), &mut cache)
@@ -397,7 +397,7 @@ fn incremental_cache_reuses_unchanged_sources_and_tracks_mutations() {
     home.put_claude_session(
         "proj",
         "second.jsonl",
-        &fixture_str("test_conversation_claude_code.jsonl"),
+        &fixture_str("sessions/claude_code.jsonl"),
     );
     get_usage_from_paths_with_cache(&home.paths, TimeRange::All, claude_only(), &mut cache)
         .unwrap();
@@ -481,7 +481,7 @@ fn usage_diagnostics_cover_empty_blank_all_failed_and_partial_scans() {
     failed.put_claude_session(
         "proj",
         "valid.jsonl",
-        &fixture_str("test_conversation_claude_code.jsonl"),
+        &fixture_str("sessions/claude_code.jsonl"),
     );
     let partial =
         get_usage_from_paths_with_diagnostics(&failed.paths, TimeRange::All, claude_only())
@@ -533,7 +533,7 @@ fn usage_database_failures_preserve_all_failed_and_partial_diagnostics() {
     home.put_claude_session(
         "proj",
         "valid.jsonl",
-        &fixture_str("test_conversation_claude_code.jsonl"),
+        &fixture_str("sessions/claude_code.jsonl"),
     );
     let providers = ProvidersConfig {
         opencode: true,
@@ -704,7 +704,7 @@ fn aggregates_claude_session_from_paths() {
     home.put_claude_session(
         "test-project",
         "session.jsonl",
-        &fixture_str("test_conversation_claude_code.jsonl"),
+        &fixture_str("sessions/claude_code.jsonl"),
     );
 
     let data = get_usage_from_paths(&home.paths, TimeRange::All).expect("aggregate claude");
@@ -732,12 +732,12 @@ fn merges_multiple_providers_from_paths() {
     home.put_claude_session(
         "proj",
         "session.jsonl",
-        &fixture_str("test_conversation_claude_code.jsonl"),
+        &fixture_str("sessions/claude_code.jsonl"),
     );
     home.put_gemini_session(
         "proj-hash",
         "chat.jsonl",
-        &fixture_str("test_conversation_gemini.jsonl"),
+        &fixture_str("sessions/gemini.jsonl"),
     );
 
     let data = get_usage_from_paths(&home.paths, TimeRange::All).expect("aggregate multi");
@@ -794,12 +794,12 @@ fn disabled_provider_is_dropped_from_usage_rollup() {
     home.put_claude_session(
         "proj",
         "session.jsonl",
-        &fixture_str("test_conversation_claude_code.jsonl"),
+        &fixture_str("sessions/claude_code.jsonl"),
     );
     home.put_gemini_session(
         "proj-hash",
         "chat.jsonl",
-        &fixture_str("test_conversation_gemini.jsonl"),
+        &fixture_str("sessions/gemini.jsonl"),
     );
 
     // Turn Gemini off in `[providers]`: it must be skipped entirely.

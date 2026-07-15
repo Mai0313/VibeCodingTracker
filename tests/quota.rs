@@ -15,7 +15,7 @@ fn session_fallback_picks_newest_rate_limits() {
     let home = TempHome::new();
     home.put_codex_session(
         "2026/06/09/rollout-2026-06-09T21-00-00-test.jsonl",
-        &fixture_str("codex_session_rate_limits.jsonl"),
+        &fixture_str("quota/codex_session_rate_limits.jsonl"),
     );
 
     let snap = latest_session_rate_limits_in(&home.paths.codex_session_dir)

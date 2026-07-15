@@ -1,7 +1,7 @@
 // Integration tests for analysis functionality.
 //
-// Single-file parsing reads the in-repo `examples/` fixtures via
-// `common::fixture` (an absolute, machine-stable path). Batch aggregation drives
+// Single-file parsing reads the in-repo fixtures via `common::fixture` (an
+// absolute, machine-stable path). Batch aggregation drives
 // `aggregate_sessions_by_model_from_paths` against a `TempHome`, so it reads no
 // real machine session directories and mutates no environment.
 
@@ -157,7 +157,7 @@ fn assert_analysis_data_eq(actual: &AnalysisData, expected: &AnalysisData) {
 
 #[test]
 fn test_single_file_analysis_claude() {
-    let analysis = parse_session_file(fixture("test_conversation_claude_code.jsonl"))
+    let analysis = parse_session_file(fixture("sessions/claude_code.jsonl"))
         .expect("should successfully analyze Claude file");
 
     assert!(analysis.is_object(), "Analysis should be a JSON object");
@@ -167,28 +167,28 @@ fn test_single_file_analysis_claude() {
 
 #[test]
 fn test_single_file_analysis_codex() {
-    let analysis = parse_session_file(fixture("test_conversation_codex.jsonl"))
+    let analysis = parse_session_file(fixture("sessions/codex.jsonl"))
         .expect("should successfully analyze Codex file");
     assert_eq!(analysis["extensionName"], "Codex");
 }
 
 #[test]
 fn test_single_file_analysis_copilot() {
-    let analysis = parse_session_file(fixture("test_conversation_copilot.jsonl"))
+    let analysis = parse_session_file(fixture("sessions/copilot.jsonl"))
         .expect("should successfully analyze Copilot file");
     assert_eq!(analysis["extensionName"], "Copilot-CLI");
 }
 
 #[test]
 fn test_single_file_analysis_gemini() {
-    let analysis = parse_session_file(fixture("test_conversation_gemini.jsonl"))
+    let analysis = parse_session_file(fixture("sessions/gemini.jsonl"))
         .expect("should successfully analyze Gemini file");
     assert_eq!(analysis["extensionName"], "Gemini");
 }
 
 #[test]
 fn test_single_file_analysis_grok() {
-    let analysis = parse_session_file(fixture("grok_session/signals.json"))
+    let analysis = parse_session_file(fixture("sessions/grok/signals.json"))
         .expect("should successfully analyze Grok file");
     assert_eq!(analysis["extensionName"], "Grok");
     let record = &analysis["records"][0];
@@ -246,7 +246,7 @@ fn disabled_grok_provider_is_not_scanned_for_analysis() {
 
 #[test]
 fn test_analysis_record_structure() {
-    let analysis = parse_session_file(fixture("test_conversation_claude_code.jsonl")).unwrap();
+    let analysis = parse_session_file(fixture("sessions/claude_code.jsonl")).unwrap();
     let records = &analysis["records"];
     let first_record = records
         .as_array()
@@ -270,7 +270,7 @@ fn test_analysis_record_structure() {
 
 #[test]
 fn test_analysis_conversation_usage() {
-    let analysis = parse_session_file(fixture("test_conversation_claude_code.jsonl")).unwrap();
+    let analysis = parse_session_file(fixture("sessions/claude_code.jsonl")).unwrap();
     let records = &analysis["records"];
     let first_record = records.as_array().and_then(|arr| arr.first()).unwrap();
     let usage = &first_record["conversationUsage"];
@@ -295,7 +295,7 @@ fn test_analysis_conversation_usage() {
 
 #[test]
 fn test_analysis_tool_call_counts() {
-    let analysis = parse_session_file(fixture("test_conversation_claude_code.jsonl")).unwrap();
+    let analysis = parse_session_file(fixture("sessions/claude_code.jsonl")).unwrap();
     let records = &analysis["records"];
     let first_record = records.as_array().and_then(|arr| arr.first()).unwrap();
     let counts = &first_record["toolCallCounts"];
@@ -308,7 +308,7 @@ fn test_analysis_tool_call_counts() {
 
 #[test]
 fn test_analysis_file_operations() {
-    let analysis = parse_session_file(fixture("test_conversation_claude_code.jsonl")).unwrap();
+    let analysis = parse_session_file(fixture("sessions/claude_code.jsonl")).unwrap();
     let records = &analysis["records"];
     let first_record = records.as_array().and_then(|arr| arr.first()).unwrap();
 
@@ -336,12 +336,12 @@ fn disabled_provider_is_dropped_from_analysis_rollup() {
     home.put_claude_session(
         "proj",
         "session.jsonl",
-        &fixture_str("test_conversation_claude_code.jsonl"),
+        &fixture_str("sessions/claude_code.jsonl"),
     );
     home.put_gemini_session(
         "proj-hash",
         "chat.jsonl",
-        &fixture_str("test_conversation_gemini.jsonl"),
+        &fixture_str("sessions/gemini.jsonl"),
     );
     // Turn Gemini off in `[providers]`: it must be skipped entirely.
     let providers = ProvidersConfig {
@@ -370,12 +370,12 @@ fn batch_analysis_from_paths_groups_by_model() {
     home.put_claude_session(
         "proj",
         "session.jsonl",
-        &fixture_str("test_conversation_claude_code.jsonl"),
+        &fixture_str("sessions/claude_code.jsonl"),
     );
     home.put_gemini_session(
         "proj-hash",
         "chat.jsonl",
-        &fixture_str("test_conversation_gemini.jsonl"),
+        &fixture_str("sessions/gemini.jsonl"),
     );
 
     let data = aggregate_sessions_by_model_from_paths(&home.paths, TimeRange::All)
@@ -429,20 +429,20 @@ fn cached_analysis_matches_uncached_and_reuses_unchanged_sources() {
     home.put_claude_session(
         "proj",
         "session.jsonl",
-        &fixture_str("test_conversation_claude_code.jsonl"),
+        &fixture_str("sessions/claude_code.jsonl"),
     );
     home.put_codex_session(
         "2026/06/06/rollout.jsonl",
-        &fixture_str("test_conversation_codex.jsonl"),
+        &fixture_str("sessions/codex.jsonl"),
     );
     home.put(
         ".copilot/session-state/copilot-session/events.jsonl",
-        &fixture_str("test_conversation_copilot.jsonl"),
+        &fixture_str("sessions/copilot.jsonl"),
     );
     home.put_gemini_session(
         "proj-hash",
         "chat.jsonl",
-        &fixture_str("test_conversation_gemini.jsonl"),
+        &fixture_str("sessions/gemini.jsonl"),
     );
     home.put_grok_fixture_session("workspace", "grok-session");
     seed_opencode_tie_breaker_db(&home.paths.opencode_db);
@@ -521,12 +521,12 @@ fn analysis_cache_preserves_entries_after_partial_directory_discovery() {
     home.put_claude_session(
         "visible",
         "session.jsonl",
-        &fixture_str("test_conversation_claude_code.jsonl"),
+        &fixture_str("sessions/claude_code.jsonl"),
     );
     let hidden_source = home.put_claude_session(
         "hidden",
         "session.jsonl",
-        &fixture_str("test_conversation_claude_code.jsonl"),
+        &fixture_str("sessions/claude_code.jsonl"),
     );
     let hidden_dir = hidden_source.parent().unwrap();
     let original_permissions = std::fs::metadata(hidden_dir).unwrap().permissions();
@@ -719,20 +719,20 @@ fn canonical_dataset_serializes_as_full_code_analysis_objects_in_provider_order(
     home.put_claude_session(
         "proj",
         "session.jsonl",
-        &fixture_str("test_conversation_claude_code.jsonl"),
+        &fixture_str("sessions/claude_code.jsonl"),
     );
     home.put_codex_session(
         "2026/04/23/rollout.jsonl",
-        &fixture_str("test_conversation_codex.jsonl"),
+        &fixture_str("sessions/codex.jsonl"),
     );
     home.put(
         ".copilot/session-state/test-session/events.jsonl",
-        &fixture_str("test_conversation_copilot.jsonl"),
+        &fixture_str("sessions/copilot.jsonl"),
     );
     home.put_gemini_session(
         "proj-hash",
         "chat.jsonl",
-        &fixture_str("test_conversation_gemini.jsonl"),
+        &fixture_str("sessions/gemini.jsonl"),
     );
     home.put_grok_fixture_session("workspace", "grok-session");
 
@@ -801,7 +801,7 @@ fn canonical_dataset_serializes_as_full_code_analysis_objects_in_provider_order(
 #[test]
 fn conversation_usage_keys_have_a_stable_serialization_order() {
     let mut first = parse_session_file_as(
-        fixture("test_conversation_claude_code.jsonl"),
+        fixture("sessions/claude_code.jsonl"),
         ExtensionType::ClaudeCode,
         ParseMode::Full,
     )
@@ -880,14 +880,11 @@ fn opencode_sessions_use_stable_source_identity_for_ties() {
 #[test]
 fn full_and_usage_only_modes_have_identical_scalar_analysis() {
     let fixtures = [
-        (
-            "test_conversation_claude_code.jsonl",
-            ExtensionType::ClaudeCode,
-        ),
-        ("test_conversation_codex.jsonl", ExtensionType::Codex),
-        ("test_conversation_copilot.jsonl", ExtensionType::Copilot),
-        ("test_conversation_gemini.jsonl", ExtensionType::Gemini),
-        ("grok_session/signals.json", ExtensionType::Grok),
+        ("sessions/claude_code.jsonl", ExtensionType::ClaudeCode),
+        ("sessions/codex.jsonl", ExtensionType::Codex),
+        ("sessions/copilot.jsonl", ExtensionType::Copilot),
+        ("sessions/gemini.jsonl", ExtensionType::Gemini),
+        ("sessions/grok/signals.json", ExtensionType::Grok),
     ];
 
     for (name, provider) in fixtures {
@@ -955,7 +952,7 @@ fn full_and_usage_only_modes_have_identical_scalar_analysis() {
 #[test]
 fn single_code_analysis_uses_the_batch_projection() {
     let analysis = parse_session_file_as(
-        fixture("test_conversation_claude_code.jsonl"),
+        fixture("sessions/claude_code.jsonl"),
         ExtensionType::ClaudeCode,
         ParseMode::Full,
     )
@@ -1322,7 +1319,7 @@ fn streaming_aggregation_retains_partial_failure_diagnostics() {
     home.put_claude_session(
         "proj",
         "valid.jsonl",
-        &fixture_str("test_conversation_claude_code.jsonl"),
+        &fixture_str("sessions/claude_code.jsonl"),
     );
     std::fs::create_dir_all(home.paths.opencode_db.parent().unwrap()).unwrap();
     std::fs::write(&home.paths.opencode_db, "not a SQLite database").unwrap();

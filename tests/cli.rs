@@ -110,11 +110,11 @@ fn test_version_command_text() {
 fn analysis_file_json_matches_typed_parser_for_every_file_provider() {
     let home = TempHome::new();
     for fixture_name in [
-        "test_conversation_claude_code.jsonl",
-        "test_conversation_codex.jsonl",
-        "test_conversation_copilot.jsonl",
-        "test_conversation_gemini.jsonl",
-        "grok_session/signals.json",
+        "sessions/claude_code.jsonl",
+        "sessions/codex.jsonl",
+        "sessions/copilot.jsonl",
+        "sessions/gemini.jsonl",
+        "sessions/grok/signals.json",
     ] {
         let path = fixture(fixture_name);
         let expected = serde_json::to_value(parse_session_file_typed(&path).unwrap()).unwrap();
@@ -151,7 +151,7 @@ fn analysis_file_json_matches_typed_parser_for_every_file_provider() {
 
 #[test]
 fn analysis_legacy_path_and_output_flags_are_rejected() {
-    let path = fixture("test_conversation_claude_code.jsonl");
+    let path = fixture("sessions/claude_code.jsonl");
 
     for flag in ["--path", "-p"] {
         Command::cargo_bin("vibe_coding_tracker")
@@ -294,11 +294,7 @@ fn test_cli_handles_unicode_paths() {
     let home = TempHome::new();
     let temp_dir = tempfile::TempDir::new().unwrap();
     let unicode_path = temp_dir.path().join("測試_test_файл.jsonl");
-    std::fs::copy(
-        fixture("test_conversation_claude_code.jsonl"),
-        &unicode_path,
-    )
-    .unwrap();
+    std::fs::copy(fixture("sessions/claude_code.jsonl"), &unicode_path).unwrap();
 
     child_cmd(&home)
         .arg("analysis")
@@ -312,7 +308,7 @@ fn test_cli_handles_spaces_in_paths() {
     let home = TempHome::new();
     let temp_dir = tempfile::TempDir::new().unwrap();
     let space_path = temp_dir.path().join("file with spaces.jsonl");
-    std::fs::copy(fixture("test_conversation_claude_code.jsonl"), &space_path).unwrap();
+    std::fs::copy(fixture("sessions/claude_code.jsonl"), &space_path).unwrap();
 
     child_cmd(&home)
         .arg("analysis")
@@ -415,7 +411,7 @@ fn test_usage_multiple_output_formats() {
 
 #[test]
 fn test_analysis_multiple_output_formats() {
-    let path = fixture("test_conversation_claude_code.jsonl");
+    let path = fixture("sessions/claude_code.jsonl");
     for combo in [
         ["--json", "--text"],
         ["--json", "--table"],
@@ -434,7 +430,7 @@ fn test_analysis_multiple_output_formats() {
 
 #[test]
 fn analysis_file_rejects_period_flags() {
-    let path = fixture("test_conversation_claude_code.jsonl");
+    let path = fixture("sessions/claude_code.jsonl");
 
     for period in ["--daily", "--weekly", "--monthly", "--all", "-a"] {
         Command::cargo_bin("vibe_coding_tracker")
@@ -451,7 +447,7 @@ fn analysis_file_rejects_period_flags() {
 #[test]
 fn analysis_file_text_and_table_use_the_canonical_parse() {
     let home = TempHome::new();
-    let path = fixture("test_conversation_claude_code.jsonl");
+    let path = fixture("sessions/claude_code.jsonl");
 
     child_cmd(&home)
         .arg("analysis")
@@ -475,11 +471,11 @@ fn analysis_file_text_and_table_use_the_canonical_parse() {
 #[test]
 fn single_file_summary_projection_is_parse_mode_invariant() {
     for fixture_name in [
-        "test_conversation_claude_code.jsonl",
-        "test_conversation_codex.jsonl",
-        "test_conversation_copilot.jsonl",
-        "test_conversation_gemini.jsonl",
-        "grok_session/signals.json",
+        "sessions/claude_code.jsonl",
+        "sessions/codex.jsonl",
+        "sessions/copilot.jsonl",
+        "sessions/gemini.jsonl",
+        "sessions/grok/signals.json",
     ] {
         let path = fixture(fixture_name);
         let full = parse_session_file_typed_with_mode(&path, ParseMode::Full).unwrap();
@@ -565,7 +561,7 @@ fn usage_json_smoke_prices_seeded_session() {
     home.put_claude_session(
         "proj",
         "session.jsonl",
-        &common::fixture_str("test_conversation_claude_code.jsonl"),
+        &common::fixture_str("sessions/claude_code.jsonl"),
     );
     home.seed_pricing_cache(&pricing_seed());
 
@@ -610,7 +606,7 @@ fn usage_text_and_table_smoke() {
     home.put_claude_session(
         "proj",
         "session.jsonl",
-        &common::fixture_str("test_conversation_claude_code.jsonl"),
+        &common::fixture_str("sessions/claude_code.jsonl"),
     );
     home.seed_pricing_cache(&pricing_seed());
 
@@ -639,7 +635,7 @@ fn analysis_batch_json_smoke() {
     home.put_claude_session(
         "proj",
         "session.jsonl",
-        &common::fixture_str("test_conversation_claude_code.jsonl"),
+        &common::fixture_str("sessions/claude_code.jsonl"),
     );
 
     let output = child_cmd(&home)
@@ -688,7 +684,7 @@ fn analysis_batch_text_and_table_smoke() {
     home.put_claude_session(
         "proj",
         "session.jsonl",
-        &common::fixture_str("test_conversation_claude_code.jsonl"),
+        &common::fixture_str("sessions/claude_code.jsonl"),
     );
     for format in ["--text", "--table"] {
         child_cmd(&home)
@@ -743,7 +739,7 @@ fn analysis_noninteractive_formats_warn_and_keep_partial_results() {
         home.put_claude_session(
             "valid",
             "valid.jsonl",
-            &common::fixture_str("test_conversation_claude_code.jsonl"),
+            &common::fixture_str("sessions/claude_code.jsonl"),
         );
         home.put_claude_session("broken", "broken.jsonl", "{not json\n");
 
@@ -791,7 +787,7 @@ fn analysis_file_does_not_create_config() {
     let home = TempHome::new();
     child_cmd(&home)
         .arg("analysis")
-        .arg(fixture("test_conversation_claude_code.jsonl"))
+        .arg(fixture("sessions/claude_code.jsonl"))
         .assert()
         .success();
     assert!(

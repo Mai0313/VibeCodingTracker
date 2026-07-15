@@ -15,17 +15,21 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use vibe_coding_tracker::utils::{HelperPaths, resolve_paths_from_home};
 
-/// Absolute path to a file under the repo's `examples/` directory.
+/// Absolute path to a file under the repo's `tests/fixtures/` directory.
+///
+/// `name` is relative to that root, so it carries the category segment:
+/// `sessions/claude_code.jsonl`, `quota/wham_usage_response.json`.
 ///
 /// Uses `CARGO_MANIFEST_DIR` so it resolves the same on any machine and
 /// regardless of the test's working directory.
 pub fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("examples")
+        .join("tests")
+        .join("fixtures")
         .join(name)
 }
 
-/// Reads a fixture file under `examples/` to a `String`.
+/// Reads a fixture file under `tests/fixtures/` to a `String`.
 pub fn fixture_str(name: &str) -> String {
     std::fs::read_to_string(fixture(name))
         .unwrap_or_else(|e| panic!("failed to read fixture {name}: {e}"))
@@ -133,16 +137,16 @@ impl TempHome {
         let signals = self.put_grok_session(
             workspace,
             session,
-            &fixture_str("grok_session/signals.json"),
+            &fixture_str("sessions/grok/signals.json"),
         );
         let dir = signals.parent().expect("Grok fixture session directory");
         Self::write_file(
             &dir.join("summary.json"),
-            &fixture_str("grok_session/summary.json"),
+            &fixture_str("sessions/grok/summary.json"),
         );
         Self::write_file(
             &dir.join("updates.jsonl"),
-            &fixture_str("grok_session/updates.jsonl"),
+            &fixture_str("sessions/grok/updates.jsonl"),
         );
         signals
     }

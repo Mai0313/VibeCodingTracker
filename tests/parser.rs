@@ -1,14 +1,16 @@
 // Integration tests to verify parser output matches expected results
 //
-// This test compares the actual analysis output with expected results from example files,
+// This test compares the actual analysis output with the golden results,
 // while ignoring certain fields that can vary between environments:
 // - insightsVersion: may differ based on build
 // - machineId: machine-specific identifier
 // - user: username may differ
 // - gitRemoteUrl: git remote URL may differ
 
+mod common;
+
+use common::fixture;
 use serde_json::Value;
-use std::path::PathBuf;
 use vibe_coding_tracker::session::parser::parse_session_file;
 
 /// Compare two JSON values while ignoring specific fields
@@ -86,8 +88,8 @@ fn compare_json_ignore_fields(actual: &Value, expected: &Value, ignore_fields: &
 
 #[test]
 fn test_claude_code_parser() {
-    let input_file = PathBuf::from("examples/test_conversation_claude_code.jsonl");
-    let expected_file = PathBuf::from("examples/analysis_result_claude_code.json");
+    let input_file = fixture("sessions/claude_code.jsonl");
+    let expected_file = fixture("sessions/claude_code.expected.json");
 
     // Skip test if files don't exist
     if !input_file.exists() {
@@ -144,8 +146,8 @@ fn test_claude_code_parser() {
 
 #[test]
 fn test_codex_parser() {
-    let input_file = PathBuf::from("examples/test_conversation_codex.jsonl");
-    let expected_file = PathBuf::from("examples/analysis_result_codex.json");
+    let input_file = fixture("sessions/codex.jsonl");
+    let expected_file = fixture("sessions/codex.expected.json");
 
     // Skip test if files don't exist
     if !input_file.exists() {
@@ -202,8 +204,8 @@ fn test_codex_parser() {
 
 #[test]
 fn test_copilot_parser() {
-    let input_file = PathBuf::from("examples/test_conversation_copilot.jsonl");
-    let expected_file = PathBuf::from("examples/analysis_result_copilot.json");
+    let input_file = fixture("sessions/copilot.jsonl");
+    let expected_file = fixture("sessions/copilot.expected.json");
 
     // Skip test if files don't exist
     if !input_file.exists() {
@@ -260,8 +262,8 @@ fn test_copilot_parser() {
 
 #[test]
 fn test_gemini_parser() {
-    let input_file = PathBuf::from("examples/test_conversation_gemini.jsonl");
-    let expected_file = PathBuf::from("examples/analysis_result_gemini.json");
+    let input_file = fixture("sessions/gemini.jsonl");
+    let expected_file = fixture("sessions/gemini.expected.json");
 
     // Skip test if files don't exist
     if !input_file.exists() {
@@ -328,8 +330,8 @@ fn test_gemini_parser() {
 
 #[test]
 fn test_grok_parser() {
-    let input_file = PathBuf::from("examples/grok_session/signals.json");
-    let expected_file = PathBuf::from("examples/analysis_result_grok.json");
+    let input_file = fixture("sessions/grok/signals.json");
+    let expected_file = fixture("sessions/grok.expected.json");
     let expected_json: Value = serde_json::from_str(
         &std::fs::read_to_string(&expected_file).expect("Failed to read Grok golden result"),
     )
