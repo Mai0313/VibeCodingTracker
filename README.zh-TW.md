@@ -342,7 +342,7 @@ Grok 的 `usage` 是單一當下的本地 context 估算：vct 會把 `signals.j
 | `--json`                                       | 完整 parser 結果. 搭配 `<FILE>` 時為單一 object, 否則為 object 陣列          |
 | `--daily` / `--weekly` / `--monthly` / `--all` | 所有 session 的時間範圍篩選. 不可與 `<FILE>` 同時使用, 其他說明見上方表格    |
 
-請參考 [`examples/`](examples/) 目錄，裡面有四種 JSONL provider 的範例輸入與對應的 JSON 輸出，以及 [`examples/grok_session/`](examples/grok_session/) 下的 Grok session fixture。
+請參考 [`tests/fixtures/sessions/`](tests/fixtures/sessions/) 目錄，裡面有四種 JSONL provider 的範例輸入與對應的 JSON 輸出，以及 [`tests/fixtures/sessions/grok/`](tests/fixtures/sessions/grok/) 下的 Grok session fixture。
 
 ### 基本用法
 
@@ -400,7 +400,7 @@ vct analysis --json --daily > today.json
 
 ### 預覽：表格與 JSON（`vct analysis`）
 
-`--table` 會顯示各 model 的明細, 並附上各 provider 的摘要, 包含 Active Days 欄位. `--text` 與 `--table` 都是相同 normalized parser records 的精簡 projection. `--json` 會保留完整 records, 包括每次操作的 details 與 token usage. 未提供 `<FILE>` 時, 外層陣列中的每個元素都是一個 session 的 `CodeAnalysis` object. 提供 `<FILE>` 時, stdout 只會輸出該 object, shape 與 [`examples/`](examples/) 中對應的結果相同.
+`--table` 會顯示各 model 的明細, 並附上各 provider 的摘要, 包含 Active Days 欄位. `--text` 與 `--table` 都是相同 normalized parser records 的精簡 projection. `--json` 會保留完整 records, 包括每次操作的 details 與 token usage. 未提供 `<FILE>` 時, 外層陣列中的每個元素都是一個 session 的 `CodeAnalysis` object. 提供 `<FILE>` 時, stdout 只會輸出該 object, shape 與 [`tests/fixtures/sessions/`](tests/fixtures/sessions/) 中對應的結果相同.
 
 ```text
 Analysis Statistics

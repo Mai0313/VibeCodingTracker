@@ -176,7 +176,7 @@ impl AnalysisCollectionDiagnostics {
 /// The in-memory entries retain provider and date provenance. Serialization is
 /// deliberately transparent: the JSON value is an array of [`CodeAnalysis`]
 /// objects, so every element has exactly the same schema as a single-file
-/// golden result under `examples/`.
+/// golden result.
 #[derive(Debug, Clone, Default)]
 pub struct AnalysisDataset {
     /// Sessions in deterministic provider and source order.

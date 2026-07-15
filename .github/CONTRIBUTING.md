@@ -76,7 +76,7 @@ Unsure where to begin contributing? You can start by looking through `good first
 ├── benches/          # Criterion benchmarks (pricing, parsing, aggregation)
 ├── cli/              # npm and PyPI wrapper packages (nodejs/, python/)
 ├── docker/           # Multi-stage Dockerfile (rust:1.96.1-bookworm builder → ubuntu:26.04 prod)
-├── examples/         # Sample session files and golden analysis outputs, plus the Grok session fixture
+├── docs/             # Reference docs (raw quota + token-refresh curl/jq recipes)
 ├── src/
 │   ├── analysis/     # Collect canonical AnalysisDataset records and project per-model summaries
 │   ├── cache/        # Library-facing LRU file-parse compatibility API
@@ -91,6 +91,7 @@ Unsure where to begin contributing? You can start by looking through `good first
 │   ├── usage/        # Roll up parsed CodeAnalysis records into per-model token totals + per-provider days
 │   └── utils/        # Path resolution, directory walking, allocator tuning, time helpers
 └── tests/            # Integration test suite (one binary per file; unit tests live inline in src/)
+    └── fixtures/     # Session inputs + golden outputs (sessions/), quota API responses (quota/)
 ```
 
 #### Building from Source

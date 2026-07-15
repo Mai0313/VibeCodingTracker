@@ -3,9 +3,9 @@
 //! These structs are the analyzer's output shape: every provider parser in
 //! `src/session/` produces a [`CodeAnalysis`] regardless of the source
 //! assistant, and the `analysis` / `usage` roll-up layers consume them. The
-//! `serde` attributes here also define the JSON layout of the golden fixtures
-//! under `examples/`, `vct analysis FILE`, and each element of the batch
-//! `vct analysis --json` array.
+//! `serde` attributes here also define the JSON layout of the golden fixtures,
+//! `vct analysis FILE`, and each element of the batch `vct analysis --json`
+//! array.
 
 use crate::constants::FastHashMap;
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeMap};

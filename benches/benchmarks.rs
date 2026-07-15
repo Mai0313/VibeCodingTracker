@@ -1,7 +1,7 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use ratatui::{Terminal, backend::TestBackend};
 use std::hint::black_box;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use vibe_coding_tracker::cli::TimeRange;
@@ -17,6 +17,14 @@ use vibe_coding_tracker::session::{
 use vibe_coding_tracker::summary_cache::{SummaryScanCache, build_scan_pool};
 use vibe_coding_tracker::usage::calculator::get_usage_from_paths_with_cache;
 use vibe_coding_tracker::utils::{HelperPaths, resolve_paths_from_home};
+
+/// Absolute path to a file under the repo's `tests/fixtures/` directory.
+fn fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join(name)
+}
 
 // ========== Pricing & String Operations ==========
 
@@ -98,15 +106,15 @@ fn benchmark_file_parsing(c: &mut Criterion) {
 
     // Test files paths
     let test_files = vec![
-        ("claude", "examples/test_conversation_claude_code.jsonl"),
-        ("codex", "examples/test_conversation_codex.jsonl"),
-        ("copilot", "examples/test_conversation_copilot.jsonl"),
-        ("gemini", "examples/test_conversation_gemini.jsonl"),
-        ("grok", "examples/grok_session/signals.json"),
+        ("claude", "sessions/claude_code.jsonl"),
+        ("codex", "sessions/codex.jsonl"),
+        ("copilot", "sessions/copilot.jsonl"),
+        ("gemini", "sessions/gemini.jsonl"),
+        ("grok", "sessions/grok/signals.json"),
     ];
 
     for (name, path) in test_files {
-        let path_buf = PathBuf::from(path);
+        let path_buf = fixture(path);
         if path_buf.exists() {
             group.bench_with_input(
                 BenchmarkId::new("parse_session_file", name),
@@ -124,33 +132,17 @@ fn benchmark_known_provider_parsing(c: &mut Criterion) {
     let fixtures = [
         (
             "claude",
-            "examples/test_conversation_claude_code.jsonl",
+            "sessions/claude_code.jsonl",
             ExtensionType::ClaudeCode,
         ),
-        (
-            "codex",
-            "examples/test_conversation_codex.jsonl",
-            ExtensionType::Codex,
-        ),
-        (
-            "copilot",
-            "examples/test_conversation_copilot.jsonl",
-            ExtensionType::Copilot,
-        ),
-        (
-            "gemini",
-            "examples/test_conversation_gemini.jsonl",
-            ExtensionType::Gemini,
-        ),
-        (
-            "grok",
-            "examples/grok_session/signals.json",
-            ExtensionType::Grok,
-        ),
+        ("codex", "sessions/codex.jsonl", ExtensionType::Codex),
+        ("copilot", "sessions/copilot.jsonl", ExtensionType::Copilot),
+        ("gemini", "sessions/gemini.jsonl", ExtensionType::Gemini),
+        ("grok", "sessions/grok/signals.json", ExtensionType::Grok),
     ];
 
     for (name, path, provider) in fixtures {
-        let path = PathBuf::from(path);
+        let path = fixture(path);
         if !path.exists() {
             continue;
         }
@@ -232,7 +224,7 @@ fn run_cached_scan(pool: &rayon::ThreadPool, paths: &HelperPaths, cache: &mut Su
 }
 
 fn benchmark_summary_scan_cache(c: &mut Criterion) {
-    let fixture = std::fs::read_to_string("examples/test_conversation_claude_code.jsonl")
+    let fixture = std::fs::read_to_string(fixture("sessions/claude_code.jsonl"))
         .expect("read scan benchmark fixture");
     let (_small_temp, small_paths, changed_path) = build_scan_corpus(100, &fixture);
     let (_large_temp, large_paths, _) = build_scan_corpus(1_000, &fixture);
@@ -332,10 +324,9 @@ fn benchmark_format_detection(c: &mut Criterion) {
 // ========== Cache Performance Benchmarks ==========
 
 fn benchmark_cache_operations(c: &mut Criterion) {
-    use std::path::PathBuf;
     use vibe_coding_tracker::cache::global_cache;
 
-    let test_path = PathBuf::from("examples/test_conversation_claude_code.jsonl");
+    let test_path = fixture("sessions/claude_code.jsonl");
 
     if !test_path.exists() {
         return;
@@ -454,14 +445,12 @@ fn benchmark_usage_aggregation(c: &mut Criterion) {
 // ========== Batch Analysis Benchmarks ==========
 
 fn benchmark_batch_analysis(c: &mut Criterion) {
-    use std::path::PathBuf;
-
-    // Only run if example files exist
-    let claude_path = PathBuf::from("examples/test_conversation_claude_code.jsonl");
-    let codex_path = PathBuf::from("examples/test_conversation_codex.jsonl");
-    let copilot_path = PathBuf::from("examples/test_conversation_copilot.jsonl");
-    let gemini_path = PathBuf::from("examples/test_conversation_gemini.jsonl");
-    let grok_path = PathBuf::from("examples/grok_session/signals.json");
+    // Only run if fixture files exist
+    let claude_path = fixture("sessions/claude_code.jsonl");
+    let codex_path = fixture("sessions/codex.jsonl");
+    let copilot_path = fixture("sessions/copilot.jsonl");
+    let gemini_path = fixture("sessions/gemini.jsonl");
+    let grok_path = fixture("sessions/grok/signals.json");
 
     if !claude_path.exists()
         || !codex_path.exists()

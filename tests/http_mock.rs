@@ -24,7 +24,7 @@ fn call_wham_maps_200_response() {
         when.method(GET).path("/wham");
         then.status(200)
             .header("content-type", "application/json")
-            .body(fixture_str("wham_usage_response.json"));
+            .body(fixture_str("quota/wham_usage_response.json"));
     });
     let client = build_client().unwrap();
 
@@ -80,7 +80,7 @@ fn call_wham_with_reset_credits_maps_details() {
         when.method(GET).path("/wham");
         then.status(200)
             .header("content-type", "application/json")
-            .body(fixture_str("wham_usage_response.json"));
+            .body(fixture_str("quota/wham_usage_response.json"));
     });
     let details = server.mock(|when, then| {
         when.method(GET)
@@ -90,7 +90,9 @@ fn call_wham_with_reset_credits_maps_details() {
             .header("originator", "codex_cli_rs");
         then.status(200)
             .header("content-type", "application/json")
-            .body(fixture_str("wham_rate_limit_reset_credits_response.json"));
+            .body(fixture_str(
+                "quota/wham_rate_limit_reset_credits_response.json",
+            ));
     });
     let client = build_client().unwrap();
 
@@ -123,7 +125,7 @@ fn reset_credit_details_failure_preserves_usage_summary() {
     server.mock(|when, then| {
         when.method(GET).path("/wham");
         then.status(200)
-            .body(fixture_str("wham_usage_response.json"));
+            .body(fixture_str("quota/wham_usage_response.json"));
     });
     server.mock(|when, then| {
         when.method(GET).path("/reset-credits");

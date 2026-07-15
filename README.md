@@ -342,7 +342,7 @@ A panel appears only for a provider whose credentials are present. When four pan
 | `--json`                                       | Complete parser results as JSON: one object for `<FILE>`, otherwise an array of objects  |
 | `--daily` / `--weekly` / `--monthly` / `--all` | Time range filter for all-session analysis (see table above; not accepted with `<FILE>`) |
 
-See [`examples/`](examples/) for sample inputs and matching JSON outputs for the four JSONL providers, plus the Grok session fixture under [`examples/grok_session/`](examples/grok_session/).
+See [`tests/fixtures/sessions/`](tests/fixtures/sessions/) for sample inputs and matching JSON outputs for the four JSONL providers, plus the Grok session fixture under [`tests/fixtures/sessions/grok/`](tests/fixtures/sessions/grok/).
 
 ### Basic Usage
 
@@ -400,7 +400,7 @@ vct analysis --json --daily > today.json
 
 ### Preview: Table & JSON (`vct analysis`)
 
-`--table` renders the per-model breakdown plus a per-provider summary (with an Active Days column). `--text` and `--table` are compact projections of the same normalized parser records. `--json` keeps the complete records, including per-operation details and token usage. With no `<FILE>`, the outer array contains one `CodeAnalysis` object per session; with `<FILE>`, stdout is that single object and matches the corresponding shape under [`examples/`](examples/).
+`--table` renders the per-model breakdown plus a per-provider summary (with an Active Days column). `--text` and `--table` are compact projections of the same normalized parser records. `--json` keeps the complete records, including per-operation details and token usage. With no `<FILE>`, the outer array contains one `CodeAnalysis` object per session; with `<FILE>`, stdout is that single object and matches the corresponding shape under [`tests/fixtures/sessions/`](tests/fixtures/sessions/).
 
 ```text
 Analysis Statistics

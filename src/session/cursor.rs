@@ -13,7 +13,7 @@
 //!
 //! Cursor does **not** persist real billing tokens locally (only the context
 //! gauge), so the `usage` view is a deliberately-rough **local estimate** from
-//! that gauge (there is no dashboard-API path here; see `examples/quota.md` for
+//! that gauge (there is no dashboard-API path here; see `docs/quota.md` for
 //! the raw endpoint if it is ever reintroduced), keeping Cursor consistent with
 //! the other providers whose `usage` is likewise computed from local session
 //! data.

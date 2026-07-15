@@ -461,7 +461,7 @@ mod tests {
     use super::*;
 
     const RESET_CREDITS_SAMPLE: &str =
-        include_str!("../../examples/wham_rate_limit_reset_credits_response.json");
+        include_str!("../../tests/fixtures/quota/wham_rate_limit_reset_credits_response.json");
     const SAMPLE: &str = r#"{
       "plan_type": "plus",
       "rate_limit": {
