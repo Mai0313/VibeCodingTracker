@@ -20,7 +20,7 @@ use crate::display::common::tui::{
 };
 use crate::display::usage::averages::{
     ProviderStats, UsageProviderTotals, UsageRow, UsageTotals, build_provider_total_rows,
-    build_usage_summary, merge_rows_by_base_model,
+    build_usage_summary_from_data, merge_rows_by_base_model,
 };
 use crate::models::{
     ClaudeQuotaSnapshot, CodexQuotaSnapshot, CopilotQuotaSnapshot, CursorQuotaSnapshot,
@@ -503,13 +503,7 @@ pub fn display_usage_interactive_with_pool(
                     );
                 }
 
-                let mut summary = build_usage_summary(
-                    &collection.data.models,
-                    &collection.data.per_provider,
-                    &collection.data.provider_days,
-                    &pricing,
-                    &collection.data.stored_costs,
-                );
+                let mut summary = build_usage_summary_from_data(&collection.data, &pricing);
                 summary.rows.retain(|row| row.total != 0 || row.cost != 0.0);
                 let merged_rows = merge_rows_by_base_model(&summary.rows);
                 Ok(UsageRefreshPayload {
@@ -706,7 +700,7 @@ fn current_view<'a>(
 }
 
 /// The change-highlight fingerprint of a row: the token buckets only (never
-/// cost, so a fuzzy-price shift can't flicker a row).
+/// cost, so a pricing-data refresh can't flicker a row).
 ///
 /// Reasoning is folded into the second field so a Gemini session whose only
 /// delta lands in `thoughts_tokens` still registers as a change. When merging is

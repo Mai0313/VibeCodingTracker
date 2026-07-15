@@ -8,12 +8,12 @@
         "claude-sonnet-4-20250514": {
           "cache_creation": {
             "ephemeral_1h_input_tokens": 0,
-            "ephemeral_5m_input_tokens": 124169
+            "ephemeral_5m_input_tokens": 99004
           },
-          "cache_creation_input_tokens": 124169,
-          "cache_read_input_tokens": 1298818,
-          "input_tokens": 252,
-          "output_tokens": 3921,
+          "cache_creation_input_tokens": 99004,
+          "cache_read_input_tokens": 1093509,
+          "input_tokens": 158,
+          "output_tokens": 3860,
           "service_tier": "standard"
         }
       },
@@ -58,7 +58,7 @@
           "description": "删除TODO.md文件",
           "filePath": "/home/wei/repo/claude-code",
           "lineCount": 0,
-          "timestamp": 1756386131354
+          "timestamp": 1756386138094
         }
       ],
       "taskId": "b162b1ae-97bc-475f-9b5f-ffbf55ca5b3f",

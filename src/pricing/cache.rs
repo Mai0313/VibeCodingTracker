@@ -18,9 +18,8 @@ use std::path::Path;
 /// prompt crosses a size threshold.
 ///
 /// `cache_creation_input_token_cost_above_1hr` is the price for cache writes
-/// with Anthropic's extended (1 hour) TTL. A value of `0.0` means the model
-/// doesn't offer 1hr cached writes at this tier — callers should fall back to
-/// the 5-minute (`cache_creation_input_token_cost`) price.
+/// with Anthropic's extended (1 hour) TTL. A value of `0.0` means that no 1hr
+/// price is available for this tier, so callers must leave that cost unresolved.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct ThresholdTier {
     /// Total input context (in tokens) above which this tier's prices take over.
@@ -37,7 +36,7 @@ pub struct ThresholdTier {
     /// Cache-write (5-minute TTL) price in USD per token at this tier.
     #[serde(default)]
     pub cache_creation_input_token_cost: f64,
-    /// Cache-write (1-hour TTL) price in USD per token; `0.0` falls back to the 5-minute rate.
+    /// Cache-write (1-hour TTL) price in USD per token; `0.0` means unavailable.
     #[serde(default)]
     pub cache_creation_input_token_cost_above_1hr: f64,
 }
@@ -100,8 +99,7 @@ pub struct ModelPricing {
     pub cache_creation_input_token_cost: f64,
 
     /// Price per token for cache writes using Anthropic's extended (1 hour) TTL.
-    /// `0.0` means the model doesn't support 1hr cached writes — callers fall
-    /// back to `cache_creation_input_token_cost` (5-minute TTL price).
+    /// `0.0` means no published 1hr price is available.
     #[serde(default)]
     pub cache_creation_input_token_cost_above_1hr: f64,
 
@@ -122,6 +120,12 @@ pub struct ModelPricing {
     /// publishes no web-search price.
     #[serde(default)]
     pub web_search_cost_per_query: f64,
+
+    /// Provider-reported pricing multipliers such as Anthropic `fast` speed
+    /// and `us` inference residency. Applied only when the response usage
+    /// explicitly reports the matching modifier.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub provider_specific_multipliers: HashMap<String, f64>,
 
     /// Threshold-based tiers, sorted ascending by `threshold_tokens`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -169,7 +173,8 @@ fn parse_tier_range(value: &serde_json::Value) -> Option<TierRange> {
 /// Extracts base prices, consolidates all `*_above_Nk_tokens` fields into
 /// `ThresholdTier` rows keyed by the numeric threshold, and parses
 /// `tiered_pricing` arrays into `TierRange` rows. `cache_creation_input_token_cost_above_1hr`
-/// is captured as a separate 1-hour TTL price (base and per-tier). Unsupported
+/// is captured as a separate 1-hour TTL price (base and per-tier), while
+/// `provider_specific_entry` retains response-selected multipliers. Unsupported
 /// fields (batch / priority / audio / computer_use) are ignored.
 pub fn parse_litellm_entry(value: &serde_json::Value) -> ModelPricing {
     let obj = match value.as_object() {
@@ -206,6 +211,21 @@ pub fn parse_litellm_entry(value: &serde_json::Value) -> ModelPricing {
                     .or_else(|| pick("search_context_size_low"))
                     .or_else(|| pick("search_context_size_high"))
                     .unwrap_or(0.0);
+            }
+            continue;
+        }
+
+        if key == "provider_specific_entry" {
+            if let Some(entries) = raw_val.as_object() {
+                pricing.provider_specific_multipliers = entries
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        value
+                            .as_f64()
+                            .filter(|value| value.is_finite() && *value > 0.0)
+                            .map(|value| (name.to_ascii_lowercase(), value))
+                    })
+                    .collect();
             }
             continue;
         }
@@ -288,12 +308,11 @@ pub fn parse_litellm_entry(value: &serde_json::Value) -> ModelPricing {
             cache_creation_input_token_cost: *tier_cache_creation
                 .get(&th)
                 .unwrap_or(&pricing.cache_creation_input_token_cost),
-            // Intentionally do NOT inherit base 1hr into the tier: if LiteLLM
-            // doesn't publish a tier-specific 1hr price, leaving this at 0 lets
-            // `calculate_cost` fall back to the tier's own 5m rate. Inheriting
-            // base 1hr could produce a tier 1hr price BELOW the tier 5m price
-            // (nonsensical) whenever the 200K tier substantially marks up the
-            // 5m rate but the base 1hr stays at its unmarked level.
+            // Intentionally do NOT inherit base 1hr into the tier. If LiteLLM
+            // doesn't publish a tier-specific 1hr price, the cost must remain
+            // unresolved. Inheriting base 1hr could produce a tier 1hr price
+            // below the tier 5m price whenever the context tier marks up the
+            // 5m rate but the base 1hr price stays unchanged.
             cache_creation_input_token_cost_above_1hr: tier_cache_creation_1hr
                 .get(&th)
                 .copied()
@@ -334,10 +353,9 @@ pub fn parse_litellm_pricing_map(raw: serde_json::Value) -> HashMap<String, Mode
 /// image modalities, reasoning-token splits, …) don't require re-fetching
 /// or a schema migration to gain access to the numbers they need.
 ///
-/// `tiered_pricing` is whitelisted explicitly even though the key name
-/// doesn't contain `cost`: its array values are the **only** source of
-/// range-based pricing (Qwen / doubao / dashscope), so dropping it would
-/// silently zero out those models on every cache reload.
+/// `tiered_pricing` and `provider_specific_entry` are whitelisted explicitly
+/// even though their keys don't contain `cost`. They carry range-based prices
+/// and provider modifiers that would otherwise disappear on cache reload.
 ///
 /// Returns `None` when the entry has no cost-related keys at all; such
 /// models carry nothing we can price against and are skipped at the map
@@ -346,7 +364,7 @@ pub fn filter_cost_fields(value: &Value) -> Option<Value> {
     let obj = value.as_object()?;
     let mut filtered = Map::with_capacity(obj.len());
     for (k, v) in obj {
-        if k.contains("cost") || k == "tiered_pricing" {
+        if k.contains("cost") || k == "tiered_pricing" || k == "provider_specific_entry" {
             filtered.insert(k.clone(), v.clone());
         }
     }
@@ -443,7 +461,7 @@ pub fn load_from_cache_in(dir: &Path) -> Result<HashMap<String, ModelPricing>> {
         anyhow::bail!("cached pricing JSON contains a negative or non-finite price");
     }
     let pricing = normalize_pricing(parsed);
-    if pricing.is_empty() {
+    if !pricing_has_real_price(&pricing) {
         anyhow::bail!("cached pricing JSON has no priced models");
     }
     Ok(pricing)
@@ -453,8 +471,8 @@ pub fn load_from_cache_in(dir: &Path) -> Result<HashMap<String, ModelPricing>> {
 /// `ModelPricing` map?
 ///
 /// The new schema (`build_filtered_cost_json` → `filter_cost_fields`)
-/// only emits keys that either contain `cost` or equal `tiered_pricing`,
-/// so it never produces top-level `tiers` / `ranges` arrays on an
+/// only emits raw pricing keys, so it never produces top-level `tiers` /
+/// `ranges` arrays on an
 /// entry. The old schema (`ModelPricing` via derived `Serialize`) did
 /// emit them whenever a model carried tier or range data. Any entry
 /// with such a key is a definitive signal of the old format.
@@ -462,16 +480,27 @@ fn looks_like_legacy_pricing_cache(raw: &Value) -> bool {
     let Some(obj) = raw.as_object() else {
         return false;
     };
+
     obj.values()
         .filter_map(|v| v.as_object())
         .any(|entry| entry.contains_key("tiers") || entry.contains_key("ranges"))
+}
+
+pub(crate) fn pricing_needs_provider_modifier_refresh(
+    pricing: &HashMap<String, ModelPricing>,
+) -> bool {
+    ["claude-opus-4-7", "claude-opus-4-8"].iter().any(|model| {
+        pricing
+            .get(*model)
+            .is_some_and(|entry| !entry.provider_specific_multipliers.contains_key("fast"))
+    })
 }
 
 /// Saves a raw LiteLLM cost-field subset to today's cache file under an explicit
 /// cache dir and cleans up old caches.
 ///
 /// Callers should pass the output of `build_filtered_cost_json` so the
-/// on-disk payload is a cost-only projection of the upstream LiteLLM JSON
+/// on-disk payload is a pricing-only projection of the upstream LiteLLM JSON
 /// — that keeps the cache file small, diff-able against upstream, and
 /// forward-compatible with calculation strategies that aren't wired up
 /// yet.
@@ -492,51 +521,47 @@ pub fn save_to_cache_in(dir: &Path, filtered_raw: &Value) -> Result<()> {
     Ok(())
 }
 
-/// Filters out models whose every pricing field is zero (unpriced / free) or
-/// whose usable pricing fields contain an invalid rate.
-///
-/// A model is kept if **any** of the following yields a positive price:
-/// - The base-level per-token costs.
-/// - Any tier entry (`ThresholdTier`) with at least one positive field.
-/// - Any range entry (`TierRange`) with at least one positive field.
-///
-/// Models are dropped when every strategy they publish is entirely zero or any
-/// usable rate is negative or non-finite. This preserves synthetic models that
-/// ship tier or range data without base prices while excluding invalid, free,
-/// and placeholder entries from LiteLLM.
+/// Invalid entries are dropped, but valid zero-priced and currently unsupported
+/// entries remain as lookup tombstones. Removing those keys lets a later
+/// substring or fuzzy lookup silently match a different paid model.
 pub fn normalize_pricing(
     mut pricing: HashMap<String, ModelPricing>,
 ) -> HashMap<String, ModelPricing> {
-    pricing.retain(|_name, p| {
-        let has_base = p.input_cost_per_token > 0.0
-            || p.output_cost_per_token > 0.0
-            || p.cache_read_input_token_cost > 0.0
-            || p.cache_creation_input_token_cost > 0.0
-            || p.cache_creation_input_token_cost_above_1hr > 0.0
-            || p.output_cost_per_reasoning_token > 0.0
-            || p.web_search_cost_per_query > 0.0;
-        let has_positive_tier = p.tiers.iter().any(|t| {
+    pricing.retain(|_name, p| model_pricing_rates_are_valid(p));
+    pricing
+}
+
+/// Returns whether at least one entry contains a real positive price.
+///
+/// Zero-priced entries are retained in memory as lookup tombstones, but an
+/// all-zero remote payload must never replace a valid daily cache.
+pub(crate) fn pricing_has_real_price(pricing: &HashMap<String, ModelPricing>) -> bool {
+    pricing.values().any(model_pricing_has_real_price)
+}
+
+fn model_pricing_has_real_price(p: &ModelPricing) -> bool {
+    p.input_cost_per_token > 0.0
+        || p.output_cost_per_token > 0.0
+        || p.cache_read_input_token_cost > 0.0
+        || p.cache_creation_input_token_cost > 0.0
+        || p.cache_creation_input_token_cost_above_1hr > 0.0
+        || p.output_cost_per_reasoning_token > 0.0
+        || p.web_search_cost_per_query > 0.0
+        || p.tiers.iter().any(|t| {
             t.input_cost_per_token > 0.0
                 || t.output_cost_per_token > 0.0
                 || t.cache_read_input_token_cost > 0.0
                 || t.cache_creation_input_token_cost > 0.0
                 || t.cache_creation_input_token_cost_above_1hr > 0.0
-        });
-        let has_positive_range = p
-            .ranges
-            .as_ref()
-            .map(|rs| {
-                rs.iter().any(|r| {
-                    r.input_cost_per_token > 0.0
-                        || r.output_cost_per_token > 0.0
-                        || r.cache_read_input_token_cost > 0.0
-                        || r.output_cost_per_reasoning_token > 0.0
-                })
+        })
+        || p.ranges.as_ref().is_some_and(|ranges| {
+            ranges.iter().any(|r| {
+                r.input_cost_per_token > 0.0
+                    || r.output_cost_per_token > 0.0
+                    || r.cache_read_input_token_cost > 0.0
+                    || r.output_cost_per_reasoning_token > 0.0
             })
-            .unwrap_or(false);
-        model_pricing_rates_are_valid(p) && (has_base || has_positive_tier || has_positive_range)
-    });
-    pricing
+        })
 }
 
 pub(crate) fn pricing_rates_are_valid(pricing: &HashMap<String, ModelPricing>) -> bool {
@@ -552,6 +577,10 @@ fn model_pricing_rates_are_valid(pricing: &ModelPricing) -> bool {
         && valid(pricing.cache_creation_input_token_cost_above_1hr)
         && valid(pricing.output_cost_per_reasoning_token)
         && valid(pricing.web_search_cost_per_query)
+        && pricing
+            .provider_specific_multipliers
+            .values()
+            .all(|multiplier| multiplier.is_finite() && *multiplier > 0.0)
         && pricing.tiers.iter().all(|tier| {
             valid(tier.input_cost_per_token)
                 && valid(tier.output_cost_per_token)
@@ -613,6 +642,63 @@ mod parser_tests {
         let p = parse_litellm_entry(&raw);
         assert_eq!(p.web_search_cost_per_query, 0.01);
         assert_eq!(p.input_cost_per_token, 5e-6);
+    }
+
+    #[test]
+    fn parses_and_filters_provider_specific_multipliers() {
+        let raw = json!({
+            "input_cost_per_token": 5e-6,
+            "provider_specific_entry": {
+                "fast": 2.0,
+                "us": 1.1,
+                "invalid": -1.0,
+                "metadata": "ignored"
+            }
+        });
+        let pricing = parse_litellm_entry(&raw);
+        assert_eq!(
+            pricing.provider_specific_multipliers.get("fast"),
+            Some(&2.0)
+        );
+        assert_eq!(pricing.provider_specific_multipliers.get("us"), Some(&1.1));
+        assert!(
+            !pricing
+                .provider_specific_multipliers
+                .contains_key("invalid")
+        );
+        assert!(
+            !pricing
+                .provider_specific_multipliers
+                .contains_key("metadata")
+        );
+
+        let filtered = filter_cost_fields(&raw).expect("priced entry");
+        assert_eq!(
+            filtered["provider_specific_entry"]["fast"].as_f64(),
+            Some(2.0)
+        );
+    }
+
+    #[test]
+    fn detects_cached_claude_entries_missing_fast_multiplier() {
+        let stale = HashMap::from([(
+            "claude-opus-4-8".to_string(),
+            ModelPricing {
+                input_cost_per_token: 5e-6,
+                ..Default::default()
+            },
+        )]);
+        assert!(pricing_needs_provider_modifier_refresh(&stale));
+
+        let current = HashMap::from([(
+            "claude-opus-4-8".to_string(),
+            ModelPricing {
+                input_cost_per_token: 5e-6,
+                provider_specific_multipliers: HashMap::from([("fast".to_string(), 2.0)]),
+                ..Default::default()
+            },
+        )]);
+        assert!(!pricing_needs_provider_modifier_refresh(&current));
     }
 
     #[test]
@@ -752,7 +838,7 @@ mod parser_tests {
     }
 
     #[test]
-    fn tier_1hr_left_zero_when_missing_so_calculate_cost_can_fall_back() {
+    fn tier_1hr_left_zero_when_missing_so_cost_stays_unresolved() {
         // If LiteLLM publishes a 200K tier but omits the 1hr-tiered field, the
         // parser must NOT inherit base 1hr (that could yield tier_1hr < tier_5m).
         let raw = json!({
@@ -1172,6 +1258,7 @@ mod serialization_tests {
             cache_creation_input_token_cost: 4.0,
             output_cost_per_reasoning_token: 11.0,
             web_search_cost_per_query: 0.01,
+            provider_specific_multipliers: HashMap::from([("fast".to_string(), 2.0)]),
             tiers: vec![ThresholdTier {
                 threshold_tokens: 200_000,
                 input_cost_per_token: 5.0,
@@ -1200,6 +1287,10 @@ mod serialization_tests {
         assert_eq!(deserialized.cache_creation_input_token_cost, 4.0);
         assert_eq!(deserialized.output_cost_per_reasoning_token, 11.0);
         assert_eq!(deserialized.web_search_cost_per_query, 0.01);
+        assert_eq!(
+            deserialized.provider_specific_multipliers.get("fast"),
+            Some(&2.0)
+        );
         assert_eq!(deserialized.tiers.len(), 1);
         assert_eq!(deserialized.tiers[0].threshold_tokens, 200_000);
         assert_eq!(deserialized.tiers[0].input_cost_per_token, 5.0);

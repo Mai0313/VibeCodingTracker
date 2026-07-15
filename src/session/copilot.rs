@@ -5,15 +5,20 @@
 //! taken from the authoritative `session.shutdown` record when present, with
 //! streamed `assistant.message.outputTokens` as a partial fallback for
 //! sessions that never shut down cleanly. File operations are paired across
-//! `tool.execution_start` / `tool.execution_complete` by `toolCallId` and
-//! only counted on success. See the table below for the full event map.
+//! `tool.execution_start` / `tool.execution_complete` by `toolCallId`.
+//! Invocations are counted when they start; only successful completions add
+//! file effects. See the table below for the full event map.
 use crate::constants::{FastHashMap, capacity};
 use crate::models::*;
-use crate::session::diagnostics::{ParseDiagnostics, ParsedAnalysis};
+use crate::session::diagnostics::{
+    AnalysisFact, AnalysisFactEffect, AnalysisMetrics, AnalysisStateSnapshot, ParseDiagnostics,
+    ParsedAnalysis, PricingGranularity, ToolFactStatus, UsageFact, UsageFactUnit,
+};
 use crate::session::state::{ParseMode, SessionParseState};
-use crate::utils::{get_git_remote_url, parse_iso_timestamp};
+use crate::utils::{accumulate_i64_fields, get_git_remote_url, parse_iso_timestamp};
 use anyhow::Result;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 
 // =============================================================================
 // Copilot CLI `events.jsonl` streaming parser
@@ -74,21 +79,24 @@ where
     // stashes its arguments here until the matching `tool.execution_complete`
     // arrives with the result payload.
     let mut pending_tools: FastHashMap<String, PendingTool> = FastHashMap::with_capacity(32);
+    let mut seen_tool_calls = HashSet::with_capacity(32);
 
     // Fallback accounting used when the session does not reach
     // `session.shutdown` (e.g. crash, SIGKILL, ongoing session). We still
     // want to attribute `assistant.message.outputTokens` to *some* model,
     // so we track the active model switches.
     let mut current_model = String::new();
-    // Set to `true` once we consume a `session.shutdown` event. If so, the
-    // shutdown record is authoritative and we discard the fallback output
-    // tallies built from streamed `assistant.message` events — those would
-    // otherwise double-count.
-    let mut shutdown_seen = false;
+    // Fallback output belongs only to the currently open epoch. A successful
+    // shutdown replaces that epoch, then a later `session.resume` can start a
+    // new fallback epoch in the same append-only file.
     let mut pending_output_tokens: FastHashMap<String, i64> = FastHashMap::with_capacity(3);
     let mut diagnostics = ParseDiagnostics::default();
+    let mut usage_facts = Vec::new();
+    let mut fallback_usage_facts = Vec::new();
+    let mut analysis_facts = Vec::new();
 
-    for event in events {
+    for (source_index, event) in events.into_iter().enumerate() {
+        let source_order = source_index + 1;
         let recognized = matches!(
             event.event_type.as_str(),
             "session.start"
@@ -156,43 +164,98 @@ where
                 }
             }
             "session.shutdown" => {
-                let payload_supported = shutdown_payload_supported(&event.data);
-                if payload_supported
-                    && let Ok(data) =
-                        serde_json::from_value::<CopilotShutdownData>(event.data.clone())
-                {
-                    diagnostics.record_relevant(true);
-                    for (model, metric) in data.model_metrics {
-                        if model.is_empty() {
-                            continue;
+                let mut covered_models = HashSet::new();
+                let mut units = Vec::new();
+                match event.data.get("modelMetrics").and_then(Value::as_object) {
+                    Some(metrics) if metrics.is_empty() => diagnostics.record_relevant(true),
+                    Some(metrics) => {
+                        for (model, metric) in metrics {
+                            if model.is_empty() {
+                                diagnostics.record_relevant(false);
+                                continue;
+                            }
+                            let Some(metric) = metric.as_object() else {
+                                diagnostics.record_relevant(false);
+                                continue;
+                            };
+                            let Some(usage_value) = metric.get("usage") else {
+                                diagnostics.record_relevant(true);
+                                continue;
+                            };
+                            if usage_value.is_null()
+                                || usage_value
+                                    .as_object()
+                                    .is_some_and(serde_json::Map::is_empty)
+                            {
+                                diagnostics.record_relevant(true);
+                                continue;
+                            }
+                            if !copilot_usage_supported(usage_value) {
+                                diagnostics.record_relevant(false);
+                                continue;
+                            }
+                            let Ok(usage) =
+                                serde_json::from_value::<CopilotModelUsage>(usage_value.clone())
+                            else {
+                                diagnostics.record_relevant(false);
+                                continue;
+                            };
+
+                            let (usage_json, split_valid) = normalize_copilot_usage(&usage);
+                            let has_normalized_usage = usage_json
+                                .as_object()
+                                .is_some_and(|usage| !usage.is_empty());
+                            if has_normalized_usage {
+                                diagnostics.record_relevant(true);
+                            }
+                            if !split_valid {
+                                diagnostics.record_relevant(false);
+                            }
+                            if !has_normalized_usage {
+                                continue;
+                            }
+                            let model = canonicalize_model_name(model);
+                            covered_models.insert(model.clone());
+                            units.push(UsageFactUnit::from_value(
+                                model.clone(),
+                                &usage_json,
+                                PricingGranularity::Aggregate,
+                            ));
+                            accumulate_copilot_usage(&mut conversation_usage, model, usage_json);
                         }
-                        let Some(usage) = metric.usage else {
-                            continue;
-                        };
-                        // Copilot's `reasoningTokens` is the model's
-                        // thinking budget emitted before the visible
-                        // response. Surface it as its own field so
-                        // `calculate_cost` can charge it against the
-                        // model's published reasoning rate (when present)
-                        // via `output_cost_per_reasoning_token`, instead
-                        // of folding it into `output_tokens` and billing
-                        // every thinking token at the flat output rate.
-                        let usage_json = json!({
-                            "input_tokens": usage.input_tokens,
-                            "output_tokens": usage.output_tokens,
-                            "reasoning_output_tokens": usage.reasoning_tokens,
-                            "cache_read_input_tokens": usage.cache_read_tokens,
-                            "cache_creation_input_tokens": usage.cache_write_tokens,
-                        });
-                        conversation_usage.insert(canonicalize_model_name(&model), usage_json);
                     }
-                    shutdown_seen = true;
-                } else {
-                    diagnostics.record_relevant(false);
+                    None => diagnostics.record_relevant(false),
+                }
+
+                finalize_copilot_fallback_epoch(
+                    &covered_models,
+                    &mut pending_output_tokens,
+                    &mut fallback_usage_facts,
+                    &mut usage_facts,
+                    &mut conversation_usage,
+                );
+                if !units.is_empty() {
+                    let stable_id =
+                        (!event.id.is_empty()).then(|| format!("copilot-shutdown:{}", event.id));
+                    usage_facts.push(UsageFact {
+                        stable_id,
+                        timestamp_ms: (ts > 0).then_some(ts),
+                        observed_at_ms: (ts > 0).then_some(ts),
+                        source_order,
+                        units,
+                    });
                 }
             }
             "assistant.message" => {
                 // Only used as a fallback when no `session.shutdown` arrives.
+                if let Some(message_model) = event
+                    .data
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .filter(|model| !model.is_empty())
+                {
+                    current_model = canonicalize_model_name(message_model);
+                }
                 if let Some(output_tokens) = event.data.get("outputTokens") {
                     let output_tokens = output_tokens.as_i64();
                     diagnostics
@@ -203,25 +266,85 @@ where
                         *pending_output_tokens
                             .entry(current_model.clone())
                             .or_insert(0) += output_tokens;
+                        let usage = json!({
+                            "input_tokens": 0,
+                            "output_tokens": output_tokens,
+                            "cache_read_input_tokens": 0,
+                            "cache_creation_input_tokens": 0,
+                            "total_tokens": output_tokens,
+                        });
+                        fallback_usage_facts.push(UsageFact {
+                            stable_id: (!event.id.is_empty())
+                                .then(|| format!("copilot-message:{}", event.id)),
+                            timestamp_ms: (ts > 0).then_some(ts),
+                            observed_at_ms: (ts > 0).then_some(ts),
+                            source_order,
+                            units: vec![UsageFactUnit::from_value(
+                                current_model.clone(),
+                                &usage,
+                                PricingGranularity::Request,
+                            )],
+                        });
                     }
                 }
             }
             "tool.execution_start" => {
                 match serde_json::from_value::<CopilotToolStartData>(event.data.clone()) {
-                    Ok(data) if !data.tool_call_id.is_empty() && !data.tool_name.is_empty() => {
+                    Ok(data) if !data.tool_name.is_empty() => {
+                        let has_correlation_id = !data.tool_call_id.is_empty();
                         let tracked = is_tracked_tool(&data.tool_name);
                         let arguments_supported =
                             tracked_tool_arguments_supported(&data.tool_name, &data.arguments);
-                        pending_tools.insert(
-                            data.tool_call_id,
-                            PendingTool {
-                                tool_name: data.tool_name,
-                                arguments: data.arguments,
-                                timestamp: ts,
-                                tracked,
-                                arguments_supported,
-                            },
-                        );
+                        if tracked
+                            && has_correlation_id
+                            && !seen_tool_calls.insert(data.tool_call_id.clone())
+                        {
+                            continue;
+                        }
+                        let mut pending = PendingTool {
+                            tool_call_id: data.tool_call_id,
+                            tool_name: data.tool_name,
+                            arguments: data.arguments,
+                            model: current_model.clone(),
+                            timestamp: ts,
+                            tracked,
+                            arguments_supported,
+                            fact_index: None,
+                        };
+                        if tracked {
+                            diagnostics.record_relevant(true);
+                            if !arguments_supported {
+                                diagnostics.record_relevant(false);
+                            }
+                            if !has_correlation_id {
+                                diagnostics.record_relevant(false);
+                            }
+                            let before = AnalysisMetrics::from_state(&state);
+                            record_tool_invocation(
+                                &mut state,
+                                &pending.tool_name,
+                                &pending.arguments,
+                            );
+                            let fact_index = analysis_facts.len();
+                            analysis_facts.push(AnalysisFact {
+                                stable_id: has_correlation_id
+                                    .then(|| format!("copilot-tool:{}", pending.tool_call_id)),
+                                timestamp_ms: (pending.timestamp > 0).then_some(pending.timestamp),
+                                observed_at_ms: (pending.timestamp > 0)
+                                    .then_some(pending.timestamp),
+                                source_order,
+                                model: pending.model.clone(),
+                                status: ToolFactStatus::Pending,
+                                metrics: AnalysisMetrics::from_state(&state).saturating_sub(before),
+                                effect: None,
+                            });
+                            pending.fact_index = Some(fact_index);
+                        }
+                        if has_correlation_id {
+                            pending_tools.insert(pending.tool_call_id.clone(), pending);
+                        } else if !tracked {
+                            diagnostics.record_relevant(false);
+                        }
                     }
                     Ok(_) | Err(_) => diagnostics.record_relevant(false),
                 }
@@ -242,15 +365,28 @@ where
                 let Some(success) = event.data.get("success").and_then(Value::as_bool) else {
                     if pending.tracked {
                         diagnostics.record_relevant(false);
+                        update_copilot_fact(
+                            &mut analysis_facts,
+                            &pending,
+                            ToolFactStatus::Pending,
+                            ts,
+                            AnalysisMetrics::default(),
+                            None,
+                        );
                     }
                     continue;
                 };
-                // Only dispatch successful tool calls — failures rarely
-                // produce meaningful arguments (e.g. path validation errors)
-                // and would skew line-count totals.
                 if !success {
                     if pending.tracked {
                         diagnostics.record_relevant(true);
+                        update_copilot_fact(
+                            &mut analysis_facts,
+                            &pending,
+                            ToolFactStatus::Failed,
+                            ts,
+                            AnalysisMetrics::default(),
+                            None,
+                        );
                     }
                     continue;
                 }
@@ -260,6 +396,14 @@ where
                         Err(_) => {
                             if pending.tracked {
                                 diagnostics.record_relevant(false);
+                                update_copilot_fact(
+                                    &mut analysis_facts,
+                                    &pending,
+                                    ToolFactStatus::Succeeded,
+                                    ts,
+                                    AnalysisMetrics::default(),
+                                    Some(AnalysisFactEffect::default()),
+                                );
                             }
                             continue;
                         }
@@ -272,32 +416,42 @@ where
                     );
                     diagnostics.record_relevant(pending.arguments_supported && result_supported);
                     if !pending.arguments_supported {
+                        update_copilot_fact(
+                            &mut analysis_facts,
+                            &pending,
+                            ToolFactStatus::Succeeded,
+                            ts,
+                            AnalysisMetrics::default(),
+                            Some(AnalysisFactEffect::default()),
+                        );
                         continue;
                     }
                 }
-                dispatch_tool(&mut state, &pending, &data);
+                let effect_before = AnalysisStateSnapshot::capture(&state);
+                let before = AnalysisMetrics::from_state(&state);
+                dispatch_tool_effects(&mut state, &pending, &data);
+                update_copilot_fact(
+                    &mut analysis_facts,
+                    &pending,
+                    ToolFactStatus::Succeeded,
+                    ts,
+                    AnalysisMetrics::from_state(&state).saturating_sub(before),
+                    Some(effect_before.effect_since(&state, Vec::new())),
+                );
             }
             _ => {}
         }
     }
 
-    // If `session.shutdown` never arrived, graft the fallback streamed
-    // output-token counters into `conversation_usage` so the row still has
-    // a non-zero number (callers can tell it's partial by the missing
-    // `input_tokens`).
-    if !shutdown_seen {
-        for (model, output_tokens) in pending_output_tokens {
-            conversation_usage.insert(
-                model,
-                json!({
-                    "input_tokens": 0,
-                    "output_tokens": output_tokens,
-                    "cache_read_input_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                }),
-            );
-        }
-    }
+    // Keep streamed output for an epoch that has not reached its own shutdown,
+    // even when an earlier epoch in the same resumed session shut down cleanly.
+    finalize_copilot_fallback_epoch(
+        &HashSet::new(),
+        &mut pending_output_tokens,
+        &mut fallback_usage_facts,
+        &mut usage_facts,
+        &mut conversation_usage,
+    );
 
     // Fallback git remote lookup when `session.start.context` did not carry
     // a repository string (e.g. running outside a git tree or pre-1.0 CLI).
@@ -314,22 +468,10 @@ where
         machine_id: String::new(),
         records: vec![record],
     };
-    Ok(ParsedAnalysis::new(analysis, diagnostics))
-}
-
-fn shutdown_payload_supported(data: &Value) -> bool {
-    let Some(metrics) = data.get("modelMetrics").and_then(Value::as_object) else {
-        return false;
-    };
-    metrics.values().all(|metric| {
-        let Some(metric) = metric.as_object() else {
-            return false;
-        };
-        match metric.get("usage") {
-            None | Some(Value::Null) => true,
-            Some(usage) => copilot_usage_supported(usage),
-        }
-    })
+    let mut parsed = ParsedAnalysis::new(analysis, diagnostics);
+    parsed.usage_facts = usage_facts;
+    parsed.analysis_facts = analysis_facts;
+    Ok(parsed)
 }
 
 fn copilot_usage_supported(usage: &Value) -> bool {
@@ -343,10 +485,6 @@ fn copilot_usage_supported(usage: &Value) -> bool {
     let Some(usage) = usage.as_object() else {
         return false;
     };
-    if usage.is_empty() {
-        return true;
-    }
-
     let mut recognized = false;
     for field in TOKEN_FIELDS {
         if let Some(value) = usage.get(*field) {
@@ -357,6 +495,101 @@ fn copilot_usage_supported(usage: &Value) -> bool {
         }
     }
     recognized
+}
+
+fn finalize_copilot_fallback_epoch(
+    covered_models: &HashSet<String>,
+    pending_output_tokens: &mut FastHashMap<String, i64>,
+    fallback_usage_facts: &mut Vec<UsageFact>,
+    usage_facts: &mut Vec<UsageFact>,
+    conversation_usage: &mut FastHashMap<String, Value>,
+) {
+    for model in covered_models {
+        pending_output_tokens.remove(model);
+    }
+    fallback_usage_facts.retain_mut(|fact| {
+        fact.units
+            .retain(|unit| !covered_models.contains(&unit.model));
+        !fact.units.is_empty()
+    });
+    for (model, output_tokens) in pending_output_tokens.drain() {
+        accumulate_copilot_usage(
+            conversation_usage,
+            model,
+            json!({
+                "input_tokens": 0,
+                "output_tokens": output_tokens,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "total_tokens": output_tokens,
+            }),
+        );
+    }
+    usage_facts.append(fallback_usage_facts);
+}
+
+fn normalize_copilot_usage(usage: &CopilotModelUsage) -> (Value, bool) {
+    let published_total = if usage.input_tokens >= 0 && usage.output_tokens >= 0 {
+        usage.input_tokens.checked_add(usage.output_tokens)
+    } else {
+        None
+    };
+    let cached_input = usage
+        .cache_read_tokens
+        .checked_add(usage.cache_write_tokens);
+    if let (Some(cached_input), Some(published_total)) = (cached_input, published_total)
+        && usage.cache_read_tokens >= 0
+        && usage.cache_write_tokens >= 0
+        && usage.reasoning_tokens >= 0
+        && cached_input <= usage.input_tokens
+        && usage.reasoning_tokens <= usage.output_tokens
+    {
+        return (
+            json!({
+                "input_tokens": usage.input_tokens - cached_input,
+                "output_tokens": usage.output_tokens - usage.reasoning_tokens,
+                "reasoning_output_tokens": usage.reasoning_tokens,
+                "cache_read_input_tokens": usage.cache_read_tokens,
+                "cache_creation_input_tokens": usage.cache_write_tokens,
+                "total_tokens": published_total,
+            }),
+            true,
+        );
+    }
+
+    let usage_json = published_total.map_or_else(
+        || json!({}),
+        |published_total| json!({ "total_tokens": published_total }),
+    );
+    (usage_json, false)
+}
+
+fn accumulate_copilot_usage(
+    conversation_usage: &mut FastHashMap<String, Value>,
+    model: String,
+    usage: Value,
+) {
+    conversation_usage
+        .entry(model)
+        .and_modify(|existing| {
+            let (Some(existing), Some(usage)) = (existing.as_object_mut(), usage.as_object())
+            else {
+                return;
+            };
+            accumulate_i64_fields(
+                existing,
+                usage,
+                &[
+                    "input_tokens",
+                    "output_tokens",
+                    "reasoning_output_tokens",
+                    "cache_read_input_tokens",
+                    "cache_creation_input_tokens",
+                    "total_tokens",
+                ],
+            );
+        })
+        .or_insert(usage);
 }
 
 fn is_tracked_tool(name: &str) -> bool {
@@ -431,19 +664,9 @@ fn tracked_tool_arguments_supported(name: &str, args: &Value) -> bool {
     }
 }
 
-fn tracked_tool_result_supported(name: &str, args: &Value, result: &Value) -> bool {
+fn tracked_tool_result_supported(name: &str, _args: &Value, result: &Value) -> bool {
     match name {
-        "view" | "show_file" | "read_file" => {
-            if let Some(range) = args
-                .get("view_range")
-                .and_then(Value::as_array)
-                .filter(|range| range.len() >= 2)
-            {
-                return range.first().and_then(Value::as_i64).is_some()
-                    && range.get(1).and_then(Value::as_i64).is_some();
-            }
-            result.get("content").is_some_and(Value::is_string)
-        }
+        "view" | "show_file" | "read_file" => result.get("content").is_some_and(Value::is_string),
         _ => true,
     }
 }
@@ -459,16 +682,71 @@ fn extract_apply_patch_text(args: &Value) -> Option<&str> {
 /// A `tool.execution_start` event held until its matching
 /// `tool.execution_complete` arrives, keyed by `toolCallId`.
 struct PendingTool {
+    /// Correlation id shared by the start and completion events.
+    tool_call_id: String,
     /// Tool name (e.g. `view`, `create`, `str_replace`, `bash`).
     tool_name: String,
-    /// Raw tool arguments object, interpreted lazily by [`dispatch_tool`].
+    /// Raw tool arguments object, interpreted lazily by [`dispatch_tool_effects`].
     arguments: Value,
+    /// Model active when the tool was invoked.
+    model: String,
     /// Start-event timestamp in epoch milliseconds, used for the detail record.
     timestamp: i64,
     /// Whether this tool contributes to the analysis projection.
     tracked: bool,
     /// Whether the tracked tool's arguments use a supported schema.
     arguments_supported: bool,
+    /// Position of this invocation's private analysis fact.
+    fact_index: Option<usize>,
+}
+
+fn record_tool_invocation(state: &mut SessionParseState, name: &str, arguments: &Value) {
+    match name {
+        "view" | "show_file" | "read_file" | "rg" | "grep" => {
+            state.tool_counts.read += 1;
+        }
+        "create" | "write_file" | "write" => state.tool_counts.write += 1,
+        "str_replace" | "edit" | "replace" | "edit_file" => {
+            state.tool_counts.edit += 1;
+        }
+        "apply_patch" => {
+            let patches = extract_apply_patch_text(arguments)
+                .map(parse_apply_patch_text)
+                .unwrap_or_default();
+            let has_write = patches.iter().any(|patch| patch.action == "add");
+            let has_edit = patches.iter().any(|patch| patch.action != "add");
+            if has_write {
+                state.tool_counts.write += 1;
+            }
+            if has_edit || !has_write {
+                state.tool_counts.edit += 1;
+            }
+        }
+        "bash" | "shell" | "execute" | "write_bash" => state.tool_counts.bash += 1,
+        _ => {}
+    }
+}
+
+fn update_copilot_fact(
+    facts: &mut [AnalysisFact],
+    pending: &PendingTool,
+    status: ToolFactStatus,
+    observed_at_ms: i64,
+    effects: AnalysisMetrics,
+    effect: Option<AnalysisFactEffect>,
+) {
+    let Some(index) = pending.fact_index else {
+        return;
+    };
+    let Some(fact) = facts.get_mut(index) else {
+        return;
+    };
+    fact.status = status;
+    fact.observed_at_ms = (observed_at_ms > 0).then_some(observed_at_ms);
+    if status == ToolFactStatus::Succeeded {
+        fact.metrics.add_assign(effects);
+        fact.effect = effect;
+    }
 }
 
 /// Routes a completed Copilot tool call to the matching file-operation tally.
@@ -476,13 +754,26 @@ struct PendingTool {
 /// Branches on `pending.tool_name`; unrecognised tools (e.g. `glob`,
 /// `task_complete`) are silently ignored. Argument field names are probed
 /// with historical aliases for forward compatibility across CLI releases.
+#[cfg(test)]
 fn dispatch_tool(
+    state: &mut SessionParseState,
+    pending: &PendingTool,
+    complete: &CopilotToolCompleteData,
+) {
+    record_tool_invocation(state, &pending.tool_name, &pending.arguments);
+    dispatch_tool_effects(state, pending, complete);
+}
+
+/// Attaches effects from a confirmed successful completion without counting
+/// the invocation again.
+fn dispatch_tool_effects(
     state: &mut SessionParseState,
     pending: &PendingTool,
     complete: &CopilotToolCompleteData,
 ) {
     let ts = pending.timestamp;
     let args = &pending.arguments;
+    let invocation_counts = state.tool_counts.clone();
 
     match pending.tool_name.as_str() {
         // Current Copilot CLI exposes `view` for reads. Historical versions
@@ -493,13 +784,12 @@ fn dispatch_tool(
                 return;
             };
 
-            state.tool_counts.read += 1;
             let content = extract_view_content(args, &complete.result);
             attach_read_detail(state, path, &content, ts);
         }
         // Search tools read repository content but do not identify one complete
         // file body, so retain the invocation without inventing line totals.
-        "rg" | "grep" => state.tool_counts.read += 1,
+        "rg" | "grep" => {}
         // `create` is the primary write tool. Historical names are kept for
         // robustness; a future release that renames the tool will still get
         // counted if the argument shape stays similar.
@@ -558,6 +848,8 @@ fn dispatch_tool(
         // no file-operation semantics we care about. Silently ignore.
         _ => {}
     }
+
+    state.tool_counts = invocation_counts;
 }
 
 fn attach_read_detail(state: &mut SessionParseState, path: &str, content: &str, ts: i64) {
@@ -655,34 +947,10 @@ fn extract_patch_strings(lines: &[String]) -> (String, String) {
 
 /// Resolve the content a Copilot `view` tool saw.
 ///
-/// Callers can pass us two sources:
-///
-/// 1. `arguments.view_range` — inclusive `[start, end]` line numbers. When
-///    present we synthesise a `line_count`-line placeholder using a
-///    non-newline character so `add_read_detail`'s `trim_end_matches('\n')`
-///    cannot collapse it back to zero. The actual content is not needed
-///    because we only care about the line count.
-/// 2. `complete.result.content` — the string the model actually received.
-///    Preferred when available and when no `view_range` was supplied.
-fn extract_view_content(arguments: &Value, result: &Value) -> String {
-    if let Some(range) = arguments.get("view_range").and_then(|v| v.as_array())
-        && range.len() >= 2
-    {
-        let start = range.first().and_then(|v| v.as_i64()).unwrap_or(0);
-        let end = range.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
-        let line_count = (end - start + 1).max(0) as usize;
-        if line_count == 0 {
-            return String::new();
-        }
-        // A pure-newline placeholder ("\n".repeat(N - 1)) would survive
-        // `count_lines` on its own, but `add_read_detail` first trims
-        // trailing newlines and then the whole thing collapses to an
-        // empty string — so the line tally would silently come back as
-        // zero. Use single-char "lines" joined by '\n' so the trim is a
-        // no-op and `count_lines` recovers exactly `line_count`.
-        return vec!["-"; line_count].join("\n");
-    }
-
+/// `view_range` describes the requested slice, but only `result.content`
+/// tells us what the model actually received. Counting the requested range
+/// would invent lines and characters when the returned content differs.
+fn extract_view_content(_arguments: &Value, result: &Value) -> String {
     result
         .get("content")
         .and_then(|c| c.as_str())
@@ -743,54 +1011,38 @@ mod tests {
         tracked_tool_arguments_supported, tracked_tool_result_supported,
     };
     use crate::models::CopilotEvent;
+    use crate::session::diagnostics::ToolFactStatus;
     use crate::session::state::ParseMode;
     use crate::session::state::SessionParseState;
     use serde_json::{Value, json};
 
     fn event(event_type: &str, data: Value) -> CopilotEvent {
+        event_at(event_type, data, "2026-07-12T00:00:00Z")
+    }
+
+    fn event_at(event_type: &str, data: Value, timestamp: &str) -> CopilotEvent {
         CopilotEvent {
             event_type: event_type.to_string(),
             data,
             id: String::new(),
-            timestamp: "2026-07-12T00:00:00Z".to_string(),
+            timestamp: timestamp.to_string(),
             parent_id: None,
         }
     }
 
-    fn count_lines_after_trim(s: &str) -> usize {
-        // Mirror src/session/state.rs count_lines + add_read_detail's
-        // trim_end_matches('\n') so the test reflects the actual line
-        // tally the analyzer would record.
-        let trimmed = s.trim_end_matches('\n');
-        if trimmed.is_empty() {
-            0
-        } else {
-            trimmed.chars().filter(|c| *c == '\n').count() + 1
-        }
+    #[test]
+    fn view_range_uses_actual_result_content() {
+        let args = json!({ "view_range": [1, 5], "path": "/tmp/foo" });
+        let result = json!({ "content": "a\nbb" });
+        assert_eq!(extract_view_content(&args, &result), "a\nbb");
     }
 
     #[test]
-    fn view_range_placeholder_survives_trim_end() {
-        // view_range [1, 5] → 5 logical lines. The synthesised
-        // placeholder must yield 5 from `count_lines` even after
-        // `trim_end_matches('\n')` runs in `add_read_detail`.
+    fn view_range_without_result_content_is_unsupported() {
         let args = json!({ "view_range": [1, 5], "path": "/tmp/foo" });
         let result = json!({});
-        let placeholder = extract_view_content(&args, &result);
-        assert_eq!(
-            count_lines_after_trim(&placeholder),
-            5,
-            "view_range [1,5] must count as 5 lines after add_read_detail's trim"
-        );
-    }
-
-    #[test]
-    fn view_range_with_zero_span_returns_empty() {
-        // Edge case: empty range produces an empty placeholder so the
-        // upstream early-return in `add_read_detail` skips it cleanly.
-        let args = json!({ "view_range": [5, 4], "path": "/tmp/foo" });
-        let result = json!({});
         assert_eq!(extract_view_content(&args, &result), "");
+        assert!(!tracked_tool_result_supported("view", &args, &result));
     }
 
     #[test]
@@ -809,30 +1061,35 @@ mod tests {
         }
     }
 
-    #[test]
-    fn current_show_file_maps_to_read() {
-        let pending = PendingTool {
-            tool_name: "show_file".to_string(),
-            arguments: json!({ "path": "/tmp/a.txt", "view_range": [1, 2] }),
+    fn pending_tool(tool_name: &str, arguments: Value) -> PendingTool {
+        PendingTool {
+            tool_call_id: "call-1".to_string(),
+            tool_name: tool_name.to_string(),
+            arguments,
+            model: "test".to_string(),
             timestamp: 1,
             tracked: true,
             arguments_supported: true,
-        };
+            fact_index: None,
+        }
+    }
+
+    #[test]
+    fn current_show_file_maps_to_read() {
+        let pending = pending_tool(
+            "show_file",
+            json!({ "path": "/tmp/a.txt", "view_range": [1, 5] }),
+        );
         let mut state = SessionParseState::new();
         dispatch_tool(&mut state, &pending, &completed());
         assert_eq!(state.tool_counts.read, 1);
         assert_eq!(state.total_read_lines, 2);
+        assert_eq!(state.total_read_characters, 10);
     }
 
     #[test]
     fn show_file_empty_and_drifted_results_keep_the_known_invocation() {
-        let pending = PendingTool {
-            tool_name: "show_file".to_string(),
-            arguments: json!({ "path": "/tmp/empty.txt" }),
-            timestamp: 1,
-            tracked: true,
-            arguments_supported: true,
-        };
+        let pending = pending_tool("show_file", json!({ "path": "/tmp/empty.txt" }));
 
         let mut empty = completed();
         empty.result = json!({ "content": "" });
@@ -863,13 +1120,7 @@ mod tests {
     fn current_search_tools_count_read_invocations_without_fake_lines() {
         let mut state = SessionParseState::new();
         for tool_name in ["rg", "grep"] {
-            let pending = PendingTool {
-                tool_name: tool_name.to_string(),
-                arguments: json!({ "pattern": "needle", "paths": ["src"] }),
-                timestamp: 1,
-                tracked: true,
-                arguments_supported: true,
-            };
+            let pending = pending_tool(tool_name, json!({ "pattern": "needle", "paths": ["src"] }));
             dispatch_tool(&mut state, &pending, &completed());
         }
         assert_eq!(state.tool_counts.read, 2);
@@ -893,15 +1144,12 @@ mod tests {
 
     #[test]
     fn current_apply_patch_string_maps_to_file_operations() {
-        let pending = PendingTool {
-            tool_name: "apply_patch".to_string(),
-            arguments: json!(
+        let pending = pending_tool(
+            "apply_patch",
+            json!(
                 "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-old\n+new\n*** Add File: notes.txt\n+hello\n*** End Patch"
             ),
-            timestamp: 1,
-            tracked: true,
-            arguments_supported: true,
-        };
+        );
         let mut state = SessionParseState::new();
         dispatch_tool(&mut state, &pending, &completed());
         assert_eq!(state.tool_counts.edit, 1);
@@ -912,15 +1160,12 @@ mod tests {
 
     #[test]
     fn current_apply_patch_string_field_maps_to_edit() {
-        let pending = PendingTool {
-            tool_name: "apply_patch".to_string(),
-            arguments: json!({
+        let pending = pending_tool(
+            "apply_patch",
+            json!({
                 "string": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-old\n+new\n*** End Patch"
             }),
-            timestamp: 1,
-            tracked: true,
-            arguments_supported: true,
-        };
+        );
         let mut state = SessionParseState::new();
         dispatch_tool(&mut state, &pending, &completed());
         assert_eq!(state.tool_counts.edit, 1);
@@ -929,15 +1174,12 @@ mod tests {
 
     #[test]
     fn current_apply_patch_input_field_maps_to_edit() {
-        let pending = PendingTool {
-            tool_name: "apply_patch".to_string(),
-            arguments: json!({
+        let pending = pending_tool(
+            "apply_patch",
+            json!({
                 "input": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-old\n+new\n*** End Patch"
             }),
-            timestamp: 1,
-            tracked: true,
-            arguments_supported: true,
-        };
+        );
         let mut state = SessionParseState::new();
         dispatch_tool(&mut state, &pending, &completed());
         assert_eq!(state.tool_counts.edit, 1);
@@ -946,13 +1188,10 @@ mod tests {
 
     #[test]
     fn current_write_bash_counts_nonempty_input() {
-        let pending = PendingTool {
-            tool_name: "write_bash".to_string(),
-            arguments: json!({ "input": "yes", "shellId": "shell-1" }),
-            timestamp: 1,
-            tracked: true,
-            arguments_supported: true,
-        };
+        let pending = pending_tool(
+            "write_bash",
+            json!({ "input": "yes", "shellId": "shell-1" }),
+        );
         let mut state = SessionParseState::new();
         dispatch_tool(&mut state, &pending, &completed());
         assert_eq!(state.tool_counts.bash, 1);
@@ -987,6 +1226,220 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_keeps_supported_models_and_fallback_for_models_without_usage() {
+        let parsed = parse_copilot_events_with_diagnostics(
+            vec![
+                event(
+                    "session.model_change",
+                    json!({ "newModel": "covered-model" }),
+                ),
+                event("assistant.message", json!({ "outputTokens": 5 })),
+                event("session.model_change", json!({ "newModel": "null-model" })),
+                event("assistant.message", json!({ "outputTokens": 7 })),
+                event("session.model_change", json!({ "newModel": "empty-model" })),
+                event("assistant.message", json!({ "outputTokens": 11 })),
+                event(
+                    "session.shutdown",
+                    json!({
+                        "modelMetrics": {
+                            "covered-model": {
+                                "usage": { "inputTokens": 100, "outputTokens": 20 }
+                            },
+                            "null-model": { "usage": null },
+                            "empty-model": { "usage": {} },
+                            "drifted-model": {
+                                "usage": { "promptTokens": 123, "completionTokens": 45 }
+                            }
+                        }
+                    }),
+                ),
+            ],
+            ParseMode::Full,
+        )
+        .unwrap();
+
+        assert!(!parsed.diagnostics.is_complete_failure());
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 1);
+        let usage = &parsed.analysis.records[0].conversation_usage;
+        assert_eq!(usage["covered-model"]["total_tokens"], 120);
+        assert_eq!(usage["null-model"]["total_tokens"], 7);
+        assert_eq!(usage["empty-model"]["total_tokens"], 11);
+        assert!(!usage.contains_key("drifted-model"));
+        assert_eq!(parsed.usage_facts.len(), 3);
+    }
+
+    #[test]
+    fn assistant_message_model_replaces_auto_fallback_before_shutdown() {
+        let parsed = parse_copilot_events_with_diagnostics(
+            vec![
+                event("session.model_change", json!({ "newModel": "auto" })),
+                event(
+                    "assistant.message",
+                    json!({ "model": "gpt-5.4-mini", "outputTokens": 20 }),
+                ),
+                event(
+                    "session.shutdown",
+                    json!({
+                        "modelMetrics": {
+                            "gpt-5.4-mini": {
+                                "usage": { "inputTokens": 100, "outputTokens": 20 }
+                            }
+                        }
+                    }),
+                ),
+            ],
+            ParseMode::Full,
+        )
+        .unwrap();
+
+        let usage = &parsed.analysis.records[0].conversation_usage;
+        assert!(!usage.contains_key("auto"));
+        assert_eq!(usage["gpt-5.4-mini"]["total_tokens"], 120);
+        assert_eq!(parsed.usage_facts.len(), 1);
+        assert_eq!(parsed.usage_facts[0].units[0].model, "gpt-5.4-mini");
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
+    }
+
+    #[test]
+    fn unsupported_shutdown_usage_keeps_streamed_fallback_and_diagnostics() {
+        let parsed = parse_copilot_events_with_diagnostics(
+            vec![
+                event(
+                    "session.model_change",
+                    json!({ "newModel": "future-model" }),
+                ),
+                event("assistant.message", json!({ "outputTokens": 9 })),
+                event(
+                    "session.shutdown",
+                    json!({
+                        "modelMetrics": {
+                            "future-model": {
+                                "usage": {
+                                    "promptTokens": 123,
+                                    "completionTokens": 45
+                                }
+                            }
+                        }
+                    }),
+                ),
+            ],
+            ParseMode::Full,
+        )
+        .unwrap();
+
+        assert!(!parsed.diagnostics.is_complete_failure());
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 1);
+        assert_eq!(
+            parsed.analysis.records[0].conversation_usage["future-model"],
+            json!({
+                "input_tokens": 0,
+                "output_tokens": 9,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "total_tokens": 9
+            })
+        );
+        assert_eq!(parsed.usage_facts.len(), 1);
+        assert_eq!(parsed.usage_facts[0].units[0].counts.total, 9);
+    }
+
+    #[test]
+    fn invalid_shutdown_parent_totals_keep_streamed_fallback_and_diagnostics() {
+        let parsed = parse_copilot_events_with_diagnostics(
+            vec![
+                event(
+                    "session.model_change",
+                    json!({ "newModel": "broken-model" }),
+                ),
+                event("assistant.message", json!({ "outputTokens": 9 })),
+                event(
+                    "session.shutdown",
+                    json!({
+                        "modelMetrics": {
+                            "broken-model": {
+                                "usage": { "inputTokens": -1, "outputTokens": 4 }
+                            }
+                        }
+                    }),
+                ),
+            ],
+            ParseMode::Full,
+        )
+        .unwrap();
+
+        assert!(!parsed.diagnostics.is_complete_failure());
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 1);
+        assert_eq!(
+            parsed.analysis.records[0].conversation_usage["broken-model"]["total_tokens"],
+            9
+        );
+        assert_eq!(parsed.usage_facts.len(), 1);
+        assert_eq!(parsed.usage_facts[0].units[0].counts.total, 9);
+    }
+
+    #[test]
+    fn partial_shutdown_seals_uncovered_fallback_before_a_resumed_epoch() {
+        let parsed = parse_copilot_events_with_diagnostics(
+            vec![
+                event(
+                    "session.model_change",
+                    json!({ "newModel": "fallback-model" }),
+                ),
+                event("assistant.message", json!({ "outputTokens": 7 })),
+                event(
+                    "session.shutdown",
+                    json!({
+                        "modelMetrics": {
+                            "covered-model": {
+                                "usage": { "inputTokens": 100, "outputTokens": 20 }
+                            },
+                            "fallback-model": { "usage": null }
+                        }
+                    }),
+                ),
+                event("session.resume", json!({})),
+                event(
+                    "session.model_change",
+                    json!({ "newModel": "fallback-model" }),
+                ),
+                event("assistant.message", json!({ "outputTokens": 3 })),
+                event(
+                    "session.shutdown",
+                    json!({
+                        "modelMetrics": {
+                            "fallback-model": {
+                                "usage": { "inputTokens": 10, "outputTokens": 2 }
+                            }
+                        }
+                    }),
+                ),
+            ],
+            ParseMode::Full,
+        )
+        .unwrap();
+
+        assert_eq!(
+            parsed.analysis.records[0].conversation_usage["fallback-model"],
+            json!({
+                "input_tokens": 10,
+                "output_tokens": 9,
+                "reasoning_output_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "total_tokens": 19
+            })
+        );
+        let fallback_total: i64 = parsed
+            .usage_facts
+            .iter()
+            .flat_map(|fact| &fact.units)
+            .filter(|unit| unit.model == "fallback-model")
+            .map(|unit| unit.counts.total)
+            .sum();
+        assert_eq!(fallback_total, 19);
+    }
+
+    #[test]
     fn shutdown_accepts_partial_current_usage_even_when_the_value_is_zero() {
         let parsed = parse_copilot_events_with_diagnostics(
             vec![event(
@@ -1011,7 +1464,183 @@ mod tests {
     }
 
     #[test]
-    fn missing_tool_success_is_schema_drift_but_explicit_false_is_a_known_failure() {
+    fn shutdown_splits_inclusive_token_parents_into_disjoint_buckets() {
+        let parsed = parse_copilot_events_with_diagnostics(
+            vec![event(
+                "session.shutdown",
+                json!({
+                    "modelMetrics": {
+                        "current-model": {
+                            "usage": {
+                                "inputTokens": 2_000,
+                                "outputTokens": 300,
+                                "cacheReadTokens": 600,
+                                "cacheWriteTokens": 100,
+                                "reasoningTokens": 50
+                            }
+                        }
+                    }
+                }),
+            )],
+            ParseMode::Full,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
+        assert_eq!(
+            parsed.analysis.records[0].conversation_usage["current-model"],
+            json!({
+                "input_tokens": 1_300,
+                "output_tokens": 250,
+                "reasoning_output_tokens": 50,
+                "cache_read_input_tokens": 600,
+                "cache_creation_input_tokens": 100,
+                "total_tokens": 2_300
+            })
+        );
+    }
+
+    #[test]
+    fn shutdown_preserves_total_but_drops_invalid_pricing_splits() {
+        let parsed = parse_copilot_events_with_diagnostics(
+            vec![event(
+                "session.shutdown",
+                json!({
+                    "modelMetrics": {
+                        "bad-cache": {
+                            "usage": {
+                                "inputTokens": 100,
+                                "outputTokens": 40,
+                                "cacheReadTokens": 80,
+                                "cacheWriteTokens": 30,
+                                "reasoningTokens": 10
+                            }
+                        },
+                        "bad-reasoning": {
+                            "usage": {
+                                "inputTokens": 100,
+                                "outputTokens": 40,
+                                "cacheReadTokens": 20,
+                                "cacheWriteTokens": 0,
+                                "reasoningTokens": 41
+                            }
+                        }
+                    }
+                }),
+            )],
+            ParseMode::Full,
+        )
+        .unwrap();
+
+        assert!(!parsed.diagnostics.is_complete_failure());
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 2);
+        for model in ["bad-cache", "bad-reasoning"] {
+            assert_eq!(
+                parsed.analysis.records[0].conversation_usage[model],
+                json!({ "total_tokens": 140 }),
+                "invalid subsets must not become priced token buckets"
+            );
+        }
+    }
+
+    #[test]
+    fn resumed_shutdown_epochs_accumulate_in_public_usage_and_facts() {
+        let parsed = parse_copilot_events_with_diagnostics(
+            vec![
+                event("session.model_change", json!({ "newModel": "model-a" })),
+                event_at(
+                    "session.shutdown",
+                    json!({
+                        "modelMetrics": {
+                            "model-a": {
+                                "usage": { "inputTokens": 100, "outputTokens": 20 }
+                            }
+                        }
+                    }),
+                    "2026-07-12T00:00:01Z",
+                ),
+                event_at("session.resume", json!({}), "2026-07-12T00:00:02Z"),
+                event_at(
+                    "session.shutdown",
+                    json!({
+                        "modelMetrics": {
+                            "model-a": {
+                                "usage": { "inputTokens": 40, "outputTokens": 10 }
+                            }
+                        }
+                    }),
+                    "2026-07-12T00:00:03Z",
+                ),
+            ],
+            ParseMode::Full,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.usage_facts.len(), 2);
+        let fact_total: i64 = parsed
+            .usage_facts
+            .iter()
+            .flat_map(|fact| &fact.units)
+            .map(|unit| unit.counts.total)
+            .sum();
+        assert_eq!(fact_total, 170);
+        assert_eq!(
+            parsed.analysis.records[0].conversation_usage["model-a"],
+            json!({
+                "input_tokens": 140,
+                "output_tokens": 30,
+                "reasoning_output_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "total_tokens": 170
+            })
+        );
+    }
+
+    #[test]
+    fn resumed_open_epoch_keeps_post_shutdown_output_fallback() {
+        let parsed = parse_copilot_events_with_diagnostics(
+            vec![
+                event("session.model_change", json!({ "newModel": "model-a" })),
+                event("assistant.message", json!({ "outputTokens": 5 })),
+                event_at(
+                    "session.shutdown",
+                    json!({
+                        "modelMetrics": {
+                            "model-a": {
+                                "usage": { "inputTokens": 100, "outputTokens": 20 }
+                            }
+                        }
+                    }),
+                    "2026-07-12T00:00:01Z",
+                ),
+                event_at("session.resume", json!({}), "2026-07-12T00:00:02Z"),
+                event_at(
+                    "assistant.message",
+                    json!({ "outputTokens": 7 }),
+                    "2026-07-12T00:00:03Z",
+                ),
+            ],
+            ParseMode::Full,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.usage_facts.len(), 2);
+        let usage = &parsed.analysis.records[0].conversation_usage["model-a"];
+        assert_eq!(usage["input_tokens"], 100);
+        assert_eq!(usage["output_tokens"], 27);
+        assert_eq!(usage["total_tokens"], 127);
+        let fact_total: i64 = parsed
+            .usage_facts
+            .iter()
+            .flat_map(|fact| &fact.units)
+            .map(|unit| unit.counts.total)
+            .sum();
+        assert_eq!(fact_total, 127);
+    }
+
+    #[test]
+    fn missing_tool_success_and_explicit_failure_keep_the_invocation() {
         let start = || {
             event(
                 "tool.execution_start",
@@ -1038,8 +1667,15 @@ mod tests {
             ParseMode::Full,
         )
         .unwrap();
-        assert!(missing.diagnostics.is_complete_failure());
-        assert_eq!(missing.analysis.records[0].tool_call_counts.read, 0);
+        assert!(!missing.diagnostics.is_complete_failure());
+        assert_eq!(missing.diagnostics.partial_failure_count(), 1);
+        assert_eq!(missing.analysis.records[0].tool_call_counts.read, 1);
+        assert_eq!(missing.analysis.records[0].total_read_lines, 0);
+        assert_eq!(missing.analysis.records[0].total_unique_files, 0);
+        assert_eq!(missing.analysis_facts.len(), 1);
+        assert_eq!(missing.analysis_facts[0].status, ToolFactStatus::Pending);
+        assert_eq!(missing.analysis_facts[0].metrics.read_count, 1);
+        assert_eq!(missing.analysis_facts[0].metrics.read_lines, 0);
 
         let failed = parse_copilot_events_with_diagnostics(
             vec![
@@ -1058,7 +1694,306 @@ mod tests {
         .unwrap();
         assert!(!failed.diagnostics.is_complete_failure());
         assert_eq!(failed.diagnostics.partial_failure_count(), 0);
-        assert_eq!(failed.analysis.records[0].tool_call_counts.read, 0);
+        assert_eq!(failed.analysis.records[0].tool_call_counts.read, 1);
+        assert_eq!(failed.analysis.records[0].total_read_lines, 0);
+        assert_eq!(failed.analysis.records[0].total_unique_files, 0);
+        assert_eq!(failed.analysis_facts.len(), 1);
+        assert_eq!(failed.analysis_facts[0].status, ToolFactStatus::Failed);
+        assert_eq!(failed.analysis_facts[0].metrics.read_count, 1);
+        assert_eq!(failed.analysis_facts[0].metrics.read_lines, 0);
+    }
+
+    #[test]
+    fn tracked_tool_without_correlation_id_is_anonymous_without_effects() {
+        let parsed = parse_copilot_events_with_diagnostics(
+            vec![
+                event("session.model_change", json!({ "newModel": "model-a" })),
+                event(
+                    "tool.execution_start",
+                    json!({
+                        "toolName": "show_file",
+                        "arguments": { "path": "/tmp/a.txt" }
+                    }),
+                ),
+                event(
+                    "tool.execution_complete",
+                    json!({
+                        "success": true,
+                        "result": { "content": "one\ntwo" }
+                    }),
+                ),
+            ],
+            ParseMode::Full,
+        )
+        .unwrap();
+        let record = &parsed.analysis.records[0];
+
+        assert_eq!(record.tool_call_counts.read, 1);
+        assert_eq!(record.total_read_lines, 0);
+        assert_eq!(record.total_unique_files, 0);
+        assert!(record.read_file_details.is_empty());
+        assert_eq!(parsed.analysis_facts.len(), 1);
+        let fact = &parsed.analysis_facts[0];
+        assert!(fact.stable_id.is_none());
+        assert_eq!(fact.model, "model-a");
+        assert_eq!(fact.status, ToolFactStatus::Pending);
+        assert_eq!(fact.metrics.read_count, 1);
+        assert_eq!(fact.metrics.read_lines, 0);
+        assert!(fact.effect.is_none());
+        assert!(!parsed.diagnostics.is_complete_failure());
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 2);
+    }
+
+    #[test]
+    fn null_tool_correlation_id_is_anonymous_without_effects() {
+        let parsed = parse_copilot_events_with_diagnostics(
+            vec![
+                event("session.model_change", json!({ "newModel": "model-a" })),
+                event(
+                    "tool.execution_start",
+                    json!({
+                        "toolCallId": null,
+                        "toolName": "show_file",
+                        "arguments": { "path": "/tmp/a.txt" }
+                    }),
+                ),
+            ],
+            ParseMode::Full,
+        )
+        .unwrap();
+        let record = &parsed.analysis.records[0];
+
+        assert_eq!(record.tool_call_counts.read, 1);
+        assert_eq!(record.total_read_lines, 0);
+        assert_eq!(record.total_unique_files, 0);
+        assert_eq!(parsed.analysis_facts.len(), 1);
+        assert!(parsed.analysis_facts[0].stable_id.is_none());
+        assert_eq!(parsed.analysis_facts[0].status, ToolFactStatus::Pending);
+        assert!(!parsed.diagnostics.is_complete_failure());
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 1);
+    }
+
+    #[test]
+    fn tool_lifecycle_counts_every_invocation_but_only_successful_effects() {
+        let parsed = parse_copilot_events_with_diagnostics(
+            vec![
+                event("session.model_change", json!({ "newModel": "model-a" })),
+                event(
+                    "tool.execution_start",
+                    json!({
+                        "toolCallId": "pending-read",
+                        "toolName": "show_file",
+                        "arguments": { "path": "/tmp/pending.txt" }
+                    }),
+                ),
+                event("abort", json!({ "reason": "cancelled" })),
+                event(
+                    "tool.execution_start",
+                    json!({
+                        "toolCallId": "failed-write",
+                        "toolName": "create",
+                        "arguments": { "path": "/tmp/failed.txt", "file_text": "ignored" }
+                    }),
+                ),
+                event(
+                    "tool.execution_complete",
+                    json!({
+                        "toolCallId": "failed-write",
+                        "success": false,
+                        "error": { "message": "rejected" }
+                    }),
+                ),
+                event(
+                    "tool.execution_start",
+                    json!({
+                        "toolCallId": "successful-edit",
+                        "toolName": "str_replace",
+                        "arguments": {
+                            "path": "/tmp/success.txt",
+                            "old_string": "old",
+                            "new_string": "new\nnext"
+                        }
+                    }),
+                ),
+                event(
+                    "tool.execution_complete",
+                    json!({
+                        "toolCallId": "successful-edit",
+                        "success": true,
+                        "result": { "content": "updated" },
+                        "model": "model-a"
+                    }),
+                ),
+            ],
+            ParseMode::Full,
+        )
+        .unwrap();
+
+        let record = &parsed.analysis.records[0];
+        assert_eq!(record.tool_call_counts.read, 1);
+        assert_eq!(record.tool_call_counts.write, 1);
+        assert_eq!(record.tool_call_counts.edit, 1);
+        assert_eq!(record.total_read_lines, 0);
+        assert_eq!(record.total_write_lines, 0);
+        assert_eq!(record.total_edit_lines, 2);
+        assert_eq!(record.total_unique_files, 1);
+        assert!(record.read_file_details.is_empty());
+        assert!(record.write_file_details.is_empty());
+        assert_eq!(record.edit_file_details.len(), 1);
+
+        assert_eq!(parsed.analysis_facts.len(), 3);
+        let pending = &parsed.analysis_facts[0];
+        assert_eq!(
+            pending.stable_id.as_deref(),
+            Some("copilot-tool:pending-read")
+        );
+        assert_eq!(pending.status, ToolFactStatus::Pending);
+        assert_eq!(pending.model, "model-a");
+        assert_eq!(pending.metrics.read_count, 1);
+        assert_eq!(pending.metrics.read_lines, 0);
+        assert!(pending.effect.is_none());
+
+        let failed = &parsed.analysis_facts[1];
+        assert_eq!(
+            failed.stable_id.as_deref(),
+            Some("copilot-tool:failed-write")
+        );
+        assert_eq!(failed.status, ToolFactStatus::Failed);
+        assert_eq!(failed.model, "model-a");
+        assert_eq!(failed.metrics.write_count, 1);
+        assert_eq!(failed.metrics.write_lines, 0);
+        assert!(failed.effect.is_none());
+
+        let succeeded = &parsed.analysis_facts[2];
+        assert_eq!(
+            succeeded.stable_id.as_deref(),
+            Some("copilot-tool:successful-edit")
+        );
+        assert_eq!(succeeded.status, ToolFactStatus::Succeeded);
+        assert_eq!(succeeded.model, "model-a");
+        assert_eq!(succeeded.metrics.edit_count, 1);
+        assert_eq!(succeeded.metrics.edit_lines, 2);
+        let effect = succeeded.effect.as_ref().expect("successful effect");
+        assert_eq!(effect.unique_files, vec!["/tmp/success.txt"]);
+        assert_eq!(effect.edit_file_details.len(), 1);
+        assert_eq!(
+            effect.edit_file_details[0].base.file_path,
+            "/tmp/success.txt"
+        );
+    }
+
+    #[test]
+    fn tool_facts_use_the_model_active_at_invocation() {
+        let parsed = parse_copilot_events_with_diagnostics(
+            vec![
+                event("session.model_change", json!({ "newModel": "model-a" })),
+                event_at(
+                    "tool.execution_start",
+                    json!({
+                        "toolCallId": "read-a",
+                        "toolName": "show_file",
+                        "arguments": { "path": "/tmp/a.txt" }
+                    }),
+                    "2026-07-12T00:00:01Z",
+                ),
+                event("session.model_change", json!({ "newModel": "model-b" })),
+                event_at(
+                    "tool.execution_complete",
+                    json!({
+                        "toolCallId": "read-a",
+                        "success": true,
+                        "result": { "content": "one\ntwo" },
+                        "model": "model-b"
+                    }),
+                    "2026-07-12T00:00:03Z",
+                ),
+                event_at(
+                    "tool.execution_start",
+                    json!({
+                        "toolCallId": "write-b",
+                        "toolName": "create",
+                        "arguments": { "path": "/tmp/b.txt", "file_text": "three" }
+                    }),
+                    "2026-07-12T00:00:04Z",
+                ),
+                event_at(
+                    "tool.execution_complete",
+                    json!({
+                        "toolCallId": "write-b",
+                        "success": true,
+                        "result": { "content": "created" },
+                        "model": "model-a"
+                    }),
+                    "2026-07-12T00:00:05Z",
+                ),
+            ],
+            ParseMode::Full,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.analysis_facts.len(), 2);
+        assert_eq!(parsed.analysis_facts[0].model, "model-a");
+        assert_eq!(
+            parsed.analysis_facts[0].timestamp_ms,
+            Some(crate::utils::parse_iso_timestamp("2026-07-12T00:00:01Z"))
+        );
+        assert_eq!(
+            parsed.analysis_facts[0].observed_at_ms,
+            Some(crate::utils::parse_iso_timestamp("2026-07-12T00:00:03Z"))
+        );
+        assert_eq!(parsed.analysis_facts[0].metrics.read_count, 1);
+        assert_eq!(parsed.analysis_facts[0].metrics.read_lines, 2);
+        assert_eq!(parsed.analysis_facts[1].model, "model-b");
+        assert_eq!(
+            parsed.analysis_facts[1].timestamp_ms,
+            Some(crate::utils::parse_iso_timestamp("2026-07-12T00:00:04Z"))
+        );
+        assert_eq!(parsed.analysis_facts[1].metrics.write_count, 1);
+        assert_eq!(parsed.analysis_facts[1].metrics.write_lines, 1);
+    }
+
+    #[test]
+    fn replayed_tool_lifecycle_is_counted_once() {
+        let start = || {
+            event(
+                "tool.execution_start",
+                json!({
+                    "toolCallId": "replayed-read",
+                    "toolName": "show_file",
+                    "arguments": { "path": "/tmp/a.txt" }
+                }),
+            )
+        };
+        let complete = || {
+            event(
+                "tool.execution_complete",
+                json!({
+                    "toolCallId": "replayed-read",
+                    "success": true,
+                    "result": { "content": "one\ntwo" },
+                    "model": "model-a"
+                }),
+            )
+        };
+        let parsed = parse_copilot_events_with_diagnostics(
+            vec![
+                event("session.model_change", json!({ "newModel": "model-a" })),
+                start(),
+                complete(),
+                start(),
+                complete(),
+            ],
+            ParseMode::Full,
+        )
+        .unwrap();
+
+        let record = &parsed.analysis.records[0];
+        assert_eq!(record.tool_call_counts.read, 1);
+        assert_eq!(record.total_read_lines, 2);
+        assert_eq!(record.read_file_details.len(), 1);
+        assert_eq!(parsed.analysis_facts.len(), 1);
+        assert_eq!(parsed.analysis_facts[0].metrics.read_count, 1);
+        assert_eq!(parsed.analysis_facts[0].metrics.read_lines, 2);
     }
 
     #[test]

@@ -241,13 +241,33 @@ pub fn is_codex_session_file(path: &Path) -> bool {
 ///
 /// Matches both top-level sessions (`~/.claude/projects/<project>/<session>.jsonl`)
 /// and subagent sessions (`~/.claude/projects/<project>/<session>/subagents/agent-*.jsonl`).
-/// Rejects meta sidecars (`*.meta.json` / `*.meta.jsonl`) and any non-JSONL artifact
-/// that ends up under the projects directory (e.g. screenshots pasted into prompts).
+/// Rejects meta sidecars (`*.meta.json` / `*.meta.jsonl`), workflow journals,
+/// and any non-JSONL artifact that ends up under the projects directory.
 pub fn is_claude_session_file(path: &Path) -> bool {
-    if is_meta_sidecar_file(path) {
+    if is_meta_sidecar_file(path) || is_claude_workflow_journal(path) {
         return false;
     }
     path.extension().is_some_and(|ext| ext == "jsonl")
+}
+
+fn is_claude_workflow_journal(path: &Path) -> bool {
+    if path.file_name() != Some(std::ffi::OsStr::new("journal.jsonl")) {
+        return false;
+    }
+    let Some(workflow) = path.parent() else {
+        return false;
+    };
+    workflow
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("wf_"))
+        && workflow
+            .parent()
+            .is_some_and(|parent| parent.file_name() == Some(std::ffi::OsStr::new("workflows")))
+        && workflow
+            .parent()
+            .and_then(Path::parent)
+            .is_some_and(|parent| parent.file_name() == Some(std::ffi::OsStr::new("subagents")))
 }
 
 /// Filter for Gemini CLI session files.
@@ -784,6 +804,22 @@ mod tests {
     }
 
     #[test]
+    fn test_is_claude_session_file_rejects_workflow_journal_only() {
+        let journal = std::path::Path::new(
+            "/home/user/.claude/projects/proj/sess/subagents/workflows/wf_123/journal.jsonl",
+        );
+        let workflow_agent = std::path::Path::new(
+            "/home/user/.claude/projects/proj/sess/subagents/workflows/wf_123/agent-one.jsonl",
+        );
+        let unrelated_journal =
+            std::path::Path::new("/home/user/.claude/projects/proj/sess/subagents/journal.jsonl");
+
+        assert!(!is_claude_session_file(journal));
+        assert!(is_claude_session_file(workflow_agent));
+        assert!(is_claude_session_file(unrelated_journal));
+    }
+
+    #[test]
     fn test_is_claude_session_file_rejects_non_jsonl() {
         // Metadata sidecars — current format (`.meta.json`)
         let meta = std::path::Path::new(
@@ -839,5 +875,29 @@ mod tests {
         assert!(names.contains(&"agent-one.jsonl".to_string()));
         assert!(!names.iter().any(|n| n.contains(".meta.")));
         assert!(!names.iter().any(|n| n.ends_with(".png")));
+    }
+
+    #[test]
+    fn test_collect_claude_session_files_skips_workflow_journals() {
+        let dir = tempdir().unwrap();
+        let project = dir.path().join("-home-user-repo");
+        let workflow = project.join("sess-a/subagents/workflows").join("wf_123");
+        fs::create_dir_all(&workflow).unwrap();
+        File::create(project.join("sess-a.jsonl")).unwrap();
+        File::create(workflow.join("journal.jsonl")).unwrap();
+        File::create(workflow.join("agent-one.jsonl")).unwrap();
+
+        let results =
+            collect_files_with_dates(dir.path(), is_claude_session_file, TimeRange::All).unwrap();
+        let paths: Vec<_> = results.iter().map(|file| file.path.as_path()).collect();
+
+        assert_eq!(results.len(), 2, "collected: {paths:?}");
+        assert!(paths.iter().any(|path| path.ends_with("sess-a.jsonl")));
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.ends_with("wf_123/agent-one.jsonl"))
+        );
+        assert!(!paths.iter().any(|path| path.ends_with("journal.jsonl")));
     }
 }

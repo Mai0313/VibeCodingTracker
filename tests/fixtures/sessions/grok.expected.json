@@ -47,9 +47,9 @@
       "toolCallCounts": {
         "Bash": 1,
         "Edit": 1,
-        "Read": 2,
+        "Read": 3,
         "TodoWrite": 1,
-        "Write": 1
+        "Write": 2
       },
       "totalEditCharacters": 9,
       "totalEditLines": 2,

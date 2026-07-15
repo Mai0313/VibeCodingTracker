@@ -55,6 +55,8 @@ pub struct SessionParseState {
     pub tool_counts: CodeAnalysisToolCalls,
     /// Distinct normalized file paths touched (populated in both parse modes).
     pub unique_files: HashSet<String>,
+    /// First-seen path order used by operation snapshots without cloning the set.
+    pub(crate) unique_file_order: Vec<String>,
     /// Sum of lines written across all `Write` operations.
     pub total_write_lines: usize,
     /// Sum of lines read across all `Read` operations.
@@ -129,6 +131,7 @@ impl SessionParseState {
             },
             tool_counts: CodeAnalysisToolCalls::default(),
             unique_files: HashSet::with_capacity(20),
+            unique_file_order: Vec::with_capacity(20),
             total_write_lines: 0,
             total_read_lines: 0,
             total_edit_lines: 0,
@@ -144,17 +147,14 @@ impl SessionParseState {
 
     /// Records a `Read` operation against `path` with the read `content`.
     ///
-    /// Trailing newlines are stripped before counting. No-op (and no count
-    /// bump) when the trimmed content is empty or when `path` normalizes to
-    /// an empty string. The detail record is only stored in
+    /// Trailing newlines are stripped before counting. A successful empty read
+    /// still counts as one invocation and records the resolved path with zero
+    /// lines and characters. An empty normalized path remains a no-op. The
+    /// detail record is only stored in
     /// [`ParseMode::Full`]; counts and unique-file tracking accrue in both modes.
     pub fn add_read_detail(&mut self, path: &str, content: &str, ts: i64) {
         let trimmed = content.trim_end_matches('\n');
         let line_count = count_lines(trimmed);
-
-        if line_count == 0 {
-            return;
-        }
 
         let char_count = trimmed.chars().count();
         let resolved = self.normalize_path(path);
@@ -173,7 +173,7 @@ impl SessionParseState {
                 },
             });
         }
-        self.unique_files.insert(resolved);
+        self.add_unique_file(resolved);
 
         self.total_read_lines += line_count;
         self.total_read_characters += char_count;
@@ -184,7 +184,7 @@ impl SessionParseState {
     pub(crate) fn add_non_text_read_path(&mut self, path: &str) {
         let resolved = self.normalize_path(path);
         if !resolved.is_empty() {
-            self.unique_files.insert(resolved);
+            self.add_unique_file(resolved);
         }
     }
 
@@ -215,7 +215,7 @@ impl SessionParseState {
                 content: trimmed.to_string(),
             });
         }
-        self.unique_files.insert(resolved);
+        self.add_unique_file(resolved);
 
         self.total_write_lines += line_count;
         self.total_write_characters += char_count;
@@ -269,7 +269,7 @@ impl SessionParseState {
                 new_string: trimmed_new.to_string(),
             });
         }
-        self.unique_files.insert(resolved);
+        self.add_unique_file(resolved);
 
         self.total_edit_lines += line_count;
         self.total_edit_characters += char_count;
@@ -282,6 +282,13 @@ impl SessionParseState {
     /// detail record (attributed to `folder_path`) is stored only in
     /// [`ParseMode::Full`]; the `bash` count accrues in both modes.
     pub fn add_run_command(&mut self, command: &str, description: &str, ts: i64) {
+        self.add_run_command_detail(command, description, ts);
+        if !command.trim().is_empty() {
+            self.tool_counts.bash += 1;
+        }
+    }
+
+    pub(crate) fn add_run_command_detail(&mut self, command: &str, description: &str, ts: i64) {
         let command = command.trim();
         if command.is_empty() {
             return;
@@ -301,8 +308,6 @@ impl SessionParseState {
                 description: description.to_string(),
             });
         }
-
-        self.tool_counts.bash += 1;
     }
 
     /// Resolves `path` to an absolute path, joining it onto `folder_path`.
@@ -329,6 +334,12 @@ impl SessionParseState {
             .to_string()
     }
 
+    pub(crate) fn add_unique_file(&mut self, path: String) {
+        if self.unique_files.insert(path.clone()) {
+            self.unique_file_order.push(path);
+        }
+    }
+
     /// Merges another accumulator created with the same parse mode.
     ///
     /// This is used when a provider must deduplicate message revisions before
@@ -347,7 +358,9 @@ impl SessionParseState {
         self.tool_counts.edit += other.tool_counts.edit;
         self.tool_counts.todo_write += other.tool_counts.todo_write;
         self.tool_counts.bash += other.tool_counts.bash;
-        self.unique_files.extend(other.unique_files);
+        for path in other.unique_file_order {
+            self.add_unique_file(path);
+        }
 
         self.total_write_lines += other.total_write_lines;
         self.total_read_lines += other.total_read_lines;
@@ -437,15 +450,17 @@ mod tests {
     }
 
     #[test]
-    fn test_add_read_detail_ignores_empty() {
-        // Test that empty content is ignored
+    fn test_add_read_detail_counts_empty_file() {
         let mut state = SessionParseState::new();
+        state.folder_path = "/workspace".to_string();
 
         state.add_read_detail("test.rs", "", 1234567890);
 
-        assert_eq!(state.read_details.len(), 0);
+        assert_eq!(state.read_details.len(), 1);
         assert_eq!(state.total_read_lines, 0);
-        assert_eq!(state.tool_counts.read, 0);
+        assert_eq!(state.total_read_characters, 0);
+        assert_eq!(state.tool_counts.read, 1);
+        assert!(state.unique_files.contains("/workspace/test.rs"));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Plain-text renderer for the usage view: one `model: $cost` line per model.
 
-use crate::display::usage::averages::{build_usage_summary, merge_rows_by_base_model};
+use crate::display::usage::averages::{build_usage_summary_from_data, merge_rows_by_base_model};
 use crate::pricing::{ModelPricingMap, fetch_model_pricing};
 use crate::usage::UsageData;
 use std::collections::HashMap;
@@ -22,13 +22,7 @@ pub fn display_usage_text(usage_data: &UsageData, merge: bool) {
     let pricing_map =
         fetch_model_pricing().unwrap_or_else(|_| ModelPricingMap::new(HashMap::new()));
 
-    let mut summary = build_usage_summary(
-        &usage_data.models,
-        &usage_data.per_provider,
-        &usage_data.provider_days,
-        &pricing_map,
-        &usage_data.stored_costs,
-    );
+    let mut summary = build_usage_summary_from_data(usage_data, &pricing_map);
 
     if summary.rows.is_empty() {
         println!("No usage data found");

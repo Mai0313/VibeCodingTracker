@@ -1,35 +1,8 @@
 use crate::display::common::ProviderTotal;
-use crate::models::{PerProviderUsage, Provider, ProviderActiveDays, UsageResult};
-use crate::usage::{CostSource, StoredCosts};
+use crate::models::Provider;
+use crate::usage::{CostSource, UsageData};
 use serde_json::Value;
 use std::borrow::Cow;
-
-/// Per-provider cost basis, resolved to a [`CostSource`] per model.
-#[derive(Clone, Copy)]
-enum ProviderPricing<'a> {
-    /// File-based providers priced purely from LiteLLM.
-    Litellm,
-    /// OpenCode: exact LiteLLM match, else its stored cost.
-    OpenCode(&'a crate::constants::FastHashMap<String, f64>),
-    /// Cursor local estimate: exact LiteLLM pricing, else zero.
-    CursorEstimate,
-    /// Hermes: exact LiteLLM match, else its stored cost.
-    Hermes(&'a crate::constants::FastHashMap<String, f64>),
-}
-
-impl ProviderPricing<'_> {
-    /// The [`CostSource`] to use for `model` under this provider's basis.
-    fn source_for(&self, model: &str) -> CostSource {
-        let stored =
-            |m: &crate::constants::FastHashMap<String, f64>| m.get(model).copied().unwrap_or(0.0);
-        match self {
-            Self::Litellm => CostSource::Litellm,
-            Self::OpenCode(m) => CostSource::OpenCodeStored(stored(m)),
-            Self::CursorEstimate => CostSource::OpenCodeStored(0.0),
-            Self::Hermes(m) => CostSource::HermesStored(stored(m)),
-        }
-    }
-}
 
 /// Data structure for a usage row.
 ///
@@ -125,14 +98,6 @@ pub struct ProviderStats {
     pub days_count: usize,
 }
 
-impl ProviderStats {
-    /// Adds `row`'s total tokens and cost into these stats.
-    fn accumulate_row(&mut self, row: &UsageRow) {
-        self.total_tokens += row.total;
-        self.total_cost += row.cost;
-    }
-}
-
 /// Type alias for usage totals grouped by provider.
 pub type UsageProviderTotals = crate::display::common::ProviderTotals<ProviderStats>;
 
@@ -147,22 +112,15 @@ pub struct UsageSummary {
     pub provider_totals: UsageProviderTotals,
 }
 
-/// Calculate per-provider totals using **source-directory** attribution.
-///
-/// Token aggregation is fed directly from the `per_provider` map that
-/// `usage::calculator` populates from each session's source directory, so the
-/// provider assignment is exact regardless of what model name the session
-/// happens to carry. The previous "averages" variant divided by
-/// `provider_days` to render a per-day rate; the structure is otherwise
-/// identical.
-pub fn calculate_provider_totals_from_per_provider(
-    per_provider: &PerProviderUsage,
-    provider_days: &ProviderActiveDays,
+/// Calculates provider totals from the request-level pricing ledger retained
+/// in [`UsageData`]. Tokens retain source-directory attribution, while costs
+/// are resolved independently for every provider request.
+pub fn calculate_provider_totals_from_usage_data(
+    usage_data: &UsageData,
     pricing_map: &crate::pricing::ModelPricingMap,
-    stored_costs: &StoredCosts,
 ) -> UsageProviderTotals {
     let mut totals = UsageProviderTotals::default();
-
+    let provider_days = &usage_data.provider_days;
     totals.claude.days_count = provider_days.claude;
     totals.codex.days_count = provider_days.codex;
     totals.copilot.days_count = provider_days.copilot;
@@ -173,64 +131,49 @@ pub fn calculate_provider_totals_from_per_provider(
     totals.hermes.days_count = provider_days.hermes;
     totals.overall.days_count = provider_days.total;
 
-    accumulate_provider(
-        &mut totals.claude,
-        &per_provider.claude,
-        pricing_map,
-        ProviderPricing::Litellm,
-    );
-    accumulate_provider(
-        &mut totals.codex,
-        &per_provider.codex,
-        pricing_map,
-        ProviderPricing::Litellm,
-    );
-    accumulate_provider(
-        &mut totals.copilot,
-        &per_provider.copilot,
-        pricing_map,
-        ProviderPricing::Litellm,
-    );
-    accumulate_provider(
-        &mut totals.gemini,
-        &per_provider.gemini,
-        pricing_map,
-        ProviderPricing::Litellm,
-    );
-    accumulate_provider(
-        &mut totals.grok,
-        &per_provider.grok,
-        pricing_map,
-        ProviderPricing::Litellm,
-    );
-    accumulate_provider(
-        &mut totals.opencode,
-        &per_provider.opencode,
-        pricing_map,
-        ProviderPricing::OpenCode(&stored_costs.opencode),
-    );
-    accumulate_provider(
-        &mut totals.cursor,
-        &per_provider.cursor,
-        pricing_map,
-        ProviderPricing::CursorEstimate,
-    );
-    accumulate_provider(
-        &mut totals.hermes,
-        &per_provider.hermes,
-        pricing_map,
-        ProviderPricing::Hermes(&stored_costs.hermes),
-    );
+    accumulate_provider_tokens(&mut totals.claude, &usage_data.per_provider.claude);
+    accumulate_provider_tokens(&mut totals.codex, &usage_data.per_provider.codex);
+    accumulate_provider_tokens(&mut totals.copilot, &usage_data.per_provider.copilot);
+    accumulate_provider_tokens(&mut totals.gemini, &usage_data.per_provider.gemini);
+    accumulate_provider_tokens(&mut totals.grok, &usage_data.per_provider.grok);
+    accumulate_provider_tokens(&mut totals.opencode, &usage_data.per_provider.opencode);
+    accumulate_provider_tokens(&mut totals.cursor, &usage_data.per_provider.cursor);
+    accumulate_provider_tokens(&mut totals.hermes, &usage_data.per_provider.hermes);
 
-    // "All Providers" row sums every provider's totals directly rather
-    // than reusing the cross-provider merged `UsageData.models` map.
-    // That merged map de-duplicates a shared model like `claude-sonnet-4-6`
-    // (used by both Claude Code and Copilot CLI) into a single row, so
-    // the underlying tokens are *not* double-counted — but we lose the
-    // provider attribution needed to populate per-provider cost columns
-    // on the same table, and the single merged row would price with one
-    // model-lookup where summing per-provider already-priced stats keeps
-    // cost consistent with each provider's own row above.
+    totals.claude.total_cost = provider_cost(
+        usage_data,
+        crate::models::ExtensionType::ClaudeCode,
+        pricing_map,
+    );
+    totals.codex.total_cost =
+        provider_cost(usage_data, crate::models::ExtensionType::Codex, pricing_map);
+    totals.copilot.total_cost = provider_cost(
+        usage_data,
+        crate::models::ExtensionType::Copilot,
+        pricing_map,
+    );
+    totals.gemini.total_cost = provider_cost(
+        usage_data,
+        crate::models::ExtensionType::Gemini,
+        pricing_map,
+    );
+    totals.grok.total_cost =
+        provider_cost(usage_data, crate::models::ExtensionType::Grok, pricing_map);
+    totals.opencode.total_cost = provider_cost(
+        usage_data,
+        crate::models::ExtensionType::OpenCode,
+        pricing_map,
+    );
+    totals.cursor.total_cost = provider_cost(
+        usage_data,
+        crate::models::ExtensionType::Cursor,
+        pricing_map,
+    );
+    totals.hermes.total_cost = provider_cost(
+        usage_data,
+        crate::models::ExtensionType::Hermes,
+        pricing_map,
+    );
     totals.overall.total_tokens = totals.claude.total_tokens
         + totals.codex.total_tokens
         + totals.copilot.total_tokens
@@ -247,22 +190,40 @@ pub fn calculate_provider_totals_from_per_provider(
         + totals.opencode.total_cost
         + totals.cursor.total_cost
         + totals.hermes.total_cost;
-
     totals
 }
 
-/// Prices every model in `usage` under `pricing`'s cost basis and folds the
-/// results into `stats`.
-fn accumulate_provider(
-    stats: &mut ProviderStats,
-    usage: &UsageResult,
+fn accumulate_provider_tokens(stats: &mut ProviderStats, usage: &crate::models::UsageResult) {
+    stats.total_tokens = usage
+        .values()
+        .map(crate::utils::extract_token_counts)
+        .map(|counts| counts.total)
+        .sum();
+}
+
+fn provider_cost(
+    usage_data: &UsageData,
+    provider: crate::models::ExtensionType,
     pricing_map: &crate::pricing::ModelPricingMap,
-    pricing: ProviderPricing,
-) {
-    for (model, raw_usage) in usage {
-        let row = extract_usage_row(model, raw_usage, pricing_map, pricing.source_for(model));
-        stats.accumulate_row(&row);
-    }
+) -> f64 {
+    let usage = match provider {
+        crate::models::ExtensionType::ClaudeCode => &usage_data.per_provider.claude,
+        crate::models::ExtensionType::Codex => &usage_data.per_provider.codex,
+        crate::models::ExtensionType::Copilot => &usage_data.per_provider.copilot,
+        crate::models::ExtensionType::Gemini => &usage_data.per_provider.gemini,
+        crate::models::ExtensionType::Grok => &usage_data.per_provider.grok,
+        crate::models::ExtensionType::OpenCode => &usage_data.per_provider.opencode,
+        crate::models::ExtensionType::Cursor => &usage_data.per_provider.cursor,
+        crate::models::ExtensionType::Hermes => &usage_data.per_provider.hermes,
+    };
+    usage
+        .keys()
+        .filter_map(|model| {
+            usage_data
+                .price_provider_model(provider, model, pricing_map)
+                .map(|(cost, _)| cost)
+        })
+        .sum()
 }
 
 /// Build provider total rows for display.
@@ -271,7 +232,7 @@ pub fn build_provider_total_rows(
 ) -> Vec<ProviderTotal<'_, ProviderStats>> {
     let mut rows = Vec::with_capacity(9); // max 8 providers + overall
 
-    if totals.claude.days_count > 0 {
+    if provider_stats_have_activity(&totals.claude) {
         rows.push(ProviderTotal::new(
             Provider::ClaudeCode,
             &totals.claude,
@@ -279,11 +240,11 @@ pub fn build_provider_total_rows(
         ));
     }
 
-    if totals.codex.days_count > 0 {
+    if provider_stats_have_activity(&totals.codex) {
         rows.push(ProviderTotal::new(Provider::Codex, &totals.codex, false));
     }
 
-    if totals.copilot.days_count > 0 {
+    if provider_stats_have_activity(&totals.copilot) {
         rows.push(ProviderTotal::new(
             Provider::Copilot,
             &totals.copilot,
@@ -291,15 +252,15 @@ pub fn build_provider_total_rows(
         ));
     }
 
-    if totals.gemini.days_count > 0 {
+    if provider_stats_have_activity(&totals.gemini) {
         rows.push(ProviderTotal::new(Provider::Gemini, &totals.gemini, false));
     }
 
-    if totals.grok.days_count > 0 {
+    if provider_stats_have_activity(&totals.grok) {
         rows.push(ProviderTotal::new(Provider::Grok, &totals.grok, false));
     }
 
-    if totals.opencode.days_count > 0 {
+    if provider_stats_have_activity(&totals.opencode) {
         rows.push(ProviderTotal::new(
             Provider::OpenCode,
             &totals.opencode,
@@ -307,89 +268,63 @@ pub fn build_provider_total_rows(
         ));
     }
 
-    if totals.cursor.days_count > 0 {
+    if provider_stats_have_activity(&totals.cursor) {
         rows.push(ProviderTotal::new(Provider::Cursor, &totals.cursor, false));
     }
 
-    if totals.hermes.days_count > 0 {
+    if provider_stats_have_activity(&totals.hermes) {
         rows.push(ProviderTotal::new(Provider::Hermes, &totals.hermes, false));
     }
 
-    if totals.overall.days_count > 0 || rows.is_empty() {
+    if provider_stats_have_activity(&totals.overall) || rows.is_empty() {
         rows.push(ProviderTotal::new_overall(&totals.overall));
     }
 
     rows
 }
 
-/// Build a summary from raw usage data.
-///
-/// `usage_data` is the cross-provider merged map (drives the per-model
-/// table); `per_provider` is the source-directory-scoped map (drives the
-/// per-provider footer). Keeping the two aggregations independent is what
-/// lets Copilot-originated Claude tokens stay attributed to Copilot even
-/// though they share a row with Claude Code tokens in the main table.
+fn provider_stats_have_activity(stats: &ProviderStats) -> bool {
+    stats.days_count > 0 || stats.total_tokens != 0 || stats.total_cost != 0.0
+}
+
+/// Builds the fully priced summary from request-level accounting facts.
 pub fn build_usage_summary(
-    usage_data: &UsageResult,
-    per_provider: &PerProviderUsage,
-    provider_days: &ProviderActiveDays,
+    usage_data: &UsageData,
     pricing_map: &crate::pricing::ModelPricingMap,
-    stored_costs: &StoredCosts,
 ) -> UsageSummary {
-    if usage_data.is_empty() {
+    if usage_data.models.is_empty() {
         return UsageSummary::default();
     }
 
     let mut summary = UsageSummary::default();
-
-    // Pre-allocate rows vector
-    summary.rows.reserve(usage_data.len());
-
-    // Extract rows first so we can sort by cost
-    for (model, usage) in usage_data.iter() {
-        let (cost, matched_model) =
-            resolve_merged_row_cost(model, per_provider, pricing_map, stored_costs)
-                .unwrap_or_else(|| price_usage(model, usage, pricing_map, CostSource::Litellm));
-        let row = build_usage_row(model, usage, cost, matched_model);
-        summary.rows.push(row);
+    summary.rows.reserve(usage_data.models.len());
+    for (model, usage) in &usage_data.models {
+        let (cost, matched_model) = usage_data
+            .price_merged_model(model, pricing_map)
+            .unwrap_or_else(|| price_usage(model, usage, pricing_map, CostSource::Litellm));
+        summary
+            .rows
+            .push(build_usage_row(model, usage, cost, matched_model));
     }
-
-    // Sort by cost ascending (higher cost at the bottom); tie-break by model name for stability
     summary.rows.sort_by(|a, b| {
         a.cost
             .partial_cmp(&b.cost)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.model.cmp(&b.model))
     });
-
     for row in &summary.rows {
         summary.totals.accumulate(row);
     }
-
-    summary.provider_totals = calculate_provider_totals_from_per_provider(
-        per_provider,
-        provider_days,
-        pricing_map,
-        stored_costs,
-    );
+    summary.provider_totals = calculate_provider_totals_from_usage_data(usage_data, pricing_map);
     summary
 }
 
-/// Builds one priced [`UsageRow`] from a model's raw usage `Value`.
-///
-/// Token counts come from [`extract_token_counts`](crate::utils::extract_token_counts);
-/// cost is resolved by [`resolve_model_cost`](crate::usage::resolve_model_cost)
-/// under `source` (LiteLLM for file providers, the stored cost for OpenCode /
-/// Cursor). When a non-exact LiteLLM key was used, the matched model name is
-/// appended to `display_model` in parentheses.
-fn extract_usage_row(
-    model: &str,
-    usage: &Value,
+/// Compatibility alias for [`build_usage_summary`].
+pub fn build_usage_summary_from_data(
+    usage_data: &UsageData,
     pricing_map: &crate::pricing::ModelPricingMap,
-    source: CostSource,
-) -> UsageRow {
-    let (cost, matched_model) = price_usage(model, usage, pricing_map, source);
-    build_usage_row(model, usage, cost, matched_model)
+) -> UsageSummary {
+    build_usage_summary(usage_data, pricing_map)
 }
 
 /// Prices one raw usage value under `source`.
@@ -404,63 +339,6 @@ fn price_usage(
 
     let counts = extract_token_counts(usage);
     resolve_model_cost(model, &counts, pricing_map, source)
-}
-
-/// Prices a merged per-model row from provider-scoped usage pieces.
-fn resolve_merged_row_cost(
-    model: &str,
-    per_provider: &PerProviderUsage,
-    pricing_map: &crate::pricing::ModelPricingMap,
-    stored_costs: &StoredCosts,
-) -> Option<(f64, Option<String>)> {
-    let mut total_cost = 0.0;
-    let mut matched_model = None;
-    let mut found = false;
-
-    for usage in [
-        &per_provider.claude,
-        &per_provider.codex,
-        &per_provider.copilot,
-        &per_provider.gemini,
-        &per_provider.grok,
-    ] {
-        if let Some(raw_usage) = usage.get(model) {
-            found = true;
-            let (cost, matched) = price_usage(model, raw_usage, pricing_map, CostSource::Litellm);
-            total_cost += cost;
-            if matched_model.is_none() {
-                matched_model = matched;
-            }
-        }
-    }
-
-    // OpenCode and Hermes prefer exact LiteLLM prices before their stored
-    // costs. Cursor is a local token estimate, so only an exact LiteLLM price
-    // is accepted and an unknown model remains unpriced.
-    let stored =
-        |m: &crate::constants::FastHashMap<String, f64>| m.get(model).copied().unwrap_or(0.0);
-    for (usage, source) in [
-        (
-            &per_provider.opencode,
-            CostSource::OpenCodeStored(stored(&stored_costs.opencode)),
-        ),
-        (&per_provider.cursor, CostSource::OpenCodeStored(0.0)),
-        (
-            &per_provider.hermes,
-            CostSource::HermesStored(stored(&stored_costs.hermes)),
-        ),
-    ] {
-        if let Some(raw_usage) = usage.get(model) {
-            found = true;
-            let (cost, matched) = price_usage(model, raw_usage, pricing_map, source);
-            total_cost += cost;
-            if matched_model.is_none() {
-                matched_model = matched;
-            }
-        }
-    }
-
-    found.then_some((total_cost, matched_model))
 }
 
 /// Builds one display row using an already-resolved cost.
@@ -557,159 +435,17 @@ pub fn merge_rows_by_base_model(rows: &[UsageRow]) -> Vec<UsageRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pricing::{ModelPricing, ModelPricingMap, clear_pricing_cache};
-    use serde_json::json;
 
     #[test]
-    fn merged_rows_include_grok_source_cost() {
-        clear_pricing_cache();
-        let mut raw_pricing = std::collections::HashMap::new();
-        raw_pricing.insert(
-            "shared-model".to_string(),
-            ModelPricing {
-                input_cost_per_token: 0.01,
-                ..Default::default()
-            },
-        );
-        let pricing_map = ModelPricingMap::new(raw_pricing);
-        let mut usage_data = UsageResult::default();
-        usage_data.insert("shared-model".to_string(), json!({"input_tokens": 200}));
-        let mut per_provider = PerProviderUsage::default();
-        per_provider
-            .claude
-            .insert("shared-model".to_string(), json!({"input_tokens": 100}));
-        per_provider
-            .grok
-            .insert("shared-model".to_string(), json!({"input_tokens": 100}));
+    fn provider_rows_keep_activity_without_a_timestamped_day() {
+        let mut totals = UsageProviderTotals::default();
+        totals.grok.total_tokens = 42;
+        totals.overall.total_tokens = 42;
 
-        let summary = build_usage_summary(
-            &usage_data,
-            &per_provider,
-            &ProviderActiveDays::default(),
-            &pricing_map,
-            &StoredCosts::default(),
-        );
-
-        assert!((summary.rows[0].cost - 2.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn merged_rows_price_opencode_fallback_only_for_opencode_tokens() {
-        clear_pricing_cache();
-
-        let mut raw_pricing = std::collections::HashMap::new();
-        raw_pricing.insert(
-            "shared".to_string(),
-            ModelPricing {
-                input_cost_per_token: 0.01,
-                ..Default::default()
-            },
-        );
-        let pricing_map = ModelPricingMap::new(raw_pricing);
-
-        let mut usage_data = UsageResult::default();
-        usage_data.insert("shared-pro".to_string(), json!({"input_tokens": 200}));
-
-        let mut per_provider = PerProviderUsage::default();
-        per_provider
-            .claude
-            .insert("shared-pro".to_string(), json!({"input_tokens": 100}));
-        per_provider
-            .opencode
-            .insert("shared-pro".to_string(), json!({"input_tokens": 100}));
-
-        let mut stored_costs = StoredCosts::default();
-        stored_costs.opencode.insert("shared-pro".to_string(), 7.0);
-
-        let summary = build_usage_summary(
-            &usage_data,
-            &per_provider,
-            &ProviderActiveDays::default(),
-            &pricing_map,
-            &stored_costs,
-        );
-
-        assert_eq!(summary.rows.len(), 1);
-        assert!((summary.rows[0].cost - 8.0).abs() < 1e-9);
-        assert_eq!(summary.rows[0].display_model, "shared-pro (shared)");
-    }
-
-    #[test]
-    fn cursor_row_uses_exact_litellm_price_and_ignores_legacy_stored_cost() {
-        clear_pricing_cache();
-
-        // An exact LiteLLM price exists for the model Cursor reports.
-        let mut raw_pricing = std::collections::HashMap::new();
-        raw_pricing.insert(
-            "gemini-2.5-pro".to_string(),
-            ModelPricing {
-                input_cost_per_token: 0.01,
-                ..Default::default()
-            },
-        );
-        let pricing_map = ModelPricingMap::new(raw_pricing);
-
-        let mut usage_data = UsageResult::default();
-        usage_data.insert("gemini-2.5-pro".to_string(), json!({"input_tokens": 1000}));
-
-        let mut per_provider = PerProviderUsage::default();
-        per_provider
-            .cursor
-            .insert("gemini-2.5-pro".to_string(), json!({"input_tokens": 1000}));
-
-        // A legacy caller may still populate the retained public field.
-        let mut stored_costs = StoredCosts::default();
-        stored_costs
-            .cursor
-            .insert("gemini-2.5-pro".to_string(), 0.3425);
-
-        let summary = build_usage_summary(
-            &usage_data,
-            &per_provider,
-            &ProviderActiveDays::default(),
-            &pricing_map,
-            &stored_costs,
-        );
-
-        assert_eq!(summary.rows.len(), 1);
-        assert!((summary.rows[0].cost - 10.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn stored_costs_do_not_cross_contaminate_on_name_collision() {
-        clear_pricing_cache();
-        // Empty pricing: OpenCode falls back to its stored cost while Cursor's
-        // local estimate stays unpriced.
-        let pricing_map = ModelPricingMap::new(std::collections::HashMap::new());
-
-        // The same bare model name appears under both OpenCode and Cursor.
-        let mut usage_data = UsageResult::default();
-        usage_data.insert("collide".to_string(), json!({"input_tokens": 10}));
-
-        let mut per_provider = PerProviderUsage::default();
-        per_provider
-            .opencode
-            .insert("collide".to_string(), json!({"input_tokens": 5}));
-        per_provider
-            .cursor
-            .insert("collide".to_string(), json!({"input_tokens": 5}));
-
-        let mut stored_costs = StoredCosts::default();
-        stored_costs.opencode.insert("collide".to_string(), 5.0);
-        stored_costs.cursor.insert("collide".to_string(), 3.0);
-
-        let summary = build_usage_summary(
-            &usage_data,
-            &per_provider,
-            &ProviderActiveDays::default(),
-            &pricing_map,
-            &stored_costs,
-        );
-
-        assert_eq!(summary.rows.len(), 1);
-        assert!((summary.rows[0].cost - 5.0).abs() < 1e-9);
-        assert!((summary.provider_totals.opencode.total_cost - 5.0).abs() < 1e-9);
-        assert!(summary.provider_totals.cursor.total_cost.abs() < 1e-9);
+        let rows = build_provider_total_rows(&totals);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].label, "Grok");
+        assert_eq!(rows[1].label, "All Providers");
     }
 
     fn row(model: &str, input: i64, total: i64, cost: f64) -> UsageRow {

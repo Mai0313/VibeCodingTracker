@@ -1,13 +1,12 @@
 //! Process-local cache for compact usage and analysis scan contributions.
 
-use crate::analysis::AggregatedAnalysisRow;
 use crate::cli::TimeRange;
-use crate::constants::FastHashMap;
-use crate::models::{CodeAnalysis, ExtensionType, UsageResult};
-use crate::session::diagnostics::{UsageContribution, UsageTokenContribution};
+use crate::models::{CodeAnalysis, ExtensionType};
+use crate::session::diagnostics::{
+    AnalysisFact, AnalysisMetrics, ParsedAnalysis, PricingGranularity, ToolFactStatus,
+    UsageContribution, UsageFact, UsageFactUnit,
+};
 use crate::session::sqlite::{DatabaseFingerprint, append_suffix};
-use crate::usage::merge_usage_values;
-use crate::utils::extract_token_counts;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -146,13 +145,13 @@ pub(crate) enum SummaryKind {
     AnalysisDatabase,
 }
 
-/// Stable source identity, including the effective date cutoff.
+/// Stable source identity. Time-range filtering is applied when compact facts
+/// are folded, so one parsed source is reusable across every range.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct SummaryCacheKey {
     kind: SummaryKind,
     provider: String,
     path: PathBuf,
-    cutoff: Option<String>,
 }
 
 impl SummaryCacheKey {
@@ -160,15 +159,12 @@ impl SummaryCacheKey {
         kind: SummaryKind,
         provider: ExtensionType,
         path: &Path,
-        time_range: TimeRange,
+        _time_range: TimeRange,
     ) -> Self {
         Self {
             kind,
             provider: provider.to_string(),
             path: path.to_path_buf(),
-            cutoff: time_range
-                .cutoff_date()
-                .map(|date| date.format("%Y-%m-%d").to_string()),
         }
     }
 }
@@ -298,235 +294,140 @@ pub(crate) struct CachedSourceSummary {
 /// Compact contribution retained between refreshes.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CompactSourceSummary {
-    /// File-parser usage values, retained in their provider-specific shape so
-    /// the diagnostics-aware collector stays identical to the public legacy
-    /// aggregation API.
-    pub(crate) usage: UsageResult,
-    /// Typed database usage. SQLite rows never need a per-row JSON object or
-    /// model map in the incremental path.
-    pub(crate) database_usage: FastHashMap<String, UsageTokenContribution>,
-    pub(crate) stored_costs: FastHashMap<String, f64>,
-    pub(crate) usage_dates: HashSet<String>,
-    pub(crate) analysis: FastHashMap<String, AggregatedAnalysisRow>,
-    pub(crate) analysis_dates: HashSet<String>,
+    pub(crate) usage_facts: Vec<UsageFact>,
+    pub(crate) analysis_facts: Vec<AnalysisFact>,
 }
 
 impl CompactSourceSummary {
-    /// Consumes a UsageOnly parse without retaining the full analysis.
-    pub(crate) fn from_file(analysis: CodeAnalysis, date: String, emit_analysis: bool) -> Self {
-        let mut summary = Self::default();
-        summary.add_analysis(analysis, date, 0.0, emit_analysis);
-        summary
+    /// Consumes a parser result while retaining only its private compact facts.
+    pub(crate) fn from_parsed(mut parsed: ParsedAnalysis, emit_analysis: bool) -> Self {
+        if emit_analysis && parsed.analysis_facts.is_empty() {
+            parsed.analysis_facts = crate::session::diagnostics::fallback_facts(&parsed.analysis).1;
+        }
+        let ParsedAnalysis {
+            usage_facts,
+            analysis_facts,
+            ..
+        } = parsed;
+        Self {
+            usage_facts,
+            analysis_facts: if emit_analysis {
+                analysis_facts
+            } else {
+                Vec::new()
+            },
+        }
     }
 
     /// Folds one compact database usage row without materializing CodeAnalysis.
-    pub(crate) fn add_usage_contribution(&mut self, contribution: UsageContribution) {
+    pub(crate) fn add_usage_contribution(
+        &mut self,
+        contribution: UsageContribution,
+        provider: ExtensionType,
+    ) {
         let UsageContribution {
-            date,
-            timestamp_ms: _,
+            date: _,
+            timestamp_ms,
             model,
             tokens,
             stored_cost,
         } = contribution;
-        let date_has_usage = stored_cost != 0.0 || tokens.has_activity();
-        *self.stored_costs.entry(model.clone()).or_insert(0.0) += stored_cost;
-        self.database_usage
-            .entry(model)
-            .and_modify(|existing| existing.merge(tokens))
-            .or_insert(tokens);
-        if date_has_usage {
-            self.usage_dates.insert(date);
-        }
+        let counts = crate::utils::TokenCounts {
+            input_tokens: tokens.input_tokens,
+            output_tokens: tokens.output_tokens,
+            reasoning_tokens: tokens.reasoning_tokens,
+            cache_read: tokens.cache_read_tokens,
+            cache_creation: tokens.cache_creation_tokens,
+            cache_creation_5m: tokens.cache_creation_tokens,
+            cache_creation_1h: 0,
+            web_search_requests: 0,
+            total: tokens.input_tokens
+                + tokens.output_tokens
+                + tokens.reasoning_tokens
+                + tokens.cache_read_tokens
+                + tokens.cache_creation_tokens,
+        };
+        self.usage_facts.push(UsageFact::anonymous(
+            timestamp_ms,
+            self.usage_facts.len(),
+            vec![UsageFactUnit {
+                model,
+                usage: std::sync::Arc::new(tokens.into_value()),
+                counts,
+                stored_cost,
+                granularity: if provider == ExtensionType::Hermes {
+                    PricingGranularity::Aggregate
+                } else {
+                    PricingGranularity::Request
+                },
+                provider_pricing_modifiers: Vec::new(),
+                analysis_presence: true,
+            }],
+        ));
     }
 
-    /// Folds one owned analysis row and optional provider-stored cost.
+    /// Folds one database-backed analysis row whose date is authoritative.
     pub(crate) fn add_analysis(
         &mut self,
         analysis: CodeAnalysis,
-        date: String,
-        stored_cost: f64,
         emit_analysis: bool,
+        analysis_facts: Vec<AnalysisFact>,
     ) {
-        let mut date_has_usage = stored_cost != 0.0;
+        if !emit_analysis {
+            return;
+        }
+        let has_explicit_facts = !analysis_facts.is_empty();
+        self.analysis_facts.extend(analysis_facts);
         for record in analysis.records {
-            let counters = (
-                record.total_edit_lines,
-                record.total_read_lines,
-                record.total_write_lines,
-                record.tool_call_counts.bash,
-                record.tool_call_counts.edit,
-                record.tool_call_counts.read,
-                record.tool_call_counts.todo_write,
-                record.tool_call_counts.write,
-            );
-
-            for (model, usage) in record.conversation_usage {
-                if meaningful_usage(&usage) {
-                    date_has_usage = true;
+            let timestamp_ms = (record.timestamp > 0).then_some(record.timestamp);
+            let metrics = AnalysisMetrics::from_record(&record);
+            if !has_explicit_facts
+                && (metrics.has_activity() || !record.conversation_usage.is_empty())
+            {
+                let mut models: Vec<_> = record
+                    .conversation_usage
+                    .keys()
+                    .filter(|model| !model.contains("<synthetic>"))
+                    .cloned()
+                    .collect();
+                if models.is_empty() {
+                    models.push(String::new());
                 }
-                if stored_cost != 0.0 {
-                    *self.stored_costs.entry(model.clone()).or_insert(0.0) += stored_cost;
-                }
-                merge_model_usage(&mut self.usage, model.clone(), usage);
-
-                if emit_analysis && !model.contains("<synthetic>") {
-                    let row = self.analysis.entry(model.clone()).or_insert_with(|| {
-                        AggregatedAnalysisRow {
-                            model,
-                            edit_lines: 0,
-                            read_lines: 0,
-                            write_lines: 0,
-                            bash_count: 0,
-                            edit_count: 0,
-                            read_count: 0,
-                            todo_write_count: 0,
-                            write_count: 0,
-                        }
+                for model in models {
+                    self.analysis_facts.push(AnalysisFact {
+                        stable_id: None,
+                        timestamp_ms,
+                        observed_at_ms: timestamp_ms,
+                        source_order: self.analysis_facts.len(),
+                        model,
+                        status: ToolFactStatus::Succeeded,
+                        metrics,
+                        effect: None,
                     });
-                    row.edit_lines += counters.0;
-                    row.read_lines += counters.1;
-                    row.write_lines += counters.2;
-                    row.bash_count += counters.3;
-                    row.edit_count += counters.4;
-                    row.read_count += counters.5;
-                    row.todo_write_count += counters.6;
-                    row.write_count += counters.7;
                 }
             }
-
-            for (model, usage) in record.advisor_usage {
-                if meaningful_usage(&usage) {
-                    date_has_usage = true;
-                }
-                merge_model_usage(&mut self.usage, model, usage);
-            }
-        }
-
-        if date_has_usage {
-            self.usage_dates.insert(date.clone());
-        }
-        if emit_analysis {
-            self.analysis_dates.insert(date);
         }
     }
-}
-
-fn merge_model_usage(result: &mut UsageResult, model: String, usage: serde_json::Value) {
-    result
-        .entry(model)
-        .and_modify(|existing| merge_usage_values(existing, &usage))
-        .or_insert(usage);
-}
-
-fn meaningful_usage(value: &serde_json::Value) -> bool {
-    let counts = extract_token_counts(value);
-    counts.total != 0
-        || counts.input_tokens != 0
-        || counts.output_tokens != 0
-        || counts.reasoning_tokens != 0
-        || counts.cache_read != 0
-        || counts.cache_creation != 0
-        || counts.cache_creation_5m != 0
-        || counts.cache_creation_1h != 0
-        || counts.web_search_requests != 0
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{CodeAnalysisRecord, CodeAnalysisToolCalls};
-    use serde_json::json;
-
-    fn analysis_with_usage(tokens: i64) -> CodeAnalysis {
-        analysis_with_usage_value(json!({ "input_tokens": tokens }))
-    }
-
-    fn analysis_with_usage_value(value: serde_json::Value) -> CodeAnalysis {
-        let mut usage = FastHashMap::default();
-        usage.insert("model".to_string(), value);
-        CodeAnalysis {
-            user: String::new(),
-            extension_name: "Codex".to_string(),
-            insights_version: String::new(),
-            machine_id: String::new(),
-            records: vec![CodeAnalysisRecord {
-                total_unique_files: 0,
-                total_write_lines: 0,
-                total_read_lines: 0,
-                total_edit_lines: 0,
-                total_write_characters: 0,
-                total_read_characters: 0,
-                total_edit_characters: 0,
-                write_file_details: Vec::new(),
-                read_file_details: Vec::new(),
-                edit_file_details: Vec::new(),
-                run_command_details: Vec::new(),
-                tool_call_counts: CodeAnalysisToolCalls::default(),
-                conversation_usage: usage,
-                advisor_usage: FastHashMap::default(),
-                task_id: String::new(),
-                timestamp: 0,
-                folder_path: String::new(),
-                git_remote_url: String::new(),
-            }],
-        }
-    }
 
     #[test]
-    fn zero_usage_does_not_mark_an_active_day() {
-        let summary =
-            CompactSourceSummary::from_file(analysis_with_usage(0), "2026-07-14".to_string(), true);
-        assert!(summary.usage_dates.is_empty());
-    }
-
-    #[test]
-    fn nonzero_usage_marks_an_active_day() {
-        let summary =
-            CompactSourceSummary::from_file(analysis_with_usage(1), "2026-07-14".to_string(), true);
-        assert!(summary.usage_dates.contains("2026-07-14"));
-    }
-
-    #[test]
-    fn published_total_alone_marks_an_active_day() {
-        let summary = CompactSourceSummary::from_file(
-            analysis_with_usage_value(json!({
-                "total_token_usage": { "total_tokens": 7 }
-            })),
-            "2026-07-14".to_string(),
-            false,
+    fn cloned_usage_fact_unit_shares_its_json_payload() {
+        let unit = UsageFactUnit::from_counts(
+            "model".to_string(),
+            crate::utils::TokenCounts {
+                input_tokens: 1,
+                total: 1,
+                ..Default::default()
+            },
+            PricingGranularity::Request,
         );
-        assert!(summary.usage_dates.contains("2026-07-14"));
-    }
+        let cloned = unit.clone();
 
-    #[test]
-    fn tool_only_usage_marks_an_active_day() {
-        let summary = CompactSourceSummary::from_file(
-            analysis_with_usage_value(json!({
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "tool_tokens": 5,
-                "total_tokens": 5
-            })),
-            "2026-07-14".to_string(),
-            false,
-        );
-        assert!(summary.usage_dates.contains("2026-07-14"));
-    }
-
-    #[test]
-    fn emitted_synthetic_session_keeps_analysis_active_day() {
-        let mut analysis = analysis_with_usage(0);
-        let usage = analysis.records[0]
-            .conversation_usage
-            .remove("model")
-            .unwrap();
-        analysis.records[0]
-            .conversation_usage
-            .insert("<synthetic>".to_string(), usage);
-
-        let summary = CompactSourceSummary::from_file(analysis, "2026-07-14".to_string(), true);
-        assert!(summary.analysis.is_empty());
-        assert!(summary.analysis_dates.contains("2026-07-14"));
+        assert!(std::sync::Arc::ptr_eq(&unit.usage, &cloned.usage));
     }
 
     #[test]

@@ -19,7 +19,7 @@
 
 </div>
 
-**Track your AI coding costs in real-time.** Vibe Coding Tracker is a lightweight, high-performance CLI tool built in Rust that monitors and analyzes your Claude Code, Codex, Copilot, Gemini, OpenCode, Cursor, Hermes, and Grok usage — with detailed cost breakdowns, token statistics, and code operation insights, all while keeping the memory footprint minimal.
+**Audit local AI coding usage and estimate its cost.** Vibe Coding Tracker is a lightweight, high-performance CLI tool built in Rust that analyzes your Claude Code, Codex, Copilot, Gemini, OpenCode, Cursor, Hermes, and Grok usage from local session data, with provider-reported costs when available, current LiteLLM list-rate estimates otherwise, token statistics, and code operation insights.
 
 [English](README.md) | [繁體中文](README.zh-TW.md) | [简体中文](README.zh-CN.md)
 
@@ -31,7 +31,7 @@
 
 ### Know Your Costs
 
-Stop wondering how much your AI coding sessions cost. Get **real-time cost tracking** with automatic pricing updates from [LiteLLM](https://github.com/BerriAI/litellm).
+Review the usage recorded by your AI coding sessions. Provider-reported costs take priority when available; otherwise vct estimates cost using a validated daily pricing snapshot from [LiteLLM](https://github.com/BerriAI/litellm).
 
 ### Ultra-Lightweight
 
@@ -44,7 +44,7 @@ Choose your preferred view:
 - **Interactive Dashboard**: Responsive terminal UI with an immediate loading spinner, background incremental refreshes, a scrollable model list (arrow keys), a live per-process CPU/memory readout, and compact K/M/B number formatting
 - **Static Reports**: Professional tables for documentation
 - **Script-Friendly**: Plain text and JSON for automation
-- **Full Precision**: Export exact costs for accounting
+- **Auditable Exports**: Export normalized usage, provider-reported costs, and current list-rate estimates
 
 ### Zero Configuration
 
@@ -65,7 +65,7 @@ Automatically detects and processes logs from Claude Code, Codex, Copilot, Gemin
 | Feature               | Description                                                              |
 | --------------------- | ------------------------------------------------------------------------ |
 | **Multi-Provider**    | Claude Code, Codex, Copilot, Gemini, OpenCode, Cursor, Hermes, and Grok  |
-| **Smart Pricing**     | Fuzzy model matching + daily cache from LiteLLM                          |
+| **Smart Pricing**     | Provider costs + validated daily LiteLLM list-rate estimates             |
 | **4 Display Modes**   | Interactive TUI, static table, plain text, and JSON                      |
 | **Dual Analysis**     | Token/cost stats (`usage`) + code operation stats (`analysis`)           |
 | **Live Quota Panels** | Live remaining quota for Claude, Codex, Copilot, and Cursor              |
@@ -296,6 +296,8 @@ The tool automatically scans these directories:
 - `$GROK_HOME/sessions/*/*/signals.json` (Grok CLI — defaults to `~/.grok`; sibling `updates.jsonl` supplies `analysis` data)
 
 Grok `usage` is one point-in-time local context estimate: vct records `signals.json`'s `contextTokensUsed` as cache-read tokens and estimates cost at the model's cache-read price. It is not cumulative billed usage. `analysis` reconstructs completed Read / Write / Edit / Bash / TodoWrite operations from the sibling `updates.jsonl`. Grok does not support quota panels or `vct fetch`.
+
+Time ranges use each usage event or tool invocation timestamp, never the session file's modification time. A resumed file can therefore contribute only its in-range events. Recognized tool invocations count once even when pending, failed, rejected, or cancelled; lines, details, unique files, and other effects require confirmed success.
 
 For noninteractive `usage` and `analysis` scans, vct exits with an error when every discovered source fails. If only some sources fail, it keeps the successful results and prints one diagnostic summary to stderr. The TUI stays best-effort and preserves its last successful payload instead.
 
@@ -648,6 +650,8 @@ vct config migrate
 
 ### Model Matching
 
+The general matcher below is used for model discovery and labels. Monetary calculation is stricter: it accepts only an exact key or one unambiguous provider-aware normalized alias, never substring or fuzzy guesses.
+
 **Priority Order**:
 
 1. **Exact Match**: `claude-sonnet-4` → `claude-sonnet-4`
@@ -658,9 +662,13 @@ vct config migrate
 
 ### Cost Details
 
+- **Precedence**: each pricing unit uses a provider-reported actual cost first, then a provider-stored estimate including an explicit `$0`, and only falls back to the current LiteLLM list rate when provider cost is absent.
+- **Request tiers**: threshold and range pricing is selected for each request independently. Provider aggregates with no request boundary use base rates; a range-only aggregate stays unresolved instead of guessing a tier. If the active price level lacks a rate for any token bucket the request used, the request stays unresolved instead of returning a partial cost.
+- **Provider modifiers**: Claude's response-reported `usage.speed` and `inference_geo` select the matching LiteLLM `provider_specific_entry` multiplier. Fast and residency multipliers stack on token and prompt-cache cost, but not on per-query web-search charges. A reported modifier with no published multiplier stays unresolved instead of silently using the standard rate.
+- **Estimate scope**: LiteLLM fallback is a current list-rate estimate, not a historical invoice or a guarantee that subscription, enterprise, regional, batch, or negotiated pricing matches.
 - **Beyond tokens**: Claude web-search tool calls (`server_tool_use.web_search_requests`) are billed per query on top of the token cost; every other model's per-query charge is $0.
-- **OpenCode**: a novel model name is priced from its tokens only on an **exact** LiteLLM match; with no exact match, vct trusts the assistant message's own stored cost instead of guessing from a loosely-similar name.
-- **Hermes**: priced the same way as OpenCode — an **exact** LiteLLM match prices from tokens, otherwise vct uses Hermes's own stored cost.
+- **OpenCode**: each assistant message's stored cost is authoritative, including an explicit `$0`; only a missing stored cost permits strict LiteLLM fallback.
+- **Hermes**: actual cost is authoritative, then Hermes's stored estimate; only missing cost permits strict LiteLLM fallback.
 - **Grok**: `contextTokensUsed` is priced as cache-read tokens only; this is a point-in-time local context estimate, not cumulative billed usage.
 - **Cache is raw**: the daily cache stores the filtered upstream LiteLLM JSON (not a derived shape), so tiered / batch pricing stays available without re-fetching, and each pricing map owns a small in-process LRU so repeated lookups stay cheap without cross-map contamination.
 

@@ -3,7 +3,7 @@ use super::cache::{ModelPricing, TierRange};
 /// Calculates total cost for a request given token counts and the model's pricing.
 ///
 /// Strategy (highest priority first):
-/// 1. If `pricing.ranges` is `Some`, selects a `TierRange` by `input_tokens`
+/// 1. If `pricing.ranges` is `Some`, selects a `TierRange` by total input context
 ///    (Qwen / doubao style volume tiers) — tier prices apply standalone.
 /// 2. Otherwise, if `pricing.tiers` is non-empty, picks the highest tier whose
 ///    `threshold_tokens` is exceeded by total input context
@@ -21,9 +21,9 @@ use super::cache::{ModelPricing, TierRange};
 /// Grok, …) continue to bill correctly.
 ///
 /// `cache_creation_5m_tokens` and `cache_creation_1h_tokens` are priced
-/// separately (5-minute default TTL vs 1-hour extended TTL). When a model
-/// doesn't publish a 1hr price (value is 0.0), the 5m price is used for both
-/// buckets — matching current behaviour for providers that don't split TTL.
+/// separately (5-minute default TTL vs 1-hour extended TTL). A missing 1-hour
+/// rate leaves that component unpriced instead of silently substituting the
+/// 5-minute rate.
 ///
 /// # Examples
 ///
@@ -71,7 +71,8 @@ pub fn calculate_cost(
         cc_5m_price,
         cc_1h_price_raw,
     ) = if let Some(ranges) = &pricing.ranges {
-        let r = select_range(ranges, input_tokens);
+        let total_input_context = input_tokens + cache_read_tokens + total_cache_creation;
+        let r = select_range(ranges, total_input_context);
         (
             r.map(|r| r.input_cost_per_token).unwrap_or(0.0),
             r.map(|r| r.output_cost_per_token).unwrap_or(0.0),
@@ -120,37 +121,177 @@ pub fn calculate_cost(
         output_price
     };
 
-    // If the active level doesn't publish a 1hr price, bill 1h tokens at the 5m
-    // rate (safer to under-bill than fabricate; also matches providers with no
-    // TTL split where cc_5m_price already covers the whole cache_creation bucket).
-    let cc_1h_price = if cc_1h_price_raw > 0.0 {
-        cc_1h_price_raw
-    } else {
-        cc_5m_price
-    };
-
     input_tokens as f64 * input_price
         + output_tokens as f64 * output_price
         + reasoning_tokens as f64 * reasoning_price
         + cache_read_tokens as f64 * cache_read_price
         + cache_creation_5m_tokens as f64 * cc_5m_price
-        + cache_creation_1h_tokens as f64 * cc_1h_price
+        + cache_creation_1h_tokens as f64 * cc_1h_price_raw
+}
+
+#[derive(Clone, Copy)]
+struct TokenRates {
+    input: f64,
+    output: f64,
+    reasoning: f64,
+    cache_read: f64,
+    cache_creation_5m: f64,
+    cache_creation_1h: f64,
+}
+
+impl TokenRates {
+    fn base(pricing: &ModelPricing) -> Self {
+        Self {
+            input: pricing.input_cost_per_token,
+            output: pricing.output_cost_per_token,
+            reasoning: if pricing.output_cost_per_reasoning_token > 0.0 {
+                pricing.output_cost_per_reasoning_token
+            } else {
+                pricing.output_cost_per_token
+            },
+            cache_read: pricing.cache_read_input_token_cost,
+            cache_creation_5m: pricing.cache_creation_input_token_cost,
+            cache_creation_1h: pricing.cache_creation_input_token_cost_above_1hr,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn covers(
+        self,
+        input_tokens: i64,
+        output_tokens: i64,
+        reasoning_tokens: i64,
+        cache_read_tokens: i64,
+        cache_creation_5m_tokens: i64,
+        cache_creation_1h_tokens: i64,
+    ) -> bool {
+        bucket_has_rate(input_tokens, self.input)
+            && bucket_has_rate(output_tokens, self.output)
+            && bucket_has_rate(reasoning_tokens, self.reasoning)
+            && bucket_has_rate(cache_read_tokens, self.cache_read)
+            && bucket_has_rate(cache_creation_5m_tokens, self.cache_creation_5m)
+            && bucket_has_rate(cache_creation_1h_tokens, self.cache_creation_1h)
+    }
+}
+
+fn bucket_has_rate(tokens: i64, rate: f64) -> bool {
+    tokens <= 0 || rate > 0.0
+}
+
+fn request_token_rates(input_context: i64, pricing: &ModelPricing) -> Option<TokenRates> {
+    if let Some(ranges) = &pricing.ranges {
+        let range = select_range(ranges, input_context)?;
+        let output = range.output_cost_per_token;
+        return Some(TokenRates {
+            input: range.input_cost_per_token,
+            output,
+            reasoning: if range.output_cost_per_reasoning_token > 0.0 {
+                range.output_cost_per_reasoning_token
+            } else {
+                output
+            },
+            cache_read: range.cache_read_input_token_cost,
+            cache_creation_5m: pricing.cache_creation_input_token_cost,
+            cache_creation_1h: pricing.cache_creation_input_token_cost_above_1hr,
+        });
+    }
+
+    let active_tier = pricing
+        .tiers
+        .iter()
+        .rev()
+        .find(|tier| input_context > tier.threshold_tokens);
+    Some(match active_tier {
+        Some(tier) => TokenRates {
+            input: tier.input_cost_per_token,
+            output: tier.output_cost_per_token,
+            reasoning: tier.output_cost_per_token,
+            cache_read: tier.cache_read_input_token_cost,
+            cache_creation_5m: tier.cache_creation_input_token_cost,
+            cache_creation_1h: tier.cache_creation_input_token_cost_above_1hr,
+        },
+        None => TokenRates::base(pricing),
+    })
+}
+
+/// Calculates one request and reports `None` when its active price level
+/// cannot price every token bucket that the request actually used.
+pub(crate) fn calculate_request_cost(
+    input_tokens: i64,
+    output_tokens: i64,
+    reasoning_tokens: i64,
+    cache_read_tokens: i64,
+    cache_creation_5m_tokens: i64,
+    cache_creation_1h_tokens: i64,
+    pricing: &ModelPricing,
+) -> Option<f64> {
+    let input_context =
+        input_tokens + cache_read_tokens + cache_creation_5m_tokens + cache_creation_1h_tokens;
+    let rates = request_token_rates(input_context, pricing)?;
+    if !rates.covers(
+        input_tokens,
+        output_tokens,
+        reasoning_tokens,
+        cache_read_tokens,
+        cache_creation_5m_tokens,
+        cache_creation_1h_tokens,
+    ) {
+        return None;
+    }
+    Some(calculate_cost(
+        input_tokens,
+        output_tokens,
+        reasoning_tokens,
+        cache_read_tokens,
+        cache_creation_5m_tokens,
+        cache_creation_1h_tokens,
+        pricing,
+    ))
+}
+
+/// Prices an aggregate using only the model's base rates. Threshold tiers
+/// cannot be inferred from a sum of independent requests.
+pub(crate) fn calculate_base_cost(
+    input_tokens: i64,
+    output_tokens: i64,
+    reasoning_tokens: i64,
+    cache_read_tokens: i64,
+    cache_creation_5m_tokens: i64,
+    cache_creation_1h_tokens: i64,
+    pricing: &ModelPricing,
+) -> Option<f64> {
+    if pricing.ranges.is_some() {
+        return None;
+    }
+    let rates = TokenRates::base(pricing);
+    if !rates.covers(
+        input_tokens,
+        output_tokens,
+        reasoning_tokens,
+        cache_read_tokens,
+        cache_creation_5m_tokens,
+        cache_creation_1h_tokens,
+    ) {
+        return None;
+    }
+    Some(
+        input_tokens as f64 * rates.input
+            + output_tokens as f64 * rates.output
+            + reasoning_tokens as f64 * rates.reasoning
+            + cache_read_tokens as f64 * rates.cache_read
+            + cache_creation_5m_tokens as f64 * rates.cache_creation_5m
+            + cache_creation_1h_tokens as f64 * rates.cache_creation_1h,
+    )
 }
 
 /// Selects a `TierRange` for range-based pricing.
 ///
-/// Ranges are sorted by `min_tokens` ascending at parse time, so the **last**
-/// range whose `min_tokens <= input_tokens` is the right match — this naturally
-/// handles both in-range hits and over-cap inputs (where `input_tokens` exceeds
-/// every defined `max_tokens`) with a single pass. Inputs below the lowest
-/// range's `min_tokens` (unexpected for LiteLLM data, which starts at 0) fall
-/// back to the first range so we still bill rather than silently return $0.
-fn select_range(ranges: &[TierRange], input_tokens: i64) -> Option<&TierRange> {
+/// Both bounds are authoritative. A gap, an input below the first range, or an
+/// input at or above the final exclusive maximum is deliberately unresolved.
+fn select_range(ranges: &[TierRange], input_context: i64) -> Option<&TierRange> {
     ranges
         .iter()
-        .rev()
-        .find(|r| r.min_tokens <= input_tokens)
-        .or_else(|| ranges.first())
+        .find(|range| range.min_tokens <= input_context && input_context < range.max_tokens)
 }
 
 #[cfg(test)]
@@ -323,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn test_range_based_falls_back_to_last_range_for_overflow() {
+    fn test_range_based_overflow_is_unpriced() {
         let p = ModelPricing {
             ranges: Some(vec![TierRange {
                 min_tokens: 0,
@@ -335,9 +476,9 @@ mod tests {
             ..Default::default()
         };
 
-        // 200K exceeds every defined range — fall back to the last one.
+        // 200K exceeds every defined range, so no arbitrary range is applied.
         let cost = calculate_cost(200_000, 0, 0, 0, 0, 0, &p);
-        assert_eq!(cost, 200_000.0 * 0.000001);
+        assert_eq!(cost, 0.0);
     }
 
     #[test]
@@ -368,9 +509,9 @@ mod tests {
     }
 
     #[test]
-    fn test_1hr_falls_back_to_5m_when_model_has_no_extended_price() {
-        // A model with only a 5m price — 1h tokens should still be billed
-        // (at the 5m rate) rather than silently costing $0.
+    fn test_missing_1hr_price_does_not_substitute_5m_rate() {
+        // A missing extended rate is incomplete pricing data, not evidence
+        // that 1h writes cost the same as 5m writes.
         let p = ModelPricing {
             cache_creation_input_token_cost: 6.25e-6,
             cache_creation_input_token_cost_above_1hr: 0.0,
@@ -378,7 +519,84 @@ mod tests {
         };
 
         let cost = calculate_cost(0, 0, 0, 0, 0, 10_000, &p);
-        assert_eq!(cost, 10_000.0 * 6.25e-6);
+        assert_eq!(cost, 0.0);
+    }
+
+    #[test]
+    fn request_and_aggregate_cost_are_unresolved_when_base_1hr_rate_is_missing() {
+        let p = ModelPricing {
+            input_cost_per_token: 3e-6,
+            cache_creation_input_token_cost: 3.75e-6,
+            cache_creation_input_token_cost_above_1hr: 0.0,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            calculate_request_cost(1_000, 0, 0, 0, 500, 10_000, &p),
+            None
+        );
+        assert_eq!(calculate_base_cost(1_000, 0, 0, 0, 500, 10_000, &p), None);
+    }
+
+    #[test]
+    fn request_cost_is_unresolved_when_active_tier_1hr_rate_is_missing() {
+        let p = ModelPricing {
+            input_cost_per_token: 3e-6,
+            cache_creation_input_token_cost: 3.75e-6,
+            cache_creation_input_token_cost_above_1hr: 6e-6,
+            tiers: vec![ThresholdTier {
+                threshold_tokens: 200_000,
+                input_cost_per_token: 6e-6,
+                cache_creation_input_token_cost: 7.5e-6,
+                cache_creation_input_token_cost_above_1hr: 0.0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(calculate_request_cost(100_000, 0, 0, 0, 500, 10_000, &p).is_some());
+        assert_eq!(
+            calculate_request_cost(250_000, 0, 0, 0, 500, 10_000, &p),
+            None
+        );
+    }
+
+    #[test]
+    fn request_cost_requires_a_rate_for_every_used_bucket() {
+        let p = ModelPricing {
+            input_cost_per_token: 1e-6,
+            output_cost_per_token: 2e-6,
+            output_cost_per_reasoning_token: 3e-6,
+            cache_read_input_token_cost: 4e-6,
+            cache_creation_input_token_cost: 5e-6,
+            cache_creation_input_token_cost_above_1hr: 6e-6,
+            ..Default::default()
+        };
+
+        let mut missing = p.clone();
+        missing.input_cost_per_token = 0.0;
+        assert_eq!(calculate_request_cost(1, 0, 0, 0, 0, 0, &missing), None);
+
+        let mut missing = p.clone();
+        missing.output_cost_per_token = 0.0;
+        assert_eq!(calculate_request_cost(0, 1, 0, 0, 0, 0, &missing), None);
+
+        let mut missing = p.clone();
+        missing.output_cost_per_reasoning_token = 0.0;
+        missing.output_cost_per_token = 0.0;
+        assert_eq!(calculate_request_cost(0, 0, 1, 0, 0, 0, &missing), None);
+
+        let mut missing = p.clone();
+        missing.cache_read_input_token_cost = 0.0;
+        assert_eq!(calculate_request_cost(0, 0, 0, 1, 0, 0, &missing), None);
+
+        let mut missing = p.clone();
+        missing.cache_creation_input_token_cost = 0.0;
+        assert_eq!(calculate_request_cost(0, 0, 0, 0, 1, 0, &missing), None);
+
+        let mut missing = p;
+        missing.cache_creation_input_token_cost_above_1hr = 0.0;
+        assert_eq!(calculate_request_cost(0, 0, 0, 0, 0, 1, &missing), None);
     }
 
     #[test]

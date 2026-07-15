@@ -6,9 +6,11 @@
 //! re-exports below; the `cache` / `calculation` / `matching` submodules are
 //! internal wiring.
 //!
-//! Lookup proceeds exact -> normalized -> substring -> Jaro-Winkler fuzzy
-//! (see [`ModelPricingMap::get`]), and cost is computed by [`calculate_cost`]
-//! across flat, threshold-tiered, and range-tiered pricing shapes.
+//! General lookup proceeds exact -> normalized -> substring -> Jaro-Winkler
+//! fuzzy (see [`ModelPricingMap::get`]). Monetary lookup is stricter: it uses
+//! only an exact key or one unambiguous provider-aware normalized alias. Cost
+//! is computed by [`calculate_cost`] across flat, threshold-tiered, and
+//! range-tiered pricing shapes.
 
 mod cache;
 mod calculation;
@@ -37,6 +39,7 @@ static FAILED_FETCHES: LazyLock<Mutex<HashMap<PricingFetchKey, Instant>>> =
 // Re-export public types and functions
 pub use cache::{ModelPricing, ThresholdTier, TierRange};
 pub use calculation::calculate_cost;
+pub(crate) use calculation::{calculate_base_cost, calculate_request_cost};
 pub use matching::{
     ModelPricingMap, ModelPricingResult, clear_pricing_cache, normalize_model_name,
 };
@@ -116,9 +119,15 @@ pub fn fetch_model_pricing_with(url: &str, cache_dir: &Path) -> Result<ModelPric
         // Load from cache
         match cache::load_from_cache_in(cache_dir) {
             Ok(pricing) => {
-                log::debug!("Loaded model pricing from today's cache");
-                clear_fetch_failure(&fetch_key);
-                return Ok(ModelPricingMap::new(pricing));
+                if cache::pricing_needs_provider_modifier_refresh(&pricing) {
+                    log::warn!(
+                        "Today's pricing cache predates provider-specific modifiers; refreshing"
+                    );
+                } else {
+                    log::debug!("Loaded model pricing from today's cache");
+                    clear_fetch_failure(&fetch_key);
+                    return Ok(ModelPricingMap::new(pricing));
+                }
             }
             Err(e) => {
                 log::warn!("Failed to load from cache: {}, fetching from remote", e);
@@ -180,7 +189,7 @@ fn fetch_model_pricing_remote(
         "Invalid model pricing JSON: top-level value must be an object"
     );
 
-    // Project the upstream JSON down to just the cost-related keys before
+    // Project the upstream JSON down to just the pricing-related keys before
     // anything else. Doing the filter first guarantees the on-disk cache
     // and the in-memory `ModelPricing` are derived from the *same* view of
     // the data — so nothing we price against can differ from what the
@@ -194,12 +203,12 @@ fn fetch_model_pricing_remote(
     );
     let pricing = cache::normalize_pricing(parsed);
     anyhow::ensure!(
-        !pricing.is_empty(),
+        cache::pricing_has_real_price(&pricing),
         "Invalid model pricing JSON: no priced models"
     );
 
     // Save the filtered raw JSON to cache. We deliberately persist the raw
-    // cost keys (rather than our derived `ModelPricing` shape) so
+    // pricing keys (rather than our derived `ModelPricing` shape) so
     // priority / flex / batch / audio / image tiers that `calculate_cost`
     // doesn't consume yet are still available to future versions without
     // a re-fetch.
@@ -242,8 +251,7 @@ mod tests {
 
     #[test]
     fn test_normalize_pricing_preserves_valid_model() {
-        // normalize_pricing no longer mutates prices — it only drops zero-cost
-        // entries. Verify a model with valid base prices survives unchanged.
+        // normalize_pricing never mutates valid prices.
         let mut pricing_map = HashMap::new();
         pricing_map.insert(
             "test-model".to_string(),
@@ -268,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_pricing_filters_zero_cost_models() {
+    fn test_normalize_pricing_keeps_zero_cost_tombstones() {
         let mut pricing_map = HashMap::new();
 
         // Add a valid model with non-zero costs
@@ -281,7 +289,8 @@ mod tests {
             },
         );
 
-        // Add a model with all zero costs - should be filtered out
+        // Zero-cost entries remain so monetary lookup cannot fall through to
+        // a similarly named paid model.
         pricing_map.insert("zero-cost-model".to_string(), ModelPricing::default());
 
         // Add another model with all zero costs
@@ -298,10 +307,9 @@ mod tests {
 
         let normalized = cache::normalize_pricing(pricing_map);
 
-        // Only the valid model should remain
-        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized.len(), 3);
         assert!(normalized.contains_key("valid-model"));
-        assert!(!normalized.contains_key("zero-cost-model"));
-        assert!(!normalized.contains_key("another-zero-model"));
+        assert!(normalized.contains_key("zero-cost-model"));
+        assert!(normalized.contains_key("another-zero-model"));
     }
 }

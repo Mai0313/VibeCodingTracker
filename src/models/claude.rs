@@ -54,6 +54,11 @@ pub struct ClaudeCodeLog {
 /// swallowed without allocating.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ClaudeMessage {
+    /// Stable provider message identifier. Claude Code can emit several
+    /// streamed snapshots with the same id; only the final snapshot carries
+    /// the authoritative usage for that inference.
+    #[serde(default)]
+    pub id: String,
     /// Model name that produced an assistant message.
     #[serde(default)]
     pub model: Option<String>,

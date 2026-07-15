@@ -10,13 +10,25 @@
 //! applied only when their paired output explicitly reports success.
 use crate::constants::FastHashMap;
 use crate::models::*;
-use crate::session::diagnostics::{ParseDiagnostics, ParsedAnalysis};
+use crate::session::diagnostics::{
+    AnalysisFact, AnalysisFactEffect, AnalysisMetrics, AnalysisStateSnapshot, ParseDiagnostics,
+    ParsedAnalysis, PricingGranularity, ToolFactStatus, UsageFact, UsageFactUnit,
+};
 use crate::session::state::{ParseMode, SessionParseState};
 use crate::utils::{get_git_remote_url, parse_iso_timestamp, process_codex_usage};
 use anyhow::Result;
 use regex::Regex;
 use serde_json::Value;
 use std::borrow::Borrow;
+use std::collections::HashSet;
+
+const CODEX_TOKEN_FIELDS: [&str; 5] = [
+    "input_tokens",
+    "cached_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+];
 
 /// Parse Codex session records from a slice of pre-typed logs.
 ///
@@ -55,13 +67,23 @@ where
     let mut state = SessionParseState::with_mode(mode);
     let mut conversation_usage: FastHashMap<String, Value> = FastHashMap::with_capacity(5);
     let mut current_model = String::new();
-    let mut replay_baseline = None;
-    let mut shell_calls: FastHashMap<String, PendingCodexShellCall> =
+    let mut previous_total_usage = None;
+    let mut shell_calls: FastHashMap<String, PendingCodexShellInvocation> =
         FastHashMap::with_capacity(50);
-    let mut custom_calls: FastHashMap<String, CodexCustomCall> = FastHashMap::with_capacity(32);
+    let mut running_shell_calls: FastHashMap<u64, RunningCodexShellInvocation> =
+        FastHashMap::with_capacity(16);
+    let mut shell_poll_sessions: FastHashMap<String, u64> = FastHashMap::with_capacity(16);
+    let mut custom_calls: FastHashMap<String, PendingCodexCustomInvocation> =
+        FastHashMap::with_capacity(32);
+    let mut processed_patch_calls: HashSet<String> = HashSet::with_capacity(32);
     let mut diagnostics = ParseDiagnostics::default();
+    let mut usage_facts = Vec::new();
+    let mut analysis_facts = Vec::new();
+    let mut analysis_fact_indices: FastHashMap<String, usize> = FastHashMap::with_capacity(50);
+    let mut source_order = 0usize;
 
     for entry in logs {
+        source_order += 1;
         let entry = entry.borrow();
         let recognized = matches!(
             entry.log_type.as_str(),
@@ -118,25 +140,101 @@ where
                 }
             }
             "event_msg" => {
-                if let Some(payload_type) = &entry.payload.payload_type
-                    && payload_type == "token_count"
-                    && let Some(info) = entry.payload.info.as_ref().filter(|info| !info.is_null())
-                {
-                    if !is_supported_codex_usage(info) {
-                        diagnostics.record_relevant(false);
-                    } else if current_model.is_empty() {
-                        diagnostics.record_relevant(true);
-                        if let Some(total) = info.get("total_token_usage") {
-                            replay_baseline = Some(total.clone());
-                        }
-                    } else {
-                        diagnostics.record_relevant(true);
-                        if let Some(baseline) = &replay_baseline {
-                            let adjusted = subtract_codex_replay_baseline(info, baseline);
-                            process_codex_usage(&mut conversation_usage, &current_model, &adjusted);
+                if let Some(payload_type) = &entry.payload.payload_type {
+                    if payload_type == "token_count"
+                        && let Some(info) =
+                            entry.payload.info.as_ref().filter(|info| !info.is_null())
+                    {
+                        if !is_supported_codex_usage(info) {
+                            diagnostics.record_relevant(false);
                         } else {
-                            process_codex_usage(&mut conversation_usage, &current_model, info);
+                            diagnostics.record_relevant(true);
+                            if let Some(usage) = accumulate_codex_usage_event(
+                                &mut conversation_usage,
+                                &current_model,
+                                info,
+                                &mut previous_total_usage,
+                            ) {
+                                usage_facts.push(UsageFact::anonymous(
+                                    ts,
+                                    source_order,
+                                    vec![UsageFactUnit::from_value(
+                                        current_model.clone(),
+                                        &usage,
+                                        PricingGranularity::Request,
+                                    )],
+                                ));
+                            }
                         }
+                    } else if payload_type == "patch_apply_end" {
+                        let Some(call_id) = entry.payload.call_id.as_deref() else {
+                            diagnostics.record_relevant(false);
+                            continue;
+                        };
+                        if processed_patch_calls.contains(call_id) {
+                            diagnostics.record_relevant(true);
+                            continue;
+                        }
+
+                        let pending_custom = custom_calls.remove(call_id);
+                        let pending_shell = shell_calls.remove(call_id);
+                        let invocation_ts = pending_custom
+                            .as_ref()
+                            .map(PendingCodexCustomInvocation::timestamp)
+                            .or_else(|| {
+                                pending_shell
+                                    .as_ref()
+                                    .map(PendingCodexShellInvocation::timestamp)
+                            })
+                            .unwrap_or(ts);
+                        let kind = entry
+                            .payload
+                            .info
+                            .as_ref()
+                            .and_then(Value::as_object)
+                            .map(structured_patch_kind)
+                            .unwrap_or(PatchInvocationKind::Edit);
+                        let fact_index = pending_custom
+                            .as_ref()
+                            .map(PendingCodexCustomInvocation::fact_index)
+                            .or_else(|| {
+                                pending_shell
+                                    .as_ref()
+                                    .map(PendingCodexShellInvocation::fact_index)
+                            })
+                            .unwrap_or_else(|| {
+                                ensure_codex_analysis_fact(
+                                    &mut analysis_facts,
+                                    &mut analysis_fact_indices,
+                                    call_id,
+                                    &current_model,
+                                    invocation_ts,
+                                    source_order,
+                                    patch_invocation_metrics(kind),
+                                )
+                            });
+                        set_codex_fact_invocation_metrics(
+                            &mut analysis_facts,
+                            fact_index,
+                            patch_invocation_metrics(kind),
+                        );
+                        let outcome = structured_patch_result(&entry.payload);
+                        let effect_paths = structured_patch_effect_paths(&state, &entry.payload);
+                        let effect_before = AnalysisStateSnapshot::capture(&state);
+                        let before = AnalysisMetrics::from_state(&state);
+                        let normalized =
+                            dispatch_structured_patch(&mut state, &entry.payload, invocation_ts);
+                        diagnostics.record_relevant(normalized);
+                        update_codex_analysis_fact(
+                            &mut analysis_facts,
+                            fact_index,
+                            outcome.fact_status(),
+                            ts,
+                            successful_effect_metrics(before, &state, outcome.is_success()),
+                            (outcome.is_success() && normalized)
+                                .then(|| effect_before.effect_since(&state, effect_paths)),
+                        );
+                        processed_patch_calls.insert(call_id.to_string());
                     }
                 }
             }
@@ -145,6 +243,22 @@ where
                     match payload_type.as_str() {
                         "function_call" => {
                             if let Some(name) = entry.payload.name.as_deref()
+                                && name == "write_stdin"
+                            {
+                                if let Some(call_id) = entry
+                                    .payload
+                                    .call_id
+                                    .as_deref()
+                                    .filter(|call_id| !call_id.is_empty())
+                                    && let Some(session_id) = entry
+                                        .payload
+                                        .arguments
+                                        .as_deref()
+                                        .and_then(parse_write_stdin_session_id)
+                                {
+                                    shell_poll_sessions.insert(call_id.to_string(), session_id);
+                                }
+                            } else if let Some(name) = entry.payload.name.as_deref()
                                 && matches!(name, "shell" | "exec_command")
                             {
                                 let call = entry
@@ -152,12 +266,35 @@ where
                                     .arguments
                                     .as_deref()
                                     .and_then(|args| parse_function_call(name, args, ts));
-                                if let Some(call_id) = entry.payload.call_id.as_deref() {
+                                let metrics = call
+                                    .as_ref()
+                                    .map(shell_invocation_metrics)
+                                    .unwrap_or_else(bash_invocation_metrics);
+                                if let Some(call_id) = entry
+                                    .payload
+                                    .call_id
+                                    .as_deref()
+                                    .filter(|call_id| !call_id.is_empty())
+                                {
+                                    let fact_index = ensure_codex_analysis_fact(
+                                        &mut analysis_facts,
+                                        &mut analysis_fact_indices,
+                                        call_id,
+                                        &current_model,
+                                        ts,
+                                        source_order,
+                                        metrics,
+                                    );
                                     if let Some(call) = call {
                                         diagnostics.record_relevant(true);
                                         shell_calls.insert(
                                             call_id.to_string(),
-                                            PendingCodexShellCall::Parsed(call),
+                                            PendingCodexShellInvocation {
+                                                call: Some(call),
+                                                timestamp: ts,
+                                                fact_index,
+                                                accumulated_output: String::new(),
+                                            },
                                         );
                                     } else {
                                         // Defer the schema verdict until the paired output. Codex
@@ -165,29 +302,121 @@ where
                                         // lifecycle records even though no command ran.
                                         shell_calls.insert(
                                             call_id.to_string(),
-                                            PendingCodexShellCall::InvalidArguments,
+                                            PendingCodexShellInvocation {
+                                                call: None,
+                                                timestamp: ts,
+                                                fact_index,
+                                                accumulated_output: String::new(),
+                                            },
                                         );
                                     }
                                 } else {
+                                    diagnostics.record_relevant(true);
+                                    if call.is_none() {
+                                        diagnostics.record_relevant(false);
+                                    }
                                     diagnostics.record_relevant(false);
+                                    record_invocation_metrics(&mut state, metrics);
+                                    push_anonymous_codex_analysis_fact(
+                                        &mut analysis_facts,
+                                        &current_model,
+                                        ts,
+                                        source_order,
+                                        metrics,
+                                    );
                                 }
                             }
                         }
                         "function_call_output" => {
-                            if let Some(call_id) = &entry.payload.call_id
+                            if entry.payload.call_id.as_deref().is_none_or(str::is_empty) {
+                                diagnostics.record_relevant(false);
+                            } else if let Some(call_id) = &entry.payload.call_id
                                 && let Some(call) = shell_calls.remove(call_id)
                             {
-                                match call {
-                                    PendingCodexShellCall::Parsed(call) => {
-                                        diagnostics.record_relevant(true);
-                                        let output = shell_output(entry.payload.output.as_deref());
-                                        state.handle_shell_call(call, output);
+                                if processed_patch_calls.contains(call_id) {
+                                    diagnostics.record_relevant(true);
+                                    continue;
+                                }
+                                let output = shell_output(entry.payload.output.as_deref());
+                                if call.call.is_some()
+                                    && let Some(session_id) = running_shell_session_id(&output)
+                                {
+                                    let mut running = RunningCodexShellInvocation {
+                                        original_call_id: call_id.to_string(),
+                                        invocation: call,
+                                    };
+                                    append_shell_output_chunk(&mut running.invocation, &output);
+                                    touch_codex_analysis_fact(
+                                        &mut analysis_facts,
+                                        running.invocation.fact_index,
+                                        ts,
+                                    );
+                                    diagnostics.record_relevant(true);
+                                    if let Some(displaced) =
+                                        running_shell_calls.insert(session_id, running)
+                                        && let Some(displaced_call) = displaced.invocation.call
+                                    {
+                                        record_pending_shell_invocation(
+                                            &mut state,
+                                            &displaced_call,
+                                        );
                                     }
-                                    PendingCodexShellCall::InvalidArguments => {
-                                        diagnostics.record_relevant(output_reports_argument_error(
-                                            entry.payload.output.as_deref(),
-                                        ));
+                                } else {
+                                    if finalize_codex_shell_invocation(
+                                        &mut state,
+                                        &mut diagnostics,
+                                        &mut analysis_facts,
+                                        call,
+                                        output,
+                                        ts,
+                                    ) {
+                                        processed_patch_calls.insert(call_id.to_string());
                                     }
+                                }
+                            } else if let Some(call_id) = &entry.payload.call_id
+                                && let Some(session_id) = shell_poll_sessions.remove(call_id)
+                                && let Some(mut running) = running_shell_calls.remove(&session_id)
+                            {
+                                let output = shell_output(entry.payload.output.as_deref());
+                                if let Some(next_session_id) = running_shell_session_id(&output) {
+                                    append_shell_output_chunk(&mut running.invocation, &output);
+                                    touch_codex_analysis_fact(
+                                        &mut analysis_facts,
+                                        running.invocation.fact_index,
+                                        ts,
+                                    );
+                                    diagnostics.record_relevant(true);
+                                    if let Some(displaced) =
+                                        running_shell_calls.insert(next_session_id, running)
+                                        && let Some(displaced_call) = displaced.invocation.call
+                                    {
+                                        record_pending_shell_invocation(
+                                            &mut state,
+                                            &displaced_call,
+                                        );
+                                    }
+                                } else if running.invocation.call.as_ref().is_some_and(|call| {
+                                    shell_file_effect_outcome(&output, call.is_patch()).is_some()
+                                }) {
+                                    let original_call_id = running.original_call_id;
+                                    if finalize_codex_shell_invocation(
+                                        &mut state,
+                                        &mut diagnostics,
+                                        &mut analysis_facts,
+                                        running.invocation,
+                                        output,
+                                        ts,
+                                    ) {
+                                        processed_patch_calls.insert(original_call_id);
+                                    }
+                                } else {
+                                    touch_codex_analysis_fact(
+                                        &mut analysis_facts,
+                                        running.invocation.fact_index,
+                                        ts,
+                                    );
+                                    diagnostics.record_relevant(true);
+                                    running_shell_calls.insert(session_id, running);
                                 }
                             }
                         }
@@ -200,25 +429,106 @@ where
                                     .arguments
                                     .as_deref()
                                     .and_then(|input| parse_custom_call(name, input, ts, mode));
-                                let normalized = call.is_some() && entry.payload.call_id.is_some();
-                                diagnostics.record_relevant(normalized);
-                                if let (Some(call), Some(call_id)) =
-                                    (call, entry.payload.call_id.as_deref())
+                                let metrics = call
+                                    .as_ref()
+                                    .map(custom_invocation_metrics)
+                                    .unwrap_or_else(|| invalid_custom_invocation_metrics(name));
+                                if let Some(call_id) = entry
+                                    .payload
+                                    .call_id
+                                    .as_deref()
+                                    .filter(|call_id| !call_id.is_empty())
                                 {
-                                    custom_calls.insert(call_id.to_string(), call);
+                                    diagnostics.record_relevant(call.is_some());
+                                    let fact_index = ensure_codex_analysis_fact(
+                                        &mut analysis_facts,
+                                        &mut analysis_fact_indices,
+                                        call_id,
+                                        &current_model,
+                                        ts,
+                                        source_order,
+                                        metrics,
+                                    );
+                                    custom_calls.insert(
+                                        call_id.to_string(),
+                                        PendingCodexCustomInvocation {
+                                            call,
+                                            kind: metrics,
+                                            timestamp: ts,
+                                            fact_index,
+                                        },
+                                    );
+                                } else {
+                                    diagnostics.record_relevant(true);
+                                    if call.is_none() {
+                                        diagnostics.record_relevant(false);
+                                    }
+                                    diagnostics.record_relevant(false);
+                                    record_invocation_metrics(&mut state, metrics);
+                                    push_anonymous_codex_analysis_fact(
+                                        &mut analysis_facts,
+                                        &current_model,
+                                        ts,
+                                        source_order,
+                                        metrics,
+                                    );
                                 }
                             }
                         }
                         "custom_tool_call_output" => {
-                            if let Some(call_id) = entry.payload.call_id.as_deref()
+                            if entry.payload.call_id.as_deref().is_none_or(str::is_empty) {
+                                diagnostics.record_relevant(false);
+                            } else if let Some(call_id) = entry.payload.call_id.as_deref()
                                 && let Some(call) = custom_calls.remove(call_id)
                             {
-                                let normalized = dispatch_custom_call(
-                                    &mut state,
-                                    call,
-                                    entry.payload.output.as_deref(),
-                                );
-                                diagnostics.record_relevant(normalized);
+                                if processed_patch_calls.contains(call_id) {
+                                    diagnostics.record_relevant(true);
+                                    continue;
+                                }
+                                if let Some(parsed_call) = call.call {
+                                    let patch_call = parsed_call.is_patch();
+                                    let outcome = custom_call_result(
+                                        &parsed_call,
+                                        entry.payload.output.as_deref(),
+                                    );
+                                    let effect_paths =
+                                        custom_call_effect_paths(&state, &parsed_call);
+                                    let effect_before = AnalysisStateSnapshot::capture(&state);
+                                    let before = AnalysisMetrics::from_state(&state);
+                                    let normalized = dispatch_custom_call(
+                                        &mut state,
+                                        parsed_call,
+                                        entry.payload.output.as_deref(),
+                                    );
+                                    diagnostics.record_relevant(normalized);
+                                    update_codex_analysis_fact(
+                                        &mut analysis_facts,
+                                        call.fact_index,
+                                        outcome.fact_status(),
+                                        ts,
+                                        successful_effect_metrics(
+                                            before,
+                                            &state,
+                                            outcome.is_success(),
+                                        ),
+                                        outcome.is_success().then(|| {
+                                            effect_before.effect_since(&state, effect_paths)
+                                        }),
+                                    );
+                                    if patch_call {
+                                        processed_patch_calls.insert(call_id.to_string());
+                                    }
+                                } else {
+                                    record_invocation_metrics(&mut state, call.kind);
+                                    update_codex_analysis_fact(
+                                        &mut analysis_facts,
+                                        call.fact_index,
+                                        ToolFactStatus::Failed,
+                                        ts,
+                                        AnalysisMetrics::default(),
+                                        None,
+                                    );
+                                }
                             }
                         }
                         _ => {}
@@ -230,9 +540,20 @@ where
     }
 
     for call in shell_calls.into_values() {
-        if matches!(call, PendingCodexShellCall::InvalidArguments) {
+        if let Some(call) = call.call {
+            record_pending_shell_invocation(&mut state, &call);
+        } else {
+            state.tool_counts.bash += 1;
             diagnostics.record_relevant(false);
         }
+    }
+    for running in running_shell_calls.into_values() {
+        if let Some(call) = running.invocation.call {
+            record_pending_shell_invocation(&mut state, &call);
+        }
+    }
+    for call in custom_calls.into_values() {
+        record_invocation_metrics(&mut state, call.kind);
     }
     if state.git_remote.is_empty() {
         state.git_remote = get_git_remote_url(&state.folder_path);
@@ -247,7 +568,7 @@ where
         machine_id: String::new(),
         records: vec![record],
     };
-    Ok(ParsedAnalysis::new(analysis, diagnostics))
+    Ok(ParsedAnalysis::new(analysis, diagnostics).with_facts(usage_facts, analysis_facts))
 }
 
 fn is_supported_codex_usage(info: &Value) -> bool {
@@ -277,34 +598,151 @@ fn is_supported_codex_usage(info: &Value) -> bool {
     recognized
 }
 
-fn subtract_codex_replay_baseline(info: &Value, baseline: &Value) -> Value {
-    let mut adjusted = info.clone();
-    let (Some(total), Some(baseline)) = (
-        adjusted
-            .get_mut("total_token_usage")
-            .and_then(Value::as_object_mut),
-        baseline.as_object(),
-    ) else {
-        return adjusted;
-    };
-    for key in [
-        "input_tokens",
-        "cached_input_tokens",
-        "output_tokens",
-        "reasoning_output_tokens",
-        "total_tokens",
-    ] {
-        if let (Some(current), Some(replayed)) = (
-            total.get(key).and_then(Value::as_i64),
-            baseline.get(key).and_then(Value::as_i64),
-        ) {
-            total.insert(
-                key.to_string(),
-                Value::from(current.saturating_sub(replayed).max(0)),
-            );
+fn accumulate_codex_usage_event(
+    conversation_usage: &mut FastHashMap<String, Value>,
+    model: &str,
+    info: &Value,
+    previous_total_usage: &mut Option<Value>,
+) -> Option<Value> {
+    let total = info.get("total_token_usage").and_then(Value::as_object);
+    let last = info.get("last_token_usage").and_then(Value::as_object);
+    let previous = previous_total_usage.as_ref().and_then(Value::as_object);
+
+    let replay = total
+        .zip(previous)
+        .is_some_and(|(current, previous)| codex_usage_equal(current, previous));
+    let reset = !replay
+        && total
+            .zip(previous)
+            .is_some_and(|(current, previous)| codex_usage_rolled_back(current, previous));
+
+    let cumulative_delta = total.map(|current| {
+        if replay {
+            serde_json::Map::new()
+        } else if reset {
+            clone_codex_usage_fields(current)
+        } else if let Some(previous) = previous {
+            subtract_codex_usage(current, previous)
+        } else {
+            clone_codex_usage_fields(current)
+        }
+    });
+
+    if let Some(total) = info.get("total_token_usage") {
+        *previous_total_usage = Some(total.clone());
+    }
+    if model.is_empty() {
+        return None;
+    }
+
+    let mut contribution = serde_json::Map::new();
+    if !replay {
+        for key in CODEX_TOKEN_FIELDS {
+            let value = last
+                .and_then(|usage| usage.get(key))
+                .and_then(Value::as_u64)
+                .or_else(|| {
+                    cumulative_delta
+                        .as_ref()
+                        .and_then(|usage| usage.get(key))
+                        .and_then(Value::as_u64)
+                });
+            if let Some(value) = value {
+                contribution.insert(key.to_string(), Value::from(value));
+            }
         }
     }
-    adjusted
+
+    let mut accumulated = conversation_usage
+        .get(model)
+        .and_then(|usage| usage.get("total_token_usage"))
+        .and_then(Value::as_object)
+        .map(clone_codex_usage_fields)
+        .unwrap_or_default();
+    for key in CODEX_TOKEN_FIELDS {
+        let Some(value) = contribution.get(key).and_then(Value::as_u64) else {
+            continue;
+        };
+        let existing = accumulated.get(key).and_then(Value::as_u64).unwrap_or(0);
+        accumulated.insert(key.to_string(), Value::from(existing.saturating_add(value)));
+    }
+
+    let fact_usage = (!contribution.is_empty()).then(|| {
+        let mut fact = serde_json::Map::new();
+        fact.insert(
+            "total_token_usage".to_string(),
+            Value::Object(contribution.clone()),
+        );
+        if let Some(context_window) = info.get("model_context_window") {
+            fact.insert("model_context_window".to_string(), context_window.clone());
+        }
+        Value::Object(fact)
+    });
+
+    let mut aggregated_info = serde_json::Map::new();
+    aggregated_info.insert("total_token_usage".to_string(), Value::Object(accumulated));
+    if !contribution.is_empty() {
+        aggregated_info.insert("last_token_usage".to_string(), Value::Object(contribution));
+    }
+    if let Some(context_window) = info.get("model_context_window") {
+        aggregated_info.insert("model_context_window".to_string(), context_window.clone());
+    }
+    process_codex_usage(conversation_usage, model, &Value::Object(aggregated_info));
+    fact_usage
+}
+
+fn clone_codex_usage_fields(
+    usage: &serde_json::Map<String, Value>,
+) -> serde_json::Map<String, Value> {
+    CODEX_TOKEN_FIELDS
+        .into_iter()
+        .filter_map(|key| {
+            usage
+                .get(key)
+                .and_then(Value::as_u64)
+                .map(|value| (key.to_string(), Value::from(value)))
+        })
+        .collect()
+}
+
+fn subtract_codex_usage(
+    current: &serde_json::Map<String, Value>,
+    previous: &serde_json::Map<String, Value>,
+) -> serde_json::Map<String, Value> {
+    CODEX_TOKEN_FIELDS
+        .into_iter()
+        .filter_map(|key| {
+            current.get(key).and_then(Value::as_u64).map(|value| {
+                let previous = previous.get(key).and_then(Value::as_u64).unwrap_or(0);
+                (key.to_string(), Value::from(value.saturating_sub(previous)))
+            })
+        })
+        .collect()
+}
+
+fn codex_usage_equal(
+    current: &serde_json::Map<String, Value>,
+    previous: &serde_json::Map<String, Value>,
+) -> bool {
+    CODEX_TOKEN_FIELDS
+        .into_iter()
+        .any(|key| current.contains_key(key) || previous.contains_key(key))
+        && CODEX_TOKEN_FIELDS.into_iter().all(|key| {
+            current.get(key).and_then(Value::as_u64) == previous.get(key).and_then(Value::as_u64)
+        })
+}
+
+fn codex_usage_rolled_back(
+    current: &serde_json::Map<String, Value>,
+    previous: &serde_json::Map<String, Value>,
+) -> bool {
+    CODEX_TOKEN_FIELDS.into_iter().any(|key| {
+        current
+            .get(key)
+            .and_then(Value::as_u64)
+            .zip(previous.get(key).and_then(Value::as_u64))
+            .is_some_and(|(current, previous)| current < previous)
+    })
 }
 
 fn is_supported_codex_token_usage(usage: &Value) -> bool {
@@ -324,7 +762,7 @@ fn is_supported_codex_token_usage(usage: &Value) -> bool {
         "total_tokens",
     ] {
         if let Some(value) = usage.get(key) {
-            if value.as_i64().is_none() {
+            if value.as_u64().is_none() {
                 return false;
             }
             recognized = true;
@@ -333,9 +771,334 @@ fn is_supported_codex_token_usage(usage: &Value) -> bool {
     recognized
 }
 
-enum PendingCodexShellCall {
-    Parsed(CodexShellCall),
-    InvalidArguments,
+struct PendingCodexShellInvocation {
+    call: Option<CodexShellCall>,
+    timestamp: i64,
+    fact_index: usize,
+    accumulated_output: String,
+}
+
+impl PendingCodexShellInvocation {
+    fn timestamp(&self) -> i64 {
+        self.timestamp
+    }
+
+    fn fact_index(&self) -> usize {
+        self.fact_index
+    }
+}
+
+struct RunningCodexShellInvocation {
+    original_call_id: String,
+    invocation: PendingCodexShellInvocation,
+}
+
+struct PendingCodexCustomInvocation {
+    call: Option<CodexCustomCall>,
+    kind: AnalysisMetrics,
+    timestamp: i64,
+    fact_index: usize,
+}
+
+impl PendingCodexCustomInvocation {
+    fn timestamp(&self) -> i64 {
+        self.timestamp
+    }
+
+    fn fact_index(&self) -> usize {
+        self.fact_index
+    }
+}
+
+fn ensure_codex_analysis_fact(
+    facts: &mut Vec<AnalysisFact>,
+    indices: &mut FastHashMap<String, usize>,
+    call_id: &str,
+    model: &str,
+    timestamp: i64,
+    source_order: usize,
+    metrics: AnalysisMetrics,
+) -> usize {
+    if let Some(index) = indices.get(call_id).copied() {
+        if let Some(fact) = facts.get_mut(index)
+            && timestamp > 0
+        {
+            fact.timestamp_ms = Some(
+                fact.timestamp_ms
+                    .map_or(timestamp, |existing| existing.min(timestamp)),
+            );
+        }
+        return index;
+    }
+
+    let index = facts.len();
+    facts.push(AnalysisFact {
+        stable_id: Some(format!("codex-tool:{call_id}")),
+        timestamp_ms: (timestamp > 0).then_some(timestamp),
+        observed_at_ms: (timestamp > 0).then_some(timestamp),
+        source_order,
+        model: model.to_string(),
+        status: ToolFactStatus::Pending,
+        metrics,
+        effect: None,
+    });
+    indices.insert(call_id.to_string(), index);
+    index
+}
+
+fn push_anonymous_codex_analysis_fact(
+    facts: &mut Vec<AnalysisFact>,
+    model: &str,
+    timestamp: i64,
+    source_order: usize,
+    metrics: AnalysisMetrics,
+) {
+    facts.push(AnalysisFact {
+        stable_id: None,
+        timestamp_ms: (timestamp > 0).then_some(timestamp),
+        observed_at_ms: (timestamp > 0).then_some(timestamp),
+        source_order,
+        model: model.to_string(),
+        status: ToolFactStatus::Pending,
+        metrics,
+        effect: None,
+    });
+}
+
+fn set_codex_fact_invocation_metrics(
+    facts: &mut [AnalysisFact],
+    index: usize,
+    metrics: AnalysisMetrics,
+) {
+    if let Some(fact) = facts.get_mut(index) {
+        fact.metrics = metrics;
+    }
+}
+
+fn update_codex_analysis_fact(
+    facts: &mut [AnalysisFact],
+    index: usize,
+    status: ToolFactStatus,
+    observed_at_ms: i64,
+    effects: AnalysisMetrics,
+    effect: Option<AnalysisFactEffect>,
+) {
+    let Some(fact) = facts.get_mut(index) else {
+        return;
+    };
+    fact.status = status;
+    fact.observed_at_ms = (observed_at_ms > 0).then_some(observed_at_ms);
+    if status == ToolFactStatus::Succeeded {
+        fact.metrics.add_assign(effects);
+        fact.effect = effect;
+    } else {
+        fact.effect = None;
+    }
+}
+
+fn touch_codex_analysis_fact(facts: &mut [AnalysisFact], index: usize, observed_at_ms: i64) {
+    if observed_at_ms > 0
+        && let Some(fact) = facts.get_mut(index)
+    {
+        fact.observed_at_ms = Some(observed_at_ms);
+    }
+}
+
+fn finalize_codex_shell_invocation(
+    state: &mut SessionParseState,
+    diagnostics: &mut ParseDiagnostics,
+    analysis_facts: &mut [AnalysisFact],
+    mut invocation: PendingCodexShellInvocation,
+    output: CodexShellOutput,
+    observed_at_ms: i64,
+) -> bool {
+    append_shell_output_chunk(&mut invocation, &output);
+    let Some(parsed_call) = invocation.call else {
+        state.tool_counts.bash += 1;
+        diagnostics.record_relevant(output_reports_argument_error(Some(&output.output)));
+        update_codex_analysis_fact(
+            analysis_facts,
+            invocation.fact_index,
+            ToolFactStatus::Failed,
+            observed_at_ms,
+            AnalysisMetrics::default(),
+            None,
+        );
+        return false;
+    };
+
+    let outcome = shell_file_effect_outcome(&output, parsed_call.is_patch());
+    let patch_call = parsed_call.is_patch();
+    let effect_paths = shell_call_effect_paths(state, &parsed_call);
+    let effect_before = AnalysisStateSnapshot::capture(state);
+    let before = AnalysisMetrics::from_state(state);
+    let normalized = state.handle_shell_call(
+        parsed_call,
+        CodexShellOutput {
+            output: invocation.accumulated_output,
+            metadata: outcome.map(|success| CodexShellMetadata {
+                exit_code: if success { 0 } else { 1 },
+                duration_seconds: 0.0,
+            }),
+        },
+    );
+    diagnostics.record_relevant(normalized);
+    update_codex_analysis_fact(
+        analysis_facts,
+        invocation.fact_index,
+        shell_fact_status(outcome),
+        observed_at_ms,
+        successful_effect_metrics(before, state, outcome == Some(true)),
+        (outcome == Some(true)).then(|| effect_before.effect_since(state, effect_paths)),
+    );
+    patch_call
+}
+
+fn append_shell_output_chunk(
+    invocation: &mut PendingCodexShellInvocation,
+    output: &CodexShellOutput,
+) {
+    let retains_output = invocation.call.as_ref().is_some_and(|call| {
+        extract_sed_file_path(&call.script).is_some()
+            || extract_cat_read(&call.script, "").is_some()
+    });
+    if retains_output {
+        invocation
+            .accumulated_output
+            .push_str(strip_exec_command_metadata_prefix(&output.output));
+    }
+}
+
+fn successful_effect_metrics(
+    before: AnalysisMetrics,
+    state: &SessionParseState,
+    succeeded: bool,
+) -> AnalysisMetrics {
+    if !succeeded {
+        return AnalysisMetrics::default();
+    }
+    let mut effects = AnalysisMetrics::from_state(state).saturating_sub(before);
+    effects.bash_count = 0;
+    effects.edit_count = 0;
+    effects.read_count = 0;
+    effects.todo_write_count = 0;
+    effects.write_count = 0;
+    effects
+}
+
+fn push_effect_path(paths: &mut Vec<String>, state: &SessionParseState, path: &str) {
+    let path = state.normalize_path(path);
+    if !path.is_empty() && !paths.contains(&path) {
+        paths.push(path);
+    }
+}
+
+fn shell_call_effect_paths(state: &SessionParseState, call: &CodexShellCall) -> Vec<String> {
+    let mut paths = Vec::new();
+    if call.is_patch() {
+        for patch in parse_apply_patch_script(&call.script) {
+            push_effect_path(&mut paths, state, &patch.file_path);
+        }
+    } else if let Some(path) = extract_sed_file_path(&call.script) {
+        push_effect_path(&mut paths, state, &path);
+    } else if let Some((path, _)) = extract_cat_read(&call.script, "") {
+        push_effect_path(&mut paths, state, &path);
+    }
+    paths
+}
+
+fn custom_call_effect_paths(state: &SessionParseState, call: &CodexCustomCall) -> Vec<String> {
+    let mut paths = Vec::new();
+    if let CodexCustomCall::ApplyPatch { patches, .. } = call {
+        for patch in patches {
+            push_effect_path(&mut paths, state, &patch.file_path);
+        }
+    }
+    paths
+}
+
+fn structured_patch_effect_paths(state: &SessionParseState, payload: &CodexPayload) -> Vec<String> {
+    let mut paths = Vec::new();
+    if let Some(changes) = payload.info.as_ref().and_then(Value::as_object) {
+        for (path, change) in changes {
+            push_effect_path(&mut paths, state, path);
+            if let Some(destination) = change
+                .get("move_path")
+                .and_then(Value::as_str)
+                .filter(|path| !path.is_empty())
+            {
+                push_effect_path(&mut paths, state, destination);
+            }
+        }
+    }
+    paths
+}
+
+fn bash_invocation_metrics() -> AnalysisMetrics {
+    AnalysisMetrics {
+        bash_count: 1,
+        ..AnalysisMetrics::default()
+    }
+}
+
+fn patch_invocation_metrics(kind: PatchInvocationKind) -> AnalysisMetrics {
+    match kind {
+        PatchInvocationKind::Write => AnalysisMetrics {
+            write_count: 1,
+            ..AnalysisMetrics::default()
+        },
+        PatchInvocationKind::Edit => AnalysisMetrics {
+            edit_count: 1,
+            ..AnalysisMetrics::default()
+        },
+    }
+}
+
+fn shell_invocation_metrics(call: &CodexShellCall) -> AnalysisMetrics {
+    if call.is_patch() {
+        return patch_invocation_metrics(patch_kind(&parse_apply_patch_script(&call.script)));
+    }
+    if extract_sed_file_path(&call.script).is_some() || extract_cat_read(&call.script, "").is_some()
+    {
+        return AnalysisMetrics {
+            read_count: 1,
+            ..AnalysisMetrics::default()
+        };
+    }
+    bash_invocation_metrics()
+}
+
+fn custom_invocation_metrics(call: &CodexCustomCall) -> AnalysisMetrics {
+    match call {
+        CodexCustomCall::Exec { .. } => bash_invocation_metrics(),
+        CodexCustomCall::ApplyPatch { patches, .. } => {
+            patch_invocation_metrics(patch_kind(patches))
+        }
+    }
+}
+
+fn invalid_custom_invocation_metrics(name: &str) -> AnalysisMetrics {
+    match name {
+        "exec" => bash_invocation_metrics(),
+        "apply_patch" => patch_invocation_metrics(PatchInvocationKind::Edit),
+        _ => AnalysisMetrics::default(),
+    }
+}
+
+fn record_invocation_metrics(state: &mut SessionParseState, metrics: AnalysisMetrics) {
+    state.tool_counts.bash += metrics.bash_count;
+    state.tool_counts.edit += metrics.edit_count;
+    state.tool_counts.read += metrics.read_count;
+    state.tool_counts.todo_write += metrics.todo_write_count;
+    state.tool_counts.write += metrics.write_count;
+}
+
+fn shell_fact_status(outcome: Option<bool>) -> ToolFactStatus {
+    if outcome == Some(true) {
+        ToolFactStatus::Succeeded
+    } else {
+        ToolFactStatus::Failed
+    }
 }
 
 fn output_reports_argument_error(output: Option<&str>) -> bool {
@@ -427,6 +1190,27 @@ fn parse_function_call(name: &str, args_str: &str, ts: i64) -> Option<CodexShell
     }
 }
 
+fn parse_write_stdin_session_id(args: &str) -> Option<u64> {
+    let args = serde_json::from_str::<Value>(args).ok()?;
+    let session_id = args.get("session_id")?;
+    session_id
+        .as_u64()
+        .or_else(|| session_id.as_str()?.parse().ok())
+}
+
+fn running_shell_session_id(output: &CodexShellOutput) -> Option<u64> {
+    let (header, _) = output.output.split_once("\nOutput:\n")?;
+    header.lines().find_map(|line| {
+        let line = line.trim();
+        [
+            "Process running with session ID ",
+            "Process still running with session ID ",
+        ]
+        .into_iter()
+        .find_map(|prefix| line.strip_prefix(prefix)?.trim().parse().ok())
+    })
+}
+
 enum CodexCustomCall {
     Exec {
         source: Option<String>,
@@ -436,6 +1220,12 @@ enum CodexCustomCall {
         patches: Vec<CodexPatch>,
         timestamp: i64,
     },
+}
+
+impl CodexCustomCall {
+    fn is_patch(&self) -> bool {
+        matches!(self, Self::ApplyPatch { .. })
+    }
 }
 
 fn parse_custom_call(
@@ -480,16 +1270,134 @@ fn dispatch_custom_call(
         CodexCustomCall::ApplyPatch { patches, timestamp } => {
             match custom_apply_patch_result(output) {
                 CustomApplyPatchResult::Success => {
-                    for patch in patches {
-                        state.handle_patch(patch, timestamp);
-                    }
+                    apply_patch_invocation(state, patches, timestamp, true);
                     true
                 }
-                CustomApplyPatchResult::Failure => true,
-                CustomApplyPatchResult::Unknown => false,
+                CustomApplyPatchResult::Failure => {
+                    apply_patch_invocation(state, patches, timestamp, false);
+                    true
+                }
+                CustomApplyPatchResult::Unknown => {
+                    apply_patch_invocation(state, patches, timestamp, false);
+                    false
+                }
             }
         }
     }
+}
+
+fn dispatch_structured_patch(
+    state: &mut SessionParseState,
+    payload: &CodexPayload,
+    timestamp: i64,
+) -> bool {
+    let outcome = structured_patch_result(payload);
+    let changes = payload.info.as_ref().and_then(Value::as_object);
+    let kind = changes
+        .map(structured_patch_kind)
+        .unwrap_or(PatchInvocationKind::Edit);
+
+    match outcome {
+        CustomApplyPatchResult::Success => {
+            let Some(changes) = changes.filter(|changes| !changes.is_empty()) else {
+                record_patch_invocation(state, kind);
+                return false;
+            };
+            if !changes.iter().all(|(path, change)| {
+                !path.is_empty()
+                    && matches!(
+                        structured_change_type(change),
+                        Some("add" | "update" | "delete")
+                    )
+            }) {
+                record_patch_invocation(state, kind);
+                return false;
+            }
+            apply_structured_patch_invocation(state, changes, timestamp, kind);
+            true
+        }
+        CustomApplyPatchResult::Failure => {
+            record_patch_invocation(state, kind);
+            true
+        }
+        CustomApplyPatchResult::Unknown => {
+            record_patch_invocation(state, kind);
+            false
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatchInvocationKind {
+    Write,
+    Edit,
+}
+
+fn patch_kind(patches: &[CodexPatch]) -> PatchInvocationKind {
+    if !patches.is_empty() && patches.iter().all(|patch| patch.action == "add") {
+        PatchInvocationKind::Write
+    } else {
+        PatchInvocationKind::Edit
+    }
+}
+
+fn structured_patch_kind(changes: &serde_json::Map<String, Value>) -> PatchInvocationKind {
+    if !changes.is_empty()
+        && changes.values().all(|change| {
+            structured_change_type(change) == Some("add")
+                && change.get("move_path").is_none_or(Value::is_null)
+        })
+    {
+        PatchInvocationKind::Write
+    } else {
+        PatchInvocationKind::Edit
+    }
+}
+
+fn record_patch_invocation(state: &mut SessionParseState, kind: PatchInvocationKind) {
+    match kind {
+        PatchInvocationKind::Write => state.tool_counts.write += 1,
+        PatchInvocationKind::Edit => state.tool_counts.edit += 1,
+    }
+}
+
+fn apply_patch_invocation(
+    state: &mut SessionParseState,
+    patches: Vec<CodexPatch>,
+    timestamp: i64,
+    apply_effects: bool,
+) {
+    let kind = patch_kind(&patches);
+    let write_count = state.tool_counts.write;
+    let edit_count = state.tool_counts.edit;
+    if apply_effects {
+        for patch in patches {
+            state.handle_patch(patch, timestamp);
+        }
+    }
+    state.tool_counts.write = write_count;
+    state.tool_counts.edit = edit_count;
+    record_patch_invocation(state, kind);
+}
+
+fn apply_structured_patch_invocation(
+    state: &mut SessionParseState,
+    changes: &serde_json::Map<String, Value>,
+    timestamp: i64,
+    kind: PatchInvocationKind,
+) {
+    let write_count = state.tool_counts.write;
+    let edit_count = state.tool_counts.edit;
+    for (path, change) in changes {
+        state.handle_structured_patch(path, change, timestamp);
+    }
+    state.tool_counts.write = write_count;
+    state.tool_counts.edit = edit_count;
+    record_patch_invocation(state, kind);
+}
+
+fn structured_change_type(change: &Value) -> Option<&str> {
+    change.get("type").and_then(Value::as_str)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -497,6 +1405,53 @@ enum CustomApplyPatchResult {
     Success,
     Failure,
     Unknown,
+}
+
+impl CustomApplyPatchResult {
+    fn is_success(self) -> bool {
+        self == Self::Success
+    }
+
+    fn fact_status(self) -> ToolFactStatus {
+        if self.is_success() {
+            ToolFactStatus::Succeeded
+        } else {
+            ToolFactStatus::Failed
+        }
+    }
+}
+
+fn custom_call_result(call: &CodexCustomCall, output: Option<&str>) -> CustomApplyPatchResult {
+    match call {
+        CodexCustomCall::Exec { .. } => custom_exec_result(output),
+        CodexCustomCall::ApplyPatch { .. } => custom_apply_patch_result(output),
+    }
+}
+
+fn custom_exec_result(output: Option<&str>) -> CustomApplyPatchResult {
+    let output = normalize_custom_output(output);
+    let output = output.trim_start().to_ascii_lowercase();
+    if output.starts_with("script completed") || output.starts_with("completed") {
+        CustomApplyPatchResult::Success
+    } else if output.starts_with("script failed")
+        || output.starts_with("failed")
+        || output.starts_with("error")
+        || output.starts_with("cancelled")
+        || output.starts_with("canceled")
+        || output.starts_with("rejected")
+    {
+        CustomApplyPatchResult::Failure
+    } else {
+        CustomApplyPatchResult::Unknown
+    }
+}
+
+fn structured_patch_result(payload: &CodexPayload) -> CustomApplyPatchResult {
+    match payload.sandbox_policy.as_ref().and_then(Value::as_bool) {
+        Some(true) => CustomApplyPatchResult::Success,
+        Some(false) => CustomApplyPatchResult::Failure,
+        None => custom_apply_patch_result(payload.output.as_deref()),
+    }
 }
 
 fn custom_apply_patch_result(output: Option<&str>) -> CustomApplyPatchResult {
@@ -508,6 +1463,7 @@ fn custom_apply_patch_result(output: Option<&str>) -> CustomApplyPatchResult {
         || output.starts_with("Error")
         || output.starts_with("apply_patch verification failed:")
         || output.starts_with("Invalid patch")
+        || output.starts_with("patch rejected")
         || output.starts_with("apply_patch handler received")
         || output.starts_with("apply_patch is unavailable")
     {
@@ -538,22 +1494,23 @@ fn normalize_custom_output(output: Option<&str>) -> String {
 trait CodexAnalysisExt {
     /// Routes a completed shell call to the read / patch / run-command tally
     /// based on what its `script` did.
-    fn handle_shell_call(&mut self, call: CodexShellCall, output: CodexShellOutput);
+    fn handle_shell_call(&mut self, call: CodexShellCall, output: CodexShellOutput) -> bool;
     /// Applies one parsed `apply_patch` hunk as a write, delete, or edit.
     fn handle_patch(&mut self, patch: CodexPatch, ts: i64);
+    /// Applies one structured `patch_apply_end` file effect.
+    fn handle_structured_patch(&mut self, path: &str, change: &Value, ts: i64);
     /// Records a shell call that was not a file operation as a run command.
     fn record_run_command(&mut self, call: CodexShellCall);
 }
 
 impl CodexAnalysisExt for SessionParseState {
-    fn handle_shell_call(&mut self, call: CodexShellCall, output: CodexShellOutput) {
+    fn handle_shell_call(&mut self, call: CodexShellCall, output: CodexShellOutput) -> bool {
         // Patch payloads carry a stable envelope regardless of the launcher name.
-        if call.script.contains("*** Begin Patch") {
+        if call.is_patch() {
             let patches = parse_apply_patch_script(&call.script);
-            for patch in patches {
-                self.handle_patch(patch, call.timestamp);
-            }
-            return;
+            let outcome = shell_file_effect_outcome(&output, true);
+            apply_patch_invocation(self, patches, call.timestamp, outcome == Some(true));
+            return outcome.is_some();
         }
 
         // The legacy `shell` function returned just the raw command output
@@ -564,18 +1521,34 @@ impl CodexAnalysisExt for SessionParseState {
 
         // Check for sed command
         if let Some(path) = extract_sed_file_path(&call.script) {
-            self.add_read_detail(&path, output_body, call.timestamp);
-            return;
+            let outcome = shell_file_effect_outcome(&output, false);
+            if outcome == Some(true) {
+                self.add_read_detail(&path, output_body, call.timestamp);
+            } else {
+                self.tool_counts.read += 1;
+            }
+            return outcome.is_some();
         }
 
         // Check for cat command
         if let Some((path, content)) = extract_cat_read(&call.script, output_body) {
-            self.add_read_detail(&path, &content, call.timestamp);
-            return;
+            let outcome = shell_file_effect_outcome(&output, false);
+            if outcome == Some(true) {
+                self.add_read_detail(&path, &content, call.timestamp);
+            } else {
+                self.tool_counts.read += 1;
+            }
+            return outcome.is_some();
         }
 
-        // Record as run command
-        self.record_run_command(call);
+        // Record command details only after a confirmed successful exit.
+        let outcome = shell_file_effect_outcome(&output, false);
+        if outcome == Some(true) {
+            self.record_run_command(call);
+        } else {
+            self.tool_counts.bash += 1;
+        }
+        outcome.is_some()
     }
 
     fn handle_patch(&mut self, patch: CodexPatch, ts: i64) {
@@ -596,13 +1569,53 @@ impl CodexAnalysisExt for SessionParseState {
             }
             "delete" => {
                 let content = old_str.trim_end_matches('\n');
-                if !content.is_empty() {
-                    self.add_edit_detail(&resolved, content, "", ts);
-                }
+                self.add_edit_detail_raw(&resolved, content, "", ts);
             }
             _ => {
-                self.add_edit_detail(&resolved, &old_str, &new_str, ts);
+                self.add_edit_detail_raw(&resolved, &old_str, &new_str, ts);
             }
+        }
+    }
+
+    fn handle_structured_patch(&mut self, path: &str, change: &Value, ts: i64) {
+        match structured_change_type(change) {
+            Some("add") => self.add_write_detail(
+                path,
+                change
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                ts,
+            ),
+            Some("delete") => self.add_edit_detail_raw(
+                path,
+                change
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                "",
+                ts,
+            ),
+            Some("update") => {
+                let (old, new) = change
+                    .get("unified_diff")
+                    .and_then(Value::as_str)
+                    .map(diff_strings)
+                    .unwrap_or_default();
+                let destination = change
+                    .get("move_path")
+                    .and_then(Value::as_str)
+                    .filter(|path| !path.is_empty())
+                    .unwrap_or(path);
+                self.add_edit_detail_raw(destination, &old, &new, ts);
+                if destination != path {
+                    let source = self.normalize_path(path);
+                    if !source.is_empty() {
+                        self.add_unique_file(source);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -626,6 +1639,62 @@ struct CodexShellCall {
     script: String,
     /// The full argv as written by the model, for verbatim run-command display.
     full_command: Vec<String>,
+}
+
+impl CodexShellCall {
+    fn is_patch(&self) -> bool {
+        self.script.contains("*** Begin Patch")
+    }
+}
+
+fn shell_file_effect_outcome(output: &CodexShellOutput, patch: bool) -> Option<bool> {
+    if let Some(metadata) = &output.metadata {
+        return Some(metadata.exit_code == 0);
+    }
+    if let Some(exit_code) = output
+        .output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Process exited with code "))
+        .and_then(|code| code.trim().parse::<i32>().ok())
+    {
+        return Some(exit_code == 0);
+    }
+    if is_explicit_shell_cancellation(&output.output) {
+        return Some(false);
+    }
+    if patch {
+        return match custom_apply_patch_result(Some(&output.output)) {
+            CustomApplyPatchResult::Success => Some(true),
+            CustomApplyPatchResult::Failure => Some(false),
+            CustomApplyPatchResult::Unknown => None,
+        };
+    }
+    None
+}
+
+fn is_explicit_shell_cancellation(output: &str) -> bool {
+    let Some(duration) = output
+        .trim()
+        .strip_prefix("aborted by user after ")
+        .and_then(|duration| duration.strip_suffix('s'))
+        .and_then(|duration| duration.parse::<f64>().ok())
+    else {
+        return false;
+    };
+    duration.is_finite() && duration >= 0.0
+}
+
+fn record_pending_shell_invocation(state: &mut SessionParseState, call: &CodexShellCall) {
+    if call.is_patch() {
+        let patches = parse_apply_patch_script(&call.script);
+        record_patch_invocation(state, patch_kind(&patches));
+    } else if extract_sed_file_path(&call.script).is_some()
+        || extract_cat_read(&call.script, "").is_some()
+    {
+        state.tool_counts.read += 1;
+    } else {
+        state.tool_counts.bash += 1;
+    }
 }
 
 /// One file hunk extracted from an `apply_patch` script.
@@ -757,6 +1826,11 @@ fn extract_patch_strings(lines: &[String]) -> (String, String) {
     (old_str, new_str)
 }
 
+fn diff_strings(diff: &str) -> (String, String) {
+    let lines: Vec<String> = diff.lines().map(str::to_string).collect();
+    extract_patch_strings(&lines)
+}
+
 /// Extracts the file path read by a `sed -n '<range>' <path>` command.
 ///
 /// Returns `None` when the script is not a recognised `sed -n` read.
@@ -808,13 +1882,17 @@ fn extract_cat_read(script: &str, output: &str) -> Option<(String, String)> {
 mod tests {
     use super::*;
 
-    fn response_item(payload: Value) -> CodexLog {
+    fn log_at(timestamp: &str, log_type: &str, payload: Value) -> CodexLog {
         serde_json::from_value(serde_json::json!({
-            "timestamp": "2026-07-12T00:00:00Z",
-            "type": "response_item",
+            "timestamp": timestamp,
+            "type": log_type,
             "payload": payload
         }))
         .unwrap()
+    }
+
+    fn response_item(payload: Value) -> CodexLog {
+        log_at("2026-07-12T00:00:00Z", "response_item", payload)
     }
 
     fn custom_output(call_id: &str, blocks: Value) -> CodexLog {
@@ -823,6 +1901,69 @@ mod tests {
             "call_id": call_id,
             "output": blocks
         }))
+    }
+
+    fn event_msg(payload: Value) -> CodexLog {
+        log_at("2026-07-12T00:00:01Z", "event_msg", payload)
+    }
+
+    fn function_call_at(timestamp: &str, name: &str, call_id: &str, arguments: Value) -> CodexLog {
+        log_at(
+            timestamp,
+            "response_item",
+            serde_json::json!({
+                "type": "function_call",
+                "name": name,
+                "arguments": arguments,
+                "call_id": call_id
+            }),
+        )
+    }
+
+    fn function_output_at(timestamp: &str, call_id: &str, output: String) -> CodexLog {
+        log_at(
+            timestamp,
+            "response_item",
+            serde_json::json!({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": output
+            }),
+        )
+    }
+
+    fn running_output(session_id: u64, output: &str) -> String {
+        format!(
+            "Chunk ID: running\nWall time: 1.0 seconds\nProcess running with session ID {session_id}\nOriginal token count: 1\nOutput:\n{output}"
+        )
+    }
+
+    fn exited_output(exit_code: i32, output: &str) -> String {
+        format!(
+            "Chunk ID: exited\nWall time: 1.0 seconds\nProcess exited with code {exit_code}\nOriginal token count: 1\nOutput:\n{output}"
+        )
+    }
+
+    fn exec_command_at(timestamp: &str, call_id: &str, command: &str) -> CodexLog {
+        function_call_at(
+            timestamp,
+            "exec_command",
+            call_id,
+            serde_json::json!({ "cmd": command, "yield_time_ms": 1_000 }),
+        )
+    }
+
+    fn write_stdin_at(timestamp: &str, call_id: &str, session_id: u64, chars: &str) -> CodexLog {
+        function_call_at(
+            timestamp,
+            "write_stdin",
+            call_id,
+            serde_json::json!({
+                "session_id": session_id,
+                "chars": chars,
+                "yield_time_ms": 30_000
+            }),
+        )
     }
 
     #[test]
@@ -861,7 +2002,10 @@ mod tests {
             response_item(serde_json::json!({
                 "type": "function_call_output",
                 "call_id": "exec-object",
-                "output": "done"
+                "output": {
+                    "output": "done",
+                    "metadata": { "exit_code": 0, "duration_seconds": 0.1 }
+                }
             })),
         ];
 
@@ -869,6 +2013,275 @@ mod tests {
         let record = &analysis.records[0];
         assert_eq!(record.tool_call_counts.bash, 1);
         assert_eq!(record.run_command_details[0].command, "pwd");
+    }
+
+    #[test]
+    fn async_exec_command_completes_through_write_stdin() {
+        let logs = vec![
+            log_at(
+                "2026-07-12T00:00:00Z",
+                "turn_context",
+                serde_json::json!({ "model": "gpt-5-codex" }),
+            ),
+            exec_command_at("2026-07-12T00:00:01Z", "exec-1", "sleep 1"),
+            function_output_at(
+                "2026-07-12T00:00:02Z",
+                "exec-1",
+                running_output(42, "partial output\n"),
+            ),
+            write_stdin_at("2026-07-12T00:00:03Z", "poll-1", 42, ""),
+            function_output_at("2026-07-12T00:00:04Z", "poll-1", exited_output(0, "done\n")),
+        ];
+
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        let record = &parsed.analysis.records[0];
+        assert_eq!(record.tool_call_counts.bash, 1);
+        assert_eq!(record.run_command_details.len(), 1);
+        assert_eq!(record.run_command_details[0].command, "sleep 1");
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
+        assert_eq!(parsed.analysis_facts.len(), 1);
+        let fact = &parsed.analysis_facts[0];
+        assert_eq!(fact.stable_id.as_deref(), Some("codex-tool:exec-1"));
+        assert_eq!(fact.status, ToolFactStatus::Succeeded);
+        assert_eq!(fact.metrics.bash_count, 1);
+        assert_eq!(
+            fact.observed_at_ms,
+            Some(parse_iso_timestamp("2026-07-12T00:00:04Z"))
+        );
+    }
+
+    #[test]
+    fn async_shell_read_accumulates_multiple_poll_chunks() {
+        let logs = vec![
+            exec_command_at(
+                "2026-07-12T00:00:01Z",
+                "read-1",
+                "sed -n '1,3p' /repo/file.rs",
+            ),
+            function_output_at(
+                "2026-07-12T00:00:02Z",
+                "read-1",
+                running_output(51, "one\n"),
+            ),
+            write_stdin_at("2026-07-12T00:00:03Z", "poll-1", 51, ""),
+            function_output_at(
+                "2026-07-12T00:00:04Z",
+                "poll-1",
+                running_output(51, "two\n"),
+            ),
+            write_stdin_at("2026-07-12T00:00:05Z", "poll-2", 51, ""),
+            function_output_at(
+                "2026-07-12T00:00:06Z",
+                "poll-2",
+                exited_output(0, "three\n"),
+            ),
+        ];
+
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        let record = &parsed.analysis.records[0];
+        assert_eq!(record.tool_call_counts.read, 1);
+        assert_eq!(record.tool_call_counts.bash, 0);
+        assert_eq!(record.total_read_lines, 3);
+        assert_eq!(record.total_read_characters, 13);
+        assert_eq!(record.total_unique_files, 1);
+        assert_eq!(record.read_file_details.len(), 1);
+        assert_eq!(record.read_file_details[0].base.file_path, "/repo/file.rs");
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
+        assert_eq!(parsed.analysis_facts[0].metrics.read_count, 1);
+        assert_eq!(parsed.analysis_facts[0].metrics.read_lines, 3);
+    }
+
+    #[test]
+    fn async_exec_command_nonzero_exit_has_no_success_detail() {
+        let logs = vec![
+            exec_command_at("2026-07-12T00:00:01Z", "exec-failed", "false"),
+            function_output_at(
+                "2026-07-12T00:00:02Z",
+                "exec-failed",
+                running_output(61, ""),
+            ),
+            write_stdin_at("2026-07-12T00:00:03Z", "poll-failed", 61, ""),
+            function_output_at(
+                "2026-07-12T00:00:04Z",
+                "poll-failed",
+                exited_output(1, "failed\n"),
+            ),
+        ];
+
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        let record = &parsed.analysis.records[0];
+        assert_eq!(record.tool_call_counts.bash, 1);
+        assert!(record.run_command_details.is_empty());
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
+        assert_eq!(parsed.analysis_facts.len(), 1);
+        assert_eq!(parsed.analysis_facts[0].status, ToolFactStatus::Failed);
+        assert!(parsed.analysis_facts[0].effect.is_none());
+    }
+
+    #[test]
+    fn user_aborted_exec_command_is_a_supported_failed_lifecycle() {
+        let logs = vec![
+            exec_command_at("2026-07-12T00:00:01Z", "exec-aborted", "long-command"),
+            function_output_at(
+                "2026-07-12T00:00:02Z",
+                "exec-aborted",
+                "aborted by user after 0.1s".to_string(),
+            ),
+        ];
+
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        let record = &parsed.analysis.records[0];
+        assert_eq!(record.tool_call_counts.bash, 1);
+        assert!(record.run_command_details.is_empty());
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
+        assert_eq!(parsed.analysis_facts.len(), 1);
+        assert_eq!(parsed.analysis_facts[0].status, ToolFactStatus::Failed);
+        assert_eq!(parsed.analysis_facts[0].metrics.bash_count, 1);
+        assert!(parsed.analysis_facts[0].effect.is_none());
+    }
+
+    #[test]
+    fn async_exec_command_at_eof_stays_pending_and_counts_once() {
+        let logs = vec![
+            exec_command_at("2026-07-12T00:00:01Z", "exec-pending", "sleep 30"),
+            function_output_at(
+                "2026-07-12T00:00:02Z",
+                "exec-pending",
+                running_output(71, "waiting\n"),
+            ),
+            write_stdin_at("2026-07-12T00:00:03Z", "poll-pending", 71, ""),
+            function_output_at(
+                "2026-07-12T00:00:04Z",
+                "poll-pending",
+                running_output(71, "still waiting\n"),
+            ),
+        ];
+
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        let record = &parsed.analysis.records[0];
+        assert_eq!(record.tool_call_counts.bash, 1);
+        assert!(record.run_command_details.is_empty());
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
+        assert_eq!(parsed.analysis_facts.len(), 1);
+        assert_eq!(parsed.analysis_facts[0].status, ToolFactStatus::Pending);
+        assert_eq!(parsed.analysis_facts[0].metrics.bash_count, 1);
+        assert_eq!(
+            parsed.analysis_facts[0].observed_at_ms,
+            Some(parse_iso_timestamp("2026-07-12T00:00:04Z"))
+        );
+    }
+
+    #[test]
+    fn async_stdin_write_error_does_not_terminate_original_command() {
+        let logs = vec![
+            exec_command_at("2026-07-12T00:00:01Z", "exec-input", "long-command"),
+            function_output_at("2026-07-12T00:00:02Z", "exec-input", running_output(81, "")),
+            write_stdin_at("2026-07-12T00:00:03Z", "write-input", 81, "yes\n"),
+            function_output_at(
+                "2026-07-12T00:00:04Z",
+                "write-input",
+                "write_stdin failed: session input stream is closed".to_string(),
+            ),
+            write_stdin_at("2026-07-12T00:00:05Z", "poll-after-error", 81, ""),
+            function_output_at(
+                "2026-07-12T00:00:06Z",
+                "poll-after-error",
+                exited_output(0, "done\n"),
+            ),
+        ];
+
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        let record = &parsed.analysis.records[0];
+        assert_eq!(record.tool_call_counts.bash, 1);
+        assert_eq!(record.run_command_details.len(), 1);
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
+        assert_eq!(parsed.analysis_facts.len(), 1);
+        assert_eq!(parsed.analysis_facts[0].status, ToolFactStatus::Succeeded);
+    }
+
+    #[test]
+    fn async_exec_commands_can_complete_out_of_order() {
+        let logs = vec![
+            log_at(
+                "2026-07-12T00:00:00Z",
+                "turn_context",
+                serde_json::json!({ "model": "model-a" }),
+            ),
+            exec_command_at("2026-07-12T00:00:01Z", "exec-a", "command-a"),
+            function_output_at("2026-07-12T00:00:02Z", "exec-a", running_output(91, "")),
+            log_at(
+                "2026-07-12T00:00:03Z",
+                "turn_context",
+                serde_json::json!({ "model": "model-b" }),
+            ),
+            exec_command_at("2026-07-12T00:00:03Z", "exec-b", "command-b"),
+            function_output_at("2026-07-12T00:00:04Z", "exec-b", running_output(92, "")),
+            write_stdin_at("2026-07-12T00:00:05Z", "poll-b", 92, ""),
+            function_output_at("2026-07-12T00:00:06Z", "poll-b", exited_output(0, "b\n")),
+            write_stdin_at("2026-07-12T00:00:07Z", "poll-a", 91, ""),
+            function_output_at("2026-07-12T00:00:08Z", "poll-a", exited_output(0, "a\n")),
+        ];
+
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        let record = &parsed.analysis.records[0];
+        assert_eq!(record.tool_call_counts.bash, 2);
+        assert_eq!(record.run_command_details.len(), 2);
+        assert_eq!(record.run_command_details[0].command, "command-b");
+        assert_eq!(record.run_command_details[1].command, "command-a");
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
+        assert_eq!(parsed.analysis_facts.len(), 2);
+        assert!(
+            parsed
+                .analysis_facts
+                .iter()
+                .all(|fact| fact.status == ToolFactStatus::Succeeded)
+        );
+        let fact_a = parsed
+            .analysis_facts
+            .iter()
+            .find(|fact| fact.stable_id.as_deref() == Some("codex-tool:exec-a"))
+            .unwrap();
+        let fact_b = parsed
+            .analysis_facts
+            .iter()
+            .find(|fact| fact.stable_id.as_deref() == Some("codex-tool:exec-b"))
+            .unwrap();
+        assert_eq!(fact_a.model, "model-a");
+        assert_eq!(fact_b.model, "model-b");
+    }
+
+    #[test]
+    fn orphan_and_duplicate_write_stdin_polls_do_not_invent_invocations() {
+        let logs = vec![
+            write_stdin_at("2026-07-12T00:00:00Z", "orphan-poll", 999, ""),
+            function_output_at(
+                "2026-07-12T00:00:01Z",
+                "orphan-poll",
+                exited_output(0, "orphan\n"),
+            ),
+            exec_command_at("2026-07-12T00:00:02Z", "exec-1", "true"),
+            function_output_at("2026-07-12T00:00:03Z", "exec-1", running_output(100, "")),
+            write_stdin_at("2026-07-12T00:00:04Z", "terminal-poll", 100, ""),
+            function_output_at(
+                "2026-07-12T00:00:05Z",
+                "terminal-poll",
+                exited_output(0, "done\n"),
+            ),
+            write_stdin_at("2026-07-12T00:00:06Z", "duplicate-poll", 100, ""),
+            function_output_at(
+                "2026-07-12T00:00:07Z",
+                "duplicate-poll",
+                exited_output(0, "duplicate\n"),
+            ),
+        ];
+
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        let record = &parsed.analysis.records[0];
+        assert_eq!(record.tool_call_counts.bash, 1);
+        assert_eq!(record.run_command_details.len(), 1);
+        assert_eq!(parsed.analysis_facts.len(), 1);
+        assert_eq!(parsed.analysis_facts[0].status, ToolFactStatus::Succeeded);
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
     }
 
     #[test]
@@ -904,8 +2317,13 @@ mod tests {
             let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
             assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
             assert!(!parsed.diagnostics.is_complete_failure());
-            assert_eq!(parsed.analysis.records[0].tool_call_counts.bash, 0);
+            assert_eq!(parsed.analysis.records[0].tool_call_counts.bash, 1);
             assert!(parsed.analysis.records[0].run_command_details.is_empty());
+            assert_eq!(parsed.analysis_facts.len(), 1);
+            let fact = &parsed.analysis_facts[0];
+            assert_eq!(fact.stable_id.as_deref(), Some("codex-tool:bad-exec"));
+            assert_eq!(fact.status, ToolFactStatus::Failed);
+            assert_eq!(fact.metrics.bash_count, 1);
         }
     }
 
@@ -927,7 +2345,108 @@ mod tests {
 
         let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
         assert!(parsed.diagnostics.is_complete_failure());
-        assert_eq!(parsed.analysis.records[0].tool_call_counts.bash, 0);
+        assert_eq!(parsed.analysis.records[0].tool_call_counts.bash, 1);
+    }
+
+    #[test]
+    fn analysis_facts_use_the_model_and_timestamp_at_invocation() {
+        let logs = vec![
+            log_at(
+                "2026-07-12T00:00:00Z",
+                "turn_context",
+                serde_json::json!({ "model": "gpt-model-a" }),
+            ),
+            log_at(
+                "2026-07-12T00:00:01Z",
+                "response_item",
+                serde_json::json!({
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": { "cmd": "sed -n '1,2p' /repo/file.rs" },
+                    "call_id": "read-model-a"
+                }),
+            ),
+            log_at(
+                "2026-07-12T00:00:02Z",
+                "turn_context",
+                serde_json::json!({ "model": "gpt-model-b" }),
+            ),
+            log_at(
+                "2026-07-12T00:00:03Z",
+                "response_item",
+                serde_json::json!({
+                    "type": "function_call_output",
+                    "call_id": "read-model-a",
+                    "output": {
+                        "output": "line one\nline two\n",
+                        "metadata": { "exit_code": 0, "duration_seconds": 0.1 }
+                    }
+                }),
+            ),
+            log_at(
+                "2026-07-12T00:00:04Z",
+                "response_item",
+                serde_json::json!({
+                    "type": "custom_tool_call",
+                    "name": "exec",
+                    "input": "await tools.exec_command({cmd: 'pwd'});",
+                    "call_id": "exec-model-b"
+                }),
+            ),
+            log_at(
+                "2026-07-12T00:00:05Z",
+                "response_item",
+                serde_json::json!({
+                    "type": "custom_tool_call_output",
+                    "call_id": "exec-model-b",
+                    "output": "Script completed"
+                }),
+            ),
+        ];
+
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        assert_eq!(parsed.analysis_facts.len(), 2);
+
+        let read = parsed
+            .analysis_facts
+            .iter()
+            .find(|fact| fact.stable_id.as_deref() == Some("codex-tool:read-model-a"))
+            .unwrap();
+        assert_eq!(read.model, "gpt-model-a");
+        assert_eq!(
+            read.timestamp_ms,
+            Some(parse_iso_timestamp("2026-07-12T00:00:01Z"))
+        );
+        assert_eq!(
+            read.observed_at_ms,
+            Some(parse_iso_timestamp("2026-07-12T00:00:03Z"))
+        );
+        assert_eq!(read.status, ToolFactStatus::Succeeded);
+        assert_eq!(read.metrics.read_count, 1);
+        assert_eq!(read.metrics.read_lines, 2);
+        let read_effect = read.effect.as_ref().unwrap();
+        assert_eq!(read_effect.read_characters, 17);
+        assert_eq!(read_effect.unique_files, ["/repo/file.rs"]);
+        assert_eq!(read_effect.read_file_details.len(), 1);
+
+        let exec = parsed
+            .analysis_facts
+            .iter()
+            .find(|fact| fact.stable_id.as_deref() == Some("codex-tool:exec-model-b"))
+            .unwrap();
+        assert_eq!(exec.model, "gpt-model-b");
+        assert_eq!(
+            exec.timestamp_ms,
+            Some(parse_iso_timestamp("2026-07-12T00:00:04Z"))
+        );
+        assert_eq!(exec.status, ToolFactStatus::Succeeded);
+        assert_eq!(exec.metrics.bash_count, 1);
+        let exec_effect = exec.effect.as_ref().unwrap();
+        assert_eq!(exec_effect.run_command_details.len(), 1);
+        assert_eq!(
+            exec_effect.run_command_details[0].command,
+            "await tools.exec_command({cmd: 'pwd'});"
+        );
     }
 
     #[test]
@@ -1050,6 +2569,177 @@ mod tests {
     }
 
     #[test]
+    fn cumulative_usage_is_deltaed_across_model_switches() {
+        let logs: Vec<CodexLog> = [
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:00Z",
+                "type": "turn_context",
+                "payload": { "model": "gpt-a" }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 100,
+                            "output_tokens": 20,
+                            "total_tokens": 120
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:02Z",
+                "type": "turn_context",
+                "payload": { "model": "gpt-b" }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:03Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 140,
+                            "output_tokens": 30,
+                            "total_tokens": 170
+                        }
+                    }
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|value| serde_json::from_value(value).unwrap())
+        .collect();
+
+        let analysis = parse_codex_logs(&logs, ParseMode::Full).unwrap();
+        let usage = &analysis.records[0].conversation_usage;
+        assert_eq!(usage["gpt-a"]["total_token_usage"]["total_tokens"], 120);
+        assert_eq!(usage["gpt-b"]["total_token_usage"]["input_tokens"], 40);
+        assert_eq!(usage["gpt-b"]["total_token_usage"]["output_tokens"], 10);
+        assert_eq!(usage["gpt-b"]["total_token_usage"]["total_tokens"], 50);
+    }
+
+    #[test]
+    fn last_usage_wins_while_missing_components_use_cumulative_delta() {
+        let logs: Vec<CodexLog> = [
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:00Z",
+                "type": "turn_context",
+                "payload": { "model": "gpt-a" }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 100,
+                            "cached_input_tokens": 20,
+                            "output_tokens": 20,
+                            "total_tokens": 120
+                        },
+                        "last_token_usage": {
+                            "input_tokens": 100,
+                            "cached_input_tokens": 20,
+                            "output_tokens": 20,
+                            "total_tokens": 120
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:02Z",
+                "type": "turn_context",
+                "payload": { "model": "gpt-b" }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:03Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 160,
+                            "cached_input_tokens": 35,
+                            "output_tokens": 30,
+                            "total_tokens": 190
+                        },
+                        "last_token_usage": {
+                            "input_tokens": 25,
+                            "output_tokens": 4
+                        }
+                    }
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|value| serde_json::from_value(value).unwrap())
+        .collect();
+
+        let analysis = parse_codex_logs(&logs, ParseMode::Full).unwrap();
+        let usage = &analysis.records[0].conversation_usage["gpt-b"]["total_token_usage"];
+        assert_eq!(usage["input_tokens"], 25);
+        assert_eq!(usage["cached_input_tokens"], 15);
+        assert_eq!(usage["output_tokens"], 4);
+        assert_eq!(usage["total_tokens"], 70);
+    }
+
+    #[test]
+    fn cumulative_replay_is_zero_and_rollback_starts_a_new_epoch() {
+        let logs: Vec<CodexLog> = [
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:00Z",
+                "type": "turn_context",
+                "payload": { "model": "gpt-a" }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": { "input_tokens": 100, "total_tokens": 100 },
+                        "last_token_usage": { "input_tokens": 100, "total_tokens": 100 }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:02Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": { "input_tokens": 100, "total_tokens": 100 },
+                        "last_token_usage": { "input_tokens": 100, "total_tokens": 100 }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:03Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": { "input_tokens": 20, "total_tokens": 20 }
+                    }
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|value| serde_json::from_value(value).unwrap())
+        .collect();
+
+        let analysis = parse_codex_logs(&logs, ParseMode::Full).unwrap();
+        let usage = &analysis.records[0].conversation_usage["gpt-a"]["total_token_usage"];
+        assert_eq!(usage["input_tokens"], 120);
+        assert_eq!(usage["total_tokens"], 120);
+    }
+
+    #[test]
     fn pre_context_usage_is_not_guessed_from_a_later_model() {
         let logs: Vec<CodexLog> = [
             serde_json::json!({
@@ -1144,6 +2834,18 @@ mod tests {
     }
 
     #[test]
+    fn running_session_marker_is_read_only_from_the_metadata_header() {
+        let raw = exited_output(0, "Process running with session ID 999\n");
+        assert_eq!(running_shell_session_id(&shell_output(Some(&raw))), None);
+
+        let raw = running_output(42, "Process running with session ID 999\n");
+        assert_eq!(
+            running_shell_session_id(&shell_output(Some(&raw))),
+            Some(42)
+        );
+    }
+
+    #[test]
     fn legacy_shell_output_passes_through_unchanged() {
         // Legacy `shell` function output has no metadata header; the
         // helper must leave non-prefixed strings exactly as-is so the
@@ -1183,6 +2885,131 @@ mod tests {
 
         let empty_path = "*** Begin Patch\n*** Add File:\n+new\n*** End Patch";
         assert!(parse_custom_call("apply_patch", empty_path, 1, ParseMode::Full).is_none());
+    }
+
+    #[test]
+    fn malformed_known_custom_calls_still_count_as_pending_invocations() {
+        let logs = vec![
+            log_at(
+                "2026-07-12T00:00:00Z",
+                "turn_context",
+                serde_json::json!({ "model": "gpt-5-codex" }),
+            ),
+            response_item(serde_json::json!({
+                "type": "custom_tool_call",
+                "name": "exec",
+                "input": "",
+                "call_id": "invalid-exec"
+            })),
+            response_item(serde_json::json!({
+                "type": "custom_tool_call",
+                "name": "apply_patch",
+                "input": "*** Begin Patch\n*** Future File: src/lib.rs\n+new\n*** End Patch",
+                "call_id": "invalid-patch"
+            })),
+        ];
+
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        let record = &parsed.analysis.records[0];
+        assert_eq!(record.tool_call_counts.bash, 1);
+        assert_eq!(record.tool_call_counts.edit, 1);
+        assert_eq!(parsed.analysis_facts.len(), 2);
+
+        let exec = parsed
+            .analysis_facts
+            .iter()
+            .find(|fact| fact.stable_id.as_deref() == Some("codex-tool:invalid-exec"))
+            .unwrap();
+        assert_eq!(exec.model, "gpt-5-codex");
+        assert_eq!(exec.status, ToolFactStatus::Pending);
+        assert_eq!(exec.metrics.bash_count, 1);
+
+        let patch = parsed
+            .analysis_facts
+            .iter()
+            .find(|fact| fact.stable_id.as_deref() == Some("codex-tool:invalid-patch"))
+            .unwrap();
+        assert_eq!(patch.model, "gpt-5-codex");
+        assert_eq!(patch.status, ToolFactStatus::Pending);
+        assert_eq!(patch.metrics.edit_count, 1);
+    }
+
+    #[test]
+    fn tracked_calls_without_correlation_ids_are_anonymous_without_effects() {
+        let logs = vec![
+            log_at(
+                "2026-07-12T00:00:00Z",
+                "turn_context",
+                serde_json::json!({ "model": "gpt-5-codex" }),
+            ),
+            response_item(serde_json::json!({
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": { "cmd": "printf test" }
+            })),
+            response_item(serde_json::json!({
+                "type": "custom_tool_call",
+                "name": "apply_patch",
+                "input": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-old\n+new\n*** End Patch"
+            })),
+        ];
+
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        let record = &parsed.analysis.records[0];
+
+        assert_eq!(record.tool_call_counts.bash, 1);
+        assert_eq!(record.tool_call_counts.edit, 1);
+        assert_eq!(record.total_unique_files, 0);
+        assert_eq!(record.total_edit_lines, 0);
+        assert!(record.edit_file_details.is_empty());
+        assert!(record.run_command_details.is_empty());
+        assert_eq!(parsed.analysis_facts.len(), 2);
+        assert!(parsed.analysis_facts.iter().all(|fact| {
+            fact.stable_id.is_none()
+                && fact.status == ToolFactStatus::Pending
+                && fact.effect.is_none()
+        }));
+        assert_eq!(parsed.analysis_facts[0].metrics.bash_count, 1);
+        assert_eq!(parsed.analysis_facts[1].metrics.edit_count, 1);
+        assert!(!parsed.diagnostics.is_complete_failure());
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 2);
+    }
+
+    #[test]
+    fn malformed_tracked_calls_without_ids_still_emit_invocations() {
+        let logs = vec![
+            log_at(
+                "2026-07-12T00:00:00Z",
+                "turn_context",
+                serde_json::json!({ "model": "gpt-5-codex" }),
+            ),
+            response_item(serde_json::json!({
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": { "unexpected": true }
+            })),
+            response_item(serde_json::json!({
+                "type": "custom_tool_call",
+                "name": "apply_patch",
+                "input": "*** Begin Patch\n*** Future File: src/lib.rs\n+new\n*** End Patch"
+            })),
+        ];
+
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        let record = &parsed.analysis.records[0];
+
+        assert_eq!(record.tool_call_counts.bash, 1);
+        assert_eq!(record.tool_call_counts.edit, 1);
+        assert_eq!(record.total_unique_files, 0);
+        assert_eq!(record.total_edit_lines, 0);
+        assert_eq!(parsed.analysis_facts.len(), 2);
+        assert!(parsed.analysis_facts.iter().all(|fact| {
+            fact.stable_id.is_none()
+                && fact.status == ToolFactStatus::Pending
+                && fact.effect.is_none()
+        }));
+        assert!(!parsed.diagnostics.is_complete_failure());
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 4);
     }
 
     #[test]
@@ -1236,6 +3063,127 @@ mod tests {
     }
 
     #[test]
+    fn structured_patch_is_authoritative_and_deduplicates_direct_lifecycle() {
+        let direct =
+            "*** Begin Patch\n*** Update File: /repo/update.rs\n@@\n-old\n+new\n*** End Patch";
+        let logs = vec![
+            response_item(serde_json::json!({
+                "type": "custom_tool_call",
+                "name": "apply_patch",
+                "input": direct,
+                "call_id": "patch-structured"
+            })),
+            event_msg(serde_json::json!({
+                "type": "patch_apply_end",
+                "call_id": "patch-structured",
+                "success": true,
+                "status": "completed",
+                "stdout": "Success. Updated the following files:\nM /repo/update.rs\n",
+                "stderr": "",
+                "changes": {
+                    "/repo/add.rs": {
+                        "type": "add",
+                        "content": "one\ntwo\n"
+                    },
+                    "/repo/update.rs": {
+                        "type": "update",
+                        "unified_diff": "@@ -1 +1 @@\n-old\n+new\n",
+                        "move_path": null
+                    },
+                    "/repo/delete.rs": {
+                        "type": "delete",
+                        "content": "removed\n"
+                    },
+                    "/repo/old.rs": {
+                        "type": "update",
+                        "unified_diff": "",
+                        "move_path": "/repo/new.rs"
+                    }
+                }
+            })),
+            custom_output(
+                "patch-structured",
+                serde_json::json!("Success. Updated the following files:\nM /repo/update.rs"),
+            ),
+        ];
+
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        let record = &parsed.analysis.records[0];
+        assert_eq!(record.tool_call_counts.edit, 1);
+        assert_eq!(record.tool_call_counts.write, 0);
+        assert_eq!(record.write_file_details.len(), 1);
+        assert_eq!(record.edit_file_details.len(), 3);
+        assert_eq!(record.total_unique_files, 5);
+        assert!(
+            record
+                .edit_file_details
+                .iter()
+                .any(|detail| detail.base.file_path == "/repo/new.rs")
+        );
+        assert_eq!(parsed.analysis_facts.len(), 1);
+        let fact = &parsed.analysis_facts[0];
+        assert_eq!(
+            fact.stable_id.as_deref(),
+            Some("codex-tool:patch-structured")
+        );
+        assert_eq!(fact.status, ToolFactStatus::Succeeded);
+        assert_eq!(fact.metrics.edit_count, 1);
+        assert_eq!(fact.metrics.write_count, 0);
+        let effect = fact.effect.as_ref().unwrap();
+        assert_eq!(effect.unique_files.len(), 5);
+        assert_eq!(effect.write_file_details.len(), 1);
+        assert_eq!(effect.edit_file_details.len(), 3);
+    }
+
+    #[test]
+    fn structured_failed_patch_counts_invocation_without_effects() {
+        let logs = vec![event_msg(serde_json::json!({
+            "type": "patch_apply_end",
+            "call_id": "patch-failed-event",
+            "success": false,
+            "status": "completed",
+            "stdout": "",
+            "stderr": "failed",
+            "changes": {
+                "/repo/file.rs": {
+                    "type": "update",
+                    "unified_diff": "@@ -1 +1 @@\n-old\n+new\n",
+                    "move_path": null
+                }
+            }
+        }))];
+
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        let record = &parsed.analysis.records[0];
+        assert_eq!(record.tool_call_counts.edit, 1);
+        assert_eq!(record.total_unique_files, 0);
+        assert!(record.edit_file_details.is_empty());
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
+        assert!(parsed.analysis_facts[0].effect.is_none());
+    }
+
+    #[test]
+    fn direct_delete_without_body_is_a_successful_edit() {
+        let patch = "*** Begin Patch\n*** Delete File: src/obsolete.rs\n*** End Patch";
+        let logs = vec![
+            response_item(serde_json::json!({
+                "type": "custom_tool_call",
+                "name": "apply_patch",
+                "input": patch,
+                "call_id": "delete-empty"
+            })),
+            custom_output("delete-empty", serde_json::json!("Done!")),
+        ];
+
+        let analysis = parse_codex_logs(&logs, ParseMode::Full).unwrap();
+        let record = &analysis.records[0];
+        assert_eq!(record.tool_call_counts.edit, 1);
+        assert_eq!(record.edit_file_details.len(), 1);
+        assert_eq!(record.total_unique_files, 1);
+        assert_eq!(record.edit_file_details[0].base.line_count, 0);
+    }
+
+    #[test]
     fn failed_direct_custom_apply_patch_is_skipped() {
         let patch = "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-old\n+new\n*** End Patch";
         let wire_result = serde_json::json!({
@@ -1255,9 +3203,79 @@ mod tests {
 
         let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
         let record = &parsed.analysis.records[0];
-        assert_eq!(record.tool_call_counts.edit, 0);
+        assert_eq!(record.tool_call_counts.edit, 1);
         assert!(record.edit_file_details.is_empty());
         assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
+    }
+
+    #[test]
+    fn patch_facts_count_every_lifecycle_but_only_success_keeps_effects() {
+        let patch = "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-old\n+new\n*** End Patch";
+        let mut logs = vec![log_at(
+            "2026-07-12T00:00:00Z",
+            "turn_context",
+            serde_json::json!({ "model": "gpt-5-codex" }),
+        )];
+        for (second, call_id) in [
+            (1, "patch-success"),
+            (2, "patch-failed"),
+            (3, "patch-rejected"),
+            (4, "patch-unknown"),
+            (5, "patch-pending"),
+        ] {
+            logs.push(log_at(
+                &format!("2026-07-12T00:00:{second:02}Z"),
+                "response_item",
+                serde_json::json!({
+                    "type": "custom_tool_call",
+                    "name": "apply_patch",
+                    "input": patch,
+                    "call_id": call_id
+                }),
+            ));
+        }
+        for (second, call_id, output) in [
+            (6, "patch-success", "Done!"),
+            (7, "patch-failed", "Failed to find expected lines"),
+            (8, "patch-rejected", "patch rejected by user"),
+            (9, "patch-unknown", "Patch command finished"),
+        ] {
+            logs.push(log_at(
+                &format!("2026-07-12T00:00:{second:02}Z"),
+                "response_item",
+                serde_json::json!({
+                    "type": "custom_tool_call_output",
+                    "call_id": call_id,
+                    "output": output
+                }),
+            ));
+        }
+
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        let record = &parsed.analysis.records[0];
+        assert_eq!(record.tool_call_counts.edit, 5);
+        assert_eq!(record.edit_file_details.len(), 1);
+        assert_eq!(parsed.analysis_facts.len(), 5);
+
+        for (call_id, status, edit_lines) in [
+            ("patch-success", ToolFactStatus::Succeeded, 1),
+            ("patch-failed", ToolFactStatus::Failed, 0),
+            ("patch-rejected", ToolFactStatus::Failed, 0),
+            ("patch-unknown", ToolFactStatus::Failed, 0),
+            ("patch-pending", ToolFactStatus::Pending, 0),
+        ] {
+            let stable_id = format!("codex-tool:{call_id}");
+            let fact = parsed
+                .analysis_facts
+                .iter()
+                .find(|fact| fact.stable_id.as_deref() == Some(stable_id.as_str()))
+                .unwrap();
+            assert_eq!(fact.model, "gpt-5-codex");
+            assert_eq!(fact.status, status);
+            assert_eq!(fact.metrics.edit_count, 1);
+            assert_eq!(fact.metrics.edit_lines, edit_lines);
+            assert_eq!(fact.effect.is_some(), status == ToolFactStatus::Succeeded);
+        }
     }
 
     #[test]
@@ -1283,7 +3301,7 @@ mod tests {
 
             let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
             let record = &parsed.analysis.records[0];
-            assert_eq!(record.tool_call_counts.edit, 0);
+            assert_eq!(record.tool_call_counts.edit, 1);
             assert!(record.edit_file_details.is_empty());
             assert_eq!(parsed.diagnostics.relevant_records, 2);
             assert_eq!(parsed.diagnostics.normalized_records, 1);
@@ -1373,10 +3391,49 @@ mod tests {
             call,
             CodexShellOutput {
                 output: String::new(),
-                metadata: None,
+                metadata: Some(CodexShellMetadata {
+                    exit_code: 0,
+                    duration_seconds: 0.0,
+                }),
             },
         );
         assert_eq!(state.tool_counts.edit, 1);
         assert_eq!(state.edit_details.len(), 1);
+    }
+
+    #[test]
+    fn failed_and_unknown_shell_reads_count_without_file_effects() {
+        for (call_id, output, partial_failures) in [
+            (
+                "failed-read",
+                serde_json::json!({
+                    "output": "permission denied",
+                    "metadata": { "exit_code": 1, "duration_seconds": 0.1 }
+                }),
+                0,
+            ),
+            ("unknown-read", serde_json::json!("file contents"), 1),
+        ] {
+            let logs = vec![
+                response_item(serde_json::json!({
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": { "cmd": "sed -n '1,10p' /repo/file.rs" },
+                    "call_id": call_id
+                })),
+                response_item(serde_json::json!({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": output
+                })),
+            ];
+
+            let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+            let record = &parsed.analysis.records[0];
+            assert_eq!(record.tool_call_counts.read, 1);
+            assert_eq!(record.total_unique_files, 0);
+            assert!(record.read_file_details.is_empty());
+            assert_eq!(parsed.diagnostics.partial_failure_count(), partial_failures);
+        }
     }
 }

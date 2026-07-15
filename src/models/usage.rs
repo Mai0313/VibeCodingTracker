@@ -16,7 +16,7 @@ pub type UsageResult = FastHashMap<String, serde_json::Value>;
 /// Tracks the number of active days per AI provider
 ///
 /// Used for calculating daily averages when data is aggregated by model only.
-/// Day counts are derived from file modification dates during processing.
+/// Day counts are derived from usage-event timestamps during processing.
 #[derive(Debug, Clone, Default)]
 pub struct ProviderActiveDays {
     /// Distinct active days observed for Claude Code.

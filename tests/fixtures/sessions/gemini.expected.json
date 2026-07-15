@@ -29,7 +29,7 @@
           "lineCount": 1,
           "newString": "專案統一使用 `uv` 進行管理。**請務必確保所有的執行指令（包含啟動機器人、執行測試、運行腳本等）都透過 `uv run` 來執行**，以確保在隔離的虛擬環境中運行並避免依賴套件的衝突或環境問題。絕對不應直接使用全域的 `python` 或 `pip`。",
           "oldString": "專案統一使用 `uv` 進行管理，不應直接使用 `pip`。",
-          "timestamp": 1776948962441
+          "timestamp": 1776948962497
         }
       ],
       "folderPath": "",
@@ -39,48 +39,48 @@
           "characterCount": 10443,
           "filePath": "README.md",
           "lineCount": 191,
-          "timestamp": 1776948791257
+          "timestamp": 1776948791357
         },
         {
           "characterCount": 20998,
           "filePath": "pyproject.toml",
           "lineCount": 721,
-          "timestamp": 1776948791257
+          "timestamp": 1776948791357
         },
         {
           "characterCount": 16565,
           "filePath": "CLAUDE.md",
           "lineCount": 151,
-          "timestamp": 1776948791257
+          "timestamp": 1776948791357
         },
         {
           "characterCount": 1449,
           "filePath": "Makefile",
           "lineCount": 37,
-          "timestamp": 1776948791257
+          "timestamp": 1776948791357
         },
         {
           "characterCount": 8245,
           "filePath": "src/discordbot/cli.py",
           "lineCount": 204,
-          "timestamp": 1776948798422
+          "timestamp": 1776948798465
         },
         {
           "characterCount": 23419,
           "filePath": "src/discordbot/cogs/gen_reply.py",
           "lineCount": 531,
-          "timestamp": 1776948798422
+          "timestamp": 1776948798465
         },
         {
           "characterCount": 765,
           "filePath": "src/discordbot/typings/config.py",
           "lineCount": 27,
-          "timestamp": 1776948798422
+          "timestamp": 1776948798465
         }
       ],
       "runCommandDetails": [],
       "taskId": "0ab84937-9fe7-4284-986a-33c832af0b6a",
-      "timestamp": 1776948962441,
+      "timestamp": 1776948962497,
       "toolCallCounts": {
         "Bash": 0,
         "Edit": 1,
@@ -101,7 +101,7 @@
           "content": "# GEMINI.md - Project Context & Instructions\n\n這是一個基於 Python 的 Discord 機器人專案，整合了 AI 聊天、影像/影片生成、Threads 解析、影片下載以及楓之谷 (MapleStory) 資料庫功能。\n\n## 專案概觀 (Project Overview)\n\n- **核心技術**: Python 3.12+, `nextcord` (Discord API), `uv` (套件管理), `pydantic` (資料驗證), `logfire` (日誌記錄)。\n- **AI 後端**: 使用 `openai` SDK 呼叫相容 OpenAI API 的端點 (通常是 [LiteLLM](https://github.com/BerriAI/litellm) proxy)。支援多種模型進行意圖路由、文本回覆、圖片/影片生成及網頁檢索。\n- **資料庫**: 支援 SQLite (預設), PostgreSQL, Redis。主要用於訊息記錄與資料快取。\n- **主要功能**:\n  - **AI Chat**: 提及機器人或私訊即可對話，支援多模態 (圖片/貼圖理解)、網頁搜尋、聊天摘要。\n  - **Threads Parsing**: 自動擴展 Threads 連結，顯示內文、媒體並下載影片。\n  - **Video Downloading**: 使用 `yt-dlp` 下載 YouTube, TikTok, Instagram, Bilibili 等平台的影片。\n  - **MapleStory Artale DB**: 提供 `/maple_*` 系列指令查詢怪物、裝備、捲軸、NPC、地圖等資料。\n\n## 建置與執行 (Building and Running)\n\n專案統一使用 `uv` 進行管理，不應直接使用 `pip`。\n\n- **安裝依賴**:\n  ```bash\n  uv sync\n  ```\n- **執行機器人**:\n  ```bash\n  uv run discordbot\n  ```\n- **執行測試**:\n  ```bash\n  uv run pytest\n  ```\n- **程式碼格式化與檢查**:\n  ```bash\n  make format  # 執行 pre-commit hooks (ruff, mypy, ty 等)\n  ```\n- **產生文件**:\n  ```bash\n  make gen-docs\n  ```\n- **更新楓之谷資料庫**:\n  ```bash\n  uv run python scripts/artale_data.py\n  ```\n\n## 開發規範 (Development Conventions)\n\n### 架構設計\n- **Entry Point**: `src/discordbot/cli.py` 是機器人的進入點，負責載入 Cog 與同步指令。\n- **Cog 模式**: 所有的功能模組都放在 `src/discordbot/cogs/` 下。\n  - 輔助程式碼應放在同層的 `_<cog>/` 目錄中 (例如 `cogs/_gen_reply/`)，這些目錄會被自動載入邏輯跳過。\n  - 檔名以 `__` 開頭的檔案也會被跳過。\n- **設定管理**: 使用 Pydantic Settings，定義在 `src/discordbot/typings/`。環境變數應填寫在 `.env` 檔案中。\n- **AI Pipeline**:\n  - 所有的 AI 呼叫必須透過 `AsyncOpenAI` 客戶端，並經由 LiteLLM 轉發。\n  - **禁止直接導入** `google-genai` 或 `anthropic` 等特定供應商的 SDK。\n  - 提示詞 (Prompts) 統一集中在 `src/discordbot/cogs/_gen_reply/prompts.py`。\n  - 狀態顯示應使用訊息反應 (Emoji reactions) 而非發送 \"Thinking...\" 訊息。\n\n### 程式碼風格\n- **格式化**: 嚴格遵守 `ruff` 規範，行長限制為 99 字符。\n- **型別檢查**: 使用 `mypy` 和 `ty` 進行靜態檢查。新的 public function 必須包含正確的 type hints。\n- **參數傳遞**: 呼叫具有兩個以上參數的函式時，**必須使用 keyword arguments**。\n- **異步處理**: 廣泛使用 `asyncio.gather` 來平行處理獨立的任務 (如獲取訊息歷史與附件)。\n- **錯誤處理**: 在 `cli.py` 的 `on_command_error` 中集中處理常見異常，並以 Embed 形式回饋給使用者。\n\n### 測試要求\n- **覆蓋率**: 新增功能必須包含測試，全專案測試覆蓋率應維持在 80% 以上。\n- **工具**: 使用 `pytest` 搭配 `pytest-asyncio`。\n\n## 關鍵檔案 (Key Files)\n\n- `pyproject.toml`: 專案依賴與工具設定 (Ruff, Pytest, Mypy, UV)。\n- `CLAUDE.md`: 詳細的開發規範與架構說明 (強烈建議閱讀)。\n- `src/discordbot/cogs/gen_reply.py`: 最核心的 AI 聊天與路由邏輯。\n- `scripts/`: 包含資料爬取、文件產生、遷移等實用指令碼。\n- `data/`: 存放日誌、楓之谷 JSON 資料、SQLite 資料庫等。",
           "filePath": "GEMINI.md",
           "lineCount": 76,
-          "timestamp": 1776948809818
+          "timestamp": 1776948809832
         }
       ]
     }

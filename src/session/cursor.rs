@@ -27,7 +27,8 @@ use crate::cli::TimeRange;
 use crate::constants::FastHashMap;
 use crate::models::{CodeAnalysis, CodeAnalysisRecord, ExtensionType};
 use crate::session::diagnostics::{
-    DatabaseAnalysisRow, DatabaseUsageRead, UsageContribution, UsageTokenContribution,
+    AnalysisFact, AnalysisFactEffect, AnalysisMetrics, AnalysisStateSnapshot, DatabaseAnalysisRow,
+    DatabaseUsageRead, ToolFactStatus, UsageContribution, UsageTokenContribution,
 };
 use crate::session::sqlite::{
     DatabaseFingerprint, optional_database_fingerprint, with_readonly_connection,
@@ -37,7 +38,7 @@ use crate::utils::{get_current_user, get_machine_id};
 use anyhow::{Result, anyhow};
 use rusqlite::Connection;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 // ===========================================================================
@@ -180,9 +181,16 @@ pub(crate) struct CursorAnalysisRead {
 }
 
 pub(crate) struct CursorStoreAnalysis {
-    pub(crate) rows: Vec<(String, CodeAnalysis)>,
+    pub(crate) rows: Vec<DatabaseAnalysisRow>,
     pub(crate) normalized_messages: usize,
     pub(crate) failed_payloads: usize,
+}
+
+struct CursorAssistantTurn {
+    timestamp_ms: i64,
+    source_order: usize,
+    date: String,
+    message: Value,
 }
 
 /// Reads Cursor stores while retaining one diagnostic per store.
@@ -224,13 +232,7 @@ pub(crate) fn read_cursor_analysis_with_diagnostics(
             }
             Ok(store) => {
                 parsed += 1;
-                for (date, analysis) in store.rows {
-                    out.push(DatabaseAnalysisRow {
-                        source_id: store_db.to_string_lossy().into_owned(),
-                        date,
-                        analysis,
-                    });
-                }
+                out.extend(store.rows);
                 if store.failed_payloads > 0 {
                     failures.push(CursorAnalysisFailure {
                         path: store_db,
@@ -295,7 +297,7 @@ fn aggregate_events(events: &[UsageEvent], time_range: TimeRange) -> Vec<UsageCo
             e.timestamp_ms,
             e.model.clone(),
             cursor_usage_value(e.input, e.output, e.cache_read, e.cache_write),
-            e.cost,
+            (e.cost != 0.0).then_some(e.cost),
         ));
     }
     out
@@ -617,95 +619,131 @@ pub(crate) fn read_store_analysis(
 ) -> Result<CursorStoreAnalysis> {
     let conv_id = conversation_id_from_path(store_db);
     let cutoff = cutoff_string(time_range);
+    let source_id = store_db.to_string_lossy().into_owned();
 
     with_readonly_connection(store_db, "blobs", "vct-cursor-", "Cursor", |conn| {
         let transaction = conn.unchecked_transaction()?;
         let model = resolve_store_model(&transaction, conv_models, &conv_id);
         let blobs = load_blobs(&transaction)?;
 
-        // Pass 1: index Read tool results by tool-call id so their file lines can
-        // be attributed to the matching Read call in pass 2.
-        let read_results = collect_read_results(&blobs);
+        // Pass 1: index terminal tool results by tool-call id. A call without a
+        // terminal result is still an invocation, but cannot claim effects.
+        let tool_results = collect_tool_results(&blobs);
         let mut failed_payloads = 0usize;
 
-        // Pass 2: fold each assistant turn's tool calls into a per-date state.
-        let mut per_date: HashMap<String, SessionParseState> = HashMap::new();
-        let mut normalized_messages = 0usize;
-        for data in &blobs {
+        // Pass 2: decode assistant turns before folding them. Blob ids are
+        // content-addressed rather than chronological, so sort by the actual
+        // invocation timestamp before deduplicating replayed tool-call ids.
+        let mut turns = Vec::new();
+        for (source_order, data) in blobs.iter().enumerate() {
             if data.first() != Some(&0x0A) {
                 continue;
             }
             let node = walk_node(data);
+            let date = node.ts.and_then(ms_to_local_date);
+            let is_in_range = date
+                .as_ref()
+                .is_none_or(|date| !is_before_cutoff(date, &cutoff));
             let Some(msg_bytes) = node.msg else {
                 // Cursor also writes aggregate DAG nodes with the normal
                 // context-gauge field and a timestamp but no message. They are
                 // not assistant turns. A timestamped node with neither the
                 // message nor the known gauge remains suspicious schema drift.
-                if node.ctx_msg.is_none()
-                    && let Some(ts) = node.ts
-                    && ms_to_local_date(ts).is_some_and(|date| !is_before_cutoff(&date, &cutoff))
-                {
+                if node.ctx_msg.is_none() && node.ts.is_some() && is_in_range {
                     failed_payloads += 1;
                 }
                 continue;
             };
-            if let Some(ts) = node.ts
-                && ms_to_local_date(ts).is_some_and(|date| is_before_cutoff(&date, &cutoff))
-            {
-                continue;
-            }
-            let Ok(msg) = serde_json::from_slice::<Value>(msg_bytes) else {
-                failed_payloads += 1;
+            let Ok(message) = serde_json::from_slice::<Value>(msg_bytes) else {
+                if is_in_range {
+                    failed_payloads += 1;
+                }
                 continue;
             };
-            let Some(role) = msg.get("role").and_then(Value::as_str) else {
-                failed_payloads += 1;
+            let Some(role) = message.get("role").and_then(Value::as_str) else {
+                if is_in_range {
+                    failed_payloads += 1;
+                }
                 continue;
             };
-            // Only assistant turns carry tool calls. Guard before creating a
-            // date bucket so a non-assistant node never emits a zero-metric row
-            // or inflates the Cursor active-day count.
             if role != "assistant" {
                 continue;
             }
-            let Some(ts) = node.ts else {
+            let (Some(timestamp_ms), Some(date)) = (node.ts, date) else {
                 failed_payloads += 1;
                 continue;
             };
-            let Some(date) = ms_to_local_date(ts) else {
-                failed_payloads += 1;
-                continue;
-            };
-            if is_before_cutoff(&date, &cutoff) {
-                continue;
-            }
-            if msg.get("content").and_then(Value::as_array).is_none() {
-                failed_payloads += 1;
+            if message.get("content").and_then(Value::as_array).is_none() {
+                if is_in_range {
+                    failed_payloads += 1;
+                }
                 continue;
             }
-            let state = per_date.entry(date).or_insert_with(|| {
+            turns.push(CursorAssistantTurn {
+                timestamp_ms,
+                source_order,
+                date,
+                message,
+            });
+        }
+        turns.sort_by_key(|turn| (turn.timestamp_ms, turn.source_order));
+
+        // Pass 3: fold each assistant turn's tool calls into a per-date state.
+        let mut per_date: HashMap<String, SessionParseState> = HashMap::new();
+        let mut facts_per_date: HashMap<String, Vec<AnalysisFact>> = HashMap::new();
+        let mut seen_tool_calls = HashSet::new();
+        let mut fact_source_order = 0usize;
+        let mut normalized_messages = 0usize;
+        for turn in turns {
+            let in_range = !is_before_cutoff(&turn.date, &cutoff);
+            let state = per_date.entry(turn.date.clone()).or_insert_with(|| {
                 let mut s = SessionParseState::with_mode(mode);
                 s.task_id = conv_id.clone();
                 s
             });
-            state.last_ts = ts.max(state.last_ts);
-            match apply_assistant_tools(state, &msg, &read_results, ts) {
+            state.last_ts = turn.timestamp_ms.max(state.last_ts);
+            let facts = facts_per_date.entry(turn.date).or_default();
+            let mut fact_sink = CursorToolFactSink {
+                facts,
+                seen_tool_calls: &mut seen_tool_calls,
+                next_source_order: &mut fact_source_order,
+                model: &model,
+                conversation_id: &conv_id,
+            };
+            match apply_assistant_tools(
+                state,
+                &turn.message,
+                &tool_results,
+                turn.timestamp_ms,
+                Some(&mut fact_sink),
+            ) {
                 Ok(tool_failures) => {
-                    normalized_messages += 1;
-                    failed_payloads += tool_failures;
+                    if in_range {
+                        normalized_messages += 1;
+                        failed_payloads += tool_failures;
+                    }
                 }
-                Err(()) => failed_payloads += 1,
+                Err(()) if in_range => failed_payloads += 1,
+                Err(()) => {}
             }
         }
 
         let mut out = Vec::with_capacity(per_date.len());
         for (date, state) in per_date {
+            if is_before_cutoff(&date, &cutoff) {
+                continue;
+            }
             let mut usage = FastHashMap::default();
             // The analysis aggregator only reads the model key; the value is a
             // placeholder (real tokens come from the usage API path).
             usage.insert(model.clone(), json!({}));
             let record = state.into_record(usage);
-            out.push((date, wrap_record(record, user, machine)));
+            out.push(DatabaseAnalysisRow {
+                source_id: source_id.clone(),
+                analysis_facts: facts_per_date.remove(&date).unwrap_or_default(),
+                date,
+                analysis: wrap_record(record, user, machine),
+            });
         }
         transaction.commit()?;
         Ok(CursorStoreAnalysis {
@@ -840,11 +878,48 @@ fn message_role(bytes: &[u8]) -> Option<String> {
 }
 
 /// Applies one assistant message's tool calls to `state`.
+struct CursorToolFactSink<'a> {
+    facts: &'a mut Vec<AnalysisFact>,
+    seen_tool_calls: &'a mut HashSet<String>,
+    next_source_order: &'a mut usize,
+    model: &'a str,
+    conversation_id: &'a str,
+}
+
+impl CursorToolFactSink<'_> {
+    fn reserve_invocation(&mut self, tool_call_id: Option<&str>) -> bool {
+        tool_call_id.is_none_or(|id| self.seen_tool_calls.insert(id.to_string()))
+    }
+
+    fn push(
+        &mut self,
+        tool_call_id: Option<&str>,
+        timestamp_ms: i64,
+        status: ToolFactStatus,
+        metrics: AnalysisMetrics,
+        effect: Option<AnalysisFactEffect>,
+    ) {
+        let source_order = *self.next_source_order;
+        *self.next_source_order += 1;
+        self.facts.push(AnalysisFact {
+            stable_id: tool_call_id.map(|id| format!("cursor-tool:{}:{id}", self.conversation_id)),
+            timestamp_ms: Some(timestamp_ms),
+            observed_at_ms: Some(timestamp_ms),
+            source_order,
+            model: self.model.to_string(),
+            status,
+            metrics,
+            effect,
+        });
+    }
+}
+
 fn apply_assistant_tools(
     state: &mut SessionParseState,
     msg: &Value,
-    read_results: &HashMap<String, CursorReadResult>,
+    tool_results: &HashMap<String, CursorToolResult>,
     ts: i64,
+    mut fact_sink: Option<&mut CursorToolFactSink<'_>>,
 ) -> std::result::Result<usize, ()> {
     if msg.get("role").and_then(|v| v.as_str()) != Some("assistant") {
         return Err(());
@@ -865,78 +940,260 @@ fn apply_assistant_tools(
             failures += 1;
             continue;
         };
-        let args = c.get("args").and_then(Value::as_object);
-        let arg = |key: &str| -> Option<&str> { args?.get(key)?.as_str() };
-        match tool {
-            "Write" => {
-                let (Some(path), Some(contents)) =
-                    (arg("path").filter(|path| !path.is_empty()), arg("contents"))
-                else {
-                    failures += 1;
-                    continue;
-                };
-                state.add_write_detail(path, contents, ts);
+        if !is_tracked_cursor_tool(tool) {
+            if is_analysis_like_tool_name(tool) && !is_ignored_cursor_tool(tool) {
+                failures += 1;
             }
-            "StrReplace" => {
-                let (Some(path), Some(old), Some(new)) = (
-                    arg("path").filter(|path| !path.is_empty()),
-                    arg("old_string"),
-                    arg("new_string"),
-                ) else {
-                    failures += 1;
-                    continue;
-                };
-                state.add_edit_detail(path, old, new, ts);
-            }
-            "Read" | "ReadFile" => {
-                let (Some(path), Some(tool_call_id)) = (
-                    arg("path").filter(|path| !path.is_empty()),
-                    c.get("toolCallId")
-                        .and_then(Value::as_str)
-                        .filter(|id| !id.is_empty()),
-                ) else {
-                    failures += 1;
-                    continue;
-                };
-                match read_results.get(tool_call_id) {
-                    Some(CursorReadResult::Content(content)) if !content.is_empty() => {
-                        state.add_read_detail(path, content, ts);
-                    }
-                    Some(CursorReadResult::Unsupported) => {
-                        failures += 1;
-                        state.tool_counts.read += 1;
-                    }
-                    _ => {
-                        // A read whose result we could not recover still counts as a
-                        // read invocation, matching the OpenCode reader.
-                        state.tool_counts.read += 1;
-                    }
-                }
-            }
-            "Shell" => {
-                let Some(command) = arg("command").filter(|command| !command.trim().is_empty())
-                else {
-                    failures += 1;
-                    continue;
-                };
-                state.add_run_command(command, arg("description").unwrap_or(""), ts);
-            }
-            "TodoWrite" => state.tool_counts.todo_write += 1,
-            // Grep / Glob / Delete etc. are not part of the tracked tool set.
-            _ => {}
+            continue;
+        }
+        let tool_call_id = c
+            .get("toolCallId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
+        if fact_sink
+            .as_deref_mut()
+            .is_some_and(|sink| !sink.reserve_invocation(tool_call_id))
+        {
+            continue;
+        }
+
+        let effect_before = AnalysisStateSnapshot::capture(state);
+        let before = AnalysisMetrics::from_state(state);
+        let (status, tool_failures) = apply_cursor_tool(
+            state,
+            c,
+            tool,
+            tool_call_id.and_then(|id| tool_results.get(id)),
+            ts,
+        );
+        failures += tool_failures;
+        if let Some(sink) = fact_sink.as_deref_mut() {
+            let metrics = AnalysisMetrics::from_state(state).saturating_sub(before);
+            let effect = (status == ToolFactStatus::Succeeded)
+                .then(|| effect_before.effect_since(state, Vec::new()));
+            sink.push(tool_call_id, ts, status, metrics, effect);
         }
     }
     Ok(failures)
 }
 
-enum CursorReadResult {
-    Content(String),
+fn apply_cursor_tool(
+    state: &mut SessionParseState,
+    call: &Value,
+    tool: &str,
+    result: Option<&CursorToolResult>,
+    ts: i64,
+) -> (ToolFactStatus, usize) {
+    record_cursor_tool_invocation(state, tool);
+    match cursor_tool_lifecycle(call, result) {
+        CursorToolLifecycle::Failed => return (ToolFactStatus::Failed, 0),
+        CursorToolLifecycle::Pending => return (ToolFactStatus::Pending, 0),
+        CursorToolLifecycle::Unsupported => return (ToolFactStatus::Pending, 1),
+        CursorToolLifecycle::Success => {}
+    }
+
+    let args = call.get("args").and_then(Value::as_object);
+    let arg = |key: &str| -> Option<&str> { args?.get(key)?.as_str() };
+    let invocation_counts = state.tool_counts.clone();
+    let normalized = match tool {
+        "Write" => {
+            let (Some(path), Some(contents)) =
+                (arg("path").filter(|path| !path.is_empty()), arg("contents"))
+            else {
+                return (ToolFactStatus::Failed, 1);
+            };
+            state.add_write_detail(path, contents, ts);
+            true
+        }
+        "StrReplace" => {
+            let (Some(path), Some(old), Some(new)) = (
+                arg("path").filter(|path| !path.is_empty()),
+                arg("old_string"),
+                arg("new_string"),
+            ) else {
+                return (ToolFactStatus::Failed, 1);
+            };
+            state.add_edit_detail(path, old, new, ts);
+            true
+        }
+        "Read" | "ReadFile" => {
+            let Some(path) = arg("path").filter(|path| !path.is_empty()) else {
+                return (ToolFactStatus::Failed, 1);
+            };
+            let Some(CursorToolResult::Success {
+                read_content: Some(content),
+            }) = result
+            else {
+                return (ToolFactStatus::Failed, 1);
+            };
+            state.add_read_detail(path, content, ts);
+            true
+        }
+        "Shell" => {
+            let Some(command) = arg("command").filter(|command| !command.trim().is_empty()) else {
+                return (ToolFactStatus::Failed, 1);
+            };
+            state.add_run_command(command, arg("description").unwrap_or(""), ts);
+            true
+        }
+        "TodoWrite" => true,
+        _ => false,
+    };
+    state.tool_counts = invocation_counts;
+    if normalized {
+        (ToolFactStatus::Succeeded, 0)
+    } else {
+        (ToolFactStatus::Failed, 1)
+    }
+}
+
+enum CursorToolResult {
+    Success { read_content: Option<String> },
+    Failed,
     Unsupported,
 }
 
-/// Indexes `Read` tool results by tool-call id, with line-number prefixes
-/// stripped so the recovered content is the file's own lines.
-fn collect_read_results(blobs: &[Vec<u8>]) -> HashMap<String, CursorReadResult> {
+fn should_replace_cursor_tool_result(
+    existing: &CursorToolResult,
+    candidate: &CursorToolResult,
+) -> bool {
+    let priority = |result: &CursorToolResult| match result {
+        CursorToolResult::Failed => 2,
+        CursorToolResult::Success { .. } => 1,
+        CursorToolResult::Unsupported => 0,
+    };
+    match priority(candidate).cmp(&priority(existing)) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => match (existing, candidate) {
+            (
+                CursorToolResult::Success {
+                    read_content: existing,
+                },
+                CursorToolResult::Success {
+                    read_content: candidate,
+                },
+            ) => compare_cursor_read_content(candidate.as_deref(), existing.as_deref()).is_gt(),
+            _ => false,
+        },
+    }
+}
+
+fn compare_cursor_read_content(left: Option<&str>, right: Option<&str>) -> std::cmp::Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => left
+            .lines()
+            .count()
+            .cmp(&right.lines().count())
+            .then_with(|| left.chars().count().cmp(&right.chars().count()))
+            .then_with(|| left.cmp(right)),
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CursorToolLifecycle {
+    Success,
+    Failed,
+    Pending,
+    Unsupported,
+}
+
+fn cursor_tool_lifecycle(call: &Value, result: Option<&CursorToolResult>) -> CursorToolLifecycle {
+    match result {
+        Some(CursorToolResult::Success { .. }) => return CursorToolLifecycle::Success,
+        Some(CursorToolResult::Failed) => return CursorToolLifecycle::Failed,
+        Some(CursorToolResult::Unsupported) => return CursorToolLifecycle::Unsupported,
+        None => {}
+    }
+
+    match cursor_status(call) {
+        Some("success" | "completed") => CursorToolLifecycle::Success,
+        Some("error" | "failed" | "rejected" | "cancelled" | "canceled") => {
+            CursorToolLifecycle::Failed
+        }
+        Some("pending" | "running") | None => CursorToolLifecycle::Pending,
+        Some(_) => CursorToolLifecycle::Unsupported,
+    }
+}
+
+fn cursor_status(value: &Value) -> Option<&str> {
+    value.get("status").and_then(Value::as_str).or_else(|| {
+        value
+            .pointer("/providerOptions/cursor/status")
+            .and_then(Value::as_str)
+    })
+}
+
+fn is_tracked_cursor_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "Write" | "StrReplace" | "Read" | "ReadFile" | "Shell" | "TodoWrite"
+    )
+}
+
+fn record_cursor_tool_invocation(state: &mut SessionParseState, tool: &str) {
+    match tool {
+        "Write" => state.tool_counts.write += 1,
+        "StrReplace" => state.tool_counts.edit += 1,
+        "Read" | "ReadFile" => state.tool_counts.read += 1,
+        "Shell" => state.tool_counts.bash += 1,
+        "TodoWrite" => state.tool_counts.todo_write += 1,
+        _ => {}
+    }
+}
+
+fn is_ignored_cursor_tool(tool: &str) -> bool {
+    matches!(tool, "Grep" | "Glob" | "Delete" | "WebFetch" | "Question")
+}
+
+fn is_analysis_like_tool_name(tool: &str) -> bool {
+    let tool = tool.to_ascii_lowercase();
+    [
+        "read", "write", "edit", "replace", "patch", "file", "shell", "command", "bash", "todo",
+    ]
+    .iter()
+    .any(|fragment| tool.contains(fragment))
+}
+
+fn cursor_result_is_error(value: &Value) -> bool {
+    value.get("isError").and_then(Value::as_bool) == Some(true)
+        || value
+            .pointer("/providerOptions/cursor/isError")
+            .and_then(Value::as_bool)
+            == Some(true)
+        || value
+            .pointer("/providerOptions/cursor/highLevelToolCallResult/isError")
+            .and_then(Value::as_bool)
+            == Some(true)
+        || value
+            .pointer("/providerOptions/cursor/highLevelToolCallResult/output/failure")
+            .is_some()
+        || value
+            .pointer("/providerOptions/cursor/highLevelToolCallResult/output/error")
+            .is_some()
+        || value.get("result").is_some_and(|result| {
+            result.get("error").is_some()
+                || result.get("isError").and_then(Value::as_bool) == Some(true)
+        })
+        || matches!(
+            cursor_status(value),
+            Some("error" | "failed" | "rejected" | "cancelled" | "canceled")
+        )
+}
+
+fn cursor_result_is_success(value: &Value) -> bool {
+    matches!(cursor_status(value), Some("success" | "completed"))
+        || value
+            .pointer("/providerOptions/cursor/highLevelToolCallResult/output/success")
+            .is_some()
+}
+
+/// Indexes terminal tool results by tool-call id. Read content has its line
+/// prefixes stripped so recovered metrics reflect the file's own lines.
+fn collect_tool_results(blobs: &[Vec<u8>]) -> HashMap<String, CursorToolResult> {
     let mut map = HashMap::new();
     for data in blobs {
         if data.first() != Some(&b'{') {
@@ -962,12 +1219,7 @@ fn collect_read_results(blobs: &[Vec<u8>]) -> HashMap<String, CursorReadResult> 
             if c.get("type").and_then(|v| v.as_str()) != Some("tool-result") {
                 continue;
             }
-            if !matches!(
-                c.get("toolName").and_then(|v| v.as_str()),
-                Some("Read" | "ReadFile")
-            ) {
-                continue;
-            }
+            let tool = c.get("toolName").and_then(Value::as_str).unwrap_or("");
             let Some(id) = c
                 .get("toolCallId")
                 .and_then(|v| v.as_str())
@@ -975,14 +1227,31 @@ fn collect_read_results(blobs: &[Vec<u8>]) -> HashMap<String, CursorReadResult> 
             else {
                 continue;
             };
-            if let Some(result) = c.get("result").and_then(|v| v.as_str()) {
-                map.insert(
-                    id.to_string(),
-                    CursorReadResult::Content(strip_cursor_line_numbers(result)),
-                );
+            let is_error = cursor_result_is_error(&msg) || cursor_result_is_error(c);
+            let parsed = if is_error {
+                CursorToolResult::Failed
+            } else if let Some(result) = c.get("result") {
+                CursorToolResult::Success {
+                    read_content: if matches!(tool, "Read" | "ReadFile") {
+                        result.as_str().map(strip_cursor_line_numbers)
+                    } else {
+                        None
+                    },
+                }
+            } else if cursor_result_is_success(&msg) || cursor_result_is_success(c) {
+                CursorToolResult::Success { read_content: None }
             } else {
-                map.entry(id.to_string())
-                    .or_insert(CursorReadResult::Unsupported);
+                CursorToolResult::Unsupported
+            };
+            match map.entry(id.to_string()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(parsed);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if should_replace_cursor_tool_result(entry.get(), &parsed) {
+                        entry.insert(parsed);
+                    }
+                }
             }
         }
     }
@@ -1080,6 +1349,13 @@ fn walk_node(data: &[u8]) -> NodeFields<'_> {
 
 /// Reads the context-occupancy value (`field 1`) out of a `field 5` gauge message.
 fn context_tokens(ctx_msg: &[u8]) -> Option<i64> {
+    // In proto3 an empty nested message is the canonical encoding of a gauge
+    // whose scalar field is zero. Treat it as a real zero-value observation,
+    // not as a schema failure.
+    if ctx_msg.is_empty() {
+        return Some(0);
+    }
+
     let mut i = 0;
     while i < ctx_msg.len() {
         let (tag, ni) = read_varint(ctx_msg, i)?;
@@ -1299,6 +1575,11 @@ mod tests {
     }
 
     #[test]
+    fn empty_context_gauge_is_zero() {
+        assert_eq!(context_tokens(&[]), Some(0));
+    }
+
+    #[test]
     fn json_blob_is_not_an_assistant_node() {
         let blob = br#"{"role":"assistant","content":[]}"#.to_vec();
         assert!(assistant_node(&blob).is_none());
@@ -1359,16 +1640,26 @@ mod tests {
                  "args": {"path": "/repo/w.rs"}},
             ]
         });
-        let mut reads = HashMap::new();
-        reads.insert(
+        let mut results = HashMap::new();
+        for id in ["a", "b", "c", "d"] {
+            results.insert(
+                id.to_string(),
+                CursorToolResult::Success { read_content: None },
+            );
+        }
+        results.insert(
             "e".to_string(),
-            CursorReadResult::Content("r1\nr2\nr3".to_string()),
+            CursorToolResult::Success {
+                read_content: Some("r1\nr2\nr3".to_string()),
+            },
         );
-        reads.insert(
+        results.insert(
             "g".to_string(),
-            CursorReadResult::Content("w1\nw2".to_string()),
+            CursorToolResult::Success {
+                read_content: Some("w1\nw2".to_string()),
+            },
         );
-        apply_assistant_tools(&mut state, &msg, &reads, 42).unwrap();
+        apply_assistant_tools(&mut state, &msg, &results, 42, None).unwrap();
 
         assert_eq!(state.tool_counts.write, 1);
         assert_eq!(state.tool_counts.edit, 1);
@@ -1379,6 +1670,184 @@ mod tests {
         assert_eq!(state.total_write_lines, 2);
         assert_eq!(state.total_edit_lines, 2);
         assert_eq!(state.total_read_lines, 5);
+    }
+
+    #[test]
+    fn failed_rejected_and_pending_tools_count_without_file_effects() {
+        let mut state = SessionParseState::with_mode(ParseMode::Full);
+        let msg = json!({
+            "role": "assistant",
+            "content": [
+                {"type": "tool-call", "toolName": "Write", "toolCallId": "failed",
+                 "args": {"path": "/repo/failed", "contents": "failed"}},
+                {"type": "tool-call", "toolName": "Write", "toolCallId": "rejected",
+                 "args": {"path": "/repo/rejected", "contents": "rejected"}},
+                {"type": "tool-call", "toolName": "Write", "toolCallId": "pending",
+                 "args": {"path": "/repo/pending", "contents": "pending"}}
+            ]
+        });
+        let results = HashMap::from([
+            ("failed".to_string(), CursorToolResult::Failed),
+            ("rejected".to_string(), CursorToolResult::Failed),
+        ]);
+
+        let failures = apply_assistant_tools(&mut state, &msg, &results, 42, None).unwrap();
+        assert_eq!(failures, 0);
+        assert_eq!(state.tool_counts.write, 3);
+        assert_eq!(state.total_write_lines, 0);
+        assert!(state.write_details.is_empty());
+        assert!(state.unique_files.is_empty());
+    }
+
+    #[test]
+    fn tool_result_parser_distinguishes_terminal_failures_and_success() {
+        let blob = br#"{"role":"tool","content":[
+            {"type":"tool-result","toolName":"Write","toolCallId":"failed","result":"denied","providerOptions":{"cursor":{"isError":true}}},
+            {"type":"tool-result","toolName":"Write","toolCallId":"rejected","status":"rejected","result":"denied"},
+            {"type":"tool-result","toolName":"Read","toolCallId":"success","result":"     1|one\n     2|two"}
+        ]}"#
+        .to_vec();
+
+        let results = collect_tool_results(&[blob]);
+        assert!(matches!(
+            results.get("failed"),
+            Some(CursorToolResult::Failed)
+        ));
+        assert!(matches!(
+            results.get("rejected"),
+            Some(CursorToolResult::Failed)
+        ));
+        assert!(matches!(
+            results.get("success"),
+            Some(CursorToolResult::Success {
+                read_content: Some(content)
+            }) if content == "one\ntwo"
+        ));
+    }
+
+    #[test]
+    fn duplicate_tool_results_merge_independently_of_blob_order() {
+        let forward = vec![
+            br#"{"role":"tool","content":[
+                {"type":"tool-result","toolName":"Write","toolCallId":"success"},
+                {"type":"tool-result","toolName":"Write","toolCallId":"failure-wins","result":"ok"},
+                {"type":"tool-result","toolName":"Read","toolCallId":"rich-read"},
+                {"type":"tool-result","toolName":"Read","toolCallId":"tied-read","result":"     1|aaa"}
+            ]}"#
+            .to_vec(),
+            br#"{"role":"tool","content":[
+                {"type":"tool-result","toolName":"Write","toolCallId":"success","result":"ok"},
+                {"type":"tool-result","toolName":"Read","toolCallId":"rich-read","result":"     1|one"},
+                {"type":"tool-result","toolName":"Read","toolCallId":"tied-read","result":"     1|bbb"}
+            ]}"#
+            .to_vec(),
+            br#"{"role":"tool","content":[
+                {"type":"tool-result","toolName":"Write","toolCallId":"failure-wins","result":"denied","isError":true},
+                {"type":"tool-result","toolName":"Read","toolCallId":"rich-read","result":"     1|one\n     2|two"}
+            ]}"#
+            .to_vec(),
+        ];
+        let reverse = forward.iter().rev().cloned().collect::<Vec<_>>();
+
+        for blobs in [&forward, &reverse] {
+            let results = collect_tool_results(blobs);
+            assert!(matches!(
+                results.get("success"),
+                Some(CursorToolResult::Success { read_content: None })
+            ));
+            assert!(matches!(
+                results.get("failure-wins"),
+                Some(CursorToolResult::Failed)
+            ));
+            assert!(matches!(
+                results.get("rich-read"),
+                Some(CursorToolResult::Success {
+                    read_content: Some(content)
+                }) if content == "one\ntwo"
+            ));
+            assert!(matches!(
+                results.get("tied-read"),
+                Some(CursorToolResult::Success {
+                    read_content: Some(content)
+                }) if content == "bbb"
+            ));
+        }
+    }
+
+    #[test]
+    fn message_level_tool_outcomes_gate_file_effects() {
+        let blobs = [
+            br#"{"role":"tool","providerOptions":{"cursor":{"isError":true}},"content":[
+                {"type":"tool-result","toolName":"Write","toolCallId":"is-error","result":"denied"}
+            ]}"#
+            .to_vec(),
+            br#"{"role":"tool","providerOptions":{"cursor":{"highLevelToolCallResult":{"isError":true}}},"content":[
+                {"type":"tool-result","toolName":"Write","toolCallId":"nested-is-error","result":"denied"}
+            ]}"#
+            .to_vec(),
+            br#"{"role":"tool","providerOptions":{"cursor":{"highLevelToolCallResult":{"output":{"failure":{"message":"denied"}}}}},"content":[
+                {"type":"tool-result","toolName":"Write","toolCallId":"failure","result":"denied"}
+            ]}"#
+            .to_vec(),
+            br#"{"role":"tool","providerOptions":{"cursor":{"highLevelToolCallResult":{"output":{"error":{"message":"failed"}}}}},"content":[
+                {"type":"tool-result","toolName":"Write","toolCallId":"error","result":"failed"}
+            ]}"#
+            .to_vec(),
+            br#"{"role":"tool","providerOptions":{"cursor":{"highLevelToolCallResult":{"output":{"success":{}}}}},"content":[
+                {"type":"tool-result","toolName":"Write","toolCallId":"success"}
+            ]}"#
+            .to_vec(),
+        ];
+        let results = collect_tool_results(&blobs);
+        for id in ["is-error", "nested-is-error", "failure", "error"] {
+            assert!(matches!(results.get(id), Some(CursorToolResult::Failed)));
+        }
+        assert!(matches!(
+            results.get("success"),
+            Some(CursorToolResult::Success { read_content: None })
+        ));
+
+        let msg = json!({
+            "role": "assistant",
+            "content": [
+                {"type": "tool-call", "toolName": "Write", "toolCallId": "is-error",
+                 "args": {"path": "/repo/is-error", "contents": "ignored"}},
+                {"type": "tool-call", "toolName": "Write", "toolCallId": "nested-is-error",
+                 "args": {"path": "/repo/nested-is-error", "contents": "ignored"}},
+                {"type": "tool-call", "toolName": "Write", "toolCallId": "failure",
+                 "args": {"path": "/repo/failure", "contents": "ignored"}},
+                {"type": "tool-call", "toolName": "Write", "toolCallId": "error",
+                 "args": {"path": "/repo/error", "contents": "ignored"}},
+                {"type": "tool-call", "toolName": "Write", "toolCallId": "success",
+                 "args": {"path": "/repo/success", "contents": "applied"}}
+            ]
+        });
+        let mut state = SessionParseState::with_mode(ParseMode::Full);
+        let failures = apply_assistant_tools(&mut state, &msg, &results, 42, None).unwrap();
+
+        assert_eq!(failures, 0);
+        assert_eq!(state.tool_counts.write, 5);
+        assert_eq!(state.total_write_lines, 1);
+        assert_eq!(state.write_details.len(), 1);
+        assert_eq!(state.unique_files.len(), 1);
+        assert!(state.unique_files.contains("/repo/success"));
+    }
+
+    #[test]
+    fn unknown_analysis_tool_reports_schema_drift() {
+        let mut state = SessionParseState::with_mode(ParseMode::Full);
+        let msg = json!({
+            "role": "assistant",
+            "content": [{
+                "type": "tool-call",
+                "toolName": "FutureFileMutator",
+                "toolCallId": "future",
+                "args": {"path": "/repo/a"}
+            }]
+        });
+
+        let failures = apply_assistant_tools(&mut state, &msg, &HashMap::new(), 42, None).unwrap();
+        assert_eq!(failures, 1);
     }
 
     #[test]
@@ -1411,7 +1880,7 @@ mod tests {
         let row = &rows[0];
         assert_eq!(row.date, "2999-01-01");
         assert_eq!(row.timestamp_ms, 32_470_920_000_000);
-        assert!((row.stored_cost - 1.5).abs() < 1e-9);
+        assert!((row.stored_cost.unwrap() - 1.5).abs() < 1e-9);
         assert_eq!(row.model, "claude-sonnet-4.6");
     }
 
@@ -1461,7 +1930,11 @@ mod tests {
         );
         // A non-assistant node must NOT create a date bucket or an active day.
         let user_node = make_node(r#"{"role":"user","content":[]}"#, 1_700_000_100_000, None);
-        let tool_result = r#"{"role":"tool","content":[{"type":"tool-result","toolName":"Read","toolCallId":"z","result":"     1|line one\n     2|line two"}]}"#;
+        let tool_result = r#"{"role":"tool","content":[
+            {"type":"tool-result","toolName":"Write","toolCallId":"a","result":"ok"},
+            {"type":"tool-result","toolName":"Shell","toolCallId":"b","result":"ok"},
+            {"type":"tool-result","toolName":"Read","toolCallId":"z","result":"     1|line one\n     2|line two"}
+        ]}"#;
         let assistant_payload = r#"{"role":"assistant","content":[]}"#;
         let (_dir, path) =
             make_store_db(&[assistant, user_node], &[tool_result, assistant_payload]);
@@ -1481,7 +1954,7 @@ mod tests {
         assert_eq!(store.rows.len(), 1);
         assert_eq!(store.normalized_messages, 1);
         assert_eq!(store.failed_payloads, 0);
-        let rec = &store.rows[0].1.records[0];
+        let rec = &store.rows[0].analysis.records[0];
         assert_eq!(rec.tool_call_counts.write, 1);
         assert_eq!(rec.tool_call_counts.bash, 1);
         assert_eq!(rec.tool_call_counts.read, 1);
@@ -1490,6 +1963,137 @@ mod tests {
         assert_eq!(rec.total_read_lines, 2);
         // No tracking DB / meta -> model falls back to "unknown".
         assert!(rec.conversation_usage.contains_key("unknown"));
+        assert_eq!(store.rows[0].analysis_facts.len(), 3);
+        assert!(
+            store.rows[0]
+                .analysis_facts
+                .iter()
+                .all(|fact| fact.model == "unknown")
+        );
+    }
+
+    #[test]
+    fn analysis_facts_preserve_invocation_model_timestamp_and_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("project/conversation/store.db");
+        let timestamp = 1_700_000_000_000;
+        let assistant = make_node(
+            r#"{"role":"assistant","content":[
+                {"type":"tool-call","toolName":"Write","toolCallId":"write-ok","args":{"path":"/r/x.rs","contents":"l1\nl2"}},
+                {"type":"tool-call","toolName":"Read","toolCallId":"read-failed","args":{"path":"/r/y.rs"}},
+                {"type":"tool-call","toolName":"Shell","toolCallId":"shell-rejected","status":"rejected","args":{"command":"rm x"}},
+                {"type":"tool-call","toolName":"StrReplace","toolCallId":"edit-cancelled","status":"cancelled","args":{"path":"/r/z.rs","old_string":"a","new_string":"b"}},
+                {"type":"tool-call","toolName":"TodoWrite","toolCallId":"todo-pending","args":{}}
+            ]}"#,
+            timestamp,
+            None,
+        );
+        let results = r#"{"role":"tool","content":[
+            {"type":"tool-result","toolName":"Write","toolCallId":"write-ok","result":"ok"},
+            {"type":"tool-result","toolName":"Read","toolCallId":"read-failed","result":"denied","isError":true}
+        ]}"#;
+        write_store_db(&path, &[assistant], &[results]);
+        let conv_models =
+            FastHashMap::from_iter([("conversation".to_string(), "cursor-model".to_string())]);
+
+        let store = read_store_analysis(
+            &path,
+            &conv_models,
+            TimeRange::All,
+            ParseMode::Full,
+            "u",
+            "m",
+        )
+        .unwrap();
+        let facts = &store.rows[0].analysis_facts;
+        assert_eq!(facts.len(), 5);
+        assert!(facts.iter().all(|fact| {
+            fact.model == "cursor-model"
+                && fact.timestamp_ms == Some(timestamp)
+                && fact.observed_at_ms == Some(timestamp)
+        }));
+
+        let fact = |id: &str| {
+            facts
+                .iter()
+                .find(|fact| fact.stable_id.as_deref() == Some(id))
+                .unwrap()
+        };
+        let write = fact("cursor-tool:conversation:write-ok");
+        assert_eq!(write.status, ToolFactStatus::Succeeded);
+        assert_eq!(write.metrics.write_count, 1);
+        assert_eq!(write.metrics.write_lines, 2);
+
+        let read = fact("cursor-tool:conversation:read-failed");
+        assert_eq!(read.status, ToolFactStatus::Failed);
+        assert_eq!(read.metrics.read_count, 1);
+        assert_eq!(read.metrics.read_lines, 0);
+
+        let rejected = fact("cursor-tool:conversation:shell-rejected");
+        assert_eq!(rejected.status, ToolFactStatus::Failed);
+        assert_eq!(rejected.metrics.bash_count, 1);
+
+        let cancelled = fact("cursor-tool:conversation:edit-cancelled");
+        assert_eq!(cancelled.status, ToolFactStatus::Failed);
+        assert_eq!(cancelled.metrics.edit_count, 1);
+        assert_eq!(cancelled.metrics.edit_lines, 0);
+
+        let pending = fact("cursor-tool:conversation:todo-pending");
+        assert_eq!(pending.status, ToolFactStatus::Pending);
+        assert_eq!(pending.metrics.todo_write_count, 1);
+    }
+
+    #[test]
+    fn replayed_tool_call_ids_use_the_earliest_invocation_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("project/conversation/store.db");
+        let older_timestamp = 1_700_000_000_000;
+        let newer_timestamp = older_timestamp + 1_000;
+        let newer = make_node(
+            r#"{"role":"assistant","content":[
+                {"type":"tool-call","toolName":"Write","toolCallId":"replayed","args":{"path":"/r/x.rs","contents":"newer-1\nnewer-2"}}
+            ]}"#,
+            newer_timestamp,
+            None,
+        );
+        let older = make_node(
+            r#"{"role":"assistant","content":[
+                {"type":"tool-call","toolName":"Write","toolCallId":"replayed","args":{"path":"/r/x.rs","contents":"older"}}
+            ]}"#,
+            older_timestamp,
+            None,
+        );
+        let result = r#"{"role":"tool","content":[
+            {"type":"tool-result","toolName":"Write","toolCallId":"replayed","result":"ok"}
+        ]}"#;
+        // Insert the replay first to verify timestamp sorting, rather than blob
+        // id order, chooses the canonical invocation.
+        write_store_db(&path, &[newer, older], &[result]);
+
+        let store = read_store_analysis(
+            &path,
+            &FastHashMap::default(),
+            TimeRange::All,
+            ParseMode::Full,
+            "u",
+            "m",
+        )
+        .unwrap();
+        assert_eq!(store.normalized_messages, 2);
+        assert_eq!(store.rows.len(), 1);
+        let row = &store.rows[0];
+        assert_eq!(row.analysis_facts.len(), 1);
+        let fact = &row.analysis_facts[0];
+        assert_eq!(
+            fact.stable_id.as_deref(),
+            Some("cursor-tool:conversation:replayed")
+        );
+        assert_eq!(fact.timestamp_ms, Some(older_timestamp));
+        assert_eq!(fact.metrics.write_count, 1);
+        assert_eq!(fact.metrics.write_lines, 1);
+        let record = &row.analysis.records[0];
+        assert_eq!(record.tool_call_counts.write, 1);
+        assert_eq!(record.total_write_lines, 1);
     }
 
     #[test]
@@ -1649,7 +2253,8 @@ mod tests {
             None,
         );
         let read_result = r#"{"role":"tool","content":[{"type":"tool-result","toolName":"Read","toolCallId":"r","futureResult":"text"}]}"#;
-        write_store_db(&store, &[assistant], &[read_result]);
+        let write_result = r#"{"role":"tool","content":[{"type":"tool-result","toolName":"Write","toolCallId":"w","result":"ok"}]}"#;
+        write_store_db(&store, &[assistant], &[read_result, write_result]);
 
         let result = read_cursor_analysis_with_diagnostics(
             &chats,
@@ -1663,7 +2268,7 @@ mod tests {
         assert!(result.failures[0].error.contains("2 analyzer payloads"));
         assert_eq!(result.rows.len(), 1);
         let record = &result.rows[0].analysis.records[0];
-        assert_eq!(record.tool_call_counts.write, 0);
+        assert_eq!(record.tool_call_counts.write, 1);
         assert_eq!(record.tool_call_counts.read, 1);
         assert_eq!(record.total_read_lines, 0);
     }

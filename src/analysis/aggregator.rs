@@ -1,20 +1,29 @@
 use crate::cli::TimeRange;
 use crate::config::ProvidersConfig;
 use crate::constants::{FastHashMap, capacity};
-use crate::models::{CodeAnalysis, ExtensionType, ProviderActiveDays};
+use crate::models::{
+    CodeAnalysis, CodeAnalysisRecord, CodeAnalysisToolCalls, ExtensionType, ProviderActiveDays,
+};
 use crate::session::cursor::{
     discover_cursor_store_dbs, load_conversation_model_snapshot,
     read_cursor_analysis_with_diagnostics, read_store_analysis,
 };
-use crate::session::diagnostics::DatabaseAnalysisRow;
+use crate::session::diagnostics::{
+    AnalysisFact, AnalysisFactEffect, AnalysisMetrics, DatabaseAnalysisRow, ToolFactStatus,
+    UsageFact, fallback_facts,
+};
 use crate::session::opencode::read_opencode_analysis_with_diagnostics;
-use crate::session::parser::parse_session_file_as_with_diagnostics;
+use crate::session::parser::{
+    SessionFileParseDiagnostics, parse_session_file_as_with_diagnostics,
+    parse_session_file_with_facts_and_diagnostics,
+};
 use crate::session::sqlite::is_cacheable_sqlite_failure;
 use crate::session::state::ParseMode;
 use crate::summary_cache::{
     CachedSourceSummary, CompactSourceSummary, SourceFingerprint, SummaryCacheKey, SummaryKind,
     SummaryScanCache, provider_scan_rank,
 };
+use crate::usage::merge_usage_values;
 use crate::utils::directory::{FileInfo, collect_files_with_max_depth_diagnostics};
 use crate::utils::{
     COPILOT_SESSION_MAX_DEPTH, GROK_SESSION_MAX_DEPTH, HelperPaths, get_current_user,
@@ -60,6 +69,7 @@ pub struct AggregatedAnalysisRow {
 
 /// Bundle of aggregated analysis rows plus the per-provider active-day counts
 /// the display layer needs for daily averages.
+#[derive(Debug, Clone)]
 pub struct AnalysisData {
     /// Rows aggregated across *all* providers, keyed by model name.
     ///
@@ -189,6 +199,14 @@ pub struct AnalysisDataset {
 }
 
 impl AnalysisDataset {
+    /// Creates a dataset from already-normalized sessions and diagnostics.
+    pub fn new(sessions: Vec<AnalysisSession>, diagnostics: AnalysisCollectionDiagnostics) -> Self {
+        Self {
+            sessions,
+            diagnostics,
+        }
+    }
+
     /// Returns whether the dataset contains no parsed sessions.
     pub fn is_empty(&self) -> bool {
         self.sessions.is_empty()
@@ -199,7 +217,12 @@ impl AnalysisDataset {
         self.sessions.len()
     }
 
-    /// Projects this canonical dataset into the compact display summaries.
+    /// Projects this canonical dataset into compact display summaries.
+    ///
+    /// A public `CodeAnalysis` record with several conversation models no
+    /// longer carries invocation-level ownership, so its nonzero metrics are
+    /// grouped under `unknown`. Use the `aggregate_sessions_*` entry points
+    /// when exact event-level model attribution is required.
     pub fn summarize(&self) -> AnalysisData {
         project_analysis_dataset(self)
     }
@@ -313,18 +336,8 @@ pub fn aggregate_sessions_by_model_from_paths_with_diagnostics(
     time_range: TimeRange,
     providers: ProvidersConfig,
 ) -> Result<AnalysisAggregation> {
-    let mut projection = AnalysisProjection::new();
-    let diagnostics = visit_analysis_sessions_from_paths_with(
-        paths,
-        time_range,
-        providers,
-        ParseMode::UsageOnly,
-        &mut |session| projection.add_session(&session),
-    )?;
-    Ok(AnalysisAggregation {
-        data: projection.finish(),
-        diagnostics,
-    })
+    let mut cache = SummaryScanCache::default();
+    aggregate_sessions_by_model_from_paths_with_cache(paths, time_range, providers, &mut cache)
 }
 
 /// Collects the canonical batch-analysis dataset from the current user's home.
@@ -356,14 +369,15 @@ pub fn collect_analysis_sessions_from_paths_with(
     providers: ProvidersConfig,
     mode: ParseMode,
 ) -> Result<AnalysisDataset> {
-    let mut sessions = Vec::new();
+    let mut sources = Vec::new();
     let diagnostics = visit_analysis_sessions_from_paths_with(
         paths,
         time_range,
         providers,
         mode,
-        &mut |session| sessions.push(session),
+        &mut |source| sources.push(source),
     )?;
+    let sessions = materialize_analysis_sources(sources, time_range, mode);
     Ok(AnalysisDataset {
         sessions,
         diagnostics,
@@ -384,7 +398,7 @@ fn visit_analysis_sessions_from_paths_with<F>(
     visitor: &mut F,
 ) -> Result<AnalysisCollectionDiagnostics>
 where
-    F: FnMut(AnalysisSession),
+    F: FnMut(CollectedAnalysisSource),
 {
     let mut diagnostics = AnalysisCollectionDiagnostics::default();
 
@@ -455,7 +469,7 @@ where
 
     if providers.opencode && paths.opencode_db.exists() {
         diagnostics.candidates += 1;
-        match read_opencode_analysis_with_diagnostics(&paths.opencode_db, time_range, mode) {
+        match read_opencode_analysis_with_diagnostics(&paths.opencode_db, TimeRange::All, mode) {
             Ok(result) => {
                 if result.expected_records > 0 && result.parsed_records == 0 {
                     record_failure(
@@ -484,7 +498,12 @@ where
                         );
                     }
                 }
-                visit_database_sessions(ExtensionType::OpenCode, result.rows, visitor);
+                visit_database_sessions(
+                    ExtensionType::OpenCode,
+                    &paths.opencode_db,
+                    result.rows,
+                    visitor,
+                );
             }
             Err(err) => record_failure(
                 &mut diagnostics,
@@ -499,7 +518,7 @@ where
         let result = read_cursor_analysis_with_diagnostics(
             &paths.cursor_chats_dir,
             &paths.cursor_tracking_db,
-            time_range,
+            TimeRange::All,
             mode,
         );
         diagnostics.candidates += result.candidates;
@@ -512,7 +531,12 @@ where
                 failure.error,
             );
         }
-        visit_database_sessions(ExtensionType::Cursor, result.rows, visitor);
+        visit_database_sessions(
+            ExtensionType::Cursor,
+            &paths.cursor_chats_dir,
+            result.rows,
+            visitor,
+        );
     }
 
     Ok(diagnostics)
@@ -543,7 +567,7 @@ pub fn aggregate_sessions_by_model_from_paths_with_cache(
     cache: &mut SummaryScanCache,
 ) -> Result<AnalysisAggregation> {
     cache.begin_scan();
-    let mut projection = AnalysisProjection::new();
+    let mut projection = AnalysisProjection::with_time_range(time_range);
     let mut diagnostics = AnalysisCollectionDiagnostics::default();
     let mut seen = HashSet::new();
 
@@ -662,7 +686,8 @@ fn scan_analysis_files<F>(
 where
     F: Copy + Fn(&Path) -> bool + Sync + Send,
 {
-    let discovery = collect_files_with_max_depth_diagnostics(dir, filter, time_range, max_depth);
+    let discovery =
+        collect_files_with_max_depth_diagnostics(dir, filter, TimeRange::All, max_depth);
     if !discovery.failures.is_empty() {
         cache.preserve_provider_keys(seen, SummaryKind::File, provider);
     }
@@ -745,7 +770,7 @@ fn load_analysis_file(file: &FileInfo, provider: ExtensionType) -> Result<Cached
     }
     let partial = parsed.diagnostics.partial_failure_count();
     Ok(CachedAnalysisLoad {
-        summary: CompactSourceSummary::from_file(parsed.analysis, file.modified_date.clone(), emit),
+        summary: CompactSourceSummary::from_parsed(parsed, emit),
         parsed: true,
         failure: (partial > 0)
             .then(|| format!("skipped {partial} malformed or unsupported analyzer records")),
@@ -778,7 +803,7 @@ fn scan_opencode_analysis(
     }
 
     cache.record_parse();
-    match read_opencode_analysis_with_diagnostics(source, time_range, ParseMode::UsageOnly) {
+    match read_opencode_analysis_with_diagnostics(source, TimeRange::All, ParseMode::UsageOnly) {
         Ok(result) => {
             let complete_failure = result.expected_records > 0 && result.parsed_records == 0;
             let failed = result
@@ -799,7 +824,7 @@ fn scan_opencode_analysis(
             };
             let mut summary = CompactSourceSummary::default();
             for row in result.rows {
-                summary.add_analysis(row.analysis, row.date, 0.0, true);
+                summary.add_analysis(row.analysis, true, row.analysis_facts);
             }
             let loaded = CachedAnalysisLoad {
                 summary,
@@ -891,7 +916,7 @@ fn scan_cursor_analysis(
         match read_store_analysis(
             &store,
             &conv_models,
-            time_range,
+            TimeRange::All,
             ParseMode::UsageOnly,
             &user,
             &machine,
@@ -913,8 +938,8 @@ fn scan_cursor_analysis(
                     None
                 };
                 let mut summary = CompactSourceSummary::default();
-                for (date, analysis) in result.rows {
-                    summary.add_analysis(analysis, date, 0.0, true);
+                for row in result.rows {
+                    summary.add_analysis(row.analysis, true, row.analysis_facts);
                 }
                 let loaded = CachedAnalysisLoad {
                     summary,
@@ -963,7 +988,7 @@ fn fold_cached_analysis(
 ) {
     if cached.parsed {
         diagnostics.parsed += 1;
-        projection.add_compact(provider, &cached.summary);
+        projection.add_compact(provider, source, &cached.summary);
     }
     if let Some(error) = &cached.failure {
         diagnostics.failures.push(AnalysisCollectionFailure {
@@ -983,7 +1008,7 @@ fn fold_loaded_analysis(
 ) {
     if loaded.parsed {
         diagnostics.parsed += 1;
-        projection.add_compact(provider, &loaded.summary);
+        projection.add_compact(provider, source, &loaded.summary);
     }
     if let Some(error) = &loaded.failure {
         diagnostics.failures.push(AnalysisCollectionFailure {
@@ -1016,7 +1041,9 @@ pub fn project_code_analysis(analysis: &CodeAnalysis) -> AnalysisData {
 
     let mut dates = HashSet::new();
     for record in &analysis.records {
-        if let Some(date) = local_date_from_millis(record.timestamp) {
+        if record.timestamp > 0
+            && let Some(date) = local_date_from_millis(record.timestamp)
+        {
             dates.insert(date);
         }
     }
@@ -1030,6 +1057,41 @@ pub fn project_code_analysis(analysis: &CodeAnalysis) -> AnalysisData {
     projection.finish()
 }
 
+/// Parses one session file and projects its private event facts into the
+/// compact summary used by non-JSON single-file output.
+///
+/// The returned [`CodeAnalysis`] keeps the public JSON contract unchanged;
+/// stable tool ids and lifecycle facts are consumed only by the projection.
+#[doc(hidden)]
+pub fn project_session_file<P: AsRef<Path>>(
+    path: P,
+    mode: ParseMode,
+) -> Result<(CodeAnalysis, AnalysisData, SessionFileParseDiagnostics)> {
+    let path = path.as_ref();
+    let (mut parsed, diagnostics) = parse_session_file_with_facts_and_diagnostics(path, mode)?;
+    let provider = extension_type_from_name(&parsed.analysis.extension_name);
+    let mut projection = AnalysisProjection::new();
+    if let Some(provider) = provider {
+        projection.add_usage_presence(provider, path, &parsed.usage_facts);
+        let analysis_facts = if parsed.analysis_facts.is_empty() {
+            fallback_facts(&parsed.analysis).1
+        } else {
+            std::mem::take(&mut parsed.analysis_facts)
+        };
+        projection.add_facts(provider, path, analysis_facts);
+    } else {
+        projection.add_analysis(None, &parsed.analysis);
+    }
+    if !parsed.analysis.records.is_empty()
+        && parsed.analysis.records.iter().all(|record| {
+            record.timestamp <= 0 || local_date_from_millis(record.timestamp).is_none()
+        })
+    {
+        projection.add_date(provider, "single".to_string());
+    }
+    Ok((parsed.analysis, projection.finish(), diagnostics))
+}
+
 /// Drains a model-keyed map into a `Vec` sorted by model name.
 fn into_sorted_rows(map: FastHashMap<String, AggregatedAnalysisRow>) -> Vec<AggregatedAnalysisRow> {
     let mut v: Vec<AggregatedAnalysisRow> = map.into_values().collect();
@@ -1037,8 +1099,18 @@ fn into_sorted_rows(map: FastHashMap<String, AggregatedAnalysisRow>) -> Vec<Aggr
     v
 }
 
+struct CollectedAnalysisSource {
+    source: PathBuf,
+    session: AnalysisSession,
+    usage_facts: Vec<UsageFact>,
+    analysis_facts: Vec<AnalysisFact>,
+}
+
 type FileSessionOutcome = std::result::Result<
-    (Option<AnalysisSession>, Option<AnalysisCollectionFailure>),
+    (
+        Option<CollectedAnalysisSource>,
+        Option<AnalysisCollectionFailure>,
+    ),
     AnalysisCollectionFailure,
 >;
 
@@ -1048,7 +1120,7 @@ fn visit_file_sessions<F, V>(
     dir: &Path,
     provider: ExtensionType,
     filter_fn: F,
-    time_range: TimeRange,
+    _time_range: TimeRange,
     max_depth: Option<usize>,
     mode: ParseMode,
     diagnostics: &mut AnalysisCollectionDiagnostics,
@@ -1056,9 +1128,10 @@ fn visit_file_sessions<F, V>(
 ) -> Result<()>
 where
     F: Copy + Fn(&Path) -> bool + Sync + Send,
-    V: FnMut(AnalysisSession),
+    V: FnMut(CollectedAnalysisSource),
 {
-    let discovery = collect_files_with_max_depth_diagnostics(dir, filter_fn, time_range, max_depth);
+    let discovery =
+        collect_files_with_max_depth_diagnostics(dir, filter_fn, TimeRange::All, max_depth);
     diagnostics.candidates += discovery.failures.len();
     for failure in discovery.failures {
         record_failure(diagnostics, provider, &failure.path, failure.error);
@@ -1067,16 +1140,12 @@ where
     let mut files = discovery.files;
     files.sort_unstable_by(|a, b| a.path.cmp(&b.path));
     diagnostics.candidates += files.len();
-
     // `Vec::into_par_iter` is indexed, so collecting retains the sorted source
     // order while moving each path/date directly into its outcome.
     let outcomes: Vec<FileSessionOutcome> = files
         .into_par_iter()
         .map(|file_info| {
-            let FileInfo {
-                path,
-                modified_date,
-            } = file_info;
+            let FileInfo { path, .. } = file_info;
             match parse_session_file_as_with_diagnostics(&path, provider, mode) {
                 Ok(parsed) if parsed.diagnostics.is_complete_failure() => {
                     let error = if parsed.diagnostics.recognized_records == 0 {
@@ -1108,19 +1177,42 @@ where
                     let partial_failure = (partial_failure_count > 0).then_some(
                         AnalysisCollectionFailure {
                             provider,
-                            source: path,
+                            source: path.clone(),
                             error: format!(
                                 "skipped {partial_failure_count} malformed or unsupported analyzer records"
                             ),
                         },
                     );
-                    let session = parsed.diagnostics.should_emit_session().then_some({
-                        AnalysisSession {
-                            provider,
-                            date: modified_date,
-                            analysis: parsed.analysis,
-                        }
-                    });
+                    let event_date = parsed
+                        .analysis
+                        .records
+                        .iter()
+                        .filter_map(|record| local_date_from_millis(record.timestamp))
+                        .max();
+                    let (fallback_usage_facts, fallback_analysis_facts) =
+                        fallback_facts(&parsed.analysis);
+                    let usage_facts = if parsed.usage_facts.is_empty() {
+                        fallback_usage_facts
+                    } else {
+                        parsed.usage_facts
+                    };
+                    let analysis_facts = if parsed.analysis_facts.is_empty() {
+                        fallback_analysis_facts
+                    } else {
+                        parsed.analysis_facts
+                    };
+                    let session = parsed.diagnostics.should_emit_session().then_some(
+                        CollectedAnalysisSource {
+                            source: path.clone(),
+                            session: AnalysisSession {
+                                provider,
+                                date: event_date.unwrap_or_default(),
+                                analysis: parsed.analysis,
+                            },
+                            usage_facts,
+                            analysis_facts,
+                        },
+                    );
                     Ok((session, partial_failure))
                 }
                 Err(err) => Err(AnalysisCollectionFailure {
@@ -1180,10 +1272,11 @@ fn push_failure(
 
 fn visit_database_sessions<F>(
     provider: ExtensionType,
+    database: &Path,
     mut rows: Vec<DatabaseAnalysisRow>,
     visitor: &mut F,
 ) where
-    F: FnMut(AnalysisSession),
+    F: FnMut(CollectedAnalysisSource),
 {
     rows.sort_unstable_by(|a, b| {
         a.date
@@ -1191,16 +1284,334 @@ fn visit_database_sessions<F>(
             .then_with(|| a.source_id.cmp(&b.source_id))
     });
     for row in rows {
-        visitor(AnalysisSession {
-            provider,
-            date: row.date,
-            analysis: row.analysis,
+        let (usage_facts, fallback_analysis_facts) = fallback_facts(&row.analysis);
+        let analysis_facts = if row.analysis_facts.is_empty() {
+            fallback_analysis_facts
+        } else {
+            row.analysis_facts
+        };
+        visitor(CollectedAnalysisSource {
+            source: PathBuf::from(format!("{}#{}", database.display(), row.source_id)),
+            session: AnalysisSession {
+                provider,
+                date: row.date,
+                analysis: row.analysis,
+            },
+            usage_facts,
+            analysis_facts,
         });
     }
 }
 
+#[derive(Clone)]
+struct SourcedUsageFact {
+    provider: ExtensionType,
+    source: PathBuf,
+    source_index: usize,
+    fact: UsageFact,
+}
+
+struct MaterializedRecord {
+    record: CodeAnalysisRecord,
+    unique_files: HashSet<String>,
+    unknown_unique_files: usize,
+    aggregate_facts: HashSet<usize>,
+    conversation_models: HashSet<String>,
+    advisor_models: HashSet<String>,
+    activity: bool,
+    max_timestamp: Option<i64>,
+}
+
+impl MaterializedRecord {
+    fn new(source: &CollectedAnalysisSource) -> Self {
+        let original = &source.session.analysis.records[0];
+        Self {
+            record: CodeAnalysisRecord {
+                total_unique_files: 0,
+                total_write_lines: 0,
+                total_read_lines: 0,
+                total_edit_lines: 0,
+                total_write_characters: 0,
+                total_read_characters: 0,
+                total_edit_characters: 0,
+                write_file_details: Vec::new(),
+                read_file_details: Vec::new(),
+                edit_file_details: Vec::new(),
+                run_command_details: Vec::new(),
+                tool_call_counts: CodeAnalysisToolCalls::default(),
+                conversation_usage: FastHashMap::default(),
+                advisor_usage: FastHashMap::default(),
+                task_id: original.task_id.clone(),
+                timestamp: 0,
+                folder_path: original.folder_path.clone(),
+                git_remote_url: original.git_remote_url.clone(),
+            },
+            unique_files: HashSet::new(),
+            unknown_unique_files: 0,
+            aggregate_facts: HashSet::new(),
+            conversation_models: original.conversation_usage.keys().cloned().collect(),
+            advisor_models: original.advisor_usage.keys().cloned().collect(),
+            activity: false,
+            max_timestamp: None,
+        }
+    }
+
+    fn observe_timestamp(&mut self, timestamp_ms: Option<i64>) {
+        if let Some(timestamp_ms) = timestamp_ms {
+            self.max_timestamp = Some(
+                self.max_timestamp
+                    .map_or(timestamp_ms, |current| current.max(timestamp_ms)),
+            );
+        }
+    }
+
+    fn add_usage_fact(&mut self, fact: UsageFact) {
+        self.activity = true;
+        self.observe_timestamp(fact.observed_at_ms.or(fact.timestamp_ms));
+        for unit in fact.units {
+            let advisor_only = self.advisor_models.contains(&unit.model)
+                && !self.conversation_models.contains(&unit.model);
+            let target = if advisor_only {
+                &mut self.record.advisor_usage
+            } else {
+                &mut self.record.conversation_usage
+            };
+            target
+                .entry(unit.model)
+                .and_modify(|existing| merge_usage_values(existing, unit.usage.as_ref()))
+                .or_insert_with(|| unit.usage.as_ref().clone());
+        }
+    }
+
+    fn add_analysis_fact(&mut self, fact: AnalysisFact) {
+        if fact.effect.as_ref().is_some_and(|effect| effect.aggregate)
+            && !self.aggregate_facts.insert(fact.source_order)
+        {
+            return;
+        }
+        self.activity = true;
+        self.observe_timestamp(fact.observed_at_ms.or(fact.timestamp_ms));
+        if !fact.model.is_empty() {
+            self.record
+                .conversation_usage
+                .entry(fact.model.clone())
+                .or_insert_with(|| serde_json::Value::Object(Default::default()));
+        }
+        self.record.total_edit_lines += fact.metrics.edit_lines;
+        self.record.total_read_lines += fact.metrics.read_lines;
+        self.record.total_write_lines += fact.metrics.write_lines;
+        self.record.tool_call_counts.bash += fact.metrics.bash_count;
+        self.record.tool_call_counts.edit += fact.metrics.edit_count;
+        self.record.tool_call_counts.read += fact.metrics.read_count;
+        self.record.tool_call_counts.todo_write += fact.metrics.todo_write_count;
+        self.record.tool_call_counts.write += fact.metrics.write_count;
+        if fact.status == ToolFactStatus::Succeeded
+            && let Some(effect) = fact.effect
+        {
+            self.add_effect(effect);
+        }
+    }
+
+    fn add_effect(&mut self, mut effect: AnalysisFactEffect) {
+        self.unique_files.extend(effect.unique_files.drain(..));
+        self.unknown_unique_files += effect.unknown_unique_files;
+        self.record.total_write_characters += effect.write_characters;
+        self.record.total_read_characters += effect.read_characters;
+        self.record.total_edit_characters += effect.edit_characters;
+        self.record
+            .write_file_details
+            .append(&mut effect.write_file_details);
+        self.record
+            .read_file_details
+            .append(&mut effect.read_file_details);
+        self.record
+            .edit_file_details
+            .append(&mut effect.edit_file_details);
+        self.record
+            .run_command_details
+            .append(&mut effect.run_command_details);
+    }
+
+    fn finish(mut self) -> CodeAnalysisRecord {
+        self.record.total_unique_files = self.unique_files.len() + self.unknown_unique_files;
+        self.record.timestamp = self.max_timestamp.unwrap_or_default();
+        self.record
+    }
+}
+
+fn materialize_analysis_sources(
+    mut sources: Vec<CollectedAnalysisSource>,
+    time_range: TimeRange,
+    _mode: ParseMode,
+) -> Vec<AnalysisSession> {
+    sources.retain(|source| {
+        let keep = !source.session.analysis.records.is_empty();
+        if !keep {
+            log::warn!(
+                "{} analysis source {} produced no records",
+                source.session.provider,
+                source.source.display()
+            );
+        }
+        keep
+    });
+    let cutoff = time_range
+        .cutoff_date()
+        .map(|date| date.format("%Y-%m-%d").to_string());
+    let mut builders: Vec<_> = sources.iter().map(MaterializedRecord::new).collect();
+    if cutoff.is_none() {
+        for (builder, source) in builders.iter_mut().zip(&sources) {
+            builder.observe_timestamp(
+                (source.session.analysis.records[0].timestamp > 0)
+                    .then_some(source.session.analysis.records[0].timestamp),
+            );
+        }
+    }
+    let mut usage_facts = Vec::new();
+    let mut analysis_facts = Vec::new();
+    let mut sources_without_facts = Vec::new();
+
+    for (source_index, source) in sources.iter_mut().enumerate() {
+        if source.usage_facts.is_empty() && source.analysis_facts.is_empty() {
+            sources_without_facts.push(source_index);
+        }
+        usage_facts.extend(source.usage_facts.drain(..).map(|fact| SourcedUsageFact {
+            provider: source.session.provider,
+            source: source.source.clone(),
+            source_index,
+            fact,
+        }));
+        analysis_facts.extend(
+            source
+                .analysis_facts
+                .drain(..)
+                .map(|fact| SourcedAnalysisFact {
+                    provider: source.session.provider,
+                    source: source.source.clone(),
+                    source_index,
+                    fact,
+                }),
+        );
+    }
+
+    for sourced in reduce_batch_usage_facts(usage_facts) {
+        if fact_is_in_range(
+            sourced.fact.timestamp_ms,
+            cutoff.as_deref(),
+            sourced.provider,
+            &sourced.source,
+            "usage",
+        ) {
+            builders[sourced.source_index].add_usage_fact(sourced.fact);
+        }
+    }
+    for sourced in reduce_analysis_facts(analysis_facts) {
+        if fact_is_in_range(
+            sourced.fact.timestamp_ms,
+            cutoff.as_deref(),
+            sourced.provider,
+            &sourced.source,
+            "analysis",
+        ) {
+            builders[sourced.source_index].add_analysis_fact(sourced.fact);
+        }
+    }
+
+    let preserve_without_facts: HashSet<_> = if cutoff.is_none() {
+        sources_without_facts.into_iter().collect()
+    } else {
+        HashSet::new()
+    };
+    sources
+        .into_iter()
+        .zip(builders)
+        .enumerate()
+        .filter_map(|(source_index, (mut source, builder))| {
+            if !builder.activity {
+                return preserve_without_facts
+                    .contains(&source_index)
+                    .then_some(source.session);
+            }
+            let record = builder.finish();
+            source.session.date = local_date_from_millis(record.timestamp).unwrap_or_default();
+            source.session.analysis.records = vec![record];
+            Some(source.session)
+        })
+        .collect()
+}
+
+fn fact_is_in_range(
+    timestamp_ms: Option<i64>,
+    cutoff: Option<&str>,
+    provider: ExtensionType,
+    source: &Path,
+    kind: &str,
+) -> bool {
+    let date = timestamp_ms.and_then(local_date_from_millis);
+    if timestamp_ms.is_none() {
+        log::warn!(
+            "{provider} {kind} fact from {} has no event timestamp{}",
+            source.display(),
+            if cutoff.is_some() {
+                " and was excluded from the selected time range"
+            } else {
+                ""
+            }
+        );
+    }
+    match (cutoff, date.as_deref()) {
+        (None, _) => true,
+        (Some(cutoff), Some(date)) => date >= cutoff,
+        (Some(_), None) => false,
+    }
+}
+
+fn reduce_batch_usage_facts(facts: Vec<SourcedUsageFact>) -> Vec<SourcedUsageFact> {
+    let mut anonymous = Vec::new();
+    let mut stable: FastHashMap<String, Vec<SourcedUsageFact>> = FastHashMap::default();
+    for sourced in facts {
+        if let Some(id) = &sourced.fact.stable_id {
+            stable
+                .entry(format!("{}\0{id}", sourced.provider))
+                .or_default()
+                .push(sourced);
+        } else {
+            anonymous.push(sourced);
+        }
+    }
+    for mut group in stable.into_values() {
+        let canonical_timestamp = group
+            .iter()
+            .filter_map(|sourced| sourced.fact.timestamp_ms)
+            .min();
+        group.sort_unstable_by(|left, right| {
+            left.fact
+                .observed_at_ms
+                .unwrap_or_default()
+                .cmp(&right.fact.observed_at_ms.unwrap_or_default())
+                .then_with(|| left.source.cmp(&right.source))
+                .then_with(|| left.fact.source_order.cmp(&right.fact.source_order))
+        });
+        if let Some(mut winner) = group.pop() {
+            winner.fact.timestamp_ms = canonical_timestamp;
+            anonymous.push(winner);
+        }
+    }
+    anonymous.sort_unstable_by(|left, right| {
+        provider_scan_rank(left.provider)
+            .cmp(&provider_scan_rank(right.provider))
+            .then_with(|| left.fact.timestamp_ms.cmp(&right.fact.timestamp_ms))
+            .then_with(|| left.source.cmp(&right.source))
+            .then_with(|| left.fact.source_order.cmp(&right.fact.source_order))
+    });
+    anonymous
+}
+
 /// Mutable accumulator shared by batch and single-file projections.
 struct AnalysisProjection {
+    cutoff: Option<String>,
+    usage_presence: Vec<SourcedUsageFact>,
+    facts: Vec<SourcedAnalysisFact>,
     all: FastHashMap<String, AggregatedAnalysisRow>,
     claude: FastHashMap<String, AggregatedAnalysisRow>,
     codex: FastHashMap<String, AggregatedAnalysisRow>,
@@ -1220,9 +1631,20 @@ struct AnalysisProjection {
     hermes_dates: HashSet<String>,
 }
 
+#[derive(Clone)]
+struct SourcedAnalysisFact {
+    provider: ExtensionType,
+    source: PathBuf,
+    source_index: usize,
+    fact: AnalysisFact,
+}
+
 impl AnalysisProjection {
     fn new() -> Self {
         Self {
+            cutoff: None,
+            usage_presence: Vec::new(),
+            facts: Vec::new(),
             all: FastHashMap::with_capacity(capacity::MODEL_COMBINATIONS),
             claude: FastHashMap::with_capacity(capacity::MODELS_PER_SESSION),
             codex: FastHashMap::with_capacity(capacity::MODELS_PER_SESSION),
@@ -1241,6 +1663,14 @@ impl AnalysisProjection {
             cursor_dates: HashSet::new(),
             hermes_dates: HashSet::new(),
         }
+    }
+
+    fn with_time_range(time_range: TimeRange) -> Self {
+        let mut projection = Self::new();
+        projection.cutoff = time_range
+            .cutoff_date()
+            .map(|date| date.format("%Y-%m-%d").to_string());
+        projection
     }
 
     fn add_session(&mut self, session: &AnalysisSession) {
@@ -1265,40 +1695,50 @@ impl AnalysisProjection {
         }
     }
 
-    fn add_compact(&mut self, provider: ExtensionType, summary: &CompactSourceSummary) {
-        merge_compact_rows(&mut self.all, &summary.analysis);
-        let provider_rows = match provider {
-            ExtensionType::ClaudeCode => Some(&mut self.claude),
-            ExtensionType::Codex => Some(&mut self.codex),
-            ExtensionType::Copilot => Some(&mut self.copilot),
-            ExtensionType::Gemini => Some(&mut self.gemini),
-            ExtensionType::Grok => Some(&mut self.grok),
-            ExtensionType::OpenCode => Some(&mut self.opencode),
-            ExtensionType::Cursor => Some(&mut self.cursor),
-            ExtensionType::Hermes => None,
-        };
-        if let Some(rows) = provider_rows {
-            merge_compact_rows(rows, &summary.analysis);
-        }
+    fn add_compact(
+        &mut self,
+        provider: ExtensionType,
+        source: &Path,
+        summary: &CompactSourceSummary,
+    ) {
+        self.add_usage_presence(provider, source, &summary.usage_facts);
+        self.add_facts(provider, source, summary.analysis_facts.iter().cloned());
+    }
 
-        self.all_dates
-            .extend(summary.analysis_dates.iter().cloned());
-        let dates = match provider {
-            ExtensionType::ClaudeCode => Some(&mut self.claude_dates),
-            ExtensionType::Codex => Some(&mut self.codex_dates),
-            ExtensionType::Copilot => Some(&mut self.copilot_dates),
-            ExtensionType::Gemini => Some(&mut self.gemini_dates),
-            ExtensionType::Grok => Some(&mut self.grok_dates),
-            ExtensionType::OpenCode => Some(&mut self.opencode_dates),
-            ExtensionType::Cursor => Some(&mut self.cursor_dates),
-            ExtensionType::Hermes => Some(&mut self.hermes_dates),
-        };
-        if let Some(dates) = dates {
-            dates.extend(summary.analysis_dates.iter().cloned());
-        }
+    fn add_usage_presence(
+        &mut self,
+        provider: ExtensionType,
+        source: &Path,
+        usage_facts: &[UsageFact],
+    ) {
+        self.usage_presence
+            .extend(usage_facts.iter().cloned().map(|fact| SourcedUsageFact {
+                provider,
+                source: source.to_path_buf(),
+                source_index: 0,
+                fact,
+            }));
+    }
+
+    fn add_facts(
+        &mut self,
+        provider: ExtensionType,
+        source: &Path,
+        facts: impl IntoIterator<Item = AnalysisFact>,
+    ) {
+        self.facts
+            .extend(facts.into_iter().map(|fact| SourcedAnalysisFact {
+                provider,
+                source: source.to_path_buf(),
+                source_index: 0,
+                fact,
+            }));
     }
 
     fn add_date(&mut self, provider: Option<ExtensionType>, date: String) {
+        if date.is_empty() {
+            return;
+        }
         self.all_dates.insert(date.clone());
         match provider {
             Some(ExtensionType::ClaudeCode) => {
@@ -1329,7 +1769,86 @@ impl AnalysisProjection {
         }
     }
 
-    fn finish(self) -> AnalysisData {
+    fn finish(mut self) -> AnalysisData {
+        for sourced in reduce_batch_usage_facts(std::mem::take(&mut self.usage_presence)) {
+            let date = sourced.fact.timestamp_ms.and_then(local_date_from_millis);
+            let included = match (&self.cutoff, &date) {
+                (None, _) => true,
+                (Some(cutoff), Some(date)) => date >= cutoff,
+                (Some(_), None) => false,
+            };
+            if sourced.fact.timestamp_ms.is_none() {
+                log::warn!(
+                    "{} usage-presence fact from {} has no event timestamp{}",
+                    sourced.provider,
+                    sourced.source.display(),
+                    if self.cutoff.is_some() {
+                        " and was excluded from the selected time range"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            if !included {
+                continue;
+            }
+
+            let mut present = false;
+            for unit in sourced.fact.units {
+                if !unit.analysis_presence || unit.model.contains("<synthetic>") {
+                    continue;
+                }
+                present = true;
+                merge_analysis_metrics(&mut self.all, &unit.model, AnalysisMetrics::default());
+                if let Some(rows) = self.provider_rows_mut(sourced.provider) {
+                    merge_analysis_metrics(rows, &unit.model, AnalysisMetrics::default());
+                }
+            }
+            if present && let Some(date) = date {
+                self.add_date(Some(sourced.provider), date);
+            }
+        }
+
+        for sourced in reduce_analysis_facts(std::mem::take(&mut self.facts)) {
+            let date = sourced.fact.timestamp_ms.and_then(local_date_from_millis);
+            let included = match (&self.cutoff, &date) {
+                (None, _) => true,
+                (Some(cutoff), Some(date)) => date >= cutoff,
+                (Some(_), None) => false,
+            };
+            if sourced.fact.timestamp_ms.is_none() {
+                log::warn!(
+                    "{} analysis fact from {} has no invocation timestamp{}",
+                    sourced.provider,
+                    sourced.source.display(),
+                    if self.cutoff.is_some() {
+                        " and was excluded from the selected time range"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            if !included {
+                continue;
+            }
+            let model = if sourced.fact.model.is_empty() {
+                log::warn!(
+                    "{} tool fact from {} has no invocation model",
+                    sourced.provider,
+                    sourced.source.display()
+                );
+                "unknown".to_string()
+            } else {
+                sourced.fact.model
+            };
+            merge_analysis_metrics(&mut self.all, &model, sourced.fact.metrics);
+            if let Some(rows) = self.provider_rows_mut(sourced.provider) {
+                merge_analysis_metrics(rows, &model, sourced.fact.metrics);
+            }
+            if let Some(date) = date {
+                self.add_date(Some(sourced.provider), date);
+            }
+        }
         let provider_days = ProviderActiveDays {
             claude: self.claude_dates.len(),
             codex: self.codex_dates.len(),
@@ -1355,35 +1874,176 @@ impl AnalysisProjection {
             provider_days,
         }
     }
+
+    fn provider_rows_mut(
+        &mut self,
+        provider: ExtensionType,
+    ) -> Option<&mut FastHashMap<String, AggregatedAnalysisRow>> {
+        match provider {
+            ExtensionType::ClaudeCode => Some(&mut self.claude),
+            ExtensionType::Codex => Some(&mut self.codex),
+            ExtensionType::Copilot => Some(&mut self.copilot),
+            ExtensionType::Gemini => Some(&mut self.gemini),
+            ExtensionType::Grok => Some(&mut self.grok),
+            ExtensionType::OpenCode => Some(&mut self.opencode),
+            ExtensionType::Cursor => Some(&mut self.cursor),
+            ExtensionType::Hermes => None,
+        }
+    }
 }
 
-fn merge_compact_rows(
+fn merge_analysis_metrics(
     target: &mut FastHashMap<String, AggregatedAnalysisRow>,
-    source: &FastHashMap<String, AggregatedAnalysisRow>,
+    model: &str,
+    metrics: AnalysisMetrics,
 ) {
-    for (model, row) in source {
-        let entry = target
-            .entry(model.clone())
-            .or_insert_with(|| AggregatedAnalysisRow {
-                model: model.clone(),
-                edit_lines: 0,
-                read_lines: 0,
-                write_lines: 0,
-                bash_count: 0,
-                edit_count: 0,
-                read_count: 0,
-                todo_write_count: 0,
-                write_count: 0,
-            });
-        entry.edit_lines += row.edit_lines;
-        entry.read_lines += row.read_lines;
-        entry.write_lines += row.write_lines;
-        entry.bash_count += row.bash_count;
-        entry.edit_count += row.edit_count;
-        entry.read_count += row.read_count;
-        entry.todo_write_count += row.todo_write_count;
-        entry.write_count += row.write_count;
+    let entry = target
+        .entry(model.to_string())
+        .or_insert_with(|| AnalysisMetrics::default().into_row(model.to_string()));
+    entry.edit_lines += metrics.edit_lines;
+    entry.read_lines += metrics.read_lines;
+    entry.write_lines += metrics.write_lines;
+    entry.bash_count += metrics.bash_count;
+    entry.edit_count += metrics.edit_count;
+    entry.read_count += metrics.read_count;
+    entry.todo_write_count += metrics.todo_write_count;
+    entry.write_count += metrics.write_count;
+}
+
+fn reduce_analysis_facts(facts: Vec<SourcedAnalysisFact>) -> Vec<SourcedAnalysisFact> {
+    let mut anonymous = Vec::new();
+    let mut stable: FastHashMap<String, Vec<SourcedAnalysisFact>> = FastHashMap::default();
+    for sourced in facts {
+        if let Some(id) = &sourced.fact.stable_id {
+            stable
+                .entry(format!("{}\0{id}", sourced.provider))
+                .or_default()
+                .push(sourced);
+        } else {
+            anonymous.push(sourced);
+        }
     }
+    for group in stable.into_values() {
+        let canonical_timestamp = group
+            .iter()
+            .filter_map(|sourced| sourced.fact.timestamp_ms)
+            .min();
+        let invocation = group
+            .iter()
+            .filter(|sourced| has_invocation_count(sourced.fact.metrics))
+            .min_by(|left, right| compare_invocations(left, right));
+        let Some(invocation) = invocation else {
+            continue;
+        };
+        let terminal = group
+            .iter()
+            .filter(|sourced| sourced.fact.status != ToolFactStatus::Pending)
+            .max_by(|left, right| compare_outcomes(left, right));
+
+        let mut winner = invocation.clone();
+        winner.fact.timestamp_ms = canonical_timestamp;
+        if winner.fact.model.is_empty()
+            && let Some(model) = group
+                .iter()
+                .filter(|sourced| !sourced.fact.model.is_empty())
+                .min_by(|left, right| compare_invocations(left, right))
+                .map(|sourced| sourced.fact.model.clone())
+        {
+            winner.fact.model = model;
+        }
+        winner.fact.metrics = invocation_counts(invocation.fact.metrics);
+        if let Some(terminal) = terminal {
+            winner.fact.status = terminal.fact.status;
+            winner.fact.observed_at_ms = terminal.fact.observed_at_ms;
+            if terminal.fact.status == ToolFactStatus::Succeeded {
+                winner
+                    .fact
+                    .metrics
+                    .add_assign(success_effects(terminal.fact.metrics));
+                winner.fact.effect = terminal.fact.effect.clone();
+            } else {
+                winner.fact.effect = None;
+            }
+        } else {
+            winner.fact.status = ToolFactStatus::Pending;
+            winner.fact.effect = None;
+        }
+        anonymous.push(winner);
+    }
+    for sourced in &mut anonymous {
+        if sourced.fact.stable_id.is_none() && sourced.fact.status != ToolFactStatus::Succeeded {
+            sourced.fact.metrics = invocation_counts(sourced.fact.metrics);
+        }
+    }
+    anonymous.sort_unstable_by(|left, right| {
+        provider_scan_rank(left.provider)
+            .cmp(&provider_scan_rank(right.provider))
+            .then_with(|| left.fact.timestamp_ms.cmp(&right.fact.timestamp_ms))
+            .then_with(|| left.source.cmp(&right.source))
+            .then_with(|| left.fact.source_order.cmp(&right.fact.source_order))
+    });
+    anonymous
+}
+
+fn has_invocation_count(metrics: AnalysisMetrics) -> bool {
+    metrics.bash_count > 0
+        || metrics.edit_count > 0
+        || metrics.read_count > 0
+        || metrics.todo_write_count > 0
+        || metrics.write_count > 0
+}
+
+fn invocation_counts(metrics: AnalysisMetrics) -> AnalysisMetrics {
+    AnalysisMetrics {
+        bash_count: metrics.bash_count,
+        edit_count: metrics.edit_count,
+        read_count: metrics.read_count,
+        todo_write_count: metrics.todo_write_count,
+        write_count: metrics.write_count,
+        ..AnalysisMetrics::default()
+    }
+}
+
+fn success_effects(metrics: AnalysisMetrics) -> AnalysisMetrics {
+    AnalysisMetrics {
+        edit_lines: metrics.edit_lines,
+        read_lines: metrics.read_lines,
+        write_lines: metrics.write_lines,
+        ..AnalysisMetrics::default()
+    }
+}
+
+fn compare_invocations(
+    left: &SourcedAnalysisFact,
+    right: &SourcedAnalysisFact,
+) -> std::cmp::Ordering {
+    left.fact
+        .timestamp_ms
+        .unwrap_or(i64::MAX)
+        .cmp(&right.fact.timestamp_ms.unwrap_or(i64::MAX))
+        .then_with(|| left.source.cmp(&right.source))
+        .then_with(|| left.fact.source_order.cmp(&right.fact.source_order))
+}
+
+fn compare_outcomes(left: &SourcedAnalysisFact, right: &SourcedAnalysisFact) -> std::cmp::Ordering {
+    left.fact
+        .status
+        .cmp(&right.fact.status)
+        .then_with(|| {
+            left.fact
+                .observed_at_ms
+                .or(left.fact.timestamp_ms)
+                .unwrap_or(i64::MIN)
+                .cmp(
+                    &right
+                        .fact
+                        .observed_at_ms
+                        .or(right.fact.timestamp_ms)
+                        .unwrap_or(i64::MIN),
+                )
+        })
+        .then_with(|| left.source.cmp(&right.source))
+        .then_with(|| left.fact.source_order.cmp(&right.fact.source_order))
 }
 
 fn extension_type_from_name(name: &str) -> Option<ExtensionType> {
@@ -1411,43 +2071,34 @@ fn local_date_from_millis(timestamp: i64) -> Option<String> {
 
 /// Folds one parsed session's per-model counters into `aggregated`.
 ///
-/// Each model in the session's `conversation_usage` gets (or creates) a row,
-/// and that record's line and tool-call counts are added in. Synthetic models
-/// (model name containing `<synthetic>`) are skipped so placeholder usage does
-/// not pollute the per-model breakdown.
+/// A record with one conversation model can be attributed directly. A legacy
+/// aggregate carrying several models has already lost invocation-level model
+/// ownership, so its metrics are kept under `unknown` instead of being copied
+/// to every model. Event-aware callers use [`AnalysisProjection::add_facts`]
+/// and retain exact attribution.
 fn aggregate_analysis_result(
     aggregated: &mut FastHashMap<String, AggregatedAnalysisRow>,
     analysis: &CodeAnalysis,
 ) {
     for record in &analysis.records {
-        for model in record.conversation_usage.keys() {
-            if model.contains("<synthetic>") {
-                continue;
+        let metrics = AnalysisMetrics::from_record(record);
+        let models: Vec<_> = record
+            .conversation_usage
+            .keys()
+            .filter(|model| !model.contains("<synthetic>"))
+            .collect();
+        match models.as_slice() {
+            [model] => merge_analysis_metrics(aggregated, model, metrics),
+            [] if metrics.has_activity() => merge_analysis_metrics(aggregated, "unknown", metrics),
+            [] => {}
+            _ if metrics.has_activity() => {
+                merge_analysis_metrics(aggregated, "unknown", metrics);
             }
-
-            let entry = aggregated
-                .entry(model.clone())
-                .or_insert_with(|| AggregatedAnalysisRow {
-                    model: model.clone(),
-                    edit_lines: 0,
-                    read_lines: 0,
-                    write_lines: 0,
-                    bash_count: 0,
-                    edit_count: 0,
-                    read_count: 0,
-                    todo_write_count: 0,
-                    write_count: 0,
-                });
-
-            entry.edit_lines += record.total_edit_lines;
-            entry.read_lines += record.total_read_lines;
-            entry.write_lines += record.total_write_lines;
-
-            entry.bash_count += record.tool_call_counts.bash;
-            entry.edit_count += record.tool_call_counts.edit;
-            entry.read_count += record.tool_call_counts.read;
-            entry.todo_write_count += record.tool_call_counts.todo_write;
-            entry.write_count += record.tool_call_counts.write;
+            _ => {
+                for model in models {
+                    merge_analysis_metrics(aggregated, model, AnalysisMetrics::default());
+                }
+            }
         }
     }
 }
@@ -1522,5 +2173,69 @@ mod tests {
             aggregated.get("claude-opus-4-8").is_none(),
             "advisor model must not be credited with the main model's file operations"
         );
+    }
+
+    #[test]
+    fn legacy_multi_model_record_is_not_credited_to_every_model() {
+        let mut analysis = analysis_with_advisor();
+        analysis.records[0]
+            .conversation_usage
+            .insert("model-b".to_string(), json!({ "input_tokens": 1 }));
+        let mut aggregated = FastHashMap::default();
+
+        aggregate_analysis_result(&mut aggregated, &analysis);
+
+        assert_eq!(aggregated.len(), 1);
+        let unknown = aggregated
+            .get("unknown")
+            .expect("unattributable aggregate must remain visible");
+        assert_eq!(unknown.read_lines, 20);
+        assert_eq!(unknown.bash_count, 3);
+    }
+
+    #[test]
+    fn successful_tool_outcome_wins_over_a_later_failed_replay() {
+        let sourced = |status, observed_at_ms, metrics, effect| SourcedAnalysisFact {
+            provider: ExtensionType::ClaudeCode,
+            source: PathBuf::from(format!("{observed_at_ms}.jsonl")),
+            source_index: 0,
+            fact: AnalysisFact {
+                stable_id: Some("shared-tool".to_string()),
+                timestamp_ms: Some(1),
+                observed_at_ms: Some(observed_at_ms),
+                source_order: 0,
+                model: "claude-test".to_string(),
+                status,
+                metrics,
+                effect,
+            },
+        };
+        let invocation = sourced(
+            ToolFactStatus::Pending,
+            1,
+            AnalysisMetrics {
+                read_count: 1,
+                ..AnalysisMetrics::default()
+            },
+            None,
+        );
+        let succeeded = sourced(
+            ToolFactStatus::Succeeded,
+            2,
+            AnalysisMetrics {
+                read_lines: 2,
+                ..AnalysisMetrics::default()
+            },
+            Some(AnalysisFactEffect::default()),
+        );
+        let later_failed = sourced(ToolFactStatus::Failed, 3, AnalysisMetrics::default(), None);
+
+        let reduced = reduce_analysis_facts(vec![invocation, succeeded, later_failed]);
+
+        assert_eq!(reduced.len(), 1);
+        assert_eq!(reduced[0].fact.status, ToolFactStatus::Succeeded);
+        assert_eq!(reduced[0].fact.metrics.read_count, 1);
+        assert_eq!(reduced[0].fact.metrics.read_lines, 2);
+        assert!(reduced[0].fact.effect.is_some());
     }
 }

@@ -4,7 +4,7 @@ use crate::display::common::table::{
     add_totals_row, create_comfy_table, create_metric_cell, create_provider_cell,
 };
 use crate::display::usage::averages::{
-    build_provider_total_rows, build_usage_summary, merge_rows_by_base_model,
+    build_provider_total_rows, build_usage_summary_from_data, merge_rows_by_base_model,
 };
 use crate::pricing::{ModelPricingMap, fetch_model_pricing};
 use crate::usage::UsageData;
@@ -42,13 +42,7 @@ pub fn display_usage_table(usage_data: &UsageData, merge: bool) {
         }
     };
 
-    let mut summary = build_usage_summary(
-        &usage_data.models,
-        &usage_data.per_provider,
-        &usage_data.provider_days,
-        &pricing_map,
-        &usage_data.stored_costs,
-    );
+    let mut summary = build_usage_summary_from_data(usage_data, &pricing_map);
 
     if summary.rows.is_empty() {
         println!("No usage data found in enabled provider sessions");

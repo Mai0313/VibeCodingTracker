@@ -24,6 +24,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 #[cfg(test)]
 use serde_json::Value;
+use std::collections::HashSet;
 use std::path::Path;
 
 /// Reads per-model token usage from the Hermes database.
@@ -31,9 +32,11 @@ use std::path::Path;
 /// Each returned tuple is `(local YYYY-MM-DD date, CodeAnalysis, stored_cost)`,
 /// where the `CodeAnalysis` holds one `session_model_usage` row's
 /// `conversation_usage` keyed by that row's `model`, and `stored_cost` is
-/// Hermes's own cost for the row (the actual billed cost when known, otherwise
-/// its estimate). The date comes from the row's `last_seen` timestamp and is
-/// filtered by `time_range`, matching the file-walker semantics.
+/// Hermes's own actual, included, or estimated cost. This compatibility API
+/// represents a missing provider cost as zero; the compact aggregation path
+/// retains that distinction and only falls back to LiteLLM when it is missing.
+/// The date comes from the row's `last_seen` timestamp and is filtered by
+/// `time_range`, matching the file-walker semantics.
 ///
 /// # Errors
 ///
@@ -71,8 +74,36 @@ struct RowSums {
     cache_read: i64,
     cache_write: i64,
     reasoning: i64,
+    costs: Vec<RowCost>,
+}
+
+struct RowCost {
+    output_index: Option<usize>,
     estimated: f64,
-    actual: f64,
+    cost: HermesCost,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HermesCostBasis {
+    Actual,
+    Estimated,
+    Included,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HermesCost {
+    basis: HermesCostBasis,
+    amount: Option<f64>,
+}
+
+impl HermesCost {
+    const fn unknown() -> Self {
+        Self {
+            basis: HermesCostBasis::Unknown,
+            amount: None,
+        }
+    }
 }
 
 /// Collects the `usage` view from `session_model_usage`, then reconciles each
@@ -112,6 +143,119 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
     .map_err(Into::into)
 }
 
+/// Returns the columns present in a known Hermes table.
+fn table_columns(conn: &Connection, table: &str) -> Result<HashSet<String>> {
+    debug_assert!(matches!(table, "session_model_usage" | "sessions"));
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    let mut columns = HashSet::new();
+    while let Some(row) = rows.next()? {
+        columns.insert(row.get(1)?);
+    }
+    Ok(columns)
+}
+
+/// Builds a stable select expression for a column added by newer Hermes
+/// releases. The alias keeps row indexes identical on legacy databases.
+fn optional_column(columns: &HashSet<String>, name: &str) -> String {
+    if columns.contains(name) {
+        name.to_string()
+    } else {
+        format!("NULL AS {name}")
+    }
+}
+
+fn classify_cost(
+    estimated: Option<f64>,
+    actual: Option<f64>,
+    status: Option<&str>,
+    source: Option<&str>,
+    billing_mode: Option<&str>,
+) -> HermesCost {
+    let estimated = valid_cost(estimated);
+    let actual = valid_cost(actual);
+    let status = status.map(str::trim).filter(|value| !value.is_empty());
+    let source = source.map(str::trim).filter(|value| !value.is_empty());
+    let billing_mode = billing_mode
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    match status {
+        Some(value) if value.eq_ignore_ascii_case("actual") => actual.map_or_else(
+            || {
+                estimated.map_or_else(HermesCost::unknown, |amount| HermesCost {
+                    basis: HermesCostBasis::Estimated,
+                    amount: Some(amount),
+                })
+            },
+            |amount| HermesCost {
+                basis: HermesCostBasis::Actual,
+                amount: Some(amount),
+            },
+        ),
+        Some(value) if value.eq_ignore_ascii_case("included") => HermesCost {
+            basis: HermesCostBasis::Included,
+            amount: Some(0.0),
+        },
+        _ if billing_mode
+            .is_some_and(|value| value.eq_ignore_ascii_case("subscription_included")) =>
+        {
+            HermesCost {
+                basis: HermesCostBasis::Included,
+                amount: Some(0.0),
+            }
+        }
+        Some(value) if value.eq_ignore_ascii_case("estimated") => HermesCost {
+            basis: HermesCostBasis::Estimated,
+            amount: estimated,
+        },
+        Some(value) if value.eq_ignore_ascii_case("unknown") => {
+            positive_numeric_cost(estimated, actual).unwrap_or_else(HermesCost::unknown)
+        }
+        Some(value) => {
+            log::warn!("Ignoring unrecognized Hermes cost status: {value}");
+            positive_numeric_cost(estimated, actual).unwrap_or_else(HermesCost::unknown)
+        }
+        None => positive_numeric_cost(estimated, actual).unwrap_or_else(|| {
+            if source.is_some_and(is_meaningful_cost_source) {
+                HermesCost {
+                    basis: HermesCostBasis::Estimated,
+                    amount: estimated,
+                }
+            } else {
+                HermesCost::unknown()
+            }
+        }),
+    }
+}
+
+/// Retains a nonzero amount from legacy or mixed-status aggregates. Hermes
+/// stores the latest status but accumulates costs, so an `unknown` final call
+/// can coexist with valid cost from earlier calls in the same row.
+fn positive_numeric_cost(estimated: Option<f64>, actual: Option<f64>) -> Option<HermesCost> {
+    if actual.is_some_and(|value| value > 0.0) {
+        Some(HermesCost {
+            basis: HermesCostBasis::Actual,
+            amount: actual,
+        })
+    } else if estimated.is_some_and(|value| value > 0.0) {
+        Some(HermesCost {
+            basis: HermesCostBasis::Estimated,
+            amount: estimated,
+        })
+    } else {
+        None
+    }
+}
+
+fn valid_cost(value: Option<f64>) -> Option<f64> {
+    value.filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+fn is_meaningful_cost_source(source: &str) -> bool {
+    !source.eq_ignore_ascii_case("none") && !source.eq_ignore_ascii_case("unknown")
+}
+
 /// Emits one contribution per `session_model_usage` row and accumulates the raw
 /// per-session sums used by the residual reconciliation.
 fn collect_per_model_rows(
@@ -120,12 +264,17 @@ fn collect_per_model_rows(
     summed: &mut FastHashMap<String, RowSums>,
     out: &mut Vec<UsageContribution>,
 ) -> Result<()> {
-    let mut stmt = conn.prepare(
+    let columns = table_columns(conn, "session_model_usage")?;
+    let query = format!(
         "SELECT session_id, model, input_tokens, output_tokens, cache_read_tokens, \
                 cache_write_tokens, reasoning_tokens, estimated_cost_usd, \
-                actual_cost_usd, last_seen, first_seen \
+                actual_cost_usd, last_seen, first_seen, {}, {}, {} \
          FROM session_model_usage",
-    )?;
+        optional_column(&columns, "cost_status"),
+        optional_column(&columns, "cost_source"),
+        optional_column(&columns, "billing_mode"),
+    );
+    let mut stmt = conn.prepare(&query)?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         let session_id: String = row.get(0)?;
@@ -135,23 +284,22 @@ fn collect_per_model_rows(
         let cache_read = row.get::<_, i64>(4)?;
         let cache_write = row.get::<_, i64>(5)?;
         let reasoning = row.get::<_, i64>(6)?;
-        let estimated = row.get::<_, f64>(7)?;
-        let actual = row.get::<_, f64>(8)?;
+        let estimated = row.get::<_, Option<f64>>(7)?;
+        let actual = row.get::<_, Option<f64>>(8)?;
         // `last_seen` (last activity) drives the date, falling back to `first_seen`.
         let seconds = row
             .get::<_, Option<f64>>(9)?
             .or(row.get::<_, Option<f64>>(10)?);
-
-        // Accumulate raw sums for the residual, even for rows outside the time
-        // window — the residual is a session-level quantity.
-        let acc = summed.entry(session_id).or_default();
-        acc.input += input;
-        acc.output += raw_output;
-        acc.cache_read += cache_read;
-        acc.cache_write += cache_write;
-        acc.reasoning += reasoning;
-        acc.estimated += estimated;
-        acc.actual += actual;
+        let cost_status = row.get::<_, Option<String>>(11)?;
+        let cost_source = row.get::<_, Option<String>>(12)?;
+        let billing_mode = row.get::<_, Option<String>>(13)?;
+        let cost = classify_cost(
+            estimated,
+            actual,
+            cost_status.as_deref(),
+            cost_source.as_deref(),
+            billing_mode.as_deref(),
+        );
 
         let model = model.trim();
         if model.is_empty() {
@@ -161,23 +309,39 @@ fn collect_per_model_rows(
         let Some(date) = ms_to_local_date((seconds * 1000.0) as i64) else {
             continue;
         };
-        if is_before_cutoff(&date, cutoff) {
-            continue;
-        }
 
-        // Hermes bills through an OpenAI-compatible layer where `output_tokens`
-        // already includes reasoning, so subtract it back out to keep each token
-        // billed once (the flat shape treats the buckets as disjoint).
-        let output = (raw_output - reasoning).max(0);
-        // Prefer the real billed cost; fall back to Hermes's own estimate.
-        let cost = if actual > 0.0 { actual } else { estimated };
-        out.push(UsageContribution::single_model(
-            date,
-            (seconds * 1000.0) as i64,
-            model.to_string(),
-            session_usage_value(input, output, reasoning, cache_read, cache_write),
+        // Accumulate raw sums for the residual, even for valid rows outside
+        // the requested time window. Invalid rows cannot be emitted, so they
+        // must not consume the session residual and make usage disappear.
+        let acc = summed.entry(session_id).or_default();
+        acc.input += input;
+        acc.output += raw_output;
+        acc.cache_read += cache_read;
+        acc.cache_write += cache_write;
+        acc.reasoning += reasoning;
+
+        let output_index = if is_before_cutoff(&date, cutoff) {
+            None
+        } else {
+            // Hermes bills through an OpenAI-compatible layer where
+            // `output_tokens` already includes reasoning, so subtract it back
+            // out to keep each token billed once.
+            let output = (raw_output - reasoning).max(0);
+            let output_index = out.len();
+            out.push(UsageContribution::single_model(
+                date,
+                (seconds * 1000.0) as i64,
+                model.to_string(),
+                session_usage_value(input, output, reasoning, cache_read, cache_write),
+                cost.amount,
+            ));
+            Some(output_index)
+        };
+        acc.costs.push(RowCost {
+            output_index,
+            estimated: estimated.unwrap_or(0.0),
             cost,
-        ));
+        });
     }
     Ok(())
 }
@@ -193,14 +357,20 @@ fn reconcile_session_residuals(
 ) -> Result<()> {
     // The `sessions` table is core to Hermes, but stay defensive: if it is
     // somehow absent, the per-model rows already collected are still returned.
-    let Ok(mut stmt) = conn.prepare(
+    if !table_exists(conn, "sessions")? {
+        return Ok(());
+    }
+    let columns = table_columns(conn, "sessions")?;
+    let query = format!(
         "SELECT id, model, input_tokens, output_tokens, cache_read_tokens, \
                 cache_write_tokens, reasoning_tokens, estimated_cost_usd, \
-                actual_cost_usd, ended_at, started_at \
+                actual_cost_usd, ended_at, started_at, {}, {}, {} \
          FROM sessions",
-    ) else {
-        return Ok(());
-    };
+        optional_column(&columns, "cost_status"),
+        optional_column(&columns, "cost_source"),
+        optional_column(&columns, "billing_mode"),
+    );
+    let mut stmt = conn.prepare(&query)?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         let id: String = row.get(0)?;
@@ -221,17 +391,24 @@ fn reconcile_session_residuals(
         let reasoning =
             (row.get::<_, Option<i64>>(6)?.unwrap_or(0) - acc.map_or(0, |a| a.reasoning)).max(0);
         let output = (raw_output - reasoning).max(0);
-        let estimated = (row.get::<_, Option<f64>>(7)?.unwrap_or(0.0)
-            - acc.map_or(0.0, |a| a.estimated))
-        .max(0.0);
-        let actual =
-            (row.get::<_, Option<f64>>(8)?.unwrap_or(0.0) - acc.map_or(0.0, |a| a.actual)).max(0.0);
+        let session_estimated = row.get::<_, Option<f64>>(7)?;
+        let session_actual = row.get::<_, Option<f64>>(8)?;
+        let cost_status = row.get::<_, Option<String>>(11)?;
+        let cost_source = row.get::<_, Option<String>>(12)?;
+        let billing_mode = row.get::<_, Option<String>>(13)?;
+        let session_cost = classify_cost(
+            session_estimated,
+            session_actual,
+            cost_status.as_deref(),
+            cost_source.as_deref(),
+            billing_mode.as_deref(),
+        );
+        let cost_residual = reconcile_session_costs(acc, session_cost, out);
         if input == 0
             && raw_output == 0
             && cache_read == 0
             && cache_write == 0
-            && estimated <= 0.0
-            && actual <= 0.0
+            && cost_residual.unwrap_or(0.0) <= 0.0
         {
             continue;
         }
@@ -253,16 +430,128 @@ fn reconcile_session_residuals(
             continue;
         }
 
-        let cost = if actual > 0.0 { actual } else { estimated };
         out.push(UsageContribution::single_model(
             date,
             (seconds * 1000.0) as i64,
             model.to_string(),
             session_usage_value(input, output, reasoning, cache_read, cache_write),
-            cost,
+            cost_residual,
         ));
     }
     Ok(())
+}
+
+/// Reconciles every emitted model row against one authoritative session cost
+/// basis. Actual and estimated amounts are never stacked on top of each other.
+fn reconcile_session_costs(
+    acc: Option<&RowSums>,
+    session_cost: HermesCost,
+    out: &mut [UsageContribution],
+) -> Option<f64> {
+    let Some(acc) = acc else {
+        return session_cost.amount;
+    };
+    let session_total = session_cost.amount?;
+
+    // An authoritative zero aggregate leaves no cost to allocate. Preserve it
+    // on every row so a missing per-model status cannot turn a confirmed free
+    // session into a LiteLLM estimate.
+    if session_total == 0.0 {
+        for row in &acc.costs {
+            set_row_stored_cost(out, row, Some(0.0));
+        }
+        return Some(0.0);
+    }
+
+    if session_cost.basis == HermesCostBasis::Actual {
+        let actual_sum: f64 = acc
+            .costs
+            .iter()
+            .filter(|row| row.cost.basis == HermesCostBasis::Actual)
+            .filter_map(|row| row.cost.amount)
+            .sum();
+        if actual_sum > session_total {
+            let scale = session_total / actual_sum;
+            for row in &acc.costs {
+                let stored_cost = match row.cost.basis {
+                    HermesCostBasis::Actual => row.cost.amount.map(|amount| amount * scale),
+                    HermesCostBasis::Estimated | HermesCostBasis::Included => Some(0.0),
+                    HermesCostBasis::Unknown => Some(0.0),
+                };
+                set_row_stored_cost(out, row, stored_cost);
+            }
+            log::warn!(
+                "Hermes per-model actual cost exceeds the session total; normalized row shares"
+            );
+            return Some(0.0);
+        }
+
+        let residual = (session_total - actual_sum).max(0.0);
+        let estimate_weight: f64 = acc
+            .costs
+            .iter()
+            .filter(|row| row.cost.basis == HermesCostBasis::Estimated)
+            .map(|row| row.estimated.max(0.0))
+            .sum();
+        for row in &acc.costs {
+            let stored_cost = match row.cost.basis {
+                HermesCostBasis::Actual => row.cost.amount,
+                HermesCostBasis::Estimated if estimate_weight > 0.0 => {
+                    Some(residual * row.estimated.max(0.0) / estimate_weight)
+                }
+                HermesCostBasis::Estimated | HermesCostBasis::Included => Some(0.0),
+                HermesCostBasis::Unknown => Some(0.0),
+            };
+            set_row_stored_cost(out, row, stored_cost);
+        }
+        return Some(if estimate_weight == 0.0 {
+            residual
+        } else {
+            0.0
+        });
+    }
+
+    if session_cost.basis == HermesCostBasis::Estimated {
+        let covered_estimate: f64 = acc
+            .costs
+            .iter()
+            .filter(|row| row.cost.basis != HermesCostBasis::Unknown)
+            .map(|row| row.estimated.max(0.0))
+            .sum();
+        let scale = if covered_estimate > session_total && covered_estimate > 0.0 {
+            log::warn!(
+                "Hermes per-model estimated cost exceeds the session total; normalized row shares"
+            );
+            session_total / covered_estimate
+        } else {
+            1.0
+        };
+        for row in &acc.costs {
+            let stored_cost = match row.cost.basis {
+                HermesCostBasis::Actual => row.cost.amount,
+                HermesCostBasis::Estimated => row.cost.amount.map(|amount| amount * scale),
+                HermesCostBasis::Included => Some(0.0),
+                HermesCostBasis::Unknown => Some(0.0),
+            };
+            set_row_stored_cost(out, row, stored_cost);
+        }
+        return Some((session_total - covered_estimate * scale).max(0.0));
+    }
+
+    if session_cost.basis == HermesCostBasis::Included {
+        for row in &acc.costs {
+            set_row_stored_cost(out, row, Some(0.0));
+        }
+        return Some(0.0);
+    }
+
+    None
+}
+
+fn set_row_stored_cost(out: &mut [UsageContribution], row: &RowCost, stored_cost: Option<f64>) {
+    if let Some(output_index) = row.output_index {
+        out[output_index].stored_cost = stored_cost;
+    }
 }
 
 /// Builds the Claude-style flat usage value from a row's token columns.
@@ -350,6 +639,50 @@ mod tests {
         )
         .unwrap();
         (dir, db_path)
+    }
+
+    fn add_cost_metadata_columns(conn: &Connection) {
+        conn.execute_batch(
+            "ALTER TABLE session_model_usage ADD COLUMN cost_status TEXT;
+             ALTER TABLE session_model_usage ADD COLUMN cost_source TEXT;
+             ALTER TABLE session_model_usage ADD COLUMN billing_mode TEXT;
+             ALTER TABLE sessions ADD COLUMN cost_status TEXT;
+             ALTER TABLE sessions ADD COLUMN cost_source TEXT;
+             ALTER TABLE sessions ADD COLUMN billing_mode TEXT;",
+        )
+        .unwrap();
+    }
+
+    fn update_row_cost_metadata(
+        conn: &Connection,
+        session_id: &str,
+        status: Option<&str>,
+        source: Option<&str>,
+        billing_mode: Option<&str>,
+    ) {
+        conn.execute(
+            "UPDATE session_model_usage
+             SET cost_status = ?2, cost_source = ?3, billing_mode = ?4
+             WHERE session_id = ?1",
+            rusqlite::params![session_id, status, source, billing_mode],
+        )
+        .unwrap();
+    }
+
+    fn update_session_cost_metadata(
+        conn: &Connection,
+        session_id: &str,
+        status: Option<&str>,
+        source: Option<&str>,
+        billing_mode: Option<&str>,
+    ) {
+        conn.execute(
+            "UPDATE sessions
+             SET cost_status = ?2, cost_source = ?3, billing_mode = ?4
+             WHERE id = ?1",
+            rusqlite::params![session_id, status, source, billing_mode],
+        )
+        .unwrap();
     }
 
     /// Inserts a `sessions` aggregate row (the per-session token/cost totals
@@ -519,6 +852,281 @@ mod tests {
     }
 
     #[test]
+    fn modern_cost_metadata_distinguishes_known_costs_from_unknown() {
+        let (dir, db_path) = make_db();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            add_cost_metadata_columns(&conn);
+
+            insert_row(
+                &conn,
+                "actual-zero",
+                "actual-zero-model",
+                "provider",
+                10,
+                1,
+                0,
+                0,
+                0,
+                9.0,
+                0.0,
+                recent_epoch_secs(),
+            );
+            update_row_cost_metadata(&conn, "actual-zero", Some("actual"), Some("provider"), None);
+
+            insert_row(
+                &conn,
+                "included-zero",
+                "included-zero-model",
+                "openai-codex",
+                20,
+                2,
+                0,
+                0,
+                0,
+                0.0,
+                0.0,
+                recent_epoch_secs(),
+            );
+            update_row_cost_metadata(
+                &conn,
+                "included-zero",
+                Some("included"),
+                Some("none"),
+                Some("subscription_included"),
+            );
+
+            insert_row(
+                &conn,
+                "estimated",
+                "estimated-model",
+                "openai",
+                30,
+                3,
+                0,
+                0,
+                0,
+                0.75,
+                0.0,
+                recent_epoch_secs(),
+            );
+            update_row_cost_metadata(
+                &conn,
+                "estimated",
+                Some("estimated"),
+                Some("official_docs_snapshot"),
+                None,
+            );
+
+            insert_row(
+                &conn,
+                "estimated-zero",
+                "estimated-zero-model",
+                "openai",
+                35,
+                3,
+                0,
+                0,
+                0,
+                0.0,
+                0.0,
+                recent_epoch_secs(),
+            );
+            update_row_cost_metadata(
+                &conn,
+                "estimated-zero",
+                Some("estimated"),
+                Some("official_docs_snapshot"),
+                None,
+            );
+
+            insert_row(
+                &conn,
+                "unknown",
+                "unknown-model",
+                "custom",
+                40,
+                4,
+                0,
+                0,
+                0,
+                0.0,
+                0.0,
+                recent_epoch_secs(),
+            );
+            update_row_cost_metadata(&conn, "unknown", Some("unknown"), Some("none"), None);
+        }
+
+        let rows = read_hermes_usage_contributions(&db_path, TimeRange::All)
+            .unwrap()
+            .rows;
+        let stored_cost = |model: &str| {
+            rows.iter()
+                .find(|row| row.model == model)
+                .unwrap()
+                .stored_cost
+        };
+        assert_eq!(stored_cost("actual-zero-model"), Some(0.0));
+        assert_eq!(stored_cost("included-zero-model"), Some(0.0));
+        assert_eq!(stored_cost("estimated-model"), Some(0.75));
+        assert_eq!(stored_cost("estimated-zero-model"), Some(0.0));
+        assert_eq!(stored_cost("unknown-model"), None);
+        drop(dir);
+    }
+
+    #[test]
+    fn actual_status_without_actual_amount_falls_back_to_estimate() {
+        let cost = classify_cost(Some(0.75), None, Some("actual"), Some("provider"), None);
+        assert_eq!(cost.basis, HermesCostBasis::Estimated);
+        assert_eq!(cost.amount, Some(0.75));
+    }
+
+    #[test]
+    fn billing_mode_and_cost_source_preserve_explicit_zero_costs() {
+        let (dir, db_path) = make_db();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            add_cost_metadata_columns(&conn);
+            insert_row(
+                &conn,
+                "included",
+                "included-model",
+                "openai-codex",
+                10,
+                1,
+                0,
+                0,
+                0,
+                0.0,
+                0.0,
+                recent_epoch_secs(),
+            );
+            update_row_cost_metadata(&conn, "included", None, None, Some("subscription_included"));
+            insert_row(
+                &conn,
+                "estimated",
+                "source-model",
+                "openai",
+                10,
+                1,
+                0,
+                0,
+                0,
+                0.0,
+                0.0,
+                recent_epoch_secs(),
+            );
+            update_row_cost_metadata(
+                &conn,
+                "estimated",
+                None,
+                Some("official_docs_snapshot"),
+                None,
+            );
+        }
+
+        let rows = read_hermes_usage_contributions(&db_path, TimeRange::All)
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.stored_cost == Some(0.0)));
+        drop(dir);
+    }
+
+    #[test]
+    fn legacy_schema_uses_positive_costs_and_leaves_zero_unknown() {
+        let (dir, db_path) = make_db();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            insert_row(
+                &conn,
+                "estimated",
+                "estimated-model",
+                "provider",
+                10,
+                1,
+                0,
+                0,
+                0,
+                0.5,
+                0.0,
+                recent_epoch_secs(),
+            );
+            insert_row(
+                &conn,
+                "unknown",
+                "unknown-model",
+                "provider",
+                10,
+                1,
+                0,
+                0,
+                0,
+                0.0,
+                0.0,
+                recent_epoch_secs(),
+            );
+        }
+
+        let rows = read_hermes_usage_contributions(&db_path, TimeRange::All)
+            .unwrap()
+            .rows;
+        let stored_cost = |model: &str| {
+            rows.iter()
+                .find(|row| row.model == model)
+                .unwrap()
+                .stored_cost
+        };
+        assert_eq!(stored_cost("estimated-model"), Some(0.5));
+        assert_eq!(stored_cost("unknown-model"), None);
+        drop(dir);
+    }
+
+    #[test]
+    fn session_actual_zero_overrides_its_nonzero_estimate() {
+        let (dir, db_path) = make_db();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            add_cost_metadata_columns(&conn);
+            insert_row(
+                &conn,
+                "s1",
+                "actual-zero-model",
+                "provider",
+                100,
+                10,
+                0,
+                0,
+                0,
+                0.0,
+                0.0,
+                recent_epoch_secs(),
+            );
+            update_row_cost_metadata(&conn, "s1", Some("unknown"), Some("none"), None);
+            insert_session(
+                &conn,
+                "s1",
+                "actual-zero-model",
+                100,
+                10,
+                0,
+                0,
+                1.5,
+                0.0,
+                recent_epoch_secs(),
+            );
+            update_session_cost_metadata(&conn, "s1", Some("actual"), Some("provider"), None);
+        }
+
+        let rows = read_hermes_usage_contributions(&db_path, TimeRange::All)
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].stored_cost, Some(0.0));
+        drop(dir);
+    }
+
+    #[test]
     fn same_model_across_billing_providers_keeps_one_key_per_row() {
         // Two rows share a model but differ in billing_provider; the reader keys
         // both by the bare model, so the aggregator merges them into one row.
@@ -593,6 +1201,53 @@ mod tests {
         assert_eq!(all.len(), 2);
         let daily = read_hermes_usage(&db_path, TimeRange::Daily).unwrap();
         assert_eq!(daily.len(), 1);
+        drop(dir);
+    }
+
+    #[test]
+    fn filtered_cost_reconciliation_includes_out_of_range_row_metadata() {
+        let (dir, db_path) = make_db();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            let old = chrono::Local::now().timestamp() as f64 - 10.0 * 86_400.0;
+            insert_row(&conn, "s1", "old-model", "p", 60, 6, 0, 0, 0, 0.0, 6.0, old);
+            insert_row(
+                &conn,
+                "s1",
+                "recent-model",
+                "p",
+                40,
+                4,
+                0,
+                0,
+                0,
+                0.0,
+                4.0,
+                recent_epoch_secs(),
+            );
+            insert_session(
+                &conn,
+                "s1",
+                "recent-model",
+                100,
+                10,
+                0,
+                0,
+                0.0,
+                10.0,
+                recent_epoch_secs(),
+            );
+        }
+
+        let rows = read_hermes_usage_contributions(&db_path, TimeRange::Daily)
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].model, "recent-model");
+        assert_eq!(rows[0].stored_cost, Some(4.0));
+        let public = read_hermes_usage(&db_path, TimeRange::Daily).unwrap();
+        assert_eq!(public.len(), 1);
+        assert!((public[0].2 - 4.0).abs() < 1e-9);
         drop(dir);
     }
 
@@ -683,6 +1338,265 @@ mod tests {
         assert_eq!(total_bucket(&sessions, "gpt-x", "input_tokens"), 100);
         assert_eq!(total_bucket(&sessions, "gpt-x", "output_tokens"), 10);
         assert!((total_cost(&sessions, "gpt-x") - 0.5).abs() < 1e-9);
+        drop(dir);
+    }
+
+    #[test]
+    fn invalid_per_model_rows_do_not_consume_session_residual() {
+        let (dir, db_path) = make_db();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            insert_row(
+                &conn,
+                "blank-model",
+                "   ",
+                "provider",
+                60,
+                6,
+                0,
+                0,
+                0,
+                0.3,
+                0.0,
+                recent_epoch_secs(),
+            );
+            insert_session(
+                &conn,
+                "blank-model",
+                "recovered-blank",
+                100,
+                10,
+                0,
+                0,
+                0.5,
+                0.0,
+                recent_epoch_secs(),
+            );
+
+            conn.execute(
+                "INSERT INTO session_model_usage (
+                     session_id, model, billing_provider, input_tokens, output_tokens,
+                     estimated_cost_usd, actual_cost_usd, first_seen, last_seen
+                 ) VALUES ('missing-time', 'ignored-model', 'provider', 70, 7, 0.35, 0, NULL, NULL)",
+                [],
+            )
+            .unwrap();
+            insert_session(
+                &conn,
+                "missing-time",
+                "recovered-time",
+                120,
+                12,
+                0,
+                0,
+                0.6,
+                0.0,
+                recent_epoch_secs(),
+            );
+        }
+
+        let sessions = read_hermes_usage(&db_path, TimeRange::All).unwrap();
+        assert_eq!(
+            total_bucket(&sessions, "recovered-blank", "input_tokens"),
+            100
+        );
+        assert_eq!(
+            total_bucket(&sessions, "recovered-time", "input_tokens"),
+            120
+        );
+        assert!(sessions.iter().all(|(_, analysis, _)| {
+            !analysis.records[0]
+                .conversation_usage
+                .contains_key("ignored-model")
+        }));
+        drop(dir);
+    }
+
+    #[test]
+    fn session_actual_does_not_stack_on_row_estimates() {
+        let (dir, db_path) = make_db();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            insert_row(
+                &conn,
+                "s1",
+                "model-a",
+                "provider",
+                60,
+                6,
+                0,
+                0,
+                0,
+                0.0,
+                6.0,
+                recent_epoch_secs(),
+            );
+            insert_row(
+                &conn,
+                "s1",
+                "model-b",
+                "provider",
+                40,
+                4,
+                0,
+                0,
+                0,
+                4.0,
+                0.0,
+                recent_epoch_secs(),
+            );
+            insert_session(
+                &conn,
+                "s1",
+                "model-a",
+                100,
+                10,
+                0,
+                0,
+                0.0,
+                10.0,
+                recent_epoch_secs(),
+            );
+        }
+
+        let sessions = read_hermes_usage(&db_path, TimeRange::All).unwrap();
+        let total: f64 = sessions.iter().map(|(_, _, cost)| *cost).sum();
+        assert!((total - 10.0).abs() < 1e-9);
+        drop(dir);
+    }
+
+    #[test]
+    fn authoritative_session_cost_suppresses_fallback_for_unknown_rows() {
+        let (dir, db_path) = make_db();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            insert_row(
+                &conn,
+                "s1",
+                "actual-model",
+                "provider",
+                60,
+                6,
+                0,
+                0,
+                0,
+                0.0,
+                6.0,
+                recent_epoch_secs(),
+            );
+            insert_row(
+                &conn,
+                "s1",
+                "unknown-model",
+                "provider",
+                40,
+                4,
+                0,
+                0,
+                0,
+                0.0,
+                0.0,
+                recent_epoch_secs(),
+            );
+            insert_session(
+                &conn,
+                "s1",
+                "session-model",
+                100,
+                10,
+                0,
+                0,
+                0.0,
+                10.0,
+                recent_epoch_secs(),
+            );
+        }
+
+        let rows = read_hermes_usage_contributions(&db_path, TimeRange::All)
+            .unwrap()
+            .rows;
+        let pricing = crate::pricing::ModelPricing {
+            input_cost_per_token: 1.0,
+            output_cost_per_token: 1.0,
+            ..Default::default()
+        };
+        let priced_total: f64 = rows
+            .iter()
+            .map(|row| {
+                row.stored_cost.unwrap_or_else(|| {
+                    crate::pricing::calculate_cost(
+                        row.tokens.input_tokens,
+                        row.tokens.output_tokens,
+                        row.tokens.reasoning_tokens,
+                        row.tokens.cache_read_tokens,
+                        row.tokens.cache_creation_tokens,
+                        0,
+                        &pricing,
+                    )
+                })
+            })
+            .sum();
+        let unknown = rows
+            .iter()
+            .find(|row| row.model == "unknown-model")
+            .unwrap();
+        assert_eq!(unknown.stored_cost, Some(0.0));
+        assert!((priced_total - 10.0).abs() < 1e-9);
+        drop(dir);
+    }
+
+    #[test]
+    fn estimated_session_preserves_actual_row_and_only_estimates_residual() {
+        let (dir, db_path) = make_db();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            add_cost_metadata_columns(&conn);
+            insert_row(
+                &conn,
+                "s1",
+                "actual-model",
+                "provider",
+                60,
+                6,
+                0,
+                0,
+                0,
+                6.0,
+                8.0,
+                recent_epoch_secs(),
+            );
+            update_row_cost_metadata(&conn, "s1", Some("actual"), Some("provider"), None);
+            insert_session(
+                &conn,
+                "s1",
+                "residual-model",
+                100,
+                10,
+                0,
+                0,
+                10.0,
+                0.0,
+                recent_epoch_secs(),
+            );
+            update_session_cost_metadata(
+                &conn,
+                "s1",
+                Some("estimated"),
+                Some("official_docs_snapshot"),
+                None,
+            );
+        }
+
+        let rows = read_hermes_usage_contributions(&db_path, TimeRange::All)
+            .unwrap()
+            .rows;
+        let actual = rows.iter().find(|row| row.model == "actual-model").unwrap();
+        let residual = rows
+            .iter()
+            .find(|row| row.model == "residual-model")
+            .unwrap();
+        assert_eq!(actual.stored_cost, Some(8.0));
+        assert_eq!(residual.stored_cost, Some(4.0));
         drop(dir);
     }
 

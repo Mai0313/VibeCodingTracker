@@ -185,7 +185,7 @@ pub fn build_analysis_provider_rows(
 ) -> Vec<ProviderTotal<'_, AnalysisProviderStats>> {
     let mut rows = Vec::with_capacity(8); // max 7 providers + overall
 
-    if totals.claude.days_count > 0 {
+    if analysis_provider_stats_have_activity(&totals.claude) {
         rows.push(ProviderTotal::new(
             Provider::ClaudeCode,
             &totals.claude,
@@ -193,11 +193,11 @@ pub fn build_analysis_provider_rows(
         ));
     }
 
-    if totals.codex.days_count > 0 {
+    if analysis_provider_stats_have_activity(&totals.codex) {
         rows.push(ProviderTotal::new(Provider::Codex, &totals.codex, false));
     }
 
-    if totals.copilot.days_count > 0 {
+    if analysis_provider_stats_have_activity(&totals.copilot) {
         rows.push(ProviderTotal::new(
             Provider::Copilot,
             &totals.copilot,
@@ -205,15 +205,15 @@ pub fn build_analysis_provider_rows(
         ));
     }
 
-    if totals.gemini.days_count > 0 {
+    if analysis_provider_stats_have_activity(&totals.gemini) {
         rows.push(ProviderTotal::new(Provider::Gemini, &totals.gemini, false));
     }
 
-    if totals.grok.days_count > 0 {
+    if analysis_provider_stats_have_activity(&totals.grok) {
         rows.push(ProviderTotal::new(Provider::Grok, &totals.grok, false));
     }
 
-    if totals.opencode.days_count > 0 {
+    if analysis_provider_stats_have_activity(&totals.opencode) {
         rows.push(ProviderTotal::new(
             Provider::OpenCode,
             &totals.opencode,
@@ -221,15 +221,27 @@ pub fn build_analysis_provider_rows(
         ));
     }
 
-    if totals.cursor.days_count > 0 {
+    if analysis_provider_stats_have_activity(&totals.cursor) {
         rows.push(ProviderTotal::new(Provider::Cursor, &totals.cursor, false));
     }
 
-    if totals.overall.days_count > 0 || rows.is_empty() {
+    if analysis_provider_stats_have_activity(&totals.overall) || rows.is_empty() {
         rows.push(ProviderTotal::new_overall(&totals.overall));
     }
 
     rows
+}
+
+fn analysis_provider_stats_have_activity(stats: &AnalysisProviderStats) -> bool {
+    stats.days_count > 0
+        || stats.total_edit_lines != 0
+        || stats.total_read_lines != 0
+        || stats.total_write_lines != 0
+        || stats.total_bash_count != 0
+        || stats.total_edit_count != 0
+        || stats.total_read_count != 0
+        || stats.total_todo_write_count != 0
+        || stats.total_write_count != 0
 }
 
 /// Convert aggregator rows into the renderers' [`AnalysisRow`] shape.
@@ -275,4 +287,22 @@ pub fn convert_to_analysis_rows(data: &[AggregatedAnalysisRow]) -> Vec<AnalysisR
             write_count: row.write_count,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_rows_keep_activity_without_a_timestamped_day() {
+        let mut totals = AnalysisProviderTotals::default();
+        totals.claude.total_read_count = 1;
+        totals.overall.total_read_count = 1;
+
+        let rows = build_analysis_provider_rows(&totals);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].label, Provider::ClaudeCode.display_name());
+        assert!(rows[1].emphasize);
+    }
 }

@@ -17,7 +17,7 @@ use serde_json::Value;
 /// (`reasoning_output_tokens`), and Copilot (`reasoning_output_tokens`
 /// after `session::copilot::parse_copilot_events` normalises it). Claude
 /// has no equivalent and leaves this at 0.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenCounts {
     /// Non-cached prompt tokens (cached reads are excluded; see `cache_read`).
     pub input_tokens: i64,
@@ -207,21 +207,14 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
             }
         }
 
-        // Flat providers may publish tool-only tokens that have no separate
-        // LiteLLM billing bucket. Keep them in the displayed/activity total
-        // without assigning them an input or output price. Prefer a larger
-        // provider-published total when present so these sessions do not look
-        // inactive merely because every priced bucket is zero.
-        let tool_tokens = usage_obj
-            .get("tool_tokens")
-            .and_then(|value| value.as_i64())
-            .unwrap_or(0);
+        // Gemini's `tool_tokens` (`toolUsePromptTokenCount`) are already a
+        // subset of `input_tokens` (`promptTokenCount`). Keep the raw field in
+        // provider usage, but do not add it to normalized totals or pricing.
         let derived_total = counts.input_tokens
             + counts.output_tokens
             + counts.reasoning_tokens
             + counts.cache_read
-            + counts.cache_creation
-            + tool_tokens;
+            + counts.cache_creation;
         counts.total = usage_obj
             .get("total_tokens")
             .and_then(|value| value.as_i64())
@@ -404,18 +397,19 @@ mod tests {
     }
 
     #[test]
-    fn gemini_tool_only_usage_remains_active() {
+    fn gemini_tool_tokens_are_not_added_to_total() {
         let usage = json!({
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "thoughts_tokens": 0,
-            "tool_tokens": 5,
-            "total_tokens": 5
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "thoughts_tokens": 5,
+            "tool_tokens": 30,
+            "total_tokens": 125
         });
         let counts = extract_token_counts(&usage);
-        assert_eq!(counts.total, 5);
-        assert_eq!(counts.input_tokens, 0);
-        assert_eq!(counts.output_tokens, 0);
+        assert_eq!(counts.total, 125);
+        assert_eq!(counts.input_tokens, 100);
+        assert_eq!(counts.output_tokens, 20);
+        assert_eq!(counts.reasoning_tokens, 5);
     }
 
     #[test]
@@ -489,20 +483,24 @@ mod tests {
     }
 
     #[test]
-    fn copilot_reasoning_output_tokens_populate_reasoning_bucket() {
-        // After `session::copilot::parse_copilot_events` normalisation,
-        // Copilot sessions use the same flat `reasoning_output_tokens` key
-        // as Codex's nested one.
+    fn normalized_copilot_usage_keeps_disjoint_buckets_and_published_total() {
+        // The Copilot parser subtracts cache and reasoning subsets before
+        // producing this flat shape. The provider's inclusive parent sum is
+        // retained as `total_tokens`.
         let usage = json!({
-            "input_tokens": 2_000,
-            "output_tokens": 300,
-            "cache_read_input_tokens": 100,
-            "cache_creation_input_tokens": 0,
-            "reasoning_output_tokens": 150
+            "input_tokens": 1_300,
+            "output_tokens": 250,
+            "cache_read_input_tokens": 600,
+            "cache_creation_input_tokens": 100,
+            "reasoning_output_tokens": 50,
+            "total_tokens": 2_300
         });
         let c = extract_token_counts(&usage);
-        assert_eq!(c.output_tokens, 300);
-        assert_eq!(c.reasoning_tokens, 150);
-        assert_eq!(c.total, 2_000 + 300 + 150 + 100);
+        assert_eq!(c.input_tokens, 1_300);
+        assert_eq!(c.output_tokens, 250);
+        assert_eq!(c.reasoning_tokens, 50);
+        assert_eq!(c.cache_read, 600);
+        assert_eq!(c.cache_creation, 100);
+        assert_eq!(c.total, 2_300);
     }
 }

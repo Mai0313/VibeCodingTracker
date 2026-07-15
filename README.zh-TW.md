@@ -19,7 +19,7 @@
 
 </div>
 
-**即時追蹤你的 AI 程式設計花費。** Vibe Coding Tracker 是一款以 Rust 打造的輕量、高效能 CLI 工具，能監控與分析你在 Claude Code、Codex、Copilot、Gemini、OpenCode、Cursor、Hermes 及 Grok 的使用狀況——提供詳細的費用明細、token 統計資料與程式碼操作分析，同時維持極低的記憶體使用量。
+**稽核本機 AI 程式設計用量並估算費用.** Vibe Coding Tracker 是一款以 Rust 打造的輕量、高效能 CLI 工具, 能從本機 session 資料分析 Claude Code、Codex、Copilot、Gemini、OpenCode、Cursor、Hermes 及 Grok 的使用狀況. Provider 有回報費用時優先採用, 否則以目前的 LiteLLM list rate 估算, 並提供 token 統計資料與程式碼操作分析.
 
 [English](README.md) | [繁體中文](README.zh-TW.md) | [简体中文](README.zh-CN.md)
 
@@ -31,7 +31,7 @@
 
 ### 掌握你的花費
 
-不用再猜測 AI 程式設計工作階段花了多少錢。透過 [LiteLLM](https://github.com/BerriAI/litellm) 自動更新價格，取得**即時費用追蹤**。
+檢視 AI 程式設計 session 實際記錄的用量. Provider 有回報費用時優先採用, 否則 vct 會使用每日驗證過的 [LiteLLM](https://github.com/BerriAI/litellm) pricing snapshot 估算費用.
 
 ### 超輕量
 
@@ -44,7 +44,7 @@
 - **互動式儀表板**: 可立即顯示 loading spinner 的響應式終端 UI, 支援背景 incremental refresh, 可捲動的 model 清單 (方向鍵), process 層級的 CPU/記憶體即時讀數, 以及 K/M/B 精簡數字格式
 - **靜態報表**:專業的表格格式,適合撰寫文件
 - **腳本友好**:純文字及 JSON 輸出,方便自動化處理
-- **完整精度**:匯出精確費用供會計使用
+- **可稽核輸出**: 匯出正規化用量、Provider 回報費用與目前的 list-rate 估算
 
 ### 零設定
 
@@ -65,7 +65,7 @@
 | 功能             | 說明                                                                  |
 | ---------------- | --------------------------------------------------------------------- |
 | **多供應商支援** | Claude Code、Codex、Copilot、Gemini、OpenCode、Cursor、Hermes 及 Grok |
-| **智慧定價**     | 模糊模型比對 + 每日從 LiteLLM cache 更新                              |
+| **智慧定價**     | Provider 回報費用 + 每日驗證過的 LiteLLM list-rate 估算               |
 | **4 種顯示模式** | 互動式 TUI、靜態表格、純文字及 JSON                                   |
 | **雙重分析**     | Token / 費用統計（`usage`）+ 程式碼操作統計（`analysis`）             |
 | **即時額度面板** | 即時顯示 Claude、Codex、Copilot 與 Cursor 的剩餘額度                  |
@@ -296,6 +296,8 @@ Totals (by Provider)
 - `$GROK_HOME/sessions/*/*/signals.json`（Grok CLI，預設使用 `~/.grok`；同層的 `updates.jsonl` 提供 `analysis` 資料）
 
 Grok 的 `usage` 是單一當下的本地 context 估算：vct 會把 `signals.json` 的 `contextTokensUsed` 記為 cache-read token，並以該 model 的 cache-read 費率估算費用。這不是累計的 billed usage。`analysis` 會從同層的 `updates.jsonl` 還原已完成的 Read / Write / Edit / Bash / TodoWrite 操作。Grok 不支援 quota panel 或 `vct fetch`。
+
+時間範圍使用每個 usage event 或 tool invocation 的 timestamp, 絕不使用 session 檔案的修改時間. Resume 後的檔案因此只會納入範圍內的 event. 已辨識的 tool invocation 即使 pending、failed、rejected 或 cancelled 也只計一次, lines、details、unique files 與其他 effects 則必須確認成功才會增加.
 
 對於非互動式 `usage` 與 `analysis` 掃描, 如果所有找到的 source 都失敗, vct 會回傳錯誤. 如果只有部分 source 失敗, vct 會保留成功的結果, 並向 stderr 印出一則診斷摘要. TUI 則保持 best-effort, 並保留上一次成功的 payload.
 
@@ -647,6 +649,8 @@ vct config migrate
 
 ### 模型比對
 
+以下一般 matcher 用於 model 探索與 label. 費用計算更嚴格, 只接受完全相符的 key 或唯一且能確認 provider 的 normalized alias, 絕不使用 substring 或 fuzzy guess.
+
 **優先順序**：
 
 1. **完全比對**：`claude-sonnet-4` → `claude-sonnet-4`
@@ -657,9 +661,13 @@ vct config migrate
 
 ### 費用細節
 
+- **優先順序**: 每個 pricing unit 先採用 Provider 回報的 actual cost, 再採用 Provider 保存的 estimate, 包含明確的 `$0`. 只有 Provider cost 缺失時才使用目前的 LiteLLM list rate.
+- **逐 request tier**: threshold 與 range pricing 會對每個 request 個別選擇. 無法辨識 request 邊界的 Provider aggregate 使用 base rate, range-only aggregate 則保持 unresolved, 不猜測 tier. 如果 active price level 缺少 request 實際使用的任一 token bucket rate, 該 request 也會保持 unresolved, 不會回傳 partial cost.
+- **Provider modifier**: Claude response 回報的 `usage.speed` 與 `inference_geo` 會選用 LiteLLM `provider_specific_entry` 中對應的 multiplier. Fast 與 data residency multiplier 會疊加到 token 和 prompt cache 費用, 但不影響每次查詢的 web-search 費用. 如果 Provider 已回報 modifier, 但定價資料沒有對應 multiplier, 該 request 會保持 unresolved, 不會悄悄套用 standard rate.
+- **估算範圍**: LiteLLM fallback 是目前的 list-rate 估算, 不是歷史 invoice, 也不保證符合 subscription、enterprise、regional、batch 或 negotiated pricing.
 - **不只 token**：Claude 的網頁搜尋工具呼叫（`server_tool_use.web_search_requests`）會在 token 費用之外，按每次查詢計費；其他所有 model 的每次查詢費用皆為 $0。
-- **OpenCode**：只有在 LiteLLM **完全比對**成功時，才會依 token 為新型 model 計價；若沒有完全比對，vct 會採信該 assistant 訊息本身儲存的費用，而不是從名稱相近的 model 去猜測。
-- **Hermes**：與 OpenCode 相同，LiteLLM **完全比對**成功時依 token 計價，否則使用 Hermes 本身儲存的費用。
+- **OpenCode**: 每個 assistant message 保存的 cost 都是 authoritative, 包含明確的 `$0`. 只有 stored cost 缺失時才允許 strict LiteLLM fallback.
+- **Hermes**: actual cost 最優先, 接著使用 Hermes 保存的 estimate. 只有 cost 缺失時才允許 strict LiteLLM fallback.
 - **Grok**：只會把 `contextTokensUsed` 當成 cache-read token 計價；這是單一當下的本地 context 估算，不是累計的 billed usage。
 - **原始 cache**: 每日 cache 儲存經過篩選的 LiteLLM 上游原始 JSON (而非衍生結構), 因此 tiered / batch 定價不需重新取得即可使用. 每個 pricing map 各自擁有一個小型 process-local LRU, 重複查詢維持低成本, 也不會在不同 map 之間互相污染.
 

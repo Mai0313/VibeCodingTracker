@@ -203,13 +203,20 @@ pub fn parse_session_file_typed_with_mode_and_diagnostics<P: AsRef<Path>>(
     path: P,
     mode: ParseMode,
 ) -> Result<(CodeAnalysis, SessionFileParseDiagnostics)> {
-    let path = path.as_ref();
+    let (parsed, diagnostics) = parse_session_file_with_facts_and_diagnostics(path.as_ref(), mode)?;
+    Ok((parsed.analysis, diagnostics))
+}
+
+pub(crate) fn parse_session_file_with_facts_and_diagnostics(
+    path: &Path,
+    mode: ParseMode,
+) -> Result<(ParsedAnalysis, SessionFileParseDiagnostics)> {
     let parsed = parse_session_file_typed_with_mode_internal(path, mode)?;
     validate_parsed_source(path, &parsed.diagnostics)?;
     let diagnostics = SessionFileParseDiagnostics {
         skipped_records: parsed.diagnostics.partial_failure_count(),
     };
-    Ok((parsed.analysis, diagnostics))
+    Ok((parsed, diagnostics))
 }
 
 fn parse_session_file_typed_with_mode_internal(

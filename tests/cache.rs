@@ -107,7 +107,7 @@ fn test_grok_cache_tracks_sibling_files() {
     let cache = FileParseCache::new();
 
     let initial = cache.get_or_parse(&signals).unwrap();
-    assert_eq!(initial.records[0].tool_call_counts.read, 2);
+    assert_eq!(initial.records[0].tool_call_counts.read, 3);
 
     let mut updates_file = std::fs::OpenOptions::new()
         .append(true)
@@ -126,7 +126,7 @@ fn test_grok_cache_tracks_sibling_files() {
     drop(updates_file);
 
     let after_updates = cache.get_or_parse(&signals).unwrap();
-    assert_eq!(after_updates.records[0].tool_call_counts.read, 3);
+    assert_eq!(after_updates.records[0].tool_call_counts.read, 4);
 
     let mut summary_value: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&summary).unwrap()).unwrap();

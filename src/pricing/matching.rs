@@ -213,6 +213,69 @@ impl ModelPricingMap {
         result
     }
 
+    /// Resolves a model for monetary calculation without substring or fuzzy
+    /// guessing.
+    ///
+    /// Exact keys always win, including known zero-priced tombstones. A
+    /// normalized alias is accepted only when it resolves unambiguously within
+    /// the same provider route, or to one unprefixed canonical key. This keeps
+    /// similarly named models from different gateways from borrowing each
+    /// other's prices.
+    pub fn get_for_cost(&self, model_name: &str) -> Option<ModelPricingResult> {
+        self.get_for_cost_with_provider(model_name, None)
+    }
+
+    /// Provider-aware variant of [`get_for_cost`](Self::get_for_cost).
+    ///
+    /// `provider_hint` is used only for a bare model name. An explicit prefix
+    /// in `model_name` remains authoritative, and an exact key always wins.
+    pub fn get_for_cost_with_provider(
+        &self,
+        model_name: &str,
+        provider_hint: Option<&str>,
+    ) -> Option<ModelPricingResult> {
+        if let Some(pricing) = self.raw.get(model_name) {
+            return Some(ModelPricingResult {
+                pricing: pricing.clone(),
+                matched_model: None,
+            });
+        }
+
+        let normalized = normalize_model_name(model_name);
+        let candidates = self.normalized_index.get(&normalized)?;
+        let query_provider = provider_prefix(model_name).or(provider_hint);
+        let mut eligible: Vec<&Rc<str>> = match query_provider {
+            Some(provider) => {
+                let same_provider: Vec<_> = candidates
+                    .iter()
+                    .filter(|candidate| provider_prefix(candidate.as_ref()) == Some(provider))
+                    .collect();
+                if same_provider.is_empty() {
+                    candidates
+                        .iter()
+                        .filter(|candidate| provider_prefix(candidate.as_ref()).is_none())
+                        .collect()
+                } else {
+                    same_provider
+                }
+            }
+            None => candidates
+                .iter()
+                .filter(|candidate| provider_prefix(candidate.as_ref()).is_none())
+                .collect(),
+        };
+        eligible.sort_unstable_by(|left, right| left.as_ref().cmp(right.as_ref()));
+        eligible.dedup_by(|left, right| left.as_ref() == right.as_ref());
+        let [candidate] = eligible.as_slice() else {
+            return None;
+        };
+        let pricing = self.raw.get(candidate.as_ref())?.clone();
+        Some(ModelPricingResult {
+            pricing,
+            matched_model: Some(candidate.to_string()),
+        })
+    }
+
     fn cached_result(&self, model_name: &str) -> Option<ModelPricingResult> {
         let mut cache = self.match_cache.borrow_mut();
         refresh_cache_generation(&mut cache);
@@ -772,5 +835,84 @@ mod tests {
 
         let result2 = map.get("モデル-2");
         assert!(result2.pricing.input_cost_per_token > 0.0);
+    }
+
+    #[test]
+    fn monetary_lookup_never_uses_fuzzy_or_substring_match() {
+        let mut raw = HashMap::new();
+        raw.insert("gpt-4".to_string(), create_test_pricing());
+        let map = ModelPricingMap::new(raw);
+
+        assert!(map.get_for_cost("gpt-4-typo").is_none());
+        assert!(map.get_for_cost("prefix-gpt-4-suffix").is_none());
+    }
+
+    #[test]
+    fn monetary_lookup_stops_at_exact_zero_tombstone() {
+        let mut raw = HashMap::new();
+        raw.insert("model-free".to_string(), ModelPricing::default());
+        raw.insert(
+            "model-free-pro".to_string(),
+            ModelPricing {
+                input_cost_per_token: 1.0,
+                ..Default::default()
+            },
+        );
+        let map = ModelPricingMap::new(raw);
+
+        let result = map.get_for_cost("model-free").unwrap();
+        assert_eq!(result.pricing.input_cost_per_token, 0.0);
+        assert!(result.matched_model.is_none());
+    }
+
+    #[test]
+    fn monetary_lookup_keeps_provider_routes_isolated() {
+        let mut raw = HashMap::new();
+        raw.insert(
+            "provider-a/model-v2".to_string(),
+            ModelPricing {
+                input_cost_per_token: 1.0,
+                ..Default::default()
+            },
+        );
+        raw.insert(
+            "provider-b/model-v2".to_string(),
+            ModelPricing {
+                input_cost_per_token: 2.0,
+                ..Default::default()
+            },
+        );
+        let map = ModelPricingMap::new(raw);
+
+        let hit = map.get_for_cost("provider-a/model-v2-20260101").unwrap();
+        assert_eq!(hit.pricing.input_cost_per_token, 1.0);
+        assert!(map.get_for_cost("model-v2-20260101").is_none());
+    }
+
+    #[test]
+    fn monetary_lookup_uses_explicit_provider_hint_for_bare_models() {
+        let mut raw = HashMap::new();
+        raw.insert(
+            "xai/grok-4.5".to_string(),
+            ModelPricing {
+                input_cost_per_token: 1.0,
+                ..Default::default()
+            },
+        );
+        raw.insert(
+            "other/grok-4.5".to_string(),
+            ModelPricing {
+                input_cost_per_token: 9.0,
+                ..Default::default()
+            },
+        );
+        let map = ModelPricingMap::new(raw);
+
+        assert!(map.get_for_cost("grok-4.5").is_none());
+        let hit = map
+            .get_for_cost_with_provider("grok-4.5", Some("xai"))
+            .unwrap();
+        assert_eq!(hit.pricing.input_cost_per_token, 1.0);
+        assert_eq!(hit.matched_model.as_deref(), Some("xai/grok-4.5"));
     }
 }

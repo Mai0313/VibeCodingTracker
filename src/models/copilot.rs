@@ -11,7 +11,7 @@
 //! under `~/.copilot/history-session-state/<sessionId>.json` with no token
 //! accounting at all; that layout is no longer supported.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -133,10 +133,10 @@ pub struct CopilotModelMetric {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CopilotModelUsage {
-    /// Input (prompt) tokens.
+    /// Input (prompt) tokens, including cache reads and writes.
     #[serde(default)]
     pub input_tokens: i64,
-    /// Output (completion) tokens.
+    /// Output (completion) tokens, including reasoning tokens.
     #[serde(default)]
     pub output_tokens: i64,
     /// Tokens served from the prompt cache.
@@ -145,7 +145,7 @@ pub struct CopilotModelUsage {
     /// Tokens written into the prompt cache.
     #[serde(default)]
     pub cache_write_tokens: i64,
-    /// Reasoning tokens billed separately by the model.
+    /// Reasoning tokens included in `output_tokens`.
     #[serde(default)]
     pub reasoning_tokens: i64,
 }
@@ -156,7 +156,7 @@ pub struct CopilotModelUsage {
 #[serde(rename_all = "camelCase")]
 pub struct CopilotToolStartData {
     /// Correlation id paired with the matching `tool.execution_complete`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub tool_call_id: String,
     /// Name of the invoked tool (e.g. `view`, `create`).
     #[serde(default)]
@@ -164,6 +164,13 @@ pub struct CopilotToolStartData {
     /// Raw tool arguments.
     #[serde(default)]
     pub arguments: Value,
+}
+
+fn deserialize_nullable_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// `tool.execution_complete` payload — carries the tool's actual output

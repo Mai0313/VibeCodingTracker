@@ -24,7 +24,8 @@ use crate::cli::TimeRange;
 use crate::constants::FastHashMap;
 use crate::models::{CodeAnalysis, CodeAnalysisRecord, ExtensionType};
 use crate::session::diagnostics::{
-    DatabaseAnalysisRow, DatabaseUsageRead, UsageContribution, UsageTokenContribution,
+    AnalysisFact, AnalysisMetrics, AnalysisStateSnapshot, DatabaseAnalysisRow, DatabaseUsageRead,
+    ToolFactStatus, UsageContribution, UsageTokenContribution,
 };
 use crate::session::sqlite::with_readonly_connection;
 use crate::session::state::{ParseMode, SessionParseState};
@@ -164,7 +165,7 @@ pub(crate) fn read_opencode_analysis_with_diagnostics(
 struct MessageUsage {
     model_id: String,
     usage: UsageTokenContribution,
-    cost: f64,
+    cost: Option<f64>,
     timestamp: Option<i64>,
 }
 
@@ -174,6 +175,7 @@ struct AnalysisAccum {
     date: String,
     usage: Value,
     state: SessionParseState,
+    analysis_facts: Vec<AnalysisFact>,
 }
 
 struct CollectedAnalysis {
@@ -283,7 +285,7 @@ fn collect_session_usage(conn: &Connection, time_range: TimeRange) -> Result<Dat
             time_updated,
             model_id,
             session_usage_value(input, output, reasoning, cache_read, cache_write),
-            cost,
+            Some(cost),
         ));
     }
 
@@ -436,6 +438,7 @@ fn collect_session_analysis(
                     date,
                     usage,
                     state,
+                    analysis_facts: Vec::new(),
                 },
             );
         }
@@ -446,7 +449,7 @@ fn collect_session_analysis(
     {
         let sql = match cutoff_ms {
             Some(_) => {
-                "SELECT part.session_id, part.data \
+                "SELECT part.id, part.session_id, part.data \
                  FROM part \
                  JOIN session ON session.id = part.session_id \
                  WHERE json_extract(part.data, '$.type') = 'tool' \
@@ -456,7 +459,7 @@ fn collect_session_analysis(
                  ORDER BY part.id"
             }
             None => {
-                "SELECT session_id, data \
+                "SELECT id, session_id, data \
                  FROM part \
                  WHERE json_extract(data, '$.type') = 'tool' \
                  ORDER BY id"
@@ -469,8 +472,9 @@ fn collect_session_analysis(
         };
 
         while let Some(row) = rows.next()? {
-            let session_id = row.get::<_, String>(0)?;
-            let data_text = row.get::<_, String>(1)?;
+            let part_id = row.get::<_, String>(0)?;
+            let session_id = row.get::<_, String>(1)?;
+            let data_text = row.get::<_, String>(2)?;
             let Some(accum) = sessions.get_mut(&session_id) else {
                 continue;
             };
@@ -479,7 +483,7 @@ fn collect_session_analysis(
                 continue;
             };
             if let Some("tool") = data.get("type").and_then(|v| v.as_str())
-                && apply_tool_part(&mut accum.state, &data) == ToolPartOutcome::Unsupported
+                && apply_tool_part_with_fact(accum, &part_id, &data) == ToolPartOutcome::Unsupported
             {
                 failed_tool_parts += 1;
             }
@@ -499,6 +503,7 @@ fn collect_session_analysis(
             source_id: id,
             date: accum.date,
             analysis: wrap_record(record, &user, &machine),
+            analysis_facts: accum.analysis_facts,
         });
     }
 
@@ -575,6 +580,7 @@ fn collect_message_analysis(
                     date,
                     usage: message.usage.into_value(),
                     state,
+                    analysis_facts: Vec::new(),
                 },
             );
         }
@@ -584,7 +590,7 @@ fn collect_message_analysis(
     {
         let sql = match cutoff_ms {
             Some(_) => {
-                "SELECT part.message_id, part.data \
+                "SELECT part.id, part.message_id, part.data \
                  FROM part \
                  JOIN message ON message.id = part.message_id \
                  JOIN session ON session.id = part.session_id \
@@ -598,7 +604,7 @@ fn collect_message_analysis(
                  ORDER BY part.id"
             }
             None => {
-                "SELECT part.message_id, part.data \
+                "SELECT part.id, part.message_id, part.data \
                  FROM part \
                  JOIN message ON message.id = part.message_id \
                  WHERE json_extract(message.data, '$.role') = 'assistant' \
@@ -613,8 +619,9 @@ fn collect_message_analysis(
         };
 
         while let Some(row) = rows.next()? {
-            let message_id = row.get::<_, String>(0)?;
-            let data_text = row.get::<_, String>(1)?;
+            let part_id = row.get::<_, String>(0)?;
+            let message_id = row.get::<_, String>(1)?;
+            let data_text = row.get::<_, String>(2)?;
             let Some(accum) = messages.get_mut(&message_id) else {
                 continue;
             };
@@ -623,7 +630,7 @@ fn collect_message_analysis(
                 continue;
             };
             if let Some("tool") = data.get("type").and_then(|v| v.as_str())
-                && apply_tool_part(&mut accum.state, &data) == ToolPartOutcome::Unsupported
+                && apply_tool_part_with_fact(accum, &part_id, &data) == ToolPartOutcome::Unsupported
             {
                 failed_tool_parts += 1;
             }
@@ -642,6 +649,7 @@ fn collect_message_analysis(
             source_id: id,
             date: accum.date,
             analysis: wrap_record(record, &user, &machine),
+            analysis_facts: accum.analysis_facts,
         });
     }
 
@@ -664,14 +672,67 @@ enum ToolPartOutcome {
     Unsupported,
 }
 
+fn apply_tool_part_with_fact(
+    accum: &mut AnalysisAccum,
+    part_id: &str,
+    data: &Value,
+) -> ToolPartOutcome {
+    let tool = data.get("tool").and_then(Value::as_str).unwrap_or("");
+    let effect_before = AnalysisStateSnapshot::capture(&accum.state);
+    let before = AnalysisMetrics::from_state(&accum.state);
+    let outcome = apply_tool_part(&mut accum.state, data);
+    if !is_tracked_tool(tool) {
+        return outcome;
+    }
+
+    let state = data.get("state");
+    let status = state
+        .and_then(|state| state.get("status"))
+        .and_then(Value::as_str);
+    let timestamp_ms = state
+        .and_then(|state| state.get("time"))
+        .and_then(|time| time.get("start"))
+        .and_then(Value::as_i64)
+        .filter(|timestamp| *timestamp > 0)
+        .or_else(|| (accum.state.last_ts > 0).then_some(accum.state.last_ts));
+    let observed_at_ms = state
+        .and_then(|state| state.get("time"))
+        .and_then(|time| time.get("end"))
+        .and_then(Value::as_i64)
+        .filter(|timestamp| *timestamp > 0)
+        .or(timestamp_ms);
+    let fact_status = match status {
+        Some("completed") if outcome == ToolPartOutcome::Normalized => ToolFactStatus::Succeeded,
+        Some("error" | "failed" | "rejected" | "cancelled" | "canceled") => ToolFactStatus::Failed,
+        Some("completed") => ToolFactStatus::Failed,
+        _ => ToolFactStatus::Pending,
+    };
+    let metrics = AnalysisMetrics::from_state(&accum.state).saturating_sub(before);
+    accum.analysis_facts.push(AnalysisFact {
+        stable_id: Some(format!("opencode-tool:{part_id}")),
+        timestamp_ms,
+        observed_at_ms,
+        source_order: accum.analysis_facts.len(),
+        model: accum.model_id.clone(),
+        status: fact_status,
+        metrics,
+        effect: (fact_status == ToolFactStatus::Succeeded)
+            .then(|| effect_before.effect_since(&accum.state, Vec::new())),
+    });
+    outcome
+}
+
 fn apply_tool_part(state: &mut SessionParseState, data: &Value) -> ToolPartOutcome {
     let tool = data.get("tool").and_then(|v| v.as_str()).unwrap_or("");
-    if !matches!(
-        tool,
-        "read" | "edit" | "write" | "bash" | "todowrite" | "apply_patch"
-    ) {
-        return ToolPartOutcome::Irrelevant;
+    if !is_tracked_tool(tool) {
+        return if is_analysis_like_tool_name(tool) && !is_ignored_tool(tool) {
+            ToolPartOutcome::Unsupported
+        } else {
+            ToolPartOutcome::Irrelevant
+        };
     }
+
+    record_tool_invocation(state, tool);
 
     let Some(st) = data.get("state").and_then(Value::as_object) else {
         return ToolPartOutcome::Unsupported;
@@ -681,7 +742,9 @@ fn apply_tool_part(state: &mut SessionParseState, data: &Value) -> ToolPartOutco
     };
     match status {
         "completed" => {}
-        "pending" | "running" | "error" => return ToolPartOutcome::Irrelevant,
+        "pending" | "running" | "error" | "failed" | "rejected" | "cancelled" | "canceled" => {
+            return ToolPartOutcome::Normalized;
+        }
         _ => return ToolPartOutcome::Unsupported,
     }
 
@@ -693,6 +756,7 @@ fn apply_tool_part(state: &mut SessionParseState, data: &Value) -> ToolPartOutco
         .unwrap_or(state.last_ts);
 
     let str_in = |key: &str| -> Option<&str> { input?.get(key)?.as_str() };
+    let invocation_counts = state.tool_counts.clone();
 
     match tool {
         "read" => {
@@ -708,7 +772,7 @@ fn apply_tool_part(state: &mut SessionParseState, data: &Value) -> ToolPartOutco
             } else {
                 // Directory listings (and empty reads) still count as a read
                 // invocation even though they contribute no file lines.
-                state.tool_counts.read += 1;
+                state.add_read_detail(path, "", ts);
             }
         }
         "edit" => {
@@ -755,7 +819,42 @@ fn apply_tool_part(state: &mut SessionParseState, data: &Value) -> ToolPartOutco
         _ => unreachable!("tracked OpenCode tool was filtered above"),
     }
 
+    state.tool_counts = invocation_counts;
     ToolPartOutcome::Normalized
+}
+
+fn is_tracked_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "read" | "edit" | "write" | "bash" | "todowrite" | "apply_patch"
+    )
+}
+
+fn record_tool_invocation(state: &mut SessionParseState, tool: &str) {
+    match tool {
+        "read" => state.tool_counts.read += 1,
+        "edit" | "apply_patch" => state.tool_counts.edit += 1,
+        "write" => state.tool_counts.write += 1,
+        "bash" => state.tool_counts.bash += 1,
+        "todowrite" => state.tool_counts.todo_write += 1,
+        _ => {}
+    }
+}
+
+fn is_ignored_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "task" | "grep" | "glob" | "webfetch" | "web_fetch" | "question"
+    )
+}
+
+fn is_analysis_like_tool_name(tool: &str) -> bool {
+    let tool = tool.to_ascii_lowercase();
+    [
+        "read", "write", "edit", "replace", "patch", "file", "shell", "command", "bash", "todo",
+    ]
+    .iter()
+    .any(|fragment| tool.contains(fragment))
 }
 
 /// Folds an OpenCode `apply_patch` tool input into file-operation counts.
@@ -941,7 +1040,7 @@ fn parse_message_usage(raw: &str) -> Option<MessageUsage> {
 
     let model_id = message_model_id(&data)?;
     let usage = parse_message_tokens(data.get("tokens")?)?;
-    let cost = data.get("cost").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let cost = data.get("cost").and_then(|v| v.as_f64());
     let timestamp = data
         .get("time")
         .and_then(|v| v.get("completed").or_else(|| v.get("created")))
@@ -1540,7 +1639,230 @@ mod tests {
         assert_eq!(result.parsed_records, 1);
         assert_eq!(result.failed_tool_parts, 2);
         assert_eq!(result.rows.len(), 1);
-        assert_eq!(result.rows[0].analysis.records[0].tool_call_counts.write, 0);
+        assert_eq!(result.rows[0].analysis.records[0].tool_call_counts.write, 2);
+        assert_eq!(result.rows[0].analysis.records[0].total_write_lines, 0);
+        assert_eq!(result.rows[0].analysis.records[0].total_unique_files, 0);
+    }
+
+    #[test]
+    fn analysis_counts_non_successful_tool_invocations_without_effects() {
+        let (_dir, db_path) = make_db();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO session (id, directory, time_updated) VALUES ('s1', '/repo', 1780757089000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES ('m1', 's1', ?1)",
+            [assistant_message("model", 0, 0, 0, 0, 0, 0.0)],
+        )
+        .unwrap();
+        for (id, status, timestamp) in [
+            ("error", "error", 1_780_757_081_001_i64),
+            ("failed", "failed", 1_780_757_081_002),
+            ("rejected", "rejected", 1_780_757_081_003),
+            ("cancelled", "cancelled", 1_780_757_081_004),
+            ("pending", "pending", 1_780_757_081_005),
+            ("running", "running", 1_780_757_081_006),
+        ] {
+            let part = json!({
+                "type": "tool",
+                "tool": "write",
+                "state": {
+                    "status": status,
+                    "time": { "start": timestamp },
+                    "input": { "filePath": format!("/repo/{id}.rs"), "content": id }
+                }
+            })
+            .to_string();
+            conn.execute(
+                "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, 'm1', 's1', ?2)",
+                rusqlite::params![id, part],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let result =
+            read_opencode_analysis_with_diagnostics(&db_path, TimeRange::All, ParseMode::Full)
+                .unwrap();
+        assert_eq!(result.failed_tool_parts, 0);
+        let record = &result.rows[0].analysis.records[0];
+        assert_eq!(record.tool_call_counts.write, 6);
+        assert_eq!(record.total_unique_files, 0);
+        assert_eq!(record.total_write_lines, 0);
+        assert!(record.write_file_details.is_empty());
+
+        let facts = &result.rows[0].analysis_facts;
+        assert_eq!(facts.len(), 6);
+        for id in ["error", "failed", "rejected", "cancelled"] {
+            let stable_id = format!("opencode-tool:{id}");
+            let fact = facts
+                .iter()
+                .find(|fact| fact.stable_id.as_deref() == Some(stable_id.as_str()))
+                .unwrap();
+            assert_eq!(fact.status, ToolFactStatus::Failed);
+            assert_eq!(fact.model, "model");
+            assert_eq!(fact.metrics.write_count, 1);
+            assert_eq!(fact.metrics.write_lines, 0);
+        }
+        for id in ["pending", "running"] {
+            let stable_id = format!("opencode-tool:{id}");
+            let fact = facts
+                .iter()
+                .find(|fact| fact.stable_id.as_deref() == Some(stable_id.as_str()))
+                .unwrap();
+            assert_eq!(fact.status, ToolFactStatus::Pending);
+            assert_eq!(fact.metrics.write_count, 1);
+            assert_eq!(fact.metrics.write_lines, 0);
+        }
+    }
+
+    #[test]
+    fn analysis_facts_use_part_identity_model_and_start_time() {
+        let (_dir, db_path) = make_db();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO session (id, directory, time_updated) VALUES ('s1', '/repo', 1780757089000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES ('m1', 's1', ?1)",
+            [assistant_message("model-a", 0, 0, 0, 0, 0, 0.0)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES ('m2', 's1', ?1)",
+            [assistant_message("model-b", 0, 0, 0, 0, 0, 0.0)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES ('read-a', 'm1', 's1', ?1)",
+            [json!({
+                "type": "tool",
+                "tool": "read",
+                "state": {
+                    "status": "completed",
+                    "time": { "start": 1_780_757_081_111_i64, "end": 1_780_757_081_222_i64 },
+                    "input": { "filePath": "/repo/a.rs" },
+                    "output": "<content>\n1: one\n2: two\n</content>"
+                }
+            })
+            .to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES ('write-b', 'm2', 's1', ?1)",
+            [json!({
+                "type": "tool",
+                "tool": "write",
+                "state": {
+                    "status": "completed",
+                    "time": { "start": 1_780_757_081_333_i64 },
+                    "input": { "filePath": "/repo/b.rs", "content": "one\ntwo\nthree" }
+                }
+            })
+            .to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let result =
+            read_opencode_analysis_with_diagnostics(&db_path, TimeRange::All, ParseMode::Full)
+                .unwrap();
+        let read = result
+            .rows
+            .iter()
+            .flat_map(|row| &row.analysis_facts)
+            .find(|fact| fact.stable_id.as_deref() == Some("opencode-tool:read-a"))
+            .unwrap();
+        assert_eq!(read.model, "model-a");
+        assert_eq!(read.timestamp_ms, Some(1_780_757_081_111));
+        assert_eq!(read.observed_at_ms, Some(1_780_757_081_222));
+        assert_eq!(read.status, ToolFactStatus::Succeeded);
+        assert_eq!(read.metrics.read_count, 1);
+        assert_eq!(read.metrics.read_lines, 2);
+
+        let write = result
+            .rows
+            .iter()
+            .flat_map(|row| &row.analysis_facts)
+            .find(|fact| fact.stable_id.as_deref() == Some("opencode-tool:write-b"))
+            .unwrap();
+        assert_eq!(write.model, "model-b");
+        assert_eq!(write.timestamp_ms, Some(1_780_757_081_333));
+        assert_eq!(write.status, ToolFactStatus::Succeeded);
+        assert_eq!(write.metrics.write_count, 1);
+        assert_eq!(write.metrics.write_lines, 3);
+    }
+
+    #[test]
+    fn completed_tool_without_start_time_uses_owning_message_time() {
+        let (_dir, db_path) = make_db();
+        let timestamp = chrono::Local::now().timestamp_millis();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO session (id, directory, time_updated) VALUES ('s1', '/repo', ?1)",
+            [timestamp],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES ('m1', 's1', ?1)",
+            [assistant_message_at("model", timestamp, 0, 0, 0, 0, 0, 0.0)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES ('write', 'm1', 's1', ?1)",
+            [json!({
+                "type": "tool",
+                "tool": "write",
+                "state": {
+                    "status": "completed",
+                    "input": { "filePath": "/repo/a.rs", "content": "one\ntwo" }
+                }
+            })
+            .to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let result =
+            read_opencode_analysis_with_diagnostics(&db_path, TimeRange::Daily, ParseMode::Full)
+                .unwrap();
+        let fact = &result.rows[0].analysis_facts[0];
+        assert_eq!(fact.timestamp_ms, Some(timestamp));
+        assert_eq!(fact.status, ToolFactStatus::Succeeded);
+        assert_eq!(fact.metrics.write_count, 1);
+        assert_eq!(fact.metrics.write_lines, 2);
+    }
+
+    #[test]
+    fn analysis_reports_unknown_analysis_tool() {
+        let (_dir, db_path) = make_db();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO session (id, directory, time_updated) VALUES ('s1', '/repo', 1780757089000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES ('m1', 's1', ?1)",
+            [assistant_message("model", 0, 0, 0, 0, 0, 0.0)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES ('p1', 'm1', 's1', ?1)",
+            [r#"{"type":"tool","tool":"future_file_mutator","state":{"status":"completed","input":{"path":"/repo/a"}}}"#],
+        )
+        .unwrap();
+        drop(conn);
+
+        let result =
+            read_opencode_analysis_with_diagnostics(&db_path, TimeRange::All, ParseMode::Full)
+                .unwrap();
+        assert_eq!(result.failed_tool_parts, 1);
     }
 
     #[test]
@@ -1779,7 +2101,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         let record = &rows[0].1.records[0];
         assert_eq!(record.tool_call_counts.read, 1);
-        assert_eq!(record.tool_call_counts.edit, 1);
+        assert_eq!(record.tool_call_counts.edit, 2);
         assert_eq!(record.tool_call_counts.bash, 1);
         assert_eq!(record.tool_call_counts.todo_write, 1);
         assert_eq!(record.total_read_lines, 2);
@@ -1845,7 +2167,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         let record = &rows[0].1.records[0];
         assert_eq!(record.tool_call_counts.edit, 1);
-        assert_eq!(record.tool_call_counts.write, 1);
+        assert_eq!(record.tool_call_counts.write, 0);
         assert_eq!(record.total_edit_lines, 2);
         assert_eq!(record.total_write_lines, 1);
     }

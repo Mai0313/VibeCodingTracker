@@ -10,22 +10,18 @@
 
 use crate::cli::TimeRange;
 use crate::config::ProvidersConfig;
-use crate::constants::{FastHashMap, capacity};
-use crate::models::{
-    CodeAnalysis, ExtensionType, PerProviderUsage, Provider, ProviderActiveDays, UsageResult,
-};
-use crate::pricing::{ModelPricingMap, calculate_cost};
+use crate::constants::FastHashMap;
+use crate::models::{ExtensionType, PerProviderUsage, Provider, ProviderActiveDays, UsageResult};
+use crate::pricing::{ModelPricingMap, calculate_base_cost, calculate_request_cost};
+use crate::session::ParseMode;
 use crate::session::cursor::{
     discover_cursor_store_dbs, load_conversation_model_snapshot, read_cursor_usage_store,
 };
-use crate::session::diagnostics::DatabaseUsageRead;
+use crate::session::diagnostics::{DatabaseUsageRead, PricingGranularity, UsageFact};
 use crate::session::hermes::read_hermes_usage_contributions;
 use crate::session::opencode::read_opencode_usage_contributions;
 use crate::session::parser::parse_session_file_as_with_diagnostics;
 use crate::session::sqlite::is_cacheable_sqlite_failure;
-use crate::session::{
-    ParseMode, parse_session_file_as, read_cursor_usage, read_hermes_usage, read_opencode_usage,
-};
 use crate::summary_cache::{
     CachedSourceSummary, CompactSourceSummary, SourceFingerprint, SummaryCacheKey, SummaryKind,
     SummaryScanCache, provider_scan_rank,
@@ -33,8 +29,8 @@ use crate::summary_cache::{
 use crate::utils::directory::{FileInfo, collect_files_with_max_depth_diagnostics};
 use crate::utils::{
     COPILOT_SESSION_MAX_DEPTH, GROK_SESSION_MAX_DEPTH, HelperPaths, TokenCounts,
-    collect_files_with_max_depth, is_claude_session_file, is_codex_session_file,
-    is_copilot_session_file, is_gemini_session_file, is_grok_session_file, resolve_paths,
+    is_claude_session_file, is_codex_session_file, is_copilot_session_file, is_gemini_session_file,
+    is_grok_session_file, resolve_paths,
 };
 use anyhow::Result;
 use rayon::prelude::*;
@@ -81,6 +77,10 @@ pub struct UsageData {
     pub provider_days: ProviderActiveDays,
     /// Provider-authoritative per-model cost (USD), summed from the source.
     pub stored_costs: StoredCosts,
+    /// Opaque request-level pricing ledger used internally by every display
+    /// mode. It is intentionally absent from JSON output.
+    #[doc(hidden)]
+    pub pricing_ledger: UsagePricingLedger,
 }
 
 /// One independently readable usage source that could not be collected.
@@ -134,7 +134,7 @@ pub struct UsageCollection {
 ///
 /// OpenCode and Hermes record their own costs. The Cursor map is retained for
 /// source compatibility, but the local Cursor estimate now carries zero stored
-/// cost and is priced by an exact LiteLLM match in the display layer. Separate
+/// cost and is priced by a strict LiteLLM match in the display layer. Separate
 /// maps prevent a colliding bare model name from cross-contaminating providers.
 #[derive(Debug, Default, Clone)]
 pub struct StoredCosts {
@@ -146,34 +146,146 @@ pub struct StoredCosts {
     pub hermes: FastHashMap<String, f64>,
 }
 
-/// Extracts token usage data from a typed `CodeAnalysis`.
+/// Opaque request-level pricing data retained alongside aggregated tokens.
 ///
-/// Reads directly from the typed `conversation_usage` map instead of walking
-/// `Value` via `.get(...)`, so no intermediate `serde_json::Value` tree is
-/// built or retained here.
-fn extract_conversation_usage_from_analysis(analysis: CodeAnalysis) -> FastHashMap<String, Value> {
-    let mut conversation_usage = FastHashMap::with_capacity(capacity::MODELS_PER_SESSION);
+/// The fields are private so provider cost basis and confidence do not become
+/// part of the public output contract.
+#[doc(hidden)]
+#[derive(Debug, Default, Clone)]
+pub struct UsagePricingLedger {
+    inner: ProviderPricingLedger,
+}
 
-    let mut merge_into = |model: String, usage: Value| {
-        conversation_usage
-            .entry(model)
-            .and_modify(|existing_usage| merge_usage_values(existing_usage, &usage))
-            .or_insert(usage);
-    };
+#[derive(Debug, Default, Clone)]
+struct ProviderPricingLedger {
+    claude: FastHashMap<String, Vec<LedgerUnit>>,
+    codex: FastHashMap<String, Vec<LedgerUnit>>,
+    copilot: FastHashMap<String, Vec<LedgerUnit>>,
+    gemini: FastHashMap<String, Vec<LedgerUnit>>,
+    grok: FastHashMap<String, Vec<LedgerUnit>>,
+    opencode: FastHashMap<String, Vec<LedgerUnit>>,
+    cursor: FastHashMap<String, Vec<LedgerUnit>>,
+    hermes: FastHashMap<String, Vec<LedgerUnit>>,
+}
 
-    for record in analysis.records {
-        for (model, usage) in record.conversation_usage {
-            merge_into(model, usage);
-        }
-        // Claude advisor-message tokens live in a separate map so the
-        // `analysis` aggregator ignores them; the `usage` path folds them in
-        // here, attributed to the advisor's own model for correct pricing.
-        for (model, usage) in record.advisor_usage {
-            merge_into(model, usage);
+#[derive(Debug, Clone)]
+struct LedgerUnit {
+    counts: TokenCounts,
+    stored_cost: Option<f64>,
+    granularity: PricingGranularity,
+    provider_pricing_modifiers: Vec<String>,
+}
+
+impl UsagePricingLedger {
+    fn provider_mut(
+        &mut self,
+        provider: ExtensionType,
+    ) -> &mut FastHashMap<String, Vec<LedgerUnit>> {
+        match provider {
+            ExtensionType::ClaudeCode => &mut self.inner.claude,
+            ExtensionType::Codex => &mut self.inner.codex,
+            ExtensionType::Copilot => &mut self.inner.copilot,
+            ExtensionType::Gemini => &mut self.inner.gemini,
+            ExtensionType::Grok => &mut self.inner.grok,
+            ExtensionType::OpenCode => &mut self.inner.opencode,
+            ExtensionType::Cursor => &mut self.inner.cursor,
+            ExtensionType::Hermes => &mut self.inner.hermes,
         }
     }
 
-    conversation_usage
+    fn provider(&self, provider: ExtensionType) -> &FastHashMap<String, Vec<LedgerUnit>> {
+        match provider {
+            ExtensionType::ClaudeCode => &self.inner.claude,
+            ExtensionType::Codex => &self.inner.codex,
+            ExtensionType::Copilot => &self.inner.copilot,
+            ExtensionType::Gemini => &self.inner.gemini,
+            ExtensionType::Grok => &self.inner.grok,
+            ExtensionType::OpenCode => &self.inner.opencode,
+            ExtensionType::Cursor => &self.inner.cursor,
+            ExtensionType::Hermes => &self.inner.hermes,
+        }
+    }
+
+    fn resolve(
+        &self,
+        provider: ExtensionType,
+        model: &str,
+        pricing_map: &ModelPricingMap,
+    ) -> Option<(f64, Option<String>)> {
+        let units = self.provider(provider).get(model)?;
+        let mut total = 0.0;
+        let mut matched_model = None;
+        for unit in units {
+            if let Some(stored) = unit.stored_cost {
+                total += stored;
+                continue;
+            }
+            let Some(result) =
+                pricing_map.get_for_cost_with_provider(model, pricing_provider_hint(provider))
+            else {
+                continue;
+            };
+            if matched_model.is_none() {
+                matched_model.clone_from(&result.matched_model);
+            }
+            let priced = match unit.granularity {
+                PricingGranularity::Request => calculate_request_cost(
+                    unit.counts.input_tokens,
+                    unit.counts.output_tokens,
+                    unit.counts.reasoning_tokens,
+                    unit.counts.cache_read,
+                    unit.counts.cache_creation_5m,
+                    unit.counts.cache_creation_1h,
+                    &result.pricing,
+                ),
+                PricingGranularity::Aggregate => calculate_base_cost(
+                    unit.counts.input_tokens,
+                    unit.counts.output_tokens,
+                    unit.counts.reasoning_tokens,
+                    unit.counts.cache_read,
+                    unit.counts.cache_creation_5m,
+                    unit.counts.cache_creation_1h,
+                    &result.pricing,
+                ),
+            };
+            let modifier =
+                unit.provider_pricing_modifiers
+                    .iter()
+                    .try_fold(1.0, |combined, modifier| {
+                        result
+                            .pricing
+                            .provider_specific_multipliers
+                            .get(modifier)
+                            .copied()
+                            .map(|value| combined * value)
+                    });
+            if let (Some(priced), Some(modifier)) = (priced, modifier) {
+                total += priced * modifier;
+            } else {
+                log::warn!(
+                    "could not resolve request-level pricing or provider modifier for {} model {}",
+                    provider,
+                    model
+                );
+            }
+            total +=
+                unit.counts.web_search_requests as f64 * result.pricing.web_search_cost_per_query;
+            if unit.counts.cache_creation_1h > 0
+                && result.pricing.cache_creation_input_token_cost_above_1hr == 0.0
+                && result
+                    .pricing
+                    .tiers
+                    .iter()
+                    .all(|tier| tier.cache_creation_input_token_cost_above_1hr == 0.0)
+            {
+                log::warn!(
+                    "model {} has 1-hour cache writes but no published 1-hour rate",
+                    model
+                );
+            }
+        }
+        Some((total, matched_model))
+    }
 }
 
 /// Aggregates token usage from all AI provider session directories.
@@ -239,174 +351,8 @@ pub fn get_usage_from_paths_with(
     time_range: TimeRange,
     providers: ProvidersConfig,
 ) -> Result<UsageData> {
-    let mut result = FastHashMap::with_capacity(capacity::MODEL_COMBINATIONS);
-    let mut per_provider = PerProviderUsage::default();
-    let mut stored_costs = StoredCosts::default();
-
-    let mut claude_dates: HashSet<String> = HashSet::new();
-    let mut codex_dates: HashSet<String> = HashSet::new();
-    let mut copilot_dates: HashSet<String> = HashSet::new();
-    let mut gemini_dates: HashSet<String> = HashSet::new();
-    let mut grok_dates: HashSet<String> = HashSet::new();
-    let mut opencode_dates: HashSet<String> = HashSet::new();
-    let mut cursor_dates: HashSet<String> = HashSet::new();
-    let mut hermes_dates: HashSet<String> = HashSet::new();
-
-    if providers.claude && paths.claude_session_dir.exists() {
-        // Walks the projects tree recursively, so top-level `<session>.jsonl` logs
-        // and `<session>/subagents/agent-*.jsonl` logs are both collected here.
-        process_usage_directory(
-            &paths.claude_session_dir,
-            ExtensionType::ClaudeCode,
-            &mut result,
-            &mut per_provider.claude,
-            &mut claude_dates,
-            is_claude_session_file,
-            time_range,
-            None,
-        )?;
-    }
-
-    if providers.codex && paths.codex_session_dir.exists() {
-        process_usage_directory(
-            &paths.codex_session_dir,
-            ExtensionType::Codex,
-            &mut result,
-            &mut per_provider.codex,
-            &mut codex_dates,
-            is_codex_session_file,
-            time_range,
-            None,
-        )?;
-    }
-
-    if providers.copilot && paths.copilot_session_dir.exists() {
-        // `events.jsonl` always lives exactly two levels under
-        // `session-state/`. Bounding the walk here keeps per-session
-        // snapshot subtrees (`rewind-snapshots/backups/*`, `files/*`, …)
-        // out of the `WalkDir` iteration entirely, so the scan cost stays
-        // linear in the number of sessions rather than total artifacts.
-        process_usage_directory(
-            &paths.copilot_session_dir,
-            ExtensionType::Copilot,
-            &mut result,
-            &mut per_provider.copilot,
-            &mut copilot_dates,
-            is_copilot_session_file,
-            time_range,
-            Some(COPILOT_SESSION_MAX_DEPTH),
-        )?;
-    }
-
-    if providers.gemini && paths.gemini_session_dir.exists() {
-        process_usage_directory(
-            &paths.gemini_session_dir,
-            ExtensionType::Gemini,
-            &mut result,
-            &mut per_provider.gemini,
-            &mut gemini_dates,
-            is_gemini_session_file,
-            time_range,
-            None,
-        )?;
-    }
-
-    if providers.grok && paths.grok_session_dir.exists() {
-        process_usage_directory(
-            &paths.grok_session_dir,
-            ExtensionType::Grok,
-            &mut result,
-            &mut per_provider.grok,
-            &mut grok_dates,
-            is_grok_session_file,
-            time_range,
-            Some(GROK_SESSION_MAX_DEPTH),
-        )?;
-    }
-
-    // OpenCode lives in a single SQLite database rather than a session
-    // directory, so it is read directly instead of walked.
-    if providers.opencode
-        && paths.opencode_db.exists()
-        && let Err(err) = process_opencode_usage(
-            &paths.opencode_db,
-            &mut result,
-            &mut per_provider.opencode,
-            &mut stored_costs.opencode,
-            &mut opencode_dates,
-            time_range,
-        )
-    {
-        log::warn!(
-            "failed to read OpenCode DB {}: {err}",
-            paths.opencode_db.display()
-        );
-    }
-
-    // Cursor's usage is a local estimate from its chat stores (read directly like
-    // OpenCode, not a walked session directory), so it is only attempted when the
-    // chat stores are present — matching the analysis path.
-    if providers.cursor
-        && paths.cursor_chats_dir.exists()
-        && let Err(err) = process_cursor_usage(
-            &paths.cursor_chats_dir,
-            &paths.cursor_tracking_db,
-            &mut result,
-            &mut per_provider.cursor,
-            &mut stored_costs.cursor,
-            &mut cursor_dates,
-            time_range,
-        )
-    {
-        log::warn!("failed to read Cursor usage: {err}");
-    }
-
-    // Hermes, like OpenCode, is a single SQLite database read directly.
-    if providers.hermes
-        && paths.hermes_db.exists()
-        && let Err(err) = process_hermes_usage(
-            &paths.hermes_db,
-            &mut result,
-            &mut per_provider.hermes,
-            &mut stored_costs.hermes,
-            &mut hermes_dates,
-            time_range,
-        )
-    {
-        log::warn!(
-            "failed to read Hermes DB {}: {err}",
-            paths.hermes_db.display()
-        );
-    }
-
-    let mut all_dates: HashSet<&String> = HashSet::new();
-    all_dates.extend(claude_dates.iter());
-    all_dates.extend(codex_dates.iter());
-    all_dates.extend(copilot_dates.iter());
-    all_dates.extend(gemini_dates.iter());
-    all_dates.extend(grok_dates.iter());
-    all_dates.extend(opencode_dates.iter());
-    all_dates.extend(cursor_dates.iter());
-    all_dates.extend(hermes_dates.iter());
-
-    let provider_days = ProviderActiveDays {
-        claude: claude_dates.len(),
-        codex: codex_dates.len(),
-        copilot: copilot_dates.len(),
-        gemini: gemini_dates.len(),
-        grok: grok_dates.len(),
-        opencode: opencode_dates.len(),
-        cursor: cursor_dates.len(),
-        hermes: hermes_dates.len(),
-        total: all_dates.len(),
-    };
-
-    Ok(UsageData {
-        models: result,
-        per_provider,
-        provider_days,
-        stored_costs,
-    })
+    let mut cache = SummaryScanCache::new();
+    Ok(get_usage_from_paths_with_cache(paths, time_range, providers, &mut cache)?.data)
 }
 
 /// Diagnostics-aware usage scan rooted at the current user's provider paths.
@@ -449,7 +395,7 @@ fn get_usage_from_paths_with_cache_inner(
     cache: &mut SummaryScanCache,
 ) -> Result<UsageCollection> {
     cache.begin_scan();
-    let mut accumulator = UsageAccumulator::default();
+    let mut accumulator = UsageAccumulator::new(time_range);
     let mut diagnostics = UsageCollectionDiagnostics::default();
     let mut seen = HashSet::new();
 
@@ -529,7 +475,7 @@ fn get_usage_from_paths_with_cache_inner(
             &mut seen,
             &mut accumulator,
             &mut diagnostics,
-            || read_opencode_usage_contributions(&paths.opencode_db, time_range),
+            || read_opencode_usage_contributions(&paths.opencode_db, TimeRange::All),
         );
     }
     if providers.cursor && paths.cursor_chats_dir.exists() {
@@ -553,7 +499,7 @@ fn get_usage_from_paths_with_cache_inner(
             &mut seen,
             &mut accumulator,
             &mut diagnostics,
-            || read_hermes_usage_contributions(&paths.hermes_db, time_range),
+            || read_hermes_usage_contributions(&paths.hermes_db, TimeRange::All),
         );
     }
 
@@ -585,7 +531,8 @@ fn scan_usage_files<F>(
 where
     F: Copy + Fn(&Path) -> bool + Sync + Send,
 {
-    let discovery = collect_files_with_max_depth_diagnostics(dir, filter, time_range, max_depth);
+    let discovery =
+        collect_files_with_max_depth_diagnostics(dir, filter, TimeRange::All, max_depth);
     if !discovery.failures.is_empty() {
         cache.preserve_provider_keys(seen, SummaryKind::File, provider);
     }
@@ -682,7 +629,7 @@ fn load_file_summary(file: &FileInfo, provider: ExtensionType) -> Result<LoadedS
     }
     let partial = parsed.diagnostics.partial_failure_count();
     Ok(LoadedSummary {
-        summary: CompactSourceSummary::from_file(parsed.analysis, file.modified_date.clone(), emit),
+        summary: CompactSourceSummary::from_parsed(parsed, emit),
         parsed: true,
         failure: (partial > 0)
             .then(|| format!("skipped {partial} malformed or unsupported analyzer records")),
@@ -729,7 +676,7 @@ fn scan_usage_database<F>(
             let failed = read.failed_records();
             let mut summary = CompactSourceSummary::default();
             for contribution in read.rows {
-                summary.add_usage_contribution(contribution);
+                summary.add_usage_contribution(contribution, provider);
             }
             let loaded = LoadedSummary {
                 summary,
@@ -840,13 +787,13 @@ fn scan_cursor_usage_database(
         }
 
         cache.record_parse();
-        match read_cursor_usage_store(&store, &conv_models, time_range) {
+        match read_cursor_usage_store(&store, &conv_models, TimeRange::All) {
             Ok(read) => {
                 let complete_failure = read.expected_records > 0 && read.parsed_records == 0;
                 let failed = read.failed_records();
                 let mut summary = CompactSourceSummary::default();
                 for contribution in read.rows {
-                    summary.add_usage_contribution(contribution);
+                    summary.add_usage_contribution(contribution, provider);
                 }
                 let loaded = LoadedSummary {
                     summary,
@@ -910,7 +857,7 @@ fn fold_cached_usage(
 ) {
     if cached.parsed {
         diagnostics.parsed += 1;
-        accumulator.add(provider, &cached.summary);
+        accumulator.add(provider, source, &cached.summary);
     }
     if let Some(error) = &cached.failure {
         diagnostics.failures.push(UsageCollectionFailure {
@@ -930,7 +877,7 @@ fn fold_loaded_usage(
 ) {
     if loaded.parsed {
         diagnostics.parsed += 1;
-        accumulator.add(provider, &loaded.summary);
+        accumulator.add(provider, source, &loaded.summary);
     }
     if let Some(error) = &loaded.failure {
         diagnostics.failures.push(UsageCollectionFailure {
@@ -941,324 +888,250 @@ fn fold_loaded_usage(
     }
 }
 
-#[derive(Default)]
 struct UsageAccumulator {
-    models: UsageResult,
-    per_provider: PerProviderUsage,
-    stored_costs: StoredCosts,
-    claude_dates: HashSet<String>,
-    codex_dates: HashSet<String>,
-    copilot_dates: HashSet<String>,
-    gemini_dates: HashSet<String>,
-    grok_dates: HashSet<String>,
-    opencode_dates: HashSet<String>,
-    cursor_dates: HashSet<String>,
-    hermes_dates: HashSet<String>,
+    cutoff: Option<String>,
+    facts: Vec<SourcedUsageFact>,
+}
+
+#[derive(Clone)]
+struct SourcedUsageFact {
+    provider: ExtensionType,
+    source: PathBuf,
+    fact: UsageFact,
+}
+
+#[derive(Default)]
+struct ProviderDateSets {
+    claude: HashSet<String>,
+    codex: HashSet<String>,
+    copilot: HashSet<String>,
+    gemini: HashSet<String>,
+    grok: HashSet<String>,
+    opencode: HashSet<String>,
+    cursor: HashSet<String>,
+    hermes: HashSet<String>,
+}
+
+impl ProviderDateSets {
+    fn get_mut(&mut self, provider: ExtensionType) -> &mut HashSet<String> {
+        match provider {
+            ExtensionType::ClaudeCode => &mut self.claude,
+            ExtensionType::Codex => &mut self.codex,
+            ExtensionType::Copilot => &mut self.copilot,
+            ExtensionType::Gemini => &mut self.gemini,
+            ExtensionType::Grok => &mut self.grok,
+            ExtensionType::OpenCode => &mut self.opencode,
+            ExtensionType::Cursor => &mut self.cursor,
+            ExtensionType::Hermes => &mut self.hermes,
+        }
+    }
 }
 
 impl UsageAccumulator {
-    fn add(&mut self, provider: ExtensionType, summary: &CompactSourceSummary) {
-        let provider_result = match provider {
-            ExtensionType::ClaudeCode => &mut self.per_provider.claude,
-            ExtensionType::Codex => &mut self.per_provider.codex,
-            ExtensionType::Copilot => &mut self.per_provider.copilot,
-            ExtensionType::Gemini => &mut self.per_provider.gemini,
-            ExtensionType::Grok => &mut self.per_provider.grok,
-            ExtensionType::OpenCode => &mut self.per_provider.opencode,
-            ExtensionType::Cursor => &mut self.per_provider.cursor,
-            ExtensionType::Hermes => &mut self.per_provider.hermes,
-        };
-        for (model, usage) in &summary.usage {
-            provider_result
-                .entry(model.clone())
-                .and_modify(|existing| merge_usage_values(existing, usage))
-                .or_insert_with(|| usage.clone());
-            self.models
-                .entry(model.clone())
-                .and_modify(|existing| merge_usage_values(existing, usage))
-                .or_insert_with(|| usage.clone());
+    fn new(time_range: TimeRange) -> Self {
+        Self {
+            cutoff: time_range
+                .cutoff_date()
+                .map(|date| date.format("%Y-%m-%d").to_string()),
+            facts: Vec::new(),
         }
-        for (model, tokens) in &summary.database_usage {
-            let usage = tokens.into_value();
-            provider_result
-                .entry(model.clone())
-                .and_modify(|existing| merge_usage_values(existing, &usage))
-                .or_insert_with(|| usage.clone());
-            self.models
-                .entry(model.clone())
-                .and_modify(|existing| merge_usage_values(existing, &usage))
-                .or_insert(usage);
-        }
+    }
 
-        let stored = match provider {
-            ExtensionType::OpenCode => Some(&mut self.stored_costs.opencode),
-            ExtensionType::Cursor => Some(&mut self.stored_costs.cursor),
-            ExtensionType::Hermes => Some(&mut self.stored_costs.hermes),
-            _ => None,
-        };
-        if let Some(stored) = stored {
-            for (model, cost) in &summary.stored_costs {
-                *stored.entry(model.clone()).or_insert(0.0) += cost;
-            }
-        }
-
-        let dates = match provider {
-            ExtensionType::ClaudeCode => &mut self.claude_dates,
-            ExtensionType::Codex => &mut self.codex_dates,
-            ExtensionType::Copilot => &mut self.copilot_dates,
-            ExtensionType::Gemini => &mut self.gemini_dates,
-            ExtensionType::Grok => &mut self.grok_dates,
-            ExtensionType::OpenCode => &mut self.opencode_dates,
-            ExtensionType::Cursor => &mut self.cursor_dates,
-            ExtensionType::Hermes => &mut self.hermes_dates,
-        };
-        dates.extend(summary.usage_dates.iter().cloned());
+    fn add(&mut self, provider: ExtensionType, source: &Path, summary: &CompactSourceSummary) {
+        self.facts.extend(
+            summary
+                .usage_facts
+                .iter()
+                .cloned()
+                .map(|fact| SourcedUsageFact {
+                    provider,
+                    source: source.to_path_buf(),
+                    fact,
+                }),
+        );
     }
 
     fn finish(self) -> UsageData {
+        let mut models = UsageResult::default();
+        let mut per_provider = PerProviderUsage::default();
+        let mut stored_costs = StoredCosts::default();
+        let mut pricing_ledger = UsagePricingLedger::default();
+        let mut dates = ProviderDateSets::default();
+
+        for sourced in reduce_usage_facts(self.facts) {
+            let date = sourced.fact.timestamp_ms.and_then(local_date_from_millis);
+            let included = match (&self.cutoff, &date) {
+                (None, _) => true,
+                (Some(cutoff), Some(date)) => date >= cutoff,
+                (Some(_), None) => false,
+            };
+            if sourced.fact.timestamp_ms.is_none() {
+                log::warn!(
+                    "{} usage fact from {} has no event timestamp{}",
+                    sourced.provider,
+                    sourced.source.display(),
+                    if self.cutoff.is_some() {
+                        " and was excluded from the selected time range"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            if !included {
+                continue;
+            }
+
+            let provider_result = provider_usage_mut(&mut per_provider, sourced.provider);
+            let provider_ledger = pricing_ledger.provider_mut(sourced.provider);
+            let mut active = false;
+            for unit in sourced.fact.units {
+                let usage = unit.usage.as_ref().clone();
+                merge_model_usage(provider_result, unit.model.clone(), usage.clone());
+                merge_model_usage(&mut models, unit.model.clone(), usage);
+                provider_ledger
+                    .entry(unit.model.clone())
+                    .or_default()
+                    .push(LedgerUnit {
+                        counts: unit.counts,
+                        stored_cost: unit.stored_cost,
+                        granularity: unit.granularity,
+                        provider_pricing_modifiers: unit.provider_pricing_modifiers,
+                    });
+                if let Some(cost) = unit.stored_cost
+                    && let Some(stored) =
+                        provider_stored_costs_mut(&mut stored_costs, sourced.provider)
+                {
+                    *stored.entry(unit.model).or_insert(0.0) += cost;
+                }
+                active |= token_counts_have_activity(&unit.counts)
+                    || unit.stored_cost.is_some_and(|cost| cost != 0.0);
+            }
+            if active && let Some(date) = date {
+                dates.get_mut(sourced.provider).insert(date);
+            }
+        }
+
         let mut all_dates = HashSet::new();
-        all_dates.extend(self.claude_dates.iter().cloned());
-        all_dates.extend(self.codex_dates.iter().cloned());
-        all_dates.extend(self.copilot_dates.iter().cloned());
-        all_dates.extend(self.gemini_dates.iter().cloned());
-        all_dates.extend(self.grok_dates.iter().cloned());
-        all_dates.extend(self.opencode_dates.iter().cloned());
-        all_dates.extend(self.cursor_dates.iter().cloned());
-        all_dates.extend(self.hermes_dates.iter().cloned());
+        all_dates.extend(dates.claude.iter().cloned());
+        all_dates.extend(dates.codex.iter().cloned());
+        all_dates.extend(dates.copilot.iter().cloned());
+        all_dates.extend(dates.gemini.iter().cloned());
+        all_dates.extend(dates.grok.iter().cloned());
+        all_dates.extend(dates.opencode.iter().cloned());
+        all_dates.extend(dates.cursor.iter().cloned());
+        all_dates.extend(dates.hermes.iter().cloned());
         UsageData {
-            models: self.models,
-            per_provider: self.per_provider,
+            models,
+            per_provider,
             provider_days: ProviderActiveDays {
-                claude: self.claude_dates.len(),
-                codex: self.codex_dates.len(),
-                copilot: self.copilot_dates.len(),
-                gemini: self.gemini_dates.len(),
-                grok: self.grok_dates.len(),
-                opencode: self.opencode_dates.len(),
-                cursor: self.cursor_dates.len(),
-                hermes: self.hermes_dates.len(),
+                claude: dates.claude.len(),
+                codex: dates.codex.len(),
+                copilot: dates.copilot.len(),
+                gemini: dates.gemini.len(),
+                grok: dates.grok.len(),
+                opencode: dates.opencode.len(),
+                cursor: dates.cursor.len(),
+                hermes: dates.hermes.len(),
                 total: all_dates.len(),
             },
-            stored_costs: self.stored_costs,
+            stored_costs,
+            pricing_ledger,
         }
     }
 }
 
-/// Walks one provider directory and merges its usage into both result maps.
-///
-/// Files matching `filter_fn` (and within `max_depth`, when set) are parsed in
-/// parallel with the provider fixed to `provider` — never re-detected from
-/// contents — and each session's per-model tokens are merged into both
-/// `global_result` (cross-provider view) and `provider_result` (source-scoped
-/// view). Every contributing session's modified date is inserted into
-/// `unique_dates` for the active-day count. A file that fails to parse logs a
-/// warning and is skipped.
-///
-/// # Errors
-///
-/// Returns an error only if the candidate-file collector returns one. The
-/// current collector skips traversal and metadata errors, and per-file parse
-/// failures are logged and skipped rather than propagated.
-#[allow(clippy::too_many_arguments)] // per-provider helper; struct-wrapping the args would hurt readability
-fn process_usage_directory<P, F>(
-    dir: P,
+fn provider_usage_mut(usage: &mut PerProviderUsage, provider: ExtensionType) -> &mut UsageResult {
+    match provider {
+        ExtensionType::ClaudeCode => &mut usage.claude,
+        ExtensionType::Codex => &mut usage.codex,
+        ExtensionType::Copilot => &mut usage.copilot,
+        ExtensionType::Gemini => &mut usage.gemini,
+        ExtensionType::Grok => &mut usage.grok,
+        ExtensionType::OpenCode => &mut usage.opencode,
+        ExtensionType::Cursor => &mut usage.cursor,
+        ExtensionType::Hermes => &mut usage.hermes,
+    }
+}
+
+fn merge_model_usage(result: &mut UsageResult, model: String, usage: Value) {
+    result
+        .entry(model)
+        .and_modify(|existing| merge_usage_values(existing, &usage))
+        .or_insert(usage);
+}
+
+fn provider_stored_costs_mut(
+    costs: &mut StoredCosts,
     provider: ExtensionType,
-    global_result: &mut UsageResult,
-    provider_result: &mut UsageResult,
-    unique_dates: &mut HashSet<String>,
-    filter_fn: F,
-    time_range: TimeRange,
-    max_depth: Option<usize>,
-) -> Result<()>
-where
-    P: AsRef<Path>,
-    F: Copy + Fn(&Path) -> bool + Sync + Send,
-{
-    let dir = dir.as_ref();
-    let files = collect_files_with_max_depth(dir, filter_fn, time_range, max_depth)?;
-
-    // Parse each file directly in `UsageOnly` mode, extract the small
-    // per-model usage map, then drop the analysis. The provider is fixed by
-    // the source directory — we do not re-detect from file contents, which
-    // would mis-classify Claude sessions whose first line is a metadata
-    // sentinel (`permission-mode`, `file-history-snapshot`) and silently drop
-    // their usage. We also deliberately bypass the global file cache here:
-    // the `usage` path never needs the heavy `write_file_details` /
-    // `edit_file_details` payloads, so caching the full analysis would waste
-    // the memory win from `UsageOnly`.
-    let file_results: Vec<(String, FastHashMap<String, Value>)> = files
-        .into_par_iter()
-        .filter_map(|file_info| {
-            match parse_session_file_as(&file_info.path, provider, ParseMode::UsageOnly) {
-                Ok(analysis) => {
-                    let conversation_usage = extract_conversation_usage_from_analysis(analysis);
-                    Some((file_info.modified_date, conversation_usage))
-                }
-                Err(e) => {
-                    log::warn!("failed to analyze {}: {e}", file_info.path.display());
-                    None
-                }
-            }
-        })
-        .collect();
-
-    // Merge parallel results sequentially (this part is fast). Every
-    // per-model usage value is merged into *both* maps:
-    //   - `global_result` keeps the cross-provider view used by the main
-    //     per-model table,
-    //   - `provider_result` keeps the same tokens scoped to this provider
-    //     so the summary footer can attribute them to the right source
-    //     directory without having to guess from the model name.
-    for (date, conversation_usage) in file_results {
-        if usage_map_has_activity(&conversation_usage, 0.0) {
-            unique_dates.insert(date);
-        }
-
-        for (model, usage_value) in conversation_usage {
-            provider_result
-                .entry(model.clone())
-                .and_modify(|existing| merge_usage_values(existing, &usage_value))
-                .or_insert_with(|| usage_value.clone());
-
-            global_result
-                .entry(model)
-                .and_modify(|existing| merge_usage_values(existing, &usage_value))
-                .or_insert(usage_value);
-        }
-    }
-
-    Ok(())
-}
-
-/// Reads OpenCode's SQLite database and merges its per-model usage into both
-/// the global and OpenCode-scoped maps.
-///
-/// Mirrors the tail of [`process_usage_directory`] but sources sessions from
-/// the database (via [`read_opencode_usage`]) instead of a directory walk. Each
-/// row's date comes from the assistant message timestamp (falling back to
-/// `session.time_updated` on legacy schemas) and is recorded in `unique_dates`
-/// for the active-day count.
-///
-/// # Errors
-///
-/// Returns an error if the database cannot be opened or queried.
-fn process_opencode_usage(
-    db_path: &Path,
-    global_result: &mut UsageResult,
-    provider_result: &mut UsageResult,
-    stored_costs: &mut FastHashMap<String, f64>,
-    unique_dates: &mut HashSet<String>,
-    time_range: TimeRange,
-) -> Result<()> {
-    let sessions = read_opencode_usage(db_path, time_range)?;
-    fold_stored_cost_sessions(
-        sessions,
-        global_result,
-        provider_result,
-        stored_costs,
-        unique_dates,
-    );
-    Ok(())
-}
-
-/// Reads Cursor's per-model usage (a local estimate from the chat stores) and
-/// merges it into both the global and Cursor-scoped maps.
-///
-/// Mirrors [`process_opencode_usage`]: the estimate carries its own per-model
-/// tuple shape as stored-cost readers. Its zero stored cost lets the display
-/// layer accept only an exact LiteLLM match rather than a fuzzy price guess.
-fn process_cursor_usage(
-    chats_dir: &Path,
-    tracking_db: &Path,
-    global_result: &mut UsageResult,
-    provider_result: &mut UsageResult,
-    stored_costs: &mut FastHashMap<String, f64>,
-    unique_dates: &mut HashSet<String>,
-    time_range: TimeRange,
-) -> Result<()> {
-    let sessions = read_cursor_usage(chats_dir, tracking_db, time_range)?;
-    fold_stored_cost_sessions(
-        sessions,
-        global_result,
-        provider_result,
-        stored_costs,
-        unique_dates,
-    );
-    Ok(())
-}
-
-/// Reads Hermes's per-model usage from its SQLite database and merges it into
-/// both the global and Hermes-scoped maps.
-///
-/// Mirrors [`process_opencode_usage`]: Hermes stores its own per-model cost, so
-/// it uses the same stored-cost path rather than a fuzzy price guess.
-///
-/// # Errors
-///
-/// Returns an error if the database cannot be opened or queried.
-fn process_hermes_usage(
-    db_path: &Path,
-    global_result: &mut UsageResult,
-    provider_result: &mut UsageResult,
-    stored_costs: &mut FastHashMap<String, f64>,
-    unique_dates: &mut HashSet<String>,
-    time_range: TimeRange,
-) -> Result<()> {
-    let sessions = read_hermes_usage(db_path, time_range)?;
-    fold_stored_cost_sessions(
-        sessions,
-        global_result,
-        provider_result,
-        stored_costs,
-        unique_dates,
-    );
-    Ok(())
-}
-
-/// Folds `(date, analysis, cost)` rows from a stored-cost provider (OpenCode /
-/// Cursor) into the global + provider-scoped maps and the stored-cost table.
-fn fold_stored_cost_sessions(
-    sessions: Vec<(String, CodeAnalysis, f64)>,
-    global_result: &mut UsageResult,
-    provider_result: &mut UsageResult,
-    stored_costs: &mut FastHashMap<String, f64>,
-    unique_dates: &mut HashSet<String>,
-) {
-    for (date, analysis, session_cost) in sessions {
-        let conversation_usage = extract_conversation_usage_from_analysis(analysis);
-        if usage_map_has_activity(&conversation_usage, session_cost) {
-            unique_dates.insert(date);
-        }
-        for (model, usage_value) in conversation_usage {
-            *stored_costs.entry(model.clone()).or_insert(0.0) += session_cost;
-
-            provider_result
-                .entry(model.clone())
-                .and_modify(|existing| merge_usage_values(existing, &usage_value))
-                .or_insert_with(|| usage_value.clone());
-
-            global_result
-                .entry(model)
-                .and_modify(|existing| merge_usage_values(existing, &usage_value))
-                .or_insert(usage_value);
-        }
+) -> Option<&mut FastHashMap<String, f64>> {
+    match provider {
+        ExtensionType::OpenCode => Some(&mut costs.opencode),
+        ExtensionType::Cursor => Some(&mut costs.cursor),
+        ExtensionType::Hermes => Some(&mut costs.hermes),
+        _ => None,
     }
 }
 
-fn usage_map_has_activity(usage: &FastHashMap<String, Value>, stored_cost: f64) -> bool {
-    stored_cost != 0.0
-        || usage.values().any(|value| {
-            let counts = crate::utils::extract_token_counts(value);
-            counts.total != 0
-                || counts.input_tokens != 0
-                || counts.output_tokens != 0
-                || counts.reasoning_tokens != 0
-                || counts.cache_read != 0
-                || counts.cache_creation != 0
-                || counts.cache_creation_5m != 0
-                || counts.cache_creation_1h != 0
-                || counts.web_search_requests != 0
-        })
+fn local_date_from_millis(timestamp_ms: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp_millis(timestamp_ms).map(|date_time| {
+        date_time
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d")
+            .to_string()
+    })
+}
+
+fn token_counts_have_activity(counts: &TokenCounts) -> bool {
+    counts.total != 0
+        || counts.input_tokens != 0
+        || counts.output_tokens != 0
+        || counts.reasoning_tokens != 0
+        || counts.cache_read != 0
+        || counts.cache_creation != 0
+        || counts.web_search_requests != 0
+}
+
+fn reduce_usage_facts(facts: Vec<SourcedUsageFact>) -> Vec<SourcedUsageFact> {
+    let mut anonymous = Vec::new();
+    let mut stable: FastHashMap<String, Vec<SourcedUsageFact>> = FastHashMap::default();
+    for sourced in facts {
+        if let Some(id) = &sourced.fact.stable_id {
+            stable
+                .entry(format!("{}\0{id}", sourced.provider))
+                .or_default()
+                .push(sourced);
+        } else {
+            anonymous.push(sourced);
+        }
+    }
+
+    for mut group in stable.into_values() {
+        let canonical_timestamp = group
+            .iter()
+            .filter_map(|sourced| sourced.fact.timestamp_ms)
+            .min();
+        group.sort_unstable_by(|left, right| {
+            left.fact
+                .observed_at_ms
+                .unwrap_or_default()
+                .cmp(&right.fact.observed_at_ms.unwrap_or_default())
+                .then_with(|| left.source.cmp(&right.source))
+                .then_with(|| left.fact.source_order.cmp(&right.fact.source_order))
+        });
+        if let Some(mut winner) = group.pop() {
+            winner.fact.timestamp_ms = canonical_timestamp;
+            anonymous.push(winner);
+        }
+    }
+
+    anonymous.sort_unstable_by(|left, right| {
+        provider_scan_rank(left.provider)
+            .cmp(&provider_scan_rank(right.provider))
+            .then_with(|| left.fact.timestamp_ms.cmp(&right.fact.timestamp_ms))
+            .then_with(|| left.source.cmp(&right.source))
+            .then_with(|| left.fact.source_order.cmp(&right.fact.source_order))
+    });
+    anonymous
 }
 
 /// How a model's USD cost is resolved.
@@ -1267,38 +1140,44 @@ fn usage_map_has_activity(usage: &FastHashMap<String, Value>, stored_cost: f64) 
 /// resolver branches on which one applies.
 #[derive(Debug, Clone, Copy)]
 pub enum CostSource {
-    /// File-based providers: the full LiteLLM lookup (exact → normalized →
-    /// substring → fuzzy).
+    /// File-based providers: strict monetary LiteLLM lookup.
     Litellm,
-    /// OpenCode: an **exact** LiteLLM match prices from tokens, otherwise the
-    /// stored assistant-message cost is used verbatim. No fuzzy guessing, so a
-    /// novel model like `deepseek-v4-pro` reports OpenCode's own cost instead of
-    /// being priced against a loosely-similar name.
-    OpenCodeStored(f64),
+    /// OpenCode's stored assistant-message cost. `Some(0.0)` is authoritative;
+    /// `None` permits a strict LiteLLM fallback.
+    OpenCodeStored(Option<f64>),
     /// Caller-supplied Cursor cost used verbatim. Retained for source
     /// compatibility; VCT's local Cursor reader now returns zero stored cost
-    /// and its display path accepts only exact LiteLLM matches.
-    CursorStored(f64),
-    /// Hermes: same basis as [`OpenCodeStored`] — an **exact** LiteLLM match
-    /// prices from tokens, otherwise Hermes's own stored cost is used. Hermes
-    /// often bills novel models LiteLLM can't price, so its own number is the
-    /// safest fallback; the map is kept separate so a colliding bare model name
-    /// can't cross-contaminate another provider's cost.
-    HermesStored(f64),
+    /// and its display path accepts only strict LiteLLM matches.
+    CursorStored(Option<f64>),
+    /// Hermes stored actual, included, or estimated cost. Missing data permits
+    /// a strict LiteLLM fallback.
+    HermesStored(Option<f64>),
 }
 
-/// Resolves the USD cost (and optional matched-model annotation) for one model.
+/// Resolves the USD cost for aggregate model counts.
 ///
-/// Returns `(cost_usd, matched_model)` where `matched_model` is `Some` only
-/// when a non-exact LiteLLM key was used (for display annotation).
+/// Aggregate counts do not preserve request boundaries, so only base rates are
+/// applied. Range-only pricing remains unresolved. Returns `(cost_usd,
+/// matched_model)` where `matched_model` is `Some` only when a non-exact
+/// LiteLLM key was used.
 pub fn resolve_model_cost(
     model: &str,
     counts: &TokenCounts,
     pricing_map: &ModelPricingMap,
     source: CostSource,
 ) -> (f64, Option<String>) {
+    resolve_model_cost_with_provider_hint(model, counts, pricing_map, source, None)
+}
+
+fn resolve_model_cost_with_provider_hint(
+    model: &str,
+    counts: &TokenCounts,
+    pricing_map: &ModelPricingMap,
+    source: CostSource,
+    provider_hint: Option<&str>,
+) -> (f64, Option<String>) {
     let priced = |pricing: &crate::pricing::ModelPricing| {
-        let token_cost = calculate_cost(
+        let token_cost = calculate_base_cost(
             counts.input_tokens,
             counts.output_tokens,
             counts.reasoning_tokens,
@@ -1306,7 +1185,8 @@ pub fn resolve_model_cost(
             counts.cache_creation_5m,
             counts.cache_creation_1h,
             pricing,
-        );
+        )
+        .unwrap_or(0.0);
         // Web search is billed per query (Claude `server_tool_use`),
         // separately from tokens. `web_search_requests` is 0 for every
         // non-Claude model, so this term is a no-op for them.
@@ -1314,20 +1194,17 @@ pub fn resolve_model_cost(
     };
 
     match source {
-        // Cursor's dashboard cost is authoritative; never re-price from tokens.
-        CostSource::CursorStored(stored) => (stored, None),
-        // OpenCode / Hermes: only trust an exact price match; otherwise use the
-        // provider's own stored cost.
-        CostSource::OpenCodeStored(stored) | CostSource::HermesStored(stored) => {
-            match pricing_map.get_exact(model) {
-                Some(pricing) => (priced(&pricing), None),
-                None => (stored, None),
-            }
-        }
-        CostSource::Litellm => {
-            let result = pricing_map.get(model);
-            (priced(&result.pricing), result.matched_model)
-        }
+        CostSource::CursorStored(Some(stored))
+        | CostSource::OpenCodeStored(Some(stored))
+        | CostSource::HermesStored(Some(stored)) => (stored, None),
+        CostSource::CursorStored(None)
+        | CostSource::OpenCodeStored(None)
+        | CostSource::HermesStored(None)
+        | CostSource::Litellm => pricing_map
+            .get_for_cost_with_provider(model, provider_hint)
+            .map_or((0.0, None), |result| {
+                (priced(&result.pricing), result.matched_model)
+            }),
     }
 }
 
@@ -1339,15 +1216,103 @@ impl UsageData {
     pub fn provider_usage(&self, provider: Provider) -> Option<&UsageResult> {
         self.per_provider.get(provider)
     }
+
+    /// Prices one provider/model row from request-level facts when available.
+    #[doc(hidden)]
+    pub fn price_provider_model(
+        &self,
+        provider: ExtensionType,
+        model: &str,
+        pricing_map: &ModelPricingMap,
+    ) -> Option<(f64, Option<String>)> {
+        let usage = provider_usage_by_extension(&self.per_provider, provider).get(model)?;
+        if let Some(cost) = self.pricing_ledger.resolve(provider, model, pricing_map) {
+            return Some(cost);
+        }
+        let stored = match provider {
+            ExtensionType::OpenCode => {
+                CostSource::OpenCodeStored(self.stored_costs.opencode.get(model).copied())
+            }
+            ExtensionType::Cursor => CostSource::CursorStored(None),
+            ExtensionType::Hermes => {
+                CostSource::HermesStored(self.stored_costs.hermes.get(model).copied())
+            }
+            _ => CostSource::Litellm,
+        };
+        Some(resolve_model_cost_with_provider_hint(
+            model,
+            &crate::utils::extract_token_counts(usage),
+            pricing_map,
+            stored,
+            pricing_provider_hint(provider),
+        ))
+    }
+
+    /// Prices a cross-provider model row by summing each provider's own
+    /// request ledger and cost precedence.
+    #[doc(hidden)]
+    pub fn price_merged_model(
+        &self,
+        model: &str,
+        pricing_map: &ModelPricingMap,
+    ) -> Option<(f64, Option<String>)> {
+        let mut total = 0.0;
+        let mut matched_model = None;
+        let mut found = false;
+        for provider in [
+            ExtensionType::ClaudeCode,
+            ExtensionType::Codex,
+            ExtensionType::Copilot,
+            ExtensionType::Gemini,
+            ExtensionType::Grok,
+            ExtensionType::OpenCode,
+            ExtensionType::Cursor,
+            ExtensionType::Hermes,
+        ] {
+            if let Some((cost, matched)) = self.price_provider_model(provider, model, pricing_map) {
+                found = true;
+                total += cost;
+                if matched_model.is_none() {
+                    matched_model = matched;
+                }
+            }
+        }
+        found.then_some((total, matched_model))
+    }
+}
+
+fn provider_usage_by_extension(usage: &PerProviderUsage, provider: ExtensionType) -> &UsageResult {
+    match provider {
+        ExtensionType::ClaudeCode => &usage.claude,
+        ExtensionType::Codex => &usage.codex,
+        ExtensionType::Copilot => &usage.copilot,
+        ExtensionType::Gemini => &usage.gemini,
+        ExtensionType::Grok => &usage.grok,
+        ExtensionType::OpenCode => &usage.opencode,
+        ExtensionType::Cursor => &usage.cursor,
+        ExtensionType::Hermes => &usage.hermes,
+    }
+}
+
+fn pricing_provider_hint(provider: ExtensionType) -> Option<&'static str> {
+    match provider {
+        ExtensionType::ClaudeCode => Some("anthropic"),
+        ExtensionType::Codex => Some("openai"),
+        ExtensionType::Gemini => Some("gemini"),
+        ExtensionType::Grok => Some("xai"),
+        ExtensionType::Copilot
+        | ExtensionType::OpenCode
+        | ExtensionType::Cursor
+        | ExtensionType::Hermes => None,
+    }
 }
 
 /// Accumulates the token fields of `new` into `existing` in place.
 ///
-/// Detects the on-disk usage shape from a marker key and merges accordingly:
-/// the flat provider shape (keyed by `input_tokens`, including the
-/// nested `cache_creation` breakdown) or the Codex shape (keyed by
-/// `total_token_usage`). Values that are not both JSON objects, or that match
-/// neither shape, are left untouched.
+/// Detects the on-disk usage shape from its token keys and merges accordingly:
+/// the flat provider shape, including partial records that only publish
+/// `total_tokens`, or the Codex shape keyed by `total_token_usage`. Values that
+/// are not both JSON objects, or that match neither shape, are left untouched.
 pub(crate) fn merge_usage_values(existing: &mut Value, new: &Value) {
     use crate::utils::{accumulate_i64_fields, accumulate_nested_object, extract_token_counts};
 
@@ -1356,8 +1321,25 @@ pub(crate) fn merge_usage_values(existing: &mut Value, new: &Value) {
     };
     let existing_flat = existing_ro.contains_key("input_tokens");
     let existing_codex = existing_ro.contains_key("total_token_usage");
-    let new_flat = new_ro.contains_key("input_tokens");
     let new_codex = new_ro.contains_key("total_token_usage");
+    let is_flat_usage = |obj: &serde_json::Map<String, Value>| {
+        [
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+            "thoughts_tokens",
+            "reasoning_output_tokens",
+            "tool_tokens",
+            "total_tokens",
+            "cache_creation",
+            "server_tool_use",
+        ]
+        .iter()
+        .any(|key| obj.contains_key(*key))
+    };
+    let existing_flat_usage = is_flat_usage(existing_ro);
+    let new_flat_usage = is_flat_usage(new_ro);
 
     // Mixed shapes — e.g. a Codex `total_token_usage` row and a Cursor / Copilot
     // flat `input_tokens` row that share a model name like `gpt-5`. The
@@ -1365,7 +1347,12 @@ pub(crate) fn merge_usage_values(existing: &mut Value, new: &Value) {
     // *same* shape, so a mismatch would silently drop the other side's tokens.
     // Normalize both to disjoint counts and rewrite `existing` as a flat value
     // that keeps every bucket (and round-trips through `extract_token_counts`).
-    if (existing_flat && new_codex) || (existing_codex && new_flat) {
+    if (existing_flat_usage || existing_codex)
+        && (new_flat_usage || new_codex)
+        && ((existing_codex && new_flat_usage)
+            || (existing_flat_usage && new_codex)
+            || (existing_flat_usage && !existing_flat))
+    {
         let merged = add_token_counts(&extract_token_counts(existing), &extract_token_counts(new));
         *existing = token_counts_to_flat_value(&merged);
         return;
@@ -1432,8 +1419,9 @@ fn add_token_counts(a: &TokenCounts, b: &TokenCounts) -> TokenCounts {
 /// Serializes normalized counts back into the flat usage shape.
 ///
 /// The key set is exactly what [`extract_token_counts`] reads for a flat value,
-/// so the result round-trips: re-extracting it yields the same counts. `total`
-/// is intentionally omitted (the extractor recomputes it as the bucket sum).
+/// so the result round-trips: re-extracting it yields the same counts. The
+/// effective published total is written explicitly because some providers
+/// include tool-only tokens that cannot be reconstructed from priced buckets.
 fn token_counts_to_flat_value(c: &TokenCounts) -> Value {
     let mut obj = serde_json::Map::new();
     obj.insert("input_tokens".into(), json!(c.input_tokens));
@@ -1444,6 +1432,7 @@ fn token_counts_to_flat_value(c: &TokenCounts) -> Value {
         "cache_creation_input_tokens".into(),
         json!(c.cache_creation),
     );
+    obj.insert("total_tokens".into(), json!(c.total));
     if c.cache_creation_5m != 0 || c.cache_creation_1h != 0 {
         obj.insert(
             "cache_creation".into(),
@@ -1465,7 +1454,7 @@ fn token_counts_to_flat_value(c: &TokenCounts) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pricing::{ModelPricing, clear_pricing_cache};
+    use crate::pricing::{ModelPricing, ThresholdTier, TierRange, clear_pricing_cache};
     use std::collections::HashMap;
 
     fn map_with_gpt4() -> ModelPricingMap {
@@ -1488,18 +1477,255 @@ mod tests {
         }
     }
 
+    fn ledger_map(model: &str, pricing: ModelPricing) -> ModelPricingMap {
+        ModelPricingMap::new(HashMap::from([(model.to_string(), pricing)]))
+    }
+
+    fn request_unit(input_tokens: i64, stored_cost: Option<f64>) -> LedgerUnit {
+        LedgerUnit {
+            counts: counts(input_tokens),
+            stored_cost,
+            granularity: PricingGranularity::Request,
+            provider_pricing_modifiers: Vec::new(),
+        }
+    }
+
     #[test]
-    fn test_opencode_exact_match_computes_from_tokens() {
+    fn request_ledger_does_not_merge_independent_threshold_contexts() {
+        let model = "tiered-model";
+        let map = ledger_map(
+            model,
+            ModelPricing {
+                input_cost_per_token: 1e-6,
+                tiers: vec![ThresholdTier {
+                    threshold_tokens: 200_000,
+                    input_cost_per_token: 2e-6,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let mut ledger = UsagePricingLedger::default();
+        ledger.provider_mut(ExtensionType::ClaudeCode).insert(
+            model.to_string(),
+            vec![request_unit(150_000, None), request_unit(150_000, None)],
+        );
+
+        let (cost, _) = ledger
+            .resolve(ExtensionType::ClaudeCode, model, &map)
+            .expect("ledger entry");
+        assert!((cost - 0.3).abs() < 1e-12);
+    }
+
+    #[test]
+    fn request_ledger_applies_threshold_to_each_request_independently() {
+        let model = "tiered-model";
+        let map = ledger_map(
+            model,
+            ModelPricing {
+                input_cost_per_token: 1e-6,
+                tiers: vec![ThresholdTier {
+                    threshold_tokens: 200_000,
+                    input_cost_per_token: 2e-6,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let mut ledger = UsagePricingLedger::default();
+        ledger.provider_mut(ExtensionType::ClaudeCode).insert(
+            model.to_string(),
+            vec![request_unit(200_001, None), request_unit(1_000, None)],
+        );
+
+        let (cost, _) = ledger
+            .resolve(ExtensionType::ClaudeCode, model, &map)
+            .expect("ledger entry");
+        assert!((cost - 0.401_002).abs() < 1e-12);
+    }
+
+    #[test]
+    fn unresolved_range_unit_does_not_discard_resolved_units() {
+        let model = "range-model";
+        let map = ledger_map(
+            model,
+            ModelPricing {
+                ranges: Some(vec![
+                    TierRange {
+                        min_tokens: 0,
+                        max_tokens: 10_000,
+                        input_cost_per_token: 1e-6,
+                        ..Default::default()
+                    },
+                    TierRange {
+                        min_tokens: 20_000,
+                        max_tokens: 30_000,
+                        input_cost_per_token: 3e-6,
+                        ..Default::default()
+                    },
+                ]),
+                ..Default::default()
+            },
+        );
+        let mut ledger = UsagePricingLedger::default();
+        ledger.provider_mut(ExtensionType::Gemini).insert(
+            model.to_string(),
+            vec![request_unit(5_000, None), request_unit(15_000, None)],
+        );
+
+        let (cost, _) = ledger
+            .resolve(ExtensionType::Gemini, model, &map)
+            .expect("ledger entry");
+        assert!((cost - 0.005).abs() < 1e-12);
+    }
+
+    #[test]
+    fn unresolved_range_still_prices_known_web_search_requests() {
+        let model = "range-model";
+        let map = ledger_map(
+            model,
+            ModelPricing {
+                web_search_cost_per_query: 0.01,
+                ranges: Some(vec![TierRange {
+                    min_tokens: 0,
+                    max_tokens: 10_000,
+                    input_cost_per_token: 1e-6,
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+        );
+        let mut unit = request_unit(15_000, None);
+        unit.counts.web_search_requests = 3;
+        let mut ledger = UsagePricingLedger::default();
+        ledger
+            .provider_mut(ExtensionType::ClaudeCode)
+            .insert(model.to_string(), vec![unit]);
+
+        let (cost, _) = ledger
+            .resolve(ExtensionType::ClaudeCode, model, &map)
+            .expect("ledger entry");
+        assert!((cost - 0.03).abs() < 1e-12);
+    }
+
+    #[test]
+    fn provider_modifiers_stack_on_tokens_but_not_web_search() {
+        let model = "claude-opus-4-8";
+        let map = ledger_map(
+            model,
+            ModelPricing {
+                input_cost_per_token: 1.0,
+                output_cost_per_token: 2.0,
+                cache_read_input_token_cost: 0.1,
+                cache_creation_input_token_cost: 1.25,
+                cache_creation_input_token_cost_above_1hr: 2.0,
+                web_search_cost_per_query: 0.01,
+                provider_specific_multipliers: HashMap::from([
+                    ("fast".to_string(), 2.0),
+                    ("us".to_string(), 1.1),
+                ]),
+                ..Default::default()
+            },
+        );
+        let mut unit = request_unit(1, None);
+        unit.counts.output_tokens = 1;
+        unit.counts.cache_read = 1;
+        unit.counts.cache_creation = 2;
+        unit.counts.cache_creation_5m = 1;
+        unit.counts.cache_creation_1h = 1;
+        unit.counts.web_search_requests = 1;
+        unit.provider_pricing_modifiers = vec!["fast".to_string(), "us".to_string()];
+        let mut ledger = UsagePricingLedger::default();
+        ledger
+            .provider_mut(ExtensionType::ClaudeCode)
+            .insert(model.to_string(), vec![unit]);
+
+        let (cost, _) = ledger
+            .resolve(ExtensionType::ClaudeCode, model, &map)
+            .expect("ledger entry");
+        let token_cost = 1.0 + 2.0 + 0.1 + 1.25 + 2.0;
+        assert!((cost - (token_cost * 2.0 * 1.1 + 0.01)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn missing_provider_modifier_never_falls_back_to_standard_token_price() {
+        let model = "claude-opus-future";
+        let map = ledger_map(
+            model,
+            ModelPricing {
+                input_cost_per_token: 1.0,
+                web_search_cost_per_query: 0.01,
+                ..Default::default()
+            },
+        );
+        let mut unit = request_unit(100, None);
+        unit.counts.web_search_requests = 2;
+        unit.provider_pricing_modifiers = vec!["fast".to_string()];
+        let mut ledger = UsagePricingLedger::default();
+        ledger
+            .provider_mut(ExtensionType::ClaudeCode)
+            .insert(model.to_string(), vec![unit]);
+
+        let (cost, _) = ledger
+            .resolve(ExtensionType::ClaudeCode, model, &map)
+            .expect("ledger entry");
+        assert!((cost - 0.02).abs() < 1e-12);
+    }
+
+    #[test]
+    fn grok_ledger_uses_xai_provider_hint_for_bare_model_id() {
+        let model = "grok-4.5";
+        let map = ledger_map(
+            "xai/grok-4.5",
+            ModelPricing {
+                input_cost_per_token: 0.01,
+                ..Default::default()
+            },
+        );
+        let mut ledger = UsagePricingLedger::default();
+        ledger
+            .provider_mut(ExtensionType::Grok)
+            .insert(model.to_string(), vec![request_unit(100, None)]);
+
+        let (cost, matched) = ledger
+            .resolve(ExtensionType::Grok, model, &map)
+            .expect("ledger entry");
+        assert!((cost - 1.0).abs() < 1e-12);
+        assert_eq!(matched.as_deref(), Some("xai/grok-4.5"));
+    }
+
+    #[test]
+    fn stored_cost_precedence_is_applied_per_ledger_unit() {
+        let model = "gpt-4";
+        let map = map_with_gpt4();
+        let mut ledger = UsagePricingLedger::default();
+        ledger.provider_mut(ExtensionType::OpenCode).insert(
+            model.to_string(),
+            vec![
+                request_unit(1_000_000, Some(0.0)),
+                request_unit(1_000, None),
+            ],
+        );
+
+        let (cost, _) = ledger
+            .resolve(ExtensionType::OpenCode, model, &map)
+            .expect("ledger entry");
+        assert!((cost - 0.01).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_opencode_stored_cost_precedes_exact_litellm_match() {
         clear_pricing_cache();
         let map = map_with_gpt4();
-        // Exact LiteLLM price exists -> compute from tokens, ignore stored cost.
+        // Provider-stored history remains authoritative when a current exact
+        // LiteLLM price also exists.
         let (cost, matched) = resolve_model_cost(
             "gpt-4",
             &counts(1_000_000),
             &map,
-            CostSource::OpenCodeStored(99.0),
+            CostSource::OpenCodeStored(Some(99.0)),
         );
-        assert!((cost - 10.0).abs() < 1e-6); // 1e6 * 1e-5
+        assert!((cost - 99.0).abs() < 1e-9);
         assert!(matched.is_none());
     }
 
@@ -1512,10 +1738,58 @@ mod tests {
             "deepseek-v4-pro",
             &counts(1_000_000),
             &map,
-            CostSource::OpenCodeStored(99.0),
+            CostSource::OpenCodeStored(Some(99.0)),
         );
         assert!((cost - 99.0).abs() < 1e-9);
         assert!(matched.is_none());
+    }
+
+    #[test]
+    fn test_explicit_zero_stored_cost_is_authoritative() {
+        let map = map_with_gpt4();
+        let (cost, matched) = resolve_model_cost(
+            "gpt-4",
+            &counts(1_000_000),
+            &map,
+            CostSource::OpenCodeStored(Some(0.0)),
+        );
+        assert_eq!(cost, 0.0);
+        assert!(matched.is_none());
+    }
+
+    #[test]
+    fn test_missing_stored_cost_uses_strict_litellm_match() {
+        let map = map_with_gpt4();
+        let (cost, matched) = resolve_model_cost(
+            "gpt-4",
+            &counts(1_000_000),
+            &map,
+            CostSource::OpenCodeStored(None),
+        );
+        assert!((cost - 10.0).abs() < 1e-6);
+        assert!(matched.is_none());
+    }
+
+    #[test]
+    fn test_hermes_explicit_zero_blocks_fallback_but_missing_cost_does_not() {
+        let map = map_with_gpt4();
+        let (included_cost, included_match) = resolve_model_cost(
+            "gpt-4",
+            &counts(1_000_000),
+            &map,
+            CostSource::HermesStored(Some(0.0)),
+        );
+        assert_eq!(included_cost, 0.0);
+        assert!(included_match.is_none());
+
+        let (fallback_cost, fallback_match) = resolve_model_cost(
+            "gpt-4",
+            &counts(1_000_000),
+            &map,
+            CostSource::HermesStored(None),
+        );
+        assert!((fallback_cost - 10.0).abs() < 1e-6);
+        assert!(fallback_match.is_none());
     }
 
     #[test]
@@ -1528,7 +1802,7 @@ mod tests {
             "gpt-4",
             &counts(1_000_000),
             &map,
-            CostSource::CursorStored(3.5),
+            CostSource::CursorStored(Some(3.5)),
         );
         assert!((cost - 3.5).abs() < 1e-9);
         assert!(matched.is_none());
@@ -1585,5 +1859,39 @@ mod tests {
         let mut existing = flat.clone();
         merge_usage_values(&mut existing, &codex);
         expect(extract_token_counts(&existing));
+    }
+
+    #[test]
+    fn merge_preserves_partial_total_only_usage_in_either_order() {
+        use crate::utils::extract_token_counts;
+
+        let total_only = json!({ "total_tokens": 17 });
+        let split = json!({
+            "input_tokens": 10,
+            "output_tokens": 4,
+            "reasoning_output_tokens": 2,
+            "cache_read_input_tokens": 3,
+            "total_tokens": 19
+        });
+        let expect = |value: &Value| {
+            let counts = extract_token_counts(value);
+            assert_eq!(counts.input_tokens, 10);
+            assert_eq!(counts.output_tokens, 4);
+            assert_eq!(counts.reasoning_tokens, 2);
+            assert_eq!(counts.cache_read, 3);
+            assert_eq!(counts.total, 36);
+        };
+
+        let mut forward = total_only.clone();
+        merge_usage_values(&mut forward, &split);
+        expect(&forward);
+
+        let mut reverse = split;
+        merge_usage_values(&mut reverse, &total_only);
+        expect(&reverse);
+        assert_eq!(
+            extract_token_counts(&forward),
+            extract_token_counts(&reverse)
+        );
     }
 }

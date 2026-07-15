@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::Arc;
+use vibe_coding_tracker::analysis::aggregator::project_session_file;
 use vibe_coding_tracker::cli::{Cli, Commands, ConfigAction, resolve_time_range_with_default};
 
 // mimalloc is opt-in behind the `mimalloc` cargo feature. The default build
@@ -106,25 +107,35 @@ fn run() -> Result<()> {
                     } else {
                         ParseMode::UsageOnly
                     };
-                    let (analysis, diagnostics) =
-                        parse_session_file_typed_with_mode_and_diagnostics(&file_path, mode)?;
-                    if diagnostics.skipped_records() > 0 {
-                        eprintln!(
-                            "Warning: Skipped {} malformed or unsupported analyzer records while parsing {}. Successful results are still shown.",
-                            diagnostics.skipped_records(),
-                            file_path.display()
-                        );
-                    }
                     if complete_json {
+                        let (analysis, diagnostics) =
+                            parse_session_file_typed_with_mode_and_diagnostics(&file_path, mode)?;
+                        if diagnostics.skipped_records() > 0 {
+                            eprintln!(
+                                "Warning: Skipped {} malformed or unsupported analyzer records while parsing {}. Successful results are still shown.",
+                                diagnostics.skipped_records(),
+                                file_path.display()
+                            );
+                        }
                         write_pretty_json(&analysis)?;
-                    } else if text {
-                        let projected =
-                            vibe_coding_tracker::analysis::project_code_analysis(&analysis);
-                        vibe_coding_tracker::display::analysis::display_analysis_text(&projected);
                     } else {
-                        let projected =
-                            vibe_coding_tracker::analysis::project_code_analysis(&analysis);
-                        vibe_coding_tracker::display::analysis::display_analysis_table(&projected);
+                        let (_, projected, diagnostics) = project_session_file(&file_path, mode)?;
+                        if diagnostics.skipped_records() > 0 {
+                            eprintln!(
+                                "Warning: Skipped {} malformed or unsupported analyzer records while parsing {}. Successful results are still shown.",
+                                diagnostics.skipped_records(),
+                                file_path.display()
+                            );
+                        }
+                        if text {
+                            vibe_coding_tracker::display::analysis::display_analysis_text(
+                                &projected,
+                            );
+                        } else {
+                            vibe_coding_tracker::display::analysis::display_analysis_table(
+                                &projected,
+                            );
+                        }
                     }
                 }
                 None => {
@@ -476,6 +487,8 @@ fn default_editor() -> &'static str {
 /// LiteLLM key was used) `matched_model`. OpenCode models without an exact
 /// price report OpenCode's own stored cost only for the OpenCode portion of a
 /// merged row rather than applying it to other providers with the same model.
+/// Rows are sorted by ascending cost, then model name, matching the other
+/// usage renderers and keeping scripted output deterministic.
 ///
 /// # Errors
 ///
@@ -504,6 +517,20 @@ fn build_enriched_json(
         enriched_data.push(entry);
     }
 
+    enriched_data.sort_by(|left, right| {
+        left["cost_usd"]
+            .as_f64()
+            .unwrap_or_default()
+            .partial_cmp(&right["cost_usd"].as_f64().unwrap_or_default())
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                left["model"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .cmp(right["model"].as_str().unwrap_or_default())
+            })
+    });
+
     Ok(enriched_data)
 }
 
@@ -513,59 +540,7 @@ fn resolve_enriched_model_cost(
     usage_data: &vibe_coding_tracker::UsageData,
     pricing_map: &ModelPricingMap,
 ) -> Option<(f64, Option<String>)> {
-    let mut total_cost = 0.0;
-    let mut matched_model = None;
-    let mut found = false;
-
-    for usage in [
-        &usage_data.per_provider.claude,
-        &usage_data.per_provider.codex,
-        &usage_data.per_provider.copilot,
-        &usage_data.per_provider.gemini,
-        &usage_data.per_provider.grok,
-    ] {
-        if let Some(raw_usage) = usage.get(model) {
-            found = true;
-            let (cost, matched) =
-                price_usage_value(model, raw_usage, pricing_map, CostSource::Litellm);
-            total_cost += cost;
-            if matched_model.is_none() {
-                matched_model = matched;
-            }
-        }
-    }
-
-    // OpenCode and Hermes prefer an exact LiteLLM match before their stored
-    // costs. Cursor is a local token estimate, so it uses an exact LiteLLM
-    // price when available and otherwise remains unpriced.
-    let stored = |m: &vibe_coding_tracker::constants::FastHashMap<String, f64>| {
-        m.get(model).copied().unwrap_or(0.0)
-    };
-    for (usage, source) in [
-        (
-            &usage_data.per_provider.opencode,
-            CostSource::OpenCodeStored(stored(&usage_data.stored_costs.opencode)),
-        ),
-        (
-            &usage_data.per_provider.cursor,
-            CostSource::OpenCodeStored(0.0),
-        ),
-        (
-            &usage_data.per_provider.hermes,
-            CostSource::HermesStored(stored(&usage_data.stored_costs.hermes)),
-        ),
-    ] {
-        if let Some(raw_usage) = usage.get(model) {
-            found = true;
-            let (cost, matched) = price_usage_value(model, raw_usage, pricing_map, source);
-            total_cost += cost;
-            if matched_model.is_none() {
-                matched_model = matched;
-            }
-        }
-    }
-
-    found.then_some((total_cost, matched_model))
+    usage_data.price_merged_model(model, pricing_map)
 }
 
 /// Prices one raw usage value under `source`.
@@ -611,6 +586,7 @@ mod tests {
             per_provider,
             provider_days: ProviderActiveDays::default(),
             stored_costs: vibe_coding_tracker::usage::StoredCosts::default(),
+            pricing_ledger: vibe_coding_tracker::usage::UsagePricingLedger::default(),
         };
 
         let rows = build_enriched_json(&usage_data, &pricing_map).unwrap();
@@ -633,29 +609,67 @@ mod tests {
         let pricing_map = ModelPricingMap::new(raw_pricing);
 
         let mut models = UsageResult::default();
-        models.insert("shared-pro".to_string(), json!({"input_tokens": 200}));
+        models.insert("shared-20250715".to_string(), json!({"input_tokens": 200}));
 
         let mut per_provider = PerProviderUsage::default();
         per_provider
             .claude
-            .insert("shared-pro".to_string(), json!({"input_tokens": 100}));
+            .insert("shared-20250715".to_string(), json!({"input_tokens": 100}));
         per_provider
             .opencode
-            .insert("shared-pro".to_string(), json!({"input_tokens": 100}));
+            .insert("shared-20250715".to_string(), json!({"input_tokens": 100}));
 
         let mut stored_costs = vibe_coding_tracker::usage::StoredCosts::default();
-        stored_costs.opencode.insert("shared-pro".to_string(), 7.0);
+        stored_costs
+            .opencode
+            .insert("shared-20250715".to_string(), 7.0);
 
         let usage_data = vibe_coding_tracker::UsageData {
             models,
             per_provider,
             provider_days: ProviderActiveDays::default(),
             stored_costs,
+            pricing_ledger: vibe_coding_tracker::usage::UsagePricingLedger::default(),
         };
 
         let rows = build_enriched_json(&usage_data, &pricing_map).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["cost_usd"].as_f64().unwrap(), 8.0);
         assert_eq!(rows[0]["matched_model"].as_str().unwrap(), "shared");
+    }
+
+    #[test]
+    fn json_rows_are_sorted_by_cost_then_model() {
+        clear_pricing_cache();
+        let mut raw_pricing = HashMap::new();
+        for model in ["model-a", "model-b", "model-c"] {
+            raw_pricing.insert(
+                model.to_string(),
+                ModelPricing {
+                    input_cost_per_token: 0.01,
+                    ..Default::default()
+                },
+            );
+        }
+        let pricing_map = ModelPricingMap::new(raw_pricing);
+        let mut models = UsageResult::default();
+        models.insert("model-c".to_string(), json!({"input_tokens": 200}));
+        models.insert("model-b".to_string(), json!({"input_tokens": 100}));
+        models.insert("model-a".to_string(), json!({"input_tokens": 100}));
+        let usage_data = vibe_coding_tracker::UsageData {
+            models,
+            per_provider: PerProviderUsage::default(),
+            provider_days: ProviderActiveDays::default(),
+            stored_costs: vibe_coding_tracker::usage::StoredCosts::default(),
+            pricing_ledger: vibe_coding_tracker::usage::UsagePricingLedger::default(),
+        };
+
+        let rows = build_enriched_json(&usage_data, &pricing_map).unwrap();
+        let models: Vec<_> = rows
+            .iter()
+            .map(|row| row["model"].as_str().unwrap())
+            .collect();
+
+        assert_eq!(models, ["model-a", "model-b", "model-c"]);
     }
 }

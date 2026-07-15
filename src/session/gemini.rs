@@ -8,7 +8,10 @@
 //! only `type == "gemini"` messages, which carry usage and tool calls.
 use crate::constants::FastHashMap;
 use crate::models::*;
-use crate::session::diagnostics::{ParseDiagnostics, ParsedAnalysis};
+use crate::session::diagnostics::{
+    AnalysisFact, AnalysisMetrics, ParseDiagnostics, ParsedAnalysis, PricingGranularity,
+    ToolFactStatus, UsageFact, UsageFactUnit,
+};
 use crate::session::state::{ParseMode, SessionParseState};
 use crate::utils::{get_git_remote_url, parse_iso_timestamp, process_gemini_usage};
 use anyhow::Result;
@@ -59,24 +62,48 @@ where
     diagnostics.record_recognized_source();
 
     let messages = deduplicate_messages(events, mode, &mut diagnostics);
-    for message in messages {
+    let mut usage_facts = Vec::new();
+    let mut analysis_facts = Vec::new();
+    for (source_order, message) in messages.into_iter().enumerate() {
         diagnostics.merge(message.diagnostics);
         if let (Some(tokens), Some(model)) = (&message.tokens, &message.model) {
             process_gemini_usage(&mut conversation_usage, model, tokens);
+            let mut one = FastHashMap::default();
+            process_gemini_usage(&mut one, model, tokens);
+            if let Some(usage) = one.remove(model) {
+                usage_facts.push(UsageFact {
+                    stable_id: Some(format!("gemini-message:{}", message.id)),
+                    timestamp_ms: (message.timestamp_ms > 0).then_some(message.timestamp_ms),
+                    observed_at_ms: (message.timestamp_ms > 0).then_some(message.timestamp_ms),
+                    source_order,
+                    units: vec![UsageFactUnit::from_value(
+                        model.clone(),
+                        &usage,
+                        PricingGranularity::Request,
+                    )],
+                });
+            }
+        }
+        for mut fact in message.tool_facts {
+            fact.source_order = analysis_facts.len();
+            analysis_facts.push(fact);
         }
         state.merge(message.state);
     }
 
     let analysis = finalize_record(state, conversation_usage, session.session_id);
-    Ok(ParsedAnalysis::new(analysis, diagnostics))
+    Ok(ParsedAnalysis::new(analysis, diagnostics).with_facts(usage_facts, analysis_facts))
 }
 
 /// One compacted assistant-message revision retained for historical metrics.
 struct GeminiMessageAnalysis {
+    id: String,
+    timestamp_ms: i64,
     state: SessionParseState,
     tokens: Option<GeminiTokens>,
     model: Option<String>,
     diagnostics: ParseDiagnostics,
+    tool_facts: Vec<AnalysisFact>,
 }
 
 /// Minimal Gemini message shape needed by analysis.
@@ -199,22 +226,28 @@ fn upsert_message(
             }
             record_message_diagnostics(&message, &mut message_diagnostics);
             let mut state = SessionParseState::with_mode(mode);
-            process_gemini_message(&mut state, &message);
+            let tool_facts = process_gemini_message(&mut state, &message, &id);
             GeminiMessageAnalysis {
+                id: id.clone(),
+                timestamp_ms: parse_iso_timestamp(&message.timestamp),
                 state,
                 tokens: message.tokens,
                 model: message.model,
                 diagnostics: message_diagnostics,
+                tool_facts,
             }
         }
         Err(_) => {
             let mut message_diagnostics = ParseDiagnostics::default();
             message_diagnostics.record_relevant(false);
             GeminiMessageAnalysis {
+                id: id.clone(),
+                timestamp_ms: 0,
                 state: SessionParseState::with_mode(mode),
                 tokens: None,
                 model: None,
                 diagnostics: message_diagnostics,
+                tool_facts: Vec::new(),
             }
         }
     };
@@ -258,8 +291,10 @@ enum GeminiToolStatus {
 
 fn gemini_tool_status(tool_call: &Value) -> GeminiToolStatus {
     match tool_call.get("status").and_then(Value::as_str) {
-        Some("success") => GeminiToolStatus::Success,
-        Some("error" | "failed") => GeminiToolStatus::Failed,
+        Some("success" | "completed") => GeminiToolStatus::Success,
+        Some("error" | "failed" | "rejected" | "cancelled" | "canceled") => {
+            GeminiToolStatus::Failed
+        }
         Some("pending" | "running") => GeminiToolStatus::Pending,
         None if tool_call.get("result").is_none_or(|result| {
             result.is_null() || result.as_array().is_some_and(Vec::is_empty)
@@ -328,15 +363,27 @@ fn record_message_diagnostics(message: &GeminiAnalysisMessage, diagnostics: &mut
                 | "write_todos"
                 | "read_many_files"
         ) {
+            if is_analysis_like_tool_name(name) {
+                diagnostics.record_relevant(false);
+            }
             continue;
         }
         let normalized = match gemini_tool_status(tool_call) {
             GeminiToolStatus::Success => tracked_tool_schema_supported(name, tool_call),
-            GeminiToolStatus::Failed => true,
-            GeminiToolStatus::Pending | GeminiToolStatus::Unsupported => false,
+            GeminiToolStatus::Failed | GeminiToolStatus::Pending => true,
+            GeminiToolStatus::Unsupported => false,
         };
         diagnostics.record_relevant(normalized);
     }
+}
+
+fn is_analysis_like_tool_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    [
+        "read", "write", "edit", "replace", "patch", "file", "shell", "command", "bash", "todo",
+    ]
+    .iter()
+    .any(|fragment| name.contains(fragment))
 }
 
 /// Converts the accumulated state into a single-record [`CodeAnalysis`],
@@ -369,99 +416,134 @@ fn finalize_record(
 }
 
 /// Folds one assistant message's timestamp and tools into a compact state.
-fn process_gemini_message(state: &mut SessionParseState, message: &GeminiAnalysisMessage) {
+fn process_gemini_message(
+    state: &mut SessionParseState,
+    message: &GeminiAnalysisMessage,
+    message_id: &str,
+) -> Vec<AnalysisFact> {
     let ts = parse_iso_timestamp(&message.timestamp);
     if ts > state.last_ts {
         state.last_ts = ts;
     }
 
     if message.message_type != "gemini" {
-        return;
+        return Vec::new();
     }
 
+    let mut facts = Vec::new();
     for tool_call in &message.tool_calls {
         let Some(name) = tool_call.get("name").and_then(|n| n.as_str()) else {
             continue;
         };
+        let tool_ts = tool_call
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .map(parse_iso_timestamp)
+            .filter(|timestamp| *timestamp > 0)
+            .unwrap_or(ts);
+        state.last_ts = state.last_ts.max(tool_ts);
+        let effect_before = crate::session::diagnostics::AnalysisStateSnapshot::capture(state);
+        let metrics_before = AnalysisMetrics::from_state(state);
         let status = gemini_tool_status(tool_call);
-        if status == GeminiToolStatus::Unsupported {
-            continue;
-        }
-        if status != GeminiToolStatus::Success {
+        if status != GeminiToolStatus::Success || !tracked_tool_schema_supported(name, tool_call) {
             record_tool_invocation(state, name);
-            continue;
-        }
-        if !tracked_tool_schema_supported(name, tool_call) {
-            record_tool_invocation(state, name);
-            continue;
-        }
+        } else {
+            let args = tool_call.get("args");
 
-        let args = tool_call.get("args");
+            match name {
+                "read_file" => {
+                    state.tool_counts.read += 1;
+                    let file_path = args
+                        .and_then(|a| a.get("file_path"))
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("");
 
-        match name {
-            "read_file" => {
-                state.tool_counts.read += 1;
-                let file_path = args
-                    .and_then(|a| a.get("file_path"))
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("");
-
-                // Content sits at result[0].functionResponse.response.output
-                if let Some(content) = tool_result_output(tool_call) {
-                    attach_read_detail(state, file_path, content, ts);
+                    // Content sits at result[0].functionResponse.response.output
+                    if let Some(content) = tool_result_output(tool_call) {
+                        attach_read_detail(state, file_path, content, tool_ts);
+                    }
                 }
-            }
-            "write_file" | "create_file" => {
-                let file_path = args
-                    .and_then(|a| a.get("file_path"))
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("");
-                let content = args
-                    .and_then(|a| a.get("content"))
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("");
+                "write_file" | "create_file" => {
+                    let file_path = args
+                        .and_then(|a| a.get("file_path"))
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("");
+                    let content = args
+                        .and_then(|a| a.get("content"))
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("");
 
-                state.add_write_detail(file_path, content, ts);
-            }
-            // Current Gemini CLI emits `replace`; `edit_file` /
-            // `replace_in_file` were the historical names and are kept
-            // here as best-effort aliases in case older sessions are
-            // still being replayed through `vct analysis <file>`.
-            "edit_file" | "replace_in_file" | "replace" => {
-                let file_path = args
-                    .and_then(|a| a.get("file_path"))
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("");
-                let old_string = args
-                    .and_then(|a| a.get("old_string").or_else(|| a.get("old_text")))
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("");
-                let new_string = args
-                    .and_then(|a| a.get("new_string").or_else(|| a.get("new_text")))
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("");
+                    state.add_write_detail(file_path, content, tool_ts);
+                }
+                // Current Gemini CLI emits `replace`; `edit_file` /
+                // `replace_in_file` were the historical names and are kept
+                // here as best-effort aliases in case older sessions are
+                // still being replayed through `vct analysis <file>`.
+                "edit_file" | "replace_in_file" | "replace" => {
+                    let file_path = args
+                        .and_then(|a| a.get("file_path"))
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("");
+                    let old_string = args
+                        .and_then(|a| a.get("old_string").or_else(|| a.get("old_text")))
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("");
+                    let new_string = args
+                        .and_then(|a| a.get("new_string").or_else(|| a.get("new_text")))
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("");
 
-                state.add_edit_detail_raw(file_path, old_string, new_string, ts);
-            }
-            "run_command" | "run_shell_command" | "execute_command" | "shell" => {
-                let command = args
-                    .and_then(|a| a.get("command").or_else(|| a.get("cmd")))
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("");
-                let description = args
-                    .and_then(|a| a.get("description"))
-                    .and_then(|d| d.as_str())
-                    .unwrap_or("");
+                    state.add_edit_detail_raw(file_path, old_string, new_string, tool_ts);
+                }
+                "run_command" | "run_shell_command" | "execute_command" | "shell" => {
+                    let command = args
+                        .and_then(|a| a.get("command").or_else(|| a.get("cmd")))
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("");
+                    let description = args
+                        .and_then(|a| a.get("description"))
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("");
 
-                state.add_run_command(command, description, ts);
+                    state.add_run_command(command, description, tool_ts);
+                }
+                "write_todos" => state.tool_counts.todo_write += 1,
+                "read_many_files" => state.tool_counts.read += 1,
+                // Meta tools like `update_topic` / `task_complete` carry no
+                // file-operation data; ignore them silently.
+                _ => {}
             }
-            "write_todos" => state.tool_counts.todo_write += 1,
-            "read_many_files" => state.tool_counts.read += 1,
-            // Meta tools like `update_topic` / `task_complete` carry no
-            // file-operation data; ignore them silently.
-            _ => {}
         }
+
+        let metrics = AnalysisMetrics::from_state(state).saturating_sub(metrics_before);
+        if !metrics.has_activity() {
+            continue;
+        }
+        let tool_id = tool_call
+            .get("id")
+            .or_else(|| tool_call.get("toolCallId"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
+        let succeeded =
+            status == GeminiToolStatus::Success && tracked_tool_schema_supported(name, tool_call);
+        facts.push(AnalysisFact {
+            stable_id: tool_id.map(|id| format!("gemini-tool:{message_id}:{id}")),
+            timestamp_ms: (tool_ts > 0).then_some(tool_ts),
+            observed_at_ms: (tool_ts > 0).then_some(tool_ts),
+            source_order: facts.len(),
+            model: message.model.clone().unwrap_or_default(),
+            status: if succeeded {
+                ToolFactStatus::Succeeded
+            } else if status == GeminiToolStatus::Pending {
+                ToolFactStatus::Pending
+            } else {
+                ToolFactStatus::Failed
+            },
+            metrics,
+            effect: succeeded.then(|| effect_before.effect_since(state, Vec::new())),
+        });
     }
+    facts
 }
 
 fn record_tool_invocation(state: &mut SessionParseState, name: &str) {
@@ -736,6 +818,62 @@ mod tests {
         assert_eq!(record.tool_call_counts.write, 1);
         assert_eq!(record.total_write_lines, 0);
         assert!(record.write_file_details.is_empty());
+    }
+
+    #[test]
+    fn rejected_and_pending_tools_count_without_claiming_file_changes() {
+        let message = assistant(
+            "incomplete-writes",
+            "gemini-test",
+            10,
+            json!([
+                {
+                    "name": "write_file",
+                    "status": "rejected",
+                    "args": {
+                        "file_path": "/tmp/rejected.txt",
+                        "content": "rejected"
+                    }
+                },
+                {
+                    "name": "write_file",
+                    "status": "pending",
+                    "args": {
+                        "file_path": "/tmp/pending.txt",
+                        "content": "pending"
+                    }
+                }
+            ]),
+        );
+
+        let parsed =
+            parse_gemini_events_with_diagnostics(session(), vec![message], ParseMode::Full)
+                .unwrap();
+        let record = &parsed.analysis.records[0];
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
+        assert_eq!(record.tool_call_counts.write, 2);
+        assert_eq!(record.total_unique_files, 0);
+        assert_eq!(record.total_write_lines, 0);
+        assert!(record.write_file_details.is_empty());
+    }
+
+    #[test]
+    fn unknown_analysis_tool_reports_schema_drift() {
+        let message = assistant(
+            "future-tool",
+            "gemini-test",
+            10,
+            json!([{
+                "name": "future_file_editor",
+                "status": "success",
+                "args": { "path": "/tmp/a.txt" }
+            }]),
+        );
+
+        let parsed =
+            parse_gemini_events_with_diagnostics(session(), vec![message], ParseMode::Full)
+                .unwrap();
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 1);
     }
 
     #[test]

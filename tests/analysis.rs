@@ -7,6 +7,7 @@
 
 mod common;
 
+use chrono::{Duration, Local, SecondsFormat};
 use common::{TempHome, append_cursor_json_blob, fixture, fixture_str};
 use rusqlite::{Connection, params};
 use serde_json::json;
@@ -18,7 +19,7 @@ use vibe_coding_tracker::analysis::aggregator::{
     AnalysisData, aggregate_sessions_by_model_from_paths,
     aggregate_sessions_by_model_from_paths_with, aggregate_sessions_by_model_from_paths_with_cache,
     aggregate_sessions_by_model_from_paths_with_diagnostics,
-    collect_analysis_sessions_from_paths_with, project_code_analysis,
+    collect_analysis_sessions_from_paths_with, project_code_analysis, project_session_file,
 };
 use vibe_coding_tracker::cli::TimeRange;
 use vibe_coding_tracker::config::ProvidersConfig;
@@ -28,6 +29,9 @@ use vibe_coding_tracker::session::parser::{
     parse_session_file_typed_with_mode_and_diagnostics,
 };
 use vibe_coding_tracker::session::state::ParseMode;
+use vibe_coding_tracker::session::{
+    cursor::read_cursor_analysis, opencode::read_opencode_analysis,
+};
 use vibe_coding_tracker::summary_cache::SummaryScanCache;
 
 fn providers_only(provider: ExtensionType) -> ProvidersConfig {
@@ -94,6 +98,168 @@ fn seed_opencode_tie_breaker_db(path: &Path) {
         .unwrap();
     }
     tx.commit().unwrap();
+}
+
+fn seed_opencode_analysis_db(path: &Path, timestamp_ms: i64) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let connection = Connection::open(path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE session (
+                 id TEXT PRIMARY KEY,
+                 directory TEXT NOT NULL,
+                 time_updated INTEGER NOT NULL
+             );
+             CREATE TABLE message (
+                 id TEXT PRIMARY KEY,
+                 session_id TEXT NOT NULL,
+                 data TEXT NOT NULL
+             );
+             CREATE TABLE part (
+                 id TEXT PRIMARY KEY,
+                 message_id TEXT NOT NULL,
+                 session_id TEXT NOT NULL,
+                 data TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO session (id, directory, time_updated) VALUES ('session', '/repo', ?1)",
+            [timestamp_ms],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO message (id, session_id, data) VALUES ('message', 'session', ?1)",
+            [json!({
+                "role": "assistant",
+                "modelID": "opencode-model",
+                "cost": 0,
+                "tokens": {
+                    "input": 1,
+                    "output": 1,
+                    "reasoning": 0,
+                    "cache": { "read": 0, "write": 0 }
+                },
+                "time": { "created": timestamp_ms, "completed": timestamp_ms }
+            })
+            .to_string()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES ('write', 'message', 'session', ?1)",
+            [json!({
+                "type": "tool",
+                "tool": "write",
+                "state": {
+                    "status": "completed",
+                    "time": { "start": timestamp_ms, "end": timestamp_ms },
+                    "input": { "filePath": "/repo/open.rs", "content": "one\ntwo" }
+                }
+            })
+            .to_string()],
+        )
+        .unwrap();
+}
+
+fn assert_effect_fields_equal(
+    actual: &vibe_coding_tracker::models::CodeAnalysis,
+    expected: &vibe_coding_tracker::models::CodeAnalysis,
+) {
+    let actual = &actual.records[0];
+    let expected = &expected.records[0];
+    assert_eq!(actual.total_unique_files, expected.total_unique_files);
+    assert_eq!(
+        actual.total_write_characters,
+        expected.total_write_characters
+    );
+    assert_eq!(actual.total_read_characters, expected.total_read_characters);
+    assert_eq!(actual.total_edit_characters, expected.total_edit_characters);
+    assert_eq!(
+        serde_json::to_value(&actual.write_file_details).unwrap(),
+        serde_json::to_value(&expected.write_file_details).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&actual.read_file_details).unwrap(),
+        serde_json::to_value(&expected.read_file_details).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&actual.edit_file_details).unwrap(),
+        serde_json::to_value(&expected.edit_file_details).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&actual.run_command_details).unwrap(),
+        serde_json::to_value(&expected.run_command_details).unwrap()
+    );
+}
+
+fn claude_read_lifecycle(
+    message_id: &str,
+    tool_id: &str,
+    timestamp: &str,
+    path: &str,
+    content: &str,
+    input_tokens: i64,
+) -> String {
+    let assistant = json!({
+        "parentUuid": null,
+        "sessionId": "session",
+        "type": "assistant",
+        "timestamp": timestamp,
+        "isSidechain": true,
+        "message": {
+            "id": message_id,
+            "model": "claude-test-model",
+            "usage": { "input_tokens": input_tokens, "output_tokens": 0 },
+            "content": [{
+                "type": "tool_use",
+                "id": tool_id,
+                "name": "Read",
+                "input": { "file_path": path }
+            }]
+        }
+    });
+    let result = json!({
+        "parentUuid": "assistant",
+        "sessionId": "session",
+        "type": "user",
+        "timestamp": timestamp,
+        "isSidechain": true,
+        "message": {
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": tool_id,
+                "content": content
+            }]
+        }
+    });
+    format!("{assistant}\n{result}\n")
+}
+
+fn codex_patch_lifecycle(call_id: &str, timestamp: &str, path: &str) -> String {
+    let patch = format!("*** Begin Patch\n*** Update File: {path}\n@@\n-old\n+new\n*** End Patch");
+    let invocation = json!({
+        "timestamp": timestamp,
+        "type": "response_item",
+        "payload": {
+            "type": "custom_tool_call",
+            "name": "apply_patch",
+            "input": patch,
+            "call_id": call_id
+        }
+    });
+    let outcome = json!({
+        "timestamp": timestamp,
+        "type": "response_item",
+        "payload": {
+            "type": "custom_tool_call_output",
+            "call_id": call_id,
+            "output": "Done!"
+        }
+    });
+    format!("{invocation}\n{outcome}\n")
 }
 
 fn assert_analysis_data_eq(actual: &AnalysisData, expected: &AnalysisData) {
@@ -197,10 +363,10 @@ fn test_single_file_analysis_grok() {
         record["conversationUsage"]["grok-test"]["cache_read_input_tokens"],
         12_345
     );
-    // One read_file plus one successful grep. The completed grep with exit 2
-    // is a semantic failure and must not inflate Read.
-    assert_eq!(record["toolCallCounts"]["Read"], 2);
-    assert_eq!(record["toolCallCounts"]["Write"], 1);
+    // Tool counts represent invocations, including the failed grep and write.
+    // Failed calls do not contribute file effects or line totals.
+    assert_eq!(record["toolCallCounts"]["Read"], 3);
+    assert_eq!(record["toolCallCounts"]["Write"], 2);
     assert_eq!(record["toolCallCounts"]["Edit"], 1);
     assert_eq!(record["toolCallCounts"]["Bash"], 1);
     assert_eq!(record["toolCallCounts"]["TodoWrite"], 1);
@@ -219,8 +385,8 @@ fn batch_analysis_attributes_grok_tools_to_the_grok_provider() {
         .iter()
         .find(|row| row.model == "grok-test")
         .expect("Grok model row");
-    assert_eq!(row.read_count, 2);
-    assert_eq!(row.write_count, 1);
+    assert_eq!(row.read_count, 3);
+    assert_eq!(row.write_count, 2);
     assert_eq!(row.edit_count, 1);
     assert_eq!(row.bash_count, 1);
     assert_eq!(row.todo_write_count, 1);
@@ -799,6 +965,581 @@ fn canonical_dataset_serializes_as_full_code_analysis_objects_in_provider_order(
 }
 
 #[test]
+fn all_time_batch_json_preserves_non_claude_full_effects() {
+    let home = TempHome::new();
+    let codex = home.put_codex_session(
+        "2026/04/23/rollout.jsonl",
+        &fixture_str("sessions/codex.jsonl"),
+    );
+    let copilot = home.put(
+        ".copilot/session-state/test-session/events.jsonl",
+        &fixture_str("sessions/copilot.jsonl"),
+    );
+    let gemini = home.put_gemini_session(
+        "proj-hash",
+        "chat.jsonl",
+        &fixture_str("sessions/gemini.jsonl"),
+    );
+    let grok = home.put_grok_fixture_session("workspace", "grok-session");
+
+    for (provider, path) in [
+        (ExtensionType::Codex, codex),
+        (ExtensionType::Copilot, copilot),
+        (ExtensionType::Gemini, gemini),
+        (ExtensionType::Grok, grok),
+    ] {
+        let expected = parse_session_file_as(&path, provider, ParseMode::Full).unwrap();
+        let dataset = collect_analysis_sessions_from_paths_with(
+            &home.paths,
+            TimeRange::All,
+            providers_only(provider),
+            ParseMode::Full,
+        )
+        .unwrap();
+        assert_eq!(dataset.len(), 1, "provider={provider}");
+        assert_effect_fields_equal(&dataset.sessions[0].analysis, &expected);
+        let compact = collect_analysis_sessions_from_paths_with(
+            &home.paths,
+            TimeRange::All,
+            providers_only(provider),
+            ParseMode::UsageOnly,
+        )
+        .unwrap();
+        assert_eq!(
+            compact.sessions[0].analysis.records[0].total_unique_files,
+            expected.records[0].total_unique_files,
+            "UsageOnly unique files drifted for provider={provider}"
+        );
+    }
+
+    let timestamp_ms = Local::now().timestamp_millis();
+    seed_opencode_analysis_db(&home.paths.opencode_db, timestamp_ms);
+    let expected = read_opencode_analysis(&home.paths.opencode_db, TimeRange::All, ParseMode::Full)
+        .unwrap()
+        .remove(0)
+        .1;
+    let dataset = collect_analysis_sessions_from_paths_with(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::OpenCode),
+        ParseMode::Full,
+    )
+    .unwrap();
+    assert_eq!(dataset.len(), 1);
+    assert_effect_fields_equal(&dataset.sessions[0].analysis, &expected);
+    let compact = collect_analysis_sessions_from_paths_with(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::OpenCode),
+        ParseMode::UsageOnly,
+    )
+    .unwrap();
+    assert_eq!(
+        compact.sessions[0].analysis.records[0].total_unique_files,
+        expected.records[0].total_unique_files
+    );
+
+    let cursor_store = home.put_cursor_session(
+        "cursor-project",
+        "cursor-conversation",
+        "cursor-model",
+        timestamp_ms,
+        123,
+    );
+    let cursor_result = json!({
+        "role": "tool",
+        "content": [{
+            "type": "tool-result",
+            "toolName": "Write",
+            "toolCallId": "write",
+            "result": "ok"
+        }]
+    })
+    .to_string()
+    .into_bytes();
+    Connection::open(cursor_store)
+        .unwrap()
+        .execute(
+            "INSERT INTO blobs (id, data) VALUES ('result', ?1)",
+            params![cursor_result],
+        )
+        .unwrap();
+    let expected = read_cursor_analysis(
+        &home.paths.cursor_chats_dir,
+        &home.paths.cursor_tracking_db,
+        TimeRange::All,
+        ParseMode::Full,
+    )
+    .unwrap()
+    .remove(0)
+    .1;
+    let dataset = collect_analysis_sessions_from_paths_with(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::Cursor),
+        ParseMode::Full,
+    )
+    .unwrap();
+    assert_eq!(dataset.len(), 1);
+    assert_effect_fields_equal(&dataset.sessions[0].analysis, &expected);
+    let compact = collect_analysis_sessions_from_paths_with(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::Cursor),
+        ParseMode::UsageOnly,
+    )
+    .unwrap();
+    assert_eq!(
+        compact.sessions[0].analysis.records[0].total_unique_files,
+        expected.records[0].total_unique_files
+    );
+}
+
+#[test]
+fn batch_json_filters_claude_usage_and_tools_by_event_time_within_one_source() {
+    let home = TempHome::new();
+    let old = (Local::now() - Duration::days(10)).to_rfc3339_opts(SecondsFormat::Secs, true);
+    let today = Local::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let contents = format!(
+        "{}{}",
+        claude_read_lifecycle(
+            "old-message",
+            "old-tool",
+            &old,
+            "/repo/old.rs",
+            "old\ncontent",
+            10,
+        ),
+        claude_read_lifecycle(
+            "today-message",
+            "today-tool",
+            &today,
+            "/repo/today.rs",
+            "one\ntwo\nthree",
+            20,
+        ),
+    );
+    let source = home.put_claude_session("project", "resume.jsonl", &contents);
+    std::fs::File::open(source)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
+        .unwrap();
+
+    let dataset = collect_analysis_sessions_from_paths_with(
+        &home.paths,
+        TimeRange::Daily,
+        providers_only(ExtensionType::ClaudeCode),
+        ParseMode::Full,
+    )
+    .unwrap();
+    assert_eq!(dataset.len(), 1);
+    let record = &dataset.sessions[0].analysis.records[0];
+    assert_eq!(record.tool_call_counts.read, 1);
+    assert_eq!(record.total_read_lines, 3);
+    assert_eq!(record.total_unique_files, 1);
+    assert_eq!(record.read_file_details.len(), 1);
+    assert_eq!(record.read_file_details[0].base.file_path, "/repo/today.rs");
+    assert_eq!(
+        record.conversation_usage["claude-test-model"]["input_tokens"],
+        20
+    );
+}
+
+#[test]
+fn batch_record_timestamp_uses_latest_lifecycle_observation() {
+    let home = TempHome::new();
+    let invocation =
+        (Local::now() - Duration::minutes(2)).to_rfc3339_opts(SecondsFormat::Millis, true);
+    let outcome =
+        (Local::now() - Duration::minutes(1)).to_rfc3339_opts(SecondsFormat::Millis, true);
+    let assistant = json!({
+        "parentUuid": null,
+        "sessionId": "session",
+        "type": "assistant",
+        "timestamp": &invocation,
+        "message": {
+            "id": "message",
+            "model": "claude-test",
+            "usage": { "input_tokens": 1, "output_tokens": 0 },
+            "content": [{
+                "type": "tool_use",
+                "id": "read",
+                "name": "Read",
+                "input": { "file_path": "/tmp/a" }
+            }]
+        }
+    });
+    let result = json!({
+        "parentUuid": "assistant",
+        "sessionId": "session",
+        "type": "user",
+        "timestamp": &outcome,
+        "isSidechain": true,
+        "message": { "content": [{
+            "type": "tool_result",
+            "tool_use_id": "read",
+            "content": "one"
+        }] }
+    });
+    let source = home.put_claude_session(
+        "project",
+        "lifecycle.jsonl",
+        &format!("{assistant}\n{result}\n"),
+    );
+    let direct =
+        parse_session_file_as(&source, ExtensionType::ClaudeCode, ParseMode::Full).unwrap();
+
+    let dataset = collect_analysis_sessions_from_paths_with(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::ClaudeCode),
+        ParseMode::Full,
+    )
+    .unwrap();
+
+    assert_eq!(
+        dataset.sessions[0].analysis.records[0].timestamp,
+        direct.records[0].timestamp
+    );
+    assert_eq!(
+        dataset.sessions[0].analysis.records[0].timestamp,
+        vibe_coding_tracker::utils::parse_iso_timestamp(&outcome)
+    );
+}
+
+#[test]
+fn batch_json_filters_codex_full_patch_effects_by_invocation_time() {
+    let home = TempHome::new();
+    let old = (Local::now() - Duration::days(10)).to_rfc3339_opts(SecondsFormat::Secs, true);
+    let today = Local::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let turn_context = json!({
+        "timestamp": &old,
+        "type": "turn_context",
+        "payload": { "model": "gpt-test" }
+    });
+    let contents = format!(
+        "{turn_context}\n{}{}",
+        codex_patch_lifecycle("old-patch", &old, "src/old.rs"),
+        codex_patch_lifecycle("today-patch", &today, "src/today.rs"),
+    );
+    home.put_codex_session("2026/07/16/rollout.jsonl", &contents);
+
+    let dataset = collect_analysis_sessions_from_paths_with(
+        &home.paths,
+        TimeRange::Daily,
+        providers_only(ExtensionType::Codex),
+        ParseMode::Full,
+    )
+    .unwrap();
+    assert_eq!(dataset.len(), 1);
+    let record = &dataset.sessions[0].analysis.records[0];
+    assert_eq!(record.tool_call_counts.edit, 1);
+    assert_eq!(record.total_edit_lines, 1);
+    assert_eq!(record.total_edit_characters, 3);
+    assert_eq!(record.total_unique_files, 1);
+    assert_eq!(record.edit_file_details.len(), 1);
+    assert_eq!(record.edit_file_details[0].base.file_path, "src/today.rs");
+    assert_eq!(record.edit_file_details[0].old_string, "old");
+    assert_eq!(record.edit_file_details[0].new_string, "new");
+}
+
+#[test]
+fn unnormalizable_codex_fact_does_not_bypass_cross_source_deduplication() {
+    let home = TempHome::new();
+    let timestamp = Local::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let context = json!({
+        "timestamp": &timestamp,
+        "type": "turn_context",
+        "payload": { "model": "gpt-test" }
+    });
+    let patch_event = |call_id: &str, change_type: &str, path: &str| {
+        json!({
+            "timestamp": &timestamp,
+            "type": "event_msg",
+            "payload": {
+                "type": "patch_apply_end",
+                "call_id": call_id,
+                "success": true,
+                "status": "completed",
+                "stdout": "Success. Updated the following files:",
+                "stderr": "",
+                "changes": {
+                    (path): {
+                        "type": change_type,
+                        "unified_diff": "@@ -1 +1 @@\n-old\n+new\n",
+                        "move_path": null
+                    }
+                }
+            }
+        })
+    };
+    let duplicate = patch_event("duplicate", "update", "/tmp/duplicate.rs");
+    home.put_codex_session(
+        "2026/07/12/a-canonical.jsonl",
+        &format!("{context}\n{duplicate}\n"),
+    );
+    let unsupported = patch_event("unsupported", "future_change", "/tmp/future.rs");
+    home.put_codex_session(
+        "2026/07/12/b-contains-fallback.jsonl",
+        &format!("{context}\n{unsupported}\n{duplicate}\n"),
+    );
+
+    let dataset = collect_analysis_sessions_from_paths_with(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::Codex),
+        ParseMode::Full,
+    )
+    .unwrap();
+    let edit_count: usize = dataset
+        .sessions
+        .iter()
+        .map(|session| session.analysis.records[0].tool_call_counts.edit)
+        .sum();
+    assert_eq!(edit_count, 2);
+}
+
+#[test]
+fn batch_json_deduplicates_split_claude_message_and_tool_lifecycles_across_sources() {
+    let home = TempHome::new();
+    let invocation_time =
+        (Local::now() - Duration::minutes(2)).to_rfc3339_opts(SecondsFormat::Secs, true);
+    let outcome_time =
+        (Local::now() - Duration::minutes(1)).to_rfc3339_opts(SecondsFormat::Secs, true);
+    let invocation = json!({
+        "parentUuid": null,
+        "sessionId": "session",
+        "type": "assistant",
+        "timestamp": invocation_time,
+        "message": {
+            "id": "shared-message",
+            "model": "claude-test-model",
+            "usage": { "input_tokens": 10, "output_tokens": 0 },
+            "content": [{
+                "type": "tool_use",
+                "id": "shared-tool",
+                "name": "Read",
+                "input": { "file_path": "/repo/shared.rs" }
+            }]
+        }
+    });
+    home.put_claude_session("project", "a-invocation.jsonl", &format!("{invocation}\n"));
+
+    let usage_snapshot = json!({
+        "parentUuid": null,
+        "sessionId": "session",
+        "type": "assistant",
+        "timestamp": &outcome_time,
+        "message": {
+            "id": "shared-message",
+            "model": "claude-test-model",
+            "usage": { "input_tokens": 20, "output_tokens": 0 },
+            "content": []
+        }
+    });
+    let outcome = json!({
+        "parentUuid": "assistant",
+        "sessionId": "session",
+        "type": "user",
+        "timestamp": &outcome_time,
+        "message": {
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "shared-tool",
+                "content": "one\ntwo"
+            }]
+        },
+        "toolUseResult": {
+            "type": "text",
+            "file": { "filePath": "/repo/shared.rs", "content": "one\ntwo" }
+        }
+    });
+    home.put_claude_session(
+        "project",
+        "b-outcome.jsonl",
+        &format!("{usage_snapshot}\n{outcome}\n"),
+    );
+
+    let dataset = collect_analysis_sessions_from_paths_with(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::ClaudeCode),
+        ParseMode::Full,
+    )
+    .unwrap();
+    assert_eq!(dataset.len(), 2);
+    let invocation_record = &dataset.sessions[0].analysis.records[0];
+    assert_eq!(invocation_record.tool_call_counts.read, 1);
+    assert_eq!(invocation_record.total_read_lines, 2);
+    assert_eq!(invocation_record.total_read_characters, 7);
+    assert_eq!(invocation_record.total_unique_files, 1);
+    assert_eq!(invocation_record.read_file_details.len(), 1);
+    assert_eq!(
+        dataset
+            .sessions
+            .iter()
+            .map(|session| session.analysis.records[0].tool_call_counts.read)
+            .sum::<usize>(),
+        1
+    );
+    assert_eq!(
+        dataset
+            .sessions
+            .iter()
+            .map(|session| session.analysis.records[0].read_file_details.len())
+            .sum::<usize>(),
+        1
+    );
+    assert_eq!(
+        dataset
+            .sessions
+            .iter()
+            .filter_map(|session| {
+                session.analysis.records[0]
+                    .conversation_usage
+                    .get("claude-test-model")
+                    .and_then(|usage| usage["input_tokens"].as_i64())
+            })
+            .sum::<i64>(),
+        20
+    );
+    let summarized = dataset.summarize();
+    assert_eq!(summarized.rows.len(), 1);
+    assert_eq!(summarized.rows[0].model, "claude-test-model");
+    assert_eq!(summarized.rows[0].read_count, 1);
+    assert_eq!(summarized.rows[0].read_lines, 2);
+}
+
+#[test]
+fn gemini_revised_snapshots_keep_each_tool_independent_of_file_order() {
+    let timestamp = Local::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let meta = json!({
+        "sessionId": "session",
+        "projectHash": "project",
+        "startTime": &timestamp,
+        "lastUpdated": &timestamp
+    });
+    let revision = |tools: serde_json::Value| {
+        json!({
+            "id": "shared-message",
+            "timestamp": &timestamp,
+            "type": "gemini",
+            "model": "gemini-test",
+            "tokens": { "input": 1, "output": 0, "cached": 0, "thoughts": 0, "tool": 0, "total": 1 },
+            "toolCalls": tools
+        })
+    };
+    let first = revision(json!([{
+        "id": "write-a",
+        "name": "write_file",
+        "status": "success",
+        "timestamp": &timestamp,
+        "args": { "file_path": "/tmp/a", "content": "a" }
+    }]));
+    let latest = revision(json!([
+        {
+            "id": "write-a",
+            "name": "write_file",
+            "status": "success",
+            "timestamp": &timestamp,
+            "args": { "file_path": "/tmp/a", "content": "a" }
+        },
+        {
+            "id": "write-b",
+            "name": "write_file",
+            "status": "success",
+            "timestamp": &timestamp,
+            "args": { "file_path": "/tmp/b", "content": "b" }
+        }
+    ]));
+
+    for swap in [false, true] {
+        let home = TempHome::new();
+        let (a, b) = if swap {
+            (&latest, &first)
+        } else {
+            (&first, &latest)
+        };
+        home.put_gemini_session("project", "a.jsonl", &format!("{meta}\n{a}\n"));
+        home.put_gemini_session("project", "b.jsonl", &format!("{meta}\n{b}\n"));
+
+        let dataset = collect_analysis_sessions_from_paths_with(
+            &home.paths,
+            TimeRange::All,
+            providers_only(ExtensionType::Gemini),
+            ParseMode::Full,
+        )
+        .unwrap();
+        let write_count: usize = dataset
+            .sessions
+            .iter()
+            .map(|session| session.analysis.records[0].tool_call_counts.write)
+            .sum();
+        let unique_files: usize = dataset
+            .sessions
+            .iter()
+            .map(|session| session.analysis.records[0].total_unique_files)
+            .sum();
+        assert_eq!(write_count, 2, "swap={swap}");
+        assert_eq!(unique_files, 2, "swap={swap}");
+        let row = aggregate_sessions_by_model_from_paths_with_diagnostics(
+            &home.paths,
+            TimeRange::All,
+            providers_only(ExtensionType::Gemini),
+        )
+        .unwrap()
+        .data
+        .rows
+        .into_iter()
+        .find(|row| row.model == "gemini-test")
+        .unwrap();
+        assert_eq!(row.write_count, 2, "swap={swap}");
+    }
+}
+
+#[test]
+fn gemini_tool_timestamp_controls_bounded_analysis_range() {
+    let home = TempHome::new();
+    let old = (Local::now() - Duration::days(10)).to_rfc3339_opts(SecondsFormat::Millis, true);
+    let recent = Local::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let meta = json!({
+        "sessionId": "session",
+        "projectHash": "project",
+        "startTime": &old,
+        "lastUpdated": &recent
+    });
+    let message = json!({
+        "id": "message",
+        "timestamp": &old,
+        "type": "gemini",
+        "model": "gemini-test",
+        "toolCalls": [{
+            "id": "recent-write",
+            "name": "write_file",
+            "status": "success",
+            "timestamp": &recent,
+            "args": { "file_path": "/tmp/recent", "content": "recent" }
+        }]
+    });
+    home.put_gemini_session("project", "chat.jsonl", &format!("{meta}\n{message}\n"));
+
+    let dataset = collect_analysis_sessions_from_paths_with(
+        &home.paths,
+        TimeRange::Daily,
+        providers_only(ExtensionType::Gemini),
+        ParseMode::Full,
+    )
+    .unwrap();
+    assert_eq!(dataset.len(), 1);
+    assert_eq!(
+        dataset.sessions[0].analysis.records[0]
+            .tool_call_counts
+            .write,
+        1
+    );
+}
+
+#[test]
 fn conversation_usage_keys_have_a_stable_serialization_order() {
     let mut first = parse_session_file_as(
         fixture("sessions/claude_code.jsonl"),
@@ -1191,7 +1932,7 @@ fn analyzer_payload_schema_drift_fails_for_every_file_provider() {
 }
 
 #[test]
-fn copilot_tracked_tool_argument_drift_is_not_a_false_success() {
+fn copilot_tracked_tool_argument_drift_keeps_only_the_invocation() {
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("copilot-tool.jsonl");
     std::fs::write(
@@ -1207,8 +1948,272 @@ fn copilot_tracked_tool_argument_drift_is_not_a_false_success() {
     )
     .unwrap();
 
-    let error = parse_session_file_typed(path).unwrap_err();
-    assert!(error.to_string().contains("none used a supported schema"));
+    let analysis = parse_session_file_typed(path).unwrap();
+    let record = &analysis.records[0];
+    assert_eq!(record.tool_call_counts.read, 1);
+    assert_eq!(record.total_read_lines, 0);
+    assert_eq!(record.total_unique_files, 0);
+    assert!(record.read_file_details.is_empty());
+}
+
+#[test]
+fn single_file_and_batch_summaries_keep_tool_invocation_model() {
+    let home = TempHome::new();
+    let path = home.put(
+        ".copilot/session-state/model-switch/events.jsonl",
+        concat!(
+            r#"{"type":"session.start","data":{"sessionId":"session","producer":"copilot-cli"},"timestamp":"2026-07-12T00:00:00Z"}"#,
+            "\n",
+            r#"{"type":"session.model_change","data":{"newModel":"model-a"},"timestamp":"2026-07-12T00:00:01Z"}"#,
+            "\n",
+            r#"{"type":"tool.execution_start","data":{"toolCallId":"read-a","toolName":"show_file","arguments":{"path":"/tmp/a.txt"}},"timestamp":"2026-07-12T00:00:02Z"}"#,
+            "\n",
+            r#"{"type":"tool.execution_complete","data":{"toolCallId":"read-a","success":true,"result":{"content":"one\ntwo"}},"timestamp":"2026-07-12T00:00:03Z"}"#,
+            "\n",
+            r#"{"type":"session.model_change","data":{"newModel":"model-b"},"timestamp":"2026-07-12T00:00:04Z"}"#,
+            "\n",
+            r#"{"type":"tool.execution_start","data":{"toolCallId":"bash-b","toolName":"write_bash","arguments":{"command":"pwd"}},"timestamp":"2026-07-12T00:00:05Z"}"#,
+            "\n",
+            r#"{"type":"tool.execution_complete","data":{"toolCallId":"bash-b","success":true,"result":{"content":"/tmp"}},"timestamp":"2026-07-12T00:00:06Z"}"#,
+            "\n"
+        ),
+    );
+
+    let (_, single, _) = project_session_file(&path, ParseMode::UsageOnly).unwrap();
+    let model_a = single
+        .rows
+        .iter()
+        .find(|row| row.model == "model-a")
+        .unwrap();
+    let model_b = single
+        .rows
+        .iter()
+        .find(|row| row.model == "model-b")
+        .unwrap();
+    assert_eq!(model_a.read_count, 1);
+    assert_eq!(model_a.read_lines, 2);
+    assert_eq!(model_a.bash_count, 0);
+    assert_eq!(model_b.read_count, 0);
+    assert_eq!(model_b.bash_count, 1);
+
+    let summary = aggregate_sessions_by_model_from_paths_with_diagnostics(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::Copilot),
+    )
+    .unwrap()
+    .data;
+    let model_a = summary
+        .rows
+        .iter()
+        .find(|row| row.model == "model-a")
+        .unwrap();
+    let model_b = summary
+        .rows
+        .iter()
+        .find(|row| row.model == "model-b")
+        .unwrap();
+    assert_eq!(model_a.read_count, 1);
+    assert_eq!(model_a.bash_count, 0);
+    assert_eq!(model_b.read_count, 0);
+    assert_eq!(model_b.bash_count, 1);
+
+    let mut dataset = collect_analysis_sessions_from_paths_with(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::Copilot),
+        ParseMode::Full,
+    )
+    .unwrap();
+    let public_summary = dataset.summarize();
+    assert_eq!(public_summary.rows.len(), 1);
+    assert_eq!(public_summary.rows[0].model, "unknown");
+    assert_eq!(public_summary.rows[0].read_count, 1);
+    assert_eq!(public_summary.rows[0].bash_count, 1);
+    dataset.sessions.clear();
+    assert!(dataset.summarize().rows.is_empty());
+}
+
+#[test]
+fn usage_presence_replay_uses_the_canonical_event_time() {
+    let home = TempHome::new();
+    let old = (Local::now() - Duration::days(10)).to_rfc3339_opts(SecondsFormat::Secs, true);
+    let recent = Local::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let message = |timestamp: &str, input_tokens: i64| {
+        json!({
+            "parentUuid": null,
+            "sessionId": "session",
+            "type": "assistant",
+            "timestamp": timestamp,
+            "message": {
+                "id": "shared-message",
+                "model": "claude-replayed-model",
+                "usage": { "input_tokens": input_tokens, "output_tokens": 1 },
+                "content": []
+            }
+        })
+    };
+    home.put_claude_session("project", "old.jsonl", &message(&old, 1).to_string());
+    home.put_claude_session("project", "recent.jsonl", &message(&recent, 2).to_string());
+
+    let dataset = collect_analysis_sessions_from_paths_with(
+        &home.paths,
+        TimeRange::Daily,
+        providers_only(ExtensionType::ClaudeCode),
+        ParseMode::Full,
+    )
+    .unwrap();
+    assert!(dataset.sessions.is_empty());
+    assert!(dataset.summarize().rows.is_empty());
+    assert_eq!(dataset.summarize().provider_days.claude, 0);
+
+    let mut cache = SummaryScanCache::default();
+    for _ in 0..2 {
+        let summary = aggregate_sessions_by_model_from_paths_with_cache(
+            &home.paths,
+            TimeRange::Daily,
+            providers_only(ExtensionType::ClaudeCode),
+            &mut cache,
+        )
+        .unwrap();
+        assert!(summary.data.rows.is_empty());
+        assert_eq!(summary.data.provider_days.claude, 0);
+    }
+}
+
+#[test]
+fn advisor_usage_does_not_create_an_analysis_model_row() {
+    let home = TempHome::new();
+    let timestamp = Local::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let source = home.put_claude_session(
+        "project",
+        "advisor.jsonl",
+        &json!({
+            "parentUuid": null,
+            "sessionId": "session",
+            "type": "assistant",
+            "timestamp": timestamp,
+            "message": {
+                "id": "message",
+                "model": "claude-main",
+                "usage": {
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "iterations": [
+                        { "type": "message", "input_tokens": 1, "output_tokens": 1 },
+                        { "type": "advisor_message", "model": "claude-advisor",
+                          "input_tokens": 10, "output_tokens": 2 }
+                    ]
+                },
+                "content": []
+            }
+        })
+        .to_string(),
+    );
+
+    let (_, direct, _) = project_session_file(&source, ParseMode::UsageOnly).unwrap();
+    assert_eq!(direct.rows.len(), 1);
+    assert_eq!(direct.rows[0].model, "claude-main");
+
+    let dataset = collect_analysis_sessions_from_paths_with(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::ClaudeCode),
+        ParseMode::Full,
+    )
+    .unwrap();
+    assert_eq!(dataset.summarize().rows.len(), 1);
+    assert_eq!(dataset.summarize().rows[0].model, "claude-main");
+}
+
+#[test]
+fn single_file_without_timestamp_keeps_one_synthetic_active_day() {
+    let home = TempHome::new();
+    let source = home.put_claude_session(
+        "project",
+        "missing-timestamp.jsonl",
+        &json!({
+            "parentUuid": null,
+            "sessionId": "session",
+            "type": "assistant",
+            "message": {
+                "id": "message",
+                "model": "claude-no-timestamp",
+                "usage": { "input_tokens": 1, "output_tokens": 1 },
+                "content": []
+            }
+        })
+        .to_string(),
+    );
+
+    let (_, summary, _) = project_session_file(&source, ParseMode::UsageOnly).unwrap();
+    assert_eq!(summary.rows.len(), 1);
+    assert_eq!(summary.rows[0].model, "claude-no-timestamp");
+    assert_eq!(summary.provider_days.claude, 1);
+    assert_eq!(summary.provider_days.total, 1);
+}
+
+#[test]
+fn zero_tool_model_and_active_day_survive_every_analysis_projection() {
+    let home = TempHome::new();
+    let timestamp = Local::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let source = home.put_claude_session(
+        "project",
+        "usage-only.jsonl",
+        &json!({
+            "parentUuid": null,
+            "sessionId": "session",
+            "type": "assistant",
+            "timestamp": &timestamp,
+            "message": {
+                "id": "message",
+                "model": "claude-zero-tool",
+                "usage": { "input_tokens": 1, "output_tokens": 1 },
+                "content": []
+            }
+        })
+        .to_string(),
+    );
+
+    let (_, direct, _) = project_session_file(&source, ParseMode::UsageOnly).unwrap();
+    assert_eq!(direct.rows.len(), 1);
+    assert_eq!(direct.rows[0].model, "claude-zero-tool");
+    assert_eq!(direct.provider_days.claude, 1);
+
+    let dataset = collect_analysis_sessions_from_paths_with(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::ClaudeCode),
+        ParseMode::Full,
+    )
+    .unwrap();
+    let summarized = dataset.summarize();
+    assert_eq!(summarized.rows.len(), 1);
+    assert_eq!(summarized.rows[0].model, "claude-zero-tool");
+    assert_eq!(summarized.provider_days.claude, 1);
+
+    let mut cache = SummaryScanCache::default();
+    let cold = aggregate_sessions_by_model_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::ClaudeCode),
+        &mut cache,
+    )
+    .unwrap();
+    assert_eq!(cold.data.rows.len(), 1);
+    assert_eq!(cold.data.rows[0].model, "claude-zero-tool");
+    assert_eq!(cold.data.provider_days.claude, 1);
+    let warm = aggregate_sessions_by_model_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::ClaudeCode),
+        &mut cache,
+    )
+    .unwrap();
+    assert_eq!(warm.data.rows.len(), 1);
+    assert_eq!(warm.data.rows[0].model, "claude-zero-tool");
+    assert_eq!(warm.data.provider_days.claude, 1);
+    assert_eq!(cache.stats().parsed_sources, 0);
 }
 
 #[test]
@@ -1268,7 +2273,8 @@ fn codex_unknown_apply_patch_output_surfaces_source_diagnostics() {
 
     let (analysis, diagnostics) =
         parse_session_file_typed_with_mode_and_diagnostics(&path, ParseMode::Full).unwrap();
-    assert_eq!(analysis.records[0].tool_call_counts.edit, 0);
+    assert_eq!(analysis.records[0].tool_call_counts.edit, 1);
+    assert!(analysis.records[0].edit_file_details.is_empty());
     assert_eq!(diagnostics.skipped_records(), 1);
 
     let dataset = collect_analysis_sessions_from_paths_with(

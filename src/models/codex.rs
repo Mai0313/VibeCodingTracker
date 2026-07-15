@@ -120,24 +120,32 @@ pub struct CodexPayload {
     /// Correlation id linking a function call to its output.
     pub call_id: Option<String>,
     /// Normalized function/custom-tool output body; text blocks are flattened.
-    #[serde(default, deserialize_with = "deserialize_tool_output")]
+    #[serde(
+        default,
+        alias = "stdout",
+        deserialize_with = "deserialize_tool_output"
+    )]
     pub output: Option<String>,
-    /// Free-form message text for event-message payloads.
+    /// Free-form message text, or structured lifecycle stderr.
+    #[serde(alias = "stderr")]
     pub message: Option<String>,
-    /// Token-usage / event info blob, shape depends on the event.
+    /// Token-usage info, or structured patch effects keyed by path.
+    #[serde(alias = "changes")]
     pub info: Option<Value>,
     /// Working directory recorded in session-meta / turn-context payloads.
     pub cwd: Option<String>,
-    /// Approval policy in effect for the turn.
+    /// Approval policy, or a structured lifecycle status such as `completed`.
+    #[serde(alias = "status")]
     pub approval_policy: Option<String>,
-    /// Sandbox policy blob in effect for the turn.
+    /// Sandbox policy blob, or a structured lifecycle success flag.
+    #[serde(alias = "success")]
     pub sandbox_policy: Option<Value>,
     /// Model name driving the turn.
     pub model: Option<String>,
     /// Reasoning-effort setting for the turn.
     pub effort: Option<String>,
-    /// Reasoning summary text, when present.
-    pub summary: Option<String>,
+    /// Reasoning summary payload, which may be text or structured blocks.
+    pub summary: Option<Value>,
     /// Record identifier.
     pub id: Option<String>,
     /// Originator label (which client produced the session).
@@ -280,6 +288,19 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_summary_accepts_structured_blocks() {
+        let parsed = payload(json!({
+            "type": "reasoning",
+            "summary": [{ "type": "summary_text", "text": "result" }]
+        }));
+
+        assert_eq!(
+            parsed.summary,
+            Some(json!([{ "type": "summary_text", "text": "result" }]))
+        );
+    }
+
+    #[test]
     fn output_accepts_missing_null_string_and_object_shapes() {
         assert_eq!(payload(json!({})).output, None);
         assert_eq!(payload(json!({ "output": null })).output, None);
@@ -326,5 +347,32 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn patch_apply_end_fields_deserialize() {
+        let parsed = payload(json!({
+            "type": "patch_apply_end",
+            "call_id": "call-1",
+            "success": true,
+            "stdout": "Success. Updated the following files:\nM old.rs\n",
+            "stderr": "",
+            "status": "completed",
+            "changes": {
+                "/repo/old.rs": {
+                    "type": "update",
+                    "unified_diff": "@@ -1 +1 @@\n-old\n+new\n",
+                    "move_path": "/repo/new.rs"
+                }
+            }
+        }));
+
+        assert_eq!(parsed.sandbox_policy, Some(json!(true)));
+        assert_eq!(parsed.approval_policy.as_deref(), Some("completed"));
+        assert_eq!(parsed.message.as_deref(), Some(""));
+        let changes = parsed.info.unwrap();
+        let change = &changes["/repo/old.rs"];
+        assert_eq!(change["type"], "update");
+        assert_eq!(change["move_path"], "/repo/new.rs");
     }
 }

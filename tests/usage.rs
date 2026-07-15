@@ -7,10 +7,13 @@
 
 mod common;
 
+use chrono::{Duration, Local, SecondsFormat};
 use common::{TempHome, append_cursor_json_blob, fixture_str};
 use rusqlite::{Connection, params};
+use serde_json::json;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use std::time::SystemTime;
 use vibe_coding_tracker::cli::TimeRange;
 use vibe_coding_tracker::config::ProvidersConfig;
 use vibe_coding_tracker::models::ExtensionType;
@@ -57,6 +60,27 @@ fn cursor_only() -> ProvidersConfig {
         hermes: false,
         grok: false,
     }
+}
+
+fn claude_usage_event(id: &str, timestamp: Option<&str>, input_tokens: i64) -> String {
+    let mut event = json!({
+        "parentUuid": null,
+        "sessionId": "session",
+        "type": "assistant",
+        "message": {
+            "id": id,
+            "model": "claude-test-model",
+            "content": [],
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": 0
+            }
+        }
+    });
+    if let Some(timestamp) = timestamp {
+        event["timestamp"] = json!(timestamp);
+    }
+    format!("{event}\n")
 }
 
 fn seed_opencode_usage_db(path: &std::path::Path) {
@@ -256,6 +280,128 @@ fn cached_usage_matches_uncached_for_every_provider_source() {
     assert_eq!(cache.stats().parsed_sources, 0);
     assert_eq!(warm.diagnostics, cold.diagnostics);
     assert_usage_data_eq(&warm.data, &uncached);
+}
+
+#[test]
+fn usage_time_ranges_follow_event_timestamps_and_reuse_cached_facts() {
+    let home = TempHome::new();
+    let today = Local::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let old = (Local::now() - Duration::days(10)).to_rfc3339_opts(SecondsFormat::Secs, true);
+    let contents = format!(
+        "{}{}",
+        claude_usage_event("old", Some(&old), 10),
+        claude_usage_event("today", Some(&today), 20),
+    );
+    home.put_claude_session("project", "resume.jsonl", &contents);
+    let mut cache = SummaryScanCache::new();
+
+    let all =
+        get_usage_from_paths_with_cache(&home.paths, TimeRange::All, claude_only(), &mut cache)
+            .unwrap();
+    assert_eq!(cache.stats().parsed_sources, 1);
+    assert_eq!(
+        all.data.per_provider.claude["claude-test-model"]["input_tokens"],
+        30
+    );
+
+    let daily =
+        get_usage_from_paths_with_cache(&home.paths, TimeRange::Daily, claude_only(), &mut cache)
+            .unwrap();
+    assert_eq!(cache.stats().parsed_sources, 0);
+    assert_eq!(
+        daily.data.per_provider.claude["claude-test-model"]["input_tokens"],
+        20
+    );
+}
+
+#[test]
+fn usage_discovery_does_not_use_source_mtime_as_event_time() {
+    let home = TempHome::new();
+    let today = Local::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let old = (Local::now() - Duration::days(10)).to_rfc3339_opts(SecondsFormat::Secs, true);
+    let old_mtime = home.put_claude_session(
+        "project",
+        "old-mtime.jsonl",
+        &claude_usage_event("today-event", Some(&today), 11),
+    );
+    std::fs::File::open(&old_mtime)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
+        .unwrap();
+    home.put_claude_session(
+        "project",
+        "today-mtime.jsonl",
+        &claude_usage_event("old-event", Some(&old), 29),
+    );
+
+    let data = get_usage_from_paths_with(&home.paths, TimeRange::Daily, claude_only()).unwrap();
+    assert_eq!(
+        data.per_provider.claude["claude-test-model"]["input_tokens"],
+        11
+    );
+}
+
+#[test]
+fn usage_missing_timestamp_is_kept_only_for_all_time() {
+    let home = TempHome::new();
+    home.put_claude_session(
+        "project",
+        "missing-time.jsonl",
+        &claude_usage_event("missing-time", None, 13),
+    );
+    let mut cache = SummaryScanCache::new();
+
+    let all =
+        get_usage_from_paths_with_cache(&home.paths, TimeRange::All, claude_only(), &mut cache)
+            .unwrap();
+    assert_eq!(
+        all.data.per_provider.claude["claude-test-model"]["input_tokens"],
+        13
+    );
+    let daily =
+        get_usage_from_paths_with_cache(&home.paths, TimeRange::Daily, claude_only(), &mut cache)
+            .unwrap();
+    assert_eq!(cache.stats().parsed_sources, 0);
+    assert!(daily.data.per_provider.claude.is_empty());
+}
+
+#[test]
+fn claude_usage_snapshots_deduplicate_across_sources_and_promote_after_deletion() {
+    let home = TempHome::new();
+    let first_time =
+        (Local::now() - Duration::minutes(2)).to_rfc3339_opts(SecondsFormat::Secs, true);
+    let second_time =
+        (Local::now() - Duration::minutes(1)).to_rfc3339_opts(SecondsFormat::Secs, true);
+    let first = home.put_claude_session(
+        "project",
+        "first.jsonl",
+        &claude_usage_event("shared-message", Some(&first_time), 10),
+    );
+    let second = home.put_claude_session(
+        "project",
+        "second.jsonl",
+        &claude_usage_event("shared-message", Some(&second_time), 20),
+    );
+    let mut cache = SummaryScanCache::new();
+
+    let deduplicated =
+        get_usage_from_paths_with_cache(&home.paths, TimeRange::All, claude_only(), &mut cache)
+            .unwrap();
+    assert_eq!(
+        deduplicated.data.per_provider.claude["claude-test-model"]["input_tokens"],
+        20
+    );
+
+    std::fs::remove_file(second).unwrap();
+    let promoted =
+        get_usage_from_paths_with_cache(&home.paths, TimeRange::All, claude_only(), &mut cache)
+            .unwrap();
+    assert_eq!(cache.stats().parsed_sources, 0);
+    assert_eq!(
+        promoted.data.per_provider.claude["claude-test-model"]["input_tokens"],
+        10
+    );
+    assert!(first.exists());
 }
 
 #[cfg(unix)]
