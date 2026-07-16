@@ -735,7 +735,10 @@ fn read_store_context(
     with_readonly_connection(store_db, "blobs", "vct-cursor-", "Cursor", |conn| {
         let transaction = conn.unchecked_transaction()?;
         let model = resolve_store_model(&transaction, conv_models, conv_id);
-        let blobs = load_blobs(&transaction)?;
+        // The gauge scan only reads binary DAG nodes; filtering in SQL keeps
+        // the (potentially large) JSON tool-result payloads from ever being
+        // materialized on the usage cheap path.
+        let blobs = load_node_blobs(&transaction)?;
         let mut turns = Vec::new();
         let mut expected_records = 0usize;
         let mut parsed_records = 0usize;
@@ -808,6 +811,17 @@ fn store_meta_model(conn: &Connection) -> Option<String> {
 /// Loads every blob's raw bytes from a store.
 fn load_blobs(conn: &Connection) -> Result<Vec<Vec<u8>>> {
     let mut stmt = conn.prepare("SELECT data FROM blobs ORDER BY id")?;
+    let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Loads only the binary DAG-node blobs (first byte `0x0A`).
+///
+/// The usage gauge path never inspects the JSON message/tool-result blobs the
+/// analysis path joins by `toolCallId`, so it skips them at the SQL layer.
+fn load_node_blobs(conn: &Connection) -> Result<Vec<Vec<u8>>> {
+    let mut stmt =
+        conn.prepare("SELECT data FROM blobs WHERE substr(data, 1, 1) = X'0A' ORDER BY id")?;
     let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
