@@ -71,7 +71,12 @@ where
     let mut custom_calls: FastHashMap<String, CodexCustomCall> = FastHashMap::with_capacity(32);
     // Call ids of direct `apply_patch` custom_tool_calls, so a paired
     // `patch_apply_end` event is not double counted (see the event_msg arm).
-    let mut apply_patch_call_ids: HashSet<String> = HashSet::new();
+    // Call ids whose file ops have already been counted, by either the direct
+    // apply_patch output or its authoritative patch_apply_end event. The first
+    // to actually count wins; the other is skipped. A direct patch whose output
+    // never confirmed success does not register here, so it can't suppress a
+    // successful event.
+    let mut patch_counted_ids: HashSet<String> = HashSet::new();
     let mut diagnostics = ParseDiagnostics::default();
 
     for entry in logs {
@@ -184,19 +189,22 @@ where
                 // records the resulting file changes in a `patch_apply_end` event.
                 // A successful one is the authoritative source of those file ops.
                 if entry.payload.payload_type.as_deref() == Some("patch_apply_end") {
-                    // Skip the completion of a direct apply_patch custom_tool_call;
-                    // that path already counts it. Otherwise this event is the only
-                    // record of the change and must be folded in.
+                    // Skip only when the paired direct apply_patch already
+                    // counted this call_id; otherwise this event is the
+                    // authoritative record of the change and must be folded in.
                     let already_counted = entry
                         .payload
                         .call_id
                         .as_deref()
-                        .is_some_and(|id| apply_patch_call_ids.contains(id));
+                        .is_some_and(|id| patch_counted_ids.contains(id));
                     if matches!(entry.payload.success, Some(true)) && !already_counted {
                         match parse_patch_changes(entry.payload.changes.as_ref()) {
                             Some(patches) => {
                                 for patch in patches {
                                     state.handle_patch(patch, ts);
+                                }
+                                if let Some(id) = entry.payload.call_id.as_deref() {
+                                    patch_counted_ids.insert(id.to_string());
                                 }
                                 diagnostics.record_relevant(true);
                             }
@@ -261,14 +269,6 @@ where
                             if let Some(name) = entry.payload.name.as_deref()
                                 && matches!(name, "exec" | "apply_patch")
                             {
-                                // Remember every direct apply_patch call id up front so a
-                                // later patch_apply_end for the same id is skipped, whichever
-                                // order the call output and the event arrive in.
-                                if name == "apply_patch"
-                                    && let Some(call_id) = entry.payload.call_id.as_deref()
-                                {
-                                    apply_patch_call_ids.insert(call_id.to_string());
-                                }
                                 let call = entry
                                     .payload
                                     .arguments
@@ -291,6 +291,8 @@ where
                                     &mut state,
                                     call,
                                     entry.payload.output.as_deref(),
+                                    call_id,
+                                    &mut patch_counted_ids,
                                 );
                                 diagnostics.record_relevant(normalized);
                             }
@@ -508,6 +510,8 @@ fn dispatch_custom_call(
     state: &mut SessionParseState,
     call: CodexCustomCall,
     output: Option<&str>,
+    call_id: &str,
+    patch_counted_ids: &mut HashSet<String>,
 ) -> bool {
     match call {
         CodexCustomCall::Exec { source, timestamp } => {
@@ -524,8 +528,12 @@ fn dispatch_custom_call(
         CodexCustomCall::ApplyPatch { patches, timestamp } => {
             match custom_apply_patch_result(output) {
                 CustomApplyPatchResult::Success => {
-                    for patch in patches {
-                        state.handle_patch(patch, timestamp);
+                    // Count once per call_id; a paired patch_apply_end for the
+                    // same id is then skipped (whichever arrives first wins).
+                    if patch_counted_ids.insert(call_id.to_string()) {
+                        for patch in patches {
+                            state.handle_patch(patch, timestamp);
+                        }
                     }
                     true
                 }
@@ -639,10 +647,11 @@ impl CodexAnalysisExt for SessionParseState {
                 self.add_write_detail(&resolved, &new_str, ts);
             }
             "delete" => {
+                // A delete is a real file operation on a unique file; record
+                // it even when the diff carried no removed content (an entry
+                // may omit `unified_diff`), consistent with add/update.
                 let content = old_str.trim_end_matches('\n');
-                if !content.is_empty() {
-                    self.add_edit_detail(&resolved, content, "", ts);
-                }
+                self.add_edit_detail_raw(&resolved, content, "", ts);
             }
             _ => {
                 self.add_edit_detail(&resolved, &old_str, &new_str, ts);
@@ -1730,6 +1739,47 @@ mod tests {
         let record = &analysis.records[0];
         assert_eq!(record.tool_call_counts.edit, 1);
         assert_eq!(record.edit_file_details.len(), 1);
+    }
+
+    #[test]
+    fn unrecognized_direct_output_does_not_suppress_authoritative_event() {
+        // A direct apply_patch whose output envelope is unrecognized counts
+        // nothing (Unknown); the paired successful patch_apply_end is the only
+        // authoritative record and must still be folded in.
+        let patch = "*** Begin Patch\n*** Update File: lib.rs\n@@\n-old\n+new\n*** End Patch";
+        let changes = serde_json::json!({
+            "lib.rs": { "type": "update", "unified_diff": "@@ -1,1 +1,1 @@\n-old\n+new\n" }
+        });
+        let logs = vec![
+            response_item(serde_json::json!({
+                "type": "custom_tool_call",
+                "name": "apply_patch",
+                "input": patch,
+                "call_id": "shared-call"
+            })),
+            custom_output("shared-call", Value::String("<unknown envelope>".into())),
+            patch_apply_end("shared-call", true, changes),
+        ];
+
+        let analysis = parse_codex_logs(&logs, ParseMode::Full).unwrap();
+        let record = &analysis.records[0];
+        assert_eq!(record.tool_call_counts.edit, 1);
+        assert_eq!(record.edit_file_details.len(), 1);
+    }
+
+    #[test]
+    fn patch_apply_end_delete_without_diff_counts_the_operation() {
+        let changes = serde_json::json!({
+            "/repo/gone.rs": { "type": "delete" }
+        });
+        let logs = vec![patch_apply_end("call-del", true, changes)];
+
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full, None).unwrap();
+        let record = &parsed.analysis.records[0];
+        assert_eq!(record.tool_call_counts.edit, 1);
+        assert_eq!(record.total_unique_files, 1);
+        assert_eq!(record.total_edit_lines, 0);
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
     }
 
     #[test]
