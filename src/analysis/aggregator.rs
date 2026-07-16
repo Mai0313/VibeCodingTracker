@@ -748,7 +748,7 @@ fn load_analysis_file(file: &FileInfo, provider: ExtensionType) -> Result<Cached
         summary: CompactSourceSummary::from_file(parsed.analysis, file.modified_date.clone(), emit),
         parsed: true,
         failure: (partial > 0)
-            .then(|| format!("skipped {partial} malformed or unsupported analyzer records")),
+            .then(|| crate::session::diagnostics::partial_failure_reason(partial)),
     })
 }
 
@@ -1105,15 +1105,14 @@ where
                 }
                 Ok(parsed) => {
                     let partial_failure_count = parsed.diagnostics.partial_failure_count();
-                    let partial_failure = (partial_failure_count > 0).then_some(
-                        AnalysisCollectionFailure {
+                    let partial_failure =
+                        (partial_failure_count > 0).then_some(AnalysisCollectionFailure {
                             provider,
                             source: path,
-                            error: format!(
-                                "skipped {partial_failure_count} malformed or unsupported analyzer records"
+                            error: crate::session::diagnostics::partial_failure_reason(
+                                partial_failure_count,
                             ),
-                        },
-                    );
+                        });
                     let session = parsed.diagnostics.should_emit_session().then_some({
                         AnalysisSession {
                             provider,
@@ -1169,12 +1168,23 @@ fn push_failure(
     diagnostics: &mut AnalysisCollectionDiagnostics,
     failure: AnalysisCollectionFailure,
 ) {
-    log::warn!(
-        "failed to collect {} analysis from {}: {}",
-        failure.provider,
-        failure.source.display(),
-        failure.error
-    );
+    // A partial parse keeps its recognized data; logging it as "failed to
+    // collect" would read as a dropped source.
+    if crate::session::diagnostics::is_partial_failure_reason(&failure.error) {
+        log::warn!(
+            "{} analysis from {}: {}",
+            failure.provider,
+            failure.source.display(),
+            failure.error
+        );
+    } else {
+        log::warn!(
+            "failed to collect {} analysis from {}: {}",
+            failure.provider,
+            failure.source.display(),
+            failure.error
+        );
+    }
     diagnostics.failures.push(failure);
 }
 

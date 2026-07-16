@@ -748,7 +748,7 @@ fn load_file_summary(
         summary: CompactSourceSummary::from_file(parsed.analysis, file.modified_date.clone(), emit),
         parsed: true,
         failure: (partial > 0)
-            .then(|| format!("skipped {partial} malformed or unsupported analyzer records")),
+            .then(|| crate::session::diagnostics::partial_failure_reason(partial)),
     })
 }
 
