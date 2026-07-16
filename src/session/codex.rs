@@ -788,11 +788,17 @@ fn parse_patch_change_entry(path: &str, entry: &Value) -> Option<CodexPatch> {
     if !matches!(action, "add" | "update" | "delete") {
         return None;
     }
-    let unified_diff = entry.get("unified_diff").and_then(Value::as_str)?;
+    // Real logs omit `unified_diff` on some entries (observed on `add`); the
+    // operation still counts, with no invented line/char content.
+    let lines = entry
+        .get("unified_diff")
+        .and_then(Value::as_str)
+        .map(|diff| diff.lines().map(str::to_string).collect())
+        .unwrap_or_default();
     Some(CodexPatch {
         action: action.to_string(),
         file_path: path.to_string(),
-        lines: unified_diff.lines().map(str::to_string).collect(),
+        lines,
     })
 }
 
@@ -1626,6 +1632,24 @@ mod tests {
         assert_eq!(record.total_unique_files, 2);
         assert_eq!(record.write_file_details[0].base.file_path, "/repo/new.rs");
         assert_eq!(record.edit_file_details[0].base.file_path, "/repo/lib.rs");
+    }
+
+    #[test]
+    fn patch_apply_end_without_unified_diff_still_counts_the_operation() {
+        // Observed in real 2026-06 logs: an `add` entry with no unified_diff.
+        // The write must count (invocation + unique file, zero line/char
+        // content) instead of flagging the record as schema drift.
+        let changes = serde_json::json!({
+            "/repo/generated.bin": { "type": "add" }
+        });
+        let logs = vec![patch_apply_end("call-nodiff", true, changes)];
+
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full, None).unwrap();
+        let record = &parsed.analysis.records[0];
+        assert_eq!(record.tool_call_counts.write, 1);
+        assert_eq!(record.total_unique_files, 1);
+        assert_eq!(record.total_write_lines, 0);
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
     }
 
     #[test]
