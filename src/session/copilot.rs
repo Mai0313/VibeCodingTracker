@@ -169,17 +169,15 @@ where
                         let Some(usage) = metric.usage else {
                             continue;
                         };
-                        // Copilot's `reasoningTokens` is the model's
-                        // thinking budget emitted before the visible
-                        // response. Surface it as its own field so
-                        // `calculate_cost` can charge it against the
-                        // model's published reasoning rate (when present)
-                        // via `output_cost_per_reasoning_token`, instead
-                        // of folding it into `output_tokens` and billing
-                        // every thinking token at the flat output rate.
+                        // Copilot's `outputTokens` follows OpenAI's convention
+                        // and already includes `reasoningTokens`, so subtract it
+                        // back out to keep each token billed once (the flat token
+                        // shape treats output and reasoning as disjoint buckets).
+                        let output_tokens =
+                            usage.output_tokens.saturating_sub(usage.reasoning_tokens);
                         let usage_json = json!({
                             "input_tokens": usage.input_tokens,
-                            "output_tokens": usage.output_tokens,
+                            "output_tokens": output_tokens,
                             "reasoning_output_tokens": usage.reasoning_tokens,
                             "cache_read_input_tokens": usage.cache_read_tokens,
                             "cache_creation_input_tokens": usage.cache_write_tokens,
