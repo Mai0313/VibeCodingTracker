@@ -217,22 +217,28 @@ pub fn process_claude_usage(
     if above_tier {
         let field = |key: &str| usage_obj.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
         let scalar_cc = field("cache_creation_input_tokens");
-        let (cc_5m, cc_1h) = match usage_obj.get("cache_creation").and_then(|v| v.as_object()) {
-            Some(split) => {
-                let ttl = |key: &str| split.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
-                (
-                    ttl("ephemeral_5m_input_tokens"),
-                    ttl("ephemeral_1h_input_tokens"),
-                )
-            }
-            None => (scalar_cc, 0),
-        };
+        // Mirror `extract_token_counts`: the scalar total is authoritative, the
+        // 1h portion comes from the split, and the remainder bills at 5m so no
+        // cache-creation token is dropped from the above-tier slice either.
+        let cc_1h = usage_obj
+            .get("cache_creation")
+            .and_then(|v| v.as_object())
+            .and_then(|split| split.get("ephemeral_1h_input_tokens"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let ephemeral_5m = usage_obj
+            .get("cache_creation")
+            .and_then(|v| v.as_object())
+            .and_then(|split| split.get("ephemeral_5m_input_tokens"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let total_cc = scalar_cc.max(ephemeral_5m + cc_1h);
         AboveTierSlice {
             input: field("input_tokens"),
             output: field("output_tokens"),
             reasoning: 0,
             cache_read: field("cache_read_input_tokens"),
-            cache_creation_5m: cc_5m,
+            cache_creation_5m: total_cc - cc_1h,
             cache_creation_1h: cc_1h,
         }
         .accumulate_into(existing_obj);

@@ -159,9 +159,14 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
 
         // Claude Code records cache_creation split by TTL:
         //   "cache_creation": { ephemeral_5m_input_tokens, ephemeral_1h_input_tokens }
-        // When present, use it verbatim for accurate 1hr TTL pricing.
+        // The scalar `cache_creation_input_tokens` is the authoritative total.
+        // Bill the 1h portion from the split and everything else at the default
+        // (5m) TTL, so the two priced buckets always sum to the scalar total.
+        // This matters because merging multi-iteration turns can leave the
+        // scalar larger than the published 5m+1h split (some iterations report
+        // only the scalar); billing 5m+1h verbatim would drop the remainder.
         if let Some(cc_split) = usage_obj.get("cache_creation").and_then(|v| v.as_object()) {
-            counts.cache_creation_5m = cc_split
+            let ephemeral_5m = cc_split
                 .get("ephemeral_5m_input_tokens")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
@@ -169,10 +174,12 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
                 .get("ephemeral_1h_input_tokens")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
-            // If the split has tokens but the scalar total was missing, derive it.
-            if counts.cache_creation == 0 {
-                counts.cache_creation = counts.cache_creation_5m + counts.cache_creation_1h;
-            }
+            // The total is the larger of the scalar and the split sum (the
+            // scalar may be missing, or the split may exceed a stale scalar).
+            counts.cache_creation = counts
+                .cache_creation
+                .max(ephemeral_5m + counts.cache_creation_1h);
+            counts.cache_creation_5m = counts.cache_creation - counts.cache_creation_1h;
         } else {
             // No TTL split → treat every cache_creation token as default (5 min) TTL.
             counts.cache_creation_5m = counts.cache_creation;
@@ -332,6 +339,26 @@ mod tests {
         assert_eq!(c.cache_creation, 1_500);
         assert_eq!(c.cache_creation_5m, 500);
         assert_eq!(c.cache_creation_1h, 1_000);
+    }
+
+    #[test]
+    fn ttl_split_smaller_than_scalar_bills_the_remainder_at_5m() {
+        // Merged multi-iteration turn: the scalar total exceeds the published
+        // 5m+1h split. The remainder must bill at the 5m TTL, not be dropped —
+        // and the two priced buckets must sum back to the scalar total.
+        let usage = json!({
+            "cache_creation_input_tokens": 397_602_459_i64,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 183_962_961_i64,
+                "ephemeral_1h_input_tokens": 213_022_705_i64
+            }
+        });
+        let c = extract_token_counts(&usage);
+        assert_eq!(c.cache_creation, 397_602_459);
+        assert_eq!(c.cache_creation_1h, 213_022_705);
+        // 5m carries its own tokens plus the 616,793-token remainder.
+        assert_eq!(c.cache_creation_5m, 397_602_459 - 213_022_705);
+        assert_eq!(c.cache_creation_5m + c.cache_creation_1h, c.cache_creation);
     }
 
     #[test]
