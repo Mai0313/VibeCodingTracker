@@ -177,10 +177,24 @@ impl ModelPricingMap {
             return result;
         }
 
+        // Loose (substring / fuzzy) matching needs a distinctive query: a
+        // placeholder like `default` (what cursor-agent stores for auto-mode
+        // conversations) or a very short fragment would otherwise inherit a
+        // coincidentally-similar model's prices. Unpriced ($0) is the safer
+        // answer for those.
+        let model_lower = model_name.to_lowercase();
+        if !eligible_for_loose_match(model_without_provider(&model_lower)) {
+            let result = ModelPricingResult {
+                pricing: ModelPricing::default(),
+                matched_model: None,
+            };
+            self.cache_result(model_name, &result);
+            return result;
+        }
+
         // Slow path 1: inspect every substring candidate and choose the most
         // specific overlap. Returning the first HashMap-derived candidate can
         // otherwise price gpt-4o as gpt-4.
-        let model_lower = model_name.to_lowercase();
         if let Some(matched_key) = self.substring_match(&model_lower)
             && let Some(pricing) = self.raw.get(matched_key.as_ref())
         {
@@ -381,6 +395,20 @@ fn model_without_provider(model_name: &str) -> &str {
         .map_or(model_name, |(_, model)| model)
 }
 
+/// Placeholder names that must never take a loose price from a
+/// coincidentally-similar key (e.g. cursor-agent's literal `default`).
+const LOOSE_MATCH_STOPLIST: [&str; 5] = ["default", "auto", "custom", "unknown", "none"];
+
+/// Minimum model-segment length for substring / fuzzy matching; anything
+/// shorter is too ambiguous to loosely price (exact and normalized matches
+/// still apply to short names like `o3`).
+const LOOSE_MATCH_MIN_SEGMENT_LEN: usize = 4;
+
+fn eligible_for_loose_match(model_segment: &str) -> bool {
+    model_segment.len() >= LOOSE_MATCH_MIN_SEGMENT_LEN
+        && !LOOSE_MATCH_STOPLIST.contains(&model_segment)
+}
+
 fn substring_provider_rank(query_provider: Option<&str>, candidate: &str) -> u8 {
     match (query_provider, provider_prefix(candidate)) {
         (Some(query), Some(candidate)) if query == candidate => 0,
@@ -455,6 +483,42 @@ mod tests {
     use super::super::cache::ThresholdTier;
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn generic_placeholder_names_never_loose_match() {
+        clear_pricing_cache();
+        let mut raw = HashMap::new();
+        raw.insert(
+            "fireworks-ai-default".to_string(),
+            ModelPricing {
+                input_cost_per_token: 0.5,
+                ..Default::default()
+            },
+        );
+        raw.insert(
+            "aut".to_string(),
+            ModelPricing {
+                input_cost_per_token: 0.5,
+                ..Default::default()
+            },
+        );
+        let map = ModelPricingMap::new(raw);
+
+        // `default` (cursor-agent's auto-mode placeholder) would substring
+        // match fireworks-ai-default; it must stay unpriced instead.
+        let result = map.get("default");
+        assert_eq!(result.pricing.input_cost_per_token, 0.0);
+        assert_eq!(result.matched_model, None);
+
+        // Short fragments skip loose matching too...
+        let result = map.get("xyz");
+        assert_eq!(result.pricing.input_cost_per_token, 0.0);
+
+        // ...but exact matches still work at any length.
+        let result = map.get("aut");
+        assert_eq!(result.pricing.input_cost_per_token, 0.5);
+        assert_eq!(result.matched_model, None);
+    }
 
     #[test]
     fn test_normalize_model_name() {
