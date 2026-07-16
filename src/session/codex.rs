@@ -10,6 +10,7 @@
 //! applied only when their paired output explicitly reports success.
 use crate::constants::FastHashMap;
 use crate::models::*;
+use crate::pricing::{TierClassifier, TierThresholds};
 use crate::session::diagnostics::{ParseDiagnostics, ParsedAnalysis};
 use crate::session::state::{ParseMode, SessionParseState};
 use crate::utils::{
@@ -42,18 +43,20 @@ where
     I: IntoIterator,
     I::Item: Borrow<CodexLog>,
 {
-    Ok(parse_codex_log_iter_with_diagnostics(logs, mode)?.analysis)
+    Ok(parse_codex_log_iter_with_diagnostics(logs, mode, None)?.analysis)
 }
 
 /// Streaming Codex parser with parser-only schema diagnostics.
 pub(crate) fn parse_codex_log_iter_with_diagnostics<I>(
     logs: I,
     mode: ParseMode,
+    tiers: Option<&TierThresholds>,
 ) -> Result<ParsedAnalysis>
 where
     I: IntoIterator,
     I::Item: Borrow<CodexLog>,
 {
+    let mut classifier = tiers.map(TierClassifier::new);
     let mut state = SessionParseState::with_mode(mode);
     let mut conversation_usage: FastHashMap<String, Value> = FastHashMap::with_capacity(5);
     let mut current_model = String::new();
@@ -145,11 +148,26 @@ where
                                     CodexTokenTotals::delta_fields(total, prev_totals.as_ref())
                                 })
                                 .unwrap_or_default();
+                            // One token_count is one turn; its request context
+                            // is the turn's own full prompt (cached included),
+                            // published as last_token_usage.input_tokens. Fall
+                            // back to the delta input when absent.
+                            let above = classifier.as_mut().is_some_and(|classifier| {
+                                let request_context = info
+                                    .get("last_token_usage")
+                                    .and_then(|last| last.get("input_tokens"))
+                                    .and_then(Value::as_i64)
+                                    .filter(|tokens| *tokens > 0)
+                                    .or_else(|| delta.get("input_tokens").and_then(Value::as_i64))
+                                    .unwrap_or(0);
+                                classifier.is_above(&current_model, request_context)
+                            });
                             process_codex_usage(
                                 &mut conversation_usage,
                                 &current_model,
                                 &delta,
                                 info,
+                                above,
                             );
                             if let Some(total) = total {
                                 prev_totals = Some(CodexTokenTotals::from_total_object(total));
@@ -889,7 +907,8 @@ mod tests {
                 })),
             ];
 
-            let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+            let parsed =
+                parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full, None).unwrap();
             assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
             assert!(!parsed.diagnostics.is_complete_failure());
             assert_eq!(parsed.analysis.records[0].tool_call_counts.bash, 0);
@@ -913,7 +932,7 @@ mod tests {
             })),
         ];
 
-        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full, None).unwrap();
         assert!(parsed.diagnostics.is_complete_failure());
         assert_eq!(parsed.analysis.records[0].tool_call_counts.bash, 0);
     }
@@ -943,7 +962,7 @@ mod tests {
         .map(|value| serde_json::from_value(value).unwrap())
         .collect();
 
-        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full, None).unwrap();
         assert!(!parsed.diagnostics.is_complete_failure());
         assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
         assert_eq!(parsed.diagnostics.relevant_records, 1);
@@ -1023,7 +1042,7 @@ mod tests {
         .map(|value| serde_json::from_value(value).unwrap())
         .collect();
 
-        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full, None).unwrap();
         assert!(!parsed.diagnostics.is_complete_failure());
         assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
 
@@ -1058,7 +1077,7 @@ mod tests {
         .map(|value| serde_json::from_value(value).unwrap())
         .collect();
 
-        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full, None).unwrap();
         assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
         assert!(parsed.analysis.records[0].conversation_usage.is_empty());
     }
@@ -1105,7 +1124,7 @@ mod tests {
         .map(|value| serde_json::from_value(value).unwrap())
         .collect();
 
-        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full, None).unwrap();
         assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
 
         let usage = &parsed.analysis.records[0].conversation_usage;
@@ -1125,6 +1144,61 @@ mod tests {
     }
 
     #[test]
+    fn per_turn_tier_classification_uses_the_turns_own_context() {
+        // Two turns: the first's own prompt (last_token_usage.input_tokens)
+        // is below the 272k threshold, the second's is above. Only the second
+        // turn's delta lands in above_tier even though the cumulative total
+        // crosses the threshold much earlier.
+        let event = |cum_input: i64, cum_out: i64, cum_total: i64, last_input: i64| {
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:00Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": cum_input,
+                            "cached_input_tokens": 0,
+                            "output_tokens": cum_out,
+                            "reasoning_output_tokens": 0,
+                            "total_tokens": cum_total
+                        },
+                        "last_token_usage": { "input_tokens": last_input },
+                        "model_context_window": 400000
+                    }
+                }
+            })
+        };
+        let logs: Vec<CodexLog> = [
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:00Z",
+                "type": "turn_context",
+                "payload": { "model": "gpt-5.4" }
+            }),
+            event(200_000, 1_000, 201_000, 200_000),
+            event(500_000, 2_500, 502_500, 300_000),
+        ]
+        .into_iter()
+        .map(|value| serde_json::from_value(value).unwrap())
+        .collect();
+
+        let tiers =
+            crate::pricing::TierThresholds::from_entries([("gpt-5.4", 272_000)].into_iter());
+        let parsed =
+            parse_codex_log_iter_with_diagnostics(&logs, ParseMode::UsageOnly, Some(&tiers))
+                .unwrap();
+        let usage = &parsed.analysis.records[0].conversation_usage["gpt-5.4"];
+        assert_eq!(usage["total_token_usage"]["total_tokens"], 502_500);
+        // Only the second turn's delta (input 300k, output 1.5k) is above.
+        assert_eq!(usage["above_tier"]["input_tokens"], 300_000);
+        assert_eq!(usage["above_tier"]["output_tokens"], 1_500);
+        assert!(
+            usage["above_tier"].get("cache_read_tokens").is_none(),
+            "no cached tokens in this session"
+        );
+    }
+
+    #[test]
     fn malformed_pre_context_usage_remains_schema_failure() {
         let logs: Vec<CodexLog> = [serde_json::json!({
             "timestamp": "2026-07-12T00:00:00Z",
@@ -1138,7 +1212,7 @@ mod tests {
         .map(|value| serde_json::from_value(value).unwrap())
         .collect();
 
-        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full, None).unwrap();
         assert!(parsed.diagnostics.is_complete_failure());
         assert!(parsed.analysis.records[0].conversation_usage.is_empty());
     }
@@ -1302,7 +1376,7 @@ mod tests {
             custom_output("patch-failed", Value::String(wire_result)),
         ];
 
-        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full, None).unwrap();
         let record = &parsed.analysis.records[0];
         assert_eq!(record.tool_call_counts.edit, 0);
         assert!(record.edit_file_details.is_empty());
@@ -1330,7 +1404,8 @@ mod tests {
                 custom_output("patch-unknown", output),
             ];
 
-            let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+            let parsed =
+                parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full, None).unwrap();
             let record = &parsed.analysis.records[0];
             assert_eq!(record.tool_call_counts.edit, 0);
             assert!(record.edit_file_details.is_empty());

@@ -719,7 +719,7 @@ where
 
 fn load_analysis_file(file: &FileInfo, provider: ExtensionType) -> Result<CachedAnalysisLoad> {
     let parsed =
-        parse_session_file_as_with_diagnostics(&file.path, provider, ParseMode::UsageOnly)?;
+        parse_session_file_as_with_diagnostics(&file.path, provider, ParseMode::UsageOnly, None)?;
     if parsed.diagnostics.is_complete_failure() {
         let error = if parsed.diagnostics.recognized_records == 0 {
             "source contained no recognized provider records".to_string()
@@ -1077,7 +1077,7 @@ where
                 path,
                 modified_date,
             } = file_info;
-            match parse_session_file_as_with_diagnostics(&path, provider, mode) {
+            match parse_session_file_as_with_diagnostics(&path, provider, mode, None) {
                 Ok(parsed) if parsed.diagnostics.is_complete_failure() => {
                     let error = if parsed.diagnostics.recognized_records == 0 {
                         "source contained no recognized provider records".to_string()

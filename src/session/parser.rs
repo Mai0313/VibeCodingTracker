@@ -3,6 +3,7 @@ use crate::constants::buffer;
 use crate::models::{
     ClaudeCodeLog, CodeAnalysis, CodexLog, CopilotEvent, ExtensionType, GeminiSession,
 };
+use crate::pricing::TierThresholds;
 use crate::session::claude::parse_claude_logs_with_diagnostics;
 use crate::session::codex::parse_codex_log_iter_with_diagnostics;
 use crate::session::copilot::parse_copilot_events_with_diagnostics;
@@ -233,7 +234,7 @@ fn parse_session_file_typed_with_mode_internal(
     }
 
     let ext_type = detect_extension_type(&data)?;
-    dispatch_by_vec(data, ext_type, mode, path)
+    dispatch_by_vec(data, ext_type, mode, path, None)
 }
 
 /// Typed entry point when the caller already knows the provider.
@@ -275,7 +276,7 @@ pub fn parse_session_file_as<P: AsRef<Path>>(
     mode: ParseMode,
 ) -> Result<CodeAnalysis> {
     let path = path.as_ref();
-    let parsed = parse_session_file_as_with_diagnostics(path, provider, mode)?;
+    let parsed = parse_session_file_as_with_diagnostics(path, provider, mode, None)?;
     validate_parsed_source(path, &parsed.diagnostics)?;
     Ok(parsed.analysis)
 }
@@ -284,8 +285,9 @@ pub(crate) fn parse_session_file_as_with_diagnostics(
     path: &Path,
     provider: ExtensionType,
     mode: ParseMode,
+    tiers: Option<&TierThresholds>,
 ) -> Result<ParsedAnalysis> {
-    if let Some(parsed) = stream_parse_known(path, provider, mode)? {
+    if let Some(parsed) = stream_parse_known(path, provider, mode, tiers)? {
         return Ok(parsed);
     }
 
@@ -300,7 +302,7 @@ pub(crate) fn parse_session_file_as_with_diagnostics(
         return Ok(empty_parsed_analysis());
     }
 
-    dispatch_by_vec(data, provider, mode, path)
+    dispatch_by_vec(data, provider, mode, path, tiers)
 }
 
 /// Streaming path when the provider is known from the caller's source.
@@ -322,6 +324,7 @@ fn stream_parse_known(
     path: &Path,
     provider: ExtensionType,
     mode: ParseMode,
+    tiers: Option<&TierThresholds>,
 ) -> Result<Option<ParsedAnalysis>> {
     match provider {
         ExtensionType::ClaudeCode => {
@@ -338,8 +341,11 @@ fn stream_parse_known(
                 Rc::clone(&warnings),
                 Rc::clone(&io_failure),
             );
-            let parsed =
-                parse_claude_logs_with_diagnostics(stream.first.into_iter().chain(rest), mode);
+            let parsed = parse_claude_logs_with_diagnostics(
+                stream.first.into_iter().chain(rest),
+                mode,
+                tiers,
+            );
             warnings.borrow().emit(path);
             if let Some(error) = io_failure.borrow_mut().take() {
                 bail!("Failed to read session file {}: {error}", path.display());
@@ -364,8 +370,11 @@ fn stream_parse_known(
                 Rc::clone(&warnings),
                 Rc::clone(&io_failure),
             );
-            let parsed =
-                parse_codex_log_iter_with_diagnostics(stream.first.into_iter().chain(rest), mode);
+            let parsed = parse_codex_log_iter_with_diagnostics(
+                stream.first.into_iter().chain(rest),
+                mode,
+                tiers,
+            );
             warnings.borrow().emit(path);
             if let Some(error) = io_failure.borrow_mut().take() {
                 bail!("Failed to read session file {}: {error}", path.display());
@@ -402,7 +411,7 @@ fn stream_parse_known(
                 provider,
             )))
         }
-        _ => stream_parse_known_dynamic(path, provider, mode),
+        _ => stream_parse_known_dynamic(path, provider, mode, tiers),
     }
 }
 
@@ -411,6 +420,7 @@ fn stream_parse_known_dynamic(
     path: &Path,
     provider: ExtensionType,
     mode: ParseMode,
+    tiers: Option<&TierThresholds>,
 ) -> Result<Option<ParsedAnalysis>> {
     let file =
         File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
@@ -434,6 +444,7 @@ fn stream_parse_known_dynamic(
         ParseDiagnostics::default(),
         Rc::new(RefCell::new(ParseWarningSummary::default())),
         path,
+        tiers,
     )?;
     Ok(Some(finalize(parsed, provider)))
 }
@@ -588,6 +599,7 @@ fn stream_parse_autodetect(path: &Path, mode: ParseMode) -> Result<Option<Parsed
         initial_diagnostics,
         warnings,
         path,
+        None,
     )?;
     Ok(Some(finalize(parsed, ext)))
 }
@@ -648,6 +660,7 @@ fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
 /// JSONL providers feed buffered records through their typed shape and chain
 /// the remaining reader. Grok reopens its single aggregate JSON object so its
 /// sibling session files remain available to the provider parser.
+#[allow(clippy::too_many_arguments)] // parse plumbing; a struct would obscure the seams
 fn dispatch_streaming_buffered(
     ext: ExtensionType,
     buffered: Vec<Value>,
@@ -656,6 +669,7 @@ fn dispatch_streaming_buffered(
     initial_diagnostics: ParseDiagnostics,
     warnings: Rc<RefCell<ParseWarningSummary>>,
     path: &Path,
+    tiers: Option<&TierThresholds>,
 ) -> Result<ParsedAnalysis> {
     let extra_diagnostics = Rc::new(RefCell::new(initial_diagnostics));
     let io_failure = Rc::new(RefCell::new(None));
@@ -670,7 +684,7 @@ fn dispatch_streaming_buffered(
             let logs = buffered.into_iter().chain(rest).filter_map(|value| {
                 deserialize_record::<ClaudeCodeLog>(value, ext, &extra_diagnostics, &warnings)
             });
-            parse_claude_logs_with_diagnostics(logs, mode)
+            parse_claude_logs_with_diagnostics(logs, mode, tiers)
                 .map(|parsed| merge_extra_diagnostics(parsed, &extra_diagnostics))
         }
         ExtensionType::Codex => {
@@ -683,7 +697,7 @@ fn dispatch_streaming_buffered(
             let logs = buffered.into_iter().chain(rest).filter_map(|value| {
                 deserialize_record::<CodexLog>(value, ext, &extra_diagnostics, &warnings)
             });
-            parse_codex_log_iter_with_diagnostics(logs, mode)
+            parse_codex_log_iter_with_diagnostics(logs, mode, tiers)
                 .map(|parsed| merge_extra_diagnostics(parsed, &extra_diagnostics))
         }
         ExtensionType::Copilot => {
@@ -723,7 +737,7 @@ fn dispatch_streaming_buffered(
                     Rc::clone(&warnings),
                     Rc::clone(&io_failure),
                 );
-                parse_gemini_events_with_diagnostics(session, iter.chain(rest_events), mode)
+                parse_gemini_events_with_diagnostics(session, iter.chain(rest_events), mode, tiers)
                     .map(|parsed| merge_extra_diagnostics(parsed, &extra_diagnostics))
             })()
         }
@@ -1042,6 +1056,7 @@ fn dispatch_by_vec(
     ext_type: ExtensionType,
     mode: ParseMode,
     path: &Path,
+    tiers: Option<&TierThresholds>,
 ) -> Result<ParsedAnalysis> {
     let extra_diagnostics = Rc::new(RefCell::new(ParseDiagnostics::default()));
     let warnings = Rc::new(RefCell::new(ParseWarningSummary::default()));
@@ -1050,13 +1065,13 @@ fn dispatch_by_vec(
             let logs = data.into_iter().filter_map(|value| {
                 deserialize_record::<ClaudeCodeLog>(value, ext_type, &extra_diagnostics, &warnings)
             });
-            parse_claude_logs_with_diagnostics(logs, mode)?
+            parse_claude_logs_with_diagnostics(logs, mode, tiers)?
         }
         ExtensionType::Codex => {
             let logs = data.into_iter().filter_map(|value| {
                 deserialize_record::<CodexLog>(value, ext_type, &extra_diagnostics, &warnings)
             });
-            parse_codex_log_iter_with_diagnostics(logs, mode)?
+            parse_codex_log_iter_with_diagnostics(logs, mode, tiers)?
         }
         ExtensionType::Copilot => {
             let events = data.into_iter().filter_map(|value| {

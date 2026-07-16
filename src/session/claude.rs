@@ -8,9 +8,12 @@
 //! together by `tool_use_id` and routes both to [`SessionParseState`].
 use crate::constants::{FastHashMap, capacity};
 use crate::models::*;
+use crate::pricing::{TierClassifier, TierThresholds};
 use crate::session::diagnostics::{ParseDiagnostics, ParsedAnalysis};
 use crate::session::state::{ParseMode, SessionParseState};
-use crate::utils::{get_git_remote_url, parse_iso_timestamp, process_claude_usage};
+use crate::utils::{
+    claude_request_context, get_git_remote_url, parse_iso_timestamp, process_claude_usage,
+};
 use anyhow::Result;
 use serde_json::Value;
 
@@ -58,17 +61,22 @@ pub fn parse_claude_logs<I>(logs: I, mode: ParseMode) -> Result<CodeAnalysis>
 where
     I: IntoIterator<Item = ClaudeCodeLog>,
 {
-    Ok(parse_claude_logs_with_diagnostics(logs, mode)?.analysis)
+    Ok(parse_claude_logs_with_diagnostics(logs, mode, None)?.analysis)
 }
 
 /// Streaming Claude parser with parser-only schema diagnostics.
+///
+/// `tiers` enables per-request context-tier classification (usage scans
+/// only); `None` skips classification entirely.
 pub(crate) fn parse_claude_logs_with_diagnostics<I>(
     logs: I,
     mode: ParseMode,
+    tiers: Option<&TierThresholds>,
 ) -> Result<ParsedAnalysis>
 where
     I: IntoIterator<Item = ClaudeCodeLog>,
 {
+    let mut classifier = tiers.map(TierClassifier::new);
     let mut state = SessionParseState::with_mode(mode);
     let mut conversation_usage: FastHashMap<String, Value> =
         FastHashMap::with_capacity(capacity::MODELS_PER_SESSION);
@@ -136,7 +144,14 @@ where
                 let normalized = is_supported_claude_usage(usage) && model.is_some();
                 diagnostics.record_relevant(normalized);
                 if normalized && let Some(model) = model {
-                    process_claude_usage(&mut conversation_usage, model, usage);
+                    // One assistant record is one billed request; classify its
+                    // own prompt context against the model's tier threshold.
+                    let above = classifier.as_mut().is_some_and(|classifier| {
+                        usage.as_object().is_some_and(|usage_obj| {
+                            classifier.is_above(model, claude_request_context(usage_obj))
+                        })
+                    });
+                    process_claude_usage(&mut conversation_usage, model, usage, above);
 
                     // Claude Code's top-level `usage` is the sum of the
                     // `message`-type entries in `usage.iterations` and EXCLUDES any
@@ -156,7 +171,20 @@ where
                                     !adv_model.is_empty() && is_supported_claude_usage(iter);
                                 diagnostics.record_relevant(normalized);
                                 if normalized {
-                                    process_claude_usage(&mut advisor_usage, adv_model, iter);
+                                    let above = classifier.as_mut().is_some_and(|classifier| {
+                                        iter.as_object().is_some_and(|usage_obj| {
+                                            classifier.is_above(
+                                                adv_model,
+                                                claude_request_context(usage_obj),
+                                            )
+                                        })
+                                    });
+                                    process_claude_usage(
+                                        &mut advisor_usage,
+                                        adv_model,
+                                        iter,
+                                        above,
+                                    );
                                 }
                             }
                         }
@@ -676,6 +704,50 @@ mod tests {
     }
 
     #[test]
+    fn per_request_tier_classification_splits_above_slice() {
+        let usage_log = |ts: &str, input: i64, cache_read: i64, output: i64| -> ClaudeCodeLog {
+            let raw = serde_json::json!({
+                "type": "assistant",
+                "timestamp": ts,
+                "message": {
+                    "model": "claude-sonnet-5",
+                    "usage": {
+                        "input_tokens": input,
+                        "cache_read_input_tokens": cache_read,
+                        "output_tokens": output
+                    },
+                    "content": []
+                }
+            });
+            serde_json::from_value(raw).unwrap()
+        };
+        // One request below the 200k threshold, one above it.
+        let logs = vec![
+            usage_log("2026-07-01T00:00:00Z", 1_000, 50_000, 200),
+            usage_log("2026-07-01T00:01:00Z", 2_000, 220_000, 300),
+        ];
+
+        let tiers = crate::pricing::TierThresholds::from_entries(
+            [("claude-sonnet-5", 200_000)].into_iter(),
+        );
+        let parsed =
+            parse_claude_logs_with_diagnostics(logs.clone(), ParseMode::UsageOnly, Some(&tiers))
+                .unwrap();
+        let usage = &parsed.analysis.records[0].conversation_usage["claude-sonnet-5"];
+        // Totals cover both requests; the above_tier slice only the second.
+        assert_eq!(usage["input_tokens"], 3_000);
+        assert_eq!(usage["output_tokens"], 500);
+        assert_eq!(usage["above_tier"]["input_tokens"], 2_000);
+        assert_eq!(usage["above_tier"]["cache_read_tokens"], 220_000);
+        assert_eq!(usage["above_tier"]["output_tokens"], 300);
+
+        // Without thresholds nothing is classified and the shape is unchanged.
+        let parsed = parse_claude_logs_with_diagnostics(logs, ParseMode::UsageOnly, None).unwrap();
+        let usage = &parsed.analysis.records[0].conversation_usage["claude-sonnet-5"];
+        assert!(usage.get("above_tier").is_none());
+    }
+
+    #[test]
     fn subagent_user_message_tool_result_is_dispatched_via_fallback() {
         // Simulate a subagent JSONL: assistant calls Read, user record
         // returns the content inside `message.content[].tool_result`
@@ -805,7 +877,8 @@ mod tests {
             .unwrap();
 
             let parsed =
-                parse_claude_logs_with_diagnostics([assistant, user], ParseMode::Full).unwrap();
+                parse_claude_logs_with_diagnostics([assistant, user], ParseMode::Full, None)
+                    .unwrap();
             assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
             let record = &parsed.analysis.records[0];
             assert_eq!(record.tool_call_counts.write, 1);
@@ -850,7 +923,7 @@ mod tests {
         .unwrap();
 
         let parsed =
-            parse_claude_logs_with_diagnostics([assistant, user], ParseMode::Full).unwrap();
+            parse_claude_logs_with_diagnostics([assistant, user], ParseMode::Full, None).unwrap();
         assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
         let record = &parsed.analysis.records[0];
         assert_eq!(record.tool_call_counts.read, 1);
@@ -892,7 +965,7 @@ mod tests {
         .unwrap();
 
         let parsed =
-            parse_claude_logs_with_diagnostics([assistant, user], ParseMode::Full).unwrap();
+            parse_claude_logs_with_diagnostics([assistant, user], ParseMode::Full, None).unwrap();
         assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
         let record = &parsed.analysis.records[0];
         assert_eq!(record.tool_call_counts.read, 0);
@@ -930,7 +1003,8 @@ mod tests {
             );
 
             let parsed =
-                parse_claude_logs_with_diagnostics([assistant, user], ParseMode::Full).unwrap();
+                parse_claude_logs_with_diagnostics([assistant, user], ParseMode::Full, None)
+                    .unwrap();
             assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
             assert!(!parsed.diagnostics.is_complete_failure());
             assert_eq!(parsed.analysis.records[0].tool_call_counts.read, 0);
@@ -950,7 +1024,8 @@ mod tests {
             }]),
         );
 
-        let parsed = parse_claude_logs_with_diagnostics([assistant], ParseMode::Full).unwrap();
+        let parsed =
+            parse_claude_logs_with_diagnostics([assistant], ParseMode::Full, None).unwrap();
         assert_eq!(parsed.diagnostics.partial_failure_count(), 1);
         assert_eq!(parsed.analysis.records[0].tool_call_counts.read, 0);
     }
@@ -1088,7 +1163,7 @@ mod tests {
         }))
         .unwrap();
 
-        let parsed = parse_claude_logs_with_diagnostics([log], ParseMode::Full).unwrap();
+        let parsed = parse_claude_logs_with_diagnostics([log], ParseMode::Full, None).unwrap();
         assert!(parsed.diagnostics.is_complete_failure());
         assert!(parsed.analysis.records[0].conversation_usage.is_empty());
     }
@@ -1162,7 +1237,7 @@ mod tests {
             }
         });
         let log: ClaudeCodeLog = serde_json::from_value(raw).unwrap();
-        let parsed = parse_claude_logs_with_diagnostics([log], ParseMode::Full).unwrap();
+        let parsed = parse_claude_logs_with_diagnostics([log], ParseMode::Full, None).unwrap();
 
         assert_eq!(parsed.diagnostics.partial_failure_count(), 1);
         assert!(parsed.analysis.records[0].advisor_usage.is_empty());

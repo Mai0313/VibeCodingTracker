@@ -313,6 +313,20 @@ impl ModelPricingMap {
     pub fn raw(&self) -> &HashMap<Rc<str>, ModelPricing> {
         &self.raw
     }
+
+    /// Builds the `Send + Sync` "model → lowest context-tier threshold"
+    /// snapshot the usage scan hands to session parsers for per-request tier
+    /// classification. Models without threshold tiers are absent.
+    pub fn tier_thresholds(&self) -> crate::pricing::TierThresholds {
+        crate::pricing::TierThresholds::from_entries(self.raw.iter().filter_map(
+            |(key, pricing)| {
+                pricing
+                    .tiers
+                    .first()
+                    .map(|tier| (key.as_ref(), tier.threshold_tokens))
+            },
+        ))
+    }
 }
 
 /// Invalidates the lookup cache in every pricing map.

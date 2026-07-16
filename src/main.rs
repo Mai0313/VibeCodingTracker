@@ -37,7 +37,7 @@ use vibe_coding_tracker::pricing::{ModelPricingMap, fetch_model_pricing};
 use vibe_coding_tracker::session::{ParseMode, parse_session_file_typed_with_mode_and_diagnostics};
 use vibe_coding_tracker::summary_cache::build_scan_pool;
 use vibe_coding_tracker::usage::{
-    CostSource, get_usage_from_directories_with_diagnostics, resolve_model_cost,
+    CostSource, get_usage_from_directories_with_diagnostics_opts, resolve_model_cost,
 };
 use vibe_coding_tracker::utils::extract_token_counts;
 
@@ -205,33 +205,44 @@ fn run() -> Result<()> {
             // preference decides. The TUI's `m` toggle persists back to config.
             let merge = merge_providers || config.usage.merge_models;
             let scan_pool = Arc::new(build_scan_pool(config.performance.resolved_scan_threads())?);
-            let usage_from_dirs = |tr| {
-                scan_pool
-                    .install(|| get_usage_from_directories_with_diagnostics(tr, config.providers))
-            };
-
-            if json {
-                let usage = usage_from_dirs(time_range)?;
-                report_usage_collection(&usage.diagnostics)?;
-                let pricing_map = match fetch_model_pricing() {
-                    Ok(map) => map,
-                    Err(e) => {
-                        log::warn!("failed to fetch pricing data: {e}; costs unavailable");
+            // Pricing is fetched before the scan so per-request context-tier
+            // classification has its thresholds; a failed fetch degrades to
+            // base-rate classification rather than aborting the scan.
+            let pricing_for_scan = |warn_to_stderr: bool| match fetch_model_pricing() {
+                Ok(map) => map,
+                Err(e) => {
+                    log::warn!("failed to fetch pricing data: {e}; costs unavailable");
+                    if warn_to_stderr {
                         eprintln!(
                             "Warning: Failed to fetch pricing data: {}. Costs will be unavailable.",
                             e
                         );
-                        ModelPricingMap::new(HashMap::new())
                     }
+                    ModelPricingMap::new(HashMap::new())
+                }
+            };
+            let scan_options =
+                |pricing_map: &ModelPricingMap| vibe_coding_tracker::usage::UsageScanOptions {
+                    tiers: Some(Arc::new(pricing_map.tier_thresholds())),
                 };
+            let usage_from_dirs = |tr, options: &vibe_coding_tracker::usage::UsageScanOptions| {
+                scan_pool.install(|| {
+                    get_usage_from_directories_with_diagnostics_opts(tr, config.providers, options)
+                })
+            };
+
+            if json {
+                let pricing_map = pricing_for_scan(true);
+                let usage = usage_from_dirs(time_range, &scan_options(&pricing_map))?;
+                report_usage_collection(&usage.diagnostics)?;
                 let enriched_data = build_enriched_json(&usage.data, &pricing_map)?;
                 write_pretty_json(&enriched_data)?;
             } else if text {
-                let usage = usage_from_dirs(time_range)?;
+                let usage = usage_from_dirs(time_range, &scan_options(&pricing_for_scan(false)))?;
                 report_usage_collection(&usage.diagnostics)?;
                 display_usage_text(&usage.data, merge);
             } else if table {
-                let usage = usage_from_dirs(time_range)?;
+                let usage = usage_from_dirs(time_range, &scan_options(&pricing_for_scan(false)))?;
                 report_usage_collection(&usage.diagnostics)?;
                 display_usage_table(&usage.data, merge);
             } else {

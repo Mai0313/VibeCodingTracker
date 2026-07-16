@@ -8,6 +8,7 @@
 //! only `type == "gemini"` messages, which carry usage and tool calls.
 use crate::constants::FastHashMap;
 use crate::models::*;
+use crate::pricing::{TierClassifier, TierThresholds};
 use crate::session::diagnostics::{ParseDiagnostics, ParsedAnalysis};
 use crate::session::state::{ParseMode, SessionParseState};
 use crate::utils::{get_git_remote_url, parse_iso_timestamp, process_gemini_usage};
@@ -41,7 +42,7 @@ pub fn parse_gemini_events<I>(
 where
     I: IntoIterator<Item = Value>,
 {
-    Ok(parse_gemini_events_with_diagnostics(session, events, mode)?.analysis)
+    Ok(parse_gemini_events_with_diagnostics(session, events, mode, None)?.analysis)
 }
 
 /// Streaming Gemini parser with event-payload schema diagnostics.
@@ -49,10 +50,12 @@ pub(crate) fn parse_gemini_events_with_diagnostics<I>(
     session: GeminiSession,
     events: I,
     mode: ParseMode,
+    tiers: Option<&TierThresholds>,
 ) -> Result<ParsedAnalysis>
 where
     I: IntoIterator<Item = Value>,
 {
+    let mut classifier = tiers.map(TierClassifier::new);
     let mut state = SessionParseState::with_mode(mode);
     let mut conversation_usage: FastHashMap<String, Value> = FastHashMap::with_capacity(3);
     let mut diagnostics = ParseDiagnostics::default();
@@ -62,7 +65,12 @@ where
     for message in messages {
         diagnostics.merge(message.diagnostics);
         if let (Some(tokens), Some(model)) = (&message.tokens, &message.model) {
-            process_gemini_usage(&mut conversation_usage, model, tokens);
+            // One billed message is one request; `tokens.input` is its full
+            // prompt count (cached subset included).
+            let above = classifier
+                .as_mut()
+                .is_some_and(|classifier| classifier.is_above(model, tokens.input));
+            process_gemini_usage(&mut conversation_usage, model, tokens, above);
         }
         state.merge(message.state);
     }
@@ -665,7 +673,7 @@ mod tests {
             }]),
         );
         let drifted =
-            parse_gemini_events_with_diagnostics(session(), vec![drifted], ParseMode::Full)
+            parse_gemini_events_with_diagnostics(session(), vec![drifted], ParseMode::Full, None)
                 .unwrap();
         assert_eq!(drifted.diagnostics.partial_failure_count(), 1);
         assert_eq!(drifted.analysis.records[0].tool_call_counts.read, 1);
@@ -684,7 +692,8 @@ mod tests {
             }]),
         );
         let empty =
-            parse_gemini_events_with_diagnostics(session(), vec![empty], ParseMode::Full).unwrap();
+            parse_gemini_events_with_diagnostics(session(), vec![empty], ParseMode::Full, None)
+                .unwrap();
         assert_eq!(empty.diagnostics.partial_failure_count(), 0);
         assert_eq!(empty.analysis.records[0].tool_call_counts.read, 1);
         assert_eq!(empty.analysis.records[0].total_read_lines, 0);
@@ -696,7 +705,7 @@ mod tests {
         message["tokens"] = json!({ "prompt": 123, "completion": 45 });
 
         let parsed =
-            parse_gemini_events_with_diagnostics(session(), vec![message], ParseMode::Full)
+            parse_gemini_events_with_diagnostics(session(), vec![message], ParseMode::Full, None)
                 .unwrap();
         assert!(parsed.diagnostics.is_complete_failure());
         assert!(
@@ -707,7 +716,7 @@ mod tests {
         let mut current = assistant("current", "gemini-test", 10, json!([]));
         current["tokens"] = json!({ "input": 0 });
         let parsed =
-            parse_gemini_events_with_diagnostics(session(), vec![current], ParseMode::Full)
+            parse_gemini_events_with_diagnostics(session(), vec![current], ParseMode::Full, None)
                 .unwrap();
         assert!(!parsed.diagnostics.is_complete_failure());
         assert_eq!(
@@ -733,7 +742,7 @@ mod tests {
         );
 
         let parsed =
-            parse_gemini_events_with_diagnostics(session(), vec![message], ParseMode::Full)
+            parse_gemini_events_with_diagnostics(session(), vec![message], ParseMode::Full, None)
                 .unwrap();
         let record = &parsed.analysis.records[0];
         assert_eq!(parsed.diagnostics.partial_failure_count(), 1);
@@ -761,7 +770,7 @@ mod tests {
         );
 
         let parsed =
-            parse_gemini_events_with_diagnostics(session(), vec![message], ParseMode::Full)
+            parse_gemini_events_with_diagnostics(session(), vec![message], ParseMode::Full, None)
                 .unwrap();
         let record = &parsed.analysis.records[0];
         assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
@@ -800,6 +809,7 @@ mod tests {
             session(),
             vec![pending, complete],
             ParseMode::Full,
+            None,
         )
         .unwrap();
         assert_eq!(parsed.diagnostics.partial_failure_count(), 0);

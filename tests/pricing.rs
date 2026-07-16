@@ -14,6 +14,28 @@ use vibe_coding_tracker::pricing::{
 };
 use vibe_coding_tracker::utils::get_pricing_cache_path_in;
 
+/// Builds normalized counts for the positional (input, output, reasoning,
+/// cache_read, cache_creation_5m, cache_creation_1h) test shorthand.
+fn tc(
+    input: i64,
+    output: i64,
+    reasoning: i64,
+    cache_read: i64,
+    cc_5m: i64,
+    cc_1h: i64,
+) -> vibe_coding_tracker::utils::TokenCounts {
+    vibe_coding_tracker::utils::TokenCounts {
+        input_tokens: input,
+        output_tokens: output,
+        reasoning_tokens: reasoning,
+        cache_read,
+        cache_creation: cc_5m + cc_1h,
+        cache_creation_5m: cc_5m,
+        cache_creation_1h: cc_1h,
+        ..Default::default()
+    }
+}
+
 fn pricing_cache_date() -> String {
     chrono::Utc::now()
         .date_naive()
@@ -403,7 +425,7 @@ fn test_calculate_cost_basic() {
     };
 
     // 2000 cache_creation tokens at default (5 minute) TTL, no reasoning tokens.
-    let cost = calculate_cost(1000, 500, 0, 10000, 2000, 0, &pricing);
+    let cost = calculate_cost(&tc(1000, 500, 0, 10000, 2000, 0), &pricing);
     // input: 1000 * 0.000003 = 0.003
     // output: 500 * 0.000015 = 0.0075
     // cache_read: 10000 * 0.0000003 = 0.003
@@ -415,7 +437,7 @@ fn test_calculate_cost_basic() {
 #[test]
 fn test_calculate_cost_zero_tokens() {
     let pricing = ModelPricing::default();
-    let cost = calculate_cost(0, 0, 0, 0, 0, 0, &pricing);
+    let cost = calculate_cost(&tc(0, 0, 0, 0, 0, 0), &pricing);
     assert_eq!(cost, 0.0);
 }
 
@@ -427,7 +449,7 @@ fn test_calculate_cost_no_cache() {
         ..Default::default()
     };
 
-    let cost = calculate_cost(1000, 500, 0, 0, 0, 0, &pricing);
+    let cost = calculate_cost(&tc(1000, 500, 0, 0, 0, 0), &pricing);
     // input: 1000 * 0.000003 = 0.003
     // output: 500 * 0.000015 = 0.0075
     // total: 0.0105
@@ -445,7 +467,7 @@ fn test_calculate_cost_large_numbers() {
         ..Default::default()
     };
 
-    let cost = calculate_cost(1_000_000, 500_000, 0, 100_000, 50_000, 0, &pricing);
+    let cost = calculate_cost(&tc(1_000_000, 500_000, 0, 100_000, 50_000, 0), &pricing);
     assert!(cost > 0.0);
     assert!(cost.is_finite());
 }
@@ -591,11 +613,19 @@ fn test_pricing_above_200k_tokens_via_tier() {
     };
 
     // Below 200K: base prices.
-    let below = calculate_cost(100_000, 50_000, 0, 0, 0, 0, &pricing);
+    let below = calculate_cost(&tc(100_000, 50_000, 0, 0, 0, 0), &pricing);
     assert_eq!(below, 100_000.0 * 0.000001 + 50_000.0 * 0.000002);
 
-    // Above 200K: tier prices for all tokens.
-    let above = calculate_cost(300_000, 50_000, 0, 0, 0, 0, &pricing);
+    // Aggregated volume alone never promotes to the tier — only the
+    // per-request above_tier slice does.
+    let aggregate = calculate_cost(&tc(300_000, 50_000, 0, 0, 0, 0), &pricing);
+    assert_eq!(aggregate, 300_000.0 * 0.000001 + 50_000.0 * 0.000002);
+
+    // A request classified above 200K bills its slice at tier prices.
+    let mut above = tc(300_000, 50_000, 0, 0, 0, 0);
+    above.above_input = 300_000;
+    above.above_output = 50_000;
+    let above = calculate_cost(&above, &pricing);
     assert_eq!(above, 300_000.0 * 0.000002 + 50_000.0 * 0.000004);
 }
 
@@ -623,10 +653,10 @@ fn test_pricing_range_based() {
         ..Default::default()
     };
 
-    let low = calculate_cost(10_000, 1000, 0, 0, 0, 0, &pricing);
+    let low = calculate_cost(&tc(10_000, 1000, 0, 0, 0, 0), &pricing);
     assert_eq!(low, 10_000.0 * 0.000001 + 1000.0 * 0.000005);
 
-    let high = calculate_cost(100_000, 1000, 0, 0, 0, 0, &pricing);
+    let high = calculate_cost(&tc(100_000, 1000, 0, 0, 0, 0), &pricing);
     assert_eq!(high, 100_000.0 * 0.0000018 + 1000.0 * 0.000009);
 }
 

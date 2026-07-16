@@ -39,6 +39,22 @@ pub struct TokenCounts {
     pub web_search_requests: i64,
     /// Sum of the billed buckets used for cost and display.
     pub total: i64,
+    /// Slice of `input_tokens` from requests whose own prompt context
+    /// exceeded the model's context-tier threshold (see the `above_tier`
+    /// object written by the usage parsers). Always a subset of the field it
+    /// mirrors — never additional tokens — so displays keep using the totals
+    /// above while `calculate_cost` bills this slice at the tier rate.
+    pub above_input: i64,
+    /// Above-threshold slice of `output_tokens`.
+    pub above_output: i64,
+    /// Above-threshold slice of `reasoning_tokens`.
+    pub above_reasoning: i64,
+    /// Above-threshold slice of `cache_read`.
+    pub above_cache_read: i64,
+    /// Above-threshold slice of `cache_creation_5m`.
+    pub above_cache_creation_5m: i64,
+    /// Above-threshold slice of `cache_creation_1h`.
+    pub above_cache_creation_1h: i64,
 }
 
 /// Extracts token counts from usage data in any provider format
@@ -109,6 +125,20 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
                 .get("web_search_requests")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
+        }
+
+        // Per-request tier classification (usage scans only): the parsers
+        // accumulate the above-threshold slice of every bucket into a nested
+        // `above_tier` object. Read it here — before the Codex early return —
+        // so both the flat and the nested shapes carry it into pricing.
+        if let Some(above) = usage_obj.get("above_tier").and_then(|v| v.as_object()) {
+            let field = |key: &str| above.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
+            counts.above_input = field("input_tokens");
+            counts.above_output = field("output_tokens");
+            counts.above_reasoning = field("reasoning_tokens");
+            counts.above_cache_read = field("cache_read_tokens");
+            counts.above_cache_creation_5m = field("cache_creation_5m_tokens");
+            counts.above_cache_creation_1h = field("cache_creation_1h_tokens");
         }
 
         // Gemini writes reasoning budget as `thoughts_tokens`; the flat
@@ -486,6 +516,52 @@ mod tests {
 
         let without = json!({ "input_tokens": 100, "output_tokens": 50 });
         assert_eq!(extract_token_counts(&without).web_search_requests, 0);
+    }
+
+    #[test]
+    fn above_tier_slices_are_extracted_for_both_shapes() {
+        // Flat shape (Claude / Gemini): above_tier is a sibling of the token
+        // fields and mirrors them as subsets.
+        let flat = json!({
+            "input_tokens": 300_000,
+            "output_tokens": 1_000,
+            "cache_read_input_tokens": 50_000,
+            "above_tier": {
+                "input_tokens": 280_000,
+                "output_tokens": 600,
+                "cache_read_tokens": 50_000
+            }
+        });
+        let c = extract_token_counts(&flat);
+        assert_eq!(c.input_tokens, 300_000);
+        assert_eq!(c.above_input, 280_000);
+        assert_eq!(c.above_output, 600);
+        assert_eq!(c.above_cache_read, 50_000);
+        assert_eq!(c.above_cache_creation_5m, 0);
+
+        // Codex shape: above_tier sits beside total_token_usage and must
+        // survive the early return that consumes the published total.
+        let codex = json!({
+            "total_token_usage": {
+                "input_tokens": 400_000,
+                "cached_input_tokens": 100_000,
+                "output_tokens": 2_000,
+                "reasoning_output_tokens": 500,
+                "total_tokens": 402_000
+            },
+            "above_tier": {
+                "input_tokens": 250_000,
+                "cache_read_tokens": 80_000,
+                "output_tokens": 900,
+                "reasoning_tokens": 300
+            }
+        });
+        let c = extract_token_counts(&codex);
+        assert_eq!(c.total, 402_000);
+        assert_eq!(c.above_input, 250_000);
+        assert_eq!(c.above_cache_read, 80_000);
+        assert_eq!(c.above_output, 900);
+        assert_eq!(c.above_reasoning, 300);
     }
 
     #[test]
