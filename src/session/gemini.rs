@@ -183,7 +183,7 @@ fn upsert_message(
         .get("tokens")
         .filter(|tokens| !tokens.is_null())
         .cloned();
-    let analysis = match serde_json::from_value::<GeminiAnalysisMessage>(message) {
+    let mut analysis = match serde_json::from_value::<GeminiAnalysisMessage>(message) {
         Ok(mut message) => {
             let mut message_diagnostics = ParseDiagnostics::default();
             if let Some(raw_tokens) = raw_tokens.as_ref() {
@@ -220,6 +220,16 @@ fn upsert_message(
     };
 
     if let Some(&index) = positions.get(&id) {
+        // A later revision that carries no usage (tokens null / omitted) must
+        // not wipe out tokens already billed on an earlier revision of the same
+        // id; keep the prior revision's usage-bearing fields in that case.
+        if analysis.tokens.is_none() {
+            let prior = &mut messages[index];
+            analysis.tokens = prior.tokens.take();
+            if analysis.model.is_none() {
+                analysis.model = prior.model.take();
+            }
+        }
         messages[index] = analysis;
     } else {
         positions.insert(id, messages.len());
@@ -563,6 +573,28 @@ mod tests {
         assert_eq!(record.tool_call_counts.write, 1);
         assert_eq!(record.write_file_details.len(), 1);
         assert_eq!(record.write_file_details[0].content, "new");
+    }
+
+    #[test]
+    fn tokenless_revision_keeps_prior_billed_tokens() {
+        // A billed revision followed by a tokenless one (tokens null) of the same
+        // id keeps the earlier tokens, while the latest revision's tool calls win.
+        let billed = assistant("message-1", "gemini-test", 42, json!([]));
+        let mut tokenless = assistant(
+            "message-1",
+            "gemini-test",
+            0,
+            json!([{ "name": "write_file", "args": {
+                "file_path": "/tmp/a.txt", "content": "x"
+            }}]),
+        );
+        tokenless["tokens"] = json!(null);
+
+        let analysis =
+            parse_gemini_events(session(), vec![billed, tokenless], ParseMode::Full).unwrap();
+        let record = &analysis.records[0];
+        assert_eq!(record.conversation_usage["gemini-test"]["input_tokens"], 42);
+        assert_eq!(record.tool_call_counts.write, 1);
     }
 
     #[test]
