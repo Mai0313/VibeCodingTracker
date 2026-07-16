@@ -17,6 +17,7 @@ use anyhow::Result;
 use regex::Regex;
 use serde_json::Value;
 use std::borrow::Borrow;
+use std::collections::HashSet;
 
 /// Parse Codex session records from a slice of pre-typed logs.
 ///
@@ -59,6 +60,9 @@ where
     let mut shell_calls: FastHashMap<String, PendingCodexShellCall> =
         FastHashMap::with_capacity(50);
     let mut custom_calls: FastHashMap<String, CodexCustomCall> = FastHashMap::with_capacity(32);
+    // Call ids of direct `apply_patch` custom_tool_calls, so a paired
+    // `patch_apply_end` event is not double counted (see the event_msg arm).
+    let mut apply_patch_call_ids: HashSet<String> = HashSet::new();
     let mut diagnostics = ParseDiagnostics::default();
 
     for entry in logs {
@@ -139,6 +143,32 @@ where
                         }
                     }
                 }
+
+                // Modern Codex applies most edits inside opaque `exec` cells and
+                // records the resulting file changes in a `patch_apply_end` event.
+                // A successful one is the authoritative source of those file ops.
+                if entry.payload.payload_type.as_deref() == Some("patch_apply_end") {
+                    // Skip the completion of a direct apply_patch custom_tool_call;
+                    // that path already counts it. Otherwise this event is the only
+                    // record of the change and must be folded in.
+                    let already_counted = entry
+                        .payload
+                        .call_id
+                        .as_deref()
+                        .is_some_and(|id| apply_patch_call_ids.contains(id));
+                    if matches!(entry.payload.success, Some(true)) && !already_counted {
+                        match parse_patch_changes(entry.payload.changes.as_ref()) {
+                            Some(patches) => {
+                                for patch in patches {
+                                    state.handle_patch(patch, ts);
+                                }
+                                diagnostics.record_relevant(true);
+                            }
+                            None => diagnostics.record_relevant(false),
+                        }
+                    }
+                    // A failed or deduped event is recognized but creates no file ops.
+                }
             }
             "response_item" => {
                 if let Some(payload_type) = &entry.payload.payload_type {
@@ -195,6 +225,14 @@ where
                             if let Some(name) = entry.payload.name.as_deref()
                                 && matches!(name, "exec" | "apply_patch")
                             {
+                                // Remember every direct apply_patch call id up front so a
+                                // later patch_apply_end for the same id is skipped, whichever
+                                // order the call output and the event arrive in.
+                                if name == "apply_patch"
+                                    && let Some(call_id) = entry.payload.call_id.as_deref()
+                                {
+                                    apply_patch_call_ids.insert(call_id.to_string());
+                                }
                                 let call = entry
                                     .payload
                                     .arguments
@@ -711,6 +749,47 @@ fn parse_apply_patch_script(script: &str) -> Vec<CodexPatch> {
     patches
 }
 
+/// Normalizes a `patch_apply_end` `changes` map into patch hunks.
+///
+/// Returns `None` when the payload is missing, not an object, or carries only
+/// unrecognizable entries (schema drift). An empty object is a well-formed
+/// no-op and yields an empty `Vec`. Entries are visited in sorted-path order
+/// (the underlying map is a `BTreeMap`) so the folded detail order is stable.
+fn parse_patch_changes(changes: Option<&Value>) -> Option<Vec<CodexPatch>> {
+    let obj = changes?.as_object()?;
+    let mut patches = Vec::with_capacity(obj.len());
+    for (path, entry) in obj {
+        if let Some(patch) = parse_patch_change_entry(path, entry) {
+            patches.push(patch);
+        }
+    }
+    if !obj.is_empty() && patches.is_empty() {
+        return None;
+    }
+    Some(patches)
+}
+
+/// Builds one [`CodexPatch`] from a single `changes` entry.
+///
+/// The unified diff feeds the same `(old, new)` extraction as the direct
+/// apply_patch path, so add / update / delete map to the identical metrics.
+fn parse_patch_change_entry(path: &str, entry: &Value) -> Option<CodexPatch> {
+    if path.is_empty() {
+        return None;
+    }
+    let entry = entry.as_object()?;
+    let action = entry.get("type").and_then(Value::as_str)?;
+    if !matches!(action, "add" | "update" | "delete") {
+        return None;
+    }
+    let unified_diff = entry.get("unified_diff").and_then(Value::as_str)?;
+    Some(CodexPatch {
+        action: action.to_string(),
+        file_path: path.to_string(),
+        lines: unified_diff.lines().map(str::to_string).collect(),
+    })
+}
+
 /// Splits diff `lines` into the joined `(old, new)` text.
 ///
 /// `+`-prefixed lines build the new content, `-`-prefixed lines the old;
@@ -823,6 +902,28 @@ mod tests {
             "call_id": call_id,
             "output": blocks
         }))
+    }
+
+    fn patch_apply_end(call_id: &str, success: bool, changes: Value) -> CodexLog {
+        serde_json::from_value(serde_json::json!({
+            "timestamp": "2026-07-12T00:00:00Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "patch_apply_end",
+                "call_id": call_id,
+                "success": success,
+                "changes": changes
+            }
+        }))
+        .unwrap()
+    }
+
+    fn apply_patch_success_output(file: &str) -> CodexLog {
+        let wire = serde_json::json!({
+            "output": format!("Success. Updated the following files:\nM {file}")
+        })
+        .to_string();
+        custom_output("shared-call", Value::String(wire))
     }
 
     #[test]
@@ -1378,5 +1479,138 @@ mod tests {
         );
         assert_eq!(state.tool_counts.edit, 1);
         assert_eq!(state.edit_details.len(), 1);
+    }
+
+    #[test]
+    fn patch_apply_end_success_counts_add_as_write_and_update_as_edit() {
+        let changes = serde_json::json!({
+            "/repo/new.rs": {
+                "type": "add",
+                "unified_diff": "@@ -0,0 +1,2 @@\n+fn main() {}\n+// added\n"
+            },
+            "/repo/lib.rs": {
+                "type": "update",
+                "unified_diff": "@@ -1,1 +1,1 @@\n-old\n+new\n"
+            }
+        });
+        let logs = vec![patch_apply_end("call-1", true, changes)];
+
+        let analysis = parse_codex_logs(&logs, ParseMode::Full).unwrap();
+        let record = &analysis.records[0];
+        assert_eq!(record.tool_call_counts.write, 1);
+        assert_eq!(record.tool_call_counts.edit, 1);
+        assert_eq!(record.total_unique_files, 2);
+        assert_eq!(record.write_file_details[0].base.file_path, "/repo/new.rs");
+        assert_eq!(record.edit_file_details[0].base.file_path, "/repo/lib.rs");
+    }
+
+    #[test]
+    fn patch_apply_end_failure_creates_no_file_ops() {
+        let changes = serde_json::json!({
+            "/repo/x.rs": { "type": "add", "unified_diff": "@@ -0,0 +1,1 @@\n+nope\n" }
+        });
+        let logs = vec![patch_apply_end("call-fail", false, changes)];
+
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        let record = &parsed.analysis.records[0];
+        assert_eq!(record.tool_call_counts.write, 0);
+        assert_eq!(record.total_unique_files, 0);
+        assert!(record.write_file_details.is_empty());
+        // Recognized event, but a failed apply is not a relevant normalization.
+        assert_eq!(parsed.diagnostics.relevant_records, 0);
+        assert!(!parsed.diagnostics.is_complete_failure());
+    }
+
+    #[test]
+    fn patch_apply_end_malformed_changes_is_relevant_failure() {
+        // success is true but `changes` is not an object → schema drift.
+        let logs = vec![patch_apply_end(
+            "call-x",
+            true,
+            Value::String("nope".into()),
+        )];
+
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        assert_eq!(parsed.analysis.records[0].tool_call_counts.edit, 0);
+        assert_eq!(parsed.analysis.records[0].tool_call_counts.write, 0);
+        assert!(parsed.diagnostics.is_complete_failure());
+    }
+
+    #[test]
+    fn patch_apply_end_deduped_against_direct_apply_patch_before_output() {
+        let patch = "*** Begin Patch\n*** Update File: lib.rs\n@@\n-old\n+new\n*** End Patch";
+        let changes = serde_json::json!({
+            "lib.rs": { "type": "update", "unified_diff": "@@ -1,1 +1,1 @@\n-old\n+new\n" }
+        });
+        // Event arrives between the custom_tool_call and its output.
+        let logs = vec![
+            response_item(serde_json::json!({
+                "type": "custom_tool_call",
+                "name": "apply_patch",
+                "input": patch,
+                "call_id": "shared-call"
+            })),
+            patch_apply_end("shared-call", true, changes),
+            apply_patch_success_output("lib.rs"),
+        ];
+
+        let analysis = parse_codex_logs(&logs, ParseMode::Full).unwrap();
+        let record = &analysis.records[0];
+        assert_eq!(record.tool_call_counts.edit, 1);
+        assert_eq!(record.edit_file_details.len(), 1);
+    }
+
+    #[test]
+    fn patch_apply_end_deduped_against_direct_apply_patch_after_output() {
+        let patch = "*** Begin Patch\n*** Update File: lib.rs\n@@\n-old\n+new\n*** End Patch";
+        let changes = serde_json::json!({
+            "lib.rs": { "type": "update", "unified_diff": "@@ -1,1 +1,1 @@\n-old\n+new\n" }
+        });
+        // Event arrives after the pending call was already consumed by its output.
+        let logs = vec![
+            response_item(serde_json::json!({
+                "type": "custom_tool_call",
+                "name": "apply_patch",
+                "input": patch,
+                "call_id": "shared-call"
+            })),
+            apply_patch_success_output("lib.rs"),
+            patch_apply_end("shared-call", true, changes),
+        ];
+
+        let analysis = parse_codex_logs(&logs, ParseMode::Full).unwrap();
+        let record = &analysis.records[0];
+        assert_eq!(record.tool_call_counts.edit, 1);
+        assert_eq!(record.edit_file_details.len(), 1);
+    }
+
+    #[test]
+    fn patch_apply_end_scalar_counts_match_across_parse_modes() {
+        let changes = serde_json::json!({
+            "/repo/new.rs": {
+                "type": "add",
+                "unified_diff": "@@ -0,0 +1,2 @@\n+fn main() {}\n+// added\n"
+            },
+            "/repo/lib.rs": {
+                "type": "update",
+                "unified_diff": "@@ -1,1 +1,1 @@\n-old\n+new\n"
+            }
+        });
+        let build = || vec![patch_apply_end("call-1", true, changes.clone())];
+
+        let full = parse_codex_logs(&build(), ParseMode::Full).unwrap();
+        let usage = parse_codex_logs(&build(), ParseMode::UsageOnly).unwrap();
+        let (f, u) = (&full.records[0], &usage.records[0]);
+
+        assert_eq!(f.tool_call_counts.write, u.tool_call_counts.write);
+        assert_eq!(f.tool_call_counts.edit, u.tool_call_counts.edit);
+        assert_eq!(f.total_unique_files, u.total_unique_files);
+        assert_eq!(f.total_write_lines, u.total_write_lines);
+        assert_eq!(f.total_edit_lines, u.total_edit_lines);
+        assert_eq!(f.total_write_characters, u.total_write_characters);
+        assert_eq!(f.total_edit_characters, u.total_edit_characters);
+        // Detail bodies are retained only in Full mode.
+        assert!(!f.write_file_details.is_empty());
+        assert!(u.write_file_details.is_empty());
     }
 }
