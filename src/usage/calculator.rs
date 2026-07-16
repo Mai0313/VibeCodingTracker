@@ -1498,6 +1498,23 @@ fn add_token_counts(a: &TokenCounts, b: &TokenCounts) -> TokenCounts {
     }
 }
 
+/// Normalizes any provider-shaped usage value into the flat key set.
+///
+/// `usage --json` rows pass through here so every model row carries the same
+/// flat fields (`input_tokens` / `output_tokens` / `reasoning_output_tokens` /
+/// `cache_read_input_tokens` / `cache_creation_input_tokens` / `total_tokens`)
+/// regardless of provider. Without this, Codex-only models would serialize
+/// their internal nested `total_token_usage` shape and consumers reading the
+/// flat keys would see `null` for all of that model's tokens.
+pub fn normalize_usage_value(usage: &Value) -> Value {
+    let counts = crate::utils::extract_token_counts(usage);
+    let mut value = token_counts_to_flat_value(&counts);
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("total_tokens".into(), json!(counts.total));
+    }
+    value
+}
+
 /// Serializes normalized counts back into the flat usage shape.
 ///
 /// The key set is exactly what [`extract_token_counts`] reads for a flat value,

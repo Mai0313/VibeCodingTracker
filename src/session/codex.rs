@@ -1635,7 +1635,7 @@ mod tests {
         });
         let logs = vec![patch_apply_end("call-fail", false, changes)];
 
-        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full, None).unwrap();
         let record = &parsed.analysis.records[0];
         assert_eq!(record.tool_call_counts.write, 0);
         assert_eq!(record.total_unique_files, 0);
@@ -1654,7 +1654,7 @@ mod tests {
             Value::String("nope".into()),
         )];
 
-        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full, None).unwrap();
         assert_eq!(parsed.analysis.records[0].tool_call_counts.edit, 0);
         assert_eq!(parsed.analysis.records[0].tool_call_counts.write, 0);
         assert!(parsed.diagnostics.is_complete_failure());

@@ -502,9 +502,11 @@ fn build_enriched_json(
         let (cost, matched_model) = resolve_enriched_model_cost(model, usage_data, pricing_map)
             .unwrap_or_else(|| price_usage_value(model, usage, pricing_map, CostSource::Litellm));
 
+        // Every row serializes the same flat token fields regardless of the
+        // provider's internal usage shape (Codex is nested internally).
         let mut entry = json!({
             "model": model,
-            "usage": usage,
+            "usage": vibe_coding_tracker::usage::normalize_usage_value(usage),
             "cost_usd": cost
         });
 
