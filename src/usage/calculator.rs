@@ -1348,6 +1348,11 @@ pub enum CostSource {
     /// safest fallback; the map is kept separate so a colliding bare model name
     /// can't cross-contaminate another provider's cost.
     HermesStored(f64),
+    /// Grok: the full LiteLLM lookup, but the context-gauge estimate lives
+    /// entirely in the cache-read bucket, so a matched model whose LiteLLM
+    /// entry publishes no cache-read price (null for several `xai/grok-*`
+    /// variants) falls back to the input rate instead of silently costing $0.
+    GrokGauge,
 }
 
 /// Resolves the USD cost (and optional matched-model annotation) for one model.
@@ -1382,6 +1387,14 @@ pub fn resolve_model_cost(
         CostSource::Litellm => {
             let result = pricing_map.get(model);
             (priced(&result.pricing), result.matched_model)
+        }
+        CostSource::GrokGauge => {
+            let result = pricing_map.get(model);
+            let mut pricing = result.pricing;
+            if pricing.cache_read_input_token_cost <= 0.0 {
+                pricing.cache_read_input_token_cost = pricing.input_cost_per_token;
+            }
+            (priced(&pricing), result.matched_model)
         }
     }
 }

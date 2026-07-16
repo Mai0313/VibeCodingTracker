@@ -9,6 +9,9 @@ use std::borrow::Cow;
 enum ProviderPricing<'a> {
     /// File-based providers priced purely from LiteLLM.
     Litellm,
+    /// Grok's context-gauge estimate: LiteLLM with an input-rate fallback for
+    /// entries that publish no cache-read price.
+    GrokGauge,
     /// OpenCode: exact LiteLLM match, else its stored cost.
     OpenCode(&'a crate::constants::FastHashMap<String, f64>),
     /// Cursor local estimate: exact LiteLLM pricing, else zero.
@@ -24,6 +27,7 @@ impl ProviderPricing<'_> {
             |m: &crate::constants::FastHashMap<String, f64>| m.get(model).copied().unwrap_or(0.0);
         match self {
             Self::Litellm => CostSource::Litellm,
+            Self::GrokGauge => CostSource::GrokGauge,
             Self::OpenCode(m) => CostSource::OpenCodeStored(stored(m)),
             Self::CursorEstimate => CostSource::OpenCodeStored(0.0),
             Self::Hermes(m) => CostSource::HermesStored(stored(m)),
@@ -201,7 +205,7 @@ pub fn calculate_provider_totals_from_per_provider(
         &mut totals.grok,
         &per_provider.grok,
         pricing_map,
-        ProviderPricing::Litellm,
+        ProviderPricing::GrokGauge,
     );
     accumulate_provider(
         &mut totals.opencode,

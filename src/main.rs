@@ -535,7 +535,6 @@ fn resolve_enriched_model_cost(
         &usage_data.per_provider.codex,
         &usage_data.per_provider.copilot,
         &usage_data.per_provider.gemini,
-        &usage_data.per_provider.grok,
     ] {
         if let Some(raw_usage) = usage.get(model) {
             found = true;
@@ -555,6 +554,7 @@ fn resolve_enriched_model_cost(
         m.get(model).copied().unwrap_or(0.0)
     };
     for (usage, source) in [
+        (&usage_data.per_provider.grok, CostSource::GrokGauge),
         (
             &usage_data.per_provider.opencode,
             CostSource::OpenCodeStored(stored(&usage_data.stored_costs.opencode)),
