@@ -12,7 +12,9 @@ use crate::constants::FastHashMap;
 use crate::models::*;
 use crate::session::diagnostics::{ParseDiagnostics, ParsedAnalysis};
 use crate::session::state::{ParseMode, SessionParseState};
-use crate::utils::{get_git_remote_url, parse_iso_timestamp, process_codex_usage};
+use crate::utils::{
+    CodexTokenTotals, get_git_remote_url, parse_iso_timestamp, process_codex_usage,
+};
 use anyhow::Result;
 use regex::Regex;
 use serde_json::Value;
@@ -55,7 +57,11 @@ where
     let mut state = SessionParseState::with_mode(mode);
     let mut conversation_usage: FastHashMap<String, Value> = FastHashMap::with_capacity(5);
     let mut current_model = String::new();
-    let mut replay_baseline = None;
+    // Codex publishes whole-session cumulative counters on every token_count
+    // event; each model is billed only the delta since the previous snapshot.
+    // Pre-context snapshots (a resumed session's replayed totals) advance the
+    // snapshot without attribution, replacing the old replay-baseline hack.
+    let mut prev_totals: Option<CodexTokenTotals> = None;
     let mut shell_calls: FastHashMap<String, PendingCodexShellCall> =
         FastHashMap::with_capacity(50);
     let mut custom_calls: FastHashMap<String, CodexCustomCall> = FastHashMap::with_capacity(32);
@@ -124,18 +130,30 @@ where
                 {
                     if !is_supported_codex_usage(info) {
                         diagnostics.record_relevant(false);
-                    } else if current_model.is_empty() {
-                        diagnostics.record_relevant(true);
-                        if let Some(total) = info.get("total_token_usage") {
-                            replay_baseline = Some(total.clone());
-                        }
                     } else {
                         diagnostics.record_relevant(true);
-                        if let Some(baseline) = &replay_baseline {
-                            let adjusted = subtract_codex_replay_baseline(info, baseline);
-                            process_codex_usage(&mut conversation_usage, &current_model, &adjusted);
+                        let total = info.get("total_token_usage").and_then(Value::as_object);
+                        if current_model.is_empty() {
+                            // Replayed pre-context totals: advance the snapshot
+                            // without attributing tokens to a guessed model.
+                            if let Some(total) = total {
+                                prev_totals = Some(CodexTokenTotals::from_total_object(total));
+                            }
                         } else {
-                            process_codex_usage(&mut conversation_usage, &current_model, info);
+                            let delta = total
+                                .map(|total| {
+                                    CodexTokenTotals::delta_fields(total, prev_totals.as_ref())
+                                })
+                                .unwrap_or_default();
+                            process_codex_usage(
+                                &mut conversation_usage,
+                                &current_model,
+                                &delta,
+                                info,
+                            );
+                            if let Some(total) = total {
+                                prev_totals = Some(CodexTokenTotals::from_total_object(total));
+                            }
                         }
                     }
                 }
@@ -275,36 +293,6 @@ fn is_supported_codex_usage(info: &Value) -> bool {
         }
     }
     recognized
-}
-
-fn subtract_codex_replay_baseline(info: &Value, baseline: &Value) -> Value {
-    let mut adjusted = info.clone();
-    let (Some(total), Some(baseline)) = (
-        adjusted
-            .get_mut("total_token_usage")
-            .and_then(Value::as_object_mut),
-        baseline.as_object(),
-    ) else {
-        return adjusted;
-    };
-    for key in [
-        "input_tokens",
-        "cached_input_tokens",
-        "output_tokens",
-        "reasoning_output_tokens",
-        "total_tokens",
-    ] {
-        if let (Some(current), Some(replayed)) = (
-            total.get(key).and_then(Value::as_i64),
-            baseline.get(key).and_then(Value::as_i64),
-        ) {
-            total.insert(
-                key.to_string(),
-                Value::from(current.saturating_sub(replayed).max(0)),
-            );
-        }
-    }
-    adjusted
 }
 
 fn is_supported_codex_token_usage(usage: &Value) -> bool {
@@ -1073,6 +1061,67 @@ mod tests {
         let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
         assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
         assert!(parsed.analysis.records[0].conversation_usage.is_empty());
+    }
+
+    #[test]
+    fn mid_session_model_switch_bills_each_model_its_own_delta() {
+        // The cumulative counter keeps growing across a model switch; the
+        // second model must be billed only the post-switch increment, not the
+        // whole-session cumulative that already contains the first model.
+        let token_count = |input: i64, cached: i64, output: i64, total: i64| {
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:00Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": input,
+                            "cached_input_tokens": cached,
+                            "output_tokens": output,
+                            "reasoning_output_tokens": 0,
+                            "total_tokens": total
+                        },
+                        "model_context_window": 200000
+                    }
+                }
+            })
+        };
+        let turn_context = |model: &str| {
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:00Z",
+                "type": "turn_context",
+                "payload": { "model": model }
+            })
+        };
+        let logs: Vec<CodexLog> = [
+            turn_context("gpt-5.6-luna"),
+            token_count(20_000, 4_000, 3_289, 23_289),
+            turn_context("gpt-5.6-sol"),
+            token_count(60_000, 30_000, 10_000, 70_000),
+            token_count(90_000, 56_000, 14_576, 104_576),
+        ]
+        .into_iter()
+        .map(|value| serde_json::from_value(value).unwrap())
+        .collect();
+
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
+
+        let usage = &parsed.analysis.records[0].conversation_usage;
+        let luna = usage["gpt-5.6-luna"]["total_token_usage"]
+            .as_object()
+            .unwrap();
+        let sol = usage["gpt-5.6-sol"]["total_token_usage"]
+            .as_object()
+            .unwrap();
+        assert_eq!(luna["total_tokens"].as_i64().unwrap(), 23_289);
+        assert_eq!(sol["total_tokens"].as_i64().unwrap(), 104_576 - 23_289);
+        assert_eq!(
+            luna["total_tokens"].as_i64().unwrap() + sol["total_tokens"].as_i64().unwrap(),
+            104_576,
+            "the two models' attributed totals must reconstruct the session cumulative"
+        );
     }
 
     #[test]

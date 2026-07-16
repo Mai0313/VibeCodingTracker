@@ -43,6 +43,6 @@ pub use paths::{
 pub use time::{now_rfc3339_utc_nanos, parse_iso_timestamp};
 pub use token_extractor::{TokenCounts, extract_token_counts};
 pub use usage_processor::{
-    accumulate_i64_fields, accumulate_nested_object, process_claude_usage, process_codex_usage,
-    process_gemini_usage,
+    CodexTokenTotals, accumulate_i64_fields, accumulate_nested_object, process_claude_usage,
+    process_codex_usage, process_gemini_usage,
 };

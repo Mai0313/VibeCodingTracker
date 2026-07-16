@@ -159,15 +159,97 @@ pub fn process_claude_usage(
     }
 }
 
-/// Merges one Codex usage record into `conversation_usage`, keyed by `model`.
+/// The five integer fields of a Codex `total_token_usage` object.
+pub const CODEX_TOKEN_FIELDS: [&str; 5] = [
+    "input_tokens",
+    "cached_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+];
+
+/// Snapshot of Codex's cumulative `total_token_usage` counters.
 ///
-/// `total_token_usage`, `last_token_usage`, and `model_context_window` are
-/// *replaced* with the incoming values rather than accumulated, because each
-/// Codex record already carries the running session total — adding them would
-/// double-count. Synthetic models and non-object `info` payloads are ignored.
+/// Codex publishes a whole-session running total on every `token_count`
+/// event. Attribution therefore works on the *delta* between consecutive
+/// snapshots, so a mid-session model switch bills each model only for the
+/// tokens produced while it was current instead of double-counting the
+/// pre-switch prefix under both models.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CodexTokenTotals {
+    pub input_tokens: i64,
+    pub cached_input_tokens: i64,
+    pub output_tokens: i64,
+    pub reasoning_output_tokens: i64,
+    pub total_tokens: i64,
+}
+
+impl CodexTokenTotals {
+    /// Reads the cumulative counters out of a `total_token_usage` object,
+    /// treating missing or non-integer fields as `0`.
+    pub fn from_total_object(total: &serde_json::Map<String, Value>) -> Self {
+        let field = |key: &str| total.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
+        Self {
+            input_tokens: field("input_tokens"),
+            cached_input_tokens: field("cached_input_tokens"),
+            output_tokens: field("output_tokens"),
+            reasoning_output_tokens: field("reasoning_output_tokens"),
+            total_tokens: field("total_tokens"),
+        }
+    }
+
+    fn field(&self, key: &str) -> i64 {
+        match key {
+            "input_tokens" => self.input_tokens,
+            "cached_input_tokens" => self.cached_input_tokens,
+            "output_tokens" => self.output_tokens,
+            "reasoning_output_tokens" => self.reasoning_output_tokens,
+            "total_tokens" => self.total_tokens,
+            _ => 0,
+        }
+    }
+
+    /// Builds the per-event delta map against `prev`, keeping only the keys
+    /// actually present in `total` so absent fields stay absent downstream.
+    ///
+    /// A drop in `total_tokens` means the counter restarted (never observed
+    /// in real logs, but cheap to guard): the event is treated as the start
+    /// of a new segment rather than clamping every field to zero, which
+    /// would silently drop the new segment's early tokens.
+    pub fn delta_fields(
+        total: &serde_json::Map<String, Value>,
+        prev: Option<&Self>,
+    ) -> serde_json::Map<String, Value> {
+        let current = Self::from_total_object(total);
+        let base = match prev {
+            Some(prev) if current.total_tokens >= prev.total_tokens => *prev,
+            _ => Self::default(),
+        };
+        let mut delta = serde_json::Map::new();
+        for key in CODEX_TOKEN_FIELDS {
+            if total.contains_key(key) {
+                delta.insert(
+                    key.to_string(),
+                    (current.field(key) - base.field(key)).max(0).into(),
+                );
+            }
+        }
+        delta
+    }
+}
+
+/// Merges one Codex usage delta into `conversation_usage`, keyed by `model`.
+///
+/// `delta` carries the per-event increments derived from consecutive
+/// cumulative snapshots (see [`CodexTokenTotals`]) and is *accumulated* into
+/// the model's `total_token_usage`, so each model ends up with exactly the
+/// tokens produced while it was the active model. `last_token_usage` and
+/// `model_context_window` are replaced with the latest values. Synthetic
+/// models and non-object `info` payloads are ignored.
 pub fn process_codex_usage(
     conversation_usage: &mut FastHashMap<String, Value>,
     model: &str,
+    delta: &serde_json::Map<String, Value>,
     info: &Value,
 ) {
     // Skip synthetic models
@@ -194,10 +276,7 @@ pub fn process_codex_usage(
         return;
     };
 
-    // Process total_token_usage (replace, not accumulate - Codex already accumulates)
-    if let Some(total_usage) = info_obj.get("total_token_usage") {
-        existing_obj.insert("total_token_usage".to_string(), total_usage.clone());
-    }
+    accumulate_nested_object(existing_obj, "total_token_usage", delta);
 
     // Process last_token_usage
     if let Some(last_usage) = info_obj.get("last_token_usage") {
@@ -500,15 +579,85 @@ mod tests {
             },
             "model_context_window": 128000
         });
+        let total = info["total_token_usage"].as_object().unwrap();
+        let delta = CodexTokenTotals::delta_fields(total, None);
 
-        process_codex_usage(&mut conversation_usage, model, &info);
+        process_codex_usage(&mut conversation_usage, model, &delta, &info);
 
         let result = conversation_usage.get(model).unwrap();
         let total_usage = result["total_token_usage"].as_object().unwrap();
         assert_eq!(total_usage["input_tokens"].as_i64().unwrap(), 100);
         assert_eq!(total_usage["output_tokens"].as_i64().unwrap(), 50);
         assert_eq!(total_usage["cached_input_tokens"].as_i64().unwrap(), 200);
+        assert!(!total_usage.contains_key("total_tokens"));
         assert_eq!(result["model_context_window"].as_i64().unwrap(), 128000);
+    }
+
+    #[test]
+    fn codex_delta_attributes_only_the_increment_to_the_current_model() {
+        // Mirrors a real mid-session model switch: the cumulative counter at
+        // the switch point must not be billed again under the second model.
+        let mut conversation_usage = FastHashMap::default();
+
+        let first = json!({
+            "total_token_usage": {
+                "input_tokens": 20_000,
+                "cached_input_tokens": 4_000,
+                "output_tokens": 3_289,
+                "reasoning_output_tokens": 1_000,
+                "total_tokens": 23_289
+            }
+        });
+        let first_total = first["total_token_usage"].as_object().unwrap();
+        let delta = CodexTokenTotals::delta_fields(first_total, None);
+        process_codex_usage(&mut conversation_usage, "gpt-5.6-luna", &delta, &first);
+        let prev = CodexTokenTotals::from_total_object(first_total);
+
+        let second = json!({
+            "total_token_usage": {
+                "input_tokens": 90_000,
+                "cached_input_tokens": 60_000,
+                "output_tokens": 14_576,
+                "reasoning_output_tokens": 5_000,
+                "total_tokens": 104_576
+            }
+        });
+        let second_total = second["total_token_usage"].as_object().unwrap();
+        let delta = CodexTokenTotals::delta_fields(second_total, Some(&prev));
+        process_codex_usage(&mut conversation_usage, "gpt-5.6-sol", &delta, &second);
+
+        let luna = conversation_usage["gpt-5.6-luna"]["total_token_usage"]
+            .as_object()
+            .unwrap();
+        let sol = conversation_usage["gpt-5.6-sol"]["total_token_usage"]
+            .as_object()
+            .unwrap();
+        assert_eq!(luna["total_tokens"].as_i64().unwrap(), 23_289);
+        assert_eq!(sol["total_tokens"].as_i64().unwrap(), 104_576 - 23_289);
+        assert_eq!(sol["input_tokens"].as_i64().unwrap(), 70_000);
+        assert_eq!(sol["cached_input_tokens"].as_i64().unwrap(), 56_000);
+    }
+
+    #[test]
+    fn codex_delta_treats_a_counter_reset_as_a_new_segment() {
+        // total_tokens dropping below the previous snapshot means the session
+        // counter restarted; the event's own values are the new segment.
+        let total = json!({
+            "input_tokens": 500,
+            "output_tokens": 100,
+            "total_tokens": 600
+        });
+        let prev = CodexTokenTotals {
+            input_tokens: 9_000,
+            cached_input_tokens: 0,
+            output_tokens: 1_000,
+            reasoning_output_tokens: 0,
+            total_tokens: 10_000,
+        };
+        let delta = CodexTokenTotals::delta_fields(total.as_object().unwrap(), Some(&prev));
+        assert_eq!(delta["input_tokens"].as_i64().unwrap(), 500);
+        assert_eq!(delta["output_tokens"].as_i64().unwrap(), 100);
+        assert_eq!(delta["total_tokens"].as_i64().unwrap(), 600);
     }
 
     #[test]
