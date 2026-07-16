@@ -169,17 +169,15 @@ where
                         let Some(usage) = metric.usage else {
                             continue;
                         };
-                        // Copilot's `reasoningTokens` is the model's
-                        // thinking budget emitted before the visible
-                        // response. Surface it as its own field so
-                        // `calculate_cost` can charge it against the
-                        // model's published reasoning rate (when present)
-                        // via `output_cost_per_reasoning_token`, instead
-                        // of folding it into `output_tokens` and billing
-                        // every thinking token at the flat output rate.
+                        // Copilot's `outputTokens` follows OpenAI's convention
+                        // and already includes `reasoningTokens`, so subtract it
+                        // back out to keep each token billed once (the flat token
+                        // shape treats output and reasoning as disjoint buckets).
+                        let output_tokens =
+                            usage.output_tokens.saturating_sub(usage.reasoning_tokens);
                         let usage_json = json!({
                             "input_tokens": usage.input_tokens,
-                            "output_tokens": usage.output_tokens,
+                            "output_tokens": output_tokens,
                             "reasoning_output_tokens": usage.reasoning_tokens,
                             "cache_read_input_tokens": usage.cache_read_tokens,
                             "cache_creation_input_tokens": usage.cache_write_tokens,
@@ -367,6 +365,9 @@ fn is_tracked_tool(name: &str) -> bool {
             | "read_file"
             | "rg"
             | "grep"
+            | "glob"
+            | "web_search"
+            | "web_fetch"
             | "create"
             | "write_file"
             | "write"
@@ -388,7 +389,7 @@ fn tracked_tool_arguments_supported(name: &str, args: &Value) -> bool {
             .get("path")
             .and_then(Value::as_str)
             .is_some_and(|path| !path.is_empty()),
-        "rg" | "grep" => true,
+        "rg" | "grep" | "glob" | "web_search" | "web_fetch" => true,
         "create" | "write_file" | "write" => {
             args.get("path")
                 .and_then(Value::as_str)
@@ -473,7 +474,7 @@ struct PendingTool {
 
 /// Routes a completed Copilot tool call to the matching file-operation tally.
 ///
-/// Branches on `pending.tool_name`; unrecognised tools (e.g. `glob`,
+/// Branches on `pending.tool_name`; unrecognised tools (e.g. `report_intent`,
 /// `task_complete`) are silently ignored. Argument field names are probed
 /// with historical aliases for forward compatibility across CLI releases.
 fn dispatch_tool(
@@ -497,9 +498,9 @@ fn dispatch_tool(
             let content = extract_view_content(args, &complete.result);
             attach_read_detail(state, path, &content, ts);
         }
-        // Search tools read repository content but do not identify one complete
+        // Search and web tools surface content but do not identify one complete
         // file body, so retain the invocation without inventing line totals.
-        "rg" | "grep" => state.tool_counts.read += 1,
+        "rg" | "grep" | "glob" | "web_search" | "web_fetch" => state.tool_counts.read += 1,
         // `create` is the primary write tool. Historical names are kept for
         // robustness; a future release that renames the tool will still get
         // counted if the argument shape stays similar.
@@ -554,8 +555,8 @@ fn dispatch_tool(
             let input = args.get("input").and_then(Value::as_str).unwrap_or("");
             state.add_run_command(input, "", ts);
         }
-        // `glob`, `report_intent`, `task_complete`, `update_topic`, … have
-        // no file-operation semantics we care about. Silently ignore.
+        // `report_intent`, `task_complete`, `update_topic`, … have no
+        // file-operation semantics we care about. Silently ignore.
         _ => {}
     }
 }
@@ -862,7 +863,7 @@ mod tests {
     #[test]
     fn current_search_tools_count_read_invocations_without_fake_lines() {
         let mut state = SessionParseState::new();
-        for tool_name in ["rg", "grep"] {
+        for tool_name in ["rg", "grep", "glob", "web_search", "web_fetch"] {
             let pending = PendingTool {
                 tool_name: tool_name.to_string(),
                 arguments: json!({ "pattern": "needle", "paths": ["src"] }),
@@ -872,7 +873,7 @@ mod tests {
             };
             dispatch_tool(&mut state, &pending, &completed());
         }
-        assert_eq!(state.tool_counts.read, 2);
+        assert_eq!(state.tool_counts.read, 5);
         assert_eq!(state.total_read_lines, 0);
     }
 

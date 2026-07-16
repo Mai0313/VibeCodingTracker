@@ -583,6 +583,32 @@ fn usage_json_smoke_prices_seeded_session() {
         .find(|r| r["model"] == "claude-sonnet-4-20250514")
         .expect("seeded Claude model should appear in usage output");
     assert!(sonnet["cost_usd"].is_number(), "cost should be priced");
+
+    // Every row's usage serializes to the same flat key set regardless of the
+    // provider's internal shape (Codex is nested internally).
+    for row in arr {
+        let usage = row["usage"]
+            .as_object()
+            .expect("usage --json rows carry a usage object");
+        for key in [
+            "input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+            "total_tokens",
+        ] {
+            assert!(
+                usage.get(key).is_some_and(serde_json::Value::is_i64),
+                "usage --json row for {} must carry flat integer {key}",
+                row["model"]
+            );
+        }
+        assert!(
+            usage.get("total_token_usage").is_none(),
+            "nested Codex shape must not leak into usage --json"
+        );
+    }
 }
 
 #[test]

@@ -269,10 +269,17 @@ fn parse_updates(
                 let Some(call) = calls.remove(id) else {
                     continue;
                 };
-                if !is_tracked_tool(&call.name) {
+                let tracked = is_tracked_tool(&call.name);
+                if !tracked && !is_known_unmodeled_tool(&call.name) {
                     continue;
                 }
                 diagnostics.record_recognized_source();
+                if !tracked {
+                    // spawn_subagent / get_command_or_subagent_output orchestrate
+                    // other tools instead of touching files: recognized so they
+                    // never look like schema drift, but mapped to no metric.
+                    continue;
+                }
                 if status != "completed" {
                     diagnostics.record_relevant(true);
                     continue;
@@ -298,6 +305,13 @@ fn is_tracked_tool(name: &str) -> bool {
         name,
         "read_file" | "grep" | "write" | "search_replace" | "run_terminal_command" | "todo_write"
     )
+}
+
+/// Grok tools we recognize but deliberately do not model. They orchestrate
+/// other tools rather than touching files, so counting them would invent
+/// metrics; recognizing them keeps them from registering as schema drift.
+fn is_known_unmodeled_tool(name: &str) -> bool {
+    matches!(name, "spawn_subagent" | "get_command_or_subagent_output")
 }
 
 fn apply_completed_tool(
@@ -575,6 +589,53 @@ mod tests {
             state.write_details[0].base.file_path,
             "/workspace/demo/src/new.rs"
         );
+    }
+
+    #[test]
+    fn known_unmodeled_orchestration_tools_are_recognized_and_ignored() {
+        for tool in ["spawn_subagent", "get_command_or_subagent_output"] {
+            let temp = tempfile::tempdir().unwrap();
+            let signals = temp.path().join("signals.json");
+            let call = json!({
+                "method": "session/update",
+                "params": {"update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "orch-1",
+                    "title": tool,
+                    "rawInput": {"task": "investigate"},
+                    "_meta": {"x.ai/tool": {"name": tool}}
+                }},
+                "timestamp": 1_767_225_600
+            });
+            let update = json!({
+                "method": "session/update",
+                "params": {"update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "orch-1",
+                    "status": "completed",
+                    "rawOutput": {"type": "TaskOutput", "text": "done"}
+                }},
+                "timestamp": 1_767_225_601
+            });
+            std::fs::write(
+                temp.path().join("updates.jsonl"),
+                format!("{call}\n{update}\n"),
+            )
+            .unwrap();
+
+            let mut state = SessionParseState::new();
+            let mut diagnostics = ParseDiagnostics::default();
+            parse_updates(&signals, &mut state, &mut diagnostics).unwrap();
+
+            assert_eq!(state.tool_counts.read, 0);
+            assert_eq!(state.tool_counts.write, 0);
+            assert_eq!(state.tool_counts.edit, 0);
+            assert_eq!(state.tool_counts.bash, 0);
+            assert_eq!(state.tool_counts.todo_write, 0);
+            assert_eq!(diagnostics.partial_failure_count(), 0);
+            // Recognized (not schema drift), just not modeled.
+            assert_eq!(diagnostics.recognized_records, 1);
+        }
     }
 
     #[test]

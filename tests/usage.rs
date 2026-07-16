@@ -867,7 +867,15 @@ fn test_usage_calculation_cost_accuracy() {
     };
 
     // 2000 cache_creation tokens, all default (5 minute) TTL, no reasoning.
-    let cost = calculate_cost(1000, 500, 0, 10000, 2000, 0, &pricing);
+    let counts = vibe_coding_tracker::utils::TokenCounts {
+        input_tokens: 1000,
+        output_tokens: 500,
+        cache_read: 10000,
+        cache_creation: 2000,
+        cache_creation_5m: 2000,
+        ..Default::default()
+    };
+    let cost = calculate_cost(&counts, &pricing);
 
     // input: 1000 * 0.000003 = 0.003
     // output: 500 * 0.000015 = 0.0075

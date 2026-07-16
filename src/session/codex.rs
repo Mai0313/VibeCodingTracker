@@ -10,13 +10,17 @@
 //! applied only when their paired output explicitly reports success.
 use crate::constants::FastHashMap;
 use crate::models::*;
+use crate::pricing::{TierClassifier, TierThresholds};
 use crate::session::diagnostics::{ParseDiagnostics, ParsedAnalysis};
 use crate::session::state::{ParseMode, SessionParseState};
-use crate::utils::{get_git_remote_url, parse_iso_timestamp, process_codex_usage};
+use crate::utils::{
+    CodexTokenTotals, get_git_remote_url, parse_iso_timestamp, process_codex_usage,
+};
 use anyhow::Result;
 use regex::Regex;
 use serde_json::Value;
 use std::borrow::Borrow;
+use std::collections::HashSet;
 
 /// Parse Codex session records from a slice of pre-typed logs.
 ///
@@ -40,25 +44,39 @@ where
     I: IntoIterator,
     I::Item: Borrow<CodexLog>,
 {
-    Ok(parse_codex_log_iter_with_diagnostics(logs, mode)?.analysis)
+    Ok(parse_codex_log_iter_with_diagnostics(logs, mode, None)?.analysis)
 }
 
 /// Streaming Codex parser with parser-only schema diagnostics.
 pub(crate) fn parse_codex_log_iter_with_diagnostics<I>(
     logs: I,
     mode: ParseMode,
+    tiers: Option<&TierThresholds>,
 ) -> Result<ParsedAnalysis>
 where
     I: IntoIterator,
     I::Item: Borrow<CodexLog>,
 {
+    let mut classifier = tiers.map(TierClassifier::new);
     let mut state = SessionParseState::with_mode(mode);
     let mut conversation_usage: FastHashMap<String, Value> = FastHashMap::with_capacity(5);
     let mut current_model = String::new();
-    let mut replay_baseline = None;
+    // Codex publishes whole-session cumulative counters on every token_count
+    // event; each model is billed only the delta since the previous snapshot.
+    // Pre-context snapshots (a resumed session's replayed totals) advance the
+    // snapshot without attribution, replacing the old replay-baseline hack.
+    let mut prev_totals: Option<CodexTokenTotals> = None;
     let mut shell_calls: FastHashMap<String, PendingCodexShellCall> =
         FastHashMap::with_capacity(50);
     let mut custom_calls: FastHashMap<String, CodexCustomCall> = FastHashMap::with_capacity(32);
+    // Call ids of direct `apply_patch` custom_tool_calls, so a paired
+    // `patch_apply_end` event is not double counted (see the event_msg arm).
+    // Call ids whose file ops have already been counted, by either the direct
+    // apply_patch output or its authoritative patch_apply_end event. The first
+    // to actually count wins; the other is skipped. A direct patch whose output
+    // never confirmed success does not register here, so it can't suppress a
+    // successful event.
+    let mut patch_counted_ids: HashSet<String> = HashSet::new();
     let mut diagnostics = ParseDiagnostics::default();
 
     for entry in logs {
@@ -124,20 +142,76 @@ where
                 {
                     if !is_supported_codex_usage(info) {
                         diagnostics.record_relevant(false);
-                    } else if current_model.is_empty() {
-                        diagnostics.record_relevant(true);
-                        if let Some(total) = info.get("total_token_usage") {
-                            replay_baseline = Some(total.clone());
-                        }
                     } else {
                         diagnostics.record_relevant(true);
-                        if let Some(baseline) = &replay_baseline {
-                            let adjusted = subtract_codex_replay_baseline(info, baseline);
-                            process_codex_usage(&mut conversation_usage, &current_model, &adjusted);
+                        let total = info.get("total_token_usage").and_then(Value::as_object);
+                        if current_model.is_empty() {
+                            // Replayed pre-context totals: advance the snapshot
+                            // without attributing tokens to a guessed model.
+                            if let Some(total) = total {
+                                prev_totals = Some(CodexTokenTotals::from_total_object(total));
+                            }
                         } else {
-                            process_codex_usage(&mut conversation_usage, &current_model, info);
+                            let delta = total
+                                .map(|total| {
+                                    CodexTokenTotals::delta_fields(total, prev_totals.as_ref())
+                                })
+                                .unwrap_or_default();
+                            // One token_count is one turn; its request context
+                            // is the turn's own full prompt (cached included),
+                            // published as last_token_usage.input_tokens. Fall
+                            // back to the delta input when absent.
+                            let above = classifier.as_mut().is_some_and(|classifier| {
+                                let request_context = info
+                                    .get("last_token_usage")
+                                    .and_then(|last| last.get("input_tokens"))
+                                    .and_then(Value::as_i64)
+                                    .filter(|tokens| *tokens > 0)
+                                    .or_else(|| delta.get("input_tokens").and_then(Value::as_i64))
+                                    .unwrap_or(0);
+                                classifier.is_above(&current_model, request_context)
+                            });
+                            process_codex_usage(
+                                &mut conversation_usage,
+                                &current_model,
+                                &delta,
+                                info,
+                                above,
+                            );
+                            if let Some(total) = total {
+                                prev_totals = Some(CodexTokenTotals::from_total_object(total));
+                            }
                         }
                     }
+                }
+
+                // Modern Codex applies most edits inside opaque `exec` cells and
+                // records the resulting file changes in a `patch_apply_end` event.
+                // A successful one is the authoritative source of those file ops.
+                if entry.payload.payload_type.as_deref() == Some("patch_apply_end") {
+                    // Skip only when the paired direct apply_patch already
+                    // counted this call_id; otherwise this event is the
+                    // authoritative record of the change and must be folded in.
+                    let already_counted = entry
+                        .payload
+                        .call_id
+                        .as_deref()
+                        .is_some_and(|id| patch_counted_ids.contains(id));
+                    if matches!(entry.payload.success, Some(true)) && !already_counted {
+                        match parse_patch_changes(entry.payload.changes.as_ref()) {
+                            Some(patches) => {
+                                for patch in patches {
+                                    state.handle_patch(patch, ts);
+                                }
+                                if let Some(id) = entry.payload.call_id.as_deref() {
+                                    patch_counted_ids.insert(id.to_string());
+                                }
+                                diagnostics.record_relevant(true);
+                            }
+                            None => diagnostics.record_relevant(false),
+                        }
+                    }
+                    // A failed or deduped event is recognized but creates no file ops.
                 }
             }
             "response_item" => {
@@ -217,6 +291,8 @@ where
                                     &mut state,
                                     call,
                                     entry.payload.output.as_deref(),
+                                    call_id,
+                                    &mut patch_counted_ids,
                                 );
                                 diagnostics.record_relevant(normalized);
                             }
@@ -275,36 +351,6 @@ fn is_supported_codex_usage(info: &Value) -> bool {
         }
     }
     recognized
-}
-
-fn subtract_codex_replay_baseline(info: &Value, baseline: &Value) -> Value {
-    let mut adjusted = info.clone();
-    let (Some(total), Some(baseline)) = (
-        adjusted
-            .get_mut("total_token_usage")
-            .and_then(Value::as_object_mut),
-        baseline.as_object(),
-    ) else {
-        return adjusted;
-    };
-    for key in [
-        "input_tokens",
-        "cached_input_tokens",
-        "output_tokens",
-        "reasoning_output_tokens",
-        "total_tokens",
-    ] {
-        if let (Some(current), Some(replayed)) = (
-            total.get(key).and_then(Value::as_i64),
-            baseline.get(key).and_then(Value::as_i64),
-        ) {
-            total.insert(
-                key.to_string(),
-                Value::from(current.saturating_sub(replayed).max(0)),
-            );
-        }
-    }
-    adjusted
 }
 
 fn is_supported_codex_token_usage(usage: &Value) -> bool {
@@ -464,6 +510,8 @@ fn dispatch_custom_call(
     state: &mut SessionParseState,
     call: CodexCustomCall,
     output: Option<&str>,
+    call_id: &str,
+    patch_counted_ids: &mut HashSet<String>,
 ) -> bool {
     match call {
         CodexCustomCall::Exec { source, timestamp } => {
@@ -480,8 +528,12 @@ fn dispatch_custom_call(
         CodexCustomCall::ApplyPatch { patches, timestamp } => {
             match custom_apply_patch_result(output) {
                 CustomApplyPatchResult::Success => {
-                    for patch in patches {
-                        state.handle_patch(patch, timestamp);
+                    // Count once per call_id; a paired patch_apply_end for the
+                    // same id is then skipped (whichever arrives first wins).
+                    if patch_counted_ids.insert(call_id.to_string()) {
+                        for patch in patches {
+                            state.handle_patch(patch, timestamp);
+                        }
                     }
                     true
                 }
@@ -595,10 +647,11 @@ impl CodexAnalysisExt for SessionParseState {
                 self.add_write_detail(&resolved, &new_str, ts);
             }
             "delete" => {
+                // A delete is a real file operation on a unique file; record
+                // it even when the diff carried no removed content (an entry
+                // may omit `unified_diff`), consistent with add/update.
                 let content = old_str.trim_end_matches('\n');
-                if !content.is_empty() {
-                    self.add_edit_detail(&resolved, content, "", ts);
-                }
+                self.add_edit_detail_raw(&resolved, content, "", ts);
             }
             _ => {
                 self.add_edit_detail(&resolved, &old_str, &new_str, ts);
@@ -709,6 +762,53 @@ fn parse_apply_patch_script(script: &str) -> Vec<CodexPatch> {
     }
 
     patches
+}
+
+/// Normalizes a `patch_apply_end` `changes` map into patch hunks.
+///
+/// Returns `None` when the payload is missing, not an object, or carries only
+/// unrecognizable entries (schema drift). An empty object is a well-formed
+/// no-op and yields an empty `Vec`. Entries are visited in sorted-path order
+/// (the underlying map is a `BTreeMap`) so the folded detail order is stable.
+fn parse_patch_changes(changes: Option<&Value>) -> Option<Vec<CodexPatch>> {
+    let obj = changes?.as_object()?;
+    let mut patches = Vec::with_capacity(obj.len());
+    for (path, entry) in obj {
+        if let Some(patch) = parse_patch_change_entry(path, entry) {
+            patches.push(patch);
+        }
+    }
+    if !obj.is_empty() && patches.is_empty() {
+        return None;
+    }
+    Some(patches)
+}
+
+/// Builds one [`CodexPatch`] from a single `changes` entry.
+///
+/// The unified diff feeds the same `(old, new)` extraction as the direct
+/// apply_patch path, so add / update / delete map to the identical metrics.
+fn parse_patch_change_entry(path: &str, entry: &Value) -> Option<CodexPatch> {
+    if path.is_empty() {
+        return None;
+    }
+    let entry = entry.as_object()?;
+    let action = entry.get("type").and_then(Value::as_str)?;
+    if !matches!(action, "add" | "update" | "delete") {
+        return None;
+    }
+    // Real logs omit `unified_diff` on some entries (observed on `add`); the
+    // operation still counts, with no invented line/char content.
+    let lines = entry
+        .get("unified_diff")
+        .and_then(Value::as_str)
+        .map(|diff| diff.lines().map(str::to_string).collect())
+        .unwrap_or_default();
+    Some(CodexPatch {
+        action: action.to_string(),
+        file_path: path.to_string(),
+        lines,
+    })
 }
 
 /// Splits diff `lines` into the joined `(old, new)` text.
@@ -825,6 +925,28 @@ mod tests {
         }))
     }
 
+    fn patch_apply_end(call_id: &str, success: bool, changes: Value) -> CodexLog {
+        serde_json::from_value(serde_json::json!({
+            "timestamp": "2026-07-12T00:00:00Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "patch_apply_end",
+                "call_id": call_id,
+                "success": success,
+                "changes": changes
+            }
+        }))
+        .unwrap()
+    }
+
+    fn apply_patch_success_output(file: &str) -> CodexLog {
+        let wire = serde_json::json!({
+            "output": format!("Success. Updated the following files:\nM {file}")
+        })
+        .to_string();
+        custom_output("shared-call", Value::String(wire))
+    }
+
     #[test]
     fn legacy_shell_function_parses_into_call() {
         // Old schema: arguments = {"command": ["bash", "-lc", "<script>"]}
@@ -901,7 +1023,8 @@ mod tests {
                 })),
             ];
 
-            let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+            let parsed =
+                parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full, None).unwrap();
             assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
             assert!(!parsed.diagnostics.is_complete_failure());
             assert_eq!(parsed.analysis.records[0].tool_call_counts.bash, 0);
@@ -925,7 +1048,7 @@ mod tests {
             })),
         ];
 
-        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full, None).unwrap();
         assert!(parsed.diagnostics.is_complete_failure());
         assert_eq!(parsed.analysis.records[0].tool_call_counts.bash, 0);
     }
@@ -955,7 +1078,7 @@ mod tests {
         .map(|value| serde_json::from_value(value).unwrap())
         .collect();
 
-        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full, None).unwrap();
         assert!(!parsed.diagnostics.is_complete_failure());
         assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
         assert_eq!(parsed.diagnostics.relevant_records, 1);
@@ -1035,7 +1158,7 @@ mod tests {
         .map(|value| serde_json::from_value(value).unwrap())
         .collect();
 
-        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full, None).unwrap();
         assert!(!parsed.diagnostics.is_complete_failure());
         assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
 
@@ -1070,9 +1193,125 @@ mod tests {
         .map(|value| serde_json::from_value(value).unwrap())
         .collect();
 
-        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full, None).unwrap();
         assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
         assert!(parsed.analysis.records[0].conversation_usage.is_empty());
+    }
+
+    #[test]
+    fn mid_session_model_switch_bills_each_model_its_own_delta() {
+        // The cumulative counter keeps growing across a model switch; the
+        // second model must be billed only the post-switch increment, not the
+        // whole-session cumulative that already contains the first model.
+        let token_count = |input: i64, cached: i64, output: i64, total: i64| {
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:00Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": input,
+                            "cached_input_tokens": cached,
+                            "output_tokens": output,
+                            "reasoning_output_tokens": 0,
+                            "total_tokens": total
+                        },
+                        "model_context_window": 200000
+                    }
+                }
+            })
+        };
+        let turn_context = |model: &str| {
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:00Z",
+                "type": "turn_context",
+                "payload": { "model": model }
+            })
+        };
+        let logs: Vec<CodexLog> = [
+            turn_context("gpt-5.6-luna"),
+            token_count(20_000, 4_000, 3_289, 23_289),
+            turn_context("gpt-5.6-sol"),
+            token_count(60_000, 30_000, 10_000, 70_000),
+            token_count(90_000, 56_000, 14_576, 104_576),
+        ]
+        .into_iter()
+        .map(|value| serde_json::from_value(value).unwrap())
+        .collect();
+
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full, None).unwrap();
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
+
+        let usage = &parsed.analysis.records[0].conversation_usage;
+        let luna = usage["gpt-5.6-luna"]["total_token_usage"]
+            .as_object()
+            .unwrap();
+        let sol = usage["gpt-5.6-sol"]["total_token_usage"]
+            .as_object()
+            .unwrap();
+        assert_eq!(luna["total_tokens"].as_i64().unwrap(), 23_289);
+        assert_eq!(sol["total_tokens"].as_i64().unwrap(), 104_576 - 23_289);
+        assert_eq!(
+            luna["total_tokens"].as_i64().unwrap() + sol["total_tokens"].as_i64().unwrap(),
+            104_576,
+            "the two models' attributed totals must reconstruct the session cumulative"
+        );
+    }
+
+    #[test]
+    fn per_turn_tier_classification_uses_the_turns_own_context() {
+        // Two turns: the first's own prompt (last_token_usage.input_tokens)
+        // is below the 272k threshold, the second's is above. Only the second
+        // turn's delta lands in above_tier even though the cumulative total
+        // crosses the threshold much earlier.
+        let event = |cum_input: i64, cum_out: i64, cum_total: i64, last_input: i64| {
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:00Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": cum_input,
+                            "cached_input_tokens": 0,
+                            "output_tokens": cum_out,
+                            "reasoning_output_tokens": 0,
+                            "total_tokens": cum_total
+                        },
+                        "last_token_usage": { "input_tokens": last_input },
+                        "model_context_window": 400000
+                    }
+                }
+            })
+        };
+        let logs: Vec<CodexLog> = [
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:00Z",
+                "type": "turn_context",
+                "payload": { "model": "gpt-5.4" }
+            }),
+            event(200_000, 1_000, 201_000, 200_000),
+            event(500_000, 2_500, 502_500, 300_000),
+        ]
+        .into_iter()
+        .map(|value| serde_json::from_value(value).unwrap())
+        .collect();
+
+        let tiers =
+            crate::pricing::TierThresholds::from_entries([("gpt-5.4", 272_000)].into_iter());
+        let parsed =
+            parse_codex_log_iter_with_diagnostics(&logs, ParseMode::UsageOnly, Some(&tiers))
+                .unwrap();
+        let usage = &parsed.analysis.records[0].conversation_usage["gpt-5.4"];
+        assert_eq!(usage["total_token_usage"]["total_tokens"], 502_500);
+        // Only the second turn's delta (input 300k, output 1.5k) is above.
+        assert_eq!(usage["above_tier"]["input_tokens"], 300_000);
+        assert_eq!(usage["above_tier"]["output_tokens"], 1_500);
+        assert!(
+            usage["above_tier"].get("cache_read_tokens").is_none(),
+            "no cached tokens in this session"
+        );
     }
 
     #[test]
@@ -1089,7 +1328,7 @@ mod tests {
         .map(|value| serde_json::from_value(value).unwrap())
         .collect();
 
-        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full, None).unwrap();
         assert!(parsed.diagnostics.is_complete_failure());
         assert!(parsed.analysis.records[0].conversation_usage.is_empty());
     }
@@ -1253,7 +1492,7 @@ mod tests {
             custom_output("patch-failed", Value::String(wire_result)),
         ];
 
-        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full, None).unwrap();
         let record = &parsed.analysis.records[0];
         assert_eq!(record.tool_call_counts.edit, 0);
         assert!(record.edit_file_details.is_empty());
@@ -1281,7 +1520,8 @@ mod tests {
                 custom_output("patch-unknown", output),
             ];
 
-            let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full).unwrap();
+            let parsed =
+                parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full, None).unwrap();
             let record = &parsed.analysis.records[0];
             assert_eq!(record.tool_call_counts.edit, 0);
             assert!(record.edit_file_details.is_empty());
@@ -1378,5 +1618,197 @@ mod tests {
         );
         assert_eq!(state.tool_counts.edit, 1);
         assert_eq!(state.edit_details.len(), 1);
+    }
+
+    #[test]
+    fn patch_apply_end_success_counts_add_as_write_and_update_as_edit() {
+        let changes = serde_json::json!({
+            "/repo/new.rs": {
+                "type": "add",
+                "unified_diff": "@@ -0,0 +1,2 @@\n+fn main() {}\n+// added\n"
+            },
+            "/repo/lib.rs": {
+                "type": "update",
+                "unified_diff": "@@ -1,1 +1,1 @@\n-old\n+new\n"
+            }
+        });
+        let logs = vec![patch_apply_end("call-1", true, changes)];
+
+        let analysis = parse_codex_logs(&logs, ParseMode::Full).unwrap();
+        let record = &analysis.records[0];
+        assert_eq!(record.tool_call_counts.write, 1);
+        assert_eq!(record.tool_call_counts.edit, 1);
+        assert_eq!(record.total_unique_files, 2);
+        assert_eq!(record.write_file_details[0].base.file_path, "/repo/new.rs");
+        assert_eq!(record.edit_file_details[0].base.file_path, "/repo/lib.rs");
+    }
+
+    #[test]
+    fn patch_apply_end_without_unified_diff_still_counts_the_operation() {
+        // Observed in real 2026-06 logs: an `add` entry with no unified_diff.
+        // The write must count (invocation + unique file, zero line/char
+        // content) instead of flagging the record as schema drift.
+        let changes = serde_json::json!({
+            "/repo/generated.bin": { "type": "add" }
+        });
+        let logs = vec![patch_apply_end("call-nodiff", true, changes)];
+
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full, None).unwrap();
+        let record = &parsed.analysis.records[0];
+        assert_eq!(record.tool_call_counts.write, 1);
+        assert_eq!(record.total_unique_files, 1);
+        assert_eq!(record.total_write_lines, 0);
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
+    }
+
+    #[test]
+    fn patch_apply_end_failure_creates_no_file_ops() {
+        let changes = serde_json::json!({
+            "/repo/x.rs": { "type": "add", "unified_diff": "@@ -0,0 +1,1 @@\n+nope\n" }
+        });
+        let logs = vec![patch_apply_end("call-fail", false, changes)];
+
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full, None).unwrap();
+        let record = &parsed.analysis.records[0];
+        assert_eq!(record.tool_call_counts.write, 0);
+        assert_eq!(record.total_unique_files, 0);
+        assert!(record.write_file_details.is_empty());
+        // Recognized event, but a failed apply is not a relevant normalization.
+        assert_eq!(parsed.diagnostics.relevant_records, 0);
+        assert!(!parsed.diagnostics.is_complete_failure());
+    }
+
+    #[test]
+    fn patch_apply_end_malformed_changes_is_relevant_failure() {
+        // success is true but `changes` is not an object → schema drift.
+        let logs = vec![patch_apply_end(
+            "call-x",
+            true,
+            Value::String("nope".into()),
+        )];
+
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full, None).unwrap();
+        assert_eq!(parsed.analysis.records[0].tool_call_counts.edit, 0);
+        assert_eq!(parsed.analysis.records[0].tool_call_counts.write, 0);
+        assert!(parsed.diagnostics.is_complete_failure());
+    }
+
+    #[test]
+    fn patch_apply_end_deduped_against_direct_apply_patch_before_output() {
+        let patch = "*** Begin Patch\n*** Update File: lib.rs\n@@\n-old\n+new\n*** End Patch";
+        let changes = serde_json::json!({
+            "lib.rs": { "type": "update", "unified_diff": "@@ -1,1 +1,1 @@\n-old\n+new\n" }
+        });
+        // Event arrives between the custom_tool_call and its output.
+        let logs = vec![
+            response_item(serde_json::json!({
+                "type": "custom_tool_call",
+                "name": "apply_patch",
+                "input": patch,
+                "call_id": "shared-call"
+            })),
+            patch_apply_end("shared-call", true, changes),
+            apply_patch_success_output("lib.rs"),
+        ];
+
+        let analysis = parse_codex_logs(&logs, ParseMode::Full).unwrap();
+        let record = &analysis.records[0];
+        assert_eq!(record.tool_call_counts.edit, 1);
+        assert_eq!(record.edit_file_details.len(), 1);
+    }
+
+    #[test]
+    fn patch_apply_end_deduped_against_direct_apply_patch_after_output() {
+        let patch = "*** Begin Patch\n*** Update File: lib.rs\n@@\n-old\n+new\n*** End Patch";
+        let changes = serde_json::json!({
+            "lib.rs": { "type": "update", "unified_diff": "@@ -1,1 +1,1 @@\n-old\n+new\n" }
+        });
+        // Event arrives after the pending call was already consumed by its output.
+        let logs = vec![
+            response_item(serde_json::json!({
+                "type": "custom_tool_call",
+                "name": "apply_patch",
+                "input": patch,
+                "call_id": "shared-call"
+            })),
+            apply_patch_success_output("lib.rs"),
+            patch_apply_end("shared-call", true, changes),
+        ];
+
+        let analysis = parse_codex_logs(&logs, ParseMode::Full).unwrap();
+        let record = &analysis.records[0];
+        assert_eq!(record.tool_call_counts.edit, 1);
+        assert_eq!(record.edit_file_details.len(), 1);
+    }
+
+    #[test]
+    fn unrecognized_direct_output_does_not_suppress_authoritative_event() {
+        // A direct apply_patch whose output envelope is unrecognized counts
+        // nothing (Unknown); the paired successful patch_apply_end is the only
+        // authoritative record and must still be folded in.
+        let patch = "*** Begin Patch\n*** Update File: lib.rs\n@@\n-old\n+new\n*** End Patch";
+        let changes = serde_json::json!({
+            "lib.rs": { "type": "update", "unified_diff": "@@ -1,1 +1,1 @@\n-old\n+new\n" }
+        });
+        let logs = vec![
+            response_item(serde_json::json!({
+                "type": "custom_tool_call",
+                "name": "apply_patch",
+                "input": patch,
+                "call_id": "shared-call"
+            })),
+            custom_output("shared-call", Value::String("<unknown envelope>".into())),
+            patch_apply_end("shared-call", true, changes),
+        ];
+
+        let analysis = parse_codex_logs(&logs, ParseMode::Full).unwrap();
+        let record = &analysis.records[0];
+        assert_eq!(record.tool_call_counts.edit, 1);
+        assert_eq!(record.edit_file_details.len(), 1);
+    }
+
+    #[test]
+    fn patch_apply_end_delete_without_diff_counts_the_operation() {
+        let changes = serde_json::json!({
+            "/repo/gone.rs": { "type": "delete" }
+        });
+        let logs = vec![patch_apply_end("call-del", true, changes)];
+
+        let parsed = parse_codex_log_iter_with_diagnostics(&logs, ParseMode::Full, None).unwrap();
+        let record = &parsed.analysis.records[0];
+        assert_eq!(record.tool_call_counts.edit, 1);
+        assert_eq!(record.total_unique_files, 1);
+        assert_eq!(record.total_edit_lines, 0);
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
+    }
+
+    #[test]
+    fn patch_apply_end_scalar_counts_match_across_parse_modes() {
+        let changes = serde_json::json!({
+            "/repo/new.rs": {
+                "type": "add",
+                "unified_diff": "@@ -0,0 +1,2 @@\n+fn main() {}\n+// added\n"
+            },
+            "/repo/lib.rs": {
+                "type": "update",
+                "unified_diff": "@@ -1,1 +1,1 @@\n-old\n+new\n"
+            }
+        });
+        let build = || vec![patch_apply_end("call-1", true, changes.clone())];
+
+        let full = parse_codex_logs(&build(), ParseMode::Full).unwrap();
+        let usage = parse_codex_logs(&build(), ParseMode::UsageOnly).unwrap();
+        let (f, u) = (&full.records[0], &usage.records[0]);
+
+        assert_eq!(f.tool_call_counts.write, u.tool_call_counts.write);
+        assert_eq!(f.tool_call_counts.edit, u.tool_call_counts.edit);
+        assert_eq!(f.total_unique_files, u.total_unique_files);
+        assert_eq!(f.total_write_lines, u.total_write_lines);
+        assert_eq!(f.total_edit_lines, u.total_edit_lines);
+        assert_eq!(f.total_write_characters, u.total_write_characters);
+        assert_eq!(f.total_edit_characters, u.total_edit_characters);
+        // Detail bodies are retained only in Full mode.
+        assert!(!f.write_file_details.is_empty());
+        assert!(u.write_file_details.is_empty());
     }
 }

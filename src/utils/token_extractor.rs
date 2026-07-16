@@ -39,6 +39,22 @@ pub struct TokenCounts {
     pub web_search_requests: i64,
     /// Sum of the billed buckets used for cost and display.
     pub total: i64,
+    /// Slice of `input_tokens` from requests whose own prompt context
+    /// exceeded the model's context-tier threshold (see the `above_tier`
+    /// object written by the usage parsers). Always a subset of the field it
+    /// mirrors — never additional tokens — so displays keep using the totals
+    /// above while `calculate_cost` bills this slice at the tier rate.
+    pub above_input: i64,
+    /// Above-threshold slice of `output_tokens`.
+    pub above_output: i64,
+    /// Above-threshold slice of `reasoning_tokens`.
+    pub above_reasoning: i64,
+    /// Above-threshold slice of `cache_read`.
+    pub above_cache_read: i64,
+    /// Above-threshold slice of `cache_creation_5m`.
+    pub above_cache_creation_5m: i64,
+    /// Above-threshold slice of `cache_creation_1h`.
+    pub above_cache_creation_1h: i64,
 }
 
 /// Extracts token counts from usage data in any provider format
@@ -111,6 +127,20 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
                 .unwrap_or(0);
         }
 
+        // Per-request tier classification (usage scans only): the parsers
+        // accumulate the above-threshold slice of every bucket into a nested
+        // `above_tier` object. Read it here — before the Codex early return —
+        // so both the flat and the nested shapes carry it into pricing.
+        if let Some(above) = usage_obj.get("above_tier").and_then(|v| v.as_object()) {
+            let field = |key: &str| above.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
+            counts.above_input = field("input_tokens");
+            counts.above_output = field("output_tokens");
+            counts.above_reasoning = field("reasoning_tokens");
+            counts.above_cache_read = field("cache_read_tokens");
+            counts.above_cache_creation_5m = field("cache_creation_5m_tokens");
+            counts.above_cache_creation_1h = field("cache_creation_1h_tokens");
+        }
+
         // Gemini writes reasoning budget as `thoughts_tokens`; the flat
         // providers (Copilot / OpenCode / Hermes) use `reasoning_output_tokens`.
         // A single record only carries one of them, but a cross-provider merge
@@ -129,9 +159,14 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
 
         // Claude Code records cache_creation split by TTL:
         //   "cache_creation": { ephemeral_5m_input_tokens, ephemeral_1h_input_tokens }
-        // When present, use it verbatim for accurate 1hr TTL pricing.
+        // The scalar `cache_creation_input_tokens` is the authoritative total.
+        // Bill the 1h portion from the split and everything else at the default
+        // (5m) TTL, so the two priced buckets always sum to the scalar total.
+        // This matters because merging multi-iteration turns can leave the
+        // scalar larger than the published 5m+1h split (some iterations report
+        // only the scalar); billing 5m+1h verbatim would drop the remainder.
         if let Some(cc_split) = usage_obj.get("cache_creation").and_then(|v| v.as_object()) {
-            counts.cache_creation_5m = cc_split
+            let ephemeral_5m = cc_split
                 .get("ephemeral_5m_input_tokens")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
@@ -139,10 +174,12 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
                 .get("ephemeral_1h_input_tokens")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
-            // If the split has tokens but the scalar total was missing, derive it.
-            if counts.cache_creation == 0 {
-                counts.cache_creation = counts.cache_creation_5m + counts.cache_creation_1h;
-            }
+            // The total is the larger of the scalar and the split sum (the
+            // scalar may be missing, or the split may exceed a stale scalar).
+            counts.cache_creation = counts
+                .cache_creation
+                .max(ephemeral_5m + counts.cache_creation_1h);
+            counts.cache_creation_5m = counts.cache_creation - counts.cache_creation_1h;
         } else {
             // No TTL split → treat every cache_creation token as default (5 min) TTL.
             counts.cache_creation_5m = counts.cache_creation;
@@ -302,6 +339,26 @@ mod tests {
         assert_eq!(c.cache_creation, 1_500);
         assert_eq!(c.cache_creation_5m, 500);
         assert_eq!(c.cache_creation_1h, 1_000);
+    }
+
+    #[test]
+    fn ttl_split_smaller_than_scalar_bills_the_remainder_at_5m() {
+        // Merged multi-iteration turn: the scalar total exceeds the published
+        // 5m+1h split. The remainder must bill at the 5m TTL, not be dropped —
+        // and the two priced buckets must sum back to the scalar total.
+        let usage = json!({
+            "cache_creation_input_tokens": 397_602_459_i64,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 183_962_961_i64,
+                "ephemeral_1h_input_tokens": 213_022_705_i64
+            }
+        });
+        let c = extract_token_counts(&usage);
+        assert_eq!(c.cache_creation, 397_602_459);
+        assert_eq!(c.cache_creation_1h, 213_022_705);
+        // 5m carries its own tokens plus the 616,793-token remainder.
+        assert_eq!(c.cache_creation_5m, 397_602_459 - 213_022_705);
+        assert_eq!(c.cache_creation_5m + c.cache_creation_1h, c.cache_creation);
     }
 
     #[test]
@@ -486,6 +543,52 @@ mod tests {
 
         let without = json!({ "input_tokens": 100, "output_tokens": 50 });
         assert_eq!(extract_token_counts(&without).web_search_requests, 0);
+    }
+
+    #[test]
+    fn above_tier_slices_are_extracted_for_both_shapes() {
+        // Flat shape (Claude / Gemini): above_tier is a sibling of the token
+        // fields and mirrors them as subsets.
+        let flat = json!({
+            "input_tokens": 300_000,
+            "output_tokens": 1_000,
+            "cache_read_input_tokens": 50_000,
+            "above_tier": {
+                "input_tokens": 280_000,
+                "output_tokens": 600,
+                "cache_read_tokens": 50_000
+            }
+        });
+        let c = extract_token_counts(&flat);
+        assert_eq!(c.input_tokens, 300_000);
+        assert_eq!(c.above_input, 280_000);
+        assert_eq!(c.above_output, 600);
+        assert_eq!(c.above_cache_read, 50_000);
+        assert_eq!(c.above_cache_creation_5m, 0);
+
+        // Codex shape: above_tier sits beside total_token_usage and must
+        // survive the early return that consumes the published total.
+        let codex = json!({
+            "total_token_usage": {
+                "input_tokens": 400_000,
+                "cached_input_tokens": 100_000,
+                "output_tokens": 2_000,
+                "reasoning_output_tokens": 500,
+                "total_tokens": 402_000
+            },
+            "above_tier": {
+                "input_tokens": 250_000,
+                "cache_read_tokens": 80_000,
+                "output_tokens": 900,
+                "reasoning_tokens": 300
+            }
+        });
+        let c = extract_token_counts(&codex);
+        assert_eq!(c.total, 402_000);
+        assert_eq!(c.above_input, 250_000);
+        assert_eq!(c.above_cache_read, 80_000);
+        assert_eq!(c.above_output, 900);
+        assert_eq!(c.above_reasoning, 300);
     }
 
     #[test]

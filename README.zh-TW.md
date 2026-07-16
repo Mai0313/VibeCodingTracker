@@ -276,11 +276,14 @@ Totals (by Provider)
       "output_tokens": 936186,
       "cache_read_input_tokens": 138099926,
       "cache_creation_input_tokens": 6057836,
-      "reasoning_output_tokens": 0
+      "reasoning_output_tokens": 0,
+      "total_tokens": 145495885
     }
   }
 ]
 ```
+
+無論來源 provider 為何，每一列都會輸出相同的扁平 token 欄位（Codex 內部的巢狀結構會在輸出前正規化）。
 
 ### 掃描範圍
 
@@ -655,12 +658,15 @@ vct config migrate
 4. **模糊比對（AI 驅動）**：使用 Jaro-Winkler 相似度（70% 門檻值）
 5. **備援方案**：若無法配對則顯示 $0.00
 
+泛用的佔位名稱（例如 cursor-agent 在 auto 模式寫入的 `default`）與過短的名稱不會進行子字串或模糊比對——寧可不計價，也不撿相似名稱的價格。
+
 ### 費用細節
 
+- **Context tier 以單一 request 計**：LiteLLM 的「above Nk tokens」費率（如 GPT-5.x 超過 272k、Gemini 超過 200k）只套用在自身 prompt context 超過門檻的那些 request 上。沒有 per-request 粒度的 provider（以及離線掃描）一律以基本費率計價，因此這類 model 的費用是下界。
 - **不只 token**：Claude 的網頁搜尋工具呼叫（`server_tool_use.web_search_requests`）會在 token 費用之外，按每次查詢計費；其他所有 model 的每次查詢費用皆為 $0。
 - **OpenCode**：只有在 LiteLLM **完全比對**成功時，才會依 token 為新型 model 計價；若沒有完全比對，vct 會採信該 assistant 訊息本身儲存的費用，而不是從名稱相近的 model 去猜測。
 - **Hermes**：與 OpenCode 相同，LiteLLM **完全比對**成功時依 token 計價，否則使用 Hermes 本身儲存的費用。
-- **Grok**：只會把 `contextTokensUsed` 當成 cache-read token 計價；這是單一當下的本地 context 估算，不是累計的 billed usage。
+- **Grok**：只會把 `contextTokensUsed` 當成 cache-read token 計價（若該 model 沒有公布 cache-read 費率則改用 input 費率）；這是單一當下的本地 context 估算，不是累計的 billed usage。
 - **原始 cache**: 每日 cache 儲存經過篩選的 LiteLLM 上游原始 JSON (而非衍生結構), 因此 tiered / batch 定價不需重新取得即可使用. 每個 pricing map 各自擁有一個小型 process-local LRU, 重複查詢維持低成本, 也不會在不同 map 之間互相污染.
 
 ---

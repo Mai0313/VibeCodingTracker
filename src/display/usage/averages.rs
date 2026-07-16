@@ -9,6 +9,9 @@ use std::borrow::Cow;
 enum ProviderPricing<'a> {
     /// File-based providers priced purely from LiteLLM.
     Litellm,
+    /// Grok's context-gauge estimate: LiteLLM with an input-rate fallback for
+    /// entries that publish no cache-read price.
+    GrokGauge,
     /// OpenCode: exact LiteLLM match, else its stored cost.
     OpenCode(&'a crate::constants::FastHashMap<String, f64>),
     /// Cursor local estimate: exact LiteLLM pricing, else zero.
@@ -24,6 +27,7 @@ impl ProviderPricing<'_> {
             |m: &crate::constants::FastHashMap<String, f64>| m.get(model).copied().unwrap_or(0.0);
         match self {
             Self::Litellm => CostSource::Litellm,
+            Self::GrokGauge => CostSource::GrokGauge,
             Self::OpenCode(m) => CostSource::OpenCodeStored(stored(m)),
             Self::CursorEstimate => CostSource::OpenCodeStored(0.0),
             Self::Hermes(m) => CostSource::HermesStored(stored(m)),
@@ -201,7 +205,7 @@ pub fn calculate_provider_totals_from_per_provider(
         &mut totals.grok,
         &per_provider.grok,
         pricing_map,
-        ProviderPricing::Litellm,
+        ProviderPricing::GrokGauge,
     );
     accumulate_provider(
         &mut totals.opencode,
@@ -422,7 +426,6 @@ fn resolve_merged_row_cost(
         &per_provider.codex,
         &per_provider.copilot,
         &per_provider.gemini,
-        &per_provider.grok,
     ] {
         if let Some(raw_usage) = usage.get(model) {
             found = true;
@@ -436,10 +439,13 @@ fn resolve_merged_row_cost(
 
     // OpenCode and Hermes prefer exact LiteLLM prices before their stored
     // costs. Cursor is a local token estimate, so only an exact LiteLLM price
-    // is accepted and an unknown model remains unpriced.
+    // is accepted and an unknown model remains unpriced. Grok's gauge falls
+    // back to the input rate when the matched model has no cache-read price —
+    // it must use `GrokGauge` here too so the merged row matches the footer.
     let stored =
         |m: &crate::constants::FastHashMap<String, f64>| m.get(model).copied().unwrap_or(0.0);
     for (usage, source) in [
+        (&per_provider.grok, CostSource::GrokGauge),
         (
             &per_provider.opencode,
             CostSource::OpenCodeStored(stored(&stored_costs.opencode)),

@@ -218,9 +218,14 @@ fn reconcile_session_residuals(
             (row.get::<_, Option<i64>>(4)?.unwrap_or(0) - acc.map_or(0, |a| a.cache_read)).max(0);
         let cache_write =
             (row.get::<_, Option<i64>>(5)?.unwrap_or(0) - acc.map_or(0, |a| a.cache_write)).max(0);
-        let reasoning =
-            (row.get::<_, Option<i64>>(6)?.unwrap_or(0) - acc.map_or(0, |a| a.reasoning)).max(0);
-        let output = (raw_output - reasoning).max(0);
+        // Reasoning is a subset of output, so cap its residual at the output
+        // residual. An inconsistent aggregate could otherwise leave reasoning >
+        // output, billing reasoning tokens against zero output.
+        let reasoning = (row.get::<_, Option<i64>>(6)?.unwrap_or(0)
+            - acc.map_or(0, |a| a.reasoning))
+        .max(0)
+        .min(raw_output);
+        let output = raw_output - reasoning;
         let estimated = (row.get::<_, Option<f64>>(7)?.unwrap_or(0.0)
             - acc.map_or(0.0, |a| a.estimated))
         .max(0.0);
@@ -769,6 +774,30 @@ mod tests {
         assert_eq!(usage["input_tokens"], 100);
         assert_eq!(usage["output_tokens"], 10);
         assert!((sessions[0].2 - 0.5).abs() < 1e-9);
+        drop(dir);
+    }
+
+    #[test]
+    fn residual_caps_reasoning_at_output() {
+        // An inconsistent aggregate where reasoning (10) exceeds output (5) must
+        // not emit reasoning tokens against zero output; reasoning is capped at
+        // the output residual (5) so each token is still billed once.
+        let (dir, db_path) = make_db();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, model, input_tokens, output_tokens, \
+                     reasoning_tokens, estimated_cost_usd, started_at, ended_at) \
+                 VALUES ('s1', 'gpt-x', 100, 5, 10, 0.5, ?1, ?1)",
+                [recent_epoch_secs()],
+            )
+            .unwrap();
+        }
+        let sessions = read_hermes_usage(&db_path, TimeRange::All).unwrap();
+        assert_eq!(sessions.len(), 1);
+        let usage = usage_of(&sessions[0].1, "gpt-x");
+        assert_eq!(usage["output_tokens"], 0);
+        assert_eq!(usage["reasoning_output_tokens"], 5);
         drop(dir);
     }
 

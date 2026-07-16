@@ -461,12 +461,17 @@ pub fn display_usage_interactive_with_pool(
         let mut worker = RefreshWorker::new_with_init(refresh_secs, move || {
             let mut cache = SummaryScanCache::new();
             let mut pricing = ModelPricingMap::new(HashMap::new());
+            let mut scan_options = crate::usage::UsageScanOptions::default();
             let mut loaded_pricing_utc_date = None;
             move || {
                 let today = chrono::Utc::now().date_naive();
                 if loaded_pricing_utc_date != Some(today) {
                     match fetch_model_pricing() {
                         Ok(map) => {
+                            // A new pricing map can move tier thresholds; the
+                            // scan invalidates its cache when the snapshot's
+                            // fingerprint changes.
+                            scan_options.tiers = Some(std::sync::Arc::new(map.tier_thresholds()));
                             pricing = map;
                             loaded_pricing_utc_date = Some(today);
                         }
@@ -477,11 +482,12 @@ pub fn display_usage_interactive_with_pool(
                 }
 
                 let collection = worker_pool.install(|| {
-                    crate::usage::get_usage_from_paths_with_cache(
+                    crate::usage::get_usage_from_paths_with_cache_opts(
                         &worker_paths,
                         time_range,
                         providers,
                         &mut cache,
+                        &scan_options,
                     )
                 })?;
                 if collection.diagnostics.all_failed() {

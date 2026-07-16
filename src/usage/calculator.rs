@@ -14,7 +14,7 @@ use crate::constants::{FastHashMap, capacity};
 use crate::models::{
     CodeAnalysis, ExtensionType, PerProviderUsage, Provider, ProviderActiveDays, UsageResult,
 };
-use crate::pricing::{ModelPricingMap, calculate_cost};
+use crate::pricing::{ModelPricingMap, TierThresholds, calculate_cost};
 use crate::session::cursor::{
     discover_cursor_store_dbs, load_conversation_model_snapshot, read_cursor_usage_store,
 };
@@ -41,6 +41,7 @@ use rayon::prelude::*;
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Aggregated token usage plus the per-provider active-day counts.
 ///
@@ -409,13 +410,43 @@ pub fn get_usage_from_paths_with(
     })
 }
 
+/// Optional knobs for a usage scan.
+///
+/// `tiers` is the per-request context-tier snapshot derived from the current
+/// pricing map (see [`TierThresholds`]); `None` (the default) classifies
+/// nothing and every request bills at base rates.
+#[derive(Debug, Default, Clone)]
+pub struct UsageScanOptions {
+    /// "Model → lowest tier threshold" snapshot for per-request classification.
+    pub tiers: Option<Arc<TierThresholds>>,
+}
+
 /// Diagnostics-aware usage scan rooted at the current user's provider paths.
 pub fn get_usage_from_directories_with_diagnostics(
     time_range: TimeRange,
     providers: ProvidersConfig,
 ) -> Result<UsageCollection> {
+    get_usage_from_directories_with_diagnostics_opts(
+        time_range,
+        providers,
+        &UsageScanOptions::default(),
+    )
+}
+
+/// [`get_usage_from_directories_with_diagnostics`] with scan options.
+pub fn get_usage_from_directories_with_diagnostics_opts(
+    time_range: TimeRange,
+    providers: ProvidersConfig,
+    options: &UsageScanOptions,
+) -> Result<UsageCollection> {
     let mut cache = SummaryScanCache::new();
-    get_usage_from_paths_with_cache(&resolve_paths()?, time_range, providers, &mut cache)
+    get_usage_from_paths_with_cache_opts(
+        &resolve_paths()?,
+        time_range,
+        providers,
+        &mut cache,
+        options,
+    )
 }
 
 /// Diagnostics-aware usage scan rooted at explicit provider paths.
@@ -439,7 +470,24 @@ pub fn get_usage_from_paths_with_cache(
     providers: ProvidersConfig,
     cache: &mut SummaryScanCache,
 ) -> Result<UsageCollection> {
-    get_usage_from_paths_with_cache_inner(paths, time_range, providers, cache)
+    get_usage_from_paths_with_cache_opts(
+        paths,
+        time_range,
+        providers,
+        cache,
+        &UsageScanOptions::default(),
+    )
+}
+
+/// [`get_usage_from_paths_with_cache`] with scan options.
+pub fn get_usage_from_paths_with_cache_opts(
+    paths: &HelperPaths,
+    time_range: TimeRange,
+    providers: ProvidersConfig,
+    cache: &mut SummaryScanCache,
+    options: &UsageScanOptions,
+) -> Result<UsageCollection> {
+    get_usage_from_paths_with_cache_inner(paths, time_range, providers, cache, options)
 }
 
 fn get_usage_from_paths_with_cache_inner(
@@ -447,7 +495,12 @@ fn get_usage_from_paths_with_cache_inner(
     time_range: TimeRange,
     providers: ProvidersConfig,
     cache: &mut SummaryScanCache,
+    options: &UsageScanOptions,
 ) -> Result<UsageCollection> {
+    // Cached summaries embed the tier classification, so a changed threshold
+    // snapshot (daily pricing reload) invalidates every cached entry.
+    let tiers = options.tiers.as_deref();
+    cache.ensure_tier_fingerprint(tiers.map_or(0, TierThresholds::fingerprint));
     cache.begin_scan();
     let mut accumulator = UsageAccumulator::default();
     let mut diagnostics = UsageCollectionDiagnostics::default();
@@ -464,6 +517,7 @@ fn get_usage_from_paths_with_cache_inner(
             &mut seen,
             &mut accumulator,
             &mut diagnostics,
+            tiers,
         )?;
     }
     if providers.codex {
@@ -477,6 +531,7 @@ fn get_usage_from_paths_with_cache_inner(
             &mut seen,
             &mut accumulator,
             &mut diagnostics,
+            tiers,
         )?;
     }
     if providers.copilot {
@@ -490,6 +545,7 @@ fn get_usage_from_paths_with_cache_inner(
             &mut seen,
             &mut accumulator,
             &mut diagnostics,
+            tiers,
         )?;
     }
     if providers.gemini {
@@ -503,6 +559,7 @@ fn get_usage_from_paths_with_cache_inner(
             &mut seen,
             &mut accumulator,
             &mut diagnostics,
+            tiers,
         )?;
     }
     if providers.grok {
@@ -516,6 +573,7 @@ fn get_usage_from_paths_with_cache_inner(
             &mut seen,
             &mut accumulator,
             &mut diagnostics,
+            tiers,
         )?;
     }
 
@@ -581,6 +639,7 @@ fn scan_usage_files<F>(
     seen: &mut HashSet<SummaryCacheKey>,
     accumulator: &mut UsageAccumulator,
     diagnostics: &mut UsageCollectionDiagnostics,
+    tiers: Option<&TierThresholds>,
 ) -> Result<()>
 where
     F: Copy + Fn(&Path) -> bool + Sync + Send,
@@ -625,7 +684,7 @@ where
     let loaded: Vec<_> = misses
         .into_par_iter()
         .map(|(file, key, fingerprint)| {
-            let result = load_file_summary(&file, provider);
+            let result = load_file_summary(&file, provider, tiers);
             (file.path, key, fingerprint, result)
         })
         .collect();
@@ -653,9 +712,13 @@ where
     Ok(())
 }
 
-fn load_file_summary(file: &FileInfo, provider: ExtensionType) -> Result<LoadedSummary> {
+fn load_file_summary(
+    file: &FileInfo,
+    provider: ExtensionType,
+    tiers: Option<&TierThresholds>,
+) -> Result<LoadedSummary> {
     let parsed =
-        parse_session_file_as_with_diagnostics(&file.path, provider, ParseMode::UsageOnly)?;
+        parse_session_file_as_with_diagnostics(&file.path, provider, ParseMode::UsageOnly, tiers)?;
     if parsed.diagnostics.is_complete_failure() {
         let failure = if parsed.diagnostics.recognized_records == 0 {
             "source contained no recognized provider records".to_string()
@@ -685,7 +748,7 @@ fn load_file_summary(file: &FileInfo, provider: ExtensionType) -> Result<LoadedS
         summary: CompactSourceSummary::from_file(parsed.analysis, file.modified_date.clone(), emit),
         parsed: true,
         failure: (partial > 0)
-            .then(|| format!("skipped {partial} malformed or unsupported analyzer records")),
+            .then(|| crate::session::diagnostics::partial_failure_reason(partial)),
     })
 }
 
@@ -1285,6 +1348,11 @@ pub enum CostSource {
     /// safest fallback; the map is kept separate so a colliding bare model name
     /// can't cross-contaminate another provider's cost.
     HermesStored(f64),
+    /// Grok: the full LiteLLM lookup, but the context-gauge estimate lives
+    /// entirely in the cache-read bucket, so a matched model whose LiteLLM
+    /// entry publishes no cache-read price (null for several `xai/grok-*`
+    /// variants) falls back to the input rate instead of silently costing $0.
+    GrokGauge,
 }
 
 /// Resolves the USD cost (and optional matched-model annotation) for one model.
@@ -1298,15 +1366,7 @@ pub fn resolve_model_cost(
     source: CostSource,
 ) -> (f64, Option<String>) {
     let priced = |pricing: &crate::pricing::ModelPricing| {
-        let token_cost = calculate_cost(
-            counts.input_tokens,
-            counts.output_tokens,
-            counts.reasoning_tokens,
-            counts.cache_read,
-            counts.cache_creation_5m,
-            counts.cache_creation_1h,
-            pricing,
-        );
+        let token_cost = calculate_cost(counts, pricing);
         // Web search is billed per query (Claude `server_tool_use`),
         // separately from tokens. `web_search_requests` is 0 for every
         // non-Claude model, so this term is a no-op for them.
@@ -1327,6 +1387,14 @@ pub fn resolve_model_cost(
         CostSource::Litellm => {
             let result = pricing_map.get(model);
             (priced(&result.pricing), result.matched_model)
+        }
+        CostSource::GrokGauge => {
+            let result = pricing_map.get(model);
+            let mut pricing = result.pricing;
+            if pricing.cache_read_input_token_cost <= 0.0 {
+                pricing.cache_read_input_token_cost = pricing.input_cost_per_token;
+            }
+            (priced(&pricing), result.matched_model)
         }
     }
 }
@@ -1404,12 +1472,20 @@ pub(crate) fn merge_usage_values(existing: &mut Value, new: &Value) {
             if let Some(new_stu) = new_obj.get("server_tool_use").and_then(|v| v.as_object()) {
                 accumulate_nested_object(existing_obj, "server_tool_use", new_stu);
             }
+
+            // Per-request tier slices accumulate the same way.
+            if let Some(new_above) = new_obj.get("above_tier").and_then(|v| v.as_object()) {
+                accumulate_nested_object(existing_obj, "above_tier", new_above);
+            }
         }
         // Handle Codex format (has total_token_usage)
-        else if existing_obj.contains_key("total_token_usage")
-            && let Some(new_total) = new_obj.get("total_token_usage").and_then(|v| v.as_object())
-        {
-            accumulate_nested_object(existing_obj, "total_token_usage", new_total);
+        else if existing_obj.contains_key("total_token_usage") {
+            if let Some(new_total) = new_obj.get("total_token_usage").and_then(|v| v.as_object()) {
+                accumulate_nested_object(existing_obj, "total_token_usage", new_total);
+            }
+            if let Some(new_above) = new_obj.get("above_tier").and_then(|v| v.as_object()) {
+                accumulate_nested_object(existing_obj, "above_tier", new_above);
+            }
         }
     }
 }
@@ -1426,7 +1502,30 @@ fn add_token_counts(a: &TokenCounts, b: &TokenCounts) -> TokenCounts {
         cache_creation_1h: a.cache_creation_1h + b.cache_creation_1h,
         web_search_requests: a.web_search_requests + b.web_search_requests,
         total: a.total + b.total,
+        above_input: a.above_input + b.above_input,
+        above_output: a.above_output + b.above_output,
+        above_reasoning: a.above_reasoning + b.above_reasoning,
+        above_cache_read: a.above_cache_read + b.above_cache_read,
+        above_cache_creation_5m: a.above_cache_creation_5m + b.above_cache_creation_5m,
+        above_cache_creation_1h: a.above_cache_creation_1h + b.above_cache_creation_1h,
     }
+}
+
+/// Normalizes any provider-shaped usage value into the flat key set.
+///
+/// `usage --json` rows pass through here so every model row carries the same
+/// flat fields (`input_tokens` / `output_tokens` / `reasoning_output_tokens` /
+/// `cache_read_input_tokens` / `cache_creation_input_tokens` / `total_tokens`)
+/// regardless of provider. Without this, Codex-only models would serialize
+/// their internal nested `total_token_usage` shape and consumers reading the
+/// flat keys would see `null` for all of that model's tokens.
+pub fn normalize_usage_value(usage: &Value) -> Value {
+    let counts = crate::utils::extract_token_counts(usage);
+    let mut value = token_counts_to_flat_value(&counts);
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("total_tokens".into(), json!(counts.total));
+    }
+    value
 }
 
 /// Serializes normalized counts back into the flat usage shape.
@@ -1457,6 +1556,25 @@ fn token_counts_to_flat_value(c: &TokenCounts) -> Value {
         obj.insert(
             "server_tool_use".into(),
             json!({ "web_search_requests": c.web_search_requests }),
+        );
+    }
+    if c.above_input != 0
+        || c.above_output != 0
+        || c.above_reasoning != 0
+        || c.above_cache_read != 0
+        || c.above_cache_creation_5m != 0
+        || c.above_cache_creation_1h != 0
+    {
+        obj.insert(
+            "above_tier".into(),
+            json!({
+                "input_tokens": c.above_input,
+                "output_tokens": c.above_output,
+                "reasoning_tokens": c.above_reasoning,
+                "cache_read_tokens": c.above_cache_read,
+                "cache_creation_5m_tokens": c.above_cache_creation_5m,
+                "cache_creation_1h_tokens": c.above_cache_creation_1h,
+            }),
         );
     }
     Value::Object(obj)

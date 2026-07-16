@@ -69,6 +69,20 @@ impl ParseDiagnostics {
     }
 }
 
+/// Reason string for a source that parsed but skipped some records.
+///
+/// Worded so every surface that shows it (per-source warnings, stderr
+/// summaries) states that the recognized records were still counted — a
+/// partial skip is not a dropped source.
+pub(crate) fn partial_failure_reason(count: usize) -> String {
+    format!("partially parsed: skipped {count} malformed or unsupported analyzer records")
+}
+
+/// Whether a stored failure reason describes a partial (data-retained) parse.
+pub(crate) fn is_partial_failure_reason(reason: &str) -> bool {
+    reason.starts_with("partially parsed:")
+}
+
 /// A normalized analysis value plus parser-only diagnostics.
 #[derive(Debug)]
 pub(crate) struct ParsedAnalysis {

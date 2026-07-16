@@ -59,6 +59,7 @@ pub struct SummaryScanCache {
     entries: HashMap<SummaryCacheKey, CachedSourceSummary>,
     parsed_sources: usize,
     total_parsed_sources: usize,
+    tier_fingerprint: u64,
 }
 
 impl SummaryScanCache {
@@ -70,6 +71,19 @@ impl SummaryScanCache {
     /// Starts one refresh cycle and resets its parse counter.
     pub(crate) fn begin_scan(&mut self) {
         self.parsed_sources = 0;
+    }
+
+    /// Drops every entry when the context-tier snapshot changed.
+    ///
+    /// Cached summaries embed the per-request tier classification, so a new
+    /// thresholds snapshot (daily pricing reload, or pricing becoming
+    /// available after an offline start) must invalidate them; unchanged
+    /// snapshots keep the incremental behavior.
+    pub(crate) fn ensure_tier_fingerprint(&mut self, fingerprint: u64) {
+        if self.tier_fingerprint != fingerprint {
+            self.entries.clear();
+            self.tier_fingerprint = fingerprint;
+        }
     }
 
     /// Records that a source loader ran during this refresh.

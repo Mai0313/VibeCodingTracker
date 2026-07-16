@@ -13,6 +13,7 @@
 mod cache;
 mod calculation;
 mod matching;
+mod tiers;
 
 use crate::utils::{find_pricing_cache_for_date_in, get_cache_dir};
 use anyhow::{Context, Result};
@@ -40,6 +41,7 @@ pub use calculation::calculate_cost;
 pub use matching::{
     ModelPricingMap, ModelPricingResult, clear_pricing_cache, normalize_model_name,
 };
+pub use tiers::{TierClassifier, TierThresholds};
 
 /// Fetches AI model pricing data from the LiteLLM repository with automatic caching.
 ///
