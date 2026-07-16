@@ -168,11 +168,8 @@ pub fn calculate_cost(counts: &TokenCounts, pricing: &ModelPricing) -> f64 {
             },
             // Above-slices without a published tier (e.g. thresholds derived
             // from a newer pricing snapshot than this entry): bill at base
-            // so the tokens are still counted exactly once.
-            None => PriceLevel {
-                reasoning_raw: 0.0,
-                ..base
-            },
+            // rates verbatim, keeping the model's dedicated reasoning rate.
+            None => base,
         };
         cost += tier.bill(
             counts.above_input,
@@ -327,6 +324,26 @@ mod tests {
         c.above_output = 1_000;
         let cost = calculate_cost(&c, &p);
         assert_eq!(cost, 300_000.0 * 0.000003 + 1_000.0 * 0.000015);
+    }
+
+    #[test]
+    fn test_above_slice_without_tier_keeps_dedicated_reasoning_rate() {
+        // A model with a dedicated reasoning rate but no context tier: an
+        // above-slice (from a normalized collision or stale threshold) must
+        // still bill reasoning at that dedicated rate, not the output rate.
+        let p = ModelPricing {
+            input_cost_per_token: 1e-6,
+            output_cost_per_token: 8e-6,
+            output_cost_per_reasoning_token: 3e-6,
+            ..Default::default()
+        };
+        let mut c = counts(1_000, 200, 500, 0, 0, 0);
+        c.above_input = 1_000;
+        c.above_output = 200;
+        c.above_reasoning = 500;
+        let cost = calculate_cost(&c, &p);
+        let expected = 1_000.0 * 1e-6 + 200.0 * 8e-6 + 500.0 * 3e-6;
+        assert_eq!(cost, expected);
     }
 
     #[test]
