@@ -276,11 +276,14 @@ Totals (by Provider)
       "output_tokens": 936186,
       "cache_read_input_tokens": 138099926,
       "cache_creation_input_tokens": 6057836,
-      "reasoning_output_tokens": 0
+      "reasoning_output_tokens": 0,
+      "total_tokens": 145495885
     }
   }
 ]
 ```
+
+Every row serializes the same flat token fields regardless of provider (Codex's internal nested shape is normalized before output).
 
 ### What It Scans
 
@@ -656,12 +659,15 @@ vct config migrate
 4. **Fuzzy (AI-powered)**: Uses Jaro-Winkler similarity (70% threshold)
 5. **Fallback**: Shows $0.00 if no match found
 
+Generic placeholder names (e.g. `default`, what cursor-agent records for auto-mode sessions) and very short names never take a substring/fuzzy match — unpriced is safer than a coincidental neighbor's price.
+
 ### Cost Details
 
+- **Context tiers are per request**: LiteLLM's "above Nk tokens" rates (e.g. GPT-5.x above 272k, Gemini above 200k) apply only to requests whose own prompt context crossed the threshold. Providers without per-request granularity — and offline scans — bill at base rates, so tiered-model costs are a lower bound there.
 - **Beyond tokens**: Claude web-search tool calls (`server_tool_use.web_search_requests`) are billed per query on top of the token cost; every other model's per-query charge is $0.
 - **OpenCode**: a novel model name is priced from its tokens only on an **exact** LiteLLM match; with no exact match, vct trusts the assistant message's own stored cost instead of guessing from a loosely-similar name.
 - **Hermes**: priced the same way as OpenCode — an **exact** LiteLLM match prices from tokens, otherwise vct uses Hermes's own stored cost.
-- **Grok**: `contextTokensUsed` is priced as cache-read tokens only; this is a point-in-time local context estimate, not cumulative billed usage.
+- **Grok**: `contextTokensUsed` is priced as cache-read tokens only (falling back to the input rate when the model publishes no cache-read price); this is a point-in-time local context estimate, not cumulative billed usage.
 - **Cache is raw**: the daily cache stores the filtered upstream LiteLLM JSON (not a derived shape), so tiered / batch pricing stays available without re-fetching, and each pricing map owns a small in-process LRU so repeated lookups stay cheap without cross-map contamination.
 
 ---
