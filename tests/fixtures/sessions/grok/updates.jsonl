@@ -14,4 +14,6 @@
 {"method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"todo-1","status":"completed","rawOutput":{"type":"Todo"}}},"timestamp":1767225606}
 {"method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"failed-1","title":"write","rawInput":{"file_path":"src/failed.rs","content":"not written"},"_meta":{"x.ai/tool":{"name":"write"}}}},"timestamp":1767225606}
 {"method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"failed-1","status":"failed","rawOutput":{"type":"Text","text":"failed"}}},"timestamp":1767225607}
+{"method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"subagent-1","title":"spawn_subagent","rawInput":{"task":"investigate build failure"},"_meta":{"x.ai/tool":{"name":"spawn_subagent"}}}},"timestamp":1767225607}
+{"method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"subagent-1","status":"completed","rawOutput":{"type":"TaskOutput","text":"subagent finished"}}},"timestamp":1767225608}
 {"method":"session/update","params":{"update":{"sessionUpdate":"future_update","futureValue":true}},"timestamp":1767225608}

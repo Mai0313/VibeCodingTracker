@@ -92,6 +92,7 @@ where
                 | "summary"
                 | "progress"
                 | "file-history-snapshot"
+                | "file-history-delta"
                 | "queue-operation"
                 | "attachment"
                 | "bridge-session"
@@ -207,7 +208,7 @@ where
                             diagnostics.record_relevant(false);
                         }
                     }
-                    "TodoWrite" | "TaskCreate" | "TaskUpdate" => {
+                    "TodoWrite" | "TaskCreate" | "TaskUpdate" | "TaskStop" => {
                         diagnostics.record_relevant(true);
                         state.tool_counts.todo_write += 1
                     }
@@ -761,12 +762,13 @@ mod tests {
             "claude-opus-4-7",
             serde_json::json!([
                 { "type": "tool_use", "id": "task-1", "name": "TaskCreate", "input": {} },
-                { "type": "tool_use", "id": "task-2", "name": "TaskUpdate", "input": {} }
+                { "type": "tool_use", "id": "task-2", "name": "TaskUpdate", "input": {} },
+                { "type": "tool_use", "id": "task-3", "name": "TaskStop", "input": {} }
             ]),
         );
 
         let analysis = parse_claude_logs(vec![log], ParseMode::Full).unwrap();
-        assert_eq!(analysis.records[0].tool_call_counts.todo_write, 2);
+        assert_eq!(analysis.records[0].tool_call_counts.todo_write, 3);
     }
 
     #[test]
