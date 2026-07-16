@@ -426,7 +426,6 @@ fn resolve_merged_row_cost(
         &per_provider.codex,
         &per_provider.copilot,
         &per_provider.gemini,
-        &per_provider.grok,
     ] {
         if let Some(raw_usage) = usage.get(model) {
             found = true;
@@ -440,10 +439,13 @@ fn resolve_merged_row_cost(
 
     // OpenCode and Hermes prefer exact LiteLLM prices before their stored
     // costs. Cursor is a local token estimate, so only an exact LiteLLM price
-    // is accepted and an unknown model remains unpriced.
+    // is accepted and an unknown model remains unpriced. Grok's gauge falls
+    // back to the input rate when the matched model has no cache-read price —
+    // it must use `GrokGauge` here too so the merged row matches the footer.
     let stored =
         |m: &crate::constants::FastHashMap<String, f64>| m.get(model).copied().unwrap_or(0.0);
     for (usage, source) in [
+        (&per_provider.grok, CostSource::GrokGauge),
         (
             &per_provider.opencode,
             CostSource::OpenCodeStored(stored(&stored_costs.opencode)),
