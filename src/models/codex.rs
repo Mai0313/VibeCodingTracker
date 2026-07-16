@@ -144,6 +144,12 @@ pub struct CodexPayload {
     pub originator: Option<String>,
     /// Git repository metadata captured at session start.
     pub git: Option<CodexGitInfo>,
+    /// Whether a `patch_apply_end` event reported a successful apply.
+    #[serde(default)]
+    pub success: Option<bool>,
+    /// Per-file changes of a `patch_apply_end` event, keyed by absolute path.
+    #[serde(default)]
+    pub changes: Option<Value>,
 }
 
 /// One content block of a Codex message payload.
@@ -239,6 +245,8 @@ mod tests {
             id: None,
             originator: None,
             git: None,
+            success: None,
+            changes: None,
         };
 
         assert_eq!(payload.arguments.as_deref(), Some("{}"));
