@@ -758,6 +758,12 @@ fn read_store_context(
             let role = message_role(msg_bytes);
             match role.as_deref() {
                 Some("assistant") => {
+                    // An empty gauge payload is an observed benign variant (a
+                    // turn recorded before any context reading, e.g. aborted);
+                    // only a non-empty payload we cannot decode is drift.
+                    if ctx_msg.is_empty() {
+                        continue;
+                    }
                     expected_records += 1;
                     if let Some(ctx) = context_tokens(ctx_msg) {
                         turns.push((ts, ctx));
