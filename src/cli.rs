@@ -94,9 +94,9 @@ pub fn resolve_time_range_with_default(
     }
 }
 
-/// A provider whose raw quota/usage API response `vct fetch` can print.
+/// A provider whose raw quota/usage API response `vct quota` can print.
 #[derive(ValueEnum, Debug, Clone, Copy)]
-pub enum FetchProvider {
+pub enum QuotaProvider {
     /// Claude Code (`GET /api/oauth/usage`).
     Claude,
     /// OpenAI Codex (ChatGPT `wham/usage`).
@@ -218,20 +218,23 @@ pub enum Commands {
     },
 
     /// Fetch a provider's raw quota/usage API response.
-    Fetch {
-        /// Which provider to fetch (claude | codex | copilot | cursor).
-        provider: FetchProvider,
+    ///
+    /// The old name `fetch` is kept as a hidden alias for back-compat.
+    #[command(alias = "fetch")]
+    Quota {
+        /// Which provider to query (claude | codex | copilot | cursor).
+        provider: QuotaProvider,
 
         /// Output as pretty JSON (default).
-        #[arg(long, group = "fetch_format")]
+        #[arg(long, group = "quota_format")]
         json: bool,
 
         /// Output as flattened plain text.
-        #[arg(long, group = "fetch_format")]
+        #[arg(long, group = "quota_format")]
         text: bool,
 
         /// Output as a flattened key/value table.
-        #[arg(long, group = "fetch_format")]
+        #[arg(long, group = "quota_format")]
         table: bool,
     },
 
