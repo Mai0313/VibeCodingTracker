@@ -139,7 +139,7 @@ where
     }
     diagnostics.candidates += discovery.failures.len();
     for failure in discovery.failures {
-        diagnostics.record_failure(provider, &failure.path, failure.error);
+        diagnostics.record_hard_failure(provider, &failure.path, failure.error);
     }
 
     let mut files = discovery.files;
@@ -158,7 +158,7 @@ where
                     misses.push((file, key, fingerprint));
                 }
             }
-            Err(error) => diagnostics.record_failure(provider, &file.path, error.to_string()),
+            Err(error) => diagnostics.record_hard_failure(provider, &file.path, error.to_string()),
         }
     }
 
@@ -183,7 +183,7 @@ where
                     loaded.failure,
                 );
             }
-            Err(error) => diagnostics.record_failure(provider, &source, error.to_string()),
+            Err(error) => diagnostics.record_hard_failure(provider, &source, error.to_string()),
         }
     }
     Ok(())

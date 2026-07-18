@@ -62,13 +62,41 @@ impl ScanDiagnostics {
         self.parsed > 0 && self.has_failures()
     }
 
-    /// Records one failed source.
+    /// Records one failed source without logging.
+    ///
+    /// Used for failures that are re-observed on every cached refresh (a
+    /// retained parse verdict), so logging here would append the same line each
+    /// tick. Direct discovery/read failures use [`record_hard_failure`] instead.
+    ///
+    /// [`record_hard_failure`]: Self::record_hard_failure
     pub(crate) fn record_failure(&mut self, provider: ExtensionType, source: &Path, error: String) {
         self.failures.push(ScanFailure {
             provider,
             source: source.to_path_buf(),
             error,
         });
+    }
+
+    /// Records a hard discovery/read failure and mirrors it to the daily log.
+    ///
+    /// For failures produced anew each scan (directory traversal, fingerprint
+    /// I/O, a hard parser error) — not the retained verdicts folded from cache —
+    /// so the log line matches one real failure per scan, as the analysis file
+    /// scan did before it moved onto the shared scanner. The log is file-only
+    /// (never stdout/stderr), so this stays TUI-safe.
+    pub(crate) fn record_hard_failure(
+        &mut self,
+        provider: ExtensionType,
+        source: &Path,
+        error: String,
+    ) {
+        log::warn!(
+            "failed to collect {} session from {}: {}",
+            provider,
+            source.display(),
+            error
+        );
+        self.record_failure(provider, source, error);
     }
 
     /// Sorts failures into the canonical, deterministic order:
