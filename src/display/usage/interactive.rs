@@ -33,7 +33,8 @@ use crate::quota::{
     load_cursor_cache, save_claude_cache, save_codex_cache, save_copilot_cache, save_cursor_cache,
     spawn_quota_worker,
 };
-use crate::summary_cache::{SummaryScanCache, build_scan_pool};
+use crate::scan::build_scan_pool;
+use crate::summary_cache::SummaryScanCache;
 use crate::utils::{
     format_compact, format_cost, format_cost_compact, format_duration_until,
     get_claude_credentials_path, get_copilot_config_path, get_cursor_auth_path, resolve_paths,

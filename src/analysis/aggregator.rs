@@ -25,7 +25,7 @@ use anyhow::Result;
 use rayon::prelude::*;
 use serde::{Serialize, Serializer, ser::SerializeSeq};
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 // `AggregatedAnalysisRow` is a neutral DTO shared with the scan cache, so it
 // lives in `models`; re-exported here to keep the `analysis::AggregatedAnalysisRow`
@@ -101,49 +101,11 @@ pub struct AnalysisSession {
     pub analysis: CodeAnalysis,
 }
 
-/// One independently readable analysis source that could not be collected.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AnalysisCollectionFailure {
-    /// Provider whose file, database, or store collection failed.
-    pub provider: ExtensionType,
-    /// File or collection root passed to the parser or database reader.
-    pub source: PathBuf,
-    /// Parser or reader error, or the reason a parsed result was rejected.
-    pub error: String,
-}
-
-/// Diagnostics retained alongside a batch analysis result.
-///
-/// A candidate is the smallest source this layer can read independently. Each
-/// JSONL file and each Cursor store is one candidate. OpenCode's database is one
-/// candidate. `parsed` counts candidates read successfully, not the number of
-/// sessions emitted by a database.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AnalysisCollectionDiagnostics {
-    /// Number of independently readable sources discovered.
-    pub candidates: usize,
-    /// Number of candidates parsed or read successfully.
-    pub parsed: usize,
-    /// Failures in deterministic provider and source order.
-    pub failures: Vec<AnalysisCollectionFailure>,
-}
-
-impl AnalysisCollectionDiagnostics {
-    /// Returns whether at least one candidate failed.
-    pub fn has_failures(&self) -> bool {
-        !self.failures.is_empty()
-    }
-
-    /// Returns whether candidates existed but none could be parsed.
-    pub fn all_failed(&self) -> bool {
-        self.candidates > 0 && self.parsed == 0
-    }
-
-    /// Returns whether the scan contains both successful and failed sources.
-    pub fn partially_failed(&self) -> bool {
-        self.parsed > 0 && self.has_failures()
-    }
-}
+// Usage and analysis share one unified scan-diagnostics type; these historical
+// names are kept as aliases so `analysis::AnalysisCollectionDiagnostics` and the
+// per-source failure constructors keep working.
+pub use crate::scan::ScanDiagnostics as AnalysisCollectionDiagnostics;
+pub use crate::scan::ScanFailure as AnalysisCollectionFailure;
 
 /// Canonical batch-analysis dataset before any display-specific projection.
 ///
@@ -609,13 +571,7 @@ pub fn aggregate_sessions_by_model_from_paths_with_cache(
     }
 
     cache.retain_kinds(&seen, &[SummaryKind::File, SummaryKind::AnalysisDatabase]);
-    diagnostics.failures.sort_by(|left, right| {
-        left.provider
-            .scan_rank()
-            .cmp(&right.provider.scan_rank())
-            .then_with(|| left.source.cmp(&right.source))
-            .then_with(|| left.error.cmp(&right.error))
-    });
+    diagnostics.finalize();
     Ok(AnalysisAggregation {
         data: projection.finish(),
         diagnostics,

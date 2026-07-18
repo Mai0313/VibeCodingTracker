@@ -34,8 +34,8 @@ use vibe_coding_tracker::display::usage::{
 };
 use vibe_coding_tracker::get_version_info;
 use vibe_coding_tracker::pricing::{ModelPricingMap, fetch_model_pricing};
+use vibe_coding_tracker::scan::build_scan_pool;
 use vibe_coding_tracker::session::{ParseMode, parse_session_file_typed_with_mode_and_diagnostics};
-use vibe_coding_tracker::summary_cache::build_scan_pool;
 use vibe_coding_tracker::usage::{
     CostSource, get_usage_from_directories_with_diagnostics_opts, resolve_model_cost,
 };

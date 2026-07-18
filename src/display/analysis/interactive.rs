@@ -169,7 +169,7 @@ pub fn display_analysis_interactive_loading(
     refresh_secs: u64,
 ) -> anyhow::Result<()> {
     let threads = crate::config::PerformanceConfig::default().resolved_scan_threads();
-    let pool = Arc::new(crate::summary_cache::build_scan_pool(threads)?);
+    let pool = Arc::new(crate::scan::build_scan_pool(threads)?);
     display_analysis_interactive_loading_with_pool(time_range, providers, refresh_secs, pool)
 }
 
@@ -396,7 +396,7 @@ pub fn display_analysis_interactive(
         return Ok(());
     }
     let threads = crate::config::PerformanceConfig::default().resolved_scan_threads();
-    let pool = Arc::new(crate::summary_cache::build_scan_pool(threads)?);
+    let pool = Arc::new(crate::scan::build_scan_pool(threads)?);
     run_analysis_interactive(
         Some(initial_data),
         time_range,
