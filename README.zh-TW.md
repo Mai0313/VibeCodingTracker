@@ -2,8 +2,8 @@
 
 # Vibe Coding Tracker — AI 程式設計助手使用量追蹤器
 
-[![Crates.io](https://img.shields.io/crates/v/vibe_coding_tracker?logo=rust&style=flat-square&color=E05D44)](https://crates.io/crates/vibe_coding_tracker)
-[![Crates.io Downloads](https://img.shields.io/crates/d/vibe_coding_tracker?logo=rust&style=flat-square)](https://crates.io/crates/vibe_coding_tracker)
+[![Crates.io](https://img.shields.io/crates/v/vct-cli?logo=rust&style=flat-square&color=E05D44)](https://crates.io/crates/vct-cli)
+[![Crates.io Downloads](https://img.shields.io/crates/d/vct-cli?logo=rust&style=flat-square)](https://crates.io/crates/vct-cli)
 [![npm version](https://img.shields.io/npm/v/vibe-coding-tracker?logo=npm&style=flat-square&color=CB3837)](https://www.npmjs.com/package/vibe-coding-tracker)
 [![npm downloads](https://img.shields.io/npm/dt/vibe-coding-tracker?logo=npm&style=flat-square)](https://www.npmjs.com/package/vibe-coding-tracker)
 [![PyPI version](https://img.shields.io/pypi/v/vibe_coding_tracker?logo=python&style=flat-square&color=3776AB)](https://pypi.org/project/vibe_coding_tracker/)
@@ -117,7 +117,7 @@ uvx vibe_coding_tracker usage
 使用 Cargo 從官方 Rust 套件倉庫安裝：
 
 ```bash
-cargo install vibe_coding_tracker
+cargo install vct-cli
 ```
 
 ### 首次執行
