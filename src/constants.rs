@@ -10,6 +10,12 @@
 /// keys here are not attacker-controlled, so DoS resistance is not required.
 pub type FastHashMap<K, V> = ahash::AHashMap<K, V>;
 
+/// Hash set backed by `ahash` for fast, non-cryptographic hashing.
+///
+/// Used in place of `std::collections::HashSet` on the incremental scan path,
+/// where the keys are process-local (not attacker-controlled).
+pub type FastHashSet<T> = ahash::AHashSet<T>;
+
 /// Pre-allocation capacity hints to minimize reallocation overhead.
 pub mod capacity {
     /// Expected number of AI models per conversation session.

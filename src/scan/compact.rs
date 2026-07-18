@@ -8,6 +8,7 @@
 
 use super::ScanDiagnostics;
 use crate::cli::TimeRange;
+use crate::constants::FastHashSet;
 use crate::models::ExtensionType;
 use crate::pricing::TierThresholds;
 use crate::session::ParseMode;
@@ -20,7 +21,6 @@ use crate::summary_cache::{
 use crate::utils::directory::{FileInfo, collect_files_with_max_depth_diagnostics};
 use anyhow::Result;
 use rayon::prelude::*;
-use std::collections::HashSet;
 use std::path::Path;
 
 /// A freshly loaded compact source summary plus its parse verdict.
@@ -125,7 +125,7 @@ pub(crate) fn scan_cached_files<F>(
     time_range: TimeRange,
     max_depth: Option<usize>,
     cache: &mut SummaryScanCache,
-    seen: &mut HashSet<SummaryCacheKey>,
+    seen: &mut FastHashSet<SummaryCacheKey>,
     sink: &mut impl CompactSink,
     diagnostics: &mut ScanDiagnostics,
     tiers: Option<&TierThresholds>,

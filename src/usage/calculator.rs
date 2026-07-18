@@ -10,7 +10,7 @@
 
 use crate::cli::TimeRange;
 use crate::config::ProvidersConfig;
-use crate::constants::{FastHashMap, capacity};
+use crate::constants::{FastHashMap, FastHashSet, capacity};
 use crate::models::{
     CodeAnalysis, ExtensionType, PerProviderUsage, Provider, ProviderActiveDays, UsageResult,
 };
@@ -471,7 +471,7 @@ fn get_usage_from_paths_with_cache_inner(
     cache.begin_scan();
     let mut accumulator = UsageAccumulator::default();
     let mut diagnostics = UsageCollectionDiagnostics::default();
-    let mut seen = HashSet::new();
+    let mut seen = FastHashSet::default();
 
     if providers.claude {
         crate::scan::scan_cached_files(
@@ -597,7 +597,7 @@ fn scan_usage_database<F>(
     fingerprint: Result<SourceFingerprint>,
     time_range: TimeRange,
     cache: &mut SummaryScanCache,
-    seen: &mut HashSet<SummaryCacheKey>,
+    seen: &mut FastHashSet<SummaryCacheKey>,
     accumulator: &mut UsageAccumulator,
     diagnostics: &mut UsageCollectionDiagnostics,
     loader: F,
@@ -680,7 +680,7 @@ fn scan_cursor_usage_database(
     tracking_db: &Path,
     time_range: TimeRange,
     cache: &mut SummaryScanCache,
-    seen: &mut HashSet<SummaryCacheKey>,
+    seen: &mut FastHashSet<SummaryCacheKey>,
     accumulator: &mut UsageAccumulator,
     diagnostics: &mut UsageCollectionDiagnostics,
 ) {
@@ -1109,18 +1109,9 @@ fn fold_stored_cost_sessions(
 
 fn usage_map_has_activity(usage: &FastHashMap<String, Value>, stored_cost: f64) -> bool {
     stored_cost != 0.0
-        || usage.values().any(|value| {
-            let counts = crate::utils::extract_token_counts(value);
-            counts.total != 0
-                || counts.input_tokens != 0
-                || counts.output_tokens != 0
-                || counts.reasoning_tokens != 0
-                || counts.cache_read != 0
-                || counts.cache_creation != 0
-                || counts.cache_creation_5m != 0
-                || counts.cache_creation_1h != 0
-                || counts.web_search_requests != 0
-        })
+        || usage
+            .values()
+            .any(|value| crate::utils::extract_token_counts(value).has_activity())
 }
 
 /// How a model's USD cost is resolved.

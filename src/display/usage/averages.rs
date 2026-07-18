@@ -392,8 +392,13 @@ fn extract_usage_row(
     pricing_map: &crate::pricing::ModelPricingMap,
     source: CostSource,
 ) -> UsageRow {
-    let (cost, matched_model) = price_usage(model, usage, pricing_map, source);
-    build_usage_row(model, usage, cost, matched_model)
+    use crate::usage::resolve_model_cost;
+    use crate::utils::extract_token_counts;
+
+    // Extract once and reuse for both pricing and the row (was extracted twice).
+    let counts = extract_token_counts(usage);
+    let (cost, matched_model) = resolve_model_cost(model, &counts, pricing_map, source);
+    build_usage_row_from_counts(model, &counts, cost, matched_model)
 }
 
 /// Prices one raw usage value under `source`.
@@ -476,10 +481,18 @@ fn build_usage_row(
     cost: f64,
     matched_model: Option<String>,
 ) -> UsageRow {
-    use crate::utils::extract_token_counts;
+    let counts = crate::utils::extract_token_counts(usage);
+    build_usage_row_from_counts(model, &counts, cost, matched_model)
+}
 
-    let counts = extract_token_counts(usage);
-
+/// Builds one display row from already-extracted token counts and a resolved
+/// cost, so callers that already have the counts do not re-walk the usage value.
+fn build_usage_row_from_counts(
+    model: &str,
+    counts: &crate::utils::TokenCounts,
+    cost: f64,
+    matched_model: Option<String>,
+) -> UsageRow {
     // Use Cow<str> for display_model to avoid allocation when no annotation
     let display_model = if let Some(matched) = &matched_model {
         Cow::Owned(format!("{} ({})", model, matched))
