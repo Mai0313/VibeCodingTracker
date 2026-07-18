@@ -41,12 +41,12 @@ Criterion benchmarks live at `src/tui/benches/benchmarks.rs` (run from the `vct-
 
 The repo is a Cargo workspace (root `Cargo.toml` = `[workspace]` with a shared `[workspace.package]` / `[workspace.dependencies]`; members pull deps via `{ workspace = true }`, and the `[profile.release]` / `[profile.dist]` sections live at the root). Four members under `src/`, with a strictly one-way dependency direction `vibe_coding_tracker (core) → vct-tui → vct-cli` (a future GUI would hang off core only):
 
-- `src/core/` — crate `vibe_coding_tracker`, the core lib (`build.rs` lives here; **no** terminal deps — no ratatui / crossterm / comfy-table / clap). Holds `models`, `constants`, `utils`, `pricing`, `session`, `scan`, `summary_cache`, `cache`, `analysis`, `usage`, `quota`, `config`, `update`, `logging`.
+- `src/core/` — crate `vct-core`, the core lib (`build.rs` lives here; **no** terminal deps — no ratatui / crossterm / comfy-table / clap). Holds `models`, `constants`, `utils`, `pricing`, `session`, `scan`, `summary_cache`, `cache`, `analysis`, `usage`, `quota`, `config`, `update`, `logging`.
 - `src/tui/` — crate `vct-tui`, the `display` module tree; depends only on `vibe_coding_tracker`. Owns the benchmark (`src/tui/benches/benchmarks.rs`).
 - `src/cli/` — crate `vct-cli`, the binary (still named `vibe_coding_tracker`; `src/cli/src/main.rs` + `src/cli/src/cli.rs`). Depends on core + vct-tui.
 - `src/test-support/` — crate `vct-test-support` (dev-only; the shared `TempHome` / `fixture` test helpers).
 
-Internal crates are unpublished (`version = "0.0.0"`, path deps); `cargo package` / `publish` are scoped to `-p vibe_coding_tracker`. The `dist` binary is still `target/<target>/dist/vibe_coding_tracker`. Core has **zero** dependency on the display or cli crates.
+On release the workflow publishes the three crates to crates.io in dependency order (`vct-core` → `vct-tui` → `vct-cli`), stamping the tag version across the workspace (`cargo set-version --workspace` plus a sed for the internal path-dep version requirements); `cargo install vct-cli` installs the `vibe_coding_tracker` binary. `vct-test-support` stays unpublished (`publish = false`), and the published crates `exclude` their non-self-contained `tests` / `benches`. The `dist` binary is still `target/<target>/dist/vibe_coding_tracker`. Core has **zero** dependency on the display or cli crates.
 
 ### Two-stage pipeline
 
