@@ -7,7 +7,7 @@
 //! also threads a per-request tier snapshot; analysis passes `None`.
 
 use super::ScanDiagnostics;
-use crate::cli::TimeRange;
+use crate::models::TimeRange;
 use crate::constants::FastHashSet;
 use crate::models::ExtensionType;
 use crate::pricing::TierThresholds;

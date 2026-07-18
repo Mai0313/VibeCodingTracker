@@ -8,7 +8,7 @@
 //! table) and once kept per source directory (the per-provider footer) — see
 //! [`UsageData`] for why.
 
-use crate::cli::TimeRange;
+use crate::models::TimeRange;
 use crate::config::ProvidersConfig;
 use crate::constants::{FastHashMap, FastHashSet, capacity};
 use crate::models::{

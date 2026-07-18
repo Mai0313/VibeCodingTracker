@@ -23,7 +23,7 @@
 //! fold Cursor in exactly like the other providers.
 
 use crate::VERSION;
-use crate::cli::TimeRange;
+use crate::models::TimeRange;
 use crate::constants::FastHashMap;
 use crate::models::{CodeAnalysis, CodeAnalysisRecord, ExtensionType};
 use crate::session::diagnostics::{

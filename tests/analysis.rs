@@ -20,7 +20,7 @@ use vibe_coding_tracker::analysis::aggregator::{
     aggregate_sessions_by_model_from_paths_with_diagnostics,
     collect_analysis_sessions_from_paths_with, project_code_analysis,
 };
-use vibe_coding_tracker::cli::TimeRange;
+use vibe_coding_tracker::TimeRange;
 use vibe_coding_tracker::config::ProvidersConfig;
 use vibe_coding_tracker::models::ExtensionType;
 use vibe_coding_tracker::session::parser::{

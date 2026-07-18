@@ -7,56 +7,12 @@
 //! into a single [`TimeRange`].
 
 use clap::{Parser, Subcommand, ValueEnum};
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Time window applied when aggregating sessions.
-///
-/// Each variant maps to a cutoff date via [`TimeRange::cutoff_date`];
-/// [`TimeRange::All`] is the default and disables filtering. Serializes as a
-/// lowercase string (`"daily"` / `"weekly"` / `"monthly"` / `"all"`) so it can
-/// be reused verbatim as the `config.general.default_time_range` setting.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum TimeRange {
-    /// Today only.
-    Daily,
-    /// The current week, starting Monday.
-    Weekly,
-    /// The current calendar month, from the 1st.
-    Monthly,
-    /// No filtering — every session.
-    #[default]
-    All,
-}
-
-impl TimeRange {
-    /// Returns the inclusive cutoff date for this range, or `None` for
-    /// [`TimeRange::All`].
-    ///
-    /// The cutoff is computed against today in the system local timezone:
-    /// `Weekly` anchors on the most recent Monday and `Monthly` on the first
-    /// of the month. Sessions on or after the returned date are kept.
-    ///
-    /// # Panics
-    ///
-    /// Does not panic: the `with_day(1)` used for `Monthly` is always valid
-    /// because day 1 exists in every month.
-    pub fn cutoff_date(&self) -> Option<chrono::NaiveDate> {
-        use chrono::{Datelike, Local};
-        let today = Local::now().date_naive();
-        match self {
-            TimeRange::All => None,
-            TimeRange::Daily => Some(today),
-            TimeRange::Weekly => {
-                let days_since_monday = today.weekday().num_days_from_monday() as i64;
-                Some(today - chrono::Duration::days(days_since_monday))
-            }
-            TimeRange::Monthly => Some(today.with_day(1).unwrap()),
-        }
-    }
-}
+// `TimeRange` is a core domain type (the aggregators and provider readers all
+// filter by it), so it lives in `models`; re-exported here for the clap layer
+// and library callers that reach it through `cli`.
+pub use crate::models::TimeRange;
 
 /// Collapses the period flags into a single [`TimeRange`].
 ///

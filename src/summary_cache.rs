@@ -1,6 +1,6 @@
 //! Process-local cache for compact usage and analysis scan contributions.
 
-use crate::cli::TimeRange;
+use crate::models::TimeRange;
 use crate::constants::{FastHashMap, FastHashSet};
 use crate::models::{AggregatedAnalysisRow, CodeAnalysis, ExtensionType, UsageResult};
 use crate::session::diagnostics::{UsageContribution, UsageTokenContribution};

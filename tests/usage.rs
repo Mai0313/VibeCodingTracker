@@ -11,7 +11,7 @@ use common::{TempHome, append_cursor_json_blob, fixture_str};
 use rusqlite::{Connection, params};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use vibe_coding_tracker::cli::TimeRange;
+use vibe_coding_tracker::TimeRange;
 use vibe_coding_tracker::config::ProvidersConfig;
 use vibe_coding_tracker::models::ExtensionType;
 use vibe_coding_tracker::summary_cache::SummaryScanCache;
