@@ -1,20 +1,23 @@
-[package]
-name = "vibe_coding_tracker"
+[workspace]
+members = ["src/core", "src/tui", "src/cli", "src/test-support"]
+resolver = "2"
+
+[workspace.package]
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.95"
 authors = ["Wei Lee <mai@mai0313.com>"]
-description = "Vibe Coding Tracker - AI coding assistant telemetry/usage parser, aggregate local session data into CodeAnalysis results"
 license = "MIT"
-readme = "README.md"
 homepage = "https://github.com/Mai0313/VibeCodingTracker"
 repository = "https://github.com/Mai0313/VibeCodingTracker"
 
-[[bin]]
-name = "vibe_coding_tracker"
-path = "src/main.rs"
+[workspace.dependencies]
+# Internal crates (path deps, never published)
+vibe_coding_tracker = { path = "src/core" }
+vct-tui = { path = "src/tui" }
+vct-test-support = { path = "src/test-support" }
 
-[dependencies]
+# External dependencies (single source of truth for versions)
 ahash = { version = "0.8.12", features = ["serde"] }
 anyhow = "1.0.102"
 base64 = "0.22.1"
@@ -27,9 +30,10 @@ flate2 = "1.1.9"
 home = "0.5.11"
 hostname = "0.4.2"
 itoa = "1.0.18"
+libc = "0.2.185"
 log = "0.4.29"
 lru = "0.18.0"
-mimalloc = { version = "0.1.50", default-features = false, optional = true }
+mimalloc = { version = "0.1.50", default-features = false }
 owo-colors = "4.3.0"
 percent-encoding = "2.3.2"
 ratatui = "0.29.0"
@@ -49,22 +53,12 @@ toml_edit = { version = "0.23.7", features = ["serde"] }
 walkdir = "2.5.0"
 zip = "7.2.0"
 
-[features]
-mimalloc = ["dep:mimalloc"]
-
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2.185"
-
-[dev-dependencies]
+# Dev dependencies
 assert_cmd = "2.2.1"
 criterion = { version = "0.7.0", features = ["html_reports"] }
 httpmock = "0.8.3"
 predicates = "3.1.4"
 serial_test = "3.4.0"
-
-[[bench]]
-name = "benchmarks"
-harness = false
 
 [profile.release]
 opt-level = 3           # Maximum optimization
