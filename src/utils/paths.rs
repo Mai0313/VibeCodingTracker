@@ -246,14 +246,20 @@ pub fn network_disabled() -> bool {
     std::env::var_os("VCT_OFFLINE").is_some_and(|v| !v.is_empty())
 }
 
-/// Returns the current username from the environment.
+/// Returns the current username from the environment (cached after first call).
 ///
 /// Reads `USER`, falling back to `USERNAME` (Windows), and finally to the
-/// literal `"unknown"` if neither is set.
+/// literal `"unknown"` if neither is set. The lookup is memoized so a large
+/// scan does not re-read the environment once per parsed file.
 pub fn get_current_user() -> String {
-    std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "unknown".to_string())
+    static CACHE: OnceLock<String> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            std::env::var("USER")
+                .or_else(|_| std::env::var("USERNAME"))
+                .unwrap_or_else(|_| "unknown".to_string())
+        })
+        .clone()
 }
 
 static MACHINE_ID_CACHE: OnceLock<String> = OnceLock::new();

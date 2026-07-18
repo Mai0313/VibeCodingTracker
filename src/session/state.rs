@@ -6,11 +6,10 @@
 //! character counts and (in [`ParseMode::Full`]) accumulates the per-op detail
 //! records. Once the file is consumed the state is converted into one
 //! [`CodeAnalysisRecord`] via [`SessionParseState::into_record`].
-use crate::constants::FastHashMap;
+use crate::constants::{FastHashMap, FastHashSet};
 use crate::models::*;
 use crate::utils::count_lines;
 use serde_json::Value;
-use std::collections::HashSet;
 
 /// Controls how much per-operation detail the session parser retains.
 ///
@@ -54,7 +53,7 @@ pub struct SessionParseState {
     /// Running per-tool call counts (always tallied, both modes).
     pub tool_counts: CodeAnalysisToolCalls,
     /// Distinct normalized file paths touched (populated in both parse modes).
-    pub unique_files: HashSet<String>,
+    pub unique_files: FastHashSet<String>,
     /// Sum of lines written across all `Write` operations.
     pub total_write_lines: usize,
     /// Sum of lines read across all `Read` operations.
@@ -128,7 +127,7 @@ impl SessionParseState {
                 Vec::new()
             },
             tool_counts: CodeAnalysisToolCalls::default(),
-            unique_files: HashSet::with_capacity(20),
+            unique_files: FastHashSet::with_capacity(20),
             total_write_lines: 0,
             total_read_lines: 0,
             total_edit_lines: 0,
