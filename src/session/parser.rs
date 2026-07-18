@@ -195,12 +195,12 @@ pub fn parse_session_file_typed_with_mode<P: AsRef<Path>>(
     path: P,
     mode: ParseMode,
 ) -> Result<CodeAnalysis> {
-    Ok(parse_session_file_typed_with_mode_and_diagnostics(path, mode)?.0)
+    Ok(parse_session_file_detailed(path, mode)?.0)
 }
 
 /// Single-file parse with a content-safe partial-failure summary for the CLI.
 #[doc(hidden)]
-pub fn parse_session_file_typed_with_mode_and_diagnostics<P: AsRef<Path>>(
+pub fn parse_session_file_detailed<P: AsRef<Path>>(
     path: P,
     mode: ParseMode,
 ) -> Result<(CodeAnalysis, SessionFileParseDiagnostics)> {
