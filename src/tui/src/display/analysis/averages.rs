@@ -1,15 +1,15 @@
 //! Analysis summary rendering helpers.
 //!
 //! The aggregated per-provider summary is core business logic and lives in
-//! [`vibe_coding_tracker::analysis::summary`]; it is re-exported here so the renderers keep
+//! [`vct_core::analysis::summary`]; it is re-exported here so the renderers keep
 //! importing it as `crate::display::analysis::averages::<item>`. This module
 //! adds only the display-only provider-total rows, which borrow into the
 //! comfy-table / ratatui renderers.
 
-pub use vibe_coding_tracker::analysis::summary::*;
+pub use vct_core::analysis::summary::*;
 
 use crate::display::common::ProviderTotal;
-use vibe_coding_tracker::models::Provider;
+use vct_core::models::Provider;
 
 /// Build the per-provider total rows for the display layer.
 ///

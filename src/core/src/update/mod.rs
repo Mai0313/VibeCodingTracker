@@ -34,7 +34,7 @@ pub use github::{GitHubAsset, GitHubRelease};
 /// # Examples
 ///
 /// ```
-/// use vibe_coding_tracker::update::extract_semver_version;
+/// use vct_core::update::extract_semver_version;
 ///
 /// assert_eq!(extract_semver_version("0.1.6-5-g1234567-dirty"), "0.1.6");
 /// assert_eq!(extract_semver_version("2.4.8"), "2.4.8");

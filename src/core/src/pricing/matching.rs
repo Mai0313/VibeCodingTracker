@@ -69,7 +69,7 @@ impl ModelPricingMap {
     ///
     /// ```
     /// use std::collections::HashMap;
-    /// use vibe_coding_tracker::pricing::{ModelPricing, ModelPricingMap};
+    /// use vct_core::pricing::{ModelPricing, ModelPricingMap};
     ///
     /// let mut raw = HashMap::new();
     /// raw.insert("gpt-4".to_string(), ModelPricing::default());
@@ -131,7 +131,7 @@ impl ModelPricingMap {
     ///
     /// ```
     /// use std::collections::HashMap;
-    /// use vibe_coding_tracker::pricing::{ModelPricing, ModelPricingMap};
+    /// use vct_core::pricing::{ModelPricing, ModelPricingMap};
     ///
     /// let mut raw = HashMap::new();
     /// raw.insert(
@@ -429,7 +429,7 @@ fn substring_provider_rank(query_provider: Option<&str>, candidate: &str) -> u8 
 /// # Examples
 ///
 /// ```
-/// use vibe_coding_tracker::pricing::normalize_model_name;
+/// use vct_core::pricing::normalize_model_name;
 ///
 /// assert_eq!(normalize_model_name("claude-3-sonnet-20240229"), "claude-3-sonnet");
 /// assert_eq!(normalize_model_name("gpt-4-v1.0"), "gpt-4");

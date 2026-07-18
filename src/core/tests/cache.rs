@@ -6,9 +6,9 @@ use serial_test::serial;
 use std::io::Write;
 use std::path::PathBuf;
 use tempfile::TempDir;
+use vct_core::cache::{FileParseCache, global_cache};
+use vct_core::pricing::clear_pricing_cache;
 use vct_test_support::fixture;
-use vibe_coding_tracker::cache::{FileParseCache, global_cache};
-use vibe_coding_tracker::pricing::clear_pricing_cache;
 
 #[test]
 #[serial(global_cache)]

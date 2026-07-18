@@ -28,9 +28,9 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, System};
-use vibe_coding_tracker::analysis::AnalysisData;
-use vibe_coding_tracker::config::ProvidersConfig;
-use vibe_coding_tracker::utils::format_compact;
+use vct_core::analysis::AnalysisData;
+use vct_core::config::ProvidersConfig;
+use vct_core::utils::format_compact;
 
 /// Upper bound on the number of rows tracked for the "recently updated"
 /// highlight, capping the tracker's memory footprint.
@@ -164,18 +164,18 @@ impl AnalysisUiState {
 
 /// Starts the CLI analysis TUI with its initial scan in the background.
 pub fn display_analysis_interactive_loading(
-    time_range: vibe_coding_tracker::models::TimeRange,
+    time_range: vct_core::models::TimeRange,
     providers: ProvidersConfig,
     refresh_secs: u64,
 ) -> anyhow::Result<()> {
-    let threads = vibe_coding_tracker::config::PerformanceConfig::default().resolved_scan_threads();
-    let pool = Arc::new(vibe_coding_tracker::scan::build_scan_pool(threads)?);
+    let threads = vct_core::config::PerformanceConfig::default().resolved_scan_threads();
+    let pool = Arc::new(vct_core::scan::build_scan_pool(threads)?);
     display_analysis_interactive_loading_with_pool(time_range, providers, refresh_secs, pool)
 }
 
 /// [`display_analysis_interactive_loading`] with a caller-owned scan pool.
 pub fn display_analysis_interactive_loading_with_pool(
-    time_range: vibe_coding_tracker::models::TimeRange,
+    time_range: vct_core::models::TimeRange,
     providers: ProvidersConfig,
     refresh_secs: u64,
     scan_pool: Arc<rayon::ThreadPool>,
@@ -185,7 +185,7 @@ pub fn display_analysis_interactive_loading_with_pool(
 
 fn run_analysis_interactive(
     initial_data: Option<AnalysisData>,
-    time_range: vibe_coding_tracker::models::TimeRange,
+    time_range: vct_core::models::TimeRange,
     providers: ProvidersConfig,
     refresh_secs: u64,
     scan_pool: Arc<rayon::ThreadPool>,
@@ -199,14 +199,14 @@ fn run_analysis_interactive(
             render_loading_frame(terminal.terminal_mut(), spinner_index)?;
         }
 
-        let paths = vibe_coding_tracker::utils::resolve_paths()?;
+        let paths = vct_core::utils::resolve_paths()?;
         let worker_paths = paths.clone();
         let worker_pool = Arc::clone(&scan_pool);
         let mut worker = RefreshWorker::new_with_init(refresh_secs, move || {
-            let mut cache = vibe_coding_tracker::summary_cache::SummaryScanCache::new();
+            let mut cache = vct_core::summary_cache::SummaryScanCache::new();
             move || {
                 let aggregation = worker_pool.install(|| {
-                    vibe_coding_tracker::analysis::aggregate_sessions_by_model_from_paths_with_cache(
+                    vct_core::analysis::aggregate_sessions_by_model_from_paths_with_cache(
                         &worker_paths,
                         time_range,
                         providers,
@@ -240,7 +240,7 @@ fn run_analysis_interactive(
         let mut sys = System::new();
         init_process_metrics(&mut sys, pid);
         let metrics_interval =
-            Duration::from_millis(vibe_coding_tracker::constants::refresh::METRICS_REFRESH_MS);
+            Duration::from_millis(vct_core::constants::refresh::METRICS_REFRESH_MS);
         let mut last_metrics = Instant::now();
         let mut last_spinner = Instant::now();
         let mut state = AnalysisUiState::new();
@@ -272,7 +272,7 @@ fn run_analysis_interactive(
                             pid,
                             refresh_status(worker.is_active(), failure_until),
                         )?;
-                        vibe_coding_tracker::utils::release_freed_heap();
+                        vct_core::utils::release_freed_heap();
                         last_metrics = Instant::now();
                     }
                     Err(RefreshWorkerError::Disconnected) => {
@@ -378,9 +378,9 @@ fn run_analysis_interactive(
 /// # Examples
 ///
 /// ```no_run
-/// use vibe_coding_tracker::analysis::aggregate_sessions_by_model;
+/// use vct_core::analysis::aggregate_sessions_by_model;
 /// use vct_tui::display::analysis::display_analysis_interactive;
-/// use vibe_coding_tracker::TimeRange;
+/// use vct_core::TimeRange;
 ///
 /// let data = aggregate_sessions_by_model(TimeRange::All)?;
 /// display_analysis_interactive(data, TimeRange::All, Default::default(), 10)?;
@@ -388,7 +388,7 @@ fn run_analysis_interactive(
 /// ```
 pub fn display_analysis_interactive(
     initial_data: AnalysisData,
-    time_range: vibe_coding_tracker::models::TimeRange,
+    time_range: vct_core::models::TimeRange,
     providers: ProvidersConfig,
     refresh_secs: u64,
 ) -> anyhow::Result<()> {
@@ -396,8 +396,8 @@ pub fn display_analysis_interactive(
         println!("No analysis data found");
         return Ok(());
     }
-    let threads = vibe_coding_tracker::config::PerformanceConfig::default().resolved_scan_threads();
-    let pool = Arc::new(vibe_coding_tracker::scan::build_scan_pool(threads)?);
+    let threads = vct_core::config::PerformanceConfig::default().resolved_scan_threads();
+    let pool = Arc::new(vct_core::scan::build_scan_pool(threads)?);
     run_analysis_interactive(
         Some(initial_data),
         time_range,

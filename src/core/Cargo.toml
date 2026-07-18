@@ -1,14 +1,17 @@
 [package]
-name = "vibe_coding_tracker"
+name = "vct-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
-description = "Vibe Coding Tracker - AI coding assistant telemetry/usage parser, aggregate local session data into CodeAnalysis results"
+description = "Vibe Coding Tracker core library - parse local AI coding assistant session data into CodeAnalysis results"
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 readme = "../../README.md"
+# Integration tests reference fixtures at the repo root and the internal
+# test-support crate, so they are not self-contained inside a published `.crate`.
+exclude = ["tests"]
 
 [lib]
 path = "src/lib.rs"

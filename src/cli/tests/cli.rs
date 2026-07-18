@@ -16,9 +16,9 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use serde_json::json;
+use vct_core::session::{ParseMode, parse_session_file_typed_with_mode};
+use vct_core::{VERSION, parse_session_file_typed};
 use vct_test_support::{TempHome, fixture};
-use vibe_coding_tracker::session::{ParseMode, parse_session_file_typed_with_mode};
-use vibe_coding_tracker::{VERSION, parse_session_file_typed};
 
 /// A minimal cost-fields pricing map used to seed the offline cache so `usage`
 /// prices its models without a network fetch.
@@ -498,8 +498,8 @@ fn single_file_summary_projection_is_parse_mode_invariant() {
                 && record.run_command_details.is_empty()
         }));
 
-        let full_rows = vibe_coding_tracker::analysis::project_code_analysis(&full).rows;
-        let compact_rows = vibe_coding_tracker::analysis::project_code_analysis(&compact).rows;
+        let full_rows = vct_core::analysis::project_code_analysis(&full).rows;
+        let compact_rows = vct_core::analysis::project_code_analysis(&compact).rows;
         assert_eq!(
             serde_json::to_value(full_rows).unwrap(),
             serde_json::to_value(compact_rows).unwrap(),

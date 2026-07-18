@@ -9,7 +9,7 @@ use std::fmt;
 /// # Examples
 ///
 /// ```
-/// use vibe_coding_tracker::models::Provider;
+/// use vct_core::models::Provider;
 ///
 /// assert_eq!(Provider::from_model_name("claude-sonnet-4"), Provider::ClaudeCode);
 /// assert_eq!(Provider::ClaudeCode.display_name(), "Claude");
@@ -48,7 +48,7 @@ impl Provider {
     /// # Examples
     ///
     /// ```
-    /// use vibe_coding_tracker::models::Provider;
+    /// use vct_core::models::Provider;
     ///
     /// assert_eq!(Provider::from_model_name("gpt-4-turbo"), Provider::Codex);
     /// assert_eq!(Provider::from_model_name("o3-mini"), Provider::Codex);

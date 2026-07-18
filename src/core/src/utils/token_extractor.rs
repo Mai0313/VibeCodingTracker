@@ -96,7 +96,7 @@ impl TokenCounts {
 ///
 /// ```
 /// use serde_json::json;
-/// use vibe_coding_tracker::utils::extract_token_counts;
+/// use vct_core::utils::extract_token_counts;
 ///
 /// // Flat provider shape with no TTL split: every
 /// // cache_creation token lands in the 5-minute bucket.

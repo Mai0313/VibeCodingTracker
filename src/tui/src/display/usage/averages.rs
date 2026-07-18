@@ -1,16 +1,16 @@
 //! Usage summary rendering helpers.
 //!
 //! The priced, aggregated summary (rows, totals, per-provider totals) is core
-//! business logic and lives in [`vibe_coding_tracker::usage::summary`]; it is re-exported
+//! business logic and lives in [`vct_core::usage::summary`]; it is re-exported
 //! here so the renderers keep importing it as
 //! `crate::display::usage::averages::<item>`. This module adds only the
 //! display-only provider-total rows, which borrow into the comfy-table /
 //! ratatui renderers.
 
-pub use vibe_coding_tracker::usage::summary::*;
+pub use vct_core::usage::summary::*;
 
 use crate::display::common::ProviderTotal;
-use vibe_coding_tracker::models::Provider;
+use vct_core::models::Provider;
 
 /// Build provider total rows for display.
 pub fn build_provider_total_rows(

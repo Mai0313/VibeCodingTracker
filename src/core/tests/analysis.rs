@@ -11,23 +11,23 @@ use serde_json::json;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use tempfile::TempDir;
-use vct_test_support::{TempHome, append_cursor_json_blob, fixture, fixture_str};
-use vibe_coding_tracker::TimeRange;
-use vibe_coding_tracker::analysis::aggregator::{
+use vct_core::TimeRange;
+use vct_core::analysis::aggregator::{
     AnalysisData, aggregate_sessions_by_model_from_paths,
     aggregate_sessions_by_model_from_paths_with_cache,
     aggregate_sessions_by_model_from_paths_with_diagnostics,
     aggregate_sessions_by_model_from_paths_with_providers,
     collect_analysis_sessions_from_paths_with, project_code_analysis,
 };
-use vibe_coding_tracker::config::ProvidersConfig;
-use vibe_coding_tracker::models::ExtensionType;
-use vibe_coding_tracker::session::parser::{
+use vct_core::config::ProvidersConfig;
+use vct_core::models::ExtensionType;
+use vct_core::session::parser::{
     parse_session_file_to_value, parse_session_file_typed, parse_session_file_typed_as,
     parse_session_file_with_diagnostics,
 };
-use vibe_coding_tracker::session::state::ParseMode;
-use vibe_coding_tracker::summary_cache::SummaryScanCache;
+use vct_core::session::state::ParseMode;
+use vct_core::summary_cache::SummaryScanCache;
+use vct_test_support::{TempHome, append_cursor_json_blob, fixture, fixture_str};
 
 fn providers_only(provider: ExtensionType) -> ProvidersConfig {
     ProvidersConfig {
@@ -1394,7 +1394,7 @@ fn cursor_all_store_failure_is_not_reported_as_parsed() {
 
 #[test]
 fn test_batch_analysis_serialization() {
-    use vibe_coding_tracker::analysis::aggregator::AggregatedAnalysisRow;
+    use vct_core::analysis::aggregator::AggregatedAnalysisRow;
 
     let row = AggregatedAnalysisRow {
         model: "claude-sonnet-4".to_string(),
@@ -1443,7 +1443,7 @@ fn test_analysis_with_invalid_json() {
 
 #[test]
 fn test_analysis_aggregation_logic() {
-    use vibe_coding_tracker::analysis::aggregator::AggregatedAnalysisRow;
+    use vct_core::analysis::aggregator::AggregatedAnalysisRow;
 
     let rows = [
         AggregatedAnalysisRow {

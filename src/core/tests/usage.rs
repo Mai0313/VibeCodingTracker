@@ -8,15 +8,15 @@
 use rusqlite::{Connection, params};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use vct_test_support::{TempHome, append_cursor_json_blob, fixture_str};
-use vibe_coding_tracker::TimeRange;
-use vibe_coding_tracker::config::ProvidersConfig;
-use vibe_coding_tracker::models::ExtensionType;
-use vibe_coding_tracker::summary_cache::SummaryScanCache;
-use vibe_coding_tracker::usage::aggregator::{
+use vct_core::TimeRange;
+use vct_core::config::ProvidersConfig;
+use vct_core::models::ExtensionType;
+use vct_core::summary_cache::SummaryScanCache;
+use vct_core::usage::aggregator::{
     UsageData, aggregate_usage_from_paths, aggregate_usage_from_paths_with_cache,
     aggregate_usage_from_paths_with_diagnostics, aggregate_usage_from_paths_with_providers,
 };
+use vct_test_support::{TempHome, append_cursor_json_blob, fixture_str};
 
 fn claude_only() -> ProvidersConfig {
     ProvidersConfig {
@@ -906,7 +906,7 @@ fn disabled_provider_is_dropped_from_usage_rollup() {
 #[test]
 fn test_usage_data_serialization() {
     use serde_json::json;
-    use vibe_coding_tracker::models::usage::UsageResult;
+    use vct_core::models::usage::UsageResult;
 
     // Create sample usage data
     let mut usage = UsageResult::default();
@@ -937,7 +937,7 @@ fn test_usage_data_serialization() {
 
 #[test]
 fn test_usage_calculation_cost_accuracy() {
-    use vibe_coding_tracker::pricing::{ModelPricing, calculate_cost};
+    use vct_core::pricing::{ModelPricing, calculate_cost};
 
     let pricing = ModelPricing {
         input_cost_per_token: 0.000003,
@@ -948,7 +948,7 @@ fn test_usage_calculation_cost_accuracy() {
     };
 
     // 2000 cache_creation tokens, all default (5 minute) TTL, no reasoning.
-    let counts = vibe_coding_tracker::utils::TokenCounts {
+    let counts = vct_core::utils::TokenCounts {
         input_tokens: 1000,
         output_tokens: 500,
         cache_read: 10000,
@@ -970,7 +970,7 @@ fn test_usage_calculation_cost_accuracy() {
 fn test_usage_with_multiple_models() {
     // Test handling of multiple models in usage data
     use serde_json::json;
-    use vibe_coding_tracker::models::usage::UsageResult;
+    use vct_core::models::usage::UsageResult;
 
     let mut usage = UsageResult::default();
     usage.insert(
@@ -1007,7 +1007,7 @@ fn test_usage_with_multiple_models() {
 fn test_usage_json_output_format() {
     // Test that JSON output format matches expected structure
     use serde_json::{Value, json};
-    use vibe_coding_tracker::models::usage::UsageResult;
+    use vct_core::models::usage::UsageResult;
 
     let mut usage = UsageResult::default();
     usage.insert(

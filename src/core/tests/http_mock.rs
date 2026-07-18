@@ -8,12 +8,12 @@
 
 use httpmock::prelude::*;
 use serde_json::json;
-use vct_test_support::fixture_str;
-use vibe_coding_tracker::quota::http::build_client;
-use vibe_coding_tracker::quota::wham::{
+use vct_core::quota::http::build_client;
+use vct_core::quota::wham::{
     ResetCreditsResult, WhamResult, call_reset_credit_details, call_wham,
     call_wham_with_reset_credits, refresh_codex,
 };
+use vct_test_support::fixture_str;
 
 #[test]
 fn call_wham_maps_200_response() {

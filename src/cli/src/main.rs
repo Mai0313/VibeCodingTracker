@@ -3,7 +3,7 @@
 //! Parses the subcommand with clap and dispatches to the library crate:
 //! batch `analysis` and `usage` views (TUI / table / text / JSON with a
 //! time-range filter), complete single-file analysis, plus `version` and
-//! `update`. The heavy lifting lives in [`vibe_coding_tracker`]; this file is
+//! `update`. The heavy lifting lives in [`vct_core`]; this file is
 //! wiring.
 //!
 //! Two things run *before* clap on purpose, and the ordering is
@@ -29,20 +29,20 @@ use std::sync::Arc;
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+use vct_core::get_version_info;
+use vct_core::scan::build_scan_pool;
+use vct_core::session::{ParseMode, parse_session_file_with_diagnostics};
+use vct_core::usage::scan_usage_priced;
 use vct_tui::display::usage::{
     display_usage_interactive_with_pool, display_usage_table, display_usage_text,
 };
-use vibe_coding_tracker::get_version_info;
-use vibe_coding_tracker::scan::build_scan_pool;
-use vibe_coding_tracker::session::{ParseMode, parse_session_file_with_diagnostics};
-use vibe_coding_tracker::usage::scan_usage_priced;
 
 /// Parses the CLI and runs the selected subcommand.
 ///
 /// Two steps run before `Cli::parse()` and must stay in this order:
 /// `tune_system_allocator()` caps glibc arenas before the first allocation
 /// (a Rayon worker), and the `--version` / `-V` branch is handled by hand so
-/// the bare flag prints just [`vibe_coding_tracker::VERSION`] without going
+/// the bare flag prints just [`vct_core::VERSION`] without going
 /// through clap (the `version` *subcommand* still renders the full table).
 ///
 /// # Errors
@@ -56,11 +56,11 @@ fn main() -> Result<()> {
     // Cap per-thread glibc arenas and pin the trim threshold before any
     // allocation happens under a Rayon worker. See `tune_system_allocator`
     // for why this matters on long TUI sessions.
-    vibe_coding_tracker::utils::tune_system_allocator();
+    vct_core::utils::tune_system_allocator();
 
     // Install the file logger (default level `warn`) before anything can log or
     // panic. It writes only to `~/.vct/logs/`, never the terminal.
-    vibe_coding_tracker::logging::init();
+    vct_core::logging::init();
     // Terminal-restore-on-panic is a presentation concern owned by the display
     // layer, so the binary installs it here rather than from core `logging`.
     // Installed early so a panic before the TUI starts still restores cleanly.
@@ -70,7 +70,7 @@ fn main() -> Result<()> {
         std::env::args_os().nth(1).and_then(|arg| arg.into_string().ok()),
         Some(arg) if arg == "--version" || arg == "-V"
     ) {
-        println!("{}", vibe_coding_tracker::VERSION);
+        println!("{}", vct_core::VERSION);
         return Ok(());
     }
 
@@ -118,12 +118,10 @@ fn run() -> Result<()> {
                     if complete_json {
                         write_pretty_json(&analysis)?;
                     } else if text {
-                        let projected =
-                            vibe_coding_tracker::analysis::project_code_analysis(&analysis);
+                        let projected = vct_core::analysis::project_code_analysis(&analysis);
                         vct_tui::display::analysis::display_analysis_text(&projected);
                     } else {
-                        let projected =
-                            vibe_coding_tracker::analysis::project_code_analysis(&analysis);
+                        let projected = vct_core::analysis::project_code_analysis(&analysis);
                         vct_tui::display::analysis::display_analysis_table(&projected);
                     }
                 }
@@ -131,8 +129,8 @@ fn run() -> Result<()> {
                     // Settings are only needed for the batch (all-sessions) path,
                     // so `analysis FILE`, `version`, `quota`, etc. never read or
                     // create `~/.vct/config.toml`.
-                    let config = vibe_coding_tracker::config::load();
-                    vibe_coding_tracker::logging::apply(&config.logging);
+                    let config = vct_core::config::load();
+                    vct_core::logging::apply(&config.logging);
                     let time_range = resolve_time_range_with_default(
                         daily,
                         weekly,
@@ -144,7 +142,7 @@ fn run() -> Result<()> {
                         Arc::new(build_scan_pool(config.performance.resolved_scan_threads())?);
                     if json {
                         let dataset = scan_pool.install(|| {
-                            vibe_coding_tracker::analysis::collect_analysis_sessions_with(
+                            vct_core::analysis::collect_analysis_sessions_with(
                                 time_range,
                                 config.providers,
                                 ParseMode::Full,
@@ -154,7 +152,7 @@ fn run() -> Result<()> {
                         write_pretty_json(&dataset)?;
                     } else if text || table {
                         let aggregation = scan_pool.install(|| {
-                            vibe_coding_tracker::analysis::aggregate_sessions_by_model_with_diagnostics(
+                            vct_core::analysis::aggregate_sessions_by_model_with_diagnostics(
                                 time_range,
                                 config.providers,
                             )
@@ -188,8 +186,8 @@ fn run() -> Result<()> {
             monthly,
             all,
         } => {
-            let config = vibe_coding_tracker::config::load();
-            vibe_coding_tracker::logging::apply(&config.logging);
+            let config = vct_core::config::load();
+            vct_core::logging::apply(&config.logging);
             let time_range = resolve_time_range_with_default(
                 daily,
                 weekly,
@@ -210,10 +208,8 @@ fn run() -> Result<()> {
                     );
                 }
                 report_usage_collection(&scan.collection.diagnostics)?;
-                let priced = vibe_coding_tracker::usage::price_usage_data(
-                    &scan.collection.data,
-                    &scan.pricing,
-                );
+                let priced =
+                    vct_core::usage::price_usage_data(&scan.collection.data, &scan.pricing);
                 write_pretty_json(&priced)?;
             } else if text {
                 let scan = scan_usage_priced(time_range, config.providers, &scan_pool)?;
@@ -294,9 +290,9 @@ fn run() -> Result<()> {
 
         Commands::Update { check, force } => {
             if check {
-                vibe_coding_tracker::update::check_update()?;
+                vct_core::update::check_update()?;
             } else {
-                vibe_coding_tracker::update::update_interactive(force)?;
+                vct_core::update::update_interactive(force)?;
             }
         }
 
@@ -323,17 +319,14 @@ fn run_config(action: ConfigAction) -> Result<()> {
     match action {
         // Pure stdout: schema generation needs no config file, so it must not
         // resolve (and thereby create) ~/.vct — keep it usable on a read-only home.
-        ConfigAction::Schema => print!("{}", vibe_coding_tracker::config::schema_json()),
+        ConfigAction::Schema => print!("{}", vct_core::config::schema_json()),
         ConfigAction::Path => {
-            println!(
-                "{}",
-                vibe_coding_tracker::utils::get_config_path()?.display()
-            );
+            println!("{}", vct_core::utils::get_config_path()?.display());
         }
         ConfigAction::Show => {
-            let path = vibe_coding_tracker::utils::get_config_path()?;
+            let path = vct_core::utils::get_config_path()?;
             // Ensure the file exists (first-run creation) before reading it back.
-            let _ = vibe_coding_tracker::config::load();
+            let _ = vct_core::config::load();
             let contents = std::fs::read_to_string(&path).unwrap_or_default();
             println!("{}", "Vibe Coding Tracker settings".bright_cyan().bold());
             println!("{}", path.display().dimmed());
@@ -341,9 +334,9 @@ fn run_config(action: ConfigAction) -> Result<()> {
             print!("{}", contents);
         }
         ConfigAction::Edit => {
-            let path = vibe_coding_tracker::utils::get_config_path()?;
+            let path = vct_core::utils::get_config_path()?;
             // Ensure the file exists before handing it to the editor.
-            let _ = vibe_coding_tracker::config::load();
+            let _ = vct_core::config::load();
             let editor = std::env::var("VISUAL")
                 .or_else(|_| std::env::var("EDITOR"))
                 .unwrap_or_else(|_| default_editor().to_string());
@@ -366,9 +359,9 @@ fn run_config(action: ConfigAction) -> Result<()> {
             }
         }
         ConfigAction::Migrate => {
-            use vibe_coding_tracker::config::MigrationStatus;
-            let path = vibe_coding_tracker::utils::get_config_path()?;
-            match vibe_coding_tracker::config::migrate_config_file(&path)? {
+            use vct_core::config::MigrationStatus;
+            let path = vct_core::utils::get_config_path()?;
+            match vct_core::config::migrate_config_file(&path)? {
                 MigrationStatus::Created => {
                     println!("Created a new config at {}", path.display());
                 }
@@ -397,11 +390,11 @@ fn run_config(action: ConfigAction) -> Result<()> {
 /// answers a non-2xx status (the body is still printed first; a 401/403 appends
 /// the provider's login hint).
 fn run_quota(provider: QuotaProvider, text: bool, table: bool) -> Result<()> {
-    use vct_tui::display::quota::{display_quota_table, display_quota_text, print_quota_json};
-    use vibe_coding_tracker::quota::{
+    use vct_core::quota::{
         CLAUDE_LOGIN_HINT, CODEX_LOGIN_HINT, COPILOT_LOGIN_HINT, CURSOR_LOGIN_HINT, claude,
         copilot, cursor, http, wham,
     };
+    use vct_tui::display::quota::{display_quota_table, display_quota_text, print_quota_json};
 
     let client = http::build_client()?;
     let (status, body) = match provider {
@@ -446,9 +439,7 @@ fn write_pretty_json(value: &impl Serialize) -> Result<()> {
 }
 
 /// Rejects a completely failed noninteractive scan and reports partial data.
-fn report_analysis_collection(
-    diagnostics: &vibe_coding_tracker::analysis::ScanDiagnostics,
-) -> Result<()> {
+fn report_analysis_collection(diagnostics: &vct_core::analysis::ScanDiagnostics) -> Result<()> {
     let Some(first) = diagnostics.failures.first() else {
         return Ok(());
     };
@@ -475,9 +466,7 @@ fn report_analysis_collection(
 }
 
 /// Rejects a completely failed noninteractive usage scan and reports partial data.
-fn report_usage_collection(
-    diagnostics: &vibe_coding_tracker::usage::ScanDiagnostics,
-) -> Result<()> {
+fn report_usage_collection(diagnostics: &vct_core::usage::ScanDiagnostics) -> Result<()> {
     let Some(first) = diagnostics.failures.first() else {
         return Ok(());
     };

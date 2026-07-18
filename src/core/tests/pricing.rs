@@ -8,11 +8,11 @@ use httpmock::prelude::*;
 use serde_json::json;
 use std::collections::HashMap;
 use tempfile::TempDir;
-use vibe_coding_tracker::pricing::{
+use vct_core::pricing::{
     ModelPricing, ModelPricingMap, ThresholdTier, TierRange, calculate_cost, clear_pricing_cache,
     fetch_model_pricing_with, normalize_model_name,
 };
-use vibe_coding_tracker::utils::get_pricing_cache_path_in;
+use vct_core::utils::get_pricing_cache_path_in;
 
 /// Builds normalized counts for the positional (input, output, reasoning,
 /// cache_read, cache_creation_5m, cache_creation_1h) test shorthand.
@@ -23,8 +23,8 @@ fn tc(
     cache_read: i64,
     cc_5m: i64,
     cc_1h: i64,
-) -> vibe_coding_tracker::utils::TokenCounts {
-    vibe_coding_tracker::utils::TokenCounts {
+) -> vct_core::utils::TokenCounts {
+    vct_core::utils::TokenCounts {
         input_tokens: input,
         output_tokens: output,
         reasoning_tokens: reasoning,
@@ -662,7 +662,7 @@ fn test_pricing_range_based() {
 
 #[test]
 fn test_pricing_result_structure() {
-    use vibe_coding_tracker::pricing::ModelPricingResult;
+    use vct_core::pricing::ModelPricingResult;
 
     let pricing = ModelPricing::default();
     let result = ModelPricingResult {

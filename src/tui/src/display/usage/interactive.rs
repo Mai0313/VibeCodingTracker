@@ -35,21 +35,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, System};
-use vibe_coding_tracker::config::ProvidersConfig;
-use vibe_coding_tracker::models::{
+use vct_core::config::ProvidersConfig;
+use vct_core::models::{
     ClaudeQuotaSnapshot, CodexQuotaSnapshot, CopilotQuotaSnapshot, CursorQuotaSnapshot,
     QuotaSource, QuotaWindow,
 };
-use vibe_coding_tracker::pricing::{ModelPricingMap, fetch_model_pricing};
-use vibe_coding_tracker::quota::{
+use vct_core::pricing::{ModelPricingMap, fetch_model_pricing};
+use vct_core::quota::{
     CLAUDE_LOGIN_HINT, CODEX_LOGIN_HINT, COPILOT_LOGIN_HINT, CURSOR_LOGIN_HINT, ClaudeState,
     CodexState, CopilotState, CursorState, load_claude_cache, load_codex_cache, load_copilot_cache,
     load_cursor_cache, save_claude_cache, save_codex_cache, save_copilot_cache, save_cursor_cache,
     spawn_quota_worker,
 };
-use vibe_coding_tracker::scan::build_scan_pool;
-use vibe_coding_tracker::summary_cache::SummaryScanCache;
-use vibe_coding_tracker::utils::{
+use vct_core::scan::build_scan_pool;
+use vct_core::summary_cache::SummaryScanCache;
+use vct_core::utils::{
     format_compact, format_cost, format_cost_compact, format_duration_until,
     get_claude_credentials_path, get_copilot_config_path, get_cursor_auth_path, resolve_paths,
 };
@@ -169,8 +169,7 @@ struct QuotaRuntime {
 
 impl QuotaRuntime {
     fn start(quota_panels: &[String], providers: ProvidersConfig, quota_refresh_secs: u64) -> Self {
-        let panel_on =
-            |name: &str| vibe_coding_tracker::config::quota_panel_selected(quota_panels, name);
+        let panel_on = |name: &str| vct_core::config::quota_panel_selected(quota_panels, name);
         let band_enabled = !quota_panels.is_empty();
         let mut present = if band_enabled {
             QuotaPresence::detect()
@@ -213,7 +212,7 @@ impl QuotaRuntime {
         ));
 
         if present.claude || present.codex || present.copilot || present.cursor {
-            match vibe_coding_tracker::quota::http::build_client() {
+            match vct_core::quota::http::build_client() {
                 Ok(client) => {
                     if present.claude {
                         let (client, shutdown, shared) =
@@ -365,7 +364,7 @@ impl UsageUiState {
             .and_then(|index| self.view().get(index))
             .map(|row| row.model.clone());
         self.merge_enabled = !self.merge_enabled;
-        let _ = vibe_coding_tracker::config::save_merge_models(self.merge_enabled);
+        let _ = vct_core::config::save_merge_models(self.merge_enabled);
         let fingerprints: Vec<_> = self
             .view()
             .iter()
@@ -443,7 +442,7 @@ impl UsageUiState {
 /// Displays usage with a dedicated scan pool supplied by the CLI.
 #[allow(clippy::too_many_arguments)]
 pub fn display_usage_interactive_with_pool(
-    time_range: vibe_coding_tracker::models::TimeRange,
+    time_range: vct_core::models::TimeRange,
     merge_providers: bool,
     quota_panels: Vec<String>,
     providers: ProvidersConfig,
@@ -463,7 +462,7 @@ pub fn display_usage_interactive_with_pool(
         let mut worker = RefreshWorker::new_with_init(refresh_secs, move || {
             let mut cache = SummaryScanCache::new();
             let mut pricing = ModelPricingMap::new(HashMap::new());
-            let mut scan_options = vibe_coding_tracker::usage::UsageScanOptions::default();
+            let mut scan_options = vct_core::usage::UsageScanOptions::default();
             let mut loaded_pricing_utc_date = None;
             move || {
                 let today = chrono::Utc::now().date_naive();
@@ -484,7 +483,7 @@ pub fn display_usage_interactive_with_pool(
                 }
 
                 let collection = worker_pool.install(|| {
-                    vibe_coding_tracker::usage::aggregate_usage_from_paths_with_cache_opts(
+                    vct_core::usage::aggregate_usage_from_paths_with_cache_opts(
                         &worker_paths,
                         time_range,
                         providers,
@@ -535,7 +534,7 @@ pub fn display_usage_interactive_with_pool(
         let mut sys = System::new();
         init_process_metrics(&mut sys, pid);
         let metrics_interval =
-            Duration::from_millis(vibe_coding_tracker::constants::refresh::METRICS_REFRESH_MS);
+            Duration::from_millis(vct_core::constants::refresh::METRICS_REFRESH_MS);
         let mut last_metrics = Instant::now();
         let mut last_spinner = Instant::now();
         let mut state = UsageUiState::new(merge_providers);
@@ -557,7 +556,7 @@ pub fn display_usage_interactive_with_pool(
                             &quota,
                             refresh_status(worker.is_active(), failure_until),
                         )?;
-                        vibe_coding_tracker::utils::release_freed_heap();
+                        vct_core::utils::release_freed_heap();
                         last_metrics = Instant::now();
                     }
                     Err(RefreshWorkerError::Disconnected) => {
@@ -682,14 +681,14 @@ pub fn display_usage_interactive_with_pool(
 ///
 /// Panics if the current process ID cannot be obtained for memory monitoring.
 pub fn display_usage_interactive(
-    time_range: vibe_coding_tracker::models::TimeRange,
+    time_range: vct_core::models::TimeRange,
     merge_providers: bool,
     quota_panels: Vec<String>,
     providers: ProvidersConfig,
     refresh_secs: u64,
     quota_refresh_secs: u64,
 ) -> anyhow::Result<()> {
-    let threads = vibe_coding_tracker::config::PerformanceConfig::default().resolved_scan_threads();
+    let threads = vct_core::config::PerformanceConfig::default().resolved_scan_threads();
     let pool = Arc::new(build_scan_pool(threads)?);
     display_usage_interactive_with_pool(
         time_range,
@@ -1669,7 +1668,7 @@ fn claude_balance_line(claude: &ClaudeQuotaSnapshot) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vibe_coding_tracker::models::Provider;
+    use vct_core::models::Provider;
 
     fn line_text(line: Line<'_>) -> String {
         line.spans

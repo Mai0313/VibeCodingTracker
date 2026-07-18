@@ -11,8 +11,8 @@ use crate::display::common::table::{
 };
 use comfy_table::{Cell, CellAlignment, Color, Table, presets::UTF8_FULL};
 use owo_colors::OwoColorize;
-use vibe_coding_tracker::analysis::AnalysisData;
-use vibe_coding_tracker::utils::format_number;
+use vct_core::analysis::AnalysisData;
+use vct_core::utils::format_number;
 
 /// Print the `analysis` data as static, colored tables to stdout.
 ///

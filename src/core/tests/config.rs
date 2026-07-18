@@ -4,10 +4,10 @@
 //! so nothing touches the real home directory or process environment.
 
 use std::fs;
+use vct_core::TimeRange;
+use vct_core::config::{self, Config};
+use vct_core::resolve_time_range_with_default;
 use vct_test_support::TempHome;
-use vibe_coding_tracker::TimeRange;
-use vibe_coding_tracker::config::{self, Config};
-use vibe_coding_tracker::resolve_time_range_with_default;
 
 #[test]
 fn load_in_creates_default_commented_file_when_absent() {

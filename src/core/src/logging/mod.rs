@@ -135,16 +135,16 @@ fn utc_date() -> String {
 
 /// Formats one log line: `<utc-nanos> <LEVEL> <target>  <message>`.
 ///
-/// The crate's own `vibe_coding_tracker::` target prefix is shortened to `vct::`
+/// The crate's own `vct_core::` target prefix is shortened to `vct::`
 /// to keep lines readable.
 fn format_line(now: &str, level: Level, target: &str, msg: &str) -> String {
     format!("{now} {:<5} {}  {msg}\n", level, normalize_target(target))
 }
 
-/// Rewrites the crate's module-path target from `vibe_coding_tracker[...]` to
+/// Rewrites the core crate's module-path target from `vct_core[...]` to
 /// `vct[...]`; leaves third-party targets untouched.
 fn normalize_target(target: &str) -> String {
-    match target.strip_prefix("vibe_coding_tracker") {
+    match target.strip_prefix("vct_core") {
         Some(rest) => format!("vct{rest}"),
         None => target.to_string(),
     }
@@ -237,7 +237,7 @@ mod tests {
         let line = format_line(
             "2026-07-12T10:30:15.123456789Z",
             Level::Warn,
-            "vibe_coding_tracker::quota::claude",
+            "vct_core::quota::claude",
             "quota fetch failed: HTTP 403",
         );
         assert_eq!(
@@ -248,11 +248,8 @@ mod tests {
 
     #[test]
     fn normalize_target_shortens_only_our_crate() {
-        assert_eq!(normalize_target("vibe_coding_tracker"), "vct");
-        assert_eq!(
-            normalize_target("vibe_coding_tracker::pricing"),
-            "vct::pricing"
-        );
+        assert_eq!(normalize_target("vct_core"), "vct");
+        assert_eq!(normalize_target("vct_core::pricing"), "vct::pricing");
         assert_eq!(normalize_target("hyper_util::client"), "hyper_util::client");
     }
 
@@ -295,7 +292,7 @@ mod tests {
         logger.log(
             &Record::builder()
                 .level(Level::Info)
-                .target("vibe_coding_tracker::x")
+                .target("vct_core::x")
                 .args(format_args!("skip me"))
                 .build(),
         );
@@ -308,7 +305,7 @@ mod tests {
         logger.log(
             &Record::builder()
                 .level(Level::Warn)
-                .target("vibe_coding_tracker::quota")
+                .target("vct_core::quota")
                 .args(format_args!("boom"))
                 .build(),
         );

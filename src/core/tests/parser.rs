@@ -8,8 +8,8 @@
 // - gitRemoteUrl: git remote URL may differ
 
 use serde_json::Value;
+use vct_core::session::parser::parse_session_file_to_value;
 use vct_test_support::fixture;
-use vibe_coding_tracker::session::parser::parse_session_file_to_value;
 
 /// Compare two JSON values while ignoring specific fields
 ///

@@ -56,7 +56,7 @@ use std::sync::Arc;
 /// # Examples
 ///
 /// ```no_run
-/// use vibe_coding_tracker::{aggregate_usage_from_home, TimeRange};
+/// use vct_core::{aggregate_usage_from_home, TimeRange};
 ///
 /// let data = aggregate_usage_from_home(TimeRange::All)?;
 /// // Total distinct days that contributed any usage, across all providers.
@@ -160,7 +160,7 @@ fn extract_conversation_usage_from_analysis(analysis: CodeAnalysis) -> FastHashM
 /// # Examples
 ///
 /// ```no_run
-/// use vibe_coding_tracker::{aggregate_usage_from_home, TimeRange};
+/// use vct_core::{aggregate_usage_from_home, TimeRange};
 ///
 /// let data = aggregate_usage_from_home(TimeRange::All)?;
 /// for model in data.models.keys() {

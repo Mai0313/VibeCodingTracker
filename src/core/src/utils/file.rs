@@ -184,7 +184,7 @@ pub fn read_json<P: AsRef<Path>>(path: P) -> Result<Vec<Value>> {
 /// # Examples
 ///
 /// ```
-/// use vibe_coding_tracker::utils::count_lines;
+/// use vct_core::utils::count_lines;
 ///
 /// assert_eq!(count_lines(""), 0);
 /// assert_eq!(count_lines("one line"), 1);
