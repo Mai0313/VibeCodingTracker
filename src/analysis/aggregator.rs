@@ -483,76 +483,16 @@ pub fn aggregate_sessions_by_model_from_paths_with_cache(
     let mut diagnostics = AnalysisCollectionDiagnostics::default();
     let mut seen = FastHashSet::default();
 
-    if providers.claude {
-        crate::scan::scan_cached_files(
-            &paths.claude_session_dir,
-            ExtensionType::ClaudeCode,
-            is_claude_session_file,
-            time_range,
-            None,
-            cache,
-            &mut seen,
-            &mut projection,
-            &mut diagnostics,
-            None,
-        )?;
-    }
-    if providers.codex {
-        crate::scan::scan_cached_files(
-            &paths.codex_session_dir,
-            ExtensionType::Codex,
-            is_codex_session_file,
-            time_range,
-            None,
-            cache,
-            &mut seen,
-            &mut projection,
-            &mut diagnostics,
-            None,
-        )?;
-    }
-    if providers.copilot {
-        crate::scan::scan_cached_files(
-            &paths.copilot_session_dir,
-            ExtensionType::Copilot,
-            is_copilot_session_file,
-            time_range,
-            Some(COPILOT_SESSION_MAX_DEPTH),
-            cache,
-            &mut seen,
-            &mut projection,
-            &mut diagnostics,
-            None,
-        )?;
-    }
-    if providers.gemini {
-        crate::scan::scan_cached_files(
-            &paths.gemini_session_dir,
-            ExtensionType::Gemini,
-            is_gemini_session_file,
-            time_range,
-            None,
-            cache,
-            &mut seen,
-            &mut projection,
-            &mut diagnostics,
-            None,
-        )?;
-    }
-    if providers.grok {
-        crate::scan::scan_cached_files(
-            &paths.grok_session_dir,
-            ExtensionType::Grok,
-            is_grok_session_file,
-            time_range,
-            Some(GROK_SESSION_MAX_DEPTH),
-            cache,
-            &mut seen,
-            &mut projection,
-            &mut diagnostics,
-            None,
-        )?;
-    }
+    crate::scan::scan_all_cached_files(
+        paths,
+        providers,
+        time_range,
+        cache,
+        &mut seen,
+        &mut projection,
+        &mut diagnostics,
+        None,
+    )?;
 
     if providers.opencode && paths.opencode_db.exists() {
         scan_opencode_analysis(

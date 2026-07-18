@@ -6,10 +6,12 @@
 //! [`ScanDiagnostics`] result type and the dedicated scan thread pool.
 
 pub(crate) mod compact;
+pub(crate) mod descriptor;
 
 pub(crate) use compact::{
     CompactSink, LoadedCompactSummary, fold_cached, fold_loaded, scan_cached_files,
 };
+pub(crate) use descriptor::scan_all_cached_files;
 
 use crate::models::ExtensionType;
 use anyhow::Result;
