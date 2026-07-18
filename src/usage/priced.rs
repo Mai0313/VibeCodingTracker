@@ -3,8 +3,8 @@
 //! Joining each model's tokens with its resolved USD cost used to live in the
 //! binary, so a non-CLI consumer (e.g. a future GUI backend) could not produce
 //! the same shape. [`price_usage_data`] returns a `Serialize`-able row set with
-//! the exact field order and `matched_model`-only-when-present behavior the CLI
-//! has always emitted.
+//! the same `matched_model`-only-when-present behavior the CLI has always
+//! emitted.
 
 use crate::pricing::ModelPricingMap;
 use crate::usage::{CostSource, UsageData, resolve_model_cost};
@@ -13,17 +13,23 @@ use serde::Serialize;
 use serde_json::Value;
 
 /// One priced model row of the `usage --json` output.
+///
+/// The old binary built each row as a `serde_json::Value` object, whose
+/// `serde_json::Map` (this crate does not enable `preserve_order`) serializes
+/// keys alphabetically. Fields are declared in that same alphabetical order
+/// (`cost_usd`, `matched_model`, `model`, `usage`) so the derived output is
+/// byte-for-byte identical to what the CLI has always emitted.
 #[derive(Debug, Clone, Serialize)]
 pub struct PricedUsageRow {
-    /// Model name (merged across providers).
-    pub model: String,
-    /// Token counts normalized to the flat key set (see [`normalize_usage_value`]).
-    pub usage: Value,
     /// Resolved cost in USD.
     pub cost_usd: f64,
     /// The LiteLLM key actually used, when it differed from `model`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_model: Option<String>,
+    /// Model name (merged across providers).
+    pub model: String,
+    /// Token counts normalized to the flat key set (see [`normalize_usage_value`]).
+    pub usage: Value,
 }
 
 /// Builds the priced `usage --json` payload, joining each model's token counts
