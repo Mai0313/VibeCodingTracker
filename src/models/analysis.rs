@@ -207,6 +207,41 @@ pub struct CodeAnalysis {
     pub records: Vec<CodeAnalysisRecord>,
 }
 
+/// Single row of aggregated file-operation metrics for one model.
+///
+/// Counts are summed across every session that used the model in the active
+/// time range. The `*_lines` fields total the lines touched by edit/read/write
+/// operations; the `*_count` fields total how many times each tool was called.
+/// Serializes with camelCase field names for library callers that persist a
+/// compact projection. The CLI's `analysis --json` output uses the full
+/// `CodeAnalysis` shape instead.
+///
+/// This is a neutral data type shared by the `analysis` roll-up and the
+/// process-local scan cache, so it lives in `models` rather than either
+/// feature.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AggregatedAnalysisRow {
+    /// Model name the metrics are grouped under.
+    pub model: String,
+    /// Total lines changed by `Edit`/`MultiEdit` operations.
+    pub edit_lines: usize,
+    /// Total lines returned by `Read` operations.
+    pub read_lines: usize,
+    /// Total lines emitted by `Write` operations.
+    pub write_lines: usize,
+    /// Number of `Bash` tool calls.
+    pub bash_count: usize,
+    /// Number of `Edit` tool calls.
+    pub edit_count: usize,
+    /// Number of `Read` tool calls.
+    pub read_count: usize,
+    /// Number of `TodoWrite` tool calls.
+    pub todo_write_count: usize,
+    /// Number of `Write` tool calls.
+    pub write_count: usize,
+}
+
 /// The AI coding assistant a session came from.
 ///
 /// Distinct from [`crate::models::Provider`]: `ExtensionType` is the
@@ -239,6 +274,26 @@ pub enum ExtensionType {
     Hermes,
     /// xAI Grok CLI.
     Grok,
+}
+
+impl ExtensionType {
+    /// Stable scan / display order shared by every provider fan-out.
+    ///
+    /// This is the single source of truth for "provider order": diagnostics
+    /// sorting, cached-scan ranking, and the descriptor table all defer to it,
+    /// so a new provider only has to be slotted in here.
+    pub fn scan_rank(self) -> u8 {
+        match self {
+            ExtensionType::ClaudeCode => 0,
+            ExtensionType::Codex => 1,
+            ExtensionType::Copilot => 2,
+            ExtensionType::Gemini => 3,
+            ExtensionType::Grok => 4,
+            ExtensionType::OpenCode => 5,
+            ExtensionType::Cursor => 6,
+            ExtensionType::Hermes => 7,
+        }
+    }
 }
 
 impl std::fmt::Display for ExtensionType {

@@ -1,13 +1,11 @@
 //! Process-local cache for compact usage and analysis scan contributions.
 
-use crate::analysis::AggregatedAnalysisRow;
 use crate::cli::TimeRange;
 use crate::constants::FastHashMap;
-use crate::models::{CodeAnalysis, ExtensionType, UsageResult};
+use crate::models::{AggregatedAnalysisRow, CodeAnalysis, ExtensionType, UsageResult};
 use crate::session::diagnostics::{UsageContribution, UsageTokenContribution};
 use crate::session::sqlite::{DatabaseFingerprint, append_suffix};
-use crate::usage::merge_usage_values;
-use crate::utils::extract_token_counts;
+use crate::utils::{extract_token_counts, merge_usage_values};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -21,20 +19,6 @@ pub fn build_scan_pool(threads: usize) -> Result<rayon::ThreadPool> {
         .thread_name(|index| format!("vct-scan-{index}"))
         .build()
         .map_err(Into::into)
-}
-
-/// Stable provider order shared by cached usage and analysis diagnostics.
-pub(crate) fn provider_scan_rank(provider: ExtensionType) -> u8 {
-    match provider {
-        ExtensionType::ClaudeCode => 0,
-        ExtensionType::Codex => 1,
-        ExtensionType::Copilot => 2,
-        ExtensionType::Gemini => 3,
-        ExtensionType::Grok => 4,
-        ExtensionType::OpenCode => 5,
-        ExtensionType::Cursor => 6,
-        ExtensionType::Hermes => 7,
-    }
 }
 
 /// Observable cache statistics used by tests and diagnostic logging.
