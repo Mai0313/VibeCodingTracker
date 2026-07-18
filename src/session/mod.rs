@@ -7,6 +7,11 @@
 //! session files — [`crate::analysis`] (aggregated tool-call metrics) and
 //! [`crate::usage`] (aggregated token counts) — share the same parsers
 //! and intermediate shape instead of one feature reaching into the other.
+//!
+//! Naming convention: the file-backed providers expose `parse_*` entry points
+//! (`parse_session_file_*`), while the SQLite-backed providers (OpenCode /
+//! Cursor / Hermes) expose `read_*` entry points, since they query a database
+//! rather than parse a byte stream.
 pub mod claude;
 pub mod codex;
 pub mod copilot;
@@ -26,7 +31,8 @@ pub use detector::{classify_records, detect_extension_type};
 pub use hermes::read_hermes_usage;
 pub use opencode::{read_opencode_analysis, read_opencode_usage};
 pub use parser::{
-    SessionFileParseDiagnostics, parse_session_file, parse_session_file_as,
-    parse_session_file_detailed, parse_session_file_typed, parse_session_file_typed_with_mode,
+    SessionFileParseDiagnostics, parse_session_file_to_value, parse_session_file_typed,
+    parse_session_file_typed_as, parse_session_file_typed_with_mode,
+    parse_session_file_with_diagnostics,
 };
 pub use state::{ParseMode, SessionParseState};

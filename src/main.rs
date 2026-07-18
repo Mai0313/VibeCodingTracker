@@ -34,7 +34,7 @@ use vibe_coding_tracker::display::usage::{
 };
 use vibe_coding_tracker::get_version_info;
 use vibe_coding_tracker::scan::build_scan_pool;
-use vibe_coding_tracker::session::{ParseMode, parse_session_file_detailed};
+use vibe_coding_tracker::session::{ParseMode, parse_session_file_with_diagnostics};
 use vibe_coding_tracker::usage::scan_usage_priced;
 
 /// Parses the CLI and runs the selected subcommand.
@@ -106,7 +106,8 @@ fn run() -> Result<()> {
                     } else {
                         ParseMode::UsageOnly
                     };
-                    let (analysis, diagnostics) = parse_session_file_detailed(&file_path, mode)?;
+                    let (analysis, diagnostics) =
+                        parse_session_file_with_diagnostics(&file_path, mode)?;
                     if diagnostics.skipped_records() > 0 {
                         eprintln!(
                             "Warning: Skipped {} malformed or unsupported analyzer records while parsing {}. Successful results are still shown.",
@@ -208,9 +209,7 @@ fn run() -> Result<()> {
             if json {
                 let scan = scan_usage_priced(time_range, config.providers, &scan_pool)?;
                 if scan.pricing_failed {
-                    eprintln!(
-                        "Warning: Failed to fetch pricing data. Costs will be unavailable."
-                    );
+                    eprintln!("Warning: Failed to fetch pricing data. Costs will be unavailable.");
                 }
                 report_usage_collection(&scan.collection.diagnostics)?;
                 let priced = vibe_coding_tracker::usage::price_usage_data(
@@ -404,8 +403,8 @@ fn run_quota(provider: QuotaProvider, text: bool, table: bool) -> Result<()> {
         display_quota_table, display_quota_text, print_quota_json,
     };
     use vibe_coding_tracker::quota::{
-        CLAUDE_LOGIN_HINT, CODEX_LOGIN_HINT, COPILOT_LOGIN_HINT, CURSOR_LOGIN_HINT, claude, copilot,
-        cursor, http, wham,
+        CLAUDE_LOGIN_HINT, CODEX_LOGIN_HINT, COPILOT_LOGIN_HINT, CURSOR_LOGIN_HINT, claude,
+        copilot, cursor, http, wham,
     };
 
     let client = http::build_client()?;
@@ -452,7 +451,7 @@ fn write_pretty_json(value: &impl Serialize) -> Result<()> {
 
 /// Rejects a completely failed noninteractive scan and reports partial data.
 fn report_analysis_collection(
-    diagnostics: &vibe_coding_tracker::analysis::AnalysisCollectionDiagnostics,
+    diagnostics: &vibe_coding_tracker::analysis::ScanDiagnostics,
 ) -> Result<()> {
     let Some(first) = diagnostics.failures.first() else {
         return Ok(());
@@ -481,7 +480,7 @@ fn report_analysis_collection(
 
 /// Rejects a completely failed noninteractive usage scan and reports partial data.
 fn report_usage_collection(
-    diagnostics: &vibe_coding_tracker::usage::UsageCollectionDiagnostics,
+    diagnostics: &vibe_coding_tracker::usage::ScanDiagnostics,
 ) -> Result<()> {
     let Some(first) = diagnostics.failures.first() else {
         return Ok(());

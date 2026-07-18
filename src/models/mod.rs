@@ -1,11 +1,14 @@
 //! Serde data models mirroring the supported assistants' on-disk session
 //! formats plus the analyzer's own aggregated result types.
 //!
-//! Each provider submodule defines the
-//! minimal subset of fields the analyzer reads from that provider's session
-//! logs; `analysis` and `usage` hold the normalized, cross-provider output
-//! shapes; `provider` carries the [`Provider`] discriminator. All items are
-//! re-exported at the module root for convenience.
+//! Each JSON/JSONL provider submodule (`claude`, `codex`, `copilot`, `gemini`,
+//! `grok`) defines the minimal subset of fields the analyzer reads from that
+//! provider's session logs; the SQLite providers (OpenCode / Cursor / Hermes)
+//! deserialize inline in their `session` readers and have no submodule here.
+//! `analysis` and `usage` hold the normalized, cross-provider output shapes;
+//! `provider` carries the [`Provider`] discriminator, `filter` the
+//! [`TimeRange`] session filter, and `aggregate` the per-provider totals
+//! container. All items are re-exported at the module root for convenience.
 
 pub mod aggregate;
 pub mod analysis;

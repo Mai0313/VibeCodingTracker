@@ -9,7 +9,9 @@
 use crate::config::ProvidersConfig;
 use crate::models::TimeRange;
 use crate::pricing::{ModelPricingMap, fetch_model_pricing};
-use crate::usage::{UsageCollection, UsageScanOptions, get_usage_from_directories_with_diagnostics_opts};
+use crate::usage::{
+    UsageCollection, UsageScanOptions, aggregate_usage_from_home_with_diagnostics_opts,
+};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -52,7 +54,7 @@ pub fn scan_usage_priced(
         tiers: Some(Arc::new(pricing.tier_thresholds())),
     };
     let collection = pool.install(|| {
-        get_usage_from_directories_with_diagnostics_opts(time_range, providers, &options)
+        aggregate_usage_from_home_with_diagnostics_opts(time_range, providers, &options)
     })?;
     Ok(PricedUsageScan {
         collection,

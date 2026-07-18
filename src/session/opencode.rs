@@ -20,8 +20,8 @@
 //! sessions that switch model mid-stream are split before aggregation.
 
 use crate::VERSION;
-use crate::models::TimeRange;
 use crate::constants::FastHashMap;
+use crate::models::TimeRange;
 use crate::models::{CodeAnalysis, CodeAnalysisRecord, ExtensionType};
 use crate::session::diagnostics::{
     DatabaseAnalysisRow, DatabaseUsageRead, UsageContribution, UsageTokenContribution,

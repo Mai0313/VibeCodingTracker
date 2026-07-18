@@ -1,7 +1,7 @@
 //! Process-local cache for compact usage and analysis scan contributions.
 
-use crate::models::TimeRange;
 use crate::constants::{FastHashMap, FastHashSet};
+use crate::models::TimeRange;
 use crate::models::{AggregatedAnalysisRow, CodeAnalysis, ExtensionType, UsageResult};
 use crate::session::diagnostics::{UsageContribution, UsageTokenContribution};
 use crate::session::sqlite::{DatabaseFingerprint, append_suffix};

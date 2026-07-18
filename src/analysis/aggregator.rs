@@ -1,6 +1,6 @@
-use crate::models::TimeRange;
 use crate::config::ProvidersConfig;
 use crate::constants::{FastHashMap, FastHashSet, capacity};
+use crate::models::TimeRange;
 use crate::models::{CodeAnalysis, ExtensionType, ProviderActiveDays};
 use crate::session::cursor::{
     discover_cursor_store_dbs, load_conversation_model_snapshot,
@@ -8,7 +8,7 @@ use crate::session::cursor::{
 };
 use crate::session::diagnostics::DatabaseAnalysisRow;
 use crate::session::opencode::read_opencode_analysis_with_diagnostics;
-use crate::session::parser::parse_session_file_as_with_diagnostics;
+use crate::session::parser::parse_session_file_typed_as_with_diagnostics;
 use crate::session::sqlite::is_cacheable_sqlite_failure;
 use crate::session::state::ParseMode;
 use crate::summary_cache::{
@@ -56,11 +56,11 @@ pub struct AnalysisData {
 /// callers that intentionally operate on best-effort data. Noninteractive
 /// callers can use the `*_with_diagnostics` variants and reject an all-failed
 /// scan or surface partial failures before rendering `data`.
-pub struct AnalysisAggregation {
+pub struct AnalysisCollection {
     /// Successfully parsed metrics, even when some other sources failed.
     pub data: AnalysisData,
     /// Candidate, success, and failure information for the scan.
-    pub diagnostics: AnalysisCollectionDiagnostics,
+    pub diagnostics: ScanDiagnostics,
 }
 
 /// Aggregated analysis rows partitioned by the source directory they came from.
@@ -101,11 +101,9 @@ pub struct AnalysisSession {
     pub analysis: CodeAnalysis,
 }
 
-// Usage and analysis share one unified scan-diagnostics type; these historical
-// names are kept as aliases so `analysis::AnalysisCollectionDiagnostics` and the
-// per-source failure constructors keep working.
-pub use crate::scan::ScanDiagnostics as AnalysisCollectionDiagnostics;
-pub use crate::scan::ScanFailure as AnalysisCollectionFailure;
+// Usage and analysis both report the one unified scan-diagnostics type; it is
+// re-exported here so callers can reach it as `analysis::ScanDiagnostics`.
+pub use crate::scan::{ScanDiagnostics, ScanFailure};
 
 /// Canonical batch-analysis dataset before any display-specific projection.
 ///
@@ -121,7 +119,7 @@ pub struct AnalysisDataset {
     ///
     /// The custom [`Serialize`] implementation deliberately omits this field
     /// so canonical batch JSON remains a transparent `CodeAnalysis[]`.
-    pub diagnostics: AnalysisCollectionDiagnostics,
+    pub diagnostics: ScanDiagnostics,
 }
 
 impl AnalysisDataset {
@@ -141,8 +139,8 @@ impl AnalysisDataset {
     }
 
     /// Projects the dataset while retaining its collection diagnostics.
-    pub fn summarize_with_diagnostics(&self) -> AnalysisAggregation {
-        AnalysisAggregation {
+    pub fn summarize_with_diagnostics(&self) -> AnalysisCollection {
+        AnalysisCollection {
             data: self.summarize(),
             diagnostics: self.diagnostics.clone(),
         }
@@ -192,19 +190,19 @@ impl Serialize for AnalysisDataset {
 /// # Ok::<(), anyhow::Error>(())
 /// ```
 pub fn aggregate_sessions_by_model(time_range: TimeRange) -> Result<AnalysisData> {
-    aggregate_sessions_by_model_with(time_range, ProvidersConfig::default())
+    aggregate_sessions_by_model_with_providers(time_range, ProvidersConfig::default())
 }
 
 /// [`aggregate_sessions_by_model`] with explicit per-provider toggles (from
 /// `~/.vct/config.toml`). A disabled provider is skipped entirely.
-pub fn aggregate_sessions_by_model_with(
+pub fn aggregate_sessions_by_model_with_providers(
     time_range: TimeRange,
     providers: ProvidersConfig,
 ) -> Result<AnalysisData> {
     Ok(aggregate_sessions_by_model_with_diagnostics(time_range, providers)?.data)
 }
 
-/// Streaming counterpart of [`aggregate_sessions_by_model_with`] that also
+/// Streaming counterpart of [`aggregate_sessions_by_model_with_providers`] that also
 /// returns source diagnostics for noninteractive callers.
 ///
 /// Parsed sessions are added to the summary as each provider completes. Only
@@ -212,7 +210,7 @@ pub fn aggregate_sessions_by_model_with(
 pub fn aggregate_sessions_by_model_with_diagnostics(
     time_range: TimeRange,
     providers: ProvidersConfig,
-) -> Result<AnalysisAggregation> {
+) -> Result<AnalysisCollection> {
     aggregate_sessions_by_model_from_paths_with_diagnostics(
         &crate::utils::resolve_paths()?,
         time_range,
@@ -231,11 +229,15 @@ pub fn aggregate_sessions_by_model_from_paths(
     paths: &HelperPaths,
     time_range: TimeRange,
 ) -> Result<AnalysisData> {
-    aggregate_sessions_by_model_from_paths_with(paths, time_range, ProvidersConfig::default())
+    aggregate_sessions_by_model_from_paths_with_providers(
+        paths,
+        time_range,
+        ProvidersConfig::default(),
+    )
 }
 
 /// [`aggregate_sessions_by_model_from_paths`] with explicit provider toggles.
-pub fn aggregate_sessions_by_model_from_paths_with(
+pub fn aggregate_sessions_by_model_from_paths_with_providers(
     paths: &HelperPaths,
     time_range: TimeRange,
     providers: ProvidersConfig,
@@ -248,7 +250,7 @@ pub fn aggregate_sessions_by_model_from_paths_with_diagnostics(
     paths: &HelperPaths,
     time_range: TimeRange,
     providers: ProvidersConfig,
-) -> Result<AnalysisAggregation> {
+) -> Result<AnalysisCollection> {
     let mut projection = AnalysisProjection::new();
     let diagnostics = visit_analysis_sessions_from_paths_with(
         paths,
@@ -257,7 +259,7 @@ pub fn aggregate_sessions_by_model_from_paths_with_diagnostics(
         ParseMode::UsageOnly,
         &mut |session| projection.add_session(&session),
     )?;
-    Ok(AnalysisAggregation {
+    Ok(AnalysisCollection {
         data: projection.finish(),
         diagnostics,
     })
@@ -318,11 +320,11 @@ fn visit_analysis_sessions_from_paths_with<F>(
     providers: ProvidersConfig,
     mode: ParseMode,
     visitor: &mut F,
-) -> Result<AnalysisCollectionDiagnostics>
+) -> Result<ScanDiagnostics>
 where
     F: FnMut(AnalysisSession),
 {
-    let mut diagnostics = AnalysisCollectionDiagnostics::default();
+    let mut diagnostics = ScanDiagnostics::default();
 
     if providers.claude {
         visit_file_sessions(
@@ -459,7 +461,7 @@ pub fn aggregate_sessions_by_model_with_cache(
     time_range: TimeRange,
     providers: ProvidersConfig,
     cache: &mut SummaryScanCache,
-) -> Result<AnalysisAggregation> {
+) -> Result<AnalysisCollection> {
     aggregate_sessions_by_model_from_paths_with_cache(
         &crate::utils::resolve_paths()?,
         time_range,
@@ -477,10 +479,10 @@ pub fn aggregate_sessions_by_model_from_paths_with_cache(
     time_range: TimeRange,
     providers: ProvidersConfig,
     cache: &mut SummaryScanCache,
-) -> Result<AnalysisAggregation> {
+) -> Result<AnalysisCollection> {
     cache.begin_scan();
     let mut projection = AnalysisProjection::new();
-    let mut diagnostics = AnalysisCollectionDiagnostics::default();
+    let mut diagnostics = ScanDiagnostics::default();
     let mut seen = FastHashSet::default();
 
     crate::scan::scan_all_cached_files(
@@ -517,7 +519,7 @@ pub fn aggregate_sessions_by_model_from_paths_with_cache(
 
     cache.retain_kinds(&seen, &[SummaryKind::File, SummaryKind::AnalysisDatabase]);
     diagnostics.finalize();
-    Ok(AnalysisAggregation {
+    Ok(AnalysisCollection {
         data: projection.finish(),
         diagnostics,
     })
@@ -529,7 +531,7 @@ fn scan_opencode_analysis(
     cache: &mut SummaryScanCache,
     seen: &mut FastHashSet<SummaryCacheKey>,
     projection: &mut AnalysisProjection,
-    diagnostics: &mut AnalysisCollectionDiagnostics,
+    diagnostics: &mut ScanDiagnostics,
 ) {
     let provider = ExtensionType::OpenCode;
     let source = &paths.opencode_db;
@@ -608,7 +610,7 @@ fn scan_cursor_analysis(
     cache: &mut SummaryScanCache,
     seen: &mut FastHashSet<SummaryCacheKey>,
     projection: &mut AnalysisProjection,
-    diagnostics: &mut AnalysisCollectionDiagnostics,
+    diagnostics: &mut ScanDiagnostics,
 ) {
     let provider = ExtensionType::Cursor;
     let source = &paths.cursor_chats_dir;
@@ -763,10 +765,8 @@ fn into_sorted_rows(map: FastHashMap<String, AggregatedAnalysisRow>) -> Vec<Aggr
     v
 }
 
-type FileSessionOutcome = std::result::Result<
-    (Option<AnalysisSession>, Option<AnalysisCollectionFailure>),
-    AnalysisCollectionFailure,
->;
+type FileSessionOutcome =
+    std::result::Result<(Option<AnalysisSession>, Option<ScanFailure>), ScanFailure>;
 
 /// Visits one file-backed provider in deterministic path order.
 #[allow(clippy::too_many_arguments)]
@@ -777,7 +777,7 @@ fn visit_file_sessions<F, V>(
     time_range: TimeRange,
     max_depth: Option<usize>,
     mode: ParseMode,
-    diagnostics: &mut AnalysisCollectionDiagnostics,
+    diagnostics: &mut ScanDiagnostics,
     visitor: &mut V,
 ) -> Result<()>
 where
@@ -803,7 +803,7 @@ where
                 path,
                 modified_date,
             } = file_info;
-            match parse_session_file_as_with_diagnostics(&path, provider, mode, None) {
+            match parse_session_file_typed_as_with_diagnostics(&path, provider, mode, None) {
                 Ok(parsed) if parsed.diagnostics.is_complete_failure() => {
                     let error = if parsed.diagnostics.recognized_records == 0 {
                         "source contained no recognized provider records".to_string()
@@ -813,7 +813,7 @@ where
                             parsed.diagnostics.relevant_records
                         )
                     };
-                    Err(AnalysisCollectionFailure {
+                    Err(ScanFailure {
                         provider,
                         source: path,
                         error,
@@ -823,7 +823,7 @@ where
                     if parsed.diagnostics.should_emit_session()
                         && parsed.analysis.records.is_empty() =>
                 {
-                    Err(AnalysisCollectionFailure {
+                    Err(ScanFailure {
                         provider,
                         source: path,
                         error: "normalized source produced no analysis records".to_string(),
@@ -831,14 +831,13 @@ where
                 }
                 Ok(parsed) => {
                     let partial_failure_count = parsed.diagnostics.partial_failure_count();
-                    let partial_failure =
-                        (partial_failure_count > 0).then_some(AnalysisCollectionFailure {
-                            provider,
-                            source: path,
-                            error: crate::session::diagnostics::partial_failure_reason(
-                                partial_failure_count,
-                            ),
-                        });
+                    let partial_failure = (partial_failure_count > 0).then_some(ScanFailure {
+                        provider,
+                        source: path,
+                        error: crate::session::diagnostics::partial_failure_reason(
+                            partial_failure_count,
+                        ),
+                    });
                     let session = parsed.diagnostics.should_emit_session().then_some({
                         AnalysisSession {
                             provider,
@@ -848,7 +847,7 @@ where
                     });
                     Ok((session, partial_failure))
                 }
-                Err(err) => Err(AnalysisCollectionFailure {
+                Err(err) => Err(ScanFailure {
                     provider,
                     source: path,
                     error: err.to_string(),
@@ -875,14 +874,14 @@ where
 }
 
 fn record_failure(
-    diagnostics: &mut AnalysisCollectionDiagnostics,
+    diagnostics: &mut ScanDiagnostics,
     provider: ExtensionType,
     source: &Path,
     error: String,
 ) {
     push_failure(
         diagnostics,
-        AnalysisCollectionFailure {
+        ScanFailure {
             provider,
             source: source.to_path_buf(),
             error,
@@ -890,10 +889,7 @@ fn record_failure(
     );
 }
 
-fn push_failure(
-    diagnostics: &mut AnalysisCollectionDiagnostics,
-    failure: AnalysisCollectionFailure,
-) {
+fn push_failure(diagnostics: &mut ScanDiagnostics, failure: ScanFailure) {
     // A partial parse keeps its recognized data; logging it as "failed to
     // collect" would read as a dropped source.
     if crate::session::diagnostics::is_partial_failure_reason(&failure.error) {

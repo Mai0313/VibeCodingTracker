@@ -1,6 +1,6 @@
 // Integration tests for usage aggregation.
 //
-// These drive `get_usage_from_paths` against a `TempHome` (fixture session files
+// These drive `aggregate_usage_from_paths` against a `TempHome` (fixture session files
 // under a temp directory) so the real aggregation runs hermetically: no
 // process-global env is mutated, no machine files are read, and no external API
 // is reached. The remaining tests are pure in-memory cost / JSON math.
@@ -15,9 +15,9 @@ use vibe_coding_tracker::TimeRange;
 use vibe_coding_tracker::config::ProvidersConfig;
 use vibe_coding_tracker::models::ExtensionType;
 use vibe_coding_tracker::summary_cache::SummaryScanCache;
-use vibe_coding_tracker::usage::calculator::{
-    UsageData, get_usage_from_paths, get_usage_from_paths_with, get_usage_from_paths_with_cache,
-    get_usage_from_paths_with_diagnostics,
+use vibe_coding_tracker::usage::aggregator::{
+    UsageData, aggregate_usage_from_paths, aggregate_usage_from_paths_with_cache,
+    aggregate_usage_from_paths_with_diagnostics, aggregate_usage_from_paths_with_providers,
 };
 
 fn claude_only() -> ProvidersConfig {
@@ -187,7 +187,8 @@ fn assert_usage_data_eq(actual: &UsageData, expected: &UsageData) {
 #[test]
 fn empty_home_yields_no_usage() {
     let home = TempHome::new();
-    let data = get_usage_from_paths(&home.paths, TimeRange::All).expect("aggregate empty home");
+    let data =
+        aggregate_usage_from_paths(&home.paths, TimeRange::All).expect("aggregate empty home");
     assert!(data.models.is_empty(), "empty home has no models");
     assert_eq!(data.provider_days.total, 0);
 }
@@ -225,10 +226,12 @@ fn cached_usage_matches_uncached_for_every_provider_source() {
     seed_hermes_usage_db(&home.paths.hermes_db);
 
     let providers = ProvidersConfig::default();
-    let uncached = get_usage_from_paths_with(&home.paths, TimeRange::All, providers).unwrap();
+    let uncached =
+        aggregate_usage_from_paths_with_providers(&home.paths, TimeRange::All, providers).unwrap();
     let mut cache = SummaryScanCache::new();
-    let cold = get_usage_from_paths_with_cache(&home.paths, TimeRange::All, providers, &mut cache)
-        .unwrap();
+    let cold =
+        aggregate_usage_from_paths_with_cache(&home.paths, TimeRange::All, providers, &mut cache)
+            .unwrap();
 
     assert_eq!(cold.diagnostics.candidates, 8);
     assert_eq!(cold.diagnostics.parsed, 8);
@@ -251,8 +254,9 @@ fn cached_usage_matches_uncached_for_every_provider_source() {
         );
     }
 
-    let warm = get_usage_from_paths_with_cache(&home.paths, TimeRange::All, providers, &mut cache)
-        .unwrap();
+    let warm =
+        aggregate_usage_from_paths_with_cache(&home.paths, TimeRange::All, providers, &mut cache)
+            .unwrap();
     assert_eq!(cache.stats().parsed_sources, 0);
     assert_eq!(warm.diagnostics, cold.diagnostics);
     assert_usage_data_eq(&warm.data, &uncached);
@@ -276,15 +280,23 @@ fn usage_cache_preserves_entries_after_partial_directory_discovery() {
     let original_permissions = std::fs::metadata(hidden_dir).unwrap().permissions();
     let mut cache = SummaryScanCache::new();
 
-    let cold =
-        get_usage_from_paths_with_cache(&home.paths, TimeRange::All, claude_only(), &mut cache)
-            .unwrap();
+    let cold = aggregate_usage_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        claude_only(),
+        &mut cache,
+    )
+    .unwrap();
     assert_eq!(cache.stats().entries, 2);
     assert_eq!(cache.stats().parsed_sources, 2);
 
     std::fs::set_permissions(hidden_dir, std::fs::Permissions::from_mode(0o0)).unwrap();
-    let partial =
-        get_usage_from_paths_with_cache(&home.paths, TimeRange::All, claude_only(), &mut cache);
+    let partial = aggregate_usage_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        claude_only(),
+        &mut cache,
+    );
     std::fs::set_permissions(hidden_dir, original_permissions).unwrap();
     let partial = partial.unwrap();
 
@@ -299,9 +311,13 @@ fn usage_cache_preserves_entries_after_partial_directory_discovery() {
     assert_eq!(cache.stats().parsed_sources, 0);
     assert_eq!(cache.stats().entries, 2);
 
-    let restored =
-        get_usage_from_paths_with_cache(&home.paths, TimeRange::All, claude_only(), &mut cache)
-            .unwrap();
+    let restored = aggregate_usage_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        claude_only(),
+        &mut cache,
+    )
+    .unwrap();
     assert_eq!(cache.stats().parsed_sources, 0);
     assert_eq!(cache.stats().entries, 2);
     assert!(restored.diagnostics.failures.is_empty());
@@ -316,40 +332,60 @@ fn cursor_usage_cache_invalidates_only_changed_stores() {
         home.put_cursor_session("project", "second", "cursor-second", 1_780_757_090_000, 200);
     let mut cache = SummaryScanCache::new();
 
-    let cold =
-        get_usage_from_paths_with_cache(&home.paths, TimeRange::All, cursor_only(), &mut cache)
-            .unwrap();
+    let cold = aggregate_usage_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        cursor_only(),
+        &mut cache,
+    )
+    .unwrap();
     assert_eq!(cache.stats().parsed_sources, 2);
     assert_eq!(cache.stats().entries, 2);
     assert_eq!(cold.diagnostics.candidates, 2);
     assert_eq!(cold.diagnostics.parsed, 2);
 
-    let warm =
-        get_usage_from_paths_with_cache(&home.paths, TimeRange::All, cursor_only(), &mut cache)
-            .unwrap();
+    let warm = aggregate_usage_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        cursor_only(),
+        &mut cache,
+    )
+    .unwrap();
     assert_eq!(cache.stats().parsed_sources, 0);
     assert_usage_data_eq(&warm.data, &cold.data);
 
     append_cursor_json_blob(&first, "mutation");
-    let changed =
-        get_usage_from_paths_with_cache(&home.paths, TimeRange::All, cursor_only(), &mut cache)
-            .unwrap();
+    let changed = aggregate_usage_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        cursor_only(),
+        &mut cache,
+    )
+    .unwrap();
     assert_eq!(cache.stats().parsed_sources, 1);
     assert_eq!(cache.stats().entries, 2);
     assert_usage_data_eq(&changed.data, &cold.data);
 
     home.put_cursor_session("project", "third", "cursor-third", 1_780_757_091_000, 300);
-    let added =
-        get_usage_from_paths_with_cache(&home.paths, TimeRange::All, cursor_only(), &mut cache)
-            .unwrap();
+    let added = aggregate_usage_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        cursor_only(),
+        &mut cache,
+    )
+    .unwrap();
     assert_eq!(cache.stats().parsed_sources, 1);
     assert_eq!(cache.stats().entries, 3);
     assert!(added.data.per_provider.cursor.contains_key("cursor-third"));
 
     std::fs::remove_file(second).unwrap();
-    let deleted =
-        get_usage_from_paths_with_cache(&home.paths, TimeRange::All, cursor_only(), &mut cache)
-            .unwrap();
+    let deleted = aggregate_usage_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        cursor_only(),
+        &mut cache,
+    )
+    .unwrap();
     assert_eq!(cache.stats().parsed_sources, 0);
     assert_eq!(cache.stats().entries, 2);
     assert_eq!(deleted.diagnostics.candidates, 2);
@@ -373,14 +409,22 @@ fn incremental_cache_reuses_unchanged_sources_and_tracks_mutations() {
     );
     let mut cache = SummaryScanCache::new();
 
-    let cold =
-        get_usage_from_paths_with_cache(&home.paths, TimeRange::All, claude_only(), &mut cache)
-            .unwrap();
+    let cold = aggregate_usage_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        claude_only(),
+        &mut cache,
+    )
+    .unwrap();
     assert_eq!(cache.stats().parsed_sources, 1);
 
-    let warm =
-        get_usage_from_paths_with_cache(&home.paths, TimeRange::All, claude_only(), &mut cache)
-            .unwrap();
+    let warm = aggregate_usage_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        claude_only(),
+        &mut cache,
+    )
+    .unwrap();
     assert_eq!(cache.stats().parsed_sources, 0);
     assert_eq!(
         serde_json::to_value(&cold.data.models).unwrap(),
@@ -390,7 +434,7 @@ fn incremental_cache_reuses_unchanged_sources_and_tracks_mutations() {
     let mut changed = fixture_str("sessions/claude_code.jsonl");
     changed.push('\n');
     std::fs::write(&source, changed).unwrap();
-    get_usage_from_paths_with_cache(&home.paths, TimeRange::All, claude_only(), &mut cache)
+    aggregate_usage_from_paths_with_cache(&home.paths, TimeRange::All, claude_only(), &mut cache)
         .unwrap();
     assert_eq!(cache.stats().parsed_sources, 1);
 
@@ -399,7 +443,7 @@ fn incremental_cache_reuses_unchanged_sources_and_tracks_mutations() {
         "second.jsonl",
         &fixture_str("sessions/claude_code.jsonl"),
     );
-    get_usage_from_paths_with_cache(&home.paths, TimeRange::All, claude_only(), &mut cache)
+    aggregate_usage_from_paths_with_cache(&home.paths, TimeRange::All, claude_only(), &mut cache)
         .unwrap();
     assert_eq!(
         cache.stats().parsed_sources,
@@ -409,7 +453,7 @@ fn incremental_cache_reuses_unchanged_sources_and_tracks_mutations() {
     assert_eq!(cache.stats().entries, 2);
 
     std::fs::remove_file(source).unwrap();
-    get_usage_from_paths_with_cache(&home.paths, TimeRange::All, claude_only(), &mut cache)
+    aggregate_usage_from_paths_with_cache(&home.paths, TimeRange::All, claude_only(), &mut cache)
         .unwrap();
     assert_eq!(cache.stats().parsed_sources, 0);
     assert_eq!(cache.stats().entries, 1, "deleted source is evicted");
@@ -419,7 +463,8 @@ fn incremental_cache_reuses_unchanged_sources_and_tracks_mutations() {
         ..claude_only()
     };
     let result =
-        get_usage_from_paths_with_cache(&home.paths, TimeRange::All, disabled, &mut cache).unwrap();
+        aggregate_usage_from_paths_with_cache(&home.paths, TimeRange::All, disabled, &mut cache)
+            .unwrap();
     assert!(result.data.models.is_empty());
     assert_eq!(cache.stats().parsed_sources, 0);
     assert_eq!(cache.stats().entries, 0);
@@ -441,16 +486,19 @@ fn grok_sidecars_invalidate_the_compact_cache() {
     };
     let mut cache = SummaryScanCache::new();
 
-    get_usage_from_paths_with_cache(&home.paths, TimeRange::All, providers, &mut cache).unwrap();
+    aggregate_usage_from_paths_with_cache(&home.paths, TimeRange::All, providers, &mut cache)
+        .unwrap();
     assert_eq!(cache.stats().parsed_sources, 1);
-    get_usage_from_paths_with_cache(&home.paths, TimeRange::All, providers, &mut cache).unwrap();
+    aggregate_usage_from_paths_with_cache(&home.paths, TimeRange::All, providers, &mut cache)
+        .unwrap();
     assert_eq!(cache.stats().parsed_sources, 0);
 
     let updates = signals.with_file_name("updates.jsonl");
     let mut content = std::fs::read_to_string(&updates).unwrap();
     content.push('\n');
     std::fs::write(updates, content).unwrap();
-    get_usage_from_paths_with_cache(&home.paths, TimeRange::All, providers, &mut cache).unwrap();
+    aggregate_usage_from_paths_with_cache(&home.paths, TimeRange::All, providers, &mut cache)
+        .unwrap();
     assert_eq!(cache.stats().parsed_sources, 1);
 }
 
@@ -458,14 +506,16 @@ fn grok_sidecars_invalidate_the_compact_cache() {
 fn usage_diagnostics_cover_empty_blank_all_failed_and_partial_scans() {
     let empty = TempHome::new();
     let no_candidates =
-        get_usage_from_paths_with_diagnostics(&empty.paths, TimeRange::All, claude_only()).unwrap();
+        aggregate_usage_from_paths_with_diagnostics(&empty.paths, TimeRange::All, claude_only())
+            .unwrap();
     assert_eq!(no_candidates.diagnostics.candidates, 0);
     assert!(!no_candidates.diagnostics.all_failed());
 
     let blank = TempHome::new();
     blank.put_claude_session("proj", "blank.jsonl", "\n");
     let blank_result =
-        get_usage_from_paths_with_diagnostics(&blank.paths, TimeRange::All, claude_only()).unwrap();
+        aggregate_usage_from_paths_with_diagnostics(&blank.paths, TimeRange::All, claude_only())
+            .unwrap();
     assert_eq!(blank_result.diagnostics.candidates, 1);
     assert_eq!(blank_result.diagnostics.parsed, 1);
     assert!(!blank_result.diagnostics.has_failures());
@@ -473,7 +523,7 @@ fn usage_diagnostics_cover_empty_blank_all_failed_and_partial_scans() {
     let failed = TempHome::new();
     failed.put_claude_session("proj", "invalid.jsonl", "not json\n");
     let failed_result =
-        get_usage_from_paths_with_diagnostics(&failed.paths, TimeRange::All, claude_only())
+        aggregate_usage_from_paths_with_diagnostics(&failed.paths, TimeRange::All, claude_only())
             .unwrap();
     assert!(failed_result.diagnostics.all_failed());
     assert_eq!(failed_result.diagnostics.failures.len(), 1);
@@ -484,7 +534,7 @@ fn usage_diagnostics_cover_empty_blank_all_failed_and_partial_scans() {
         &fixture_str("sessions/claude_code.jsonl"),
     );
     let partial =
-        get_usage_from_paths_with_diagnostics(&failed.paths, TimeRange::All, claude_only())
+        aggregate_usage_from_paths_with_diagnostics(&failed.paths, TimeRange::All, claude_only())
             .unwrap();
     assert!(partial.diagnostics.partially_failed());
     assert!(!partial.data.models.is_empty());
@@ -499,11 +549,14 @@ fn zero_usage_metadata_does_not_increment_active_days() {
         r#"{"type":"permission-mode","parentUuid":"root","timestamp":"2026-07-12T00:00:00Z"}"#,
     );
 
-    let legacy = get_usage_from_paths_with(&home.paths, TimeRange::All, claude_only()).unwrap();
+    let legacy =
+        aggregate_usage_from_paths_with_providers(&home.paths, TimeRange::All, claude_only())
+            .unwrap();
     assert_eq!(legacy.provider_days.claude, 0);
 
     let cached =
-        get_usage_from_paths_with_diagnostics(&home.paths, TimeRange::All, claude_only()).unwrap();
+        aggregate_usage_from_paths_with_diagnostics(&home.paths, TimeRange::All, claude_only())
+            .unwrap();
     assert_eq!(cached.data.provider_days.claude, 0);
 }
 
@@ -514,7 +567,7 @@ fn usage_database_failures_preserve_all_failed_and_partial_diagnostics() {
     std::fs::write(&home.paths.opencode_db, "not a SQLite database").unwrap();
 
     let failed =
-        get_usage_from_paths_with_diagnostics(&home.paths, TimeRange::All, opencode_only())
+        aggregate_usage_from_paths_with_diagnostics(&home.paths, TimeRange::All, opencode_only())
             .unwrap();
     assert!(failed.data.models.is_empty());
     assert_eq!(failed.diagnostics.candidates, 1);
@@ -540,7 +593,8 @@ fn usage_database_failures_preserve_all_failed_and_partial_diagnostics() {
         ..claude_only()
     };
     let partial =
-        get_usage_from_paths_with_diagnostics(&home.paths, TimeRange::All, providers).unwrap();
+        aggregate_usage_from_paths_with_diagnostics(&home.paths, TimeRange::All, providers)
+            .unwrap();
     assert_eq!(partial.diagnostics.candidates, 2);
     assert_eq!(partial.diagnostics.parsed, 1);
     assert!(partial.diagnostics.partially_failed());
@@ -564,18 +618,26 @@ fn opencode_usage_schema_drift_is_diagnostic_and_fingerprint_cached() {
     drop(connection);
 
     let mut cache = SummaryScanCache::new();
-    let failed =
-        get_usage_from_paths_with_cache(&home.paths, TimeRange::All, opencode_only(), &mut cache)
-            .unwrap();
+    let failed = aggregate_usage_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        opencode_only(),
+        &mut cache,
+    )
+    .unwrap();
     assert!(failed.diagnostics.all_failed());
     assert_eq!(failed.diagnostics.candidates, 1);
     assert_eq!(failed.diagnostics.parsed, 0);
     assert_eq!(failed.diagnostics.failures.len(), 1);
     assert_eq!(cache.stats().parsed_sources, 1);
 
-    let warm =
-        get_usage_from_paths_with_cache(&home.paths, TimeRange::All, opencode_only(), &mut cache)
-            .unwrap();
+    let warm = aggregate_usage_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        opencode_only(),
+        &mut cache,
+    )
+    .unwrap();
     assert_eq!(cache.stats().parsed_sources, 0);
     assert_eq!(warm.diagnostics, failed.diagnostics);
 
@@ -588,9 +650,13 @@ fn opencode_usage_schema_drift_is_diagnostic_and_fingerprint_cached() {
         .unwrap();
     drop(connection);
 
-    let partial =
-        get_usage_from_paths_with_cache(&home.paths, TimeRange::All, opencode_only(), &mut cache)
-            .unwrap();
+    let partial = aggregate_usage_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        opencode_only(),
+        &mut cache,
+    )
+    .unwrap();
     assert_eq!(cache.stats().parsed_sources, 1);
     assert!(partial.diagnostics.partially_failed());
     assert_eq!(partial.diagnostics.candidates, 1);
@@ -608,15 +674,23 @@ fn deterministic_sqlite_schema_failure_is_cached() {
         .unwrap();
 
     let mut cache = SummaryScanCache::new();
-    let cold =
-        get_usage_from_paths_with_cache(&home.paths, TimeRange::All, opencode_only(), &mut cache)
-            .unwrap();
+    let cold = aggregate_usage_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        opencode_only(),
+        &mut cache,
+    )
+    .unwrap();
     assert!(cold.diagnostics.all_failed());
     assert_eq!(cache.stats().parsed_sources, 1);
 
-    let warm =
-        get_usage_from_paths_with_cache(&home.paths, TimeRange::All, opencode_only(), &mut cache)
-            .unwrap();
+    let warm = aggregate_usage_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        opencode_only(),
+        &mut cache,
+    )
+    .unwrap();
     assert!(warm.diagnostics.all_failed());
     assert_eq!(warm.diagnostics, cold.diagnostics);
     assert_eq!(cache.stats().parsed_sources, 0);
@@ -630,7 +704,8 @@ fn cursor_tracking_failure_does_not_create_a_source_candidate() {
     std::fs::write(&home.paths.cursor_tracking_db, "not SQLite").unwrap();
 
     let result =
-        get_usage_from_paths_with_diagnostics(&home.paths, TimeRange::All, cursor_only()).unwrap();
+        aggregate_usage_from_paths_with_diagnostics(&home.paths, TimeRange::All, cursor_only())
+            .unwrap();
     assert_eq!(result.diagnostics.candidates, 0);
     assert_eq!(result.diagnostics.parsed, 0);
     assert_eq!(result.diagnostics.failures.len(), 1);
@@ -674,13 +749,17 @@ fn opencode_wal_change_invalidates_the_compact_cache() {
         .unwrap();
 
     let mut cache = SummaryScanCache::new();
-    let cold =
-        get_usage_from_paths_with_cache(&home.paths, TimeRange::All, opencode_only(), &mut cache)
-            .unwrap();
+    let cold = aggregate_usage_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        opencode_only(),
+        &mut cache,
+    )
+    .unwrap();
     assert_eq!(cache.stats().parsed_sources, 1);
     assert_eq!(cold.data.models["wal-model"]["input_tokens"], 10);
 
-    get_usage_from_paths_with_cache(&home.paths, TimeRange::All, opencode_only(), &mut cache)
+    aggregate_usage_from_paths_with_cache(&home.paths, TimeRange::All, opencode_only(), &mut cache)
         .unwrap();
     assert_eq!(cache.stats().parsed_sources, 0);
 
@@ -691,9 +770,13 @@ fn opencode_wal_change_invalidates_the_compact_cache() {
             params!["s2", r#"{"id":"wal-model"}"#, 1_780_757_090_000_i64, 20],
         )
         .unwrap();
-    let changed =
-        get_usage_from_paths_with_cache(&home.paths, TimeRange::All, opencode_only(), &mut cache)
-            .unwrap();
+    let changed = aggregate_usage_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        opencode_only(),
+        &mut cache,
+    )
+    .unwrap();
     assert_eq!(cache.stats().parsed_sources, 1);
     assert_eq!(changed.data.models["wal-model"]["input_tokens"], 30);
 }
@@ -707,7 +790,7 @@ fn aggregates_claude_session_from_paths() {
         &fixture_str("sessions/claude_code.jsonl"),
     );
 
-    let data = get_usage_from_paths(&home.paths, TimeRange::All).expect("aggregate claude");
+    let data = aggregate_usage_from_paths(&home.paths, TimeRange::All).expect("aggregate claude");
 
     assert!(
         data.models.contains_key("claude-sonnet-4-20250514"),
@@ -740,7 +823,7 @@ fn merges_multiple_providers_from_paths() {
         &fixture_str("sessions/gemini.jsonl"),
     );
 
-    let data = get_usage_from_paths(&home.paths, TimeRange::All).expect("aggregate multi");
+    let data = aggregate_usage_from_paths(&home.paths, TimeRange::All).expect("aggregate multi");
 
     assert!(data.models.contains_key("claude-sonnet-4-20250514"));
     assert!(
@@ -757,7 +840,7 @@ fn aggregates_grok_context_estimate_without_model_or_compaction_duplication() {
     let home = TempHome::new();
     home.put_grok_fixture_session("workspace", "grok-session");
 
-    let data = get_usage_from_paths(&home.paths, TimeRange::All).expect("aggregate Grok");
+    let data = aggregate_usage_from_paths(&home.paths, TimeRange::All).expect("aggregate Grok");
     let usage = data.models.get("grok-test").expect("resolved Grok model");
 
     assert_eq!(usage["input_tokens"], 0);
@@ -780,7 +863,7 @@ fn disabled_grok_provider_is_not_scanned() {
         ..ProvidersConfig::default()
     };
 
-    let data = get_usage_from_paths_with(&home.paths, TimeRange::All, providers)
+    let data = aggregate_usage_from_paths_with_providers(&home.paths, TimeRange::All, providers)
         .expect("aggregate with Grok disabled");
 
     assert!(data.models.is_empty());
@@ -807,7 +890,7 @@ fn disabled_provider_is_dropped_from_usage_rollup() {
         gemini: false,
         ..ProvidersConfig::default()
     };
-    let data = get_usage_from_paths_with(&home.paths, TimeRange::All, providers)
+    let data = aggregate_usage_from_paths_with_providers(&home.paths, TimeRange::All, providers)
         .expect("aggregate with gemini disabled");
 
     assert!(

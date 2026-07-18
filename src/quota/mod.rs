@@ -1,10 +1,13 @@
 //! Quota orchestration for the `usage` panels.
 //!
-//! Each provider (Claude / Codex) runs its own background worker
-//! ([`provider::spawn_quota_worker`]) that refreshes a shared snapshot every
-//! ~10s, seeded from an on-disk cache. The provider-specific fetch + token
-//! refresh lives in [`claude`] and [`wham`] (+ this module's [`CodexState`]);
-//! the shared HTTP + refresh primitives live in [`http`] and [`refresh`].
+//! Each supported provider (Claude / Codex / Copilot / Cursor) runs its own
+//! background worker ([`provider::spawn_quota_worker`]) that refreshes a shared
+//! snapshot on the configured cadence, seeded from an on-disk cache. The
+//! provider-specific fetch (and, for Claude / Codex, token refresh) lives in
+//! [`claude`], [`wham`] (+ this module's [`CodexState`]), [`copilot`], and
+//! [`cursor`]; the shared HTTP + refresh primitives live in [`http`] and
+//! [`refresh`]. The one-shot `vct quota` raw fetchers (`fetch_*_raw`) are the
+//! reusable core entry points; the CLI does the render.
 
 pub mod cache;
 pub mod claude;

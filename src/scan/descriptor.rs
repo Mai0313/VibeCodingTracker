@@ -7,10 +7,10 @@
 //! scan loop.
 
 use super::{CompactSink, ScanDiagnostics, scan_cached_files};
-use crate::models::TimeRange;
 use crate::config::ProvidersConfig;
 use crate::constants::FastHashSet;
 use crate::models::ExtensionType;
+use crate::models::TimeRange;
 use crate::pricing::TierThresholds;
 use crate::summary_cache::{SummaryCacheKey, SummaryScanCache};
 use crate::utils::{

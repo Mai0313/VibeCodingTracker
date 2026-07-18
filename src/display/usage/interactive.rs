@@ -483,7 +483,7 @@ pub fn display_usage_interactive_with_pool(
                 }
 
                 let collection = worker_pool.install(|| {
-                    crate::usage::get_usage_from_paths_with_cache_opts(
+                    crate::usage::aggregate_usage_from_paths_with_cache_opts(
                         &worker_paths,
                         time_range,
                         providers,

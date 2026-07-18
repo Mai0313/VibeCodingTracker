@@ -8,9 +8,9 @@
 //! table) and once kept per source directory (the per-provider footer) — see
 //! [`UsageData`] for why.
 
-use crate::models::TimeRange;
 use crate::config::ProvidersConfig;
 use crate::constants::{FastHashMap, FastHashSet, capacity};
+use crate::models::TimeRange;
 use crate::models::{
     CodeAnalysis, ExtensionType, PerProviderUsage, Provider, ProviderActiveDays, UsageResult,
 };
@@ -23,16 +23,16 @@ use crate::session::hermes::read_hermes_usage_contributions;
 use crate::session::opencode::read_opencode_usage_contributions;
 use crate::session::sqlite::is_cacheable_sqlite_failure;
 use crate::session::{
-    ParseMode, parse_session_file_as, read_cursor_usage, read_hermes_usage, read_opencode_usage,
+    ParseMode, parse_session_file_typed_as, read_cursor_usage, read_hermes_usage,
+    read_opencode_usage,
 };
 use crate::summary_cache::{
     CompactSourceSummary, SourceFingerprint, SummaryCacheKey, SummaryKind, SummaryScanCache,
 };
 use crate::utils::{
-    COPILOT_SESSION_MAX_DEPTH, GROK_SESSION_MAX_DEPTH, HelperPaths,
-    collect_files_with_max_depth, is_claude_session_file, is_codex_session_file,
-    is_copilot_session_file, is_gemini_session_file, is_grok_session_file, merge_usage_values,
-    resolve_paths,
+    COPILOT_SESSION_MAX_DEPTH, GROK_SESSION_MAX_DEPTH, HelperPaths, collect_files_with_max_depth,
+    is_claude_session_file, is_codex_session_file, is_copilot_session_file, is_gemini_session_file,
+    is_grok_session_file, merge_usage_values, resolve_paths,
 };
 use anyhow::Result;
 use rayon::prelude::*;
@@ -44,7 +44,7 @@ use std::sync::Arc;
 
 /// Aggregated token usage plus the per-provider active-day counts.
 ///
-/// Built only by [`get_usage_from_directories`]; all fields are public for the
+/// Built only by [`aggregate_usage_from_home`]; all fields are public for the
 /// display layer to read. Token totals are tracked two ways at once because the
 /// two views need different attribution: [`models`](UsageData::models) merges a
 /// shared model (e.g. `claude-sonnet-4-6` emitted by both Claude Code and
@@ -56,9 +56,9 @@ use std::sync::Arc;
 /// # Examples
 ///
 /// ```no_run
-/// use vibe_coding_tracker::{get_usage_from_directories, TimeRange};
+/// use vibe_coding_tracker::{aggregate_usage_from_home, TimeRange};
 ///
-/// let data = get_usage_from_directories(TimeRange::All)?;
+/// let data = aggregate_usage_from_home(TimeRange::All)?;
 /// // Total distinct days that contributed any usage, across all providers.
 /// println!("active days: {}", data.provider_days.total);
 /// # Ok::<(), anyhow::Error>(())
@@ -84,18 +84,16 @@ pub struct UsageData {
     pub stored_costs: StoredCosts,
 }
 
-// Usage and analysis share one unified scan-diagnostics type; these historical
-// names are kept as aliases so `usage::UsageCollectionDiagnostics` and the
-// per-source failure constructors keep working.
-pub use crate::scan::ScanDiagnostics as UsageCollectionDiagnostics;
-pub use crate::scan::ScanFailure as UsageCollectionFailure;
+// Usage and analysis both report the one unified scan-diagnostics type; it is
+// re-exported here so callers can reach it as `usage::ScanDiagnostics`.
+pub use crate::scan::{ScanDiagnostics, ScanFailure};
 
 /// Usage data paired with source-collection diagnostics.
 pub struct UsageCollection {
     /// Successfully collected usage.
     pub data: UsageData,
     /// Candidate, success, and failure counts from the scan.
-    pub diagnostics: UsageCollectionDiagnostics,
+    pub diagnostics: ScanDiagnostics,
 }
 
 /// Provider-authoritative per-model costs, kept **separate per provider**.
@@ -162,47 +160,47 @@ fn extract_conversation_usage_from_analysis(analysis: CodeAnalysis) -> FastHashM
 /// # Examples
 ///
 /// ```no_run
-/// use vibe_coding_tracker::{get_usage_from_directories, TimeRange};
+/// use vibe_coding_tracker::{aggregate_usage_from_home, TimeRange};
 ///
-/// let data = get_usage_from_directories(TimeRange::All)?;
+/// let data = aggregate_usage_from_home(TimeRange::All)?;
 /// for model in data.models.keys() {
 ///     println!("{model}");
 /// }
 /// # Ok::<(), anyhow::Error>(())
 /// ```
-pub fn get_usage_from_directories(time_range: TimeRange) -> Result<UsageData> {
-    get_usage_from_directories_with(time_range, ProvidersConfig::default())
+pub fn aggregate_usage_from_home(time_range: TimeRange) -> Result<UsageData> {
+    aggregate_usage_from_home_with_providers(time_range, ProvidersConfig::default())
 }
 
-/// [`get_usage_from_directories`] with explicit per-provider toggles (from
+/// [`aggregate_usage_from_home`] with explicit per-provider toggles (from
 /// `~/.vct/config.toml`). A disabled provider is skipped entirely.
-pub fn get_usage_from_directories_with(
+pub fn aggregate_usage_from_home_with_providers(
     time_range: TimeRange,
     providers: ProvidersConfig,
 ) -> Result<UsageData> {
-    get_usage_from_paths_with(&resolve_paths()?, time_range, providers)
+    aggregate_usage_from_paths_with_providers(&resolve_paths()?, time_range, providers)
 }
 
 /// Aggregates token usage from provider session directories rooted at an
 /// explicit [`HelperPaths`].
 ///
-/// The env-free, injectable counterpart of [`get_usage_from_directories`]:
+/// The env-free, injectable counterpart of [`aggregate_usage_from_home`]:
 /// every provider path comes from `paths` rather than the resolved home
 /// directory, so tests can point them at a temp tree and exercise the real
 /// aggregation without mutating process-global `HOME`. See
-/// [`get_usage_from_directories`] for the aggregation semantics.
+/// [`aggregate_usage_from_home`] for the aggregation semantics.
 ///
 /// # Errors
 ///
 /// Returns an error only under the same conditions as
-/// [`get_usage_from_directories`].
-pub fn get_usage_from_paths(paths: &HelperPaths, time_range: TimeRange) -> Result<UsageData> {
-    get_usage_from_paths_with(paths, time_range, ProvidersConfig::default())
+/// [`aggregate_usage_from_home`].
+pub fn aggregate_usage_from_paths(paths: &HelperPaths, time_range: TimeRange) -> Result<UsageData> {
+    aggregate_usage_from_paths_with_providers(paths, time_range, ProvidersConfig::default())
 }
 
-/// [`get_usage_from_paths`] with explicit provider toggles (the injectable core
+/// [`aggregate_usage_from_paths`] with explicit provider toggles (the injectable core
 /// used by the CLI once `config.toml` is loaded).
-pub fn get_usage_from_paths_with(
+pub fn aggregate_usage_from_paths_with_providers(
     paths: &HelperPaths,
     time_range: TimeRange,
     providers: ProvidersConfig,
@@ -389,25 +387,25 @@ pub struct UsageScanOptions {
 }
 
 /// Diagnostics-aware usage scan rooted at the current user's provider paths.
-pub fn get_usage_from_directories_with_diagnostics(
+pub fn aggregate_usage_from_home_with_diagnostics(
     time_range: TimeRange,
     providers: ProvidersConfig,
 ) -> Result<UsageCollection> {
-    get_usage_from_directories_with_diagnostics_opts(
+    aggregate_usage_from_home_with_diagnostics_opts(
         time_range,
         providers,
         &UsageScanOptions::default(),
     )
 }
 
-/// [`get_usage_from_directories_with_diagnostics`] with scan options.
-pub fn get_usage_from_directories_with_diagnostics_opts(
+/// [`aggregate_usage_from_home_with_diagnostics`] with scan options.
+pub fn aggregate_usage_from_home_with_diagnostics_opts(
     time_range: TimeRange,
     providers: ProvidersConfig,
     options: &UsageScanOptions,
 ) -> Result<UsageCollection> {
     let mut cache = SummaryScanCache::new();
-    get_usage_from_paths_with_cache_opts(
+    aggregate_usage_from_paths_with_cache_opts(
         &resolve_paths()?,
         time_range,
         providers,
@@ -417,13 +415,13 @@ pub fn get_usage_from_directories_with_diagnostics_opts(
 }
 
 /// Diagnostics-aware usage scan rooted at explicit provider paths.
-pub fn get_usage_from_paths_with_diagnostics(
+pub fn aggregate_usage_from_paths_with_diagnostics(
     paths: &HelperPaths,
     time_range: TimeRange,
     providers: ProvidersConfig,
 ) -> Result<UsageCollection> {
     let mut cache = SummaryScanCache::new();
-    get_usage_from_paths_with_cache(paths, time_range, providers, &mut cache)
+    aggregate_usage_from_paths_with_cache(paths, time_range, providers, &mut cache)
 }
 
 /// Incremental usage scan backed by a process-local compact summary cache.
@@ -431,13 +429,13 @@ pub fn get_usage_from_paths_with_diagnostics(
 /// Reusing `cache` across calls reparses only sources whose fingerprint
 /// changed. Cached schema failures retain their diagnostics, while metadata,
 /// open, and read errors are not inserted and are retried next time.
-pub fn get_usage_from_paths_with_cache(
+pub fn aggregate_usage_from_paths_with_cache(
     paths: &HelperPaths,
     time_range: TimeRange,
     providers: ProvidersConfig,
     cache: &mut SummaryScanCache,
 ) -> Result<UsageCollection> {
-    get_usage_from_paths_with_cache_opts(
+    aggregate_usage_from_paths_with_cache_opts(
         paths,
         time_range,
         providers,
@@ -446,18 +444,18 @@ pub fn get_usage_from_paths_with_cache(
     )
 }
 
-/// [`get_usage_from_paths_with_cache`] with scan options.
-pub fn get_usage_from_paths_with_cache_opts(
+/// [`aggregate_usage_from_paths_with_cache`] with scan options.
+pub fn aggregate_usage_from_paths_with_cache_opts(
     paths: &HelperPaths,
     time_range: TimeRange,
     providers: ProvidersConfig,
     cache: &mut SummaryScanCache,
     options: &UsageScanOptions,
 ) -> Result<UsageCollection> {
-    get_usage_from_paths_with_cache_inner(paths, time_range, providers, cache, options)
+    aggregate_usage_from_paths_with_cache_inner(paths, time_range, providers, cache, options)
 }
 
-fn get_usage_from_paths_with_cache_inner(
+fn aggregate_usage_from_paths_with_cache_inner(
     paths: &HelperPaths,
     time_range: TimeRange,
     providers: ProvidersConfig,
@@ -470,7 +468,7 @@ fn get_usage_from_paths_with_cache_inner(
     cache.ensure_tier_fingerprint(tiers.map_or(0, TierThresholds::fingerprint));
     cache.begin_scan();
     let mut accumulator = UsageAccumulator::default();
-    let mut diagnostics = UsageCollectionDiagnostics::default();
+    let mut diagnostics = ScanDiagnostics::default();
     let mut seen = FastHashSet::default();
 
     crate::scan::scan_all_cached_files(
@@ -539,7 +537,7 @@ fn scan_usage_database<F>(
     cache: &mut SummaryScanCache,
     seen: &mut FastHashSet<SummaryCacheKey>,
     accumulator: &mut UsageAccumulator,
-    diagnostics: &mut UsageCollectionDiagnostics,
+    diagnostics: &mut ScanDiagnostics,
     loader: F,
 ) where
     F: FnOnce() -> Result<DatabaseUsageRead>,
@@ -550,7 +548,7 @@ fn scan_usage_database<F>(
     let fingerprint = match fingerprint {
         Ok(value) => value,
         Err(error) => {
-            diagnostics.failures.push(UsageCollectionFailure {
+            diagnostics.failures.push(ScanFailure {
                 provider,
                 source: source.to_path_buf(),
                 error: error.to_string(),
@@ -597,7 +595,7 @@ fn scan_usage_database<F>(
         }
         Err(error) => {
             let failure = error.to_string();
-            diagnostics.failures.push(UsageCollectionFailure {
+            diagnostics.failures.push(ScanFailure {
                 provider,
                 source: source.to_path_buf(),
                 error: failure.clone(),
@@ -622,7 +620,7 @@ fn scan_cursor_usage_database(
     cache: &mut SummaryScanCache,
     seen: &mut FastHashSet<SummaryCacheKey>,
     accumulator: &mut UsageAccumulator,
-    diagnostics: &mut UsageCollectionDiagnostics,
+    diagnostics: &mut ScanDiagnostics,
 ) {
     let provider = ExtensionType::Cursor;
     let discovery = discover_cursor_store_dbs(chats_dir);
@@ -631,7 +629,7 @@ fn scan_cursor_usage_database(
     }
     for failure in discovery.failures {
         diagnostics.candidates += 1;
-        diagnostics.failures.push(UsageCollectionFailure {
+        diagnostics.failures.push(ScanFailure {
             provider,
             source: failure.path,
             error: failure.error,
@@ -642,7 +640,7 @@ fn scan_cursor_usage_database(
         match load_conversation_model_snapshot(tracking_db) {
             Ok(snapshot) => (snapshot.models, snapshot.fingerprint, true),
             Err(error) => {
-                diagnostics.failures.push(UsageCollectionFailure {
+                diagnostics.failures.push(ScanFailure {
                     provider,
                     source: tracking_db.to_path_buf(),
                     error: error.to_string(),
@@ -667,7 +665,7 @@ fn scan_cursor_usage_database(
         let fingerprint = match fingerprint {
             Ok(fingerprint) => fingerprint,
             Err(error) => {
-                diagnostics.failures.push(UsageCollectionFailure {
+                diagnostics.failures.push(ScanFailure {
                     provider,
                     source: store,
                     error: error.to_string(),
@@ -718,7 +716,7 @@ fn scan_cursor_usage_database(
             }
             Err(error) => {
                 let failure = error.to_string();
-                diagnostics.failures.push(UsageCollectionFailure {
+                diagnostics.failures.push(ScanFailure {
                     provider,
                     source: store.clone(),
                     error: failure.clone(),
@@ -891,7 +889,7 @@ where
     let file_results: Vec<(String, FastHashMap<String, Value>)> = files
         .into_par_iter()
         .filter_map(|file_info| {
-            match parse_session_file_as(&file_info.path, provider, ParseMode::UsageOnly) {
+            match parse_session_file_typed_as(&file_info.path, provider, ParseMode::UsageOnly) {
                 Ok(analysis) => {
                     let conversation_usage = extract_conversation_usage_from_analysis(analysis);
                     Some((file_info.modified_date, conversation_usage))

@@ -115,13 +115,13 @@ impl ParseWarningSummary {
 /// # Examples
 ///
 /// ```no_run
-/// use vibe_coding_tracker::parse_session_file;
+/// use vibe_coding_tracker::parse_session_file_to_value;
 ///
-/// let value = parse_session_file("session.jsonl")?;
+/// let value = parse_session_file_to_value("session.jsonl")?;
 /// assert!(value.is_object());
 /// # Ok::<(), anyhow::Error>(())
 /// ```
-pub fn parse_session_file<P: AsRef<Path>>(path: P) -> Result<Value> {
+pub fn parse_session_file_to_value<P: AsRef<Path>>(path: P) -> Result<Value> {
     let analysis = parse_session_file_typed(path)?;
     if analysis.records.is_empty() && analysis.extension_name.is_empty() {
         // Preserve historical behaviour: empty input → `{}` rather than a
@@ -133,7 +133,7 @@ pub fn parse_session_file<P: AsRef<Path>>(path: P) -> Result<Value> {
 
 /// Typed entry point that auto-detects the provider from file contents.
 ///
-/// Prefer [`parse_session_file_as`] whenever the caller already knows
+/// Prefer [`parse_session_file_typed_as`] whenever the caller already knows
 /// which provider the file belongs to (e.g. when walking
 /// `~/.claude/projects/*.jsonl` vs `~/.codex/sessions/*.jsonl`). Content-based
 /// detection is only intended for the CLI single-file path where the user
@@ -195,12 +195,12 @@ pub fn parse_session_file_typed_with_mode<P: AsRef<Path>>(
     path: P,
     mode: ParseMode,
 ) -> Result<CodeAnalysis> {
-    Ok(parse_session_file_detailed(path, mode)?.0)
+    Ok(parse_session_file_with_diagnostics(path, mode)?.0)
 }
 
 /// Single-file parse with a content-safe partial-failure summary for the CLI.
 #[doc(hidden)]
-pub fn parse_session_file_detailed<P: AsRef<Path>>(
+pub fn parse_session_file_with_diagnostics<P: AsRef<Path>>(
     path: P,
     mode: ParseMode,
 ) -> Result<(CodeAnalysis, SessionFileParseDiagnostics)> {
@@ -257,12 +257,12 @@ fn parse_session_file_typed_with_mode_internal(
 /// # Examples
 ///
 /// ```no_run
-/// use vibe_coding_tracker::session::parse_session_file_as;
+/// use vibe_coding_tracker::session::parse_session_file_typed_as;
 /// use vibe_coding_tracker::session::ParseMode;
 /// use vibe_coding_tracker::ExtensionType;
 ///
 /// // A file walked out of `~/.claude/projects` is known to be Claude Code.
-/// let analysis = parse_session_file_as(
+/// let analysis = parse_session_file_typed_as(
 ///     "session.jsonl",
 ///     ExtensionType::ClaudeCode,
 ///     ParseMode::Full,
@@ -270,18 +270,18 @@ fn parse_session_file_typed_with_mode_internal(
 /// # let _ = analysis;
 /// # Ok::<(), anyhow::Error>(())
 /// ```
-pub fn parse_session_file_as<P: AsRef<Path>>(
+pub fn parse_session_file_typed_as<P: AsRef<Path>>(
     path: P,
     provider: ExtensionType,
     mode: ParseMode,
 ) -> Result<CodeAnalysis> {
     let path = path.as_ref();
-    let parsed = parse_session_file_as_with_diagnostics(path, provider, mode, None)?;
+    let parsed = parse_session_file_typed_as_with_diagnostics(path, provider, mode, None)?;
     validate_parsed_source(path, &parsed.diagnostics)?;
     Ok(parsed.analysis)
 }
 
-pub(crate) fn parse_session_file_as_with_diagnostics(
+pub(crate) fn parse_session_file_typed_as_with_diagnostics(
     path: &Path,
     provider: ExtensionType,
     mode: ParseMode,
