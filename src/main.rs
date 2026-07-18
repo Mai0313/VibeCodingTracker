@@ -14,7 +14,6 @@ use clap::Parser;
 use comfy_table::{Cell, CellAlignment, Color, ContentArrangement, Table, presets::UTF8_FULL};
 use owo_colors::OwoColorize;
 use serde::Serialize;
-use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -36,10 +35,7 @@ use vibe_coding_tracker::get_version_info;
 use vibe_coding_tracker::pricing::{ModelPricingMap, fetch_model_pricing};
 use vibe_coding_tracker::scan::build_scan_pool;
 use vibe_coding_tracker::session::{ParseMode, parse_session_file_typed_with_mode_and_diagnostics};
-use vibe_coding_tracker::usage::{
-    CostSource, get_usage_from_directories_with_diagnostics_opts, resolve_model_cost,
-};
-use vibe_coding_tracker::utils::extract_token_counts;
+use vibe_coding_tracker::usage::get_usage_from_directories_with_diagnostics_opts;
 
 /// Parses the CLI and runs the selected subcommand.
 ///
@@ -235,8 +231,9 @@ fn run() -> Result<()> {
                 let pricing_map = pricing_for_scan(true);
                 let usage = usage_from_dirs(time_range, &scan_options(&pricing_map))?;
                 report_usage_collection(&usage.diagnostics)?;
-                let enriched_data = build_enriched_json(&usage.data, &pricing_map)?;
-                write_pretty_json(&enriched_data)?;
+                let priced =
+                    vibe_coding_tracker::usage::price_usage_data(&usage.data, &pricing_map);
+                write_pretty_json(&priced)?;
             } else if text {
                 let usage = usage_from_dirs(time_range, &scan_options(&pricing_for_scan(false)))?;
                 report_usage_collection(&usage.diagnostics)?;
@@ -476,199 +473,4 @@ fn report_usage_collection(
 /// The fallback editor when neither `$VISUAL` nor `$EDITOR` is set.
 fn default_editor() -> &'static str {
     if cfg!(windows) { "notepad" } else { "vi" }
-}
-
-/// Builds the `usage --json` payload, joining each model's token counts with
-/// its priced cost.
-///
-/// For every model it resolves the USD cost via
-/// [`resolve_model_cost`](vibe_coding_tracker::usage::resolve_model_cost) and
-/// emits a JSON object with `model`, `usage`, `cost_usd`, and (when a non-exact
-/// LiteLLM key was used) `matched_model`. OpenCode models without an exact
-/// price report OpenCode's own stored cost only for the OpenCode portion of a
-/// merged row rather than applying it to other providers with the same model.
-///
-/// # Errors
-///
-/// Returns an error only if a usage value cannot be serialized into the
-/// resulting JSON object.
-fn build_enriched_json(
-    usage_data: &vibe_coding_tracker::UsageData,
-    pricing_map: &ModelPricingMap,
-) -> Result<Vec<Value>> {
-    let mut enriched_data = Vec::with_capacity(usage_data.models.len());
-
-    for (model, usage) in usage_data.models.iter() {
-        let (cost, matched_model) = resolve_enriched_model_cost(model, usage_data, pricing_map)
-            .unwrap_or_else(|| price_usage_value(model, usage, pricing_map, CostSource::Litellm));
-
-        // Every row serializes the same flat token fields regardless of the
-        // provider's internal usage shape (Codex is nested internally).
-        let mut entry = json!({
-            "model": model,
-            "usage": vibe_coding_tracker::usage::normalize_usage_value(usage),
-            "cost_usd": cost
-        });
-
-        if let Some(matched) = &matched_model {
-            entry["matched_model"] = json!(matched);
-        }
-
-        enriched_data.push(entry);
-    }
-
-    Ok(enriched_data)
-}
-
-/// Resolves cost for one merged JSON row from provider-scoped usage pieces.
-fn resolve_enriched_model_cost(
-    model: &str,
-    usage_data: &vibe_coding_tracker::UsageData,
-    pricing_map: &ModelPricingMap,
-) -> Option<(f64, Option<String>)> {
-    let mut total_cost = 0.0;
-    let mut matched_model = None;
-    let mut found = false;
-
-    for usage in [
-        &usage_data.per_provider.claude,
-        &usage_data.per_provider.codex,
-        &usage_data.per_provider.copilot,
-        &usage_data.per_provider.gemini,
-    ] {
-        if let Some(raw_usage) = usage.get(model) {
-            found = true;
-            let (cost, matched) =
-                price_usage_value(model, raw_usage, pricing_map, CostSource::Litellm);
-            total_cost += cost;
-            if matched_model.is_none() {
-                matched_model = matched;
-            }
-        }
-    }
-
-    // OpenCode and Hermes prefer an exact LiteLLM match before their stored
-    // costs. Cursor is a local token estimate, so it uses an exact LiteLLM
-    // price when available and otherwise remains unpriced.
-    let stored = |m: &vibe_coding_tracker::constants::FastHashMap<String, f64>| {
-        m.get(model).copied().unwrap_or(0.0)
-    };
-    for (usage, source) in [
-        (&usage_data.per_provider.grok, CostSource::GrokGauge),
-        (
-            &usage_data.per_provider.opencode,
-            CostSource::OpenCodeStored(stored(&usage_data.stored_costs.opencode)),
-        ),
-        (
-            &usage_data.per_provider.cursor,
-            CostSource::OpenCodeStored(0.0),
-        ),
-        (
-            &usage_data.per_provider.hermes,
-            CostSource::HermesStored(stored(&usage_data.stored_costs.hermes)),
-        ),
-    ] {
-        if let Some(raw_usage) = usage.get(model) {
-            found = true;
-            let (cost, matched) = price_usage_value(model, raw_usage, pricing_map, source);
-            total_cost += cost;
-            if matched_model.is_none() {
-                matched_model = matched;
-            }
-        }
-    }
-
-    found.then_some((total_cost, matched_model))
-}
-
-/// Prices one raw usage value under `source`.
-fn price_usage_value(
-    model: &str,
-    usage: &Value,
-    pricing_map: &ModelPricingMap,
-    source: CostSource,
-) -> (f64, Option<String>) {
-    let counts = extract_token_counts(usage);
-    resolve_model_cost(model, &counts, pricing_map, source)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use vibe_coding_tracker::models::{PerProviderUsage, ProviderActiveDays, UsageResult};
-    use vibe_coding_tracker::pricing::{ModelPricing, clear_pricing_cache};
-
-    #[test]
-    fn json_rows_include_grok_source_cost() {
-        clear_pricing_cache();
-        let mut raw_pricing = HashMap::new();
-        raw_pricing.insert(
-            "shared-model".to_string(),
-            ModelPricing {
-                input_cost_per_token: 0.01,
-                ..Default::default()
-            },
-        );
-        let pricing_map = ModelPricingMap::new(raw_pricing);
-        let mut models = UsageResult::default();
-        models.insert("shared-model".to_string(), json!({"input_tokens": 200}));
-        let mut per_provider = PerProviderUsage::default();
-        per_provider
-            .claude
-            .insert("shared-model".to_string(), json!({"input_tokens": 100}));
-        per_provider
-            .grok
-            .insert("shared-model".to_string(), json!({"input_tokens": 100}));
-        let usage_data = vibe_coding_tracker::UsageData {
-            models,
-            per_provider,
-            provider_days: ProviderActiveDays::default(),
-            stored_costs: vibe_coding_tracker::usage::StoredCosts::default(),
-        };
-
-        let rows = build_enriched_json(&usage_data, &pricing_map).unwrap();
-
-        assert!((rows[0]["cost_usd"].as_f64().unwrap() - 2.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn json_rows_price_opencode_fallback_only_for_opencode_tokens() {
-        clear_pricing_cache();
-
-        let mut raw_pricing = HashMap::new();
-        raw_pricing.insert(
-            "shared".to_string(),
-            ModelPricing {
-                input_cost_per_token: 0.01,
-                ..Default::default()
-            },
-        );
-        let pricing_map = ModelPricingMap::new(raw_pricing);
-
-        let mut models = UsageResult::default();
-        models.insert("shared-pro".to_string(), json!({"input_tokens": 200}));
-
-        let mut per_provider = PerProviderUsage::default();
-        per_provider
-            .claude
-            .insert("shared-pro".to_string(), json!({"input_tokens": 100}));
-        per_provider
-            .opencode
-            .insert("shared-pro".to_string(), json!({"input_tokens": 100}));
-
-        let mut stored_costs = vibe_coding_tracker::usage::StoredCosts::default();
-        stored_costs.opencode.insert("shared-pro".to_string(), 7.0);
-
-        let usage_data = vibe_coding_tracker::UsageData {
-            models,
-            per_provider,
-            provider_days: ProviderActiveDays::default(),
-            stored_costs,
-        };
-
-        let rows = build_enriched_json(&usage_data, &pricing_map).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["cost_usd"].as_f64().unwrap(), 8.0);
-        assert_eq!(rows[0]["matched_model"].as_str().unwrap(), "shared");
-    }
 }

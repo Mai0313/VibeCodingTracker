@@ -3,6 +3,7 @@
 
 use crate::constants::FastHashMap;
 use crate::models::Provider;
+use serde::Serialize;
 
 /// Token usage data aggregated by model (across all dates)
 ///
@@ -17,7 +18,7 @@ pub type UsageResult = FastHashMap<String, serde_json::Value>;
 ///
 /// Used for calculating daily averages when data is aggregated by model only.
 /// Day counts are derived from file modification dates during processing.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ProviderActiveDays {
     /// Distinct active days observed for Claude Code.
     pub claude: usize,
@@ -54,7 +55,7 @@ pub struct ProviderActiveDays {
 /// layer can sum tokens and cost by source directory directly, with no
 /// prefix heuristics involved. It is populated in `usage::calculator` at
 /// the same time the global merged map is built.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize)]
 pub struct PerProviderUsage {
     /// Per-model usage attributed to Claude Code.
     pub claude: UsageResult,
