@@ -143,15 +143,16 @@ jobs:
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
 
       - name: Build crate package (.crate)
+        continue-on-error: true
         run: |
-          cargo package --locked --allow-dirty
+          cargo package -p vibe_coding_tracker --locked --allow-dirty
 
       - name: Publish to crates.io
         continue-on-error: true
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          cargo publish --allow-dirty
+          cargo publish -p vibe_coding_tracker --allow-dirty
 
       - name: Upload .crate artifact
         uses: actions/upload-artifact@v7

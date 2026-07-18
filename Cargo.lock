@@ -3231,6 +3231,56 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
+name = "vct-cli"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "clap",
+ "comfy-table",
+ "log",
+ "mimalloc",
+ "owo-colors",
+ "predicates",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "vct-test-support",
+ "vct-tui",
+ "vibe_coding_tracker",
+]
+
+[[package]]
+name = "vct-test-support"
+version = "0.0.0"
+dependencies = [
+ "chrono",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "vibe_coding_tracker",
+]
+
+[[package]]
+name = "vct-tui"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "comfy-table",
+ "criterion",
+ "crossterm 0.29.0",
+ "log",
+ "owo-colors",
+ "ratatui",
+ "rayon",
+ "serde_json",
+ "sysinfo",
+ "tempfile",
+ "vibe_coding_tracker",
+]
+
+[[package]]
 name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3242,14 +3292,9 @@ version = "0.0.0"
 dependencies = [
  "ahash",
  "anyhow",
- "assert_cmd",
  "base64",
  "bytecount",
  "chrono",
- "clap",
- "comfy-table",
- "criterion",
- "crossterm 0.29.0",
  "flate2",
  "home",
  "hostname",
@@ -3258,11 +3303,7 @@ dependencies = [
  "libc",
  "log",
  "lru 0.18.0",
- "mimalloc",
- "owo-colors",
  "percent-encoding",
- "predicates",
- "ratatui",
  "rayon",
  "regex",
  "reqwest",
@@ -3273,10 +3314,10 @@ dependencies = [
  "serde_json",
  "serial_test",
  "strsim",
- "sysinfo",
  "tar",
  "tempfile",
  "toml_edit",
+ "vct-test-support",
  "walkdir",
  "zip",
 ]
