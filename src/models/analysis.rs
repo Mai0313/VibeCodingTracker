@@ -256,7 +256,7 @@ pub struct AggregatedAnalysisRow {
 ///
 /// assert_eq!(ExtensionType::Copilot.to_string(), "Copilot-CLI");
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExtensionType {
     /// Anthropic Claude Code.
     ClaudeCode,

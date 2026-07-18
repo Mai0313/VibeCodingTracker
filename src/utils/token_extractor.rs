@@ -57,6 +57,25 @@ pub struct TokenCounts {
     pub above_cache_creation_1h: i64,
 }
 
+impl TokenCounts {
+    /// Whether any billed bucket carries a nonzero count.
+    ///
+    /// The single source of truth for "did this usage do anything" — used to
+    /// decide whether a date counts as active. New buckets added above must be
+    /// reflected here so no activity check silently misses them.
+    pub fn has_activity(&self) -> bool {
+        self.total != 0
+            || self.input_tokens != 0
+            || self.output_tokens != 0
+            || self.reasoning_tokens != 0
+            || self.cache_read != 0
+            || self.cache_creation != 0
+            || self.cache_creation_5m != 0
+            || self.cache_creation_1h != 0
+            || self.web_search_requests != 0
+    }
+}
+
 /// Extracts token counts from usage data in any provider format
 ///
 /// Supports two shapes:

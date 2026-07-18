@@ -1,13 +1,13 @@
 //! Process-local cache for compact usage and analysis scan contributions.
 
 use crate::cli::TimeRange;
-use crate::constants::FastHashMap;
+use crate::constants::{FastHashMap, FastHashSet};
 use crate::models::{AggregatedAnalysisRow, CodeAnalysis, ExtensionType, UsageResult};
 use crate::session::diagnostics::{UsageContribution, UsageTokenContribution};
 use crate::session::sqlite::{DatabaseFingerprint, append_suffix};
 use crate::utils::{extract_token_counts, merge_usage_values};
 use anyhow::Result;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -31,7 +31,7 @@ pub struct SummaryScanCacheStats {
 /// already-aggregated rows.
 #[derive(Default)]
 pub struct SummaryScanCache {
-    entries: HashMap<SummaryCacheKey, CachedSourceSummary>,
+    entries: FastHashMap<SummaryCacheKey, CachedSourceSummary>,
     parsed_sources: usize,
     total_parsed_sources: usize,
     tier_fingerprint: u64,
@@ -105,7 +105,11 @@ impl SummaryScanCache {
         );
     }
 
-    pub(crate) fn retain_kinds(&mut self, seen: &HashSet<SummaryCacheKey>, kinds: &[SummaryKind]) {
+    pub(crate) fn retain_kinds(
+        &mut self,
+        seen: &FastHashSet<SummaryCacheKey>,
+        kinds: &[SummaryKind],
+    ) {
         self.entries
             .retain(|key, _| !kinds.contains(&key.kind) || seen.contains(key));
     }
@@ -113,11 +117,10 @@ impl SummaryScanCache {
     /// Keeps existing entries for a provider when source discovery was partial.
     pub(crate) fn preserve_provider_keys(
         &self,
-        seen: &mut HashSet<SummaryCacheKey>,
+        seen: &mut FastHashSet<SummaryCacheKey>,
         kind: SummaryKind,
         provider: ExtensionType,
     ) {
-        let provider = provider.to_string();
         seen.extend(
             self.entries
                 .keys()
@@ -139,7 +142,7 @@ pub(crate) enum SummaryKind {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct SummaryCacheKey {
     kind: SummaryKind,
-    provider: String,
+    provider: ExtensionType,
     path: PathBuf,
     cutoff: Option<String>,
 }
@@ -153,7 +156,7 @@ impl SummaryCacheKey {
     ) -> Self {
         Self {
             kind,
-            provider: provider.to_string(),
+            provider,
             path: path.to_path_buf(),
             cutoff: time_range
                 .cutoff_date()
@@ -408,16 +411,7 @@ fn merge_model_usage(result: &mut UsageResult, model: String, usage: serde_json:
 }
 
 fn meaningful_usage(value: &serde_json::Value) -> bool {
-    let counts = extract_token_counts(value);
-    counts.total != 0
-        || counts.input_tokens != 0
-        || counts.output_tokens != 0
-        || counts.reasoning_tokens != 0
-        || counts.cache_read != 0
-        || counts.cache_creation != 0
-        || counts.cache_creation_5m != 0
-        || counts.cache_creation_1h != 0
-        || counts.web_search_requests != 0
+    extract_token_counts(value).has_activity()
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 use crate::cli::TimeRange;
 use crate::config::ProvidersConfig;
-use crate::constants::{FastHashMap, capacity};
+use crate::constants::{FastHashMap, FastHashSet, capacity};
 use crate::models::{CodeAnalysis, ExtensionType, ProviderActiveDays};
 use crate::session::cursor::{
     discover_cursor_store_dbs, load_conversation_model_snapshot,
@@ -481,7 +481,7 @@ pub fn aggregate_sessions_by_model_from_paths_with_cache(
     cache.begin_scan();
     let mut projection = AnalysisProjection::new();
     let mut diagnostics = AnalysisCollectionDiagnostics::default();
-    let mut seen = HashSet::new();
+    let mut seen = FastHashSet::default();
 
     if providers.claude {
         crate::scan::scan_cached_files(
@@ -587,7 +587,7 @@ fn scan_opencode_analysis(
     paths: &HelperPaths,
     time_range: TimeRange,
     cache: &mut SummaryScanCache,
-    seen: &mut HashSet<SummaryCacheKey>,
+    seen: &mut FastHashSet<SummaryCacheKey>,
     projection: &mut AnalysisProjection,
     diagnostics: &mut AnalysisCollectionDiagnostics,
 ) {
@@ -666,7 +666,7 @@ fn scan_cursor_analysis(
     paths: &HelperPaths,
     time_range: TimeRange,
     cache: &mut SummaryScanCache,
-    seen: &mut HashSet<SummaryCacheKey>,
+    seen: &mut FastHashSet<SummaryCacheKey>,
     projection: &mut AnalysisProjection,
     diagnostics: &mut AnalysisCollectionDiagnostics,
 ) {
