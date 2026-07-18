@@ -7,9 +7,10 @@
 //! created lazily on the first record, so a command that logs nothing (e.g. a
 //! successful `vct version`) leaves `~/.vct` untouched.
 //!
-//! [`init`] installs the logger (default level `warn`) plus a panic hook that
-//! restores the terminal and records the panic. [`apply`] later reconfigures the
-//! level from `[logging]` in the user config and prunes stale files.
+//! [`init`] installs the logger (default level `warn`). Terminal-restore-on-panic
+//! is a presentation concern, so the CLI binary installs that hook separately.
+//! [`apply`] later reconfigures the level from `[logging]` in the user config and
+//! prunes stale files.
 
 use crate::config::{LogLevel, LoggingConfig};
 use crate::utils::now_rfc3339_utc_nanos;
