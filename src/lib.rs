@@ -31,7 +31,6 @@ pub mod cli;
 pub mod config;
 pub mod constants;
 pub mod display;
-pub mod fetch;
 pub mod logging;
 pub mod models;
 pub mod pricing;

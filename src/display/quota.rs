@@ -1,4 +1,4 @@
-//! Renderers for `vct fetch`.
+//! Renderers for `vct quota`.
 //!
 //! The provider quota APIs return nested JSON dicts. `--json` (the default)
 //! pretty-prints the body as-is; `--text` and `--table` flatten it to
@@ -9,7 +9,7 @@ use comfy_table::{Cell, CellAlignment, Color, ContentArrangement, Table, presets
 use serde_json::Value;
 
 /// Prints the response body as pretty JSON, or verbatim if it is not JSON.
-pub fn print_fetch_json(body: &str) {
+pub fn print_quota_json(body: &str) {
     match serde_json::from_str::<Value>(body) {
         Ok(value) => match serde_json::to_string_pretty(&value) {
             Ok(pretty) => println!("{pretty}"),
@@ -21,7 +21,7 @@ pub fn print_fetch_json(body: &str) {
 
 /// Prints the response as flattened `key: value` lines, or verbatim if it is
 /// not JSON.
-pub fn display_fetch_text(body: &str) {
+pub fn display_quota_text(body: &str) {
     match serde_json::from_str::<Value>(body) {
         Ok(value) => {
             let mut rows = Vec::new();
@@ -36,7 +36,7 @@ pub fn display_fetch_text(body: &str) {
 
 /// Prints the response as a flattened Field/Value table, or the raw body
 /// verbatim if it is not JSON.
-pub fn display_fetch_table(body: &str) {
+pub fn display_quota_table(body: &str) {
     let value = match serde_json::from_str::<Value>(body) {
         Ok(v) => v,
         Err(_) => {

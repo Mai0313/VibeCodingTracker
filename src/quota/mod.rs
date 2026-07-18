@@ -11,6 +11,7 @@ pub mod claude;
 pub mod codex_session;
 pub mod copilot;
 pub mod cursor;
+pub mod fetch;
 pub mod http;
 pub mod provider;
 pub mod refresh;

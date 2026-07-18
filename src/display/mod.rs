@@ -6,5 +6,5 @@
 
 pub mod analysis;
 pub mod common;
-pub mod fetch;
+pub mod quota;
 pub mod usage;

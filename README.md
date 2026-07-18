@@ -148,7 +148,7 @@ Commands:
   usage       Display token usage statistics
   version     Display version information
   update      Update to the latest version from GitHub releases
-  fetch       Fetch a provider's raw quota/usage API response
+  quota       Fetch a provider's raw quota/usage API response
   config      Show or edit the persistent settings file (~/.vct/config.toml)
   help        Print this message or the help of the given subcommand(s)
 ```
@@ -298,7 +298,7 @@ The tool automatically scans these directories:
 - `~/.hermes/state.db` (Hermes — SQLite database, honors `$HERMES_HOME`; `usage` only)
 - `$GROK_HOME/sessions/*/*/signals.json` (Grok CLI — defaults to `~/.grok`; sibling `updates.jsonl` supplies `analysis` data)
 
-Grok `usage` is one point-in-time local context estimate: vct records `signals.json`'s `contextTokensUsed` as cache-read tokens and estimates cost at the model's cache-read price. It is not cumulative billed usage. `analysis` reconstructs completed Read / Write / Edit / Bash / TodoWrite operations from the sibling `updates.jsonl`. Grok does not support quota panels or `vct fetch`.
+Grok `usage` is one point-in-time local context estimate: vct records `signals.json`'s `contextTokensUsed` as cache-read tokens and estimates cost at the model's cache-read price. It is not cumulative billed usage. `analysis` reconstructs completed Read / Write / Edit / Bash / TodoWrite operations from the sibling `updates.jsonl`. Grok does not support quota panels or `vct quota`.
 
 For noninteractive `usage` and `analysis` scans, vct exits with an error when every discovered source fails. If only some sources fail, it keeps the successful results and prints one diagnostic summary to stderr. The TUI stays best-effort and preserves its last successful payload instead.
 
@@ -509,11 +509,13 @@ The binary version is produced at build time by `build.rs` from `git describe`, 
 
 ---
 
-## Fetch Command
+## Quota Command
 
 **Print a provider's raw quota/usage API response — no parsing, no aggregation.**
 
 Calls the same quota endpoint the `usage` dashboard uses (Claude / Codex / Copilot / Cursor) exactly once and prints the raw body, so you can inspect the exact API shape or sanity-check your credentials. It reads each provider's stored credentials and does **not** refresh tokens: if a token is expired, re-auth with that provider's own CLI (`claude` / `codex` / `copilot` / `cursor-agent`).
+
+> The previous name `vct fetch` is kept as a hidden alias, so existing scripts keep working.
 
 ### Flags
 
@@ -528,16 +530,16 @@ Calls the same quota endpoint the `usage` dashboard uses (Claude / Codex / Copil
 
 ```bash
 # Raw JSON (default)
-vct fetch claude
-vct fetch codex
-vct fetch copilot
-vct fetch cursor
+vct quota claude
+vct quota codex
+vct quota copilot
+vct quota cursor
 
 # Flattened plain text
-vct fetch codex --text
+vct quota codex --text
 
 # Flattened key/value table
-vct fetch copilot --table
+vct quota copilot --table
 ```
 
 > [!NOTE]

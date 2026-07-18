@@ -129,7 +129,7 @@ fn run() -> Result<()> {
                 }
                 None => {
                     // Settings are only needed for the batch (all-sessions) path,
-                    // so `analysis FILE`, `version`, `fetch`, etc. never read or
+                    // so `analysis FILE`, `version`, `quota`, etc. never read or
                     // create `~/.vct/config.toml`.
                     let config = vibe_coding_tracker::config::load();
                     vibe_coding_tracker::logging::apply(&config.logging);
@@ -322,13 +322,13 @@ fn run() -> Result<()> {
             }
         }
 
-        Commands::Fetch {
+        Commands::Quota {
             provider,
             text,
             table,
             ..
         } => {
-            vibe_coding_tracker::fetch::run(provider, text, table)?;
+            vibe_coding_tracker::quota::fetch::run(provider, text, table)?;
         }
 
         Commands::Config { action } => {

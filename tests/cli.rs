@@ -367,10 +367,10 @@ fn test_version_help() {
 }
 
 #[test]
-fn test_fetch_help() {
+fn test_quota_help() {
     Command::cargo_bin("vibe_coding_tracker")
         .unwrap()
-        .arg("fetch")
+        .arg("quota")
         .arg("--help")
         .assert()
         .success()
@@ -378,6 +378,18 @@ fn test_fetch_help() {
         .stdout(predicate::str::contains("codex"))
         .stdout(predicate::str::contains("copilot"))
         .stdout(predicate::str::contains("cursor"));
+}
+
+#[test]
+fn test_fetch_alias_still_works() {
+    // `fetch` is kept as a hidden alias of `quota` for back-compat.
+    Command::cargo_bin("vibe_coding_tracker")
+        .unwrap()
+        .arg("fetch")
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("claude"));
 }
 
 #[test]
@@ -499,20 +511,20 @@ fn single_file_summary_projection_is_parse_mode_invariant() {
 }
 
 #[test]
-fn test_fetch_requires_provider() {
+fn test_quota_requires_provider() {
     Command::cargo_bin("vibe_coding_tracker")
         .unwrap()
-        .arg("fetch")
+        .arg("quota")
         .assert()
         .failure()
         .stderr(predicate::str::contains("required").or(predicate::str::contains("PROVIDER")));
 }
 
 #[test]
-fn test_fetch_invalid_provider() {
+fn test_quota_invalid_provider() {
     Command::cargo_bin("vibe_coding_tracker")
         .unwrap()
-        .arg("fetch")
+        .arg("quota")
         .arg("not-a-provider")
         .assert()
         .failure()
@@ -520,7 +532,7 @@ fn test_fetch_invalid_provider() {
 }
 
 #[test]
-fn test_fetch_multiple_output_formats() {
+fn test_quota_multiple_output_formats() {
     // clap rejects the combination before any network call is made.
     for combo in [
         ["--json", "--text"],
@@ -529,7 +541,7 @@ fn test_fetch_multiple_output_formats() {
     ] {
         Command::cargo_bin("vibe_coding_tracker")
             .unwrap()
-            .arg("fetch")
+            .arg("quota")
             .arg("claude")
             .args(combo)
             .assert()
