@@ -5,9 +5,15 @@
 //! parts that do not depend on which feature is folding: the unified
 //! [`ScanDiagnostics`] result type and the dedicated scan thread pool.
 
+pub(crate) mod compact;
+
+pub(crate) use compact::{
+    CompactSink, LoadedCompactSummary, fold_cached, fold_loaded, scan_cached_files,
+};
+
 use crate::models::ExtensionType;
 use anyhow::Result;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// One independently readable source that could not be collected.
 ///
@@ -52,6 +58,15 @@ impl ScanDiagnostics {
     /// Whether successful results coexist with one or more failures.
     pub fn partially_failed(&self) -> bool {
         self.parsed > 0 && self.has_failures()
+    }
+
+    /// Records one failed source.
+    pub(crate) fn record_failure(&mut self, provider: ExtensionType, source: &Path, error: String) {
+        self.failures.push(ScanFailure {
+            provider,
+            source: source.to_path_buf(),
+            error,
+        });
     }
 
     /// Sorts failures into the canonical, deterministic order:
