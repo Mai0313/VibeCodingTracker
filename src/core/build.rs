@@ -16,9 +16,28 @@ fn main() {
     println!("cargo:rustc-env=BUILD_RUST_VERSION={}", rust_version);
     println!("cargo:rustc-env=BUILD_CARGO_VERSION={}", cargo_version);
 
-    // Re-run build script if git state changes
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/index");
+    // Re-run the build script when git state changes. This crate is a workspace
+    // member, so its manifest dir is not the repo root; resolve the repository's
+    // real git dir (also a file->dir indirection under a git worktree) instead
+    // of the nonexistent `<crate>/.git`.
+    if let Some(git_dir) = git_dir() {
+        println!("cargo:rerun-if-changed={git_dir}/HEAD");
+        println!("cargo:rerun-if-changed={git_dir}/index");
+    }
+}
+
+/// Absolute path to the repository's git dir (worktree-aware), or `None`
+/// outside a git checkout (e.g. a packaged `.crate`).
+fn git_dir() -> Option<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--absolute-git-dir"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let dir = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    (!dir.is_empty()).then_some(dir)
 }
 
 fn get_git_version(base_version: &str) -> String {
