@@ -22,17 +22,19 @@ pub struct PricedUsageScan {
     pub collection: UsageCollection,
     /// The pricing map used for tier classification; empty when the fetch failed.
     pub pricing: ModelPricingMap,
-    /// Whether the pricing fetch degraded to an empty map (costs unavailable).
-    pub pricing_failed: bool,
+    /// The pricing-fetch error when it degraded to an empty map (costs
+    /// unavailable), so the caller can surface the concrete cause; `None` on
+    /// success.
+    pub pricing_error: Option<String>,
 }
 
 /// Fetches pricing, derives the context-tier thresholds, and scans usage.
 ///
 /// A failed pricing fetch is logged and downgraded to an empty map (the scan
 /// still runs, classifying every request at the base rate) rather than aborting;
-/// the returned [`PricedUsageScan::pricing_failed`] lets the caller surface that
-/// however it wants. The scan runs on `pool` so it never touches Rayon's global
-/// pool.
+/// the returned [`PricedUsageScan::pricing_error`] carries the concrete cause so
+/// the caller can surface it however it wants. The scan runs on `pool` so it
+/// never touches Rayon's global pool.
 ///
 /// # Errors
 ///
@@ -43,11 +45,11 @@ pub fn scan_usage_priced(
     providers: ProvidersConfig,
     pool: &rayon::ThreadPool,
 ) -> Result<PricedUsageScan> {
-    let (pricing, pricing_failed) = match fetch_model_pricing() {
-        Ok(map) => (map, false),
+    let (pricing, pricing_error) = match fetch_model_pricing() {
+        Ok(map) => (map, None),
         Err(e) => {
             log::warn!("failed to fetch pricing data: {e}; costs unavailable");
-            (ModelPricingMap::new(HashMap::new()), true)
+            (ModelPricingMap::new(HashMap::new()), Some(e.to_string()))
         }
     };
     let options = UsageScanOptions {
@@ -59,6 +61,6 @@ pub fn scan_usage_priced(
     Ok(PricedUsageScan {
         collection,
         pricing,
-        pricing_failed,
+        pricing_error,
     })
 }
