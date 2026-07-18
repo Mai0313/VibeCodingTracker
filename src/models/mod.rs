@@ -7,6 +7,7 @@
 //! shapes; `provider` carries the [`Provider`] discriminator. All items are
 //! re-exported at the module root for convenience.
 
+pub mod aggregate;
 pub mod analysis;
 pub mod claude;
 pub mod codex;
@@ -18,6 +19,7 @@ pub mod provider;
 pub mod quota;
 pub mod usage;
 
+pub use self::aggregate::*;
 pub use self::analysis::*;
 pub use self::claude::*;
 pub use self::codex::*;

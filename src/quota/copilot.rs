@@ -290,7 +290,7 @@ fn fetch_copilot_user(client: &Client, api_url: &str, token: &str, now: i64) -> 
 ///
 /// Returns an error if the config is missing, has no usable token, or the
 /// request cannot be sent.
-pub(crate) fn fetch_copilot_raw(client: &Client) -> Result<(u16, String)> {
+pub fn fetch_copilot_raw(client: &Client) -> Result<(u16, String)> {
     fetch_copilot_raw_from(client, &get_copilot_config_path()?)
 }
 

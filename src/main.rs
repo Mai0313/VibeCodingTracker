@@ -14,10 +14,11 @@ use clap::Parser;
 use comfy_table::{Cell, CellAlignment, Color, ContentArrangement, Table, presets::UTF8_FULL};
 use owo_colors::OwoColorize;
 use serde::Serialize;
-use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::Arc;
-use vibe_coding_tracker::cli::{Cli, Commands, ConfigAction, resolve_time_range_with_default};
+use vibe_coding_tracker::cli::{
+    Cli, Commands, ConfigAction, QuotaProvider, resolve_time_range_with_default,
+};
 
 // mimalloc is opt-in behind the `mimalloc` cargo feature. The default build
 // uses the system allocator because mimalloc's lazy purge retains freed
@@ -32,10 +33,9 @@ use vibe_coding_tracker::display::usage::{
     display_usage_interactive_with_pool, display_usage_table, display_usage_text,
 };
 use vibe_coding_tracker::get_version_info;
-use vibe_coding_tracker::pricing::{ModelPricingMap, fetch_model_pricing};
 use vibe_coding_tracker::scan::build_scan_pool;
 use vibe_coding_tracker::session::{ParseMode, parse_session_file_detailed};
-use vibe_coding_tracker::usage::get_usage_from_directories_with_diagnostics_opts;
+use vibe_coding_tracker::usage::scan_usage_priced;
 
 /// Parses the CLI and runs the selected subcommand.
 ///
@@ -61,6 +61,10 @@ fn main() -> Result<()> {
     // Install the file logger (default level `warn`) before anything can log or
     // panic. It writes only to `~/.vct/logs/`, never the terminal.
     vibe_coding_tracker::logging::init();
+    // Terminal-restore-on-panic is a presentation concern owned by the display
+    // layer, so the binary installs it here rather than from core `logging`.
+    // Installed early so a panic before the TUI starts still restores cleanly.
+    vibe_coding_tracker::display::common::tui::ensure_terminal_panic_hook();
 
     if matches!(
         std::env::args_os().nth(1).and_then(|arg| arg.into_string().ok()),
@@ -200,47 +204,28 @@ fn run() -> Result<()> {
             // preference decides. The TUI's `m` toggle persists back to config.
             let merge = merge_providers || config.usage.merge_models;
             let scan_pool = Arc::new(build_scan_pool(config.performance.resolved_scan_threads())?);
-            // Pricing is fetched before the scan so per-request context-tier
-            // classification has its thresholds; a failed fetch degrades to
-            // base-rate classification rather than aborting the scan.
-            let pricing_for_scan = |warn_to_stderr: bool| match fetch_model_pricing() {
-                Ok(map) => map,
-                Err(e) => {
-                    log::warn!("failed to fetch pricing data: {e}; costs unavailable");
-                    if warn_to_stderr {
-                        eprintln!(
-                            "Warning: Failed to fetch pricing data: {}. Costs will be unavailable.",
-                            e
-                        );
-                    }
-                    ModelPricingMap::new(HashMap::new())
-                }
-            };
-            let scan_options =
-                |pricing_map: &ModelPricingMap| vibe_coding_tracker::usage::UsageScanOptions {
-                    tiers: Some(Arc::new(pricing_map.tier_thresholds())),
-                };
-            let usage_from_dirs = |tr, options: &vibe_coding_tracker::usage::UsageScanOptions| {
-                scan_pool.install(|| {
-                    get_usage_from_directories_with_diagnostics_opts(tr, config.providers, options)
-                })
-            };
 
             if json {
-                let pricing_map = pricing_for_scan(true);
-                let usage = usage_from_dirs(time_range, &scan_options(&pricing_map))?;
-                report_usage_collection(&usage.diagnostics)?;
-                let priced =
-                    vibe_coding_tracker::usage::price_usage_data(&usage.data, &pricing_map);
+                let scan = scan_usage_priced(time_range, config.providers, &scan_pool)?;
+                if scan.pricing_failed {
+                    eprintln!(
+                        "Warning: Failed to fetch pricing data. Costs will be unavailable."
+                    );
+                }
+                report_usage_collection(&scan.collection.diagnostics)?;
+                let priced = vibe_coding_tracker::usage::price_usage_data(
+                    &scan.collection.data,
+                    &scan.pricing,
+                );
                 write_pretty_json(&priced)?;
             } else if text {
-                let usage = usage_from_dirs(time_range, &scan_options(&pricing_for_scan(false)))?;
-                report_usage_collection(&usage.diagnostics)?;
-                display_usage_text(&usage.data, merge);
+                let scan = scan_usage_priced(time_range, config.providers, &scan_pool)?;
+                report_usage_collection(&scan.collection.diagnostics)?;
+                display_usage_text(&scan.collection.data, merge);
             } else if table {
-                let usage = usage_from_dirs(time_range, &scan_options(&pricing_for_scan(false)))?;
-                report_usage_collection(&usage.diagnostics)?;
-                display_usage_table(&usage.data, merge);
+                let scan = scan_usage_priced(time_range, config.providers, &scan_pool)?;
+                report_usage_collection(&scan.collection.diagnostics)?;
+                display_usage_table(&scan.collection.data, merge);
             } else {
                 // `config` is not used after this, so hand the panel list off by
                 // move; read both cadences first so the borrows end before the
@@ -324,7 +309,7 @@ fn run() -> Result<()> {
             table,
             ..
         } => {
-            vibe_coding_tracker::quota::fetch::run(provider, text, table)?;
+            run_quota(provider, text, table)?;
         }
 
         Commands::Config { action } => {
@@ -398,6 +383,60 @@ fn run_config(action: ConfigAction) -> Result<()> {
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Runs `vct quota <provider>`: fetch the raw body and render it.
+///
+/// `text` / `table` pick the output format; neither set means pretty JSON.
+/// Dispatching the clap [`QuotaProvider`] onto core's per-provider raw fetchers
+/// is CLI glue, so it lives here rather than in the (display-free) core `quota`
+/// module.
+///
+/// # Errors
+///
+/// Returns an error if credentials are missing, the request fails, or the API
+/// answers a non-2xx status (the body is still printed first; a 401/403 appends
+/// the provider's login hint).
+fn run_quota(provider: QuotaProvider, text: bool, table: bool) -> Result<()> {
+    use vibe_coding_tracker::display::quota::{
+        display_quota_table, display_quota_text, print_quota_json,
+    };
+    use vibe_coding_tracker::quota::{
+        CLAUDE_LOGIN_HINT, CODEX_LOGIN_HINT, COPILOT_LOGIN_HINT, CURSOR_LOGIN_HINT, claude, copilot,
+        cursor, http, wham,
+    };
+
+    let client = http::build_client()?;
+    let (status, body) = match provider {
+        QuotaProvider::Claude => claude::fetch_claude_raw(&client),
+        QuotaProvider::Codex => wham::fetch_codex_raw(&client),
+        QuotaProvider::Copilot => copilot::fetch_copilot_raw(&client),
+        QuotaProvider::Cursor => cursor::fetch_cursor_raw(&client),
+    }?;
+
+    if text {
+        display_quota_text(&body);
+    } else if table {
+        display_quota_table(&body);
+    } else {
+        print_quota_json(&body);
+    }
+
+    if !(200..300).contains(&status) {
+        let (name, hint) = match provider {
+            QuotaProvider::Claude => ("claude", CLAUDE_LOGIN_HINT),
+            QuotaProvider::Codex => ("codex", CODEX_LOGIN_HINT),
+            QuotaProvider::Copilot => ("copilot", COPILOT_LOGIN_HINT),
+            QuotaProvider::Cursor => ("cursor", CURSOR_LOGIN_HINT),
+        };
+        // A rejected token (401/403) is the one case a re-login fixes, so only
+        // then append the login hint; other statuses (429, 5xx, ...) just report.
+        if status == 401 || status == 403 {
+            bail!("HTTP {status} from {name} ({hint})");
+        }
+        bail!("HTTP {status} from {name}");
     }
     Ok(())
 }

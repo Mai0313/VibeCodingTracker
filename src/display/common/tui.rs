@@ -415,7 +415,7 @@ fn panic_delegates_to_previous(tui_active: bool, restore_terminal: bool) -> bool
 /// Owner-thread panics restore the terminal before the previous hook runs. A
 /// caught background panic does not delegate while the TUI remains active, so
 /// it cannot print through the alternate screen.
-pub(crate) fn ensure_terminal_panic_hook() {
+pub fn ensure_terminal_panic_hook() {
     TERMINAL_PANIC_HOOK.call_once(|| {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {

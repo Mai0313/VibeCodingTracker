@@ -346,7 +346,7 @@ pub fn call_reset_credit_details(
 ///
 /// Returns an error if `auth.json` is missing, has no access token, or the
 /// request cannot be sent.
-pub(crate) fn fetch_codex_raw(client: &reqwest::blocking::Client) -> Result<(u16, String)> {
+pub fn fetch_codex_raw(client: &reqwest::blocking::Client) -> Result<(u16, String)> {
     let auth_path = crate::utils::resolve_paths()?.codex_dir.join("auth.json");
     fetch_codex_raw_from(client, WHAM_URL, &auth_path)
 }

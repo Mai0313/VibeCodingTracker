@@ -101,7 +101,7 @@ fn parse_claude_oauth(body: &str) -> Option<ClaudeOauth> {
 ///
 /// Returns an error if the credentials file is missing, has no access token, or
 /// the request cannot be sent.
-pub(crate) fn fetch_claude_raw(client: &Client) -> Result<(u16, String)> {
+pub fn fetch_claude_raw(client: &Client) -> Result<(u16, String)> {
     fetch_claude_raw_from(client, CLAUDE_USAGE_URL, &get_claude_credentials_path()?)
 }
 
