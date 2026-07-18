@@ -2,7 +2,7 @@
 
 use comfy_table::Color as TableColor;
 use ratatui::style::Color as RatatuiColor;
-use vibe_coding_tracker::models::Provider;
+use vct_core::models::Provider;
 
 /// Per-provider display configuration paired with the provider's totals.
 ///

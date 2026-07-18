@@ -13,8 +13,10 @@ repository = "https://github.com/Mai0313/VibeCodingTracker"
 
 [workspace.dependencies]
 # Internal crates (path deps, never published)
-vibe_coding_tracker = { path = "src/core" }
-vct-tui = { path = "src/tui" }
+# Internal path deps carry a `version` so crates.io can resolve them when
+# publishing; the release workflow stamps the real version across all members.
+vct-core = { path = "src/core", version = "0.0.0" }
+vct-tui = { path = "src/tui", version = "0.0.0" }
 vct-test-support = { path = "src/test-support" }
 
 # External dependencies (single source of truth for versions)

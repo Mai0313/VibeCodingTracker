@@ -10,7 +10,7 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
-vibe_coding_tracker = { workspace = true }
+vct-core = { workspace = true }
 chrono = { workspace = true }
 rusqlite = { workspace = true }
 serde_json = { workspace = true }

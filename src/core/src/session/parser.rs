@@ -115,7 +115,7 @@ impl ParseWarningSummary {
 /// # Examples
 ///
 /// ```no_run
-/// use vibe_coding_tracker::parse_session_file_to_value;
+/// use vct_core::parse_session_file_to_value;
 ///
 /// let value = parse_session_file_to_value("session.jsonl")?;
 /// assert!(value.is_object());
@@ -154,7 +154,7 @@ pub fn parse_session_file_to_value<P: AsRef<Path>>(path: P) -> Result<Value> {
 /// # Examples
 ///
 /// ```no_run
-/// use vibe_coding_tracker::parse_session_file_typed;
+/// use vct_core::parse_session_file_typed;
 ///
 /// let analysis = parse_session_file_typed("session.jsonl")?;
 /// println!("provider: {}", analysis.extension_name);
@@ -182,8 +182,8 @@ pub fn parse_session_file_typed<P: AsRef<Path>>(path: P) -> Result<CodeAnalysis>
 /// # Examples
 ///
 /// ```no_run
-/// use vibe_coding_tracker::session::parse_session_file_typed_with_mode;
-/// use vibe_coding_tracker::session::ParseMode;
+/// use vct_core::session::parse_session_file_typed_with_mode;
+/// use vct_core::session::ParseMode;
 ///
 /// let analysis =
 ///     parse_session_file_typed_with_mode("session.jsonl", ParseMode::UsageOnly)?;
@@ -257,9 +257,9 @@ fn parse_session_file_typed_with_mode_internal(
 /// # Examples
 ///
 /// ```no_run
-/// use vibe_coding_tracker::session::parse_session_file_typed_as;
-/// use vibe_coding_tracker::session::ParseMode;
-/// use vibe_coding_tracker::ExtensionType;
+/// use vct_core::session::parse_session_file_typed_as;
+/// use vct_core::session::ParseMode;
+/// use vct_core::ExtensionType;
 ///
 /// // A file walked out of `~/.claude/projects` is known to be Claude Code.
 /// let analysis = parse_session_file_typed_as(

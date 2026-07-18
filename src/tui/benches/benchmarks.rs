@@ -4,20 +4,20 @@ use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
-use vct_tui::display::common::render_loading_frame;
-use vct_tui::display::usage::UsageFrameBenchmark;
-use vibe_coding_tracker::config::ProvidersConfig;
-use vibe_coding_tracker::constants::FastHashMap;
-use vibe_coding_tracker::models::ExtensionType;
-use vibe_coding_tracker::models::TimeRange;
-use vibe_coding_tracker::pricing::{ModelPricingMap, normalize_model_name};
-use vibe_coding_tracker::scan::build_scan_pool;
-use vibe_coding_tracker::session::{
+use vct_core::config::ProvidersConfig;
+use vct_core::constants::FastHashMap;
+use vct_core::models::ExtensionType;
+use vct_core::models::TimeRange;
+use vct_core::pricing::{ModelPricingMap, normalize_model_name};
+use vct_core::scan::build_scan_pool;
+use vct_core::session::{
     ParseMode, parse_session_file_typed_as, parse_session_file_typed_with_mode,
 };
-use vibe_coding_tracker::summary_cache::SummaryScanCache;
-use vibe_coding_tracker::usage::aggregator::aggregate_usage_from_paths_with_cache;
-use vibe_coding_tracker::utils::{HelperPaths, resolve_paths_from_home};
+use vct_core::summary_cache::SummaryScanCache;
+use vct_core::usage::aggregator::aggregate_usage_from_paths_with_cache;
+use vct_core::utils::{HelperPaths, resolve_paths_from_home};
+use vct_tui::display::common::render_loading_frame;
+use vct_tui::display::usage::UsageFrameBenchmark;
 
 /// Absolute path to a file under the repo's `tests/fixtures/` directory.
 fn fixture(name: &str) -> PathBuf {
@@ -53,19 +53,19 @@ fn benchmark_pricing_lookup(c: &mut Criterion) {
     let mut pricing_data = HashMap::new();
     pricing_data.insert(
         "claude-3-sonnet".to_string(),
-        vibe_coding_tracker::pricing::ModelPricing::default(),
+        vct_core::pricing::ModelPricing::default(),
     );
     pricing_data.insert(
         "gpt-4-turbo".to_string(),
-        vibe_coding_tracker::pricing::ModelPricing::default(),
+        vct_core::pricing::ModelPricing::default(),
     );
     pricing_data.insert(
         "gemini-pro".to_string(),
-        vibe_coding_tracker::pricing::ModelPricing::default(),
+        vct_core::pricing::ModelPricing::default(),
     );
     pricing_data.insert(
         "copilot-gpt-4".to_string(),
-        vibe_coding_tracker::pricing::ModelPricing::default(),
+        vct_core::pricing::ModelPricing::default(),
     );
 
     let pricing_map = ModelPricingMap::new(pricing_data);
@@ -91,15 +91,15 @@ fn benchmark_line_counting(c: &mut Criterion) {
         .collect::<String>();
 
     c.bench_function("count_lines short (3 lines)", |b| {
-        b.iter(|| vibe_coding_tracker::utils::count_lines(black_box(short_text)))
+        b.iter(|| vct_core::utils::count_lines(black_box(short_text)))
     });
 
     c.bench_function("count_lines medium (100 lines)", |b| {
-        b.iter(|| vibe_coding_tracker::utils::count_lines(black_box(&medium_text)))
+        b.iter(|| vct_core::utils::count_lines(black_box(&medium_text)))
     });
 
     c.bench_function("count_lines long (10k lines)", |b| {
-        b.iter(|| vibe_coding_tracker::utils::count_lines(black_box(&long_text)))
+        b.iter(|| vct_core::utils::count_lines(black_box(&long_text)))
     });
 }
 
@@ -123,11 +123,7 @@ fn benchmark_file_parsing(c: &mut Criterion) {
             group.bench_with_input(
                 BenchmarkId::new("parse_session_file_to_value", name),
                 &path_buf,
-                |b, p| {
-                    b.iter(|| {
-                        vibe_coding_tracker::session::parse_session_file_to_value(black_box(p))
-                    })
-                },
+                |b, p| b.iter(|| vct_core::session::parse_session_file_to_value(black_box(p))),
             );
         }
     }
@@ -297,7 +293,7 @@ fn benchmark_summary_scan_cache(c: &mut Criterion) {
 
 fn benchmark_format_detection(c: &mut Criterion) {
     use serde_json::json;
-    use vibe_coding_tracker::session::detector::detect_extension_type;
+    use vct_core::session::detector::detect_extension_type;
 
     let claude_data = vec![
         json!({"parentUuid": null, "type": "user", "message": {"role": "user"}}),
@@ -333,7 +329,7 @@ fn benchmark_format_detection(c: &mut Criterion) {
 // ========== Cache Performance Benchmarks ==========
 
 fn benchmark_cache_operations(c: &mut Criterion) {
-    use vibe_coding_tracker::cache::global_cache;
+    use vct_core::cache::global_cache;
 
     let test_path = fixture("sessions/claude_code.jsonl");
 
@@ -427,7 +423,7 @@ fn benchmark_hashmap_performance(c: &mut Criterion) {
 
 fn benchmark_usage_aggregation(c: &mut Criterion) {
     use serde_json::json;
-    use vibe_coding_tracker::models::usage::UsageResult;
+    use vct_core::models::usage::UsageResult;
 
     c.bench_function("aggregate usage 100 models", |b| {
         b.iter(|| {
@@ -483,7 +479,7 @@ fn benchmark_batch_analysis(c: &mut Criterion) {
 
             // Simulate batch processing
             for (path, _name) in paths {
-                let _ = vibe_coding_tracker::session::parse_session_file_to_value(black_box(&path));
+                let _ = vct_core::session::parse_session_file_to_value(black_box(&path));
             }
         })
     });
@@ -493,7 +489,7 @@ fn benchmark_batch_analysis(c: &mut Criterion) {
 
 fn benchmark_json_serialization(c: &mut Criterion) {
     use serde_json::json;
-    use vibe_coding_tracker::models::usage::UsageResult;
+    use vct_core::models::usage::UsageResult;
 
     // Create sample data
     let mut result = UsageResult::default();

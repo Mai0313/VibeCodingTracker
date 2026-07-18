@@ -4,9 +4,9 @@
 //! path-injected resolver directly, so the test needs no `HOME` mutation and no
 //! `#[serial]` — it runs in parallel and reads no machine files.
 
+use vct_core::models::QuotaSource;
+use vct_core::quota::codex_session::latest_session_rate_limits_in;
 use vct_test_support::{TempHome, fixture_str};
-use vibe_coding_tracker::models::QuotaSource;
-use vibe_coding_tracker::quota::codex_session::latest_session_rate_limits_in;
 
 #[test]
 fn session_fallback_picks_newest_rate_limits() {

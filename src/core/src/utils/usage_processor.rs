@@ -16,7 +16,7 @@ use serde_json::Value;
 ///
 /// ```
 /// use serde_json::{json, Map};
-/// use vibe_coding_tracker::utils::accumulate_i64_fields;
+/// use vct_core::utils::accumulate_i64_fields;
 ///
 /// let mut target = Map::new();
 /// target.insert("input".into(), json!(10));
@@ -54,7 +54,7 @@ pub fn accumulate_i64_fields(
 ///
 /// ```
 /// use serde_json::{json, Map};
-/// use vibe_coding_tracker::utils::accumulate_nested_object;
+/// use vct_core::utils::accumulate_nested_object;
 ///
 /// let mut target = Map::new();
 /// target.insert("usage".into(), json!({ "input": 100 }));

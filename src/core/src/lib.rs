@@ -75,8 +75,8 @@ pub const CARGO_VERSION: &str = env!("BUILD_CARGO_VERSION");
 /// # Examples
 ///
 /// ```
-/// let info = vibe_coding_tracker::get_version_info();
-/// assert_eq!(info.version, vibe_coding_tracker::VERSION);
+/// let info = vct_core::get_version_info();
+/// assert_eq!(info.version, vct_core::VERSION);
 /// ```
 pub fn get_version_info() -> VersionInfo {
     VersionInfo {

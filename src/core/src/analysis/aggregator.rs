@@ -180,8 +180,8 @@ impl Serialize for AnalysisDataset {
 /// # Examples
 ///
 /// ```no_run
-/// use vibe_coding_tracker::analysis::aggregate_sessions_by_model;
-/// use vibe_coding_tracker::TimeRange;
+/// use vct_core::analysis::aggregate_sessions_by_model;
+/// use vct_core::TimeRange;
 ///
 /// let data = aggregate_sessions_by_model(TimeRange::All)?;
 /// for row in &data.rows {

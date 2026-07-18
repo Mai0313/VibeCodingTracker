@@ -2,8 +2,8 @@
 
 use crate::display::usage::averages::{build_usage_summary, merge_rows_by_base_model};
 use std::collections::HashMap;
-use vibe_coding_tracker::pricing::{ModelPricingMap, fetch_model_pricing};
-use vibe_coding_tracker::usage::UsageData;
+use vct_core::pricing::{ModelPricingMap, fetch_model_pricing};
+use vct_core::usage::UsageData;
 
 /// Prints token usage to stdout as one `model: $cost` line per model.
 ///

@@ -26,7 +26,7 @@ pub fn now_rfc3339_utc_nanos() -> String {
 /// # Examples
 ///
 /// ```
-/// use vibe_coding_tracker::utils::parse_iso_timestamp;
+/// use vct_core::utils::parse_iso_timestamp;
 ///
 /// assert_eq!(parse_iso_timestamp("1970-01-01T00:00:01Z"), 1_000);
 /// assert_eq!(parse_iso_timestamp(""), 0);

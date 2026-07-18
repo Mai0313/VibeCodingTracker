@@ -11,7 +11,7 @@ use std::sync::RwLock;
 /// # Examples
 ///
 /// ```
-/// use vibe_coding_tracker::utils::format_number;
+/// use vct_core::utils::format_number;
 ///
 /// assert_eq!(format_number(0), "0");
 /// assert_eq!(format_number(1234), "1,234");
@@ -67,7 +67,7 @@ where
 /// # Examples
 ///
 /// ```
-/// use vibe_coding_tracker::utils::format_compact;
+/// use vct_core::utils::format_compact;
 ///
 /// assert_eq!(format_compact(999), "999");
 /// assert_eq!(format_compact(1_000), "1.00K");
@@ -125,7 +125,7 @@ pub fn format_compact(n: i64) -> String {
 /// # Examples
 ///
 /// ```
-/// use vibe_coding_tracker::utils::format_cost;
+/// use vct_core::utils::format_cost;
 ///
 /// assert_eq!(format_cost(0.0), "$0.00");
 /// assert_eq!(format_cost(1234.5), "$1,234.50");
@@ -148,7 +148,7 @@ pub fn format_cost(cost: f64) -> String {
 /// # Examples
 ///
 /// ```
-/// use vibe_coding_tracker::utils::format_cost_compact;
+/// use vct_core::utils::format_cost_compact;
 ///
 /// assert_eq!(format_cost_compact(74.18), "$74.18");
 /// assert_eq!(format_cost_compact(4114.28), "$4.11K");
@@ -204,7 +204,7 @@ pub fn get_current_date() -> String {
 /// # Examples
 ///
 /// ```
-/// use vibe_coding_tracker::utils::format_duration_until;
+/// use vct_core::utils::format_duration_until;
 ///
 /// assert_eq!(format_duration_until(100, 100), "now");
 /// assert_eq!(format_duration_until(100 + 13 * 60, 100), "13m");

@@ -87,9 +87,9 @@ impl PriceLevel {
 /// # Examples
 ///
 /// ```
-/// use vibe_coding_tracker::pricing::ModelPricing;
-/// use vibe_coding_tracker::pricing::calculate_cost;
-/// use vibe_coding_tracker::utils::TokenCounts;
+/// use vct_core::pricing::ModelPricing;
+/// use vct_core::pricing::calculate_cost;
+/// use vct_core::utils::TokenCounts;
 ///
 /// let pricing = ModelPricing {
 ///     input_cost_per_token: 3e-6,

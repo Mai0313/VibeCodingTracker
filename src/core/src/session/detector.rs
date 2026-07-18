@@ -63,8 +63,8 @@ pub(crate) fn record_inspections() -> usize {
 ///
 /// ```
 /// use serde_json::json;
-/// use vibe_coding_tracker::session::detector::detect_extension_type;
-/// use vibe_coding_tracker::ExtensionType;
+/// use vct_core::session::detector::detect_extension_type;
+/// use vct_core::ExtensionType;
 ///
 /// let records = [json!({ "parentUuid": "abc", "type": "user" })];
 /// assert_eq!(detect_extension_type(&records).unwrap(), ExtensionType::ClaudeCode);
@@ -99,8 +99,8 @@ pub fn detect_extension_type(data: &[Value]) -> Result<ExtensionType> {
 ///
 /// ```
 /// use serde_json::json;
-/// use vibe_coding_tracker::session::detector::classify_records;
-/// use vibe_coding_tracker::ExtensionType;
+/// use vct_core::session::detector::classify_records;
+/// use vct_core::ExtensionType;
 ///
 /// // A marker-less Claude metadata preamble stays indeterminate...
 /// let preamble = [json!({ "type": "file-history-snapshot" })];

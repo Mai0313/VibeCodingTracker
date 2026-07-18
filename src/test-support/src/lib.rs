@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
-use vibe_coding_tracker::utils::{HelperPaths, resolve_paths_from_home};
+use vct_core::utils::{HelperPaths, resolve_paths_from_home};
 
 /// Absolute path to a file under the repo's `tests/fixtures/` directory.
 ///

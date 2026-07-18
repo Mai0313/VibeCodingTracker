@@ -8,12 +8,16 @@ description = "Terminal (ratatui / comfy-table) presentation layer for Vibe Codi
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
+readme = "../../README.md"
+# The benchmark references fixtures at the repo root, so it is not
+# self-contained inside a published `.crate`.
+exclude = ["benches"]
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
-vibe_coding_tracker = { workspace = true }
+vct-core = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 comfy-table = { workspace = true }

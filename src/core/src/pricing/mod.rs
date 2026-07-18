@@ -64,7 +64,7 @@ pub use tiers::{TierClassifier, TierThresholds};
 /// # Examples
 ///
 /// ```no_run
-/// use vibe_coding_tracker::pricing::fetch_model_pricing;
+/// use vct_core::pricing::fetch_model_pricing;
 ///
 /// let pricing = fetch_model_pricing()?;
 /// let opus = pricing.get("claude-opus-4");

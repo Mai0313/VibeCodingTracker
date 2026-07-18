@@ -3,7 +3,7 @@
 //! Emits one machine-parseable `key=value` line per model, suited for piping
 //! into scripts.
 
-use vibe_coding_tracker::analysis::AnalysisData;
+use vct_core::analysis::AnalysisData;
 
 /// Displays aggregated analysis data as plain text (one model per line, key=value pairs).
 ///

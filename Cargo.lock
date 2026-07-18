@@ -3245,49 +3245,13 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "vct-core",
  "vct-test-support",
  "vct-tui",
- "vibe_coding_tracker",
 ]
 
 [[package]]
-name = "vct-test-support"
-version = "0.0.0"
-dependencies = [
- "chrono",
- "rusqlite",
- "serde_json",
- "tempfile",
- "vibe_coding_tracker",
-]
-
-[[package]]
-name = "vct-tui"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "chrono",
- "comfy-table",
- "criterion",
- "crossterm 0.29.0",
- "log",
- "owo-colors",
- "ratatui",
- "rayon",
- "serde_json",
- "sysinfo",
- "tempfile",
- "vibe_coding_tracker",
-]
-
-[[package]]
-name = "version_check"
-version = "0.9.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "vibe_coding_tracker"
+name = "vct-core"
 version = "0.0.0"
 dependencies = [
  "ahash",
@@ -3321,6 +3285,42 @@ dependencies = [
  "walkdir",
  "zip",
 ]
+
+[[package]]
+name = "vct-test-support"
+version = "0.0.0"
+dependencies = [
+ "chrono",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "vct-core",
+]
+
+[[package]]
+name = "vct-tui"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "comfy-table",
+ "criterion",
+ "crossterm 0.29.0",
+ "log",
+ "owo-colors",
+ "ratatui",
+ "rayon",
+ "serde_json",
+ "sysinfo",
+ "tempfile",
+ "vct-core",
+]
+
+[[package]]
+name = "version_check"
+version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "wait-timeout"

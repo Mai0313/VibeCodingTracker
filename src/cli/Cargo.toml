@@ -4,17 +4,20 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
-description = "Command-line entry point for Vibe Coding Tracker (the `vct` binary)"
+description = "Vibe Coding Tracker - AI coding assistant telemetry/usage CLI + TUI (the `vibe_coding_tracker` / `vct` binary)"
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
+readme = "../../README.md"
+# The assert_cmd binary test is not self-contained inside a published `.crate`.
+exclude = ["tests"]
 
 [[bin]]
 name = "vibe_coding_tracker"
 path = "src/main.rs"
 
 [dependencies]
-vibe_coding_tracker = { workspace = true }
+vct-core = { workspace = true }
 vct-tui = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }

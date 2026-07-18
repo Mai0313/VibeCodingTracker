@@ -12,7 +12,7 @@ use std::path::PathBuf;
 // `TimeRange` and the period-flag resolvers are core domain logic (no clap
 // types), so they live in `models::filter`; re-exported here for the clap layer
 // and library callers that reach them through `cli`.
-pub use vibe_coding_tracker::models::resolve_time_range_with_default;
+pub use vct_core::models::resolve_time_range_with_default;
 
 /// A provider whose raw quota/usage API response `vct quota` can print.
 #[derive(ValueEnum, Debug, Clone, Copy)]
@@ -30,7 +30,7 @@ pub enum QuotaProvider {
 /// Vibe Coding Tracker - AI coding assistant usage analyzer.
 #[derive(Parser, Debug)]
 #[command(name = "vibe_coding_tracker")]
-#[command(author, version = vibe_coding_tracker::VERSION, about, long_about = None)]
+#[command(author, version = vct_core::VERSION, about, long_about = None)]
 pub struct Cli {
     /// The subcommand to run.
     #[command(subcommand)]

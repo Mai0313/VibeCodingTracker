@@ -188,8 +188,8 @@ fn accumulate_analysis_provider(stats: &mut AnalysisProviderStats, rows: &[Aggre
 /// # Examples
 ///
 /// ```
-/// use vibe_coding_tracker::analysis::AggregatedAnalysisRow;
-/// use vibe_coding_tracker::analysis::convert_to_analysis_rows;
+/// use vct_core::analysis::AggregatedAnalysisRow;
+/// use vct_core::analysis::convert_to_analysis_rows;
 ///
 /// let aggregated = vec![AggregatedAnalysisRow {
 ///     model: "claude-sonnet-4-6".to_string(),

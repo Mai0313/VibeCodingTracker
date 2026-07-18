@@ -9,9 +9,9 @@ use crate::display::usage::averages::{
 use comfy_table::{Cell, CellAlignment, Color, Table, presets::UTF8_FULL};
 use owo_colors::OwoColorize;
 use std::collections::HashMap;
-use vibe_coding_tracker::pricing::{ModelPricingMap, fetch_model_pricing};
-use vibe_coding_tracker::usage::UsageData;
-use vibe_coding_tracker::utils::format_number;
+use vct_core::pricing::{ModelPricingMap, fetch_model_pricing};
+use vct_core::usage::UsageData;
+use vct_core::utils::format_number;
 
 /// Prints token usage to stdout as a colored per-model table plus a
 /// per-provider totals footer.

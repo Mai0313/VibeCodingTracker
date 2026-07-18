@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 const GITHUB_API_RELEASES_URL: &str =
     "https://api.github.com/repos/Mai0313/VibeCodingTracker/releases/latest";
 /// `User-Agent` header value (`<crate>/<version>`), required by the GitHub API.
-const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
+// Pinned to the product name (not the crate name, which is `vct-core`) so the
+// GitHub API sees a stable identifier across the workspace rename.
+const USER_AGENT: &str = concat!("vibe_coding_tracker/", env!("CARGO_PKG_VERSION"));
 
 /// A GitHub release, deserialized from the Releases API.
 #[derive(Debug, Deserialize, Serialize)]

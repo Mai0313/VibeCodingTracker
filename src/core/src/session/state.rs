@@ -82,7 +82,7 @@ impl SessionParseState {
     /// # Examples
     ///
     /// ```
-    /// use vibe_coding_tracker::session::state::SessionParseState;
+    /// use vct_core::session::state::SessionParseState;
     ///
     /// let mut state = SessionParseState::new();
     /// state.folder_path = "/repo".to_string();

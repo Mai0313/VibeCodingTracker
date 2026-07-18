@@ -252,7 +252,7 @@ pub struct AggregatedAnalysisRow {
 /// # Examples
 ///
 /// ```
-/// use vibe_coding_tracker::models::ExtensionType;
+/// use vct_core::models::ExtensionType;
 ///
 /// assert_eq!(ExtensionType::Copilot.to_string(), "Copilot-CLI");
 /// ```
