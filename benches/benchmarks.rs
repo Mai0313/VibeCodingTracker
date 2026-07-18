@@ -11,10 +11,11 @@ use vibe_coding_tracker::display::common::render_loading_frame;
 use vibe_coding_tracker::display::usage::UsageFrameBenchmark;
 use vibe_coding_tracker::models::ExtensionType;
 use vibe_coding_tracker::pricing::{ModelPricingMap, normalize_model_name};
+use vibe_coding_tracker::scan::build_scan_pool;
 use vibe_coding_tracker::session::{
     ParseMode, parse_session_file_as, parse_session_file_typed_with_mode,
 };
-use vibe_coding_tracker::summary_cache::{SummaryScanCache, build_scan_pool};
+use vibe_coding_tracker::summary_cache::SummaryScanCache;
 use vibe_coding_tracker::usage::calculator::get_usage_from_paths_with_cache;
 use vibe_coding_tracker::utils::{HelperPaths, resolve_paths_from_home};
 

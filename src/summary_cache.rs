@@ -12,15 +12,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-/// Builds the dedicated Rayon pool used by CLI scans.
-pub fn build_scan_pool(threads: usize) -> Result<rayon::ThreadPool> {
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(threads.max(1))
-        .thread_name(|index| format!("vct-scan-{index}"))
-        .build()
-        .map_err(Into::into)
-}
-
 /// Observable cache statistics used by tests and diagnostic logging.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SummaryScanCacheStats {

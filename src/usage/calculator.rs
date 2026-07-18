@@ -41,7 +41,7 @@ use anyhow::Result;
 use rayon::prelude::*;
 use serde_json::Value;
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 /// Aggregated token usage plus the per-provider active-day counts.
@@ -85,44 +85,11 @@ pub struct UsageData {
     pub stored_costs: StoredCosts,
 }
 
-/// One independently readable usage source that could not be collected.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UsageCollectionFailure {
-    /// Provider selected from the source directory or database.
-    pub provider: ExtensionType,
-    /// File, database, or Cursor collection root that failed.
-    pub source: PathBuf,
-    /// Content-safe error summary.
-    pub error: String,
-}
-
-/// Candidate, success, and failure counts for a usage scan.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct UsageCollectionDiagnostics {
-    /// Independently readable sources discovered by the scan.
-    pub candidates: usize,
-    /// Sources parsed or read successfully, including valid blank sources.
-    pub parsed: usize,
-    /// Complete and partial failures in deterministic provider/source order.
-    pub failures: Vec<UsageCollectionFailure>,
-}
-
-impl UsageCollectionDiagnostics {
-    /// Whether at least one source failed or was only partially understood.
-    pub fn has_failures(&self) -> bool {
-        !self.failures.is_empty()
-    }
-
-    /// Whether candidates existed but none could be read successfully.
-    pub fn all_failed(&self) -> bool {
-        self.candidates > 0 && self.parsed == 0
-    }
-
-    /// Whether successful results coexist with one or more failures.
-    pub fn partially_failed(&self) -> bool {
-        self.parsed > 0 && self.has_failures()
-    }
-}
+// Usage and analysis share one unified scan-diagnostics type; these historical
+// names are kept as aliases so `usage::UsageCollectionDiagnostics` and the
+// per-source failure constructors keep working.
+pub use crate::scan::ScanDiagnostics as UsageCollectionDiagnostics;
+pub use crate::scan::ScanFailure as UsageCollectionFailure;
 
 /// Usage data paired with source-collection diagnostics.
 pub struct UsageCollection {
@@ -617,13 +584,7 @@ fn get_usage_from_paths_with_cache_inner(
     }
 
     cache.retain_kinds(&seen, &[SummaryKind::File, SummaryKind::UsageDatabase]);
-    diagnostics.failures.sort_by(|left, right| {
-        left.provider
-            .scan_rank()
-            .cmp(&right.provider.scan_rank())
-            .then_with(|| left.source.cmp(&right.source))
-            .then_with(|| left.error.cmp(&right.error))
-    });
+    diagnostics.finalize();
     Ok(UsageCollection {
         data: accumulator.finish(),
         diagnostics,
