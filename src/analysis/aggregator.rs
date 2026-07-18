@@ -12,8 +12,7 @@ use crate::session::parser::parse_session_file_as_with_diagnostics;
 use crate::session::sqlite::is_cacheable_sqlite_failure;
 use crate::session::state::ParseMode;
 use crate::summary_cache::{
-    CachedSourceSummary, CompactSourceSummary, SourceFingerprint, SummaryCacheKey, SummaryKind,
-    SummaryScanCache,
+    CompactSourceSummary, SourceFingerprint, SummaryCacheKey, SummaryKind, SummaryScanCache,
 };
 use crate::utils::directory::{FileInfo, collect_files_with_max_depth_diagnostics};
 use crate::utils::{
@@ -484,7 +483,7 @@ pub fn aggregate_sessions_by_model_from_paths_with_cache(
     let mut seen = HashSet::new();
 
     if providers.claude {
-        scan_analysis_files(
+        crate::scan::scan_cached_files(
             &paths.claude_session_dir,
             ExtensionType::ClaudeCode,
             is_claude_session_file,
@@ -494,10 +493,11 @@ pub fn aggregate_sessions_by_model_from_paths_with_cache(
             &mut seen,
             &mut projection,
             &mut diagnostics,
+            None,
         )?;
     }
     if providers.codex {
-        scan_analysis_files(
+        crate::scan::scan_cached_files(
             &paths.codex_session_dir,
             ExtensionType::Codex,
             is_codex_session_file,
@@ -507,10 +507,11 @@ pub fn aggregate_sessions_by_model_from_paths_with_cache(
             &mut seen,
             &mut projection,
             &mut diagnostics,
+            None,
         )?;
     }
     if providers.copilot {
-        scan_analysis_files(
+        crate::scan::scan_cached_files(
             &paths.copilot_session_dir,
             ExtensionType::Copilot,
             is_copilot_session_file,
@@ -520,10 +521,11 @@ pub fn aggregate_sessions_by_model_from_paths_with_cache(
             &mut seen,
             &mut projection,
             &mut diagnostics,
+            None,
         )?;
     }
     if providers.gemini {
-        scan_analysis_files(
+        crate::scan::scan_cached_files(
             &paths.gemini_session_dir,
             ExtensionType::Gemini,
             is_gemini_session_file,
@@ -533,10 +535,11 @@ pub fn aggregate_sessions_by_model_from_paths_with_cache(
             &mut seen,
             &mut projection,
             &mut diagnostics,
+            None,
         )?;
     }
     if providers.grok {
-        scan_analysis_files(
+        crate::scan::scan_cached_files(
             &paths.grok_session_dir,
             ExtensionType::Grok,
             is_grok_session_file,
@@ -546,6 +549,7 @@ pub fn aggregate_sessions_by_model_from_paths_with_cache(
             &mut seen,
             &mut projection,
             &mut diagnostics,
+            None,
         )?;
     }
 
@@ -578,111 +582,6 @@ pub fn aggregate_sessions_by_model_from_paths_with_cache(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn scan_analysis_files<F>(
-    dir: &Path,
-    provider: ExtensionType,
-    filter: F,
-    time_range: TimeRange,
-    max_depth: Option<usize>,
-    cache: &mut SummaryScanCache,
-    seen: &mut HashSet<SummaryCacheKey>,
-    projection: &mut AnalysisProjection,
-    diagnostics: &mut AnalysisCollectionDiagnostics,
-) -> Result<()>
-where
-    F: Copy + Fn(&Path) -> bool + Sync + Send,
-{
-    let discovery = collect_files_with_max_depth_diagnostics(dir, filter, time_range, max_depth);
-    if !discovery.failures.is_empty() {
-        cache.preserve_provider_keys(seen, SummaryKind::File, provider);
-    }
-    diagnostics.candidates += discovery.failures.len();
-    for failure in discovery.failures {
-        record_failure(diagnostics, provider, &failure.path, failure.error);
-    }
-
-    let mut files = discovery.files;
-    files.sort_unstable_by(|left, right| left.path.cmp(&right.path));
-    diagnostics.candidates += files.len();
-    let mut misses = Vec::new();
-
-    for file in files {
-        let key = SummaryCacheKey::new(SummaryKind::File, provider, &file.path, time_range);
-        seen.insert(key.clone());
-        match SourceFingerprint::file(&file.path, provider) {
-            Ok(fingerprint) => {
-                if let Some(cached) = cache.get(&key, &fingerprint) {
-                    fold_cached_analysis(provider, &file.path, cached, projection, diagnostics);
-                } else {
-                    misses.push((file, key, fingerprint));
-                }
-            }
-            Err(error) => record_failure(diagnostics, provider, &file.path, error.to_string()),
-        }
-    }
-
-    let loaded: Vec<_> = misses
-        .into_par_iter()
-        .map(|(file, key, fingerprint)| {
-            let result = load_analysis_file(&file, provider);
-            (file.path, key, fingerprint, result)
-        })
-        .collect();
-    for (source, key, fingerprint, result) in loaded {
-        cache.record_parse();
-        match result {
-            Ok(loaded) => {
-                fold_loaded_analysis(provider, &source, &loaded, projection, diagnostics);
-                cache.insert(
-                    key,
-                    fingerprint,
-                    loaded.summary,
-                    loaded.parsed,
-                    loaded.failure,
-                );
-            }
-            Err(error) => record_failure(diagnostics, provider, &source, error.to_string()),
-        }
-    }
-    Ok(())
-}
-
-fn load_analysis_file(file: &FileInfo, provider: ExtensionType) -> Result<CachedAnalysisLoad> {
-    let parsed =
-        parse_session_file_as_with_diagnostics(&file.path, provider, ParseMode::UsageOnly, None)?;
-    if parsed.diagnostics.is_complete_failure() {
-        let error = if parsed.diagnostics.recognized_records == 0 {
-            "source contained no recognized provider records".to_string()
-        } else {
-            format!(
-                "none of {} analyzer-relevant provider records used a supported schema",
-                parsed.diagnostics.relevant_records
-            )
-        };
-        return Ok(CachedAnalysisLoad {
-            summary: CompactSourceSummary::default(),
-            parsed: false,
-            failure: Some(error),
-        });
-    }
-    let emit = parsed.diagnostics.should_emit_session();
-    if emit && parsed.analysis.records.is_empty() {
-        return Ok(CachedAnalysisLoad {
-            summary: CompactSourceSummary::default(),
-            parsed: false,
-            failure: Some("normalized source produced no analysis records".to_string()),
-        });
-    }
-    let partial = parsed.diagnostics.partial_failure_count();
-    Ok(CachedAnalysisLoad {
-        summary: CompactSourceSummary::from_file(parsed.analysis, file.modified_date.clone(), emit),
-        parsed: true,
-        failure: (partial > 0)
-            .then(|| crate::session::diagnostics::partial_failure_reason(partial)),
-    })
-}
-
 fn scan_opencode_analysis(
     paths: &HelperPaths,
     time_range: TimeRange,
@@ -704,7 +603,7 @@ fn scan_opencode_analysis(
         }
     };
     if let Some(cached) = cache.get(&key, &fingerprint) {
-        fold_cached_analysis(provider, source, cached, projection, diagnostics);
+        crate::scan::fold_cached(provider, source, cached, projection, diagnostics);
         return;
     }
 
@@ -732,12 +631,12 @@ fn scan_opencode_analysis(
             for row in result.rows {
                 summary.add_analysis(row.analysis, row.date, 0.0, true);
             }
-            let loaded = CachedAnalysisLoad {
+            let loaded = crate::scan::LoadedCompactSummary {
                 summary,
                 parsed: !complete_failure,
                 failure,
             };
-            fold_loaded_analysis(provider, source, &loaded, projection, diagnostics);
+            crate::scan::fold_loaded(provider, source, &loaded, projection, diagnostics);
             cache.insert(
                 key,
                 fingerprint,
@@ -814,7 +713,7 @@ fn scan_cursor_analysis(
             }
         };
         if tracking_ok && let Some(cached) = cache.get(&key, &fingerprint) {
-            fold_cached_analysis(provider, &store, cached, projection, diagnostics);
+            crate::scan::fold_cached(provider, &store, cached, projection, diagnostics);
             continue;
         }
 
@@ -847,12 +746,12 @@ fn scan_cursor_analysis(
                 for (date, analysis) in result.rows {
                     summary.add_analysis(analysis, date, 0.0, true);
                 }
-                let loaded = CachedAnalysisLoad {
+                let loaded = crate::scan::LoadedCompactSummary {
                     summary,
                     parsed: !complete_failure,
                     failure,
                 };
-                fold_loaded_analysis(provider, &store, &loaded, projection, diagnostics);
+                crate::scan::fold_loaded(provider, &store, &loaded, projection, diagnostics);
                 if tracking_ok {
                     cache.insert(
                         key,
@@ -877,51 +776,6 @@ fn scan_cursor_analysis(
                 }
             }
         }
-    }
-}
-struct CachedAnalysisLoad {
-    summary: CompactSourceSummary,
-    parsed: bool,
-    failure: Option<String>,
-}
-
-fn fold_cached_analysis(
-    provider: ExtensionType,
-    source: &Path,
-    cached: &CachedSourceSummary,
-    projection: &mut AnalysisProjection,
-    diagnostics: &mut AnalysisCollectionDiagnostics,
-) {
-    if cached.parsed {
-        diagnostics.parsed += 1;
-        projection.add_compact(provider, &cached.summary);
-    }
-    if let Some(error) = &cached.failure {
-        diagnostics.failures.push(AnalysisCollectionFailure {
-            provider,
-            source: source.to_path_buf(),
-            error: error.clone(),
-        });
-    }
-}
-
-fn fold_loaded_analysis(
-    provider: ExtensionType,
-    source: &Path,
-    loaded: &CachedAnalysisLoad,
-    projection: &mut AnalysisProjection,
-    diagnostics: &mut AnalysisCollectionDiagnostics,
-) {
-    if loaded.parsed {
-        diagnostics.parsed += 1;
-        projection.add_compact(provider, &loaded.summary);
-    }
-    if let Some(error) = &loaded.failure {
-        diagnostics.failures.push(AnalysisCollectionFailure {
-            provider,
-            source: source.to_path_buf(),
-            error: error.clone(),
-        });
     }
 }
 
@@ -1159,6 +1013,12 @@ struct AnalysisProjection {
     opencode_dates: HashSet<String>,
     cursor_dates: HashSet<String>,
     hermes_dates: HashSet<String>,
+}
+
+impl crate::scan::CompactSink for AnalysisProjection {
+    fn fold(&mut self, provider: ExtensionType, summary: &CompactSourceSummary) {
+        self.add_compact(provider, summary);
+    }
 }
 
 impl AnalysisProjection {

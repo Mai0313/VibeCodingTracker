@@ -21,16 +21,13 @@ use crate::session::cursor::{
 use crate::session::diagnostics::DatabaseUsageRead;
 use crate::session::hermes::read_hermes_usage_contributions;
 use crate::session::opencode::read_opencode_usage_contributions;
-use crate::session::parser::parse_session_file_as_with_diagnostics;
 use crate::session::sqlite::is_cacheable_sqlite_failure;
 use crate::session::{
     ParseMode, parse_session_file_as, read_cursor_usage, read_hermes_usage, read_opencode_usage,
 };
 use crate::summary_cache::{
-    CachedSourceSummary, CompactSourceSummary, SourceFingerprint, SummaryCacheKey, SummaryKind,
-    SummaryScanCache,
+    CompactSourceSummary, SourceFingerprint, SummaryCacheKey, SummaryKind, SummaryScanCache,
 };
-use crate::utils::directory::{FileInfo, collect_files_with_max_depth_diagnostics};
 use crate::utils::{
     COPILOT_SESSION_MAX_DEPTH, GROK_SESSION_MAX_DEPTH, HelperPaths, TokenCounts,
     collect_files_with_max_depth, is_claude_session_file, is_codex_session_file,
@@ -475,7 +472,7 @@ fn get_usage_from_paths_with_cache_inner(
     let mut seen = HashSet::new();
 
     if providers.claude {
-        scan_usage_files(
+        crate::scan::scan_cached_files(
             &paths.claude_session_dir,
             ExtensionType::ClaudeCode,
             is_claude_session_file,
@@ -489,7 +486,7 @@ fn get_usage_from_paths_with_cache_inner(
         )?;
     }
     if providers.codex {
-        scan_usage_files(
+        crate::scan::scan_cached_files(
             &paths.codex_session_dir,
             ExtensionType::Codex,
             is_codex_session_file,
@@ -503,7 +500,7 @@ fn get_usage_from_paths_with_cache_inner(
         )?;
     }
     if providers.copilot {
-        scan_usage_files(
+        crate::scan::scan_cached_files(
             &paths.copilot_session_dir,
             ExtensionType::Copilot,
             is_copilot_session_file,
@@ -517,7 +514,7 @@ fn get_usage_from_paths_with_cache_inner(
         )?;
     }
     if providers.gemini {
-        scan_usage_files(
+        crate::scan::scan_cached_files(
             &paths.gemini_session_dir,
             ExtensionType::Gemini,
             is_gemini_session_file,
@@ -531,7 +528,7 @@ fn get_usage_from_paths_with_cache_inner(
         )?;
     }
     if providers.grok {
-        scan_usage_files(
+        crate::scan::scan_cached_files(
             &paths.grok_session_dir,
             ExtensionType::Grok,
             is_grok_session_file,
@@ -592,130 +589,6 @@ fn get_usage_from_paths_with_cache_inner(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn scan_usage_files<F>(
-    dir: &Path,
-    provider: ExtensionType,
-    filter: F,
-    time_range: TimeRange,
-    max_depth: Option<usize>,
-    cache: &mut SummaryScanCache,
-    seen: &mut HashSet<SummaryCacheKey>,
-    accumulator: &mut UsageAccumulator,
-    diagnostics: &mut UsageCollectionDiagnostics,
-    tiers: Option<&TierThresholds>,
-) -> Result<()>
-where
-    F: Copy + Fn(&Path) -> bool + Sync + Send,
-{
-    let discovery = collect_files_with_max_depth_diagnostics(dir, filter, time_range, max_depth);
-    if !discovery.failures.is_empty() {
-        cache.preserve_provider_keys(seen, SummaryKind::File, provider);
-    }
-    diagnostics.candidates += discovery.failures.len();
-    for failure in discovery.failures {
-        diagnostics.failures.push(UsageCollectionFailure {
-            provider,
-            source: failure.path,
-            error: failure.error,
-        });
-    }
-
-    let mut files = discovery.files;
-    files.sort_unstable_by(|left, right| left.path.cmp(&right.path));
-    diagnostics.candidates += files.len();
-
-    let mut misses = Vec::new();
-    for file in files {
-        let key = SummaryCacheKey::new(SummaryKind::File, provider, &file.path, time_range);
-        seen.insert(key.clone());
-        match SourceFingerprint::file(&file.path, provider) {
-            Ok(fingerprint) => {
-                if let Some(cached) = cache.get(&key, &fingerprint) {
-                    fold_cached_usage(provider, &file.path, cached, accumulator, diagnostics);
-                } else {
-                    misses.push((file, key, fingerprint));
-                }
-            }
-            Err(error) => diagnostics.failures.push(UsageCollectionFailure {
-                provider,
-                source: file.path,
-                error: error.to_string(),
-            }),
-        }
-    }
-
-    let loaded: Vec<_> = misses
-        .into_par_iter()
-        .map(|(file, key, fingerprint)| {
-            let result = load_file_summary(&file, provider, tiers);
-            (file.path, key, fingerprint, result)
-        })
-        .collect();
-
-    for (source, key, fingerprint, result) in loaded {
-        cache.record_parse();
-        match result {
-            Ok(loaded) => {
-                fold_loaded_usage(provider, &source, &loaded, accumulator, diagnostics);
-                cache.insert(
-                    key,
-                    fingerprint,
-                    loaded.summary,
-                    loaded.parsed,
-                    loaded.failure,
-                );
-            }
-            Err(error) => diagnostics.failures.push(UsageCollectionFailure {
-                provider,
-                source,
-                error: error.to_string(),
-            }),
-        }
-    }
-    Ok(())
-}
-
-fn load_file_summary(
-    file: &FileInfo,
-    provider: ExtensionType,
-    tiers: Option<&TierThresholds>,
-) -> Result<LoadedSummary> {
-    let parsed =
-        parse_session_file_as_with_diagnostics(&file.path, provider, ParseMode::UsageOnly, tiers)?;
-    if parsed.diagnostics.is_complete_failure() {
-        let failure = if parsed.diagnostics.recognized_records == 0 {
-            "source contained no recognized provider records".to_string()
-        } else {
-            format!(
-                "none of {} analyzer-relevant provider records used a supported schema",
-                parsed.diagnostics.relevant_records
-            )
-        };
-        return Ok(LoadedSummary {
-            summary: CompactSourceSummary::default(),
-            parsed: false,
-            failure: Some(failure),
-        });
-    }
-
-    let emit = parsed.diagnostics.should_emit_session();
-    if emit && parsed.analysis.records.is_empty() {
-        return Ok(LoadedSummary {
-            summary: CompactSourceSummary::default(),
-            parsed: false,
-            failure: Some("normalized source produced no analysis records".to_string()),
-        });
-    }
-    let partial = parsed.diagnostics.partial_failure_count();
-    Ok(LoadedSummary {
-        summary: CompactSourceSummary::from_file(parsed.analysis, file.modified_date.clone(), emit),
-        parsed: true,
-        failure: (partial > 0)
-            .then(|| crate::session::diagnostics::partial_failure_reason(partial)),
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
 fn scan_usage_database<F>(
     provider: ExtensionType,
     source: &Path,
@@ -744,7 +617,7 @@ fn scan_usage_database<F>(
         }
     };
     if let Some(cached) = cache.get(&key, &fingerprint) {
-        fold_cached_usage(provider, source, cached, accumulator, diagnostics);
+        crate::scan::fold_cached(provider, source, cached, accumulator, diagnostics);
         return;
     }
 
@@ -757,7 +630,7 @@ fn scan_usage_database<F>(
             for contribution in read.rows {
                 summary.add_usage_contribution(contribution);
             }
-            let loaded = LoadedSummary {
+            let loaded = crate::scan::LoadedCompactSummary {
                 summary,
                 parsed: !complete_failure,
                 failure: if complete_failure {
@@ -771,7 +644,7 @@ fn scan_usage_database<F>(
                     None
                 },
             };
-            fold_loaded_usage(provider, source, &loaded, accumulator, diagnostics);
+            crate::scan::fold_loaded(provider, source, &loaded, accumulator, diagnostics);
             cache.insert(
                 key,
                 fingerprint,
@@ -861,7 +734,7 @@ fn scan_cursor_usage_database(
             }
         };
         if tracking_ok && let Some(cached) = cache.get(&key, &fingerprint) {
-            fold_cached_usage(provider, &store, cached, accumulator, diagnostics);
+            crate::scan::fold_cached(provider, &store, cached, accumulator, diagnostics);
             continue;
         }
 
@@ -874,7 +747,7 @@ fn scan_cursor_usage_database(
                 for contribution in read.rows {
                     summary.add_usage_contribution(contribution);
                 }
-                let loaded = LoadedSummary {
+                let loaded = crate::scan::LoadedCompactSummary {
                     summary,
                     parsed: !complete_failure,
                     failure: if complete_failure {
@@ -890,7 +763,7 @@ fn scan_cursor_usage_database(
                         None
                     },
                 };
-                fold_loaded_usage(provider, &store, &loaded, accumulator, diagnostics);
+                crate::scan::fold_loaded(provider, &store, &loaded, accumulator, diagnostics);
                 if tracking_ok {
                     cache.insert(
                         key,
@@ -921,51 +794,6 @@ fn scan_cursor_usage_database(
         }
     }
 }
-struct LoadedSummary {
-    summary: CompactSourceSummary,
-    parsed: bool,
-    failure: Option<String>,
-}
-
-fn fold_cached_usage(
-    provider: ExtensionType,
-    source: &Path,
-    cached: &CachedSourceSummary,
-    accumulator: &mut UsageAccumulator,
-    diagnostics: &mut UsageCollectionDiagnostics,
-) {
-    if cached.parsed {
-        diagnostics.parsed += 1;
-        accumulator.add(provider, &cached.summary);
-    }
-    if let Some(error) = &cached.failure {
-        diagnostics.failures.push(UsageCollectionFailure {
-            provider,
-            source: source.to_path_buf(),
-            error: error.clone(),
-        });
-    }
-}
-
-fn fold_loaded_usage(
-    provider: ExtensionType,
-    source: &Path,
-    loaded: &LoadedSummary,
-    accumulator: &mut UsageAccumulator,
-    diagnostics: &mut UsageCollectionDiagnostics,
-) {
-    if loaded.parsed {
-        diagnostics.parsed += 1;
-        accumulator.add(provider, &loaded.summary);
-    }
-    if let Some(error) = &loaded.failure {
-        diagnostics.failures.push(UsageCollectionFailure {
-            provider,
-            source: source.to_path_buf(),
-            error: error.clone(),
-        });
-    }
-}
 
 #[derive(Default)]
 struct UsageAccumulator {
@@ -980,6 +808,12 @@ struct UsageAccumulator {
     opencode_dates: HashSet<String>,
     cursor_dates: HashSet<String>,
     hermes_dates: HashSet<String>,
+}
+
+impl crate::scan::CompactSink for UsageAccumulator {
+    fn fold(&mut self, provider: ExtensionType, summary: &CompactSourceSummary) {
+        self.add(provider, summary);
+    }
 }
 
 impl UsageAccumulator {
