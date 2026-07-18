@@ -42,7 +42,6 @@ pub mod update;
 pub mod usage;
 pub mod utils;
 
-pub use cli::TimeRange;
 pub use models::*;
 pub use session::parser::{parse_session_file, parse_session_file_typed};
 pub use usage::calculator::{UsageData, get_usage_from_directories, get_usage_from_paths};

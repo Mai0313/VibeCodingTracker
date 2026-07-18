@@ -164,7 +164,7 @@ impl AnalysisUiState {
 
 /// Starts the CLI analysis TUI with its initial scan in the background.
 pub fn display_analysis_interactive_loading(
-    time_range: crate::cli::TimeRange,
+    time_range: crate::models::TimeRange,
     providers: ProvidersConfig,
     refresh_secs: u64,
 ) -> anyhow::Result<()> {
@@ -175,7 +175,7 @@ pub fn display_analysis_interactive_loading(
 
 /// [`display_analysis_interactive_loading`] with a caller-owned scan pool.
 pub fn display_analysis_interactive_loading_with_pool(
-    time_range: crate::cli::TimeRange,
+    time_range: crate::models::TimeRange,
     providers: ProvidersConfig,
     refresh_secs: u64,
     scan_pool: Arc<rayon::ThreadPool>,
@@ -185,7 +185,7 @@ pub fn display_analysis_interactive_loading_with_pool(
 
 fn run_analysis_interactive(
     initial_data: Option<AnalysisData>,
-    time_range: crate::cli::TimeRange,
+    time_range: crate::models::TimeRange,
     providers: ProvidersConfig,
     refresh_secs: u64,
     scan_pool: Arc<rayon::ThreadPool>,
@@ -387,7 +387,7 @@ fn run_analysis_interactive(
 /// ```
 pub fn display_analysis_interactive(
     initial_data: AnalysisData,
-    time_range: crate::cli::TimeRange,
+    time_range: crate::models::TimeRange,
     providers: ProvidersConfig,
     refresh_secs: u64,
 ) -> anyhow::Result<()> {

@@ -1,4 +1,4 @@
-use crate::cli::TimeRange;
+use crate::models::TimeRange;
 use crate::config::ProvidersConfig;
 use crate::constants::{FastHashMap, FastHashSet, capacity};
 use crate::models::{CodeAnalysis, ExtensionType, ProviderActiveDays};

@@ -7,7 +7,7 @@
 //! scan loop.
 
 use super::{CompactSink, ScanDiagnostics, scan_cached_files};
-use crate::cli::TimeRange;
+use crate::models::TimeRange;
 use crate::config::ProvidersConfig;
 use crate::constants::FastHashSet;
 use crate::models::ExtensionType;

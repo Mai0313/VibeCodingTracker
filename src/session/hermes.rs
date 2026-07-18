@@ -14,7 +14,7 @@
 //! session is also reconciled against the `sessions` aggregate so partial or
 //! missing per-model rows are not under-counted (see [`collect_usage`]).
 
-use crate::cli::TimeRange;
+use crate::models::TimeRange;
 use crate::constants::FastHashMap;
 use crate::models::{CodeAnalysis, ExtensionType};
 use crate::session::diagnostics::{DatabaseUsageRead, UsageContribution, UsageTokenContribution};

@@ -1,4 +1,4 @@
-use crate::cli::TimeRange;
+use crate::models::TimeRange;
 use anyhow::Result;
 use std::fs;
 use std::path::{Path, PathBuf};

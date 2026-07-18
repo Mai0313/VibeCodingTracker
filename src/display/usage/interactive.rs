@@ -442,7 +442,7 @@ impl UsageUiState {
 /// Displays usage with a dedicated scan pool supplied by the CLI.
 #[allow(clippy::too_many_arguments)]
 pub fn display_usage_interactive_with_pool(
-    time_range: crate::cli::TimeRange,
+    time_range: crate::models::TimeRange,
     merge_providers: bool,
     quota_panels: Vec<String>,
     providers: ProvidersConfig,
@@ -680,7 +680,7 @@ pub fn display_usage_interactive_with_pool(
 ///
 /// Panics if the current process ID cannot be obtained for memory monitoring.
 pub fn display_usage_interactive(
-    time_range: crate::cli::TimeRange,
+    time_range: crate::models::TimeRange,
     merge_providers: bool,
     quota_panels: Vec<String>,
     providers: ProvidersConfig,

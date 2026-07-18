@@ -23,7 +23,7 @@
 //! (e.g. a hand-edited inline `usage = { ... }` table), so the returned [`Config`]
 //! is always correct even when the file was not rewritten.
 
-use crate::cli::TimeRange;
+use crate::models::TimeRange;
 use crate::utils::{get_cache_dir, write_string_atomic};
 use anyhow::Result;
 use schemars::JsonSchema;
