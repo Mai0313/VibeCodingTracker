@@ -768,26 +768,37 @@ impl UsageAccumulator {
             ExtensionType::Cursor => &mut self.per_provider.cursor,
             ExtensionType::Hermes => &mut self.per_provider.hermes,
         };
+        // Clone the model key only on a miss (an insert genuinely needs an owned
+        // key); a merge into an existing row needs no allocation at all.
         for (model, usage) in &summary.usage {
-            provider_result
-                .entry(model.clone())
-                .and_modify(|existing| merge_usage_values(existing, usage))
-                .or_insert_with(|| usage.clone());
-            self.models
-                .entry(model.clone())
-                .and_modify(|existing| merge_usage_values(existing, usage))
-                .or_insert_with(|| usage.clone());
+            match provider_result.get_mut(model) {
+                Some(existing) => merge_usage_values(existing, usage),
+                None => {
+                    provider_result.insert(model.clone(), usage.clone());
+                }
+            }
+            match self.models.get_mut(model) {
+                Some(existing) => merge_usage_values(existing, usage),
+                None => {
+                    self.models.insert(model.clone(), usage.clone());
+                }
+            }
         }
         for (model, tokens) in &summary.database_usage {
             let usage = tokens.into_value();
-            provider_result
-                .entry(model.clone())
-                .and_modify(|existing| merge_usage_values(existing, &usage))
-                .or_insert_with(|| usage.clone());
-            self.models
-                .entry(model.clone())
-                .and_modify(|existing| merge_usage_values(existing, &usage))
-                .or_insert(usage);
+            match provider_result.get_mut(model) {
+                Some(existing) => merge_usage_values(existing, &usage),
+                None => {
+                    provider_result.insert(model.clone(), usage.clone());
+                }
+            }
+            match self.models.get_mut(model) {
+                Some(existing) => merge_usage_values(existing, &usage),
+                None => {
+                    // Last use of `usage`, so move it in rather than clone.
+                    self.models.insert(model.clone(), usage);
+                }
+            }
         }
 
         let stored = match provider {
@@ -816,15 +827,18 @@ impl UsageAccumulator {
     }
 
     fn finish(self) -> UsageData {
-        let mut all_dates = HashSet::new();
-        all_dates.extend(self.claude_dates.iter().cloned());
-        all_dates.extend(self.codex_dates.iter().cloned());
-        all_dates.extend(self.copilot_dates.iter().cloned());
-        all_dates.extend(self.gemini_dates.iter().cloned());
-        all_dates.extend(self.grok_dates.iter().cloned());
-        all_dates.extend(self.opencode_dates.iter().cloned());
-        all_dates.extend(self.cursor_dates.iter().cloned());
-        all_dates.extend(self.hermes_dates.iter().cloned());
+        // Only the union's cardinality is needed, so union references rather
+        // than cloning every date string across the eight per-provider sets.
+        let mut all_dates: HashSet<&String> = HashSet::new();
+        all_dates.extend(self.claude_dates.iter());
+        all_dates.extend(self.codex_dates.iter());
+        all_dates.extend(self.copilot_dates.iter());
+        all_dates.extend(self.gemini_dates.iter());
+        all_dates.extend(self.grok_dates.iter());
+        all_dates.extend(self.opencode_dates.iter());
+        all_dates.extend(self.cursor_dates.iter());
+        all_dates.extend(self.hermes_dates.iter());
+        let total_days = all_dates.len();
         UsageData {
             models: self.models,
             per_provider: self.per_provider,
@@ -837,7 +851,7 @@ impl UsageAccumulator {
                 opencode: self.opencode_dates.len(),
                 cursor: self.cursor_dates.len(),
                 hermes: self.hermes_dates.len(),
-                total: all_dates.len(),
+                total: total_days,
             },
             stored_costs: self.stored_costs,
         }

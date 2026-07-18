@@ -701,12 +701,11 @@ fn parse_apply_patch_script(script: &str) -> Vec<CodexPatch> {
     };
 
     let segment = &script[start..];
-    let lines: Vec<&str> = segment.lines().collect();
     // Pre-allocate capacity based on typical patch count (1-5 patches)
     let mut patches = Vec::with_capacity(3);
     let mut current: Option<CodexPatch> = None;
 
-    for line in lines {
+    for line in segment.lines() {
         let line = line.trim_end_matches('\r');
 
         if line.starts_with("*** End Patch") {
@@ -884,12 +883,14 @@ fn extract_cat_read(script: &str, output: &str) -> Option<(String, String)> {
             continue;
         }
 
-        let fields: Vec<&str> = trimmed.split_whitespace().collect();
-        if fields.len() < 2 {
+        // `trimmed` starts with "cat "; skip that field and take the path.
+        let mut fields = trimmed.split_whitespace();
+        fields.next();
+        let Some(path_field) = fields.next() else {
             continue;
-        }
+        };
 
-        let path = fields[1].trim_matches(|c| c == '"' || c == '\'');
+        let path = path_field.trim_matches(|c| c == '"' || c == '\'');
 
         // Optimize: avoid multiple allocations
         let clean_output = if let Some(idx) = output.find("\n---") {

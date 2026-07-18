@@ -842,25 +842,36 @@ fn iter_jsonl_values<'a>(
     warnings: Rc<RefCell<ParseWarningSummary>>,
     io_failure: Rc<RefCell<Option<String>>>,
 ) -> impl Iterator<Item = Value> + 'a {
-    reader.lines().enumerate().filter_map(move |(index, line)| {
-        let line = match line {
-            Ok(line) => line,
-            Err(err) => {
-                warnings.borrow_mut().record_unreadable(index + 1, &err);
-                *io_failure.borrow_mut() = Some(err.to_string());
-                return None;
+    // Reuse one byte buffer via `read_until` instead of allocating a `String`
+    // per line (`reader.lines()`), mirroring `iter_jsonl_typed`.
+    let mut line = Vec::with_capacity(buffer::AVG_JSONL_LINE_SIZE);
+    let mut line_number = 0_usize;
+
+    std::iter::from_fn(move || {
+        loop {
+            line.clear();
+            line_number += 1;
+            match reader.read_until(b'\n', &mut line) {
+                Ok(0) => return None,
+                Ok(_) => {}
+                Err(err) => {
+                    warnings.borrow_mut().record_unreadable(line_number, &err);
+                    *io_failure.borrow_mut() = Some(err.to_string());
+                    return None;
+                }
             }
-        };
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        match serde_json::from_str::<Value>(trimmed) {
-            Ok(value) => Some(value),
-            Err(err) => {
-                warnings.borrow_mut().record_malformed(index + 1, &err);
-                diagnostics.borrow_mut().record_malformed();
-                None
+
+            let bytes = trim_ascii_whitespace(&line);
+            if bytes.is_empty() {
+                continue;
+            }
+
+            match serde_json::from_slice::<Value>(bytes) {
+                Ok(value) => return Some(value),
+                Err(err) => {
+                    warnings.borrow_mut().record_malformed(line_number, &err);
+                    diagnostics.borrow_mut().record_malformed();
+                }
             }
         }
     })
