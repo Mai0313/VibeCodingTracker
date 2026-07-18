@@ -13,7 +13,7 @@ use crate::session::sqlite::is_cacheable_sqlite_failure;
 use crate::session::state::ParseMode;
 use crate::summary_cache::{
     CachedSourceSummary, CompactSourceSummary, SourceFingerprint, SummaryCacheKey, SummaryKind,
-    SummaryScanCache, provider_scan_rank,
+    SummaryScanCache,
 };
 use crate::utils::directory::{FileInfo, collect_files_with_max_depth_diagnostics};
 use crate::utils::{
@@ -23,40 +23,14 @@ use crate::utils::{
 };
 use anyhow::Result;
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize, Serializer, ser::SerializeSeq};
+use serde::{Serialize, Serializer, ser::SerializeSeq};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-/// Single row of aggregated file-operation metrics for one model.
-///
-/// Counts are summed across every session that used the model in the active
-/// time range. The `*_lines` fields total the lines touched by edit/read/write
-/// operations; the `*_count` fields total how many times each tool was called.
-/// Serializes with camelCase field names for library callers that persist a
-/// compact projection. The CLI's `analysis --json` output uses
-/// [`AnalysisDataset`] instead.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AggregatedAnalysisRow {
-    /// Model name the metrics are grouped under.
-    pub model: String,
-    /// Total lines changed by `Edit`/`MultiEdit` operations.
-    pub edit_lines: usize,
-    /// Total lines returned by `Read` operations.
-    pub read_lines: usize,
-    /// Total lines emitted by `Write` operations.
-    pub write_lines: usize,
-    /// Number of `Bash` tool calls.
-    pub bash_count: usize,
-    /// Number of `Edit` tool calls.
-    pub edit_count: usize,
-    /// Number of `Read` tool calls.
-    pub read_count: usize,
-    /// Number of `TodoWrite` tool calls.
-    pub todo_write_count: usize,
-    /// Number of `Write` tool calls.
-    pub write_count: usize,
-}
+// `AggregatedAnalysisRow` is a neutral DTO shared with the scan cache, so it
+// lives in `models`; re-exported here to keep the `analysis::AggregatedAnalysisRow`
+// (and `analysis::aggregator::AggregatedAnalysisRow`) paths working.
+pub use crate::models::AggregatedAnalysisRow;
 
 /// Bundle of aggregated analysis rows plus the per-provider active-day counts
 /// the display layer needs for daily averages.
@@ -636,8 +610,9 @@ pub fn aggregate_sessions_by_model_from_paths_with_cache(
 
     cache.retain_kinds(&seen, &[SummaryKind::File, SummaryKind::AnalysisDatabase]);
     diagnostics.failures.sort_by(|left, right| {
-        provider_scan_rank(left.provider)
-            .cmp(&provider_scan_rank(right.provider))
+        left.provider
+            .scan_rank()
+            .cmp(&right.provider.scan_rank())
             .then_with(|| left.source.cmp(&right.source))
             .then_with(|| left.error.cmp(&right.error))
     });

@@ -7,3 +7,6 @@
 pub mod calculator;
 
 pub use calculator::*;
+// The token-merge helpers moved to `utils`; keep the historical
+// `usage::normalize_usage_value` path working for the CLI and library callers.
+pub use crate::utils::normalize_usage_value;
