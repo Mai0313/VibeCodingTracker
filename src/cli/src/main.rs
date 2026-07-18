@@ -204,8 +204,10 @@ fn run() -> Result<()> {
 
             if json {
                 let scan = scan_usage_priced(time_range, config.providers, &scan_pool)?;
-                if scan.pricing_failed {
-                    eprintln!("Warning: Failed to fetch pricing data. Costs will be unavailable.");
+                if let Some(error) = &scan.pricing_error {
+                    eprintln!(
+                        "Warning: Failed to fetch pricing data: {error}. Costs will be unavailable."
+                    );
                 }
                 report_usage_collection(&scan.collection.diagnostics)?;
                 let priced = vibe_coding_tracker::usage::price_usage_data(
