@@ -216,7 +216,7 @@ fn fetch_cursor_usage(client: &Client, cookie: &str, now: i64, usage_url: &str) 
 ///
 /// Returns an error if `auth.json` is missing, has no usable session, or the
 /// request cannot be sent.
-pub(crate) fn fetch_cursor_raw(client: &Client) -> Result<(u16, String)> {
+pub fn fetch_cursor_raw(client: &Client) -> Result<(u16, String)> {
     fetch_cursor_raw_from(client, CURSOR_USAGE_URL, &get_cursor_auth_path()?)
 }
 

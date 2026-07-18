@@ -5,9 +5,12 @@
 //! [`get_usage_from_directories`]; both are re-exported at the crate root.
 
 pub mod calculator;
+pub mod pipeline;
 pub mod priced;
+pub mod summary;
 
 pub use calculator::*;
+pub use pipeline::{PricedUsageScan, scan_usage_priced};
 pub use priced::{PricedUsageRow, price_usage_data};
 // Shared merged-cost resolver used by both the JSON payload and the display
 // summaries.

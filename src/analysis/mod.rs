@@ -5,5 +5,7 @@
 //! dataset, then projects the same values into the compact summaries rendered
 //! by the TUI, text, and table views.
 pub mod aggregator;
+pub mod summary;
 
 pub use aggregator::*;
+pub use summary::*;

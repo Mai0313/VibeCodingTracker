@@ -161,13 +161,13 @@ fn to_level_filter(level: LogLevel) -> LevelFilter {
     }
 }
 
-/// Installs the global file logger at the default level (`warn`) and a panic
-/// hook that restores the terminal and records the panic.
+/// Installs the global file logger at the default level (`warn`).
 ///
 /// Called once at process start, before any subcommand runs. Safe to call more
 /// than once (subsequent calls are ignored) so tests that exercise `main` don't
 /// double-install. The level is later refined by [`apply`] once the user config
-/// is loaded.
+/// is loaded. Terminal-restore-on-panic is a presentation concern, so the CLI
+/// binary installs that hook separately (the TUI setup also self-installs it).
 pub fn init() {
     let dir = home::home_dir().map(|home| home.join(".vct").join(LOG_DIR_NAME));
     let logger = LOGGER.get_or_init(|| FileLogger::new(dir, LevelFilter::Warn));
@@ -175,9 +175,6 @@ pub fn init() {
     if log::set_logger(logger).is_ok() {
         log::set_max_level(LevelFilter::Warn);
     }
-    // Terminal safety is independent of logger ownership. This also preserves
-    // a logger or panic hook that an embedding application installed first.
-    crate::display::common::tui::ensure_terminal_panic_hook();
 }
 
 /// Applies the persisted `[logging]` settings: sets the max level and prunes
