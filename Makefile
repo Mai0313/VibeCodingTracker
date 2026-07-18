@@ -23,7 +23,7 @@ release: ## Build release binary
 	cargo build --release --locked
 
 package: ## Build crate package (.crate)
-	cargo package -p vibe_coding_tracker --locked --allow-dirty
+	cargo package --workspace --allow-dirty
 
 test: ## Run all tests
 	cargo test --all
