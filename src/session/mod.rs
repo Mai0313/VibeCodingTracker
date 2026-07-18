@@ -27,7 +27,6 @@ pub use hermes::read_hermes_usage;
 pub use opencode::{read_opencode_analysis, read_opencode_usage};
 pub use parser::{
     SessionFileParseDiagnostics, parse_session_file, parse_session_file_as,
-    parse_session_file_typed, parse_session_file_typed_with_mode,
-    parse_session_file_typed_with_mode_and_diagnostics,
+    parse_session_file_detailed, parse_session_file_typed, parse_session_file_typed_with_mode,
 };
 pub use state::{ParseMode, SessionParseState};

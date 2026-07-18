@@ -24,8 +24,8 @@ use vibe_coding_tracker::cli::TimeRange;
 use vibe_coding_tracker::config::ProvidersConfig;
 use vibe_coding_tracker::models::ExtensionType;
 use vibe_coding_tracker::session::parser::{
-    parse_session_file, parse_session_file_as, parse_session_file_typed,
-    parse_session_file_typed_with_mode_and_diagnostics,
+    parse_session_file, parse_session_file_as, parse_session_file_detailed,
+    parse_session_file_typed,
 };
 use vibe_coding_tracker::session::state::ParseMode;
 use vibe_coding_tracker::summary_cache::SummaryScanCache;
@@ -1266,8 +1266,7 @@ fn codex_unknown_apply_patch_output_surfaces_source_diagnostics() {
         ),
     );
 
-    let (analysis, diagnostics) =
-        parse_session_file_typed_with_mode_and_diagnostics(&path, ParseMode::Full).unwrap();
+    let (analysis, diagnostics) = parse_session_file_detailed(&path, ParseMode::Full).unwrap();
     assert_eq!(analysis.records[0].tool_call_counts.edit, 0);
     assert_eq!(diagnostics.skipped_records(), 1);
 

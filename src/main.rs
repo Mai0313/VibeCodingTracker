@@ -34,7 +34,7 @@ use vibe_coding_tracker::display::usage::{
 use vibe_coding_tracker::get_version_info;
 use vibe_coding_tracker::pricing::{ModelPricingMap, fetch_model_pricing};
 use vibe_coding_tracker::scan::build_scan_pool;
-use vibe_coding_tracker::session::{ParseMode, parse_session_file_typed_with_mode_and_diagnostics};
+use vibe_coding_tracker::session::{ParseMode, parse_session_file_detailed};
 use vibe_coding_tracker::usage::get_usage_from_directories_with_diagnostics_opts;
 
 /// Parses the CLI and runs the selected subcommand.
@@ -102,8 +102,7 @@ fn run() -> Result<()> {
                     } else {
                         ParseMode::UsageOnly
                     };
-                    let (analysis, diagnostics) =
-                        parse_session_file_typed_with_mode_and_diagnostics(&file_path, mode)?;
+                    let (analysis, diagnostics) = parse_session_file_detailed(&file_path, mode)?;
                     if diagnostics.skipped_records() > 0 {
                         eprintln!(
                             "Warning: Skipped {} malformed or unsupported analyzer records while parsing {}. Successful results are still shown.",
