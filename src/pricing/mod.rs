@@ -12,6 +12,7 @@
 
 mod cache;
 mod calculation;
+mod cost;
 mod matching;
 mod tiers;
 
@@ -38,6 +39,7 @@ static FAILED_FETCHES: LazyLock<Mutex<HashMap<PricingFetchKey, Instant>>> =
 // Re-export public types and functions
 pub use cache::{ModelPricing, ThresholdTier, TierRange};
 pub use calculation::calculate_cost;
+pub use cost::{CostSource, resolve_model_cost};
 pub use matching::{
     ModelPricingMap, ModelPricingResult, clear_pricing_cache, normalize_model_name,
 };

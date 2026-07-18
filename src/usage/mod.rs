@@ -9,6 +9,9 @@ pub mod priced;
 
 pub use calculator::*;
 pub use priced::{PricedUsageRow, price_usage_data};
+// Shared merged-cost resolver used by both the JSON payload and the display
+// summaries.
+pub(crate) use priced::resolve_merged_model_cost;
 // The token-merge helpers moved to `utils`; keep the historical
 // `usage::normalize_usage_value` path working for the CLI and library callers.
 pub use crate::utils::normalize_usage_value;

@@ -1,6 +1,7 @@
 use crate::display::common::ProviderTotal;
 use crate::models::{PerProviderUsage, Provider, ProviderActiveDays, UsageResult};
-use crate::usage::{CostSource, StoredCosts};
+use crate::pricing::CostSource;
+use crate::usage::StoredCosts;
 use serde_json::Value;
 use std::borrow::Cow;
 
@@ -351,9 +352,13 @@ pub fn build_usage_summary(
 
     // Extract rows first so we can sort by cost
     for (model, usage) in usage_data.iter() {
-        let (cost, matched_model) =
-            resolve_merged_row_cost(model, per_provider, pricing_map, stored_costs)
-                .unwrap_or_else(|| price_usage(model, usage, pricing_map, CostSource::Litellm));
+        let (cost, matched_model) = crate::usage::resolve_merged_model_cost(
+            model,
+            per_provider,
+            pricing_map,
+            stored_costs,
+        )
+        .unwrap_or_else(|| price_usage(model, usage, pricing_map, CostSource::Litellm));
         let row = build_usage_row(model, usage, cost, matched_model);
         summary.rows.push(row);
     }
@@ -382,7 +387,7 @@ pub fn build_usage_summary(
 /// Builds one priced [`UsageRow`] from a model's raw usage `Value`.
 ///
 /// Token counts come from [`extract_token_counts`](crate::utils::extract_token_counts);
-/// cost is resolved by [`resolve_model_cost`](crate::usage::resolve_model_cost)
+/// cost is resolved by [`resolve_model_cost`](crate::pricing::resolve_model_cost)
 /// under `source` (LiteLLM for file providers, the stored cost for OpenCode /
 /// Cursor). When a non-exact LiteLLM key was used, the matched model name is
 /// appended to `display_model` in parentheses.
@@ -392,7 +397,7 @@ fn extract_usage_row(
     pricing_map: &crate::pricing::ModelPricingMap,
     source: CostSource,
 ) -> UsageRow {
-    use crate::usage::resolve_model_cost;
+    use crate::pricing::resolve_model_cost;
     use crate::utils::extract_token_counts;
 
     // Extract once and reuse for both pricing and the row (was extracted twice).
@@ -408,70 +413,11 @@ fn price_usage(
     pricing_map: &crate::pricing::ModelPricingMap,
     source: CostSource,
 ) -> (f64, Option<String>) {
-    use crate::usage::resolve_model_cost;
+    use crate::pricing::resolve_model_cost;
     use crate::utils::extract_token_counts;
 
     let counts = extract_token_counts(usage);
     resolve_model_cost(model, &counts, pricing_map, source)
-}
-
-/// Prices a merged per-model row from provider-scoped usage pieces.
-fn resolve_merged_row_cost(
-    model: &str,
-    per_provider: &PerProviderUsage,
-    pricing_map: &crate::pricing::ModelPricingMap,
-    stored_costs: &StoredCosts,
-) -> Option<(f64, Option<String>)> {
-    let mut total_cost = 0.0;
-    let mut matched_model = None;
-    let mut found = false;
-
-    for usage in [
-        &per_provider.claude,
-        &per_provider.codex,
-        &per_provider.copilot,
-        &per_provider.gemini,
-    ] {
-        if let Some(raw_usage) = usage.get(model) {
-            found = true;
-            let (cost, matched) = price_usage(model, raw_usage, pricing_map, CostSource::Litellm);
-            total_cost += cost;
-            if matched_model.is_none() {
-                matched_model = matched;
-            }
-        }
-    }
-
-    // OpenCode and Hermes prefer exact LiteLLM prices before their stored
-    // costs. Cursor is a local token estimate, so only an exact LiteLLM price
-    // is accepted and an unknown model remains unpriced. Grok's gauge falls
-    // back to the input rate when the matched model has no cache-read price —
-    // it must use `GrokGauge` here too so the merged row matches the footer.
-    let stored =
-        |m: &crate::constants::FastHashMap<String, f64>| m.get(model).copied().unwrap_or(0.0);
-    for (usage, source) in [
-        (&per_provider.grok, CostSource::GrokGauge),
-        (
-            &per_provider.opencode,
-            CostSource::OpenCodeStored(stored(&stored_costs.opencode)),
-        ),
-        (&per_provider.cursor, CostSource::OpenCodeStored(0.0)),
-        (
-            &per_provider.hermes,
-            CostSource::HermesStored(stored(&stored_costs.hermes)),
-        ),
-    ] {
-        if let Some(raw_usage) = usage.get(model) {
-            found = true;
-            let (cost, matched) = price_usage(model, raw_usage, pricing_map, source);
-            total_cost += cost;
-            if matched_model.is_none() {
-                matched_model = matched;
-            }
-        }
-    }
-
-    found.then_some((total_cost, matched_model))
 }
 
 /// Builds one display row using an already-resolved cost.

@@ -6,8 +6,9 @@
 //! the same `matched_model`-only-when-present behavior the CLI has always
 //! emitted.
 
-use crate::pricing::ModelPricingMap;
-use crate::usage::{CostSource, UsageData, resolve_model_cost};
+use crate::models::PerProviderUsage;
+use crate::pricing::{CostSource, ModelPricingMap, resolve_model_cost};
+use crate::usage::{StoredCosts, UsageData};
 use crate::utils::{extract_token_counts, normalize_usage_value};
 use serde::Serialize;
 use serde_json::Value;
@@ -48,8 +49,13 @@ pub fn price_usage_data(
     let mut rows = Vec::with_capacity(usage_data.models.len());
 
     for (model, usage) in usage_data.models.iter() {
-        let (cost, matched_model) = resolve_merged_model_cost(model, usage_data, pricing_map)
-            .unwrap_or_else(|| price_usage_value(model, usage, pricing_map, CostSource::Litellm));
+        let (cost, matched_model) = resolve_merged_model_cost(
+            model,
+            &usage_data.per_provider,
+            pricing_map,
+            &usage_data.stored_costs,
+        )
+        .unwrap_or_else(|| price_usage_value(model, usage, pricing_map, CostSource::Litellm));
 
         rows.push(PricedUsageRow {
             model: model.clone(),
@@ -62,21 +68,29 @@ pub fn price_usage_data(
     rows
 }
 
-/// Resolves cost for one merged row from its provider-scoped usage pieces.
-fn resolve_merged_model_cost(
+/// Resolves cost for one merged per-model row from its provider-scoped usage
+/// pieces.
+///
+/// The merged row is priced by summing each provider's own portion under that
+/// provider's cost basis (LiteLLM for the file providers, the stored cost for
+/// OpenCode / Hermes, an input-rate-floored gauge for Grok), so Copilot-billed
+/// Claude tokens keep Copilot's basis even when they share a row with Claude
+/// Code. Shared by the `usage --json` payload and the TUI/table summaries.
+pub(crate) fn resolve_merged_model_cost(
     model: &str,
-    usage_data: &UsageData,
+    per_provider: &PerProviderUsage,
     pricing_map: &ModelPricingMap,
+    stored_costs: &StoredCosts,
 ) -> Option<(f64, Option<String>)> {
     let mut total_cost = 0.0;
     let mut matched_model = None;
     let mut found = false;
 
     for usage in [
-        &usage_data.per_provider.claude,
-        &usage_data.per_provider.codex,
-        &usage_data.per_provider.copilot,
-        &usage_data.per_provider.gemini,
+        &per_provider.claude,
+        &per_provider.codex,
+        &per_provider.copilot,
+        &per_provider.gemini,
     ] {
         if let Some(raw_usage) = usage.get(model) {
             found = true;
@@ -95,18 +109,15 @@ fn resolve_merged_model_cost(
     let stored =
         |m: &crate::constants::FastHashMap<String, f64>| m.get(model).copied().unwrap_or(0.0);
     for (usage, source) in [
-        (&usage_data.per_provider.grok, CostSource::GrokGauge),
+        (&per_provider.grok, CostSource::GrokGauge),
         (
-            &usage_data.per_provider.opencode,
-            CostSource::OpenCodeStored(stored(&usage_data.stored_costs.opencode)),
+            &per_provider.opencode,
+            CostSource::OpenCodeStored(stored(&stored_costs.opencode)),
         ),
+        (&per_provider.cursor, CostSource::OpenCodeStored(0.0)),
         (
-            &usage_data.per_provider.cursor,
-            CostSource::OpenCodeStored(0.0),
-        ),
-        (
-            &usage_data.per_provider.hermes,
-            CostSource::HermesStored(stored(&usage_data.stored_costs.hermes)),
+            &per_provider.hermes,
+            CostSource::HermesStored(stored(&stored_costs.hermes)),
         ),
     ] {
         if let Some(raw_usage) = usage.get(model) {
@@ -123,7 +134,7 @@ fn resolve_merged_model_cost(
 }
 
 /// Prices one raw usage value under `source`.
-fn price_usage_value(
+pub(crate) fn price_usage_value(
     model: &str,
     usage: &Value,
     pricing_map: &ModelPricingMap,
