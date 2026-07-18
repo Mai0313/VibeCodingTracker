@@ -139,22 +139,29 @@ jobs:
           VERSION="${TAG#v}"
           echo "Version from tag: ${VERSION}"
           cargo install cargo-edit --locked
-          cargo set-version "${VERSION}"
+          cargo set-version --workspace "${VERSION}"
+          # Stamp the internal path-dep version requirements so the published
+          # crates resolve one another on crates.io.
+          sed -i -E "s|(vct-core = \{ path = \"src/core\", version = )\"[^\"]*\"|\1\"${VERSION}\"|" Cargo.toml
+          sed -i -E "s|(vct-tui = \{ path = \"src/tui\", version = )\"[^\"]*\"|\1\"${VERSION}\"|" Cargo.toml
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
 
-      - name: Build crate package (.crate)
+      - name: Build crate packages (.crate)
         continue-on-error: true
         run: |
-          cargo package -p vibe_coding_tracker --locked --allow-dirty
+          cargo package --workspace --allow-dirty
 
       - name: Publish to crates.io
         continue-on-error: true
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          cargo publish -p vibe_coding_tracker --allow-dirty
+          # Publish in dependency order; cargo waits for each to index.
+          cargo publish -p vct-core --allow-dirty
+          cargo publish -p vct-tui --allow-dirty
+          cargo publish -p vct-cli --allow-dirty
 
-      - name: Upload .crate artifact
+      - name: Upload .crate artifacts
         uses: actions/upload-artifact@v7
         with:
           path: target/package/*.crate
