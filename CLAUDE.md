@@ -46,6 +46,9 @@ Local session data
 src/session/        ← provider detection + per-provider parsers → CodeAnalysis
         │
         ▼
+src/scan/           ← shared provider-scan machinery (ScanDiagnostics, CompactSink, cached file scanner)
+        │
+        ▼
 src/analysis/       ← roll up CodeAnalysis records → AggregatedAnalysisRow
 src/usage/          ← roll up CodeAnalysis records → UsageResult / PerProviderUsage
         │
@@ -54,6 +57,8 @@ src/display/        ← TUI / table / text / JSON renderers
 ```
 
 `src/session/` owns the "raw bytes → typed `CodeAnalysis`" boundary so both `analysis` and `usage` consume the same parsed shape. Do **not** add direct file parsing to `src/usage/` or `src/analysis/`; route everything through `src/session/parser.rs`.
+
+`src/scan/` is the neutral layer both features share so neither reaches into the other: it owns the unified `ScanDiagnostics` / `ScanFailure` types, the byte-identical cached file scanner (`scan_cached_files`) plus its `CompactSink` fold hook and `load_compact_file_summary`, and the dedicated `build_scan_pool`. `usage` and `analysis` each implement `CompactSink` and supply only their fold logic. The neutral token-bucket helpers (`merge_usage_values` / `normalize_usage_value`) live in `utils::token_merge`, `AggregatedAnalysisRow` is a `models` DTO, and provider ordering is `ExtensionType::scan_rank` — so `summary_cache` no longer imports from `usage` or `analysis` (the old dependency cycle is gone). The `usage --json` priced payload is built by `usage::price_usage_data` (returns the serializable `PricedUsageRow`), not the binary.
 
 ### Provider classification
 
