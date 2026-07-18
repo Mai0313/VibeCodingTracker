@@ -44,7 +44,7 @@ pub fn parse_claude_log_values(records: Vec<Value>, mode: ParseMode) -> Result<C
 /// Parse Claude Code session records from any iterator of pre-typed logs.
 ///
 /// This is the streaming entry point: callers that read JSONL one line at a
-/// time (see [`crate::session::parser::parse_session_file`]) feed records
+/// time (see [`crate::session::parser::parse_session_file_to_value`]) feed records
 /// through here without ever materialising a full `Vec<Value>` of raw JSON.
 ///
 /// The returned [`CodeAnalysis`] always holds exactly one record; the

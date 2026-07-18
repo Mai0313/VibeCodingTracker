@@ -43,8 +43,8 @@ pub mod usage;
 pub mod utils;
 
 pub use models::*;
-pub use session::parser::{parse_session_file, parse_session_file_typed};
-pub use usage::calculator::{UsageData, get_usage_from_directories, get_usage_from_paths};
+pub use session::parser::{parse_session_file_to_value, parse_session_file_typed};
+pub use usage::aggregator::{UsageData, aggregate_usage_from_home, aggregate_usage_from_paths};
 // Curated surface for non-CLI consumers (e.g. a future GUI backend): the
 // serializable priced-usage payload, the compact analysis summary, and the
 // shared scan diagnostics.

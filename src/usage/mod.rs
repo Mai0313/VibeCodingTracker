@@ -1,15 +1,18 @@
 //! Token-usage aggregation across provider session directories.
 //!
 //! Rolls parsed [`CodeAnalysis`](crate::models::CodeAnalysis) records up into
-//! [`UsageData`] for the `usage` view. The single entry point is
-//! [`get_usage_from_directories`]; both are re-exported at the crate root.
+//! [`UsageData`] for the `usage` view. [`aggregate_usage_from_home`] is the
+//! home-resolved entry point and [`aggregate_usage_from_paths`] its
+//! test/injection twin; [`scan_usage_priced`] wraps the pricing-then-scan
+//! pipeline, [`price_usage_data`] builds the priced JSON payload, and
+//! [`summary`] builds the aggregated view the display renders.
 
-pub mod calculator;
+pub mod aggregator;
 pub mod pipeline;
 pub mod priced;
 pub mod summary;
 
-pub use calculator::*;
+pub use aggregator::*;
 pub use pipeline::{PricedUsageScan, scan_usage_priced};
 pub use priced::{PricedUsageRow, price_usage_data};
 // Shared merged-cost resolver used by both the JSON payload and the display

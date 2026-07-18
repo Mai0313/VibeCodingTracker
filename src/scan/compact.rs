@@ -7,13 +7,13 @@
 //! also threads a per-request tier snapshot; analysis passes `None`.
 
 use super::ScanDiagnostics;
-use crate::models::TimeRange;
 use crate::constants::FastHashSet;
 use crate::models::ExtensionType;
+use crate::models::TimeRange;
 use crate::pricing::TierThresholds;
 use crate::session::ParseMode;
 use crate::session::diagnostics::partial_failure_reason;
-use crate::session::parser::parse_session_file_as_with_diagnostics;
+use crate::session::parser::parse_session_file_typed_as_with_diagnostics;
 use crate::summary_cache::{
     CachedSourceSummary, CompactSourceSummary, SourceFingerprint, SummaryCacheKey, SummaryKind,
     SummaryScanCache,
@@ -45,8 +45,12 @@ pub(crate) fn load_compact_file_summary(
     provider: ExtensionType,
     tiers: Option<&TierThresholds>,
 ) -> Result<LoadedCompactSummary> {
-    let parsed =
-        parse_session_file_as_with_diagnostics(&file.path, provider, ParseMode::UsageOnly, tiers)?;
+    let parsed = parse_session_file_typed_as_with_diagnostics(
+        &file.path,
+        provider,
+        ParseMode::UsageOnly,
+        tiers,
+    )?;
     if parsed.diagnostics.is_complete_failure() {
         let failure = if parsed.diagnostics.recognized_records == 0 {
             "source contained no recognized provider records".to_string()

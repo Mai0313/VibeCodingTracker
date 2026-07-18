@@ -53,7 +53,7 @@ pub struct ProviderActiveDays {
 ///
 /// This struct keeps a separate `UsageResult` per provider so the display
 /// layer can sum tokens and cost by source directory directly, with no
-/// prefix heuristics involved. It is populated in `usage::calculator` at
+/// prefix heuristics involved. It is populated in `usage::aggregator` at
 /// the same time the global merged map is built.
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct PerProviderUsage {

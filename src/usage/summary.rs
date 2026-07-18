@@ -162,7 +162,7 @@ pub struct UsageSummary {
 /// Calculate per-provider totals using **source-directory** attribution.
 ///
 /// Token aggregation is fed directly from the `per_provider` map that
-/// `usage::calculator` populates from each session's source directory, so the
+/// `usage::aggregator` populates from each session's source directory, so the
 /// provider assignment is exact regardless of what model name the session
 /// happens to carry. The previous "averages" variant divided by
 /// `provider_days` to render a per-day rate; the structure is otherwise
@@ -302,13 +302,9 @@ pub fn build_usage_summary(
 
     // Extract rows first so we can sort by cost
     for (model, usage) in usage_data.iter() {
-        let (cost, matched_model) = crate::usage::resolve_merged_model_cost(
-            model,
-            per_provider,
-            pricing_map,
-            stored_costs,
-        )
-        .unwrap_or_else(|| price_usage(model, usage, pricing_map, CostSource::Litellm));
+        let (cost, matched_model) =
+            crate::usage::resolve_merged_model_cost(model, per_provider, pricing_map, stored_costs)
+                .unwrap_or_else(|| price_usage(model, usage, pricing_map, CostSource::Litellm));
         let row = build_usage_row(model, usage, cost, matched_model);
         summary.rows.push(row);
     }

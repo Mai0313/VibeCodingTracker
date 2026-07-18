@@ -13,10 +13,10 @@ use vibe_coding_tracker::models::ExtensionType;
 use vibe_coding_tracker::pricing::{ModelPricingMap, normalize_model_name};
 use vibe_coding_tracker::scan::build_scan_pool;
 use vibe_coding_tracker::session::{
-    ParseMode, parse_session_file_as, parse_session_file_typed_with_mode,
+    ParseMode, parse_session_file_typed_as, parse_session_file_typed_with_mode,
 };
 use vibe_coding_tracker::summary_cache::SummaryScanCache;
-use vibe_coding_tracker::usage::calculator::get_usage_from_paths_with_cache;
+use vibe_coding_tracker::usage::aggregator::aggregate_usage_from_paths_with_cache;
 use vibe_coding_tracker::utils::{HelperPaths, resolve_paths_from_home};
 
 /// Absolute path to a file under the repo's `tests/fixtures/` directory.
@@ -118,9 +118,13 @@ fn benchmark_file_parsing(c: &mut Criterion) {
         let path_buf = fixture(path);
         if path_buf.exists() {
             group.bench_with_input(
-                BenchmarkId::new("parse_session_file", name),
+                BenchmarkId::new("parse_session_file_to_value", name),
                 &path_buf,
-                |b, p| b.iter(|| vibe_coding_tracker::session::parse_session_file(black_box(p))),
+                |b, p| {
+                    b.iter(|| {
+                        vibe_coding_tracker::session::parse_session_file_to_value(black_box(p))
+                    })
+                },
             );
         }
     }
@@ -154,7 +158,7 @@ fn benchmark_known_provider_parsing(c: &mut Criterion) {
             group.bench_function(BenchmarkId::new(name, mode_name), |b| {
                 b.iter(|| {
                     black_box(
-                        parse_session_file_as(black_box(&path), provider, mode)
+                        parse_session_file_typed_as(black_box(&path), provider, mode)
                             .expect("parse known-provider benchmark fixture"),
                     )
                 })
@@ -219,8 +223,9 @@ fn build_scan_corpus(source_count: usize, fixture: &str) -> (TempDir, HelperPath
 }
 
 fn run_cached_scan(pool: &rayon::ThreadPool, paths: &HelperPaths, cache: &mut SummaryScanCache) {
-    let result = pool
-        .install(|| get_usage_from_paths_with_cache(paths, TimeRange::All, claude_only(), cache));
+    let result = pool.install(|| {
+        aggregate_usage_from_paths_with_cache(paths, TimeRange::All, claude_only(), cache)
+    });
     black_box(result.expect("scan benchmark corpus"));
 }
 
@@ -475,7 +480,7 @@ fn benchmark_batch_analysis(c: &mut Criterion) {
 
             // Simulate batch processing
             for (path, _name) in paths {
-                let _ = vibe_coding_tracker::session::parse_session_file(black_box(&path));
+                let _ = vibe_coding_tracker::session::parse_session_file_to_value(black_box(&path));
             }
         })
     });

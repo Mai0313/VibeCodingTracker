@@ -14,18 +14,19 @@ use serde_json::json;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use tempfile::TempDir;
+use vibe_coding_tracker::TimeRange;
 use vibe_coding_tracker::analysis::aggregator::{
     AnalysisData, aggregate_sessions_by_model_from_paths,
-    aggregate_sessions_by_model_from_paths_with, aggregate_sessions_by_model_from_paths_with_cache,
+    aggregate_sessions_by_model_from_paths_with_cache,
     aggregate_sessions_by_model_from_paths_with_diagnostics,
+    aggregate_sessions_by_model_from_paths_with_providers,
     collect_analysis_sessions_from_paths_with, project_code_analysis,
 };
-use vibe_coding_tracker::TimeRange;
 use vibe_coding_tracker::config::ProvidersConfig;
 use vibe_coding_tracker::models::ExtensionType;
 use vibe_coding_tracker::session::parser::{
-    parse_session_file, parse_session_file_as, parse_session_file_detailed,
-    parse_session_file_typed,
+    parse_session_file_to_value, parse_session_file_typed, parse_session_file_typed_as,
+    parse_session_file_with_diagnostics,
 };
 use vibe_coding_tracker::session::state::ParseMode;
 use vibe_coding_tracker::summary_cache::SummaryScanCache;
@@ -157,7 +158,7 @@ fn assert_analysis_data_eq(actual: &AnalysisData, expected: &AnalysisData) {
 
 #[test]
 fn test_single_file_analysis_claude() {
-    let analysis = parse_session_file(fixture("sessions/claude_code.jsonl"))
+    let analysis = parse_session_file_to_value(fixture("sessions/claude_code.jsonl"))
         .expect("should successfully analyze Claude file");
 
     assert!(analysis.is_object(), "Analysis should be a JSON object");
@@ -167,28 +168,28 @@ fn test_single_file_analysis_claude() {
 
 #[test]
 fn test_single_file_analysis_codex() {
-    let analysis = parse_session_file(fixture("sessions/codex.jsonl"))
+    let analysis = parse_session_file_to_value(fixture("sessions/codex.jsonl"))
         .expect("should successfully analyze Codex file");
     assert_eq!(analysis["extensionName"], "Codex");
 }
 
 #[test]
 fn test_single_file_analysis_copilot() {
-    let analysis = parse_session_file(fixture("sessions/copilot.jsonl"))
+    let analysis = parse_session_file_to_value(fixture("sessions/copilot.jsonl"))
         .expect("should successfully analyze Copilot file");
     assert_eq!(analysis["extensionName"], "Copilot-CLI");
 }
 
 #[test]
 fn test_single_file_analysis_gemini() {
-    let analysis = parse_session_file(fixture("sessions/gemini.jsonl"))
+    let analysis = parse_session_file_to_value(fixture("sessions/gemini.jsonl"))
         .expect("should successfully analyze Gemini file");
     assert_eq!(analysis["extensionName"], "Gemini");
 }
 
 #[test]
 fn test_single_file_analysis_grok() {
-    let analysis = parse_session_file(fixture("sessions/grok/signals.json"))
+    let analysis = parse_session_file_to_value(fixture("sessions/grok/signals.json"))
         .expect("should successfully analyze Grok file");
     assert_eq!(analysis["extensionName"], "Grok");
     let record = &analysis["records"][0];
@@ -237,8 +238,12 @@ fn disabled_grok_provider_is_not_scanned_for_analysis() {
         ..ProvidersConfig::default()
     };
 
-    let data = aggregate_sessions_by_model_from_paths_with(&home.paths, TimeRange::All, providers)
-        .expect("aggregate with Grok disabled");
+    let data = aggregate_sessions_by_model_from_paths_with_providers(
+        &home.paths,
+        TimeRange::All,
+        providers,
+    )
+    .expect("aggregate with Grok disabled");
     assert!(data.rows.is_empty());
     assert!(data.per_provider.grok.is_empty());
     assert_eq!(data.provider_days.grok, 0);
@@ -246,7 +251,7 @@ fn disabled_grok_provider_is_not_scanned_for_analysis() {
 
 #[test]
 fn test_analysis_record_structure() {
-    let analysis = parse_session_file(fixture("sessions/claude_code.jsonl")).unwrap();
+    let analysis = parse_session_file_to_value(fixture("sessions/claude_code.jsonl")).unwrap();
     let records = &analysis["records"];
     let first_record = records
         .as_array()
@@ -270,7 +275,7 @@ fn test_analysis_record_structure() {
 
 #[test]
 fn test_analysis_conversation_usage() {
-    let analysis = parse_session_file(fixture("sessions/claude_code.jsonl")).unwrap();
+    let analysis = parse_session_file_to_value(fixture("sessions/claude_code.jsonl")).unwrap();
     let records = &analysis["records"];
     let first_record = records.as_array().and_then(|arr| arr.first()).unwrap();
     let usage = &first_record["conversationUsage"];
@@ -295,7 +300,7 @@ fn test_analysis_conversation_usage() {
 
 #[test]
 fn test_analysis_tool_call_counts() {
-    let analysis = parse_session_file(fixture("sessions/claude_code.jsonl")).unwrap();
+    let analysis = parse_session_file_to_value(fixture("sessions/claude_code.jsonl")).unwrap();
     let records = &analysis["records"];
     let first_record = records.as_array().and_then(|arr| arr.first()).unwrap();
     let counts = &first_record["toolCallCounts"];
@@ -308,7 +313,7 @@ fn test_analysis_tool_call_counts() {
 
 #[test]
 fn test_analysis_file_operations() {
-    let analysis = parse_session_file(fixture("sessions/claude_code.jsonl")).unwrap();
+    let analysis = parse_session_file_to_value(fixture("sessions/claude_code.jsonl")).unwrap();
     let records = &analysis["records"];
     let first_record = records.as_array().and_then(|arr| arr.first()).unwrap();
 
@@ -348,8 +353,12 @@ fn disabled_provider_is_dropped_from_analysis_rollup() {
         gemini: false,
         ..ProvidersConfig::default()
     };
-    let data = aggregate_sessions_by_model_from_paths_with(&home.paths, TimeRange::All, providers)
-        .expect("aggregate with gemini disabled");
+    let data = aggregate_sessions_by_model_from_paths_with_providers(
+        &home.paths,
+        TimeRange::All,
+        providers,
+    )
+    .expect("aggregate with gemini disabled");
 
     assert!(
         data.rows
@@ -800,7 +809,7 @@ fn canonical_dataset_serializes_as_full_code_analysis_objects_in_provider_order(
 
 #[test]
 fn conversation_usage_keys_have_a_stable_serialization_order() {
-    let mut first = parse_session_file_as(
+    let mut first = parse_session_file_typed_as(
         fixture("sessions/claude_code.jsonl"),
         ExtensionType::ClaudeCode,
         ParseMode::Full,
@@ -889,8 +898,8 @@ fn full_and_usage_only_modes_have_identical_scalar_analysis() {
 
     for (name, provider) in fixtures {
         let path = fixture(name);
-        let full = parse_session_file_as(&path, provider, ParseMode::Full).unwrap();
-        let summary = parse_session_file_as(&path, provider, ParseMode::UsageOnly).unwrap();
+        let full = parse_session_file_typed_as(&path, provider, ParseMode::Full).unwrap();
+        let summary = parse_session_file_typed_as(&path, provider, ParseMode::UsageOnly).unwrap();
         assert_eq!(full.records.len(), summary.records.len(), "fixture={name}");
 
         for (full, summary) in full.records.iter().zip(&summary.records) {
@@ -951,7 +960,7 @@ fn full_and_usage_only_modes_have_identical_scalar_analysis() {
 
 #[test]
 fn single_code_analysis_uses_the_batch_projection() {
-    let analysis = parse_session_file_as(
+    let analysis = parse_session_file_typed_as(
         fixture("sessions/claude_code.jsonl"),
         ExtensionType::ClaudeCode,
         ParseMode::Full,
@@ -1266,7 +1275,8 @@ fn codex_unknown_apply_patch_output_surfaces_source_diagnostics() {
         ),
     );
 
-    let (analysis, diagnostics) = parse_session_file_detailed(&path, ParseMode::Full).unwrap();
+    let (analysis, diagnostics) =
+        parse_session_file_with_diagnostics(&path, ParseMode::Full).unwrap();
     assert_eq!(analysis.records[0].tool_call_counts.edit, 0);
     assert_eq!(diagnostics.skipped_records(), 1);
 
@@ -1418,7 +1428,8 @@ fn test_analysis_with_empty_file() {
     let empty_file = temp_dir.path().join("empty.jsonl");
     std::fs::write(&empty_file, "").unwrap();
 
-    let result = parse_session_file(&empty_file).expect("empty input has a defined JSON shape");
+    let result =
+        parse_session_file_to_value(&empty_file).expect("empty input has a defined JSON shape");
     assert_eq!(result, json!({}));
 }
 
@@ -1428,7 +1439,7 @@ fn test_analysis_with_invalid_json() {
     let invalid_file = temp_dir.path().join("invalid.jsonl");
     std::fs::write(&invalid_file, "not valid json\n{incomplete").unwrap();
 
-    let result = parse_session_file(&invalid_file);
+    let result = parse_session_file_to_value(&invalid_file);
     assert!(result.is_err(), "Should fail on invalid JSON");
 }
 
@@ -1517,8 +1528,9 @@ fn test_provider_known_extracts_usage_when_first_line_is_permission_mode() {
     let file = tmp.path().join("session.jsonl");
     write_claude_fixture_with_sentinel_prelude(&file, "permission-mode");
 
-    let analysis = parse_session_file_as(&file, ExtensionType::ClaudeCode, ParseMode::UsageOnly)
-        .expect("provider-known path should accept the sentinel prelude");
+    let analysis =
+        parse_session_file_typed_as(&file, ExtensionType::ClaudeCode, ParseMode::UsageOnly)
+            .expect("provider-known path should accept the sentinel prelude");
 
     assert_eq!(analysis.extension_name, "Claude-Code");
     assert_eq!(analysis.records.len(), 1);
@@ -1540,8 +1552,9 @@ fn test_provider_known_extracts_usage_when_first_line_is_file_history_snapshot()
     let file = tmp.path().join("session.jsonl");
     write_claude_fixture_with_sentinel_prelude(&file, "file-history-snapshot");
 
-    let analysis = parse_session_file_as(&file, ExtensionType::ClaudeCode, ParseMode::UsageOnly)
-        .expect("provider-known path should accept the sentinel prelude");
+    let analysis =
+        parse_session_file_typed_as(&file, ExtensionType::ClaudeCode, ParseMode::UsageOnly)
+            .expect("provider-known path should accept the sentinel prelude");
 
     let record = &analysis.records[0];
     assert!(
@@ -1556,8 +1569,9 @@ fn test_provider_known_extracts_usage_when_first_line_is_queue_operation() {
     let file = tmp.path().join("session.jsonl");
     write_claude_fixture_with_sentinel_prelude(&file, "queue-operation");
 
-    let analysis = parse_session_file_as(&file, ExtensionType::ClaudeCode, ParseMode::UsageOnly)
-        .expect("provider-known path should accept the sentinel prelude");
+    let analysis =
+        parse_session_file_typed_as(&file, ExtensionType::ClaudeCode, ParseMode::UsageOnly)
+            .expect("provider-known path should accept the sentinel prelude");
 
     let record = &analysis.records[0];
     assert!(
@@ -1572,7 +1586,8 @@ fn test_autodetect_sees_past_queue_operation_prelude() {
     let file = tmp.path().join("session.jsonl");
     write_claude_fixture_with_sentinel_prelude(&file, "queue-operation");
 
-    let analysis = parse_session_file(&file).expect("auto-detect should handle the prelude");
+    let analysis =
+        parse_session_file_to_value(&file).expect("auto-detect should handle the prelude");
     assert_eq!(analysis["extensionName"], "Claude-Code");
     assert_eq!(
         usage_input_tokens_for_model(&analysis, "claude-opus-4-7"),
@@ -1589,7 +1604,8 @@ fn test_autodetect_sees_past_sentinel_prelude() {
     let file = tmp.path().join("session.jsonl");
     write_claude_fixture_with_sentinel_prelude(&file, "permission-mode");
 
-    let analysis = parse_session_file(&file).expect("auto-detect should handle the prelude");
+    let analysis =
+        parse_session_file_to_value(&file).expect("auto-detect should handle the prelude");
 
     assert_eq!(analysis["extensionName"], "Claude-Code");
     assert_eq!(
@@ -1614,7 +1630,7 @@ fn test_autodetect_handles_ten_thousand_record_preamble() {
     body.push('\n');
     std::fs::write(&file, body).unwrap();
 
-    let analysis = parse_session_file(&file).expect("auto-detect should remain linear");
+    let analysis = parse_session_file_to_value(&file).expect("auto-detect should remain linear");
 
     assert_eq!(analysis["extensionName"], "Claude-Code");
     assert_eq!(

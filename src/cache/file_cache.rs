@@ -157,7 +157,7 @@ impl FileParseCache {
             || provider == Some(ExtensionType::Grok))
         .then(|| grok_dependency_stamps(path));
         let analysis = match provider {
-            Some(p) => crate::session::parse_session_file_as(path, p, ParseMode::Full)?,
+            Some(p) => crate::session::parse_session_file_typed_as(path, p, ParseMode::Full)?,
             None => crate::session::parse_session_file_typed(path)?,
         };
         let arc_analysis = Arc::new(analysis);

@@ -11,7 +11,7 @@ mod common;
 
 use common::fixture;
 use serde_json::Value;
-use vibe_coding_tracker::session::parser::parse_session_file;
+use vibe_coding_tracker::session::parser::parse_session_file_to_value;
 
 /// Compare two JSON values while ignoring specific fields
 ///
@@ -109,7 +109,7 @@ fn test_claude_code_parser() {
         serde_json::from_str(&expected_content).expect("Failed to parse expected result JSON");
 
     // Analyze the input file
-    let actual_result = parse_session_file(&input_file);
+    let actual_result = parse_session_file_to_value(&input_file);
     assert!(
         actual_result.is_ok(),
         "Failed to analyze Claude Code conversation: {:?}",
@@ -167,7 +167,7 @@ fn test_codex_parser() {
         serde_json::from_str(&expected_content).expect("Failed to parse expected result JSON");
 
     // Analyze the input file
-    let actual_result = parse_session_file(&input_file);
+    let actual_result = parse_session_file_to_value(&input_file);
     assert!(
         actual_result.is_ok(),
         "Failed to analyze Codex conversation: {:?}",
@@ -225,7 +225,7 @@ fn test_copilot_parser() {
         serde_json::from_str(&expected_content).expect("Failed to parse expected result JSON");
 
     // Analyze the input file
-    let actual_result = parse_session_file(&input_file);
+    let actual_result = parse_session_file_to_value(&input_file);
     assert!(
         actual_result.is_ok(),
         "Failed to analyze Copilot conversation: {:?}",
@@ -283,7 +283,7 @@ fn test_gemini_parser() {
         serde_json::from_str(&expected_content).expect("Failed to parse expected result JSON");
 
     // Analyze the input file
-    let actual_result = parse_session_file(&input_file);
+    let actual_result = parse_session_file_to_value(&input_file);
     assert!(
         actual_result.is_ok(),
         "Failed to analyze Gemini conversation: {:?}",
@@ -337,7 +337,8 @@ fn test_grok_parser() {
     )
     .expect("Failed to parse Grok golden result");
 
-    let actual_json = parse_session_file(&input_file).expect("Failed to analyze Grok session");
+    let actual_json =
+        parse_session_file_to_value(&input_file).expect("Failed to analyze Grok session");
     let ignore_fields = ["insightsVersion", "machineId", "user"];
     let matches = compare_json_ignore_fields(&actual_json, &expected_json, &ignore_fields);
 
@@ -393,7 +394,8 @@ fn test_gemini_parser_jsonl() {
             .expect("failed to write fixture");
     }
 
-    let actual = parse_session_file(&input_file).expect("parse Gemini fixture session file");
+    let actual =
+        parse_session_file_to_value(&input_file).expect("parse Gemini fixture session file");
 
     assert_eq!(actual["extensionName"], "Gemini");
     let record = &actual["records"][0];
