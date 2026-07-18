@@ -33,6 +33,7 @@ pub use crate::models::AggregatedAnalysisRow;
 
 /// Bundle of aggregated analysis rows plus the per-provider active-day counts
 /// the display layer needs for daily averages.
+#[derive(Debug, Clone, Serialize)]
 pub struct AnalysisData {
     /// Rows aggregated across *all* providers, keyed by model name.
     ///
@@ -67,7 +68,7 @@ pub struct AnalysisAggregation {
 /// Attribution is by provider directory, not by model name, so a model that
 /// appears under more than one provider (e.g. `claude-sonnet-4-6` recorded by
 /// both Claude Code and Copilot CLI) lands in the correct bucket.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize)]
 pub struct PerProviderAnalysisRows {
     /// Rows from the Claude Code session directory.
     pub claude: Vec<AggregatedAnalysisRow>,

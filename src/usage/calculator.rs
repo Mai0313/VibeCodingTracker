@@ -36,6 +36,7 @@ use crate::utils::{
 };
 use anyhow::Result;
 use rayon::prelude::*;
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::Path;
@@ -62,6 +63,7 @@ use std::sync::Arc;
 /// println!("active days: {}", data.provider_days.total);
 /// # Ok::<(), anyhow::Error>(())
 /// ```
+#[derive(Debug, Clone, Serialize)]
 pub struct UsageData {
     /// Tokens aggregated across *all* providers, keyed by model name.
     ///
@@ -102,7 +104,7 @@ pub struct UsageCollection {
 /// source compatibility, but the local Cursor estimate now carries zero stored
 /// cost and is priced by an exact LiteLLM match in the display layer. Separate
 /// maps prevent a colliding bare model name from cross-contaminating providers.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize)]
 pub struct StoredCosts {
     /// OpenCode's per-model stored cost, keyed by model name.
     pub opencode: FastHashMap<String, f64>,
