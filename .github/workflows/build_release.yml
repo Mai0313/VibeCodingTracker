@@ -15,6 +15,9 @@ jobs:
   build:
     name: ${{ matrix.runner }} - ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
+    # Linux builds run inside manylinux_2_28 so the binaries keep a glibc 2.28
+    # floor. The runner's own glibc (2.39) would restrict them to Ubuntu 24.04+.
+    container: ${{ matrix.container }}
 
     timeout-minutes: 30
 
@@ -31,9 +34,11 @@ jobs:
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             friendly_id: linux-x64-gnu
+            container: quay.io/pypa/manylinux_2_28_x86_64
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             friendly_id: linux-arm64-gnu
+            container: quay.io/pypa/manylinux_2_28_aarch64
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
             friendly_id: windows-x64
@@ -42,11 +47,24 @@ jobs:
             friendly_id: windows-arm64
 
     steps:
+      - name: Install manylinux build dependencies
+        if: ${{ matrix.container }}
+        run: |
+          # aws-lc-sys (rustls) needs cmake; libsqlite3-sys compiles bundled SQLite.
+          dnf install -y cmake perl
+
       - name: Checkout
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Trust the workspace inside the container
+        if: ${{ matrix.container }}
+        run: |
+          # build.rs shells out to git for BUILD_VERSION; without this it would
+          # silently fall back to the Cargo.toml version.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Setup Rust Toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1.17.0
@@ -80,6 +98,20 @@ jobs:
           fi
           # Copy only the binary to avoid uploading sidecar files like *.d
           cp "${bin_dir}/${bin}" "${dest}/${bin}"
+
+      - name: Verify glibc floor
+        if: ${{ matrix.container }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="dist/${{ matrix.target }}/vibe_coding_tracker"
+          floor="GLIBC_2.28"
+          highest=$(objdump -T "$bin" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -1)
+          echo "Highest required symbol version: ${highest}"
+          if [ "$(printf '%s\n%s\n' "$floor" "$highest" | sort -V | tail -1)" != "$floor" ]; then
+            echo "::error::glibc floor regressed to ${highest}; expected ${floor} or lower"
+            exit 1
+          fi
 
       - name: Create .zip (Windows)
         if: ${{ startsWith(matrix.runner, 'windows') }}
