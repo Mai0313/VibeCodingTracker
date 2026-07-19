@@ -241,6 +241,9 @@ jobs:
       id-token: write
 
     strategy:
+      # A registry hiccup on one platform must not cancel the other five; npm
+      # refuses to republish a version, so a cancelled leg burns the tag.
+      fail-fast: false
       matrix:
         include:
           - friendly_id: macos-arm64
