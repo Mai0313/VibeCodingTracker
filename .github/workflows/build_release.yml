@@ -304,6 +304,9 @@ jobs:
       id-token: write
 
     strategy:
+      # Same reasoning as publish-npm-platform: npm refuses to republish a
+      # version, so a leg cancelled because a sibling failed burns the tag.
+      fail-fast: false
       matrix:
         include:
           - name: vibe-coding-tracker
@@ -329,8 +332,13 @@ jobs:
         id: version
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          # A prerelease tag must not take `latest`, and npm refuses an untagged
+          # prerelease publish outright, so derive the dist-tag from the version.
+          NPM_TAG=latest
+          case "${VERSION}" in *-*) NPM_TAG="${VERSION#*-}" ;; esac
           echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
-          echo "Publishing version: ${VERSION}"
+          echo "NPM_TAG=${NPM_TAG}" >> $GITHUB_OUTPUT
+          echo "Publishing version: ${VERSION} under dist-tag ${NPM_TAG}"
 
       - name: Update package.json name, version and platform deps
         working-directory: cli/nodejs
@@ -367,7 +375,7 @@ jobs:
       - name: Publish to npm
         working-directory: cli/nodejs
         run: |
-          npm publish --access public
+          npm publish --access public --tag ${{ steps.version.outputs.NPM_TAG }}
 
       - name: Verify publication
         working-directory: cli/nodejs
@@ -398,14 +406,22 @@ jobs:
 
       # A platform version winning `latest` on the host package would hand every
       # `npm install @mai0313/vct` a binary with no launcher, so assert loudly.
+      # Only the leg that publishes @mai0313/vct can establish this, and only
+      # when the release is not a prerelease (those keep `latest` where it was).
       - name: Verify @mai0313/vct latest is the wrapper
+        if: matrix.name == 'vct' && matrix.scope == '@mai0313' && steps.version.outputs.NPM_TAG == 'latest'
         run: |
           set -euo pipefail
           VERSION="${{ steps.version.outputs.VERSION }}"
-          LATEST=$(npm view @mai0313/vct dist-tags.latest)
+          LATEST=""
+          for _ in 1 2 3 4 5 6; do
+            LATEST=$(npm view @mai0313/vct dist-tags.latest 2>/dev/null || echo "")
+            [ "${LATEST}" = "${VERSION}" ] && break
+            sleep 10
+          done
           echo "@mai0313/vct latest = ${LATEST}"
           if [ "${LATEST}" != "${VERSION}" ]; then
-            echo "::error::@mai0313/vct latest is ${LATEST}, expected ${VERSION}."
+            echo "::error::@mai0313/vct latest is '${LATEST}', expected ${VERSION}."
             echo "::error::Repair with: npm dist-tag add @mai0313/vct@${VERSION} latest"
             exit 1
           fi
@@ -514,7 +530,10 @@ jobs:
         env:
           UV_PUBLISH_TOKEN: ${{ secrets.UV_PUBLISH_TOKEN }}
         run: |
-          uv publish wheelhouse/*.whl
+          # --check-url lets a re-run skip wheels already uploaded; without it
+          # uv aborts on the first duplicate and never retries the rest, and
+          # PyPI forbids reusing a filename, so the version stays half-published.
+          uv publish --check-url https://pypi.org/simple/ wheelhouse/*.whl
 
       - name: Verify publication
         working-directory: cli/python
