@@ -1,90 +1,133 @@
 #!/usr/bin/env node
 
+// Launcher for the Vibe Coding Tracker CLI.
+//
+// The native binary is not bundled here. Each platform ships as its own npm
+// package listed in optionalDependencies, so npm installs only the one matching
+// the host. This resolves that package and runs the binary inside it.
+
 const { spawn } = require('child_process');
-const path = require('path');
 const fs = require('fs');
+const path = require('path');
 
-// Determine platform-specific directory and binary name
-function getPlatformInfo() {
-  const platform = process.platform;
-  const arch = process.arch;
+const WRAPPER_NAME = require('../package.json').name;
+const BINARY_NAME = 'vibe_coding_tracker';
 
-  const platformMap = {
-    darwin: {
-      x64: { dir: 'macos-x64', binary: 'vibe_coding_tracker' },
-      arm64: { dir: 'macos-arm64', binary: 'vibe_coding_tracker' },
-    },
-    linux: {
-      x64: { dir: 'linux-x64-gnu', binary: 'vibe_coding_tracker' },
-      arm64: { dir: 'linux-arm64-gnu', binary: 'vibe_coding_tracker' },
-    },
-    win32: {
-      x64: { dir: 'windows-x64', binary: 'vibe_coding_tracker.exe' },
-      arm64: { dir: 'windows-arm64', binary: 'vibe_coding_tracker.exe' },
-    },
-  };
+// Keys are `${process.platform}-${process.arch}`.
+const PLATFORM_PACKAGES = {
+  'darwin-arm64': '@mai0313/vct-darwin-arm64',
+  'darwin-x64': '@mai0313/vct-darwin-x64',
+  'linux-arm64': '@mai0313/vct-linux-arm64',
+  'linux-x64': '@mai0313/vct-linux-x64',
+  'win32-arm64': '@mai0313/vct-win32-arm64',
+  'win32-x64': '@mai0313/vct-win32-x64',
+};
 
-  if (!platformMap[platform] || !platformMap[platform][arch]) {
-    console.error(`Unsupported platform: ${platform}-${arch}`);
-    process.exit(1);
+function fail(lines) {
+  for (const line of lines) {
+    console.error(line);
   }
-
-  return platformMap[platform][arch];
+  process.exit(1);
 }
 
-// Find the binary for current platform
-function findBinary() {
-  const platformInfo = getPlatformInfo();
-  const packageRoot = path.join(__dirname, '..');
-  const binariesDir = path.join(packageRoot, 'binaries');
+// Only npm lifecycle scripts get npm_config_user_agent, so fall back to
+// recognizing the install layout each package manager produces.
+function reinstallCommand() {
+  const userAgent = process.env.npm_config_user_agent || '';
+  const spec = `${WRAPPER_NAME}@latest`;
+  if (/\bbun\//.test(userAgent) || __dirname.includes('.bun')) {
+    return `bun install -g ${spec}`;
+  }
+  if (/\bpnpm\//.test(userAgent) || __dirname.includes(`${path.sep}.pnpm${path.sep}`)) {
+    return `pnpm add -g ${spec}`;
+  }
+  if (/\byarn\//.test(userAgent)) {
+    return `yarn global add ${spec}`;
+  }
+  return `npm install -g ${spec}`;
+}
 
-  if (!fs.existsSync(binariesDir)) {
-    console.error('Error: Binaries directory not found.');
-    console.error('Please reinstall the package.');
-    process.exit(1);
+// musl leaves glibcVersionRuntime unset; cheaper and more reliable than ldd.
+function isMusl() {
+  if (process.platform !== 'linux') {
+    return false;
+  }
+  const report =
+    typeof process.report?.getReport === 'function' ? process.report.getReport() : null;
+  return report != null && report.header?.glibcVersionRuntime === undefined;
+}
+
+function resolveBinary() {
+  const platformKey = `${process.platform}-${process.arch}`;
+  const platformPackage = PLATFORM_PACKAGES[platformKey];
+
+  if (!platformPackage) {
+    fail([
+      `${WRAPPER_NAME}: unsupported platform ${platformKey}`,
+      `  Supported: ${Object.keys(PLATFORM_PACKAGES).join(', ')}`,
+    ]);
   }
 
-  // Look for the binary in platform-specific subdirectory
-  const platformDir = path.join(binariesDir, platformInfo.dir);
-  const binaryPath = path.join(platformDir, platformInfo.binary);
+  let packageDir;
+  try {
+    packageDir = path.dirname(require.resolve(`${platformPackage}/package.json`));
+  } catch {
+    fail(
+      isMusl()
+        ? [
+            `${WRAPPER_NAME}: missing optional dependency ${platformPackage}`,
+            '  This looks like a musl system (Alpine); only glibc builds are published.',
+            '  Download a binary from https://github.com/Mai0313/VibeCodingTracker/releases instead.',
+          ]
+        : [
+            `${WRAPPER_NAME}: missing optional dependency ${platformPackage}`,
+            '  This usually means the install ran with --omit=optional or the download failed.',
+            `  Reinstall with: ${reinstallCommand()}`,
+          ],
+    );
+  }
 
+  const binaryName = process.platform === 'win32' ? `${BINARY_NAME}.exe` : BINARY_NAME;
+  const binaryPath = path.join(packageDir, binaryName);
   if (!fs.existsSync(binaryPath)) {
-    console.error(`Error: Binary not found for your platform: ${platformInfo.dir}/${platformInfo.binary}`);
-    console.error('Please reinstall the package.');
-    process.exit(1);
-  }
-
-  // Make binary executable on Unix-like systems
-  if (process.platform !== 'win32') {
-    try {
-      fs.chmodSync(binaryPath, 0o755);
-    } catch (err) {
-      // Ignore error if already executable
-    }
+    fail([
+      `${WRAPPER_NAME}: ${platformPackage} is installed but ${binaryName} is missing`,
+      `  Reinstall with: ${reinstallCommand()}`,
+    ]);
   }
 
   return binaryPath;
 }
 
-// Get binary path
-const binaryPath = findBinary();
-
-// Forward all arguments to the binary
-const args = process.argv.slice(2);
-const child = spawn(binaryPath, args, {
+const child = spawn(resolveBinary(), process.argv.slice(2), {
   stdio: 'inherit',
   windowsHide: true,
 });
 
+// Forward terminating signals so the TUI shuts down cleanly instead of being
+// orphaned when the wrapper dies first.
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.on(signal, () => {
+    if (!child.killed) {
+      try {
+        child.kill(signal);
+      } catch {
+        // The child already exited; nothing to signal.
+      }
+    }
+  });
+}
+
+child.on('error', (err) => {
+  console.error(`${WRAPPER_NAME}: failed to start binary: ${err.message}`);
+  process.exit(1);
+});
+
+// Mirror the child's termination reason so shell scripts see the right status.
 child.on('exit', (code, signal) => {
   if (signal) {
     process.kill(process.pid, signal);
   } else {
-    process.exit(code);
+    process.exit(code ?? 1);
   }
-});
-
-child.on('error', (err) => {
-  console.error('Failed to start binary:', err);
-  process.exit(1);
 });
