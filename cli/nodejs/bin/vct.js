@@ -12,6 +12,7 @@ const path = require('path');
 
 const WRAPPER_NAME = require('../package.json').name;
 const BINARY_NAME = 'vibe_coding_tracker';
+const FORWARDED_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'];
 
 // Keys are `${process.platform}-${process.arch}`.
 const PLATFORM_PACKAGES = {
@@ -104,16 +105,16 @@ const child = spawn(resolveBinary(), process.argv.slice(2), {
   windowsHide: true,
 });
 
-// Forward terminating signals so the TUI shuts down cleanly instead of being
-// orphaned when the wrapper dies first.
-for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+// Forward terminating signals so the TUI can restore the terminal instead of
+// being orphaned when the wrapper dies first. Every delivery is forwarded, not
+// just the first: supervisors escalate SIGINT to SIGTERM, and gating on
+// child.killed (which Node never clears) would swallow everything after it.
+for (const signal of FORWARDED_SIGNALS) {
   process.on(signal, () => {
-    if (!child.killed) {
-      try {
-        child.kill(signal);
-      } catch {
-        // The child already exited; nothing to signal.
-      }
+    try {
+      child.kill(signal);
+    } catch {
+      // The child already exited; its exit handler settles our status.
     }
   });
 }
@@ -125,9 +126,13 @@ child.on('error', (err) => {
 
 // Mirror the child's termination reason so shell scripts see the right status.
 child.on('exit', (code, signal) => {
-  if (signal) {
-    process.kill(process.pid, signal);
-  } else {
+  if (!signal) {
     process.exit(code ?? 1);
   }
+  // Drop our own handlers before re-raising, otherwise the signal is caught
+  // above and the wrapper exits 0 for a child that died on SIGINT.
+  for (const forwarded of FORWARDED_SIGNALS) {
+    process.removeAllListeners(forwarded);
+  }
+  process.kill(process.pid, signal);
 });
