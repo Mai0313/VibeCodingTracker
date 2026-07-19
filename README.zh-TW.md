@@ -99,9 +99,11 @@ npm install -g @mai0313/vct
 npm install -g @mai0313/vibe-coding-tracker
 ```
 
+只會下載你所在平台的執行檔：包裝套件在 `optionalDependencies` 中為每個平台各宣告一個 `@mai0313/vct-<platform>` 套件，npm 只安裝符合的那一個。
+
 #### 方法二：透過 PyPI 安裝
 
-**前置條件**：Python 3.8 或更高版本
+**前置條件**：Python 3.8 或更高版本，pip 20.3 或更高版本
 
 ```bash
 pip install vibe_coding_tracker
@@ -112,6 +114,8 @@ uv pip install vibe_coding_tracker
 uvx vibe_coding_tracker usage
 ```
 
+每個平台各自發佈一個 wheel，同樣只會下載你所在平台的執行檔。`PATH` 上的 `vct` 就是原生執行檔本身，而不是 Python 啟動器。
+
 #### 方法三：透過 crates.io 安裝
 
 使用 Cargo 從官方 Rust 套件倉庫安裝：
@@ -119,6 +123,8 @@ uvx vibe_coding_tracker usage
 ```bash
 cargo install vct-cli
 ```
+
+> **Linux**：發佈的執行檔需要 glibc 2.28 或更高版本（Ubuntu 20.04+、Debian 10+、RHEL 8+）。npm 與 PyPI 套件不涵蓋 Alpine 等 musl 發行版，請改從[發佈頁面](https://github.com/Mai0313/VibeCodingTracker/releases)下載執行檔或從原始碼建置。
 
 ### 首次執行
 
