@@ -99,7 +99,7 @@ npm install -g @mai0313/vct
 npm install -g @mai0313/vibe-coding-tracker
 ```
 
-Only your platform's binary is downloaded: the wrapper declares one `@mai0313/vct-<platform>` package per platform in `optionalDependencies`, and npm installs just the matching one.
+Only your platform's binary is downloaded. The package you install is a small launcher, and `optionalDependencies` pulls in just the one native build that matches your machine.
 
 #### Method 2: Install from PyPI
 
@@ -123,8 +123,6 @@ Install using Cargo from the official Rust package registry:
 ```bash
 cargo install vct-cli
 ```
-
-> **Linux**: the published binaries require glibc 2.28 or newer (Ubuntu 20.04+, Debian 10+, RHEL 8+). musl distributions such as Alpine are not covered by the npm and PyPI packages; grab a binary from the [releases page](https://github.com/Mai0313/VibeCodingTracker/releases) or build from source instead.
 
 ### First Run
 

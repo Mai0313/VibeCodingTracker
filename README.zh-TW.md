@@ -99,7 +99,7 @@ npm install -g @mai0313/vct
 npm install -g @mai0313/vibe-coding-tracker
 ```
 
-只會下載你所在平台的執行檔：包裝套件在 `optionalDependencies` 中為每個平台各宣告一個 `@mai0313/vct-<platform>` 套件，npm 只安裝符合的那一個。
+只會下載你所在平台的執行檔。你裝到的是一個輕量啟動器，`optionalDependencies` 只會拉取與你機器相符的那一份原生執行檔。
 
 #### 方法二：透過 PyPI 安裝
 
@@ -123,8 +123,6 @@ uvx vibe_coding_tracker usage
 ```bash
 cargo install vct-cli
 ```
-
-> **Linux**：發佈的執行檔需要 glibc 2.28 或更高版本（Ubuntu 20.04+、Debian 10+、RHEL 8+）。npm 與 PyPI 套件不涵蓋 Alpine 等 musl 發行版，請改從[發佈頁面](https://github.com/Mai0313/VibeCodingTracker/releases)下載執行檔或從原始碼建置。
 
 ### 首次執行
 
