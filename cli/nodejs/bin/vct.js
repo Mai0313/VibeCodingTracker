@@ -2,9 +2,10 @@
 
 // Launcher for the Vibe Coding Tracker CLI.
 //
-// The native binary is not bundled here. Each platform ships as its own npm
-// package listed in optionalDependencies, so npm installs only the one matching
-// the host. This resolves that package and runs the binary inside it.
+// The native binary is not bundled here. Each platform is published as its own
+// prerelease version of @mai0313/vct (2.3.0-linux-x64 and friends), aliased into
+// optionalDependencies so npm installs only the one matching the host. This
+// resolves that alias and runs the binary inside it.
 
 const { spawn } = require('child_process');
 const fs = require('fs');
@@ -14,8 +15,11 @@ const WRAPPER_NAME = require('../package.json').name;
 const BINARY_NAME = 'vibe_coding_tracker';
 const FORWARDED_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'];
 
-// Keys are `${process.platform}-${process.arch}`.
-const PLATFORM_PACKAGES = {
+// Keys are `${process.platform}-${process.arch}`; values are the alias names
+// from optionalDependencies, which are the directory names npm installs under.
+// They are not publishable package names -- every platform lives under
+// @mai0313/vct, distinguished by a version suffix.
+const PLATFORM_ALIASES = {
   'darwin-arm64': '@mai0313/vct-darwin-arm64',
   'darwin-x64': '@mai0313/vct-darwin-x64',
   'linux-arm64': '@mai0313/vct-linux-arm64',
@@ -60,28 +64,28 @@ function isMusl() {
 
 function resolveBinary() {
   const platformKey = `${process.platform}-${process.arch}`;
-  const platformPackage = PLATFORM_PACKAGES[platformKey];
+  const platformAlias = PLATFORM_ALIASES[platformKey];
 
-  if (!platformPackage) {
+  if (!platformAlias) {
     fail([
       `${WRAPPER_NAME}: unsupported platform ${platformKey}`,
-      `  Supported: ${Object.keys(PLATFORM_PACKAGES).join(', ')}`,
+      `  Supported: ${Object.keys(PLATFORM_ALIASES).join(', ')}`,
     ]);
   }
 
   let packageDir;
   try {
-    packageDir = path.dirname(require.resolve(`${platformPackage}/package.json`));
+    packageDir = path.dirname(require.resolve(`${platformAlias}/package.json`));
   } catch {
     fail(
       isMusl()
         ? [
-            `${WRAPPER_NAME}: missing optional dependency ${platformPackage}`,
+            `${WRAPPER_NAME}: no native binary installed for ${platformKey}`,
             '  This looks like a musl system (Alpine); only glibc builds are published.',
             '  Download a binary from https://github.com/Mai0313/VibeCodingTracker/releases instead.',
           ]
         : [
-            `${WRAPPER_NAME}: missing optional dependency ${platformPackage}`,
+            `${WRAPPER_NAME}: no native binary installed for ${platformKey}`,
             '  This usually means the install ran with --omit=optional or the download failed.',
             `  Reinstall with: ${reinstallCommand()}`,
           ],
@@ -92,7 +96,7 @@ function resolveBinary() {
   const binaryPath = path.join(packageDir, binaryName);
   if (!fs.existsSync(binaryPath)) {
     fail([
-      `${WRAPPER_NAME}: ${platformPackage} is installed but ${binaryName} is missing`,
+      `${WRAPPER_NAME}: the ${platformKey} package is installed but ${binaryName} is missing`,
       `  Reinstall with: ${reinstallCommand()}`,
     ]);
   }

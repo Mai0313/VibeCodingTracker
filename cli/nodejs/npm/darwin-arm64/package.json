@@ -1,5 +1,5 @@
 {
-  "name": "@mai0313/vct-darwin-arm64",
+  "name": "@mai0313/vct",
   "version": "0.0.0",
   "description": "Native binary for Vibe Coding Tracker on darwin-arm64",
   "author": "Wei Lee <mai@mai0313.com>",
