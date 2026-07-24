@@ -196,8 +196,12 @@ jobs:
           files: |
             dist/**/*
 
-  publish-npm:
-    name: Publish to npm - ${{ matrix.scope && format('{0}/', matrix.scope) || '' }}${{ matrix.name }}
+  # Each platform is published as a prerelease version of @mai0313/vct
+  # (<version>-linux-x64 and friends) carrying a single binary and declaring its
+  # os/cpu, so npm installs only the matching one. These must reach the registry
+  # before the wrappers below, which alias them by exact version.
+  publish-npm-platform:
+    name: Publish to npm - @mai0313/vct (${{ matrix.npm_platform }})
     needs: build
     runs-on: ubuntu-latest
 
@@ -206,6 +210,103 @@ jobs:
       id-token: write
 
     strategy:
+      # A registry hiccup on one platform must not cancel the other five; npm
+      # refuses to republish a version, so a cancelled leg burns the tag.
+      fail-fast: false
+      # All six publishes mutate the same packument, and npm answers concurrent
+      # writes with 409. Serialize them.
+      max-parallel: 1
+      matrix:
+        include:
+          - friendly_id: macos-arm64
+            npm_platform: darwin-arm64
+          - friendly_id: macos-x64
+            npm_platform: darwin-x64
+          - friendly_id: linux-arm64-gnu
+            npm_platform: linux-arm64
+          - friendly_id: linux-x64-gnu
+            npm_platform: linux-x64
+          - friendly_id: windows-arm64
+            npm_platform: win32-arm64
+          - friendly_id: windows-x64
+            npm_platform: win32-x64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Publishing version: ${VERSION}"
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ matrix.friendly_id }}
+          path: artifact
+
+      - name: Assemble platform package
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          pkg="cli/nodejs/npm/${{ matrix.npm_platform }}"
+
+          for archive in artifact/*.tar.gz; do
+            [ -e "$archive" ] || continue
+            tar -xzf "$archive" -C "$pkg"
+          done
+          for archive in artifact/*.zip; do
+            [ -e "$archive" ] || continue
+            unzip -q "$archive" -d "$pkg"
+          done
+
+          binary=$(jq -r '.files[0]' "$pkg/package.json")
+          test -f "$pkg/$binary"
+          case "$binary" in
+            *.exe) ;;
+            *) chmod +x "$pkg/$binary" ;;
+          esac
+
+          jq --arg v "${VERSION}-${{ matrix.npm_platform }}" '.version = $v' \
+             "$pkg/package.json" > "$pkg/package.json.tmp"
+          mv "$pkg/package.json.tmp" "$pkg/package.json"
+          cp README.md "$pkg/README.md"
+
+          echo "Package contents:" && ls -lh "$pkg"
+
+      # --tag is mandatory. Without it npm would move `latest` onto a binary-only
+      # version that has no bin field, breaking install for everyone. npm 11+
+      # refuses an untagged prerelease publish outright; the explicit tag keeps
+      # this correct on any npm.
+      - name: Publish to npm
+        working-directory: cli/nodejs/npm/${{ matrix.npm_platform }}
+        run: |
+          npm publish --access public --tag ${{ matrix.npm_platform }}
+
+  publish-npm:
+    name: Publish to npm - ${{ matrix.scope && format('{0}/', matrix.scope) || '' }}${{ matrix.name }}
+    needs: publish-npm-platform
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+
+    strategy:
+      # Same reasoning as publish-npm-platform: npm refuses to republish a
+      # version, so a leg cancelled because a sibling failed burns the tag.
+      fail-fast: false
       matrix:
         include:
           - name: vibe-coding-tracker
@@ -231,57 +332,39 @@ jobs:
         id: version
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          # A prerelease tag must not take `latest`, and npm refuses an untagged
+          # prerelease publish outright, so derive the dist-tag from the version.
+          NPM_TAG=latest
+          case "${VERSION}" in *-*) NPM_TAG="${VERSION#*-}" ;; esac
           echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
-          echo "Publishing version: ${VERSION}"
+          echo "NPM_TAG=${NPM_TAG}" >> $GITHUB_OUTPUT
+          echo "Publishing version: ${VERSION} under dist-tag ${NPM_TAG}"
 
-      - name: Download and extract build artifacts
-        uses: actions/download-artifact@v8
-        with:
-          path: cli/nodejs/binaries/temp
-          merge-multiple: true
-
-      - name: Extract binaries from archives
-        working-directory: cli/nodejs/binaries/temp
-        run: |
-          for archive in *; do
-            platform=$(echo "$archive" | sed -E 's/^vibe_coding_tracker-v[0-9]+\.[0-9]+\.[0-9]+-//')
-            platform="${platform%.tar.gz}"
-            platform="${platform%.zip}"
-
-            echo "Extracting $archive to $platform/"
-            mkdir -p "../$platform"
-
-            case "$archive" in
-              *.tar.gz) tar -xzf "$archive" -C "../$platform" ;;
-              *.zip)    unzip -q "$archive" -d "../$platform" ;;
-            esac
-          done
-
-      - name: Cleanup and verify
-        run: |
-          rm -rf cli/nodejs/binaries/temp
-          echo "Extracted binaries:" && ls -lhR cli/nodejs/binaries/
-
-      - name: Update package.json version and name
+      - name: Update package.json name, version and platform deps
         working-directory: cli/nodejs
         run: |
+          set -euo pipefail
           VERSION="${{ steps.version.outputs.VERSION }}"
           PACKAGE_NAME="${{ matrix.name }}"
           SCOPE="${{ matrix.scope }}"
 
-          # Update version
-          npm version ${VERSION} --no-git-tag-version
-
-          # Update package name with scope if present
           if [ -n "${SCOPE}" ]; then
             FULL_NAME="${SCOPE}/${PACKAGE_NAME}"
           else
             FULL_NAME="${PACKAGE_NAME}"
           fi
 
-          # Use jq to update package name
-          cat package.json | jq --arg name "${FULL_NAME}" '.name = $name' > package.json.tmp
+          # Each alias key already names its platform, so the exact prerelease
+          # version it points at is derived from the key itself.
+          jq --arg name "${FULL_NAME}" --arg v "${VERSION}" \
+             '.name = $name
+              | .version = $v
+              | .optionalDependencies |= with_entries(
+                  .value = "npm:@mai0313/vct@" + $v + "-" + (.key | ltrimstr("@mai0313/vct-"))
+                )' \
+             package.json > package.json.tmp
           mv package.json.tmp package.json
+          cat package.json
 
       - name: Copy README for npm
         run: |
@@ -292,7 +375,7 @@ jobs:
       - name: Publish to npm
         working-directory: cli/nodejs
         run: |
-          npm publish --access public
+          npm publish --access public --tag ${{ steps.version.outputs.NPM_TAG }}
 
       - name: Verify publication
         working-directory: cli/nodejs
@@ -319,6 +402,28 @@ jobs:
           else
             echo "Warning: Could not immediately verify publication"
             echo "Please check: https://www.npmjs.com/package/${FULL_NAME}"
+          fi
+
+      # A platform version winning `latest` on the host package would hand every
+      # `npm install @mai0313/vct` a binary with no launcher, so assert loudly.
+      # Only the leg that publishes @mai0313/vct can establish this, and only
+      # when the release is not a prerelease (those keep `latest` where it was).
+      - name: Verify @mai0313/vct latest is the wrapper
+        if: matrix.name == 'vct' && matrix.scope == '@mai0313' && steps.version.outputs.NPM_TAG == 'latest'
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          LATEST=""
+          for _ in 1 2 3 4 5 6; do
+            LATEST=$(npm view @mai0313/vct dist-tags.latest 2>/dev/null || echo "")
+            [ "${LATEST}" = "${VERSION}" ] && break
+            sleep 10
+          done
+          echo "@mai0313/vct latest = ${LATEST}"
+          if [ "${LATEST}" != "${VERSION}" ]; then
+            echo "::error::@mai0313/vct latest is '${LATEST}', expected ${VERSION}."
+            echo "::error::Repair with: npm dist-tag add @mai0313/vct@${VERSION} latest"
+            exit 1
           fi
 
   publish-pypi:
@@ -349,33 +454,11 @@ jobs:
           echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
           echo "Publishing version: ${VERSION}"
 
-      - name: Download and extract build artifacts
+      - name: Download build artifacts
         uses: actions/download-artifact@v8
         with:
-          path: cli/python/src/vibe_coding_tracker/binaries/temp
+          path: artifacts
           merge-multiple: true
-
-      - name: Extract binaries from archives
-        working-directory: cli/python/src/vibe_coding_tracker/binaries/temp
-        run: |
-          for archive in *; do
-            platform=$(echo "$archive" | sed -E 's/^vibe_coding_tracker-v[0-9]+\.[0-9]+\.[0-9]+-//')
-            platform="${platform%.tar.gz}"
-            platform="${platform%.zip}"
-
-            echo "Extracting $archive to $platform/"
-            mkdir -p "../$platform"
-
-            case "$archive" in
-              *.tar.gz) tar -xzf "$archive" -C "../$platform" ;;
-              *.zip)    unzip -q "$archive" -d "../$platform" ;;
-            esac
-          done
-
-      - name: Cleanup and verify
-        run: |
-          rm -rf cli/python/src/vibe_coding_tracker/binaries/temp
-          echo "Extracted binaries:" && ls -lhR cli/python/src/vibe_coding_tracker/binaries/
 
       - name: Update pyproject.toml version
         working-directory: cli/python
@@ -388,17 +471,69 @@ jobs:
           cp README.zh-CN.md cli/python/README.zh-CN.md
           cp README.zh-TW.md cli/python/README.zh-TW.md
 
-      - name: Build package
-        working-directory: cli/python
+      - name: Build per-platform wheels
         run: |
-          uv build
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.VERSION }}"
+
+          # Each wheel carries one platform's binary and is tagged accordingly,
+          # so pip resolves exactly one of them per host.
+          # manylinux@<arch> means "derive the glibc floor from the binary"; the
+          # rest are fixed by the target's own deployment floor.
+          targets=(
+            "macos-arm64 macosx_11_0_arm64"
+            "macos-x64 macosx_10_12_x86_64"
+            "linux-arm64-gnu manylinux@aarch64"
+            "linux-x64-gnu manylinux@x86_64"
+            "windows-arm64 win_arm64"
+            "windows-x64 win_amd64"
+          )
+
+          mkdir -p wheelhouse
+          for entry in "${targets[@]}"; do
+            read -r friendly_id tag <<< "$entry"
+            archive=$(ls artifacts/vibe_coding_tracker-v"${VERSION}"-"${friendly_id}".*)
+
+            rm -rf cli/python/bin
+            mkdir -p cli/python/bin
+            case "$archive" in
+              *.tar.gz) tar -xzf "$archive" -C cli/python/bin ;;
+              *.zip)    unzip -q "$archive" -d cli/python/bin ;;
+            esac
+
+            # Read the floor off the binary rather than hardcoding one, so the
+            # tag stays truthful whenever the build image's glibc moves.
+            if [[ "$tag" == manylinux@* ]]; then
+              floor=$(objdump -T cli/python/bin/vibe_coding_tracker \
+                      | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -1)
+              tag="manylinux_${floor#GLIBC_}_${tag#manylinux@}"
+              tag="${tag//./_}"
+              echo "${friendly_id}: requires ${floor}, tagging ${tag}"
+            fi
+
+            # Ship the binary under both CLI names; there is no Python launcher.
+            if [ -f cli/python/bin/vibe_coding_tracker.exe ]; then
+              cp cli/python/bin/vibe_coding_tracker.exe cli/python/bin/vct.exe
+            else
+              cp cli/python/bin/vibe_coding_tracker cli/python/bin/vct
+              chmod +x cli/python/bin/vct cli/python/bin/vibe_coding_tracker
+            fi
+
+            (cd cli/python && uv build --wheel --out-dir ../../wheelhouse)
+            uv run --no-project --with 'wheel>=0.45' python -m wheel tags \
+              --platform-tag "$tag" --remove wheelhouse/*-py3-none-any.whl
+          done
+
+          echo "Built wheels:" && ls -lh wheelhouse
 
       - name: Publish to PyPI
-        working-directory: cli/python
         env:
           UV_PUBLISH_TOKEN: ${{ secrets.UV_PUBLISH_TOKEN }}
         run: |
-          uv publish
+          # --check-url lets a re-run skip wheels already uploaded; without it
+          # uv aborts on the first duplicate and never retries the rest, and
+          # PyPI forbids reusing a filename, so the version stays half-published.
+          uv publish --check-url https://pypi.org/simple/ wheelhouse/*.whl
 
       - name: Verify publication
         working-directory: cli/python

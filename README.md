@@ -99,9 +99,11 @@ npm install -g @mai0313/vct
 npm install -g @mai0313/vibe-coding-tracker
 ```
 
+Only your platform's binary is downloaded. The package you install is a small launcher, and `optionalDependencies` pulls in just the one native build that matches your machine.
+
 #### Method 2: Install from PyPI
 
-**Prerequisites**: Python 3.8 or higher
+**Prerequisites**: Python 3.8 or higher, pip 20.3 or higher
 
 ```bash
 pip install vibe_coding_tracker
@@ -111,6 +113,8 @@ uv pip install vibe_coding_tracker
 # Run without installing, straight from PyPI (uv)
 uvx vibe_coding_tracker usage
 ```
+
+Each platform ships as its own wheel, so again only your platform's binary is downloaded. `vct` on your `PATH` is the native binary itself, not a Python launcher.
 
 #### Method 3: Install from crates.io
 

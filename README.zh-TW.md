@@ -99,9 +99,11 @@ npm install -g @mai0313/vct
 npm install -g @mai0313/vibe-coding-tracker
 ```
 
+只會下載你所在平台的執行檔。你裝到的是一個輕量啟動器，`optionalDependencies` 只會拉取與你機器相符的那一份原生執行檔。
+
 #### 方法二：透過 PyPI 安裝
 
-**前置條件**：Python 3.8 或更高版本
+**前置條件**：Python 3.8 或更高版本，pip 20.3 或更高版本
 
 ```bash
 pip install vibe_coding_tracker
@@ -111,6 +113,8 @@ uv pip install vibe_coding_tracker
 # Run without installing, straight from PyPI (uv)
 uvx vibe_coding_tracker usage
 ```
+
+每個平台各自發佈一個 wheel，同樣只會下載你所在平台的執行檔。`PATH` 上的 `vct` 就是原生執行檔本身，而不是 Python 啟動器。
 
 #### 方法三：透過 crates.io 安裝
 

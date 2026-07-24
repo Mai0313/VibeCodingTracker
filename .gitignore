@@ -22,5 +22,13 @@ target
 
 *.info
 
+# Release packaging staging, populated by the release workflow
+/cli/nodejs/npm/*/vibe_coding_tracker
+/cli/nodejs/npm/*/vibe_coding_tracker.exe
+/cli/nodejs/README*.md
+/cli/python/bin/
+/cli/python/README*.md
+/wheelhouse/
+
 TODO.md
 .env
