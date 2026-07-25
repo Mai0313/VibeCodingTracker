@@ -1,6 +1,6 @@
 # Quota + token refresh (raw curl/jq examples)
 
-Raw, copy-pastable `curl` + `jq` recipes for reading each provider's remaining quota and refreshing its OAuth token, straight from the credential files the official CLIs already manage on disk. No browser, no headless webview, so they work over plain SSH.
+Raw, copy-pastable `curl` + `jq` recipes for reading each provider's quota usage and refreshing its OAuth token, straight from the credential files the official CLIs already manage on disk. No browser, no headless webview, so they work over plain SSH.
 
 These are minimal examples: they stop at "dump the JSON response". Field extraction / mapping is left out on purpose.
 

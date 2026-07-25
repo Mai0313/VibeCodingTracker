@@ -68,7 +68,7 @@
 | **智能定价**     | 模糊模型匹配 + 从 LiteLLM 每日缓存更新                                |
 | **4 种显示模式** | 交互式 TUI、静态表格、纯文本和 JSON                                   |
 | **双维度分析**   | token/费用统计（`usage`）+ 代码操作统计（`analysis`）                 |
-| **实时额度面板** | Claude、Codex、Copilot 和 Cursor 的实时剩余额度                       |
+| **实时额度面板** | Claude、Codex、Copilot 和 Cursor 的实时额度用量                       |
 | **超轻量级**     | TUI 常驻内存 50 MB 以内、精简的 incremental scan, 基于 Rust 构建      |
 | **实时更新**     | 响应式 loading 与后台 refresh, 并高亮变化                             |
 
@@ -304,7 +304,7 @@ Grok 的 `usage` 是单一时点的本地 context 估算：vct 会把 `signals.j
 
 ### 实时额度面板
 
-`vct usage` 会**在仪表盘中直接显示 Claude Code、Codex、GitHub Copilot 与 Cursor 的实时剩余额度——完全零配置。** 不需要 status-line hook，也无需手动输入任何凭证：vct 会读取各 provider 自己的 OAuth 凭证，在后台线程调用其用量 API，并在你工作时保持面板持续更新。（想要更清爽的面板？在 [`config.toml`](#%E9%85%8D%E7%BD%AE) 中精简 `[usage.quota]` 下的 `panels`，或设为 `[]` 隐藏整栏。）
+`vct usage` 会**在仪表盘中直接显示 Claude Code、Codex、GitHub Copilot 与 Cursor 的实时额度用量——完全零配置。** 不需要 status-line hook，也无需手动输入任何凭证：vct 会读取各 provider 自己的 OAuth 凭证，在后台线程调用其用量 API，并在你工作时保持面板持续更新。每个进度条都是**已用**百分比，所以进度条满格代表该额度周期已耗尽，而不是还没开始用。（想要更清爽的面板？在 [`config.toml`](#%E9%85%8D%E7%BD%AE) 中精简 `[usage.quota]` 下的 `panels`，或设为 `[]` 隐藏整栏。）
 
 ```
 ┌ Claude ─────────────────┐┌ Codex ──────────────────┐┌ Copilot ────────────────┐┌ Cursor ─────────────────┐

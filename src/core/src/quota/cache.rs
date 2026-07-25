@@ -1,5 +1,5 @@
 //! On-disk caches for the latest per-provider quota snapshots
-//! (`~/.vct/{claude,codex}_usage.json`).
+//! (`~/.vct/{claude,codex,copilot,cursor}_usage.json`).
 //!
 //! Each is a single last-known-good file (not dated like the pricing cache,
 //! since we always want the latest value). A fresh `vct usage` launch seeds

@@ -68,7 +68,7 @@ Automatically detects and processes logs from Claude Code, Codex, Copilot, Gemin
 | **Smart Pricing**     | Fuzzy model matching + daily cache from LiteLLM                          |
 | **4 Display Modes**   | Interactive TUI, static table, plain text, and JSON                      |
 | **Dual Analysis**     | Token/cost stats (`usage`) + code operation stats (`analysis`)           |
-| **Live Quota Panels** | Live remaining quota for Claude, Codex, Copilot, and Cursor              |
+| **Live Quota Panels** | Live quota usage for Claude, Codex, Copilot, and Cursor                  |
 | **Ultra-Lightweight** | Under ~50 MB RSS in the TUI, compact incremental scans — built with Rust |
 | **Live Updates**      | Responsive loading and background refreshes with change highlighting     |
 
@@ -304,7 +304,7 @@ For noninteractive `usage` and `analysis` scans, vct exits with an error when ev
 
 ### Live Quota Panels
 
-`vct usage` shows **live remaining quota for Claude Code, Codex, GitHub Copilot, and Cursor right in the dashboard — with zero setup.** No status-line hook, no credentials to enter: vct reads each provider's own credentials, calls its usage API on a background thread, and keeps the panels current while you work. (Prefer a quieter dashboard? Trim `panels` under `[usage.quota]` in [`config.toml`](#configuration), or set it to `[]` to hide the band.)
+`vct usage` shows **live quota usage for Claude Code, Codex, GitHub Copilot, and Cursor right in the dashboard — with zero setup.** No status-line hook, no credentials to enter: vct reads each provider's own credentials, calls its usage API on a background thread, and keeps the panels current while you work. Every gauge is percent **used**, so a full bar means the window is spent, not untouched. (Prefer a quieter dashboard? Trim `panels` under `[usage.quota]` in [`config.toml`](#configuration), or set it to `[]` to hide the band.)
 
 ```
 ┌ Claude ─────────────────┐┌ Codex ──────────────────┐┌ Copilot ────────────────┐┌ Cursor ─────────────────┐

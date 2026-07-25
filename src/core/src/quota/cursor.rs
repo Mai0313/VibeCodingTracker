@@ -53,8 +53,9 @@ pub(crate) fn cursor_ua() -> &'static str {
 
 /// A usable Cursor session: the synthesized cookie header + the JWT expiry.
 ///
-/// Shared with the session-data reader (`crate::session::cursor`), which reuses
-/// the same cookie to reach the dashboard usage-events API.
+/// Built and consumed only by this fetcher. The session-data reader
+/// (`crate::session::cursor`) reads local chat stores, so it needs neither a
+/// cookie nor the network.
 pub(crate) struct CursorSession {
     pub(crate) cookie: String,
     pub(crate) exp: i64,
