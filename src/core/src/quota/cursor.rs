@@ -104,16 +104,14 @@ pub fn map_cursor_usage(body: &str, now: i64) -> Result<CursorQuotaSnapshot> {
         serde_json::from_str(body).context("Failed to parse Cursor usage summary")?;
 
     let reset = resp.billing_cycle_end.as_deref().and_then(iso_to_unix_secs);
-    // NOTE: despite the `*PercentUsed` names, Cursor reports these inversely to
-    // absolute usage. Observed on a fresh free plan: `plan.used == 0` yet
-    // `totalPercentUsed == 94`, so the field is *not* percent used. We invert
-    // (100 - value) so a barely-used account reads as a near-empty gauge and
-    // matches what cursor.com shows, consistent with the other panels. Do not
-    // "simplify" this back to `p` — that regresses the gauge to show ~full for
-    // an unused account.
+    // `*PercentUsed` is percent consumed: the same response restates those very
+    // numbers in English via `autoModelSelectedDisplayMessage` /
+    // `namedModelSelectedDisplayMessage` ("You've used N% of your included …").
+    // Take them verbatim, clamped only as an out-of-range guard. Do not invert:
+    // #69 did, which reported an idle account as a full gauge with LIMIT set.
     let win = |pct: Option<f64>| {
         pct.map(|p| QuotaWindow {
-            used_percent: (100.0 - p).clamp(0.0, 100.0),
+            used_percent: p.clamp(0.0, 100.0),
             resets_at_unix: reset,
         })
     };
@@ -352,10 +350,10 @@ mod tests {
         let snap = map_cursor_usage(SUMMARY, 1_000_000).unwrap();
         assert_eq!(snap.source, QuotaSource::Api);
         assert_eq!(snap.plan_type.as_deref(), Some("free"));
-        // API reports percent remaining; the gauge shows used (100 - remaining).
-        assert_eq!(snap.total.as_ref().unwrap().used_percent, 6.0);
-        assert_eq!(snap.auto.as_ref().unwrap().used_percent, 0.0);
-        assert_eq!(snap.api.as_ref().unwrap().used_percent, 56.0);
+        // The API reports percent used; the gauge shows it verbatim.
+        assert_eq!(snap.total.as_ref().unwrap().used_percent, 94.0);
+        assert_eq!(snap.auto.as_ref().unwrap().used_percent, 100.0);
+        assert_eq!(snap.api.as_ref().unwrap().used_percent, 44.0);
         assert!(snap.total.as_ref().unwrap().resets_at_unix.unwrap() > 0);
         // On-demand disabled → no dollar figure.
         assert!(snap.on_demand_dollars.is_none());
@@ -383,20 +381,49 @@ mod tests {
 
     #[test]
     fn flags_limit_when_total_maxed() {
-        // 0% remaining -> 100% used -> limit reached.
-        let body =
-            r#"{ "isUnlimited": false, "individualUsage": { "plan": { "totalPercentUsed": 0 } } }"#;
+        let body = r#"{ "isUnlimited": false, "individualUsage": { "plan": { "totalPercentUsed": 100 } } }"#;
         let snap = map_cursor_usage(body, 1).unwrap();
         assert!(snap.limit_reached);
     }
 
     #[test]
     fn unlimited_never_flags_limit() {
-        // Even at 0% remaining (fully used), the unlimited flag suppresses LIMIT.
-        let body =
-            r#"{ "isUnlimited": true, "individualUsage": { "plan": { "totalPercentUsed": 0 } } }"#;
+        // Even at 100% used, the unlimited flag suppresses LIMIT.
+        let body = r#"{ "isUnlimited": true, "individualUsage": { "plan": { "totalPercentUsed": 100 } } }"#;
         let snap = map_cursor_usage(body, 1).unwrap();
         assert!(!snap.limit_reached);
+    }
+
+    #[test]
+    fn idle_account_reads_as_unused() {
+        // The shape a never-used plan actually returns. Inverting it renders
+        // three full gauges and a spurious LIMIT flag.
+        let body = r#"{
+          "membershipType": "free",
+          "isUnlimited": false,
+          "individualUsage": {
+            "plan": {
+              "used": 0, "limit": 0, "remaining": 0,
+              "autoPercentUsed": 0, "apiPercentUsed": 0, "totalPercentUsed": 0
+            }
+          }
+        }"#;
+        let snap = map_cursor_usage(body, 1).unwrap();
+        assert_eq!(snap.total.as_ref().unwrap().used_percent, 0.0);
+        assert_eq!(snap.auto.as_ref().unwrap().used_percent, 0.0);
+        assert_eq!(snap.api.as_ref().unwrap().used_percent, 0.0);
+        assert!(!snap.limit_reached);
+    }
+
+    #[test]
+    fn out_of_range_percentages_are_clamped() {
+        // The clamp is the whole mapping now, so pin both arms: a gauge outside
+        // 0..=100 would break the bar width and the limit comparison.
+        let body = r#"{ "individualUsage": { "plan": { "totalPercentUsed": 150, "autoPercentUsed": -5 } } }"#;
+        let snap = map_cursor_usage(body, 1).unwrap();
+        assert_eq!(snap.total.as_ref().unwrap().used_percent, 100.0);
+        assert_eq!(snap.auto.as_ref().unwrap().used_percent, 0.0);
+        assert!(snap.limit_reached);
     }
 
     #[test]
@@ -427,7 +454,10 @@ mod tests {
         let client = build_client().unwrap();
 
         match fetch_cursor_usage(&client, "cookie", 1_000_000, &server.url("/ok")) {
-            FetchResult::Ok(snap) => assert_eq!(snap.plan_type.as_deref(), Some("free")),
+            FetchResult::Ok(snap) => {
+                assert_eq!(snap.plan_type.as_deref(), Some("free"));
+                assert_eq!(snap.total.as_ref().unwrap().used_percent, 94.0);
+            }
             _ => panic!("expected Ok"),
         }
         ok.assert();

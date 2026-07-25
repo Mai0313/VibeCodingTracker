@@ -169,7 +169,7 @@ curl -s "https://cursor.com/api/auth/me" \
     -H "Cookie: $COOKIE" -H "Accept: application/json" | jq
 ```
 
-Usage lives under `.individualUsage.plan` (`autoPercentUsed` / `apiPercentUsed` / `totalPercentUsed`), `.individualUsage.onDemand`, and `.teamUsage`; billing window under `.billingCycleStart` / `.billingCycleEnd`. Monetary `used` / `limit` values are in cents (divide by 100).
+Usage lives under `.individualUsage.plan` (`autoPercentUsed` / `apiPercentUsed` / `totalPercentUsed`), `.individualUsage.onDemand`, and `.teamUsage`; billing window under `.billingCycleStart` / `.billingCycleEnd`. Monetary `used` / `limit` values are in cents (divide by 100). The three `*PercentUsed` fields mean percent **used**: the same response restates those numbers in English via `autoModelSelectedDisplayMessage` / `namedModelSelectedDisplayMessage` ("You've used N% of your included total usage"), and an idle account returns `0` for all three. Use them verbatim — never invert.
 
 ### Fetch token usage (dashboard billing)
 
