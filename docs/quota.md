@@ -25,7 +25,7 @@ These headers are camouflage, not auth: the endpoints answer a bare bearer token
 Cadence matters more than any header, so poll slowly and back off on `429`.
 Codex does not strictly need it (OpenAI treats codex-cli traffic as sanctioned), but the example still sends a codex-shaped UA + originator for parity.
 Send only stable identity headers, never per-request/per-turn state.
-The version strings below are hardcoded for the example; a real implementation can detect them (e.g. `claude --version`, `codex --version`).
+The version strings below are hardcoded for the example; a real implementation can detect them (e.g. `claude --version`, `codex --version`, `grok --version`).
 
 ## Codex
 
@@ -254,44 +254,75 @@ Unlike Codex / Claude above, this refresh does **not** rotate the refresh token 
 
 ## Grok
 
-Credential file `~/.grok/auth.json`: a JSON object keyed by one entry per login, each `{ key, refresh_token, id_token, expires_at, oidc_client_id }`. The **access token is the `key` field** (not a field named `access_token`) — a JWT — and it is the bearer for the calls below. The refresh client id comes from `oidc_client_id`, else the trailing `::`-delimited segment of the entry key, else the CLI default.
+The current CLI is the Rust [`xai-org/grok-build`](https://github.com/xai-org/grok-build), and the calls below are exactly what its `x.ai/billing` extension sends — the same request behind the `/usage` slash command (alias `/cost`) and the status-bar credit meter.
 
-Every proxy call also sends `X-XAI-Token-Auth: xai-grok-cli` — the marker the Grok CLI attaches alongside the bearer.
+Credential file `~/.grok/auth.json` (`$GROK_HOME/auth.json`; `GROK_AUTH_PATH` relocates it): a JSON object with one entry per login scope, keyed `"<issuer>::<client_id>"` for an xAI OAuth2 login (e.g. `https://auth.x.ai::b1a00492-…`), `"xai::api_key"` for a plain API key, or the legacy `"https://accounts.x.ai/sign-in"`. The **access token is the `key` field** (not a field named `access_token`) — a JWT — and the same entry carries `user_id`, `refresh_token`, `expires_at`, `oidc_issuer`, and `oidc_client_id`.
+
+Only two headers are load-bearing: the bearer, and `X-XAI-Token-Auth: xai-grok-cli`, which tells the proxy's auth middleware to validate the token as a CLI session. `x-grok-client-version` feeds the proxy's version gate, so send it as well. The remaining headers (`x-userid`, `x-grok-client-mode`, `User-Agent`) are the CLI's own identity — see Client impersonation above.
 
 ### Fetch quota
 
 ```bash
 AUTH=~/.grok/auth.json
-TOKEN=$(jq -r 'to_entries[0].value.key' "$AUTH")   # access token lives under `.key`
+TOKEN=$(jq -r 'to_entries[0].value.key' "$AUTH")       # access token lives under `.key`
+USERID=$(jq -r 'to_entries[0].value.user_id' "$AUTH")
 
-# Weekly shared pool + pay-as-you-go cap (the exact call the Grok CLI makes):
 curl -s "https://cli-chat-proxy.grok.com/v1/billing?format=credits" \
     -H "Authorization: Bearer ${TOKEN}" \
     -H "X-XAI-Token-Auth: xai-grok-cli" \
-    -H "Accept: application/json" | jq
+    -H "x-userid: ${USERID}" \
+    -H "x-grok-client-version: 0.2.112" \
+    -H "x-grok-client-mode: interactive" \
+    -H "User-Agent: grok-pager/0.2.112 grok-shell/0.2.112 (linux; x86_64)" | jq
+```
 
-# Plan / subscription name:
+`billing?format=credits` returns the `GetGrokCreditsConfig` message wrapped as `{"config": {…}}`. Every money value is `{"val": <cents>}`, and proto3 JSON omits zero-valued scalars, so a `$0` amount arrives as `{}` and a false flag is simply absent. Fields:
+
+| Field                                                               | Meaning                                                                        |
+| ------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `creditUsagePercent`                                                | included-allowance usage, `0.0`–`100.0` — what the status bar shows            |
+| `currentPeriod`                                                     | `type` (`USAGE_PERIOD_TYPE_WEEKLY` / `…_MONTHLY`) plus RFC3339 `start` / `end` |
+| `onDemandCap` / `onDemandUsed`                                      | pay-as-you-go cap and spend this period                                        |
+| `prepaidBalance`                                                    | remaining purchased ("bought") credit balance                                  |
+| `isUnifiedBillingUser`                                              | whether the account is on the shared weekly/monthly pool                       |
+| `history[]`                                                         | past periods: `billingCycle` + `includedUsed` / `onDemandUsed` / `totalUsed`   |
+| `monthlyLimit` / `used` / `billingPeriodStart` / `billingPeriodEnd` | deprecated legacy shape, still emitted by older servers                        |
+
+The CLI fills `on_demand_enabled` and `subscription_tier` into the same object from remote settings, so a raw curl returns only `config`. Two companions live on the same base and take the same headers:
+
+```bash
+# Prepaid auto top-up rule (the CLI asks only when prepaidBalance is non-zero):
+curl -s "https://cli-chat-proxy.grok.com/v1/auto-topup-rule" \
+    -H "Authorization: Bearer ${TOKEN}" \
+    -H "X-XAI-Token-Auth: xai-grok-cli" \
+    -H "x-grok-client-version: 0.2.112" | jq
+
+# Plan / feature flags — `subscription_tier`, `subscription_tier_display`, `on_demand_enabled`:
 curl -s "https://cli-chat-proxy.grok.com/v1/settings" \
     -H "Authorization: Bearer ${TOKEN}" \
     -H "X-XAI-Token-Auth: xai-grok-cli" \
-    -H "Accept: application/json" | jq
+    -H "x-grok-client-version: 0.2.112" | jq
 ```
 
-`billing?format=credits` returns the `GetGrokCreditsConfig` message: the weekly shared-pool usage percent + reset, and the pay-as-you-go cap. Accounts not yet on unified weekly billing report no weekly pool. A `401` / `403` means the token expired: refresh (below) and retry once.
+A `401` / `403` means the token expired: refresh (below) and retry once. There are no `x-ratelimit-*` response headers anywhere in the CLI — a rate or credit limit reaches the client only as an inference error (`429`, or `402` once credits run out).
 
 ### Refresh token
 
+The token endpoint is never hardcoded: the CLI resolves it from OIDC discovery on the entry's issuer, so do the same.
+
 ```bash
 AUTH=~/.grok/auth.json
-RT=$(jq -r 'to_entries[0].value.refresh_token // to_entries[0].value.refresh' "$AUTH")
-# client id: the entry's oidc_client_id, else the trailing "::" segment of the entry key (no hardcoded fallback).
-CID=$(jq -r 'to_entries[0] | .value.oidc_client_id // (.key | split("::") | last) // empty' "$AUTH")
+RT=$(jq -r 'to_entries[0].value.refresh_token' "$AUTH")
+# issuer / client id: the entry's own fields, else the two "::"-delimited halves of the entry key.
+ISS=$(jq -r 'to_entries[0] | .value.oidc_issuer // (.key | split("::")[0])' "$AUTH")
+CID=$(jq -r 'to_entries[0] | .value.oidc_client_id // (.key | split("::") | last)' "$AUTH")
+TOKEN_URL=$(curl -s "${ISS}/.well-known/openid-configuration" | jq -r .token_endpoint)
 
-curl -s "https://auth.x.ai/oauth2/token" \
+curl -s "$TOKEN_URL" \
     -H "Content-Type: application/x-www-form-urlencoded" \
     --data-urlencode "grant_type=refresh_token" \
     --data-urlencode "client_id=${CID}" \
     --data-urlencode "refresh_token=${RT}" | jq
 ```
 
-Response carries `access_token` / `refresh_token` / `id_token` / `expires_in`. Write the new `access_token` back into that entry's `key`, plus the rotated `refresh_token` / `id_token` / `expires_at`, preserving every **other** entry in the file. There is no `client_secret` (xAI's CLI OAuth client is public and secret-less), so this refresh trips none of the secret scanners.
+For an xAI login that discovery resolves to `https://auth.x.ai/oauth2/token`. Response carries `access_token` / `refresh_token` / `id_token` / `expires_in`. Write the new `access_token` back into that entry's `key`, plus the rotated `refresh_token` and a fresh `expires_at`, preserving every **other** entry in the file. A team login also sends `principal_type` / `principal_id` form fields. There is no `client_secret` (xAI's CLI OAuth client is public and secret-less), so this refresh trips none of the secret scanners.
