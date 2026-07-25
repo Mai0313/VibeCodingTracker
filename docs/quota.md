@@ -276,7 +276,7 @@ curl -s "https://cli-chat-proxy.grok.com/v1/billing?format=credits" \
     -H "User-Agent: grok-pager/0.2.112 grok-shell/0.2.112 (linux; x86_64)" | jq
 ```
 
-`billing?format=credits` returns the `GetGrokCreditsConfig` message wrapped as `{"config": {…}}`. Every money value is `{"val": <cents>}`, and proto3 JSON omits zero-valued scalars, so a `$0` amount arrives as `{}` and a false flag is simply absent. Fields:
+`billing?format=credits` returns the `GetGrokCreditsConfig` message wrapped as `{"config": {…}}`. Every money value is `{"val": <cents>}`, and proto3 JSON omits zero-valued scalars, so a `$0` amount arrives as `{}` and a false flag is simply absent. That reaches the headline field too: an account with no spend this period returns no `creditUsagePercent` at all, so read an absent field as `0` rather than as an error. Fields:
 
 | Field                                                               | Meaning                                                                        |
 | ------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
@@ -288,7 +288,7 @@ curl -s "https://cli-chat-proxy.grok.com/v1/billing?format=credits" \
 | `history[]`                                                         | past periods: `billingCycle` + `includedUsed` / `onDemandUsed` / `totalUsed`   |
 | `monthlyLimit` / `used` / `billingPeriodStart` / `billingPeriodEnd` | deprecated legacy shape, still emitted by older servers                        |
 
-The CLI fills `on_demand_enabled` and `subscription_tier` into the same object from remote settings, so a raw curl returns only `config`. Two companions live on the same base and take the same headers:
+That table is what the CLI's own struct reads, and the wire response is a superset of it — a live account also returns `topUpMethod`, which the CLI ignores — so parse leniently rather than exhaustively. The CLI fills `on_demand_enabled` and `subscription_tier` into the same object from remote settings, so a raw curl returns only `config`. Two companions live on the same base and take the same headers:
 
 ```bash
 # Prepaid auto top-up rule (the CLI asks only when prepaidBalance is non-zero):
