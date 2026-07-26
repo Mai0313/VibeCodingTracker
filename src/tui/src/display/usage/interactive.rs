@@ -1656,17 +1656,25 @@ fn render_grok_quota(f: &mut Frame, area: Rect, grok: &GrokQuotaSnapshot, now: i
         has_data = true;
     }
     match (grok.on_demand_dollars, grok.on_demand_cap_dollars) {
-        // With a cap configured the spend reads as its own gauge.
+        // With a cap configured the spend reads as its own gauge. Both amounts
+        // are compacted (`$1.2K`) so a four-figure cap cannot outgrow the
+        // narrowest panel and get truncated into a smaller, plausible number.
         (Some(used), Some(cap)) if cap > 0.0 => lines.push(quota_gauge_line_value(
             "ondmd",
             (used / cap * 100.0).clamp(0.0, 100.0),
-            &format!("${used:.2}/${cap:.2}"),
+            &format!("{}/{}", format_cost_compact(used), format_cost_compact(cap)),
         )),
-        (Some(used), _) => lines.push(dim_line(&format!("on-demand: ${used:.2}"))),
+        (Some(used), _) => lines.push(dim_line(&format!(
+            "on-demand: {}",
+            format_cost_compact(used)
+        ))),
         _ => {}
     }
     if let Some(balance) = grok.prepaid_balance_dollars {
-        lines.push(dim_line(&format!("Balance: ${balance:.2}")));
+        lines.push(dim_line(&format!(
+            "Balance: {}",
+            format_cost_compact(balance)
+        )));
     }
     if has_data {
         lines.push(staleness_line(grok.fetched_at, now));
@@ -1976,6 +1984,25 @@ mod tests {
         assert!(rendered.contains("$18.40/$50.00"));
         assert!(rendered.contains("Balance: $2.50"));
         assert!(rendered.contains("updated just now"));
+    }
+
+    /// A four-figure cap must stay readable in the narrowest cell. Printing it
+    /// in full overflows and the clip turns `$5000.00` into `$500`, so the
+    /// gauge and the numbers next to it tell contradictory stories.
+    #[test]
+    fn grok_panel_compacts_large_money_rather_than_truncating_it() {
+        let grok = GrokQuotaSnapshot {
+            source: QuotaSource::Api,
+            included: Some(QuotaWindow::default()),
+            on_demand_dollars: Some(1234.50),
+            on_demand_cap_dollars: Some(5000.0),
+            prepaid_balance_dollars: Some(12345.0),
+            ..Default::default()
+        };
+        let rendered = render_min_panel(|frame, area| render_grok_quota(frame, area, &grok, 0));
+        // Exactly the 13 columns the gauge leaves in the narrowest cell.
+        assert!(rendered.contains("$1.24K/$5.00K"), "got:\n{rendered}");
+        assert!(rendered.contains("Balance: $12.3K"), "got:\n{rendered}");
     }
 
     /// The common free account: no money lines at all, and an unlabelled period
