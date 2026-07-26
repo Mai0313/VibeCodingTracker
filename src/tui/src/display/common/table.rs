@@ -335,6 +335,59 @@ pub fn frame_layout(area: Rect, content_min_w: u16, rail: bool, band_height: u16
     }
 }
 
+/// One numeric column of a scrollable table, plus how readily it may go.
+pub struct ColumnSpec {
+    /// Header text.
+    pub header: &'static str,
+    /// Column width in cells.
+    pub width: u16,
+    /// Drop order when the pane is too narrow: the highest rank goes first.
+    /// The columns a reader would miss most carry the lowest ranks.
+    pub drop_rank: u8,
+}
+
+/// Chooses which numeric columns survive in `inner` content columns.
+///
+/// Returns the kept columns in their original order together with the number
+/// dropped, which the caller shows in the table's title. Dropping whole columns
+/// from the low-value end keeps the model name readable; the previous behaviour
+/// gave every numeric column its full width and squeezed the name to nothing.
+pub fn fit_columns(specs: &[ColumnSpec], inner: u16, name_min_w: u16) -> (Vec<usize>, usize) {
+    let mut kept: Vec<usize> = (0..specs.len()).collect();
+    // Each column is preceded by one space of column spacing.
+    let span = |kept: &[usize]| -> u16 {
+        kept.iter()
+            .map(|&i| specs[i].width + 1)
+            .sum::<u16>()
+            .saturating_add(name_min_w)
+    };
+    while !kept.is_empty() && span(&kept) > inner {
+        let worst = kept
+            .iter()
+            .enumerate()
+            .max_by_key(|&(_, &i)| specs[i].drop_rank)
+            .map(|(pos, _)| pos);
+        match worst {
+            Some(pos) => {
+                kept.remove(pos);
+            }
+            None => break,
+        }
+    }
+    let dropped = specs.len() - kept.len();
+    (kept, dropped)
+}
+
+/// Border, title and drop-notice for a scrollable table.
+pub struct TableChrome<'a> {
+    /// Left-aligned title; carries the totals for the rows underneath.
+    pub title: &'a str,
+    /// Right-aligned notice naming what the table had to leave out.
+    pub note: Option<String>,
+    /// Border color.
+    pub border_color: RatatuiColor,
+}
+
 /// Builds a table row with the first `left_cols` cells left-aligned and the
 /// rest right-aligned, painted with `style`.
 ///
@@ -366,22 +419,38 @@ pub fn styled_row(cells: Vec<String>, style: Style, left_cols: usize) -> Ratatui
 pub fn render_scrollable_table(
     f: &mut Frame,
     area: Rect,
+    chrome: TableChrome<'_>,
     header: Vec<&str>,
     rows: Vec<RatatuiRow>,
     widths: &[Constraint],
-    border_color: RatatuiColor,
     row_count: usize,
     scroll: &mut ScrollState,
 ) {
     let viewport = area.height.saturating_sub(4);
 
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .title(Line::from(format!(" {} ", chrome.title)))
+        .border_style(Style::default().fg(chrome.border_color));
+    if let Some(note) = chrome.note {
+        block = block.title(
+            Line::from(Span::styled(
+                format!(" {note} "),
+                Style::default().fg(RatatuiColor::DarkGray),
+            ))
+            .right_aligned(),
+        );
+    }
+
     // Selection is shown purely by the row color (no leading symbol / gutter).
-    let table = create_ratatui_table(rows, header, widths, border_color).row_highlight_style(
-        Style::default()
-            .fg(RatatuiColor::Black)
-            .bg(RatatuiColor::Cyan)
-            .add_modifier(Modifier::BOLD),
-    );
+    let table = create_ratatui_table(rows, header, widths, chrome.border_color)
+        .block(block)
+        .row_highlight_style(
+            Style::default()
+                .fg(RatatuiColor::Black)
+                .bg(RatatuiColor::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
 
     f.render_stateful_widget(table, area, &mut scroll.table);
 
@@ -550,8 +619,8 @@ pub fn create_provider_row<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTENT_MIN_H, FOOTER_H, RAIL_MIN_W, Rect, fit_diagnostics, frame_layout, normalized_cpu,
-        rail_width,
+        CONTENT_MIN_H, ColumnSpec, FOOTER_H, RAIL_MIN_W, Rect, fit_columns, fit_diagnostics,
+        frame_layout, normalized_cpu, rail_width,
     };
 
     #[test]
@@ -605,6 +674,42 @@ mod tests {
         let off = frame_layout(Rect::new(0, 0, 200, 40), 66, false, 0);
         assert!(off.rail.is_none());
         assert_eq!(off.content.width, 200);
+    }
+
+    #[test]
+    fn columns_drop_from_the_low_value_end_before_the_name_is_squeezed() {
+        const COLS: [ColumnSpec; 4] = [
+            ColumnSpec {
+                header: "a",
+                width: 10,
+                drop_rank: 0,
+            },
+            ColumnSpec {
+                header: "b",
+                width: 10,
+                drop_rank: 1,
+            },
+            ColumnSpec {
+                header: "c",
+                width: 10,
+                drop_rank: 3,
+            },
+            ColumnSpec {
+                header: "d",
+                width: 10,
+                drop_rank: 2,
+            },
+        ];
+        // Everything fits: nothing is dropped and the order is preserved.
+        assert_eq!(fit_columns(&COLS, 100, 20), (vec![0, 1, 2, 3], 0));
+        // One column too many: the highest drop_rank goes first, and the kept
+        // columns stay in their original order.
+        assert_eq!(fit_columns(&COLS, 55, 20), (vec![0, 1, 3], 1));
+        assert_eq!(fit_columns(&COLS, 44, 20), (vec![0, 1], 2));
+        assert_eq!(fit_columns(&COLS, 33, 20), (vec![0], 3));
+        // The name minimum always wins; an impossibly narrow pane keeps no
+        // numeric column rather than cutting the name to nothing.
+        assert_eq!(fit_columns(&COLS, 20, 20), (vec![], 4));
     }
 
     #[test]

@@ -9,9 +9,10 @@ use crate::display::analysis::averages::{
     calculate_analysis_provider_totals_from_per_provider, convert_to_analysis_rows,
 };
 use crate::display::common::table::{
-    CONTENT_MIN_H, FOOTER_H, create_controls_with_status, create_provider_row,
-    create_ratatui_table, create_summary, frame_layout, init_process_metrics,
-    refresh_process_metrics, render_scrollable_table, render_too_small, styled_row,
+    CONTENT_MIN_H, ColumnSpec, FOOTER_H, TableChrome, create_controls_with_status,
+    create_provider_row, create_ratatui_table, create_summary, fit_columns, frame_layout,
+    init_process_metrics, refresh_process_metrics, render_scrollable_table, render_too_small,
+    styled_row,
 };
 use crate::display::common::tui::{
     InputAction, RefreshWorker, RefreshWorkerError, ScrollState, TerminalSession, UpdateTracker,
@@ -44,6 +45,9 @@ const ANALYSIS_MIN_H: u16 = 14;
 /// scrollable table (`frame_layout` gives it `CONTENT_MIN_H` ≈ 2 body rows after
 /// the border + header + margin) plus the one-line summary and controls rows.
 const ANALYSIS_BELOW_BAND_MIN_H: u16 = CONTENT_MIN_H + FOOTER_H;
+/// Floor for the model-name column, so narrowing the pane drops a metric column
+/// rather than cutting the name.
+const MODEL_COL_MIN_W: u16 = 20;
 
 /// Height of the provider band, or `None` when the terminal is too short to
 /// show it without squeezing the table / summary / controls beneath it.
@@ -436,17 +440,64 @@ fn render_analysis_frame_with_status(
         let band_height = analysis_panels_height(area.height, provider_rows.len()).unwrap_or(0);
         let chunks = frame_layout(area, ANALYSIS_MIN_W, false, band_height);
 
-        let header = vec![
-            "Model",
-            "Edit Lines",
-            "Read Lines",
-            "Write Lines",
-            "Bash",
-            "Edit",
-            "Read",
-            "TodoWrite",
-            "Write",
+        // Numeric columns, ordered by how readily they may be dropped when the
+        // pane is narrow. Line counts are the headline metric, so the per-tool
+        // call counts go first.
+        const NUMERIC: [ColumnSpec; 8] = [
+            ColumnSpec {
+                header: "Edit Lines",
+                width: 11,
+                drop_rank: 0,
+            },
+            ColumnSpec {
+                header: "Read Lines",
+                width: 11,
+                drop_rank: 1,
+            },
+            ColumnSpec {
+                header: "Write Lines",
+                width: 11,
+                drop_rank: 2,
+            },
+            ColumnSpec {
+                header: "Bash",
+                width: 7,
+                drop_rank: 4,
+            },
+            ColumnSpec {
+                header: "Edit",
+                width: 7,
+                drop_rank: 3,
+            },
+            ColumnSpec {
+                header: "Read",
+                width: 7,
+                drop_rank: 5,
+            },
+            ColumnSpec {
+                header: "TodoWrite",
+                width: 10,
+                drop_rank: 7,
+            },
+            ColumnSpec {
+                header: "Write",
+                width: 7,
+                drop_rank: 6,
+            },
         ];
+
+        let inner = chunks.content.width.saturating_sub(2);
+        let (kept, dropped) = fit_columns(&NUMERIC, inner, MODEL_COL_MIN_W);
+        let numeric_span: u16 = kept.iter().map(|&i| NUMERIC[i].width + 1).sum();
+        let model_w = inner.saturating_sub(numeric_span).max(MODEL_COL_MIN_W);
+
+        let mut header: Vec<&str> = Vec::with_capacity(kept.len() + 1);
+        header.push("Model");
+        header.extend(kept.iter().map(|&i| NUMERIC[i].header));
+
+        let mut widths: Vec<Constraint> = Vec::with_capacity(header.len());
+        widths.push(Constraint::Length(model_w));
+        widths.extend(kept.iter().map(|&i| Constraint::Length(NUMERIC[i].width)));
 
         // One selectable row per model; the grand total lives only in the
         // summary bar below. Compact K/M/B numbers keep long counts in-column.
@@ -458,44 +509,47 @@ fn render_analysis_frame_with_status(
                 } else {
                     Style::default()
                 };
-                styled_row(
-                    vec![
-                        row.model.clone(),
-                        format_compact(row.edit_lines as i64),
-                        format_compact(row.read_lines as i64),
-                        format_compact(row.write_lines as i64),
-                        format_compact(row.bash_count as i64),
-                        format_compact(row.edit_count as i64),
-                        format_compact(row.read_count as i64),
-                        format_compact(row.todo_write_count as i64),
-                        format_compact(row.write_count as i64),
-                    ],
-                    style,
-                    1,
-                )
+                let all = [
+                    format_compact(row.edit_lines as i64),
+                    format_compact(row.read_lines as i64),
+                    format_compact(row.write_lines as i64),
+                    format_compact(row.bash_count as i64),
+                    format_compact(row.edit_count as i64),
+                    format_compact(row.read_count as i64),
+                    format_compact(row.todo_write_count as i64),
+                    format_compact(row.write_count as i64),
+                ];
+                let mut cells = Vec::with_capacity(header.len());
+                cells.push(row.model.clone());
+                cells.extend(kept.iter().map(|&i| all[i].clone()));
+                styled_row(cells, style, 1)
             })
             .collect();
 
-        let widths = [
-            Constraint::Min(16),    // Model
-            Constraint::Length(11), // Edit Lines
-            Constraint::Length(11), // Read Lines
-            Constraint::Length(11), // Write Lines
-            Constraint::Length(7),  // Bash
-            Constraint::Length(7),  // Edit
-            Constraint::Length(7),  // Read
-            Constraint::Length(10), // TodoWrite
-            Constraint::Length(7),  // Write
-        ];
-
         let row_count = rows.len();
+        let title = format!(
+            "Models · {} lines · {} tool calls · {} models",
+            format_compact((totals.edit_lines + totals.read_lines + totals.write_lines) as i64),
+            format_compact(
+                (totals.bash_count
+                    + totals.edit_count
+                    + totals.read_count
+                    + totals.todo_write_count
+                    + totals.write_count) as i64
+            ),
+            rows_data.len()
+        );
         render_scrollable_table(
             f,
             chunks.content,
+            TableChrome {
+                title: &title,
+                note: (dropped > 0).then(|| format!("−{dropped} cols")),
+                border_color: RatatuiColor::Green,
+            },
             header,
             rows,
             &widths,
-            RatatuiColor::Green,
             row_count,
             scroll,
         );

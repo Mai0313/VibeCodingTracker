@@ -9,9 +9,9 @@
 
 use crate::display::common::ProviderTotal;
 use crate::display::common::table::{
-    FOOTER_H, create_controls_with_status, create_provider_row, create_ratatui_table,
-    create_summary, frame_layout, init_process_metrics, refresh_process_metrics,
-    render_scrollable_table, render_too_small, styled_row,
+    ColumnSpec, FOOTER_H, TableChrome, create_controls_with_status, create_provider_row,
+    create_ratatui_table, create_summary, fit_columns, frame_layout, init_process_metrics,
+    refresh_process_metrics, render_scrollable_table, render_too_small, styled_row,
 };
 use crate::display::common::tui::{
     InputAction, RefreshWorker, RefreshWorkerError, ScrollState, TerminalSession, UpdateTracker,
@@ -104,6 +104,16 @@ const USAGE_CONTENT_MIN_W: u16 = 66;
 /// Body rows the model table must keep for the quota grid to be worth drawing.
 /// Below this the grid folds to the one-line digest, which is announced there.
 const TABLE_MIN_BODY_H: u16 = 8;
+/// Model-name column floor, so a narrowing pane drops a numeric column rather
+/// than cutting a provider-prefixed name.
+const MODEL_COL_MIN_W: u16 = 20;
+/// Width past which the model column stops earning the slack and the share bar
+/// takes over. Long enough for the longest names in practice.
+const MODEL_COL_COMFORTABLE_W: u16 = 34;
+/// Share-bar column bounds. It appears only once every numeric column already
+/// fits, since a bar is worth less than the numbers it summarizes.
+const SHARE_COL_MIN_W: u16 = 12;
+const SHARE_COL_MAX_W: u16 = 24;
 /// How many providers can show a quota card (Claude / Codex / Copilot / Cursor
 /// / Grok). The grid never reads this — it only bounds the render dispatch.
 const MAX_QUOTA_PANELS: usize = 5;
@@ -885,15 +895,70 @@ fn render_usage_frame_with_status<B: Backend>(
             band_h,
         );
 
-        let header = vec![
-            "Model",
-            "Input",
-            "Output",
-            "Cache Read",
-            "Cache Write",
-            "Total",
-            "Cost (USD)",
+        // Numeric columns, ordered by how readily they may be dropped when the
+        // pane is narrow. Cost and Total are the reason the view exists, so they
+        // stay; the cache split goes first.
+        const NUMERIC: [ColumnSpec; 6] = [
+            ColumnSpec {
+                header: "Input",
+                width: 9,
+                drop_rank: 3,
+            },
+            ColumnSpec {
+                header: "Output",
+                width: 9,
+                drop_rank: 2,
+            },
+            ColumnSpec {
+                header: "Cache Read",
+                width: 11,
+                drop_rank: 4,
+            },
+            ColumnSpec {
+                header: "Cache Write",
+                width: 11,
+                drop_rank: 5,
+            },
+            ColumnSpec {
+                header: "Total",
+                width: 9,
+                drop_rank: 1,
+            },
+            ColumnSpec {
+                header: "Cost (USD)",
+                width: 12,
+                drop_rank: 0,
+            },
         ];
+
+        let inner = chunks.content.width.saturating_sub(2);
+        let (kept, dropped) = fit_columns(&NUMERIC, inner, MODEL_COL_MIN_W);
+        let numeric_span: u16 = kept.iter().map(|&i| NUMERIC[i].width + 1).sum();
+        // Slack past the model column's cap becomes the share bar.
+        let avail = inner.saturating_sub(numeric_span);
+        let slack = avail.saturating_sub(MODEL_COL_COMFORTABLE_W);
+        let share_w = if dropped == 0 && slack > SHARE_COL_MIN_W {
+            (slack - 1).min(SHARE_COL_MAX_W)
+        } else {
+            0
+        };
+        let model_w = avail
+            .saturating_sub(if share_w > 0 { share_w + 1 } else { 0 })
+            .max(MODEL_COL_MIN_W);
+
+        let mut header: Vec<&str> = Vec::with_capacity(kept.len() + 2);
+        header.push("Model");
+        header.extend(kept.iter().map(|&i| NUMERIC[i].header));
+        if share_w > 0 {
+            header.push("Share");
+        }
+
+        let mut widths: Vec<Constraint> = Vec::with_capacity(header.len());
+        widths.push(Constraint::Length(model_w));
+        widths.extend(kept.iter().map(|&i| Constraint::Length(NUMERIC[i].width)));
+        if share_w > 0 {
+            widths.push(Constraint::Length(share_w));
+        }
 
         // One selectable row per model. The grand total lives only in the
         // summary bar below (it was redundant here and in the provider band).
@@ -905,40 +970,42 @@ fn render_usage_frame_with_status<B: Backend>(
                 } else {
                     Style::default()
                 };
-                styled_row(
-                    vec![
-                        row.display_model.clone(),
-                        format_compact(row.input_tokens),
-                        format_compact(row.output_with_reasoning()),
-                        format_compact(row.cache_read),
-                        format_compact(row.cache_creation),
-                        format_compact(row.total),
-                        format_cost(row.cost),
-                    ],
-                    style,
-                    1,
-                )
+                let all = [
+                    format_compact(row.input_tokens),
+                    format_compact(row.output_with_reasoning()),
+                    format_compact(row.cache_read),
+                    format_compact(row.cache_creation),
+                    format_compact(row.total),
+                    format_cost(row.cost),
+                ];
+                let mut cells = Vec::with_capacity(header.len());
+                cells.push(row.display_model.clone());
+                cells.extend(kept.iter().map(|&i| all[i].clone()));
+                if share_w > 0 {
+                    cells.push(share_cell(row.total, totals.total, share_w));
+                }
+                styled_row(cells, style, 1)
             })
             .collect();
 
-        let widths = [
-            Constraint::Min(16),
-            Constraint::Length(9),
-            Constraint::Length(9),
-            Constraint::Length(11),
-            Constraint::Length(11),
-            Constraint::Length(9),
-            Constraint::Length(12),
-        ];
-
         let row_count = rows.len();
+        let title = format!(
+            "Models · {} · {} tokens · {} models",
+            format_cost(totals.cost),
+            format_compact(totals.total),
+            rows_data.len()
+        );
         render_scrollable_table(
             f,
             chunks.content,
+            TableChrome {
+                title: &title,
+                note: (dropped > 0).then(|| format!("−{dropped} cols")),
+                border_color: RatatuiColor::Green,
+            },
             header,
             rows,
             &widths,
-            RatatuiColor::Green,
             row_count,
             scroll,
         );
@@ -1347,6 +1414,19 @@ fn grid_cells(spec: &GridSpec, band: Rect, n: usize) -> Vec<Rect> {
         }
     }
     cells
+}
+
+/// Renders one model's share of the total tokens as a right-aligned bar plus
+/// percentage, sized to `width`.
+fn share_cell(value: i64, total: i64, width: u16) -> String {
+    if total <= 0 || width < 6 {
+        return String::new();
+    }
+    let share = (value as f64 / total as f64).clamp(0.0, 1.0);
+    // Six columns are reserved for " nnn.n%".
+    let bar_w = usize::from(width - 6);
+    let filled = (share * bar_w as f64).round() as usize;
+    format!("{}{:>5.1}%", "█".repeat(filled.min(bar_w)), share * 100.0)
 }
 
 /// Collects every present provider's card, in the fixed render order.
@@ -2743,6 +2823,26 @@ mod tests {
         let rendered = render_overlay(80, 13);
         assert!(rendered.contains("hidden"), "got:\n{rendered}");
         assert!(rendered.contains("Claude"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn share_cell_fills_its_column_without_overflowing() {
+        for width in [SHARE_COL_MIN_W, 18, SHARE_COL_MAX_W] {
+            for (value, total) in [(0i64, 100i64), (50, 100), (100, 100), (7, 1000)] {
+                let cell = share_cell(value, total, width);
+                assert!(
+                    cell.chars().count() <= usize::from(width),
+                    "{value}/{total} at {width}: {cell:?}"
+                );
+            }
+        }
+        // A full share fills the bar; an empty one draws none of it.
+        assert!(share_cell(100, 100, 20).starts_with('█'));
+        assert!(!share_cell(0, 100, 20).starts_with('█'));
+        // No totals yet, or a column too narrow to say anything: draw nothing
+        // rather than a bar that means nothing.
+        assert_eq!(share_cell(5, 0, 20), "");
+        assert_eq!(share_cell(5, 100, 4), "");
     }
 
     #[test]
