@@ -3276,4 +3276,174 @@ mod tests {
         let large = claude_card(&claude, 0, OVERLAY_GRID.max_w);
         assert!(large.lines.len() <= usize::from(OVERLAY_GRID.height - 2));
     }
+
+    /// Renders a whole usage frame at `w`x`h` and returns its rows.
+    ///
+    /// Frame-level rather than unit-level on purpose: every piece of this
+    /// layout fits itself to a width it is handed, so the defects worth
+    /// catching are the ones where the width handed down is the wrong one.
+    fn render_frame(w: u16, h: u16, present: QuotaPresence, overlay: bool) -> Vec<String> {
+        let mut bench = UsageFrameBenchmark::new(w, h).expect("frame fixture");
+        let quota = QuotaView {
+            claude: &bench.claude,
+            codex: &bench.codex,
+            copilot: &bench.copilot,
+            cursor: &bench.cursor,
+            grok: &bench.grok,
+            present,
+            band_enabled: true,
+            rail_visible: true,
+            overlay_open: overlay,
+        };
+        render_usage_frame_with_status(
+            &mut bench.terminal,
+            &bench.rows,
+            &bench.totals,
+            &bench.provider_totals,
+            &bench.update_tracker,
+            &bench.sys,
+            bench.pid,
+            &quota,
+            &mut bench.scroll,
+            false,
+            None,
+            false,
+        )
+        .expect("frame renders");
+        let buffer = bench.terminal.backend().buffer();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    const ALL_PRESENT: QuotaPresence = QuotaPresence {
+        claude: true,
+        codex: true,
+        copilot: true,
+        cursor: true,
+        grok: true,
+    };
+
+    /// Sizes worth pinning: the hard minimum, the common terminals, the rail
+    /// threshold either side, and one very wide.
+    const FRAME_SIZES: [(u16, u16); 8] = [
+        (USAGE_MIN_W, USAGE_MIN_H),
+        (80, 24),
+        (95, 30),
+        (96, 30),
+        (100, 30),
+        (120, 40),
+        (160, 45),
+        (220, 50),
+    ];
+
+    /// Asserts no cell on the row was cut mid-structure.
+    ///
+    /// `detail_line` only emits ` · ` between two parts it decided both fit,
+    /// and a `+N` marker is a promise that N things were held back — so a cell
+    /// ending on either is a line laid out for a width it did not get.
+    fn assert_no_clipped_markers(row: &str, context: &str) {
+        for cell in row.split('│') {
+            let cell = cell.trim_end();
+            assert!(
+                !cell.ends_with('·'),
+                "{context} was clipped mid-list: {row:?}"
+            );
+            assert!(
+                !cell.ends_with('+'),
+                "{context} clipped a `+N` marker: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn frame_never_draws_outside_its_own_width() {
+        for (w, h) in FRAME_SIZES {
+            for overlay in [false, true] {
+                for (y, row) in render_frame(w, h, ALL_PRESENT, overlay).iter().enumerate() {
+                    assert_eq!(
+                        row.chars().count(),
+                        usize::from(w),
+                        "{w}x{h} overlay={overlay}"
+                    );
+                    assert_no_clipped_markers(row, &format!("{w}x{h} overlay={overlay} row {y}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_size_shows_a_quota_surface_and_a_model_table() {
+        for (w, h) in FRAME_SIZES {
+            let screen = render_frame(w, h, ALL_PRESENT, false).join("\n");
+            assert!(screen.contains("Models"), "{w}x{h} lost the model table");
+            // Either the cards are on screen or the digest that replaces them
+            // is — never neither, and never both.
+            let has_cards = screen.contains("Claude") && screen.contains("Grok");
+            let has_digest = screen.contains("more → Q") || screen.contains("Claude -");
+            assert!(has_cards || has_digest, "{w}x{h} has no quota surface");
+            // Quitting is always discoverable.
+            assert!(screen.contains("q quit"), "{w}x{h} lost the quit hint");
+        }
+    }
+
+    #[test]
+    fn overlay_cards_are_built_for_the_cell_they_are_drawn_in() {
+        // Every "+N" on screen is a promise that N things were held back. If a
+        // card is laid out for a wider cell than it is drawn in, the marker
+        // itself is what gets cut — the promise loses its number, which is the
+        // exact shape of laying a card out against the spec maximum instead of
+        // the cell it gets. Codex's extras are sized to land on that boundary.
+        for (w, h) in [(100u16, 30u16), (120, 40), (160, 45), (220, 50)] {
+            let mut bench = UsageFrameBenchmark::new(w, h).expect("frame fixture");
+            bench.codex = CodexQuotaSnapshot {
+                source: QuotaSource::Api,
+                fetched_at: 1,
+                plan_type: Some("plus".into()),
+                credits_balance: Some("0".into()),
+                reset_credits_available: Some(2),
+                reset_credit_expirations: Some(vec![Some(10_000)]),
+                approx_messages: Some((120, 150)),
+                spend_limit: Some(50.0),
+                ..Default::default()
+            };
+            let quota = QuotaView {
+                claude: &bench.claude,
+                codex: &bench.codex,
+                copilot: &bench.copilot,
+                cursor: &bench.cursor,
+                grok: &bench.grok,
+                present: ALL_PRESENT,
+                band_enabled: true,
+                rail_visible: true,
+                overlay_open: true,
+            };
+            render_usage_frame_with_status(
+                &mut bench.terminal,
+                &bench.rows,
+                &bench.totals,
+                &bench.provider_totals,
+                &bench.update_tracker,
+                &bench.sys,
+                bench.pid,
+                &quota,
+                &mut bench.scroll,
+                false,
+                None,
+                false,
+            )
+            .expect("frame renders");
+            let buffer = bench.terminal.backend().buffer();
+            for y in 0..h {
+                let row: String = (0..w)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect();
+                assert_no_clipped_markers(&row, &format!("{w}x{h} row {y}"));
+            }
+        }
+    }
 }
