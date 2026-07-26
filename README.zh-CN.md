@@ -216,12 +216,12 @@ vct usage --table --merge-providers
 ### 预览：交互式面板（`vct usage`）
 
 ```
-┌ Models · $79.33 · 49.1M tokens · 3 models ────────────────────────── −1 cols ┐┌ Providers ───────────────────────────┐
-│Model                   Input     Output    Cache Read  Total     Cost (USD)  █│Provider       Tokens      Cost       │
+┌ Models · $79.33 · 49.1M tokens · 3 models ────────────────────────── −2 cols ┐┌ Providers ───────────────────────────┐
+│Model                               Input     Output    Total     Cost (USD)  █│Provider       Tokens      Cost       │
 │                                                                              █│                                      │
-│gemini-3.1-pro-preview       129K     10.3K       67.4K      207K        $0.40█│Claude         48.9M       $78.93     │
-│claude-haiku-4-5-202510     5.57K     19.8K       4.63M     5.28M        $1.34█│Gemini         207K        $0.40      │
-│claude-opus-4-8             25.7K      179K       40.8M     43.6M       $77.59█│                                      │
+│gemini-3.1-pro-preview                   129K     10.3K      207K        $0.40█│Claude         48.9M       $78.93     │
+│claude-haiku-4-5-20251001               5.57K     19.8K     5.28M        $1.34█│Gemini         207K        $0.40      │
+│claude-opus-4-8                         25.7K      179K     43.6M       $77.59█│                                      │
 │                                                                              █│                                      │
 │                                                                              █│                                      │
 └──────────────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────┘
@@ -232,8 +232,8 @@ vct usage --table --merge-providers
 │Fable ▰▰▰▰▱  79% 1d23h││credits 0 · +3 reset  ││                      ││api   ▰▰▰▱▱  44% 16d0h││balance $12.00        │
 │bal - · $0.00 used    ││reset expires 17d0h   ││                      ││                      ││                      │
 └──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘
-                Total Cost: $79.33  |  Total Tokens: 49.1M  |  Models: 3  |  Memory: 4.6 MB  |  CPU: 0.0%
-                       ↑/↓ scroll  m merge  p panes  Q quota  r refresh  q quit  |  Star on GitHub
+                Total Cost: $79.33  |  Total Tokens: 49.1M  |  Models: 3  |  Memory: 4.7 MB  |  CPU: 0.0%
+                       ↑/↓ scroll  m merge  p hide  Q quota  r refresh  q quit  |  Star on GitHub
 ```
 
 两个交互式面板都会在 terminal setup 完成后立即绘制居中的 `Loading sessions...` spinner. Loading 期间仍可响应 `q`, Ctrl+C 与 resize event. 后续扫描由单一 background worker 执行, 并在 `Refreshing...` footer 下保留上一次成功的数据. 重复的 refresh 请求最多只会合并为一个 pending scan. 如果 refresh 失败, 面板会保留 last-known-good view, 并在下次排程或手动刷新时重试.
@@ -325,7 +325,7 @@ Grok 的 `usage` 是单一时点的本地 context 估算：vct 会把 `signals.j
 
 **自动刷新 token。** 对 Claude、Codex 和 Grok，当 token 接近过期或被拒绝时，vct 会刷新它并把新 token 写回该 provider 自己的凭证文件（采用该 CLI 的原始格式），因此 token 会在多次检查之间复用，而不是每次都重新刷新。Grok 的 token 端点会像它自己的 CLI 那样，从登录时的 issuer 解析得出，而不是写死在代码里；写入时也会保留文件中其他所有的登录信息。如果刷新失败，面板会显示 `run: <provider> auth login` 提示，而不会直接中断。Copilot（长期有效的 token）和 Cursor（由其自身客户端保持最新）为只读——vct 从不写入它们的凭证文件。
 
-只有在某个 provider 的凭证存在时，才会显示对应的面板。面板排在一个统一网格上：一行放得下几张就放几张，放不下的自动折到下一行，因此新增一个 provider 只是多一张卡片，不会多一条排版规则。当终端高度不足以留给网格时，它会收成一行摘要，并写出没能显示的 provider；按 `Q` 打开完整的额度浮层，无论终端多大，每张卡片都放得下全部内容，按 `p` 可切换 Provider Usage 侧栏。额度面板仅在交互式 TUI 中显示；`--table`、`--text`、`--json` 不受影响。
+只有在某个 provider 的凭证存在时，才会显示对应的面板。面板排在一个统一网格上：一行放得下几张就放几张，放不下的自动折到下一行，因此新增一个 provider 只是多一张卡片，不会多一条排版规则。当终端高度不足以留给网格时，它会收成一行摘要，显示放得下的 gauge，并把其余的记成数量；按 `Q` 打开完整的额度浮层，无论终端多大，每张卡片都放得下全部内容，按 `p` 可切换 Provider Usage 侧栏。额度面板仅在交互式 TUI 中显示；`--table`、`--text`、`--json` 不受影响。
 
 > **平台说明：** 在 macOS 上，Claude Code 会把 OAuth 凭证保存在系统 Keychain 中，而不是 `~/.claude/.credentials.json`，因此在 macOS 上不会显示 Claude 面板。Cursor 的 `~/.config/cursor` 凭证路径偏向 Linux。
 
@@ -388,9 +388,10 @@ vct analysis --json --daily > today.json
 │                                                                                                                      █
 │claude-opus-4-8                               12.4K       88.1K       9.02K     412     231     604         96      88█
 │gemini-3.1-pro-preview                        2.10K       14.8K       1.62K      84      44     112         16      15█
-│claude-haiku-4-5-20251001                       840       5.40K         610      31      16      42          6       5│
+│claude-haiku-4-5-20251001                       840       5.40K         610      31      16      42          6       5█
+│                                                                                                                      █
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+┌ Providers ───────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │Provider                 Edit Lines  Read Lines  Write Lines  Bash     Edit     Read     TodoWrite   Write    Days    │
 │                                                                                                                      │
 │Claude                   13.2K       93.5K       9.63K        443      247      646      102         93       12      │

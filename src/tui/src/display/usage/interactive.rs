@@ -98,15 +98,19 @@ const CURSOR_COLOR: RatatuiColor = RatatuiColor::Rgb(64, 180, 180);
 /// Grok brand color (xAI near-black, lifted to stay readable on a dark terminal).
 const GROK_COLOR: RatatuiColor = RatatuiColor::Rgb(170, 170, 178);
 
-/// Width the scrollable model table needs before a side rail may take the rest.
-/// Model(16) + six numeric columns and their gaps, plus borders and scrollbar.
+/// Width below which the side rail is not worth its columns: the content pane
+/// keeps the model name plus roughly four numeric columns, which is the point
+/// where `fit_columns` starts dropping things a reader would miss. It is a
+/// policy floor, not the table's full span — the full six columns need 93.
 const USAGE_CONTENT_MIN_W: u16 = 66;
 /// Body rows the model table must keep for the quota grid to be worth drawing.
 /// Below this the grid folds to the one-line digest, which is announced there.
 const TABLE_MIN_BODY_H: u16 = 8;
 /// Model-name column floor, so a narrowing pane drops a numeric column rather
-/// than cutting a provider-prefixed name.
-const MODEL_COL_MIN_W: u16 = 20;
+/// than cutting the name. Sized for a date-suffixed model id
+/// (`claude-sonnet-4-5-20250929`), because two such ids differing only in the
+/// date would otherwise render as identical rows carrying different costs.
+const MODEL_COL_MIN_W: u16 = 26;
 /// Width past which the model column stops earning the slack and the share bar
 /// takes over. Long enough for the longest names in practice.
 const MODEL_COL_COMFORTABLE_W: u16 = 34;
@@ -783,10 +787,12 @@ pub fn display_usage_interactive_with_pool(
 /// - Real-time memory monitoring
 /// - Provider-grouped totals
 /// - Scrollable model table (arrow keys)
-/// - Keyboard controls: `q`, `Esc`, or `Ctrl+C` to exit, `r` to refresh, `m` to
-///   toggle merging models that share a base name across provider prefixes
-///   (e.g. `openai/gpt-5.5` + `azure/gpt-5.5`). `merge_providers` seeds the
-///   initial state and the `m` toggle is persisted back to `config.toml`.
+/// - Keyboard controls: `q` or `Ctrl+C` to exit; `Esc` closes the quota overlay
+///   and otherwise exits; `r` to refresh; `Q` to open the full quota detail;
+///   `p` to toggle the Provider Usage pane; `m` to toggle merging models that
+///   share a base name across provider prefixes (e.g. `openai/gpt-5.5` +
+///   `azure/gpt-5.5`). `merge_providers` seeds the initial state and the `m`
+///   toggle is persisted back to `config.toml`.
 ///
 /// `quota_panels` selects which live quota panels to show (by provider name);
 /// an empty list drops the band entirely. `providers` (from the config) selects
@@ -878,8 +884,9 @@ fn render_usage_frame_with_status<B: Backend>(
             return;
         }
 
-        // `band_enabled == false` (empty `quota_panels`) drops the whole quota
-        // surface, Provider Usage rail included — not just the gauges hidden.
+        // `band_enabled == false` (empty `quota_panels`) drops the quota
+        // surface. Provider Usage is local scan data, not a quota panel, so it
+        // is governed by the `p` toggle alone.
         let n = quota.present.count();
         let grid_h = visible_grid_height(area, quota.band_enabled, n);
         // A folded grid still costs one row, for the digest that replaces it.
@@ -888,12 +895,7 @@ fn render_usage_frame_with_status<B: Backend>(
         } else {
             u16::from(quota.band_enabled && n > 0)
         };
-        let chunks = frame_layout(
-            area,
-            USAGE_CONTENT_MIN_W,
-            quota.band_enabled && quota.rail_visible,
-            band_h,
-        );
+        let chunks = frame_layout(area, USAGE_CONTENT_MIN_W, quota.rail_visible, band_h);
 
         // Numeric columns, ordered by how readily they may be dropped when the
         // pane is narrow. Cost and Total are the reason the view exists, so they
@@ -1010,6 +1012,10 @@ fn render_usage_frame_with_status<B: Backend>(
             scroll,
         );
 
+        // The rail is one presentation of "show providers"; when the terminal
+        // is too narrow for a side pane the same toggle centers it as an
+        // overlay, so the totals are never simply unreachable.
+        let rail_folded = quota.rail_visible && chunks.rail.is_none();
         if let Some(rail_area) = chunks.rail {
             render_provider_rail(f, rail_area, &provider_rows);
         }
@@ -1075,16 +1081,24 @@ fn render_usage_frame_with_status<B: Backend>(
         } else {
             " merge  "
         };
+        let pane_hint = if quota.rail_visible {
+            " hide  "
+        } else {
+            " providers  "
+        };
         f.render_widget(
             create_controls_with_status(
-                &[("m", merge_hint), ("p", " panes  "), ("Q", " quota  ")],
+                &[("m", merge_hint), ("p", pane_hint), ("Q", " quota  ")],
                 status,
                 chunks.controls.width,
             ),
             chunks.controls,
         );
 
-        // Drawn last so it covers the frame it is layered over.
+        // Drawn last so they cover the frame they are layered over.
+        if rail_folded {
+            render_provider_overlay(f, area, &provider_rows);
+        }
         if quota.overlay_open {
             render_quota_overlay(f, area, quota, chrono::Local::now().timestamp());
         }
@@ -1335,10 +1349,18 @@ fn dim_line(text: &str) -> Line<'static> {
     ))
 }
 
+/// [`dim_line`] fitted to a card's content width.
+fn dim_line_fit(text: &str, inner_w: u16) -> Line<'static> {
+    dim_line(&fit_text(text, inner_w))
+}
+
 /// A red login-hint line shown when a provider's token needs a re-login.
-fn login_hint_line(hint: &str) -> Line<'static> {
+///
+/// Fitted rather than clipped: this is the one line on the card that tells the
+/// user what to *do*, so a half-drawn command would be worse than a marked one.
+fn login_hint_line(hint: &str, inner_w: u16) -> Line<'static> {
     Line::from(Span::styled(
-        hint.to_string(),
+        fit_text(hint, inner_w),
         Style::default()
             .fg(RatatuiColor::Red)
             .add_modifier(Modifier::BOLD),
@@ -1451,6 +1473,33 @@ fn collect_cards(quota: &QuotaView, now: i64, width: u16) -> Vec<QuotaCard> {
     cards
 }
 
+/// Renders the Provider Usage totals as a centered overlay.
+///
+/// Used when `p` is on but the terminal is too narrow for a side rail. The
+/// alternative was leaving the totals unreachable below 96 columns, which is
+/// exactly the kind of silent disappearance the rest of this layout avoids.
+fn render_provider_overlay(
+    f: &mut Frame,
+    area: Rect,
+    provider_rows: &[ProviderTotal<'_, ProviderStats>],
+) {
+    let listed = provider_rows
+        .iter()
+        .filter(|row| row.label != "All Providers")
+        .count();
+    // Border, header, header margin, share bar, plus a row per provider.
+    let height = (listed as u16 + 5).min(area.height.saturating_sub(2));
+    let width = area.width.saturating_sub(4).min(48);
+    let rect = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, rect);
+    render_provider_rail(f, rect, provider_rows);
+}
+
 /// Renders the full-screen quota overlay opened with `Q`.
 ///
 /// This is where a card gets enough room for every line it has, whatever the
@@ -1466,21 +1515,22 @@ fn render_quota_overlay(f: &mut Frame, area: Rect, quota: &QuotaView, now: i64) 
     };
     f.render_widget(Clear, outer);
 
-    let cards = collect_cards(quota, now, OVERLAY_GRID.max_w);
     let inner = Rect {
         x: outer.x + 1,
         y: outer.y + 1,
         width: outer.width.saturating_sub(2),
         height: outer.height.saturating_sub(2),
     };
+    // Lay the cells out first: a card's lines are built for the width they will
+    // be drawn at, never for the spec's maximum, or the fitting every line
+    // builder does would be against a cell the card never gets.
+    let present = quota.present.count();
+    let cells = grid_cells(&OVERLAY_GRID, inner, present);
+    let card_w = cells.first().map_or(OVERLAY_GRID.min_w, |cell| cell.width);
+    let cards = collect_cards(quota, now, card_w);
+    let rows_that_fit = usize::from(inner.height / OVERLAY_GRID.height);
     let (cols, _) = quota_grid(&OVERLAY_GRID, inner.width, cards.len());
-    let fits = if cols == 0 {
-        0
-    } else {
-        cards
-            .len()
-            .min(cols * usize::from(inner.height / OVERLAY_GRID.height))
-    };
+    let fits = cards.len().min(cols.saturating_mul(rows_that_fit));
     let hidden = cards.len() - fits;
 
     let mut block = Block::default()
@@ -1594,15 +1644,18 @@ fn render_provider_rail(
             .style(Style::default().fg(RatatuiColor::DarkGray)),
         );
     }
+    // The placeholder is a sentence, not a row: as a table cell it would be
+    // clipped to the width of the Provider column ("No provid").
     if totals_rows.is_empty() {
-        totals_rows.push(
-            RatatuiRow::new(vec![
-                "No provider data yet".to_string(),
-                "-".to_string(),
-                "-".to_string(),
-            ])
-            .style(Style::default().fg(RatatuiColor::DarkGray)),
+        f.render_widget(
+            Paragraph::new(dim_line_fit("No provider data yet", rows_area.width)),
+            rows_area,
         );
+        f.render_widget(
+            Paragraph::new(provider_share_bar(provider_rows, bar_area.width)),
+            bar_area,
+        );
+        return;
     }
 
     let totals_widths = [
@@ -1627,9 +1680,19 @@ fn render_provider_rail(
     );
 }
 
-/// Every present provider's headline gauge: the most-consumed of its windows,
-/// which is the one that will bite first.
-fn digest_items(quota: &QuotaView) -> Vec<(&'static str, RatatuiColor, Option<f64>)> {
+/// One provider's line in the folded digest.
+struct DigestItem {
+    name: &'static str,
+    color: RatatuiColor,
+    /// The most-consumed of the provider's windows, which bites first.
+    peak: Option<f64>,
+    limit_reached: bool,
+    needs_login: bool,
+}
+
+/// Every present provider's headline gauge plus the two states that must not
+/// wait for the overlay: a spent window and a token that needs a re-login.
+fn digest_items(quota: &QuotaView) -> Vec<DigestItem> {
     fn peak(windows: &[Option<&QuotaWindow>]) -> Option<f64> {
         windows
             .iter()
@@ -1642,43 +1705,57 @@ fn digest_items(quota: &QuotaView) -> Vec<(&'static str, RatatuiColor, Option<f6
 
     let mut items = Vec::with_capacity(MAX_QUOTA_PANELS);
     if quota.present.claude {
-        items.push((
-            "Claude",
-            CLAUDE_COLOR,
-            peak(&[
+        items.push(DigestItem {
+            name: "Claude",
+            color: CLAUDE_COLOR,
+            peak: peak(&[
                 quota.claude.five_hour.as_ref(),
                 quota.claude.seven_day.as_ref(),
                 quota.claude.scoped_weekly.as_ref(),
             ]),
-        ));
+            limit_reached: quota.claude.limit_reached,
+            needs_login: quota.claude.needs_login,
+        });
     }
     if quota.present.codex {
-        items.push((
-            "Codex",
-            CODEX_COLOR,
-            peak(&[quota.codex.primary.as_ref(), quota.codex.secondary.as_ref()]),
-        ));
+        items.push(DigestItem {
+            name: "Codex",
+            color: CODEX_COLOR,
+            peak: peak(&[quota.codex.primary.as_ref(), quota.codex.secondary.as_ref()]),
+            limit_reached: quota.codex.limit_reached == Some(true),
+            needs_login: quota.codex.needs_login,
+        });
     }
     if quota.present.copilot {
-        items.push((
-            "Copilot",
-            COPILOT_COLOR,
-            peak(&[quota.copilot.premium.as_ref()]),
-        ));
+        items.push(DigestItem {
+            name: "Copilot",
+            color: COPILOT_COLOR,
+            peak: peak(&[quota.copilot.premium.as_ref()]),
+            limit_reached: quota.copilot.limit_reached,
+            needs_login: quota.copilot.needs_login,
+        });
     }
     if quota.present.cursor {
-        items.push((
-            "Cursor",
-            CURSOR_COLOR,
-            peak(&[
+        items.push(DigestItem {
+            name: "Cursor",
+            color: CURSOR_COLOR,
+            peak: peak(&[
                 quota.cursor.total.as_ref(),
                 quota.cursor.auto.as_ref(),
                 quota.cursor.api.as_ref(),
             ]),
-        ));
+            limit_reached: quota.cursor.limit_reached,
+            needs_login: quota.cursor.needs_login,
+        });
     }
     if quota.present.grok {
-        items.push(("Grok", GROK_COLOR, peak(&[quota.grok.included.as_ref()])));
+        items.push(DigestItem {
+            name: "Grok",
+            color: GROK_COLOR,
+            peak: peak(&[quota.grok.included.as_ref()]),
+            limit_reached: quota.grok.limit_reached,
+            needs_login: quota.grok.needs_login,
+        });
     }
     items
 }
@@ -1687,13 +1764,23 @@ fn digest_items(quota: &QuotaView) -> Vec<(&'static str, RatatuiColor, Option<f6
 ///
 /// Segments are dropped whole from the tail, and the remainder is named in a
 /// trailing `+N more → Q`, so the line never implies it lists every provider.
-fn quota_digest(items: &[(&'static str, RatatuiColor, Option<f64>)], width: u16) -> Line<'static> {
+/// A spent window and a dead token are carried here rather than left for the
+/// overlay: they are the two states a user needs to act on, and the digest is
+/// the only quota surface on these terminal sizes.
+fn quota_digest(items: &[DigestItem], width: u16) -> Line<'static> {
     const SEP: &str = "  ·  ";
-    /// `Claude ▰▰▱ 58%` — a three-cell bar keeps the line short.
-    fn segment(name: &str, pct: Option<f64>) -> String {
-        match pct {
-            Some(pct) => format!("{name} {} {pct:.0}%", mini_bar_n(pct, 3)),
-            None => format!("{name} -"),
+    /// `Claude ▰▰▱ 58%`, `Claude LIMIT`, `Claude login` — a three-cell bar keeps
+    /// the line short.
+    fn segment(item: &DigestItem) -> String {
+        if item.needs_login {
+            return format!("{} login", item.name);
+        }
+        match item.peak {
+            Some(pct) if item.limit_reached => {
+                format!("{} {} LIMIT", item.name, mini_bar_n(pct, 3))
+            }
+            Some(pct) => format!("{} {} {pct:.0}%", item.name, mini_bar_n(pct, 3)),
+            None => format!("{} -", item.name),
         }
     }
 
@@ -1703,7 +1790,7 @@ fn quota_digest(items: &[(&'static str, RatatuiColor, Option<f64>)], width: u16)
 
     let widths: Vec<usize> = items
         .iter()
-        .map(|(name, _, pct)| segment(name, *pct).chars().count())
+        .map(|item| segment(item).chars().count())
         .collect();
     let mut shown = items.len();
     let mut used: usize = widths.iter().sum::<usize>() + SEP.chars().count() * (items.len() - 1);
@@ -1723,17 +1810,23 @@ fn quota_digest(items: &[(&'static str, RatatuiColor, Option<f64>)], width: u16)
     }
 
     let mut spans: Vec<Span> = Vec::with_capacity(shown * 2);
-    for (i, (name, color, pct)) in items.iter().take(shown).enumerate() {
+    for (i, item) in items.iter().take(shown).enumerate() {
         if i > 0 {
             spans.push(Span::styled(
                 SEP,
                 Style::default().fg(RatatuiColor::DarkGray),
             ));
         }
-        spans.push(Span::styled(
-            segment(name, *pct),
-            Style::default().fg(*color),
-        ));
+        // A provider needing attention is painted like the card's own flag, so
+        // the digest reads the same way the grid would have.
+        let style = if item.needs_login || item.limit_reached {
+            Style::default()
+                .fg(RatatuiColor::Red)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(item.color)
+        };
+        spans.push(Span::styled(segment(item), style));
     }
     let hidden = items.len() - shown;
     if hidden > 0 {
@@ -1802,16 +1895,39 @@ fn render_quota_card(f: &mut Frame, area: Rect, card: &QuotaCard) {
     f.render_widget(Paragraph::new(shown).block(block), area);
 }
 
+/// Truncates `text` to `width` columns, marking the cut with an ellipsis.
+///
+/// For text the card cannot shorten any other way. Everything with a structure
+/// to exploit (a gauge's reset marker, a detail line's parts) drops a whole
+/// element instead, so this is the last resort rather than the default.
+fn fit_text(text: &str, width: u16) -> String {
+    let width = usize::from(width);
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    text.chars()
+        .take(width.saturating_sub(1))
+        .collect::<String>()
+        + "…"
+}
+
 /// Builds the card's first line: plan tier on the left, fetch age on the right.
 ///
 /// Merging the two saves a row in every card, and they belong together — the age
-/// qualifies everything below it.
-fn plan_line(plan: &str, fetched_at: i64, now: i64, inner_w: u16) -> Line<'static> {
+/// qualifies everything below it. The plan string is provider-supplied and
+/// unbounded, so it is the side that gives way: the age always survives, because
+/// a clipped age (`2h1`) reads as fresher data rather than as a truncation, and
+/// a retained snapshot's age is the only sign it is stale.
+fn plan_line(plan: Option<&str>, fetched_at: i64, now: i64, inner_w: u16) -> Line<'static> {
     let (age, color) = staleness(fetched_at, now);
     let inner = usize::from(inner_w);
-    let pad = inner.saturating_sub(plan.chars().count() + age.chars().count());
+    let age_w = age.chars().count();
+    // One column of separation, so the two never run together.
+    let plan_w = inner.saturating_sub(age_w + 1);
+    let plan = fit_text(plan.unwrap_or("-"), plan_w as u16);
+    let pad = inner.saturating_sub(plan.chars().count() + age_w);
     Line::from(vec![
-        Span::styled(plan.to_string(), Style::default().fg(RatatuiColor::Gray)),
+        Span::styled(plan, Style::default().fg(RatatuiColor::Gray)),
         Span::raw(" ".repeat(pad)),
         Span::styled(age, Style::default().fg(color)),
     ])
@@ -1978,9 +2094,19 @@ fn claude_card(claude: &ClaudeQuotaSnapshot, now: i64, width: u16) -> QuotaCard 
         .filter(|_| claude.scoped_weekly.is_some());
     let label_w = label_width(&["5h", "7d", scoped.unwrap_or("")]);
 
-    let mut lines: Vec<Line> = Vec::new();
-    if let Some(plan) = &claude.plan_type {
-        lines.push(plan_line(plan, claude.fetched_at, now, inner));
+    // The plan/age line is unconditional: the age is the only sign that a
+    // retained snapshot is stale, and a provider without a plan label (Grok
+    // when its settings fetch failed) needs it just as much.
+    let mut lines: Vec<Line> = vec![plan_line(
+        claude.plan_type.as_deref(),
+        claude.fetched_at,
+        now,
+        inner,
+    )];
+    // The hint sits above the gauges rather than after them: it is the only
+    // actionable line on the card, so it must not be the one a short cell drops.
+    if claude.needs_login {
+        lines.push(login_hint_line(CLAUDE_LOGIN_HINT, inner));
     }
     // Track windows separately so a lone Plan line does not count as "has data".
     let mut has_data = false;
@@ -2022,10 +2148,9 @@ fn claude_card(claude: &ClaudeQuotaSnapshot, now: i64, width: u16) -> QuotaCard 
     if has_data && let Some(line) = detail_line(&claude_balance_parts(claude), inner) {
         lines.push(line);
     }
-    if claude.needs_login {
-        lines.push(login_hint_line(CLAUDE_LOGIN_HINT));
-    } else if !has_data {
-        lines.push(dim_line("no rate-limit data"));
+    // The login hint already explains an empty card, so the two never stack.
+    if !has_data && !claude.needs_login {
+        lines.push(dim_line_fit("no rate-limit data", inner));
     }
 
     QuotaCard {
@@ -2046,20 +2171,23 @@ fn codex_card(codex: &CodexQuotaSnapshot, now: i64, width: u16) -> QuotaCard {
     };
 
     let lines: Vec<Line> = if codex.source == QuotaSource::None {
-        let mut v = vec![dim_line("no Codex quota")];
+        let mut v = vec![dim_line_fit("no Codex quota", inner)];
         if codex.needs_login {
-            v.push(login_hint_line(CODEX_LOGIN_HINT));
+            v.push(login_hint_line(CODEX_LOGIN_HINT, inner));
         } else {
-            v.push(dim_line("(no auth.json / sessions)"));
+            v.push(dim_line_fit("(no auth.json / sessions)", inner));
         }
         v
     } else {
         let mut v = vec![plan_line(
-            codex.plan_type.as_deref().unwrap_or("?"),
+            codex.plan_type.as_deref(),
             codex.fetched_at,
             now,
             inner,
         )];
+        if codex.needs_login {
+            v.push(login_hint_line(CODEX_LOGIN_HINT, inner));
+        }
         if let Some(w) = &codex.primary {
             v.push(gauge_line(
                 "5h",
@@ -2080,10 +2208,8 @@ fn codex_card(codex: &CodexQuotaSnapshot, now: i64, width: u16) -> QuotaCard {
                 inner,
             ));
         }
-        // Keep session-fallback data visible but flag the re-login.
-        if codex.needs_login {
-            v.push(login_hint_line(CODEX_LOGIN_HINT));
-        } else {
+        // Session-fallback data stays visible alongside the re-login hint.
+        if !codex.needs_login {
             if let Some(line) = detail_line(&codex_credit_parts(codex), inner) {
                 v.push(line);
             }
@@ -2107,10 +2233,16 @@ fn copilot_card(copilot: &CopilotQuotaSnapshot, now: i64, width: u16) -> QuotaCa
     let inner = card_inner_w(width);
     let label_w = label_width(&["prem", "reqs"]);
 
-    let mut lines: Vec<Line> = Vec::new();
-    if let Some(plan) = &copilot.plan_type {
-        lines.push(plan_line(plan, copilot.fetched_at, now, inner));
+    let mut lines: Vec<Line> = vec![plan_line(
+        copilot.plan_type.as_deref(),
+        copilot.fetched_at,
+        now,
+        inner,
+    )];
+    if copilot.needs_login {
+        lines.push(login_hint_line(COPILOT_LOGIN_HINT, inner));
     }
+    let mut has_data = false;
     if let Some(w) = &copilot.premium {
         lines.push(gauge_line(
             "prem",
@@ -2134,14 +2266,14 @@ fn copilot_card(copilot: &CopilotQuotaSnapshot, now: i64, width: u16) -> QuotaCa
                 inner,
             ));
         }
+        has_data = true;
     } else if copilot.premium_unlimited {
-        lines.push(dim_line("premium: unlimited"));
+        lines.push(dim_line_fit("premium: unlimited", inner));
+        has_data = true;
     }
-    let has_content = !lines.is_empty();
-    if copilot.needs_login {
-        lines.push(login_hint_line(COPILOT_LOGIN_HINT));
-    } else if !has_content {
-        lines.push(dim_line("no Copilot quota"));
+    // The login hint already explains an empty card, so the two never stack.
+    if !has_data && !copilot.needs_login {
+        lines.push(dim_line_fit("no Copilot quota", inner));
     }
 
     QuotaCard {
@@ -2157,10 +2289,16 @@ fn cursor_card(cursor: &CursorQuotaSnapshot, now: i64, width: u16) -> QuotaCard 
     let inner = card_inner_w(width);
     let label_w = label_width(&["total", "auto", "api"]);
 
-    let mut lines: Vec<Line> = Vec::new();
-    if let Some(plan) = &cursor.plan_type {
-        lines.push(plan_line(plan, cursor.fetched_at, now, inner));
+    let mut lines: Vec<Line> = vec![plan_line(
+        cursor.plan_type.as_deref(),
+        cursor.fetched_at,
+        now,
+        inner,
+    )];
+    if cursor.needs_login {
+        lines.push(login_hint_line(CURSOR_LOGIN_HINT, inner));
     }
+    let mut has_data = false;
     for (label, window) in [
         ("total", &cursor.total),
         ("auto", &cursor.auto),
@@ -2175,6 +2313,7 @@ fn cursor_card(cursor: &CursorQuotaSnapshot, now: i64, width: u16) -> QuotaCard 
                 now,
                 inner,
             ));
+            has_data = true;
         }
     }
     if let Some(d) = cursor.on_demand_dollars
@@ -2182,11 +2321,9 @@ fn cursor_card(cursor: &CursorQuotaSnapshot, now: i64, width: u16) -> QuotaCard 
     {
         lines.push(line);
     }
-    let has_content = !lines.is_empty();
-    if cursor.needs_login {
-        lines.push(login_hint_line(CURSOR_LOGIN_HINT));
-    } else if !has_content {
-        lines.push(dim_line("no Cursor quota"));
+    // The login hint already explains an empty card, so the two never stack.
+    if !has_data && !cursor.needs_login {
+        lines.push(dim_line_fit("no Cursor quota", inner));
     }
 
     QuotaCard {
@@ -2205,9 +2342,14 @@ fn grok_card(grok: &GrokQuotaSnapshot, now: i64, width: u16) -> QuotaCard {
     let period = grok.period_label.as_deref().unwrap_or("incl");
     let label_w = label_width(&[period, "ondmd"]);
 
-    let mut lines: Vec<Line> = Vec::new();
-    if let Some(plan) = &grok.plan_type {
-        lines.push(plan_line(plan, grok.fetched_at, now, inner));
+    let mut lines: Vec<Line> = vec![plan_line(
+        grok.plan_type.as_deref(),
+        grok.fetched_at,
+        now,
+        inner,
+    )];
+    if grok.needs_login {
+        lines.push(login_hint_line(GROK_LOGIN_HINT, inner));
     }
     // Track the gauge separately so a lone Plan line does not count as data.
     let mut has_data = false;
@@ -2250,10 +2392,9 @@ fn grok_card(grok: &GrokQuotaSnapshot, now: i64, width: u16) -> QuotaCard {
     {
         lines.push(line);
     }
-    if grok.needs_login {
-        lines.push(login_hint_line(GROK_LOGIN_HINT));
-    } else if !has_data {
-        lines.push(dim_line("no Grok quota"));
+    // The login hint already explains an empty card, so the two never stack.
+    if !has_data && !grok.needs_login {
+        lines.push(dim_line_fit("no Grok quota", inner));
     }
 
     QuotaCard {
@@ -2337,6 +2478,7 @@ fn claude_balance_parts(claude: &ClaudeQuotaSnapshot) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::display::common::table::RAIL_MIN_W;
     use vct_core::models::Provider;
 
     fn line_text(line: Line<'_>) -> String {
@@ -2585,6 +2727,123 @@ mod tests {
         assert!(!rendered.contains("no Grok quota"));
     }
 
+    /// Renders the Provider Usage rail at a given size and returns its text.
+    fn render_rail(width: u16, height: u16, providers: usize) -> String {
+        let stats = ProviderStats {
+            total_tokens: 1_000,
+            total_cost: 1.0,
+            days_count: 1,
+        };
+        const NAMES: [Provider; 8] = [
+            Provider::ClaudeCode,
+            Provider::Codex,
+            Provider::Copilot,
+            Provider::Gemini,
+            Provider::Grok,
+            Provider::OpenCode,
+            Provider::Cursor,
+            Provider::Hermes,
+        ];
+        let rows: Vec<_> = NAMES
+            .iter()
+            .take(providers)
+            .map(|p| ProviderTotal::new(*p, &stats, false))
+            .collect();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| render_provider_rail(frame, frame.area(), &rows))
+            .expect("rail renders");
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn rail_says_how_many_providers_it_could_not_list() {
+        // Eight providers into a rail with room for four data rows: the ones
+        // that did not fit are counted, in the title and in the body, rather
+        // than the list just stopping at the border.
+        let short = render_rail(RAIL_MIN_W, 9, 8);
+        assert!(short.contains("+5"), "got:\n{short}");
+        assert!(short.contains("more"), "got:\n{short}");
+
+        // With room for all of them, neither marker appears.
+        let tall = render_rail(RAIL_MIN_W, 14, 8);
+        assert!(!tall.contains("more"), "got:\n{tall}");
+        assert!(tall.contains("Hermes"), "got:\n{tall}");
+
+        // No data at all still says so rather than drawing an empty box.
+        let empty = render_rail(RAIL_MIN_W, 10, 0);
+        assert!(empty.contains("No provider data yet"), "got:\n{empty}");
+    }
+
+    #[test]
+    fn model_table_columns_stay_readable_at_every_supported_width() {
+        // The production column set, at the widths the frame actually produces.
+        const NUMERIC: [ColumnSpec; 6] = [
+            ColumnSpec {
+                header: "Input",
+                width: 9,
+                drop_rank: 3,
+            },
+            ColumnSpec {
+                header: "Output",
+                width: 9,
+                drop_rank: 2,
+            },
+            ColumnSpec {
+                header: "Cache Read",
+                width: 11,
+                drop_rank: 4,
+            },
+            ColumnSpec {
+                header: "Cache Write",
+                width: 11,
+                drop_rank: 5,
+            },
+            ColumnSpec {
+                header: "Total",
+                width: 9,
+                drop_rank: 1,
+            },
+            ColumnSpec {
+                header: "Cost (USD)",
+                width: 12,
+                drop_rank: 0,
+            },
+        ];
+        for width in [USAGE_MIN_W, 80, 96, 100, 110, 120, 140, 160, 180, 200, 240] {
+            let content = frame_layout(Rect::new(0, 0, width, 30), USAGE_CONTENT_MIN_W, true, 0)
+                .content
+                .width;
+            let inner = content.saturating_sub(2);
+            let (kept, dropped) = fit_columns(&NUMERIC, inner, MODEL_COL_MIN_W);
+            let span: u16 = kept.iter().map(|&i| NUMERIC[i].width + 1).sum();
+            let model_w = inner.saturating_sub(span).max(MODEL_COL_MIN_W);
+
+            // Cost is never dropped: it is why the view exists.
+            assert!(kept.contains(&5), "width={width} dropped Cost");
+            // A date-suffixed model id stays distinguishable at every width.
+            assert!(
+                model_w >= MODEL_COL_MIN_W,
+                "width={width} gave the name {model_w} columns"
+            );
+            // Whatever is kept actually fits beside the name.
+            assert!(
+                span + MODEL_COL_MIN_W <= inner || kept.is_empty(),
+                "width={width} kept {} columns that do not fit",
+                kept.len()
+            );
+            assert_eq!(dropped, NUMERIC.len() - kept.len());
+        }
+    }
+
     #[test]
     fn grid_packs_by_width_and_wraps_the_remainder() {
         // One rule for every count: as many cards per row as the width allows.
@@ -2692,6 +2951,51 @@ mod tests {
     }
 
     #[test]
+    fn login_hint_survives_a_full_card() {
+        // A dead token on an otherwise-full snapshot: the actionable line must
+        // be on screen, not behind the `+N` marker, or a broken panel reads as
+        // a healthy one.
+        let claude = ClaudeQuotaSnapshot {
+            plan_type: Some("max 20x".into()),
+            five_hour: Some(QuotaWindow::default()),
+            seven_day: Some(QuotaWindow::default()),
+            scoped_weekly: Some(QuotaWindow::default()),
+            scoped_label: Some("Opus".into()),
+            balance: Some("$5.00".into()),
+            spend_used: Some("$1.20".into()),
+            needs_login: true,
+            ..Default::default()
+        };
+        let rendered = render_min_card(&claude_card(&claude, 0, CARD_GRID.min_w));
+        assert!(rendered.contains(CLAUDE_LOGIN_HINT), "got:\n{rendered}");
+        assert!(rendered.contains("+"), "and it says something was hidden");
+    }
+
+    #[test]
+    fn plan_line_shortens_the_plan_and_never_the_age() {
+        // The plan string is provider-supplied and unbounded; the age is the
+        // only signal a retained snapshot is stale, so the age always wins.
+        let inner = card_inner_w(CARD_GRID.min_w);
+        let text = line_text(plan_line(
+            Some("copilot_pro_plus_enterprise"),
+            1,
+            100_000,
+            inner,
+        ));
+        assert_eq!(text.chars().count(), usize::from(inner), "got {text:?}");
+        assert!(text.ends_with("ago"), "the age survives whole: {text:?}");
+        assert!(text.contains('…'), "and the cut is marked: {text:?}");
+
+        // A provider with no plan label still shows its age.
+        let text = line_text(plan_line(None, 1, 100_000, inner));
+        assert!(text.ends_with("ago"), "got {text:?}");
+        assert!(text.starts_with('-'), "got {text:?}");
+
+        // Never fetched reads as such rather than as a fresh snapshot.
+        assert!(line_text(plan_line(Some("pro"), 0, 100_000, inner)).contains("never"));
+    }
+
+    #[test]
     fn card_counts_the_lines_it_could_not_show() {
         // Six lines into five content rows: the card flags the remainder in its
         // title instead of quietly ending at the border.
@@ -2742,12 +3046,19 @@ mod tests {
 
     #[test]
     fn digest_names_the_providers_it_could_not_fit() {
+        let item = |name, peak| DigestItem {
+            name,
+            color: RatatuiColor::Gray,
+            peak,
+            limit_reached: false,
+            needs_login: false,
+        };
         let items = vec![
-            ("Claude", RatatuiColor::Gray, Some(58.0)),
-            ("Codex", RatatuiColor::Gray, Some(31.0)),
-            ("Copilot", RatatuiColor::Gray, Some(72.0)),
-            ("Cursor", RatatuiColor::Gray, Some(41.0)),
-            ("Grok", RatatuiColor::Gray, None),
+            item("Claude", Some(58.0)),
+            item("Codex", Some(31.0)),
+            item("Copilot", Some(72.0)),
+            item("Cursor", Some(41.0)),
+            item("Grok", None),
         ];
         let wide = line_text(quota_digest(&items, 120));
         assert!(wide.contains("Claude"), "got {wide:?}");
@@ -2769,6 +3080,35 @@ mod tests {
         let tiny = line_text(quota_digest(&items, 10));
         assert!(tiny.contains("Claude"), "got {tiny:?}");
         assert!(tiny.contains("+4 more"), "got {tiny:?}");
+    }
+
+    #[test]
+    fn digest_carries_the_states_that_need_acting_on() {
+        // The digest is the only quota surface on the sizes where the grid
+        // folds, so a spent window and a dead token cannot wait for the overlay.
+        let items = vec![
+            DigestItem {
+                name: "Cursor",
+                color: RatatuiColor::Gray,
+                peak: Some(100.0),
+                limit_reached: true,
+                needs_login: false,
+            },
+            DigestItem {
+                name: "Claude",
+                color: RatatuiColor::Gray,
+                peak: Some(58.0),
+                limit_reached: false,
+                needs_login: true,
+            },
+        ];
+        let text = line_text(quota_digest(&items, 120));
+        assert!(text.contains("Cursor"), "got {text:?}");
+        assert!(text.contains("LIMIT"), "got {text:?}");
+        assert!(text.contains("Claude login"), "got {text:?}");
+        // A dead token's percentage is meaningless, so it is replaced, not
+        // appended.
+        assert!(!text.contains("58%"), "got {text:?}");
     }
 
     /// Builds a `QuotaView` with every provider present, for overlay tests.
@@ -2875,6 +3215,21 @@ mod tests {
     }
 
     #[test]
+    fn share_cell_bar_is_proportional() {
+        let width = 26u16;
+        let bar = |value: i64| {
+            share_cell(value, 100, width)
+                .chars()
+                .filter(|c| *c == '█')
+                .count()
+        };
+        // Twice the share, twice the bar (the column reserves 6 for the number).
+        assert_eq!(bar(50), usize::from(width - 6) / 2);
+        assert_eq!(bar(100), usize::from(width - 6));
+        assert!(bar(25) < bar(50) && bar(50) < bar(75));
+    }
+
+    #[test]
     fn share_cell_fills_its_column_without_overflowing() {
         for width in [SHARE_COL_MIN_W, 18, SHARE_COL_MAX_W] {
             for (value, total) in [(0i64, 100i64), (50, 100), (100, 100), (7, 1000)] {
@@ -2900,8 +3255,8 @@ mod tests {
         const _: () = assert!(OVERLAY_GRID.min_w > CARD_GRID.min_w);
         const _: () = assert!(OVERLAY_GRID.height > CARD_GRID.height);
 
-        // Concretely: the fullest provider's lines all survive the overlay cell
-        // even when the always-on card had to flag some of them hidden.
+        // Concretely: a snapshot that overflows the always-on card must fit the
+        // overlay one, which is the only reason the overlay exists.
         let claude = ClaudeQuotaSnapshot {
             plan_type: Some("max 20x".into()),
             five_hour: Some(QuotaWindow::default()),
@@ -2910,9 +3265,15 @@ mod tests {
             scoped_label: Some("Opus".into()),
             balance: Some("$5.00".into()),
             spend_used: Some("$1.20".into()),
+            needs_login: true,
             ..Default::default()
         };
-        let card = claude_card(&claude, 0, OVERLAY_GRID.max_w);
-        assert!(card.lines.len() <= usize::from(OVERLAY_GRID.height - 2));
+        let small = claude_card(&claude, 0, CARD_GRID.min_w);
+        assert!(
+            small.lines.len() > usize::from(CARD_GRID.height - 2),
+            "this snapshot is supposed to overflow the always-on card"
+        );
+        let large = claude_card(&claude, 0, OVERLAY_GRID.max_w);
+        assert!(large.lines.len() <= usize::from(OVERLAY_GRID.height - 2));
     }
 }

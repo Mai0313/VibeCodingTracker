@@ -282,7 +282,7 @@ pub fn create_controls_with_status(
 pub const CONTENT_MIN_H: u16 = 6;
 /// Narrowest a side rail may be and still hold a gauge line or a three-column
 /// provider row without truncating it.
-pub const RAIL_MIN_W: u16 = 30;
+pub(crate) const RAIL_MIN_W: u16 = 30;
 /// Widest a side rail grows to; past this the content pane keeps the slack.
 const RAIL_MAX_W: u16 = 52;
 /// Rows the frame always spends below the content: summary + controls.
@@ -311,7 +311,7 @@ pub struct FrameChunks {
 /// share is then capped at whatever the content pane can spare, so the returned
 /// width is the width the rail actually gets rather than one the layout solver
 /// would have to shrink back.
-pub fn rail_width(width: u16, content_min_w: u16) -> Option<u16> {
+fn rail_width(width: u16, content_min_w: u16) -> Option<u16> {
     (width >= content_min_w.saturating_add(RAIL_MIN_W)).then(|| {
         (width / 3)
             .clamp(RAIL_MIN_W, RAIL_MAX_W)

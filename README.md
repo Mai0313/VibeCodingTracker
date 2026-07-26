@@ -216,12 +216,12 @@ vct usage --table --merge-providers
 ### Preview: Interactive Dashboard (`vct usage`)
 
 ```
-┌ Models · $79.33 · 49.1M tokens · 3 models ────────────────────────── −1 cols ┐┌ Providers ───────────────────────────┐
-│Model                   Input     Output    Cache Read  Total     Cost (USD)  █│Provider       Tokens      Cost       │
+┌ Models · $79.33 · 49.1M tokens · 3 models ────────────────────────── −2 cols ┐┌ Providers ───────────────────────────┐
+│Model                               Input     Output    Total     Cost (USD)  █│Provider       Tokens      Cost       │
 │                                                                              █│                                      │
-│gemini-3.1-pro-preview       129K     10.3K       67.4K      207K        $0.40█│Claude         48.9M       $78.93     │
-│claude-haiku-4-5-202510     5.57K     19.8K       4.63M     5.28M        $1.34█│Gemini         207K        $0.40      │
-│claude-opus-4-8             25.7K      179K       40.8M     43.6M       $77.59█│                                      │
+│gemini-3.1-pro-preview                   129K     10.3K      207K        $0.40█│Claude         48.9M       $78.93     │
+│claude-haiku-4-5-20251001               5.57K     19.8K     5.28M        $1.34█│Gemini         207K        $0.40      │
+│claude-opus-4-8                         25.7K      179K     43.6M       $77.59█│                                      │
 │                                                                              █│                                      │
 │                                                                              █│                                      │
 └──────────────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────┘
@@ -232,8 +232,8 @@ vct usage --table --merge-providers
 │Fable ▰▰▰▰▱  79% 1d23h││credits 0 · +3 reset  ││                      ││api   ▰▰▰▱▱  44% 16d0h││balance $12.00        │
 │bal - · $0.00 used    ││reset expires 17d0h   ││                      ││                      ││                      │
 └──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘
-                Total Cost: $79.33  |  Total Tokens: 49.1M  |  Models: 3  |  Memory: 4.6 MB  |  CPU: 0.0%
-                       ↑/↓ scroll  m merge  p panes  Q quota  r refresh  q quit  |  Star on GitHub
+                Total Cost: $79.33  |  Total Tokens: 49.1M  |  Models: 3  |  Memory: 4.7 MB  |  CPU: 0.0%
+                       ↑/↓ scroll  m merge  p hide  Q quota  r refresh  q quit  |  Star on GitHub
 ```
 
 Both interactive dashboards draw a centered `Loading sessions...` spinner as soon as terminal setup finishes. Loading stays responsive to `q`, Ctrl+C, and resize events. Later scans run in one background worker, keep the last successful data visible with a `Refreshing...` footer, and coalesce repeated refresh requests into at most one pending scan. A failed refresh keeps the last-known-good view and retries on the next scheduled or manual refresh.
@@ -325,7 +325,7 @@ For noninteractive `usage` and `analysis` scans, vct exits with an error when ev
 
 **Automatic token refresh.** For Claude, Codex, and Grok, when a token is near expiry or rejected, vct refreshes it and writes the new token back to the provider's own credential file (in that CLI's exact format), so a token is reused across checks rather than refreshed every time. Grok's token endpoint is resolved from its login issuer rather than hardcoded, the way its own CLI does it, and every other login in the file is preserved on write. If a refresh cannot proceed, the panel shows a `run: <provider> auth login` hint instead of breaking. Copilot (long-lived token) and Cursor (kept fresh by its own client) are read-only — vct never writes their credential files.
 
-A panel appears only for a provider whose credentials are present. Panels are placed on a uniform grid that fits as many cards per row as the terminal allows and wraps the rest onto the next row, so a new provider costs a card and never a new layout rule. On a terminal too short to spend rows on the grid, it folds into a one-line digest that names the providers it could not show; press `Q` for the full-detail overlay, where every card has room for every line whatever the terminal size, and `p` to toggle the Provider Usage side pane. Quota panels appear only in the interactive TUI; `--table`, `--text`, and `--json` are unchanged.
+A panel appears only for a provider whose credentials are present. Panels are placed on a uniform grid that fits as many cards per row as the terminal allows and wraps the rest onto the next row, so a new provider costs a card and never a new layout rule. On a terminal too short to spend rows on the grid, it folds into a one-line digest showing the gauges that still fit and counting the rest; press `Q` for the full-detail overlay, where every card has room for every line whatever the terminal size, and `p` to toggle the Provider Usage side pane. Quota panels appear only in the interactive TUI; `--table`, `--text`, and `--json` are unchanged.
 
 > **Platform note:** on macOS, Claude Code stores its OAuth credentials in the system Keychain rather than `~/.claude/.credentials.json`, so the Claude panel is not shown on macOS. Cursor's `~/.config/cursor` credential path is Linux-oriented.
 
@@ -388,9 +388,10 @@ vct analysis --json --daily > today.json
 │                                                                                                                      █
 │claude-opus-4-8                               12.4K       88.1K       9.02K     412     231     604         96      88█
 │gemini-3.1-pro-preview                        2.10K       14.8K       1.62K      84      44     112         16      15█
-│claude-haiku-4-5-20251001                       840       5.40K         610      31      16      42          6       5│
+│claude-haiku-4-5-20251001                       840       5.40K         610      31      16      42          6       5█
+│                                                                                                                      █
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+┌ Providers ───────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │Provider                 Edit Lines  Read Lines  Write Lines  Bash     Edit     Read     TodoWrite   Write    Days    │
 │                                                                                                                      │
 │Claude                   13.2K       93.5K       9.63K        443      247      646      102         93       12      │

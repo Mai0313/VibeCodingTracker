@@ -1002,6 +1002,34 @@ mod tests {
     }
 
     #[test]
+    fn each_control_key_maps_to_its_own_action() {
+        let press = |code| {
+            let mut source = FakeEventSource::new([Event::Key(crossterm::event::KeyEvent::new(
+                code,
+                KeyModifiers::NONE,
+            ))]);
+            handle_input_from(&mut source).unwrap()
+        };
+
+        assert_eq!(press(KeyCode::Char('q')), InputAction::Quit);
+        assert_eq!(press(KeyCode::Char('r')), InputAction::Refresh);
+        assert_eq!(press(KeyCode::Char('m')), InputAction::ToggleMerge);
+        // Esc is distinct from quit so a view with an overlay can back out of it
+        // instead of exiting.
+        assert_eq!(press(KeyCode::Esc), InputAction::Close);
+        // Shift+q opens the quota detail; plain `q` still quits.
+        assert_eq!(press(KeyCode::Char('Q')), InputAction::ToggleQuota);
+        assert_eq!(press(KeyCode::Char('p')), InputAction::TogglePane);
+        assert_eq!(press(KeyCode::Char('P')), InputAction::TogglePane);
+
+        let mut ctrl_c = FakeEventSource::new([Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        ))]);
+        assert_eq!(handle_input_from(&mut ctrl_c).unwrap(), InputAction::Quit);
+    }
+
+    #[test]
     fn input_drain_is_bounded_during_resize_burst() {
         let events = (0..MAX_DRAINED_EVENTS + 10).map(|index| {
             Event::Resize(
