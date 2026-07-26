@@ -117,7 +117,10 @@ pub struct GeneralConfig {
     pub default_time_range: TimeRange,
     /// Layout version of this file, stamped by vct. Only the upgrade pass reads
     /// it; leave it alone unless you want a past upgrade to run again.
-    #[serde(default = "legacy_config_version")]
+    #[serde(
+        default = "legacy_config_version",
+        deserialize_with = "de_config_version"
+    )]
     pub version: u32,
 }
 
@@ -335,6 +338,24 @@ fn legacy_config_version() -> u32 {
     1
 }
 
+/// Reads the version marker, mapping a hand-edited non-integer (`version = "2"`)
+/// onto the legacy value instead of rejecting it.
+///
+/// Rejection would fail the whole document, and the infallible read then turns
+/// that into a silent reset of every setting — the same trap
+/// [`rename_refresh_key`] drops malformed values to avoid. Reading it as legacy
+/// makes the upgrade pass rewrite the key with a real integer.
+fn de_config_version<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Value::deserialize(deserializer)
+        .ok()
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or_else(legacy_config_version))
+}
+
 fn default_quota_panels() -> Vec<String> {
     ["claude", "codex", "copilot", "cursor", "grok"]
         .iter()
@@ -481,11 +502,6 @@ fn migrate_document(doc: &mut DocumentMut) -> bool {
     let schema = json_schema();
     let mut changed = false;
 
-    // The `#:schema` directive on the first line drives editor autocomplete.
-    if !has_schema_directive(doc) {
-        changed |= prepend_schema_directive(doc);
-    }
-
     // `[usage]`: rename the refresh key, then move quota_panels into the nested
     // `[usage.quota]`. Quota goes last so its `[usage.quota]` header renders
     // after every leaf key of `[usage]` (a leaf after a sub-table would be
@@ -502,9 +518,17 @@ fn migrate_document(doc: &mut DocumentMut) -> bool {
         changed |= rename_refresh_key(analysis, &schema, &["analysis", "refresh_interval"]);
     }
 
-    // Runs last so it sees the panel list the pass above may have just moved
-    // into `[usage.quota]`.
+    // Runs after the moves above so it sees the panel list they may have just
+    // relocated into `[usage.quota]`.
     changed |= backfill_new_quota_panels(doc, &schema);
+
+    // The `#:schema` directive on the first line drives editor autocomplete. It
+    // attaches to the document's first element, so it goes last: on an empty
+    // file the back-fill above is what creates that first element, and running
+    // earlier would leave the directive to a second pass.
+    if !has_schema_directive(doc) {
+        changed |= prepend_schema_directive(doc);
+    }
 
     changed
 }
@@ -596,12 +620,18 @@ fn panels_out_of_reach(doc: &DocumentMut) -> bool {
     match usage.as_table() {
         // `usage = { ... }`: nothing under it can be rewritten.
         None => usage.as_table_like().is_some_and(holds_panels),
-        // A standard `[usage]` whose `quota` child is inline.
-        Some(usage) => usage
-            .get("quota")
-            .filter(|quota| !quota.is_table())
-            .and_then(Item::as_table_like)
-            .is_some_and(|quota| quota.contains_key("panels")),
+        Some(usage) => {
+            // A standard `[usage]` whose `quota` child is inline.
+            let inline_quota = usage
+                .get("quota")
+                .filter(|quota| !quota.is_table())
+                .and_then(Item::as_table_like)
+                .is_some_and(|quota| quota.contains_key("panels"));
+            // Or a legacy `quota_panels` that `migrate_quota_panels` declined to
+            // move (it also refuses an inline `quota` sibling), which leaves the
+            // effective list somewhere this pass cannot extend.
+            inline_quota || usage.contains_key("quota_panels")
+        }
     }
 }
 
@@ -1305,6 +1335,56 @@ mod tests {
         // An absent panel list simply picks up the current default.
         assert!(cfg.usage.shows_quota_panel("grok"));
         assert!(migrate_text(&migrated).unwrap().is_none());
+    }
+
+    #[test]
+    fn an_empty_file_reaches_the_current_layout_in_one_pass() {
+        // The back-fill creates `[general]` on a file that had no tables at all,
+        // so the `#:schema` directive has to be attached after it — otherwise
+        // the first pass writes a file the second pass rewrites again.
+        for text in ["", "# just a comment\n"] {
+            let migrated = migrate_text(text)
+                .unwrap()
+                .expect("an empty file is stamped");
+            assert!(migrated.starts_with("#:schema "));
+            assert!(migrated.contains("version = 2"));
+            assert!(
+                migrate_text(&migrated).unwrap().is_none(),
+                "one pass must be enough"
+            );
+        }
+    }
+
+    #[test]
+    fn a_panel_list_that_could_not_be_moved_is_not_marked_upgraded() {
+        // `migrate_quota_panels` refuses to merge into an inline `quota` child,
+        // so the legacy list survives out of reach. Stamping the marker here
+        // would retire the one-shot upgrade without ever having run it.
+        let text =
+            "#:schema x\n[usage]\nquota_panels = [\"claude\"]\nquota = { refresh_interval = 30 }\n";
+        assert!(migrate_text(text).unwrap().is_none());
+        assert!(panels_out_of_reach(&text.parse::<DocumentMut>().unwrap()));
+    }
+
+    #[test]
+    fn a_hand_edited_version_value_never_resets_the_config() {
+        // A non-integer marker must read as legacy, not fail the document: the
+        // infallible read would turn that into a silent reset of every setting.
+        for bad in ["\"2\"", "2.5", "true", "-1"] {
+            let text = format!(
+                "[general]\nversion = {bad}\ndefault_time_range = \"weekly\"\n[providers]\ncursor = false\n"
+            );
+            let cfg: Config = toml_edit::de::from_str(&text).expect("document still parses");
+            assert_eq!(cfg.general.version, legacy_config_version(), "bad = {bad}");
+            assert_eq!(cfg.general.default_time_range, TimeRange::Weekly);
+            assert!(!cfg.providers.cursor);
+            // Being read as legacy, the upgrade pass rewrites it with a real one.
+            let migrated = migrate_text(&text)
+                .unwrap()
+                .expect("the marker is repaired");
+            let cfg: Config = toml_edit::de::from_str(&migrated).unwrap();
+            assert_eq!(cfg.general.version, CONFIG_VERSION);
+        }
     }
 
     #[test]
