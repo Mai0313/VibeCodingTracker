@@ -183,7 +183,7 @@ impl UsageConfig {
 pub struct QuotaConfig {
     /// Which live quota panels to show in the usage TUI (by provider name:
     /// `claude` / `codex` / `copilot` / `cursor` / `grok`). An empty list hides
-    /// the band.
+    /// every quota card; the Provider Usage pane has its own `p` toggle.
     #[serde(default = "default_quota_panels")]
     pub panels: Vec<String>,
     /// Seconds between live quota-panel polls, shared by every provider

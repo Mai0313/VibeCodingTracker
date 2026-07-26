@@ -216,23 +216,24 @@ vct usage --table --merge-providers
 ### 预览：交互式面板（`vct usage`）
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Model                         Input   Output   Cache Read  Cache Write    Total  Cost (USD) │
-│                                                                                             │
-│ gemini-3.1-pro-preview         129K    10.3K        67.4K            0     207K       $0.40 │
-│ claude-haiku-4-5-20251001     5.57K    19.8K        4.63M         620K    5.27M       $1.34 │
-│ claude-opus-4-8               25.7K     179K        40.8M        2.57M    43.6M      $77.59 │
-└─────────────────────────────────────────────────────────────────────────────────────────────┘
-┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Provider                        Tokens        Cost                                          │
-│                                                                                             │
-│ Claude                           48.9M      $78.93                                          │
-│ Gemini                            207K       $0.40                                          │
-└─────────────────────────────────────────────────────────────────────────────────────────────┘
-┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Total Cost: $79.33  |  Total Tokens: 49.3M  |  Models: 3  |  Memory: 42.8 MB  |  CPU: 17.9% │
-└─────────────────────────────────────────────────────────────────────────────────────────────┘
-  ↑/↓ scroll  m merge  r refresh  q quit  |  Star on GitHub
+┌ Models · $79.33 · 49.1M tokens · 3 models ────────────────────────── −2 cols ┐┌ Providers ───────────────────────────┐
+│Model                               Input     Output    Total     Cost (USD)  █│Provider       Tokens      Cost       │
+│                                                                              █│                                      │
+│gemini-3.1-pro-preview                   129K     10.3K      207K        $0.40█│Claude         48.9M       $78.93     │
+│claude-haiku-4-5-20251001               5.57K     19.8K     5.28M        $1.34█│Gemini         207K        $0.40      │
+│claude-opus-4-8                         25.7K      179K     43.6M       $77.59█│                                      │
+│                                                                              █│                                      │
+│                                                                              █│                                      │
+└──────────────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────┘
+┌ Claude ──────────────┐┌ Codex ───────────────┐┌ Copilot ─────────────┐┌ Cursor ────────LIMIT ┐┌ Grok ────────────────┐
+│max 20x       just now││plus          just now││individual    just now││free          just now││SuperGrok     just now│
+│5h    ▰▱▱▱▱  13% 1h42m││5h    ▰▰▱▱▱  33% 12m  ││prem  ▰▱▱▱▱   3% 24d0h││total ▰▰▰▰▰  94% 16d0h││week  ▰▰▱▱▱  38% 3d4h │
+│7d    ▰▰▰▱▱  58% 1d23h││7d    ▰▰▱▱▱  36% 1h54m││reqs  ▰▱▱▱▱ 45/1500   ││auto  ▰▰▰▰▰ 100% 16d0h││ondmd $4.20/$50.00    │
+│Fable ▰▰▰▰▱  79% 1d23h││credits 0 · +3 reset  ││                      ││api   ▰▰▰▱▱  44% 16d0h││balance $12.00        │
+│bal - · $0.00 used    ││reset expires 17d0h   ││                      ││                      ││                      │
+└──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘
+                Total Cost: $79.33  |  Total Tokens: 49.1M  |  Models: 3  |  Memory: 4.7 MB  |  CPU: 0.0%
+                       ↑/↓ scroll  m merge  p hide  Q quota  r refresh  q quit  |  Star on GitHub
 ```
 
 两个交互式面板都会在 terminal setup 完成后立即绘制居中的 `Loading sessions...` spinner. Loading 期间仍可响应 `q`, Ctrl+C 与 resize event. 后续扫描由单一 background worker 执行, 并在 `Refreshing...` footer 下保留上一次成功的数据. 重复的 refresh 请求最多只会合并为一个 pending scan. 如果 refresh 失败, 面板会保留 last-known-good view, 并在下次排程或手动刷新时重试.
@@ -304,17 +305,16 @@ Grok 的 `usage` 是单一时点的本地 context 估算：vct 会把 `signals.j
 
 ### 实时额度面板
 
-`vct usage` 会**在仪表盘中直接显示 Claude Code、Codex、GitHub Copilot、Cursor 与 Grok 的实时额度用量——完全零配置。** 不需要 status-line hook，也无需手动输入任何凭证：vct 会读取各 provider 自己的 OAuth 凭证，在后台线程调用其用量 API，并在你工作时保持面板持续更新。每个进度条都是**已用**百分比，所以进度条满格代表该额度周期已耗尽，而不是还没开始用。（想要更清爽的面板？在 [`config.toml`](#%E9%85%8D%E7%BD%AE) 中精简 `[usage.quota]` 下的 `panels`，或设为 `[]` 隐藏整栏。）
+`vct usage` 会**在仪表盘中直接显示 Claude Code、Codex、GitHub Copilot、Cursor 与 Grok 的实时额度用量——完全零配置。** 不需要 status-line hook，也无需手动输入任何凭证：vct 会读取各 provider 自己的 OAuth 凭证，在后台线程调用其用量 API，并在你工作时保持面板持续更新。每个进度条都是**已用**百分比，所以进度条满格代表该额度周期已耗尽，而不是还没开始用。（想要更清爽的面板？在 [`config.toml`](#%E9%85%8D%E7%BD%AE) 中精简 `[usage.quota]` 下的 `panels`，或设为 `[]` 隐藏所有额度卡片。Provider Usage 侧栏是本机扫描数据而不是额度面板，所以它有自己的 `p` 开关。）
 
 ```
-┌ Claude ─────────────────┐┌ Codex ──────────────────┐┌ Copilot ────────────────┐┌ Cursor ─────────────────┐┌ Grok ───────────────────┐
-│ Plan: max 20x           ││ Plan: plus              ││ Plan: individual        ││ Plan: free              ││ Plan: SuperGrok         │
-│ 5h    ▰▱▱▱▱  13% ↻ 1h42m││ 5h    ▰▰▱▱▱  33% ↻ 12m  ││ prem  ▰▱▱▱▱   3% ↻ 24d  ││ total ▰▰▰▰▰  94% ↻ 16d  ││ week  ▰▰▱▱▱  38% ↻ 3d4h │
-│ 7d    ▰▰▰▱▱  58% ↻ 1d23h││ 7d    ▰▰▱▱▱  36% ↻ 1h54m││ reqs  ▰▱▱▱▱ 45/1500     ││ auto  ▰▰▰▰▰ 100% ↻ 16d  ││ ondmd ▰▱▱▱▱ $4.20/$50.00│
-│ Fable ▰▰▰▰▱  79% ↻ 1d23h││ Credits: 0  +3 reset    ││ updated just now        ││ api   ▰▰▰▱▱  44% ↻ 16d  ││ Balance: $12.00         │
-│ Balance: -   $0.00 used ││ reset expires 17d0h     ││                         ││ updated just now        ││ updated just now        │
-│ updated just now        ││ updated just now        ││                         ││                         ││                         │
-└─────────────────────────┘└─────────────────────────┘└─────────────────────────┘└─────────────────────────┘└─────────────────────────┘
+┌ Claude ──────────────┐┌ Codex ───────────────┐┌ Copilot ─────────────┐┌ Cursor ────────LIMIT ┐┌ Grok ────────────────┐
+│max 20x       just now││plus          just now││individual    just now││free          just now││SuperGrok     just now│
+│5h    ▰▱▱▱▱  13% 1h42m││5h    ▰▰▱▱▱  33% 12m  ││prem  ▰▱▱▱▱   3% 24d0h││total ▰▰▰▰▰  94% 16d0h││week  ▰▰▱▱▱  38% 3d4h │
+│7d    ▰▰▰▱▱  58% 1d23h││7d    ▰▰▱▱▱  36% 1h54m││reqs  ▰▱▱▱▱ 45/1500   ││auto  ▰▰▰▰▰ 100% 16d0h││ondmd $4.20/$50.00    │
+│Fable ▰▰▰▰▱  79% 1d23h││credits 0 · +3 reset  ││                      ││api   ▰▰▰▱▱  44% 16d0h││balance $12.00        │
+│bal - · $0.00 used    ││reset expires 17d0h   ││                      ││                      ││                      │
+└──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘
 ```
 
 - **Claude** — 方案类型、5 小时、每周以及单模型每周用量，来自官方 OAuth 用量 API（`GET /api/oauth/usage`），从 `~/.claude/.credentials.json` 读取，并显示额度余额。约每分钟轮询一次以避开该端点的速率限制；触及上限时标题会出现红色 `LIMIT` 标记。单模型每周那一行属于尽力而为，未返回该范围时就自动隐藏。
@@ -325,7 +325,7 @@ Grok 的 `usage` 是单一时点的本地 context 估算：vct 会把 `signals.j
 
 **自动刷新 token。** 对 Claude、Codex 和 Grok，当 token 接近过期或被拒绝时，vct 会刷新它并把新 token 写回该 provider 自己的凭证文件（采用该 CLI 的原始格式），因此 token 会在多次检查之间复用，而不是每次都重新刷新。Grok 的 token 端点会像它自己的 CLI 那样，从登录时的 issuer 解析得出，而不是写死在代码里；写入时也会保留文件中其他所有的登录信息。如果刷新失败，面板会显示 `run: <provider> auth login` 提示，而不会直接中断。Copilot（长期有效的 token）和 Cursor（由其自身客户端保持最新）为只读——vct 从不写入它们的凭证文件。
 
-只有在某个 provider 的凭证存在时，才会显示对应的面板。当这一栏的宽度不足以同时容纳两者时，Provider Usage 表格会先折叠隐藏；再不够时，面板会折到下面的第二行——五个面板时会排成 3 + 2 网格，而末尾空出的位置又会把表格放回来。额度面板仅在交互式 TUI 中显示；`--table`、`--text`、`--json` 不受影响。
+只有在某个 provider 的凭证存在时，才会显示对应的面板。面板排在一个统一网格上：一行放得下几张就放几张，放不下的自动折到下一行，因此新增一个 provider 只是多一张卡片，不会多一条排版规则。当终端高度不足以留给网格时，它会收成一行摘要，显示放得下的 gauge，并把其余的记成数量；按 `Q` 打开完整的额度浮层，无论终端多大，每张卡片都放得下全部内容，按 `p` 可切换 Provider Usage 侧栏。额度面板仅在交互式 TUI 中显示；`--table`、`--text`、`--json` 不受影响。
 
 > **平台说明：** 在 macOS 上，Claude Code 会把 OAuth 凭证保存在系统 Keychain 中，而不是 `~/.claude/.credentials.json`，因此在 macOS 上不会显示 Claude 面板。Cursor 的 `~/.config/cursor` 凭证路径偏向 Linux。
 
@@ -383,23 +383,22 @@ vct analysis --json --daily > today.json
 ### 预览：交互式面板（`vct analysis`）
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Model                        Edit Lines   Read Lines  Write Lines   Bash   Edit   Read  TodoWrite  Write        │
-│                                                                                                                 │
-│ claude-haiku-4-5-20251001             0            0            0     43      0     59          0      0        │
-│ claude-opus-4-8                   1.28K        13.3K        1.58K     82    146    209         18     62        │
-│ gemini-3.1-pro-preview                0            0            0      0      0      0          0      0        │
-└─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Provider                     Edit Lines   Read Lines  Write Lines   Bash   Edit   Read  TodoWrite  Write   Days │
-│                                                                                                                 │
-│ Claude                            1.28K        13.3K        1.58K    125    146    268         18     62      3 │
-│ Gemini                                0            0            0      0      0      0          0      0      1 │
-└─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Total Lines: 16.1K  |  Total Tools: 619  |  Models: 3  |  Memory: 41.2 MB  |  CPU: 17.9%                        │
-└─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-  ↑/↓ scroll  r refresh  q quit  |  Star on GitHub
+┌ Models · 135K lines · 1.80K tool calls · 3 models ───────────────────────────────────────────────────────────────────┐
+│Model                                   Edit Lines  Read Lines  Write Lines Bash    Edit    Read    TodoWrite  Write  █
+│                                                                                                                      █
+│claude-opus-4-8                               12.4K       88.1K       9.02K     412     231     604         96      88█
+│gemini-3.1-pro-preview                        2.10K       14.8K       1.62K      84      44     112         16      15█
+│claude-haiku-4-5-20251001                       840       5.40K         610      31      16      42          6       5█
+│                                                                                                                      █
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Providers ───────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│Provider                 Edit Lines  Read Lines  Write Lines  Bash     Edit     Read     TodoWrite   Write    Days    │
+│                                                                                                                      │
+│Claude                   13.2K       93.5K       9.63K        443      247      646      102         93       12      │
+│Gemini                   2.10K       14.8K       1.62K        84       44       112      16          15       3       │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+                 Total Lines: 135K  |  Total Tools: 1.80K  |  Models: 3  |  Memory: 4.8 MB  |  CPU: 0.0%
+                                    ↑/↓ scroll  r refresh  q quit  |  Star on GitHub
 ```
 
 ### 预览：表格与 JSON（`vct analysis`）
@@ -572,7 +571,7 @@ merge_models = false
 refresh_interval = 10
 
 [usage.quota]
-# 显示哪些实时额度面板; 删除某个名称即可隐藏该面板, 用空列表 ([]) 隐藏整栏
+# 显示哪些实时额度面板; 删除某个名称即可隐藏该面板, 用空列表 ([]) 全部隐藏
 panels = ["claude", "codex", "copilot", "cursor", "grok"]
 # 每个 provider 共用的实时额度面板轮询间隔秒数 (最小为 1)
 refresh_interval = 60
@@ -612,7 +611,7 @@ retention_days = 7
 | `general.version`              | vct 标记在文件上的布局版本，让后续版本新增的面板只会向你提供一次。                                              |
 | `usage.merge_models`           | 让面板启动时就处于合并状态；`m` 切换会把你上次的选择保存回这里。`--merge-providers` 会强制开启。                |
 | `usage.refresh_interval`       | `usage` 面板的自动刷新间隔（秒）。                                                                              |
-| `usage.quota.panels`           | 显示哪些额度面板（`claude` / `codex` / `copilot` / `cursor` / `grok`）；删除名称即可隐藏，`[]` 隐藏整栏。       |
+| `usage.quota.panels`           | 显示哪些额度面板（`claude` / `codex` / `copilot` / `cursor` / `grok`）；删除名称即可隐藏，`[]` 全部隐藏。       |
 | `usage.quota.refresh_interval` | 每个实时额度面板的轮询间隔（秒）；数值越大越不容易触发 provider 的速率限制。                                    |
 | `analysis.refresh_interval`    | `analysis` 面板的自动刷新间隔（秒）。                                                                           |
 | `performance.scan_threads`     | CLI scan worker 数. `0` 优先采用正数的 `RAYON_NUM_THREADS`, 否则最多使用两个 worker; 所有值都会受 CPU 数量限制. |

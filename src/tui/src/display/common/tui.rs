@@ -545,11 +545,21 @@ fn handle_input_from(source: &mut impl EventSource) -> anyhow::Result<InputActio
             // twice (which would double every nav step / page jump).
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 if key.code == KeyCode::Char('q')
-                    || key.code == KeyCode::Esc
                     || (key.code == KeyCode::Char('c')
                         && key.modifiers.contains(KeyModifiers::CONTROL))
                 {
                     return Ok(InputAction::Quit);
+                }
+                // Esc is a "back out of what is open" key, so a view with an
+                // overlay closes it; one without treats it as quit.
+                if key.code == KeyCode::Esc {
+                    return Ok(InputAction::Close);
+                }
+                if key.code == KeyCode::Char('Q') {
+                    return Ok(InputAction::ToggleQuota);
+                }
+                if key.code == KeyCode::Char('p') || key.code == KeyCode::Char('P') {
+                    return Ok(InputAction::TogglePane);
                 }
                 if key.code == KeyCode::Char('r') || key.code == KeyCode::Char('R') {
                     return Ok(InputAction::Refresh);
@@ -603,8 +613,15 @@ impl NavDelta {
 /// Action the TUI event loop should take in response to user input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputAction {
-    /// User asked to exit (`q`, `Esc`, or `Ctrl+C`).
+    /// User asked to exit (`q` or `Ctrl+C`).
     Quit,
+    /// User pressed `Esc`: close whatever is open, or quit when nothing is.
+    Close,
+    /// User toggled the full-screen quota detail overlay (`Q`); usage view
+    /// only, ignored elsewhere.
+    ToggleQuota,
+    /// User toggled the side pane (`p` / `P`).
+    TogglePane,
     /// User asked to re-fetch and redraw (`r` / `R`).
     Refresh,
     /// User toggled provider-prefix merging (`m` / `M`); usage view only,
@@ -906,7 +923,7 @@ mod tests {
     fn find_label_start_locates_repo_label_on_bottom_row() {
         let area = Rect::new(0, 0, 120, 1);
         let mut buf = Buffer::empty(area);
-        create_controls(&[("m", " merge  ")]).render(area, &mut buf);
+        create_controls(&[("m", " merge  ")], area.width).render(area, &mut buf);
 
         let (x, y) = find_label_start(&buf).expect("repo label should be present");
         assert_eq!(y, 0);
@@ -917,12 +934,22 @@ mod tests {
     }
 
     #[test]
-    fn find_label_start_is_none_when_truncated() {
-        // Too narrow to fit the whole label → nothing to hyperlink.
-        let area = Rect::new(0, 0, 10, 1);
+    fn find_label_start_is_none_when_the_label_was_dropped() {
+        // Too narrow for the label → the footer drops it whole, so there is
+        // nothing to hyperlink (and nothing clipped mid-word either).
+        let area = Rect::new(0, 0, 40, 1);
         let mut buf = Buffer::empty(area);
-        create_controls(&[]).render(area, &mut buf);
+        create_controls(&[], area.width).render(area, &mut buf);
         assert!(find_label_start(&buf).is_none());
+
+        let row: String = (0..area.width)
+            .map(|x| buf.cell((x, 0)).unwrap().symbol())
+            .collect();
+        assert!(
+            row.contains("q quit"),
+            "quitting stays discoverable: {row:?}"
+        );
+        assert!(!row.contains("Star"), "no half-drawn label: {row:?}");
     }
 
     #[test]
@@ -972,6 +999,34 @@ mod tests {
         assert!(!worker.request_if_due());
         release_tx.send(()).unwrap();
         assert_eq!(wait_for_result(&mut worker), Ok(1));
+    }
+
+    #[test]
+    fn each_control_key_maps_to_its_own_action() {
+        let press = |code| {
+            let mut source = FakeEventSource::new([Event::Key(crossterm::event::KeyEvent::new(
+                code,
+                KeyModifiers::NONE,
+            ))]);
+            handle_input_from(&mut source).unwrap()
+        };
+
+        assert_eq!(press(KeyCode::Char('q')), InputAction::Quit);
+        assert_eq!(press(KeyCode::Char('r')), InputAction::Refresh);
+        assert_eq!(press(KeyCode::Char('m')), InputAction::ToggleMerge);
+        // Esc is distinct from quit so a view with an overlay can back out of it
+        // instead of exiting.
+        assert_eq!(press(KeyCode::Esc), InputAction::Close);
+        // Shift+q opens the quota detail; plain `q` still quits.
+        assert_eq!(press(KeyCode::Char('Q')), InputAction::ToggleQuota);
+        assert_eq!(press(KeyCode::Char('p')), InputAction::TogglePane);
+        assert_eq!(press(KeyCode::Char('P')), InputAction::TogglePane);
+
+        let mut ctrl_c = FakeEventSource::new([Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        ))]);
+        assert_eq!(handle_input_from(&mut ctrl_c).unwrap(), InputAction::Quit);
     }
 
     #[test]

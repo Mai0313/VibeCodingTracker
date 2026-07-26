@@ -216,23 +216,24 @@ vct usage --table --merge-providers
 ### Preview: Interactive Dashboard (`vct usage`)
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Model                         Input   Output   Cache Read  Cache Write    Total  Cost (USD) │
-│                                                                                             │
-│ gemini-3.1-pro-preview         129K    10.3K        67.4K            0     207K       $0.40 │
-│ claude-haiku-4-5-20251001     5.57K    19.8K        4.63M         620K    5.27M       $1.34 │
-│ claude-opus-4-8               25.7K     179K        40.8M        2.57M    43.6M      $77.59 │
-└─────────────────────────────────────────────────────────────────────────────────────────────┘
-┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Provider                        Tokens        Cost                                          │
-│                                                                                             │
-│ Claude                           48.9M      $78.93                                          │
-│ Gemini                            207K       $0.40                                          │
-└─────────────────────────────────────────────────────────────────────────────────────────────┘
-┌─────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Total Cost: $79.33  |  Total Tokens: 49.3M  |  Models: 3  |  Memory: 42.8 MB  |  CPU: 17.9% │
-└─────────────────────────────────────────────────────────────────────────────────────────────┘
-  ↑/↓ scroll  m merge  r refresh  q quit  |  Star on GitHub
+┌ Models · $79.33 · 49.1M tokens · 3 models ────────────────────────── −2 cols ┐┌ Providers ───────────────────────────┐
+│Model                               Input     Output    Total     Cost (USD)  █│Provider       Tokens      Cost       │
+│                                                                              █│                                      │
+│gemini-3.1-pro-preview                   129K     10.3K      207K        $0.40█│Claude         48.9M       $78.93     │
+│claude-haiku-4-5-20251001               5.57K     19.8K     5.28M        $1.34█│Gemini         207K        $0.40      │
+│claude-opus-4-8                         25.7K      179K     43.6M       $77.59█│                                      │
+│                                                                              █│                                      │
+│                                                                              █│                                      │
+└──────────────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────┘
+┌ Claude ──────────────┐┌ Codex ───────────────┐┌ Copilot ─────────────┐┌ Cursor ────────LIMIT ┐┌ Grok ────────────────┐
+│max 20x       just now││plus          just now││individual    just now││free          just now││SuperGrok     just now│
+│5h    ▰▱▱▱▱  13% 1h42m││5h    ▰▰▱▱▱  33% 12m  ││prem  ▰▱▱▱▱   3% 24d0h││total ▰▰▰▰▰  94% 16d0h││week  ▰▰▱▱▱  38% 3d4h │
+│7d    ▰▰▰▱▱  58% 1d23h││7d    ▰▰▱▱▱  36% 1h54m││reqs  ▰▱▱▱▱ 45/1500   ││auto  ▰▰▰▰▰ 100% 16d0h││ondmd $4.20/$50.00    │
+│Fable ▰▰▰▰▱  79% 1d23h││credits 0 · +3 reset  ││                      ││api   ▰▰▰▱▱  44% 16d0h││balance $12.00        │
+│bal - · $0.00 used    ││reset expires 17d0h   ││                      ││                      ││                      │
+└──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘
+                Total Cost: $79.33  |  Total Tokens: 49.1M  |  Models: 3  |  Memory: 4.7 MB  |  CPU: 0.0%
+                       ↑/↓ scroll  m merge  p hide  Q quota  r refresh  q quit  |  Star on GitHub
 ```
 
 Both interactive dashboards draw a centered `Loading sessions...` spinner as soon as terminal setup finishes. Loading stays responsive to `q`, Ctrl+C, and resize events. Later scans run in one background worker, keep the last successful data visible with a `Refreshing...` footer, and coalesce repeated refresh requests into at most one pending scan. A failed refresh keeps the last-known-good view and retries on the next scheduled or manual refresh.
@@ -304,17 +305,16 @@ For noninteractive `usage` and `analysis` scans, vct exits with an error when ev
 
 ### Live Quota Panels
 
-`vct usage` shows **live quota usage for Claude Code, Codex, GitHub Copilot, Cursor, and Grok right in the dashboard — with zero setup.** No status-line hook, no credentials to enter: vct reads each provider's own credentials, calls its usage API on a background thread, and keeps the panels current while you work. Every gauge is percent **used**, so a full bar means the window is spent, not untouched. (Prefer a quieter dashboard? Trim `panels` under `[usage.quota]` in [`config.toml`](#configuration), or set it to `[]` to hide the band.)
+`vct usage` shows **live quota usage for Claude Code, Codex, GitHub Copilot, Cursor, and Grok right in the dashboard — with zero setup.** No status-line hook, no credentials to enter: vct reads each provider's own credentials, calls its usage API on a background thread, and keeps the panels current while you work. Every gauge is percent **used**, so a full bar means the window is spent, not untouched. (Prefer a quieter dashboard? Trim `panels` under `[usage.quota]` in [`config.toml`](#configuration), or set it to `[]` to hide the quota cards entirely. The Provider Usage pane is local scan data, not a quota panel, so it keeps its own `p` toggle.)
 
 ```
-┌ Claude ─────────────────┐┌ Codex ──────────────────┐┌ Copilot ────────────────┐┌ Cursor ─────────────────┐┌ Grok ───────────────────┐
-│ Plan: max 20x           ││ Plan: plus              ││ Plan: individual        ││ Plan: free              ││ Plan: SuperGrok         │
-│ 5h    ▰▱▱▱▱  13% ↻ 1h42m││ 5h    ▰▰▱▱▱  33% ↻ 12m  ││ prem  ▰▱▱▱▱   3% ↻ 24d  ││ total ▰▰▰▰▰  94% ↻ 16d  ││ week  ▰▰▱▱▱  38% ↻ 3d4h │
-│ 7d    ▰▰▰▱▱  58% ↻ 1d23h││ 7d    ▰▰▱▱▱  36% ↻ 1h54m││ reqs  ▰▱▱▱▱ 45/1500     ││ auto  ▰▰▰▰▰ 100% ↻ 16d  ││ ondmd ▰▱▱▱▱ $4.20/$50.00│
-│ Fable ▰▰▰▰▱  79% ↻ 1d23h││ Credits: 0  +3 reset    ││ updated just now        ││ api   ▰▰▰▱▱  44% ↻ 16d  ││ Balance: $12.00         │
-│ Balance: -   $0.00 used ││ reset expires 17d0h     ││                         ││ updated just now        ││ updated just now        │
-│ updated just now        ││ updated just now        ││                         ││                         ││                         │
-└─────────────────────────┘└─────────────────────────┘└─────────────────────────┘└─────────────────────────┘└─────────────────────────┘
+┌ Claude ──────────────┐┌ Codex ───────────────┐┌ Copilot ─────────────┐┌ Cursor ────────LIMIT ┐┌ Grok ────────────────┐
+│max 20x       just now││plus          just now││individual    just now││free          just now││SuperGrok     just now│
+│5h    ▰▱▱▱▱  13% 1h42m││5h    ▰▰▱▱▱  33% 12m  ││prem  ▰▱▱▱▱   3% 24d0h││total ▰▰▰▰▰  94% 16d0h││week  ▰▰▱▱▱  38% 3d4h │
+│7d    ▰▰▰▱▱  58% 1d23h││7d    ▰▰▱▱▱  36% 1h54m││reqs  ▰▱▱▱▱ 45/1500   ││auto  ▰▰▰▰▰ 100% 16d0h││ondmd $4.20/$50.00    │
+│Fable ▰▰▰▰▱  79% 1d23h││credits 0 · +3 reset  ││                      ││api   ▰▰▰▱▱  44% 16d0h││balance $12.00        │
+│bal - · $0.00 used    ││reset expires 17d0h   ││                      ││                      ││                      │
+└──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘
 ```
 
 - **Claude** — plan tier, 5-hour, weekly, and per-model weekly usage from the official OAuth usage API (`GET /api/oauth/usage`), read from `~/.claude/.credentials.json`, plus your credit balance. Polled about once a minute to stay under the endpoint's rate limit; a red `LIMIT` flag appears in the title when a cap is hit. The per-model weekly row is best-effort and simply hides when that scope is not returned.
@@ -325,7 +325,7 @@ For noninteractive `usage` and `analysis` scans, vct exits with an error when ev
 
 **Automatic token refresh.** For Claude, Codex, and Grok, when a token is near expiry or rejected, vct refreshes it and writes the new token back to the provider's own credential file (in that CLI's exact format), so a token is reused across checks rather than refreshed every time. Grok's token endpoint is resolved from its login issuer rather than hardcoded, the way its own CLI does it, and every other login in the file is preserved on write. If a refresh cannot proceed, the panel shows a `run: <provider> auth login` hint instead of breaking. Copilot (long-lived token) and Cursor (kept fresh by its own client) are read-only — vct never writes their credential files.
 
-A panel appears only for a provider whose credentials are present. The band drops the Provider Usage table once it runs out of width for both, and wraps the panels onto a second row below that — with five panels that is a 3 + 2 grid whose trailing gap takes the table back. Quota panels appear only in the interactive TUI; `--table`, `--text`, and `--json` are unchanged.
+A panel appears only for a provider whose credentials are present. Panels are placed on a uniform grid that fits as many cards per row as the terminal allows and wraps the rest onto the next row, so a new provider costs a card and never a new layout rule. On a terminal too short to spend rows on the grid, it folds into a one-line digest showing the gauges that still fit and counting the rest; press `Q` for the full-detail overlay, where every card has room for every line whatever the terminal size, and `p` to toggle the Provider Usage side pane. Quota panels appear only in the interactive TUI; `--table`, `--text`, and `--json` are unchanged.
 
 > **Platform note:** on macOS, Claude Code stores its OAuth credentials in the system Keychain rather than `~/.claude/.credentials.json`, so the Claude panel is not shown on macOS. Cursor's `~/.config/cursor` credential path is Linux-oriented.
 
@@ -383,23 +383,22 @@ vct analysis --json --daily > today.json
 ### Preview: Interactive Dashboard (`vct analysis`)
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Model                        Edit Lines   Read Lines  Write Lines   Bash   Edit   Read  TodoWrite  Write        │
-│                                                                                                                 │
-│ claude-haiku-4-5-20251001             0            0            0     43      0     59          0      0        │
-│ claude-opus-4-8                   1.28K        13.3K        1.58K     82    146    209         18     62        │
-│ gemini-3.1-pro-preview                0            0            0      0      0      0          0      0        │
-└─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Provider                     Edit Lines   Read Lines  Write Lines   Bash   Edit   Read  TodoWrite  Write   Days │
-│                                                                                                                 │
-│ Claude                            1.28K        13.3K        1.58K    125    146    268         18     62      3 │
-│ Gemini                                0            0            0      0      0      0          0      0      1 │
-└─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Total Lines: 16.1K  |  Total Tools: 619  |  Models: 3  |  Memory: 41.2 MB  |  CPU: 17.9%                        │
-└─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-  ↑/↓ scroll  r refresh  q quit  |  Star on GitHub
+┌ Models · 135K lines · 1.80K tool calls · 3 models ───────────────────────────────────────────────────────────────────┐
+│Model                                   Edit Lines  Read Lines  Write Lines Bash    Edit    Read    TodoWrite  Write  █
+│                                                                                                                      █
+│claude-opus-4-8                               12.4K       88.1K       9.02K     412     231     604         96      88█
+│gemini-3.1-pro-preview                        2.10K       14.8K       1.62K      84      44     112         16      15█
+│claude-haiku-4-5-20251001                       840       5.40K         610      31      16      42          6       5█
+│                                                                                                                      █
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Providers ───────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│Provider                 Edit Lines  Read Lines  Write Lines  Bash     Edit     Read     TodoWrite   Write    Days    │
+│                                                                                                                      │
+│Claude                   13.2K       93.5K       9.63K        443      247      646      102         93       12      │
+│Gemini                   2.10K       14.8K       1.62K        84       44       112      16          15       3       │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+                 Total Lines: 135K  |  Total Tools: 1.80K  |  Models: 3  |  Memory: 4.8 MB  |  CPU: 0.0%
+                                    ↑/↓ scroll  r refresh  q quit  |  Star on GitHub
 ```
 
 ### Preview: Table & JSON (`vct analysis`)
@@ -573,7 +572,7 @@ refresh_interval = 10
 
 [usage.quota]
 # Which live quota panels to show. Remove a name to hide that panel; use an
-# empty list ([]) to hide the whole band.
+# empty list ([]) to hide them all.
 panels = ["claude", "codex", "copilot", "cursor", "grok"]
 # Seconds between live quota-panel polls, shared by every provider (minimum 1).
 refresh_interval = 60
@@ -613,7 +612,7 @@ retention_days = 7
 | `general.version`              | Layout version vct stamps on the file, so a panel added by a later release is offered to you exactly once.                      |
 | `usage.merge_models`           | Seeds the dashboard merged; the `m` toggle saves your last choice back here. `--merge-providers` forces on.                     |
 | `usage.refresh_interval`       | Redraw cadence of the `usage` dashboard (seconds).                                                                              |
-| `usage.quota.panels`           | Which quota panels to show (`claude` / `codex` / `copilot` / `cursor` / `grok`); drop a name to hide it, `[]` to hide the band. |
+| `usage.quota.panels`           | Which quota panels to show (`claude` / `codex` / `copilot` / `cursor` / `grok`); drop a name to hide it, `[]` to hide them all. |
 | `usage.quota.refresh_interval` | Poll cadence for every live quota panel (seconds); higher is safer against a provider's rate limits.                            |
 | `analysis.refresh_interval`    | Redraw cadence of the `analysis` dashboard (seconds).                                                                           |
 | `performance.scan_threads`     | CLI scan workers. `0` uses `RAYON_NUM_THREADS` when positive, otherwise at most two workers; every value is CPU-capped.         |

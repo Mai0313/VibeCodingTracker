@@ -9,9 +9,10 @@ use crate::display::analysis::averages::{
     calculate_analysis_provider_totals_from_per_provider, convert_to_analysis_rows,
 };
 use crate::display::common::table::{
-    create_controls_with_status, create_provider_row, create_ratatui_table, create_summary,
-    init_process_metrics, main_layout, refresh_process_metrics, render_scrollable_table,
-    render_too_small, styled_row,
+    CONTENT_MIN_H, ColumnSpec, FOOTER_H, TableChrome, create_controls_with_status,
+    create_provider_row, create_ratatui_table, create_summary, fit_columns, frame_layout,
+    init_process_metrics, refresh_process_metrics, render_scrollable_table, render_too_small,
+    styled_row,
 };
 use crate::display::common::tui::{
     InputAction, RefreshWorker, RefreshWorkerError, ScrollState, TerminalSession, UpdateTracker,
@@ -19,10 +20,11 @@ use crate::display::common::tui::{
 };
 use ratatui::{
     Terminal,
-    backend::CrosstermBackend,
+    backend::{Backend, CrosstermBackend},
     layout::Constraint,
     style::{Color as RatatuiColor, Style, Stylize},
-    widgets::Row as RatatuiRow,
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph, Row as RatatuiRow},
 };
 use std::io;
 use std::sync::Arc;
@@ -41,9 +43,14 @@ const MAX_TRACKED_ANALYSIS_ROWS: usize = 100;
 const ANALYSIS_MIN_W: u16 = 84;
 const ANALYSIS_MIN_H: u16 = 14;
 /// Rows that must fit *below* the provider band before it is worth showing: the
-/// scrollable table (`main_layout` gives it `Min(6)` ≈ 2 body rows after the
-/// border + header + margin) plus the summary bar (3) and controls line (1).
-const ANALYSIS_BELOW_BAND_MIN_H: u16 = 10;
+/// scrollable table (`frame_layout` gives it `CONTENT_MIN_H` ≈ 2 body rows after
+/// the border + header + margin) plus the one-line summary and controls rows.
+const ANALYSIS_BELOW_BAND_MIN_H: u16 = CONTENT_MIN_H + FOOTER_H;
+/// Floor for the model-name column, so narrowing the pane drops a metric column
+/// rather than cutting the name.
+const MODEL_COL_MIN_W: u16 = 26;
+/// Floor for the provider-name column in the band below.
+const PROVIDER_COL_MIN_W: u16 = 15;
 
 /// Height of the provider band, or `None` when the terminal is too short to
 /// show it without squeezing the table / summary / controls beneath it.
@@ -310,7 +317,8 @@ fn run_analysis_interactive(
             }
 
             match handle_input()? {
-                InputAction::Quit => break,
+                // Nothing is layered over the analysis view, so Esc is quit.
+                InputAction::Quit | InputAction::Close => break,
                 InputAction::Refresh => {
                     worker.request();
                     if loaded {
@@ -322,7 +330,8 @@ fn run_analysis_interactive(
                         )?;
                     }
                 }
-                InputAction::ToggleMerge => {}
+                InputAction::ToggleMerge | InputAction::ToggleQuota => {}
+                InputAction::TogglePane => {}
                 InputAction::Navigate(delta) if loaded => {
                     state.scroll.apply(delta, state.rows.len());
                     state.render(
@@ -408,8 +417,8 @@ pub fn display_analysis_interactive(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_analysis_frame_with_status(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+fn render_analysis_frame_with_status<B: Backend>(
+    terminal: &mut Terminal<B>,
     rows_data: &[AnalysisRow],
     totals: &AnalysisRow,
     provider_totals: &AnalysisProviderTotals,
@@ -428,20 +437,72 @@ fn render_analysis_frame_with_status(
             return;
         }
 
-        let panels_height = analysis_panels_height(area.height, provider_rows.len());
-        let chunks = main_layout(area, panels_height);
+        // The analysis provider table is ten columns wide, so it stays a
+        // full-width band rather than moving into a side rail like the usage
+        // view's three-column one.
+        let full_band = analysis_panels_height(area.height, provider_rows.len());
+        // A dropped band still costs one row, for the notice that says so.
+        let band_height = full_band.unwrap_or(1);
+        let chunks = frame_layout(area, ANALYSIS_MIN_W, false, band_height);
 
-        let header = vec![
-            "Model",
-            "Edit Lines",
-            "Read Lines",
-            "Write Lines",
-            "Bash",
-            "Edit",
-            "Read",
-            "TodoWrite",
-            "Write",
+        // Numeric columns, ordered by how readily they may be dropped when the
+        // pane is narrow. Line counts are the headline metric, so the per-tool
+        // call counts go first.
+        const NUMERIC: [ColumnSpec; 8] = [
+            ColumnSpec {
+                header: "Edit Lines",
+                width: 11,
+                drop_rank: 0,
+            },
+            ColumnSpec {
+                header: "Read Lines",
+                width: 11,
+                drop_rank: 1,
+            },
+            ColumnSpec {
+                header: "Write Lines",
+                width: 11,
+                drop_rank: 2,
+            },
+            ColumnSpec {
+                header: "Bash",
+                width: 7,
+                drop_rank: 4,
+            },
+            ColumnSpec {
+                header: "Edit",
+                width: 7,
+                drop_rank: 3,
+            },
+            ColumnSpec {
+                header: "Read",
+                width: 7,
+                drop_rank: 5,
+            },
+            ColumnSpec {
+                header: "TodoWrite",
+                width: 10,
+                drop_rank: 7,
+            },
+            ColumnSpec {
+                header: "Write",
+                width: 7,
+                drop_rank: 6,
+            },
         ];
+
+        let inner = chunks.content.width.saturating_sub(2);
+        let (kept, dropped) = fit_columns(&NUMERIC, inner, MODEL_COL_MIN_W);
+        let numeric_span: u16 = kept.iter().map(|&i| NUMERIC[i].width + 1).sum();
+        let model_w = inner.saturating_sub(numeric_span).max(MODEL_COL_MIN_W);
+
+        let mut header: Vec<&str> = Vec::with_capacity(kept.len() + 1);
+        header.push("Model");
+        header.extend(kept.iter().map(|&i| NUMERIC[i].header));
+
+        let mut widths: Vec<Constraint> = Vec::with_capacity(header.len());
+        widths.push(Constraint::Length(model_w));
+        widths.extend(kept.iter().map(|&i| Constraint::Length(NUMERIC[i].width)));
 
         // One selectable row per model; the grand total lives only in the
         // summary bar below. Compact K/M/B numbers keep long counts in-column.
@@ -453,124 +514,191 @@ fn render_analysis_frame_with_status(
                 } else {
                     Style::default()
                 };
-                styled_row(
-                    vec![
-                        row.model.clone(),
-                        format_compact(row.edit_lines as i64),
-                        format_compact(row.read_lines as i64),
-                        format_compact(row.write_lines as i64),
-                        format_compact(row.bash_count as i64),
-                        format_compact(row.edit_count as i64),
-                        format_compact(row.read_count as i64),
-                        format_compact(row.todo_write_count as i64),
-                        format_compact(row.write_count as i64),
-                    ],
-                    style,
-                    1,
-                )
+                let all = [
+                    format_compact(row.edit_lines as i64),
+                    format_compact(row.read_lines as i64),
+                    format_compact(row.write_lines as i64),
+                    format_compact(row.bash_count as i64),
+                    format_compact(row.edit_count as i64),
+                    format_compact(row.read_count as i64),
+                    format_compact(row.todo_write_count as i64),
+                    format_compact(row.write_count as i64),
+                ];
+                let mut cells = Vec::with_capacity(header.len());
+                cells.push(row.model.clone());
+                cells.extend(kept.iter().map(|&i| all[i].clone()));
+                styled_row(cells, style, 1)
             })
             .collect();
 
-        let widths = [
-            Constraint::Min(16),    // Model
-            Constraint::Length(11), // Edit Lines
-            Constraint::Length(11), // Read Lines
-            Constraint::Length(11), // Write Lines
-            Constraint::Length(7),  // Bash
-            Constraint::Length(7),  // Edit
-            Constraint::Length(7),  // Read
-            Constraint::Length(10), // TodoWrite
-            Constraint::Length(7),  // Write
-        ];
-
         let row_count = rows.len();
+        let title = format!(
+            "Models · {} lines · {} tool calls · {} models",
+            format_compact((totals.edit_lines + totals.read_lines + totals.write_lines) as i64),
+            format_compact(
+                (totals.bash_count
+                    + totals.edit_count
+                    + totals.read_count
+                    + totals.todo_write_count
+                    + totals.write_count) as i64
+            ),
+            rows_data.len()
+        );
         render_scrollable_table(
             f,
-            chunks.table,
+            chunks.content,
+            TableChrome {
+                title: &title,
+                note: (dropped > 0).then(|| format!("−{dropped} cols")),
+                border_color: RatatuiColor::Green,
+            },
             header,
             rows,
             &widths,
-            RatatuiColor::Green,
             row_count,
             scroll,
         );
 
-        if let Some(panel_area) = chunks.panels {
+        if let (Some(panel_area), None) = (chunks.band, full_band) {
+            // Too short for the provider table: say so rather than leaving the
+            // reader to wonder where it went.
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!(
+                        "{} provider totals hidden — needs {} more rows",
+                        provider_rows.len().saturating_sub(1),
+                        analysis_panels_height(u16::MAX, provider_rows.len())
+                            .unwrap_or(0)
+                            .saturating_add(ANALYSIS_BELOW_BAND_MIN_H)
+                            .saturating_sub(area.height)
+                    ),
+                    Style::default().fg(RatatuiColor::DarkGray),
+                )))
+                .centered(),
+                panel_area,
+            );
+        } else if let Some(panel_area) = chunks.band {
+            // The provider band carries one more column than the model table
+            // (Days) and is drawn at the full frame width, so it gets the same
+            // priority treatment rather than over-committing and clipping its
+            // own headers.
+            const BAND_NUMERIC: [ColumnSpec; 9] = [
+                ColumnSpec {
+                    header: "Edit Lines",
+                    width: 11,
+                    drop_rank: 0,
+                },
+                ColumnSpec {
+                    header: "Read Lines",
+                    width: 11,
+                    drop_rank: 1,
+                },
+                ColumnSpec {
+                    header: "Write Lines",
+                    width: 12,
+                    drop_rank: 2,
+                },
+                ColumnSpec {
+                    header: "Bash",
+                    width: 8,
+                    drop_rank: 5,
+                },
+                ColumnSpec {
+                    header: "Edit",
+                    width: 8,
+                    drop_rank: 4,
+                },
+                ColumnSpec {
+                    header: "Read",
+                    width: 8,
+                    drop_rank: 6,
+                },
+                ColumnSpec {
+                    header: "TodoWrite",
+                    width: 11,
+                    drop_rank: 8,
+                },
+                ColumnSpec {
+                    header: "Write",
+                    width: 8,
+                    drop_rank: 7,
+                },
+                ColumnSpec {
+                    header: "Days",
+                    width: 8,
+                    drop_rank: 3,
+                },
+            ];
+            let band_inner = panel_area.width.saturating_sub(2);
+            let (band_kept, band_dropped) =
+                fit_columns(&BAND_NUMERIC, band_inner, PROVIDER_COL_MIN_W);
+            let band_span: u16 = band_kept.iter().map(|&i| BAND_NUMERIC[i].width + 1).sum();
+            let provider_w = band_inner.saturating_sub(band_span).max(PROVIDER_COL_MIN_W);
+
+            let mut totals_header: Vec<&str> = Vec::with_capacity(band_kept.len() + 1);
+            totals_header.push("Provider");
+            totals_header.extend(band_kept.iter().map(|&i| BAND_NUMERIC[i].header));
+
+            let mut totals_widths: Vec<Constraint> = Vec::with_capacity(totals_header.len());
+            totals_widths.push(Constraint::Length(provider_w));
+            totals_widths.extend(
+                band_kept
+                    .iter()
+                    .map(|&i| Constraint::Length(BAND_NUMERIC[i].width)),
+            );
+
             // Drop the "All Providers" aggregate; the summary bar already
             // carries the grand totals.
             let mut totals_rows: Vec<RatatuiRow> = provider_rows
                 .iter()
                 .filter(|row| row.label != "All Providers")
                 .map(|row| {
-                    create_provider_row(
-                        vec![
-                            row.label.to_string(),
-                            format_compact(row.stats.total_edit_lines as i64),
-                            format_compact(row.stats.total_read_lines as i64),
-                            format_compact(row.stats.total_write_lines as i64),
-                            format_compact(row.stats.total_bash_count as i64),
-                            format_compact(row.stats.total_edit_count as i64),
-                            format_compact(row.stats.total_read_count as i64),
-                            format_compact(row.stats.total_todo_write_count as i64),
-                            format_compact(row.stats.total_write_count as i64),
-                            format_compact(row.stats.days_count as i64),
-                        ],
-                        row.tui_color,
-                        row.emphasize,
-                    )
+                    let all = [
+                        format_compact(row.stats.total_edit_lines as i64),
+                        format_compact(row.stats.total_read_lines as i64),
+                        format_compact(row.stats.total_write_lines as i64),
+                        format_compact(row.stats.total_bash_count as i64),
+                        format_compact(row.stats.total_edit_count as i64),
+                        format_compact(row.stats.total_read_count as i64),
+                        format_compact(row.stats.total_todo_write_count as i64),
+                        format_compact(row.stats.total_write_count as i64),
+                        format_compact(row.stats.days_count as i64),
+                    ];
+                    let mut cells = Vec::with_capacity(totals_header.len());
+                    cells.push(row.label.to_string());
+                    cells.extend(band_kept.iter().map(|&i| all[i].clone()));
+                    create_provider_row(cells, row.tui_color, row.emphasize)
                 })
                 .collect();
 
             if totals_rows.is_empty() {
+                let mut cells = vec!["No provider data yet".to_string()];
+                cells.extend(std::iter::repeat_n("-".to_string(), band_kept.len()));
                 totals_rows.push(
-                    RatatuiRow::new(vec![
-                        "No provider data yet".to_string(),
-                        "-".to_string(),
-                        "-".to_string(),
-                        "-".to_string(),
-                        "-".to_string(),
-                        "-".to_string(),
-                        "-".to_string(),
-                        "-".to_string(),
-                        "-".to_string(),
-                        "-".to_string(),
-                    ])
-                    .style(Style::default().fg(RatatuiColor::DarkGray)),
+                    RatatuiRow::new(cells).style(Style::default().fg(RatatuiColor::DarkGray)),
                 );
             }
 
-            let totals_header = vec![
-                "Provider",
-                "Edit Lines",
-                "Read Lines",
-                "Write Lines",
-                "Bash",
-                "Edit",
-                "Read",
-                "TodoWrite",
-                "Write",
-                "Days",
-            ];
-
-            let totals_widths = [
-                Constraint::Min(15),    // Provider
-                Constraint::Length(11), // Edit Lines
-                Constraint::Length(11), // Read Lines
-                Constraint::Length(12), // Write Lines
-                Constraint::Length(8),  // Bash
-                Constraint::Length(8),  // Edit
-                Constraint::Length(8),  // Read
-                Constraint::Length(11), // TodoWrite
-                Constraint::Length(8),  // Write
-                Constraint::Length(8),  // Days
-            ];
-
+            let mut band_block = Block::default()
+                .borders(Borders::ALL)
+                .title(Line::from(" Providers "))
+                .border_style(Style::default().fg(RatatuiColor::Magenta));
+            if band_dropped > 0 {
+                band_block = band_block.title(
+                    Line::from(Span::styled(
+                        format!(" −{band_dropped} cols "),
+                        Style::default().fg(RatatuiColor::DarkGray),
+                    ))
+                    .right_aligned(),
+                );
+            }
             let totals_table = create_ratatui_table(
                 totals_rows,
                 totals_header,
                 &totals_widths,
                 RatatuiColor::Magenta,
-            );
+            )
+            .block(band_block);
             f.render_widget(totals_table, panel_area);
         }
 
@@ -599,7 +727,10 @@ fn render_analysis_frame_with_status(
         let summary = create_summary(summary_items, sys, pid, chunks.summary.width);
         f.render_widget(summary, chunks.summary);
 
-        f.render_widget(create_controls_with_status(&[], status), chunks.controls);
+        f.render_widget(
+            create_controls_with_status(&[], status, chunks.controls.width),
+            chunks.controls,
+        );
     })?;
 
     // ratatui can't embed the OSC 8 escape itself, so hyperlink the repo label
@@ -616,18 +747,73 @@ mod tests {
     #[test]
     fn band_shown_only_when_it_fits_in_full() {
         // Five sample providers + the overall row = 6 band rows -> 10 tall, so the
-        // band needs at least 20 rows of terminal to also fit table+summary+
+        // band needs at least 18 rows of terminal to also fit table+summary+
         // controls. Below that it is hidden (previously it rendered truncated).
-        assert_eq!(analysis_panels_height(18, 6), None);
-        assert_eq!(analysis_panels_height(19, 6), None);
-        assert_eq!(analysis_panels_height(20, 6), Some(10));
+        assert_eq!(analysis_panels_height(16, 6), None);
+        assert_eq!(analysis_panels_height(17, 6), None);
+        assert_eq!(analysis_panels_height(18, 6), Some(10));
 
         // The threshold scales down with fewer providers instead of a fixed 18.
-        assert_eq!(analysis_panels_height(14, 1), None);
-        assert_eq!(analysis_panels_height(15, 1), Some(5));
+        assert_eq!(analysis_panels_height(12, 1), None);
+        assert_eq!(analysis_panels_height(13, 1), Some(5));
 
-        // No providers still floors the band height at 4 (needs 14 rows).
-        assert_eq!(analysis_panels_height(13, 0), None);
-        assert_eq!(analysis_panels_height(14, 0), Some(4));
+        // No providers still floors the band height at 4 (needs 12 rows).
+        assert_eq!(analysis_panels_height(11, 0), None);
+        assert_eq!(analysis_panels_height(12, 0), Some(4));
+    }
+
+    #[test]
+    fn dropped_provider_band_is_announced() {
+        use ratatui::backend::TestBackend;
+        // 6 provider rows need 10 band rows plus 8 below, so 17 is too short.
+        let (w, h) = (ANALYSIS_MIN_W, 17u16);
+        assert_eq!(analysis_panels_height(h, 6), None);
+
+        let rows = vec![AnalysisRow {
+            model: "claude-opus-4-8".to_string(),
+            edit_lines: 1,
+            ..Default::default()
+        }];
+        // Five providers plus the overall row = 6 band rows, which needs 10 for
+        // the band and 8 beneath it: more than this terminal has.
+        let mut provider_totals = AnalysisProviderTotals::default();
+        for stats in [
+            &mut provider_totals.claude,
+            &mut provider_totals.codex,
+            &mut provider_totals.copilot,
+            &mut provider_totals.gemini,
+            &mut provider_totals.grok,
+        ] {
+            stats.total_edit_lines = 1;
+            stats.days_count = 1;
+        }
+        provider_totals.overall.total_edit_lines = 5;
+        provider_totals.overall.days_count = 1;
+        assert_eq!(build_analysis_provider_rows(&provider_totals).len(), 6);
+
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let mut scroll = ScrollState::new();
+        let pid = sysinfo::get_current_pid().unwrap();
+        let mut sys = System::new();
+        init_process_metrics(&mut sys, pid);
+        render_analysis_frame_with_status(
+            &mut terminal,
+            &rows,
+            &AnalysisRow::default(),
+            &provider_totals,
+            &UpdateTracker::new(MAX_TRACKED_ANALYSIS_ROWS, 0),
+            &sys,
+            pid,
+            &mut scroll,
+            None,
+        )
+        .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let screen: String = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| buffer.cell((x, y)).unwrap().symbol().to_string())
+            .collect();
+        assert!(screen.contains("provider totals hidden"), "got:\n{screen}");
     }
 }

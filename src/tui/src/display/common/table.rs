@@ -105,7 +105,8 @@ fn fit_diagnostics(
     (true, used + mem_width + cpu_width <= available)
 }
 
-/// Builds the TUI summary bar from caller-supplied items plus live memory and CPU readouts.
+/// Builds the one-line TUI summary bar from caller-supplied items plus live
+/// memory and CPU readouts.
 ///
 /// Each `(icon, value, color)` tuple in `summary_items` becomes a colored,
 /// pipe-separated segment; these primary items are always rendered. A
@@ -116,14 +117,16 @@ fn fit_diagnostics(
 /// clipped mid-word. They read `0.0` if `sys` has no entry for `pid`. CPU is
 /// normalized to a 0-100% share of the machine. `sys` is expected to have been
 /// refreshed by the caller before this call.
+///
+/// The bar is deliberately unbordered: it carries a single line of text, and a
+/// border around it would cost two more rows of the scrollable table above.
 pub fn create_summary<'a>(
     summary_items: Vec<(&'a str, &'a str, RatatuiColor)>, // (icon, value, color) tuples
     sys: &'a System,
     pid: sysinfo::Pid,
     width: u16,
 ) -> Paragraph<'a> {
-    // Content sits inside the block's borders, which take one column each side.
-    let available = width.saturating_sub(2) as usize;
+    let available = width as usize;
 
     let mut spans = Vec::new();
     let mut used = 0usize;
@@ -182,13 +185,7 @@ pub fn create_summary<'a>(
         ));
     }
 
-    Paragraph::new(vec![Line::from(spans)])
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(RatatuiColor::Yellow)),
-        )
-        .centered()
+    Paragraph::new(vec![Line::from(spans)]).centered()
 }
 
 /// Short call-to-action shown in the footer (also the OSC 8 hyperlink text).
@@ -198,26 +195,61 @@ pub const REPO_URL: &str = "https://github.com/Mai0313/VibeCodingTracker";
 
 /// Builds the single-line key-hint footer (navigation + the GitHub repo link).
 ///
-/// Everything is on one line to save vertical space; the repo link sits last so
-/// it is the first thing truncated on a narrow terminal, leaving the keys
-/// readable. `extra` inserts view-specific `(key, label)` hints just before
-/// `r refresh` — the usage view passes its `m merge` toggle; other views pass
-/// an empty slice. The label is drawn as plain (underlined) text here; a
-/// terminal hyperlink is layered on afterward by
+/// Everything is on one line to save vertical space. `extra` inserts
+/// view-specific `(key, label)` hints just before `r refresh` — the usage view
+/// passes its `m` / `p` / `Q` toggles; other views pass an empty slice. The repo
+/// label is drawn as plain (underlined) text here; a terminal hyperlink is
+/// layered on afterward by
 /// [`overlay_repo_hyperlink`](super::tui::overlay_repo_hyperlink).
-pub fn create_controls(extra: &[(&str, &str)]) -> Paragraph<'static> {
-    create_controls_with_status(extra, None)
+pub fn create_controls(extra: &[(&str, &str)], width: u16) -> Paragraph<'static> {
+    create_controls_with_status(extra, None, width)
 }
 
 /// Builds the controls footer with an optional transient refresh status.
+///
+/// Hints are dropped whole rather than clipped mid-word when they do not fit
+/// `width`, in this order: the repo label, then the view-specific `extra` hints
+/// from the right, then the status. Scrolling, refresh and quit always survive —
+/// a footer that cannot say how to quit is worse than one that says less.
 pub fn create_controls_with_status(
     extra: &[(&str, &str)],
     status: Option<&str>,
+    width: u16,
 ) -> Paragraph<'static> {
     let key = Style::default().fg(RatatuiColor::Cyan).bold();
     let dim = Style::default().fg(RatatuiColor::DarkGray);
+    let available = width as usize;
+
+    // Widths of the parts that are always drawn.
+    let core = seg_width("↑/↓ scroll  r refresh  q quit");
+    let repo = seg_width("  |  ") + seg_width(REPO_LABEL);
+    let status_w = status.map_or(0, |s| seg_width("  |  ") + seg_width(s));
+    let extra_w: Vec<usize> = extra
+        .iter()
+        .map(|(k, label)| seg_width(k) + seg_width(label))
+        .collect();
+
+    // Drop from the cheapest end until what is left fits.
+    let mut shown_extra = extra.len();
+    let mut show_status = status.is_some();
+    let mut show_repo = true;
+    let used = |shown: usize, status: bool, repo_shown: bool| {
+        core + extra_w[..shown].iter().sum::<usize>()
+            + if status { status_w } else { 0 }
+            + if repo_shown { repo } else { 0 }
+    };
+    if used(shown_extra, show_status, show_repo) > available {
+        show_repo = false;
+    }
+    while shown_extra > 0 && used(shown_extra, show_status, show_repo) > available {
+        shown_extra -= 1;
+    }
+    if used(shown_extra, show_status, show_repo) > available {
+        show_status = false;
+    }
+
     let mut spans = vec![Span::styled("↑/↓", key), Span::styled(" scroll  ", dim)];
-    for (k, label) in extra {
+    for (k, label) in &extra[..shown_extra] {
         spans.push(Span::styled(k.to_string(), key));
         spans.push(Span::styled(label.to_string(), dim));
     }
@@ -228,75 +260,169 @@ pub fn create_controls_with_status(
         Style::default().fg(RatatuiColor::Red).bold(),
     ));
     spans.push(Span::styled(" quit", dim));
-    if let Some(status) = status {
+    if show_status && let Some(status) = status {
         spans.push(Span::styled("  |  ", dim));
         spans.push(Span::styled(
             status.to_string(),
             Style::default().fg(RatatuiColor::Yellow).bold(),
         ));
     }
-    spans.push(Span::styled("  |  ", dim));
-    spans.push(Span::styled(
-        REPO_LABEL,
-        Style::default().fg(RatatuiColor::Cyan).underlined(),
-    ));
+    if show_repo {
+        spans.push(Span::styled("  |  ", dim));
+        spans.push(Span::styled(
+            REPO_LABEL,
+            Style::default().fg(RatatuiColor::Cyan).underlined(),
+        ));
+    }
     Paragraph::new(vec![Line::from(spans)]).centered()
 }
 
-/// Vertical chunk rects for an interactive frame.
+/// Rows the scrollable content pane is never squeezed below. The block border,
+/// header row and header margin eat 4, so this keeps ~2 body rows alive.
+pub const CONTENT_MIN_H: u16 = 6;
+/// Narrowest a side rail may be and still hold a gauge line or a three-column
+/// provider row without truncating it.
+pub(crate) const RAIL_MIN_W: u16 = 30;
+/// Widest a side rail grows to; past this the content pane keeps the slack.
+const RAIL_MAX_W: u16 = 52;
+/// Rows the frame always spends below the content: summary + controls.
+pub const FOOTER_H: u16 = 2;
+
+/// Chunk rects for an interactive frame.
 pub struct FrameChunks {
     /// Scrollable main table area.
-    pub table: Rect,
-    /// Provider / quota band, present only when there is room for it.
-    pub panels: Option<Rect>,
-    /// Summary bar area.
+    pub content: Rect,
+    /// Side rail beside the content, present only on a wide enough terminal.
+    pub rail: Option<Rect>,
+    /// Full-width band under the content, present only when one was asked for.
+    pub band: Option<Rect>,
+    /// Single-line summary area.
     pub summary: Rect,
     /// Single-line controls footer area.
     pub controls: Rect,
 }
 
-/// Splits `area` into the standard interactive-view rows.
+/// Width the side rail takes at `width`, or `None` when it does not fit.
 ///
-/// When `panels_height` is `Some`, a provider/quota band of that height sits
-/// between the scrollable table and the summary; when `None` (a tight terminal)
-/// the band is dropped and the table absorbs the space. The table always gets
-/// `Min(6)` so at least ~2 body rows survive (border + header + margin eat 4).
-pub fn main_layout(area: Rect, panels_height: Option<u16>) -> FrameChunks {
-    match panels_height {
-        Some(h) => {
-            let c = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Min(6),
-                    Constraint::Length(h),
-                    Constraint::Length(3),
-                    Constraint::Length(1),
-                ])
-                .split(area);
-            FrameChunks {
-                table: c[0],
-                panels: Some(c[1]),
-                summary: c[2],
-                controls: c[3],
-            }
+/// The rail exists to put the horizontal gutter to work, so it only appears
+/// once the content pane can keep its own minimum beside it. Between the
+/// bounds it takes a third of the terminal, which is what lets a wide terminal
+/// spend its slack on rail content instead of inflating a name column. The
+/// share is then capped at whatever the content pane can spare, so the returned
+/// width is the width the rail actually gets rather than one the layout solver
+/// would have to shrink back.
+fn rail_width(width: u16, content_min_w: u16) -> Option<u16> {
+    (width >= content_min_w.saturating_add(RAIL_MIN_W)).then(|| {
+        (width / 3)
+            .clamp(RAIL_MIN_W, RAIL_MAX_W)
+            .min(width - content_min_w)
+    })
+}
+
+/// Splits `area` into the standard interactive-view regions.
+///
+/// Vertically: the content pane absorbs all leftover height, then an optional
+/// `band_height`-row band, then one row each of summary and controls.
+/// Horizontally the content row is split once — content pane plus rail — and
+/// only when `rail` is requested *and* [`rail_width`] says it fits. That single
+/// comparison is the whole responsive story; nothing here reads how many items
+/// the caller intends to draw.
+pub fn frame_layout(area: Rect, content_min_w: u16, rail: bool, band_height: u16) -> FrameChunks {
+    let mut constraints: Vec<Constraint> = Vec::with_capacity(4);
+    constraints.push(Constraint::Min(CONTENT_MIN_H));
+    if band_height > 0 {
+        constraints.push(Constraint::Length(band_height));
+    }
+    constraints.push(Constraint::Length(1));
+    constraints.push(Constraint::Length(1));
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+
+    let mut next = 0;
+    let mut take = || {
+        let rect = rows[next];
+        next += 1;
+        rect
+    };
+    let top = take();
+    let band = (band_height > 0).then(&mut take);
+    let summary = take();
+    let controls = take();
+
+    let (content, rail) = match rail.then(|| rail_width(top.width, content_min_w)).flatten() {
+        Some(w) => {
+            let cells = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(content_min_w), Constraint::Length(w)])
+                .split(top);
+            (cells[0], Some(cells[1]))
         }
-        None => {
-            let c = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Min(6),
-                    Constraint::Length(3),
-                    Constraint::Length(1),
-                ])
-                .split(area);
-            FrameChunks {
-                table: c[0],
-                panels: None,
-                summary: c[1],
-                controls: c[2],
+        None => (top, None),
+    };
+
+    FrameChunks {
+        content,
+        rail,
+        band,
+        summary,
+        controls,
+    }
+}
+
+/// One numeric column of a scrollable table, plus how readily it may go.
+pub struct ColumnSpec {
+    /// Header text.
+    pub header: &'static str,
+    /// Column width in cells.
+    pub width: u16,
+    /// Drop order when the pane is too narrow: the highest rank goes first.
+    /// The columns a reader would miss most carry the lowest ranks.
+    pub drop_rank: u8,
+}
+
+/// Chooses which numeric columns survive in `inner` content columns.
+///
+/// Returns the kept columns in their original order together with the number
+/// dropped, which the caller shows in the table's title. Dropping whole columns
+/// from the low-value end keeps the model name readable; the previous behaviour
+/// gave every numeric column its full width and squeezed the name to nothing.
+pub fn fit_columns(specs: &[ColumnSpec], inner: u16, name_min_w: u16) -> (Vec<usize>, usize) {
+    let mut kept: Vec<usize> = (0..specs.len()).collect();
+    // Each column is preceded by one space of column spacing.
+    let span = |kept: &[usize]| -> u16 {
+        kept.iter()
+            .map(|&i| specs[i].width + 1)
+            .sum::<u16>()
+            .saturating_add(name_min_w)
+    };
+    while !kept.is_empty() && span(&kept) > inner {
+        let worst = kept
+            .iter()
+            .enumerate()
+            .max_by_key(|&(_, &i)| specs[i].drop_rank)
+            .map(|(pos, _)| pos);
+        match worst {
+            Some(pos) => {
+                kept.remove(pos);
             }
+            None => break,
         }
     }
+    let dropped = specs.len() - kept.len();
+    (kept, dropped)
+}
+
+/// Border, title and drop-notice for a scrollable table.
+pub struct TableChrome<'a> {
+    /// Left-aligned title; carries the totals for the rows underneath.
+    pub title: &'a str,
+    /// Right-aligned notice naming what the table had to leave out.
+    pub note: Option<String>,
+    /// Border color.
+    pub border_color: RatatuiColor,
 }
 
 /// Builds a table row with the first `left_cols` cells left-aligned and the
@@ -330,22 +456,38 @@ pub fn styled_row(cells: Vec<String>, style: Style, left_cols: usize) -> Ratatui
 pub fn render_scrollable_table(
     f: &mut Frame,
     area: Rect,
+    chrome: TableChrome<'_>,
     header: Vec<&str>,
     rows: Vec<RatatuiRow>,
     widths: &[Constraint],
-    border_color: RatatuiColor,
     row_count: usize,
     scroll: &mut ScrollState,
 ) {
     let viewport = area.height.saturating_sub(4);
 
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .title(Line::from(format!(" {} ", chrome.title)))
+        .border_style(Style::default().fg(chrome.border_color));
+    if let Some(note) = chrome.note {
+        block = block.title(
+            Line::from(Span::styled(
+                format!(" {note} "),
+                Style::default().fg(RatatuiColor::DarkGray),
+            ))
+            .right_aligned(),
+        );
+    }
+
     // Selection is shown purely by the row color (no leading symbol / gutter).
-    let table = create_ratatui_table(rows, header, widths, border_color).row_highlight_style(
-        Style::default()
-            .fg(RatatuiColor::Black)
-            .bg(RatatuiColor::Cyan)
-            .add_modifier(Modifier::BOLD),
-    );
+    let table = create_ratatui_table(rows, header, widths, chrome.border_color)
+        .block(block)
+        .row_highlight_style(
+            Style::default()
+                .fg(RatatuiColor::Black)
+                .bg(RatatuiColor::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
 
     f.render_stateful_widget(table, area, &mut scroll.table);
 
@@ -513,7 +655,109 @@ pub fn create_provider_row<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{fit_diagnostics, normalized_cpu};
+    use super::{
+        CONTENT_MIN_H, ColumnSpec, FOOTER_H, RAIL_MIN_W, Rect, create_controls_with_status,
+        fit_columns, fit_diagnostics, frame_layout, normalized_cpu, rail_width,
+    };
+
+    #[test]
+    fn rail_appears_only_once_the_content_pane_keeps_its_minimum() {
+        // One comparison decides it: content minimum + rail minimum.
+        assert_eq!(rail_width(66 + RAIL_MIN_W - 1, 66), None);
+        assert_eq!(rail_width(66 + RAIL_MIN_W, 66), Some(RAIL_MIN_W));
+        // Between the bounds the rail takes a third of the terminal.
+        assert_eq!(rail_width(120, 66), Some(40));
+        // Near the threshold the third is capped at what the content can spare,
+        // so the reported width is the one the rail actually gets.
+        assert_eq!(rail_width(100, 66), Some(33));
+        // ...and stops growing, so a very wide terminal keeps its slack in the
+        // content pane rather than in an increasingly empty rail.
+        assert_eq!(rail_width(400, 66), Some(52));
+        // A wider content minimum pushes the threshold out with it.
+        assert_eq!(rail_width(84 + RAIL_MIN_W - 1, 84), None);
+        assert_eq!(rail_width(84 + RAIL_MIN_W, 84), Some(RAIL_MIN_W));
+    }
+
+    #[test]
+    fn frame_gives_every_leftover_row_to_the_content_pane() {
+        let area = Rect::new(0, 0, 120, 40);
+        let c = frame_layout(area, 66, false, 0);
+        assert_eq!(c.content.height, 40 - FOOTER_H);
+        assert!(c.band.is_none());
+        assert_eq!(c.summary.height, 1);
+        assert_eq!(c.controls.height, 1);
+        assert_eq!(c.controls.y, 39);
+
+        let c = frame_layout(area, 66, false, 6);
+        assert_eq!(c.content.height, 40 - FOOTER_H - 6);
+        assert_eq!(c.band.expect("band requested").height, 6);
+    }
+
+    #[test]
+    fn frame_splits_the_content_row_only_when_the_rail_fits() {
+        let wide = frame_layout(Rect::new(0, 0, 120, 40), 66, true, 0);
+        let rail = wide.rail.expect("rail fits at 120 columns");
+        assert_eq!(rail.width, 40);
+        assert_eq!(wide.content.width, 80);
+        assert_eq!(wide.content.height, rail.height);
+
+        // Below the threshold the content pane takes the whole row instead of
+        // both being squeezed under their minimums.
+        let narrow = frame_layout(Rect::new(0, 0, 90, 40), 66, true, 0);
+        assert!(narrow.rail.is_none());
+        assert_eq!(narrow.content.width, 90);
+
+        // A caller that does not want a rail never gets one.
+        let off = frame_layout(Rect::new(0, 0, 200, 40), 66, false, 0);
+        assert!(off.rail.is_none());
+        assert_eq!(off.content.width, 200);
+    }
+
+    #[test]
+    fn columns_drop_from_the_low_value_end_before_the_name_is_squeezed() {
+        const COLS: [ColumnSpec; 4] = [
+            ColumnSpec {
+                header: "a",
+                width: 10,
+                drop_rank: 0,
+            },
+            ColumnSpec {
+                header: "b",
+                width: 10,
+                drop_rank: 1,
+            },
+            ColumnSpec {
+                header: "c",
+                width: 10,
+                drop_rank: 3,
+            },
+            ColumnSpec {
+                header: "d",
+                width: 10,
+                drop_rank: 2,
+            },
+        ];
+        // Everything fits: nothing is dropped and the order is preserved.
+        assert_eq!(fit_columns(&COLS, 100, 20), (vec![0, 1, 2, 3], 0));
+        // One column too many: the highest drop_rank goes first, and the kept
+        // columns stay in their original order.
+        assert_eq!(fit_columns(&COLS, 55, 20), (vec![0, 1, 3], 1));
+        assert_eq!(fit_columns(&COLS, 44, 20), (vec![0, 1], 2));
+        assert_eq!(fit_columns(&COLS, 33, 20), (vec![0], 3));
+        // The name minimum always wins; an impossibly narrow pane keeps no
+        // numeric column rather than cutting the name to nothing.
+        assert_eq!(fit_columns(&COLS, 20, 20), (vec![], 4));
+    }
+
+    #[test]
+    fn frame_holds_the_content_minimum_when_the_terminal_is_short() {
+        // The band and footer are `Length`, so a shortfall is taken from them
+        // first; the content pane never drops below its minimum.
+        let c = frame_layout(Rect::new(0, 0, 120, CONTENT_MIN_H + FOOTER_H), 66, false, 0);
+        assert_eq!(c.content.height, CONTENT_MIN_H);
+        assert_eq!(c.summary.height, 1);
+        assert_eq!(c.controls.height, 1);
+    }
 
     #[test]
     fn normalized_cpu_divides_by_cores_and_clamps() {
@@ -523,6 +767,41 @@ mod tests {
         assert_eq!(normalized_cpu(0.0, 8.0), 0.0);
         // A transient over-count (all cores summed above 100%) is clamped.
         assert_eq!(normalized_cpu(410.0, 4.0), 100.0);
+    }
+
+    #[test]
+    fn controls_drop_hints_whole_and_always_keep_quit() {
+        use ratatui::widgets::Widget;
+        let render = |width: u16| {
+            let area = Rect::new(0, 0, width, 1);
+            let mut buf = ratatui::buffer::Buffer::empty(area);
+            create_controls_with_status(
+                &[("m", " merge  "), ("p", " panes  "), ("Q", " quota  ")],
+                None,
+                width,
+            )
+            .render(area, &mut buf);
+            (0..width)
+                .map(|x| buf.cell((x, 0)).unwrap().symbol())
+                .collect::<String>()
+        };
+
+        // Wide: everything, including the repo label.
+        let wide = render(120);
+        assert!(wide.contains("Star on GitHub") && wide.contains("Q quota"));
+
+        // The hard minimum terminal width. The repo label goes first, then the
+        // extras from the right, and nothing is left half-drawn.
+        let min = render(74);
+        assert!(!min.contains("Star"), "got {min:?}");
+        assert!(min.contains("q quit"), "got {min:?}");
+        assert!(min.trim_end().chars().count() <= 74);
+
+        // Absurdly narrow: the keys that still fit are whole words.
+        let tiny = render(30);
+        assert!(!tiny.contains("Star"), "got {tiny:?}");
+        assert!(!tiny.contains("quota"), "got {tiny:?}");
+        assert!(tiny.contains("quit"), "got {tiny:?}");
     }
 
     #[test]
