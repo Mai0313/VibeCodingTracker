@@ -157,7 +157,7 @@ fn existing_current_file_is_parsed_and_left_in_place() {
 }
 
 #[test]
-fn generated_schema_exposes_grok_as_an_enabled_non_quota_provider() {
+fn generated_schema_exposes_grok_as_an_enabled_provider_with_a_quota_panel() {
     let schema: serde_json::Value =
         serde_json::from_str(&config::schema_json()).expect("generated schema is valid JSON");
     let providers = &schema["properties"]["providers"];
@@ -165,11 +165,12 @@ fn generated_schema_exposes_grok_as_an_enabled_non_quota_provider() {
     assert_eq!(providers["default"]["grok"], true);
     assert_eq!(providers["properties"]["grok"]["default"], true);
     assert!(
-        !schema["properties"]["usage"]["properties"]["quota"]["default"]["panels"]
+        schema["properties"]["usage"]["properties"]["quota"]["default"]["panels"]
             .as_array()
             .expect("quota panels array")
             .iter()
-            .any(|panel| panel == "grok")
+            .any(|panel| panel == "grok"),
+        "Grok ships as a quota panel, so it belongs in the default list"
     );
 }
 

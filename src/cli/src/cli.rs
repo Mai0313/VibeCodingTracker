@@ -25,6 +25,8 @@ pub enum QuotaProvider {
     Copilot,
     /// Cursor CLI (`GET /api/usage-summary`).
     Cursor,
+    /// Grok CLI (`GET /v1/billing?format=credits`).
+    Grok,
 }
 
 /// Vibe Coding Tracker - AI coding assistant usage analyzer.
@@ -142,7 +144,7 @@ pub enum Commands {
     /// The old name `fetch` is kept as a hidden alias for back-compat.
     #[command(alias = "fetch")]
     Quota {
-        /// Which provider to query (claude | codex | copilot | cursor).
+        /// Which provider to query (claude | codex | copilot | cursor | grok).
         provider: QuotaProvider,
 
         /// Output as pretty JSON (default).

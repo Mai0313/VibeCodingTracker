@@ -178,7 +178,8 @@
             "claude",
             "codex",
             "copilot",
-            "cursor"
+            "cursor",
+            "grok"
           ],
           "refresh_interval": 60
         },
@@ -197,7 +198,8 @@
               "claude",
               "codex",
               "copilot",
-              "cursor"
+              "cursor",
+              "grok"
             ],
             "refresh_interval": 60
           },
@@ -208,9 +210,10 @@
                 "claude",
                 "codex",
                 "copilot",
-                "cursor"
+                "cursor",
+                "grok"
               ],
-              "description": "Which live quota panels to show in the usage TUI (by provider name:\n`claude` / `codex` / `copilot` / `cursor`). An empty list hides the band.",
+              "description": "Which live quota panels to show in the usage TUI (by provider name:\n`claude` / `codex` / `copilot` / `cursor` / `grok`). An empty list hides\nthe band.",
               "items": {
                 "type": "string"
               },

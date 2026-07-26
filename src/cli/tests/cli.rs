@@ -375,7 +375,8 @@ fn test_quota_help() {
         .stdout(predicate::str::contains("claude"))
         .stdout(predicate::str::contains("codex"))
         .stdout(predicate::str::contains("copilot"))
-        .stdout(predicate::str::contains("cursor"));
+        .stdout(predicate::str::contains("cursor"))
+        .stdout(predicate::str::contains("grok"));
 }
 
 #[test]

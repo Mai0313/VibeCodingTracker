@@ -150,7 +150,8 @@ impl UsageConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct QuotaConfig {
     /// Which live quota panels to show in the usage TUI (by provider name:
-    /// `claude` / `codex` / `copilot` / `cursor`). An empty list hides the band.
+    /// `claude` / `codex` / `copilot` / `cursor` / `grok`). An empty list hides
+    /// the band.
     #[serde(default = "default_quota_panels")]
     pub panels: Vec<String>,
     /// Seconds between live quota-panel polls, shared by every provider
@@ -301,7 +302,7 @@ fn default_quota_refresh_secs() -> u64 {
 }
 
 fn default_quota_panels() -> Vec<String> {
-    ["claude", "codex", "copilot", "cursor"]
+    ["claude", "codex", "copilot", "cursor", "grok"]
         .iter()
         .map(|s| s.to_string())
         .collect()
