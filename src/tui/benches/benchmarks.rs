@@ -533,8 +533,11 @@ fn benchmark_tui_frame_render(c: &mut Criterion) {
         })
     });
 
+    // Wide enough that the band keeps the Provider Usage table alongside all
+    // five quota panels, so the frame benchmarked still covers the provider
+    // table and share bar rather than only the panels.
     let mut ready =
-        UsageFrameBenchmark::new(160, 42).expect("create ready frame benchmark fixture");
+        UsageFrameBenchmark::new(190, 42).expect("create ready frame benchmark fixture");
     group.bench_function("ready", |b| {
         b.iter(|| {
             ready
@@ -544,7 +547,7 @@ fn benchmark_tui_frame_render(c: &mut Criterion) {
     });
 
     let mut refreshing =
-        UsageFrameBenchmark::new(160, 42).expect("create refreshing frame benchmark fixture");
+        UsageFrameBenchmark::new(190, 42).expect("create refreshing frame benchmark fixture");
     group.bench_function("refreshing", |b| {
         b.iter(|| {
             refreshing

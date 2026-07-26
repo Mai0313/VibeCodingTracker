@@ -391,8 +391,8 @@ fn run_config(action: ConfigAction) -> Result<()> {
 /// the provider's login hint).
 fn run_quota(provider: QuotaProvider, text: bool, table: bool) -> Result<()> {
     use vct_core::quota::{
-        CLAUDE_LOGIN_HINT, CODEX_LOGIN_HINT, COPILOT_LOGIN_HINT, CURSOR_LOGIN_HINT, claude,
-        copilot, cursor, http, wham,
+        CLAUDE_LOGIN_HINT, CODEX_LOGIN_HINT, COPILOT_LOGIN_HINT, CURSOR_LOGIN_HINT,
+        GROK_LOGIN_HINT, claude, copilot, cursor, grok, http, wham,
     };
     use vct_tui::display::quota::{display_quota_table, display_quota_text, print_quota_json};
 
@@ -402,6 +402,7 @@ fn run_quota(provider: QuotaProvider, text: bool, table: bool) -> Result<()> {
         QuotaProvider::Codex => wham::fetch_codex_raw(&client),
         QuotaProvider::Copilot => copilot::fetch_copilot_raw(&client),
         QuotaProvider::Cursor => cursor::fetch_cursor_raw(&client),
+        QuotaProvider::Grok => grok::fetch_grok_raw(&client),
     }?;
 
     if text {
@@ -418,6 +419,7 @@ fn run_quota(provider: QuotaProvider, text: bool, table: bool) -> Result<()> {
             QuotaProvider::Codex => ("codex", CODEX_LOGIN_HINT),
             QuotaProvider::Copilot => ("copilot", COPILOT_LOGIN_HINT),
             QuotaProvider::Cursor => ("cursor", CURSOR_LOGIN_HINT),
+            QuotaProvider::Grok => ("grok", GROK_LOGIN_HINT),
         };
         // A rejected token (401/403) is the one case a re-login fixes, so only
         // then append the login hint; other statuses (429, 5xx, ...) just report.

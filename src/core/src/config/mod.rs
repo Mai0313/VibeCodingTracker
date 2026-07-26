@@ -38,6 +38,20 @@ use toml_edit::{Array, DocumentMut, Item, Table, TableLike, value};
 const SCHEMA_URL: &str =
     "https://raw.githubusercontent.com/Mai0313/VibeCodingTracker/main/vct.schema.json";
 
+/// Current layout version of `config.toml`, stamped into `[general].version`.
+///
+/// It exists so an upgrade can add a setting to an existing file exactly once.
+/// Version 1 is any file written before the key existed.
+const CONFIG_VERSION: u32 = 2;
+
+/// Quota panels introduced after version 1, back-filled once into a file older
+/// than the version that shipped them.
+///
+/// Only the panel a given version *added* is back-filled, so a panel the user
+/// removed on purpose earlier is never resurrected. Extend this list (and bump
+/// [`CONFIG_VERSION`]) when a new provider gains a panel.
+const PANELS_ADDED_BY_VERSION: &[(u32, &str)] = &[(2, "grok")];
+
 /// The full settings document.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
 pub struct Config {
@@ -95,12 +109,30 @@ impl PerformanceConfig {
 }
 
 /// `[general]` — settings shared across subcommands.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct GeneralConfig {
     /// Default time range when no --daily/--weekly/--monthly/--all flag is given.
     /// One of: "daily" | "weekly" | "monthly" | "all".
     #[serde(default)]
     pub default_time_range: TimeRange,
+    /// Layout version of this file, stamped by vct. Only the upgrade pass reads
+    /// it; leave it alone unless you want a past upgrade to run again.
+    #[serde(
+        default = "legacy_config_version",
+        deserialize_with = "de_config_version"
+    )]
+    pub version: u32,
+}
+
+impl Default for GeneralConfig {
+    fn default() -> Self {
+        Self {
+            default_time_range: TimeRange::default(),
+            // A file this tool writes is current by construction; only a file
+            // read from disk without the key is legacy (see the serde default).
+            version: CONFIG_VERSION,
+        }
+    }
 }
 
 /// `[usage]` — usage dashboard preferences.
@@ -150,7 +182,8 @@ impl UsageConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct QuotaConfig {
     /// Which live quota panels to show in the usage TUI (by provider name:
-    /// `claude` / `codex` / `copilot` / `cursor`). An empty list hides the band.
+    /// `claude` / `codex` / `copilot` / `cursor` / `grok`). An empty list hides
+    /// the band.
     #[serde(default = "default_quota_panels")]
     pub panels: Vec<String>,
     /// Seconds between live quota-panel polls, shared by every provider
@@ -300,8 +333,31 @@ fn default_quota_refresh_secs() -> u64 {
     60
 }
 
+/// The version a file carrying no `[general].version` key predates.
+fn legacy_config_version() -> u32 {
+    1
+}
+
+/// Reads the version marker, mapping a hand-edited non-integer (`version = "2"`)
+/// onto the legacy value instead of rejecting it.
+///
+/// Rejection would fail the whole document, and the infallible read then turns
+/// that into a silent reset of every setting — the same trap
+/// [`rename_refresh_key`] drops malformed values to avoid. Reading it as legacy
+/// makes the upgrade pass rewrite the key with a real integer.
+fn de_config_version<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Value::deserialize(deserializer)
+        .ok()
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or_else(legacy_config_version))
+}
+
 fn default_quota_panels() -> Vec<String> {
-    ["claude", "codex", "copilot", "cursor"]
+    ["claude", "codex", "copilot", "cursor", "grok"]
         .iter()
         .map(|s| s.to_string())
         .collect()
@@ -446,11 +502,6 @@ fn migrate_document(doc: &mut DocumentMut) -> bool {
     let schema = json_schema();
     let mut changed = false;
 
-    // The `#:schema` directive on the first line drives editor autocomplete.
-    if !has_schema_directive(doc) {
-        changed |= prepend_schema_directive(doc);
-    }
-
     // `[usage]`: rename the refresh key, then move quota_panels into the nested
     // `[usage.quota]`. Quota goes last so its `[usage.quota]` header renders
     // after every leaf key of `[usage]` (a leaf after a sub-table would be
@@ -467,7 +518,144 @@ fn migrate_document(doc: &mut DocumentMut) -> bool {
         changed |= rename_refresh_key(analysis, &schema, &["analysis", "refresh_interval"]);
     }
 
+    // Runs after the moves above so it sees the panel list they may have just
+    // relocated into `[usage.quota]`.
+    changed |= backfill_new_quota_panels(doc, &schema);
+
+    // The `#:schema` directive on the first line drives editor autocomplete. It
+    // attaches to the document's first element, so it goes last: on an empty
+    // file the back-fill above is what creates that first element, and running
+    // earlier would leave the directive to a second pass.
+    if !has_schema_directive(doc) {
+        changed |= prepend_schema_directive(doc);
+    }
+
     changed
+}
+
+/// Adds quota panels that shipped after this file was written, exactly once.
+///
+/// The one-shot guarantee is `[general].version`: a file predating a panel is
+/// missing it because the panel did not exist yet, not because the user removed
+/// it — but only until the marker is stamped, after which a removal sticks.
+/// Only the panels a version *added* are considered, so a panel the user
+/// dropped before this upgrade is never resurrected either.
+///
+/// Two cases are deliberately left alone: an empty `panels` list (the band was
+/// turned off on purpose) and a file whose `[general]` is an inline table (the
+/// marker could not be written, so back-filling could not stay one-shot).
+fn backfill_new_quota_panels(doc: &mut DocumentMut, schema: &Value) -> bool {
+    let from_version = match doc.get("general") {
+        Some(item) => {
+            let Some(general) = item.as_table() else {
+                // Inline `general = { ... }`: no place to stamp the marker.
+                return false;
+            };
+            general
+                .get("version")
+                .and_then(Item::as_integer)
+                .and_then(|v| u32::try_from(v).ok())
+                .unwrap_or_else(legacy_config_version)
+        }
+        None => legacy_config_version(),
+    };
+    if from_version >= CONFIG_VERSION {
+        return false;
+    }
+
+    // The list lives inside an inline table this pass never rewrites, so it
+    // cannot be back-filled — and stamping the marker anyway would retire the
+    // upgrade without having run it.
+    if panels_out_of_reach(doc) {
+        return false;
+    }
+
+    if let Some(panels) = doc
+        .get_mut("usage")
+        .and_then(Item::as_table_mut)
+        .and_then(|usage| usage.get_mut("quota"))
+        .and_then(Item::as_table_mut)
+        .and_then(|quota| quota.get_mut("panels"))
+        .and_then(Item::as_array_mut)
+        // An empty list hides the whole band; adding to it would undo that.
+        .filter(|panels| !panels.is_empty())
+    {
+        let missing: Vec<&str> = PANELS_ADDED_BY_VERSION
+            .iter()
+            .filter(|(version, _)| from_version < *version)
+            .map(|(_, name)| *name)
+            .filter(|name| {
+                !panels
+                    .iter()
+                    .filter_map(|p| p.as_str())
+                    .any(|p| p.eq_ignore_ascii_case(name))
+            })
+            .collect();
+        for name in missing {
+            panels.push(name);
+        }
+    }
+
+    stamp_config_version(doc, schema);
+    true
+}
+
+/// Whether the effective panel list sits inside an inline table.
+///
+/// [`migrate_document`] deliberately leaves inline tables alone, so such a list
+/// can be neither read nor extended here — the read-time [`migrate_legacy`] shim
+/// is what keeps it working. A file without a panel list at all is *not* out of
+/// reach: it simply picks up the current default, new names included.
+fn panels_out_of_reach(doc: &DocumentMut) -> bool {
+    let Some(usage) = doc.get("usage") else {
+        return false;
+    };
+    let holds_panels = |table: &dyn TableLike| {
+        table.contains_key("quota_panels")
+            || table
+                .get("quota")
+                .and_then(Item::as_table_like)
+                .is_some_and(|quota| quota.contains_key("panels"))
+    };
+    match usage.as_table() {
+        // `usage = { ... }`: nothing under it can be rewritten.
+        None => usage.as_table_like().is_some_and(holds_panels),
+        Some(usage) => {
+            // A standard `[usage]` whose `quota` child is inline.
+            let inline_quota = usage
+                .get("quota")
+                .filter(|quota| !quota.is_table())
+                .and_then(Item::as_table_like)
+                .is_some_and(|quota| quota.contains_key("panels"));
+            // Or a legacy `quota_panels` that `migrate_quota_panels` declined to
+            // move (it also refuses an inline `quota` sibling), which leaves the
+            // effective list somewhere this pass cannot extend.
+            inline_quota || usage.contains_key("quota_panels")
+        }
+    }
+}
+
+/// Writes `[general].version` (creating the table when a hand-written file has
+/// no `[general]` section at all).
+fn stamp_config_version(doc: &mut DocumentMut, schema: &Value) {
+    if doc.get("general").is_none() {
+        let mut table = Table::new();
+        table.set_implicit(false);
+        if let Some(desc) = schema_description(schema, &["general"]) {
+            table
+                .decor_mut()
+                .set_prefix(format!("\n{}", comment_block(&desc)));
+        }
+        doc.insert("general", Item::Table(table));
+    }
+    let Some(general) = doc.get_mut("general").and_then(Item::as_table_mut) else {
+        return;
+    };
+    let had_key = general.contains_key("version");
+    general.insert("version", value(i64::from(CONFIG_VERSION)));
+    if !had_key {
+        apply_comment(general, "version", "", schema, &["general", "version"]);
+    }
 }
 
 /// Whether the document already carries a `#:schema` directive line.
@@ -943,16 +1131,22 @@ mod tests {
         assert!(!migrated.contains("quota_panels"));
         assert!(!migrated.contains("refresh_interval_secs"));
         assert!(migrated.contains("[usage.quota]"));
-        assert!(migrated.contains("panels = [\"claude\", \"codex\"]"));
-        // The user's values survive, and the quota default is filled in.
+        // The user's names keep their order; panels that shipped later are
+        // appended once, and the file is stamped so that only happens once.
+        assert!(migrated.contains("panels = [\"claude\", \"codex\", \"grok\"]"));
         let cfg: Config = toml_edit::de::from_str(&migrated).unwrap();
         assert_eq!(cfg.usage.refresh_interval, 15);
         assert_eq!(cfg.analysis.refresh_interval, 20);
         assert_eq!(
             cfg.usage.quota.panels,
-            vec!["claude".to_string(), "codex".to_string()]
+            vec![
+                "claude".to_string(),
+                "codex".to_string(),
+                "grok".to_string()
+            ]
         );
         assert_eq!(cfg.usage.quota.refresh_interval, 60);
+        assert_eq!(cfg.general.version, CONFIG_VERSION);
     }
 
     #[test]
@@ -971,8 +1165,9 @@ mod tests {
 
     #[test]
     fn migrate_document_adds_only_the_schema_directive_when_keys_are_current() {
-        // New key names + nested quota, but missing the `#:schema` directive.
-        let text = "[usage]\nrefresh_interval = 10\n\n[usage.quota]\npanels = [\"claude\"]\n";
+        // Current key names, nested quota and version marker, but missing the
+        // `#:schema` directive.
+        let text = "[general]\nversion = 2\n\n[usage]\nrefresh_interval = 10\n\n[usage.quota]\npanels = [\"claude\"]\n";
         let migrated = migrate_text(text).unwrap().expect("adds #:schema");
         assert!(migrated.starts_with("#:schema "));
         assert!(migrated.contains("refresh_interval = 10"));
@@ -1049,7 +1244,10 @@ mod tests {
         let migrated = migrate_text(text).unwrap().expect("legacy file changes");
         assert!(!migrated.contains("quota_panels"));
         let cfg: Config = toml_edit::de::from_str(&migrated).unwrap();
-        assert_eq!(cfg.usage.quota.panels, vec!["claude".to_string()]);
+        assert_eq!(
+            cfg.usage.quota.panels,
+            vec!["claude".to_string(), "grok".to_string()]
+        );
         assert_eq!(cfg.usage.quota.refresh_interval, 30);
         assert!(migrate_text(&migrated).unwrap().is_none());
     }
@@ -1060,16 +1258,147 @@ mod tests {
         let migrated = migrate_text(text).unwrap().expect("drops the legacy key");
         assert!(!migrated.contains("quota_panels"));
         let cfg: Config = toml_edit::de::from_str(&migrated).unwrap();
-        assert_eq!(cfg.usage.quota.panels, vec!["claude".to_string()]);
+        assert_eq!(
+            cfg.usage.quota.panels,
+            vec!["claude".to_string(), "grok".to_string()]
+        );
     }
 
     #[test]
     fn migrate_document_skips_an_inline_quota_child() {
         // An inline `quota = { ... }` under `[usage]` is left untouched (with its
-        // legacy sibling) rather than risk losing data merging into it.
+        // legacy sibling) rather than risk losing data merging into it — and no
+        // version marker is stamped, so the file is not recorded as upgraded.
         let text =
             "#:schema x\n[usage]\nquota_panels = [\"claude\"]\nquota = { panels = [\"codex\"] }\n";
         assert!(migrate_text(text).unwrap().is_none());
+        assert!(panels_out_of_reach(&text.parse::<DocumentMut>().unwrap()));
+    }
+
+    /// The one-shot contract: a panel that shipped after the file was written is
+    /// added once, and removing it afterwards sticks.
+    #[test]
+    fn backfilled_panel_is_added_once_and_stays_removed() {
+        let text = "#:schema x\n[general]\ndefault_time_range = \"all\"\n\n[usage.quota]\npanels = [\"claude\", \"codex\"]\n";
+        let migrated = migrate_text(text)
+            .unwrap()
+            .expect("version 1 file upgrades");
+        assert!(migrated.contains("panels = [\"claude\", \"codex\", \"grok\"]"));
+        assert!(migrated.contains("version = 2"));
+        assert!(migrate_text(&migrated).unwrap().is_none());
+
+        // The user removes it again: the marker keeps the upgrade from re-running.
+        let pruned = migrated.replace(
+            "[\"claude\", \"codex\", \"grok\"]",
+            "[\"claude\", \"codex\"]",
+        );
+        assert!(migrate_text(&pruned).unwrap().is_none());
+        let cfg: Config = toml_edit::de::from_str(&pruned).unwrap();
+        assert!(!cfg.usage.shows_quota_panel("grok"));
+    }
+
+    /// A panel the user dropped *before* this upgrade is not resurrected: only
+    /// the names a later version introduced are back-filled.
+    #[test]
+    fn backfill_leaves_previously_removed_panels_alone() {
+        let text = "#:schema x\n[usage.quota]\npanels = [\"claude\"]\n";
+        let migrated = migrate_text(text)
+            .unwrap()
+            .expect("version 1 file upgrades");
+        let cfg: Config = toml_edit::de::from_str(&migrated).unwrap();
+        assert_eq!(
+            cfg.usage.quota.panels,
+            vec!["claude".to_string(), "grok".to_string()],
+            "codex / copilot / cursor were removed on purpose and stay removed"
+        );
+    }
+
+    #[test]
+    fn backfill_never_reopens_a_band_turned_off() {
+        // `panels = []` hides the whole band; the upgrade must not undo that.
+        let text = "#:schema x\n[usage.quota]\npanels = []\n";
+        let migrated = migrate_text(text).unwrap().expect("the marker is stamped");
+        let cfg: Config = toml_edit::de::from_str(&migrated).unwrap();
+        assert!(cfg.usage.quota.panels.is_empty());
+        assert_eq!(cfg.general.version, CONFIG_VERSION);
+    }
+
+    #[test]
+    fn backfill_stamps_a_file_with_no_general_section() {
+        // A hand-written file may have no `[general]` at all; the marker still
+        // needs somewhere to live, and the result must stay valid TOML.
+        let text = "#:schema x\n[providers]\ncursor = false\n";
+        let migrated = migrate_text(text).unwrap().expect("the marker is stamped");
+        let cfg: Config = toml_edit::de::from_str(&migrated).unwrap();
+        assert_eq!(cfg.general.version, CONFIG_VERSION);
+        assert!(!cfg.providers.cursor);
+        // An absent panel list simply picks up the current default.
+        assert!(cfg.usage.shows_quota_panel("grok"));
+        assert!(migrate_text(&migrated).unwrap().is_none());
+    }
+
+    #[test]
+    fn an_empty_file_reaches_the_current_layout_in_one_pass() {
+        // The back-fill creates `[general]` on a file that had no tables at all,
+        // so the `#:schema` directive has to be attached after it — otherwise
+        // the first pass writes a file the second pass rewrites again.
+        for text in ["", "# just a comment\n"] {
+            let migrated = migrate_text(text)
+                .unwrap()
+                .expect("an empty file is stamped");
+            assert!(migrated.starts_with("#:schema "));
+            assert!(migrated.contains("version = 2"));
+            assert!(
+                migrate_text(&migrated).unwrap().is_none(),
+                "one pass must be enough"
+            );
+        }
+    }
+
+    #[test]
+    fn a_panel_list_that_could_not_be_moved_is_not_marked_upgraded() {
+        // `migrate_quota_panels` refuses to merge into an inline `quota` child,
+        // so the legacy list survives out of reach. Stamping the marker here
+        // would retire the one-shot upgrade without ever having run it.
+        let text =
+            "#:schema x\n[usage]\nquota_panels = [\"claude\"]\nquota = { refresh_interval = 30 }\n";
+        assert!(migrate_text(text).unwrap().is_none());
+        assert!(panels_out_of_reach(&text.parse::<DocumentMut>().unwrap()));
+    }
+
+    #[test]
+    fn a_hand_edited_version_value_never_resets_the_config() {
+        // A non-integer marker must read as legacy, not fail the document: the
+        // infallible read would turn that into a silent reset of every setting.
+        for bad in ["\"2\"", "2.5", "true", "-1"] {
+            let text = format!(
+                "[general]\nversion = {bad}\ndefault_time_range = \"weekly\"\n[providers]\ncursor = false\n"
+            );
+            let cfg: Config = toml_edit::de::from_str(&text).expect("document still parses");
+            assert_eq!(cfg.general.version, legacy_config_version(), "bad = {bad}");
+            assert_eq!(cfg.general.default_time_range, TimeRange::Weekly);
+            assert!(!cfg.providers.cursor);
+            // Being read as legacy, the upgrade pass rewrites it with a real one.
+            let migrated = migrate_text(&text)
+                .unwrap()
+                .expect("the marker is repaired");
+            let cfg: Config = toml_edit::de::from_str(&migrated).unwrap();
+            assert_eq!(cfg.general.version, CONFIG_VERSION);
+        }
+    }
+
+    #[test]
+    fn every_backfilled_panel_ships_by_the_current_version() {
+        for (version, name) in PANELS_ADDED_BY_VERSION {
+            assert!(
+                *version <= CONFIG_VERSION,
+                "{name} is scheduled for a version this build never stamps"
+            );
+            assert!(
+                default_quota_panels().iter().any(|p| p == name),
+                "{name} is back-filled but is not a current default panel"
+            );
+        }
     }
 
     #[test]

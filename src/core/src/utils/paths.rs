@@ -387,6 +387,19 @@ pub fn get_cursor_usage_cache_path() -> Result<PathBuf> {
     Ok(get_cache_dir()?.join("cursor_usage.json"))
 }
 
+/// Returns the Grok usage cache path
+/// (`~/.vct/grok_usage.json`).
+///
+/// As a side effect of resolving the cache directory, the directory is
+/// created if missing.
+///
+/// # Errors
+///
+/// Returns an error if the cache directory cannot be resolved or created.
+pub fn get_grok_usage_cache_path() -> Result<PathBuf> {
+    Ok(get_cache_dir()?.join("grok_usage.json"))
+}
+
 /// Returns the persistent settings file path (`~/.vct/config.toml`).
 ///
 /// As a side effect of resolving the cache directory, the directory is created
@@ -432,6 +445,16 @@ pub fn get_copilot_config_path() -> Result<PathBuf> {
 /// Returns an error if the user's home directory cannot be determined.
 pub fn get_cursor_auth_path() -> Result<PathBuf> {
     Ok(resolve_paths()?.cursor_dir.join("auth.json"))
+}
+
+/// Returns the Grok CLI OAuth credentials path
+/// (`$GROK_HOME/auth.json` or `~/.grok/auth.json`).
+///
+/// # Errors
+///
+/// Returns an error if the user's home directory cannot be determined.
+pub fn get_grok_auth_path() -> Result<PathBuf> {
+    Ok(resolve_paths()?.grok_dir.join("auth.json"))
 }
 
 /// Returns the Claude OAuth credentials path (`~/.claude/.credentials.json`).

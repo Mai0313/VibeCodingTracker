@@ -14,7 +14,8 @@
 //!   limit or network blip never blanks a panel; the next success overwrites it.
 
 use crate::models::{
-    ClaudeQuotaSnapshot, CodexQuotaSnapshot, CopilotQuotaSnapshot, CursorQuotaSnapshot, QuotaSource,
+    ClaudeQuotaSnapshot, CodexQuotaSnapshot, CopilotQuotaSnapshot, CursorQuotaSnapshot,
+    GrokQuotaSnapshot, QuotaSource,
 };
 use serde::Serialize;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -91,6 +92,21 @@ impl QuotaSnapshot for CursorQuotaSnapshot {
             || self.api.is_some()
             || self.plan_type.is_some()
             || self.needs_login
+    }
+    fn set_needs_login(&mut self, value: bool) {
+        self.needs_login = value;
+    }
+}
+
+impl QuotaSnapshot for GrokQuotaSnapshot {
+    fn fetched_at(&self) -> i64 {
+        self.fetched_at
+    }
+    fn is_present(&self) -> bool {
+        // Mirror the render gate: the included gauge, the plan label, or a login
+        // hint each give the panel something to show. The money fields never
+        // stand alone — a billing body that maps at all yields `included`.
+        self.included.is_some() || self.plan_type.is_some() || self.needs_login
     }
     fn set_needs_login(&mut self, value: bool) {
         self.needs_login = value;

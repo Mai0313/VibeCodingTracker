@@ -40,6 +40,7 @@ fn child_cmd(home: &TempHome) -> Command {
     cmd.env("HOME", home.home())
         .env("USERPROFILE", home.home())
         .env("HERMES_HOME", home.home().join(".hermes"))
+        .env("GROK_HOME", home.home().join(".grok"))
         .env("VCT_OFFLINE", "1")
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME");
@@ -375,7 +376,8 @@ fn test_quota_help() {
         .stdout(predicate::str::contains("claude"))
         .stdout(predicate::str::contains("codex"))
         .stdout(predicate::str::contains("copilot"))
-        .stdout(predicate::str::contains("cursor"));
+        .stdout(predicate::str::contains("cursor"))
+        .stdout(predicate::str::contains("grok"));
 }
 
 #[test]

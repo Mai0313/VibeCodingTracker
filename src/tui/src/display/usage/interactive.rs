@@ -38,20 +38,21 @@ use sysinfo::{Pid, System};
 use vct_core::config::ProvidersConfig;
 use vct_core::models::{
     ClaudeQuotaSnapshot, CodexQuotaSnapshot, CopilotQuotaSnapshot, CursorQuotaSnapshot,
-    QuotaSource, QuotaWindow,
+    GrokQuotaSnapshot, QuotaSource, QuotaWindow,
 };
 use vct_core::pricing::{ModelPricingMap, fetch_model_pricing};
 use vct_core::quota::{
     CLAUDE_LOGIN_HINT, CODEX_LOGIN_HINT, COPILOT_LOGIN_HINT, CURSOR_LOGIN_HINT, ClaudeState,
-    CodexState, CopilotState, CursorState, load_claude_cache, load_codex_cache, load_copilot_cache,
-    load_cursor_cache, save_claude_cache, save_codex_cache, save_copilot_cache, save_cursor_cache,
-    spawn_quota_worker,
+    CodexState, CopilotState, CursorState, GROK_LOGIN_HINT, GrokState, load_claude_cache,
+    load_codex_cache, load_copilot_cache, load_cursor_cache, load_grok_cache, save_claude_cache,
+    save_codex_cache, save_copilot_cache, save_cursor_cache, save_grok_cache, spawn_quota_worker,
 };
 use vct_core::scan::build_scan_pool;
 use vct_core::summary_cache::SummaryScanCache;
 use vct_core::utils::{
     format_compact, format_cost, format_cost_compact, format_duration_until,
-    get_claude_credentials_path, get_copilot_config_path, get_cursor_auth_path, resolve_paths,
+    get_claude_credentials_path, get_copilot_config_path, get_cursor_auth_path, get_grok_auth_path,
+    resolve_paths,
 };
 
 /// Minimum height for the bottom quota panels. Sized for the common case
@@ -67,6 +68,8 @@ const CODEX_COLOR: RatatuiColor = RatatuiColor::Rgb(118, 127, 198);
 const COPILOT_COLOR: RatatuiColor = RatatuiColor::Rgb(46, 160, 67);
 /// Cursor brand color (teal) for the quota panel border.
 const CURSOR_COLOR: RatatuiColor = RatatuiColor::Rgb(64, 180, 180);
+/// Grok brand color (xAI near-black, lifted to stay readable on a dark terminal).
+const GROK_COLOR: RatatuiColor = RatatuiColor::Rgb(170, 170, 178);
 
 /// Minimum readable width for a single quota panel column (label + bar +
 /// percent + reset). Below this a panel's gauge tail may clip.
@@ -78,6 +81,9 @@ const PANEL_MIN_W: u16 = 28;
 const BAND_TABLE_MIN_W: u16 = 38;
 /// Terminal height needed to wrap the panels into a two-row grid.
 const PANELS_2ROW_MIN_H: u16 = 26;
+/// How many providers can show a quota panel (Claude / Codex / Copilot / Cursor
+/// / Grok) — the widest band the layout ever has to place.
+const MAX_QUOTA_PANELS: usize = 5;
 
 /// Which provider quota panels have credentials on this machine.
 #[derive(Clone, Copy, Default)]
@@ -86,6 +92,7 @@ struct QuotaPresence {
     codex: bool,
     copilot: bool,
     cursor: bool,
+    grok: bool,
 }
 
 impl QuotaPresence {
@@ -101,17 +108,23 @@ impl QuotaPresence {
             .map(|p| p.exists())
             .unwrap_or(false);
         let cursor = get_cursor_auth_path().map(|p| p.exists()).unwrap_or(false);
+        let grok = get_grok_auth_path().map(|p| p.exists()).unwrap_or(false);
         Self {
             claude,
             codex,
             copilot,
             cursor,
+            grok,
         }
     }
 
     /// Number of provider quota panels present.
     fn count(&self) -> usize {
-        self.claude as usize + self.codex as usize + self.copilot as usize + self.cursor as usize
+        self.claude as usize
+            + self.codex as usize
+            + self.copilot as usize
+            + self.cursor as usize
+            + self.grok as usize
     }
 }
 
@@ -121,6 +134,7 @@ struct QuotaView<'a> {
     codex: &'a CodexQuotaSnapshot,
     copilot: &'a CopilotQuotaSnapshot,
     cursor: &'a CursorQuotaSnapshot,
+    grok: &'a GrokQuotaSnapshot,
     present: QuotaPresence,
     /// Whether the bottom band is shown at all. `false` when `usage.quota.panels`
     /// is empty, which drops the whole band (panels *and* the Provider Usage
@@ -164,6 +178,7 @@ struct QuotaRuntime {
     codex: Arc<Mutex<CodexQuotaSnapshot>>,
     copilot: Arc<Mutex<CopilotQuotaSnapshot>>,
     cursor: Arc<Mutex<CursorQuotaSnapshot>>,
+    grok: Arc<Mutex<GrokQuotaSnapshot>>,
     _guard: QuotaShutdownGuard,
 }
 
@@ -180,6 +195,7 @@ impl QuotaRuntime {
         present.codex &= providers.codex && panel_on("codex");
         present.copilot &= providers.copilot && panel_on("copilot");
         present.cursor &= providers.cursor && panel_on("cursor");
+        present.grok &= providers.grok && panel_on("grok");
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let claude = Arc::new(Mutex::new(
@@ -210,8 +226,15 @@ impl QuotaRuntime {
                 .flatten()
                 .unwrap_or_default(),
         ));
+        let grok = Arc::new(Mutex::new(
+            present
+                .grok
+                .then(load_grok_cache)
+                .flatten()
+                .unwrap_or_default(),
+        ));
 
-        if present.claude || present.codex || present.copilot || present.cursor {
+        if present.claude || present.codex || present.copilot || present.cursor || present.grok {
             match vct_core::quota::http::build_client() {
                 Ok(client) => {
                     if present.claude {
@@ -274,6 +297,21 @@ impl QuotaRuntime {
                             },
                         );
                     }
+                    if present.grok {
+                        let (client, shutdown, shared) =
+                            (client.clone(), Arc::clone(&shutdown), Arc::clone(&grok));
+                        let mut state = GrokState::default();
+                        spawn_quota_worker(
+                            "grok",
+                            shared,
+                            shutdown,
+                            quota_refresh_secs,
+                            move || state.resolve(&client),
+                            |snapshot| {
+                                let _ = save_grok_cache(snapshot);
+                            },
+                        );
+                    }
                 }
                 Err(error) => {
                     log::warn!("quota workers disabled: failed to build HTTP client: {error}")
@@ -288,6 +326,7 @@ impl QuotaRuntime {
             codex,
             copilot,
             cursor,
+            grok,
             _guard: QuotaShutdownGuard { shutdown },
         }
     }
@@ -305,6 +344,7 @@ struct UsageUiState {
     codex: CodexQuotaSnapshot,
     copilot: CopilotQuotaSnapshot,
     cursor: CursorQuotaSnapshot,
+    grok: GrokQuotaSnapshot,
 }
 
 impl UsageUiState {
@@ -321,6 +361,7 @@ impl UsageUiState {
             codex: CodexQuotaSnapshot::default(),
             copilot: CopilotQuotaSnapshot::default(),
             cursor: CursorQuotaSnapshot::default(),
+            grok: GrokQuotaSnapshot::default(),
         }
     }
 
@@ -402,6 +443,11 @@ impl UsageUiState {
             .lock()
             .map(|value| value.clone())
             .unwrap_or_default();
+        self.grok = runtime
+            .grok
+            .lock()
+            .map(|value| value.clone())
+            .unwrap_or_default();
     }
 
     fn render(
@@ -418,6 +464,7 @@ impl UsageUiState {
             codex: &self.codex,
             copilot: &self.copilot,
             cursor: &self.cursor,
+            grok: &self.grok,
             present: runtime.present,
             band_enabled: runtime.band_enabled,
         };
@@ -907,7 +954,8 @@ fn render_usage_frame_with_status<B: Backend>(
             }
 
             // Render present panels in fixed order (Claude → Codex → Copilot →
-            // Cursor) into the grid cells; a missing provider consumes no cell.
+            // Cursor → Grok) into the grid cells; a missing provider consumes no
+            // cell.
             let now = chrono::Local::now().timestamp();
             let mut idx = 0;
             if quota.present.claude {
@@ -924,6 +972,10 @@ fn render_usage_frame_with_status<B: Backend>(
             }
             if quota.present.cursor {
                 render_cursor_quota(f, grid.panels[idx], quota.cursor, now);
+                idx += 1;
+            }
+            if quota.present.grok {
+                render_grok_quota(f, grid.panels[idx], quota.grok, now);
             }
         }
 
@@ -983,6 +1035,7 @@ pub struct UsageFrameBenchmark {
     codex: CodexQuotaSnapshot,
     copilot: CopilotQuotaSnapshot,
     cursor: CursorQuotaSnapshot,
+    grok: GrokQuotaSnapshot,
     scroll: ScrollState,
 }
 
@@ -1069,6 +1122,7 @@ impl UsageFrameBenchmark {
             codex: CodexQuotaSnapshot::default(),
             copilot: CopilotQuotaSnapshot::default(),
             cursor: CursorQuotaSnapshot::default(),
+            grok: GrokQuotaSnapshot::default(),
             scroll,
         })
     }
@@ -1080,11 +1134,13 @@ impl UsageFrameBenchmark {
             codex: &self.codex,
             copilot: &self.copilot,
             cursor: &self.cursor,
+            grok: &self.grok,
             present: QuotaPresence {
                 claude: true,
                 codex: true,
                 copilot: true,
                 cursor: true,
+                grok: true,
             },
             band_enabled: true,
         };
@@ -1351,7 +1407,7 @@ fn split_even(area: Rect, k: usize) -> Vec<Rect> {
 fn split_band(band: Rect, arrange: &BandArrange, n: usize) -> BandGrid {
     match *arrange {
         BandArrange::SingleRow { table } => {
-            let mut cons: Vec<Constraint> = Vec::new();
+            let mut cons: Vec<Constraint> = Vec::with_capacity(1 + MAX_QUOTA_PANELS);
             if table {
                 cons.push(Constraint::Min(BAND_TABLE_MIN_W));
             }
@@ -1576,6 +1632,57 @@ fn render_cursor_quota(f: &mut Frame, area: Rect, cursor: &CursorQuotaSnapshot, 
         lines.push(login_hint_line(CURSOR_LOGIN_HINT));
     } else if !has_content {
         lines.push(dim_line("no Cursor quota"));
+    }
+
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// Renders the Grok quota panel (plan, included-allowance gauge, optional
+/// on-demand and prepaid lines, staleness + login hint).
+fn render_grok_quota(f: &mut Frame, area: Rect, grok: &GrokQuotaSnapshot, now: i64) {
+    let block = quota_block(" Grok ", GROK_COLOR, grok.limit_reached);
+
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(plan) = &grok.plan_type {
+        lines.push(plan_line(plan));
+    }
+    // Track the gauge separately so a lone Plan line does not count as data.
+    let mut has_data = false;
+    if let Some(w) = &grok.included {
+        // The label names the period the allowance runs on, which the API
+        // reports per account; an unlabelled window falls back to "incl".
+        let label = grok.period_label.as_deref().unwrap_or("incl");
+        lines.push(quota_gauge_line(label, w, now));
+        has_data = true;
+    }
+    match (grok.on_demand_dollars, grok.on_demand_cap_dollars) {
+        // With a cap configured the spend reads as its own gauge. Both amounts
+        // are compacted (`$1.2K`) so a four-figure cap cannot outgrow the
+        // narrowest panel and get truncated into a smaller, plausible number.
+        (Some(used), Some(cap)) if cap > 0.0 => lines.push(quota_gauge_line_value(
+            "ondmd",
+            (used / cap * 100.0).clamp(0.0, 100.0),
+            &format!("{}/{}", format_cost_compact(used), format_cost_compact(cap)),
+        )),
+        (Some(used), _) => lines.push(dim_line(&format!(
+            "on-demand: {}",
+            format_cost_compact(used)
+        ))),
+        _ => {}
+    }
+    if let Some(balance) = grok.prepaid_balance_dollars {
+        lines.push(dim_line(&format!(
+            "Balance: {}",
+            format_cost_compact(balance)
+        )));
+    }
+    if has_data {
+        lines.push(staleness_line(grok.fetched_at, now));
+    }
+    if grok.needs_login {
+        lines.push(login_hint_line(GROK_LOGIN_HINT));
+    } else if !has_data {
+        lines.push(dim_line("no Grok quota"));
     }
 
     f.render_widget(Paragraph::new(lines).block(block), area);
@@ -1830,6 +1937,113 @@ mod tests {
         assert!(rendered.contains("updated just now"));
     }
 
+    /// Renders a panel into the smallest cell the band ever hands out and
+    /// returns its text, so a test can assert what survives the clip.
+    fn render_min_panel(draw: impl FnOnce(&mut Frame, Rect)) -> String {
+        let mut terminal =
+            Terminal::new(TestBackend::new(PANEL_MIN_W, QUOTA_PANEL_MIN_HEIGHT)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, frame.area()))
+            .expect("panel renders");
+        let buffer = terminal.backend().buffer();
+        (0..QUOTA_PANEL_MIN_HEIGHT)
+            .map(|y| {
+                (0..PANEL_MIN_W)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A pay-as-you-go Grok account fills the panel to its documented maximum:
+    /// plan, the period-labelled allowance gauge, the on-demand gauge, the
+    /// prepaid balance, and the staleness line all have to fit.
+    #[test]
+    fn grok_panel_fits_every_line_in_the_minimum_cell() {
+        let now = 1_000;
+        let grok = GrokQuotaSnapshot {
+            source: QuotaSource::Api,
+            fetched_at: now,
+            plan_type: Some("SuperGrok".to_string()),
+            included: Some(QuotaWindow {
+                used_percent: 42.0,
+                resets_at_unix: Some(now + 86_400),
+            }),
+            period_label: Some("week".to_string()),
+            on_demand_dollars: Some(18.40),
+            on_demand_cap_dollars: Some(50.0),
+            prepaid_balance_dollars: Some(2.50),
+            ..Default::default()
+        };
+        let rendered = render_min_panel(|frame, area| render_grok_quota(frame, area, &grok, now));
+
+        assert!(rendered.contains("Plan: SuperGrok"));
+        assert!(rendered.contains("week"));
+        assert!(rendered.contains("42%"));
+        assert!(rendered.contains("$18.40/$50.00"));
+        assert!(rendered.contains("Balance: $2.50"));
+        assert!(rendered.contains("updated just now"));
+    }
+
+    /// A four-figure cap must stay readable in the narrowest cell. Printing it
+    /// in full overflows and the clip turns `$5000.00` into `$500`, so the
+    /// gauge and the numbers next to it tell contradictory stories.
+    #[test]
+    fn grok_panel_compacts_large_money_rather_than_truncating_it() {
+        let grok = GrokQuotaSnapshot {
+            source: QuotaSource::Api,
+            included: Some(QuotaWindow::default()),
+            on_demand_dollars: Some(1234.50),
+            on_demand_cap_dollars: Some(5000.0),
+            prepaid_balance_dollars: Some(12345.0),
+            ..Default::default()
+        };
+        let rendered = render_min_panel(|frame, area| render_grok_quota(frame, area, &grok, 0));
+        // Exactly the 13 columns the gauge leaves in the narrowest cell.
+        assert!(rendered.contains("$1.24K/$5.00K"), "got:\n{rendered}");
+        assert!(rendered.contains("Balance: $12.3K"), "got:\n{rendered}");
+    }
+
+    /// The common free account: no money lines at all, and an unlabelled period
+    /// falls back to a generic gauge label rather than rendering nothing.
+    #[test]
+    fn grok_panel_omits_zero_money_and_labels_an_unknown_period() {
+        let now = 1_000;
+        let grok = GrokQuotaSnapshot {
+            source: QuotaSource::Api,
+            fetched_at: now,
+            included: Some(QuotaWindow {
+                used_percent: 0.0,
+                resets_at_unix: Some(now + 3_600),
+            }),
+            ..Default::default()
+        };
+        let rendered = render_min_panel(|frame, area| render_grok_quota(frame, area, &grok, now));
+
+        assert!(rendered.contains("incl"));
+        assert!(!rendered.contains("on-demand"));
+        assert!(!rendered.contains("Balance"));
+        assert!(!rendered.contains("Plan:"));
+    }
+
+    /// With no data at all the panel says so, and a rejected token adds the
+    /// login hint rather than an empty box.
+    #[test]
+    fn grok_panel_reports_missing_data_and_a_needed_login() {
+        let rendered =
+            render_min_panel(|frame, area| render_grok_quota(frame, area, &Default::default(), 0));
+        assert!(rendered.contains("no Grok quota"));
+
+        let grok = GrokQuotaSnapshot {
+            needs_login: true,
+            ..Default::default()
+        };
+        let rendered = render_min_panel(|frame, area| render_grok_quota(frame, area, &grok, 0));
+        assert!(rendered.contains(GROK_LOGIN_HINT));
+        assert!(!rendered.contains("no Grok quota"));
+    }
+
     #[test]
     fn arrange_wide_keeps_table_in_one_row() {
         // Plenty of width for the table + 4 panels.
@@ -1905,11 +2119,48 @@ mod tests {
     #[test]
     fn split_band_always_yields_exactly_n_panels() {
         let area = Rect::new(0, 0, 200, 16);
-        for n in 0..=4 {
+        for n in 0..=MAX_QUOTA_PANELS {
             let arrange = arrange_band(area.width, area.height, n);
             let grid = split_band(area, &arrange, n);
             assert_eq!(grid.panels.len(), n, "n={n}");
         }
+    }
+
+    /// The full five-provider band: one row only on a very wide terminal,
+    /// otherwise a 3+2 grid whose trailing hole takes the Provider Usage table.
+    #[test]
+    fn arrange_five_panels_wraps_to_a_three_plus_two_grid() {
+        let all = MAX_QUOTA_PANELS;
+        match arrange_band(BAND_TABLE_MIN_W + PANEL_MIN_W * all as u16, 40, all) {
+            BandArrange::SingleRow { table } => assert!(table),
+            _ => panic!("a wide terminal keeps table + five panels in one row"),
+        }
+        match arrange_band(PANEL_MIN_W * all as u16, 40, all) {
+            BandArrange::SingleRow { table } => assert!(!table),
+            _ => panic!("five panels alone still fit one row"),
+        }
+        match arrange_band(100, PANELS_2ROW_MIN_H, all) {
+            BandArrange::TwoRow { top, table_in_hole } => {
+                assert_eq!(top, 3, "the odd panel rides on the top row");
+                assert!(table_in_hole, "the trailing hole takes the table");
+            }
+            _ => panic!("expected a two-row grid"),
+        }
+    }
+
+    #[test]
+    fn split_band_five_panels_keeps_every_cell_addressable() {
+        // The render dispatch indexes `panels` by present-provider order, so a
+        // two-row split must still hand back exactly five cells plus the table.
+        let area = Rect::new(0, 0, 100, QUOTA_PANEL_MIN_HEIGHT * 2);
+        let arrange = arrange_band(area.width, PANELS_2ROW_MIN_H, MAX_QUOTA_PANELS);
+        let grid = split_band(area, &arrange, MAX_QUOTA_PANELS);
+        assert_eq!(grid.panels.len(), MAX_QUOTA_PANELS);
+        assert!(grid.table.is_some());
+        assert!(
+            grid.panels.iter().all(|cell| cell.width > 0),
+            "no panel may collapse to nothing"
+        );
     }
 
     #[test]

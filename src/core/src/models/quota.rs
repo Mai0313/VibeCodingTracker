@@ -713,7 +713,168 @@ pub struct CursorOnDemand {
     pub used: Option<f64>,
 }
 
-// ---- Normalized Copilot / Cursor snapshots (worker output + on-disk cache) ----
+// ---- Grok billing API (GET /v1/billing?format=credits) ----
+
+/// `https://cli-chat-proxy.grok.com/v1/billing?format=credits` response.
+///
+/// The credits config arrives wrapped in a `config` object. The CLI fills
+/// `subscription_tier` / `on_demand_enabled` into the same object from
+/// `/v1/settings`, so a bare fetch returns only `config`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GrokBillingResponse {
+    /// The credit configuration, absent on an error body.
+    #[serde(default)]
+    pub config: Option<GrokCreditsConfig>,
+}
+
+/// The `config` object of a Grok credits response (subset we read).
+///
+/// This is a proto3 `GetGrokCreditsConfig` rendered as JSON, so every
+/// zero-valued scalar may be omitted — including the headline
+/// `creditUsagePercent`. Every field is therefore optional and an absent one
+/// reads as zero, never as an error. The wire response is a superset of the
+/// fields below (a live account also returns `topUpMethod`), so unknown keys are
+/// ignored rather than rejected.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GrokCreditsConfig {
+    /// Included-allowance usage (0..100) — what the CLI status bar shows.
+    #[serde(default, deserialize_with = "de_f64_or_zero")]
+    pub credit_usage_percent: f64,
+    /// The current billing period (weekly or monthly) with its RFC3339 bounds.
+    #[serde(default)]
+    pub current_period: Option<GrokUsagePeriod>,
+    /// Pay-as-you-go cap for this period.
+    #[serde(default)]
+    pub on_demand_cap: Option<GrokMoney>,
+    /// Pay-as-you-go spend this period.
+    #[serde(default)]
+    pub on_demand_used: Option<GrokMoney>,
+    /// Remaining purchased ("bought") credit balance.
+    #[serde(default)]
+    pub prepaid_balance: Option<GrokMoney>,
+    /// Deprecated legacy period end, still emitted by older servers; the
+    /// fallback reset time when `current_period` is absent.
+    #[serde(default)]
+    pub billing_period_end: Option<String>,
+}
+
+/// The `currentPeriod` object of a Grok credits config.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GrokUsagePeriod {
+    /// Period kind, e.g. `USAGE_PERIOD_TYPE_WEEKLY` / `..._MONTHLY`.
+    #[serde(default, rename = "type")]
+    pub period_type: Option<String>,
+    /// RFC3339 period end — when the included allowance resets.
+    #[serde(default)]
+    pub end: Option<String>,
+}
+
+/// A Grok money amount in **cents**, e.g. `{"val": 1840}` for $18.40.
+///
+/// A zero amount can arrive as `{}` (proto3 omits zero scalars) or as an
+/// explicit `{"val": 0}`; both read as zero.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GrokMoney {
+    /// Amount in cents.
+    #[serde(default, deserialize_with = "de_f64_or_zero")]
+    pub val: f64,
+}
+
+impl GrokMoney {
+    /// The amount in whole currency units (dollars).
+    pub fn as_dollars(&self) -> f64 {
+        self.val / 100.0
+    }
+}
+
+/// `https://cli-chat-proxy.grok.com/v1/settings` response (the plan label only).
+///
+/// The real body carries well over a hundred feature flags; only the display
+/// tier is read, so every other key is ignored.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GrokSettingsResponse {
+    /// Human-readable plan tier, e.g. "Free" / "SuperGrok".
+    #[serde(default)]
+    pub subscription_tier_display: Option<String>,
+}
+
+// ---- ~/.grok/auth.json ----
+
+/// One entry of `~/.grok/auth.json`, keyed in the file by login scope
+/// (`"<issuer>::<client_id>"`, `"xai::api_key"`, or the legacy sign-in URL).
+///
+/// The access token is the **`key`** field, not a field named `access_token`.
+/// `Debug` is written by hand so no bearer, refresh token, or account
+/// identifier can reach a log or assertion message.
+#[derive(Clone, Default, Deserialize)]
+pub struct GrokAuthEntry {
+    /// Bearer access token (a JWT).
+    #[serde(default)]
+    pub key: Option<String>,
+    /// Refresh token (rotates on refresh; must be persisted).
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    /// Access-token expiry as an RFC3339 timestamp.
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    /// OIDC issuer this login came from; the base for token-endpoint discovery.
+    #[serde(default)]
+    pub oidc_issuer: Option<String>,
+    /// OAuth client id, sent as a form field on refresh.
+    #[serde(default)]
+    pub oidc_client_id: Option<String>,
+    /// Account id, sent as the `x-userid` header.
+    #[serde(default)]
+    pub user_id: Option<String>,
+    /// Principal kind for a team login, re-sent on refresh.
+    #[serde(default)]
+    pub principal_type: Option<String>,
+    /// Principal id for a team login, re-sent on refresh.
+    #[serde(default)]
+    pub principal_id: Option<String>,
+}
+
+impl fmt::Debug for GrokAuthEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GrokAuthEntry")
+            .field("key", &redact(&self.key))
+            .field("refresh_token", &redact(&self.refresh_token))
+            .field("expires_at", &self.expires_at)
+            .field("oidc_issuer", &self.oidc_issuer)
+            .field("oidc_client_id", &self.oidc_client_id)
+            .field("user_id", &redact(&self.user_id))
+            .field("principal_type", &self.principal_type)
+            .field("principal_id", &redact(&self.principal_id))
+            .finish()
+    }
+}
+
+/// An xAI OIDC token-endpoint refresh response.
+#[derive(Clone, Deserialize)]
+pub struct GrokRefreshResponse {
+    /// New bearer access token (written back into the entry's `key`).
+    #[serde(default)]
+    pub access_token: Option<String>,
+    /// New refresh token (rotates).
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    /// Lifetime of the new access token, in seconds.
+    #[serde(default)]
+    pub expires_in: Option<i64>,
+}
+
+impl fmt::Debug for GrokRefreshResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GrokRefreshResponse")
+            .field("access_token", &redact(&self.access_token))
+            .field("refresh_token", &redact(&self.refresh_token))
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
+}
+
+// ---- Normalized Copilot / Cursor / Grok snapshots (worker output + cache) ----
 
 /// Normalized Copilot quota snapshot, shared via `Arc<Mutex>` and persisted to
 /// `~/.vct/copilot_usage.json`.
@@ -777,6 +938,42 @@ pub struct CursorQuotaSnapshot {
     pub limit_reached: bool,
     /// Credentials present but the token is unusable (expired / 401); the panel
     /// shows a `cursor login` hint.
+    #[serde(default)]
+    pub needs_login: bool,
+}
+
+/// Normalized Grok quota snapshot, shared via `Arc<Mutex>` and persisted to
+/// `~/.vct/grok_usage.json`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GrokQuotaSnapshot {
+    /// Which source produced this snapshot.
+    #[serde(default)]
+    pub source: QuotaSource,
+    /// Unix seconds when this snapshot was produced.
+    pub fetched_at: i64,
+    /// Plan tier (e.g. "Free"), from `/v1/settings`, shown as Plan.
+    #[serde(default)]
+    pub plan_type: Option<String>,
+    /// Included-allowance usage for the current period.
+    #[serde(default)]
+    pub included: Option<QuotaWindow>,
+    /// Short label for the included window's period, e.g. "week" / "month".
+    #[serde(default)]
+    pub period_label: Option<String>,
+    /// Pay-as-you-go spend this period, in USD.
+    #[serde(default)]
+    pub on_demand_dollars: Option<f64>,
+    /// Pay-as-you-go cap this period, in USD, when one is set.
+    #[serde(default)]
+    pub on_demand_cap_dollars: Option<f64>,
+    /// Remaining prepaid credit balance, in USD.
+    #[serde(default)]
+    pub prepaid_balance_dollars: Option<f64>,
+    /// Whether the included allowance is exhausted (drives the `LIMIT` flag).
+    #[serde(default)]
+    pub limit_reached: bool,
+    /// Credentials present but the token is unusable (expired / refresh failed /
+    /// 401); the panel shows a `grok login` hint.
     #[serde(default)]
     pub needs_login: bool,
 }

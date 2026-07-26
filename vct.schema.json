@@ -20,7 +20,8 @@
     },
     "general": {
       "default": {
-        "default_time_range": "all"
+        "default_time_range": "all",
+        "version": 2
       },
       "description": "`[general]` — settings shared across subcommands.",
       "properties": {
@@ -49,6 +50,13 @@
               "type": "string"
             }
           ]
+        },
+        "version": {
+          "default": 1,
+          "description": "Layout version of this file, stamped by vct. Only the upgrade pass reads\nit; leave it alone unless you want a past upgrade to run again.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "type": "object"
@@ -178,7 +186,8 @@
             "claude",
             "codex",
             "copilot",
-            "cursor"
+            "cursor",
+            "grok"
           ],
           "refresh_interval": 60
         },
@@ -197,7 +206,8 @@
               "claude",
               "codex",
               "copilot",
-              "cursor"
+              "cursor",
+              "grok"
             ],
             "refresh_interval": 60
           },
@@ -208,9 +218,10 @@
                 "claude",
                 "codex",
                 "copilot",
-                "cursor"
+                "cursor",
+                "grok"
               ],
-              "description": "Which live quota panels to show in the usage TUI (by provider name:\n`claude` / `codex` / `copilot` / `cursor`). An empty list hides the band.",
+              "description": "Which live quota panels to show in the usage TUI (by provider name:\n`claude` / `codex` / `copilot` / `cursor` / `grok`). An empty list hides\nthe band.",
               "items": {
                 "type": "string"
               },

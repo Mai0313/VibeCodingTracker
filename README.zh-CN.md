@@ -68,7 +68,7 @@
 | **智能定价**     | 模糊模型匹配 + 从 LiteLLM 每日缓存更新                                |
 | **4 种显示模式** | 交互式 TUI、静态表格、纯文本和 JSON                                   |
 | **双维度分析**   | token/费用统计（`usage`）+ 代码操作统计（`analysis`）                 |
-| **实时额度面板** | Claude、Codex、Copilot 和 Cursor 的实时额度用量                       |
+| **实时额度面板** | Claude、Codex、Copilot、Cursor 和 Grok 的实时额度用量                 |
 | **超轻量级**     | TUI 常驻内存 50 MB 以内、精简的 incremental scan, 基于 Rust 构建      |
 | **实时更新**     | 响应式 loading 与后台 refresh, 并高亮变化                             |
 
@@ -298,33 +298,34 @@ Totals (by Provider)
 - `~/.hermes/state.db`（Hermes，SQLite 数据库，遵循 `$HERMES_HOME`；仅 `usage`）
 - `$GROK_HOME/sessions/*/*/signals.json`（Grok CLI，默认使用 `~/.grok`；同层的 `updates.jsonl` 提供 `analysis` 数据）
 
-Grok 的 `usage` 是单一时点的本地 context 估算：vct 会把 `signals.json` 的 `contextTokensUsed` 记为 cache-read token，并按该 model 的 cache-read 费率估算费用。这不是累计的 billed usage。`analysis` 会从同层的 `updates.jsonl` 还原已完成的 Read / Write / Edit / Bash / TodoWrite 操作。Grok 不支持 quota panel 或 `vct quota`。
+Grok 的 `usage` 是单一时点的本地 context 估算：vct 会把 `signals.json` 的 `contextTokensUsed` 记为 cache-read token，并按该 model 的 cache-read 费率估算费用。这不是累计的 billed usage。`analysis` 会从同层的 `updates.jsonl` 还原已完成的 Read / Write / Edit / Bash / TodoWrite 操作。至于你实际计费的额度，请参见下方的 Grok 额度面板。
 
 对于非交互式 `usage` 与 `analysis` 扫描, 如果所有找到的 source 都失败, vct 会以错误结束. 如果只有部分 source 失败, vct 会保留成功的结果, 并向 stderr 打印一则诊断摘要. TUI 则保持 best-effort, 并保留上一次成功的 payload.
 
 ### 实时额度面板
 
-`vct usage` 会**在仪表盘中直接显示 Claude Code、Codex、GitHub Copilot 与 Cursor 的实时额度用量——完全零配置。** 不需要 status-line hook，也无需手动输入任何凭证：vct 会读取各 provider 自己的 OAuth 凭证，在后台线程调用其用量 API，并在你工作时保持面板持续更新。每个进度条都是**已用**百分比，所以进度条满格代表该额度周期已耗尽，而不是还没开始用。（想要更清爽的面板？在 [`config.toml`](#%E9%85%8D%E7%BD%AE) 中精简 `[usage.quota]` 下的 `panels`，或设为 `[]` 隐藏整栏。）
+`vct usage` 会**在仪表盘中直接显示 Claude Code、Codex、GitHub Copilot、Cursor 与 Grok 的实时额度用量——完全零配置。** 不需要 status-line hook，也无需手动输入任何凭证：vct 会读取各 provider 自己的 OAuth 凭证，在后台线程调用其用量 API，并在你工作时保持面板持续更新。每个进度条都是**已用**百分比，所以进度条满格代表该额度周期已耗尽，而不是还没开始用。（想要更清爽的面板？在 [`config.toml`](#%E9%85%8D%E7%BD%AE) 中精简 `[usage.quota]` 下的 `panels`，或设为 `[]` 隐藏整栏。）
 
 ```
-┌ Claude ─────────────────┐┌ Codex ──────────────────┐┌ Copilot ────────────────┐┌ Cursor ─────────────────┐
-│ Plan: max 20x           ││ Plan: plus              ││ Plan: individual        ││ Plan: free              │
-│ 5h    ▰▱▱▱▱  13% ↻ 1h42m││ 5h    ▰▰▱▱▱  33% ↻ 12m  ││ prem  ▰▱▱▱▱   3% ↻ 24d  ││ total ▰▰▰▰▰  94% ↻ 16d  │
-│ 7d    ▰▰▰▱▱  58% ↻ 1d23h││ 7d    ▰▰▱▱▱  36% ↻ 1h54m││ reqs  ▰▱▱▱▱ 45/1500     ││ auto  ▰▰▰▰▰ 100% ↻ 16d  │
-│ Fable ▰▰▰▰▱  79% ↻ 1d23h││ Credits: 0  +3 reset    ││ updated just now        ││ api   ▰▰▰▱▱  44% ↻ 16d  │
-│ Balance: -   $0.00 used ││ reset expires 17d0h     ││                         ││ updated just now        │
-│ updated just now        ││ updated just now        ││                         ││                         │
-└─────────────────────────┘└─────────────────────────┘└─────────────────────────┘└─────────────────────────┘
+┌ Claude ─────────────────┐┌ Codex ──────────────────┐┌ Copilot ────────────────┐┌ Cursor ─────────────────┐┌ Grok ───────────────────┐
+│ Plan: max 20x           ││ Plan: plus              ││ Plan: individual        ││ Plan: free              ││ Plan: SuperGrok         │
+│ 5h    ▰▱▱▱▱  13% ↻ 1h42m││ 5h    ▰▰▱▱▱  33% ↻ 12m  ││ prem  ▰▱▱▱▱   3% ↻ 24d  ││ total ▰▰▰▰▰  94% ↻ 16d  ││ week  ▰▰▱▱▱  38% ↻ 3d4h │
+│ 7d    ▰▰▰▱▱  58% ↻ 1d23h││ 7d    ▰▰▱▱▱  36% ↻ 1h54m││ reqs  ▰▱▱▱▱ 45/1500     ││ auto  ▰▰▰▰▰ 100% ↻ 16d  ││ ondmd ▰▱▱▱▱ $4.20/$50.00│
+│ Fable ▰▰▰▰▱  79% ↻ 1d23h││ Credits: 0  +3 reset    ││ updated just now        ││ api   ▰▰▰▱▱  44% ↻ 16d  ││ Balance: $12.00         │
+│ Balance: -   $0.00 used ││ reset expires 17d0h     ││                         ││ updated just now        ││ updated just now        │
+│ updated just now        ││ updated just now        ││                         ││                         ││                         │
+└─────────────────────────┘└─────────────────────────┘└─────────────────────────┘└─────────────────────────┘└─────────────────────────┘
 ```
 
 - **Claude** — 方案类型、5 小时、每周以及单模型每周用量，来自官方 OAuth 用量 API（`GET /api/oauth/usage`），从 `~/.claude/.credentials.json` 读取，并显示额度余额。约每分钟轮询一次以避开该端点的速率限制；触及上限时标题会出现红色 `LIMIT` 标记。单模型每周那一行属于尽力而为，未返回该范围时就自动隐藏。
 - **Codex** — 套餐类型、5 小时和每周用量、额度余额以及已获取的可用 reset credit 中最早的到期时间，使用 `~/.codex/auth.json` 从 ChatGPT 后端（`wham/usage` + `wham/rate-limit-reset-credits`）获取（在适用时显示大致剩余讯息数 / 消费上限）；API 不可用时回退到 Codex 会话日志中最新的 `rate_limits`（标题显示 `Codex` 或 `Codex (session)`）。
 - **Copilot** — 方案类型，以及你的 premium 请求额度，以两个进度条呈现：已用百分比，以及已用 / 总量的请求数（例如 `45/1500`），来自 GitHub 的 Copilot API（`GET /copilot_internal/user`），从 `~/.copilot/config.json` 读取。该请求会模拟 Copilot CLI。token 为长期有效，因此不需要刷新；遇到 `401` / `403` 时会显示 `run: copilot login` 提示。
 - **Cursor** — 方案类型、total / auto / API **已用**百分比，以及按需消费，来自 cursor.com（`GET /api/usage-summary`），使用 `~/.config/cursor/auth.json` 中的 session token。刷新是被动式的：vct 每次轮询都会重新读取该文件，并在 token 有效期内使用它，因为官方 Cursor 客户端会让它保持最新。
+- **Grok** — 方案类型，以及当前每周或每月周期内的方案内含额度用量，来自 Grok CLI 自己的计费端点（`GET /v1/billing?format=credits`），从 `~/.grok/auth.json` 读取。预付余额只有在非零时才会显示；按量付费的消费则在你有过消费、或设置了上限之后才会显示。该请求会模拟 Grok CLI；遇到 `401` / `403` 时会显示 `run: grok login` 提示。
 
-**自动刷新 token。** 对 Claude 和 Codex，当 token 接近过期或被拒绝时，vct 会刷新它并把新 token 写回该 provider 自己的凭证文件（采用该 CLI 的原始格式），因此 token 会在多次检查之间复用，而不是每次都重新刷新。如果刷新失败，面板会显示 `run: <provider> auth login` 提示，而不会直接中断。Copilot（长期有效的 token）和 Cursor（由其自身客户端保持最新）为只读——vct 从不写入它们的凭证文件。
+**自动刷新 token。** 对 Claude、Codex 和 Grok，当 token 接近过期或被拒绝时，vct 会刷新它并把新 token 写回该 provider 自己的凭证文件（采用该 CLI 的原始格式），因此 token 会在多次检查之间复用，而不是每次都重新刷新。Grok 的 token 端点会像它自己的 CLI 那样，从登录时的 issuer 解析得出，而不是写死在代码里；写入时也会保留文件中其他所有的登录信息。如果刷新失败，面板会显示 `run: <provider> auth login` 提示，而不会直接中断。Copilot（长期有效的 token）和 Cursor（由其自身客户端保持最新）为只读——vct 从不写入它们的凭证文件。
 
-只有在某个 provider 的凭证存在时，才会显示对应的面板。当四个面板都显示时，Provider Usage 表格会从这一栏中折叠隐藏；在较窄的宽度下，面板会折行成 2×2 网格。额度面板仅在交互式 TUI 中显示；`--table`、`--text`、`--json` 不受影响。
+只有在某个 provider 的凭证存在时，才会显示对应的面板。当这一栏的宽度不足以同时容纳两者时，Provider Usage 表格会先折叠隐藏；再不够时，面板会折到下面的第二行——五个面板时会排成 3 + 2 网格，而末尾空出的位置又会把表格放回来。额度面板仅在交互式 TUI 中显示；`--table`、`--text`、`--json` 不受影响。
 
 > **平台说明：** 在 macOS 上，Claude Code 会把 OAuth 凭证保存在系统 Keychain 中，而不是 `~/.claude/.credentials.json`，因此在 macOS 上不会显示 Claude 面板。Cursor 的 `~/.config/cursor` 凭证路径偏向 Linux。
 
@@ -513,7 +514,7 @@ Binary version 由 `build.rs` 在编译期通过 `git describe` 写入，开发�
 
 **打印某个供应商的原始 quota/usage API 响应 — 不解析、不聚合。**
 
-对 `usage` 面板使用的同一个 quota 端点（Claude / Codex / Copilot / Cursor）发一次请求，直接打印原始 body，方便你查看 API 的实际结构或检查凭证是否正常。它读取各供应商已保存的凭证，并且**不会**刷新 token：token 过期时，请用对应供应商自己的 CLI 重新登录（`claude` / `codex` / `copilot` / `cursor-agent`）。
+对 `usage` 面板使用的同一个 quota 端点（Claude / Codex / Copilot / Cursor / Grok）发一次请求，直接打印原始 body，方便你查看 API 的实际结构或检查凭证是否正常。它读取各供应商已保存的凭证，并且**不会**刷新 token：token 过期时，请用对应供应商自己的 CLI 重新登录（`claude` / `codex` / `copilot` / `cursor-agent` / `grok`）。
 
 > 旧名称 `vct fetch` 保留为隐藏别名，现有脚本仍可继续使用。
 
@@ -534,6 +535,7 @@ vct quota claude
 vct quota codex
 vct quota copilot
 vct quota cursor
+vct quota grok
 
 # 摊平成纯文本
 vct quota codex --text
@@ -549,7 +551,7 @@ vct quota copilot --table
 
 ## 配置
 
-vct 会把用户设置保存在 `~/.vct/config.toml` 中。该文件会在**首次运行时以默认值自动生成**，因此你完全不必手动编写——只有想修改某个默认值时才编辑它。它由 vct 的类型化设置生成，并在第一行带有 `#:schema` 指令，因此支持 schema 的 TOML 编辑器（taplo / VS Code 的 "Even Better TOML"）会提供自动补全与校验。你也可以用 `vct config schema` 自行打印该 schema。由旧版 vct 生成的文件会在下次被 vct 读取时就地升级到当前布局（也可用 `vct config migrate` 手动触发），因此升级后绝不会停留在过时的格式上。
+vct 会把用户设置保存在 `~/.vct/config.toml` 中。该文件会在**首次运行时以默认值自动生成**，因此你完全不必手动编写——只有想修改某个默认值时才编辑它。它由 vct 的类型化设置生成，并在第一行带有 `#:schema` 指令，因此支持 schema 的 TOML 编辑器（taplo / VS Code 的 "Even Better TOML"）会提供自动补全与校验。你也可以用 `vct config schema` 自行打印该 schema。由旧版 vct 生成的文件会在下次被 vct 读取时就地升级到当前布局（也可用 `vct config migrate` 手动触发），因此升级后绝不会停留在过时的格式上。该升级也会把你的文件写入之后才发布的额度面板补进来——但只补一次。你再次删除该名称后它就不会回来，而你先前已经移除的面板也绝不会被重新加回。
 
 ```toml
 #:schema https://raw.githubusercontent.com/Mai0313/VibeCodingTracker/main/vct.schema.json
@@ -558,6 +560,9 @@ vct 会把用户设置保存在 `~/.vct/config.toml` 中。该文件会在**首�
 # 未指定 --daily/--weekly/--monthly/--all flag 时使用的默认时间范围
 # 取值之一: "daily" | "weekly" | "monthly" | "all"
 default_time_range = "all"
+# 该文件的布局版本, 由 vct 标记. 只有升级流程会读取它;
+# 除非你想让某次过去的升级再跑一遍, 否则不要动它.
+version = 2
 
 [usage]
 # 启动 usage 面板时就把跨 provider 前缀的 model 合并显示
@@ -568,7 +573,7 @@ refresh_interval = 10
 
 [usage.quota]
 # 显示哪些实时额度面板; 删除某个名称即可隐藏该面板, 用空列表 ([]) 隐藏整栏
-panels = ["claude", "codex", "copilot", "cursor"]
+panels = ["claude", "codex", "copilot", "cursor", "grok"]
 # 每个 provider 共用的实时额度面板轮询间隔秒数 (最小为 1)
 refresh_interval = 60
 
@@ -604,9 +609,10 @@ retention_days = 7
 | 设置项                         | 作用                                                                                                            |
 | ------------------------------ | --------------------------------------------------------------------------------------------------------------- |
 | `general.default_time_range`   | 当你没有传入 `--daily/--weekly/--monthly/--all` 时使用的时间范围。显式传入的 flag 始终优先。                    |
+| `general.version`              | vct 标记在文件上的布局版本，让后续版本新增的面板只会向你提供一次。                                              |
 | `usage.merge_models`           | 让面板启动时就处于合并状态；`m` 切换会把你上次的选择保存回这里。`--merge-providers` 会强制开启。                |
 | `usage.refresh_interval`       | `usage` 面板的自动刷新间隔（秒）。                                                                              |
-| `usage.quota.panels`           | 显示哪些额度面板（`claude` / `codex` / `copilot` / `cursor`）；删除名称即可隐藏，`[]` 隐藏整栏。                |
+| `usage.quota.panels`           | 显示哪些额度面板（`claude` / `codex` / `copilot` / `cursor` / `grok`）；删除名称即可隐藏，`[]` 隐藏整栏。       |
 | `usage.quota.refresh_interval` | 每个实时额度面板的轮询间隔（秒）；数值越大越不容易触发 provider 的速率限制。                                    |
 | `analysis.refresh_interval`    | `analysis` 面板的自动刷新间隔（秒）。                                                                           |
 | `performance.scan_threads`     | CLI scan worker 数. `0` 优先采用正数的 `RAYON_NUM_THREADS`, 否则最多使用两个 worker; 所有值都会受 CPU 数量限制. |
