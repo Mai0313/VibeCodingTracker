@@ -20,7 +20,7 @@ use crate::display::common::tui::{
 };
 use ratatui::{
     Terminal,
-    backend::CrosstermBackend,
+    backend::{Backend, CrosstermBackend},
     layout::Constraint,
     style::{Color as RatatuiColor, Style, Stylize},
     widgets::Row as RatatuiRow,
@@ -414,8 +414,8 @@ pub fn display_analysis_interactive(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_analysis_frame_with_status(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+fn render_analysis_frame_with_status<B: Backend>(
+    terminal: &mut Terminal<B>,
     rows_data: &[AnalysisRow],
     totals: &AnalysisRow,
     provider_totals: &AnalysisProviderTotals,
