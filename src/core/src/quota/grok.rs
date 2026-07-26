@@ -254,11 +254,15 @@ pub fn map_grok_billing(body: &str, now: i64) -> Result<GrokQuotaSnapshot> {
     let used = config.on_demand_used.as_ref().map(|m| m.as_dollars());
     let balance = config.prepaid_balance.as_ref().map(|m| m.as_dollars());
     // Pay-as-you-go and prepaid credit are opt-in extras: show them only once
-    // they carry a value, so a plain subscription panel stays three lines.
+    // they carry a value, so a plain subscription panel stays three lines. Once
+    // a cap is configured the spend is meaningful even at zero — and proto3
+    // omits `onDemandUsed` entirely in that case, so read its absence as $0.
     let on_demand_cap_dollars = cap.filter(|c| *c > 0.0);
-    let on_demand_dollars = used
-        .filter(|u| *u > 0.0)
-        .or(on_demand_cap_dollars.and(used));
+    let on_demand_dollars = if on_demand_cap_dollars.is_some() {
+        Some(used.unwrap_or(0.0))
+    } else {
+        used.filter(|u| *u > 0.0)
+    };
 
     Ok(GrokQuotaSnapshot {
         source: QuotaSource::Api,
@@ -891,11 +895,28 @@ mod tests {
     #[test]
     fn an_untouched_cap_still_reports_zero_spend() {
         // With a cap configured the on-demand line is meaningful even at $0, so
-        // it is shown rather than hidden as it is on a cap-less account.
+        // it is shown rather than hidden as it is on a cap-less account —
+        // whether the zero arrives as `{}` or is omitted altogether.
         let body = r#"{ "config": { "onDemandCap": { "val": 5000 }, "onDemandUsed": {} } }"#;
         let snap = map_grok_billing(body, 1).unwrap();
         assert_eq!(snap.on_demand_cap_dollars, Some(50.0));
         assert_eq!(snap.on_demand_dollars, Some(0.0));
+
+        let body = r#"{ "config": { "onDemandCap": { "val": 5000 } } }"#;
+        let snap = map_grok_billing(body, 1).unwrap();
+        assert_eq!(snap.on_demand_dollars, Some(0.0));
+    }
+
+    #[test]
+    fn reads_the_nanosecond_expiry_the_grok_cli_writes() {
+        // The real `expires_at` carries nine fractional digits. Failing to parse
+        // it would read as "never expires" and silently disable proactive
+        // refresh, leaving every poll to 401 first.
+        let cred = select_grok_entry(&oauth_auth("2026-07-26T15:33:55.311478864Z")).unwrap();
+        assert_eq!(cred.expires_at_secs(), Some(1_785_080_035));
+        // An unparseable stamp reads as unknown, not as the epoch.
+        let cred = select_grok_entry(&oauth_auth("not-a-timestamp")).unwrap();
+        assert_eq!(cred.expires_at_secs(), None);
     }
 
     #[test]
