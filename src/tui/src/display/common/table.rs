@@ -290,12 +290,7 @@ pub fn rail_width(width: u16, content_min_w: u16) -> Option<u16> {
 /// only when `rail` is requested *and* [`rail_width`] says it fits. That single
 /// comparison is the whole responsive story; nothing here reads how many items
 /// the caller intends to draw.
-pub fn frame_layout(
-    area: Rect,
-    content_min_w: u16,
-    rail: bool,
-    band_height: u16,
-) -> FrameChunks {
+pub fn frame_layout(area: Rect, content_min_w: u16, rail: bool, band_height: u16) -> FrameChunks {
     let mut constraints: Vec<Constraint> = Vec::with_capacity(4);
     constraints.push(Constraint::Min(CONTENT_MIN_H));
     if band_height > 0 {

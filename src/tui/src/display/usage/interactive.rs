@@ -9,9 +9,9 @@
 
 use crate::display::common::ProviderTotal;
 use crate::display::common::table::{
-    CONTENT_MIN_H, FOOTER_H, create_controls_with_status, create_provider_row,
-    create_ratatui_table, create_summary, frame_layout, init_process_metrics,
-    refresh_process_metrics, render_scrollable_table, render_too_small, styled_row,
+    FOOTER_H, create_controls_with_status, create_provider_row, create_ratatui_table,
+    create_summary, frame_layout, init_process_metrics, refresh_process_metrics,
+    render_scrollable_table, render_too_small, styled_row,
 };
 use crate::display::common::tui::{
     InputAction, RefreshWorker, RefreshWorkerError, ScrollState, TerminalSession, UpdateTracker,
@@ -55,11 +55,19 @@ use vct_core::utils::{
     resolve_paths,
 };
 
-/// Minimum height for the bottom quota panels. Sized for the common case
-/// (Claude: 5h/7d/scoped/balance/staleness; Codex:
-/// plan/5h/7d/credits/reset-expiry/staleness) plus the border. A rare overlap
-/// clips the least-critical bottom line, which `Paragraph` handles safely.
-const QUOTA_PANEL_MIN_HEIGHT: u16 = 8;
+/// Height of one quota card: a border, [`CARD_CONTENT_H`] content rows, and a
+/// border. Five rows is what the fullest provider needs (Claude: plan, 5h, 7d,
+/// scoped, balance), so the common case shows everything.
+const CARD_H: u16 = 7;
+/// Narrowest a quota card may be. A full gauge line is
+/// `label(5) + bar(5) + percent(4) + reset(6)` = 20 content columns, so 24
+/// leaves two spare inside the borders. This is also the value that lets five
+/// cards share one row on a 120-column terminal.
+const CARD_MIN_W: u16 = 24;
+/// Widest a quota card grows to. Past this the cards stop stretching and the
+/// grid centers itself, so a very wide terminal does not hand each provider a
+/// 60-column box holding a 20-column gauge.
+const CARD_MAX_W: u16 = 40;
 /// Claude brand color for the quota panel border.
 const CLAUDE_COLOR: RatatuiColor = RatatuiColor::Rgb(190, 116, 87);
 /// Codex brand color for the quota panel border.
@@ -71,18 +79,14 @@ const CURSOR_COLOR: RatatuiColor = RatatuiColor::Rgb(64, 180, 180);
 /// Grok brand color (xAI near-black, lifted to stay readable on a dark terminal).
 const GROK_COLOR: RatatuiColor = RatatuiColor::Rgb(170, 170, 178);
 
-/// Minimum readable width for a single quota panel column (label + bar +
-/// percent + reset). Below this a panel's gauge tail may clip.
-const PANEL_MIN_W: u16 = 28;
-/// Minimum width to keep the (slimmed) Provider Usage table inline in the band.
-/// Matches the table's own column widths (Provider 9 + Tokens 11 + Cost 11 plus
-/// borders/spacing) so it is only kept when it can render without truncating;
-/// otherwise the band drops it and the panels take the full width.
-const BAND_TABLE_MIN_W: u16 = 38;
-/// Terminal height needed to wrap the panels into a two-row grid.
-const PANELS_2ROW_MIN_H: u16 = 26;
-/// How many providers can show a quota panel (Claude / Codex / Copilot / Cursor
-/// / Grok) — the widest band the layout ever has to place.
+/// Width the scrollable model table needs before a side rail may take the rest.
+/// Model(16) + six numeric columns and their gaps, plus borders and scrollbar.
+const USAGE_CONTENT_MIN_W: u16 = 66;
+/// Body rows the model table must keep for the quota grid to be worth drawing.
+/// Below this the grid folds to the one-line digest, which is announced there.
+const TABLE_MIN_BODY_H: u16 = 8;
+/// How many providers can show a quota card (Claude / Codex / Copilot / Cursor
+/// / Grok). The grid never reads this — it only bounds the render dispatch.
 const MAX_QUOTA_PANELS: usize = 5;
 
 /// Which provider quota panels have credentials on this machine.
@@ -148,11 +152,6 @@ const MAX_TRACKED_ROWS: usize = 100;
 /// Hard minimum terminal width/height; below this only a notice is drawn.
 const USAGE_MIN_W: u16 = 74;
 const USAGE_MIN_H: u16 = 14;
-/// At or above this height the provider/quota band is shown; below it the band
-/// is dropped so the scrollable table keeps a usable height.
-const USAGE_PANELS_MIN_H: u16 = 22;
-/// Minimum combined height reserved for the model table, summary, and controls.
-const USAGE_NON_PANEL_MIN_H: u16 = CONTENT_MIN_H + FOOTER_H;
 
 struct UsageRefreshPayload {
     rows: Vec<UsageRow>,
@@ -802,23 +801,17 @@ fn render_usage_frame_with_status<B: Backend>(
             return;
         }
 
-        // Drop the provider/quota band on short terminals so the scrollable
-        // table keeps a usable height.
-        // Decide how the band arranges the present quota panels (and whether the
-        // slimmed Provider Usage table shares the row) from the terminal size,
-        // then size the band accordingly. The band spans the full width, so the
-        // arrange decision uses `area.width`.
+        // `band_enabled == false` (empty `quota_panels`) drops the whole quota
+        // surface, Provider Usage rail included — not just the gauges hidden.
         let n = quota.present.count();
-        let arrange = arrange_band(area.width, area.height, n);
-        // `band_enabled == false` (empty `quota_panels`) drops the whole band, so
-        // the scrollable table takes the full height — not just the gauges hidden.
-        let panels_height = visible_band_height(
-            area.height,
-            quota.band_enabled,
-            &arrange,
-            provider_rows.len(),
-        );
-        let chunks = frame_layout(area, USAGE_MIN_W, false, panels_height.unwrap_or(0));
+        let grid_h = visible_grid_height(area, quota.band_enabled, n);
+        // A folded grid still costs one row, for the digest that replaces it.
+        let band_h = if grid_h > 0 {
+            grid_h
+        } else {
+            u16::from(quota.band_enabled && n > 0)
+        };
+        let chunks = frame_layout(area, USAGE_CONTENT_MIN_W, quota.band_enabled, band_h);
 
         let header = vec![
             "Model",
@@ -878,104 +871,45 @@ fn render_usage_frame_with_status<B: Backend>(
             scroll,
         );
 
-        if let Some(panel_area) = chunks.band {
-            let grid = split_band(panel_area, &arrange, n);
+        if let Some(rail_area) = chunks.rail {
+            render_provider_rail(f, rail_area, &provider_rows);
+        }
 
-            // The (slimmed) Provider Usage table is only shown when the band
-            // keeps a cell for it; otherwise the panels take the whole band and
-            // the scrollable per-model table above carries the per-provider view.
-            if let Some(table_area) = grid.table {
-                // Draw one outer border for the whole cell, then split its inside
-                // into the provider table (top) and a stacked share bar pinned to
-                // the bottom line, so both live inside the same box.
-                let block = Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(RatatuiColor::Magenta));
-                let inner = block.inner(table_area);
-                f.render_widget(block, table_area);
-
-                let cells = RatatuiLayout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Min(2), Constraint::Length(1)])
-                    .split(inner);
-                let (rows_area, bar_area) = (cells[0], cells[1]);
-
-                // Drop the "All Providers" aggregate; the summary bar already
-                // carries the grand totals.
-                let mut totals_rows: Vec<RatatuiRow> = provider_rows
-                    .iter()
-                    .filter(|row| row.label != "All Providers")
-                    .map(|row| {
-                        create_provider_row(
-                            vec![
-                                row.label.to_string(),
-                                format_compact(row.stats.total_tokens),
-                                format_cost_compact(row.stats.total_cost),
-                            ],
-                            row.tui_color,
-                            row.emphasize,
-                        )
-                    })
-                    .collect();
-
-                if totals_rows.is_empty() {
-                    totals_rows.push(
-                        RatatuiRow::new(vec![
-                            "No provider data yet".to_string(),
-                            "-".to_string(),
-                            "-".to_string(),
-                        ])
-                        .style(Style::default().fg(RatatuiColor::DarkGray)),
-                    );
-                }
-
-                let totals_header = vec!["Provider", "Tokens", "Cost"];
-                let totals_widths = [
-                    Constraint::Min(9),
-                    Constraint::Length(11),
-                    Constraint::Length(11),
-                ];
-
-                // Reuse the shared table builder but strip its own border (the
-                // outer block above already draws it) by overriding the block.
-                let totals_table = create_ratatui_table(
-                    totals_rows,
-                    totals_header,
-                    &totals_widths,
-                    RatatuiColor::Magenta,
-                )
-                .block(Block::default());
-                f.render_widget(totals_table, rows_area);
-
-                f.render_widget(
-                    Paragraph::new(provider_share_bar(&provider_rows, bar_area.width)),
-                    bar_area,
-                );
-            }
-
-            // Render present panels in fixed order (Claude → Codex → Copilot →
-            // Cursor → Grok) into the grid cells; a missing provider consumes no
-            // cell.
+        if let Some(band_area) = chunks.band {
             let now = chrono::Local::now().timestamp();
-            let mut idx = 0;
-            if quota.present.claude {
-                render_claude_quota(f, grid.panels[idx], quota.claude, now);
-                idx += 1;
-            }
-            if quota.present.codex {
-                render_codex_quota(f, grid.panels[idx], quota.codex, now);
-                idx += 1;
-            }
-            if quota.present.copilot {
-                render_copilot_quota(f, grid.panels[idx], quota.copilot, now);
-                idx += 1;
-            }
-            if quota.present.cursor {
-                render_cursor_quota(f, grid.panels[idx], quota.cursor, now);
-                idx += 1;
-            }
-            if quota.present.grok {
-                render_grok_quota(f, grid.panels[idx], quota.grok, now);
+            if grid_h > 0 {
+                let cells = grid_cells(band_area, n);
+                // Present providers render in a fixed order (Claude → Codex →
+                // Copilot → Cursor → Grok) into the cells; a missing provider
+                // consumes no cell, and `grid_cells` always returns exactly `n`.
+                let mut idx = 0;
+                let mut place = |f: &mut Frame, card: QuotaCard| {
+                    if let Some(cell) = cells.get(idx) {
+                        render_quota_card(f, *cell, &card);
+                    }
+                    idx += 1;
+                };
+                let card_w = cells.first().map_or(CARD_MIN_W, |cell| cell.width);
+                if quota.present.claude {
+                    place(f, claude_card(quota.claude, now, card_w));
+                }
+                if quota.present.codex {
+                    place(f, codex_card(quota.codex, now, card_w));
+                }
+                if quota.present.copilot {
+                    place(f, copilot_card(quota.copilot, now, card_w));
+                }
+                if quota.present.cursor {
+                    place(f, cursor_card(quota.cursor, now, card_w));
+                }
+                if quota.present.grok {
+                    place(f, grok_card(quota.grok, now, card_w));
+                }
+            } else {
+                f.render_widget(
+                    Paragraph::new(quota_digest(&digest_items(quota), band_area.width)).centered(),
+                    band_area,
+                );
             }
         }
 
@@ -1174,8 +1108,15 @@ fn gauge_color(pct: f64) -> RatatuiColor {
 
 /// Renders a 5-segment mini bar like `▰▰▱▱▱` (any usage shows one block).
 fn mini_bar(pct: f64) -> String {
-    let filled = ((pct / 20.0).ceil() as i64).clamp(0, 5) as usize;
-    (0..5).map(|i| if i < filled { '▰' } else { '▱' }).collect()
+    mini_bar_n(pct, 5)
+}
+
+/// [`mini_bar`] with a caller-chosen cell count, for the narrower digest bar.
+fn mini_bar_n(pct: f64, cells: usize) -> String {
+    let filled = ((pct / (100.0 / cells as f64)).ceil() as i64).clamp(0, cells as i64) as usize;
+    (0..cells)
+        .map(|i| if i < filled { '▰' } else { '▱' })
+        .collect()
 }
 
 /// Builds a horizontal stacked share bar filling `width` columns: one solid
@@ -1236,71 +1177,6 @@ fn provider_share_bar(rows: &[ProviderTotal<'_, ProviderStats>], width: u16) -> 
     Line::from(spans)
 }
 
-/// Builds one gauge line: `5h     ▰▰▱▱▱   27%  ↻ 4h13m`.
-///
-/// The label is padded to a fixed width so the bars line up across `5h` / `7d`
-/// and the longer per-model labels ("Opus" / "Sonnet").
-fn quota_gauge_line(label: &str, w: &QuotaWindow, now: i64) -> Line<'static> {
-    let pct = w.used_percent;
-    let color = gauge_color(pct);
-    let mut spans = vec![
-        Span::styled(
-            format!("{label:<6} "),
-            Style::default().fg(RatatuiColor::Gray),
-        ),
-        Span::styled(mini_bar(pct), Style::default().fg(color)),
-        Span::styled(format!(" {pct:>3.0}%"), Style::default().fg(color)),
-    ];
-    if let Some(reset) = w.resets_at_unix {
-        spans.push(Span::styled(
-            format!("  ↻ {}", format_duration_until(reset, now)),
-            Style::default().fg(RatatuiColor::DarkGray),
-        ));
-    }
-    Line::from(spans)
-}
-
-/// Like [`quota_gauge_line`] but labels the bar with a caller-supplied value
-/// (e.g. `36/1500`) instead of a percentage, and carries no reset marker. `pct`
-/// still drives the bar fill and its traffic-light color; used for the Copilot
-/// request-count gauge, which shares the `prem` line's reset window.
-fn quota_gauge_line_value(label: &str, pct: f64, value: &str) -> Line<'static> {
-    let color = gauge_color(pct);
-    Line::from(vec![
-        Span::styled(
-            format!("{label:<6} "),
-            Style::default().fg(RatatuiColor::Gray),
-        ),
-        Span::styled(mini_bar(pct), Style::default().fg(color)),
-        Span::styled(format!(" {value}"), Style::default().fg(color)),
-    ])
-}
-
-/// Builds the "updated Xm ago" staleness line, from the last successful fetch.
-///
-/// Dimmed by default, escalating to yellow past 1h and red past 6h so a panel
-/// stuck on stale data (e.g. persistent auth failure) reads as such.
-fn staleness_line(fetched_at: i64, now: i64) -> Line<'static> {
-    if fetched_at <= 0 {
-        return dim_line("updated: never");
-    }
-    let age = (now - fetched_at).max(0);
-    let color = if age > 6 * 3600 {
-        RatatuiColor::Red
-    } else if age > 3600 {
-        RatatuiColor::Yellow
-    } else {
-        RatatuiColor::DarkGray
-    };
-    let ago = format_duration_until(now, fetched_at);
-    let text = if ago == "now" {
-        "updated just now".to_string()
-    } else {
-        format!("updated {ago} ago")
-    };
-    Line::from(Span::styled(text, Style::default().fg(color)))
-}
-
 /// A dim gray line for placeholder / hint text.
 fn dim_line(text: &str) -> Line<'static> {
     Line::from(Span::styled(
@@ -1319,198 +1195,578 @@ fn login_hint_line(hint: &str) -> Line<'static> {
     ))
 }
 
-/// Resolved band arrangement (pure; independent of the band `Rect`).
-enum BandArrange {
-    /// One row: an optional Provider Usage table cell, then the panel cells.
-    SingleRow { table: bool },
-    /// Two rows: `top` panels on the first row, the rest on the second; a
-    /// trailing empty cell on the second row is filled with the table.
-    TwoRow { top: usize, table_in_hole: bool },
-}
-
-/// Decides the band arrangement from band width, terminal height, and the
-/// number of present quota panels.
+/// Columns and rows the quota grid uses for `n` cards at `width`.
 ///
-/// Preference order: table + all panels in one row → panels-only in one row
-/// (table dropped as redundant with the scrollable table) → a two-row grid →
-/// a last-resort even split that may clip a gauge tail but never panics.
-fn arrange_band(w: u16, area_h: u16, n: usize) -> BandArrange {
+/// This is the whole placement rule. The card count enters only as `n`, so a
+/// new provider is a longer list and never a new case: the grid packs as many
+/// cards per row as the width allows and wraps the remainder onto further rows.
+fn quota_grid(width: u16, n: usize) -> (usize, usize) {
     if n == 0 {
-        return BandArrange::SingleRow { table: true };
+        return (0, 0);
     }
-    let panels_w = PANEL_MIN_W.saturating_mul(n as u16);
-    if w >= BAND_TABLE_MIN_W + panels_w {
-        BandArrange::SingleRow { table: true }
-    } else if w >= panels_w {
-        BandArrange::SingleRow { table: false }
-    } else if area_h >= PANELS_2ROW_MIN_H {
-        let top = n.div_ceil(2);
-        BandArrange::TwoRow {
-            top,
-            table_in_hole: top * 2 > n,
-        }
+    let cols = usize::from((width / CARD_MIN_W).max(1)).min(n);
+    (cols, n.div_ceil(cols))
+}
+
+/// Rows the grid needs at `width` for `n` cards.
+fn grid_height(width: u16, n: usize) -> u16 {
+    let (_, rows) = quota_grid(width, n);
+    (rows as u16).saturating_mul(CARD_H)
+}
+
+/// The grid height the frame can actually spend, or `0` when the grid folds.
+///
+/// The model table is the primary content, so the grid is only drawn while the
+/// table keeps [`TABLE_MIN_BODY_H`] body rows beneath it (its border, header and
+/// header margin cost 4 more). When it folds, the one-line quota digest takes
+/// its place and says how many providers moved behind `Q` — the grid is never
+/// dropped silently.
+fn visible_grid_height(area: Rect, band_enabled: bool, n: usize) -> u16 {
+    if !band_enabled || n == 0 {
+        return 0;
+    }
+    let height = grid_height(area.width, n);
+    let table_h = area.height.saturating_sub(FOOTER_H).saturating_sub(height);
+    if table_h >= TABLE_MIN_BODY_H.saturating_add(4) {
+        height
     } else {
-        BandArrange::SingleRow { table: false }
+        0
     }
 }
 
-/// The band height fed to `main_layout` (computed before the band `Rect` exists).
-fn band_height(arrange: &BandArrange, provider_rows: usize) -> u16 {
-    match arrange {
-        // The rendered table omits the overall row already included in
-        // `provider_rows`: border(2) + header/margin(2) + rows(-1) + bar(1).
-        BandArrange::SingleRow { table: true } => (provider_rows as u16)
-            .saturating_add(4)
-            .max(QUOTA_PANEL_MIN_HEIGHT),
-        BandArrange::SingleRow { table: false } => QUOTA_PANEL_MIN_HEIGHT,
-        BandArrange::TwoRow { .. } => QUOTA_PANEL_MIN_HEIGHT.saturating_mul(2),
-    }
-}
-
-fn visible_band_height(
-    area_height: u16,
-    band_enabled: bool,
-    arrange: &BandArrange,
-    provider_rows: usize,
-) -> Option<u16> {
-    if !band_enabled || area_height < USAGE_PANELS_MIN_H {
-        return None;
-    }
-
-    let height = band_height(arrange, provider_rows);
-    (area_height >= height.saturating_add(USAGE_NON_PANEL_MIN_H)).then_some(height)
-}
-
-/// The band split into an optional table cell plus one cell per present panel.
-struct BandGrid {
-    table: Option<Rect>,
-    panels: Vec<Rect>,
-}
-
-/// Splits a horizontal rect into `k` equal columns.
-fn split_even(area: Rect, k: usize) -> Vec<Rect> {
-    if k == 0 {
+/// Splits the grid band into exactly `n` card cells, row-major.
+///
+/// Cards keep a uniform width, so a final row holding fewer than a full set is
+/// left ragged rather than stretching its cards out of alignment with the rows
+/// above. The returned length is always `n`, which is what lets the render
+/// dispatch index it by present-provider order.
+fn grid_cells(band: Rect, n: usize) -> Vec<Rect> {
+    let (cols, rows) = quota_grid(band.width, n);
+    if cols == 0 {
         return Vec::new();
     }
-    let cons = vec![Constraint::Ratio(1, k as u32); k];
-    RatatuiLayout::default()
-        .direction(Direction::Horizontal)
-        .constraints(cons)
-        .split(area)
-        .to_vec()
-}
+    let card_w = (band.width / cols as u16).min(CARD_MAX_W);
+    // Center the row so capped cards do not leave all their slack on one side.
+    let indent = (band.width - card_w * cols as u16) / 2;
+    let row_rects = RatatuiLayout::default()
+        .direction(Direction::Vertical)
+        .constraints(vec![Constraint::Length(CARD_H); rows])
+        .split(band);
 
-/// Splits the resolved band `Rect` into the table cell + ordered panel cells.
-///
-/// `panels` always has exactly `n` entries so the render dispatch can index it
-/// by present-provider order without bounds concerns.
-fn split_band(band: Rect, arrange: &BandArrange, n: usize) -> BandGrid {
-    match *arrange {
-        BandArrange::SingleRow { table } => {
-            let mut cons: Vec<Constraint> = Vec::with_capacity(1 + MAX_QUOTA_PANELS);
-            if table {
-                cons.push(Constraint::Min(BAND_TABLE_MIN_W));
-            }
-            // Give each panel an equal share of whatever the table leaves.
-            let panel_span = if table {
-                band.width.saturating_sub(BAND_TABLE_MIN_W)
-            } else {
-                band.width
-            };
-            let pw = if n > 0 {
-                (panel_span / n as u16).max(PANEL_MIN_W)
-            } else {
-                PANEL_MIN_W
-            };
-            for _ in 0..n {
-                cons.push(Constraint::Length(pw));
-            }
-            let cells = RatatuiLayout::default()
-                .direction(Direction::Horizontal)
-                .constraints(cons)
-                .split(band);
-            let (table_rect, off) = if table {
-                (Some(cells[0]), 1)
-            } else {
-                (None, 0)
-            };
-            BandGrid {
-                table: table_rect,
-                panels: cells[off..off + n].to_vec(),
-            }
-        }
-        BandArrange::TwoRow { top, table_in_hole } => {
-            let rows = RatatuiLayout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(QUOTA_PANEL_MIN_HEIGHT),
-                    Constraint::Length(QUOTA_PANEL_MIN_HEIGHT),
-                ])
-                .split(band);
-            let bottom = n - top;
-            let row0 = split_even(rows[0], top);
-            let row1 = split_even(rows[1], bottom + table_in_hole as usize);
-            let mut panels = row0;
-            panels.extend_from_slice(&row1[..bottom]);
-            let table_rect = table_in_hole.then(|| row1[bottom]);
-            BandGrid {
-                table: table_rect,
-                panels,
-            }
+    let mut cells = Vec::with_capacity(n);
+    for (r, row) in row_rects.iter().enumerate() {
+        for c in 0..(n - r * cols).min(cols) {
+            cells.push(Rect {
+                x: row.x + indent + c as u16 * card_w,
+                y: row.y,
+                width: card_w,
+                height: row.height,
+            });
         }
     }
+    cells
 }
 
-/// Builds a quota-panel block: provider title on the left, plus a red bold
-/// `LIMIT` flag right-aligned in the top border when a cap is hit. Shared by
-/// both panels so they flag limits identically.
-fn quota_block(title: &str, border: RatatuiColor, limit_reached: bool) -> Block<'static> {
+/// Renders the Provider Usage rail: a three-column table over a stacked share
+/// bar, both inside one border.
+///
+/// The rail is short by design, so a provider list longer than it can hold is
+/// truncated with a `+N more` row and a `+N` flag in the title rather than
+/// stopping at the border with no sign that anything is missing.
+fn render_provider_rail(
+    f: &mut Frame,
+    area: Rect,
+    provider_rows: &[ProviderTotal<'_, ProviderStats>],
+) {
+    // Drop the "All Providers" aggregate; the summary bar carries the totals.
+    let listed: Vec<_> = provider_rows
+        .iter()
+        .filter(|row| row.label != "All Providers")
+        .collect();
+    // Border(2) + header + header margin + share bar leave this many data rows.
+    let capacity = usize::from(area.height.saturating_sub(5));
+    let mut hidden = listed.len().saturating_sub(capacity);
+    // The "+N more" row costs a slot of its own.
+    if hidden > 0 {
+        hidden = listed.len().saturating_sub(capacity.saturating_sub(1));
+    }
+    let shown = listed.len() - hidden;
+
     let mut block = Block::default()
         .borders(Borders::ALL)
-        .title(Line::from(title.to_string()))
-        .border_style(Style::default().fg(border));
-    if limit_reached {
+        .title(Line::from(" Providers "))
+        .border_style(Style::default().fg(RatatuiColor::Magenta));
+    if hidden > 0 {
         block = block.title(
             Line::from(Span::styled(
-                "LIMIT ",
-                Style::default()
-                    .fg(RatatuiColor::Red)
-                    .add_modifier(Modifier::BOLD),
+                format!("+{hidden} "),
+                Style::default().fg(RatatuiColor::DarkGray),
             ))
             .right_aligned(),
         );
     }
-    block
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let cells = RatatuiLayout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(2), Constraint::Length(1)])
+        .split(inner);
+    let (rows_area, bar_area) = (cells[0], cells[1]);
+
+    let mut totals_rows: Vec<RatatuiRow> = listed
+        .iter()
+        .take(shown)
+        .map(|row| {
+            create_provider_row(
+                vec![
+                    row.label.to_string(),
+                    format_compact(row.stats.total_tokens),
+                    format_cost_compact(row.stats.total_cost),
+                ],
+                row.tui_color,
+                row.emphasize,
+            )
+        })
+        .collect();
+
+    if hidden > 0 {
+        totals_rows.push(
+            RatatuiRow::new(vec![
+                format!("+{hidden} more"),
+                String::new(),
+                String::new(),
+            ])
+            .style(Style::default().fg(RatatuiColor::DarkGray)),
+        );
+    }
+    if totals_rows.is_empty() {
+        totals_rows.push(
+            RatatuiRow::new(vec![
+                "No provider data yet".to_string(),
+                "-".to_string(),
+                "-".to_string(),
+            ])
+            .style(Style::default().fg(RatatuiColor::DarkGray)),
+        );
+    }
+
+    let totals_widths = [
+        Constraint::Min(9),
+        Constraint::Length(11),
+        Constraint::Length(11),
+    ];
+    // Reuse the shared table builder but strip its own border (the outer block
+    // above already draws it) by overriding the block.
+    let totals_table = create_ratatui_table(
+        totals_rows,
+        vec!["Provider", "Tokens", "Cost"],
+        &totals_widths,
+        RatatuiColor::Magenta,
+    )
+    .block(Block::default());
+    f.render_widget(totals_table, rows_area);
+
+    f.render_widget(
+        Paragraph::new(provider_share_bar(provider_rows, bar_area.width)),
+        bar_area,
+    );
 }
 
-/// Renders the Claude quota panel (5h / 7d / scoped gauges + balance +
-/// staleness + login hint).
-fn render_claude_quota(f: &mut Frame, area: Rect, claude: &ClaudeQuotaSnapshot, now: i64) {
-    let block = quota_block(" Claude ", CLAUDE_COLOR, claude.limit_reached);
+/// Every present provider's headline gauge: the most-consumed of its windows,
+/// which is the one that will bite first.
+fn digest_items(quota: &QuotaView) -> Vec<(&'static str, RatatuiColor, Option<f64>)> {
+    fn peak(windows: &[Option<&QuotaWindow>]) -> Option<f64> {
+        windows
+            .iter()
+            .flatten()
+            .map(|w| w.used_percent)
+            .fold(None, |acc: Option<f64>, pct| {
+                Some(acc.map_or(pct, |a| a.max(pct)))
+            })
+    }
+
+    let mut items = Vec::with_capacity(MAX_QUOTA_PANELS);
+    if quota.present.claude {
+        items.push((
+            "Claude",
+            CLAUDE_COLOR,
+            peak(&[
+                quota.claude.five_hour.as_ref(),
+                quota.claude.seven_day.as_ref(),
+                quota.claude.scoped_weekly.as_ref(),
+            ]),
+        ));
+    }
+    if quota.present.codex {
+        items.push((
+            "Codex",
+            CODEX_COLOR,
+            peak(&[quota.codex.primary.as_ref(), quota.codex.secondary.as_ref()]),
+        ));
+    }
+    if quota.present.copilot {
+        items.push((
+            "Copilot",
+            COPILOT_COLOR,
+            peak(&[quota.copilot.premium.as_ref()]),
+        ));
+    }
+    if quota.present.cursor {
+        items.push((
+            "Cursor",
+            CURSOR_COLOR,
+            peak(&[
+                quota.cursor.total.as_ref(),
+                quota.cursor.auto.as_ref(),
+                quota.cursor.api.as_ref(),
+            ]),
+        ));
+    }
+    if quota.present.grok {
+        items.push(("Grok", GROK_COLOR, peak(&[quota.grok.included.as_ref()])));
+    }
+    items
+}
+
+/// The one-line quota digest shown in place of the grid on a short terminal.
+///
+/// Segments are dropped whole from the tail, and the remainder is named in a
+/// trailing `+N more → Q`, so the line never implies it lists every provider.
+fn quota_digest(items: &[(&'static str, RatatuiColor, Option<f64>)], width: u16) -> Line<'static> {
+    const SEP: &str = "  ·  ";
+    /// `Claude ▰▰▱ 58%` — a three-cell bar keeps the line short.
+    fn segment(name: &str, pct: Option<f64>) -> String {
+        match pct {
+            Some(pct) => format!("{name} {} {pct:.0}%", mini_bar_n(pct, 3)),
+            None => format!("{name} -"),
+        }
+    }
+
+    if items.is_empty() {
+        return dim_line("no quota panels");
+    }
+
+    let widths: Vec<usize> = items
+        .iter()
+        .map(|(name, _, pct)| segment(name, *pct).chars().count())
+        .collect();
+    let mut shown = items.len();
+    let mut used: usize = widths.iter().sum::<usize>() + SEP.chars().count() * (items.len() - 1);
+    while shown > 1 {
+        let hidden = items.len() - shown;
+        // `+N more → Q` needs room of its own once anything is hidden.
+        let tail = if hidden > 0 {
+            SEP.chars().count() + format!("+{hidden} more → Q").chars().count()
+        } else {
+            0
+        };
+        if used + tail <= usize::from(width) {
+            break;
+        }
+        shown -= 1;
+        used -= widths[shown] + SEP.chars().count();
+    }
+
+    let mut spans: Vec<Span> = Vec::with_capacity(shown * 2);
+    for (i, (name, color, pct)) in items.iter().take(shown).enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(
+                SEP,
+                Style::default().fg(RatatuiColor::DarkGray),
+            ));
+        }
+        spans.push(Span::styled(
+            segment(name, *pct),
+            Style::default().fg(*color),
+        ));
+    }
+    let hidden = items.len() - shown;
+    if hidden > 0 {
+        spans.push(Span::styled(
+            SEP,
+            Style::default().fg(RatatuiColor::DarkGray),
+        ));
+        spans.push(Span::styled(
+            format!("+{hidden} more → Q"),
+            Style::default().fg(RatatuiColor::DarkGray),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// One provider's quota, laid out as an ordered list of lines.
+///
+/// The list is built most-important-first and independently of the cell it will
+/// land in, so the same card can be drawn small in the grid and full-size in the
+/// `Q` overlay. Whatever does not fit is counted, never dropped in silence.
+struct QuotaCard {
+    title: &'static str,
+    color: RatatuiColor,
+    limit_reached: bool,
+    lines: Vec<Line<'static>>,
+}
+
+/// Content columns available inside a card `width` wide.
+fn card_inner_w(width: u16) -> u16 {
+    width.saturating_sub(2)
+}
+
+/// Renders `card` into `area`, flagging a hit cap and any lines that did not fit.
+///
+/// The trailing flags share the top border: `+2` for hidden lines, `LIMIT` for a
+/// spent window. `+2` is the promise that the overlay has more to show.
+fn render_quota_card(f: &mut Frame, area: Rect, card: &QuotaCard) {
+    let capacity = usize::from(area.height.saturating_sub(2));
+    let hidden = card.lines.len().saturating_sub(capacity);
+
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .title(Line::from(format!(" {} ", card.title)))
+        .border_style(Style::default().fg(card.color));
+
+    let mut flags: Vec<Span> = Vec::new();
+    if hidden > 0 {
+        flags.push(Span::styled(
+            format!("+{hidden} "),
+            Style::default().fg(RatatuiColor::DarkGray),
+        ));
+    }
+    if card.limit_reached {
+        flags.push(Span::styled(
+            "LIMIT ",
+            Style::default()
+                .fg(RatatuiColor::Red)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if !flags.is_empty() {
+        block = block.title(Line::from(flags).right_aligned());
+    }
+
+    let shown = card.lines[..capacity.min(card.lines.len())].to_vec();
+    f.render_widget(Paragraph::new(shown).block(block), area);
+}
+
+/// Builds the card's first line: plan tier on the left, fetch age on the right.
+///
+/// Merging the two saves a row in every card, and they belong together — the age
+/// qualifies everything below it.
+fn plan_line(plan: &str, fetched_at: i64, now: i64, inner_w: u16) -> Line<'static> {
+    let (age, color) = staleness(fetched_at, now);
+    let inner = usize::from(inner_w);
+    let pad = inner.saturating_sub(plan.chars().count() + age.chars().count());
+    Line::from(vec![
+        Span::styled(plan.to_string(), Style::default().fg(RatatuiColor::Gray)),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(age, Style::default().fg(color)),
+    ])
+}
+
+/// The "how old is this snapshot" marker, escalating in color past 1h and 6h so
+/// a panel stuck on stale data reads as such.
+fn staleness(fetched_at: i64, now: i64) -> (String, RatatuiColor) {
+    if fetched_at <= 0 {
+        return ("never".to_string(), RatatuiColor::DarkGray);
+    }
+    let age = (now - fetched_at).max(0);
+    let color = if age > 6 * 3600 {
+        RatatuiColor::Red
+    } else if age > 3600 {
+        RatatuiColor::Yellow
+    } else {
+        RatatuiColor::DarkGray
+    };
+    let ago = format_duration_until(now, fetched_at);
+    let text = if ago == "now" {
+        "just now".to_string()
+    } else {
+        format!("{ago} ago")
+    };
+    (text, color)
+}
+
+/// Builds one gauge line: `5h    ▰▰▱▱▱  34%  ↻ 2h11m`.
+///
+/// The label column is padded to `label_w` so the bars line up down the card.
+/// The reset marker is fitted to what is left: full (`↻ 2h11m`), then bare
+/// (`2h11m`), then dropped — a narrow card loses the marker rather than having
+/// its duration truncated into a smaller, plausible one.
+fn gauge_line(
+    label: &str,
+    label_w: usize,
+    pct: f64,
+    reset: Option<i64>,
+    now: i64,
+    inner_w: u16,
+) -> Line<'static> {
+    let color = gauge_color(pct);
+    let mut spans = vec![
+        Span::styled(
+            format!("{label:<label_w$} "),
+            Style::default().fg(RatatuiColor::Gray),
+        ),
+        Span::styled(mini_bar(pct), Style::default().fg(color)),
+        Span::styled(format!(" {pct:>3.0}%"), Style::default().fg(color)),
+    ];
+    if let Some(reset) = reset {
+        let text = format_duration_until(reset, now);
+        // label + separator + bar + " nnn%".
+        let used = label_w + 1 + 5 + 5;
+        let room = usize::from(inner_w).saturating_sub(used);
+        let width = text.chars().count();
+        let marker = if room >= width + 4 {
+            Some(format!("  ↻ {text}"))
+        } else if room > width {
+            Some(format!(" {text}"))
+        } else {
+            None
+        };
+        if let Some(marker) = marker {
+            spans.push(Span::styled(
+                marker,
+                Style::default().fg(RatatuiColor::DarkGray),
+            ));
+        }
+    }
+    Line::from(spans)
+}
+
+/// Like [`gauge_line`] but labels the bar with a caller-supplied value (e.g.
+/// `1080/1500`) instead of a percentage, and carries no reset marker. `pct`
+/// still drives the bar fill and its traffic-light color.
+///
+/// The bar is dropped when the value would not otherwise fit: a used/total pair
+/// already says what the bar says, whereas a truncated `$1.24K/$5.` reads as a
+/// smaller, plausible number that contradicts the bar beside it.
+fn gauge_line_value(
+    label: &str,
+    label_w: usize,
+    pct: f64,
+    value: &str,
+    inner_w: u16,
+) -> Line<'static> {
+    let color = gauge_color(pct);
+    let mut spans = vec![Span::styled(
+        format!("{label:<label_w$} "),
+        Style::default().fg(RatatuiColor::Gray),
+    )];
+    if label_w + 1 + 5 + 1 + value.chars().count() <= usize::from(inner_w) {
+        spans.push(Span::styled(mini_bar(pct), Style::default().fg(color)));
+        spans.push(Span::styled(
+            format!(" {value}"),
+            Style::default().fg(color),
+        ));
+    } else {
+        spans.push(Span::styled(value.to_string(), Style::default().fg(color)));
+    }
+    Line::from(spans)
+}
+
+/// Joins detail `parts` with ` · `, keeping as many as fit `inner_w`.
+///
+/// A part that does not fit is counted in a trailing `+N`, so a card never
+/// implies it is showing everything it has. Returns `None` when there is
+/// nothing to say.
+fn detail_line(parts: &[String], inner_w: u16) -> Option<Line<'static>> {
+    if parts.is_empty() {
+        return None;
+    }
+    let inner = usize::from(inner_w);
+    let mut kept = 0usize;
+    let mut text = String::new();
+    for part in parts {
+        let candidate = if kept == 0 {
+            part.clone()
+        } else {
+            format!("{text} · {part}")
+        };
+        // Reserve room for the "+N" marker the remaining parts would need.
+        let remaining = parts.len() - kept - 1;
+        let reserve = if remaining > 0 { 4 } else { 0 };
+        if candidate.chars().count() + reserve > inner {
+            break;
+        }
+        text = candidate;
+        kept += 1;
+    }
+    if kept == 0 {
+        // Not even the first part fits; show its head rather than nothing.
+        text = parts[0].chars().take(inner.saturating_sub(1)).collect();
+        kept = 1;
+    }
+    let hidden = parts.len() - kept;
+    if hidden > 0 {
+        text.push_str(&format!(" +{hidden}"));
+    }
+    Some(Line::from(Span::styled(
+        text,
+        Style::default().fg(RatatuiColor::DarkGray),
+    )))
+}
+
+/// Width of the label column in a card, wide enough for its longest label.
+fn label_width(labels: &[&str]) -> usize {
+    labels
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(5)
+        .max(5)
+}
+
+/// Builds the Claude card: plan, 5h / 7d / per-model gauges, then balance.
+fn claude_card(claude: &ClaudeQuotaSnapshot, now: i64, width: u16) -> QuotaCard {
+    let inner = card_inner_w(width);
+    let scoped = claude
+        .scoped_label
+        .as_deref()
+        .filter(|_| claude.scoped_weekly.is_some());
+    let label_w = label_width(&["5h", "7d", scoped.unwrap_or("")]);
 
     let mut lines: Vec<Line> = Vec::new();
     if let Some(plan) = &claude.plan_type {
-        lines.push(plan_line(plan));
+        lines.push(plan_line(plan, claude.fetched_at, now, inner));
     }
     // Track windows separately so a lone Plan line does not count as "has data".
     let mut has_data = false;
     if let Some(w) = &claude.five_hour {
-        lines.push(quota_gauge_line("5h", w, now));
+        lines.push(gauge_line(
+            "5h",
+            label_w,
+            w.used_percent,
+            w.resets_at_unix,
+            now,
+            inner,
+        ));
         has_data = true;
     }
     if let Some(w) = &claude.seven_day {
-        lines.push(quota_gauge_line("7d", w, now));
+        lines.push(gauge_line(
+            "7d",
+            label_w,
+            w.used_percent,
+            w.resets_at_unix,
+            now,
+            inner,
+        ));
         has_data = true;
     }
     // The per-model weekly cap (Fable today) is volatile on Anthropic's side, so
     // it is only drawn when both the window and its model label are present.
-    if let (Some(w), Some(label)) = (&claude.scoped_weekly, &claude.scoped_label) {
-        lines.push(quota_gauge_line(label, w, now));
+    if let (Some(w), Some(label)) = (&claude.scoped_weekly, scoped) {
+        lines.push(gauge_line(
+            label,
+            label_w,
+            w.used_percent,
+            w.resets_at_unix,
+            now,
+            inner,
+        ));
         has_data = true;
     }
-    if has_data {
-        lines.push(claude_balance_line(claude));
-        lines.push(staleness_line(claude.fetched_at, now));
+    if has_data && let Some(line) = detail_line(&claude_balance_parts(claude), inner) {
+        lines.push(line);
     }
     if claude.needs_login {
         lines.push(login_hint_line(CLAUDE_LOGIN_HINT));
@@ -1518,18 +1774,22 @@ fn render_claude_quota(f: &mut Frame, area: Rect, claude: &ClaudeQuotaSnapshot, 
         lines.push(dim_line("no rate-limit data"));
     }
 
-    f.render_widget(Paragraph::new(lines).block(block), area);
+    QuotaCard {
+        title: "Claude",
+        color: CLAUDE_COLOR,
+        limit_reached: claude.limit_reached,
+        lines,
+    }
 }
 
-/// Renders the Codex quota panel (plan, 5h / 7d gauges, credits, extras,
-/// staleness).
-fn render_codex_quota(f: &mut Frame, area: Rect, codex: &CodexQuotaSnapshot, now: i64) {
+/// Builds the Codex card: plan, 5h / 7d gauges, credits, then reset extras.
+fn codex_card(codex: &CodexQuotaSnapshot, now: i64, width: u16) -> QuotaCard {
+    let inner = card_inner_w(width);
+    let label_w = label_width(&["5h", "7d"]);
     let title = match codex.source {
-        QuotaSource::Api => " Codex ",
-        QuotaSource::SessionFallback => " Codex (session) ",
-        QuotaSource::None => " Codex ",
+        QuotaSource::SessionFallback => "Codex (session)",
+        QuotaSource::Api | QuotaSource::None => "Codex",
     };
-    let block = quota_block(title, CODEX_COLOR, codex.limit_reached == Some(true));
 
     let lines: Vec<Line> = if codex.source == QuotaSource::None {
         let mut v = vec![dim_line("no Codex quota")];
@@ -1540,144 +1800,201 @@ fn render_codex_quota(f: &mut Frame, area: Rect, codex: &CodexQuotaSnapshot, now
         }
         v
     } else {
-        let mut v = vec![plan_line(codex.plan_type.as_deref().unwrap_or("?"))];
-
+        let mut v = vec![plan_line(
+            codex.plan_type.as_deref().unwrap_or("?"),
+            codex.fetched_at,
+            now,
+            inner,
+        )];
         if let Some(w) = &codex.primary {
-            v.push(quota_gauge_line("5h", w, now));
+            v.push(gauge_line(
+                "5h",
+                label_w,
+                w.used_percent,
+                w.resets_at_unix,
+                now,
+                inner,
+            ));
         }
         if let Some(w) = &codex.secondary {
-            v.push(quota_gauge_line("7d", w, now));
+            v.push(gauge_line(
+                "7d",
+                label_w,
+                w.used_percent,
+                w.resets_at_unix,
+                now,
+                inner,
+            ));
         }
-        // Keep session-fallback data visible but flag the re-login (S3).
+        // Keep session-fallback data visible but flag the re-login.
         if codex.needs_login {
             v.push(login_hint_line(CODEX_LOGIN_HINT));
         } else {
-            v.push(credits_line(codex));
-            if let Some(extra) = codex_extras_line(codex, now) {
-                v.push(extra);
+            if let Some(line) = detail_line(&codex_credit_parts(codex), inner) {
+                v.push(line);
+            }
+            if let Some(line) = detail_line(&codex_extra_parts(codex, now), inner) {
+                v.push(line);
             }
         }
-        v.push(staleness_line(codex.fetched_at, now));
         v
     };
 
-    f.render_widget(Paragraph::new(lines).block(block), area);
+    QuotaCard {
+        title,
+        color: CODEX_COLOR,
+        limit_reached: codex.limit_reached == Some(true),
+        lines,
+    }
 }
 
-/// Renders the Copilot quota panel (plan, premium percent gauge, premium
-/// request-count gauge, staleness + login hint).
-fn render_copilot_quota(f: &mut Frame, area: Rect, copilot: &CopilotQuotaSnapshot, now: i64) {
-    let block = quota_block(" Copilot ", COPILOT_COLOR, copilot.limit_reached);
+/// Builds the Copilot card: plan, premium percent gauge, request-count gauge.
+fn copilot_card(copilot: &CopilotQuotaSnapshot, now: i64, width: u16) -> QuotaCard {
+    let inner = card_inner_w(width);
+    let label_w = label_width(&["prem", "reqs"]);
 
     let mut lines: Vec<Line> = Vec::new();
     if let Some(plan) = &copilot.plan_type {
-        lines.push(plan_line(plan));
+        lines.push(plan_line(plan, copilot.fetched_at, now, inner));
     }
     if let Some(w) = &copilot.premium {
-        lines.push(quota_gauge_line("prem", w, now));
+        lines.push(gauge_line(
+            "prem",
+            label_w,
+            w.used_percent,
+            w.resets_at_unix,
+            now,
+            inner,
+        ));
         // A second gauge showing the premium requests as used/total counts.
         if let (Some(rem), Some(total)) = (copilot.premium_remaining, copilot.premium_entitlement)
             && total > 0
         {
             let used = (total - rem).max(0);
             let pct = (used as f64 / total as f64) * 100.0;
-            lines.push(quota_gauge_line_value(
+            lines.push(gauge_line_value(
                 "reqs",
+                label_w,
                 pct,
                 &format!("{used}/{total}"),
+                inner,
             ));
         }
     } else if copilot.premium_unlimited {
         lines.push(dim_line("premium: unlimited"));
     }
     let has_content = !lines.is_empty();
-    if has_content {
-        lines.push(staleness_line(copilot.fetched_at, now));
-    }
     if copilot.needs_login {
         lines.push(login_hint_line(COPILOT_LOGIN_HINT));
     } else if !has_content {
         lines.push(dim_line("no Copilot quota"));
     }
 
-    f.render_widget(Paragraph::new(lines).block(block), area);
+    QuotaCard {
+        title: "Copilot",
+        color: COPILOT_COLOR,
+        limit_reached: copilot.limit_reached,
+        lines,
+    }
 }
 
-/// Renders the Cursor quota panel (plan, total / auto / api gauges, optional
-/// on-demand spend, staleness + login hint).
-fn render_cursor_quota(f: &mut Frame, area: Rect, cursor: &CursorQuotaSnapshot, now: i64) {
-    let block = quota_block(" Cursor ", CURSOR_COLOR, cursor.limit_reached);
+/// Builds the Cursor card: plan, total / auto / api gauges, on-demand spend.
+fn cursor_card(cursor: &CursorQuotaSnapshot, now: i64, width: u16) -> QuotaCard {
+    let inner = card_inner_w(width);
+    let label_w = label_width(&["total", "auto", "api"]);
 
     let mut lines: Vec<Line> = Vec::new();
     if let Some(plan) = &cursor.plan_type {
-        lines.push(plan_line(plan));
+        lines.push(plan_line(plan, cursor.fetched_at, now, inner));
     }
-    if let Some(w) = &cursor.total {
-        lines.push(quota_gauge_line("total", w, now));
+    for (label, window) in [
+        ("total", &cursor.total),
+        ("auto", &cursor.auto),
+        ("api", &cursor.api),
+    ] {
+        if let Some(w) = window {
+            lines.push(gauge_line(
+                label,
+                label_w,
+                w.used_percent,
+                w.resets_at_unix,
+                now,
+                inner,
+            ));
+        }
     }
-    if let Some(w) = &cursor.auto {
-        lines.push(quota_gauge_line("auto", w, now));
-    }
-    if let Some(w) = &cursor.api {
-        lines.push(quota_gauge_line("api", w, now));
-    }
-    if let Some(d) = cursor.on_demand_dollars {
-        lines.push(dim_line(&format!("on-demand: ${d:.2}")));
+    if let Some(d) = cursor.on_demand_dollars
+        && let Some(line) = detail_line(&[format!("on-demand ${d:.2}")], inner)
+    {
+        lines.push(line);
     }
     let has_content = !lines.is_empty();
-    if has_content {
-        lines.push(staleness_line(cursor.fetched_at, now));
-    }
     if cursor.needs_login {
         lines.push(login_hint_line(CURSOR_LOGIN_HINT));
     } else if !has_content {
         lines.push(dim_line("no Cursor quota"));
     }
 
-    f.render_widget(Paragraph::new(lines).block(block), area);
+    QuotaCard {
+        title: "Cursor",
+        color: CURSOR_COLOR,
+        limit_reached: cursor.limit_reached,
+        lines,
+    }
 }
 
-/// Renders the Grok quota panel (plan, included-allowance gauge, optional
-/// on-demand and prepaid lines, staleness + login hint).
-fn render_grok_quota(f: &mut Frame, area: Rect, grok: &GrokQuotaSnapshot, now: i64) {
-    let block = quota_block(" Grok ", GROK_COLOR, grok.limit_reached);
+/// Builds the Grok card: plan, included-allowance gauge, on-demand and prepaid.
+fn grok_card(grok: &GrokQuotaSnapshot, now: i64, width: u16) -> QuotaCard {
+    let inner = card_inner_w(width);
+    // The label names the period the allowance runs on, which the API reports
+    // per account; an unlabelled window falls back to "incl".
+    let period = grok.period_label.as_deref().unwrap_or("incl");
+    let label_w = label_width(&[period, "ondmd"]);
 
     let mut lines: Vec<Line> = Vec::new();
     if let Some(plan) = &grok.plan_type {
-        lines.push(plan_line(plan));
+        lines.push(plan_line(plan, grok.fetched_at, now, inner));
     }
     // Track the gauge separately so a lone Plan line does not count as data.
     let mut has_data = false;
     if let Some(w) = &grok.included {
-        // The label names the period the allowance runs on, which the API
-        // reports per account; an unlabelled window falls back to "incl".
-        let label = grok.period_label.as_deref().unwrap_or("incl");
-        lines.push(quota_gauge_line(label, w, now));
+        lines.push(gauge_line(
+            period,
+            label_w,
+            w.used_percent,
+            w.resets_at_unix,
+            now,
+            inner,
+        ));
         has_data = true;
     }
     match (grok.on_demand_dollars, grok.on_demand_cap_dollars) {
         // With a cap configured the spend reads as its own gauge. Both amounts
         // are compacted (`$1.2K`) so a four-figure cap cannot outgrow the
-        // narrowest panel and get truncated into a smaller, plausible number.
-        (Some(used), Some(cap)) if cap > 0.0 => lines.push(quota_gauge_line_value(
+        // narrowest card and get truncated into a smaller, plausible number.
+        (Some(used), Some(cap)) if cap > 0.0 => lines.push(gauge_line_value(
             "ondmd",
+            label_w,
             (used / cap * 100.0).clamp(0.0, 100.0),
             &format!("{}/{}", format_cost_compact(used), format_cost_compact(cap)),
+            inner,
         )),
-        (Some(used), _) => lines.push(dim_line(&format!(
-            "on-demand: {}",
-            format_cost_compact(used)
-        ))),
+        (Some(used), _) => {
+            if let Some(line) =
+                detail_line(&[format!("on-demand {}", format_cost_compact(used))], inner)
+            {
+                lines.push(line);
+            }
+        }
         _ => {}
     }
-    if let Some(balance) = grok.prepaid_balance_dollars {
-        lines.push(dim_line(&format!(
-            "Balance: {}",
-            format_cost_compact(balance)
-        )));
-    }
-    if has_data {
-        lines.push(staleness_line(grok.fetched_at, now));
+    if let Some(balance) = grok.prepaid_balance_dollars
+        && let Some(line) = detail_line(
+            &[format!("balance {}", format_cost_compact(balance))],
+            inner,
+        )
+    {
+        lines.push(line);
     }
     if grok.needs_login {
         lines.push(login_hint_line(GROK_LOGIN_HINT));
@@ -1685,39 +2002,37 @@ fn render_grok_quota(f: &mut Frame, area: Rect, grok: &GrokQuotaSnapshot, now: i
         lines.push(dim_line("no Grok quota"));
     }
 
-    f.render_widget(Paragraph::new(lines).block(block), area);
-}
-
-/// Builds the `Plan: <tier>` line shared by both panels.
-fn plan_line(plan: &str) -> Line<'static> {
-    Line::from(Span::styled(
-        format!("Plan: {plan}"),
-        Style::default().fg(RatatuiColor::Gray),
-    ))
-}
-
-/// Builds the credits line for the Codex panel.
-fn credits_line(codex: &CodexQuotaSnapshot) -> Line<'static> {
-    let mut s = String::from("Credits: ");
-    if codex.unlimited == Some(true) {
-        s.push_str("unlimited");
-    } else if let Some(bal) = &codex.credits_balance {
-        s.push_str(bal);
-    } else {
-        s.push('-');
+    QuotaCard {
+        title: "Grok",
+        color: GROK_COLOR,
+        limit_reached: grok.limit_reached,
+        lines,
     }
+}
+
+/// The credit parts of the Codex card.
+fn codex_credit_parts(codex: &CodexQuotaSnapshot) -> Vec<String> {
+    let balance = if codex.unlimited == Some(true) {
+        "credits unlimited".to_string()
+    } else if let Some(bal) = &codex.credits_balance {
+        format!("credits {bal}")
+    } else {
+        "credits -".to_string()
+    };
+    let mut parts = vec![balance];
     if let Some(n) = codex.reset_credits_available
         && n > 0
     {
-        s.push_str(&format!("  +{n} reset"));
+        parts.push(format!("+{n} reset"));
     }
-    Line::from(Span::styled(s, Style::default().fg(RatatuiColor::Gray)))
+    parts
 }
 
-/// Builds the optional Codex extras line (`reset expires X  ·  ~L-H msgs  ·
-/// cap $X`). Reset-credit details lead the line so the expiry stays visible in
-/// a narrow panel even when message and spend metadata are also present.
-fn codex_extras_line(codex: &CodexQuotaSnapshot, now: i64) -> Option<Line<'static>> {
+/// The Codex extras (`reset expires X`, `~L-H msgs`, `cap $X`).
+///
+/// Reset-credit details lead so the expiry stays visible in a narrow card even
+/// when message and spend metadata are also present.
+fn codex_extra_parts(codex: &CodexQuotaSnapshot, now: i64) -> Vec<String> {
     let mut parts: Vec<String> = Vec::new();
     if codex.reset_credits_available.is_some_and(|count| count > 0)
         && let Some(expirations) = &codex.reset_credit_expirations
@@ -1750,26 +2065,19 @@ fn codex_extras_line(codex: &CodexQuotaSnapshot, now: i64) -> Option<Line<'stati
         };
         parts.push(format!("cap {cap_str}"));
     }
-    if parts.is_empty() {
-        return None;
-    }
-    Some(Line::from(Span::styled(
-        parts.join("  ·  "),
-        Style::default().fg(RatatuiColor::DarkGray),
-    )))
+    parts
 }
 
-/// Builds the balance line for the Claude panel (mirrors Codex's credits line).
-fn claude_balance_line(claude: &ClaudeQuotaSnapshot) -> Line<'static> {
-    let mut s = String::from("Balance: ");
-    match &claude.balance {
-        Some(b) => s.push_str(b),
-        None => s.push('-'),
-    }
+/// The balance parts of the Claude card (mirrors Codex's credit parts).
+fn claude_balance_parts(claude: &ClaudeQuotaSnapshot) -> Vec<String> {
+    let mut parts = vec![match &claude.balance {
+        Some(b) => format!("bal {b}"),
+        None => "bal -".to_string(),
+    }];
     if let Some(used) = &claude.spend_used {
-        s.push_str(&format!("    {used} used"));
+        parts.push(format!("{used} used"));
     }
-    Line::from(Span::styled(s, Style::default().fg(RatatuiColor::Gray)))
+    parts
 }
 
 #[cfg(test)]
@@ -1854,10 +2162,9 @@ mod tests {
             ..Default::default()
         };
 
-        let line = codex_extras_line(&codex, now).unwrap();
         assert_eq!(
-            line_text(line),
-            "reset expires 2h13m  ·  ~120-150 msgs  ·  cap $50"
+            codex_extra_parts(&codex, now),
+            ["reset expires 2h13m", "~120-150 msgs", "cap $50"]
         );
     }
 
@@ -1869,9 +2176,7 @@ mod tests {
             ..Default::default()
         };
 
-        let line = codex_extras_line(&codex, 1_000).unwrap();
-        assert_eq!(line_text(line), "reset never expires");
-        assert!("reset never expires".chars().count() <= usize::from(PANEL_MIN_W - 2));
+        assert_eq!(codex_extra_parts(&codex, 1_000), ["reset never expires"]);
     }
 
     #[test]
@@ -1882,8 +2187,7 @@ mod tests {
             ..Default::default()
         };
 
-        let line = codex_extras_line(&codex, 1_000).unwrap();
-        assert_eq!(line_text(line), "~120-150 msgs");
+        assert_eq!(codex_extra_parts(&codex, 1_000), ["~120-150 msgs"]);
     }
 
     #[test]
@@ -1894,7 +2198,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(codex_extras_line(&codex, 1_000).is_none());
+        assert!(codex_extra_parts(&codex, 1_000).is_empty());
     }
 
     #[test]
@@ -1917,38 +2221,23 @@ mod tests {
             reset_credit_expirations: Some(vec![Some(now + 2 * 3_600 + 13 * 60)]),
             ..Default::default()
         };
-        let mut terminal =
-            Terminal::new(TestBackend::new(PANEL_MIN_W, QUOTA_PANEL_MIN_HEIGHT)).unwrap();
+        let rendered = render_min_card(&codex_card(&codex, now, CARD_MIN_W));
 
-        terminal
-            .draw(|frame| render_codex_quota(frame, frame.area(), &codex, now))
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        let rendered = (0..QUOTA_PANEL_MIN_HEIGHT)
-            .map(|y| {
-                (0..PANEL_MIN_W)
-                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(rendered.contains("reset expires 2h13m"));
-        assert!(rendered.contains("updated just now"));
+        assert!(rendered.contains("reset expires 2h13m"), "got:\n{rendered}");
+        assert!(rendered.contains("just now"), "got:\n{rendered}");
     }
 
-    /// Renders a panel into the smallest cell the band ever hands out and
-    /// returns its text, so a test can assert what survives the clip.
-    fn render_min_panel(draw: impl FnOnce(&mut Frame, Rect)) -> String {
-        let mut terminal =
-            Terminal::new(TestBackend::new(PANEL_MIN_W, QUOTA_PANEL_MIN_HEIGHT)).unwrap();
+    /// Renders a card into the smallest cell the grid ever hands out and returns
+    /// its text, so a test can assert what survives that width.
+    fn render_min_card(card: &QuotaCard) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(CARD_MIN_W, CARD_H)).unwrap();
         terminal
-            .draw(|frame| draw(frame, frame.area()))
-            .expect("panel renders");
+            .draw(|frame| render_quota_card(frame, frame.area(), card))
+            .expect("card renders");
         let buffer = terminal.backend().buffer();
-        (0..QUOTA_PANEL_MIN_HEIGHT)
+        (0..CARD_H)
             .map(|y| {
-                (0..PANEL_MIN_W)
+                (0..CARD_MIN_W)
                     .map(|x| buffer.cell((x, y)).unwrap().symbol())
                     .collect::<String>()
             })
@@ -1976,14 +2265,14 @@ mod tests {
             prepaid_balance_dollars: Some(2.50),
             ..Default::default()
         };
-        let rendered = render_min_panel(|frame, area| render_grok_quota(frame, area, &grok, now));
+        let rendered = render_min_card(&grok_card(&grok, now, CARD_MIN_W));
 
-        assert!(rendered.contains("Plan: SuperGrok"));
+        assert!(rendered.contains("SuperGrok"), "got:\n{rendered}");
         assert!(rendered.contains("week"));
         assert!(rendered.contains("42%"));
-        assert!(rendered.contains("$18.40/$50.00"));
-        assert!(rendered.contains("Balance: $2.50"));
-        assert!(rendered.contains("updated just now"));
+        assert!(rendered.contains("$18.40/$50.00"), "got:\n{rendered}");
+        assert!(rendered.contains("balance $2.50"), "got:\n{rendered}");
+        assert!(rendered.contains("just now"), "got:\n{rendered}");
     }
 
     /// A four-figure cap must stay readable in the narrowest cell. Printing it
@@ -1999,10 +2288,9 @@ mod tests {
             prepaid_balance_dollars: Some(12345.0),
             ..Default::default()
         };
-        let rendered = render_min_panel(|frame, area| render_grok_quota(frame, area, &grok, 0));
-        // Exactly the 13 columns the gauge leaves in the narrowest cell.
+        let rendered = render_min_card(&grok_card(&grok, 0, CARD_MIN_W));
         assert!(rendered.contains("$1.24K/$5.00K"), "got:\n{rendered}");
-        assert!(rendered.contains("Balance: $12.3K"), "got:\n{rendered}");
+        assert!(rendered.contains("balance $12.3K"), "got:\n{rendered}");
     }
 
     /// The common free account: no money lines at all, and an unlabelled period
@@ -2019,159 +2307,202 @@ mod tests {
             }),
             ..Default::default()
         };
-        let rendered = render_min_panel(|frame, area| render_grok_quota(frame, area, &grok, now));
+        let rendered = render_min_card(&grok_card(&grok, now, CARD_MIN_W));
 
         assert!(rendered.contains("incl"));
         assert!(!rendered.contains("on-demand"));
-        assert!(!rendered.contains("Balance"));
-        assert!(!rendered.contains("Plan:"));
+        assert!(!rendered.contains("balance"));
     }
 
     /// With no data at all the panel says so, and a rejected token adds the
     /// login hint rather than an empty box.
     #[test]
     fn grok_panel_reports_missing_data_and_a_needed_login() {
-        let rendered =
-            render_min_panel(|frame, area| render_grok_quota(frame, area, &Default::default(), 0));
+        let rendered = render_min_card(&grok_card(&Default::default(), 0, CARD_MIN_W));
         assert!(rendered.contains("no Grok quota"));
 
         let grok = GrokQuotaSnapshot {
             needs_login: true,
             ..Default::default()
         };
-        let rendered = render_min_panel(|frame, area| render_grok_quota(frame, area, &grok, 0));
+        let rendered = render_min_card(&grok_card(&grok, 0, CARD_MIN_W));
         assert!(rendered.contains(GROK_LOGIN_HINT));
         assert!(!rendered.contains("no Grok quota"));
     }
 
     #[test]
-    fn arrange_wide_keeps_table_in_one_row() {
-        // Plenty of width for the table + 4 panels.
-        match arrange_band(BAND_TABLE_MIN_W + PANEL_MIN_W * 4, 40, 4) {
-            BandArrange::SingleRow { table } => assert!(table),
-            _ => panic!("expected single row with table"),
+    fn grid_packs_by_width_and_wraps_the_remainder() {
+        // One rule for every count: as many cards per row as the width allows.
+        assert_eq!(quota_grid(CARD_MIN_W * 5, 5), (5, 1));
+        assert_eq!(quota_grid(120, 5), (5, 1));
+        assert_eq!(quota_grid(100, 5), (4, 2));
+        assert_eq!(quota_grid(80, 5), (3, 2));
+        // Never more columns than there are cards.
+        assert_eq!(quota_grid(400, 2), (2, 1));
+        // A terminal too narrow for even one card still gets a single column
+        // rather than a division by zero.
+        assert_eq!(quota_grid(10, 3), (1, 3));
+        assert_eq!(quota_grid(120, 0), (0, 0));
+    }
+
+    #[test]
+    fn grid_absorbs_a_new_provider_without_a_new_case() {
+        // The count only ever enters as a list length, so a sixth provider is
+        // placed by the same expression as the first.
+        for n in 1..=8 {
+            let (cols, rows) = quota_grid(120, n);
+            assert!(cols >= 1 && cols <= n);
+            assert!(cols * rows >= n);
+            assert_eq!(grid_height(120, n), rows as u16 * CARD_H);
         }
     }
 
     #[test]
-    fn arrange_medium_drops_table_but_stays_one_row() {
-        // Enough for 4 panels but not the table alongside them.
-        match arrange_band(PANEL_MIN_W * 4, 40, 4) {
-            BandArrange::SingleRow { table } => assert!(!table),
-            _ => panic!("expected single row without table"),
-        }
-    }
-
-    #[test]
-    fn arrange_narrow_tall_wraps_to_two_rows() {
-        match arrange_band(80, PANELS_2ROW_MIN_H, 4) {
-            BandArrange::TwoRow { top, table_in_hole } => {
-                assert_eq!(top, 2);
-                assert!(!table_in_hole, "even count fills both rows");
-            }
-            _ => panic!("expected two-row grid"),
-        }
-    }
-
-    #[test]
-    fn arrange_three_panels_fills_hole_with_table() {
-        match arrange_band(80, PANELS_2ROW_MIN_H, 3) {
-            BandArrange::TwoRow { top, table_in_hole } => {
-                assert_eq!(top, 2);
-                assert!(table_in_hole, "odd count leaves a hole for the table");
-            }
-            _ => panic!("expected two-row grid"),
-        }
-    }
-
-    #[test]
-    fn arrange_narrow_short_falls_back_to_single_row() {
-        // Too narrow for one row and too short for two: last-resort even split.
-        match arrange_band(80, PANELS_2ROW_MIN_H - 1, 4) {
-            BandArrange::SingleRow { table } => assert!(!table),
-            _ => panic!("expected single-row fallback"),
-        }
-    }
-
-    #[test]
-    fn arrange_zero_panels_is_table_only() {
-        match arrange_band(100, 40, 0) {
-            BandArrange::SingleRow { table } => assert!(table),
-            _ => panic!("expected table-only row"),
-        }
-    }
-
-    #[test]
-    fn band_height_preserves_all_provider_rows() {
-        let arrange = BandArrange::SingleRow { table: true };
-
-        assert_eq!(visible_band_height(22, true, &arrange, 8), Some(12));
-        assert_eq!(visible_band_height(22, true, &arrange, 11), None);
-        assert_eq!(visible_band_height(23, true, &arrange, 11), Some(15));
-    }
-
-    #[test]
-    fn disabled_band_stays_hidden() {
-        let arrange = BandArrange::SingleRow { table: true };
-        assert_eq!(visible_band_height(40, false, &arrange, 9), None);
-    }
-
-    #[test]
-    fn split_band_always_yields_exactly_n_panels() {
-        let area = Rect::new(0, 0, 200, 16);
+    fn grid_cells_always_yield_exactly_n_addressable_cards() {
+        // The render dispatch walks these cells in present-provider order, so a
+        // short or zero-width cell list would drop (or mis-place) a provider.
         for n in 0..=MAX_QUOTA_PANELS {
-            let arrange = arrange_band(area.width, area.height, n);
-            let grid = split_band(area, &arrange, n);
-            assert_eq!(grid.panels.len(), n, "n={n}");
-        }
-    }
-
-    /// The full five-provider band: one row only on a very wide terminal,
-    /// otherwise a 3+2 grid whose trailing hole takes the Provider Usage table.
-    #[test]
-    fn arrange_five_panels_wraps_to_a_three_plus_two_grid() {
-        let all = MAX_QUOTA_PANELS;
-        match arrange_band(BAND_TABLE_MIN_W + PANEL_MIN_W * all as u16, 40, all) {
-            BandArrange::SingleRow { table } => assert!(table),
-            _ => panic!("a wide terminal keeps table + five panels in one row"),
-        }
-        match arrange_band(PANEL_MIN_W * all as u16, 40, all) {
-            BandArrange::SingleRow { table } => assert!(!table),
-            _ => panic!("five panels alone still fit one row"),
-        }
-        match arrange_band(100, PANELS_2ROW_MIN_H, all) {
-            BandArrange::TwoRow { top, table_in_hole } => {
-                assert_eq!(top, 3, "the odd panel rides on the top row");
-                assert!(table_in_hole, "the trailing hole takes the table");
+            for width in [80u16, 100, 120, 160, 200] {
+                let band = Rect::new(0, 0, width, grid_height(width, n));
+                let cells = grid_cells(band, n);
+                assert_eq!(cells.len(), n, "n={n} width={width}");
+                assert!(
+                    cells.iter().all(|c| c.width > 0 && c.height == CARD_H),
+                    "n={n} width={width}"
+                );
+                assert!(
+                    cells.iter().all(|c| c.x + c.width <= width),
+                    "no cell may overflow the band: n={n} width={width}"
+                );
             }
-            _ => panic!("expected a two-row grid"),
         }
     }
 
     #[test]
-    fn split_band_five_panels_keeps_every_cell_addressable() {
-        // The render dispatch indexes `panels` by present-provider order, so a
-        // two-row split must still hand back exactly five cells plus the table.
-        let area = Rect::new(0, 0, 100, QUOTA_PANEL_MIN_HEIGHT * 2);
-        let arrange = arrange_band(area.width, PANELS_2ROW_MIN_H, MAX_QUOTA_PANELS);
-        let grid = split_band(area, &arrange, MAX_QUOTA_PANELS);
-        assert_eq!(grid.panels.len(), MAX_QUOTA_PANELS);
-        assert!(grid.table.is_some());
-        assert!(
-            grid.panels.iter().all(|cell| cell.width > 0),
-            "no panel may collapse to nothing"
+    fn grid_cards_never_shrink_below_the_readable_minimum() {
+        // The old band emitted constraints that over-committed the row and let
+        // the solver squeeze panels to 16 columns; the grid picks a column count
+        // the width can actually hold.
+        for width in [74u16, 80, 96, 100, 120, 160, 200] {
+            let band = Rect::new(0, 0, width, grid_height(width, MAX_QUOTA_PANELS));
+            for cell in grid_cells(band, MAX_QUOTA_PANELS) {
+                assert!(
+                    cell.width >= CARD_MIN_W || width < CARD_MIN_W,
+                    "width={width} gave a {}-column card",
+                    cell.width
+                );
+                assert!(cell.width <= CARD_MAX_W);
+            }
+        }
+    }
+
+    #[test]
+    fn grid_folds_rather_than_starving_the_model_table() {
+        let n = MAX_QUOTA_PANELS;
+        // Tall enough: the grid is drawn and the table keeps its floor.
+        let tall = Rect::new(0, 0, 120, 40);
+        assert_eq!(visible_grid_height(tall, true, n), CARD_H);
+        // Short and narrow enough to need two card rows: folding wins.
+        let short = Rect::new(0, 0, 80, 24);
+        assert_eq!(visible_grid_height(short, true, n), 0);
+        // The exact boundary: the table must keep TABLE_MIN_BODY_H body rows.
+        let grid = grid_height(120, n);
+        let floor = grid + FOOTER_H + TABLE_MIN_BODY_H + 4;
+        assert_eq!(
+            visible_grid_height(Rect::new(0, 0, 120, floor - 1), true, n),
+            0
+        );
+        assert_eq!(
+            visible_grid_height(Rect::new(0, 0, 120, floor), true, n),
+            grid
         );
     }
 
     #[test]
-    fn split_band_two_row_three_panels_has_table_in_hole() {
-        let area = Rect::new(0, 0, 80, 16);
-        let arrange = BandArrange::TwoRow {
-            top: 2,
-            table_in_hole: true,
+    fn disabled_band_stays_hidden() {
+        // An empty `usage.quota.panels` drops the whole quota surface.
+        assert_eq!(visible_grid_height(Rect::new(0, 0, 200, 60), false, 5), 0);
+        // ...and so does having no provider with credentials.
+        assert_eq!(visible_grid_height(Rect::new(0, 0, 200, 60), true, 0), 0);
+    }
+
+    #[test]
+    fn card_counts_the_lines_it_could_not_show() {
+        // Six lines into five content rows: the card flags the remainder in its
+        // title instead of quietly ending at the border.
+        let card = QuotaCard {
+            title: "Test",
+            color: RatatuiColor::Gray,
+            limit_reached: false,
+            lines: (0..6).map(|i| dim_line(&format!("line{i}"))).collect(),
         };
-        let grid = split_band(area, &arrange, 3);
-        assert_eq!(grid.panels.len(), 3);
-        assert!(grid.table.is_some(), "the hole is filled with the table");
+        let rendered = render_min_card(&card);
+        assert!(rendered.contains("+1"), "got:\n{rendered}");
+        assert!(rendered.contains("line4"), "got:\n{rendered}");
+        assert!(!rendered.contains("line5"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn gauge_line_drops_the_reset_marker_before_truncating_its_duration() {
+        let inner = card_inner_w(CARD_MIN_W);
+        // A month-long cycle is the longest duration the API produces.
+        let text = line_text(gauge_line("total", 5, 41.0, Some(30 * 86_400), 0, inner));
+        assert!(text.chars().count() <= usize::from(inner), "got {text:?}");
+        assert!(
+            text.contains("30d0h"),
+            "the duration itself is never cut: {text:?}"
+        );
+        // With room the marker comes back.
+        let wide = line_text(gauge_line("total", 5, 41.0, Some(30 * 86_400), 0, 40));
+        assert!(wide.contains("↻ 30d0h"), "got {wide:?}");
+    }
+
+    #[test]
+    fn detail_line_counts_the_parts_it_dropped() {
+        let parts = vec![
+            "reset expires 2h13m".to_string(),
+            "~120-150 msgs".to_string(),
+            "cap $50".to_string(),
+        ];
+        let line = detail_line(&parts, card_inner_w(CARD_MIN_W)).expect("has parts");
+        let text = line_text(line);
+        assert!(text.starts_with("reset expires 2h13m"), "got {text:?}");
+        assert!(text.ends_with("+2"), "got {text:?}");
+        assert!(text.chars().count() <= usize::from(card_inner_w(CARD_MIN_W)));
+        // Given room, nothing is hidden and no marker appears.
+        let full = line_text(detail_line(&parts, 60).expect("has parts"));
+        assert_eq!(full, "reset expires 2h13m · ~120-150 msgs · cap $50");
+        assert!(detail_line(&[], 40).is_none());
+    }
+
+    #[test]
+    fn digest_names_the_providers_it_could_not_fit() {
+        let items = vec![
+            ("Claude", RatatuiColor::Gray, Some(58.0)),
+            ("Codex", RatatuiColor::Gray, Some(31.0)),
+            ("Copilot", RatatuiColor::Gray, Some(72.0)),
+            ("Cursor", RatatuiColor::Gray, Some(41.0)),
+            ("Grok", RatatuiColor::Gray, None),
+        ];
+        let wide = line_text(quota_digest(&items, 120));
+        assert!(wide.contains("Claude"), "got {wide:?}");
+        assert!(
+            wide.contains("Grok -"),
+            "a provider with no window still shows: {wide:?}"
+        );
+        assert!(
+            !wide.contains("more"),
+            "nothing hidden at 120 columns: {wide:?}"
+        );
+
+        let narrow = line_text(quota_digest(&items, 60));
+        assert!(narrow.chars().count() <= 60, "got {narrow:?}");
+        assert!(narrow.contains("more → Q"), "got {narrow:?}");
+
+        // Even at an absurd width one provider survives, so the row is never
+        // blank without an explanation.
+        let tiny = line_text(quota_digest(&items, 10));
+        assert!(tiny.contains("Claude"), "got {tiny:?}");
+        assert!(tiny.contains("+4 more"), "got {tiny:?}");
     }
 }
