@@ -9,9 +9,9 @@
 
 use crate::display::common::ProviderTotal;
 use crate::display::common::table::{
-    create_controls_with_status, create_provider_row, create_ratatui_table, create_summary,
-    init_process_metrics, main_layout, refresh_process_metrics, render_scrollable_table,
-    render_too_small, styled_row,
+    CONTENT_MIN_H, FOOTER_H, create_controls_with_status, create_provider_row,
+    create_ratatui_table, create_summary, frame_layout, init_process_metrics,
+    refresh_process_metrics, render_scrollable_table, render_too_small, styled_row,
 };
 use crate::display::common::tui::{
     InputAction, RefreshWorker, RefreshWorkerError, ScrollState, TerminalSession, UpdateTracker,
@@ -152,7 +152,7 @@ const USAGE_MIN_H: u16 = 14;
 /// is dropped so the scrollable table keeps a usable height.
 const USAGE_PANELS_MIN_H: u16 = 22;
 /// Minimum combined height reserved for the model table, summary, and controls.
-const USAGE_NON_PANEL_MIN_H: u16 = 10;
+const USAGE_NON_PANEL_MIN_H: u16 = CONTENT_MIN_H + FOOTER_H;
 
 struct UsageRefreshPayload {
     rows: Vec<UsageRow>,
@@ -818,7 +818,7 @@ fn render_usage_frame_with_status<B: Backend>(
             &arrange,
             provider_rows.len(),
         );
-        let chunks = main_layout(area, panels_height);
+        let chunks = frame_layout(area, USAGE_MIN_W, false, panels_height.unwrap_or(0));
 
         let header = vec![
             "Model",
@@ -869,7 +869,7 @@ fn render_usage_frame_with_status<B: Backend>(
         let row_count = rows.len();
         render_scrollable_table(
             f,
-            chunks.table,
+            chunks.content,
             header,
             rows,
             &widths,
@@ -878,7 +878,7 @@ fn render_usage_frame_with_status<B: Backend>(
             scroll,
         );
 
-        if let Some(panel_area) = chunks.panels {
+        if let Some(panel_area) = chunks.band {
             let grid = split_band(panel_area, &arrange, n);
 
             // The (slimmed) Provider Usage table is only shown when the band
@@ -2106,8 +2106,8 @@ mod tests {
         let arrange = BandArrange::SingleRow { table: true };
 
         assert_eq!(visible_band_height(22, true, &arrange, 8), Some(12));
-        assert_eq!(visible_band_height(22, true, &arrange, 9), None);
-        assert_eq!(visible_band_height(23, true, &arrange, 9), Some(13));
+        assert_eq!(visible_band_height(22, true, &arrange, 11), None);
+        assert_eq!(visible_band_height(23, true, &arrange, 11), Some(15));
     }
 
     #[test]

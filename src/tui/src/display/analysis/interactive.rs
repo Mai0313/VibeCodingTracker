@@ -9,9 +9,9 @@ use crate::display::analysis::averages::{
     calculate_analysis_provider_totals_from_per_provider, convert_to_analysis_rows,
 };
 use crate::display::common::table::{
-    create_controls_with_status, create_provider_row, create_ratatui_table, create_summary,
-    init_process_metrics, main_layout, refresh_process_metrics, render_scrollable_table,
-    render_too_small, styled_row,
+    CONTENT_MIN_H, FOOTER_H, create_controls_with_status, create_provider_row,
+    create_ratatui_table, create_summary, frame_layout, init_process_metrics,
+    refresh_process_metrics, render_scrollable_table, render_too_small, styled_row,
 };
 use crate::display::common::tui::{
     InputAction, RefreshWorker, RefreshWorkerError, ScrollState, TerminalSession, UpdateTracker,
@@ -41,9 +41,9 @@ const MAX_TRACKED_ANALYSIS_ROWS: usize = 100;
 const ANALYSIS_MIN_W: u16 = 84;
 const ANALYSIS_MIN_H: u16 = 14;
 /// Rows that must fit *below* the provider band before it is worth showing: the
-/// scrollable table (`main_layout` gives it `Min(6)` ≈ 2 body rows after the
-/// border + header + margin) plus the summary bar (3) and controls line (1).
-const ANALYSIS_BELOW_BAND_MIN_H: u16 = 10;
+/// scrollable table (`frame_layout` gives it `CONTENT_MIN_H` ≈ 2 body rows after
+/// the border + header + margin) plus the one-line summary and controls rows.
+const ANALYSIS_BELOW_BAND_MIN_H: u16 = CONTENT_MIN_H + FOOTER_H;
 
 /// Height of the provider band, or `None` when the terminal is too short to
 /// show it without squeezing the table / summary / controls beneath it.
@@ -428,8 +428,11 @@ fn render_analysis_frame_with_status(
             return;
         }
 
-        let panels_height = analysis_panels_height(area.height, provider_rows.len());
-        let chunks = main_layout(area, panels_height);
+        // The analysis provider table is ten columns wide, so it stays a
+        // full-width band rather than moving into a side rail like the usage
+        // view's three-column one.
+        let band_height = analysis_panels_height(area.height, provider_rows.len()).unwrap_or(0);
+        let chunks = frame_layout(area, ANALYSIS_MIN_W, false, band_height);
 
         let header = vec![
             "Model",
@@ -486,7 +489,7 @@ fn render_analysis_frame_with_status(
         let row_count = rows.len();
         render_scrollable_table(
             f,
-            chunks.table,
+            chunks.content,
             header,
             rows,
             &widths,
@@ -495,7 +498,7 @@ fn render_analysis_frame_with_status(
             scroll,
         );
 
-        if let Some(panel_area) = chunks.panels {
+        if let Some(panel_area) = chunks.band {
             // Drop the "All Providers" aggregate; the summary bar already
             // carries the grand totals.
             let mut totals_rows: Vec<RatatuiRow> = provider_rows
@@ -616,18 +619,18 @@ mod tests {
     #[test]
     fn band_shown_only_when_it_fits_in_full() {
         // Five sample providers + the overall row = 6 band rows -> 10 tall, so the
-        // band needs at least 20 rows of terminal to also fit table+summary+
+        // band needs at least 18 rows of terminal to also fit table+summary+
         // controls. Below that it is hidden (previously it rendered truncated).
-        assert_eq!(analysis_panels_height(18, 6), None);
-        assert_eq!(analysis_panels_height(19, 6), None);
-        assert_eq!(analysis_panels_height(20, 6), Some(10));
+        assert_eq!(analysis_panels_height(16, 6), None);
+        assert_eq!(analysis_panels_height(17, 6), None);
+        assert_eq!(analysis_panels_height(18, 6), Some(10));
 
         // The threshold scales down with fewer providers instead of a fixed 18.
-        assert_eq!(analysis_panels_height(14, 1), None);
-        assert_eq!(analysis_panels_height(15, 1), Some(5));
+        assert_eq!(analysis_panels_height(12, 1), None);
+        assert_eq!(analysis_panels_height(13, 1), Some(5));
 
-        // No providers still floors the band height at 4 (needs 14 rows).
-        assert_eq!(analysis_panels_height(13, 0), None);
-        assert_eq!(analysis_panels_height(14, 0), Some(4));
+        // No providers still floors the band height at 4 (needs 12 rows).
+        assert_eq!(analysis_panels_height(11, 0), None);
+        assert_eq!(analysis_panels_height(12, 0), Some(4));
     }
 }

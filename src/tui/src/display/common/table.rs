@@ -105,7 +105,8 @@ fn fit_diagnostics(
     (true, used + mem_width + cpu_width <= available)
 }
 
-/// Builds the TUI summary bar from caller-supplied items plus live memory and CPU readouts.
+/// Builds the one-line TUI summary bar from caller-supplied items plus live
+/// memory and CPU readouts.
 ///
 /// Each `(icon, value, color)` tuple in `summary_items` becomes a colored,
 /// pipe-separated segment; these primary items are always rendered. A
@@ -116,14 +117,16 @@ fn fit_diagnostics(
 /// clipped mid-word. They read `0.0` if `sys` has no entry for `pid`. CPU is
 /// normalized to a 0-100% share of the machine. `sys` is expected to have been
 /// refreshed by the caller before this call.
+///
+/// The bar is deliberately unbordered: it carries a single line of text, and a
+/// border around it would cost two more rows of the scrollable table above.
 pub fn create_summary<'a>(
     summary_items: Vec<(&'a str, &'a str, RatatuiColor)>, // (icon, value, color) tuples
     sys: &'a System,
     pid: sysinfo::Pid,
     width: u16,
 ) -> Paragraph<'a> {
-    // Content sits inside the block's borders, which take one column each side.
-    let available = width.saturating_sub(2) as usize;
+    let available = width as usize;
 
     let mut spans = Vec::new();
     let mut used = 0usize;
@@ -182,13 +185,7 @@ pub fn create_summary<'a>(
         ));
     }
 
-    Paragraph::new(vec![Line::from(spans)])
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(RatatuiColor::Yellow)),
-        )
-        .centered()
+    Paragraph::new(vec![Line::from(spans)]).centered()
 }
 
 /// Short call-to-action shown in the footer (also the OSC 8 hyperlink text).
@@ -243,59 +240,103 @@ pub fn create_controls_with_status(
     Paragraph::new(vec![Line::from(spans)]).centered()
 }
 
-/// Vertical chunk rects for an interactive frame.
+/// Rows the scrollable content pane is never squeezed below. The block border,
+/// header row and header margin eat 4, so this keeps ~2 body rows alive.
+pub const CONTENT_MIN_H: u16 = 6;
+/// Narrowest a side rail may be and still hold a gauge line or a three-column
+/// provider row without truncating it.
+pub const RAIL_MIN_W: u16 = 30;
+/// Widest a side rail grows to; past this the content pane keeps the slack.
+const RAIL_MAX_W: u16 = 52;
+/// Rows the frame always spends below the content: summary + controls.
+pub const FOOTER_H: u16 = 2;
+
+/// Chunk rects for an interactive frame.
 pub struct FrameChunks {
     /// Scrollable main table area.
-    pub table: Rect,
-    /// Provider / quota band, present only when there is room for it.
-    pub panels: Option<Rect>,
-    /// Summary bar area.
+    pub content: Rect,
+    /// Side rail beside the content, present only on a wide enough terminal.
+    pub rail: Option<Rect>,
+    /// Full-width band under the content, present only when one was asked for.
+    pub band: Option<Rect>,
+    /// Single-line summary area.
     pub summary: Rect,
     /// Single-line controls footer area.
     pub controls: Rect,
 }
 
-/// Splits `area` into the standard interactive-view rows.
+/// Width the side rail takes at `width`, or `None` when it does not fit.
 ///
-/// When `panels_height` is `Some`, a provider/quota band of that height sits
-/// between the scrollable table and the summary; when `None` (a tight terminal)
-/// the band is dropped and the table absorbs the space. The table always gets
-/// `Min(6)` so at least ~2 body rows survive (border + header + margin eat 4).
-pub fn main_layout(area: Rect, panels_height: Option<u16>) -> FrameChunks {
-    match panels_height {
-        Some(h) => {
-            let c = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Min(6),
-                    Constraint::Length(h),
-                    Constraint::Length(3),
-                    Constraint::Length(1),
-                ])
-                .split(area);
-            FrameChunks {
-                table: c[0],
-                panels: Some(c[1]),
-                summary: c[2],
-                controls: c[3],
-            }
+/// The rail exists to put the horizontal gutter to work, so it only appears
+/// once the content pane can keep its own minimum beside it. Between the
+/// bounds it takes a third of the terminal, which is what lets a wide terminal
+/// spend its slack on rail content instead of inflating a name column. The
+/// share is then capped at whatever the content pane can spare, so the returned
+/// width is the width the rail actually gets rather than one the layout solver
+/// would have to shrink back.
+pub fn rail_width(width: u16, content_min_w: u16) -> Option<u16> {
+    (width >= content_min_w.saturating_add(RAIL_MIN_W)).then(|| {
+        (width / 3)
+            .clamp(RAIL_MIN_W, RAIL_MAX_W)
+            .min(width - content_min_w)
+    })
+}
+
+/// Splits `area` into the standard interactive-view regions.
+///
+/// Vertically: the content pane absorbs all leftover height, then an optional
+/// `band_height`-row band, then one row each of summary and controls.
+/// Horizontally the content row is split once — content pane plus rail — and
+/// only when `rail` is requested *and* [`rail_width`] says it fits. That single
+/// comparison is the whole responsive story; nothing here reads how many items
+/// the caller intends to draw.
+pub fn frame_layout(
+    area: Rect,
+    content_min_w: u16,
+    rail: bool,
+    band_height: u16,
+) -> FrameChunks {
+    let mut constraints: Vec<Constraint> = Vec::with_capacity(4);
+    constraints.push(Constraint::Min(CONTENT_MIN_H));
+    if band_height > 0 {
+        constraints.push(Constraint::Length(band_height));
+    }
+    constraints.push(Constraint::Length(1));
+    constraints.push(Constraint::Length(1));
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+
+    let mut next = 0;
+    let mut take = || {
+        let rect = rows[next];
+        next += 1;
+        rect
+    };
+    let top = take();
+    let band = (band_height > 0).then(&mut take);
+    let summary = take();
+    let controls = take();
+
+    let (content, rail) = match rail.then(|| rail_width(top.width, content_min_w)).flatten() {
+        Some(w) => {
+            let cells = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(content_min_w), Constraint::Length(w)])
+                .split(top);
+            (cells[0], Some(cells[1]))
         }
-        None => {
-            let c = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Min(6),
-                    Constraint::Length(3),
-                    Constraint::Length(1),
-                ])
-                .split(area);
-            FrameChunks {
-                table: c[0],
-                panels: None,
-                summary: c[1],
-                controls: c[2],
-            }
-        }
+        None => (top, None),
+    };
+
+    FrameChunks {
+        content,
+        rail,
+        band,
+        summary,
+        controls,
     }
 }
 
@@ -513,7 +554,73 @@ pub fn create_provider_row<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{fit_diagnostics, normalized_cpu};
+    use super::{
+        CONTENT_MIN_H, FOOTER_H, RAIL_MIN_W, Rect, fit_diagnostics, frame_layout, normalized_cpu,
+        rail_width,
+    };
+
+    #[test]
+    fn rail_appears_only_once_the_content_pane_keeps_its_minimum() {
+        // One comparison decides it: content minimum + rail minimum.
+        assert_eq!(rail_width(66 + RAIL_MIN_W - 1, 66), None);
+        assert_eq!(rail_width(66 + RAIL_MIN_W, 66), Some(RAIL_MIN_W));
+        // Between the bounds the rail takes a third of the terminal.
+        assert_eq!(rail_width(120, 66), Some(40));
+        // Near the threshold the third is capped at what the content can spare,
+        // so the reported width is the one the rail actually gets.
+        assert_eq!(rail_width(100, 66), Some(33));
+        // ...and stops growing, so a very wide terminal keeps its slack in the
+        // content pane rather than in an increasingly empty rail.
+        assert_eq!(rail_width(400, 66), Some(52));
+        // A wider content minimum pushes the threshold out with it.
+        assert_eq!(rail_width(84 + RAIL_MIN_W - 1, 84), None);
+        assert_eq!(rail_width(84 + RAIL_MIN_W, 84), Some(RAIL_MIN_W));
+    }
+
+    #[test]
+    fn frame_gives_every_leftover_row_to_the_content_pane() {
+        let area = Rect::new(0, 0, 120, 40);
+        let c = frame_layout(area, 66, false, 0);
+        assert_eq!(c.content.height, 40 - FOOTER_H);
+        assert!(c.band.is_none());
+        assert_eq!(c.summary.height, 1);
+        assert_eq!(c.controls.height, 1);
+        assert_eq!(c.controls.y, 39);
+
+        let c = frame_layout(area, 66, false, 6);
+        assert_eq!(c.content.height, 40 - FOOTER_H - 6);
+        assert_eq!(c.band.expect("band requested").height, 6);
+    }
+
+    #[test]
+    fn frame_splits_the_content_row_only_when_the_rail_fits() {
+        let wide = frame_layout(Rect::new(0, 0, 120, 40), 66, true, 0);
+        let rail = wide.rail.expect("rail fits at 120 columns");
+        assert_eq!(rail.width, 40);
+        assert_eq!(wide.content.width, 80);
+        assert_eq!(wide.content.height, rail.height);
+
+        // Below the threshold the content pane takes the whole row instead of
+        // both being squeezed under their minimums.
+        let narrow = frame_layout(Rect::new(0, 0, 90, 40), 66, true, 0);
+        assert!(narrow.rail.is_none());
+        assert_eq!(narrow.content.width, 90);
+
+        // A caller that does not want a rail never gets one.
+        let off = frame_layout(Rect::new(0, 0, 200, 40), 66, false, 0);
+        assert!(off.rail.is_none());
+        assert_eq!(off.content.width, 200);
+    }
+
+    #[test]
+    fn frame_holds_the_content_minimum_when_the_terminal_is_short() {
+        // The band and footer are `Length`, so a shortfall is taken from them
+        // first; the content pane never drops below its minimum.
+        let c = frame_layout(Rect::new(0, 0, 120, CONTENT_MIN_H + FOOTER_H), 66, false, 0);
+        assert_eq!(c.content.height, CONTENT_MIN_H);
+        assert_eq!(c.summary.height, 1);
+        assert_eq!(c.controls.height, 1);
+    }
 
     #[test]
     fn normalized_cpu_divides_by_cores_and_clamps() {
