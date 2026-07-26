@@ -521,6 +521,16 @@ pub(crate) fn fetch_grok_raw_from(
     Ok((status, text))
 }
 
+/// A plan label fetched from the settings endpoint, pinned to the credential
+/// file it belongs to.
+struct CachedPlan {
+    /// The label, or `None` when the account reports no display tier.
+    label: Option<String>,
+    /// `auth.json`'s mtime when this was fetched; a re-login rewrites the file
+    /// and drops the label so the new account's plan is read fresh.
+    mtime: Option<SystemTime>,
+}
+
 /// The result of obtaining a usable access token.
 ///
 /// There is no transient arm: the credential file is read by the caller, so the
@@ -541,11 +551,10 @@ pub struct GrokState {
     cooldown: RefreshCooldown,
     /// Discovered `(issuer, token_endpoint)`, so discovery runs once per issuer.
     token_endpoint: Option<(String, String)>,
-    /// Plan label, fetched from the settings endpoint at most once per worker.
-    plan: Option<String>,
-    /// Whether the settings endpoint has answered at all; a failed fetch leaves
-    /// this false so the next tick retries.
-    plan_fetched: bool,
+    /// Plan label, fetched once per login rather than once per tick: it lives
+    /// behind a second endpoint, and only a re-login can change whose plan it
+    /// is. A failed fetch caches nothing, so the next tick retries.
+    plan: Option<CachedPlan>,
 }
 
 impl GrokState {
@@ -571,7 +580,13 @@ impl GrokState {
         match fetch_grok_billing(client, &token, user_id.as_deref(), now, GROK_BILLING_URL) {
             FetchResult::Ok(snap) => {
                 self.cooldown.clear();
-                QuotaOutcome::Data(self.with_plan(client, snap, &token, user_id.as_deref()))
+                QuotaOutcome::Data(self.with_plan(
+                    client,
+                    snap,
+                    &token,
+                    user_id.as_deref(),
+                    file_mtime(&path),
+                ))
             }
             FetchResult::Unauthorized => {
                 let mtime = file_mtime(&path);
@@ -595,6 +610,7 @@ impl GrokState {
                                     snap,
                                     &fresh,
                                     user_id.as_deref(),
+                                    file_mtime(&path),
                                 ))
                             }
                             // A transient retry error keeps the freshly
@@ -621,25 +637,32 @@ impl GrokState {
         }
     }
 
-    /// Attaches the plan label, fetching it from the settings endpoint the first
-    /// time it is needed. A failure only costs the Plan line.
+    /// Attaches the plan label, fetching it from the settings endpoint when it
+    /// is not already cached for this login. A failure only costs the Plan line.
     fn with_plan(
         &mut self,
         client: &Client,
         mut snap: GrokQuotaSnapshot,
         token: &str,
         user_id: Option<&str>,
+        cred_mtime: Option<SystemTime>,
     ) -> GrokQuotaSnapshot {
-        if !self.plan_fetched {
+        if self
+            .plan
+            .as_ref()
+            .is_none_or(|cached| cached.mtime != cred_mtime)
+        {
             match fetch_grok_plan(client, token, user_id, GROK_SETTINGS_URL) {
-                Ok(plan) => {
-                    self.plan_fetched = true;
-                    self.plan = plan;
+                Ok(label) => {
+                    self.plan = Some(CachedPlan {
+                        label,
+                        mtime: cred_mtime,
+                    })
                 }
                 Err(e) => log::warn!("grok quota: failed to read plan from settings: {e}"),
             }
         }
-        snap.plan_type = self.plan.clone();
+        snap.plan_type = self.plan.as_ref().and_then(|cached| cached.label.clone());
         snap
     }
 
@@ -691,11 +714,12 @@ impl GrokState {
         let expected_mtime = file_mtime(path);
         let body = std::fs::read_to_string(path).ok()?;
         let cred = select_grok_entry(&body)?;
-        if !cred.is_refreshable() {
+        // An API-key login has no issuer to discover a token endpoint from, so
+        // there is nothing to renew with: fall through to the login hint.
+        let Some(issuer) = cred.issuer().map(str::to_string) else {
             log::warn!("grok token expired and this login cannot be refreshed");
             return None;
-        }
-        let issuer = cred.issuer()?.to_string();
+        };
         let token_url = self.token_endpoint(client, &issuer)?;
         match refresh_grok(client, path, &cred, expected_mtime, &token_url) {
             Ok((access, expires_at)) => {
@@ -777,10 +801,13 @@ mod tests {
 
     #[test]
     fn prefers_a_refreshable_login_over_an_api_key() {
-        // The API key sorts first alphabetically and never expires, so only the
-        // refreshable-first rule keeps the subscription login winning.
+        // Every other sort key favours the API key here — it sorts first
+        // alphabetically and carries the later expiry — so only the
+        // refreshable-first rule keeps the renewable subscription login
+        // winning. Picking the API key would leave the worker sitting on a
+        // token it can never renew.
         let body = r#"{
-          "xai::api_key": { "key": "api-key-token" },
+          "xai::api_key": { "key": "api-key-token", "expires_at": "2030-01-01T00:00:00Z" },
           "https://auth.x.ai::c": {
             "key": "oauth-token", "refresh_token": "rt",
             "oidc_issuer": "https://auth.x.ai", "oidc_client_id": "c",
@@ -862,6 +889,9 @@ mod tests {
     fn maps_an_idle_weekly_account() {
         let snap = map_grok_billing(CREDITS, 1_000_000).unwrap();
         assert_eq!(snap.source, QuotaSource::Api);
+        // Drives the panel's staleness line, so a wrong stamp reads as
+        // "updated 56 years ago" on every otherwise-healthy tick.
+        assert_eq!(snap.fetched_at, 1_000_000);
         // `creditUsagePercent` is omitted at zero — that means 0%, not an error.
         let included = snap.included.as_ref().unwrap();
         assert_eq!(included.used_percent, 0.0);
@@ -937,6 +967,21 @@ mod tests {
         assert!(snap.included.as_ref().unwrap().resets_at_unix.unwrap() > 0);
         // An unknown period type leaves the gauge unlabelled rather than lying.
         assert!(snap.period_label.is_none());
+    }
+
+    #[test]
+    fn the_current_period_outranks_the_deprecated_one() {
+        // Older servers still emit both. `currentPeriod` is the live one, so a
+        // reversed precedence would count down to a stale reset date.
+        let body = r#"{ "config": {
+          "currentPeriod": { "type": "USAGE_PERIOD_TYPE_WEEKLY", "end": "2026-07-29T00:00:00+00:00" },
+          "billingPeriodEnd": "2026-01-01T00:00:00+00:00"
+        } }"#;
+        let snap = map_grok_billing(body, 1).unwrap();
+        assert_eq!(
+            snap.included.unwrap().resets_at_unix,
+            iso_to_unix_secs("2026-07-29T00:00:00+00:00")
+        );
     }
 
     #[test]
@@ -1261,14 +1306,16 @@ mod tests {
         ));
 
         // An expired API-key login has nothing to refresh with, so the worker
-        // asks for a login instead of sitting on a dead token.
-        let expired = select_grok_entry(
-            r#"{ "xai::api_key": { "key": "t", "expires_at": "2020-01-01T00:00:00Z" } }"#,
-        )
-        .unwrap();
+        // asks for a login instead of sitting on a dead token. The file must
+        // exist, or `force_refresh` would bail on the read and never reach the
+        // unrefreshable-login guard this pins.
+        let api_key = r#"{ "xai::api_key": { "key": "t", "expires_at": "2020-01-01T00:00:00Z" } }"#;
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, api_key).unwrap();
+        let expired = select_grok_entry(api_key).unwrap();
         let mut state = GrokState::default();
         assert!(matches!(
-            state.ensure_token(&client, &missing, &expired, 1_900_000_000),
+            state.ensure_token(&client, &path, &expired, 1_900_000_000),
             EnsureToken::NeedsLogin
         ));
     }
