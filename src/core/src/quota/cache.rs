@@ -1,5 +1,5 @@
 //! On-disk caches for the latest per-provider quota snapshots
-//! (`~/.vct/{claude,codex,copilot,cursor}_usage.json`).
+//! (`~/.vct/{claude,codex,copilot,cursor,grok}_usage.json`).
 //!
 //! Each is a single last-known-good file (not dated like the pricing cache,
 //! since we always want the latest value). A fresh `vct usage` launch seeds
@@ -7,10 +7,11 @@
 
 use crate::models::{
     ClaudeQuotaSnapshot, CodexQuotaSnapshot, CopilotQuotaSnapshot, CursorQuotaSnapshot,
+    GrokQuotaSnapshot,
 };
 use crate::utils::{
     get_claude_usage_cache_path, get_codex_usage_cache_path, get_copilot_usage_cache_path,
-    get_cursor_usage_cache_path, write_json_atomic,
+    get_cursor_usage_cache_path, get_grok_usage_cache_path, write_json_atomic,
 };
 use anyhow::Result;
 use serde::Serialize;
@@ -66,4 +67,14 @@ pub fn load_cursor_cache() -> Option<CursorQuotaSnapshot> {
 /// Persists the Cursor quota snapshot atomically.
 pub fn save_cursor_cache(snap: &CursorQuotaSnapshot) -> Result<()> {
     save_cache(get_cursor_usage_cache_path(), snap)
+}
+
+/// Loads the last-known Grok quota snapshot, or `None` if absent/corrupt.
+pub fn load_grok_cache() -> Option<GrokQuotaSnapshot> {
+    load_cache(get_grok_usage_cache_path())
+}
+
+/// Persists the Grok quota snapshot atomically.
+pub fn save_grok_cache(snap: &GrokQuotaSnapshot) -> Result<()> {
+    save_cache(get_grok_usage_cache_path(), snap)
 }

@@ -12,6 +12,15 @@ pub fn now_rfc3339_utc_nanos() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
 
+/// Formats `unix_secs` in the same shape [`now_rfc3339_utc_nanos`] produces.
+///
+/// Used to stamp a refreshed token's expiry in the exact format the Grok CLI
+/// writes into `auth.json`. Returns `None` for a timestamp outside the
+/// representable range rather than silently substituting another instant.
+pub fn rfc3339_utc_nanos(unix_secs: i64) -> Option<String> {
+    DateTime::from_timestamp(unix_secs, 0).map(|dt| dt.to_rfc3339_opts(SecondsFormat::Nanos, true))
+}
+
 /// Parses an ISO-8601 / RFC 3339 timestamp into Unix milliseconds.
 ///
 /// RFC 3339 is tried first (the common case, with timezone offset or `Z`),
@@ -61,6 +70,21 @@ pub fn parse_iso_timestamp(ts: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rfc3339_utc_nanos_round_trips_and_matches_the_now_shape() {
+        let stamp = rfc3339_utc_nanos(1_785_058_368).expect("in range");
+        assert_eq!(stamp, "2026-07-26T09:32:48.000000000Z");
+        // The same shape `now_rfc3339_utc_nanos` writes, and re-readable.
+        assert_eq!(parse_iso_timestamp(&stamp), 1_785_058_368_000);
+        assert_eq!(
+            stamp.len(),
+            now_rfc3339_utc_nanos().len(),
+            "both stamps must be the fixed-width nanosecond form"
+        );
+        // Out of range yields None rather than a substituted instant.
+        assert!(rfc3339_utc_nanos(i64::MAX).is_none());
+    }
 
     #[test]
     fn test_parse_iso_timestamp_rfc3339() {

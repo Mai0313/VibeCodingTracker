@@ -1,31 +1,33 @@
 //! Quota orchestration for the `usage` panels.
 //!
-//! Each supported provider (Claude / Codex / Copilot / Cursor) runs its own
-//! background worker ([`provider::spawn_quota_worker`]) that refreshes a shared
-//! snapshot on the configured cadence, seeded from an on-disk cache. The
-//! provider-specific fetch (and, for Claude / Codex, token refresh) lives in
-//! [`claude`], [`wham`] (+ this module's [`CodexState`]), [`copilot`], and
-//! [`cursor`]; the shared HTTP + refresh primitives live in [`http`] and
-//! [`refresh`]. The one-shot `vct quota` raw fetchers (`fetch_*_raw`) are the
-//! reusable core entry points; the CLI does the render.
+//! Each supported provider (Claude / Codex / Copilot / Cursor / Grok) runs its
+//! own background worker ([`provider::spawn_quota_worker`]) that refreshes a
+//! shared snapshot on the configured cadence, seeded from an on-disk cache. The
+//! provider-specific fetch (and, for Claude / Codex / Grok, token refresh) lives
+//! in [`claude`], [`wham`] (+ this module's [`CodexState`]), [`copilot`],
+//! [`cursor`], and [`grok`]; the shared HTTP + refresh primitives live in
+//! [`http`] and [`refresh`]. The one-shot `vct quota` raw fetchers
+//! (`fetch_*_raw`) are the reusable core entry points; the CLI does the render.
 
 pub mod cache;
 pub mod claude;
 pub mod codex_session;
 pub mod copilot;
 pub mod cursor;
+pub mod grok;
 pub mod http;
 pub mod provider;
 pub mod refresh;
 pub mod wham;
 
 pub use cache::{
-    load_claude_cache, load_codex_cache, load_copilot_cache, load_cursor_cache, save_claude_cache,
-    save_codex_cache, save_copilot_cache, save_cursor_cache,
+    load_claude_cache, load_codex_cache, load_copilot_cache, load_cursor_cache, load_grok_cache,
+    save_claude_cache, save_codex_cache, save_copilot_cache, save_cursor_cache, save_grok_cache,
 };
 pub use claude::{CLAUDE_LOGIN_HINT, ClaudeState};
 pub use copilot::{COPILOT_LOGIN_HINT, CopilotState};
 pub use cursor::{CURSOR_LOGIN_HINT, CursorState};
+pub use grok::{GROK_LOGIN_HINT, GrokState};
 pub use provider::{QuotaOutcome, QuotaSnapshot, spawn_quota_worker};
 
 use crate::models::CodexQuotaSnapshot;
