@@ -1079,6 +1079,7 @@ fn render_usage_frame_with_status<B: Backend>(
             create_controls_with_status(
                 &[("m", merge_hint), ("p", " panes  "), ("Q", " quota  ")],
                 status,
+                chunks.controls.width,
             ),
             chunks.controls,
         );
@@ -1499,6 +1500,18 @@ fn render_quota_overlay(f: &mut Frame, area: Rect, quota: &QuotaView, now: i64) 
         .right_aligned(),
     );
     f.render_widget(block, outer);
+
+    // An empty overlay would be a dead end, so say why it is empty. The band
+    // being switched off is a setting, not a missing credential.
+    if cards.is_empty() {
+        let reason = if quota.band_enabled {
+            "No provider on this machine has quota credentials."
+        } else {
+            "Quota panels are off: set `panels` under [usage.quota] in ~/.vct/config.toml."
+        };
+        f.render_widget(Paragraph::new(dim_line(reason)).centered(), inner);
+        return;
+    }
 
     for (cell, card) in grid_cells(&OVERLAY_GRID, inner, fits)
         .into_iter()
@@ -2814,6 +2827,42 @@ mod tests {
             !rendered.contains("hidden"),
             "nothing was hidden:\n{rendered}"
         );
+    }
+
+    #[test]
+    fn overlay_explains_itself_when_there_is_nothing_to_show() {
+        let (c, x, p, u, g) = Default::default();
+        let mut quota = QuotaView {
+            claude: &c,
+            codex: &x,
+            copilot: &p,
+            cursor: &u,
+            grok: &g,
+            present: QuotaPresence::default(),
+            band_enabled: true,
+            rail_visible: true,
+            overlay_open: true,
+        };
+        let render = |quota: &QuotaView| {
+            let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+            terminal
+                .draw(|frame| render_quota_overlay(frame, frame.area(), quota, 0))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..20u16)
+                .map(|y| {
+                    (0..80u16)
+                        .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("")
+        };
+        // No credentials anywhere: an empty box would be a dead end.
+        assert!(render(&quota).contains("quota credentials"));
+        // Panels switched off is a setting, and the overlay says where to change it.
+        quota.band_enabled = false;
+        assert!(render(&quota).contains("[usage.quota]"));
     }
 
     #[test]

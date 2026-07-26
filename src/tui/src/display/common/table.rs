@@ -195,26 +195,61 @@ pub const REPO_URL: &str = "https://github.com/Mai0313/VibeCodingTracker";
 
 /// Builds the single-line key-hint footer (navigation + the GitHub repo link).
 ///
-/// Everything is on one line to save vertical space; the repo link sits last so
-/// it is the first thing truncated on a narrow terminal, leaving the keys
-/// readable. `extra` inserts view-specific `(key, label)` hints just before
-/// `r refresh` — the usage view passes its `m merge` toggle; other views pass
-/// an empty slice. The label is drawn as plain (underlined) text here; a
-/// terminal hyperlink is layered on afterward by
+/// Everything is on one line to save vertical space. `extra` inserts
+/// view-specific `(key, label)` hints just before `r refresh` — the usage view
+/// passes its `m` / `p` / `Q` toggles; other views pass an empty slice. The repo
+/// label is drawn as plain (underlined) text here; a terminal hyperlink is
+/// layered on afterward by
 /// [`overlay_repo_hyperlink`](super::tui::overlay_repo_hyperlink).
-pub fn create_controls(extra: &[(&str, &str)]) -> Paragraph<'static> {
-    create_controls_with_status(extra, None)
+pub fn create_controls(extra: &[(&str, &str)], width: u16) -> Paragraph<'static> {
+    create_controls_with_status(extra, None, width)
 }
 
 /// Builds the controls footer with an optional transient refresh status.
+///
+/// Hints are dropped whole rather than clipped mid-word when they do not fit
+/// `width`, in this order: the repo label, then the view-specific `extra` hints
+/// from the right, then the status. Scrolling, refresh and quit always survive —
+/// a footer that cannot say how to quit is worse than one that says less.
 pub fn create_controls_with_status(
     extra: &[(&str, &str)],
     status: Option<&str>,
+    width: u16,
 ) -> Paragraph<'static> {
     let key = Style::default().fg(RatatuiColor::Cyan).bold();
     let dim = Style::default().fg(RatatuiColor::DarkGray);
+    let available = width as usize;
+
+    // Widths of the parts that are always drawn.
+    let core = seg_width("↑/↓ scroll  r refresh  q quit");
+    let repo = seg_width("  |  ") + seg_width(REPO_LABEL);
+    let status_w = status.map_or(0, |s| seg_width("  |  ") + seg_width(s));
+    let extra_w: Vec<usize> = extra
+        .iter()
+        .map(|(k, label)| seg_width(k) + seg_width(label))
+        .collect();
+
+    // Drop from the cheapest end until what is left fits.
+    let mut shown_extra = extra.len();
+    let mut show_status = status.is_some();
+    let mut show_repo = true;
+    let used = |shown: usize, status: bool, repo_shown: bool| {
+        core + extra_w[..shown].iter().sum::<usize>()
+            + if status { status_w } else { 0 }
+            + if repo_shown { repo } else { 0 }
+    };
+    if used(shown_extra, show_status, show_repo) > available {
+        show_repo = false;
+    }
+    while shown_extra > 0 && used(shown_extra, show_status, show_repo) > available {
+        shown_extra -= 1;
+    }
+    if used(shown_extra, show_status, show_repo) > available {
+        show_status = false;
+    }
+
     let mut spans = vec![Span::styled("↑/↓", key), Span::styled(" scroll  ", dim)];
-    for (k, label) in extra {
+    for (k, label) in &extra[..shown_extra] {
         spans.push(Span::styled(k.to_string(), key));
         spans.push(Span::styled(label.to_string(), dim));
     }
@@ -225,18 +260,20 @@ pub fn create_controls_with_status(
         Style::default().fg(RatatuiColor::Red).bold(),
     ));
     spans.push(Span::styled(" quit", dim));
-    if let Some(status) = status {
+    if show_status && let Some(status) = status {
         spans.push(Span::styled("  |  ", dim));
         spans.push(Span::styled(
             status.to_string(),
             Style::default().fg(RatatuiColor::Yellow).bold(),
         ));
     }
-    spans.push(Span::styled("  |  ", dim));
-    spans.push(Span::styled(
-        REPO_LABEL,
-        Style::default().fg(RatatuiColor::Cyan).underlined(),
-    ));
+    if show_repo {
+        spans.push(Span::styled("  |  ", dim));
+        spans.push(Span::styled(
+            REPO_LABEL,
+            Style::default().fg(RatatuiColor::Cyan).underlined(),
+        ));
+    }
     Paragraph::new(vec![Line::from(spans)]).centered()
 }
 
@@ -619,8 +656,8 @@ pub fn create_provider_row<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTENT_MIN_H, ColumnSpec, FOOTER_H, RAIL_MIN_W, Rect, fit_columns, fit_diagnostics,
-        frame_layout, normalized_cpu, rail_width,
+        CONTENT_MIN_H, ColumnSpec, FOOTER_H, RAIL_MIN_W, Rect, create_controls_with_status,
+        fit_columns, fit_diagnostics, frame_layout, normalized_cpu, rail_width,
     };
 
     #[test]
@@ -730,6 +767,41 @@ mod tests {
         assert_eq!(normalized_cpu(0.0, 8.0), 0.0);
         // A transient over-count (all cores summed above 100%) is clamped.
         assert_eq!(normalized_cpu(410.0, 4.0), 100.0);
+    }
+
+    #[test]
+    fn controls_drop_hints_whole_and_always_keep_quit() {
+        use ratatui::widgets::Widget;
+        let render = |width: u16| {
+            let area = Rect::new(0, 0, width, 1);
+            let mut buf = ratatui::buffer::Buffer::empty(area);
+            create_controls_with_status(
+                &[("m", " merge  "), ("p", " panes  "), ("Q", " quota  ")],
+                None,
+                width,
+            )
+            .render(area, &mut buf);
+            (0..width)
+                .map(|x| buf.cell((x, 0)).unwrap().symbol())
+                .collect::<String>()
+        };
+
+        // Wide: everything, including the repo label.
+        let wide = render(120);
+        assert!(wide.contains("Star on GitHub") && wide.contains("Q quota"));
+
+        // The hard minimum terminal width. The repo label goes first, then the
+        // extras from the right, and nothing is left half-drawn.
+        let min = render(74);
+        assert!(!min.contains("Star"), "got {min:?}");
+        assert!(min.contains("q quit"), "got {min:?}");
+        assert!(min.trim_end().chars().count() <= 74);
+
+        // Absurdly narrow: the keys that still fit are whole words.
+        let tiny = render(30);
+        assert!(!tiny.contains("Star"), "got {tiny:?}");
+        assert!(!tiny.contains("quota"), "got {tiny:?}");
+        assert!(tiny.contains("quit"), "got {tiny:?}");
     }
 
     #[test]

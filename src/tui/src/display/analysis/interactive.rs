@@ -658,7 +658,10 @@ fn render_analysis_frame_with_status<B: Backend>(
         let summary = create_summary(summary_items, sys, pid, chunks.summary.width);
         f.render_widget(summary, chunks.summary);
 
-        f.render_widget(create_controls_with_status(&[], status), chunks.controls);
+        f.render_widget(
+            create_controls_with_status(&[], status, chunks.controls.width),
+            chunks.controls,
+        );
     })?;
 
     // ratatui can't embed the OSC 8 escape itself, so hyperlink the repo label

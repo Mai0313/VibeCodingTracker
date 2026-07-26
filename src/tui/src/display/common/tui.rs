@@ -923,7 +923,7 @@ mod tests {
     fn find_label_start_locates_repo_label_on_bottom_row() {
         let area = Rect::new(0, 0, 120, 1);
         let mut buf = Buffer::empty(area);
-        create_controls(&[("m", " merge  ")]).render(area, &mut buf);
+        create_controls(&[("m", " merge  ")], area.width).render(area, &mut buf);
 
         let (x, y) = find_label_start(&buf).expect("repo label should be present");
         assert_eq!(y, 0);
@@ -934,12 +934,22 @@ mod tests {
     }
 
     #[test]
-    fn find_label_start_is_none_when_truncated() {
-        // Too narrow to fit the whole label → nothing to hyperlink.
-        let area = Rect::new(0, 0, 10, 1);
+    fn find_label_start_is_none_when_the_label_was_dropped() {
+        // Too narrow for the label → the footer drops it whole, so there is
+        // nothing to hyperlink (and nothing clipped mid-word either).
+        let area = Rect::new(0, 0, 40, 1);
         let mut buf = Buffer::empty(area);
-        create_controls(&[]).render(area, &mut buf);
+        create_controls(&[], area.width).render(area, &mut buf);
         assert!(find_label_start(&buf).is_none());
+
+        let row: String = (0..area.width)
+            .map(|x| buf.cell((x, 0)).unwrap().symbol())
+            .collect();
+        assert!(
+            row.contains("q quit"),
+            "quitting stays discoverable: {row:?}"
+        );
+        assert!(!row.contains("Star"), "no half-drawn label: {row:?}");
     }
 
     #[test]
