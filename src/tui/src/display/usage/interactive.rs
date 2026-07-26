@@ -27,7 +27,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout as RatatuiLayout, Rect},
     style::{Color as RatatuiColor, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Row as RatatuiRow},
+    widgets::{Block, Borders, Clear, Paragraph, Row as RatatuiRow},
 };
 use std::collections::HashMap;
 use std::io;
@@ -55,19 +55,38 @@ use vct_core::utils::{
     resolve_paths,
 };
 
-/// Height of one quota card: a border, [`CARD_CONTENT_H`] content rows, and a
-/// border. Five rows is what the fullest provider needs (Claude: plan, 5h, 7d,
-/// scoped, balance), so the common case shows everything.
-const CARD_H: u16 = 7;
-/// Narrowest a quota card may be. A full gauge line is
-/// `label(5) + bar(5) + percent(4) + reset(6)` = 20 content columns, so 24
-/// leaves two spare inside the borders. This is also the value that lets five
-/// cards share one row on a 120-column terminal.
-const CARD_MIN_W: u16 = 24;
-/// Widest a quota card grows to. Past this the cards stop stretching and the
-/// grid centers itself, so a very wide terminal does not hand each provider a
-/// 60-column box holding a 20-column gauge.
-const CARD_MAX_W: u16 = 40;
+/// How wide and tall the cards in one grid are.
+///
+/// The placement formula is shared; only these numbers differ between the
+/// always-on grid under the table and the full-screen `Q` overlay.
+struct GridSpec {
+    /// Narrowest a card may be, and the divisor that decides the column count.
+    min_w: u16,
+    /// Widest a card grows to; past this the grid centers its slack instead.
+    max_w: u16,
+    /// Card height, borders included.
+    height: u16,
+}
+
+/// The always-on grid under the model table.
+///
+/// A full gauge line is `label(5) + bar(5) + percent(5) + reset(6)` = 21 content
+/// columns, so 24 leaves room inside the borders — and it is the width that lets
+/// five cards share one row on a 120-column terminal. Five content rows is what
+/// the fullest provider needs (Claude: plan, 5h, 7d, scoped, balance).
+const CARD_GRID: GridSpec = GridSpec {
+    min_w: 24,
+    max_w: 40,
+    height: 7,
+};
+
+/// The `Q` overlay grid: wider and taller, so every provider shows every line
+/// no matter how narrow the terminal made the always-on cards.
+const OVERLAY_GRID: GridSpec = GridSpec {
+    min_w: 34,
+    max_w: 46,
+    height: 9,
+};
 /// Claude brand color for the quota panel border.
 const CLAUDE_COLOR: RatatuiColor = RatatuiColor::Rgb(190, 116, 87);
 /// Codex brand color for the quota panel border.
@@ -140,10 +159,14 @@ struct QuotaView<'a> {
     cursor: &'a CursorQuotaSnapshot,
     grok: &'a GrokQuotaSnapshot,
     present: QuotaPresence,
-    /// Whether the bottom band is shown at all. `false` when `usage.quota.panels`
-    /// is empty, which drops the whole band (panels *and* the Provider Usage
-    /// table), not just the individual gauges.
+    /// Whether the quota surface is shown at all. `false` when
+    /// `usage.quota.panels` is empty, which drops the card grid *and* the
+    /// Provider Usage rail, not just the individual gauges.
     band_enabled: bool,
+    /// Whether the side rail is currently toggled on (`p`).
+    rail_visible: bool,
+    /// Whether the full-detail quota overlay is open (`Q`).
+    overlay_open: bool,
 }
 
 /// Upper bound on rows the [`UpdateTracker`] remembers for change highlighting.
@@ -339,6 +362,8 @@ struct UsageUiState {
     update_tracker: UpdateTracker,
     scroll: ScrollState,
     merge_enabled: bool,
+    rail_visible: bool,
+    overlay_open: bool,
     claude: ClaudeQuotaSnapshot,
     codex: CodexQuotaSnapshot,
     copilot: CopilotQuotaSnapshot,
@@ -356,6 +381,8 @@ impl UsageUiState {
             update_tracker: UpdateTracker::new(MAX_TRACKED_ROWS, 1000),
             scroll: ScrollState::new(),
             merge_enabled,
+            rail_visible: true,
+            overlay_open: false,
             claude: ClaudeQuotaSnapshot::default(),
             codex: CodexQuotaSnapshot::default(),
             copilot: CopilotQuotaSnapshot::default(),
@@ -466,6 +493,8 @@ impl UsageUiState {
             grok: &self.grok,
             present: runtime.present,
             band_enabled: runtime.band_enabled,
+            rail_visible: self.rail_visible,
+            overlay_open: self.overlay_open,
         };
         let rows = current_view(self.merge_enabled, &self.rows, &self.merged_rows);
         render_usage_frame_with_status(
@@ -654,8 +683,46 @@ pub fn display_usage_interactive_with_pool(
                         )?;
                     }
                 }
+                // Esc backs out of the quota overlay; with nothing open it quits.
+                InputAction::Close if state.overlay_open => {
+                    state.overlay_open = false;
+                    if loaded {
+                        state.render(
+                            terminal.terminal_mut(),
+                            &sys,
+                            pid,
+                            &quota,
+                            refresh_status(worker.is_active(), failure_until),
+                        )?;
+                    }
+                }
+                InputAction::Close => break,
                 InputAction::ToggleMerge => {
                     state.toggle_merge();
+                    if loaded {
+                        state.render(
+                            terminal.terminal_mut(),
+                            &sys,
+                            pid,
+                            &quota,
+                            refresh_status(worker.is_active(), failure_until),
+                        )?;
+                    }
+                }
+                InputAction::ToggleQuota => {
+                    state.overlay_open = !state.overlay_open;
+                    if loaded {
+                        state.render(
+                            terminal.terminal_mut(),
+                            &sys,
+                            pid,
+                            &quota,
+                            refresh_status(worker.is_active(), failure_until),
+                        )?;
+                    }
+                }
+                InputAction::TogglePane => {
+                    state.rail_visible = !state.rail_visible;
                     if loaded {
                         state.render(
                             terminal.terminal_mut(),
@@ -811,7 +878,12 @@ fn render_usage_frame_with_status<B: Backend>(
         } else {
             u16::from(quota.band_enabled && n > 0)
         };
-        let chunks = frame_layout(area, USAGE_CONTENT_MIN_W, quota.band_enabled, band_h);
+        let chunks = frame_layout(
+            area,
+            USAGE_CONTENT_MIN_W,
+            quota.band_enabled && quota.rail_visible,
+            band_h,
+        );
 
         let header = vec![
             "Model",
@@ -878,7 +950,7 @@ fn render_usage_frame_with_status<B: Backend>(
         if let Some(band_area) = chunks.band {
             let now = chrono::Local::now().timestamp();
             if grid_h > 0 {
-                let cells = grid_cells(band_area, n);
+                let cells = grid_cells(&CARD_GRID, band_area, n);
                 // Present providers render in a fixed order (Claude → Codex →
                 // Copilot → Cursor → Grok) into the cells; a missing provider
                 // consumes no cell, and `grid_cells` always returns exactly `n`.
@@ -889,7 +961,7 @@ fn render_usage_frame_with_status<B: Backend>(
                     }
                     idx += 1;
                 };
-                let card_w = cells.first().map_or(CARD_MIN_W, |cell| cell.width);
+                let card_w = cells.first().map_or(CARD_GRID.min_w, |cell| cell.width);
                 if quota.present.claude {
                     place(f, claude_card(quota.claude, now, card_w));
                 }
@@ -937,9 +1009,17 @@ fn render_usage_frame_with_status<B: Backend>(
             " merge  "
         };
         f.render_widget(
-            create_controls_with_status(&[("m", merge_hint)], status),
+            create_controls_with_status(
+                &[("m", merge_hint), ("p", " panes  "), ("Q", " quota  ")],
+                status,
+            ),
             chunks.controls,
         );
+
+        // Drawn last so it covers the frame it is layered over.
+        if quota.overlay_open {
+            render_quota_overlay(f, area, quota, chrono::Local::now().timestamp());
+        }
     })?;
 
     // ratatui can't embed the OSC 8 escape itself, so hyperlink the repo label
@@ -1077,6 +1157,8 @@ impl UsageFrameBenchmark {
                 grok: true,
             },
             band_enabled: true,
+            rail_visible: true,
+            overlay_open: false,
         };
         render_usage_frame_with_status(
             &mut self.terminal,
@@ -1200,18 +1282,18 @@ fn login_hint_line(hint: &str) -> Line<'static> {
 /// This is the whole placement rule. The card count enters only as `n`, so a
 /// new provider is a longer list and never a new case: the grid packs as many
 /// cards per row as the width allows and wraps the remainder onto further rows.
-fn quota_grid(width: u16, n: usize) -> (usize, usize) {
+fn quota_grid(spec: &GridSpec, width: u16, n: usize) -> (usize, usize) {
     if n == 0 {
         return (0, 0);
     }
-    let cols = usize::from((width / CARD_MIN_W).max(1)).min(n);
+    let cols = usize::from((width / spec.min_w).max(1)).min(n);
     (cols, n.div_ceil(cols))
 }
 
 /// Rows the grid needs at `width` for `n` cards.
-fn grid_height(width: u16, n: usize) -> u16 {
-    let (_, rows) = quota_grid(width, n);
-    (rows as u16).saturating_mul(CARD_H)
+fn grid_height(spec: &GridSpec, width: u16, n: usize) -> u16 {
+    let (_, rows) = quota_grid(spec, width, n);
+    (rows as u16).saturating_mul(spec.height)
 }
 
 /// The grid height the frame can actually spend, or `0` when the grid folds.
@@ -1225,7 +1307,7 @@ fn visible_grid_height(area: Rect, band_enabled: bool, n: usize) -> u16 {
     if !band_enabled || n == 0 {
         return 0;
     }
-    let height = grid_height(area.width, n);
+    let height = grid_height(&CARD_GRID, area.width, n);
     let table_h = area.height.saturating_sub(FOOTER_H).saturating_sub(height);
     if table_h >= TABLE_MIN_BODY_H.saturating_add(4) {
         height
@@ -1240,17 +1322,17 @@ fn visible_grid_height(area: Rect, band_enabled: bool, n: usize) -> u16 {
 /// left ragged rather than stretching its cards out of alignment with the rows
 /// above. The returned length is always `n`, which is what lets the render
 /// dispatch index it by present-provider order.
-fn grid_cells(band: Rect, n: usize) -> Vec<Rect> {
-    let (cols, rows) = quota_grid(band.width, n);
+fn grid_cells(spec: &GridSpec, band: Rect, n: usize) -> Vec<Rect> {
+    let (cols, rows) = quota_grid(spec, band.width, n);
     if cols == 0 {
         return Vec::new();
     }
-    let card_w = (band.width / cols as u16).min(CARD_MAX_W);
+    let card_w = (band.width / cols as u16).min(spec.max_w);
     // Center the row so capped cards do not leave all their slack on one side.
     let indent = (band.width - card_w * cols as u16) / 2;
     let row_rects = RatatuiLayout::default()
         .direction(Direction::Vertical)
-        .constraints(vec![Constraint::Length(CARD_H); rows])
+        .constraints(vec![Constraint::Length(spec.height); rows])
         .split(band);
 
     let mut cells = Vec::with_capacity(n);
@@ -1265,6 +1347,85 @@ fn grid_cells(band: Rect, n: usize) -> Vec<Rect> {
         }
     }
     cells
+}
+
+/// Collects every present provider's card, in the fixed render order.
+fn collect_cards(quota: &QuotaView, now: i64, width: u16) -> Vec<QuotaCard> {
+    let mut cards = Vec::with_capacity(MAX_QUOTA_PANELS);
+    if quota.present.claude {
+        cards.push(claude_card(quota.claude, now, width));
+    }
+    if quota.present.codex {
+        cards.push(codex_card(quota.codex, now, width));
+    }
+    if quota.present.copilot {
+        cards.push(copilot_card(quota.copilot, now, width));
+    }
+    if quota.present.cursor {
+        cards.push(cursor_card(quota.cursor, now, width));
+    }
+    if quota.present.grok {
+        cards.push(grok_card(quota.grok, now, width));
+    }
+    cards
+}
+
+/// Renders the full-screen quota overlay opened with `Q`.
+///
+/// This is where a card gets enough room for every line it has, whatever the
+/// always-on grid had to leave out. It uses the same placement formula with a
+/// roomier spec; a terminal too short even for that says how many providers it
+/// could not reach rather than ending at the border.
+fn render_quota_overlay(f: &mut Frame, area: Rect, quota: &QuotaView, now: i64) {
+    let outer = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    f.render_widget(Clear, outer);
+
+    let cards = collect_cards(quota, now, OVERLAY_GRID.max_w);
+    let inner = Rect {
+        x: outer.x + 1,
+        y: outer.y + 1,
+        width: outer.width.saturating_sub(2),
+        height: outer.height.saturating_sub(2),
+    };
+    let (cols, _) = quota_grid(&OVERLAY_GRID, inner.width, cards.len());
+    let fits = if cols == 0 {
+        0
+    } else {
+        cards
+            .len()
+            .min(cols * usize::from(inner.height / OVERLAY_GRID.height))
+    };
+    let hidden = cards.len() - fits;
+
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .title(Line::from(" Quota — all providers "))
+        .border_style(Style::default().fg(RatatuiColor::Cyan));
+    let hint = if hidden > 0 {
+        format!(" +{hidden} hidden · esc to close ")
+    } else {
+        " esc to close ".to_string()
+    };
+    block = block.title(
+        Line::from(Span::styled(
+            hint,
+            Style::default().fg(RatatuiColor::DarkGray),
+        ))
+        .right_aligned(),
+    );
+    f.render_widget(block, outer);
+
+    for (cell, card) in grid_cells(&OVERLAY_GRID, inner, fits)
+        .into_iter()
+        .zip(&cards)
+    {
+        render_quota_card(f, cell, card);
+    }
 }
 
 /// Renders the Provider Usage rail: a three-column table over a stacked share
@@ -2221,7 +2382,7 @@ mod tests {
             reset_credit_expirations: Some(vec![Some(now + 2 * 3_600 + 13 * 60)]),
             ..Default::default()
         };
-        let rendered = render_min_card(&codex_card(&codex, now, CARD_MIN_W));
+        let rendered = render_min_card(&codex_card(&codex, now, CARD_GRID.min_w));
 
         assert!(rendered.contains("reset expires 2h13m"), "got:\n{rendered}");
         assert!(rendered.contains("just now"), "got:\n{rendered}");
@@ -2230,14 +2391,15 @@ mod tests {
     /// Renders a card into the smallest cell the grid ever hands out and returns
     /// its text, so a test can assert what survives that width.
     fn render_min_card(card: &QuotaCard) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(CARD_MIN_W, CARD_H)).unwrap();
+        let mut terminal =
+            Terminal::new(TestBackend::new(CARD_GRID.min_w, CARD_GRID.height)).unwrap();
         terminal
             .draw(|frame| render_quota_card(frame, frame.area(), card))
             .expect("card renders");
         let buffer = terminal.backend().buffer();
-        (0..CARD_H)
+        (0..CARD_GRID.height)
             .map(|y| {
-                (0..CARD_MIN_W)
+                (0..CARD_GRID.min_w)
                     .map(|x| buffer.cell((x, y)).unwrap().symbol())
                     .collect::<String>()
             })
@@ -2265,7 +2427,7 @@ mod tests {
             prepaid_balance_dollars: Some(2.50),
             ..Default::default()
         };
-        let rendered = render_min_card(&grok_card(&grok, now, CARD_MIN_W));
+        let rendered = render_min_card(&grok_card(&grok, now, CARD_GRID.min_w));
 
         assert!(rendered.contains("SuperGrok"), "got:\n{rendered}");
         assert!(rendered.contains("week"));
@@ -2288,7 +2450,7 @@ mod tests {
             prepaid_balance_dollars: Some(12345.0),
             ..Default::default()
         };
-        let rendered = render_min_card(&grok_card(&grok, 0, CARD_MIN_W));
+        let rendered = render_min_card(&grok_card(&grok, 0, CARD_GRID.min_w));
         assert!(rendered.contains("$1.24K/$5.00K"), "got:\n{rendered}");
         assert!(rendered.contains("balance $12.3K"), "got:\n{rendered}");
     }
@@ -2307,7 +2469,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let rendered = render_min_card(&grok_card(&grok, now, CARD_MIN_W));
+        let rendered = render_min_card(&grok_card(&grok, now, CARD_GRID.min_w));
 
         assert!(rendered.contains("incl"));
         assert!(!rendered.contains("on-demand"));
@@ -2318,14 +2480,14 @@ mod tests {
     /// login hint rather than an empty box.
     #[test]
     fn grok_panel_reports_missing_data_and_a_needed_login() {
-        let rendered = render_min_card(&grok_card(&Default::default(), 0, CARD_MIN_W));
+        let rendered = render_min_card(&grok_card(&Default::default(), 0, CARD_GRID.min_w));
         assert!(rendered.contains("no Grok quota"));
 
         let grok = GrokQuotaSnapshot {
             needs_login: true,
             ..Default::default()
         };
-        let rendered = render_min_card(&grok_card(&grok, 0, CARD_MIN_W));
+        let rendered = render_min_card(&grok_card(&grok, 0, CARD_GRID.min_w));
         assert!(rendered.contains(GROK_LOGIN_HINT));
         assert!(!rendered.contains("no Grok quota"));
     }
@@ -2333,16 +2495,16 @@ mod tests {
     #[test]
     fn grid_packs_by_width_and_wraps_the_remainder() {
         // One rule for every count: as many cards per row as the width allows.
-        assert_eq!(quota_grid(CARD_MIN_W * 5, 5), (5, 1));
-        assert_eq!(quota_grid(120, 5), (5, 1));
-        assert_eq!(quota_grid(100, 5), (4, 2));
-        assert_eq!(quota_grid(80, 5), (3, 2));
+        assert_eq!(quota_grid(&CARD_GRID, CARD_GRID.min_w * 5, 5), (5, 1));
+        assert_eq!(quota_grid(&CARD_GRID, 120, 5), (5, 1));
+        assert_eq!(quota_grid(&CARD_GRID, 100, 5), (4, 2));
+        assert_eq!(quota_grid(&CARD_GRID, 80, 5), (3, 2));
         // Never more columns than there are cards.
-        assert_eq!(quota_grid(400, 2), (2, 1));
+        assert_eq!(quota_grid(&CARD_GRID, 400, 2), (2, 1));
         // A terminal too narrow for even one card still gets a single column
         // rather than a division by zero.
-        assert_eq!(quota_grid(10, 3), (1, 3));
-        assert_eq!(quota_grid(120, 0), (0, 0));
+        assert_eq!(quota_grid(&CARD_GRID, 10, 3), (1, 3));
+        assert_eq!(quota_grid(&CARD_GRID, 120, 0), (0, 0));
     }
 
     #[test]
@@ -2350,10 +2512,13 @@ mod tests {
         // The count only ever enters as a list length, so a sixth provider is
         // placed by the same expression as the first.
         for n in 1..=8 {
-            let (cols, rows) = quota_grid(120, n);
+            let (cols, rows) = quota_grid(&CARD_GRID, 120, n);
             assert!(cols >= 1 && cols <= n);
             assert!(cols * rows >= n);
-            assert_eq!(grid_height(120, n), rows as u16 * CARD_H);
+            assert_eq!(
+                grid_height(&CARD_GRID, 120, n),
+                rows as u16 * CARD_GRID.height
+            );
         }
     }
 
@@ -2363,11 +2528,13 @@ mod tests {
         // short or zero-width cell list would drop (or mis-place) a provider.
         for n in 0..=MAX_QUOTA_PANELS {
             for width in [80u16, 100, 120, 160, 200] {
-                let band = Rect::new(0, 0, width, grid_height(width, n));
-                let cells = grid_cells(band, n);
+                let band = Rect::new(0, 0, width, grid_height(&CARD_GRID, width, n));
+                let cells = grid_cells(&CARD_GRID, band, n);
                 assert_eq!(cells.len(), n, "n={n} width={width}");
                 assert!(
-                    cells.iter().all(|c| c.width > 0 && c.height == CARD_H),
+                    cells
+                        .iter()
+                        .all(|c| c.width > 0 && c.height == CARD_GRID.height),
                     "n={n} width={width}"
                 );
                 assert!(
@@ -2384,14 +2551,19 @@ mod tests {
         // the solver squeeze panels to 16 columns; the grid picks a column count
         // the width can actually hold.
         for width in [74u16, 80, 96, 100, 120, 160, 200] {
-            let band = Rect::new(0, 0, width, grid_height(width, MAX_QUOTA_PANELS));
-            for cell in grid_cells(band, MAX_QUOTA_PANELS) {
+            let band = Rect::new(
+                0,
+                0,
+                width,
+                grid_height(&CARD_GRID, width, MAX_QUOTA_PANELS),
+            );
+            for cell in grid_cells(&CARD_GRID, band, MAX_QUOTA_PANELS) {
                 assert!(
-                    cell.width >= CARD_MIN_W || width < CARD_MIN_W,
+                    cell.width >= CARD_GRID.min_w || width < CARD_GRID.min_w,
                     "width={width} gave a {}-column card",
                     cell.width
                 );
-                assert!(cell.width <= CARD_MAX_W);
+                assert!(cell.width <= CARD_GRID.max_w);
             }
         }
     }
@@ -2401,12 +2573,12 @@ mod tests {
         let n = MAX_QUOTA_PANELS;
         // Tall enough: the grid is drawn and the table keeps its floor.
         let tall = Rect::new(0, 0, 120, 40);
-        assert_eq!(visible_grid_height(tall, true, n), CARD_H);
+        assert_eq!(visible_grid_height(tall, true, n), CARD_GRID.height);
         // Short and narrow enough to need two card rows: folding wins.
         let short = Rect::new(0, 0, 80, 24);
         assert_eq!(visible_grid_height(short, true, n), 0);
         // The exact boundary: the table must keep TABLE_MIN_BODY_H body rows.
-        let grid = grid_height(120, n);
+        let grid = grid_height(&CARD_GRID, 120, n);
         let floor = grid + FOOTER_H + TABLE_MIN_BODY_H + 4;
         assert_eq!(
             visible_grid_height(Rect::new(0, 0, 120, floor - 1), true, n),
@@ -2444,7 +2616,7 @@ mod tests {
 
     #[test]
     fn gauge_line_drops_the_reset_marker_before_truncating_its_duration() {
-        let inner = card_inner_w(CARD_MIN_W);
+        let inner = card_inner_w(CARD_GRID.min_w);
         // A month-long cycle is the longest duration the API produces.
         let text = line_text(gauge_line("total", 5, 41.0, Some(30 * 86_400), 0, inner));
         assert!(text.chars().count() <= usize::from(inner), "got {text:?}");
@@ -2464,11 +2636,11 @@ mod tests {
             "~120-150 msgs".to_string(),
             "cap $50".to_string(),
         ];
-        let line = detail_line(&parts, card_inner_w(CARD_MIN_W)).expect("has parts");
+        let line = detail_line(&parts, card_inner_w(CARD_GRID.min_w)).expect("has parts");
         let text = line_text(line);
         assert!(text.starts_with("reset expires 2h13m"), "got {text:?}");
         assert!(text.ends_with("+2"), "got {text:?}");
-        assert!(text.chars().count() <= usize::from(card_inner_w(CARD_MIN_W)));
+        assert!(text.chars().count() <= usize::from(card_inner_w(CARD_GRID.min_w)));
         // Given room, nothing is hidden and no marker appears.
         let full = line_text(detail_line(&parts, 60).expect("has parts"));
         assert_eq!(full, "reset expires 2h13m · ~120-150 msgs · cap $50");
@@ -2504,5 +2676,94 @@ mod tests {
         let tiny = line_text(quota_digest(&items, 10));
         assert!(tiny.contains("Claude"), "got {tiny:?}");
         assert!(tiny.contains("+4 more"), "got {tiny:?}");
+    }
+
+    /// Builds a `QuotaView` with every provider present, for overlay tests.
+    fn every_provider<'a>(
+        claude: &'a ClaudeQuotaSnapshot,
+        codex: &'a CodexQuotaSnapshot,
+        copilot: &'a CopilotQuotaSnapshot,
+        cursor: &'a CursorQuotaSnapshot,
+        grok: &'a GrokQuotaSnapshot,
+    ) -> QuotaView<'a> {
+        QuotaView {
+            claude,
+            codex,
+            copilot,
+            cursor,
+            grok,
+            present: QuotaPresence {
+                claude: true,
+                codex: true,
+                copilot: true,
+                cursor: true,
+                grok: true,
+            },
+            band_enabled: true,
+            rail_visible: true,
+            overlay_open: true,
+        }
+    }
+
+    fn render_overlay(width: u16, height: u16) -> String {
+        let (claude, codex, copilot, cursor, grok) = Default::default();
+        let quota = every_provider(&claude, &codex, &copilot, &cursor, &grok);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| render_quota_overlay(frame, frame.area(), &quota, 0))
+            .expect("overlay renders");
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn overlay_shows_every_provider_when_it_has_the_room() {
+        let rendered = render_overlay(140, 30);
+        for name in ["Claude", "Codex", "Copilot", "Cursor", "Grok"] {
+            assert!(rendered.contains(name), "{name} missing from:\n{rendered}");
+        }
+        assert!(rendered.contains("esc to close"), "got:\n{rendered}");
+        assert!(
+            !rendered.contains("hidden"),
+            "nothing was hidden:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn overlay_says_how_many_providers_it_could_not_reach() {
+        // Two columns of one row is all a short terminal fits; the rest are
+        // counted in the title rather than ending at the border unannounced.
+        let rendered = render_overlay(80, 13);
+        assert!(rendered.contains("hidden"), "got:\n{rendered}");
+        assert!(rendered.contains("Claude"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn overlay_grid_gives_cards_room_the_always_on_grid_cannot() {
+        // The overlay exists so a provider's full line list has somewhere to go.
+        const _: () = assert!(OVERLAY_GRID.min_w > CARD_GRID.min_w);
+        const _: () = assert!(OVERLAY_GRID.height > CARD_GRID.height);
+
+        // Concretely: the fullest provider's lines all survive the overlay cell
+        // even when the always-on card had to flag some of them hidden.
+        let claude = ClaudeQuotaSnapshot {
+            plan_type: Some("max 20x".into()),
+            five_hour: Some(QuotaWindow::default()),
+            seven_day: Some(QuotaWindow::default()),
+            scoped_weekly: Some(QuotaWindow::default()),
+            scoped_label: Some("Opus".into()),
+            balance: Some("$5.00".into()),
+            spend_used: Some("$1.20".into()),
+            ..Default::default()
+        };
+        let card = claude_card(&claude, 0, OVERLAY_GRID.max_w);
+        assert!(card.lines.len() <= usize::from(OVERLAY_GRID.height - 2));
     }
 }

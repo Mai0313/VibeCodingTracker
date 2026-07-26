@@ -545,11 +545,21 @@ fn handle_input_from(source: &mut impl EventSource) -> anyhow::Result<InputActio
             // twice (which would double every nav step / page jump).
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 if key.code == KeyCode::Char('q')
-                    || key.code == KeyCode::Esc
                     || (key.code == KeyCode::Char('c')
                         && key.modifiers.contains(KeyModifiers::CONTROL))
                 {
                     return Ok(InputAction::Quit);
+                }
+                // Esc is a "back out of what is open" key, so a view with an
+                // overlay closes it; one without treats it as quit.
+                if key.code == KeyCode::Esc {
+                    return Ok(InputAction::Close);
+                }
+                if key.code == KeyCode::Char('Q') {
+                    return Ok(InputAction::ToggleQuota);
+                }
+                if key.code == KeyCode::Char('p') || key.code == KeyCode::Char('P') {
+                    return Ok(InputAction::TogglePane);
                 }
                 if key.code == KeyCode::Char('r') || key.code == KeyCode::Char('R') {
                     return Ok(InputAction::Refresh);
@@ -603,8 +613,15 @@ impl NavDelta {
 /// Action the TUI event loop should take in response to user input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputAction {
-    /// User asked to exit (`q`, `Esc`, or `Ctrl+C`).
+    /// User asked to exit (`q` or `Ctrl+C`).
     Quit,
+    /// User pressed `Esc`: close whatever is open, or quit when nothing is.
+    Close,
+    /// User toggled the full-screen quota detail overlay (`Q`); usage view
+    /// only, ignored elsewhere.
+    ToggleQuota,
+    /// User toggled the side pane (`p` / `P`).
+    TogglePane,
     /// User asked to re-fetch and redraw (`r` / `R`).
     Refresh,
     /// User toggled provider-prefix merging (`m` / `M`); usage view only,

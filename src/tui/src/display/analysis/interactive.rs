@@ -310,7 +310,8 @@ fn run_analysis_interactive(
             }
 
             match handle_input()? {
-                InputAction::Quit => break,
+                // Nothing is layered over the analysis view, so Esc is quit.
+                InputAction::Quit | InputAction::Close => break,
                 InputAction::Refresh => {
                     worker.request();
                     if loaded {
@@ -322,7 +323,8 @@ fn run_analysis_interactive(
                         )?;
                     }
                 }
-                InputAction::ToggleMerge => {}
+                InputAction::ToggleMerge | InputAction::ToggleQuota => {}
+                InputAction::TogglePane => {}
                 InputAction::Navigate(delta) if loaded => {
                     state.scroll.apply(delta, state.rows.len());
                     state.render(
