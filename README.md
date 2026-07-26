@@ -305,7 +305,7 @@ For noninteractive `usage` and `analysis` scans, vct exits with an error when ev
 
 ### Live Quota Panels
 
-`vct usage` shows **live quota usage for Claude Code, Codex, GitHub Copilot, Cursor, and Grok right in the dashboard — with zero setup.** No status-line hook, no credentials to enter: vct reads each provider's own credentials, calls its usage API on a background thread, and keeps the panels current while you work. Every gauge is percent **used**, so a full bar means the window is spent, not untouched. (Prefer a quieter dashboard? Trim `panels` under `[usage.quota]` in [`config.toml`](#configuration), or set it to `[]` to hide the band.)
+`vct usage` shows **live quota usage for Claude Code, Codex, GitHub Copilot, Cursor, and Grok right in the dashboard — with zero setup.** No status-line hook, no credentials to enter: vct reads each provider's own credentials, calls its usage API on a background thread, and keeps the panels current while you work. Every gauge is percent **used**, so a full bar means the window is spent, not untouched. (Prefer a quieter dashboard? Trim `panels` under `[usage.quota]` in [`config.toml`](#configuration), or set it to `[]` to hide the quota cards entirely. The Provider Usage pane is local scan data, not a quota panel, so it keeps its own `p` toggle.)
 
 ```
 ┌ Claude ──────────────┐┌ Codex ───────────────┐┌ Copilot ─────────────┐┌ Cursor ────────LIMIT ┐┌ Grok ────────────────┐
@@ -572,7 +572,7 @@ refresh_interval = 10
 
 [usage.quota]
 # Which live quota panels to show. Remove a name to hide that panel; use an
-# empty list ([]) to hide the whole band.
+# empty list ([]) to hide them all.
 panels = ["claude", "codex", "copilot", "cursor", "grok"]
 # Seconds between live quota-panel polls, shared by every provider (minimum 1).
 refresh_interval = 60
@@ -612,7 +612,7 @@ retention_days = 7
 | `general.version`              | Layout version vct stamps on the file, so a panel added by a later release is offered to you exactly once.                      |
 | `usage.merge_models`           | Seeds the dashboard merged; the `m` toggle saves your last choice back here. `--merge-providers` forces on.                     |
 | `usage.refresh_interval`       | Redraw cadence of the `usage` dashboard (seconds).                                                                              |
-| `usage.quota.panels`           | Which quota panels to show (`claude` / `codex` / `copilot` / `cursor` / `grok`); drop a name to hide it, `[]` to hide the band. |
+| `usage.quota.panels`           | Which quota panels to show (`claude` / `codex` / `copilot` / `cursor` / `grok`); drop a name to hide it, `[]` to hide them all. |
 | `usage.quota.refresh_interval` | Poll cadence for every live quota panel (seconds); higher is safer against a provider's rate limits.                            |
 | `analysis.refresh_interval`    | Redraw cadence of the `analysis` dashboard (seconds).                                                                           |
 | `performance.scan_threads`     | CLI scan workers. `0` uses `RAYON_NUM_THREADS` when positive, otherwise at most two workers; every value is CPU-capped.         |

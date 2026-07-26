@@ -305,7 +305,7 @@ Grok 的 `usage` 是單一當下的本地 context 估算：vct 會把 `signals.j
 
 ### 即時額度面板
 
-`vct usage` 會**在儀表板中直接顯示 Claude Code、Codex、GitHub Copilot、Cursor 與 Grok 的即時額度用量——完全零設定。** 不需要 status-line hook，也不需要手動輸入憑證：vct 會讀取各 provider 自己的 OAuth 憑證，在背景執行緒呼叫其用量 API，並在你工作時讓面板保持最新。每個進度條都是**已用**百分比，所以進度條滿格代表該額度週期已用盡，而不是還沒開始用。（想要更清爽的儀表板嗎？在 [`config.toml`](#%E8%A8%AD%E5%AE%9A) 中精簡 `[usage.quota]` 下的 `panels`,或設為 `[]` 隱藏整條。）
+`vct usage` 會**在儀表板中直接顯示 Claude Code、Codex、GitHub Copilot、Cursor 與 Grok 的即時額度用量——完全零設定。** 不需要 status-line hook，也不需要手動輸入憑證：vct 會讀取各 provider 自己的 OAuth 憑證，在背景執行緒呼叫其用量 API，並在你工作時讓面板保持最新。每個進度條都是**已用**百分比，所以進度條滿格代表該額度週期已用盡，而不是還沒開始用。（想要更清爽的儀表板嗎？在 [`config.toml`](#%E8%A8%AD%E5%AE%9A) 中精簡 `[usage.quota]` 下的 `panels`,或設為 `[]` 隱藏所有額度卡片。Provider Usage 側欄是本機掃描資料而不是額度面板,所以它有自己的 `p` 開關。）
 
 ```
 ┌ Claude ──────────────┐┌ Codex ───────────────┐┌ Copilot ─────────────┐┌ Cursor ────────LIMIT ┐┌ Grok ────────────────┐
@@ -571,7 +571,7 @@ merge_models = false
 refresh_interval = 10
 
 [usage.quota]
-# 顯示哪些即時額度面板;移除某個名稱即可隱藏該面板,用空列表 ([]) 隱藏整條。
+# 顯示哪些即時額度面板;移除某個名稱即可隱藏該面板,用空列表 ([]) 全部隱藏。
 panels = ["claude", "codex", "copilot", "cursor", "grok"]
 # 每個 provider 共用的即時額度面板輪詢間隔秒數（最少 1）。
 refresh_interval = 60
@@ -611,7 +611,7 @@ retention_days = 7
 | `general.version`              | vct 標記在檔案上的版面版本，讓後續版本新增的面板只會向你提議一次。                                            |
 | `usage.merge_models`           | 讓儀表板一開始就是合併狀態;`m` 切換會把你最後的選擇存回這裡。`--merge-providers` 會強制開啟。                 |
 | `usage.refresh_interval`       | `usage` 儀表板自動刷新的間隔（秒）。                                                                          |
-| `usage.quota.panels`           | 顯示哪些額度面板（`claude` / `codex` / `copilot` / `cursor` / `grok`）；移除名稱即可隱藏,`[]` 隱藏整條。      |
+| `usage.quota.panels`           | 顯示哪些額度面板（`claude` / `codex` / `copilot` / `cursor` / `grok`）；移除名稱即可隱藏,`[]` 全部隱藏。      |
 | `usage.quota.refresh_interval` | 每個即時額度面板的輪詢間隔（秒）；數值越大越不容易觸發 provider 的速率限制。                                  |
 | `analysis.refresh_interval`    | `analysis` 儀表板自動刷新的間隔（秒）。                                                                       |
 | `performance.scan_threads`     | CLI scan worker 數. `0` 優先採用正數的 `RAYON_NUM_THREADS`, 否則最多使用兩個 worker; 所有值都受 CPU 數量限制. |

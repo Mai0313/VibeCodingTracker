@@ -24,7 +24,7 @@ use ratatui::{
     layout::Constraint,
     style::{Color as RatatuiColor, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, Borders, Row as RatatuiRow},
+    widgets::{Block, Borders, Paragraph, Row as RatatuiRow},
 };
 use std::io;
 use std::sync::Arc;
@@ -440,7 +440,9 @@ fn render_analysis_frame_with_status<B: Backend>(
         // The analysis provider table is ten columns wide, so it stays a
         // full-width band rather than moving into a side rail like the usage
         // view's three-column one.
-        let band_height = analysis_panels_height(area.height, provider_rows.len()).unwrap_or(0);
+        let full_band = analysis_panels_height(area.height, provider_rows.len());
+        // A dropped band still costs one row, for the notice that says so.
+        let band_height = full_band.unwrap_or(1);
         let chunks = frame_layout(area, ANALYSIS_MIN_W, false, band_height);
 
         // Numeric columns, ordered by how readily they may be dropped when the
@@ -557,7 +559,25 @@ fn render_analysis_frame_with_status<B: Backend>(
             scroll,
         );
 
-        if let Some(panel_area) = chunks.band {
+        if let (Some(panel_area), None) = (chunks.band, full_band) {
+            // Too short for the provider table: say so rather than leaving the
+            // reader to wonder where it went.
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!(
+                        "{} provider totals hidden — needs {} more rows",
+                        provider_rows.len().saturating_sub(1),
+                        analysis_panels_height(u16::MAX, provider_rows.len())
+                            .unwrap_or(0)
+                            .saturating_add(ANALYSIS_BELOW_BAND_MIN_H)
+                            .saturating_sub(area.height)
+                    ),
+                    Style::default().fg(RatatuiColor::DarkGray),
+                )))
+                .centered(),
+                panel_area,
+            );
+        } else if let Some(panel_area) = chunks.band {
             // The provider band carries one more column than the model table
             // (Days) and is drawn at the full frame width, so it gets the same
             // priority treatment rather than over-committing and clipping its
@@ -740,5 +760,60 @@ mod tests {
         // No providers still floors the band height at 4 (needs 12 rows).
         assert_eq!(analysis_panels_height(11, 0), None);
         assert_eq!(analysis_panels_height(12, 0), Some(4));
+    }
+
+    #[test]
+    fn dropped_provider_band_is_announced() {
+        use ratatui::backend::TestBackend;
+        // 6 provider rows need 10 band rows plus 8 below, so 17 is too short.
+        let (w, h) = (ANALYSIS_MIN_W, 17u16);
+        assert_eq!(analysis_panels_height(h, 6), None);
+
+        let rows = vec![AnalysisRow {
+            model: "claude-opus-4-8".to_string(),
+            edit_lines: 1,
+            ..Default::default()
+        }];
+        // Five providers plus the overall row = 6 band rows, which needs 10 for
+        // the band and 8 beneath it: more than this terminal has.
+        let mut provider_totals = AnalysisProviderTotals::default();
+        for stats in [
+            &mut provider_totals.claude,
+            &mut provider_totals.codex,
+            &mut provider_totals.copilot,
+            &mut provider_totals.gemini,
+            &mut provider_totals.grok,
+        ] {
+            stats.total_edit_lines = 1;
+            stats.days_count = 1;
+        }
+        provider_totals.overall.total_edit_lines = 5;
+        provider_totals.overall.days_count = 1;
+        assert_eq!(build_analysis_provider_rows(&provider_totals).len(), 6);
+
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let mut scroll = ScrollState::new();
+        let pid = sysinfo::get_current_pid().unwrap();
+        let mut sys = System::new();
+        init_process_metrics(&mut sys, pid);
+        render_analysis_frame_with_status(
+            &mut terminal,
+            &rows,
+            &AnalysisRow::default(),
+            &provider_totals,
+            &UpdateTracker::new(MAX_TRACKED_ANALYSIS_ROWS, 0),
+            &sys,
+            pid,
+            &mut scroll,
+            None,
+        )
+        .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let screen: String = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| buffer.cell((x, y)).unwrap().symbol().to_string())
+            .collect();
+        assert!(screen.contains("provider totals hidden"), "got:\n{screen}");
     }
 }
