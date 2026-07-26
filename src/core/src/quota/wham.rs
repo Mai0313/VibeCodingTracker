@@ -586,6 +586,20 @@ mod tests {
         assert_eq!(snap.limit_reached, None);
     }
 
+    /// Version probing is off outside the binary, so the User-Agent is built
+    /// from the fallback and is stable enough to assert on.
+    #[test]
+    fn codex_ua_uses_the_fallback_version_under_test() {
+        assert_eq!(
+            codex_ua(),
+            format!(
+                "codex_cli_rs/{CODEX_FALLBACK_VERSION} ({}; {})",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            )
+        );
+    }
+
     // ---- HTTP-layer test against a local mock server (no real API) ----
 
     #[test]

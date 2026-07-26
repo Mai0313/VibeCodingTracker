@@ -66,6 +66,11 @@ fn main() -> Result<()> {
     // Installed early so a panic before the TUI starts still restores cleanly.
     vct_tui::display::common::tui::ensure_terminal_panic_hook();
 
+    // Let the quota fetchers impersonate the real provider clients: probing
+    // `<cli> --version` spawns a subprocess and caches the answer in `~/.vct`,
+    // so core leaves it to the binary to allow.
+    vct_core::quota::enable_cli_version_detection();
+
     if matches!(
         std::env::args_os().nth(1).and_then(|arg| arg.into_string().ok()),
         Some(arg) if arg == "--version" || arg == "-V"

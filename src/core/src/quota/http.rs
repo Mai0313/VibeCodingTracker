@@ -5,12 +5,38 @@
 //! ISO-timestamp conversion used by the fetchers.
 
 use anyhow::{Context, Result};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Whether this process may probe the installed provider CLIs for their
+/// versions. Off until [`enable_cli_version_detection`] turns it on.
+static CLI_VERSION_DETECTION: AtomicBool = AtomicBool::new(false);
+
+/// Lets [`detect_cli_version`] probe the installed CLIs for this process.
+///
+/// Probing spawns `<bin> --version` and caches the answer under `~/.vct` —
+/// side effects that belong to the application rather than to a library call,
+/// so `vct-core` keeps them off until the binary opts in (once, before
+/// dispatch). Any other embedder — including the test suite — gets each
+/// provider's fallback version without a subprocess or a home directory write.
+pub fn enable_cli_version_detection() {
+    CLI_VERSION_DETECTION.store(true, Ordering::Relaxed);
+}
+
+/// Whether CLI version probing has been enabled for this process.
+fn cli_version_detection_enabled() -> bool {
+    CLI_VERSION_DETECTION.load(Ordering::Relaxed)
+}
 
 /// Detects an installed CLI's version by running `<bin> --version`, caching the
 /// result under `~/.vct/<cache_file>` for the day so it is not re-run on every
 /// launch. Falls back to `fallback` when the CLI is absent or unreadable, so the
-/// User-Agent it feeds is always a plausible client version.
+/// User-Agent it feeds is always a plausible client version — and returns that
+/// same fallback outright until [`enable_cli_version_detection`] is called.
 pub fn detect_cli_version(bin: &str, cache_file: &str, fallback: &str) -> String {
+    if !cli_version_detection_enabled() {
+        return fallback.to_string();
+    }
     if let Some(v) = read_cached_version(cache_file) {
         return v;
     }
@@ -33,8 +59,13 @@ pub fn parse_version(raw: &str) -> Option<String> {
 /// Reads the `{version, last_checked_at}` cache, returning the version only if
 /// it was stamped earlier on the current UTC day.
 fn read_cached_version(cache_file: &str) -> Option<String> {
-    let path = crate::utils::get_cache_dir().ok()?.join(cache_file);
-    let text = std::fs::read_to_string(path).ok()?;
+    read_cached_version_in(&crate::utils::get_cache_dir().ok()?, cache_file)
+}
+
+/// The injectable core of [`read_cached_version`]: reads from an explicit cache
+/// directory. Production passes `~/.vct`; tests pass a temp dir.
+fn read_cached_version_in(dir: &Path, cache_file: &str) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join(cache_file)).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
     if !is_today_utc(v.get("last_checked_at")?.as_str()?) {
         return None;
@@ -44,9 +75,14 @@ fn read_cached_version(cache_file: &str) -> Option<String> {
 
 /// Persists `version` stamped with the current UTC time (best-effort, atomic).
 fn write_cached_version(cache_file: &str, version: &str) -> Result<()> {
-    let path = crate::utils::get_cache_dir()?.join(cache_file);
+    write_cached_version_in(&crate::utils::get_cache_dir()?, cache_file, version)
+}
+
+/// The injectable core of [`write_cached_version`], writing into an explicit
+/// cache directory.
+fn write_cached_version_in(dir: &Path, cache_file: &str, version: &str) -> Result<()> {
     crate::utils::write_json_atomic(
-        path,
+        dir.join(cache_file),
         &serde_json::json!({
             "version": version,
             "last_checked_at": crate::utils::now_rfc3339_utc_nanos(),
@@ -117,6 +153,43 @@ mod tests {
         assert!(is_today_utc(&now));
         assert!(!is_today_utc("2000-01-01T00:00:00Z"));
         assert!(!is_today_utc("not-a-timestamp"));
+    }
+
+    /// Nothing in the suite may enable probing: it would spawn a provider CLI
+    /// and write into the developer's real `~/.vct`.
+    #[test]
+    fn cli_version_detection_stays_off_outside_the_binary() {
+        assert!(!cli_version_detection_enabled());
+        assert_eq!(
+            detect_cli_version("cargo", "cargo_version.json", "1.2.3"),
+            "1.2.3"
+        );
+    }
+
+    #[test]
+    fn cached_version_round_trips_and_goes_stale_the_next_utc_day() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            read_cached_version_in(dir.path(), "grok_version.json"),
+            None
+        );
+
+        write_cached_version_in(dir.path(), "grok_version.json", "0.2.112").unwrap();
+        assert_eq!(
+            read_cached_version_in(dir.path(), "grok_version.json").as_deref(),
+            Some("0.2.112")
+        );
+
+        std::fs::write(
+            dir.path().join("grok_version.json"),
+            serde_json::json!({ "version": "0.1.0", "last_checked_at": "2000-01-01T00:00:00Z" })
+                .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            read_cached_version_in(dir.path(), "grok_version.json"),
+            None
+        );
     }
 
     #[test]

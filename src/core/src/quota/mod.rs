@@ -28,6 +28,7 @@ pub use claude::{CLAUDE_LOGIN_HINT, ClaudeState};
 pub use copilot::{COPILOT_LOGIN_HINT, CopilotState};
 pub use cursor::{CURSOR_LOGIN_HINT, CursorState};
 pub use grok::{GROK_LOGIN_HINT, GrokState};
+pub use http::enable_cli_version_detection;
 pub use provider::{QuotaOutcome, QuotaSnapshot, spawn_quota_worker};
 
 use crate::models::CodexQuotaSnapshot;
