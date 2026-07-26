@@ -135,9 +135,9 @@ fn existing_current_file_is_parsed_and_left_in_place() {
     let th = TempHome::new();
     let dir = &th.paths.cache_dir;
     fs::create_dir_all(dir).unwrap();
-    // Already in the current format (new keys + `#:schema`), so load must not
-    // rewrite it.
-    let original = "#:schema https://example.test/vct.schema.json\n[general]\ndefault_time_range = \"weekly\"\n\n[usage]\nmerge_models = true\n\n[usage.quota]\npanels = [\"claude\"]\n\n[providers]\ncursor = false\n";
+    // Already in the current format (new keys + `#:schema` + version marker), so
+    // load must not rewrite it.
+    let original = "#:schema https://example.test/vct.schema.json\n[general]\ndefault_time_range = \"weekly\"\nversion = 2\n\n[usage]\nmerge_models = true\n\n[usage.quota]\npanels = [\"claude\"]\n\n[providers]\ncursor = false\n";
     fs::write(dir.join("config.toml"), original).unwrap();
 
     let cfg = config::load_in(dir);
@@ -183,8 +183,12 @@ fn load_in_migrates_a_legacy_file_in_place() {
     fs::write(dir.join("config.toml"), legacy).unwrap();
 
     let cfg = config::load_in(dir);
-    // The user's values are honored through the migration.
-    assert_eq!(cfg.usage.quota.panels, vec!["claude".to_string()]);
+    // The user's values are honored through the migration, and a panel that
+    // shipped after this file was written is back-filled once.
+    assert_eq!(
+        cfg.usage.quota.panels,
+        vec!["claude".to_string(), "grok".to_string()]
+    );
     assert_eq!(cfg.usage.refresh_interval, 15);
     assert_eq!(cfg.analysis.refresh_interval, 20);
 

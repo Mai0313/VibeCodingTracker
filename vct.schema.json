@@ -20,7 +20,8 @@
     },
     "general": {
       "default": {
-        "default_time_range": "all"
+        "default_time_range": "all",
+        "version": 2
       },
       "description": "`[general]` — settings shared across subcommands.",
       "properties": {
@@ -49,6 +50,13 @@
               "type": "string"
             }
           ]
+        },
+        "version": {
+          "default": 1,
+          "description": "Layout version of this file, stamped by vct. Only the upgrade pass reads\nit; leave it alone unless you want a past upgrade to run again.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "type": "object"

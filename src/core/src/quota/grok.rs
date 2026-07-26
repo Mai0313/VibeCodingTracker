@@ -173,7 +173,9 @@ pub(crate) fn select_grok_entry(body: &str) -> Option<GrokCredential> {
 
 /// The outcome of reading a login for one worker tick.
 enum CredentialRead {
-    Ok(GrokCredential),
+    // Boxed so the outcome enum stays pointer-sized: the credential is one
+    // per tick, but every arm would otherwise carry its whole footprint.
+    Ok(Box<GrokCredential>),
     /// The file exists but holds no usable login (logged out / cleared): an auth
     /// failure, so nudge login rather than sitting on stale numbers.
     NeedsLogin,
@@ -189,7 +191,7 @@ fn read_grok_credential(path: &Path) -> CredentialRead {
         return CredentialRead::Transient;
     };
     match select_grok_entry(&body) {
-        Some(cred) => CredentialRead::Ok(cred),
+        Some(cred) => CredentialRead::Ok(Box::new(cred)),
         None => CredentialRead::NeedsLogin,
     }
 }
@@ -551,7 +553,7 @@ impl GrokState {
             Err(_) => return QuotaOutcome::Transient,
         };
         let cred = match read_grok_credential(&path) {
-            CredentialRead::Ok(cred) => cred,
+            CredentialRead::Ok(cred) => *cred,
             CredentialRead::NeedsLogin => return QuotaOutcome::NeedsLogin,
             CredentialRead::Transient => return QuotaOutcome::Transient,
         };
