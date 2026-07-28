@@ -29,6 +29,11 @@ use vct_core::session::state::ParseMode;
 use vct_core::summary_cache::SummaryScanCache;
 use vct_test_support::{TempHome, append_cursor_json_blob, fixture, fixture_str};
 
+/// A real Codex rollout file name: the archive move preserves it, and it is
+/// what cross-root deduplication keys on.
+const CODEX_ROLLOUT: &str =
+    "rollout-2026-06-06T10-00-00-019e4b75-8a4e-7801-a9ed-9723e77e0497.jsonl";
+
 fn providers_only(provider: ExtensionType) -> ProvidersConfig {
     ProvidersConfig {
         claude: provider == ExtensionType::ClaudeCode,
@@ -1635,4 +1640,61 @@ fn test_autodetect_handles_ten_thousand_record_preamble() {
         usage_input_tokens_for_model(&analysis, "claude-opus-4-7"),
         100
     );
+}
+
+#[test]
+fn codex_archived_sessions_contribute_analysis_exactly_once() {
+    let rollout = fixture_str("sessions/codex.jsonl");
+    let providers = providers_only(ExtensionType::Codex);
+
+    let active = TempHome::new();
+    active.put_codex_session(&format!("2026/06/06/{CODEX_ROLLOUT}"), &rollout);
+    let expected = aggregate_sessions_by_model_from_paths_with_providers(
+        &active.paths,
+        TimeRange::All,
+        providers,
+    )
+    .unwrap();
+    assert!(
+        !expected.per_provider.codex.is_empty(),
+        "the Codex fixture must contribute a row from the active root"
+    );
+
+    // Archiving moves the rollout log into the flat archived root; its file
+    // operations must keep counting from there.
+    let archived = TempHome::new();
+    archived.put_codex_archived_session(CODEX_ROLLOUT, &rollout);
+    let archived_only = aggregate_sessions_by_model_from_paths_with_providers(
+        &archived.paths,
+        TimeRange::All,
+        providers,
+    )
+    .unwrap();
+    assert_analysis_data_eq(&archived_only, &expected);
+
+    // A scan racing the archive move can see the same log under both roots.
+    let both = TempHome::new();
+    both.put_codex_session(&format!("2026/06/06/{CODEX_ROLLOUT}"), &rollout);
+    both.put_codex_archived_session(CODEX_ROLLOUT, &rollout);
+    let deduplicated = aggregate_sessions_by_model_from_paths_with_providers(
+        &both.paths,
+        TimeRange::All,
+        providers,
+    )
+    .unwrap();
+    assert_analysis_data_eq(&deduplicated, &expected);
+
+    let dataset = collect_analysis_sessions_from_paths_with(
+        &both.paths,
+        TimeRange::All,
+        providers,
+        ParseMode::Full,
+    )
+    .unwrap();
+    assert_eq!(
+        dataset.len(),
+        1,
+        "the canonical dataset must carry the session once"
+    );
+    assert_eq!(dataset.diagnostics.candidates, 1);
 }

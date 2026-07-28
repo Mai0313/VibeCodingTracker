@@ -19,8 +19,11 @@ pub struct HelperPaths {
     pub home_dir: PathBuf,
     /// Codex root (`~/.codex`).
     pub codex_dir: PathBuf,
-    /// Codex session logs (`~/.codex/sessions`).
+    /// Codex active session logs (`~/.codex/sessions`).
     pub codex_session_dir: PathBuf,
+    /// Codex archived session logs (`~/.codex/archived_sessions`); see
+    /// [`HelperPaths::codex_session_dirs`].
+    pub codex_archived_session_dir: PathBuf,
     /// Claude Code root (`~/.claude`).
     pub claude_dir: PathBuf,
     /// Claude Code session logs (`~/.claude/projects`).
@@ -61,6 +64,19 @@ pub struct HelperPaths {
     pub hermes_db: PathBuf,
     /// This tool's cache directory (`~/.vct`).
     pub cache_dir: PathBuf,
+}
+
+impl HelperPaths {
+    /// Every directory that can hold a Codex rollout log, active root first.
+    ///
+    /// Codex is the one file-backed provider with more than one session root:
+    /// archiving moves a log from the dated `sessions/YYYY/MM/DD/` tree into the
+    /// flat `archived_sessions/`, unchanged. The order is load-bearing — a
+    /// discovery walk keeps the copy it meets first, so a scan that races the
+    /// move attributes the session to the active root.
+    pub fn codex_session_dirs(&self) -> [&Path; 2] {
+        [&self.codex_session_dir, &self.codex_archived_session_dir]
+    }
 }
 
 /// Builds a [`HelperPaths`] from the current user's home directory.
@@ -172,6 +188,7 @@ fn build_paths(
 ) -> HelperPaths {
     let codex_dir = home_dir.join(".codex");
     let codex_session_dir = codex_dir.join("sessions");
+    let codex_archived_session_dir = codex_dir.join("archived_sessions");
     let claude_dir = home_dir.join(".claude");
     let claude_session_dir = claude_dir.join("projects");
     let copilot_dir = home_dir.join(".copilot");
@@ -218,6 +235,7 @@ fn build_paths(
         home_dir: home_dir.to_path_buf(),
         codex_dir,
         codex_session_dir,
+        codex_archived_session_dir,
         claude_dir,
         claude_session_dir,
         copilot_dir,
@@ -539,6 +557,18 @@ mod tests {
         assert!(p.cache_dir.ends_with(".vct"));
 
         assert_eq!(p.codex_session_dir, home.join(".codex").join("sessions"));
+        assert_eq!(
+            p.codex_archived_session_dir,
+            home.join(".codex").join("archived_sessions")
+        );
+        // Active root first: a duplicate found there wins over the archived copy.
+        assert_eq!(
+            p.codex_session_dirs(),
+            [
+                p.codex_session_dir.as_path(),
+                p.codex_archived_session_dir.as_path()
+            ]
+        );
         assert_eq!(p.claude_session_dir, home.join(".claude").join("projects"));
         assert_eq!(
             p.copilot_session_dir,

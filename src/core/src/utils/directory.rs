@@ -1,5 +1,7 @@
+use crate::constants::FastHashSet;
 use crate::models::TimeRange;
 use anyhow::Result;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -194,6 +196,85 @@ where
         files: results,
         failures,
     }
+}
+
+/// Discovers matching files across every root one provider's sessions live in.
+///
+/// Roots are walked in order and their results concatenated, so a provider with
+/// a single root behaves exactly as [`collect_files_with_max_depth_diagnostics`]
+/// does. With more than one root, a file name already found in an **earlier**
+/// root is dropped from a later one: Codex archives a session by moving its
+/// rollout log from `sessions/` to `archived_sessions/`, and a scan that races
+/// that move would otherwise fold the same session twice.
+///
+/// Declaring more than one root therefore asserts that a repeated file name means
+/// a repeated session. Codex satisfies that: its rollout logs are named
+/// `rollout-<timestamp>-<uuid>.jsonl` and keep that name across the move. Names
+/// are compared only across roots, never within one, because a provider may
+/// legitimately give every session the same file name (Copilot writes
+/// `events.jsonl` for all of them) — such a provider has to stay single-root.
+/// Each drop is logged at debug level so a wrong assertion is diagnosable rather
+/// than a silently missing session.
+pub(crate) fn collect_provider_files_diagnostics<F>(
+    dirs: &[&Path],
+    filter_fn: F,
+    time_range: TimeRange,
+    max_depth: Option<usize>,
+) -> FileDiscovery
+where
+    F: Fn(&Path) -> bool,
+{
+    let Some((first, rest)) = dirs.split_first() else {
+        return FileDiscovery {
+            files: Vec::new(),
+            failures: Vec::new(),
+        };
+    };
+    let mut discovery =
+        collect_files_with_max_depth_diagnostics(first, &filter_fn, time_range, max_depth);
+    if rest.is_empty() {
+        return discovery;
+    }
+
+    for dir in rest {
+        let mut found =
+            collect_files_with_max_depth_diagnostics(dir, &filter_fn, time_range, max_depth);
+        discovery.failures.append(&mut found.failures);
+        // The overwhelmingly common shape is an absent or empty later root (no
+        // session has been archived yet), so skip building the name index for it.
+        if found.files.is_empty() {
+            continue;
+        }
+        // Scoped so the borrow of the already-merged names ends before the append.
+        {
+            let seen: FastHashSet<&OsStr> = discovery
+                .files
+                .iter()
+                .filter_map(|file| file.path.file_name())
+                .collect();
+            found.files.retain(|file| {
+                let duplicate = file
+                    .path
+                    .file_name()
+                    .is_some_and(|name| seen.contains(name));
+                if duplicate {
+                    log::debug!(
+                        "skipping {}: already discovered under an earlier session root",
+                        file.path.display()
+                    );
+                }
+                !duplicate
+            });
+        }
+        discovery.files.append(&mut found.files);
+    }
+
+    discovery.failures.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.error.cmp(&right.error))
+    });
+    discovery
 }
 
 /// Maximum traversal depth for Copilot CLI session scans.
@@ -579,6 +660,86 @@ mod tests {
         .unwrap();
         assert_eq!(bounded.len(), 1);
         assert!(bounded[0].path.ends_with("sess-abc/events.jsonl"));
+    }
+
+    #[test]
+    fn test_collect_provider_files_deduplicates_only_across_roots() {
+        // Mirrors Codex: a dated active root plus the flat archived root the
+        // rollout log is moved into, with one session momentarily in both.
+        let dir = tempdir().unwrap();
+        let active = dir
+            .path()
+            .join("sessions")
+            .join("2026")
+            .join("06")
+            .join("06");
+        let archived = dir.path().join("archived_sessions");
+        fs::create_dir_all(&active).unwrap();
+        fs::create_dir_all(&archived).unwrap();
+        File::create(active.join("rollout-live.jsonl")).unwrap();
+        File::create(active.join("rollout-moving.jsonl")).unwrap();
+        File::create(archived.join("rollout-moving.jsonl")).unwrap();
+        File::create(archived.join("rollout-old.jsonl")).unwrap();
+
+        let roots = [dir.path().join("sessions"), archived.clone()];
+        let roots: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
+        let files =
+            collect_provider_files_diagnostics(&roots, is_codex_session_file, TimeRange::All, None)
+                .files;
+
+        let mut found: Vec<PathBuf> = files.into_iter().map(|file| file.path).collect();
+        found.sort();
+        assert_eq!(found.len(), 3, "the moving session must be counted once");
+        // The active copy wins, so the archived duplicate is the one dropped.
+        assert!(found.contains(&active.join("rollout-moving.jsonl")));
+        assert!(!found.contains(&archived.join("rollout-moving.jsonl")));
+        assert!(found.contains(&archived.join("rollout-old.jsonl")));
+    }
+
+    #[test]
+    fn test_collect_provider_files_keeps_same_named_files_in_one_root() {
+        // Every Copilot session log is named `events.jsonl`; a single-root
+        // provider must never have those collapsed into one.
+        let dir = tempdir().unwrap();
+        let sessions = dir.path().join("session-state");
+        for session in ["sess-a", "sess-b"] {
+            let path = sessions.join(session);
+            fs::create_dir_all(&path).unwrap();
+            File::create(path.join("events.jsonl")).unwrap();
+        }
+
+        let roots = [sessions.as_path()];
+        let files = collect_provider_files_diagnostics(
+            &roots,
+            is_copilot_session_file,
+            TimeRange::All,
+            Some(COPILOT_SESSION_MAX_DEPTH),
+        )
+        .files;
+
+        assert_eq!(files.len(), 2);
+    }
+
+    #[test]
+    fn test_collect_provider_files_skips_missing_roots() {
+        let dir = tempdir().unwrap();
+        let archived = dir.path().join("archived_sessions");
+        fs::create_dir_all(&archived).unwrap();
+        File::create(archived.join("rollout-old.jsonl")).unwrap();
+
+        // A Codex home that has only ever archived: the active root is absent.
+        let roots = [dir.path().join("sessions"), archived];
+        let roots: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
+        let discovery =
+            collect_provider_files_diagnostics(&roots, is_codex_session_file, TimeRange::All, None);
+
+        assert_eq!(discovery.files.len(), 1);
+        assert!(discovery.failures.is_empty());
+        assert!(
+            collect_provider_files_diagnostics(&[], is_codex_session_file, TimeRange::All, None)
+                .files
+                .is_empty()
+        );
     }
 
     #[test]

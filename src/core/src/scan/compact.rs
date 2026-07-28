@@ -18,7 +18,7 @@ use crate::summary_cache::{
     CachedSourceSummary, CompactSourceSummary, SourceFingerprint, SummaryCacheKey, SummaryKind,
     SummaryScanCache,
 };
-use crate::utils::directory::{FileInfo, collect_files_with_max_depth_diagnostics};
+use crate::utils::directory::{FileInfo, collect_provider_files_diagnostics};
 use anyhow::Result;
 use rayon::prelude::*;
 use std::path::Path;
@@ -117,13 +117,13 @@ pub(crate) fn fold_loaded(
     }
 }
 
-/// Scans one file-backed provider directory through the incremental cache.
+/// Scans one file-backed provider's session roots through the incremental cache.
 ///
 /// Shared verbatim by usage and analysis: discovery, cache lookup, parallel
 /// miss-load, cache insert, and fold. Each feature supplies only its `sink`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn scan_cached_files<F>(
-    dir: &Path,
+    dirs: &[&Path],
     provider: ExtensionType,
     filter: F,
     time_range: TimeRange,
@@ -137,7 +137,7 @@ pub(crate) fn scan_cached_files<F>(
 where
     F: Copy + Fn(&Path) -> bool + Sync + Send,
 {
-    let discovery = collect_files_with_max_depth_diagnostics(dir, filter, time_range, max_depth);
+    let discovery = collect_provider_files_diagnostics(dirs, filter, time_range, max_depth);
     if !discovery.failures.is_empty() {
         cache.preserve_provider_keys(seen, SummaryKind::File, provider);
     }

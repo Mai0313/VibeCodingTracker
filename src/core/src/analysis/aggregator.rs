@@ -14,7 +14,7 @@ use crate::session::state::ParseMode;
 use crate::summary_cache::{
     CompactSourceSummary, SourceFingerprint, SummaryCacheKey, SummaryKind, SummaryScanCache,
 };
-use crate::utils::directory::{FileInfo, collect_files_with_max_depth_diagnostics};
+use crate::utils::directory::{FileInfo, collect_provider_files_diagnostics};
 use crate::utils::{
     COPILOT_SESSION_MAX_DEPTH, GROK_SESSION_MAX_DEPTH, HelperPaths, get_current_user,
     get_machine_id, is_claude_session_file, is_codex_session_file, is_copilot_session_file,
@@ -328,7 +328,7 @@ where
 
     if providers.claude {
         visit_file_sessions(
-            &paths.claude_session_dir,
+            &[paths.claude_session_dir.as_path()],
             ExtensionType::ClaudeCode,
             is_claude_session_file,
             time_range,
@@ -341,7 +341,7 @@ where
 
     if providers.codex {
         visit_file_sessions(
-            &paths.codex_session_dir,
+            &paths.codex_session_dirs(),
             ExtensionType::Codex,
             is_codex_session_file,
             time_range,
@@ -354,7 +354,7 @@ where
 
     if providers.copilot {
         visit_file_sessions(
-            &paths.copilot_session_dir,
+            &[paths.copilot_session_dir.as_path()],
             ExtensionType::Copilot,
             is_copilot_session_file,
             time_range,
@@ -367,7 +367,7 @@ where
 
     if providers.gemini {
         visit_file_sessions(
-            &paths.gemini_session_dir,
+            &[paths.gemini_session_dir.as_path()],
             ExtensionType::Gemini,
             is_gemini_session_file,
             time_range,
@@ -380,7 +380,7 @@ where
 
     if providers.grok {
         visit_file_sessions(
-            &paths.grok_session_dir,
+            &[paths.grok_session_dir.as_path()],
             ExtensionType::Grok,
             is_grok_session_file,
             time_range,
@@ -771,7 +771,7 @@ type FileSessionOutcome =
 /// Visits one file-backed provider in deterministic path order.
 #[allow(clippy::too_many_arguments)]
 fn visit_file_sessions<F, V>(
-    dir: &Path,
+    dirs: &[&Path],
     provider: ExtensionType,
     filter_fn: F,
     time_range: TimeRange,
@@ -784,7 +784,7 @@ where
     F: Copy + Fn(&Path) -> bool + Sync + Send,
     V: FnMut(AnalysisSession),
 {
-    let discovery = collect_files_with_max_depth_diagnostics(dir, filter_fn, time_range, max_depth);
+    let discovery = collect_provider_files_diagnostics(dirs, filter_fn, time_range, max_depth);
     diagnostics.candidates += discovery.failures.len();
     for failure in discovery.failures {
         record_failure(diagnostics, provider, &failure.path, failure.error);

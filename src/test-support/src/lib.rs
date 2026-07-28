@@ -108,6 +108,14 @@ impl TempHome {
         p
     }
 
+    /// Drops a Codex rollout log at `~/.codex/archived_sessions/<rel>`, where
+    /// Codex moves a session's log once the user archives it.
+    pub fn put_codex_archived_session(&self, rel: &str, content: &str) -> PathBuf {
+        let p = self.paths.codex_archived_session_dir.join(rel);
+        Self::write_file(&p, content);
+        p
+    }
+
     /// Drops a Gemini chat log at `~/.gemini/tmp/<project>/chats/<file>`.
     ///
     /// The `chats` parent segment is required by `is_gemini_session_file`.
