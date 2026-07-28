@@ -138,6 +138,9 @@ impl QuotaPresence {
         let claude = get_claude_credentials_path()
             .map(|p| p.exists())
             .unwrap_or(false);
+        // Deliberately the active session root only: the panel's API-less
+        // fallback reads rate limits from there, so presence has to track what
+        // that fallback can actually find.
         let codex = resolve_paths()
             .map(|p| p.codex_dir.join("auth.json").exists() || p.codex_session_dir.exists())
             .unwrap_or(false);

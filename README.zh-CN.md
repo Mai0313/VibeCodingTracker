@@ -291,7 +291,7 @@ Totals (by Provider)
 该工具会自动扫描以下目录：
 
 - `~/.claude/projects/**/*.jsonl`（Claude Code，递归包含 subagent 日志）
-- `~/.codex/sessions/**/*.jsonl`（Codex，递归包含每日子目录）
+- `~/.codex/sessions/**/*.jsonl`（Codex，递归包含每日子目录），以及 `~/.codex/archived_sessions/*.jsonl`——归档会话时 Codex 会把日志移进这个扁平目录（同时存在于两处的会话只会计入一次）
 - `~/.copilot/session-state/<sessionId>/events.jsonl`（Copilot CLI）
 - `~/.gemini/tmp/<project_hash>/chats/*.jsonl`（Gemini CLI）
 - `~/.local/share/opencode/opencode.db`（OpenCode，SQLite 数据库；遵循 `$XDG_DATA_HOME`）

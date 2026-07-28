@@ -29,10 +29,11 @@ use crate::session::{
 use crate::summary_cache::{
     CompactSourceSummary, SourceFingerprint, SummaryCacheKey, SummaryKind, SummaryScanCache,
 };
+use crate::utils::directory::collect_provider_files_diagnostics;
 use crate::utils::{
-    COPILOT_SESSION_MAX_DEPTH, GROK_SESSION_MAX_DEPTH, HelperPaths, collect_files_with_max_depth,
-    is_claude_session_file, is_codex_session_file, is_copilot_session_file, is_gemini_session_file,
-    is_grok_session_file, merge_usage_values, resolve_paths,
+    COPILOT_SESSION_MAX_DEPTH, GROK_SESSION_MAX_DEPTH, HelperPaths, is_claude_session_file,
+    is_codex_session_file, is_copilot_session_file, is_gemini_session_file, is_grok_session_file,
+    merge_usage_values, resolve_paths,
 };
 use anyhow::Result;
 use rayon::prelude::*;
@@ -222,7 +223,7 @@ pub fn aggregate_usage_from_paths_with_providers(
         // Walks the projects tree recursively, so top-level `<session>.jsonl` logs
         // and `<session>/subagents/agent-*.jsonl` logs are both collected here.
         process_usage_directory(
-            &paths.claude_session_dir,
+            &[paths.claude_session_dir.as_path()],
             ExtensionType::ClaudeCode,
             &mut result,
             &mut per_provider.claude,
@@ -230,12 +231,13 @@ pub fn aggregate_usage_from_paths_with_providers(
             is_claude_session_file,
             time_range,
             None,
-        )?;
+        );
     }
 
-    if providers.codex && paths.codex_session_dir.exists() {
+    let codex_dirs = paths.codex_session_dirs();
+    if providers.codex && codex_dirs.iter().any(|dir| dir.exists()) {
         process_usage_directory(
-            &paths.codex_session_dir,
+            &codex_dirs,
             ExtensionType::Codex,
             &mut result,
             &mut per_provider.codex,
@@ -243,7 +245,7 @@ pub fn aggregate_usage_from_paths_with_providers(
             is_codex_session_file,
             time_range,
             None,
-        )?;
+        );
     }
 
     if providers.copilot && paths.copilot_session_dir.exists() {
@@ -253,7 +255,7 @@ pub fn aggregate_usage_from_paths_with_providers(
         // out of the `WalkDir` iteration entirely, so the scan cost stays
         // linear in the number of sessions rather than total artifacts.
         process_usage_directory(
-            &paths.copilot_session_dir,
+            &[paths.copilot_session_dir.as_path()],
             ExtensionType::Copilot,
             &mut result,
             &mut per_provider.copilot,
@@ -261,12 +263,12 @@ pub fn aggregate_usage_from_paths_with_providers(
             is_copilot_session_file,
             time_range,
             Some(COPILOT_SESSION_MAX_DEPTH),
-        )?;
+        );
     }
 
     if providers.gemini && paths.gemini_session_dir.exists() {
         process_usage_directory(
-            &paths.gemini_session_dir,
+            &[paths.gemini_session_dir.as_path()],
             ExtensionType::Gemini,
             &mut result,
             &mut per_provider.gemini,
@@ -274,12 +276,12 @@ pub fn aggregate_usage_from_paths_with_providers(
             is_gemini_session_file,
             time_range,
             None,
-        )?;
+        );
     }
 
     if providers.grok && paths.grok_session_dir.exists() {
         process_usage_directory(
-            &paths.grok_session_dir,
+            &[paths.grok_session_dir.as_path()],
             ExtensionType::Grok,
             &mut result,
             &mut per_provider.grok,
@@ -287,7 +289,7 @@ pub fn aggregate_usage_from_paths_with_providers(
             is_grok_session_file,
             time_range,
             Some(GROK_SESSION_MAX_DEPTH),
-        )?;
+        );
     }
 
     // OpenCode lives in a single SQLite database rather than a session
@@ -858,24 +860,19 @@ impl UsageAccumulator {
     }
 }
 
-/// Walks one provider directory and merges its usage into both result maps.
+/// Walks one provider's session roots and merges their usage into both result maps.
 ///
 /// Files matching `filter_fn` (and within `max_depth`, when set) are parsed in
 /// parallel with the provider fixed to `provider` — never re-detected from
 /// contents — and each session's per-model tokens are merged into both
 /// `global_result` (cross-provider view) and `provider_result` (source-scoped
 /// view). Every contributing session's modified date is inserted into
-/// `unique_dates` for the active-day count. A file that fails to parse logs a
-/// warning and is skipped.
-///
-/// # Errors
-///
-/// Returns an error only if the candidate-file collector returns one. The
-/// current collector skips traversal and metadata errors, and per-file parse
-/// failures are logged and skipped rather than propagated.
+/// `unique_dates` for the active-day count. Traversal and metadata errors are
+/// skipped by the collector, and a file that fails to parse logs a warning and
+/// is skipped, so this is best-effort by construction and cannot fail.
 #[allow(clippy::too_many_arguments)] // per-provider helper; struct-wrapping the args would hurt readability
-fn process_usage_directory<P, F>(
-    dir: P,
+fn process_usage_directory<F>(
+    dirs: &[&Path],
     provider: ExtensionType,
     global_result: &mut UsageResult,
     provider_result: &mut UsageResult,
@@ -883,13 +880,12 @@ fn process_usage_directory<P, F>(
     filter_fn: F,
     time_range: TimeRange,
     max_depth: Option<usize>,
-) -> Result<()>
-where
-    P: AsRef<Path>,
+) where
     F: Copy + Fn(&Path) -> bool + Sync + Send,
 {
-    let dir = dir.as_ref();
-    let files = collect_files_with_max_depth(dir, filter_fn, time_range, max_depth)?;
+    // This entry point has no diagnostics channel, so discovery failures are
+    // dropped here; the `*_with_diagnostics` scanners are the ones that report them.
+    let files = collect_provider_files_diagnostics(dirs, filter_fn, time_range, max_depth).files;
 
     // Parse each file directly in `UsageOnly` mode, extract the small
     // per-model usage map, then drop the analysis. The provider is fixed by
@@ -940,8 +936,6 @@ where
                 .or_insert(usage_value);
         }
     }
-
-    Ok(())
 }
 
 /// Reads OpenCode's SQLite database and merges its per-model usage into both

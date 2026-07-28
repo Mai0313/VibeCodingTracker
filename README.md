@@ -291,7 +291,7 @@ Every row serializes the same flat token fields regardless of provider (Codex's 
 The tool automatically scans these directories:
 
 - `~/.claude/projects/**/*.jsonl` (Claude Code — recursive, includes subagent logs)
-- `~/.codex/sessions/**/*.jsonl` (Codex — recursive, includes daily subdirectories)
+- `~/.codex/sessions/**/*.jsonl` (Codex — recursive, includes daily subdirectories) plus `~/.codex/archived_sessions/*.jsonl`, the flat directory Codex moves a session's log into when you archive it (a session found in both is counted once)
 - `~/.copilot/session-state/<sessionId>/events.jsonl` (Copilot CLI)
 - `~/.gemini/tmp/<project_hash>/chats/*.jsonl` (Gemini CLI)
 - `~/.local/share/opencode/opencode.db` (OpenCode — SQLite database; honors `$XDG_DATA_HOME`)

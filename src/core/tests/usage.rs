@@ -18,10 +18,30 @@ use vct_core::usage::aggregator::{
 };
 use vct_test_support::{TempHome, append_cursor_json_blob, fixture_str};
 
+/// A real Codex rollout file name: the archive move preserves it, and it is
+/// what cross-root deduplication keys on.
+const CODEX_ROLLOUT: &str =
+    "rollout-2026-06-06T10-00-00-019e4b75-8a4e-7801-a9ed-9723e77e0497.jsonl";
+
 fn claude_only() -> ProvidersConfig {
     ProvidersConfig {
         claude: true,
         codex: false,
+        copilot: false,
+        gemini: false,
+        opencode: false,
+        cursor: false,
+        hermes: false,
+        grok: false,
+    }
+}
+
+// Only the permission-based test needs this, and that one is Unix-only.
+#[cfg(unix)]
+fn codex_only() -> ProvidersConfig {
+    ProvidersConfig {
+        claude: false,
+        codex: true,
         copilot: false,
         gemini: false,
         opencode: false,
@@ -1063,4 +1083,92 @@ fn test_usage_handles_missing_cache_tokens() {
         usage_value["cache_creation_input_tokens"].as_i64().unwrap(),
         0
     );
+}
+
+#[test]
+fn codex_archived_sessions_contribute_usage_exactly_once() {
+    let rollout = fixture_str("sessions/codex.jsonl");
+
+    let active = TempHome::new();
+    active.put_codex_session(&format!("2026/06/06/{CODEX_ROLLOUT}"), &rollout);
+    let expected = aggregate_usage_from_paths(&active.paths, TimeRange::All).unwrap();
+    assert!(
+        !expected.per_provider.codex.is_empty(),
+        "the Codex fixture must contribute usage from the active root"
+    );
+
+    // Archiving moves the rollout log into the flat archived root, so a scan
+    // that only reads the active one would silently lose this session.
+    let archived = TempHome::new();
+    archived.put_codex_archived_session(CODEX_ROLLOUT, &rollout);
+    let archived_only = aggregate_usage_from_paths(&archived.paths, TimeRange::All).unwrap();
+    assert_usage_data_eq(&archived_only, &expected);
+
+    // A scan racing the archive move can see the same log under both roots.
+    let both = TempHome::new();
+    both.put_codex_session(&format!("2026/06/06/{CODEX_ROLLOUT}"), &rollout);
+    both.put_codex_archived_session(CODEX_ROLLOUT, &rollout);
+    let deduplicated = aggregate_usage_from_paths(&both.paths, TimeRange::All).unwrap();
+    assert_usage_data_eq(&deduplicated, &expected);
+}
+
+#[test]
+fn moving_a_codex_session_between_roots_keeps_cached_usage_stable() {
+    let home = TempHome::new();
+    let active = home.put_codex_session(
+        &format!("2026/06/06/{CODEX_ROLLOUT}"),
+        &fixture_str("sessions/codex.jsonl"),
+    );
+    let archived = home.paths.codex_archived_session_dir.join(CODEX_ROLLOUT);
+    std::fs::create_dir_all(archived.parent().unwrap()).unwrap();
+    let providers = ProvidersConfig::default();
+    let mut cache = SummaryScanCache::new();
+    let before =
+        aggregate_usage_from_paths_with_cache(&home.paths, TimeRange::All, providers, &mut cache)
+            .unwrap();
+    assert_eq!(before.diagnostics.parsed, 1);
+    assert_eq!(cache.stats().entries, 1);
+
+    // Archiving, then un-archiving: the cache is keyed by path, so both moves
+    // must re-key the entry rather than drop or duplicate the session.
+    for (from, to) in [(&active, &archived), (&archived, &active)] {
+        std::fs::rename(from, to).unwrap();
+        let after = aggregate_usage_from_paths_with_cache(
+            &home.paths,
+            TimeRange::All,
+            providers,
+            &mut cache,
+        )
+        .unwrap();
+        assert_eq!(after.diagnostics, before.diagnostics);
+        assert_usage_data_eq(&after.data, &before.data);
+        // The vacated path must be evicted, not left behind as a stale entry.
+        assert_eq!(cache.stats().entries, 1);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_codex_root_does_not_sink_the_other_one() {
+    let home = TempHome::new();
+    home.put_codex_session(
+        &format!("2026/06/06/{CODEX_ROLLOUT}"),
+        &fixture_str("sessions/codex.jsonl"),
+    );
+    let archived = &home.paths.codex_archived_session_dir;
+    std::fs::create_dir_all(archived).unwrap();
+    let original_permissions = std::fs::metadata(archived).unwrap().permissions();
+
+    std::fs::set_permissions(archived, std::fs::Permissions::from_mode(0o0)).unwrap();
+    let partial =
+        aggregate_usage_from_paths_with_diagnostics(&home.paths, TimeRange::All, codex_only());
+    std::fs::set_permissions(archived, original_permissions).unwrap();
+    let partial = partial.unwrap();
+
+    // One root failing is a partial failure, not an all-failed scan: the active
+    // root's session still counts, and the unreadable root is reported.
+    assert_eq!(partial.diagnostics.parsed, 1);
+    assert_eq!(partial.diagnostics.failures.len(), 1);
+    assert_eq!(partial.diagnostics.failures[0].source, *archived);
+    assert!(!partial.data.per_provider.codex.is_empty());
 }
