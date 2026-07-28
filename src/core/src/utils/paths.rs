@@ -12,7 +12,9 @@ use std::sync::OnceLock;
 ///
 /// Construct one with [`resolve_paths`]; the fields are derived from the
 /// user's home directory and are not validated to exist. The `*_session_dir`
-/// fields point at the subtree a directory walker scans for that provider.
+/// fields point at the primary subtree a directory walker scans for that
+/// provider; [`HelperPaths::codex_archived_session_dir`] returns Codex's
+/// additional archive root.
 #[derive(Debug, Clone)]
 pub struct HelperPaths {
     /// The user's home directory, the root for every other path.
@@ -61,6 +63,13 @@ pub struct HelperPaths {
     pub hermes_db: PathBuf,
     /// This tool's cache directory (`~/.vct`).
     pub cache_dir: PathBuf,
+}
+
+impl HelperPaths {
+    /// Returns the archived Codex session directory (`~/.codex/archived_sessions`).
+    pub fn codex_archived_session_dir(&self) -> PathBuf {
+        self.codex_dir.join("archived_sessions")
+    }
 }
 
 /// Builds a [`HelperPaths`] from the current user's home directory.
@@ -539,6 +548,10 @@ mod tests {
         assert!(p.cache_dir.ends_with(".vct"));
 
         assert_eq!(p.codex_session_dir, home.join(".codex").join("sessions"));
+        assert_eq!(
+            p.codex_archived_session_dir(),
+            home.join(".codex").join("archived_sessions")
+        );
         assert_eq!(p.claude_session_dir, home.join(".claude").join("projects"));
         assert_eq!(
             p.copilot_session_dir,

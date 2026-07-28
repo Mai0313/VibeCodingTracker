@@ -431,6 +431,105 @@ fn batch_analysis_from_paths_groups_by_model() {
 }
 
 #[test]
+fn codex_archived_sessions_are_included_and_deduplicated() {
+    let home = TempHome::new();
+    let fixture = fixture_str("sessions/codex.jsonl");
+    let archived_duplicate = fixture.replace("aide-gpt-5", "archived-duplicate-model");
+    home.put_archived_codex_session("rollout-shared.jsonl", &archived_duplicate);
+    let providers = providers_only(ExtensionType::Codex);
+
+    let archive_only = collect_analysis_sessions_from_paths_with(
+        &home.paths,
+        TimeRange::All,
+        providers,
+        ParseMode::Full,
+    )
+    .unwrap();
+    assert_eq!(archive_only.len(), 1);
+    assert_eq!(archive_only.diagnostics.candidates, 1);
+    assert!(
+        archive_only
+            .summarize()
+            .per_provider
+            .codex
+            .iter()
+            .any(|row| row.model == "archived-duplicate-model")
+    );
+
+    home.put_codex_session("2026/07/29/rollout-active-copy.jsonl", &fixture);
+    let active_preferred = collect_analysis_sessions_from_paths_with(
+        &home.paths,
+        TimeRange::All,
+        providers,
+        ParseMode::Full,
+    )
+    .unwrap();
+    assert_eq!(active_preferred.len(), 1);
+    let active_summary = active_preferred.summarize();
+    let rows = &active_summary.per_provider.codex;
+    assert!(rows.iter().any(|row| row.model == "aide-gpt-5"));
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.model == "archived-duplicate-model")
+    );
+
+    let distinct_archived = fixture
+        .replace(
+            "01996135-afde-7911-97f0-d863511eca56",
+            "019fae00-0000-7000-8000-000000000124",
+        )
+        .replace("aide-gpt-5", "archived-distinct-model");
+    home.put_archived_codex_session("rollout-distinct.jsonl", &distinct_archived);
+
+    let combined = collect_analysis_sessions_from_paths_with(
+        &home.paths,
+        TimeRange::All,
+        providers,
+        ParseMode::Full,
+    )
+    .unwrap();
+    assert_eq!(combined.len(), 2);
+    assert_eq!(combined.diagnostics.candidates, 2);
+    let combined_summary = combined.summarize();
+    let rows = &combined_summary.per_provider.codex;
+    assert!(rows.iter().any(|row| row.model == "aide-gpt-5"));
+    assert!(
+        rows.iter()
+            .any(|row| row.model == "archived-distinct-model")
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.model == "archived-duplicate-model")
+    );
+
+    let mut cache = SummaryScanCache::new();
+    let cold = aggregate_sessions_by_model_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        providers,
+        &mut cache,
+    )
+    .unwrap();
+    assert_eq!(cold.diagnostics.candidates, 2);
+    assert_eq!(cold.diagnostics.parsed, 2);
+    assert_eq!(cache.stats().entries, 2);
+    assert_eq!(cache.stats().parsed_sources, 2);
+    assert_analysis_data_eq(&cold.data, &combined_summary);
+
+    let warm = aggregate_sessions_by_model_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        providers,
+        &mut cache,
+    )
+    .unwrap();
+    assert_eq!(cache.stats().parsed_sources, 0);
+    assert_analysis_data_eq(&warm.data, &combined_summary);
+}
+
+#[test]
 fn cached_analysis_matches_uncached_and_reuses_unchanged_sources() {
     let home = TempHome::new();
     home.put_claude_session(

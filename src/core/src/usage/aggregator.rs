@@ -29,10 +29,12 @@ use crate::session::{
 use crate::summary_cache::{
     CompactSourceSummary, SourceFingerprint, SummaryCacheKey, SummaryKind, SummaryScanCache,
 };
+use crate::utils::directory::FileInfo;
 use crate::utils::{
-    COPILOT_SESSION_MAX_DEPTH, GROK_SESSION_MAX_DEPTH, HelperPaths, collect_files_with_max_depth,
-    is_claude_session_file, is_codex_session_file, is_copilot_session_file, is_gemini_session_file,
-    is_grok_session_file, merge_usage_values, resolve_paths,
+    COPILOT_SESSION_MAX_DEPTH, GROK_SESSION_MAX_DEPTH, HelperPaths,
+    collect_codex_session_files_with_diagnostics, collect_files_with_max_depth,
+    is_claude_session_file, is_copilot_session_file, is_gemini_session_file, is_grok_session_file,
+    merge_usage_values, resolve_paths,
 };
 use anyhow::Result;
 use rayon::prelude::*;
@@ -233,16 +235,21 @@ pub fn aggregate_usage_from_paths_with_providers(
         )?;
     }
 
-    if providers.codex && paths.codex_session_dir.exists() {
-        process_usage_directory(
+    let codex_archived_session_dir = paths.codex_archived_session_dir();
+    if providers.codex && (paths.codex_session_dir.exists() || codex_archived_session_dir.exists())
+    {
+        let files = collect_codex_session_files_with_diagnostics(
             &paths.codex_session_dir,
+            &codex_archived_session_dir,
+            time_range,
+        )
+        .files;
+        process_usage_files(
+            files,
             ExtensionType::Codex,
             &mut result,
             &mut per_provider.codex,
             &mut codex_dates,
-            is_codex_session_file,
-            time_range,
-            None,
         )?;
     }
 
@@ -890,7 +897,22 @@ where
 {
     let dir = dir.as_ref();
     let files = collect_files_with_max_depth(dir, filter_fn, time_range, max_depth)?;
+    process_usage_files(
+        files,
+        provider,
+        global_result,
+        provider_result,
+        unique_dates,
+    )
+}
 
+fn process_usage_files(
+    files: Vec<FileInfo>,
+    provider: ExtensionType,
+    global_result: &mut UsageResult,
+    provider_result: &mut UsageResult,
+    unique_dates: &mut HashSet<String>,
+) -> Result<()> {
     // Parse each file directly in `UsageOnly` mode, extract the small
     // per-model usage map, then drop the analysis. The provider is fixed by
     // the source directory — we do not re-detect from file contents, which

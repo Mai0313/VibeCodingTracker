@@ -1,6 +1,9 @@
 use crate::models::TimeRange;
 use anyhow::Result;
+use serde::Deserialize;
+use std::collections::HashSet;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -196,6 +199,93 @@ where
     }
 }
 
+/// Discovers active and archived Codex rollout files as one deduplicated source.
+///
+/// Current Codex logs carry their stable session identity in
+/// `session_meta.payload.id`. Active files are considered first so they win
+/// when the same session also remains under `archived_sessions`. A file without
+/// a readable session id is retained rather than guessed to be a duplicate.
+pub(crate) fn collect_codex_session_files_with_diagnostics(
+    active_dir: &Path,
+    archived_dir: &Path,
+    time_range: TimeRange,
+) -> FileDiscovery {
+    let mut active = collect_files_with_max_depth_diagnostics(
+        active_dir,
+        is_codex_session_file,
+        time_range,
+        None,
+    );
+    let mut archived = collect_files_with_max_depth_diagnostics(
+        archived_dir,
+        is_codex_session_file,
+        time_range,
+        None,
+    );
+    active
+        .files
+        .sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    archived
+        .files
+        .sort_unstable_by(|left, right| left.path.cmp(&right.path));
+
+    let mut seen_session_ids = HashSet::new();
+    let mut files = Vec::with_capacity(active.files.len() + archived.files.len());
+    for file in active.files.into_iter().chain(archived.files) {
+        if let Some(session_id) = read_codex_session_id(&file.path)
+            && !seen_session_ids.insert(session_id)
+        {
+            continue;
+        }
+        files.push(file);
+    }
+    files.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+
+    active.failures.append(&mut archived.failures);
+    active.failures.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.error.cmp(&right.error))
+    });
+    FileDiscovery {
+        files,
+        failures: active.failures,
+    }
+}
+
+#[derive(Deserialize)]
+struct CodexSessionIdentityRecord {
+    #[serde(rename = "type")]
+    record_type: String,
+    #[serde(default)]
+    payload: CodexSessionIdentityPayload,
+}
+
+#[derive(Default, Deserialize)]
+struct CodexSessionIdentityPayload {
+    id: Option<String>,
+}
+
+fn read_codex_session_id(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => return None,
+            Ok(_) => {}
+        }
+        let Ok(record) = serde_json::from_str::<CodexSessionIdentityRecord>(&line) else {
+            continue;
+        };
+        if record.record_type == "session_meta" {
+            return record.payload.id.filter(|id| !id.is_empty());
+        }
+    }
+}
+
 /// Maximum traversal depth for Copilot CLI session scans.
 ///
 /// Copilot writes `~/.copilot/session-state/<sessionId>/events.jsonl`, so
@@ -213,9 +303,10 @@ pub const COPILOT_SESSION_MAX_DEPTH: usize = 2;
 /// each signals file is exactly three levels below the sessions root.
 pub const GROK_SESSION_MAX_DEPTH: usize = 3;
 
-/// Filter for Codex session files under `~/.codex/sessions/YYYY/MM/DD/`.
+/// Filter for Codex session files under the active or archived session roots.
 ///
-/// Codex writes `rollout-*.jsonl` files directly into the dated sub-folders.
+/// Active sessions live in dated sub-folders under `~/.codex/sessions`, while
+/// archived sessions live directly under `~/.codex/archived_sessions`.
 /// We also accept `.json` defensively in case an older dump ever gets dropped
 /// into the tree, but reject Claude Code's `*.meta.json` / `*.meta.jsonl`
 /// subagent sidecar files (those live under `~/.claude/projects/` in

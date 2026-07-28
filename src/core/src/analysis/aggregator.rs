@@ -14,11 +14,12 @@ use crate::session::state::ParseMode;
 use crate::summary_cache::{
     CompactSourceSummary, SourceFingerprint, SummaryCacheKey, SummaryKind, SummaryScanCache,
 };
-use crate::utils::directory::{FileInfo, collect_files_with_max_depth_diagnostics};
+use crate::utils::collect_codex_session_files_with_diagnostics;
+use crate::utils::directory::{FileDiscovery, FileInfo, collect_files_with_max_depth_diagnostics};
 use crate::utils::{
     COPILOT_SESSION_MAX_DEPTH, GROK_SESSION_MAX_DEPTH, HelperPaths, get_current_user,
-    get_machine_id, is_claude_session_file, is_codex_session_file, is_copilot_session_file,
-    is_gemini_session_file, is_grok_session_file,
+    get_machine_id, is_claude_session_file, is_copilot_session_file, is_gemini_session_file,
+    is_grok_session_file,
 };
 use anyhow::Result;
 use rayon::prelude::*;
@@ -72,7 +73,7 @@ pub struct AnalysisCollection {
 pub struct PerProviderAnalysisRows {
     /// Rows from the Claude Code session directory.
     pub claude: Vec<AggregatedAnalysisRow>,
-    /// Rows from the Codex session directory.
+    /// Rows from the active and archived Codex session directories.
     pub codex: Vec<AggregatedAnalysisRow>,
     /// Rows from the Copilot CLI session directory.
     pub copilot: Vec<AggregatedAnalysisRow>,
@@ -340,12 +341,15 @@ where
     }
 
     if providers.codex {
-        visit_file_sessions(
+        let archived_session_dir = paths.codex_archived_session_dir();
+        let discovery = collect_codex_session_files_with_diagnostics(
             &paths.codex_session_dir,
-            ExtensionType::Codex,
-            is_codex_session_file,
+            &archived_session_dir,
             time_range,
-            None,
+        );
+        visit_discovered_file_sessions(
+            discovery,
+            ExtensionType::Codex,
             mode,
             &mut diagnostics,
             visitor,
@@ -785,6 +789,19 @@ where
     V: FnMut(AnalysisSession),
 {
     let discovery = collect_files_with_max_depth_diagnostics(dir, filter_fn, time_range, max_depth);
+    visit_discovered_file_sessions(discovery, provider, mode, diagnostics, visitor)
+}
+
+fn visit_discovered_file_sessions<V>(
+    discovery: FileDiscovery,
+    provider: ExtensionType,
+    mode: ParseMode,
+    diagnostics: &mut ScanDiagnostics,
+    visitor: &mut V,
+) -> Result<()>
+where
+    V: FnMut(AnalysisSession),
+{
     diagnostics.candidates += discovery.failures.len();
     for failure in discovery.failures {
         record_failure(diagnostics, provider, &failure.path, failure.error);

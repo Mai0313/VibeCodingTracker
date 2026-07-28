@@ -138,7 +138,7 @@ Resolved by `src/core/src/utils/paths.rs` (`resolve_paths`):
 | Provider      | Source path                                                                                                                                                  |
 | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Claude Code   | `~/.claude/projects/**/*.jsonl` (recursive — includes subagents)                                                                                             |
-| Codex         | `~/.codex/sessions/**/*.jsonl`                                                                                                                               |
+| Codex         | `~/.codex/sessions/**/*.jsonl` plus `~/.codex/archived_sessions/*.jsonl`                                                                                     |
 | Copilot CLI   | `~/.copilot/session-state/<sessionId>/events.jsonl` (depth-bounded walk via `COPILOT_SESSION_MAX_DEPTH` to skip per-session snapshot subtrees)               |
 | Gemini CLI    | `~/.gemini/tmp/<project_hash>/chats/*.jsonl` plus `chats/<parent_session>/*.jsonl` for subagents                                                             |
 | OpenCode      | `~/.local/share/opencode/opencode.db` (SQLite database, read via `rusqlite`; honors `$XDG_DATA_HOME`)                                                        |

@@ -18,6 +18,7 @@ pub mod token_merge;
 pub mod usage_processor;
 
 // Public API exports (commonly used across modules)
+pub(crate) use directory::collect_codex_session_files_with_diagnostics;
 pub use directory::{
     COPILOT_SESSION_MAX_DEPTH, GROK_SESSION_MAX_DEPTH, collect_files_with_dates,
     collect_files_with_max_depth, is_claude_session_file, is_codex_session_file,

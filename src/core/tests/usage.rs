@@ -31,6 +31,19 @@ fn claude_only() -> ProvidersConfig {
     }
 }
 
+fn codex_only() -> ProvidersConfig {
+    ProvidersConfig {
+        claude: false,
+        codex: true,
+        copilot: false,
+        gemini: false,
+        opencode: false,
+        cursor: false,
+        hermes: false,
+        grok: false,
+    }
+}
+
 fn opencode_only() -> ProvidersConfig {
     ProvidersConfig {
         claude: false,
@@ -189,6 +202,115 @@ fn empty_home_yields_no_usage() {
         aggregate_usage_from_paths(&home.paths, TimeRange::All).expect("aggregate empty home");
     assert!(data.models.is_empty(), "empty home has no models");
     assert_eq!(data.provider_days.total, 0);
+}
+
+#[test]
+fn codex_archived_sessions_are_included_and_deduplicated() {
+    let home = TempHome::new();
+    let fixture = fixture_str("sessions/codex.jsonl");
+    let archived_duplicate = fixture.replace("aide-gpt-5", "archived-duplicate-model");
+    home.put_archived_codex_session("rollout-shared.jsonl", &archived_duplicate);
+
+    let archive_only =
+        aggregate_usage_from_paths_with_providers(&home.paths, TimeRange::All, codex_only())
+            .unwrap();
+    assert!(
+        archive_only
+            .per_provider
+            .codex
+            .contains_key("archived-duplicate-model")
+    );
+
+    let mut cache = SummaryScanCache::new();
+    let archive_only_cached = aggregate_usage_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        codex_only(),
+        &mut cache,
+    )
+    .unwrap();
+    assert_eq!(archive_only_cached.diagnostics.candidates, 1);
+    assert_eq!(archive_only_cached.diagnostics.parsed, 1);
+    assert_eq!(cache.stats().parsed_sources, 1);
+    assert_usage_data_eq(&archive_only_cached.data, &archive_only);
+
+    home.put_codex_session("2026/07/29/rollout-active-copy.jsonl", &fixture);
+    let active_preferred =
+        aggregate_usage_from_paths_with_providers(&home.paths, TimeRange::All, codex_only())
+            .unwrap();
+    assert!(
+        active_preferred
+            .per_provider
+            .codex
+            .contains_key("aide-gpt-5")
+    );
+    assert!(
+        !active_preferred
+            .per_provider
+            .codex
+            .contains_key("archived-duplicate-model")
+    );
+
+    let active_preferred_cached = aggregate_usage_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        codex_only(),
+        &mut cache,
+    )
+    .unwrap();
+    assert_eq!(active_preferred_cached.diagnostics.candidates, 1);
+    assert_eq!(active_preferred_cached.diagnostics.parsed, 1);
+    assert_eq!(cache.stats().entries, 1);
+    assert_eq!(cache.stats().parsed_sources, 1);
+    assert_usage_data_eq(&active_preferred_cached.data, &active_preferred);
+
+    let distinct_archived = fixture
+        .replace(
+            "01996135-afde-7911-97f0-d863511eca56",
+            "019fae00-0000-7000-8000-000000000124",
+        )
+        .replace("aide-gpt-5", "archived-distinct-model");
+    home.put_archived_codex_session("rollout-distinct.jsonl", &distinct_archived);
+
+    let combined =
+        aggregate_usage_from_paths_with_providers(&home.paths, TimeRange::All, codex_only())
+            .unwrap();
+    assert!(combined.per_provider.codex.contains_key("aide-gpt-5"));
+    assert!(
+        combined
+            .per_provider
+            .codex
+            .contains_key("archived-distinct-model")
+    );
+    assert!(
+        !combined
+            .per_provider
+            .codex
+            .contains_key("archived-duplicate-model")
+    );
+
+    let combined_cached = aggregate_usage_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        codex_only(),
+        &mut cache,
+    )
+    .unwrap();
+    assert_eq!(combined_cached.diagnostics.candidates, 2);
+    assert_eq!(combined_cached.diagnostics.parsed, 2);
+    assert_eq!(cache.stats().entries, 2);
+    assert_eq!(cache.stats().parsed_sources, 1);
+    assert_usage_data_eq(&combined_cached.data, &combined);
+
+    let warm = aggregate_usage_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        codex_only(),
+        &mut cache,
+    )
+    .unwrap();
+    assert_eq!(cache.stats().parsed_sources, 0);
+    assert_usage_data_eq(&warm.data, &combined);
 }
 
 #[test]
