@@ -8,8 +8,8 @@ on:
 permissions: write-all
 
 concurrency:
-  group: ${{ github.workflow }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -206,6 +206,7 @@ jobs:
       id-token: write
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - name: vibe-coding-tracker
@@ -292,7 +293,17 @@ jobs:
       - name: Publish to npm
         working-directory: cli/nodejs
         run: |
-          npm publish --access public
+          PKG=$(node -p "require('./package.json').name")
+          VER=$(node -p "require('./package.json').version")
+          if npm view "${PKG}@${VER}" version >/dev/null 2>&1; then
+            echo "${PKG}@${VER} is already on the registry, nothing to do."
+            exit 0
+          fi
+          # A trusted-publisher mismatch surfaces as ENEEDAUTH, see npm/cli#9088
+          npm publish --access public || {
+            echo "::error::npm publish failed for ${PKG}. If this is ENEEDAUTH, check the trusted publisher at https://www.npmjs.com/package/${PKG}/access"
+            exit 1
+          }
 
       - name: Verify publication
         working-directory: cli/nodejs
@@ -398,7 +409,7 @@ jobs:
         env:
           UV_PUBLISH_TOKEN: ${{ secrets.UV_PUBLISH_TOKEN }}
         run: |
-          uv publish
+          uv publish --check-url https://pypi.org/simple/
 
       - name: Verify publication
         working-directory: cli/python
