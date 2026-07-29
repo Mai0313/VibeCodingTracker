@@ -437,13 +437,10 @@ fn render_analysis_frame_with_status<B: Backend>(
             return;
         }
 
-        // The analysis provider table is ten columns wide, so it stays a
-        // full-width band rather than moving into a side rail like the usage
-        // view's three-column one.
         let full_band = analysis_panels_height(area.height, provider_rows.len());
         // A dropped band still costs one row, for the notice that says so.
         let band_height = full_band.unwrap_or(1);
-        let chunks = frame_layout(area, ANALYSIS_MIN_W, false, band_height);
+        let chunks = frame_layout(area, band_height);
 
         // Numeric columns, ordered by how readily they may be dropped when the
         // pane is narrow. Line counts are the headline metric, so the per-tool

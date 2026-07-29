@@ -280,20 +280,13 @@ pub fn create_controls_with_status(
 /// Rows the scrollable content pane is never squeezed below. The block border,
 /// header row and header margin eat 4, so this keeps ~2 body rows alive.
 pub const CONTENT_MIN_H: u16 = 6;
-/// Narrowest a side rail may be and still hold a gauge line or a three-column
-/// provider row without truncating it.
-pub(crate) const RAIL_MIN_W: u16 = 30;
-/// Widest a side rail grows to; past this the content pane keeps the slack.
-const RAIL_MAX_W: u16 = 52;
 /// Rows the frame always spends below the content: summary + controls.
 pub const FOOTER_H: u16 = 2;
 
 /// Chunk rects for an interactive frame.
 pub struct FrameChunks {
-    /// Scrollable main table area.
+    /// Scrollable main table area, always the full width of the frame.
     pub content: Rect,
-    /// Side rail beside the content, present only on a wide enough terminal.
-    pub rail: Option<Rect>,
     /// Full-width band under the content, present only when one was asked for.
     pub band: Option<Rect>,
     /// Single-line summary area.
@@ -302,32 +295,14 @@ pub struct FrameChunks {
     pub controls: Rect,
 }
 
-/// Width the side rail takes at `width`, or `None` when it does not fit.
-///
-/// The rail exists to put the horizontal gutter to work, so it only appears
-/// once the content pane can keep its own minimum beside it. Between the
-/// bounds it takes a third of the terminal, which is what lets a wide terminal
-/// spend its slack on rail content instead of inflating a name column. The
-/// share is then capped at whatever the content pane can spare, so the returned
-/// width is the width the rail actually gets rather than one the layout solver
-/// would have to shrink back.
-fn rail_width(width: u16, content_min_w: u16) -> Option<u16> {
-    (width >= content_min_w.saturating_add(RAIL_MIN_W)).then(|| {
-        (width / 3)
-            .clamp(RAIL_MIN_W, RAIL_MAX_W)
-            .min(width - content_min_w)
-    })
-}
-
 /// Splits `area` into the standard interactive-view regions.
 ///
-/// Vertically: the content pane absorbs all leftover height, then an optional
-/// `band_height`-row band, then one row each of summary and controls.
-/// Horizontally the content row is split once — content pane plus rail — and
-/// only when `rail` is requested *and* [`rail_width`] says it fits. That single
-/// comparison is the whole responsive story; nothing here reads how many items
-/// the caller intends to draw.
-pub fn frame_layout(area: Rect, content_min_w: u16, rail: bool, band_height: u16) -> FrameChunks {
+/// The content pane absorbs all leftover height, then an optional
+/// `band_height`-row band, then one row each of summary and controls. Every
+/// region spans the full width: a view that wants to show more than its table
+/// spends rows on a band, never columns on a side pane, so the table's own
+/// columns are never the thing that pays for it.
+pub fn frame_layout(area: Rect, band_height: u16) -> FrameChunks {
     let mut constraints: Vec<Constraint> = Vec::with_capacity(4);
     constraints.push(Constraint::Min(CONTENT_MIN_H));
     if band_height > 0 {
@@ -347,25 +322,13 @@ pub fn frame_layout(area: Rect, content_min_w: u16, rail: bool, band_height: u16
         next += 1;
         rect
     };
-    let top = take();
+    let content = take();
     let band = (band_height > 0).then(&mut take);
     let summary = take();
     let controls = take();
 
-    let (content, rail) = match rail.then(|| rail_width(top.width, content_min_w)).flatten() {
-        Some(w) => {
-            let cells = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(content_min_w), Constraint::Length(w)])
-                .split(top);
-            (cells[0], Some(cells[1]))
-        }
-        None => (top, None),
-    };
-
     FrameChunks {
         content,
-        rail,
         band,
         summary,
         controls,
@@ -656,61 +619,36 @@ pub fn create_provider_row<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTENT_MIN_H, ColumnSpec, FOOTER_H, RAIL_MIN_W, Rect, create_controls_with_status,
-        fit_columns, fit_diagnostics, frame_layout, normalized_cpu, rail_width,
+        CONTENT_MIN_H, ColumnSpec, FOOTER_H, Rect, create_controls_with_status, fit_columns,
+        fit_diagnostics, frame_layout, normalized_cpu,
     };
-
-    #[test]
-    fn rail_appears_only_once_the_content_pane_keeps_its_minimum() {
-        // One comparison decides it: content minimum + rail minimum.
-        assert_eq!(rail_width(66 + RAIL_MIN_W - 1, 66), None);
-        assert_eq!(rail_width(66 + RAIL_MIN_W, 66), Some(RAIL_MIN_W));
-        // Between the bounds the rail takes a third of the terminal.
-        assert_eq!(rail_width(120, 66), Some(40));
-        // Near the threshold the third is capped at what the content can spare,
-        // so the reported width is the one the rail actually gets.
-        assert_eq!(rail_width(100, 66), Some(33));
-        // ...and stops growing, so a very wide terminal keeps its slack in the
-        // content pane rather than in an increasingly empty rail.
-        assert_eq!(rail_width(400, 66), Some(52));
-        // A wider content minimum pushes the threshold out with it.
-        assert_eq!(rail_width(84 + RAIL_MIN_W - 1, 84), None);
-        assert_eq!(rail_width(84 + RAIL_MIN_W, 84), Some(RAIL_MIN_W));
-    }
 
     #[test]
     fn frame_gives_every_leftover_row_to_the_content_pane() {
         let area = Rect::new(0, 0, 120, 40);
-        let c = frame_layout(area, 66, false, 0);
+        let c = frame_layout(area, 0);
         assert_eq!(c.content.height, 40 - FOOTER_H);
         assert!(c.band.is_none());
         assert_eq!(c.summary.height, 1);
         assert_eq!(c.controls.height, 1);
         assert_eq!(c.controls.y, 39);
 
-        let c = frame_layout(area, 66, false, 6);
+        let c = frame_layout(area, 6);
         assert_eq!(c.content.height, 40 - FOOTER_H - 6);
         assert_eq!(c.band.expect("band requested").height, 6);
     }
 
     #[test]
-    fn frame_splits_the_content_row_only_when_the_rail_fits() {
-        let wide = frame_layout(Rect::new(0, 0, 120, 40), 66, true, 0);
-        let rail = wide.rail.expect("rail fits at 120 columns");
-        assert_eq!(rail.width, 40);
-        assert_eq!(wide.content.width, 80);
-        assert_eq!(wide.content.height, rail.height);
-
-        // Below the threshold the content pane takes the whole row instead of
-        // both being squeezed under their minimums.
-        let narrow = frame_layout(Rect::new(0, 0, 90, 40), 66, true, 0);
-        assert!(narrow.rail.is_none());
-        assert_eq!(narrow.content.width, 90);
-
-        // A caller that does not want a rail never gets one.
-        let off = frame_layout(Rect::new(0, 0, 200, 40), 66, false, 0);
-        assert!(off.rail.is_none());
-        assert_eq!(off.content.width, 200);
+    fn every_region_spans_the_full_frame_width() {
+        // Nothing is ever taken out of the content pane horizontally, so the
+        // table's columns only ever compete with each other.
+        for width in [74u16, 90, 120, 200] {
+            let c = frame_layout(Rect::new(0, 0, width, 40), 6);
+            assert_eq!(c.content.width, width);
+            assert_eq!(c.band.expect("band requested").width, width);
+            assert_eq!(c.summary.width, width);
+            assert_eq!(c.controls.width, width);
+        }
     }
 
     #[test]
@@ -753,7 +691,7 @@ mod tests {
     fn frame_holds_the_content_minimum_when_the_terminal_is_short() {
         // The band and footer are `Length`, so a shortfall is taken from them
         // first; the content pane never drops below its minimum.
-        let c = frame_layout(Rect::new(0, 0, 120, CONTENT_MIN_H + FOOTER_H), 66, false, 0);
+        let c = frame_layout(Rect::new(0, 0, 120, CONTENT_MIN_H + FOOTER_H), 0);
         assert_eq!(c.content.height, CONTENT_MIN_H);
         assert_eq!(c.summary.height, 1);
         assert_eq!(c.controls.height, 1);
