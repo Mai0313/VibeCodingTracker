@@ -22,7 +22,7 @@ use ratatui::{
     Terminal,
     backend::{Backend, CrosstermBackend},
     layout::Constraint,
-    style::{Color as RatatuiColor, Style, Stylize},
+    style::{Color as RatatuiColor, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Row as RatatuiRow},
 };
@@ -417,7 +417,7 @@ pub fn display_analysis_interactive(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_analysis_frame_with_status<B: Backend>(
+fn render_analysis_frame_with_status<B: Backend<Error: Send + Sync + 'static>>(
     terminal: &mut Terminal<B>,
     rows_data: &[AnalysisRow],
     totals: &AnalysisRow,

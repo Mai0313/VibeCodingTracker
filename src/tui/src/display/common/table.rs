@@ -12,7 +12,7 @@ use comfy_table::{Attribute, Cell, CellAlignment, Color, Table, presets::UTF8_FU
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
-    style::{Color as RatatuiColor, Modifier, Style, Stylize},
+    style::{Color as RatatuiColor, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
         Block, Borders, Cell as RatatuiCell, Paragraph, Row as RatatuiRow, Scrollbar,

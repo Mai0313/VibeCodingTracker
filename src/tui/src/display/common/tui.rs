@@ -322,7 +322,7 @@ impl<T: Send + 'static> RefreshWorker<T> {
 
 /// Draws a centered loading spinner that also works on very small terminals.
 pub fn render_loading_frame(
-    terminal: &mut Terminal<impl Backend>,
+    terminal: &mut Terminal<impl Backend<Error: Send + Sync + 'static>>,
     spinner_index: usize,
 ) -> anyhow::Result<()> {
     terminal.draw(|frame| render_loading(frame, spinner_index, "Loading sessions..."))?;

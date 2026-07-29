@@ -25,7 +25,7 @@ use ratatui::{
     Frame, Terminal,
     backend::{Backend, CrosstermBackend, TestBackend},
     layout::{Constraint, Direction, Layout as RatatuiLayout, Rect},
-    style::{Color as RatatuiColor, Modifier, Style, Stylize},
+    style::{Color as RatatuiColor, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Row as RatatuiRow},
 };
@@ -872,7 +872,7 @@ fn row_fingerprint(row: &UsageRow) -> (i64, i64, i64, i64) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_usage_frame_with_status<B: Backend>(
+fn render_usage_frame_with_status<B: Backend<Error: Send + Sync + 'static>>(
     terminal: &mut Terminal<B>,
     rows_data: &[UsageRow],
     totals: &UsageTotals,
