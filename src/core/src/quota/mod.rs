@@ -31,13 +31,50 @@ pub use grok::{GROK_LOGIN_HINT, GrokState};
 pub use http::enable_cli_version_detection;
 pub use provider::{QuotaOutcome, QuotaSnapshot, spawn_quota_worker};
 
-use crate::models::CodexQuotaSnapshot;
+use crate::models::{CodexQuotaSnapshot, QuotaWindow};
 use crate::quota::refresh::{RefreshCooldown, file_mtime};
 use crate::quota::wham::{ResetCreditsResult, WhamResult};
 use std::time::SystemTime;
 
 /// Login hint shown when Codex refresh fails.
 pub const CODEX_LOGIN_HINT: &str = "run: codex auth login";
+
+const CODEX_FIVE_HOUR_SECONDS: i64 = 5 * 60 * 60;
+const CODEX_SEVEN_DAY_SECONDS: i64 = 7 * 24 * 60 * 60;
+
+/// The normalized Codex window slot rendered by the quota card.
+#[derive(Clone, Copy)]
+pub(crate) enum CodexWindowSlot {
+    FiveHour,
+    SevenDay,
+}
+
+/// Places a Codex window according to its reported period.
+///
+/// Older API responses and session logs can omit the period, so `fallback`
+/// preserves their historical positional meaning. An unrecognized reported
+/// period is ignored rather than assigned an incorrect fixed label.
+pub(crate) fn assign_codex_window(
+    five_hour: &mut Option<QuotaWindow>,
+    seven_day: &mut Option<QuotaWindow>,
+    window: QuotaWindow,
+    period_seconds: Option<i64>,
+    fallback: CodexWindowSlot,
+) {
+    let slot = match period_seconds {
+        Some(CODEX_FIVE_HOUR_SECONDS) => Some(CodexWindowSlot::FiveHour),
+        Some(CODEX_SEVEN_DAY_SECONDS) => Some(CodexWindowSlot::SevenDay),
+        Some(_) => None,
+        None => Some(fallback),
+    };
+    let Some(slot) = slot else {
+        return;
+    };
+    match slot {
+        CodexWindowSlot::FiveHour => *five_hour = Some(window),
+        CodexWindowSlot::SevenDay => *seven_day = Some(window),
+    }
+}
 
 /// Outcome of a Codex wham fetch (with reactive refresh).
 enum CodexFetch {

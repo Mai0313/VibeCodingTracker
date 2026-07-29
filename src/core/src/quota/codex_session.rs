@@ -9,6 +9,7 @@
 use crate::models::{
     CodexQuotaSnapshot, CodexSessionRateLimits, CodexSessionWindow, QuotaSource, QuotaWindow,
 };
+use crate::quota::{CodexWindowSlot, assign_codex_window};
 use crate::utils::{is_codex_session_file, resolve_paths};
 use anyhow::Result;
 use serde_json::Value;
@@ -191,16 +192,36 @@ pub fn extract_latest_rate_limits(values: &[Value], now: i64) -> Option<CodexQuo
         }
         // Drop windows whose reset time has already passed; their used_percent
         // is from an elapsed window and no longer reflects reality.
-        let primary = rl
-            .primary
-            .as_ref()
-            .map(map_session_window)
-            .filter(|w| is_window_live(w, now));
-        let secondary = rl
-            .secondary
-            .as_ref()
-            .map(map_session_window)
-            .filter(|w| is_window_live(w, now));
+        let mut primary = None;
+        let mut secondary = None;
+        if let Some(window) = &rl.primary {
+            let mapped = map_session_window(window);
+            if is_window_live(&mapped, now) {
+                assign_codex_window(
+                    &mut primary,
+                    &mut secondary,
+                    mapped,
+                    window
+                        .window_minutes
+                        .and_then(|minutes| minutes.checked_mul(60)),
+                    CodexWindowSlot::FiveHour,
+                );
+            }
+        }
+        if let Some(window) = &rl.secondary {
+            let mapped = map_session_window(window);
+            if is_window_live(&mapped, now) {
+                assign_codex_window(
+                    &mut primary,
+                    &mut secondary,
+                    mapped,
+                    window
+                        .window_minutes
+                        .and_then(|minutes| minutes.checked_mul(60)),
+                    CodexWindowSlot::SevenDay,
+                );
+            }
+        }
         if primary.is_none() && secondary.is_none() {
             // No live window here; older records are even more stale.
             continue;
@@ -262,12 +283,35 @@ mod tests {
     }
 
     #[test]
+    fn maps_weekly_only_primary_window_to_weekly_slot() {
+        let values = vec![
+            json!({"payload":{"rate_limits":{"primary":{"used_percent":42.0,"window_minutes":10080,"resets_at":2000},"plan_type":"plus"}}}),
+        ];
+
+        let snap = extract_latest_rate_limits(&values, 1000).unwrap();
+        assert!(snap.primary.is_none());
+        let weekly = snap.secondary.expect("weekly window");
+        assert_eq!(weekly.used_percent, 42.0);
+        assert_eq!(weekly.resets_at_unix, Some(2000));
+    }
+
+    #[test]
+    fn unknown_window_period_is_not_mislabeled() {
+        let values = vec![
+            json!({"payload":{"rate_limits":{"primary":{"used_percent":42.0,"window_minutes":1440,"resets_at":2000},"plan_type":"plus"}}}),
+        ];
+
+        assert!(extract_latest_rate_limits(&values, 1000).is_none());
+    }
+
+    #[test]
     fn handles_info_nested_rate_limits() {
         let values = vec![
-            json!({"payload":{"info":{"rate_limits":{"primary":{"used_percent":5.0,"resets_at":1}}}}}),
+            json!({"payload":{"info":{"rate_limits":{"primary":{"used_percent":5.0,"resets_at":1},"secondary":{"used_percent":6.0,"resets_at":2}}}}}),
         ];
         let snap = extract_latest_rate_limits(&values, 0).unwrap();
         assert_eq!(snap.primary.unwrap().used_percent, 5.0);
+        assert_eq!(snap.secondary.unwrap().used_percent, 6.0);
     }
 
     #[test]
