@@ -216,15 +216,16 @@ vct usage --table --merge-providers
 ### Preview: Interactive Dashboard (`vct usage`)
 
 ```
-┌ Models · $79.33 · 49.1M tokens · 3 models ────────────────────────── −2 cols ┐┌ Providers ───────────────────────────┐
-│Model                               Input     Output    Total     Cost (USD)  █│Provider       Tokens      Cost       │
-│                                                                              █│                                      │
-│gemini-3.1-pro-preview                   129K     10.3K      207K        $0.40█│Claude         48.9M       $78.93     │
-│claude-haiku-4-5-20251001               5.57K     19.8K     5.28M        $1.34█│Gemini         207K        $0.40      │
-│claude-opus-4-8                         25.7K      179K     43.6M       $77.59█│                                      │
-│                                                                              █│                                      │
-│                                                                              █│                                      │
-└──────────────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────┘
+┌ Models · $79.33 · 49.1M tokens · 3 models ───────────────────────────────────────────────────────────────────────────┐
+│Model                              Input     Output    Cache Read  Cache Write Total     Cost (USD)   Share           █
+│                                                                                                                      █
+│gemini-3.1-pro-preview                  129K     10.3K       66.0K       1.70K      207K        $0.40             0.4%█
+│claude-haiku-4-5-20251001              5.57K     19.8K       5.20M       55.0K     5.28M        $1.34          █ 10.8%█
+│claude-opus-4-8                        25.7K      179K       42.9M        496K     43.6M       $77.59  █████████ 88.8%█
+│                                                                                                                      █
+│                                                                                                                      █
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+                                              Claude $78.93 · Gemini $0.40
 ┌ Claude ──────────────┐┌ Codex ───────────────┐┌ Copilot ─────────────┐┌ Cursor ────────LIMIT ┐┌ Grok ────────────────┐
 │max 20x       just now││plus          just now││individual    just now││free          just now││SuperGrok     just now│
 │5h    ▰▱▱▱▱  13% 1h42m││5h    ▰▰▱▱▱  33% 12m  ││prem  ▰▱▱▱▱   3% 24d0h││total ▰▰▰▰▰  94% 16d0h││week  ▰▰▱▱▱  38% 3d4h │
@@ -233,7 +234,7 @@ vct usage --table --merge-providers
 │bal - · $0.00 used    ││reset expires 17d0h   ││                      ││                      ││                      │
 └──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘
                 Total Cost: $79.33  |  Total Tokens: 49.1M  |  Models: 3  |  Memory: 4.7 MB  |  CPU: 0.0%
-                       ↑/↓ scroll  m merge  p hide  Q quota  r refresh  q quit  |  Star on GitHub
+                    ↑/↓ scroll  m merge  p providers  Q quota  r refresh  q quit  |  Star on GitHub
 ```
 
 Both interactive dashboards draw a centered `Loading sessions...` spinner as soon as terminal setup finishes. Loading stays responsive to `q`, Ctrl+C, and resize events. Later scans run in one background worker, keep the last successful data visible with a `Refreshing...` footer, and coalesce repeated refresh requests into at most one pending scan. A failed refresh keeps the last-known-good view and retries on the next scheduled or manual refresh.
@@ -305,7 +306,7 @@ For noninteractive `usage` and `analysis` scans, vct exits with an error when ev
 
 ### Live Quota Panels
 
-`vct usage` shows **live quota usage for Claude Code, Codex, GitHub Copilot, Cursor, and Grok right in the dashboard — with zero setup.** No status-line hook, no credentials to enter: vct reads each provider's own credentials, calls its usage API on a background thread, and keeps the panels current while you work. Every gauge is percent **used**, so a full bar means the window is spent, not untouched. (Prefer a quieter dashboard? Trim `panels` under `[usage.quota]` in [`config.toml`](#configuration), or set it to `[]` to hide the quota cards entirely. The Provider Usage pane is local scan data, not a quota panel, so it keeps its own `p` toggle.)
+`vct usage` shows **live quota usage for Claude Code, Codex, GitHub Copilot, Cursor, and Grok right in the dashboard — with zero setup.** No status-line hook, no credentials to enter: vct reads each provider's own credentials, calls its usage API on a background thread, and keeps the panels current while you work. Every gauge is percent **used**, so a full bar means the window is spent, not untouched. (Prefer a quieter dashboard? Trim `panels` under `[usage.quota]` in [`config.toml`](#configuration), or set it to `[]` to hide the quota cards entirely. The per-provider cost line under the table is local scan data, not a quota panel, so it stays whatever you set here.)
 
 ```
 ┌ Claude ──────────────┐┌ Codex ───────────────┐┌ Copilot ─────────────┐┌ Cursor ────────LIMIT ┐┌ Grok ────────────────┐
@@ -325,7 +326,7 @@ For noninteractive `usage` and `analysis` scans, vct exits with an error when ev
 
 **Automatic token refresh.** For Claude, Codex, and Grok, when a token is near expiry or rejected, vct refreshes it and writes the new token back to the provider's own credential file (in that CLI's exact format), so a token is reused across checks rather than refreshed every time. Grok's token endpoint is resolved from its login issuer rather than hardcoded, the way its own CLI does it, and every other login in the file is preserved on write. If a refresh cannot proceed, the panel shows a `run: <provider> auth login` hint instead of breaking. Copilot (long-lived token) and Cursor (kept fresh by its own client) are read-only — vct never writes their credential files.
 
-A panel appears only for a provider whose credentials are present. Panels are placed on a uniform grid that fits as many cards per row as the terminal allows and wraps the rest onto the next row, so a new provider costs a card and never a new layout rule. On a terminal too short to spend rows on the grid, it folds into a one-line digest showing the gauges that still fit and counting the rest; press `Q` for the full-detail overlay, where every card has room for every line whatever the terminal size, and `p` to toggle the Provider Usage side pane. Quota panels appear only in the interactive TUI; `--table`, `--text`, and `--json` are unchanged.
+A panel appears only for a provider whose credentials are present. Panels are placed on a uniform grid that fits as many cards per row as the terminal allows and wraps the rest onto the next row, so a new provider costs a card and never a new layout rule. On a terminal too short to spend rows on the grid, it folds into a one-line digest showing the gauges that still fit and counting the rest; press `Q` for the full-detail overlay, where every card has room for every line whatever the terminal size, and `p` for the Provider Usage panel with per-provider tokens and share. Quota panels appear only in the interactive TUI; `--table`, `--text`, and `--json` are unchanged.
 
 > **Platform note:** on macOS, Claude Code stores its OAuth credentials in the system Keychain rather than `~/.claude/.credentials.json`, so the Claude panel is not shown on macOS. Cursor's `~/.config/cursor` credential path is Linux-oriented.
 
