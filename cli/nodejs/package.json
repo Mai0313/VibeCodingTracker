@@ -30,18 +30,18 @@
   "engines": {
     "node": ">=18.0.0"
   },
-  "os": [
-    "darwin",
-    "linux",
-    "win32"
-  ],
-  "cpu": [
-    "x64",
-    "arm64"
-  ],
+  "optionalDependencies": {
+    "@mai0313/vct-darwin-arm64": "npm:@mai0313/vct@0.0.0-darwin-arm64",
+    "@mai0313/vct-darwin-x64": "npm:@mai0313/vct@0.0.0-darwin-x64",
+    "@mai0313/vct-linux-arm64": "npm:@mai0313/vct@0.0.0-linux-arm64",
+    "@mai0313/vct-linux-x64": "npm:@mai0313/vct@0.0.0-linux-x64",
+    "@mai0313/vct-win32-arm64": "npm:@mai0313/vct@0.0.0-win32-arm64",
+    "@mai0313/vct-win32-x64": "npm:@mai0313/vct@0.0.0-win32-x64"
+  },
   "files": [
     "bin/",
-    "binaries/",
-    "README.md"
+    "README.md",
+    "README.zh-CN.md",
+    "README.zh-TW.md"
   ]
 }

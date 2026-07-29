@@ -251,5 +251,5 @@ Aggregate sessions whose modified date falls within the current ISO week.
 
 - **Distribution binaries**: `.github/workflows/build_release.yml` uses `cargo build --profile dist --locked --target <target>` and packages `target/<target>/dist/vibe_coding_tracker`.
 - **Crates.io**: `cargo package --locked --allow-dirty` locally; publishing is automated via `.github/workflows/build_release.yml`.
-- **npm / PyPI**: wrapper packages live under `cli/nodejs` and `cli/python`. They download the matching GitHub release binary at install time.
+- **npm / PyPI**: wrapper packages live under `cli/nodejs` and `cli/python`, and each publishes one artifact per platform so an install only downloads its own host's binary. npm ships a launcher-only wrapper whose `optionalDependencies` alias six prerelease versions of `@mai0313/vct` itself (`<version>-linux-x64`, …), each published with `--tag <platform>` so `latest` stays on the wrapper; PyPI ships six platform-tagged wheels carrying the binary as a wheel script. Both are populated from the release artifacts at publish time, so `uv build` in `cli/python` needs `cli/python/bin/` to exist and cannot run from a bare checkout.
 - **Docker**: `docker build -f docker/Dockerfile --target prod -t vibe_coding_tracker:latest .` produces an `ubuntu:26.04`-based image that runs the release binary as `ENTRYPOINT`.

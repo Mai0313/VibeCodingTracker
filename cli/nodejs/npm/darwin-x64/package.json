@@ -1,0 +1,27 @@
+{
+  "name": "@mai0313/vct",
+  "version": "0.0.0",
+  "description": "Native binary for Vibe Coding Tracker on darwin-x64",
+  "author": "Wei Lee <mai@mai0313.com>",
+  "license": "MIT",
+  "homepage": "https://github.com/Mai0313/VibeCodingTracker",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Mai0313/VibeCodingTracker.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Mai0313/VibeCodingTracker/issues"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "vibe_coding_tracker"
+  ]
+}
