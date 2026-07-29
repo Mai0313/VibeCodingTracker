@@ -293,10 +293,10 @@ pub struct WhamRateLimit {
     /// Whether a limit has been reached.
     #[serde(default)]
     pub limit_reached: Option<bool>,
-    /// 5-hour window.
+    /// First rate-limit window reported by the API.
     #[serde(default)]
     pub primary_window: Option<WhamWindow>,
-    /// Weekly window.
+    /// Second rate-limit window reported by the API.
     #[serde(default)]
     pub secondary_window: Option<WhamWindow>,
 }
@@ -509,10 +509,10 @@ pub struct CodexSessionRateLimits {
     /// Plan tier (e.g. "plus"), alongside the windows.
     #[serde(default)]
     pub plan_type: Option<String>,
-    /// 5-hour window.
+    /// First rate-limit window reported by the session log.
     #[serde(default)]
     pub primary: Option<CodexSessionWindow>,
-    /// Weekly window.
+    /// Second rate-limit window reported by the session log.
     #[serde(default)]
     pub secondary: Option<CodexSessionWindow>,
 }
@@ -565,9 +565,9 @@ pub struct CodexQuotaSnapshot {
     pub fetched_at: i64,
     /// Plan tier, e.g. "plus".
     pub plan_type: Option<String>,
-    /// 5-hour window.
+    /// Normalized 5-hour window, regardless of its source field.
     pub primary: Option<QuotaWindow>,
-    /// Weekly window.
+    /// Normalized weekly window, regardless of its source field.
     pub secondary: Option<QuotaWindow>,
     /// Credit balance (string, matching the API's `"0"`).
     pub credits_balance: Option<String>,

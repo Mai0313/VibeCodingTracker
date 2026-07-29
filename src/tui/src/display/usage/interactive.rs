@@ -2756,6 +2756,25 @@ mod tests {
         assert!(rendered.contains("just now"), "got:\n{rendered}");
     }
 
+    #[test]
+    fn codex_weekly_only_card_omits_five_hour_label() {
+        let now = 1_000;
+        let codex = CodexQuotaSnapshot {
+            source: QuotaSource::Api,
+            fetched_at: now,
+            plan_type: Some("plus".to_string()),
+            secondary: Some(QuotaWindow {
+                used_percent: 42.0,
+                resets_at_unix: Some(now + 7 * 86_400),
+            }),
+            ..Default::default()
+        };
+
+        let rendered = render_min_card(&codex_card(&codex, now, CARD_GRID.min_w));
+        assert!(rendered.contains("7d"), "got:\n{rendered}");
+        assert!(!rendered.contains("5h"), "got:\n{rendered}");
+    }
+
     /// Renders a card into the smallest cell the grid ever hands out and returns
     /// its text, so a test can assert what survives that width.
     fn render_min_card(card: &QuotaCard) -> String {

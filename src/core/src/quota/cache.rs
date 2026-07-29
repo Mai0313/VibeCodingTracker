@@ -46,7 +46,7 @@ impl CachedQuota for ClaudeQuotaSnapshot {
 }
 
 impl CachedQuota for CodexQuotaSnapshot {
-    const SCHEMA_VERSION: u32 = 1;
+    const SCHEMA_VERSION: u32 = 2;
 }
 
 impl CachedQuota for CopilotQuotaSnapshot {
@@ -314,6 +314,30 @@ mod tests {
         .unwrap();
 
         assert!(load_cache::<CursorQuotaSnapshot>(Ok(path)).is_none());
+    }
+
+    #[test]
+    fn positional_codex_cache_is_rejected() {
+        let (_dir, path) = cache_file();
+        let positional = CodexQuotaSnapshot {
+            source: QuotaSource::Api,
+            primary: Some(QuotaWindow {
+                used_percent: 42.0,
+                resets_at_unix: Some(1_700_600_000),
+            }),
+            ..Default::default()
+        };
+        std::fs::write(
+            &path,
+            serde_json::to_string(&VersionedCache {
+                schema_version: 1,
+                snapshot: positional,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(load_cache::<CodexQuotaSnapshot>(Ok(path)).is_none());
     }
 
     #[test]

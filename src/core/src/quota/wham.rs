@@ -12,6 +12,7 @@ use crate::models::{
     WhamResetCreditsDetails, WhamUsageResponse, WhamWindow,
 };
 use crate::quota::refresh::{file_mtime, send_refresh, update_json_file_in_place};
+use crate::quota::{CodexWindowSlot, assign_codex_window};
 use crate::utils::now_rfc3339_utc_nanos;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -94,11 +95,29 @@ pub fn map_wham_response(body: &str, now: i64) -> Result<CodexQuotaSnapshot> {
         serde_json::from_str(body).context("Failed to parse wham/usage response")?;
 
     let (primary, secondary, rate_reached) = match &resp.rate_limit {
-        Some(rl) => (
-            rl.primary_window.as_ref().map(|w| map_window(w, now)),
-            rl.secondary_window.as_ref().map(|w| map_window(w, now)),
-            rl.limit_reached,
-        ),
+        Some(rl) => {
+            let mut primary = None;
+            let mut secondary = None;
+            if let Some(window) = &rl.primary_window {
+                assign_codex_window(
+                    &mut primary,
+                    &mut secondary,
+                    map_window(window, now),
+                    window.limit_window_seconds,
+                    CodexWindowSlot::FiveHour,
+                );
+            }
+            if let Some(window) = &rl.secondary_window {
+                assign_codex_window(
+                    &mut primary,
+                    &mut secondary,
+                    map_window(window, now),
+                    window.limit_window_seconds,
+                    CodexWindowSlot::SevenDay,
+                );
+            }
+            (primary, secondary, rl.limit_reached)
+        }
         None => (None, None, None),
     };
 
@@ -494,6 +513,27 @@ mod tests {
     }
 
     #[test]
+    fn maps_weekly_only_primary_window_to_weekly_slot() {
+        let body = r#"{
+          "plan_type": "plus",
+          "rate_limit": {
+            "primary_window": {
+              "used_percent": 42,
+              "limit_window_seconds": 604800,
+              "reset_at": 1785946962
+            },
+            "secondary_window": null
+          }
+        }"#;
+
+        let snap = map_wham_response(body, 1_000).unwrap();
+        assert!(snap.primary.is_none());
+        let weekly = snap.secondary.expect("weekly window");
+        assert_eq!(weekly.used_percent, 42.0);
+        assert_eq!(weekly.resets_at_unix, Some(1785946962));
+    }
+
+    #[test]
     fn maps_available_reset_credit_expirations_in_order() {
         let (count, expirations) = map_reset_credits_response(RESET_CREDITS_SAMPLE).unwrap();
 
@@ -530,7 +570,39 @@ mod tests {
         let body =
             r#"{"rate_limit":{"primary_window":{"used_percent":10,"reset_after_seconds":100}}}"#;
         let snap = map_wham_response(body, 1_000).unwrap();
+        assert!(snap.secondary.is_none());
         assert_eq!(snap.primary.unwrap().resets_at_unix, Some(1_100));
+    }
+
+    #[test]
+    fn durationless_windows_keep_positional_mapping() {
+        let body = r#"{
+          "rate_limit": {
+            "primary_window": {"used_percent": 10, "reset_at": 1100},
+            "secondary_window": {"used_percent": 20, "reset_at": 1200}
+          }
+        }"#;
+
+        let snap = map_wham_response(body, 1_000).unwrap();
+        assert_eq!(snap.primary.unwrap().used_percent, 10.0);
+        assert_eq!(snap.secondary.unwrap().used_percent, 20.0);
+    }
+
+    #[test]
+    fn unknown_window_period_is_not_mislabeled() {
+        let body = r#"{
+          "rate_limit": {
+            "primary_window": {
+              "used_percent": 42,
+              "limit_window_seconds": 86400,
+              "reset_at": 87400
+            }
+          }
+        }"#;
+
+        let snap = map_wham_response(body, 1_000).unwrap();
+        assert!(snap.primary.is_none());
+        assert!(snap.secondary.is_none());
     }
 
     #[test]
