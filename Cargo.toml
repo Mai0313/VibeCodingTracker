@@ -22,7 +22,7 @@ vct-test-support = { path = "src/test-support" }
 # External dependencies (single source of truth for versions)
 ahash = { version = "0.8.12", features = ["serde"] }
 anyhow = "1.0.102"
-base64 = "0.22.1"
+base64 = "0.23.0"
 bytecount = "0.6.9"
 chrono = "0.4.44"
 clap = { version = "4.6.1", features = ["derive"] }
@@ -38,7 +38,7 @@ lru = "0.18.0"
 mimalloc = { version = "0.1.50", default-features = false }
 owo-colors = "4.3.0"
 percent-encoding = "2.3.2"
-ratatui = "0.29.0"
+ratatui = "0.30.2"
 rayon = "1.12.0"
 regex = "1.12.3"
 reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "form", "json", "rustls"] }
@@ -48,19 +48,19 @@ semver = "1.0.28"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 strsim = "0.11.1"
-sysinfo = "0.36.1"
+sysinfo = "0.39.6"
 tar = "0.4.46"
 tempfile = "3.27.0"
-toml_edit = { version = "0.23.7", features = ["serde"] }
+toml_edit = { version = "0.25.13", features = ["serde"] }
 walkdir = "2.5.0"
-zip = "7.2.0"
+zip = "8.6.0"
 
 # Dev dependencies
 assert_cmd = "2.2.1"
-criterion = { version = "0.7.0", features = ["html_reports"] }
+criterion = { version = "0.8.2", features = ["html_reports"] }
 httpmock = "0.8.3"
 predicates = "3.1.4"
-serial_test = "3.4.0"
+serial_test = "4.0.1"
 
 [profile.release]
 opt-level = 3           # Maximum optimization
