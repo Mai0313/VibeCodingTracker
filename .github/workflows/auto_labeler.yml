@@ -7,6 +7,7 @@ permissions: write-all
 
 jobs:
   labeler:
+    name: Labeler
     runs-on: ubuntu-latest
 
     steps:
