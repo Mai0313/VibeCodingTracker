@@ -4,22 +4,35 @@
 # https://docs.github.com/github/administering-a-repository/configuration-options-for-dependency-updates
 # https://containers.dev/guide/dependabot
 
+# Ecosystems are staggered an hour apart: concurrent merges move each other's
+# base, which blocks GITHUB_TOKEN from merging .github/workflows updates.
+
 version: 2
 updates:
-  # # Cargo (Rust)
-  # - package-ecosystem: "cargo"
-  #   directory: "/"
-  #   schedule:
-  #     interval: "weekly"
-  #   commit-message:
-  #     prefix: "chore"
-  #     include: "scope"
+  # Cargo (Rust)
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "daily"
+      time: "04:00"
+      timezone: "Asia/Taipei"
+    groups:
+      cargo:
+        patterns: ["*"]
+    commit-message:
+      prefix: "chore"
+      include: "scope"
 
   # Rust toolchain (rust-toolchain.toml)
   - package-ecosystem: "rust-toolchain"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: "daily"
+      time: "05:00"
+      timezone: "Asia/Taipei"
+    groups:
+      rust-toolchain:
+        patterns: ["*"]
     commit-message:
       prefix: "chore"
       include: "scope"
@@ -28,7 +41,12 @@ updates:
   - package-ecosystem: "docker"
     directory: "/docker"
     schedule:
-      interval: "weekly"
+      interval: "daily"
+      time: "06:00"
+      timezone: "Asia/Taipei"
+    groups:
+      docker:
+        patterns: ["*"]
     commit-message:
       prefix: "chore"
       include: "scope"
@@ -38,6 +56,11 @@ updates:
     directory: "/"
     schedule:
       interval: "daily"
+      time: "07:00"
+      timezone: "Asia/Taipei"
+    groups:
+      devcontainers:
+        patterns: ["*"]
     commit-message:
       prefix: "chore"
       include: "scope"
@@ -47,6 +70,11 @@ updates:
     directory: "/"
     schedule:
       interval: "daily"
+      time: "08:00"
+      timezone: "Asia/Taipei"
+    groups:
+      github-actions:
+        patterns: ["*"]
     commit-message:
       prefix: "chore"
       include: "scope"
