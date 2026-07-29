@@ -17,14 +17,15 @@
 //! [`migrate_document`] rewrites a standard-`[header]`-table file in place —
 //! adding the `#:schema` directive, renaming `refresh_interval_secs` to
 //! `refresh_interval`, and moving `[usage].quota_panels` into the nested
-//! `[usage.quota]` table — so an existing user actually gets the new layout
-//! (`vct config migrate` forces the same pass). A read-time [`migrate_legacy`]
+//! `[usage.quota]` table, and adding the startup auto-update preference, so an
+//! existing user actually gets the new layout (`vct config migrate` forces the
+//! same pass). A read-time [`migrate_legacy`]
 //! shim then backstops any residual legacy form the structural pass leaves alone
 //! (e.g. a hand-edited inline `usage = { ... }` table), so the returned [`Config`]
 //! is always correct even when the file was not rewritten.
 
 use crate::models::TimeRange;
-use crate::utils::{get_cache_dir, write_string_atomic};
+use crate::utils::{get_cache_dir, resolve_paths, write_string_atomic};
 use anyhow::Result;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -42,7 +43,7 @@ const SCHEMA_URL: &str =
 ///
 /// It exists so an upgrade can add a setting to an existing file exactly once.
 /// Version 1 is any file written before the key existed.
-const CONFIG_VERSION: u32 = 2;
+const CONFIG_VERSION: u32 = 3;
 
 /// Quota panels introduced after version 1, back-filled once into a file older
 /// than the version that shipped them.
@@ -115,6 +116,9 @@ pub struct GeneralConfig {
     /// One of: "daily" | "weekly" | "monthly" | "all".
     #[serde(default)]
     pub default_time_range: TimeRange,
+    /// Check for a newer vct release when the CLI starts.
+    #[serde(default = "default_true")]
+    pub auto_update: bool,
     /// Layout version of this file, stamped by vct. Only the upgrade pass reads
     /// it; leave it alone unless you want a past upgrade to run again.
     #[serde(
@@ -128,6 +132,7 @@ impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
             default_time_range: TimeRange::default(),
+            auto_update: true,
             // A file this tool writes is current by construction; only a file
             // read from disk without the key is legacy (see the serde default).
             version: CONFIG_VERSION,
@@ -375,6 +380,27 @@ pub fn load() -> Config {
     }
 }
 
+/// Reads settings from `~/.vct/config.toml` without creating or modifying any
+/// files. Legacy layouts are migrated in memory only.
+///
+/// Infallible: any error resolving, reading, or parsing degrades to
+/// [`Config::default`].
+pub fn load_read_only() -> Config {
+    match resolve_paths() {
+        Ok(paths) => load_read_only_in(&paths.cache_dir),
+        Err(_) => Config::default(),
+    }
+}
+
+/// [`load_read_only`] rooted at an explicit directory (test seam).
+pub fn load_read_only_in(dir: &Path) -> Config {
+    let path = dir.join("config.toml");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Config::default();
+    };
+    parse_config_text(&text)
+}
+
 /// [`load`] rooted at an explicit directory (test seam).
 pub fn load_in(dir: &Path) -> Config {
     let path = dir.join("config.toml");
@@ -394,16 +420,30 @@ pub fn load_in(dir: &Path) -> Config {
             Ok(None) => text,
             Err(_) => return Config::default(),
         };
-        let mut config: Config = toml_edit::de::from_str(&effective).unwrap_or_default();
-        // Backstop for any residual legacy form the structural migration leaves
-        // alone (e.g. an inline `usage = { ... }` table).
-        migrate_legacy(&mut config, &effective);
-        return config;
+        return parse_effective_config(&effective);
     }
     // First run: materialize the generated commented template.
     let text = default_document().to_string();
     let _ = write_string_atomic(&path, &text);
     toml_edit::de::from_str(&text).unwrap_or_default()
+}
+
+/// Parses text after the same in-memory structural migration used by the
+/// writable loader, without persisting the result.
+fn parse_config_text(text: &str) -> Config {
+    match migrate_text(text) {
+        Ok(Some(migrated)) => parse_effective_config(&migrated),
+        Ok(None) => parse_effective_config(text),
+        Err(_) => Config::default(),
+    }
+}
+
+fn parse_effective_config(text: &str) -> Config {
+    let mut config: Config = toml_edit::de::from_str(text).unwrap_or_default();
+    // Backstop for any residual legacy form the structural migration leaves
+    // alone (e.g. a hand-edited inline table).
+    migrate_legacy(&mut config, text);
+    config
 }
 
 /// Outcome of an explicit [`migrate_config_file`] run, surfaced by
@@ -567,9 +607,13 @@ fn backfill_new_quota_panels(doc: &mut DocumentMut, schema: &Value) -> bool {
     // cannot be back-filled — and stamping the marker anyway would retire the
     // upgrade without having run it.
     if panels_out_of_reach(doc) {
-        return false;
+        // This upgrade may still safely add an unrelated leaf to a standard
+        // `[general]` table. Do not stamp the version though: the quota upgrade
+        // has not run and must remain eligible for a future safe migration.
+        return backfill_auto_update(doc, schema);
     }
 
+    let mut changed = false;
     if let Some(panels) = doc
         .get_mut("usage")
         .and_then(Item::as_table_mut)
@@ -593,11 +637,36 @@ fn backfill_new_quota_panels(doc: &mut DocumentMut, schema: &Value) -> bool {
             .collect();
         for name in missing {
             panels.push(name);
+            changed = true;
         }
     }
 
-    stamp_config_version(doc, schema);
-    true
+    changed |= stamp_config_version(doc, schema);
+    changed |= backfill_auto_update(doc, schema);
+    changed
+}
+
+/// Adds the startup update preference to a legacy standard `[general]` table.
+///
+/// Inline tables are deliberately left untouched: changing their shape here
+/// risks discarding hand-edited formatting or sibling keys. Serde supplies the
+/// same `true` default when such a table is read.
+fn backfill_auto_update(doc: &mut DocumentMut, schema: &Value) -> bool {
+    let Some(general) = doc.get_mut("general").and_then(Item::as_table_mut) else {
+        return false;
+    };
+    if !general.contains_key("auto_update") {
+        general.insert("auto_update", value(true));
+        apply_comment(
+            general,
+            "auto_update",
+            "",
+            schema,
+            &["general", "auto_update"],
+        );
+        return true;
+    }
+    false
 }
 
 /// Whether the effective panel list sits inside an inline table.
@@ -637,7 +706,8 @@ fn panels_out_of_reach(doc: &DocumentMut) -> bool {
 
 /// Writes `[general].version` (creating the table when a hand-written file has
 /// no `[general]` section at all).
-fn stamp_config_version(doc: &mut DocumentMut, schema: &Value) {
+fn stamp_config_version(doc: &mut DocumentMut, schema: &Value) -> bool {
+    let mut changed = false;
     if doc.get("general").is_none() {
         let mut table = Table::new();
         table.set_implicit(false);
@@ -647,15 +717,21 @@ fn stamp_config_version(doc: &mut DocumentMut, schema: &Value) {
                 .set_prefix(format!("\n{}", comment_block(&desc)));
         }
         doc.insert("general", Item::Table(table));
+        changed = true;
     }
     let Some(general) = doc.get_mut("general").and_then(Item::as_table_mut) else {
-        return;
+        return changed;
     };
     let had_key = general.contains_key("version");
+    let version_is_current = general
+        .get("version")
+        .and_then(Item::as_integer)
+        .is_some_and(|version| version == i64::from(CONFIG_VERSION));
     general.insert("version", value(i64::from(CONFIG_VERSION)));
     if !had_key {
         apply_comment(general, "version", "", schema, &["general", "version"]);
     }
+    changed || !version_is_current
 }
 
 /// Whether the document already carries a `#:schema` directive line.
@@ -1167,7 +1243,7 @@ mod tests {
     fn migrate_document_adds_only_the_schema_directive_when_keys_are_current() {
         // Current key names, nested quota and version marker, but missing the
         // `#:schema` directive.
-        let text = "[general]\nversion = 2\n\n[usage]\nrefresh_interval = 10\n\n[usage.quota]\npanels = [\"claude\"]\n";
+        let text = "[general]\nversion = 3\n\n[usage]\nrefresh_interval = 10\n\n[usage.quota]\npanels = [\"claude\"]\n";
         let migrated = migrate_text(text).unwrap().expect("adds #:schema");
         assert!(migrated.starts_with("#:schema "));
         assert!(migrated.contains("refresh_interval = 10"));
@@ -1193,6 +1269,15 @@ mod tests {
         assert!(migrated.contains("quota_panels"));
         // Still idempotent for the untouched inline table.
         assert!(migrate_text(&migrated).unwrap().is_none());
+    }
+
+    #[test]
+    fn migrate_document_leaves_an_inline_general_table_unmodified() {
+        let text = "#:schema x\ngeneral = { default_time_range = \"weekly\", version = 2 }\n";
+        assert!(migrate_text(text).unwrap().is_none());
+        let cfg = parse_config_text(text);
+        assert_eq!(cfg.general.default_time_range, TimeRange::Weekly);
+        assert!(cfg.general.auto_update);
     }
 
     #[test]
@@ -1284,7 +1369,7 @@ mod tests {
             .unwrap()
             .expect("version 1 file upgrades");
         assert!(migrated.contains("panels = [\"claude\", \"codex\", \"grok\"]"));
-        assert!(migrated.contains("version = 2"));
+        assert!(migrated.contains("version = 3"));
         assert!(migrate_text(&migrated).unwrap().is_none());
 
         // The user removes it again: the marker keeps the upgrade from re-running.
@@ -1347,7 +1432,7 @@ mod tests {
                 .unwrap()
                 .expect("an empty file is stamped");
             assert!(migrated.starts_with("#:schema "));
-            assert!(migrated.contains("version = 2"));
+            assert!(migrated.contains("version = 3"));
             assert!(
                 migrate_text(&migrated).unwrap().is_none(),
                 "one pass must be enough"

@@ -75,9 +75,20 @@ install_binary() {
     install_dir="$(select_install_dir)"
     mkdir -p "$install_dir"
 
-    chmod +x "$binary"
-    cp "$binary" "${install_dir}/${BINARY_NAME}"
-    ln -sf "${install_dir}/${BINARY_NAME}" "${install_dir}/vct"
+    local target="${install_dir}/${BINARY_NAME}"
+    local canonical_install_dir
+    canonical_install_dir="$(cd -P "$install_dir" && pwd)"
+    local staged_target
+    staged_target="$(mktemp "${canonical_install_dir}/.${BINARY_NAME}.XXXXXX")"
+    local staged_marker
+    staged_marker="$(mktemp "${canonical_install_dir}/.${BINARY_NAME}.marker.XXXXXX")"
+
+    cp "$binary" "$staged_target"
+    chmod +x "$staged_target"
+    mv -f "$staged_target" "$target"
+    printf 'vct-release-installer-v1\n' > "$staged_marker"
+    mv -f "$staged_marker" "${canonical_install_dir}/${BINARY_NAME}.vct-managed"
+    ln -sf "$target" "${install_dir}/vct"
 
     echo "Installed ${BINARY_NAME} ${version} to ${install_dir}"
 

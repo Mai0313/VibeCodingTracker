@@ -20,11 +20,17 @@
     },
     "general": {
       "default": {
+        "auto_update": true,
         "default_time_range": "all",
-        "version": 2
+        "version": 3
       },
       "description": "`[general]` — settings shared across subcommands.",
       "properties": {
+        "auto_update": {
+          "default": true,
+          "description": "Check for a newer vct release when the CLI starts.",
+          "type": "boolean"
+        },
         "default_time_range": {
           "default": "all",
           "description": "Default time range when no --daily/--weekly/--monthly/--all flag is given.\nOne of: \"daily\" | \"weekly\" | \"monthly\" | \"all\".",
