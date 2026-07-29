@@ -98,14 +98,14 @@ const CURSOR_COLOR: RatatuiColor = RatatuiColor::Rgb(64, 180, 180);
 /// Grok brand color (xAI near-black, lifted to stay readable on a dark terminal).
 const GROK_COLOR: RatatuiColor = RatatuiColor::Rgb(170, 170, 178);
 
-/// Width below which the side rail is not worth its columns: the content pane
-/// keeps the model name plus roughly four numeric columns, which is the point
-/// where `fit_columns` starts dropping things a reader would miss. It is a
-/// policy floor, not the table's full span — the full six columns need 93.
-const USAGE_CONTENT_MIN_W: u16 = 66;
 /// Body rows the model table must keep for the quota grid to be worth drawing.
 /// Below this the grid folds to the one-line digest, which is announced there.
 const TABLE_MIN_BODY_H: u16 = 8;
+/// Rows the Provider Usage line always costs. It is one row at every terminal
+/// size: the per-provider totals are the second thing this view is for, and one
+/// row is cheap enough that it never has to compete with the table for space.
+/// Everything that does not fit on it moves behind `p`.
+const PROVIDER_LINE_H: u16 = 1;
 /// Model-name column floor, so a narrowing pane drops a numeric column rather
 /// than cutting the name. Sized for a date-suffixed model id
 /// (`claude-sonnet-4-5-20250929`), because two such ids differing only in the
@@ -177,11 +177,12 @@ struct QuotaView<'a> {
     grok: &'a GrokQuotaSnapshot,
     present: QuotaPresence,
     /// Whether the quota surface is shown at all. `false` when
-    /// `usage.quota.panels` is empty, which drops the card grid *and* the
-    /// Provider Usage rail, not just the individual gauges.
+    /// `usage.quota.panels` is empty, which drops the card grid and its digest.
+    /// It does not touch the Provider Usage line: that is local scan data, not
+    /// a quota panel.
     band_enabled: bool,
-    /// Whether the side rail is currently toggled on (`p`).
-    rail_visible: bool,
+    /// Whether the Provider Usage detail panel is open (`p`).
+    provider_panel_open: bool,
     /// Whether the full-detail quota overlay is open (`Q`).
     overlay_open: bool,
 }
@@ -379,7 +380,7 @@ struct UsageUiState {
     update_tracker: UpdateTracker,
     scroll: ScrollState,
     merge_enabled: bool,
-    rail_visible: bool,
+    provider_panel_open: bool,
     overlay_open: bool,
     claude: ClaudeQuotaSnapshot,
     codex: CodexQuotaSnapshot,
@@ -398,7 +399,7 @@ impl UsageUiState {
             update_tracker: UpdateTracker::new(MAX_TRACKED_ROWS, 1000),
             scroll: ScrollState::new(),
             merge_enabled,
-            rail_visible: true,
+            provider_panel_open: false,
             overlay_open: false,
             claude: ClaudeQuotaSnapshot::default(),
             codex: CodexQuotaSnapshot::default(),
@@ -510,7 +511,7 @@ impl UsageUiState {
             grok: &self.grok,
             present: runtime.present,
             band_enabled: runtime.band_enabled,
-            rail_visible: self.rail_visible,
+            provider_panel_open: self.provider_panel_open,
             overlay_open: self.overlay_open,
         };
         let rows = current_view(self.merge_enabled, &self.rows, &self.merged_rows);
@@ -700,9 +701,11 @@ pub fn display_usage_interactive_with_pool(
                         )?;
                     }
                 }
-                // Esc backs out of the quota overlay; with nothing open it quits.
-                InputAction::Close if state.overlay_open => {
+                // Esc backs out of whichever panel is open; with nothing open it
+                // quits.
+                InputAction::Close if state.overlay_open || state.provider_panel_open => {
                     state.overlay_open = false;
+                    state.provider_panel_open = false;
                     if loaded {
                         state.render(
                             terminal.terminal_mut(),
@@ -726,8 +729,11 @@ pub fn display_usage_interactive_with_pool(
                         )?;
                     }
                 }
+                // The two panels are both centered and full of numbers, so they
+                // take turns rather than stacking.
                 InputAction::ToggleQuota => {
                     state.overlay_open = !state.overlay_open;
+                    state.provider_panel_open = false;
                     if loaded {
                         state.render(
                             terminal.terminal_mut(),
@@ -739,7 +745,8 @@ pub fn display_usage_interactive_with_pool(
                     }
                 }
                 InputAction::TogglePane => {
-                    state.rail_visible = !state.rail_visible;
+                    state.provider_panel_open = !state.provider_panel_open;
+                    state.overlay_open = false;
                     if loaded {
                         state.render(
                             terminal.terminal_mut(),
@@ -790,12 +797,13 @@ pub fn display_usage_interactive_with_pool(
 /// - Real-time memory monitoring
 /// - Provider-grouped totals
 /// - Scrollable model table (arrow keys)
-/// - Keyboard controls: `q` or `Ctrl+C` to exit; `Esc` closes the quota overlay
-///   and otherwise exits; `r` to refresh; `Q` to open the full quota detail;
-///   `p` to toggle the Provider Usage pane; `m` to toggle merging models that
-///   share a base name across provider prefixes (e.g. `openai/gpt-5.5` +
-///   `azure/gpt-5.5`). `merge_providers` seeds the initial state and the `m`
-///   toggle is persisted back to `config.toml`.
+/// - Keyboard controls: `q` or `Ctrl+C` to exit; `Esc` closes whichever panel
+///   is open and otherwise exits; `r` to refresh; `Q` to open the full quota
+///   detail; `p` to open the Provider Usage detail panel (`Q` and `p` close
+///   each other); `m` to toggle merging models that share a base name across
+///   provider prefixes (e.g. `openai/gpt-5.5` + `azure/gpt-5.5`).
+///   `merge_providers` seeds the initial state and the `m` toggle is persisted
+///   back to `config.toml`.
 ///
 /// `quota_panels` selects which live quota panels to show (by provider name);
 /// an empty list drops the band entirely. `providers` (from the config) selects
@@ -888,17 +896,17 @@ fn render_usage_frame_with_status<B: Backend>(
         }
 
         // `band_enabled == false` (empty `quota_panels`) drops the quota
-        // surface. Provider Usage is local scan data, not a quota panel, so it
-        // is governed by the `p` toggle alone.
+        // surface. The Provider Usage line is local scan data, not a quota
+        // panel, so it is always drawn and costs its one row unconditionally.
         let n = quota.present.count();
         let grid_h = visible_grid_height(area, quota.band_enabled, n);
         // A folded grid still costs one row, for the digest that replaces it.
-        let band_h = if grid_h > 0 {
+        let quota_h = if grid_h > 0 {
             grid_h
         } else {
             u16::from(quota.band_enabled && n > 0)
         };
-        let chunks = frame_layout(area, USAGE_CONTENT_MIN_W, quota.rail_visible, band_h);
+        let chunks = frame_layout(area, PROVIDER_LINE_H + quota_h);
 
         // Numeric columns, ordered by how readily they may be dropped when the
         // pane is narrow. Cost and Total are the reason the view exists, so they
@@ -1015,18 +1023,25 @@ fn render_usage_frame_with_status<B: Backend>(
             scroll,
         );
 
-        // The rail is one presentation of "show providers"; when the terminal
-        // is too narrow for a side pane the same toggle centers it as an
-        // overlay, so the totals are never simply unreachable.
-        let rail_folded = quota.rail_visible && chunks.rail.is_none();
-        if let Some(rail_area) = chunks.rail {
-            render_provider_rail(f, rail_area, &provider_rows);
-        }
-
         if let Some(band_area) = chunks.band {
+            // The band carries the Provider Usage line first, then whatever
+            // quota surface is left. Splitting here (rather than asking the
+            // frame for two bands) keeps the frame's vertical story to one
+            // caller-sized region.
+            let rows = RatatuiLayout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(PROVIDER_LINE_H), Constraint::Min(0)])
+                .split(band_area);
+            let (provider_area, quota_area) = (rows[0], rows[1]);
+
+            f.render_widget(
+                Paragraph::new(provider_digest(&provider_rows, provider_area.width)).centered(),
+                provider_area,
+            );
+
             let now = chrono::Local::now().timestamp();
             if grid_h > 0 {
-                let cells = grid_cells(&CARD_GRID, band_area, n);
+                let cells = grid_cells(&CARD_GRID, quota_area, n);
                 // Present providers render in a fixed order (Claude → Codex →
                 // Copilot → Cursor → Grok) into the cells; a missing provider
                 // consumes no cell, and `grid_cells` always returns exactly `n`.
@@ -1053,10 +1068,10 @@ fn render_usage_frame_with_status<B: Backend>(
                 if quota.present.grok {
                     place(f, grok_card(quota.grok, now, card_w));
                 }
-            } else {
+            } else if quota_area.height > 0 {
                 f.render_widget(
-                    Paragraph::new(quota_digest(&digest_items(quota), band_area.width)).centered(),
-                    band_area,
+                    Paragraph::new(quota_digest(&digest_items(quota), quota_area.width)).centered(),
+                    quota_area,
                 );
             }
         }
@@ -1084,23 +1099,19 @@ fn render_usage_frame_with_status<B: Backend>(
         } else {
             " merge  "
         };
-        let pane_hint = if quota.rail_visible {
-            " hide  "
-        } else {
-            " providers  "
-        };
         f.render_widget(
             create_controls_with_status(
-                &[("m", merge_hint), ("p", pane_hint), ("Q", " quota  ")],
+                &[("m", merge_hint), ("p", " providers  "), ("Q", " quota  ")],
                 status,
                 chunks.controls.width,
             ),
             chunks.controls,
         );
 
-        // Drawn last so they cover the frame they are layered over.
-        if rail_folded {
-            render_provider_overlay(f, area, &provider_rows);
+        // Drawn last so it covers the frame it is layered over. Only one panel
+        // is ever open: `p` and `Q` close each other, so they cannot stack.
+        if quota.provider_panel_open {
+            render_provider_panel(f, area, &provider_rows);
         }
         if quota.overlay_open {
             render_quota_overlay(f, area, quota, chrono::Local::now().timestamp());
@@ -1242,7 +1253,7 @@ impl UsageFrameBenchmark {
                 grok: true,
             },
             band_enabled: true,
-            rail_visible: true,
+            provider_panel_open: false,
             overlay_open: false,
         };
         render_usage_frame_with_status(
@@ -1393,15 +1404,20 @@ fn grid_height(spec: &GridSpec, width: u16, n: usize) -> u16 {
 ///
 /// The model table is the primary content, so the grid is only drawn while the
 /// table keeps [`TABLE_MIN_BODY_H`] body rows beneath it (its border, header and
-/// header margin cost 4 more). When it folds, the one-line quota digest takes
-/// its place and says how many providers moved behind `Q` — the grid is never
-/// dropped silently.
+/// header margin cost 4 more, and the Provider Usage line takes one row before
+/// the grid gets any). When it folds, the one-line quota digest takes its place
+/// and says how many providers moved behind `Q` — the grid is never dropped
+/// silently.
 fn visible_grid_height(area: Rect, band_enabled: bool, n: usize) -> u16 {
     if !band_enabled || n == 0 {
         return 0;
     }
     let height = grid_height(&CARD_GRID, area.width, n);
-    let table_h = area.height.saturating_sub(FOOTER_H).saturating_sub(height);
+    let table_h = area
+        .height
+        .saturating_sub(FOOTER_H)
+        .saturating_sub(PROVIDER_LINE_H)
+        .saturating_sub(height);
     if table_h >= TABLE_MIN_BODY_H.saturating_add(4) {
         height
     } else {
@@ -1476,12 +1492,147 @@ fn collect_cards(quota: &QuotaView, now: i64, width: u16) -> Vec<QuotaCard> {
     cards
 }
 
-/// Renders the Provider Usage totals as a centered overlay.
+/// Chooses which one-line digest segments fit in `width` columns.
 ///
-/// Used when `p` is on but the terminal is too narrow for a side rail. The
-/// alternative was leaving the totals unreachable below 96 columns, which is
-/// exactly the kind of silent disappearance the rest of this layout avoids.
-fn render_provider_overlay(
+/// `widths` holds each segment's column count in display order, `drop_order`
+/// lists those same indices in the order they may be given up (least worth
+/// showing first), and `tail` is the label the `+N ` count prefixes — which
+/// costs room of its own as soon as anything is hidden. Returns a keep-mask in
+/// display order; at least one segment always survives, because a line saying
+/// only `+8 more` tells the reader nothing.
+///
+/// The drop order is a parameter rather than "the last one" because the two
+/// callers disagree about which segment is cheapest to lose.
+fn fit_digest(
+    widths: &[usize],
+    sep: usize,
+    drop_order: &[usize],
+    tail: &str,
+    width: usize,
+) -> Vec<bool> {
+    let mut keep = vec![true; widths.len()];
+    let mut shown = widths.len();
+    let mut used: usize = widths.iter().sum::<usize>() + sep * shown.saturating_sub(1);
+    for &victim in drop_order {
+        if shown <= 1 {
+            break;
+        }
+        let hidden = widths.len() - shown;
+        let tail_w = if hidden > 0 {
+            sep + format!("+{hidden} {tail}").chars().count()
+        } else {
+            0
+        };
+        if used + tail_w <= width {
+            break;
+        }
+        keep[victim] = false;
+        used -= widths[victim] + sep;
+        shown -= 1;
+    }
+    keep
+}
+
+/// Assembles a digest line from the segments [`fit_digest`] kept, plus the
+/// trailing count of the ones it did not.
+fn digest_line(
+    segments: Vec<(String, Style)>,
+    keep: &[bool],
+    sep: &'static str,
+    tail: &str,
+) -> Line<'static> {
+    let dim = Style::default().fg(RatatuiColor::DarkGray);
+    let mut spans: Vec<Span> = Vec::with_capacity(segments.len() * 2);
+    for (text, style) in segments
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(segment, keep)| keep.then_some(segment))
+    {
+        if !spans.is_empty() {
+            spans.push(Span::styled(sep, dim));
+        }
+        spans.push(Span::styled(text, style));
+    }
+    let hidden = keep.iter().filter(|keep| !**keep).count();
+    if hidden > 0 {
+        spans.push(Span::styled(sep, dim));
+        spans.push(Span::styled(format!("+{hidden} {tail}"), dim));
+    }
+    Line::from(spans)
+}
+
+/// The one-line Provider Usage digest drawn under the model table.
+///
+/// One segment per provider (`Claude $0.91`), painted in that provider's own
+/// color so it reads the same way its rows and share-bar segments do. Cost is
+/// the one number that earns a permanent row here; tokens and the per-provider
+/// day counts live behind `p`. Whatever does not fit is named in a trailing
+/// `+N more → p`, so the line never implies it lists every provider.
+fn provider_digest(rows: &[ProviderTotal<'_, ProviderStats>], width: u16) -> Line<'static> {
+    /// Narrower than the quota digest's separator on purpose: there are eight
+    /// providers to the quota band's five, and the two columns this saves per
+    /// gap are what let all eight fit on a 120-column terminal.
+    const SEP: &str = " · ";
+    const TAIL: &str = "more → p";
+    // The summary bar already carries the grand total, so the aggregate row
+    // would only repeat it.
+    let listed: Vec<_> = rows
+        .iter()
+        .filter(|row| row.label != "All Providers")
+        .collect();
+    if listed.is_empty() {
+        return dim_line("no provider data yet");
+    }
+
+    let segments: Vec<(String, Style)> = listed
+        .iter()
+        .map(|row| {
+            (
+                format!(
+                    "{} {}",
+                    row.label,
+                    format_cost_compact(row.stats.total_cost)
+                ),
+                Style::default().fg(row.tui_color),
+            )
+        })
+        .collect();
+
+    // Cost is what this line is for, so the cheapest providers are the ones to
+    // give up. Dropping by list position instead would hide Cursor and Hermes
+    // first purely because of where they sit in the enum, which on an account
+    // dominated by one of them drops the very number the line exists to show.
+    // Ties go to the later provider, so a row of untouched providers still
+    // empties from the tail.
+    let mut drop_order: Vec<usize> = (0..listed.len()).collect();
+    drop_order.sort_by(|&a, &b| {
+        listed[a]
+            .stats
+            .total_cost
+            .partial_cmp(&listed[b].stats.total_cost)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.cmp(&a))
+    });
+
+    let widths: Vec<usize> = segments
+        .iter()
+        .map(|(text, _)| text.chars().count())
+        .collect();
+    let keep = fit_digest(
+        &widths,
+        SEP.chars().count(),
+        &drop_order,
+        TAIL,
+        usize::from(width),
+    );
+    digest_line(segments, &keep, SEP, TAIL)
+}
+
+/// Renders the full Provider Usage totals as a centered panel, opened with `p`.
+///
+/// This is where the numbers the one-line digest cannot carry live: per-provider
+/// tokens beside cost, and the stacked share bar at full panel width.
+fn render_provider_panel(
     f: &mut Frame,
     area: Rect,
     provider_rows: &[ProviderTotal<'_, ProviderStats>],
@@ -1500,7 +1651,7 @@ fn render_provider_overlay(
         height,
     };
     f.render_widget(Clear, rect);
-    render_provider_rail(f, rect, provider_rows);
+    render_provider_table(f, rect, provider_rows);
 }
 
 /// Renders the full-screen quota overlay opened with `Q`.
@@ -1574,13 +1725,14 @@ fn render_quota_overlay(f: &mut Frame, area: Rect, quota: &QuotaView, now: i64) 
     }
 }
 
-/// Renders the Provider Usage rail: a three-column table over a stacked share
+/// Renders the Provider Usage totals: a three-column table over a stacked share
 /// bar, both inside one border.
 ///
-/// The rail is short by design, so a provider list longer than it can hold is
-/// truncated with a `+N more` row and a `+N` flag in the title rather than
-/// stopping at the border with no sign that anything is missing.
-fn render_provider_rail(
+/// A short terminal can leave the panel with fewer rows than there are
+/// providers, so a list longer than it can hold is truncated with a `+N more`
+/// row and a `+N` flag in the title rather than stopping at the border with no
+/// sign that anything is missing.
+fn render_provider_table(
     f: &mut Frame,
     area: Rect,
     provider_rows: &[ProviderTotal<'_, ProviderStats>],
@@ -1601,7 +1753,7 @@ fn render_provider_rail(
 
     let mut block = Block::default()
         .borders(Borders::ALL)
-        .title(Line::from(" Providers "))
+        .title(Line::from(" Providers · esc to close "))
         .border_style(Style::default().fg(RatatuiColor::Magenta));
     if hidden > 0 {
         block = block.title(
@@ -1772,6 +1924,7 @@ fn digest_items(quota: &QuotaView) -> Vec<DigestItem> {
 /// the only quota surface on these terminal sizes.
 fn quota_digest(items: &[DigestItem], width: u16) -> Line<'static> {
     const SEP: &str = "  ·  ";
+    const TAIL: &str = "more → Q";
     /// `Claude ▰▰▱ 58%`, `Claude LIMIT`, `Claude login` — a three-cell bar keeps
     /// the line short.
     fn segment(item: &DigestItem) -> String {
@@ -1791,58 +1944,36 @@ fn quota_digest(items: &[DigestItem], width: u16) -> Line<'static> {
         return dim_line("no quota panels");
     }
 
-    let widths: Vec<usize> = items
+    let segments: Vec<(String, Style)> = items
         .iter()
-        .map(|item| segment(item).chars().count())
+        .map(|item| {
+            // A provider needing attention is painted like the card's own flag,
+            // so the digest reads the same way the grid would have.
+            let style = if item.needs_login || item.limit_reached {
+                Style::default()
+                    .fg(RatatuiColor::Red)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(item.color)
+            };
+            (segment(item), style)
+        })
         .collect();
-    let mut shown = items.len();
-    let mut used: usize = widths.iter().sum::<usize>() + SEP.chars().count() * (items.len() - 1);
-    while shown > 1 {
-        let hidden = items.len() - shown;
-        // `+N more → Q` needs room of its own once anything is hidden.
-        let tail = if hidden > 0 {
-            SEP.chars().count() + format!("+{hidden} more → Q").chars().count()
-        } else {
-            0
-        };
-        if used + tail <= usize::from(width) {
-            break;
-        }
-        shown -= 1;
-        used -= widths[shown] + SEP.chars().count();
-    }
 
-    let mut spans: Vec<Span> = Vec::with_capacity(shown * 2);
-    for (i, item) in items.iter().take(shown).enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(
-                SEP,
-                Style::default().fg(RatatuiColor::DarkGray),
-            ));
-        }
-        // A provider needing attention is painted like the card's own flag, so
-        // the digest reads the same way the grid would have.
-        let style = if item.needs_login || item.limit_reached {
-            Style::default()
-                .fg(RatatuiColor::Red)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(item.color)
-        };
-        spans.push(Span::styled(segment(item), style));
-    }
-    let hidden = items.len() - shown;
-    if hidden > 0 {
-        spans.push(Span::styled(
-            SEP,
-            Style::default().fg(RatatuiColor::DarkGray),
-        ));
-        spans.push(Span::styled(
-            format!("+{hidden} more → Q"),
-            Style::default().fg(RatatuiColor::DarkGray),
-        ));
-    }
-    Line::from(spans)
+    // Every gauge here is equally worth showing, so the tail goes first.
+    let drop_order: Vec<usize> = (0..items.len()).rev().collect();
+    let widths: Vec<usize> = segments
+        .iter()
+        .map(|(text, _)| text.chars().count())
+        .collect();
+    let keep = fit_digest(
+        &widths,
+        SEP.chars().count(),
+        &drop_order,
+        TAIL,
+        usize::from(width),
+    );
+    digest_line(segments, &keep, SEP, TAIL)
 }
 
 /// One provider's quota, laid out as an ordered list of lines.
@@ -2481,7 +2612,6 @@ fn claude_balance_parts(claude: &ClaudeQuotaSnapshot) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::display::common::table::RAIL_MIN_W;
     use vct_core::models::Provider;
 
     fn line_text(line: Line<'_>) -> String {
@@ -2730,32 +2860,38 @@ mod tests {
         assert!(!rendered.contains("no Grok quota"));
     }
 
-    /// Renders the Provider Usage rail at a given size and returns its text.
-    fn render_rail(width: u16, height: u16, providers: usize) -> String {
+    const PROVIDER_NAMES: [Provider; 8] = [
+        Provider::ClaudeCode,
+        Provider::Codex,
+        Provider::Copilot,
+        Provider::Gemini,
+        Provider::Grok,
+        Provider::OpenCode,
+        Provider::Cursor,
+        Provider::Hermes,
+    ];
+
+    /// `n` provider total rows, each carrying the same nonzero stats.
+    fn provider_rows(n: usize, stats: &ProviderStats) -> Vec<ProviderTotal<'_, ProviderStats>> {
+        PROVIDER_NAMES
+            .iter()
+            .take(n)
+            .map(|p| ProviderTotal::new(*p, stats, false))
+            .collect()
+    }
+
+    /// Renders the Provider Usage panel table at a given size and returns its text.
+    fn render_panel(width: u16, height: u16, providers: usize) -> String {
         let stats = ProviderStats {
             total_tokens: 1_000,
             total_cost: 1.0,
             days_count: 1,
         };
-        const NAMES: [Provider; 8] = [
-            Provider::ClaudeCode,
-            Provider::Codex,
-            Provider::Copilot,
-            Provider::Gemini,
-            Provider::Grok,
-            Provider::OpenCode,
-            Provider::Cursor,
-            Provider::Hermes,
-        ];
-        let rows: Vec<_> = NAMES
-            .iter()
-            .take(providers)
-            .map(|p| ProviderTotal::new(*p, &stats, false))
-            .collect();
+        let rows = provider_rows(providers, &stats);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| render_provider_rail(frame, frame.area(), &rows))
-            .expect("rail renders");
+            .draw(|frame| render_provider_table(frame, frame.area(), &rows))
+            .expect("panel renders");
         let buffer = terminal.backend().buffer();
         (0..height)
             .map(|y| {
@@ -2768,22 +2904,94 @@ mod tests {
     }
 
     #[test]
-    fn rail_says_how_many_providers_it_could_not_list() {
-        // Eight providers into a rail with room for four data rows: the ones
+    fn provider_panel_says_how_many_providers_it_could_not_list() {
+        // Eight providers into a panel with room for four data rows: the ones
         // that did not fit are counted, in the title and in the body, rather
         // than the list just stopping at the border.
-        let short = render_rail(RAIL_MIN_W, 9, 8);
+        let short = render_panel(34, 9, 8);
         assert!(short.contains("+5"), "got:\n{short}");
         assert!(short.contains("more"), "got:\n{short}");
 
         // With room for all of them, neither marker appears.
-        let tall = render_rail(RAIL_MIN_W, 14, 8);
+        let tall = render_panel(34, 14, 8);
         assert!(!tall.contains("more"), "got:\n{tall}");
         assert!(tall.contains("Hermes"), "got:\n{tall}");
 
         // No data at all still says so rather than drawing an empty box.
-        let empty = render_rail(RAIL_MIN_W, 10, 0);
+        let empty = render_panel(34, 10, 0);
         assert!(empty.contains("No provider data yet"), "got:\n{empty}");
+    }
+
+    #[test]
+    fn provider_digest_drops_whole_segments_and_counts_the_rest() {
+        let stats = ProviderStats {
+            total_tokens: 1_000,
+            total_cost: 1.0,
+            days_count: 1,
+        };
+        let rows = provider_rows(8, &stats);
+
+        // Wide enough for all eight: every provider is named, nothing is
+        // counted away.
+        let wide = line_text(provider_digest(&rows, 120));
+        for provider in PROVIDER_NAMES {
+            assert!(
+                wide.contains(provider.display_name()),
+                "width=120 dropped {}: {wide}",
+                provider.display_name()
+            );
+        }
+        assert!(!wide.contains("more"), "got: {wide}");
+        assert!(wide.chars().count() <= 120, "got: {wide}");
+
+        // Narrow: whole segments go and the remainder is named, so the line
+        // never implies it listed everyone. Equal costs empty from the tail.
+        let narrow = line_text(provider_digest(&rows, 46));
+        assert!(narrow.contains("more → p"), "got: {narrow}");
+        assert!(!narrow.contains("Hermes"), "got: {narrow}");
+        assert!(narrow.chars().count() <= 46, "got: {narrow}");
+
+        // The aggregate row is the summary bar's job, not the digest's.
+        let overall = ProviderTotal::new_overall(&stats);
+        let mut with_overall = provider_rows(2, &stats);
+        with_overall.push(overall);
+        let line = line_text(provider_digest(&with_overall, 120));
+        assert!(!line.contains("All Providers"), "got: {line}");
+
+        // An empty scan says so rather than drawing a blank row.
+        assert_eq!(line_text(provider_digest(&[], 120)), "no provider data yet");
+    }
+
+    #[test]
+    fn provider_digest_keeps_the_costliest_provider_however_narrow_it_gets() {
+        // The spender that dominates the account sits last in the enum order,
+        // so dropping by list position would hide exactly the number the line
+        // exists to show.
+        let idle = ProviderStats {
+            total_tokens: 10,
+            total_cost: 0.0,
+            days_count: 1,
+        };
+        let big = ProviderStats {
+            total_tokens: 90_000_000,
+            total_cost: 412.75,
+            days_count: 1,
+        };
+        let mut rows = provider_rows(7, &idle);
+        rows.push(ProviderTotal::new(Provider::Hermes, &big, false));
+
+        // Down to a single segment, the surviving one is the expensive one.
+        for width in [120u16, 80, 60, 40, 20] {
+            let line = line_text(provider_digest(&rows, width));
+            assert!(
+                line.contains("Hermes $412.75"),
+                "width={width} dropped the costliest provider: {line}"
+            );
+        }
+
+        // The rest are still accounted for rather than silently missing.
+        let narrow = line_text(provider_digest(&rows, 20));
+        assert!(narrow.contains("+7 more → p"), "got: {narrow}");
     }
 
     #[test]
@@ -2822,9 +3030,7 @@ mod tests {
             },
         ];
         for width in [USAGE_MIN_W, 80, 96, 100, 110, 120, 140, 160, 180, 200, 240] {
-            let content = frame_layout(Rect::new(0, 0, width, 30), USAGE_CONTENT_MIN_W, true, 0)
-                .content
-                .width;
+            let content = frame_layout(Rect::new(0, 0, width, 30), 0).content.width;
             let inner = content.saturating_sub(2);
             let (kept, dropped) = fit_columns(&NUMERIC, inner, MODEL_COL_MIN_W);
             let span: u16 = kept.iter().map(|&i| NUMERIC[i].width + 1).sum();
@@ -2932,9 +3138,10 @@ mod tests {
         // Short and narrow enough to need two card rows: folding wins.
         let short = Rect::new(0, 0, 80, 24);
         assert_eq!(visible_grid_height(short, true, n), 0);
-        // The exact boundary: the table must keep TABLE_MIN_BODY_H body rows.
+        // The exact boundary: the table must keep TABLE_MIN_BODY_H body rows
+        // once the footer, the Provider Usage line and the grid are paid for.
         let grid = grid_height(&CARD_GRID, 120, n);
-        let floor = grid + FOOTER_H + TABLE_MIN_BODY_H + 4;
+        let floor = grid + FOOTER_H + PROVIDER_LINE_H + TABLE_MIN_BODY_H + 4;
         assert_eq!(
             visible_grid_height(Rect::new(0, 0, 120, floor - 1), true, n),
             0
@@ -3136,7 +3343,7 @@ mod tests {
                 grok: true,
             },
             band_enabled: true,
-            rail_visible: true,
+            provider_panel_open: false,
             overlay_open: true,
         }
     }
@@ -3183,7 +3390,7 @@ mod tests {
             grok: &g,
             present: QuotaPresence::default(),
             band_enabled: true,
-            rail_visible: true,
+            provider_panel_open: false,
             overlay_open: true,
         };
         let render = |quota: &QuotaView| {
@@ -3285,7 +3492,13 @@ mod tests {
     /// Frame-level rather than unit-level on purpose: every piece of this
     /// layout fits itself to a width it is handed, so the defects worth
     /// catching are the ones where the width handed down is the wrong one.
-    fn render_frame(w: u16, h: u16, present: QuotaPresence, overlay: bool) -> Vec<String> {
+    fn render_frame(
+        w: u16,
+        h: u16,
+        present: QuotaPresence,
+        overlay: bool,
+        provider_panel: bool,
+    ) -> Vec<String> {
         let mut bench = UsageFrameBenchmark::new(w, h).expect("frame fixture");
         let quota = QuotaView {
             claude: &bench.claude,
@@ -3295,7 +3508,7 @@ mod tests {
             grok: &bench.grok,
             present,
             band_enabled: true,
-            rail_visible: true,
+            provider_panel_open: provider_panel,
             overlay_open: overlay,
         };
         render_usage_frame_with_status(
@@ -3331,8 +3544,8 @@ mod tests {
         grok: true,
     };
 
-    /// Sizes worth pinning: the hard minimum, the common terminals, the rail
-    /// threshold either side, and one very wide.
+    /// Sizes worth pinning: the hard minimum, the common terminals, the widths
+    /// either side of where the quota grid changes shape, and one very wide.
     const FRAME_SIZES: [(u16, u16); 8] = [
         (USAGE_MIN_W, USAGE_MIN_H),
         (80, 24),
@@ -3365,15 +3578,17 @@ mod tests {
 
     #[test]
     fn frame_never_draws_outside_its_own_width() {
+        // Both panels are covered: each is centered over the frame at every
+        // terminal size, so an over-wide one would run off the edge here.
         for (w, h) in FRAME_SIZES {
-            for overlay in [false, true] {
-                for (y, row) in render_frame(w, h, ALL_PRESENT, overlay).iter().enumerate() {
-                    assert_eq!(
-                        row.chars().count(),
-                        usize::from(w),
-                        "{w}x{h} overlay={overlay}"
-                    );
-                    assert_no_clipped_markers(row, &format!("{w}x{h} overlay={overlay} row {y}"));
+            for (overlay, panel) in [(false, false), (true, false), (false, true)] {
+                let context = format!("{w}x{h} overlay={overlay} panel={panel}");
+                for (y, row) in render_frame(w, h, ALL_PRESENT, overlay, panel)
+                    .iter()
+                    .enumerate()
+                {
+                    assert_eq!(row.chars().count(), usize::from(w), "{context}");
+                    assert_no_clipped_markers(row, &format!("{context} row {y}"));
                 }
             }
         }
@@ -3382,7 +3597,7 @@ mod tests {
     #[test]
     fn every_size_shows_a_quota_surface_and_a_model_table() {
         for (w, h) in FRAME_SIZES {
-            let screen = render_frame(w, h, ALL_PRESENT, false).join("\n");
+            let screen = render_frame(w, h, ALL_PRESENT, false, false).join("\n");
             assert!(screen.contains("Models"), "{w}x{h} lost the model table");
             // Either the cards are on screen or the digest that replaces them
             // is — never neither, and never both.
@@ -3391,6 +3606,29 @@ mod tests {
             assert!(has_cards || has_digest, "{w}x{h} has no quota surface");
             // Quitting is always discoverable.
             assert!(screen.contains("q quit"), "{w}x{h} lost the quit hint");
+        }
+    }
+
+    #[test]
+    fn every_size_shows_the_provider_line_and_can_reach_the_panel() {
+        for (w, h) in FRAME_SIZES {
+            // The provider line costs its row unconditionally, and drops the
+            // cheapest first, so the fixture's biggest spender survives at
+            // every size rather than at the wide ones only.
+            let screen = render_frame(w, h, ALL_PRESENT, false, false).join("\n");
+            assert!(
+                screen.contains("Hermes $"),
+                "{w}x{h} dropped the highest-cost provider"
+            );
+            assert!(screen.contains("p providers"), "{w}x{h} lost the `p` hint");
+
+            // ...and `p` reaches the numbers the line could not carry.
+            let panel = render_frame(w, h, ALL_PRESENT, false, true).join("\n");
+            assert!(panel.contains("Tokens"), "{w}x{h} panel lost its columns");
+            assert!(
+                panel.contains("esc to close"),
+                "{w}x{h} panel lost its close hint"
+            );
         }
     }
 
@@ -3422,7 +3660,7 @@ mod tests {
                 grok: &bench.grok,
                 present: ALL_PRESENT,
                 band_enabled: true,
-                rail_visible: true,
+                provider_panel_open: false,
                 overlay_open: true,
             };
             render_usage_frame_with_status(

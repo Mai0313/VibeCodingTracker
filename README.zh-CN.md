@@ -216,15 +216,16 @@ vct usage --table --merge-providers
 ### 预览：交互式面板（`vct usage`）
 
 ```
-┌ Models · $79.33 · 49.1M tokens · 3 models ────────────────────────── −2 cols ┐┌ Providers ───────────────────────────┐
-│Model                               Input     Output    Total     Cost (USD)  █│Provider       Tokens      Cost       │
-│                                                                              █│                                      │
-│gemini-3.1-pro-preview                   129K     10.3K      207K        $0.40█│Claude         48.9M       $78.93     │
-│claude-haiku-4-5-20251001               5.57K     19.8K     5.28M        $1.34█│Gemini         207K        $0.40      │
-│claude-opus-4-8                         25.7K      179K     43.6M       $77.59█│                                      │
-│                                                                              █│                                      │
-│                                                                              █│                                      │
-└──────────────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────┘
+┌ Models · $79.33 · 49.1M tokens · 3 models ───────────────────────────────────────────────────────────────────────────┐
+│Model                              Input     Output    Cache Read  Cache Write Total     Cost (USD)   Share           █
+│                                                                                                                      █
+│gemini-3.1-pro-preview                  129K     10.3K       66.0K       1.70K      207K        $0.40             0.4%█
+│claude-haiku-4-5-20251001              5.57K     19.8K       5.20M       55.0K     5.28M        $1.34          █ 10.8%█
+│claude-opus-4-8                        25.7K      179K       42.9M        496K     43.6M       $77.59  █████████ 88.8%█
+│                                                                                                                      █
+│                                                                                                                      █
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+                                              Claude $78.93 · Gemini $0.40
 ┌ Claude ──────────────┐┌ Codex ───────────────┐┌ Copilot ─────────────┐┌ Cursor ────────LIMIT ┐┌ Grok ────────────────┐
 │max 20x       just now││plus          just now││individual    just now││free          just now││SuperGrok     just now│
 │5h    ▰▱▱▱▱  13% 1h42m││5h    ▰▰▱▱▱  33% 12m  ││prem  ▰▱▱▱▱   3% 24d0h││total ▰▰▰▰▰  94% 16d0h││week  ▰▰▱▱▱  38% 3d4h │
@@ -233,7 +234,7 @@ vct usage --table --merge-providers
 │bal - · $0.00 used    ││reset expires 17d0h   ││                      ││                      ││                      │
 └──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘
                 Total Cost: $79.33  |  Total Tokens: 49.1M  |  Models: 3  |  Memory: 4.7 MB  |  CPU: 0.0%
-                       ↑/↓ scroll  m merge  p hide  Q quota  r refresh  q quit  |  Star on GitHub
+                    ↑/↓ scroll  m merge  p providers  Q quota  r refresh  q quit  |  Star on GitHub
 ```
 
 两个交互式面板都会在 terminal setup 完成后立即绘制居中的 `Loading sessions...` spinner. Loading 期间仍可响应 `q`, Ctrl+C 与 resize event. 后续扫描由单一 background worker 执行, 并在 `Refreshing...` footer 下保留上一次成功的数据. 重复的 refresh 请求最多只会合并为一个 pending scan. 如果 refresh 失败, 面板会保留 last-known-good view, 并在下次排程或手动刷新时重试.
@@ -305,7 +306,7 @@ Grok 的 `usage` 是单一时点的本地 context 估算：vct 会把 `signals.j
 
 ### 实时额度面板
 
-`vct usage` 会**在仪表盘中直接显示 Claude Code、Codex、GitHub Copilot、Cursor 与 Grok 的实时额度用量——完全零配置。** 不需要 status-line hook，也无需手动输入任何凭证：vct 会读取各 provider 自己的 OAuth 凭证，在后台线程调用其用量 API，并在你工作时保持面板持续更新。每个进度条都是**已用**百分比，所以进度条满格代表该额度周期已耗尽，而不是还没开始用。（想要更清爽的面板？在 [`config.toml`](#%E9%85%8D%E7%BD%AE) 中精简 `[usage.quota]` 下的 `panels`，或设为 `[]` 隐藏所有额度卡片。Provider Usage 侧栏是本机扫描数据而不是额度面板，所以它有自己的 `p` 开关。）
+`vct usage` 会**在仪表盘中直接显示 Claude Code、Codex、GitHub Copilot、Cursor 与 Grok 的实时额度用量——完全零配置。** 不需要 status-line hook，也无需手动输入任何凭证：vct 会读取各 provider 自己的 OAuth 凭证，在后台线程调用其用量 API，并在你工作时保持面板持续更新。每个进度条都是**已用**百分比，所以进度条满格代表该额度周期已耗尽，而不是还没开始用。（想要更清爽的面板？在 [`config.toml`](#%E9%85%8D%E7%BD%AE) 中精简 `[usage.quota]` 下的 `panels`，或设为 `[]` 隐藏所有额度卡片。表格下方那行各 provider 成本是本机扫描数据而不是额度面板，所以不受这里的设置影响。）
 
 ```
 ┌ Claude ──────────────┐┌ Codex ───────────────┐┌ Copilot ─────────────┐┌ Cursor ────────LIMIT ┐┌ Grok ────────────────┐
@@ -325,7 +326,7 @@ Grok 的 `usage` 是单一时点的本地 context 估算：vct 会把 `signals.j
 
 **自动刷新 token。** 对 Claude、Codex 和 Grok，当 token 接近过期或被拒绝时，vct 会刷新它并把新 token 写回该 provider 自己的凭证文件（采用该 CLI 的原始格式），因此 token 会在多次检查之间复用，而不是每次都重新刷新。Grok 的 token 端点会像它自己的 CLI 那样，从登录时的 issuer 解析得出，而不是写死在代码里；写入时也会保留文件中其他所有的登录信息。如果刷新失败，面板会显示 `run: <provider> auth login` 提示，而不会直接中断。Copilot（长期有效的 token）和 Cursor（由其自身客户端保持最新）为只读——vct 从不写入它们的凭证文件。
 
-只有在某个 provider 的凭证存在时，才会显示对应的面板。面板排在一个统一网格上：一行放得下几张就放几张，放不下的自动折到下一行，因此新增一个 provider 只是多一张卡片，不会多一条排版规则。当终端高度不足以留给网格时，它会收成一行摘要，显示放得下的 gauge，并把其余的记成数量；按 `Q` 打开完整的额度浮层，无论终端多大，每张卡片都放得下全部内容，按 `p` 可切换 Provider Usage 侧栏。额度面板仅在交互式 TUI 中显示；`--table`、`--text`、`--json` 不受影响。
+只有在某个 provider 的凭证存在时，才会显示对应的面板。面板排在一个统一网格上：一行放得下几张就放几张，放不下的自动折到下一行，因此新增一个 provider 只是多一张卡片，不会多一条排版规则。当终端高度不足以留给网格时，它会收成一行摘要，显示放得下的 gauge，并把其余的记成数量；按 `Q` 打开完整的额度浮层，无论终端多大，每张卡片都放得下全部内容，按 `p` 打开 Provider Usage 面板，里面有各 provider 的 token 数与占比。额度面板仅在交互式 TUI 中显示；`--table`、`--text`、`--json` 不受影响。
 
 > **平台说明：** 在 macOS 上，Claude Code 会把 OAuth 凭证保存在系统 Keychain 中，而不是 `~/.claude/.credentials.json`，因此在 macOS 上不会显示 Claude 面板。Cursor 的 `~/.config/cursor` 凭证路径偏向 Linux。
 
