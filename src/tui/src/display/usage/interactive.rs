@@ -1492,19 +1492,88 @@ fn collect_cards(quota: &QuotaView, now: i64, width: u16) -> Vec<QuotaCard> {
     cards
 }
 
+/// Chooses which one-line digest segments fit in `width` columns.
+///
+/// `widths` holds each segment's column count in display order, `drop_order`
+/// lists those same indices in the order they may be given up (least worth
+/// showing first), and `tail` is the label the `+N ` count prefixes — which
+/// costs room of its own as soon as anything is hidden. Returns a keep-mask in
+/// display order; at least one segment always survives, because a line saying
+/// only `+8 more` tells the reader nothing.
+///
+/// The drop order is a parameter rather than "the last one" because the two
+/// callers disagree about which segment is cheapest to lose.
+fn fit_digest(
+    widths: &[usize],
+    sep: usize,
+    drop_order: &[usize],
+    tail: &str,
+    width: usize,
+) -> Vec<bool> {
+    let mut keep = vec![true; widths.len()];
+    let mut shown = widths.len();
+    let mut used: usize = widths.iter().sum::<usize>() + sep * shown.saturating_sub(1);
+    for &victim in drop_order {
+        if shown <= 1 {
+            break;
+        }
+        let hidden = widths.len() - shown;
+        let tail_w = if hidden > 0 {
+            sep + format!("+{hidden} {tail}").chars().count()
+        } else {
+            0
+        };
+        if used + tail_w <= width {
+            break;
+        }
+        keep[victim] = false;
+        used -= widths[victim] + sep;
+        shown -= 1;
+    }
+    keep
+}
+
+/// Assembles a digest line from the segments [`fit_digest`] kept, plus the
+/// trailing count of the ones it did not.
+fn digest_line(
+    segments: Vec<(String, Style)>,
+    keep: &[bool],
+    sep: &'static str,
+    tail: &str,
+) -> Line<'static> {
+    let dim = Style::default().fg(RatatuiColor::DarkGray);
+    let mut spans: Vec<Span> = Vec::with_capacity(segments.len() * 2);
+    for (text, style) in segments
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(segment, keep)| keep.then_some(segment))
+    {
+        if !spans.is_empty() {
+            spans.push(Span::styled(sep, dim));
+        }
+        spans.push(Span::styled(text, style));
+    }
+    let hidden = keep.iter().filter(|keep| !**keep).count();
+    if hidden > 0 {
+        spans.push(Span::styled(sep, dim));
+        spans.push(Span::styled(format!("+{hidden} {tail}"), dim));
+    }
+    Line::from(spans)
+}
+
 /// The one-line Provider Usage digest drawn under the model table.
 ///
 /// One segment per provider (`Claude $0.91`), painted in that provider's own
 /// color so it reads the same way its rows and share-bar segments do. Cost is
 /// the one number that earns a permanent row here; tokens and the per-provider
-/// day counts live behind `p`. Segments drop whole from the tail and whatever
-/// is left over is named in a trailing `+N more → p`, so the line never implies
-/// it lists every provider.
+/// day counts live behind `p`. Whatever does not fit is named in a trailing
+/// `+N more → p`, so the line never implies it lists every provider.
 fn provider_digest(rows: &[ProviderTotal<'_, ProviderStats>], width: u16) -> Line<'static> {
     /// Narrower than the quota digest's separator on purpose: there are eight
     /// providers to the quota band's five, and the two columns this saves per
     /// gap are what let all eight fit on a 120-column terminal.
     const SEP: &str = " · ";
+    const TAIL: &str = "more → p";
     // The summary bar already carries the grand total, so the aggregate row
     // would only repeat it.
     let listed: Vec<_> = rows
@@ -1515,60 +1584,48 @@ fn provider_digest(rows: &[ProviderTotal<'_, ProviderStats>], width: u16) -> Lin
         return dim_line("no provider data yet");
     }
 
-    let segment = |row: &ProviderTotal<'_, ProviderStats>| {
-        format!(
-            "{} {}",
-            row.label,
-            format_cost_compact(row.stats.total_cost)
-        )
-    };
-
-    let widths: Vec<usize> = listed
+    let segments: Vec<(String, Style)> = listed
         .iter()
-        .map(|row| segment(row).chars().count())
+        .map(|row| {
+            (
+                format!(
+                    "{} {}",
+                    row.label,
+                    format_cost_compact(row.stats.total_cost)
+                ),
+                Style::default().fg(row.tui_color),
+            )
+        })
         .collect();
-    let mut shown = listed.len();
-    let mut used: usize = widths.iter().sum::<usize>() + SEP.chars().count() * (listed.len() - 1);
-    while shown > 1 {
-        let hidden = listed.len() - shown;
-        // `+N more → p` needs room of its own once anything is hidden.
-        let tail = if hidden > 0 {
-            SEP.chars().count() + format!("+{hidden} more → p").chars().count()
-        } else {
-            0
-        };
-        if used + tail <= usize::from(width) {
-            break;
-        }
-        shown -= 1;
-        used -= widths[shown] + SEP.chars().count();
-    }
 
-    let mut spans: Vec<Span> = Vec::with_capacity(shown * 2);
-    for (i, row) in listed.iter().take(shown).enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(
-                SEP,
-                Style::default().fg(RatatuiColor::DarkGray),
-            ));
-        }
-        spans.push(Span::styled(
-            segment(row),
-            Style::default().fg(row.tui_color),
-        ));
-    }
-    let hidden = listed.len() - shown;
-    if hidden > 0 {
-        spans.push(Span::styled(
-            SEP,
-            Style::default().fg(RatatuiColor::DarkGray),
-        ));
-        spans.push(Span::styled(
-            format!("+{hidden} more → p"),
-            Style::default().fg(RatatuiColor::DarkGray),
-        ));
-    }
-    Line::from(spans)
+    // Cost is what this line is for, so the cheapest providers are the ones to
+    // give up. Dropping by list position instead would hide Cursor and Hermes
+    // first purely because of where they sit in the enum, which on an account
+    // dominated by one of them drops the very number the line exists to show.
+    // Ties go to the later provider, so a row of untouched providers still
+    // empties from the tail.
+    let mut drop_order: Vec<usize> = (0..listed.len()).collect();
+    drop_order.sort_by(|&a, &b| {
+        listed[a]
+            .stats
+            .total_cost
+            .partial_cmp(&listed[b].stats.total_cost)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.cmp(&a))
+    });
+
+    let widths: Vec<usize> = segments
+        .iter()
+        .map(|(text, _)| text.chars().count())
+        .collect();
+    let keep = fit_digest(
+        &widths,
+        SEP.chars().count(),
+        &drop_order,
+        TAIL,
+        usize::from(width),
+    );
+    digest_line(segments, &keep, SEP, TAIL)
 }
 
 /// Renders the full Provider Usage totals as a centered panel, opened with `p`.
@@ -1867,6 +1924,7 @@ fn digest_items(quota: &QuotaView) -> Vec<DigestItem> {
 /// the only quota surface on these terminal sizes.
 fn quota_digest(items: &[DigestItem], width: u16) -> Line<'static> {
     const SEP: &str = "  ·  ";
+    const TAIL: &str = "more → Q";
     /// `Claude ▰▰▱ 58%`, `Claude LIMIT`, `Claude login` — a three-cell bar keeps
     /// the line short.
     fn segment(item: &DigestItem) -> String {
@@ -1886,58 +1944,36 @@ fn quota_digest(items: &[DigestItem], width: u16) -> Line<'static> {
         return dim_line("no quota panels");
     }
 
-    let widths: Vec<usize> = items
+    let segments: Vec<(String, Style)> = items
         .iter()
-        .map(|item| segment(item).chars().count())
+        .map(|item| {
+            // A provider needing attention is painted like the card's own flag,
+            // so the digest reads the same way the grid would have.
+            let style = if item.needs_login || item.limit_reached {
+                Style::default()
+                    .fg(RatatuiColor::Red)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(item.color)
+            };
+            (segment(item), style)
+        })
         .collect();
-    let mut shown = items.len();
-    let mut used: usize = widths.iter().sum::<usize>() + SEP.chars().count() * (items.len() - 1);
-    while shown > 1 {
-        let hidden = items.len() - shown;
-        // `+N more → Q` needs room of its own once anything is hidden.
-        let tail = if hidden > 0 {
-            SEP.chars().count() + format!("+{hidden} more → Q").chars().count()
-        } else {
-            0
-        };
-        if used + tail <= usize::from(width) {
-            break;
-        }
-        shown -= 1;
-        used -= widths[shown] + SEP.chars().count();
-    }
 
-    let mut spans: Vec<Span> = Vec::with_capacity(shown * 2);
-    for (i, item) in items.iter().take(shown).enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(
-                SEP,
-                Style::default().fg(RatatuiColor::DarkGray),
-            ));
-        }
-        // A provider needing attention is painted like the card's own flag, so
-        // the digest reads the same way the grid would have.
-        let style = if item.needs_login || item.limit_reached {
-            Style::default()
-                .fg(RatatuiColor::Red)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(item.color)
-        };
-        spans.push(Span::styled(segment(item), style));
-    }
-    let hidden = items.len() - shown;
-    if hidden > 0 {
-        spans.push(Span::styled(
-            SEP,
-            Style::default().fg(RatatuiColor::DarkGray),
-        ));
-        spans.push(Span::styled(
-            format!("+{hidden} more → Q"),
-            Style::default().fg(RatatuiColor::DarkGray),
-        ));
-    }
-    Line::from(spans)
+    // Every gauge here is equally worth showing, so the tail goes first.
+    let drop_order: Vec<usize> = (0..items.len()).rev().collect();
+    let widths: Vec<usize> = segments
+        .iter()
+        .map(|(text, _)| text.chars().count())
+        .collect();
+    let keep = fit_digest(
+        &widths,
+        SEP.chars().count(),
+        &drop_order,
+        TAIL,
+        usize::from(width),
+    );
+    digest_line(segments, &keep, SEP, TAIL)
 }
 
 /// One provider's quota, laid out as an ordered list of lines.
@@ -2908,8 +2944,8 @@ mod tests {
         assert!(!wide.contains("more"), "got: {wide}");
         assert!(wide.chars().count() <= 120, "got: {wide}");
 
-        // Narrow: segments go whole from the tail and the remainder is named,
-        // so the line never implies it listed everyone.
+        // Narrow: whole segments go and the remainder is named, so the line
+        // never implies it listed everyone. Equal costs empty from the tail.
         let narrow = line_text(provider_digest(&rows, 46));
         assert!(narrow.contains("more → p"), "got: {narrow}");
         assert!(!narrow.contains("Hermes"), "got: {narrow}");
@@ -2924,6 +2960,38 @@ mod tests {
 
         // An empty scan says so rather than drawing a blank row.
         assert_eq!(line_text(provider_digest(&[], 120)), "no provider data yet");
+    }
+
+    #[test]
+    fn provider_digest_keeps_the_costliest_provider_however_narrow_it_gets() {
+        // The spender that dominates the account sits last in the enum order,
+        // so dropping by list position would hide exactly the number the line
+        // exists to show.
+        let idle = ProviderStats {
+            total_tokens: 10,
+            total_cost: 0.0,
+            days_count: 1,
+        };
+        let big = ProviderStats {
+            total_tokens: 90_000_000,
+            total_cost: 412.75,
+            days_count: 1,
+        };
+        let mut rows = provider_rows(7, &idle);
+        rows.push(ProviderTotal::new(Provider::Hermes, &big, false));
+
+        // Down to a single segment, the surviving one is the expensive one.
+        for width in [120u16, 80, 60, 40, 20] {
+            let line = line_text(provider_digest(&rows, width));
+            assert!(
+                line.contains("Hermes $412.75"),
+                "width={width} dropped the costliest provider: {line}"
+            );
+        }
+
+        // The rest are still accounted for rather than silently missing.
+        let narrow = line_text(provider_digest(&rows, 20));
+        assert!(narrow.contains("+7 more → p"), "got: {narrow}");
     }
 
     #[test]
@@ -3424,7 +3492,13 @@ mod tests {
     /// Frame-level rather than unit-level on purpose: every piece of this
     /// layout fits itself to a width it is handed, so the defects worth
     /// catching are the ones where the width handed down is the wrong one.
-    fn render_frame(w: u16, h: u16, present: QuotaPresence, overlay: bool) -> Vec<String> {
+    fn render_frame(
+        w: u16,
+        h: u16,
+        present: QuotaPresence,
+        overlay: bool,
+        provider_panel: bool,
+    ) -> Vec<String> {
         let mut bench = UsageFrameBenchmark::new(w, h).expect("frame fixture");
         let quota = QuotaView {
             claude: &bench.claude,
@@ -3434,7 +3508,7 @@ mod tests {
             grok: &bench.grok,
             present,
             band_enabled: true,
-            provider_panel_open: false,
+            provider_panel_open: provider_panel,
             overlay_open: overlay,
         };
         render_usage_frame_with_status(
@@ -3504,15 +3578,17 @@ mod tests {
 
     #[test]
     fn frame_never_draws_outside_its_own_width() {
+        // Both panels are covered: each is centered over the frame at every
+        // terminal size, so an over-wide one would run off the edge here.
         for (w, h) in FRAME_SIZES {
-            for overlay in [false, true] {
-                for (y, row) in render_frame(w, h, ALL_PRESENT, overlay).iter().enumerate() {
-                    assert_eq!(
-                        row.chars().count(),
-                        usize::from(w),
-                        "{w}x{h} overlay={overlay}"
-                    );
-                    assert_no_clipped_markers(row, &format!("{w}x{h} overlay={overlay} row {y}"));
+            for (overlay, panel) in [(false, false), (true, false), (false, true)] {
+                let context = format!("{w}x{h} overlay={overlay} panel={panel}");
+                for (y, row) in render_frame(w, h, ALL_PRESENT, overlay, panel)
+                    .iter()
+                    .enumerate()
+                {
+                    assert_eq!(row.chars().count(), usize::from(w), "{context}");
+                    assert_no_clipped_markers(row, &format!("{context} row {y}"));
                 }
             }
         }
@@ -3521,7 +3597,7 @@ mod tests {
     #[test]
     fn every_size_shows_a_quota_surface_and_a_model_table() {
         for (w, h) in FRAME_SIZES {
-            let screen = render_frame(w, h, ALL_PRESENT, false).join("\n");
+            let screen = render_frame(w, h, ALL_PRESENT, false, false).join("\n");
             assert!(screen.contains("Models"), "{w}x{h} lost the model table");
             // Either the cards are on screen or the digest that replaces them
             // is — never neither, and never both.
@@ -3530,6 +3606,29 @@ mod tests {
             assert!(has_cards || has_digest, "{w}x{h} has no quota surface");
             // Quitting is always discoverable.
             assert!(screen.contains("q quit"), "{w}x{h} lost the quit hint");
+        }
+    }
+
+    #[test]
+    fn every_size_shows_the_provider_line_and_can_reach_the_panel() {
+        for (w, h) in FRAME_SIZES {
+            // The provider line costs its row unconditionally, and drops the
+            // cheapest first, so the fixture's biggest spender survives at
+            // every size rather than at the wide ones only.
+            let screen = render_frame(w, h, ALL_PRESENT, false, false).join("\n");
+            assert!(
+                screen.contains("Hermes $"),
+                "{w}x{h} dropped the highest-cost provider"
+            );
+            assert!(screen.contains("p providers"), "{w}x{h} lost the `p` hint");
+
+            // ...and `p` reaches the numbers the line could not carry.
+            let panel = render_frame(w, h, ALL_PRESENT, false, true).join("\n");
+            assert!(panel.contains("Tokens"), "{w}x{h} panel lost its columns");
+            assert!(
+                panel.contains("esc to close"),
+                "{w}x{h} panel lost its close hint"
+            );
         }
     }
 

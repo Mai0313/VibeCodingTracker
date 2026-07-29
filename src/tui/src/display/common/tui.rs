@@ -620,7 +620,8 @@ pub enum InputAction {
     /// User toggled the full-screen quota detail overlay (`Q`); usage view
     /// only, ignored elsewhere.
     ToggleQuota,
-    /// User toggled the side pane (`p` / `P`).
+    /// User toggled the detail pane (`p` / `P`); usage view only, ignored
+    /// elsewhere.
     TogglePane,
     /// User asked to re-fetch and redraw (`r` / `R`).
     Refresh,
