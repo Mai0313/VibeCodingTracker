@@ -461,9 +461,13 @@ Codex code mode session 會提供已完成的 JavaScript `exec` cell, 但沒有 
 
 ## Update 指令
 
-**自動保持安裝為最新版本。**
+**自動讓受支援的直接安裝維持最新版本.**
 
-Update 指令適用於**所有安裝方式**（npm/pip/cargo/手動安裝），透過直接從 GitHub releases 下載並替換執行檔來完成更新。
+vct 啟動時最多每天 UTC 日期檢查一次新版. 只有透過官方 `scripts/install.sh` 或 `scripts/install.ps1` 安裝, 且帶有 `.vct-managed` marker 的執行檔, 才會下載並套用新版. 檢查, 下載與替換都不會印到 stdout 或 stderr. 網路失敗, rate limit, 唯讀目錄或另一個 vct process 正在執行時, 目前指令仍會照常繼續, 原因只會寫入 diagnostic log. `VCT_OFFLINE=1` 會完全略過檢查.
+
+Unix 套用更新後, vct 會用新版 binary 重新執行目前指令. Windows 則會讓目前指令結束, 再由 helper 套用替換. 自動流程絕不會修改透過 cargo, npm, PyPI, distro package 安裝的版本, 或沒有 marker 的手動與 development build. 請透過對應 package manager 更新. 既有的直接安裝只要再執行一次目前的官方 installer, 就會建立 marker 並啟用自動更新.
+
+在 `~/.vct/config.toml` 設定 `general.auto_update = false` 可關閉啟動檢查與自動更新. 明確執行的 `vct update` 會保留原有的手動行為.
 
 ### 基本用法
 
@@ -560,9 +564,12 @@ vct 會把使用者設定存放在 `~/.vct/config.toml`。這個檔案會在**�
 # 未指定 --daily/--weekly/--monthly/--all flag 時使用的預設時間範圍。
 # 可選值："daily" | "weekly" | "monthly" | "all"
 default_time_range = "all"
+# 啟動時檢查新版, 並自動更新由官方 installer 建立的受支援直接安裝.
+# 設為 false 可關閉此行為.
+auto_update = true
 # 這個檔案的版面版本，由 vct 標記。只有升級流程會讀取它;
 # 除非你想讓過去的升級再跑一次，否則別去動它。
-version = 2
+version = 3
 
 [usage]
 # 啟動 usage 儀表板時，是否先把不同 provider 前綴的 model 合併。
@@ -609,6 +616,7 @@ retention_days = 7
 | 設定項                         | 效果                                                                                                          |
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------- |
 | `general.default_time_range`   | 未指定 `--daily/--weekly/--monthly/--all` 時使用的時間範圍。明確指定的 flag 一律優先。                        |
+| `general.auto_update`          | 啟動時每天 UTC 日期最多檢查一次, 並只更新官方 installer 的直接安裝. 設為 `false` 可關閉.                      |
 | `general.version`              | vct 標記在檔案上的版面版本，讓後續版本新增的面板只會向你提議一次。                                            |
 | `usage.merge_models`           | 讓儀表板一開始就是合併狀態;`m` 切換會把你最後的選擇存回這裡。`--merge-providers` 會強制開啟。                 |
 | `usage.refresh_interval`       | `usage` 儀表板自動刷新的間隔（秒）。                                                                          |

@@ -461,9 +461,13 @@ Codex code mode session 会提供已完成的 JavaScript `exec` cell, 但没有 
 
 ## Update 命令
 
-**自动保持安装版本为最新。**
+**自动让受支持的直接安装保持最新版本.**
 
-update 命令适用于**所有安装方式**（npm/pip/cargo/手动安装），它会直接从 GitHub releases 下载并替换二进制文件。
+vct 启动时每天 UTC 日期最多检查一次新版. 只有通过官方 `scripts/install.sh` 或 `scripts/install.ps1` 安装, 并且带有 `.vct-managed` marker 的二进制文件, 才会下载并应用新版. 检查, 下载和替换都不会输出到 stdout 或 stderr. 网络失败, rate limit, 只读目录或另一个 vct process 正在运行时, 当前命令仍会照常继续, 原因只会写入 diagnostic log. `VCT_OFFLINE=1` 会完全跳过检查.
+
+Unix 应用更新后, vct 会用新版 binary 重新执行当前命令. Windows 会先让当前命令结束, 再由 helper 应用替换. 自动流程绝不会修改通过 cargo, npm, PyPI, distro package 安装的版本, 也不会修改没有 marker 的手动安装或 development build. 请通过相应的 package manager 更新. 现有直接安装只要再运行一次当前官方 installer, 就会创建 marker 并启用自动更新.
+
+在 `~/.vct/config.toml` 中设置 `general.auto_update = false` 可以关闭启动检查和自动更新. 显式执行的 `vct update` 会保留原有手动行为.
 
 ### 基本用法
 
@@ -560,9 +564,12 @@ vct 会把用户设置保存在 `~/.vct/config.toml` 中。该文件会在**首�
 # 未指定 --daily/--weekly/--monthly/--all flag 时使用的默认时间范围
 # 取值之一: "daily" | "weekly" | "monthly" | "all"
 default_time_range = "all"
+# 启动时检查新版, 并自动更新由官方 installer 创建的受支持直接安装.
+# 设为 false 可关闭此行为.
+auto_update = true
 # 该文件的布局版本, 由 vct 标记. 只有升级流程会读取它;
 # 除非你想让某次过去的升级再跑一遍, 否则不要动它.
-version = 2
+version = 3
 
 [usage]
 # 启动 usage 面板时就把跨 provider 前缀的 model 合并显示
@@ -609,6 +616,7 @@ retention_days = 7
 | 设置项                         | 作用                                                                                                            |
 | ------------------------------ | --------------------------------------------------------------------------------------------------------------- |
 | `general.default_time_range`   | 当你没有传入 `--daily/--weekly/--monthly/--all` 时使用的时间范围。显式传入的 flag 始终优先。                    |
+| `general.auto_update`          | 启动时每天 UTC 日期最多检查一次, 并且只更新官方 installer 的直接安装. 设为 `false` 可关闭.                      |
 | `general.version`              | vct 标记在文件上的布局版本，让后续版本新增的面板只会向你提供一次。                                              |
 | `usage.merge_models`           | 让面板启动时就处于合并状态；`m` 切换会把你上次的选择保存回这里。`--merge-providers` 会强制开启。                |
 | `usage.refresh_interval`       | `usage` 面板的自动刷新间隔（秒）。                                                                              |

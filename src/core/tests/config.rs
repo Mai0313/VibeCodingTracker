@@ -18,6 +18,7 @@ fn load_in_creates_default_commented_file_when_absent() {
 
     assert_eq!(cfg, Config::default());
     assert_eq!(cfg.general.default_time_range, TimeRange::All);
+    assert!(cfg.general.auto_update);
     assert!(cfg.usage.shows_quota_panel("cursor"));
     assert!(!cfg.usage.merge_models);
     // New sections default sensibly.
@@ -40,6 +41,7 @@ fn load_in_creates_default_commented_file_when_absent() {
     assert!(text.contains("[performance]"));
     assert!(text.contains("[logging]"));
     assert!(text.contains("merge_models = false"));
+    assert!(text.contains("auto_update = true"));
     assert!(text.contains("grok = true"));
     // A generated comment must survive so the file is self-documenting.
     assert!(text.contains("# Toggled live"));
@@ -137,11 +139,12 @@ fn existing_current_file_is_parsed_and_left_in_place() {
     fs::create_dir_all(dir).unwrap();
     // Already in the current format (new keys + `#:schema` + version marker), so
     // load must not rewrite it.
-    let original = "#:schema https://example.test/vct.schema.json\n[general]\ndefault_time_range = \"weekly\"\nversion = 2\n\n[usage]\nmerge_models = true\n\n[usage.quota]\npanels = [\"claude\"]\n\n[providers]\ncursor = false\n";
+    let original = "#:schema https://example.test/vct.schema.json\n[general]\ndefault_time_range = \"weekly\"\nauto_update = false\nversion = 3\n\n[usage]\nmerge_models = true\n\n[usage.quota]\npanels = [\"claude\"]\n\n[providers]\ncursor = false\n";
     fs::write(dir.join("config.toml"), original).unwrap();
 
     let cfg = config::load_in(dir);
     assert_eq!(cfg.general.default_time_range, TimeRange::Weekly);
+    assert!(!cfg.general.auto_update);
     assert!(cfg.usage.merge_models);
     assert!(cfg.usage.shows_quota_panel("claude"));
     assert!(!cfg.usage.shows_quota_panel("cursor"));
@@ -191,6 +194,7 @@ fn load_in_migrates_a_legacy_file_in_place() {
     );
     assert_eq!(cfg.usage.refresh_interval, 15);
     assert_eq!(cfg.analysis.refresh_interval, 20);
+    assert!(cfg.general.auto_update);
 
     // The file on disk is upgraded to the current layout.
     let text = fs::read_to_string(dir.join("config.toml")).unwrap();
@@ -198,10 +202,70 @@ fn load_in_migrates_a_legacy_file_in_place() {
     assert!(text.contains("[usage.quota]"));
     assert!(!text.contains("quota_panels"));
     assert!(!text.contains("refresh_interval_secs"));
+    assert!(text.contains("auto_update = true"));
 
     // A second load leaves the now-current file untouched.
     config::load_in(dir);
     assert_eq!(fs::read_to_string(dir.join("config.toml")).unwrap(), text);
+}
+
+#[test]
+fn load_in_preserves_an_explicit_auto_update_preference() {
+    let th = TempHome::new();
+    let dir = &th.paths.cache_dir;
+    fs::create_dir_all(dir).unwrap();
+    fs::write(
+        dir.join("config.toml"),
+        "[general]\ndefault_time_range = \"weekly\"\nauto_update = false\nversion = 2\n",
+    )
+    .unwrap();
+
+    let cfg = config::load_in(dir);
+    assert!(!cfg.general.auto_update);
+    let text = fs::read_to_string(dir.join("config.toml")).unwrap();
+    assert!(text.contains("auto_update = false"));
+    assert!(text.contains("version = 3"));
+    config::load_in(dir);
+    assert_eq!(fs::read_to_string(dir.join("config.toml")).unwrap(), text);
+}
+
+#[test]
+fn load_in_backfills_auto_update_for_a_legacy_general_table_once() {
+    let th = TempHome::new();
+    let dir = &th.paths.cache_dir;
+    fs::create_dir_all(dir).unwrap();
+    fs::write(
+        dir.join("config.toml"),
+        "[general]\ndefault_time_range = \"weekly\"\nversion = 2\n",
+    )
+    .unwrap();
+
+    let cfg = config::load_in(dir);
+    assert!(cfg.general.auto_update);
+    let text = fs::read_to_string(dir.join("config.toml")).unwrap();
+    assert!(text.contains("auto_update = true"));
+    assert!(text.contains("version = 3"));
+    config::load_in(dir);
+    assert_eq!(fs::read_to_string(dir.join("config.toml")).unwrap(), text);
+}
+
+#[test]
+fn load_read_only_in_never_writes_or_creates_config() {
+    let th = TempHome::new();
+    let dir = &th.paths.cache_dir;
+
+    assert_eq!(config::load_read_only_in(dir), Config::default());
+    assert!(!dir.exists());
+
+    fs::create_dir_all(dir).unwrap();
+    let path = dir.join("config.toml");
+    let original = "[general]\ndefault_time_range = \"weekly\"\nversion = 2\n";
+    fs::write(&path, original).unwrap();
+
+    let cfg = config::load_read_only_in(dir);
+    assert_eq!(cfg.general.default_time_range, TimeRange::Weekly);
+    assert!(cfg.general.auto_update);
+    assert_eq!(fs::read_to_string(path).unwrap(), original);
 }
 
 #[test]

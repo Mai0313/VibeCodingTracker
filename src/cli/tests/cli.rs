@@ -818,6 +818,51 @@ fn readonly_commands_do_not_create_config() {
         !home.home().join(".vct/config.toml").exists(),
         "version must not create config.toml"
     );
+    assert!(
+        !home.home().join(".vct/version.json").exists(),
+        "offline startup must not create version.json"
+    );
+}
+
+#[test]
+fn startup_reads_auto_update_preference_without_rewriting_config() {
+    let home = TempHome::new();
+    let original = "#:schema https://example.test/vct.schema.json\n[general]\nauto_update = false\nversion = 3\n";
+    home.put(".vct/config.toml", original);
+
+    child_cmd(&home)
+        .arg("version")
+        .arg("--json")
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read_to_string(home.home().join(".vct/config.toml")).unwrap(),
+        original
+    );
+    assert!(!home.home().join(".vct/version.json").exists());
+}
+
+#[test]
+fn package_managed_binary_skips_startup_update_before_network_or_cache_writes() {
+    let home = TempHome::new();
+    let output = child_cmd(&home)
+        .env_remove("VCT_OFFLINE")
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .env_remove("NO_PROXY")
+        .arg("version")
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap();
+    assert!(output.stderr.is_empty());
+    assert!(
+        !home.home().join(".vct/version.json").exists(),
+        "an unmarked binary must skip before claiming the daily check"
+    );
 }
 
 #[test]
@@ -856,6 +901,7 @@ fn config_show_creates_and_prints_settings() {
         .success()
         .stdout(predicate::str::contains("[usage]"))
         .stdout(predicate::str::contains("merge_models"))
+        .stdout(predicate::str::contains("auto_update"))
         .stdout(predicate::str::contains("[providers]"))
         .stdout(predicate::str::contains("[usage.quota]"));
 
@@ -886,6 +932,7 @@ fn config_migrate_upgrades_a_legacy_file() {
     let text = std::fs::read_to_string(home.home().join(".vct/config.toml")).unwrap();
     assert!(text.starts_with("#:schema "));
     assert!(text.contains("[usage.quota]"));
+    assert!(text.contains("auto_update = true"));
     assert!(!text.contains("quota_panels"));
     assert!(!text.contains("refresh_interval_secs"));
 

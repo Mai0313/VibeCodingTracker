@@ -59,8 +59,30 @@ function Install-Binary {
         }
 
         $target = Join-Path $installDir "$BinaryName.exe"
-        Copy-Item -Path $binary.FullName -Destination $target -Force
-        Copy-Item -Path $target -Destination (Join-Path $installDir "vct.exe") -Force
+        $stagedTarget = Join-Path $installDir ".$BinaryName.$PID.new"
+        Copy-Item -Path $binary.FullName -Destination $stagedTarget -Force
+        Move-Item -LiteralPath $stagedTarget -Destination $target -Force
+
+        $wrapper = Join-Path $installDir "vct.cmd"
+        $stagedWrapper = Join-Path $installDir ".vct.$PID.cmd"
+        [System.IO.File]::WriteAllText(
+            $stagedWrapper,
+            "@echo off`r`n`"%~dp0$BinaryName.exe`" %*`r`n",
+            [System.Text.Encoding]::ASCII
+        )
+        Move-Item -LiteralPath $stagedWrapper -Destination $wrapper -Force
+        $legacyAlias = Join-Path $installDir "vct.exe"
+        if (Test-Path -LiteralPath $legacyAlias) {
+            Remove-Item -LiteralPath $legacyAlias -Force
+        }
+
+        $markerPath = [System.IO.Path]::GetFullPath($target) + ".vct-managed"
+        $stagedMarker = "$markerPath.$PID.new"
+        [System.IO.File]::WriteAllBytes(
+            $stagedMarker,
+            [System.Text.Encoding]::ASCII.GetBytes("vct-release-installer-v1`n")
+        )
+        Move-Item -LiteralPath $stagedMarker -Destination $markerPath -Force
 
         Write-Host "Installed $BinaryName $Version to $installDir"
         if ($env:Path -notlike "*$installDir*") {

@@ -461,9 +461,13 @@ Codex code-mode sessions expose a completed JavaScript `exec` cell but no struct
 
 ## Update Command
 
-**Keep your installation up-to-date automatically.**
+**Keep supported direct installations up to date automatically.**
 
-The update command works for **all installation methods** (npm/pip/cargo/manual) by directly downloading and replacing the binary from GitHub releases.
+At startup, vct silently checks for a newer release at most once per UTC day. A newer release is downloaded and applied only when the current binary was installed by the official `scripts/install.sh` or `scripts/install.ps1` installer and carries its `.vct-managed` marker. The check, download, and replacement never print to stdout or stderr. A network failure, rate limit, read-only directory, or another running vct process only leaves the current command running; the reason is recorded in the diagnostic log. `VCT_OFFLINE=1` skips the check completely.
+
+After a Unix update, vct re-executes the current command with the new binary. On Windows, the current command finishes and a helper applies the replacement afterwards. The automatic path never modifies installs from cargo, npm, PyPI, a distro package, or an unmarked manual or development build. Update those through their package manager instead. To add automatic updates to an existing direct install, run the current official installer once more so it creates the marker.
+
+Set `general.auto_update = false` in `~/.vct/config.toml` to disable startup checks and automatic updates. The explicit `vct update` command retains its existing manual behavior.
 
 ### Basic Usage
 
@@ -560,9 +564,12 @@ vct keeps its user settings in `~/.vct/config.toml`. The file is **created with 
 # Default time range when no --daily/--weekly/--monthly/--all flag is given.
 # One of: "daily" | "weekly" | "monthly" | "all".
 default_time_range = "all"
+# Check for a newer release at startup and automatically update supported direct installs.
+# Set to false to disable this behavior.
+auto_update = true
 # Layout version of this file, stamped by vct. Only the upgrade pass reads it;
 # leave it alone unless you want a past upgrade to run again.
-version = 2
+version = 3
 
 [usage]
 # Start the usage dashboard with models merged across provider prefixes.
@@ -610,6 +617,7 @@ retention_days = 7
 | Setting                        | Effect                                                                                                                          |
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
 | `general.default_time_range`   | Period used when you pass no `--daily/--weekly/--monthly/--all`. An explicit flag always wins.                                  |
+| `general.auto_update`          | Check once per UTC day at startup and automatically update only official-installer direct installs. Set to `false` to disable.  |
 | `general.version`              | Layout version vct stamps on the file, so a panel added by a later release is offered to you exactly once.                      |
 | `usage.merge_models`           | Seeds the dashboard merged; the `m` toggle saves your last choice back here. `--merge-providers` forces on.                     |
 | `usage.refresh_interval`       | Redraw cadence of the `usage` dashboard (seconds).                                                                              |

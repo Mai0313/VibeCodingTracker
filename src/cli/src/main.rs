@@ -37,6 +37,8 @@ use vct_tui::display::usage::{
     display_usage_interactive_with_pool, display_usage_table, display_usage_text,
 };
 
+const AUTO_UPDATE_REEXEC_ENV: &str = "VCT_AUTO_UPDATE_REEXEC";
+
 /// Parses the CLI and runs the selected subcommand.
 ///
 /// Two steps run before `Cli::parse()` and must stay in this order:
@@ -91,6 +93,7 @@ fn main() -> Result<()> {
 /// Parses the CLI and dispatches the selected subcommand.
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    run_startup_auto_update(&cli);
 
     match cli.command {
         Commands::Analysis {
@@ -132,8 +135,8 @@ fn run() -> Result<()> {
                 }
                 None => {
                     // Settings are only needed for the batch (all-sessions) path,
-                    // so `analysis FILE`, `version`, `quota`, etc. never read or
-                    // create `~/.vct/config.toml`.
+                    // so `analysis FILE`, `version`, `quota`, etc. never create
+                    // or rewrite `~/.vct/config.toml`.
                     let config = vct_core::config::load();
                     vct_core::logging::apply(&config.logging);
                     let time_range = resolve_time_range_with_default(
@@ -317,6 +320,54 @@ fn run() -> Result<()> {
 
     Ok(())
 }
+
+/// Runs the silent startup updater before any command emits output or enters a
+/// terminal session.
+fn run_startup_auto_update(cli: &Cli) {
+    if std::env::var_os(AUTO_UPDATE_REEXEC_ENV).is_some()
+        || matches!(
+            &cli.command,
+            Commands::Update { .. } | Commands::Config { .. }
+        )
+    {
+        return;
+    }
+
+    let config = vct_core::config::load_read_only();
+    let reexec_path = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.canonicalize().ok());
+    if vct_core::update::maybe_auto_update(config.general.auto_update)
+        == vct_core::update::AutoUpdateOutcome::Updated
+    {
+        reexec_current_command(reexec_path);
+    }
+}
+
+#[cfg(unix)]
+fn reexec_current_command(current_exe: Option<std::path::PathBuf>) {
+    use std::os::unix::process::CommandExt;
+
+    let Some(current_exe) = current_exe else {
+        log::warn!("auto-update succeeded but the current executable could not be resolved");
+        return;
+    };
+    let error = build_reexec_command(&current_exe, std::env::args_os().skip(1)).exec();
+    log::warn!("auto-update succeeded but re-exec failed: {error}");
+}
+
+#[cfg(unix)]
+fn build_reexec_command(
+    current_exe: &std::path::Path,
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> std::process::Command {
+    let mut command = std::process::Command::new(current_exe);
+    command.args(args).env(AUTO_UPDATE_REEXEC_ENV, "1");
+    command
+}
+
+#[cfg(not(unix))]
+fn reexec_current_command(_current_exe: Option<std::path::PathBuf>) {}
 
 /// Handles the `config` subcommand: print the path, show current settings, open
 /// the file in the user's editor, or print the JSON schema.
@@ -502,4 +553,37 @@ fn report_usage_collection(diagnostics: &vct_core::usage::ScanDiagnostics) -> Re
 /// The fallback editor when neither `$VISUAL` nor `$EDITOR` is set.
 fn default_editor() -> &'static str {
     if cfg!(windows) { "notepad" } else { "vi" }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::{AUTO_UPDATE_REEXEC_ENV, build_reexec_command};
+    use std::ffi::{OsStr, OsString};
+    use std::path::Path;
+
+    #[test]
+    fn reexec_preserves_every_original_argument_and_sets_the_sentinel() {
+        let args = [
+            OsString::from("analysis"),
+            OsString::from("path with spaces/session.jsonl"),
+            OsString::from("--json"),
+        ];
+        let command = build_reexec_command(Path::new("/tmp/vct next"), args.clone());
+
+        assert_eq!(command.get_program(), OsStr::new("/tmp/vct next"));
+        assert_eq!(
+            command
+                .get_args()
+                .map(OsStr::to_os_string)
+                .collect::<Vec<_>>(),
+            args
+        );
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(name, _)| *name == OsStr::new(AUTO_UPDATE_REEXEC_ENV))
+                .and_then(|(_, value)| value),
+            Some(OsStr::new("1"))
+        );
+    }
 }
