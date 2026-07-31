@@ -91,6 +91,10 @@ jobs:
           $bin = "vibe_coding_tracker.exe"
           $zip = "vibe_coding_tracker-v$version-${{ matrix.friendly_id }}.zip"
           Compress-Archive -Path "$dest\$bin" -DestinationPath "$dest\$zip" -Force
+          # Everything left in $dest gets uploaded and lands on the release, and
+          # both Windows targets name their binary the same, so leaving it here
+          # publishes one arch-ambiguous .exe that overwrites the other.
+          Remove-Item "$dest\$bin" -Force
 
       - name: Create .tar.gz (all platforms)
         if: ${{ !startsWith(matrix.runner, 'windows') }}
