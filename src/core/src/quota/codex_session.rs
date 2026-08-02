@@ -13,6 +13,8 @@ use crate::quota::{CodexWindowSlot, assign_codex_window};
 use crate::utils::{is_codex_session_file, resolve_paths};
 use anyhow::Result;
 use serde_json::Value;
+use std::collections::HashSet;
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -35,29 +37,27 @@ const MAX_FILES: usize = 64;
 /// yields `Ok(None)`. An unreadable file (or a half-written tail line on a
 /// live session) is tolerated rather than aborting the scan.
 pub fn latest_session_rate_limits() -> Result<Option<CodexQuotaSnapshot>> {
-    latest_session_rate_limits_in(&resolve_paths()?.codex_session_dir)
+    let paths = resolve_paths()?;
+    latest_session_rate_limits_in(&paths.codex_session_dirs())
 }
 
-/// Returns the newest Codex session `rate_limits` under an explicit sessions
-/// directory.
+/// Returns the newest Codex session `rate_limits` under explicit session roots.
 ///
 /// The env-free, injectable counterpart of [`latest_session_rate_limits`]: the
-/// directory is passed in rather than resolved from the home directory, so
-/// tests can point it at a temp tree of fixture rollouts without mutating
-/// process-global `HOME`.
+/// roots are passed in rather than resolved from the home directory, so tests
+/// can point them at a temp tree of fixture rollouts without mutating
+/// process-global `HOME`. Production passes `HelperPaths::codex_session_dirs`,
+/// the active root followed by the archived one.
 ///
 /// # Errors
 ///
 /// Never errors on a missing directory (`Ok(None)`); an unreadable file is
 /// tolerated rather than aborting the scan.
 pub fn latest_session_rate_limits_in(
-    codex_session_dir: &Path,
+    codex_session_dirs: &[&Path],
 ) -> Result<Option<CodexQuotaSnapshot>> {
-    if !codex_session_dir.exists() {
-        return Ok(None);
-    }
     let now = chrono::Local::now().timestamp();
-    for file in newest_codex_files(codex_session_dir, MAX_FILES) {
+    for file in newest_codex_files(codex_session_dirs, MAX_FILES) {
         let values = read_jsonl_lenient(&file);
         if let Some(snap) = extract_latest_rate_limits(&values, now) {
             return Ok(Some(snap));
@@ -100,32 +100,94 @@ fn read_jsonl_lenient(path: &Path) -> Vec<Value> {
 /// (on top of the `usage` scan the TUI already runs).
 const MAX_DAY_DIRS: usize = 14;
 
-/// Collects up to `n` Codex rollout files, newest by mtime first.
+/// Collects up to `n` Codex rollout files across every session root, newest by
+/// mtime first.
 ///
-/// Only the most recent [`MAX_DAY_DIRS`] date directories are visited, so the
-/// walk stays bounded regardless of how much history is on disk.
-fn newest_codex_files(dir: &Path, n: usize) -> Vec<PathBuf> {
+/// Each root contributes its own bounded candidate list (see
+/// [`root_candidates`]); mtime is the ranking key across roots, so an archived
+/// session competes with an active one on equal terms. A rollout name already
+/// seen in an earlier root is dropped from a later one, so a scan racing the
+/// archive move does not spend two parses on one session. That comparison is
+/// deliberately across roots only — within a root, name collisions are the
+/// caller's business.
+fn newest_codex_files(dirs: &[&Path], n: usize) -> Vec<PathBuf> {
     let mut files: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    let mut seen: HashSet<OsString> = HashSet::new();
+    for dir in dirs {
+        let mut names = Vec::new();
+        for path in root_candidates(dir, n) {
+            let Some(name) = path.file_name() else {
+                continue;
+            };
+            if seen.contains(name) {
+                continue;
+            }
+            // Only a staged file claims its name. The one way a stat fails here
+            // is the archive move landing between the listing and this call, and
+            // that is exactly when the later root holds the readable copy.
+            let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
+                continue;
+            };
+            names.push(name.to_os_string());
+            files.push((modified, path));
+        }
+        seen.extend(names);
+    }
+    files.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    files.truncate(n);
+    files.into_iter().map(|(_, p)| p).collect()
+}
+
+/// Bounded rollout candidates under one session root, both layouts covered.
+///
+/// Codex keeps active sessions in a dated `YYYY/MM/DD/` tree and archived ones
+/// flat, and each layout needs its own bound: the dated subtree stops after
+/// [`MAX_DAY_DIRS`] day directories, while a flat root has no directory
+/// structure to descend and is bounded by file name instead (see
+/// [`newest_named_files`]). Both are collected so neither root needs to declare
+/// which shape it is.
+fn root_candidates(dir: &Path, n: usize) -> Vec<PathBuf> {
+    let mut files = newest_named_files(dir, n);
     for day in recent_day_dirs(dir, MAX_DAY_DIRS) {
         for entry in WalkDir::new(&day).into_iter().filter_map(|e| e.ok()) {
             if !entry.file_type().is_file() {
                 continue;
             }
-            let path = entry.path();
-            if !is_codex_session_file(path) {
-                continue;
-            }
-            let Ok(metadata) = entry.metadata() else {
-                continue;
-            };
-            if let Ok(modified) = metadata.modified() {
-                files.push((modified, path.to_path_buf()));
+            if is_codex_session_file(entry.path()) {
+                files.push(entry.path().to_path_buf());
             }
         }
     }
-    files.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    files
+}
+
+/// The `n` newest rollout logs sitting directly in `dir`, by file name.
+///
+/// Codex names a rollout `rollout-<ISO-8601 start>-<uuid>.jsonl`, so sorting the
+/// names descending orders them by session start without reading any metadata.
+/// Only the survivors are stat'd by the caller, which is what keeps a flat
+/// archive of a thousand-odd sessions from costing a thousand stats per refresh
+/// tick.
+///
+/// Selecting by name rather than mtime is also the safer read of an archived
+/// file: archiving does not always preserve the original mtime — a bulk archive
+/// run can stamp its whole batch with the run's own time — so a months-old
+/// session can look freshly written and crowd genuinely recent files out of the
+/// candidate set. The name is written by the session that produced the log and
+/// survives the move.
+fn newest_named_files(dir: &Path, n: usize) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .map(|e| e.path())
+        .filter(|p| is_codex_session_file(p))
+        .collect();
+    files.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
     files.truncate(n);
-    files.into_iter().map(|(_, p)| p).collect()
+    files
 }
 
 /// Returns the newest leaf date directories under `sessions`, newest first.
@@ -383,36 +445,111 @@ mod tests {
         assert!(recent[13].ends_with("2026/06/07"), "stops 14 days back");
     }
 
-    #[test]
-    fn newest_files_within_date_dirs_sorted_and_capped() {
+    /// Writes a rollout log at `root/rel` with an explicit mtime offset.
+    fn write_rollout(root: &Path, rel: &str, secs: u64) -> PathBuf {
         use std::io::Write;
         use std::time::{Duration, SystemTime};
 
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(b"{}\n").unwrap();
+        file.set_modified(base + Duration::from_secs(secs)).unwrap();
+        path
+    }
+
+    #[test]
+    fn newest_files_within_date_dirs_sorted_and_capped() {
         let dir = tempfile::tempdir().unwrap();
         let sessions = dir.path();
-        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        let mk = |rel: &str, secs: u64| {
-            let path = sessions.join(rel);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            let mut file = std::fs::File::create(&path).unwrap();
-            file.write_all(b"{}\n").unwrap();
-            file.set_modified(base + Duration::from_secs(secs)).unwrap();
-            path
-        };
 
-        let old = mk("2026/06/26/rollout-old.jsonl", 0);
-        let new2 = mk("2026/06/27/rollout-b.jsonl", 10);
-        let new1 = mk("2026/06/27/rollout-a.jsonl", 20);
+        let old = write_rollout(sessions, "2026/06/26/rollout-old.jsonl", 0);
+        let new2 = write_rollout(sessions, "2026/06/27/rollout-b.jsonl", 10);
+        let new1 = write_rollout(sessions, "2026/06/27/rollout-a.jsonl", 20);
         // A non-Codex file must be ignored by the filter.
         std::fs::write(sessions.join("2026/06/27/notes.txt"), "x").unwrap();
 
-        let newest = newest_codex_files(sessions, 2);
+        let newest = newest_codex_files(&[sessions], 2);
         assert_eq!(
             newest,
             vec![new1, new2],
             "newest mtime first, cap respected"
         );
         assert!(!newest.contains(&old), "older-day file dropped by the cap");
+    }
+
+    #[test]
+    fn flat_root_is_bounded_by_file_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let archived = dir.path();
+        // Same mtime everywhere, so only the name can order these.
+        for d in 1..=20u32 {
+            write_rollout(
+                archived,
+                &format!("rollout-2026-06-{d:02}T00-00-00-x.jsonl"),
+                0,
+            );
+        }
+        std::fs::write(archived.join("notes.txt"), "x").unwrap();
+
+        let newest = newest_named_files(archived, 3);
+        assert_eq!(newest.len(), 3, "bounded to the limit, not all 20 files");
+        assert!(newest[0].ends_with("rollout-2026-06-20T00-00-00-x.jsonl"));
+        assert!(newest[2].ends_with("rollout-2026-06-18T00-00-00-x.jsonl"));
+    }
+
+    #[test]
+    fn archived_root_competes_with_active_on_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("sessions");
+        let archived = dir.path().join("archived_sessions");
+
+        let stale = write_rollout(
+            &active,
+            "2026/06/27/rollout-2026-06-27T09-00-00-a.jsonl",
+            10,
+        );
+        let fresh = write_rollout(&archived, "rollout-2026-06-27T12-00-00-b.jsonl", 20);
+
+        let newest = newest_codex_files(&[active.as_path(), archived.as_path()], 8);
+        assert_eq!(
+            newest,
+            vec![fresh, stale],
+            "the archived snapshot is newer, so it is parsed first"
+        );
+    }
+
+    #[test]
+    fn session_present_in_both_roots_is_listed_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("sessions");
+        let archived = dir.path().join("archived_sessions");
+
+        // Mid-archive: the same rollout name exists under both roots.
+        let name = "rollout-2026-06-27T12-00-00-b.jsonl";
+        let live = write_rollout(&active, &format!("2026/06/27/{name}"), 10);
+        write_rollout(&archived, name, 20);
+
+        let newest = newest_codex_files(&[active.as_path(), archived.as_path()], 8);
+        assert_eq!(
+            newest,
+            vec![live],
+            "active root wins, archived copy dropped"
+        );
+    }
+
+    #[test]
+    fn missing_roots_yield_no_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("sessions");
+        let archived = dir.path().join("archived_sessions");
+
+        assert!(
+            latest_session_rate_limits_in(&[active.as_path(), archived.as_path()])
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
