@@ -32,7 +32,14 @@ jobs:
       - name: Trufflehog Scanning
         uses: trufflesecurity/trufflehog@v3.96.0
         with:
-          extra_args: --results=verified,unknown
+          # The Lob detector matches `(live|test)_` plus 35 word characters, so
+          # any test named as a full sentence can hit it. Lob itself answers a
+          # bogus key 401, but it sits behind Cloudflare, which serves
+          # TruffleHog's own User-Agent a 403, and the detector reads 403 as
+          # "key is live, just unbilled". Every match therefore reports as
+          # verified. It cannot tell a real Lob key from a test name.
+          # See https://github.com/Mai0313/discordbot/issues/472
+          extra_args: --results=verified,unknown --exclude-detectors=lob
 
   codeql-scanning:
     name: CodeQL Scanning
