@@ -1,11 +1,16 @@
-# 依分支名稱自動為 PR 掛上一個 type label。
+# Applies one type label to a pull request, based on the name of its branch.
 #
-# 只看 head-branch,不看檔案路徑,因為路徑說不出「這是修 bug」還是「這是新功能」。
-# 唯一的例外是 chore:一個只動到工具鏈的 PR 就真的是雜務,而 any-glob-to-all-files
-# 要求「所有」改動檔案都符合,不會像 any-glob-to-any-file 那樣碰到一個就中。
+# Only head-branch is matched, never file paths, because a path cannot say
+# whether a change is a bugfix or a new feature. The single exception is chore:
+# a pull request that touches nothing but tooling really is maintenance, and
+# any-glob-to-all-files requires *every* changed file to match, so it will not
+# fire on a change that merely happens to touch one of these paths.
 #
-# 顏色和描述沒辦法寫在這裡,由 .github/workflows/sync_labels.yml 維護。
-# 這份設定與語言無關,所有 template 和下游 repo 共用同一份。
+# Colors and descriptions cannot be declared here; the labels themselves are
+# owned by .github/workflows/sync_labels.yml.
+#
+# These rules are language agnostic, so every template and every downstream
+# repository carries this file unchanged.
 
 breaking:
   - head-branch: ["^breaking/"]
