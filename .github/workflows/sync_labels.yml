@@ -1,0 +1,41 @@
+name: Sync Labels
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - .github/workflows/sync_labels.yml
+  workflow_dispatch:
+
+permissions: write-all
+
+jobs:
+  sync_labels:
+    name: Sync Labels
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Sync
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # --force 讓已存在的 label 更新顏色和描述,不存在的就建出來。
+          # 沒有這一步,actions/labeler 會自己補建,但它只能給名字,顏色一律是灰的。
+          sync() { gh label create "$1" --color "$2" --description "$3" --force; }
+
+          sync breaking      B60205 "Breaks compatibility and bumps the major version"
+          sync bug           D73A4A "Something isn't working"
+          sync feature       0E8A16 "New functionality"
+          sync perf          FBCA04 "Performance improvement"
+          sync refactor      5319E7 "Code restructuring without a behavior change"
+          sync test          006B75 "Tests and test infrastructure"
+          sync documentation 0075CA "Improvements or additions to documentation"
+          sync chore         CFD3D7 "Maintenance, CI, build and tooling"
+
+          # Dependabot 自己會建這個,labeler.yml 不管它,這裡只統一顏色。
+          sync dependencies  0366D6 "Pull requests that update a dependency file"
