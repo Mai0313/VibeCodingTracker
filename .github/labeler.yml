@@ -1,143 +1,41 @@
-# 🏷️ Auto Labeler Configuration
-# 這個檔案會自動為 PR 添加標籤，基於分支名稱和檔案變更路徑
-# 設計來支援 Rust 專案，與 release-drafter.yml 完全對應
+# 依分支名稱自動為 PR 掛上一個 type label。
+#
+# 只看 head-branch,不看檔案路徑,因為路徑說不出「這是修 bug」還是「這是新功能」。
+# 唯一的例外是 chore:一個只動到工具鏈的 PR 就真的是雜務,而 any-glob-to-all-files
+# 要求「所有」改動檔案都符合,不會像 any-glob-to-any-file 那樣碰到一個就中。
+#
+# 顏色和描述沒辦法寫在這裡,由 .github/workflows/sync_labels.yml 維護。
+# 這份設定與語言無關,所有 template 和下游 repo 共用同一份。
 
-# 主要標籤會被 release-drafter.yml 用於：
-# 1. 自動分類到對應的 changelog 區段
-# 2. 決定版本號 (Major/Minor/Patch)
-# 3. 生成 release notes
-
-# ===============================
-# 🎯 Main Labels (對應 release-drafter categories)
-# ===============================
-
-# 💥 Breaking Changes
 breaking:
-  - head-branch:
-      - "^breaking/.*"
-      - "^major/.*"
-      - "^BREAKING/.*"
+  - head-branch: ["^breaking/"]
 
-# ✨ Features
 feature:
-  - head-branch:
-      - "^feat/.*"
-      - "^feature/.*"
-      - "^add/.*"
-  - changed-files:
-      - any-glob-to-any-file:
-          - "src/**/*.rs"
-          - "lib/**/*.rs"
-          - "build.rs"
+  - head-branch: ["^feat/"]
 
-# 🐛 Bug Fixes
-bugfix:
-  - head-branch:
-      - "^fix/.*"
-      - "^bug/.*"
-      - "^bugfix/.*"
-      - "^hotfix/.*"
+bug:
+  - head-branch: ["^fix/"]
 
-# 🧰 Maintenance
-chore:
-  - head-branch:
-      - "^chore/.*"
-      - "^maintenance/.*"
-      - "^config/.*"
-      - "^update/.*"
-  - changed-files:
-      - any-glob-to-any-file:
-          - ".github/**"
-          - "Makefile"
-          - "Dockerfile"
-          - "docker/**"
-          - ".devcontainer/**"
-          - ".editorconfig"
-          - "rust-toolchain*"
-          - "rustfmt.toml"
-          - ".rustfmt.toml"
-          - "clippy.toml"
-          - "Clippy.toml"
-
-# 📦 Dependencies
-dependencies:
-  - head-branch:
-      - "^dep/.*"
-      - "^deps/.*"
-      - "^dependencies/.*"
-      - "^dependabot/.*"
-  - changed-files:
-      - any-glob-to-any-file:
-          - "Cargo.toml"
-          - "Cargo.lock"
-
-# 📝 Documentation
-documentation:
-  - head-branch:
-      - "^docs/.*"
-      - "^doc/.*"
-      - "^documentation/.*"
-  - changed-files:
-      - any-glob-to-any-file:
-          - "docs/**/*"
-          - "**/*.md"
-          - "**/*.rst"
-          - "**/*.ipynb"
-          - "notebooks/**/*"
-          - "notebook/**/*"
-          - "mkdocs.yml"
-          - "README*"
-          - "CHANGELOG*"
-
-# 🧪 Tests
-unit-test:
-  - head-branch:
-      - "^test/.*"
-      - "^tests/.*"
-  - changed-files:
-      - any-glob-to-any-file:
-          - "tests/**/*.rs"
-          - "tests/fixtures/**"
-
-# ⚡️ Performance Improvements
-perf:
-  - head-branch:
-      - "^perf/.*"
-      - "^performance/.*"
-      - "^optimize/.*"
-  - changed-files:
-      - any-glob-to-any-file:
-          - "benches/**/*.rs"
-
-# 🔒️ Security Fixes
-security:
-  - head-branch:
-      - "^security/.*"
-      - "^sec/.*"
-
-# ♻️ Code Refactoring
 refactor:
-  - head-branch:
-      - "^refactor/.*"
-      - "^cleanup/.*"
-      - "^restructure/.*"
+  - head-branch: ["^refactor/"]
 
-# 🎨 Code Style & Formatting
-style:
-  - head-branch:
-      - "^style/.*"
-      - "^format/.*"
-      - "^lint/.*"
+documentation:
+  - head-branch: ["^docs?/"]
+
+test:
+  - head-branch: ["^tests?/"]
+
+perf:
+  - head-branch: ["^perf/"]
+
+chore:
+  - head-branch: ["^chore/", "^ci/", "^build/", "^style/", "^config/"]
   - changed-files:
-      - any-glob-to-any-file:
-          - "rustfmt.toml"
-          - ".rustfmt.toml"
-          - "clippy.toml"
-          - "Clippy.toml"
-          - ".editorconfig"
-
-# 🔙 Reverts
-revert:
-  - head-branch:
-      - "^revert/.*"
-      - "^rollback/.*"
+      - any-glob-to-all-files:
+          - ".github/**"
+          - ".devcontainer/**"
+          - "docker/**"
+          - "Dockerfile*"
+          - "Makefile"
+          - ".pre-commit-config.yaml"
+          - ".gitignore"
