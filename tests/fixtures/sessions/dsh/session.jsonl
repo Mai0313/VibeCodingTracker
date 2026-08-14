@@ -9,7 +9,7 @@
 {"type":"tool/call","seq":7,"time":1786728852574,"data":{"turn":1,"step":2,"callId":"c2","name":"grep","arguments":"{\"pattern\": \"demo\"}"}}
 {"type":"tool/result","seq":8,"time":1786728853574,"data":{"turn":1,"step":2,"message":{},"meta":{"path":"/repo/demo/src/main.rs","offset":1,"lines":[{"number":1,"text":"fn main() {"},{"number":2,"text":"    demo();"},{"number":3,"text":"}"}],"totalLines":3,"lang":"rust"}},"surfaceOp":"append","sourceEventSeqs":[6]}
 {"type":"tool/result","seq":9,"time":1786728854574,"data":{"turn":1,"step":2,"message":{},"meta":{"shape":"matches","files":[],"truncated":false,"total":0}},"surfaceOp":"append","sourceEventSeqs":[7]}
-{"type":"tool/call","seq":10,"time":1786728855574,"data":{"turn":1,"step":3,"callId":"c3","name":"edit","arguments":"{\"file_path\": \"src/main.rs\", \"old_string\": \"    demo();\", \"new_string\": \"    demo();\\n    extra();\"}"}}
+{"type":"tool/call","seq":10,"time":1786728855574,"data":{"turn":1,"step":3,"callId":"c3","name":"edit","arguments":"{\"file_path\": \"/repo/demo/src/main.rs\", \"old_string\": \"    demo();\", \"new_string\": \"    demo();\\n    extra();\"}"}}
 {"type":"tool/result","seq":11,"time":1786728856574,"data":{"turn":1,"step":3,"message":{},"meta":{"diffs":[{"path":"src/main.rs","oldText":"fn main() {\n    demo();\n}","newText":"fn main() {\n    demo();\n    extra();\n}"}]}},"surfaceOp":"append","sourceEventSeqs":[10]}
 {"type":"tool/call","seq":12,"time":1786728857574,"data":{"turn":1,"step":3,"callId":"c4","name":"write","arguments":"{\"file_path\": \"/repo/demo/notes.txt\", \"content\": \"one\\ntwo\\n\"}"}}
 {"type":"tool/result","seq":13,"time":1786728858574,"data":{"turn":1,"step":3,"message":{},"meta":{"diffs":[]}},"surfaceOp":"append","sourceEventSeqs":[12]}
