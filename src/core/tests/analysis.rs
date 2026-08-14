@@ -44,6 +44,7 @@ fn providers_only(provider: ExtensionType) -> ProvidersConfig {
         opencode: provider == ExtensionType::OpenCode,
         cursor: provider == ExtensionType::Cursor,
         hermes: provider == ExtensionType::Hermes,
+        dsh: provider == ExtensionType::DeepSeek,
     }
 }
 

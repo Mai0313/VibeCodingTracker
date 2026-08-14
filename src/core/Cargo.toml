@@ -43,6 +43,7 @@ tempfile = { workspace = true }
 toml_edit = { workspace = true }
 walkdir = { workspace = true }
 zip = { workspace = true }
+zstd = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }

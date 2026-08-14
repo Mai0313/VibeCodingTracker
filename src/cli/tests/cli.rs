@@ -41,6 +41,7 @@ fn child_cmd(home: &TempHome) -> Command {
         .env("USERPROFILE", home.home())
         .env("HERMES_HOME", home.home().join(".hermes"))
         .env("GROK_HOME", home.home().join(".grok"))
+        .env("DSH_HOME", home.home().join(".dsh"))
         .env("VCT_OFFLINE", "1")
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME");

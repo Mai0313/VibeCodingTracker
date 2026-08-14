@@ -18,6 +18,7 @@ pub mod copilot;
 pub mod cursor;
 pub mod detector;
 pub(crate) mod diagnostics;
+pub(crate) mod dsh;
 pub mod gemini;
 pub mod grok;
 pub mod hermes;

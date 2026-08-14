@@ -33,6 +33,7 @@ fn claude_only() -> ProvidersConfig {
         cursor: false,
         hermes: false,
         grok: false,
+        dsh: false,
     }
 }
 
@@ -48,6 +49,7 @@ fn codex_only() -> ProvidersConfig {
         cursor: false,
         hermes: false,
         grok: false,
+        dsh: false,
     }
 }
 
@@ -61,6 +63,7 @@ fn opencode_only() -> ProvidersConfig {
         cursor: false,
         hermes: false,
         grok: false,
+        dsh: false,
     }
 }
 
@@ -74,6 +77,7 @@ fn cursor_only() -> ProvidersConfig {
         cursor: true,
         hermes: false,
         grok: false,
+        dsh: false,
     }
 }
 
@@ -501,6 +505,7 @@ fn grok_sidecars_invalidate_the_compact_cache() {
         opencode: false,
         cursor: false,
         hermes: false,
+        dsh: false,
     };
     let mut cache = SummaryScanCache::new();
 

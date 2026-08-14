@@ -274,6 +274,8 @@ pub enum ExtensionType {
     Hermes,
     /// xAI Grok CLI.
     Grok,
+    /// DeepSeek Harness (`dsh`).
+    DeepSeek,
 }
 
 impl ExtensionType {
@@ -289,9 +291,10 @@ impl ExtensionType {
             ExtensionType::Copilot => 2,
             ExtensionType::Gemini => 3,
             ExtensionType::Grok => 4,
-            ExtensionType::OpenCode => 5,
-            ExtensionType::Cursor => 6,
-            ExtensionType::Hermes => 7,
+            ExtensionType::DeepSeek => 5,
+            ExtensionType::OpenCode => 6,
+            ExtensionType::Cursor => 7,
+            ExtensionType::Hermes => 8,
         }
     }
 }
@@ -307,6 +310,7 @@ impl std::fmt::Display for ExtensionType {
             ExtensionType::Cursor => write!(f, "Cursor"),
             ExtensionType::Hermes => write!(f, "Hermes"),
             ExtensionType::Grok => write!(f, "Grok"),
+            ExtensionType::DeepSeek => write!(f, "DeepSeek-Harness"),
         }
     }
 }

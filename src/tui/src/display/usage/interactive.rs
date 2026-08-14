@@ -1571,9 +1571,10 @@ fn digest_line(
 /// day counts live behind `p`. Whatever does not fit is named in a trailing
 /// `+N more → p`, so the line never implies it lists every provider.
 fn provider_digest(rows: &[ProviderTotal<'_, ProviderStats>], width: u16) -> Line<'static> {
-    /// Narrower than the quota digest's separator on purpose: there are eight
-    /// providers to the quota band's five, and the two columns this saves per
-    /// gap are what let all eight fit on a 120-column terminal.
+    /// Narrower than the quota digest's separator on purpose: there are nine
+    /// providers to the quota band's five, so the two columns this saves per
+    /// gap buy roughly two more segments before the line has to start folding
+    /// them into the `+N more` tail.
     const SEP: &str = " · ";
     const TAIL: &str = "more → p";
     // The summary bar already carries the grand total, so the aggregate row

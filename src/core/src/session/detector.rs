@@ -7,6 +7,7 @@
 //! while [`classify_records`] returns `None` on indeterminate input so a
 //! streaming caller can keep peeking lines until a marker appears.
 use crate::models::ExtensionType;
+use crate::session::dsh::is_dsh_header;
 use crate::session::grok::is_grok_signals;
 use anyhow::{Result, bail};
 use serde_json::Value;
@@ -144,6 +145,14 @@ impl RecordClassifier {
         if first {
             if is_grok_signals(record) {
                 self.classified = Some(ExtensionType::Grok);
+                return self.classified;
+            }
+
+            // A `dsh` log opens with its session header. Only an uncompressed
+            // root reaches the record classifier at all — a zstd log is routed
+            // by its frame magic before anything reads it as text.
+            if is_dsh_header(record) {
+                self.classified = Some(ExtensionType::DeepSeek);
                 return self.classified;
             }
 

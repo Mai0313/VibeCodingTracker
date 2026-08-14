@@ -294,6 +294,12 @@ pub const COPILOT_SESSION_MAX_DEPTH: usize = 2;
 /// each signals file is exactly three levels below the sessions root.
 pub const GROK_SESSION_MAX_DEPTH: usize = 3;
 
+/// Maximum traversal depth for DeepSeek Harness session scans.
+///
+/// `dsh` writes `$DSH_HOME/sessions/<project>/<session>/session.jsonl.zstd`,
+/// so each log is exactly three levels below the sessions root.
+pub const DSH_SESSION_MAX_DEPTH: usize = 3;
+
 /// Filter for Codex session files under `~/.codex/sessions/YYYY/MM/DD/`.
 ///
 /// Codex writes `rollout-*.jsonl` files directly into the dated sub-folders.
@@ -396,6 +402,27 @@ pub fn is_copilot_session_file(path: &Path) -> bool {
 /// consumed by the Grok parser after the signals file has been selected.
 pub fn is_grok_session_file(path: &Path) -> bool {
     if path.file_name() != Some(std::ffi::OsStr::new("signals.json")) {
+        return false;
+    }
+
+    path.parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .is_some_and(|sessions| sessions.file_name() == Some(std::ffi::OsStr::new("sessions")))
+}
+
+/// Filter for DeepSeek Harness session logs.
+///
+/// `dsh` writes one log per session at
+/// `$DSH_HOME/sessions/<project>/<session>/session.jsonl.zstd`, and the same
+/// path without the `.zstd` suffix when the root is configured with
+/// `compression: 'none'`. A root only ever uses one of the two encodings, but
+/// accepting both here keeps the filter independent of that setting.
+pub fn is_dsh_session_file(path: &Path) -> bool {
+    let name = path.file_name();
+    if name != Some(std::ffi::OsStr::new("session.jsonl.zstd"))
+        && name != Some(std::ffi::OsStr::new("session.jsonl"))
+    {
         return false;
     }
 

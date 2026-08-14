@@ -31,9 +31,9 @@ use crate::summary_cache::{
 };
 use crate::utils::directory::collect_provider_files_diagnostics;
 use crate::utils::{
-    COPILOT_SESSION_MAX_DEPTH, GROK_SESSION_MAX_DEPTH, HelperPaths, is_claude_session_file,
-    is_codex_session_file, is_copilot_session_file, is_gemini_session_file, is_grok_session_file,
-    merge_usage_values, resolve_paths,
+    COPILOT_SESSION_MAX_DEPTH, DSH_SESSION_MAX_DEPTH, GROK_SESSION_MAX_DEPTH, HelperPaths,
+    is_claude_session_file, is_codex_session_file, is_copilot_session_file, is_dsh_session_file,
+    is_gemini_session_file, is_grok_session_file, merge_usage_values, resolve_paths,
 };
 use anyhow::Result;
 use rayon::prelude::*;
@@ -215,6 +215,7 @@ pub fn aggregate_usage_from_paths_with_providers(
     let mut copilot_dates: HashSet<String> = HashSet::new();
     let mut gemini_dates: HashSet<String> = HashSet::new();
     let mut grok_dates: HashSet<String> = HashSet::new();
+    let mut deepseek_dates: HashSet<String> = HashSet::new();
     let mut opencode_dates: HashSet<String> = HashSet::new();
     let mut cursor_dates: HashSet<String> = HashSet::new();
     let mut hermes_dates: HashSet<String> = HashSet::new();
@@ -292,6 +293,19 @@ pub fn aggregate_usage_from_paths_with_providers(
         );
     }
 
+    if providers.dsh && paths.dsh_session_dir.exists() {
+        process_usage_directory(
+            &[paths.dsh_session_dir.as_path()],
+            ExtensionType::DeepSeek,
+            &mut result,
+            &mut per_provider.deepseek,
+            &mut deepseek_dates,
+            is_dsh_session_file,
+            time_range,
+            Some(DSH_SESSION_MAX_DEPTH),
+        );
+    }
+
     // OpenCode lives in a single SQLite database rather than a session
     // directory, so it is read directly instead of walked.
     if providers.opencode
@@ -353,6 +367,7 @@ pub fn aggregate_usage_from_paths_with_providers(
     all_dates.extend(copilot_dates.iter());
     all_dates.extend(gemini_dates.iter());
     all_dates.extend(grok_dates.iter());
+    all_dates.extend(deepseek_dates.iter());
     all_dates.extend(opencode_dates.iter());
     all_dates.extend(cursor_dates.iter());
     all_dates.extend(hermes_dates.iter());
@@ -363,6 +378,7 @@ pub fn aggregate_usage_from_paths_with_providers(
         copilot: copilot_dates.len(),
         gemini: gemini_dates.len(),
         grok: grok_dates.len(),
+        deepseek: deepseek_dates.len(),
         opencode: opencode_dates.len(),
         cursor: cursor_dates.len(),
         hermes: hermes_dates.len(),
@@ -747,6 +763,7 @@ struct UsageAccumulator {
     copilot_dates: HashSet<String>,
     gemini_dates: HashSet<String>,
     grok_dates: HashSet<String>,
+    deepseek_dates: HashSet<String>,
     opencode_dates: HashSet<String>,
     cursor_dates: HashSet<String>,
     hermes_dates: HashSet<String>,
@@ -766,6 +783,7 @@ impl UsageAccumulator {
             ExtensionType::Copilot => &mut self.per_provider.copilot,
             ExtensionType::Gemini => &mut self.per_provider.gemini,
             ExtensionType::Grok => &mut self.per_provider.grok,
+            ExtensionType::DeepSeek => &mut self.per_provider.deepseek,
             ExtensionType::OpenCode => &mut self.per_provider.opencode,
             ExtensionType::Cursor => &mut self.per_provider.cursor,
             ExtensionType::Hermes => &mut self.per_provider.hermes,
@@ -821,6 +839,7 @@ impl UsageAccumulator {
             ExtensionType::Copilot => &mut self.copilot_dates,
             ExtensionType::Gemini => &mut self.gemini_dates,
             ExtensionType::Grok => &mut self.grok_dates,
+            ExtensionType::DeepSeek => &mut self.deepseek_dates,
             ExtensionType::OpenCode => &mut self.opencode_dates,
             ExtensionType::Cursor => &mut self.cursor_dates,
             ExtensionType::Hermes => &mut self.hermes_dates,
@@ -830,13 +849,14 @@ impl UsageAccumulator {
 
     fn finish(self) -> UsageData {
         // Only the union's cardinality is needed, so union references rather
-        // than cloning every date string across the eight per-provider sets.
+        // than cloning every date string across the nine per-provider sets.
         let mut all_dates: HashSet<&String> = HashSet::new();
         all_dates.extend(self.claude_dates.iter());
         all_dates.extend(self.codex_dates.iter());
         all_dates.extend(self.copilot_dates.iter());
         all_dates.extend(self.gemini_dates.iter());
         all_dates.extend(self.grok_dates.iter());
+        all_dates.extend(self.deepseek_dates.iter());
         all_dates.extend(self.opencode_dates.iter());
         all_dates.extend(self.cursor_dates.iter());
         all_dates.extend(self.hermes_dates.iter());
@@ -850,6 +870,7 @@ impl UsageAccumulator {
                 copilot: self.copilot_dates.len(),
                 gemini: self.gemini_dates.len(),
                 grok: self.grok_dates.len(),
+                deepseek: self.deepseek_dates.len(),
                 opencode: self.opencode_dates.len(),
                 cursor: self.cursor_dates.len(),
                 hermes: self.hermes_dates.len(),

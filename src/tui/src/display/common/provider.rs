@@ -72,6 +72,11 @@ impl<'a, T> ProviderTotal<'a, T> {
                 RatatuiColor::LightRed,
                 TableColor::DarkRed,
             ),
+            Provider::DeepSeek => (
+                Provider::DeepSeek.display_name(),
+                RatatuiColor::LightCyan,
+                TableColor::DarkCyan,
+            ),
             Provider::Unknown => ("Unknown", RatatuiColor::Gray, TableColor::Grey),
         };
 

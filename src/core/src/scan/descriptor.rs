@@ -1,6 +1,6 @@
 //! Data-driven provider fan-out for the cached file scan.
 //!
-//! The five file-backed providers are scanned with the identical
+//! The six file-backed providers are scanned with the identical
 //! [`scan_cached_files`](super::scan_cached_files) call, differing only in their
 //! session roots, filter, depth cap, and enable toggle. Listing them once here
 //! means adding a provider is a single table row instead of a new `if` block in
@@ -14,8 +14,9 @@ use crate::models::TimeRange;
 use crate::pricing::TierThresholds;
 use crate::summary_cache::{SummaryCacheKey, SummaryScanCache};
 use crate::utils::{
-    COPILOT_SESSION_MAX_DEPTH, GROK_SESSION_MAX_DEPTH, HelperPaths, is_claude_session_file,
-    is_codex_session_file, is_copilot_session_file, is_gemini_session_file, is_grok_session_file,
+    COPILOT_SESSION_MAX_DEPTH, DSH_SESSION_MAX_DEPTH, GROK_SESSION_MAX_DEPTH, HelperPaths,
+    is_claude_session_file, is_codex_session_file, is_copilot_session_file, is_dsh_session_file,
+    is_gemini_session_file, is_grok_session_file,
 };
 use anyhow::Result;
 use std::path::Path;
@@ -36,7 +37,7 @@ struct FileProviderSpec {
 ///
 /// Database-backed providers (OpenCode, Cursor, Hermes) are not here: each has a
 /// bespoke reader that differs between the usage and analysis features.
-const FILE_PROVIDERS: [FileProviderSpec; 5] = [
+const FILE_PROVIDERS: [FileProviderSpec; 6] = [
     FileProviderSpec {
         provider: ExtensionType::ClaudeCode,
         enabled: |p| p.claude,
@@ -71,6 +72,13 @@ const FILE_PROVIDERS: [FileProviderSpec; 5] = [
         dirs: |p| vec![p.grok_session_dir.as_path()],
         filter: is_grok_session_file,
         max_depth: Some(GROK_SESSION_MAX_DEPTH),
+    },
+    FileProviderSpec {
+        provider: ExtensionType::DeepSeek,
+        enabled: |p| p.dsh,
+        dirs: |p| vec![p.dsh_session_dir.as_path()],
+        filter: is_dsh_session_file,
+        max_depth: Some(DSH_SESSION_MAX_DEPTH),
     },
 ];
 

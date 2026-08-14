@@ -32,6 +32,8 @@ pub enum Provider {
     Hermes,
     /// xAI Grok CLI.
     Grok,
+    /// DeepSeek Harness (`dsh`).
+    DeepSeek,
     /// Model name matched no known provider prefix.
     Unknown,
 }
@@ -130,6 +132,7 @@ impl Provider {
             Self::Cursor => "Cursor",
             Self::Hermes => "Hermes",
             Self::Grok => "Grok",
+            Self::DeepSeek => "DeepSeek",
             Self::Unknown => "Unknown",
         }
     }

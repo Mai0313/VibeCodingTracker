@@ -36,6 +36,8 @@ pub struct ProviderActiveDays {
     pub hermes: usize,
     /// Distinct active days observed for Grok CLI.
     pub grok: usize,
+    /// Distinct active days observed for DeepSeek Harness.
+    pub deepseek: usize,
     /// Distinct active days across all providers combined.
     pub total: usize,
 }
@@ -73,6 +75,8 @@ pub struct PerProviderUsage {
     pub hermes: UsageResult,
     /// Per-model usage attributed to Grok CLI.
     pub grok: UsageResult,
+    /// Per-model usage attributed to DeepSeek Harness.
+    pub deepseek: UsageResult,
 }
 
 impl PerProviderUsage {
@@ -87,6 +91,7 @@ impl PerProviderUsage {
             Provider::Cursor => Some(&self.cursor),
             Provider::Hermes => Some(&self.hermes),
             Provider::Grok => Some(&self.grok),
+            Provider::DeepSeek => Some(&self.deepseek),
             Provider::Unknown => None,
         }
     }
@@ -103,6 +108,7 @@ impl PerProviderUsage {
             Provider::Cursor => Some(&mut self.cursor),
             Provider::Hermes => Some(&mut self.hermes),
             Provider::Grok => Some(&mut self.grok),
+            Provider::DeepSeek => Some(&mut self.deepseek),
             Provider::Unknown => None,
         }
     }

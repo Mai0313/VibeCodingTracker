@@ -205,6 +205,7 @@ fn claude_only() -> ProvidersConfig {
         cursor: false,
         hermes: false,
         grok: false,
+        dsh: false,
     }
 }
 
