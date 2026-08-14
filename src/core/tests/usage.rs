@@ -33,6 +33,7 @@ fn claude_only() -> ProvidersConfig {
         cursor: false,
         hermes: false,
         grok: false,
+        dsh: false,
     }
 }
 
@@ -48,6 +49,7 @@ fn codex_only() -> ProvidersConfig {
         cursor: false,
         hermes: false,
         grok: false,
+        dsh: false,
     }
 }
 
@@ -61,6 +63,7 @@ fn opencode_only() -> ProvidersConfig {
         cursor: false,
         hermes: false,
         grok: false,
+        dsh: false,
     }
 }
 
@@ -74,6 +77,7 @@ fn cursor_only() -> ProvidersConfig {
         cursor: true,
         hermes: false,
         grok: false,
+        dsh: false,
     }
 }
 
@@ -488,6 +492,43 @@ fn incremental_cache_reuses_unchanged_sources_and_tracks_mutations() {
     assert_eq!(cache.stats().entries, 0);
 }
 
+/// Each assistant step reports its usage twice — once as an early
+/// `assistant/chunk` sample and again on the assembled `assistant/message`.
+/// Counting both would double every bucket, so this pins the totals the fixture
+/// was built to produce.
+#[test]
+fn dsh_usage_counts_each_step_once() {
+    let home = TempHome::new();
+    home.put_dsh_fixture_session("project", "session-fixture");
+
+    let data = aggregate_usage_from_paths(&home.paths, TimeRange::All).expect("aggregate usage");
+    let usage = data
+        .per_provider
+        .deepseek
+        .get("demo-model")
+        .expect("DeepSeek usage row");
+
+    // The fixture's one `demo-model` step reports 10 / 100 / 200 / 50 twice.
+    assert_eq!(usage["input_tokens"], 10);
+    assert_eq!(usage["output_tokens"], 100);
+    assert_eq!(usage["cache_read_input_tokens"], 200);
+    assert_eq!(usage["cache_creation_input_tokens"], 50);
+
+    let reasoner = data
+        .per_provider
+        .deepseek
+        .get("demo-reasoner")
+        .expect("DeepSeek reasoning row");
+    // Reasoning is a subset of output upstream, so it is subtracted back out.
+    assert_eq!(reasoner["reasoning_output_tokens"], 30);
+    // 80 - 30 from the message, plus the 2 of the step that died after its
+    // usage chunk — that one names no model, so it is attributed to the route
+    // the harness last logged.
+    assert_eq!(reasoner["output_tokens"], 52);
+    assert_eq!(reasoner["input_tokens"], 6);
+    assert_eq!(data.provider_days.deepseek, 1);
+}
+
 #[test]
 fn grok_sidecars_invalidate_the_compact_cache() {
     let home = TempHome::new();
@@ -501,6 +542,7 @@ fn grok_sidecars_invalidate_the_compact_cache() {
         opencode: false,
         cursor: false,
         hermes: false,
+        dsh: false,
     };
     let mut cache = SummaryScanCache::new();
 

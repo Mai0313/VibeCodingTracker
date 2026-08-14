@@ -16,9 +16,9 @@ use crate::summary_cache::{
 };
 use crate::utils::directory::{FileInfo, collect_provider_files_diagnostics};
 use crate::utils::{
-    COPILOT_SESSION_MAX_DEPTH, GROK_SESSION_MAX_DEPTH, HelperPaths, get_current_user,
-    get_machine_id, is_claude_session_file, is_codex_session_file, is_copilot_session_file,
-    is_gemini_session_file, is_grok_session_file,
+    COPILOT_SESSION_MAX_DEPTH, DSH_SESSION_MAX_DEPTH, GROK_SESSION_MAX_DEPTH, HelperPaths,
+    get_current_user, get_machine_id, is_claude_session_file, is_codex_session_file,
+    is_copilot_session_file, is_dsh_session_file, is_gemini_session_file, is_grok_session_file,
 };
 use anyhow::Result;
 use rayon::prelude::*;
@@ -80,6 +80,8 @@ pub struct PerProviderAnalysisRows {
     pub gemini: Vec<AggregatedAnalysisRow>,
     /// Rows from the Grok CLI session directory.
     pub grok: Vec<AggregatedAnalysisRow>,
+    /// Rows from the DeepSeek Harness session directory.
+    pub deepseek: Vec<AggregatedAnalysisRow>,
     /// Rows from the OpenCode database.
     pub opencode: Vec<AggregatedAnalysisRow>,
     /// Rows from the Cursor chat stores.
@@ -385,6 +387,19 @@ where
             is_grok_session_file,
             time_range,
             Some(GROK_SESSION_MAX_DEPTH),
+            mode,
+            &mut diagnostics,
+            visitor,
+        )?;
+    }
+
+    if providers.dsh {
+        visit_file_sessions(
+            &[paths.dsh_session_dir.as_path()],
+            ExtensionType::DeepSeek,
+            is_dsh_session_file,
+            time_range,
+            Some(DSH_SESSION_MAX_DEPTH),
             mode,
             &mut diagnostics,
             visitor,
@@ -939,6 +954,7 @@ struct AnalysisProjection {
     copilot: FastHashMap<String, AggregatedAnalysisRow>,
     gemini: FastHashMap<String, AggregatedAnalysisRow>,
     grok: FastHashMap<String, AggregatedAnalysisRow>,
+    deepseek: FastHashMap<String, AggregatedAnalysisRow>,
     opencode: FastHashMap<String, AggregatedAnalysisRow>,
     cursor: FastHashMap<String, AggregatedAnalysisRow>,
     all_dates: HashSet<String>,
@@ -947,6 +963,7 @@ struct AnalysisProjection {
     copilot_dates: HashSet<String>,
     gemini_dates: HashSet<String>,
     grok_dates: HashSet<String>,
+    deepseek_dates: HashSet<String>,
     opencode_dates: HashSet<String>,
     cursor_dates: HashSet<String>,
     hermes_dates: HashSet<String>,
@@ -967,6 +984,7 @@ impl AnalysisProjection {
             copilot: FastHashMap::with_capacity(capacity::MODELS_PER_SESSION),
             gemini: FastHashMap::with_capacity(capacity::MODELS_PER_SESSION),
             grok: FastHashMap::with_capacity(capacity::MODELS_PER_SESSION),
+            deepseek: FastHashMap::with_capacity(capacity::MODELS_PER_SESSION),
             opencode: FastHashMap::with_capacity(capacity::MODELS_PER_SESSION),
             cursor: FastHashMap::with_capacity(capacity::MODELS_PER_SESSION),
             all_dates: HashSet::new(),
@@ -975,6 +993,7 @@ impl AnalysisProjection {
             copilot_dates: HashSet::new(),
             gemini_dates: HashSet::new(),
             grok_dates: HashSet::new(),
+            deepseek_dates: HashSet::new(),
             opencode_dates: HashSet::new(),
             cursor_dates: HashSet::new(),
             hermes_dates: HashSet::new(),
@@ -994,6 +1013,7 @@ impl AnalysisProjection {
             Some(ExtensionType::Copilot) => Some(&mut self.copilot),
             Some(ExtensionType::Gemini) => Some(&mut self.gemini),
             Some(ExtensionType::Grok) => Some(&mut self.grok),
+            Some(ExtensionType::DeepSeek) => Some(&mut self.deepseek),
             Some(ExtensionType::OpenCode) => Some(&mut self.opencode),
             Some(ExtensionType::Cursor) => Some(&mut self.cursor),
             Some(ExtensionType::Hermes) | None => None,
@@ -1011,6 +1031,7 @@ impl AnalysisProjection {
             ExtensionType::Copilot => Some(&mut self.copilot),
             ExtensionType::Gemini => Some(&mut self.gemini),
             ExtensionType::Grok => Some(&mut self.grok),
+            ExtensionType::DeepSeek => Some(&mut self.deepseek),
             ExtensionType::OpenCode => Some(&mut self.opencode),
             ExtensionType::Cursor => Some(&mut self.cursor),
             ExtensionType::Hermes => None,
@@ -1027,6 +1048,7 @@ impl AnalysisProjection {
             ExtensionType::Copilot => Some(&mut self.copilot_dates),
             ExtensionType::Gemini => Some(&mut self.gemini_dates),
             ExtensionType::Grok => Some(&mut self.grok_dates),
+            ExtensionType::DeepSeek => Some(&mut self.deepseek_dates),
             ExtensionType::OpenCode => Some(&mut self.opencode_dates),
             ExtensionType::Cursor => Some(&mut self.cursor_dates),
             ExtensionType::Hermes => Some(&mut self.hermes_dates),
@@ -1054,6 +1076,9 @@ impl AnalysisProjection {
             Some(ExtensionType::Grok) => {
                 self.grok_dates.insert(date);
             }
+            Some(ExtensionType::DeepSeek) => {
+                self.deepseek_dates.insert(date);
+            }
             Some(ExtensionType::OpenCode) => {
                 self.opencode_dates.insert(date);
             }
@@ -1074,6 +1099,7 @@ impl AnalysisProjection {
             copilot: self.copilot_dates.len(),
             gemini: self.gemini_dates.len(),
             grok: self.grok_dates.len(),
+            deepseek: self.deepseek_dates.len(),
             opencode: self.opencode_dates.len(),
             cursor: self.cursor_dates.len(),
             hermes: self.hermes_dates.len(),
@@ -1087,6 +1113,7 @@ impl AnalysisProjection {
                 copilot: into_sorted_rows(self.copilot),
                 gemini: into_sorted_rows(self.gemini),
                 grok: into_sorted_rows(self.grok),
+                deepseek: into_sorted_rows(self.deepseek),
                 opencode: into_sorted_rows(self.opencode),
                 cursor: into_sorted_rows(self.cursor),
             },
@@ -1131,6 +1158,7 @@ fn extension_type_from_name(name: &str) -> Option<ExtensionType> {
         "Copilot-CLI" => Some(ExtensionType::Copilot),
         "Gemini" => Some(ExtensionType::Gemini),
         "Grok" => Some(ExtensionType::Grok),
+        "DeepSeek-Harness" => Some(ExtensionType::DeepSeek),
         "OpenCode" => Some(ExtensionType::OpenCode),
         "Cursor" => Some(ExtensionType::Cursor),
         "Hermes" => Some(ExtensionType::Hermes),

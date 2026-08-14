@@ -142,6 +142,7 @@
         "codex": true,
         "copilot": true,
         "cursor": true,
+        "dsh": true,
         "gemini": true,
         "grok": true,
         "hermes": true,
@@ -162,6 +163,10 @@
           "type": "boolean"
         },
         "cursor": {
+          "default": true,
+          "type": "boolean"
+        },
+        "dsh": {
           "default": true,
           "type": "boolean"
         },

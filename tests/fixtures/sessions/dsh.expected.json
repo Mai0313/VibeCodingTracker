@@ -1,0 +1,81 @@
+{
+  "extensionName": "DeepSeek-Harness",
+  "insightsVersion": "ignored",
+  "machineId": "ignored",
+  "records": [
+    {
+      "conversationUsage": {
+        "demo-model": {
+          "cache_creation_input_tokens": 50,
+          "cache_read_input_tokens": 200,
+          "input_tokens": 10,
+          "output_tokens": 100,
+          "reasoning_output_tokens": 0
+        },
+        "demo-reasoner": {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 400,
+          "input_tokens": 6,
+          "output_tokens": 52,
+          "reasoning_output_tokens": 30
+        }
+      },
+      "editFileDetails": [
+        {
+          "characterCount": 24,
+          "filePath": "/repo/demo/src/main.rs",
+          "lineCount": 2,
+          "newString": "    demo();\n    extra();",
+          "oldString": "    demo();",
+          "timestamp": 1786728856574
+        }
+      ],
+      "folderPath": "/repo/demo",
+      "gitRemoteUrl": "",
+      "readFileDetails": [
+        {
+          "characterCount": 25,
+          "filePath": "/repo/demo/src/main.rs",
+          "lineCount": 3,
+          "timestamp": 1786728853574
+        }
+      ],
+      "runCommandDetails": [
+        {
+          "characterCount": 10,
+          "command": "cargo test",
+          "description": "Run the test suite",
+          "filePath": "/repo/demo",
+          "lineCount": 0,
+          "timestamp": 1786728860574
+        }
+      ],
+      "taskId": "session-fixture",
+      "timestamp": 1786728868574,
+      "toolCallCounts": {
+        "Bash": 1,
+        "Edit": 1,
+        "Read": 1,
+        "TodoWrite": 1,
+        "Write": 1
+      },
+      "totalEditCharacters": 24,
+      "totalEditLines": 2,
+      "totalReadCharacters": 25,
+      "totalReadLines": 3,
+      "totalUniqueFiles": 2,
+      "totalWriteCharacters": 7,
+      "totalWriteLines": 2,
+      "writeFileDetails": [
+        {
+          "characterCount": 7,
+          "content": "one\ntwo",
+          "filePath": "/repo/demo/notes.txt",
+          "lineCount": 2,
+          "timestamp": 1786728858574
+        }
+      ]
+    }
+  ],
+  "user": "ignored"
+}

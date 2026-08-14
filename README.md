@@ -19,7 +19,7 @@
 
 </div>
 
-**Track your AI coding costs in real-time.** Vibe Coding Tracker is a lightweight, high-performance CLI tool built in Rust that monitors and analyzes your Claude Code, Codex, Copilot, Gemini, OpenCode, Cursor, Hermes, and Grok usage — with detailed cost breakdowns, token statistics, and code operation insights, all while keeping the memory footprint minimal.
+**Track your AI coding costs in real-time.** Vibe Coding Tracker is a lightweight, high-performance CLI tool built in Rust that monitors and analyzes your Claude Code, Codex, Copilot, Gemini, OpenCode, Cursor, Hermes, Grok, and DeepSeek Harness usage — with detailed cost breakdowns, token statistics, and code operation insights, all while keeping the memory footprint minimal.
 
 [English](README.md) | [繁體中文](README.zh-TW.md) | [简体中文](README.zh-CN.md)
 
@@ -48,7 +48,7 @@ Choose your preferred view:
 
 ### Zero Configuration
 
-Automatically detects and processes logs from Claude Code, Codex, Copilot, Gemini, OpenCode, Cursor, Hermes, and Grok. No setup required — just run and analyze. A `~/.vct/config.toml` is created with sensible defaults on first run if you ever want to tweak behavior (see [Configuration](#configuration)).
+Automatically detects and processes logs from Claude Code, Codex, Copilot, Gemini, OpenCode, Cursor, Hermes, Grok, and DeepSeek Harness. No setup required — just run and analyze. A `~/.vct/config.toml` is created with sensible defaults on first run if you ever want to tweak behavior (see [Configuration](#configuration)).
 
 ### Rich Insights
 
@@ -62,15 +62,15 @@ Automatically detects and processes logs from Claude Code, Codex, Copilot, Gemin
 
 ## Key Features
 
-| Feature               | Description                                                              |
-| --------------------- | ------------------------------------------------------------------------ |
-| **Multi-Provider**    | Claude Code, Codex, Copilot, Gemini, OpenCode, Cursor, Hermes, and Grok  |
-| **Smart Pricing**     | Fuzzy model matching + daily cache from LiteLLM                          |
-| **4 Display Modes**   | Interactive TUI, static table, plain text, and JSON                      |
-| **Dual Analysis**     | Token/cost stats (`usage`) + code operation stats (`analysis`)           |
-| **Live Quota Panels** | Live quota usage for Claude, Codex, Copilot, Cursor, and Grok            |
-| **Ultra-Lightweight** | Under ~50 MB RSS in the TUI, compact incremental scans — built with Rust |
-| **Live Updates**      | Responsive loading and background refreshes with change highlighting     |
+| Feature               | Description                                                                               |
+| --------------------- | ----------------------------------------------------------------------------------------- |
+| **Multi-Provider**    | Claude Code, Codex, Copilot, Gemini, OpenCode, Cursor, Hermes, Grok, and DeepSeek Harness |
+| **Smart Pricing**     | Fuzzy model matching + daily cache from LiteLLM                                           |
+| **4 Display Modes**   | Interactive TUI, static table, plain text, and JSON                                       |
+| **Dual Analysis**     | Token/cost stats (`usage`) + code operation stats (`analysis`)                            |
+| **Live Quota Panels** | Live quota usage for Claude, Codex, Copilot, Cursor, and Grok                             |
+| **Ultra-Lightweight** | Under ~50 MB RSS in the TUI, compact incremental scans — built with Rust                  |
+| **Live Updates**      | Responsive loading and background refreshes with change highlighting                      |
 
 ---
 
@@ -299,6 +299,7 @@ The tool automatically scans these directories:
 - `~/.cursor/chats/*/*/store.db` (Cursor — SQLite chat stores, used for `analysis` and a local `usage` estimate consistent with the other providers)
 - `~/.hermes/state.db` (Hermes — SQLite database, honors `$HERMES_HOME`; `usage` only)
 - `$GROK_HOME/sessions/*/*/signals.json` (Grok CLI — defaults to `~/.grok`; sibling `updates.jsonl` supplies `analysis` data)
+- `$DSH_HOME/sessions/*/*/session.jsonl.zstd` (DeepSeek Harness — defaults to `~/.dsh`; a root configured with `compression = "none"` writes `session.jsonl` instead, and both are read)
 
 Grok `usage` is one point-in-time local context estimate: vct records `signals.json`'s `contextTokensUsed` as cache-read tokens and estimates cost at the model's cache-read price. It is not cumulative billed usage. `analysis` reconstructs completed Read / Write / Edit / Bash / TodoWrite operations from the sibling `updates.jsonl`. For your actual billed allowance, see the Grok quota panel below.
 
@@ -347,7 +348,7 @@ A panel appears only for a provider whose credentials are present. Panels are pl
 | `--json`                                       | Complete parser results as JSON: one object for `<FILE>`, otherwise an array of objects  |
 | `--daily` / `--weekly` / `--monthly` / `--all` | Time range filter for all-session analysis (see table above; not accepted with `<FILE>`) |
 
-See [`tests/fixtures/sessions/`](tests/fixtures/sessions/) for sample inputs and matching JSON outputs for the four JSONL providers, plus the Grok session fixture under [`tests/fixtures/sessions/grok/`](tests/fixtures/sessions/grok/).
+See [`tests/fixtures/sessions/`](tests/fixtures/sessions/) for sample inputs and matching JSON outputs for the four JSONL providers, plus the Grok session fixture under [`tests/fixtures/sessions/grok/`](tests/fixtures/sessions/grok/) and the DeepSeek Harness one under [`tests/fixtures/sessions/dsh/`](tests/fixtures/sessions/dsh/).
 
 ### Basic Usage
 
@@ -605,6 +606,7 @@ opencode = true
 cursor = true
 hermes = true
 grok = true
+dsh = true
 
 [logging]
 # Minimum level written to ~/.vct/logs/vct-YYYY-MM-DD.log.
@@ -683,6 +685,7 @@ Generic placeholder names (e.g. `default`, what cursor-agent records for auto-mo
 - **Beyond tokens**: Claude web-search tool calls (`server_tool_use.web_search_requests`) are billed per query on top of the token cost; every other model's per-query charge is $0.
 - **OpenCode**: a novel model name is priced from its tokens only on an **exact** LiteLLM match; with no exact match, vct trusts the assistant message's own stored cost instead of guessing from a loosely-similar name.
 - **Hermes**: priced the same way as OpenCode — an **exact** LiteLLM match prices from tokens, otherwise vct uses Hermes's own stored cost.
+- **DeepSeek Harness**: `dsh` records no cost of its own, so every model is priced from LiteLLM through the same lookup chain as the other file-based providers — there is no stored-cost fallback like OpenCode's or Hermes's. It routes to whatever the deployment configures, so expect deployment-defined model names, which land at $0 when nothing in LiteLLM matches.
 - **Grok**: `contextTokensUsed` is priced as cache-read tokens only (falling back to the input rate when the model publishes no cache-read price); this is a point-in-time local context estimate, not cumulative billed usage.
 - **Cache is raw**: the daily cache stores the filtered upstream LiteLLM JSON (not a derived shape), so tiered / batch pricing stays available without re-fetching, and each pricing map owns a small in-process LRU so repeated lookups stay cheap without cross-map contamination.
 

@@ -3977,6 +3977,7 @@ dependencies = [
  "vct-test-support",
  "walkdir",
  "zip",
+ "zstd",
 ]
 
 [[package]]

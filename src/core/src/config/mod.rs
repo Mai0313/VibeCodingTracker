@@ -259,6 +259,8 @@ pub struct ProvidersConfig {
     pub hermes: bool,
     #[serde(default = "default_true")]
     pub grok: bool,
+    #[serde(default = "default_true")]
+    pub dsh: bool,
 }
 
 impl Default for ProvidersConfig {
@@ -272,6 +274,7 @@ impl Default for ProvidersConfig {
             cursor: true,
             hermes: true,
             grok: true,
+            dsh: true,
         }
     }
 }

@@ -30,6 +30,8 @@ pub struct ProviderTotals<S> {
     pub hermes: S,
     /// Totals for Grok CLI sessions.
     pub grok: S,
+    /// Totals for DeepSeek Harness sessions.
+    pub deepseek: S,
     /// Sum across every provider (the "All Providers" bucket).
     pub overall: S,
 }
@@ -45,6 +47,7 @@ impl<S: Default> Default for ProviderTotals<S> {
             cursor: S::default(),
             hermes: S::default(),
             grok: S::default(),
+            deepseek: S::default(),
             overall: S::default(),
         }
     }
@@ -65,6 +68,7 @@ impl<S> ProviderTotals<S> {
             Provider::Cursor => &self.cursor,
             Provider::Hermes => &self.hermes,
             Provider::Grok => &self.grok,
+            Provider::DeepSeek => &self.deepseek,
             Provider::Unknown => &self.overall,
         }
     }
@@ -83,6 +87,7 @@ impl<S> ProviderTotals<S> {
             Provider::Cursor => &mut self.cursor,
             Provider::Hermes => &mut self.hermes,
             Provider::Grok => &mut self.grok,
+            Provider::DeepSeek => &mut self.deepseek,
             Provider::Unknown => &mut self.overall,
         }
     }
