@@ -38,6 +38,14 @@ pub fn fixture_str(name: &str) -> String {
         .unwrap_or_else(|e| panic!("failed to read fixture {name}: {e}"))
 }
 
+/// Reads a fixture file under `tests/fixtures/` to bytes.
+///
+/// Needed for the compressed DeepSeek Harness session log, which is the one
+/// fixture that is not text.
+pub fn fixture_bytes(name: &str) -> Vec<u8> {
+    std::fs::read(fixture(name)).unwrap_or_else(|e| panic!("failed to read fixture {name}: {e}"))
+}
+
 /// Appends a valid standalone JSON blob large enough to change a Cursor store fingerprint.
 pub fn append_cursor_json_blob(path: &Path, id: &str) {
     let connection = rusqlite::Connection::open(path).expect("open Cursor store");
@@ -59,7 +67,7 @@ pub fn append_cursor_json_blob(path: &Path, id: &str) {
 /// A temporary fake home directory plus the [`HelperPaths`] rooted inside it.
 ///
 /// Every provider directory (`.claude`, `.codex`, `.gemini`, `.copilot`,
-/// `.cursor`, `.grok`, `.local/share/opencode`, `.config/cursor`) and the `~/.vct` cache
+/// `.cursor`, `.grok`, `.dsh`, `.local/share/opencode`, `.config/cursor`) and the `~/.vct` cache
 /// resolve under `dir`, matching exactly what production would compute for a
 /// user whose `HOME` was this directory.
 pub struct TempHome {
@@ -88,6 +96,11 @@ impl TempHome {
 
     /// Writes `content` to `path`, creating any missing parent directories.
     fn write_file(path: &Path, content: &str) {
+        Self::write_bytes(path, content.as_bytes());
+    }
+
+    /// Byte-level counterpart of [`TempHome::write_file`].
+    fn write_bytes(path: &Path, content: &[u8]) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).expect("create parent dirs");
         }
@@ -160,6 +173,28 @@ impl TempHome {
             &fixture_str("sessions/grok/updates.jsonl"),
         );
         signals
+    }
+
+    /// Drops a DeepSeek Harness session log at
+    /// `~/.dsh/sessions/<project>/<session>/session.jsonl.zstd`.
+    pub fn put_dsh_session(&self, project: &str, session: &str, content: &[u8]) -> PathBuf {
+        let p = self
+            .paths
+            .dsh_session_dir
+            .join(project)
+            .join(session)
+            .join("session.jsonl.zstd");
+        Self::write_bytes(&p, content);
+        p
+    }
+
+    /// Copies the multi-frame DeepSeek Harness fixture log.
+    pub fn put_dsh_fixture_session(&self, project: &str, session: &str) -> PathBuf {
+        self.put_dsh_session(
+            project,
+            session,
+            &fixture_bytes("sessions/dsh/session.jsonl.zstd"),
+        )
     }
 
     /// Seeds one Cursor chat store with an assistant tool call and context gauge.

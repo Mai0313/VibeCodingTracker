@@ -361,6 +361,48 @@ fn test_grok_parser() {
     );
 }
 
+#[test]
+fn test_dsh_parser() {
+    let expected_file = fixture("sessions/dsh.expected.json");
+    let expected_json: Value = serde_json::from_str(
+        &std::fs::read_to_string(&expected_file).expect("Failed to read DeepSeek golden result"),
+    )
+    .expect("Failed to parse DeepSeek golden result");
+    let ignore_fields = ["insightsVersion", "machineId", "user"];
+
+    // The same session in both on-disk encodings: a root configured with
+    // `compression: 'none'` writes the plain JSONL, and the default zstd root
+    // writes it as one frame per append batch. Neither may change the result.
+    for name in [
+        "sessions/dsh/session.jsonl.zstd",
+        "sessions/dsh/session.jsonl",
+    ] {
+        let actual_json =
+            parse_session_file_to_value(fixture(name)).expect("Failed to analyze DeepSeek session");
+        let matches = compare_json_ignore_fields(&actual_json, &expected_json, &ignore_fields);
+
+        if !matches {
+            eprintln!("\n=== ACTUAL OUTPUT ({name}) ===");
+            eprintln!(
+                "{}",
+                serde_json::to_string_pretty(&actual_json)
+                    .unwrap_or_else(|_| "Invalid JSON".to_string())
+            );
+            eprintln!("\n=== EXPECTED OUTPUT ===");
+            eprintln!(
+                "{}",
+                serde_json::to_string_pretty(&expected_json)
+                    .unwrap_or_else(|_| "Invalid JSON".to_string())
+            );
+        }
+
+        assert!(
+            matches,
+            "DeepSeek analysis of {name} does not match the golden result (ignoring runtime fields)"
+        );
+    }
+}
+
 /// Inline-fixture smoke test for the Gemini JSONL parser.
 ///
 /// Complements `test_gemini_parser` (which uses a real-world session dump)

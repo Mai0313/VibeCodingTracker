@@ -127,6 +127,10 @@ fn assert_analysis_data_eq(actual: &AnalysisData, expected: &AnalysisData) {
         serde_json::to_value(&expected.per_provider.grok).unwrap()
     );
     assert_eq!(
+        serde_json::to_value(&actual.per_provider.deepseek).unwrap(),
+        serde_json::to_value(&expected.per_provider.deepseek).unwrap()
+    );
+    assert_eq!(
         serde_json::to_value(&actual.per_provider.opencode).unwrap(),
         serde_json::to_value(&expected.per_provider.opencode).unwrap()
     );
@@ -141,6 +145,7 @@ fn assert_analysis_data_eq(actual: &AnalysisData, expected: &AnalysisData) {
             actual.provider_days.copilot,
             actual.provider_days.gemini,
             actual.provider_days.grok,
+            actual.provider_days.deepseek,
             actual.provider_days.opencode,
             actual.provider_days.cursor,
             actual.provider_days.hermes,
@@ -152,6 +157,7 @@ fn assert_analysis_data_eq(actual: &AnalysisData, expected: &AnalysisData) {
             expected.provider_days.copilot,
             expected.provider_days.gemini,
             expected.provider_days.grok,
+            expected.provider_days.deepseek,
             expected.provider_days.opencode,
             expected.provider_days.cursor,
             expected.provider_days.hermes,
@@ -231,6 +237,48 @@ fn batch_analysis_attributes_grok_tools_to_the_grok_provider() {
     assert_eq!(row.todo_write_count, 1);
     assert_eq!(data.per_provider.grok.len(), 1);
     assert_eq!(data.provider_days.grok, 1);
+}
+
+#[test]
+fn batch_analysis_attributes_dsh_tools_to_the_deepseek_provider() {
+    let home = TempHome::new();
+    home.put_dsh_fixture_session("project", "session-fixture");
+
+    let data = aggregate_sessions_by_model_from_paths(&home.paths, TimeRange::All)
+        .expect("aggregate DeepSeek analysis");
+    let row = data
+        .rows
+        .iter()
+        .find(|row| row.model == "demo-model")
+        .expect("DeepSeek model row");
+    assert_eq!(row.read_count, 1);
+    assert_eq!(row.write_count, 1);
+    assert_eq!(row.edit_count, 1);
+    assert_eq!(row.bash_count, 1);
+    assert_eq!(row.todo_write_count, 1);
+    // Both models in the session bill against the same file operations.
+    assert_eq!(data.per_provider.deepseek.len(), 2);
+    assert_eq!(data.provider_days.deepseek, 1);
+}
+
+#[test]
+fn disabled_dsh_provider_is_not_scanned_for_analysis() {
+    let home = TempHome::new();
+    home.put_dsh_fixture_session("project", "session-fixture");
+    let providers = ProvidersConfig {
+        dsh: false,
+        ..ProvidersConfig::default()
+    };
+
+    let data = aggregate_sessions_by_model_from_paths_with_providers(
+        &home.paths,
+        TimeRange::All,
+        providers,
+    )
+    .expect("aggregate with DeepSeek disabled");
+
+    assert!(data.per_provider.deepseek.is_empty());
+    assert_eq!(data.provider_days.deepseek, 0);
 }
 
 #[test]
@@ -898,6 +946,7 @@ fn full_and_usage_only_modes_have_identical_scalar_analysis() {
         ("sessions/copilot.jsonl", ExtensionType::Copilot),
         ("sessions/gemini.jsonl", ExtensionType::Gemini),
         ("sessions/grok/signals.json", ExtensionType::Grok),
+        ("sessions/dsh/session.jsonl.zstd", ExtensionType::DeepSeek),
     ];
 
     for (name, provider) in fixtures {
