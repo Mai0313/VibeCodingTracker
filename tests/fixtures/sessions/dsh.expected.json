@@ -8,15 +8,15 @@
         "demo-model": {
           "cache_creation_input_tokens": 50,
           "cache_read_input_tokens": 200,
-          "input_tokens": 11,
-          "output_tokens": 102,
+          "input_tokens": 10,
+          "output_tokens": 100,
           "reasoning_output_tokens": 0
         },
         "demo-reasoner": {
           "cache_creation_input_tokens": 0,
           "cache_read_input_tokens": 400,
-          "input_tokens": 5,
-          "output_tokens": 50,
+          "input_tokens": 6,
+          "output_tokens": 52,
           "reasoning_output_tokens": 30
         }
       },
@@ -51,7 +51,7 @@
         }
       ],
       "taskId": "session-fixture",
-      "timestamp": 1786728867574,
+      "timestamp": 1786728868574,
       "toolCallCounts": {
         "Bash": 1,
         "Edit": 1,

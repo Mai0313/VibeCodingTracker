@@ -508,18 +508,24 @@ fn dsh_usage_counts_each_step_once() {
         .get("demo-model")
         .expect("DeepSeek usage row");
 
-    assert_eq!(usage["input_tokens"], 11);
-    assert_eq!(usage["output_tokens"], 102);
+    // The fixture's one `demo-model` step reports 10 / 100 / 200 / 50 twice.
+    assert_eq!(usage["input_tokens"], 10);
+    assert_eq!(usage["output_tokens"], 100);
     assert_eq!(usage["cache_read_input_tokens"], 200);
     assert_eq!(usage["cache_creation_input_tokens"], 50);
-    // Reasoning is a subset of output upstream, so it is subtracted back out.
+
     let reasoner = data
         .per_provider
         .deepseek
         .get("demo-reasoner")
         .expect("DeepSeek reasoning row");
-    assert_eq!(reasoner["output_tokens"], 50);
+    // Reasoning is a subset of output upstream, so it is subtracted back out.
     assert_eq!(reasoner["reasoning_output_tokens"], 30);
+    // 80 - 30 from the message, plus the 2 of the step that died after its
+    // usage chunk — that one names no model, so it is attributed to the route
+    // the harness last logged.
+    assert_eq!(reasoner["output_tokens"], 52);
+    assert_eq!(reasoner["input_tokens"], 6);
     assert_eq!(data.provider_days.deepseek, 1);
 }
 

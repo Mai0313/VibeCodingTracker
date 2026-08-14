@@ -19,6 +19,7 @@
 {"type":"tool/result","seq":17,"time":1786728862574,"data":{"turn":1,"step":3,"message":{}},"surfaceOp":"append","sourceEventSeqs":[16]}
 {"type":"tool/call","seq":18,"time":1786728863574,"data":{"turn":1,"step":3,"callId":"c7","name":"read","arguments":"{\"file_path\": \"missing.rs\"}"}}
 {"type":"tool/result","seq":19,"time":1786728864574,"data":{"turn":1,"step":3,"message":{},"error":{"name":"NotFound","code":"ENOENT"}},"surfaceOp":"append","sourceEventSeqs":[18]}
-{"type":"assistant/message","seq":20,"time":1786728865574,"data":{"turn":2,"step":1,"message":{"role":"assistant","content":[],"source":{"kind":"model","provider":"openai","model":"demo-reasoner"}},"usage":{"inputTokens":5,"outputTokens":80,"reasoningTokens":30,"cacheReadTokens":400,"cacheWriteTokens":0}},"surfaceOp":"append","sourceEventSeqs":[]}
-{"type":"assistant/chunk","seq":21,"time":1786728866574,"data":{"turn":2,"step":2,"chunk":{"type":"usage","usage":{"inputTokens":1,"outputTokens":2}}}}
-{"type":"turn/end","seq":22,"time":1786728867574,"data":{"turn":2}}
+{"type":"request/context","seq":20,"time":1786728865574,"data":{"provider":"openai","model":"demo-reasoner","contextWindow":272000}}
+{"type":"assistant/message","seq":21,"time":1786728866574,"data":{"turn":2,"step":1,"message":{"role":"assistant","content":[],"source":{"kind":"model","provider":"openai","model":"demo-reasoner"}},"usage":{"inputTokens":5,"outputTokens":80,"reasoningTokens":30,"cacheReadTokens":400,"cacheWriteTokens":0}},"surfaceOp":"append","sourceEventSeqs":[20]}
+{"type":"assistant/chunk","seq":22,"time":1786728867574,"data":{"turn":2,"step":2,"chunk":{"type":"usage","usage":{"inputTokens":1,"outputTokens":2}}}}
+{"type":"turn/end","seq":23,"time":1786728868574,"data":{"turn":2}}

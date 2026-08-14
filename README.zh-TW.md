@@ -684,7 +684,7 @@ vct config migrate
 - **不只 token**：Claude 的網頁搜尋工具呼叫（`server_tool_use.web_search_requests`）會在 token 費用之外，按每次查詢計費；其他所有 model 的每次查詢費用皆為 $0。
 - **OpenCode**：只有在 LiteLLM **完全比對**成功時，才會依 token 為新型 model 計價；若沒有完全比對，vct 會採信該 assistant 訊息本身儲存的費用，而不是從名稱相近的 model 去猜測。
 - **Hermes**：與 OpenCode 相同，LiteLLM **完全比對**成功時依 token 計價，否則使用 Hermes 本身儲存的費用。
-- **DeepSeek Harness**：`dsh` 本身不記錄任何費用，因此一律依 LiteLLM 計價。它會路由到部署方設定的任意 provider，所以 LiteLLM 無法定價的部署自訂 model 名稱會顯示 $0，而不會去比對一個只是大致相似的名稱。
+- **DeepSeek Harness**：`dsh` 本身不記錄任何費用，因此一律經由與其他 file-based provider 相同的查找鏈依 LiteLLM 計價，沒有 OpenCode 或 Hermes 那樣的 stored cost 兜底。它會路由到部署方設定的任意 provider，因此部署自訂的 model 名稱很常見；LiteLLM 完全比對不到時費用為 $0。
 - **Grok**：只會把 `contextTokensUsed` 當成 cache-read token 計價（若該 model 沒有公布 cache-read 費率則改用 input 費率）；這是單一當下的本地 context 估算，不是累計的 billed usage。
 - **原始 cache**: 每日 cache 儲存經過篩選的 LiteLLM 上游原始 JSON (而非衍生結構), 因此 tiered / batch 定價不需重新取得即可使用. 每個 pricing map 各自擁有一個小型 process-local LRU, 重複查詢維持低成本, 也不會在不同 map 之間互相污染.
 

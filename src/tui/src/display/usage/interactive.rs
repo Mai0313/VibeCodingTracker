@@ -1572,9 +1572,9 @@ fn digest_line(
 /// `+N more → p`, so the line never implies it lists every provider.
 fn provider_digest(rows: &[ProviderTotal<'_, ProviderStats>], width: u16) -> Line<'static> {
     /// Narrower than the quota digest's separator on purpose: there are nine
-    /// providers to the quota band's five, so the two columns this saves per
-    /// gap buy roughly two more segments before the line has to start folding
-    /// them into the `+N more` tail.
+    /// providers to the quota band's five, so every column saved per gap is
+    /// another provider named on the line before the rest fold into the
+    /// `+N more` tail.
     const SEP: &str = " · ";
     const TAIL: &str = "more → p";
     // The summary bar already carries the grand total, so the aggregate row
@@ -2882,12 +2882,15 @@ mod tests {
         assert!(!rendered.contains("no Grok quota"));
     }
 
-    const PROVIDER_NAMES: [Provider; 8] = [
+    /// Every provider the digest and panel can be handed, so both exercise the
+    /// real maximum rather than a sample of it.
+    const PROVIDER_NAMES: [Provider; 9] = [
         Provider::ClaudeCode,
         Provider::Codex,
         Provider::Copilot,
         Provider::Gemini,
         Provider::Grok,
+        Provider::DeepSeek,
         Provider::OpenCode,
         Provider::Cursor,
         Provider::Hermes,
@@ -2927,15 +2930,15 @@ mod tests {
 
     #[test]
     fn provider_panel_says_how_many_providers_it_could_not_list() {
-        // Eight providers into a panel with room for four data rows: the ones
+        // Every provider into a panel with room for four data rows: the ones
         // that did not fit are counted, in the title and in the body, rather
         // than the list just stopping at the border.
-        let short = render_panel(34, 9, 8);
-        assert!(short.contains("+5"), "got:\n{short}");
+        let short = render_panel(34, 9, PROVIDER_NAMES.len());
+        assert!(short.contains("+6"), "got:\n{short}");
         assert!(short.contains("more"), "got:\n{short}");
 
         // With room for all of them, neither marker appears.
-        let tall = render_panel(34, 14, 8);
+        let tall = render_panel(34, 15, PROVIDER_NAMES.len());
         assert!(!tall.contains("more"), "got:\n{tall}");
         assert!(tall.contains("Hermes"), "got:\n{tall}");
 
@@ -2951,20 +2954,27 @@ mod tests {
             total_cost: 1.0,
             days_count: 1,
         };
-        let rows = provider_rows(8, &stats);
+        let rows = provider_rows(PROVIDER_NAMES.len(), &stats);
 
-        // Wide enough for all eight: every provider is named, nothing is
-        // counted away.
-        let wide = line_text(provider_digest(&rows, 120));
+        // Wide enough for every provider: each one is named, nothing is counted
+        // away.
+        let wide = line_text(provider_digest(&rows, 140));
         for provider in PROVIDER_NAMES {
             assert!(
                 wide.contains(provider.display_name()),
-                "width=120 dropped {}: {wide}",
+                "width=140 dropped {}: {wide}",
                 provider.display_name()
             );
         }
         assert!(!wide.contains("more"), "got: {wide}");
-        assert!(wide.chars().count() <= 120, "got: {wide}");
+        assert!(wide.chars().count() <= 140, "got: {wide}");
+
+        // A full nine no longer fits the 120-column terminal the separator was
+        // sized for, so the line has to say what it left out instead of
+        // quietly listing eight of them.
+        let squeezed = line_text(provider_digest(&rows, 120));
+        assert!(squeezed.contains("more → p"), "got: {squeezed}");
+        assert!(squeezed.chars().count() <= 120, "got: {squeezed}");
 
         // Narrow: whole segments go and the remainder is named, so the line
         // never implies it listed everyone. Equal costs empty from the tail.
