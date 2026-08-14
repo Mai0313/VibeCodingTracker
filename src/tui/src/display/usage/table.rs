@@ -132,7 +132,7 @@ pub fn display_usage_table(usage_data: &UsageData, merge: bool) {
     println!();
 
     let mut totals_table = Table::new();
-    totals_table.load_preset(UTF8_FULL).set_header(vec![
+    totals_table.load_style(UTF8_FULL).set_header(vec![
         Cell::new("Provider")
             .fg(Color::Magenta)
             .set_alignment(CellAlignment::Left),

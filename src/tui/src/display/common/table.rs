@@ -543,7 +543,7 @@ pub fn create_ratatui_table<'a>(
 /// left-aligned, the rest right-aligned. The returned table has no body rows.
 pub fn create_comfy_table(headers: Vec<&str>, header_color: Color) -> Table {
     let mut table = Table::new();
-    table.load_preset(UTF8_FULL).set_header(
+    table.load_style(UTF8_FULL).set_header(
         headers
             .iter()
             .enumerate()
