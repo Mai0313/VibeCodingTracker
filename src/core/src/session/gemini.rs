@@ -289,67 +289,169 @@ fn gemini_tool_status(tool_call: &Value) -> GeminiToolStatus {
     }
 }
 
-fn tracked_tool_schema_supported(name: &str, tool_call: &Value) -> bool {
-    let args = tool_call.get("args");
-    match name {
-        "read_file" => {
-            args.and_then(|args| args.get("file_path"))
+/// A Gemini tool this parser tracks, resolved from the name in the log.
+///
+/// One variant per metric the tool folds into. The schema check, the invocation
+/// counter and the file-operation fold each match exhaustively on the enum, so a
+/// variant one of them forgets is a build error rather than a silently dropped
+/// metric. What the compiler cannot check is [`TrackedTool::from_name`] itself,
+/// which is why every tool name is spelled there and nowhere else.
+#[derive(Clone, Copy)]
+enum TrackedTool {
+    Read,
+    Write,
+    Edit,
+    Shell,
+    TodoWrite,
+    ReadManyFiles,
+}
+
+impl TrackedTool {
+    /// Resolves a log name, or `None` for one this table does not list (the
+    /// meta tools `update_topic`, `task_complete`, … among them). A name absent
+    /// here contributes nothing at all, so a tool the parser should track but
+    /// this table misses is invisible rather than merely undetailed.
+    fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "read_file" => Self::Read,
+            "write_file" | "create_file" => Self::Write,
+            // Current Gemini CLI emits `replace`; `edit_file` /
+            // `replace_in_file` were the historical names and are kept here as
+            // best-effort aliases in case older sessions are still being
+            // replayed through `vct analysis <file>`.
+            "edit_file" | "replace_in_file" | "replace" => Self::Edit,
+            "run_command" | "run_shell_command" | "execute_command" | "shell" => Self::Shell,
+            "write_todos" => Self::TodoWrite,
+            // Counts as a read, but reports no content to attach, which is why
+            // it is not folded into `Read`.
+            "read_many_files" => Self::ReadManyFiles,
+            _ => return None,
+        })
+    }
+
+    /// Whether a successful call carries the arguments [`Self::record_operation`]
+    /// needs; a call that does not is counted as an invocation only.
+    fn schema_supported(self, tool_call: &Value) -> bool {
+        let args = tool_call.get("args");
+        match self {
+            Self::Read => {
+                args.and_then(|args| args.get("file_path"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|path| !path.is_empty())
+                    && tool_result_output(tool_call).is_some()
+            }
+            Self::Write => {
+                args.and_then(|args| args.get("file_path"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|path| !path.is_empty())
+                    && args
+                        .and_then(|args| args.get("content"))
+                        .is_some_and(Value::is_string)
+            }
+            Self::Edit => {
+                args.and_then(|args| args.get("file_path"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|path| !path.is_empty())
+                    && args
+                        .and_then(|args| args.get("old_string").or_else(|| args.get("old_text")))
+                        .is_some_and(Value::is_string)
+                    && args
+                        .and_then(|args| args.get("new_string").or_else(|| args.get("new_text")))
+                        .is_some_and(Value::is_string)
+            }
+            Self::Shell => args
+                .and_then(|args| args.get("command").or_else(|| args.get("cmd")))
                 .and_then(Value::as_str)
-                .is_some_and(|path| !path.is_empty())
-                && tool_result_output(tool_call).is_some()
+                .is_some_and(|command| !command.trim().is_empty()),
+            Self::TodoWrite | Self::ReadManyFiles => true,
         }
-        "write_file" | "create_file" => {
-            args.and_then(|args| args.get("file_path"))
-                .and_then(Value::as_str)
-                .is_some_and(|path| !path.is_empty())
-                && args
-                    .and_then(|args| args.get("content"))
-                    .is_some_and(Value::is_string)
+    }
+
+    /// Counts the call without claiming any file operation, for a call that
+    /// did not succeed or whose arguments this parser cannot read.
+    fn record_invocation(self, state: &mut SessionParseState) {
+        match self {
+            Self::Read | Self::ReadManyFiles => state.tool_counts.read += 1,
+            Self::Write => state.tool_counts.write += 1,
+            Self::Edit => state.tool_counts.edit += 1,
+            Self::Shell => state.tool_counts.bash += 1,
+            Self::TodoWrite => state.tool_counts.todo_write += 1,
         }
-        "edit_file" | "replace_in_file" | "replace" => {
-            args.and_then(|args| args.get("file_path"))
-                .and_then(Value::as_str)
-                .is_some_and(|path| !path.is_empty())
-                && args
-                    .and_then(|args| args.get("old_string").or_else(|| args.get("old_text")))
-                    .is_some_and(Value::is_string)
-                && args
-                    .and_then(|args| args.get("new_string").or_else(|| args.get("new_text")))
-                    .is_some_and(Value::is_string)
+    }
+
+    /// Folds a successful call whose schema [`Self::schema_supported`] accepted
+    /// into the file-operation metrics.
+    fn record_operation(self, state: &mut SessionParseState, tool_call: &Value, ts: i64) {
+        let args = tool_call.get("args");
+        match self {
+            Self::Read => {
+                state.tool_counts.read += 1;
+                let file_path = args
+                    .and_then(|a| a.get("file_path"))
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("");
+
+                if let Some(content) = tool_result_output(tool_call) {
+                    attach_read_detail(state, file_path, content, ts);
+                }
+            }
+            Self::Write => {
+                let file_path = args
+                    .and_then(|a| a.get("file_path"))
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("");
+                let content = args
+                    .and_then(|a| a.get("content"))
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("");
+
+                state.add_write_detail(file_path, content, ts);
+            }
+            Self::Edit => {
+                let file_path = args
+                    .and_then(|a| a.get("file_path"))
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("");
+                let old_string = args
+                    .and_then(|a| a.get("old_string").or_else(|| a.get("old_text")))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
+                let new_string = args
+                    .and_then(|a| a.get("new_string").or_else(|| a.get("new_text")))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
+
+                state.add_edit_detail_raw(file_path, old_string, new_string, ts);
+            }
+            Self::Shell => {
+                let command = args
+                    .and_then(|a| a.get("command").or_else(|| a.get("cmd")))
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("");
+                let description = args
+                    .and_then(|a| a.get("description"))
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("");
+
+                state.add_run_command(command, description, ts);
+            }
+            Self::TodoWrite => state.tool_counts.todo_write += 1,
+            Self::ReadManyFiles => state.tool_counts.read += 1,
         }
-        "run_command" | "run_shell_command" | "execute_command" | "shell" => args
-            .and_then(|args| args.get("command").or_else(|| args.get("cmd")))
-            .and_then(Value::as_str)
-            .is_some_and(|command| !command.trim().is_empty()),
-        "write_todos" | "read_many_files" => true,
-        _ => false,
     }
 }
 
 fn record_message_diagnostics(message: &GeminiAnalysisMessage, diagnostics: &mut ParseDiagnostics) {
     for tool_call in &message.tool_calls {
-        let Some(name) = tool_call.get("name").and_then(Value::as_str) else {
+        let Some(tool) = tool_call
+            .get("name")
+            .and_then(Value::as_str)
+            .and_then(TrackedTool::from_name)
+        else {
             continue;
         };
-        if !matches!(
-            name,
-            "read_file"
-                | "write_file"
-                | "create_file"
-                | "edit_file"
-                | "replace_in_file"
-                | "replace"
-                | "run_command"
-                | "run_shell_command"
-                | "execute_command"
-                | "shell"
-                | "write_todos"
-                | "read_many_files"
-        ) {
-            continue;
-        }
         let normalized = match gemini_tool_status(tool_call) {
-            GeminiToolStatus::Success => tracked_tool_schema_supported(name, tool_call),
+            GeminiToolStatus::Success => tool.schema_supported(tool_call),
             GeminiToolStatus::Failed => true,
             GeminiToolStatus::Pending | GeminiToolStatus::Unsupported => false,
         };
@@ -393,101 +495,23 @@ fn process_gemini_message(state: &mut SessionParseState, message: &GeminiAnalysi
     }
 
     for tool_call in &message.tool_calls {
-        let Some(name) = tool_call.get("name").and_then(|n| n.as_str()) else {
+        let Some(tool) = tool_call
+            .get("name")
+            .and_then(|n| n.as_str())
+            .and_then(TrackedTool::from_name)
+        else {
             continue;
         };
         let status = gemini_tool_status(tool_call);
         if status == GeminiToolStatus::Unsupported {
             continue;
         }
-        if status != GeminiToolStatus::Success {
-            record_tool_invocation(state, name);
-            continue;
-        }
-        if !tracked_tool_schema_supported(name, tool_call) {
-            record_tool_invocation(state, name);
+        if status != GeminiToolStatus::Success || !tool.schema_supported(tool_call) {
+            tool.record_invocation(state);
             continue;
         }
 
-        let args = tool_call.get("args");
-
-        match name {
-            "read_file" => {
-                state.tool_counts.read += 1;
-                let file_path = args
-                    .and_then(|a| a.get("file_path"))
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("");
-
-                if let Some(content) = tool_result_output(tool_call) {
-                    attach_read_detail(state, file_path, content, ts);
-                }
-            }
-            "write_file" | "create_file" => {
-                let file_path = args
-                    .and_then(|a| a.get("file_path"))
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("");
-                let content = args
-                    .and_then(|a| a.get("content"))
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("");
-
-                state.add_write_detail(file_path, content, ts);
-            }
-            // Current Gemini CLI emits `replace`; `edit_file` /
-            // `replace_in_file` were the historical names and are kept
-            // here as best-effort aliases in case older sessions are
-            // still being replayed through `vct analysis <file>`.
-            "edit_file" | "replace_in_file" | "replace" => {
-                let file_path = args
-                    .and_then(|a| a.get("file_path"))
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("");
-                let old_string = args
-                    .and_then(|a| a.get("old_string").or_else(|| a.get("old_text")))
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("");
-                let new_string = args
-                    .and_then(|a| a.get("new_string").or_else(|| a.get("new_text")))
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("");
-
-                state.add_edit_detail_raw(file_path, old_string, new_string, ts);
-            }
-            "run_command" | "run_shell_command" | "execute_command" | "shell" => {
-                let command = args
-                    .and_then(|a| a.get("command").or_else(|| a.get("cmd")))
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("");
-                let description = args
-                    .and_then(|a| a.get("description"))
-                    .and_then(|d| d.as_str())
-                    .unwrap_or("");
-
-                state.add_run_command(command, description, ts);
-            }
-            "write_todos" => state.tool_counts.todo_write += 1,
-            "read_many_files" => state.tool_counts.read += 1,
-            // Unreachable: `tracked_tool_schema_supported` accepts only the
-            // names matched above.
-            _ => {}
-        }
-    }
-}
-
-fn record_tool_invocation(state: &mut SessionParseState, name: &str) {
-    match name {
-        "read_file" | "read_many_files" => state.tool_counts.read += 1,
-        "write_file" | "create_file" => state.tool_counts.write += 1,
-        "edit_file" | "replace_in_file" | "replace" => state.tool_counts.edit += 1,
-        "run_command" | "run_shell_command" | "execute_command" | "shell" => {
-            state.tool_counts.bash += 1;
-        }
-        "write_todos" => state.tool_counts.todo_write += 1,
-        // Meta tools (`update_topic`, `task_complete`, …) carry no
-        // file-operation data.
-        _ => {}
+        tool.record_operation(state, tool_call, ts);
     }
 }
 
@@ -654,6 +678,88 @@ mod tests {
         assert_eq!(counts.bash, 1);
         assert_eq!(counts.todo_write, 1);
         assert_eq!(counts.read, 1);
+    }
+
+    #[test]
+    fn every_tracked_name_folds_into_its_own_metric() {
+        // `TrackedTool::from_name` is the only place these names are spelled
+        // now, so an alias moved to the wrong variant no longer contradicts a
+        // second list a reader could hold it against. This is what catches it.
+        // An exhaustive `match self` rejects a variant a fold forgot, never a
+        // variant it folded into the wrong counter, which is what these
+        // expectations pin down.
+        // Counters in order: read, write, edit, bash, todo_write.
+        let cases = [
+            ("read_file", [1, 0, 0, 0, 0]),
+            ("read_many_files", [1, 0, 0, 0, 0]),
+            ("write_file", [0, 1, 0, 0, 0]),
+            ("create_file", [0, 1, 0, 0, 0]),
+            ("edit_file", [0, 0, 1, 0, 0]),
+            ("replace_in_file", [0, 0, 1, 0, 0]),
+            ("replace", [0, 0, 1, 0, 0]),
+            ("run_command", [0, 0, 0, 1, 0]),
+            ("run_shell_command", [0, 0, 0, 1, 0]),
+            ("execute_command", [0, 0, 0, 1, 0]),
+            ("shell", [0, 0, 0, 1, 0]),
+            ("write_todos", [0, 0, 0, 0, 1]),
+            // A meta tool stays untracked and moves no counter.
+            ("update_topic", [0, 0, 0, 0, 0]),
+        ];
+
+        // A successful call folds through `record_operation`, a failed one
+        // through `record_invocation`. They are separate matches, and a name
+        // must reach the same counter either way.
+        for status in ["success", "error"] {
+            for (name, expected) in cases {
+                // A superset of arguments, so whichever schema check applies to
+                // the name is satisfied and a successful call really does take
+                // the operation path instead of degrading to an invocation.
+                let message = assistant(
+                    "message-1",
+                    "gemini-test",
+                    10,
+                    json!([{
+                        "name": name,
+                        "status": status,
+                        "args": {
+                            "file_path": "/tmp/a.txt",
+                            "content": "one",
+                            "old_string": "one",
+                            "new_string": "two",
+                            "command": "true"
+                        },
+                        "result": [{
+                            "functionResponse": { "response": { "output": "one" } }
+                        }]
+                    }]),
+                );
+
+                let parsed = parse_gemini_events_with_diagnostics(
+                    session(),
+                    vec![message],
+                    ParseMode::Full,
+                    None,
+                )
+                .unwrap();
+                let counts = &parsed.analysis.records[0].tool_call_counts;
+                assert_eq!(
+                    [
+                        counts.read,
+                        counts.write,
+                        counts.edit,
+                        counts.bash,
+                        counts.todo_write
+                    ],
+                    expected,
+                    "{name} ({status}) folded into the wrong metric"
+                );
+                assert_eq!(
+                    parsed.diagnostics.partial_failure_count(),
+                    0,
+                    "{name} ({status}) must not raise schema drift"
+                );
+            }
+        }
     }
 
     #[test]
