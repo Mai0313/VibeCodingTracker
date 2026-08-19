@@ -116,7 +116,9 @@ pub fn read_opencode_analysis(
     }
     // Records and tool parts are different units: one message can carry many
     // parts, so adding them together reports a part count as a record count.
-    let failed_records = result.expected_records.saturating_sub(result.parsed_records);
+    let failed_records = result
+        .expected_records
+        .saturating_sub(result.parsed_records);
     if failed_records > 0 {
         log::warn!("skipped {failed_records} OpenCode analysis records with unsupported schema");
     }
