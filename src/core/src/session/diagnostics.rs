@@ -71,14 +71,20 @@ impl ParseDiagnostics {
 
 /// Reason string for a source that parsed but skipped some records.
 ///
-/// Worded so every surface that shows it (per-source warnings, stderr
-/// summaries) states that the recognized records were still counted — a
-/// partial skip is not a dropped source.
+/// The `partially parsed:` prefix is a contract, not phrasing:
+/// [`is_partial_failure_reason`] matches it to pick the per-source log wording
+/// that keeps a partial skip from reading as a dropped source. The tail is
+/// shown verbatim in the CLI's stderr scan summary, so it has to stand on its
+/// own there; rewording the tail is free, changing the prefix silently breaks
+/// that match.
 pub(crate) fn partial_failure_reason(count: usize) -> String {
     format!("partially parsed: skipped {count} malformed or unsupported analyzer records")
 }
 
 /// Whether a stored failure reason describes a partial (data-retained) parse.
+///
+/// Recognizes only the prefix [`partial_failure_reason`] writes; any other
+/// reason is a source that produced nothing.
 pub(crate) fn is_partial_failure_reason(reason: &str) -> bool {
     reason.starts_with("partially parsed:")
 }
@@ -99,9 +105,10 @@ pub(crate) struct DatabaseAnalysisRow {
 
 /// Typed token buckets produced by database-backed usage readers.
 ///
-/// SQLite rows stay in this scalar form through the incremental cache. The
-/// compatibility wrappers materialize the historical JSON object only at the
-/// public API boundary.
+/// SQLite rows stay in this scalar form through the incremental cache, so a
+/// cached source costs no per-row JSON object. Callers materialize the
+/// historical JSON shape with [`Self::into_value`] only where they fold into a
+/// map that is already `Value`-keyed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct UsageTokenContribution {
     pub(crate) input_tokens: i64,
