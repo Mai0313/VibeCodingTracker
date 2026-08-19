@@ -285,7 +285,7 @@ Totals (by Provider)
 ]
 ```
 
-無論來源 provider 為何，每一列都會輸出相同的扁平 token 欄位（Codex 內部的巢狀結構會在輸出前正規化）。
+無論來源 provider 為何，每一列都會輸出相同的扁平 token 欄位（Codex 內部的巢狀結構會在輸出前正規化）。若某個 provider 計費的 bucket 是其他 provider 沒有的，該列會額外帶上自己的 key：實際用掉 tool token 的 Gemini 列會帶 `tool_tokens`，LiteLLM 沒有對應費率，只計入 `total_tokens`。
 
 ### 掃描範圍
 

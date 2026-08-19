@@ -285,7 +285,7 @@ Totals (by Provider)
 ]
 ```
 
-无论来源 provider 是什么，每一行都会输出相同的扁平 token 字段（Codex 内部的嵌套结构会在输出前规范化）。
+无论来源 provider 是什么，每一行都会输出相同的扁平 token 字段（Codex 内部的嵌套结构会在输出前规范化）。若某个 provider 计费的 bucket 是其他 provider 没有的，该行会额外带上自己的 key：实际用掉 tool token 的 Gemini 行会带 `tool_tokens`，LiteLLM 没有对应费率，只计入 `total_tokens`。
 
 ### 扫描范围
 

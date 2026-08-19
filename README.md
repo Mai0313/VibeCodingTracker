@@ -285,7 +285,7 @@ Totals (by Provider)
 ]
 ```
 
-Every row serializes the same flat token fields regardless of provider (Codex's internal nested shape is normalized before output).
+Every row serializes the same flat token fields regardless of provider (Codex's internal nested shape is normalized before output). A provider that bills a bucket the others don't have adds its own key: a Gemini row that spent tool tokens carries `tool_tokens`, which LiteLLM has no rate for and which are counted in `total_tokens` alone.
 
 ### What It Scans
 
