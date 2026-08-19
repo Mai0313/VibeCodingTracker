@@ -1,15 +1,15 @@
 //! Per-request context-tier classification support.
 //!
-//! LiteLLM publishes `*_above_Nk_tokens` price tiers whose real billing
-//! semantics are **per request**: a request is promoted to the tier rate only
-//! when its own prompt context exceeds the threshold. The usage aggregator,
-//! however, merges tokens across records, files, and sessions before pricing,
-//! so tier selection at pricing time would compare the threshold against a
-//! cumulative figure and promote a whole month of small requests to the
-//! elevated rate.
+//! LiteLLM publishes `*_above_Nk_tokens` price tiers and `tiered_pricing`
+//! ranges whose real billing semantics are **per request**: a request is
+//! promoted to the higher rate only when its own prompt context exceeds the
+//! boundary. The usage aggregator, however, merges tokens across records,
+//! files, and sessions before pricing, so selection at pricing time would
+//! compare the boundary against a cumulative figure and promote a whole month
+//! of small requests to the elevated rate.
 //!
-//! [`TierThresholds`] is a `Send + Sync` snapshot of "model → lowest tier
-//! threshold" derived from a [`ModelPricingMap`](super::ModelPricingMap). The
+//! [`TierThresholds`] is a `Send + Sync` snapshot of "model → second price
+//! level's boundary" derived from a [`ModelPricingMap`](super::ModelPricingMap). The
 //! usage scan hands it to the session parsers, which classify each request as
 //! it is folded and accumulate the above-threshold slice into a separate
 //! `above_tier` bucket that `calculate_cost` bills at the tier rate. Parsers
@@ -20,12 +20,19 @@ use crate::constants::FastHashMap;
 use crate::pricing::normalize_model_name;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
-/// Immutable "model → lowest context-tier threshold (tokens)" snapshot.
+/// Immutable "model → context-tier threshold (tokens)" snapshot.
 ///
 /// Keys are stored both as the LiteLLM key lowercased and as its normalized
 /// form, so the session-log model names (`gpt-5.4`, `azure/gpt-5.5`,
 /// `claude-sonnet-5`) resolve without re-implementing the full pricing match
 /// chain. A model that resolves to no entry simply has no tier.
+///
+/// A threshold means the same thing to a classifier whichever pricing strategy
+/// produced it — "above this, the second price level applies" — but the two
+/// strategies read it back against different price rows, so a normalized
+/// collision between a range-based and a threshold-based model would classify
+/// one of them against the other's boundary. No such collision exists in the
+/// LiteLLM data today.
 #[derive(Debug, Default)]
 pub struct TierThresholds {
     thresholds: FastHashMap<Box<str>, i64>,
@@ -33,7 +40,7 @@ pub struct TierThresholds {
 }
 
 impl TierThresholds {
-    /// Builds the snapshot from `(model key, lowest threshold)` pairs.
+    /// Builds the snapshot from `(model key, threshold)` pairs.
     ///
     /// On key collisions (e.g. `openai/gpt-5.4` and `azure/gpt-5.4`
     /// normalizing to the same name) the smallest threshold wins — the
@@ -66,8 +73,8 @@ impl TierThresholds {
         }
     }
 
-    /// Lowest tier threshold for `model`, or `None` when the model has no
-    /// context tier (or cannot be resolved).
+    /// Tier threshold for `model`, or `None` when the model has a single
+    /// price level (or cannot be resolved).
     pub fn threshold_for(&self, model: &str) -> Option<i64> {
         if self.thresholds.is_empty() {
             return None;

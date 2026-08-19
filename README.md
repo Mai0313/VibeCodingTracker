@@ -681,7 +681,7 @@ Generic placeholder names (e.g. `default`, what cursor-agent records for auto-mo
 
 ### Cost Details
 
-- **Context tiers are per request**: LiteLLM's "above Nk tokens" rates (e.g. GPT-5.x above 272k, Gemini above 200k) apply only to requests whose own prompt context crossed the threshold. Providers without per-request granularity — and offline scans — bill at base rates, so tiered-model costs are a lower bound there.
+- **Context tiers are per request**: LiteLLM's "above Nk tokens" rates (e.g. GPT-5.x above 272k, Gemini above 200k) and its Qwen / doubao volume rows alike apply only to requests whose own prompt context crossed the boundary — never to a whole scan's token sum. Providers without per-request granularity — and offline scans — bill at the lowest rate, so tiered-model costs are a lower bound there.
 - **Beyond tokens**: Claude web-search tool calls (`server_tool_use.web_search_requests`) are billed per query on top of the token cost; every other model's per-query charge is $0.
 - **OpenCode**: a novel model name is priced from its tokens only on an **exact** LiteLLM match; with no exact match, vct trusts the assistant message's own stored cost instead of guessing from a loosely-similar name.
 - **Hermes**: priced the same way as OpenCode — an **exact** LiteLLM match prices from tokens, otherwise vct uses Hermes's own stored cost.
