@@ -69,10 +69,11 @@ pub fn price_usage_data(
 ///
 /// The merged row is priced by summing each provider's own portion under that
 /// provider's cost basis (LiteLLM for the file providers, an exact match else
-/// the stored cost for OpenCode / Hermes / Cursor, LiteLLM with an input-rate
-/// fallback for Grok's cache-read gauge), so OpenCode's stored cost applies only
-/// to OpenCode's own tokens even when another provider shares the row. Returns
-/// `None` when no provider bucket holds `model`.
+/// the stored cost for OpenCode / Hermes, an exact match else `$0` for Cursor's
+/// local estimate, LiteLLM with an input-rate fallback for Grok's cache-read
+/// gauge), so OpenCode's stored cost applies only to OpenCode's own tokens even
+/// when another provider shares the row. Returns `None` when no provider bucket
+/// holds `model`.
 pub(crate) fn resolve_merged_model_cost(
     model: &str,
     per_provider: &PerProviderUsage,
@@ -101,8 +102,6 @@ pub(crate) fn resolve_merged_model_cost(
         }
     }
 
-    // Cursor passes `OpenCodeStored(0.0)`: a local token estimate takes an exact
-    // LiteLLM price when there is one and otherwise stays unpriced.
     let stored =
         |m: &crate::constants::FastHashMap<String, f64>| m.get(model).copied().unwrap_or(0.0);
     for (usage, source) in [
@@ -111,7 +110,7 @@ pub(crate) fn resolve_merged_model_cost(
             &per_provider.opencode,
             CostSource::OpenCodeStored(stored(&stored_costs.opencode)),
         ),
-        (&per_provider.cursor, CostSource::OpenCodeStored(0.0)),
+        (&per_provider.cursor, CostSource::CursorEstimate),
         (
             &per_provider.hermes,
             CostSource::HermesStored(stored(&stored_costs.hermes)),

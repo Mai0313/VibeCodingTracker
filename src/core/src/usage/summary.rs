@@ -36,7 +36,7 @@ impl ProviderPricing<'_> {
             Self::Litellm => CostSource::Litellm,
             Self::GrokGauge => CostSource::GrokGauge,
             Self::OpenCode(m) => CostSource::OpenCodeStored(stored(m)),
-            Self::CursorEstimate => CostSource::OpenCodeStored(0.0),
+            Self::CursorEstimate => CostSource::CursorEstimate,
             Self::Hermes(m) => CostSource::HermesStored(stored(m)),
         }
     }
@@ -537,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn cursor_row_uses_exact_litellm_price_and_ignores_legacy_stored_cost() {
+    fn cursor_row_uses_exact_litellm_price() {
         clear_pricing_cache();
 
         // An exact LiteLLM price exists for the model Cursor reports.
@@ -559,18 +559,12 @@ mod tests {
             .cursor
             .insert("gemini-2.5-pro".to_string(), json!({"input_tokens": 1000}));
 
-        // A legacy caller may still populate the retained public field.
-        let mut stored_costs = StoredCosts::default();
-        stored_costs
-            .cursor
-            .insert("gemini-2.5-pro".to_string(), 0.3425);
-
         let summary = build_usage_summary(
             &usage_data,
             &per_provider,
             &ProviderActiveDays::default(),
             &pricing_map,
-            &stored_costs,
+            &StoredCosts::default(),
         );
 
         assert_eq!(summary.rows.len(), 1);
@@ -578,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn stored_costs_do_not_cross_contaminate_on_name_collision() {
+    fn stored_cost_prices_only_its_own_providers_share_of_a_merged_row() {
         clear_pricing_cache();
         // Empty pricing: OpenCode falls back to its stored cost while Cursor's
         // local estimate stays unpriced.
@@ -598,7 +592,6 @@ mod tests {
 
         let mut stored_costs = StoredCosts::default();
         stored_costs.opencode.insert("collide".to_string(), 5.0);
-        stored_costs.cursor.insert("collide".to_string(), 3.0);
 
         let summary = build_usage_summary(
             &usage_data,

@@ -235,15 +235,10 @@ fn assert_usage_data_eq(actual: &UsageData, expected: &UsageData) {
         assert_eq!(actual_days, expected_days, "{provider} active days differ");
     }
 
-    let StoredCosts {
-        opencode,
-        cursor,
-        hermes,
-    } = stored_costs;
+    let StoredCosts { opencode, hermes } = stored_costs;
     let other = &expected.stored_costs;
     for (provider, actual_costs, expected_costs) in [
         ("OpenCode", opencode, &other.opencode),
-        ("Cursor", cursor, &other.cursor),
         ("Hermes", hermes, &other.hermes),
     ] {
         assert_eq!(
