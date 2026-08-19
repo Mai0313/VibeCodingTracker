@@ -7,13 +7,13 @@
 
 /// Hash map backed by `ahash` for fast, non-cryptographic hashing.
 ///
-/// Used in place of `std::collections::HashMap` throughout the crate; every key
-/// is process-local rather than attacker-controlled, so DoS resistance is not
-/// required.
+/// Used in place of `std::collections::HashMap` on the hot aggregation paths;
+/// every key is process-local rather than attacker-controlled, so DoS
+/// resistance is not required.
 pub type FastHashMap<K, V> = ahash::AHashMap<K, V>;
 
 /// Hash set backed by `ahash`, replacing `std::collections::HashSet` on the
-/// same grounds as [`FastHashMap`].
+/// same paths and the same grounds as [`FastHashMap`].
 pub type FastHashSet<T> = ahash::AHashSet<T>;
 
 /// Pre-allocation capacity hints to minimize reallocation overhead.

@@ -173,10 +173,11 @@ fn resolve_hermes_home(
 /// environment variable.
 ///
 /// Every provider takes its home-relative default (`~/.config/cursor`,
-/// `~/.local/share/opencode`, `~/.hermes`, `~/.grok`, `~/.dsh`) — what
-/// [`resolve_paths`] falls back to when none of the env vars are set. This is
-/// the seam tests use to point every path at a temp directory instead of
-/// mutating process-global `HOME` / `XDG_*` state.
+/// `~/.local/share/opencode`, `~/.hermes`, `~/.grok`, `~/.dsh`), which is what
+/// [`resolve_paths`] falls back to with none of the env vars set — except on
+/// Windows, where it puts Hermes under `%LOCALAPPDATA%` instead. This is the
+/// seam tests use to point every path at a temp directory instead of mutating
+/// process-global `HOME` / `XDG_*` state.
 pub fn resolve_paths_from_home(home_dir: &Path) -> HelperPaths {
     build_paths(home_dir, None, None, None, None, None)
 }
@@ -257,9 +258,9 @@ fn build_paths(
 
 /// Whether `VCT_OFFLINE` is set to a non-empty value.
 ///
-/// The pricing fetch degrades to today's cache or an empty map, and the update
-/// paths (`vct update --check` and the startup auto-update) skip the GitHub
-/// probe. The quota fetchers do not consult this.
+/// The pricing fetch degrades to today's cache or an empty map, and every
+/// update path but `vct update --force` skips the GitHub probe. The quota
+/// fetchers do not consult this.
 pub fn network_disabled() -> bool {
     std::env::var_os("VCT_OFFLINE").is_some_and(|v| !v.is_empty())
 }

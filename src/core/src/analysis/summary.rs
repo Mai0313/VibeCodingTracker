@@ -74,6 +74,7 @@ impl AnalysisProviderStats {
     }
 }
 
+/// Per-provider analysis totals, including the "All Providers" bucket.
 pub type AnalysisProviderTotals = crate::models::ProviderTotals<AnalysisProviderStats>;
 
 /// Calculate per-provider analysis totals using **source-directory**

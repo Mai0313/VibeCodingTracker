@@ -138,7 +138,7 @@ impl ProviderStats {
     }
 }
 
-/// Type alias for usage totals grouped by provider.
+/// Per-provider usage totals, including the "All Providers" bucket.
 pub type UsageProviderTotals = crate::models::ProviderTotals<ProviderStats>;
 
 /// Fully priced usage view shared by every output mode.

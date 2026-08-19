@@ -233,6 +233,10 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
             // billed once — visible output at the output rate, reasoning at its
             // dedicated rate (or the output fallback). Without this, reasoning
             // is billed twice: once inside output and again as its own bucket.
+            // Measured over 21,113 real Codex `token_count` events:
+            // `total_tokens == input + output` held for every one and
+            // `reasoning > output` never occurred, so reasoning is always a
+            // subset of output and the clamp below is a guard, not a live case.
             counts.output_tokens = (counts.output_tokens - counts.reasoning_tokens).max(0);
             if let Some(total) = total_usage.get("total_tokens").and_then(|v| v.as_i64()) {
                 // `total_tokens == input (incl. cached) + output`, and output

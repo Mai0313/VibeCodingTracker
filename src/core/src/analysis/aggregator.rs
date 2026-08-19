@@ -164,8 +164,9 @@ impl Serialize for AnalysisDataset {
 /// Aggregate file-operation metrics across every provider's session files,
 /// keyed by model.
 ///
-/// Scans every provider's session files or database, sums tool-call counts and
-/// line counts by model within `time_range`, and returns rows sorted by model
+/// Scans every provider's session files or database except Hermes, which is
+/// usage-only and has no analysis reader, sums tool-call counts and line
+/// counts by model within `time_range`, and returns rows sorted by model
 /// name alongside per-provider active-day counts. Parsed sessions are folded
 /// directly into the compact summary in [`ParseMode::UsageOnly`], so this path
 /// never retains a cross-provider [`AnalysisDataset`]. A missing provider
@@ -312,6 +313,9 @@ pub fn collect_analysis_sessions_from_paths_with(
 ///
 /// Both the canonical collector and the summary projection go through here, so
 /// source discovery, diagnostics, and ordering stay identical between them.
+/// The collector's visitor retains every session; the projection's folds each
+/// one and drops it, which is what keeps the summary path off a cross-provider
+/// dataset.
 fn visit_analysis_sessions_from_paths_with<F>(
     paths: &HelperPaths,
     time_range: TimeRange,
