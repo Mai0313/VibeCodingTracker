@@ -20,10 +20,9 @@ use serde_json::Value;
 ///
 /// `session` carries the first-line meta record (`sessionId` etc.), and
 /// `events` yields one parsed JSON value per subsequent line. The parser
-/// deduplicates append-only revisions into the historical message set, then
-/// deserializes each `type == "gemini"` message into [`GeminiMessage`]. User
-/// and info messages remain in the set for ordering but do not contribute
-/// metrics.
+/// deduplicates append-only revisions (including `$set.messages` snapshots)
+/// into the historical message set, which holds `type == "gemini"` messages
+/// only; every other event just moves a diagnostics counter.
 ///
 /// This is the only supported Gemini entry point — legacy single-object
 /// exports (`chats/<session>.json` with an inline `messages` array) are no
@@ -33,7 +32,8 @@ use serde_json::Value;
 ///
 /// Returns `anyhow::Result` for parity with the other provider parsers, but
 /// has no fallible step. Non-`gemini` events are skipped, and unsupported
-/// Gemini message schemas are logged before being skipped.
+/// Gemini message schemas only land in the parse diagnostics this wrapper
+/// discards.
 pub fn parse_gemini_events<I>(
     session: GeminiSession,
     events: I,
@@ -89,8 +89,8 @@ struct GeminiMessageAnalysis {
 
 /// Minimal Gemini message shape needed by analysis.
 ///
-/// Deliberately omits user content and thoughts so `UsageOnly` never retains
-/// those large fields while deduplicating revisions.
+/// Deliberately omits `content` and `thoughts` so neither mode retains those
+/// large fields while deduplicating revisions.
 #[derive(Deserialize)]
 struct GeminiAnalysisMessage {
     #[serde(default)]
@@ -358,16 +358,15 @@ fn record_message_diagnostics(message: &GeminiAnalysisMessage, diagnostics: &mut
 }
 
 /// Converts the accumulated state into a single-record [`CodeAnalysis`],
-/// stamping the `task_id` from the session meta and resolving the git remote
-/// from the process working directory when none was captured.
+/// stamping the `task_id` from the session meta.
 fn finalize_record(
     mut state: SessionParseState,
     conversation_usage: FastHashMap<String, Value>,
     session_id: String,
 ) -> CodeAnalysis {
-    // Gemini CLI does not record the invoking `cwd` in its log format today;
-    // fall back to querying git from the process's current dir so the usage
-    // report still stamps a remote URL when running inside a repo.
+    // Gemini CLI does not record the invoking `cwd` in its log format today, so
+    // `folder_path` is empty here and this resolves to an empty remote; it only
+    // yields a URL if a future log format carries a workspace path.
     if state.git_remote.is_empty() {
         state.git_remote = get_git_remote_url(&state.folder_path);
     }
@@ -424,7 +423,6 @@ fn process_gemini_message(state: &mut SessionParseState, message: &GeminiAnalysi
                     .and_then(|p| p.as_str())
                     .unwrap_or("");
 
-                // Content sits at result[0].functionResponse.response.output
                 if let Some(content) = tool_result_output(tool_call) {
                     attach_read_detail(state, file_path, content, ts);
                 }
@@ -475,8 +473,8 @@ fn process_gemini_message(state: &mut SessionParseState, message: &GeminiAnalysi
             }
             "write_todos" => state.tool_counts.todo_write += 1,
             "read_many_files" => state.tool_counts.read += 1,
-            // Meta tools like `update_topic` / `task_complete` carry no
-            // file-operation data; ignore them silently.
+            // Unreachable: `tracked_tool_schema_supported` accepts only the
+            // names matched above.
             _ => {}
         }
     }
@@ -491,10 +489,14 @@ fn record_tool_invocation(state: &mut SessionParseState, name: &str) {
             state.tool_counts.bash += 1;
         }
         "write_todos" => state.tool_counts.todo_write += 1,
+        // Meta tools (`update_topic`, `task_complete`, …) carry no
+        // file-operation data.
         _ => {}
     }
 }
 
+/// Attaches read content without letting `add_read_detail` increment the read
+/// count the caller already recorded.
 fn attach_read_detail(state: &mut SessionParseState, path: &str, content: &str, ts: i64) {
     let invocation_count = state.tool_counts.read;
     state.add_read_detail(path, content, ts);
