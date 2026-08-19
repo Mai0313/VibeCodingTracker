@@ -1549,41 +1549,73 @@ fn test_analysis_with_invalid_json() {
 }
 
 #[test]
-fn test_analysis_aggregation_logic() {
+fn analysis_rows_sum_repeated_sessions_for_one_model() {
     use vct_core::analysis::aggregator::AggregatedAnalysisRow;
 
-    let rows = [
-        AggregatedAnalysisRow {
-            model: "claude-sonnet-4".to_string(),
-            edit_lines: 50,
-            read_lines: 100,
-            write_lines: 25,
-            bash_count: 5,
-            edit_count: 10,
-            read_count: 15,
-            todo_write_count: 2,
-            write_count: 3,
-        },
-        AggregatedAnalysisRow {
-            model: "claude-sonnet-4".to_string(),
-            edit_lines: 50,
-            read_lines: 100,
-            write_lines: 25,
-            bash_count: 5,
-            edit_count: 10,
-            read_count: 15,
-            todo_write_count: 3,
-            write_count: 5,
-        },
-    ];
+    /// Every counter of a row. Destructured rather than read field by field, so
+    /// a counter added later is a compile error here instead of a field the
+    /// doubling assertion silently skips.
+    fn counters(row: &AggregatedAnalysisRow) -> [usize; 8] {
+        let AggregatedAnalysisRow {
+            model: _,
+            edit_lines,
+            read_lines,
+            write_lines,
+            bash_count,
+            edit_count,
+            read_count,
+            todo_write_count,
+            write_count,
+        } = *row;
+        [
+            edit_lines,
+            read_lines,
+            write_lines,
+            bash_count,
+            edit_count,
+            read_count,
+            todo_write_count,
+            write_count,
+        ]
+    }
 
-    let total_edit_lines: usize = rows.iter().map(|r| r.edit_lines).sum();
-    let total_read_lines: usize = rows.iter().map(|r| r.read_lines).sum();
-    let total_write_lines: usize = rows.iter().map(|r| r.write_lines).sum();
+    let session = fixture_str("sessions/claude_code.jsonl");
+    const MODEL: &str = "claude-sonnet-4-20250514";
 
-    assert_eq!(total_edit_lines, 100);
-    assert_eq!(total_read_lines, 200);
-    assert_eq!(total_write_lines, 50);
+    let one = TempHome::new();
+    one.put_claude_session("proj", "session.jsonl", &session);
+    let single = aggregate_sessions_by_model_from_paths(&one.paths, TimeRange::All)
+        .expect("aggregate one session");
+    let single_row = single
+        .rows
+        .iter()
+        .find(|row| row.model == MODEL)
+        .expect("a row for the fixture's model");
+    assert!(
+        counters(single_row).iter().all(|count| *count > 0),
+        "the fixture must exercise every counter for the doubling to mean anything, got: {:?}",
+        counters(single_row)
+    );
+
+    // The same session recorded twice: the aggregator folds both into one row
+    // per model, so every counter doubles.
+    let two = TempHome::new();
+    two.put_claude_session("proj", "session.jsonl", &session);
+    two.put_claude_session("proj", "second.jsonl", &session);
+    let doubled = aggregate_sessions_by_model_from_paths(&two.paths, TimeRange::All)
+        .expect("aggregate two sessions");
+    assert_eq!(
+        doubled.rows.len(),
+        single.rows.len(),
+        "the second session must not open a second row"
+    );
+    let doubled_row = doubled
+        .rows
+        .iter()
+        .find(|row| row.model == MODEL)
+        .expect("a row for the fixture's model");
+
+    assert_eq!(counters(doubled_row), counters(single_row).map(|c| c * 2));
 }
 
 /// Writes a Claude session whose first line is a metadata sentinel carrying no
