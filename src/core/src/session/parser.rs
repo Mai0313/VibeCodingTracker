@@ -25,8 +25,9 @@ use std::rc::Rc;
 
 /// Content-safe warning summary used by the CLI's single-file path.
 ///
-/// This type is public only because Cargo builds `src/main.rs` as a separate
-/// crate from the library. Provider diagnostics remain crate-private.
+/// Public only because the binary is a separate workspace crate and so can
+/// reach nothing narrower than `pub`. The richer provider diagnostics stay
+/// crate-private.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SessionFileParseDiagnostics {
@@ -34,8 +35,9 @@ pub struct SessionFileParseDiagnostics {
 }
 
 impl SessionFileParseDiagnostics {
-    /// Number of malformed, unrecognized, or analyzer-relevant records skipped
-    /// after another record from the same source was recognized successfully.
+    /// Number of malformed, unrecognized, or unsupported analyzer records that
+    /// an otherwise-successful parse skipped. Zero when the whole source
+    /// failed, since that surfaces as an error instead.
     pub fn skipped_records(self) -> usize {
         self.skipped_records
     }
@@ -97,15 +99,12 @@ impl ParseWarningSummary {
 }
 
 /// Parses a session file (JSONL or JSON) and returns the result as a
-/// `serde_json::Value` (the CLI single-file dump path).
+/// `serde_json::Value`.
 ///
-/// Internally this is a thin wrapper over [`parse_session_file_typed`]; the
-/// conversion to `Value` happens once at the edge here rather than inside the
-/// cache, which keeps long sessions from being duplicated between typed and
-/// `Value` forms when multiple commands run against the same file.
-///
-/// An empty input yields `{}` (not a populated-but-empty `CodeAnalysis`), to
-/// preserve historical CLI behaviour.
+/// A thin wrapper over [`parse_session_file_typed`], kept for library callers
+/// and the golden tests; the CLI's own single-file path goes through
+/// `parse_session_file_with_diagnostics`. An empty input yields `{}` (not a
+/// populated-but-empty `CodeAnalysis`), to preserve historical CLI behaviour.
 ///
 /// # Errors
 ///
@@ -125,8 +124,8 @@ impl ParseWarningSummary {
 pub fn parse_session_file_to_value<P: AsRef<Path>>(path: P) -> Result<Value> {
     let analysis = parse_session_file_typed(path)?;
     if analysis.records.is_empty() && analysis.extension_name.is_empty() {
-        // Preserve historical behaviour: empty input → `{}` rather than a
-        // fully-populated but empty `CodeAnalysis` object.
+        // Empty input never reaches `finalize`, so a blank `extension_name`
+        // is what marks it.
         return Ok(serde_json::json!({}));
     }
     Ok(serde_json::to_value(&analysis)?)
@@ -524,18 +523,18 @@ where
 ///
 /// Reads JSONL records one line at a time and feeds a stateful classifier that
 /// commits to a provider as soon as any record carries a distinctive marker.
-/// Because the classifier returns `None` when it has not seen a positive
-/// signal yet, we simply keep peeking until one appears (or EOF). There is
-/// no arbitrary upper bound on how long a Claude metadata preamble may
-/// be — previously a 7+ line preamble silently mis-classified the whole
-/// session as Codex because the 8-record peek window ran out before the
-/// first `parentUuid` record was read.
+/// The classifier returns `None` until it sees a positive signal, so this loop
+/// keeps peeking until one appears (or EOF): a Claude metadata preamble has no
+/// bounded length, and the previous fixed 8-record peek window silently
+/// mis-classified any session whose first `parentUuid` record sat past it as
+/// Codex, dropping that session's usage.
 ///
-/// If the entire file is consumed without any marker firing, the default
-/// is Codex: Codex rollout logs usually contain one of the recognised
-/// `type` values (`session_meta`, `turn_context`, …) so a synthetic file
-/// with no markers is most likely a deliberately-empty Codex fixture
-/// rather than a silently-broken Claude log.
+/// If the entire file is consumed without any marker firing, the default is
+/// Codex. The recorded reason is a likelihood tradeoff rather than a proof: a
+/// real Codex rollout log does carry one of the recognised `type` values, so a
+/// file with no marker at all is more likely a deliberately-empty Codex fixture
+/// than a silently-broken Claude log. Nothing in the marker set forces that
+/// answer — treat it as the tie-break it is.
 ///
 /// Returns `Ok(None)` when the file is empty or its first line is not JSON
 /// (a pretty-printed dump), signalling the caller to use the `read_json`
@@ -570,21 +569,17 @@ fn stream_parse_autodetect(path: &Path, mode: ParseMode) -> Result<Option<Parsed
                 first_line_was_json.get_or_insert(true);
                 let classification = classifier.push(&v);
                 buffered.push(v);
-                // Each record is inspected once by the stateful classifier.
-                // As soon as it has a confident verdict, hand the buffered
-                // prefix and remaining reader to the dispatcher.
                 if let Some(found) = classification {
                     ext = Some(found);
                     break;
                 }
             }
             Err(err) => {
-                // A non-JSON line on the very first record means the file
-                // is a pretty-printed single-object dump (Copilot legacy
-                // shape or similar); let the caller fall through to
-                // `read_json`. Otherwise we have buffered at least one
-                // valid record already — stop peeking and let the
-                // dispatcher decide.
+                // A non-JSON line on the very first record means the file is a
+                // pretty-printed single-object document (Grok's
+                // `signals.json`); let the caller fall through to `read_json`.
+                // Past that, at least one valid record is already buffered —
+                // stop peeking and let the dispatcher decide.
                 if buffered.is_empty() {
                     first_line_was_json = Some(false);
                     break;
@@ -603,9 +598,6 @@ fn stream_parse_autodetect(path: &Path, mode: ParseMode) -> Result<Option<Parsed
         return Ok(None);
     }
 
-    // If the whole file was consumed without any distinctive marker, fall
-    // back to Codex — a JSONL file with no Claude / Gemini / Copilot / Grok
-    // markers is almost certainly a Codex log (or a synthetic fixture).
     let ext = ext.unwrap_or(ExtensionType::Codex);
     let parsed = dispatch_streaming_buffered(
         ext,
@@ -673,9 +665,10 @@ fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
 
 /// Streams the rest of the file, prepending any already-parsed records.
 ///
-/// JSONL providers feed buffered records through their typed shape and chain
-/// the remaining reader. Grok reopens its single aggregate JSON object so its
-/// sibling session files remain available to the provider parser.
+/// Claude / Codex / Copilot turn each buffered `Value` into their typed record
+/// and chain the remaining reader; Gemini's parser consumes `Value`s directly.
+/// Grok drops the reader and reopens by path, because its parser also reads the
+/// sibling `summary.json` and `updates.jsonl`.
 #[allow(clippy::too_many_arguments)] // parse plumbing; a struct would obscure the seams
 fn dispatch_streaming_buffered(
     ext: ExtensionType,
@@ -717,10 +710,6 @@ fn dispatch_streaming_buffered(
                 .map(|parsed| merge_extra_diagnostics(parsed, &extra_diagnostics))
         }
         ExtensionType::Copilot => {
-            // Copilot CLI emits one event per line under
-            // `session-state/<uuid>/events.jsonl`. The streaming path sees
-            // this as a sequence of parseable `Value`s whose very first
-            // line is `type == "session.start"`.
             let rest = iter_jsonl_values(
                 &mut reader,
                 Rc::clone(&extra_diagnostics),
@@ -734,11 +723,9 @@ fn dispatch_streaming_buffered(
                 .map(|parsed| merge_extra_diagnostics(parsed, &extra_diagnostics))
         }
         ExtensionType::Gemini => {
-            // Gemini sessions are line-delimited event streams: the first
-            // line is a session-meta record carrying `sessionId` etc.,
-            // and every subsequent line is an individual event. Feed the
-            // already-buffered lines plus the rest of the reader into
-            // `parse_gemini_events`.
+            // Gemini's first line is the session-meta record and every later
+            // line an event, so the first buffered value is peeled off before
+            // the rest of the stream reaches the event parser.
             (|| {
                 let mut iter = buffered.into_iter();
                 let first = iter
@@ -770,9 +757,8 @@ fn dispatch_streaming_buffered(
         // OpenCode stores sessions in a SQLite database, not a JSONL file, so
         // it never flows through the file parser. See `session::opencode`.
         ExtensionType::OpenCode => Ok(empty_parsed_analysis()),
-        // Cursor sessions live in per-conversation SQLite blob stores (analysis)
-        // and its billing tokens come from an API (usage), never a JSONL file.
-        // See `session::cursor`.
+        // Cursor sessions live in per-conversation SQLite blob stores, never a
+        // JSONL file. See `session::cursor`.
         ExtensionType::Cursor => Ok(empty_parsed_analysis()),
         // Hermes stores usage in a single SQLite database, not a JSONL file, so
         // it never flows through the file parser. See `session::hermes`.
@@ -855,9 +841,12 @@ where
 
 /// Iterator that yields raw [`Value`]s, one per non-empty line in the reader.
 ///
-/// Used by parsers (Gemini / Copilot) that need to dispatch per-event on a
-/// runtime-typed shape before committing to a strongly-typed struct, since
-/// different event types carry completely different payloads.
+/// Gemini's parser consumes `Value`s directly, which is how a walked Gemini
+/// session is parsed: `stream_parse_known`'s `_` arm routes it here with no
+/// classifier involved. The auto-detect path sends Claude / Codex / Copilot
+/// through this too, since the classifier has already materialized their
+/// buffered prefix as `Value`s; those three convert each one into their typed
+/// record straight away.
 fn iter_jsonl_values<'a>(
     reader: &'a mut BufReader<File>,
     diagnostics: Rc<RefCell<ParseDiagnostics>>,
@@ -865,7 +854,7 @@ fn iter_jsonl_values<'a>(
     io_failure: Rc<RefCell<Option<String>>>,
 ) -> impl Iterator<Item = Value> + 'a {
     // Reuse one byte buffer via `read_until` instead of allocating a `String`
-    // per line (`reader.lines()`), mirroring `iter_jsonl_typed`.
+    // per line (`reader.lines()`).
     let mut line = Vec::with_capacity(buffer::AVG_JSONL_LINE_SIZE);
     let mut line_number = 0_usize;
 
@@ -1087,9 +1076,11 @@ fn merge_extra_diagnostics(
     parsed
 }
 
-/// Legacy dispatch used by the pretty-printed JSON fallback. Operates on an
-/// already-materialised `Vec<Value>` — preferred to be avoided in the hot
-/// path, but needed for Gemini/Copilot dumps that span multiple lines.
+/// Whole-file dispatch over an already-materialised `Vec<Value>`.
+///
+/// Reached only when the streaming peek could not read line one as JSON, which
+/// in practice means a pretty-printed single-object document such as Grok's
+/// `signals.json`.
 fn dispatch_by_vec(
     data: Vec<Value>,
     ext_type: ExtensionType,
@@ -1122,9 +1113,8 @@ fn dispatch_by_vec(
         | ExtensionType::OpenCode
         | ExtensionType::Cursor
         | ExtensionType::Hermes => {
-            // Copilot/Gemini only support the JSONL event stream, while OpenCode,
-            // Cursor, and Hermes are read from SQLite (see `session::opencode` /
-            // `session::cursor` / `session::hermes`), not a file. A file that
+            // Gemini only supports the JSONL event stream, while OpenCode,
+            // Cursor, and Hermes are read from SQLite, not a file. A file that
             // falls through to this branch (e.g. a stray pretty-printed export)
             // has no parser for its shape — return an empty analysis instead of
             // silently mis-parsing.
@@ -1158,7 +1148,7 @@ fn empty_parsed_analysis() -> ParsedAnalysis {
     ParsedAnalysis::new(empty_analysis(), ParseDiagnostics::default())
 }
 
-/// Attaches runtime metadata (user, machine, version) expected in the output.
+/// Stamps the output-level metadata: user, provider name, machine, version.
 fn finalize(mut parsed: ParsedAnalysis, ext_type: ExtensionType) -> ParsedAnalysis {
     parsed.analysis.user = get_current_user();
     parsed.analysis.extension_name = ext_type.to_string();
