@@ -10,10 +10,10 @@ use rusqlite::{Connection, params};
 use std::os::unix::fs::PermissionsExt;
 use vct_core::TimeRange;
 use vct_core::config::ProvidersConfig;
-use vct_core::models::ExtensionType;
+use vct_core::models::{ExtensionType, PerProviderUsage, ProviderActiveDays};
 use vct_core::summary_cache::SummaryScanCache;
 use vct_core::usage::aggregator::{
-    UsageData, aggregate_usage_from_paths, aggregate_usage_from_paths_with_cache,
+    StoredCosts, UsageData, aggregate_usage_from_paths, aggregate_usage_from_paths_with_cache,
     aggregate_usage_from_paths_with_diagnostics, aggregate_usage_from_paths_with_providers,
 };
 use vct_test_support::{TempHome, append_cursor_json_blob, fixture_str};
@@ -167,43 +167,84 @@ fn seed_hermes_usage_db(path: &std::path::Path) {
         .unwrap();
 }
 
+/// Compares every per-provider bucket of two usage results.
+///
+/// Each bucket is reached by destructuring rather than by naming fields one at
+/// a time: a provider added to one of these structs then fails to compile here,
+/// instead of silently going uncompared the way DeepSeek Harness did.
 fn assert_usage_data_eq(actual: &UsageData, expected: &UsageData) {
     assert_eq!(actual.models, expected.models);
-    assert_eq!(actual.per_provider.claude, expected.per_provider.claude);
-    assert_eq!(actual.per_provider.codex, expected.per_provider.codex);
-    assert_eq!(actual.per_provider.copilot, expected.per_provider.copilot);
-    assert_eq!(actual.per_provider.gemini, expected.per_provider.gemini);
-    assert_eq!(actual.per_provider.grok, expected.per_provider.grok);
-    assert_eq!(actual.per_provider.opencode, expected.per_provider.opencode);
-    assert_eq!(actual.per_provider.cursor, expected.per_provider.cursor);
-    assert_eq!(actual.per_provider.hermes, expected.per_provider.hermes);
-    assert_eq!(
-        (
-            actual.provider_days.claude,
-            actual.provider_days.codex,
-            actual.provider_days.copilot,
-            actual.provider_days.gemini,
-            actual.provider_days.grok,
-            actual.provider_days.opencode,
-            actual.provider_days.cursor,
-            actual.provider_days.hermes,
-            actual.provider_days.total,
-        ),
-        (
-            expected.provider_days.claude,
-            expected.provider_days.codex,
-            expected.provider_days.copilot,
-            expected.provider_days.gemini,
-            expected.provider_days.grok,
-            expected.provider_days.opencode,
-            expected.provider_days.cursor,
-            expected.provider_days.hermes,
-            expected.provider_days.total,
-        )
-    );
-    assert_eq!(actual.stored_costs.opencode, expected.stored_costs.opencode);
-    assert_eq!(actual.stored_costs.cursor, expected.stored_costs.cursor);
-    assert_eq!(actual.stored_costs.hermes, expected.stored_costs.hermes);
+
+    let PerProviderUsage {
+        claude,
+        codex,
+        copilot,
+        gemini,
+        opencode,
+        cursor,
+        hermes,
+        grok,
+        deepseek,
+    } = &actual.per_provider;
+    let other = &expected.per_provider;
+    for (provider, actual_usage, expected_usage) in [
+        ("Claude", claude, &other.claude),
+        ("Codex", codex, &other.codex),
+        ("Copilot", copilot, &other.copilot),
+        ("Gemini", gemini, &other.gemini),
+        ("OpenCode", opencode, &other.opencode),
+        ("Cursor", cursor, &other.cursor),
+        ("Hermes", hermes, &other.hermes),
+        ("Grok", grok, &other.grok),
+        ("DeepSeek", deepseek, &other.deepseek),
+    ] {
+        assert_eq!(actual_usage, expected_usage, "{provider} usage differs");
+    }
+
+    let ProviderActiveDays {
+        claude,
+        codex,
+        copilot,
+        gemini,
+        opencode,
+        cursor,
+        hermes,
+        grok,
+        deepseek,
+        total,
+    } = &actual.provider_days;
+    let other = &expected.provider_days;
+    for (provider, actual_days, expected_days) in [
+        ("Claude", claude, &other.claude),
+        ("Codex", codex, &other.codex),
+        ("Copilot", copilot, &other.copilot),
+        ("Gemini", gemini, &other.gemini),
+        ("OpenCode", opencode, &other.opencode),
+        ("Cursor", cursor, &other.cursor),
+        ("Hermes", hermes, &other.hermes),
+        ("Grok", grok, &other.grok),
+        ("DeepSeek", deepseek, &other.deepseek),
+        ("All providers", total, &other.total),
+    ] {
+        assert_eq!(actual_days, expected_days, "{provider} active days differ");
+    }
+
+    let StoredCosts {
+        opencode,
+        cursor,
+        hermes,
+    } = &actual.stored_costs;
+    let other = &expected.stored_costs;
+    for (provider, actual_costs, expected_costs) in [
+        ("OpenCode", opencode, &other.opencode),
+        ("Cursor", cursor, &other.cursor),
+        ("Hermes", hermes, &other.hermes),
+    ] {
+        assert_eq!(
+            actual_costs, expected_costs,
+            "{provider} stored costs differ"
+        );
+    }
 }
 
 #[test]
@@ -246,6 +287,7 @@ fn cached_usage_matches_uncached_for_every_provider_source() {
         1_234,
     );
     seed_hermes_usage_db(&home.paths.hermes_db);
+    home.put_dsh_fixture_session("dsh-project", "dsh-session");
 
     let providers = ProvidersConfig::default();
     let uncached =
@@ -255,20 +297,35 @@ fn cached_usage_matches_uncached_for_every_provider_source() {
         aggregate_usage_from_paths_with_cache(&home.paths, TimeRange::All, providers, &mut cache)
             .unwrap();
 
-    assert_eq!(cold.diagnostics.candidates, 8);
-    assert_eq!(cold.diagnostics.parsed, 8);
+    assert_eq!(cold.diagnostics.candidates, 9);
+    assert_eq!(cold.diagnostics.parsed, 9);
     assert!(cold.diagnostics.failures.is_empty());
-    assert_eq!(cache.stats().parsed_sources, 8);
+    assert_eq!(cache.stats().parsed_sources, 9);
     assert_usage_data_eq(&cold.data, &uncached);
+    // Destructured so that a provider added later cannot be left unseeded: the
+    // new field has to be named here, and naming it without using it below is
+    // an unused-variable warning, which CI denies.
+    let PerProviderUsage {
+        claude,
+        codex,
+        copilot,
+        gemini,
+        opencode,
+        cursor,
+        hermes,
+        grok,
+        deepseek,
+    } = &cold.data.per_provider;
     for (provider, usage) in [
-        ("Claude", &cold.data.per_provider.claude),
-        ("Codex", &cold.data.per_provider.codex),
-        ("Copilot", &cold.data.per_provider.copilot),
-        ("Gemini", &cold.data.per_provider.gemini),
-        ("Grok", &cold.data.per_provider.grok),
-        ("OpenCode", &cold.data.per_provider.opencode),
-        ("Cursor", &cold.data.per_provider.cursor),
-        ("Hermes", &cold.data.per_provider.hermes),
+        ("Claude", claude),
+        ("Codex", codex),
+        ("Copilot", copilot),
+        ("Gemini", gemini),
+        ("Grok", grok),
+        ("DeepSeek", deepseek),
+        ("OpenCode", opencode),
+        ("Cursor", cursor),
+        ("Hermes", hermes),
     ] {
         assert!(
             !usage.is_empty(),

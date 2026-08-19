@@ -13,14 +13,14 @@ use std::path::Path;
 use tempfile::TempDir;
 use vct_core::TimeRange;
 use vct_core::analysis::aggregator::{
-    AnalysisData, aggregate_sessions_by_model_from_paths,
+    AnalysisData, PerProviderAnalysisRows, aggregate_sessions_by_model_from_paths,
     aggregate_sessions_by_model_from_paths_with_cache,
     aggregate_sessions_by_model_from_paths_with_diagnostics,
     aggregate_sessions_by_model_from_paths_with_providers,
     collect_analysis_sessions_from_paths_with, project_code_analysis,
 };
 use vct_core::config::ProvidersConfig;
-use vct_core::models::ExtensionType;
+use vct_core::models::{ExtensionType, ProviderActiveDays};
 use vct_core::session::parser::{
     parse_session_file_to_value, parse_session_file_typed, parse_session_file_typed_as,
     parse_session_file_with_diagnostics,
@@ -101,69 +101,72 @@ fn seed_opencode_tie_breaker_db(path: &Path) {
     tx.commit().unwrap();
 }
 
+/// Compares every per-provider bucket of two analysis results.
+///
+/// Each bucket is reached by destructuring rather than by naming fields one at
+/// a time: a provider added to one of these structs then fails to compile here,
+/// instead of silently going uncompared.
 fn assert_analysis_data_eq(actual: &AnalysisData, expected: &AnalysisData) {
     assert_eq!(
         serde_json::to_value(&actual.rows).unwrap(),
         serde_json::to_value(&expected.rows).unwrap()
     );
-    assert_eq!(
-        serde_json::to_value(&actual.per_provider.claude).unwrap(),
-        serde_json::to_value(&expected.per_provider.claude).unwrap()
-    );
-    assert_eq!(
-        serde_json::to_value(&actual.per_provider.codex).unwrap(),
-        serde_json::to_value(&expected.per_provider.codex).unwrap()
-    );
-    assert_eq!(
-        serde_json::to_value(&actual.per_provider.copilot).unwrap(),
-        serde_json::to_value(&expected.per_provider.copilot).unwrap()
-    );
-    assert_eq!(
-        serde_json::to_value(&actual.per_provider.gemini).unwrap(),
-        serde_json::to_value(&expected.per_provider.gemini).unwrap()
-    );
-    assert_eq!(
-        serde_json::to_value(&actual.per_provider.grok).unwrap(),
-        serde_json::to_value(&expected.per_provider.grok).unwrap()
-    );
-    assert_eq!(
-        serde_json::to_value(&actual.per_provider.deepseek).unwrap(),
-        serde_json::to_value(&expected.per_provider.deepseek).unwrap()
-    );
-    assert_eq!(
-        serde_json::to_value(&actual.per_provider.opencode).unwrap(),
-        serde_json::to_value(&expected.per_provider.opencode).unwrap()
-    );
-    assert_eq!(
-        serde_json::to_value(&actual.per_provider.cursor).unwrap(),
-        serde_json::to_value(&expected.per_provider.cursor).unwrap()
-    );
-    assert_eq!(
-        (
-            actual.provider_days.claude,
-            actual.provider_days.codex,
-            actual.provider_days.copilot,
-            actual.provider_days.gemini,
-            actual.provider_days.grok,
-            actual.provider_days.deepseek,
-            actual.provider_days.opencode,
-            actual.provider_days.cursor,
-            actual.provider_days.hermes,
-            actual.provider_days.total,
-        ),
-        (
-            expected.provider_days.claude,
-            expected.provider_days.codex,
-            expected.provider_days.copilot,
-            expected.provider_days.gemini,
-            expected.provider_days.grok,
-            expected.provider_days.deepseek,
-            expected.provider_days.opencode,
-            expected.provider_days.cursor,
-            expected.provider_days.hermes,
-            expected.provider_days.total,
-        )
-    );
+
+    let PerProviderAnalysisRows {
+        claude,
+        codex,
+        copilot,
+        gemini,
+        grok,
+        deepseek,
+        opencode,
+        cursor,
+    } = &actual.per_provider;
+    let other = &expected.per_provider;
+    for (provider, actual_rows, expected_rows) in [
+        ("Claude", claude, &other.claude),
+        ("Codex", codex, &other.codex),
+        ("Copilot", copilot, &other.copilot),
+        ("Gemini", gemini, &other.gemini),
+        ("Grok", grok, &other.grok),
+        ("DeepSeek", deepseek, &other.deepseek),
+        ("OpenCode", opencode, &other.opencode),
+        ("Cursor", cursor, &other.cursor),
+    ] {
+        assert_eq!(
+            serde_json::to_value(actual_rows).unwrap(),
+            serde_json::to_value(expected_rows).unwrap(),
+            "{provider} rows differ"
+        );
+    }
+
+    let ProviderActiveDays {
+        claude,
+        codex,
+        copilot,
+        gemini,
+        opencode,
+        cursor,
+        hermes,
+        grok,
+        deepseek,
+        total,
+    } = &actual.provider_days;
+    let other = &expected.provider_days;
+    for (provider, actual_days, expected_days) in [
+        ("Claude", claude, &other.claude),
+        ("Codex", codex, &other.codex),
+        ("Copilot", copilot, &other.copilot),
+        ("Gemini", gemini, &other.gemini),
+        ("Grok", grok, &other.grok),
+        ("DeepSeek", deepseek, &other.deepseek),
+        ("OpenCode", opencode, &other.opencode),
+        ("Cursor", cursor, &other.cursor),
+        ("Hermes", hermes, &other.hermes),
+        ("All providers", total, &other.total),
+    ] {
+        assert_eq!(actual_days, expected_days, "{provider} active days differ");
+    }
 }
 
 #[test]
@@ -506,6 +509,7 @@ fn cached_analysis_matches_uncached_and_reuses_unchanged_sources() {
         &fixture_str("sessions/gemini.jsonl"),
     );
     home.put_grok_fixture_session("workspace", "grok-session");
+    home.put_dsh_fixture_session("dsh-project", "dsh-session");
     seed_opencode_tie_breaker_db(&home.paths.opencode_db);
     home.put_cursor_session(
         "cursor-project",
@@ -530,32 +534,47 @@ fn cached_analysis_matches_uncached_and_reuses_unchanged_sources() {
         &mut cache,
     )
     .unwrap();
-    assert_eq!(cache.stats().parsed_sources, 7);
-    assert_eq!(cold.diagnostics.candidates, 7);
-    assert_eq!(cold.diagnostics.parsed, 7);
+    assert_eq!(cache.stats().parsed_sources, 8);
+    assert_eq!(cold.diagnostics.candidates, 8);
+    assert_eq!(cold.diagnostics.parsed, 8);
     assert!(cold.diagnostics.failures.is_empty());
     assert_eq!(cold.diagnostics, uncached.diagnostics);
     assert_analysis_data_eq(&cold.data, &uncached.data);
+    // Destructured so that a provider added later cannot be left unseeded: the
+    // new field has to be named here, and naming it without using it below is
+    // an unused-variable warning, which CI denies.
+    let PerProviderAnalysisRows {
+        claude,
+        codex,
+        copilot,
+        gemini,
+        grok,
+        deepseek,
+        opencode,
+        cursor,
+    } = &cold.data.per_provider;
     for (provider, rows) in [
-        ("Claude", &cold.data.per_provider.claude),
-        ("Codex", &cold.data.per_provider.codex),
-        ("Copilot", &cold.data.per_provider.copilot),
-        ("Gemini", &cold.data.per_provider.gemini),
-        ("Grok", &cold.data.per_provider.grok),
-        ("OpenCode", &cold.data.per_provider.opencode),
-        ("Cursor", &cold.data.per_provider.cursor),
+        ("Claude", claude),
+        ("Codex", codex),
+        ("Copilot", copilot),
+        ("Gemini", gemini),
+        ("Grok", grok),
+        ("DeepSeek", deepseek),
+        ("OpenCode", opencode),
+        ("Cursor", cursor),
     ] {
         assert!(!rows.is_empty(), "{provider} fixture must contribute a row");
     }
     for rows in [
         &cold.data.rows,
-        &cold.data.per_provider.claude,
-        &cold.data.per_provider.codex,
-        &cold.data.per_provider.copilot,
-        &cold.data.per_provider.gemini,
-        &cold.data.per_provider.grok,
-        &cold.data.per_provider.opencode,
-        &cold.data.per_provider.cursor,
+        claude,
+        codex,
+        copilot,
+        gemini,
+        grok,
+        deepseek,
+        opencode,
+        cursor,
     ] {
         assert!(
             rows.windows(2).all(|pair| pair[0].model <= pair[1].model),
