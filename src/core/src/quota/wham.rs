@@ -198,8 +198,8 @@ pub fn map_reset_credits_response(body: &str) -> Result<(i64, Vec<Option<i64>>)>
     Ok((available_count, expirations))
 }
 
-/// Extracts an `[low, high]` approximate-messages pair, dropping the all-zero
-/// case (no credits → nothing useful to show).
+/// Extracts a `[low, high]` approximate-messages pair, dropping one whose upper
+/// bound is zero (no credits → nothing useful to show).
 fn approx_pair(v: &Option<Vec<i64>>) -> Option<(i64, i64)> {
     let v = v.as_ref()?;
     let low = *v.first()?;
@@ -285,7 +285,7 @@ pub fn call_wham(
 
 /// Calls `wham/usage`, then enriches a successful snapshot with earned reset
 /// credit details. The details request is best-effort: any HTTP or parse error
-/// preserves the count returned by `wham/usage` and does not fail the panel.
+/// keeps the count `wham/usage` already reported.
 pub fn call_wham_with_reset_credits(
     client: &reqwest::blocking::Client,
     token: &str,
@@ -355,7 +355,7 @@ pub fn call_reset_credit_details(
     }
 }
 
-/// Fetches the raw `wham/usage` response for `vct fetch codex`.
+/// Fetches the raw `wham/usage` response for `vct quota codex`.
 ///
 /// Uses the stored access token verbatim (no refresh, no file writes) and
 /// returns `(status_code, body)`. A non-2xx status is left for the caller to
@@ -413,8 +413,8 @@ pub fn refresh_codex(
     auth_path: &Path,
     token_url: &str,
 ) -> Result<String> {
-    // Capture the mtime with the refresh token from the same read so the
-    // write-back guards on the exact file version we send.
+    // Capture the mtime before the read, so a concurrent rewrite by the official
+    // CLI aborts the write-back instead of clobbering the token it just rotated.
     let expected_mtime = file_mtime(auth_path);
     let body = std::fs::read_to_string(auth_path)
         .with_context(|| format!("Failed to read {}", auth_path.display()))?;

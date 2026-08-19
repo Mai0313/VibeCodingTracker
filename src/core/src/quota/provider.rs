@@ -9,7 +9,7 @@
 //! - [`QuotaOutcome::Data`] — store the fresh snapshot + persist it.
 //! - [`QuotaOutcome::NeedsLogin`] — flip `needs_login` on the *current*
 //!   snapshot (keep its data), so a refresh failure never blanks out
-//!   still-valid last-known-good numbers (S3).
+//!   still-valid last-known-good numbers.
 //! - [`QuotaOutcome::Transient`] — keep last-known-good indefinitely, so a rate
 //!   limit or network blip never blanks a panel; the next success overwrites it.
 
@@ -69,9 +69,7 @@ impl QuotaSnapshot for CopilotQuotaSnapshot {
     }
     fn is_present(&self) -> bool {
         // Mirror the render gate: a premium gauge, an unlimited flag, the plan
-        // label, or a login hint all give the panel something to show. (Chat /
-        // completions unlimited flags are not rendered, so they must not gate
-        // visibility either, or the panel would show "no Copilot quota".)
+        // label, or a login hint all give the panel something to show.
         self.premium.is_some()
             || self.premium_unlimited
             || self.plan_type.is_some()
@@ -166,10 +164,8 @@ where
                         save(&snap);
                     }
                 }
-                // A transient failure (network error, 429 rate limit) leaves the
-                // last-known-good snapshot untouched — the panel keeps showing it
-                // with a growing staleness marker until the next success
-                // overwrites it, rather than blanking out.
+                // Deliberately empty: the last-known-good snapshot stays as it is
+                // until the next success overwrites it.
                 Ok(QuotaOutcome::Transient) => {}
                 Err(_) => log::warn!("{label} quota worker panicked; keeping last snapshot"),
             }

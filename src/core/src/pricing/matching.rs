@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use strsim::jaro_winkler;
 
-// Similarity threshold for fuzzy matching (0.0 to 1.0)
+// Jaro-Winkler score at or above which a fuzzy candidate is accepted.
 const SIMILARITY_THRESHOLD: f64 = 0.7;
 
 // Maximum number of cached pricing lookups per pricing map.
@@ -27,7 +27,12 @@ pub struct ModelPricingResult {
     pub matched_model: Option<String>,
 }
 
-/// Optimized pricing map with precomputed indices for O(1) exact matches and fast fuzzy matching.
+/// Pricing table with precomputed indices for O(1) exact matches and a
+/// single-pass scan for the loose stages.
+///
+/// Neither `Send` nor `Sync` (`Rc` keys plus a `RefCell` lookup cache), so a
+/// thread that needs pricing builds its own map; [`ModelPricingMap::tier_thresholds`]
+/// extracts the shareable snapshot.
 #[derive(Debug, Clone)]
 pub struct ModelPricingMap {
     // Original pricing data (use Rc<str> to avoid cloning keys)
@@ -61,10 +66,6 @@ impl MatchCache {
 impl ModelPricingMap {
     /// Creates a new pricing map with precomputed indices for optimized lookups.
     ///
-    /// This constructor processes the raw pricing data to build:
-    /// - Normalized key index for version-agnostic matching.
-    /// - Lowercase key list for substring and fuzzy matching.
-    ///
     /// # Examples
     ///
     /// ```
@@ -77,30 +78,25 @@ impl ModelPricingMap {
     /// assert!(!map.is_empty());
     /// ```
     pub fn new(raw: HashMap<String, ModelPricing>) -> Self {
-        // Pre-allocate with exact capacity
         let capacity = raw.len();
         let mut normalized_index = HashMap::with_capacity(capacity);
         let mut lowercase_keys = Vec::with_capacity(capacity);
         let mut rc_raw = HashMap::with_capacity(capacity);
 
-        // Convert keys to Rc<str> to avoid cloning
         for (key, pricing) in raw {
             let rc_key: Rc<str> = key.as_str().into();
 
-            // Precompute normalized key
             let normalized = normalize_model_name(&key);
             normalized_index
                 .entry(normalized)
                 .or_insert_with(Vec::new)
                 .push(rc_key.clone());
 
-            // Precompute lowercase key for substring/fuzzy matching
             lowercase_keys.push((key.to_lowercase(), rc_key.clone()));
 
             rc_raw.insert(rc_key, pricing);
         }
 
-        // Sort lowercase_keys for potential binary search optimization
         lowercase_keys.sort_by(|a, b| a.0.cmp(&b.0));
         for candidates in normalized_index.values_mut() {
             candidates.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
@@ -118,10 +114,14 @@ impl ModelPricingMap {
     ///
     /// Matching strategy (in order of priority):
     /// 1. Exact match (O(1) hash lookup).
-    /// 2. Normalized match (removes version suffixes).
+    /// 2. Normalized match (provider prefix, date and version suffixes stripped).
     /// 3. Substring match (bidirectional contains check).
     /// 4. Fuzzy match (Jaro-Winkler ≥ 0.7 threshold).
     /// 5. Default (zero cost) if no match found.
+    ///
+    /// Steps 3 and 4 are skipped for a placeholder name (`default`, `auto`, …)
+    /// or a model segment shorter than four bytes: those go straight to the
+    /// zero-cost default rather than inherit a lookalike's price.
     ///
     /// Results are cached per map. [`clear_pricing_cache`] invalidates every
     /// existing map lazily, so even the "no match" outcome can be memoized
@@ -193,8 +193,8 @@ impl ModelPricingMap {
         }
 
         // Slow path 1: inspect every substring candidate and choose the most
-        // specific overlap. Returning the first HashMap-derived candidate can
-        // otherwise price gpt-4o as gpt-4.
+        // specific overlap. Taking the first candidate instead prices gpt-4o
+        // as gpt-4.
         if let Some(matched_key) = self.substring_match(&model_lower)
             && let Some(pricing) = self.raw.get(matched_key.as_ref())
         {
@@ -206,8 +206,7 @@ impl ModelPricingMap {
             return result;
         }
 
-        // Slow path 2: fuzzy matching runs only when normalization and
-        // substring matching found nothing.
+        // Slow path 2: fuzzy match.
         if let Some(matched_key) = self.fuzzy_match(&model_lower)
             && let Some(pricing) = self.raw.get(matched_key.as_ref())
         {
@@ -311,9 +310,9 @@ impl ModelPricingMap {
     /// Unlike [`get`](Self::get), this performs no normalization, substring, or
     /// fuzzy matching: it returns `Some` only when `model_name` is a verbatim
     /// key in the pricing table, and `None` otherwise. This is the lookup used
-    /// for providers (OpenCode) that carry their own authoritative cost and
-    /// should fall back to that stored cost rather than guess a price from a
-    /// loosely-similar model name.
+    /// for providers (OpenCode, Hermes) that carry their own authoritative cost
+    /// and should fall back to that stored cost rather than guess a price from
+    /// a loosely-similar model name.
     pub fn get_exact(&self, model_name: &str) -> Option<ModelPricing> {
         self.raw.get(model_name).cloned()
     }
@@ -424,8 +423,6 @@ fn substring_provider_rank(query_provider: Option<&str>, candidate: &str) -> u8 
 /// - Date suffixes: `-20231201`, `-12345678` (exactly 8 ASCII digits).
 /// - Version suffixes: `-v1.0`, `-v2`.
 ///
-/// Optimized to minimize string allocations (a single allocation at the end).
-///
 /// # Examples
 ///
 /// ```
@@ -467,7 +464,6 @@ pub fn normalize_model_name(name: &str) -> String {
         break;
     }
 
-    // Only allocate once at the end
     name[start..end].to_string()
 }
 
@@ -554,7 +550,6 @@ mod tests {
 
     #[test]
     fn test_exact_match() {
-        // Test exact model name match
         clear_pricing_cache();
 
         let mut raw = HashMap::new();
@@ -564,15 +559,14 @@ mod tests {
         let map = ModelPricingMap::new(raw);
 
         let result = map.get("gpt-4");
-        assert!(result.pricing.input_cost_per_token > 0.0); // Should match
+        assert!(result.pricing.input_cost_per_token > 0.0);
 
         let result2 = map.get("claude-3-opus");
-        assert!(result2.pricing.input_cost_per_token > 0.0); // Should match
+        assert!(result2.pricing.input_cost_per_token > 0.0);
     }
 
     #[test]
     fn test_normalized_match() {
-        // Test normalized matching (removes version suffixes)
         clear_pricing_cache();
 
         let mut raw = HashMap::new();
@@ -580,14 +574,14 @@ mod tests {
 
         let map = ModelPricingMap::new(raw);
 
-        // Should match via substring or fuzzy matching
+        // `0613` is four digits, so nothing normalizes away: despite this
+        // test's name the price comes from the substring stage.
         let result = map.get("gpt-4");
         assert!(result.pricing.input_cost_per_token > 0.0);
     }
 
     #[test]
     fn test_substring_match() {
-        // Test substring matching
         clear_pricing_cache();
 
         let mut raw = HashMap::new();
@@ -595,14 +589,16 @@ mod tests {
 
         let map = ModelPricingMap::new(raw);
 
-        // Should match via substring or normalization
+        // The key's 8-digit date normalizes away, so despite this test's name
+        // the price comes from the normalized stage.
         let result = map.get("claude-3-opus");
         assert!(result.pricing.input_cost_per_token > 0.0);
     }
 
     #[test]
     fn test_case_insensitive_match() {
-        // Test case-insensitive matching
+        // Case folding happens only in the loose stages, so this resolves
+        // through the substring scan rather than the exact or normalized one.
         let mut raw = HashMap::new();
         raw.insert("GPT-4".to_string(), create_test_pricing());
 
@@ -635,7 +631,8 @@ mod tests {
         let map = ModelPricingMap::new(raw);
 
         assert!(map.get_exact("gpt-4").is_some());
-        // These all resolve via get() (substring/fuzzy) but must miss get_exact.
+        // `gpt-4-turbo` and `GPT-4` resolve via get()'s substring stage and
+        // `deepseek-v4-pro` resolves to nothing; none of them is a verbatim key.
         assert!(map.get_exact("gpt-4-turbo").is_none());
         assert!(map.get_exact("deepseek-v4-pro").is_none());
         assert!(map.get_exact("GPT-4").is_none());
@@ -655,7 +652,6 @@ mod tests {
 
     #[test]
     fn test_multiple_models() {
-        // Test with multiple models
         let mut raw = HashMap::new();
         let pricing1 = ModelPricing {
             input_cost_per_token: 0.000001,
@@ -695,7 +691,6 @@ mod tests {
 
     #[test]
     fn test_pricing_map_debug() {
-        // Test that ModelPricingMap can be debug formatted
         let mut raw = HashMap::new();
         raw.insert("test-model".to_string(), create_test_pricing());
 
@@ -707,7 +702,6 @@ mod tests {
 
     #[test]
     fn test_pricing_map_clone() {
-        // Test that ModelPricingMap can be cloned
         let mut raw = HashMap::new();
         raw.insert("test-model".to_string(), create_test_pricing());
 
@@ -741,7 +735,8 @@ mod tests {
 
     #[test]
     fn test_match_priority() {
-        // Test that exact match takes priority over fuzzy match
+        // An exact hit wins over the loose stages, which would also reach
+        // gpt-4-turbo.
         clear_pricing_cache();
 
         let mut raw = HashMap::new();
@@ -759,27 +754,25 @@ mod tests {
 
         let map = ModelPricingMap::new(raw);
 
-        // Exact match should be used
         let result = map.get("gpt-4");
         assert_eq!(result.pricing.input_cost_per_token, 0.000001);
     }
 
     #[test]
     fn test_version_stripping() {
-        // Test that version numbers are handled correctly
         let mut raw = HashMap::new();
         raw.insert("claude-3-opus".to_string(), create_test_pricing());
 
         let map = ModelPricingMap::new(raw);
 
-        // Should match without version
+        // The 8-digit date suffix is stripped, so the query normalizes onto
+        // the bare key.
         let result = map.get("claude-3-opus-20240229");
         assert!(result.pricing.input_cost_per_token > 0.0);
     }
 
     #[test]
     fn test_result_clone() {
-        // Test that ModelPricingResult can be cloned
         let mut raw = HashMap::new();
         raw.insert("test".to_string(), create_test_pricing());
 
@@ -795,7 +788,6 @@ mod tests {
 
     #[test]
     fn test_result_debug() {
-        // Test that ModelPricingResult can be debug formatted
         let mut raw = HashMap::new();
         raw.insert("test".to_string(), create_test_pricing());
 
@@ -825,7 +817,6 @@ mod tests {
 
     #[test]
     fn test_very_long_model_name() {
-        // Test with very long model name
         let mut raw = HashMap::new();
         let long_name = "a".repeat(1000);
         raw.insert(long_name.clone(), create_test_pricing());
@@ -838,7 +829,6 @@ mod tests {
 
     #[test]
     fn test_unicode_model_names() {
-        // Test model names with unicode characters
         let mut raw = HashMap::new();
         raw.insert("模型-1".to_string(), create_test_pricing());
         raw.insert("モデル-2".to_string(), create_test_pricing());

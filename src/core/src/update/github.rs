@@ -11,9 +11,8 @@ use std::time::Duration;
 /// GitHub REST endpoint for the repository's latest release.
 const GITHUB_API_RELEASES_URL: &str =
     "https://api.github.com/repos/Mai0313/VibeCodingTracker/releases/latest";
-/// `User-Agent` header value (`<crate>/<version>`), required by the GitHub API.
-// Pinned to the product name (not the crate name, which is `vct-core`) so the
-// GitHub API sees a stable identifier across the workspace rename.
+/// `User-Agent` header value (`vibe_coding_tracker/<version>`), required by the
+/// GitHub API. Pinned to the product name rather than this crate's name.
 const USER_AGENT: &str = concat!("vibe_coding_tracker/", env!("CARGO_PKG_VERSION"));
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(5);

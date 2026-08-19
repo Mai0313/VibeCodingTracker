@@ -4,7 +4,8 @@
 //! endpoint (`GET /v1/billing?format=credits`), impersonating the Grok CLI via
 //! its `grok-pager` / `grok-shell` User-Agent and the `X-XAI-Token-Auth` header
 //! the proxy's auth middleware requires. The plan label comes from the companion
-//! `/v1/settings` endpoint and is fetched at most once per worker.
+//! `/v1/settings` endpoint, re-read only when `auth.json` changes rather than on
+//! every tick.
 //!
 //! The access token lives in each entry's **`key`** field (not `access_token`)
 //! and expires in hours, so refresh works like Claude's: proactive near expiry,
@@ -198,8 +199,9 @@ fn read_grok_credential(path: &Path) -> CredentialRead {
 
 /// Builds a request carrying the Grok CLI's identity headers.
 ///
-/// Only the bearer and `X-XAI-Token-Auth` are load-bearing; the version gate
-/// reads `x-grok-client-version`, and the rest is the client identity.
+/// The proxy authenticates on the bearer plus `X-XAI-Token-Auth` (without which
+/// it rejects any token) and gates on `x-grok-client-version`; the rest is
+/// client identity.
 fn grok_request(client: &Client, url: &str, token: &str, user_id: Option<&str>) -> RequestBuilder {
     let mut req = client
         .get(url)
@@ -551,9 +553,10 @@ pub struct GrokState {
     cooldown: RefreshCooldown,
     /// Discovered `(issuer, token_endpoint)`, so discovery runs once per issuer.
     token_endpoint: Option<(String, String)>,
-    /// Plan label, fetched once per login rather than once per tick: it lives
-    /// behind a second endpoint, and only a re-login can change whose plan it
-    /// is. A failed fetch caches nothing, so the next tick retries.
+    /// Plan label, fetched once per `auth.json` version rather than once per
+    /// tick: it lives behind a second endpoint, and only a re-login can change
+    /// whose plan it is. A failed fetch caches nothing, so the next tick
+    /// retries.
     plan: Option<CachedPlan>,
 }
 
@@ -707,9 +710,9 @@ impl GrokState {
 
     /// Re-reads the credential file and refreshes once.
     ///
-    /// The mtime is captured before the read so the write-back guards on the
-    /// exact file version whose refresh token we send — otherwise we could
-    /// consume a token the CLI just wrote and then abort its write.
+    /// The mtime is captured before the read, so a concurrent rewrite by the
+    /// official CLI aborts the write-back instead of clobbering the token it
+    /// just rotated.
     fn force_refresh(&mut self, client: &Client, path: &Path) -> Option<String> {
         let expected_mtime = file_mtime(path);
         let body = std::fs::read_to_string(path).ok()?;

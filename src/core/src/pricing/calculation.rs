@@ -63,9 +63,9 @@ impl PriceLevel {
 /// 2. Otherwise, base prices bill the base slice of every bucket, and the
 ///    `above_*` slices (accumulated per request by the usage parsers for
 ///    requests whose own prompt context crossed the model's tier threshold)
-///    bill at the lowest tier's prices. Tier selection against summed counts
-///    was removed: LiteLLM's "above Nk tokens" semantics are per request, so
-///    comparing the threshold against cross-session aggregates promoted whole
+///    bill at the lowest tier's prices. Never select a tier from the summed
+///    counts: LiteLLM's "above Nk tokens" semantics are per request, so a
+///    threshold compared against cross-session aggregates promotes whole
 ///    months of small requests to the elevated rate.
 /// 3. Counts without `above_*` slices (analysis paths, offline scans,
 ///    providers without per-request granularity) therefore bill entirely at
@@ -80,9 +80,8 @@ impl PriceLevel {
 /// Grok, …) continue to bill correctly.
 ///
 /// `cache_creation_5m` and `cache_creation_1h` are priced separately
-/// (5-minute default TTL vs 1-hour extended TTL). When a model doesn't
-/// publish a 1hr price (value is 0.0), the 5m price is used for both buckets
-/// — matching current behaviour for providers that don't split TTL.
+/// (5-minute default TTL vs 1-hour extended TTL). When the active price level
+/// publishes no 1hr rate (value is 0.0), the 5m price bills both buckets.
 ///
 /// # Examples
 ///
@@ -262,7 +261,8 @@ mod tests {
     #[test]
     fn test_flat_pricing_applies_base() {
         let p = flat_pricing();
-        // 200 of cache_creation goes into the 5m bucket (no TTL split available).
+        // 200 cache-read tokens, and 100 cache-creation tokens that all sit in
+        // the 5m bucket (no TTL split available).
         let cost = calculate_cost(&counts(1000, 500, 0, 200, 100, 0), &p);
         let expected =
             1000.0 * 0.000003 + 500.0 * 0.000015 + 200.0 * 0.0000003 + 100.0 * 0.00000375;

@@ -125,7 +125,7 @@ impl CodexState {
             ) {
                 CodexFetch::Ok(snap) => return QuotaOutcome::Data(snap),
                 CodexFetch::NeedsLogin => {
-                    // Keep any session-fallback data, flag the login hint (S3).
+                    // Keep any session-fallback data, flag the login hint.
                     let mut snap = codex_session::latest_session_rate_limits()
                         .ok()
                         .flatten()
@@ -327,12 +327,6 @@ mod tests {
     use httpmock::prelude::*;
 
     /// The reactive 401 → refresh → retry loop, end-to-end against a mock server.
-    ///
-    /// The first wham call carries the stale token and 401s; the loop then hits
-    /// the (mock) token endpoint, writes the rotated token back to auth.json, and
-    /// retries wham with the fresh token, which succeeds. The two wham mocks are
-    /// distinguished by their `Authorization` header so the ordering is asserted
-    /// structurally rather than by call sequence.
     #[test]
     fn fetch_with_refresh_recovers_from_401() {
         let server = MockServer::start();

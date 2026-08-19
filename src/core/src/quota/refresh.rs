@@ -1,5 +1,5 @@
-//! Shared OAuth token-refresh primitives used by the Claude / Codex quota
-//! fetchers.
+//! Shared OAuth token-refresh primitives used by the Claude, Codex, and Grok
+//! quota fetchers.
 //!
 //! The provider-specific request/response shapes live in each fetcher; this
 //! module owns the cross-cutting concerns:
@@ -9,8 +9,7 @@
 //! - **write-back that preserves unknown fields** by mutating a whole
 //!   `serde_json::Value` and re-checking the file mtime just before the
 //!   atomic write (TOCTOU guard against a concurrently-running official CLI),
-//! - the near-expiry check and the RFC3339 timestamp formats the provider
-//!   CLIs write.
+//! - the near-expiry check that decides when to refresh proactively.
 //!
 //! No function here ever logs a request/response body or a token; callers only
 //! surface the HTTP status.
@@ -23,7 +22,7 @@ use std::path::Path;
 use std::time::SystemTime;
 
 /// Cooldown after a refresh failure, so a revoked/rotated-away refresh token
-/// cannot make the 10s worker retry the token endpoint every tick (B1).
+/// cannot make the quota worker retry the token endpoint on every poll.
 pub const REFRESH_COOLDOWN_SECS: i64 = 300;
 
 /// Skew applied to proactive expiry checks, to absorb a slightly-fast clock.
@@ -68,7 +67,7 @@ pub fn file_mtime(path: &Path) -> Option<SystemTime> {
 /// True when `expires_at_secs` is known and within `skew_secs` of `now_secs`.
 ///
 /// An unknown expiry (`None`) returns `false` — we never refresh blindly, which
-/// would spin the token endpoint (see B1).
+/// would spin the token endpoint.
 pub fn is_expiring(expires_at_secs: Option<i64>, now_secs: i64, skew_secs: i64) -> bool {
     expires_at_secs.is_some_and(|exp| exp - now_secs <= skew_secs)
 }
