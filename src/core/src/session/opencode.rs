@@ -186,6 +186,10 @@ struct CollectedAnalysis {
 }
 
 /// Counts rows that should be understood by the current analysis reader.
+///
+/// Every branch selects exactly what its collector counterpart selects: a row
+/// counted here but unreachable there is reported as schema drift, and a
+/// database made up entirely of such rows fails the whole scan.
 fn count_analysis_candidates(conn: &Connection, time_range: TimeRange) -> Result<usize> {
     let cutoff_ms = cutoff_millis(time_range);
     let (sql, parameterized) = if table_exists(conn, "message")? {
@@ -203,6 +207,7 @@ fn count_analysis_candidates(conn: &Connection, time_range: TimeRange) -> Result
             ),
             None => (
                 "SELECT COUNT(*) FROM message \
+                 JOIN session ON session.id = message.session_id \
                  WHERE json_extract(message.data, '$.role') = 'assistant'",
                 false,
             ),
@@ -1458,6 +1463,58 @@ mod tests {
                 .to_string()
                 .contains("none of 1 OpenCode analysis records")
         );
+    }
+
+    #[test]
+    fn analysis_candidate_count_skips_messages_without_a_session() {
+        let (_dir, db_path) = make_db();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO session (id, directory, time_updated) VALUES ('s1', '/repo', 1780757089000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES ('m1', 's1', ?1)",
+            [assistant_message("model", 1, 2, 0, 0, 0, 0.5)],
+        )
+        .unwrap();
+        // The collectors join `session`, so an assistant row whose session is
+        // gone can never be collected and must not be counted as expected.
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES ('m2', 'gone', ?1)",
+            [assistant_message("model", 3, 4, 0, 0, 0, 0.5)],
+        )
+        .unwrap();
+        drop(conn);
+
+        let result =
+            read_opencode_analysis_with_diagnostics(&db_path, TimeRange::All, ParseMode::Full)
+                .unwrap();
+        assert_eq!(result.expected_records, 1);
+        assert_eq!(result.parsed_records, 1);
+        assert_eq!(result.rows.len(), 1);
+    }
+
+    #[test]
+    fn analysis_accepts_a_database_whose_assistant_rows_are_all_orphaned() {
+        let (_dir, db_path) = make_db();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES ('m1', 'gone', ?1)",
+            [assistant_message("model", 1, 2, 0, 0, 0, 0.5)],
+        )
+        .unwrap();
+        drop(conn);
+
+        let result =
+            read_opencode_analysis_with_diagnostics(&db_path, TimeRange::All, ParseMode::Full)
+                .unwrap();
+        assert_eq!(result.expected_records, 0);
+        assert_eq!(result.parsed_records, 0);
+
+        let rows = read_opencode_analysis(&db_path, TimeRange::All, ParseMode::Full).unwrap();
+        assert!(rows.is_empty());
     }
 
     #[test]

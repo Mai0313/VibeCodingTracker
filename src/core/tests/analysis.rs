@@ -1400,6 +1400,34 @@ fn collection_diagnostics_reject_unknown_opencode_assistant_schema() {
 }
 
 #[test]
+fn collection_diagnostics_accept_opencode_messages_without_a_session() {
+    let home = TempHome::new();
+    std::fs::create_dir_all(home.paths.opencode_db.parent().unwrap()).unwrap();
+    let conn = Connection::open(&home.paths.opencode_db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_updated INTEGER); \
+         CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT); \
+         CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT); \
+         INSERT INTO message VALUES ('m1', 'gone', \
+             '{\"role\":\"assistant\",\"modelID\":\"model\",\"tokens\":{\"input\":1}}');",
+    )
+    .unwrap();
+    drop(conn);
+
+    let dataset = collect_analysis_sessions_from_paths_with(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::OpenCode),
+        ParseMode::Full,
+    )
+    .unwrap();
+    assert!(dataset.is_empty());
+    assert_eq!(dataset.diagnostics.candidates, 1);
+    assert_eq!(dataset.diagnostics.parsed, 1);
+    assert!(dataset.diagnostics.failures.is_empty());
+}
+
+#[test]
 fn streaming_aggregation_retains_partial_failure_diagnostics() {
     let home = TempHome::new();
     home.put_claude_session(
