@@ -307,8 +307,8 @@ enum TrackedTool {
 }
 
 impl TrackedTool {
-    /// Resolves a log name, or `None` for a tool carrying no file-operation
-    /// data (the meta tools `update_topic`, `task_complete`, …). A name absent
+    /// Resolves a log name, or `None` for one this table does not list (the
+    /// meta tools `update_topic`, `task_complete`, … among them). A name absent
     /// here contributes nothing at all, so a tool the parser should track but
     /// this table misses is invisible rather than merely undetailed.
     fn from_name(name: &str) -> Option<Self> {
