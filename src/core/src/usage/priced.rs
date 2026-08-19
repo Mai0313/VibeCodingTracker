@@ -1,10 +1,8 @@
 //! Priced `usage` rows: the library-owned `usage --json` payload.
 //!
-//! Joining each model's tokens with its resolved USD cost used to live in the
-//! binary, so a non-CLI consumer (e.g. a future GUI backend) could not produce
-//! the same shape. [`price_usage_data`] returns a `Serialize`-able row set with
-//! the same `matched_model`-only-when-present behavior the CLI has always
-//! emitted.
+//! [`price_usage_data`] joins each model's tokens with its resolved USD cost
+//! and returns a `Serialize`-able row set, so a non-CLI consumer produces the
+//! same shape the CLI emits.
 
 use crate::models::PerProviderUsage;
 use crate::pricing::{CostSource, ModelPricingMap, resolve_model_cost};
@@ -15,11 +13,11 @@ use serde_json::Value;
 
 /// One priced model row of the `usage --json` output.
 ///
-/// The old binary built each row as a `serde_json::Value` object, whose
-/// `serde_json::Map` (this crate does not enable `preserve_order`) serializes
-/// keys alphabetically. Fields are declared in that same alphabetical order
-/// (`cost_usd`, `matched_model`, `model`, `usage`) so the derived output is
-/// byte-for-byte identical to what the CLI has always emitted.
+/// Fields are declared in alphabetical order (`cost_usd`, `matched_model`,
+/// `model`, `usage`) on purpose: the CLI used to build each row as a
+/// `serde_json::Value`, whose `serde_json::Map` (this crate does not enable
+/// `preserve_order`) serializes keys alphabetically, so keeping that order makes
+/// the derived output byte-for-byte identical. Do not reorder them.
 #[derive(Debug, Clone, Serialize)]
 pub struct PricedUsageRow {
     /// Resolved cost in USD.
@@ -36,12 +34,10 @@ pub struct PricedUsageRow {
 /// Builds the priced `usage --json` payload, joining each model's token counts
 /// with its resolved USD cost.
 ///
-/// For every model it resolves the cost via [`resolve_model_cost`] and emits a
-/// [`PricedUsageRow`]. OpenCode and Hermes models without an exact LiteLLM price
-/// report their own stored cost for their own portion of a merged row rather
-/// than applying it to other providers with the same model name. Rows follow the
-/// insertion order of `usage_data.models` (deliberately unsorted, matching the
-/// historical output).
+/// OpenCode and Hermes models without an exact LiteLLM price report their own
+/// stored cost for their own portion of a merged row rather than applying it to
+/// other providers with the same model name. Rows follow the insertion order of
+/// `usage_data.models` (deliberately unsorted, matching the historical output).
 pub fn price_usage_data(
     usage_data: &UsageData,
     pricing_map: &ModelPricingMap,
@@ -72,10 +68,11 @@ pub fn price_usage_data(
 /// pieces.
 ///
 /// The merged row is priced by summing each provider's own portion under that
-/// provider's cost basis (LiteLLM for the file providers, the stored cost for
-/// OpenCode / Hermes, an input-rate-floored gauge for Grok), so Copilot-billed
-/// Claude tokens keep Copilot's basis even when they share a row with Claude
-/// Code. Shared by the `usage --json` payload and the TUI/table summaries.
+/// provider's cost basis (LiteLLM for the file providers, an exact match else
+/// the stored cost for OpenCode / Hermes / Cursor, LiteLLM with an input-rate
+/// fallback for Grok's cache-read gauge), so OpenCode's stored cost applies only
+/// to OpenCode's own tokens even when another provider shares the row. Returns
+/// `None` when no provider bucket holds `model`.
 pub(crate) fn resolve_merged_model_cost(
     model: &str,
     per_provider: &PerProviderUsage,
@@ -104,9 +101,8 @@ pub(crate) fn resolve_merged_model_cost(
         }
     }
 
-    // OpenCode and Hermes prefer an exact LiteLLM match before their stored
-    // costs. Cursor is a local token estimate, so it uses an exact LiteLLM
-    // price when available and otherwise remains unpriced.
+    // Cursor passes `OpenCodeStored(0.0)`: a local token estimate takes an exact
+    // LiteLLM price when there is one and otherwise stays unpriced.
     let stored =
         |m: &crate::constants::FastHashMap<String, f64>| m.get(model).copied().unwrap_or(0.0);
     for (usage, source) in [

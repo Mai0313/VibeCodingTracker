@@ -15,9 +15,9 @@ pub mod summary;
 pub use aggregator::*;
 pub use pipeline::{PricedUsageScan, scan_usage_priced};
 pub use priced::{PricedUsageRow, price_usage_data};
-// Shared merged-cost resolver used by both the JSON payload and the display
-// summaries.
+// Shared merged-cost resolver used by both the `usage --json` payload and the
+// `summary` roll-up.
 pub(crate) use priced::resolve_merged_model_cost;
-// The token-merge helpers moved to `utils`; keep the historical
-// `usage::normalize_usage_value` path working for the CLI and library callers.
+// Now lives in `utils`; re-exported to keep the historical
+// `usage::normalize_usage_value` path working for library callers.
 pub use crate::utils::normalize_usage_value;
