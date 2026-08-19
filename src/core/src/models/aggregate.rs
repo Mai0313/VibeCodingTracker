@@ -1,9 +1,10 @@
 //! Neutral per-provider totals container shared by the `usage` and `analysis`
 //! roll-ups (and their display summaries).
 //!
-//! `ProviderTotals<S>` is pure data over [`Provider`] — no feature or
-//! presentation knowledge — so both core summaries and the display layer build
-//! and read it without either depending on the other.
+//! `ProviderTotals<S>` carries no feature or presentation knowledge, which is
+//! what lets it live in `models`: `usage` and `analysis` each build one without
+//! importing the other, and the display layer re-exports this type instead of
+//! defining a parallel container.
 
 use crate::models::Provider;
 

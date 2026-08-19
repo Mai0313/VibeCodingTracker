@@ -2,8 +2,7 @@
 //!
 //! [`TimeRange`] is a core domain concept — the aggregators, scanners, and
 //! provider readers all filter sessions by it — so it lives here in `models`
-//! rather than in the CLI layer. The clap surface re-exports it, and
-//! `cli::resolve_time_range*` collapses the period flags into one.
+//! rather than in the CLI layer.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -57,8 +56,7 @@ impl TimeRange {
 
 /// Collapses the period flags into a single [`TimeRange`].
 ///
-/// Checks `daily`, then `weekly`, then `monthly`, returning the first that is
-/// set; falls back to [`TimeRange::All`] when none are. The flags are mutually
+/// Falls back to [`TimeRange::All`] when none is set. The flags are mutually
 /// exclusive at the CLI layer (shared `period` group), so at most one is ever
 /// true here.
 pub fn resolve_time_range(daily: bool, weekly: bool, monthly: bool) -> TimeRange {
