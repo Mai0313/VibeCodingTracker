@@ -135,9 +135,13 @@ impl RowTally {
 /// session's per-model rows) to the session's recorded model. We mirror that so
 /// vct's totals agree with Hermes instead of under-reporting, with one
 /// deliberate divergence: a per-model row this reader cannot place is left out
-/// of the subtraction, because Hermes still shows such a row under its own
-/// (blank) model name while vct emits nothing for it, so subtracting it here
-/// would drop its tokens from both sides.
+/// of the subtraction. Hermes subtracts every row because it goes on to show
+/// each one, a blank model name included; vct emits nothing for a row it cannot
+/// place, so subtracting it here would drop its tokens from both sides. The
+/// residual carries them instead, which re-attributes them to the session's
+/// recorded model — a different model than the row's own, where the row named
+/// one and only its timestamp was unusable. Attributing the tokens imperfectly
+/// beats losing them.
 fn collect_usage(conn: &Connection, time_range: TimeRange) -> Result<DatabaseUsageRead> {
     let cutoff = cutoff_string(time_range);
 
@@ -210,11 +214,6 @@ fn collect_per_model_rows(
             .get::<_, Option<f64>>(9)?
             .or(row.get::<_, Option<f64>>(10)?);
 
-        let model = model.trim();
-        if model.is_empty() {
-            summed.entry(session_id).or_default().unattributed += 1;
-            continue;
-        }
         let Some(seconds) = seconds else {
             summed.entry(session_id).or_default().unattributed += 1;
             continue;
@@ -223,6 +222,16 @@ fn collect_per_model_rows(
             summed.entry(session_id).or_default().unattributed += 1;
             continue;
         };
+        let model = model.trim();
+        if model.is_empty() {
+            // Only a row this window would have reported can be lost in it. A
+            // row with no date at all fails that test in every window, which is
+            // why the two guards above mark unconditionally.
+            if !is_before_cutoff(&date, cutoff) {
+                summed.entry(session_id).or_default().unattributed += 1;
+            }
+            continue;
+        }
         tally.attributed();
 
         // Accumulate raw sums for the residual, even for rows outside the time
@@ -335,11 +344,6 @@ fn reconcile_session_residuals(
             continue;
         }
 
-        let model = model.as_deref().unwrap_or("").trim();
-        if model.is_empty() {
-            tally.dropped(1);
-            continue;
-        }
         let Some(seconds) = row
             .get::<_, Option<f64>>(9)?
             .or(row.get::<_, Option<f64>>(10)?)
@@ -351,13 +355,21 @@ fn reconcile_session_residuals(
             tally.dropped(1);
             continue;
         };
+        let model = model.as_deref().unwrap_or("").trim();
+        let out_of_window = is_before_cutoff(&date, cutoff);
+        if model.is_empty() && !out_of_window {
+            tally.dropped(1);
+            continue;
+        }
         tally.attributed();
         // This residual carries whatever the session's own per-model rows could
-        // not, so those rows are no longer a loss.
+        // not, so those rows stop being a loss. Out of the window it carries
+        // nothing, but nothing is reported for the session there either, so an
+        // unplaceable model costs this scan nothing worth raising.
         if let Some(sums) = summed.get_mut(&id) {
             sums.unattributed = 0;
         }
-        if is_before_cutoff(&date, cutoff) {
+        if out_of_window {
             continue;
         }
 
@@ -984,6 +996,86 @@ mod tests {
         }
         let read = read_hermes_usage_contributions(&db_path, TimeRange::All).unwrap();
         assert_eq!(read.rows.len(), 1);
+        assert_eq!(read.failed_records(), 1);
+        drop(dir);
+    }
+
+    #[test]
+    fn session_residual_with_no_model_is_reported() {
+        // The aggregate has tokens nobody claimed and names no model to put
+        // them under, so they reach no output at all.
+        let (dir, db_path) = make_db();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            insert_session(
+                &conn,
+                "s1",
+                "",
+                100,
+                10,
+                0,
+                0,
+                0.5,
+                0.0,
+                recent_epoch_secs(),
+            );
+        }
+        let read = read_hermes_usage_contributions(&db_path, TimeRange::All).unwrap();
+        assert!(read.rows.is_empty());
+        assert_eq!(read.failed_records(), 1);
+        drop(dir);
+    }
+
+    #[test]
+    fn session_residual_outside_the_time_range_is_not_reported_as_drift() {
+        // Same unusable aggregate, but old enough that a daily scan would not
+        // have reported the session anyway — so it is nothing to raise here.
+        let (dir, db_path) = make_db();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            let old = chrono::Local::now().timestamp() as f64 - 10.0 * 86_400.0;
+            insert_session(&conn, "s1", "", 100, 10, 0, 0, 0.5, 0.0, old);
+        }
+        let read = read_hermes_usage_contributions(&db_path, TimeRange::Daily).unwrap();
+        assert!(read.rows.is_empty());
+        assert_eq!(read.failed_records(), 0);
+        // The same database over the full range does have a loss to report.
+        let all = read_hermes_usage_contributions(&db_path, TimeRange::All).unwrap();
+        assert_eq!(all.failed_records(), 1);
+        drop(dir);
+    }
+
+    #[test]
+    fn session_residual_with_no_timestamp_is_reported() {
+        // Nothing dates this aggregate, so the reader cannot place its residual
+        // in any range. Reaching that guard takes a nullable `started_at`, which
+        // the shipped schema forbids and the reader tolerates anyway.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                     id TEXT PRIMARY KEY,
+                     model TEXT,
+                     input_tokens INTEGER DEFAULT 0,
+                     output_tokens INTEGER DEFAULT 0,
+                     cache_read_tokens INTEGER DEFAULT 0,
+                     cache_write_tokens INTEGER DEFAULT 0,
+                     reasoning_tokens INTEGER DEFAULT 0,
+                     estimated_cost_usd REAL DEFAULT 0,
+                     actual_cost_usd REAL DEFAULT 0,
+                     started_at REAL,
+                     ended_at REAL
+                 );
+                 INSERT INTO sessions (id, model, input_tokens, output_tokens, \
+                     estimated_cost_usd) \
+                 VALUES ('s1', 'gpt-x', 100, 10, 0.5);",
+            )
+            .unwrap();
+        }
+        let read = read_hermes_usage_contributions(&db_path, TimeRange::All).unwrap();
+        assert!(read.rows.is_empty());
         assert_eq!(read.failed_records(), 1);
         drop(dir);
     }
