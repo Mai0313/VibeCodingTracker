@@ -248,7 +248,7 @@ where
 
         if let Some(tur) = &log.tool_use_result {
             let correlated =
-                first_tool_result(log.message.as_ref()).and_then(|(tool_use_id, _, is_error)| {
+                first_tool_result(log.message.as_ref()).and_then(|(tool_use_id, is_error)| {
                     pending_tool_uses
                         .remove(tool_use_id)
                         .map(|pending| (pending, is_error))
@@ -360,17 +360,17 @@ fn is_tracked_file_tool(name: &str) -> bool {
     matches!(name, "Read" | "Write" | "Edit")
 }
 
-fn first_tool_result(message: Option<&ClaudeMessage>) -> Option<(&str, &str, bool)> {
+fn first_tool_result(message: Option<&ClaudeMessage>) -> Option<(&str, bool)> {
     message?.content.iter().find_map(|item| {
         let ClaudeContentItem::ToolResult {
             tool_use_id,
-            content,
             is_error,
+            ..
         } = item
         else {
             return None;
         };
-        Some((tool_use_id.as_str(), content.as_str(), *is_error))
+        Some((tool_use_id.as_str(), *is_error))
     })
 }
 

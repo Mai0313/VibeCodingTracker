@@ -975,10 +975,8 @@ fn collect_read_results(blobs: &[Vec<u8>]) -> HashMap<String, CursorReadResult> 
         let role = msg.get("role").and_then(Value::as_str);
         // Assistant messages are also stored as standalone content-addressed
         // JSON blobs and referenced from binary DAG nodes. Pass 2 reads the
-        // dated node, so this undated payload copy is expected and ignored.
-        if role == Some("assistant") {
-            continue;
-        }
+        // dated node, so this undated payload copy is expected and skipped
+        // here along with every other non-tool role.
         if role != Some("tool") {
             continue;
         }

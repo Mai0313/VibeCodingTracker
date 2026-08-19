@@ -11,7 +11,7 @@ use crate::session::detector::{RecordClassifier, detect_extension_type};
 use crate::session::diagnostics::{ParseDiagnostics, ParsedAnalysis};
 use crate::session::dsh::{has_zstd_magic, parse_dsh_session};
 use crate::session::gemini::parse_gemini_events_with_diagnostics;
-use crate::session::grok::{is_grok_signals, parse_grok_session};
+use crate::session::grok::parse_grok_session;
 use crate::session::state::ParseMode;
 use crate::utils::{get_current_user, get_machine_id, read_json, read_jsonl};
 use anyhow::{Context, Result, bail};
@@ -1057,11 +1057,11 @@ fn raw_record_kind(provider: ExtensionType, value: &Value) -> (bool, bool) {
             (recognized, relevant)
         }
         ExtensionType::Gemini => (false, false),
-        ExtensionType::Grok => (is_grok_signals(value), is_grok_signals(value)),
-        // DeepSeek runs its own reader (and the SQLite providers are not files
-        // at all), so no record of theirs ever reaches the typed-stream path
-        // this classifies for.
-        ExtensionType::DeepSeek
+        // Grok and DeepSeek run their own readers (and the SQLite providers are
+        // not files at all), so no record of theirs ever reaches the
+        // typed-stream path this classifies for.
+        ExtensionType::Grok
+        | ExtensionType::DeepSeek
         | ExtensionType::OpenCode
         | ExtensionType::Cursor
         | ExtensionType::Hermes => (false, false),
