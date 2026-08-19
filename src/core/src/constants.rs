@@ -1,19 +1,19 @@
-//! Compile-time sizing knobs: pre-allocation capacities and I/O buffer sizes.
+//! Compile-time sizing knobs: pre-allocation capacities, I/O buffer sizes, and
+//! the TUI metrics cadence.
 //!
-//! These are best-effort hints to size collections and buffers up front so
-//! the hot paths reallocate less; they are not hard limits except where noted
-//! (e.g. [`capacity::FILE_CACHE_SIZE`], which bounds the LRU).
+//! The capacities and buffer sizes are best-effort hints to size collections
+//! and buffers up front so the hot paths reallocate less; they are not hard
+//! limits except for [`capacity::FILE_CACHE_SIZE`], which bounds the LRU.
 
 /// Hash map backed by `ahash` for fast, non-cryptographic hashing.
 ///
-/// Used in place of `std::collections::HashMap` on hot aggregation paths; the
-/// keys here are not attacker-controlled, so DoS resistance is not required.
+/// Used in place of `std::collections::HashMap` throughout the crate; every key
+/// is process-local rather than attacker-controlled, so DoS resistance is not
+/// required.
 pub type FastHashMap<K, V> = ahash::AHashMap<K, V>;
 
-/// Hash set backed by `ahash` for fast, non-cryptographic hashing.
-///
-/// Used in place of `std::collections::HashSet` on the incremental scan path,
-/// where the keys are process-local (not attacker-controlled).
+/// Hash set backed by `ahash`, replacing `std::collections::HashSet` on the
+/// same grounds as [`FastHashMap`].
 pub type FastHashSet<T> = ahash::AHashSet<T>;
 
 /// Pre-allocation capacity hints to minimize reallocation overhead.
@@ -32,8 +32,9 @@ pub mod capacity {
 
     /// Maximum number of parsed files held in the LRU file cache.
     ///
-    /// Deliberately small (reduced from 15 to 5) to bound RSS in TUI mode,
-    /// where the cache is refreshed repeatedly.
+    /// Deliberately small: every entry holds an `Arc<CodeAnalysis>`, and only
+    /// library callers reach this cache; the CLI and TUI scan paths use the
+    /// compact [`crate::summary_cache::SummaryScanCache`] instead.
     pub const FILE_CACHE_SIZE: usize = 5;
 
     /// Expected number of token fields per usage entry.
@@ -52,9 +53,10 @@ pub mod buffer {
 
 /// TUI refresh cadences.
 pub mod refresh {
-    /// Lightweight CPU/memory sampling + redraw cadence for the summary bar,
-    /// decoupled from the heavier session-aggregation refresh. Reading our own
-    /// process stats and repainting cached rows is nearly free, so this can run
-    /// far more often than the data refresh without noticeable overhead.
+    /// CPU/memory sampling + redraw cadence for the summary bar.
+    ///
+    /// Sampling our own process stats and repainting cached rows is nearly
+    /// free, so this runs far more often than the session-aggregation refresh
+    /// it is decoupled from.
     pub const METRICS_REFRESH_MS: u64 = 2000;
 }

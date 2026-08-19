@@ -25,10 +25,10 @@ pub struct SummaryScanCacheStats {
 
 /// Compact, process-local cache reused by a TUI refresh worker.
 ///
-/// It never stores raw JSON or complete [`CodeAnalysis`] values. File-backed
-/// entries retain only model usage, operation counters, dates, and a compact
-/// diagnostic summary. Database readers use the same container for their
-/// already-aggregated rows.
+/// It never stores raw session JSON or complete [`CodeAnalysis`] values.
+/// File-backed entries retain only model usage, operation counters, dates, and
+/// a compact diagnostic summary. Database readers use the same container for
+/// their already-aggregated rows.
 #[derive(Default)]
 pub struct SummaryScanCache {
     entries: FastHashMap<SummaryCacheKey, CachedSourceSummary>,
@@ -130,7 +130,8 @@ impl SummaryScanCache {
     }
 }
 
-/// Which compact projection a database-backed cache entry contains.
+/// Which projection a cache entry holds: a session file parse, shared by both
+/// features, or one feature's view of a database source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum SummaryKind {
     File,
@@ -304,14 +305,16 @@ pub(crate) struct CompactSourceSummary {
 }
 
 impl CompactSourceSummary {
-    /// Consumes a UsageOnly parse without retaining the full analysis.
+    /// Consumes a `ParseMode::UsageOnly` parse without retaining the full
+    /// analysis.
     pub(crate) fn from_file(analysis: CodeAnalysis, date: String, emit_analysis: bool) -> Self {
         let mut summary = Self::default();
         summary.add_analysis(analysis, date, 0.0, emit_analysis);
         summary
     }
 
-    /// Folds one compact database usage row without materializing CodeAnalysis.
+    /// Folds one compact database usage row without materializing a
+    /// [`CodeAnalysis`].
     pub(crate) fn add_usage_contribution(&mut self, contribution: UsageContribution) {
         let UsageContribution {
             date,
@@ -331,7 +334,7 @@ impl CompactSourceSummary {
         }
     }
 
-    /// Folds one owned analysis row and optional provider-stored cost.
+    /// Folds one owned [`CodeAnalysis`] and its provider-stored cost.
     pub(crate) fn add_analysis(
         &mut self,
         analysis: CodeAnalysis,
