@@ -267,9 +267,22 @@ pub struct CodexTokenTotals {
 
 impl CodexTokenTotals {
     /// Reads the cumulative counters out of a `total_token_usage` object,
-    /// treating missing or non-integer fields as `0`.
-    pub fn from_total_object(total: &serde_json::Map<String, Value>) -> Self {
-        let field = |key: &str| total.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
+    /// carrying `prev`'s value forward for every field the object omits (or
+    /// reports as a non-integer).
+    ///
+    /// The counters are whole-session cumulative, so an omitted field is
+    /// unreported rather than back to zero, and its last reported value is
+    /// the only defensible reading. Reading it as zero instead makes the
+    /// snapshot look like a counter restart and re-attributes the whole
+    /// session prefix to the current model.
+    pub fn from_total_object(total: &serde_json::Map<String, Value>, prev: Option<&Self>) -> Self {
+        let carried = prev.copied().unwrap_or_default();
+        let field = |key: &str| {
+            total
+                .get(key)
+                .and_then(|v| v.as_i64())
+                .unwrap_or_else(|| carried.field(key))
+        };
         Self {
             input_tokens: field("input_tokens"),
             cached_input_tokens: field("cached_input_tokens"),
@@ -293,15 +306,20 @@ impl CodexTokenTotals {
     /// Builds the per-event delta map against `prev`, keeping only the keys
     /// actually present in `total` so absent fields stay absent downstream.
     ///
-    /// A drop in `total_tokens` means the counter restarted (never observed
-    /// in real logs, but cheap to guard): the event is treated as the start
-    /// of a new segment rather than clamping every field to zero, which
-    /// would silently drop the new segment's early tokens.
+    /// A reported drop in `total_tokens` means the counter restarted (never
+    /// observed in real logs, but cheap to guard): the event is treated as
+    /// the start of a new segment rather than clamping every field to zero,
+    /// which would silently drop the new segment's early tokens. An object
+    /// that omits the field reports no drop at all — [`from_total_object`]
+    /// carries the previous total forward, so an absent field can never be
+    /// mistaken for a restart.
+    ///
+    /// [`from_total_object`]: Self::from_total_object
     pub fn delta_fields(
         total: &serde_json::Map<String, Value>,
         prev: Option<&Self>,
     ) -> serde_json::Map<String, Value> {
-        let current = Self::from_total_object(total);
+        let current = Self::from_total_object(total, prev);
         let base = match prev {
             Some(prev) if current.total_tokens >= prev.total_tokens => *prev,
             _ => Self::default(),
@@ -721,7 +739,7 @@ mod tests {
             &first,
             false,
         );
-        let prev = CodexTokenTotals::from_total_object(first_total);
+        let prev = CodexTokenTotals::from_total_object(first_total, None);
 
         let second = json!({
             "total_token_usage": {
@@ -774,6 +792,63 @@ mod tests {
         assert_eq!(delta["input_tokens"].as_i64().unwrap(), 500);
         assert_eq!(delta["output_tokens"].as_i64().unwrap(), 100);
         assert_eq!(delta["total_tokens"].as_i64().unwrap(), 600);
+    }
+
+    #[test]
+    fn codex_delta_ignores_a_total_tokens_the_event_never_reported() {
+        // An object carrying only some of the counters says nothing about a
+        // restart: only its own increments may be attributed, never the whole
+        // cumulative prefix.
+        let prev = CodexTokenTotals {
+            input_tokens: 20_000,
+            cached_input_tokens: 4_000,
+            output_tokens: 3_289,
+            reasoning_output_tokens: 1_000,
+            total_tokens: 23_289,
+        };
+        let total = json!({
+            "input_tokens": 21_000,
+            "cached_input_tokens": 4_500,
+            "output_tokens": 3_500
+        });
+        let delta = CodexTokenTotals::delta_fields(total.as_object().unwrap(), Some(&prev));
+        assert_eq!(delta["input_tokens"].as_i64().unwrap(), 1_000);
+        assert_eq!(delta["cached_input_tokens"].as_i64().unwrap(), 500);
+        assert_eq!(delta["output_tokens"].as_i64().unwrap(), 211);
+        assert!(!delta.contains_key("total_tokens"));
+    }
+
+    #[test]
+    fn codex_snapshot_carries_an_unreported_counter_forward() {
+        // The next event that does report `total_tokens` must measure against
+        // the last reported value, not against zero.
+        let first = json!({
+            "input_tokens": 20_000,
+            "cached_input_tokens": 4_000,
+            "output_tokens": 3_289,
+            "reasoning_output_tokens": 1_000,
+            "total_tokens": 23_289
+        });
+        let first = CodexTokenTotals::from_total_object(first.as_object().unwrap(), None);
+
+        let second = json!({
+            "input_tokens": 21_000,
+            "output_tokens": 3_500
+        });
+        let second = CodexTokenTotals::from_total_object(second.as_object().unwrap(), Some(&first));
+        assert_eq!(second.total_tokens, 23_289);
+        assert_eq!(second.cached_input_tokens, 4_000);
+
+        let third = json!({
+            "input_tokens": 90_000,
+            "cached_input_tokens": 60_000,
+            "output_tokens": 14_576,
+            "reasoning_output_tokens": 5_000,
+            "total_tokens": 104_576
+        });
+        let delta = CodexTokenTotals::delta_fields(third.as_object().unwrap(), Some(&second));
+        assert_eq!(delta["total_tokens"].as_i64().unwrap(), 104_576 - 23_289);
+        assert_eq!(delta["cached_input_tokens"].as_i64().unwrap(), 56_000);
     }
 
     #[test]
