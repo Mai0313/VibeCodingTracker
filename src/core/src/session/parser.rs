@@ -11,7 +11,7 @@ use crate::session::detector::{RecordClassifier, detect_extension_type};
 use crate::session::diagnostics::{ParseDiagnostics, ParsedAnalysis};
 use crate::session::dsh::{has_zstd_magic, parse_dsh_session};
 use crate::session::gemini::parse_gemini_events_with_diagnostics;
-use crate::session::grok::{is_grok_signals, parse_grok_session};
+use crate::session::grok::parse_grok_session;
 use crate::session::state::ParseMode;
 use crate::utils::{get_current_user, get_machine_id, read_json, read_jsonl};
 use anyhow::{Context, Result, bail};
@@ -346,6 +346,7 @@ fn stream_parse_known(
             let rest = iter_jsonl_typed(
                 &mut stream.reader,
                 provider,
+                stream.lines_read,
                 Rc::clone(&diagnostics),
                 Rc::clone(&warnings),
                 Rc::clone(&io_failure),
@@ -375,6 +376,7 @@ fn stream_parse_known(
             let rest = iter_jsonl_typed(
                 &mut stream.reader,
                 provider,
+                stream.lines_read,
                 Rc::clone(&diagnostics),
                 Rc::clone(&warnings),
                 Rc::clone(&io_failure),
@@ -404,6 +406,7 @@ fn stream_parse_known(
             let rest = iter_jsonl_typed(
                 &mut stream.reader,
                 provider,
+                stream.lines_read,
                 Rc::clone(&diagnostics),
                 Rc::clone(&warnings),
                 Rc::clone(&io_failure),
@@ -441,7 +444,8 @@ fn stream_parse_known_dynamic(
         File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
     let mut reader = BufReader::with_capacity(buffer::FILE_READ_BUFFER, file);
 
-    let first_line = match read_next_non_empty_line(&mut reader)? {
+    let mut lines_read = 0_usize;
+    let first_line = match read_next_non_empty_line(&mut reader, &mut lines_read)? {
         Some(line) => line,
         None => return Ok(None), // empty file — caller returns the empty shape
     };
@@ -460,6 +464,7 @@ fn stream_parse_known_dynamic(
         Rc::new(RefCell::new(ParseWarningSummary::default())),
         path,
         tiers,
+        lines_read,
     )?;
     Ok(Some(finalize(parsed, provider)))
 }
@@ -469,6 +474,9 @@ struct TypedStream<T> {
     reader: BufReader<File>,
     diagnostics: ParseDiagnostics,
     warnings: ParseWarningSummary,
+    /// Physical lines the first record consumed, so the rest of the file keeps
+    /// reporting real line numbers.
+    lines_read: usize,
 }
 
 /// Opens a JSONL source and parses its first record directly into `T`.
@@ -483,8 +491,9 @@ where
         File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
     let mut reader = BufReader::with_capacity(buffer::FILE_READ_BUFFER, file);
     let mut line = Vec::with_capacity(buffer::AVG_JSONL_LINE_SIZE);
+    let mut lines_read = 0_usize;
 
-    if !read_next_non_empty_bytes(&mut reader, &mut line)? {
+    if !read_next_non_empty_bytes(&mut reader, &mut line, &mut lines_read)? {
         return Ok(None);
     }
 
@@ -516,6 +525,7 @@ where
         reader,
         diagnostics,
         warnings,
+        lines_read,
     }))
 }
 
@@ -555,14 +565,15 @@ fn stream_parse_autodetect(path: &Path, mode: ParseMode) -> Result<Option<Parsed
     let mut initial_diagnostics = ParseDiagnostics::default();
     let mut classifier = RecordClassifier::default();
     let warnings = Rc::new(RefCell::new(ParseWarningSummary::default()));
-    let mut line_number = 0_usize;
+    // Physical lines, blank ones included, so the number a malformed record is
+    // reported under is the one an editor shows.
+    let mut lines_read = 0_usize;
 
     loop {
-        let line = match read_next_non_empty_line(&mut reader)? {
+        let line = match read_next_non_empty_line(&mut reader, &mut lines_read)? {
             Some(line) => line,
             None => break,
         };
-        line_number += 1;
 
         match serde_json::from_str::<Value>(line.trim()) {
             Ok(v) => {
@@ -584,7 +595,7 @@ fn stream_parse_autodetect(path: &Path, mode: ParseMode) -> Result<Option<Parsed
                     first_line_was_json = Some(false);
                     break;
                 }
-                warnings.borrow_mut().record_malformed(line_number, &err);
+                warnings.borrow_mut().record_malformed(lines_read, &err);
                 initial_diagnostics.record_malformed();
             }
         }
@@ -608,6 +619,7 @@ fn stream_parse_autodetect(path: &Path, mode: ParseMode) -> Result<Option<Parsed
         warnings,
         path,
         None,
+        lines_read,
     )?;
     Ok(Some(finalize(parsed, ext)))
 }
@@ -615,11 +627,18 @@ fn stream_parse_autodetect(path: &Path, mode: ParseMode) -> Result<Option<Parsed
 /// Reads lines from `reader` until it finds a non-empty one. Returns `Ok(None)`
 /// at EOF.
 ///
+/// `consumed` counts every physical line read, blank ones included, so a caller
+/// that continues the file with another reader can keep reporting the same line
+/// numbers the user sees in an editor.
+///
 /// # Errors
 ///
 /// Returns an error if the underlying `read_line` fails (e.g. an I/O error or
 /// invalid UTF-8 in the stream).
-fn read_next_non_empty_line<R: BufRead>(reader: &mut R) -> Result<Option<String>> {
+fn read_next_non_empty_line<R: BufRead>(
+    reader: &mut R,
+    consumed: &mut usize,
+) -> Result<Option<String>> {
     let mut line = String::new();
     loop {
         line.clear();
@@ -629,6 +648,7 @@ fn read_next_non_empty_line<R: BufRead>(reader: &mut R) -> Result<Option<String>
         if n == 0 {
             return Ok(None);
         }
+        *consumed += 1;
         if !line.trim().is_empty() {
             return Ok(Some(line));
         }
@@ -636,7 +656,13 @@ fn read_next_non_empty_line<R: BufRead>(reader: &mut R) -> Result<Option<String>
 }
 
 /// Reuses `line` while reading through blank lines to the next JSONL record.
-fn read_next_non_empty_bytes<R: BufRead>(reader: &mut R, line: &mut Vec<u8>) -> Result<bool> {
+///
+/// `consumed` counts physical lines exactly as in [`read_next_non_empty_line`].
+fn read_next_non_empty_bytes<R: BufRead>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+    consumed: &mut usize,
+) -> Result<bool> {
     loop {
         line.clear();
         let count = reader
@@ -645,6 +671,7 @@ fn read_next_non_empty_bytes<R: BufRead>(reader: &mut R, line: &mut Vec<u8>) -> 
         if count == 0 {
             return Ok(false);
         }
+        *consumed += 1;
         if !trim_ascii_whitespace(line).is_empty() {
             return Ok(true);
         }
@@ -679,6 +706,7 @@ fn dispatch_streaming_buffered(
     warnings: Rc<RefCell<ParseWarningSummary>>,
     path: &Path,
     tiers: Option<&TierThresholds>,
+    lines_read: usize,
 ) -> Result<ParsedAnalysis> {
     let extra_diagnostics = Rc::new(RefCell::new(initial_diagnostics));
     let io_failure = Rc::new(RefCell::new(None));
@@ -686,6 +714,7 @@ fn dispatch_streaming_buffered(
         ExtensionType::ClaudeCode => {
             let rest = iter_jsonl_values(
                 &mut reader,
+                lines_read,
                 Rc::clone(&extra_diagnostics),
                 Rc::clone(&warnings),
                 Rc::clone(&io_failure),
@@ -699,6 +728,7 @@ fn dispatch_streaming_buffered(
         ExtensionType::Codex => {
             let rest = iter_jsonl_values(
                 &mut reader,
+                lines_read,
                 Rc::clone(&extra_diagnostics),
                 Rc::clone(&warnings),
                 Rc::clone(&io_failure),
@@ -712,6 +742,7 @@ fn dispatch_streaming_buffered(
         ExtensionType::Copilot => {
             let rest = iter_jsonl_values(
                 &mut reader,
+                lines_read,
                 Rc::clone(&extra_diagnostics),
                 Rc::clone(&warnings),
                 Rc::clone(&io_failure),
@@ -736,6 +767,7 @@ fn dispatch_streaming_buffered(
 
                 let rest_events = iter_jsonl_values(
                     &mut reader,
+                    lines_read,
                     Rc::clone(&extra_diagnostics),
                     Rc::clone(&warnings),
                     Rc::clone(&io_failure),
@@ -784,10 +816,12 @@ fn json_error_category(error: &serde_json::Error) -> &'static str {
 ///
 /// The line buffer is retained across iterations. A raw `Value` is only built
 /// when typed deserialization fails and diagnostics need to classify the
-/// unsupported record.
+/// unsupported record. `lines_read` is how many physical lines the caller
+/// already consumed from `reader`, so reported line numbers stay absolute.
 fn iter_jsonl_typed<'a, T>(
     reader: &'a mut BufReader<File>,
     provider: ExtensionType,
+    lines_read: usize,
     diagnostics: Rc<RefCell<ParseDiagnostics>>,
     warnings: Rc<RefCell<ParseWarningSummary>>,
     io_failure: Rc<RefCell<Option<String>>>,
@@ -796,7 +830,7 @@ where
     T: DeserializeOwned + 'a,
 {
     let mut line = Vec::with_capacity(buffer::AVG_JSONL_LINE_SIZE);
-    let mut line_number = 1_usize;
+    let mut line_number = lines_read;
 
     std::iter::from_fn(move || {
         loop {
@@ -847,8 +881,13 @@ where
 /// through this too, since the classifier has already materialized their
 /// buffered prefix as `Value`s; those three convert each one into their typed
 /// record straight away.
+///
+/// `lines_read` is how many physical lines the caller already consumed from
+/// `reader` — the buffered prefix on the auto-detect path — so reported line
+/// numbers stay absolute instead of restarting at 1.
 fn iter_jsonl_values<'a>(
     reader: &'a mut BufReader<File>,
+    lines_read: usize,
     diagnostics: Rc<RefCell<ParseDiagnostics>>,
     warnings: Rc<RefCell<ParseWarningSummary>>,
     io_failure: Rc<RefCell<Option<String>>>,
@@ -856,7 +895,7 @@ fn iter_jsonl_values<'a>(
     // Reuse one byte buffer via `read_until` instead of allocating a `String`
     // per line (`reader.lines()`).
     let mut line = Vec::with_capacity(buffer::AVG_JSONL_LINE_SIZE);
-    let mut line_number = 0_usize;
+    let mut line_number = lines_read;
 
     std::iter::from_fn(move || {
         loop {
@@ -1057,11 +1096,11 @@ fn raw_record_kind(provider: ExtensionType, value: &Value) -> (bool, bool) {
             (recognized, relevant)
         }
         ExtensionType::Gemini => (false, false),
-        ExtensionType::Grok => (is_grok_signals(value), is_grok_signals(value)),
-        // DeepSeek runs its own reader (and the SQLite providers are not files
-        // at all), so no record of theirs ever reaches the typed-stream path
-        // this classifies for.
-        ExtensionType::DeepSeek
+        // Grok and DeepSeek run their own readers (and the SQLite providers are
+        // not files at all), so no record of theirs ever reaches the
+        // typed-stream path this classifies for.
+        ExtensionType::Grok
+        | ExtensionType::DeepSeek
         | ExtensionType::OpenCode
         | ExtensionType::Cursor
         | ExtensionType::Hermes => (false, false),
@@ -1206,5 +1245,36 @@ mod tests {
 
         assert_eq!(parsed.analysis.extension_name, "Claude-Code");
         assert_eq!(record_inspections(), 10_001);
+    }
+
+    #[test]
+    fn a_malformed_record_is_reported_under_its_physical_line() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("session.jsonl");
+        // Record, blank, record, malformed: the failure sits on line 4.
+        std::fs::write(&path, "{\"a\":1}\n\n{\"b\":2}\nnot json\n").unwrap();
+
+        let mut reader = BufReader::new(File::open(&path).unwrap());
+        let mut lines_read = 0_usize;
+        // Every streaming entry point consumes the first record before handing
+        // the rest of the file to the iterator.
+        read_next_non_empty_line(&mut reader, &mut lines_read)
+            .unwrap()
+            .unwrap();
+        assert_eq!(lines_read, 1);
+
+        let warnings = Rc::new(RefCell::new(ParseWarningSummary::default()));
+        let rest: Vec<Value> = iter_jsonl_values(
+            &mut reader,
+            lines_read,
+            Rc::new(RefCell::new(ParseDiagnostics::default())),
+            Rc::clone(&warnings),
+            Rc::new(RefCell::new(None)),
+        )
+        .collect();
+
+        assert_eq!(rest.len(), 1);
+        let reason = warnings.borrow().first_reason.clone().unwrap();
+        assert!(reason.starts_with("malformed line 4:"), "{reason}");
     }
 }

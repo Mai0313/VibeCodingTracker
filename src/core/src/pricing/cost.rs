@@ -1,11 +1,11 @@
 //! Per-model USD cost resolution.
 //!
-//! Turns a model's [`TokenCounts`](crate::utils::TokenCounts) into a dollar
-//! cost against the [`ModelPricingMap`], branching on the authoritative cost
-//! source for the provider that produced the tokens. This is pure pricing
-//! policy (no `usage`- or `analysis`-feature knowledge), so it lives in
-//! `pricing` and the `usage` roll-up consumes it for both the `--json` rows and
-//! the priced summary the frontends render.
+//! Turns a model's [`TokenCounts`] into a dollar cost against the
+//! [`ModelPricingMap`], branching on the authoritative cost source for the
+//! provider that produced the tokens. This is pure pricing policy (no `usage`-
+//! or `analysis`-feature knowledge), so it lives in `pricing` and the `usage`
+//! roll-up consumes it for both the `--json` rows and the priced summary the
+//! frontends render.
 
 use crate::pricing::{ModelPricing, ModelPricingMap, calculate_cost};
 use crate::utils::TokenCounts;
@@ -24,11 +24,11 @@ pub enum CostSource {
     /// novel model like `deepseek-v4-pro` reports OpenCode's own cost instead of
     /// being priced against a loosely-similar name.
     OpenCodeStored(f64),
-    /// Caller-supplied Cursor cost, used verbatim and never re-priced from
-    /// tokens. VCT's own Cursor scan is a local token estimate carrying no
-    /// cost, so it prices through an exact LiteLLM match instead and never
-    /// builds this variant.
-    CursorStored(f64),
+    /// Cursor: a local token estimate that carries no cost of its own, so an
+    /// **exact** LiteLLM match prices it from tokens and anything else stays at
+    /// `$0`. Cursor bills several models under its own internal names, and an
+    /// unpriced row beats one guessed from a loosely-similar name.
+    CursorEstimate,
     /// Hermes: same basis as [`CostSource::OpenCodeStored`] — an **exact**
     /// LiteLLM match prices from tokens, otherwise Hermes's own stored cost is
     /// used. Hermes often bills novel models LiteLLM can't price, so its own
@@ -60,14 +60,16 @@ pub fn resolve_model_cost(
         token_cost + counts.web_search_requests as f64 * pricing.web_search_cost_per_query
     };
 
+    // An exact LiteLLM key prices from tokens; anything else falls back to
+    // `stored` rather than to a normalized / substring / fuzzy neighbor.
+    let exact_or = |stored: f64| match pricing_map.get_exact(model) {
+        Some(pricing) => (priced(&pricing), None),
+        None => (stored, None),
+    };
+
     match source {
-        CostSource::CursorStored(stored) => (stored, None),
-        CostSource::OpenCodeStored(stored) | CostSource::HermesStored(stored) => {
-            match pricing_map.get_exact(model) {
-                Some(pricing) => (priced(&pricing), None),
-                None => (stored, None),
-            }
-        }
+        CostSource::CursorEstimate => exact_or(0.0),
+        CostSource::OpenCodeStored(stored) | CostSource::HermesStored(stored) => exact_or(stored),
         CostSource::Litellm => {
             let result = pricing_map.get(model);
             (priced(&result.pricing), result.matched_model)
@@ -140,18 +142,28 @@ mod tests {
     }
 
     #[test]
-    fn test_cursor_stored_cost_ignores_exact_match() {
+    fn test_cursor_estimate_prices_only_on_exact_match() {
         clear_pricing_cache();
         let map = map_with_gpt4();
-        // Cursor's dashboard cost is authoritative even when an exact LiteLLM
-        // price exists -> use the stored cost, never re-price from tokens.
+        // Exact LiteLLM price -> price the local estimate from tokens.
         let (cost, matched) = resolve_model_cost(
             "gpt-4",
             &counts(1_000_000),
             &map,
-            CostSource::CursorStored(3.5),
+            CostSource::CursorEstimate,
         );
-        assert!((cost - 3.5).abs() < 1e-9);
+        assert!((cost - 10.0).abs() < 1e-6);
+        assert!(matched.is_none());
+
+        // No exact price: Cursor records no cost of its own, so the row stays
+        // unpriced instead of being guessed from a similar name.
+        let (cost, matched) = resolve_model_cost(
+            "composer-2",
+            &counts(1_000_000),
+            &map,
+            CostSource::CursorEstimate,
+        );
+        assert_eq!(cost, 0.0);
         assert!(matched.is_none());
     }
 

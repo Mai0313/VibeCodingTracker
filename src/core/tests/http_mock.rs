@@ -10,8 +10,7 @@ use httpmock::prelude::*;
 use serde_json::json;
 use vct_core::quota::http::build_client;
 use vct_core::quota::wham::{
-    ResetCreditsResult, WhamResult, call_reset_credit_details, call_wham,
-    call_wham_with_reset_credits, refresh_codex,
+    ResetCreditsResult, WhamResult, call_reset_credit_details, call_wham, refresh_codex,
 };
 use vct_test_support::fixture_str;
 
@@ -72,14 +71,8 @@ fn call_wham_500_is_transient() {
 }
 
 #[test]
-fn call_wham_with_reset_credits_maps_details() {
+fn call_reset_credit_details_maps_available_credits() {
     let server = MockServer::start();
-    let usage = server.mock(|when, then| {
-        when.method(GET).path("/wham");
-        then.status(200)
-            .header("content-type", "application/json")
-            .body(fixture_str("quota/wham_usage_response.json"));
-    });
     let details = server.mock(|when, then| {
         when.method(GET)
             .path("/reset-credits")
@@ -94,58 +87,21 @@ fn call_wham_with_reset_credits_maps_details() {
     });
     let client = build_client().unwrap();
 
-    let result = call_wham_with_reset_credits(
-        &client,
-        "tok",
-        Some("acct"),
-        1_000_000,
-        &server.url("/wham"),
-        &server.url("/reset-credits"),
-    );
+    let result =
+        call_reset_credit_details(&client, "tok", Some("acct"), &server.url("/reset-credits"));
 
-    usage.assert();
     details.assert();
     match result {
-        WhamResult::Ok(snap) => {
-            assert_eq!(snap.reset_credits_available, Some(5));
-            let expirations = snap.reset_credit_expirations.unwrap();
+        ResetCreditsResult::Ok {
+            available_count,
+            expirations,
+        } => {
+            assert_eq!(available_count, Some(5));
             assert_eq!(expirations.len(), 3);
             assert!(expirations[0].unwrap() < expirations[1].unwrap());
             assert_eq!(expirations[2], None);
         }
-        _ => panic!("expected WhamResult::Ok"),
-    }
-}
-
-#[test]
-fn reset_credit_details_failure_preserves_usage_summary() {
-    let server = MockServer::start();
-    server.mock(|when, then| {
-        when.method(GET).path("/wham");
-        then.status(200)
-            .body(fixture_str("quota/wham_usage_response.json"));
-    });
-    server.mock(|when, then| {
-        when.method(GET).path("/reset-credits");
-        then.status(500).body("boom");
-    });
-    let client = build_client().unwrap();
-
-    let result = call_wham_with_reset_credits(
-        &client,
-        "tok",
-        Some("acct"),
-        1_000_000,
-        &server.url("/wham"),
-        &server.url("/reset-credits"),
-    );
-
-    match result {
-        WhamResult::Ok(snap) => {
-            assert_eq!(snap.reset_credits_available, Some(2));
-            assert!(snap.reset_credit_expirations.is_none());
-        }
-        _ => panic!("details failure must not fail the usage snapshot"),
+        _ => panic!("expected ResetCreditsResult::Ok"),
     }
 }
 

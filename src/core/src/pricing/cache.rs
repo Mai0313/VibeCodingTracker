@@ -43,18 +43,23 @@ pub struct ThresholdTier {
 
 /// A single range for range-based tiered pricing (Qwen / doubao style).
 ///
-/// Selection is by `min_tokens` alone: `calculate_cost` takes the last range
-/// whose `min_tokens` is at or below the request's `input_tokens`, so an input
-/// past the final `max_tokens` (or inside a gap between rows) still bills at
-/// the nearest lower row. Unlike `ThresholdTier`, a range replaces the input,
-/// output, reasoning and cache-read prices outright; only cache-write prices
-/// still come from the base level, which LiteLLM does not publish per range.
+/// Rows are sorted ascending, and only the first two are ever selected: the
+/// session parsers classify each request against row 0's `max_tokens`, and
+/// `calculate_cost` bills the base slice at row 0 and the above-bound slice at
+/// row 1. A request bigger than row 1 covers therefore bills at row 1 — the
+/// same lower bound `ThresholdTier` takes for its own higher tiers, because
+/// one `above_*` bucket can only carry two levels.
+///
+/// Unlike `ThresholdTier`, a range replaces the input, output, reasoning and
+/// cache-read prices outright; only cache-write prices still come from the
+/// base level, which LiteLLM does not publish per range.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct TierRange {
     /// Inclusive lower bound of the input-token range this row prices.
     pub min_tokens: i64,
-    /// Exclusive upper bound as published by LiteLLM; selection reads only
-    /// `min_tokens`.
+    /// Exclusive upper bound as published by LiteLLM. Row 0's is the
+    /// per-request classification bound the parsers compare against; the rest
+    /// are informational, since no row past 1 is ever selected.
     pub max_tokens: i64,
     /// Input price in USD per token within this range.
     #[serde(default)]
@@ -73,8 +78,11 @@ pub struct TierRange {
 /// Pricing data for a single AI model in USD per token.
 ///
 /// Supports three strategies, checked in this order by `calculate_cost`:
-/// 1. **Range-based** (`ranges` is `Some`): `input_tokens` selects a `TierRange`
-///    and its prices are applied standalone. Used by Qwen / doubao families.
+/// 1. **Range-based** (`ranges` is `Some`): the session parsers classify each
+///    request against `ranges[0].max_tokens` while folding, and
+///    `calculate_cost` bills that above-bound slice at `ranges[1]`'s prices
+///    with the rest staying on `ranges[0]`'s. Rows past the second are never
+///    selected. Used by the Qwen / doubao families.
 /// 2. **Threshold-based** (`tiers` is non-empty): the session parsers classify
 ///    each request against the model's lowest `threshold_tokens` while folding,
 ///    and `calculate_cost` bills that above-threshold slice at `tiers[0]`'s
@@ -308,9 +316,10 @@ pub fn parse_litellm_entry(value: &serde_json::Value) -> ModelPricing {
         })
         .collect();
 
-    // Range-based models: sort by min_tokens ascending so selection can assume
-    // ordering (LiteLLM data is already sorted, but being explicit makes the
-    // `calculate_cost` dispatch logic simpler to reason about).
+    // Range-based models: sort by min_tokens ascending so `ranges[0]` and
+    // `ranges[1]` really are the two lowest rows, which is what both the
+    // threshold snapshot and `calculate_cost` index them as (LiteLLM data is
+    // already sorted, but relying on that silently would be a trap).
     if let Some(ranges) = pricing.ranges.as_mut() {
         ranges.sort_by_key(|r| r.min_tokens);
     }
@@ -388,15 +397,18 @@ pub(crate) fn pricing_cache_date() -> String {
 
 /// Removes outdated pricing cache files in `dir`, keeping only today's cache.
 ///
-/// Best-effort: an unreadable directory or a failed delete is ignored rather
-/// than propagated, since a stale cache file is harmless and rotates out daily.
+/// Best-effort: an unreadable directory or a failed delete is logged rather
+/// than propagated, since a stale cache file is harmless. A delete that keeps
+/// failing does not rotate out on its own, though, so it is worth a warning.
 pub fn cleanup_old_cache_in(dir: &Path) {
     let today = pricing_cache_date();
 
     for (filename, path) in list_pricing_cache_files_in(dir) {
         if !filename.contains(&today) {
-            let _ = fs::remove_file(&path);
-            log::debug!("Removed old cache file: {:?}", path);
+            match fs::remove_file(&path) {
+                Ok(()) => log::debug!("Removed old cache file: {}", path.display()),
+                Err(e) => log::warn!("Failed to remove old cache file {}: {e}", path.display()),
+            }
         }
     }
 }

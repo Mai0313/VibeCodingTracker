@@ -112,10 +112,12 @@ struct CopilotCreds {
 /// the entitlement API host from the account's login host.
 ///
 /// Prefers the `lastLoggedInUser` account's `<host>:<login>` key so a config
-/// still holding several accounts queries the one the user is actually on;
-/// otherwise takes the lowest-sorting `https://github.com` key, `serde_json`
-/// being built without `preserve_order` here so the file's own order is
-/// already gone.
+/// still holding several accounts queries the one the user is actually on.
+/// Without one, any host carrying a token will do — a GHE-only config is a
+/// logged-in account, not a logged-out one — picked in an explicit order
+/// (github.com first, then the lowest-sorting key) because `serde_json` is
+/// built without `preserve_order` here, so the file's own order is already
+/// gone by the time this runs.
 fn read_copilot_creds(body: &str) -> Option<CopilotCreds> {
     let stripped = strip_jsonc_comments(body);
     let root: serde_json::Value = serde_json::from_str(&stripped).ok()?;
@@ -128,24 +130,43 @@ fn read_copilot_creds(body: &str) -> Option<CopilotCreds> {
         let host = user.get("host")?.as_str()?;
         let login = user.get("login")?.as_str()?;
         let key = format!("{host}:{login}");
+        // A key naming no host to call is no more usable here than in the
+        // fallback below, so drop through to the rest of the file instead of
+        // calling the whole config logged out.
+        split_token_key(&key)?;
         let token = tokens.get(&key).and_then(entry_token)?;
         Some((key, token))
     });
 
     let (key, token) = match preferred {
         Some(pair) => pair,
-        None => {
-            let (k, v) = tokens
-                .iter()
-                .find(|(k, _)| k.starts_with("https://github.com"))?;
-            (k.clone(), entry_token(v)?)
-        }
+        None => tokens
+            .iter()
+            .filter_map(|(key, value)| {
+                let (domain, _) = split_token_key(key)?;
+                Some((domain == "github.com", key, entry_token(value)?))
+            })
+            .min_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)))
+            .map(|(_, key, token)| (key.clone(), token))?,
     };
 
     Some(CopilotCreds {
-        api_url: copilot_api_url(&key),
+        api_url: copilot_api_url(&key)?,
         token,
     })
+}
+
+/// Splits a `copilotTokens` key into its scheme-stripped domain and login:
+/// `https://acme.ghe.com:me` -> `("acme.ghe.com", "me")`.
+///
+/// `None` for anything that is not a `<scheme>://<host>:<login>` login URL —
+/// such a key names no host to call, so it is not a login this can use.
+fn split_token_key(key: &str) -> Option<(&str, &str)> {
+    let (host, login) = key.rsplit_once(':')?;
+    let domain = host
+        .strip_prefix("https://")
+        .or_else(|| host.strip_prefix("http://"))?;
+    (!domain.is_empty() && !login.is_empty()).then_some((domain, login))
 }
 
 /// Derives the entitlement API URL from a `copilotTokens` key (`<host>:<login>`).
@@ -153,12 +174,9 @@ fn read_copilot_creds(body: &str) -> Option<CopilotCreds> {
 /// `https://github.com:me` -> `https://api.github.com/copilot_internal/user`; a
 /// GHE data-residency host (`https://acme.ghe.com:me`) maps to
 /// `https://api.acme.ghe.com/...` so those tokens reach the correct host.
-fn copilot_api_url(key: &str) -> String {
-    let host = key.rsplit_once(':').map(|(h, _)| h).unwrap_or(key);
-    let domain = host
-        .trim_start_matches("https://")
-        .trim_start_matches("http://");
-    format!("https://api.{domain}{COPILOT_USAGE_PATH}")
+fn copilot_api_url(key: &str) -> Option<String> {
+    let (domain, _) = split_token_key(key)?;
+    Some(format!("https://api.{domain}{COPILOT_USAGE_PATH}"))
 }
 
 /// Maps a `/copilot_internal/user` body into a [`CopilotQuotaSnapshot`] (pure).
@@ -425,16 +443,69 @@ mod tests {
     }
 
     #[test]
+    fn falls_back_to_a_ghe_token_without_last_user() {
+        let cfg = r#"{ "copilotTokens": { "https://acme.ghe.com:me": "gho_GHE" } }"#;
+        let creds = read_copilot_creds(cfg).unwrap();
+        assert_eq!(creds.token, "gho_GHE");
+        assert_eq!(
+            creds.api_url,
+            "https://api.acme.ghe.com/copilot_internal/user"
+        );
+    }
+
+    #[test]
+    fn fallback_prefers_github_com_over_another_host() {
+        // The GHE key sorts first, so only the host preference decides this.
+        let cfg = r#"{
+            "copilotTokens": {
+                "https://acme.ghe.com:me": "gho_GHE",
+                "https://github.com:zoe": "gho_DOTCOM"
+            }
+        }"#;
+        assert_eq!(read_copilot_creds(cfg).unwrap().token, "gho_DOTCOM");
+    }
+
+    #[test]
+    fn fallback_between_github_logins_takes_the_lowest_key() {
+        let cfg = r#"{
+            "copilotTokens": {
+                "https://github.com:bob": "gho_BOB",
+                "https://github.com:alice": "gho_ALICE"
+            }
+        }"#;
+        assert_eq!(read_copilot_creds(cfg).unwrap().token, "gho_ALICE");
+    }
+
+    #[test]
+    fn fallback_skips_an_empty_token() {
+        let cfg = r#"{
+            "copilotTokens": {
+                "https://github.com:alice": "",
+                "https://github.com:bob": "gho_BOB"
+            }
+        }"#;
+        assert_eq!(read_copilot_creds(cfg).unwrap().token, "gho_BOB");
+    }
+
+    #[test]
+    fn fallback_skips_a_key_that_is_not_a_login_url() {
+        // No host to call, so this is a logged-out config, not a usable one.
+        let cfg = r#"{ "copilotTokens": { "https://github.com": "gho_NOLOGIN" } }"#;
+        assert!(read_copilot_creds(cfg).is_none());
+    }
+
+    #[test]
     fn derives_api_host_from_login_host() {
         assert_eq!(
-            copilot_api_url("https://github.com:me"),
+            copilot_api_url("https://github.com:me").unwrap(),
             "https://api.github.com/copilot_internal/user"
         );
         // GHE data-residency host keeps its subdomain.
         assert_eq!(
-            copilot_api_url("https://acme.ghe.com:me"),
+            copilot_api_url("https://acme.ghe.com:me").unwrap(),
             "https://api.acme.ghe.com/copilot_internal/user"
         );
+        assert!(copilot_api_url("https://github.com").is_none());
     }
 
     #[test]

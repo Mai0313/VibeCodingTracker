@@ -374,9 +374,11 @@ fn install_and_report(
 
 /// Installs the latest release, but only if it is newer than the current one.
 ///
-/// Returns `Ok(())` without doing anything when already up to date. Unlike
-/// [`maybe_auto_update`] this applies to any installation: it replaces
-/// whatever executable is running, with no ownership marker required.
+/// Returns `Ok(())` without doing anything when already up to date, or when
+/// `VCT_OFFLINE` is set — offline is a no-op rather than an error, and costs
+/// neither a request nor a lock file. Unlike [`maybe_auto_update`] this applies
+/// to any installation: it replaces whatever executable is running, with no
+/// ownership marker required.
 ///
 /// # Errors
 ///
@@ -385,6 +387,9 @@ fn install_and_report(
 /// version comparison fails (GitHub fetch or version parse), or if the
 /// subsequent install fails (see `perform_installation_at`).
 pub fn perform_update() -> Result<()> {
+    if crate::utils::network_disabled() {
+        return Ok(());
+    }
     let _lock = acquire_update_lock()?;
     perform_update_unlocked()
 }
@@ -400,7 +405,9 @@ fn perform_update_unlocked() -> Result<()> {
 /// Installs the latest release unconditionally, skipping the freshness check.
 ///
 /// Always re-downloads and reinstalls the latest tag even when the current
-/// binary already matches it (useful for repairing a broken install).
+/// binary already matches it (useful for repairing a broken install). The one
+/// thing `force` does not override is `VCT_OFFLINE`: with it set this returns
+/// `Ok(())` without contacting GitHub or claiming the lock.
 ///
 /// # Errors
 ///
@@ -410,6 +417,9 @@ fn perform_update_unlocked() -> Result<()> {
 /// parsed, or if the install fails (see
 /// `perform_installation_at`, notably when no asset matches this platform).
 pub fn perform_force_update() -> Result<()> {
+    if crate::utils::network_disabled() {
+        return Ok(());
+    }
     let _lock = acquire_update_lock()?;
     perform_force_update_unlocked()
 }
@@ -452,8 +462,14 @@ fn acquire_update_lock_at(current_exe: &Path) -> Result<lock::UpdateLock> {
 /// never block the requested command.
 pub fn maybe_auto_update(enabled: bool) -> AutoUpdateOutcome {
     let offline = crate::utils::network_disabled();
-    let Ok(current_exe) = env::current_exe() else {
-        return AutoUpdateOutcome::Failed;
+    let current_exe = match env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            log::warn!(
+                "startup auto-update failed: cannot resolve the running executable: {error}"
+            );
+            return AutoUpdateOutcome::Failed;
+        }
     };
     let managed = ownership::is_release_managed(&current_exe);
     if !auto_update_allowed(enabled, offline, managed) {
@@ -538,7 +554,8 @@ fn auto_update_with(
 /// With `force` set, skips the freshness check and the prompt and reinstalls
 /// the latest release outright. Otherwise it checks for a newer version and,
 /// only if one exists, asks for `y`/`N` confirmation on stdin before
-/// installing — anything other than `y` cancels.
+/// installing — anything other than `y` cancels. With `VCT_OFFLINE` set
+/// neither path reaches GitHub.
 ///
 /// # Errors
 ///
@@ -577,12 +594,6 @@ pub fn update_interactive(force: bool) -> Result<()> {
         }
     }
 }
-
-// Re-export functions for testing
-#[doc(hidden)]
-pub use archive::{extract_targz, extract_zip};
-#[doc(hidden)]
-pub use platform::get_asset_pattern;
 
 #[cfg(test)]
 mod tests {

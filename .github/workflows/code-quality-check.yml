@@ -43,3 +43,12 @@ jobs:
       - name: clippy (deny warnings)
         run: |
           cargo clippy --all-targets --all-features -- -D warnings
+
+      # Public-only is the configuration docs.rs actually builds;
+      # `--document-private-items` is the only mode that checks links inside
+      # private items, of which this repo documents a great many. `-D warnings`
+      # comes from `.cargo/config.toml`.
+      - name: rustdoc (deny warnings)
+        run: |
+          cargo doc --no-deps --workspace --all-features
+          cargo doc --no-deps --workspace --all-features --document-private-items

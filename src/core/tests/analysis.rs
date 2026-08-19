@@ -13,14 +13,14 @@ use std::path::Path;
 use tempfile::TempDir;
 use vct_core::TimeRange;
 use vct_core::analysis::aggregator::{
-    AnalysisData, aggregate_sessions_by_model_from_paths,
+    AnalysisData, PerProviderAnalysisRows, aggregate_sessions_by_model_from_paths,
     aggregate_sessions_by_model_from_paths_with_cache,
     aggregate_sessions_by_model_from_paths_with_diagnostics,
     aggregate_sessions_by_model_from_paths_with_providers,
     collect_analysis_sessions_from_paths_with, project_code_analysis,
 };
 use vct_core::config::ProvidersConfig;
-use vct_core::models::ExtensionType;
+use vct_core::models::{ExtensionType, ProviderActiveDays};
 use vct_core::session::parser::{
     parse_session_file_to_value, parse_session_file_typed, parse_session_file_typed_as,
     parse_session_file_with_diagnostics,
@@ -101,69 +101,77 @@ fn seed_opencode_tie_breaker_db(path: &Path) {
     tx.commit().unwrap();
 }
 
+/// Compares every bucket of two analysis results.
+///
+/// Every struct here is destructured rather than having its fields named one at
+/// a time: a bucket added to any of them then fails to compile, instead of
+/// silently going uncompared.
 fn assert_analysis_data_eq(actual: &AnalysisData, expected: &AnalysisData) {
+    let AnalysisData {
+        rows,
+        per_provider,
+        provider_days,
+    } = actual;
     assert_eq!(
-        serde_json::to_value(&actual.rows).unwrap(),
+        serde_json::to_value(rows).unwrap(),
         serde_json::to_value(&expected.rows).unwrap()
     );
-    assert_eq!(
-        serde_json::to_value(&actual.per_provider.claude).unwrap(),
-        serde_json::to_value(&expected.per_provider.claude).unwrap()
-    );
-    assert_eq!(
-        serde_json::to_value(&actual.per_provider.codex).unwrap(),
-        serde_json::to_value(&expected.per_provider.codex).unwrap()
-    );
-    assert_eq!(
-        serde_json::to_value(&actual.per_provider.copilot).unwrap(),
-        serde_json::to_value(&expected.per_provider.copilot).unwrap()
-    );
-    assert_eq!(
-        serde_json::to_value(&actual.per_provider.gemini).unwrap(),
-        serde_json::to_value(&expected.per_provider.gemini).unwrap()
-    );
-    assert_eq!(
-        serde_json::to_value(&actual.per_provider.grok).unwrap(),
-        serde_json::to_value(&expected.per_provider.grok).unwrap()
-    );
-    assert_eq!(
-        serde_json::to_value(&actual.per_provider.deepseek).unwrap(),
-        serde_json::to_value(&expected.per_provider.deepseek).unwrap()
-    );
-    assert_eq!(
-        serde_json::to_value(&actual.per_provider.opencode).unwrap(),
-        serde_json::to_value(&expected.per_provider.opencode).unwrap()
-    );
-    assert_eq!(
-        serde_json::to_value(&actual.per_provider.cursor).unwrap(),
-        serde_json::to_value(&expected.per_provider.cursor).unwrap()
-    );
-    assert_eq!(
-        (
-            actual.provider_days.claude,
-            actual.provider_days.codex,
-            actual.provider_days.copilot,
-            actual.provider_days.gemini,
-            actual.provider_days.grok,
-            actual.provider_days.deepseek,
-            actual.provider_days.opencode,
-            actual.provider_days.cursor,
-            actual.provider_days.hermes,
-            actual.provider_days.total,
-        ),
-        (
-            expected.provider_days.claude,
-            expected.provider_days.codex,
-            expected.provider_days.copilot,
-            expected.provider_days.gemini,
-            expected.provider_days.grok,
-            expected.provider_days.deepseek,
-            expected.provider_days.opencode,
-            expected.provider_days.cursor,
-            expected.provider_days.hermes,
-            expected.provider_days.total,
-        )
-    );
+
+    let PerProviderAnalysisRows {
+        claude,
+        codex,
+        copilot,
+        gemini,
+        grok,
+        deepseek,
+        opencode,
+        cursor,
+    } = per_provider;
+    let other = &expected.per_provider;
+    for (provider, actual_rows, expected_rows) in [
+        ("Claude", claude, &other.claude),
+        ("Codex", codex, &other.codex),
+        ("Copilot", copilot, &other.copilot),
+        ("Gemini", gemini, &other.gemini),
+        ("Grok", grok, &other.grok),
+        ("DeepSeek", deepseek, &other.deepseek),
+        ("OpenCode", opencode, &other.opencode),
+        ("Cursor", cursor, &other.cursor),
+    ] {
+        assert_eq!(
+            serde_json::to_value(actual_rows).unwrap(),
+            serde_json::to_value(expected_rows).unwrap(),
+            "{provider} rows differ"
+        );
+    }
+
+    let ProviderActiveDays {
+        claude,
+        codex,
+        copilot,
+        gemini,
+        opencode,
+        cursor,
+        hermes,
+        grok,
+        deepseek,
+        total,
+    } = provider_days;
+    let other = &expected.provider_days;
+    for (provider, actual_days, expected_days) in [
+        ("Claude", claude, &other.claude),
+        ("Codex", codex, &other.codex),
+        ("Copilot", copilot, &other.copilot),
+        ("Gemini", gemini, &other.gemini),
+        ("Grok", grok, &other.grok),
+        ("DeepSeek", deepseek, &other.deepseek),
+        ("OpenCode", opencode, &other.opencode),
+        ("Cursor", cursor, &other.cursor),
+        ("Hermes", hermes, &other.hermes),
+        ("All providers", total, &other.total),
+    ] {
+        assert_eq!(actual_days, expected_days, "{provider} active days differ");
+    }
 }
 
 #[test]
@@ -506,6 +514,7 @@ fn cached_analysis_matches_uncached_and_reuses_unchanged_sources() {
         &fixture_str("sessions/gemini.jsonl"),
     );
     home.put_grok_fixture_session("workspace", "grok-session");
+    home.put_dsh_fixture_session("dsh-project", "dsh-session");
     seed_opencode_tie_breaker_db(&home.paths.opencode_db);
     home.put_cursor_session(
         "cursor-project",
@@ -530,32 +539,47 @@ fn cached_analysis_matches_uncached_and_reuses_unchanged_sources() {
         &mut cache,
     )
     .unwrap();
-    assert_eq!(cache.stats().parsed_sources, 7);
-    assert_eq!(cold.diagnostics.candidates, 7);
-    assert_eq!(cold.diagnostics.parsed, 7);
+    assert_eq!(cache.stats().parsed_sources, 8);
+    assert_eq!(cold.diagnostics.candidates, 8);
+    assert_eq!(cold.diagnostics.parsed, 8);
     assert!(cold.diagnostics.failures.is_empty());
     assert_eq!(cold.diagnostics, uncached.diagnostics);
     assert_analysis_data_eq(&cold.data, &uncached.data);
+    // Destructured so that a provider added later cannot be left unseeded: the
+    // new field has to be named here, and naming it without using it below is
+    // an unused-variable warning, which CI denies.
+    let PerProviderAnalysisRows {
+        claude,
+        codex,
+        copilot,
+        gemini,
+        grok,
+        deepseek,
+        opencode,
+        cursor,
+    } = &cold.data.per_provider;
     for (provider, rows) in [
-        ("Claude", &cold.data.per_provider.claude),
-        ("Codex", &cold.data.per_provider.codex),
-        ("Copilot", &cold.data.per_provider.copilot),
-        ("Gemini", &cold.data.per_provider.gemini),
-        ("Grok", &cold.data.per_provider.grok),
-        ("OpenCode", &cold.data.per_provider.opencode),
-        ("Cursor", &cold.data.per_provider.cursor),
+        ("Claude", claude),
+        ("Codex", codex),
+        ("Copilot", copilot),
+        ("Gemini", gemini),
+        ("Grok", grok),
+        ("DeepSeek", deepseek),
+        ("OpenCode", opencode),
+        ("Cursor", cursor),
     ] {
         assert!(!rows.is_empty(), "{provider} fixture must contribute a row");
     }
     for rows in [
         &cold.data.rows,
-        &cold.data.per_provider.claude,
-        &cold.data.per_provider.codex,
-        &cold.data.per_provider.copilot,
-        &cold.data.per_provider.gemini,
-        &cold.data.per_provider.grok,
-        &cold.data.per_provider.opencode,
-        &cold.data.per_provider.cursor,
+        claude,
+        codex,
+        copilot,
+        gemini,
+        grok,
+        deepseek,
+        opencode,
+        cursor,
     ] {
         assert!(
             rows.windows(2).all(|pair| pair[0].model <= pair[1].model),
@@ -1376,6 +1400,34 @@ fn collection_diagnostics_reject_unknown_opencode_assistant_schema() {
 }
 
 #[test]
+fn collection_diagnostics_accept_opencode_messages_without_a_session() {
+    let home = TempHome::new();
+    std::fs::create_dir_all(home.paths.opencode_db.parent().unwrap()).unwrap();
+    let conn = Connection::open(&home.paths.opencode_db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_updated INTEGER); \
+         CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT); \
+         CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT); \
+         INSERT INTO message VALUES ('m1', 'gone', \
+             '{\"role\":\"assistant\",\"modelID\":\"model\",\"tokens\":{\"input\":1}}');",
+    )
+    .unwrap();
+    drop(conn);
+
+    let dataset = collect_analysis_sessions_from_paths_with(
+        &home.paths,
+        TimeRange::All,
+        providers_only(ExtensionType::OpenCode),
+        ParseMode::Full,
+    )
+    .unwrap();
+    assert!(dataset.is_empty());
+    assert_eq!(dataset.diagnostics.candidates, 1);
+    assert_eq!(dataset.diagnostics.parsed, 1);
+    assert!(dataset.diagnostics.failures.is_empty());
+}
+
+#[test]
 fn streaming_aggregation_retains_partial_failure_diagnostics() {
     let home = TempHome::new();
     home.put_claude_session(
@@ -1497,41 +1549,73 @@ fn test_analysis_with_invalid_json() {
 }
 
 #[test]
-fn test_analysis_aggregation_logic() {
+fn analysis_rows_sum_repeated_sessions_for_one_model() {
     use vct_core::analysis::aggregator::AggregatedAnalysisRow;
 
-    let rows = [
-        AggregatedAnalysisRow {
-            model: "claude-sonnet-4".to_string(),
-            edit_lines: 50,
-            read_lines: 100,
-            write_lines: 25,
-            bash_count: 5,
-            edit_count: 10,
-            read_count: 15,
-            todo_write_count: 2,
-            write_count: 3,
-        },
-        AggregatedAnalysisRow {
-            model: "claude-sonnet-4".to_string(),
-            edit_lines: 50,
-            read_lines: 100,
-            write_lines: 25,
-            bash_count: 5,
-            edit_count: 10,
-            read_count: 15,
-            todo_write_count: 3,
-            write_count: 5,
-        },
-    ];
+    /// Every counter of a row. Destructured rather than read field by field, so
+    /// a counter added later is a compile error here instead of a field the
+    /// doubling assertion silently skips.
+    fn counters(row: &AggregatedAnalysisRow) -> [usize; 8] {
+        let AggregatedAnalysisRow {
+            model: _,
+            edit_lines,
+            read_lines,
+            write_lines,
+            bash_count,
+            edit_count,
+            read_count,
+            todo_write_count,
+            write_count,
+        } = *row;
+        [
+            edit_lines,
+            read_lines,
+            write_lines,
+            bash_count,
+            edit_count,
+            read_count,
+            todo_write_count,
+            write_count,
+        ]
+    }
 
-    let total_edit_lines: usize = rows.iter().map(|r| r.edit_lines).sum();
-    let total_read_lines: usize = rows.iter().map(|r| r.read_lines).sum();
-    let total_write_lines: usize = rows.iter().map(|r| r.write_lines).sum();
+    let session = fixture_str("sessions/claude_code.jsonl");
+    const MODEL: &str = "claude-sonnet-4-20250514";
 
-    assert_eq!(total_edit_lines, 100);
-    assert_eq!(total_read_lines, 200);
-    assert_eq!(total_write_lines, 50);
+    let one = TempHome::new();
+    one.put_claude_session("proj", "session.jsonl", &session);
+    let single = aggregate_sessions_by_model_from_paths(&one.paths, TimeRange::All)
+        .expect("aggregate one session");
+    let single_row = single
+        .rows
+        .iter()
+        .find(|row| row.model == MODEL)
+        .expect("a row for the fixture's model");
+    assert!(
+        counters(single_row).iter().all(|count| *count > 0),
+        "the fixture must exercise every counter for the doubling to mean anything, got: {:?}",
+        counters(single_row)
+    );
+
+    // The same session recorded twice: the aggregator folds both into one row
+    // per model, so every counter doubles.
+    let two = TempHome::new();
+    two.put_claude_session("proj", "session.jsonl", &session);
+    two.put_claude_session("proj", "second.jsonl", &session);
+    let doubled = aggregate_sessions_by_model_from_paths(&two.paths, TimeRange::All)
+        .expect("aggregate two sessions");
+    assert_eq!(
+        doubled.rows.len(),
+        single.rows.len(),
+        "the second session must not open a second row"
+    );
+    let doubled_row = doubled
+        .rows
+        .iter()
+        .find(|row| row.model == MODEL)
+        .expect("a row for the fixture's model");
+
+    assert_eq!(counters(doubled_row), counters(single_row).map(|c| c * 2));
 }
 
 /// Writes a Claude session whose first line is a metadata sentinel carrying no

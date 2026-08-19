@@ -165,15 +165,6 @@ pub(crate) struct DatabaseUsageRead {
 }
 
 impl DatabaseUsageRead {
-    pub(crate) fn complete(rows: Vec<UsageContribution>) -> Self {
-        let parsed_records = rows.len();
-        Self {
-            rows,
-            expected_records: parsed_records,
-            parsed_records,
-        }
-    }
-
     pub(crate) fn failed_records(&self) -> usize {
         self.expected_records.saturating_sub(self.parsed_records)
     }

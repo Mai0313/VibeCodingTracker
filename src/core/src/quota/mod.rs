@@ -272,7 +272,7 @@ impl CodexState {
                 expirations,
             } => {
                 self.reset_credits_cooldown.clear();
-                snap.reset_credits_available = Some(available_count);
+                snap.reset_credits_available = available_count.or(snap.reset_credits_available);
                 snap.reset_credit_expirations = Some(expirations);
             }
             ResetCreditsResult::Transient => {}
@@ -306,7 +306,8 @@ impl CodexState {
                         expirations,
                     } => {
                         self.reset_credits_cooldown.clear();
-                        snap.reset_credits_available = Some(available_count);
+                        snap.reset_credits_available =
+                            available_count.or(snap.reset_credits_available);
                         snap.reset_credit_expirations = Some(expirations);
                     }
                     ResetCreditsResult::Unauthorized => {
@@ -455,6 +456,93 @@ mod tests {
                 assert_eq!(snap.reset_credit_expirations.unwrap().len(), 1);
             }
             _ => panic!("expected a recovered snapshot after details refresh"),
+        }
+    }
+
+    /// A failing details endpoint is best-effort: the usage snapshot survives
+    /// with the count `wham/usage` itself reported.
+    #[test]
+    fn fetch_with_refresh_keeps_usage_when_details_fail() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/wham");
+            then.status(200)
+                .body(r#"{"plan_type":"plus","rate_limit_reset_credits":{"available_count":2}}"#);
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/reset-credits");
+            then.status(500).body("boom");
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let auth = dir.path().join("auth.json");
+        std::fs::write(
+            &auth,
+            r#"{"tokens":{"access_token":"tok","refresh_token":"rt","account_id":"acct"}}"#,
+        )
+        .unwrap();
+
+        let client = crate::quota::http::build_client().unwrap();
+        let mut state = CodexState::default();
+        let result = state.fetch_with_refresh(
+            &client,
+            &auth,
+            1_000_000,
+            &server.url("/wham"),
+            &server.url("/reset-credits"),
+            &server.url("/token"),
+        );
+
+        match result {
+            CodexFetch::Ok(snap) => {
+                assert_eq!(snap.reset_credits_available, Some(2));
+                assert!(snap.reset_credit_expirations.is_none());
+            }
+            _ => panic!("a details failure must not fail the usage snapshot"),
+        }
+    }
+
+    /// A details response that omits `available_count` still contributes its
+    /// expirations, and the count `wham/usage` reported is what survives.
+    #[test]
+    fn fetch_with_refresh_keeps_the_usage_count_when_details_omit_it() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/wham");
+            then.status(200)
+                .body(r#"{"plan_type":"plus","rate_limit_reset_credits":{"available_count":2}}"#);
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/reset-credits");
+            then.status(200)
+                .body(r#"{"credits":[{"status":"available","expires_at":null}]}"#);
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let auth = dir.path().join("auth.json");
+        std::fs::write(
+            &auth,
+            r#"{"tokens":{"access_token":"tok","refresh_token":"rt","account_id":"acct"}}"#,
+        )
+        .unwrap();
+
+        let client = crate::quota::http::build_client().unwrap();
+        let mut state = CodexState::default();
+        let result = state.fetch_with_refresh(
+            &client,
+            &auth,
+            1_000_000,
+            &server.url("/wham"),
+            &server.url("/reset-credits"),
+            &server.url("/token"),
+        );
+
+        match result {
+            CodexFetch::Ok(snap) => {
+                assert_eq!(snap.reset_credits_available, Some(2), "from wham/usage");
+                assert_eq!(snap.reset_credit_expirations, Some(vec![None]));
+            }
+            _ => panic!("a details response missing fields must still map"),
         }
     }
 

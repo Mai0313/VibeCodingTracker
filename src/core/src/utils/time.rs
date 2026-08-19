@@ -23,16 +23,14 @@ pub fn rfc3339_utc_nanos(unix_secs: i64) -> Option<String> {
     DateTime::from_timestamp(unix_secs, 0).map(|dt| dt.to_rfc3339_opts(SecondsFormat::Nanos, true))
 }
 
-/// Parses an ISO-8601 / RFC 3339 timestamp into Unix milliseconds.
+/// Parses an RFC 3339 timestamp into Unix milliseconds.
 ///
-/// RFC 3339 is tried first (the common case, with timezone offset or `Z`),
-/// then a small set of explicit UTC fallback patterns covering 3-digit,
-/// arbitrary-precision, and zero-fraction sub-seconds. Surrounding
-/// whitespace is *not* tolerated.
+/// Any offset the standard allows is accepted (`Z` or a numeric offset), at
+/// any sub-second precision. An input carrying no offset is rejected, and
+/// surrounding whitespace is *not* tolerated.
 ///
-/// Returns `0` for an empty string or any input that matches none of the
-/// accepted formats; callers treat `0` as "unknown time" rather than the
-/// Unix epoch.
+/// Returns `0` for an empty string or any input that is not RFC 3339;
+/// callers treat `0` as "unknown time" rather than the Unix epoch.
 ///
 /// # Examples
 ///
@@ -48,23 +46,10 @@ pub fn parse_iso_timestamp(ts: &str) -> i64 {
         return 0;
     }
 
-    if let Ok(dt) = DateTime::parse_from_rfc3339(ts) {
-        return dt.timestamp_millis();
+    match DateTime::parse_from_rfc3339(ts) {
+        Ok(dt) => dt.timestamp_millis(),
+        Err(_) => 0,
     }
-
-    let formats = [
-        "%Y-%m-%dT%H:%M:%S%.3fZ",
-        "%Y-%m-%dT%H:%M:%S%.fZ",
-        "%Y-%m-%dT%H:%M:%SZ",
-    ];
-
-    for format in &formats {
-        if let Ok(dt) = DateTime::parse_from_str(ts, format) {
-            return dt.timestamp_millis();
-        }
-    }
-
-    0
 }
 
 #[cfg(test)]
@@ -110,18 +95,29 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_iso_timestamp_fallback_formats() {
-        let ts1 = "2024-01-15T10:30:45.123Z";
-        let result1 = parse_iso_timestamp(ts1);
-        assert!(result1 > 0);
+    fn test_parse_iso_timestamp_sub_second_precision() {
+        // Every sub-second width RFC 3339 allows lands on the same instant,
+        // truncated to milliseconds.
+        assert_eq!(
+            parse_iso_timestamp("2024-01-15T10:30:45.123Z"),
+            1_705_314_645_123
+        );
+        assert_eq!(
+            parse_iso_timestamp("2024-01-15T10:30:45.123456Z"),
+            1_705_314_645_123
+        );
+        assert_eq!(
+            parse_iso_timestamp("2024-01-15T10:30:45Z"),
+            1_705_314_645_000
+        );
+    }
 
-        let ts2 = "2024-01-15T10:30:45.123456Z";
-        let result2 = parse_iso_timestamp(ts2);
-        assert!(result2 > 0);
-
-        let ts3 = "2024-01-15T10:30:45Z";
-        let result3 = parse_iso_timestamp(ts3);
-        assert!(result3 > 0);
+    #[test]
+    fn test_parse_iso_timestamp_requires_an_offset() {
+        // A naive timestamp has no offset to resolve, so it is rejected
+        // rather than assumed to be UTC.
+        assert_eq!(parse_iso_timestamp("2024-01-15T10:30:45"), 0);
+        assert_eq!(parse_iso_timestamp("2024-01-15T10:30:45.123"), 0);
     }
 
     #[test]

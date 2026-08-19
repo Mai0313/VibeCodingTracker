@@ -248,7 +248,7 @@ where
 
         if let Some(tur) = &log.tool_use_result {
             let correlated =
-                first_tool_result(log.message.as_ref()).and_then(|(tool_use_id, _, is_error)| {
+                first_tool_result(log.message.as_ref()).and_then(|(tool_use_id, is_error)| {
                     pending_tool_uses
                         .remove(tool_use_id)
                         .map(|pending| (pending, is_error))
@@ -360,17 +360,17 @@ fn is_tracked_file_tool(name: &str) -> bool {
     matches!(name, "Read" | "Write" | "Edit")
 }
 
-fn first_tool_result(message: Option<&ClaudeMessage>) -> Option<(&str, &str, bool)> {
+fn first_tool_result(message: Option<&ClaudeMessage>) -> Option<(&str, bool)> {
     message?.content.iter().find_map(|item| {
         let ClaudeContentItem::ToolResult {
             tool_use_id,
-            content,
             is_error,
+            ..
         } = item
         else {
             return None;
         };
-        Some((tool_use_id.as_str(), content.as_str(), *is_error))
+        Some((tool_use_id.as_str(), *is_error))
     })
 }
 
@@ -774,12 +774,13 @@ mod tests {
     }
 
     #[test]
-    fn main_session_string_tool_use_result_does_not_double_count() {
-        // Main session records can have a string-shaped toolUseResult
-        // (rejection messages) alongside a content tool_result block.
-        // Here we simulate `isSidechain == false` and expect zero read
-        // lines: the string `toolUseResult` carries no file content, so the
-        // content block's text must not be counted as one.
+    fn main_session_tool_result_block_is_not_read_as_file_content() {
+        // A main-session user record can carry a content tool_result block
+        // alongside a string-shaped `toolUseResult` (a rejection message),
+        // which deserializes to `None` and so lands in the subagent fallback
+        // branch. The `!log.is_sidechain` gate there is what keeps the
+        // block's text out of the read tally, while the assistant's
+        // `tool_use` still counts one Read call.
         let raw_assistant = serde_json::json!({
             "type": "assistant",
             "timestamp": "2025-01-01T00:00:00Z",
@@ -813,7 +814,7 @@ mod tests {
         let record = &analysis.records[0];
         assert_eq!(
             record.total_read_lines, 0,
-            "main-session string toolUseResult must not trigger fallback"
+            "main-session tool_result block must not be dispatched as a file read"
         );
         assert_eq!(record.tool_call_counts.read, 1, "tool_use bump only");
     }

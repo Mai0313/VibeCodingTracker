@@ -116,9 +116,10 @@ impl Log for FileLogger {
     }
 
     fn flush(&self) {
-        if let Ok(mut guard) = self.open.lock()
-            && let Some(open) = guard.as_mut()
-        {
+        // Same contract as `append`: a poisoned mutex still holds a valid file
+        // handle, so recover instead of turning flush into a permanent no-op.
+        let mut guard = self.open.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(open) = guard.as_mut() {
             let _ = open.file.flush();
         }
     }

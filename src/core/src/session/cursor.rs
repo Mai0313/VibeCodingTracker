@@ -277,7 +277,6 @@ struct UsageEvent {
     output: i64,
     cache_read: i64,
     cache_write: i64,
-    cost: f64,
 }
 
 struct CursorUsageEvents {
@@ -300,7 +299,9 @@ fn aggregate_events(events: &[UsageEvent], time_range: TimeRange) -> Vec<UsageCo
             e.timestamp_ms,
             e.model.clone(),
             cursor_usage_value(e.input, e.output, e.cache_read, e.cache_write),
-            e.cost,
+            // Cursor records no cost locally, so every row is priced by the
+            // caller's exact LiteLLM match alone.
+            0.0,
         ));
     }
     out
@@ -329,7 +330,6 @@ pub(crate) fn read_cursor_usage_store(
                 output: 0,
                 cache_read,
                 cache_write: 0,
-                cost: 0.0,
             })
         })
         .collect::<Vec<_>>();
@@ -427,7 +427,6 @@ fn approximation_events(chats_dir: &Path, tracking_db: &Path) -> CursorUsageEven
                 output: 0,
                 cache_read: ctx,
                 cache_write: 0,
-                cost: 0.0,
             })
             .collect(),
         candidates,
@@ -801,20 +800,32 @@ fn resolve_store_model(
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// Reads `lastUsedModel` from the store's `meta` row.
+/// Reads `lastUsedModel` from the store's `meta` table.
 ///
 /// The `meta.value` is a hex-encoded JSON string; decode then read the field.
 /// Tolerates a plain-JSON value too, in case a future build stops hex-encoding.
+/// `meta` is keyed `(key PRIMARY KEY, value)` and current stores hold one row
+/// keyed `0`, but that name is cursor-agent's to change, so every row is
+/// decoded and the first one carrying the field wins rather than whichever row
+/// SQLite happens to return first.
 fn store_meta_model(conn: &Connection) -> Option<String> {
-    let value: String = conn
-        .query_row("SELECT value FROM meta LIMIT 1", [], |r| r.get(0))
-        .ok()?;
-    let bytes = decode_hex(&value).unwrap_or_else(|| value.clone().into_bytes());
-    let json: Value = serde_json::from_slice(&bytes).ok()?;
-    json.get("lastUsedModel")
-        .and_then(|m| m.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+    let mut stmt = conn.prepare("SELECT value FROM meta ORDER BY key").ok()?;
+    // A row whose `value` is NULL or not text is skipped, not fatal: failing
+    // the whole read on one would lose the lookup for exactly the multi-row
+    // store this scan exists to handle.
+    let values = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .ok()?
+        .filter_map(rusqlite::Result::ok)
+        .collect::<Vec<_>>();
+    values.into_iter().find_map(|value| {
+        let bytes = decode_hex(&value).unwrap_or_else(|| value.into_bytes());
+        let json: Value = serde_json::from_slice(&bytes).ok()?;
+        json.get("lastUsedModel")
+            .and_then(|m| m.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    })
 }
 
 /// Loads every blob's raw bytes from a store.
@@ -833,22 +844,6 @@ fn load_node_blobs(conn: &Connection) -> Result<Vec<Vec<u8>>> {
         conn.prepare("SELECT data FROM blobs WHERE substr(data, 1, 1) = X'0A' ORDER BY id")?;
     let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-}
-
-/// Returns `(embedded message JSON bytes, timestamp_ms)` for a binary DAG node.
-///
-/// Binary nodes start with `field 1` (`0x0A`), carry the message in `field 4`
-/// and the epoch-ms timestamp in `field 26`; the role is not checked here.
-/// Non-node blobs (JSON messages) return `None`, as do nodes missing the
-/// timestamp — an undateable turn is skipped rather than mis-bucketed to the
-/// epoch (1970).
-#[cfg(test)]
-fn assistant_node(data: &[u8]) -> Option<(&[u8], i64)> {
-    if data.first() != Some(&0x0A) {
-        return None;
-    }
-    let node = walk_node(data);
-    Some((node.msg?, node.ts?))
 }
 
 /// The `role` of a message JSON blob, when it parses and carries one.
@@ -975,10 +970,8 @@ fn collect_read_results(blobs: &[Vec<u8>]) -> HashMap<String, CursorReadResult> 
         let role = msg.get("role").and_then(Value::as_str);
         // Assistant messages are also stored as standalone content-addressed
         // JSON blobs and referenced from binary DAG nodes. Pass 2 reads the
-        // dated node, so this undated payload copy is expected and ignored.
-        if role == Some("assistant") {
-            continue;
-        }
+        // dated node, so this undated payload copy is expected and skipped
+        // here along with every other non-tool role.
         if role != Some("tool") {
             continue;
         }
@@ -1306,15 +1299,15 @@ mod tests {
     }
 
     #[test]
-    fn assistant_node_extracts_message_and_ts() {
+    fn node_fields_extract_message_and_ts() {
         let node = make_node(
             r#"{"role":"assistant","content":[]}"#,
             1_700_000_000_000,
             None,
         );
-        let (msg, ts) = assistant_node(&node).unwrap();
-        assert_eq!(ts, 1_700_000_000_000);
-        let parsed: Value = serde_json::from_slice(msg).unwrap();
+        let nf = walk_node(&node);
+        assert_eq!(nf.ts, Some(1_700_000_000_000));
+        let parsed: Value = serde_json::from_slice(nf.msg.unwrap()).unwrap();
         assert_eq!(parsed["role"], "assistant");
     }
 
@@ -1326,9 +1319,33 @@ mod tests {
     }
 
     #[test]
-    fn json_blob_is_not_an_assistant_node() {
-        let blob = br#"{"role":"assistant","content":[]}"#.to_vec();
-        assert!(assistant_node(&blob).is_none());
+    fn json_blob_is_not_read_as_an_assistant_turn() {
+        // Assistant turns are binary DAG nodes; a JSON blob is a tool-result
+        // payload even when its own `role` says assistant. Neither reader may
+        // pick one up as a turn, or the same tool calls would be billed twice
+        // once a real node references them.
+        let json_blob = r#"{"role":"assistant","content":[
+            {"type":"tool-call","toolName":"Write","toolCallId":"a","args":{"path":"/r/x.rs","contents":"l1\nl2"}}
+        ]}"#;
+        let (_dir, path) = make_store_db(&[], &[json_blob]);
+        let conv_models = FastHashMap::default();
+
+        let store = read_store_analysis(
+            &path,
+            &conv_models,
+            TimeRange::All,
+            ParseMode::Full,
+            "u",
+            "m",
+        )
+        .unwrap();
+        assert!(store.rows.is_empty());
+        assert_eq!(store.normalized_messages, 0);
+        assert_eq!(store.failed_payloads, 0);
+
+        let read = read_store_context(&path, &conv_models, "conversation").unwrap();
+        assert!(read.turns.is_empty());
+        assert_eq!(read.expected_records, 0);
     }
 
     #[test]
@@ -1419,7 +1436,6 @@ mod tests {
                 output: 20,
                 cache_read: 50,
                 cache_write: 10,
-                cost: 1.5,
             },
             UsageEvent {
                 date: "2000-01-01".to_string(),
@@ -1429,7 +1445,6 @@ mod tests {
                 output: 5,
                 cache_read: 0,
                 cache_write: 0,
-                cost: 0.0,
             },
         ];
         // Daily cutoff drops the ancient 2000 row but keeps the far-future one.
@@ -1438,7 +1453,8 @@ mod tests {
         let row = &rows[0];
         assert_eq!(row.date, "2999-01-01");
         assert_eq!(row.timestamp_ms, 32_470_920_000_000);
-        assert!((row.stored_cost - 1.5).abs() < 1e-9);
+        // Cursor rows never carry a stored cost of their own.
+        assert_eq!(row.stored_cost, 0.0);
         assert_eq!(row.model, "claude-sonnet-4.6");
     }
 
@@ -1473,6 +1489,30 @@ mod tests {
             .unwrap();
         }
         drop(conn);
+    }
+
+    #[test]
+    fn store_meta_model_does_not_depend_on_which_row_comes_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        write_store_db(&path, &[], &[]);
+        let conn = Connection::open(&path).unwrap();
+        let hex: String = r#"{"agentId":"a","lastUsedModel":"gpt-5.6-sol"}"#
+            .bytes()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('0', ?1)",
+            [r#"{"other":true}"#],
+        )
+        .unwrap();
+        // A row that is not readable as text must not abort the scan.
+        conn.execute("INSERT INTO meta (key, value) VALUES ('1', NULL)", [])
+            .unwrap();
+        conn.execute("INSERT INTO meta (key, value) VALUES ('z', ?1)", [&hex])
+            .unwrap();
+
+        assert_eq!(store_meta_model(&conn).as_deref(), Some("gpt-5.6-sol"));
     }
 
     #[test]

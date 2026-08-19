@@ -114,14 +114,18 @@ pub fn read_opencode_analysis(
             result.expected_records
         ));
     }
+    // Records and tool parts are different units: one message can carry many
+    // parts, so adding them together reports a part count as a record count.
     let failed_records = result
         .expected_records
-        .saturating_sub(result.parsed_records)
-        + result.failed_tool_parts;
+        .saturating_sub(result.parsed_records);
     if failed_records > 0 {
+        log::warn!("skipped {failed_records} OpenCode analysis records with unsupported schema");
+    }
+    if result.failed_tool_parts > 0 {
         log::warn!(
-            "skipped {} OpenCode analysis records with unsupported schema",
-            failed_records
+            "skipped {} OpenCode tool parts with unsupported schema",
+            result.failed_tool_parts
         );
     }
     Ok(result
@@ -186,6 +190,10 @@ struct CollectedAnalysis {
 }
 
 /// Counts rows that should be understood by the current analysis reader.
+///
+/// Every branch selects exactly what its collector counterpart selects: a row
+/// counted here but unreachable there is reported as schema drift, and a
+/// database made up entirely of such rows fails the whole scan.
 fn count_analysis_candidates(conn: &Connection, time_range: TimeRange) -> Result<usize> {
     let cutoff_ms = cutoff_millis(time_range);
     let (sql, parameterized) = if table_exists(conn, "message")? {
@@ -203,6 +211,7 @@ fn count_analysis_candidates(conn: &Connection, time_range: TimeRange) -> Result
             ),
             None => (
                 "SELECT COUNT(*) FROM message \
+                 JOIN session ON session.id = message.session_id \
                  WHERE json_extract(message.data, '$.role') = 'assistant'",
                 false,
             ),
@@ -886,6 +895,19 @@ fn extract_patch_strings(lines: &[String]) -> (String, String) {
 /// OpenCode records non-cached input separately from cache reads (input is
 /// disjoint from cache, matching the Claude convention), so each counter drops
 /// into one bucket with no adjustment.
+///
+/// `reasoning` is disjoint from `output` as well, which is why nothing here
+/// mirrors the `output - reasoning` correction Copilot, Hermes and DeepSeek
+/// Harness each apply at their parsers: OpenCode has already made it, in
+/// `Session.getUsage`, which is where both the message payload and the legacy
+/// columns get their token object from. Current databases bear it out — the
+/// stored `total` (the provider's own count, kept untouched) comes to
+/// `input + output + reasoning + cache`, and plenty of rows report more
+/// reasoning than output, which is impossible had output ever contained it.
+/// Subtracting a second time would floor most short thinking-heavy replies at
+/// zero output; `test_read_usage_maps_tokens` and
+/// `test_legacy_session_usage_keeps_reasoning_disjoint` hold the two read
+/// paths to that.
 fn session_usage_value(
     input: i64,
     output: i64,
@@ -931,8 +953,13 @@ fn parse_model_id(raw: &str) -> Option<String> {
             let s = s.trim();
             (!s.is_empty()).then(|| s.to_string())
         }
-        // Not a JSON object or string: treat the column as a plain model name.
-        _ => Some(raw.to_string()),
+        // A bare model name is not valid JSON, so a parse failure is what the
+        // legacy plain-string column looks like.
+        Err(_) => Some(raw.to_string()),
+        // Any other JSON value carries no model name. The SQL guard tests for
+        // SQL `NULL`, not for a column holding the four characters `null`,
+        // which would otherwise be priced and displayed as a model.
+        _ => None,
     }
 }
 
@@ -1348,6 +1375,13 @@ mod tests {
         );
         assert_eq!(parse_model_id(r#"{"providerID":"x"}"#), None);
         assert_eq!(parse_model_id("   "), None);
+        // A column holding a JSON scalar names no model; the SQL guard only
+        // filters SQL `NULL` and the empty string.
+        assert_eq!(parse_model_id("null"), None);
+        assert_eq!(parse_model_id("42"), None);
+        assert_eq!(parse_model_id("[]"), None);
+        // A quoted string is still the legacy plain-name column.
+        assert_eq!(parse_model_id(r#""gpt-5""#).as_deref(), Some("gpt-5"));
     }
 
     #[test]
@@ -1429,6 +1463,32 @@ mod tests {
         assert_eq!(usage["cache_creation_input_tokens"], 25);
     }
 
+    /// The legacy branch only runs when there is no `message` table, so the
+    /// session row in `test_read_usage_maps_tokens` never reaches it.
+    #[test]
+    fn test_legacy_session_usage_keeps_reasoning_disjoint() {
+        let (_dir, db_path) = make_db();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute("DROP TABLE message", []).unwrap();
+        conn.execute("DROP TABLE part", []).unwrap();
+        conn.execute(
+	            "INSERT INTO session (id, model, directory, time_updated, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write)
+	             VALUES ('s1', '{\"id\":\"gpt-5.4\"}', '/repo', 1780757088080, 0.02, 19691, 21, 26, 0, 0)",
+	            [],
+	        )
+	        .unwrap();
+        drop(conn);
+
+        let rows = read_opencode_usage(&db_path, TimeRange::All).unwrap();
+        assert_eq!(rows.len(), 1);
+        let usage = &rows[0].1.records[0].conversation_usage["gpt-5.4"];
+        // More reasoning than output is the shape real rows take, and is
+        // impossible had output ever contained reasoning; a subtraction added
+        // here would floor this at zero.
+        assert_eq!(usage["output_tokens"], 21);
+        assert_eq!(usage["reasoning_output_tokens"], 26);
+    }
+
     #[test]
     fn analysis_rejects_assistant_rows_with_completely_unknown_schema() {
         let (_dir, db_path) = make_db();
@@ -1458,6 +1518,58 @@ mod tests {
                 .to_string()
                 .contains("none of 1 OpenCode analysis records")
         );
+    }
+
+    #[test]
+    fn analysis_candidate_count_skips_messages_without_a_session() {
+        let (_dir, db_path) = make_db();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO session (id, directory, time_updated) VALUES ('s1', '/repo', 1780757089000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES ('m1', 's1', ?1)",
+            [assistant_message("model", 1, 2, 0, 0, 0, 0.5)],
+        )
+        .unwrap();
+        // The collectors join `session`, so an assistant row whose session is
+        // gone can never be collected and must not be counted as expected.
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES ('m2', 'gone', ?1)",
+            [assistant_message("model", 3, 4, 0, 0, 0, 0.5)],
+        )
+        .unwrap();
+        drop(conn);
+
+        let result =
+            read_opencode_analysis_with_diagnostics(&db_path, TimeRange::All, ParseMode::Full)
+                .unwrap();
+        assert_eq!(result.expected_records, 1);
+        assert_eq!(result.parsed_records, 1);
+        assert_eq!(result.rows.len(), 1);
+    }
+
+    #[test]
+    fn analysis_accepts_a_database_whose_assistant_rows_are_all_orphaned() {
+        let (_dir, db_path) = make_db();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES ('m1', 'gone', ?1)",
+            [assistant_message("model", 1, 2, 0, 0, 0, 0.5)],
+        )
+        .unwrap();
+        drop(conn);
+
+        let result =
+            read_opencode_analysis_with_diagnostics(&db_path, TimeRange::All, ParseMode::Full)
+                .unwrap();
+        assert_eq!(result.expected_records, 0);
+        assert_eq!(result.parsed_records, 0);
+
+        let rows = read_opencode_analysis(&db_path, TimeRange::All, ParseMode::Full).unwrap();
+        assert!(rows.is_empty());
     }
 
     #[test]

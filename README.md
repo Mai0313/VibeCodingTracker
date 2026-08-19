@@ -285,7 +285,7 @@ Totals (by Provider)
 ]
 ```
 
-Every row serializes the same flat token fields regardless of provider (Codex's internal nested shape is normalized before output).
+Every row serializes the same flat token fields regardless of provider (Codex's internal nested shape is normalized before output). A provider that bills a bucket the others don't have adds its own key: a Gemini row that spent tool tokens carries `tool_tokens`, which LiteLLM has no rate for and which are counted in `total_tokens` alone.
 
 ### What It Scans
 
@@ -468,7 +468,7 @@ At startup, vct silently checks for a newer release at most once per UTC day. A 
 
 After a Unix update, vct re-executes the current command with the new binary. On Windows, the current command finishes and a helper applies the replacement afterwards. The automatic path never modifies installs from cargo, npm, PyPI, a distro package, or an unmarked manual or development build. Update those through their package manager instead. To add automatic updates to an existing direct install, run the current official installer once more so it creates the marker.
 
-Set `general.auto_update = false` in `~/.vct/config.toml` to disable startup checks and automatic updates. The explicit `vct update` command retains its existing manual behavior.
+Set `general.auto_update = false` in `~/.vct/config.toml` to disable startup checks and automatic updates. The explicit `vct update` command retains its existing manual behavior. `VCT_OFFLINE=1` also applies to it: `--check`, the interactive prompt, and `--force` alike return without contacting GitHub.
 
 ### Basic Usage
 
@@ -681,7 +681,7 @@ Generic placeholder names (e.g. `default`, what cursor-agent records for auto-mo
 
 ### Cost Details
 
-- **Context tiers are per request**: LiteLLM's "above Nk tokens" rates (e.g. GPT-5.x above 272k, Gemini above 200k) apply only to requests whose own prompt context crossed the threshold. Providers without per-request granularity — and offline scans — bill at base rates, so tiered-model costs are a lower bound there.
+- **Context tiers are per request**: LiteLLM's "above Nk tokens" rates (e.g. GPT-5.x above 272k, Gemini above 200k) and its Qwen / doubao volume rows alike apply only to requests whose own prompt context crossed the boundary — never to a whole scan's token sum. Providers without per-request granularity — and offline scans — bill at the lowest rate, so tiered-model costs are a lower bound there.
 - **Beyond tokens**: Claude web-search tool calls (`server_tool_use.web_search_requests`) are billed per query on top of the token cost; every other model's per-query charge is $0.
 - **OpenCode**: a novel model name is priced from its tokens only on an **exact** LiteLLM match; with no exact match, vct trusts the assistant message's own stored cost instead of guessing from a loosely-similar name.
 - **Hermes**: priced the same way as OpenCode — an **exact** LiteLLM match prices from tokens, otherwise vct uses Hermes's own stored cost.

@@ -118,6 +118,7 @@ fn analysis_file_json_matches_typed_parser_for_every_file_provider() {
         "sessions/copilot.jsonl",
         "sessions/gemini.jsonl",
         "sessions/grok/signals.json",
+        "sessions/dsh/session.jsonl.zstd",
     ] {
         let path = fixture(fixture_name);
         let expected = serde_json::to_value(parse_session_file_typed(&path).unwrap()).unwrap();
@@ -282,15 +283,33 @@ fn usage_output_flag_is_rejected() {
 }
 
 #[test]
-fn test_analysis_validates_file_extension() {
+fn analysis_detects_provider_by_content_not_extension() {
     let home = TempHome::new();
     let temp_dir = tempfile::TempDir::new().unwrap();
-    let wrong_ext = temp_dir.path().join("test.txt");
-    std::fs::write(&wrong_ext, "test content").unwrap();
 
-    // Nothing is asserted: the extension is not validated, so the file's
-    // content alone decides whether the run succeeds.
-    let _ = child_cmd(&home).arg("analysis").arg(&wrong_ext).output();
+    // A Claude session under a `.txt` name: detection reads the records, so the
+    // provider still resolves and the run succeeds.
+    let wrong_ext = temp_dir.path().join("session.txt");
+    std::fs::copy(fixture("sessions/claude_code.jsonl"), &wrong_ext).unwrap();
+    child_cmd(&home)
+        .arg("analysis")
+        .arg(&wrong_ext)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            r#""extensionName": "Claude-Code""#,
+        ));
+
+    // And the mirror case: a `.jsonl` name buys nothing when the content does
+    // not even parse.
+    let right_ext = temp_dir.path().join("session.jsonl");
+    std::fs::write(&right_ext, "test content\n").unwrap();
+    child_cmd(&home)
+        .arg("analysis")
+        .arg(&right_ext)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Failed to parse JSON from file"));
 }
 
 #[test]
@@ -493,6 +512,7 @@ fn single_file_summary_projection_is_parse_mode_invariant() {
         "sessions/copilot.jsonl",
         "sessions/gemini.jsonl",
         "sessions/grok/signals.json",
+        "sessions/dsh/session.jsonl.zstd",
     ] {
         let path = fixture(fixture_name);
         let full = parse_session_file_typed_with_mode(&path, ParseMode::Full).unwrap();
@@ -579,6 +599,13 @@ fn usage_json_smoke_prices_seeded_session() {
         "proj",
         "session.jsonl",
         &vct_test_support::fixture_str("sessions/claude_code.jsonl"),
+    );
+    // Codex is the provider whose usage stays nested internally, so the
+    // flat-shape loop below only means anything with one of its sessions in the
+    // scan.
+    home.put_codex_session(
+        "2026/06/06/rollout-2026-06-06T10-00-00-019e4b75-8a4e-7801-a9ed-9723e77e0497.jsonl",
+        &vct_test_support::fixture_str("sessions/codex.jsonl"),
     );
     home.seed_pricing_cache(&pricing_seed());
 
@@ -868,6 +895,31 @@ fn package_managed_binary_skips_startup_update_before_network_or_cache_writes() 
         !home.home().join(".vct/version.json").exists(),
         "an unmarked binary must skip before claiming the daily check"
     );
+}
+
+// The dead proxy is what makes a regressed offline guard fail this assertion
+// rather than download a release over the compiled test binary.
+#[test]
+fn explicit_update_is_a_no_op_when_offline() {
+    let home = TempHome::new();
+
+    for args in [&["update"][..], &["update", "--force"][..]] {
+        let output = child_cmd(&home)
+            .env("HTTPS_PROXY", "http://127.0.0.1:9")
+            .env("HTTP_PROXY", "http://127.0.0.1:9")
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
+            .args(args)
+            .output()
+            .unwrap();
+
+        assert!(output.status.success(), "{args:?} must exit successfully");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "Checking for updates...\n",
+            "{args:?} must stop before the GitHub request"
+        );
+    }
 }
 
 #[test]

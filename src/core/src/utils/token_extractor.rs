@@ -32,9 +32,13 @@ pub struct TokenCounts {
     /// per query (not per token) at the model's web-search rate, so it is
     /// tracked here but excluded from `total`.
     pub web_search_requests: i64,
+    /// Tokens a provider bills for tool payloads alone (Gemini `tool_tokens`).
+    /// LiteLLM publishes no rate for them, so they are counted in `total` and
+    /// left out of every priced bucket.
+    pub tool_tokens: i64,
     /// Token total shown in the UI and used by [`TokenCounts::has_activity`].
-    /// Includes provider `tool_tokens`, which have no price bucket, so
-    /// `calculate_cost` bills the individual buckets rather than this.
+    /// Includes `tool_tokens`, which have no price bucket, so `calculate_cost`
+    /// bills the individual buckets rather than this.
     pub total: i64,
     /// Slice of `input_tokens` from requests whose own prompt context
     /// exceeded the model's context-tier threshold (see the `above_tier`
@@ -58,8 +62,9 @@ impl TokenCounts {
     /// Whether this usage did anything; the one test for whether a date counts
     /// as active.
     ///
-    /// Covers every field except the `above_*` slices, which are subsets of
-    /// fields already checked. A new bucket must be added here too.
+    /// Covers every field except `tool_tokens` and the `above_*` slices, which
+    /// are subsets of fields already checked (`tool_tokens` is a summand of
+    /// `total`). A new bucket must be added here too.
     pub fn has_activity(&self) -> bool {
         self.total != 0
             || self.input_tokens != 0
@@ -252,7 +257,7 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
         // them an input or output price, and take the larger of that sum and
         // any provider-published `total_tokens`, so a session whose priced
         // buckets are all zero does not read as inactive.
-        let tool_tokens = usage_obj
+        counts.tool_tokens = usage_obj
             .get("tool_tokens")
             .and_then(|value| value.as_i64())
             .unwrap_or(0);
@@ -261,7 +266,7 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
             + counts.reasoning_tokens
             + counts.cache_read
             + counts.cache_creation
-            + tool_tokens;
+            + counts.tool_tokens;
         counts.total = usage_obj
             .get("total_tokens")
             .and_then(|value| value.as_i64())

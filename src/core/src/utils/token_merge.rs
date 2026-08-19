@@ -98,6 +98,7 @@ fn add_token_counts(a: &TokenCounts, b: &TokenCounts) -> TokenCounts {
         cache_creation_5m: a.cache_creation_5m + b.cache_creation_5m,
         cache_creation_1h: a.cache_creation_1h + b.cache_creation_1h,
         web_search_requests: a.web_search_requests + b.web_search_requests,
+        tool_tokens: a.tool_tokens + b.tool_tokens,
         total: a.total + b.total,
         above_input: a.above_input + b.above_input,
         above_output: a.above_output + b.above_output,
@@ -129,7 +130,9 @@ pub fn normalize_usage_value(usage: &Value) -> Value {
 ///
 /// The key set is exactly what [`extract_token_counts`] reads for a flat value,
 /// so every bucket round-trips. `total` is intentionally omitted: the extractor
-/// recomputes it as the bucket sum.
+/// recomputes it as the bucket sum, which matches only because no provider
+/// publishes a `total_tokens` larger than its own buckets sum to. One that did
+/// would lose the difference here, the way `tool_tokens` used to.
 fn token_counts_to_flat_value(c: &TokenCounts) -> Value {
     let mut obj = serde_json::Map::new();
     obj.insert("input_tokens".into(), json!(c.input_tokens));
@@ -155,6 +158,13 @@ fn token_counts_to_flat_value(c: &TokenCounts) -> Value {
             json!({ "web_search_requests": c.web_search_requests }),
         );
     }
+    // Only Gemini publishes this, so writing it unconditionally would put a
+    // `"tool_tokens": 0` on every other provider's row. Omitting it when it
+    // carries tokens is what loses them: the extractor recomputes the total
+    // from the keys it finds, and nothing else records them.
+    if c.tool_tokens != 0 {
+        obj.insert("tool_tokens".into(), json!(c.tool_tokens));
+    }
     if c.above_input != 0
         || c.above_output != 0
         || c.above_reasoning != 0
@@ -175,4 +185,49 @@ fn token_counts_to_flat_value(c: &TokenCounts) -> Value {
         );
     }
     Value::Object(obj)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalized_gemini_row_keeps_tool_tokens_in_its_buckets() {
+        let normalized = normalize_usage_value(&json!({
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_read_input_tokens": 50,
+            "thoughts_tokens": 30,
+            "tool_tokens": 7,
+            "total_tokens": 150
+        }));
+
+        assert_eq!(normalized["tool_tokens"], json!(7));
+        // Without the key the row would report a total its own buckets fall
+        // short of by exactly the tool tokens.
+        let buckets: i64 = [
+            "input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+            "tool_tokens",
+        ]
+        .iter()
+        .map(|key| normalized[*key].as_i64().unwrap())
+        .sum();
+        assert_eq!(buckets, normalized["total_tokens"].as_i64().unwrap());
+    }
+
+    #[test]
+    fn normalized_row_without_tool_tokens_omits_the_key() {
+        // Every provider but Gemini: the flat key set is unchanged.
+        let normalized = normalize_usage_value(&json!({
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_read_input_tokens": 50
+        }));
+
+        assert!(normalized.get("tool_tokens").is_none());
+    }
 }

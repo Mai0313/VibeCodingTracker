@@ -6,7 +6,6 @@
 //! files into a fake home and call the `*_from_paths` aggregation entry points
 //! directly. No `HOME`/`XDG_*`/`VCT_OFFLINE` is ever touched, so every test runs
 //! in parallel and behaves identically locally and in CI.
-#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;

@@ -285,7 +285,7 @@ Totals (by Provider)
 ]
 ```
 
-无论来源 provider 是什么，每一行都会输出相同的扁平 token 字段（Codex 内部的嵌套结构会在输出前规范化）。
+无论来源 provider 是什么，每一行都会输出相同的扁平 token 字段（Codex 内部的嵌套结构会在输出前规范化）。若某个 provider 计费的 bucket 是其他 provider 没有的，该行会额外带上自己的 key：实际用掉 tool token 的 Gemini 行会带 `tool_tokens`，LiteLLM 没有对应费率，只计入 `total_tokens`。
 
 ### 扫描范围
 
@@ -468,7 +468,7 @@ vct 启动时每天 UTC 日期最多检查一次新版. 只有通过官方 `scri
 
 Unix 应用更新后, vct 会用新版 binary 重新执行当前命令. Windows 会先让当前命令结束, 再由 helper 应用替换. 自动流程绝不会修改通过 cargo, npm, PyPI, distro package 安装的版本, 也不会修改没有 marker 的手动安装或 development build. 请通过相应的 package manager 更新. 现有直接安装只要再运行一次当前官方 installer, 就会创建 marker 并启用自动更新.
 
-在 `~/.vct/config.toml` 中设置 `general.auto_update = false` 可以关闭启动检查和自动更新. 显式执行的 `vct update` 会保留原有手动行为.
+在 `~/.vct/config.toml` 中设置 `general.auto_update = false` 可以关闭启动检查和自动更新. 显式执行的 `vct update` 会保留原有手动行为. `VCT_OFFLINE=1` 对它同样有效: `--check`, 交互式确认和 `--force` 都会直接返回, 不会连接 GitHub.
 
 ### 基本用法
 
@@ -680,7 +680,7 @@ vct config migrate
 
 ### 费用细节
 
-- **Context tier 按单个 request 计**：LiteLLM 的「above Nk tokens」费率（如 GPT-5.x 超过 272k、Gemini 超过 200k）只应用在自身 prompt context 超过阈值的那些 request 上。没有 per-request 粒度的 provider（以及离线扫描）一律按基础费率计价，因此这类 model 的费用是下界。
+- **Context tier 按单个 request 计**：LiteLLM 的「above Nk tokens」费率（如 GPT-5.x 超过 272k、Gemini 超过 200k）与 Qwen / doubao 的用量级距同样只应用在自身 prompt context 超过分界的那些 request 上，不会应用到整次扫描的 token 总和。没有 per-request 粒度的 provider（以及离线扫描）一律按最低一级的费率计价，因此这类 model 的费用是下界。
 - **不止 token**：Claude 的 web-search 工具调用（`server_tool_use.web_search_requests`）会在 token 费用之外按每次查询计费；其他所有 model 的每次查询费用均为 $0。
 - **OpenCode**：只有在 LiteLLM 上**精确**匹配时，才会根据 token 为一个全新的 model 名称定价；若没有精确匹配，vct 会信任该 assistant message 自身存储的费用，而不是从一个只是大致相似的名称去猜测。
 - **Hermes**：与 OpenCode 相同，LiteLLM 上**精确**匹配时按 token 定价，否则使用 Hermes 自身存储的费用。

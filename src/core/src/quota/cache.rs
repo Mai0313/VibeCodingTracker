@@ -41,7 +41,7 @@ trait CachedQuota: Serialize + DeserializeOwned {
 }
 
 impl CachedQuota for ClaudeQuotaSnapshot {
-    const SCHEMA_VERSION: u32 = 1;
+    const SCHEMA_VERSION: u32 = 2;
 }
 
 impl CachedQuota for CodexQuotaSnapshot {
@@ -57,7 +57,7 @@ impl CachedQuota for CursorQuotaSnapshot {
 }
 
 impl CachedQuota for GrokQuotaSnapshot {
-    const SCHEMA_VERSION: u32 = 1;
+    const SCHEMA_VERSION: u32 = 2;
 }
 
 /// The on-disk envelope: the writing build's schema version + the snapshot.
