@@ -47,12 +47,6 @@ pub struct CopilotSessionStartData {
     /// Session identifier.
     #[serde(default)]
     pub session_id: String,
-    /// Copilot CLI version that produced the session.
-    #[serde(default)]
-    pub copilot_version: String,
-    /// ISO-8601 session start time.
-    #[serde(default)]
-    pub start_time: String,
     /// Workspace context, when the session ran inside a project.
     #[serde(default)]
     pub context: Option<CopilotSessionContext>,
@@ -78,25 +72,10 @@ pub struct CopilotSessionContext {
     /// run inside a git repo.
     #[serde(default)]
     pub repository: String,
-    /// E.g. `"github"`.
-    #[serde(default)]
-    pub host_type: String,
     /// E.g. `"github.com"`; used together with `repository` to reconstruct
     /// the remote URL.
     #[serde(default)]
     pub repository_host: String,
-}
-
-/// `session.model_change` payload — each session may switch between models at
-/// any point, so the analyzer attributes the streamed `assistant.message`
-/// output tokens to the most recent one. That fallback only applies to
-/// sessions that never reach `session.shutdown`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CopilotModelChangeData {
-    /// Model the session switched to.
-    #[serde(default)]
-    pub new_model: String,
 }
 
 /// `session.shutdown` payload — authoritative per-model token usage.
@@ -111,9 +90,6 @@ pub struct CopilotShutdownData {
     /// Per-model token metrics, keyed by model name.
     #[serde(default)]
     pub model_metrics: BTreeMap<String, CopilotModelMetric>,
-    /// Model that was active when the session shut down.
-    #[serde(default)]
-    pub current_model: String,
 }
 
 /// Per-model block inside [`CopilotShutdownData::model_metrics`].
