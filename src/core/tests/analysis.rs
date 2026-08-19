@@ -101,14 +101,19 @@ fn seed_opencode_tie_breaker_db(path: &Path) {
     tx.commit().unwrap();
 }
 
-/// Compares every per-provider bucket of two analysis results.
+/// Compares every bucket of two analysis results.
 ///
-/// Each bucket is reached by destructuring rather than by naming fields one at
-/// a time: a provider added to one of these structs then fails to compile here,
-/// instead of silently going uncompared.
+/// Every struct here is destructured rather than having its fields named one at
+/// a time: a bucket added to any of them then fails to compile, instead of
+/// silently going uncompared.
 fn assert_analysis_data_eq(actual: &AnalysisData, expected: &AnalysisData) {
+    let AnalysisData {
+        rows,
+        per_provider,
+        provider_days,
+    } = actual;
     assert_eq!(
-        serde_json::to_value(&actual.rows).unwrap(),
+        serde_json::to_value(rows).unwrap(),
         serde_json::to_value(&expected.rows).unwrap()
     );
 
@@ -121,7 +126,7 @@ fn assert_analysis_data_eq(actual: &AnalysisData, expected: &AnalysisData) {
         deepseek,
         opencode,
         cursor,
-    } = &actual.per_provider;
+    } = per_provider;
     let other = &expected.per_provider;
     for (provider, actual_rows, expected_rows) in [
         ("Claude", claude, &other.claude),
@@ -151,7 +156,7 @@ fn assert_analysis_data_eq(actual: &AnalysisData, expected: &AnalysisData) {
         grok,
         deepseek,
         total,
-    } = &actual.provider_days;
+    } = provider_days;
     let other = &expected.provider_days;
     for (provider, actual_days, expected_days) in [
         ("Claude", claude, &other.claude),

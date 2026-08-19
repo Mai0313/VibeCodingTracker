@@ -167,13 +167,19 @@ fn seed_hermes_usage_db(path: &std::path::Path) {
         .unwrap();
 }
 
-/// Compares every per-provider bucket of two usage results.
+/// Compares every bucket of two usage results.
 ///
-/// Each bucket is reached by destructuring rather than by naming fields one at
-/// a time: a provider added to one of these structs then fails to compile here,
-/// instead of silently going uncompared the way DeepSeek Harness did.
+/// Every struct here is destructured rather than having its fields named one at
+/// a time: a bucket added to any of them then fails to compile, instead of
+/// silently going uncompared the way DeepSeek Harness did.
 fn assert_usage_data_eq(actual: &UsageData, expected: &UsageData) {
-    assert_eq!(actual.models, expected.models);
+    let UsageData {
+        models,
+        per_provider,
+        provider_days,
+        stored_costs,
+    } = actual;
+    assert_eq!(models, &expected.models);
 
     let PerProviderUsage {
         claude,
@@ -185,7 +191,7 @@ fn assert_usage_data_eq(actual: &UsageData, expected: &UsageData) {
         hermes,
         grok,
         deepseek,
-    } = &actual.per_provider;
+    } = per_provider;
     let other = &expected.per_provider;
     for (provider, actual_usage, expected_usage) in [
         ("Claude", claude, &other.claude),
@@ -212,7 +218,7 @@ fn assert_usage_data_eq(actual: &UsageData, expected: &UsageData) {
         grok,
         deepseek,
         total,
-    } = &actual.provider_days;
+    } = provider_days;
     let other = &expected.provider_days;
     for (provider, actual_days, expected_days) in [
         ("Claude", claude, &other.claude),
@@ -233,7 +239,7 @@ fn assert_usage_data_eq(actual: &UsageData, expected: &UsageData) {
         opencode,
         cursor,
         hermes,
-    } = &actual.stored_costs;
+    } = stored_costs;
     let other = &expected.stored_costs;
     for (provider, actual_costs, expected_costs) in [
         ("OpenCode", opencode, &other.opencode),
