@@ -149,7 +149,10 @@ where
                             // Replayed pre-context totals: advance the snapshot
                             // without attributing tokens to a guessed model.
                             if let Some(total) = total {
-                                prev_totals = Some(CodexTokenTotals::from_total_object(total));
+                                prev_totals = Some(CodexTokenTotals::from_total_object(
+                                    total,
+                                    prev_totals.as_ref(),
+                                ));
                             }
                         } else {
                             let delta = total
@@ -179,7 +182,10 @@ where
                                 above,
                             );
                             if let Some(total) = total {
-                                prev_totals = Some(CodexTokenTotals::from_total_object(total));
+                                prev_totals = Some(CodexTokenTotals::from_total_object(
+                                    total,
+                                    prev_totals.as_ref(),
+                                ));
                             }
                         }
                     }
