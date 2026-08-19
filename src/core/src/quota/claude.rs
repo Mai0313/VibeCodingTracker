@@ -312,11 +312,10 @@ fn refresh_claude(
         body["scope"] = json!(scopes.join(" "));
     }
 
-    let urls = token_urls;
     let mut parsed: Option<ClaudeRefreshResponse> = None;
     let mut last_err: Option<anyhow::Error> = None;
-    for (i, url) in urls.iter().enumerate() {
-        let has_next = i + 1 < urls.len();
+    for (i, url) in token_urls.iter().enumerate() {
+        let has_next = i + 1 < token_urls.len();
         let req = client
             .post(url)
             .header(reqwest::header::USER_AGENT, claude_ua())

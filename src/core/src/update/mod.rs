@@ -589,12 +589,6 @@ pub fn update_interactive(force: bool) -> Result<()> {
     }
 }
 
-// Re-export functions for testing
-#[doc(hidden)]
-pub use archive::{extract_targz, extract_zip};
-#[doc(hidden)]
-pub use platform::get_asset_pattern;
-
 #[cfg(test)]
 mod tests {
     use super::*;

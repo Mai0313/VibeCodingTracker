@@ -39,7 +39,9 @@ pub struct ModelPricingMap {
     raw: HashMap<Rc<str>, ModelPricing>,
     // Precomputed normalized keys for fast matching
     normalized_index: HashMap<String, Vec<Rc<str>>>,
-    // Precomputed lowercase keys for substring/fuzzy matching
+    // Precomputed lowercase keys for substring/fuzzy matching. Order is
+    // unobservable: both consumers scan the whole vector and tie-break on the
+    // key itself, so no arrangement of it can change a lookup.
     lowercase_keys: Vec<(String, Rc<str>)>, // (lowercase_key, original_key as Rc)
     // Lookup results belong to this map. A process-global result cache is
     // incorrect because model names can map to different prices in each map.
@@ -97,7 +99,6 @@ impl ModelPricingMap {
             rc_raw.insert(rc_key, pricing);
         }
 
-        lowercase_keys.sort_by(|a, b| a.0.cmp(&b.0));
         for candidates in normalized_index.values_mut() {
             candidates.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
         }
