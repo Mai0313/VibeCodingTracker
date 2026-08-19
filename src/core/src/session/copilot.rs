@@ -220,7 +220,25 @@ where
                             },
                         );
                     }
-                    Ok(_) | Err(_) => diagnostics.record_relevant(false),
+                    Ok(data) => {
+                        diagnostics.record_relevant(false);
+                        // The verdict for this call is already taken. Holding
+                        // the id keeps its completion pairing, so the same
+                        // drift is not counted a second time as an orphan.
+                        if !data.tool_call_id.is_empty() {
+                            pending_tools.insert(
+                                data.tool_call_id,
+                                PendingTool {
+                                    tool_name: String::new(),
+                                    arguments: Value::Null,
+                                    timestamp: ts,
+                                    tracked: false,
+                                    arguments_supported: false,
+                                },
+                            );
+                        }
+                    }
+                    Err(_) => diagnostics.record_relevant(false),
                 }
             }
             "tool.execution_complete" => {
@@ -234,6 +252,14 @@ where
                     continue;
                 };
                 let Some(pending) = pending_tools.remove(tool_call_id) else {
+                    // Without the start event there is no tool name, so there
+                    // is no `tracked` flag to gate on. Only a completion that
+                    // reported success could have carried a file operation —
+                    // a failed one is skipped even when it does pair — so that
+                    // is the orphan counted as a record left unnormalized.
+                    if event.data.get("success").and_then(Value::as_bool) == Some(true) {
+                        diagnostics.record_relevant(false);
+                    }
                     continue;
                 };
                 let Some(success) = event.data.get("success").and_then(Value::as_bool) else {
@@ -1065,6 +1091,46 @@ mod tests {
         assert!(!failed.diagnostics.is_complete_failure());
         assert_eq!(failed.diagnostics.partial_failure_count(), 0);
         assert_eq!(failed.analysis.records[0].tool_call_counts.read, 0);
+    }
+
+    #[test]
+    fn an_orphaned_successful_completion_is_not_dropped_silently() {
+        let complete = |success: bool| {
+            event(
+                "tool.execution_complete",
+                json!({
+                    "toolCallId": "never-started",
+                    "success": success,
+                    "result": { "content": "one\ntwo" }
+                }),
+            )
+        };
+
+        let orphan =
+            parse_copilot_events_with_diagnostics(vec![complete(true)], ParseMode::Full).unwrap();
+        assert_eq!(orphan.diagnostics.failed_relevant_records, 1);
+
+        // A failed tool produces no metric even when it does pair, so its
+        // orphan lost nothing and must not read as a gap.
+        let failed =
+            parse_copilot_events_with_diagnostics(vec![complete(false)], ParseMode::Full).unwrap();
+        assert_eq!(failed.diagnostics.failed_relevant_records, 0);
+        assert_eq!(failed.diagnostics.partial_failure_count(), 0);
+
+        // A start whose schema drifted already recorded the failure, so its
+        // completion must not record a second one for the same call.
+        let drifted = parse_copilot_events_with_diagnostics(
+            vec![
+                event(
+                    "tool.execution_start",
+                    json!({ "toolCallId": "never-started", "renamedTool": "show_file" }),
+                ),
+                complete(true),
+            ],
+            ParseMode::Full,
+        )
+        .unwrap();
+        assert_eq!(drifted.diagnostics.failed_relevant_records, 1);
     }
 
     #[test]

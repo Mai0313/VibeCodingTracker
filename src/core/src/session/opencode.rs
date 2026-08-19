@@ -114,14 +114,18 @@ pub fn read_opencode_analysis(
             result.expected_records
         ));
     }
+    // Records and tool parts are different units: one message can carry many
+    // parts, so adding them together reports a part count as a record count.
     let failed_records = result
         .expected_records
-        .saturating_sub(result.parsed_records)
-        + result.failed_tool_parts;
+        .saturating_sub(result.parsed_records);
     if failed_records > 0 {
+        log::warn!("skipped {failed_records} OpenCode analysis records with unsupported schema");
+    }
+    if result.failed_tool_parts > 0 {
         log::warn!(
-            "skipped {} OpenCode analysis records with unsupported schema",
-            failed_records
+            "skipped {} OpenCode tool parts with unsupported schema",
+            result.failed_tool_parts
         );
     }
     Ok(result
@@ -949,8 +953,13 @@ fn parse_model_id(raw: &str) -> Option<String> {
             let s = s.trim();
             (!s.is_empty()).then(|| s.to_string())
         }
-        // Not a JSON object or string: treat the column as a plain model name.
-        _ => Some(raw.to_string()),
+        // A bare model name is not valid JSON, so a parse failure is what the
+        // legacy plain-string column looks like.
+        Err(_) => Some(raw.to_string()),
+        // Any other JSON value carries no model name. The SQL guard tests for
+        // SQL `NULL`, not for a column holding the four characters `null`,
+        // which would otherwise be priced and displayed as a model.
+        _ => None,
     }
 }
 
@@ -1366,6 +1375,13 @@ mod tests {
         );
         assert_eq!(parse_model_id(r#"{"providerID":"x"}"#), None);
         assert_eq!(parse_model_id("   "), None);
+        // A column holding a JSON scalar names no model; the SQL guard only
+        // filters SQL `NULL` and the empty string.
+        assert_eq!(parse_model_id("null"), None);
+        assert_eq!(parse_model_id("42"), None);
+        assert_eq!(parse_model_id("[]"), None);
+        // A quoted string is still the legacy plain-name column.
+        assert_eq!(parse_model_id(r#""gpt-5""#).as_deref(), Some("gpt-5"));
     }
 
     #[test]

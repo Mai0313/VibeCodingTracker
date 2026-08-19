@@ -336,7 +336,10 @@ fn apply_completed_tool(
                 .pointer("/FileContent/content")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            if content.is_empty() {
+            // `add_read_detail` counts nothing for a body that trims to no
+            // lines, so a newline-only read has to take the same branch as an
+            // empty one or the invocation vanishes from every counter.
+            if content.trim_end_matches('\n').is_empty() {
                 state.tool_counts.read += 1;
                 state.add_non_text_read_path(path);
             } else {
@@ -574,6 +577,24 @@ mod tests {
         );
         assert_eq!(state.edit_details[0].old_string, "matched one");
         assert_eq!(state.edit_details[1].old_string, "matched two");
+    }
+
+    #[test]
+    fn newline_only_read_still_counts_the_invocation() {
+        let mut state = SessionParseState::new();
+        let call = PendingToolCall {
+            name: "read_file".to_string(),
+            input: json!({"target_file": "/workspace/blank.txt"}),
+        };
+        let output = json!({
+            "type": "Read",
+            "FileContent": {"absolute_path": "/workspace/blank.txt", "content": "\n\n"}
+        });
+
+        assert!(apply_completed_tool(&mut state, &call, 123, &output));
+        assert_eq!(state.tool_counts.read, 1);
+        assert_eq!(state.total_read_lines, 0);
+        assert!(state.unique_files.contains("/workspace/blank.txt"));
     }
 
     #[test]

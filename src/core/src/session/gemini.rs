@@ -250,8 +250,12 @@ fn gemini_tokens_supported(tokens: &Value) -> bool {
     let Some(tokens) = tokens.as_object() else {
         return false;
     };
+    // Every `GeminiTokens` field defaults, so an empty object deserializes to
+    // all zeros and would pass as a clean scan that billed nothing. It carries
+    // no less drift than an object of only unknown keys, which is already
+    // refused below.
     if tokens.is_empty() {
-        return true;
+        return false;
     }
 
     let mut recognized = false;
@@ -826,6 +830,21 @@ mod tests {
         assert_eq!(
             parsed.analysis.records[0].conversation_usage["gemini-test"]["input_tokens"],
             0
+        );
+    }
+
+    #[test]
+    fn an_empty_token_object_does_not_become_zero_usage() {
+        let mut message = assistant("empty-tokens", "gemini-test", 10, json!([]));
+        message["tokens"] = json!({});
+
+        let parsed =
+            parse_gemini_events_with_diagnostics(session(), vec![message], ParseMode::Full, None)
+                .unwrap();
+        assert!(parsed.diagnostics.is_complete_failure());
+        assert!(
+            parsed.analysis.records[0].conversation_usage.is_empty(),
+            "an empty token object must not become a successful all-zero usage row"
         );
     }
 

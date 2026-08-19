@@ -800,20 +800,32 @@ fn resolve_store_model(
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// Reads `lastUsedModel` from the store's `meta` row.
+/// Reads `lastUsedModel` from the store's `meta` table.
 ///
 /// The `meta.value` is a hex-encoded JSON string; decode then read the field.
 /// Tolerates a plain-JSON value too, in case a future build stops hex-encoding.
+/// `meta` is keyed `(key PRIMARY KEY, value)` and current stores hold one row
+/// keyed `0`, but that name is cursor-agent's to change, so every row is
+/// decoded and the first one carrying the field wins rather than whichever row
+/// SQLite happens to return first.
 fn store_meta_model(conn: &Connection) -> Option<String> {
-    let value: String = conn
-        .query_row("SELECT value FROM meta LIMIT 1", [], |r| r.get(0))
-        .ok()?;
-    let bytes = decode_hex(&value).unwrap_or_else(|| value.clone().into_bytes());
-    let json: Value = serde_json::from_slice(&bytes).ok()?;
-    json.get("lastUsedModel")
-        .and_then(|m| m.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+    let mut stmt = conn.prepare("SELECT value FROM meta ORDER BY key").ok()?;
+    // A row whose `value` is NULL or not text is skipped, not fatal: failing
+    // the whole read on one would lose the lookup for exactly the multi-row
+    // store this scan exists to handle.
+    let values = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .ok()?
+        .filter_map(rusqlite::Result::ok)
+        .collect::<Vec<_>>();
+    values.into_iter().find_map(|value| {
+        let bytes = decode_hex(&value).unwrap_or_else(|| value.into_bytes());
+        let json: Value = serde_json::from_slice(&bytes).ok()?;
+        json.get("lastUsedModel")
+            .and_then(|m| m.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    })
 }
 
 /// Loads every blob's raw bytes from a store.
@@ -1477,6 +1489,30 @@ mod tests {
             .unwrap();
         }
         drop(conn);
+    }
+
+    #[test]
+    fn store_meta_model_does_not_depend_on_which_row_comes_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        write_store_db(&path, &[], &[]);
+        let conn = Connection::open(&path).unwrap();
+        let hex: String = r#"{"agentId":"a","lastUsedModel":"gpt-5.6-sol"}"#
+            .bytes()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('0', ?1)",
+            [r#"{"other":true}"#],
+        )
+        .unwrap();
+        // A row that is not readable as text must not abort the scan.
+        conn.execute("INSERT INTO meta (key, value) VALUES ('1', NULL)", [])
+            .unwrap();
+        conn.execute("INSERT INTO meta (key, value) VALUES ('z', ?1)", [&hex])
+            .unwrap();
+
+        assert_eq!(store_meta_model(&conn).as_deref(), Some("gpt-5.6-sol"));
     }
 
     #[test]

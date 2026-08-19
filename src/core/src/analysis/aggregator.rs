@@ -605,7 +605,7 @@ fn scan_opencode_analysis(
             );
         }
         Err(error) => {
-            let failure = error.to_string();
+            let failure = format!("{error:#}");
             record_failure(diagnostics, provider, source, failure.clone());
             if is_cacheable_sqlite_failure(&error) {
                 cache.insert(
@@ -644,7 +644,7 @@ fn scan_cursor_analysis(
         match load_conversation_model_snapshot(tracking_db) {
             Ok(snapshot) => (snapshot.models, snapshot.fingerprint, true),
             Err(error) => {
-                record_failure(diagnostics, provider, tracking_db, error.to_string());
+                record_failure(diagnostics, provider, tracking_db, format!("{error:#}"));
                 (FastHashMap::default(), None, false)
             }
         };
@@ -722,7 +722,7 @@ fn scan_cursor_analysis(
                 }
             }
             Err(error) => {
-                let failure = error.to_string();
+                let failure = format!("{error:#}");
                 record_failure(diagnostics, provider, &store, failure.clone());
                 if tracking_ok && is_cacheable_sqlite_failure(&error) {
                     cache.insert(

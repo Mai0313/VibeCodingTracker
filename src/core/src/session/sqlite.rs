@@ -53,6 +53,10 @@ pub(crate) fn optional_database_fingerprint(db_path: &Path) -> Result<Option<Dat
 /// remain failures until the source fingerprint changes, so incremental scans
 /// may cache their diagnostics. Open, permission, busy, and I/O failures are
 /// deliberately excluded and retried on every refresh.
+///
+/// The decision reads the flattened chain (`{error:#}`), so a caller rendering
+/// the same failure for the user has to flatten it too — plain `Display` keeps
+/// only the outermost context, which is never the cause this matches on.
 pub(crate) fn is_cacheable_sqlite_failure(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}").to_ascii_lowercase();
     [
@@ -63,7 +67,6 @@ pub(crate) fn is_cacheable_sqlite_failure(error: &anyhow::Error) -> bool {
         "malformed json",
         "file is not a database",
         "database disk image is malformed",
-        "unsupported sqlite schema",
     ]
     .iter()
     .any(|needle| message.contains(needle))
@@ -91,18 +94,21 @@ pub(crate) fn with_readonly_connection<T>(
         return f(&conn);
     }
 
+    // The context names the source database, not the private copy: the copy's
+    // path is deleted by the time anyone reads the message, and it is the
+    // source the user can act on.
     let copy = StableTempCopy::new(db_path, temp_prefix)?;
     let conn = Connection::open_with_flags(&copy.db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
         .with_context(|| {
             format!(
-                "Failed to open {label} DB copy at {}",
-                copy.db_path.display()
+                "Failed to open a copy of the {label} DB at {}",
+                db_path.display()
             )
         })?;
     probe(&conn, &probe_sql).with_context(|| {
         format!(
-            "Failed to read {label} DB copy at {}",
-            copy.db_path.display()
+            "Failed to read a copy of the {label} DB at {}",
+            db_path.display()
         )
     })?;
     f(&conn)
@@ -242,6 +248,36 @@ mod tests {
             .unwrap();
 
         assert_eq!(value, 42);
+    }
+
+    #[test]
+    fn a_probe_failure_keeps_its_cause_and_names_the_source() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source_path = source_dir.path().join("source.db");
+        let source = Connection::open(&source_path).unwrap();
+        source
+            .execute_batch("CREATE TABLE other (value INTEGER NOT NULL);")
+            .unwrap();
+        drop(source);
+
+        let error = with_readonly_connection(
+            &source_path,
+            "session",
+            "vct-sqlite-test-",
+            "Example",
+            |_| Ok(()),
+        )
+        .unwrap_err();
+
+        // Plain `Display` stops at the outer context, which is exactly what
+        // the cacheability check never sees.
+        let flattened = format!("{error:#}");
+        assert!(flattened.contains("no such table"), "{flattened}");
+        assert!(
+            flattened.contains(&source_path.display().to_string()),
+            "{flattened}"
+        );
+        assert!(is_cacheable_sqlite_failure(&error));
     }
 
     #[test]
