@@ -11,7 +11,7 @@ use crate::models::*;
 use crate::pricing::{TierClassifier, TierThresholds};
 use crate::session::diagnostics::{ParseDiagnostics, ParsedAnalysis};
 use crate::session::state::{ParseMode, SessionParseState};
-use crate::utils::{get_git_remote_url, parse_iso_timestamp, process_gemini_usage};
+use crate::utils::{parse_iso_timestamp, process_gemini_usage};
 use anyhow::Result;
 use serde::Deserialize;
 use serde_json::Value;
@@ -359,18 +359,14 @@ fn record_message_diagnostics(message: &GeminiAnalysisMessage, diagnostics: &mut
 
 /// Converts the accumulated state into a single-record [`CodeAnalysis`],
 /// stamping the `task_id` from the session meta.
+///
+/// Gemini CLI records no workspace path, so `folder_path` and `git_remote`
+/// both stay empty; there is nothing to resolve a remote against.
 fn finalize_record(
-    mut state: SessionParseState,
+    state: SessionParseState,
     conversation_usage: FastHashMap<String, Value>,
     session_id: String,
 ) -> CodeAnalysis {
-    // Gemini CLI does not record the invoking `cwd` in its log format today, so
-    // `folder_path` is empty here and this resolves to an empty remote; it only
-    // yields a URL if a future log format carries a workspace path.
-    if state.git_remote.is_empty() {
-        state.git_remote = get_git_remote_url(&state.folder_path);
-    }
-
     let last_ts = state.last_ts;
     let mut record = state.into_record(conversation_usage);
     record.task_id = session_id;
