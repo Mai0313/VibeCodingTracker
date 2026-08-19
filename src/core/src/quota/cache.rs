@@ -41,7 +41,7 @@ trait CachedQuota: Serialize + DeserializeOwned {
 }
 
 impl CachedQuota for ClaudeQuotaSnapshot {
-    const SCHEMA_VERSION: u32 = 1;
+    const SCHEMA_VERSION: u32 = 2;
 }
 
 impl CachedQuota for CodexQuotaSnapshot {

@@ -126,6 +126,10 @@ pub enum QuotaOutcome<T> {
 /// Spawns a detached background worker that refreshes `shared` (and the on-disk
 /// cache via `save`) every `refresh_secs` until `shutdown` is set.
 ///
+/// `refresh_secs` is clamped to at least one second here rather than trusted:
+/// a `0` cadence leaves no sleep at all, so the worker would hammer `resolve`
+/// (and the provider's API) in a tight loop.
+///
 /// The worker is panic-isolated and holds the mutex only for the assignment, so
 /// it can never poison the lock. It is not joined on quit — `shutdown` is set as
 /// a courtesy and the OS reclaims the thread on process exit.
@@ -142,6 +146,8 @@ where
     R: FnMut() -> QuotaOutcome<T> + Send + 'static,
     S: Fn(&T) + Send + 'static,
 {
+    // Sleep in 200ms slices so shutdown stays responsive.
+    let ticks = refresh_secs.max(1).saturating_mul(5);
     std::thread::spawn(move || {
         loop {
             if shutdown.load(Ordering::Relaxed) {
@@ -169,8 +175,7 @@ where
                 Ok(QuotaOutcome::Transient) => {}
                 Err(_) => log::warn!("{label} quota worker panicked; keeping last snapshot"),
             }
-            // Sleep in 200ms slices so shutdown stays responsive.
-            for _ in 0..(refresh_secs * 5) {
+            for _ in 0..ticks {
                 if shutdown.load(Ordering::Relaxed) {
                     break;
                 }

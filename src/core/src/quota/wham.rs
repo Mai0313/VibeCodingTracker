@@ -286,37 +286,6 @@ pub fn call_wham(
     }
 }
 
-/// Calls `wham/usage`, then enriches a successful snapshot with earned reset
-/// credit details. The details request is best-effort: any HTTP or parse error
-/// keeps the count `wham/usage` already reported.
-pub fn call_wham_with_reset_credits(
-    client: &reqwest::blocking::Client,
-    token: &str,
-    account_id: Option<&str>,
-    now: i64,
-    wham_url: &str,
-    reset_credits_url: &str,
-) -> WhamResult {
-    let mut snap = match call_wham(client, token, account_id, now, wham_url) {
-        WhamResult::Ok(snap) => snap,
-        WhamResult::Unauthorized => return WhamResult::Unauthorized,
-        WhamResult::Transient => return WhamResult::Transient,
-    };
-
-    match call_reset_credit_details(client, token, account_id, reset_credits_url) {
-        ResetCreditsResult::Ok {
-            available_count,
-            expirations,
-        } => {
-            snap.reset_credits_available = available_count.or(snap.reset_credits_available);
-            snap.reset_credit_expirations = Some(expirations);
-        }
-        ResetCreditsResult::Unauthorized | ResetCreditsResult::Transient => {}
-    }
-
-    WhamResult::Ok(snap)
-}
-
 /// Calls and maps the earned reset-credit details endpoint.
 pub fn call_reset_credit_details(
     client: &reqwest::blocking::Client,

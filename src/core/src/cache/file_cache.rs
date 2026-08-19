@@ -1,9 +1,8 @@
 use crate::constants::capacity;
 use crate::models::{
     CodeAnalysis, CodeAnalysisApplyDiffDetail, CodeAnalysisReadDetail, CodeAnalysisRecord,
-    CodeAnalysisRunCommandDetail, CodeAnalysisWriteDetail, ExtensionType,
+    CodeAnalysisRunCommandDetail, CodeAnalysisWriteDetail,
 };
-use crate::session::ParseMode;
 use anyhow::Result;
 use lru::LruCache;
 use std::fs;
@@ -66,9 +65,10 @@ impl FileParseCache {
     /// Retrieves cached analysis or parses the file if needed, auto-detecting
     /// the provider from file contents.
     ///
-    /// Prefer [`Self::get_or_parse_as`] whenever the caller already knows which
-    /// provider the file belongs to (e.g. walking a specific session
-    /// directory). Content detection is only safe for ad-hoc single-file paths.
+    /// Detection is content-based, so this suits an ad-hoc single-file path. A
+    /// caller walking one provider's session directory already knows the
+    /// provider and should parse through
+    /// [`crate::session::parse_session_file_typed_as`] instead.
     ///
     /// # Errors
     ///
@@ -76,35 +76,7 @@ impl FileParseCache {
     /// session file fails (malformed data, unreadable contents, etc.). A
     /// poisoned cache lock does not error — it simply forces a reparse.
     pub fn get_or_parse<P: AsRef<Path>>(&self, path: P) -> Result<Arc<CodeAnalysis>> {
-        self.get_or_parse_inner(path.as_ref(), None)
-    }
-
-    /// Same as [`Self::get_or_parse`] but the caller specifies which provider
-    /// the file belongs to — the parser skips content-based detection, so
-    /// metadata sentinels at the top of a Claude session (`permission-mode`,
-    /// `file-history-snapshot`) cannot cause the file to be mis-filed under a
-    /// different provider.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the file's metadata cannot be read or if parsing the
-    /// session file as `provider` fails.
-    pub fn get_or_parse_as<P: AsRef<Path>>(
-        &self,
-        path: P,
-        provider: ExtensionType,
-    ) -> Result<Arc<CodeAnalysis>> {
-        self.get_or_parse_inner(path.as_ref(), Some(provider))
-    }
-
-    /// Shared cache lookup + parse path behind [`Self::get_or_parse`] and
-    /// [`Self::get_or_parse_as`]; `provider` of `None` triggers content-based
-    /// auto-detection.
-    fn get_or_parse_inner(
-        &self,
-        path: &Path,
-        provider: Option<ExtensionType>,
-    ) -> Result<Arc<CodeAnalysis>> {
+        let path = path.as_ref();
         let path_buf = path.to_path_buf();
 
         let primary = file_stamp(path)?;
@@ -113,8 +85,7 @@ impl FileParseCache {
             if let Ok(cache_read) = self.cache.read() {
                 // peek() rather than get(), so a hit needs no write lock.
                 if let Some(cached) = cache_read.peek(&path_buf) {
-                    let is_grok = provider == Some(ExtensionType::Grok)
-                        || cached.analysis.extension_name == "Grok";
+                    let is_grok = cached.analysis.extension_name == "Grok";
                     let fingerprint = FileFingerprint {
                         primary,
                         grok_dependencies: is_grok.then(|| grok_dependency_stamps(path)),
@@ -137,26 +108,22 @@ impl FileParseCache {
         }
 
         log::debug!("LRU cache miss for {}, parsing...", path.display());
-        let possible_grok_dependencies = (provider.is_none()
-            || provider == Some(ExtensionType::Grok))
-        .then(|| grok_dependency_stamps(path));
-        let analysis = match provider {
-            Some(p) => crate::session::parse_session_file_typed_as(path, p, ParseMode::Full)?,
-            None => crate::session::parse_session_file_typed(path)?,
-        };
+        // Sampled before the parse: a stamp taken after it could be newer than
+        // what was actually parsed, and the entry would never go stale.
+        let possible_grok_dependencies = grok_dependency_stamps(path);
+        let analysis = crate::session::parse_session_file_typed(path)?;
         let arc_analysis = Arc::new(analysis);
         let size_bytes = estimate_analysis_bytes(arc_analysis.as_ref());
 
         // At capacity the LRU evicts its oldest entry to make room.
         if let Ok(mut cache_write) = self.cache.write() {
-            let is_grok =
-                provider == Some(ExtensionType::Grok) || arc_analysis.extension_name == "Grok";
+            let is_grok = arc_analysis.extension_name == "Grok";
             cache_write.put(
                 path_buf,
                 CachedFile {
                     fingerprint: FileFingerprint {
                         primary,
-                        grok_dependencies: is_grok.then_some(possible_grok_dependencies).flatten(),
+                        grok_dependencies: is_grok.then_some(possible_grok_dependencies),
                     },
                     analysis: Arc::clone(&arc_analysis),
                     size_bytes,
