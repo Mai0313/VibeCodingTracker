@@ -27,7 +27,8 @@ where
     }
 }
 
-/// Normalizes string, object, and content-block output shapes into plain text.
+/// Normalizes string, object, and content-block output shapes into one string;
+/// an object stays JSON-encoded for the parser to decode again.
 fn deserialize_tool_output<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
@@ -46,6 +47,9 @@ where
     }
 }
 
+/// Flattens a content-block array into text, adding a newline only where the
+/// blocks do not already supply one; `input_image` blocks carry no text and are
+/// skipped, while any other textless block is rejected as an unknown shape.
 fn normalize_output_blocks<E>(blocks: Vec<Value>) -> Result<String, E>
 where
     E: serde::de::Error,

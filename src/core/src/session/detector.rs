@@ -31,20 +31,24 @@ pub(crate) fn record_inspections() -> usize {
 /// session data.
 ///
 /// Thin eager wrapper over [`classify_records`]: returns whatever marker the
-/// records carry, falling back to [`ExtensionType::Codex`] when none is
-/// found (a marker-less JSONL stream is almost always a Codex log, whose
-/// `type` discriminators just happen to be absent in this slice).
+/// records carry, falling back to [`ExtensionType::Codex`] when none is found.
+/// That fallback is a tie-break, not a positive identification.
 ///
-/// Detection strategy:
-/// - Grok: a single object with `primaryModelId` + `contextTokensUsed` and
-///   either `contextWindowTokens` or `toolsUsed`
-/// - Gemini: first line is a session-meta record with `sessionId` and
-///   `projectHash` fields but *no* `messages` array (legacy single-object
-///   Gemini exports are no longer supported)
-/// - Copilot: first line is a `type == "session.start"` event whose
-///   `data.producer` field identifies a Copilot agent (e.g.
-///   `copilot-agent`, `copilot-cli`). Legacy single-object dumps under
-///   `~/.copilot/history-session-state/` are no longer supported.
+/// Detection strategy, in the order the classifier applies it. The first four
+/// markers are tested against the first record only; the last two against
+/// every record:
+/// - Grok: `primaryModelId` + `contextTokensUsed` and either
+///   `contextWindowTokens` or `toolsUsed`
+/// - DeepSeek Harness: a session header — `type == "session"` with a numeric
+///   `version` and a string `id`. Only an uncompressed log gets this far; a
+///   zstd-framed one is routed by its frame magic before it is read as text.
+/// - Gemini: a session-meta record with `sessionId` and `projectHash` fields
+///   but *no* `messages` array (legacy single-object Gemini exports are no
+///   longer supported)
+/// - Copilot: a `type == "session.start"` event whose `data.producer` field
+///   identifies a Copilot agent (e.g. `copilot-agent`, `copilot-cli`). Legacy
+///   single-object dumps under `~/.copilot/history-session-state/` are no
+///   longer supported.
 /// - Claude Code: contains `parentUuid` field in log entries
 /// - Codex: contains a record whose `type` is one of `session_meta`,
 ///   `turn_context`, `event_msg`, or `response_item` — **or** as a final
@@ -87,13 +91,12 @@ pub fn detect_extension_type(data: &[Value]) -> Result<ExtensionType> {
 /// `None` signal to decide whether to peek one more JSONL line before
 /// falling back to the default.
 ///
-/// Why this matters: the previous design buffered a fixed `AUTODETECT_PEEK_LINES`
-/// (8) records and then called [`detect_extension_type`], which silently
-/// committed to Codex (the default) once that buffer was exhausted. A Claude
-/// session whose `parentUuid`-bearing record sat past a long metadata
-/// prelude could then be mis-classified as Codex and have its usage
-/// silently dropped. With this function the caller can keep reading until
-/// a positive signal appears, so there is no arbitrary limit to the
+/// Why this matters: the previous design buffered a fixed 8-record peek window
+/// and then called [`detect_extension_type`], which silently committed to Codex
+/// (the default) once that buffer was exhausted. A Claude session whose
+/// `parentUuid`-bearing record sat past a long metadata prelude was then
+/// mis-classified as Codex and had its usage silently dropped. Letting the
+/// caller keep reading until a positive signal appears puts no limit on the
 /// preamble length we tolerate.
 ///
 /// # Examples
@@ -345,7 +348,6 @@ mod tests {
 
     #[test]
     fn test_detect_claude_code_format() {
-        // Test Claude Code format detection with parentUuid field
         let data = vec![
             json!({
                 "parentUuid": "parent-uuid",
@@ -364,7 +366,6 @@ mod tests {
 
     #[test]
     fn test_detect_codex_format_default() {
-        // Test Codex format detection (default when no distinctive markers found)
         let data = vec![json!({
             "timestamp": 1234567890,
             "model": "gpt-4",
@@ -377,10 +378,10 @@ mod tests {
 
     #[test]
     fn test_detect_claude_code_in_first_few_records() {
-        // Test that detection works within first 5 records
+        // A marker that only shows up in a later record still classifies the
+        // whole slice.
         let mut data = vec![json!({"field": "value1"}), json!({"field": "value2"})];
 
-        // Add Claude marker in third record
         data.push(json!({
             "parentUuid": "test-uuid",
             "content": "test"
@@ -484,7 +485,6 @@ mod tests {
 
     #[test]
     fn test_detect_empty_data_error() {
-        // Test that empty data returns an error
         let data: Vec<Value> = vec![];
 
         let result = detect_extension_type(&data);
@@ -494,7 +494,6 @@ mod tests {
 
     #[test]
     fn test_detect_multiple_objects_without_markers() {
-        // Test that multiple objects without distinctive markers default to Codex
         let data = vec![
             json!({"timestamp": 123}),
             json!({"model": "gpt-4"}),

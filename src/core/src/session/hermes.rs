@@ -1,10 +1,10 @@
 //! Hermes session reader (SQLite, not JSONL).
 //!
-//! Like OpenCode, Hermes stores usage in a single SQLite database at
-//! `~/.hermes/state.db` rather than per-session JSONL files. The
-//! `session_model_usage` table already holds one pre-aggregated row per
-//! `(session, model, billing_provider, ...)`, so this module reads those rows
-//! directly and maps them onto the same flat [`CodeAnalysis`] shape the
+//! Like OpenCode, Hermes stores usage in a single SQLite database (`state.db`
+//! under the Hermes home, `~/.hermes` by default) rather than per-session JSONL
+//! files. The `session_model_usage` table already holds one pre-aggregated row
+//! per `(session, model, billing_provider, ...)`, so this module reads those
+//! rows directly and maps them onto the same flat [`CodeAnalysis`] shape the
 //! file-based providers produce, letting the `usage` aggregator fold Hermes in
 //! alongside everyone else.
 //!
@@ -12,7 +12,7 @@
 //! so there is no `analysis` reader. Rows are keyed by the bare `model` column,
 //! so a model billed through two providers merges into one model row. Each
 //! session is also reconciled against the `sessions` aggregate so partial or
-//! missing per-model rows are not under-counted (see [`collect_usage`]).
+//! missing per-model rows are not under-counted (see `collect_usage`).
 
 use crate::constants::FastHashMap;
 use crate::models::TimeRange;
@@ -29,11 +29,13 @@ use std::path::Path;
 /// Reads per-model token usage from the Hermes database.
 ///
 /// Each returned tuple is `(local YYYY-MM-DD date, CodeAnalysis, stored_cost)`,
-/// where the `CodeAnalysis` holds one `session_model_usage` row's
-/// `conversation_usage` keyed by that row's `model`, and `stored_cost` is
-/// Hermes's own cost for the row (the actual billed cost when known, otherwise
-/// its estimate). The date comes from the row's `last_seen` timestamp and is
-/// filtered by `time_range`, matching the file-walker semantics.
+/// where the `CodeAnalysis` holds one model's `conversation_usage` keyed by that
+/// model, and `stored_cost` is Hermes's own cost for it (the actual billed cost
+/// when positive, otherwise its estimate). A tuple is either one
+/// `session_model_usage` row or one session's residual against the `sessions`
+/// aggregate; its date comes from the last-activity timestamp (`last_seen` /
+/// `ended_at`, falling back to the first-activity one) and is filtered by
+/// `time_range`, matching the file-walker semantics.
 ///
 /// # Errors
 ///
@@ -112,8 +114,9 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
     .map_err(Into::into)
 }
 
-/// Emits one contribution per `session_model_usage` row and accumulates the raw
-/// per-session sums used by the residual reconciliation.
+/// Emits one contribution per `session_model_usage` row that carries a model, a
+/// timestamp, and a date inside the cutoff, and accumulates the raw per-session
+/// sums used by the residual reconciliation.
 fn collect_per_model_rows(
     conn: &Connection,
     cutoff: &Option<String>,
@@ -183,16 +186,17 @@ fn collect_per_model_rows(
 }
 
 /// Attributes each session's positive residual (aggregate minus the sum of its
-/// per-model rows) to the session's recorded model, mirroring Hermes's insights
-/// view so partial or missing per-model rows are not dropped.
+/// per-model rows) to the session's recorded model.
 fn reconcile_session_residuals(
     conn: &Connection,
     cutoff: &Option<String>,
     summed: &FastHashMap<String, RowSums>,
     out: &mut Vec<UsageContribution>,
 ) -> Result<()> {
-    // The `sessions` table is core to Hermes, but stay defensive: if it is
-    // somehow absent, the per-model rows already collected are still returned.
+    // Opening the connection already probed `sessions`, so a failed prepare
+    // most likely means a column this build names has moved, though a corrupt
+    // or unreadable database lands here too. Either way the per-model rows
+    // already collected are still returned.
     let Ok(mut stmt) = conn.prepare(
         "SELECT id, model, input_tokens, output_tokens, cache_read_tokens, \
                 cache_write_tokens, reasoning_tokens, estimated_cost_usd, \
@@ -270,11 +274,12 @@ fn reconcile_session_residuals(
     Ok(())
 }
 
-/// Builds the Claude-style flat usage value from a row's token columns.
+/// Packs a row's token columns into the disjoint token buckets.
 ///
 /// Hermes records non-cached input separately from cache reads (matching the
-/// Claude convention), so the columns map straight onto the field names
-/// `extract_token_counts` understands.
+/// Claude convention), so no column has to be split apart here. Reasoning is
+/// the one column this reader treats as overlapping, and both callers subtract
+/// it out of `output` before getting here.
 fn session_usage_value(
     input: i64,
     output: i64,

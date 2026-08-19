@@ -26,7 +26,8 @@ pub struct GrokSummary {
     pub info: GrokSessionInfo,
     /// Last session update time in RFC 3339 format.
     pub updated_at: String,
-    /// Fallback last-activity time in RFC 3339 format.
+    /// Last-activity time in RFC 3339 format; the later of it and `updated_at`
+    /// seeds the session timestamp, which `updates.jsonl` can then push later.
     pub last_active_at: String,
     /// Alias or model id used only when signals omit model attribution.
     pub current_model_id: String,

@@ -5,19 +5,22 @@ use crate::constants::FastHashMap;
 use crate::models::Provider;
 use serde::Serialize;
 
-/// Token usage data aggregated by model (across all dates)
+/// Token usage data aggregated by model name (across all dates).
 ///
-/// Structure: Model Name -> Usage Metrics
-/// - Uses FastHashMap (ahash) for better performance than std HashMap
-/// - Usage format varies by provider:
-///   * Claude/Gemini: `{ input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens }`
-///   * Codex: `{ total_token_usage: { input_tokens, output_tokens } }`
+/// The value keeps the provider's own token shape, of which there are two:
+/// flat token keys (`input_tokens`, `output_tokens`, …) for every provider
+/// except Codex, which nests its counters under `total_token_usage`. Which
+/// keys a flat value carries still varies — Gemini's reasoning arrives as
+/// `thoughts_tokens` where the others use `reasoning_output_tokens`.
+/// `extract_token_counts` is what reads both shapes into disjoint buckets.
 pub type UsageResult = FastHashMap<String, serde_json::Value>;
 
-/// Tracks the number of active days per AI provider
+/// Tracks the number of active days per AI provider.
 ///
 /// Used for calculating daily averages when data is aggregated by model only.
-/// Day counts are derived from file modification dates during processing.
+/// A day is counted from the session's own date: the file modification date
+/// for the file-backed providers, the stored row timestamp for the
+/// SQLite-backed ones.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ProviderActiveDays {
     /// Distinct active days observed for Claude Code.
@@ -42,21 +45,19 @@ pub struct ProviderActiveDays {
     pub total: usize,
 }
 
-/// Per-provider usage data, keyed by source directory rather than by model name.
+/// Per-provider usage data, bucketed by the provider that produced it rather
+/// than by model name.
 ///
 /// The top-level `UsageResult` in `UsageData` intentionally merges same-named
 /// models across providers (so the per-model table shows one row for
 /// `claude-sonnet-4-6` regardless of whether Claude Code, Copilot CLI, or
 /// both invoked it). That merge loses the *source* information though, which
-/// matters for the per-provider summary: once Copilot CLI stopped writing
-/// the `copilot` sentinel and started recording real model names, the old
-/// "classify each row by model-name prefix" logic mis-attributed every
-/// Copilot session to Claude Code.
-///
-/// This struct keeps a separate `UsageResult` per provider so the display
-/// layer can sum tokens and cost by source directory directly, with no
-/// prefix heuristics involved. It is populated in `usage::aggregator` at
-/// the same time the global merged map is built.
+/// matters for the per-provider summary: once Copilot CLI stopped writing the
+/// `copilot` sentinel and started recording real model names, the old
+/// "classify each row by model-name prefix" logic mis-attributed every Copilot
+/// session to Claude Code. Keeping one `UsageResult` per provider lets the
+/// display layer sum tokens and cost by source with no prefix heuristics. It
+/// is populated at the same time as the global merged map.
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct PerProviderUsage {
     /// Per-model usage attributed to Claude Code.

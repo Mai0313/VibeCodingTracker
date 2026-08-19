@@ -1,6 +1,6 @@
 //! OpenCode session reader (SQLite, not JSONL).
 //!
-//! Unlike the five file-based providers, OpenCode stores every session in a
+//! Unlike the file-based providers, OpenCode stores every session in a
 //! single SQLite database at `~/.local/share/opencode/opencode.db` (WAL mode).
 //! This module owns the "SQLite rows -> typed [`CodeAnalysis`]" boundary, so
 //! both the `usage` and `analysis` aggregators consume the same shape the
@@ -11,13 +11,16 @@
 //! - [`read_opencode_usage`] reads assistant messages for per-model tokens and
 //!   cost, with an older `session`-table fallback.
 //! - [`read_opencode_analysis`] additionally folds the `part` table's tool
-//!   calls (`read`, `edit`, `write`, `bash`, `todowrite`) into
+//!   calls (`read`, `edit`, `write`, `bash`, `todowrite`, `apply_patch`) into
 //!   per-message file-operation metrics.
 //!
-//! Token columns map onto the Claude-style flat usage shape so the existing
-//! `merge_usage_values` / `extract_token_counts` / LiteLLM cost path works
-//! unchanged. Assistant messages carry their own `providerID` + `modelID`, so
-//! sessions that switch model mid-stream are split before aggregation.
+//! Token columns map onto the Claude-style flat usage shape, so the shared
+//! `merge_usage_values` / `extract_token_counts` path handles them unchanged.
+//! Cost is the exception: the usage layer prices an OpenCode model from tokens
+//! only on an exact LiteLLM match, and otherwise falls back to the per-message
+//! cost this module returns. Assistant messages carry their own `providerID` +
+//! `modelID`, so sessions that switch model mid-stream are split before
+//! aggregation.
 
 use crate::VERSION;
 use crate::constants::FastHashMap;
@@ -44,7 +47,8 @@ use std::path::Path;
 /// `conversation_usage`, keyed by that message's provider-qualified model id,
 /// and `stored_cost` is OpenCode's own cost for that message. The date comes
 /// from the assistant message timestamp and is filtered by `time_range`,
-/// matching the file-walker semantics.
+/// matching the file-walker semantics. Databases with no `message` table fall
+/// back to one row per `session`, dated by `time_updated`.
 ///
 /// # Errors
 ///
@@ -87,13 +91,13 @@ pub(crate) fn read_opencode_usage_contributions(
 
 /// Reads per-session file-operation metrics from the OpenCode database.
 ///
-/// Like [`read_opencode_usage`], but also folds each session's tool calls from
-/// the `part` table into `tool_call_counts` and the `total_*` line/character
+/// Like [`read_opencode_usage`], but also folds each row's tool calls from the
+/// `part` table into `tool_call_counts` and the `total_*` line/character
 /// counts. `mode` controls whether the heavy per-operation detail bodies are
-/// retained ([`ParseMode::Full`]) or skipped ([`ParseMode::UsageOnly`]); the
-/// aggregated `analysis` view uses `UsageOnly`. Message/session metadata and
-/// tool parts are read inside one transaction so a concurrent OpenCode commit
-/// cannot split the result across two SQLite snapshots.
+/// retained ([`ParseMode::Full`]) or skipped ([`ParseMode::UsageOnly`]).
+/// Message/session metadata and tool parts are read inside one transaction so
+/// a concurrent OpenCode commit cannot split the result across two SQLite
+/// snapshots.
 ///
 /// # Errors
 ///
@@ -135,7 +139,7 @@ pub(crate) struct OpenCodeAnalysisRead {
     pub expected_records: usize,
     /// Selected rows that produced a normalized `CodeAnalysis`.
     pub parsed_records: usize,
-    /// Completed known tool parts with unsupported analyzer fields.
+    /// Tool parts the analyzer could not normalize, including unreadable JSON.
     pub failed_tool_parts: usize,
 }
 
@@ -651,12 +655,6 @@ fn collect_message_analysis(
     })
 }
 
-/// Dispatches a single `part` (type `tool`) onto the session parse state.
-///
-/// Only the tools the analyzer tracks across providers are folded in
-/// (`read`, `edit`, `write`, `bash`, `todowrite`, `apply_patch`); auxiliary
-/// tools such as `task`, `grep`, `glob`, `webfetch`, and `question` are ignored
-/// to stay consistent with the other providers' tool-count semantics.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ToolPartOutcome {
     Irrelevant,
@@ -664,6 +662,12 @@ enum ToolPartOutcome {
     Unsupported,
 }
 
+/// Dispatches a single `part` (type `tool`) onto the session parse state.
+///
+/// Only the tools the analyzer tracks across providers are folded in
+/// (`read`, `edit`, `write`, `bash`, `todowrite`, `apply_patch`); auxiliary
+/// tools such as `task`, `grep`, `glob`, `webfetch`, and `question` are ignored
+/// to stay consistent with the other providers' tool-count semantics.
 fn apply_tool_part(state: &mut SessionParseState, data: &Value) -> ToolPartOutcome {
     let tool = data.get("tool").and_then(|v| v.as_str()).unwrap_or("");
     if !matches!(
@@ -772,7 +776,7 @@ fn apply_patch_text(state: &mut SessionParseState, patch_text: &str, ts: i64) {
     }
 }
 
-/// One file hunk extracted from an OpenCode `apply_patch` tool call.
+/// One file's patch section extracted from an OpenCode `apply_patch` tool call.
 struct OpenCodePatch {
     action: String,
     file_path: String,
@@ -877,11 +881,11 @@ fn extract_patch_strings(lines: &[String]) -> (String, String) {
     (old_str, new_str)
 }
 
-/// Builds the Claude-style flat usage value from a session's token columns.
+/// Packs OpenCode's token counters into the shared usage buckets.
 ///
 /// OpenCode records non-cached input separately from cache reads (input is
-/// disjoint from cache, matching the Claude convention), so the columns map
-/// straight onto the field names `extract_token_counts` understands.
+/// disjoint from cache, matching the Claude convention), so each counter drops
+/// into one bucket with no adjustment.
 fn session_usage_value(
     input: i64,
     output: i64,
@@ -927,7 +931,7 @@ fn parse_model_id(raw: &str) -> Option<String> {
             let s = s.trim();
             (!s.is_empty()).then(|| s.to_string())
         }
-        // Not valid JSON: treat the column as a plain model name.
+        // Not a JSON object or string: treat the column as a plain model name.
         _ => Some(raw.to_string()),
     }
 }

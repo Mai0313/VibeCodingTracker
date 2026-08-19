@@ -6,7 +6,7 @@
 //! streamed `assistant.message.outputTokens` as a partial fallback for
 //! sessions that never shut down cleanly. File operations are paired across
 //! `tool.execution_start` / `tool.execution_complete` by `toolCallId` and
-//! only counted on success. See the table below for the full event map.
+//! only counted on success. See the table below for the event map.
 use crate::constants::{FastHashMap, capacity};
 use crate::models::*;
 use crate::session::diagnostics::{ParseDiagnostics, ParsedAnalysis};
@@ -19,20 +19,19 @@ use serde_json::{Value, json};
 // Copilot CLI `events.jsonl` streaming parser
 // =============================================================================
 //
-// Copilot CLI stores every session as
-// `~/.copilot/session-state/<sessionId>/events.jsonl`. Each line is a single
-// `CopilotEvent` whose `event_type` decides how to interpret `data`:
+// Each line is a single `CopilotEvent` whose `event_type` decides how to
+// interpret `data`:
 //
 //   session.start            → session-scoped context (sessionId, cwd, …)
 //   session.model_change     → tracks the currently active model
-//   session.task_complete    → task summary, informational only
 //   session.shutdown         → authoritative per-model token usage
-//   system.message           → system prompt; ignored
-//   user.message             → user-turn content; ignored
 //   assistant.message        → streaming output; only outputTokens is reliable
-//   assistant.turn_start/end → turn bookkeeping; ignored
 //   tool.execution_start     → paired with the matching complete event
 //   tool.execution_complete  → fires the analyzer's file-op handlers
+//
+// Every other entry in the `recognized` list below (system / user messages,
+// turn and hook bookkeeping, subagents, aborts, …) is known-and-ignored; an
+// `event_type` outside that list counts as schema drift.
 //
 // Legacy single-object dumps under `~/.copilot/history-session-state/` are
 // not supported — users with old dumps will see them fall through to the
@@ -70,9 +69,7 @@ where
     let mut state = SessionParseState::with_mode(mode);
     let mut conversation_usage: FastHashMap<String, Value> =
         FastHashMap::with_capacity(capacity::MODELS_PER_SESSION);
-    // Pending tool calls indexed by `toolCallId` — each `tool.execution_start`
-    // stashes its arguments here until the matching `tool.execution_complete`
-    // arrives with the result payload.
+    // Pending tool calls indexed by `toolCallId`.
     let mut pending_tools: FastHashMap<String, PendingTool> = FastHashMap::with_capacity(32);
 
     // Fallback accounting used when the session does not reach
@@ -80,10 +77,9 @@ where
     // want to attribute `assistant.message.outputTokens` to *some* model,
     // so we track the active model switches.
     let mut current_model = String::new();
-    // Set to `true` once we consume a `session.shutdown` event. If so, the
-    // shutdown record is authoritative and we discard the fallback output
-    // tallies built from streamed `assistant.message` events — those would
-    // otherwise double-count.
+    // A consumed `session.shutdown` record is authoritative. The fallback
+    // graft below inserts on the same canonicalized model key, so without
+    // this guard it would replace that row with a zero-`input_tokens` one.
     let mut shutdown_seen = false;
     let mut pending_output_tokens: FastHashMap<String, i64> = FastHashMap::with_capacity(3);
     let mut diagnostics = ParseDiagnostics::default();
@@ -357,6 +353,10 @@ fn copilot_usage_supported(usage: &Value) -> bool {
     recognized
 }
 
+/// Tools whose payloads this parser claims to understand.
+///
+/// An unsupported payload on one of these is schema drift; on any other tool
+/// it is not.
 fn is_tracked_tool(name: &str) -> bool {
     matches!(
         name,
@@ -486,9 +486,8 @@ fn dispatch_tool(
     let args = &pending.arguments;
 
     match pending.tool_name.as_str() {
-        // Current Copilot CLI exposes `view` for reads. Historical versions
-        // used `str_replace_editor` with `command == "view"`, which we no
-        // longer attempt to parse.
+        // Historical releases exposed reads as `str_replace_editor` with
+        // `command == "view"`, which we no longer attempt to parse.
         "view" | "show_file" | "read_file" => {
             let Some(path) = args.get("path").and_then(|p| p.as_str()) else {
                 return;
@@ -501,9 +500,9 @@ fn dispatch_tool(
         // Search and web tools surface content but do not identify one complete
         // file body, so retain the invocation without inventing line totals.
         "rg" | "grep" | "glob" | "web_search" | "web_fetch" => state.tool_counts.read += 1,
-        // `create` is the primary write tool. Historical names are kept for
-        // robustness; a future release that renames the tool will still get
-        // counted if the argument shape stays similar.
+        // `create` is the primary write tool; the other names are ones the CLI
+        // is known or likely to emit. A tool name outside this list is
+        // ignored, however similar its argument shape.
         "create" | "write_file" | "write" => {
             let Some(path) = args.get("path").and_then(|p| p.as_str()) else {
                 return;
@@ -515,8 +514,7 @@ fn dispatch_tool(
                 .unwrap_or("");
             state.add_write_detail(path, content, ts);
         }
-        // Edit-style tool names the CLI is known or likely to emit. Field
-        // shape is assumed to stay `{path, old_string|old_str, new_string|new_str}`.
+        // Edit-style tool names the CLI is known or likely to emit.
         "str_replace" | "edit" | "replace" | "edit_file" => {
             let Some(path) = args.get("path").and_then(|p| p.as_str()) else {
                 return;
@@ -561,6 +559,11 @@ fn dispatch_tool(
     }
 }
 
+/// Attaches the read body without double-counting the invocation.
+///
+/// The caller has already bumped `tool_counts.read` so an empty or
+/// undecodable body still shows up, and `add_read_detail` bumps it again for
+/// a non-empty body, so the count is saved and restored around the call.
 fn attach_read_detail(state: &mut SessionParseState, path: &str, content: &str, ts: i64) {
     let invocation_count = state.tool_counts.read;
     state.add_read_detail(path, content, ts);
@@ -634,6 +637,7 @@ fn parse_apply_patch_text(patch_text: &str) -> Vec<CopilotPatch> {
     patches
 }
 
+/// Splits one patch body's `-` / `+` lines into its removed and added text.
 fn extract_patch_strings(lines: &[String]) -> (String, String) {
     let mut old_string = String::new();
     let mut new_string = String::new();
@@ -656,15 +660,13 @@ fn extract_patch_strings(lines: &[String]) -> (String, String) {
 
 /// Resolve the content a Copilot `view` tool saw.
 ///
-/// Callers can pass us two sources:
+/// Two sources, in order:
 ///
-/// 1. `arguments.view_range` — inclusive `[start, end]` line numbers. When
-///    present we synthesise a `line_count`-line placeholder using a
-///    non-newline character so `add_read_detail`'s `trim_end_matches('\n')`
-///    cannot collapse it back to zero. The actual content is not needed
-///    because we only care about the line count.
-/// 2. `complete.result.content` — the string the model actually received.
-///    Preferred when available and when no `view_range` was supplied.
+/// 1. `arguments.view_range` — inclusive `[start, end]` line numbers. Only
+///    the line count matters downstream, so a placeholder of that many lines
+///    stands in for the body (see the comment on its shape below).
+/// 2. `result.content` — the string the model actually received. Used when
+///    no `view_range` was supplied.
 fn extract_view_content(arguments: &Value, result: &Value) -> String {
     if let Some(range) = arguments.get("view_range").and_then(|v| v.as_array())
         && range.len() >= 2
@@ -759,9 +761,9 @@ mod tests {
     }
 
     fn count_lines_after_trim(s: &str) -> usize {
-        // Mirror src/session/state.rs count_lines + add_read_detail's
-        // trim_end_matches('\n') so the test reflects the actual line
-        // tally the analyzer would record.
+        // Mirror `add_read_detail`'s `trim_end_matches('\n')` + `count_lines`
+        // so the test reflects the actual line tally the analyzer would
+        // record.
         let trimmed = s.trim_end_matches('\n');
         if trimmed.is_empty() {
             0

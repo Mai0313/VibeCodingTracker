@@ -1,13 +1,15 @@
-//! Parser for OpenAI Codex rollout logs (`~/.codex/sessions/**/*.jsonl`).
+//! Parser for OpenAI Codex rollout logs (the `*.jsonl` files under `~/.codex`).
 //!
 //! Codex records carry a `type` discriminator (`session_meta`,
 //! `turn_context`, `event_msg`, `response_item`). File operations are not
-//! first-class: Codex records them as legacy `function_call` pairs or current
-//! `custom_tool_call` pairs. This parser joins each call to its output by
-//! `call_id`. Legacy shell calls retain command-level analysis. A top-level
-//! custom `exec` is counted as one run command because its JavaScript source
-//! does not prove which nested tools actually ran. Direct custom patches are
-//! applied only when their paired output explicitly reports success.
+//! first-class: Codex records them as legacy `function_call` pairs, current
+//! `custom_tool_call` pairs, or `patch_apply_end` events. This parser joins
+//! each call to its output by `call_id`. Legacy shell calls retain
+//! command-level analysis. A top-level custom `exec` is counted as one run
+//! command because its JavaScript source does not prove which nested tools
+//! actually ran. Direct custom patches are applied only when their paired
+//! output explicitly reports success; a successful `patch_apply_end` is folded
+//! in unless the same `call_id` was already counted.
 use crate::constants::FastHashMap;
 use crate::models::*;
 use crate::pricing::{TierClassifier, TierThresholds};
@@ -64,13 +66,11 @@ where
     // Codex publishes whole-session cumulative counters on every token_count
     // event; each model is billed only the delta since the previous snapshot.
     // Pre-context snapshots (a resumed session's replayed totals) advance the
-    // snapshot without attribution, replacing the old replay-baseline hack.
+    // snapshot without attribution.
     let mut prev_totals: Option<CodexTokenTotals> = None;
     let mut shell_calls: FastHashMap<String, PendingCodexShellCall> =
         FastHashMap::with_capacity(50);
     let mut custom_calls: FastHashMap<String, CodexCustomCall> = FastHashMap::with_capacity(32);
-    // Call ids of direct `apply_patch` custom_tool_calls, so a paired
-    // `patch_apply_end` event is not double counted (see the event_msg arm).
     // Call ids whose file ops have already been counted, by either the direct
     // apply_patch output or its authoritative patch_apply_end event. The first
     // to actually count wins; the other is skipped. A direct patch whose output
@@ -106,7 +106,7 @@ where
                 if state.folder_path.is_empty()
                     && let Some(cwd) = &entry.payload.cwd
                 {
-                    state.folder_path.clone_from(cwd); // More efficient than clone()
+                    state.folder_path.clone_from(cwd);
                 }
                 if state.task_id.is_empty()
                     && let Some(id) = &entry.payload.id
@@ -132,7 +132,7 @@ where
                     .as_ref()
                     .filter(|model| !model.is_empty())
                 {
-                    current_model.clone_from(model); // Reuse existing allocation
+                    current_model.clone_from(model);
                 }
             }
             "event_msg" => {
@@ -189,9 +189,8 @@ where
                 // records the resulting file changes in a `patch_apply_end` event.
                 // A successful one is the authoritative source of those file ops.
                 if entry.payload.payload_type.as_deref() == Some("patch_apply_end") {
-                    // Skip only when the paired direct apply_patch already
-                    // counted this call_id; otherwise this event is the
-                    // authoritative record of the change and must be folded in.
+                    // Skip when this call_id's file ops were already counted,
+                    // by the direct apply_patch output or an earlier event.
                     let already_counted = entry
                         .payload
                         .call_id
@@ -326,6 +325,8 @@ where
     Ok(ParsedAnalysis::new(analysis, diagnostics))
 }
 
+/// Whether a `token_count` info blob is a shape this parser can fold; one
+/// carrying no recognized key at all is reported as schema drift.
 fn is_supported_codex_usage(info: &Value) -> bool {
     let Some(info) = info.as_object() else {
         return false;
@@ -384,6 +385,8 @@ enum PendingCodexShellCall {
     InvalidArguments,
 }
 
+/// Whether an output is Codex reporting that the model's arguments failed to
+/// parse, rather than the result of a command that actually ran.
 fn output_reports_argument_error(output: Option<&str>) -> bool {
     let output = shell_output(output).output;
     let output = strip_exec_command_metadata_prefix(&output)
@@ -423,7 +426,9 @@ fn strip_exec_command_metadata_prefix(output: &str) -> &str {
     }
 }
 
-/// Normalizes legacy strings and structured outputs serialized at the model boundary.
+/// Decodes a shell output into a `CodexShellOutput`, falling back to the
+/// object's `output` field and then to the raw text when it is not the
+/// structured envelope.
 fn shell_output(output: Option<&str>) -> CodexShellOutput {
     let Some(output) = output else {
         return CodexShellOutput {
@@ -608,25 +613,21 @@ impl CodexAnalysisExt for SessionParseState {
             return;
         }
 
-        // The legacy `shell` function returned just the raw command output
-        // in `output`. The current `exec_command` function wraps that
-        // output with a metadata header — strip it so line counting sees
-        // only what the model actually saw as the file body.
+        // `exec_command` wraps the captured command output in a metadata
+        // header (legacy `shell` did not); strip it so line counting sees only
+        // the file body.
         let output_body = strip_exec_command_metadata_prefix(&output.output);
 
-        // Check for sed command
         if let Some(path) = extract_sed_file_path(&call.script) {
             self.add_read_detail(&path, output_body, call.timestamp);
             return;
         }
 
-        // Check for cat command
         if let Some((path, content)) = extract_cat_read(&call.script, output_body) {
             self.add_read_detail(&path, &content, call.timestamp);
             return;
         }
 
-        // Record as run command
         self.record_run_command(call);
     }
 
@@ -816,7 +817,6 @@ fn parse_patch_change_entry(path: &str, entry: &Value) -> Option<CodexPatch> {
 /// `@@` hunk headers and `\` no-newline markers are skipped. Both results
 /// have their trailing newline trimmed.
 fn extract_patch_strings(lines: &[String]) -> (String, String) {
-    // Pre-allocate with estimated capacity
     let estimated_size = lines.iter().map(|l| l.len()).sum::<usize>();
     let mut old_str = String::with_capacity(estimated_size / 2);
     let mut new_str = String::with_capacity(estimated_size / 2);
@@ -847,7 +847,6 @@ fn extract_patch_strings(lines: &[String]) -> (String, String) {
         }
     }
 
-    // Trim in-place instead of allocating new strings
     let old_len = old_str.trim_end_matches('\n').len();
     old_str.truncate(old_len);
     let new_len = new_str.trim_end_matches('\n').len();
@@ -892,7 +891,6 @@ fn extract_cat_read(script: &str, output: &str) -> Option<(String, String)> {
 
         let path = path_field.trim_matches(|c| c == '"' || c == '\'');
 
-        // Optimize: avoid multiple allocations
         let clean_output = if let Some(idx) = output.find("\n---") {
             output[..idx].trim_end_matches('\n').to_string()
         } else {

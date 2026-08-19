@@ -1,13 +1,10 @@
 //! Quota / rate-limit data models for the `usage` quota panels.
 //!
-//! Each provider has a raw wire shape that normalizes into one shared output
+//! Each provider has its own raw wire shape — and, where a token is involved,
+//! its own credential file — all normalizing into one shared output
 //! ([`QuotaWindow`] / per-provider `*QuotaSnapshot`) so the TUI gauges render
-//! every provider identically:
-//!
-//! - **Claude** — `GET /api/oauth/usage` ([`ClaudeUsageResponse`]) plus the
-//!   OAuth credentials in `~/.claude/.credentials.json` ([`ClaudeCredentials`]).
-//! - **Codex** — `wham/usage` API ([`WhamUsageResponse`]) with a session-log
-//!   fallback ([`CodexSessionRateLimits`]) and `~/.codex/auth.json`.
+//! every provider identically. The section banners below group each provider's
+//! types with the endpoint they come from.
 //!
 //! Structs holding bearer tokens use a hand-written [`fmt::Debug`] that redacts
 //! the secret so a token can never reach a log or assertion message.
@@ -540,7 +537,7 @@ pub enum QuotaSource {
     /// No data available.
     #[default]
     None,
-    /// Live API (`wham/usage` or Claude usage).
+    /// The provider's live quota API.
     Api,
     /// Newest Codex session-log `rate_limits`.
     SessionFallback,
@@ -582,7 +579,8 @@ pub struct CodexQuotaSnapshot {
     /// The backend may cap this list, so its length is not the total count.
     #[serde(default)]
     pub reset_credit_expirations: Option<Vec<Option<i64>>>,
-    /// Approximate `[low, high]` messages the remaining credits still buy.
+    /// Approximate `[low, high]` local (CLI) messages the remaining credits
+    /// still buy; the cloud-task pair is not carried.
     #[serde(default)]
     pub approx_messages: Option<(i64, i64)>,
     /// Configured spend cap, when set.
@@ -937,7 +935,7 @@ pub struct CursorQuotaSnapshot {
     #[serde(default)]
     pub limit_reached: bool,
     /// Credentials present but the token is unusable (expired / 401); the panel
-    /// shows a `cursor login` hint.
+    /// shows a `cursor-agent login` hint.
     #[serde(default)]
     pub needs_login: bool,
 }

@@ -1,7 +1,8 @@
 //! Shared session-file parsing layer.
 //!
 //! Every supported provider writes its session history to disk in a
-//! provider-specific JSON, JSONL, or SQLite shape.
+//! provider-specific JSON, JSONL (zstd-framed for DeepSeek Harness), or SQLite
+//! shape.
 //! This module owns the "turn raw bytes into a typed
 //! [`crate::CodeAnalysis`]" boundary so both of the features that consume
 //! session files — [`crate::analysis`] (aggregated tool-call metrics) and
