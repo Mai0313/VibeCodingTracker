@@ -114,14 +114,16 @@ pub fn read_opencode_analysis(
             result.expected_records
         ));
     }
-    let failed_records = result
-        .expected_records
-        .saturating_sub(result.parsed_records)
-        + result.failed_tool_parts;
+    // Records and tool parts are different units: one message can carry many
+    // parts, so adding them together reports a part count as a record count.
+    let failed_records = result.expected_records.saturating_sub(result.parsed_records);
     if failed_records > 0 {
+        log::warn!("skipped {failed_records} OpenCode analysis records with unsupported schema");
+    }
+    if result.failed_tool_parts > 0 {
         log::warn!(
-            "skipped {} OpenCode analysis records with unsupported schema",
-            failed_records
+            "skipped {} OpenCode tool parts with unsupported schema",
+            result.failed_tool_parts
         );
     }
     Ok(result
