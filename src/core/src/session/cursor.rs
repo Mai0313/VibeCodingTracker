@@ -835,22 +835,6 @@ fn load_node_blobs(conn: &Connection) -> Result<Vec<Vec<u8>>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// Returns `(embedded message JSON bytes, timestamp_ms)` for a binary DAG node.
-///
-/// Binary nodes start with `field 1` (`0x0A`), carry the message in `field 4`
-/// and the epoch-ms timestamp in `field 26`; the role is not checked here.
-/// Non-node blobs (JSON messages) return `None`, as do nodes missing the
-/// timestamp — an undateable turn is skipped rather than mis-bucketed to the
-/// epoch (1970).
-#[cfg(test)]
-fn assistant_node(data: &[u8]) -> Option<(&[u8], i64)> {
-    if data.first() != Some(&0x0A) {
-        return None;
-    }
-    let node = walk_node(data);
-    Some((node.msg?, node.ts?))
-}
-
 /// The `role` of a message JSON blob, when it parses and carries one.
 fn message_role(bytes: &[u8]) -> Option<String> {
     serde_json::from_slice::<Value>(bytes)
@@ -1306,15 +1290,15 @@ mod tests {
     }
 
     #[test]
-    fn assistant_node_extracts_message_and_ts() {
+    fn node_fields_extract_message_and_ts() {
         let node = make_node(
             r#"{"role":"assistant","content":[]}"#,
             1_700_000_000_000,
             None,
         );
-        let (msg, ts) = assistant_node(&node).unwrap();
-        assert_eq!(ts, 1_700_000_000_000);
-        let parsed: Value = serde_json::from_slice(msg).unwrap();
+        let nf = walk_node(&node);
+        assert_eq!(nf.ts, Some(1_700_000_000_000));
+        let parsed: Value = serde_json::from_slice(nf.msg.unwrap()).unwrap();
         assert_eq!(parsed["role"], "assistant");
     }
 
@@ -1326,9 +1310,33 @@ mod tests {
     }
 
     #[test]
-    fn json_blob_is_not_an_assistant_node() {
-        let blob = br#"{"role":"assistant","content":[]}"#.to_vec();
-        assert!(assistant_node(&blob).is_none());
+    fn json_blob_is_not_read_as_an_assistant_turn() {
+        // Assistant turns are binary DAG nodes; a JSON blob is a tool-result
+        // payload even when its own `role` says assistant. Neither reader may
+        // pick one up as a turn, or the same tool calls would be billed twice
+        // once a real node references them.
+        let json_blob = r#"{"role":"assistant","content":[
+            {"type":"tool-call","toolName":"Write","toolCallId":"a","args":{"path":"/r/x.rs","contents":"l1\nl2"}}
+        ]}"#;
+        let (_dir, path) = make_store_db(&[], &[json_blob]);
+        let conv_models = FastHashMap::default();
+
+        let store = read_store_analysis(
+            &path,
+            &conv_models,
+            TimeRange::All,
+            ParseMode::Full,
+            "u",
+            "m",
+        )
+        .unwrap();
+        assert!(store.rows.is_empty());
+        assert_eq!(store.normalized_messages, 0);
+        assert_eq!(store.failed_payloads, 0);
+
+        let read = read_store_context(&path, &conv_models, "conversation").unwrap();
+        assert!(read.turns.is_empty());
+        assert_eq!(read.expected_records, 0);
     }
 
     #[test]
