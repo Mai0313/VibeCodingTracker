@@ -67,20 +67,6 @@ pub fn init_process_metrics(sys: &mut System, pid: sysinfo::Pid) {
     refresh_process_metrics(sys, pid);
 }
 
-/// Builds the bordered, centered title paragraph for the top of a TUI view.
-pub fn create_title(title_text: &str, color: RatatuiColor) -> Paragraph<'_> {
-    Paragraph::new(vec![Line::from(vec![Span::styled(
-        title_text,
-        Style::default().fg(color).bold(),
-    )])])
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(color)),
-    )
-    .centered()
-}
-
 /// Separator drawn between summary-bar segments.
 const SUMMARY_SEP: &str = "  |  ";
 
