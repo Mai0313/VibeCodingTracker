@@ -121,15 +121,17 @@ Notes:
 ## Copilot
 
 Credential file `~/.copilot/config.json`:
-`.copilotTokens["https://github.com:<login>"]` holds a long-lived GitHub OAuth token (`gho_...`).
+`.copilotTokens["<host>:<login>"]` holds a long-lived GitHub OAuth token (`gho_...`), the host being `https://github.com` or a GHE data-residency host. `.lastLoggedInUser` names the account to prefer when the file holds several.
 Note this file is **JSONC** (it starts with `//` comment lines), so strip comments before parsing it as JSON string-aware, so the `//` inside the `https://github.com:<login>` key survives.
 
 ### Fetch quota
 
 ```bash
-TOKEN=$(jq -r '.copilotTokens | to_entries[] | select(.key|startswith("https://github.com")) | .value' ~/.copilot/config.json | head -1)
+KEY=$(jq -r 'if .lastLoggedInUser then "\(.lastLoggedInUser.host):\(.lastLoggedInUser.login)" else (.copilotTokens | keys[0]) end' ~/.copilot/config.json)
+TOKEN=$(jq -r --arg k "$KEY" '.copilotTokens[$k]' ~/.copilot/config.json)
+HOST=${KEY%:*}; HOST=${HOST#https://}
 
-curl -s "https://api.github.com/copilot_internal/user" \
+curl -s "https://api.${HOST}/copilot_internal/user" \
     -H "Authorization: token $TOKEN" \
     -H "Accept: application/json" \
     -H "Editor-Version: vscode/1.96.2" \

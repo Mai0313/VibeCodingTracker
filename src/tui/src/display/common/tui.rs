@@ -229,6 +229,14 @@ impl<T: Send + 'static> RefreshWorker<T> {
                 }
                 match command {
                     RefreshCommand::Run => {
+                        // Catching the panic keeps the worker answering the next
+                        // request; letting it unwind out of the loop drops the
+                        // result channel, and a disconnected worker never
+                        // refreshes again. It only fires on an unwinding
+                        // profile — dev, and the test profile that pins the
+                        // retry below. The release and dist profiles set
+                        // `panic = "abort"`, where the process is gone before
+                        // this is reached.
                         let result =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut loader))
                                 .map_err(|_| {
@@ -639,45 +647,6 @@ pub enum InputAction {
     Resize,
     /// No actionable event; keep the current frame and loop.
     Continue,
-}
-
-/// Tracks when the next periodic data refresh is due, plus a one-shot force flag.
-pub struct RefreshState {
-    last_refresh: Instant,
-    force_refresh: bool,
-    refresh_interval: Duration,
-}
-
-impl RefreshState {
-    /// Creates a refresh state with the given interval in seconds, primed to refresh immediately.
-    ///
-    /// `last_refresh` is backdated by one interval and `force_refresh` is set,
-    /// so the first [`should_refresh`](Self::should_refresh) returns `true` and
-    /// the initial load is not delayed by one interval.
-    pub fn new(refresh_secs: u64) -> Self {
-        let refresh_interval = Duration::from_secs(refresh_secs);
-        Self {
-            last_refresh: Instant::now() - refresh_interval,
-            force_refresh: true,
-            refresh_interval,
-        }
-    }
-
-    /// Returns whether a refresh is due (forced, or the interval has elapsed).
-    pub fn should_refresh(&self) -> bool {
-        self.force_refresh || self.last_refresh.elapsed() >= self.refresh_interval
-    }
-
-    /// Records that a refresh just happened, resetting the timer and clearing the force flag.
-    pub fn mark_refreshed(&mut self) {
-        self.last_refresh = Instant::now();
-        self.force_refresh = false;
-    }
-
-    /// Forces the next [`should_refresh`](Self::should_refresh) to return `true`.
-    pub fn force(&mut self) {
-        self.force_refresh = true;
-    }
 }
 
 /// Tracks per-row changes to drive temporary highlighting of recently-updated rows.

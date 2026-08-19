@@ -169,16 +169,18 @@ pub fn map_wham_response(body: &str, now: i64) -> Result<CodexQuotaSnapshot> {
 /// times for credits whose status is `available`.
 ///
 /// The expiry list may be shorter than the count because the backend can cap
-/// detail rows. `None` entries sort last and mean the credit never expires.
+/// detail rows. `None` entries sort last and mean the credit never expires. A
+/// `None` count means the response did not report one, leaving whatever
+/// wham/usage already said standing.
 ///
 /// # Errors
 ///
 /// Returns an error when the response shape or an available credit's RFC3339
 /// expiry is malformed.
-pub fn map_reset_credits_response(body: &str) -> Result<(i64, Vec<Option<i64>>)> {
+pub fn map_reset_credits_response(body: &str) -> Result<(Option<i64>, Vec<Option<i64>>)> {
     let resp: WhamResetCreditsDetails = serde_json::from_str(body)
         .context("Failed to parse wham/rate-limit-reset-credits response")?;
-    let available_count = resp.available_count.max(0);
+    let available_count = resp.available_count.map(|count| count.max(0));
 
     let mut expirations = Vec::new();
     for credit in resp.credits.into_iter().filter(|c| c.status == "available") {
@@ -234,9 +236,10 @@ pub enum WhamResult {
 
 /// Outcome of the optional reset-credit details request.
 pub enum ResetCreditsResult {
-    /// Authoritative count plus sorted available-credit expirations.
+    /// Authoritative count plus sorted available-credit expirations. A `None`
+    /// count means the response omitted it; keep the one wham/usage reported.
     Ok {
-        available_count: i64,
+        available_count: Option<i64>,
         expirations: Vec<Option<i64>>,
     },
     /// 401: the caller may refresh the token and retry once.
@@ -305,7 +308,7 @@ pub fn call_wham_with_reset_credits(
             available_count,
             expirations,
         } => {
-            snap.reset_credits_available = Some(available_count);
+            snap.reset_credits_available = available_count.or(snap.reset_credits_available);
             snap.reset_credit_expirations = Some(expirations);
         }
         ResetCreditsResult::Unauthorized | ResetCreditsResult::Transient => {}
@@ -537,7 +540,7 @@ mod tests {
     fn maps_available_reset_credit_expirations_in_order() {
         let (count, expirations) = map_reset_credits_response(RESET_CREDITS_SAMPLE).unwrap();
 
-        assert_eq!(count, 5, "top-level count stays authoritative");
+        assert_eq!(count, Some(5), "top-level count stays authoritative");
         assert_eq!(expirations.len(), 3, "redeemed credit is excluded");
         assert!(expirations[0].unwrap() < expirations[1].unwrap());
         assert_eq!(expirations[2], None, "non-expiring credit sorts last");
@@ -555,6 +558,40 @@ mod tests {
         }"#;
 
         assert!(map_reset_credits_response(body).is_err());
+    }
+
+    #[test]
+    fn maps_reset_credits_response_with_dropped_fields() {
+        let body = r#"{
+          "credits": [
+            { "status": "available", "expires_at": "2026-08-01T00:00:00Z" },
+            { "status": "available" },
+            { "expires_at": "2026-07-01T00:00:00Z" }
+          ],
+          "available_count": 3
+        }"#;
+
+        let (count, expirations) = map_reset_credits_response(body).unwrap();
+
+        assert_eq!(count, Some(3));
+        assert_eq!(
+            expirations,
+            vec![Some(1785542400), None],
+            "an entry with no status is not readable as available"
+        );
+    }
+
+    #[test]
+    fn missing_reset_credit_count_leaves_the_usage_count_standing() {
+        let (count, expirations) =
+            map_reset_credits_response(r#"{"credits":[{"status":"redeemed"}]}"#).unwrap();
+
+        assert_eq!(count, None, "absent count means unknown, not zero");
+        assert!(expirations.is_empty());
+
+        let (count, expirations) = map_reset_credits_response("{}").unwrap();
+        assert_eq!(count, None);
+        assert!(expirations.is_empty());
     }
 
     #[test]
