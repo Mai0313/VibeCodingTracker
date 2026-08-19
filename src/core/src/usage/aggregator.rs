@@ -1124,4 +1124,43 @@ mod tests {
         merge_usage_values(&mut existing, &codex);
         expect(extract_token_counts(&existing));
     }
+
+    #[test]
+    fn merge_preserves_tool_tokens_across_mixed_shapes() {
+        use crate::utils::extract_token_counts;
+
+        let codex = json!({
+            "total_token_usage": {
+                "input_tokens": 1000,
+                "cached_input_tokens": 200,
+                "output_tokens": 500,
+                "total_tokens": 1500
+            }
+        });
+        // A Gemini row for the same model name. `tool_tokens` is the one bucket
+        // with no price and no field of its own in the flat key set, so it is
+        // the one the mixed-shape rewrite used to drop.
+        let gemini = json!({
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_read_input_tokens": 50,
+            "thoughts_tokens": 30,
+            "tool_tokens": 7,
+            "total_tokens": 200
+        });
+
+        let expect = |c: TokenCounts| {
+            assert_eq!(c.tool_tokens, 7);
+            // 1500 (Codex) + 100 + 20 + 50 + 30 + 7 (Gemini).
+            assert_eq!(c.total, 1707);
+        };
+
+        let mut existing = codex.clone();
+        merge_usage_values(&mut existing, &gemini);
+        expect(extract_token_counts(&existing));
+
+        let mut existing = gemini.clone();
+        merge_usage_values(&mut existing, &codex);
+        expect(extract_token_counts(&existing));
+    }
 }
