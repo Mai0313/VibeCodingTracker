@@ -26,7 +26,7 @@ use walkdir::WalkDir;
 /// snapshot, so the common case costs a single parse. This cap only bites when
 /// many recent sessions ran without rate limits (e.g. API-key mode); it is kept
 /// generous enough to look past a multi-day run of quota-less sessions, yet
-/// bounded so the 10s background refresh never reparses an unbounded history.
+/// bounded so the background quota refresh never reparses an unbounded history.
 const MAX_FILES: usize = 64;
 
 /// Returns the newest Codex session `rate_limits` as a snapshot, if any.
@@ -51,8 +51,8 @@ pub fn latest_session_rate_limits() -> Result<Option<CodexQuotaSnapshot>> {
 ///
 /// # Errors
 ///
-/// Never errors on a missing directory (`Ok(None)`); an unreadable file is
-/// tolerated rather than aborting the scan.
+/// Never returns an error: a missing root yields `Ok(None)` and an unreadable
+/// file is skipped. The `Result` mirrors [`latest_session_rate_limits`].
 pub fn latest_session_rate_limits_in(
     codex_session_dirs: &[&Path],
 ) -> Result<Option<CodexQuotaSnapshot>> {
@@ -95,9 +95,9 @@ fn read_jsonl_lenient(path: &Path) -> Vec<Value> {
 /// Maximum number of recent date directories (`YYYY/MM/DD`) to scan.
 ///
 /// Codex lays sessions out as `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`.
-/// Restricting the walk to the newest few day directories keeps the 10s
-/// background refresh from re-walking an entire multi-month history every tick
-/// (on top of the `usage` scan the TUI already runs).
+/// Restricting the walk to the newest few day directories keeps the background
+/// quota refresh from re-walking an entire multi-month history every tick (on
+/// top of the `usage` scan the TUI already runs).
 const MAX_DAY_DIRS: usize = 14;
 
 /// Collects up to `n` Codex rollout files across every session root, newest by
@@ -107,9 +107,7 @@ const MAX_DAY_DIRS: usize = 14;
 /// [`root_candidates`]); mtime is the ranking key across roots, so an archived
 /// session competes with an active one on equal terms. A rollout name already
 /// seen in an earlier root is dropped from a later one, so a scan racing the
-/// archive move does not spend two parses on one session. That comparison is
-/// deliberately across roots only — within a root, name collisions are the
-/// caller's business.
+/// archive move does not spend two parses on one session.
 fn newest_codex_files(dirs: &[&Path], n: usize) -> Vec<PathBuf> {
     let mut files: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
     let mut seen: HashSet<OsString> = HashSet::new();
@@ -122,9 +120,9 @@ fn newest_codex_files(dirs: &[&Path], n: usize) -> Vec<PathBuf> {
             if seen.contains(name) {
                 continue;
             }
-            // Only a staged file claims its name. The one way a stat fails here
-            // is the archive move landing between the listing and this call, and
-            // that is exactly when the later root holds the readable copy.
+            // A name is claimed only by a file that could be stat'd, so a rollout
+            // the archive move took away between the listing and this call does
+            // not block the copy the later root now holds.
             let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
                 continue;
             };
@@ -229,10 +227,12 @@ fn sorted_subdirs_desc(dir: &Path) -> Vec<PathBuf> {
 ///
 /// Looks at both `payload.rate_limits` and `payload.info.rate_limits`, and
 /// captures `plan_type` from the same object. A record is skipped when its
-/// `rate_limits` carries no window, belongs to a non-`codex` limit family, or
-/// every window has already passed its `resets_at` (an elapsed window's
-/// percentage no longer reflects current usage). A window that has reset is
-/// dropped individually, so a record can still contribute its live window.
+/// `rate_limits` belongs to a non-`codex` limit family, or when it leaves no
+/// usable window behind: none reported, every one naming a `window_minutes`
+/// period the panel does not recognize (an absent one keeps its positional
+/// meaning), or every one already past its `resets_at` (an elapsed window's
+/// percentage no longer reflects current usage). Each window is judged on its
+/// own, so a record can still contribute the one that is live.
 pub fn extract_latest_rate_limits(values: &[Value], now: i64) -> Option<CodexQuotaSnapshot> {
     for v in values.iter().rev() {
         let Some(payload) = v.get("payload") else {
@@ -252,8 +252,6 @@ pub fn extract_latest_rate_limits(values: &[Value], now: i64) -> Option<CodexQuo
         if rl.limit_id.as_deref().is_some_and(|id| id != "codex") {
             continue;
         }
-        // Drop windows whose reset time has already passed; their used_percent
-        // is from an elapsed window and no longer reflects reality.
         let mut primary = None;
         let mut secondary = None;
         if let Some(window) = &rl.primary {
@@ -285,7 +283,7 @@ pub fn extract_latest_rate_limits(values: &[Value], now: i64) -> Option<CodexQuo
             }
         }
         if primary.is_none() && secondary.is_none() {
-            // No live window here; older records are even more stale.
+            // Nothing usable in this record; fall back to the next older one.
             continue;
         }
         return Some(CodexQuotaSnapshot {

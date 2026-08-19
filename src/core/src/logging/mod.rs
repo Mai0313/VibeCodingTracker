@@ -42,7 +42,7 @@ struct OpenLog {
 
 /// A thread-safe file logger implementing [`log::Log`].
 ///
-/// The open file lives behind a `Mutex` so the main thread and the (up to four)
+/// The open file lives behind a `Mutex` so the main thread and the (up to five)
 /// background quota workers can share it. Each record is written with a single
 /// `write_all` and no user-space buffering, so nothing is lost on a
 /// `panic = "abort"` process abort.
@@ -81,7 +81,6 @@ impl FileLogger {
         let today = utc_date();
         // A poisoned mutex still holds a valid file handle; recover and keep logging.
         let mut guard = self.open.lock().unwrap_or_else(|p| p.into_inner());
-        // (Re)open when there is no file yet or the UTC day has rolled over.
         if guard.as_ref().is_none_or(|o| o.date != today) {
             if fs::create_dir_all(dir).is_err() {
                 return;
@@ -164,11 +163,9 @@ fn to_level_filter(level: LogLevel) -> LevelFilter {
 
 /// Installs the global file logger at the default level (`warn`).
 ///
-/// Called once at process start, before any subcommand runs. Safe to call more
-/// than once (subsequent calls are ignored) so tests that exercise `main` don't
-/// double-install. The level is later refined by [`apply`] once the user config
-/// is loaded. Terminal-restore-on-panic is a presentation concern, so the CLI
-/// binary installs that hook separately (the TUI setup also self-installs it).
+/// Called once at process start, before any subcommand runs; a repeat call is
+/// ignored. The level is later refined by [`apply`] once the user config is
+/// loaded.
 pub fn init() {
     let dir = home::home_dir().map(|home| home.join(".vct").join(LOG_DIR_NAME));
     let logger = LOGGER.get_or_init(|| FileLogger::new(dir, LevelFilter::Warn));

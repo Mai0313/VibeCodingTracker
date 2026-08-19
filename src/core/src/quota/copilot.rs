@@ -37,9 +37,9 @@ pub const COPILOT_LOGIN_HINT: &str = "run: copilot login";
 
 /// Builds the Copilot CLI's request User-Agent, e.g. `GitHubCopilotCLI/1.0.68`.
 ///
-/// The version is detected from the installed CLI (see
-/// [`crate::quota::http::detect_cli_version`]) so the UA tracks the real client
-/// rather than drifting from a hardcoded constant.
+/// Resolved once per process. [`crate::quota::http::detect_cli_version`] probes
+/// the installed CLI only when the binary has enabled probing, so an embedder
+/// (and the whole test suite) gets `COPILOT_FALLBACK_VERSION`.
 fn copilot_ua() -> &'static str {
     static UA: OnceLock<String> = OnceLock::new();
     UA.get_or_init(|| {
@@ -52,8 +52,8 @@ fn copilot_ua() -> &'static str {
 }
 
 /// Strips `//` line comments and `/* */` block comments from a JSONC string,
-/// respecting string context so a `//` inside a value (e.g. a
-/// `"https://github.com:login"` key) is never removed.
+/// leaving anything inside a JSON string alone: the `copilotTokens` keys are
+/// login URLs (`"https://github.com:octocat"`) whose `//` must survive.
 fn strip_jsonc_comments(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -111,9 +111,11 @@ struct CopilotCreds {
 /// Reads the `gho_...` GitHub token from the (JSONC) Copilot config and derives
 /// the entitlement API host from the account's login host.
 ///
-/// Prefers the token for `lastLoggedInUser` (`<host>:<login>`) so a config that
-/// still holds several accounts queries the one the user is actually on, then
-/// falls back to the first `https://github.com` entry.
+/// Prefers the `lastLoggedInUser` account's `<host>:<login>` key so a config
+/// still holding several accounts queries the one the user is actually on;
+/// otherwise takes the lowest-sorting `https://github.com` key, `serde_json`
+/// being built without `preserve_order` here so the file's own order is
+/// already gone.
 fn read_copilot_creds(body: &str) -> Option<CopilotCreds> {
     let stripped = strip_jsonc_comments(body);
     let root: serde_json::Value = serde_json::from_str(&stripped).ok()?;
@@ -122,8 +124,6 @@ fn read_copilot_creds(body: &str) -> Option<CopilotCreds> {
     let entry_token =
         |v: &serde_json::Value| v.as_str().filter(|s| !s.is_empty()).map(str::to_string);
 
-    // The `copilotTokens` keys are `<host>:<login>`; match the last-logged-in
-    // account first, then fall back to the first GitHub entry.
     let preferred = root.get("lastLoggedInUser").and_then(|user| {
         let host = user.get("host")?.as_str()?;
         let login = user.get("login")?.as_str()?;
@@ -189,10 +189,11 @@ pub fn map_copilot_user(body: &str, now: i64) -> Result<CopilotQuotaSnapshot> {
     let premium_remaining = premium_entry.and_then(|e| e.remaining).map(|v| v as i64);
     let premium_entitlement = premium_entry.and_then(|e| e.entitlement).map(|v| v as i64);
 
-    // Derive the used-percent from `percent_remaining` (preferred) or the
-    // remaining/entitlement ratio. A zero-entitlement placeholder (common for
-    // token-based / business seats) carries no real gauge, so drop it rather
-    // than render a misleading empty bar.
+    // `percent_remaining` really is percent remaining, hence the inversion into
+    // the consumed percent every gauge shows; the remaining/entitlement ratio
+    // covers a response that omits it. A zero-entitlement placeholder (common
+    // for token-based / business seats) carries no real gauge, so drop it
+    // rather than render a misleading empty bar.
     let placeholder = matches!((premium_remaining, premium_entitlement), (Some(0), Some(0)));
     let premium = if premium_unlimited || placeholder {
         None
@@ -281,7 +282,7 @@ fn fetch_copilot_user(client: &Client, api_url: &str, token: &str, now: i64) -> 
     }
 }
 
-/// Fetches the raw `/copilot_internal/user` response for `vct fetch copilot`.
+/// Fetches the raw `/copilot_internal/user` response for `vct quota copilot`.
 ///
 /// Uses the stored `gho_` token verbatim (Copilot has no refresh) and returns
 /// `(status_code, body)`. A non-2xx status is left for the caller to surface.
@@ -364,7 +365,7 @@ mod tests {
     use super::*;
 
     // A real (redacted) config.json shape: JSONC with leading comments and a
-    // URL key whose value contains `//`.
+    // login-URL key containing `//`.
     const CONFIG: &str = r#"// User settings belong in settings.json.
 // This file is managed automatically.
 {
@@ -378,7 +379,7 @@ mod tests {
     fn strips_comments_without_eating_url_slashes() {
         let out = strip_jsonc_comments(CONFIG);
         assert!(!out.contains("// User settings"));
-        // The `//` inside the string value must survive.
+        // The `//` inside the key string must survive.
         assert!(out.contains("https://github.com:octocat"));
         let creds = read_copilot_creds(CONFIG).unwrap();
         assert_eq!(creds.token, "gho_EXAMPLETOKEN");

@@ -4,7 +4,8 @@
 //! cost against the [`ModelPricingMap`], branching on the authoritative cost
 //! source for the provider that produced the tokens. This is pure pricing
 //! policy (no `usage`- or `analysis`-feature knowledge), so it lives in
-//! `pricing` and both the `usage` roll-up and the display summaries consume it.
+//! `pricing` and the `usage` roll-up consumes it for both the `--json` rows and
+//! the priced summary the frontends render.
 
 use crate::pricing::{ModelPricing, ModelPricingMap, calculate_cost};
 use crate::utils::TokenCounts;
@@ -23,15 +24,16 @@ pub enum CostSource {
     /// novel model like `deepseek-v4-pro` reports OpenCode's own cost instead of
     /// being priced against a loosely-similar name.
     OpenCodeStored(f64),
-    /// Caller-supplied Cursor cost used verbatim. Retained for source
-    /// compatibility; VCT's local Cursor reader now returns zero stored cost
-    /// and its display path accepts only exact LiteLLM matches.
+    /// Caller-supplied Cursor cost, used verbatim and never re-priced from
+    /// tokens. VCT's own Cursor scan is a local token estimate carrying no
+    /// cost, so it prices through an exact LiteLLM match instead and never
+    /// builds this variant.
     CursorStored(f64),
-    /// Hermes: same basis as [`OpenCodeStored`] — an **exact** LiteLLM match
-    /// prices from tokens, otherwise Hermes's own stored cost is used. Hermes
-    /// often bills novel models LiteLLM can't price, so its own number is the
-    /// safest fallback; the map is kept separate so a colliding bare model name
-    /// can't cross-contaminate another provider's cost.
+    /// Hermes: same basis as [`CostSource::OpenCodeStored`] — an **exact**
+    /// LiteLLM match prices from tokens, otherwise Hermes's own stored cost is
+    /// used. Hermes often bills novel models LiteLLM can't price, so its own
+    /// number is the safest fallback; the map is kept separate so a colliding
+    /// bare model name can't cross-contaminate another provider's cost.
     HermesStored(f64),
     /// Grok: the full LiteLLM lookup, but the context-gauge estimate lives
     /// entirely in the cache-read bucket, so a matched model whose LiteLLM
@@ -59,10 +61,7 @@ pub fn resolve_model_cost(
     };
 
     match source {
-        // Cursor's dashboard cost is authoritative; never re-price from tokens.
         CostSource::CursorStored(stored) => (stored, None),
-        // OpenCode / Hermes: only trust an exact price match; otherwise use the
-        // provider's own stored cost.
         CostSource::OpenCodeStored(stored) | CostSource::HermesStored(stored) => {
             match pricing_map.get_exact(model) {
                 Some(pricing) => (priced(&pricing), None),

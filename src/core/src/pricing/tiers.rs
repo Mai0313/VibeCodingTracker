@@ -86,7 +86,8 @@ impl TierThresholds {
         self.thresholds.is_empty()
     }
 
-    /// Stable identity of this snapshot's contents, `0` only when empty.
+    /// Order-independent identity of this snapshot's contents; an empty
+    /// snapshot is `0`.
     pub fn fingerprint(&self) -> u64 {
         self.fingerprint
     }
@@ -110,8 +111,10 @@ impl<'a> TierClassifier<'a> {
         }
     }
 
-    /// Whether a request for `model` with `request_context` prompt tokens
-    /// (input + cache read + cache creation) is billed at the tier rate.
+    /// Whether a request for `model` is billed at the tier rate.
+    ///
+    /// `request_context` is that one request's own full prompt size, cached
+    /// tokens included — never a sum across requests.
     pub fn is_above(&mut self, model: &str, request_context: i64) -> bool {
         let threshold = match self.memo.get(model) {
             Some(threshold) => *threshold,

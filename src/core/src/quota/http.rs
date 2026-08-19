@@ -1,7 +1,9 @@
 //! Shared HTTP helpers for the quota fetchers.
 //!
 //! One blocking client is built without a default `User-Agent` and shared
-//! across the provider workers; each request sets its own UA. Also holds the
+//! across the provider workers; each request sets its own UA. The version those
+//! User-Agents carry comes from [`detect_cli_version`], which probes the
+//! installed provider CLIs only once the binary opts in. Also holds the
 //! ISO-timestamp conversion used by the fetchers.
 
 use anyhow::{Context, Result};

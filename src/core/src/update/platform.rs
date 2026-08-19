@@ -28,7 +28,6 @@ pub fn get_asset_pattern(version: &str) -> Result<String> {
     let os = env::consts::OS;
     let arch = env::consts::ARCH;
 
-    // Map Rust arch names to release asset arch names
     let arch_name = match arch {
         "x86_64" => "x64",
         "aarch64" => "arm64",
