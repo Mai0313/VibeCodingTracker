@@ -78,18 +78,19 @@ pub struct CopilotSessionContext {
     /// run inside a git repo.
     #[serde(default)]
     pub repository: String,
-    /// E.g. `"github"`; used together with `repository_host` to reconstruct
-    /// the remote URL when the CLI omits the full URL.
+    /// E.g. `"github"`.
     #[serde(default)]
     pub host_type: String,
-    /// E.g. `"github.com"`.
+    /// E.g. `"github.com"`; used together with `repository` to reconstruct
+    /// the remote URL.
     #[serde(default)]
     pub repository_host: String,
 }
 
-/// `session.model_change` payload — each session may switch between models
-/// at any point, so the analyzer uses the most recent one when attributing
-/// streaming `assistant.message` tokens that arrive before `session.shutdown`.
+/// `session.model_change` payload — each session may switch between models at
+/// any point, so the analyzer attributes the streamed `assistant.message`
+/// output tokens to the most recent one. That fallback only applies to
+/// sessions that never reach `session.shutdown`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CopilotModelChangeData {
@@ -126,17 +127,16 @@ pub struct CopilotModelMetric {
 
 /// Token counts captured by Copilot CLI at session shutdown.
 ///
-/// Field names mirror the camelCase keys the CLI writes to disk — the
-/// usage_processor normalises these into the Claude-style field names
-/// (`input_tokens`, `cache_read_input_tokens`, …) before storing them in
-/// `conversation_usage`.
+/// Field names mirror the camelCase keys the CLI writes to disk — the Copilot
+/// parser normalises these into the flat token keys (`input_tokens`,
+/// `cache_read_input_tokens`, …) before storing them in `conversation_usage`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CopilotModelUsage {
     /// Input (prompt) tokens.
     #[serde(default)]
     pub input_tokens: i64,
-    /// Output (completion) tokens.
+    /// Output (completion) tokens, already **including** `reasoning_tokens`.
     #[serde(default)]
     pub output_tokens: i64,
     /// Tokens served from the prompt cache.
@@ -145,7 +145,8 @@ pub struct CopilotModelUsage {
     /// Tokens written into the prompt cache.
     #[serde(default)]
     pub cache_write_tokens: i64,
-    /// Reasoning tokens billed separately by the model.
+    /// Reasoning tokens, a subset of `output_tokens` rather than a separate
+    /// charge; the parser subtracts them back out so each token bills once.
     #[serde(default)]
     pub reasoning_tokens: i64,
 }
