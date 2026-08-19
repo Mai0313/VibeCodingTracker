@@ -1,9 +1,10 @@
 // Golden-output comparison for the session parsers.
 //
-// Each test excludes the fields that cannot be reproduced on another machine:
-// `insightsVersion`, `machineId` and `user` everywhere, plus `gitRemoteUrl`
-// (a git lookup against the session's workspace) for Claude Code / Codex /
-// Copilot / Gemini.
+// `insightsVersion`, `machineId` and `user` are excluded everywhere: each is
+// stamped from the machine running the test. Claude Code / Codex / Copilot also
+// exclude `gitRemoteUrl`, which is a git lookup against the workspace the
+// session recorded. Gemini excludes `gitRemoteUrl` and `folderPath` for a
+// different reason, given at that test.
 
 use serde_json::Value;
 use vct_core::session::parser::parse_session_file_to_value;
@@ -272,8 +273,10 @@ fn test_gemini_parser() {
 
     let actual_json = actual_result.unwrap();
 
-    // `folderPath` is excluded too, though nothing about it actually varies:
-    // Gemini session logs carry no cwd, so the analyzer always leaves it empty.
+    // Neither of Gemini's two extra exclusions varies by machine: the logs
+    // carry no cwd, so `folderPath` stays empty and the git lookup it feeds
+    // returns nothing. They are excluded because the committed golden still
+    // records a `gitRemoteUrl` that an older build produced (see #167).
     let ignore_fields = [
         "insightsVersion",
         "machineId",

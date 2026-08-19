@@ -18,9 +18,10 @@ use vct_core::utils::format_number;
 ///
 /// The "Output" column folds `reasoning_tokens` back into the displayed number
 /// so each row reconciles with "Total Tokens", while cost is priced against the
-/// separated buckets. Prints a "no usage data" message when empty. If pricing
-/// cannot be fetched, a warning is written to stderr and costs are shown as
-/// `$0.00`. When `merge` is set, rows sharing a base model name across provider
+/// separated buckets. Prints a "no usage data" message when empty. A failed
+/// pricing fetch warns on stderr and leaves LiteLLM-priced models at zero cost;
+/// providers carrying their own stored cost keep it. When `merge` is set, rows
+/// sharing a base model name across provider
 /// prefixes (e.g. `openai/gpt-5.5` + `azure/gpt-5.5`) are collapsed into one.
 pub fn display_usage_table(usage_data: &UsageData, merge: bool) {
     if usage_data.models.is_empty() {

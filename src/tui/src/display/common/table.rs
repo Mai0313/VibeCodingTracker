@@ -199,9 +199,10 @@ pub const REPO_URL: &str = "https://github.com/Mai0313/VibeCodingTracker";
 /// Builds the single-line key-hint footer (navigation + the GitHub repo link).
 ///
 /// Everything is on one line to save vertical space. `extra` inserts
-/// view-specific `(key, label)` hints just before `r refresh`; a view with none
-/// passes an empty slice. The repo label is drawn as plain (underlined) text
-/// here; a terminal hyperlink is layered on afterward by
+/// view-specific `(key, label)` hints just before `r refresh`. This is the
+/// no-status shorthand for [`create_controls_with_status`]. The repo label is
+/// drawn as plain (underlined) text here; a terminal hyperlink is layered on
+/// afterward by
 /// [`overlay_repo_hyperlink`](super::tui::overlay_repo_hyperlink).
 pub fn create_controls(extra: &[(&str, &str)], width: u16) -> Paragraph<'static> {
     create_controls_with_status(extra, None, width)

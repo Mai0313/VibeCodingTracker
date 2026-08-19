@@ -979,7 +979,8 @@ fn render_usage_frame_with_status<B: Backend<Error: Send + Sync + 'static>>(
             widths.push(Constraint::Length(share_w));
         }
 
-        // The grand total lives only in the summary bar below.
+        // No total row: the grand total is carried by the table title and the
+        // summary bar, never by a selectable row.
         let rows: Vec<RatatuiRow> = rows_data
             .iter()
             .map(|row| {

@@ -283,8 +283,8 @@ fn test_file_cache_multiple_files() {
 #[test]
 #[serial(global_cache)]
 fn test_file_cache_lru_eviction() {
-    // One file re-read many times: the LRU capacity
-    // (`capacity::FILE_CACHE_SIZE`) is never reached, so nothing is evicted.
+    // Misnamed: one file re-read many times evicts nothing, and the final
+    // assert would pass after an eviction anyway, since a miss just re-parses.
 
     let example_file = fixture("sessions/claude_code.jsonl");
 

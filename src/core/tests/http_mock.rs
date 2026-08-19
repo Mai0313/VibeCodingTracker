@@ -2,9 +2,9 @@
 //!
 //! Every request goes to a local `httpmock` server whose URL is injected via the
 //! endpoint parameters added for testability, so no real provider API is ever
-//! reached. Private fetchers / orchestration (Claude, Cursor, Copilot, the
-//! 401 → refresh → retry loop, GitHub releases) are covered by inline unit tests
-//! in their own source files, which can see crate-private items.
+//! reached. Each provider's own send layer, the 401 → refresh → retry loop and
+//! the GitHub releases path are covered by inline `#[cfg(test)]` tests in their
+//! own source files, which can reach crate-private items.
 
 use httpmock::prelude::*;
 use serde_json::json;

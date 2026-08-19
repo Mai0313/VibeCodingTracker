@@ -1,15 +1,16 @@
 // Integration tests for the built `vct` binary.
 //
 // Two groups:
-//  1. CLI wiring and single-file behavior. Clap-only checks use the inherited
-//     environment because they stop before runtime dispatch; every command that
-//     can parse, log, or return a runtime error uses an isolated child HOME.
+//  1. CLI wiring and single-file behavior. Checks that stop at clap, plus the
+//     settings-free `version` command, run on the inherited environment; every
+//     command that can parse a session, log, or reach a provider path uses an
+//     isolated child HOME.
 //  2. Per-child HOME smoke tests — batch `usage` / `analysis` run against an
 //     isolated temp HOME seeded with fixture sessions plus an offline pricing
-//     cache; `config` and the startup side-effect checks use an empty one, so
-//     they can assert what the binary does and does not create. Either way the
-//     compiled binary is exercised end-to-end without touching the real home
-//     or any external API.
+//     cache, while the `config` and startup side-effect checks seed only what
+//     the case under test needs, so they can assert what the binary creates and
+//     what it rewrites. Either way the compiled binary is exercised end-to-end
+//     without touching the real home or any external API.
 //
 // Setting the environment on the child is the only way to isolate a separate
 // binary; it is per-child (no `#[serial]`, no process-global mutation) and
