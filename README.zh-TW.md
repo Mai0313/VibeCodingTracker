@@ -680,7 +680,7 @@ vct config migrate
 
 ### 費用細節
 
-- **Context tier 以單一 request 計**：LiteLLM 的「above Nk tokens」費率（如 GPT-5.x 超過 272k、Gemini 超過 200k）只套用在自身 prompt context 超過門檻的那些 request 上。沒有 per-request 粒度的 provider（以及離線掃描）一律以基本費率計價，因此這類 model 的費用是下界。
+- **Context tier 以單一 request 計**：LiteLLM 的「above Nk tokens」費率（如 GPT-5.x 超過 272k、Gemini 超過 200k）與 Qwen / doubao 的用量級距同樣只套用在自身 prompt context 超過分界的那些 request 上，不會套用到整次掃描的 token 總和。沒有 per-request 粒度的 provider（以及離線掃描）一律以最低一級的費率計價，因此這類 model 的費用是下界。
 - **不只 token**：Claude 的網頁搜尋工具呼叫（`server_tool_use.web_search_requests`）會在 token 費用之外，按每次查詢計費；其他所有 model 的每次查詢費用皆為 $0。
 - **OpenCode**：只有在 LiteLLM **完全比對**成功時，才會依 token 為新型 model 計價；若沒有完全比對，vct 會採信該 assistant 訊息本身儲存的費用，而不是從名稱相近的 model 去猜測。
 - **Hermes**：與 OpenCode 相同，LiteLLM **完全比對**成功時依 token 計價，否則使用 Hermes 本身儲存的費用。
