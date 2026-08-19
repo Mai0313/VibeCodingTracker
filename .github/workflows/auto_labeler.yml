@@ -1,14 +1,7 @@
 name: Pull Request Labeler
 
-# pull_request_target, because GitHub hands a pull_request run a read-only
-# GITHUB_TOKEN when the pull request comes from a fork, whatever permissions
-# this workflow asks for. Labeling an outside contribution died there with
-# "Resource not accessible by integration".
-#
-# That event grants write access, which is why this job must never check out
-# the pull request's own code. It does not need a working tree anyway: with no
-# configuration file on the runner, the action reads this repository's copy
-# over the API.
+# pull_request_target because a fork's pull_request run gets a read-only token;
+# never check out the PR's own code under it.
 
 on:
   pull_request_target:
