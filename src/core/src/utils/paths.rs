@@ -259,8 +259,9 @@ fn build_paths(
 /// Whether `VCT_OFFLINE` is set to a non-empty value.
 ///
 /// The pricing fetch degrades to today's cache or an empty map, and every
-/// update path but `vct update --force` skips the GitHub probe. The quota
-/// fetchers do not consult this.
+/// update path skips the GitHub probe — the startup hook, `--check`, the
+/// interactive prompt and `--force` alike. The quota fetchers do not consult
+/// this.
 pub fn network_disabled() -> bool {
     std::env::var_os("VCT_OFFLINE").is_some_and(|v| !v.is_empty())
 }

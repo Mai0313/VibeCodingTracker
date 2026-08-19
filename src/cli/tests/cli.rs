@@ -872,6 +872,31 @@ fn package_managed_binary_skips_startup_update_before_network_or_cache_writes() 
     );
 }
 
+// The dead proxy is what makes a regressed offline guard fail this assertion
+// rather than download a release over the compiled test binary.
+#[test]
+fn explicit_update_is_a_no_op_when_offline() {
+    let home = TempHome::new();
+
+    for args in [&["update"][..], &["update", "--force"][..]] {
+        let output = child_cmd(&home)
+            .env("HTTPS_PROXY", "http://127.0.0.1:9")
+            .env("HTTP_PROXY", "http://127.0.0.1:9")
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
+            .args(args)
+            .output()
+            .unwrap();
+
+        assert!(output.status.success(), "{args:?} must exit successfully");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "Checking for updates...\n",
+            "{args:?} must stop before the GitHub request"
+        );
+    }
+}
+
 #[test]
 fn analysis_file_does_not_create_config() {
     let home = TempHome::new();

@@ -468,7 +468,7 @@ vct 启动时每天 UTC 日期最多检查一次新版. 只有通过官方 `scri
 
 Unix 应用更新后, vct 会用新版 binary 重新执行当前命令. Windows 会先让当前命令结束, 再由 helper 应用替换. 自动流程绝不会修改通过 cargo, npm, PyPI, distro package 安装的版本, 也不会修改没有 marker 的手动安装或 development build. 请通过相应的 package manager 更新. 现有直接安装只要再运行一次当前官方 installer, 就会创建 marker 并启用自动更新.
 
-在 `~/.vct/config.toml` 中设置 `general.auto_update = false` 可以关闭启动检查和自动更新. 显式执行的 `vct update` 会保留原有手动行为.
+在 `~/.vct/config.toml` 中设置 `general.auto_update = false` 可以关闭启动检查和自动更新. 显式执行的 `vct update` 会保留原有手动行为. `VCT_OFFLINE=1` 对它同样有效: `--check`, 交互式确认和 `--force` 都会直接返回, 不会连接 GitHub.
 
 ### 基本用法
 

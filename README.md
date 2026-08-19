@@ -468,7 +468,7 @@ At startup, vct silently checks for a newer release at most once per UTC day. A 
 
 After a Unix update, vct re-executes the current command with the new binary. On Windows, the current command finishes and a helper applies the replacement afterwards. The automatic path never modifies installs from cargo, npm, PyPI, a distro package, or an unmarked manual or development build. Update those through their package manager instead. To add automatic updates to an existing direct install, run the current official installer once more so it creates the marker.
 
-Set `general.auto_update = false` in `~/.vct/config.toml` to disable startup checks and automatic updates. The explicit `vct update` command retains its existing manual behavior.
+Set `general.auto_update = false` in `~/.vct/config.toml` to disable startup checks and automatic updates. The explicit `vct update` command retains its existing manual behavior. `VCT_OFFLINE=1` also applies to it: `--check`, the interactive prompt, and `--force` alike return without contacting GitHub.
 
 ### Basic Usage
 
