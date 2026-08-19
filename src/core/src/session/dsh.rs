@@ -353,6 +353,10 @@ impl<'a> DshParser<'a> {
     }
 
     /// Holds one step's usage sample, flushing the previous step's.
+    ///
+    /// The sample's verdict is left to [`Self::flush_usage`]: a report that the
+    /// next one supersedes describes the same billing event, so counting both
+    /// would report two records where the log has one.
     fn apply_usage(&mut self, data: &Value, usage: Option<&Value>, model: String) {
         // An assistant message carries no `usage` when the adapter reported
         // none; that is a routing fact, not a schema failure.
@@ -363,8 +367,6 @@ impl<'a> DshParser<'a> {
             self.diagnostics.record_relevant(false);
             return;
         };
-        self.diagnostics.record_relevant(true);
-
         let sample = UsageSample {
             turn: data.get("turn").and_then(Value::as_i64).unwrap_or(0),
             step: data.get("step").and_then(Value::as_i64).unwrap_or(0),
@@ -378,10 +380,18 @@ impl<'a> DshParser<'a> {
         self.pending_usage = Some(sample);
     }
 
+    /// Folds the held sample into the per-model totals and records its verdict.
+    ///
+    /// Every step reports its usage twice, so the verdict belongs to the
+    /// survivor of the last-wins slot rather than to each report. A sample
+    /// whose route never resolved (usage before the first `request/context`)
+    /// cannot be attributed to a model, so it is a relevant record the parser
+    /// could not normalize rather than a silent zero.
     fn flush_usage(&mut self) {
         let Some(sample) = self.pending_usage.take() else {
             return;
         };
+        self.diagnostics.record_relevant(!sample.model.is_empty());
         if sample.model.is_empty() {
             return;
         }
@@ -418,15 +428,19 @@ impl<'a> DshParser<'a> {
     /// `tool/call`, which is what carries the operation's own arguments. A
     /// result reporting `error` leaves no metric behind.
     fn apply_tool_result(&mut self, object: &Map<String, Value>, data: &Value) {
-        let call_seq = object
+        // The envelope can list several source events, so every entry is
+        // searched rather than index 0 alone: reading one position mispairs the
+        // result and leaks the real call. A call whose own record was lost with
+        // a torn frame cannot be identified, and the result payload alone does
+        // not say which tool produced it.
+        let Some(call) = object
             .get("sourceEventSeqs")
             .and_then(Value::as_array)
-            .and_then(|seqs| seqs.first())
-            .and_then(Value::as_i64);
-        // A call whose own record was lost with a torn frame cannot be
-        // identified, and the result payload alone does not say which tool
-        // produced it.
-        let Some(call) = call_seq.and_then(|seq| self.pending_calls.remove(&seq)) else {
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_i64)
+            .find_map(|seq| self.pending_calls.remove(&seq))
+        else {
             return;
         };
         if data.get("error").is_some_and(|error| !error.is_null()) {
@@ -696,6 +710,104 @@ mod tests {
         let parsed = parse(&path);
         assert_eq!(parsed.diagnostics.unrecognized_records, 1);
         assert_eq!(parsed.diagnostics.recognized_records, 2);
+    }
+
+    #[test]
+    fn one_step_reported_twice_is_one_relevant_record() {
+        let dir = TempDir::new().unwrap();
+        let route = json!({"type": "request/context", "seq": 1, "time": 2, "data": {"model": "m"}})
+            .to_string();
+        let chunk = json!({
+            "type": "assistant/chunk",
+            "seq": 2,
+            "time": 3,
+            "data": {
+                "turn": 1,
+                "step": 1,
+                "chunk": {"type": "usage", "usage": {"inputTokens": 1, "outputTokens": 2}},
+            },
+        })
+        .to_string();
+        let path = write_frames(
+            &dir,
+            "session.jsonl.zstd",
+            &[
+                vec![HEADER.to_string()],
+                vec![route, chunk, usage_event(3, 1, 1, "m", 2)],
+            ],
+        );
+
+        let parsed = parse(&path);
+        // The early chunk and the assembled message describe the same step, so
+        // the pair bills once and is counted once.
+        assert_eq!(
+            parsed.analysis.records[0].conversation_usage["m"]["output_tokens"],
+            2
+        );
+        assert_eq!(parsed.diagnostics.relevant_records, 1);
+        assert_eq!(parsed.diagnostics.normalized_records, 1);
+    }
+
+    #[test]
+    fn usage_with_no_route_is_a_failed_record_not_a_silent_drop() {
+        let dir = TempDir::new().unwrap();
+        // A usage chunk takes its model from the last `request/context`, so one
+        // arriving before the first route has nothing to attribute it to.
+        let chunk = json!({
+            "type": "assistant/chunk",
+            "seq": 1,
+            "time": 2,
+            "data": {
+                "turn": 1,
+                "step": 1,
+                "chunk": {"type": "usage", "usage": {"inputTokens": 5, "outputTokens": 7}},
+            },
+        })
+        .to_string();
+        let path = write_frames(
+            &dir,
+            "session.jsonl.zstd",
+            &[vec![HEADER.to_string()], vec![chunk]],
+        );
+
+        let parsed = parse(&path);
+        assert!(parsed.analysis.records[0].conversation_usage.is_empty());
+        assert_eq!(parsed.diagnostics.relevant_records, 1);
+        assert_eq!(parsed.diagnostics.failed_relevant_records, 1);
+    }
+
+    #[test]
+    fn a_result_pairs_on_any_source_event_seq() {
+        let dir = TempDir::new().unwrap();
+        let call = json!({
+            "type": "tool/call",
+            "seq": 4,
+            "time": 5,
+            "data": {
+                "name": "write",
+                "arguments": r#"{"file_path":"/repo/new.rs","content":"one\ntwo\n"}"#,
+            },
+        })
+        .to_string();
+        // The call seq sits past index 0; reading only the first entry loses the
+        // operation and leaves the call pending.
+        let result = json!({
+            "type": "tool/result",
+            "seq": 6,
+            "time": 7,
+            "sourceEventSeqs": [3, 4],
+            "data": {"meta": {}},
+        })
+        .to_string();
+        let path = write_frames(
+            &dir,
+            "session.jsonl.zstd",
+            &[vec![HEADER.to_string()], vec![call, result]],
+        );
+
+        let record = &parse(&path).analysis.records[0];
+        assert_eq!(record.tool_call_counts.write, 1);
+        assert_eq!(record.total_write_lines, 2);
     }
 
     #[test]
