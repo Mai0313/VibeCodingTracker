@@ -150,6 +150,39 @@ fn reset_credit_details_failure_preserves_usage_summary() {
 }
 
 #[test]
+fn reset_credit_details_without_a_count_keeps_the_usage_summary_count() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/wham");
+        then.status(200)
+            .body(fixture_str("quota/wham_usage_response.json"));
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/reset-credits");
+        then.status(200)
+            .body(r#"{"credits":[{"status":"available","expires_at":null}]}"#);
+    });
+    let client = build_client().unwrap();
+
+    let result = call_wham_with_reset_credits(
+        &client,
+        "tok",
+        Some("acct"),
+        1_000_000,
+        &server.url("/wham"),
+        &server.url("/reset-credits"),
+    );
+
+    match result {
+        WhamResult::Ok(snap) => {
+            assert_eq!(snap.reset_credits_available, Some(2), "from wham/usage");
+            assert_eq!(snap.reset_credit_expirations, Some(vec![None]));
+        }
+        _ => panic!("a details response missing fields must still map"),
+    }
+}
+
+#[test]
 fn reset_credit_details_401_is_unauthorized() {
     let server = MockServer::start();
     server.mock(|when, then| {
