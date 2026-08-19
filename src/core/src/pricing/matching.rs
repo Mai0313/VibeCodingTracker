@@ -327,19 +327,35 @@ impl ModelPricingMap {
         &self.raw
     }
 
-    /// Builds the `Send + Sync` "model → lowest context-tier threshold"
-    /// snapshot the usage scan hands to session parsers for per-request tier
-    /// classification. Models without threshold tiers are absent.
+    /// Builds the `Send + Sync` "model → context-tier threshold" snapshot the
+    /// usage scan hands to session parsers for per-request tier
+    /// classification. Models with neither pricing strategy are absent.
     pub fn tier_thresholds(&self) -> crate::pricing::TierThresholds {
-        crate::pricing::TierThresholds::from_entries(self.raw.iter().filter_map(
-            |(key, pricing)| {
-                pricing
-                    .tiers
-                    .first()
-                    .map(|tier| (key.as_ref(), tier.threshold_tokens))
-            },
-        ))
+        crate::pricing::TierThresholds::from_entries(
+            self.raw.iter().filter_map(|(key, pricing)| {
+                Some((key.as_ref(), classification_threshold(pricing)?))
+            }),
+        )
     }
+}
+
+/// The context size above which a request bills at `pricing`'s second price
+/// level, or `None` when the model has only one level.
+///
+/// Checked in `calculate_cost`'s own dispatch order, so an entry carrying both
+/// strategies classifies against the one that will price it. A range-based
+/// model's boundary is row 0's `max_tokens`, which is exclusive while
+/// [`TierClassifier`](crate::pricing::TierClassifier) compares strictly
+/// greater — hence the `- 1`, which is what makes a request of exactly
+/// `max_tokens` the first one row 1 prices.
+fn classification_threshold(pricing: &ModelPricing) -> Option<i64> {
+    if let Some(ranges) = &pricing.ranges {
+        // Row 1 prices the whole above-slice, so a single-row model has
+        // nothing to promote to and classifies nothing.
+        let boundary = ranges.first()?.max_tokens;
+        return (ranges.len() >= 2 && boundary > 0).then_some(boundary - 1);
+    }
+    pricing.tiers.first().map(|tier| tier.threshold_tokens)
 }
 
 /// Invalidates the lookup cache in every pricing map.
@@ -476,7 +492,7 @@ fn is_numeric_version_suffix(suffix: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::cache::ThresholdTier;
+    use super::super::cache::{ThresholdTier, TierRange};
     use super::*;
     use std::collections::HashMap;
 
@@ -840,5 +856,71 @@ mod tests {
 
         let result2 = map.get("モデル-2");
         assert!(result2.pricing.input_cost_per_token > 0.0);
+    }
+
+    fn range_row(min_tokens: i64, max_tokens: i64) -> TierRange {
+        TierRange {
+            min_tokens,
+            max_tokens,
+            input_cost_per_token: 0.000001,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn tier_thresholds_exports_range_models_one_below_row_zeros_bound() {
+        let mut raw = HashMap::new();
+        raw.insert(
+            "dashscope/qwen3-coder-plus".to_string(),
+            ModelPricing {
+                ranges: Some(vec![range_row(0, 32_000), range_row(32_000, 128_000)]),
+                ..Default::default()
+            },
+        );
+        let thresholds = ModelPricingMap::new(raw).tier_thresholds();
+
+        // `max_tokens` is exclusive and `TierClassifier` compares strictly
+        // greater, so a request of exactly 32_000 is row 1's first.
+        assert_eq!(thresholds.threshold_for("qwen3-coder-plus"), Some(31_999));
+    }
+
+    #[test]
+    fn tier_thresholds_skips_single_row_range_models() {
+        let mut raw = HashMap::new();
+        raw.insert(
+            "dashscope/qwen-single".to_string(),
+            ModelPricing {
+                ranges: Some(vec![range_row(0, 32_000)]),
+                ..Default::default()
+            },
+        );
+        // Nothing to promote to, so classifying would only cost work.
+        assert!(
+            ModelPricingMap::new(raw)
+                .tier_thresholds()
+                .threshold_for("qwen-single")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn tier_thresholds_still_exports_threshold_models() {
+        let mut raw = HashMap::new();
+        raw.insert(
+            "claude-sonnet-4-5".to_string(),
+            ModelPricing {
+                tiers: vec![ThresholdTier {
+                    threshold_tokens: 200_000,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            ModelPricingMap::new(raw)
+                .tier_thresholds()
+                .threshold_for("claude-sonnet-4-5"),
+            Some(200_000)
+        );
     }
 }

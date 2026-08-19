@@ -628,7 +628,7 @@ fn test_pricing_above_200k_tokens_via_tier() {
 
 #[test]
 fn test_pricing_range_based() {
-    // Mimics Qwen-style range-based pricing selected by input_tokens.
+    // Mimics Qwen-style range-based pricing.
     let pricing = ModelPricing {
         input_cost_per_token: 999.0, // Should be ignored — ranges takes priority.
         ranges: Some(vec![
@@ -653,8 +653,16 @@ fn test_pricing_range_based() {
     let low = calculate_cost(&tc(10_000, 1000, 0, 0, 0, 0), &pricing);
     assert_eq!(low, 10_000.0 * 0.000001 + 1000.0 * 0.000005);
 
-    let high = calculate_cost(&tc(100_000, 1000, 0, 0, 0, 0), &pricing);
-    assert_eq!(high, 100_000.0 * 0.0000018 + 1000.0 * 0.000009);
+    // Aggregated volume alone never promotes to row 1 — only the per-request
+    // above slice the parsers classify does.
+    let aggregate = calculate_cost(&tc(100_000, 1000, 0, 0, 0, 0), &pricing);
+    assert_eq!(aggregate, 100_000.0 * 0.000001 + 1000.0 * 0.000005);
+
+    let mut above = tc(100_000, 1000, 0, 0, 0, 0);
+    above.above_input = 100_000;
+    above.above_output = 1000;
+    let above = calculate_cost(&above, &pricing);
+    assert_eq!(above, 100_000.0 * 0.0000018 + 1000.0 * 0.000009);
 }
 
 #[test]
