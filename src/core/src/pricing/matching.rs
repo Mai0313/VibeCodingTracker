@@ -587,13 +587,13 @@ mod tests {
         clear_pricing_cache();
 
         let mut raw = HashMap::new();
-        raw.insert("gpt-4-0613".to_string(), create_test_pricing());
+        raw.insert("claude-3-opus-20240229".to_string(), create_test_pricing());
 
         let map = ModelPricingMap::new(raw);
 
-        // `0613` is four digits, so nothing normalizes away: despite this
-        // test's name the price comes from the substring stage.
-        let result = map.get("gpt-4");
+        // The key's 8-digit date suffix normalizes away, so the query and the
+        // key share a normalized form and never reach the looser stages.
+        let result = map.get("claude-3-opus");
         assert!(result.pricing.input_cost_per_token > 0.0);
     }
 
@@ -602,13 +602,13 @@ mod tests {
         clear_pricing_cache();
 
         let mut raw = HashMap::new();
-        raw.insert("claude-3-opus-20240229".to_string(), create_test_pricing());
+        raw.insert("gpt-4-0613".to_string(), create_test_pricing());
 
         let map = ModelPricingMap::new(raw);
 
-        // The key's 8-digit date normalizes away, so despite this test's name
-        // the price comes from the normalized stage.
-        let result = map.get("claude-3-opus");
+        // `0613` is four digits, not the eight a date suffix needs, so nothing
+        // normalizes away and the price comes from the substring scan.
+        let result = map.get("gpt-4");
         assert!(result.pricing.input_cost_per_token > 0.0);
     }
 
@@ -627,17 +627,15 @@ mod tests {
 
     #[test]
     fn test_fuzzy_match() {
-        // Test fuzzy matching with similar names
         let mut raw = HashMap::new();
         raw.insert("claude-3-sonnet".to_string(), create_test_pricing());
 
         let map = ModelPricingMap::new(raw);
 
-        // Slightly misspelled should still match (if similarity >= 0.7)
+        // Neither name contains the other, so the substring stage finds nothing
+        // and the typo resolves on Jaro-Winkler alone (~0.98, over the 0.7 gate).
         let result = map.get("claude-3-sonet");
-        // This might or might not match depending on Jaro-Winkler score
-        // Just verify it returns a result
-        assert!(result.pricing.input_cost_per_token >= 0.0);
+        assert!(result.pricing.input_cost_per_token > 0.0);
     }
 
     #[test]
