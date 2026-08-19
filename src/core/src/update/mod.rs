@@ -1,11 +1,11 @@
 //! Self-update: replace the running binary from the matching GitHub release.
 //!
-//! The flow is: resolve the current host's `(os, arch, libc)` tuple, fetch the
-//! latest GitHub Releases tag, pick the asset whose name matches that tuple,
-//! download and extract it (zip on Windows, tar.gz elsewhere), then atomically
-//! swap it in over the current executable. [`check_update`] is a read-only
-//! probe; [`update_interactive`] is the entry point the `vct update`
-//! subcommand calls.
+//! The flow is: resolve the current host's `(os, arch)` pair, fetch the latest
+//! GitHub Releases tag, pick the asset whose name matches that pair, download
+//! and extract it (zip on Windows, tar.gz elsewhere), then swap it over the
+//! current executable — an atomic rename on Unix, a post-exit helper on
+//! Windows. [`check_update`] is a read-only probe; [`update_interactive`] is
+//! the entry point the `vct update` subcommand calls.
 //!
 //! Submodules: `github` (Releases API + download), `archive` (extraction with
 //! path-traversal guards), `lock` (cross-process serialization), `ownership`
@@ -29,7 +29,6 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-// Re-export public types for backward compatibility
 pub use github::{GitHubAsset, GitHubRelease};
 
 /// Result of the best-effort startup update hook.
@@ -74,7 +73,6 @@ const MAX_VERSION_OUTPUT_BYTES: u64 = 256;
 /// assert_eq!(extract_semver_version("2.4.8"), "2.4.8");
 /// ```
 pub fn extract_semver_version(build_version: &str) -> &str {
-    // Split by '-' and take the first part (the base version)
     build_version.split('-').next().unwrap_or(build_version)
 }
 
@@ -126,8 +124,8 @@ fn get_version_comparison() -> Result<Option<(String, Version, Version, GitHubRe
 
     let latest_version = parse_latest_version(&release)?;
 
-    // Record the check regardless of whether a newer version exists.
-    // Best-effort: a write failure never blocks an explicit update.
+    // Recorded before the up-to-date early return, so a no-op check still
+    // stamps the daily cadence.
     let _ = version_cache::record_version_check(&latest_version.to_string());
 
     if latest_version <= current_version {
@@ -147,14 +145,14 @@ fn get_version_comparison() -> Result<Option<(String, Version, Version, GitHubRe
 ///
 /// Prints an "update available" line and returns `Some(tag_name)` when a newer
 /// release exists, or `None` when already current. This is the read-only path
-/// behind `vct update --check`.
+/// behind `vct update --check`. With `VCT_OFFLINE` set it returns `None`
+/// without contacting GitHub.
 ///
 /// # Errors
 ///
 /// Returns an error if the version comparison fails — i.e. the GitHub fetch or
 /// any version parse fails (see `get_version_comparison`).
 pub fn check_update() -> Result<Option<String>> {
-    // Offline mode: skip the GitHub Releases probe entirely.
     if crate::utils::network_disabled() {
         return Ok(None);
     }
@@ -189,7 +187,6 @@ fn perform_installation_at(
     latest_version: &Version,
     release: &GitHubRelease,
 ) -> Result<InstallationDisposition> {
-    // Find the asset for current platform
     let asset_pattern = platform::get_asset_pattern(&latest_version.to_string())?;
     let asset = release
         .assets
@@ -217,7 +214,6 @@ fn perform_installation_at(
         );
     }
 
-    // Extract the archive
     let extract_dir = staging.path().join("extracted");
     fs::create_dir_all(&extract_dir).context("Update failed: Cannot create temporary directory")?;
 
@@ -231,7 +227,6 @@ fn perform_installation_at(
         anyhow::bail!("Update failed: Unsupported archive format");
     };
 
-    // Perform platform-specific update
     #[cfg(unix)]
     {
         let staged = platform::stage_update_unix(current_exe, &new_binary)
@@ -379,23 +374,23 @@ fn install_and_report(
 
 /// Installs the latest release, but only if it is newer than the current one.
 ///
-/// Returns `Ok(())` without doing anything when already up to date. Works
-/// regardless of how the binary was installed (npm/pip/cargo/manual), because
-/// every channel ships the same pre-compiled GitHub release binaries.
+/// Returns `Ok(())` without doing anything when already up to date. Unlike
+/// [`maybe_auto_update`] this applies to any installation: it replaces
+/// whatever executable is running, with no ownership marker required.
 ///
 /// # Errors
 ///
-/// Returns an error if the version comparison fails (GitHub fetch or version
-/// parse) or if the subsequent install fails (see `perform_installation_at`).
+/// Returns an error if the lock file beside the executable cannot be claimed
+/// (another update is running, or the directory is not writable), if the
+/// version comparison fails (GitHub fetch or version parse), or if the
+/// subsequent install fails (see `perform_installation_at`).
 pub fn perform_update() -> Result<()> {
     let _lock = acquire_update_lock()?;
     perform_update_unlocked()
 }
 
 fn perform_update_unlocked() -> Result<()> {
-    // Get version comparison
     let Some((current_version, _, latest_version, release)) = get_version_comparison()? else {
-        // Already on latest version
         return Ok(());
     };
 
@@ -409,8 +404,10 @@ fn perform_update_unlocked() -> Result<()> {
 ///
 /// # Errors
 ///
-/// Returns an error if the GitHub release fetch fails, if the current or
-/// latest version cannot be parsed, or if the install fails (see
+/// Returns an error if the lock file beside the executable cannot be claimed
+/// (another update is running, or the directory is not writable), if the
+/// GitHub release fetch fails, if the current or latest version cannot be
+/// parsed, or if the install fails (see
 /// `perform_installation_at`, notably when no asset matches this platform).
 pub fn perform_force_update() -> Result<()> {
     let _lock = acquire_update_lock()?;
@@ -450,8 +447,8 @@ fn acquire_update_lock_at(current_exe: &Path) -> Result<lock::UpdateLock> {
 ///
 /// This is a best-effort hook for ordinary commands. It performs no work when
 /// disabled, offline, already checked on the current UTC date, or when the
-/// executable lacks the official release installer's ownership marker. Every
-/// error is logged and converted to [`AutoUpdateOutcome::Failed`] so it can
+/// executable lacks the official release installer's ownership marker. A
+/// failure is logged and reported as [`AutoUpdateOutcome::Failed`] so it can
 /// never block the requested command.
 pub fn maybe_auto_update(enabled: bool) -> AutoUpdateOutcome {
     let offline = crate::utils::network_disabled();
@@ -552,7 +549,6 @@ pub fn update_interactive(force: bool) -> Result<()> {
     println!("Checking for updates...");
 
     if force {
-        // Force update: skip version check, always download latest
         perform_force_update()
     } else {
         // Normal update: check version and prompt for confirmation
@@ -649,105 +645,91 @@ mod tests {
 
     #[test]
     fn test_extract_semver_version_clean() {
-        // Test extracting clean semver version
         let version = "0.1.6";
         assert_eq!(extract_semver_version(version), "0.1.6");
     }
 
     #[test]
     fn test_extract_semver_version_with_git_metadata() {
-        // Test extracting version with git metadata
         let version = "0.1.6-5-g1234567";
         assert_eq!(extract_semver_version(version), "0.1.6");
     }
 
     #[test]
     fn test_extract_semver_version_with_dirty_flag() {
-        // Test extracting version with dirty flag
         let version = "0.1.6-5-g1234567-dirty";
         assert_eq!(extract_semver_version(version), "0.1.6");
     }
 
     #[test]
     fn test_extract_semver_version_rc() {
-        // Test extracting release candidate version
         let version = "1.0.0-rc.1";
         assert_eq!(extract_semver_version(version), "1.0.0");
     }
 
     #[test]
     fn test_extract_semver_version_beta() {
-        // Test extracting beta version
         let version = "2.3.4-beta.2";
         assert_eq!(extract_semver_version(version), "2.3.4");
     }
 
     #[test]
     fn test_extract_semver_version_alpha() {
-        // Test extracting alpha version
         let version = "0.5.0-alpha";
         assert_eq!(extract_semver_version(version), "0.5.0");
     }
 
     #[test]
     fn test_extract_semver_version_complex() {
-        // Test extracting complex version string
         let version = "1.2.3-45-gabcdef0-modified";
         assert_eq!(extract_semver_version(version), "1.2.3");
     }
 
     #[test]
     fn test_extract_semver_version_single_digit() {
-        // Test single digit versions
         assert_eq!(extract_semver_version("1.0.0"), "1.0.0");
         assert_eq!(extract_semver_version("0.0.1"), "0.0.1");
     }
 
     #[test]
     fn test_extract_semver_version_large_numbers() {
-        // Test with large version numbers
         assert_eq!(extract_semver_version("10.20.30"), "10.20.30");
         assert_eq!(extract_semver_version("100.200.300-1-g123"), "100.200.300");
     }
 
     #[test]
     fn test_extract_semver_version_empty() {
-        // Test with empty string (edge case)
         assert_eq!(extract_semver_version(""), "");
     }
 
     #[test]
     fn test_extract_semver_version_no_dashes() {
-        // Test version without any dashes
         let version = "2.4.8";
         assert_eq!(extract_semver_version(version), "2.4.8");
     }
 
     #[test]
     fn test_extract_semver_version_multiple_dashes() {
-        // Test with multiple dashes
         let version = "1.0.0-pre-release-candidate";
         assert_eq!(extract_semver_version(version), "1.0.0");
     }
 
     #[test]
     fn test_extract_semver_version_only_major_minor() {
-        // Test incomplete version (not standard semver, but should handle gracefully)
+        // A non-semver input is returned unchanged rather than rejected.
         let version = "1.2";
         assert_eq!(extract_semver_version(version), "1.2");
     }
 
     #[test]
     fn test_extract_semver_version_with_v_prefix() {
-        // Test with v prefix (common in git tags)
-        // Note: This function doesn't strip 'v', that's done elsewhere
+        // The 'v' prefix survives; callers strip it before parsing.
         let version = "v1.2.3-dirty";
         assert_eq!(extract_semver_version(version), "v1.2.3");
     }
 
     #[test]
     fn test_extract_semver_version_consistency() {
-        // Test that calling twice gives same result
         let version = "3.1.4-15-g926535-dirty";
         let result1 = extract_semver_version(version);
         let result2 = extract_semver_version(version);
@@ -756,14 +738,12 @@ mod tests {
 
     #[test]
     fn test_extract_semver_version_zero_version() {
-        // Test zero versions
         assert_eq!(extract_semver_version("0.0.0"), "0.0.0");
         assert_eq!(extract_semver_version("0.0.0-dev"), "0.0.0");
     }
 
     #[test]
     fn test_extract_semver_version_patch_zero() {
-        // Test with patch version zero
         assert_eq!(extract_semver_version("1.5.0"), "1.5.0");
         assert_eq!(extract_semver_version("2.0.0-rc1"), "2.0.0");
     }

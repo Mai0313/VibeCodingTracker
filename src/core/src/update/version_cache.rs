@@ -100,7 +100,6 @@ mod tests {
         let next = with_check(prev, "0.2.0", "now".into());
         assert_eq!(next.latest_version.as_deref(), Some("0.2.0"));
         assert_eq!(next.last_checked_at, "now");
-        // A prior dismissal survives the check.
         assert_eq!(next.dismissed_version.as_deref(), Some("0.1.0"));
     }
 

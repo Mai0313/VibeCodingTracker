@@ -14,8 +14,8 @@ use zip::ZipArchive;
 
 /// Extracts a tar.gz archive into `extract_to` and returns the binary path.
 ///
-/// Each entry is unpacked only after confirming its joined path stays under
-/// `extract_to`; an entry that would escape aborts the whole extraction.
+/// An entry whose path would escape `extract_to` is refused and aborts the
+/// whole extraction.
 ///
 /// # Errors
 ///
@@ -27,7 +27,6 @@ pub fn extract_targz(archive_path: &Path, extract_to: &Path) -> Result<std::path
     let tar = GzDecoder::new(tar_gz);
     let mut archive = Archive::new(tar);
 
-    // Manually extract with path validation to prevent path traversal attacks
     for entry in archive
         .entries()
         .context("Failed to read archive entries")?
@@ -53,8 +52,8 @@ pub fn extract_targz(archive_path: &Path, extract_to: &Path) -> Result<std::path
 
 /// Extracts a zip archive into `extract_to` and returns the binary path.
 ///
-/// Recreates directory entries and writes file entries, validating each
-/// destination against `extract_to` before touching the filesystem.
+/// Each entry's destination is validated against `extract_to` before anything
+/// is written; an entry that would escape aborts the whole extraction.
 ///
 /// # Errors
 ///
@@ -66,7 +65,6 @@ pub fn extract_zip(archive_path: &Path, extract_to: &Path) -> Result<std::path::
     let file = File::open(archive_path).context("Failed to open archive file")?;
     let mut archive = ZipArchive::new(file).context("Failed to read zip archive")?;
 
-    // Manually extract with path validation to prevent path traversal attacks
     for i in 0..archive.len() {
         let mut file = archive.by_index(i).context("Failed to read zip entry")?;
         let file_path = file.name().to_string();
@@ -92,19 +90,10 @@ pub fn extract_zip(archive_path: &Path, extract_to: &Path) -> Result<std::path::
     find_binary_in_directory(extract_to)
 }
 
-/// Locates the extracted binary by name and marks it executable on Unix.
-///
-/// Probes the platform-specific candidate names (`vibe_coding_tracker` / `vct`,
-/// with `.exe` on Windows) directly under `extract_to` and returns the first
-/// that exists. On Unix the found binary is `chmod`-ed to `0o755` so it can be
-/// run after the swap.
-///
-/// # Errors
-///
-/// Returns an error if no candidate name is found, or on Unix if reading or
-/// setting the binary's permissions fails.
+/// Returns the extracted binary's path, looking only directly under
+/// `extract_to`. On Unix it is `chmod`-ed to `0o755` so the candidate can be
+/// executed for validation.
 fn find_binary_in_directory(extract_to: &Path) -> Result<PathBuf> {
-    // Find the binary in the extracted files
     #[cfg(unix)]
     let binary_names = ["vibe_coding_tracker", "vct"];
 
@@ -114,7 +103,6 @@ fn find_binary_in_directory(extract_to: &Path) -> Result<PathBuf> {
     for name in &binary_names {
         let binary_path = extract_to.join(name);
         if binary_path.exists() {
-            // Make executable on Unix-like systems
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
