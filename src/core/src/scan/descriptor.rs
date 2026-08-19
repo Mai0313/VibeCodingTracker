@@ -1,10 +1,9 @@
 //! Data-driven provider fan-out for the cached file scan.
 //!
 //! The six file-backed providers are scanned with the identical
-//! [`scan_cached_files`](super::scan_cached_files) call, differing only in their
-//! session roots, filter, depth cap, and enable toggle. Listing them once here
-//! means adding a provider is a single table row instead of a new `if` block in
-//! every scan loop.
+//! [`scan_cached_files`] call, differing only in their session roots, filter,
+//! depth cap, and enable toggle. Listing them once here means adding a provider
+//! is a single table row instead of a new `if` block in every scan loop.
 
 use super::{CompactSink, ScanDiagnostics, scan_cached_files};
 use crate::config::ProvidersConfig;

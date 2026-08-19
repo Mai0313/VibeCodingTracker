@@ -406,7 +406,7 @@ fn base_model_key(model: &str) -> &str {
     model.split_once('/').map(|(_, rest)| rest).unwrap_or(model)
 }
 
-/// Collapses rows by [`base_model_key`], summing every token bucket and the
+/// Collapses rows by `base_model_key`, summing every token bucket and the
 /// already-resolved cost, and labels each merged row with the bare base name.
 ///
 /// Costs are summed verbatim rather than re-derived: each input row was already

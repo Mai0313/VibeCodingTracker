@@ -1,11 +1,11 @@
 //! Per-model USD cost resolution.
 //!
-//! Turns a model's [`TokenCounts`](crate::utils::TokenCounts) into a dollar
-//! cost against the [`ModelPricingMap`], branching on the authoritative cost
-//! source for the provider that produced the tokens. This is pure pricing
-//! policy (no `usage`- or `analysis`-feature knowledge), so it lives in
-//! `pricing` and the `usage` roll-up consumes it for both the `--json` rows and
-//! the priced summary the frontends render.
+//! Turns a model's [`TokenCounts`] into a dollar cost against the
+//! [`ModelPricingMap`], branching on the authoritative cost source for the
+//! provider that produced the tokens. This is pure pricing policy (no `usage`-
+//! or `analysis`-feature knowledge), so it lives in `pricing` and the `usage`
+//! roll-up consumes it for both the `--json` rows and the priced summary the
+//! frontends render.
 
 use crate::pricing::{ModelPricing, ModelPricingMap, calculate_cost};
 use crate::utils::TokenCounts;
