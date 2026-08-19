@@ -12,6 +12,8 @@ use vct_core::analysis::AnalysisData;
 /// ```text
 /// {model}: editLines={N} readLines={N} writeLines={N} bash={N} edit={N} read={N} todoWrite={N} write={N}
 /// ```
+///
+/// Prints a placeholder line and returns early when there are no rows.
 pub fn display_analysis_text(analysis: &AnalysisData) {
     if analysis.rows.is_empty() {
         println!("No analysis data found");

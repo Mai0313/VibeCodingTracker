@@ -62,7 +62,7 @@ fn first_run_leaves_existing_version_json_untouched() {
 
     assert!(version_json.exists(), "version.json must be left in place");
     assert_eq!(fs::read_to_string(&version_json).unwrap(), original);
-    // The settings file must not carry any update/version bookkeeping.
+    // The self-update record's fields must not leak into the settings file.
     let text = fs::read_to_string(dir.join("config.toml")).unwrap();
     assert!(!text.contains("[update]"));
     assert!(!text.contains("latest_version"));

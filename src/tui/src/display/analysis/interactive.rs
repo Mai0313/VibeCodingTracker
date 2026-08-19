@@ -442,9 +442,9 @@ fn render_analysis_frame_with_status<B: Backend<Error: Send + Sync + 'static>>(
         let band_height = full_band.unwrap_or(1);
         let chunks = frame_layout(area, band_height);
 
-        // Numeric columns, ordered by how readily they may be dropped when the
-        // pane is narrow. Line counts are the headline metric, so the per-tool
-        // call counts go first.
+        // Numeric columns in display order; `drop_rank` decides which go when
+        // the pane is narrow. Line counts are the headline metric, so the
+        // per-tool call counts go first.
         const NUMERIC: [ColumnSpec; 8] = [
             ColumnSpec {
                 header: "Edit Lines",
@@ -771,8 +771,7 @@ mod tests {
             edit_lines: 1,
             ..Default::default()
         }];
-        // Five providers plus the overall row = 6 band rows, which needs 10 for
-        // the band and 8 beneath it: more than this terminal has.
+        // Five providers plus the overall row make up those 6 band rows.
         let mut provider_totals = AnalysisProviderTotals::default();
         for stats in [
             &mut provider_totals.claude,

@@ -1,7 +1,10 @@
-//! comfy-table and ratatui cell / table builders shared across both views.
+//! Frame layout, plus the comfy-table and ratatui cell / table builders shared
+//! across both views.
 //!
-//! These are pure widget constructors with no I/O; they encode the common
-//! styling so the static-table and TUI renderers stay visually consistent.
+//! The builders are pure widget constructors that encode the common styling so
+//! the static-table and TUI renderers stay visually consistent; the summary
+//! bar's process-metrics helpers are the one exception, sampling this process's
+//! own CPU and memory.
 //! A recurring convention: the leading label column(s) are left-aligned and
 //! every trailing (numeric) column is right-aligned. The comfy-table helpers
 //! left-align the first two (index 0 and 1); the ratatui `styled_row` helper
@@ -196,10 +199,10 @@ pub const REPO_URL: &str = "https://github.com/Mai0313/VibeCodingTracker";
 /// Builds the single-line key-hint footer (navigation + the GitHub repo link).
 ///
 /// Everything is on one line to save vertical space. `extra` inserts
-/// view-specific `(key, label)` hints just before `r refresh` — the usage view
-/// passes its `m` / `p` / `Q` toggles; other views pass an empty slice. The repo
-/// label is drawn as plain (underlined) text here; a terminal hyperlink is
-/// layered on afterward by
+/// view-specific `(key, label)` hints just before `r refresh`. This is the
+/// no-status shorthand for [`create_controls_with_status`]. The repo label is
+/// drawn as plain (underlined) text here; a terminal hyperlink is layered on
+/// afterward by
 /// [`overlay_repo_hyperlink`](super::tui::overlay_repo_hyperlink).
 pub fn create_controls(extra: &[(&str, &str)], width: u16) -> Paragraph<'static> {
     create_controls_with_status(extra, None, width)
@@ -220,7 +223,7 @@ pub fn create_controls_with_status(
     let dim = Style::default().fg(RatatuiColor::DarkGray);
     let available = width as usize;
 
-    // Widths of the parts that are always drawn.
+    // Width of every part; which of them survive is decided below.
     let core = seg_width("↑/↓ scroll  r refresh  q quit");
     let repo = seg_width("  |  ") + seg_width(REPO_LABEL);
     let status_w = status.map_or(0, |s| seg_width("  |  ") + seg_width(s));
@@ -349,9 +352,10 @@ pub struct ColumnSpec {
 /// Chooses which numeric columns survive in `inner` content columns.
 ///
 /// Returns the kept columns in their original order together with the number
-/// dropped, which the caller shows in the table's title. Dropping whole columns
-/// from the low-value end keeps the model name readable; the previous behaviour
-/// gave every numeric column its full width and squeezed the name to nothing.
+/// dropped, which the caller shows in the table's title. `name_min_w` cells are
+/// reserved for the model-name column before any numeric column is fitted, so a
+/// pane too narrow for even one of them keeps none rather than squeezing the
+/// name.
 pub fn fit_columns(specs: &[ColumnSpec], inner: u16, name_min_w: u16) -> (Vec<usize>, usize) {
     let mut kept: Vec<usize> = (0..specs.len()).collect();
     // Each column is preceded by one space of column spacing.

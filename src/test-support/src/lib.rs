@@ -1,14 +1,11 @@
 //! Shared helpers for the integration test binaries.
 //!
-//! The whole point of this module is hermetic isolation **without** mutating
+//! The whole point of these helpers is hermetic isolation **without** mutating
 //! process-global environment: [`TempHome`] builds a [`HelperPaths`] rooted at a
 //! `TempDir` via [`resolve_paths_from_home`], so a test can drop fixture session
 //! files into a fake home and call the `*_from_paths` aggregation entry points
 //! directly. No `HOME`/`XDG_*`/`VCT_OFFLINE` is ever touched, so every test runs
 //! in parallel and behaves identically locally and in CI.
-//!
-//! Each integration test binary compiles this module independently and uses only
-//! a subset of the helpers, so `dead_code` is expected and allowed.
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
@@ -67,9 +64,10 @@ pub fn append_cursor_json_blob(path: &Path, id: &str) {
 /// A temporary fake home directory plus the [`HelperPaths`] rooted inside it.
 ///
 /// Every provider directory (`.claude`, `.codex`, `.gemini`, `.copilot`,
-/// `.cursor`, `.grok`, `.dsh`, `.local/share/opencode`, `.config/cursor`) and the `~/.vct` cache
-/// resolve under `dir`, matching exactly what production would compute for a
-/// user whose `HOME` was this directory.
+/// `.cursor`, `.grok`, `.dsh`, `.hermes`, `.local/share/opencode`,
+/// `.config/cursor`) and the `~/.vct` cache resolve under `dir`, matching
+/// exactly what production would compute for a user whose `HOME` was this
+/// directory.
 pub struct TempHome {
     pub dir: TempDir,
     pub paths: HelperPaths,
