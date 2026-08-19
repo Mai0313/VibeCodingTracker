@@ -333,9 +333,6 @@ pub struct WhamCredits {
     /// Approximate `[low, high]` local (CLI) messages the credits still buy.
     #[serde(default)]
     pub approx_local_messages: Option<Vec<i64>>,
-    /// Approximate `[low, high]` cloud-task messages the credits still buy.
-    #[serde(default)]
-    pub approx_cloud_messages: Option<Vec<i64>>,
 }
 
 /// Deserializes a JSON string or number into `Option<String>`.

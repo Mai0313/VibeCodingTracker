@@ -142,6 +142,9 @@ where
                 }
             }
             "session.model_change" => {
+                // A session may switch models at any point, so the streamed
+                // `assistant.message` tokens below are attributed to whichever
+                // model was current when they arrived.
                 let new_model = event
                     .data
                     .get("newModel")
