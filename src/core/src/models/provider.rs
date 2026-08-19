@@ -62,17 +62,15 @@ impl Provider {
     pub const fn from_model_name(model: &str) -> Self {
         let bytes = model.as_bytes();
 
-        if bytes.len() >= 6 {
-            // Check for "claude" prefix
-            if bytes[0] == b'c'
-                && bytes[1] == b'l'
-                && bytes[2] == b'a'
-                && bytes[3] == b'u'
-                && bytes[4] == b'd'
-                && bytes[5] == b'e'
-            {
-                return Self::ClaudeCode;
-            }
+        if bytes.len() >= 6
+            && bytes[0] == b'c'
+            && bytes[1] == b'l'
+            && bytes[2] == b'a'
+            && bytes[3] == b'u'
+            && bytes[4] == b'd'
+            && bytes[5] == b'e'
+        {
+            return Self::ClaudeCode;
         }
 
         if bytes.len() >= 7
