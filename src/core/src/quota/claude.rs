@@ -4,7 +4,7 @@
 //! official usage API (`GET /api/oauth/usage`), and — when the token is
 //! near-expiry or rejected — refreshes it against the Claude token endpoint and
 //! writes the rotated token back, preserving every other field. A refreshed
-//! access token is cached in memory so the 10s worker reuses it rather than
+//! access token is cached in memory so the worker reuses it rather than
 //! refreshing each tick. A refresh failure arms a cooldown (so a revoked token
 //! cannot spin the endpoint) and surfaces a `claude auth login` hint.
 
@@ -43,7 +43,8 @@ const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const CLAUDE_TOKEN_URL_PRIMARY: &str = "https://platform.claude.com/v1/oauth/token";
 /// Legacy token endpoint host (fallback on 404/405 from the primary).
 const CLAUDE_TOKEN_URL_LEGACY: &str = "https://console.anthropic.com/v1/oauth/token";
-/// Login hint shown when refresh fails.
+/// Login hint surfaced when the stored credentials cannot be used (refresh
+/// failed, or there is no access token at all).
 pub const CLAUDE_LOGIN_HINT: &str = "run: claude auth login";
 
 /// Builds Claude Code's request User-Agent, e.g. `claude-cli/2.1.201 (external, cli)`.
@@ -66,10 +67,8 @@ fn claude_ua() -> &'static str {
     .as_str()
 }
 
-/// The production token endpoints to try, in order (primary then legacy).
-///
-/// Tests inject their own list via the `token_urls` parameter of
-/// [`refresh_claude`] rather than mutating the environment.
+/// The production token endpoints to try, in order (primary then legacy); tests
+/// pass their own list to [`refresh_claude`] instead.
 fn claude_token_urls_default() -> Vec<String> {
     vec![
         CLAUDE_TOKEN_URL_PRIMARY.to_string(),
@@ -91,7 +90,7 @@ fn parse_claude_oauth(body: &str) -> Option<ClaudeOauth> {
     creds.claude_ai_oauth
 }
 
-/// Fetches the raw `/api/oauth/usage` response for `vct fetch claude`.
+/// Fetches the raw `/api/oauth/usage` response for `vct quota claude`.
 ///
 /// Uses the stored access token verbatim (no refresh, no file writes) and
 /// returns `(status_code, body)`. A non-2xx status is left for the caller to
@@ -193,7 +192,6 @@ pub fn map_claude_usage(body: &str, now: i64) -> Result<ClaudeQuotaSnapshot> {
         .and_then(|m| m.display_name.as_deref())
         .filter(|name| !name.is_empty())
         .map(|name| name.chars().take(6).collect::<String>());
-    // Only surface the window when we also have a model label to name it.
     let scoped_weekly = scoped
         .filter(|_| scoped_label.is_some())
         .map(|l| QuotaWindow {
@@ -246,7 +244,7 @@ enum FetchResult {
     Transient,
 }
 
-/// Calls the usage API at `usage_url` with `token`.
+/// Calls the usage API once and classifies the response for the worker.
 fn fetch_claude_usage(client: &Client, token: &str, now: i64, usage_url: &str) -> FetchResult {
     let resp = match client
         .get(usage_url)
@@ -269,7 +267,7 @@ fn fetch_claude_usage(client: &Client, token: &str, now: i64, usage_url: &str) -
         return FetchResult::Unauthorized;
     }
     if !status.is_success() {
-        // 403 and friends are not treated as "needs login" (S9).
+        // 403 and friends are not treated as "needs login".
         log::warn!("claude quota fetch: HTTP {status}");
         return FetchResult::Transient;
     }
@@ -290,9 +288,10 @@ fn fetch_claude_usage(client: &Client, token: &str, now: i64, usage_url: &str) -
 
 /// Refreshes the Claude token and writes it back. Returns `(access, expires_ms)`.
 ///
-/// Tries the primary host first, falling back to the legacy host only on
-/// 404/405 (a moved endpoint), never on 400/401 (`invalid_grant`, meaning the
-/// refresh token is stale — likely rotated by a running Claude Code).
+/// Tries the primary host first and falls back to the legacy host on a 404/405
+/// (a moved endpoint) or a request that could not be sent, never on 400/401
+/// (`invalid_grant`, meaning the refresh token is stale — likely rotated by a
+/// running Claude Code).
 fn refresh_claude(
     client: &Client,
     path: &Path,
@@ -475,9 +474,6 @@ impl ClaudeState {
         now_secs: i64,
         now_ms: i64,
     ) -> EnsureToken {
-        // In-memory token still valid AND the credential file unchanged since we
-        // cached it? A re-login / account switch rewrites `.credentials.json`, so
-        // the cached token must be dropped even while it is unexpired.
         if let Some((tok, exp_ms, cred_mtime)) = &self.token
             && exp_ms - now_ms > EXPIRY_SKEW_SECS * 1000
             && *cred_mtime == file_mtime(path)
@@ -485,10 +481,9 @@ impl ClaudeState {
             return EnsureToken::Token(tok.clone());
         }
 
-        // Distinguish an unreadable/absent file (transient — e.g. an atomic
-        // rewrite by the official CLI) from a present-but-unparseable one (an
-        // auth failure that should nudge re-login, not sit on stale data), the
-        // same split the Cursor/Copilot workers make.
+        // An unreadable/absent file is transient (e.g. an atomic rewrite by the
+        // official CLI); a present-but-unparseable one is an auth failure that
+        // should nudge re-login rather than sit on stale data.
         let body = match std::fs::read_to_string(path) {
             Ok(b) => b,
             Err(_) => return EnsureToken::Transient,

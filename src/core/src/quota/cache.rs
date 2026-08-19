@@ -6,8 +6,8 @@
 //! the panels from here instantly while the background workers refresh them.
 //!
 //! What lands on disk is the already-derived snapshot, so every file is stamped
-//! with the writing build's [`CachedQuota::SCHEMA_VERSION`] and a file carrying
-//! any other version is ignored instead of displayed.
+//! with the writing build's per-provider schema version, and a file carrying any
+//! other version is ignored instead of displayed.
 
 use crate::models::{
     ClaudeQuotaSnapshot, CodexQuotaSnapshot, CopilotQuotaSnapshot, CursorQuotaSnapshot,
@@ -27,10 +27,9 @@ use std::path::PathBuf;
 /// [`Self::SCHEMA_VERSION`] versions how the stored fields are *derived*, not
 /// the JSON shape: the file holds normalized values (a gauge's `used_percent`,
 /// a pre-formatted money amount), so a build that computes one of them
-/// differently must not paint the previous build's numbers. "The next fetch
-/// replaces them" is no bound — a transient failure keeps the last-known-good
-/// snapshot indefinitely, so an offline or rate-limited upgrade would sit on
-/// them.
+/// differently must not paint the previous build's numbers. A transient failure
+/// keeps the last-known-good snapshot indefinitely, so an offline or
+/// rate-limited upgrade would otherwise sit on them until its first success.
 ///
 /// Bump a provider's version in the same change that alters how any of its
 /// snapshot fields is derived. A file whose version differs — including a

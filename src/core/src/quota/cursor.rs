@@ -33,9 +33,9 @@ pub const CURSOR_LOGIN_HINT: &str = "run: cursor-agent login";
 
 /// Builds the Cursor CLI's request User-Agent, e.g. `cursor-agent/2026.07.07`.
 ///
-/// The version is detected from the installed CLI (see
-/// [`crate::quota::http::detect_cli_version`]) so the UA tracks the real client
-/// rather than drifting from a hardcoded constant.
+/// Resolved once per process. [`crate::quota::http::detect_cli_version`] probes
+/// the installed CLI only when the binary has enabled probing, so an embedder
+/// (and the whole test suite) gets `CURSOR_FALLBACK_VERSION`.
 pub(crate) fn cursor_ua() -> &'static str {
     static UA: OnceLock<String> = OnceLock::new();
     UA.get_or_init(|| {
@@ -204,7 +204,7 @@ fn fetch_cursor_usage(client: &Client, cookie: &str, now: i64, usage_url: &str) 
     }
 }
 
-/// Fetches the raw `/api/usage-summary` response for `vct fetch cursor`.
+/// Fetches the raw `/api/usage-summary` response for `vct quota cursor`.
 ///
 /// Synthesizes the session cookie from the stored JWT and sends one request. It
 /// does **not** check the JWT `exp` (an expired token just 401s) and never
@@ -418,7 +418,7 @@ mod tests {
 
     #[test]
     fn out_of_range_percentages_are_clamped() {
-        // The clamp is the whole mapping now, so pin both arms: a gauge outside
+        // The clamp is the whole mapping, so pin both arms: a gauge outside
         // 0..=100 would break the bar width and the limit comparison.
         let body = r#"{ "individualUsage": { "plan": { "totalPercentUsed": 150, "autoPercentUsed": -5 } } }"#;
         let snap = map_cursor_usage(body, 1).unwrap();
