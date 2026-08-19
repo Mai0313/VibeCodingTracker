@@ -12,11 +12,13 @@ use serde_json::{Value, json};
 
 /// Accumulates the token fields of `new` into `existing` in place.
 ///
-/// Detects the on-disk usage shape from a marker key and merges accordingly:
-/// the flat provider shape (keyed by `input_tokens`, including the
-/// nested `cache_creation` breakdown) or the Codex shape (keyed by
-/// `total_token_usage`). Values that are not both JSON objects, or that match
-/// neither shape, are left untouched.
+/// Dispatches on `existing`'s marker key: the flat provider shape
+/// (`input_tokens`, plus the nested `cache_creation`, `server_tool_use` and
+/// `above_tier` objects) or the Codex shape (`total_token_usage`, plus
+/// `above_tier`). When the two sides carry *different* shapes, both are
+/// normalized through [`extract_token_counts`] and `existing` is replaced
+/// wholesale by the flat sum. Values that are not both JSON objects, or that
+/// match neither shape, are left untouched.
 pub(crate) fn merge_usage_values(existing: &mut Value, new: &Value) {
     let (Some(existing_ro), Some(new_ro)) = (existing.as_object(), new.as_object()) else {
         return;
@@ -26,12 +28,10 @@ pub(crate) fn merge_usage_values(existing: &mut Value, new: &Value) {
     let new_flat = new_ro.contains_key("input_tokens");
     let new_codex = new_ro.contains_key("total_token_usage");
 
-    // Mixed shapes — e.g. a Codex `total_token_usage` row and a Cursor / Copilot
-    // flat `input_tokens` row that share a model name like `gpt-5`. The
-    // shape-specific branches below only accumulate when both sides carry the
-    // *same* shape, so a mismatch would silently drop the other side's tokens.
-    // Normalize both to disjoint counts and rewrite `existing` as a flat value
-    // that keeps every bucket (and round-trips through `extract_token_counts`).
+    // Mixed shapes — e.g. a Codex `total_token_usage` row and a Cursor /
+    // Copilot flat `input_tokens` row that share a model name like `gpt-5`.
+    // The branches below only accumulate when both sides carry the *same*
+    // shape, so a mismatch would silently drop the other side's tokens.
     if (existing_flat && new_codex) || (existing_codex && new_flat) {
         let merged = add_token_counts(&extract_token_counts(existing), &extract_token_counts(new));
         *existing = token_counts_to_flat_value(&merged);
@@ -39,7 +39,6 @@ pub(crate) fn merge_usage_values(existing: &mut Value, new: &Value) {
     }
 
     if let (Some(existing_obj), Some(new_obj)) = (existing.as_object_mut(), new.as_object()) {
-        // Handle the flat provider format (has input_tokens)
         if existing_obj.contains_key("input_tokens") {
             accumulate_i64_fields(
                 existing_obj,
@@ -49,12 +48,10 @@ pub(crate) fn merge_usage_values(existing: &mut Value, new: &Value) {
                     "cache_creation_input_tokens",
                     "cache_read_input_tokens",
                     "output_tokens",
-                    // Gemini `thoughts_tokens` and Copilot's normalised
-                    // `reasoning_output_tokens` both carry the same
-                    // reasoning-budget semantics and must accumulate so
-                    // cross-provider aggregation in `usage` doesn't drop
-                    // the thinking-time tokens the model was actually
-                    // billed for.
+                    // Gemini's `thoughts_tokens` and the other flat providers'
+                    // `reasoning_output_tokens` carry the same reasoning-budget
+                    // semantics, so both accumulate; dropping either loses
+                    // thinking-time tokens the model was billed for.
                     "thoughts_tokens",
                     "reasoning_output_tokens",
                     "tool_tokens",
@@ -77,7 +74,8 @@ pub(crate) fn merge_usage_values(existing: &mut Value, new: &Value) {
                 accumulate_nested_object(existing_obj, "above_tier", new_above);
             }
         }
-        // Handle Codex format (has total_token_usage)
+        // Codex keeps its buckets nested, so the whole inner object accumulates
+        // rather than a named field list.
         else if existing_obj.contains_key("total_token_usage") {
             if let Some(new_total) = new_obj.get("total_token_usage").and_then(|v| v.as_object()) {
                 accumulate_nested_object(existing_obj, "total_token_usage", new_total);
@@ -130,8 +128,8 @@ pub fn normalize_usage_value(usage: &Value) -> Value {
 /// Serializes normalized counts back into the flat usage shape.
 ///
 /// The key set is exactly what [`extract_token_counts`] reads for a flat value,
-/// so the result round-trips: re-extracting it yields the same counts. `total`
-/// is intentionally omitted (the extractor recomputes it as the bucket sum).
+/// so every bucket round-trips. `total` is intentionally omitted: the extractor
+/// recomputes it as the bucket sum.
 fn token_counts_to_flat_value(c: &TokenCounts) -> Value {
     let mut obj = serde_json::Map::new();
     obj.insert("input_tokens".into(), json!(c.input_tokens));

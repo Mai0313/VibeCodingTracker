@@ -1,6 +1,7 @@
 //! Leaf helpers shared across the crate: directory walking, JSON/JSONL file
 //! IO, number/date formatting, git remote lookup, glibc heap tuning, path
-//! resolution, ISO timestamp parsing, and token-count extraction.
+//! resolution, RFC 3339 timestamps, and token-count extraction, merging, and
+//! per-provider usage folding.
 //!
 //! The most frequently used items are re-exported at this module's root so
 //! callers can write `utils::format_number` instead of reaching into the
@@ -17,7 +18,6 @@ pub mod token_extractor;
 pub mod token_merge;
 pub mod usage_processor;
 
-// Public API exports (commonly used across modules)
 pub use directory::{
     COPILOT_SESSION_MAX_DEPTH, DSH_SESSION_MAX_DEPTH, GROK_SESSION_MAX_DEPTH,
     collect_files_with_dates, collect_files_with_max_depth, is_claude_session_file,

@@ -2,21 +2,16 @@ use serde_json::Value;
 
 /// Normalized token counts extracted from provider-specific usage data.
 ///
-/// `cache_creation` is the total across TTL variants. For Claude Code, the
-/// `cache_creation_5m` / `cache_creation_1h` split reflects Anthropic's two
-/// cache TTL tiers (5 minutes default, 1 hour extended — the latter is ~60%
-/// more expensive per write). Providers that don't split TTL (Codex, Gemini,
-/// older Claude Code records) get all cache_creation tokens into the 5m bucket.
+/// `cache_creation == cache_creation_5m + cache_creation_1h` always holds.
+/// The split mirrors Anthropic's two cache TTL tiers, which bill at different
+/// rates; providers that publish no split (Codex, Gemini, older Claude Code
+/// records) put every cache-write token in the 5m bucket.
 ///
-/// Invariant: `cache_creation == cache_creation_5m + cache_creation_1h` when
-/// the split data is available.
-///
-/// `reasoning_tokens` carries the model's "thinking" budget emitted as part
-/// of the assistant turn but billed separately from user-visible output.
-/// Populated by Gemini (`thoughts_tokens`), Codex
-/// (`reasoning_output_tokens`), and Copilot (`reasoning_output_tokens`
-/// after `session::copilot::parse_copilot_events` normalises it). Claude
-/// has no equivalent and leaves this at 0.
+/// `reasoning_tokens` carries the model's "thinking" budget, billed separately
+/// from user-visible output. Codex publishes it inside `total_token_usage`,
+/// Gemini as `thoughts_tokens`, and Copilot / OpenCode / Hermes / DeepSeek
+/// Harness as a flat `reasoning_output_tokens`. Claude, Cursor and Grok report
+/// no reasoning at all and leave this at 0.
 #[derive(Debug, Default)]
 pub struct TokenCounts {
     /// Non-cached prompt tokens (cached reads are excluded; see `cache_read`).
@@ -37,7 +32,9 @@ pub struct TokenCounts {
     /// per query (not per token) at the model's web-search rate, so it is
     /// tracked here but excluded from `total`.
     pub web_search_requests: i64,
-    /// Sum of the billed buckets used for cost and display.
+    /// Token total shown in the UI and used by [`TokenCounts::has_activity`].
+    /// Includes provider `tool_tokens`, which have no price bucket, so
+    /// `calculate_cost` bills the individual buckets rather than this.
     pub total: i64,
     /// Slice of `input_tokens` from requests whose own prompt context
     /// exceeded the model's context-tier threshold (see the `above_tier`
@@ -58,11 +55,11 @@ pub struct TokenCounts {
 }
 
 impl TokenCounts {
-    /// Whether any billed bucket carries a nonzero count.
+    /// Whether this usage did anything; the one test for whether a date counts
+    /// as active.
     ///
-    /// The single source of truth for "did this usage do anything" — used to
-    /// decide whether a date counts as active. New buckets added above must be
-    /// reflected here so no activity check silently misses them.
+    /// Covers every field except the `above_*` slices, which are subsets of
+    /// fields already checked. A new bucket must be added here too.
     pub fn has_activity(&self) -> bool {
         self.total != 0
             || self.input_tokens != 0
@@ -76,18 +73,14 @@ impl TokenCounts {
     }
 }
 
-/// Extracts token counts from usage data in any provider format
+/// Extracts token counts from usage data in any provider format.
 ///
-/// Supports two shapes:
-/// - Flat providers: direct fields like `input_tokens`, `output_tokens`
-/// - Codex: Nested `total_token_usage` object with different field names
-///
-/// Reasoning tokens (Gemini `thoughts_tokens`, Codex
-/// `reasoning_output_tokens`, Copilot `reasoning_output_tokens`) are no
-/// longer folded into `output_tokens`. Keeping them separate is what lets
-/// `calculate_cost` bill them at `output_cost_per_reasoning_token` for
-/// providers that publish a distinct reasoning rate (e.g. Gemini 2.5
-/// Flash, Perplexity Sonar Deep Research, dashscope/qwen-turbo).
+/// Handles two shapes: the flat provider fields (`input_tokens`,
+/// `output_tokens`, …), which already arrive disjoint, and Codex's nested
+/// `total_token_usage`, which is normalized to the same convention by
+/// subtracting cache reads out of input and reasoning out of output. Every
+/// bucket of the result is therefore billed exactly once, and reasoning can
+/// take `output_cost_per_reasoning_token` where the model publishes one.
 ///
 /// Returns a normalized [`TokenCounts`]; a non-object `usage` yields the
 /// all-zero default.
@@ -160,12 +153,12 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
             counts.above_cache_creation_1h = field("cache_creation_1h_tokens");
         }
 
-        // Gemini writes reasoning budget as `thoughts_tokens`; the flat
-        // providers (Copilot / OpenCode / Hermes) use `reasoning_output_tokens`.
-        // A single record only carries one of them, but a cross-provider merge
-        // of the same model (e.g. Gemini CLI and Hermes both using `gemini-*`)
-        // keeps both keys, so sum them — an overwrite would drop the other
-        // provider's thinking-time tokens from the merged Output/Total.
+        // Gemini writes reasoning budget as `thoughts_tokens`; the other flat
+        // providers (Copilot / OpenCode / Hermes / DeepSeek Harness) use
+        // `reasoning_output_tokens`. A single record only carries one of them,
+        // but a cross-provider merge of the same model (e.g. Gemini CLI and
+        // Hermes both using `gemini-*`) keeps both keys, so sum them — an
+        // overwrite would drop one provider's thinking-time tokens.
         let thoughts = usage_obj
             .get("thoughts_tokens")
             .and_then(|v| v.as_i64())
@@ -178,12 +171,11 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
 
         // Claude Code records cache_creation split by TTL:
         //   "cache_creation": { ephemeral_5m_input_tokens, ephemeral_1h_input_tokens }
-        // The scalar `cache_creation_input_tokens` is the authoritative total.
-        // Bill the 1h portion from the split and everything else at the default
-        // (5m) TTL, so the two priced buckets always sum to the scalar total.
-        // This matters because merging multi-iteration turns can leave the
-        // scalar larger than the published 5m+1h split (some iterations report
-        // only the scalar); billing 5m+1h verbatim would drop the remainder.
+        // Take the 1h portion from the split and bill everything else at the
+        // default (5m) TTL, so the two priced buckets always sum to the total.
+        // Billing 5m+1h verbatim would drop tokens: merging multi-iteration
+        // turns can leave the scalar larger than the published split (some
+        // iterations report only the scalar).
         if let Some(cc_split) = usage_obj.get("cache_creation").and_then(|v| v.as_object()) {
             let ephemeral_5m = cc_split
                 .get("ephemeral_5m_input_tokens")
@@ -209,19 +201,13 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
             .get("total_token_usage")
             .and_then(|v| v.as_object())
         {
-            // Codex follows OpenAI's convention: `input_tokens` is the
-            // full prompt size and `cached_input_tokens` is the subset
-            // that hit the prompt cache. LiteLLM, in contrast, prices
-            // non-cached input (`input_cost_per_token`) and cached reads
-            // (`cache_read_input_token_cost`) *separately*. Forwarding
-            // Codex's raw `input_tokens` to `calculate_cost` alongside
-            // the same `cached_input_tokens` would charge every cached
-            // token twice — once at the full input rate, then again at
-            // the cache read rate — inflating Codex cost reports by
-            // ~130% on heavy-cache sessions.
-            //
-            // Subtract cached from raw input so each token is billed
-            // exactly once, at the right rate.
+            // Codex follows OpenAI's convention: `input_tokens` is the full
+            // prompt size and `cached_input_tokens` is the subset that hit the
+            // prompt cache. LiteLLM prices non-cached input
+            // (`input_cost_per_token`) and cached reads
+            // (`cache_read_input_token_cost`) *separately*, so subtract cached
+            // out of raw input — forwarding both verbatim would charge every
+            // cached token twice.
             let raw_input = total_usage
                 .get("input_tokens")
                 .and_then(|v| v.as_i64())
@@ -234,8 +220,6 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
             counts.cache_read = cached;
 
             if let Some(output) = total_usage.get("output_tokens").and_then(|v| v.as_i64()) {
-                // Codex already accumulates across turns, so replace instead
-                // of adding — the value is the running total for the session.
                 counts.output_tokens = output;
             }
             if let Some(reasoning) = total_usage
@@ -245,14 +229,10 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
                 counts.reasoning_tokens = reasoning;
             }
             // OpenAI convention: `output_tokens` (completion) already INCLUDES
-            // `reasoning_output_tokens`. Split them into disjoint buckets so
-            // each token is billed exactly once — visible output at the output
-            // rate, reasoning at its dedicated rate (or the output fallback).
-            // Without this subtraction reasoning is billed twice: once inside
-            // output and again as the separate reasoning bucket. Verified
-            // across 21,113 real Codex token_count events: `total_tokens ==
-            // input + output` holds for every one and `reasoning > output`
-            // never occurs, so reasoning is always a subset of output.
+            // `reasoning_output_tokens`. Subtract it back out so each token is
+            // billed once — visible output at the output rate, reasoning at its
+            // dedicated rate (or the output fallback). Without this, reasoning
+            // is billed twice: once inside output and again as its own bucket.
             counts.output_tokens = (counts.output_tokens - counts.reasoning_tokens).max(0);
             if let Some(total) = total_usage.get("total_tokens").and_then(|v| v.as_i64()) {
                 // `total_tokens == input (incl. cached) + output`, and output
@@ -263,11 +243,11 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
             }
         }
 
-        // Flat providers may publish tool-only tokens that have no separate
-        // LiteLLM billing bucket. Keep them in the displayed/activity total
-        // without assigning them an input or output price. Prefer a larger
-        // provider-published total when present so these sessions do not look
-        // inactive merely because every priced bucket is zero.
+        // Flat providers may publish tool-only tokens with no LiteLLM billing
+        // bucket. Fold them into the displayed/activity total without giving
+        // them an input or output price, and take the larger of that sum and
+        // any provider-published `total_tokens`, so a session whose priced
+        // buckets are all zero does not read as inactive.
         let tool_tokens = usage_obj
             .get("tool_tokens")
             .and_then(|value| value.as_i64())
@@ -443,9 +423,8 @@ mod tests {
 
     #[test]
     fn codex_cached_exceeding_input_clamps_to_zero() {
-        // Defensive: never emit a negative `input_tokens` even if the
-        // provider ever misreports cached > input. Better to undercount
-        // than to panic via integer overflow downstream.
+        // Defensive: never emit a negative `input_tokens` even if the provider
+        // ever misreports cached > input.
         let usage = json!({
             "total_token_usage": {
                 "input_tokens": 100,
@@ -496,10 +475,9 @@ mod tests {
 
     #[test]
     fn codex_reasoning_is_split_out_of_output() {
-        // Mimics a real Codex `event_msg` record mid-session. Per OpenAI's
-        // convention `output_tokens` already includes `reasoning_output_tokens`,
-        // so the extractor subtracts reasoning out of output to keep the two
-        // buckets disjoint (each token billed exactly once).
+        // Mimics a real Codex `event_msg` record mid-session: `output_tokens`
+        // already includes `reasoning_output_tokens`, so the extractor
+        // subtracts reasoning out of output to keep the two buckets disjoint.
         let usage = json!({
             "total_token_usage": {
                 "input_tokens": 5_645,

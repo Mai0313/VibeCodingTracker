@@ -1,13 +1,15 @@
-//! Timestamp parsing helpers for the ISO-8601 / RFC 3339 strings that the
-//! provider session logs embed in each record.
+//! RFC 3339 timestamp helpers: parsing the ISO-8601 strings that provider
+//! session logs and quota responses carry, and formatting the UTC stamps vct
+//! writes back into credential and cache files.
 
 use chrono::{DateTime, SecondsFormat, Utc};
 
 /// Current UTC time as RFC3339 with nanoseconds and a `Z` suffix
 /// (e.g. `2026-07-07T05:34:50.563606999Z`).
 ///
-/// Matches the format Codex writes for `auth.json`'s `last_refresh` and the
-/// stamp the quota version caches / self `version.json` record use.
+/// Matches the format Codex writes for `auth.json`'s `last_refresh`, so a
+/// refreshed token can be written back in that CLI's own shape; the caches and
+/// log lines vct writes itself reuse the same stamp.
 pub fn now_rfc3339_utc_nanos() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
@@ -46,12 +48,10 @@ pub fn parse_iso_timestamp(ts: &str) -> i64 {
         return 0;
     }
 
-    // Try RFC3339 first (most common format)
     if let Ok(dt) = DateTime::parse_from_rfc3339(ts) {
         return dt.timestamp_millis();
     }
 
-    // Try other formats
     let formats = [
         "%Y-%m-%dT%H:%M:%S%.3fZ",
         "%Y-%m-%dT%H:%M:%S%.fZ",
@@ -88,19 +88,15 @@ mod tests {
 
     #[test]
     fn test_parse_iso_timestamp_rfc3339() {
-        // Test parsing RFC3339 format (most common)
         let ts = "2024-01-15T10:30:45.123Z";
         let result = parse_iso_timestamp(ts);
         assert!(result > 0);
-
-        // Should parse to a valid timestamp (2024)
         assert!(result > 1_700_000_000_000); // After 2023
         assert!(result < 1_800_000_000_000); // Before 2027
     }
 
     #[test]
     fn test_parse_iso_timestamp_with_timezone() {
-        // Test parsing with timezone offset
         let ts = "2024-01-15T10:30:45.123+08:00";
         let result = parse_iso_timestamp(ts);
         assert!(result > 0);
@@ -108,7 +104,6 @@ mod tests {
 
     #[test]
     fn test_parse_iso_timestamp_no_millis() {
-        // Test parsing without milliseconds
         let ts = "2024-01-15T10:30:45Z";
         let result = parse_iso_timestamp(ts);
         assert!(result > 0);
@@ -116,17 +111,14 @@ mod tests {
 
     #[test]
     fn test_parse_iso_timestamp_fallback_formats() {
-        // Test fallback format with milliseconds
         let ts1 = "2024-01-15T10:30:45.123Z";
         let result1 = parse_iso_timestamp(ts1);
         assert!(result1 > 0);
 
-        // Test fallback format with fractional seconds
         let ts2 = "2024-01-15T10:30:45.123456Z";
         let result2 = parse_iso_timestamp(ts2);
         assert!(result2 > 0);
 
-        // Test fallback format without fractional seconds
         let ts3 = "2024-01-15T10:30:45Z";
         let result3 = parse_iso_timestamp(ts3);
         assert!(result3 > 0);
@@ -134,14 +126,12 @@ mod tests {
 
     #[test]
     fn test_parse_iso_timestamp_empty() {
-        // Test parsing empty string
         let result = parse_iso_timestamp("");
         assert_eq!(result, 0);
     }
 
     #[test]
     fn test_parse_iso_timestamp_invalid() {
-        // Test parsing invalid format
         let result = parse_iso_timestamp("not a timestamp");
         assert_eq!(result, 0);
 
@@ -154,7 +144,6 @@ mod tests {
 
     #[test]
     fn test_parse_iso_timestamp_different_years() {
-        // Test different years to ensure parsing is consistent
         let ts_2020 = "2020-06-15T12:00:00Z";
         let ts_2024 = "2024-06-15T12:00:00Z";
 
@@ -168,7 +157,6 @@ mod tests {
 
     #[test]
     fn test_parse_iso_timestamp_milliseconds_precision() {
-        // Test that milliseconds are preserved
         let ts1 = "2024-01-15T10:30:45.000Z";
         let ts2 = "2024-01-15T10:30:45.999Z";
 
@@ -184,7 +172,6 @@ mod tests {
 
     #[test]
     fn test_parse_iso_timestamp_same_time() {
-        // Test parsing the same timestamp twice
         let ts = "2024-01-15T10:30:45.123Z";
         let result1 = parse_iso_timestamp(ts);
         let result2 = parse_iso_timestamp(ts);
@@ -194,8 +181,6 @@ mod tests {
 
     #[test]
     fn test_parse_iso_timestamp_edge_cases() {
-        // Test edge cases
-
         // Beginning of year
         let ts1 = "2024-01-01T00:00:00Z";
         let result1 = parse_iso_timestamp(ts1);
@@ -215,7 +200,6 @@ mod tests {
 
     #[test]
     fn test_parse_iso_timestamp_negative_timezone() {
-        // Test parsing with negative timezone offset
         let ts = "2024-01-15T10:30:45.123-05:00";
         let result = parse_iso_timestamp(ts);
         assert!(result > 0);
@@ -223,7 +207,6 @@ mod tests {
 
     #[test]
     fn test_parse_iso_timestamp_midnight() {
-        // Test midnight timestamps
         let ts = "2024-01-15T00:00:00.000Z";
         let result = parse_iso_timestamp(ts);
         assert!(result > 0);
@@ -231,7 +214,6 @@ mod tests {
 
     #[test]
     fn test_parse_iso_timestamp_noon() {
-        // Test noon timestamps
         let ts = "2024-01-15T12:00:00.000Z";
         let result = parse_iso_timestamp(ts);
         assert!(result > 0);
@@ -256,7 +238,6 @@ mod tests {
 
     #[test]
     fn test_parse_iso_timestamp_ordering() {
-        // Test that timestamps maintain proper ordering
         let timestamps = [
             "2024-01-15T10:00:00Z",
             "2024-01-15T11:00:00Z",

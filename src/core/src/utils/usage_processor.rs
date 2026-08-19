@@ -157,7 +157,6 @@ pub fn process_claude_usage(
     usage: &Value,
     above_tier: bool,
 ) {
-    // Skip synthetic models
     if model.contains("<synthetic>") {
         return;
     }
@@ -167,7 +166,6 @@ pub fn process_claude_usage(
         None => return,
     };
 
-    // Get or create usage entry
     let existing = conversation_usage
         .entry(model.to_string())
         .or_insert_with(|| {
@@ -185,7 +183,6 @@ pub fn process_claude_usage(
         return;
     };
 
-    // Accumulate numeric token fields
     accumulate_i64_fields(
         existing_obj,
         usage_obj,
@@ -197,19 +194,16 @@ pub fn process_claude_usage(
         ],
     );
 
-    // Handle service_tier
     if let Some(service_tier) = usage_obj.get("service_tier").and_then(|v| v.as_str()) {
         existing_obj.insert("service_tier".to_string(), service_tier.into());
     }
 
-    // Handle cache_creation nested object
     if let Some(cache_creation) = usage_obj.get("cache_creation").and_then(|v| v.as_object()) {
         accumulate_nested_object(existing_obj, "cache_creation", cache_creation);
     }
 
-    // Handle server_tool_use nested object (web_search_requests /
-    // web_fetch_requests). Accumulated so per-query web-search billing sees
-    // the session total.
+    // Accumulate server_tool_use (web_search_requests / web_fetch_requests) so
+    // per-query web-search billing sees the session total.
     if let Some(server_tool_use) = usage_obj.get("server_tool_use").and_then(|v| v.as_object()) {
         accumulate_nested_object(existing_obj, "server_tool_use", server_tool_use);
     }
@@ -217,9 +211,10 @@ pub fn process_claude_usage(
     if above_tier {
         let field = |key: &str| usage_obj.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
         let scalar_cc = field("cache_creation_input_tokens");
-        // Mirror `extract_token_counts`: the scalar total is authoritative, the
-        // 1h portion comes from the split, and the remainder bills at 5m so no
-        // cache-creation token is dropped from the above-tier slice either.
+        // Mirror `extract_token_counts`: the total is the larger of the scalar
+        // and the split sum, the 1h portion comes from the split, and the
+        // remainder bills at 5m so no cache-creation token is dropped from the
+        // above-tier slice either.
         let cc_1h = usage_obj
             .get("cache_creation")
             .and_then(|v| v.as_object())
@@ -343,7 +338,6 @@ pub fn process_codex_usage(
     info: &Value,
     above_tier: bool,
 ) {
-    // Skip synthetic models
     if model.contains("<synthetic>") {
         return;
     }
@@ -384,12 +378,10 @@ pub fn process_codex_usage(
         .accumulate_into(existing_obj);
     }
 
-    // Process last_token_usage
     if let Some(last_usage) = info_obj.get("last_token_usage") {
         existing_obj.insert("last_token_usage".to_string(), last_usage.clone());
     }
 
-    // Handle model_context_window
     if let Some(context_window) = info_obj.get("model_context_window") {
         existing_obj.insert("model_context_window".to_string(), context_window.clone());
     }
@@ -430,19 +422,11 @@ pub fn process_gemini_usage(
         return;
     };
 
-    // Gemini's `tokens.input` is the full promptTokenCount (mirrors
-    // Google's API), which already includes the cached subset reported
-    // as `tokens.cached`. LiteLLM prices the two independently — if we
-    // accumulated `tokens.input` verbatim, every cached token would be
-    // billed at both `input_cost_per_token` and
-    // `cache_read_input_token_cost`, inflating Gemini cost reports.
-    //
-    // Subtract cached from input before accumulating so downstream
-    // bookkeeping matches the Claude convention (input ⊥ cache_read).
-    // We verify this against the Gemini CLI event stream: every
-    // observed record satisfies `total == input + output + thoughts`
-    // with `cached` *not* added — i.e. cached is already folded into
-    // `input`, not stored alongside it.
+    // `tokens.input` is the full promptTokenCount and already includes
+    // `tokens.cached` (every observed record satisfies `total == input + output
+    // + thoughts`, with cached *not* added on top). LiteLLM prices the two
+    // independently, so accumulating input verbatim would bill every cached
+    // token at both `input_cost_per_token` and `cache_read_input_token_cost`.
     let input_non_cached = (tokens.input - tokens.cached).max(0);
 
     let current_input = existing_obj
@@ -454,7 +438,6 @@ pub fn process_gemini_usage(
         (current_input + input_non_cached).into(),
     );
 
-    // Add cached tokens as cache_read_input_tokens
     let current_cached = existing_obj
         .get("cache_read_input_tokens")
         .and_then(|v| v.as_i64())
@@ -464,7 +447,6 @@ pub fn process_gemini_usage(
         (current_cached + tokens.cached).into(),
     );
 
-    // Add output tokens
     let current_output = existing_obj
         .get("output_tokens")
         .and_then(|v| v.as_i64())
@@ -474,7 +456,6 @@ pub fn process_gemini_usage(
         (current_output + tokens.output).into(),
     );
 
-    // Add thoughts tokens (Gemini-specific)
     let current_thoughts = existing_obj
         .get("thoughts_tokens")
         .and_then(|v| v.as_i64())
@@ -484,7 +465,6 @@ pub fn process_gemini_usage(
         (current_thoughts + tokens.thoughts).into(),
     );
 
-    // Add tool tokens (Gemini-specific)
     let current_tool = existing_obj
         .get("tool_tokens")
         .and_then(|v| v.as_i64())
@@ -494,7 +474,6 @@ pub fn process_gemini_usage(
         (current_tool + tokens.tool).into(),
     );
 
-    // Add total tokens
     let current_total = existing_obj
         .get("total_tokens")
         .and_then(|v| v.as_i64())

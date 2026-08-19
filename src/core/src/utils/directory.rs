@@ -40,9 +40,9 @@ pub(crate) struct FileDiscovery {
 ///
 /// # Errors
 ///
-/// Returns `Result` for caller ergonomics, but the current implementation
-/// never produces an error: a missing directory yields an empty list, and
-/// per-entry traversal or metadata failures are silently skipped.
+/// Returns `Result` for caller ergonomics but never fails: a missing directory
+/// yields an empty list, and per-entry traversal or metadata failures are
+/// dropped by this wrapper.
 pub fn collect_files_with_dates<P, F>(
     dir: P,
     filter_fn: F,
@@ -58,18 +58,16 @@ where
 /// Same as [`collect_files_with_dates`] but with an optional traversal depth cap.
 ///
 /// `max_depth` is counted from the root directory: `None` walks the whole
-/// tree, `Some(2)` only descends two levels. Callers that know the exact
-/// nesting of the file they want (e.g. Copilot's
-/// `session-state/<sessionId>/events.jsonl` is always at depth 2) can use
-/// this to avoid paying the cost of `WalkDir` visiting large sibling
-/// subtrees such as `rewind-snapshots/backups/` that never contain a
-/// match but can hold hundreds of files per session.
+/// tree, `Some(2)` only descends two levels. A caller that knows the exact
+/// nesting of the file it wants uses this to keep `WalkDir` out of large
+/// sibling subtrees that can never match; see [`COPILOT_SESSION_MAX_DEPTH`]
+/// for the shape that motivated it.
 ///
 /// # Errors
 ///
-/// Returns `Result` for caller ergonomics, but the current implementation
-/// never produces an error: a missing directory yields an empty list, and
-/// per-entry traversal or metadata failures are silently skipped.
+/// Returns `Result` for caller ergonomics but never fails: a missing directory
+/// yields an empty list, and per-entry traversal or metadata failures are
+/// dropped by this wrapper.
 pub fn collect_files_with_max_depth<P, F>(
     dir: P,
     filter_fn: F,
@@ -204,17 +202,16 @@ where
 /// a single root behaves exactly as [`collect_files_with_max_depth_diagnostics`]
 /// does. With more than one root, a file name already found in an **earlier**
 /// root is dropped from a later one: Codex archives a session by moving its
-/// rollout log from `sessions/` to `archived_sessions/`, and a scan that races
-/// that move would otherwise fold the same session twice.
+/// rollout log from `sessions/` to `archived_sessions/` under the same
+/// `rollout-<timestamp>-<uuid>.jsonl` name, and a scan that races that move
+/// would otherwise fold the same session twice.
 ///
 /// Declaring more than one root therefore asserts that a repeated file name means
-/// a repeated session. Codex satisfies that: its rollout logs are named
-/// `rollout-<timestamp>-<uuid>.jsonl` and keep that name across the move. Names
-/// are compared only across roots, never within one, because a provider may
-/// legitimately give every session the same file name (Copilot writes
-/// `events.jsonl` for all of them) — such a provider has to stay single-root.
-/// Each drop is logged at debug level so a wrong assertion is diagnosable rather
-/// than a silently missing session.
+/// a repeated session. Names are compared only across roots, never within one,
+/// because a provider may legitimately give every session the same file name
+/// (Copilot writes `events.jsonl` for all of them) — such a provider has to stay
+/// single-root. Each drop is logged at debug level so a wrong assertion is
+/// diagnosable rather than a silently missing session.
 pub(crate) fn collect_provider_files_diagnostics<F>(
     dirs: &[&Path],
     filter_fn: F,
@@ -281,11 +278,9 @@ where
 ///
 /// Copilot writes `~/.copilot/session-state/<sessionId>/events.jsonl`, so
 /// the event log is always exactly two directory levels below
-/// `session-state/`. Anything deeper belongs to companion subtrees we
-/// intentionally ignore (`rewind-snapshots/backups/`, `checkpoints/`,
-/// `files/`, `research/`) — some of which can hold dozens of files per
-/// session and would otherwise make `WalkDir` visit hundreds of entries
-/// per session just to have `is_copilot_session_file` reject them.
+/// `session-state/`. Anything deeper belongs to companion subtrees
+/// (`rewind-snapshots/backups/`, `checkpoints/`, `files/`, `research/`) that
+/// hold no session log but can carry hundreds of files per session.
 pub const COPILOT_SESSION_MAX_DEPTH: usize = 2;
 
 /// Maximum traversal depth for Grok CLI session scans.
@@ -300,19 +295,19 @@ pub const GROK_SESSION_MAX_DEPTH: usize = 3;
 /// so each log is exactly three levels below the sessions root.
 pub const DSH_SESSION_MAX_DEPTH: usize = 3;
 
-/// Filter for Codex session files under `~/.codex/sessions/YYYY/MM/DD/`.
+/// Filter for Codex session files.
 ///
-/// Codex writes `rollout-*.jsonl` files directly into the dated sub-folders.
-/// We also accept `.json` defensively in case an older dump ever gets dropped
-/// into the tree, but reject Claude Code's `*.meta.json` / `*.meta.jsonl`
-/// subagent sidecar files (those live under `~/.claude/projects/` in
-/// practice, but the filter still guards against the unlikely collision).
+/// Codex writes `rollout-*.jsonl` files directly into the dated sub-folders of
+/// `~/.codex/sessions/YYYY/MM/DD/`, and keeps those names in the flat
+/// `~/.codex/archived_sessions/` root; both are scanned with this filter. We
+/// also accept `.json` defensively in case an older dump ever gets dropped into
+/// the tree, but reject Claude Code's `*.meta.json` / `*.meta.jsonl` subagent
+/// sidecar files (those live under `~/.claude/projects/` in practice, but the
+/// filter still guards against the unlikely collision).
 ///
-/// Intentionally separated from the other per-provider filters
-/// (`is_claude_session_file`, `is_copilot_session_file`,
-/// `is_gemini_session_file`) even though the body is currently trivial:
-/// keeping one filter per provider means future format changes on one
-/// provider do not require teasing apart a shared implementation.
+/// Kept separate from the other per-provider filters even though the body is
+/// trivial, so a format change on one provider does not have to be teased out
+/// of a shared implementation.
 pub fn is_codex_session_file(path: &Path) -> bool {
     if is_meta_sidecar_file(path) {
         return false;
@@ -341,13 +336,13 @@ pub fn is_claude_session_file(path: &Path) -> bool {
 ///
 /// Current Gemini CLI stores each chat as a line-delimited event stream at
 /// `~/.gemini/tmp/<project>/chats/session-*.jsonl`. Subagent sessions sit one
-/// level deeper at `chats/<parent-session>/<subagent>.jsonl`. Sibling artifacts
-/// (`discordbot/logs.json`, the `bin/rg` binary, `.project_root`) are rejected.
+/// level deeper at `chats/<parent-session>/<subagent>.jsonl`. Artifacts outside
+/// `chats/` (stray `.json` logs, the `bin/rg` binary, `.project_root`) are
+/// rejected.
 ///
 /// Legacy single-object exports (`chats/<session>.json`) are intentionally
 /// not matched: the JSONL format is the only shape the analyzer understands
-/// today, and silently scanning `.json` files we can no longer parse just
-/// yields `Warning: Failed to analyze ...` noise on every run.
+/// today, so scanning them would only add parse failures to every scan.
 pub fn is_gemini_session_file(path: &Path) -> bool {
     if path.extension() != Some(std::ffi::OsStr::new("jsonl")) {
         false
@@ -373,22 +368,18 @@ pub fn is_gemini_session_file(path: &Path) -> bool {
 /// and fail to parse.
 ///
 /// The historical single-file layout
-/// (`~/.copilot/history-session-state/<sessionId>.json`) is not matched
-/// and no longer supported by the analyzer at all.
+/// (`~/.copilot/history-session-state/<sessionId>.json`) is not matched and is
+/// not supported by the analyzer at all.
 pub fn is_copilot_session_file(path: &Path) -> bool {
-    // Compare raw `OsStr` rather than going through `to_str()` so paths with
-    // non-UTF-8 bytes elsewhere in the tree do not silently reject the file.
-    // The chosen constants (`events.jsonl`, `session-state`) are pure ASCII,
-    // so the comparison is safe on every platform we care about and keeps
-    // the style consistent with `is_gemini_session_file`'s `OsStr::new("chats")`
-    // check above.
+    // Compare raw `OsStr` rather than going through `to_str()` so a path with
+    // non-UTF-8 bytes elsewhere in the tree is not silently rejected.
     if path.file_name() != Some(std::ffi::OsStr::new("events.jsonl")) {
         return false;
     }
 
-    // Must sit one level under `session-state/<sessionId>/events.jsonl` —
-    // reject anything that just happens to be called `events.jsonl` in a
-    // nested subfolder (e.g. `rewind-snapshots/events.jsonl`).
+    // The parent of the parent must be `session-state`, so anything that just
+    // happens to be called `events.jsonl` in a nested subfolder (e.g.
+    // `rewind-snapshots/events.jsonl`) is rejected.
     path.parent()
         .and_then(|p| p.parent())
         .map(|pp| pp.file_name() == Some(std::ffi::OsStr::new("session-state")))
@@ -432,12 +423,9 @@ pub fn is_dsh_session_file(path: &Path) -> bool {
         .is_some_and(|sessions| sessions.file_name() == Some(std::ffi::OsStr::new("sessions")))
 }
 
-/// Returns true if the path is a Claude Code meta sidecar file.
-///
-/// Claude Code writes these next to subagent session logs with metadata like
-/// `agentType` / `description`. Today they're `*.meta.json`; we also reject
-/// `*.meta.jsonl` pre-emptively so the filter stays correct if the format
-/// ever switches to line-delimited JSON.
+/// Returns true for a Claude Code metadata sidecar written beside a subagent
+/// session log. Today those are `*.meta.json`; `*.meta.jsonl` matches too, in
+/// case the format ever switches to line-delimited JSON.
 fn is_meta_sidecar_file(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
@@ -453,50 +441,43 @@ mod tests {
 
     #[test]
     fn test_is_codex_session_file_jsonl() {
-        // Test JSONL file extension
         let path = std::path::Path::new("test.jsonl");
         assert!(is_codex_session_file(path));
     }
 
     #[test]
     fn test_is_codex_session_file_json() {
-        // Test JSON file extension
         let path = std::path::Path::new("test.json");
         assert!(is_codex_session_file(path));
     }
 
     #[test]
     fn test_is_codex_session_file_txt() {
-        // Test non-JSON file extension
         let path = std::path::Path::new("test.txt");
         assert!(!is_codex_session_file(path));
     }
 
     #[test]
     fn test_is_codex_session_file_no_extension() {
-        // Test file without extension
         let path = std::path::Path::new("test");
         assert!(!is_codex_session_file(path));
     }
 
     #[test]
     fn test_is_codex_session_file_uppercase() {
-        // Test uppercase extension
         let path = std::path::Path::new("test.JSON");
         assert!(!is_codex_session_file(path)); // Case-sensitive
     }
 
     #[test]
     fn test_is_gemini_session_file_rejects_legacy_json() {
-        // Legacy single-object exports (`chats/<session>.json`) are intentionally
-        // no longer matched — the analyzer only handles the JSONL event stream.
+        // The analyzer only handles the JSONL event stream.
         let path = std::path::Path::new("/home/user/.gemini/tmp/hash/chats/chat.json");
         assert!(!is_gemini_session_file(path));
     }
 
     #[test]
     fn test_is_gemini_session_file_accepts_jsonl() {
-        // Current Gemini CLI writes each event as a JSONL line under `chats/`.
         let path = std::path::Path::new(
             "/home/user/.gemini/tmp/proj/chats/session-2026-04-23T12-52.jsonl",
         );
@@ -520,21 +501,18 @@ mod tests {
 
     #[test]
     fn test_is_gemini_session_file_wrong_parent() {
-        // Test file not in chats directory
         let path = std::path::Path::new("/home/user/.gemini/tmp/hash/other/file.json");
         assert!(!is_gemini_session_file(path));
     }
 
     #[test]
     fn test_is_gemini_session_file_wrong_extension() {
-        // Test file in chats directory but wrong extension
         let path = std::path::Path::new("/home/user/.gemini/tmp/hash/chats/file.txt");
         assert!(!is_gemini_session_file(path));
     }
 
     #[test]
     fn test_is_gemini_session_file_no_parent() {
-        // Test file without parent
         let path = std::path::Path::new("file.json");
         assert!(!is_gemini_session_file(path));
     }
@@ -554,7 +532,6 @@ mod tests {
 
     #[test]
     fn test_is_copilot_session_file_accepts_events_jsonl() {
-        // Current layout: `session-state/<sessionId>/events.jsonl`
         let path = std::path::Path::new(
             "/home/user/.copilot/session-state/d2e098d0-e0d6-4d6b-914b-c4c5543b17e3/events.jsonl",
         );
@@ -592,8 +569,6 @@ mod tests {
 
     #[test]
     fn test_is_copilot_session_file_rejects_other_files() {
-        // Plain JSON / JSONL files outside the `session-state/<uuid>/` layout
-        // should never pass.
         let path1 = std::path::Path::new("/tmp/events.jsonl");
         assert!(!is_copilot_session_file(path1));
 
@@ -771,7 +746,6 @@ mod tests {
 
     #[test]
     fn test_collect_files_with_dates_empty_dir() {
-        // Test collecting files from empty directory
         let dir = tempdir().unwrap();
 
         let results =
@@ -781,7 +755,6 @@ mod tests {
 
     #[test]
     fn test_collect_files_with_dates_nonexistent_dir() {
-        // Test collecting files from non-existent directory
         let results =
             collect_files_with_dates("/nonexistent/path", is_codex_session_file, TimeRange::All)
                 .unwrap();
@@ -790,10 +763,8 @@ mod tests {
 
     #[test]
     fn test_collect_files_with_dates_with_files() {
-        // Test collecting JSON files from directory
         let dir = tempdir().unwrap();
 
-        // Create some JSON files
         File::create(dir.path().join("file1.json")).unwrap();
         File::create(dir.path().join("file2.jsonl")).unwrap();
         File::create(dir.path().join("file3.txt")).unwrap(); // Should be filtered out
@@ -802,7 +773,6 @@ mod tests {
             collect_files_with_dates(dir.path(), is_codex_session_file, TimeRange::All).unwrap();
         assert_eq!(results.len(), 2);
 
-        // Check that date fields are set
         for file_info in &results {
             assert!(!file_info.modified_date.is_empty());
             assert!(file_info.modified_date.contains('-')); // Should be YYYY-MM-DD format
@@ -811,10 +781,8 @@ mod tests {
 
     #[test]
     fn test_collect_files_with_dates_nested_directories() {
-        // Test collecting files from nested directories
         let dir = tempdir().unwrap();
 
-        // Create nested structure
         fs::create_dir_all(dir.path().join("subdir1")).unwrap();
         fs::create_dir_all(dir.path().join("subdir2")).unwrap();
 
@@ -829,14 +797,12 @@ mod tests {
 
     #[test]
     fn test_collect_files_with_dates_filter_function() {
-        // Test that filter function works correctly
         let dir = tempdir().unwrap();
 
         File::create(dir.path().join("file1.json")).unwrap();
         File::create(dir.path().join("file2.jsonl")).unwrap();
         File::create(dir.path().join("file3.txt")).unwrap();
 
-        // Custom filter: only .txt files
         let results = collect_files_with_dates(
             dir.path(),
             |p| p.extension().is_some_and(|e| e == "txt"),
@@ -849,7 +815,6 @@ mod tests {
 
     #[test]
     fn test_collect_files_with_dates_no_matching_files() {
-        // Test when no files match filter
         let dir = tempdir().unwrap();
 
         File::create(dir.path().join("file1.txt")).unwrap();
@@ -862,7 +827,6 @@ mod tests {
 
     #[test]
     fn test_file_info_path() {
-        // Test that FileInfo contains correct paths
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test.json");
         File::create(&file_path).unwrap();
@@ -875,7 +839,6 @@ mod tests {
 
     #[test]
     fn test_file_info_date_format() {
-        // Test that date format is YYYY-MM-DD
         let dir = tempdir().unwrap();
         File::create(dir.path().join("test.json")).unwrap();
 
@@ -890,13 +853,10 @@ mod tests {
 
     #[test]
     fn test_collect_files_ignores_directories() {
-        // Test that directories are not included in results
         let dir = tempdir().unwrap();
 
-        // Create a directory with .json in name
         fs::create_dir(dir.path().join("test.json")).unwrap();
 
-        // Create an actual file
         File::create(dir.path().join("real.json")).unwrap();
 
         let results =
@@ -906,7 +866,6 @@ mod tests {
 
     #[test]
     fn test_is_codex_session_file_with_dots_in_name() {
-        // Test files with dots in name
         let path = std::path::Path::new("my.test.file.json");
         assert!(is_codex_session_file(path));
 
@@ -924,7 +883,6 @@ mod tests {
 
     #[test]
     fn test_collect_files_with_content() {
-        // Test that files with content are collected
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test.json");
 
@@ -960,11 +918,10 @@ mod tests {
 
     #[test]
     fn test_is_claude_session_file_accepts_jsonl() {
-        // Top-level Claude session logs
         let top_level = std::path::Path::new("/home/user/.claude/projects/proj/sess.jsonl");
         assert!(is_claude_session_file(top_level));
 
-        // Subagent session logs sit one extra level deeper
+        // Subagent session logs sit one extra level deeper.
         let subagent = std::path::Path::new(
             "/home/user/.claude/projects/proj/sess/subagents/agent-afda1991051a0eb93.jsonl",
         );
@@ -973,24 +930,22 @@ mod tests {
 
     #[test]
     fn test_is_claude_session_file_rejects_non_jsonl() {
-        // Metadata sidecars — current format (`.meta.json`)
         let meta = std::path::Path::new(
             "/home/user/.claude/projects/proj/sess/subagents/agent-afda1991051a0eb93.meta.json",
         );
         assert!(!is_claude_session_file(meta));
 
-        // Metadata sidecars — hypothetical future format (`.meta.jsonl`). Has `.jsonl`
-        // extension, so without the sidecar check it would slip through.
+        // A `.meta.jsonl` sidecar has the accepted extension, so without the
+        // sidecar check it would slip through.
         let meta_jsonl = std::path::Path::new(
             "/home/user/.claude/projects/proj/sess/subagents/agent-afda1991051a0eb93.meta.jsonl",
         );
         assert!(!is_claude_session_file(meta_jsonl));
 
-        // Plain .json files (not something Claude Code writes in this tree)
         let plain_json = std::path::Path::new("/home/user/.claude/projects/proj/notes.json");
         assert!(!is_claude_session_file(plain_json));
 
-        // Other pasted artifacts
+        // Artifacts pasted into a prompt land in the same tree.
         let image = std::path::Path::new("/home/user/.claude/projects/proj/sess/paste.png");
         assert!(!is_claude_session_file(image));
     }
