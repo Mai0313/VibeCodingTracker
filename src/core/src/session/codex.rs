@@ -420,16 +420,39 @@ fn output_reports_argument_error(output: Option<&str>) -> bool {
 /// Without stripping, sed/cat read-detail extraction over-counts the file
 /// by 5 lines (the prefix). Legacy `shell` outputs do not include the
 /// header, so the search returns the original slice unchanged when no
-/// `\nOutput:\n` marker is found.
+/// `\nOutput:\n` marker is found — or when what precedes the marker is not a
+/// header, which is how a `cat` of a file whose body contains a line reading
+/// `Output:` keeps everything above it.
 fn strip_exec_command_metadata_prefix(output: &str) -> &str {
     const MARKER: &str = "\nOutput:\n";
-    if let Some(idx) = output.find(MARKER) {
-        &output[idx + MARKER.len()..]
-    } else if let Some(rest) = output.strip_prefix("Output:\n") {
-        rest
-    } else {
-        output
+    if let Some(idx) = output.find(MARKER)
+        && is_exec_metadata_header(&output[..idx])
+    {
+        return &output[idx + MARKER.len()..];
     }
+    output.strip_prefix("Output:\n").unwrap_or(output)
+}
+
+/// Whether everything ahead of the `Output:` marker is Codex's own header.
+///
+/// The header vocabulary is a closed set on purpose: an open rule such as
+/// "looks like `Key: value`" matches the YAML and log dumps a `cat` most often
+/// produces, which is the content this guard exists to protect. A header line
+/// this build has never seen therefore stops the strip rather than truncating,
+/// which over-counts a read by the header's length instead of losing its body.
+fn is_exec_metadata_header(prefix: &str) -> bool {
+    const HEADER_LINES: [&str; 5] = [
+        "Chunk ID:",
+        "Original token count:",
+        "Process exited with code",
+        "Script completed",
+        "Wall time:",
+    ];
+
+    !prefix.is_empty()
+        && prefix
+            .lines()
+            .all(|line| HEADER_LINES.iter().any(|known| line.starts_with(known)))
 }
 
 /// Decodes a shell output into a `CodexShellOutput`, falling back to the
@@ -1397,6 +1420,20 @@ mod tests {
         // existing fixture-based tests keep matching.
         let raw = "line one\nline two\n";
         assert_eq!(strip_exec_command_metadata_prefix(raw), raw);
+    }
+
+    #[test]
+    fn a_body_line_reading_output_is_not_a_metadata_header() {
+        // `cat` of a file that documents its own output; nothing above the
+        // `Output:` line may be discarded.
+        let raw = "fn main() {}\nUsage: demo\nOutput:\nthe answer\n";
+        assert_eq!(strip_exec_command_metadata_prefix(raw), raw);
+    }
+
+    #[test]
+    fn custom_exec_header_variant_is_still_stripped() {
+        let raw = "Script completed\nWall time: 0.1 seconds\nOutput:\nthe content";
+        assert_eq!(strip_exec_command_metadata_prefix(raw), "the content");
     }
 
     #[test]
