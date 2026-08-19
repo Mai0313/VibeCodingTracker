@@ -1682,17 +1682,21 @@ fn render_quota_overlay(f: &mut Frame, area: Rect, quota: &QuotaView, now: i64) 
         width: outer.width.saturating_sub(2),
         height: outer.height.saturating_sub(2),
     };
-    // Lay the cells out first: a card's lines are built for the width they will
-    // be drawn at, never for the spec's maximum, or the fitting every line
-    // builder does would be against a cell the card never gets.
+    // Settle how many cards get drawn before laying any out, so the width a
+    // card is built for and the cell it is drawn into come from the same
+    // layout. A card's lines are built for the width they will be drawn at,
+    // never for the spec's maximum, or the fitting every line builder does
+    // would be against a cell the card never gets. `collect_cards` pushes one
+    // card per present provider, so the count the grid needs is known before
+    // the first card exists.
     let present = quota.present.count();
-    let cells = grid_cells(&OVERLAY_GRID, inner, present);
+    let rows_that_fit = usize::from(inner.height / OVERLAY_GRID.height);
+    let (cols, _) = quota_grid(&OVERLAY_GRID, inner.width, present);
+    let fits = present.min(cols.saturating_mul(rows_that_fit));
+    let hidden = present - fits;
+    let cells = grid_cells(&OVERLAY_GRID, inner, fits);
     let card_w = cells.first().map_or(OVERLAY_GRID.min_w, |cell| cell.width);
     let cards = collect_cards(quota, now, card_w);
-    let rows_that_fit = usize::from(inner.height / OVERLAY_GRID.height);
-    let (cols, _) = quota_grid(&OVERLAY_GRID, inner.width, cards.len());
-    let fits = cards.len().min(cols.saturating_mul(rows_that_fit));
-    let hidden = cards.len() - fits;
 
     let mut block = Block::default()
         .borders(Borders::ALL)
@@ -1724,10 +1728,7 @@ fn render_quota_overlay(f: &mut Frame, area: Rect, quota: &QuotaView, now: i64) 
         return;
     }
 
-    for (cell, card) in grid_cells(&OVERLAY_GRID, inner, fits)
-        .into_iter()
-        .zip(&cards)
-    {
+    for (cell, card) in cells.into_iter().zip(&cards) {
         render_quota_card(f, cell, card);
     }
 }
