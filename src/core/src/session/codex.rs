@@ -1093,7 +1093,10 @@ mod tests {
     }
 
     #[test]
-    fn resumed_usage_subtracts_the_pre_context_replay_baseline() {
+    fn resumed_usage_bills_only_post_baseline_deltas() {
+        // A resumed session replays its prior context before the first
+        // `turn_context`: that opening snapshot only advances the parse loop's
+        // baseline, and every later event is billed its own delta.
         let logs: Vec<CodexLog> = [
             serde_json::json!({
                 "timestamp": "2026-07-12T00:00:00Z",
