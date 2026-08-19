@@ -186,12 +186,14 @@ pub fn map_claude_usage(body: &str, now: i64) -> Result<ClaudeQuotaSnapshot> {
                     .unwrap_or(std::cmp::Ordering::Equal),
             )
         });
+    // The label is carried whole: how much of it fits is a panel-layout
+    // question, so the renderer that owns the column width decides it.
     let scoped_label = scoped
         .and_then(|l| l.scope.as_ref())
         .and_then(|s| s.model.as_ref())
         .and_then(|m| m.display_name.as_deref())
         .filter(|name| !name.is_empty())
-        .map(|name| name.chars().take(6).collect::<String>());
+        .map(str::to_owned);
     let scoped_weekly = scoped
         .filter(|_| scoped_label.is_some())
         .map(|l| QuotaWindow {
@@ -626,6 +628,18 @@ mod tests {
         assert!(snap.limit_reached, "5h at 100% trips the LIMIT flag");
         assert_eq!(snap.balance.as_deref(), Some("$5.00"));
         assert_eq!(snap.scoped_label.as_deref(), Some("Opus"));
+    }
+
+    #[test]
+    fn scoped_label_is_carried_whole() {
+        // Anthropic sends a full display name. Shortening it is the panel's
+        // call, so the mapper must not spend it here.
+        let body = r#"{
+          "limits": [ { "kind": "weekly_scoped", "percent": 30, "is_active": true,
+                        "scope": { "model": { "display_name": "Claude Opus 4.5" } } } ]
+        }"#;
+        let snap = map_claude_usage(body, 1).unwrap();
+        assert_eq!(snap.scoped_label.as_deref(), Some("Claude Opus 4.5"));
     }
 
     #[test]

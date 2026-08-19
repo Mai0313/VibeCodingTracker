@@ -121,6 +121,11 @@ const SHARE_COL_MAX_W: u16 = 24;
 /// How many providers can show a quota card (Claude / Codex / Copilot / Cursor
 /// / Grok). The grid never reads this — it only bounds the render dispatch.
 const MAX_QUOTA_PANELS: usize = 5;
+/// Widest a provider-supplied gauge label may be (Claude's per-model weekly
+/// row). It sits in the same column as `5h` / `7d`, so anything past this is
+/// width the bars lose; `label_width`'s own floor is 5, making 6 the first
+/// width that costs anything at all.
+const SCOPED_LABEL_W: u16 = 6;
 
 /// Which provider quota panels have credentials on this machine.
 #[derive(Clone, Copy, Default)]
@@ -2231,11 +2236,15 @@ fn label_width(labels: &[&str]) -> usize {
 /// Builds the Claude card: plan, 5h / 7d / per-model gauges, then balance.
 fn claude_card(claude: &ClaudeQuotaSnapshot, now: i64, width: u16) -> QuotaCard {
     let inner = card_inner_w(width);
+    // The scoped row's label shares the gauge label column with `5h` / `7d`, so
+    // every character past `SCOPED_LABEL_W` would come straight off the bars.
+    // Anthropic sends a full display name ("Claude Opus 4.5"), hence the cut.
     let scoped = claude
         .scoped_label
         .as_deref()
-        .filter(|_| claude.scoped_weekly.is_some());
-    let label_w = label_width(&["5h", "7d", scoped.unwrap_or("")]);
+        .filter(|_| claude.scoped_weekly.is_some())
+        .map(|label| fit_text(label, SCOPED_LABEL_W));
+    let label_w = label_width(&["5h", "7d", scoped.as_deref().unwrap_or("")]);
 
     // The plan/age line is unconditional: the age is the only sign that a
     // retained snapshot is stale, and a provider without a plan label (Grok
@@ -2277,7 +2286,7 @@ fn claude_card(claude: &ClaudeQuotaSnapshot, now: i64, width: u16) -> QuotaCard 
     }
     // The per-model weekly cap (Fable today) is volatile on Anthropic's side, so
     // it is only drawn when both the window and its model label are present.
-    if let (Some(w), Some(label)) = (&claude.scoped_weekly, scoped) {
+    if let (Some(w), Some(label)) = (&claude.scoped_weekly, scoped.as_deref()) {
         lines.push(gauge_line(
             label,
             label_w,
@@ -3217,6 +3226,22 @@ mod tests {
         let rendered = render_min_card(&claude_card(&claude, 0, CARD_GRID.min_w));
         assert!(rendered.contains(CLAUDE_LOGIN_HINT), "got:\n{rendered}");
         assert!(rendered.contains("+"), "and it says something was hidden");
+    }
+
+    #[test]
+    fn claude_card_shortens_a_long_scoped_label() {
+        // The scoped label is a provider-supplied model name sharing the gauge
+        // label column with 5h / 7d, so the card cuts it rather than letting it
+        // push every bar to the right. The cut is marked, not silent.
+        let claude = ClaudeQuotaSnapshot {
+            five_hour: Some(QuotaWindow::default()),
+            scoped_weekly: Some(QuotaWindow::default()),
+            scoped_label: Some("Claude Opus 4.5".into()),
+            ..Default::default()
+        };
+        let rendered = render_min_card(&claude_card(&claude, 0, CARD_GRID.min_w));
+        assert!(rendered.contains("Claud…"), "got:\n{rendered}");
+        assert!(!rendered.contains("Opus"), "the tail is gone:\n{rendered}");
     }
 
     #[test]
