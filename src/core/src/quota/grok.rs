@@ -589,6 +589,7 @@ impl GrokState {
                     &token,
                     user_id.as_deref(),
                     file_mtime(&path),
+                    GROK_SETTINGS_URL,
                 ))
             }
             FetchResult::Unauthorized => {
@@ -614,6 +615,7 @@ impl GrokState {
                                     &fresh,
                                     user_id.as_deref(),
                                     file_mtime(&path),
+                                    GROK_SETTINGS_URL,
                                 ))
                             }
                             // A transient retry error keeps the freshly
@@ -649,13 +651,18 @@ impl GrokState {
         token: &str,
         user_id: Option<&str>,
         cred_mtime: Option<SystemTime>,
+        settings_url: &str,
     ) -> GrokQuotaSnapshot {
         if self
             .plan
             .as_ref()
             .is_none_or(|cached| cached.mtime != cred_mtime)
         {
-            match fetch_grok_plan(client, token, user_id, GROK_SETTINGS_URL) {
+            // Drop the stale label first: it belongs to whoever wrote the
+            // previous `auth.json`, so a failed fetch must leave the Plan line
+            // off rather than paint the previous account's tier.
+            self.plan = None;
+            match fetch_grok_plan(client, token, user_id, settings_url) {
                 Ok(label) => {
                     self.plan = Some(CachedPlan {
                         label,
@@ -1087,6 +1094,59 @@ mod tests {
         );
         // A failed fetch is an error so the worker retries it later.
         assert!(fetch_grok_plan(&client, "tok", None, &server.url("/down")).is_err());
+    }
+
+    #[test]
+    fn a_relogin_drops_the_plan_label_even_when_the_refetch_fails() {
+        let server = MockServer::start();
+        let settings = server.mock(|when, then| {
+            when.method(GET).path("/settings");
+            then.status(200)
+                .body(r#"{"subscription_tier_display":"SuperGrok"}"#);
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/down");
+            then.status(503);
+        });
+        let client = build_client().unwrap();
+        let mut state = GrokState::default();
+        let first_login = Some(SystemTime::UNIX_EPOCH);
+        let second_login = Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1));
+        let snap = || map_grok_billing(CREDITS, 1_000_000).unwrap();
+
+        let labelled = state.with_plan(
+            &client,
+            snap(),
+            "tok",
+            None,
+            first_login,
+            &server.url("/settings"),
+        );
+        assert_eq!(labelled.plan_type.as_deref(), Some("SuperGrok"));
+
+        // Same login: the label is reused rather than re-fetched.
+        let cached = state.with_plan(
+            &client,
+            snap(),
+            "tok",
+            None,
+            first_login,
+            &server.url("/settings"),
+        );
+        assert_eq!(cached.plan_type.as_deref(), Some("SuperGrok"));
+        assert_eq!(settings.calls(), 1, "the label is cached per login");
+
+        // A re-login with the settings endpoint down: the panel omits the Plan
+        // line instead of painting the previous account's tier.
+        let after_relogin = state.with_plan(
+            &client,
+            snap(),
+            "tok",
+            None,
+            second_login,
+            &server.url("/down"),
+        );
+        assert_eq!(after_relogin.plan_type, None);
     }
 
     #[test]
