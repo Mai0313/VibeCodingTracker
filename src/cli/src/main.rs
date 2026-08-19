@@ -1,12 +1,12 @@
 //! Binary entry point for the `vibe_coding_tracker` (`vct`) CLI.
 //!
-//! Parses the subcommand with clap and dispatches to the library crate:
+//! Parses the subcommand with clap and dispatches to the library crates:
 //! batch `analysis` and `usage` views (TUI / table / text / JSON with a
-//! time-range filter), complete single-file analysis, plus `version` and
-//! `update`. The heavy lifting lives in [`vct_core`]; this file is
-//! wiring.
+//! time-range filter), complete single-file analysis, plus `version`,
+//! `update`, `quota` and `config`. The heavy lifting lives in [`vct_core`]
+//! and [`vct_tui`]; this file is wiring.
 //!
-//! Two things run *before* clap on purpose, and the ordering is
+//! Process-wide setup runs *before* clap on purpose, and the ordering is
 //! load-bearing — see [`main`].
 
 mod cli;
@@ -20,12 +20,10 @@ use serde::Serialize;
 use std::io::{self, Write};
 use std::sync::Arc;
 
-// mimalloc is opt-in behind the `mimalloc` cargo feature. The default build
-// uses the system allocator because mimalloc's lazy purge retains freed
-// pages — the RSS difference on the TUI loops (repeated parse of session
-// directories) was roughly 10× in favour of the system allocator. Users who
-// want mimalloc's speed for short one-shot runs can rebuild with
-// `--features mimalloc`.
+// mimalloc is opt-in behind the `mimalloc` cargo feature: it is faster for
+// short one-shot runs, but its lazy purge retains freed pages, which measured
+// roughly 10× the RSS of the system allocator on the TUI loops (repeated parse
+// of session directories). So the default build keeps the system allocator.
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -39,13 +37,17 @@ use vct_tui::display::usage::{
 
 const AUTO_UPDATE_REEXEC_ENV: &str = "VCT_AUTO_UPDATE_REEXEC";
 
-/// Parses the CLI and runs the selected subcommand.
+/// Runs process-wide setup, then hands off to [`run`], which does the clap
+/// parse and the dispatch.
 ///
-/// Two steps run before `Cli::parse()` and must stay in this order:
+/// Everything here has to happen before [`run`] reaches `Cli::parse()`:
 /// `tune_system_allocator()` caps glibc arenas before the first allocation
-/// (a Rayon worker), and the `--version` / `-V` branch is handled by hand so
-/// the bare flag prints just [`vct_core::VERSION`] without going
-/// through clap (the `version` *subcommand* still renders the full table).
+/// (a Rayon worker); the file logger and the terminal panic hook are installed
+/// before anything can log or panic; `enable_cli_version_detection()` opts this
+/// process into the `<cli> --version` probing that library embedders and tests
+/// must not do. The `--version` / `-V` branch is then handled by hand so the
+/// bare flag prints just [`vct_core::VERSION`] without going through clap
+/// (the `version` *subcommand* still renders the full table).
 ///
 /// # Errors
 ///
@@ -55,22 +57,18 @@ const AUTO_UPDATE_REEXEC_ENV: &str = "VCT_AUTO_UPDATE_REEXEC";
 /// fetch failure in `usage --json` is downgraded to a warning rather than an
 /// error, so costs are reported as unavailable instead of aborting.
 fn main() -> Result<()> {
-    // Cap per-thread glibc arenas and pin the trim threshold before any
-    // allocation happens under a Rayon worker. See `tune_system_allocator`
-    // for why this matters on long TUI sessions.
+    // Must precede the first allocation; see `tune_system_allocator`.
     vct_core::utils::tune_system_allocator();
 
-    // Install the file logger (default level `warn`) before anything can log or
-    // panic. It writes only to `~/.vct/logs/`, never the terminal.
+    // Default level `warn`, and it writes only to `~/.vct/logs/`, never the
+    // terminal, so it is TUI-safe.
     vct_core::logging::init();
     // Terminal-restore-on-panic is a presentation concern owned by the display
-    // layer, so the binary installs it here rather than from core `logging`.
-    // Installed early so a panic before the TUI starts still restores cleanly.
+    // layer, so the binary installs it rather than core `logging`.
     vct_tui::display::common::tui::ensure_terminal_panic_hook();
 
-    // Let the quota fetchers impersonate the real provider clients: probing
-    // `<cli> --version` spawns a subprocess and caches the answer in `~/.vct`,
-    // so core leaves it to the binary to allow.
+    // Probing `<cli> --version` spawns a subprocess and writes to `~/.vct`, so
+    // core leaves it to the binary to allow.
     vct_core::quota::enable_cli_version_detection();
 
     if matches!(
@@ -134,7 +132,7 @@ fn run() -> Result<()> {
                     }
                 }
                 None => {
-                    // Settings are only needed for the batch (all-sessions) path,
+                    // Only the batch (all-sessions) path takes the writable load,
                     // so `analysis FILE`, `version`, `quota`, etc. never create
                     // or rewrite `~/.vct/config.toml`.
                     let config = vct_core::config::load();
@@ -323,6 +321,10 @@ fn run() -> Result<()> {
 
 /// Runs the silent startup updater before any command emits output or enters a
 /// terminal session.
+///
+/// Skipped for `update` / `config` and inside a re-exec'd child. On Unix an
+/// applied update re-execs the current command in place, so this call may
+/// never return.
 fn run_startup_auto_update(cli: &Cli) {
     if std::env::var_os(AUTO_UPDATE_REEXEC_ENV).is_some()
         || matches!(
@@ -369,8 +371,7 @@ fn build_reexec_command(
 #[cfg(not(unix))]
 fn reexec_current_command(_current_exe: Option<std::path::PathBuf>) {}
 
-/// Handles the `config` subcommand: print the path, show current settings, open
-/// the file in the user's editor, or print the JSON schema.
+/// Handles the `config` subcommand by dispatching one [`ConfigAction`].
 fn run_config(action: ConfigAction) -> Result<()> {
     match action {
         // Pure stdout: schema generation needs no config file, so it must not
@@ -436,9 +437,8 @@ fn run_config(action: ConfigAction) -> Result<()> {
 /// Runs `vct quota <provider>`: fetch the raw body and render it.
 ///
 /// `text` / `table` pick the output format; neither set means pretty JSON.
-/// Dispatching the clap [`QuotaProvider`] onto core's per-provider raw fetchers
-/// is CLI glue, so it lives here rather than in the (display-free) core `quota`
-/// module.
+/// Dispatching the clap [`QuotaProvider`] onto core's raw fetchers is CLI glue,
+/// so it stays out of the display-free core `quota` module.
 ///
 /// # Errors
 ///
