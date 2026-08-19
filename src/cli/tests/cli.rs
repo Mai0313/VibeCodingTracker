@@ -118,6 +118,7 @@ fn analysis_file_json_matches_typed_parser_for_every_file_provider() {
         "sessions/copilot.jsonl",
         "sessions/gemini.jsonl",
         "sessions/grok/signals.json",
+        "sessions/dsh/session.jsonl.zstd",
     ] {
         let path = fixture(fixture_name);
         let expected = serde_json::to_value(parse_session_file_typed(&path).unwrap()).unwrap();
@@ -493,6 +494,7 @@ fn single_file_summary_projection_is_parse_mode_invariant() {
         "sessions/copilot.jsonl",
         "sessions/gemini.jsonl",
         "sessions/grok/signals.json",
+        "sessions/dsh/session.jsonl.zstd",
     ] {
         let path = fixture(fixture_name);
         let full = parse_session_file_typed_with_mode(&path, ParseMode::Full).unwrap();

@@ -4,7 +4,37 @@ $Repo = "Mai0313/VibeCodingTracker"
 $BinaryName = "vibe_coding_tracker"
 
 [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
-[System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+
+# The request already reports the underlying reason; this only says what to do about it.
+$TlsFailureHint = @(
+    "If the error above is a trust or certificate problem, this machine does not trust the",
+    "server's issuer. Import the missing root (or your proxy's CA) into the Windows",
+    "certificate store and retry. This installer never skips certificate verification."
+) -join "`r`n"
+
+function Invoke-Download {
+    param(
+        [Parameter(Mandatory = $true)][string]$Uri,
+        [string]$OutFile
+    )
+
+    $params = @{ Uri = $Uri; UseBasicParsing = $true }
+    if ($OutFile) {
+        $params.OutFile = $OutFile
+    }
+
+    try {
+        return Invoke-WebRequest @params
+    }
+    catch {
+        # The outer message is just "see inner exception"; the certificate error is nested.
+        $reason = @()
+        for ($e = $_.Exception; $e; $e = $e.InnerException) {
+            $reason += $e.Message
+        }
+        throw "Download failed: $Uri`r`n$($reason -join "`r`n")`r`n$TlsFailureHint"
+    }
+}
 
 function Get-Architecture {
     switch ($env:PROCESSOR_ARCHITECTURE) {
@@ -18,7 +48,7 @@ function Get-Architecture {
 }
 
 function Get-LatestVersion {
-    $response = Invoke-WebRequest -Uri "https://api.github.com/repos/$Repo/releases/latest" -UseBasicParsing
+    $response = Invoke-Download -Uri "https://api.github.com/repos/$Repo/releases/latest"
     $tag = ($response.Content | ConvertFrom-Json).tag_name
     if (-not $tag) {
         Write-Error "Failed to determine latest release."
@@ -45,7 +75,7 @@ function Install-Binary {
 
     try {
         $archive = Join-Path $tempDir $filename
-        Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing
+        Invoke-Download -Uri $url -OutFile $archive
 
         Expand-Archive -Path $archive -DestinationPath $tempDir -Force
         $binary = Get-ChildItem -Path $tempDir -Filter "$BinaryName.exe" -Recurse | Select-Object -First 1

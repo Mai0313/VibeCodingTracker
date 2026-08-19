@@ -11,6 +11,7 @@ use std::sync::RwLock;
 /// assert_eq!(format_number(0), "0");
 /// assert_eq!(format_number(1234), "1,234");
 /// assert_eq!(format_number(1_234_567), "1,234,567");
+/// assert_eq!(format_number(-123_456), "-123,456");
 /// ```
 pub fn format_number<T>(n: T) -> String
 where
@@ -19,22 +20,31 @@ where
     let mut buf = itoa::Buffer::new();
     let s = buf.format(n);
 
-    if s.len() <= 3 {
+    // Group the digits alone: counting the sign toward the leading group makes
+    // it the whole group whenever the digit count is a multiple of three, and
+    // the loop then opens with a separator ("-,123").
+    let (sign, digits) = match s.strip_prefix('-') {
+        Some(digits) => ("-", digits),
+        None => ("", s),
+    };
+
+    if digits.len() <= 3 {
         return s.to_string();
     }
 
-    let mut result = String::with_capacity(s.len() + (s.len() - 1) / 3);
-    let remainder = s.len() % 3;
+    let mut result = String::with_capacity(sign.len() + digits.len() + (digits.len() - 1) / 3);
+    result.push_str(sign);
+    let remainder = digits.len() % 3;
 
     if remainder > 0 {
-        result.push_str(&s[..remainder]);
+        result.push_str(&digits[..remainder]);
     }
 
-    for (i, chunk) in s.as_bytes()[remainder..].chunks_exact(3).enumerate() {
+    for (i, chunk) in digits.as_bytes()[remainder..].chunks_exact(3).enumerate() {
         if remainder > 0 || i > 0 {
             result.push(',');
         }
-        // SAFETY: itoa renders ASCII only, so any byte slice of `s` is valid UTF-8.
+        // SAFETY: itoa renders ASCII only, so any byte slice of `digits` is valid UTF-8.
         unsafe {
             result.push_str(std::str::from_utf8_unchecked(chunk));
         }
@@ -244,6 +254,26 @@ mod tests {
         assert_eq!(format_number(1000000), "1,000,000");
         assert_eq!(format_number(12345678901_i64), "12,345,678,901");
         assert_eq!(format_number(999999999999_i64), "999,999,999,999");
+    }
+
+    #[test]
+    fn test_format_number_negative() {
+        // Short enough to skip the grouping loop entirely.
+        assert_eq!(format_number(-1), "-1");
+        assert_eq!(format_number(-99), "-99");
+        assert_eq!(format_number(-123), "-123");
+        assert_eq!(format_number(-999), "-999");
+
+        // A digit count that is a multiple of three: the sign must not become
+        // the leading group, or the first separator lands right after it.
+        assert_eq!(format_number(-123456), "-123,456");
+        assert_eq!(format_number(-123456789), "-123,456,789");
+
+        // The widths that stayed correct even with the sign counted in.
+        assert_eq!(format_number(-1234), "-1,234");
+        assert_eq!(format_number(-12345), "-12,345");
+
+        assert_eq!(format_number(i64::MIN), "-9,223,372,036,854,775,808");
     }
 
     #[test]

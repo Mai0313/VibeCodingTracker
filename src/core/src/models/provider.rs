@@ -186,6 +186,7 @@ mod tests {
         assert_eq!(Provider::Cursor.display_name(), "Cursor");
         assert_eq!(Provider::Hermes.display_name(), "Hermes");
         assert_eq!(Provider::Grok.display_name(), "Grok");
+        assert_eq!(Provider::DeepSeek.display_name(), "DeepSeek");
         assert_eq!(Provider::Unknown.display_name(), "Unknown");
     }
 }
