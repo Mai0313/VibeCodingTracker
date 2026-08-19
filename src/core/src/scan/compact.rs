@@ -120,7 +120,7 @@ pub(crate) fn fold_loaded(
 /// Scans one file-backed provider's session roots through the incremental cache.
 ///
 /// Shared verbatim by usage and analysis: discovery, cache lookup, parallel
-/// miss-load, cache insert, and fold. Each feature supplies only its `sink`.
+/// miss-load, cache insert, and fold.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn scan_cached_files<F>(
     dirs: &[&Path],

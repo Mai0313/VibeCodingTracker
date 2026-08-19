@@ -1534,14 +1534,11 @@ fn test_analysis_aggregation_logic() {
     assert_eq!(total_write_lines, 50);
 }
 
-/// Regression for the silent usage drop that happened when a Claude session
-/// started with a metadata sentinel (`permission-mode`, `file-history-snapshot`,
-/// `queue-operation`). Those records don't carry `parentUuid`, so the old
-/// streaming detector — which only looked at the first line — classified the
-/// whole file as Codex and the assistant `usage` entries never landed in the
-/// Claude totals. This test writes a fixture with such a prelude and asserts both
-/// the provider-known entry point and the auto-detect entry point return the
-/// Claude model usage.
+/// Writes a Claude session whose first line is a metadata sentinel carrying no
+/// `parentUuid`, followed by one assistant record with model and usage.
+///
+/// Panics unless `sentinel_type` is `permission-mode`, `file-history-snapshot`
+/// or `queue-operation`.
 fn write_claude_fixture_with_sentinel_prelude(path: &std::path::Path, sentinel_type: &str) {
     let sentinel = match sentinel_type {
         "permission-mode" => {

@@ -1,8 +1,8 @@
 //! Normalized, cross-provider analysis result types.
 //!
-//! These structs are the analyzer's output shape: every provider parser in
-//! `src/session/` produces a [`CodeAnalysis`] regardless of the source
-//! assistant, and the `analysis` / `usage` roll-up layers consume them. The
+//! These structs are the analyzer's output shape: every provider parser
+//! produces a [`CodeAnalysis`] regardless of the source assistant, and the
+//! `analysis` / `usage` roll-up layers consume them. The
 //! `serde` attributes here also define the JSON layout of the golden fixtures,
 //! `vct analysis FILE`, and each element of the batch `vct analysis --json`
 //! array.
@@ -224,7 +224,7 @@ pub struct CodeAnalysis {
 pub struct AggregatedAnalysisRow {
     /// Model name the metrics are grouped under.
     pub model: String,
-    /// Total lines changed by `Edit`/`MultiEdit` operations.
+    /// Total lines changed by `Edit` operations.
     pub edit_lines: usize,
     /// Total lines returned by `Read` operations.
     pub read_lines: usize,
@@ -279,11 +279,10 @@ pub enum ExtensionType {
 }
 
 impl ExtensionType {
-    /// Stable scan / display order shared by every provider fan-out.
+    /// Canonical provider order, used to sort scan diagnostics deterministically.
     ///
-    /// This is the single source of truth for "provider order": diagnostics
-    /// sorting, cached-scan ranking, and the descriptor table all defer to it,
-    /// so a new provider only has to be slotted in here.
+    /// The scan's own provider fan-out does **not** read this — it has its own
+    /// ordered table — so a new provider has to be slotted into both.
     pub fn scan_rank(self) -> u8 {
         match self {
             ExtensionType::ClaudeCode => 0,
@@ -337,7 +336,6 @@ mod tests {
 
     #[test]
     fn test_code_analysis_tool_calls_serialization() {
-        // Test serializing CodeAnalysisToolCalls
         let tool_calls = CodeAnalysisToolCalls {
             read: 10,
             write: 5,
@@ -358,7 +356,6 @@ mod tests {
 
     #[test]
     fn test_code_analysis_tool_calls_default() {
-        // Test default values
         let tool_calls = CodeAnalysisToolCalls::default();
 
         assert_eq!(tool_calls.read, 0);
@@ -370,7 +367,6 @@ mod tests {
 
     #[test]
     fn test_code_analysis_detail_base_serialization() {
-        // Test serializing CodeAnalysisDetailBase
         let detail = CodeAnalysisDetailBase {
             file_path: "/path/to/file.rs".to_string(),
             line_count: 100,
@@ -389,7 +385,6 @@ mod tests {
 
     #[test]
     fn test_code_analysis_write_detail_serialization() {
-        // Test serializing CodeAnalysisWriteDetail
         let write_detail = CodeAnalysisWriteDetail {
             base: CodeAnalysisDetailBase {
                 file_path: "/test/file.rs".to_string(),
@@ -410,7 +405,6 @@ mod tests {
 
     #[test]
     fn test_code_analysis_read_detail_serialization() {
-        // Test serializing CodeAnalysisReadDetail
         let read_detail = CodeAnalysisReadDetail {
             base: CodeAnalysisDetailBase {
                 file_path: "/test/input.txt".to_string(),
@@ -430,7 +424,6 @@ mod tests {
 
     #[test]
     fn test_code_analysis_apply_diff_detail_serialization() {
-        // Test serializing CodeAnalysisApplyDiffDetail
         let edit_detail = CodeAnalysisApplyDiffDetail {
             base: CodeAnalysisDetailBase {
                 file_path: "/test/edit.rs".to_string(),
@@ -452,7 +445,6 @@ mod tests {
 
     #[test]
     fn test_code_analysis_run_command_detail_serialization() {
-        // Test serializing CodeAnalysisRunCommandDetail
         let run_detail = CodeAnalysisRunCommandDetail {
             base: CodeAnalysisDetailBase {
                 file_path: "/workspace".to_string(),
@@ -473,7 +465,6 @@ mod tests {
 
     #[test]
     fn test_extension_type_equality() {
-        // Test ExtensionType equality
         assert_eq!(ExtensionType::ClaudeCode, ExtensionType::ClaudeCode);
         assert_eq!(ExtensionType::Codex, ExtensionType::Codex);
         assert_eq!(ExtensionType::Copilot, ExtensionType::Copilot);
@@ -486,7 +477,6 @@ mod tests {
 
     #[test]
     fn test_extension_type_clone() {
-        // Test ExtensionType can be cloned
         let ext1 = ExtensionType::ClaudeCode;
         let ext2 = ext1;
 
@@ -495,7 +485,6 @@ mod tests {
 
     #[test]
     fn test_extension_type_debug() {
-        // Test ExtensionType debug formatting
         let ext = ExtensionType::ClaudeCode;
         let debug_str = format!("{:?}", ext);
 
@@ -504,7 +493,6 @@ mod tests {
 
     #[test]
     fn test_code_analysis_tool_calls_clone() {
-        // Test cloning CodeAnalysisToolCalls
         let tool_calls1 = CodeAnalysisToolCalls {
             read: 5,
             write: 3,
@@ -521,7 +509,6 @@ mod tests {
 
     #[test]
     fn test_camel_case_serialization() {
-        // Test that serialization uses camelCase
         let detail = CodeAnalysisDetailBase {
             file_path: "/test".to_string(),
             line_count: 10,
@@ -531,7 +518,6 @@ mod tests {
 
         let json = serde_json::to_value(&detail).unwrap();
 
-        // Should have camelCase keys
         assert!(json["filePath"].is_string());
         assert!(json["lineCount"].is_number());
         assert!(json["characterCount"].is_number());
@@ -540,7 +526,6 @@ mod tests {
 
     #[test]
     fn test_pascal_case_tool_calls() {
-        // Test that tool calls use PascalCase
         let tool_calls = CodeAnalysisToolCalls {
             read: 1,
             write: 2,
@@ -551,7 +536,6 @@ mod tests {
 
         let json = serde_json::to_value(&tool_calls).unwrap();
 
-        // Should have PascalCase keys (first letter capitalized)
         assert!(json["Read"].is_number());
         assert!(json["Write"].is_number());
         assert!(json["Edit"].is_number());
@@ -559,7 +543,6 @@ mod tests {
 
     #[test]
     fn test_code_analysis_record_serialization() {
-        // Test serializing full CodeAnalysisRecord
         let record = CodeAnalysisRecord {
             total_unique_files: 5,
             total_write_lines: 100,
@@ -592,7 +575,6 @@ mod tests {
 
     #[test]
     fn test_empty_details_serialization() {
-        // Test serializing empty detail vectors
         let record = CodeAnalysisRecord {
             total_unique_files: 0,
             total_write_lines: 0,

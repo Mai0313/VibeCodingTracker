@@ -119,6 +119,11 @@ impl TerminalSession {
     }
 
     /// Mutable access to the ratatui terminal.
+    ///
+    /// # Panics
+    ///
+    /// Panics once the session has been closed by [`Self::close`] or
+    /// [`Self::finish`].
     pub fn terminal_mut(&mut self) -> &mut Terminal<CrosstermBackend<io::Stdout>> {
         self.terminal.as_mut().expect("terminal session is open")
     }
@@ -167,7 +172,7 @@ enum RefreshCommand {
 /// Failure returned by a background refresh worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefreshWorkerError {
-    /// The loader returned an application error and can be retried.
+    /// The loader returned an error or panicked, and can be retried.
     Load(String),
     /// The worker thread exited, so future refresh requests cannot run.
     Disconnected,
@@ -254,7 +259,7 @@ impl<T: Send + 'static> RefreshWorker<T> {
         }
     }
 
-    /// Starts the initial load or coalesces a request behind the active load.
+    /// Dispatches a load, or coalesces the request behind the running one.
     pub fn request(&mut self) {
         if self.disconnected {
             return;
@@ -368,7 +373,7 @@ impl<T> Drop for RefreshWorker<T> {
 /// Best-effort terminal restore for the panic hook, when no [`Terminal`] handle
 /// is available.
 ///
-/// No-ops unless the TUI currently owns the screen (see [`IN_TUI`]), so calling
+/// No-ops unless the TUI currently owns the screen, so calling
 /// it from a panic that fired outside the TUI emits nothing. Every step is
 /// best-effort: a panic hook must never itself panic or early-return, so errors
 /// are ignored and the flag is cleared regardless.
@@ -411,7 +416,6 @@ fn panic_delegates_to_previous(tui_active: bool, restore_terminal: bool) -> bool
 
 /// Installs terminal panic protection once while preserving the previous hook.
 ///
-/// Public display callers do not have to initialize this crate's logger first.
 /// Owner-thread panics restore the terminal before the previous hook runs. A
 /// caught background panic does not delegate while the TUI remains active, so
 /// it cannot print through the alternate screen.
@@ -542,7 +546,7 @@ fn handle_input_from(source: &mut impl EventSource) -> anyhow::Result<InputActio
         match source.read()? {
             // Windows emits Press/Repeat/Release for a single keystroke while
             // Unix only emits Press; drop Release so one keypress isn't counted
-            // twice (which would double every nav step / page jump).
+            // twice (which would double every nav step).
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 if key.code == KeyCode::Char('q')
                     || (key.code == KeyCode::Char('c')
@@ -620,8 +624,8 @@ pub enum InputAction {
     /// User toggled the full-screen quota detail overlay (`Q`); usage view
     /// only, ignored elsewhere.
     ToggleQuota,
-    /// User toggled the detail pane (`p` / `P`); usage view only, ignored
-    /// elsewhere.
+    /// User toggled the Provider Usage panel (`p` / `P`); usage view only,
+    /// ignored elsewhere.
     TogglePane,
     /// User asked to re-fetch and redraw (`r` / `R`).
     Refresh,
@@ -759,7 +763,6 @@ impl UpdateTracker {
         self.last_update_times
             .retain(|key, _| current_keys.contains(key));
 
-        // If we exceed max_tracked, drop an arbitrary subset to fit the cap.
         // NOTE: HashMap iteration order is unspecified, so this is not "most recent".
         if self.previous_hashes.len() > self.max_tracked {
             let keys_to_remove: Vec<_> = self
@@ -774,7 +777,6 @@ impl UpdateTracker {
             }
         }
 
-        // Release excess capacity to reduce memory footprint
         self.previous_hashes.shrink_to_fit();
         self.last_update_times.shrink_to_fit();
     }

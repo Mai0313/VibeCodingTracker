@@ -1,13 +1,16 @@
 // Integration tests for the built `vct` binary.
 //
 // Two groups:
-//  1. CLI wiring and single-file behavior. Clap-only checks use the inherited
-//     environment because they stop before runtime dispatch; every command that
-//     can parse, log, or return a runtime error uses an isolated child HOME.
-//  2. Per-child HOME smoke tests — `usage` / `analysis` (batch) run against an
+//  1. CLI wiring and single-file behavior. Checks that stop at clap, plus the
+//     settings-free `version` command, run on the inherited environment; every
+//     command that can parse a session, log, or reach a provider path uses an
+//     isolated child HOME.
+//  2. Per-child HOME smoke tests — batch `usage` / `analysis` run against an
 //     isolated temp HOME seeded with fixture sessions plus an offline pricing
-//     cache, so the compiled binary is exercised end-to-end without touching
-//     the real home or any external API.
+//     cache, while the `config` and startup side-effect checks seed only what
+//     the case under test needs, so they can assert what the binary creates and
+//     what it rewrites. Either way the compiled binary is exercised end-to-end
+//     without touching the real home or any external API.
 //
 // Setting the environment on the child is the only way to isolate a separate
 // binary; it is per-child (no `#[serial]`, no process-global mutation) and
@@ -285,7 +288,8 @@ fn test_analysis_validates_file_extension() {
     let wrong_ext = temp_dir.path().join("test.txt");
     std::fs::write(&wrong_ext, "test content").unwrap();
 
-    // Behavior depends on implementation - may succeed or fail; must not panic.
+    // Nothing is asserted: the extension is not validated, so the file's
+    // content alone decides whether the run succeeds.
     let _ = child_cmd(&home).arg("analysis").arg(&wrong_ext).output();
 }
 
@@ -882,7 +886,6 @@ fn analysis_file_does_not_create_config() {
 
 #[test]
 fn config_path_prints_config_toml_location() {
-    // Uses a per-child HOME so the check never touches the real `~/.vct`.
     let home = TempHome::new();
     child_cmd(&home)
         .arg("config")

@@ -3,20 +3,19 @@
 //! Cursor keeps session data in two places under `~/.cursor`:
 //!
 //! - `ai-tracking/ai-code-tracking.db` — one row per AI-authored code line,
-//!   carrying the `model` that wrote it. Used to attribute each conversation to
-//!   a model for the `analysis` view (`conversationId -> model`).
+//!   carrying the `model` that wrote it. Both views use it to attribute a
+//!   conversation to a model (`conversationId -> model`).
 //! - `chats/<projectHash>/<conversationId>/store.db` — a content-addressed blob
 //!   store holding the whole conversation. Assistant turns live in binary
 //!   protobuf DAG nodes (`field 4` = the message JSON, `field 26` = timestamp,
 //!   `field 5` = the running context-window gauge); tool results live in
-//!   standalone JSON blobs. Parsed for `analysis` tool-call metrics.
+//!   standalone JSON blobs. `analysis` reads the tool calls out of it; `usage`
+//!   wants only the gauge, so it never loads the JSON blobs at all.
 //!
-//! Cursor does **not** persist real billing tokens locally (only the context
-//! gauge), so the `usage` view is a deliberately-rough **local estimate** from
-//! that gauge (there is no dashboard-API path here; see `docs/quota.md` for
-//! the raw endpoint if it is ever reintroduced), keeping Cursor consistent with
-//! the other providers whose `usage` is likewise computed from local session
-//! data.
+//! Cursor does **not** persist real billing tokens locally (only that gauge),
+//! so the `usage` view is a deliberately-rough **local estimate**. There is no
+//! dashboard-API path here; see `docs/quota.md` for the raw endpoint if it is
+//! ever reintroduced.
 //!
 //! Both entry points return the same `(local YYYY-MM-DD, CodeAnalysis[, cost])`
 //! shape the OpenCode reader produces, so the `usage` / `analysis` aggregators
@@ -46,10 +45,10 @@ use std::path::{Path, PathBuf};
 
 /// Reads per-model token usage for Cursor.
 ///
-/// Cursor does not persist real billing tokens locally (only a context gauge),
-/// so this is a deliberately-rough estimate from the chat stores: the context
-/// gauge is counted as cache-read tokens. The caller applies the shared
-/// LiteLLM pricing map so a TUI refresh does not rebuild it per reader call.
+/// A deliberately-rough estimate: Cursor persists no billing tokens locally, so
+/// each conversation's context gauge is counted as cache-read tokens instead.
+/// Pricing is left to the caller's shared LiteLLM map so a TUI refresh does not
+/// rebuild one per reader call.
 ///
 /// Each returned tuple is `(local YYYY-MM-DD, CodeAnalysis, 0.0)` with the
 /// analysis carrying one model's `conversation_usage`, matching the shape of
@@ -57,7 +56,10 @@ use std::path::{Path, PathBuf};
 ///
 /// # Errors
 ///
-/// Returns an error only if reading the local chat stores fails.
+/// A store that cannot be read is logged and skipped. Returns an error only
+/// when no candidate decoded at all — a candidate being a discovered store or
+/// a directory that could not be walked, so an unreadable chats root errors on
+/// its own.
 pub fn read_cursor_usage(
     chats_dir: &Path,
     tracking_db: &Path,
@@ -90,11 +92,11 @@ pub fn read_cursor_usage(
 pub(crate) struct CursorUsageRead {
     /// Successfully aggregated date/model rows.
     pub rows: Vec<UsageContribution>,
-    /// Number of discovered stores, or one traversal candidate on failure.
+    /// Discovered stores plus the traversal failures found beside them.
     pub candidates: usize,
     /// Stores decoded successfully, including valid empty stores.
     pub parsed: usize,
-    /// Store-level open or decode failures.
+    /// Traversal, tracking-DB, and per-store decode failures.
     pub failures: Vec<CursorAnalysisFailure>,
 }
 
@@ -116,10 +118,11 @@ pub(crate) fn read_cursor_usage_with_diagnostics(
 /// Reads per-model file-operation metrics for Cursor from the chat stores.
 ///
 /// Walks every `chats/*/*/store.db`, extracts each assistant turn's tool calls
-/// (`Read` / `Write` / `StrReplace`→edit / `Shell`→bash / `TodoWrite`), and
-/// attributes them to the conversation's model (from `ai-code-tracking.db`,
-/// falling back to the store's `lastUsedModel`). Records are bucketed by the
-/// assistant turn's local date and filtered by `time_range`.
+/// (`Read`/`ReadFile` / `Write` / `StrReplace`→edit / `Shell`→bash /
+/// `TodoWrite`), and attributes them to the conversation's model (from
+/// `ai-code-tracking.db`, else the store's `lastUsedModel`, else `"unknown"`).
+/// Records are bucketed by the assistant turn's local date and filtered by
+/// `time_range`.
 ///
 /// # Errors
 ///
@@ -171,14 +174,16 @@ pub(crate) struct CursorStoreDiscovery {
 pub(crate) struct CursorAnalysisRead {
     /// Successfully decoded date/session rows.
     pub rows: Vec<DatabaseAnalysisRow>,
-    /// Number of discovered `store.db` files.
+    /// Discovered `store.db` files plus the traversal failures found beside them.
     pub candidates: usize,
     /// Number of stores decoded successfully, including valid empty stores.
     pub parsed: usize,
-    /// Store-level failures retained for noninteractive diagnostics.
+    /// Traversal, tracking-DB, and per-store failures retained for
+    /// noninteractive diagnostics.
     pub failures: Vec<CursorAnalysisFailure>,
 }
 
+/// One store's analysis rows plus its schema-normalization counts.
 pub(crate) struct CursorStoreAnalysis {
     pub(crate) rows: Vec<(String, CodeAnalysis)>,
     pub(crate) normalized_messages: usize,
@@ -261,8 +266,8 @@ pub(crate) fn read_cursor_analysis_with_diagnostics(
 // usage: local estimate
 // ===========================================================================
 
-/// One usage aggregation row keyed by `(date, model)`, so any time range can
-/// filter it locally. A purely in-memory intermediate — never serialized.
+/// One usage row carrying its own local date, so any time range can filter it
+/// after the fact. A purely in-memory intermediate — never serialized.
 #[derive(Debug)]
 struct UsageEvent {
     date: String,
@@ -335,20 +340,19 @@ pub(crate) fn read_cursor_usage_store(
     })
 }
 
-// ===========================================================================
-// usage: local estimate
-// ===========================================================================
-
 /// Builds all-time usage-estimate events from the local context gauge.
 ///
 /// Cursor stores only the running context-window size per assistant turn, not
 /// billed tokens. Each turn re-sends (and prompt-cache-reads) the accumulated
-/// context, so summing the gauge across a conversation's turns approximates the
-/// **cache-read** token volume — reported in the cache-read bucket both because
-/// that is the honest bucket and because it is then priced at the much cheaper
+/// context, so summing the gauge over a conversation's turns approximates the
+/// **cache-read** token volume. It goes in the cache-read bucket both because
+/// that is the honest bucket and because it is then billed at the much cheaper
 /// cache rate rather than a wildly-inflated full-input rate. Input/output are
-/// unknown (`0`) and the stored cost is `0` (models Cursor prices itself, e.g.
-/// `composer-*`, have no LiteLLM entry and stay `$0`). Deliberately rough.
+/// unknown (`0`) and the stored cost is `0`; the caller prices Cursor on an
+/// exact LiteLLM match alone, so a model Cursor prices itself (e.g.
+/// `composer-*`) stays at `$0` rather than being guessed at from a similar
+/// name. Deliberately rough.
+///
 /// Returns all dates; the caller filters by time range.
 fn approximation_events(chats_dir: &Path, tracking_db: &Path) -> CursorUsageEvents {
     let (conv_models, tracking_failure) = match load_conversation_models(tracking_db) {
@@ -702,7 +706,7 @@ pub(crate) fn read_store_analysis(
         for (date, state) in per_date {
             let mut usage = FastHashMap::default();
             // The analysis aggregator only reads the model key; the value is a
-            // placeholder (real tokens come from the usage API path).
+            // placeholder (tokens come from the usage view's local estimate).
             usage.insert(model.clone(), json!({}));
             let record = state.into_record(usage);
             out.push((date, wrap_record(record, user, machine)));
@@ -716,10 +720,8 @@ pub(crate) fn read_store_analysis(
     })
 }
 
-/// Reads a store's per-turn context-occupancy gauge for the usage approximation.
-///
-/// Returns the conversation's model plus `(timestamp_ms, context_tokens)` for
-/// every assistant turn that carries the gauge.
+/// One store's context-gauge read: the conversation's model plus
+/// `(timestamp_ms, context_tokens)` for every assistant turn carrying the gauge.
 struct CursorStoreContextRead {
     model: String,
     turns: Vec<(i64, i64)>,
@@ -727,6 +729,7 @@ struct CursorStoreContextRead {
     parsed_records: usize,
 }
 
+/// Reads a store's per-turn context-occupancy gauge for the usage estimate.
 fn read_store_context(
     store_db: &Path,
     conv_models: &FastHashMap<String, String>,
@@ -752,9 +755,9 @@ fn read_store_context(
                 continue;
             };
             // Only assistant turns represent a real per-request context. Cursor
-            // also stores intermediate DAG nodes that carry the running gauge but
-            // no assistant message; counting those would roughly double the
-            // approximation's tokens and inflate its active-day count.
+            // also stores intermediate DAG nodes that carry the running gauge on
+            // a non-assistant message; counting those would roughly double the
+            // estimate's tokens and inflate its active-day count.
             let role = message_role(msg_bytes);
             match role.as_deref() {
                 Some("assistant") => {
@@ -832,12 +835,13 @@ fn load_node_blobs(conn: &Connection) -> Result<Vec<Vec<u8>>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// Returns `(assistant message JSON bytes, timestamp_ms)` for a binary DAG node.
+/// Returns `(embedded message JSON bytes, timestamp_ms)` for a binary DAG node.
 ///
-/// Binary nodes start with `field 1` (`0x0A`) and embed exactly one assistant
-/// message in `field 4`; `field 26` is the epoch-ms timestamp. Non-node blobs
-/// (JSON messages) return `None`, as do nodes missing the timestamp — an
-/// undateable turn is skipped rather than mis-bucketed to the epoch (1970).
+/// Binary nodes start with `field 1` (`0x0A`), carry the message in `field 4`
+/// and the epoch-ms timestamp in `field 26`; the role is not checked here.
+/// Non-node blobs (JSON messages) return `None`, as do nodes missing the
+/// timestamp — an undateable turn is skipped rather than mis-bucketed to the
+/// epoch (1970).
 #[cfg(test)]
 fn assistant_node(data: &[u8]) -> Option<(&[u8], i64)> {
     if data.first() != Some(&0x0A) {
@@ -847,7 +851,7 @@ fn assistant_node(data: &[u8]) -> Option<(&[u8], i64)> {
     Some((node.msg?, node.ts?))
 }
 
-/// Whether a message JSON blob is an assistant turn.
+/// The `role` of a message JSON blob, when it parses and carries one.
 fn message_role(bytes: &[u8]) -> Option<String> {
     serde_json::from_slice::<Value>(bytes)
         .ok()
@@ -860,6 +864,9 @@ fn message_role(bytes: &[u8]) -> Option<String> {
 }
 
 /// Applies one assistant message's tool calls to `state`.
+///
+/// Returns how many tool payloads used an unsupported schema; `Err(())` when
+/// the message itself is not a usable assistant turn.
 fn apply_assistant_tools(
     state: &mut SessionParseState,
     msg: &Value,
@@ -1151,7 +1158,7 @@ fn read_varint(data: &[u8], pos: usize) -> Option<(u64, usize)> {
 // shared helpers
 // ===========================================================================
 
-/// Builds the Claude-style flat usage value the token extractor understands.
+/// Packs Cursor's estimated token counts into the shared usage buckets.
 fn cursor_usage_value(
     input: i64,
     output: i64,

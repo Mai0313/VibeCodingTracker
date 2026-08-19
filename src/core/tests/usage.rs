@@ -970,7 +970,6 @@ fn test_usage_data_serialization() {
     use serde_json::json;
     use vct_core::models::usage::UsageResult;
 
-    // Create sample usage data
     let mut usage = UsageResult::default();
     usage.insert(
         "claude-sonnet-4".to_string(),
@@ -984,14 +983,12 @@ fn test_usage_data_serialization() {
         }),
     );
 
-    // Test serialization to JSON
     let json = serde_json::to_string(&usage).unwrap();
     assert!(
         json.contains("claude-sonnet-4"),
         "Should contain model name"
     );
 
-    // Test deserialization
     let deserialized: UsageResult = serde_json::from_str(&json).unwrap();
     assert_eq!(deserialized.len(), usage.len());
     assert!(deserialized.contains_key("claude-sonnet-4"));
@@ -1030,7 +1027,6 @@ fn test_usage_calculation_cost_accuracy() {
 
 #[test]
 fn test_usage_with_multiple_models() {
-    // Test handling of multiple models in usage data
     use serde_json::json;
     use vct_core::models::usage::UsageResult;
 
@@ -1067,7 +1063,6 @@ fn test_usage_with_multiple_models() {
 
 #[test]
 fn test_usage_json_output_format() {
-    // Test that JSON output format matches expected structure
     use serde_json::{Value, json};
     use vct_core::models::usage::UsageResult;
 
@@ -1087,7 +1082,6 @@ fn test_usage_json_output_format() {
     let json = serde_json::to_string_pretty(&usage).unwrap();
     let parsed: Value = serde_json::from_str(&json).unwrap();
 
-    // Verify structure
     assert!(parsed.is_object(), "Root should be an object");
 
     let model_value = &parsed["claude-sonnet-4"];
@@ -1107,7 +1101,6 @@ fn test_usage_json_output_format() {
 
 #[test]
 fn test_usage_handles_missing_cache_tokens() {
-    // Test that usage calculations work when cache tokens are 0
     use serde_json::json;
 
     let usage_value = json!({

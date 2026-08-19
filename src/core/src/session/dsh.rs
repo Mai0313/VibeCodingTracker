@@ -185,8 +185,7 @@ pub(crate) fn parse_dsh_session(
     };
 
     // A foreign format version means the envelope's own semantics may have
-    // moved, so every number derived from it would be a guess. Upstream ships
-    // no migration either and refuses the log outright.
+    // moved, so every number derived from it would be a guess.
     if let Some(version) = parser.unsupported_version {
         bail!(
             "DeepSeek session {} uses format version {version}, but only version {SUPPORTED_FORMAT_VERSION} is supported",

@@ -18,9 +18,10 @@ use vct_core::utils::format_number;
 ///
 /// The "Output" column folds `reasoning_tokens` back into the displayed number
 /// so each row reconciles with "Total Tokens", while cost is priced against the
-/// separated buckets. Prints a "no usage data" message when empty. If pricing
-/// cannot be fetched, a warning is written to stderr and costs are shown as
-/// `$0.00`. When `merge` is set, rows sharing a base model name across provider
+/// separated buckets. Prints a "no usage data" message when empty. A failed
+/// pricing fetch warns on stderr and leaves LiteLLM-priced models at zero cost;
+/// providers carrying their own stored cost keep it. When `merge` is set, rows
+/// sharing a base model name across provider
 /// prefixes (e.g. `openai/gpt-5.5` + `azure/gpt-5.5`) are collapsed into one.
 pub fn display_usage_table(usage_data: &UsageData, merge: bool) {
     if usage_data.models.is_empty() {
@@ -31,7 +32,6 @@ pub fn display_usage_table(usage_data: &UsageData, merge: bool) {
     println!("{}", "Token Usage Statistics".bright_cyan().bold());
     println!();
 
-    // Fetch pricing data
     let pricing_map = match fetch_model_pricing() {
         Ok(map) => map,
         Err(e) => {
@@ -63,7 +63,6 @@ pub fn display_usage_table(usage_data: &UsageData, merge: bool) {
     let rows = &summary.rows;
     let totals = &summary.totals;
 
-    // Create table
     let mut table = create_comfy_table(
         vec![
             "Model",
@@ -77,10 +76,6 @@ pub fn display_usage_table(usage_data: &UsageData, merge: bool) {
         Color::Yellow,
     );
 
-    // Add data rows. The "Output" column folds `reasoning_tokens` back
-    // into the displayed number so each row still adds up to `Total`
-    // — costs are already calculated against the separated buckets via
-    // `calculate_cost`.
     for row in rows {
         table.add_row(vec![
             Cell::new(&row.display_model)
@@ -107,7 +102,6 @@ pub fn display_usage_table(usage_data: &UsageData, merge: bool) {
         ]);
     }
 
-    // Add totals row
     add_totals_row(
         &mut table,
         vec![
@@ -125,7 +119,6 @@ pub fn display_usage_table(usage_data: &UsageData, merge: bool) {
     println!("{table}");
     println!();
 
-    // Display per-provider totals (tokens + cost).
     let provider_rows = build_provider_total_rows(&summary.provider_totals);
 
     println!("{}", "Totals (by Provider)".bright_magenta().bold());

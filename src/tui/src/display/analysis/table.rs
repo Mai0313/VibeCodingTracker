@@ -87,7 +87,6 @@ pub fn display_analysis_table(analysis: &AnalysisData) {
         totals.write_count += row.write_count;
     }
 
-    // Add totals row
     add_totals_row(
         &mut table,
         vec![
@@ -107,9 +106,8 @@ pub fn display_analysis_table(analysis: &AnalysisData) {
     println!("{table}");
     println!();
 
-    // Compute per-provider totals directly from the per-provider aggregated
-    // rows the batch analyzer produced (no model-name guessing — each row
-    // is already scoped to a known source directory).
+    // Each aggregated row is already scoped to a known source directory, so
+    // provider attribution needs no model-name guessing.
     let provider_totals = calculate_analysis_provider_totals_from_per_provider(
         &analysis.per_provider,
         &analysis.provider_days,

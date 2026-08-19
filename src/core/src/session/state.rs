@@ -97,12 +97,10 @@ impl SessionParseState {
     /// Creates an empty parse state with the given detail-retention `mode`.
     ///
     /// In [`ParseMode::Full`] the detail `Vec`s are pre-sized to typical session
-    /// sizes. `unique_files` is pre-sized in both modes because
-    /// `total_unique_files` is a scalar total that must stay exact.
+    /// sizes; in [`ParseMode::UsageOnly`] they stay empty, so pre-sizing them is
+    /// skipped. `unique_files` is populated in both modes — `total_unique_files`
+    /// is a scalar total that must stay exact — so it is pre-sized in both.
     pub fn with_mode(mode: ParseMode) -> Self {
-        // Pre-allocate Vecs with reasonable capacity estimates based on
-        // typical session sizes. In `UsageOnly` mode we skip the
-        // pre-allocation because the vecs stay empty.
         let pre = matches!(mode, ParseMode::Full);
         Self {
             mode,
@@ -228,7 +226,6 @@ impl SessionParseState {
     /// [`SessionParseState::add_write_detail`]. Otherwise delegates to
     /// [`SessionParseState::add_edit_detail_raw`].
     pub fn add_edit_detail(&mut self, path: &str, old: &str, new: &str, ts: i64) {
-        // If old is empty and new has content, treat as write
         if old.trim_end_matches('\n').is_empty() && !new.trim_end_matches('\n').is_empty() {
             self.add_write_detail(path, new, ts);
             return;
@@ -408,7 +405,6 @@ mod tests {
 
     #[test]
     fn test_session_parse_state_new() {
-        // Test creating a new SessionParseState
         let state = SessionParseState::new();
 
         assert_eq!(state.total_write_lines, 0);
@@ -423,7 +419,6 @@ mod tests {
 
     #[test]
     fn test_add_read_detail() {
-        // Test adding a read operation
         let mut state = SessionParseState::new();
         state.folder_path = "/test/folder".to_string();
 
@@ -437,7 +432,6 @@ mod tests {
 
     #[test]
     fn test_add_read_detail_ignores_empty() {
-        // Test that empty content is ignored
         let mut state = SessionParseState::new();
 
         state.add_read_detail("test.rs", "", 1234567890);
@@ -449,7 +443,6 @@ mod tests {
 
     #[test]
     fn test_add_write_detail() {
-        // Test adding a write operation
         let mut state = SessionParseState::new();
         state.folder_path = "/test/folder".to_string();
 
@@ -463,7 +456,6 @@ mod tests {
 
     #[test]
     fn test_add_edit_detail() {
-        // Test adding an edit operation
         let mut state = SessionParseState::new();
         state.folder_path = "/test".to_string();
 
@@ -482,7 +474,6 @@ mod tests {
 
     #[test]
     fn test_add_edit_detail_empty_old_becomes_write() {
-        // Test that edit with empty old content becomes a write
         let mut state = SessionParseState::new();
         state.folder_path = "/test".to_string();
 
@@ -497,7 +488,6 @@ mod tests {
 
     #[test]
     fn test_add_run_command() {
-        // Test adding a run command
         let mut state = SessionParseState::new();
         state.folder_path = "/workspace".to_string();
 
@@ -510,7 +500,6 @@ mod tests {
 
     #[test]
     fn test_add_run_command_ignores_empty() {
-        // Test that empty commands are ignored
         let mut state = SessionParseState::new();
 
         state.add_run_command("", "description", 1234567890);
@@ -522,7 +511,6 @@ mod tests {
 
     #[test]
     fn test_normalize_path_absolute() {
-        // Test normalizing absolute paths
         let mut state = SessionParseState::new();
         state.folder_path = "/workspace".to_string();
 
@@ -532,7 +520,6 @@ mod tests {
 
     #[test]
     fn test_normalize_path_relative() {
-        // Test normalizing relative paths
         let mut state = SessionParseState::new();
         state.folder_path = "/workspace".to_string();
 
@@ -542,7 +529,6 @@ mod tests {
 
     #[test]
     fn test_normalize_path_empty_folder() {
-        // Test normalizing when folder_path is empty
         let state = SessionParseState::new();
 
         let result = state.normalize_path("file.rs");
@@ -551,7 +537,6 @@ mod tests {
 
     #[test]
     fn test_normalize_path_empty_input() {
-        // Test normalizing empty path
         let mut state = SessionParseState::new();
         state.folder_path = "/workspace".to_string();
 
@@ -561,16 +546,13 @@ mod tests {
 
     #[test]
     fn test_unique_files_tracking() {
-        // Test that unique files are tracked correctly
         let mut state = SessionParseState::new();
         state.folder_path = "/project".to_string();
 
-        // Add operations on same file
         state.add_read_detail("file1.rs", "content", 1);
         state.add_write_detail("file1.rs", "content", 2);
         state.add_edit_detail("file1.rs", "old", "new", 3);
 
-        // Add operations on different file
         state.add_read_detail("file2.rs", "content", 4);
 
         assert_eq!(state.unique_files.len(), 2);
@@ -580,7 +562,6 @@ mod tests {
 
     #[test]
     fn test_character_counting() {
-        // Test that character counts are correct
         let mut state = SessionParseState::new();
 
         state.add_read_detail("file.txt", "hello", 1);
@@ -595,7 +576,6 @@ mod tests {
 
     #[test]
     fn test_into_record() {
-        // Test converting state into a record
         let mut state = SessionParseState::new();
         state.folder_path = "/test".to_string();
         state.git_remote = "https://github.com/test/repo".to_string();
@@ -619,7 +599,6 @@ mod tests {
 
     #[test]
     fn test_default_trait() {
-        // Test Default trait implementation
         let state = SessionParseState::default();
 
         assert_eq!(state.total_write_lines, 0);
@@ -629,23 +608,18 @@ mod tests {
 
     #[test]
     fn test_multiple_operations() {
-        // Test handling multiple operations
         let mut state = SessionParseState::new();
         state.folder_path = "/workspace".to_string();
 
-        // Multiple reads
         state.add_read_detail("a.rs", "line1", 1);
         state.add_read_detail("b.rs", "line1\nline2", 2);
         state.add_read_detail("c.rs", "line1\nline2\nline3", 3);
 
-        // Multiple writes
         state.add_write_detail("out1.txt", "content1", 4);
         state.add_write_detail("out2.txt", "content2", 5);
 
-        // Multiple edits
         state.add_edit_detail("edit1.rs", "old", "new", 6);
 
-        // Multiple commands
         state.add_run_command("ls", "list files", 7);
         state.add_run_command("pwd", "print dir", 8);
 

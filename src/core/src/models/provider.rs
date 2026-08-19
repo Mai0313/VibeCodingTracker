@@ -1,3 +1,5 @@
+//! The [`Provider`] discriminator and its model-name detection.
+
 use std::fmt;
 
 /// Supported AI coding assistant providers.
@@ -58,7 +60,6 @@ impl Provider {
     /// assert_eq!(Provider::from_model_name("mystery-model"), Provider::Unknown);
     /// ```
     pub const fn from_model_name(model: &str) -> Self {
-        // Use byte comparison for better performance
         let bytes = model.as_bytes();
 
         if bytes.len() >= 6 {
@@ -74,7 +75,6 @@ impl Provider {
             }
         }
 
-        // Check for "copilot" prefix
         if bytes.len() >= 7
             && bytes[0] == b'c'
             && bytes[1] == b'o'
@@ -107,7 +107,6 @@ impl Provider {
             return Self::Grok;
         }
 
-        // Check for OpenAI/Codex models
         if bytes.len() >= 3 && bytes[0] == b'g' && bytes[1] == b'p' && bytes[2] == b't' {
             return Self::Codex;
         }

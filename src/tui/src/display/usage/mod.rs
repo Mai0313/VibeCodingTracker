@@ -1,9 +1,10 @@
 //! Renderers for the per-model token-usage + cost view.
 //!
-//! `averages` turns a [`UsageData`](vct_core::usage::UsageData) into the priced,
-//! sorted [`UsageSummary`] shared by all output modes;
-//! `interactive`, `table`, and `text` render that summary as the
-//! auto-refreshing TUI, a static table, or one line per model respectively.
+//! The priced, sorted [`UsageSummary`] is built in core; `averages` re-exports
+//! it and adds the display-only provider-total rows. `interactive`, `table` and
+//! `text` render that summary as the auto-refreshing TUI, a static table, or
+//! one line per model respectively. `usage --json` is priced in core and never
+//! reaches this module.
 
 mod averages;
 mod interactive;

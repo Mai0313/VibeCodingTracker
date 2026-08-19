@@ -1,9 +1,9 @@
 //! Serde models for the Google Gemini CLI chat-log JSONL format.
 //!
 //! The first line of each chat file is a [`GeminiSession`] meta record; the
-//! remaining lines are individual events the parser handles as plain `Value`s,
-//! materializing only assistant turns into [`GeminiMessage`]. The `content`
-//! field is polymorphic and handled by the `deserialize_content` helper.
+//! remaining lines are individual events the parser handles as plain `Value`s.
+//! The `content` field is polymorphic and handled by the `deserialize_content`
+//! helper.
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -44,13 +44,13 @@ pub struct GeminiSession {
     pub kind: Option<String>,
 }
 
-/// Single message within a Gemini session
+/// Single message within a Gemini session.
 ///
-/// Used both for the legacy `messages[]` entries and for JSONL events whose
-/// `type == "gemini"`. Non-assistant events (`"user"`, `"info"`, `$set`
-/// meta-updates, …) are filtered out by the analyzer before reaching this
-/// type, so fields such as `content` and `model` can stay absent without
-/// breaking deserialisation.
+/// A `type == "gemini"` event as written on the wire. No parser in this crate
+/// deserializes into it today — the Gemini parser uses its own narrower
+/// analysis shape — and legacy `messages[]` exports are no longer read at all.
+/// Every field tolerates absence, so a partially populated event still
+/// deserializes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GeminiMessage {
@@ -124,7 +124,8 @@ pub struct GeminiThought {
 /// Token-usage breakdown for a single Gemini message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeminiTokens {
-    /// Input (prompt) tokens.
+    /// Input (prompt) tokens: the full prompt count, with the `cached` subset
+    /// already folded in.
     #[serde(default)]
     pub input: i64,
     /// Output (response) tokens.
@@ -133,7 +134,8 @@ pub struct GeminiTokens {
     /// Tokens served from cache.
     #[serde(default)]
     pub cached: i64,
-    /// Tokens spent on reasoning / thoughts.
+    /// Tokens spent on reasoning / thoughts, disjoint from `output` — every
+    /// observed record satisfies `total == input + output + thoughts`.
     #[serde(default)]
     pub thoughts: i64,
     /// Tokens attributed to tool use.

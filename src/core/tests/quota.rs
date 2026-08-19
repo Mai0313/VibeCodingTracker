@@ -69,8 +69,8 @@ fn newest_snapshot_wins_across_roots() {
         "rollout-2026-06-09T21-00-00-new.jsonl",
         &fixture_with_percent("77.0", "88.0"),
     );
-    // The archive move preserves mtime, and users archive same-day, so the
-    // freshest snapshot on disk is frequently the archived one.
+    // mtime ranks across roots, and users archive same-day, so the freshest
+    // snapshot on disk is frequently the archived one.
     let base = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
     std::fs::File::options()
         .write(true)

@@ -83,8 +83,7 @@ const FILE_PROVIDERS: [FileProviderSpec; 6] = [
 ];
 
 /// Scans every enabled file-backed provider through the incremental cache,
-/// folding each into `sink`. Replaces the per-provider `if` ladder in both the
-/// usage and analysis cached collectors.
+/// folding each into `sink`. Shared by the usage and analysis cached collectors.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn scan_all_cached_files(
     paths: &HelperPaths,
