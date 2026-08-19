@@ -17,10 +17,9 @@ use std::path::Path;
 /// tokens" model where the entire request switches to a higher rate once the
 /// prompt crosses a size threshold.
 ///
-/// `cache_creation_input_token_cost_above_1hr` is the price for cache writes
-/// with Anthropic's extended (1 hour) TTL. A value of `0.0` means the model
-/// doesn't offer 1hr cached writes at this tier — callers should fall back to
-/// the 5-minute (`cache_creation_input_token_cost`) price.
+/// Only the lowest tier is ever applied: the session parsers classify each
+/// request against `tiers[0].threshold_tokens` and `calculate_cost` bills the
+/// above-threshold slice at `tiers[0]`.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct ThresholdTier {
     /// Total input context (in tokens) above which this tier's prices take over.
@@ -44,14 +43,18 @@ pub struct ThresholdTier {
 
 /// A single range for range-based tiered pricing (Qwen / doubao style).
 ///
-/// Matches when `input_tokens` falls in `[min_tokens, max_tokens)`. Unlike
-/// `ThresholdTier`, each range is a fully independent price table — base
-/// prices are not used as fallback.
+/// Selection is by `min_tokens` alone: `calculate_cost` takes the last range
+/// whose `min_tokens` is at or below the request's `input_tokens`, so an input
+/// past the final `max_tokens` (or inside a gap between rows) still bills at
+/// the nearest lower row. Unlike `ThresholdTier`, a range replaces the input,
+/// output, reasoning and cache-read prices outright; only cache-write prices
+/// still come from the base level, which LiteLLM does not publish per range.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct TierRange {
     /// Inclusive lower bound of the input-token range this row prices.
     pub min_tokens: i64,
-    /// Exclusive upper bound of the input-token range this row prices.
+    /// Exclusive upper bound as published by LiteLLM; selection reads only
+    /// `min_tokens`.
     pub max_tokens: i64,
     /// Input price in USD per token within this range.
     #[serde(default)]
@@ -72,10 +75,12 @@ pub struct TierRange {
 /// Supports three strategies, checked in this order by `calculate_cost`:
 /// 1. **Range-based** (`ranges` is `Some`): `input_tokens` selects a `TierRange`
 ///    and its prices are applied standalone. Used by Qwen / doubao families.
-/// 2. **Threshold-based** (`tiers` is non-empty): the highest `ThresholdTier`
-///    whose `threshold_tokens` is exceeded by total input context wins; all
-///    token types switch to that tier's prices. Used by Claude Sonnet 4.x,
-///    Gemini 2.5 Pro, Gemini 1.5 (128k), GPT-5.x (272k), etc.
+/// 2. **Threshold-based** (`tiers` is non-empty): the session parsers classify
+///    each request against the model's lowest `threshold_tokens` while folding,
+///    and `calculate_cost` bills that above-threshold slice at `tiers[0]`'s
+///    prices with the rest staying on base prices. Higher tiers are never
+///    selected. Used by Claude Sonnet 4.x, Gemini 2.5 Pro, Gemini 1.5 (128k),
+///    GPT-5.x (272k), etc.
 /// 3. **Flat** (neither set): base prices apply to every request.
 ///
 /// This struct is only ever held in memory — `tiers` / `ranges` are derived
@@ -169,8 +174,10 @@ fn parse_tier_range(value: &serde_json::Value) -> Option<TierRange> {
 /// Extracts base prices, consolidates all `*_above_Nk_tokens` fields into
 /// `ThresholdTier` rows keyed by the numeric threshold, and parses
 /// `tiered_pricing` arrays into `TierRange` rows. `cache_creation_input_token_cost_above_1hr`
-/// is captured as a separate 1-hour TTL price (base and per-tier). Unsupported
-/// fields (batch / priority / audio / computer_use) are ignored.
+/// is captured as a separate 1-hour TTL price (base and per-tier), and the
+/// nested `search_context_cost_per_query` object collapses to one per-query
+/// web-search price. Unsupported fields (batch / priority / audio /
+/// computer_use) are ignored.
 pub fn parse_litellm_entry(value: &serde_json::Value) -> ModelPricing {
     let obj = match value.as_object() {
         Some(o) => o,
@@ -182,7 +189,8 @@ pub fn parse_litellm_entry(value: &serde_json::Value) -> ModelPricing {
     let mut tier_output: HashMap<i64, f64> = HashMap::new();
     let mut tier_cache_read: HashMap<i64, f64> = HashMap::new();
     let mut tier_cache_creation: HashMap<i64, f64> = HashMap::new();
-    // 1-hour TTL variants: a threshold of 0 means the base (non-tiered) 1hr price.
+    // 1-hour TTL variants, keyed by tier threshold; the base (non-tiered) 1hr
+    // price is a field on `ModelPricing`, never an entry here.
     let mut tier_cache_creation_1hr: HashMap<i64, f64> = HashMap::new();
 
     for (key, raw_val) in obj {
@@ -223,7 +231,6 @@ pub fn parse_litellm_entry(value: &serde_json::Value) -> ModelPricing {
                 pricing.cache_creation_input_token_cost = num_value
             }
             "cache_creation_input_token_cost_above_1hr" => {
-                // Base (non-tiered) 1hr TTL price.
                 pricing.cache_creation_input_token_cost_above_1hr = num_value;
             }
             "output_cost_per_reasoning_token" => {
@@ -312,6 +319,9 @@ pub fn parse_litellm_entry(value: &serde_json::Value) -> ModelPricing {
 }
 
 /// Parses the full LiteLLM `model_prices_and_context_window.json` payload.
+///
+/// A payload that is not a JSON object, and any entry that is not an object,
+/// yield no models rather than an error.
 pub fn parse_litellm_pricing_map(raw: serde_json::Value) -> HashMap<String, ModelPricing> {
     let obj = match raw.as_object() {
         Some(o) => o,
@@ -327,21 +337,18 @@ pub fn parse_litellm_pricing_map(raw: serde_json::Value) -> HashMap<String, Mode
 /// object, preserving values verbatim (including nested objects like
 /// `search_context_cost_per_query`).
 ///
-/// We keep *all* keys whose name contains `cost` rather than only the ones
-/// the current `calculate_cost` knows how to consume. That way the on-disk
-/// cache is a faithful, diff-able subset of the upstream LiteLLM JSON —
-/// future calculation strategies (priority / flex / batch tiers, audio /
-/// image modalities, reasoning-token splits, …) don't require re-fetching
-/// or a schema migration to gain access to the numbers they need.
+/// Every key whose name contains `cost` is kept, not just the ones
+/// `calculate_cost` consumes today, so a future strategy can read the numbers
+/// it needs out of an existing cache file without a refetch or a migration.
 ///
 /// `tiered_pricing` is whitelisted explicitly even though the key name
 /// doesn't contain `cost`: its array values are the **only** source of
 /// range-based pricing (Qwen / doubao / dashscope), so dropping it would
 /// silently zero out those models on every cache reload.
 ///
-/// Returns `None` when the entry has no cost-related keys at all; such
-/// models carry nothing we can price against and are skipped at the map
-/// level.
+/// Returns `None` for an entry that is not an object, or that has no
+/// cost-related keys at all; such models carry nothing we can price against
+/// and are skipped at the map level.
 pub fn filter_cost_fields(value: &Value) -> Option<Value> {
     let obj = value.as_object()?;
     let mut filtered = Map::with_capacity(obj.len());
@@ -358,9 +365,9 @@ pub fn filter_cost_fields(value: &Value) -> Option<Value> {
 }
 
 /// Builds the on-disk cache payload: a map from model name to its
-/// cost-only subset (see `filter_cost_fields`). Non-object top-level
-/// entries (e.g. LiteLLM's `sample_spec`, which is kept — it still has
-/// cost keys) and entries with no cost keys are dropped here.
+/// cost-only subset (see `filter_cost_fields`). Entries that are not objects,
+/// and objects carrying no cost keys, are dropped here; LiteLLM's
+/// `sample_spec` survives because it does carry cost keys.
 pub fn build_filtered_cost_json(raw: &Value) -> Value {
     let obj = match raw.as_object() {
         Some(o) => o,
@@ -381,7 +388,7 @@ pub(crate) fn pricing_cache_date() -> String {
 
 /// Removes outdated pricing cache files in `dir`, keeping only today's cache.
 ///
-/// Best-effort: a failure to list or delete a file is logged or ignored rather
+/// Best-effort: an unreadable directory or a failed delete is ignored rather
 /// than propagated, since a stale cache file is harmless and rotates out daily.
 pub fn cleanup_old_cache_in(dir: &Path) {
     let today = pricing_cache_date();
@@ -401,22 +408,13 @@ pub fn cleanup_old_cache_in(dir: &Path) {
 /// shape, so we re-run `parse_litellm_entry` here to rebuild `tiers`
 /// and `ranges` on load.
 ///
-/// Pre-Phase-2 versions serialised the derived `ModelPricing` struct
-/// directly, carrying top-level `tiers` / `ranges` arrays instead of
-/// the raw `*_above_Nk_tokens` / `tiered_pricing` keys.
-/// `parse_litellm_entry` would silently drop those arrays (they aren't
-/// cost-keyed scalars) and under-price every tier- or range-priced
-/// model until the cache rotated the next day. We detect that shape
-/// via `looks_like_legacy_pricing_cache` and return `Err` so
-/// `fetch_model_pricing` falls through to a refetch, which overwrites
-/// the stale cache with the new schema.
-///
 /// # Errors
 ///
 /// Returns an error if no cache file exists for today, the file cannot be
-/// read, its contents are not valid JSON, it contains no priced model, or the
-/// file is in the pre-Phase-2 legacy schema (deliberately treated as an error
-/// to force a refetch).
+/// read, its contents are not valid JSON or not a JSON object, it carries a
+/// negative or non-finite price, it contains no priced model, or it is in the
+/// legacy serialized-`ModelPricing` schema. That last case is deliberately an
+/// error so the caller refetches and overwrites the stale file.
 pub fn load_from_cache_in(dir: &Path) -> Result<HashMap<String, ModelPricing>> {
     let today = pricing_cache_date();
     let cache_path = find_pricing_cache_for_date_in(dir, &today)
@@ -449,15 +447,12 @@ pub fn load_from_cache_in(dir: &Path) -> Result<HashMap<String, ModelPricing>> {
     Ok(pricing)
 }
 
-/// Heuristic: does this cache file look like a pre-Phase-2 serialised
-/// `ModelPricing` map?
+/// Whether this cache file is a legacy serialized `ModelPricing` map.
 ///
-/// The new schema (`build_filtered_cost_json` → `filter_cost_fields`)
-/// only emits keys that either contain `cost` or equal `tiered_pricing`,
-/// so it never produces top-level `tiers` / `ranges` arrays on an
-/// entry. The old schema (`ModelPricing` via derived `Serialize`) did
-/// emit them whenever a model carried tier or range data. Any entry
-/// with such a key is a definitive signal of the old format.
+/// The current schema keeps only keys containing `cost` plus
+/// `tiered_pricing`, so a `tiers` / `ranges` key on an entry can only come
+/// from the old derived-`Serialize` shape, whose arrays `parse_litellm_entry`
+/// would silently drop.
 fn looks_like_legacy_pricing_cache(raw: &Value) -> bool {
     let Some(obj) = raw.as_object() else {
         return false;
@@ -470,11 +465,9 @@ fn looks_like_legacy_pricing_cache(raw: &Value) -> bool {
 /// Saves a raw LiteLLM cost-field subset to today's cache file under an explicit
 /// cache dir and cleans up old caches.
 ///
-/// Callers should pass the output of `build_filtered_cost_json` so the
-/// on-disk payload is a cost-only projection of the upstream LiteLLM JSON
-/// — that keeps the cache file small, diff-able against upstream, and
-/// forward-compatible with calculation strategies that aren't wired up
-/// yet.
+/// Callers must pass the output of `build_filtered_cost_json`: the on-disk
+/// payload is the raw cost-key projection, and `load_from_cache_in` rejects a
+/// file holding the derived `ModelPricing` shape.
 ///
 /// # Errors
 ///
@@ -496,7 +489,7 @@ pub fn save_to_cache_in(dir: &Path, filtered_raw: &Value) -> Result<()> {
 /// whose usable pricing fields contain an invalid rate.
 ///
 /// A model is kept if **any** of the following yields a positive price:
-/// - The base-level per-token costs.
+/// - Any base-level price, including the per-query web-search rate.
 /// - Any tier entry (`ThresholdTier`) with at least one positive field.
 /// - Any range entry (`TierRange`) with at least one positive field.
 ///
@@ -770,10 +763,10 @@ mod parser_tests {
 
     #[test]
     fn cache_reload_reconstructs_tiers_from_raw_keys() {
-        // Cache files now store the raw LiteLLM cost-field subset rather
-        // than our derived `ModelPricing` shape. Reloading must rebuild
-        // `tiers` by re-running `parse_litellm_entry`, or a Sonnet-style
-        // 200K tier would silently vanish and under-price large sessions.
+        // Cache files store the raw LiteLLM cost-field subset, so a reload
+        // must rebuild `tiers` by re-running `parse_litellm_entry` or a
+        // Sonnet-style 200K tier silently vanishes and under-prices large
+        // sessions.
         let raw = json!({
             "input_cost_per_token": 3e-6,
             "output_cost_per_token": 1.5e-5,
@@ -792,8 +785,7 @@ mod parser_tests {
     #[test]
     fn parses_output_cost_per_reasoning_token() {
         // Gemini 2.5 Flash and friends bill `thoughts_tokens` at a separate
-        // per-token rate. Older `ModelPricing` dropped this field entirely;
-        // the parser now preserves it as a base-level price.
+        // per-token rate, kept as a base-level price.
         let raw = json!({
             "input_cost_per_token": 3e-7,
             "output_cost_per_token": 2.5e-6,
@@ -934,11 +926,10 @@ mod parser_tests {
     #[test]
     fn cache_roundtrip_preserves_range_priced_models() {
         // Full-pipeline regression: a range-priced model goes through
-        // `build_filtered_cost_json` (what `save_to_cache` writes) and
-        // back through `parse_litellm_pricing_map` (what
-        // `load_from_cache` reads). `ranges` must survive end-to-end —
-        // earlier iterations of the filter dropped `tiered_pricing` as
-        // a non-cost key, zeroing every Qwen / doubao model.
+        // `build_filtered_cost_json` (what `save_to_cache_in` writes) and
+        // back through `parse_litellm_pricing_map` (what `load_from_cache_in`
+        // reads). `ranges` must survive end-to-end, or every Qwen / doubao
+        // model prices at zero.
         let upstream = json!({
             "qwen3-coder-plus": {
                 "tiered_pricing": [
@@ -1043,7 +1034,6 @@ mod serialization_tests {
 
     #[test]
     fn test_model_pricing_default() {
-        // Test ModelPricing default values
         let pricing = ModelPricing::default();
 
         assert_eq!(pricing.input_cost_per_token, 0.0);
@@ -1056,7 +1046,7 @@ mod serialization_tests {
 
     #[test]
     fn test_model_pricing_serialization() {
-        // Test ModelPricing can be serialized and deserialized with a threshold tier
+        // A threshold tier survives a serialize / deserialize round trip.
         let pricing = ModelPricing {
             input_cost_per_token: 0.000001,
             output_cost_per_token: 0.000002,
@@ -1088,7 +1078,7 @@ mod serialization_tests {
 
     #[test]
     fn test_model_pricing_clone() {
-        // Vec means ModelPricing is no longer Copy — explicit clone is required.
+        // `ModelPricing` holds a `Vec`, so it is `Clone` but not `Copy`.
         let pricing1 = ModelPricing {
             input_cost_per_token: 0.000001,
             output_cost_per_token: 0.000002,
@@ -1106,7 +1096,6 @@ mod serialization_tests {
 
     #[test]
     fn test_model_pricing_debug() {
-        // Test ModelPricing debug formatting
         let pricing = ModelPricing::default();
         let debug_str = format!("{:?}", pricing);
 
@@ -1115,7 +1104,7 @@ mod serialization_tests {
 
     #[test]
     fn test_model_pricing_with_partial_data() {
-        // Test deserializing with partial data (using #[serde(default)])
+        // Absent fields fall back to `#[serde(default)]`.
         let json = r#"{"input_cost_per_token": 0.000001}"#;
         let pricing: ModelPricing = serde_json::from_str(json).unwrap();
 
@@ -1125,7 +1114,6 @@ mod serialization_tests {
 
     #[test]
     fn test_model_pricing_empty_json() {
-        // Test deserializing empty JSON object
         let json = "{}";
         let pricing: ModelPricing = serde_json::from_str(json).unwrap();
 
@@ -1135,7 +1123,6 @@ mod serialization_tests {
 
     #[test]
     fn test_model_pricing_hashmap_serialization() {
-        // Test HashMap<String, ModelPricing> serialization
         let mut pricing_map = HashMap::new();
         pricing_map.insert(
             "gpt-4".to_string(),
@@ -1214,19 +1201,18 @@ mod serialization_tests {
 
     #[test]
     fn test_model_pricing_zero_values() {
-        // Test with all zero values
         let pricing = ModelPricing::default();
         let json = serde_json::to_string(&pricing).unwrap();
         let deserialized: ModelPricing = serde_json::from_str(&json).unwrap();
 
-        // All should be zero
         assert_eq!(deserialized.input_cost_per_token, 0.0);
         assert_eq!(deserialized.output_cost_per_token, 0.0);
     }
 
     #[test]
     fn test_model_pricing_negative_values() {
-        // Test that negative values are preserved (although not realistic)
+        // Serde preserves a negative rate; rejecting one is
+        // `model_pricing_rates_are_valid`'s job, not the deserializer's.
         let pricing = ModelPricing {
             input_cost_per_token: -0.000001,
             output_cost_per_token: -0.000002,
@@ -1242,7 +1228,6 @@ mod serialization_tests {
 
     #[test]
     fn test_model_pricing_very_small_values() {
-        // Test with very small values (scientific notation)
         let pricing = ModelPricing {
             input_cost_per_token: 1e-10,
             output_cost_per_token: 1e-15,
@@ -1258,7 +1243,6 @@ mod serialization_tests {
 
     #[test]
     fn test_model_pricing_large_values() {
-        // Test with large values
         let pricing = ModelPricing {
             input_cost_per_token: 1000000.0,
             output_cost_per_token: 9999999.99,
