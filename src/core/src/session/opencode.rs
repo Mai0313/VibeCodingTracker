@@ -891,6 +891,19 @@ fn extract_patch_strings(lines: &[String]) -> (String, String) {
 /// OpenCode records non-cached input separately from cache reads (input is
 /// disjoint from cache, matching the Claude convention), so each counter drops
 /// into one bucket with no adjustment.
+///
+/// `reasoning` is disjoint from `output` as well, which is why nothing here
+/// mirrors the `output - reasoning` correction Copilot, Hermes and DeepSeek
+/// Harness each apply at their parsers: OpenCode has already made it, in
+/// `Session.getUsage`, which is where both the message payload and the legacy
+/// columns get their token object from. Current databases bear it out — the
+/// stored `total` (the provider's own count, kept untouched) comes to
+/// `input + output + reasoning + cache`, and plenty of rows report more
+/// reasoning than output, which is impossible had output ever contained it.
+/// Subtracting a second time would floor most short thinking-heavy replies at
+/// zero output; `test_read_usage_maps_tokens` and
+/// `test_legacy_session_usage_keeps_reasoning_disjoint` hold the two read
+/// paths to that.
 fn session_usage_value(
     input: i64,
     output: i64,
@@ -1432,6 +1445,32 @@ mod tests {
         assert_eq!(usage["reasoning_output_tokens"], 7);
         assert_eq!(usage["cache_read_input_tokens"], 200);
         assert_eq!(usage["cache_creation_input_tokens"], 25);
+    }
+
+    /// The legacy branch only runs when there is no `message` table, so the
+    /// session row in `test_read_usage_maps_tokens` never reaches it.
+    #[test]
+    fn test_legacy_session_usage_keeps_reasoning_disjoint() {
+        let (_dir, db_path) = make_db();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute("DROP TABLE message", []).unwrap();
+        conn.execute("DROP TABLE part", []).unwrap();
+        conn.execute(
+	            "INSERT INTO session (id, model, directory, time_updated, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write)
+	             VALUES ('s1', '{\"id\":\"gpt-5.4\"}', '/repo', 1780757088080, 0.02, 19691, 21, 26, 0, 0)",
+	            [],
+	        )
+	        .unwrap();
+        drop(conn);
+
+        let rows = read_opencode_usage(&db_path, TimeRange::All).unwrap();
+        assert_eq!(rows.len(), 1);
+        let usage = &rows[0].1.records[0].conversation_usage["gpt-5.4"];
+        // More reasoning than output is the shape real rows take, and is
+        // impossible had output ever contained reasoning; a subtraction added
+        // here would floor this at zero.
+        assert_eq!(usage["output_tokens"], 21);
+        assert_eq!(usage["reasoning_output_tokens"], 26);
     }
 
     #[test]
