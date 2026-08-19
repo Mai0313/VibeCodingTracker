@@ -1,0 +1,6 @@
+# Every rustdoc lint is warn-by-default, so a broken intra-doc link would
+# otherwise just scroll past a plain `cargo doc`. Denying here rather than in a
+# `[lints.rustdoc]` table keeps the escalation out of the published `.crate`, so
+# a nightly lint change can never fail a docs.rs build for a released version.
+[build]
+rustdocflags = ["-D", "warnings"]

@@ -189,7 +189,7 @@ When optimizing, include before/after numbers in the PR description.
 
 #### Code Quality
 
-We use `rustfmt` and `clippy` to ensure code quality. The CI (`.github/workflows/code-quality-check.yml`) runs both with `-D warnings`, so please run them locally before submitting:
+We use `rustfmt`, `clippy` and `rustdoc` to ensure code quality. The CI (`.github/workflows/code-quality-check.yml`) runs all three with `-D warnings`, so please run them locally before submitting:
 
 ```bash
 # Format your code
@@ -200,6 +200,11 @@ cargo fmt --all -- --check
 
 # Run linting checks (warnings are errors in CI)
 cargo clippy --all-targets --all-features --locked -- -D warnings
+
+# Build the docs; `.cargo/config.toml` turns every rustdoc warning into an
+# error, and each mode checks links the other cannot see
+cargo doc --no-deps --workspace --all-features
+cargo doc --no-deps --workspace --all-features --document-private-items
 ```
 
 #### Pre-commit Hooks
@@ -243,7 +248,7 @@ Aggregate sessions whose modified date falls within the current ISO week.
 
 1. Fork the repository and create a topic branch (`feat/...`, `fix/...`, `docs/...`).
 2. Make focused commits following the convention above.
-3. Run `make fmt`, `uvx pre-commit run -a`, `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features --locked -- -D warnings`, `VCT_OFFLINE=1 cargo test --all-targets --all-features --locked`, `cargo +1.95.0 check --all-targets --all-features --locked`, and `cargo build --profile dist --locked`.
+3. Run `make fmt`, `uvx pre-commit run -a`, `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features --locked -- -D warnings`, `cargo doc --no-deps --workspace --all-features` (also with `--document-private-items`), `VCT_OFFLINE=1 cargo test --all-targets --all-features --locked`, `cargo +1.95.0 check --all-targets --all-features --locked`, and `cargo build --profile dist --locked`.
 4. Update the relevant README files (`README.md`, `README.zh-CN.md`, `README.zh-TW.md`) when behavior or flags change — all three languages should stay in sync.
 5. Open a draft PR against `main` with an English title and body. Keep it in draft until every GitHub Actions check passes; the title must satisfy the semantic-pull-request check.
 

@@ -11,14 +11,6 @@ license = "MIT"
 homepage = "https://github.com/Mai0313/VibeCodingTracker"
 repository = "https://github.com/Mai0313/VibeCodingTracker"
 
-# Rustdoc lints, inherited by every member via `[lints] workspace = true`.
-# These are warn-by-default, so without this table a broken link only scrolls
-# past a plain `cargo doc` and the count grows unnoticed.
-[workspace.lints.rustdoc]
-broken_intra_doc_links = "deny"
-private_intra_doc_links = "deny"
-redundant_explicit_links = "deny"
-
 [workspace.dependencies]
 # Internal crates (path deps, never published)
 # Internal path deps carry a `version` so crates.io can resolve them when

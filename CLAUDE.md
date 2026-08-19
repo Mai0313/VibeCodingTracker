@@ -28,7 +28,7 @@ The repo is a Cargo workspace, so `cargo build --workspace` / `cargo test --work
 | `cargo build --profile dist --locked`       | Distribution build (fat LTO, single codegen unit) of the whole workspace — used by release artifacts |
 | `cargo build --release --features mimalloc` | Opt-in mimalloc allocator (faster one-shot, ~10× higher RSS in TUI loops)                            |
 | `make fmt`                                  | `cargo fmt --all` + `cargo clippy --fix` + clippy with `-D warnings`                                 |
-| `cargo doc --no-deps --workspace`           | Rustdoc build; `[workspace.lints.rustdoc]` denies broken / private / redundant intra-doc links       |
+| `cargo doc --no-deps --workspace`           | Rustdoc build; `.cargo/config.toml` denies every rustdoc warning, broken intra-doc links included    |
 | `uvx pre-commit run --all-files`            | Run all pre-commit hooks (whitespace, JSON/YAML/TOML, mdformat, gitleaks, shellcheck)                |
 | `uvx pre-commit install --install-hooks`    | Install the git hooks once after cloning                                                             |
 
