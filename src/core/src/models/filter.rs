@@ -54,15 +54,6 @@ impl TimeRange {
     }
 }
 
-/// Collapses the period flags into a single [`TimeRange`].
-///
-/// Falls back to [`TimeRange::All`] when none is set. The flags are mutually
-/// exclusive at the CLI layer (shared `period` group), so at most one is ever
-/// true here.
-pub fn resolve_time_range(daily: bool, weekly: bool, monthly: bool) -> TimeRange {
-    resolve_time_range_with_default(daily, weekly, monthly, false, TimeRange::All)
-}
-
 /// Collapses the period flags into a [`TimeRange`], falling back to `default`
 /// when the caller passed none of them.
 ///
