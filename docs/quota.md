@@ -195,7 +195,7 @@ Response is `totalUsageEventsCount` + a `usageEventsDisplay[]` page; paginate `p
 
 Reactive. The `accessToken` is valid ~60 days (`offline_access` scope) and the official Cursor CLI / IDE keeps `auth.json` fresh in the background, so the simplest approach is to re-read the file each poll and use the token while its JWT `exp` is in the future.
 cursor.com does not return a rotating `Set-Cookie` on the usage call.
-Self-refresh would go through WorkOS AuthKit (`authentication.cursor.sh`) via the cursor backend (`api2.cursor.sh`, paths like `/auth/token`), but the exact request shape is not pinned here. On a `401` re-login via `cursor login`.
+Self-refresh would go through WorkOS AuthKit (`authentication.cursor.sh`) via the cursor backend (`api2.cursor.sh`, paths like `/auth/token`), but the exact request shape is not pinned here. On a `401` re-login via `cursor-agent login`.
 
 ## Antigravity
 
