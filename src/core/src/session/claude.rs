@@ -17,12 +17,7 @@ use crate::utils::{
 use anyhow::Result;
 use serde_json::Value;
 
-/// Parse Claude Code session records from a `Vec<Value>` fallback.
-///
-/// Used by the pretty-printed single-object JSON fallback path in the
-/// top-level [`parse_session_file_typed`] dispatcher. Records are moved
-/// into the typed iterator form so that the lean [`ClaudeCodeLog`] shape
-/// drops unused payloads at deserialisation.
+/// Parse Claude Code session records already materialised as a `Vec<Value>`.
 ///
 /// Records that fail to deserialise into [`ClaudeCodeLog`] are skipped rather
 /// than aborting the parse.
@@ -32,8 +27,6 @@ use serde_json::Value;
 /// Returns `Err` only if the underlying [`parse_claude_logs`] does; in
 /// practice the Claude parse never fails (malformed records are dropped),
 /// so this is `Ok` for any input.
-///
-/// [`parse_session_file_typed`]: crate::session::parser::parse_session_file_typed
 pub fn parse_claude_log_values(records: Vec<Value>, mode: ParseMode) -> Result<CodeAnalysis> {
     let iter = records
         .into_iter()
@@ -43,9 +36,8 @@ pub fn parse_claude_log_values(records: Vec<Value>, mode: ParseMode) -> Result<C
 
 /// Parse Claude Code session records from any iterator of pre-typed logs.
 ///
-/// This is the streaming entry point: callers that read JSONL one line at a
-/// time (see [`crate::session::parser::parse_session_file_to_value`]) feed records
-/// through here without ever materialising a full `Vec<Value>` of raw JSON.
+/// The streaming entry point: records can be fed in one line at a time,
+/// without ever materialising a full `Vec<Value>` of raw JSON.
 ///
 /// The returned [`CodeAnalysis`] always holds exactly one record; the
 /// runtime metadata fields (`user`, `extension_name`, …) are left blank here
@@ -156,11 +148,11 @@ where
                     // Claude Code's top-level `usage` is the sum of the
                     // `message`-type entries in `usage.iterations` and EXCLUDES any
                     // `advisor_message` iteration (a secondary inference Claude Code
-                    // runs but keeps off its own /cost accounting). Capture those
-                    // advisor tokens — under the advisor's own model so they price
-                    // correctly — in the separate `advisor_usage` map so the
-                    // `usage` cost reflects them without the `analysis` aggregator
-                    // crediting the advisor with the main model's file operations.
+                    // runs but keeps off its own /cost accounting). The sample in
+                    // `advisor_message_usage_is_separated_from_conversation_usage`
+                    // below is what that was read off. Key each advisor iteration by
+                    // the model it names so it prices at that model's rate; one that
+                    // names no model falls back to the main model's key.
                     if let Some(iters) = usage.get("iterations").and_then(|v| v.as_array()) {
                         for iter in iters {
                             if iter.get("type").and_then(|t| t.as_str()) == Some("advisor_message")
@@ -296,12 +288,12 @@ where
         {
             // Subagent JSONL fallback: tool results live inside
             // `message.content[].tool_result` instead of the top-level
-            // `toolUseResult` field. We gate this on `is_sidechain` because
-            // main-session user records can also legitimately have content
-            // tool_result blocks alongside a non-dict (string-shaped)
-            // `toolUseResult` (e.g. user-rejection messages); without the
-            // sidechain guard those would double-count against the
-            // toolUseResult path that runs above.
+            // `toolUseResult` field. Gated on `is_sidechain` because a
+            // main-session user record can carry a content tool_result block
+            // alongside a string-shaped `toolUseResult` (e.g. a user
+            // rejection), which deserializes to `None` and so lands in this
+            // branch; that string result carries no file body, so the content
+            // block's text must not be counted as one.
             for item in &message.content {
                 let ClaudeContentItem::ToolResult {
                     tool_use_id,
@@ -638,9 +630,8 @@ fn dispatch_subagent_tool_result(
 
     match tool_name {
         "Read" => {
-            // The numbered file contents the subagent saw — drives the
-            // read-line tally. Use the result body, not the input, since
-            // Read's input only carries the path.
+            // Read's input carries only the path, so the line tally has to
+            // come from the result body.
             preserve_file_tool_counts(state, |state| {
                 state.add_read_detail(file_path, result_content, ts);
             });
@@ -786,9 +777,9 @@ mod tests {
     fn main_session_string_tool_use_result_does_not_double_count() {
         // Main session records can have a string-shaped toolUseResult
         // (rejection messages) alongside a content tool_result block.
-        // Without `is_sidechain`, the fallback would double-count. Here
-        // we simulate `isSidechain == false` and expect zero read lines
-        // (the string `toolUseResult` carries no file content).
+        // Here we simulate `isSidechain == false` and expect zero read
+        // lines: the string `toolUseResult` carries no file content, so the
+        // content block's text must not be counted as one.
         let raw_assistant = serde_json::json!({
             "type": "assistant",
             "timestamp": "2025-01-01T00:00:00Z",

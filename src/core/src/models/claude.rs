@@ -10,10 +10,9 @@ use serde_json::Value;
 
 /// Single log entry from a Claude Code session file.
 ///
-/// Only fields the analyzer actually reads are materialised. Large unrelated
-/// payloads — assistant text content, `tool_result` bodies, `parentUuid`,
-/// version metadata — are dropped by serde during parse so they never retain
-/// memory, which is what keeps long sessions from ballooning the working set.
+/// Large unrelated payloads — assistant text content, `parentUuid`, version
+/// metadata — are dropped by serde during parse so they never retain memory,
+/// which is what keeps long sessions from ballooning the working set.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClaudeCodeLog {
@@ -38,15 +37,13 @@ pub struct ClaudeCodeLog {
     /// `true` for records inside a subagent JSONL
     /// (`<session>/subagents/agent-*.jsonl`). Subagent records do not carry
     /// the top-level `toolUseResult` field, so the analyzer falls back to
-    /// scanning `message.content[].tool_result` for them. Main-session
-    /// records (`isSidechain == false` or missing) skip the fallback to
-    /// avoid double-counting tool results that already arrived via
-    /// `toolUseResult`.
+    /// scanning `message.content[].tool_result` for them; main-session
+    /// records (`isSidechain == false` or missing) skip that fallback.
     #[serde(default)]
     pub is_sidechain: bool,
 }
 
-/// Assistant/user message with only the fields `session::claude::parse_claude_logs` inspects.
+/// Assistant/user message, carrying only the fields the Claude parser inspects.
 ///
 /// `content` may appear in the source as either an array of typed blocks
 /// (assistant messages) or a plain string (user messages like `"Caveat: ..."`).
@@ -69,9 +66,8 @@ pub struct ClaudeMessage {
 ///
 /// `ToolUse` carries the assistant-side invocation. `ToolResult` carries the
 /// matching result block from the *user*-role record — used as a fallback
-/// when the legacy top-level `toolUseResult` field is absent (Claude Code
-/// subagent JSONL files under `<session>/subagents/agent-*.jsonl` only
-/// embed results inside `message.content[].tool_result` blocks). Anything
+/// when the legacy top-level `toolUseResult` field is absent (subagent JSONL
+/// files embed results only inside `message.content[].tool_result`). Anything
 /// else (text, thinking traces, images, …) collapses to `Other` and is
 /// discarded at parse time.
 #[derive(Debug, Clone, Deserialize)]
@@ -97,7 +93,7 @@ pub enum ClaudeContentItem {
         /// Flattened result text (string or joined array blocks).
         #[serde(default, deserialize_with = "deserialize_tool_result_content")]
         content: String,
-        /// Whether Claude rejected the invocation before the tool ran.
+        /// Whether the call came back as an error rather than a result.
         #[serde(default)]
         is_error: bool,
     },
@@ -106,28 +102,23 @@ pub enum ClaudeContentItem {
     Other,
 }
 
-/// Tool input across all tools we care about. Each tool only populates a
-/// subset of fields; serde silently ignores unknown fields and unset fields
-/// stay `None`. Unrelated tools (Glob, Grep, WebSearch, …) deserialize into
-/// an all-`None` value that the analyzer treats as a no-op.
+/// Tool input across all tools we care about. Each tool populates only a
+/// subset of these fields; unrelated tools (Glob, Grep, WebSearch, …)
+/// deserialize into an all-`None` value the analyzer treats as a no-op.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ClaudeToolInput {
-    // Bash
     /// Shell command line (Bash tool).
     #[serde(default)]
     pub command: Option<String>,
     /// Human-readable command description (Bash tool).
     #[serde(default)]
     pub description: Option<String>,
-    // Read / Write / Edit share `file_path`
     /// Target file path (Read / Write / Edit tools).
     #[serde(default)]
     pub file_path: Option<String>,
-    // Write
     /// File content to write (Write tool).
     #[serde(default)]
     pub content: Option<String>,
-    // Edit
     /// Text to replace (Edit tool).
     #[serde(default)]
     pub old_string: Option<String>,
