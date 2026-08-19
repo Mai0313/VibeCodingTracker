@@ -462,8 +462,14 @@ fn acquire_update_lock_at(current_exe: &Path) -> Result<lock::UpdateLock> {
 /// never block the requested command.
 pub fn maybe_auto_update(enabled: bool) -> AutoUpdateOutcome {
     let offline = crate::utils::network_disabled();
-    let Ok(current_exe) = env::current_exe() else {
-        return AutoUpdateOutcome::Failed;
+    let current_exe = match env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            log::warn!(
+                "startup auto-update failed: cannot resolve the running executable: {error}"
+            );
+            return AutoUpdateOutcome::Failed;
+        }
     };
     let managed = ownership::is_release_managed(&current_exe);
     if !auto_update_allowed(enabled, offline, managed) {

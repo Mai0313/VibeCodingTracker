@@ -397,15 +397,18 @@ pub(crate) fn pricing_cache_date() -> String {
 
 /// Removes outdated pricing cache files in `dir`, keeping only today's cache.
 ///
-/// Best-effort: an unreadable directory or a failed delete is ignored rather
-/// than propagated, since a stale cache file is harmless and rotates out daily.
+/// Best-effort: an unreadable directory or a failed delete is logged rather
+/// than propagated, since a stale cache file is harmless. A delete that keeps
+/// failing does not rotate out on its own, though, so it is worth a warning.
 pub fn cleanup_old_cache_in(dir: &Path) {
     let today = pricing_cache_date();
 
     for (filename, path) in list_pricing_cache_files_in(dir) {
         if !filename.contains(&today) {
-            let _ = fs::remove_file(&path);
-            log::debug!("Removed old cache file: {:?}", path);
+            match fs::remove_file(&path) {
+                Ok(()) => log::debug!("Removed old cache file: {}", path.display()),
+                Err(e) => log::warn!("Failed to remove old cache file {}: {e}", path.display()),
+            }
         }
     }
 }
