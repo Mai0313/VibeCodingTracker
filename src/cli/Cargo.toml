@@ -12,6 +12,9 @@ readme = "../../README.md"
 # The assert_cmd binary test is not self-contained inside a published `.crate`.
 exclude = ["tests"]
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "vibe_coding_tracker"
 path = "src/main.rs"

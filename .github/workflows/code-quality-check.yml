@@ -43,3 +43,11 @@ jobs:
       - name: clippy (deny warnings)
         run: |
           cargo clippy --all-targets --all-features -- -D warnings
+
+      # Public-only is what docs.rs renders, and the only mode where
+      # `private_intra_doc_links` fires; `--document-private-items` is the only
+      # mode that checks links inside private items.
+      - name: rustdoc (deny warnings)
+        run: |
+          cargo doc --no-deps --workspace --all-features
+          cargo doc --no-deps --workspace --all-features --document-private-items

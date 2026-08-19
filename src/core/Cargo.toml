@@ -13,6 +13,9 @@ readme = "../../README.md"
 # test-support crate, so they are not self-contained inside a published `.crate`.
 exclude = ["tests"]
 
+[lints]
+workspace = true
+
 [lib]
 path = "src/lib.rs"
 

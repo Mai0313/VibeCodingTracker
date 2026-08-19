@@ -13,6 +13,9 @@ readme = "../../README.md"
 # self-contained inside a published `.crate`.
 exclude = ["benches"]
 
+[lints]
+workspace = true
+
 [lib]
 path = "src/lib.rs"
 

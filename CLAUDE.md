@@ -28,12 +28,13 @@ The repo is a Cargo workspace, so `cargo build --workspace` / `cargo test --work
 | `cargo build --profile dist --locked`       | Distribution build (fat LTO, single codegen unit) of the whole workspace — used by release artifacts |
 | `cargo build --release --features mimalloc` | Opt-in mimalloc allocator (faster one-shot, ~10× higher RSS in TUI loops)                            |
 | `make fmt`                                  | `cargo fmt --all` + `cargo clippy --fix` + clippy with `-D warnings`                                 |
+| `cargo doc --no-deps --workspace`           | Rustdoc build; `[workspace.lints.rustdoc]` denies broken / private / redundant intra-doc links       |
 | `uvx pre-commit run --all-files`            | Run all pre-commit hooks (whitespace, JSON/YAML/TOML, mdformat, gitleaks, shellcheck)                |
 | `uvx pre-commit install --install-hooks`    | Install the git hooks once after cloning                                                             |
 
 Criterion benchmarks live at `src/tui/benches/benchmarks.rs` (run from the `vct-tui` crate); reports land in `target/criterion`.
 
-**Before every commit / PR**, always run `make fmt` and `uvx pre-commit run -a`. CI runs both with `-D warnings`, and the pre-commit hooks gate-keep the repo (gitleaks, mdformat, etc.).
+**Before every commit / PR**, always run `make fmt` and `uvx pre-commit run -a`. CI runs both with `-D warnings`, and the pre-commit hooks gate-keep the repo (gitleaks, mdformat, etc.). The same job also builds the docs twice, with and without `--document-private-items`, since each mode checks links the other cannot see.
 
 ## Architecture
 
