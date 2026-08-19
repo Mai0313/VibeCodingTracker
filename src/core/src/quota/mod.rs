@@ -272,7 +272,7 @@ impl CodexState {
                 expirations,
             } => {
                 self.reset_credits_cooldown.clear();
-                snap.reset_credits_available = Some(available_count);
+                snap.reset_credits_available = available_count.or(snap.reset_credits_available);
                 snap.reset_credit_expirations = Some(expirations);
             }
             ResetCreditsResult::Transient => {}
@@ -306,7 +306,8 @@ impl CodexState {
                         expirations,
                     } => {
                         self.reset_credits_cooldown.clear();
-                        snap.reset_credits_available = Some(available_count);
+                        snap.reset_credits_available =
+                            available_count.or(snap.reset_credits_available);
                         snap.reset_credit_expirations = Some(expirations);
                     }
                     ResetCreditsResult::Unauthorized => {

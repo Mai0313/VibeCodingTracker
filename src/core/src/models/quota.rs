@@ -408,23 +408,26 @@ pub struct WhamResetCredits {
 #[derive(Debug, Clone, Deserialize)]
 pub struct WhamResetCreditsDetails {
     /// Per-credit details. The backend may cap this list.
+    #[serde(default)]
     pub credits: Vec<WhamResetCreditDetails>,
-    /// Authoritative number of available reset credits.
-    pub available_count: i64,
+    /// Authoritative number of available reset credits, when reported. Absent
+    /// means "unknown", not zero: the caller keeps the count wham/usage gave it.
+    #[serde(default)]
+    pub available_count: Option<i64>,
 }
 
 /// One earned rate-limit reset credit.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WhamResetCreditDetails {
-    /// Stable backend identifier.
+    /// Stable backend identifier, only ever quoted back in an error message.
+    #[serde(default)]
     pub id: String,
-    /// Limit family reset by this credit.
-    pub reset_type: String,
-    /// Lifecycle state, e.g. `available` / `redeeming` / `redeemed`.
+    /// Lifecycle state, e.g. `available` / `redeeming` / `redeemed`. An entry
+    /// that omits it is not readable as available, so it is skipped.
+    #[serde(default)]
     pub status: String,
-    /// RFC3339 grant time.
-    pub granted_at: String,
     /// RFC3339 expiry time, or `None` when the credit does not expire.
+    #[serde(default)]
     pub expires_at: Option<String>,
 }
 
