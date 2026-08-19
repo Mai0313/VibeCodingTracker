@@ -31,7 +31,6 @@ pub fn display_usage_table(usage_data: &UsageData, merge: bool) {
     println!("{}", "Token Usage Statistics".bright_cyan().bold());
     println!();
 
-    // Fetch pricing data
     let pricing_map = match fetch_model_pricing() {
         Ok(map) => map,
         Err(e) => {
@@ -63,7 +62,6 @@ pub fn display_usage_table(usage_data: &UsageData, merge: bool) {
     let rows = &summary.rows;
     let totals = &summary.totals;
 
-    // Create table
     let mut table = create_comfy_table(
         vec![
             "Model",
@@ -77,10 +75,6 @@ pub fn display_usage_table(usage_data: &UsageData, merge: bool) {
         Color::Yellow,
     );
 
-    // Add data rows. The "Output" column folds `reasoning_tokens` back
-    // into the displayed number so each row still adds up to `Total`
-    // — costs are already calculated against the separated buckets via
-    // `calculate_cost`.
     for row in rows {
         table.add_row(vec![
             Cell::new(&row.display_model)
@@ -107,7 +101,6 @@ pub fn display_usage_table(usage_data: &UsageData, merge: bool) {
         ]);
     }
 
-    // Add totals row
     add_totals_row(
         &mut table,
         vec![
@@ -125,7 +118,6 @@ pub fn display_usage_table(usage_data: &UsageData, merge: bool) {
     println!("{table}");
     println!();
 
-    // Display per-provider totals (tokens + cost).
     let provider_rows = build_provider_total_rows(&summary.provider_totals);
 
     println!("{}", "Totals (by Provider)".bright_magenta().bold());

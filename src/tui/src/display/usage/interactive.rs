@@ -535,6 +535,10 @@ impl UsageUiState {
 }
 
 /// Displays usage with a dedicated scan pool supplied by the CLI.
+///
+/// Every scan runs inside `scan_pool`; the argument, error and panic contract is
+/// otherwise [`display_usage_interactive`]'s, which wraps this with a pool of
+/// its own.
 #[allow(clippy::too_many_arguments)]
 pub fn display_usage_interactive_with_pool(
     time_range: vct_core::models::TimeRange,
@@ -910,9 +914,9 @@ fn render_usage_frame_with_status<B: Backend<Error: Send + Sync + 'static>>(
         };
         let chunks = frame_layout(area, PROVIDER_LINE_H + quota_h);
 
-        // Numeric columns, ordered by how readily they may be dropped when the
-        // pane is narrow. Cost and Total are the reason the view exists, so they
-        // stay; the cache split goes first.
+        // Numeric columns in display order, each ranked by how readily it may be
+        // dropped when the pane is narrow. Cost and Total are the reason the
+        // view exists, so they stay; the cache split goes first.
         const NUMERIC: [ColumnSpec; 6] = [
             ColumnSpec {
                 header: "Input",
@@ -975,8 +979,7 @@ fn render_usage_frame_with_status<B: Backend<Error: Send + Sync + 'static>>(
             widths.push(Constraint::Length(share_w));
         }
 
-        // One selectable row per model. The grand total lives only in the
-        // summary bar below (it was redundant here and in the provider band).
+        // The grand total lives only in the summary bar below.
         let rows: Vec<RatatuiRow> = rows_data
             .iter()
             .map(|row| {
@@ -1981,9 +1984,10 @@ fn quota_digest(items: &[DigestItem], width: u16) -> Line<'static> {
 
 /// One provider's quota, laid out as an ordered list of lines.
 ///
-/// The list is built most-important-first and independently of the cell it will
-/// land in, so the same card can be drawn small in the grid and full-size in the
-/// `Q` overlay. Whatever does not fit is counted, never dropped in silence.
+/// Every line is built for the width of the cell the card will be drawn in, so
+/// the `Q` overlay rebuilds its cards at its own roomier width. The height is
+/// not applied here: the list is ordered most-important-first, and a cell too
+/// short for it keeps the head while [`render_quota_card`] counts the rest.
 struct QuotaCard {
     title: &'static str,
     color: RatatuiColor,

@@ -1,10 +1,8 @@
 //! Analysis summary rendering helpers.
 //!
-//! The aggregated per-provider summary is core business logic and lives in
-//! [`vct_core::analysis::summary`]; it is re-exported here so the renderers keep
-//! importing it as `crate::display::analysis::averages::<item>`. This module
-//! adds only the display-only provider-total rows, which borrow into the
-//! comfy-table / ratatui renderers.
+//! Re-exports the aggregated per-provider summary from
+//! [`vct_core::analysis::summary`] and adds the display-only provider-total
+//! rows, which borrow into the comfy-table / ratatui renderers.
 
 pub use vct_core::analysis::summary::*;
 

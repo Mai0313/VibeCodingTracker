@@ -248,7 +248,7 @@ fn test_model_pricing_normalized_match() {
     );
     let pricing_map = ModelPricingMap::new(raw_map);
 
-    // Test with version suffix
+    // Test with date suffix
     let result = pricing_map.get("claude-3-sonnet-20240229");
     assert_eq!(result.pricing.input_cost_per_token, 0.000003);
     assert_eq!(
@@ -495,8 +495,6 @@ fn test_pricing_with_provider_prefix() {
 
 #[test]
 fn test_pricing_multiple_models() {
-    // The lookup match-cache is process-global; clear it so a prior test's
-    // (possibly offline / empty) result for these names doesn't bleed in.
     clear_pricing_cache();
 
     let mut raw_map = HashMap::new();
@@ -574,7 +572,6 @@ fn test_pricing_case_insensitive() {
     );
     let pricing_map = ModelPricingMap::new(raw_map);
 
-    // Should match despite case difference
     let result = pricing_map.get("gpt-4");
     assert!(
         result.pricing.input_cost_per_token > 0.0 || result.matched_model.is_some(),

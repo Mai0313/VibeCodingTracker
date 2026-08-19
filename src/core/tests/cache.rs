@@ -245,7 +245,6 @@ fn test_file_cache_concurrent_access() {
         handles.push(handle);
     }
 
-    // All threads should succeed
     for handle in handles {
         let result = handle.join().unwrap();
         assert!(result.is_ok(), "Concurrent access should succeed");
@@ -284,8 +283,8 @@ fn test_file_cache_multiple_files() {
 #[test]
 #[serial(global_cache)]
 fn test_file_cache_lru_eviction() {
-    // This test verifies that LRU eviction works (implicitly through capacity limits)
-    // The actual LRU capacity is set in constants.rs
+    // One file re-read many times: the LRU capacity
+    // (`capacity::FILE_CACHE_SIZE`) is never reached, so nothing is evicted.
 
     let example_file = fixture("sessions/claude_code.jsonl");
 
@@ -301,18 +300,14 @@ fn test_file_cache_lru_eviction() {
         let _ = cache.get_or_parse(&example_file);
     }
 
-    // Verify the file is still cached (LRU keeps frequently accessed files)
     let result = cache.get_or_parse(&example_file);
     assert!(result.is_ok(), "File should still be cached");
 }
 
 #[test]
 fn test_pricing_cache_clear() {
-    // Test pricing cache clearing
+    // Smoke test: clearing leaves no observable state to assert against.
     clear_pricing_cache();
-
-    // Should not error and cache should be cleared
-    // (No direct way to verify cache state, but should not panic)
 }
 
 #[test]
@@ -401,7 +396,6 @@ fn test_cache_arc_sharing() {
     let result2 = cache.get_or_parse(&example_file);
 
     if let (Ok(r1), Ok(r2)) = (result1, result2) {
-        // Both should point to the same underlying data (Arc)
         assert!(Arc::ptr_eq(&r1, &r2), "Cached Arc should be shared");
     }
 }

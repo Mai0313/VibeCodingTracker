@@ -1,20 +1,16 @@
-// Integration tests to verify parser output matches expected results
+// Golden-output comparison for the session parsers.
 //
-// This test compares the actual analysis output with the golden results,
-// while ignoring certain fields that can vary between environments:
-// - insightsVersion: may differ based on build
-// - machineId: machine-specific identifier
-// - user: username may differ
-// - gitRemoteUrl: git remote URL may differ
+// Each test excludes the fields that cannot be reproduced on another machine:
+// `insightsVersion`, `machineId` and `user` everywhere, plus `gitRemoteUrl`
+// (a git lookup against the session's workspace) for Claude Code / Codex /
+// Copilot / Gemini.
 
 use serde_json::Value;
 use vct_core::session::parser::parse_session_file_to_value;
 use vct_test_support::fixture;
 
-/// Compare two JSON values while ignoring specific fields
-///
-/// This function recursively compares two JSON values, ignoring the specified fields
-/// at any level of nesting.
+/// Compares two JSON values recursively, ignoring `ignore_fields` at every
+/// level of nesting. Prints the first mismatch it finds to stderr.
 fn compare_json_ignore_fields(actual: &Value, expected: &Value, ignore_fields: &[&str]) -> bool {
     match (actual, expected) {
         (Value::Object(actual_map), Value::Object(expected_map)) => {
@@ -100,13 +96,11 @@ fn test_claude_code_parser() {
         return;
     }
 
-    // Read expected result
     let expected_content =
         std::fs::read_to_string(&expected_file).expect("Failed to read expected result file");
     let expected_json: Value =
         serde_json::from_str(&expected_content).expect("Failed to parse expected result JSON");
 
-    // Analyze the input file
     let actual_result = parse_session_file_to_value(&input_file);
     assert!(
         actual_result.is_ok(),
@@ -116,12 +110,10 @@ fn test_claude_code_parser() {
 
     let actual_json = actual_result.unwrap();
 
-    // Compare results, ignoring specific fields
     let ignore_fields = ["insightsVersion", "machineId", "user", "gitRemoteUrl"];
     let matches = compare_json_ignore_fields(&actual_json, &expected_json, &ignore_fields);
 
     if !matches {
-        // Print detailed comparison for debugging
         eprintln!("\n=== ACTUAL OUTPUT ===");
         eprintln!(
             "{}",
@@ -158,13 +150,11 @@ fn test_codex_parser() {
         return;
     }
 
-    // Read expected result
     let expected_content =
         std::fs::read_to_string(&expected_file).expect("Failed to read expected result file");
     let expected_json: Value =
         serde_json::from_str(&expected_content).expect("Failed to parse expected result JSON");
 
-    // Analyze the input file
     let actual_result = parse_session_file_to_value(&input_file);
     assert!(
         actual_result.is_ok(),
@@ -174,12 +164,10 @@ fn test_codex_parser() {
 
     let actual_json = actual_result.unwrap();
 
-    // Compare results, ignoring specific fields
     let ignore_fields = ["insightsVersion", "machineId", "user", "gitRemoteUrl"];
     let matches = compare_json_ignore_fields(&actual_json, &expected_json, &ignore_fields);
 
     if !matches {
-        // Print detailed comparison for debugging
         eprintln!("\n=== ACTUAL OUTPUT ===");
         eprintln!(
             "{}",
@@ -216,13 +204,11 @@ fn test_copilot_parser() {
         return;
     }
 
-    // Read expected result
     let expected_content =
         std::fs::read_to_string(&expected_file).expect("Failed to read expected result file");
     let expected_json: Value =
         serde_json::from_str(&expected_content).expect("Failed to parse expected result JSON");
 
-    // Analyze the input file
     let actual_result = parse_session_file_to_value(&input_file);
     assert!(
         actual_result.is_ok(),
@@ -232,12 +218,10 @@ fn test_copilot_parser() {
 
     let actual_json = actual_result.unwrap();
 
-    // Compare results, ignoring specific fields
     let ignore_fields = ["insightsVersion", "machineId", "user", "gitRemoteUrl"];
     let matches = compare_json_ignore_fields(&actual_json, &expected_json, &ignore_fields);
 
     if !matches {
-        // Print detailed comparison for debugging
         eprintln!("\n=== ACTUAL OUTPUT ===");
         eprintln!(
             "{}",
@@ -274,13 +258,11 @@ fn test_gemini_parser() {
         return;
     }
 
-    // Read expected result
     let expected_content =
         std::fs::read_to_string(&expected_file).expect("Failed to read expected result file");
     let expected_json: Value =
         serde_json::from_str(&expected_content).expect("Failed to parse expected result JSON");
 
-    // Analyze the input file
     let actual_result = parse_session_file_to_value(&input_file);
     assert!(
         actual_result.is_ok(),
@@ -290,11 +272,8 @@ fn test_gemini_parser() {
 
     let actual_json = actual_result.unwrap();
 
-    // Compare results, ignoring specific fields. `folderPath` is included
-    // because Gemini session logs do not carry a cwd in the meta record, so
-    // the analyzer leaves it empty and the git-remote lookup falls back to
-    // the current working directory — both of which are environment-
-    // specific and will differ between CI and a local developer machine.
+    // `folderPath` is excluded too, though nothing about it actually varies:
+    // Gemini session logs carry no cwd, so the analyzer always leaves it empty.
     let ignore_fields = [
         "insightsVersion",
         "machineId",
@@ -305,7 +284,6 @@ fn test_gemini_parser() {
     let matches = compare_json_ignore_fields(&actual_json, &expected_json, &ignore_fields);
 
     if !matches {
-        // Print detailed comparison for debugging
         eprintln!("\n=== ACTUAL OUTPUT ===");
         eprintln!(
             "{}",
@@ -403,20 +381,14 @@ fn test_dsh_parser() {
     }
 }
 
-/// Inline-fixture smoke test for the Gemini JSONL parser.
-///
-/// Complements `test_gemini_parser` (which uses a real-world session dump)
-/// by exercising narrow edge cases that the real fixture may not hit:
-/// ignored `user` / `info` events, a `$set` meta-update line the analyzer
-/// must silently skip, and one assistant `gemini` event carrying token
-/// usage plus a `toolCalls[]` entry for a `replace` edit.
+/// Verifies a Gemini assistant event's usage and `replace` tool call are
+/// recorded while `info` / `user` / `$set` lines contribute nothing.
 #[test]
 fn test_gemini_parser_jsonl() {
     use std::io::Write;
 
     let tempdir = tempfile::tempdir().expect("failed to create tempdir");
-    // `is_gemini_session_file` requires the parent directory to be named
-    // `chats`, so honour that even for the inline fixture.
+    // Mirrors the on-disk Gemini layout; detection itself is content-based.
     let chats_dir = tempdir.path().join("project-hash").join("chats");
     std::fs::create_dir_all(&chats_dir).expect("failed to mkdir -p chats");
     let input_file = chats_dir.join("session-fixture.jsonl");

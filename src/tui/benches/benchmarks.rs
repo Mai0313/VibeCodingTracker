@@ -21,7 +21,7 @@ use vct_tui::display::usage::UsageFrameBenchmark;
 
 /// Absolute path to a file under the repo's `tests/fixtures/` directory.
 fn fixture(name: &str) -> PathBuf {
-    // From `src/core` up to the repo root, then into `tests/fixtures`.
+    // From `src/tui` up to the repo root, then into `tests/fixtures`.
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
@@ -108,7 +108,6 @@ fn benchmark_line_counting(c: &mut Criterion) {
 fn benchmark_file_parsing(c: &mut Criterion) {
     let mut group = c.benchmark_group("file_parsing");
 
-    // Test files paths
     let test_files = vec![
         ("claude", "sessions/claude_code.jsonl"),
         ("codex", "sessions/codex.jsonl"),
@@ -469,7 +468,6 @@ fn benchmark_batch_analysis(c: &mut Criterion) {
 
     c.bench_function("batch analyze all formats", |b| {
         b.iter(|| {
-            // Create temporary directory paths for testing
             let paths = vec![
                 (claude_path.clone(), "claude"),
                 (codex_path.clone(), "codex"),

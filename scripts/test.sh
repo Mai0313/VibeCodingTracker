@@ -17,6 +17,8 @@ generate_result() {
     mv "$temporary" "$output"
 }
 
+# Only the four single-file JSONL providers are regenerated here; the Grok and
+# DeepSeek Harness goldens are not refreshed by this script.
 generate_result tests/fixtures/sessions/claude_code.jsonl tests/fixtures/sessions/claude_code.expected.json
 generate_result tests/fixtures/sessions/codex.jsonl tests/fixtures/sessions/codex.expected.json
 generate_result tests/fixtures/sessions/gemini.jsonl tests/fixtures/sessions/gemini.expected.json

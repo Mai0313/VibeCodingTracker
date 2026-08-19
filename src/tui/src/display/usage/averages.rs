@@ -1,18 +1,20 @@
 //! Usage summary rendering helpers.
 //!
 //! The priced, aggregated summary (rows, totals, per-provider totals) is core
-//! business logic and lives in [`vct_core::usage::summary`]; it is re-exported
-//! here so the renderers keep importing it as
-//! `crate::display::usage::averages::<item>`. This module adds only the
-//! display-only provider-total rows, which borrow into the comfy-table /
-//! ratatui renderers.
+//! business logic in [`vct_core::usage::summary`], re-exported here. This
+//! module adds only the display-only provider-total rows, which borrow into the
+//! comfy-table / ratatui renderers.
 
 pub use vct_core::usage::summary::*;
 
 use crate::display::common::ProviderTotal;
 use vct_core::models::Provider;
 
-/// Build provider total rows for display.
+/// Builds the per-provider footer rows, borrowing from `totals`.
+///
+/// A provider with no active days is skipped; the overall row is appended when
+/// it has active days or when no provider qualified, so the result is never
+/// empty.
 pub fn build_provider_total_rows(
     totals: &UsageProviderTotals,
 ) -> Vec<ProviderTotal<'_, ProviderStats>> {
