@@ -3,7 +3,8 @@
 // These drive `aggregate_usage_from_paths` against a `TempHome` (fixture session files
 // under a temp directory) so the real aggregation runs hermetically: no
 // process-global env is mutated, no machine files are read, and no external API
-// is reached. The remaining tests are pure in-memory cost / JSON math.
+// is reached. The lone exception is the cost-math case, which prices a token
+// bucket directly and needs no sources at all.
 
 use rusqlite::{Connection, params};
 #[cfg(unix)]
@@ -966,35 +967,6 @@ fn disabled_provider_is_dropped_from_usage_rollup() {
 }
 
 #[test]
-fn test_usage_data_serialization() {
-    use serde_json::json;
-    use vct_core::models::usage::UsageResult;
-
-    let mut usage = UsageResult::default();
-    usage.insert(
-        "claude-sonnet-4".to_string(),
-        json!({
-            "input_tokens": 1000,
-            "output_tokens": 500,
-            "cache_read_input_tokens": 2000,
-            "cache_creation_input_tokens": 1000,
-            "cost_usd": 0.05,
-            "matched_model": "claude-sonnet-4"
-        }),
-    );
-
-    let json = serde_json::to_string(&usage).unwrap();
-    assert!(
-        json.contains("claude-sonnet-4"),
-        "Should contain model name"
-    );
-
-    let deserialized: UsageResult = serde_json::from_str(&json).unwrap();
-    assert_eq!(deserialized.len(), usage.len());
-    assert!(deserialized.contains_key("claude-sonnet-4"));
-}
-
-#[test]
 fn test_usage_calculation_cost_accuracy() {
     use vct_core::pricing::{ModelPricing, calculate_cost};
 
@@ -1026,97 +998,111 @@ fn test_usage_calculation_cost_accuracy() {
 }
 
 #[test]
-fn test_usage_with_multiple_models() {
+fn usage_json_rows_flatten_the_codex_nested_shape() {
     use serde_json::json;
-    use vct_core::models::usage::UsageResult;
+    use std::collections::HashMap;
+    use vct_core::pricing::{ModelPricing, ModelPricingMap, clear_pricing_cache};
+    use vct_core::usage::price_usage_data;
 
-    let mut usage = UsageResult::default();
-    usage.insert(
-        "claude-sonnet-4".to_string(),
-        json!({
-            "input_tokens": 1000,
-            "output_tokens": 500,
-            "cache_read_input_tokens": 0,
-            "cache_creation_input_tokens": 0,
-            "cost_usd": 0.05
-        }),
+    clear_pricing_cache();
+    let home = TempHome::new();
+    home.put_codex_session(
+        &format!("2026/06/06/{CODEX_ROLLOUT}"),
+        &fixture_str("sessions/codex.jsonl"),
     );
-    usage.insert(
-        "gpt-4-turbo".to_string(),
-        json!({
-            "input_tokens": 2000,
-            "output_tokens": 1000,
-            "cache_read_input_tokens": 0,
-            "cache_creation_input_tokens": 0,
-            "cost_usd": 0.10
-        }),
-    );
+    let data = aggregate_usage_from_paths(&home.paths, TimeRange::All).expect("aggregate codex");
 
-    assert_eq!(usage.len(), 2, "Should have two models");
-
-    let total_cost: f64 = usage.values().filter_map(|v| v["cost_usd"].as_f64()).sum();
+    // Codex keeps its own nested shape in the aggregate, which is exactly why
+    // the payload builder has to flatten it.
+    let raw = data
+        .models
+        .get("aide-gpt-5")
+        .expect("the Codex fixture's model");
     assert!(
-        (total_cost - 0.15).abs() < 0.001,
-        "Total cost should be sum of individual costs"
-    );
-}
-
-#[test]
-fn test_usage_json_output_format() {
-    use serde_json::{Value, json};
-    use vct_core::models::usage::UsageResult;
-
-    let mut usage = UsageResult::default();
-    usage.insert(
-        "claude-sonnet-4".to_string(),
-        json!({
-            "input_tokens": 1000,
-            "output_tokens": 500,
-            "cache_read_input_tokens": 2000,
-            "cache_creation_input_tokens": 1000,
-            "cost_usd": 0.05123456789,
-            "matched_model": "claude-sonnet-4"
-        }),
+        raw.get("total_token_usage").is_some(),
+        "the aggregate should still carry Codex's nested shape, got: {raw}"
     );
 
-    let json = serde_json::to_string_pretty(&usage).unwrap();
-    let parsed: Value = serde_json::from_str(&json).unwrap();
-
-    assert!(parsed.is_object(), "Root should be an object");
-
-    let model_value = &parsed["claude-sonnet-4"];
-    assert!(
-        model_value["input_tokens"].is_number(),
-        "input_tokens should be number"
+    let mut prices = HashMap::new();
+    prices.insert(
+        "aide-gpt-5".to_string(),
+        ModelPricing {
+            input_cost_per_token: 1e-6,
+            ..Default::default()
+        },
     );
-    assert!(
-        model_value["output_tokens"].is_number(),
-        "output_tokens should be number"
-    );
-    assert!(
-        model_value["cost_usd"].is_number(),
-        "cost_usd should be number"
-    );
-}
+    let rows = price_usage_data(&data, &ModelPricingMap::new(prices));
+    let row = rows
+        .iter()
+        .find(|row| row.model == "aide-gpt-5")
+        .expect("a priced row for the Codex model");
 
-#[test]
-fn test_usage_handles_missing_cache_tokens() {
-    use serde_json::json;
-
-    let usage_value = json!({
-        "model": "test-model",
-        "input_tokens": 1000,
-        "output_tokens": 500,
-        "cache_read_input_tokens": 0,
-        "cache_creation_input_tokens": 0,
-        "cost_usd": 0.05
-    });
-
-    assert_eq!(usage_value["input_tokens"].as_i64().unwrap(), 1000);
-    assert_eq!(usage_value["cache_read_input_tokens"].as_i64().unwrap(), 0);
+    // The fixture's final snapshot reports `input 270530 (136832 cached) /
+    // output 12551 (9536 reasoning) / total 283081`. Flattening splits those
+    // into disjoint buckets so each token is billed exactly once, and nothing
+    // of the nested shape survives.
     assert_eq!(
-        usage_value["cache_creation_input_tokens"].as_i64().unwrap(),
-        0
+        row.usage,
+        json!({
+            "input_tokens": 270_530 - 136_832,
+            "cache_read_input_tokens": 136_832,
+            "output_tokens": 12_551 - 9_536,
+            "reasoning_output_tokens": 9_536,
+            "cache_creation_input_tokens": 0,
+            "total_tokens": 283_081,
+        })
+    );
+
+    // Only input carries a rate here, so the cost is billed off the flattened
+    // bucket rather than Codex's raw prompt size.
+    assert!(
+        (row.cost_usd - 0.133_698).abs() < 1e-9,
+        "got {}",
+        row.cost_usd
+    );
+}
+
+#[test]
+fn usage_json_reports_absent_cache_buckets_as_zero() {
+    use std::collections::HashMap;
+    use vct_core::pricing::{ModelPricingMap, clear_pricing_cache};
+    use vct_core::usage::price_usage_data;
+
+    clear_pricing_cache();
+    let home = TempHome::new();
+    home.put_gemini_session(
+        "proj-hash",
+        "chat.jsonl",
+        &fixture_str("sessions/gemini.jsonl"),
+    );
+    let data = aggregate_usage_from_paths(&home.paths, TimeRange::All).expect("aggregate gemini");
+
+    // The fixture's Pro model never writes to the cache, so its record carries
+    // no cache-write bucket at all.
+    let raw = data
+        .models
+        .get("gemini-3.1-pro-preview")
+        .expect("the Gemini fixture's Pro model");
+    assert!(
+        raw.get("cache_creation_input_tokens").is_none(),
+        "the aggregate should leave the absent bucket absent, got: {raw}"
+    );
+
+    let rows = price_usage_data(&data, &ModelPricingMap::new(HashMap::new()));
+    let row = rows
+        .iter()
+        .find(|row| row.model == "gemini-3.1-pro-preview")
+        .expect("a priced row for the Gemini Pro model");
+
+    assert_eq!(
+        row.usage["cache_creation_input_tokens"].as_i64(),
+        Some(0),
+        "an absent bucket must serialize as 0, not disappear from the row"
+    );
+    assert_eq!(row.usage["cache_read_input_tokens"].as_i64(), Some(0));
+    assert!(
+        row.usage["input_tokens"].as_i64().unwrap() > 0,
+        "and the buckets the record does carry survive"
     );
 }
 

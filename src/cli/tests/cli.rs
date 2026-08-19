@@ -282,15 +282,33 @@ fn usage_output_flag_is_rejected() {
 }
 
 #[test]
-fn test_analysis_validates_file_extension() {
+fn analysis_detects_provider_by_content_not_extension() {
     let home = TempHome::new();
     let temp_dir = tempfile::TempDir::new().unwrap();
-    let wrong_ext = temp_dir.path().join("test.txt");
-    std::fs::write(&wrong_ext, "test content").unwrap();
 
-    // Nothing is asserted: the extension is not validated, so the file's
-    // content alone decides whether the run succeeds.
-    let _ = child_cmd(&home).arg("analysis").arg(&wrong_ext).output();
+    // A Claude session under a `.txt` name: detection reads the records, so the
+    // provider still resolves and the run succeeds.
+    let wrong_ext = temp_dir.path().join("session.txt");
+    std::fs::copy(fixture("sessions/claude_code.jsonl"), &wrong_ext).unwrap();
+    child_cmd(&home)
+        .arg("analysis")
+        .arg(&wrong_ext)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            r#""extensionName": "Claude-Code""#,
+        ));
+
+    // And the mirror case: a `.jsonl` name buys nothing when the content does
+    // not even parse.
+    let right_ext = temp_dir.path().join("session.jsonl");
+    std::fs::write(&right_ext, "test content\n").unwrap();
+    child_cmd(&home)
+        .arg("analysis")
+        .arg(&right_ext)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Failed to parse JSON from file"));
 }
 
 #[test]
@@ -579,6 +597,13 @@ fn usage_json_smoke_prices_seeded_session() {
         "proj",
         "session.jsonl",
         &vct_test_support::fixture_str("sessions/claude_code.jsonl"),
+    );
+    // Codex is the provider whose usage stays nested internally, so the
+    // flat-shape loop below only means anything with one of its sessions in the
+    // scan.
+    home.put_codex_session(
+        "2026/06/06/rollout-2026-06-06T10-00-00-019e4b75-8a4e-7801-a9ed-9723e77e0497.jsonl",
+        &vct_test_support::fixture_str("sessions/codex.jsonl"),
     );
     home.seed_pricing_cache(&pricing_seed());
 
