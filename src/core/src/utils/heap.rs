@@ -1,56 +1,47 @@
-//! Allocator-level helpers.
+//! Allocator-level helpers that bound the TUI's resident-set growth.
 //!
-//! The TUI refresh loops allocate and drop large numbers of small objects
-//! each cycle (session-file JSONL parsers, per-model hashmaps, ratatui row
-//! vectors). With the default glibc allocator this leaves arenas full of
-//! freed-but-not-returned pages, which is what drives the monotonic RSS
-//! growth you see on a long-running `vibe_coding_tracker usage` session.
-//!
-//! `release_freed_heap` calls `malloc_trim(0)` on Linux/glibc to ask the
-//! allocator to give those pages back to the kernel. It is a no-op on
-//! other platforms (musl, macOS, Windows) because the symbol isn't
-//! available — those allocators either return memory eagerly already or
-//! don't expose a trim knob.
+//! Each refresh cycle allocates and drops large numbers of small objects, and
+//! the default glibc allocator retains those as freed-but-not-returned pages.
+//! Both helpers below exist solely to stop that retention accumulating; both
+//! are no-ops outside Linux/glibc, where neither symbol exists.
 
-/// Ask the system allocator to release any free pages in its arenas back
-/// to the OS. Safe to call as often as you like — cost is O(arena size).
+/// Asks the system allocator to return the free pages in its arenas to the OS.
+///
+/// Called after each successful TUI refresh. Cost is O(arena size), so it
+/// suits a cycle boundary rather than a hot loop. No-op outside Linux/glibc.
 #[inline]
 pub fn release_freed_heap() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    // SAFETY: `malloc_trim` is a pure advisory call that inspects the
-    // allocator's free lists and returns unused pages. It has no
-    // preconditions and returns 1 if memory was released, 0 otherwise.
+    // SAFETY: `malloc_trim` is advisory and has no preconditions; it only
+    // inspects the allocator's free lists and releases unused pages.
     unsafe {
         libc::malloc_trim(0);
     }
 }
 
-/// Apply one-time glibc malloc tuning. Must be called before the first
-/// allocation that crosses thread boundaries to have its full effect.
+/// Applies one-time glibc malloc tuning; no-op outside Linux/glibc.
 ///
-/// What it does (Linux glibc only; no-op elsewhere):
+/// Must run before the first allocation that crosses thread boundaries to
+/// have its full effect. Both knobs are load-bearing, not cosmetic:
 ///
-/// - `M_ARENA_MAX = 2`: cap the number of per-thread arenas glibc will
-///   create for multi-threaded workloads. Without this cap, a 16-core box
-///   can spin up to 128 arenas for our Rayon worker pool; each arena
-///   retains its own free list independently of `malloc_trim`, which is
-///   how the TUI grew ~6 MB per 10 s refresh even after we trimmed the
-///   main arena at the end of every cycle. Two arenas is enough to keep
-///   allocator lock contention off the critical path while preventing the
-///   retention from multiplying across cores.
-/// - `M_TRIM_THRESHOLD = 128 KiB`: lower the threshold at which glibc
-///   will voluntarily hand the arena's top chunk back to the OS. Default
-///   (128 KiB) is already low but the value can grow automatically; we
-///   pin it so long sessions don't drift.
+/// - `M_ARENA_MAX = 2` caps the per-thread arenas glibc creates for the Rayon
+///   pool (a 16-core box otherwise gets up to 128). Each arena retains its own
+///   free list independently of `malloc_trim`, which is how the TUI grew
+///   ~6 MB per 10 s refresh even with a trim at the end of every cycle. Two
+///   arenas keep allocator lock contention off the critical path without
+///   multiplying that retention across cores.
+/// - `M_TRIM_THRESHOLD = 128 KiB` pins the point at which glibc hands the
+///   arena's top chunk back to the OS. The default starts at this value but
+///   grows automatically, so long sessions drift without the pin.
 pub fn tune_system_allocator() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
-        // Constants are stable glibc ABI but not re-exported by the `libc`
-        // crate; see `malloc.h`: M_TRIM_THRESHOLD = -1, M_ARENA_MAX = -8.
+        // Stable glibc ABI, but not re-exported by the `libc` crate; the
+        // values come from `malloc.h`.
         const M_TRIM_THRESHOLD: libc::c_int = -1;
         const M_ARENA_MAX: libc::c_int = -8;
-        // SAFETY: `mallopt` is documented as thread-safe and has no
-        // preconditions; invalid option numbers simply return 0.
+        // SAFETY: `mallopt` is thread-safe and has no preconditions; an
+        // unrecognized option number simply returns 0.
         unsafe {
             libc::mallopt(M_ARENA_MAX, 2);
             libc::mallopt(M_TRIM_THRESHOLD, 128 * 1024);

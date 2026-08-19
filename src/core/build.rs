@@ -1,25 +1,21 @@
 use std::process::Command;
 
 fn main() {
-    // Get base version from Cargo.toml
     let base_version = env!("CARGO_PKG_VERSION");
-
-    // Try to get git information
     let git_version = get_git_version(base_version);
-
-    // Set the version as an environment variable for the build
     println!("cargo:rustc-env=BUILD_VERSION={}", git_version);
 
-    // Get Rust and Cargo versions at build time
     let rust_version = get_rust_version();
     let cargo_version = get_cargo_version();
     println!("cargo:rustc-env=BUILD_RUST_VERSION={}", rust_version);
     println!("cargo:rustc-env=BUILD_CARGO_VERSION={}", cargo_version);
 
-    // Re-run the build script when git state changes. This crate is a workspace
-    // member, so its manifest dir is not the repo root; resolve the repository's
-    // real git dir (also a file->dir indirection under a git worktree) instead
-    // of the nonexistent `<crate>/.git`.
+    // Emitting any `rerun-if-changed` opts out of Cargo's default "re-run when
+    // any package file changes", so the stamped version refreshes when HEAD or
+    // the index moves rather than on every source edit. This crate is a
+    // workspace member, so `<crate>/.git` does not exist; resolve the
+    // repository's real git dir instead (a file->dir indirection under a git
+    // worktree).
     if let Some(git_dir) = git_dir() {
         println!("cargo:rerun-if-changed={git_dir}/HEAD");
         println!("cargo:rerun-if-changed={git_dir}/index");
@@ -40,18 +36,16 @@ fn git_dir() -> Option<String> {
     (!dir.is_empty()).then_some(dir)
 }
 
+/// Assembles `<tag>[-<commits>]-g<sha>[-dirty]`, substituting `base_version`
+/// for a missing tag and returning it alone outside a git checkout.
 fn get_git_version(base_version: &str) -> String {
-    // Check if we're in a git repository
     if !is_git_repo() {
         return base_version.to_string();
     }
 
-    // Get the latest tag
     let latest_tag = get_latest_tag();
 
-    // Use tag version if available, otherwise use Cargo.toml version
     let version = if let Some(ref tag) = latest_tag {
-        // Remove 'v' prefix if present
         tag.strip_prefix('v').unwrap_or(tag).to_string()
     } else {
         base_version.to_string()
@@ -59,24 +53,20 @@ fn get_git_version(base_version: &str) -> String {
 
     let mut version_parts = vec![version];
 
-    // Get commit count from latest tag (or from start if no tag)
     let commit_count = if let Some(ref tag) = latest_tag {
         get_commit_count_from_tag(tag)
     } else {
         get_total_commit_count()
     };
 
-    // Add commit count if > 0
     if commit_count > 0 {
         version_parts.push(commit_count.to_string());
     }
 
-    // Get short commit hash
     if let Some(commit_hash) = get_commit_hash() {
         version_parts.push(format!("g{}", commit_hash));
     }
 
-    // Check if working directory is dirty
     if is_working_directory_dirty() {
         version_parts.push("dirty".to_string());
     }

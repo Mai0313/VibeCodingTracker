@@ -4,20 +4,22 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, RwLock};
 
-// Global cache for Git remote URLs (thread-safe)
-// Key: original absolute or canonical path, Value: remote URL
+// Keyed by both the caller's original absolute path and the canonical path,
+// so a symlinked alias resolves to the same entry. Never invalidated.
 static GIT_URL_CACHE: LazyLock<RwLock<HashMap<PathBuf, String>>> =
     LazyLock::new(|| RwLock::new(HashMap::with_capacity(20)));
 
 /// Returns the `origin` remote URL for the git repository at `cwd`.
 ///
-/// Results are memoized in a process-global, thread-safe cache under both the
-/// original absolute path and its canonical path. This avoids repeated
-/// canonicalization while still letting symlinked variants share one lookup.
 /// The returned URL has any trailing `.git` stripped. Returns an empty
 /// `String` when `cwd` is empty, is not a git working tree, has no `origin`
-/// remote, or the config cannot be read. Callers treat the empty string as
+/// remote, or the config cannot be read; callers treat the empty string as
 /// "no remote".
+///
+/// Results, including the empty ones, are memoized in a process-global cache
+/// that is never invalidated, so a directory that gains or changes its
+/// `origin` after the first lookup keeps reporting the first answer for the
+/// life of the process.
 pub fn get_git_remote_url<P: AsRef<Path>>(cwd: P) -> String {
     let cwd = cwd.as_ref();
     if cwd.as_os_str().is_empty() {
@@ -46,7 +48,6 @@ pub fn get_git_remote_url<P: AsRef<Path>>(cwd: P) -> String {
         return url;
     }
 
-    // Cache miss - perform actual lookup
     let url = get_git_remote_url_impl(cwd);
 
     // Keep both aliases. The original absolute path avoids repeated
@@ -72,7 +73,8 @@ fn cached_url(path: &Path) -> Option<String> {
 
 /// Parses `<cwd>/.git/config` and returns the `[remote "origin"]` URL,
 /// or an empty string if absent. The uncached inner worker behind
-/// [`get_git_remote_url`].
+/// [`get_git_remote_url`]. Only the `url = <value>` spelling git itself
+/// writes is recognized.
 fn get_git_remote_url_impl(cwd: &Path) -> String {
     let git_config = cwd.join(".git").join("config");
 
@@ -87,16 +89,13 @@ fn get_git_remote_url_impl(cwd: &Path) -> String {
     for line in reader.lines().map_while(Result::ok) {
         let trimmed = line.trim();
 
-        // Check for section headers
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
             in_origin_section = trimmed.starts_with("[remote \"origin\"");
             continue;
         }
 
-        // Look for url in origin section
         if in_origin_section && trimmed.starts_with("url = ") {
             let url = trimmed.trim_start_matches("url = ").trim();
-            // Remove .git suffix if present
             let url = url.strip_suffix(".git").unwrap_or(url);
             return url.to_string();
         }
@@ -114,7 +113,6 @@ mod tests {
 
     #[test]
     fn test_get_git_remote_url_no_git_dir() {
-        // Test directory without .git
         let dir = tempdir().unwrap();
 
         let url = get_git_remote_url(dir.path());
@@ -128,7 +126,6 @@ mod tests {
 
     #[test]
     fn test_get_git_remote_url_empty_config() {
-        // Test with empty git config
         let dir = tempdir().unwrap();
         let git_dir = dir.path().join(".git");
         fs::create_dir(&git_dir).unwrap();
@@ -142,7 +139,6 @@ mod tests {
 
     #[test]
     fn test_get_git_remote_url_with_origin() {
-        // Test with valid git config containing origin
         let dir = tempdir().unwrap();
         let git_dir = dir.path().join(".git");
         fs::create_dir(&git_dir).unwrap();
@@ -161,7 +157,6 @@ mod tests {
 
     #[test]
     fn test_get_git_remote_url_strips_git_suffix() {
-        // Test that .git suffix is removed
         let dir = tempdir().unwrap();
         let git_dir = dir.path().join(".git");
         fs::create_dir(&git_dir).unwrap();
@@ -177,7 +172,6 @@ mod tests {
 
     #[test]
     fn test_get_git_remote_url_ssh_format() {
-        // Test with SSH URL format
         let dir = tempdir().unwrap();
         let git_dir = dir.path().join(".git");
         fs::create_dir(&git_dir).unwrap();
@@ -193,7 +187,7 @@ mod tests {
 
     #[test]
     fn test_get_git_remote_url_multiple_remotes() {
-        // Test with multiple remotes (should return origin)
+        // `origin` wins even when another remote's section comes first.
         let dir = tempdir().unwrap();
         let git_dir = dir.path().join(".git");
         fs::create_dir(&git_dir).unwrap();
@@ -211,7 +205,6 @@ mod tests {
 
     #[test]
     fn test_get_git_remote_url_caching() {
-        // Test that results are cached (call twice)
         let dir = tempdir().unwrap();
         let git_dir = dir.path().join(".git");
         fs::create_dir(&git_dir).unwrap();
@@ -231,6 +224,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_absolute_symlink_cache_hit_does_not_recanonicalize() {
+        // Deleting the repo proves the second lookup served the cached entry
+        // for the symlink itself, without touching the filesystem again.
         use std::os::unix::fs::symlink;
 
         let dir = tempdir().unwrap();
@@ -252,7 +247,6 @@ mod tests {
 
     #[test]
     fn test_get_git_remote_url_whitespace() {
-        // Test with extra whitespace
         let dir = tempdir().unwrap();
         let git_dir = dir.path().join(".git");
         fs::create_dir(&git_dir).unwrap();
@@ -268,7 +262,6 @@ mod tests {
 
     #[test]
     fn test_get_git_remote_url_no_origin() {
-        // Test with no origin remote
         let dir = tempdir().unwrap();
         let git_dir = dir.path().join(".git");
         fs::create_dir(&git_dir).unwrap();
@@ -284,7 +277,6 @@ mod tests {
 
     #[test]
     fn test_get_git_remote_url_gitlab() {
-        // Test with GitLab URL
         let dir = tempdir().unwrap();
         let git_dir = dir.path().join(".git");
         fs::create_dir(&git_dir).unwrap();
@@ -300,7 +292,6 @@ mod tests {
 
     #[test]
     fn test_get_git_remote_url_bitbucket() {
-        // Test with Bitbucket URL
         let dir = tempdir().unwrap();
         let git_dir = dir.path().join(".git");
         fs::create_dir(&git_dir).unwrap();
@@ -316,7 +307,6 @@ mod tests {
 
     #[test]
     fn test_get_git_remote_url_malformed_config() {
-        // Test with malformed config
         let dir = tempdir().unwrap();
         let git_dir = dir.path().join(".git");
         fs::create_dir(&git_dir).unwrap();
@@ -332,7 +322,6 @@ mod tests {
 
     #[test]
     fn test_get_git_remote_url_url_without_git_suffix() {
-        // Test URL that doesn't have .git suffix
         let dir = tempdir().unwrap();
         let git_dir = dir.path().join(".git");
         fs::create_dir(&git_dir).unwrap();
@@ -348,7 +337,6 @@ mod tests {
 
     #[test]
     fn test_get_git_remote_url_self_hosted() {
-        // Test with self-hosted git server
         let dir = tempdir().unwrap();
         let git_dir = dir.path().join(".git");
         fs::create_dir(&git_dir).unwrap();
@@ -364,7 +352,6 @@ mod tests {
 
     #[test]
     fn test_get_git_remote_url_path_with_spaces() {
-        // Test directory path with spaces (though URL shouldn't have spaces)
         let dir = tempdir().unwrap();
         let subdir = dir.path().join("my project");
         fs::create_dir(&subdir).unwrap();
@@ -383,7 +370,6 @@ mod tests {
 
     #[test]
     fn test_get_git_remote_url_empty_url_field() {
-        // Test with empty url field
         let dir = tempdir().unwrap();
         let git_dir = dir.path().join(".git");
         fs::create_dir(&git_dir).unwrap();

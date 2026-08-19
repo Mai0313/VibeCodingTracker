@@ -1,10 +1,10 @@
 //! Library crate behind the `vibe_coding_tracker` / `vct` CLI.
 //!
-//! The crate scans on-disk session logs written by eight AI coding assistants:
+//! The crate scans on-disk session logs written by nine AI coding assistants:
 //! JSONL logs from Claude Code, OpenAI Codex, GitHub Copilot CLI, and Gemini
-//! CLI; `signals.json` plus sibling `updates.jsonl` from Grok CLI; SQLite data
-//! from OpenCode and Cursor; and usage-only SQLite data from Hermes. It exposes
-//! two views:
+//! CLI; `signals.json` plus sibling `updates.jsonl` from Grok CLI; a
+//! zstd-framed JSONL log from DeepSeek Harness; SQLite data from OpenCode and
+//! Cursor; and usage-only SQLite data from Hermes. It exposes two views:
 //!
 //! - **usage** — per-model token counts and LiteLLM-priced cost
 //! - **analysis** — complete per-session data plus compact per-model
@@ -13,19 +13,23 @@
 //! # Pipeline
 //!
 //! Raw bytes flow through a two-stage pipeline. [`session`] owns the
-//! "local session data → typed [`CodeAnalysis`]" boundary (provider detection plus a
-//! parser per provider); [`analysis`] and [`usage`] then aggregate those
-//! typed records. The `vct-tui` crate renders the result as an interactive
+//! "local session data → typed [`CodeAnalysis`]" boundary (provider detection
+//! plus a parser per provider) and is the only place file parsing lives;
+//! [`scan`] holds the provider-scan machinery both features share, and
+//! [`analysis`] and [`usage`] aggregate the typed records into their own
+//! roll-ups. The `vct-tui` crate renders the result as an interactive
 //! TUI, a static table, plain text, or JSON, and the `vct-cli` binary wires
-//! the clap surface to both. Both downstream views consume the same parsed
-//! shape, so file parsing lives only in [`session`]. This crate holds no
-//! terminal dependency, so a future GUI backend can reuse it directly.
+//! the clap surface to both. This crate holds no terminal dependency, so a
+//! future GUI backend can reuse it directly.
 //!
-//! Supporting modules: [`pricing`] (LiteLLM price lookup with a daily
-//! on-disk cache), [`cache`] (LRU file cache keyed by mtime), [`update`]
-//! (self-replace from the matching GitHub release asset), [`utils`]
-//! (path resolution and the glibc allocator tuning), and [`constants`]
-//! (capacity and buffer sizing).
+//! The remaining modules support those two views: [`models`] (the shared serde
+//! shapes), [`summary_cache`] (the process-local incremental scan cache),
+//! [`pricing`] (LiteLLM price lookup with a daily on-disk cache), [`quota`]
+//! (live provider quota fetchers), [`config`] (`~/.vct/config.toml`),
+//! [`logging`] (file-only diagnostics), [`cache`] (library-facing LRU cache of
+//! parsed sessions), [`update`] (self-replace from the matching GitHub release
+//! asset), [`utils`] (leaf helpers), and [`constants`] (capacity and buffer
+//! sizing).
 
 pub mod analysis;
 pub mod cache;

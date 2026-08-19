@@ -7,10 +7,9 @@ use std::path::Path;
 
 /// Reads a JSONL file and returns one [`Value`] per non-empty line.
 ///
-/// Blank and whitespace-only lines are skipped. The result `Vec` is
-/// pre-sized from the file length (via [`buffer::AVG_JSONL_LINE_SIZE`]) and
-/// shrunk to fit afterwards to avoid both repeated reallocation and retained
-/// slack.
+/// Blank and whitespace-only lines are skipped. Parsing is strict: one bad
+/// line fails the whole file, and callers that must tolerate a torn tail use
+/// their own lenient reader instead.
 ///
 /// # Errors
 ///
@@ -21,18 +20,14 @@ pub fn read_jsonl<P: AsRef<Path>>(path: P) -> Result<Vec<Value>> {
     let file = File::open(path.as_ref())
         .with_context(|| format!("Failed to open file: {}", path.as_ref().display()))?;
 
-    // Pre-allocate Vec capacity based on estimated line count
-    // This reduces allocations and improves performance significantly
     let file_size = file.metadata().ok().map(|m| m.len() as usize).unwrap_or(0);
     let estimated_lines = if file_size > 0 {
-        // Use centralized constant for average line size estimation
         file_size / buffer::AVG_JSONL_LINE_SIZE
     } else {
         10 // Default minimum capacity
     };
     let mut results = Vec::with_capacity(estimated_lines);
 
-    // Use centralized buffer size constant for optimal I/O performance
     let reader = BufReader::with_capacity(buffer::FILE_READ_BUFFER, file);
 
     for (index, line) in reader.lines().enumerate() {
@@ -48,7 +43,6 @@ pub fn read_jsonl<P: AsRef<Path>>(path: P) -> Result<Vec<Value>> {
         results.push(obj);
     }
 
-    // Shrink capacity to actual size to free excess memory
     results.shrink_to_fit();
 
     Ok(results)
@@ -57,9 +51,10 @@ pub fn read_jsonl<P: AsRef<Path>>(path: P) -> Result<Vec<Value>> {
 /// Serializes `value` as compact JSON and writes it to `path` atomically.
 ///
 /// Writes to a temporary file in the same directory, fsyncs it, then renames
-/// it over `path`, so a concurrent reader never observes a partially written
-/// file. Used by the quota-cache writers (the background quota workers each
-/// persist their last-known-good snapshot).
+/// it over `path`, so a concurrent reader sees either the old file or the
+/// whole new one, never a partial write. Missing parent directories are
+/// created. The fsync is best-effort: its failure is ignored, so the rename
+/// is atomic but not proof against a crash before the data reaches disk.
 ///
 /// # Errors
 ///
@@ -75,9 +70,9 @@ where
 
 /// Like [`write_json_atomic`] but pretty-prints the JSON.
 ///
-/// Used for credential write-back so a refreshed token file keeps the
-/// human-readable 2-space layout the provider CLIs write, rather than being
-/// collapsed onto one line.
+/// For files another tool or a human also reads, such as credential write-back
+/// where collapsing a provider CLI's token file onto one line would be a
+/// visible regression.
 ///
 /// # Errors
 ///
@@ -91,7 +86,7 @@ where
     write_json_atomic_inner(path.as_ref(), value, true)
 }
 
-/// Shared atomic-write body: temp file in the same dir, fsync, rename.
+/// Shared body of the two atomic JSON writers; `pretty` selects the layout.
 fn write_json_atomic_inner<T>(path: &Path, value: &T, pretty: bool) -> Result<()>
 where
     T: serde::Serialize,
@@ -108,8 +103,8 @@ where
 /// Writes `contents` to `path` atomically (temp file in the same dir, fsync,
 /// rename), so a concurrent reader never observes a partial file.
 ///
-/// The string counterpart of [`write_json_atomic`], used to persist non-JSON
-/// text such as the `~/.vct/config.toml` settings file.
+/// The string counterpart of [`write_json_atomic`], with the same best-effort
+/// fsync and the same parent-directory creation.
 ///
 /// # Errors
 ///
@@ -122,8 +117,8 @@ pub fn write_string_atomic<P: AsRef<Path>>(path: P, contents: &str) -> Result<()
     })
 }
 
-/// Runs `write` against a temp file in `path`'s directory, fsyncs it, then
-/// atomically renames it over `path`.
+/// Runs `write` against a temp file in `path`'s directory, fsyncs it
+/// best-effort, then atomically renames it over `path`.
 fn persist_atomic(
     path: &Path,
     write: impl FnOnce(&mut tempfile::NamedTempFile) -> Result<()>,
@@ -154,11 +149,9 @@ pub fn read_json<P: AsRef<Path>>(path: P) -> Result<Vec<Value>> {
     let file = File::open(path.as_ref())
         .with_context(|| format!("Failed to open file: {}", path.as_ref().display()))?;
 
-    // Pre-allocate String capacity based on file size to reduce allocations
     let file_size = file.metadata().ok().map(|m| m.len() as usize).unwrap_or(0);
     let mut contents = String::with_capacity(file_size);
 
-    // Use centralized buffer size constant for optimal I/O performance
     let mut reader = BufReader::with_capacity(buffer::FILE_READ_BUFFER, file);
     reader
         .read_to_string(&mut contents)
@@ -177,9 +170,8 @@ pub fn read_json<P: AsRef<Path>>(path: P) -> Result<Vec<Value>> {
 /// Counts the lines in `text`.
 ///
 /// A line is a `\n`-terminated run; a trailing partial line (text not ending
-/// in `\n`) counts as one more. The empty string is zero lines. Newline
-/// counting uses the SIMD-accelerated `bytecount` crate rather than iterating
-/// chars.
+/// in `\n`) counts as one more. The empty string is zero lines. `\r\n` is
+/// counted the same as `\n`.
 ///
 /// # Examples
 ///
@@ -195,8 +187,6 @@ pub fn count_lines(text: &str) -> usize {
     if text.is_empty() {
         return 0;
     }
-    // Use bytecount for much faster line counting (SIMD-accelerated)
-    // Count newlines and add 1 if text doesn't end with newline
     let newline_count = bytecount::count(text.as_bytes(), b'\n');
     if text.ends_with('\n') {
         newline_count
@@ -232,44 +222,37 @@ mod tests {
 
     #[test]
     fn test_count_lines_empty() {
-        // Test counting lines in empty string
         assert_eq!(count_lines(""), 0);
     }
 
     #[test]
     fn test_count_lines_single_line_no_newline() {
-        // Test single line without trailing newline
         assert_eq!(count_lines("hello"), 1);
     }
 
     #[test]
     fn test_count_lines_single_line_with_newline() {
-        // Test single line with trailing newline
         assert_eq!(count_lines("hello\n"), 1);
     }
 
     #[test]
     fn test_count_lines_multiple_lines() {
-        // Test multiple lines without trailing newline
         assert_eq!(count_lines("line1\nline2\nline3"), 3);
     }
 
     #[test]
     fn test_count_lines_multiple_lines_with_newline() {
-        // Test multiple lines with trailing newline
         assert_eq!(count_lines("line1\nline2\nline3\n"), 3);
     }
 
     #[test]
     fn test_count_lines_empty_lines() {
-        // Test with empty lines in between
         assert_eq!(count_lines("line1\n\nline3"), 3);
         assert_eq!(count_lines("\n\n\n"), 3);
     }
 
     #[test]
     fn test_read_jsonl_valid() {
-        // Test reading valid JSONL file
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test.jsonl");
 
@@ -287,7 +270,6 @@ mod tests {
 
     #[test]
     fn test_read_jsonl_with_empty_lines() {
-        // Test reading JSONL with empty lines (should skip them)
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test.jsonl");
 
@@ -304,7 +286,6 @@ mod tests {
 
     #[test]
     fn test_read_jsonl_empty_file() {
-        // Test reading empty JSONL file
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("empty.jsonl");
 
@@ -316,7 +297,6 @@ mod tests {
 
     #[test]
     fn test_read_jsonl_invalid_json() {
-        // Test reading JSONL with invalid JSON
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("invalid.jsonl");
 
@@ -329,14 +309,12 @@ mod tests {
 
     #[test]
     fn test_read_jsonl_nonexistent_file() {
-        // Test reading non-existent file
         let result = read_jsonl("/nonexistent/path/file.jsonl");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_read_json_valid() {
-        // Test reading valid JSON file
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test.json");
 
@@ -351,7 +329,7 @@ mod tests {
 
     #[test]
     fn test_read_json_array() {
-        // Test reading JSON array (wrapped in single-element vector)
+        // A top-level array is the sole element of the returned Vec, not spread.
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("array.json");
 
@@ -366,7 +344,6 @@ mod tests {
 
     #[test]
     fn test_read_json_invalid() {
-        // Test reading invalid JSON
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("invalid.json");
 
@@ -379,28 +356,24 @@ mod tests {
 
     #[test]
     fn test_read_json_nonexistent_file() {
-        // Test reading non-existent file
         let result = read_json("/nonexistent/path/file.json");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_count_lines_unicode() {
-        // Test counting lines with unicode characters
         assert_eq!(count_lines("こんにちは"), 1);
         assert_eq!(count_lines("line1 😀\nline2 🎉\nline3 🚀"), 3);
     }
 
     #[test]
     fn test_count_lines_windows_line_endings() {
-        // Test with Windows-style line endings (\r\n)
-        // Note: count_lines counts \n, so \r\n will work correctly
+        // Only `\n` is counted, so a `\r\n` file yields the same total.
         assert_eq!(count_lines("line1\r\nline2\r\nline3"), 3);
     }
 
     #[test]
     fn test_read_jsonl_large_objects() {
-        // Test reading JSONL with larger objects
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("large.jsonl");
 
@@ -424,7 +397,6 @@ mod tests {
 
     #[test]
     fn test_read_json_nested_structure() {
-        // Test reading JSON with deeply nested structure
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("nested.json");
 
@@ -448,7 +420,6 @@ mod tests {
 
     #[test]
     fn test_count_lines_only_newlines() {
-        // Test string with only newlines
         assert_eq!(count_lines("\n"), 1);
         assert_eq!(count_lines("\n\n"), 2);
         assert_eq!(count_lines("\n\n\n"), 3);
@@ -456,7 +427,6 @@ mod tests {
 
     #[test]
     fn test_count_lines_mixed_content() {
-        // Test mixed content with spaces and newlines
         assert_eq!(count_lines("a\n  \nc"), 3);
         assert_eq!(count_lines("  hello  \n  world  "), 2);
     }

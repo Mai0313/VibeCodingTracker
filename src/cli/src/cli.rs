@@ -2,16 +2,15 @@
 //!
 //! The `///` comments on [`Commands`] and their arguments are what clap
 //! renders as `--help` text, so they read as user-facing prose. [`Cli`] is
-//! the parsed top-level structure; [`resolve_time_range`] collapses the
-//! mutually-exclusive `--daily` / `--weekly` / `--monthly` / `--all` flags
-//! into a single [`TimeRange`].
+//! the parsed top-level structure; [`resolve_time_range_with_default`]
+//! collapses the mutually-exclusive `--daily` / `--weekly` / `--monthly` /
+//! `--all` flags into a single `TimeRange`.
 
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
-// `TimeRange` and the period-flag resolvers are core domain logic (no clap
-// types), so they live in `models::filter`; re-exported here for the clap layer
-// and library callers that reach them through `cli`.
+// The period-flag resolver is core domain logic (no clap types), so it lives in
+// `models::filter`; re-exported here so the clap layer has one import path.
 pub use vct_core::models::resolve_time_range_with_default;
 
 /// A provider whose raw quota/usage API response `vct quota` can print.
@@ -29,7 +28,11 @@ pub enum QuotaProvider {
     Grok,
 }
 
-/// Vibe Coding Tracker - AI coding assistant usage analyzer.
+/// The parsed top-level command line.
+///
+/// This comment is not the `--help` about text: the valueless `about` in the
+/// `#[command]` attribute below resolves to the crate description declared in
+/// `Cargo.toml`.
 #[derive(Parser, Debug)]
 #[command(name = "vibe_coding_tracker")]
 #[command(author, version = vct_core::VERSION, about, long_about = None)]

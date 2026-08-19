@@ -9,9 +9,9 @@ use crate::models::ProviderActiveDays;
 
 /// Display-side copy of one model's analysis metrics.
 ///
-/// Mirrors [`AggregatedAnalysisRow`] but is decoupled from the (de)serializable
-/// aggregator type so the renderers can also use it as a mutable `TOTAL`
-/// accumulator. Construct via [`convert_to_analysis_rows`] or `Default`.
+/// Field-for-field mirror of [`AggregatedAnalysisRow`], decoupled from that
+/// (de)serializable type so the renderers can also use it as the mutable
+/// `TOTAL` row accumulator.
 #[derive(Default)]
 pub struct AnalysisRow {
     /// Model name the metrics are grouped under.
@@ -34,9 +34,10 @@ pub struct AnalysisRow {
     pub write_count: usize,
 }
 
-/// Per-provider totals for analysis. `days_count` records how many distinct
-/// days contributed to the totals so the display layer can show the spread
-/// without computing a rate.
+/// Per-provider totals for analysis.
+///
+/// The counters are summed from the provider's [`AnalysisRow`]s; `days_count`
+/// is copied from [`ProviderActiveDays`] instead.
 #[derive(Default, Clone)]
 pub struct AnalysisProviderStats {
     /// Sum of `Edit` lines across the provider's models.
@@ -73,17 +74,17 @@ impl AnalysisProviderStats {
     }
 }
 
-/// Type alias for analysis totals grouped by provider.
+/// Per-provider analysis totals, including the "All Providers" bucket.
 pub type AnalysisProviderTotals = crate::models::ProviderTotals<AnalysisProviderStats>;
 
 /// Calculate per-provider analysis totals using **source-directory**
-/// attribution, matching the usage command's approach.
+/// attribution, mirroring the usage command's per-provider roll-up.
 ///
-/// Consuming `PerProviderAnalysisRows` directly means same-named models
-/// that appear in multiple providers (e.g. `claude-sonnet-4-6` recorded
-/// both by Claude Code and Copilot CLI after the recent Copilot refactor)
-/// are attributed correctly to each source directory rather than being
-/// lumped under whichever provider the model name happens to look like.
+/// Folding [`PerProviderAnalysisRows`] keeps a model recorded by two providers
+/// (e.g. `claude-sonnet-4-6` under both Claude Code and Copilot CLI) attributed
+/// to each source directory rather than to whichever provider its name
+/// resembles. The `hermes` bucket stays at its default: Hermes is usage-only,
+/// so no analysis rows reach it.
 pub fn calculate_analysis_provider_totals_from_per_provider(
     per_provider: &PerProviderAnalysisRows,
     provider_days: &ProviderActiveDays,
@@ -109,10 +110,9 @@ pub fn calculate_analysis_provider_totals_from_per_provider(
     accumulate_analysis_provider(&mut totals.opencode, &per_provider.opencode);
     accumulate_analysis_provider(&mut totals.cursor, &per_provider.cursor);
 
-    // "All Providers" row is the sum of every provider's totals, matching
-    // the usage command. Summing per-provider stats keeps the overall
-    // total == Σ providers even when a model appears under more than one
-    // provider.
+    // Summing the per-provider stats, rather than folding the model-keyed
+    // roll-up, keeps the "All Providers" row equal to Σ providers even when a
+    // model appears under more than one provider.
     totals.overall.total_edit_lines = totals.claude.total_edit_lines
         + totals.codex.total_edit_lines
         + totals.copilot.total_edit_lines
@@ -190,10 +190,6 @@ fn accumulate_analysis_provider(stats: &mut AnalysisProviderStats, rows: &[Aggre
 }
 
 /// Convert aggregator rows into the renderers' [`AnalysisRow`] shape.
-///
-/// A field-for-field copy that decouples the display state from the
-/// (de)serializable [`AggregatedAnalysisRow`]; `model` is cloned, all counters
-/// are carried over verbatim.
 ///
 /// # Examples
 ///

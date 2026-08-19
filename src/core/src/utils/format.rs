@@ -3,11 +3,6 @@ use std::sync::RwLock;
 
 /// Formats an integer with comma thousands-separators.
 ///
-/// Accepts any [`itoa::Integer`], so both signed and unsigned widths work.
-/// Uses `itoa` to render the digits into a stack buffer, then inserts commas
-/// every three digits from the right — no intermediate `String` allocation
-/// for the conversion itself.
-///
 /// # Examples
 ///
 /// ```
@@ -21,7 +16,6 @@ pub fn format_number<T>(n: T) -> String
 where
     T: itoa::Integer,
 {
-    // Use itoa for fast conversion (no allocations, direct to buffer)
     let mut buf = itoa::Buffer::new();
     let s = buf.format(n);
 
@@ -32,18 +26,15 @@ where
     let mut result = String::with_capacity(s.len() + (s.len() - 1) / 3);
     let remainder = s.len() % 3;
 
-    // Handle first group (which might be 1, 2, or 3 digits)
     if remainder > 0 {
         result.push_str(&s[..remainder]);
     }
 
-    // Handle remaining groups of 3 (direct byte operations for speed)
     for (i, chunk) in s.as_bytes()[remainder..].chunks_exact(3).enumerate() {
-        // Add comma before each group (including first if remainder > 0)
         if remainder > 0 || i > 0 {
             result.push(',');
         }
-        // SAFETY: chunks_exact(3) guarantees valid UTF-8 ASCII digits
+        // SAFETY: itoa renders ASCII only, so any byte slice of `s` is valid UTF-8.
         unsafe {
             result.push_str(std::str::from_utf8_unchecked(chunk));
         }
@@ -54,15 +45,14 @@ where
 
 /// Formats an integer into a compact human string with a K/M/B/T suffix.
 ///
-/// Targets a dense dashboard where column width is scarce: values under 1000
-/// render verbatim, otherwise the largest fitting unit is used with 3
-/// significant figures (2 / 1 / 0 decimals as the scaled value crosses 10 and
-/// 100), so the result stays within ~5 characters. Rounding that would reach
-/// 1000 within a unit is promoted to the next unit, so `999_950` renders as
-/// `"1.00M"` rather than `"1000K"`. Negative values keep a leading `-`.
+/// Values under 1000 render verbatim; larger ones use the largest fitting unit
+/// with 3 significant figures (2 / 1 / 0 decimals as the scaled value crosses
+/// 10 and 100), so the result stays within ~5 characters. Rounding that would
+/// reach 1000 within a unit is promoted to the next unit, so `999_950` renders
+/// as `"1.00M"` rather than `"1000K"`. Negative values keep a leading `-`.
 ///
-/// Only the interactive TUI uses this; the static table, text, and JSON paths
-/// keep [`format_number`] so their numbers stay exact.
+/// Only the interactive TUI uses this; the static table renders the same counts
+/// exactly with [`format_number`].
 ///
 /// # Examples
 ///
@@ -80,7 +70,6 @@ pub fn format_compact(n: i64) -> String {
 
     let abs = n.unsigned_abs() as f64;
     if abs < 1000.0 {
-        // No suffix needed; render the integer verbatim (keeps the sign).
         return n.to_string();
     }
 
@@ -102,8 +91,7 @@ pub fn format_compact(n: i64) -> String {
         .unwrap_or(UNITS.len() - 1);
     let mut scaled = abs / UNITS[idx].0;
 
-    // Rounding can push the scaled value to 1000 (e.g. 999_950 -> "1000K");
-    // promote one unit up so it reads "1.00M".
+    // Rounding can reach 1000 within a unit; promote so 999_950 reads "1.00M".
     let dec = decimals(scaled);
     let factor = 10f64.powi(dec as i32);
     if (scaled * factor).round() / factor >= 1000.0 && idx > 0 {
@@ -118,9 +106,10 @@ pub fn format_compact(n: i64) -> String {
 
 /// Formats a USD amount as `"$1,234.56"` (comma-grouped dollars, two decimals).
 ///
-/// Unlike [`format_compact`], money is never abbreviated to K/M/B — that would
-/// drop the cents — so long totals are kept readable with thousands separators
-/// instead. Negative amounts render as `"-$1.23"`.
+/// Never abbreviated, so the cents survive at any magnitude
+/// ([`format_cost_compact`] is the K/M/B/T form). Negative amounts render as
+/// `"-$1.23"`, except that an amount rounding to zero cents renders `"$0.00"`
+/// with no sign.
 ///
 /// # Examples
 ///
@@ -141,9 +130,8 @@ pub fn format_cost(cost: f64) -> String {
 ///
 /// Amounts under `$1000` keep full cents via [`format_cost`] (`$74.18`); larger
 /// amounts drop to [`format_compact`]'s 3-significant-figure form prefixed with
-/// `$` (`$8.63K`, `$14.2K`). This mirrors how the TUI already abbreviates token
-/// counts — only the interactive view uses it, while the static table, text, and
-/// JSON paths keep [`format_cost`] so their amounts stay exact to the cent.
+/// `$` (`$8.63K`, `$14.2K`). Only the interactive usage view uses it; the static
+/// table, text, and JSON paths emit unabbreviated amounts of their own.
 ///
 /// # Examples
 ///
@@ -163,20 +151,17 @@ pub fn format_cost_compact(cost: f64) -> String {
     format!("{sign}${}", format_compact(cost.abs().round() as i64))
 }
 
-// Cache for current date (updated once per day)
 static DATE_CACHE: RwLock<Option<(NaiveDate, String)>> = RwLock::new(None);
 
 /// Returns today's local date as a `YYYY-MM-DD` string.
 ///
-/// The formatted string is cached behind an `RwLock` and only recomputed
-/// when the local calendar day changes, so repeated calls within the same
-/// day (e.g. tagging every aggregated row) avoid re-running `strftime`. A
-/// poisoned lock degrades gracefully: the value is recomputed without
-/// touching the cache rather than panicking.
+/// Memoized in a process-wide `RwLock` and recomputed only when the local
+/// calendar day changes. A poisoned lock degrades gracefully: the value is
+/// recomputed without touching the cache rather than panicking.
 pub fn get_current_date() -> String {
     let today = Local::now().date_naive();
 
-    // Fast path: read lock to check if cache is valid
+    // Scoped so the read guard is released before the write lock is taken.
     {
         if let Ok(cache) = DATE_CACHE.read()
             && let Some((cached_date, cached_string)) = cache.as_ref()
@@ -186,7 +171,6 @@ pub fn get_current_date() -> String {
         }
     }
 
-    // Slow path: write lock to update cache
     let date_string = today.format("%Y-%m-%d").to_string();
     if let Ok(mut cache) = DATE_CACHE.write() {
         *cache = Some((today, date_string.clone()));
@@ -197,9 +181,9 @@ pub fn get_current_date() -> String {
 
 /// Formats the time remaining until `reset_unix` as a compact human string.
 ///
-/// Returns "now" when the reset is in the past or under a minute away
-/// (clamped at 0), otherwise the two most significant units: "13m", "2h13m",
-/// or "4d2h".
+/// Returns `"now"` when the reset is in the past or under a minute away (the
+/// difference is clamped at 0), otherwise the two most significant units
+/// (`"4d2h"`, `"2h13m"`), or just minutes (`"13m"`) under an hour.
 ///
 /// # Examples
 ///
@@ -242,11 +226,8 @@ mod tests {
 
     #[test]
     fn test_format_number_edge_cases() {
-        // Single digit
         assert_eq!(format_number(1), "1");
         assert_eq!(format_number(9), "9");
-
-        // Two digits
         assert_eq!(format_number(10), "10");
         assert_eq!(format_number(99), "99");
 
@@ -258,12 +239,9 @@ mod tests {
         assert_eq!(format_number(1000), "1,000");
         assert_eq!(format_number(9999), "9,999");
 
-        // Exact multiples of 1000
         assert_eq!(format_number(10000), "10,000");
         assert_eq!(format_number(100000), "100,000");
         assert_eq!(format_number(1000000), "1,000,000");
-
-        // Large numbers
         assert_eq!(format_number(12345678901_i64), "12,345,678,901");
         assert_eq!(format_number(999999999999_i64), "999,999,999,999");
     }

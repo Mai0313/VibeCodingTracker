@@ -1,12 +1,13 @@
-//! Aggregates per-model token usage across the file-backed provider session trees.
+//! Aggregates per-model token usage across every provider source.
 //!
-//! Each provider directory is walked with the provider fixed by its *source
-//! path* (never re-detected from file contents), parsed in
-//! [`ParseMode::UsageOnly`] to skip the heavy file-operation payloads, and the
-//! small per-model usage maps are merged into a [`UsageData`]. The provider is
-//! tracked twice on purpose — once merged across providers (the per-model
-//! table) and once kept per source directory (the per-provider footer) — see
-//! [`UsageData`] for why.
+//! File-backed providers are walked with the provider fixed by its *source
+//! path* (never re-detected from file contents) and parsed in
+//! [`ParseMode::UsageOnly`] to skip the heavy file-operation payloads;
+//! OpenCode, Cursor and Hermes are read straight out of their SQLite
+//! databases. Every source's per-model usage is merged into a [`UsageData`],
+//! which tracks the provider twice on purpose — once merged across providers
+//! (the per-model table) and once kept per source (the per-provider footer) —
+//! see [`UsageData`] for why.
 
 use crate::config::ProvidersConfig;
 use crate::constants::{FastHashMap, FastHashSet, capacity};
@@ -45,14 +46,13 @@ use std::sync::Arc;
 
 /// Aggregated token usage plus the per-provider active-day counts.
 ///
-/// Built only by [`aggregate_usage_from_home`]; all fields are public for the
-/// display layer to read. Token totals are tracked two ways at once because the
-/// two views need different attribution: [`models`](UsageData::models) merges a
-/// shared model (e.g. `claude-sonnet-4-6` emitted by both Claude Code and
-/// Copilot CLI) into one row, while [`per_provider`](UsageData::per_provider)
-/// keeps the same tokens scoped to the source directory so the footer can
-/// attribute them correctly. The shared tokens are merged, not summed, so they
-/// are never double-counted across the two maps.
+/// All fields are public for the display layer to read. Token totals are
+/// tracked two ways at once because the two views need different attribution:
+/// [`models`](UsageData::models) merges a shared model (e.g. `claude-sonnet-4-6`
+/// emitted by both Claude Code and Copilot CLI) into one row, while
+/// [`per_provider`](UsageData::per_provider) keeps the same tokens scoped to the
+/// source so the footer can attribute them correctly. The same tokens land in
+/// both maps, so a consumer reads one view or the other and never sums them.
 ///
 /// # Examples
 ///
@@ -100,9 +100,9 @@ pub struct UsageCollection {
 /// Provider-authoritative per-model costs, kept **separate per provider**.
 ///
 /// OpenCode and Hermes record their own costs. The Cursor map is retained for
-/// source compatibility, but the local Cursor estimate now carries zero stored
-/// cost and is priced by an exact LiteLLM match in the display layer. Separate
-/// maps prevent a colliding bare model name from cross-contaminating providers.
+/// source compatibility, but the local Cursor estimate carries zero stored cost
+/// and is priced only by an exact LiteLLM match. Separate maps prevent a
+/// colliding bare model name from cross-contaminating providers.
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct StoredCosts {
     /// OpenCode's per-model stored cost, keyed by model name.
@@ -113,11 +113,7 @@ pub struct StoredCosts {
     pub hermes: FastHashMap<String, f64>,
 }
 
-/// Extracts token usage data from a typed `CodeAnalysis`.
-///
-/// Reads directly from the typed `conversation_usage` map instead of walking
-/// `Value` via `.get(...)`, so no intermediate `serde_json::Value` tree is
-/// built or retained here.
+/// Merges a session's per-model token usage out of a typed [`CodeAnalysis`].
 fn extract_conversation_usage_from_analysis(analysis: CodeAnalysis) -> FastHashMap<String, Value> {
     let mut conversation_usage = FastHashMap::with_capacity(capacity::MODELS_PER_SESSION);
 
@@ -145,11 +141,11 @@ fn extract_conversation_usage_from_analysis(analysis: CodeAnalysis) -> FastHashM
 
 /// Aggregates token usage from all AI provider session directories.
 ///
-/// Scans the file-backed provider session trees resolved by [`resolve_paths`],
-/// filtered by `time_range`, and rolls every session's
-/// per-model usage into a [`UsageData`]. Missing provider directories are
-/// skipped silently, and a source file or OpenCode database that fails to parse
-/// logs a warning to stderr and is excluded rather than aborting the whole scan.
+/// Scans every provider source resolved by [`resolve_paths`], filtered by
+/// `time_range`, and rolls every session's per-model usage into a
+/// [`UsageData`]. Missing provider sources are skipped silently, and a source
+/// file or database that fails to parse logs a warning to the diagnostic log
+/// and is excluded rather than aborting the whole scan.
 ///
 /// # Errors
 ///
@@ -250,11 +246,10 @@ pub fn aggregate_usage_from_paths_with_providers(
     }
 
     if providers.copilot && paths.copilot_session_dir.exists() {
-        // `events.jsonl` always lives exactly two levels under
-        // `session-state/`. Bounding the walk here keeps per-session
-        // snapshot subtrees (`rewind-snapshots/backups/*`, `files/*`, …)
-        // out of the `WalkDir` iteration entirely, so the scan cost stays
-        // linear in the number of sessions rather than total artifacts.
+        // `events.jsonl` always lives exactly two levels under `session-state/`,
+        // so bounding the walk keeps per-session snapshot subtrees
+        // (`rewind-snapshots/backups/*`, `files/*`, …) out of the iteration and
+        // the scan cost linear in sessions rather than total artifacts.
         process_usage_directory(
             &[paths.copilot_session_dir.as_path()],
             ExtensionType::Copilot,
@@ -887,10 +882,10 @@ impl UsageAccumulator {
 /// parallel with the provider fixed to `provider` — never re-detected from
 /// contents — and each session's per-model tokens are merged into both
 /// `global_result` (cross-provider view) and `provider_result` (source-scoped
-/// view). Every contributing session's modified date is inserted into
-/// `unique_dates` for the active-day count. Traversal and metadata errors are
-/// skipped by the collector, and a file that fails to parse logs a warning and
-/// is skipped, so this is best-effort by construction and cannot fail.
+/// view). A session that contributed any tokens has its modified date inserted
+/// into `unique_dates` for the active-day count. Traversal and metadata errors
+/// are skipped by the collector, and a file that fails to parse logs a warning
+/// and is skipped, so this is best-effort by construction and cannot fail.
 #[allow(clippy::too_many_arguments)] // per-provider helper; struct-wrapping the args would hurt readability
 fn process_usage_directory<F>(
     dirs: &[&Path],
@@ -908,13 +903,11 @@ fn process_usage_directory<F>(
     // dropped here; the `*_with_diagnostics` scanners are the ones that report them.
     let files = collect_provider_files_diagnostics(dirs, filter_fn, time_range, max_depth).files;
 
-    // Parse each file directly in `UsageOnly` mode, extract the small
-    // per-model usage map, then drop the analysis. The provider is fixed by
-    // the source directory — we do not re-detect from file contents, which
-    // would mis-classify Claude sessions whose first line is a metadata
-    // sentinel (`permission-mode`, `file-history-snapshot`) and silently drop
-    // their usage. We also deliberately bypass the global file cache here:
-    // the `usage` path never needs the heavy `write_file_details` /
+    // Fixing the provider by source directory is what keeps a Claude session
+    // whose first line is a metadata sentinel (`permission-mode`,
+    // `file-history-snapshot`) from being re-detected as another provider and
+    // silently dropped. The global file cache is bypassed on purpose: the
+    // `usage` path never needs the heavy `write_file_details` /
     // `edit_file_details` payloads, so caching the full analysis would waste
     // the memory win from `UsageOnly`.
     let file_results: Vec<(String, FastHashMap<String, Value>)> = files
@@ -933,13 +926,7 @@ fn process_usage_directory<F>(
         })
         .collect();
 
-    // Merge parallel results sequentially (this part is fast). Every
-    // per-model usage value is merged into *both* maps:
-    //   - `global_result` keeps the cross-provider view used by the main
-    //     per-model table,
-    //   - `provider_result` keeps the same tokens scoped to this provider
-    //     so the summary footer can attribute them to the right source
-    //     directory without having to guess from the model name.
+    // Merged sequentially; it is cheap next to the parallel parse above.
     for (date, conversation_usage) in file_results {
         if usage_map_has_activity(&conversation_usage, 0.0) {
             unique_dates.insert(date);
@@ -993,9 +980,9 @@ fn process_opencode_usage(
 /// Reads Cursor's per-model usage (a local estimate from the chat stores) and
 /// merges it into both the global and Cursor-scoped maps.
 ///
-/// Mirrors [`process_opencode_usage`]: the estimate carries its own per-model
-/// tuple shape as stored-cost readers. Its zero stored cost lets the display
-/// layer accept only an exact LiteLLM match rather than a fuzzy price guess.
+/// Mirrors [`process_opencode_usage`], but the estimate carries a zero stored
+/// cost, so pricing accepts only an exact LiteLLM match rather than a fuzzy
+/// price guess.
 fn process_cursor_usage(
     chats_dir: &Path,
     tracking_db: &Path,
@@ -1045,7 +1032,8 @@ fn process_hermes_usage(
 }
 
 /// Folds `(date, analysis, cost)` rows from a stored-cost provider (OpenCode /
-/// Cursor) into the global + provider-scoped maps and the stored-cost table.
+/// Cursor / Hermes) into the global + provider-scoped maps and the stored-cost
+/// table.
 fn fold_stored_cost_sessions(
     sessions: Vec<(String, CodeAnalysis, f64)>,
     global_result: &mut UsageResult,
@@ -1082,10 +1070,8 @@ fn usage_map_has_activity(usage: &FastHashMap<String, Value>, stored_cost: f64) 
 }
 
 impl UsageData {
-    /// Returns the per-provider usage slice for `provider`, or `None`
-    /// when the provider has no dedicated bucket (e.g. `Provider::Unknown`
-    /// — the display layer's fallthrough view is fed by the global
-    /// `models` map instead).
+    /// Returns the per-provider usage slice for `provider`, or `None` when the
+    /// provider has no dedicated bucket ([`Provider::Unknown`]).
     pub fn provider_usage(&self, provider: Provider) -> Option<&UsageResult> {
         self.per_provider.get(provider)
     }

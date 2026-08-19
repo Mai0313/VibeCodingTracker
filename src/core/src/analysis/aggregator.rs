@@ -26,9 +26,8 @@ use serde::{Serialize, Serializer, ser::SerializeSeq};
 use std::collections::HashSet;
 use std::path::Path;
 
-// `AggregatedAnalysisRow` is a neutral DTO shared with the scan cache, so it
-// lives in `models`; re-exported here to keep the `analysis::AggregatedAnalysisRow`
-// (and `analysis::aggregator::AggregatedAnalysisRow`) paths working.
+// Defined in `models` because the scan cache shares it; re-exported here so the
+// `analysis::AggregatedAnalysisRow` path keeps working.
 pub use crate::models::AggregatedAnalysisRow;
 
 /// Bundle of aggregated analysis rows plus the per-provider active-day counts
@@ -41,10 +40,10 @@ pub struct AnalysisData {
     /// providers (e.g. Copilot CLI + Claude Code both using
     /// `claude-sonnet-4-6`) share a single row here.
     pub rows: Vec<AggregatedAnalysisRow>,
-    /// Same aggregation, but partitioned by **source directory** rather
-    /// than by model name. Drives the per-provider summary footer so
-    /// Copilot-originated sessions cannot be mis-attributed to Claude Code
-    /// just because their model name starts with `claude-`.
+    /// Same aggregation, bucketed by **provider** before the per-model
+    /// roll-up. Drives the per-provider totals table, so Copilot-originated
+    /// sessions cannot be mis-attributed to Claude Code just because their
+    /// model name starts with `claude-`.
     pub per_provider: PerProviderAnalysisRows,
     /// Distinct active-day count per provider, used to derive daily averages.
     pub provider_days: ProviderActiveDays,
@@ -52,10 +51,9 @@ pub struct AnalysisData {
 
 /// A compact summary plus diagnostics from the source scan that produced it.
 ///
-/// The legacy aggregation entry points return only [`AnalysisData`] for TUI
-/// callers that intentionally operate on best-effort data. Noninteractive
-/// callers can use the `*_with_diagnostics` variants and reject an all-failed
-/// scan or surface partial failures before rendering `data`.
+/// The plain aggregation entry points return only [`AnalysisData`]; the
+/// `*_with_diagnostics` variants return this instead, so a caller can reject an
+/// all-failed scan or surface partial failures before rendering `data`.
 pub struct AnalysisCollection {
     /// Successfully parsed metrics, even when some other sources failed.
     pub data: AnalysisData,
@@ -63,11 +61,12 @@ pub struct AnalysisCollection {
     pub diagnostics: ScanDiagnostics,
 }
 
-/// Aggregated analysis rows partitioned by the source directory they came from.
+/// Aggregated analysis rows partitioned by the provider that produced them.
 ///
-/// Attribution is by provider directory, not by model name, so a model that
-/// appears under more than one provider (e.g. `claude-sonnet-4-6` recorded by
-/// both Claude Code and Copilot CLI) lands in the correct bucket.
+/// Attribution comes from the source directory or database, not from the model
+/// name, so a model that appears under more than one provider (e.g.
+/// `claude-sonnet-4-6` recorded by both Claude Code and Copilot CLI) lands in
+/// the correct bucket.
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct PerProviderAnalysisRows {
     /// Rows from the Claude Code session directory.
@@ -165,19 +164,20 @@ impl Serialize for AnalysisDataset {
 /// Aggregate file-operation metrics across every provider's session files,
 /// keyed by model.
 ///
-/// Scans every enabled analysis provider's session files or database, sums
-/// tool-call counts and line counts by model within `time_range`, and returns
-/// rows sorted by model name alongside per-provider active-day counts. Parsed
-/// sessions are folded directly into the compact summary in
-/// [`ParseMode::UsageOnly`], so this path never retains a cross-provider
-/// [`AnalysisDataset`]. Missing provider directories are skipped, and
-/// individual source failures are logged rather than aborting the scan.
+/// Scans every provider's session files or database except Hermes, which is
+/// usage-only and has no analysis reader, sums tool-call counts and line
+/// counts by model within `time_range`, and returns rows sorted by model
+/// name alongside per-provider active-day counts. Parsed sessions are folded
+/// directly into the compact summary in [`ParseMode::UsageOnly`], so this path
+/// never retains a cross-provider [`AnalysisDataset`]. A missing provider
+/// directory yields no rows rather than an error.
 ///
 /// # Errors
 ///
-/// Returns an error if the provider paths cannot be resolved. Directory
-/// traversal and metadata errors are currently skipped by the walker rather
-/// than propagated.
+/// Returns an error only if the provider paths cannot be resolved. Traversal,
+/// metadata, and per-source parse failures are logged and recorded as scan
+/// diagnostics, which this entry point discards; use
+/// [`aggregate_sessions_by_model_with_diagnostics`] to see them.
 ///
 /// # Examples
 ///
@@ -223,10 +223,9 @@ pub fn aggregate_sessions_by_model_with_diagnostics(
 /// Aggregates file-operation metrics from provider session directories rooted at
 /// an explicit [`HelperPaths`].
 ///
-/// The env-free, injectable counterpart of [`aggregate_sessions_by_model`]:
-/// every provider path comes from `paths` rather than the resolved home
-/// directory, so tests can point them at a temp tree and exercise the real
-/// aggregation without mutating process-global `HOME`.
+/// The env-free counterpart of [`aggregate_sessions_by_model`]: every provider
+/// path comes from `paths`, so tests can point them at a temp tree without
+/// mutating process-global `HOME`.
 pub fn aggregate_sessions_by_model_from_paths(
     paths: &HelperPaths,
     time_range: TimeRange,
@@ -269,9 +268,9 @@ pub fn aggregate_sessions_by_model_from_paths_with_diagnostics(
 
 /// Collects the canonical batch-analysis dataset from the current user's home.
 ///
-/// Providers are always appended in this order: Claude, Codex, Copilot,
-/// Gemini, Grok, OpenCode, Cursor. `mode` controls only detail retention; every
-/// scalar counter remains available to downstream projections.
+/// Providers are always appended in this order: Claude, Codex, Copilot, Gemini,
+/// Grok, DeepSeek, OpenCode, Cursor. `mode` controls only detail retention;
+/// every scalar counter remains available to downstream projections.
 pub fn collect_analysis_sessions_with(
     time_range: TimeRange,
     providers: ProvidersConfig,
@@ -312,10 +311,11 @@ pub fn collect_analysis_sessions_from_paths_with(
 
 /// Visits parsed sessions in deterministic provider and source order.
 ///
-/// The canonical collector passes a `Vec::push` visitor and retains every
-/// session. Summary aggregation passes an [`AnalysisProjection`] visitor and
-/// drops each parsed session immediately after folding it. This keeps source
-/// discovery, diagnostics, and ordering identical across both paths.
+/// Both the canonical collector and the summary projection go through here, so
+/// source discovery, diagnostics, and ordering stay identical between them.
+/// The collector's visitor retains every session; the projection's folds each
+/// one and drops it, which is what keeps the summary path off a cross-provider
+/// dataset.
 fn visit_analysis_sessions_from_paths_with<F>(
     paths: &HelperPaths,
     time_range: TimeRange,
@@ -487,8 +487,9 @@ pub fn aggregate_sessions_by_model_with_cache(
 
 /// Incremental compact analysis scan rooted at explicit provider paths.
 ///
-/// File sources share the same compact cache shape as the usage collector.
-/// Database entries retain only model counters, dates, and source diagnostics.
+/// `cache` is updated in place: a source whose fingerprint is unchanged is
+/// folded from its cached compact summary instead of being re-parsed, and file
+/// and analysis-database entries not seen in this scan are dropped.
 pub fn aggregate_sessions_by_model_from_paths_with_cache(
     paths: &HelperPaths,
     time_range: TimeRange,
@@ -946,7 +947,7 @@ fn visit_database_sessions<F>(
     }
 }
 
-/// Mutable accumulator shared by batch and single-file projections.
+/// Mutable accumulator shared by the batch, cached, and single-file projections.
 struct AnalysisProjection {
     all: FastHashMap<String, AggregatedAnalysisRow>,
     claude: FastHashMap<String, AggregatedAnalysisRow>,
@@ -1177,10 +1178,9 @@ fn local_date_from_millis(timestamp: i64) -> Option<String> {
 
 /// Folds one parsed session's per-model counters into `aggregated`.
 ///
-/// Each model in the session's `conversation_usage` gets (or creates) a row,
-/// and that record's line and tool-call counts are added in. Synthetic models
-/// (model name containing `<synthetic>`) are skipped so placeholder usage does
-/// not pollute the per-model breakdown.
+/// Every model in a record's `conversation_usage` is credited with that
+/// record's full line and tool-call counts; models whose name contains
+/// `<synthetic>` are skipped so placeholder usage never reaches the breakdown.
 fn aggregate_analysis_result(
     aggregated: &mut FastHashMap<String, AggregatedAnalysisRow>,
     analysis: &CodeAnalysis,
@@ -1271,9 +1271,7 @@ mod tests {
 
     #[test]
     fn advisor_model_is_not_credited_with_file_operations() {
-        // Regression guard: advisor-message usage lives in `advisor_usage`, not
-        // `conversation_usage`, so the aggregator must not create a row for the
-        // advisor model or credit it with the main model's tool / line counts.
+        // Advisor usage lives in `advisor_usage`, not `conversation_usage`.
         let analysis = analysis_with_advisor();
         let mut aggregated = FastHashMap::default();
         aggregate_analysis_result(&mut aggregated, &analysis);
