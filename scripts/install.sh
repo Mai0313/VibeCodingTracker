@@ -28,8 +28,20 @@ detect_platform() {
     printf "%s-%s" "$os" "$arch"
 }
 
+# curl already prints the underlying reason; this only says what to do about it.
+download_failed() {
+    echo "Download failed: $1" >&2
+    echo "If the error above is a certificate problem, this machine does not trust the" >&2
+    echo "server's issuer. Update your CA certificates, or point CURL_CA_BUNDLE at your" >&2
+    echo "proxy's CA, and retry. This installer never skips certificate verification." >&2
+    exit 1
+}
+
 get_latest_version() {
-    curl -fsSLk "https://api.github.com/repos/${REPO}/releases/latest" |
+    local url="https://api.github.com/repos/${REPO}/releases/latest"
+    local response
+    response="$(curl -fsSL "$url")" || download_failed "$url"
+    printf "%s" "$response" |
         grep -o '"tag_name": "[^"]*"' |
         cut -d'"' -f4
 }
@@ -61,7 +73,7 @@ install_binary() {
     trap 'rm -rf "$temp_dir"' EXIT
 
     local archive="${temp_dir}/${filename}"
-    curl -fsSLk -o "$archive" "$url"
+    curl -fsSL -o "$archive" "$url" || download_failed "$url"
     tar -xzf "$archive" -C "$temp_dir"
 
     local binary
