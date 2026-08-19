@@ -277,7 +277,6 @@ struct UsageEvent {
     output: i64,
     cache_read: i64,
     cache_write: i64,
-    cost: f64,
 }
 
 struct CursorUsageEvents {
@@ -300,7 +299,9 @@ fn aggregate_events(events: &[UsageEvent], time_range: TimeRange) -> Vec<UsageCo
             e.timestamp_ms,
             e.model.clone(),
             cursor_usage_value(e.input, e.output, e.cache_read, e.cache_write),
-            e.cost,
+            // Cursor records no cost locally, so every row is priced by the
+            // caller's exact LiteLLM match alone.
+            0.0,
         ));
     }
     out
@@ -329,7 +330,6 @@ pub(crate) fn read_cursor_usage_store(
                 output: 0,
                 cache_read,
                 cache_write: 0,
-                cost: 0.0,
             })
         })
         .collect::<Vec<_>>();
@@ -427,7 +427,6 @@ fn approximation_events(chats_dir: &Path, tracking_db: &Path) -> CursorUsageEven
                 output: 0,
                 cache_read: ctx,
                 cache_write: 0,
-                cost: 0.0,
             })
             .collect(),
         candidates,
@@ -1419,7 +1418,6 @@ mod tests {
                 output: 20,
                 cache_read: 50,
                 cache_write: 10,
-                cost: 1.5,
             },
             UsageEvent {
                 date: "2000-01-01".to_string(),
@@ -1429,7 +1427,6 @@ mod tests {
                 output: 5,
                 cache_read: 0,
                 cache_write: 0,
-                cost: 0.0,
             },
         ];
         // Daily cutoff drops the ancient 2000 row but keeps the far-future one.
@@ -1438,7 +1435,8 @@ mod tests {
         let row = &rows[0];
         assert_eq!(row.date, "2999-01-01");
         assert_eq!(row.timestamp_ms, 32_470_920_000_000);
-        assert!((row.stored_cost - 1.5).abs() < 1e-9);
+        // Cursor rows never carry a stored cost of their own.
+        assert_eq!(row.stored_cost, 0.0);
         assert_eq!(row.model, "claude-sonnet-4.6");
     }
 

@@ -99,16 +99,14 @@ pub struct UsageCollection {
 
 /// Provider-authoritative per-model costs, kept **separate per provider**.
 ///
-/// OpenCode and Hermes record their own costs. The Cursor map is retained for
-/// source compatibility, but the local Cursor estimate carries zero stored cost
-/// and is priced only by an exact LiteLLM match. Separate maps prevent a
-/// colliding bare model name from cross-contaminating providers.
+/// OpenCode and Hermes are the providers that record their own costs; Cursor
+/// carries none, so its local estimate is priced by an exact LiteLLM match
+/// alone. Separate maps prevent a colliding bare model name from
+/// cross-contaminating providers.
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct StoredCosts {
     /// OpenCode's per-model stored cost, keyed by model name.
     pub opencode: FastHashMap<String, f64>,
-    /// Cursor's per-model dashboard cost, keyed by model name.
-    pub cursor: FastHashMap<String, f64>,
     /// Hermes's per-model stored cost, keyed by model name.
     pub hermes: FastHashMap<String, f64>,
 }
@@ -330,7 +328,6 @@ pub fn aggregate_usage_from_paths_with_providers(
             &paths.cursor_tracking_db,
             &mut result,
             &mut per_provider.cursor,
-            &mut stored_costs.cursor,
             &mut cursor_dates,
             time_range,
         )
@@ -818,7 +815,6 @@ impl UsageAccumulator {
 
         let stored = match provider {
             ExtensionType::OpenCode => Some(&mut self.stored_costs.opencode),
-            ExtensionType::Cursor => Some(&mut self.stored_costs.cursor),
             ExtensionType::Hermes => Some(&mut self.stored_costs.hermes),
             _ => None,
         };
@@ -967,11 +963,11 @@ fn process_opencode_usage(
     time_range: TimeRange,
 ) -> Result<()> {
     let sessions = read_opencode_usage(db_path, time_range)?;
-    fold_stored_cost_sessions(
+    fold_database_sessions(
         sessions,
         global_result,
         provider_result,
-        stored_costs,
+        Some(stored_costs),
         unique_dates,
     );
     Ok(())
@@ -980,26 +976,19 @@ fn process_opencode_usage(
 /// Reads Cursor's per-model usage (a local estimate from the chat stores) and
 /// merges it into both the global and Cursor-scoped maps.
 ///
-/// Mirrors [`process_opencode_usage`], but the estimate carries a zero stored
-/// cost, so pricing accepts only an exact LiteLLM match rather than a fuzzy
-/// price guess.
+/// Mirrors [`process_opencode_usage`], but Cursor records no cost of its own,
+/// so there is no stored-cost map to fold into and pricing accepts only an
+/// exact LiteLLM match rather than a fuzzy price guess.
 fn process_cursor_usage(
     chats_dir: &Path,
     tracking_db: &Path,
     global_result: &mut UsageResult,
     provider_result: &mut UsageResult,
-    stored_costs: &mut FastHashMap<String, f64>,
     unique_dates: &mut HashSet<String>,
     time_range: TimeRange,
 ) -> Result<()> {
     let sessions = read_cursor_usage(chats_dir, tracking_db, time_range)?;
-    fold_stored_cost_sessions(
-        sessions,
-        global_result,
-        provider_result,
-        stored_costs,
-        unique_dates,
-    );
+    fold_database_sessions(sessions, global_result, provider_result, None, unique_dates);
     Ok(())
 }
 
@@ -1021,24 +1010,26 @@ fn process_hermes_usage(
     time_range: TimeRange,
 ) -> Result<()> {
     let sessions = read_hermes_usage(db_path, time_range)?;
-    fold_stored_cost_sessions(
+    fold_database_sessions(
         sessions,
         global_result,
         provider_result,
-        stored_costs,
+        Some(stored_costs),
         unique_dates,
     );
     Ok(())
 }
 
-/// Folds `(date, analysis, cost)` rows from a stored-cost provider (OpenCode /
-/// Cursor / Hermes) into the global + provider-scoped maps and the stored-cost
-/// table.
-fn fold_stored_cost_sessions(
+/// Folds `(date, analysis, cost)` rows from a database provider (OpenCode /
+/// Cursor / Hermes) into the global + provider-scoped maps.
+///
+/// `stored_costs` is `None` for Cursor, whose local estimate reports no cost of
+/// its own; the other two fold their per-model cost into the table.
+fn fold_database_sessions(
     sessions: Vec<(String, CodeAnalysis, f64)>,
     global_result: &mut UsageResult,
     provider_result: &mut UsageResult,
-    stored_costs: &mut FastHashMap<String, f64>,
+    mut stored_costs: Option<&mut FastHashMap<String, f64>>,
     unique_dates: &mut HashSet<String>,
 ) {
     for (date, analysis, session_cost) in sessions {
@@ -1047,7 +1038,9 @@ fn fold_stored_cost_sessions(
             unique_dates.insert(date);
         }
         for (model, usage_value) in conversation_usage {
-            *stored_costs.entry(model.clone()).or_insert(0.0) += session_cost;
+            if let Some(stored_costs) = &mut stored_costs {
+                *stored_costs.entry(model.clone()).or_insert(0.0) += session_cost;
+            }
 
             provider_result
                 .entry(model.clone())
