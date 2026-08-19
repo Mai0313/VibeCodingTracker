@@ -604,7 +604,7 @@ fn scan_usage_database<F>(
             );
         }
         Err(error) => {
-            let failure = error.to_string();
+            let failure = format!("{error:#}");
             diagnostics.failures.push(ScanFailure {
                 provider,
                 source: source.to_path_buf(),
@@ -653,7 +653,7 @@ fn scan_cursor_usage_database(
                 diagnostics.failures.push(ScanFailure {
                     provider,
                     source: tracking_db.to_path_buf(),
-                    error: error.to_string(),
+                    error: format!("{error:#}"),
                 });
                 (FastHashMap::default(), None, false)
             }
@@ -725,7 +725,7 @@ fn scan_cursor_usage_database(
                 }
             }
             Err(error) => {
-                let failure = error.to_string();
+                let failure = format!("{error:#}");
                 diagnostics.failures.push(ScanFailure {
                     provider,
                     source: store.clone(),
