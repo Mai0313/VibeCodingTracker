@@ -229,6 +229,14 @@ impl<T: Send + 'static> RefreshWorker<T> {
                 }
                 match command {
                     RefreshCommand::Run => {
+                        // Catching the panic keeps the worker answering the next
+                        // request; letting it unwind out of the loop drops the
+                        // result channel, and a disconnected worker never
+                        // refreshes again. It only fires on an unwinding
+                        // profile — dev, and the test profile that pins the
+                        // retry below. The release and dist profiles set
+                        // `panic = "abort"`, where the process is gone before
+                        // this is reached.
                         let result =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut loader))
                                 .map_err(|_| {
