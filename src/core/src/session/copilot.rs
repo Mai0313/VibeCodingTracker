@@ -206,17 +206,12 @@ where
             "tool.execution_start" => {
                 match serde_json::from_value::<CopilotToolStartData>(event.data.clone()) {
                     Ok(data) if !data.tool_call_id.is_empty() && !data.tool_name.is_empty() => {
-                        let tracked = is_tracked_tool(&data.tool_name);
-                        let arguments_supported =
-                            tracked_tool_arguments_supported(&data.tool_name, &data.arguments);
                         pending_tools.insert(
                             data.tool_call_id,
                             PendingTool {
-                                tool_name: data.tool_name,
+                                tool: TrackedTool::from_name(&data.tool_name),
                                 arguments: data.arguments,
                                 timestamp: ts,
-                                tracked,
-                                arguments_supported,
                             },
                         );
                     }
@@ -229,11 +224,9 @@ where
                             pending_tools.insert(
                                 data.tool_call_id,
                                 PendingTool {
-                                    tool_name: String::new(),
+                                    tool: None,
                                     arguments: Value::Null,
                                     timestamp: ts,
-                                    tracked: false,
-                                    arguments_supported: false,
                                 },
                             );
                         }
@@ -263,7 +256,7 @@ where
                     continue;
                 };
                 let Some(success) = event.data.get("success").and_then(Value::as_bool) else {
-                    if pending.tracked {
+                    if pending.tool.is_some() {
                         diagnostics.record_relevant(false);
                     }
                     continue;
@@ -272,7 +265,7 @@ where
                 // produce meaningful arguments (e.g. path validation errors)
                 // and would skew line-count totals.
                 if !success {
-                    if pending.tracked {
+                    if pending.tool.is_some() {
                         diagnostics.record_relevant(true);
                     }
                     continue;
@@ -281,24 +274,21 @@ where
                     match serde_json::from_value::<CopilotToolCompleteData>(event.data.clone()) {
                         Ok(data) => data,
                         Err(_) => {
-                            if pending.tracked {
+                            if pending.tool.is_some() {
                                 diagnostics.record_relevant(false);
                             }
                             continue;
                         }
                     };
-                if pending.tracked {
-                    let result_supported = tracked_tool_result_supported(
-                        &pending.tool_name,
-                        &pending.arguments,
-                        &data.result,
-                    );
-                    diagnostics.record_relevant(pending.arguments_supported && result_supported);
-                    if !pending.arguments_supported {
-                        continue;
-                    }
+                let folded = pending
+                    .tool
+                    .and_then(|tool| tool.read_args(&pending.arguments, &data.result));
+                if pending.tool.is_some() {
+                    diagnostics.record_relevant(folded.as_ref().is_some_and(ToolArgs::is_complete));
                 }
-                dispatch_tool(&mut state, &pending, &data);
+                if let Some(folded) = folded {
+                    folded.record(&mut state, pending.timestamp);
+                }
             }
             _ => {}
         }
@@ -382,100 +372,183 @@ fn copilot_usage_supported(usage: &Value) -> bool {
     recognized
 }
 
-/// Tools whose payloads this parser claims to understand.
+/// A Copilot tool this parser tracks, resolved from the name in the log.
 ///
-/// An unsupported payload on one of these is schema drift; on any other tool
-/// it is not.
-fn is_tracked_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "view"
-            | "show_file"
-            | "read_file"
-            | "rg"
-            | "grep"
-            | "glob"
-            | "web_search"
-            | "web_fetch"
-            | "create"
-            | "write_file"
-            | "write"
-            | "str_replace"
-            | "edit"
-            | "replace"
-            | "edit_file"
-            | "apply_patch"
-            | "bash"
-            | "shell"
-            | "execute"
-            | "write_bash"
-    )
+/// One variant per metric the tool folds into. [`TrackedTool::read_args`] and
+/// [`ToolArgs::record`] match exhaustively on their enum, so a variant one of
+/// them forgets is a build error rather than a silently dropped metric. What
+/// the compiler cannot check is [`TrackedTool::from_name`] itself, which is why
+/// every tool name is spelled there and nowhere else.
+#[derive(Clone, Copy)]
+enum TrackedTool {
+    Read,
+    Search,
+    Write,
+    Edit,
+    ApplyPatch,
+    Shell,
+    WriteBash,
 }
 
-fn tracked_tool_arguments_supported(name: &str, args: &Value) -> bool {
-    match name {
-        "view" | "show_file" | "read_file" => args
-            .get("path")
-            .and_then(Value::as_str)
-            .is_some_and(|path| !path.is_empty()),
-        "rg" | "grep" | "glob" | "web_search" | "web_fetch" => true,
-        "create" | "write_file" | "write" => {
-            args.get("path")
-                .and_then(Value::as_str)
-                .is_some_and(|path| !path.is_empty())
-                && args
-                    .get("file_text")
-                    .or_else(|| args.get("content"))
-                    .is_some_and(Value::is_string)
-        }
-        "str_replace" | "edit" | "replace" | "edit_file" => {
-            args.get("path")
-                .and_then(Value::as_str)
-                .is_some_and(|path| !path.is_empty())
-                && args
-                    .get("old_string")
-                    .or_else(|| args.get("old_str"))
-                    .or_else(|| args.get("old_text"))
-                    .is_some_and(Value::is_string)
-                && args
-                    .get("new_string")
-                    .or_else(|| args.get("new_str"))
-                    .or_else(|| args.get("new_text"))
-                    .is_some_and(Value::is_string)
-        }
-        "apply_patch" => extract_apply_patch_text(args).is_some_and(|patch| {
-            parse_apply_patch_text(patch)
-                .iter()
-                .any(|patch| !patch.file_path.is_empty())
-        }),
-        "bash" | "shell" | "execute" => args
-            .get("command")
-            .or_else(|| args.get("cmd"))
-            .and_then(Value::as_str)
-            .is_some_and(|command| !command.trim().is_empty()),
-        "write_bash" => args
-            .get("input")
-            .and_then(Value::as_str)
-            .is_some_and(|command| !command.trim().is_empty()),
-        _ => false,
+impl TrackedTool {
+    /// Resolves a log name, or `None` for one this table does not list
+    /// (`report_intent`, `task_complete`, `update_topic`, … among them). An
+    /// unsupported payload on a listed tool is schema drift; on any other tool
+    /// it is not.
+    fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            // Historical releases exposed reads as `str_replace_editor` with
+            // `command == "view"`, which we no longer attempt to parse.
+            "view" | "show_file" | "read_file" => Self::Read,
+            // Search and web tools surface content but do not identify one
+            // complete file body, so they retain the invocation without
+            // inventing line totals.
+            "rg" | "grep" | "glob" | "web_search" | "web_fetch" => Self::Search,
+            // `create` is the primary write tool; the other names are ones the
+            // CLI is known or likely to emit. A tool name outside this table is
+            // ignored, however similar its argument shape.
+            "create" | "write_file" | "write" => Self::Write,
+            // Edit-style tool names the CLI is known or likely to emit.
+            "str_replace" | "edit" | "replace" | "edit_file" => Self::Edit,
+            "apply_patch" => Self::ApplyPatch,
+            "bash" | "shell" | "execute" => Self::Shell,
+            "write_bash" => Self::WriteBash,
+            _ => return None,
+        })
     }
-}
 
-fn tracked_tool_result_supported(name: &str, args: &Value, result: &Value) -> bool {
-    match name {
-        "view" | "show_file" | "read_file" => {
-            if let Some(range) = args
-                .get("view_range")
-                .and_then(Value::as_array)
-                .filter(|range| range.len() >= 2)
-            {
-                return range.first().and_then(Value::as_i64).is_some()
-                    && range.get(1).and_then(Value::as_i64).is_some();
+    /// Reads what a successful call folds into metrics, or `None` when this
+    /// parser cannot read its arguments — that call is schema drift and folds
+    /// nothing. Every argument key looked up by name, historical alias
+    /// spellings included, is listed here and nowhere else; the one exception
+    /// is the patch envelope, whose own spellings live in
+    /// [`extract_apply_patch_text`].
+    ///
+    /// `result` arrives with the completion and only [`TrackedTool::Read`] uses
+    /// it; a result that does not read leaves the call foldable, so it is the
+    /// variant's business rather than this `Option`'s.
+    fn read_args<'a>(self, args: &'a Value, result: &Value) -> Option<ToolArgs<'a>> {
+        Some(match self {
+            Self::Read => ToolArgs::Read {
+                path: arg_path(args)?,
+                content: read_view_content(args, result),
+            },
+            Self::Search => ToolArgs::Search,
+            Self::Write => ToolArgs::Write {
+                path: arg_path(args)?,
+                content: arg_str(args, &["file_text", "content"])?,
+            },
+            Self::Edit => ToolArgs::Edit {
+                path: arg_path(args)?,
+                old_string: arg_str(args, &["old_string", "old_str", "old_text"])?,
+                new_string: arg_str(args, &["new_string", "new_str", "new_text"])?,
+            },
+            Self::ApplyPatch => {
+                let patches = parse_apply_patch_text(extract_apply_patch_text(args)?);
+                // A patch envelope naming no file at all folds nothing, so it
+                // reads as unsupported rather than as an empty success.
+                if patches.iter().all(|patch| patch.file_path.is_empty()) {
+                    return None;
+                }
+                ToolArgs::ApplyPatch { patches }
             }
-            result.get("content").is_some_and(Value::is_string)
-        }
-        _ => true,
+            Self::Shell => ToolArgs::Shell {
+                // A blank command would be dropped by `add_run_command`,
+                // leaving the call with no metric at all, so it counts as
+                // unreadable here.
+                command: arg_str(args, &["command", "cmd"])
+                    .filter(|command| !command.trim().is_empty())?,
+                // Optional, and absent from plenty of real calls: it is
+                // reported alongside the command, not part of what makes the
+                // call foldable.
+                description: arg_str(args, &["description"]).unwrap_or(""),
+            },
+            Self::WriteBash => ToolArgs::WriteBash {
+                input: arg_str(args, &["input"]).filter(|input| !input.trim().is_empty())?,
+            },
+        })
     }
+}
+
+/// The payload of a successful [`TrackedTool`] call, read once.
+///
+/// Building one *is* the schema check, so a key validation accepts cannot be a
+/// key the fold then fails to read: there is no second reader to disagree with.
+/// The two used to be separate `match` arms over the tool name, each restating
+/// the whole name table and the alias set of every argument that has one.
+enum ToolArgs<'a> {
+    /// `content` is `None` when the completion carried no body this parser
+    /// could read. The arguments were fine, so the call still counts as one
+    /// read invocation, but it contributes no lines and reads as schema drift.
+    Read {
+        path: &'a str,
+        content: Option<String>,
+    },
+    Search,
+    Write {
+        path: &'a str,
+        content: &'a str,
+    },
+    Edit {
+        path: &'a str,
+        old_string: &'a str,
+        new_string: &'a str,
+    },
+    ApplyPatch {
+        patches: Vec<CopilotPatch>,
+    },
+    Shell {
+        command: &'a str,
+        description: &'a str,
+    },
+    WriteBash {
+        input: &'a str,
+    },
+}
+
+impl ToolArgs<'_> {
+    /// Whether the whole payload read. Only [`ToolArgs::Read`] can be built
+    /// from arguments this parser understands and still answer `false`.
+    fn is_complete(&self) -> bool {
+        !matches!(self, Self::Read { content: None, .. })
+    }
+
+    /// Folds the call into the file-operation metrics.
+    fn record(self, state: &mut SessionParseState, ts: i64) {
+        match self {
+            Self::Read { path, content } => {
+                state.tool_counts.read += 1;
+                attach_read_detail(state, path, content.as_deref().unwrap_or(""), ts);
+            }
+            Self::Search => state.tool_counts.read += 1,
+            Self::Write { path, content } => state.add_write_detail(path, content, ts),
+            Self::Edit {
+                path,
+                old_string,
+                new_string,
+            } => state.add_edit_detail(path, old_string, new_string, ts),
+            Self::ApplyPatch { patches } => record_patches(state, patches, ts),
+            Self::Shell {
+                command,
+                description,
+            } => state.add_run_command(command, description, ts),
+            Self::WriteBash { input } => state.add_run_command(input, "", ts),
+        }
+    }
+}
+
+/// The string under the first of `keys` that `args` carries.
+///
+/// A key present but holding something other than a string ends the search: the
+/// log did spell the argument, just not in a shape this parser can read.
+fn arg_str<'a>(args: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter().find_map(|key| args.get(*key))?.as_str()
+}
+
+/// The `path` argument, which every variant carrying one requires to be
+/// non-empty; an operation against no path records nothing downstream.
+fn arg_path(args: &Value) -> Option<&str> {
+    arg_str(args, &["path"]).filter(|path| !path.is_empty())
 }
 
 fn extract_apply_patch_text(args: &Value) -> Option<&str> {
@@ -489,103 +562,15 @@ fn extract_apply_patch_text(args: &Value) -> Option<&str> {
 /// A `tool.execution_start` event held until its matching
 /// `tool.execution_complete` arrives, keyed by `toolCallId`.
 struct PendingTool {
-    /// Tool name (e.g. `view`, `create`, `str_replace`, `bash`).
-    tool_name: String,
-    /// Raw tool arguments object, interpreted lazily by [`dispatch_tool`].
+    /// The tracked tool this call names, or `None` for a name outside
+    /// [`TrackedTool::from_name`] — such a call folds nothing and is not
+    /// schema drift either.
+    tool: Option<TrackedTool>,
+    /// Raw tool arguments object, read by [`TrackedTool::read_args`] once the
+    /// completion supplies the result half of the payload.
     arguments: Value,
     /// Start-event timestamp in epoch milliseconds, used for the detail record.
     timestamp: i64,
-    /// Whether this tool contributes to the analysis projection.
-    tracked: bool,
-    /// Whether the tracked tool's arguments use a supported schema.
-    arguments_supported: bool,
-}
-
-/// Routes a completed Copilot tool call to the matching file-operation tally.
-///
-/// Branches on `pending.tool_name`; unrecognised tools (e.g. `report_intent`,
-/// `task_complete`) are silently ignored. Argument field names are probed
-/// with historical aliases for forward compatibility across CLI releases.
-fn dispatch_tool(
-    state: &mut SessionParseState,
-    pending: &PendingTool,
-    complete: &CopilotToolCompleteData,
-) {
-    let ts = pending.timestamp;
-    let args = &pending.arguments;
-
-    match pending.tool_name.as_str() {
-        // Historical releases exposed reads as `str_replace_editor` with
-        // `command == "view"`, which we no longer attempt to parse.
-        "view" | "show_file" | "read_file" => {
-            let Some(path) = args.get("path").and_then(|p| p.as_str()) else {
-                return;
-            };
-
-            state.tool_counts.read += 1;
-            let content = extract_view_content(args, &complete.result);
-            attach_read_detail(state, path, &content, ts);
-        }
-        // Search and web tools surface content but do not identify one complete
-        // file body, so retain the invocation without inventing line totals.
-        "rg" | "grep" | "glob" | "web_search" | "web_fetch" => state.tool_counts.read += 1,
-        // `create` is the primary write tool; the other names are ones the CLI
-        // is known or likely to emit. A tool name outside this list is
-        // ignored, however similar its argument shape.
-        "create" | "write_file" | "write" => {
-            let Some(path) = args.get("path").and_then(|p| p.as_str()) else {
-                return;
-            };
-            let content = args
-                .get("file_text")
-                .or_else(|| args.get("content"))
-                .and_then(|c| c.as_str())
-                .unwrap_or("");
-            state.add_write_detail(path, content, ts);
-        }
-        // Edit-style tool names the CLI is known or likely to emit.
-        "str_replace" | "edit" | "replace" | "edit_file" => {
-            let Some(path) = args.get("path").and_then(|p| p.as_str()) else {
-                return;
-            };
-            let old_str = args
-                .get("old_string")
-                .or_else(|| args.get("old_str"))
-                .or_else(|| args.get("old_text"))
-                .and_then(|s| s.as_str())
-                .unwrap_or("");
-            let new_str = args
-                .get("new_string")
-                .or_else(|| args.get("new_str"))
-                .or_else(|| args.get("new_text"))
-                .and_then(|s| s.as_str())
-                .unwrap_or("");
-            state.add_edit_detail(path, old_str, new_str, ts);
-        }
-        "apply_patch" => {
-            let patch = extract_apply_patch_text(args).unwrap_or("");
-            apply_patch_text(state, patch, ts);
-        }
-        "bash" | "shell" | "execute" => {
-            let command = args
-                .get("command")
-                .or_else(|| args.get("cmd"))
-                .and_then(|c| c.as_str())
-                .unwrap_or("");
-            let description = args
-                .get("description")
-                .and_then(|d| d.as_str())
-                .unwrap_or("");
-            state.add_run_command(command, description, ts);
-        }
-        "write_bash" => {
-            let input = args.get("input").and_then(Value::as_str).unwrap_or("");
-            state.add_run_command(input, "", ts);
-        }
-        // `report_intent`, `task_complete`, `update_topic`, … have no
-        // file-operation semantics we care about. Silently ignore.
-        _ => {}
-    }
 }
 
 /// Attaches the read body without double-counting the invocation.
@@ -599,9 +584,9 @@ fn attach_read_detail(state: &mut SessionParseState, path: &str, content: &str, 
     state.tool_counts.read = invocation_count;
 }
 
-/// Folds a successful `apply_patch` call into per-file details.
-fn apply_patch_text(state: &mut SessionParseState, patch_text: &str, ts: i64) {
-    for patch in parse_apply_patch_text(patch_text) {
+/// Folds a successful `apply_patch` call's parsed patches into per-file details.
+fn record_patches(state: &mut SessionParseState, patches: Vec<CopilotPatch>, ts: i64) {
+    for patch in patches {
         let (old_string, new_string) = extract_patch_strings(&patch.lines);
         match patch.action.as_str() {
             "add" => state.add_write_detail(&patch.file_path, &new_string, ts),
@@ -687,24 +672,30 @@ fn extract_patch_strings(lines: &[String]) -> (String, String) {
     (old_string, new_string)
 }
 
-/// Resolve the content a Copilot `view` tool saw.
+/// Resolve the content a Copilot `view`-family call saw, or `None` when
+/// neither source reads — the arguments were still fine, so the call keeps its
+/// invocation and only its body is reported as drift.
 ///
 /// Two sources, in order:
 ///
 /// 1. `arguments.view_range` — inclusive `[start, end]` line numbers. Only
 ///    the line count matters downstream, so a placeholder of that many lines
-///    stands in for the body (see the comment on its shape below).
+///    stands in for the body (see the comment on its shape below). A bound
+///    that is not an integer reads as nothing, rather than as the `[0, 0]`
+///    span an `unwrap_or(0)` would invent for it.
 /// 2. `result.content` — the string the model actually received. Used when
 ///    no `view_range` was supplied.
-fn extract_view_content(arguments: &Value, result: &Value) -> String {
-    if let Some(range) = arguments.get("view_range").and_then(|v| v.as_array())
-        && range.len() >= 2
+fn read_view_content(arguments: &Value, result: &Value) -> Option<String> {
+    if let Some(range) = arguments
+        .get("view_range")
+        .and_then(|v| v.as_array())
+        .filter(|range| range.len() >= 2)
     {
-        let start = range.first().and_then(|v| v.as_i64()).unwrap_or(0);
-        let end = range.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
+        let start = range.first()?.as_i64()?;
+        let end = range.get(1)?.as_i64()?;
         let line_count = (end - start + 1).max(0) as usize;
         if line_count == 0 {
-            return String::new();
+            return Some(String::new());
         }
         // A pure-newline placeholder ("\n".repeat(N - 1)) would survive
         // `count_lines` on its own, but `add_read_detail` first trims
@@ -712,14 +703,10 @@ fn extract_view_content(arguments: &Value, result: &Value) -> String {
         // empty string — so the line tally would silently come back as
         // zero. Use single-char "lines" joined by '\n' so the trim is a
         // no-op and `count_lines` recovers exactly `line_count`.
-        return vec!["-"; line_count].join("\n");
+        return Some(vec!["-"; line_count].join("\n"));
     }
 
-    result
-        .get("content")
-        .and_then(|c| c.as_str())
-        .unwrap_or("")
-        .to_string()
+    Some(result.get("content")?.as_str()?.to_string())
 }
 
 /// Best-effort reconstruction of a repository's git remote URL from the
@@ -770,9 +757,8 @@ fn canonicalize_model_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CopilotToolCompleteData, PendingTool, canonicalize_model_name, dispatch_tool,
-        extract_view_content, parse_copilot_events_with_diagnostics,
-        tracked_tool_arguments_supported, tracked_tool_result_supported,
+        ToolArgs, TrackedTool, canonicalize_model_name, parse_copilot_events_with_diagnostics,
+        read_view_content,
     };
     use crate::models::CopilotEvent;
     use crate::session::state::ParseMode;
@@ -787,6 +773,25 @@ mod tests {
             timestamp: "2026-07-12T00:00:00Z".to_string(),
             parent_id: None,
         }
+    }
+
+    /// Reads a completed call's payload the way the completion arm does.
+    ///
+    /// Panics on a name outside the tracked table so a test cannot silently
+    /// assert about a tool the parser stopped resolving.
+    fn read<'a>(tool_name: &str, arguments: &'a Value, result: &Value) -> Option<ToolArgs<'a>> {
+        TrackedTool::from_name(tool_name)
+            .unwrap_or_else(|| panic!("`{tool_name}` must resolve to a tracked tool"))
+            .read_args(arguments, result)
+    }
+
+    /// Folds one successful call and hands back the state it produced.
+    fn fold(tool_name: &str, arguments: Value, result: Value) -> SessionParseState {
+        let mut state = SessionParseState::new();
+        if let Some(payload) = read(tool_name, &arguments, &result) {
+            payload.record(&mut state, 1);
+        }
+        state
     }
 
     fn count_lines_after_trim(s: &str) -> usize {
@@ -808,7 +813,7 @@ mod tests {
         // `trim_end_matches('\n')` runs in `add_read_detail`.
         let args = json!({ "view_range": [1, 5], "path": "/tmp/foo" });
         let result = json!({});
-        let placeholder = extract_view_content(&args, &result);
+        let placeholder = read_view_content(&args, &result).expect("a readable range");
         assert_eq!(
             count_lines_after_trim(&placeholder),
             5,
@@ -822,71 +827,55 @@ mod tests {
         // upstream early-return in `add_read_detail` skips it cleanly.
         let args = json!({ "view_range": [5, 4], "path": "/tmp/foo" });
         let result = json!({});
-        assert_eq!(extract_view_content(&args, &result), "");
+        assert_eq!(read_view_content(&args, &result).as_deref(), Some(""));
     }
 
     #[test]
     fn view_without_range_uses_result_content() {
         let args = json!({ "path": "/tmp/foo" });
         let result = json!({ "content": "alpha\nbeta\ngamma" });
-        assert_eq!(extract_view_content(&args, &result), "alpha\nbeta\ngamma");
+        assert_eq!(
+            read_view_content(&args, &result).as_deref(),
+            Some("alpha\nbeta\ngamma")
+        );
     }
 
-    fn completed() -> CopilotToolCompleteData {
-        CopilotToolCompleteData {
-            tool_call_id: "call-1".to_string(),
-            success: true,
-            result: json!({ "content": "alpha\nbeta" }),
-            model: "test".to_string(),
-        }
+    fn completed_result() -> Value {
+        json!({ "content": "alpha\nbeta" })
     }
 
     #[test]
     fn current_show_file_maps_to_read() {
-        let pending = PendingTool {
-            tool_name: "show_file".to_string(),
-            arguments: json!({ "path": "/tmp/a.txt", "view_range": [1, 2] }),
-            timestamp: 1,
-            tracked: true,
-            arguments_supported: true,
-        };
-        let mut state = SessionParseState::new();
-        dispatch_tool(&mut state, &pending, &completed());
+        let state = fold(
+            "show_file",
+            json!({ "path": "/tmp/a.txt", "view_range": [1, 2] }),
+            completed_result(),
+        );
         assert_eq!(state.tool_counts.read, 1);
         assert_eq!(state.total_read_lines, 2);
     }
 
     #[test]
     fn show_file_empty_and_drifted_results_keep_the_known_invocation() {
-        let pending = PendingTool {
-            tool_name: "show_file".to_string(),
-            arguments: json!({ "path": "/tmp/empty.txt" }),
-            timestamp: 1,
-            tracked: true,
-            arguments_supported: true,
-        };
+        let args = json!({ "path": "/tmp/empty.txt" });
 
-        let mut empty = completed();
-        empty.result = json!({ "content": "" });
-        assert!(tracked_tool_result_supported(
-            &pending.tool_name,
-            &pending.arguments,
-            &empty.result
-        ));
-        let mut state = SessionParseState::new();
-        dispatch_tool(&mut state, &pending, &empty);
+        let empty = json!({ "content": "" });
+        assert!(
+            read("show_file", &args, &empty)
+                .expect("readable arguments")
+                .is_complete()
+        );
+        let state = fold("show_file", args.clone(), empty);
         assert_eq!(state.tool_counts.read, 1);
         assert_eq!(state.total_read_lines, 0);
 
-        let mut drifted = completed();
-        drifted.result = json!({ "futureContent": "" });
-        assert!(!tracked_tool_result_supported(
-            &pending.tool_name,
-            &pending.arguments,
-            &drifted.result
-        ));
-        let mut state = SessionParseState::new();
-        dispatch_tool(&mut state, &pending, &drifted);
+        let drifted = json!({ "futureContent": "" });
+        assert!(
+            !read("show_file", &args, &drifted)
+                .expect("readable arguments")
+                .is_complete()
+        );
+        let state = fold("show_file", args, drifted);
         assert_eq!(state.tool_counts.read, 1);
         assert_eq!(state.total_read_lines, 0);
     }
@@ -895,14 +884,10 @@ mod tests {
     fn current_search_tools_count_read_invocations_without_fake_lines() {
         let mut state = SessionParseState::new();
         for tool_name in ["rg", "grep", "glob", "web_search", "web_fetch"] {
-            let pending = PendingTool {
-                tool_name: tool_name.to_string(),
-                arguments: json!({ "pattern": "needle", "paths": ["src"] }),
-                timestamp: 1,
-                tracked: true,
-                arguments_supported: true,
-            };
-            dispatch_tool(&mut state, &pending, &completed());
+            let args = json!({ "pattern": "needle", "paths": ["src"] });
+            read(tool_name, &args, &completed_result())
+                .expect("search arguments are always readable")
+                .record(&mut state, 1);
         }
         assert_eq!(state.tool_counts.read, 5);
         assert_eq!(state.total_read_lines, 0);
@@ -911,31 +896,24 @@ mod tests {
     #[test]
     fn apply_patch_arguments_require_a_supported_nonempty_file_header() {
         let drifted = json!("*** Begin Patch\n*** Future File: src/lib.rs\n+new\n*** End Patch");
-        assert!(!tracked_tool_arguments_supported("apply_patch", &drifted));
+        assert!(read("apply_patch", &drifted, &Value::Null).is_none());
 
         let empty_body = json!("*** Begin Patch\n*** Add File: empty.txt\n*** End Patch");
-        assert!(tracked_tool_arguments_supported("apply_patch", &empty_body));
+        assert!(read("apply_patch", &empty_body, &Value::Null).is_some());
 
         let empty_path = json!("*** Begin Patch\n*** Add File:\n+new\n*** End Patch");
-        assert!(!tracked_tool_arguments_supported(
-            "apply_patch",
-            &empty_path
-        ));
+        assert!(read("apply_patch", &empty_path, &Value::Null).is_none());
     }
 
     #[test]
     fn current_apply_patch_string_maps_to_file_operations() {
-        let pending = PendingTool {
-            tool_name: "apply_patch".to_string(),
-            arguments: json!(
+        let state = fold(
+            "apply_patch",
+            json!(
                 "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-old\n+new\n*** Add File: notes.txt\n+hello\n*** End Patch"
             ),
-            timestamp: 1,
-            tracked: true,
-            arguments_supported: true,
-        };
-        let mut state = SessionParseState::new();
-        dispatch_tool(&mut state, &pending, &completed());
+            completed_result(),
+        );
         assert_eq!(state.tool_counts.edit, 1);
         assert_eq!(state.tool_counts.write, 1);
         assert_eq!(state.edit_details.len(), 1);
@@ -944,49 +922,37 @@ mod tests {
 
     #[test]
     fn current_apply_patch_string_field_maps_to_edit() {
-        let pending = PendingTool {
-            tool_name: "apply_patch".to_string(),
-            arguments: json!({
+        let state = fold(
+            "apply_patch",
+            json!({
                 "string": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-old\n+new\n*** End Patch"
             }),
-            timestamp: 1,
-            tracked: true,
-            arguments_supported: true,
-        };
-        let mut state = SessionParseState::new();
-        dispatch_tool(&mut state, &pending, &completed());
+            completed_result(),
+        );
         assert_eq!(state.tool_counts.edit, 1);
         assert_eq!(state.edit_details.len(), 1);
     }
 
     #[test]
     fn current_apply_patch_input_field_maps_to_edit() {
-        let pending = PendingTool {
-            tool_name: "apply_patch".to_string(),
-            arguments: json!({
+        let state = fold(
+            "apply_patch",
+            json!({
                 "input": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-old\n+new\n*** End Patch"
             }),
-            timestamp: 1,
-            tracked: true,
-            arguments_supported: true,
-        };
-        let mut state = SessionParseState::new();
-        dispatch_tool(&mut state, &pending, &completed());
+            completed_result(),
+        );
         assert_eq!(state.tool_counts.edit, 1);
         assert_eq!(state.edit_details.len(), 1);
     }
 
     #[test]
     fn current_write_bash_counts_nonempty_input() {
-        let pending = PendingTool {
-            tool_name: "write_bash".to_string(),
-            arguments: json!({ "input": "yes", "shellId": "shell-1" }),
-            timestamp: 1,
-            tracked: true,
-            arguments_supported: true,
-        };
-        let mut state = SessionParseState::new();
-        dispatch_tool(&mut state, &pending, &completed());
+        let state = fold(
+            "write_bash",
+            json!({ "input": "yes", "shellId": "shell-1" }),
+            completed_result(),
+        );
         assert_eq!(state.tool_counts.bash, 1);
         assert_eq!(state.run_details.len(), 1);
     }
