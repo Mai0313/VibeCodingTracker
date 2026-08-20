@@ -295,8 +295,8 @@ fn gemini_tool_status(tool_call: &Value) -> GeminiToolStatus {
 
 /// A Gemini tool this parser tracks, resolved from the name in the log.
 ///
-/// One variant per metric the tool folds into. The schema check, the invocation
-/// counter and the file-operation fold each match exhaustively on the enum, so a
+/// One variant per metric the tool folds into. [`TrackedTool::read_args`] and
+/// [`TrackedTool::record_invocation`] both match exhaustively on the enum, so a
 /// variant one of them forgets is a build error rather than a silently dropped
 /// metric. What the compiler cannot check is [`TrackedTool::from_name`] itself,
 /// which is why every tool name is spelled there and nowhere else.
@@ -333,42 +333,40 @@ impl TrackedTool {
         })
     }
 
-    /// Whether a successful call carries the arguments [`Self::record_operation`]
-    /// needs; a call that does not is counted as an invocation only.
-    fn schema_supported(self, tool_call: &Value) -> bool {
+    /// Reads the arguments a successful call folds into metrics, or `None` when
+    /// this parser cannot read them — that call is counted as an invocation
+    /// only. Every argument key the parser knows, historical alias spellings
+    /// included, is listed here and nowhere else.
+    fn read_args(self, tool_call: &Value) -> Option<ToolArgs<'_>> {
         let args = tool_call.get("args");
-        match self {
-            Self::Read => {
-                args.and_then(|args| args.get("file_path"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|path| !path.is_empty())
-                    && tool_result_output(tool_call).is_some()
-            }
-            Self::Write => {
-                args.and_then(|args| args.get("file_path"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|path| !path.is_empty())
-                    && args
-                        .and_then(|args| args.get("content"))
-                        .is_some_and(Value::is_string)
-            }
-            Self::Edit => {
-                args.and_then(|args| args.get("file_path"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|path| !path.is_empty())
-                    && args
-                        .and_then(|args| args.get("old_string").or_else(|| args.get("old_text")))
-                        .is_some_and(Value::is_string)
-                    && args
-                        .and_then(|args| args.get("new_string").or_else(|| args.get("new_text")))
-                        .is_some_and(Value::is_string)
-            }
-            Self::Shell => args
-                .and_then(|args| args.get("command").or_else(|| args.get("cmd")))
-                .and_then(Value::as_str)
-                .is_some_and(|command| !command.trim().is_empty()),
-            Self::TodoWrite | Self::ReadManyFiles => true,
-        }
+        Some(match self {
+            Self::Read => ToolArgs::Read {
+                file_path: arg_file_path(args)?,
+                content: tool_result_output(tool_call)?,
+            },
+            Self::Write => ToolArgs::Write {
+                file_path: arg_file_path(args)?,
+                content: arg_str(args, &["content"])?,
+            },
+            Self::Edit => ToolArgs::Edit {
+                file_path: arg_file_path(args)?,
+                old_string: arg_str(args, &["old_string", "old_text"])?,
+                new_string: arg_str(args, &["new_string", "new_text"])?,
+            },
+            Self::Shell => ToolArgs::Shell {
+                // A blank command would be dropped by `add_run_command`,
+                // leaving the call with no metric at all, so it counts as
+                // unreadable here and is recorded as an invocation instead.
+                command: arg_str(args, &["command", "cmd"])
+                    .filter(|command| !command.trim().is_empty())?,
+                // Optional, and absent from plenty of real calls: it is
+                // reported alongside the command, not part of what makes the
+                // call foldable.
+                description: arg_str(args, &["description"]).unwrap_or(""),
+            },
+            Self::TodoWrite => ToolArgs::TodoWrite,
+            Self::ReadManyFiles => ToolArgs::ReadManyFiles,
+        })
     }
 
     /// Counts the call without claiming any file operation, for a call that
@@ -382,67 +380,78 @@ impl TrackedTool {
             Self::TodoWrite => state.tool_counts.todo_write += 1,
         }
     }
+}
 
-    /// Folds a successful call whose schema [`Self::schema_supported`] accepted
-    /// into the file-operation metrics.
-    fn record_operation(self, state: &mut SessionParseState, tool_call: &Value, ts: i64) {
-        let args = tool_call.get("args");
+/// The arguments of a successful [`TrackedTool`] call, read once.
+///
+/// Building one *is* the schema check, so a key validation accepts cannot be a
+/// key the fold then fails to read: there is no second reader to disagree with.
+/// The two used to be separate `match` arms over [`TrackedTool`], each spelling
+/// out the alias pair of every argument that has one.
+enum ToolArgs<'a> {
+    Read {
+        file_path: &'a str,
+        content: &'a str,
+    },
+    Write {
+        file_path: &'a str,
+        content: &'a str,
+    },
+    Edit {
+        file_path: &'a str,
+        old_string: &'a str,
+        new_string: &'a str,
+    },
+    Shell {
+        command: &'a str,
+        description: &'a str,
+    },
+    TodoWrite,
+    ReadManyFiles,
+}
+
+impl ToolArgs<'_> {
+    /// Folds the call into the file-operation metrics.
+    fn record(self, state: &mut SessionParseState, ts: i64) {
         match self {
-            Self::Read => {
+            Self::Read { file_path, content } => {
                 state.tool_counts.read += 1;
-                let file_path = args
-                    .and_then(|a| a.get("file_path"))
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("");
-
-                if let Some(content) = tool_result_output(tool_call) {
-                    attach_read_detail(state, file_path, content, ts);
-                }
+                attach_read_detail(state, file_path, content, ts);
             }
-            Self::Write => {
-                let file_path = args
-                    .and_then(|a| a.get("file_path"))
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("");
-                let content = args
-                    .and_then(|a| a.get("content"))
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("");
-
-                state.add_write_detail(file_path, content, ts);
-            }
-            Self::Edit => {
-                let file_path = args
-                    .and_then(|a| a.get("file_path"))
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("");
-                let old_string = args
-                    .and_then(|a| a.get("old_string").or_else(|| a.get("old_text")))
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("");
-                let new_string = args
-                    .and_then(|a| a.get("new_string").or_else(|| a.get("new_text")))
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("");
-
+            Self::Write { file_path, content } => state.add_write_detail(file_path, content, ts),
+            Self::Edit {
+                file_path,
+                old_string,
+                new_string,
+            } => {
+                // `add_edit_detail_raw`, not `add_edit_detail`: an empty
+                // `old_string` here is an edit that replaced nothing, not a new
+                // file expressed as a diff, so it must not turn into a write.
                 state.add_edit_detail_raw(file_path, old_string, new_string, ts);
             }
-            Self::Shell => {
-                let command = args
-                    .and_then(|a| a.get("command").or_else(|| a.get("cmd")))
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("");
-                let description = args
-                    .and_then(|a| a.get("description"))
-                    .and_then(|d| d.as_str())
-                    .unwrap_or("");
-
-                state.add_run_command(command, description, ts);
-            }
+            Self::Shell {
+                command,
+                description,
+            } => state.add_run_command(command, description, ts),
             Self::TodoWrite => state.tool_counts.todo_write += 1,
             Self::ReadManyFiles => state.tool_counts.read += 1,
         }
     }
+}
+
+/// The string under the first of `keys` that `args` carries.
+///
+/// A key present but holding something other than a string ends the search: the
+/// log did spell the argument, just not in a shape this parser can read.
+fn arg_str<'a>(args: Option<&'a Value>, keys: &[&str]) -> Option<&'a str> {
+    let args = args?;
+    keys.iter().find_map(|key| args.get(*key))?.as_str()
+}
+
+/// The `file_path` argument, which every variant carrying one requires to be
+/// non-empty; an operation against no path records nothing downstream.
+fn arg_file_path(args: Option<&Value>) -> Option<&str> {
+    arg_str(args, &["file_path"]).filter(|path| !path.is_empty())
 }
 
 fn record_message_diagnostics(message: &GeminiAnalysisMessage, diagnostics: &mut ParseDiagnostics) {
@@ -455,7 +464,7 @@ fn record_message_diagnostics(message: &GeminiAnalysisMessage, diagnostics: &mut
             continue;
         };
         let normalized = match gemini_tool_status(tool_call) {
-            GeminiToolStatus::Success => tool.schema_supported(tool_call),
+            GeminiToolStatus::Success => tool.read_args(tool_call).is_some(),
             GeminiToolStatus::Failed => true,
             GeminiToolStatus::Pending | GeminiToolStatus::Unsupported => false,
         };
@@ -510,12 +519,13 @@ fn process_gemini_message(state: &mut SessionParseState, message: &GeminiAnalysi
         if status == GeminiToolStatus::Unsupported {
             continue;
         }
-        if status != GeminiToolStatus::Success || !tool.schema_supported(tool_call) {
+        if status == GeminiToolStatus::Success
+            && let Some(args) = tool.read_args(tool_call)
+        {
+            args.record(state, ts);
+        } else {
             tool.record_invocation(state);
-            continue;
         }
-
-        tool.record_operation(state, tool_call, ts);
     }
 }
 
@@ -710,7 +720,7 @@ mod tests {
             ("update_topic", [0, 0, 0, 0, 0]),
         ];
 
-        // A successful call folds through `record_operation`, a failed one
+        // A successful call folds through `ToolArgs::record`, a failed one
         // through `record_invocation`. They are separate matches, and a name
         // must reach the same counter either way.
         for status in ["success", "error"] {
