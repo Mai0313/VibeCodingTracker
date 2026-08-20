@@ -54,6 +54,22 @@ select_install_dir() {
     fi
 }
 
+# Removes what this run created and nothing else, so a failure at any point leaves the install
+# directory as it was found. STAGE_DIR and NEW_MARKER are tested rather than passed straight to rm:
+# BSD `rm -r` hands its whole operand list to fts_open(), which rejects a zero-length name outright,
+# so one empty argument would silently spare every other operand as well. Each removal is kept from
+# failing because under `set -e` a failing trap decides the script's exit status.
+cleanup() {
+    rm -rf "$TEMP_DIR" || true
+    if [ -n "$STAGE_DIR" ]; then
+        rm -rf "$STAGE_DIR" || true
+    fi
+    if [ -n "$NEW_MARKER" ]; then
+        rm -f "$NEW_MARKER" || true
+    fi
+    return 0
+}
+
 install_binary() {
     local platform="$1"
     local version="$2"
@@ -68,11 +84,13 @@ install_binary() {
     fi
 
     local url="https://github.com/${REPO}/releases/download/${version}/${filename}"
-    # Not a local: the EXIT trap outlives this function, and under `set -u` an out-of-scope name
-    # makes the trap fail instead of cleaning up. Armed after mktemp so TEMP_DIR is never unset,
-    # and kept from failing because under `set -e` a failing trap decides the script's exit status.
+    # Not locals: the EXIT trap outlives this function, and under `set -u` an out-of-scope name
+    # makes the trap fail instead of cleaning up. The other two stay empty until the install
+    # directory has been chosen; the trap is armed after mktemp so TEMP_DIR is never unset.
+    STAGE_DIR=""
+    NEW_MARKER=""
     TEMP_DIR="$(mktemp -d)"
-    trap 'rm -rf "$TEMP_DIR" || true' EXIT
+    trap cleanup EXIT
 
     local archive="${TEMP_DIR}/${filename}"
     curl -fsSL -o "$archive" "$url" || download_failed "$url"
@@ -92,16 +110,34 @@ install_binary() {
     local target="${install_dir}/${BINARY_NAME}"
     local canonical_install_dir
     canonical_install_dir="$(cd -P "$install_dir" && pwd)"
-    local staged_target
-    staged_target="$(mktemp "${canonical_install_dir}/.${BINARY_NAME}.XXXXXX")"
-    local staged_marker
-    staged_marker="$(mktemp "${canonical_install_dir}/.${BINARY_NAME}.marker.XXXXXX")"
+    # Staged beside the targets so each move into place is a same-filesystem rename, and inside one
+    # directory of its own so a single `rm -rf` in the trap reaps whatever a failed run staged.
+    STAGE_DIR="$(mktemp -d "${canonical_install_dir}/.${BINARY_NAME}.XXXXXX")"
 
+    local staged_target="${STAGE_DIR}/${BINARY_NAME}"
     cp "$binary" "$staged_target"
     chmod +x "$staged_target"
-    mv -f "$staged_target" "$target"
+
+    local marker="${canonical_install_dir}/${BINARY_NAME}.vct-managed"
+    local staged_marker="${STAGE_DIR}/${BINARY_NAME}.vct-managed"
     printf 'vct-release-installer-v1\n' > "$staged_marker"
-    mv -f "$staged_marker" "${canonical_install_dir}/${BINARY_NAME}.vct-managed"
+    # Readable only by the installing user, which for a root install into /usr/local/bin is the only
+    # user who could act on it: the marker is what lets the startup auto-update replace the binary,
+    # and every other user would reach that path only to fail on the same directory it cannot write.
+    chmod 600 "$staged_marker"
+
+    # Both files are ready before either lands, and the marker lands first. Two renames cannot be
+    # made atomic, so this is the order whose half-done state is survivable: a binary installed
+    # without its marker is one the startup auto-update silently never fires for again, whereas an
+    # unaccompanied marker is undone below. Only one this run put down is undone, since a marker
+    # that was already there belongs to the install that is already there.
+    if [ ! -e "$marker" ]; then
+        NEW_MARKER="$marker"
+    fi
+    mv -f "$staged_marker" "$marker"
+    mv -f "$staged_target" "$target"
+    # The binary the marker claims is in place, so the marker is no longer this run's to undo.
+    NEW_MARKER=""
     ln -sf "$target" "${install_dir}/vct"
 
     echo "Installed ${BINARY_NAME} ${version} to ${install_dir}"
