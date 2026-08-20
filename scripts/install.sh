@@ -68,16 +68,18 @@ install_binary() {
     fi
 
     local url="https://github.com/${REPO}/releases/download/${version}/${filename}"
-    local temp_dir
-    temp_dir="$(mktemp -d)"
-    trap 'rm -rf "$temp_dir"' EXIT
+    # Not a local: the EXIT trap outlives this function, and under `set -u` an out-of-scope name
+    # makes the trap fail instead of cleaning up. Armed after mktemp so TEMP_DIR is never unset,
+    # and kept from failing because under `set -e` a failing trap decides the script's exit status.
+    TEMP_DIR="$(mktemp -d)"
+    trap 'rm -rf "$TEMP_DIR" || true' EXIT
 
-    local archive="${temp_dir}/${filename}"
+    local archive="${TEMP_DIR}/${filename}"
     curl -fsSL -o "$archive" "$url" || download_failed "$url"
-    tar -xzf "$archive" -C "$temp_dir"
+    tar -xzf "$archive" -C "$TEMP_DIR"
 
     local binary
-    binary="$(find "$temp_dir" -type f -name "$BINARY_NAME" -print -quit)"
+    binary="$(find "$TEMP_DIR" -type f -name "$BINARY_NAME" -print -quit)"
     if [ -z "$binary" ]; then
         echo "Binary not found in downloaded archive." >&2
         exit 1
