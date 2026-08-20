@@ -1085,15 +1085,38 @@ fn cutoff_string(time_range: TimeRange) -> Option<String> {
 }
 
 /// Converts the inclusive local-date cutoff into an epoch-millis lower bound.
+///
+/// `None` means [`TimeRange::All`] and nothing else. Every query builder reads
+/// it as "no date predicate", so a conversion that gave up here would drop the
+/// filter from the SQL while the caller still believed it had one.
 fn cutoff_millis(time_range: TimeRange) -> Option<i64> {
-    use chrono::{Datelike, TimeZone};
+    time_range
+        .cutoff_date()
+        .map(|date| day_start_millis(&chrono::Local, date))
+}
 
-    time_range.cutoff_date().and_then(|date| {
-        chrono::Local
-            .with_ymd_and_hms(date.year(), date.month(), date.day(), 0, 0, 0)
-            .earliest()
-            .map(|dt| dt.timestamp_millis())
-    })
+/// Epoch-millis of the first instant of `date` in `tz`.
+///
+/// The timezone is a parameter so a test can drive one whose midnight is
+/// skipped without touching the ambient `TZ`.
+fn day_start_millis<Tz: chrono::TimeZone>(tz: &Tz, date: chrono::NaiveDate) -> i64 {
+    use chrono::{Offset, TimeDelta};
+
+    let midnight = date.and_time(chrono::NaiveTime::MIN);
+    // `earliest()` also picks the first of the pair when midnight is ambiguous,
+    // which is what a zone falling back onto its own midnight produces.
+    if let Some(start) = tz.from_local_datetime(&midnight).earliest() {
+        return start.timestamp_millis();
+    }
+    // `America/Santiago`, `America/Havana` and `Asia/Beirut` put their spring
+    // DST jump at local midnight, so once a year `00:00` never happens and
+    // there is nothing to map. The day still begins — at the jump itself,
+    // which is midnight read against the offset in force just before it. The
+    // probe is a full day earlier, further back than any offset can reach.
+    let before = tz.offset_from_utc_datetime(&(midnight - TimeDelta::days(1)));
+    (midnight - TimeDelta::seconds(i64::from(before.fix().local_minus_utc())))
+        .and_utc()
+        .timestamp_millis()
 }
 
 /// Returns `true` when `date` is strictly before the cutoff (should be skipped).
@@ -1768,6 +1791,90 @@ mod tests {
         assert!(record.conversation_usage.contains_key("recent-model"));
         assert_eq!(record.tool_call_counts.read, 1);
         assert_eq!(record.total_read_lines, 1);
+    }
+
+    /// A zone that skips local midnight, the way `America/Santiago` does on
+    /// 2026-09-06: the clock jumps straight from `00:00` to `01:00`.
+    #[derive(Clone)]
+    struct MidnightGapZone;
+
+    impl MidnightGapZone {
+        const BEFORE: i32 = -4 * 3600;
+        const AFTER: i32 = -3 * 3600;
+
+        fn gap_date() -> chrono::NaiveDate {
+            chrono::NaiveDate::from_ymd_opt(2026, 9, 6).unwrap()
+        }
+
+        /// The instant the clock jumps, as a UTC datetime.
+        fn transition() -> chrono::NaiveDateTime {
+            Self::gap_date().and_hms_opt(4, 0, 0).unwrap()
+        }
+
+        fn offset(seconds: i32) -> chrono::FixedOffset {
+            chrono::FixedOffset::east_opt(seconds).unwrap()
+        }
+    }
+
+    impl chrono::TimeZone for MidnightGapZone {
+        type Offset = chrono::FixedOffset;
+
+        fn from_offset(_: &Self::Offset) -> Self {
+            Self
+        }
+
+        fn offset_from_local_date(
+            &self,
+            _: &chrono::NaiveDate,
+        ) -> chrono::MappedLocalTime<Self::Offset> {
+            chrono::MappedLocalTime::Single(Self::offset(Self::AFTER))
+        }
+
+        fn offset_from_local_datetime(
+            &self,
+            local: &chrono::NaiveDateTime,
+        ) -> chrono::MappedLocalTime<Self::Offset> {
+            let midnight = Self::gap_date().and_hms_opt(0, 0, 0).unwrap();
+            let resumes = Self::gap_date().and_hms_opt(1, 0, 0).unwrap();
+            if *local < midnight {
+                chrono::MappedLocalTime::Single(Self::offset(Self::BEFORE))
+            } else if *local < resumes {
+                chrono::MappedLocalTime::None
+            } else {
+                chrono::MappedLocalTime::Single(Self::offset(Self::AFTER))
+            }
+        }
+
+        fn offset_from_utc_date(&self, _: &chrono::NaiveDate) -> Self::Offset {
+            Self::offset(Self::AFTER)
+        }
+
+        fn offset_from_utc_datetime(&self, utc: &chrono::NaiveDateTime) -> Self::Offset {
+            if *utc < Self::transition() {
+                Self::offset(Self::BEFORE)
+            } else {
+                Self::offset(Self::AFTER)
+            }
+        }
+    }
+
+    #[test]
+    fn day_start_falls_forward_when_local_midnight_is_skipped() {
+        // `00:00` never happens, so the day begins where the clock jumps.
+        assert_eq!(
+            day_start_millis(&MidnightGapZone, MidnightGapZone::gap_date()),
+            MidnightGapZone::transition().and_utc().timestamp_millis()
+        );
+        // The next day is ordinary and still starts at its own local midnight.
+        let ordinary = chrono::NaiveDate::from_ymd_opt(2026, 9, 7).unwrap();
+        assert_eq!(
+            day_start_millis(&MidnightGapZone, ordinary),
+            ordinary
+                .and_hms_opt(3, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp_millis()
+        );
     }
 
     #[test]
