@@ -62,7 +62,7 @@ Unsure where to begin contributing? You can start by looking through `good first
 
 #### Prerequisites
 
-- [Rust toolchain](https://rustup.rs/) **1.95 or higher** — pinned in `rust-toolchain.toml` (channel `1.96.1`) and required by `Cargo.toml` (`rust-version = "1.95"`); this project targets the **Rust 2024 edition**. Update with `rustup update` if needed.
+- [Rust toolchain](https://rustup.rs/) — the channel is pinned in `rust-toolchain.toml`, and `rustup` installs it for you on the first `cargo` command inside the repo; the minimum supported version is `Cargo.toml`'s `rust-version`. This project targets the **Rust 2024 edition**.
 - `rustfmt` and `clippy` components (installed by default with `rustup`).
 - Optional: [`pre-commit`](https://pre-commit.com/), [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov) for coverage, and Docker if you plan to touch the image build.
 
@@ -75,7 +75,7 @@ Unsure where to begin contributing? You can start by looking through `good first
 .
 ├── benches/          # Criterion benchmarks (pricing, parsing, aggregation)
 ├── cli/              # npm and PyPI wrapper packages (nodejs/, python/)
-├── docker/           # Multi-stage Dockerfile (rust:1.96.1-bookworm builder → ubuntu:26.04 prod)
+├── docker/           # Multi-stage Dockerfile (Rust builder → Ubuntu prod stage)
 ├── docs/             # Reference docs (raw quota + token-refresh curl/jq recipes)
 ├── src/
 │   ├── analysis/     # Collect canonical AnalysisDataset records and project per-model summaries

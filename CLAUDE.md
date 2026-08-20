@@ -15,7 +15,7 @@ Four auxiliary subcommands round out the CLI: `vct version` prints build/toolcha
 
 ## Common commands
 
-The toolchain is pinned to `rust-toolchain.toml` (1.97.0, edition 2024). On this machine `cargo` is **not** on the default `PATH`; export it before invoking any cargo command:
+The toolchain channel is pinned by `rust-toolchain.toml` (read that file for the version; edition 2024). On this machine `cargo` is **not** on the default `PATH`; export it before invoking any cargo command:
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
