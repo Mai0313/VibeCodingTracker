@@ -516,19 +516,22 @@ fn auto_update_with(
     fetch_release: impl FnOnce() -> Result<GitHubRelease>,
     install_release: impl FnOnce(&GitHubRelease, &Version) -> Result<InstallationDisposition>,
 ) -> Result<AutoUpdateOutcome> {
-    let Some(_lock) = lock::UpdateLock::try_acquire(lock_dir)? else {
-        log::warn!("startup auto-update skipped because another update is running");
-        return Ok(AutoUpdateOutcome::Skipped);
-    };
-
     let record = version_cache::read_self_version_in(cache_dir);
     if !version_cache::check_is_due(&record, now) {
         return Ok(AutoUpdateOutcome::Skipped);
     }
 
-    // Claim today's attempt before touching the network. If GitHub is down, the
-    // failed request is still throttled until the next UTC date.
+    // Claim today's attempt before the lock and before the network, so whatever
+    // stops this run — a lock another process holds, an install directory this
+    // user cannot write, a GitHub outage — is reported once rather than on every
+    // command until the next UTC date. The price is the check this run gives up.
     version_cache::record_check_attempt_in(cache_dir, now)?;
+
+    let Some(_lock) = lock::UpdateLock::try_acquire(lock_dir)? else {
+        log::warn!("startup auto-update skipped because another update is running");
+        return Ok(AutoUpdateOutcome::Skipped);
+    };
+
     let release = fetch_release().context("Failed to fetch latest release information")?;
     let latest_version = parse_latest_version(&release)?;
     if let Err(error) =
