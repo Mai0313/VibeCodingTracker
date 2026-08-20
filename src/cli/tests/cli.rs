@@ -23,7 +23,7 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use serde_json::json;
 use vct_core::session::{ParseMode, parse_session_file_typed_with_mode};
-use vct_core::{VERSION, parse_session_file_typed};
+use vct_core::{CARGO_VERSION, RUST_VERSION, VERSION, parse_session_file_typed};
 use vct_test_support::{TempHome, fixture};
 
 /// A minimal cost-fields pricing map used to seed the offline cache so `usage`
@@ -89,7 +89,7 @@ fn test_short_version_flag_outputs_build_version_only() {
 }
 
 #[test]
-fn test_version_command_json() {
+fn test_version_command_json_matches_build_constants() {
     let home = TempHome::new();
     let output = child_cmd(&home)
         .arg("version")
@@ -98,7 +98,18 @@ fn test_version_command_json() {
         .unwrap();
     assert!(output.status.success());
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(json["Version"].is_string(), "Should have Version field");
+    // The whole object rather than a field at a time: the subcommand renders
+    // `get_version_info()` while `--version` prints `VERSION` from `main.rs`
+    // ahead of clap, so this is what holds those two paths to one answer, and
+    // an exact match pins the key set on top of the values.
+    assert_eq!(
+        json,
+        json!({
+            "Version": VERSION,
+            "Rust Version": RUST_VERSION,
+            "Cargo Version": CARGO_VERSION,
+        })
+    );
 }
 
 #[test]
@@ -576,19 +587,6 @@ fn test_quota_multiple_output_formats() {
             .failure()
             .stderr(predicate::str::contains("cannot be used with"));
     }
-}
-
-#[test]
-fn test_cli_version_matches_cargo() {
-    let home = TempHome::new();
-    let output = child_cmd(&home)
-        .arg("version")
-        .arg("--json")
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(json["Version"].is_string(), "Should have Version field");
 }
 
 // ============================================================================
