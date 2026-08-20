@@ -127,7 +127,7 @@ Two release profiles are defined in `Cargo.toml`:
 
 `Cargo.toml` exposes a small set of optional features; the defaults are tuned for long-running TUI sessions.
 
-- **System allocator (default)** — the build links against glibc's `malloc`. Combined with the `mallopt` tuning applied at startup (see `src/utils/heap.rs`) and the per-refresh `malloc_trim(0)` call, this keeps `usage` / `analysis` TUI RSS roughly flat (~30–50 MB) even over hours of refreshes. Use this for anything you plan to leave open.
+- **System allocator (default)** — the build links against glibc's `malloc`. Combined with the `mallopt` tuning applied at startup (see `src/core/src/utils/heap.rs`) and the per-refresh `malloc_trim(0)` call, this keeps `usage` / `analysis` TUI RSS roughly flat (~30–50 MB) even over hours of refreshes. Use this for anything you plan to leave open.
 - **`mimalloc` (opt-in)** — enable with `cargo build --release --features mimalloc`. Links Microsoft's mimalloc as the global allocator. Startup / one-shot commands (`vct usage --json`, `vct analysis file.jsonl`) are slightly faster, but mimalloc's lazy purge retains freed pages — on a 219-session directory the TUI RSS was ~11× higher than the default build in our measurements. Prefer this only for scripted, short-lived invocations.
 
 On Linux/glibc the main binary also calls `mallopt(M_ARENA_MAX, 2)` + `mallopt(M_TRIM_THRESHOLD, 128 KiB)` at start. These cap the number of per-thread allocator arenas (so Rayon workers can't multiply arena-side fragmentation across cores) and pin the trim threshold. The calls are no-ops on other platforms / allocators.
@@ -146,20 +146,20 @@ Common Makefile shortcuts (`make help` to list all):
 
 #### Running Tests
 
-Tests follow the Rust Book's [ch11-03 organization](https://doc.rust-lang.org/book/ch11-03-test-organization.html): unit tests live inline in `src/` inside `#[cfg(test)] mod tests`, and each integration test file under `tests/*.rs` builds as its own Cargo test binary.
+Tests follow the Rust Book's [ch11-03 organization](https://doc.rust-lang.org/book/ch11-03-test-organization.html): unit tests live inline in each crate's `src/` inside `#[cfg(test)] mod tests`, and each integration test file under a crate's `tests/` builds as its own Cargo test binary.
 
 ```bash
 # Everything (library unit tests + integration tests + doctests)
 cargo test --all
 
-# Integration tests only (each file under tests/ is a separate test binary)
+# Integration tests only (each file under a crate's tests/ is a separate binary)
 cargo test --tests
 
-# A specific integration test crate
+# A specific integration test binary
 cargo test --test analysis
 
 # Unit tests for a specific src module (path mirrors the module path)
-cargo test --lib analysis::detector
+cargo test --lib session::detector
 cargo test --lib pricing::matching
 
 # Run a single test by name (works across all binaries)
@@ -177,7 +177,7 @@ VCT_OFFLINE=1 cargo test --all-targets --all-features --locked
 
 #### Benchmarks
 
-Performance-sensitive code paths (pricing lookup, provider parsing, cold and incremental scans, long-preamble detection, aggregation, and TUI rendering) have Criterion benchmarks in `benches/benchmarks.rs`:
+Performance-sensitive code paths (pricing lookup, provider parsing, cold and incremental scans, long-preamble detection, aggregation, and TUI rendering) have Criterion benchmarks in `src/tui/benches/benchmarks.rs`:
 
 ```bash
 cargo bench
