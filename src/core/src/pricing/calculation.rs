@@ -1,5 +1,5 @@
 use super::cache::{ModelPricing, TierRange};
-use crate::utils::TokenCounts;
+use crate::utils::{TierSlice, TokenCounts};
 
 /// One resolved set of per-token prices (base level or one tier).
 #[derive(Clone, Copy)]
@@ -42,15 +42,7 @@ impl PriceLevel {
         }
     }
 
-    fn bill(
-        &self,
-        input: i64,
-        output: i64,
-        reasoning: i64,
-        cache_read: i64,
-        cc_5m: i64,
-        cc_1h: i64,
-    ) -> f64 {
+    fn bill(&self, tokens: &TierSlice) -> f64 {
         let reasoning_price = if self.reasoning_raw > 0.0 {
             self.reasoning_raw
         } else {
@@ -61,36 +53,38 @@ impl PriceLevel {
         } else {
             self.cc_5m
         };
-        input as f64 * self.input
-            + output as f64 * self.output
-            + reasoning as f64 * reasoning_price
-            + cache_read as f64 * self.cache_read
-            + cc_5m as f64 * self.cc_5m
-            + cc_1h as f64 * cc_1h_price
+        tokens.input_tokens as f64 * self.input
+            + tokens.output_tokens as f64 * self.output
+            + tokens.reasoning_tokens as f64 * reasoning_price
+            + tokens.cache_read as f64 * self.cache_read
+            + tokens.cache_creation_5m as f64 * self.cc_5m
+            + tokens.cache_creation_1h as f64 * cc_1h_price
     }
 }
 
 /// Calculates total cost for normalized token counts and the model's pricing.
 ///
-/// Both pricing strategies bill the same two-level split, and **neither ever
-/// selects a level from the summed counts**: `counts` is a per-model aggregate
-/// across records, files and sessions, while LiteLLM's tier semantics are per
+/// Both pricing strategies bill a per-level split, and **neither ever selects
+/// a level from the summed counts**: `counts` is a per-model aggregate across
+/// records, files and sessions, while LiteLLM's tier semantics are per
 /// request, so a level chosen from the sum promotes whole months of small
 /// requests to the elevated rate. The level is chosen per request instead, by
-/// the usage parsers, which accumulate the crossing requests' tokens into the
-/// `above_*` slices.
+/// the usage parsers, which accumulate each request's tokens into its level's
+/// [`TokenCounts::above_tiers`] slice.
 ///
 /// 1. Range-based (`pricing.ranges` is `Some`, Qwen / doubao volume tiers):
-///    the base slice bills at `ranges[0]`, the `above_*` slice at `ranges[1]`.
-/// 2. Threshold-based (`pricing.tiers`): base prices bill the base slice and
-///    the `above_*` slice bills at `tiers[0]`.
-/// 3. Counts without `above_*` slices (analysis paths, offline scans,
-///    providers without per-request granularity) therefore bill entirely at
-///    the lowest level — a deliberate lower bound.
+///    level `n`'s slice bills at `ranges[n]`, the remainder at `ranges[0]`.
+/// 2. Threshold-based (`pricing.tiers`): level `n`'s slice bills at
+///    `tiers[n - 1]`, the remainder at base prices.
+/// 3. Counts without slices (analysis paths, offline scans, providers without
+///    per-request granularity) therefore bill entirely at the lowest level —
+///    a deliberate lower bound.
 ///
-/// Levels past the second are never selected in either strategy: one `above_*`
-/// bucket can only carry two levels, so a request bigger than `ranges[1]`
-/// covers is a lower bound too.
+/// A price a level does not publish falls back to the level below it, and a
+/// level past the model's last published row bills at that row. Only the range
+/// strategy reaches that chain in practice: `parse_litellm_entry` already fills
+/// a tier's unpublished input / output / cache prices from the model's base,
+/// so a `ThresholdTier` arrives here with nothing left to inherit.
 ///
 /// `reasoning_tokens` covers the model's "thinking" budget (Gemini
 /// `thoughts_tokens`, Codex `reasoning_output_tokens`, Copilot
@@ -127,91 +121,91 @@ impl PriceLevel {
 /// ```
 pub fn calculate_cost(counts: &TokenCounts, pricing: &ModelPricing) -> f64 {
     if let Some(ranges) = &pricing.ranges {
-        let Some(row) = ranges.first() else {
+        let (Some(first), Some(top)) = (ranges.first(), ranges.last()) else {
             return 0.0;
         };
-        return bill_split(counts, PriceLevel::range(row, pricing), |base| {
-            match ranges.get(1) {
-                // Rows are sorted ascending and the parsers classify against
-                // row 0's upper bound, so row 1 is the level the above-slice
-                // crossed into. A price row 1 doesn't publish falls back to
-                // row 0's rather than billing $0.
-                Some(row) => PriceLevel {
-                    input: positive_or(row.input_cost_per_token, base.input),
-                    output: positive_or(row.output_cost_per_token, base.output),
-                    reasoning_raw: positive_or(
-                        row.output_cost_per_reasoning_token,
-                        base.reasoning_raw,
-                    ),
-                    cache_read: positive_or(row.cache_read_input_token_cost, base.cache_read),
-                    ..base
-                },
-                // Single-row models publish no threshold, so they never carry
-                // an above-slice; an inherited one bills at row 0.
-                None => base,
+        return bill_levels(counts, PriceLevel::range(first, pricing), |level, below| {
+            // Rows are sorted ascending and the parsers classify against each
+            // row's lower bound, so level `n` is row `n`. A level past the
+            // last published row bills there, which is also what a single-row
+            // model's inherited slice does. A price the row doesn't publish
+            // falls back to the level below rather than billing $0.
+            let row = ranges.get(level).unwrap_or(top);
+            PriceLevel {
+                input: positive_or(row.input_cost_per_token, below.input),
+                output: positive_or(row.output_cost_per_token, below.output),
+                reasoning_raw: positive_or(
+                    row.output_cost_per_reasoning_token,
+                    below.reasoning_raw,
+                ),
+                cache_read: positive_or(row.cache_read_input_token_cost, below.cache_read),
+                ..below
             }
         });
     }
 
-    bill_split(counts, PriceLevel::base(pricing), |base| {
-        // Classification uses the lowest threshold, so the lowest tier's
-        // prices apply. A tier field the model doesn't publish (0.0) falls
-        // back to the base price for that bucket rather than billing $0.
-        match pricing.tiers.first() {
+    bill_levels(counts, PriceLevel::base(pricing), |level, below| {
+        // Level `n` is classified against the `n`th threshold, so it bills at
+        // `tiers[n - 1]`. A tier field the model doesn't publish (0.0) falls
+        // back to the level below rather than billing $0.
+        match pricing
+            .tiers
+            .get(level - 1)
+            .or_else(|| pricing.tiers.last())
+        {
             Some(tier) => PriceLevel {
-                input: positive_or(tier.input_cost_per_token, base.input),
-                output: positive_or(tier.output_cost_per_token, base.output),
+                input: positive_or(tier.input_cost_per_token, below.input),
+                output: positive_or(tier.output_cost_per_token, below.output),
                 // LiteLLM publishes no tier-specific reasoning rate; billing
                 // tier reasoning at the tier output rate matches "once you're
                 // in the tier, everything is more expensive".
                 reasoning_raw: 0.0,
-                cache_read: positive_or(tier.cache_read_input_token_cost, base.cache_read),
-                cc_5m: positive_or(tier.cache_creation_input_token_cost, base.cc_5m),
+                cache_read: positive_or(tier.cache_read_input_token_cost, below.cache_read),
+                cc_5m: positive_or(tier.cache_creation_input_token_cost, below.cc_5m),
                 cc_1h_raw: tier.cache_creation_input_token_cost_above_1hr,
             },
-            // Above-slices without a published tier (e.g. thresholds derived
-            // from a newer pricing snapshot than this entry): bill at base
-            // rates verbatim, keeping the model's dedicated reasoning rate.
-            None => base,
+            // Slices without a published tier (e.g. boundaries derived from a
+            // newer pricing snapshot than this entry): bill at base rates
+            // verbatim, keeping the model's dedicated reasoning rate.
+            None => below,
         }
     })
 }
 
-/// Bills every bucket's base slice at `base` and its above-threshold slice at
-/// the level `above` resolves to, which is only built when a slice exists.
-fn bill_split(
+/// Bills what no level claimed at `base` and every classified slice at the
+/// level `level_price` resolves it to.
+///
+/// Levels resolve in order even where nothing classified into one, because
+/// each level's unpublished prices fall back to the level directly below it.
+fn bill_levels(
     counts: &TokenCounts,
     base: PriceLevel,
-    above: impl FnOnce(PriceLevel) -> PriceLevel,
+    level_price: impl Fn(usize, PriceLevel) -> PriceLevel,
 ) -> f64 {
-    // The above-threshold slices are subsets of the totals; the base slice is
-    // the remainder. Clamp defensively so a malformed merge can never bill
-    // negative tokens.
-    let base_slice = |total: i64, above: i64| (total - above).max(0);
-    let mut cost = base.bill(
-        base_slice(counts.input_tokens, counts.above_input),
-        base_slice(counts.output_tokens, counts.above_output),
-        base_slice(counts.reasoning_tokens, counts.above_reasoning),
-        base_slice(counts.cache_read, counts.above_cache_read),
-        base_slice(counts.cache_creation_5m, counts.above_cache_creation_5m),
-        base_slice(counts.cache_creation_1h, counts.above_cache_creation_1h),
-    );
+    let mut classified = TierSlice::default();
+    for slice in &counts.above_tiers {
+        classified.merge(slice);
+    }
 
-    let has_above = counts.above_input != 0
-        || counts.above_output != 0
-        || counts.above_reasoning != 0
-        || counts.above_cache_read != 0
-        || counts.above_cache_creation_5m != 0
-        || counts.above_cache_creation_1h != 0;
-    if has_above {
-        cost += above(base).bill(
-            counts.above_input,
-            counts.above_output,
-            counts.above_reasoning,
-            counts.above_cache_read,
-            counts.above_cache_creation_5m,
-            counts.above_cache_creation_1h,
-        );
+    // The classified slices are subsets of the totals; what is left bills at
+    // the base level. Clamp defensively so a malformed merge can never bill
+    // negative tokens.
+    let remainder = |total: i64, classified: i64| (total - classified).max(0);
+    let mut cost = base.bill(&TierSlice {
+        input_tokens: remainder(counts.input_tokens, classified.input_tokens),
+        output_tokens: remainder(counts.output_tokens, classified.output_tokens),
+        reasoning_tokens: remainder(counts.reasoning_tokens, classified.reasoning_tokens),
+        cache_read: remainder(counts.cache_read, classified.cache_read),
+        cache_creation_5m: remainder(counts.cache_creation_5m, classified.cache_creation_5m),
+        cache_creation_1h: remainder(counts.cache_creation_1h, classified.cache_creation_1h),
+    });
+
+    let mut prices = base;
+    for (index, slice) in counts.above_tiers.iter().enumerate() {
+        prices = level_price(index + 1, prices);
+        if !slice.is_empty() {
+            cost += prices.bill(slice);
+        }
     }
 
     cost
@@ -242,6 +236,23 @@ mod tests {
             cache_creation: cc_5m + cc_1h,
             cache_creation_5m: cc_5m,
             cache_creation_1h: cc_1h,
+            ..Default::default()
+        }
+    }
+
+    /// Sets the slice classified into `level`, filling any level below it with
+    /// zeros the way the parsers' own accumulator does.
+    fn classify(counts: &mut TokenCounts, level: usize, slice: TierSlice) {
+        if counts.above_tiers.len() < level {
+            counts.above_tiers.resize(level, TierSlice::default());
+        }
+        counts.above_tiers[level - 1] = slice;
+    }
+
+    fn slice(input: i64, output: i64) -> TierSlice {
+        TierSlice {
+            input_tokens: input,
+            output_tokens: output,
             ..Default::default()
         }
     }
@@ -311,10 +322,17 @@ mod tests {
     fn test_above_slice_bills_at_tier_and_remainder_at_base() {
         let p = sonnet_like_pricing();
         let mut c = counts(300_000, 1_000, 0, 100_000, 10_000, 0);
-        c.above_input = 250_000;
-        c.above_output = 600;
-        c.above_cache_read = 80_000;
-        c.above_cache_creation_5m = 10_000;
+        classify(
+            &mut c,
+            1,
+            TierSlice {
+                input_tokens: 250_000,
+                output_tokens: 600,
+                cache_read: 80_000,
+                cache_creation_5m: 10_000,
+                ..Default::default()
+            },
+        );
         let cost = calculate_cost(&c, &p);
         let base_part = 50_000.0 * 0.000003 + 400.0 * 0.000015 + 20_000.0 * 0.0000003;
         let tier_part =
@@ -326,8 +344,7 @@ mod tests {
     fn test_fully_above_request_bills_everything_at_tier() {
         let p = sonnet_like_pricing();
         let mut c = counts(250_000, 1_000, 0, 0, 0, 0);
-        c.above_input = 250_000;
-        c.above_output = 1_000;
+        classify(&mut c, 1, slice(250_000, 1_000));
         let cost = calculate_cost(&c, &p);
         assert_eq!(cost, 250_000.0 * 0.000006 + 1_000.0 * 0.0000225);
     }
@@ -338,8 +355,7 @@ mod tests {
         // the tokens must still be billed exactly once, at base rates.
         let p = flat_pricing();
         let mut c = counts(300_000, 1_000, 0, 0, 0, 0);
-        c.above_input = 300_000;
-        c.above_output = 1_000;
+        classify(&mut c, 1, slice(300_000, 1_000));
         let cost = calculate_cost(&c, &p);
         assert_eq!(cost, 300_000.0 * 0.000003 + 1_000.0 * 0.000015);
     }
@@ -356,9 +372,16 @@ mod tests {
             ..Default::default()
         };
         let mut c = counts(1_000, 200, 500, 0, 0, 0);
-        c.above_input = 1_000;
-        c.above_output = 200;
-        c.above_reasoning = 500;
+        classify(
+            &mut c,
+            1,
+            TierSlice {
+                input_tokens: 1_000,
+                output_tokens: 200,
+                reasoning_tokens: 500,
+                ..Default::default()
+            },
+        );
         let cost = calculate_cost(&c, &p);
         let expected = 1_000.0 * 1e-6 + 200.0 * 8e-6 + 500.0 * 3e-6;
         assert_eq!(cost, expected);
@@ -381,7 +404,14 @@ mod tests {
             ..Default::default()
         };
         let mut c = counts(0, 0, 0, 200_000, 0, 0);
-        c.above_cache_read = 200_000;
+        classify(
+            &mut c,
+            1,
+            TierSlice {
+                cache_read: 200_000,
+                ..Default::default()
+            },
+        );
         let cost = calculate_cost(&c, &p);
         assert_eq!(cost, 200_000.0 * 0.0000001);
     }
@@ -404,9 +434,16 @@ mod tests {
             ..Default::default()
         };
         let mut c = counts(250_000, 1_000, 500, 0, 0, 0);
-        c.above_input = 250_000;
-        c.above_output = 1_000;
-        c.above_reasoning = 500;
+        classify(
+            &mut c,
+            1,
+            TierSlice {
+                input_tokens: 250_000,
+                output_tokens: 1_000,
+                reasoning_tokens: 500,
+                ..Default::default()
+            },
+        );
         let cost = calculate_cost(&c, &p);
         let expected = 250_000.0 * 6e-6 + 1_000.0 * 2.25e-5 + 500.0 * 2.25e-5;
         assert_eq!(cost, expected);
@@ -418,7 +455,7 @@ mod tests {
         // base tokens.
         let p = sonnet_like_pricing();
         let mut c = counts(100, 0, 0, 0, 0, 0);
-        c.above_input = 500;
+        classify(&mut c, 1, slice(500, 0));
         let cost = calculate_cost(&c, &p);
         assert_eq!(cost, 500.0 * 0.000006);
     }
@@ -482,8 +519,7 @@ mod tests {
     fn test_range_above_slice_bills_at_row_one_and_remainder_at_row_zero() {
         let p = qwen_like_pricing();
         let mut c = counts(500_000, 5_000, 0, 0, 0, 0);
-        c.above_input = 300_000;
-        c.above_output = 4_000;
+        classify(&mut c, 1, slice(300_000, 4_000));
         let cost = calculate_cost(&c, &p);
         let base_part = 200_000.0 * 0.000001 + 1_000.0 * 0.000005;
         let above_part = 300_000.0 * 0.0000018 + 4_000.0 * 0.000009;
@@ -491,15 +527,119 @@ mod tests {
     }
 
     #[test]
-    fn test_range_above_slice_never_reaches_rows_past_the_second() {
-        // One `above_*` bucket carries two levels, so a request past row 1
-        // bills at row 1 — a deliberate lower bound, not row 3's rate.
+    fn test_range_above_slice_reaches_the_row_it_classified_into() {
+        // A 500K-context request belongs to the top row, whose output rate is
+        // 12x row 0's. Billing it at row 1 — all one `above_*` bucket could
+        // ever express — under-reported it by 6.7x on output.
         let p = qwen_like_pricing();
         let mut c = counts(500_000, 5_000, 0, 0, 0, 0);
-        c.above_input = 500_000;
-        c.above_output = 5_000;
+        classify(&mut c, 3, slice(500_000, 5_000));
         let cost = calculate_cost(&c, &p);
-        assert_eq!(cost, 500_000.0 * 0.0000018 + 5_000.0 * 0.000009);
+        assert_eq!(cost, 500_000.0 * 0.000006 + 5_000.0 * 0.00006);
+    }
+
+    #[test]
+    fn test_every_range_row_bills_its_own_slice() {
+        // One model's month: requests landed in all four rows, so each row's
+        // slice bills at that row and only the unclassified remainder at row 0.
+        let p = qwen_like_pricing();
+        let mut c = counts(400_000, 4_000, 0, 0, 0, 0);
+        classify(&mut c, 1, slice(100_000, 1_000));
+        classify(&mut c, 2, slice(100_000, 1_000));
+        classify(&mut c, 3, slice(100_000, 1_000));
+        let cost = calculate_cost(&c, &p);
+        let expected = 100_000.0 * 0.000001
+            + 1_000.0 * 0.000005
+            + 100_000.0 * 0.0000018
+            + 1_000.0 * 0.000009
+            + 100_000.0 * 0.000003
+            + 1_000.0 * 0.000015
+            + 100_000.0 * 0.000006
+            + 1_000.0 * 0.00006;
+        assert_eq!(cost, expected);
+    }
+
+    #[test]
+    fn test_each_threshold_tier_bills_its_own_slice() {
+        // Every threshold-priced model LiteLLM publishes today carries exactly
+        // one tier, so this pins the level → `tiers[n - 1]` mapping before a
+        // second one ever ships.
+        let p = ModelPricing {
+            input_cost_per_token: 1e-6,
+            output_cost_per_token: 2e-6,
+            tiers: vec![
+                ThresholdTier {
+                    threshold_tokens: 200_000,
+                    input_cost_per_token: 2e-6,
+                    output_cost_per_token: 4e-6,
+                    ..Default::default()
+                },
+                ThresholdTier {
+                    threshold_tokens: 500_000,
+                    input_cost_per_token: 4e-6,
+                    output_cost_per_token: 8e-6,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let mut c = counts(900_000, 9_000, 0, 0, 0, 0);
+        classify(&mut c, 1, slice(300_000, 3_000));
+        classify(&mut c, 2, slice(400_000, 4_000));
+        let expected = 200_000.0 * 1e-6
+            + 2_000.0 * 2e-6
+            + 300_000.0 * 2e-6
+            + 3_000.0 * 4e-6
+            + 400_000.0 * 4e-6
+            + 4_000.0 * 8e-6;
+        assert_eq!(calculate_cost(&c, &p), expected);
+    }
+
+    #[test]
+    fn test_a_level_past_the_last_row_bills_at_that_row() {
+        // Boundaries can come from a newer pricing snapshot than this entry,
+        // so a level the model no longer publishes must still bill at its
+        // dearest row rather than falling back to row 0.
+        let p = qwen_like_pricing();
+        let mut c = counts(10_000, 0, 0, 0, 0, 0);
+        classify(&mut c, 7, slice(10_000, 0));
+        assert_eq!(calculate_cost(&c, &p), 10_000.0 * 0.000006);
+    }
+
+    #[test]
+    fn test_higher_range_row_inherits_prices_from_the_row_below_it() {
+        // Row 2 publishes only input; its output must fall back to row 1's
+        // rather than to row 0's, which is the cheaper of the two.
+        let p = ModelPricing {
+            ranges: Some(vec![
+                TierRange {
+                    min_tokens: 0,
+                    max_tokens: 32_000,
+                    input_cost_per_token: 1e-6,
+                    output_cost_per_token: 5e-6,
+                    ..Default::default()
+                },
+                TierRange {
+                    min_tokens: 32_000,
+                    max_tokens: 128_000,
+                    input_cost_per_token: 1.8e-6,
+                    output_cost_per_token: 9e-6,
+                    ..Default::default()
+                },
+                TierRange {
+                    min_tokens: 128_000,
+                    max_tokens: 256_000,
+                    input_cost_per_token: 3e-6,
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+
+        let mut c = counts(200_000, 2_000, 0, 0, 0, 0);
+        classify(&mut c, 2, slice(200_000, 2_000));
+        assert_eq!(calculate_cost(&c, &p), 200_000.0 * 3e-6 + 2_000.0 * 9e-6);
     }
 
     #[test]
@@ -527,9 +667,16 @@ mod tests {
         };
 
         let mut c = counts(10_000, 2_000, 0, 5_000, 0, 0);
-        c.above_input = 10_000;
-        c.above_output = 2_000;
-        c.above_cache_read = 5_000;
+        classify(
+            &mut c,
+            1,
+            TierSlice {
+                input_tokens: 10_000,
+                output_tokens: 2_000,
+                cache_read: 5_000,
+                ..Default::default()
+            },
+        );
         let cost = calculate_cost(&c, &p);
         assert_eq!(
             cost,
@@ -557,7 +704,7 @@ mod tests {
 
         // An above-slice inherited from a stale threshold bills there too.
         let mut c = counts(200_000, 0, 0, 0, 0, 0);
-        c.above_input = 200_000;
+        classify(&mut c, 1, slice(200_000, 0));
         assert_eq!(calculate_cost(&c, &p), 200_000.0 * 0.000001);
     }
 
@@ -586,8 +733,15 @@ mod tests {
         };
 
         let mut c = counts(0, 0, 0, 0, 4_000, 2_000);
-        c.above_cache_creation_5m = 1_000;
-        c.above_cache_creation_1h = 500;
+        classify(
+            &mut c,
+            1,
+            TierSlice {
+                cache_creation_5m: 1_000,
+                cache_creation_1h: 500,
+                ..Default::default()
+            },
+        );
         let cost = calculate_cost(&c, &p);
         assert_eq!(cost, 4_000.0 * 0.00000375 + 2_000.0 * 0.000006);
     }
@@ -652,9 +806,16 @@ mod tests {
         };
 
         let mut c = counts(250_000, 0, 0, 0, 5_000, 5_000);
-        c.above_input = 250_000;
-        c.above_cache_creation_5m = 5_000;
-        c.above_cache_creation_1h = 5_000;
+        classify(
+            &mut c,
+            1,
+            TierSlice {
+                input_tokens: 250_000,
+                cache_creation_5m: 5_000,
+                cache_creation_1h: 5_000,
+                ..Default::default()
+            },
+        );
         let cost = calculate_cost(&c, &p);
         let expected = 250_000.0 * 6e-6 + 5_000.0 * 7.5e-6 + 5_000.0 * 1.2e-5;
         assert_eq!(cost, expected);

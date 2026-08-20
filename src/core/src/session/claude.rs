@@ -137,13 +137,13 @@ where
                 diagnostics.record_relevant(normalized);
                 if normalized && let Some(model) = model {
                     // One assistant record is one billed request; classify its
-                    // own prompt context against the model's tier threshold.
-                    let above = classifier.as_mut().is_some_and(|classifier| {
-                        usage.as_object().is_some_and(|usage_obj| {
-                            classifier.is_above(model, claude_request_context(usage_obj))
+                    // own prompt context against the model's price levels.
+                    let level = classifier.as_mut().map_or(0, |classifier| {
+                        usage.as_object().map_or(0, |usage_obj| {
+                            classifier.level(model, claude_request_context(usage_obj))
                         })
                     });
-                    process_claude_usage(&mut conversation_usage, model, usage, above);
+                    process_claude_usage(&mut conversation_usage, model, usage, level);
 
                     // Claude Code's top-level `usage` is the sum of the
                     // `message`-type entries in `usage.iterations` and EXCLUDES any
@@ -163,19 +163,17 @@ where
                                     !adv_model.is_empty() && is_supported_claude_usage(iter);
                                 diagnostics.record_relevant(normalized);
                                 if normalized {
-                                    let above = classifier.as_mut().is_some_and(|classifier| {
-                                        iter.as_object().is_some_and(|usage_obj| {
-                                            classifier.is_above(
-                                                adv_model,
-                                                claude_request_context(usage_obj),
-                                            )
+                                    let level = classifier.as_mut().map_or(0, |classifier| {
+                                        iter.as_object().map_or(0, |usage_obj| {
+                                            classifier
+                                                .level(adv_model, claude_request_context(usage_obj))
                                         })
                                     });
                                     process_claude_usage(
                                         &mut advisor_usage,
                                         adv_model,
                                         iter,
-                                        above,
+                                        level,
                                     );
                                 }
                             }
@@ -719,7 +717,7 @@ mod tests {
         ];
 
         let tiers = crate::pricing::TierThresholds::from_entries(
-            [("claude-sonnet-5", 200_000)].into_iter(),
+            [("claude-sonnet-5", vec![200_000])].into_iter(),
         );
         let parsed =
             parse_claude_logs_with_diagnostics(logs.clone(), ParseMode::UsageOnly, Some(&tiers))
@@ -728,9 +726,9 @@ mod tests {
         // Totals cover both requests; the above_tier slice only the second.
         assert_eq!(usage["input_tokens"], 3_000);
         assert_eq!(usage["output_tokens"], 500);
-        assert_eq!(usage["above_tier"]["input_tokens"], 2_000);
-        assert_eq!(usage["above_tier"]["cache_read_tokens"], 220_000);
-        assert_eq!(usage["above_tier"]["output_tokens"], 300);
+        assert_eq!(usage["above_tier"]["level_1_input_tokens"], 2_000);
+        assert_eq!(usage["above_tier"]["level_1_cache_read_tokens"], 220_000);
+        assert_eq!(usage["above_tier"]["level_1_output_tokens"], 300);
 
         // Without thresholds nothing is classified and the shape is unchanged.
         let parsed = parse_claude_logs_with_diagnostics(logs, ParseMode::UsageOnly, None).unwrap();

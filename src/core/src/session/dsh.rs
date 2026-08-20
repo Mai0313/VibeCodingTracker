@@ -13,6 +13,8 @@ use crate::models::CodeAnalysis;
 use crate::pricing::{TierClassifier, TierThresholds};
 use crate::session::diagnostics::{ParseDiagnostics, ParsedAnalysis};
 use crate::session::state::{ParseMode, SessionParseState};
+use crate::utils::token_merge::write_tier_slice;
+use crate::utils::{MAX_TIER_LEVELS, TierSlice};
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
@@ -139,17 +141,30 @@ impl DshTokens {
     fn request_context(self) -> i64 {
         self.input + self.cache_read + self.cache_write
     }
-
-    fn is_empty(self) -> bool {
-        self.request_context() == 0 && self.output == 0 && self.reasoning == 0
-    }
 }
 
-/// Per-model running totals plus the above-tier slice of them.
+/// Per-model running totals plus the per-price-level slices of them.
+///
+/// `above_tiers[n]` is the slice classified into price level `n + 1`; the base
+/// level is the remainder and is never held here.
 #[derive(Debug, Default)]
 struct ModelUsage {
     total: DshTokens,
-    above_tier: DshTokens,
+    above_tiers: Vec<DshTokens>,
+}
+
+impl ModelUsage {
+    /// Merges `tokens` into the slice for `level`, growing the vector to reach
+    /// it. Level 0 is the base level and holds no slice.
+    fn classify(&mut self, level: usize, tokens: DshTokens) {
+        if level == 0 || level > MAX_TIER_LEVELS {
+            return;
+        }
+        if self.above_tiers.len() < level {
+            self.above_tiers.resize(level, DshTokens::default());
+        }
+        self.above_tiers[level - 1].merge(tokens);
+    }
 }
 
 /// A `tool/call` waiting for the `tool/result` that reports its outcome.
@@ -395,14 +410,12 @@ impl<'a> DshParser<'a> {
         if sample.model.is_empty() {
             return;
         }
-        let above_tier = self.classifier.as_mut().is_some_and(|classifier| {
-            classifier.is_above(&sample.model, sample.tokens.request_context())
+        let level = self.classifier.as_mut().map_or(0, |classifier| {
+            classifier.level(&sample.model, sample.tokens.request_context())
         });
         let entry = self.usage.entry(sample.model).or_default();
         entry.total.merge(sample.tokens);
-        if above_tier {
-            entry.above_tier.merge(sample.tokens);
-        }
+        entry.classify(level, sample.tokens);
     }
 
     fn apply_tool_call(&mut self, object: &Map<String, Value>, data: &Value) {
@@ -558,14 +571,23 @@ impl<'a> DshParser<'a> {
                 "cache_read_input_tokens": usage.total.cache_read,
                 "cache_creation_input_tokens": usage.total.cache_write,
             });
-            if !usage.above_tier.is_empty() {
-                value["above_tier"] = json!({
-                    "input_tokens": usage.above_tier.input,
-                    "output_tokens": usage.above_tier.output,
-                    "reasoning_tokens": usage.above_tier.reasoning,
-                    "cache_read_tokens": usage.above_tier.cache_read,
-                    "cache_creation_5m_tokens": usage.above_tier.cache_write,
-                });
+            let mut above = Map::new();
+            for (index, slice) in usage.above_tiers.iter().enumerate() {
+                write_tier_slice(
+                    &mut above,
+                    index + 1,
+                    &TierSlice {
+                        input_tokens: slice.input,
+                        output_tokens: slice.output,
+                        reasoning_tokens: slice.reasoning,
+                        cache_read: slice.cache_read,
+                        cache_creation_5m: slice.cache_write,
+                        cache_creation_1h: 0,
+                    },
+                );
+            }
+            if !above.is_empty() {
+                value["above_tier"] = Value::Object(above);
             }
             conversation_usage.insert(model, value);
         }
@@ -621,6 +643,48 @@ mod tests {
 
     fn parse(path: &std::path::Path) -> ParsedAnalysis {
         parse_dsh_session(path, ParseMode::Full, None).expect("parse session")
+    }
+
+    #[test]
+    fn each_step_lands_in_the_price_level_its_own_context_reached() {
+        let sized_event = |seq: i64, step: i64, input: i64| {
+            json!({
+                "type": "assistant/message",
+                "seq": seq,
+                "time": 1000 + seq,
+                "data": {
+                    "turn": 1,
+                    "step": step,
+                    "message": {"source": {"kind": "model", "provider": "p", "model": "qwen3"}},
+                    "usage": {"inputTokens": input, "outputTokens": 100},
+                },
+            })
+            .to_string()
+        };
+        let dir = TempDir::new().unwrap();
+        let path = write_frames(
+            &dir,
+            "session.jsonl.zstd",
+            &[
+                vec![HEADER.to_string()],
+                vec![sized_event(1, 1, 10_000)],
+                vec![sized_event(2, 2, 60_000)],
+                vec![sized_event(3, 3, 500_000)],
+            ],
+        );
+
+        let tiers = crate::pricing::TierThresholds::from_entries(
+            [("qwen3", vec![31_999, 127_999, 255_999])].into_iter(),
+        );
+        let parsed =
+            parse_dsh_session(&path, ParseMode::UsageOnly, Some(&tiers)).expect("parse session");
+        let above = &parsed.analysis.records[0].conversation_usage["qwen3"]["above_tier"];
+
+        // The first step stays on the base level, and the other two must not
+        // pile into one slice: they belong to different price rows.
+        assert_eq!(above["level_1_input_tokens"], 60_000);
+        assert_eq!(above["level_3_input_tokens"], 500_000);
+        assert!(above.get("level_2_input_tokens").is_none());
     }
 
     #[test]

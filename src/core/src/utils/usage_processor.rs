@@ -3,6 +3,8 @@
 //! along the way.
 
 use crate::constants::FastHashMap;
+use crate::utils::TierSlice;
+use crate::utils::token_merge::write_tier_slice;
 use serde_json::Value;
 
 /// Adds the named `i64` fields from `source` into `target`, in place.
@@ -89,40 +91,25 @@ pub fn accumulate_nested_object(
     }
 }
 
-/// Normalized above-threshold slice of one request's tokens.
+/// Accumulates one classified request's tokens into `existing_obj`'s
+/// `above_tier` object under its price level.
 ///
-/// Accumulated into the per-model `above_tier` object that
-/// `extract_token_counts` reads back into `TokenCounts::above_*`, so
-/// `calculate_cost` can bill this slice at the model's context-tier rate.
-/// The buckets use the extractor's disjoint semantics (input excludes cache
-/// reads, output excludes reasoning).
-#[derive(Debug, Clone, Copy, Default)]
-struct AboveTierSlice {
-    input: i64,
-    output: i64,
-    reasoning: i64,
-    cache_read: i64,
-    cache_creation_5m: i64,
-    cache_creation_1h: i64,
-}
-
-impl AboveTierSlice {
-    fn accumulate_into(self, existing_obj: &mut serde_json::Map<String, Value>) {
-        let mut slice = serde_json::Map::with_capacity(6);
-        let mut push = |key: &str, value: i64| {
-            if value != 0 {
-                slice.insert(key.to_string(), value.into());
-            }
-        };
-        push("input_tokens", self.input);
-        push("output_tokens", self.output);
-        push("reasoning_tokens", self.reasoning);
-        push("cache_read_tokens", self.cache_read);
-        push("cache_creation_5m_tokens", self.cache_creation_5m);
-        push("cache_creation_1h_tokens", self.cache_creation_1h);
-        if !slice.is_empty() {
-            accumulate_nested_object(existing_obj, "above_tier", &slice);
-        }
+/// `extract_token_counts` reads that object back into
+/// `TokenCounts::above_tiers`, so `calculate_cost` can bill each level's slice
+/// at that level's rates. A `level` of 0 is the model's base level and leaves
+/// nothing behind.
+fn accumulate_tier_slice(
+    existing_obj: &mut serde_json::Map<String, Value>,
+    level: usize,
+    slice: &TierSlice,
+) {
+    if level == 0 {
+        return;
+    }
+    let mut keyed = serde_json::Map::with_capacity(6);
+    write_tier_slice(&mut keyed, level, slice);
+    if !keyed.is_empty() {
+        accumulate_nested_object(existing_obj, "above_tier", &keyed);
     }
 }
 
@@ -148,14 +135,14 @@ pub fn claude_request_context(usage_obj: &serde_json::Map<String, Value>) -> i64
 /// [`accumulate_nested_object`]. Records for synthetic models (whose name
 /// contains `<synthetic>`) and non-object `usage` payloads are ignored.
 ///
-/// `above_tier` marks this record (one request) as classified above the
-/// model's context-tier threshold: its buckets are additionally accumulated
-/// into the `above_tier` slice that prices at the tier rate.
+/// `tier_level` is the price level this record (one request) classified into:
+/// its buckets are additionally accumulated into that level's `above_tier`
+/// slice, which prices at that level's rates. `0` is the model's base level.
 pub fn process_claude_usage(
     conversation_usage: &mut FastHashMap<String, Value>,
     model: &str,
     usage: &Value,
-    above_tier: bool,
+    tier_level: usize,
 ) {
     if model.contains("<synthetic>") {
         return;
@@ -208,13 +195,13 @@ pub fn process_claude_usage(
         accumulate_nested_object(existing_obj, "server_tool_use", server_tool_use);
     }
 
-    if above_tier {
+    if tier_level > 0 {
         let field = |key: &str| usage_obj.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
         let scalar_cc = field("cache_creation_input_tokens");
         // Mirror `extract_token_counts`: the total is the larger of the scalar
         // and the split sum, the 1h portion comes from the split, and the
         // remainder bills at 5m so no cache-creation token is dropped from the
-        // above-tier slice either.
+        // classified slice either.
         let cc_1h = usage_obj
             .get("cache_creation")
             .and_then(|v| v.as_object())
@@ -228,15 +215,18 @@ pub fn process_claude_usage(
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
         let total_cc = scalar_cc.max(ephemeral_5m + cc_1h);
-        AboveTierSlice {
-            input: field("input_tokens"),
-            output: field("output_tokens"),
-            reasoning: 0,
-            cache_read: field("cache_read_input_tokens"),
-            cache_creation_5m: total_cc - cc_1h,
-            cache_creation_1h: cc_1h,
-        }
-        .accumulate_into(existing_obj);
+        accumulate_tier_slice(
+            existing_obj,
+            tier_level,
+            &TierSlice {
+                input_tokens: field("input_tokens"),
+                output_tokens: field("output_tokens"),
+                reasoning_tokens: 0,
+                cache_read: field("cache_read_input_tokens"),
+                cache_creation_5m: total_cc - cc_1h,
+                cache_creation_1h: cc_1h,
+            },
+        );
     }
 }
 
@@ -346,15 +336,16 @@ impl CodexTokenTotals {
 /// `model_context_window` are replaced with the latest values. Synthetic
 /// models and non-object `info` payloads are ignored.
 ///
-/// `above_tier` marks this turn as classified above the model's context-tier
-/// threshold: the delta is additionally accumulated (in the extractor's
-/// disjoint form) into the `above_tier` slice that prices at the tier rate.
+/// `tier_level` is the price level this turn classified into: the delta is
+/// additionally accumulated (in the extractor's disjoint form) into that
+/// level's `above_tier` slice, which prices at that level's rates. `0` is the
+/// model's base level.
 pub fn process_codex_usage(
     conversation_usage: &mut FastHashMap<String, Value>,
     model: &str,
     delta: &serde_json::Map<String, Value>,
     info: &Value,
-    above_tier: bool,
+    tier_level: usize,
 ) {
     if model.contains("<synthetic>") {
         return;
@@ -381,19 +372,22 @@ pub fn process_codex_usage(
 
     accumulate_nested_object(existing_obj, "total_token_usage", delta);
 
-    if above_tier {
+    if tier_level > 0 {
         let field = |key: &str| delta.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
         let cached = field("cached_input_tokens");
         let reasoning = field("reasoning_output_tokens");
-        AboveTierSlice {
-            input: (field("input_tokens") - cached).max(0),
-            output: (field("output_tokens") - reasoning).max(0),
-            reasoning,
-            cache_read: cached,
-            cache_creation_5m: 0,
-            cache_creation_1h: 0,
-        }
-        .accumulate_into(existing_obj);
+        accumulate_tier_slice(
+            existing_obj,
+            tier_level,
+            &TierSlice {
+                input_tokens: (field("input_tokens") - cached).max(0),
+                output_tokens: (field("output_tokens") - reasoning).max(0),
+                reasoning_tokens: reasoning,
+                cache_read: cached,
+                cache_creation_5m: 0,
+                cache_creation_1h: 0,
+            },
+        );
     }
 
     if let Some(last_usage) = info_obj.get("last_token_usage") {
@@ -414,14 +408,14 @@ pub fn process_codex_usage(
 /// cache reads are disjoint. The subtraction is clamped at `0` to stay
 /// defensive against a misreport where `cached > input`.
 ///
-/// `above_tier` marks this message (one request) as classified above the
-/// model's context-tier threshold: its buckets are additionally accumulated
-/// into the `above_tier` slice that prices at the tier rate.
+/// `tier_level` is the price level this message (one request) classified into:
+/// its buckets are additionally accumulated into that level's `above_tier`
+/// slice, which prices at that level's rates. `0` is the model's base level.
 pub fn process_gemini_usage(
     conversation_usage: &mut FastHashMap<String, Value>,
     model: &str,
     tokens: &crate::models::GeminiTokens,
-    above_tier: bool,
+    tier_level: usize,
 ) {
     let existing = conversation_usage
         .entry(model.to_string())
@@ -501,16 +495,19 @@ pub fn process_gemini_usage(
         (current_total + tokens.total).into(),
     );
 
-    if above_tier {
-        AboveTierSlice {
-            input: input_non_cached,
-            output: tokens.output,
-            reasoning: tokens.thoughts,
-            cache_read: tokens.cached,
-            cache_creation_5m: 0,
-            cache_creation_1h: 0,
-        }
-        .accumulate_into(existing_obj);
+    if tier_level > 0 {
+        accumulate_tier_slice(
+            existing_obj,
+            tier_level,
+            &TierSlice {
+                input_tokens: input_non_cached,
+                output_tokens: tokens.output,
+                reasoning_tokens: tokens.thoughts,
+                cache_read: tokens.cached,
+                cache_creation_5m: 0,
+                cache_creation_1h: 0,
+            },
+        );
     }
 }
 
@@ -613,7 +610,7 @@ mod tests {
             "cache_creation_input_tokens": 25
         });
 
-        process_claude_usage(&mut conversation_usage, model, &usage, false);
+        process_claude_usage(&mut conversation_usage, model, &usage, 0);
 
         let result = conversation_usage.get(model).unwrap();
         assert_eq!(result["input_tokens"].as_i64().unwrap(), 100);
@@ -631,13 +628,13 @@ mod tests {
             "input_tokens": 100,
             "output_tokens": 50
         });
-        process_claude_usage(&mut conversation_usage, model, &usage1, false);
+        process_claude_usage(&mut conversation_usage, model, &usage1, 0);
 
         let usage2 = json!({
             "input_tokens": 75,
             "output_tokens": 25
         });
-        process_claude_usage(&mut conversation_usage, model, &usage2, false);
+        process_claude_usage(&mut conversation_usage, model, &usage2, 0);
 
         let result = conversation_usage.get(model).unwrap();
         assert_eq!(result["input_tokens"].as_i64().unwrap(), 175);
@@ -656,7 +653,7 @@ mod tests {
                 "input_tokens": 10,
                 "server_tool_use": { "web_search_requests": 2, "web_fetch_requests": 1 }
             }),
-            false,
+            0,
         );
         process_claude_usage(
             &mut conversation_usage,
@@ -665,7 +662,7 @@ mod tests {
                 "input_tokens": 5,
                 "server_tool_use": { "web_search_requests": 3, "web_fetch_requests": 0 }
             }),
-            false,
+            0,
         );
 
         let stu = conversation_usage.get(model).unwrap()["server_tool_use"]
@@ -684,7 +681,7 @@ mod tests {
             "output_tokens": 50
         });
 
-        process_claude_usage(&mut conversation_usage, model, &usage, false);
+        process_claude_usage(&mut conversation_usage, model, &usage, 0);
 
         assert!(conversation_usage.is_empty());
     }
@@ -704,7 +701,7 @@ mod tests {
         let total = info["total_token_usage"].as_object().unwrap();
         let delta = CodexTokenTotals::delta_fields(total, None);
 
-        process_codex_usage(&mut conversation_usage, model, &delta, &info, false);
+        process_codex_usage(&mut conversation_usage, model, &delta, &info, 0);
 
         let result = conversation_usage.get(model).unwrap();
         let total_usage = result["total_token_usage"].as_object().unwrap();
@@ -732,13 +729,7 @@ mod tests {
         });
         let first_total = first["total_token_usage"].as_object().unwrap();
         let delta = CodexTokenTotals::delta_fields(first_total, None);
-        process_codex_usage(
-            &mut conversation_usage,
-            "gpt-5.6-luna",
-            &delta,
-            &first,
-            false,
-        );
+        process_codex_usage(&mut conversation_usage, "gpt-5.6-luna", &delta, &first, 0);
         let prev = CodexTokenTotals::from_total_object(first_total, None);
 
         let second = json!({
@@ -752,13 +743,7 @@ mod tests {
         });
         let second_total = second["total_token_usage"].as_object().unwrap();
         let delta = CodexTokenTotals::delta_fields(second_total, Some(&prev));
-        process_codex_usage(
-            &mut conversation_usage,
-            "gpt-5.6-sol",
-            &delta,
-            &second,
-            false,
-        );
+        process_codex_usage(&mut conversation_usage, "gpt-5.6-sol", &delta, &second, 0);
 
         let luna = conversation_usage["gpt-5.6-luna"]["total_token_usage"]
             .as_object()
@@ -866,7 +851,7 @@ mod tests {
             total: 360,
         };
 
-        process_gemini_usage(&mut conversation_usage, model, &tokens, false);
+        process_gemini_usage(&mut conversation_usage, model, &tokens, 0);
 
         let result = conversation_usage.get(model).unwrap();
         assert_eq!(
@@ -895,7 +880,7 @@ mod tests {
             total: 14_397,
         };
 
-        process_gemini_usage(&mut conversation_usage, model, &tokens, false);
+        process_gemini_usage(&mut conversation_usage, model, &tokens, 0);
 
         let result = conversation_usage.get(model).unwrap();
         assert_eq!(result["input_tokens"].as_i64().unwrap(), 13_906);

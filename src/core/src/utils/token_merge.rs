@@ -6,7 +6,7 @@
 //! other.
 
 use crate::utils::{
-    TokenCounts, accumulate_i64_fields, accumulate_nested_object, extract_token_counts,
+    TierSlice, TokenCounts, accumulate_i64_fields, accumulate_nested_object, extract_token_counts,
 };
 use serde_json::{Value, json};
 
@@ -89,6 +89,17 @@ pub(crate) fn merge_usage_values(existing: &mut Value, new: &Value) {
 
 /// Sums two normalized [`TokenCounts`] field by field.
 fn add_token_counts(a: &TokenCounts, b: &TokenCounts) -> TokenCounts {
+    // Tier slices line up by index because the index *is* the price level; the
+    // longer side's extra levels carry over untouched.
+    let mut above_tiers = a.above_tiers.clone();
+    above_tiers.resize(
+        above_tiers.len().max(b.above_tiers.len()),
+        TierSlice::default(),
+    );
+    for (slice, other) in above_tiers.iter_mut().zip(&b.above_tiers) {
+        slice.merge(other);
+    }
+
     TokenCounts {
         input_tokens: a.input_tokens + b.input_tokens,
         output_tokens: a.output_tokens + b.output_tokens,
@@ -100,12 +111,7 @@ fn add_token_counts(a: &TokenCounts, b: &TokenCounts) -> TokenCounts {
         web_search_requests: a.web_search_requests + b.web_search_requests,
         tool_tokens: a.tool_tokens + b.tool_tokens,
         total: a.total + b.total,
-        above_input: a.above_input + b.above_input,
-        above_output: a.above_output + b.above_output,
-        above_reasoning: a.above_reasoning + b.above_reasoning,
-        above_cache_read: a.above_cache_read + b.above_cache_read,
-        above_cache_creation_5m: a.above_cache_creation_5m + b.above_cache_creation_5m,
-        above_cache_creation_1h: a.above_cache_creation_1h + b.above_cache_creation_1h,
+        above_tiers,
     }
 }
 
@@ -118,21 +124,17 @@ fn add_token_counts(a: &TokenCounts, b: &TokenCounts) -> TokenCounts {
 /// their internal nested `total_token_usage` shape and consumers reading the
 /// flat keys would see `null` for all of that model's tokens.
 pub fn normalize_usage_value(usage: &Value) -> Value {
-    let counts = extract_token_counts(usage);
-    let mut value = token_counts_to_flat_value(&counts);
-    if let Some(obj) = value.as_object_mut() {
-        obj.insert("total_tokens".into(), json!(counts.total));
-    }
-    value
+    token_counts_to_flat_value(&extract_token_counts(usage))
 }
 
 /// Serializes normalized counts back into the flat usage shape.
 ///
 /// The key set is exactly what [`extract_token_counts`] reads for a flat value,
-/// so every bucket round-trips. `total` is intentionally omitted: the extractor
-/// recomputes it as the bucket sum, which matches only because no provider
-/// publishes a `total_tokens` larger than its own buckets sum to. One that did
-/// would lose the difference here, the way `tool_tokens` used to.
+/// so every quantity round-trips — `total` included, which is why it is written
+/// even where it equals the bucket sum. Deriving it back from the buckets
+/// instead would hold only while no provider publishes a `total_tokens` larger
+/// than its own buckets sum to, and one that did would lose the difference
+/// here, the way `tool_tokens` used to.
 fn token_counts_to_flat_value(c: &TokenCounts) -> Value {
     let mut obj = serde_json::Map::new();
     obj.insert("input_tokens".into(), json!(c.input_tokens));
@@ -165,26 +167,39 @@ fn token_counts_to_flat_value(c: &TokenCounts) -> Value {
     if c.tool_tokens != 0 {
         obj.insert("tool_tokens".into(), json!(c.tool_tokens));
     }
-    if c.above_input != 0
-        || c.above_output != 0
-        || c.above_reasoning != 0
-        || c.above_cache_read != 0
-        || c.above_cache_creation_5m != 0
-        || c.above_cache_creation_1h != 0
-    {
-        obj.insert(
-            "above_tier".into(),
-            json!({
-                "input_tokens": c.above_input,
-                "output_tokens": c.above_output,
-                "reasoning_tokens": c.above_reasoning,
-                "cache_read_tokens": c.above_cache_read,
-                "cache_creation_5m_tokens": c.above_cache_creation_5m,
-                "cache_creation_1h_tokens": c.above_cache_creation_1h,
-            }),
-        );
+    obj.insert("total_tokens".into(), json!(c.total));
+
+    let mut above = serde_json::Map::new();
+    for (index, slice) in c.above_tiers.iter().enumerate() {
+        write_tier_slice(&mut above, index + 1, slice);
+    }
+    if !above.is_empty() {
+        obj.insert("above_tier".into(), Value::Object(above));
     }
     Value::Object(obj)
+}
+
+/// Writes one price level's non-zero buckets as `level_<n>_<bucket>` keys.
+///
+/// Keeping the whole `above_tier` object a flat integer map is what lets it
+/// merge through `accumulate_nested_object` like `cache_creation` and
+/// `server_tool_use` do, whatever levels the two sides carry.
+pub(crate) fn write_tier_slice(
+    target: &mut serde_json::Map<String, Value>,
+    level: usize,
+    slice: &TierSlice,
+) {
+    let mut push = |bucket: &str, value: i64| {
+        if value != 0 {
+            target.insert(format!("level_{level}_{bucket}"), value.into());
+        }
+    };
+    push("input_tokens", slice.input_tokens);
+    push("output_tokens", slice.output_tokens);
+    push("reasoning_tokens", slice.reasoning_tokens);
+    push("cache_read_tokens", slice.cache_read);
+    push("cache_creation_5m_tokens", slice.cache_creation_5m);
+    push("cache_creation_1h_tokens", slice.cache_creation_1h);
 }
 
 #[cfg(test)]
@@ -217,6 +232,56 @@ mod tests {
         .map(|key| normalized[*key].as_i64().unwrap())
         .sum();
         assert_eq!(buckets, normalized["total_tokens"].as_i64().unwrap());
+    }
+
+    #[test]
+    fn mixed_shape_merge_keeps_a_total_its_buckets_fall_short_of() {
+        // The mixed branch replaces the row wholesale with the flat sum, so
+        // anything the flat shape has no key for is gone. No provider publishes
+        // a `total_tokens` larger than its own buckets sum to today, but
+        // nothing stops one, and deriving the total back from the buckets is
+        // what silently drops the difference — the way `tool_tokens` was lost.
+        let mut existing = json!({
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "total_tokens": 500
+        });
+        merge_usage_values(
+            &mut existing,
+            &json!({
+                "total_token_usage": {
+                    "input_tokens": 50,
+                    "output_tokens": 10,
+                    "total_tokens": 60
+                }
+            }),
+        );
+
+        assert_eq!(existing["input_tokens"], json!(150));
+        assert_eq!(existing["total_tokens"], json!(560));
+        assert_eq!(extract_token_counts(&existing).total, 560);
+    }
+
+    #[test]
+    fn mixed_shape_merge_keeps_each_tier_slice_on_its_own_level() {
+        // Two rows for one model classified into different price levels. The
+        // levels are positional, so folding one into the other's index would
+        // bill a level-2 request at level 1's cheaper prices.
+        let mut existing = json!({
+            "input_tokens": 300_000,
+            "above_tier": { "level_2_input_tokens": 300_000 }
+        });
+        merge_usage_values(
+            &mut existing,
+            &json!({
+                "total_token_usage": { "input_tokens": 40_000, "total_tokens": 40_000 },
+                "above_tier": { "level_1_input_tokens": 40_000 }
+            }),
+        );
+
+        let counts = extract_token_counts(&existing);
+        assert_eq!(counts.above_tiers[0].input_tokens, 40_000);
+        assert_eq!(counts.above_tiers[1].input_tokens, 300_000);
     }
 
     #[test]

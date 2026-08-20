@@ -17,9 +17,10 @@ use std::path::Path;
 /// tokens" model where the entire request switches to a higher rate once the
 /// prompt crosses a size threshold.
 ///
-/// Only the lowest tier is ever applied: the session parsers classify each
-/// request against `tiers[0].threshold_tokens` and `calculate_cost` bills the
-/// above-threshold slice at `tiers[0]`.
+/// The session parsers classify each request against every tier's
+/// `threshold_tokens` and `calculate_cost` bills the slice that cleared the
+/// `n`th of them at `tiers[n - 1]`. Every threshold-priced model LiteLLM
+/// publishes today carries exactly one tier.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct ThresholdTier {
     /// Total input context (in tokens) above which this tier's prices take over.
@@ -43,23 +44,24 @@ pub struct ThresholdTier {
 
 /// A single range for range-based tiered pricing (Qwen / doubao style).
 ///
-/// Rows are sorted ascending, and only the first two are ever selected: the
-/// session parsers classify each request against row 0's `max_tokens`, and
-/// `calculate_cost` bills the base slice at row 0 and the above-bound slice at
-/// row 1. A request bigger than row 1 covers therefore bills at row 1 — the
-/// same lower bound `ThresholdTier` takes for its own higher tiers, because
-/// one `above_*` bucket can only carry two levels.
+/// Rows are sorted ascending and every one of them is selectable: the session
+/// parsers classify each request against each row's `min_tokens`, and
+/// `calculate_cost` bills the slice that reached row `n` at that row, with the
+/// rest at row 0. A request past the top row's own range still bills there.
 ///
 /// Unlike `ThresholdTier`, a range replaces the input, output, reasoning and
 /// cache-read prices outright; only cache-write prices still come from the
 /// base level, which LiteLLM does not publish per range.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct TierRange {
-    /// Inclusive lower bound of the input-token range this row prices.
+    /// Inclusive lower bound of the input-token range this row prices, and the
+    /// per-request classification bound the parsers compare against (row 0's
+    /// excepted — nothing sits below it).
     pub min_tokens: i64,
-    /// Exclusive upper bound as published by LiteLLM. Row 0's is the
-    /// per-request classification bound the parsers compare against; the rest
-    /// are informational, since no row past 1 is ever selected.
+    /// Exclusive upper bound as published by LiteLLM. Informational: a request
+    /// past the top row's bound still bills there, and reading a row's bound
+    /// as the *next* row's lower one assumes a contiguity LiteLLM does not
+    /// promise.
     pub max_tokens: i64,
     /// Input price in USD per token within this range.
     #[serde(default)]
@@ -79,16 +81,14 @@ pub struct TierRange {
 ///
 /// Supports three strategies, checked in this order by `calculate_cost`:
 /// 1. **Range-based** (`ranges` is `Some`): the session parsers classify each
-///    request against `ranges[0].max_tokens` while folding, and
-///    `calculate_cost` bills that above-bound slice at `ranges[1]`'s prices
-///    with the rest staying on `ranges[0]`'s. Rows past the second are never
-///    selected. Used by the Qwen / doubao families.
+///    request against every row's `min_tokens` while folding, and
+///    `calculate_cost` bills each row's slice at that row's prices with the
+///    rest staying on `ranges[0]`'s. Used by the Qwen / doubao families.
 /// 2. **Threshold-based** (`tiers` is non-empty): the session parsers classify
-///    each request against the model's lowest `threshold_tokens` while folding,
-///    and `calculate_cost` bills that above-threshold slice at `tiers[0]`'s
-///    prices with the rest staying on base prices. Higher tiers are never
-///    selected. Used by Claude Sonnet 4.x, Gemini 2.5 Pro, Gemini 1.5 (128k),
-///    GPT-5.x (272k), etc.
+///    each request against every `threshold_tokens` while folding, and
+///    `calculate_cost` bills the slice that cleared the `n`th at `tiers[n - 1]`
+///    with the rest staying on base prices. Used by Claude Sonnet 4.x, Gemini
+///    2.5 Pro, Gemini 1.5 (128k), GPT-5.x (272k), etc.
 /// 3. **Flat** (neither set): base prices apply to every request.
 ///
 /// This struct is only ever held in memory — `tiers` / `ranges` are derived
@@ -316,10 +316,10 @@ pub fn parse_litellm_entry(value: &serde_json::Value) -> ModelPricing {
         })
         .collect();
 
-    // Range-based models: sort by min_tokens ascending so `ranges[0]` and
-    // `ranges[1]` really are the two lowest rows, which is what both the
-    // threshold snapshot and `calculate_cost` index them as (LiteLLM data is
-    // already sorted, but relying on that silently would be a trap).
+    // Range-based models: sort by min_tokens ascending so row `n` really is
+    // the `n`th cheapest, which is what both the boundary snapshot and
+    // `calculate_cost` index them as (LiteLLM data is already sorted, but
+    // relying on that silently would be a trap).
     if let Some(ranges) = pricing.ranges.as_mut() {
         ranges.sort_by_key(|r| r.min_tokens);
     }
