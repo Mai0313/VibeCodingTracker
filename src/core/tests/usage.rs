@@ -1313,6 +1313,82 @@ fn opencode_bills_a_large_request_at_the_tier_it_reached() {
     assert!((row.cost_usd - 0.801).abs() < 1e-9, "got {}", row.cost_usd);
 }
 
+#[test]
+fn an_analysis_scan_sharing_a_cache_keeps_the_usage_tier_slices() {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use vct_core::analysis::aggregator::aggregate_sessions_by_model_from_paths_with_cache;
+    use vct_core::pricing::{ModelPricing, ModelPricingMap, ThresholdTier};
+    use vct_core::usage::{UsageScanOptions, aggregate_usage_from_paths_with_cache_opts};
+
+    let home = TempHome::new();
+    home.put_claude_session(
+        "project",
+        "session.jsonl",
+        &fixture_str("sessions/claude_code.jsonl"),
+    );
+
+    // The fixture's per-request contexts straddle 20k, so a snapshot carrying
+    // that boundary classifies some of its requests and leaves the rest at base.
+    let mut prices = HashMap::new();
+    prices.insert(
+        "claude-sonnet-4-20250514".to_string(),
+        ModelPricing {
+            input_cost_per_token: 1e-6,
+            tiers: vec![ThresholdTier {
+                threshold_tokens: 20_000,
+                input_cost_per_token: 2e-6,
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+    let options = UsageScanOptions {
+        tiers: Some(Arc::new(ModelPricingMap::new(prices).tier_thresholds())),
+    };
+    let usage_scan = |cache: &mut SummaryScanCache| {
+        aggregate_usage_from_paths_with_cache_opts(
+            &home.paths,
+            TimeRange::All,
+            claude_only(),
+            cache,
+            &options,
+        )
+        .expect("aggregate claude usage")
+    };
+
+    // What an embedder holding one cache for both views gets. The second
+    // session is what makes the analysis scan miss the cache: it reparses that
+    // source with no snapshot, and whatever it leaves behind is what the next
+    // usage scan prices.
+    let mut shared = SummaryScanCache::new();
+    usage_scan(&mut shared);
+    home.put_claude_session(
+        "project",
+        "resumed.jsonl",
+        &fixture_str("sessions/claude_code.jsonl"),
+    );
+    aggregate_sessions_by_model_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        claude_only(),
+        &mut shared,
+    )
+    .expect("aggregate claude analysis");
+
+    let cold = usage_scan(&mut SummaryScanCache::new());
+    let classified = &cold.data.models["claude-sonnet-4-20250514"]["above_tier"];
+    assert!(
+        classified["level_1_cache_read_tokens"]
+            .as_i64()
+            .unwrap_or(0)
+            > 0,
+        "the snapshot classified nothing, so losing it would be undetectable here"
+    );
+
+    assert_usage_data_eq(&usage_scan(&mut shared).data, &cold.data);
+}
+
 /// Seeds two assistant messages on one exactly-priced tiered model, one either
 /// side of its context boundary.
 fn seed_opencode_tiered_db(path: &std::path::Path) {
