@@ -8,6 +8,8 @@
 //! frontends render.
 
 use crate::pricing::{ModelPricing, ModelPricingMap, calculate_cost};
+#[cfg(test)]
+use crate::utils::TierSlice;
 use crate::utils::TokenCounts;
 
 /// How a model's USD cost is resolved.
@@ -138,6 +140,29 @@ mod tests {
             CostSource::OpenCodeStored(99.0),
         );
         assert!((cost - 99.0).abs() < 1e-9);
+        assert!(matched.is_none());
+    }
+
+    #[test]
+    fn test_opencode_tier_slice_cannot_reach_the_stored_cost_branch() {
+        clear_pricing_cache();
+        let map = map_with_gpt4();
+        // The tier snapshot resolves a model by lowercase-or-normalized name
+        // while pricing demands an exact key, so a row can be classified and
+        // still fall back to the stored cost. The slice must be inert there,
+        // not a partial token price added to (or in place of) that number.
+        let mut counts = counts(1_000_000);
+        counts.above_tiers = vec![TierSlice {
+            input_tokens: 1_000_000,
+            ..Default::default()
+        }];
+        let (cost, matched) = resolve_model_cost(
+            "openai/gpt-4",
+            &counts,
+            &map,
+            CostSource::OpenCodeStored(99.0),
+        );
+        assert_eq!(cost, 99.0);
         assert!(matched.is_none());
     }
 

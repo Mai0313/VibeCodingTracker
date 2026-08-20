@@ -324,12 +324,16 @@ fn collect_per_model_rows(
         let output = (raw_output - reasoning).max(0);
         // Prefer the real billed cost; fall back to Hermes's own estimate.
         let cost = if actual > 0.0 { actual } else { estimated };
+        // A `session_model_usage` row is already aggregated over every request
+        // the session sent to that model, so no single request context exists
+        // to classify and the row bills at base rates.
         out.push(UsageContribution::single_model(
             date,
             (seconds * 1000.0) as i64,
             model.to_string(),
             session_usage_value(input, output, reasoning, cache_read, cache_write),
             cost,
+            0,
         ));
     }
     Ok(())
@@ -436,6 +440,7 @@ fn reconcile_session_residuals(
             model.to_string(),
             session_usage_value(input, output, reasoning, cache_read, cache_write),
             cost,
+            0,
         ));
     }
     Ok(())

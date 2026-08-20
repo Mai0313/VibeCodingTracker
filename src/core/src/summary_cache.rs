@@ -295,9 +295,12 @@ pub(crate) struct CompactSourceSummary {
     /// the diagnostics-aware collector stays identical to the public legacy
     /// aggregation API.
     pub(crate) usage: UsageResult,
-    /// Typed database usage. SQLite rows never need a per-row JSON object or
-    /// model map in the incremental path.
-    pub(crate) database_usage: FastHashMap<String, UsageTokenContribution>,
+    /// Typed database usage, keyed by model and the price level its rows
+    /// classified into. SQLite rows never need a per-row JSON object or model
+    /// map in the incremental path, and the level in the key is what keeps two
+    /// requests on one model at different levels in separate slices instead of
+    /// summing them into one.
+    pub(crate) database_usage: FastHashMap<(String, usize), UsageTokenContribution>,
     pub(crate) stored_costs: FastHashMap<String, f64>,
     pub(crate) usage_dates: HashSet<String>,
     pub(crate) analysis: FastHashMap<String, AggregatedAnalysisRow>,
@@ -322,11 +325,12 @@ impl CompactSourceSummary {
             model,
             tokens,
             stored_cost,
+            tier_level,
         } = contribution;
         let date_has_usage = stored_cost != 0.0 || tokens.has_activity();
         *self.stored_costs.entry(model.clone()).or_insert(0.0) += stored_cost;
         self.database_usage
-            .entry(model)
+            .entry((model, tier_level))
             .and_modify(|existing| existing.merge(tokens))
             .or_insert(tokens);
         if date_has_usage {
@@ -513,6 +517,46 @@ mod tests {
         let summary = CompactSourceSummary::from_file(analysis, "2026-07-14".to_string(), true);
         assert!(summary.analysis.is_empty());
         assert!(summary.analysis_dates.contains("2026-07-14"));
+    }
+
+    #[test]
+    fn one_model_at_two_levels_keeps_its_slices_apart() {
+        let tokens = |input: i64| UsageTokenContribution {
+            input_tokens: input,
+            ..Default::default()
+        };
+        let row = |input, level| {
+            UsageContribution::single_model(
+                "2026-07-14".to_string(),
+                0,
+                "model".to_string(),
+                tokens(input),
+                0.0,
+                level,
+            )
+        };
+
+        let mut summary = CompactSourceSummary::default();
+        summary.add_usage_contribution(row(300_000, 1));
+        summary.add_usage_contribution(row(400_000, 2));
+        summary.add_usage_contribution(row(1_000, 0));
+
+        // Summing the three into one bucket would lose which price level each
+        // request reached, which is the whole point of the level in the key.
+        assert_eq!(summary.database_usage.len(), 3);
+        // The same fold the usage accumulator runs over these rows.
+        let mut merged: Option<serde_json::Value> = None;
+        for ((_, level), tokens) in &summary.database_usage {
+            let usage = tokens.into_value(*level);
+            match merged.as_mut() {
+                Some(existing) => merge_usage_values(existing, &usage),
+                None => merged = Some(usage),
+            }
+        }
+        let counts = extract_token_counts(&merged.unwrap());
+        assert_eq!(counts.input_tokens, 701_000);
+        assert_eq!(counts.above_tiers[0].input_tokens, 300_000);
+        assert_eq!(counts.above_tiers[1].input_tokens, 400_000);
     }
 
     #[test]

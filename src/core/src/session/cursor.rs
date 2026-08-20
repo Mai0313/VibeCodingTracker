@@ -302,6 +302,9 @@ fn aggregate_events(events: &[UsageEvent], time_range: TimeRange) -> Vec<UsageCo
             // Cursor records no cost locally, so every row is priced by the
             // caller's exact LiteLLM match alone.
             0.0,
+            // The gauge is one conversation's running context, not one
+            // request's, so there is nothing to classify against a tier.
+            0,
         ));
     }
     out
