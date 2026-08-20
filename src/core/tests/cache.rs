@@ -72,8 +72,8 @@ fn test_file_cache_invalidation() {
     let cache = global_cache();
 
     // Parse and cache
-    let result1 = cache.get_or_parse(&test_file);
-    assert!(result1.is_ok());
+    let result1 = cache.get_or_parse(&test_file).unwrap();
+    assert_eq!(result1.records[0].task_id, "one");
 
     // Modify file (change modification time)
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -85,9 +85,10 @@ fn test_file_cache_invalidation() {
     .unwrap();
     drop(file);
 
-    // Should detect file change and re-parse
-    let result2 = cache.get_or_parse(&test_file);
-    assert!(result2.is_ok());
+    // The rewrite is the same length as the original, so only the timestamp
+    // half of the fingerprint can tell the two apart.
+    let result2 = cache.get_or_parse(&test_file).unwrap();
+    assert_eq!(result2.records[0].task_id, "two");
 }
 
 #[test]
@@ -160,7 +161,7 @@ fn test_dsh_cache_tracks_an_appended_frame() {
     let cache = FileParseCache::new();
 
     let initial = cache.get_or_parse(&session).unwrap();
-    assert_eq!(initial.records[0].tool_call_counts.read, 1);
+    let reads_before = initial.records[0].tool_call_counts.read;
 
     // The second read must be a hit, or the re-read below could report a new
     // count while never having been cached at all.
@@ -168,14 +169,15 @@ fn test_dsh_cache_tracks_an_appended_frame() {
     assert!(Arc::ptr_eq(&initial, &hit), "unchanged source should hit");
 
     // `dsh` appends one self-contained zstd frame per batch instead of
-    // rewriting the log, so this is how a live session grows on disk.
+    // rewriting the log, so this is how a live session grows on disk. The
+    // leading newline terminates the previous batch's last line rather than
+    // relying on it to have ended with one.
     let batch = [
-        r#"{"type":"turn/start","seq":24,"time":1786728869574,"data":{"turn":3}}"#,
-        r#"{"type":"tool/call","seq":25,"time":1786728870574,"data":{"turn":3,"step":1,"callId":"c8","name":"read","arguments":"{\"file_path\": \"src/appended.rs\"}"}}"#,
-        r#"{"type":"tool/result","seq":26,"time":1786728871574,"data":{"turn":3,"step":1,"message":{},"meta":{"path":"/repo/demo/src/appended.rs","offset":1,"lines":[{"number":1,"text":"fn appended() {}"}],"totalLines":1,"lang":"rust"}},"surfaceOp":"append","sourceEventSeqs":[25]}"#,
+        r#"{"type":"tool/call","seq":24,"time":1786728869574,"data":{"turn":3,"step":1,"callId":"c8","name":"read","arguments":"{\"file_path\": \"src/appended.rs\"}"}}"#,
+        r#"{"type":"tool/result","seq":25,"time":1786728870574,"data":{"turn":3,"step":1,"message":{},"meta":{"path":"/repo/demo/src/appended.rs","offset":1,"lines":[{"number":1,"text":"fn appended() {}"}],"totalLines":1,"lang":"rust"}},"surfaceOp":"append","sourceEventSeqs":[24]}"#,
     ]
     .join("\n");
-    let frame = zstd::encode_all(format!("{batch}\n").as_bytes(), 0).unwrap();
+    let frame = zstd::encode_all(format!("\n{batch}\n").as_bytes(), 0).unwrap();
     std::fs::OpenOptions::new()
         .append(true)
         .open(&session)
@@ -184,7 +186,10 @@ fn test_dsh_cache_tracks_an_appended_frame() {
         .unwrap();
 
     let after_append = cache.get_or_parse(&session).unwrap();
-    assert_eq!(after_append.records[0].tool_call_counts.read, 2);
+    assert_eq!(
+        after_append.records[0].tool_call_counts.read,
+        reads_before + 1
+    );
 }
 
 #[test]
