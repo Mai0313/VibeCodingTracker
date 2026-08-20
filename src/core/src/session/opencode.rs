@@ -26,6 +26,7 @@ use crate::VERSION;
 use crate::constants::FastHashMap;
 use crate::models::TimeRange;
 use crate::models::{CodeAnalysis, CodeAnalysisRecord, ExtensionType};
+use crate::pricing::{TierClassifier, TierThresholds};
 use crate::session::diagnostics::{
     DatabaseAnalysisRow, DatabaseUsageRead, UsageContribution, UsageTokenContribution,
 };
@@ -59,7 +60,7 @@ pub fn read_opencode_usage(
 ) -> Result<Vec<(String, CodeAnalysis, f64)>> {
     let user = get_current_user();
     let machine = get_machine_id().to_string();
-    let read = read_opencode_usage_contributions(db_path, time_range)?;
+    let read = read_opencode_usage_contributions(db_path, time_range, None)?;
     if read.expected_records > 0 && read.parsed_records == 0 {
         return Err(anyhow!(
             "none of {} OpenCode usage records used a recognized schema",
@@ -80,13 +81,18 @@ pub fn read_opencode_usage(
 }
 
 /// Reads compact OpenCode usage rows for the summary aggregation path.
+///
+/// `tiers` is the usage scan's context-tier snapshot; each assistant message is
+/// one billed request, so it is classified against its own prompt context.
+/// `None` classifies nothing and bills everything at base rates.
 pub(crate) fn read_opencode_usage_contributions(
     db_path: &Path,
     time_range: TimeRange,
+    tiers: Option<&TierThresholds>,
 ) -> Result<DatabaseUsageRead> {
     let cutoff_ms = cutoff_millis(time_range);
     with_readonly_connection(db_path, "session", "vct-opencode-", "OpenCode", |conn| {
-        collect_usage(conn, cutoff_ms)
+        collect_usage(conn, cutoff_ms, tiers)
     })
 }
 
@@ -265,9 +271,13 @@ fn count_analysis_candidates(conn: &Connection, cutoff_ms: Option<i64>) -> Resul
 }
 
 /// Collects the `usage` view from assistant messages when available.
-fn collect_usage(conn: &Connection, cutoff_ms: Option<i64>) -> Result<DatabaseUsageRead> {
+fn collect_usage(
+    conn: &Connection,
+    cutoff_ms: Option<i64>,
+    tiers: Option<&TierThresholds>,
+) -> Result<DatabaseUsageRead> {
     if table_exists(conn, "message")? {
-        return collect_message_usage(conn, cutoff_ms);
+        return collect_message_usage(conn, cutoff_ms, tiers);
     }
 
     collect_session_usage(conn, cutoff_ms)
@@ -312,12 +322,16 @@ fn collect_session_usage(conn: &Connection, cutoff_ms: Option<i64>) -> Result<Da
             continue;
         };
 
+        // A `session` row is the whole conversation's totals, not one request,
+        // so there is no context to compare against a tier boundary; it bills
+        // at base rates the same way every pre-`message` schema already did.
         out.push(UsageContribution::single_model(
             date,
             time_updated,
             model_id,
             session_usage_value(input, output, reasoning, cache_read, cache_write),
             cost,
+            0,
         ));
     }
 
@@ -330,7 +344,11 @@ fn collect_session_usage(conn: &Connection, cutoff_ms: Option<i64>) -> Result<Da
 }
 
 /// Collects the `usage` view from assistant messages.
-fn collect_message_usage(conn: &Connection, cutoff_ms: Option<i64>) -> Result<DatabaseUsageRead> {
+fn collect_message_usage(
+    conn: &Connection,
+    cutoff_ms: Option<i64>,
+    tiers: Option<&TierThresholds>,
+) -> Result<DatabaseUsageRead> {
     let sql = match cutoff_ms {
         Some(_) => format!(
             "SELECT {MESSAGE_TIMESTAMP_SQL}, message.data \
@@ -352,6 +370,7 @@ fn collect_message_usage(conn: &Connection, cutoff_ms: Option<i64>) -> Result<Da
         None => stmt.query([])?,
     };
 
+    let mut classifier = tiers.map(TierClassifier::new);
     let mut out = Vec::new();
     let mut expected_records = 0usize;
     while let Some(row) = rows.next()? {
@@ -365,12 +384,16 @@ fn collect_message_usage(conn: &Connection, cutoff_ms: Option<i64>) -> Result<Da
             continue;
         };
 
+        let tier_level = classifier.as_mut().map_or(0, |classifier| {
+            classifier.level(&message.model_id, request_context(&message.usage))
+        });
         out.push(UsageContribution::single_model(
             date,
             message_ts,
             message.model_id,
             message.usage,
             message.cost,
+            tier_level,
         ));
     }
 
@@ -443,8 +466,9 @@ fn collect_session_analysis(
                 continue;
             };
 
-            let usage =
-                session_usage_value(input, output, reasoning, cache_read, cache_write).into_value();
+            // Analysis is never priced, so it classifies nothing.
+            let usage = session_usage_value(input, output, reasoning, cache_read, cache_write)
+                .into_value(0);
             let mut state = SessionParseState::with_mode(mode);
             state.folder_path = directory;
             state.task_id = id.clone();
@@ -581,7 +605,9 @@ fn collect_message_analysis(
                 AnalysisAccum {
                     model_id: message.model_id,
                     date,
-                    usage: message.usage.into_value(),
+                    // The `analysis` view is never priced, so it classifies
+                    // nothing and its usage values stay free of `above_tier`.
+                    usage: message.usage.into_value(0),
                     state,
                 },
             );
@@ -895,6 +921,29 @@ fn extract_patch_strings(lines: &[String]) -> (String, String) {
 /// zero output; `test_read_usage_maps_tokens` and
 /// `test_legacy_session_usage_keeps_reasoning_disjoint` hold the two read
 /// paths to that.
+/// The full prompt context of one assistant message.
+///
+/// OpenCode stores its buckets disjointly (`total == input + output +
+/// reasoning + cache.read + cache.write` on real databases), so the prompt is
+/// everything that is not completion: fresh input plus both cache buckets.
+/// That sum is what the provider compares against a context-tier boundary, the
+/// same way [`claude_request_context`](crate::utils::claude_request_context)
+/// reads a Claude request.
+//
+// One message is one request only because OpenCode almost always finishes an
+// assistant turn in a single step: on a real 1287-message database 1236 of the
+// 1237 messages carrying step parts have exactly one `step-start`, and the lone
+// two-step message recorded usage for only one of them, so no message there
+// actually sums two billed requests. A message that did would be classified
+// against the sum of its steps' contexts and could land a level high. Per-step
+// figures exist (`part` rows of type `step-finish` carry their own `tokens`),
+// but reading them would pull the whole `part` table onto the usage path, which
+// is the cost this reader exists to avoid, and 68 messages carry no
+// `step-finish` part at all to read.
+fn request_context(tokens: &UsageTokenContribution) -> i64 {
+    tokens.input_tokens + tokens.cache_read_tokens + tokens.cache_creation_tokens
+}
+
 fn session_usage_value(
     input: i64,
     output: i64,
@@ -1480,6 +1529,118 @@ mod tests {
         // here would floor this at zero.
         assert_eq!(usage["output_tokens"], 21);
         assert_eq!(usage["reasoning_output_tokens"], 26);
+    }
+
+    fn tier_snapshot() -> TierThresholds {
+        TierThresholds::from_entries([("azure/gpt-5.5", vec![272_000])].into_iter())
+    }
+
+    /// Seeds two assistant messages on one tiered model, straddling its
+    /// boundary, and returns the compact rows a usage scan would collect.
+    fn straddling_tier_rows(tiers: Option<&TierThresholds>) -> Vec<UsageContribution> {
+        let (_dir, db_path) = make_db();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO session (id, directory, time_updated) VALUES ('s1', '/repo', 1780757089000)",
+            [],
+        )
+        .unwrap();
+        for (id, input, cache_read) in [("m-big", 200_000, 80_000), ("m-small", 1_000, 0)] {
+            conn.execute(
+                "INSERT INTO message (id, session_id, data) VALUES (?1, 's1', ?2)",
+                rusqlite::params![
+                    id,
+                    assistant_message_with_provider(
+                        "gpt-5.5",
+                        Some("azure"),
+                        input,
+                        100,
+                        10,
+                        cache_read,
+                        0,
+                        0.5,
+                    )
+                ],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        read_opencode_usage_contributions(&db_path, TimeRange::All, tiers)
+            .unwrap()
+            .rows
+    }
+
+    #[test]
+    fn request_context_counts_the_whole_prompt() {
+        // Everything that is not completion: OpenCode's buckets are disjoint,
+        // so leaving either cache bucket out under-reports the context the
+        // provider actually billed the request against.
+        let tokens = session_usage_value(200_000, 100, 10, 80_000, 5_000);
+        assert_eq!(request_context(&tokens), 285_000);
+    }
+
+    #[test]
+    fn a_request_above_the_boundary_is_billed_at_its_level() {
+        let tiers = tier_snapshot();
+        let rows = straddling_tier_rows(Some(&tiers));
+        assert_eq!(rows.len(), 2);
+
+        let big = rows.iter().find(|row| row.tokens.input_tokens == 200_000);
+        let small = rows.iter().find(|row| row.tokens.input_tokens == 1_000);
+        // 200k input plus 80k cache reads clears 272k; 1k on its own does not.
+        assert_eq!(big.map(|row| row.tier_level), Some(1));
+        assert_eq!(small.map(|row| row.tier_level), Some(0));
+
+        let above = big.unwrap().tokens.into_value(1);
+        assert_eq!(above["above_tier"]["level_1_input_tokens"], 200_000);
+        assert_eq!(above["above_tier"]["level_1_cache_read_tokens"], 80_000);
+        assert_eq!(above["above_tier"]["level_1_output_tokens"], 100);
+        assert_eq!(above["above_tier"]["level_1_reasoning_tokens"], 10);
+        // The slice is a subset of the totals, never tokens on top of them.
+        assert_eq!(above["input_tokens"], 200_000);
+        assert!(
+            small
+                .unwrap()
+                .tokens
+                .into_value(0)
+                .get("above_tier")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn no_thresholds_classifies_nothing() {
+        // An offline scan has no pricing to derive boundaries from, so every
+        // request bills at base rates rather than being guessed at.
+        let rows = straddling_tier_rows(None);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.tier_level == 0));
+    }
+
+    #[test]
+    fn legacy_session_rows_are_never_classified() {
+        let (_dir, db_path) = make_db();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute("DROP TABLE message", []).unwrap();
+        conn.execute("DROP TABLE part", []).unwrap();
+        conn.execute(
+	            "INSERT INTO session (id, model, directory, time_updated, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write)
+	             VALUES ('s1', '{\"id\":\"gpt-5.5\",\"providerID\":\"azure\"}', '/repo', 1780757088080, 0.02, 400000, 21, 26, 0, 0)",
+	            [],
+	        )
+	        .unwrap();
+        drop(conn);
+
+        let tiers = tier_snapshot();
+        let rows = read_opencode_usage_contributions(&db_path, TimeRange::All, Some(&tiers))
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), 1);
+        // The column is the whole conversation's total, not one request's
+        // context, so it must not be compared against a per-request boundary
+        // however far above it the sum happens to land.
+        assert_eq!(rows[0].tier_level, 0);
     }
 
     #[test]

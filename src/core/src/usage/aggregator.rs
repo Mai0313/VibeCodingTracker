@@ -502,7 +502,7 @@ fn aggregate_usage_from_paths_with_cache_inner(
             &mut seen,
             &mut accumulator,
             &mut diagnostics,
-            || read_opencode_usage_contributions(&paths.opencode_db, time_range),
+            || read_opencode_usage_contributions(&paths.opencode_db, time_range, tiers),
         );
     }
     if providers.cursor && paths.cursor_chats_dir.exists() {
@@ -796,8 +796,8 @@ impl UsageAccumulator {
                 }
             }
         }
-        for (model, tokens) in &summary.database_usage {
-            let usage = tokens.into_value();
+        for ((model, tier_level), tokens) in &summary.database_usage {
+            let usage = tokens.into_value(*tier_level);
             match provider_result.get_mut(model) {
                 Some(existing) => merge_usage_values(existing, &usage),
                 None => {

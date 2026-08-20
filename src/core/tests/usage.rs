@@ -1251,3 +1251,98 @@ fn an_unreadable_codex_root_does_not_sink_the_other_one() {
     assert_eq!(partial.diagnostics.failures[0].source, *archived);
     assert!(!partial.data.per_provider.codex.is_empty());
 }
+
+#[test]
+fn opencode_bills_a_large_request_at_the_tier_it_reached() {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use vct_core::pricing::{ModelPricing, ModelPricingMap, ThresholdTier, clear_pricing_cache};
+    use vct_core::usage::{UsageScanOptions, aggregate_usage_from_paths_with_cache_opts};
+
+    clear_pricing_cache();
+    let home = TempHome::new();
+    // Two requests on one tiered model straddling its 272k boundary: 200k
+    // input plus 80k cache reads clears it, 1k on its own does not.
+    seed_opencode_tiered_db(&home.paths.opencode_db);
+
+    let mut prices = HashMap::new();
+    prices.insert(
+        "azure/gpt-5.5".to_string(),
+        ModelPricing {
+            input_cost_per_token: 1e-6,
+            tiers: vec![ThresholdTier {
+                threshold_tokens: 272_000,
+                input_cost_per_token: 4e-6,
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+    let pricing = ModelPricingMap::new(prices);
+    let options = UsageScanOptions {
+        tiers: Some(Arc::new(pricing.tier_thresholds())),
+    };
+
+    let mut cache = SummaryScanCache::new();
+    let collected = aggregate_usage_from_paths_with_cache_opts(
+        &home.paths,
+        TimeRange::All,
+        opencode_only(),
+        &mut cache,
+        &options,
+    )
+    .expect("aggregate opencode");
+
+    let raw = collected
+        .data
+        .models
+        .get("azure/gpt-5.5")
+        .expect("the seeded model");
+    assert_eq!(raw["above_tier"]["level_1_input_tokens"], 200_000);
+    assert_eq!(raw["above_tier"]["level_1_cache_read_tokens"], 80_000);
+    assert_eq!(raw["input_tokens"], 201_000);
+
+    let rows = vct_core::usage::price_usage_data(&collected.data, &pricing);
+    let row = rows
+        .iter()
+        .find(|row| row.model == "azure/gpt-5.5")
+        .expect("a priced row for the seeded model");
+    // The big request's 200k input bills at the tier rate and only the small
+    // one's 1k stays at base. Billing the pair as one aggregate would report
+    // $0.201; classifying nothing at all would report the same.
+    assert!((row.cost_usd - 0.801).abs() < 1e-9, "got {}", row.cost_usd);
+}
+
+/// Seeds two assistant messages on one exactly-priced tiered model, one either
+/// side of its context boundary.
+fn seed_opencode_tiered_db(path: &std::path::Path) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let connection = Connection::open(path).unwrap();
+    connection
+        .execute_batch(
+            r#"CREATE TABLE session (
+                   id TEXT PRIMARY KEY,
+                   directory TEXT NOT NULL,
+                   time_updated INTEGER NOT NULL
+               );
+               CREATE TABLE message (
+                   id TEXT PRIMARY KEY,
+                   session_id TEXT NOT NULL,
+                   data TEXT NOT NULL
+               );
+               INSERT INTO session (id, directory, time_updated)
+               VALUES ('tiered-session', '/repo', 1780757089000);
+               INSERT INTO message (id, session_id, data) VALUES
+               (
+                   'big',
+                   'tiered-session',
+                   '{"role":"assistant","providerID":"azure","modelID":"gpt-5.5","cost":0.5,"tokens":{"input":200000,"output":100,"reasoning":10,"cache":{"read":80000,"write":0}},"time":{"created":1780757088000,"completed":1780757089000}}'
+               ),
+               (
+                   'small',
+                   'tiered-session',
+                   '{"role":"assistant","providerID":"azure","modelID":"gpt-5.5","cost":0.5,"tokens":{"input":1000,"output":100,"reasoning":10,"cache":{"read":0,"write":0}},"time":{"created":1780757088000,"completed":1780757089000}}'
+               );"#,
+        )
+        .unwrap();
+}
