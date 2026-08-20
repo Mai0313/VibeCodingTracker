@@ -72,6 +72,9 @@ function Install-Binary {
 
     $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid())
     New-Item -ItemType Directory -Path $tempDir | Out-Null
+    # Set before the try so the finally can always test it; Remove-Item rejects a null LiteralPath
+    # at parameter binding, which -ErrorAction does not suppress.
+    $stageDir = $null
 
     try {
         $archive = Join-Path $tempDir $filename
@@ -88,13 +91,19 @@ function Install-Binary {
             New-Item -ItemType Directory -Path $installDir | Out-Null
         }
 
+        # Staged beside the targets so each move into place is a same-volume rename, and inside one
+        # directory of its own so a single Remove-Item in the finally reaps whatever a failed run
+        # staged.
+        $stageDir = Join-Path $installDir ".$BinaryName.$PID.staging"
+        New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+
         $target = Join-Path $installDir "$BinaryName.exe"
-        $stagedTarget = Join-Path $installDir ".$BinaryName.$PID.new"
+        $stagedTarget = Join-Path $stageDir "$BinaryName.exe"
         Copy-Item -Path $binary.FullName -Destination $stagedTarget -Force
         Move-Item -LiteralPath $stagedTarget -Destination $target -Force
 
         $wrapper = Join-Path $installDir "vct.cmd"
-        $stagedWrapper = Join-Path $installDir ".vct.$PID.cmd"
+        $stagedWrapper = Join-Path $stageDir "vct.cmd"
         [System.IO.File]::WriteAllText(
             $stagedWrapper,
             "@echo off`r`n`"%~dp0$BinaryName.exe`" %*`r`n",
@@ -107,7 +116,7 @@ function Install-Binary {
         }
 
         $markerPath = [System.IO.Path]::GetFullPath($target) + ".vct-managed"
-        $stagedMarker = "$markerPath.$PID.new"
+        $stagedMarker = Join-Path $stageDir "$BinaryName.exe.vct-managed"
         [System.IO.File]::WriteAllBytes(
             $stagedMarker,
             [System.Text.Encoding]::ASCII.GetBytes("vct-release-installer-v1`n")
@@ -125,6 +134,9 @@ function Install-Binary {
     }
     finally {
         Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+        if ($stageDir) {
+            Remove-Item -LiteralPath $stageDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
