@@ -71,28 +71,27 @@ Unsure where to begin contributing? You can start by looking through `good first
 
 #### Project Layout
 
+The repository is a Cargo workspace: all the Rust code lives in the four members under `src/`, and everything around them is packaging, docs, tooling and test data.
+
 ```
 .
-├── benches/          # Criterion benchmarks (pricing, parsing, aggregation)
+├── assets/           # Repository images (social preview)
 ├── cli/              # npm and PyPI wrapper packages (nodejs/, python/)
 ├── docker/           # Multi-stage Dockerfile (Rust builder → Ubuntu prod stage)
 ├── docs/             # Reference docs (raw quota + token-refresh curl/jq recipes)
-├── src/
-│   ├── analysis/     # Collect canonical AnalysisDataset records and project per-model summaries
-│   ├── cache/        # Library-facing LRU file-parse compatibility API
-│   ├── cli.rs        # clap definitions (commands, flags, TimeRange enum)
-│   ├── constants.rs  # Capacity / buffer-size tuning constants + FastHashMap alias
-│   ├── display/      # TUI dashboards, static tables, plain-text renderers (usage rows sorted by cost ascending)
-│   ├── models/       # Typed structs (CodeAnalysis, Provider, ExtensionType, per-provider log shapes)
-│   ├── pricing/      # LiteLLM fetch, daily on-disk cache, fuzzy model matching, cost calculation
-│   ├── session/      # Per-provider parsers, SQLite readers, detector, and ParseMode
-│   ├── summary_cache.rs # Compact process-local cache for incremental CLI summary scans
-│   ├── update/       # Self-update via GitHub releases (archive extraction)
-│   ├── usage/        # Roll up parsed CodeAnalysis records into per-model token totals + per-provider days
-│   └── utils/        # Path resolution, directory walking, allocator tuning, time helpers
-└── tests/            # Integration test suite (one binary per file; unit tests live inline in src/)
+├── scripts/          # install.sh / install.ps1, plus test.sh to regenerate the JSONL goldens
+├── src/              # The four workspace members
+│   ├── core/         # vct-core: parsing, aggregation, pricing, quota, config, self-update — no terminal deps
+│   ├── tui/          # vct-tui: TUI dashboards, static tables, plain-text renderers, Criterion benchmarks
+│   ├── cli/          # vct-cli: the vibe_coding_tracker binary — clap definitions and command dispatch
+│   └── test-support/ # vct-test-support: dev-only TempHome / fixture helpers (unpublished)
+└── tests/
     └── fixtures/     # Session inputs + golden outputs (sessions/), quota API responses (quota/)
 ```
+
+Crates depend one way only — `vct-core` → `vct-tui` → `vct-cli` — so core never reaches into display or CLI code, and a future GUI can hang off core alone. Unit tests live inline in each crate's `src/`, integration tests under the owning crate's `tests/` directory; the root `tests/` holds fixtures only.
+
+For the module-by-module breakdown inside each crate, see the **Architecture** section of [`CLAUDE.md`](../CLAUDE.md).
 
 #### Building from Source
 
