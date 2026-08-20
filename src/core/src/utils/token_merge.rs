@@ -124,21 +124,17 @@ fn add_token_counts(a: &TokenCounts, b: &TokenCounts) -> TokenCounts {
 /// their internal nested `total_token_usage` shape and consumers reading the
 /// flat keys would see `null` for all of that model's tokens.
 pub fn normalize_usage_value(usage: &Value) -> Value {
-    let counts = extract_token_counts(usage);
-    let mut value = token_counts_to_flat_value(&counts);
-    if let Some(obj) = value.as_object_mut() {
-        obj.insert("total_tokens".into(), json!(counts.total));
-    }
-    value
+    token_counts_to_flat_value(&extract_token_counts(usage))
 }
 
 /// Serializes normalized counts back into the flat usage shape.
 ///
 /// The key set is exactly what [`extract_token_counts`] reads for a flat value,
-/// so every bucket round-trips. `total` is intentionally omitted: the extractor
-/// recomputes it as the bucket sum, which matches only because no provider
-/// publishes a `total_tokens` larger than its own buckets sum to. One that did
-/// would lose the difference here, the way `tool_tokens` used to.
+/// so every quantity round-trips — `total` included, which is why it is written
+/// even where it equals the bucket sum. Deriving it back from the buckets
+/// instead would hold only while no provider publishes a `total_tokens` larger
+/// than its own buckets sum to, and one that did would lose the difference
+/// here, the way `tool_tokens` used to.
 fn token_counts_to_flat_value(c: &TokenCounts) -> Value {
     let mut obj = serde_json::Map::new();
     obj.insert("input_tokens".into(), json!(c.input_tokens));
@@ -171,6 +167,8 @@ fn token_counts_to_flat_value(c: &TokenCounts) -> Value {
     if c.tool_tokens != 0 {
         obj.insert("tool_tokens".into(), json!(c.tool_tokens));
     }
+    obj.insert("total_tokens".into(), json!(c.total));
+
     let mut above = serde_json::Map::new();
     for (index, slice) in c.above_tiers.iter().enumerate() {
         write_tier_slice(&mut above, index + 1, slice);
@@ -234,6 +232,34 @@ mod tests {
         .map(|key| normalized[*key].as_i64().unwrap())
         .sum();
         assert_eq!(buckets, normalized["total_tokens"].as_i64().unwrap());
+    }
+
+    #[test]
+    fn mixed_shape_merge_keeps_a_total_its_buckets_fall_short_of() {
+        // The mixed branch replaces the row wholesale with the flat sum, so
+        // anything the flat shape has no key for is gone. No provider publishes
+        // a `total_tokens` larger than its own buckets sum to today, but
+        // nothing stops one, and deriving the total back from the buckets is
+        // what silently drops the difference — the way `tool_tokens` was lost.
+        let mut existing = json!({
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "total_tokens": 500
+        });
+        merge_usage_values(
+            &mut existing,
+            &json!({
+                "total_token_usage": {
+                    "input_tokens": 50,
+                    "output_tokens": 10,
+                    "total_tokens": 60
+                }
+            }),
+        );
+
+        assert_eq!(existing["input_tokens"], json!(150));
+        assert_eq!(existing["total_tokens"], json!(560));
+        assert_eq!(extract_token_counts(&existing).total, 560);
     }
 
     #[test]
