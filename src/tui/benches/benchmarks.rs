@@ -114,6 +114,7 @@ fn benchmark_file_parsing(c: &mut Criterion) {
         ("copilot", "sessions/copilot.jsonl"),
         ("gemini", "sessions/gemini.jsonl"),
         ("grok", "sessions/grok/signals.json"),
+        ("dsh", "sessions/dsh/session.jsonl.zstd"),
     ];
 
     for (name, path) in test_files {
@@ -142,6 +143,11 @@ fn benchmark_known_provider_parsing(c: &mut Criterion) {
         ("copilot", "sessions/copilot.jsonl", ExtensionType::Copilot),
         ("gemini", "sessions/gemini.jsonl", ExtensionType::Gemini),
         ("grok", "sessions/grok/signals.json", ExtensionType::Grok),
+        (
+            "dsh",
+            "sessions/dsh/session.jsonl.zstd",
+            ExtensionType::DeepSeek,
+        ),
     ];
 
     for (name, path, provider) in fixtures {
@@ -456,12 +462,14 @@ fn benchmark_batch_analysis(c: &mut Criterion) {
     let copilot_path = fixture("sessions/copilot.jsonl");
     let gemini_path = fixture("sessions/gemini.jsonl");
     let grok_path = fixture("sessions/grok/signals.json");
+    let dsh_path = fixture("sessions/dsh/session.jsonl.zstd");
 
     if !claude_path.exists()
         || !codex_path.exists()
         || !copilot_path.exists()
         || !gemini_path.exists()
         || !grok_path.exists()
+        || !dsh_path.exists()
     {
         return;
     }
@@ -474,6 +482,7 @@ fn benchmark_batch_analysis(c: &mut Criterion) {
                 (copilot_path.clone(), "copilot"),
                 (gemini_path.clone(), "gemini"),
                 (grok_path.clone(), "grok"),
+                (dsh_path.clone(), "dsh"),
             ];
 
             // Simulate batch processing
