@@ -150,6 +150,44 @@ fn test_grok_cache_tracks_sibling_files() {
 }
 
 #[test]
+fn test_dsh_cache_tracks_an_appended_frame() {
+    use std::sync::Arc;
+
+    let temp_dir = TempDir::new().unwrap();
+    let session = temp_dir.path().join("session.jsonl.zstd");
+    std::fs::copy(fixture("sessions/dsh/session.jsonl.zstd"), &session).unwrap();
+
+    let cache = FileParseCache::new();
+
+    let initial = cache.get_or_parse(&session).unwrap();
+    assert_eq!(initial.records[0].tool_call_counts.read, 1);
+
+    // The second read must be a hit, or the re-read below could report a new
+    // count while never having been cached at all.
+    let hit = cache.get_or_parse(&session).unwrap();
+    assert!(Arc::ptr_eq(&initial, &hit), "unchanged source should hit");
+
+    // `dsh` appends one self-contained zstd frame per batch instead of
+    // rewriting the log, so this is how a live session grows on disk.
+    let batch = [
+        r#"{"type":"turn/start","seq":24,"time":1786728869574,"data":{"turn":3}}"#,
+        r#"{"type":"tool/call","seq":25,"time":1786728870574,"data":{"turn":3,"step":1,"callId":"c8","name":"read","arguments":"{\"file_path\": \"src/appended.rs\"}"}}"#,
+        r#"{"type":"tool/result","seq":26,"time":1786728871574,"data":{"turn":3,"step":1,"message":{},"meta":{"path":"/repo/demo/src/appended.rs","offset":1,"lines":[{"number":1,"text":"fn appended() {}"}],"totalLines":1,"lang":"rust"}},"surfaceOp":"append","sourceEventSeqs":[25]}"#,
+    ]
+    .join("\n");
+    let frame = zstd::encode_all(format!("{batch}\n").as_bytes(), 0).unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&session)
+        .unwrap()
+        .write_all(&frame)
+        .unwrap();
+
+    let after_append = cache.get_or_parse(&session).unwrap();
+    assert_eq!(after_append.records[0].tool_call_counts.read, 2);
+}
+
+#[test]
 #[serial(global_cache)]
 fn test_file_cache_clear() {
     let cache = global_cache();
