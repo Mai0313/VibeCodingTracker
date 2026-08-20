@@ -13,7 +13,7 @@ use crate::config::ProvidersConfig;
 use crate::constants::{FastHashMap, FastHashSet, capacity};
 use crate::models::TimeRange;
 use crate::models::{
-    CodeAnalysis, ExtensionType, PerProviderUsage, Provider, ProviderActiveDays, UsageResult,
+    CodeAnalysis, ExtensionType, PerProviderUsage, ProviderActiveDays, UsageResult,
 };
 use crate::pricing::TierThresholds;
 use crate::session::cursor::{
@@ -1060,14 +1060,6 @@ fn usage_map_has_activity(usage: &FastHashMap<String, Value>, stored_cost: f64) 
         || usage
             .values()
             .any(|value| crate::utils::extract_token_counts(value).has_activity())
-}
-
-impl UsageData {
-    /// Returns the per-provider usage slice for `provider`, or `None` when the
-    /// provider has no dedicated bucket ([`Provider::Unknown`]).
-    pub fn provider_usage(&self, provider: Provider) -> Option<&UsageResult> {
-        self.per_provider.get(provider)
-    }
 }
 
 #[cfg(test)]
