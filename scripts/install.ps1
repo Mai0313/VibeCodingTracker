@@ -72,9 +72,10 @@ function Install-Binary {
 
     $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid())
     New-Item -ItemType Directory -Path $tempDir | Out-Null
-    # Set before the try so the finally can always test it; Remove-Item rejects a null LiteralPath
-    # at parameter binding, which -ErrorAction does not suppress.
+    # Set before the try so the finally can always test them; Remove-Item rejects a null
+    # LiteralPath at parameter binding, which -ErrorAction does not suppress.
     $stageDir = $null
+    $newMarker = $null
 
     try {
         $archive = Join-Path $tempDir $filename
@@ -100,7 +101,6 @@ function Install-Binary {
         $target = Join-Path $installDir "$BinaryName.exe"
         $stagedTarget = Join-Path $stageDir "$BinaryName.exe"
         Copy-Item -Path $binary.FullName -Destination $stagedTarget -Force
-        Move-Item -LiteralPath $stagedTarget -Destination $target -Force
 
         $wrapper = Join-Path $installDir "vct.cmd"
         $stagedWrapper = Join-Path $stageDir "vct.cmd"
@@ -109,11 +109,6 @@ function Install-Binary {
             "@echo off`r`n`"%~dp0$BinaryName.exe`" %*`r`n",
             [System.Text.Encoding]::ASCII
         )
-        Move-Item -LiteralPath $stagedWrapper -Destination $wrapper -Force
-        $legacyAlias = Join-Path $installDir "vct.exe"
-        if (Test-Path -LiteralPath $legacyAlias) {
-            Remove-Item -LiteralPath $legacyAlias -Force
-        }
 
         $markerPath = [System.IO.Path]::GetFullPath($target) + ".vct-managed"
         $stagedMarker = Join-Path $stageDir "$BinaryName.exe.vct-managed"
@@ -121,7 +116,26 @@ function Install-Binary {
             $stagedMarker,
             [System.Text.Encoding]::ASCII.GetBytes("vct-release-installer-v1`n")
         )
+
+        # Every file is ready before any of them lands, and the marker lands first. Renames cannot
+        # be made atomic across files, so this is the order whose half-done state is survivable: a
+        # binary installed without its marker is one the startup auto-update silently never fires
+        # for again, whereas an unaccompanied marker is undone in the finally. Only one this run
+        # put down is undone, since a marker that was already there belongs to the install that is
+        # already there.
+        if (-not (Test-Path -LiteralPath $markerPath)) {
+            $newMarker = $markerPath
+        }
         Move-Item -LiteralPath $stagedMarker -Destination $markerPath -Force
+        Move-Item -LiteralPath $stagedTarget -Destination $target -Force
+        # The binary the marker claims is in place, so the marker is no longer this run's to undo.
+        $newMarker = $null
+        Move-Item -LiteralPath $stagedWrapper -Destination $wrapper -Force
+
+        $legacyAlias = Join-Path $installDir "vct.exe"
+        if (Test-Path -LiteralPath $legacyAlias) {
+            Remove-Item -LiteralPath $legacyAlias -Force
+        }
 
         Write-Host "Installed $BinaryName $Version to $installDir"
         if ($env:Path -notlike "*$installDir*") {
@@ -136,6 +150,9 @@ function Install-Binary {
         Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
         if ($stageDir) {
             Remove-Item -LiteralPath $stageDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        if ($newMarker) {
+            Remove-Item -LiteralPath $newMarker -Force -ErrorAction SilentlyContinue
         }
     }
 }
