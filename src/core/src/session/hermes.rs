@@ -103,9 +103,10 @@ struct RowSums {
 ///
 /// A row the time range filters out still counts as attributed: it was
 /// understood, it just falls outside the window. So does a per-model row the
-/// residual rescued, since nothing was lost. Only tokens that reach no output
-/// at all land in `unusable`, which the scan turns into the user-visible "used
-/// an unsupported schema" line.
+/// residual rescued, since nothing was lost. What lands in `unusable` is what
+/// this reader could not report as Hermes recorded it — tokens that reach no
+/// output at all, and a query whose failure costs a whole pass, which the scan
+/// turns into the user-visible "used an unsupported schema" line.
 #[derive(Default)]
 struct RowTally {
     expected: usize,
@@ -152,12 +153,20 @@ fn collect_usage(conn: &Connection, time_range: TimeRange) -> Result<DatabaseUsa
 
     // Older Hermes releases predate `session_model_usage`; treat a missing table
     // as an empty per-model set and let the `sessions` reconciliation below
-    // produce usage from the aggregate (matching Hermes's own fallback).
-    if table_exists(conn, "session_model_usage")? {
-        collect_per_model_rows(conn, &cutoff, &mut summed, &mut out, &mut tally)?;
+    // produce usage from the aggregate (matching Hermes's own fallback). A
+    // missing table is not drift, so it is checked for rather than left to fail
+    // the query.
+    if table_exists(conn, "session_model_usage")?
+        && let Err(error) = collect_per_model_rows(conn, &cutoff, &mut summed, &mut out, &mut tally)
+    {
+        report_unreadable("per-model usage rows", &error, &mut tally);
     }
 
-    reconcile_session_residuals(conn, &cutoff, &mut summed, &mut out, &mut tally)?;
+    if let Err(error) =
+        reconcile_session_residuals(conn, &cutoff, &mut summed, &mut out, &mut tally)
+    {
+        report_unreadable("session residuals", &error, &mut tally);
+    }
     // Whatever no session row picked up is the part that really was lost: a row
     // whose session has no aggregate, or whose aggregate this reader could not
     // place either. Only that is reported.
@@ -167,6 +176,22 @@ fn collect_usage(conn: &Connection, time_range: TimeRange) -> Result<DatabaseUsa
         expected_records: tally.expected,
         parsed_records: tally.expected - tally.unusable,
     })
+}
+
+/// Records a query this reader could not finish, without failing the read.
+///
+/// Neither table is the only source of a session's usage: per-model rows this
+/// reader cannot read fall through to the `sessions` residual, which
+/// reconstructs the same totals from the aggregate, and a residual it cannot
+/// read leaves that session's per-model rows standing. So a query that fails,
+/// at `prepare` or partway through its rows, gives up the rest of its own pass
+/// and keeps what it already collected, rather than taking the other pass down
+/// with it. How many contributions that costs is unknowable from here and the
+/// count feeds a per-record message, so it stays a floor of one; the concrete
+/// cause goes to the log instead.
+fn report_unreadable(what: &str, error: &rusqlite::Error, tally: &mut RowTally) {
+    tally.dropped(1);
+    log::warn!("Hermes {what} unavailable: {error}");
 }
 
 /// Returns whether `table` exists in the database.
@@ -186,13 +211,15 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
 /// A row this reader cannot place feeds neither, so its tokens fall through to
 /// the session residual instead of disappearing from both sides; it is held
 /// against the session as `unattributed` until that residual carries them.
+///
+/// An error stops this pass rather than the read: see [`report_unreadable`].
 fn collect_per_model_rows(
     conn: &Connection,
     cutoff: &Option<String>,
     summed: &mut FastHashMap<String, RowSums>,
     out: &mut Vec<UsageContribution>,
     tally: &mut RowTally,
-) -> Result<()> {
+) -> rusqlite::Result<()> {
     let mut stmt = conn.prepare(
         "SELECT session_id, model, input_tokens, output_tokens, cache_read_tokens, \
                 cache_write_tokens, reasoning_tokens, estimated_cost_usd, \
@@ -201,15 +228,41 @@ fn collect_per_model_rows(
     )?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
+        // `session_id` is the one column with no fallback: a row that cannot
+        // name its session has nothing to hold its tokens against, so a failure
+        // here stops the pass instead of losing the row quietly.
         let session_id: String = row.get(0)?;
-        let model: String = row.get(1)?;
-        let input = row.get::<_, i64>(2)?;
-        let raw_output = row.get::<_, i64>(3)?;
-        let cache_read = row.get::<_, i64>(4)?;
-        let cache_write = row.get::<_, i64>(5)?;
-        let reasoning = row.get::<_, i64>(6)?;
-        let estimated = row.get::<_, f64>(7)?;
-        let actual = row.get::<_, f64>(8)?;
+        let model: Option<String> = row.get(1)?;
+        // A migration that adds a column leaves every row behind it NULL, and a
+        // NULL is a number this reader does not have. Reading it as zero would
+        // not just under-count the row, it would mis-split it: a NULL
+        // `reasoning_tokens` bills the whole of `output_tokens` at the output
+        // rate, and the reasoning the session really used is then capped away
+        // against a zero output residual. So a NULL makes the row unplaceable,
+        // exactly like one naming no model, and the residual carries it.
+        let (
+            Some(input),
+            Some(raw_output),
+            Some(cache_read),
+            Some(cache_write),
+            Some(reasoning),
+            Some(estimated),
+            Some(actual),
+        ) = (
+            row.get::<_, Option<i64>>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+            row.get::<_, Option<i64>>(4)?,
+            row.get::<_, Option<i64>>(5)?,
+            row.get::<_, Option<i64>>(6)?,
+            row.get::<_, Option<f64>>(7)?,
+            row.get::<_, Option<f64>>(8)?,
+        )
+        else {
+            // Nothing was read, so there is no telling whether the row held
+            // anything; assume it did rather than drop it quietly.
+            mark_unattributed(summed, session_id, true);
+            continue;
+        };
         // A row holding no tokens and no cost is nothing to carry and nothing
         // to lose, so failing to place it below is not a loss to report.
         let carries_usage = input != 0
@@ -219,10 +272,14 @@ fn collect_per_model_rows(
             || cache_write != 0
             || estimated != 0.0
             || actual != 0.0;
-        // `last_seen` (last activity) drives the date, falling back to `first_seen`.
-        let seconds = row
-            .get::<_, Option<f64>>(9)?
-            .or(row.get::<_, Option<f64>>(10)?);
+        // `last_seen` (last activity) drives the date, falling back to
+        // `first_seen`. The fallback is only read when it is needed, so an
+        // unreadable `first_seen` cannot cost a row its perfectly good
+        // `last_seen`.
+        let seconds = match row.get::<_, Option<f64>>(9)? {
+            Some(seconds) => Some(seconds),
+            None => row.get::<_, Option<f64>>(10)?,
+        };
 
         let Some(seconds) = seconds else {
             mark_unattributed(summed, session_id, carries_usage);
@@ -232,7 +289,7 @@ fn collect_per_model_rows(
             mark_unattributed(summed, session_id, carries_usage);
             continue;
         };
-        let model = model.trim();
+        let model = model.as_deref().unwrap_or("").trim();
         if model.is_empty() {
             // Only a row this window would have reported can be lost in it. A
             // row with no date at all fails that test in every window, which is
@@ -285,35 +342,21 @@ fn collect_per_model_rows(
 /// lost one reports it instead of showing a total that quietly shed those
 /// tokens. Placing a session's residual also clears the `unattributed` marks
 /// its per-model rows left behind, since the residual has just carried them.
+///
+/// An error stops this pass rather than the read: see [`report_unreadable`].
 fn reconcile_session_residuals(
     conn: &Connection,
     cutoff: &Option<String>,
     summed: &mut FastHashMap<String, RowSums>,
     out: &mut Vec<UsageContribution>,
     tally: &mut RowTally,
-) -> Result<()> {
-    let mut stmt = match conn.prepare(
+) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare(
         "SELECT id, model, input_tokens, output_tokens, cache_read_tokens, \
                 cache_write_tokens, reasoning_tokens, estimated_cost_usd, \
                 actual_cost_usd, ended_at, started_at \
          FROM sessions",
-    ) {
-        Ok(stmt) => stmt,
-        Err(error) => {
-            // Opening the connection already probed `sessions`, so a failed
-            // prepare most likely means a column this build names has moved,
-            // though a corrupt or unreadable database lands here too. The
-            // per-model rows already collected are still returned, but no
-            // session gets a residual now, so report the aggregate as one
-            // unreadable record rather than passing the scan off as clean.
-            // How many residuals that cost is unknowable from here, and the
-            // count feeds a per-record message, so it stays a floor of one;
-            // the concrete cause goes to the log instead.
-            tally.dropped(1);
-            log::warn!("Hermes session residuals unavailable: {error}");
-            return Ok(());
-        }
-    };
+    )?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         let id: String = row.get(0)?;
@@ -1382,6 +1425,163 @@ mod tests {
         let read = read_hermes_usage_contributions(&db_path, TimeRange::All).unwrap();
         assert_eq!(read.rows.len(), 1);
         assert_eq!(read.failed_records(), 1);
+        drop(dir);
+    }
+
+    #[test]
+    fn unreadable_per_model_query_falls_back_to_the_session_aggregate() {
+        // A renamed `session_model_usage` column used to abort the whole Hermes
+        // read. The aggregate reconstructs the same totals, so what the failure
+        // costs is the per-model pass and nothing else.
+        let (dir, db_path) = make_db();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            let now = recent_epoch_secs();
+            insert_row(
+                &conn,
+                "s1",
+                "gpt-x",
+                "openai-api",
+                60,
+                6,
+                0,
+                0,
+                0,
+                0.3,
+                0.0,
+                now,
+            );
+            conn.execute_batch(
+                "ALTER TABLE session_model_usage \
+                 RENAME COLUMN reasoning_tokens TO thinking_tokens;",
+            )
+            .unwrap();
+            insert_session(&conn, "s1", "gpt-x", 100, 10, 5, 0, 0.5, 0.0, now);
+        }
+        let sessions = read_hermes_usage(&db_path, TimeRange::All).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(total_bucket(&sessions, "gpt-x", "input_tokens"), 100);
+        assert_eq!(
+            total_bucket(&sessions, "gpt-x", "cache_read_input_tokens"),
+            5
+        );
+        assert!((total_cost(&sessions, "gpt-x") - 0.5).abs() < 1e-9);
+        // The per-model breakdown is gone even though the totals are not, so
+        // the scan still hears about it.
+        let read = read_hermes_usage_contributions(&db_path, TimeRange::All).unwrap();
+        assert_eq!(read.failed_records(), 1);
+        drop(dir);
+    }
+
+    #[test]
+    fn unreadable_session_row_keeps_the_per_model_rows() {
+        // The mirror image: a `sessions` column this reader cannot read costs
+        // the residuals, not the per-model rows already collected.
+        let (dir, db_path) = make_db();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            let now = recent_epoch_secs();
+            insert_row(
+                &conn,
+                "s1",
+                "gpt-x",
+                "openai-api",
+                60,
+                6,
+                0,
+                0,
+                0,
+                0.3,
+                0.0,
+                now,
+            );
+            // Text in an INTEGER-affinity column: SQLite keeps it as text, and
+            // the reader has no number to read out of it.
+            conn.execute(
+                "INSERT INTO sessions (id, model, input_tokens, output_tokens, \
+                     estimated_cost_usd, started_at, ended_at) \
+                 VALUES ('s1', 'gpt-x', 'not-a-number', 10, 0.5, ?1, ?1)",
+                [now],
+            )
+            .unwrap();
+        }
+        let read = read_hermes_usage_contributions(&db_path, TimeRange::All).unwrap();
+        assert_eq!(read.rows.len(), 1);
+        assert_eq!(read.failed_records(), 1);
+        drop(dir);
+    }
+
+    #[test]
+    fn per_model_row_with_a_null_column_leaves_its_tokens_to_the_residual() {
+        // A migration that adds a column leaves the rows written before it
+        // NULL. Reading that as zero would mis-split the row rather than merely
+        // under-count it, so the row is left unplaced and the aggregate carries
+        // the session whole, reasoning and all.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE session_model_usage (
+                     session_id TEXT NOT NULL,
+                     model TEXT NOT NULL,
+                     input_tokens INTEGER NOT NULL DEFAULT 0,
+                     output_tokens INTEGER NOT NULL DEFAULT 0,
+                     cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                     cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                     reasoning_tokens INTEGER,
+                     estimated_cost_usd REAL NOT NULL DEFAULT 0,
+                     actual_cost_usd REAL NOT NULL DEFAULT 0,
+                     first_seen REAL,
+                     last_seen REAL
+                 );
+                 CREATE TABLE sessions (
+                     id TEXT PRIMARY KEY,
+                     model TEXT,
+                     input_tokens INTEGER DEFAULT 0,
+                     output_tokens INTEGER DEFAULT 0,
+                     cache_read_tokens INTEGER DEFAULT 0,
+                     cache_write_tokens INTEGER DEFAULT 0,
+                     reasoning_tokens INTEGER DEFAULT 0,
+                     estimated_cost_usd REAL DEFAULT 0,
+                     actual_cost_usd REAL DEFAULT 0,
+                     started_at REAL NOT NULL,
+                     ended_at REAL
+                 );",
+            )
+            .unwrap();
+            let now = recent_epoch_secs();
+            // The row's `reasoning_tokens` predates the column, so it is NULL
+            // while its `output_tokens` still includes those 4 tokens.
+            conn.execute(
+                "INSERT INTO session_model_usage (session_id, model, input_tokens, \
+                     output_tokens, estimated_cost_usd, first_seen, last_seen) \
+                 VALUES ('s1', 'gpt-x', 100, 10, 0.5, ?1, ?1)",
+                [now],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, model, input_tokens, output_tokens, \
+                     reasoning_tokens, estimated_cost_usd, started_at, ended_at) \
+                 VALUES ('s1', 'gpt-x', 100, 10, 4, 0.5, ?1, ?1)",
+                [now],
+            )
+            .unwrap();
+        }
+        let sessions = read_hermes_usage(&db_path, TimeRange::All).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(total_bucket(&sessions, "gpt-x", "input_tokens"), 100);
+        // Reading the NULL as zero would bill all 10 output tokens at the
+        // output rate and leave the reasoning bucket empty.
+        assert_eq!(total_bucket(&sessions, "gpt-x", "output_tokens"), 6);
+        assert_eq!(
+            total_bucket(&sessions, "gpt-x", "reasoning_output_tokens"),
+            4
+        );
+        assert!((total_cost(&sessions, "gpt-x") - 0.5).abs() < 1e-9);
+        // The residual carried everything, so there is no loss to report.
+        let read = read_hermes_usage_contributions(&db_path, TimeRange::All).unwrap();
+        assert_eq!(read.failed_records(), 0);
         drop(dir);
     }
 
