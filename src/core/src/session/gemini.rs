@@ -67,10 +67,10 @@ where
         if let (Some(tokens), Some(model)) = (&message.tokens, &message.model) {
             // One billed message is one request; `tokens.input` is its full
             // prompt count (cached subset included).
-            let above = classifier
+            let level = classifier
                 .as_mut()
-                .is_some_and(|classifier| classifier.is_above(model, tokens.input));
-            process_gemini_usage(&mut conversation_usage, model, tokens, above);
+                .map_or(0, |classifier| classifier.level(model, tokens.input));
+            process_gemini_usage(&mut conversation_usage, model, tokens, level);
         }
         state.merge(message.state);
     }

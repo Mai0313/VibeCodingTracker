@@ -164,7 +164,7 @@ where
                             // is the turn's own full prompt (cached included),
                             // published as last_token_usage.input_tokens. Fall
                             // back to the delta input when absent.
-                            let above = classifier.as_mut().is_some_and(|classifier| {
+                            let level = classifier.as_mut().map_or(0, |classifier| {
                                 let request_context = info
                                     .get("last_token_usage")
                                     .and_then(|last| last.get("input_tokens"))
@@ -172,14 +172,14 @@ where
                                     .filter(|tokens| *tokens > 0)
                                     .or_else(|| delta.get("input_tokens").and_then(Value::as_i64))
                                     .unwrap_or(0);
-                                classifier.is_above(&current_model, request_context)
+                                classifier.level(&current_model, request_context)
                             });
                             process_codex_usage(
                                 &mut conversation_usage,
                                 &current_model,
                                 &delta,
                                 info,
-                                above,
+                                level,
                             );
                             if let Some(total) = total {
                                 prev_totals = Some(CodexTokenTotals::from_total_object(
@@ -1330,17 +1330,19 @@ mod tests {
         .collect();
 
         let tiers =
-            crate::pricing::TierThresholds::from_entries([("gpt-5.4", 272_000)].into_iter());
+            crate::pricing::TierThresholds::from_entries([("gpt-5.4", vec![272_000])].into_iter());
         let parsed =
             parse_codex_log_iter_with_diagnostics(&logs, ParseMode::UsageOnly, Some(&tiers))
                 .unwrap();
         let usage = &parsed.analysis.records[0].conversation_usage["gpt-5.4"];
         assert_eq!(usage["total_token_usage"]["total_tokens"], 502_500);
         // Only the second turn's delta (input 300k, output 1.5k) is above.
-        assert_eq!(usage["above_tier"]["input_tokens"], 300_000);
-        assert_eq!(usage["above_tier"]["output_tokens"], 1_500);
+        assert_eq!(usage["above_tier"]["level_1_input_tokens"], 300_000);
+        assert_eq!(usage["above_tier"]["level_1_output_tokens"], 1_500);
         assert!(
-            usage["above_tier"].get("cache_read_tokens").is_none(),
+            usage["above_tier"]
+                .get("level_1_cache_read_tokens")
+                .is_none(),
             "no cached tokens in this session"
         );
     }

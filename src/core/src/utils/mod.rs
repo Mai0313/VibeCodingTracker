@@ -44,7 +44,7 @@ pub use paths::{
     network_disabled, resolve_paths, resolve_paths_from_home,
 };
 pub use time::{now_rfc3339_utc_nanos, parse_iso_timestamp, rfc3339_utc_nanos};
-pub use token_extractor::{TokenCounts, extract_token_counts};
+pub use token_extractor::{MAX_TIER_LEVELS, TierSlice, TokenCounts, extract_token_counts};
 pub(crate) use token_merge::merge_usage_values;
 pub use token_merge::normalize_usage_value;
 pub use usage_processor::{

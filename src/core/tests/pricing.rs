@@ -12,7 +12,7 @@ use vct_core::pricing::{
     ModelPricing, ModelPricingMap, ThresholdTier, TierRange, calculate_cost, clear_pricing_cache,
     fetch_model_pricing_with, normalize_model_name,
 };
-use vct_core::utils::get_pricing_cache_path_in;
+use vct_core::utils::{TierSlice, get_pricing_cache_path_in};
 
 /// Builds normalized counts for the positional (input, output, reasoning,
 /// cache_read, cache_creation_5m, cache_creation_1h) test shorthand.
@@ -620,8 +620,11 @@ fn test_pricing_above_200k_tokens_via_tier() {
 
     // A request classified above 200K bills its slice at tier prices.
     let mut above = tc(300_000, 50_000, 0, 0, 0, 0);
-    above.above_input = 300_000;
-    above.above_output = 50_000;
+    above.above_tiers = vec![TierSlice {
+        input_tokens: 300_000,
+        output_tokens: 50_000,
+        ..Default::default()
+    }];
     let above = calculate_cost(&above, &pricing);
     assert_eq!(above, 300_000.0 * 0.000002 + 50_000.0 * 0.000004);
 }
@@ -659,8 +662,11 @@ fn test_pricing_range_based() {
     assert_eq!(aggregate, 100_000.0 * 0.000001 + 1000.0 * 0.000005);
 
     let mut above = tc(100_000, 1000, 0, 0, 0, 0);
-    above.above_input = 100_000;
-    above.above_output = 1000;
+    above.above_tiers = vec![TierSlice {
+        input_tokens: 100_000,
+        output_tokens: 1000,
+        ..Default::default()
+    }];
     let above = calculate_cost(&above, &pricing);
     assert_eq!(above, 100_000.0 * 0.0000018 + 1000.0 * 0.000009);
 }

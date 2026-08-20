@@ -1,4 +1,5 @@
 use super::cache::ModelPricing;
+use crate::utils::MAX_TIER_LEVELS;
 use lru::LruCache;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -328,35 +329,64 @@ impl ModelPricingMap {
         &self.raw
     }
 
-    /// Builds the `Send + Sync` "model → context-tier threshold" snapshot the
+    /// Builds the `Send + Sync` "model → price-level boundaries" snapshot the
     /// usage scan hands to session parsers for per-request tier
     /// classification. Models with neither pricing strategy are absent.
     pub fn tier_thresholds(&self) -> crate::pricing::TierThresholds {
         crate::pricing::TierThresholds::from_entries(
             self.raw.iter().filter_map(|(key, pricing)| {
-                Some((key.as_ref(), classification_threshold(pricing)?))
+                Some((key.as_ref(), classification_boundaries(pricing)?))
             }),
         )
     }
 }
 
-/// The context size above which a request bills at `pricing`'s second price
-/// level, or `None` when the model has only one level.
+/// The ascending context sizes at which `pricing` moves up a price level, or
+/// `None` when the model has only one level.
 ///
 /// Checked in `calculate_cost`'s own dispatch order, so an entry carrying both
-/// strategies classifies against the one that will price it. A range-based
-/// model's boundary is row 0's `max_tokens`, which is exclusive while
+/// strategies classifies against the one that will price it. Level `n` — the
+/// level above the `n`th boundary — is `ranges[n]` for a range-based model and
+/// `tiers[n - 1]` for a threshold-based one.
+///
+/// A range's boundary is the row's own inclusive `min_tokens`, so each level is
+/// the highest row whose lower bound the request cleared; row 0's is skipped
+/// because nothing sits below it. Reading the *previous* row's exclusive
+/// `max_tokens` instead says the same thing for the contiguous tables LiteLLM
+/// publishes today, but promotes a request that falls in a gap to a row it
+/// never reached. The `- 1` is because
 /// [`TierClassifier`](crate::pricing::TierClassifier) compares strictly
-/// greater — hence the `- 1`, which is what makes a request of exactly
-/// `max_tokens` the first one row 1 prices.
-fn classification_threshold(pricing: &ModelPricing) -> Option<i64> {
-    if let Some(ranges) = &pricing.ranges {
-        // Row 1 prices the whole above-slice, so a single-row model has
-        // nothing to promote to and classifies nothing.
-        let boundary = ranges.first()?.max_tokens;
-        return (ranges.len() >= 2 && boundary > 0).then_some(boundary - 1);
+/// greater, which is what makes a request of exactly `min_tokens` the first one
+/// that row prices.
+fn classification_boundaries(pricing: &ModelPricing) -> Option<Vec<i64>> {
+    match &pricing.ranges {
+        Some(ranges) => {
+            let (_, above_first) = ranges.split_first()?;
+            ascending_boundaries(above_first.iter().map(|row| row.min_tokens - 1))
+        }
+        None => ascending_boundaries(pricing.tiers.iter().map(|tier| tier.threshold_tokens)),
     }
-    pricing.tiers.first().map(|tier| tier.threshold_tokens)
+}
+
+/// Keeps the leading run of `bounds` that is non-negative and strictly
+/// ascending, capped at [`MAX_TIER_LEVELS`].
+///
+/// A price row whose bound does not clear its predecessor's would make the
+/// levels above it meaningless; stopping there costs only those levels, while
+/// dropping the row instead would shift every level below it onto the wrong
+/// price row. Zero is a legitimate first bound — a model publishing an
+/// `above_0k_tokens` rate prices every request there — but a negative one only
+/// ever comes from a malformed row.
+fn ascending_boundaries(bounds: impl Iterator<Item = i64>) -> Option<Vec<i64>> {
+    let mut boundaries: Vec<i64> = Vec::new();
+    for bound in bounds {
+        if boundaries.len() == MAX_TIER_LEVELS || bound <= boundaries.last().copied().unwrap_or(-1)
+        {
+            break;
+        }
+        boundaries.push(bound);
+    }
+    (!boundaries.is_empty()).then_some(boundaries)
 }
 
 /// Invalidates the lookup cache in every pricing map.
@@ -867,20 +897,55 @@ mod tests {
     }
 
     #[test]
-    fn tier_thresholds_exports_range_models_one_below_row_zeros_bound() {
+    fn tier_thresholds_exports_every_range_bound_below_the_top_row() {
         let mut raw = HashMap::new();
         raw.insert(
             "dashscope/qwen3-coder-plus".to_string(),
             ModelPricing {
-                ranges: Some(vec![range_row(0, 32_000), range_row(32_000, 128_000)]),
+                ranges: Some(vec![
+                    range_row(0, 32_000),
+                    range_row(32_000, 128_000),
+                    range_row(128_000, 256_000),
+                    range_row(256_000, 1_000_000),
+                ]),
                 ..Default::default()
             },
         );
         let thresholds = ModelPricingMap::new(raw).tier_thresholds();
 
-        // `max_tokens` is exclusive and `TierClassifier` compares strictly
-        // greater, so a request of exactly 32_000 is row 1's first.
-        assert_eq!(thresholds.threshold_for("qwen3-coder-plus"), Some(31_999));
+        // `min_tokens` is inclusive and `TierClassifier` compares strictly
+        // greater, so a request of exactly 32_000 is row 1's first. Row 0 has
+        // no bound below it, and the top row has none above it — a request
+        // past 1M still bills there.
+        assert_eq!(
+            thresholds.boundaries_for("qwen3-coder-plus"),
+            Some(&[31_999, 127_999, 255_999][..])
+        );
+    }
+
+    #[test]
+    fn tier_thresholds_never_promote_a_request_into_a_gap_between_rows() {
+        let mut raw = HashMap::new();
+        raw.insert(
+            "vendor/qwen-gapped".to_string(),
+            ModelPricing {
+                // Nothing prices 128k..256k.
+                ranges: Some(vec![
+                    range_row(0, 32_000),
+                    range_row(32_000, 128_000),
+                    range_row(256_000, 1_000_000),
+                ]),
+                ..Default::default()
+            },
+        );
+        let thresholds = ModelPricingMap::new(raw).tier_thresholds();
+
+        // Reading the previous row's `max_tokens` would put a 200k request on
+        // the top row, whose own range it never reached.
+        assert_eq!(
+            thresholds.boundaries_for("qwen-gapped"),
+            Some(&[31_999, 255_999][..])
+        );
     }
 
     #[test]
@@ -897,8 +962,35 @@ mod tests {
         assert!(
             ModelPricingMap::new(raw)
                 .tier_thresholds()
-                .threshold_for("qwen-single")
+                .boundaries_for("qwen-single")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn tier_thresholds_stop_at_a_bound_that_does_not_ascend() {
+        let mut raw = HashMap::new();
+        raw.insert(
+            "vendor/qwen-malformed".to_string(),
+            ModelPricing {
+                ranges: Some(vec![
+                    range_row(0, 32_000),
+                    range_row(32_000, 128_000),
+                    range_row(32_000, 128_000),
+                    range_row(128_000, 256_000),
+                ]),
+                ..Default::default()
+            },
+        );
+        // Row 2's lower bound repeats row 1's, so levels 2 and up cannot be
+        // told apart. Keeping level 1 alone under-bills the top rows; dropping
+        // the bad row instead would bill level 2's requests at row 2's prices
+        // while they belong to row 3.
+        assert_eq!(
+            ModelPricingMap::new(raw)
+                .tier_thresholds()
+                .boundaries_for("qwen-malformed"),
+            Some(&[31_999][..])
         );
     }
 
@@ -918,8 +1010,8 @@ mod tests {
         assert_eq!(
             ModelPricingMap::new(raw)
                 .tier_thresholds()
-                .threshold_for("claude-sonnet-4-5"),
-            Some(200_000)
+                .boundaries_for("claude-sonnet-4-5"),
+            Some(&[200_000][..])
         );
     }
 }

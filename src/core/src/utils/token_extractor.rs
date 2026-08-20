@@ -1,5 +1,54 @@
 use serde_json::Value;
 
+/// Highest context-tier price level a usage value can express.
+///
+/// LiteLLM's dearest range-priced model publishes four rows today, so this is
+/// far above anything real; it exists because [`extract_token_counts`] indexes
+/// a vector by the level it reads out of a key name, and that key can come
+/// from any caller. A model publishing more levels than this bills its top
+/// ones at level `MAX_TIER_LEVELS` — a lower bound, never a lost token.
+pub const MAX_TIER_LEVELS: usize = 16;
+
+/// One context-tier price level's slice of a model's tokens.
+///
+/// The buckets mirror the same-named [`TokenCounts`] fields and use the same
+/// disjoint semantics (input excludes cache reads, output excludes reasoning),
+/// because a slice is always a subset of the totals — never tokens on top of
+/// them. `calculate_cost` bills the slice at level *n*'s prices and the
+/// remainder at the model's base level.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TierSlice {
+    /// Non-cached prompt tokens billed at this level.
+    pub input_tokens: i64,
+    /// Completion tokens (excluding reasoning) billed at this level.
+    pub output_tokens: i64,
+    /// Reasoning tokens billed at this level.
+    pub reasoning_tokens: i64,
+    /// Cache reads billed at this level.
+    pub cache_read: i64,
+    /// Cache writes at the default 5-minute TTL billed at this level.
+    pub cache_creation_5m: i64,
+    /// Cache writes at the extended 1-hour TTL billed at this level.
+    pub cache_creation_1h: i64,
+}
+
+impl TierSlice {
+    /// Adds every bucket of `other` into this slice.
+    pub fn merge(&mut self, other: &Self) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.reasoning_tokens += other.reasoning_tokens;
+        self.cache_read += other.cache_read;
+        self.cache_creation_5m += other.cache_creation_5m;
+        self.cache_creation_1h += other.cache_creation_1h;
+    }
+
+    /// Whether this level classified no tokens at all.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Normalized token counts extracted from provider-specific usage data.
 ///
 /// `cache_creation == cache_creation_5m + cache_creation_1h` always holds.
@@ -40,31 +89,38 @@ pub struct TokenCounts {
     /// Includes `tool_tokens`, which have no price bucket, so `calculate_cost`
     /// bills the individual buckets rather than this.
     pub total: i64,
-    /// Slice of `input_tokens` from requests whose own prompt context
-    /// exceeded the model's context-tier threshold (see the `above_tier`
-    /// object written by the usage parsers). Always a subset of the field it
-    /// mirrors — never additional tokens — so displays keep using the totals
-    /// above while `calculate_cost` bills this slice at the tier rate.
-    pub above_input: i64,
-    /// Above-threshold slice of `output_tokens`.
-    pub above_output: i64,
-    /// Above-threshold slice of `reasoning_tokens`.
-    pub above_reasoning: i64,
-    /// Above-threshold slice of `cache_read`.
-    pub above_cache_read: i64,
-    /// Above-threshold slice of `cache_creation_5m`.
-    pub above_cache_creation_5m: i64,
-    /// Above-threshold slice of `cache_creation_1h`.
-    pub above_cache_creation_1h: i64,
+    /// Per-level slices of the buckets above, from requests whose own prompt
+    /// context reached the model's higher price levels (see the `above_tier`
+    /// object written by the usage parsers). Index `n` is price level `n + 1`,
+    /// the model's base level being 0, and a level nothing classified into is
+    /// a zero entry rather than a gap. Always subsets of the fields they
+    /// mirror — never additional tokens — so displays keep using the totals
+    /// above while `calculate_cost` bills each slice at its level's rates.
+    /// Empty for everything that classifies nothing.
+    pub above_tiers: Vec<TierSlice>,
 }
 
 impl TokenCounts {
+    /// The slice billed at price `level`, growing the vector to reach it.
+    ///
+    /// `None` for level 0 (the base level is the remainder, not a slice) and
+    /// for a level past [`MAX_TIER_LEVELS`].
+    fn tier_slice_mut(&mut self, level: usize) -> Option<&mut TierSlice> {
+        if level == 0 || level > MAX_TIER_LEVELS {
+            return None;
+        }
+        if self.above_tiers.len() < level {
+            self.above_tiers.resize(level, TierSlice::default());
+        }
+        self.above_tiers.get_mut(level - 1)
+    }
+
     /// Whether this usage did anything; the one test for whether a date counts
     /// as active.
     ///
-    /// Covers every field except `tool_tokens` and the `above_*` slices, which
-    /// are subsets of fields already checked (`tool_tokens` is a summand of
-    /// `total`). A new bucket must be added here too.
+    /// Covers every field except `tool_tokens` and the `above_tiers` slices,
+    /// which are subsets of fields already checked (`tool_tokens` is a summand
+    /// of `total`). A new bucket must be added here too.
     pub fn has_activity(&self) -> bool {
         self.total != 0
             || self.input_tokens != 0
@@ -76,6 +132,17 @@ impl TokenCounts {
             || self.cache_creation_1h != 0
             || self.web_search_requests != 0
     }
+}
+
+/// Splits an `above_tier` key into its price level and bucket name.
+///
+/// `"level_2_input_tokens"` is level 2's `input_tokens` bucket. A key in any
+/// other shape belongs to no level and is skipped.
+fn split_tier_key(key: &str) -> Option<(usize, &str)> {
+    let rest = key.strip_prefix("level_")?;
+    let separator = rest.find('_')?;
+    let level = rest[..separator].parse().ok()?;
+    Some((level, &rest[separator + 1..]))
 }
 
 /// Extracts token counts from usage data in any provider format.
@@ -145,17 +212,33 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
         }
 
         // Per-request tier classification (usage scans only): the parsers
-        // accumulate the above-threshold slice of every bucket into a nested
-        // `above_tier` object. Read it here — before the Codex early return —
-        // so both the flat and the nested shapes carry it into pricing.
+        // accumulate each classified request's buckets into a nested
+        // `above_tier` object, keyed `level_<n>_<bucket>` so the whole thing
+        // stays one flat integer map and merges like every other nested usage
+        // object. Read it here — before the Codex early return — so both the
+        // flat and the nested shapes carry it into pricing.
         if let Some(above) = usage_obj.get("above_tier").and_then(|v| v.as_object()) {
-            let field = |key: &str| above.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
-            counts.above_input = field("input_tokens");
-            counts.above_output = field("output_tokens");
-            counts.above_reasoning = field("reasoning_tokens");
-            counts.above_cache_read = field("cache_read_tokens");
-            counts.above_cache_creation_5m = field("cache_creation_5m_tokens");
-            counts.above_cache_creation_1h = field("cache_creation_1h_tokens");
+            for (key, value) in above {
+                let (Some(tokens), Some((level, bucket))) = (value.as_i64(), split_tier_key(key))
+                else {
+                    continue;
+                };
+                // Resolved before the level, so a key naming no bucket cannot
+                // conjure the level it claims to sit at.
+                let bucket: fn(&mut TierSlice) -> &mut i64 = match bucket {
+                    "input_tokens" => |slice| &mut slice.input_tokens,
+                    "output_tokens" => |slice| &mut slice.output_tokens,
+                    "reasoning_tokens" => |slice| &mut slice.reasoning_tokens,
+                    "cache_read_tokens" => |slice| &mut slice.cache_read,
+                    "cache_creation_5m_tokens" => |slice| &mut slice.cache_creation_5m,
+                    "cache_creation_1h_tokens" => |slice| &mut slice.cache_creation_1h,
+                    _ => continue,
+                };
+                let Some(slice) = counts.tier_slice_mut(level) else {
+                    continue;
+                };
+                *bucket(slice) = tokens;
+            }
         }
 
         // Gemini writes reasoning budget as `thoughts_tokens`; the other flat
@@ -560,17 +643,22 @@ mod tests {
             "output_tokens": 1_000,
             "cache_read_input_tokens": 50_000,
             "above_tier": {
-                "input_tokens": 280_000,
-                "output_tokens": 600,
-                "cache_read_tokens": 50_000
+                "level_1_input_tokens": 280_000,
+                "level_1_output_tokens": 600,
+                "level_1_cache_read_tokens": 50_000
             }
         });
         let c = extract_token_counts(&flat);
         assert_eq!(c.input_tokens, 300_000);
-        assert_eq!(c.above_input, 280_000);
-        assert_eq!(c.above_output, 600);
-        assert_eq!(c.above_cache_read, 50_000);
-        assert_eq!(c.above_cache_creation_5m, 0);
+        assert_eq!(
+            c.above_tiers,
+            vec![TierSlice {
+                input_tokens: 280_000,
+                output_tokens: 600,
+                cache_read: 50_000,
+                ..Default::default()
+            }]
+        );
 
         // Codex shape: above_tier sits beside total_token_usage and must
         // survive the early return that consumes the published total.
@@ -583,18 +671,75 @@ mod tests {
                 "total_tokens": 402_000
             },
             "above_tier": {
-                "input_tokens": 250_000,
-                "cache_read_tokens": 80_000,
-                "output_tokens": 900,
-                "reasoning_tokens": 300
+                "level_1_input_tokens": 250_000,
+                "level_1_cache_read_tokens": 80_000,
+                "level_1_output_tokens": 900,
+                "level_1_reasoning_tokens": 300
             }
         });
         let c = extract_token_counts(&codex);
         assert_eq!(c.total, 402_000);
-        assert_eq!(c.above_input, 250_000);
-        assert_eq!(c.above_cache_read, 80_000);
-        assert_eq!(c.above_output, 900);
-        assert_eq!(c.above_reasoning, 300);
+        assert_eq!(
+            c.above_tiers,
+            vec![TierSlice {
+                input_tokens: 250_000,
+                output_tokens: 900,
+                reasoning_tokens: 300,
+                cache_read: 80_000,
+                ..Default::default()
+            }]
+        );
+    }
+
+    #[test]
+    fn every_price_level_gets_its_own_slice() {
+        // A range-priced model whose requests landed in rows 1 and 3. Level 2
+        // saw nothing, and must read back as a zero entry rather than shifting
+        // level 3's tokens down onto row 2's cheaper prices.
+        let usage = json!({
+            "input_tokens": 500_000,
+            "output_tokens": 3_000,
+            "above_tier": {
+                "level_1_input_tokens": 100_000,
+                "level_1_output_tokens": 1_000,
+                "level_3_input_tokens": 300_000,
+                "level_3_output_tokens": 1_500
+            }
+        });
+        let c = extract_token_counts(&usage);
+        assert_eq!(
+            c.above_tiers,
+            vec![
+                TierSlice {
+                    input_tokens: 100_000,
+                    output_tokens: 1_000,
+                    ..Default::default()
+                },
+                TierSlice::default(),
+                TierSlice {
+                    input_tokens: 300_000,
+                    output_tokens: 1_500,
+                    ..Default::default()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn unreadable_above_tier_keys_are_skipped() {
+        // The object is a flat map so it merges like every other nested usage
+        // object, which means anything can land in it. A key naming no level
+        // classifies nothing, and an absurd one must not size a vector by it.
+        let usage = json!({
+            "input_tokens": 10,
+            "above_tier": {
+                "input_tokens": 5,
+                "level_x_input_tokens": 5,
+                "level_1_unknown_bucket": 5,
+                "level_99999999999_input_tokens": 5
+            }
+        });
+        assert!(extract_token_counts(&usage).above_tiers.is_empty());
     }
 
     #[test]
