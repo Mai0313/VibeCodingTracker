@@ -595,6 +595,14 @@ pub fn update_interactive(force: bool) -> Result<()> {
     }
 }
 
+// `Command::spawn` copies the descriptor table into the child, and the copies
+// only close at the child's own `exec`. Until then the child pins whatever the
+// rest of the process had open: a write descriptor on a staged candidate, so
+// another thread's `execve` of it fails with `ETXTBSY`, and the update lock's
+// `flock`, which outlives its owner dropping it and makes the next claim report
+// contention. Both were seen as CI flakes (#224), so every test here and in
+// `lock` that can reach a spawn or claim the lock joins the `update_spawn`
+// serial group.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -602,6 +610,7 @@ mod tests {
     use flate2::{Compression, write::GzEncoder};
     #[cfg(unix)]
     use httpmock::prelude::*;
+    use serial_test::serial;
     use std::cell::Cell;
 
     fn release(tag: &str) -> GitHubRelease {
@@ -634,6 +643,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial(update_spawn)]
     fn candidate_validation_has_a_bounded_timeout() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -768,6 +778,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(update_spawn)]
     fn current_day_cache_skips_fetch_and_install() {
         let dir = tempfile::tempdir().unwrap();
         let now = "2026-07-30T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
@@ -787,6 +798,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(update_spawn)]
     fn failed_fetch_is_throttled_for_the_rest_of_the_day() {
         let dir = tempfile::tempdir().unwrap();
         let now = "2026-07-30T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
@@ -823,6 +835,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial(update_spawn)]
     fn newer_release_installs_once_and_records_the_version() {
         let dir = tempfile::tempdir().unwrap();
         let now = "2026-07-30T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
@@ -865,6 +878,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(update_spawn)]
     fn current_release_never_calls_installer() {
         let dir = tempfile::tempdir().unwrap();
         let now = "2026-07-30T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
@@ -883,6 +897,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(update_spawn)]
     fn lock_contention_skips_without_fetching() {
         let dir = tempfile::tempdir().unwrap();
         let _lock = lock::UpdateLock::try_acquire(dir.path())
@@ -904,6 +919,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(update_spawn)]
     fn manual_update_lock_lives_beside_the_executable() {
         let install_dir = tempfile::tempdir().unwrap();
         let executable = install_dir.path().join("vibe_coding_tracker");
@@ -917,6 +933,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(update_spawn)]
     fn invalid_cache_path_fails_before_fetch() {
         let root = tempfile::tempdir().unwrap();
         let missing = root.path().join("missing");
@@ -937,6 +954,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial(update_spawn)]
     fn installation_downloads_and_atomically_replaces_the_target() {
         let candidate = release_binary("1.1.0");
         let archive = release_archive(&candidate);
@@ -968,6 +986,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial(update_spawn)]
     fn invalid_candidate_never_replaces_the_target() {
         let archive = release_archive(b"not an executable format");
         let server = MockServer::start();
@@ -995,6 +1014,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial(update_spawn)]
     fn wrong_candidate_version_never_replaces_the_target() {
         let archive = release_archive(&release_binary("1.0.0"));
         let server = MockServer::start();
@@ -1022,6 +1042,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial(update_spawn)]
     fn size_mismatch_never_replaces_the_target() {
         let archive = release_archive(b"truncated binary");
         let server = MockServer::start();

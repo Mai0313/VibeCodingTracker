@@ -34,11 +34,16 @@ pub(super) fn update_lock_path(lock_dir: &Path) -> PathBuf {
     lock_dir.join(LOCK_FILE)
 }
 
+// Both tests drop a lock and claim it again, so they join the update module's
+// `update_spawn` serial group; the note above its own tests says why a
+// concurrently forked child would otherwise keep the released `flock`.
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
+    #[serial(update_spawn)]
     fn only_one_process_claims_the_lock() {
         let dir = tempfile::tempdir().unwrap();
         let first = UpdateLock::try_acquire(dir.path())
@@ -50,6 +55,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(update_spawn)]
     fn concurrent_claims_have_one_winner() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::{Arc, Barrier};
