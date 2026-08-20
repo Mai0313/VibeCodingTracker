@@ -455,6 +455,11 @@ pub fn aggregate_usage_from_paths_with_cache(
 }
 
 /// [`aggregate_usage_from_paths_with_cache`] with scan options.
+///
+/// A tier snapshot in `options` also makes `cache` single-feature: sharing it
+/// with an analysis scan stays correct, but each alternation then clears the
+/// whole cache — database sources along with session files — so a caller
+/// wanting incremental refreshes for both keeps one cache per feature.
 pub fn aggregate_usage_from_paths_with_cache_opts(
     paths: &HelperPaths,
     time_range: TimeRange,
@@ -475,7 +480,7 @@ fn aggregate_usage_from_paths_with_cache_inner(
     // Cached summaries embed the tier classification, so a changed threshold
     // snapshot (daily pricing reload) invalidates every cached entry.
     let tiers = options.tiers.as_deref();
-    cache.ensure_tier_fingerprint(tiers.map_or(0, TierThresholds::fingerprint));
+    cache.ensure_tier_snapshot(tiers);
     cache.begin_scan();
     let mut accumulator = UsageAccumulator::default();
     let mut diagnostics = ScanDiagnostics::default();
