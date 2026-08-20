@@ -82,9 +82,10 @@ pub(crate) fn read_hermes_usage_contributions(
 /// matches Hermes, which subtracts raw columns.
 ///
 /// `unattributed` counts the session's per-model rows this reader could not
-/// place. Their tokens are deliberately left out of the sums above so the
-/// residual carries them instead; the count survives only until the session's
-/// own row does carry them, and is reported as drift when no row ever does.
+/// place, and that held something worth placing. Their tokens are deliberately
+/// left out of the sums above so the residual carries them instead; the count
+/// survives only until the session's own row does carry them, and is reported
+/// as drift when no row ever does.
 #[derive(Default)]
 struct RowSums {
     input: i64,
@@ -209,17 +210,26 @@ fn collect_per_model_rows(
         let reasoning = row.get::<_, i64>(6)?;
         let estimated = row.get::<_, f64>(7)?;
         let actual = row.get::<_, f64>(8)?;
+        // A row holding no tokens and no cost is nothing to carry and nothing
+        // to lose, so failing to place it below is not a loss to report.
+        let carries_usage = input != 0
+            || raw_output != 0
+            || reasoning != 0
+            || cache_read != 0
+            || cache_write != 0
+            || estimated != 0.0
+            || actual != 0.0;
         // `last_seen` (last activity) drives the date, falling back to `first_seen`.
         let seconds = row
             .get::<_, Option<f64>>(9)?
             .or(row.get::<_, Option<f64>>(10)?);
 
         let Some(seconds) = seconds else {
-            summed.entry(session_id).or_default().unattributed += 1;
+            mark_unattributed(summed, session_id, carries_usage);
             continue;
         };
         let Some(date) = ms_to_local_date((seconds * 1000.0) as i64) else {
-            summed.entry(session_id).or_default().unattributed += 1;
+            mark_unattributed(summed, session_id, carries_usage);
             continue;
         };
         let model = model.trim();
@@ -228,7 +238,7 @@ fn collect_per_model_rows(
             // row with no date at all fails that test in every window, which is
             // why the two guards above mark unconditionally.
             if !is_before_cutoff(&date, cutoff) {
-                summed.entry(session_id).or_default().unattributed += 1;
+                mark_unattributed(summed, session_id, carries_usage);
             }
             continue;
         }
@@ -329,11 +339,12 @@ fn reconcile_session_residuals(
         .max(0)
         .min(raw_output);
         let output = raw_output - reasoning;
-        let estimated = (row.get::<_, Option<f64>>(7)?.unwrap_or(0.0)
-            - acc.map_or(0.0, |a| a.estimated))
-        .max(0.0);
-        let actual =
-            (row.get::<_, Option<f64>>(8)?.unwrap_or(0.0) - acc.map_or(0.0, |a| a.actual)).max(0.0);
+        let estimated = residual_cost(
+            row.get::<_, Option<f64>>(7)?.unwrap_or(0.0) - acc.map_or(0.0, |a| a.estimated),
+        );
+        let actual = residual_cost(
+            row.get::<_, Option<f64>>(8)?.unwrap_or(0.0) - acc.map_or(0.0, |a| a.actual),
+        );
         if input == 0
             && raw_output == 0
             && cache_read == 0
@@ -341,6 +352,10 @@ fn reconcile_session_residuals(
             && estimated <= 0.0
             && actual <= 0.0
         {
+            // The marks the session's unplaceable rows left stand: an empty
+            // residual beside real unplaced tokens means the aggregate never
+            // counted them either, which is exactly the loss worth reporting.
+            // A row that held nothing was never marked in the first place.
             continue;
         }
 
@@ -366,9 +381,7 @@ fn reconcile_session_residuals(
         // not, so those rows stop being a loss. Out of the window it carries
         // nothing, but nothing is reported for the session there either, so an
         // unplaceable model costs this scan nothing worth raising.
-        if let Some(sums) = summed.get_mut(&id) {
-            sums.unattributed = 0;
-        }
+        clear_unattributed(summed, &id);
         if out_of_window {
             continue;
         }
@@ -383,6 +396,50 @@ fn reconcile_session_residuals(
         ));
     }
     Ok(())
+}
+
+/// Holds one unplaceable per-model row against its session, so the session's
+/// residual can carry it — or, when no residual ever does, so the scan reports
+/// it. A row that carried nothing is skipped: there is nothing to carry and
+/// nothing to lose, and marking it would flag a complete database as a lossy
+/// one.
+fn mark_unattributed(
+    summed: &mut FastHashMap<String, RowSums>,
+    session_id: String,
+    carries_usage: bool,
+) {
+    if carries_usage {
+        summed.entry(session_id).or_default().unattributed += 1;
+    }
+}
+
+/// Drops the marks a session's unplaceable per-model rows left behind.
+fn clear_unattributed(summed: &mut FastHashMap<String, RowSums>, id: &str) {
+    if let Some(sums) = summed.get_mut(id) {
+        sums.unattributed = 0;
+    }
+}
+
+/// Smallest residual cost this reader treats as money rather than noise.
+///
+/// A nanodollar sits far below the cheapest real token — a $0.05-per-million
+/// input rate makes one token `5e-8` — and far above what the subtraction below
+/// leaves behind, which is a few multiples of `f64::EPSILON` scaled to the
+/// session's own cost.
+const COST_EPSILON: f64 = 1e-9;
+
+/// Clamps one residual cost, snapping float noise to zero.
+///
+/// The residual is a session's stored cost minus the sum of its per-model
+/// costs, and two separately-rounded `f64` sums do not cancel exactly: the
+/// textbook `0.8 - (0.7 + 0.1)` leaves `1.1e-16`. That is not free to pass on,
+/// because both usage consumers read any nonzero cost as activity, so a session
+/// its rows already cover would emit a residual with every token bucket zero,
+/// mark its date an active Hermes day, and print a `$0.00` model row. Anything
+/// under [`COST_EPSILON`] is that noise; a negative residual (an aggregate its
+/// rows overshoot) is nothing owed either way.
+fn residual_cost(value: f64) -> f64 {
+    if value < COST_EPSILON { 0.0 } else { value }
 }
 
 /// Packs a row's token columns into the disjoint token buckets.
@@ -1166,6 +1223,165 @@ mod tests {
         let usage = usage_of(&sessions[0].1, "gpt-x");
         assert_eq!(usage["output_tokens"], 0);
         assert_eq!(usage["reasoning_output_tokens"], 5);
+        drop(dir);
+    }
+
+    #[test]
+    fn residual_of_float_noise_is_not_emitted() {
+        // Two per-model rows account for the session exactly, but their costs
+        // are an f64 sum: `0.8 - (0.7 + 0.1)` leaves `1.1e-16`. That used to
+        // emit a residual with every token bucket zero and a cost that renders
+        // as `$0.00` while still marking the day an active Hermes day.
+        let (dir, db_path) = make_db();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            let now = recent_epoch_secs();
+            insert_row(
+                &conn,
+                "s1",
+                "gpt-x",
+                "openai-api",
+                60,
+                6,
+                0,
+                0,
+                0,
+                0.7,
+                0.0,
+                now,
+            );
+            insert_row(
+                &conn,
+                "s1",
+                "gpt-y",
+                "openai-api",
+                40,
+                4,
+                0,
+                0,
+                0,
+                0.1,
+                0.0,
+                now,
+            );
+            insert_session(&conn, "s1", "gpt-x", 100, 10, 0, 0, 0.8, 0.0, now);
+        }
+        let read = read_hermes_usage_contributions(&db_path, TimeRange::All).unwrap();
+        assert_eq!(read.rows.len(), 2);
+        assert!(read.rows.iter().all(|row| row.tokens.has_activity()));
+        drop(dir);
+    }
+
+    #[test]
+    fn dust_in_the_actual_residual_no_longer_hides_a_real_estimated_one() {
+        // The cost picker prefers `actual` whenever it is positive, so an
+        // `actual` residual that is only float noise used to be reported in
+        // place of the real `estimated` residual beside it.
+        let (dir, db_path) = make_db();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            let now = recent_epoch_secs();
+            insert_row(
+                &conn,
+                "s1",
+                "gpt-x",
+                "openai-api",
+                60,
+                6,
+                0,
+                0,
+                0,
+                0.1,
+                0.7,
+                now,
+            );
+            insert_row(
+                &conn,
+                "s1",
+                "gpt-y",
+                "openai-api",
+                30,
+                3,
+                0,
+                0,
+                0,
+                0.1,
+                0.1,
+                now,
+            );
+            insert_session(&conn, "s1", "gpt-x", 100, 10, 0, 0, 0.5, 0.8, now);
+        }
+        let read = read_hermes_usage_contributions(&db_path, TimeRange::All).unwrap();
+        assert_eq!(read.rows.len(), 3);
+        let residual = read.rows.last().unwrap();
+        assert_eq!(residual.tokens.input_tokens, 10);
+        assert!((residual.stored_cost - 0.3).abs() < 1e-9);
+        drop(dir);
+    }
+
+    #[test]
+    fn covered_session_does_not_report_a_row_that_held_nothing() {
+        // The blank-model row carries no tokens and no cost, so there is
+        // nothing for the residual to carry and nothing to report as lost. The
+        // aggregate here leaves no residual at all, which is what used to make
+        // that row's mark stick.
+        let (dir, db_path) = make_db();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            let now = recent_epoch_secs();
+            insert_row(
+                &conn,
+                "s1",
+                "gpt-x",
+                "openai-api",
+                100,
+                10,
+                0,
+                0,
+                0,
+                0.5,
+                0.0,
+                now,
+            );
+            insert_row(&conn, "s1", "", "openai-api", 0, 0, 0, 0, 0, 0.0, 0.0, now);
+            insert_session(&conn, "s1", "gpt-x", 100, 10, 0, 0, 0.5, 0.0, now);
+        }
+        let read = read_hermes_usage_contributions(&db_path, TimeRange::All).unwrap();
+        assert_eq!(read.rows.len(), 1);
+        assert_eq!(read.failed_records(), 0);
+        drop(dir);
+    }
+
+    #[test]
+    fn covered_session_still_reports_a_row_that_held_something() {
+        // The mirror of the case above: the aggregate leaves no residual, but
+        // the unplaceable row carried 40 tokens. An aggregate that small has
+        // not counted them either, so they reach no output at all and the scan
+        // has to say so.
+        let (dir, db_path) = make_db();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            let now = recent_epoch_secs();
+            insert_row(
+                &conn,
+                "s1",
+                "gpt-x",
+                "openai-api",
+                100,
+                10,
+                0,
+                0,
+                0,
+                0.5,
+                0.0,
+                now,
+            );
+            insert_row(&conn, "s1", "", "openai-api", 40, 4, 0, 0, 0, 0.0, 0.0, now);
+            insert_session(&conn, "s1", "gpt-x", 100, 10, 0, 0, 0.5, 0.0, now);
+        }
+        let read = read_hermes_usage_contributions(&db_path, TimeRange::All).unwrap();
+        assert_eq!(read.rows.len(), 1);
+        assert_eq!(read.failed_records(), 1);
         drop(dir);
     }
 
