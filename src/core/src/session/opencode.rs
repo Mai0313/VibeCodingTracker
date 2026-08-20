@@ -84,8 +84,9 @@ pub(crate) fn read_opencode_usage_contributions(
     db_path: &Path,
     time_range: TimeRange,
 ) -> Result<DatabaseUsageRead> {
+    let cutoff_ms = cutoff_millis(time_range);
     with_readonly_connection(db_path, "session", "vct-opencode-", "OpenCode", |conn| {
-        collect_usage(conn, time_range)
+        collect_usage(conn, cutoff_ms)
     })
 }
 
@@ -153,10 +154,11 @@ pub(crate) fn read_opencode_analysis_with_diagnostics(
     time_range: TimeRange,
     mode: ParseMode,
 ) -> Result<OpenCodeAnalysisRead> {
+    let cutoff_ms = cutoff_millis(time_range);
     with_readonly_connection(db_path, "session", "vct-opencode-", "OpenCode", |conn| {
         let transaction = conn.unchecked_transaction()?;
-        let expected_records = count_analysis_candidates(&transaction, time_range)?;
-        let collected = collect_analysis(&transaction, time_range, mode)?;
+        let expected_records = count_analysis_candidates(&transaction, cutoff_ms)?;
+        let collected = collect_analysis(&transaction, cutoff_ms, mode)?;
         let parsed_records = collected.rows.len();
         transaction.commit()?;
         Ok(OpenCodeAnalysisRead {
@@ -173,7 +175,6 @@ struct MessageUsage {
     model_id: String,
     usage: UsageTokenContribution,
     cost: f64,
-    timestamp: Option<i64>,
 }
 
 /// Per-record accumulator used while folding tool parts.
@@ -189,30 +190,55 @@ struct CollectedAnalysis {
     failed_tool_parts: usize,
 }
 
+/// The one epoch-millis timestamp an assistant message is dated by.
+///
+/// Every query that selects or filters assistant messages interpolates this
+/// same fragment, and the collectors read the resolved column rather than
+/// re-deriving a timestamp from the JSON: two readers of one value cannot
+/// disagree about which rows a period contains. Every query using it must
+/// join both `message` and `session`.
+///
+/// The `typeof` guard is what makes the fallback chain total. `json_extract`
+/// hands back whatever JSON type the field holds, and only a number is a
+/// timestamp: anything else is passed over so the next candidate gets its
+/// turn, rather than being coerced into a number SQLite invents (`CAST` keeps
+/// the longest leading numeric prefix, so an ISO-8601 string would read as its
+/// year). Unguarded, such a value would also compare above every integer
+/// instead of numerically. The `CAST` itself is for a float, which `rusqlite`
+/// cannot read back as an `i64` at all.
+const MESSAGE_TIMESTAMP_SQL: &str = "COALESCE( \
+     CASE WHEN typeof(json_extract(message.data, '$.time.completed')) IN ('integer', 'real') \
+          THEN CAST(json_extract(message.data, '$.time.completed') AS INTEGER) END, \
+     CASE WHEN typeof(json_extract(message.data, '$.time.created')) IN ('integer', 'real') \
+          THEN CAST(json_extract(message.data, '$.time.created') AS INTEGER) END, \
+     session.time_updated \
+     )";
+
 /// Counts rows that should be understood by the current analysis reader.
 ///
 /// Every branch selects exactly what its collector counterpart selects: a row
 /// counted here but unreachable there is reported as schema drift, and a
-/// database made up entirely of such rows fails the whole scan.
-fn count_analysis_candidates(conn: &Connection, time_range: TimeRange) -> Result<usize> {
-    let cutoff_ms = cutoff_millis(time_range);
+/// database made up entirely of such rows fails the whole scan. That is also
+/// why `cutoff_ms` arrives as a value rather than a [`TimeRange`] to resolve
+/// here — resolving it twice would let a scan that straddles local midnight
+/// count one period and collect another.
+fn count_analysis_candidates(conn: &Connection, cutoff_ms: Option<i64>) -> Result<usize> {
     let (sql, parameterized) = if table_exists(conn, "message")? {
         match cutoff_ms {
             Some(_) => (
-                "SELECT COUNT(*) FROM message \
-                 JOIN session ON session.id = message.session_id \
-                 WHERE json_extract(message.data, '$.role') = 'assistant' \
-                   AND COALESCE( \
-                       json_extract(message.data, '$.time.completed'), \
-                       json_extract(message.data, '$.time.created'), \
-                       session.time_updated \
-                   ) >= ?1",
+                format!(
+                    "SELECT COUNT(*) FROM message \
+                     JOIN session ON session.id = message.session_id \
+                     WHERE json_extract(message.data, '$.role') = 'assistant' \
+                       AND {MESSAGE_TIMESTAMP_SQL} >= ?1"
+                ),
                 true,
             ),
             None => (
                 "SELECT COUNT(*) FROM message \
                  JOIN session ON session.id = message.session_id \
-                 WHERE json_extract(message.data, '$.role') = 'assistant'",
+                 WHERE json_extract(message.data, '$.role') = 'assistant'"
+                    .to_string(),
                 false,
             ),
         }
@@ -220,37 +246,35 @@ fn count_analysis_candidates(conn: &Connection, time_range: TimeRange) -> Result
         match cutoff_ms {
             Some(_) => (
                 "SELECT COUNT(*) FROM session \
-                 WHERE model IS NOT NULL AND model != '' AND time_updated >= ?1",
+                 WHERE model IS NOT NULL AND model != '' AND time_updated >= ?1"
+                    .to_string(),
                 true,
             ),
             None => (
-                "SELECT COUNT(*) FROM session WHERE model IS NOT NULL AND model != ''",
+                "SELECT COUNT(*) FROM session WHERE model IS NOT NULL AND model != ''".to_string(),
                 false,
             ),
         }
     };
     let count: i64 = if parameterized {
-        conn.query_row(sql, [cutoff_ms.unwrap_or_default()], |row| row.get(0))?
+        conn.query_row(&sql, [cutoff_ms.unwrap_or_default()], |row| row.get(0))?
     } else {
-        conn.query_row(sql, [], |row| row.get(0))?
+        conn.query_row(&sql, [], |row| row.get(0))?
     };
     Ok(usize::try_from(count).unwrap_or_default())
 }
 
 /// Collects the `usage` view from assistant messages when available.
-fn collect_usage(conn: &Connection, time_range: TimeRange) -> Result<DatabaseUsageRead> {
+fn collect_usage(conn: &Connection, cutoff_ms: Option<i64>) -> Result<DatabaseUsageRead> {
     if table_exists(conn, "message")? {
-        return collect_message_usage(conn, time_range);
+        return collect_message_usage(conn, cutoff_ms);
     }
 
-    collect_session_usage(conn, time_range)
+    collect_session_usage(conn, cutoff_ms)
 }
 
 /// Collects the `usage` view from the legacy `session` columns.
-fn collect_session_usage(conn: &Connection, time_range: TimeRange) -> Result<DatabaseUsageRead> {
-    let cutoff = cutoff_string(time_range);
-    let cutoff_ms = cutoff_millis(time_range);
-
+fn collect_session_usage(conn: &Connection, cutoff_ms: Option<i64>) -> Result<DatabaseUsageRead> {
     let sql = match cutoff_ms {
         Some(_) => {
             "SELECT model, tokens_input, tokens_output, tokens_reasoning, \
@@ -287,9 +311,6 @@ fn collect_session_usage(conn: &Connection, time_range: TimeRange) -> Result<Dat
         let Some(date) = ms_to_local_date(time_updated) else {
             continue;
         };
-        if is_before_cutoff(&date, &cutoff) {
-            continue;
-        }
 
         out.push(UsageContribution::single_model(
             date,
@@ -309,30 +330,23 @@ fn collect_session_usage(conn: &Connection, time_range: TimeRange) -> Result<Dat
 }
 
 /// Collects the `usage` view from assistant messages.
-fn collect_message_usage(conn: &Connection, time_range: TimeRange) -> Result<DatabaseUsageRead> {
-    let cutoff = cutoff_string(time_range);
-    let cutoff_ms = cutoff_millis(time_range);
-
+fn collect_message_usage(conn: &Connection, cutoff_ms: Option<i64>) -> Result<DatabaseUsageRead> {
     let sql = match cutoff_ms {
-        Some(_) => {
-            "SELECT session.time_updated, message.data \
+        Some(_) => format!(
+            "SELECT {MESSAGE_TIMESTAMP_SQL}, message.data \
              FROM message \
              JOIN session ON session.id = message.session_id \
              WHERE json_extract(message.data, '$.role') = 'assistant' \
-               AND COALESCE( \
-                   json_extract(message.data, '$.time.completed'), \
-                   json_extract(message.data, '$.time.created'), \
-                   session.time_updated \
-               ) >= ?1"
-        }
-        None => {
-            "SELECT session.time_updated, message.data \
+               AND {MESSAGE_TIMESTAMP_SQL} >= ?1"
+        ),
+        None => format!(
+            "SELECT {MESSAGE_TIMESTAMP_SQL}, message.data \
              FROM message \
              JOIN session ON session.id = message.session_id \
              WHERE json_extract(message.data, '$.role') = 'assistant'"
-        }
+        ),
     };
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare(&sql)?;
     let mut rows = match cutoff_ms {
         Some(cutoff_ms) => stmt.query([cutoff_ms])?,
         None => stmt.query([])?,
@@ -342,18 +356,14 @@ fn collect_message_usage(conn: &Connection, time_range: TimeRange) -> Result<Dat
     let mut expected_records = 0usize;
     while let Some(row) = rows.next()? {
         expected_records += 1;
-        let session_ts = row.get::<_, i64>(0)?;
+        let message_ts = row.get::<_, i64>(0)?;
         let data_text = row.get::<_, String>(1)?;
         let Some(message) = parse_message_usage(&data_text) else {
             continue;
         };
-        let message_ts = message.timestamp.unwrap_or(session_ts);
         let Some(date) = ms_to_local_date(message_ts) else {
             continue;
         };
-        if is_before_cutoff(&date, &cutoff) {
-            continue;
-        }
 
         out.push(UsageContribution::single_model(
             date,
@@ -375,26 +385,24 @@ fn collect_message_usage(conn: &Connection, time_range: TimeRange) -> Result<Dat
 /// Collects the `analysis` view from assistant messages + parts when available.
 fn collect_analysis(
     conn: &Connection,
-    time_range: TimeRange,
+    cutoff_ms: Option<i64>,
     mode: ParseMode,
 ) -> Result<CollectedAnalysis> {
     if table_exists(conn, "message")? {
-        return collect_message_analysis(conn, time_range, mode);
+        return collect_message_analysis(conn, cutoff_ms, mode);
     }
 
-    collect_session_analysis(conn, time_range, mode)
+    collect_session_analysis(conn, cutoff_ms, mode)
 }
 
 /// Collects the legacy `analysis` view from `session` + `part`.
 fn collect_session_analysis(
     conn: &Connection,
-    time_range: TimeRange,
+    cutoff_ms: Option<i64>,
     mode: ParseMode,
 ) -> Result<CollectedAnalysis> {
     let user = get_current_user();
     let machine = get_machine_id().to_string();
-    let cutoff = cutoff_string(time_range);
-    let cutoff_ms = cutoff_millis(time_range);
 
     // 1. Load session metadata and seed one parse state per session.
     let mut sessions: HashMap<String, AnalysisAccum> = HashMap::new();
@@ -499,12 +507,9 @@ fn collect_session_analysis(
         }
     }
 
-    // 3. Convert each session into a CodeAnalysis, honouring the time filter.
+    // 3. Convert each session into a CodeAnalysis.
     let mut out = Vec::with_capacity(sessions.len());
     for (id, accum) in sessions {
-        if is_before_cutoff(&accum.date, &cutoff) {
-            continue;
-        }
         let mut usage_map = FastHashMap::default();
         usage_map.insert(accum.model_id, accum.usage);
         let record = accum.state.into_record(usage_map);
@@ -524,36 +529,30 @@ fn collect_session_analysis(
 /// Collects the `analysis` view from assistant messages and their parts.
 fn collect_message_analysis(
     conn: &Connection,
-    time_range: TimeRange,
+    cutoff_ms: Option<i64>,
     mode: ParseMode,
 ) -> Result<CollectedAnalysis> {
     let user = get_current_user();
     let machine = get_machine_id().to_string();
-    let cutoff = cutoff_string(time_range);
-    let cutoff_ms = cutoff_millis(time_range);
 
     let mut messages: HashMap<String, AnalysisAccum> = HashMap::new();
     {
         let sql = match cutoff_ms {
-            Some(_) => {
-                "SELECT message.id, message.session_id, message.data, session.directory, session.time_updated \
+            Some(_) => format!(
+                "SELECT message.id, message.session_id, message.data, session.directory, {MESSAGE_TIMESTAMP_SQL} \
                  FROM message \
                  JOIN session ON session.id = message.session_id \
                  WHERE json_extract(message.data, '$.role') = 'assistant' \
-                   AND COALESCE( \
-                       json_extract(message.data, '$.time.completed'), \
-                       json_extract(message.data, '$.time.created'), \
-                       session.time_updated \
-                   ) >= ?1"
-            }
-            None => {
-                "SELECT message.id, message.session_id, message.data, session.directory, session.time_updated \
+                   AND {MESSAGE_TIMESTAMP_SQL} >= ?1"
+            ),
+            None => format!(
+                "SELECT message.id, message.session_id, message.data, session.directory, {MESSAGE_TIMESTAMP_SQL} \
                  FROM message \
                  JOIN session ON session.id = message.session_id \
                  WHERE json_extract(message.data, '$.role') = 'assistant'"
-            }
+            ),
         };
-        let mut stmt = conn.prepare(sql)?;
+        let mut stmt = conn.prepare(&sql)?;
         let mut rows = match cutoff_ms {
             Some(cutoff_ms) => stmt.query([cutoff_ms])?,
             None => stmt.query([])?,
@@ -564,17 +563,13 @@ fn collect_message_analysis(
             let session_id = row.get::<_, String>(1)?;
             let data_text = row.get::<_, String>(2)?;
             let directory = row.get::<_, String>(3)?;
-            let session_ts = row.get::<_, i64>(4)?;
+            let message_ts = row.get::<_, i64>(4)?;
             let Some(message) = parse_message_usage(&data_text) else {
                 continue;
             };
-            let message_ts = message.timestamp.unwrap_or(session_ts);
             let Some(date) = ms_to_local_date(message_ts) else {
                 continue;
             };
-            if is_before_cutoff(&date, &cutoff) {
-                continue;
-            }
 
             let mut state = SessionParseState::with_mode(mode);
             state.folder_path = directory;
@@ -596,30 +591,25 @@ fn collect_message_analysis(
     let mut failed_tool_parts = 0usize;
     {
         let sql = match cutoff_ms {
-            Some(_) => {
+            Some(_) => format!(
                 "SELECT part.message_id, part.data \
                  FROM part \
                  JOIN message ON message.id = part.message_id \
                  JOIN session ON session.id = part.session_id \
                  WHERE json_extract(message.data, '$.role') = 'assistant' \
                    AND json_extract(part.data, '$.type') = 'tool' \
-                   AND COALESCE( \
-                       json_extract(message.data, '$.time.completed'), \
-                       json_extract(message.data, '$.time.created'), \
-                       session.time_updated \
-                   ) >= ?1 \
+                   AND {MESSAGE_TIMESTAMP_SQL} >= ?1 \
                  ORDER BY part.id"
-            }
-            None => {
-                "SELECT part.message_id, part.data \
+            ),
+            None => "SELECT part.message_id, part.data \
                  FROM part \
                  JOIN message ON message.id = part.message_id \
                  WHERE json_extract(message.data, '$.role') = 'assistant' \
                    AND json_extract(part.data, '$.type') = 'tool' \
                  ORDER BY part.id"
-            }
+                .to_string(),
         };
-        let mut stmt = conn.prepare(sql)?;
+        let mut stmt = conn.prepare(&sql)?;
         let mut rows = match cutoff_ms {
             Some(cutoff_ms) => stmt.query([cutoff_ms])?,
             None => stmt.query([])?,
@@ -645,9 +635,6 @@ fn collect_message_analysis(
 
     let mut out = Vec::with_capacity(messages.len());
     for (id, accum) in messages {
-        if is_before_cutoff(&accum.date, &cutoff) {
-            continue;
-        }
         let mut usage_map = FastHashMap::default();
         usage_map.insert(accum.model_id, accum.usage);
         let record = accum.state.into_record(usage_map);
@@ -973,16 +960,11 @@ fn parse_message_usage(raw: &str) -> Option<MessageUsage> {
     let model_id = message_model_id(&data)?;
     let usage = parse_message_tokens(data.get("tokens")?)?;
     let cost = data.get("cost").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let timestamp = data
-        .get("time")
-        .and_then(|v| v.get("completed").or_else(|| v.get("created")))
-        .and_then(|v| v.as_i64());
 
     Some(MessageUsage {
         model_id,
         usage,
         cost,
-        timestamp,
     })
 }
 
@@ -1077,28 +1059,39 @@ fn ms_to_local_date(ms: i64) -> Option<String> {
     })
 }
 
-/// Pre-computes the `YYYY-MM-DD` cutoff for `time_range`, if any.
-fn cutoff_string(time_range: TimeRange) -> Option<String> {
+/// Converts the inclusive local-date cutoff into an epoch-millis lower bound.
+///
+/// `None` means [`TimeRange::All`] and nothing else. Every query builder reads
+/// it as "no date predicate", so a conversion that gave up here would drop the
+/// filter from the SQL while the caller still believed it had one.
+fn cutoff_millis(time_range: TimeRange) -> Option<i64> {
     time_range
         .cutoff_date()
-        .map(|d| d.format("%Y-%m-%d").to_string())
+        .map(|date| day_start_millis(&chrono::Local, date))
 }
 
-/// Converts the inclusive local-date cutoff into an epoch-millis lower bound.
-fn cutoff_millis(time_range: TimeRange) -> Option<i64> {
-    use chrono::{Datelike, TimeZone};
+/// Epoch-millis of the first instant of `date` in `tz`.
+///
+/// The timezone is a parameter so a test can drive one whose midnight is
+/// skipped without touching the ambient `TZ`.
+fn day_start_millis<Tz: chrono::TimeZone>(tz: &Tz, date: chrono::NaiveDate) -> i64 {
+    use chrono::{Offset, TimeDelta};
 
-    time_range.cutoff_date().and_then(|date| {
-        chrono::Local
-            .with_ymd_and_hms(date.year(), date.month(), date.day(), 0, 0, 0)
-            .earliest()
-            .map(|dt| dt.timestamp_millis())
-    })
-}
-
-/// Returns `true` when `date` is strictly before the cutoff (should be skipped).
-fn is_before_cutoff(date: &str, cutoff: &Option<String>) -> bool {
-    matches!(cutoff, Some(c) if date < c.as_str())
+    let midnight = date.and_time(chrono::NaiveTime::MIN);
+    // `earliest()` also picks the first of the pair when midnight is ambiguous,
+    // which is what a zone falling back onto its own midnight produces.
+    if let Some(start) = tz.from_local_datetime(&midnight).earliest() {
+        return start.timestamp_millis();
+    }
+    // `America/Santiago`, `America/Havana` and `Asia/Beirut` put their spring
+    // DST jump at local midnight, so once a year `00:00` never happens and
+    // there is nothing to map. The day still begins — at the jump itself,
+    // which is midnight read against the offset in force just before it. The
+    // probe is a full day earlier, further back than any offset can reach.
+    let before = tz.offset_from_utc_datetime(&(midnight - TimeDelta::days(1)));
+    (midnight - TimeDelta::seconds(i64::from(before.fix().local_minus_utc())))
+        .and_utc()
+        .timestamp_millis()
 }
 
 /// Returns whether a table exists in the OpenCode database.
@@ -1768,6 +1761,153 @@ mod tests {
         assert!(record.conversation_usage.contains_key("recent-model"));
         assert_eq!(record.tool_call_counts.read, 1);
         assert_eq!(record.total_read_lines, 1);
+    }
+
+    /// A zone that skips local midnight, the way `America/Santiago` does on
+    /// 2026-09-06: the clock jumps straight from `00:00` to `01:00`.
+    #[derive(Clone)]
+    struct MidnightGapZone;
+
+    impl MidnightGapZone {
+        const BEFORE: i32 = -4 * 3600;
+        const AFTER: i32 = -3 * 3600;
+
+        fn gap_date() -> chrono::NaiveDate {
+            chrono::NaiveDate::from_ymd_opt(2026, 9, 6).unwrap()
+        }
+
+        /// The instant the clock jumps, as a UTC datetime.
+        fn transition() -> chrono::NaiveDateTime {
+            Self::gap_date().and_hms_opt(4, 0, 0).unwrap()
+        }
+
+        fn offset(seconds: i32) -> chrono::FixedOffset {
+            chrono::FixedOffset::east_opt(seconds).unwrap()
+        }
+    }
+
+    impl chrono::TimeZone for MidnightGapZone {
+        type Offset = chrono::FixedOffset;
+
+        fn from_offset(_: &Self::Offset) -> Self {
+            Self
+        }
+
+        fn offset_from_local_date(
+            &self,
+            _: &chrono::NaiveDate,
+        ) -> chrono::MappedLocalTime<Self::Offset> {
+            chrono::MappedLocalTime::Single(Self::offset(Self::AFTER))
+        }
+
+        fn offset_from_local_datetime(
+            &self,
+            local: &chrono::NaiveDateTime,
+        ) -> chrono::MappedLocalTime<Self::Offset> {
+            let midnight = Self::gap_date().and_hms_opt(0, 0, 0).unwrap();
+            let resumes = Self::gap_date().and_hms_opt(1, 0, 0).unwrap();
+            if *local < midnight {
+                chrono::MappedLocalTime::Single(Self::offset(Self::BEFORE))
+            } else if *local < resumes {
+                chrono::MappedLocalTime::None
+            } else {
+                chrono::MappedLocalTime::Single(Self::offset(Self::AFTER))
+            }
+        }
+
+        fn offset_from_utc_date(&self, _: &chrono::NaiveDate) -> Self::Offset {
+            Self::offset(Self::AFTER)
+        }
+
+        fn offset_from_utc_datetime(&self, utc: &chrono::NaiveDateTime) -> Self::Offset {
+            if *utc < Self::transition() {
+                Self::offset(Self::BEFORE)
+            } else {
+                Self::offset(Self::AFTER)
+            }
+        }
+    }
+
+    #[test]
+    fn day_start_falls_forward_when_local_midnight_is_skipped() {
+        // `00:00` never happens, so the day begins where the clock jumps.
+        assert_eq!(
+            day_start_millis(&MidnightGapZone, MidnightGapZone::gap_date()),
+            MidnightGapZone::transition().and_utc().timestamp_millis()
+        );
+        // The next day is ordinary and still starts at its own local midnight.
+        let ordinary = chrono::NaiveDate::from_ymd_opt(2026, 9, 7).unwrap();
+        assert_eq!(
+            day_start_millis(&MidnightGapZone, ordinary),
+            ordinary
+                .and_hms_opt(3, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp_millis()
+        );
+    }
+
+    #[test]
+    fn message_timestamp_resolves_the_same_way_for_the_count_and_the_collectors() {
+        let now_ms = chrono::Local::now().timestamp_millis();
+        let stale_ms = 1000000000000i64;
+        // Every `$.time.*` value in a real OpenCode database is a JSON integer,
+        // so these are shapes a future writer could produce rather than ones it
+        // does. SQLite and serde_json read each of them differently, which is
+        // why the timestamp is resolved once in SQL and read back from there.
+        for (completed, created, kept) in [
+            // A JSON null is not a value, so `created` gets its turn.
+            (json!(null), now_ms, true),
+            (json!(now_ms as f64), stale_ms, true),
+            // Text is not a number however much it looks like one, and it must
+            // not drag a stale row into the period: unguarded, SQLite sorts it
+            // above every integer and the count keeps the row the collector
+            // cannot place.
+            (json!(now_ms.to_string()), stale_ms, false),
+            // Falling through leaves the row dated by `created`, not by the
+            // year SQLite would read out of the front of the string.
+            (json!("2026-08-20T00:00:00Z"), now_ms, true),
+        ] {
+            let (_dir, db_path) = make_db();
+            let conn = Connection::open(&db_path).unwrap();
+            // The session is stale, so only the message's own timestamp can put
+            // this row inside today.
+            conn.execute(
+                "INSERT INTO session (id, model, directory, time_updated) VALUES ('s1', '{\"id\":\"m1\"}', '/repo', ?1)",
+                rusqlite::params![stale_ms],
+            )
+            .unwrap();
+            let message = json!({
+                "role": "assistant",
+                "modelID": "m1",
+                "cost": 0.01,
+                "tokens": { "input": 10, "output": 0, "reasoning": 0, "cache": { "read": 0, "write": 0 } },
+                "time": { "created": created, "completed": completed },
+            });
+            conn.execute(
+                "INSERT INTO message (id, session_id, data) VALUES ('m1', 's1', ?1)",
+                [message.to_string()],
+            )
+            .unwrap();
+            drop(conn);
+
+            let expected = usize::from(kept);
+            let result = read_opencode_analysis_with_diagnostics(
+                &db_path,
+                TimeRange::Daily,
+                ParseMode::Full,
+            )
+            .unwrap();
+            assert_eq!(result.expected_records, expected, "counted {completed}");
+            assert_eq!(result.parsed_records, expected, "collected {completed}");
+            assert_eq!(
+                read_opencode_usage(&db_path, TimeRange::Daily)
+                    .unwrap()
+                    .len(),
+                expected,
+                "usage {completed}"
+            );
+        }
     }
 
     #[test]
