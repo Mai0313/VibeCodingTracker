@@ -100,8 +100,8 @@ fn test_version_command_json_matches_build_constants() {
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     // The whole object rather than a field at a time: the subcommand renders
     // `get_version_info()` while `--version` prints `VERSION` from `main.rs`
-    // ahead of clap, so this is what holds those two paths to one answer, and
-    // an exact match pins the key set on top of the values.
+    // ahead of clap, so this pins the subcommand's side of that pair to the
+    // same constants, and an exact match pins the key set as well as the values.
     assert_eq!(
         json,
         json!({
