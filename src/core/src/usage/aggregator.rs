@@ -439,6 +439,11 @@ pub fn aggregate_usage_from_paths_with_diagnostics(
 /// Reusing `cache` across calls reparses only sources whose fingerprint
 /// changed. Cached schema failures retain their diagnostics, while metadata,
 /// open, and read errors are not inserted and are retried next time.
+///
+/// One cache serves one feature at a time. Sharing it with an analysis scan
+/// stays correct, but the two scans then invalidate each other's session-file
+/// entries on every alternation, so a caller wanting incremental refreshes for
+/// both keeps one cache per feature.
 pub fn aggregate_usage_from_paths_with_cache(
     paths: &HelperPaths,
     time_range: TimeRange,
@@ -475,7 +480,7 @@ fn aggregate_usage_from_paths_with_cache_inner(
     // Cached summaries embed the tier classification, so a changed threshold
     // snapshot (daily pricing reload) invalidates every cached entry.
     let tiers = options.tiers.as_deref();
-    cache.ensure_tier_fingerprint(tiers.map_or(0, TierThresholds::fingerprint));
+    cache.ensure_tier_snapshot(tiers);
     cache.begin_scan();
     let mut accumulator = UsageAccumulator::default();
     let mut diagnostics = ScanDiagnostics::default();

@@ -490,12 +490,21 @@ pub fn aggregate_sessions_by_model_with_cache(
 /// `cache` is updated in place: a source whose fingerprint is unchanged is
 /// folded from its cached compact summary instead of being re-parsed, and file
 /// and analysis-database entries not seen in this scan are dropped.
+///
+/// One cache serves one feature at a time. Sharing it with a usage scan stays
+/// correct, but the two scans then invalidate each other's session-file entries
+/// on every alternation, so a caller wanting incremental refreshes for both
+/// keeps one cache per feature.
 pub fn aggregate_sessions_by_model_from_paths_with_cache(
     paths: &HelperPaths,
     time_range: TimeRange,
     providers: ProvidersConfig,
     cache: &mut SummaryScanCache,
 ) -> Result<AnalysisCollection> {
+    // This scan parses with no tier snapshot, so it stamps none: entries it
+    // writes classify nothing, and a usage scan holding a real snapshot has to
+    // reparse them rather than price them at base rates.
+    cache.ensure_tier_snapshot(None);
     cache.begin_scan();
     let mut projection = AnalysisProjection::new();
     let mut diagnostics = ScanDiagnostics::default();

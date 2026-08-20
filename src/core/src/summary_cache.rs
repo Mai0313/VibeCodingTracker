@@ -3,6 +3,7 @@
 use crate::constants::{FastHashMap, FastHashSet};
 use crate::models::TimeRange;
 use crate::models::{AggregatedAnalysisRow, CodeAnalysis, ExtensionType, UsageResult};
+use crate::pricing::TierThresholds;
 use crate::session::diagnostics::{UsageContribution, UsageTokenContribution};
 use crate::session::sqlite::{DatabaseFingerprint, append_suffix};
 use crate::utils::{extract_token_counts, merge_usage_values};
@@ -53,8 +54,15 @@ impl SummaryScanCache {
     /// Cached summaries embed the per-request tier classification, so a new
     /// thresholds snapshot (daily pricing reload, or pricing becoming
     /// available after an offline start) must invalidate them; unchanged
-    /// snapshots keep the incremental behavior.
-    pub(crate) fn ensure_tier_fingerprint(&mut self, fingerprint: u64) {
+    /// snapshots keep the incremental behavior. Scanning with no snapshot is
+    /// one of those changes, not an exemption from them: it writes entries
+    /// classified against nothing, so a later scan holding a real snapshot
+    /// must not reuse them.
+    ///
+    /// This takes the snapshot itself rather than its fingerprint so a scan
+    /// can only ever stamp what it is about to parse with.
+    pub(crate) fn ensure_tier_snapshot(&mut self, tiers: Option<&TierThresholds>) {
+        let fingerprint = tiers.map_or(0, TierThresholds::fingerprint);
         if self.tier_fingerprint != fingerprint {
             self.entries.clear();
             self.tier_fingerprint = fingerprint;
