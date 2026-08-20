@@ -883,6 +883,153 @@ mod tests {
         assert_eq!(record.tool_call_counts.write, 0);
         assert_eq!(record.total_edit_lines, 0);
         assert_eq!(record.total_write_lines, 0);
+
+        // The other way an edit can turn into a write: an `old_string` that is
+        // present but empty replaced nothing, which is not the same as a new
+        // file expressed as a diff. Only `add_edit_detail_raw` keeps them apart.
+        let empty_old = assistant(
+            "empty-old-edit",
+            "gemini-test",
+            10,
+            json!([{
+                "name": "replace",
+                "args": {
+                    "file_path": "/tmp/a.txt",
+                    "old_string": "",
+                    "new_string": "new"
+                }
+            }]),
+        );
+
+        let parsed =
+            parse_gemini_events_with_diagnostics(session(), vec![empty_old], ParseMode::Full, None)
+                .unwrap();
+        let record = &parsed.analysis.records[0];
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
+        assert_eq!(record.tool_call_counts.edit, 1);
+        assert_eq!(record.tool_call_counts.write, 0);
+        assert_eq!(record.total_edit_lines, 1);
+        assert_eq!(record.total_write_lines, 0);
+    }
+
+    #[test]
+    fn every_argument_alias_reaches_the_fold() {
+        // An argument's alias spellings are stated once, in
+        // `TrackedTool::read_args`, so a dropped alias no longer shows up as
+        // two lists disagreeing — it simply stops resolving. These assert on
+        // the folded content rather than on the counter, because a key that
+        // resolved to nothing would leave the counter right while the detail
+        // it carries went empty, which is the miscount this pairing produced.
+        for (old_key, new_key) in [("old_string", "new_string"), ("old_text", "new_text")] {
+            let mut args = json!({ "file_path": "/tmp/a.txt" });
+            args[old_key] = json!("one");
+            args[new_key] = json!("two\nthree");
+            let message = assistant(
+                "edit",
+                "gemini-test",
+                10,
+                json!([{ "name": "replace", "args": args }]),
+            );
+
+            let parsed = parse_gemini_events_with_diagnostics(
+                session(),
+                vec![message],
+                ParseMode::Full,
+                None,
+            )
+            .unwrap();
+            let record = &parsed.analysis.records[0];
+            assert_eq!(
+                parsed.diagnostics.partial_failure_count(),
+                0,
+                "{old_key}/{new_key} must not raise schema drift"
+            );
+            assert_eq!(record.tool_call_counts.edit, 1);
+            assert_eq!(
+                record.total_edit_lines, 2,
+                "{new_key} did not reach the fold"
+            );
+            assert_eq!(
+                record.edit_file_details[0].old_string, "one",
+                "{old_key} did not reach the fold"
+            );
+        }
+
+        for command_key in ["command", "cmd"] {
+            let mut args = json!({ "description": "list the tree" });
+            args[command_key] = json!("ls -la");
+            let message = assistant(
+                "shell",
+                "gemini-test",
+                10,
+                json!([{ "name": "run_shell_command", "args": args }]),
+            );
+
+            let parsed = parse_gemini_events_with_diagnostics(
+                session(),
+                vec![message],
+                ParseMode::Full,
+                None,
+            )
+            .unwrap();
+            let record = &parsed.analysis.records[0];
+            assert_eq!(
+                parsed.diagnostics.partial_failure_count(),
+                0,
+                "{command_key} must not raise schema drift"
+            );
+            assert_eq!(record.tool_call_counts.bash, 1);
+            assert_eq!(
+                record.run_command_details[0].command, "ls -la",
+                "{command_key} did not reach the fold"
+            );
+        }
+    }
+
+    #[test]
+    fn a_blank_command_is_counted_rather_than_dropped() {
+        // `add_run_command` drops a command that is empty after trimming, so a
+        // blank one must not be treated as readable: it would leave the call
+        // with no counter and no drift at all.
+        let message = assistant(
+            "blank-command",
+            "gemini-test",
+            10,
+            json!([{ "name": "run_shell_command", "args": { "command": "   " } }]),
+        );
+
+        let parsed =
+            parse_gemini_events_with_diagnostics(session(), vec![message], ParseMode::Full, None)
+                .unwrap();
+        let record = &parsed.analysis.records[0];
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 1);
+        assert_eq!(record.tool_call_counts.bash, 1);
+        assert!(record.run_command_details.is_empty());
+    }
+
+    #[test]
+    fn an_unsupported_tool_status_records_nothing() {
+        // A status this parser does not recognize is neither a run nor a
+        // failure, so it moves no counter — unlike every other non-success
+        // status, which counts the invocation.
+        let message = assistant(
+            "unsupported-status",
+            "gemini-test",
+            10,
+            json!([{
+                "name": "write_file",
+                "status": "cancelled",
+                "args": { "file_path": "/tmp/a.txt", "content": "one" }
+            }]),
+        );
+
+        let parsed =
+            parse_gemini_events_with_diagnostics(session(), vec![message], ParseMode::Full, None)
+                .unwrap();
+        let record = &parsed.analysis.records[0];
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 1);
+        assert_eq!(record.tool_call_counts.write, 0);
+        assert_eq!(record.total_write_lines, 0);
     }
 
     #[test]
