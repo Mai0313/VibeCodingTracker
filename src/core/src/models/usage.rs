@@ -2,7 +2,6 @@
 //! display layer.
 
 use crate::constants::FastHashMap;
-use crate::models::Provider;
 use serde::Serialize;
 
 /// Token usage data aggregated by model name (across all dates).
@@ -58,6 +57,16 @@ pub struct ProviderActiveDays {
 /// session to Claude Code. Keeping one `UsageResult` per provider lets the
 /// display layer sum tokens and cost by source with no prefix heuristics. It
 /// is populated at the same time as the global merged map.
+///
+/// There is deliberately no keyed accessor on this type. Its nine buckets are
+/// one per [`ExtensionType`](crate::models::ExtensionType) variant, so a
+/// [`Provider`](crate::models::Provider)-keyed lookup would carry a tenth
+/// `Unknown` naming no bucket here. And nothing ever arrives holding a single
+/// key to look up: the summary and pricing passes each need all nine under a
+/// per-provider rule, one aggregation path names all nine fields directly, and
+/// the one that does key its write keys it on `ExtensionType`.
+// A `Provider`-keyed `get` / `get_mut` pair, reachable only through the equally
+// uncalled `UsageData::provider_usage`, was removed in #237.
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct PerProviderUsage {
     /// Per-model usage attributed to Claude Code.
@@ -78,39 +87,4 @@ pub struct PerProviderUsage {
     pub grok: UsageResult,
     /// Per-model usage attributed to DeepSeek Harness.
     pub deepseek: UsageResult,
-}
-
-impl PerProviderUsage {
-    /// Returns the usage map for `provider`, or `None` for [`Provider::Unknown`].
-    pub fn get(&self, provider: Provider) -> Option<&UsageResult> {
-        match provider {
-            Provider::ClaudeCode => Some(&self.claude),
-            Provider::Codex => Some(&self.codex),
-            Provider::Copilot => Some(&self.copilot),
-            Provider::Gemini => Some(&self.gemini),
-            Provider::OpenCode => Some(&self.opencode),
-            Provider::Cursor => Some(&self.cursor),
-            Provider::Hermes => Some(&self.hermes),
-            Provider::Grok => Some(&self.grok),
-            Provider::DeepSeek => Some(&self.deepseek),
-            Provider::Unknown => None,
-        }
-    }
-
-    /// Returns a mutable handle to the usage map for `provider`, or `None` for
-    /// [`Provider::Unknown`].
-    pub fn get_mut(&mut self, provider: Provider) -> Option<&mut UsageResult> {
-        match provider {
-            Provider::ClaudeCode => Some(&mut self.claude),
-            Provider::Codex => Some(&mut self.codex),
-            Provider::Copilot => Some(&mut self.copilot),
-            Provider::Gemini => Some(&mut self.gemini),
-            Provider::OpenCode => Some(&mut self.opencode),
-            Provider::Cursor => Some(&mut self.cursor),
-            Provider::Hermes => Some(&mut self.hermes),
-            Provider::Grok => Some(&mut self.grok),
-            Provider::DeepSeek => Some(&mut self.deepseek),
-            Provider::Unknown => None,
-        }
-    }
 }
