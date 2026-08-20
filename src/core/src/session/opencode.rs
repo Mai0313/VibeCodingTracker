@@ -921,29 +921,6 @@ fn extract_patch_strings(lines: &[String]) -> (String, String) {
 /// zero output; `test_read_usage_maps_tokens` and
 /// `test_legacy_session_usage_keeps_reasoning_disjoint` hold the two read
 /// paths to that.
-/// The full prompt context of one assistant message.
-///
-/// OpenCode stores its buckets disjointly (`total == input + output +
-/// reasoning + cache.read + cache.write` on real databases), so the prompt is
-/// everything that is not completion: fresh input plus both cache buckets.
-/// That sum is what the provider compares against a context-tier boundary, the
-/// same way [`claude_request_context`](crate::utils::claude_request_context)
-/// reads a Claude request.
-//
-// One message is one request only because OpenCode almost always finishes an
-// assistant turn in a single step: on a real 1287-message database 1236 of the
-// 1237 messages carrying step parts have exactly one `step-start`, and the lone
-// two-step message recorded usage for only one of them, so no message there
-// actually sums two billed requests. A message that did would be classified
-// against the sum of its steps' contexts and could land a level high. Per-step
-// figures exist (`part` rows of type `step-finish` carry their own `tokens`),
-// but reading them would pull the whole `part` table onto the usage path, which
-// is the cost this reader exists to avoid, and 68 messages carry no
-// `step-finish` part at all to read.
-fn request_context(tokens: &UsageTokenContribution) -> i64 {
-    tokens.input_tokens + tokens.cache_read_tokens + tokens.cache_creation_tokens
-}
-
 fn session_usage_value(
     input: i64,
     output: i64,
@@ -958,6 +935,28 @@ fn session_usage_value(
         cache_read_tokens: cache_read,
         cache_creation_tokens: cache_write,
     }
+}
+
+/// The full prompt context of one assistant message.
+///
+/// The buckets above are disjoint, so the prompt is everything that is not
+/// completion: fresh input plus both cache buckets. That sum is what the
+/// provider compares against a context-tier boundary, the same way
+/// [`claude_request_context`](crate::utils::claude_request_context) reads a
+/// Claude request.
+//
+// One message is one request only because OpenCode almost always finishes an
+// assistant turn in a single step: on a real 1287-message database 1236 of the
+// 1237 messages carrying step parts have exactly one `step-start`, and the lone
+// two-step message recorded usage for only one of them, so no message there
+// actually sums two billed requests. A message that did would be classified
+// against the sum of its steps' contexts and could land a level high. Per-step
+// figures exist (`part` rows of type `step-finish` carry their own `tokens`),
+// but reading them would pull the whole `part` table onto the usage path, which
+// is the cost this reader exists to avoid, and 68 messages carry no
+// `step-finish` part at all to read.
+fn request_context(tokens: &UsageTokenContribution) -> i64 {
+    tokens.input_tokens + tokens.cache_read_tokens + tokens.cache_creation_tokens
 }
 
 /// Resolves the model name from the `session.model` column.
@@ -1625,11 +1624,11 @@ mod tests {
         conn.execute("DROP TABLE message", []).unwrap();
         conn.execute("DROP TABLE part", []).unwrap();
         conn.execute(
-	            "INSERT INTO session (id, model, directory, time_updated, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write)
-	             VALUES ('s1', '{\"id\":\"gpt-5.5\",\"providerID\":\"azure\"}', '/repo', 1780757088080, 0.02, 400000, 21, 26, 0, 0)",
-	            [],
-	        )
-	        .unwrap();
+            "INSERT INTO session (id, model, directory, time_updated, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write) \
+             VALUES ('s1', '{\"id\":\"gpt-5.5\",\"providerID\":\"azure\"}', '/repo', 1780757088080, 0.02, 400000, 21, 26, 0, 0)",
+            [],
+        )
+        .unwrap();
         drop(conn);
 
         let tiers = tier_snapshot();
