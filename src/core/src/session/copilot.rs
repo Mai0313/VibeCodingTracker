@@ -794,6 +794,40 @@ mod tests {
         state
     }
 
+    /// What one folded call moved, so a tool filed under the wrong variant
+    /// fails on the whole shape rather than on one counter it happens to share.
+    #[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
+    struct Counters {
+        read: usize,
+        write: usize,
+        edit: usize,
+        bash: usize,
+        read_lines: usize,
+    }
+
+    impl Counters {
+        fn of(state: &SessionParseState) -> Self {
+            Self {
+                read: state.tool_counts.read,
+                write: state.tool_counts.write,
+                edit: state.tool_counts.edit,
+                bash: state.tool_counts.bash,
+                read_lines: state.total_read_lines,
+            }
+        }
+    }
+
+    /// An arguments object built from string pairs, for the alias walk below
+    /// (whose keys are loop variables rather than literals).
+    fn args_of(pairs: &[(&str, &str)]) -> Value {
+        Value::Object(
+            pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), json!(value)))
+                .collect(),
+        )
+    }
+
     fn count_lines_after_trim(s: &str) -> usize {
         // Mirror `add_read_detail`'s `trim_end_matches('\n')` + `count_lines`
         // so the test reflects the actual line tally the analyzer would
@@ -881,6 +915,25 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_view_range_counts_the_read_without_inventing_lines() {
+        // A bound that is not an integer used to be called drift by the schema
+        // check and read anyway by the fold, whose `unwrap_or(0)` turned it
+        // into the span `[0, 0]` — one fabricated line for a range nobody
+        // could read.
+        let args = json!({ "path": "/tmp/a.txt", "view_range": ["1", "5"] });
+        let result = json!({ "content": "alpha\nbeta" });
+        assert!(
+            !read("show_file", &args, &result)
+                .expect("readable arguments")
+                .is_complete()
+        );
+
+        let state = fold("show_file", args, result);
+        assert_eq!(state.tool_counts.read, 1);
+        assert_eq!(state.total_read_lines, 0);
+    }
+
+    #[test]
     fn current_search_tools_count_read_invocations_without_fake_lines() {
         let mut state = SessionParseState::new();
         for tool_name in ["rg", "grep", "glob", "web_search", "web_fetch"] {
@@ -955,6 +1008,187 @@ mod tests {
         );
         assert_eq!(state.tool_counts.bash, 1);
         assert_eq!(state.run_details.len(), 1);
+    }
+
+    #[test]
+    fn every_tracked_tool_name_folds_into_its_metric() {
+        // `TrackedTool::from_name` is the only place these names are spelled
+        // now, and a list of strings is not something the compiler checks, so
+        // every one is walked here: a name dropped from the table stops folding
+        // altogether rather than merely losing its detail.
+        let read_args = json!({ "path": "/tmp/a.txt", "view_range": [1, 2] });
+        let search_args = json!({ "pattern": "needle" });
+        let write_args = json!({ "path": "/tmp/a.txt", "content": "one\ntwo" });
+        let edit_args = json!({ "path": "/tmp/a.txt", "old_string": "one", "new_string": "two" });
+        let patch_args =
+            json!("*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-old\n+new\n*** End Patch");
+        let shell_args = json!({ "command": "ls" });
+        let write_bash_args = json!({ "input": "yes" });
+
+        // Read lines are what separate the two families sharing the read
+        // counter. Every other pair needs different arguments, so a name filed
+        // under the wrong variant reads as nothing and folds nothing.
+        let families: &[(&[&str], &Value, Counters)] = &[
+            (
+                &["view", "show_file", "read_file"],
+                &read_args,
+                Counters {
+                    read: 1,
+                    read_lines: 2,
+                    ..Counters::default()
+                },
+            ),
+            (
+                &["rg", "grep", "glob", "web_search", "web_fetch"],
+                &search_args,
+                Counters {
+                    read: 1,
+                    ..Counters::default()
+                },
+            ),
+            (
+                &["create", "write_file", "write"],
+                &write_args,
+                Counters {
+                    write: 1,
+                    ..Counters::default()
+                },
+            ),
+            (
+                &["str_replace", "edit", "replace", "edit_file"],
+                &edit_args,
+                Counters {
+                    edit: 1,
+                    ..Counters::default()
+                },
+            ),
+            (
+                &["apply_patch"],
+                &patch_args,
+                Counters {
+                    edit: 1,
+                    ..Counters::default()
+                },
+            ),
+            (
+                &["bash", "shell", "execute"],
+                &shell_args,
+                Counters {
+                    bash: 1,
+                    ..Counters::default()
+                },
+            ),
+            (
+                &["write_bash"],
+                &write_bash_args,
+                Counters {
+                    bash: 1,
+                    ..Counters::default()
+                },
+            ),
+        ];
+
+        for (names, args, expected) in families {
+            for name in *names {
+                let state = fold(name, (*args).clone(), completed_result());
+                assert_eq!(
+                    Counters::of(&state),
+                    *expected,
+                    "`{name}` must fold into its metric"
+                );
+            }
+        }
+
+        // A name outside the table is not tracked, so it is neither folded nor
+        // reported as drift.
+        assert!(TrackedTool::from_name("report_intent").is_none());
+    }
+
+    #[test]
+    fn an_edit_that_replaces_nothing_is_reclassified_as_a_write() {
+        // Copilot folds edits through `add_edit_detail`, not the `_raw` form
+        // its Gemini counterpart uses: an empty `old_string` here is a new file
+        // expressed as a diff, and lands as a write. Nothing pinned that before
+        // the two readers became one, and the schema check has always let an
+        // empty string through.
+        let state = fold(
+            "str_replace",
+            json!({ "path": "/tmp/a.txt", "old_string": "", "new_string": "one\ntwo" }),
+            Value::Null,
+        );
+        assert_eq!(state.tool_counts.write, 1);
+        assert_eq!(state.tool_counts.edit, 0);
+        assert_eq!(state.total_write_lines, 2);
+    }
+
+    #[test]
+    fn every_argument_alias_reaches_the_fold() {
+        // The alias sets live in `TrackedTool::read_args` alone now, but a list
+        // of strings is not something the compiler checks either. Each case
+        // asserts on the folded *content*, not on a counter: an alias that
+        // resolved to nothing would leave the counter right and the detail
+        // empty.
+        for old_key in ["old_string", "old_str", "old_text"] {
+            for new_key in ["new_string", "new_str", "new_text"] {
+                let state = fold(
+                    "str_replace",
+                    args_of(&[
+                        ("path", "/tmp/a.txt"),
+                        (old_key, "before"),
+                        (new_key, "after"),
+                    ]),
+                    Value::Null,
+                );
+                let detail = state.edit_details.first().expect("one folded edit");
+                assert_eq!(detail.old_string, "before", "`{old_key}` reaches the fold");
+                assert_eq!(detail.new_string, "after", "`{new_key}` reaches the fold");
+            }
+        }
+
+        for content_key in ["file_text", "content"] {
+            let state = fold(
+                "create",
+                args_of(&[("path", "/tmp/a.txt"), (content_key, "one\ntwo")]),
+                Value::Null,
+            );
+            let detail = state.write_details.first().expect("one folded write");
+            assert_eq!(
+                detail.content, "one\ntwo",
+                "`{content_key}` reaches the fold"
+            );
+        }
+
+        for command_key in ["command", "cmd"] {
+            let state = fold(
+                "bash",
+                args_of(&[(command_key, "ls -l"), ("description", "list")]),
+                Value::Null,
+            );
+            let detail = state.run_details.first().expect("one folded command");
+            assert_eq!(detail.command, "ls -l", "`{command_key}` reaches the fold");
+            assert_eq!(detail.description, "list");
+        }
+    }
+
+    #[test]
+    fn a_log_spelling_two_aliases_takes_the_earlier_one() {
+        // `arg_str` resolves an alias list in order, which is what the chain of
+        // `.or_else(|| args.get(..))` calls it replaced did. Reordering a list
+        // is the one edit to `read_args` that changes an answer without
+        // changing what the parser accepts.
+        let state = fold(
+            "str_replace",
+            json!({
+                "path": "/tmp/a.txt",
+                "old_text": "historical",
+                "old_str": "middle",
+                "old_string": "current",
+                "new_string": "after",
+            }),
+            Value::Null,
+        );
+        let detail = state.edit_details.first().expect("one folded edit");
+        assert_eq!(detail.old_string, "current");
     }
 
     #[test]
