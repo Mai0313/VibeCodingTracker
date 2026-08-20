@@ -516,19 +516,22 @@ fn auto_update_with(
     fetch_release: impl FnOnce() -> Result<GitHubRelease>,
     install_release: impl FnOnce(&GitHubRelease, &Version) -> Result<InstallationDisposition>,
 ) -> Result<AutoUpdateOutcome> {
-    let Some(_lock) = lock::UpdateLock::try_acquire(lock_dir)? else {
-        log::warn!("startup auto-update skipped because another update is running");
-        return Ok(AutoUpdateOutcome::Skipped);
-    };
-
     let record = version_cache::read_self_version_in(cache_dir);
     if !version_cache::check_is_due(&record, now) {
         return Ok(AutoUpdateOutcome::Skipped);
     }
 
-    // Claim today's attempt before touching the network. If GitHub is down, the
-    // failed request is still throttled until the next UTC date.
+    // Claim today's attempt before the lock and before the network, so whatever
+    // stops this run — a lock another process holds, an install directory this
+    // user cannot write, a GitHub outage — is reported once rather than on every
+    // command until the next UTC date. The price is the check this run gives up.
     version_cache::record_check_attempt_in(cache_dir, now)?;
+
+    let Some(_lock) = lock::UpdateLock::try_acquire(lock_dir)? else {
+        log::warn!("startup auto-update skipped because another update is running");
+        return Ok(AutoUpdateOutcome::Skipped);
+    };
+
     let release = fetch_release().context("Failed to fetch latest release information")?;
     let latest_version = parse_latest_version(&release)?;
     if let Err(error) =
@@ -898,9 +901,9 @@ mod tests {
 
     #[test]
     #[serial(update_spawn)]
-    fn lock_contention_skips_without_fetching() {
+    fn lock_contention_is_throttled_for_the_rest_of_the_day() {
         let dir = tempfile::tempdir().unwrap();
-        let _lock = lock::UpdateLock::try_acquire(dir.path())
+        let lock = lock::UpdateLock::try_acquire(dir.path())
             .unwrap()
             .expect("lock");
         let now = "2026-07-30T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
@@ -914,8 +917,61 @@ mod tests {
             |_, _| panic!("contended process must not install"),
         )
         .unwrap();
-
         assert_eq!(outcome, AutoUpdateOutcome::Skipped);
+
+        // The losing run spent today's check, so a lock that has since been
+        // released is not retried until the next UTC date.
+        drop(lock);
+        let second = auto_update_with(
+            dir.path(),
+            dir.path(),
+            &Version::new(1, 0, 0),
+            now,
+            || panic!("a lost lock must not fetch twice on one UTC date"),
+            |_, _| panic!("a lost lock must not install twice on one UTC date"),
+        )
+        .unwrap();
+
+        assert_eq!(second, AutoUpdateOutcome::Skipped);
+    }
+
+    #[test]
+    #[serial(update_spawn)]
+    fn unclaimable_lock_is_throttled_for_the_rest_of_the_day() {
+        let dir = tempfile::tempdir().unwrap();
+        // A regular file where the install directory belongs: opening the lock
+        // inside it fails for every user, root included, unlike a directory
+        // made unwritable by its mode.
+        let lock_dir = dir.path().join("not-a-directory");
+        fs::write(&lock_dir, b"binary").unwrap();
+        let now = "2026-07-30T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+
+        let first = auto_update_with(
+            dir.path(),
+            &lock_dir,
+            &Version::new(1, 0, 0),
+            now,
+            || panic!("an unclaimable lock must not fetch"),
+            |_, _| panic!("an unclaimable lock must not install"),
+        );
+        assert!(first.is_err());
+        // Reported once because the day was already spent on the way in.
+        assert_eq!(
+            version_cache::read_self_version_in(dir.path()).last_checked_at,
+            "2026-07-30T12:00:00.000000000Z"
+        );
+
+        let second = auto_update_with(
+            dir.path(),
+            &lock_dir,
+            &Version::new(1, 0, 0),
+            now,
+            || panic!("an unclaimable lock must not fetch twice on one UTC date"),
+            |_, _| panic!("an unclaimable lock must not install twice on one UTC date"),
+        )
+        .unwrap();
+
+        assert_eq!(second, AutoUpdateOutcome::Skipped);
     }
 
     #[test]
@@ -950,6 +1006,9 @@ mod tests {
         );
 
         assert!(result.is_err());
+        // Today's claim precedes the lock's, so a failed one leaves the install
+        // directory untouched.
+        assert!(!lock::update_lock_path(root.path()).exists());
     }
 
     #[cfg(unix)]
