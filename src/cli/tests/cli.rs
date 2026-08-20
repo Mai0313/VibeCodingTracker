@@ -1,11 +1,13 @@
 // Integration tests for the built `vct` binary.
 //
 // Two groups:
-//  1. CLI wiring and single-file behavior. Only a check that exits inside clap
-//     — `--help`, an unknown subcommand, a rejected flag combination — runs on
-//     the inherited environment; anything that reaches dispatch uses an
-//     isolated child HOME, because `run()` calls `run_startup_auto_update`
-//     before the subcommand arm and that reads `~/.vct/config.toml`.
+//  1. CLI wiring and single-file behavior. Only a check that stops before
+//     dispatch — `--help`, an unknown subcommand, a rejected flag combination,
+//     or the top-level `--version` / `-V` flag `main.rs` short-circuits ahead
+//     of clap — runs on the inherited environment; anything that reaches
+//     dispatch uses an isolated child HOME, because `run()` calls
+//     `run_startup_auto_update` before the subcommand arm and that reads
+//     `~/.vct/config.toml`.
 //  2. Per-child HOME smoke tests — batch `usage` / `analysis` run against an
 //     isolated temp HOME seeded with fixture sessions plus an offline pricing
 //     cache, while the `config` and startup side-effect checks seed only what
