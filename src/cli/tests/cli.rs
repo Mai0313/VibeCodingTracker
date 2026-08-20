@@ -1,10 +1,11 @@
 // Integration tests for the built `vct` binary.
 //
 // Two groups:
-//  1. CLI wiring and single-file behavior. Checks that stop at clap, plus the
-//     settings-free `version` command, run on the inherited environment; every
-//     command that can parse a session, log, or reach a provider path uses an
-//     isolated child HOME.
+//  1. CLI wiring and single-file behavior. Only a check that exits inside clap
+//     — `--help`, an unknown subcommand, a rejected flag combination — runs on
+//     the inherited environment; anything that reaches dispatch uses an
+//     isolated child HOME, because `run()` calls `run_startup_auto_update`
+//     before the subcommand arm and that reads `~/.vct/config.toml`.
 //  2. Per-child HOME smoke tests — batch `usage` / `analysis` run against an
 //     isolated temp HOME seeded with fixture sessions plus an offline pricing
 //     cache, while the `config` and startup side-effect checks seed only what
@@ -57,8 +58,8 @@ fn child_cmd(home: &TempHome) -> Command {
 
 #[test]
 fn test_version_command() {
-    Command::cargo_bin("vibe_coding_tracker")
-        .unwrap()
+    let home = TempHome::new();
+    child_cmd(&home)
         .arg("version")
         .assert()
         .success()
@@ -87,8 +88,8 @@ fn test_short_version_flag_outputs_build_version_only() {
 
 #[test]
 fn test_version_command_json() {
-    let output = Command::cargo_bin("vibe_coding_tracker")
-        .unwrap()
+    let home = TempHome::new();
+    let output = child_cmd(&home)
         .arg("version")
         .arg("--json")
         .output()
@@ -100,8 +101,8 @@ fn test_version_command_json() {
 
 #[test]
 fn test_version_command_text() {
-    Command::cargo_bin("vibe_coding_tracker")
-        .unwrap()
+    let home = TempHome::new();
+    child_cmd(&home)
         .arg("version")
         .arg("--text")
         .assert()
@@ -577,8 +578,8 @@ fn test_quota_multiple_output_formats() {
 
 #[test]
 fn test_cli_version_matches_cargo() {
-    let output = Command::cargo_bin("vibe_coding_tracker")
-        .unwrap()
+    let home = TempHome::new();
+    let output = child_cmd(&home)
         .arg("version")
         .arg("--json")
         .output()
