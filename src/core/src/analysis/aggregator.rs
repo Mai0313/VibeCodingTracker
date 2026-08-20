@@ -491,10 +491,10 @@ pub fn aggregate_sessions_by_model_with_cache(
 /// folded from its cached compact summary instead of being re-parsed, and file
 /// and analysis-database entries not seen in this scan are dropped.
 ///
-/// One cache serves one feature at a time. Sharing it with a usage scan stays
-/// correct, but the two scans then invalidate each other's session-file entries
-/// on every alternation, so a caller wanting incremental refreshes for both
-/// keeps one cache per feature.
+/// A usage scan carrying a tier snapshot makes `cache` single-feature: sharing
+/// it with one stays correct, but each alternation then clears the whole cache
+/// — database sources along with session files — so a caller wanting
+/// incremental refreshes for both keeps one cache per feature.
 pub fn aggregate_sessions_by_model_from_paths_with_cache(
     paths: &HelperPaths,
     time_range: TimeRange,

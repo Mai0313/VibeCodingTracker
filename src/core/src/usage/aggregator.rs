@@ -439,11 +439,6 @@ pub fn aggregate_usage_from_paths_with_diagnostics(
 /// Reusing `cache` across calls reparses only sources whose fingerprint
 /// changed. Cached schema failures retain their diagnostics, while metadata,
 /// open, and read errors are not inserted and are retried next time.
-///
-/// One cache serves one feature at a time. Sharing it with an analysis scan
-/// stays correct, but the two scans then invalidate each other's session-file
-/// entries on every alternation, so a caller wanting incremental refreshes for
-/// both keeps one cache per feature.
 pub fn aggregate_usage_from_paths_with_cache(
     paths: &HelperPaths,
     time_range: TimeRange,
@@ -460,6 +455,11 @@ pub fn aggregate_usage_from_paths_with_cache(
 }
 
 /// [`aggregate_usage_from_paths_with_cache`] with scan options.
+///
+/// A tier snapshot in `options` also makes `cache` single-feature: sharing it
+/// with an analysis scan stays correct, but each alternation then clears the
+/// whole cache — database sources along with session files — so a caller
+/// wanting incremental refreshes for both keeps one cache per feature.
 pub fn aggregate_usage_from_paths_with_cache_opts(
     paths: &HelperPaths,
     time_range: TimeRange,
