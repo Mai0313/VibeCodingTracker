@@ -211,6 +211,8 @@ Two base URLs: `cloudcode-pa.googleapis.com` (prod) and `daily-cloudcode-pa.goog
 
 ```bash
 # The stored access_token is ~1h-lived; if this 401s, run Refresh token below and use that access_token.
+# Where the agy CLI is installed, `agy models >/dev/null` refreshes it in place as a side effect, which
+# is the way through when you do not have the client_secret that Refresh token below needs.
 TOKEN=$(jq -r '.token.access_token' ~/.gemini/antigravity-cli/antigravity-oauth-token)
 
 curl -s -X POST "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary" \
@@ -220,7 +222,7 @@ curl -s -X POST "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuot
     -d '{}' | jq
 ```
 
-Each bucket carries `bucketId` (`gemini-5h` / `gemini-weekly` / `3p-5h` / `3p-weekly`), `remainingFraction` (0…1, where 1 = full, so used% = `(1 - remainingFraction) * 100`), and `resetTime`.
+The buckets are not flat. The response is a `groups` array, one entry per shared pool, each carrying its own `displayName` (`Gemini Models` / `Claude and GPT models`) and a `description` naming the models in it, with that pool's two buckets nested under `buckets`. A bucket carries `bucketId` (`gemini-5h` / `gemini-weekly` / `3p-5h` / `3p-weekly`), `displayName`, `window` (`5h` / `weekly`), `resetTime`, and `remainingFraction` (0…1, where 1 = full, so used% = `(1 - remainingFraction) * 100`). Its own `description` is a sentence about what has been consumed so far, and proto3 omits it entirely while the bucket is still full — treat it as optional rather than as something every bucket has. A top-level `description` restates the shared-limit rules.
 
 Older builds lack that RPC; the legacy fallbacks are 5h-only and take the same bearer token:
 
