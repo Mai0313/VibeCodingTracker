@@ -1,3 +1,11 @@
+# Normalize every text file to LF, in the repo and in the working tree, so a
+# Windows checkout cannot introduce CRLF.
+* text=auto eol=lf
+
+# cmd.exe needs CRLF in batch files.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
 # *.md linguist-detectable=false
 # *.sh linguist-detectable=false
 # Makefile linguist-detectable=false
