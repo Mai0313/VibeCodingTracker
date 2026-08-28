@@ -40,7 +40,7 @@ where
         result.push_str(&digits[..remainder]);
     }
 
-    for (i, chunk) in digits.as_bytes()[remainder..].chunks_exact(3).enumerate() {
+    for (i, chunk) in digits.as_bytes()[remainder..].as_chunks::<3>().0.iter().enumerate() {
         if remainder > 0 || i > 0 {
             result.push(',');
         }
