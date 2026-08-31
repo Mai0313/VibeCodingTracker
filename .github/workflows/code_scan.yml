@@ -53,9 +53,9 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: CodeQL Initialize
-        uses: github/codeql-action/init@v4.37.8
+        uses: github/codeql-action/init@v4.37.9
         with:
           languages: rust
 
       - name: CodeQL Analyze
-        uses: github/codeql-action/analyze@v4.37.8
+        uses: github/codeql-action/analyze@v4.37.9
