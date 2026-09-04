@@ -30,7 +30,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Trufflehog Scanning
-        uses: trufflesecurity/trufflehog@v3.97.1
+        uses: trufflesecurity/trufflehog@v3.97.2
         with:
           # The Lob detector matches `(live|test)_` plus 35 word characters, so
           # any test named as a full sentence can hit it. Lob itself answers a
