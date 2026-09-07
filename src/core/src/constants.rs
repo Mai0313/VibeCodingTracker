@@ -34,7 +34,7 @@ pub mod capacity {
     ///
     /// Deliberately small: every entry holds an `Arc<CodeAnalysis>`, and only
     /// library callers reach this cache; the CLI and TUI scan paths use the
-    /// compact [`crate::summary_cache::SummaryScanCache`] instead.
+    /// compact [`crate::ledger::SessionLedger`] instead.
     pub const FILE_CACHE_SIZE: usize = 5;
 
     /// Expected number of token fields per usage entry.

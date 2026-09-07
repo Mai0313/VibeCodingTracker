@@ -1,16 +1,20 @@
 //! Shared provider-scan primitives for the `usage` and `analysis` roll-ups.
 //!
-//! Both features discover the same provider sources, parse each one, and record
-//! the same candidate / parsed / failure diagnostics. This module owns the
-//! parts that do not depend on which feature is folding: the unified
-//! [`ScanDiagnostics`] result type and the dedicated scan thread pool.
+//! Both features discover the same provider sources, read each one through the
+//! same session ledger, and record the same candidate / parsed / retained /
+//! failure diagnostics. This module owns the parts that do not depend on which
+//! feature is folding: the unified [`ScanDiagnostics`] result type, the
+//! ledger-backed scanners, and the dedicated scan thread pool.
 
 pub(crate) mod compact;
+pub(crate) mod cursor;
+pub(crate) mod database;
 pub(crate) mod descriptor;
 
-pub(crate) use compact::{
-    CompactSink, LoadedCompactSummary, fold_cached, fold_loaded, scan_cached_files,
-};
+pub(crate) use crate::ledger::ScanFeature;
+pub(crate) use compact::{CompactSink, scan_cached_files};
+pub(crate) use cursor::scan_cursor_stores;
+pub(crate) use database::{group_analysis_rows, group_usage_rows, scan_database_half};
 pub(crate) use descriptor::scan_all_cached_files;
 
 use crate::models::ExtensionType;
@@ -31,7 +35,7 @@ pub struct ScanFailure {
     pub error: String,
 }
 
-/// Candidate, success, and failure counts for one scan.
+/// Candidate, success, retained and failure counts for one scan.
 ///
 /// A candidate is the smallest independently readable source. `parsed` counts
 /// candidates read successfully (including valid blank sources), not the number
@@ -42,6 +46,8 @@ pub struct ScanDiagnostics {
     pub candidates: usize,
     /// Number of candidates parsed or read successfully.
     pub parsed: usize,
+    /// Sessions folded from the ledger whose source is no longer on disk.
+    pub retained: usize,
     /// Failures in deterministic provider and source order.
     pub failures: Vec<ScanFailure>,
 }
@@ -52,9 +58,10 @@ impl ScanDiagnostics {
         !self.failures.is_empty()
     }
 
-    /// Whether candidates existed but none could be read successfully.
+    /// Whether candidates existed but none could be read successfully, and
+    /// nothing was retained from the ledger to show in their place.
     pub fn all_failed(&self) -> bool {
-        self.candidates > 0 && self.parsed == 0
+        self.candidates > 0 && self.parsed == 0 && self.retained == 0
     }
 
     /// Whether successful results coexist with one or more failures.
@@ -64,7 +71,7 @@ impl ScanDiagnostics {
 
     /// Records one failed source without logging.
     ///
-    /// Used for failures that are re-observed on every cached refresh (a
+    /// Used for failures that are re-observed on every refresh (a
     /// retained parse verdict), so logging here would append the same line each
     /// tick. Direct discovery/read failures use [`record_hard_failure`] instead.
     ///
@@ -79,8 +86,8 @@ impl ScanDiagnostics {
 
     /// Records a hard discovery/read failure and mirrors it to the daily log.
     ///
-    /// For failures produced anew each scan (directory traversal, fingerprint
-    /// I/O, a hard parser error) — not the retained verdicts folded from cache —
+    /// For failures produced anew each scan (directory traversal, stamp I/O, a
+    /// hard parser error) — not the retained verdicts folded from the ledger —
     /// so the log line matches one real failure per scan. The log is file-only
     /// (never stdout/stderr), so this stays TUI-safe.
     pub(crate) fn record_hard_failure(

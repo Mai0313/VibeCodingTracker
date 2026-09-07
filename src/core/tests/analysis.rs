@@ -20,13 +20,13 @@ use vct_core::analysis::aggregator::{
     collect_analysis_sessions_from_paths_with, project_code_analysis,
 };
 use vct_core::config::ProvidersConfig;
+use vct_core::ledger::SessionLedger;
 use vct_core::models::{ExtensionType, ProviderActiveDays};
 use vct_core::session::parser::{
     parse_session_file_to_value, parse_session_file_typed, parse_session_file_typed_as,
     parse_session_file_with_diagnostics,
 };
 use vct_core::session::state::ParseMode;
-use vct_core::summary_cache::SummaryScanCache;
 use vct_test_support::{TempHome, append_cursor_json_blob, fixture, fixture_str};
 
 /// A real Codex rollout file name: the archive move preserves it, and it is
@@ -531,7 +531,7 @@ fn cached_analysis_matches_uncached_and_reuses_unchanged_sources() {
     )
     .unwrap();
 
-    let mut cache = SummaryScanCache::new();
+    let mut cache = SessionLedger::new();
     let cold = aggregate_sessions_by_model_from_paths_with_cache(
         &home.paths,
         TimeRange::All,
@@ -616,7 +616,7 @@ fn analysis_cache_preserves_entries_after_partial_directory_discovery() {
     let hidden_dir = hidden_source.parent().unwrap();
     let original_permissions = std::fs::metadata(hidden_dir).unwrap().permissions();
     let providers = providers_only(ExtensionType::ClaudeCode);
-    let mut cache = SummaryScanCache::new();
+    let mut cache = SessionLedger::new();
 
     let cold = aggregate_sessions_by_model_from_paths_with_cache(
         &home.paths,
@@ -671,7 +671,7 @@ fn deterministic_analysis_sqlite_schema_failure_is_cached() {
         .execute_batch("CREATE TABLE session (id TEXT PRIMARY KEY);")
         .unwrap();
     let providers = providers_only(ExtensionType::OpenCode);
-    let mut cache = SummaryScanCache::new();
+    let mut cache = SessionLedger::new();
 
     let cold = aggregate_sessions_by_model_from_paths_with_cache(
         &home.paths,
@@ -706,7 +706,7 @@ fn cursor_tracking_failure_is_not_an_analysis_candidate() {
         &home.paths,
         TimeRange::All,
         providers_only(ExtensionType::Cursor),
-        &mut SummaryScanCache::new(),
+        &mut SessionLedger::new(),
     )
     .unwrap();
     assert_eq!(result.diagnostics.candidates, 0);
@@ -721,7 +721,7 @@ fn cursor_analysis_cache_invalidates_only_changed_stores() {
     let first = home.put_cursor_session("project", "first", "cursor-first", 1_780_757_089_000, 100);
     let second =
         home.put_cursor_session("project", "second", "cursor-second", 1_780_757_090_000, 200);
-    let mut cache = SummaryScanCache::new();
+    let mut cache = SessionLedger::new();
 
     let cold = aggregate_sessions_by_model_from_paths_with_cache(
         &home.paths,
@@ -776,6 +776,7 @@ fn cursor_analysis_cache_invalidates_only_changed_stores() {
             .any(|row| row.model == "cursor-third")
     );
 
+    // A store that is gone stays in the ledger and keeps contributing.
     std::fs::remove_file(second).unwrap();
     let deleted = aggregate_sessions_by_model_from_paths_with_cache(
         &home.paths,
@@ -785,17 +786,11 @@ fn cursor_analysis_cache_invalidates_only_changed_stores() {
     )
     .unwrap();
     assert_eq!(cache.stats().parsed_sources, 0);
-    assert_eq!(cache.stats().entries, 2);
+    assert_eq!(cache.stats().entries, 3);
     assert_eq!(deleted.diagnostics.candidates, 2);
     assert_eq!(deleted.diagnostics.parsed, 2);
-    assert!(
-        !deleted
-            .data
-            .per_provider
-            .cursor
-            .iter()
-            .any(|row| row.model == "cursor-second")
-    );
+    assert_eq!(deleted.diagnostics.retained, 1);
+    assert_analysis_data_eq(&deleted.data, &added.data);
 }
 
 #[test]

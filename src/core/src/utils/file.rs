@@ -87,16 +87,22 @@ where
 }
 
 /// Shared body of the two atomic JSON writers; `pretty` selects the layout.
+///
+/// The serializer emits many small writes, so they are buffered: an
+/// unbuffered session ledger of a few megabytes cost millions of `write`
+/// syscalls and several seconds.
 fn write_json_atomic_inner<T>(path: &Path, value: &T, pretty: bool) -> Result<()>
 where
     T: serde::Serialize,
 {
     persist_atomic(path, |tmp| {
+        let mut writer = std::io::BufWriter::new(tmp);
         if pretty {
-            serde_json::to_writer_pretty(tmp, value).context("Failed to serialize JSON")
+            serde_json::to_writer_pretty(&mut writer, value).context("Failed to serialize JSON")?;
         } else {
-            serde_json::to_writer(tmp, value).context("Failed to serialize JSON")
+            serde_json::to_writer(&mut writer, value).context("Failed to serialize JSON")?;
         }
+        writer.flush().context("Failed to flush JSON")
     })
 }
 

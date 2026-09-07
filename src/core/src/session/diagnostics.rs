@@ -100,6 +100,10 @@ pub(crate) struct ParsedAnalysis {
 
 /// Database-backed analysis row with a stable source identity for ordering.
 pub(crate) struct DatabaseAnalysisRow {
+    /// The session the row belongs to, the ledger's key for it.
+    pub session_id: String,
+    /// The row's own identity, finer than the session where a session yields
+    /// several rows (one per OpenCode message); orders batch output.
     pub source_id: String,
     pub date: String,
     pub analysis: CodeAnalysis,
@@ -107,10 +111,9 @@ pub(crate) struct DatabaseAnalysisRow {
 
 /// Typed token buckets produced by database-backed usage readers.
 ///
-/// SQLite rows stay in this scalar form through the incremental cache, so a
-/// cached source costs no per-row JSON object. Callers materialize the
-/// historical JSON shape with [`Self::into_value`] only where they fold into a
-/// map that is already `Value`-keyed.
+/// SQLite rows stay in this scalar form until they are folded into a
+/// session's day, where [`Self::into_value`] materializes the historical
+/// JSON shape once per row.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct UsageTokenContribution {
     pub(crate) input_tokens: i64,
@@ -169,19 +172,15 @@ impl UsageTokenContribution {
             || self.cache_read_tokens != 0
             || self.cache_creation_tokens != 0
     }
-
-    pub(crate) fn merge(&mut self, other: Self) {
-        self.input_tokens += other.input_tokens;
-        self.output_tokens += other.output_tokens;
-        self.reasoning_tokens += other.reasoning_tokens;
-        self.cache_read_tokens += other.cache_read_tokens;
-        self.cache_creation_tokens += other.cache_creation_tokens;
-    }
 }
 
 /// Compact token contribution produced by a database-backed usage reader.
 #[derive(Debug)]
 pub(crate) struct UsageContribution {
+    /// The session the row belongs to, the ledger's key for it.
+    pub(crate) session_id: String,
+    /// The directory the session ran in, where the provider records one.
+    pub(crate) cwd: Option<String>,
     pub(crate) date: String,
     pub(crate) timestamp_ms: i64,
     pub(crate) model: String,
@@ -212,6 +211,7 @@ impl DatabaseUsageRead {
 
 impl UsageContribution {
     pub(crate) fn single_model(
+        session_id: String,
         date: String,
         timestamp_ms: i64,
         model: String,
@@ -220,6 +220,8 @@ impl UsageContribution {
         tier_level: usize,
     ) -> Self {
         Self {
+            session_id,
+            cwd: None,
             date,
             timestamp_ms,
             model,

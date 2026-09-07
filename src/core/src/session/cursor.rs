@@ -231,6 +231,7 @@ pub(crate) fn read_cursor_analysis_with_diagnostics(
                 parsed += 1;
                 for (date, analysis) in store.rows {
                     out.push(DatabaseAnalysisRow {
+                        session_id: conversation_id_from_path(&store_db),
                         source_id: store_db.to_string_lossy().into_owned(),
                         date,
                         analysis,
@@ -270,6 +271,7 @@ pub(crate) fn read_cursor_analysis_with_diagnostics(
 /// after the fact. A purely in-memory intermediate — never serialized.
 #[derive(Debug)]
 struct UsageEvent {
+    conversation_id: String,
     date: String,
     timestamp_ms: i64,
     model: String,
@@ -295,6 +297,7 @@ fn aggregate_events(events: &[UsageEvent], time_range: TimeRange) -> Vec<UsageCo
             continue;
         }
         out.push(UsageContribution::single_model(
+            e.conversation_id.clone(),
             e.date.clone(),
             e.timestamp_ms,
             e.model.clone(),
@@ -326,6 +329,7 @@ pub(crate) fn read_cursor_usage_store(
         .into_iter()
         .filter_map(|(timestamp_ms, cache_read)| {
             ms_to_local_date(timestamp_ms).map(|date| UsageEvent {
+                conversation_id: conv_id.clone(),
                 date,
                 timestamp_ms,
                 model: read.model.clone(),
@@ -368,8 +372,8 @@ fn approximation_events(chats_dir: &Path, tracking_db: &Path) -> CursorUsageEven
             }),
         ),
     };
-    // (date, model) -> (summed context-window gauge, latest timestamp)
-    let mut agg: HashMap<(String, String), (i64, i64)> = HashMap::new();
+    // (conversation, date, model) -> (summed context-window gauge, latest timestamp)
+    let mut agg: HashMap<(String, String, String), (i64, i64)> = HashMap::new();
     let discovery = discover_cursor_store_dbs(chats_dir);
     let candidates = discovery.stores.len() + discovery.failures.len();
     let mut parsed = 0usize;
@@ -413,7 +417,9 @@ fn approximation_events(chats_dir: &Path, tracking_db: &Path) -> CursorUsageEven
             let Some(date) = ms_to_local_date(ts) else {
                 continue;
             };
-            let entry = agg.entry((date, read.model.clone())).or_insert((0, ts));
+            let entry = agg
+                .entry((conv_id.clone(), date, read.model.clone()))
+                .or_insert((0, ts));
             entry.0 += ctx;
             entry.1 = entry.1.max(ts);
         }
@@ -422,15 +428,18 @@ fn approximation_events(chats_dir: &Path, tracking_db: &Path) -> CursorUsageEven
     CursorUsageEvents {
         events: agg
             .into_iter()
-            .map(|((date, model), (ctx, timestamp_ms))| UsageEvent {
-                date,
-                timestamp_ms,
-                model,
-                input: 0,
-                output: 0,
-                cache_read: ctx,
-                cache_write: 0,
-            })
+            .map(
+                |((conversation_id, date, model), (ctx, timestamp_ms))| UsageEvent {
+                    conversation_id,
+                    date,
+                    timestamp_ms,
+                    model,
+                    input: 0,
+                    output: 0,
+                    cache_read: ctx,
+                    cache_write: 0,
+                },
+            )
             .collect(),
         candidates,
         parsed,
@@ -1432,6 +1441,7 @@ mod tests {
     fn aggregate_events_filters_and_builds_records() {
         let events = vec![
             UsageEvent {
+                conversation_id: "conversation".to_string(),
                 date: "2999-01-01".to_string(),
                 timestamp_ms: 32_470_920_000_000,
                 model: "claude-sonnet-4.6".to_string(),
@@ -1441,6 +1451,7 @@ mod tests {
                 cache_write: 10,
             },
             UsageEvent {
+                conversation_id: "conversation".to_string(),
                 date: "2000-01-01".to_string(),
                 timestamp_ms: 946_684_800_000,
                 model: "composer-2".to_string(),

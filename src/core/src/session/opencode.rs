@@ -288,12 +288,12 @@ fn collect_session_usage(conn: &Connection, cutoff_ms: Option<i64>) -> Result<Da
     let sql = match cutoff_ms {
         Some(_) => {
             "SELECT model, tokens_input, tokens_output, tokens_reasoning, \
-                    tokens_cache_read, tokens_cache_write, time_updated, cost \
+                    tokens_cache_read, tokens_cache_write, time_updated, cost, id, directory \
              FROM session WHERE model IS NOT NULL AND model != '' AND time_updated >= ?1"
         }
         None => {
             "SELECT model, tokens_input, tokens_output, tokens_reasoning, \
-                    tokens_cache_read, tokens_cache_write, time_updated, cost \
+                    tokens_cache_read, tokens_cache_write, time_updated, cost, id, directory \
              FROM session WHERE model IS NOT NULL AND model != ''"
         }
     };
@@ -315,6 +315,8 @@ fn collect_session_usage(conn: &Connection, cutoff_ms: Option<i64>) -> Result<Da
         let cache_write = row.get::<_, i64>(5)?;
         let time_updated = row.get::<_, i64>(6)?;
         let cost = row.get::<_, f64>(7)?;
+        let session_id = row.get::<_, String>(8)?;
+        let directory = row.get::<_, Option<String>>(9)?;
         let Some(model_id) = parse_model_id(&model) else {
             continue;
         };
@@ -325,14 +327,17 @@ fn collect_session_usage(conn: &Connection, cutoff_ms: Option<i64>) -> Result<Da
         // A `session` row is the whole conversation's totals, not one request,
         // so there is no context to compare against a tier boundary; it bills
         // at base rates the same way every pre-`message` schema already did.
-        out.push(UsageContribution::single_model(
+        let mut contribution = UsageContribution::single_model(
+            session_id,
             date,
             time_updated,
             model_id,
             session_usage_value(input, output, reasoning, cache_read, cache_write),
             cost,
             0,
-        ));
+        );
+        contribution.cwd = directory.filter(|directory| !directory.is_empty());
+        out.push(contribution);
     }
 
     let parsed_records = out.len();
@@ -351,14 +356,14 @@ fn collect_message_usage(
 ) -> Result<DatabaseUsageRead> {
     let sql = match cutoff_ms {
         Some(_) => format!(
-            "SELECT {MESSAGE_TIMESTAMP_SQL}, message.data \
+            "SELECT {MESSAGE_TIMESTAMP_SQL}, message.data, message.session_id, session.directory \
              FROM message \
              JOIN session ON session.id = message.session_id \
              WHERE json_extract(message.data, '$.role') = 'assistant' \
                AND {MESSAGE_TIMESTAMP_SQL} >= ?1"
         ),
         None => format!(
-            "SELECT {MESSAGE_TIMESTAMP_SQL}, message.data \
+            "SELECT {MESSAGE_TIMESTAMP_SQL}, message.data, message.session_id, session.directory \
              FROM message \
              JOIN session ON session.id = message.session_id \
              WHERE json_extract(message.data, '$.role') = 'assistant'"
@@ -377,6 +382,8 @@ fn collect_message_usage(
         expected_records += 1;
         let message_ts = row.get::<_, i64>(0)?;
         let data_text = row.get::<_, String>(1)?;
+        let session_id = row.get::<_, String>(2)?;
+        let directory = row.get::<_, Option<String>>(3)?;
         let Some(message) = parse_message_usage(&data_text) else {
             continue;
         };
@@ -387,14 +394,17 @@ fn collect_message_usage(
         let tier_level = classifier.as_mut().map_or(0, |classifier| {
             classifier.level(&message.model_id, request_context(&message.usage))
         });
-        out.push(UsageContribution::single_model(
+        let mut contribution = UsageContribution::single_model(
+            session_id,
             date,
             message_ts,
             message.model_id,
             message.usage,
             message.cost,
             tier_level,
-        ));
+        );
+        contribution.cwd = directory.filter(|directory| !directory.is_empty());
+        out.push(contribution);
     }
 
     let parsed_records = out.len();
@@ -538,6 +548,7 @@ fn collect_session_analysis(
         usage_map.insert(accum.model_id, accum.usage);
         let record = accum.state.into_record(usage_map);
         out.push(DatabaseAnalysisRow {
+            session_id: id.clone(),
             source_id: id,
             date: accum.date,
             analysis: wrap_record(record, &user, &machine),
@@ -663,8 +674,10 @@ fn collect_message_analysis(
     for (id, accum) in messages {
         let mut usage_map = FastHashMap::default();
         usage_map.insert(accum.model_id, accum.usage);
+        let session_id = accum.state.task_id.clone();
         let record = accum.state.into_record(usage_map);
         out.push(DatabaseAnalysisRow {
+            session_id,
             source_id: id,
             date: accum.date,
             analysis: wrap_record(record, &user, &machine),

@@ -14,8 +14,9 @@ use crate::display::common::table::{
     refresh_process_metrics, render_scrollable_table, render_too_small, styled_row,
 };
 use crate::display::common::tui::{
-    InputAction, RefreshWorker, RefreshWorkerError, ScrollState, TerminalSession, UpdateTracker,
-    handle_input, overlay_repo_hyperlink, refresh_status, render_loading_frame,
+    InputAction, LEDGER_SAVE_INTERVAL, RefreshWorker, RefreshWorkerError, ScrollState,
+    TerminalSession, UpdateTracker, handle_input, overlay_repo_hyperlink, refresh_status,
+    render_loading_frame,
 };
 use crate::display::usage::averages::{
     ProviderStats, UsageProviderTotals, UsageRow, UsageTotals, build_provider_total_rows,
@@ -36,6 +37,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, System};
 use vct_core::config::ProvidersConfig;
+use vct_core::ledger::SessionLedger;
 use vct_core::models::{
     ClaudeQuotaSnapshot, CodexQuotaSnapshot, CopilotQuotaSnapshot, CursorQuotaSnapshot,
     GrokQuotaSnapshot, QuotaSource, QuotaWindow,
@@ -48,7 +50,6 @@ use vct_core::quota::{
     save_codex_cache, save_copilot_cache, save_cursor_cache, save_grok_cache, spawn_quota_worker,
 };
 use vct_core::scan::build_scan_pool;
-use vct_core::summary_cache::SummaryScanCache;
 use vct_core::utils::{
     format_compact, format_cost, format_cost_compact, format_duration_until,
     get_claude_credentials_path, get_copilot_config_path, get_cursor_auth_path, get_grok_auth_path,
@@ -564,7 +565,7 @@ pub fn display_usage_interactive_with_pool(
         let worker_paths = paths.clone();
         let worker_pool = Arc::clone(&scan_pool);
         let mut worker = RefreshWorker::new_with_init(refresh_secs, move || {
-            let mut cache = SummaryScanCache::new();
+            let mut ledger = SessionLedger::open(&worker_paths.cache_dir);
             let mut pricing = ModelPricingMap::new(HashMap::new());
             let mut scan_options = vct_core::usage::UsageScanOptions::default();
             let mut loaded_pricing_utc_date = None;
@@ -591,10 +592,16 @@ pub fn display_usage_interactive_with_pool(
                         &worker_paths,
                         time_range,
                         providers,
-                        &mut cache,
+                        &mut ledger,
                         &scan_options,
                     )
                 })?;
+                // A live session changes every tick; writing its provider's
+                // file once a minute keeps the ledger current without
+                // rewriting it on every refresh.
+                if let Err(error) = ledger.save_if_due(LEDGER_SAVE_INTERVAL) {
+                    log::warn!("failed to save the session ledger: {error:#}");
+                }
                 if collection.diagnostics.all_failed() {
                     let first = collection
                         .diagnostics

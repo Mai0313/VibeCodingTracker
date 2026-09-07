@@ -496,8 +496,23 @@ fn write_pretty_json(value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
+/// Says how many sessions came from the ledger rather than from disk.
+///
+/// Those sessions are real usage the assistant has since pruned, so they
+/// belong in every total; the note is what keeps the total from disagreeing
+/// with the files on disk in silence.
+fn report_retained_sessions(diagnostics: &vct_core::ScanDiagnostics) {
+    if diagnostics.retained > 0 {
+        eprintln!(
+            "Note: {} sessions no longer on disk are included from the session ledger (~/.vct/sessions).",
+            diagnostics.retained
+        );
+    }
+}
+
 /// Rejects a completely failed noninteractive scan and reports partial data.
 fn report_analysis_collection(diagnostics: &vct_core::analysis::ScanDiagnostics) -> Result<()> {
+    report_retained_sessions(diagnostics);
     let Some(first) = diagnostics.failures.first() else {
         return Ok(());
     };
@@ -525,6 +540,7 @@ fn report_analysis_collection(diagnostics: &vct_core::analysis::ScanDiagnostics)
 
 /// Rejects a completely failed noninteractive usage scan and reports partial data.
 fn report_usage_collection(diagnostics: &vct_core::usage::ScanDiagnostics) -> Result<()> {
+    report_retained_sessions(diagnostics);
     let Some(first) = diagnostics.failures.first() else {
         return Ok(());
     };
