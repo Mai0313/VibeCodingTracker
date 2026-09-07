@@ -31,6 +31,10 @@ pub struct ClaudeCodeLog {
     /// The message body, when the record carries one.
     #[serde(default)]
     pub message: Option<ClaudeMessage>,
+    /// API request identifier, paired with `message.id` to identify the one
+    /// billed request a record belongs to.
+    #[serde(default)]
+    pub request_id: Option<String>,
     /// Legacy top-level `toolUseResult`; absent on subagent records.
     #[serde(default, deserialize_with = "deserialize_tool_use_result")]
     pub tool_use_result: Option<ClaudeToolUseResult>,
@@ -51,6 +55,10 @@ pub struct ClaudeCodeLog {
 /// swallowed without allocating.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ClaudeMessage {
+    /// API response identifier (`msg_…`), paired with the record's
+    /// `requestId` to identify the one billed request this record belongs to.
+    #[serde(default)]
+    pub id: Option<String>,
     /// Model name that produced an assistant message.
     #[serde(default)]
     pub model: Option<String>,
