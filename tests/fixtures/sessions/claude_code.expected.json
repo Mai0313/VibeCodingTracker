@@ -1,24 +1,24 @@
 {
-  "user": "wei",
+  "user": "ignored",
   "extensionName": "Claude-Code",
-  "insightsVersion": "0.5.5-5-gbcec23f-dirty",
-  "machineId": "18f309cbbb654be69eff5ff79d2f3fa6",
+  "insightsVersion": "ignored",
+  "machineId": "ignored",
   "records": [
     {
       "totalUniqueFiles": 5,
-      "totalWriteLines": 3,
-      "totalReadLines": 2,
-      "totalEditLines": 2,
-      "totalWriteCharacters": 9,
-      "totalReadCharacters": 6,
-      "totalEditCharacters": 6,
+      "totalWriteLines": 6,
+      "totalReadLines": 5,
+      "totalEditLines": 4,
+      "totalWriteCharacters": 23,
+      "totalReadCharacters": 31,
+      "totalEditCharacters": 24,
       "writeFileDetails": [
         {
           "filePath": "/repo/claude-demo/版本需求說明-繁體中文.md",
-          "lineCount": 1,
-          "characterCount": 3,
+          "lineCount": 4,
+          "characterCount": 17,
           "timestamp": 1756386099481,
-          "content": "..."
+          "content": "# 版本需求說明\n\n第一行\n第二行"
         },
         {
           "filePath": "/repo/claude-demo/版本需求说明-简体中文.md",
@@ -38,8 +38,8 @@
       "readFileDetails": [
         {
           "filePath": "/repo/claude-demo/go.mod",
-          "lineCount": 1,
-          "characterCount": 3,
+          "lineCount": 4,
+          "characterCount": 28,
           "timestamp": 1756385853529
         },
         {
@@ -52,11 +52,11 @@
       "editFileDetails": [
         {
           "filePath": "/repo/claude-demo/go.mod",
-          "lineCount": 1,
-          "characterCount": 3,
+          "lineCount": 3,
+          "characterCount": 21,
           "timestamp": 1756385905637,
-          "oldString": "...",
-          "newString": "..."
+          "oldString": "go 1.24.0\n// 舊註解",
+          "newString": "go 1.24\n// 新註解\n// 第三行"
         },
         {
           "filePath": "/repo/claude-demo/.python-version",

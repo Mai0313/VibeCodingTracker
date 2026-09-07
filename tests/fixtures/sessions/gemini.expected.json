@@ -1,31 +1,31 @@
 {
-  "user": "wei",
+  "user": "ignored",
   "extensionName": "Gemini",
-  "insightsVersion": "0.5.17-19-g7b9f5ab-dirty",
-  "machineId": "18f309cbbb654be69eff5ff79d2f3fa6",
+  "insightsVersion": "ignored",
+  "machineId": "ignored",
   "records": [
     {
       "totalUniqueFiles": 8,
-      "totalWriteLines": 1,
-      "totalReadLines": 7,
-      "totalEditLines": 1,
-      "totalWriteCharacters": 3,
-      "totalReadCharacters": 21,
-      "totalEditCharacters": 3,
+      "totalWriteLines": 4,
+      "totalReadLines": 10,
+      "totalEditLines": 3,
+      "totalWriteCharacters": 17,
+      "totalReadCharacters": 46,
+      "totalEditCharacters": 21,
       "writeFileDetails": [
         {
           "filePath": "GEMINI.md",
-          "lineCount": 1,
-          "characterCount": 3,
+          "lineCount": 4,
+          "characterCount": 17,
           "timestamp": 1776948809818,
-          "content": "..."
+          "content": "# 版本需求說明\n\n第一行\n第二行"
         }
       ],
       "readFileDetails": [
         {
           "filePath": "README.md",
-          "lineCount": 1,
-          "characterCount": 3,
+          "lineCount": 4,
+          "characterCount": 28,
           "timestamp": 1776948791257
         },
         {
@@ -68,11 +68,11 @@
       "editFileDetails": [
         {
           "filePath": "GEMINI.md",
-          "lineCount": 1,
-          "characterCount": 3,
+          "lineCount": 3,
+          "characterCount": 21,
           "timestamp": 1776948962441,
-          "oldString": "...",
-          "newString": "..."
+          "oldString": "go 1.24.0\n// 舊註解",
+          "newString": "go 1.24\n// 新註解\n// 第三行"
         }
       ],
       "runCommandDetails": [],
