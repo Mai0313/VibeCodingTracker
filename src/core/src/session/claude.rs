@@ -82,8 +82,19 @@ where
     let mut pending_tool_uses: FastHashMap<String, PendingClaudeTool> =
         FastHashMap::with_capacity(64);
     let mut diagnostics = ParseDiagnostics::default();
+    // Claude Code writes one record per content block of a single API
+    // response, and every one of them repeats that response's *whole* `usage`
+    // object: a reply carrying a thinking block, text and three tool calls
+    // arrives as five records all reporting the same tokens. Billing them as
+    // they arrive charges one request once per content block, so each is
+    // banked here under the request it belongs to and only the last record for
+    // a key survives — the earlier ones report a partially streamed
+    // `output_tokens`, never a larger one. `(model, usage)` in arrival order;
+    // `billed_index` maps the request key to its slot.
+    let mut billed_requests: Vec<(String, Value)> = Vec::with_capacity(64);
+    let mut billed_index: FastHashMap<String, usize> = FastHashMap::with_capacity(64);
 
-    for log in logs {
+    for mut log in logs {
         let recognized = matches!(
             log.log_type.as_str(),
             "assistant"
@@ -128,56 +139,39 @@ where
             diagnostics.record_relevant(false);
         }
 
-        if log.log_type == "assistant"
-            && let Some(message) = &log.message
-        {
-            if let Some(usage) = &message.usage {
-                let model = message.model.as_deref().filter(|model| !model.is_empty());
-                let normalized = is_supported_claude_usage(usage) && model.is_some();
-                diagnostics.record_relevant(normalized);
-                if normalized && let Some(model) = model {
-                    // One assistant record is one billed request; classify its
-                    // own prompt context against the model's price levels.
-                    let level = classifier.as_mut().map_or(0, |classifier| {
-                        usage.as_object().map_or(0, |usage_obj| {
-                            classifier.level(model, claude_request_context(usage_obj))
-                        })
-                    });
-                    process_claude_usage(&mut conversation_usage, model, usage, level);
+        // Read the request identity before the usage below is moved out of the
+        // same record: both live in `log`, so taking one needs a mutable borrow
+        // that a live borrow for the other would conflict with.
+        let request_key = (log.log_type == "assistant"
+            && log
+                .message
+                .as_ref()
+                .is_some_and(|message| message.usage.is_some()))
+        .then(|| claude_request_key(&log))
+        .flatten();
 
-                    // Claude Code's top-level `usage` is the sum of the
-                    // `message`-type entries in `usage.iterations` and EXCLUDES any
-                    // `advisor_message` iteration (a secondary inference Claude Code
-                    // runs but keeps off its own /cost accounting). The sample in
-                    // `advisor_message_usage_is_separated_from_conversation_usage`
-                    // below is what that was read off. Key each advisor iteration by
-                    // the model it names so it prices at that model's rate; one that
-                    // names no model falls back to the main model's key.
-                    if let Some(iters) = usage.get("iterations").and_then(|v| v.as_array()) {
-                        for iter in iters {
-                            if iter.get("type").and_then(|t| t.as_str()) == Some("advisor_message")
-                            {
-                                let adv_model =
-                                    iter.get("model").and_then(|m| m.as_str()).unwrap_or(model);
-                                let normalized =
-                                    !adv_model.is_empty() && is_supported_claude_usage(iter);
-                                diagnostics.record_relevant(normalized);
-                                if normalized {
-                                    let level = classifier.as_mut().map_or(0, |classifier| {
-                                        iter.as_object().map_or(0, |usage_obj| {
-                                            classifier
-                                                .level(adv_model, claude_request_context(usage_obj))
-                                        })
-                                    });
-                                    process_claude_usage(
-                                        &mut advisor_usage,
-                                        adv_model,
-                                        iter,
-                                        level,
-                                    );
-                                }
+        if log.log_type == "assistant"
+            && let Some(message) = &mut log.message
+        {
+            // Moved rather than cloned: most of these records are duplicates
+            // whose usage is dropped again the moment the next one lands.
+            if let Some(usage) = message.usage.take() {
+                let model = message.model.as_deref().filter(|model| !model.is_empty());
+                if !(is_supported_claude_usage(&usage) && model.is_some()) {
+                    diagnostics.record_relevant(false);
+                } else if let Some(model) = model {
+                    let entry = (model.to_string(), usage);
+                    match request_key {
+                        Some(key) => match billed_index.get(&key) {
+                            Some(&slot) => billed_requests[slot] = entry,
+                            None => {
+                                billed_index.insert(key, billed_requests.len());
+                                billed_requests.push(entry);
                             }
-                        }
+                        },
+                        // No API response to key on: nothing can be shown to
+                        // duplicate it, so bill it on its own.
+                        None => billed_requests.push(entry),
                     }
                 }
             }
@@ -324,6 +318,48 @@ where
         }
     }
 
+    for (model, usage) in billed_requests {
+        diagnostics.record_relevant(true);
+        // One banked entry is one billed request; classify its own prompt
+        // context against the model's price levels.
+        let level = classifier.as_mut().map_or(0, |classifier| {
+            usage.as_object().map_or(0, |usage_obj| {
+                classifier.level(&model, claude_request_context(usage_obj))
+            })
+        });
+        process_claude_usage(&mut conversation_usage, &model, &usage, level);
+
+        // Claude Code's top-level `usage` is the sum of the `message`-type
+        // entries in `usage.iterations` and EXCLUDES any `advisor_message`
+        // iteration (a secondary inference Claude Code runs but keeps off its
+        // own /cost accounting). The sample in
+        // `advisor_message_usage_is_separated_from_conversation_usage` below is
+        // what that was read off. Key each advisor iteration by the model it
+        // names so it prices at that model's rate; one that names no model
+        // falls back to the main model's key.
+        if let Some(iters) = usage.get("iterations").and_then(|v| v.as_array()) {
+            for iter in iters {
+                if iter.get("type").and_then(|t| t.as_str()) != Some("advisor_message") {
+                    continue;
+                }
+                let adv_model = iter
+                    .get("model")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or(model.as_str());
+                let normalized = !adv_model.is_empty() && is_supported_claude_usage(iter);
+                diagnostics.record_relevant(normalized);
+                if normalized {
+                    let level = classifier.as_mut().map_or(0, |classifier| {
+                        iter.as_object().map_or(0, |usage_obj| {
+                            classifier.level(adv_model, claude_request_context(usage_obj))
+                        })
+                    });
+                    process_claude_usage(&mut advisor_usage, adv_model, iter, level);
+                }
+            }
+        }
+    }
+
     for pending in pending_tool_uses.into_values() {
         if is_tracked_file_tool(&pending.name) && !pending.input_supported {
             diagnostics.record_relevant(false);
@@ -390,6 +426,25 @@ fn tracked_tool_input_supported(name: &str, input: Option<&ClaudeToolInput>) -> 
             .as_deref()
             .is_some_and(|command| !command.trim().is_empty()),
         _ => false,
+    }
+}
+
+/// Identity of the one billed request an assistant record belongs to.
+///
+/// `message.id` is the API response id and already identifies the request on
+/// its own; `requestId` is appended where the record carries one so a retry
+/// that reuses a response id still bills separately. `None` when the record
+/// names no response at all, which no observed Claude Code build writes.
+fn claude_request_key(log: &ClaudeCodeLog) -> Option<String> {
+    let id = log
+        .message
+        .as_ref()?
+        .id
+        .as_deref()
+        .filter(|id| !id.is_empty())?;
+    match log.request_id.as_deref().filter(|id| !id.is_empty()) {
+        Some(request_id) => Some(format!("{id}:{request_id}")),
+        None => Some(id.to_string()),
     }
 }
 
@@ -1204,6 +1259,153 @@ mod tests {
         let advisor = record.advisor_usage.get("claude-opus-4-8").unwrap();
         assert_eq!(advisor["input_tokens"].as_i64().unwrap(), 47579);
         assert_eq!(advisor["output_tokens"].as_i64().unwrap(), 10521);
+    }
+
+    #[test]
+    fn one_response_split_across_content_blocks_bills_once() {
+        // Claude Code writes one record per content block of a single API
+        // response and repeats the whole `usage` object on each, so the three
+        // records below are one billed request, not three. The `output_tokens`
+        // rises across them because the earlier records were written while the
+        // response was still streaming; the last value is the final one.
+        let response = |content: serde_json::Value, output: i64| {
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2025-01-01T00:00:00Z",
+                "requestId": "req_1",
+                "message": {
+                    "id": "msg_1",
+                    "model": "claude-opus-4-8",
+                    "content": content,
+                    "usage": {
+                        "input_tokens": 11,
+                        "output_tokens": output,
+                        "cache_read_input_tokens": 16788,
+                        "cache_creation_input_tokens": 1328
+                    }
+                }
+            })
+        };
+        let logs: Vec<ClaudeCodeLog> = vec![
+            response(serde_json::json!([{ "type": "thinking" }]), 8),
+            response(serde_json::json!([{ "type": "text" }]), 8),
+            response(
+                serde_json::json!([
+                    { "type": "tool_use", "id": "tool_1", "name": "Read",
+                      "input": { "file_path": "/tmp/a.rs" } }
+                ]),
+                167,
+            ),
+        ]
+        .into_iter()
+        .map(|raw| serde_json::from_value(raw).unwrap())
+        .collect();
+
+        let analysis = parse_claude_logs(logs, ParseMode::Full).unwrap();
+        let usage = &analysis.records[0].conversation_usage["claude-opus-4-8"];
+        assert_eq!(usage["input_tokens"].as_i64().unwrap(), 11);
+        assert_eq!(usage["cache_read_input_tokens"].as_i64().unwrap(), 16788);
+        assert_eq!(usage["cache_creation_input_tokens"].as_i64().unwrap(), 1328);
+        // The final streamed value, not 8 and not the 183 the three sum to.
+        assert_eq!(usage["output_tokens"].as_i64().unwrap(), 167);
+
+        // Deduplication is scoped to the usage: the tool call carried by the
+        // last record is still counted.
+        assert_eq!(analysis.records[0].tool_call_counts.read, 1);
+    }
+
+    #[test]
+    fn advisor_iterations_of_one_response_bill_once() {
+        // The advisor tokens ride inside the same repeated `usage` object, so a
+        // response split across content blocks repeats them too.
+        let response = |output: i64| {
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2025-01-01T00:00:00Z",
+                "requestId": "req_1",
+                "message": {
+                    "id": "msg_1",
+                    "model": "claude-haiku-4-5",
+                    "content": [],
+                    "usage": {
+                        "input_tokens": 4,
+                        "output_tokens": output,
+                        "iterations": [
+                            { "type": "advisor_message", "model": "claude-opus-4-8",
+                              "input_tokens": 47579, "output_tokens": 10521 }
+                        ]
+                    }
+                }
+            })
+        };
+        let logs: Vec<ClaudeCodeLog> = vec![response(12), response(7440)]
+            .into_iter()
+            .map(|raw| serde_json::from_value(raw).unwrap())
+            .collect();
+
+        let analysis = parse_claude_logs(logs, ParseMode::Full).unwrap();
+        let advisor = analysis.records[0]
+            .advisor_usage
+            .get("claude-opus-4-8")
+            .unwrap();
+        assert_eq!(advisor["input_tokens"].as_i64().unwrap(), 47579);
+        assert_eq!(advisor["output_tokens"].as_i64().unwrap(), 10521);
+    }
+
+    #[test]
+    fn records_naming_no_response_each_bill() {
+        // No Claude Code build observed so far omits `message.id`, so this
+        // guards the fallback rather than a live shape: with nothing to key on,
+        // two records are two requests and must not collapse into one.
+        let response = serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2025-01-01T00:00:00Z",
+            "message": {
+                "model": "claude-opus-4-8",
+                "content": [],
+                "usage": { "input_tokens": 5, "output_tokens": 100 }
+            }
+        });
+        let logs: Vec<ClaudeCodeLog> = vec![response.clone(), response]
+            .into_iter()
+            .map(|raw| serde_json::from_value(raw).unwrap())
+            .collect();
+
+        let analysis = parse_claude_logs(logs, ParseMode::Full).unwrap();
+        let usage = &analysis.records[0].conversation_usage["claude-opus-4-8"];
+        assert_eq!(usage["input_tokens"].as_i64().unwrap(), 10);
+        assert_eq!(usage["output_tokens"].as_i64().unwrap(), 200);
+    }
+
+    #[test]
+    fn responses_with_distinct_ids_each_bill() {
+        let response = |id: &str, request: &str| {
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2025-01-01T00:00:00Z",
+                "requestId": request,
+                "message": {
+                    "id": id,
+                    "model": "claude-opus-4-8",
+                    "content": [],
+                    "usage": { "input_tokens": 5, "output_tokens": 100 }
+                }
+            })
+        };
+        let logs: Vec<ClaudeCodeLog> = vec![
+            response("msg_1", "req_1"),
+            response("msg_2", "req_2"),
+            // A retry reusing the response id still bills separately.
+            response("msg_2", "req_3"),
+        ]
+        .into_iter()
+        .map(|raw| serde_json::from_value(raw).unwrap())
+        .collect();
+
+        let analysis = parse_claude_logs(logs, ParseMode::Full).unwrap();
+        let usage = &analysis.records[0].conversation_usage["claude-opus-4-8"];
+        assert_eq!(usage["input_tokens"].as_i64().unwrap(), 15);
+        assert_eq!(usage["output_tokens"].as_i64().unwrap(), 300);
     }
 
     #[test]
