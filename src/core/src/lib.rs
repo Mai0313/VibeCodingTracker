@@ -23,8 +23,8 @@
 //! future GUI backend can reuse it directly.
 //!
 //! The remaining modules support those two views: [`models`] (the shared serde
-//! shapes), [`summary_cache`] (the process-local incremental scan cache),
-//! [`pricing`] (LiteLLM price lookup with a daily on-disk cache), [`quota`]
+//! shapes), [`ledger`] (the persistent per-session ledger every scan reads
+//! and writes), [`pricing`] (LiteLLM price lookup with a daily on-disk cache), [`quota`]
 //! (live provider quota fetchers), [`config`] (`~/.vct/config.toml`),
 //! [`logging`] (file-only diagnostics), [`cache`] (library-facing LRU cache of
 //! parsed sessions), [`update`] (self-replace from the matching GitHub release
@@ -35,13 +35,13 @@ pub mod analysis;
 pub mod cache;
 pub mod config;
 pub mod constants;
+pub mod ledger;
 pub mod logging;
 pub mod models;
 pub mod pricing;
 pub mod quota;
 pub mod scan;
 pub mod session;
-pub mod summary_cache;
 pub mod update;
 pub mod usage;
 pub mod utils;

@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use vct_core::config::ProvidersConfig;
 use vct_core::constants::FastHashMap;
+use vct_core::ledger::SessionLedger;
 use vct_core::models::ExtensionType;
 use vct_core::models::TimeRange;
 use vct_core::pricing::{ModelPricingMap, normalize_model_name};
@@ -13,7 +14,6 @@ use vct_core::scan::build_scan_pool;
 use vct_core::session::{
     ParseMode, parse_session_file_typed_as, parse_session_file_typed_with_mode,
 };
-use vct_core::summary_cache::SummaryScanCache;
 use vct_core::usage::aggregator::aggregate_usage_from_paths_with_cache;
 use vct_core::utils::{HelperPaths, resolve_paths_from_home};
 use vct_tui::display::common::render_loading_frame;
@@ -227,7 +227,7 @@ fn build_scan_corpus(source_count: usize, fixture: &str) -> (TempDir, HelperPath
     (temp, paths, changed)
 }
 
-fn run_cached_scan(pool: &rayon::ThreadPool, paths: &HelperPaths, cache: &mut SummaryScanCache) {
+fn run_cached_scan(pool: &rayon::ThreadPool, paths: &HelperPaths, cache: &mut SessionLedger) {
     let result = pool.install(|| {
         aggregate_usage_from_paths_with_cache(paths, TimeRange::All, claude_only(), cache)
     });
@@ -247,20 +247,20 @@ fn benchmark_summary_scan_cache(c: &mut Criterion) {
 
     group.bench_function(BenchmarkId::new("cold", 100), |b| {
         b.iter_batched(
-            SummaryScanCache::new,
+            SessionLedger::new,
             |mut cache| run_cached_scan(&pool, &small_paths, &mut cache),
             criterion::BatchSize::SmallInput,
         );
     });
     group.bench_function(BenchmarkId::new("cold", 1_000), |b| {
         b.iter_batched(
-            SummaryScanCache::new,
+            SessionLedger::new,
             |mut cache| run_cached_scan(&pool, &large_paths, &mut cache),
             criterion::BatchSize::SmallInput,
         );
     });
 
-    let mut warm_cache = SummaryScanCache::new();
+    let mut warm_cache = SessionLedger::new();
     run_cached_scan(&pool, &small_paths, &mut warm_cache);
     group.bench_function(BenchmarkId::new("unchanged", 100), |b| {
         b.iter(|| {
@@ -272,7 +272,7 @@ fn benchmark_summary_scan_cache(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("single_changed", 100), |b| {
         b.iter_custom(|iterations| {
             std::fs::write(&changed_path, &fixture).expect("reset changed benchmark fixture");
-            let mut cache = SummaryScanCache::new();
+            let mut cache = SessionLedger::new();
             run_cached_scan(&pool, &small_paths, &mut cache);
             let fixture_with_newline = format!("{fixture}\n");
             let mut elapsed = Duration::ZERO;

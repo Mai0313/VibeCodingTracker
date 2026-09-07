@@ -1,24 +1,19 @@
 use crate::config::ProvidersConfig;
-use crate::constants::{FastHashMap, FastHashSet, capacity};
+use crate::constants::{FastHashMap, capacity};
+use crate::ledger::{DayEntry, SessionLedger, merge_analysis_rows};
 use crate::models::TimeRange;
 use crate::models::{CodeAnalysis, ExtensionType, ProviderActiveDays};
-use crate::session::cursor::{
-    discover_cursor_store_dbs, load_conversation_model_snapshot,
-    read_cursor_analysis_with_diagnostics, read_store_analysis,
-};
+use crate::scan::{ScanFeature, group_analysis_rows, scan_cursor_stores, scan_database_half};
+use crate::session::cursor::read_cursor_analysis_with_diagnostics;
 use crate::session::diagnostics::DatabaseAnalysisRow;
 use crate::session::opencode::read_opencode_analysis_with_diagnostics;
 use crate::session::parser::parse_session_file_typed_as_with_diagnostics;
-use crate::session::sqlite::is_cacheable_sqlite_failure;
 use crate::session::state::ParseMode;
-use crate::summary_cache::{
-    CompactSourceSummary, SourceFingerprint, SummaryCacheKey, SummaryKind, SummaryScanCache,
-};
 use crate::utils::directory::{FileInfo, collect_provider_files_diagnostics};
 use crate::utils::{
     COPILOT_SESSION_MAX_DEPTH, DSH_SESSION_MAX_DEPTH, GROK_SESSION_MAX_DEPTH, HelperPaths,
-    get_current_user, get_machine_id, is_claude_session_file, is_codex_session_file,
-    is_copilot_session_file, is_dsh_session_file, is_gemini_session_file, is_grok_session_file,
+    is_claude_session_file, is_codex_session_file, is_copilot_session_file, is_dsh_session_file,
+    is_gemini_session_file, is_grok_session_file,
 };
 use anyhow::Result;
 use rayon::prelude::*;
@@ -204,20 +199,30 @@ pub fn aggregate_sessions_by_model_with_providers(
     Ok(aggregate_sessions_by_model_with_diagnostics(time_range, providers)?.data)
 }
 
-/// Streaming counterpart of [`aggregate_sessions_by_model_with_providers`] that also
+/// Counterpart of [`aggregate_sessions_by_model_with_providers`] that also
 /// returns source diagnostics for noninteractive callers.
 ///
-/// Parsed sessions are added to the summary as each provider completes. Only
-/// one provider's parallel parse results are temporarily retained at a time.
+/// Scans through the session ledger under the user's `~/.vct` and writes it
+/// back, so sessions whose source is gone still count; a ledger that cannot
+/// be written is logged and the result returned anyway. The env-free
+/// [`aggregate_sessions_by_model_from_paths_with_diagnostics`] is the
+/// ledger-free scan of what is on disk right now.
 pub fn aggregate_sessions_by_model_with_diagnostics(
     time_range: TimeRange,
     providers: ProvidersConfig,
 ) -> Result<AnalysisCollection> {
-    aggregate_sessions_by_model_from_paths_with_diagnostics(
-        &crate::utils::resolve_paths()?,
+    let paths = crate::utils::resolve_paths()?;
+    let mut ledger = SessionLedger::open(&paths.cache_dir);
+    let collection = aggregate_sessions_by_model_from_paths_with_cache(
+        &paths,
         time_range,
         providers,
-    )
+        &mut ledger,
+    )?;
+    if let Err(error) = ledger.save() {
+        log::warn!("failed to save the session ledger: {error:#}");
+    }
+    Ok(collection)
 }
 
 /// Aggregates file-operation metrics from provider session directories rooted at
@@ -246,7 +251,11 @@ pub fn aggregate_sessions_by_model_from_paths_with_providers(
     Ok(aggregate_sessions_by_model_from_paths_with_diagnostics(paths, time_range, providers)?.data)
 }
 
-/// Env-free streaming aggregation with source diagnostics.
+/// Env-free streaming aggregation with source diagnostics, reading every
+/// source afresh with no ledger.
+///
+/// Parsed sessions are added to the summary as each provider completes. Only
+/// one provider's parallel parse results are temporarily retained at a time.
 pub fn aggregate_sessions_by_model_from_paths_with_diagnostics(
     paths: &HelperPaths,
     time_range: TimeRange,
@@ -475,276 +484,98 @@ where
 pub fn aggregate_sessions_by_model_with_cache(
     time_range: TimeRange,
     providers: ProvidersConfig,
-    cache: &mut SummaryScanCache,
+    ledger: &mut SessionLedger,
 ) -> Result<AnalysisCollection> {
     aggregate_sessions_by_model_from_paths_with_cache(
         &crate::utils::resolve_paths()?,
         time_range,
         providers,
-        cache,
+        ledger,
     )
 }
 
 /// Incremental compact analysis scan rooted at explicit provider paths.
 ///
-/// `cache` is updated in place: a source whose fingerprint is unchanged is
-/// folded from its cached compact summary instead of being re-parsed, and file
-/// and analysis-database entries not seen in this scan are dropped.
-///
-/// A usage scan carrying a tier snapshot makes `cache` single-feature: sharing
-/// it with one stays correct, but each alternation then clears the whole cache
-/// — database sources along with session files — so a caller wanting
-/// incremental refreshes for both keeps one cache per feature.
+/// `ledger` is updated in place: a source whose stamp is unchanged is folded
+/// from its ledger entry instead of being re-read, and a session whose source
+/// is gone keeps being folded. This scan parses with no tier snapshot and
+/// stamps none, so a usage scan holding a snapshot re-reads what it wrote
+/// rather than pricing it at base rates.
 pub fn aggregate_sessions_by_model_from_paths_with_cache(
     paths: &HelperPaths,
     time_range: TimeRange,
     providers: ProvidersConfig,
-    cache: &mut SummaryScanCache,
+    ledger: &mut SessionLedger,
 ) -> Result<AnalysisCollection> {
-    // This scan parses with no tier snapshot, so it stamps none: entries it
-    // writes classify nothing, and a usage scan holding a real snapshot has to
-    // reparse them rather than price them at base rates.
-    cache.ensure_tier_snapshot(None);
-    cache.begin_scan();
+    ledger.begin_scan();
     let mut projection = AnalysisProjection::new();
     let mut diagnostics = ScanDiagnostics::default();
-    let mut seen = FastHashSet::default();
 
     crate::scan::scan_all_cached_files(
         paths,
         providers,
         time_range,
-        cache,
-        &mut seen,
+        ledger,
+        ScanFeature::Analysis,
         &mut projection,
         &mut diagnostics,
         None,
     )?;
 
-    if providers.opencode && paths.opencode_db.exists() {
-        scan_opencode_analysis(
-            paths,
+    // Every database read covers all time: the range is applied to the folded
+    // days, so a `--daily` scan cannot mistake older sessions for deleted ones.
+    if providers.opencode {
+        scan_database_half(
+            ExtensionType::OpenCode,
+            &paths.opencode_db,
+            ScanFeature::Analysis,
+            None,
             time_range,
-            cache,
-            &mut seen,
+            ledger,
             &mut projection,
             &mut diagnostics,
+            || {
+                let read = read_opencode_analysis_with_diagnostics(
+                    &paths.opencode_db,
+                    TimeRange::All,
+                    ParseMode::UsageOnly,
+                )?;
+                let complete_failure = read.expected_records > 0 && read.parsed_records == 0;
+                let failed = read.expected_records.saturating_sub(read.parsed_records)
+                    + read.failed_tool_parts;
+                let failure = if complete_failure {
+                    Some(format!(
+                        "none of {} analysis records used a recognized schema",
+                        read.expected_records
+                    ))
+                } else if failed > 0 {
+                    Some(format!(
+                        "{failed} analysis payloads used an unsupported schema"
+                    ))
+                } else {
+                    None
+                };
+                Ok(group_analysis_rows(read.rows, !complete_failure, failure))
+            },
         );
     }
-    if providers.cursor && paths.cursor_chats_dir.exists() {
-        scan_cursor_analysis(
+    if providers.cursor {
+        scan_cursor_stores(
             paths,
+            ScanFeature::Analysis,
+            None,
             time_range,
-            cache,
-            &mut seen,
+            ledger,
             &mut projection,
             &mut diagnostics,
         );
     }
 
-    cache.retain_kinds(&seen, &[SummaryKind::File, SummaryKind::AnalysisDatabase]);
     diagnostics.finalize();
     Ok(AnalysisCollection {
         data: projection.finish(),
         diagnostics,
     })
-}
-
-fn scan_opencode_analysis(
-    paths: &HelperPaths,
-    time_range: TimeRange,
-    cache: &mut SummaryScanCache,
-    seen: &mut FastHashSet<SummaryCacheKey>,
-    projection: &mut AnalysisProjection,
-    diagnostics: &mut ScanDiagnostics,
-) {
-    let provider = ExtensionType::OpenCode;
-    let source = &paths.opencode_db;
-    diagnostics.candidates += 1;
-    let key = SummaryCacheKey::new(SummaryKind::AnalysisDatabase, provider, source, time_range);
-    seen.insert(key.clone());
-    let fingerprint = match SourceFingerprint::sqlite(source, &[]) {
-        Ok(value) => value,
-        Err(error) => {
-            record_failure(diagnostics, provider, source, error.to_string());
-            return;
-        }
-    };
-    if let Some(cached) = cache.get(&key, &fingerprint) {
-        crate::scan::fold_cached(provider, source, cached, projection, diagnostics);
-        return;
-    }
-
-    cache.record_parse();
-    match read_opencode_analysis_with_diagnostics(source, time_range, ParseMode::UsageOnly) {
-        Ok(result) => {
-            let complete_failure = result.expected_records > 0 && result.parsed_records == 0;
-            let failed = result
-                .expected_records
-                .saturating_sub(result.parsed_records)
-                + result.failed_tool_parts;
-            let failure = if complete_failure {
-                Some(format!(
-                    "none of {} analysis records used a recognized schema",
-                    result.expected_records
-                ))
-            } else if failed > 0 {
-                Some(format!(
-                    "{failed} analysis payloads used an unsupported schema"
-                ))
-            } else {
-                None
-            };
-            let mut summary = CompactSourceSummary::default();
-            for row in result.rows {
-                summary.add_analysis(row.analysis, row.date, 0.0, true);
-            }
-            let loaded = crate::scan::LoadedCompactSummary {
-                summary,
-                parsed: !complete_failure,
-                failure,
-            };
-            crate::scan::fold_loaded(provider, source, &loaded, projection, diagnostics);
-            cache.insert(
-                key,
-                fingerprint,
-                loaded.summary,
-                loaded.parsed,
-                loaded.failure,
-            );
-        }
-        Err(error) => {
-            let failure = format!("{error:#}");
-            record_failure(diagnostics, provider, source, failure.clone());
-            if is_cacheable_sqlite_failure(&error) {
-                cache.insert(
-                    key,
-                    fingerprint,
-                    CompactSourceSummary::default(),
-                    false,
-                    Some(failure),
-                );
-            }
-        }
-    }
-}
-
-fn scan_cursor_analysis(
-    paths: &HelperPaths,
-    time_range: TimeRange,
-    cache: &mut SummaryScanCache,
-    seen: &mut FastHashSet<SummaryCacheKey>,
-    projection: &mut AnalysisProjection,
-    diagnostics: &mut ScanDiagnostics,
-) {
-    let provider = ExtensionType::Cursor;
-    let source = &paths.cursor_chats_dir;
-    let discovery = discover_cursor_store_dbs(source);
-    if !discovery.failures.is_empty() {
-        cache.preserve_provider_keys(seen, SummaryKind::AnalysisDatabase, provider);
-    }
-    for failure in discovery.failures {
-        diagnostics.candidates += 1;
-        record_failure(diagnostics, provider, &failure.path, failure.error);
-    }
-
-    let tracking_db = &paths.cursor_tracking_db;
-    let (conv_models, tracking_fingerprint, tracking_ok) =
-        match load_conversation_model_snapshot(tracking_db) {
-            Ok(snapshot) => (snapshot.models, snapshot.fingerprint, true),
-            Err(error) => {
-                record_failure(diagnostics, provider, tracking_db, format!("{error:#}"));
-                (FastHashMap::default(), None, false)
-            }
-        };
-    let user = get_current_user();
-    let machine = get_machine_id().to_string();
-
-    for store in discovery.stores {
-        diagnostics.candidates += 1;
-        let key = SummaryCacheKey::new(SummaryKind::AnalysisDatabase, provider, &store, time_range);
-        seen.insert(key.clone());
-        let fingerprint = if tracking_ok {
-            SourceFingerprint::sqlite_with_dependency(
-                &store,
-                tracking_db,
-                tracking_fingerprint.as_ref(),
-            )
-        } else {
-            SourceFingerprint::sqlite(&store, &[])
-        };
-        let fingerprint = match fingerprint {
-            Ok(fingerprint) => fingerprint,
-            Err(error) => {
-                record_failure(diagnostics, provider, &store, error.to_string());
-                continue;
-            }
-        };
-        if tracking_ok && let Some(cached) = cache.get(&key, &fingerprint) {
-            crate::scan::fold_cached(provider, &store, cached, projection, diagnostics);
-            continue;
-        }
-
-        cache.record_parse();
-        match read_store_analysis(
-            &store,
-            &conv_models,
-            time_range,
-            ParseMode::UsageOnly,
-            &user,
-            &machine,
-        ) {
-            Ok(result) => {
-                let complete_failure =
-                    result.normalized_messages == 0 && result.failed_payloads > 0;
-                let failure = if complete_failure {
-                    Some(format!(
-                        "none of {} analyzer payloads used a supported schema",
-                        result.failed_payloads
-                    ))
-                } else if result.failed_payloads > 0 {
-                    Some(format!(
-                        "{} analyzer payloads used an unsupported schema",
-                        result.failed_payloads
-                    ))
-                } else {
-                    None
-                };
-                let mut summary = CompactSourceSummary::default();
-                for (date, analysis) in result.rows {
-                    summary.add_analysis(analysis, date, 0.0, true);
-                }
-                let loaded = crate::scan::LoadedCompactSummary {
-                    summary,
-                    parsed: !complete_failure,
-                    failure,
-                };
-                crate::scan::fold_loaded(provider, &store, &loaded, projection, diagnostics);
-                if tracking_ok {
-                    cache.insert(
-                        key,
-                        fingerprint,
-                        loaded.summary,
-                        loaded.parsed,
-                        loaded.failure,
-                    );
-                }
-            }
-            Err(error) => {
-                let failure = format!("{error:#}");
-                record_failure(diagnostics, provider, &store, failure.clone());
-                if tracking_ok && is_cacheable_sqlite_failure(&error) {
-                    cache.insert(
-                        key,
-                        fingerprint,
-                        CompactSourceSummary::default(),
-                        false,
-                        Some(failure),
-                    );
-                }
-            }
-        }
-    }
 }
 
 /// Projects a canonical dataset into the compact model/provider summaries used
@@ -827,6 +658,7 @@ where
             let FileInfo {
                 path,
                 modified_date,
+                ..
             } = file_info;
             match parse_session_file_typed_as_with_diagnostics(&path, provider, mode, None) {
                 Ok(parsed) if parsed.diagnostics.is_complete_failure() => {
@@ -980,8 +812,25 @@ struct AnalysisProjection {
 }
 
 impl crate::scan::CompactSink for AnalysisProjection {
-    fn fold(&mut self, provider: ExtensionType, summary: &CompactSourceSummary) {
-        self.add_compact(provider, summary);
+    fn fold(&mut self, provider: ExtensionType, date: &str, day: &DayEntry) {
+        merge_analysis_rows(&mut self.all, &day.analysis);
+        let provider_rows = match provider {
+            ExtensionType::ClaudeCode => Some(&mut self.claude),
+            ExtensionType::Codex => Some(&mut self.codex),
+            ExtensionType::Copilot => Some(&mut self.copilot),
+            ExtensionType::Gemini => Some(&mut self.gemini),
+            ExtensionType::Grok => Some(&mut self.grok),
+            ExtensionType::DeepSeek => Some(&mut self.deepseek),
+            ExtensionType::OpenCode => Some(&mut self.opencode),
+            ExtensionType::Cursor => Some(&mut self.cursor),
+            ExtensionType::Hermes => None,
+        };
+        if let Some(rows) = provider_rows {
+            merge_analysis_rows(rows, &day.analysis);
+        }
+        if day.active.analysis {
+            self.add_date(Some(provider), date.to_string());
+        }
     }
 }
 
@@ -1030,41 +879,6 @@ impl AnalysisProjection {
         };
         if let Some(rows) = provider_rows {
             aggregate_analysis_result(rows, analysis);
-        }
-    }
-
-    fn add_compact(&mut self, provider: ExtensionType, summary: &CompactSourceSummary) {
-        merge_compact_rows(&mut self.all, &summary.analysis);
-        let provider_rows = match provider {
-            ExtensionType::ClaudeCode => Some(&mut self.claude),
-            ExtensionType::Codex => Some(&mut self.codex),
-            ExtensionType::Copilot => Some(&mut self.copilot),
-            ExtensionType::Gemini => Some(&mut self.gemini),
-            ExtensionType::Grok => Some(&mut self.grok),
-            ExtensionType::DeepSeek => Some(&mut self.deepseek),
-            ExtensionType::OpenCode => Some(&mut self.opencode),
-            ExtensionType::Cursor => Some(&mut self.cursor),
-            ExtensionType::Hermes => None,
-        };
-        if let Some(rows) = provider_rows {
-            merge_compact_rows(rows, &summary.analysis);
-        }
-
-        self.all_dates
-            .extend(summary.analysis_dates.iter().cloned());
-        let dates = match provider {
-            ExtensionType::ClaudeCode => Some(&mut self.claude_dates),
-            ExtensionType::Codex => Some(&mut self.codex_dates),
-            ExtensionType::Copilot => Some(&mut self.copilot_dates),
-            ExtensionType::Gemini => Some(&mut self.gemini_dates),
-            ExtensionType::Grok => Some(&mut self.grok_dates),
-            ExtensionType::DeepSeek => Some(&mut self.deepseek_dates),
-            ExtensionType::OpenCode => Some(&mut self.opencode_dates),
-            ExtensionType::Cursor => Some(&mut self.cursor_dates),
-            ExtensionType::Hermes => Some(&mut self.hermes_dates),
-        };
-        if let Some(dates) = dates {
-            dates.extend(summary.analysis_dates.iter().cloned());
         }
     }
 
@@ -1129,35 +943,6 @@ impl AnalysisProjection {
             },
             provider_days,
         }
-    }
-}
-
-fn merge_compact_rows(
-    target: &mut FastHashMap<String, AggregatedAnalysisRow>,
-    source: &FastHashMap<String, AggregatedAnalysisRow>,
-) {
-    for (model, row) in source {
-        let entry = target
-            .entry(model.clone())
-            .or_insert_with(|| AggregatedAnalysisRow {
-                model: model.clone(),
-                edit_lines: 0,
-                read_lines: 0,
-                write_lines: 0,
-                bash_count: 0,
-                edit_count: 0,
-                read_count: 0,
-                todo_write_count: 0,
-                write_count: 0,
-            });
-        entry.edit_lines += row.edit_lines;
-        entry.read_lines += row.read_lines;
-        entry.write_lines += row.write_lines;
-        entry.bash_count += row.bash_count;
-        entry.edit_count += row.edit_count;
-        entry.read_count += row.read_count;
-        entry.todo_write_count += row.todo_write_count;
-        entry.write_count += row.write_count;
     }
 }
 

@@ -4,6 +4,7 @@ use anyhow::Result;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use walkdir::WalkDir;
 
 /// A file matched during directory traversal, paired with its modification date.
@@ -12,6 +13,10 @@ pub struct FileInfo {
     pub path: PathBuf,
     /// Local modification date formatted as `YYYY-MM-DD`, used for grouping.
     pub modified_date: String,
+    /// The modification time `modified_date` was derived from.
+    pub modified: SystemTime,
+    /// Length in bytes at discovery time.
+    pub len: u64,
 }
 
 /// One directory traversal or metadata error encountered during discovery.
@@ -182,6 +187,8 @@ where
         results.push(FileInfo {
             path: path.to_path_buf(),
             modified_date: date_key,
+            modified,
+            len: metadata.len(),
         });
     }
 

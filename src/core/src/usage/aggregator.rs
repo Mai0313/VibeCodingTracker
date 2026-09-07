@@ -10,25 +10,19 @@
 //! see [`UsageData`] for why.
 
 use crate::config::ProvidersConfig;
-use crate::constants::{FastHashMap, FastHashSet, capacity};
+use crate::constants::{FastHashMap, capacity};
+use crate::ledger::{DayEntry, SessionLedger, stamp};
 use crate::models::TimeRange;
 use crate::models::{
     CodeAnalysis, ExtensionType, PerProviderUsage, ProviderActiveDays, UsageResult,
 };
 use crate::pricing::TierThresholds;
-use crate::session::cursor::{
-    discover_cursor_store_dbs, load_conversation_model_snapshot, read_cursor_usage_store,
-};
-use crate::session::diagnostics::DatabaseUsageRead;
+use crate::scan::{ScanFeature, group_usage_rows, scan_cursor_stores, scan_database_half};
 use crate::session::hermes::read_hermes_usage_contributions;
 use crate::session::opencode::read_opencode_usage_contributions;
-use crate::session::sqlite::is_cacheable_sqlite_failure;
 use crate::session::{
     ParseMode, parse_session_file_typed_as, read_cursor_usage, read_hermes_usage,
     read_opencode_usage,
-};
-use crate::summary_cache::{
-    CompactSourceSummary, SourceFingerprint, SummaryCacheKey, SummaryKind, SummaryScanCache,
 };
 use crate::utils::directory::collect_provider_files_diagnostics;
 use crate::utils::{
@@ -397,6 +391,10 @@ pub struct UsageScanOptions {
 }
 
 /// Diagnostics-aware usage scan rooted at the current user's provider paths.
+///
+/// Reads and writes the on-disk session ledger under `~/.vct/sessions/`, so
+/// sessions whose source is gone still count; see
+/// [`aggregate_usage_from_home_with_diagnostics_opts`].
 pub fn aggregate_usage_from_home_with_diagnostics(
     time_range: TimeRange,
     providers: ProvidersConfig,
@@ -409,345 +407,144 @@ pub fn aggregate_usage_from_home_with_diagnostics(
 }
 
 /// [`aggregate_usage_from_home_with_diagnostics`] with scan options.
+///
+/// Opens the session ledger under the user's `~/.vct`, scans through it, and
+/// writes it back; a ledger that cannot be written is logged and the scan's
+/// result returned anyway.
 pub fn aggregate_usage_from_home_with_diagnostics_opts(
     time_range: TimeRange,
     providers: ProvidersConfig,
     options: &UsageScanOptions,
 ) -> Result<UsageCollection> {
-    let mut cache = SummaryScanCache::new();
-    aggregate_usage_from_paths_with_cache_opts(
-        &resolve_paths()?,
+    let paths = resolve_paths()?;
+    let mut ledger = SessionLedger::open(&paths.cache_dir);
+    let collection = aggregate_usage_from_paths_with_cache_opts(
+        &paths,
         time_range,
         providers,
-        &mut cache,
+        &mut ledger,
         options,
-    )
+    )?;
+    if let Err(error) = ledger.save() {
+        log::warn!("failed to save the session ledger: {error:#}");
+    }
+    Ok(collection)
 }
 
-/// Diagnostics-aware usage scan rooted at explicit provider paths.
+/// Diagnostics-aware usage scan rooted at explicit provider paths, through an
+/// in-memory ledger that touches nothing on disk.
 pub fn aggregate_usage_from_paths_with_diagnostics(
     paths: &HelperPaths,
     time_range: TimeRange,
     providers: ProvidersConfig,
 ) -> Result<UsageCollection> {
-    let mut cache = SummaryScanCache::new();
-    aggregate_usage_from_paths_with_cache(paths, time_range, providers, &mut cache)
+    let mut ledger = SessionLedger::new();
+    aggregate_usage_from_paths_with_cache(paths, time_range, providers, &mut ledger)
 }
 
-/// Incremental usage scan backed by a process-local compact summary cache.
+/// Incremental usage scan through a session ledger.
 ///
-/// Reusing `cache` across calls reparses only sources whose fingerprint
-/// changed. Cached schema failures retain their diagnostics, while metadata,
-/// open, and read errors are not inserted and are retried next time.
+/// Reusing `ledger` across calls re-reads only sources whose stamp changed,
+/// and keeps folding sessions whose source has gone. Retained schema failures
+/// keep their diagnostics, while metadata, open, and read errors are not
+/// recorded and are retried next time.
 pub fn aggregate_usage_from_paths_with_cache(
     paths: &HelperPaths,
     time_range: TimeRange,
     providers: ProvidersConfig,
-    cache: &mut SummaryScanCache,
+    ledger: &mut SessionLedger,
 ) -> Result<UsageCollection> {
     aggregate_usage_from_paths_with_cache_opts(
         paths,
         time_range,
         providers,
-        cache,
+        ledger,
         &UsageScanOptions::default(),
     )
 }
 
 /// [`aggregate_usage_from_paths_with_cache`] with scan options.
 ///
-/// A tier snapshot in `options` also makes `cache` single-feature: sharing it
-/// with an analysis scan stays correct, but each alternation then clears the
-/// whole cache — database sources along with session files — so a caller
-/// wanting incremental refreshes for both keeps one cache per feature.
+/// The ledger stamps each session's usage half with the tier snapshot it was
+/// classified against, so one ledger serves both features: an entry an
+/// analysis scan wrote is re-read by a usage scan that carries a snapshot, and
+/// nothing else is disturbed.
 pub fn aggregate_usage_from_paths_with_cache_opts(
     paths: &HelperPaths,
     time_range: TimeRange,
     providers: ProvidersConfig,
-    cache: &mut SummaryScanCache,
+    ledger: &mut SessionLedger,
     options: &UsageScanOptions,
 ) -> Result<UsageCollection> {
-    aggregate_usage_from_paths_with_cache_inner(paths, time_range, providers, cache, options)
-}
-
-fn aggregate_usage_from_paths_with_cache_inner(
-    paths: &HelperPaths,
-    time_range: TimeRange,
-    providers: ProvidersConfig,
-    cache: &mut SummaryScanCache,
-    options: &UsageScanOptions,
-) -> Result<UsageCollection> {
-    // Cached summaries embed the tier classification, so a changed threshold
-    // snapshot (daily pricing reload) invalidates every cached entry.
     let tiers = options.tiers.as_deref();
-    cache.ensure_tier_snapshot(tiers);
-    cache.begin_scan();
+    ledger.begin_scan();
     let mut accumulator = UsageAccumulator::default();
     let mut diagnostics = ScanDiagnostics::default();
-    let mut seen = FastHashSet::default();
 
     crate::scan::scan_all_cached_files(
         paths,
         providers,
         time_range,
-        cache,
-        &mut seen,
+        ledger,
+        ScanFeature::Usage,
         &mut accumulator,
         &mut diagnostics,
         tiers,
     )?;
 
-    if providers.opencode && paths.opencode_db.exists() {
-        scan_usage_database(
+    // Every database read covers all time: the range is applied to the folded
+    // days, so a `--daily` scan cannot mistake older sessions for deleted ones.
+    if providers.opencode {
+        scan_database_half(
             ExtensionType::OpenCode,
             &paths.opencode_db,
-            SourceFingerprint::sqlite(&paths.opencode_db, &[]),
+            ScanFeature::Usage,
+            stamp::tiers_fingerprint(tiers),
             time_range,
-            cache,
-            &mut seen,
+            ledger,
             &mut accumulator,
             &mut diagnostics,
-            || read_opencode_usage_contributions(&paths.opencode_db, time_range, tiers),
+            || {
+                read_opencode_usage_contributions(&paths.opencode_db, TimeRange::All, tiers)
+                    .map(|read| group_usage_rows(read, "usage records", true))
+            },
         );
     }
-    if providers.cursor && paths.cursor_chats_dir.exists() {
-        scan_cursor_usage_database(
-            &paths.cursor_chats_dir,
-            &paths.cursor_tracking_db,
+    // Cursor and Hermes classify nothing, so no snapshot goes on their stamps
+    // and a pricing change never re-reads them.
+    if providers.cursor {
+        scan_cursor_stores(
+            paths,
+            ScanFeature::Usage,
+            None,
             time_range,
-            cache,
-            &mut seen,
+            ledger,
             &mut accumulator,
             &mut diagnostics,
         );
     }
-    if providers.hermes && paths.hermes_db.exists() {
-        scan_usage_database(
+    if providers.hermes {
+        scan_database_half(
             ExtensionType::Hermes,
             &paths.hermes_db,
-            SourceFingerprint::sqlite(&paths.hermes_db, &[]),
+            ScanFeature::Usage,
+            None,
             time_range,
-            cache,
-            &mut seen,
+            ledger,
             &mut accumulator,
             &mut diagnostics,
-            || read_hermes_usage_contributions(&paths.hermes_db, time_range),
+            || {
+                read_hermes_usage_contributions(&paths.hermes_db, TimeRange::All)
+                    .map(|read| group_usage_rows(read, "usage records", true))
+            },
         );
     }
 
-    cache.retain_kinds(&seen, &[SummaryKind::File, SummaryKind::UsageDatabase]);
     diagnostics.finalize();
     Ok(UsageCollection {
         data: accumulator.finish(),
         diagnostics,
     })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn scan_usage_database<F>(
-    provider: ExtensionType,
-    source: &Path,
-    fingerprint: Result<SourceFingerprint>,
-    time_range: TimeRange,
-    cache: &mut SummaryScanCache,
-    seen: &mut FastHashSet<SummaryCacheKey>,
-    accumulator: &mut UsageAccumulator,
-    diagnostics: &mut ScanDiagnostics,
-    loader: F,
-) where
-    F: FnOnce() -> Result<DatabaseUsageRead>,
-{
-    diagnostics.candidates += 1;
-    let key = SummaryCacheKey::new(SummaryKind::UsageDatabase, provider, source, time_range);
-    seen.insert(key.clone());
-    let fingerprint = match fingerprint {
-        Ok(value) => value,
-        Err(error) => {
-            diagnostics.failures.push(ScanFailure {
-                provider,
-                source: source.to_path_buf(),
-                error: error.to_string(),
-            });
-            return;
-        }
-    };
-    if let Some(cached) = cache.get(&key, &fingerprint) {
-        crate::scan::fold_cached(provider, source, cached, accumulator, diagnostics);
-        return;
-    }
-
-    cache.record_parse();
-    match loader() {
-        Ok(read) => {
-            let complete_failure = read.expected_records > 0 && read.parsed_records == 0;
-            let failed = read.failed_records();
-            let mut summary = CompactSourceSummary::default();
-            for contribution in read.rows {
-                summary.add_usage_contribution(contribution);
-            }
-            let loaded = crate::scan::LoadedCompactSummary {
-                summary,
-                parsed: !complete_failure,
-                failure: if complete_failure {
-                    Some(format!(
-                        "none of {} usage records used a supported schema",
-                        read.expected_records
-                    ))
-                } else if failed > 0 {
-                    Some(format!("{failed} usage records used an unsupported schema"))
-                } else {
-                    None
-                },
-            };
-            crate::scan::fold_loaded(provider, source, &loaded, accumulator, diagnostics);
-            cache.insert(
-                key,
-                fingerprint,
-                loaded.summary,
-                loaded.parsed,
-                loaded.failure,
-            );
-        }
-        Err(error) => {
-            let failure = format!("{error:#}");
-            diagnostics.failures.push(ScanFailure {
-                provider,
-                source: source.to_path_buf(),
-                error: failure.clone(),
-            });
-            if is_cacheable_sqlite_failure(&error) {
-                cache.insert(
-                    key,
-                    fingerprint,
-                    CompactSourceSummary::default(),
-                    false,
-                    Some(failure),
-                );
-            }
-        }
-    }
-}
-
-fn scan_cursor_usage_database(
-    chats_dir: &Path,
-    tracking_db: &Path,
-    time_range: TimeRange,
-    cache: &mut SummaryScanCache,
-    seen: &mut FastHashSet<SummaryCacheKey>,
-    accumulator: &mut UsageAccumulator,
-    diagnostics: &mut ScanDiagnostics,
-) {
-    let provider = ExtensionType::Cursor;
-    let discovery = discover_cursor_store_dbs(chats_dir);
-    if !discovery.failures.is_empty() {
-        cache.preserve_provider_keys(seen, SummaryKind::UsageDatabase, provider);
-    }
-    for failure in discovery.failures {
-        diagnostics.candidates += 1;
-        diagnostics.failures.push(ScanFailure {
-            provider,
-            source: failure.path,
-            error: failure.error,
-        });
-    }
-
-    let (conv_models, tracking_fingerprint, tracking_ok) =
-        match load_conversation_model_snapshot(tracking_db) {
-            Ok(snapshot) => (snapshot.models, snapshot.fingerprint, true),
-            Err(error) => {
-                diagnostics.failures.push(ScanFailure {
-                    provider,
-                    source: tracking_db.to_path_buf(),
-                    error: format!("{error:#}"),
-                });
-                (FastHashMap::default(), None, false)
-            }
-        };
-
-    for store in discovery.stores {
-        diagnostics.candidates += 1;
-        let key = SummaryCacheKey::new(SummaryKind::UsageDatabase, provider, &store, time_range);
-        seen.insert(key.clone());
-        let fingerprint = if tracking_ok {
-            SourceFingerprint::sqlite_with_dependency(
-                &store,
-                tracking_db,
-                tracking_fingerprint.as_ref(),
-            )
-        } else {
-            SourceFingerprint::sqlite(&store, &[])
-        };
-        let fingerprint = match fingerprint {
-            Ok(fingerprint) => fingerprint,
-            Err(error) => {
-                diagnostics.failures.push(ScanFailure {
-                    provider,
-                    source: store,
-                    error: error.to_string(),
-                });
-                continue;
-            }
-        };
-        if tracking_ok && let Some(cached) = cache.get(&key, &fingerprint) {
-            crate::scan::fold_cached(provider, &store, cached, accumulator, diagnostics);
-            continue;
-        }
-
-        cache.record_parse();
-        match read_cursor_usage_store(&store, &conv_models, time_range) {
-            Ok(read) => {
-                let complete_failure = read.expected_records > 0 && read.parsed_records == 0;
-                let failed = read.failed_records();
-                let mut summary = CompactSourceSummary::default();
-                for contribution in read.rows {
-                    summary.add_usage_contribution(contribution);
-                }
-                let loaded = crate::scan::LoadedCompactSummary {
-                    summary,
-                    parsed: !complete_failure,
-                    failure: if complete_failure {
-                        Some(format!(
-                            "none of {} Cursor usage payloads used a supported schema",
-                            read.expected_records
-                        ))
-                    } else if failed > 0 {
-                        Some(format!(
-                            "{failed} Cursor usage payloads used an unsupported schema"
-                        ))
-                    } else {
-                        None
-                    },
-                };
-                crate::scan::fold_loaded(provider, &store, &loaded, accumulator, diagnostics);
-                if tracking_ok {
-                    cache.insert(
-                        key,
-                        fingerprint,
-                        loaded.summary,
-                        loaded.parsed,
-                        loaded.failure,
-                    );
-                }
-            }
-            Err(error) => {
-                let failure = format!("{error:#}");
-                diagnostics.failures.push(ScanFailure {
-                    provider,
-                    source: store.clone(),
-                    error: failure.clone(),
-                });
-                if tracking_ok && is_cacheable_sqlite_failure(&error) {
-                    cache.insert(
-                        key,
-                        fingerprint,
-                        CompactSourceSummary::default(),
-                        false,
-                        Some(failure),
-                    );
-                }
-            }
-        }
-    }
 }
 
 #[derive(Default)]
@@ -767,13 +564,7 @@ struct UsageAccumulator {
 }
 
 impl crate::scan::CompactSink for UsageAccumulator {
-    fn fold(&mut self, provider: ExtensionType, summary: &CompactSourceSummary) {
-        self.add(provider, summary);
-    }
-}
-
-impl UsageAccumulator {
-    fn add(&mut self, provider: ExtensionType, summary: &CompactSourceSummary) {
+    fn fold(&mut self, provider: ExtensionType, date: &str, day: &DayEntry) {
         let provider_result = match provider {
             ExtensionType::ClaudeCode => &mut self.per_provider.claude,
             ExtensionType::Codex => &mut self.per_provider.codex,
@@ -787,22 +578,8 @@ impl UsageAccumulator {
         };
         // Clone the model key only on a miss (an insert genuinely needs an owned
         // key); a merge into an existing row needs no allocation at all.
-        for (model, usage) in &summary.usage {
-            match provider_result.get_mut(model) {
-                Some(existing) => merge_usage_values(existing, usage),
-                None => {
-                    provider_result.insert(model.clone(), usage.clone());
-                }
-            }
-            match self.models.get_mut(model) {
-                Some(existing) => merge_usage_values(existing, usage),
-                None => {
-                    self.models.insert(model.clone(), usage.clone());
-                }
-            }
-        }
-        for ((model, tier_level), tokens) in &summary.database_usage {
-            let usage = tokens.into_value(*tier_level);
+        for (model, raw) in &day.usage {
+            let usage = DayEntry::usage_value(raw);
             match provider_result.get_mut(model) {
                 Some(existing) => merge_usage_values(existing, &usage),
                 None => {
@@ -824,25 +601,29 @@ impl UsageAccumulator {
             _ => None,
         };
         if let Some(stored) = stored {
-            for (model, cost) in &summary.stored_costs {
+            for (model, cost) in &day.stored_cost {
                 *stored.entry(model.clone()).or_insert(0.0) += cost;
             }
         }
 
-        let dates = match provider {
-            ExtensionType::ClaudeCode => &mut self.claude_dates,
-            ExtensionType::Codex => &mut self.codex_dates,
-            ExtensionType::Copilot => &mut self.copilot_dates,
-            ExtensionType::Gemini => &mut self.gemini_dates,
-            ExtensionType::Grok => &mut self.grok_dates,
-            ExtensionType::DeepSeek => &mut self.deepseek_dates,
-            ExtensionType::OpenCode => &mut self.opencode_dates,
-            ExtensionType::Cursor => &mut self.cursor_dates,
-            ExtensionType::Hermes => &mut self.hermes_dates,
-        };
-        dates.extend(summary.usage_dates.iter().cloned());
+        if day.active.usage {
+            let dates = match provider {
+                ExtensionType::ClaudeCode => &mut self.claude_dates,
+                ExtensionType::Codex => &mut self.codex_dates,
+                ExtensionType::Copilot => &mut self.copilot_dates,
+                ExtensionType::Gemini => &mut self.gemini_dates,
+                ExtensionType::Grok => &mut self.grok_dates,
+                ExtensionType::DeepSeek => &mut self.deepseek_dates,
+                ExtensionType::OpenCode => &mut self.opencode_dates,
+                ExtensionType::Cursor => &mut self.cursor_dates,
+                ExtensionType::Hermes => &mut self.hermes_dates,
+            };
+            dates.insert(date.to_string());
+        }
     }
+}
 
+impl UsageAccumulator {
     fn finish(self) -> UsageData {
         // Only the union's cardinality is needed, so union references rather
         // than cloning every date string across the nine per-provider sets.

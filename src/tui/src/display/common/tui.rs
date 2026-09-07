@@ -187,6 +187,14 @@ impl std::fmt::Display for RefreshWorkerError {
     }
 }
 
+/// How often a refresh worker writes its session ledger back to disk at most.
+///
+/// A session being used changes on every refresh, so saving on every tick
+/// would rewrite its provider's whole file every few seconds; once a minute
+/// bounds that, and what a crash loses is at most a minute of parse work,
+/// redone on the next launch.
+pub const LEDGER_SAVE_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Single background loader with one active and one coalesced pending refresh.
 pub struct RefreshWorker<T> {
     command_tx: SyncSender<RefreshCommand>,

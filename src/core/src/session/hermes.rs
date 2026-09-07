@@ -305,7 +305,7 @@ fn collect_per_model_rows(
         // window — the residual is a session-level quantity, and the residual
         // row it feeds is cutoff-filtered on its own, so holding a pre-cutoff
         // row out here would let the aggregate count it a second time.
-        let acc = summed.entry(session_id).or_default();
+        let acc = summed.entry(session_id.clone()).or_default();
         acc.input += input;
         acc.output += raw_output;
         acc.cache_read += cache_read;
@@ -328,6 +328,7 @@ fn collect_per_model_rows(
         // the session sent to that model, so no single request context exists
         // to classify and the row bills at base rates.
         out.push(UsageContribution::single_model(
+            session_id,
             date,
             (seconds * 1000.0) as i64,
             model.to_string(),
@@ -435,6 +436,7 @@ fn reconcile_session_residuals(
 
         let cost = if actual > 0.0 { actual } else { estimated };
         out.push(UsageContribution::single_model(
+            id,
             date,
             (seconds * 1000.0) as i64,
             model.to_string(),

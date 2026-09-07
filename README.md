@@ -35,7 +35,7 @@ Stop wondering how much your AI coding sessions cost. Get **real-time cost track
 
 ### Ultra-Lightweight
 
-Built with Rust for minimal resource footprint. The interactive TUI dashboard typically sits at **under ~50 MB of resident memory** once the first refresh is done, even with hundreds of long-context sessions on disk — no Electron, no bloated runtimes. A compact process-local summary cache reparses only new or changed sources after the first scan, while dedicated scan workers and glibc allocator tuning keep long-running CPU and RSS honest.
+Built with Rust for minimal resource footprint. The interactive TUI dashboard typically sits at **around 60 MB of resident memory** once the first refresh is done, even with thousands of sessions on disk — no Electron, no bloated runtimes. A persistent per-session ledger under `~/.vct/sessions/` means only new or changed sources are ever parsed again, even across runs, while dedicated scan workers and glibc allocator tuning keep long-running CPU and RSS honest.
 
 ### Beautiful Visualizations
 
@@ -304,6 +304,10 @@ The tool automatically scans these directories:
 Grok `usage` is one point-in-time local context estimate: vct records `signals.json`'s `contextTokensUsed` as cache-read tokens and estimates cost at the model's cache-read price. It is not cumulative billed usage. `analysis` reconstructs completed Read / Write / Edit / Bash / TodoWrite operations from the sibling `updates.jsonl`. For your actual billed allowance, see the Grok quota panel below.
 
 For noninteractive `usage` and `analysis` scans, vct exits with an error when every discovered source fails. If only some sources fail, it keeps the successful results and prints one diagnostic summary to stderr. The TUI stays best-effort and preserves its last successful payload instead.
+
+### Session Ledger
+
+Every `usage` and `analysis` scan reads and writes a per-session ledger under `~/.vct/sessions/` (one `<provider>.json` per assistant). A session that has not changed is never parsed twice, so one-shot runs and the dashboard's first paint only spend time on what changed. More importantly, a session stays in the ledger after its source is gone: when an assistant prunes its own history (Claude Code keeps 30 days by default) or a whole session directory such as `~/.claude/projects` is deleted, every total still includes it, and noninteractive runs print a one-line note saying how many sessions came from the ledger. A resumed session is re-read when its log changes. The ledger holds only per-day token counts and tool counters in each provider's own shape, never transcripts or prices, and vct never deletes it: an unreadable file is renamed aside and a file written by a newer vct is left alone. Delete the directory to start over from what is on disk. `vct analysis --json` and `vct analysis FILE` parse their files in full and do not use it.
 
 ### Live Quota Panels
 

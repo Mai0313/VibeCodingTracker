@@ -11,8 +11,8 @@ use rusqlite::{Connection, params};
 use std::os::unix::fs::PermissionsExt;
 use vct_core::TimeRange;
 use vct_core::config::ProvidersConfig;
+use vct_core::ledger::SessionLedger;
 use vct_core::models::{ExtensionType, PerProviderUsage, ProviderActiveDays};
-use vct_core::summary_cache::SummaryScanCache;
 use vct_core::usage::aggregator::{
     StoredCosts, UsageData, aggregate_usage_from_paths, aggregate_usage_from_paths_with_cache,
     aggregate_usage_from_paths_with_diagnostics, aggregate_usage_from_paths_with_providers,
@@ -294,7 +294,7 @@ fn cached_usage_matches_uncached_for_every_provider_source() {
     let providers = ProvidersConfig::default();
     let uncached =
         aggregate_usage_from_paths_with_providers(&home.paths, TimeRange::All, providers).unwrap();
-    let mut cache = SummaryScanCache::new();
+    let mut cache = SessionLedger::new();
     let cold =
         aggregate_usage_from_paths_with_cache(&home.paths, TimeRange::All, providers, &mut cache)
             .unwrap();
@@ -359,7 +359,7 @@ fn usage_cache_preserves_entries_after_partial_directory_discovery() {
     );
     let hidden_dir = hidden_source.parent().unwrap();
     let original_permissions = std::fs::metadata(hidden_dir).unwrap().permissions();
-    let mut cache = SummaryScanCache::new();
+    let mut cache = SessionLedger::new();
 
     let cold = aggregate_usage_from_paths_with_cache(
         &home.paths,
@@ -411,7 +411,7 @@ fn cursor_usage_cache_invalidates_only_changed_stores() {
     let first = home.put_cursor_session("project", "first", "cursor-first", 1_780_757_089_000, 100);
     let second =
         home.put_cursor_session("project", "second", "cursor-second", 1_780_757_090_000, 200);
-    let mut cache = SummaryScanCache::new();
+    let mut cache = SessionLedger::new();
 
     let cold = aggregate_usage_from_paths_with_cache(
         &home.paths,
@@ -459,6 +459,7 @@ fn cursor_usage_cache_invalidates_only_changed_stores() {
     assert_eq!(cache.stats().entries, 3);
     assert!(added.data.per_provider.cursor.contains_key("cursor-third"));
 
+    // A store that is gone stays in the ledger and keeps contributing.
     std::fs::remove_file(second).unwrap();
     let deleted = aggregate_usage_from_paths_with_cache(
         &home.paths,
@@ -468,16 +469,11 @@ fn cursor_usage_cache_invalidates_only_changed_stores() {
     )
     .unwrap();
     assert_eq!(cache.stats().parsed_sources, 0);
-    assert_eq!(cache.stats().entries, 2);
+    assert_eq!(cache.stats().entries, 3);
     assert_eq!(deleted.diagnostics.candidates, 2);
     assert_eq!(deleted.diagnostics.parsed, 2);
-    assert!(
-        !deleted
-            .data
-            .per_provider
-            .cursor
-            .contains_key("cursor-second")
-    );
+    assert_eq!(deleted.diagnostics.retained, 1);
+    assert_usage_data_eq(&deleted.data, &added.data);
 }
 
 #[test]
@@ -488,7 +484,7 @@ fn incremental_cache_reuses_unchanged_sources_and_tracks_mutations() {
         "session.jsonl",
         &fixture_str("sessions/claude_code.jsonl"),
     );
-    let mut cache = SummaryScanCache::new();
+    let mut cache = SessionLedger::new();
 
     let cold = aggregate_usage_from_paths_with_cache(
         &home.paths,
@@ -533,12 +529,31 @@ fn incremental_cache_reuses_unchanged_sources_and_tracks_mutations() {
     );
     assert_eq!(cache.stats().entries, 2);
 
+    let before_deletion = aggregate_usage_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        claude_only(),
+        &mut cache,
+    )
+    .unwrap();
     std::fs::remove_file(source).unwrap();
-    aggregate_usage_from_paths_with_cache(&home.paths, TimeRange::All, claude_only(), &mut cache)
-        .unwrap();
+    let after_deletion = aggregate_usage_from_paths_with_cache(
+        &home.paths,
+        TimeRange::All,
+        claude_only(),
+        &mut cache,
+    )
+    .unwrap();
     assert_eq!(cache.stats().parsed_sources, 0);
-    assert_eq!(cache.stats().entries, 1, "deleted source is evicted");
+    assert_eq!(
+        cache.stats().entries,
+        2,
+        "a deleted source stays in the ledger"
+    );
+    assert_eq!(after_deletion.diagnostics.retained, 1);
+    assert_usage_data_eq(&after_deletion.data, &before_deletion.data);
 
+    // A disabled provider folds nothing, and its ledger entries are left alone.
     let disabled = ProvidersConfig {
         claude: false,
         ..claude_only()
@@ -548,7 +563,7 @@ fn incremental_cache_reuses_unchanged_sources_and_tracks_mutations() {
             .unwrap();
     assert!(result.data.models.is_empty());
     assert_eq!(cache.stats().parsed_sources, 0);
-    assert_eq!(cache.stats().entries, 0);
+    assert_eq!(cache.stats().entries, 2);
 }
 
 /// Each assistant step reports its usage twice — once as an early
@@ -603,7 +618,7 @@ fn grok_sidecars_invalidate_the_compact_cache() {
         hermes: false,
         dsh: false,
     };
-    let mut cache = SummaryScanCache::new();
+    let mut cache = SessionLedger::new();
 
     aggregate_usage_from_paths_with_cache(&home.paths, TimeRange::All, providers, &mut cache)
         .unwrap();
@@ -736,7 +751,7 @@ fn opencode_usage_schema_drift_is_diagnostic_and_fingerprint_cached() {
         .unwrap();
     drop(connection);
 
-    let mut cache = SummaryScanCache::new();
+    let mut cache = SessionLedger::new();
     let failed = aggregate_usage_from_paths_with_cache(
         &home.paths,
         TimeRange::All,
@@ -792,7 +807,7 @@ fn deterministic_sqlite_schema_failure_is_cached() {
         .execute_batch("CREATE TABLE session (id TEXT PRIMARY KEY);")
         .unwrap();
 
-    let mut cache = SummaryScanCache::new();
+    let mut cache = SessionLedger::new();
     let cold = aggregate_usage_from_paths_with_cache(
         &home.paths,
         TimeRange::All,
@@ -867,7 +882,7 @@ fn opencode_wal_change_invalidates_the_compact_cache() {
         )
         .unwrap();
 
-    let mut cache = SummaryScanCache::new();
+    let mut cache = SessionLedger::new();
     let cold = aggregate_usage_from_paths_with_cache(
         &home.paths,
         TimeRange::All,
@@ -1201,15 +1216,16 @@ fn moving_a_codex_session_between_roots_keeps_cached_usage_stable() {
     let archived = home.paths.codex_archived_session_dir.join(CODEX_ROLLOUT);
     std::fs::create_dir_all(archived.parent().unwrap()).unwrap();
     let providers = ProvidersConfig::default();
-    let mut cache = SummaryScanCache::new();
+    let mut cache = SessionLedger::new();
     let before =
         aggregate_usage_from_paths_with_cache(&home.paths, TimeRange::All, providers, &mut cache)
             .unwrap();
     assert_eq!(before.diagnostics.parsed, 1);
     assert_eq!(cache.stats().entries, 1);
 
-    // Archiving, then un-archiving: the cache is keyed by path, so both moves
-    // must re-key the entry rather than drop or duplicate the session.
+    // Archiving, then un-archiving: the ledger keys Codex on the file name, so
+    // both moves find the same entry rather than retaining the vacated path as
+    // a missing session beside a new one.
     for (from, to) in [(&active, &archived), (&archived, &active)] {
         std::fs::rename(from, to).unwrap();
         let after = aggregate_usage_from_paths_with_cache(
@@ -1221,7 +1237,6 @@ fn moving_a_codex_session_between_roots_keeps_cached_usage_stable() {
         .unwrap();
         assert_eq!(after.diagnostics, before.diagnostics);
         assert_usage_data_eq(&after.data, &before.data);
-        // The vacated path must be evicted, not left behind as a stale entry.
         assert_eq!(cache.stats().entries, 1);
     }
 }
@@ -1283,7 +1298,7 @@ fn opencode_bills_a_large_request_at_the_tier_it_reached() {
         tiers: Some(Arc::new(pricing.tier_thresholds())),
     };
 
-    let mut cache = SummaryScanCache::new();
+    let mut cache = SessionLedger::new();
     let collected = aggregate_usage_from_paths_with_cache_opts(
         &home.paths,
         TimeRange::All,
@@ -1346,7 +1361,7 @@ fn an_analysis_scan_sharing_a_cache_keeps_the_usage_tier_slices() {
     let options = UsageScanOptions {
         tiers: Some(Arc::new(ModelPricingMap::new(prices).tier_thresholds())),
     };
-    let usage_scan = |cache: &mut SummaryScanCache| {
+    let usage_scan = |cache: &mut SessionLedger| {
         aggregate_usage_from_paths_with_cache_opts(
             &home.paths,
             TimeRange::All,
@@ -1361,7 +1376,7 @@ fn an_analysis_scan_sharing_a_cache_keeps_the_usage_tier_slices() {
     // session is what makes the analysis scan miss the cache: it reparses that
     // source with no snapshot, and whatever it leaves behind is what the next
     // usage scan prices.
-    let mut shared = SummaryScanCache::new();
+    let mut shared = SessionLedger::new();
     usage_scan(&mut shared);
     home.put_claude_session(
         "project",
@@ -1376,7 +1391,7 @@ fn an_analysis_scan_sharing_a_cache_keeps_the_usage_tier_slices() {
     )
     .expect("aggregate claude analysis");
 
-    let cold = usage_scan(&mut SummaryScanCache::new());
+    let cold = usage_scan(&mut SessionLedger::new());
     let classified = &cold.data.models["claude-sonnet-4-20250514"]["above_tier"];
     assert!(
         classified["level_1_cache_read_tokens"]

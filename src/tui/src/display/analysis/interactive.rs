@@ -210,16 +210,24 @@ fn run_analysis_interactive(
         let worker_paths = paths.clone();
         let worker_pool = Arc::clone(&scan_pool);
         let mut worker = RefreshWorker::new_with_init(refresh_secs, move || {
-            let mut cache = vct_core::summary_cache::SummaryScanCache::new();
+            let mut ledger = vct_core::ledger::SessionLedger::open(&worker_paths.cache_dir);
             move || {
                 let aggregation = worker_pool.install(|| {
                     vct_core::analysis::aggregate_sessions_by_model_from_paths_with_cache(
                         &worker_paths,
                         time_range,
                         providers,
-                        &mut cache,
+                        &mut ledger,
                     )
                 })?;
+                // A live session changes every tick; writing its provider's
+                // file once a minute keeps the ledger current without
+                // rewriting it on every refresh.
+                if let Err(error) =
+                    ledger.save_if_due(crate::display::common::tui::LEDGER_SAVE_INTERVAL)
+                {
+                    log::warn!("failed to save the session ledger: {error:#}");
+                }
                 if aggregation.diagnostics.all_failed() {
                     let first = aggregation
                         .diagnostics

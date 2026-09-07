@@ -1,17 +1,16 @@
-//! Data-driven provider fan-out for the cached file scan.
+//! Data-driven provider fan-out for the ledger-backed file scan.
 //!
 //! The six file-backed providers are scanned with the identical
 //! [`scan_cached_files`] call, differing only in their session roots, filter,
 //! depth cap, and enable toggle. Listing them once here means adding a provider
 //! is a single table row instead of a new `if` block in every scan loop.
 
-use super::{CompactSink, ScanDiagnostics, scan_cached_files};
+use super::{CompactSink, ScanDiagnostics, ScanFeature, scan_cached_files};
 use crate::config::ProvidersConfig;
-use crate::constants::FastHashSet;
+use crate::ledger::SessionLedger;
 use crate::models::ExtensionType;
 use crate::models::TimeRange;
 use crate::pricing::TierThresholds;
-use crate::summary_cache::{SummaryCacheKey, SummaryScanCache};
 use crate::utils::{
     COPILOT_SESSION_MAX_DEPTH, DSH_SESSION_MAX_DEPTH, GROK_SESSION_MAX_DEPTH, HelperPaths,
     is_claude_session_file, is_codex_session_file, is_copilot_session_file, is_dsh_session_file,
@@ -81,15 +80,15 @@ const FILE_PROVIDERS: [FileProviderSpec; 6] = [
     },
 ];
 
-/// Scans every enabled file-backed provider through the incremental cache,
-/// folding each into `sink`. Shared by the usage and analysis cached collectors.
+/// Scans every enabled file-backed provider through the ledger, folding each
+/// into `sink`. Shared by the usage and analysis ledger-backed collectors.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn scan_all_cached_files(
     paths: &HelperPaths,
     providers: ProvidersConfig,
     time_range: TimeRange,
-    cache: &mut SummaryScanCache,
-    seen: &mut FastHashSet<SummaryCacheKey>,
+    ledger: &mut SessionLedger,
+    feature: ScanFeature,
     sink: &mut impl CompactSink,
     diagnostics: &mut ScanDiagnostics,
     tiers: Option<&TierThresholds>,
@@ -102,8 +101,8 @@ pub(crate) fn scan_all_cached_files(
                 spec.filter,
                 time_range,
                 spec.max_depth,
-                cache,
-                seen,
+                ledger,
+                feature,
                 sink,
                 diagnostics,
                 tiers,
