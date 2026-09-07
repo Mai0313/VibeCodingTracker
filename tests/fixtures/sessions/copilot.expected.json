@@ -1,9 +1,70 @@
 {
+  "user": "ignored",
   "extensionName": "Copilot-CLI",
-  "insightsVersion": "0.5.17-15-g8fcfa09-dirty",
-  "machineId": "18f309cbbb654be69eff5ff79d2f3fa6",
+  "insightsVersion": "ignored",
+  "machineId": "ignored",
   "records": [
     {
+      "totalUniqueFiles": 4,
+      "totalWriteLines": 0,
+      "totalReadLines": 4,
+      "totalEditLines": 0,
+      "totalWriteCharacters": 0,
+      "totalReadCharacters": 12,
+      "totalEditCharacters": 0,
+      "writeFileDetails": [],
+      "readFileDetails": [
+        {
+          "filePath": "/repo/copilot-demo",
+          "lineCount": 1,
+          "characterCount": 3,
+          "timestamp": 1776964283999
+        },
+        {
+          "filePath": "/repo/copilot-demo/Cargo.toml",
+          "lineCount": 1,
+          "characterCount": 3,
+          "timestamp": 1776964284000
+        },
+        {
+          "filePath": "/repo/copilot-demo/src",
+          "lineCount": 1,
+          "characterCount": 3,
+          "timestamp": 1776964302491
+        },
+        {
+          "filePath": "/repo/copilot-demo/.github",
+          "lineCount": 1,
+          "characterCount": 3,
+          "timestamp": 1776964302491
+        }
+      ],
+      "editFileDetails": [],
+      "runCommandDetails": [
+        {
+          "filePath": "/repo/copilot-demo",
+          "lineCount": 0,
+          "characterCount": 40,
+          "timestamp": 1776964318361,
+          "command": "ls /repo/copilot-demo/.github/workflows/",
+          "description": "..."
+        },
+        {
+          "filePath": "/repo/copilot-demo",
+          "lineCount": 0,
+          "characterCount": 65,
+          "timestamp": 1776964329139,
+          "command": "grep -rn \"///\" /repo/copilot-demo/src --include=\"*.rs\" | head -30",
+          "description": "..."
+        }
+      ],
+      "toolCallCounts": {
+        "Read": 9,
+        "Write": 0,
+        "Edit": 0,
+        "TodoWrite": 0,
+        "Bash": 2
+      },
       "conversationUsage": {
         "claude-sonnet-4-6": {
           "cache_creation_input_tokens": 0,
@@ -13,71 +74,10 @@
           "reasoning_output_tokens": 1024
         }
       },
-      "editFileDetails": [],
-      "folderPath": "/home/wei/repo/VibeCodingTracker",
-      "gitRemoteUrl": "https://github.com/Mai0313/VibeCodingTracker",
-      "readFileDetails": [
-        {
-          "characterCount": 295,
-          "filePath": "/home/wei/repo/VibeCodingTracker",
-          "lineCount": 28,
-          "timestamp": 1776964283999
-        },
-        {
-          "characterCount": 2580,
-          "filePath": "/home/wei/repo/VibeCodingTracker/Cargo.toml",
-          "lineCount": 82,
-          "timestamp": 1776964284000
-        },
-        {
-          "characterCount": 91,
-          "filePath": "/home/wei/repo/VibeCodingTracker/src",
-          "lineCount": 12,
-          "timestamp": 1776964302491
-        },
-        {
-          "characterCount": 80,
-          "filePath": "/home/wei/repo/VibeCodingTracker/.github",
-          "lineCount": 7,
-          "timestamp": 1776964302491
-        }
-      ],
-      "runCommandDetails": [
-        {
-          "characterCount": 54,
-          "command": "ls /home/wei/repo/VibeCodingTracker/.github/workflows/",
-          "description": "List existing GitHub Actions workflows",
-          "filePath": "/home/wei/repo/VibeCodingTracker",
-          "lineCount": 0,
-          "timestamp": 1776964318361
-        },
-        {
-          "characterCount": 79,
-          "command": "grep -rn \"///\" /home/wei/repo/VibeCodingTracker/src --include=\"*.rs\" | head -30",
-          "description": "Check existing rustdoc comments in source",
-          "filePath": "/home/wei/repo/VibeCodingTracker",
-          "lineCount": 0,
-          "timestamp": 1776964329139
-        }
-      ],
       "taskId": "96ef38f0-9d09-45c3-8124-6448c36090ed",
       "timestamp": 1776964700178,
-      "toolCallCounts": {
-        "Bash": 2,
-        "Edit": 0,
-        "Read": 9,
-        "TodoWrite": 0,
-        "Write": 0
-      },
-      "totalEditCharacters": 0,
-      "totalEditLines": 0,
-      "totalReadCharacters": 3046,
-      "totalReadLines": 129,
-      "totalUniqueFiles": 4,
-      "totalWriteCharacters": 0,
-      "totalWriteLines": 0,
-      "writeFileDetails": []
+      "folderPath": "/repo/copilot-demo",
+      "gitRemoteUrl": "https://github.com/demo-org/copilot-demo"
     }
-  ],
-  "user": "wei"
+  ]
 }

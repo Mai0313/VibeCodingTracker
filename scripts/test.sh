@@ -13,7 +13,11 @@ generate_result() {
     local temporary
     temporary="$tmp_dir/$(basename "$output")"
 
-    ./target/debug/vibe_coding_tracker analysis "$input" > "$temporary"
+    # These three describe whoever ran this script, not the parse. The golden
+    # test ignores them, so pin them to a literal rather than committing a
+    # different machine's values on every regeneration.
+    ./target/debug/vibe_coding_tracker analysis "$input" |
+        jq '.insightsVersion = "ignored" | .machineId = "ignored" | .user = "ignored"' > "$temporary"
     mv "$temporary" "$output"
 }
 
