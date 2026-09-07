@@ -370,6 +370,88 @@ fn an_opencode_session_deleted_from_the_database_is_retained() {
 }
 
 #[test]
+fn a_database_that_stops_being_readable_keeps_serving_its_sessions() {
+    let home = TempHome::new();
+    seed_opencode_db(
+        &home.paths.opencode_db,
+        &[("ses_a", "model-a"), ("ses_b", "model-b")],
+    );
+    let providers = only(ExtensionType::OpenCode);
+    let mut ledger = open(&home);
+    let before = usage(&home, TimeRange::All, providers, &mut ledger);
+    ledger.save().unwrap();
+
+    // Every row turns into a schema this build does not understand: the read
+    // succeeds but understands nothing, so the sessions are served from the
+    // ledger, counted as retained, and not marked missing.
+    let connection = Connection::open(&home.paths.opencode_db).unwrap();
+    connection
+        .execute_batch(r#"UPDATE message SET data = '{"role":"assistant","futureUsage":{}}';"#)
+        .unwrap();
+    drop(connection);
+    let mut reopened = open(&home);
+    let drifted = usage(&home, TimeRange::All, providers, &mut reopened);
+    assert_eq!(drifted.diagnostics.candidates, 1);
+    assert_eq!(drifted.diagnostics.parsed, 0);
+    assert_eq!(drifted.diagnostics.retained, 2);
+    assert!(!drifted.diagnostics.all_failed());
+    assert_eq!(drifted.diagnostics.failures.len(), 1);
+    assert_eq!(drifted.data.models, before.data.models);
+    reopened.save().unwrap();
+    let file = ledger_file(&home, ExtensionType::OpenCode);
+    assert!(file["sessions"]["ses_a"]["missing_since"].is_null());
+    assert_eq!(file["source"]["usage"]["parsed"], false);
+
+    // The same holds when the query itself fails against the bytes on disk.
+    let connection = Connection::open(&home.paths.opencode_db).unwrap();
+    connection.execute_batch("DROP TABLE session;").unwrap();
+    drop(connection);
+    let mut reopened = open(&home);
+    let broken = usage(&home, TimeRange::All, providers, &mut reopened);
+    assert_eq!(broken.diagnostics.parsed, 0);
+    assert_eq!(broken.diagnostics.retained, 2);
+    assert!(!broken.diagnostics.all_failed());
+    assert_eq!(broken.data.models, before.data.models);
+    let again = usage(&home, TimeRange::All, providers, &mut reopened);
+    assert_eq!(
+        reopened.stats().parsed_sources,
+        0,
+        "the failure verdict is retained"
+    );
+    assert_eq!(again.diagnostics, broken.diagnostics);
+}
+
+#[test]
+fn cursor_writes_no_stored_cost() {
+    let home = TempHome::new();
+    home.put_cursor_session(
+        "hash",
+        "conversation",
+        "cursor-model",
+        1_780_757_089_000,
+        100,
+    );
+    let mut ledger = open(&home);
+    usage(
+        &home,
+        TimeRange::All,
+        only(ExtensionType::Cursor),
+        &mut ledger,
+    );
+    ledger.save().unwrap();
+    let file = ledger_file(&home, ExtensionType::Cursor);
+    let day = file["sessions"]["hash/conversation/store.db"]["days"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    assert!(day["usage"]["cursor-model"].is_object());
+    assert!(day.get("stored_cost").is_none());
+}
+
+#[test]
 fn a_hermes_database_that_disappears_keeps_its_sessions() {
     let home = TempHome::new();
     seed_hermes_db(&home.paths.hermes_db);

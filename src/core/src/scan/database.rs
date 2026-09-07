@@ -38,8 +38,14 @@ pub(crate) struct SessionRead {
 /// Groups a usage read's rows by session and day.
 ///
 /// `noun` names the rows in the failure reason (`usage records`, `Cursor usage
-/// payloads`), which the CLI shows verbatim.
-pub(crate) fn group_usage_rows(read: DatabaseUsageRead, noun: &str) -> DatabaseHalfRead {
+/// payloads`), which the CLI shows verbatim. `records_cost` says whether the
+/// provider prices its own rows (OpenCode, Hermes); a provider that does not
+/// (Cursor) gets no stored-cost map written at all.
+pub(crate) fn group_usage_rows(
+    read: DatabaseUsageRead,
+    noun: &str,
+    records_cost: bool,
+) -> DatabaseHalfRead {
     let complete_failure = read.expected_records > 0 && read.parsed_records == 0;
     let failed = read.failed_records();
     let failure = if complete_failure {
@@ -62,7 +68,7 @@ pub(crate) fn group_usage_rows(read: DatabaseUsageRead, noun: &str) -> DatabaseH
             row.model,
             row.tokens,
             row.tier_level,
-            row.stored_cost,
+            records_cost.then_some(row.stored_cost),
         );
     }
     DatabaseHalfRead {
@@ -124,7 +130,7 @@ pub(crate) fn scan_database_half<R>(
 
     if !db_path.exists() {
         book.settle_all_missing(&today());
-        let retained = fold_book(provider, &book, cutoff.as_deref(), sink, diagnostics);
+        let retained = fold_book(provider, &book, cutoff.as_deref(), true, sink, diagnostics);
         ledger.record_retained(retained);
         ledger.put_provider(provider, book);
         return;
@@ -135,16 +141,23 @@ pub(crate) fn scan_database_half<R>(
         Ok(files) => ScanStamp::new(tiers, files),
         Err(error) => {
             diagnostics.record_hard_failure(provider, db_path, error.to_string());
-            let retained = fold_book(provider, &book, cutoff.as_deref(), sink, diagnostics);
+            let retained = fold_book(provider, &book, cutoff.as_deref(), true, sink, diagnostics);
             ledger.record_retained(retained);
             ledger.put_provider(provider, book);
             return;
         }
     };
 
+    // Whether this scan's sessions come from a read that succeeded (now or
+    // when the stamp was written) rather than from the ledger alone. A
+    // database that exists but cannot be read still serves what it held: the
+    // sessions are real usage, and they count as retained rather than parsed
+    // so the scan neither reads as all-failed nor claims a read it did not get.
+    let read_ok;
     if let Some(stamp) = book.source.half(feature)
         && stamp.is_current(feature, &current)
     {
+        read_ok = stamp.parsed;
         if stamp.parsed {
             diagnostics.parsed += 1;
         }
@@ -165,10 +178,13 @@ pub(crate) fn scan_database_half<R>(
                     entry.replace_half(feature, session.days);
                     entry.missing_since = None;
                 }
-                book.settle_unseen(&seen, true, &today());
+                // A read that understood nothing says nothing about which
+                // sessions are still there, so it marks none of them missing.
                 if read.parsed {
+                    book.settle_unseen(&seen, true, &today());
                     diagnostics.parsed += 1;
                 }
+                read_ok = read.parsed;
                 if let Some(failure) = &read.failure {
                     diagnostics.record_failure(provider, db_path, failure.clone());
                 }
@@ -177,6 +193,7 @@ pub(crate) fn scan_database_half<R>(
                 book.dirty = true;
             }
             Err(error) => {
+                read_ok = false;
                 let failure = format!("{error:#}");
                 diagnostics.record_hard_failure(provider, db_path, failure.clone());
                 if is_cacheable_sqlite_failure(&error) {
@@ -188,23 +205,34 @@ pub(crate) fn scan_database_half<R>(
         }
     }
 
-    let retained = fold_book(provider, &book, cutoff.as_deref(), sink, diagnostics);
+    let retained = fold_book(
+        provider,
+        &book,
+        cutoff.as_deref(),
+        !read_ok,
+        sink,
+        diagnostics,
+    );
     ledger.record_retained(retained);
     ledger.put_provider(provider, book);
 }
 
-/// Folds every session of `book`, counting the ones whose source is gone.
+/// Folds every session of `book`, counting as retained the ones served from
+/// the ledger alone: every session when `from_ledger` (the database is gone
+/// or unreadable), otherwise those whose source is marked missing. A session
+/// holding no days contributes nothing and is not counted.
 fn fold_book(
     provider: ExtensionType,
     book: &ProviderLedger,
     cutoff: Option<&str>,
+    from_ledger: bool,
     sink: &mut impl CompactSink,
     diagnostics: &mut ScanDiagnostics,
 ) -> usize {
     let mut retained = 0;
     for entry in book.sessions.values() {
         fold_days(provider, &entry.days, cutoff, sink);
-        if entry.missing_since.is_some() {
+        if !entry.days.is_empty() && (from_ledger || entry.missing_since.is_some()) {
             retained += 1;
         }
     }

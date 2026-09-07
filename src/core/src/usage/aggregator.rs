@@ -506,7 +506,7 @@ pub fn aggregate_usage_from_paths_with_cache_opts(
             &mut diagnostics,
             || {
                 read_opencode_usage_contributions(&paths.opencode_db, TimeRange::All, tiers)
-                    .map(|read| group_usage_rows(read, "usage records"))
+                    .map(|read| group_usage_rows(read, "usage records", true))
             },
         );
     }
@@ -535,7 +535,7 @@ pub fn aggregate_usage_from_paths_with_cache_opts(
             &mut diagnostics,
             || {
                 read_hermes_usage_contributions(&paths.hermes_db, TimeRange::All)
-                    .map(|read| group_usage_rows(read, "usage records"))
+                    .map(|read| group_usage_rows(read, "usage records", true))
             },
         );
     }

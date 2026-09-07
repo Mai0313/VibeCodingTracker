@@ -75,7 +75,7 @@ pub(crate) fn fold_present(
 }
 
 /// Folds every session of `book` the scan did not find on disk, and returns
-/// how many there were.
+/// how many of them held anything.
 pub(crate) fn fold_unseen(
     provider: ExtensionType,
     book: &ProviderLedger,
@@ -90,7 +90,9 @@ pub(crate) fn fold_unseen(
             continue;
         }
         fold_days(provider, &entry.days, cutoff, sink);
-        retained += 1;
+        if !entry.days.is_empty() {
+            retained += 1;
+        }
     }
     diagnostics.retained += retained;
     retained

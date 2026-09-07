@@ -504,7 +504,7 @@ fn write_pretty_json(value: &impl Serialize) -> Result<()> {
 fn report_retained_sessions(diagnostics: &vct_core::ScanDiagnostics) {
     if diagnostics.retained > 0 {
         eprintln!(
-            "Note: {} sessions no longer on disk are included from the session ledger (~/.vct/sessions).",
+            "Note: {} sessions not found on disk are included from the session ledger (~/.vct/sessions).",
             diagnostics.retained
         );
     }

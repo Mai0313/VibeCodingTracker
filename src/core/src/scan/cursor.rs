@@ -55,7 +55,7 @@ fn read_store_half(
 ) -> Result<StoreHalfRead> {
     match feature {
         ScanFeature::Usage => read_cursor_usage_store(store, conv_models, TimeRange::All)
-            .map(|read| group_usage_rows(read, "Cursor usage payloads").into()),
+            .map(|read| group_usage_rows(read, "Cursor usage payloads", false).into()),
         ScanFeature::Analysis => {
             let read = read_store_analysis(
                 store,

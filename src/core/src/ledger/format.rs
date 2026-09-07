@@ -330,7 +330,8 @@ impl DayEntry {
 
     /// Folds one database usage row into the usage half.
     ///
-    /// The stored cost is recorded even when it is zero, matching the
+    /// `stored_cost` is `None` for a provider that prices none of its rows
+    /// (Cursor). One that does is recorded even when it is zero, matching the
     /// uncached roll-up, whose per-model cost map carries a `0.0` entry for a
     /// model the provider priced at nothing.
     pub(crate) fn add_usage_row(
@@ -338,12 +339,14 @@ impl DayEntry {
         model: String,
         tokens: UsageTokenContribution,
         tier_level: usize,
-        stored_cost: f64,
+        stored_cost: Option<f64>,
     ) {
-        if stored_cost != 0.0 || tokens.has_activity() {
+        if stored_cost.is_some_and(|cost| cost != 0.0) || tokens.has_activity() {
             self.active.usage = true;
         }
-        *self.stored_cost.entry(model.clone()).or_insert(0.0) += stored_cost;
+        if let Some(cost) = stored_cost {
+            *self.stored_cost.entry(model.clone()).or_insert(0.0) += cost;
+        }
         merge_model_usage(&mut self.usage, model, tokens.into_value(tier_level));
     }
 
@@ -570,9 +573,9 @@ mod tests {
             ..Default::default()
         };
         let mut day = DayEntry::default();
-        day.add_usage_row("model".to_string(), tokens(300_000), 1, 0.0);
-        day.add_usage_row("model".to_string(), tokens(400_000), 2, 0.0);
-        day.add_usage_row("model".to_string(), tokens(1_000), 0, 0.0);
+        day.add_usage_row("model".to_string(), tokens(300_000), 1, Some(0.0));
+        day.add_usage_row("model".to_string(), tokens(400_000), 2, Some(0.0));
+        day.add_usage_row("model".to_string(), tokens(1_000), 0, Some(0.0));
 
         let counts = extract_token_counts(&DayEntry::usage_value(&day.usage["model"]));
         assert_eq!(counts.input_tokens, 701_000);
@@ -591,7 +594,7 @@ mod tests {
                 ..Default::default()
             },
             0,
-            0.25,
+            Some(0.25),
         );
         let mut fresh = DayEntry::default();
         fresh.add_analysis_records(&analysis_with_usage(0));
@@ -610,7 +613,7 @@ mod tests {
             ..Default::default()
         };
         let mut first = DayEntry::default();
-        first.add_usage_row("model".to_string(), tokens, 0, 0.0);
+        first.add_usage_row("model".to_string(), tokens, 0, Some(0.0));
         let mut entry = SessionEntry::default();
         entry.days.insert("2026-09-01".to_string(), first.clone());
         entry
@@ -628,7 +631,7 @@ mod tests {
                 ..Default::default()
             },
             0,
-            0.0,
+            Some(0.0),
         );
         entry.replace_half(
             ScanFeature::Usage,
