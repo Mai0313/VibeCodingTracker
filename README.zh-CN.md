@@ -35,7 +35,7 @@
 
 ### 超轻量级
 
-使用 Rust 构建, 资源占用极低. 交互式 TUI 面板完成首次刷新后, 常驻内存通常控制在 **约 50 MB 以内**, 即使磁盘上有数百个长 context session 文件也不例外. 首次扫描后, 精简的 process-local summary cache 只会重新解析新增或变更的 source, dedicated scan worker 与 glibc allocator 调整也能让长时间运行的 CPU 和 RSS 保持稳定.
+使用 Rust 构建, 资源占用极低. 交互式 TUI 面板完成首次刷新后, 常驻内存通常在 **60 MB 左右**, 即使磁盘上有数千个 session 文件也不例外. `~/.vct/sessions/` 下的 session 账本让每次运行都只需重新解析新增或变更的 source, dedicated scan worker 与 glibc allocator 调整也能让长时间运行的 CPU 和 RSS 保持稳定.
 
 ### 精美的可视化
 
@@ -304,6 +304,10 @@ Totals (by Provider)
 Grok 的 `usage` 是单一时点的本地 context 估算：vct 会把 `signals.json` 的 `contextTokensUsed` 记为 cache-read token，并按该 model 的 cache-read 费率估算费用。这不是累计的 billed usage。`analysis` 会从同层的 `updates.jsonl` 还原已完成的 Read / Write / Edit / Bash / TodoWrite 操作。至于你实际计费的额度，请参见下方的 Grok 额度面板。
 
 对于非交互式 `usage` 与 `analysis` 扫描, 如果所有找到的 source 都失败, vct 会以错误结束. 如果只有部分 source 失败, vct 会保留成功的结果, 并向 stderr 打印一则诊断摘要. TUI 则保持 best-effort, 并保留上一次成功的 payload.
+
+### Session 账本
+
+每次 `usage` 与 `analysis` 扫描都会读写 `~/.vct/sessions/` 下的 session 账本（每个助手一个 `<provider>.json`）。没有变动的 session 不会被解析第二次，所以一次性运行与面板的首次加载只需处理有变动的部分。更重要的是，来源消失后 session 仍会留在账本里：当助手清掉自己的历史（Claude Code 默认只保留 30 天），或整个 session 目录（例如 `~/.claude/projects`）被删除时，所有汇总仍会把它们算进去，非交互式运行也会打印一行说明有多少 session 来自账本。继续对话的 session 会在日志变动时重新读取。账本只保存每日的 token 数与工具计数（沿用各 provider 自己的字段形状），不存对话内容也不存价格，而且 vct 永远不会删除它：读不了的文件会改名放在旁边，较新版 vct 写的文件则原封不动。想从磁盘现状重新开始，删掉这个目录即可。`vct analysis --json` 与 `vct analysis FILE` 会完整解析文件，不使用账本。
 
 ### 实时额度面板
 
