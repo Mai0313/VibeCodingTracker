@@ -1,9 +1,13 @@
 //! On-disk caches for the latest per-provider quota snapshots
-//! (`~/.vct/{claude,codex,copilot,cursor,grok}_usage.json`).
+//! (`~/.vct/quota/<provider>.json`).
 //!
 //! Each is a single last-known-good file (not dated like the pricing cache,
 //! since we always want the latest value). A fresh `vct usage` launch seeds
 //! the panels from here instantly while the background workers refresh them.
+//!
+//! One file per provider is what keeps the write below a blind overwrite: each
+//! is written by exactly one quota worker, which holds the whole snapshot, so
+//! nothing here reads before it writes and no lock is needed.
 //!
 //! What lands on disk is the already-derived snapshot, so every file is stamped
 //! with the writing build's per-provider schema version, and a file carrying any
@@ -13,10 +17,7 @@ use crate::models::{
     ClaudeQuotaSnapshot, CodexQuotaSnapshot, CopilotQuotaSnapshot, CursorQuotaSnapshot,
     GrokQuotaSnapshot,
 };
-use crate::utils::{
-    get_claude_usage_cache_path, get_codex_usage_cache_path, get_copilot_usage_cache_path,
-    get_cursor_usage_cache_path, get_grok_usage_cache_path, write_json_atomic,
-};
+use crate::utils::{get_quota_cache_path, write_json_atomic};
 use anyhow::Result;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -38,29 +39,38 @@ use std::path::PathBuf;
 trait CachedQuota: Serialize + DeserializeOwned {
     /// Derivation-semantics version of this provider's snapshot.
     const SCHEMA_VERSION: u32;
+    /// The provider's name, which is both the file's stem and the `provider`
+    /// field a load checks it against.
+    const PROVIDER: &'static str;
 }
 
 impl CachedQuota for ClaudeQuotaSnapshot {
     const SCHEMA_VERSION: u32 = 2;
+    const PROVIDER: &'static str = "claude";
 }
 
 impl CachedQuota for CodexQuotaSnapshot {
     const SCHEMA_VERSION: u32 = 2;
+    const PROVIDER: &'static str = "codex";
 }
 
 impl CachedQuota for CopilotQuotaSnapshot {
     const SCHEMA_VERSION: u32 = 1;
+    const PROVIDER: &'static str = "copilot";
 }
 
 impl CachedQuota for CursorQuotaSnapshot {
     const SCHEMA_VERSION: u32 = 1;
+    const PROVIDER: &'static str = "cursor";
 }
 
 impl CachedQuota for GrokQuotaSnapshot {
     const SCHEMA_VERSION: u32 = 2;
+    const PROVIDER: &'static str = "grok";
 }
 
-/// The on-disk envelope: the writing build's schema version + the snapshot.
+/// The on-disk envelope: the writing build's schema version, the provider the
+/// snapshot belongs to, and the snapshot.
 ///
 /// The snapshot is nested rather than `#[serde(flatten)]`ed so both directions
 /// fail safe: a pre-versioning file has no `snapshot` key and is rejected here,
@@ -70,6 +80,10 @@ impl CachedQuota for GrokQuotaSnapshot {
 struct VersionedCache<T> {
     /// [`CachedQuota::SCHEMA_VERSION`] of the build that wrote the file.
     schema_version: u32,
+    /// [`CachedQuota::PROVIDER`] of the snapshot below, so a file that ended up
+    /// under the wrong name says whose numbers it holds rather than painting
+    /// them onto another provider's panel.
+    provider: String,
     /// The normalized snapshot itself.
     snapshot: T,
 }
@@ -95,6 +109,15 @@ fn load_cache<T: CachedQuota>(path: Result<PathBuf>) -> Option<T> {
         );
         return None;
     }
+    if cached.provider != T::PROVIDER {
+        log::debug!(
+            "ignoring quota cache {}: holds {} data, not {}",
+            path.display(),
+            cached.provider,
+            T::PROVIDER
+        );
+        return None;
+    }
     Some(cached.snapshot)
 }
 
@@ -104,64 +127,70 @@ fn save_cache<T: CachedQuota>(path: Result<PathBuf>, snapshot: &T) -> Result<()>
         path?,
         &VersionedCache {
             schema_version: T::SCHEMA_VERSION,
+            provider: T::PROVIDER.to_string(),
             snapshot,
         },
     )
 }
 
+/// The cache path for `T`'s provider.
+fn cache_path<T: CachedQuota>() -> Result<PathBuf> {
+    get_quota_cache_path(T::PROVIDER)
+}
+
 /// Loads the last-known Claude quota snapshot, or `None` when it is absent,
 /// corrupt, or stamped with a schema version this build does not share.
 pub fn load_claude_cache() -> Option<ClaudeQuotaSnapshot> {
-    load_cache(get_claude_usage_cache_path())
+    load_cache(cache_path::<ClaudeQuotaSnapshot>())
 }
 
 /// Persists the Claude quota snapshot atomically.
 pub fn save_claude_cache(snap: &ClaudeQuotaSnapshot) -> Result<()> {
-    save_cache(get_claude_usage_cache_path(), snap)
+    save_cache(cache_path::<ClaudeQuotaSnapshot>(), snap)
 }
 
 /// Loads the last-known Codex quota snapshot, or `None` when it is absent,
 /// corrupt, or stamped with a schema version this build does not share.
 pub fn load_codex_cache() -> Option<CodexQuotaSnapshot> {
-    load_cache(get_codex_usage_cache_path())
+    load_cache(cache_path::<CodexQuotaSnapshot>())
 }
 
 /// Persists the Codex quota snapshot atomically.
 pub fn save_codex_cache(snap: &CodexQuotaSnapshot) -> Result<()> {
-    save_cache(get_codex_usage_cache_path(), snap)
+    save_cache(cache_path::<CodexQuotaSnapshot>(), snap)
 }
 
 /// Loads the last-known Copilot quota snapshot, or `None` when it is absent,
 /// corrupt, or stamped with a schema version this build does not share.
 pub fn load_copilot_cache() -> Option<CopilotQuotaSnapshot> {
-    load_cache(get_copilot_usage_cache_path())
+    load_cache(cache_path::<CopilotQuotaSnapshot>())
 }
 
 /// Persists the Copilot quota snapshot atomically.
 pub fn save_copilot_cache(snap: &CopilotQuotaSnapshot) -> Result<()> {
-    save_cache(get_copilot_usage_cache_path(), snap)
+    save_cache(cache_path::<CopilotQuotaSnapshot>(), snap)
 }
 
 /// Loads the last-known Cursor quota snapshot, or `None` when it is absent,
 /// corrupt, or stamped with a schema version this build does not share.
 pub fn load_cursor_cache() -> Option<CursorQuotaSnapshot> {
-    load_cache(get_cursor_usage_cache_path())
+    load_cache(cache_path::<CursorQuotaSnapshot>())
 }
 
 /// Persists the Cursor quota snapshot atomically.
 pub fn save_cursor_cache(snap: &CursorQuotaSnapshot) -> Result<()> {
-    save_cache(get_cursor_usage_cache_path(), snap)
+    save_cache(cache_path::<CursorQuotaSnapshot>(), snap)
 }
 
 /// Loads the last-known Grok quota snapshot, or `None` when it is absent,
 /// corrupt, or stamped with a schema version this build does not share.
 pub fn load_grok_cache() -> Option<GrokQuotaSnapshot> {
-    load_cache(get_grok_usage_cache_path())
+    load_cache(cache_path::<GrokQuotaSnapshot>())
 }
 
 /// Persists the Grok quota snapshot atomically.
 pub fn save_grok_cache(snap: &GrokQuotaSnapshot) -> Result<()> {
-    save_cache(get_grok_usage_cache_path(), snap)
+    save_cache(cache_path::<GrokQuotaSnapshot>(), snap)
 }
 
 #[cfg(test)]
@@ -173,7 +202,7 @@ mod tests {
     /// A temp dir plus the cache path inside it, so no test touches `$HOME`.
     fn cache_file() -> (TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("provider_usage.json");
+        let path = dir.path().join("provider.json");
         (dir, path)
     }
 
@@ -279,6 +308,7 @@ mod tests {
             body["schema_version"],
             serde_json::json!(CursorQuotaSnapshot::SCHEMA_VERSION)
         );
+        assert_eq!(body["provider"], "cursor");
         assert_eq!(body["snapshot"]["plan_type"], "pro");
         // The other direction of the nesting: an older build cannot read this as
         // a bare snapshot either, so it blanks the panel instead of misreading
@@ -306,6 +336,26 @@ mod tests {
             &path,
             serde_json::to_string(&VersionedCache {
                 schema_version: CursorQuotaSnapshot::SCHEMA_VERSION + 1,
+                provider: "cursor".into(),
+                snapshot: cursor_snapshot(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(load_cache::<CursorQuotaSnapshot>(Ok(path)).is_none());
+    }
+
+    /// A well-formed file holding another provider's snapshot is dropped rather
+    /// than painted onto this provider's panel.
+    #[test]
+    fn mismatched_provider_is_rejected() {
+        let (_dir, path) = cache_file();
+        std::fs::write(
+            &path,
+            serde_json::to_string(&VersionedCache {
+                schema_version: CursorQuotaSnapshot::SCHEMA_VERSION,
+                provider: "claude".into(),
                 snapshot: cursor_snapshot(),
             })
             .unwrap(),
@@ -330,6 +380,7 @@ mod tests {
             &path,
             serde_json::to_string(&VersionedCache {
                 schema_version: 1,
+                provider: "codex".into(),
                 snapshot: positional,
             })
             .unwrap(),

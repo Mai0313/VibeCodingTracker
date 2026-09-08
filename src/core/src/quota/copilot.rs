@@ -45,7 +45,7 @@ fn copilot_ua() -> &'static str {
     UA.get_or_init(|| {
         format!(
             "GitHubCopilotCLI/{}",
-            detect_cli_version("copilot", "copilot_version.json", COPILOT_FALLBACK_VERSION)
+            detect_cli_version("copilot", "copilot", COPILOT_FALLBACK_VERSION)
         )
     })
     .as_str()

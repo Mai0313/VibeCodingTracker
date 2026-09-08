@@ -41,11 +41,7 @@ pub(crate) fn cursor_ua() -> &'static str {
     UA.get_or_init(|| {
         format!(
             "cursor-agent/{}",
-            detect_cli_version(
-                "cursor-agent",
-                "cursor_version.json",
-                CURSOR_FALLBACK_VERSION
-            )
+            detect_cli_version("cursor-agent", "cursor", CURSOR_FALLBACK_VERSION)
         )
     })
     .as_str()

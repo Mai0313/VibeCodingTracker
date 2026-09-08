@@ -48,20 +48,20 @@ fn load_in_creates_default_commented_file_when_absent() {
 }
 
 #[test]
-fn first_run_leaves_existing_version_json_untouched() {
-    // The self-update record (`version.json`) is a separate concern from the
-    // settings file; creating config.toml must not touch or fold it in.
+fn first_run_leaves_existing_version_record_untouched() {
+    // The self-update record (`version/vct.json`) is a separate concern from
+    // the settings file; creating config.toml must not touch or fold it in.
     let th = TempHome::new();
     let dir = &th.paths.cache_dir;
-    fs::create_dir_all(dir).unwrap();
-    let version_json = dir.join("version.json");
-    let original = r#"{"latest_version":"1.6.0","last_checked_at":"2026-07-09T18:11:41.390888319Z","dismissed_version":null}"#;
-    fs::write(&version_json, original).unwrap();
+    let record = dir.join("version").join("vct.json");
+    fs::create_dir_all(record.parent().unwrap()).unwrap();
+    let original = r#"{"schema_version":1,"provider":"vct","latest_version":"1.6.0","last_checked_at":"2026-07-09T18:11:41.390888319Z","dismissed_version":null}"#;
+    fs::write(&record, original).unwrap();
 
     config::load_in(dir);
 
-    assert!(version_json.exists(), "version.json must be left in place");
-    assert_eq!(fs::read_to_string(&version_json).unwrap(), original);
+    assert!(record.exists(), "the record must be left in place");
+    assert_eq!(fs::read_to_string(&record).unwrap(), original);
     // The self-update record's fields must not leak into the settings file.
     let text = fs::read_to_string(dir.join("config.toml")).unwrap();
     assert!(!text.contains("[update]"));

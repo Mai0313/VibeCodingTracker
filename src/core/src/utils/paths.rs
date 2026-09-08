@@ -346,54 +346,20 @@ pub fn get_pricing_cache_path_in(dir: &Path, date: &str) -> PathBuf {
     dir.join(format!("model_pricing_{}.json", date))
 }
 
-/// Returns the Claude quota cache path (`~/.vct/claude_usage.json`), creating
-/// `~/.vct` if missing.
+/// Returns a provider's quota cache path (`~/.vct/quota/<provider>.json`),
+/// creating `~/.vct` if missing.
+///
+/// One file per provider, the same shape as the session ledger's
+/// `~/.vct/sessions/<provider>.json`: each is written by exactly one quota
+/// worker, so the blind overwrite in [`crate::quota::cache`] needs no locking.
 ///
 /// # Errors
 ///
 /// Returns an error if the cache directory cannot be resolved or created.
-pub fn get_claude_usage_cache_path() -> Result<PathBuf> {
-    Ok(get_cache_dir()?.join("claude_usage.json"))
-}
-
-/// Returns the Codex quota cache path (`~/.vct/codex_usage.json`), creating
-/// `~/.vct` if missing.
-///
-/// # Errors
-///
-/// Returns an error if the cache directory cannot be resolved or created.
-pub fn get_codex_usage_cache_path() -> Result<PathBuf> {
-    Ok(get_cache_dir()?.join("codex_usage.json"))
-}
-
-/// Returns the Copilot quota cache path (`~/.vct/copilot_usage.json`), creating
-/// `~/.vct` if missing.
-///
-/// # Errors
-///
-/// Returns an error if the cache directory cannot be resolved or created.
-pub fn get_copilot_usage_cache_path() -> Result<PathBuf> {
-    Ok(get_cache_dir()?.join("copilot_usage.json"))
-}
-
-/// Returns the Cursor quota cache path (`~/.vct/cursor_usage.json`), creating
-/// `~/.vct` if missing.
-///
-/// # Errors
-///
-/// Returns an error if the cache directory cannot be resolved or created.
-pub fn get_cursor_usage_cache_path() -> Result<PathBuf> {
-    Ok(get_cache_dir()?.join("cursor_usage.json"))
-}
-
-/// Returns the Grok quota cache path (`~/.vct/grok_usage.json`), creating
-/// `~/.vct` if missing.
-///
-/// # Errors
-///
-/// Returns an error if the cache directory cannot be resolved or created.
-pub fn get_grok_usage_cache_path() -> Result<PathBuf> {
-    Ok(get_cache_dir()?.join("grok_usage.json"))
+pub fn get_quota_cache_path(provider: &str) -> Result<PathBuf> {
+    Ok(get_cache_dir()?
+        .join("quota")
+        .join(format!("{provider}.json")))
 }
 
 /// Returns the persistent settings file path (`~/.vct/config.toml`), creating
@@ -406,17 +372,27 @@ pub fn get_config_path() -> Result<PathBuf> {
     Ok(get_cache_dir()?.join("config.toml"))
 }
 
-/// Returns this tool's own version record path (`~/.vct/version.json`),
-/// creating `~/.vct` if missing.
+/// Returns a version record path (`~/.vct/version/<provider>.json`), creating
+/// `~/.vct` if missing.
 ///
-/// Holds `{ latest_version, last_checked_at, dismissed_version }`; the startup
-/// auto-update reads `last_checked_at` to run at most one check per UTC date.
+/// The five provider entries hold the installed CLI's version, detected for the
+/// User-Agents in [`crate::quota`]; `vct` holds this tool's own update-check
+/// record, whose `last_checked_at` throttles the startup check to one per UTC
+/// date.
 ///
 /// # Errors
 ///
 /// Returns an error if the cache directory cannot be resolved or created.
-pub fn get_self_version_cache_path() -> Result<PathBuf> {
-    Ok(get_cache_dir()?.join("version.json"))
+pub fn get_version_cache_path(provider: &str) -> Result<PathBuf> {
+    Ok(get_version_cache_path_in(&get_cache_dir()?, provider))
+}
+
+/// Returns `<dir>/version/<provider>.json`.
+///
+/// The env-free counterpart of [`get_version_cache_path`]: pure composition,
+/// touching neither the home directory nor the filesystem.
+pub fn get_version_cache_path_in(dir: &Path, provider: &str) -> PathBuf {
+    dir.join("version").join(format!("{provider}.json"))
 }
 
 /// Returns the Copilot CLI config path (`~/.copilot/config.json`).
