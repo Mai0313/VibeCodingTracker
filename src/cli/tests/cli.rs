@@ -861,7 +861,7 @@ fn readonly_commands_do_not_create_config() {
 /// in, by a command that owns no settings and creates nothing else.
 #[test]
 fn startup_removes_the_flat_cache_layout() {
-    const LEGACY: [&str; 11] = [
+    const LEGACY: [&str; 12] = [
         "claude_usage.json",
         "codex_usage.json",
         "copilot_usage.json",
@@ -873,6 +873,7 @@ fn startup_removes_the_flat_cache_layout() {
         "cursor_version.json",
         "grok_version.json",
         "version.json",
+        "cursor_usage_events.json",
     ];
     let home = TempHome::new();
     for name in LEGACY {

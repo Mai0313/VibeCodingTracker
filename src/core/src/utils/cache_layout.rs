@@ -1,16 +1,18 @@
-//! Removal of the flat `~/.vct` layout that preceded `quota/` and `version/`.
+//! Removal of what no longer belongs directly in `~/.vct`: the flat layout that
+//! preceded `quota/` and `version/`, plus one older orphan.
 //!
-//! Every file listed here is a cache or a throttle stamp that the next run
-//! rebuilds on its own, so they are deleted rather than migrated: a quota
+//! The flat layout's files are each a cache or a throttle stamp that the next
+//! run rebuilds on its own, so they are deleted rather than migrated: a quota
 //! snapshot returns with its provider's first fetch, a CLI version with the
 //! next `<cli> --version`, and the update record with that day's check.
 //! Carrying their contents across would buy one HTTP round trip and cost a
-//! per-format field back-fill.
+//! per-format field back-fill. `cursor_usage_events.json` has no reader left at
+//! all: the dashboard-billing fetch that wrote it was removed long before this.
 
 use crate::utils::resolve_paths;
 use std::path::Path;
 
-/// What the flat layout kept directly in `~/.vct`.
+/// What no longer belongs directly in `~/.vct`.
 const LEGACY_FILES: &[&str] = &[
     "claude_usage.json",
     "codex_usage.json",
@@ -23,6 +25,7 @@ const LEGACY_FILES: &[&str] = &[
     "cursor_version.json",
     "grok_version.json",
     "version.json",
+    "cursor_usage_events.json",
 ];
 
 /// Deletes whatever the flat layout left in `~/.vct`.
