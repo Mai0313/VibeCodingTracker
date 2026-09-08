@@ -852,9 +852,48 @@ fn readonly_commands_do_not_create_config() {
         "version must not create config.toml"
     );
     assert!(
-        !home.home().join(".vct/version.json").exists(),
-        "offline startup must not create version.json"
+        !home.home().join(".vct/version/vct.json").exists(),
+        "offline startup must not create the update record"
     );
+}
+
+/// The flat layout that preceded `quota/` and `version/` is swept on the way
+/// in, by a command that owns no settings and creates nothing else.
+#[test]
+fn startup_removes_the_flat_cache_layout() {
+    const LEGACY: [&str; 12] = [
+        "claude_usage.json",
+        "codex_usage.json",
+        "copilot_usage.json",
+        "cursor_usage.json",
+        "grok_usage.json",
+        "claude_version.json",
+        "codex_version.json",
+        "copilot_version.json",
+        "cursor_version.json",
+        "grok_version.json",
+        "version.json",
+        "cursor_usage_events.json",
+    ];
+    let home = TempHome::new();
+    for name in LEGACY {
+        home.put(&format!(".vct/{name}"), "{}");
+    }
+    home.put(".vct/sessions/claude.json", "{}");
+
+    child_cmd(&home).arg("version").assert().success();
+
+    for name in LEGACY {
+        assert!(
+            !home.home().join(".vct").join(name).exists(),
+            "{name} must be gone"
+        );
+    }
+    assert!(
+        home.home().join(".vct/sessions/claude.json").exists(),
+        "the ledger is not part of the sweep"
+    );
+    assert!(!home.home().join(".vct/config.toml").exists());
 }
 
 #[test]
@@ -873,7 +912,7 @@ fn startup_reads_auto_update_preference_without_rewriting_config() {
         std::fs::read_to_string(home.home().join(".vct/config.toml")).unwrap(),
         original
     );
-    assert!(!home.home().join(".vct/version.json").exists());
+    assert!(!home.home().join(".vct/version/vct.json").exists());
 }
 
 #[test]
@@ -893,7 +932,7 @@ fn package_managed_binary_skips_startup_update_before_network_or_cache_writes() 
     serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap();
     assert!(output.stderr.is_empty());
     assert!(
-        !home.home().join(".vct/version.json").exists(),
+        !home.home().join(".vct/version/vct.json").exists(),
         "an unmarked binary must skip before claiming the daily check"
     );
 }

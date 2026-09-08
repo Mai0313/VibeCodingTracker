@@ -91,6 +91,9 @@ fn main() -> Result<()> {
 /// Parses the CLI and dispatches the selected subcommand.
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    // After the parse, so a `--help` or a rejected flag exits without touching
+    // the user's `~/.vct` at all.
+    vct_core::utils::remove_legacy_cache_files();
     run_startup_auto_update(&cli);
 
     match cli.command {

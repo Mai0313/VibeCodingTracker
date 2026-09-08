@@ -553,7 +553,7 @@ pub struct QuotaWindow {
 }
 
 /// Normalized Codex quota snapshot, shared via `Arc<Mutex>` and persisted to
-/// `~/.vct/codex_usage.json`.
+/// `~/.vct/quota/codex.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CodexQuotaSnapshot {
     /// Which source produced this snapshot.
@@ -875,7 +875,7 @@ impl fmt::Debug for GrokRefreshResponse {
 // ---- Normalized Copilot / Cursor / Grok snapshots (worker output + cache) ----
 
 /// Normalized Copilot quota snapshot, shared via `Arc<Mutex>` and persisted to
-/// `~/.vct/copilot_usage.json`.
+/// `~/.vct/quota/copilot.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CopilotQuotaSnapshot {
     /// Which source produced this snapshot.
@@ -908,7 +908,7 @@ pub struct CopilotQuotaSnapshot {
 }
 
 /// Normalized Cursor quota snapshot, shared via `Arc<Mutex>` and persisted to
-/// `~/.vct/cursor_usage.json`.
+/// `~/.vct/quota/cursor.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CursorQuotaSnapshot {
     /// Which source produced this snapshot.
@@ -941,7 +941,7 @@ pub struct CursorQuotaSnapshot {
 }
 
 /// Normalized Grok quota snapshot, shared via `Arc<Mutex>` and persisted to
-/// `~/.vct/grok_usage.json`.
+/// `~/.vct/quota/grok.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GrokQuotaSnapshot {
     /// Which source produced this snapshot.

@@ -57,11 +57,7 @@ fn claude_ua() -> &'static str {
     UA.get_or_init(|| {
         format!(
             "claude-cli/{} (external, cli)",
-            crate::quota::http::detect_cli_version(
-                "claude",
-                "claude_version.json",
-                CLAUDE_FALLBACK_VERSION,
-            )
+            crate::quota::http::detect_cli_version("claude", "claude", CLAUDE_FALLBACK_VERSION,)
         )
     })
     .as_str()

@@ -44,11 +44,7 @@ fn codex_ua() -> &'static str {
     UA.get_or_init(|| {
         format!(
             "codex_cli_rs/{} ({}; {})",
-            crate::quota::http::detect_cli_version(
-                "codex",
-                "codex_version.json",
-                CODEX_FALLBACK_VERSION
-            ),
+            crate::quota::http::detect_cli_version("codex", "codex", CODEX_FALLBACK_VERSION),
             std::env::consts::OS,
             std::env::consts::ARCH,
         )

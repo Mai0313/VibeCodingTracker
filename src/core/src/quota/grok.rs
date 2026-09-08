@@ -53,7 +53,7 @@ pub const GROK_LOGIN_HINT: &str = "run: grok login";
 fn grok_version() -> &'static str {
     static VERSION: OnceLock<String> = OnceLock::new();
     VERSION
-        .get_or_init(|| detect_cli_version("grok", "grok_version.json", GROK_FALLBACK_VERSION))
+        .get_or_init(|| detect_cli_version("grok", "grok", GROK_FALLBACK_VERSION))
         .as_str()
 }
 
