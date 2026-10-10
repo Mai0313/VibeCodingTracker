@@ -35,7 +35,7 @@
 
 ### 超輕量
 
-以 Rust 打造, 資源佔用極低. 互動式 TUI 儀表板完成首次刷新後通常維持在 **60 MB 左右的常駐記憶體**, 即使硬碟上有數千個 session 也一樣. `~/.vct/sessions/` 底下的 session 帳本讓每次執行都只需重新解析新增或變更的 source, dedicated scan worker 與 glibc allocator 調整也能讓長時間執行時的 CPU 和 RSS 維持穩定.
+以 Rust 打造, 資源佔用極低. 互動式 TUI 儀表板完成首次刷新後通常維持在 **60 MB 左右的常駐記憶體**, 即使硬碟上有數千個 session 也一樣. `~/.vct/sessions/` 底下的 session 帳本讓每次執行都只需重新解析新增或變更的 source.
 
 ### 精美視覺化
 
@@ -79,8 +79,6 @@
 ### 安裝
 
 選擇最適合你的安裝方式：
-
-> **開發者**: 如果你想從原始碼建置或參與開發, 請參閱 [CONTRIBUTING.md](.github/CONTRIBUTING.md).
 
 #### 方法一：透過 npm 安裝
 
@@ -137,21 +135,7 @@ vct analysis
 
 ## 指令指南
 
-### 快速參考
-
-```
-vct <COMMAND> [OPTIONS]
-# Replace with `vibe_coding_tracker` if you are using the full binary name
-
-Commands:
-  analysis    Analyze local session data (single file or all sessions)
-  usage       Display token usage statistics
-  version     Display version information
-  update      Update to the latest version from GitHub releases
-  quota       Fetch a provider's raw quota/usage API response
-  config      Show or edit the persistent settings file (~/.vct/config.toml)
-  help        Print this message or the help of the given subcommand(s)
-```
+執行 `vct --help` 可列出所有指令，`vct <command> --help` 則會列出該指令的 flag。
 
 時間範圍 flag（`usage` 與 `analysis` 共用，互斥，預設 `--all`）：
 
@@ -167,17 +151,6 @@ Commands:
 ## Usage 指令
 
 **追蹤你在所有 AI 程式設計工作階段的花費。**
-
-### Flag 一覽
-
-| Flag                                           | 用途                                                                          |
-| ---------------------------------------------- | ----------------------------------------------------------------------------- |
-| *(不帶參數)*                                   | 互動式 TUI 儀表板（預設）                                                     |
-| `--table`                                      | 靜態表格，不啟動 TUI                                                          |
-| `--text`                                       | 純文字，適合腳本處理                                                          |
-| `--json`                                       | JSON 輸出，附帶 pricing 資訊                                                  |
-| `--merge-providers`                            | 合併共享同一 base 名稱、僅 provider 前綴不同的 model（`--json` 會忽略此選項） |
-| `--daily` / `--weekly` / `--monthly` / `--all` | 時間範圍篩選（見上方表格）                                                    |
 
 ### 基本用法
 
@@ -237,7 +210,7 @@ vct usage --table --merge-providers
                     ↑/↓ scroll  m merge  p providers  Q quota  r refresh  q quit  |  Star on GitHub
 ```
 
-兩個互動式儀表板都會在 terminal setup 完成後立即繪製置中的 `Loading sessions...` spinner. Loading 期間仍可處理 `q`, Ctrl+C 與 resize event. 後續掃描由單一 background worker 執行, 並在 `Refreshing...` footer 下保留上一次成功的資料. 重複的 refresh 要求最多只會合併為一個 pending scan. 如果 refresh 失敗, 儀表板會保留 last-known-good view, 並在下次排程或手動刷新時重試.
+兩個互動式儀表板都會在 terminal setup 完成後立即繪製置中的 `Loading sessions...` spinner. Loading 期間仍可處理 `q`, Ctrl+C 與 resize event. 後續掃描會在 `Refreshing...` footer 下保留上一次成功的資料. 如果 refresh 失敗, 儀表板會保留 last-known-good view, 並在下次排程或手動刷新時重試.
 
 ### 預覽：表格與 JSON（`vct usage`）
 
@@ -285,7 +258,7 @@ Totals (by Provider)
 ]
 ```
 
-無論來源 provider 為何，每一列都會輸出相同的扁平 token 欄位（Codex 內部的巢狀結構會在輸出前正規化）。若某個 provider 計費的 bucket 是其他 provider 沒有的，該列會額外帶上自己的 key：實際用掉 tool token 的 Gemini 列會帶 `tool_tokens`，LiteLLM 沒有對應費率，只計入 `total_tokens`。
+無論來源 provider 為何，每一列都會輸出相同的扁平 token 欄位。若某個 provider 計費的 bucket 是其他 provider 沒有的，該列會額外帶上自己的 key：實際用掉 tool token 的 Gemini 列會帶 `tool_tokens`，LiteLLM 沒有對應費率，只計入 `total_tokens`。
 
 ### 掃描範圍
 
@@ -326,12 +299,12 @@ Grok 的 `usage` 是單一當下的本地 context 估算：vct 會把 `signals.j
 - **Claude** — 方案類型、5 小時、每週以及單模型每週用量，來自官方 OAuth 用量 API（`GET /api/oauth/usage`），從 `~/.claude/.credentials.json` 讀取，並顯示額度餘額。約每分鐘輪詢一次以避開該端點的速率限制；觸及上限時標題會出現紅色 `LIMIT` 標記。單模型每週那一行屬於盡力而為，未回傳該範圍時就自動隱藏。
 - **Codex** — 方案類型、可用的 5 小時和每週用量週期、額度餘額以及已取得的可用 reset credit 中最早的到期時間，使用 `~/.codex/auth.json` 從 ChatGPT 後端（`wham/usage` + `wham/rate-limit-reset-credits`）取得（在適用時顯示大致剩餘訊息數 / 消費上限）；API 無法使用時回退到 Codex 工作階段紀錄中最新的 `rate_limits`（標題顯示 `Codex` 或 `Codex (session)`）。
 - **Copilot** — 方案類型以及你的 premium 請求額度，以兩個進度條呈現：已用百分比，以及已用 / 總量請求數（例如 `45/1500`），來自 GitHub 的 Copilot API（`GET /copilot_internal/user`），從 `~/.copilot/config.json` 讀取。該請求會模擬 Copilot CLI。token 為長期有效，因此不需要刷新；遇到 `401` / `403` 時會顯示 `run: copilot login` 提示。
-- **Cursor** — 方案類型、total / auto / API **已用**百分比，以及按需消費，來自 cursor.com（`GET /api/usage-summary`），使用 `~/.config/cursor/auth.json` 中的 session token。刷新是被動式的：vct 每次輪詢都會重新讀取該檔案，並在 token 有效期內使用它，因為官方 Cursor 用戶端會讓它保持最新。
+- **Cursor** — 方案類型、total / auto / API **已用**百分比，以及按需消費，來自 cursor.com（`GET /api/usage-summary`），使用 `~/.config/cursor/auth.json` 中的 session token。
 - **Grok** — 方案類型以及目前每週或每月週期的內含額度用量，來自 Grok CLI 自己的計費端點（`GET /v1/billing?format=credits`），從 `~/.grok/auth.json` 讀取。預付餘額只有在不為零時才會顯示；按量計費的消費則在你有過消費、或設定了上限之後才會顯示。該請求會模擬 Grok CLI；遇到 `401` / `403` 時會顯示 `run: grok login` 提示。
 
-**自動刷新 token。** 對 Claude、Codex 和 Grok，當 token 接近過期或被拒絕時，vct 會刷新它並把新的 token 寫回該 provider 自己的憑證檔案（採用該 CLI 的原始格式），因此 token 會在多次檢查之間重複使用，而不是每次都重新刷新。Grok 的 token 端點會如同它自己的 CLI 一樣，從登入的 issuer 解析出來，而不是寫死在程式裡；寫入時也會保留該檔案中其他所有的登入資訊。如果刷新失敗，面板會顯示 `run: <provider> auth login` 提示，而不會直接中斷。Copilot（長期有效的 token）和 Cursor（由其自身用戶端保持最新）為唯讀——vct 從不寫入它們的憑證檔案。
+**自動刷新 token。** 對 Claude、Codex 和 Grok，當 token 接近過期或被拒絕時，vct 會刷新它並把新的 token 寫回該 provider 自己的憑證檔案（採用該 CLI 的原始格式）。寫入 Grok 的憑證檔案時，會保留該檔案中其他所有的登入資訊。如果刷新失敗，面板會顯示 `run: <provider> auth login` 提示，而不會直接中斷。Copilot（長期有效的 token）和 Cursor（由其自身用戶端保持最新）為唯讀——vct 從不寫入它們的憑證檔案。
 
-只有在某個 provider 的憑證存在時，才會顯示對應的面板。面板排在一個統一網格上：一列放得下幾張就放幾張，放不下的自動折到下一列，因此新增一個 provider 只是多一張卡片，不會多一條排版規則。當終端高度不足以留給網格時，它會收成一行摘要，顯示放得下的 gauge，並把其餘的記成數量；按 `Q` 開啟完整的額度浮層，無論終端多大，每張卡片都放得下全部內容，按 `p` 開啟 Provider Usage 面板，裡面有各 provider 的 token 數與佔比。額度面板僅在互動式 TUI 中顯示；`--table`、`--text`、`--json` 不受影響。
+只有在某個 provider 的憑證存在時，才會顯示對應的面板。面板排在一個統一網格上：一列放得下幾張就放幾張，放不下的自動折到下一列。當終端高度不足以留給網格時，它會收成一行摘要，顯示放得下的 gauge，並把其餘的記成數量；按 `Q` 開啟完整的額度浮層，無論終端多大，每張卡片都放得下全部內容，按 `p` 開啟 Provider Usage 面板，裡面有各 provider 的 token 數與佔比。額度面板僅在互動式 TUI 中顯示；`--table`、`--text`、`--json` 不受影響。
 
 > **平台說明：** 在 macOS 上，Claude Code 會把 OAuth 憑證儲存在系統 Keychain 中，而不是 `~/.claude/.credentials.json`，因此在 macOS 上不會顯示 Claude 面板。Cursor 的 `~/.config/cursor` 憑證路徑偏向 Linux。
 
@@ -340,17 +313,6 @@ Grok 的 `usage` 是單一當下的本地 context 估算：vct 會把 `signals.j
 ## Analysis 指令
 
 **深入分析程式碼操作——精確掌握你的 AI 助手做了哪些事。**
-
-### 參數與 Flag
-
-| 參數 / Flag                                    | 用途                                                                         |
-| ---------------------------------------------- | ---------------------------------------------------------------------------- |
-| *(不帶參數)*                                   | 互動式 TUI 儀表板, 涵蓋所有 session                                          |
-| `<FILE>`                                       | 分析單一 JSONL/JSON session 檔案, 並將完整 `CodeAnalysis` JSON 輸出到 stdout |
-| `--table`                                      | 靜態摘要表格, 附帶 provider 總計                                             |
-| `--text`                                       | 純文字摘要, 方便腳本處理                                                     |
-| `--json`                                       | 完整 parser 結果. 搭配 `<FILE>` 時為單一 object, 否則為 object 陣列          |
-| `--daily` / `--weekly` / `--monthly` / `--all` | 所有 session 的時間範圍篩選. 不可與 `<FILE>` 同時使用, 其他說明見上方表格    |
 
 請參考 [`tests/fixtures/sessions/`](tests/fixtures/sessions/) 目錄，裡面有四種 JSONL provider 的範例輸入與對應的 JSON 輸出，以及 [`tests/fixtures/sessions/grok/`](tests/fixtures/sessions/grok/) 下的 Grok session fixture 與 [`tests/fixtures/sessions/dsh/`](tests/fixtures/sessions/dsh/) 下的 DeepSeek Harness session fixture。
 
@@ -515,8 +477,6 @@ vct version --json   # 機器可讀的 JSON
 └───────────────┴──────────┘
 ```
 
-Binary version 由 `build.rs` 在編譯期透過 `git describe` 寫入，開發版本會附上 commit 數、short SHA 與 `dirty` 後綴。
-
 ---
 
 ## Quota 指令
@@ -526,15 +486,6 @@ Binary version 由 `build.rs` 在編譯期透過 `git describe` 寫入，開發�
 對 `usage` 面板使用的同一個 quota 端點（Claude / Codex / Copilot / Cursor / Grok）發一次請求，直接印出原始 body，方便你檢視 API 的實際結構或確認憑證是否正常。它讀取各供應商已儲存的憑證，而且**不會**刷新 token：token 過期時，請用對應供應商自己的 CLI 重新登入（`claude` / `codex` / `copilot` / `cursor-agent` / `grok`）。
 
 > 舊名稱 `vct fetch` 保留為隱藏別名，現有 script 仍可繼續使用。
-
-### 參數
-
-| 參數      | 用途                          |
-| --------- | ----------------------------- |
-| *(無)*    | 彩色 JSON（預設）             |
-| `--json`  | 彩色 JSON                     |
-| `--text`  | 攤平成 `key: value`，適合腳本 |
-| `--table` | 攤平成 Field / Value 表格     |
 
 ### 基本用法
 
@@ -562,83 +513,13 @@ vct quota copilot --table
 
 vct 會把使用者設定存放在 `~/.vct/config.toml`。這個檔案會在**首次執行時以預設值自動建立**，所以你完全不必手動撰寫，只有想更改某個預設值時才需要編輯它。它由 vct 的型別化設定產生，並在第一行帶有 `#:schema` 指令，因此支援 schema 的 TOML 編輯器（taplo / VS Code 的 "Even Better TOML"）會提供自動補全與驗證。你也可以用 `vct config schema` 自行印出該 schema。由舊版 vct 產生的檔案會在下次被 vct 讀取時就地升級到目前的版面(也可用 `vct config migrate` 手動觸發),因此升級後絕不會停留在過時的格式上。這個升級也會把你的檔案寫入之後才推出的額度面板補上——但只補一次。你再次移除那個名稱後它就會一直保持移除，而你先前已經拿掉的面板也絕不會被加回來。
 
-```toml
-#:schema https://raw.githubusercontent.com/Mai0313/VibeCodingTracker/main/vct.schema.json
-
-[general]
-# 未指定 --daily/--weekly/--monthly/--all flag 時使用的預設時間範圍。
-# 可選值："daily" | "weekly" | "monthly" | "all"
-default_time_range = "all"
-# 啟動時檢查新版, 並自動更新由官方 installer 建立的受支援直接安裝.
-# 設為 false 可關閉此行為.
-auto_update = true
-# 這個檔案的版面版本，由 vct 標記。只有升級流程會讀取它;
-# 除非你想讓過去的升級再跑一次，否則別去動它。
-version = 3
-
-[usage]
-# 啟動 usage 儀表板時，是否先把不同 provider 前綴的 model 合併。
-# 可用 `m` 即時切換;最後的狀態會存回這裡。
-merge_models = false
-# usage TUI 自動刷新的間隔秒數（最少 1）。
-refresh_interval = 10
-
-[usage.quota]
-# 顯示哪些即時額度面板;移除某個名稱即可隱藏該面板,用空列表 ([]) 全部隱藏。
-panels = ["claude", "codex", "copilot", "cursor", "grok"]
-# 每個 provider 共用的即時額度面板輪詢間隔秒數（最少 1）。
-refresh_interval = 60
-
-[analysis]
-# analysis TUI 自動刷新的間隔秒數（最少 1）。
-refresh_interval = 10
-
-[performance]
-# CLI session scan 使用的 Rayon worker 數. 0 代表實測最佳的 auto 預設值;
-# 正整數會限制在機器的 available parallelism 以內.
-scan_threads = 0
-
-[providers]
-# 是否把各 provider 的 session 納入 usage / analysis。把某個 provider 設為 false
-# 就會完全略過它（不掃描目錄，也不呼叫 API）。
-claude = true
-codex = true
-copilot = true
-gemini = true
-opencode = true
-cursor = true
-hermes = true
-grok = true
-dsh = true
-
-[logging]
-# 寫入 ~/.vct/logs/vct-YYYY-MM-DD.log 的最低日誌等級。
-# 取值: "off" | "error" | "warn" | "info" | "debug" | "trace"。
-level = "warn"
-# 保留幾天的每日日誌檔; 更舊的檔案會在啟動時清除。0 表示全部保留。
-retention_days = 7
-```
-
-| 設定項                         | 效果                                                                                                          |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------------- |
-| `general.default_time_range`   | 未指定 `--daily/--weekly/--monthly/--all` 時使用的時間範圍。明確指定的 flag 一律優先。                        |
-| `general.auto_update`          | 啟動時每天 UTC 日期最多檢查一次, 並只更新官方 installer 的直接安裝. 設為 `false` 可關閉.                      |
-| `general.version`              | vct 標記在檔案上的版面版本，讓後續版本新增的面板只會向你提議一次。                                            |
-| `usage.merge_models`           | 讓儀表板一開始就是合併狀態;`m` 切換會把你最後的選擇存回這裡。`--merge-providers` 會強制開啟。                 |
-| `usage.refresh_interval`       | `usage` 儀表板自動刷新的間隔（秒）。                                                                          |
-| `usage.quota.panels`           | 顯示哪些額度面板（`claude` / `codex` / `copilot` / `cursor` / `grok`）；移除名稱即可隱藏,`[]` 全部隱藏。      |
-| `usage.quota.refresh_interval` | 每個即時額度面板的輪詢間隔（秒）；數值越大越不容易觸發 provider 的速率限制。                                  |
-| `analysis.refresh_interval`    | `analysis` 儀表板自動刷新的間隔（秒）。                                                                       |
-| `performance.scan_threads`     | CLI scan worker 數. `0` 優先採用正數的 `RAYON_NUM_THREADS`, 否則最多使用兩個 worker; 所有值都受 CPU 數量限制. |
-| `providers.*`                  | 設為 `false` 時完全略過某個 provider（不掃描、不呼叫 API），沒在用的話很方便。                                |
-| `logging.level`                | 寫入日誌檔的最低等級（`off`..`trace`）；絕不會印到終端機。                                                    |
-| `logging.retention_days`       | 保留幾天的每日日誌檔；更舊的 `vct-*.log` 會在啟動時清除（`0` 表示全部保留）。                                 |
-
-> [!NOTE]
-> vct 會把診斷訊息寫入 `~/.vct/logs/vct-YYYY-MM-DD.log`（純文字，只寫檔案，絕不顯示在儀表板上）。健康運行時保持安靜（預設等級 `warn`），而且檔案是延遲建立的，所以一次正常執行不會留下任何檔案。當額度抓取失敗或某個 session 被略過時，原因就記錄在這裡——需要完整細節時把 `logging.level` 調到 `debug`。
+執行 `vct config show` 即可印出這個檔案，檔案內的註解說明了每一項設定。
 
 > [!NOTE]
 > Cursor 的 `usage` 是從對話庫產生的**本地估算**，因此行為與 Claude Code / Codex / Copilot / Gemini 一致（全都是從本地 session 檔案計算），而且不需要連網。這個估算會低估 Cursor 的真實花費，因為其中有很大一部分是以 Cursor 內部的 model 名稱計費，而本地資料無法為這些名稱定價，所以請把 Cursor 的費用視為概估值。
+
+> [!NOTE]
+> vct 會把診斷訊息寫入 `~/.vct/logs/vct-YYYY-MM-DD.log`（純文字，只寫檔案，絕不顯示在儀表板上）。健康運行時保持安靜（預設等級 `warn`），而且檔案是延遲建立的，所以一次正常執行不會留下任何檔案。當額度抓取失敗或某個 session 被略過時，原因就記錄在這裡——需要完整細節時把 `logging.level` 調到 `debug`。
 
 ### 管理設定檔
 
@@ -666,9 +547,8 @@ vct config migrate
 ### 運作方式
 
 1. **自動更新**: 每個 UTC 日期從 [LiteLLM](https://github.com/BerriAI/litellm) 取得一次最新價格
-2. **驗證後 cache**: 只接受成功且包含實際價格的 JSON model map, 再 atomic 寫入 `~/.vct/`
-3. **確定性比對**: 即使 model 名稱含有版本或 provider 前綴, 也會選擇最具體的配對
-4. **失敗保護**: 取得失敗不會覆蓋有效 cache, vct 會保留舊 map, 並在五分鐘 backoff 後才再次嘗試
+2. **確定性比對**: 即使 model 名稱含有版本或 provider 前綴, 也會選擇最具體的配對
+3. **失敗保護**: 取得失敗不會覆蓋有效 cache, vct 會保留舊 map, 並在五分鐘 backoff 後才再次嘗試
 
 ### 模型比對
 
@@ -690,13 +570,9 @@ vct config migrate
 - **Hermes**：與 OpenCode 相同，LiteLLM **完全比對**成功時依 token 計價，否則使用 Hermes 本身儲存的費用。
 - **DeepSeek Harness**：`dsh` 本身不記錄任何費用，因此一律經由與其他 file-based provider 相同的查找鏈依 LiteLLM 計價，沒有 OpenCode 或 Hermes 那樣的 stored cost 兜底。它會路由到部署方設定的任意 provider，因此部署自訂的 model 名稱很常見；LiteLLM 完全比對不到時費用為 $0。
 - **Grok**：只會把 `contextTokensUsed` 當成 cache-read token 計價（若該 model 沒有公布 cache-read 費率則改用 input 費率）；這是單一當下的本地 context 估算，不是累計的 billed usage。
-- **原始 cache**: 每日 cache 儲存經過篩選的 LiteLLM 上游原始 JSON (而非衍生結構), 因此 tiered / batch 定價不需重新取得即可使用. 每個 pricing map 各自擁有一個小型 process-local LRU, 重複查詢維持低成本, 也不會在不同 map 之間互相污染.
 
 ---
 
-## Docker 支援
+## 開發
 
-```bash
-# Build image
-docker build -f docker/Dockerfile --target prod -t vibe_coding_tracker:latest .
-```
+開發環境設定、從原始碼建置、測試、程式碼品質、commit 規範，以及發佈與打包說明，都在 [CONTRIBUTING.md](./.github/CONTRIBUTING.md)。

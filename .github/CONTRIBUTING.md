@@ -67,7 +67,7 @@ Unsure where to begin contributing? You can start by looking through `good first
 - Optional: [`pre-commit`](https://pre-commit.com/), [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov) for coverage, and Docker if you plan to touch the image build.
 
 > [!NOTE]
-> `build.rs` embeds the git describe output into the binary as the version string. Building outside a git worktree falls back to the `Cargo.toml` version.
+> `build.rs` embeds the git describe output into the binary as the version string, so a development build carries the commit count, short SHA and a `dirty` suffix when applicable. Building outside a git worktree falls back to the `Cargo.toml` version.
 
 #### Project Layout
 

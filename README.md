@@ -35,7 +35,7 @@ Stop wondering how much your AI coding sessions cost. Get **real-time cost track
 
 ### Ultra-Lightweight
 
-Built with Rust for minimal resource footprint. The interactive TUI dashboard typically sits at **around 60 MB of resident memory** once the first refresh is done, even with thousands of sessions on disk — no Electron, no bloated runtimes. A persistent per-session ledger under `~/.vct/sessions/` means only new or changed sources are ever parsed again, even across runs, while dedicated scan workers and glibc allocator tuning keep long-running CPU and RSS honest.
+Built with Rust for minimal resource footprint. The interactive TUI dashboard typically sits at **around 60 MB of resident memory** once the first refresh is done, even with thousands of sessions on disk — no Electron, no bloated runtimes. A persistent per-session ledger under `~/.vct/sessions/` means only new or changed sources are ever parsed again, even across runs.
 
 ### Beautiful Visualizations
 
@@ -79,8 +79,6 @@ Automatically detects and processes logs from Claude Code, Codex, Copilot, Gemin
 ### Installation
 
 Choose the installation method that works best for you:
-
-> **Developers**: If you want to build from source or contribute to development, please see [CONTRIBUTING.md](.github/CONTRIBUTING.md).
 
 #### Method 1: Install from npm
 
@@ -137,21 +135,7 @@ vct analysis
 
 ## Command Guide
 
-### Quick Reference
-
-```
-vct <COMMAND> [OPTIONS]
-# Replace with `vibe_coding_tracker` if you are using the full binary name
-
-Commands:
-  analysis    Analyze local session data (single file or all sessions)
-  usage       Display token usage statistics
-  version     Display version information
-  update      Update to the latest version from GitHub releases
-  quota       Fetch a provider's raw quota/usage API response
-  config      Show or edit the persistent settings file (~/.vct/config.toml)
-  help        Print this message or the help of the given subcommand(s)
-```
+Run `vct --help` to list the commands, and `vct <command> --help` for a command's flags.
 
 Time range flags (shared by `usage` and `analysis`, mutually exclusive, default `--all`):
 
@@ -167,17 +151,6 @@ Time range flags (shared by `usage` and `analysis`, mutually exclusive, default 
 ## Usage Command
 
 **Track your spending across all AI coding sessions.**
-
-### Flags
-
-| Flag                                           | Purpose                                                                          |
-| ---------------------------------------------- | -------------------------------------------------------------------------------- |
-| *(none)*                                       | Interactive TUI dashboard (default)                                              |
-| `--table`                                      | Static table, no TUI                                                             |
-| `--text`                                       | Plain text, script-friendly                                                      |
-| `--json`                                       | JSON with enriched pricing metadata                                              |
-| `--merge-providers`                            | Merge models sharing a base name across provider prefixes (ignored for `--json`) |
-| `--daily` / `--weekly` / `--monthly` / `--all` | Time range filter (see table above)                                              |
 
 ### Basic Usage
 
@@ -237,7 +210,7 @@ vct usage --table --merge-providers
                     ↑/↓ scroll  m merge  p providers  Q quota  r refresh  q quit  |  Star on GitHub
 ```
 
-Both interactive dashboards draw a centered `Loading sessions...` spinner as soon as terminal setup finishes. Loading stays responsive to `q`, Ctrl+C, and resize events. Later scans run in one background worker, keep the last successful data visible with a `Refreshing...` footer, and coalesce repeated refresh requests into at most one pending scan. A failed refresh keeps the last-known-good view and retries on the next scheduled or manual refresh.
+Both interactive dashboards draw a centered `Loading sessions...` spinner as soon as terminal setup finishes. Loading stays responsive to `q`, Ctrl+C, and resize events. Later scans keep the last successful data visible with a `Refreshing...` footer. A failed refresh keeps the last-known-good view and retries on the next scheduled or manual refresh.
 
 ### Preview: Table & JSON (`vct usage`)
 
@@ -285,7 +258,7 @@ Totals (by Provider)
 ]
 ```
 
-Every row serializes the same flat token fields regardless of provider (Codex's internal nested shape is normalized before output). A provider that bills a bucket the others don't have adds its own key: a Gemini row that spent tool tokens carries `tool_tokens`, which LiteLLM has no rate for and which are counted in `total_tokens` alone.
+Every row serializes the same flat token fields regardless of provider. A provider that bills a bucket the others don't have adds its own key: a Gemini row that spent tool tokens carries `tool_tokens`, which LiteLLM has no rate for and which are counted in `total_tokens` alone.
 
 ### What It Scans
 
@@ -326,12 +299,12 @@ Every `usage` and `analysis` scan reads and writes a per-session ledger under `~
 - **Claude** — plan tier, 5-hour, weekly, and per-model weekly usage from the official OAuth usage API (`GET /api/oauth/usage`), read from `~/.claude/.credentials.json`, plus your credit balance. Polled about once a minute to stay under the endpoint's rate limit; a red `LIMIT` flag appears in the title when a cap is hit. The per-model weekly row is best-effort and simply hides when that scope is not returned.
 - **Codex** — plan tier, available 5-hour and weekly usage windows, credit balance, and the earliest fetched available earned-reset expiry from the ChatGPT backend (`wham/usage` + `wham/rate-limit-reset-credits`) using `~/.codex/auth.json` (with approximate remaining messages / spend cap when applicable); falls back to the newest `rate_limits` in your Codex session logs when the API is unavailable (the title shows `Codex` vs `Codex (session)`).
 - **Copilot** — plan tier plus your premium-request quota, shown as two gauges: percent used and the used / total request count (e.g. `45/1500`), from GitHub's Copilot API (`GET /copilot_internal/user`), read from `~/.copilot/config.json`. The request impersonates the Copilot CLI. The token is long-lived, so there is no refresh; a `401` / `403` shows a `run: copilot login` hint.
-- **Cursor** — plan tier, total / auto / API percent **used**, and on-demand spend from cursor.com (`GET /api/usage-summary`), using the session token in `~/.config/cursor/auth.json`. Refresh is reactive: vct re-reads the file each poll and uses the token while it is valid, since the official Cursor client keeps it fresh.
+- **Cursor** — plan tier, total / auto / API percent **used**, and on-demand spend from cursor.com (`GET /api/usage-summary`), using the session token in `~/.config/cursor/auth.json`.
 - **Grok** — plan tier plus your included-allowance usage for the current weekly or monthly period, from the Grok CLI's own billing endpoint (`GET /v1/billing?format=credits`), read from `~/.grok/auth.json`. A prepaid balance is shown only once it is non-zero, and pay-as-you-go spend once you have either spent something or set a cap. The request impersonates the Grok CLI; a `401` / `403` shows a `run: grok login` hint.
 
-**Automatic token refresh.** For Claude, Codex, and Grok, when a token is near expiry or rejected, vct refreshes it and writes the new token back to the provider's own credential file (in that CLI's exact format), so a token is reused across checks rather than refreshed every time. Grok's token endpoint is resolved from its login issuer rather than hardcoded, the way its own CLI does it, and every other login in the file is preserved on write. If a refresh cannot proceed, the panel shows a `run: <provider> auth login` hint instead of breaking. Copilot (long-lived token) and Cursor (kept fresh by its own client) are read-only — vct never writes their credential files.
+**Automatic token refresh.** For Claude, Codex, and Grok, when a token is near expiry or rejected, vct refreshes it and writes the new token back to the provider's own credential file (in that CLI's exact format). For Grok, every other login in the file is preserved on write. If a refresh cannot proceed, the panel shows a `run: <provider> auth login` hint instead of breaking. Copilot (long-lived token) and Cursor (kept fresh by its own client) are read-only — vct never writes their credential files.
 
-A panel appears only for a provider whose credentials are present. Panels are placed on a uniform grid that fits as many cards per row as the terminal allows and wraps the rest onto the next row, so a new provider costs a card and never a new layout rule. On a terminal too short to spend rows on the grid, it folds into a one-line digest showing the gauges that still fit and counting the rest; press `Q` for the full-detail overlay, where every card has room for every line whatever the terminal size, and `p` for the Provider Usage panel with per-provider tokens and share. Quota panels appear only in the interactive TUI; `--table`, `--text`, and `--json` are unchanged.
+A panel appears only for a provider whose credentials are present. Panels are placed on a uniform grid that fits as many cards per row as the terminal allows and wraps the rest onto the next row. On a terminal too short to spend rows on the grid, it folds into a one-line digest showing the gauges that still fit and counting the rest; press `Q` for the full-detail overlay, where every card has room for every line whatever the terminal size, and `p` for the Provider Usage panel with per-provider tokens and share. Quota panels appear only in the interactive TUI; `--table`, `--text`, and `--json` are unchanged.
 
 > **Platform note:** on macOS, Claude Code stores its OAuth credentials in the system Keychain rather than `~/.claude/.credentials.json`, so the Claude panel is not shown on macOS. Cursor's `~/.config/cursor` credential path is Linux-oriented.
 
@@ -340,17 +313,6 @@ A panel appears only for a provider whose credentials are present. Panels are pl
 ## Analysis Command
 
 **Deep dive into code operations — see exactly what your AI assistant did.**
-
-### Arguments and Flags
-
-| Argument / Flag                                | Purpose                                                                                  |
-| ---------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| *(none)*                                       | Interactive TUI dashboard over all sessions                                              |
-| `<FILE>`                                       | Analyze one JSONL/JSON session file and print its complete `CodeAnalysis` JSON           |
-| `--table`                                      | Static summary table with per-provider totals                                            |
-| `--text`                                       | Plain-text summary, script-friendly                                                      |
-| `--json`                                       | Complete parser results as JSON: one object for `<FILE>`, otherwise an array of objects  |
-| `--daily` / `--weekly` / `--monthly` / `--all` | Time range filter for all-session analysis (see table above; not accepted with `<FILE>`) |
 
 See [`tests/fixtures/sessions/`](tests/fixtures/sessions/) for sample inputs and matching JSON outputs for the four JSONL providers, plus the Grok session fixture under [`tests/fixtures/sessions/grok/`](tests/fixtures/sessions/grok/) and the DeepSeek Harness one under [`tests/fixtures/sessions/dsh/`](tests/fixtures/sessions/dsh/).
 
@@ -515,8 +477,6 @@ vct version --json   # Machine-readable JSON
 └───────────────┴──────────┘
 ```
 
-The binary version is produced at build time by `build.rs` from `git describe`, so development builds include commit count + short SHA + `dirty` suffix when applicable.
-
 ---
 
 ## Quota Command
@@ -526,15 +486,6 @@ The binary version is produced at build time by `build.rs` from `git describe`, 
 Calls the same quota endpoint the `usage` dashboard uses (Claude / Codex / Copilot / Cursor / Grok) exactly once and prints the raw body, so you can inspect the exact API shape or sanity-check your credentials. It reads each provider's stored credentials and does **not** refresh tokens: if a token is expired, re-auth with that provider's own CLI (`claude` / `codex` / `copilot` / `cursor-agent` / `grok`).
 
 > The previous name `vct fetch` is kept as a hidden alias, so existing scripts keep working.
-
-### Flags
-
-| Flag      | Purpose                                       |
-| --------- | --------------------------------------------- |
-| *(none)*  | Pretty JSON (default)                         |
-| `--json`  | Pretty JSON                                   |
-| `--text`  | Flattened `key: value` lines, script-friendly |
-| `--table` | Flattened Field / Value table                 |
 
 ### Basic Usage
 
@@ -562,78 +513,7 @@ vct quota copilot --table
 
 vct keeps its user settings in `~/.vct/config.toml`. The file is **created with defaults on first run**, so you never have to write it by hand — edit it only when you want to change a default. It is generated from vct's typed settings and carries a `#:schema` directive on the first line, so a schema-aware TOML editor (taplo / VS Code "Even Better TOML") gives you autocomplete and validation. Print the schema yourself with `vct config schema`. A file written by an older vct is upgraded to the current layout in place the next time vct reads it (or on demand with `vct config migrate`), so an upgrade never leaves you on a stale format. That upgrade also adds a quota panel released after your file was written — once. Remove the name again and it stays removed, and a panel you had already dropped is never brought back.
 
-```toml
-#:schema https://raw.githubusercontent.com/Mai0313/VibeCodingTracker/main/vct.schema.json
-
-[general]
-# Default time range when no --daily/--weekly/--monthly/--all flag is given.
-# One of: "daily" | "weekly" | "monthly" | "all".
-default_time_range = "all"
-# Check for a newer release at startup and automatically update supported direct installs.
-# Set to false to disable this behavior.
-auto_update = true
-# Layout version of this file, stamped by vct. Only the upgrade pass reads it;
-# leave it alone unless you want a past upgrade to run again.
-version = 3
-
-[usage]
-# Start the usage dashboard with models merged across provider prefixes.
-# Toggled live with `m`; the last state is saved back here.
-merge_models = false
-# Seconds between automatic redraws of the usage TUI (minimum 1).
-refresh_interval = 10
-
-[usage.quota]
-# Which live quota panels to show. Remove a name to hide that panel; use an
-# empty list ([]) to hide them all.
-panels = ["claude", "codex", "copilot", "cursor", "grok"]
-# Seconds between live quota-panel polls, shared by every provider (minimum 1).
-refresh_interval = 60
-
-[analysis]
-# Seconds between automatic redraws of the analysis TUI (minimum 1).
-refresh_interval = 10
-
-[performance]
-# Rayon workers used by CLI session scans. 0 selects the measured auto default;
-# a positive value is capped at the machine's available parallelism.
-scan_threads = 0
-
-[providers]
-# Include each provider's sessions in usage / analysis. Set a provider to false
-# to skip it entirely (no directory scan, no API).
-claude = true
-codex = true
-copilot = true
-gemini = true
-opencode = true
-cursor = true
-hermes = true
-grok = true
-dsh = true
-
-[logging]
-# Minimum level written to ~/.vct/logs/vct-YYYY-MM-DD.log.
-# One of: "off" | "error" | "warn" | "info" | "debug" | "trace".
-level = "warn"
-# Days of daily log files to keep; older files are pruned on startup. 0 keeps every file.
-retention_days = 7
-```
-
-| Setting                        | Effect                                                                                                                          |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
-| `general.default_time_range`   | Period used when you pass no `--daily/--weekly/--monthly/--all`. An explicit flag always wins.                                  |
-| `general.auto_update`          | Check once per UTC day at startup and automatically update only official-installer direct installs. Set to `false` to disable.  |
-| `general.version`              | Layout version vct stamps on the file, so a panel added by a later release is offered to you exactly once.                      |
-| `usage.merge_models`           | Seeds the dashboard merged; the `m` toggle saves your last choice back here. `--merge-providers` forces on.                     |
-| `usage.refresh_interval`       | Redraw cadence of the `usage` dashboard (seconds).                                                                              |
-| `usage.quota.panels`           | Which quota panels to show (`claude` / `codex` / `copilot` / `cursor` / `grok`); drop a name to hide it, `[]` to hide them all. |
-| `usage.quota.refresh_interval` | Poll cadence for every live quota panel (seconds); higher is safer against a provider's rate limits.                            |
-| `analysis.refresh_interval`    | Redraw cadence of the `analysis` dashboard (seconds).                                                                           |
-| `performance.scan_threads`     | CLI scan workers. `0` uses `RAYON_NUM_THREADS` when positive, otherwise at most two workers; every value is CPU-capped.         |
-| `providers.*`                  | Skip a provider entirely (no scan, no API) when `false` — handy if you don't use one.                                           |
-| `logging.level`                | Minimum severity written to the log file (`off`..`trace`); never printed to the terminal.                                       |
-| `logging.retention_days`       | Days of daily log files to keep; older `vct-*.log` are pruned on startup (`0` keeps all).                                       |
+Run `vct config show` to print the file; its comments explain every setting.
 
 > [!NOTE]
 > Cursor `usage` is a **local estimate** from the chat stores, so it behaves like Claude Code / Codex / Copilot / Gemini (all computed from local session files) and needs no network. It undercounts Cursor's real spend, because much of it is billed under Cursor-internal model names the local data cannot price — treat Cursor cost as approximate.
@@ -667,9 +547,8 @@ vct config migrate
 ### How It Works
 
 1. **Automatic Updates**: Fetches pricing from [LiteLLM](https://github.com/BerriAI/litellm) once per UTC day
-2. **Validated Caching**: Accepts only a successful JSON model map containing real prices, then writes it atomically to `~/.vct/`
-3. **Deterministic Matching**: Finds the most specific model match even for versioned or provider-prefixed names
-4. **Failure Safety**: A failed fetch cannot replace a good cache; vct keeps the previous map and backs off for five minutes before another attempt
+2. **Deterministic Matching**: Finds the most specific model match even for versioned or provider-prefixed names
+3. **Failure Safety**: A failed fetch cannot replace a good cache; vct keeps the previous map and backs off for five minutes before another attempt
 
 ### Model Matching
 
@@ -691,13 +570,9 @@ Generic placeholder names (e.g. `default`, what cursor-agent records for auto-mo
 - **Hermes**: priced the same way as OpenCode — an **exact** LiteLLM match prices from tokens, otherwise vct uses Hermes's own stored cost.
 - **DeepSeek Harness**: `dsh` records no cost of its own, so every model is priced from LiteLLM through the same lookup chain as the other file-based providers — there is no stored-cost fallback like OpenCode's or Hermes's. It routes to whatever the deployment configures, so expect deployment-defined model names, which land at $0 when nothing in LiteLLM matches.
 - **Grok**: `contextTokensUsed` is priced as cache-read tokens only (falling back to the input rate when the model publishes no cache-read price); this is a point-in-time local context estimate, not cumulative billed usage.
-- **Cache is raw**: the daily cache stores the filtered upstream LiteLLM JSON (not a derived shape), so tiered / batch pricing stays available without re-fetching, and each pricing map owns a small in-process LRU so repeated lookups stay cheap without cross-map contamination.
 
 ---
 
-## Docker Support
+## Development
 
-```bash
-# Build image
-docker build -f docker/Dockerfile --target prod -t vibe_coding_tracker:latest .
-```
+Contributor setup, building from source, tests, code quality, commit conventions, and release and packaging notes live in [CONTRIBUTING.md](./.github/CONTRIBUTING.md).
