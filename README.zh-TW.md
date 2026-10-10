@@ -181,7 +181,7 @@ vct usage --table --merge-providers
 ```
 
 > [!NOTE]
-> Model 列會依 cost 由小到大排序，所以花費最高的 model 會排在最後(在 `--table` 中緊鄰 `TOTAL` 列上方)。這個排序會套用到互動式儀表板、`--table` 與 `--text` 三種輸出;`--json` 也會保持相同順序。互動式儀表板也會隱藏在所選範圍內用量為 0 的 model。
+> Model 列會依 cost 由小到大排序，所以花費最高的 model 會排在最後(在 `--table` 中緊鄰 `TOTAL` 列上方)。這個排序會套用到互動式儀表板、`--table` 與 `--text` 三種輸出;`--json` 的列則沒有固定順序。互動式儀表板也會隱藏在所選範圍內用量為 0 的 model。
 
 > [!TIP]
 > 同一個 model 在不同 provider 前綴下路由時會顯示成多列（`openai/gpt-5.5`、`azure/gpt-5.5`、純 `gpt-5.5`）。`--merge-providers` 會把第一個 `/` 之後 base 名稱相同的列合併（`gpt-5.5` 與 `gpt-5.4` 這類版本不同的仍分開），並把它們已定價的 cost 相加。在互動式儀表板中按 `m` 可即時切換（這個選擇會存進 `~/.vct/config.toml`，所以下次啟動時會記住這個設定）;`--merge-providers` 則讓儀表板一打開就是合併狀態。`--json` 保持為逐一 model 的原始輸出。
@@ -241,16 +241,20 @@ Totals (by Provider)
 ```
 
 ```json
-// vct usage --json  (one model shown; rows are sorted by cost)
+// vct usage --json  (one model shown; rows come in no fixed order)
 [
   {
-    "model": "claude-opus-4-8",
     "cost_usd": 151.29,
+    "model": "claude-opus-4-8",
     "usage": {
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 6057836
+      },
+      "cache_creation_input_tokens": 6057836,
+      "cache_read_input_tokens": 138099926,
       "input_tokens": 401937,
       "output_tokens": 936186,
-      "cache_read_input_tokens": 138099926,
-      "cache_creation_input_tokens": 6057836,
       "reasoning_output_tokens": 0,
       "total_tokens": 145495885
     }
@@ -258,7 +262,7 @@ Totals (by Provider)
 ]
 ```
 
-無論來源 provider 為何，每一列都會輸出相同的扁平 token 欄位。若某個 provider 計費的 bucket 是其他 provider 沒有的，該列會額外帶上自己的 key：實際用掉 tool token 的 Gemini 列會帶 `tool_tokens`，LiteLLM 沒有對應費率，只計入 `total_tokens`。
+無論來源 provider 為何，每一列都會輸出相同的扁平 token 欄位。有幾個 key 只在該列有對應數值時才會出現：`cache_creation` 把 cache 寫入拆成 5 分鐘與 1 小時 TTL 兩部分，`server_tool_use` 記錄 Claude 的 web search 次數，`above_tier` 記錄 prompt 超過長 context 計價級距的請求所用的 token，實際用掉 tool token 的 Gemini 列則會帶 `tool_tokens`，LiteLLM 沒有對應費率，只計入 `total_tokens`。
 
 ### 掃描範圍
 

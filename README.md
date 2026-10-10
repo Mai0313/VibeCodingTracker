@@ -181,7 +181,7 @@ vct usage --table --merge-providers
 ```
 
 > [!NOTE]
-> Model rows are sorted by cost in ascending order, so the highest-spending model is listed last (right above the `TOTAL` row in `--table`). This applies to the interactive dashboard, `--table`, and `--text` output; `--json` preserves the same order. The interactive dashboard also hides models with zero usage in the selected range.
+> Model rows are sorted by cost in ascending order, so the highest-spending model is listed last (right above the `TOTAL` row in `--table`). This applies to the interactive dashboard, `--table`, and `--text` output; `--json` lists its rows in no fixed order. The interactive dashboard also hides models with zero usage in the selected range.
 
 > [!TIP]
 > The same model can show up as several rows when it is routed under different provider prefixes (`openai/gpt-5.5`, `azure/gpt-5.5`, plain `gpt-5.5`). `--merge-providers` collapses rows that share the base name after the first `/` (versions like `gpt-5.5` vs `gpt-5.4` stay separate) and sums their already-priced cost. In the interactive dashboard, press `m` to toggle it live (the choice is saved to `~/.vct/config.toml`, so the next launch remembers it); `--merge-providers` opens the dashboard already merged. `--json` is left as the raw per-model export.
@@ -241,16 +241,20 @@ Totals (by Provider)
 ```
 
 ```json
-// vct usage --json  (one model shown; rows are sorted by cost)
+// vct usage --json  (one model shown; rows come in no fixed order)
 [
   {
-    "model": "claude-opus-4-8",
     "cost_usd": 151.29,
+    "model": "claude-opus-4-8",
     "usage": {
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 6057836
+      },
+      "cache_creation_input_tokens": 6057836,
+      "cache_read_input_tokens": 138099926,
       "input_tokens": 401937,
       "output_tokens": 936186,
-      "cache_read_input_tokens": 138099926,
-      "cache_creation_input_tokens": 6057836,
       "reasoning_output_tokens": 0,
       "total_tokens": 145495885
     }
@@ -258,7 +262,7 @@ Totals (by Provider)
 ]
 ```
 
-Every row serializes the same flat token fields regardless of provider. A provider that bills a bucket the others don't have adds its own key: a Gemini row that spent tool tokens carries `tool_tokens`, which LiteLLM has no rate for and which are counted in `total_tokens` alone.
+Every row carries the same flat token fields regardless of provider. A few keys appear only on a row that has something to put in them: `cache_creation` splits the cache writes into their 5-minute and 1-hour TTL shares, `server_tool_use` counts Claude web searches, `above_tier` holds the tokens of requests whose prompt crossed a long-context price tier, and a Gemini row that spent tool tokens carries `tool_tokens`, which LiteLLM has no rate for and which are counted in `total_tokens` alone.
 
 ### What It Scans
 
