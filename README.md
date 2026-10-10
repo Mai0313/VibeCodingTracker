@@ -69,7 +69,7 @@ Automatically detects and processes logs from Claude Code, Codex, Copilot, Gemin
 | **4 Display Modes**   | Interactive TUI, static table, plain text, and JSON                                       |
 | **Dual Analysis**     | Token/cost stats (`usage`) + code operation stats (`analysis`)                            |
 | **Live Quota Panels** | Live quota usage for Claude, Codex, Copilot, Cursor, and Grok                             |
-| **Ultra-Lightweight** | Under ~50 MB RSS in the TUI, compact incremental scans — built with Rust                  |
+| **Ultra-Lightweight** | Around 60 MB RSS in the TUI, compact incremental scans — built with Rust                  |
 | **Live Updates**      | Responsive loading and background refreshes with change highlighting                      |
 
 ---
@@ -164,7 +164,7 @@ vct usage --table
 # Plain text for scripts
 vct usage --text
 
-# JSON for data processing (includes cost_usd and matched_model fields)
+# JSON for data processing (every row has cost_usd; matched_model only when priced under another model name)
 vct usage --json
 
 # Save enriched JSON with shell redirection
@@ -557,7 +557,7 @@ vct config migrate
 1. **Exact Match**: `claude-sonnet-4` → `claude-sonnet-4`
 2. **Normalized**: `claude-sonnet-4-20250514` → `claude-sonnet-4`
 3. **Substring**: `custom-gpt-4` → `gpt-4`
-4. **Fuzzy (AI-powered)**: Uses Jaro-Winkler similarity (70% threshold)
+4. **Fuzzy**: Uses Jaro-Winkler similarity (70% threshold)
 5. **Fallback**: Shows $0.00 if no match found
 
 Generic placeholder names (e.g. `default`, what cursor-agent records for auto-mode sessions) and very short names never take a substring/fuzzy match — unpriced is safer than a coincidental neighbor's price.

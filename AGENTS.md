@@ -123,7 +123,7 @@ OpenCode, Cursor, and Hermes all use `src/core/src/session/sqlite.rs`. It first 
 
 ### `ParseMode`
 
-`src/core/src/session/state.rs` defines `ParseMode::Full` vs `ParseMode::UsageOnly`. The usage and summary-display paths use `UsageOnly` to skip allocating the large `write_file_details` / `edit_file_details` bodies — this is a major part of why the TUI sits at ~30–50 MB RSS even on 200+ session directories. All scalar counters, including `total_unique_files`, must remain identical between modes. Preserve this distinction when adding new fields to `CodeAnalysisRecord`.
+`src/core/src/session/state.rs` defines `ParseMode::Full` vs `ParseMode::UsageOnly`. The usage and summary-display paths use `UsageOnly` to skip allocating the large `write_file_details` / `edit_file_details` bodies — this is a major part of why the TUI sits at around 60 MB RSS even on 200+ session directories. All scalar counters, including `total_unique_files`, must remain identical between modes. Preserve this distinction when adding new fields to `CodeAnalysisRecord`.
 
 ### Token accounting quirks
 

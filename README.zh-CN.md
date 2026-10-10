@@ -69,7 +69,7 @@
 | **4 种显示模式** | 交互式 TUI、静态表格、纯文本和 JSON                                                     |
 | **双维度分析**   | token/费用统计（`usage`）+ 代码操作统计（`analysis`）                                   |
 | **实时额度面板** | Claude、Codex、Copilot、Cursor 和 Grok 的实时额度用量                                   |
-| **超轻量级**     | TUI 常驻内存 50 MB 以内、精简的 incremental scan, 基于 Rust 构建                        |
+| **超轻量级**     | TUI 常驻内存约 60 MB、精简的 incremental scan, 基于 Rust 构建                           |
 | **实时更新**     | 响应式 loading 与后台 refresh, 并高亮变化                                               |
 
 ---
@@ -164,7 +164,7 @@ vct usage --table
 # Plain text for scripts
 vct usage --text
 
-# JSON 输出，包含 cost_usd 与 matched_model 字段
+# JSON 输出，每行都有 cost_usd；以其他模型名称计价时才会多出 matched_model 字段
 vct usage --json
 
 # 通过 shell redirection 保存富化 JSON
@@ -557,7 +557,7 @@ vct config migrate
 1. **精确匹配**：`claude-sonnet-4` → `claude-sonnet-4`
 2. **标准化匹配**：`claude-sonnet-4-20250514` → `claude-sonnet-4`
 3. **子串匹配**：`custom-gpt-4` → `gpt-4`
-4. **模糊匹配（AI 驱动）**：使用 Jaro-Winkler 相似度算法（70% 阈值）
+4. **模糊匹配**：使用 Jaro-Winkler 相似度算法（70% 阈值）
 5. **兜底方案**：如果未找到匹配，显示 $0.00
 
 通用的占位名称（例如 cursor-agent 在 auto 模式写入的 `default`）与过短的名称不会进行子串或模糊匹配——宁可不计价，也不捡相似名称的价格。

@@ -69,7 +69,7 @@
 | **4 種顯示模式** | 互動式 TUI、靜態表格、純文字及 JSON                                                     |
 | **雙重分析**     | Token / 費用統計（`usage`）+ 程式碼操作統計（`analysis`）                               |
 | **即時額度面板** | 即時顯示 Claude、Codex、Copilot、Cursor 與 Grok 的額度用量                              |
-| **超輕量**       | TUI 常駐記憶體 ~50 MB 以內、精簡的 incremental scan, 以 Rust 打造                       |
+| **超輕量**       | TUI 常駐記憶體約 60 MB、精簡的 incremental scan, 以 Rust 打造                           |
 | **即時更新**     | 響應式 loading 與背景 refresh, 並突顯變更                                               |
 
 ---
@@ -164,7 +164,7 @@ vct usage --table
 # Plain text for scripts
 vct usage --text
 
-# JSON 輸出，包含 cost_usd 與 matched_model 欄位
+# JSON 輸出，每列都有 cost_usd；以其他 model 名稱計價時才會多出 matched_model 欄位
 vct usage --json
 
 # 透過 shell redirection 儲存富化 JSON
@@ -557,7 +557,7 @@ vct config migrate
 1. **完全比對**：`claude-sonnet-4` → `claude-sonnet-4`
 2. **正規化比對**：`claude-sonnet-4-20250514` → `claude-sonnet-4`
 3. **子字串比對**：`custom-gpt-4` → `gpt-4`
-4. **模糊比對（AI 驅動）**：使用 Jaro-Winkler 相似度（70% 門檻值）
+4. **模糊比對**：使用 Jaro-Winkler 相似度（70% 門檻值）
 5. **備援方案**：若無法配對則顯示 $0.00
 
 泛用的佔位名稱（例如 cursor-agent 在 auto 模式寫入的 `default`）與過短的名稱不會進行子字串或模糊比對——寧可不計價，也不撿相似名稱的價格。
