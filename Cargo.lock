@@ -1933,6 +1933,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lru"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a9f71e3591c7ec44d3e563e87bf14ddc2bada8519dca046e5b0e560cd004e2d"
+dependencies = [
+ "hashbrown 0.17.0",
+]
+
+[[package]]
 name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2659,7 +2668,7 @@ dependencies = [
  "hashbrown 0.17.0",
  "itertools 0.14.0",
  "kasuari",
- "lru",
+ "lru 0.18.5",
  "palette",
  "serde",
  "strum",
@@ -3974,7 +3983,7 @@ dependencies = [
  "itoa",
  "libc",
  "log",
- "lru",
+ "lru 0.19.0",
  "percent-encoding",
  "rayon",
  "regex",
