@@ -67,7 +67,10 @@ pub fn extract_zip(archive_path: &Path, extract_to: &Path) -> Result<std::path::
 
     for i in 0..archive.len() {
         let mut file = archive.by_index(i).context("Failed to read zip entry")?;
-        let file_path = file.name().to_string();
+        let file_path = file
+            .name()
+            .context("Failed to read zip entry name")?
+            .to_string();
         let Some(enclosed_path) = file.enclosed_name() else {
             anyhow::bail!(
                 "Archive contains invalid path that attempts to escape extraction directory: {}",
