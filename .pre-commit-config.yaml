@@ -60,6 +60,7 @@ repos:
         args:
           - --number
           - --no-validate
+          - --wrap=no
         additional_dependencies:
           # https://mdformat.readthedocs.io/en/stable/users/plugins.html
           # Code formatter plugins
@@ -87,6 +88,16 @@ repos:
           # Legacy/Additional
           # - mdformat-tables  # deprecated, use mdformat-gfm
           # - mdformat-wikilink  # wikilinks
+
+  # mdformat leaves front matter alone, so a wrapped description needs its own check
+  - repo: local
+    hooks:
+      - id: description-one-line
+        name: description on one line
+        language: pygrep
+        entry: '^description:[ \t]*(?:[>|][-+]?[ \t]*\n[ \t]+\S[^\n]*|[^>|\s][^\n]*)\n[ \t]+\S'
+        args: [--multiline]
+        files: (^|/)SKILL\.md$
 
   - repo: https://github.com/gitleaks/gitleaks
     rev: v8.30.0
