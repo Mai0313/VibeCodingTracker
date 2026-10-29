@@ -28,6 +28,7 @@ jobs:
     name: Dependabot Auto Merge
     needs: dependency-review
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     if: github.event.pull_request.user.login == 'dependabot[bot]'
 
     steps:
@@ -43,8 +44,24 @@ jobs:
         run: |
           gh pr review --approve "${{ github.event.pull_request.html_url }}"
 
-      - name: Enable auto-merge for Dependabot PRs
+      # No check is required, so `gh pr merge --auto` would merge before CI finishes; wait for this PR's own checks instead.
+      - name: Wait for the other checks
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh pr merge --squash --auto --delete-branch "${{ github.event.pull_request.html_url }}"
+          while :; do
+            sleep 30
+            buckets=$(gh pr checks "${{ github.event.pull_request.html_url }}" --json bucket,workflow \
+              --jq '[.[] | select(.workflow != "${{ github.workflow }}") | .bucket] | join(" ")' || true)
+            case " $buckets " in
+              *" fail "* | *" cancel "*) echo "::error::A check failed, so the PR is left open." && exit 1 ;;
+              "  " | *" pending "*) ;;
+              *) break ;;
+            esac
+          done
+
+      - name: Merge Dependabot PR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr merge --squash --delete-branch --match-head-commit "${{ github.event.pull_request.head.sha }}" "${{ github.event.pull_request.html_url }}"
