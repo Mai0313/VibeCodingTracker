@@ -170,7 +170,7 @@ vct usage --table --merge-providers
 ```
 
 > [!NOTE]
-> Model rows are sorted by cost in ascending order, so the highest-spending model is listed last (right above the `TOTAL` row in `--table`). This applies to the interactive dashboard, `--table`, and `--text` output; `--json` lists its rows in no fixed order. The interactive dashboard also hides models with zero usage in the selected range.
+> Model rows are sorted by cost in descending order, so the highest-spending model is listed first (the `TOTAL` row still closes `--table`). This applies to the interactive dashboard, `--table`, and `--text` output; `--json` lists its rows in no fixed order. The interactive dashboard also hides models with zero usage in the selected range.
 
 > [!TIP]
 > The same model can show up as several rows when it is routed under different provider prefixes (`openai/gpt-5.5`, `azure/gpt-5.5`, plain `gpt-5.5`). `--merge-providers` collapses rows that share the base name after the first `/` (versions like `gpt-5.5` vs `gpt-5.4` stay separate) and sums their already-priced cost. In the interactive dashboard, press `m` to toggle it live (the choice is saved to `~/.vct/config.toml`, so the next launch remembers it); `--merge-providers` opens the dashboard already merged. `--json` is left as the raw per-model export.
@@ -178,25 +178,27 @@ vct usage --table --merge-providers
 ### Preview: Interactive Dashboard (`vct usage`)
 
 ```
-┌ Models · $79.33 · 49.1M tokens · 3 models ───────────────────────────────────────────────────────────────────────────┐
-│Model                              Input     Output    Cache Read  Cache Write Total     Cost (USD)   Share           █
-│                                                                                                                      █
-│gemini-3.1-pro-preview                  129K     10.3K       66.0K       1.70K      207K        $0.40             0.4%█
-│claude-haiku-4-5-20251001              5.57K     19.8K       5.20M       55.0K     5.28M        $1.34          █ 10.8%█
-│claude-opus-4-8                        25.7K      179K       42.9M        496K     43.6M       $77.59  █████████ 88.8%█
-│                                                                                                                      █
-│                                                                                                                      █
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-                                              Claude $78.93 · Gemini $0.40
-┌ Claude ──────────────┐┌ Codex ───────────────┐┌ Copilot ─────────────┐┌ Cursor ────────LIMIT ┐┌ Grok ────────────────┐
-│max 20x       just now││plus          just now││individual    just now││free          just now││SuperGrok     just now│
-│5h    ▰▱▱▱▱  13% 1h42m││5h    ▰▰▱▱▱  33% 12m  ││prem  ▰▱▱▱▱   3% 24d0h││total ▰▰▰▰▰  94% 16d0h││week  ▰▰▱▱▱  38% 3d4h │
-│7d    ▰▰▰▱▱  58% 1d23h││7d    ▰▰▱▱▱  36% 1h54m││reqs  ▰▱▱▱▱ 45/1500   ││auto  ▰▰▰▰▰ 100% 16d0h││ondmd $4.20/$50.00    │
-│Fable ▰▰▰▰▱  79% 1d23h││credits 0 · +3 reset  ││                      ││api   ▰▰▰▱▱  44% 16d0h││balance $12.00        │
-│bal - · $0.00 used    ││reset expires 17d0h   ││                      ││                      ││                      │
-└──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘
-                Total Cost: $79.33  |  Total Tokens: 49.1M  |  Models: 3  |  Memory: 4.7 MB  |  CPU: 0.0%
-                    ↑/↓ scroll  m merge  p providers  Q quota  r refresh  q quit  |  Star on GitHub
+  Usage   $79.33 · 49.1M tokens · 3 models
+
+  Model                              Input     Output    Cache Read  Cache Write Total     Cost (USD)   Share
+› claude-opus-4-8                        25.7K      179K       42.9M        496K     43.6M       $77.59  ████████ 88.8%┃
+  claude-haiku-4-5-20251001              5.57K     19.8K       5.20M       55.0K     5.28M        $1.34         █ 10.8%┃
+  gemini-3.1-pro-preview                  129K     10.3K       66.0K       1.70K      207K        $0.40            0.4%┃
+                                                                                                                       ┃
+                                                                                                                       ┃
+                                                                                                                       ┃
+                                                                                                                       │
+                                                                                                                       │
+  ● Claude $78.93 ● Gemini $0.40
+
+  ● Claude                ● Codex                 ● Copilot               ● Cursor         LIMIT  ● Grok
+  max 20x       just now  plus          just now  individual    just now  free          just now  SuperGrok     just now
+  5h    █░░░░  13% 1h42m  5h    ██░░░  33% 12m    prem  █░░░░   3% 24d0h  total █████  94% 16d0h  week  ██░░░  38% 3d4h
+  7d    ███░░  58% 1d23h  7d    ██░░░  36% 1h54m  reqs  █░░░░ 45/1500     auto  █████ 100% 16d0h  ondmd $4.20/$50.00
+  Fable ████░  79% 1d23h  credits 0 · +3 reset                            api   ███░░  44% 16d0h  balance $12.00
+  bal - · $0.00 used      reset expires 17d0h
+
+  ↑↓ scroll · m merge · p providers · Q quota · r refresh · q quit                    5.7 MB · CPU 0.0% · Star on GitHub
 ```
 
 Both interactive dashboards draw a centered `Loading sessions...` spinner as soon as terminal setup finishes. Loading stays responsive to `q`, Ctrl+C, and resize events. Later scans keep the last successful data visible with a `Refreshing...` footer. A failed refresh keeps the last-known-good view and retries on the next scheduled or manual refresh.
@@ -211,9 +213,9 @@ Token Usage Statistics
 ┌───────────────────────────┬─────────┬─────────┬─────────────┬─────────────┬──────────────┬────────────┐
 │ Model                     ┆   Input ┆  Output ┆  Cache Read ┆ Cache Write ┆ Total Tokens ┆ Cost (USD) │
 ╞═══════════════════════════╪═════════╪═════════╪═════════════╪═════════════╪══════════════╪════════════╡
-│ opencode/gemini-3.5-flash ┆  19,421 ┆     254 ┆           0 ┆           0 ┆       19,675 ┆      $0.03 │
-│ gpt-5.5                   ┆ 242,227 ┆  16,229 ┆   2,406,912 ┆           0 ┆    2,665,368 ┆      $5.56 │
 │ claude-opus-4-8           ┆ 401,937 ┆ 936,186 ┆ 138,099,926 ┆   6,057,836 ┆  145,495,885 ┆    $151.29 │
+│ gpt-5.5                   ┆ 242,227 ┆  16,229 ┆   2,406,912 ┆           0 ┆    2,665,368 ┆      $5.56 │
+│ opencode/gemini-3.5-flash ┆  19,421 ┆     254 ┆           0 ┆           0 ┆       19,675 ┆      $0.03 │
 │ TOTAL                     ┆ 663,585 ┆ 952,669 ┆ 140,506,838 ┆   6,057,836 ┆  148,180,928 ┆    $156.88 │
 └───────────────────────────┴─────────┴─────────┴─────────────┴─────────────┴──────────────┴────────────┘
 
@@ -280,17 +282,16 @@ Every `usage` and `analysis` scan reads and writes a per-session ledger under `~
 `vct usage` shows **live quota usage for Claude Code, Codex, GitHub Copilot, Cursor, and Grok right in the dashboard — with zero setup.** No status-line hook, no credentials to enter: vct reads each provider's own credentials, calls its usage API on a background thread, and keeps the panels current while you work. Every gauge is percent **used**, so a full bar means the window is spent, not untouched. (Prefer a quieter dashboard? Trim `panels` under `[usage.quota]` in [`config.toml`](#configuration), or set it to `[]` to hide the quota cards entirely. The per-provider cost line under the table is local scan data, not a quota panel, so it stays whatever you set here.)
 
 ```
-┌ Claude ──────────────┐┌ Codex ───────────────┐┌ Copilot ─────────────┐┌ Cursor ────────LIMIT ┐┌ Grok ────────────────┐
-│max 20x       just now││plus          just now││individual    just now││free          just now││SuperGrok     just now│
-│5h    ▰▱▱▱▱  13% 1h42m││5h    ▰▰▱▱▱  33% 12m  ││prem  ▰▱▱▱▱   3% 24d0h││total ▰▰▰▰▰  94% 16d0h││week  ▰▰▱▱▱  38% 3d4h │
-│7d    ▰▰▰▱▱  58% 1d23h││7d    ▰▰▱▱▱  36% 1h54m││reqs  ▰▱▱▱▱ 45/1500   ││auto  ▰▰▰▰▰ 100% 16d0h││ondmd $4.20/$50.00    │
-│Fable ▰▰▰▰▱  79% 1d23h││credits 0 · +3 reset  ││                      ││api   ▰▰▰▱▱  44% 16d0h││balance $12.00        │
-│bal - · $0.00 used    ││reset expires 17d0h   ││                      ││                      ││                      │
-└──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘
+  ● Claude                ● Codex                 ● Copilot               ● Cursor         LIMIT  ● Grok
+  max 20x       just now  plus          just now  individual    just now  free          just now  SuperGrok     just now
+  5h    █░░░░  13% 1h42m  5h    ██░░░  33% 12m    prem  █░░░░   3% 24d0h  total █████  94% 16d0h  week  ██░░░  38% 3d4h
+  7d    ███░░  58% 1d23h  7d    ██░░░  36% 1h54m  reqs  █░░░░ 45/1500     auto  █████ 100% 16d0h  ondmd $4.20/$50.00
+  Fable ████░  79% 1d23h  credits 0 · +3 reset                            api   ███░░  44% 16d0h  balance $12.00
+  bal - · $0.00 used      reset expires 17d0h
 ```
 
-- **Claude** — plan tier, 5-hour, weekly, and per-model weekly usage from the official OAuth usage API (`GET /api/oauth/usage`), read from `~/.claude/.credentials.json`, plus your credit balance. Polled about once a minute to stay under the endpoint's rate limit; a red `LIMIT` flag appears in the title when a cap is hit. The per-model weekly row is best-effort and simply hides when that scope is not returned.
-- **Codex** — plan tier, available 5-hour and weekly usage windows, credit balance, and the earliest fetched available earned-reset expiry from the ChatGPT backend (`wham/usage` + `wham/rate-limit-reset-credits`) using `~/.codex/auth.json` (with approximate remaining messages / spend cap when applicable); falls back to the newest `rate_limits` in your Codex session logs when the API is unavailable (the title shows `Codex` vs `Codex (session)`).
+- **Claude** — plan tier, 5-hour, weekly, and per-model weekly usage from the official OAuth usage API (`GET /api/oauth/usage`), read from `~/.claude/.credentials.json`, plus your credit balance. Polled about once a minute to stay under the endpoint's rate limit; a red `LIMIT` flag appears on the provider's name row when a cap is hit. The per-model weekly row is best-effort and simply hides when that scope is not returned.
+- **Codex** — plan tier, available 5-hour and weekly usage windows, credit balance, and the earliest fetched available earned-reset expiry from the ChatGPT backend (`wham/usage` + `wham/rate-limit-reset-credits`) using `~/.codex/auth.json` (with approximate remaining messages / spend cap when applicable); falls back to the newest `rate_limits` in your Codex session logs when the API is unavailable (the name row shows `Codex` vs `Codex (session)`).
 - **Copilot** — plan tier plus your premium-request quota, shown as two gauges: percent used and the used / total request count (e.g. `45/1500`), from GitHub's Copilot API (`GET /copilot_internal/user`), read from `~/.copilot/config.json`. The request impersonates the Copilot CLI. The token is long-lived, so there is no refresh; a `401` / `403` shows a `run: copilot login` hint.
 - **Cursor** — plan tier, total / auto / API percent **used**, and on-demand spend from cursor.com (`GET /api/usage-summary`), using the session token in `~/.config/cursor/auth.json`.
 - **Grok** — plan tier plus your included-allowance usage for the current weekly or monthly period, from the Grok CLI's own billing endpoint (`GET /v1/billing?format=credits`), read from `~/.grok/auth.json`. A prepaid balance is shown only once it is non-zero, and pay-as-you-go spend once you have either spent something or set a cap. The request impersonates the Grok CLI; a `401` / `403` shows a `run: grok login` hint.
@@ -344,22 +345,21 @@ vct analysis --json --daily > today.json
 ### Preview: Interactive Dashboard (`vct analysis`)
 
 ```
-┌ Models · 135K lines · 1.80K tool calls · 3 models ───────────────────────────────────────────────────────────────────┐
-│Model                                   Edit Lines  Read Lines  Write Lines Bash    Edit    Read    TodoWrite  Write  █
-│                                                                                                                      █
-│claude-opus-4-8                               12.4K       88.1K       9.02K     412     231     604         96      88█
-│gemini-3.1-pro-preview                        2.10K       14.8K       1.62K      84      44     112         16      15█
-│claude-haiku-4-5-20251001                       840       5.40K         610      31      16      42          6       5█
-│                                                                                                                      █
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌ Providers ───────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│Provider                 Edit Lines  Read Lines  Write Lines  Bash     Edit     Read     TodoWrite   Write    Days    │
-│                                                                                                                      │
-│Claude                   13.2K       93.5K       9.63K        443      247      646      102         93       12      │
-│Gemini                   2.10K       14.8K       1.62K        84       44       112      16          15       3       │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-                 Total Lines: 135K  |  Total Tools: 1.80K  |  Models: 3  |  Memory: 4.8 MB  |  CPU: 0.0%
-                                    ↑/↓ scroll  r refresh  q quit  |  Star on GitHub
+  Analysis   135K lines · 1.80K tool calls · 3 models
+
+  Model                                  Edit Lines  Read Lines  Write Lines Bash    Edit    Read    TodoWrite  Write
+› claude-opus-4-8                              12.4K       88.1K       9.02K     412     231     604         96      88┃
+  gemini-3.1-pro-preview                       2.10K       14.8K       1.62K      84      44     112         16      15┃
+  claude-haiku-4-5-20251001                      840       5.40K         610      31      16      42          6       5┃
+                                                                                                                       │
+  Providers
+
+  Provider                Edit Lines  Read Lines  Write Lines  Bash     Edit     Read     TodoWrite   Write    Days
+  ● Claude                13.2K       93.5K       9.63K        443      247      646      102         93       12
+  ● Gemini                2.10K       14.8K       1.62K        84       44       112      16          15       3
+
+
+  ↑↓ scroll · r refresh · q quit                                                      5.5 MB · CPU 0.0% · Star on GitHub
 ```
 
 ### Preview: Table & JSON (`vct analysis`)

@@ -170,7 +170,7 @@ vct usage --table --merge-providers
 ```
 
 > [!NOTE]
-> Model 列會依 cost 由小到大排序，所以花費最高的 model 會排在最後(在 `--table` 中緊鄰 `TOTAL` 列上方)。這個排序會套用到互動式儀表板、`--table` 與 `--text` 三種輸出;`--json` 的列則沒有固定順序。互動式儀表板也會隱藏在所選範圍內用量為 0 的 model。
+> Model 列會依 cost 由大到小排序，所以花費最高的 model 會排在最前(`--table` 仍以 `TOTAL` 列結尾)。這個排序會套用到互動式儀表板、`--table` 與 `--text` 三種輸出;`--json` 的列則沒有固定順序。互動式儀表板也會隱藏在所選範圍內用量為 0 的 model。
 
 > [!TIP]
 > 同一個 model 在不同 provider 前綴下路由時會顯示成多列（`openai/gpt-5.5`、`azure/gpt-5.5`、純 `gpt-5.5`）。`--merge-providers` 會把第一個 `/` 之後 base 名稱相同的列合併（`gpt-5.5` 與 `gpt-5.4` 這類版本不同的仍分開），並把它們已定價的 cost 相加。在互動式儀表板中按 `m` 可即時切換（這個選擇會存進 `~/.vct/config.toml`，所以下次啟動時會記住這個設定）;`--merge-providers` 則讓儀表板一打開就是合併狀態。`--json` 保持為逐一 model 的原始輸出。
@@ -178,25 +178,27 @@ vct usage --table --merge-providers
 ### 預覽：互動式儀表板（`vct usage`）
 
 ```
-┌ Models · $79.33 · 49.1M tokens · 3 models ───────────────────────────────────────────────────────────────────────────┐
-│Model                              Input     Output    Cache Read  Cache Write Total     Cost (USD)   Share           █
-│                                                                                                                      █
-│gemini-3.1-pro-preview                  129K     10.3K       66.0K       1.70K      207K        $0.40             0.4%█
-│claude-haiku-4-5-20251001              5.57K     19.8K       5.20M       55.0K     5.28M        $1.34          █ 10.8%█
-│claude-opus-4-8                        25.7K      179K       42.9M        496K     43.6M       $77.59  █████████ 88.8%█
-│                                                                                                                      █
-│                                                                                                                      █
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-                                              Claude $78.93 · Gemini $0.40
-┌ Claude ──────────────┐┌ Codex ───────────────┐┌ Copilot ─────────────┐┌ Cursor ────────LIMIT ┐┌ Grok ────────────────┐
-│max 20x       just now││plus          just now││individual    just now││free          just now││SuperGrok     just now│
-│5h    ▰▱▱▱▱  13% 1h42m││5h    ▰▰▱▱▱  33% 12m  ││prem  ▰▱▱▱▱   3% 24d0h││total ▰▰▰▰▰  94% 16d0h││week  ▰▰▱▱▱  38% 3d4h │
-│7d    ▰▰▰▱▱  58% 1d23h││7d    ▰▰▱▱▱  36% 1h54m││reqs  ▰▱▱▱▱ 45/1500   ││auto  ▰▰▰▰▰ 100% 16d0h││ondmd $4.20/$50.00    │
-│Fable ▰▰▰▰▱  79% 1d23h││credits 0 · +3 reset  ││                      ││api   ▰▰▰▱▱  44% 16d0h││balance $12.00        │
-│bal - · $0.00 used    ││reset expires 17d0h   ││                      ││                      ││                      │
-└──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘
-                Total Cost: $79.33  |  Total Tokens: 49.1M  |  Models: 3  |  Memory: 4.7 MB  |  CPU: 0.0%
-                    ↑/↓ scroll  m merge  p providers  Q quota  r refresh  q quit  |  Star on GitHub
+  Usage   $79.33 · 49.1M tokens · 3 models
+
+  Model                              Input     Output    Cache Read  Cache Write Total     Cost (USD)   Share
+› claude-opus-4-8                        25.7K      179K       42.9M        496K     43.6M       $77.59  ████████ 88.8%┃
+  claude-haiku-4-5-20251001              5.57K     19.8K       5.20M       55.0K     5.28M        $1.34         █ 10.8%┃
+  gemini-3.1-pro-preview                  129K     10.3K       66.0K       1.70K      207K        $0.40            0.4%┃
+                                                                                                                       ┃
+                                                                                                                       ┃
+                                                                                                                       ┃
+                                                                                                                       │
+                                                                                                                       │
+  ● Claude $78.93 ● Gemini $0.40
+
+  ● Claude                ● Codex                 ● Copilot               ● Cursor         LIMIT  ● Grok
+  max 20x       just now  plus          just now  individual    just now  free          just now  SuperGrok     just now
+  5h    █░░░░  13% 1h42m  5h    ██░░░  33% 12m    prem  █░░░░   3% 24d0h  total █████  94% 16d0h  week  ██░░░  38% 3d4h
+  7d    ███░░  58% 1d23h  7d    ██░░░  36% 1h54m  reqs  █░░░░ 45/1500     auto  █████ 100% 16d0h  ondmd $4.20/$50.00
+  Fable ████░  79% 1d23h  credits 0 · +3 reset                            api   ███░░  44% 16d0h  balance $12.00
+  bal - · $0.00 used      reset expires 17d0h
+
+  ↑↓ scroll · m merge · p providers · Q quota · r refresh · q quit                    5.7 MB · CPU 0.0% · Star on GitHub
 ```
 
 兩個互動式儀表板都會在 terminal setup 完成後立即繪製置中的 `Loading sessions...` spinner. Loading 期間仍可處理 `q`, Ctrl+C 與 resize event. 後續掃描會在 `Refreshing...` footer 下保留上一次成功的資料. 如果 refresh 失敗, 儀表板會保留 last-known-good view, 並在下次排程或手動刷新時重試.
@@ -211,9 +213,9 @@ Token Usage Statistics
 ┌───────────────────────────┬─────────┬─────────┬─────────────┬─────────────┬──────────────┬────────────┐
 │ Model                     ┆   Input ┆  Output ┆  Cache Read ┆ Cache Write ┆ Total Tokens ┆ Cost (USD) │
 ╞═══════════════════════════╪═════════╪═════════╪═════════════╪═════════════╪══════════════╪════════════╡
-│ opencode/gemini-3.5-flash ┆  19,421 ┆     254 ┆           0 ┆           0 ┆       19,675 ┆      $0.03 │
-│ gpt-5.5                   ┆ 242,227 ┆  16,229 ┆   2,406,912 ┆           0 ┆    2,665,368 ┆      $5.56 │
 │ claude-opus-4-8           ┆ 401,937 ┆ 936,186 ┆ 138,099,926 ┆   6,057,836 ┆  145,495,885 ┆    $151.29 │
+│ gpt-5.5                   ┆ 242,227 ┆  16,229 ┆   2,406,912 ┆           0 ┆    2,665,368 ┆      $5.56 │
+│ opencode/gemini-3.5-flash ┆  19,421 ┆     254 ┆           0 ┆           0 ┆       19,675 ┆      $0.03 │
 │ TOTAL                     ┆ 663,585 ┆ 952,669 ┆ 140,506,838 ┆   6,057,836 ┆  148,180,928 ┆    $156.88 │
 └───────────────────────────┴─────────┴─────────┴─────────────┴─────────────┴──────────────┴────────────┘
 
@@ -280,17 +282,16 @@ Grok 的 `usage` 是單一當下的本地 context 估算：vct 會把 `signals.j
 `vct usage` 會**在儀表板中直接顯示 Claude Code、Codex、GitHub Copilot、Cursor 與 Grok 的即時額度用量——完全零設定。** 不需要 status-line hook，也不需要手動輸入憑證：vct 會讀取各 provider 自己的 OAuth 憑證，在背景執行緒呼叫其用量 API，並在你工作時讓面板保持最新。每個進度條都是**已用**百分比，所以進度條滿格代表該額度週期已用盡，而不是還沒開始用。（想要更清爽的儀表板嗎？在 [`config.toml`](#%E8%A8%AD%E5%AE%9A) 中精簡 `[usage.quota]` 下的 `panels`,或設為 `[]` 隱藏所有額度卡片。表格下方那行各 provider 成本是本機掃描資料而不是額度面板,所以不受這裡的設定影響。）
 
 ```
-┌ Claude ──────────────┐┌ Codex ───────────────┐┌ Copilot ─────────────┐┌ Cursor ────────LIMIT ┐┌ Grok ────────────────┐
-│max 20x       just now││plus          just now││individual    just now││free          just now││SuperGrok     just now│
-│5h    ▰▱▱▱▱  13% 1h42m││5h    ▰▰▱▱▱  33% 12m  ││prem  ▰▱▱▱▱   3% 24d0h││total ▰▰▰▰▰  94% 16d0h││week  ▰▰▱▱▱  38% 3d4h │
-│7d    ▰▰▰▱▱  58% 1d23h││7d    ▰▰▱▱▱  36% 1h54m││reqs  ▰▱▱▱▱ 45/1500   ││auto  ▰▰▰▰▰ 100% 16d0h││ondmd $4.20/$50.00    │
-│Fable ▰▰▰▰▱  79% 1d23h││credits 0 · +3 reset  ││                      ││api   ▰▰▰▱▱  44% 16d0h││balance $12.00        │
-│bal - · $0.00 used    ││reset expires 17d0h   ││                      ││                      ││                      │
-└──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘
+  ● Claude                ● Codex                 ● Copilot               ● Cursor         LIMIT  ● Grok
+  max 20x       just now  plus          just now  individual    just now  free          just now  SuperGrok     just now
+  5h    █░░░░  13% 1h42m  5h    ██░░░  33% 12m    prem  █░░░░   3% 24d0h  total █████  94% 16d0h  week  ██░░░  38% 3d4h
+  7d    ███░░  58% 1d23h  7d    ██░░░  36% 1h54m  reqs  █░░░░ 45/1500     auto  █████ 100% 16d0h  ondmd $4.20/$50.00
+  Fable ████░  79% 1d23h  credits 0 · +3 reset                            api   ███░░  44% 16d0h  balance $12.00
+  bal - · $0.00 used      reset expires 17d0h
 ```
 
-- **Claude** — 方案類型、5 小時、每週以及單模型每週用量，來自官方 OAuth 用量 API（`GET /api/oauth/usage`），從 `~/.claude/.credentials.json` 讀取，並顯示額度餘額。約每分鐘輪詢一次以避開該端點的速率限制；觸及上限時標題會出現紅色 `LIMIT` 標記。單模型每週那一行屬於盡力而為，未回傳該範圍時就自動隱藏。
-- **Codex** — 方案類型、可用的 5 小時和每週用量週期、額度餘額以及已取得的可用 reset credit 中最早的到期時間，使用 `~/.codex/auth.json` 從 ChatGPT 後端（`wham/usage` + `wham/rate-limit-reset-credits`）取得（在適用時顯示大致剩餘訊息數 / 消費上限）；API 無法使用時回退到 Codex 工作階段紀錄中最新的 `rate_limits`（標題顯示 `Codex` 或 `Codex (session)`）。
+- **Claude** — 方案類型、5 小時、每週以及單模型每週用量，來自官方 OAuth 用量 API（`GET /api/oauth/usage`），從 `~/.claude/.credentials.json` 讀取，並顯示額度餘額。約每分鐘輪詢一次以避開該端點的速率限制；觸及上限時 provider 名稱那一列會出現紅色 `LIMIT` 標記。單模型每週那一行屬於盡力而為，未回傳該範圍時就自動隱藏。
+- **Codex** — 方案類型、可用的 5 小時和每週用量週期、額度餘額以及已取得的可用 reset credit 中最早的到期時間，使用 `~/.codex/auth.json` 從 ChatGPT 後端（`wham/usage` + `wham/rate-limit-reset-credits`）取得（在適用時顯示大致剩餘訊息數 / 消費上限）；API 無法使用時回退到 Codex 工作階段紀錄中最新的 `rate_limits`（名稱那一列顯示 `Codex` 或 `Codex (session)`）。
 - **Copilot** — 方案類型以及你的 premium 請求額度，以兩個進度條呈現：已用百分比，以及已用 / 總量請求數（例如 `45/1500`），來自 GitHub 的 Copilot API（`GET /copilot_internal/user`），從 `~/.copilot/config.json` 讀取。該請求會模擬 Copilot CLI。token 為長期有效，因此不需要刷新；遇到 `401` / `403` 時會顯示 `run: copilot login` 提示。
 - **Cursor** — 方案類型、total / auto / API **已用**百分比，以及按需消費，來自 cursor.com（`GET /api/usage-summary`），使用 `~/.config/cursor/auth.json` 中的 session token。
 - **Grok** — 方案類型以及目前每週或每月週期的內含額度用量，來自 Grok CLI 自己的計費端點（`GET /v1/billing?format=credits`），從 `~/.grok/auth.json` 讀取。預付餘額只有在不為零時才會顯示；按量計費的消費則在你有過消費、或設定了上限之後才會顯示。該請求會模擬 Grok CLI；遇到 `401` / `403` 時會顯示 `run: grok login` 提示。
@@ -344,22 +345,21 @@ vct analysis --json --daily > today.json
 ### 預覽：互動式儀表板（`vct analysis`）
 
 ```
-┌ Models · 135K lines · 1.80K tool calls · 3 models ───────────────────────────────────────────────────────────────────┐
-│Model                                   Edit Lines  Read Lines  Write Lines Bash    Edit    Read    TodoWrite  Write  █
-│                                                                                                                      █
-│claude-opus-4-8                               12.4K       88.1K       9.02K     412     231     604         96      88█
-│gemini-3.1-pro-preview                        2.10K       14.8K       1.62K      84      44     112         16      15█
-│claude-haiku-4-5-20251001                       840       5.40K         610      31      16      42          6       5█
-│                                                                                                                      █
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌ Providers ───────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│Provider                 Edit Lines  Read Lines  Write Lines  Bash     Edit     Read     TodoWrite   Write    Days    │
-│                                                                                                                      │
-│Claude                   13.2K       93.5K       9.63K        443      247      646      102         93       12      │
-│Gemini                   2.10K       14.8K       1.62K        84       44       112      16          15       3       │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-                 Total Lines: 135K  |  Total Tools: 1.80K  |  Models: 3  |  Memory: 4.8 MB  |  CPU: 0.0%
-                                    ↑/↓ scroll  r refresh  q quit  |  Star on GitHub
+  Analysis   135K lines · 1.80K tool calls · 3 models
+
+  Model                                  Edit Lines  Read Lines  Write Lines Bash    Edit    Read    TodoWrite  Write
+› claude-opus-4-8                              12.4K       88.1K       9.02K     412     231     604         96      88┃
+  gemini-3.1-pro-preview                       2.10K       14.8K       1.62K      84      44     112         16      15┃
+  claude-haiku-4-5-20251001                      840       5.40K         610      31      16      42          6       5┃
+                                                                                                                       │
+  Providers
+
+  Provider                Edit Lines  Read Lines  Write Lines  Bash     Edit     Read     TodoWrite   Write    Days
+  ● Claude                13.2K       93.5K       9.63K        443      247      646      102         93       12
+  ● Gemini                2.10K       14.8K       1.62K        84       44       112      16          15       3
+
+
+  ↑↓ scroll · r refresh · q quit                                                      5.5 MB · CPU 0.0% · Star on GitHub
 ```
 
 ### 預覽：表格與 JSON（`vct analysis`）
