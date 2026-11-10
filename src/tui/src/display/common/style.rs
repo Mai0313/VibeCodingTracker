@@ -6,7 +6,8 @@
 //! one accent, reserved for what the user can act on, and three status colors.
 //! Every color is an ANSI index, which is what makes the terminal's own theme
 //! resolve it; `clippy.toml` denies `Color::Rgb` and `Color::Indexed` so a later
-//! change cannot quietly reintroduce a hard-coded shade.
+//! change cannot quietly reintroduce a hard-coded shade. The sole exception is
+//! [`provider_color`], which says there why a brand color earns it.
 
 use ratatui::style::{Color, Modifier, Style};
 use vct_core::models::Provider;
@@ -72,24 +73,37 @@ pub fn gauge(pct: f64) -> Style {
     }
 }
 
-/// The single per-provider color used anywhere in the TUI.
+/// The single per-provider color used anywhere in the TUI, and the one place
+/// hard-coded RGB is allowed.
 ///
-/// On a line of text it is only ever painted on a provider's `●` marker, never
-/// on its name or its numbers, so the color identifies the row without deciding
+/// On a line of text the color is only ever painted on a provider's `●` marker,
+/// never on its name or its numbers, so it identifies the row without deciding
 /// how it reads. The one other use is the `p` panel's stacked share bar, where
 /// the color *is* the data: each provider's slice of the bar is identified by
 /// nothing else.
+///
+/// Those two are a glyph and a block, not text — they are recognized rather
+/// than read, which is what the rest of this module's ANSI-only rule protects.
+/// Nine ANSI hues on one line are nine colors that were never designed to sit
+/// together; a provider's own brand color both reads as a set and says which
+/// provider it is. What it costs is that these do **not** follow a light
+/// terminal theme, so each one is chosen to stay legible on either background.
+#[allow(clippy::disallowed_methods)]
 pub fn provider_color(provider: Provider) -> Color {
     match provider {
-        Provider::ClaudeCode => Color::Cyan,
-        Provider::Codex => Color::Yellow,
-        Provider::Copilot => Color::Green,
-        Provider::Gemini => Color::LightBlue,
-        Provider::OpenCode => Color::Red,
-        Provider::Cursor => Color::LightMagenta,
-        Provider::Hermes => Color::LightYellow,
-        Provider::Grok => Color::LightRed,
-        Provider::DeepSeek => Color::LightCyan,
+        Provider::ClaudeCode => Color::Rgb(190, 116, 87),
+        Provider::Codex => Color::Rgb(118, 127, 198),
+        Provider::Copilot => Color::Rgb(46, 160, 67),
+        Provider::Gemini => Color::Rgb(66, 133, 244),
+        // OpenCode and Hermes publish no brand color to take: a neutral and a
+        // warm tan hold the slots, far enough from the other seven to tell
+        // apart. Replace them if either ever ships one.
+        Provider::OpenCode => Color::Rgb(159, 159, 159),
+        Provider::Cursor => Color::Rgb(64, 180, 180),
+        Provider::Hermes => Color::Rgb(205, 164, 96),
+        Provider::Grok => Color::Rgb(170, 170, 178),
+        Provider::DeepSeek => Color::Rgb(77, 107, 254),
+        // Not a provider, so not a brand: whatever the terminal calls gray.
         Provider::Unknown => Color::Gray,
     }
 }
