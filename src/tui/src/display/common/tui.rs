@@ -16,9 +16,8 @@ use ratatui::{
     backend::{Backend, CrosstermBackend},
     buffer::Buffer,
     layout::{Constraint, Flex, Layout},
-    style::{Color, Style},
     text::Line,
-    widgets::{Block, Borders, Paragraph, ScrollbarState, TableState},
+    widgets::{Paragraph, ScrollbarState, TableState},
 };
 use std::io::{self, Write};
 use std::sync::Once;
@@ -372,9 +371,8 @@ fn render_loading(frame: &mut Frame, spinner_index: usize, message: &str) {
     ));
     frame.render_widget(
         Paragraph::new(text)
-            .style(Style::default().fg(Color::Cyan))
-            .centered()
-            .block(Block::default().borders(Borders::ALL)),
+            .style(crate::display::common::style::secondary())
+            .centered(),
         middle,
     );
 }
@@ -481,13 +479,13 @@ pub fn overlay_repo_hyperlink(buffer: &Buffer) -> io::Result<()> {
         return Ok(());
     };
 
-    // OSC 8 open (params ; URL, ST-terminated), then cyan + underline to match
+    // OSC 8 open (params ; URL, ST-terminated), then dim + underline to match
     // the label ratatui drew, then reset, then the empty OSC 8 close.
     let mut stdout = io::stdout();
     queue!(stdout, MoveTo(x, y))?;
     write!(
         stdout,
-        "\x1b]8;;{REPO_URL}\x1b\\\x1b[36;4m{REPO_LABEL}\x1b[0m\x1b]8;;\x1b\\"
+        "\x1b]8;;{REPO_URL}\x1b\\\x1b[2;4m{REPO_LABEL}\x1b[0m\x1b]8;;\x1b\\"
     )?;
     stdout.flush()
 }
@@ -837,6 +835,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, mpsc};
+    use sysinfo::System;
 
     struct FakeEventSource {
         events: VecDeque<Event>,
@@ -903,7 +902,8 @@ mod tests {
     fn find_label_start_locates_repo_label_on_bottom_row() {
         let area = Rect::new(0, 0, 120, 1);
         let mut buf = Buffer::empty(area);
-        create_controls(&[("m", " merge  ")], area.width).render(area, &mut buf);
+        let (sys, pid) = (System::new(), sysinfo::Pid::from(0));
+        create_controls(&[("m", "merge")], None, &sys, pid, area.width).render(area, &mut buf);
 
         let (x, y) = find_label_start(&buf).expect("repo label should be present");
         assert_eq!(y, 0);
@@ -919,7 +919,8 @@ mod tests {
         // nothing to hyperlink (and nothing clipped mid-word either).
         let area = Rect::new(0, 0, 40, 1);
         let mut buf = Buffer::empty(area);
-        create_controls(&[], area.width).render(area, &mut buf);
+        let (sys, pid) = (System::new(), sysinfo::Pid::from(0));
+        create_controls(&[], None, &sys, pid, area.width).render(area, &mut buf);
         assert!(find_label_start(&buf).is_none());
 
         let row: String = (0..area.width)

@@ -2,23 +2,24 @@
 //! across both views.
 //!
 //! The builders are pure widget constructors that encode the common styling so
-//! the static-table and TUI renderers stay visually consistent; the summary
-//! bar's process-metrics helpers are the one exception, sampling this process's
-//! own CPU and memory.
+//! the static-table and TUI renderers stay visually consistent; the controls
+//! footer's process-metrics helpers are the one exception, sampling this
+//! process's own CPU and memory.
 //! A recurring convention: the leading label column(s) are left-aligned and
 //! every trailing (numeric) column is right-aligned. The comfy-table helpers
 //! left-align the first two (index 0 and 1); the ratatui `styled_row` helper
 //! takes the number of left-aligned columns as its `left_cols` argument.
 
+use crate::display::common::style;
 use crate::display::common::tui::ScrollState;
 use comfy_table::{Attribute, Cell, CellAlignment, Color, Table, presets::UTF8_FULL};
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color as RatatuiColor, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
-        Block, Borders, Cell as RatatuiCell, Paragraph, Row as RatatuiRow, Scrollbar,
+        Cell as RatatuiCell, HighlightSpacing, Paragraph, Row as RatatuiRow, Scrollbar,
         ScrollbarOrientation, ScrollbarState, Table as RatatuiTable,
     },
 };
@@ -38,11 +39,12 @@ fn normalized_cpu(raw: f32, cores: f32) -> f32 {
 
 /// Refreshes only this process's CPU + memory in `sys` (skipping disk / exe /
 /// tasks), pruning any dead entry. This is the single source of the "our own
-/// process, cheap metrics only" contract shared by every summary-bar refresh —
+/// process, cheap metrics only" contract shared by every footer refresh —
 /// deliberately narrower than sysinfo's default `refresh_processes`. On Linux it
 /// reads this process's stat plus `/proc/stat` for the CPU-time delta (a couple
 /// of small reads), cheap enough to run on a fast metrics tick. `.with_cpu()`
-/// also populates `sys.cpus()`, which `create_summary` uses to normalize CPU%.
+/// also populates `sys.cpus()`, which the footer's own metrics helper uses to
+/// normalize CPU%.
 pub fn refresh_process_metrics(sys: &mut System, pid: sysinfo::Pid) {
     sys.refresh_processes_specifics(
         sysinfo::ProcessesToUpdate::Some(&[pid]),
@@ -53,12 +55,12 @@ pub fn refresh_process_metrics(sys: &mut System, pid: sysinfo::Pid) {
     );
 }
 
-/// One-time init for the summary-bar metrics `System`, called once after
+/// One-time init for the footer's metrics `System`, called once after
 /// `System::new()` before the refresh loop.
 ///
-/// It populates the CPU list (`refresh_cpu_all`) so `create_summary` can read
-/// `sys.cpus().len()` as the CPU% divisor, then primes this process's first
-/// sample. The CPU-list step is **required**: a process-only refresh does not
+/// It populates the CPU list (`refresh_cpu_all`) so the footer's metrics helper
+/// can read `sys.cpus().len()` as the CPU% divisor, then primes this process's
+/// first sample. The CPU-list step is **required**: a process-only refresh does not
 /// initialize `sys.cpus()` on macOS, which would leave the divisor at 1 and
 /// over-report CPU%. The list is stable, so it is never refreshed again — the
 /// per-tick path stays [`refresh_process_metrics`].
@@ -67,79 +69,24 @@ pub fn init_process_metrics(sys: &mut System, pid: sysinfo::Pid) {
     refresh_process_metrics(sys, pid);
 }
 
-/// Separator drawn between summary-bar segments.
-const SUMMARY_SEP: &str = "  |  ";
-
-/// Display width of an ASCII summary fragment (labels / formatted numbers are
+/// Display width of an ASCII footer fragment (labels / formatted numbers are
 /// ASCII, so char count equals column count).
 fn seg_width(s: &str) -> usize {
     s.chars().count()
 }
 
-/// Decides which trailing diagnostic segments fit after the primary items.
-///
-/// `used` is the primary items' width, `available` the content width. Returns
-/// `(show_memory, show_cpu)`: Memory is shown only if it fits, and CPU only if
-/// Memory is also shown and both fit — so on a narrowing bar CPU drops first,
-/// then Memory, and neither is ever clipped mid-word.
-fn fit_diagnostics(
-    used: usize,
-    available: usize,
-    mem_width: usize,
-    cpu_width: usize,
-) -> (bool, bool) {
-    if used + mem_width > available {
-        return (false, false);
-    }
-    (true, used + mem_width + cpu_width <= available)
-}
+/// Separator between footer segments.
+const SEP: &str = " · ";
 
-/// Builds the one-line TUI summary bar from caller-supplied items plus live
-/// memory and CPU readouts.
+/// This process's `97.1 MB · CPU 0.1%` readout for the right of the footer.
 ///
-/// Each `(icon, value, color)` tuple in `summary_items` becomes a colored,
-/// pipe-separated segment; these primary items are always rendered. A
-/// `Memory: <n> MB` and a `CPU: <n>%` segment for the current process `pid` are
-/// then appended **only while they fit** within `width` (the summary rect's
-/// width): on a terminal too narrow for the full line the diagnostic segments
-/// degrade gracefully, dropped whole (CPU first, then Memory) instead of
-/// clipped mid-word. They read `0.0` if `sys` has no entry for `pid`. CPU is
+/// Both numbers read `0.0` if `sys` has no entry for `pid`, and CPU is
 /// normalized to a 0-100% share of the machine. `sys` is expected to have been
 /// refreshed by the caller before this call.
-///
-/// The bar is deliberately unbordered: it carries a single line of text, and a
-/// border around it would cost two more rows of the scrollable table above.
-pub fn create_summary<'a>(
-    summary_items: Vec<(&'a str, &'a str, RatatuiColor)>, // (icon, value, color) tuples
-    sys: &'a System,
-    pid: sysinfo::Pid,
-    width: u16,
-) -> Paragraph<'a> {
-    let available = width as usize;
-
-    let mut spans = Vec::new();
-    let mut used = 0usize;
-
-    // Primary items are always shown (they clip only on an extremely narrow bar).
-    for (i, (icon, value, color)) in summary_items.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw(SUMMARY_SEP));
-            used += seg_width(SUMMARY_SEP);
-        }
-        let label = format!("{} ", icon);
-        used += seg_width(&label) + seg_width(value);
-        spans.push(Span::styled(label, Style::default().fg(*color).bold()));
-        spans.push(Span::styled(*value, Style::default().fg(*color).bold()));
-    }
-
-    // Diagnostic segments for this process. Both are measured up front; how
-    // many actually render is decided by `fit_diagnostics` (CPU drops first).
+fn process_metrics(sys: &System, pid: sysinfo::Pid) -> String {
     let memory_mb = sys
         .process(pid)
         .map_or(0.0, |p| p.memory() as f64 / 1024.0 / 1024.0);
-    let mem_value = format!("{:.1} MB", memory_mb);
-    let mem_width = seg_width(SUMMARY_SEP) + seg_width("Memory: ") + seg_width(&mem_value);
-
     // CPU normalized to a 0-100% machine share. Divide by `sys.cpus().len()`
     // (sysinfo's own basis, populated by `init_process_metrics`); `.max(1)`
     // guards the empty-CPU-list case.
@@ -147,34 +94,7 @@ pub fn create_summary<'a>(
     let cpu_percent = sys
         .process(pid)
         .map_or(0.0, |p| normalized_cpu(p.cpu_usage(), cores));
-    let cpu_value = format!("{:.1}%", cpu_percent);
-    let cpu_width = seg_width(SUMMARY_SEP) + seg_width("CPU: ") + seg_width(&cpu_value);
-
-    let (show_mem, show_cpu) = fit_diagnostics(used, available, mem_width, cpu_width);
-    if show_mem {
-        spans.push(Span::raw(SUMMARY_SEP));
-        spans.push(Span::styled(
-            "Memory: ",
-            Style::default().fg(RatatuiColor::LightRed).bold(),
-        ));
-        spans.push(Span::styled(
-            mem_value,
-            Style::default().fg(RatatuiColor::LightYellow).bold(),
-        ));
-    }
-    if show_cpu {
-        spans.push(Span::raw(SUMMARY_SEP));
-        spans.push(Span::styled(
-            "CPU: ",
-            Style::default().fg(RatatuiColor::LightRed).bold(),
-        ));
-        spans.push(Span::styled(
-            cpu_value,
-            Style::default().fg(RatatuiColor::LightYellow).bold(),
-        ));
-    }
-
-    Paragraph::new(vec![Line::from(spans)]).centered()
+    format!("{memory_mb:.1} MB · CPU {cpu_percent:.1}%")
 }
 
 /// Short call-to-action shown in the footer (also the OSC 8 hyperlink text).
@@ -182,95 +102,146 @@ pub const REPO_LABEL: &str = "Star on GitHub";
 /// URL the footer's repository label points at when clicked.
 pub const REPO_URL: &str = "https://github.com/Mai0313/VibeCodingTracker";
 
-/// Builds the single-line key-hint footer (navigation + the GitHub repo link).
+/// Builds the single footer row: key hints on the left, this process's metrics
+/// and the GitHub repo link on the right.
 ///
-/// Everything is on one line to save vertical space. `extra` inserts
-/// view-specific `(key, label)` hints just before `r refresh`. This is the
-/// no-status shorthand for [`create_controls_with_status`]. The repo label is
-/// drawn as plain (underlined) text here; a terminal hyperlink is layered on
-/// afterward by
+/// `extra` inserts view-specific `(key, label)` hints just before `r refresh`,
+/// and `status` carries a transient refresh state. Keys are bold and their
+/// descriptions dim, so the row reads as one band of secondary text with the
+/// pressable characters standing out.
+///
+/// Segments are dropped whole rather than clipped mid-word when they do not fit
+/// `width`, in this order: the repo label, the process metrics, the
+/// view-specific `extra` hints from the right, the status, then scrolling and
+/// refresh. `q quit` always survives — a footer that cannot say how to quit is
+/// worse than one that says less.
+///
+/// The repo label is drawn as plain (dim, underlined) text here; a terminal
+/// hyperlink is layered on afterward by
 /// [`overlay_repo_hyperlink`](super::tui::overlay_repo_hyperlink).
-pub fn create_controls(extra: &[(&str, &str)], width: u16) -> Paragraph<'static> {
-    create_controls_with_status(extra, None, width)
-}
-
-/// Builds the controls footer with an optional transient refresh status.
-///
-/// Hints are dropped whole rather than clipped mid-word when they do not fit
-/// `width`, in this order: the repo label, then the view-specific `extra` hints
-/// from the right, then the status. Scrolling, refresh and quit always survive —
-/// a footer that cannot say how to quit is worse than one that says less.
-pub fn create_controls_with_status(
+pub fn create_controls(
     extra: &[(&str, &str)],
     status: Option<&str>,
+    sys: &System,
+    pid: sysinfo::Pid,
     width: u16,
 ) -> Paragraph<'static> {
-    let key = Style::default().fg(RatatuiColor::Cyan).bold();
-    let dim = Style::default().fg(RatatuiColor::DarkGray);
+    let key = style::strong();
+    let dim = style::secondary();
     let available = width as usize;
+    let metrics = process_metrics(sys, pid);
 
-    // Width of every part; which of them survive is decided below.
-    let core = seg_width("↑/↓ scroll  r refresh  q quit");
-    let repo = seg_width("  |  ") + seg_width(REPO_LABEL);
-    let status_w = status.map_or(0, |s| seg_width("  |  ") + seg_width(s));
-    let extra_w: Vec<usize> = extra
-        .iter()
-        .map(|(k, label)| seg_width(k) + seg_width(label))
-        .collect();
+    // Width of every part; which of them survive is decided below. The core is
+    // the two indent columns plus the one hint that never drops.
+    let hint_w = |k: &str, label: &str| seg_width(SEP) + seg_width(k) + 1 + seg_width(label);
+    let core = 2 + seg_width("q quit");
+    let repo = seg_width(SEP) + seg_width(REPO_LABEL);
+    let metrics_w = seg_width(SEP) + seg_width(&metrics);
+    let status_w = status.map_or(0, |s| seg_width(SEP) + seg_width(s));
+    let scroll_w = hint_w("↑↓", "scroll");
+    let refresh_w = hint_w("r", "refresh");
+    let extra_w: Vec<usize> = extra.iter().map(|(k, label)| hint_w(k, label)).collect();
 
-    // Drop from the cheapest end until what is left fits.
+    // Give up one thing at a time, cheapest first, until what is left fits.
+    // `q quit` is not on the list, so the loop always terminates with it shown.
     let mut shown_extra = extra.len();
     let mut show_status = status.is_some();
+    let mut show_metrics = true;
     let mut show_repo = true;
-    let used = |shown: usize, status: bool, repo_shown: bool| {
-        core + extra_w[..shown].iter().sum::<usize>()
-            + if status { status_w } else { 0 }
-            + if repo_shown { repo } else { 0 }
-    };
-    if used(shown_extra, show_status, show_repo) > available {
-        show_repo = false;
-    }
-    while shown_extra > 0 && used(shown_extra, show_status, show_repo) > available {
-        shown_extra -= 1;
-    }
-    if used(shown_extra, show_status, show_repo) > available {
-        show_status = false;
+    let mut show_scroll = true;
+    let mut show_refresh = true;
+    loop {
+        let used = core
+            + extra_w[..shown_extra].iter().sum::<usize>()
+            + if show_status { status_w } else { 0 }
+            + if show_metrics { metrics_w } else { 0 }
+            + if show_repo { repo } else { 0 }
+            + if show_scroll { scroll_w } else { 0 }
+            + if show_refresh { refresh_w } else { 0 };
+        if used <= available {
+            break;
+        }
+        if show_repo {
+            show_repo = false;
+        } else if show_metrics {
+            show_metrics = false;
+        } else if shown_extra > 0 {
+            shown_extra -= 1;
+        } else if show_status {
+            show_status = false;
+        } else if show_scroll {
+            show_scroll = false;
+        } else if show_refresh {
+            show_refresh = false;
+        } else {
+            break;
+        }
     }
 
-    let mut spans = vec![Span::styled("↑/↓", key), Span::styled(" scroll  ", dim)];
-    for (k, label) in &extra[..shown_extra] {
+    // Left half: the keys. The indent is already there, so the separator goes
+    // in front of every hint but the first.
+    let mut left = vec![Span::raw("  ")];
+    let hint = |spans: &mut Vec<Span<'static>>, k: &str, label: &str| {
+        if spans.len() > 1 {
+            spans.push(Span::styled(SEP, dim));
+        }
         spans.push(Span::styled(k.to_string(), key));
-        spans.push(Span::styled(label.to_string(), dim));
+        spans.push(Span::styled(format!(" {label}"), dim));
+    };
+    if show_scroll {
+        hint(&mut left, "↑↓", "scroll");
     }
-    spans.push(Span::styled("r", key));
-    spans.push(Span::styled(" refresh  ", dim));
-    spans.push(Span::styled(
-        "q",
-        Style::default().fg(RatatuiColor::Red).bold(),
-    ));
-    spans.push(Span::styled(" quit", dim));
+    for (k, label) in &extra[..shown_extra] {
+        hint(&mut left, k, label);
+    }
+    if show_refresh {
+        hint(&mut left, "r", "refresh");
+    }
+    hint(&mut left, "q", "quit");
     if show_status && let Some(status) = status {
-        spans.push(Span::styled("  |  ", dim));
-        spans.push(Span::styled(
-            status.to_string(),
-            Style::default().fg(RatatuiColor::Yellow).bold(),
-        ));
+        left.push(Span::styled(SEP, dim));
+        left.push(Span::styled(status.to_string(), style::attention()));
+    }
+
+    // Right half: what the footer reports rather than what it offers.
+    let mut right: Vec<Span<'static>> = Vec::new();
+    if show_metrics {
+        right.push(Span::styled(metrics, dim));
     }
     if show_repo {
-        spans.push(Span::styled("  |  ", dim));
-        spans.push(Span::styled(
+        if !right.is_empty() {
+            right.push(Span::styled(SEP, dim));
+        }
+        right.push(Span::styled(
             REPO_LABEL,
-            Style::default().fg(RatatuiColor::Cyan).underlined(),
+            dim.add_modifier(Modifier::UNDERLINED),
         ));
     }
-    Paragraph::new(vec![Line::from(spans)]).centered()
+
+    // Push the right half flush to the edge. Both halves were fitted above, so
+    // the gap is never negative and nothing has to be clipped here.
+    let mut spans = left;
+    if !right.is_empty() {
+        let used: usize = spans
+            .iter()
+            .chain(right.iter())
+            .map(|s| seg_width(s.content.as_ref()))
+            .sum();
+        spans.push(Span::raw(" ".repeat(available.saturating_sub(used))));
+        spans.extend(right);
+    }
+    Paragraph::new(vec![Line::from(spans)])
 }
 
-/// Rows the scrollable content pane is never squeezed below. The block border,
-/// header row and header margin eat 4, so this keeps ~2 body rows alive.
+/// Rows the scrollable content pane is never squeezed below. The title, its
+/// blank row and the header row eat 3, so this keeps ~3 body rows alive.
 pub const CONTENT_MIN_H: u16 = 6;
-/// Rows the frame always spends below the content: summary + controls.
+/// Rows the frame always spends below the content: a blank spacer + controls.
 pub const FOOTER_H: u16 = 2;
+/// Columns a scrollable table spends beside its own cells: two for the
+/// selection marker's gutter, one for the scrollbar. Callers fit their columns
+/// into the content width less this.
+pub const TABLE_SIDE_W: u16 = 3;
 
 /// Chunk rects for an interactive frame.
 pub struct FrameChunks {
@@ -278,8 +249,6 @@ pub struct FrameChunks {
     pub content: Rect,
     /// Full-width band under the content, present only when one was asked for.
     pub band: Option<Rect>,
-    /// Single-line summary area.
-    pub summary: Rect,
     /// Single-line controls footer area.
     pub controls: Rect,
 }
@@ -287,7 +256,9 @@ pub struct FrameChunks {
 /// Splits `area` into the standard interactive-view regions.
 ///
 /// The content pane absorbs all leftover height, then an optional
-/// `band_height`-row band, then one row each of summary and controls. Every
+/// `band_height`-row band, then a blank spacer row and the controls footer. The
+/// spacer is the only region nothing is drawn into: with no borders anywhere,
+/// one empty row is what separates the footer from the band above it. Every
 /// region spans the full width: a view that wants to show more than its table
 /// spends rows on a band, never columns on a side pane, so the table's own
 /// columns are never the thing that pays for it.
@@ -313,13 +284,12 @@ pub fn frame_layout(area: Rect, band_height: u16) -> FrameChunks {
     };
     let content = take();
     let band = (band_height > 0).then(&mut take);
-    let summary = take();
+    let _spacer = take();
     let controls = take();
 
     FrameChunks {
         content,
         band,
-        summary,
         controls,
     }
 }
@@ -368,22 +338,51 @@ pub fn fit_columns(specs: &[ColumnSpec], inner: u16, name_min_w: u16) -> (Vec<us
     (kept, dropped)
 }
 
-/// Border, title and drop-notice for a scrollable table.
+/// Title and drop-notice for a scrollable table.
 pub struct TableChrome<'a> {
-    /// Left-aligned title; carries the totals for the rows underneath.
-    pub title: &'a str,
+    /// Left-aligned title line; carries the totals for the rows underneath.
+    pub title: Line<'a>,
     /// Right-aligned notice naming what the table had to leave out.
     pub note: Option<String>,
-    /// Border color.
-    pub border_color: RatatuiColor,
+}
+
+/// Lays `left` out with `right` pushed flush to the far edge of `width`.
+///
+/// Both sides are the caller's already-styled spans and the gap between them is
+/// plain padding, so a right-aligned marker shares a row with the text on the
+/// left instead of costing a row of its own. `right` gives way when the two
+/// cannot both fit, since every caller puts the shortening-resistant half there.
+pub fn spread<'a>(left: Vec<Span<'a>>, right: Vec<Span<'a>>, width: u16) -> Line<'a> {
+    let used: usize = left
+        .iter()
+        .chain(right.iter())
+        .map(|s| seg_width(s.content.as_ref()))
+        .sum();
+    let mut spans = left;
+    spans.push(Span::raw(
+        " ".repeat(usize::from(width).saturating_sub(used)),
+    ));
+    spans.extend(right);
+    Line::from(spans)
+}
+
+/// True for a numeric cell that holds no quantity: `0`, `$0.00`, `0.0%`, blank.
+///
+/// Tested by looking for a significant digit rather than by parsing, which
+/// covers every formatted shape the views produce (compact counts, money,
+/// percentages) without each one having to say so.
+fn is_zero_value(text: &str) -> bool {
+    !text.chars().any(|c| ('1'..='9').contains(&c))
 }
 
 /// Builds a table row with the first `left_cols` cells left-aligned and the
-/// rest right-aligned, painted with `style`.
+/// rest right-aligned, painted with `row_style`.
 ///
 /// Right-aligning the numeric columns keeps variable-width compact values
-/// (`1.23M`, `999K`) flush instead of ragged.
-pub fn styled_row(cells: Vec<String>, style: Style, left_cols: usize) -> RatatuiRow<'static> {
+/// (`1.23M`, `999K`) flush instead of ragged. A numeric cell holding nothing but
+/// zeros is dimmed on top of `row_style`, so a table of mostly-idle models reads
+/// as the few numbers that carry a value.
+pub fn styled_row(cells: Vec<String>, row_style: Style, left_cols: usize) -> RatatuiRow<'static> {
     let cells: Vec<RatatuiCell> = cells
         .into_iter()
         .enumerate()
@@ -393,18 +392,28 @@ pub fn styled_row(cells: Vec<String>, style: Style, left_cols: usize) -> Ratatui
             } else {
                 Alignment::Right
             };
-            RatatuiCell::from(Text::from(s).alignment(align))
+            let zero = i >= left_cols && is_zero_value(&s);
+            let cell = RatatuiCell::from(Text::from(s).alignment(align));
+            if zero {
+                cell.style(style::secondary())
+            } else {
+                cell
+            }
         })
         .collect();
-    RatatuiRow::new(cells).style(style)
+    RatatuiRow::new(cells).style(row_style)
 }
 
 /// Renders a scrollable, selectable table plus a side scrollbar into `area`.
 ///
-/// `rows` are the already-styled body rows (highlight / TOTAL styling applied by
-/// the caller); `row_count` is the total displayed row count used to size the
-/// scrollbar. The block border + header + header margin consume 4 rows, so the
-/// visible body height is `area.height - 4`.
+/// The table has no border: the title takes the first row, a blank row follows,
+/// and the rest is the table itself, so the visible body height is
+/// `area.height - 3`. Alignment and whitespace divide the regions instead of
+/// box-drawing characters.
+///
+/// `rows` are the already-styled body rows (change highlighting applied by the
+/// caller); `row_count` is the total displayed row count used to size the
+/// scrollbar.
 #[allow(clippy::too_many_arguments)]
 pub fn render_scrollable_table(
     f: &mut Frame,
@@ -416,36 +425,43 @@ pub fn render_scrollable_table(
     row_count: usize,
     scroll: &mut ScrollState,
 ) {
-    let viewport = area.height.saturating_sub(4);
+    let title = match chrome.note {
+        Some(note) => spread(
+            chrome.title.spans,
+            vec![Span::styled(note, style::secondary())],
+            area.width,
+        ),
+        None => chrome.title,
+    };
+    f.render_widget(Paragraph::new(title), Rect { height: 1, ..area });
 
-    let mut block = Block::default()
-        .borders(Borders::ALL)
-        .title(Line::from(format!(" {} ", chrome.title)))
-        .border_style(Style::default().fg(chrome.border_color));
-    if let Some(note) = chrome.note {
-        block = block.title(
-            Line::from(Span::styled(
-                format!(" {note} "),
-                Style::default().fg(RatatuiColor::DarkGray),
-            ))
-            .right_aligned(),
-        );
-    }
+    // The title and its blank row sit above the table; the header is then the
+    // only thing marking where the data starts.
+    let rows_area = Rect {
+        y: area.y + 2,
+        height: area.height.saturating_sub(2),
+        ..area
+    };
+    let viewport = rows_area.height.saturating_sub(1);
 
-    // Selection is shown purely by the row color (no leading symbol / gutter).
-    let table = create_ratatui_table(rows, header, widths, chrome.border_color)
-        .block(block)
-        .row_highlight_style(
-            Style::default()
-                .fg(RatatuiColor::Black)
-                .bg(RatatuiColor::Cyan)
-                .add_modifier(Modifier::BOLD),
-        );
+    // The scrollbar owns the last column, so the table is drawn one column
+    // narrower than the pane. Together with the two-column selection gutter
+    // that is `TABLE_SIDE_W`, which the caller fitted its columns into.
+    let table = create_ratatui_table(rows, header, widths)
+        .row_highlight_style(style::strong())
+        .highlight_symbol(Span::styled("› ", style::accent()))
+        .highlight_spacing(HighlightSpacing::Always);
+    f.render_stateful_widget(
+        table,
+        Rect {
+            width: rows_area.width.saturating_sub(1),
+            ..rows_area
+        },
+        &mut scroll.table,
+    );
 
-    f.render_stateful_widget(table, area, &mut scroll.table);
-
-    // Scrollbar driven by the selected index, inset by one row so it sits
-    // between the block's top/bottom borders instead of over the corners.
+    // Scrollbar driven by the selected index, inset by the header row so it
+    // runs beside the body and nothing else.
     let selected = scroll.table.selected().unwrap_or(0);
     scroll.scrollbar = ScrollbarState::new(row_count)
         .viewport_content_length(viewport as usize)
@@ -453,11 +469,16 @@ pub fn render_scrollable_table(
     f.render_stateful_widget(
         Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
-            .end_symbol(None),
-        area.inner(Margin {
-            vertical: 1,
-            horizontal: 0,
-        }),
+            .end_symbol(None)
+            .thumb_symbol("┃")
+            .track_symbol(Some("│"))
+            .thumb_style(style::secondary())
+            .track_style(style::secondary()),
+        Rect {
+            y: rows_area.y + 1,
+            height: viewport,
+            ..rows_area
+        },
         &mut scroll.scrollbar,
     );
 }
@@ -469,62 +490,39 @@ pub fn render_scrollable_table(
 pub fn render_too_small(f: &mut Frame, min_w: u16, min_h: u16) {
     let area = f.area();
     let para = Paragraph::new(vec![
-        Line::from(Span::styled(
-            "Terminal too small",
-            Style::default().fg(RatatuiColor::Red).bold(),
-        )),
+        Line::from(Span::styled("Terminal too small", style::alert())),
         Line::from(Span::styled(
             format!(
                 "resize to at least {min_w} x {min_h}  (now {} x {})",
                 area.width, area.height
             ),
-            Style::default().fg(RatatuiColor::Gray),
+            style::secondary(),
         )),
     ])
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(RatatuiColor::Red)),
-    )
     .alignment(Alignment::Center);
 
     let v = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(0),
-            Constraint::Length(4),
+            Constraint::Length(2),
             Constraint::Min(0),
         ])
         .split(area);
     f.render_widget(para, v[1]);
 }
 
-/// Builds a ratatui [`Table`](RatatuiTable) with the standard header and border styling.
+/// Builds a borderless ratatui [`Table`](RatatuiTable) with the standard header
+/// styling.
 ///
-/// `widths` sets the per-column constraints; the header row is rendered black-on-green
-/// and bold with a one-line bottom margin.
+/// `widths` sets the per-column constraints; the header row is dimmed and sits
+/// directly on top of the body, carrying no visual weight of its own.
 pub fn create_ratatui_table<'a>(
     rows: Vec<RatatuiRow<'a>>,
     header: Vec<&'a str>,
     widths: &'a [Constraint],
-    border_color: RatatuiColor,
 ) -> RatatuiTable<'a> {
-    RatatuiTable::new(rows, widths)
-        .header(
-            RatatuiRow::new(header)
-                .style(
-                    Style::default()
-                        .fg(RatatuiColor::Black)
-                        .bg(RatatuiColor::Green)
-                        .bold(),
-                )
-                .bottom_margin(1),
-        )
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border_color)),
-        )
+    RatatuiTable::new(rows, widths).header(RatatuiRow::new(header).style(style::secondary()))
 }
 
 /// Builds an empty comfy [`Table`] with a colored, UTF-8-bordered header row.
@@ -591,27 +589,50 @@ pub fn create_metric_cell(value: String, color: Color, emphasize: bool) -> Cell 
     cell
 }
 
-/// Builds a ratatui [`Row`](RatatuiRow) styled in `color`, bolded when `emphasize`.
+/// Builds a ratatui [`Row`](RatatuiRow) for one provider, marked with a `●` in
+/// `color` and bolded when `emphasize`.
+///
+/// The marker is the only colored thing on the row: the name and the numbers
+/// stay in the terminal's own foreground, so nine providers in a column read as
+/// one table rather than as nine kinds of text.
 pub fn create_provider_row<'a>(
     cells: Vec<String>,
     color: RatatuiColor,
     emphasize: bool,
 ) -> RatatuiRow<'a> {
     let style = if emphasize {
-        Style::default().fg(color).add_modifier(Modifier::BOLD)
+        style::strong()
     } else {
-        Style::default().fg(color)
+        style::primary()
     };
 
-    RatatuiRow::new(cells).style(style)
+    let mut cells = cells.into_iter();
+    let label = cells.next().unwrap_or_default();
+    let first = RatatuiCell::from(Line::from(vec![
+        Span::styled("● ", Style::default().fg(color)),
+        Span::raw(label),
+    ]));
+    RatatuiRow::new(
+        std::iter::once(first)
+            .chain(cells.map(RatatuiCell::from))
+            .collect::<Vec<_>>(),
+    )
+    .style(style)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTENT_MIN_H, ColumnSpec, FOOTER_H, Rect, create_controls_with_status, fit_columns,
-        fit_diagnostics, frame_layout, normalized_cpu,
+        CONTENT_MIN_H, ColumnSpec, FOOTER_H, Rect, create_controls, fit_columns, frame_layout,
+        normalized_cpu,
     };
+    use sysinfo::{Pid, System};
+
+    /// A metrics source with no entry for the pid, so both readouts are `0.0`
+    /// and no test depends on this machine's load.
+    fn no_metrics() -> (System, Pid) {
+        (System::new(), Pid::from(0))
+    }
 
     #[test]
     fn frame_gives_every_leftover_row_to_the_content_pane() {
@@ -619,7 +640,6 @@ mod tests {
         let c = frame_layout(area, 0);
         assert_eq!(c.content.height, 40 - FOOTER_H);
         assert!(c.band.is_none());
-        assert_eq!(c.summary.height, 1);
         assert_eq!(c.controls.height, 1);
         assert_eq!(c.controls.y, 39);
 
@@ -636,7 +656,6 @@ mod tests {
             let c = frame_layout(Rect::new(0, 0, width, 40), 6);
             assert_eq!(c.content.width, width);
             assert_eq!(c.band.expect("band requested").width, width);
-            assert_eq!(c.summary.width, width);
             assert_eq!(c.controls.width, width);
         }
     }
@@ -683,7 +702,6 @@ mod tests {
         // first; the content pane never drops below its minimum.
         let c = frame_layout(Rect::new(0, 0, 120, CONTENT_MIN_H + FOOTER_H), 0);
         assert_eq!(c.content.height, CONTENT_MIN_H);
-        assert_eq!(c.summary.height, 1);
         assert_eq!(c.controls.height, 1);
     }
 
@@ -698,14 +716,17 @@ mod tests {
     }
 
     #[test]
-    fn controls_drop_hints_whole_and_always_keep_quit() {
+    fn controls_drop_segments_whole_and_always_keep_quit() {
         use ratatui::widgets::Widget;
+        let (sys, pid) = no_metrics();
         let render = |width: u16| {
             let area = Rect::new(0, 0, width, 1);
             let mut buf = ratatui::buffer::Buffer::empty(area);
-            create_controls_with_status(
-                &[("m", " merge  "), ("p", " panes  "), ("Q", " quota  ")],
+            create_controls(
+                &[("m", "merge"), ("p", "providers"), ("Q", "quota")],
                 None,
+                &sys,
+                pid,
                 width,
             )
             .render(area, &mut buf);
@@ -714,12 +735,18 @@ mod tests {
                 .collect::<String>()
         };
 
-        // Wide: everything, including the repo label.
+        // Wide: everything, including the metrics and the repo label.
         let wide = render(120);
-        assert!(wide.contains("Star on GitHub") && wide.contains("Q quota"));
+        assert!(wide.contains("Star on GitHub"), "got {wide:?}");
+        assert!(
+            wide.contains("Q quota") && wide.contains("CPU 0.0%"),
+            "got {wide:?}"
+        );
+        // The repo label is pushed flush to the right edge.
+        assert!(wide.trim_end().ends_with("Star on GitHub"), "got {wide:?}");
 
         // The hard minimum terminal width. The repo label goes first, then the
-        // extras from the right, and nothing is left half-drawn.
+        // metrics, then the extras from the right, and nothing is half-drawn.
         let min = render(74);
         assert!(!min.contains("Star"), "got {min:?}");
         assert!(min.contains("q quit"), "got {min:?}");
@@ -727,26 +754,78 @@ mod tests {
 
         // Absurdly narrow: the keys that still fit are whole words.
         let tiny = render(30);
-        assert!(!tiny.contains("Star"), "got {tiny:?}");
+        assert!(
+            !tiny.contains("Star") && !tiny.contains("MB"),
+            "got {tiny:?}"
+        );
         assert!(!tiny.contains("quota"), "got {tiny:?}");
         assert!(tiny.contains("quit"), "got {tiny:?}");
     }
 
     #[test]
-    fn fit_diagnostics_drops_cpu_before_memory() {
-        let (mem, cpu) = (20usize, 15usize); // realistic segment widths
-        let used = 56; // primary items
+    fn a_numeric_cell_of_only_zeros_is_dimmed() {
+        use ratatui::style::Modifier;
+        use ratatui::widgets::{Table, Widget};
 
-        // Wide bar: both fit.
-        assert_eq!(fit_diagnostics(used, 91, mem, cpu), (true, true));
-        // Exactly enough for Memory but not CPU (the common ~80-col case).
-        assert_eq!(fit_diagnostics(used, used + mem, mem, cpu), (true, false));
-        assert_eq!(fit_diagnostics(used, 78, mem, cpu), (true, false));
-        // Too narrow even for Memory: both drop, never a lone CPU.
-        assert_eq!(
-            fit_diagnostics(used, used + mem - 1, mem, cpu),
-            (false, false)
+        let area = Rect::new(0, 0, 24, 1);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        let row = super::styled_row(
+            vec![
+                "model".to_string(),
+                "$0.00".to_string(),
+                "$0.01".to_string(),
+            ],
+            super::Style::default(),
+            1,
         );
-        assert_eq!(fit_diagnostics(used, 60, mem, cpu), (false, false));
+        Table::new(
+            vec![row],
+            [
+                super::Constraint::Length(8),
+                super::Constraint::Length(6),
+                super::Constraint::Length(6),
+            ],
+        )
+        .render(area, &mut buf);
+
+        let dim_at = |x: u16| {
+            buf.cell((x, 0))
+                .unwrap()
+                .style()
+                .add_modifier
+                .contains(Modifier::DIM)
+        };
+        let row: String = (0..24)
+            .map(|x| buf.cell((x, 0)).unwrap().symbol())
+            .collect();
+        let zero_at = row.find("$0.00").expect("zero cell drawn") as u16;
+        let paid_at = row.find("$0.01").expect("paid cell drawn") as u16;
+
+        // The cell that holds nothing is the one that recedes; a cent is a
+        // quantity and reads at full weight.
+        assert!((0..5).all(|i| dim_at(zero_at + i)), "got {row:?}");
+        assert!((0..5).all(|i| !dim_at(paid_at + i)), "got {row:?}");
+        // The label column is never dimmed, whatever it says.
+        assert!(!dim_at(0), "got {row:?}");
+    }
+
+    #[test]
+    fn controls_give_up_the_repo_label_before_the_metrics() {
+        use ratatui::widgets::Widget;
+        let (sys, pid) = no_metrics();
+        let render = |width: u16| {
+            let area = Rect::new(0, 0, width, 1);
+            let mut buf = ratatui::buffer::Buffer::empty(area);
+            create_controls(&[], None, &sys, pid, width).render(area, &mut buf);
+            (0..width)
+                .map(|x| buf.cell((x, 0)).unwrap().symbol())
+                .collect::<String>()
+        };
+
+        // Just too narrow for both: the metrics are this process's own health,
+        // the label is an invitation, so the label is the one that goes.
+        let row = render(62);
+        assert!(row.contains("CPU 0.0%"), "got {row:?}");
+        assert!(!row.contains("Star"), "got {row:?}");
     }
 }

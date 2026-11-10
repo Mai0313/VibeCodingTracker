@@ -1,0 +1,6 @@
+disallowed-methods = [
+    { path = "ratatui::style::Color::Rgb", reason = "Use ANSI colors, which follow the terminal's own theme; see the TUI styling rules in AGENTS.md." },
+    { path = "ratatui::style::Color::Indexed", reason = "Use ANSI colors, which follow the terminal's own theme; see the TUI styling rules in AGENTS.md." },
+    { path = "ratatui::style::Stylize::white", reason = "Hardcoding white loses the terminal's own foreground; prefer the default plus dim/bold." },
+    { path = "ratatui::style::Stylize::black", reason = "Hardcoding black loses the terminal's own foreground; prefer the default plus dim/bold." },
+]

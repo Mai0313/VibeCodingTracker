@@ -1,5 +1,6 @@
 //! Display styling for a single provider row (label + per-renderer colors).
 
+use crate::display::common::style::provider_color;
 use comfy_table::Color as TableColor;
 use ratatui::style::Color as RatatuiColor;
 use vct_core::models::Provider;
@@ -14,7 +15,7 @@ use vct_core::models::Provider;
 pub struct ProviderTotal<'a, T> {
     /// Human-readable provider name shown in the row.
     pub label: &'static str,
-    /// Foreground color used when rendering this row in the TUI.
+    /// Color of this provider's `●` marker in the TUI.
     pub tui_color: RatatuiColor,
     /// Foreground color used when rendering this row in a static table.
     pub table_color: TableColor,
@@ -27,62 +28,28 @@ pub struct ProviderTotal<'a, T> {
 impl<'a, T> ProviderTotal<'a, T> {
     /// Creates a per-provider total row with the provider's canonical label and colors.
     ///
-    /// The label comes from [`Provider::display_name`] and each provider maps to
-    /// a fixed color pair (e.g. Claude → cyan, Codex → yellow). The caller
-    /// chooses whether to `emphasize` (bold) the row.
+    /// The label comes from [`Provider::display_name`]. The TUI color is the
+    /// shared [`provider_color`] map — the one the whole TUI uses — while the
+    /// static table keeps its own, because comfy-table paints a whole cell
+    /// rather than a marker. The caller chooses whether to `emphasize` (bold)
+    /// the row.
     pub fn new(provider: Provider, stats: &'a T, emphasize: bool) -> Self {
-        let (label, tui_color, table_color) = match provider {
-            Provider::ClaudeCode => (
-                Provider::ClaudeCode.display_name(),
-                RatatuiColor::Cyan,
-                TableColor::Cyan,
-            ),
-            Provider::Codex => (
-                Provider::Codex.display_name(),
-                RatatuiColor::Yellow,
-                TableColor::Yellow,
-            ),
-            Provider::Copilot => (
-                Provider::Copilot.display_name(),
-                RatatuiColor::Green,
-                TableColor::Green,
-            ),
-            Provider::Gemini => (
-                Provider::Gemini.display_name(),
-                RatatuiColor::LightBlue,
-                TableColor::Blue,
-            ),
-            Provider::OpenCode => (
-                Provider::OpenCode.display_name(),
-                RatatuiColor::Red,
-                TableColor::Red,
-            ),
-            Provider::Cursor => (
-                Provider::Cursor.display_name(),
-                RatatuiColor::LightMagenta,
-                TableColor::DarkMagenta,
-            ),
-            Provider::Hermes => (
-                Provider::Hermes.display_name(),
-                RatatuiColor::LightYellow,
-                TableColor::DarkYellow,
-            ),
-            Provider::Grok => (
-                Provider::Grok.display_name(),
-                RatatuiColor::LightRed,
-                TableColor::DarkRed,
-            ),
-            Provider::DeepSeek => (
-                Provider::DeepSeek.display_name(),
-                RatatuiColor::LightCyan,
-                TableColor::DarkCyan,
-            ),
-            Provider::Unknown => ("Unknown", RatatuiColor::Gray, TableColor::Grey),
+        let table_color = match provider {
+            Provider::ClaudeCode => TableColor::Cyan,
+            Provider::Codex => TableColor::Yellow,
+            Provider::Copilot => TableColor::Green,
+            Provider::Gemini => TableColor::Blue,
+            Provider::OpenCode => TableColor::Red,
+            Provider::Cursor => TableColor::DarkMagenta,
+            Provider::Hermes => TableColor::DarkYellow,
+            Provider::Grok => TableColor::DarkRed,
+            Provider::DeepSeek => TableColor::DarkCyan,
+            Provider::Unknown => TableColor::Grey,
         };
 
         Self {
-            label,
-            tui_color,
+            label: provider.display_name(),
+            tui_color: provider_color(provider),
             table_color,
             stats,
             emphasize,
