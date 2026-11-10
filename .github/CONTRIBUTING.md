@@ -91,7 +91,7 @@ The repository is a Cargo workspace: all the Rust code lives in the four members
 
 Crates depend one way only — `vct-core` → `vct-tui` → `vct-cli` — so core never reaches into display or CLI code, and a future GUI can hang off core alone. Unit tests live inline in each crate's `src/`, integration tests under the owning crate's `tests/` directory; the root `tests/` holds fixtures only.
 
-For the module-by-module breakdown inside each crate, see the **Architecture** section of [`CLAUDE.md`](../CLAUDE.md).
+For the module-by-module breakdown inside each crate, see the **Architecture** section of [`AGENTS.md`](../AGENTS.md).
 
 #### Building from Source
 
