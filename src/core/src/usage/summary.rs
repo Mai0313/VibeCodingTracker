@@ -144,7 +144,7 @@ pub type UsageProviderTotals = crate::models::ProviderTotals<ProviderStats>;
 /// Fully priced usage view shared by every output mode.
 #[derive(Default)]
 pub struct UsageSummary {
-    /// Per-model rows, sorted by ascending cost (model name as tie-break).
+    /// Per-model rows, sorted by descending cost (model name as tie-break).
     pub rows: Vec<UsageRow>,
     /// Column-wise totals across all rows.
     pub totals: UsageTotals,
@@ -303,12 +303,14 @@ pub fn build_usage_summary(
         summary.rows.push(row);
     }
 
-    // Ascending cost puts the expensive models at the bottom of the table. The
-    // model-name tie-break is what keeps equal-cost rows in a stable order:
-    // `usage_data` is a hash map, so its iteration order is not reproducible.
+    // Descending cost puts the expensive models at the top, where a reader
+    // opening the view lands; ascending made the first screen a column of
+    // `$0.00` and pushed the row that matters off the bottom. The model-name
+    // tie-break is what keeps equal-cost rows in a stable order: `usage_data`
+    // is a hash map, so its iteration order is not reproducible.
     summary.rows.sort_by(|a, b| {
-        a.cost
-            .partial_cmp(&b.cost)
+        b.cost
+            .partial_cmp(&a.cost)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.model.cmp(&b.model))
     });
@@ -415,7 +417,7 @@ fn base_model_key(model: &str) -> &str {
 /// pieces. The prefix is dropped even from a model with no duplicate
 /// (`opencode/big-pickle` -> `big-pickle`), which also discards any
 /// fuzzy-match annotation the row's `display_model` carried. The result is
-/// re-sorted by ascending cost, tie-broken by model name, matching
+/// re-sorted by descending cost, tie-broken by model name, matching
 /// [`build_usage_summary`].
 pub fn merge_rows_by_base_model(rows: &[UsageRow]) -> Vec<UsageRow> {
     use std::collections::HashMap;
@@ -447,9 +449,11 @@ pub fn merge_rows_by_base_model(rows: &[UsageRow]) -> Vec<UsageRow> {
         merged.push(acc);
     }
 
+    // Same descending-cost order as the unmerged rows, so toggling `m` does not
+    // also flip the table over.
     merged.sort_by(|a, b| {
-        a.cost
-            .partial_cmp(&b.cost)
+        b.cost
+            .partial_cmp(&a.cost)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.model.cmp(&b.model))
     });
@@ -680,19 +684,21 @@ mod tests {
     }
 
     #[test]
-    fn merge_reorders_by_ascending_cost() {
+    fn merge_reorders_by_descending_cost() {
         let rows = vec![
+            row("cheap-model", 1, 1, 0.01),
             row("openai/gpt-5.5", 1, 1, 9.0),
             row("azure/gpt-5.5", 1, 1, 9.0),
-            row("cheap-model", 1, 1, 0.01),
         ];
 
         let merged = merge_rows_by_base_model(&rows);
 
         assert_eq!(merged.len(), 2);
-        // cheap-model (0.01) sorts before the merged gpt-5.5 row (18.0).
-        assert_eq!(merged[0].model, "cheap-model");
-        assert_eq!(merged[1].model, "gpt-5.5");
-        assert!((merged[1].cost - 18.0).abs() < 1e-9);
+        // The merged gpt-5.5 row (18.0) sorts above cheap-model (0.01), which
+        // is also what summing the two prefixed rows is for: the merged row
+        // takes the place its combined cost earns, not either half's.
+        assert_eq!(merged[0].model, "gpt-5.5");
+        assert!((merged[0].cost - 18.0).abs() < 1e-9);
+        assert_eq!(merged[1].model, "cheap-model");
     }
 }

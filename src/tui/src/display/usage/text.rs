@@ -7,7 +7,7 @@ use vct_core::usage::UsageData;
 
 /// Prints token usage to stdout as one `model: $cost` line per model.
 ///
-/// Rows are ordered by ascending cost. Prints `No usage data found` when there
+/// Rows are ordered by descending cost. Prints `No usage data found` when there
 /// is nothing to show. A failed pricing fetch is swallowed, leaving
 /// LiteLLM-priced models at zero cost. When `merge` is set, rows sharing a base
 /// model name across provider prefixes (e.g. `openai/gpt-5.5` +
