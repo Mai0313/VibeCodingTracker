@@ -375,6 +375,37 @@ fn test_dsh_parser() {
     }
 }
 
+#[test]
+fn test_antigravity_parser() {
+    let input_file = fixture(
+        "sessions/antigravity/agy/brain/5f0c2a9e-1b7d-4c3e-9a2f-6d8e4b1c7a30/.system_generated/logs/transcript_full.jsonl",
+    );
+    let expected_file = fixture("sessions/antigravity.expected.json");
+    let expected_json: Value = serde_json::from_str(
+        &std::fs::read_to_string(&expected_file).expect("Failed to read Antigravity golden result"),
+    )
+    .expect("Failed to parse Antigravity golden result");
+
+    let actual_json =
+        parse_session_file_to_value(&input_file).expect("Failed to analyze Antigravity session");
+    let ignore_fields = ["insightsVersion", "machineId", "user"];
+    let matches = compare_json_ignore_fields(&actual_json, &expected_json, &ignore_fields);
+
+    if !matches {
+        eprintln!("\n=== ACTUAL OUTPUT ===");
+        eprintln!(
+            "{}",
+            serde_json::to_string_pretty(&actual_json)
+                .unwrap_or_else(|_| "Invalid JSON".to_string())
+        );
+    }
+
+    assert!(
+        matches,
+        "Antigravity analysis output does not match the golden result (ignoring runtime fields)"
+    );
+}
+
 /// Verifies a Gemini assistant event's usage and `replace` tool call are
 /// recorded while `info` / `user` / `$set` lines contribute nothing.
 #[test]

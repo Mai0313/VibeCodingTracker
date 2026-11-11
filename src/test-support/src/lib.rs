@@ -194,6 +194,33 @@ impl TempHome {
         )
     }
 
+    /// Copies the synthetic Antigravity fixture conversation into
+    /// `~/.gemini/<app>/brain/<conversation>/` (its transcript) and
+    /// `~/.gemini/<app>/conversations/<conversation>.db` (its model map), where
+    /// `app` is `antigravity-cli`, `antigravity` or `jetski`.
+    pub fn put_antigravity_fixture_session(&self, app: &str, conversation: &str) -> PathBuf {
+        const FIXTURE: &str = "sessions/antigravity/agy";
+        const ID: &str = "5f0c2a9e-1b7d-4c3e-9a2f-6d8e4b1c7a30";
+        let root = self.paths.gemini_dir.join(app);
+        let transcript = root
+            .join("brain")
+            .join(conversation)
+            .join(".system_generated/logs/transcript_full.jsonl");
+        Self::write_file(
+            &transcript,
+            &fixture_str(&format!(
+                "{FIXTURE}/brain/{ID}/.system_generated/logs/transcript_full.jsonl"
+            )),
+        );
+        Self::write_bytes(
+            &root
+                .join("conversations")
+                .join(format!("{conversation}.db")),
+            &fixture_bytes(&format!("{FIXTURE}/conversations/{ID}.db")),
+        );
+        transcript
+    }
+
     /// Seeds one Cursor chat store with an assistant tool call and context gauge.
     pub fn put_cursor_session(
         &self,

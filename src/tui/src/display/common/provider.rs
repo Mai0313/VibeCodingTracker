@@ -77,6 +77,11 @@ impl<'a, T> ProviderTotal<'a, T> {
                 RatatuiColor::LightCyan,
                 TableColor::DarkCyan,
             ),
+            Provider::Antigravity => (
+                Provider::Antigravity.display_name(),
+                RatatuiColor::Blue,
+                TableColor::DarkBlue,
+            ),
             Provider::Unknown => ("Unknown", RatatuiColor::Gray, TableColor::Grey),
         };
 

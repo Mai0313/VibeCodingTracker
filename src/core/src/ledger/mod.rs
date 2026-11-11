@@ -274,13 +274,14 @@ impl ProviderLedger {
     }
 }
 
-const ALL_PROVIDERS: [ExtensionType; 9] = [
+const ALL_PROVIDERS: [ExtensionType; 10] = [
     ExtensionType::ClaudeCode,
     ExtensionType::Codex,
     ExtensionType::Copilot,
     ExtensionType::Gemini,
     ExtensionType::Grok,
     ExtensionType::DeepSeek,
+    ExtensionType::Antigravity,
     ExtensionType::OpenCode,
     ExtensionType::Cursor,
     ExtensionType::Hermes,
@@ -296,6 +297,7 @@ pub(crate) fn provider_file_stem(provider: ExtensionType) -> &'static str {
         ExtensionType::Gemini => "gemini",
         ExtensionType::Grok => "grok",
         ExtensionType::DeepSeek => "dsh",
+        ExtensionType::Antigravity => "antigravity",
         ExtensionType::OpenCode => "opencode",
         ExtensionType::Cursor => "cursor",
         ExtensionType::Hermes => "hermes",

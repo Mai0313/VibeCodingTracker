@@ -1,6 +1,6 @@
 //! Data-driven provider fan-out for the ledger-backed file scan.
 //!
-//! The six file-backed providers are scanned with the identical
+//! The seven file-backed providers are scanned with the identical
 //! [`scan_cached_files`] call, differing only in their session roots, filter,
 //! depth cap, and enable toggle. Listing them once here means adding a provider
 //! is a single table row instead of a new `if` block in every scan loop.
@@ -12,9 +12,10 @@ use crate::models::ExtensionType;
 use crate::models::TimeRange;
 use crate::pricing::TierThresholds;
 use crate::utils::{
-    COPILOT_SESSION_MAX_DEPTH, DSH_SESSION_MAX_DEPTH, GROK_SESSION_MAX_DEPTH, HelperPaths,
-    is_claude_session_file, is_codex_session_file, is_copilot_session_file, is_dsh_session_file,
-    is_gemini_session_file, is_grok_session_file,
+    ANTIGRAVITY_SESSION_MAX_DEPTH, COPILOT_SESSION_MAX_DEPTH, DSH_SESSION_MAX_DEPTH,
+    GROK_SESSION_MAX_DEPTH, HelperPaths, is_antigravity_session_file, is_claude_session_file,
+    is_codex_session_file, is_copilot_session_file, is_dsh_session_file, is_gemini_session_file,
+    is_grok_session_file,
 };
 use anyhow::Result;
 use std::path::Path;
@@ -22,7 +23,8 @@ use std::path::Path;
 /// One file-backed provider's scan parameters.
 ///
 /// `dirs` is a list because a provider can keep its sessions in more than one
-/// root — Codex splits them across active and archived directories.
+/// root — Codex splits them across active and archived directories, and
+/// Antigravity across the `agy` CLI, Desktop and Jetski.
 struct FileProviderSpec {
     provider: ExtensionType,
     enabled: fn(&ProvidersConfig) -> bool,
@@ -35,7 +37,7 @@ struct FileProviderSpec {
 ///
 /// Database-backed providers (OpenCode, Cursor, Hermes) are not here: each has a
 /// bespoke reader that differs between the usage and analysis features.
-const FILE_PROVIDERS: [FileProviderSpec; 6] = [
+const FILE_PROVIDERS: [FileProviderSpec; 7] = [
     FileProviderSpec {
         provider: ExtensionType::ClaudeCode,
         enabled: |p| p.claude,
@@ -77,6 +79,13 @@ const FILE_PROVIDERS: [FileProviderSpec; 6] = [
         dirs: |p| vec![p.dsh_session_dir.as_path()],
         filter: is_dsh_session_file,
         max_depth: Some(DSH_SESSION_MAX_DEPTH),
+    },
+    FileProviderSpec {
+        provider: ExtensionType::Antigravity,
+        enabled: |p| p.antigravity,
+        dirs: |p| p.antigravity_session_dirs().to_vec(),
+        filter: is_antigravity_session_file,
+        max_depth: Some(ANTIGRAVITY_SESSION_MAX_DEPTH),
     },
 ];
 

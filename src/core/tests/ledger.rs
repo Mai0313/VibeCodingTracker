@@ -31,6 +31,7 @@ fn only(provider: ExtensionType) -> ProvidersConfig {
         hermes: provider == ExtensionType::Hermes,
         grok: provider == ExtensionType::Grok,
         dsh: provider == ExtensionType::DeepSeek,
+        antigravity: provider == ExtensionType::Antigravity,
     }
 }
 
@@ -601,4 +602,41 @@ fn session_keys_are_provider_relative() {
     );
     assert_eq!(keys(ExtensionType::Cursor), ["hash/conversation/store.db"]);
     assert_eq!(keys(ExtensionType::OpenCode), ["ses_1"]);
+}
+
+#[test]
+fn an_antigravity_conversation_database_change_rereads_its_transcript() {
+    let home = TempHome::new();
+    let transcript = home.put_antigravity_fixture_session("antigravity-cli", "conversation");
+    let providers = only(ExtensionType::Antigravity);
+    let mut ledger = open(&home);
+    usage(&home, TimeRange::All, providers, &mut ledger);
+    ledger.save().unwrap();
+    let keys: Vec<String> = ledger_file(&home, ExtensionType::Antigravity)["sessions"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(
+        keys,
+        ["conversation/.system_generated/logs/transcript_full.jsonl"]
+    );
+
+    let mut ledger = open(&home);
+    usage(&home, TimeRange::All, providers, &mut ledger);
+    assert_eq!(ledger.stats().parsed_sources, 0);
+
+    // The model map lives in the database, so losing it alone re-reads the
+    // untouched transcript, which now has no model to bill.
+    let db = transcript
+        .ancestors()
+        .nth(5)
+        .unwrap()
+        .join("conversations/conversation.db");
+    std::fs::remove_file(db).unwrap();
+    let rescan = usage(&home, TimeRange::All, providers, &mut ledger);
+    assert_eq!(ledger.stats().parsed_sources, 1);
+    let models: Vec<&String> = rescan.data.per_provider.antigravity.keys().collect();
+    assert_eq!(models, ["unknown"]);
 }

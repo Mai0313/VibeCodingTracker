@@ -21,10 +21,10 @@ pub mod usage_processor;
 
 pub use cache_layout::remove_legacy_cache_files;
 pub use directory::{
-    COPILOT_SESSION_MAX_DEPTH, DSH_SESSION_MAX_DEPTH, GROK_SESSION_MAX_DEPTH,
-    collect_files_with_dates, collect_files_with_max_depth, is_claude_session_file,
-    is_codex_session_file, is_copilot_session_file, is_dsh_session_file, is_gemini_session_file,
-    is_grok_session_file,
+    ANTIGRAVITY_SESSION_MAX_DEPTH, COPILOT_SESSION_MAX_DEPTH, DSH_SESSION_MAX_DEPTH,
+    GROK_SESSION_MAX_DEPTH, collect_files_with_dates, collect_files_with_max_depth,
+    is_antigravity_session_file, is_claude_session_file, is_codex_session_file,
+    is_copilot_session_file, is_dsh_session_file, is_gemini_session_file, is_grok_session_file,
 };
 pub use file::{
     count_lines, read_json, read_jsonl, save_json_pretty, write_json_atomic,

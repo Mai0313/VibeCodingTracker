@@ -45,6 +45,7 @@ fn providers_only(provider: ExtensionType) -> ProvidersConfig {
         cursor: provider == ExtensionType::Cursor,
         hermes: provider == ExtensionType::Hermes,
         dsh: provider == ExtensionType::DeepSeek,
+        antigravity: provider == ExtensionType::Antigravity,
     }
 }
 
@@ -124,6 +125,7 @@ fn assert_analysis_data_eq(actual: &AnalysisData, expected: &AnalysisData) {
         gemini,
         grok,
         deepseek,
+        antigravity,
         opencode,
         cursor,
     } = per_provider;
@@ -135,6 +137,7 @@ fn assert_analysis_data_eq(actual: &AnalysisData, expected: &AnalysisData) {
         ("Gemini", gemini, &other.gemini),
         ("Grok", grok, &other.grok),
         ("DeepSeek", deepseek, &other.deepseek),
+        ("Antigravity", antigravity, &other.antigravity),
         ("OpenCode", opencode, &other.opencode),
         ("Cursor", cursor, &other.cursor),
     ] {
@@ -155,6 +158,7 @@ fn assert_analysis_data_eq(actual: &AnalysisData, expected: &AnalysisData) {
         hermes,
         grok,
         deepseek,
+        antigravity,
         total,
     } = provider_days;
     let other = &expected.provider_days;
@@ -165,6 +169,7 @@ fn assert_analysis_data_eq(actual: &AnalysisData, expected: &AnalysisData) {
         ("Gemini", gemini, &other.gemini),
         ("Grok", grok, &other.grok),
         ("DeepSeek", deepseek, &other.deepseek),
+        ("Antigravity", antigravity, &other.antigravity),
         ("OpenCode", opencode, &other.opencode),
         ("Cursor", cursor, &other.cursor),
         ("Hermes", hermes, &other.hermes),
@@ -267,6 +272,27 @@ fn batch_analysis_attributes_dsh_tools_to_the_deepseek_provider() {
     // Both models in the session bill against the same file operations.
     assert_eq!(data.per_provider.deepseek.len(), 2);
     assert_eq!(data.provider_days.deepseek, 1);
+}
+
+#[test]
+fn batch_analysis_attributes_antigravity_tools_to_its_provider() {
+    let home = TempHome::new();
+    home.put_antigravity_fixture_session("jetski", "conversation");
+
+    let data = aggregate_sessions_by_model_from_paths(&home.paths, TimeRange::All)
+        .expect("aggregate Antigravity analysis");
+    let row = data
+        .per_provider
+        .antigravity
+        .iter()
+        .find(|row| row.model == "gemini-3.5-flash")
+        .expect("Antigravity model row");
+    // The failed edit leaves no metric behind.
+    assert_eq!(row.read_count, 1);
+    assert_eq!(row.write_count, 1);
+    assert_eq!(row.edit_count, 1);
+    assert_eq!(row.bash_count, 1);
+    assert_eq!(data.provider_days.antigravity, 1);
 }
 
 #[test]
@@ -515,6 +541,9 @@ fn cached_analysis_matches_uncached_and_reuses_unchanged_sources() {
     );
     home.put_grok_fixture_session("workspace", "grok-session");
     home.put_dsh_fixture_session("dsh-project", "dsh-session");
+    // Two of Antigravity's three roots, so both are walked and kept apart.
+    home.put_antigravity_fixture_session("antigravity-cli", "agy-conversation");
+    home.put_antigravity_fixture_session("jetski", "jetski-conversation");
     seed_opencode_tie_breaker_db(&home.paths.opencode_db);
     home.put_cursor_session(
         "cursor-project",
@@ -539,9 +568,9 @@ fn cached_analysis_matches_uncached_and_reuses_unchanged_sources() {
         &mut cache,
     )
     .unwrap();
-    assert_eq!(cache.stats().parsed_sources, 8);
-    assert_eq!(cold.diagnostics.candidates, 8);
-    assert_eq!(cold.diagnostics.parsed, 8);
+    assert_eq!(cache.stats().parsed_sources, 10);
+    assert_eq!(cold.diagnostics.candidates, 10);
+    assert_eq!(cold.diagnostics.parsed, 10);
     assert!(cold.diagnostics.failures.is_empty());
     assert_eq!(cold.diagnostics, uncached.diagnostics);
     assert_analysis_data_eq(&cold.data, &uncached.data);
@@ -555,6 +584,7 @@ fn cached_analysis_matches_uncached_and_reuses_unchanged_sources() {
         gemini,
         grok,
         deepseek,
+        antigravity,
         opencode,
         cursor,
     } = &cold.data.per_provider;
@@ -565,6 +595,7 @@ fn cached_analysis_matches_uncached_and_reuses_unchanged_sources() {
         ("Gemini", gemini),
         ("Grok", grok),
         ("DeepSeek", deepseek),
+        ("Antigravity", antigravity),
         ("OpenCode", opencode),
         ("Cursor", cursor),
     ] {
@@ -578,6 +609,7 @@ fn cached_analysis_matches_uncached_and_reuses_unchanged_sources() {
         gemini,
         grok,
         deepseek,
+        antigravity,
         opencode,
         cursor,
     ] {
@@ -966,6 +998,10 @@ fn full_and_usage_only_modes_have_identical_scalar_analysis() {
         ("sessions/gemini.jsonl", ExtensionType::Gemini),
         ("sessions/grok/signals.json", ExtensionType::Grok),
         ("sessions/dsh/session.jsonl.zstd", ExtensionType::DeepSeek),
+        (
+            "sessions/antigravity/agy/brain/5f0c2a9e-1b7d-4c3e-9a2f-6d8e4b1c7a30/.system_generated/logs/transcript_full.jsonl",
+            ExtensionType::Antigravity,
+        ),
     ];
 
     for (name, provider) in fixtures {

@@ -164,12 +164,13 @@ pub struct CodeAnalysisRecord {
     /// (see [`crate::models::UsageResult`]).
     #[serde(serialize_with = "serialize_conversation_usage")]
     pub conversation_usage: FastHashMap<String, serde_json::Value>,
-    /// Token usage from Claude Code `advisor_message` iterations, keyed by the
-    /// advisor's own model. Kept **out** of `conversation_usage` on purpose:
-    /// the `analysis` aggregator attributes a record's file-operation / tool
-    /// counts to every model in `conversation_usage`, but an advisor model
-    /// never executes tools, so adding it there would mis-attribute the main
-    /// model's metrics to the advisor. The `usage` path merges this in (priced
+    /// Token usage from requests that execute no tools — Claude Code
+    /// `advisor_message` iterations, keyed by the advisor's own model, and
+    /// Antigravity compaction requests, keyed `unknown`. Kept **out** of
+    /// `conversation_usage` on purpose: the `analysis` aggregator attributes a
+    /// record's file-operation / tool counts to every model in
+    /// `conversation_usage`, so adding these there would mis-attribute the main
+    /// model's metrics to them. The `usage` path merges this in (priced
     /// at the advisor's own rate); `analysis` ignores it. Not serialized, so
     /// the `analysis` JSON / golden output is unaffected.
     #[serde(skip)]
@@ -276,6 +277,8 @@ pub enum ExtensionType {
     Grok,
     /// DeepSeek Harness (`dsh`).
     DeepSeek,
+    /// Google Antigravity: the `agy` CLI, the Desktop app and Jetski.
+    Antigravity,
 }
 
 impl ExtensionType {
@@ -291,9 +294,10 @@ impl ExtensionType {
             ExtensionType::Gemini => 3,
             ExtensionType::Grok => 4,
             ExtensionType::DeepSeek => 5,
-            ExtensionType::OpenCode => 6,
-            ExtensionType::Cursor => 7,
-            ExtensionType::Hermes => 8,
+            ExtensionType::Antigravity => 6,
+            ExtensionType::OpenCode => 7,
+            ExtensionType::Cursor => 8,
+            ExtensionType::Hermes => 9,
         }
     }
 }
@@ -310,6 +314,7 @@ impl std::fmt::Display for ExtensionType {
             ExtensionType::Hermes => write!(f, "Hermes"),
             ExtensionType::Grok => write!(f, "Grok"),
             ExtensionType::DeepSeek => write!(f, "DeepSeek-Harness"),
+            ExtensionType::Antigravity => write!(f, "Antigravity"),
         }
     }
 }

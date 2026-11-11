@@ -54,6 +54,9 @@ pub struct HelperPaths {
     pub dsh_dir: PathBuf,
     /// DeepSeek Harness session logs (`$DSH_HOME/sessions` or `~/.dsh/sessions`).
     pub dsh_session_dir: PathBuf,
+    /// Antigravity conversation roots: `~/.gemini/{antigravity-cli,antigravity,jetski}/brain`,
+    /// written by the `agy` CLI, the Desktop app and Jetski in the same layout.
+    pub antigravity_brain_dirs: [PathBuf; 3],
     /// OpenCode data root (`$XDG_DATA_HOME/opencode` or `~/.local/share/opencode`).
     pub opencode_dir: PathBuf,
     /// OpenCode SQLite database (`<opencode_dir>/opencode.db`).
@@ -74,6 +77,11 @@ impl HelperPaths {
     /// under an earlier root, so a scan racing the move counts the session once.
     pub fn codex_session_dirs(&self) -> [&Path; 2] {
         [&self.codex_session_dir, &self.codex_archived_session_dir]
+    }
+
+    /// Every Antigravity conversation root, as discovery walks them.
+    pub fn antigravity_session_dirs(&self) -> [&Path; 3] {
+        self.antigravity_brain_dirs.each_ref().map(PathBuf::as_path)
     }
 }
 
@@ -216,6 +224,8 @@ fn build_paths(
     let cursor_chats_dir = cursor_data_dir.join("chats");
     let gemini_dir = home_dir.join(".gemini");
     let gemini_session_dir = gemini_dir.join("tmp");
+    let antigravity_brain_dirs =
+        ["antigravity-cli", "antigravity", "jetski"].map(|app| gemini_dir.join(app).join("brain"));
     let grok_dir = resolve_grok_home(home_dir, grok_home);
     let grok_session_dir = grok_dir.join("sessions");
     let dsh_dir = resolve_dsh_home(home_dir, dsh_home);
@@ -249,6 +259,7 @@ fn build_paths(
         grok_session_dir,
         dsh_dir,
         dsh_session_dir,
+        antigravity_brain_dirs,
         opencode_dir,
         opencode_db,
         hermes_db,
@@ -526,6 +537,11 @@ mod tests {
         assert_eq!(p.gemini_session_dir, home.join(".gemini").join("tmp"));
         assert_eq!(p.grok_session_dir, home.join(".grok").join("sessions"));
         assert_eq!(p.dsh_session_dir, home.join(".dsh").join("sessions"));
+        assert_eq!(
+            p.antigravity_brain_dirs,
+            ["antigravity-cli", "antigravity", "jetski"]
+                .map(|app| home.join(".gemini").join(app).join("brain"))
+        );
         assert_eq!(p.opencode_db, p.opencode_dir.join("opencode.db"));
         assert!(p.opencode_dir.ends_with("opencode"));
         assert_eq!(p.hermes_db, home.join(".hermes").join("state.db"));

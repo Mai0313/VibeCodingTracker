@@ -97,6 +97,7 @@ pub fn calculate_analysis_provider_totals_from_per_provider(
     totals.gemini.days_count = provider_days.gemini;
     totals.grok.days_count = provider_days.grok;
     totals.deepseek.days_count = provider_days.deepseek;
+    totals.antigravity.days_count = provider_days.antigravity;
     totals.opencode.days_count = provider_days.opencode;
     totals.cursor.days_count = provider_days.cursor;
     totals.overall.days_count = provider_days.total;
@@ -107,6 +108,7 @@ pub fn calculate_analysis_provider_totals_from_per_provider(
     accumulate_analysis_provider(&mut totals.gemini, &per_provider.gemini);
     accumulate_analysis_provider(&mut totals.grok, &per_provider.grok);
     accumulate_analysis_provider(&mut totals.deepseek, &per_provider.deepseek);
+    accumulate_analysis_provider(&mut totals.antigravity, &per_provider.antigravity);
     accumulate_analysis_provider(&mut totals.opencode, &per_provider.opencode);
     accumulate_analysis_provider(&mut totals.cursor, &per_provider.cursor);
 
@@ -119,6 +121,7 @@ pub fn calculate_analysis_provider_totals_from_per_provider(
         + totals.gemini.total_edit_lines
         + totals.grok.total_edit_lines
         + totals.deepseek.total_edit_lines
+        + totals.antigravity.total_edit_lines
         + totals.opencode.total_edit_lines
         + totals.cursor.total_edit_lines;
     totals.overall.total_read_lines = totals.claude.total_read_lines
@@ -127,6 +130,7 @@ pub fn calculate_analysis_provider_totals_from_per_provider(
         + totals.gemini.total_read_lines
         + totals.grok.total_read_lines
         + totals.deepseek.total_read_lines
+        + totals.antigravity.total_read_lines
         + totals.opencode.total_read_lines
         + totals.cursor.total_read_lines;
     totals.overall.total_write_lines = totals.claude.total_write_lines
@@ -135,6 +139,7 @@ pub fn calculate_analysis_provider_totals_from_per_provider(
         + totals.gemini.total_write_lines
         + totals.grok.total_write_lines
         + totals.deepseek.total_write_lines
+        + totals.antigravity.total_write_lines
         + totals.opencode.total_write_lines
         + totals.cursor.total_write_lines;
     totals.overall.total_bash_count = totals.claude.total_bash_count
@@ -143,6 +148,7 @@ pub fn calculate_analysis_provider_totals_from_per_provider(
         + totals.gemini.total_bash_count
         + totals.grok.total_bash_count
         + totals.deepseek.total_bash_count
+        + totals.antigravity.total_bash_count
         + totals.opencode.total_bash_count
         + totals.cursor.total_bash_count;
     totals.overall.total_edit_count = totals.claude.total_edit_count
@@ -151,6 +157,7 @@ pub fn calculate_analysis_provider_totals_from_per_provider(
         + totals.gemini.total_edit_count
         + totals.grok.total_edit_count
         + totals.deepseek.total_edit_count
+        + totals.antigravity.total_edit_count
         + totals.opencode.total_edit_count
         + totals.cursor.total_edit_count;
     totals.overall.total_read_count = totals.claude.total_read_count
@@ -159,6 +166,7 @@ pub fn calculate_analysis_provider_totals_from_per_provider(
         + totals.gemini.total_read_count
         + totals.grok.total_read_count
         + totals.deepseek.total_read_count
+        + totals.antigravity.total_read_count
         + totals.opencode.total_read_count
         + totals.cursor.total_read_count;
     totals.overall.total_todo_write_count = totals.claude.total_todo_write_count
@@ -167,6 +175,7 @@ pub fn calculate_analysis_provider_totals_from_per_provider(
         + totals.gemini.total_todo_write_count
         + totals.grok.total_todo_write_count
         + totals.deepseek.total_todo_write_count
+        + totals.antigravity.total_todo_write_count
         + totals.opencode.total_todo_write_count
         + totals.cursor.total_todo_write_count;
     totals.overall.total_write_count = totals.claude.total_write_count
@@ -175,6 +184,7 @@ pub fn calculate_analysis_provider_totals_from_per_provider(
         + totals.gemini.total_write_count
         + totals.grok.total_write_count
         + totals.deepseek.total_write_count
+        + totals.antigravity.total_write_count
         + totals.opencode.total_write_count
         + totals.cursor.total_write_count;
 

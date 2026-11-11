@@ -35,6 +35,7 @@ fn claude_only() -> ProvidersConfig {
         hermes: false,
         grok: false,
         dsh: false,
+        antigravity: false,
     }
 }
 
@@ -51,6 +52,7 @@ fn codex_only() -> ProvidersConfig {
         hermes: false,
         grok: false,
         dsh: false,
+        antigravity: false,
     }
 }
 
@@ -65,6 +67,7 @@ fn opencode_only() -> ProvidersConfig {
         hermes: false,
         grok: false,
         dsh: false,
+        antigravity: false,
     }
 }
 
@@ -79,6 +82,7 @@ fn cursor_only() -> ProvidersConfig {
         hermes: false,
         grok: false,
         dsh: false,
+        antigravity: false,
     }
 }
 
@@ -192,6 +196,7 @@ fn assert_usage_data_eq(actual: &UsageData, expected: &UsageData) {
         hermes,
         grok,
         deepseek,
+        antigravity,
     } = per_provider;
     let other = &expected.per_provider;
     for (provider, actual_usage, expected_usage) in [
@@ -204,6 +209,7 @@ fn assert_usage_data_eq(actual: &UsageData, expected: &UsageData) {
         ("Hermes", hermes, &other.hermes),
         ("Grok", grok, &other.grok),
         ("DeepSeek", deepseek, &other.deepseek),
+        ("Antigravity", antigravity, &other.antigravity),
     ] {
         assert_eq!(actual_usage, expected_usage, "{provider} usage differs");
     }
@@ -218,6 +224,7 @@ fn assert_usage_data_eq(actual: &UsageData, expected: &UsageData) {
         hermes,
         grok,
         deepseek,
+        antigravity,
         total,
     } = provider_days;
     let other = &expected.provider_days;
@@ -231,6 +238,7 @@ fn assert_usage_data_eq(actual: &UsageData, expected: &UsageData) {
         ("Hermes", hermes, &other.hermes),
         ("Grok", grok, &other.grok),
         ("DeepSeek", deepseek, &other.deepseek),
+        ("Antigravity", antigravity, &other.antigravity),
         ("All providers", total, &other.total),
     ] {
         assert_eq!(actual_days, expected_days, "{provider} active days differ");
@@ -290,6 +298,9 @@ fn cached_usage_matches_uncached_for_every_provider_source() {
     );
     seed_hermes_usage_db(&home.paths.hermes_db);
     home.put_dsh_fixture_session("dsh-project", "dsh-session");
+    // Two of Antigravity's three roots, so both are walked and kept apart.
+    home.put_antigravity_fixture_session("antigravity-cli", "agy-conversation");
+    home.put_antigravity_fixture_session("jetski", "jetski-conversation");
 
     let providers = ProvidersConfig::default();
     let uncached =
@@ -299,10 +310,10 @@ fn cached_usage_matches_uncached_for_every_provider_source() {
         aggregate_usage_from_paths_with_cache(&home.paths, TimeRange::All, providers, &mut cache)
             .unwrap();
 
-    assert_eq!(cold.diagnostics.candidates, 9);
-    assert_eq!(cold.diagnostics.parsed, 9);
+    assert_eq!(cold.diagnostics.candidates, 11);
+    assert_eq!(cold.diagnostics.parsed, 11);
     assert!(cold.diagnostics.failures.is_empty());
-    assert_eq!(cache.stats().parsed_sources, 9);
+    assert_eq!(cache.stats().parsed_sources, 11);
     assert_usage_data_eq(&cold.data, &uncached);
     // Destructured so that a provider added later cannot be left unseeded: the
     // new field has to be named here, and naming it without using it below is
@@ -317,6 +328,7 @@ fn cached_usage_matches_uncached_for_every_provider_source() {
         hermes,
         grok,
         deepseek,
+        antigravity,
     } = &cold.data.per_provider;
     for (provider, usage) in [
         ("Claude", claude),
@@ -325,6 +337,7 @@ fn cached_usage_matches_uncached_for_every_provider_source() {
         ("Gemini", gemini),
         ("Grok", grok),
         ("DeepSeek", deepseek),
+        ("Antigravity", antigravity),
         ("OpenCode", opencode),
         ("Cursor", cursor),
         ("Hermes", hermes),
@@ -603,6 +616,28 @@ fn dsh_usage_counts_each_step_once() {
     assert_eq!(data.provider_days.deepseek, 1);
 }
 
+/// The `agy` CLI, the Desktop app and Jetski are three roots of one provider.
+#[test]
+fn antigravity_roots_add_up_to_one_provider() {
+    let home = TempHome::new();
+    for app in ["antigravity-cli", "antigravity", "jetski"] {
+        home.put_antigravity_fixture_session(app, &format!("{app}-conversation"));
+    }
+
+    let data = aggregate_usage_from_paths(&home.paths, TimeRange::All).expect("aggregate usage");
+    let usage = &data.per_provider.antigravity;
+    // The fixture's three requests on `gemini-3.5-flash` total 13300 / 24800 /
+    // 870, and its one compaction request names no model.
+    assert_eq!(usage["gemini-3.5-flash"]["input_tokens"], 3 * 13_300);
+    assert_eq!(
+        usage["gemini-3.5-flash"]["cache_read_input_tokens"],
+        3 * 24_800
+    );
+    assert_eq!(usage["gemini-3.8-flash"]["output_tokens"], 3 * 90);
+    assert_eq!(usage["unknown"]["input_tokens"], 3 * 4_000);
+    assert_eq!(data.provider_days.antigravity, 1);
+}
+
 #[test]
 fn grok_sidecars_invalidate_the_compact_cache() {
     let home = TempHome::new();
@@ -617,6 +652,7 @@ fn grok_sidecars_invalidate_the_compact_cache() {
         cursor: false,
         hermes: false,
         dsh: false,
+        antigravity: false,
     };
     let mut cache = SessionLedger::new();
 

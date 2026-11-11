@@ -8,7 +8,7 @@
 
 </div>
 
-**实时追踪你的 AI 编程开销。** Vibe Coding Tracker 是一款基于 Rust 构建的轻量级高性能 CLI 工具，用于监控和分析你在 Claude Code、Codex、Copilot、Gemini、OpenCode、Cursor、Hermes、Grok 和 DeepSeek Harness 上的使用情况——提供详细的费用明细、token 统计和代码操作洞察，同时保持极低的内存占用。
+**实时追踪你的 AI 编程开销。** Vibe Coding Tracker 是一款基于 Rust 构建的轻量级高性能 CLI 工具，用于监控和分析你在 Claude Code、Codex、Copilot、Gemini、OpenCode、Cursor、Hermes、Grok、DeepSeek Harness 和 Antigravity 上的使用情况——提供详细的费用明细、token 统计和代码操作洞察，同时保持极低的内存占用。
 
 [English](README.md) | [繁體中文](README.zh-TW.md) | [简体中文](README.zh-CN.md)
 
@@ -37,7 +37,7 @@
 
 ### 零配置
 
-自动检测并处理来自 Claude Code、Codex、Copilot、Gemini、OpenCode、Cursor、Hermes、Grok 和 DeepSeek Harness 的日志。无需任何设置——直接运行即可分析。首次运行时会自动生成一个带有合理默认值的 `~/.vct/config.toml`，方便你日后想调整行为时使用（参见 [配置](#%E9%85%8D%E7%BD%AE)）。
+自动检测并处理来自 Claude Code、Codex、Copilot、Gemini、OpenCode、Cursor、Hermes、Grok、DeepSeek Harness 和 Antigravity 的日志。无需任何设置——直接运行即可分析。首次运行时会自动生成一个带有合理默认值的 `~/.vct/config.toml`，方便你日后想调整行为时使用（参见 [配置](#%E9%85%8D%E7%BD%AE)）。
 
 ### 丰富的洞察
 
@@ -51,15 +51,15 @@
 
 ## 核心特性
 
-| 特性             | 说明                                                                                    |
-| ---------------- | --------------------------------------------------------------------------------------- |
-| **多供应商支持** | Claude Code、Codex、Copilot、Gemini、OpenCode、Cursor、Hermes、Grok 和 DeepSeek Harness |
-| **智能定价**     | 模糊模型匹配 + 从 LiteLLM 每日缓存更新                                                  |
-| **4 种显示模式** | 交互式 TUI、静态表格、纯文本和 JSON                                                     |
-| **双维度分析**   | token/费用统计（`usage`）+ 代码操作统计（`analysis`）                                   |
-| **实时额度面板** | Claude、Codex、Copilot、Cursor 和 Grok 的实时额度用量                                   |
-| **超轻量级**     | TUI 常驻内存约 60 MB、精简的 incremental scan, 基于 Rust 构建                           |
-| **实时更新**     | 响应式 loading 与后台 refresh, 并高亮变化                                               |
+| 特性             | 说明                                                                                                 |
+| ---------------- | ---------------------------------------------------------------------------------------------------- |
+| **多供应商支持** | Claude Code、Codex、Copilot、Gemini、OpenCode、Cursor、Hermes、Grok、DeepSeek Harness 和 Antigravity |
+| **智能定价**     | 模糊模型匹配 + 从 LiteLLM 每日缓存更新                                                               |
+| **4 种显示模式** | 交互式 TUI、静态表格、纯文本和 JSON                                                                  |
+| **双维度分析**   | token/费用统计（`usage`）+ 代码操作统计（`analysis`）                                                |
+| **实时额度面板** | Claude、Codex、Copilot、Cursor 和 Grok 的实时额度用量                                                |
+| **超轻量级**     | TUI 常驻内存约 60 MB、精简的 incremental scan, 基于 Rust 构建                                        |
+| **实时更新**     | 响应式 loading 与后台 refresh, 并高亮变化                                                            |
 
 ---
 
@@ -266,6 +266,7 @@ Totals (by Provider)
 - `~/.hermes/state.db`（Hermes，SQLite 数据库，遵循 `$HERMES_HOME`；仅 `usage`）
 - `$GROK_HOME/sessions/*/*/signals.json`（Grok CLI，默认使用 `~/.grok`；同层的 `updates.jsonl` 提供 `analysis` 数据）
 - `$DSH_HOME/sessions/*/*/session.jsonl.zstd`（DeepSeek Harness，默认使用 `~/.dsh`；若该 root 配置为 `compression = "none"` 则写成 `session.jsonl`，两种都会读取）
+- `~/.gemini/{antigravity-cli,antigravity,jetski}/brain/*/.system_generated/logs/transcript_full.jsonl`（Antigravity：`agy` CLI、Desktop app 与 Jetski 合并算作同一个 provider；每段对话的 model 取自同层的 `conversations/<id>.db`）
 
 Grok 的 `usage` 是单一时点的本地 context 估算：vct 会把 `signals.json` 的 `contextTokensUsed` 记为 cache-read token，并按该 model 的 cache-read 费率估算费用。这不是累计的 billed usage。`analysis` 会从同层的 `updates.jsonl` 还原已完成的 Read / Write / Edit / Bash / TodoWrite 操作。至于你实际计费的额度，请参见下方的 Grok 额度面板。
 
@@ -307,7 +308,7 @@ Grok 的 `usage` 是单一时点的本地 context 估算：vct 会把 `signals.j
 
 **深入了解代码操作——查看你的 AI 助手到底做了什么。**
 
-参见 [`tests/fixtures/sessions/`](tests/fixtures/sessions/) 目录，其中包含四种 JSONL provider 的示例输入与对应 JSON 输出，以及 [`tests/fixtures/sessions/grok/`](tests/fixtures/sessions/grok/) 下的 Grok session fixture 和 [`tests/fixtures/sessions/dsh/`](tests/fixtures/sessions/dsh/) 下的 DeepSeek Harness session fixture。
+参见 [`tests/fixtures/sessions/`](tests/fixtures/sessions/) 目录，其中包含四种 JSONL provider 的示例输入与对应 JSON 输出，以及 [`tests/fixtures/sessions/grok/`](tests/fixtures/sessions/grok/) 下的 Grok session fixture 、[`tests/fixtures/sessions/dsh/`](tests/fixtures/sessions/dsh/) 下的 DeepSeek Harness session fixture，以及 [`tests/fixtures/sessions/antigravity/`](tests/fixtures/sessions/antigravity/) 下的 Antigravity fixture。
 
 ### 基本用法
 
@@ -562,6 +563,7 @@ vct config migrate
 - **OpenCode**：只有在 LiteLLM 上**精确**匹配时，才会根据 token 为一个全新的 model 名称定价；若没有精确匹配，vct 会信任该 assistant message 自身存储的费用，而不是从一个只是大致相似的名称去猜测。
 - **Hermes**：与 OpenCode 相同，LiteLLM 上**精确**匹配时按 token 定价，否则使用 Hermes 自身存储的费用。
 - **DeepSeek Harness**：`dsh` 本身不记录任何费用，因此全部经由与其他 file-based provider 相同的查找链依 LiteLLM 计价，没有 OpenCode 或 Hermes 那样的 stored cost 兜底。它会路由到部署方配置的任意 provider，因此部署自定义的 model 名称很常见；LiteLLM 完全比对不到时费用为 $0。
+- **Antigravity**：与其他 file-based provider 一样依 LiteLLM 计价，model 取自每个 request 的 generation 记录。Compaction request 没有记录 model，其 token 会记在 `unknown` 下，费用为 $0。
 - **Grok**：只会把 `contextTokensUsed` 作为 cache-read token 计价（若该 model 未公布 cache-read 费率则改用 input 费率）；这是单一时点的本地 context 估算，不是累计的 billed usage。
 
 ---

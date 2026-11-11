@@ -171,6 +171,7 @@ pub fn calculate_provider_totals_from_per_provider(
     totals.gemini.days_count = provider_days.gemini;
     totals.grok.days_count = provider_days.grok;
     totals.deepseek.days_count = provider_days.deepseek;
+    totals.antigravity.days_count = provider_days.antigravity;
     totals.opencode.days_count = provider_days.opencode;
     totals.cursor.days_count = provider_days.cursor;
     totals.hermes.days_count = provider_days.hermes;
@@ -213,6 +214,12 @@ pub fn calculate_provider_totals_from_per_provider(
         ProviderPricing::Litellm,
     );
     accumulate_provider(
+        &mut totals.antigravity,
+        &per_provider.antigravity,
+        pricing_map,
+        ProviderPricing::Litellm,
+    );
+    accumulate_provider(
         &mut totals.opencode,
         &per_provider.opencode,
         pricing_map,
@@ -241,6 +248,7 @@ pub fn calculate_provider_totals_from_per_provider(
         + totals.gemini.total_tokens
         + totals.grok.total_tokens
         + totals.deepseek.total_tokens
+        + totals.antigravity.total_tokens
         + totals.opencode.total_tokens
         + totals.cursor.total_tokens
         + totals.hermes.total_tokens;
@@ -250,6 +258,7 @@ pub fn calculate_provider_totals_from_per_provider(
         + totals.gemini.total_cost
         + totals.grok.total_cost
         + totals.deepseek.total_cost
+        + totals.antigravity.total_cost
         + totals.opencode.total_cost
         + totals.cursor.total_cost
         + totals.hermes.total_cost;

@@ -11,9 +11,10 @@ use crate::session::parser::parse_session_file_typed_as_with_diagnostics;
 use crate::session::state::ParseMode;
 use crate::utils::directory::{FileInfo, collect_provider_files_diagnostics};
 use crate::utils::{
-    COPILOT_SESSION_MAX_DEPTH, DSH_SESSION_MAX_DEPTH, GROK_SESSION_MAX_DEPTH, HelperPaths,
-    is_claude_session_file, is_codex_session_file, is_copilot_session_file, is_dsh_session_file,
-    is_gemini_session_file, is_grok_session_file,
+    ANTIGRAVITY_SESSION_MAX_DEPTH, COPILOT_SESSION_MAX_DEPTH, DSH_SESSION_MAX_DEPTH,
+    GROK_SESSION_MAX_DEPTH, HelperPaths, is_antigravity_session_file, is_claude_session_file,
+    is_codex_session_file, is_copilot_session_file, is_dsh_session_file, is_gemini_session_file,
+    is_grok_session_file,
 };
 use anyhow::Result;
 use rayon::prelude::*;
@@ -76,6 +77,8 @@ pub struct PerProviderAnalysisRows {
     pub grok: Vec<AggregatedAnalysisRow>,
     /// Rows from the DeepSeek Harness session directory.
     pub deepseek: Vec<AggregatedAnalysisRow>,
+    /// Rows from the Antigravity conversation directories.
+    pub antigravity: Vec<AggregatedAnalysisRow>,
     /// Rows from the OpenCode database.
     pub opencode: Vec<AggregatedAnalysisRow>,
     /// Rows from the Cursor chat stores.
@@ -278,7 +281,7 @@ pub fn aggregate_sessions_by_model_from_paths_with_diagnostics(
 /// Collects the canonical batch-analysis dataset from the current user's home.
 ///
 /// Providers are always appended in this order: Claude, Codex, Copilot, Gemini,
-/// Grok, DeepSeek, OpenCode, Cursor. `mode` controls only detail retention;
+/// Grok, DeepSeek, Antigravity, OpenCode, Cursor. `mode` controls only detail retention;
 /// every scalar counter remains available to downstream projections.
 pub fn collect_analysis_sessions_with(
     time_range: TimeRange,
@@ -409,6 +412,19 @@ where
             is_dsh_session_file,
             time_range,
             Some(DSH_SESSION_MAX_DEPTH),
+            mode,
+            &mut diagnostics,
+            visitor,
+        )?;
+    }
+
+    if providers.antigravity {
+        visit_file_sessions(
+            &paths.antigravity_session_dirs(),
+            ExtensionType::Antigravity,
+            is_antigravity_session_file,
+            time_range,
+            Some(ANTIGRAVITY_SESSION_MAX_DEPTH),
             mode,
             &mut diagnostics,
             visitor,
@@ -640,7 +656,8 @@ where
     F: Copy + Fn(&Path) -> bool + Sync + Send,
     V: FnMut(AnalysisSession),
 {
-    let discovery = collect_provider_files_diagnostics(dirs, filter_fn, time_range, max_depth);
+    let discovery =
+        collect_provider_files_diagnostics(dirs, provider, filter_fn, time_range, max_depth);
     diagnostics.candidates += discovery.failures.len();
     for failure in discovery.failures {
         record_failure(diagnostics, provider, &failure.path, failure.error);
@@ -797,6 +814,7 @@ struct AnalysisProjection {
     gemini: FastHashMap<String, AggregatedAnalysisRow>,
     grok: FastHashMap<String, AggregatedAnalysisRow>,
     deepseek: FastHashMap<String, AggregatedAnalysisRow>,
+    antigravity: FastHashMap<String, AggregatedAnalysisRow>,
     opencode: FastHashMap<String, AggregatedAnalysisRow>,
     cursor: FastHashMap<String, AggregatedAnalysisRow>,
     all_dates: HashSet<String>,
@@ -806,6 +824,7 @@ struct AnalysisProjection {
     gemini_dates: HashSet<String>,
     grok_dates: HashSet<String>,
     deepseek_dates: HashSet<String>,
+    antigravity_dates: HashSet<String>,
     opencode_dates: HashSet<String>,
     cursor_dates: HashSet<String>,
     hermes_dates: HashSet<String>,
@@ -821,6 +840,7 @@ impl crate::scan::CompactSink for AnalysisProjection {
             ExtensionType::Gemini => Some(&mut self.gemini),
             ExtensionType::Grok => Some(&mut self.grok),
             ExtensionType::DeepSeek => Some(&mut self.deepseek),
+            ExtensionType::Antigravity => Some(&mut self.antigravity),
             ExtensionType::OpenCode => Some(&mut self.opencode),
             ExtensionType::Cursor => Some(&mut self.cursor),
             ExtensionType::Hermes => None,
@@ -844,6 +864,7 @@ impl AnalysisProjection {
             gemini: FastHashMap::with_capacity(capacity::MODELS_PER_SESSION),
             grok: FastHashMap::with_capacity(capacity::MODELS_PER_SESSION),
             deepseek: FastHashMap::with_capacity(capacity::MODELS_PER_SESSION),
+            antigravity: FastHashMap::with_capacity(capacity::MODELS_PER_SESSION),
             opencode: FastHashMap::with_capacity(capacity::MODELS_PER_SESSION),
             cursor: FastHashMap::with_capacity(capacity::MODELS_PER_SESSION),
             all_dates: HashSet::new(),
@@ -853,6 +874,7 @@ impl AnalysisProjection {
             gemini_dates: HashSet::new(),
             grok_dates: HashSet::new(),
             deepseek_dates: HashSet::new(),
+            antigravity_dates: HashSet::new(),
             opencode_dates: HashSet::new(),
             cursor_dates: HashSet::new(),
             hermes_dates: HashSet::new(),
@@ -873,6 +895,7 @@ impl AnalysisProjection {
             Some(ExtensionType::Gemini) => Some(&mut self.gemini),
             Some(ExtensionType::Grok) => Some(&mut self.grok),
             Some(ExtensionType::DeepSeek) => Some(&mut self.deepseek),
+            Some(ExtensionType::Antigravity) => Some(&mut self.antigravity),
             Some(ExtensionType::OpenCode) => Some(&mut self.opencode),
             Some(ExtensionType::Cursor) => Some(&mut self.cursor),
             Some(ExtensionType::Hermes) | None => None,
@@ -903,6 +926,9 @@ impl AnalysisProjection {
             Some(ExtensionType::DeepSeek) => {
                 self.deepseek_dates.insert(date);
             }
+            Some(ExtensionType::Antigravity) => {
+                self.antigravity_dates.insert(date);
+            }
             Some(ExtensionType::OpenCode) => {
                 self.opencode_dates.insert(date);
             }
@@ -924,6 +950,7 @@ impl AnalysisProjection {
             gemini: self.gemini_dates.len(),
             grok: self.grok_dates.len(),
             deepseek: self.deepseek_dates.len(),
+            antigravity: self.antigravity_dates.len(),
             opencode: self.opencode_dates.len(),
             cursor: self.cursor_dates.len(),
             hermes: self.hermes_dates.len(),
@@ -938,6 +965,7 @@ impl AnalysisProjection {
                 gemini: into_sorted_rows(self.gemini),
                 grok: into_sorted_rows(self.grok),
                 deepseek: into_sorted_rows(self.deepseek),
+                antigravity: into_sorted_rows(self.antigravity),
                 opencode: into_sorted_rows(self.opencode),
                 cursor: into_sorted_rows(self.cursor),
             },
@@ -954,6 +982,7 @@ fn extension_type_from_name(name: &str) -> Option<ExtensionType> {
         "Gemini" => Some(ExtensionType::Gemini),
         "Grok" => Some(ExtensionType::Grok),
         "DeepSeek-Harness" => Some(ExtensionType::DeepSeek),
+        "Antigravity" => Some(ExtensionType::Antigravity),
         "OpenCode" => Some(ExtensionType::OpenCode),
         "Cursor" => Some(ExtensionType::Cursor),
         "Hermes" => Some(ExtensionType::Hermes),

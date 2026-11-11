@@ -90,6 +90,7 @@ pub(crate) fn resolve_merged_model_cost(
         &per_provider.copilot,
         &per_provider.gemini,
         &per_provider.deepseek,
+        &per_provider.antigravity,
     ] {
         if let Some(raw_usage) = usage.get(model) {
             found = true;

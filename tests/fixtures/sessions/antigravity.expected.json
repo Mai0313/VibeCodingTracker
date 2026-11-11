@@ -1,0 +1,77 @@
+{
+  "user": "ignored",
+  "extensionName": "Antigravity",
+  "insightsVersion": "ignored",
+  "machineId": "ignored",
+  "records": [
+    {
+      "totalUniqueFiles": 2,
+      "totalWriteLines": 6,
+      "totalReadLines": 3,
+      "totalEditLines": 6,
+      "totalWriteCharacters": 82,
+      "totalReadCharacters": 47,
+      "totalEditCharacters": 77,
+      "writeFileDetails": [
+        {
+          "filePath": "/workspace/demo/tests/greet.rs",
+          "lineCount": 6,
+          "characterCount": 82,
+          "timestamp": 1794301440000,
+          "content": "use demo::greet;\n\n#[test]\nfn greets() {\n    assert_eq!(greet(\"Wei\"), \"你好, Wei\");\n}"
+        }
+      ],
+      "readFileDetails": [
+        {
+          "filePath": "/workspace/demo/src/lib.rs",
+          "lineCount": 3,
+          "characterCount": 47,
+          "timestamp": 1794301320000
+        }
+      ],
+      "editFileDetails": [
+        {
+          "filePath": "/workspace/demo/src/lib.rs",
+          "lineCount": 6,
+          "characterCount": 77,
+          "timestamp": 1794301440000,
+          "oldString": "    a + b\n}",
+          "newString": "    a + b\n}\n\npub fn greet(name: &str) -> String {\n    format!(\"你好, {name}\")\n}"
+        }
+      ],
+      "runCommandDetails": [
+        {
+          "filePath": "/workspace/demo",
+          "lineCount": 0,
+          "characterCount": 10,
+          "timestamp": 1794301560000,
+          "command": "cargo test",
+          "description": "Run the test suite"
+        }
+      ],
+      "toolCallCounts": {
+        "Read": 1,
+        "Write": 1,
+        "Edit": 1,
+        "TodoWrite": 0,
+        "Bash": 1
+      },
+      "conversationUsage": {
+        "gemini-3.5-flash": {
+          "cache_read_input_tokens": 24800,
+          "input_tokens": 13300,
+          "output_tokens": 870
+        },
+        "gemini-3.8-flash": {
+          "cache_read_input_tokens": 5000,
+          "input_tokens": 300,
+          "output_tokens": 90
+        }
+      },
+      "taskId": "5f0c2a9e-1b7d-4c3e-9a2f-6d8e4b1c7a30",
+      "timestamp": 1794301740000,
+      "folderPath": "/workspace/demo",
+      "gitRemoteUrl": "https://github.com/example/demo"
+    }
+  ]
+}

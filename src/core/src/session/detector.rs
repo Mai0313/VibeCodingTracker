@@ -7,6 +7,7 @@
 //! while [`classify_records`] returns `None` on indeterminate input so a
 //! streaming caller can keep peeking lines until a marker appears.
 use crate::models::ExtensionType;
+use crate::session::antigravity::is_antigravity_step;
 use crate::session::dsh::is_dsh_header;
 use crate::session::grok::is_grok_signals;
 use anyhow::{Result, bail};
@@ -34,7 +35,7 @@ pub(crate) fn record_inspections() -> usize {
 /// records carry, falling back to [`ExtensionType::Codex`] when none is found.
 /// That fallback is a tie-break, not a positive identification.
 ///
-/// Detection strategy, in the order the classifier applies it. The first four
+/// Detection strategy, in the order the classifier applies it. The first five
 /// markers are tested against the first record only; the last two against
 /// every record:
 /// - Grok: `primaryModelId` + `contextTokensUsed` and either
@@ -42,6 +43,8 @@ pub(crate) fn record_inspections() -> usize {
 /// - DeepSeek Harness: a session header — `type == "session"` with a numeric
 ///   `version` and a string `id`. Only an uncompressed log gets this far; a
 ///   zstd-framed one is routed by its frame magic before it is read as text.
+/// - Antigravity: a transcript step — a numeric `step_index` with string
+///   `source` and `type`
 /// - Gemini: a session-meta record with `sessionId` and `projectHash` fields
 ///   but *no* `messages` array (legacy single-object Gemini exports are no
 ///   longer supported)
@@ -156,6 +159,11 @@ impl RecordClassifier {
             // by its frame magic before anything reads it as text.
             if is_dsh_header(record) {
                 self.classified = Some(ExtensionType::DeepSeek);
+                return self.classified;
+            }
+
+            if is_antigravity_step(record) {
+                self.classified = Some(ExtensionType::Antigravity);
                 return self.classified;
             }
 
