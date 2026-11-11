@@ -447,13 +447,34 @@ fn run_config(action: ConfigAction) -> Result<()> {
 ///
 /// Returns an error if credentials are missing, the request fails, or the API
 /// answers a non-2xx status (the body is still printed first; a 401/403 appends
-/// the provider's login hint).
+/// the provider's login hint). For Antigravity, which runs agy instead of an
+/// HTTP request, a failed `/usage` run takes the place of the status.
 fn run_quota(provider: QuotaProvider, text: bool, table: bool) -> Result<()> {
     use vct_core::quota::{
         CLAUDE_LOGIN_HINT, CODEX_LOGIN_HINT, COPILOT_LOGIN_HINT, CURSOR_LOGIN_HINT,
-        GROK_LOGIN_HINT, claude, copilot, cursor, grok, http, wham,
+        GROK_LOGIN_HINT, antigravity, claude, copilot, cursor, grok, http, wham,
     };
     use vct_tui::display::quota::{display_quota_table, display_quota_text, print_quota_json};
+
+    let render = |body: &str| {
+        if text {
+            display_quota_text(body);
+        } else if table {
+            display_quota_table(body);
+        } else {
+            print_quota_json(body);
+        }
+    };
+
+    // agy makes the request itself, so its result carries no HTTP status.
+    if let QuotaProvider::Antigravity = provider {
+        let body = antigravity::fetch_antigravity_raw()?;
+        render(&body);
+        if let Some(error) = antigravity::antigravity_raw_error(&body) {
+            bail!("{error}");
+        }
+        return Ok(());
+    }
 
     let client = http::build_client()?;
     let (status, body) = match provider {
@@ -462,15 +483,10 @@ fn run_quota(provider: QuotaProvider, text: bool, table: bool) -> Result<()> {
         QuotaProvider::Copilot => copilot::fetch_copilot_raw(&client),
         QuotaProvider::Cursor => cursor::fetch_cursor_raw(&client),
         QuotaProvider::Grok => grok::fetch_grok_raw(&client),
+        QuotaProvider::Antigravity => unreachable!("answered above"),
     }?;
 
-    if text {
-        display_quota_text(&body);
-    } else if table {
-        display_quota_table(&body);
-    } else {
-        print_quota_json(&body);
-    }
+    render(&body);
 
     if !(200..300).contains(&status) {
         let (name, hint) = match provider {
@@ -479,6 +495,7 @@ fn run_quota(provider: QuotaProvider, text: bool, table: bool) -> Result<()> {
             QuotaProvider::Copilot => ("copilot", COPILOT_LOGIN_HINT),
             QuotaProvider::Cursor => ("cursor", CURSOR_LOGIN_HINT),
             QuotaProvider::Grok => ("grok", GROK_LOGIN_HINT),
+            QuotaProvider::Antigravity => unreachable!("answered above"),
         };
         // A rejected token (401/403) is the one case a re-login fixes, so only
         // then append the login hint; other statuses (429, 5xx, ...) just report.

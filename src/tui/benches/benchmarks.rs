@@ -544,7 +544,7 @@ fn benchmark_tui_frame_render(c: &mut Criterion) {
 
     // Wide and tall enough that the frame benchmarked is the full one: the model
     // table with its share column, the Provider Usage line under it, and all
-    // five quota cards on a single grid row. A narrower or shorter size would
+    // six quota cards on a single grid row. A narrower or shorter size would
     // fold one of those away and measure a cheaper frame.
     let mut ready =
         UsageFrameBenchmark::new(190, 42).expect("create ready frame benchmark fixture");

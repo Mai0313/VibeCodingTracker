@@ -2,7 +2,8 @@
 //!
 //! Each provider gets its own thread (so one provider's slow HTTP never stalls
 //! the others), but they all run the same panic-isolated poll loop here (cadence
-//! from `config.usage.quota.refresh_interval`). A provider supplies a stateful
+//! from `config.usage.quota.refresh_interval`, which Antigravity raises to its
+//! own floor). A provider supplies a stateful
 //! `resolve` closure returning a [`QuotaOutcome`]; the worker applies it to the
 //! shared snapshot:
 //!
@@ -14,8 +15,8 @@
 //!   limit or network blip never blanks a panel; the next success overwrites it.
 
 use crate::models::{
-    ClaudeQuotaSnapshot, CodexQuotaSnapshot, CopilotQuotaSnapshot, CursorQuotaSnapshot,
-    GrokQuotaSnapshot, QuotaSource,
+    AntigravityQuotaSnapshot, ClaudeQuotaSnapshot, CodexQuotaSnapshot, CopilotQuotaSnapshot,
+    CursorQuotaSnapshot, GrokQuotaSnapshot, QuotaSource,
 };
 use serde::Serialize;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -105,6 +106,18 @@ impl QuotaSnapshot for GrokQuotaSnapshot {
         // hint each give the panel something to show. The money fields never
         // stand alone — a billing body that maps at all yields `included`.
         self.included.is_some() || self.plan_type.is_some() || self.needs_login
+    }
+    fn set_needs_login(&mut self, value: bool) {
+        self.needs_login = value;
+    }
+}
+
+impl QuotaSnapshot for AntigravityQuotaSnapshot {
+    fn fetched_at(&self) -> i64 {
+        self.fetched_at
+    }
+    fn is_present(&self) -> bool {
+        !self.buckets.is_empty() || self.needs_login
     }
     fn set_needs_login(&mut self, value: bool) {
         self.needs_login = value;

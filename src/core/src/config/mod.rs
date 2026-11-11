@@ -43,7 +43,7 @@ const SCHEMA_URL: &str =
 ///
 /// It exists so an upgrade can add a setting to an existing file exactly once.
 /// Version 1 is any file written before the key existed.
-const CONFIG_VERSION: u32 = 3;
+const CONFIG_VERSION: u32 = 4;
 
 /// Quota panels introduced after version 1, back-filled once into a file older
 /// than the version that shipped them.
@@ -51,7 +51,7 @@ const CONFIG_VERSION: u32 = 3;
 /// Only the panel a given version *added* is back-filled, so a panel the user
 /// removed on purpose earlier is never resurrected. Extend this list (and bump
 /// [`CONFIG_VERSION`]) when a new provider gains a panel.
-const PANELS_ADDED_BY_VERSION: &[(u32, &str)] = &[(2, "grok")];
+const PANELS_ADDED_BY_VERSION: &[(u32, &str)] = &[(2, "grok"), (4, "antigravity")];
 
 /// The full settings document.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
@@ -187,12 +187,15 @@ impl UsageConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct QuotaConfig {
     /// Which live quota panels to show in the usage TUI (by provider name:
-    /// `claude` / `codex` / `copilot` / `cursor` / `grok`). An empty list hides
-    /// every quota card; the Provider Usage pane has its own `p` toggle.
+    /// `claude` / `codex` / `copilot` / `cursor` / `grok` / `antigravity`). An
+    /// empty list hides every quota card; the Provider Usage pane has its own `p`
+    /// toggle.
     #[serde(default = "default_quota_panels")]
     pub panels: Vec<String>,
     /// Seconds between live quota-panel polls, shared by every provider
     /// (minimum 1). Higher is safer against a provider's rate limits.
+    /// The Antigravity panel never polls more often than every 300 seconds, since
+    /// each poll starts the agy CLI.
     #[serde(default = "default_quota_refresh_secs")]
     pub refresh_interval: u64,
 }
@@ -368,10 +371,17 @@ where
 }
 
 fn default_quota_panels() -> Vec<String> {
-    ["claude", "codex", "copilot", "cursor", "grok"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
+    [
+        "claude",
+        "codex",
+        "copilot",
+        "cursor",
+        "grok",
+        "antigravity",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 /// Loads settings from `~/.vct/config.toml`, creating it with defaults on first
@@ -1216,7 +1226,7 @@ mod tests {
         assert!(migrated.contains("[usage.quota]"));
         // The user's names keep their order; panels that shipped later are
         // appended once, and the file is stamped so that only happens once.
-        assert!(migrated.contains("panels = [\"claude\", \"codex\", \"grok\"]"));
+        assert!(migrated.contains("panels = [\"claude\", \"codex\", \"grok\", \"antigravity\"]"));
         let cfg: Config = toml_edit::de::from_str(&migrated).unwrap();
         assert_eq!(cfg.usage.refresh_interval, 15);
         assert_eq!(cfg.analysis.refresh_interval, 20);
@@ -1225,7 +1235,8 @@ mod tests {
             vec![
                 "claude".to_string(),
                 "codex".to_string(),
-                "grok".to_string()
+                "grok".to_string(),
+                "antigravity".to_string()
             ]
         );
         assert_eq!(cfg.usage.quota.refresh_interval, 60);
@@ -1250,7 +1261,7 @@ mod tests {
     fn migrate_document_adds_only_the_schema_directive_when_keys_are_current() {
         // Current key names, nested quota and version marker, but missing the
         // `#:schema` directive.
-        let text = "[general]\nversion = 3\n\n[usage]\nrefresh_interval = 10\n\n[usage.quota]\npanels = [\"claude\"]\n";
+        let text = "[general]\nversion = 4\n\n[usage]\nrefresh_interval = 10\n\n[usage.quota]\npanels = [\"claude\"]\n";
         let migrated = migrate_text(text).unwrap().expect("adds #:schema");
         assert!(migrated.starts_with("#:schema "));
         assert!(migrated.contains("refresh_interval = 10"));
@@ -1338,7 +1349,11 @@ mod tests {
         let cfg: Config = toml_edit::de::from_str(&migrated).unwrap();
         assert_eq!(
             cfg.usage.quota.panels,
-            vec!["claude".to_string(), "grok".to_string()]
+            vec![
+                "claude".to_string(),
+                "grok".to_string(),
+                "antigravity".to_string()
+            ]
         );
         assert_eq!(cfg.usage.quota.refresh_interval, 30);
         assert!(migrate_text(&migrated).unwrap().is_none());
@@ -1352,7 +1367,11 @@ mod tests {
         let cfg: Config = toml_edit::de::from_str(&migrated).unwrap();
         assert_eq!(
             cfg.usage.quota.panels,
-            vec!["claude".to_string(), "grok".to_string()]
+            vec![
+                "claude".to_string(),
+                "grok".to_string(),
+                "antigravity".to_string()
+            ]
         );
     }
 
@@ -1375,18 +1394,35 @@ mod tests {
         let migrated = migrate_text(text)
             .unwrap()
             .expect("version 1 file upgrades");
-        assert!(migrated.contains("panels = [\"claude\", \"codex\", \"grok\"]"));
-        assert!(migrated.contains("version = 3"));
+        assert!(migrated.contains("panels = [\"claude\", \"codex\", \"grok\", \"antigravity\"]"));
+        assert!(migrated.contains("version = 4"));
         assert!(migrate_text(&migrated).unwrap().is_none());
 
-        // The user removes it again: the marker keeps the upgrade from re-running.
+        // The user removes them again: the marker keeps the upgrade from re-running.
         let pruned = migrated.replace(
-            "[\"claude\", \"codex\", \"grok\"]",
+            "[\"claude\", \"codex\", \"grok\", \"antigravity\"]",
             "[\"claude\", \"codex\"]",
         );
         assert!(migrate_text(&pruned).unwrap().is_none());
         let cfg: Config = toml_edit::de::from_str(&pruned).unwrap();
         assert!(!cfg.usage.shows_quota_panel("grok"));
+        assert!(!cfg.usage.shows_quota_panel("antigravity"));
+    }
+
+    /// A file stamped by the version that shipped `grok` gains only the panel a
+    /// later version added, so a `grok` removed since stays removed.
+    #[test]
+    fn a_version_3_file_gains_only_antigravity() {
+        let text = "#:schema x\n[general]\nauto_update = true\nversion = 3\n\n[usage.quota]\npanels = [\"claude\"]\n";
+        let migrated = migrate_text(text)
+            .unwrap()
+            .expect("version 3 file upgrades");
+        let cfg: Config = toml_edit::de::from_str(&migrated).unwrap();
+        assert_eq!(
+            cfg.usage.quota.panels,
+            vec!["claude".to_string(), "antigravity".to_string()]
+        );
+        assert_eq!(cfg.general.version, CONFIG_VERSION);
     }
 
     /// A panel the user dropped *before* this upgrade is not resurrected: only
@@ -1400,7 +1436,11 @@ mod tests {
         let cfg: Config = toml_edit::de::from_str(&migrated).unwrap();
         assert_eq!(
             cfg.usage.quota.panels,
-            vec!["claude".to_string(), "grok".to_string()],
+            vec![
+                "claude".to_string(),
+                "grok".to_string(),
+                "antigravity".to_string()
+            ],
             "codex / copilot / cursor were removed on purpose and stay removed"
         );
     }
@@ -1439,7 +1479,7 @@ mod tests {
                 .unwrap()
                 .expect("an empty file is stamped");
             assert!(migrated.starts_with("#:schema "));
-            assert!(migrated.contains("version = 3"));
+            assert!(migrated.contains("version = 4"));
             assert!(
                 migrate_text(&migrated).unwrap().is_none(),
                 "one pass must be enough"

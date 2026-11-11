@@ -26,6 +26,8 @@ pub enum QuotaProvider {
     Cursor,
     /// Grok CLI (`GET /v1/billing?format=credits`).
     Grok,
+    /// Antigravity CLI (`agy -p /usage --output-format json`).
+    Antigravity,
 }
 
 /// The parsed top-level command line.
@@ -147,7 +149,8 @@ pub enum Commands {
     /// The old name `fetch` is kept as a hidden alias for back-compat.
     #[command(alias = "fetch")]
     Quota {
-        /// Which provider to query (claude | codex | copilot | cursor | grok).
+        /// Which provider to query (claude | codex | copilot | cursor | grok |
+        /// antigravity).
         provider: QuotaProvider,
 
         /// Output as pretty JSON (default).

@@ -139,7 +139,7 @@ fn existing_current_file_is_parsed_and_left_in_place() {
     fs::create_dir_all(dir).unwrap();
     // Already in the current format (new keys + `#:schema` + version marker), so
     // load must not rewrite it.
-    let original = "#:schema https://example.test/vct.schema.json\n[general]\ndefault_time_range = \"weekly\"\nauto_update = false\nversion = 3\n\n[usage]\nmerge_models = true\n\n[usage.quota]\npanels = [\"claude\"]\n\n[providers]\ncursor = false\n";
+    let original = "#:schema https://example.test/vct.schema.json\n[general]\ndefault_time_range = \"weekly\"\nauto_update = false\nversion = 4\n\n[usage]\nmerge_models = true\n\n[usage.quota]\npanels = [\"claude\"]\n\n[providers]\ncursor = false\n";
     fs::write(dir.join("config.toml"), original).unwrap();
 
     let cfg = config::load_in(dir);
@@ -190,7 +190,11 @@ fn load_in_migrates_a_legacy_file_in_place() {
     // shipped after this file was written is back-filled once.
     assert_eq!(
         cfg.usage.quota.panels,
-        vec!["claude".to_string(), "grok".to_string()]
+        vec![
+            "claude".to_string(),
+            "grok".to_string(),
+            "antigravity".to_string()
+        ]
     );
     assert_eq!(cfg.usage.refresh_interval, 15);
     assert_eq!(cfg.analysis.refresh_interval, 20);
@@ -224,7 +228,7 @@ fn load_in_preserves_an_explicit_auto_update_preference() {
     assert!(!cfg.general.auto_update);
     let text = fs::read_to_string(dir.join("config.toml")).unwrap();
     assert!(text.contains("auto_update = false"));
-    assert!(text.contains("version = 3"));
+    assert!(text.contains("version = 4"));
     config::load_in(dir);
     assert_eq!(fs::read_to_string(dir.join("config.toml")).unwrap(), text);
 }
@@ -244,7 +248,7 @@ fn load_in_backfills_auto_update_for_a_legacy_general_table_once() {
     assert!(cfg.general.auto_update);
     let text = fs::read_to_string(dir.join("config.toml")).unwrap();
     assert!(text.contains("auto_update = true"));
-    assert!(text.contains("version = 3"));
+    assert!(text.contains("version = 4"));
     config::load_in(dir);
     assert_eq!(fs::read_to_string(dir.join("config.toml")).unwrap(), text);
 }

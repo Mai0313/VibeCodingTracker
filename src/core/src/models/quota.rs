@@ -872,7 +872,67 @@ impl fmt::Debug for GrokRefreshResponse {
     }
 }
 
-// ---- Normalized Copilot / Cursor / Grok snapshots (worker output + cache) ----
+// ---- Antigravity (`agy -p '/usage' --output-format json`) ----
+
+/// What `agy -p '/usage' --output-format json` prints (subset we read).
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgyPrintResponse {
+    /// `SUCCESS`, or `ERROR` with [`Self::error`] saying why.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// The failure message on an `ERROR` run.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// The slash command's own result.
+    #[serde(default)]
+    pub command: Option<AgyCommand>,
+}
+
+/// The `command` object of an agy print-mode result.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgyCommand {
+    /// The `/usage` payload.
+    #[serde(default)]
+    pub data: Option<AgyUsageData>,
+}
+
+/// The `command.data` object of a `/usage` run.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgyUsageData {
+    /// One entry per shared model pool, e.g. "Gemini Models".
+    #[serde(default)]
+    pub groups: Vec<AgyUsageGroup>,
+}
+
+/// One shared model pool of a `/usage` run.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgyUsageGroup {
+    /// Pool name, e.g. "Gemini Models" / "Claude and GPT models".
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The pool's limits.
+    #[serde(default)]
+    pub buckets: Vec<AgyUsageBucket>,
+}
+
+/// One limit of a `/usage` pool.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgyUsageBucket {
+    /// Display name, e.g. "Weekly Limit Remaining".
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Window code, e.g. `weekly` / `5h`.
+    #[serde(default)]
+    pub window: Option<String>,
+    /// Share of the limit still available (0..1, where 1 = untouched).
+    #[serde(default)]
+    pub remaining_fraction: Option<f64>,
+    /// RFC3339 time the limit refills.
+    #[serde(default)]
+    pub reset_time: Option<String>,
+}
+
+// ---- Normalized Copilot / Cursor / Grok / Antigravity snapshots (worker output + cache) ----
 
 /// Normalized Copilot quota snapshot, shared via `Arc<Mutex>` and persisted to
 /// `~/.vct/quota/copilot.json`.
@@ -974,6 +1034,38 @@ pub struct GrokQuotaSnapshot {
     /// 401); the panel shows a `grok login` hint.
     #[serde(default)]
     pub needs_login: bool,
+}
+
+/// Normalized Antigravity quota snapshot, shared via `Arc<Mutex>` and persisted
+/// to `~/.vct/quota/antigravity.json`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AntigravityQuotaSnapshot {
+    /// Which source produced this snapshot.
+    #[serde(default)]
+    pub source: QuotaSource,
+    /// Unix seconds when this snapshot was produced.
+    pub fetched_at: i64,
+    /// One gauge per `/usage` limit, in the order agy lists them.
+    #[serde(default)]
+    pub buckets: Vec<AntigravityBucket>,
+    /// Whether any limit is spent (drives the `LIMIT` flag).
+    #[serde(default)]
+    pub limit_reached: bool,
+    /// The sign-in file is gone or agy could not sign in; the panel shows an
+    /// `agy acp --login` hint.
+    #[serde(default)]
+    pub needs_login: bool,
+}
+
+/// One Antigravity limit, normalized.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AntigravityBucket {
+    /// The model pool it belongs to, e.g. "Gemini Models".
+    pub group: String,
+    /// Its window as agy names it, e.g. `weekly` / `5h`.
+    pub window: String,
+    /// Percent consumed and reset time.
+    pub usage: QuotaWindow,
 }
 
 #[cfg(test)]

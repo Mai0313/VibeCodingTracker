@@ -37,12 +37,12 @@ pub use format::{
 pub use git::get_git_remote_url;
 pub use heap::{release_freed_heap, tune_system_allocator};
 pub use paths::{
-    HelperPaths, find_pricing_cache_for_date, find_pricing_cache_for_date_in, get_cache_dir,
-    get_claude_credentials_path, get_config_path, get_copilot_config_path, get_current_user,
-    get_cursor_auth_path, get_grok_auth_path, get_machine_id, get_pricing_cache_path,
-    get_pricing_cache_path_in, get_quota_cache_path, get_version_cache_path,
-    get_version_cache_path_in, list_pricing_cache_files, list_pricing_cache_files_in,
-    network_disabled, resolve_paths, resolve_paths_from_home,
+    HelperPaths, find_pricing_cache_for_date, find_pricing_cache_for_date_in,
+    get_antigravity_token_path, get_cache_dir, get_claude_credentials_path, get_config_path,
+    get_copilot_config_path, get_current_user, get_cursor_auth_path, get_grok_auth_path,
+    get_machine_id, get_pricing_cache_path, get_pricing_cache_path_in, get_quota_cache_path,
+    get_version_cache_path, get_version_cache_path_in, list_pricing_cache_files,
+    list_pricing_cache_files_in, network_disabled, resolve_paths, resolve_paths_from_home,
 };
 pub use time::{now_rfc3339_utc_nanos, parse_iso_timestamp, rfc3339_utc_nanos};
 pub use token_extractor::{MAX_TIER_LEVELS, TierSlice, TokenCounts, extract_token_counts};

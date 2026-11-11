@@ -437,6 +437,19 @@ pub fn get_grok_auth_path() -> Result<PathBuf> {
     Ok(resolve_paths()?.grok_dir.join("auth.json"))
 }
 
+/// Returns the agy CLI's sign-in file
+/// (`~/.gemini/antigravity-cli/antigravity-oauth-token`).
+///
+/// # Errors
+///
+/// Returns an error if the user's home directory cannot be determined.
+pub fn get_antigravity_token_path() -> Result<PathBuf> {
+    Ok(resolve_paths()?
+        .gemini_dir
+        .join("antigravity-cli")
+        .join("antigravity-oauth-token"))
+}
+
 /// Returns the Claude OAuth credentials path (`~/.claude/.credentials.json`).
 ///
 /// # Errors
