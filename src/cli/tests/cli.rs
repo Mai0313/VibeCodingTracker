@@ -133,6 +133,7 @@ fn analysis_file_json_matches_typed_parser_for_every_file_provider() {
         "sessions/gemini.jsonl",
         "sessions/grok/signals.json",
         "sessions/dsh/session.jsonl.zstd",
+        "sessions/antigravity/agy/brain/5f0c2a9e-1b7d-4c3e-9a2f-6d8e4b1c7a30/.system_generated/logs/transcript_full.jsonl",
     ] {
         let path = fixture(fixture_name);
         let expected = serde_json::to_value(parse_session_file_typed(&path).unwrap()).unwrap();
@@ -527,6 +528,7 @@ fn single_file_summary_projection_is_parse_mode_invariant() {
         "sessions/gemini.jsonl",
         "sessions/grok/signals.json",
         "sessions/dsh/session.jsonl.zstd",
+        "sessions/antigravity/agy/brain/5f0c2a9e-1b7d-4c3e-9a2f-6d8e4b1c7a30/.system_generated/logs/transcript_full.jsonl",
     ] {
         let path = fixture(fixture_name);
         let full = parse_session_file_typed_with_mode(&path, ParseMode::Full).unwrap();

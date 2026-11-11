@@ -18,7 +18,7 @@ use vct_core::models::Provider;
 pub fn build_provider_total_rows(
     totals: &UsageProviderTotals,
 ) -> Vec<ProviderTotal<'_, ProviderStats>> {
-    let mut rows = Vec::with_capacity(10); // max 9 providers + overall
+    let mut rows = Vec::with_capacity(11); // max 10 providers + overall
 
     if totals.claude.days_count > 0 {
         rows.push(ProviderTotal::new(
@@ -52,6 +52,14 @@ pub fn build_provider_total_rows(
         rows.push(ProviderTotal::new(
             Provider::DeepSeek,
             &totals.deepseek,
+            false,
+        ));
+    }
+
+    if totals.antigravity.days_count > 0 {
+        rows.push(ProviderTotal::new(
+            Provider::Antigravity,
+            &totals.antigravity,
             false,
         ));
     }

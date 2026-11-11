@@ -178,7 +178,8 @@ pub(crate) fn scan_cached_files<F>(
 where
     F: Copy + Fn(&Path) -> bool + Sync + Send,
 {
-    let discovery = collect_provider_files_diagnostics(dirs, filter, TimeRange::All, max_depth);
+    let discovery =
+        collect_provider_files_diagnostics(dirs, provider, filter, TimeRange::All, max_depth);
     let partial = !discovery.failures.is_empty();
     diagnostics.candidates += discovery.failures.len();
     for failure in discovery.failures {

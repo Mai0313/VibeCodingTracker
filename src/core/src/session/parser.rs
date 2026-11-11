@@ -4,6 +4,7 @@ use crate::models::{
     ClaudeCodeLog, CodeAnalysis, CodexLog, CopilotEvent, ExtensionType, GeminiSession,
 };
 use crate::pricing::TierThresholds;
+use crate::session::antigravity::parse_antigravity_session;
 use crate::session::claude::parse_claude_logs_with_diagnostics;
 use crate::session::codex::parse_codex_log_iter_with_diagnostics;
 use crate::session::copilot::parse_copilot_events_with_diagnostics;
@@ -429,6 +430,12 @@ fn stream_parse_known(
             parse_dsh_session(path, mode, tiers)?,
             provider,
         ))),
+        // The model map comes from the conversation database beside the log,
+        // so the parser opens the transcript itself.
+        ExtensionType::Antigravity => Ok(Some(finalize(
+            parse_antigravity_session(path, mode, tiers)?,
+            provider,
+        ))),
         _ => stream_parse_known_dynamic(path, provider, mode, tiers),
     }
 }
@@ -786,6 +793,10 @@ fn dispatch_streaming_buffered(
             drop(reader);
             parse_dsh_session(path, mode, tiers)
         }
+        ExtensionType::Antigravity => {
+            drop(reader);
+            parse_antigravity_session(path, mode, tiers)
+        }
         // OpenCode stores sessions in a SQLite database, not a JSONL file, so
         // it never flows through the file parser. See `session::opencode`.
         ExtensionType::OpenCode => Ok(empty_parsed_analysis()),
@@ -1096,11 +1107,12 @@ fn raw_record_kind(provider: ExtensionType, value: &Value) -> (bool, bool) {
             (recognized, relevant)
         }
         ExtensionType::Gemini => (false, false),
-        // Grok and DeepSeek run their own readers (and the SQLite providers are
-        // not files at all), so no record of theirs ever reaches the
-        // typed-stream path this classifies for.
+        // Grok, DeepSeek and Antigravity run their own readers (and the SQLite
+        // providers are not files at all), so no record of theirs ever reaches
+        // the typed-stream path this classifies for.
         ExtensionType::Grok
         | ExtensionType::DeepSeek
+        | ExtensionType::Antigravity
         | ExtensionType::OpenCode
         | ExtensionType::Cursor
         | ExtensionType::Hermes => (false, false),
@@ -1165,6 +1177,7 @@ fn dispatch_by_vec(
         }
         ExtensionType::Grok => parse_grok_session(path, mode)?,
         ExtensionType::DeepSeek => parse_dsh_session(path, mode, tiers)?,
+        ExtensionType::Antigravity => parse_antigravity_session(path, mode, tiers)?,
     };
     warnings.borrow().emit(path);
     Ok(finalize(

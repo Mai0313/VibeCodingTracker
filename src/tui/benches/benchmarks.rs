@@ -211,6 +211,7 @@ fn claude_only() -> ProvidersConfig {
         hermes: false,
         grok: false,
         dsh: false,
+        antigravity: false,
     }
 }
 

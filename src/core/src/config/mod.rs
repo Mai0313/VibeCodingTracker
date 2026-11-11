@@ -261,6 +261,8 @@ pub struct ProvidersConfig {
     pub grok: bool,
     #[serde(default = "default_true")]
     pub dsh: bool,
+    #[serde(default = "default_true")]
+    pub antigravity: bool,
 }
 
 impl Default for ProvidersConfig {
@@ -275,6 +277,7 @@ impl Default for ProvidersConfig {
             hermes: true,
             grok: true,
             dsh: true,
+            antigravity: true,
         }
     }
 }

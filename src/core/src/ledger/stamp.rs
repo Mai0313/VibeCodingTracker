@@ -3,6 +3,7 @@
 use super::format::FileStamp;
 use crate::models::ExtensionType;
 use crate::pricing::TierThresholds;
+use crate::session::antigravity;
 use crate::session::sqlite::{DatabaseFingerprint, append_suffix};
 use crate::utils::directory::FileInfo;
 use anyhow::Result;
@@ -14,7 +15,8 @@ use std::time::SystemTime;
 
 /// The files a session log's parse depends on: the log itself, stamped from
 /// the metadata discovery already read, plus, for Grok, the sidecars the
-/// parser reads beside it.
+/// parser reads beside it, and for Antigravity the conversation database its
+/// model map comes from.
 pub(crate) fn file_source(
     file: &FileInfo,
     provider: ExtensionType,
@@ -36,6 +38,13 @@ pub(crate) fn file_source(
             let cwd = workspace.join(".cwd");
             files.insert("../.cwd".to_string(), optional_stamp(&cwd)?);
         }
+    }
+    if provider == ExtensionType::Antigravity
+        && let Some(db) = antigravity::conversation_db_path(&file.path)
+    {
+        let wal = append_suffix(&db, "-wal");
+        files.insert("conversation.db".to_string(), optional_stamp(&db)?);
+        files.insert("conversation.db-wal".to_string(), optional_stamp(&wal)?);
     }
     Ok(files)
 }

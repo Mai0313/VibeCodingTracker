@@ -40,6 +40,8 @@ pub struct ProviderActiveDays {
     pub grok: usize,
     /// Distinct active days observed for DeepSeek Harness.
     pub deepseek: usize,
+    /// Distinct active days observed for Antigravity.
+    pub antigravity: usize,
     /// Distinct active days across all providers combined.
     pub total: usize,
 }
@@ -58,12 +60,12 @@ pub struct ProviderActiveDays {
 /// display layer sum tokens and cost by source with no prefix heuristics. It
 /// is populated at the same time as the global merged map.
 ///
-/// There is deliberately no keyed accessor on this type. Its nine buckets are
+/// There is deliberately no keyed accessor on this type. Its ten buckets are
 /// one per [`ExtensionType`](crate::models::ExtensionType) variant, so a
-/// [`Provider`](crate::models::Provider)-keyed lookup would carry a tenth
+/// [`Provider`](crate::models::Provider)-keyed lookup would carry an eleventh
 /// `Unknown` naming no bucket here. And nothing ever arrives holding a single
-/// key to look up: the summary and pricing passes each need all nine under a
-/// per-provider rule, one aggregation path names all nine fields directly, and
+/// key to look up: the summary and pricing passes each need all ten under a
+/// per-provider rule, one aggregation path names all ten fields directly, and
 /// the one that does key its write keys it on `ExtensionType`.
 // A `Provider`-keyed `get` / `get_mut` pair, reachable only through the equally
 // uncalled `UsageData::provider_usage`, was removed in #237.
@@ -87,4 +89,6 @@ pub struct PerProviderUsage {
     pub grok: UsageResult,
     /// Per-model usage attributed to DeepSeek Harness.
     pub deepseek: UsageResult,
+    /// Per-model usage attributed to Antigravity.
+    pub antigravity: UsageResult,
 }

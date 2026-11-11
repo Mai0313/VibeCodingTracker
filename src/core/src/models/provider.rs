@@ -37,6 +37,8 @@ pub enum Provider {
     Grok,
     /// DeepSeek Harness (`dsh`).
     DeepSeek,
+    /// Google Antigravity.
+    Antigravity,
     /// No known provider.
     Unknown,
 }
@@ -56,6 +58,7 @@ impl Provider {
             Self::Hermes => "Hermes",
             Self::Grok => "Grok",
             Self::DeepSeek => "DeepSeek",
+            Self::Antigravity => "Antigravity",
             Self::Unknown => "Unknown",
         }
     }
@@ -82,6 +85,7 @@ mod tests {
         assert_eq!(Provider::Hermes.display_name(), "Hermes");
         assert_eq!(Provider::Grok.display_name(), "Grok");
         assert_eq!(Provider::DeepSeek.display_name(), "DeepSeek");
+        assert_eq!(Provider::Antigravity.display_name(), "Antigravity");
         assert_eq!(Provider::Unknown.display_name(), "Unknown");
     }
 }

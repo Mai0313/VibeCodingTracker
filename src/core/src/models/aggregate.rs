@@ -31,6 +31,8 @@ pub struct ProviderTotals<S> {
     pub grok: S,
     /// Totals for DeepSeek Harness sessions.
     pub deepseek: S,
+    /// Totals for Antigravity sessions.
+    pub antigravity: S,
     /// Sum across every provider (the "All Providers" bucket).
     pub overall: S,
 }
@@ -47,6 +49,7 @@ impl<S: Default> Default for ProviderTotals<S> {
             hermes: S::default(),
             grok: S::default(),
             deepseek: S::default(),
+            antigravity: S::default(),
             overall: S::default(),
         }
     }

@@ -1143,7 +1143,7 @@ fn context_tokens(ctx_msg: &[u8]) -> Option<i64> {
 ///
 /// Bounded to 10 bytes and to the slice length so a truncated blob can never
 /// spin or read out of bounds.
-fn read_varint(data: &[u8], pos: usize) -> Option<(u64, usize)> {
+pub(crate) fn read_varint(data: &[u8], pos: usize) -> Option<(u64, usize)> {
     let mut result: u64 = 0;
     let mut shift = 0u32;
     let mut i = pos;

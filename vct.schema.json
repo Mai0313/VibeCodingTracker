@@ -138,6 +138,7 @@
     },
     "providers": {
       "default": {
+        "antigravity": true,
         "claude": true,
         "codex": true,
         "copilot": true,
@@ -150,6 +151,10 @@
       },
       "description": "`[providers]` — per-provider include toggles.\n\nEach provider defaults to `true`; setting one to `false` skips it entirely\n(no directory scan, no API) in both the usage and analysis roll-ups.",
       "properties": {
+        "antigravity": {
+          "default": true,
+          "type": "boolean"
+        },
         "claude": {
           "default": true,
           "type": "boolean"

@@ -13,6 +13,7 @@
 //! (`parse_session_file_*`), while the SQLite-backed providers (OpenCode /
 //! Cursor / Hermes) expose `read_*` entry points, since they query a database
 //! rather than parse a byte stream.
+pub(crate) mod antigravity;
 pub mod claude;
 pub mod codex;
 pub mod copilot;

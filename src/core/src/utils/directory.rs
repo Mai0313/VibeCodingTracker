@@ -1,7 +1,7 @@
 use crate::constants::FastHashSet;
-use crate::models::TimeRange;
+use crate::ledger::key::session_key;
+use crate::models::{ExtensionType, TimeRange};
 use anyhow::Result;
-use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -207,20 +207,21 @@ where
 ///
 /// Roots are walked in order and their results concatenated, so a provider with
 /// a single root behaves exactly as [`collect_files_with_max_depth_diagnostics`]
-/// does. With more than one root, a file name already found in an **earlier**
-/// root is dropped from a later one: Codex archives a session by moving its
-/// rollout log from `sessions/` to `archived_sessions/` under the same
-/// `rollout-<timestamp>-<uuid>.jsonl` name, and a scan that races that move
-/// would otherwise fold the same session twice.
+/// does. With more than one root, a session whose ledger key (`session_key`)
+/// was already found in an **earlier** root is dropped from a later one: Codex
+/// archives a session by moving its rollout log from `sessions/` to
+/// `archived_sessions/` under the same `rollout-<timestamp>-<uuid>.jsonl` name,
+/// and a scan that races that move would otherwise fold the same session twice.
+/// Codex keys on that file name; every other provider keys on the path relative
+/// to its root, so Antigravity's identically named transcripts stay apart unless
+/// two roots hold the same conversation directory.
 ///
-/// Declaring more than one root therefore asserts that a repeated file name means
-/// a repeated session. Names are compared only across roots, never within one,
-/// because a provider may legitimately give every session the same file name
-/// (Copilot writes `events.jsonl` for all of them) — such a provider has to stay
-/// single-root. Each drop is logged at debug level so a wrong assertion is
-/// diagnosable rather than a silently missing session.
+/// Keys are compared only across roots, never within one. Each drop is logged
+/// at debug level so a wrong identity is diagnosable rather than a silently
+/// missing session.
 pub(crate) fn collect_provider_files_diagnostics<F>(
     dirs: &[&Path],
+    provider: ExtensionType,
     filter_fn: F,
     time_range: TimeRange,
     max_depth: Option<usize>,
@@ -240,36 +241,32 @@ where
         return discovery;
     }
 
+    let mut seen: FastHashSet<String> = discovery
+        .files
+        .iter()
+        .map(|file| session_key(provider, &[first], &file.path))
+        .collect();
     for dir in rest {
         let mut found =
             collect_files_with_max_depth_diagnostics(dir, &filter_fn, time_range, max_depth);
         discovery.failures.append(&mut found.failures);
-        // The overwhelmingly common shape is an absent or empty later root (no
-        // session has been archived yet), so skip building the name index for it.
-        if found.files.is_empty() {
-            continue;
-        }
-        // Scoped so the borrow of the already-merged names ends before the append.
-        {
-            let seen: FastHashSet<&OsStr> = discovery
-                .files
-                .iter()
-                .filter_map(|file| file.path.file_name())
-                .collect();
-            found.files.retain(|file| {
-                let duplicate = file
-                    .path
-                    .file_name()
-                    .is_some_and(|name| seen.contains(name));
-                if duplicate {
-                    log::debug!(
-                        "skipping {}: already discovered under an earlier session root",
-                        file.path.display()
-                    );
-                }
-                !duplicate
-            });
-        }
+        let found_keys: Vec<String> = found
+            .files
+            .iter()
+            .map(|file| session_key(provider, &[dir], &file.path))
+            .collect();
+        let mut keys = found_keys.iter();
+        found.files.retain(|file| {
+            let duplicate = keys.next().is_some_and(|key| seen.contains(key));
+            if duplicate {
+                log::debug!(
+                    "skipping {}: already discovered under an earlier session root",
+                    file.path.display()
+                );
+            }
+            !duplicate
+        });
+        seen.extend(found_keys);
         discovery.files.append(&mut found.files);
     }
 
@@ -301,6 +298,14 @@ pub const GROK_SESSION_MAX_DEPTH: usize = 3;
 /// `dsh` writes `$DSH_HOME/sessions/<project>/<session>/session.jsonl.zstd`,
 /// so each log is exactly three levels below the sessions root.
 pub const DSH_SESSION_MAX_DEPTH: usize = 3;
+
+/// Maximum traversal depth for Antigravity conversation scans.
+///
+/// Each conversation's log sits at
+/// `brain/<conversation>/.system_generated/logs/transcript_full.jsonl`, four
+/// levels below the `brain` root; deeper siblings (`steps/<n>/`, `chunks/`)
+/// hold per-step output and are never logs.
+pub const ANTIGRAVITY_SESSION_MAX_DEPTH: usize = 4;
 
 /// Filter for Codex session files.
 ///
@@ -428,6 +433,21 @@ pub fn is_dsh_session_file(path: &Path) -> bool {
         .and_then(Path::parent)
         .and_then(Path::parent)
         .is_some_and(|sessions| sessions.file_name() == Some(std::ffi::OsStr::new("sessions")))
+}
+
+/// Filter for Antigravity conversation transcripts.
+///
+/// `logs/` also holds `transcript.jsonl`, the same steps with every tool
+/// argument re-encoded as a JSON string and long fields truncated, so only the
+/// `_full` log is read.
+pub fn is_antigravity_session_file(path: &Path) -> bool {
+    if path.file_name() != Some(std::ffi::OsStr::new("transcript_full.jsonl")) {
+        return false;
+    }
+    let logs = path.parent();
+    logs.and_then(Path::file_name) == Some(std::ffi::OsStr::new("logs"))
+        && logs.and_then(Path::parent).and_then(Path::file_name)
+            == Some(std::ffi::OsStr::new(".system_generated"))
 }
 
 /// Returns true for a Claude Code metadata sidecar written beside a subagent
@@ -692,9 +712,14 @@ mod tests {
 
         let roots = [dir.path().join("sessions"), archived.clone()];
         let roots: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
-        let files =
-            collect_provider_files_diagnostics(&roots, is_codex_session_file, TimeRange::All, None)
-                .files;
+        let files = collect_provider_files_diagnostics(
+            &roots,
+            ExtensionType::Codex,
+            is_codex_session_file,
+            TimeRange::All,
+            None,
+        )
+        .files;
 
         let mut found: Vec<PathBuf> = files.into_iter().map(|file| file.path).collect();
         found.sort();
@@ -720,6 +745,7 @@ mod tests {
         let roots = [sessions.as_path()];
         let files = collect_provider_files_diagnostics(
             &roots,
+            ExtensionType::Copilot,
             is_copilot_session_file,
             TimeRange::All,
             Some(COPILOT_SESSION_MAX_DEPTH),
@@ -727,6 +753,41 @@ mod tests {
         .files;
 
         assert_eq!(files.len(), 2);
+    }
+
+    #[test]
+    fn test_collect_provider_files_keeps_same_named_files_across_roots_by_relative_path() {
+        // Every Antigravity transcript has the same file name; only the same
+        // conversation directory in two roots is one session.
+        let dir = tempdir().unwrap();
+        let roots = [dir.path().join("cli"), dir.path().join("jetski")];
+        for (root, conversation) in [(0, "a"), (1, "b"), (1, "a")] {
+            let logs = roots[root]
+                .join(conversation)
+                .join(".system_generated/logs");
+            fs::create_dir_all(&logs).unwrap();
+            File::create(logs.join("transcript_full.jsonl")).unwrap();
+        }
+        let roots: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
+
+        let files = collect_provider_files_diagnostics(
+            &roots,
+            ExtensionType::Antigravity,
+            is_antigravity_session_file,
+            TimeRange::All,
+            Some(ANTIGRAVITY_SESSION_MAX_DEPTH),
+        )
+        .files;
+
+        let mut found: Vec<PathBuf> = files.into_iter().map(|file| file.path).collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                roots[0].join("a/.system_generated/logs/transcript_full.jsonl"),
+                roots[1].join("b/.system_generated/logs/transcript_full.jsonl"),
+            ]
+        );
     }
 
     #[test]
@@ -739,15 +800,26 @@ mod tests {
         // A Codex home that has only ever archived: the active root is absent.
         let roots = [dir.path().join("sessions"), archived];
         let roots: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
-        let discovery =
-            collect_provider_files_diagnostics(&roots, is_codex_session_file, TimeRange::All, None);
+        let discovery = collect_provider_files_diagnostics(
+            &roots,
+            ExtensionType::Codex,
+            is_codex_session_file,
+            TimeRange::All,
+            None,
+        );
 
         assert_eq!(discovery.files.len(), 1);
         assert!(discovery.failures.is_empty());
         assert!(
-            collect_provider_files_diagnostics(&[], is_codex_session_file, TimeRange::All, None)
-                .files
-                .is_empty()
+            collect_provider_files_diagnostics(
+                &[],
+                ExtensionType::Codex,
+                is_codex_session_file,
+                TimeRange::All,
+                None,
+            )
+            .files
+            .is_empty()
         );
     }
 
