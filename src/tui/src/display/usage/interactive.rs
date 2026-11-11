@@ -39,21 +39,23 @@ use sysinfo::{Pid, System};
 use vct_core::config::ProvidersConfig;
 use vct_core::ledger::SessionLedger;
 use vct_core::models::{
-    ClaudeQuotaSnapshot, CodexQuotaSnapshot, CopilotQuotaSnapshot, CursorQuotaSnapshot,
-    GrokQuotaSnapshot, QuotaSource, QuotaWindow,
+    AntigravityBucket, AntigravityQuotaSnapshot, ClaudeQuotaSnapshot, CodexQuotaSnapshot,
+    CopilotQuotaSnapshot, CursorQuotaSnapshot, GrokQuotaSnapshot, QuotaSource, QuotaWindow,
 };
 use vct_core::pricing::{ModelPricingMap, fetch_model_pricing};
 use vct_core::quota::{
-    CLAUDE_LOGIN_HINT, CODEX_LOGIN_HINT, COPILOT_LOGIN_HINT, CURSOR_LOGIN_HINT, ClaudeState,
-    CodexState, CopilotState, CursorState, GROK_LOGIN_HINT, GrokState, load_claude_cache,
-    load_codex_cache, load_copilot_cache, load_cursor_cache, load_grok_cache, save_claude_cache,
-    save_codex_cache, save_copilot_cache, save_cursor_cache, save_grok_cache, spawn_quota_worker,
+    ANTIGRAVITY_LOGIN_HINT, ANTIGRAVITY_MIN_REFRESH_SECS, AntigravityState, CLAUDE_LOGIN_HINT,
+    CODEX_LOGIN_HINT, COPILOT_LOGIN_HINT, CURSOR_LOGIN_HINT, ClaudeState, CodexState, CopilotState,
+    CursorState, GROK_LOGIN_HINT, GrokState, load_antigravity_cache, load_claude_cache,
+    load_codex_cache, load_copilot_cache, load_cursor_cache, load_grok_cache,
+    save_antigravity_cache, save_claude_cache, save_codex_cache, save_copilot_cache,
+    save_cursor_cache, save_grok_cache, spawn_quota_worker,
 };
 use vct_core::scan::build_scan_pool;
 use vct_core::utils::{
     format_compact, format_cost, format_cost_compact, format_duration_until,
-    get_claude_credentials_path, get_copilot_config_path, get_cursor_auth_path, get_grok_auth_path,
-    resolve_paths,
+    get_antigravity_token_path, get_claude_credentials_path, get_copilot_config_path,
+    get_cursor_auth_path, get_grok_auth_path, resolve_paths,
 };
 
 /// How wide and tall the cards in one grid are.
@@ -98,6 +100,8 @@ const COPILOT_COLOR: RatatuiColor = RatatuiColor::Rgb(46, 160, 67);
 const CURSOR_COLOR: RatatuiColor = RatatuiColor::Rgb(64, 180, 180);
 /// Grok brand color (xAI near-black, lifted to stay readable on a dark terminal).
 const GROK_COLOR: RatatuiColor = RatatuiColor::Rgb(170, 170, 178);
+/// Antigravity color (Google blue) for the quota panel border.
+const ANTIGRAVITY_COLOR: RatatuiColor = RatatuiColor::Rgb(66, 133, 244);
 
 /// Body rows the model table must keep for the quota grid to be worth drawing.
 /// Below this the grid folds to the one-line digest, which is announced there.
@@ -120,13 +124,18 @@ const MODEL_COL_COMFORTABLE_W: u16 = 34;
 const SHARE_COL_MIN_W: u16 = 12;
 const SHARE_COL_MAX_W: u16 = 24;
 /// How many providers can show a quota card (Claude / Codex / Copilot / Cursor
-/// / Grok). The grid never reads this — it only bounds the render dispatch.
-const MAX_QUOTA_PANELS: usize = 5;
+/// / Grok / Antigravity). The grid never reads this — it only bounds the render
+/// dispatch.
+const MAX_QUOTA_PANELS: usize = 6;
 /// Widest a provider-supplied gauge label may be (Claude's per-model weekly
 /// row). It sits in the same column as `5h` / `7d`, so anything past this is
 /// width the bars lose; `label_width`'s own floor is 5, making 6 the first
 /// width that costs anything at all.
 const SCOPED_LABEL_W: u16 = 6;
+/// Widest an Antigravity gauge label may be: the longest agy's own windows
+/// produce (`Gemini 7d`), and narrow enough that the bar and percent still fit
+/// the narrowest card.
+const ANTIGRAVITY_LABEL_W: u16 = 9;
 
 /// Which provider quota panels have credentials on this machine.
 #[derive(Clone, Copy, Default)]
@@ -136,6 +145,7 @@ struct QuotaPresence {
     copilot: bool,
     cursor: bool,
     grok: bool,
+    antigravity: bool,
 }
 
 impl QuotaPresence {
@@ -157,12 +167,18 @@ impl QuotaPresence {
             .unwrap_or(false);
         let cursor = get_cursor_auth_path().map(|p| p.exists()).unwrap_or(false);
         let grok = get_grok_auth_path().map(|p| p.exists()).unwrap_or(false);
+        // agy's sign-in file stands in for credentials: checking it costs
+        // nothing, where asking agy itself would start a whole process.
+        let antigravity = get_antigravity_token_path()
+            .map(|p| p.exists())
+            .unwrap_or(false);
         Self {
             claude,
             codex,
             copilot,
             cursor,
             grok,
+            antigravity,
         }
     }
 
@@ -173,6 +189,7 @@ impl QuotaPresence {
             + self.copilot as usize
             + self.cursor as usize
             + self.grok as usize
+            + self.antigravity as usize
     }
 }
 
@@ -183,6 +200,7 @@ struct QuotaView<'a> {
     copilot: &'a CopilotQuotaSnapshot,
     cursor: &'a CursorQuotaSnapshot,
     grok: &'a GrokQuotaSnapshot,
+    antigravity: &'a AntigravityQuotaSnapshot,
     present: QuotaPresence,
     /// Whether the quota surface is shown at all. `false` when
     /// `usage.quota.panels` is empty, which drops the card grid and its digest.
@@ -227,6 +245,7 @@ struct QuotaRuntime {
     copilot: Arc<Mutex<CopilotQuotaSnapshot>>,
     cursor: Arc<Mutex<CursorQuotaSnapshot>>,
     grok: Arc<Mutex<GrokQuotaSnapshot>>,
+    antigravity: Arc<Mutex<AntigravityQuotaSnapshot>>,
     _guard: QuotaShutdownGuard,
 }
 
@@ -244,6 +263,7 @@ impl QuotaRuntime {
         present.copilot &= providers.copilot && panel_on("copilot");
         present.cursor &= providers.cursor && panel_on("cursor");
         present.grok &= providers.grok && panel_on("grok");
+        present.antigravity &= providers.antigravity && panel_on("antigravity");
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let claude = Arc::new(Mutex::new(
@@ -281,6 +301,28 @@ impl QuotaRuntime {
                 .flatten()
                 .unwrap_or_default(),
         ));
+        let antigravity = Arc::new(Mutex::new(
+            present
+                .antigravity
+                .then(load_antigravity_cache)
+                .flatten()
+                .unwrap_or_default(),
+        ));
+
+        // Antigravity sends no HTTP request of its own, so it needs no client.
+        if present.antigravity {
+            let mut state = AntigravityState::default();
+            spawn_quota_worker(
+                "antigravity",
+                Arc::clone(&antigravity),
+                Arc::clone(&shutdown),
+                quota_refresh_secs.max(ANTIGRAVITY_MIN_REFRESH_SECS),
+                move || state.resolve(),
+                |snapshot| {
+                    let _ = save_antigravity_cache(snapshot);
+                },
+            );
+        }
 
         if present.claude || present.codex || present.copilot || present.cursor || present.grok {
             match vct_core::quota::http::build_client() {
@@ -375,6 +417,7 @@ impl QuotaRuntime {
             copilot,
             cursor,
             grok,
+            antigravity,
             _guard: QuotaShutdownGuard { shutdown },
         }
     }
@@ -395,6 +438,7 @@ struct UsageUiState {
     copilot: CopilotQuotaSnapshot,
     cursor: CursorQuotaSnapshot,
     grok: GrokQuotaSnapshot,
+    antigravity: AntigravityQuotaSnapshot,
 }
 
 impl UsageUiState {
@@ -414,6 +458,7 @@ impl UsageUiState {
             copilot: CopilotQuotaSnapshot::default(),
             cursor: CursorQuotaSnapshot::default(),
             grok: GrokQuotaSnapshot::default(),
+            antigravity: AntigravityQuotaSnapshot::default(),
         }
     }
 
@@ -500,6 +545,11 @@ impl UsageUiState {
             .lock()
             .map(|value| value.clone())
             .unwrap_or_default();
+        self.antigravity = runtime
+            .antigravity
+            .lock()
+            .map(|value| value.clone())
+            .unwrap_or_default();
     }
 
     fn render(
@@ -517,6 +567,7 @@ impl UsageUiState {
             copilot: &self.copilot,
             cursor: &self.cursor,
             grok: &self.grok,
+            antigravity: &self.antigravity,
             present: runtime.present,
             band_enabled: runtime.band_enabled,
             provider_panel_open: self.provider_panel_open,
@@ -827,7 +878,7 @@ pub fn display_usage_interactive_with_pool(
 /// an empty list drops the band entirely. `providers` (from the config) selects
 /// which providers are aggregated. `refresh_secs` is the TUI re-aggregation
 /// cadence; `quota_refresh_secs` is the shared poll cadence for every live quota
-/// worker.
+/// worker, which Antigravity raises to `ANTIGRAVITY_MIN_REFRESH_SECS`.
 ///
 /// # Errors
 ///
@@ -1061,8 +1112,9 @@ fn render_usage_frame_with_status<B: Backend<Error: Send + Sync + 'static>>(
             if grid_h > 0 {
                 let cells = grid_cells(&CARD_GRID, quota_area, n);
                 // Present providers render in a fixed order (Claude → Codex →
-                // Copilot → Cursor → Grok) into the cells; a missing provider
-                // consumes no cell, and `grid_cells` always returns exactly `n`.
+                // Copilot → Cursor → Grok → Antigravity) into the cells; a
+                // missing provider consumes no cell, and `grid_cells` always
+                // returns exactly `n`.
                 let mut idx = 0;
                 let mut place = |f: &mut Frame, card: QuotaCard| {
                     if let Some(cell) = cells.get(idx) {
@@ -1085,6 +1137,9 @@ fn render_usage_frame_with_status<B: Backend<Error: Send + Sync + 'static>>(
                 }
                 if quota.present.grok {
                     place(f, grok_card(quota.grok, now, card_w));
+                }
+                if quota.present.antigravity {
+                    place(f, antigravity_card(quota.antigravity, now, card_w));
                 }
             } else if quota_area.height > 0 {
                 f.render_widget(
@@ -1164,6 +1219,7 @@ pub struct UsageFrameBenchmark {
     copilot: CopilotQuotaSnapshot,
     cursor: CursorQuotaSnapshot,
     grok: GrokQuotaSnapshot,
+    antigravity: AntigravityQuotaSnapshot,
     scroll: ScrollState,
 }
 
@@ -1251,6 +1307,7 @@ impl UsageFrameBenchmark {
             copilot: CopilotQuotaSnapshot::default(),
             cursor: CursorQuotaSnapshot::default(),
             grok: GrokQuotaSnapshot::default(),
+            antigravity: AntigravityQuotaSnapshot::default(),
             scroll,
         })
     }
@@ -1263,12 +1320,14 @@ impl UsageFrameBenchmark {
             copilot: &self.copilot,
             cursor: &self.cursor,
             grok: &self.grok,
+            antigravity: &self.antigravity,
             present: QuotaPresence {
                 claude: true,
                 codex: true,
                 copilot: true,
                 cursor: true,
                 grok: true,
+                antigravity: true,
             },
             band_enabled: true,
             provider_panel_open: false,
@@ -1506,6 +1565,9 @@ fn collect_cards(quota: &QuotaView, now: i64, width: u16) -> Vec<QuotaCard> {
     }
     if quota.present.grok {
         cards.push(grok_card(quota.grok, now, width));
+    }
+    if quota.present.antigravity {
+        cards.push(antigravity_card(quota.antigravity, now, width));
     }
     cards
 }
@@ -1930,6 +1992,21 @@ fn digest_items(quota: &QuotaView) -> Vec<DigestItem> {
             peak: peak(&[quota.grok.included.as_ref()]),
             limit_reached: quota.grok.limit_reached,
             needs_login: quota.grok.needs_login,
+        });
+    }
+    if quota.present.antigravity {
+        let windows: Vec<_> = quota
+            .antigravity
+            .buckets
+            .iter()
+            .map(|b| Some(&b.usage))
+            .collect();
+        items.push(DigestItem {
+            name: "Antigravity",
+            color: ANTIGRAVITY_COLOR,
+            peak: peak(&windows),
+            limit_reached: quota.antigravity.limit_reached,
+            needs_login: quota.antigravity.needs_login,
         });
     }
     items
@@ -2564,6 +2641,69 @@ fn grok_card(grok: &GrokQuotaSnapshot, now: i64, width: u16) -> QuotaCard {
     }
 }
 
+/// Builds the Antigravity card: one gauge per `/usage` limit. `/usage` names no
+/// plan, so the first line carries only the snapshot's age.
+fn antigravity_card(antigravity: &AntigravityQuotaSnapshot, now: i64, width: u16) -> QuotaCard {
+    let inner = card_inner_w(width);
+    let mut lines: Vec<Line> = vec![plan_line(None, antigravity.fetched_at, now, inner)];
+    if antigravity.needs_login {
+        lines.push(login_hint_line(ANTIGRAVITY_LOGIN_HINT, inner));
+    }
+    let labels = antigravity_labels(&antigravity.buckets, inner);
+    let label_w = label_width(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+    for (label, bucket) in labels.iter().zip(&antigravity.buckets) {
+        lines.push(gauge_line(
+            label,
+            label_w,
+            bucket.usage.used_percent,
+            bucket.usage.resets_at_unix,
+            now,
+            inner,
+        ));
+    }
+    // The login hint already explains an empty card, so the two never stack.
+    if antigravity.buckets.is_empty() && !antigravity.needs_login {
+        lines.push(dim_line_fit("no Antigravity quota", inner));
+    }
+
+    QuotaCard {
+        title: "Antigravity",
+        color: ANTIGRAVITY_COLOR,
+        limit_reached: antigravity.limit_reached,
+        lines,
+    }
+}
+
+/// Gauge labels for the Antigravity limits: the pool's first word and the
+/// window (`Gemini 7d`), or only the word's initial (`G 7d`) when the full
+/// labels would leave no room for a reset time at this width. A longer label,
+/// such as a limit's title standing in for a missing window, is cut to
+/// [`ANTIGRAVITY_LABEL_W`] rather than pushing the bar off the card.
+fn antigravity_labels(buckets: &[AntigravityBucket], inner_w: u16) -> Vec<String> {
+    let label = |bucket: &AntigravityBucket, initial_only: bool| {
+        let word = bucket.group.split_whitespace().next().unwrap_or("");
+        let word: String = if initial_only {
+            word.chars().take(1).collect()
+        } else {
+            word.to_string()
+        };
+        let window = if bucket.window == "weekly" {
+            "7d"
+        } else {
+            bucket.window.as_str()
+        };
+        fit_text(&format!("{word} {window}"), ANTIGRAVITY_LABEL_W)
+    };
+    let full: Vec<String> = buckets.iter().map(|b| label(b, false)).collect();
+    // label + separator + bar + " nnn%" + a bare reset as long as " 23h59m".
+    let widest = label_width(&full.iter().map(String::as_str).collect::<Vec<_>>());
+    if widest + 1 + 5 + 5 + 7 <= usize::from(inner_w) {
+        full
+    } else {
+        buckets.iter().map(|b| label(b, true)).collect()
+    }
+}
+
 /// The credit parts of the Codex card.
 fn codex_credit_parts(codex: &CodexQuotaSnapshot) -> Vec<String> {
     let balance = if codex.unlimited == Some(true) {
@@ -2904,6 +3044,110 @@ mod tests {
         assert!(!rendered.contains("no Grok quota"));
     }
 
+    fn antigravity_snapshot(now: i64) -> AntigravityQuotaSnapshot {
+        let bucket =
+            |group: &str, window: &str, used_percent: f64, reset_in: i64| AntigravityBucket {
+                group: group.to_string(),
+                window: window.to_string(),
+                usage: QuotaWindow {
+                    used_percent,
+                    resets_at_unix: Some(now + reset_in),
+                },
+            };
+        AntigravityQuotaSnapshot {
+            source: QuotaSource::Api,
+            fetched_at: now,
+            buckets: vec![
+                bucket("Gemini Models", "weekly", 8.0, 2 * 86_400 + 18 * 3_600),
+                bucket("Gemini Models", "5h", 23.0, 2 * 3_600 + 50 * 60),
+                bucket("Claude and GPT models", "weekly", 57.0, 20 * 3_600),
+                bucket("Claude and GPT models", "5h", 0.0, 5 * 3_600),
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// Four limits fill the narrowest cell: the pool shrinks to its initial so
+    /// every gauge keeps its reset time.
+    #[test]
+    fn antigravity_panel_fits_every_limit_in_the_minimum_cell() {
+        let now = 1_000;
+        let rendered = render_min_card(&antigravity_card(
+            &antigravity_snapshot(now),
+            now,
+            CARD_GRID.min_w,
+        ));
+        for line in [
+            "G 7d",
+            "8% 2d18h",
+            "G 5h",
+            "23% 2h50m",
+            "C 7d",
+            "57% 20h",
+            "C 5h",
+        ] {
+            assert!(rendered.contains(line), "{line} missing from:\n{rendered}");
+        }
+        assert!(rendered.contains("just now"), "got:\n{rendered}");
+        assert!(
+            !rendered.contains('+'),
+            "nothing may be hidden:\n{rendered}"
+        );
+    }
+
+    /// A card with room to spare names the pool in full.
+    #[test]
+    fn antigravity_panel_names_the_pool_when_it_has_the_room() {
+        let card = antigravity_card(&antigravity_snapshot(0), 0, OVERLAY_GRID.min_w);
+        let text: String = card
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+            .collect();
+        assert!(text.contains("Gemini 7d"), "got {text:?}");
+        assert!(text.contains("Claude 5h"), "got {text:?}");
+    }
+
+    /// A limit agy names by its title alone still shows its gauge in the
+    /// narrowest card: the title is cut, never the bar or the percent.
+    #[test]
+    fn antigravity_panel_cuts_a_long_label_rather_than_the_gauge() {
+        let antigravity = AntigravityQuotaSnapshot {
+            buckets: vec![AntigravityBucket {
+                group: "Gemini Models".to_string(),
+                window: "Weekly Limit Remaining".to_string(),
+                usage: QuotaWindow {
+                    used_percent: 42.0,
+                    resets_at_unix: None,
+                },
+            }],
+            ..Default::default()
+        };
+        let rendered = render_min_card(&antigravity_card(&antigravity, 0, CARD_GRID.min_w));
+        assert!(rendered.contains("G Weekly…"), "got:\n{rendered}");
+        assert!(rendered.contains("42%"), "got:\n{rendered}");
+    }
+
+    #[test]
+    fn antigravity_panel_reports_missing_data_and_a_needed_login() {
+        let rendered = render_min_card(&antigravity_card(&Default::default(), 0, CARD_GRID.min_w));
+        assert!(
+            rendered.contains("no Antigravity quota"),
+            "got:\n{rendered}"
+        );
+
+        let antigravity = AntigravityQuotaSnapshot {
+            needs_login: true,
+            ..Default::default()
+        };
+        let rendered = render_min_card(&antigravity_card(&antigravity, 0, CARD_GRID.min_w));
+        assert!(
+            rendered.contains(ANTIGRAVITY_LOGIN_HINT),
+            "got:\n{rendered}"
+        );
+        assert!(!rendered.contains("no Antigravity quota"));
+    }
+
     /// Every provider the digest and panel can be handed, so both exercise the
     /// real maximum rather than a sample of it.
     const PROVIDER_NAMES: [Provider; 10] = [
@@ -3187,8 +3431,9 @@ mod tests {
     #[test]
     fn grid_folds_rather_than_starving_the_model_table() {
         let n = MAX_QUOTA_PANELS;
-        // Tall enough: the grid is drawn and the table keeps its floor.
-        let tall = Rect::new(0, 0, 120, 40);
+        // Wide enough for one card row and tall enough: the grid is drawn and
+        // the table keeps its floor.
+        let tall = Rect::new(0, 0, 160, 40);
         assert_eq!(visible_grid_height(tall, true, n), CARD_GRID.height);
         // Short and narrow enough to need two card rows: folding wins.
         let short = Rect::new(0, 0, 80, 24);
@@ -3399,6 +3644,7 @@ mod tests {
         copilot: &'a CopilotQuotaSnapshot,
         cursor: &'a CursorQuotaSnapshot,
         grok: &'a GrokQuotaSnapshot,
+        antigravity: &'a AntigravityQuotaSnapshot,
     ) -> QuotaView<'a> {
         QuotaView {
             claude,
@@ -3406,13 +3652,8 @@ mod tests {
             copilot,
             cursor,
             grok,
-            present: QuotaPresence {
-                claude: true,
-                codex: true,
-                copilot: true,
-                cursor: true,
-                grok: true,
-            },
+            antigravity,
+            present: ALL_PRESENT,
             band_enabled: true,
             provider_panel_open: false,
             overlay_open: true,
@@ -3420,8 +3661,8 @@ mod tests {
     }
 
     fn render_overlay(width: u16, height: u16) -> String {
-        let (claude, codex, copilot, cursor, grok) = Default::default();
-        let quota = every_provider(&claude, &codex, &copilot, &cursor, &grok);
+        let (claude, codex, copilot, cursor, grok, antigravity) = Default::default();
+        let quota = every_provider(&claude, &codex, &copilot, &cursor, &grok, &antigravity);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| render_quota_overlay(frame, frame.area(), &quota, 0))
@@ -3440,7 +3681,14 @@ mod tests {
     #[test]
     fn overlay_shows_every_provider_when_it_has_the_room() {
         let rendered = render_overlay(140, 30);
-        for name in ["Claude", "Codex", "Copilot", "Cursor", "Grok"] {
+        for name in [
+            "Claude",
+            "Codex",
+            "Copilot",
+            "Cursor",
+            "Grok",
+            "Antigravity",
+        ] {
             assert!(rendered.contains(name), "{name} missing from:\n{rendered}");
         }
         assert!(rendered.contains("esc to close"), "got:\n{rendered}");
@@ -3452,13 +3700,14 @@ mod tests {
 
     #[test]
     fn overlay_explains_itself_when_there_is_nothing_to_show() {
-        let (c, x, p, u, g) = Default::default();
+        let (c, x, p, u, g, a) = Default::default();
         let mut quota = QuotaView {
             claude: &c,
             codex: &x,
             copilot: &p,
             cursor: &u,
             grok: &g,
+            antigravity: &a,
             present: QuotaPresence::default(),
             band_enabled: true,
             provider_panel_open: false,
@@ -3577,6 +3826,7 @@ mod tests {
             copilot: &bench.copilot,
             cursor: &bench.cursor,
             grok: &bench.grok,
+            antigravity: &bench.antigravity,
             present,
             band_enabled: true,
             provider_panel_open: provider_panel,
@@ -3613,6 +3863,7 @@ mod tests {
         copilot: true,
         cursor: true,
         grok: true,
+        antigravity: true,
     };
 
     /// Sizes worth pinning: the hard minimum, the common terminals, the widths
@@ -3652,6 +3903,7 @@ mod tests {
         // Both panels are covered: each is centered over the frame at every
         // terminal size, so an over-wide one would run off the edge here.
         for (w, h) in FRAME_SIZES {
+            let plain = render_frame(w, h, ALL_PRESENT, false, false);
             for (overlay, panel) in [(false, false), (true, false), (false, true)] {
                 let context = format!("{w}x{h} overlay={overlay} panel={panel}");
                 for (y, row) in render_frame(w, h, ALL_PRESENT, overlay, panel)
@@ -3659,7 +3911,29 @@ mod tests {
                     .enumerate()
                 {
                     assert_eq!(row.chars().count(), usize::from(w), "{context}");
-                    assert_no_clipped_markers(row, &format!("{context} row {y}"));
+                    // The provider panel hides the middle of the rows behind
+                    // it, and what is left of them either side can end
+                    // anywhere, so only the columns it drew over are checked;
+                    // the rest of the row was checked without it.
+                    let checked: String = if panel {
+                        let changed: Vec<bool> = row
+                            .chars()
+                            .zip(plain[y].chars())
+                            .map(|(a, b)| a != b)
+                            .collect();
+                        match (
+                            changed.iter().position(|c| *c),
+                            changed.iter().rposition(|c| *c),
+                        ) {
+                            (Some(first), Some(last)) => {
+                                row.chars().skip(first).take(last + 1 - first).collect()
+                            }
+                            _ => String::new(),
+                        }
+                    } else {
+                        row.clone()
+                    };
+                    assert_no_clipped_markers(&checked, &format!("{context} row {y}"));
                 }
             }
         }
@@ -3729,6 +4003,7 @@ mod tests {
                 copilot: &bench.copilot,
                 cursor: &bench.cursor,
                 grok: &bench.grok,
+                antigravity: &bench.antigravity,
                 present: ALL_PRESENT,
                 band_enabled: true,
                 provider_panel_open: false,
