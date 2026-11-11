@@ -14,8 +14,8 @@
 //! other version is ignored instead of displayed.
 
 use crate::models::{
-    ClaudeQuotaSnapshot, CodexQuotaSnapshot, CopilotQuotaSnapshot, CursorQuotaSnapshot,
-    GrokQuotaSnapshot,
+    AntigravityQuotaSnapshot, ClaudeQuotaSnapshot, CodexQuotaSnapshot, CopilotQuotaSnapshot,
+    CursorQuotaSnapshot, GrokQuotaSnapshot,
 };
 use crate::utils::{get_quota_cache_path, write_json_atomic};
 use anyhow::Result;
@@ -67,6 +67,11 @@ impl CachedQuota for CursorQuotaSnapshot {
 impl CachedQuota for GrokQuotaSnapshot {
     const SCHEMA_VERSION: u32 = 2;
     const PROVIDER: &'static str = "grok";
+}
+
+impl CachedQuota for AntigravityQuotaSnapshot {
+    const SCHEMA_VERSION: u32 = 1;
+    const PROVIDER: &'static str = "antigravity";
 }
 
 /// The on-disk envelope: the writing build's schema version, the provider the
@@ -191,6 +196,17 @@ pub fn load_grok_cache() -> Option<GrokQuotaSnapshot> {
 /// Persists the Grok quota snapshot atomically.
 pub fn save_grok_cache(snap: &GrokQuotaSnapshot) -> Result<()> {
     save_cache(cache_path::<GrokQuotaSnapshot>(), snap)
+}
+
+/// Loads the last-known Antigravity quota snapshot, or `None` when it is
+/// absent, corrupt, or stamped with a schema version this build does not share.
+pub fn load_antigravity_cache() -> Option<AntigravityQuotaSnapshot> {
+    load_cache(cache_path::<AntigravityQuotaSnapshot>())
+}
+
+/// Persists the Antigravity quota snapshot atomically.
+pub fn save_antigravity_cache(snap: &AntigravityQuotaSnapshot) -> Result<()> {
+    save_cache(cache_path::<AntigravityQuotaSnapshot>(), snap)
 }
 
 #[cfg(test)]
