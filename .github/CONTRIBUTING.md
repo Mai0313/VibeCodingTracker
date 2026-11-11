@@ -140,7 +140,7 @@ Common Makefile shortcuts (`make help` to list all):
 | `make release`  | Locked release build (`cargo build --release --locked`)                   |
 | `make package`  | `cargo package --locked --allow-dirty`                                    |
 | `make test`     | Run the full `cargo test --all` suite                                     |
-| `make fmt`      | `cargo fmt --all` + clippy auto-fix (`--fix`) + clippy `-D warnings` gate |
+| `make fmt`      | clippy auto-fix (`--fix`) + `cargo fmt --all` + clippy `-D warnings` gate |
 | `make coverage` | Install & run `cargo-llvm-cov` for workspace coverage                     |
 | `make clean`    | Remove build artifacts and prune git objects                              |
 
