@@ -22,7 +22,7 @@
       "default": {
         "auto_update": true,
         "default_time_range": "all",
-        "version": 3
+        "version": 4
       },
       "description": "`[general]` — settings shared across subcommands.",
       "properties": {
@@ -203,7 +203,8 @@
             "codex",
             "copilot",
             "cursor",
-            "grok"
+            "grok",
+            "antigravity"
           ],
           "refresh_interval": 60
         },
@@ -223,7 +224,8 @@
               "codex",
               "copilot",
               "cursor",
-              "grok"
+              "grok",
+              "antigravity"
             ],
             "refresh_interval": 60
           },
@@ -235,9 +237,10 @@
                 "codex",
                 "copilot",
                 "cursor",
-                "grok"
+                "grok",
+                "antigravity"
               ],
-              "description": "Which live quota panels to show in the usage TUI (by provider name:\n`claude` / `codex` / `copilot` / `cursor` / `grok`). An empty list hides\nevery quota card; the Provider Usage pane has its own `p` toggle.",
+              "description": "Which live quota panels to show in the usage TUI (by provider name:\n`claude` / `codex` / `copilot` / `cursor` / `grok` / `antigravity`). An\nempty list hides every quota card; the Provider Usage pane has its own `p`\ntoggle.",
               "items": {
                 "type": "string"
               },
@@ -245,7 +248,7 @@
             },
             "refresh_interval": {
               "default": 60,
-              "description": "Seconds between live quota-panel polls, shared by every provider\n(minimum 1). Higher is safer against a provider's rate limits.",
+              "description": "Seconds between live quota-panel polls, shared by every provider\n(minimum 1). Higher is safer against a provider's rate limits.\nThe Antigravity panel never polls more often than every 300 seconds, since\neach poll starts the agy CLI.",
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
