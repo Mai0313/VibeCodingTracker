@@ -9,7 +9,10 @@
 //! One run starts a whole agy process (a few seconds and ~260 MB), so the panel
 //! polls no more often than [`ANTIGRAVITY_MIN_REFRESH_SECS`]. A signed-out agy
 //! waits a minute for an interactive sign-in and may open a browser, so a run
-//! that reports a failed sign-in is not repeated until the sign-in file changes.
+//! that reports a failed sign-in is not repeated until the sign-in file changes,
+//! across restarts too. An offline agy whose token has expired reports the same
+//! failed sign-in, so agy is not run while Google's token endpoint is out of
+//! reach.
 
 use crate::models::{
     AgyPrintResponse, AntigravityBucket, AntigravityQuotaSnapshot, QuotaSource, QuotaWindow,
@@ -19,10 +22,12 @@ use crate::quota::provider::QuotaOutcome;
 use crate::quota::refresh::file_mtime;
 use crate::utils::get_antigravity_token_path;
 use anyhow::{Context, Result, bail};
+use std::ffi::OsString;
 use std::io;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
-use std::time::SystemTime;
+use std::time::Duration;
 
 /// Login hint shown when agy has no usable sign-in. `agy acp --login` signs in
 /// from the terminal and exits; inside an interactive `agy`, `/login` does the
@@ -122,7 +127,31 @@ fn map_agy_usage(body: &[u8], now: i64) -> AgyUsage {
         buckets,
         limit_reached,
         needs_login: false,
+        signed_out_mtime: None,
     })
+}
+
+/// Whether a proxy is configured for agy's HTTPS requests, which agy then
+/// sends through it rather than dialing out directly.
+fn proxy_configured(var: impl Fn(&str) -> Option<OsString>) -> bool {
+    ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
+        .iter()
+        .any(|name| var(name).is_some_and(|value| !value.is_empty()))
+}
+
+/// Whether agy can reach Google's OAuth token endpoint, which it refreshes its
+/// token against. Behind a proxy the direct connection proves nothing, so it is
+/// taken as reachable.
+fn token_endpoint_reachable() -> bool {
+    if proxy_configured(|name| std::env::var_os(name)) {
+        return true;
+    }
+    let Ok(addrs) = ("oauth2.googleapis.com", 443).to_socket_addrs() else {
+        return false;
+    };
+    addrs
+        .into_iter()
+        .any(|addr| TcpStream::connect_timeout(&addr, Duration::from_secs(3)).is_ok())
 }
 
 /// Runs `agy -p /usage` once for `vct quota antigravity` and returns its raw
@@ -173,28 +202,40 @@ pub fn antigravity_raw_error(body: &str) -> Option<String> {
 /// Per-worker Antigravity state.
 #[derive(Default)]
 pub struct AntigravityState {
-    /// The sign-in file's mtime when agy last failed to sign in. agy is not run
-    /// again until the file changes, which a re-login does.
-    signed_out_at: Option<Option<SystemTime>>,
+    /// The snapshot this worker last handed out, or the cached one it resumed
+    /// from. A failed sign-in re-flags it rather than blanking it, and its
+    /// `signed_out_mtime` is the hold.
+    last: AntigravityQuotaSnapshot,
 }
 
 impl AntigravityState {
-    /// One worker tick: run `/usage` unless agy is known to be signed out.
+    /// Resumes from the cached snapshot, so a sign-in found dead before a
+    /// restart is not run again after it.
+    pub fn resume(cached: AntigravityQuotaSnapshot) -> Self {
+        Self { last: cached }
+    }
+
+    /// One worker tick: run `/usage` unless agy is known to be signed out or
+    /// cannot reach Google.
     pub fn resolve(&mut self) -> QuotaOutcome<AntigravityQuotaSnapshot> {
         let Ok(token) = get_antigravity_token_path() else {
             return QuotaOutcome::Transient;
         };
-        self.resolve_with(&token, chrono::Local::now().timestamp(), || {
-            agy_usage_command().output()
-        })
+        self.resolve_with(
+            &token,
+            chrono::Local::now().timestamp(),
+            token_endpoint_reachable,
+            || agy_usage_command().output(),
+        )
     }
 
     /// The injectable core of [`Self::resolve`]: production passes the real
-    /// sign-in file and agy runner, tests a temp file and a fake.
+    /// sign-in file, reachability probe and agy runner, tests fakes.
     fn resolve_with(
         &mut self,
         token: &Path,
         now: i64,
+        online: impl FnOnce() -> bool,
         run: impl FnOnce() -> io::Result<Output>,
     ) -> QuotaOutcome<AntigravityQuotaSnapshot> {
         if !token.exists() {
@@ -203,8 +244,12 @@ impl AntigravityState {
         // Read before the run: a re-login during the minute a dead sign-in
         // keeps agy waiting must still count as a change afterwards.
         let mtime = file_mtime(token);
-        if self.signed_out_at == Some(mtime) {
+        if mtime.is_some() && self.last.signed_out_mtime == mtime {
             return QuotaOutcome::NeedsLogin;
+        }
+        if !online() {
+            log::warn!("antigravity quota: Google's token endpoint is unreachable; agy not run");
+            return QuotaOutcome::Transient;
         }
         let output = match run() {
             Ok(output) => output,
@@ -215,13 +260,16 @@ impl AntigravityState {
         };
         match map_agy_usage(&output.stdout, now) {
             AgyUsage::Data(snapshot) => {
-                self.signed_out_at = None;
+                self.last = snapshot.clone();
                 QuotaOutcome::Data(snapshot)
             }
             AgyUsage::SignedOut(e) => {
                 log::warn!("antigravity quota: agy /usage failed: {e}");
-                self.signed_out_at = Some(mtime);
-                QuotaOutcome::NeedsLogin
+                // Handed out as data, not `NeedsLogin`, so the worker saves the
+                // hold to the cache file.
+                self.last.needs_login = true;
+                self.last.signed_out_mtime = mtime;
+                QuotaOutcome::Data(self.last.clone())
             }
             AgyUsage::Failed(e) => {
                 log::warn!(
@@ -348,12 +396,23 @@ mod tests {
         assert_eq!(body, USAGE);
     }
 
+    /// The reachability probe on a connected machine.
+    fn online() -> bool {
+        true
+    }
+
+    /// Whether `outcome` flags a failed sign-in and carries the hold, which is
+    /// what the worker saves to the cache file.
+    fn holds_sign_in(outcome: &QuotaOutcome<AntigravityQuotaSnapshot>) -> bool {
+        matches!(outcome, QuotaOutcome::Data(s) if s.needs_login && s.signed_out_mtime.is_some())
+    }
+
     #[test]
     fn resolve_without_a_sign_in_file_asks_for_login_without_starting_agy() {
         let dir = tempfile::tempdir().unwrap();
         let token = dir.path().join("antigravity-oauth-token");
-        let outcome =
-            AntigravityState::default().resolve_with(&token, 0, || panic!("agy must not run"));
+        let outcome = AntigravityState::default()
+            .resolve_with(&token, 0, online, || panic!("agy must not run"));
         assert!(matches!(outcome, QuotaOutcome::NeedsLogin));
     }
 
@@ -369,26 +428,80 @@ mod tests {
         };
         let mut state = AntigravityState::default();
 
-        assert!(matches!(
-            state.resolve_with(&token, 0, signed_out),
-            QuotaOutcome::NeedsLogin
+        assert!(holds_sign_in(
+            &state.resolve_with(&token, 0, online, signed_out)
         ));
         assert!(matches!(
-            state.resolve_with(&token, 0, signed_out),
+            state.resolve_with(&token, 0, online, signed_out),
             QuotaOutcome::NeedsLogin
         ));
         assert_eq!(runs.get(), 1, "a dead sign-in must not relaunch agy");
 
         // A re-login rewrites the file, which is what earns another run.
         touch_later(&token);
-        let outcome = state.resolve_with(&token, 5, || ran(USAGE));
-        assert!(matches!(outcome, QuotaOutcome::Data(ref s) if s.buckets.len() == 4));
-        assert!(state.signed_out_at.is_none());
+        let outcome = state.resolve_with(&token, 5, online, || ran(USAGE));
+        assert!(
+            matches!(outcome, QuotaOutcome::Data(ref s) if s.buckets.len() == 4 && !s.needs_login)
+        );
+        assert!(state.last.signed_out_mtime.is_none());
+    }
+
+    #[test]
+    fn a_failed_sign_in_keeps_the_gauges_and_stays_held_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("antigravity-oauth-token");
+        std::fs::write(&token, "{}").unwrap();
+        let mut state = AntigravityState::default();
+
+        assert!(matches!(
+            state.resolve_with(&token, 5, online, || ran(USAGE)),
+            QuotaOutcome::Data(_)
+        ));
+        let QuotaOutcome::Data(saved) = state.resolve_with(&token, 9, online, || ran(SIGNED_OUT))
+        else {
+            panic!("a failed sign-in must hand out the hold");
+        };
+        assert!(saved.needs_login);
+        assert_eq!(
+            saved.buckets.len(),
+            4,
+            "a failed sign-in must not blank the gauges"
+        );
+        assert_eq!(saved.fetched_at, 5);
+
+        // The next process resumes from what the worker wrote to the cache file.
+        let cached = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        let outcome = AntigravityState::resume(cached)
+            .resolve_with(&token, 20, online, || panic!("agy must not run"));
+        assert!(matches!(outcome, QuotaOutcome::NeedsLogin));
+    }
+
+    #[test]
+    fn only_a_set_https_or_all_proxy_counts_as_a_proxy() {
+        let with = |set: &'static str, value: &'static str| {
+            move |name: &str| (name == set).then(|| OsString::from(value))
+        };
+        assert!(proxy_configured(with("HTTPS_PROXY", "http://proxy:3128")));
+        assert!(proxy_configured(with("all_proxy", "socks5://proxy:1080")));
+        assert!(!proxy_configured(with("HTTPS_PROXY", "")));
+        assert!(!proxy_configured(with("HTTP_PROXY", "http://proxy:3128")));
+    }
+
+    #[test]
+    fn agy_is_not_run_while_google_is_out_of_reach() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("antigravity-oauth-token");
+        std::fs::write(&token, "{}").unwrap();
+        let mut state = AntigravityState::default();
+
+        let outcome = state.resolve_with(&token, 0, || false, || panic!("agy must not run"));
+        assert!(matches!(outcome, QuotaOutcome::Transient));
+        assert!(state.last.signed_out_mtime.is_none());
     }
 
     /// Moves the file's mtime forward, as a re-login rewriting it does.
     fn touch_later(path: &Path) {
-        let later = SystemTime::now() + std::time::Duration::from_secs(60);
+        let later = std::time::SystemTime::now() + Duration::from_secs(60);
         std::fs::File::options()
             .write(true)
             .open(path)
@@ -404,13 +517,13 @@ mod tests {
         std::fs::write(&token, "{}").unwrap();
         let mut state = AntigravityState::default();
 
-        let outcome = state.resolve_with(&token, 0, || {
+        let outcome = state.resolve_with(&token, 0, online, || {
             touch_later(&token);
             ran(SIGNED_OUT)
         });
-        assert!(matches!(outcome, QuotaOutcome::NeedsLogin));
+        assert!(holds_sign_in(&outcome));
         let reran = Cell::new(false);
-        let outcome = state.resolve_with(&token, 5, || {
+        let outcome = state.resolve_with(&token, 5, online, || {
             reran.set(true);
             ran(USAGE)
         });
@@ -427,14 +540,14 @@ mod tests {
 
         let not_found = || Err(io::Error::from(io::ErrorKind::NotFound));
         assert!(matches!(
-            state.resolve_with(&token, 0, not_found),
+            state.resolve_with(&token, 0, online, not_found),
             QuotaOutcome::Transient
         ));
         let broken = || ran("garbage");
         assert!(matches!(
-            state.resolve_with(&token, 0, broken),
+            state.resolve_with(&token, 0, online, broken),
             QuotaOutcome::Transient
         ));
-        assert!(state.signed_out_at.is_none());
+        assert!(state.last.signed_out_mtime.is_none());
     }
 }

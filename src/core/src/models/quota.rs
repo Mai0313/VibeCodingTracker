@@ -1055,6 +1055,11 @@ pub struct AntigravityQuotaSnapshot {
     /// `agy acp --login` hint.
     #[serde(default)]
     pub needs_login: bool,
+    /// The sign-in file's mtime when agy last failed to sign in. agy is not run
+    /// again until the file changes, which a re-login does; kept here so the
+    /// hold outlives the process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_out_mtime: Option<std::time::SystemTime>,
 }
 
 /// One Antigravity limit, normalized.
