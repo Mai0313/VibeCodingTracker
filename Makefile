@@ -12,8 +12,8 @@ clean: ## Clean build artifacts and caches
 	@git gc --prune=now --aggressive
 
 fmt: ## Format code with rustfmt and auto-fix clippy warnings
-	cargo fmt --all
 	cargo clippy --all-targets --all-features --fix --allow-dirty --allow-staged
+	cargo fmt --all
 	cargo clippy --all-targets --all-features -- -D warnings
 
 build: ## Build release binary
