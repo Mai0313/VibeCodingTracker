@@ -8,14 +8,14 @@ These are minimal examples: they stop at "dump the JSON response". Field extract
 
 ## At a glance
 
-| Provider    | Credential file                                     | Quota endpoint                                                         | Refresh model                                    |
-| ----------- | --------------------------------------------------- | ---------------------------------------------------------------------- | ------------------------------------------------ |
-| Codex       | `~/.codex/auth.json`                                | `GET  chatgpt.com/backend-api/wham/usage` + reset-credit details       | `POST auth.openai.com/oauth/token` (rotates)     |
-| Claude Code | `~/.claude/.credentials.json`                       | `GET  api.anthropic.com/api/oauth/usage`                               | `POST platform.claude.com/v1/oauth/token`        |
-| Copilot     | `~/.copilot/config.json`                            | `GET  api.github.com/copilot_internal/user`                            | none (long-lived `gho_` token)                   |
-| Cursor      | `~/.config/cursor/auth.json`                        | `GET  cursor.com/api/usage-summary`                                    | reactive (official CLI keeps the file fresh)     |
-| Antigravity | `~/.gemini/antigravity-cli/antigravity-oauth-token` | `POST cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary` | `POST oauth2.googleapis.com/token` (no rotation) |
-| Grok        | `~/.grok/auth.json`                                 | `GET  cli-chat-proxy.grok.com/v1/billing?format=credits`               | `POST auth.x.ai/oauth2/token` (rotates)          |
+| Provider    | Credential file                                     | Quota endpoint                                                               | Refresh model                                    |
+| ----------- | --------------------------------------------------- | ---------------------------------------------------------------------------- | ------------------------------------------------ |
+| Codex       | `~/.codex/auth.json`                                | `GET  chatgpt.com/backend-api/wham/usage` + reset-credit details             | `POST auth.openai.com/oauth/token` (rotates)     |
+| Claude Code | `~/.claude/.credentials.json`                       | `GET  api.anthropic.com/api/oauth/usage`                                     | `POST platform.claude.com/v1/oauth/token`        |
+| Copilot     | `~/.copilot/config.json`                            | `GET  api.github.com/copilot_internal/user`                                  | none (long-lived `gho_` token)                   |
+| Cursor      | `~/.config/cursor/auth.json`                        | `GET  cursor.com/api/usage-summary`                                          | reactive (official CLI keeps the file fresh)     |
+| Antigravity | `~/.gemini/antigravity-cli/antigravity-oauth-token` | `POST daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary` | `POST oauth2.googleapis.com/token` (no rotation) |
+| Grok        | `~/.grok/auth.json`                                 | `GET  cli-chat-proxy.grok.com/v1/billing?format=credits`                     | `POST auth.x.ai/oauth2/token` (rotates)          |
 
 ## Client impersonation
 
@@ -182,7 +182,7 @@ Reactive. The `accessToken` is valid ~60 days (`offline_access` scope) and the o
 
 ## Antigravity
 
-Credential file (Linux) `~/.gemini/antigravity-cli/antigravity-oauth-token`: plain JSON, `.token.access_token`, `.token.refresh_token`, `.token.expiry`. On macOS the same blob lives in the Keychain instead (service `gemini`, account `antigravity`), sometimes wrapped with a `go-keyring-base64:` prefix; the field names are the same once unwrapped.
+Credential file (Linux) `~/.gemini/antigravity-cli/antigravity-oauth-token`: plain JSON, `.token.access_token`, `.token.refresh_token`, `.token.expiry`, plus `.auth_method` (`consumer` for a personal Google account, `gcp` for a Google Cloud sign-in) and, for Cloud sign-ins, `.project_id`. On macOS the same blob lives in the Keychain instead (service `gemini`, account `antigravity`), sometimes wrapped with a `go-keyring-base64:` prefix; the field names are the same once unwrapped.
 
 Antigravity also has a second, richer source when the app (or the `agy` CLI) is **running**: a local Connect-RPC language server on loopback (`RetrieveUserQuotaSummary` on `https://127.0.0.1:<port>/...`), discovered by scanning for the process and reading its `--csrf_token`. That path needs no OAuth but only works while the app is up. The recipe below is the **app-closed** path, the one that fits this file: credential file in, HTTP out, works over plain SSH.
 
@@ -190,22 +190,46 @@ Unlike the other providers, the stored `access_token` is short-lived (~1h) and n
 
 ### Fetch quota
 
-Two base URLs: `cloudcode-pa.googleapis.com` (prod) and `daily-cloudcode-pa.googleapis.com` (canary), same schema. The authoritative endpoint is `retrieveUserQuotaSummary`: two shared pools (Gemini, and everything non-Gemini incl. Claude / GPT-OSS), each with a rolling 5-hour and a weekly window.
+This is what agy itself sends for `/usage`:
+
+- **Host by `auth_method`.** `consumer` goes to `https://daily-cloudcode-pa.googleapis.com`, `gcp` to `https://cloudcode-pa.googleapis.com`, and `CLOUD_CODE_URL` overrides both. Despite its name, `daily-` is not a canary here: it is the host every personal account talks to.
+- **`project` is a required field of the request**, so the body is never `{}`. With a `project_id` in the credential file, agy sends that and also sets `X-Goog-User-Project` to it. Without one (every personal account), it first asks `loadCodeAssist` for the account's `cloudaicompanionProject` and sends no `X-Goog-User-Project`.
+- **User-Agent** is `antigravity/cli/<version> (aidev_client; os_type=<os>; arch=<arch>; auth_method=<auth_method>)`, `<version>` being what `agy --version` prints. It is not camouflage here: the server picks the models the client is eligible for, and with them the pools it reports, from the client and version in it. A bare `antigravity/1.5.5` gets the `Claude and GPT models` group without the Gemini one.
+
+A Business pay-as-you-go sign-in has no quota summary at all: agy skips the call and shows nothing.
 
 ```bash
+CRED=~/.gemini/antigravity-cli/antigravity-oauth-token
 # The stored access_token is ~1h-lived; if this 401s, run Refresh token below and use that access_token.
 # Where the agy CLI is installed, `agy models >/dev/null` refreshes it in place as a side effect, which
 # is the way through when you do not have the client_secret that Refresh token below needs.
-TOKEN=$(jq -r '.token.access_token' ~/.gemini/antigravity-cli/antigravity-oauth-token)
+TOKEN=$(jq -r '.token.access_token' "$CRED")
+METHOD=$(jq -r '.auth_method // "consumer"' "$CRED")
+if [[ "$METHOD" == gcp ]]; then BASE=https://cloudcode-pa.googleapis.com; else BASE=https://daily-cloudcode-pa.googleapis.com; fi
+BASE=${CLOUD_CODE_URL:-$BASE}
+UA="antigravity/cli/$(agy --version | grep -oE '[0-9]+(\.[0-9]+)+' | head -1) (aidev_client; os_type=linux; arch=amd64; auth_method=${METHOD})"
 
-curl -s -X POST "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary" \
+PROJECT=$(jq -r '.project_id // empty' "$CRED")
+if [[ -n "$PROJECT" ]]; then
+    USER_PROJECT=(-H "X-Goog-User-Project: ${PROJECT}")
+else
+    USER_PROJECT=()
+    PROJECT=$(curl -s -X POST "${BASE}/v1internal:loadCodeAssist" \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "User-Agent: ${UA}" \
+            -H "Content-Type: application/json" \
+        -d '{"metadata": {"ideType": "ANTIGRAVITY"}}' | jq -r '.cloudaicompanionProject')
+fi
+
+curl -s -X POST "${BASE}/v1internal:retrieveUserQuotaSummary" \
     -H "Authorization: Bearer ${TOKEN}" \
-    -H "User-Agent: antigravity" \
+    -H "User-Agent: ${UA}" \
     -H "Content-Type: application/json" \
-    -d '{}' | jq
+    "${USER_PROJECT[@]}" \
+    -d "{\"project\": \"${PROJECT}\"}" | jq
 ```
 
-The buckets are not flat. The response is a `groups` array, one entry per shared pool, each carrying its own `displayName` (`Gemini Models` / `Claude and GPT models`) and a `description` naming the models in it, with that pool's two buckets nested under `buckets`. A bucket carries `bucketId` (`gemini-5h` / `gemini-weekly` / `3p-5h` / `3p-weekly`), `displayName`, `window` (`5h` / `weekly`), `resetTime`, and `remainingFraction` (0…1, where 1 = full, so used% = `(1 - remainingFraction) * 100`). Its own `description` is a sentence about what has been consumed so far, and proto3 omits it entirely while the bucket is still full — treat it as optional rather than as something every bucket has. A top-level `description` restates the shared-limit rules.
+The buckets are not flat. The response is a `groups` array, one entry per shared pool, each carrying its own `displayName` (`Gemini Models` / `Claude and GPT models`) and a `description` naming the models in it, with that pool's buckets nested under `buckets`. A bucket carries `bucketId` (`gemini-5h` / `gemini-weekly` / `3p-5h` / `3p-weekly`), `displayName`, `window` (`5h` / `weekly`), `resetTime`, `disabled`, and `remainingFraction` (0…1, where 1 = full, so used% = `(1 - remainingFraction) * 100`). Its own `description` is a sentence about what has been consumed so far, and proto3 omits it entirely while the bucket is still full — treat it as optional rather than as something every bucket has. A top-level `description` restates the shared-limit rules. The pools, their windows and the bucket ids are the server's to choose (other account types get other groups and windows), so read them from the response rather than matching the ids above. `remainingFraction` is one arm of a oneof whose other arm is a raw `remainingAmount`, and a top-level `buckets` array is a deprecated flat copy.
 
 Older builds lack that RPC; the legacy fallbacks are 5h-only and take the same bearer token:
 
