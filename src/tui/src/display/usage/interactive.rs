@@ -301,17 +301,16 @@ impl QuotaRuntime {
                 .flatten()
                 .unwrap_or_default(),
         ));
-        let antigravity = Arc::new(Mutex::new(
-            present
-                .antigravity
-                .then(load_antigravity_cache)
-                .flatten()
-                .unwrap_or_default(),
-        ));
+        let antigravity_cached = present
+            .antigravity
+            .then(load_antigravity_cache)
+            .flatten()
+            .unwrap_or_default();
+        let antigravity = Arc::new(Mutex::new(antigravity_cached.clone()));
 
         // Antigravity sends no HTTP request of its own, so it needs no client.
         if present.antigravity {
-            let mut state = AntigravityState::default();
+            let mut state = AntigravityState::resume(antigravity_cached);
             spawn_quota_worker(
                 "antigravity",
                 Arc::clone(&antigravity),
