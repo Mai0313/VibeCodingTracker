@@ -30,7 +30,7 @@ Built with Rust for minimal resource footprint. The interactive TUI dashboard ty
 
 Choose your preferred view:
 
-- **Interactive Dashboard**: One terminal app with Usage, Analysis, Quota and Settings tabs, an immediate loading spinner, background incremental refreshes, a scrollable, sortable model list (arrow keys, `o`), a live per-process CPU/memory readout, and compact K/M/B number formatting
+- **Interactive Dashboard**: One terminal app with Usage, Analysis, Quota and Settings tabs, an immediate loading spinner, background incremental refreshes, a scrollable, sortable model list (arrow keys), a live per-process CPU/memory readout, and compact K/M/B number formatting
 - **Static Reports**: Professional tables for documentation
 - **Script-Friendly**: Plain text and JSON for automation
 - **Full Precision**: Export exact costs for accounting
@@ -128,17 +128,20 @@ Run `vct --help` to list the commands, and `vct <command> --help` for a command'
 
 `vct` with no command opens the interactive app, one screen with four tabs: `1 Usage`, `2 Analysis`, `3 Quota` and `4 Settings`. `vct usage`, `vct analysis` and `vct quota` open the same app on their own tab, while `--json`, `--text` and `--table` print and never open it. Without a terminal (piped or redirected), a bare `vct` prints the help and exits with status 2.
 
-| Key                 | Action                                                                          |
-| ------------------- | ------------------------------------------------------------------------------- |
-| `1`-`4`             | Jump to a tab                                                                   |
-| `Tab` / `Shift+Tab` | Next / previous tab (on the Settings tab, `Tab` switches between its two panes) |
-| `↑` / `↓`           | Move the selected row                                                           |
-| `o`                 | Cycle the sort column (Usage, Analysis)                                         |
-| `t`                 | Cycle the time range: day, week, month, all (Usage, Analysis)                   |
-| `r`                 | Refresh now (Usage, Analysis)                                                   |
-| `m`                 | Merge / split provider prefixes, saved to the config file (Usage)               |
-| `p`                 | Open the Provider Usage panel; `Esc` closes it (Usage)                          |
-| `q` / `Esc`         | Quit                                                                            |
+| Key                 | Action                                                              |
+| ------------------- | ------------------------------------------------------------------- |
+| `1`-`4`             | Jump to a tab                                                       |
+| `Tab` / `Shift+Tab` | Next / previous tab                                                 |
+| `↑` / `↓`           | Move the selected row                                               |
+| `Enter`             | Show the selected model's full numbers (Usage, Analysis)            |
+| `←` / `→`           | Sort by the column to the left / right (Usage, Analysis)            |
+| `[` / `]`           | Earlier / later time range: day, week, month, all (Usage, Analysis) |
+| `r`                 | Refresh now (Usage, Analysis)                                       |
+| `m`                 | Merge / split provider prefixes, saved to the config file (Usage)   |
+| `p`                 | Open the Provider Usage panel (Usage)                               |
+| `?`                 | List the current tab's keys                                         |
+| `Esc`               | Close the open panel                                                |
+| `q`                 | Quit                                                                |
 
 The Quota and Settings tabs scan no sessions. The first visit to Usage or Analysis starts that tab's scan, and only the tab on screen refreshes on its timer. The right side of the tab bar shows the time range and vct's own memory and CPU.
 
@@ -186,7 +189,7 @@ vct usage --table --merge-providers
 ```
 
 > [!NOTE]
-> `--table` and `--text` sort model rows by cost in ascending order, so the highest-spending model is listed last (right above the `TOTAL` row in `--table`); `--json` lists its rows in no fixed order. The app sorts by cost, highest first, and `o` cycles the sort column: cost, total, input, output, cache read, cache write, model name. The right side of the table title names the current sort (`cost ▼`). The app also hides models with zero usage in the selected range.
+> `--table` and `--text` sort model rows by cost in ascending order, so the highest-spending model is listed last (right above the `TOTAL` row in `--table`); `--json` lists its rows in no fixed order. The app sorts by cost, highest first, and `←` / `→` move the sort to the column on that side, whose header is highlighted. The right side of the table title names the current sort (`sort: cost ▼`). The app also hides models with zero usage in the selected range.
 
 > [!TIP]
 > The same model can show up as several rows when it is routed under different provider prefixes (`openai/gpt-5.5`, `azure/gpt-5.5`, plain `gpt-5.5`). `--merge-providers` collapses rows that share the base name after the first `/` (versions like `gpt-5.5` vs `gpt-5.4` stay separate) and sums their already-priced cost. On the Usage tab, press `m` to toggle it live (the choice is saved to `~/.vct/config.toml`, so the next launch remembers it); `--merge-providers` opens the tab already merged. `--json` is left as the raw per-model export.
@@ -195,24 +198,24 @@ vct usage --table --merge-providers
 
 ```
  vct  1 Usage  2 Analysis  3 Quota  4 Settings                         range  day  week  month  all   61.8 MB · CPU 0.1%
-┌ Models · $79.33 · 49.1M tokens · 3 models ─────────────────────────────────────────────────────────────────── cost ▼ ┐
-│Model                              Input     Output    Cache Read  Cache Write Total     Cost (USD)   Share           █
-│                                                                                                                      █
-│claude-opus-4-8                        25.7K      179K       42.9M        496K     43.6M       $77.59  █████████ 88.8%█
-│claude-haiku-4-5-20251001              5.57K     19.8K       5.20M       55.0K     5.28M        $1.34          █ 10.8%█
-│gemini-3.1-pro-preview                  129K     10.3K       66.0K       1.70K      207K        $0.40             0.4%█
-│                                                                                                                      █
-│                                                                                                                      █
+┌ Models · $79.33 · 49.1M tokens · 3 models ───────────────────────────────────────────────────────────── sort: cost ▼ ┐
+│Model                                  Input    Output  Cache Read Cache Write     Total   Cost (USD)            Share│
+│                                                                                                                      │
+│claude-opus-4-8                        25.7K      179K       42.9M        496K     43.6M       $77.59 ━━━━━━━━━  88.8%│
+│claude-haiku-4-5-20251001              5.57K     19.8K       5.20M       55.0K     5.28M        $1.34 ━          10.8%│
+│gemini-3.1-pro-preview                  129K     10.3K       66.0K       1.70K      207K        $0.40             0.4%│
+│                                                                                                                      │
+│                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-                                              Claude $78.93 · Gemini $0.40
-┌ Claude ──────────────┐┌ Codex ───────────────┐┌ Copilot ─────────────┐┌ Cursor ────────LIMIT ┐┌ Grok ────────────────┐
+                                            ● Claude $78.93  ● Gemini $0.40
+┌ ● Claude ────────────┐┌ ● Codex ─────────────┐┌ ● Copilot ───────────┐┌ ● Cursor ──────LIMIT ┐┌ ● Grok ──────────────┐
 │max 20x       just now││plus          just now││individual    just now││free          just now││SuperGrok     just now│
-│5h    ▰▱▱▱▱  13% 1h42m││5h    ▰▰▱▱▱  33% 12m  ││prem  ▰▱▱▱▱   3% 24d0h││total ▰▰▰▰▰  94% 16d0h││week  ▰▰▱▱▱  38% 3d4h │
-│7d    ▰▰▰▱▱  58% 1d23h││7d    ▰▰▱▱▱  36% 1h54m││reqs  ▰▱▱▱▱ 45/1500   ││auto  ▰▰▰▰▰ 100% 16d0h││ondmd $4.20/$50.00    │
-│Fable ▰▰▰▰▱  79% 1d23h││credits 0 · +3 reset  ││                      ││api   ▰▰▰▱▱  44% 16d0h││balance $12.00        │
+│5h    ━────  13% 1h42m││5h    ━━───  33% 12m  ││prem  ━────   3% 24d0h││total ━━━━━  94% 16d0h││week  ━━───  38% 3d4h │
+│7d    ━━━──  58% 1d23h││7d    ━━───  36% 1h54m││reqs  ━──── 45/1500   ││auto  ━━━━━ 100% 16d0h││ondmd $4.20/$50.00    │
+│Fable ━━━━─  79% 1d23h││credits 0 · +3 reset  ││                      ││api   ━━━──  44% 16d0h││balance $12.00        │
 │bal - · $0.00 used    ││reset expires 17d0h   ││                      ││                      ││                      │
 └──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘
-                ↑/↓ scroll  o sort  t range  m merge  p providers  r refresh  q quit  |  Star on GitHub
+ ↑↓ move  ←→ sort  [ ] range  p providers  m merge  ⏎ details  r refresh  1-4/tab view  ? help  q quit   Star on GitHub
 ```
 
 The Usage and Analysis tabs each start their scan on the first visit and draw a centered `Loading sessions...` spinner. Loading stays responsive to `q`, Ctrl+C, and resize events. Later scans keep the last successful data visible with a `Refreshing...` footer. A failed refresh keeps the last-known-good view and retries on the next scheduled or manual refresh. A range with no sessions shows an empty table.
@@ -314,18 +317,18 @@ vct then runs `vct ledger export` on each host over ssh and folds what comes bac
 `vct usage` shows **live quota usage for Claude Code, Codex, GitHub Copilot, Cursor, Grok, and Antigravity right in the dashboard — with zero setup.** No status-line hook, no credentials to enter: vct reads each provider's own credentials, calls its usage API (for Antigravity, asks the `agy` CLI) on a background thread, and keeps the panels current while you work. Every gauge is percent **used**, so a full bar means the window is spent, not untouched. (Prefer a quieter dashboard? Trim `panels` under `[usage.quota]` in [`config.toml`](#configuration), or set it to `[]` to hide the quota cards entirely. The per-provider cost line under the table is local scan data, not a quota panel, so it stays whatever you set here.)
 
 ```
-┌ Claude ──────────────┐┌ Codex ───────────────┐┌ Copilot ─────────────┐┌ Cursor ────────LIMIT ┐┌ Grok ────────────────┐
+┌ ● Claude ────────────┐┌ ● Codex ─────────────┐┌ ● Copilot ───────────┐┌ ● Cursor ──────LIMIT ┐┌ ● Grok ──────────────┐
 │max 20x       just now││plus          just now││individual    just now││free          just now││SuperGrok     just now│
-│5h    ▰▱▱▱▱  13% 1h42m││5h    ▰▰▱▱▱  33% 12m  ││prem  ▰▱▱▱▱   3% 24d0h││total ▰▰▰▰▰  94% 16d0h││week  ▰▰▱▱▱  38% 3d4h │
-│7d    ▰▰▰▱▱  58% 1d23h││7d    ▰▰▱▱▱  36% 1h54m││reqs  ▰▱▱▱▱ 45/1500   ││auto  ▰▰▰▰▰ 100% 16d0h││ondmd $4.20/$50.00    │
-│Fable ▰▰▰▰▱  79% 1d23h││credits 0 · +3 reset  ││                      ││api   ▰▰▰▱▱  44% 16d0h││balance $12.00        │
+│5h    ━────  13% 1h42m││5h    ━━───  33% 12m  ││prem  ━────   3% 24d0h││total ━━━━━  94% 16d0h││week  ━━───  38% 3d4h │
+│7d    ━━━──  58% 1d23h││7d    ━━───  36% 1h54m││reqs  ━──── 45/1500   ││auto  ━━━━━ 100% 16d0h││ondmd $4.20/$50.00    │
+│Fable ━━━━─  79% 1d23h││credits 0 · +3 reset  ││                      ││api   ━━━──  44% 16d0h││balance $12.00        │
 │bal - · $0.00 used    ││reset expires 17d0h   ││                      ││                      ││                      │
 └──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘
-┌ Antigravity ──────+2 ┐
+┌ ● Antigravity ────+2 ┐
 │-             just now│
 │Gemini Models         │
-│5h     ▰▰▱▱▱  23%     │
-│weekly ▰▱▱▱▱   8%     │
+│5h     ━━───  23%     │
+│weekly ━────   8%     │
 │Claude and GPT models │
 └──────────────────────┘
 ```
@@ -387,24 +390,24 @@ vct analysis --json --daily > today.json
 
 ```
  vct  1 Usage  2 Analysis  3 Quota  4 Settings                         range  day  week  month  all   61.9 MB · CPU 0.1%
-┌ Models · 135K lines · 1.80K tool calls · 3 models ────────────────────────────────────────────────────────── lines ▼ ┐
-│Model                                   Edit Lines  Read Lines  Write Lines Bash    Edit    Read    TodoWrite  Write  █
-│                                                                                                                      █
-│claude-opus-4-8                               12.4K       88.1K       9.02K     412     231     604         96      88█
-│gemini-3.1-pro-preview                        2.10K       14.8K       1.62K      84      44     112         16      15█
-│claude-haiku-4-5-20251001                       840       5.40K         610      31      16      42          6       5█
-│                                                                                                                      █
+┌ Models · 135K lines · 1.80K tool calls · 3 models ─────────────────────────────────────────────── sort: edit lines ▼ ┐
+│Model                                    Edit Lines  Read Lines Write Lines    Bash    Edit    Read  TodoWrite   Write│
+│                                                                                                                      │
+│claude-opus-4-8                               12.4K       88.1K       9.02K     412     231     604         96      88│
+│gemini-3.1-pro-preview                        2.10K       14.8K       1.62K      84      44     112         16      15│
+│claude-haiku-4-5-20251001                       840       5.40K         610      31      16      42          6       5│
+│                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌ Providers ───────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│Provider                 Edit Lines  Read Lines  Write Lines  Bash     Edit     Read     TodoWrite   Write    Days    │
+│Provider                  Edit Lines  Read Lines  Write Lines     Bash     Edit     Read   TodoWrite    Write     Days│
 │                                                                                                                      │
-│Claude                   13.2K       93.5K       9.63K        443      247      646      102         93       12      │
-│Gemini                   2.10K       14.8K       1.62K        84       44       112      16          15       3       │
+│● Claude                       13.2K       93.5K        9.63K      443      247      646         102       93       12│
+│● Gemini                       2.10K       14.8K        1.62K       84       44      112          16       15        3│
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-                           ↑/↓ scroll  o sort  t range  r refresh  q quit  |  Star on GitHub
+ ↑↓ move  ←→ sort  [ ] range  ⏎ details  r refresh  1-4/tab view  ? help  q quit                         Star on GitHub
 ```
 
-The table is sorted by total lines, highest first; `o` cycles the sort column: lines, edit lines, read lines, write lines, tool calls, model name.
+The table is sorted by edit lines, highest first; `←` / `→` move the sort to the column on that side, and the sorted column's header is highlighted.
 
 ### Preview: Table & JSON (`vct analysis`)
 
@@ -531,15 +534,15 @@ vct quota
 ```
  vct  1 Usage  2 Analysis  3 Quota  4 Settings                31.6 MB · CPU 0.0%
 
-┌ Claude ──────────────────────────────┐┌ Codex ───────────────────────────────┐
+┌ ● Claude ────────────────────────────┐┌ ● Codex ─────────────────────────────┐
 │max 5x                        just now││plus                          just now│
-│5h    ▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱  30%  ↻ 2h18m ││5h    ▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱   0%  ↻ 4h59m │
-│7d    ▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱  28%  ↻ 6d3h  ││7d    ▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱   1%  ↻ 6d8h  │
-│Fable ▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱  14%  ↻ 6d3h  ││credits 0 · +3 reset                  │
+│5h    ━━━━━━───────────  30%  ↻ 2h18m ││5h    ─────────────────   0%  ↻ 4h59m │
+│7d    ━━━━━────────────  28%  ↻ 6d3h  ││7d    ━────────────────   1%  ↻ 6d8h  │
+│Fable ━━━──────────────  14%  ↻ 6d3h  ││credits 0 · +3 reset                  │
 │bal - · $0.00 used                    ││reset expires 17d11h                  │
 └──────────────────────────────────────┘└──────────────────────────────────────┘
 
-                                     q quit
+ 1-4/tab view  ? help  q quit                                    Star on GitHub
 ```
 
 > `vct monitor` and the hidden alias `vct fetch` are removed. Use `vct quota` for the cards and `vct quota <provider>` for a raw response.
@@ -585,26 +588,34 @@ Run `vct config show` to print the file; its comments explain every setting.
 
 ### Settings Tab
 
-Press `4` in the app (or `Tab` over to it) to edit every `config.toml` setting as a form: sections on the left, that section's fields on the right, and under them the focused field's description, config key and default.
+Press `4` in the app (or `Tab` over to it) to edit every `config.toml` setting as a form: one list of every setting grouped by section, the section list on the left marking where the selection is, and under them the selected field's description, config key and default. A `*` marks a field changed from its default.
 
 ```
  vct  1 Usage  2 Analysis  3 Quota  4 Settings                                                        31.8 MB · CPU 0.0%
-┌ Sections ──────┐┌ Usage ─────────────────────────────────────────────────────────────────────────────────────────────┐
-│ General        ││ Merge models across providers                                                               [x] on │
-│ Usage          ││ Redraw interval                                                                           ‹ 10 s › │
-│ Analysis       ││ Quota panel: Claude                                                                         [x] on │
-│ Providers      ││ Quota panel: Codex                                                                          [x] on │
-│ Remotes        ││ Quota panel: Copilot                                                                        [x] on │
-│ Performance    ││ Quota panel: Cursor                                                                         [x] on │
-│ Logging        ││ Quota panel: Grok                                                                           [x] on │
+┌ Sections ──────┐┌ Settings ─────────────────────────────────────────────────────────────────────────────── 27 more ↓ ┐
+│   General      ││ General                                                                                            │
+│ › Usage        ││   Default time range                                                                        ‹ all ›│
+│   Analysis     ││   Check for updates on start                                                                 [x] on│
+│   Providers    ││                                                                                                    │
+│   Remotes      ││ Usage                                                                                              │
+│   Performance  ││   Merge models across providers                                                             [ ] off│
+│   Logging      ││   Redraw interval                                                                          ‹ 10 s ›│
+│                ││   Quota panel: Claude                                                                        [x] on│
+│                ││   Quota panel: Codex                                                                         [x] on│
+│                ││   Quota panel: Copilot                                                                       [x] on│
+│                ││   Quota panel: Cursor                                                                        [x] on│
+│                ││   Quota panel: Grok                                                                          [x] on│
+│                ││   Quota panel: Antigravity                                                                   [x] on│
+│                ││   Quota poll interval                                                                      ‹ 60 s ›│
 └────────────────┘└────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌ Quota panel: Claude · usage.quota.panels ─────────────────────────────────────────────────────────── default: [x] on ┐
-│Which live quota panels to show in the app, by provider name. An empty list hides every quota card.                   │
+│Which live quota panels to show in the app (by provider name: `claude` / `codex` / `copilot` / `cursor` / `grok` /    │
+│`antigravity`). An empty list hides every quota card.                                                                 │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-                       ↑↓ move  ←→ change  ⏎ edit  tab pane  x reset  e editor  1-4 view  q quit
+ ↑↓ move  ←→ change  space toggle  ⏎ edit  x reset  e editor  1-4/tab view  ? help  q quit               Star on GitHub
 ```
 
-- `↑` / `↓` move, `Tab` switches pane, `←` / `→` change a value (toggle, step a number, cycle a choice), `x` resets the field to its default, and `e` opens the file in `$VISUAL` / `$EDITOR` and reloads it when the editor exits.
+- `↑` / `↓` move through every setting, `PgUp` / `PgDn` jump a section, `←` / `→` change a value (toggle, step a number, cycle a choice), `Space` toggles, `x` resets the field to its default, and `e` opens the file in `$VISUAL` / `$EDITOR` and reloads it when the editor exits.
 - `Enter` opens an editor: a list to pick from, a number or text input, or the remote host list (`a` add, `Enter` edit, `d` delete).
 - Each change is written to the file at once and keeps the file's comments.
 - Changes to merge, the refresh intervals, the quota panels, the quota poll interval and the provider toggles show in the running app (quota panels when you leave the Settings tab). Default time range, auto update, scan threads, logging and remotes apply from the next start, and the form says so on those fields.
