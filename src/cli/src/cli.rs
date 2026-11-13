@@ -122,6 +122,9 @@ pub enum Commands {
         all: bool,
     },
 
+    /// Watch live quota usage for every signed-in provider.
+    Monitor,
+
     /// Display version information.
     Version {
         /// Output as JSON.

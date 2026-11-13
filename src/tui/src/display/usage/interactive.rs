@@ -62,13 +62,13 @@ use vct_core::utils::{
 ///
 /// The placement formula is shared; only these numbers differ between the
 /// always-on grid under the table and the full-screen `Q` overlay.
-struct GridSpec {
+pub(super) struct GridSpec {
     /// Narrowest a card may be, and the divisor that decides the column count.
-    min_w: u16,
+    pub(super) min_w: u16,
     /// Widest a card grows to; past this the grid centers its slack instead.
-    max_w: u16,
+    pub(super) max_w: u16,
     /// Card height, borders included.
-    height: u16,
+    pub(super) height: u16,
 }
 
 /// The always-on grid under the model table.
@@ -139,13 +139,13 @@ const ANTIGRAVITY_LABEL_W: u16 = 9;
 
 /// Which provider quota panels have credentials on this machine.
 #[derive(Clone, Copy, Default)]
-struct QuotaPresence {
-    claude: bool,
-    codex: bool,
-    copilot: bool,
-    cursor: bool,
-    grok: bool,
-    antigravity: bool,
+pub(super) struct QuotaPresence {
+    pub(super) claude: bool,
+    pub(super) codex: bool,
+    pub(super) copilot: bool,
+    pub(super) cursor: bool,
+    pub(super) grok: bool,
+    pub(super) antigravity: bool,
 }
 
 impl QuotaPresence {
@@ -190,23 +190,23 @@ impl QuotaPresence {
 }
 
 /// Borrowed quota state passed to the render frame.
-struct QuotaView<'a> {
-    claude: &'a ClaudeQuotaSnapshot,
-    codex: &'a CodexQuotaSnapshot,
-    copilot: &'a CopilotQuotaSnapshot,
-    cursor: &'a CursorQuotaSnapshot,
-    grok: &'a GrokQuotaSnapshot,
-    antigravity: &'a AntigravityQuotaSnapshot,
-    present: QuotaPresence,
+pub(super) struct QuotaView<'a> {
+    pub(super) claude: &'a ClaudeQuotaSnapshot,
+    pub(super) codex: &'a CodexQuotaSnapshot,
+    pub(super) copilot: &'a CopilotQuotaSnapshot,
+    pub(super) cursor: &'a CursorQuotaSnapshot,
+    pub(super) grok: &'a GrokQuotaSnapshot,
+    pub(super) antigravity: &'a AntigravityQuotaSnapshot,
+    pub(super) present: QuotaPresence,
     /// Whether the quota surface is shown at all. `false` when
     /// `usage.quota.panels` is empty, which drops the card grid and its digest.
     /// It does not touch the Provider Usage line: that is local scan data, not
     /// a quota panel.
-    band_enabled: bool,
+    pub(super) band_enabled: bool,
     /// Whether the Provider Usage detail panel is open (`p`).
-    provider_panel_open: bool,
+    pub(super) provider_panel_open: bool,
     /// Whether the full-detail quota overlay is open (`Q`).
-    overlay_open: bool,
+    pub(super) overlay_open: bool,
 }
 
 /// Upper bound on rows the [`UpdateTracker`] remembers for change highlighting.
@@ -233,20 +233,24 @@ impl Drop for QuotaShutdownGuard {
     }
 }
 
-struct QuotaRuntime {
-    present: QuotaPresence,
-    band_enabled: bool,
-    claude: Arc<Mutex<ClaudeQuotaSnapshot>>,
-    codex: Arc<Mutex<CodexQuotaSnapshot>>,
-    copilot: Arc<Mutex<CopilotQuotaSnapshot>>,
-    cursor: Arc<Mutex<CursorQuotaSnapshot>>,
-    grok: Arc<Mutex<GrokQuotaSnapshot>>,
-    antigravity: Arc<Mutex<AntigravityQuotaSnapshot>>,
+pub(super) struct QuotaRuntime {
+    pub(super) present: QuotaPresence,
+    pub(super) band_enabled: bool,
+    pub(super) claude: Arc<Mutex<ClaudeQuotaSnapshot>>,
+    pub(super) codex: Arc<Mutex<CodexQuotaSnapshot>>,
+    pub(super) copilot: Arc<Mutex<CopilotQuotaSnapshot>>,
+    pub(super) cursor: Arc<Mutex<CursorQuotaSnapshot>>,
+    pub(super) grok: Arc<Mutex<GrokQuotaSnapshot>>,
+    pub(super) antigravity: Arc<Mutex<AntigravityQuotaSnapshot>>,
     _guard: QuotaShutdownGuard,
 }
 
 impl QuotaRuntime {
-    fn start(quota_panels: &[String], providers: ProvidersConfig, quota_refresh_secs: u64) -> Self {
+    pub(super) fn start(
+        quota_panels: &[String],
+        providers: ProvidersConfig,
+        quota_refresh_secs: u64,
+    ) -> Self {
         let panel_on = |name: &str| vct_core::config::quota_panel_selected(quota_panels, name);
         let band_enabled = !quota_panels.is_empty();
         let mut present = if band_enabled {
@@ -1119,22 +1123,22 @@ fn render_usage_frame_with_status<B: Backend<Error: Send + Sync + 'static>>(
                 };
                 let card_w = cells.first().map_or(CARD_GRID.min_w, |cell| cell.width);
                 if quota.present.claude {
-                    place(f, claude_card(quota.claude, now, card_w));
+                    place(f, claude_card(quota.claude, now, card_w, false));
                 }
                 if quota.present.codex {
-                    place(f, codex_card(quota.codex, now, card_w));
+                    place(f, codex_card(quota.codex, now, card_w, false));
                 }
                 if quota.present.copilot {
-                    place(f, copilot_card(quota.copilot, now, card_w));
+                    place(f, copilot_card(quota.copilot, now, card_w, false));
                 }
                 if quota.present.cursor {
-                    place(f, cursor_card(quota.cursor, now, card_w));
+                    place(f, cursor_card(quota.cursor, now, card_w, false));
                 }
                 if quota.present.grok {
-                    place(f, grok_card(quota.grok, now, card_w));
+                    place(f, grok_card(quota.grok, now, card_w, false));
                 }
                 if quota.present.antigravity {
-                    place(f, antigravity_card(quota.antigravity, now, card_w));
+                    place(f, antigravity_card(quota.antigravity, now, card_w, false));
                 }
             } else if quota_area.height > 0 {
                 f.render_widget(
@@ -1356,12 +1360,21 @@ fn gauge_color(pct: f64) -> RatatuiColor {
     }
 }
 
-/// Renders a 5-segment mini bar like `▰▰▱▱▱` (any usage shows one block).
-fn mini_bar(pct: f64) -> String {
-    mini_bar_n(pct, 5)
+/// Cells a gauge bar gets in a card `inner_w` columns wide.
+///
+/// Five everywhere but the monitor, whose `wide` bars take what the label, the
+/// percent and a full reset marker (`  ↻ 23h59m`) leave over.
+fn bar_cells(label_w: usize, inner_w: u16, wide: bool) -> usize {
+    if wide {
+        usize::from(inner_w)
+            .saturating_sub(label_w + 1 + 5 + 10)
+            .max(5)
+    } else {
+        5
+    }
 }
 
-/// [`mini_bar`] with a caller-chosen cell count, for the narrower digest bar.
+/// Renders a `cells`-segment mini bar like `▰▰▱▱▱` (any usage shows one block).
 fn mini_bar_n(pct: f64, cells: usize) -> String {
     let filled = ((pct / (100.0 / cells as f64)).ceil() as i64).clamp(0, cells as i64) as usize;
     (0..cells)
@@ -1428,7 +1441,7 @@ fn provider_share_bar(rows: &[ProviderTotal<'_, ProviderStats>], width: u16) -> 
 }
 
 /// A dim gray line for placeholder / hint text.
-fn dim_line(text: &str) -> Line<'static> {
+pub(super) fn dim_line(text: &str) -> Line<'static> {
     Line::from(Span::styled(
         text.to_string(),
         Style::default().fg(RatatuiColor::DarkGray),
@@ -1544,25 +1557,25 @@ fn share_cell(value: i64, total: i64, width: u16) -> String {
 }
 
 /// Collects every present provider's card, in the fixed render order.
-fn collect_cards(quota: &QuotaView, now: i64, width: u16) -> Vec<QuotaCard> {
+fn collect_cards(quota: &QuotaView, now: i64, width: u16, wide: bool) -> Vec<QuotaCard> {
     let mut cards = Vec::with_capacity(MAX_QUOTA_PANELS);
     if quota.present.claude {
-        cards.push(claude_card(quota.claude, now, width));
+        cards.push(claude_card(quota.claude, now, width, wide));
     }
     if quota.present.codex {
-        cards.push(codex_card(quota.codex, now, width));
+        cards.push(codex_card(quota.codex, now, width, wide));
     }
     if quota.present.copilot {
-        cards.push(copilot_card(quota.copilot, now, width));
+        cards.push(copilot_card(quota.copilot, now, width, wide));
     }
     if quota.present.cursor {
-        cards.push(cursor_card(quota.cursor, now, width));
+        cards.push(cursor_card(quota.cursor, now, width, wide));
     }
     if quota.present.grok {
-        cards.push(grok_card(quota.grok, now, width));
+        cards.push(grok_card(quota.grok, now, width, wide));
     }
     if quota.present.antigravity {
-        cards.push(antigravity_card(quota.antigravity, now, width));
+        cards.push(antigravity_card(quota.antigravity, now, width, wide));
     }
     cards
 }
@@ -1751,38 +1764,7 @@ fn render_quota_overlay(f: &mut Frame, area: Rect, quota: &QuotaView, now: i64) 
         width: outer.width.saturating_sub(2),
         height: outer.height.saturating_sub(2),
     };
-    // Settle how many cards get drawn before laying any out, so the width a
-    // card is built for and the cell it is drawn into come from the same
-    // layout. A card's lines are built for the width they will be drawn at,
-    // never for the spec's maximum, or the fitting every line builder does
-    // would be against a cell the card never gets. `collect_cards` pushes one
-    // card per present provider, so the count the grid needs is known before
-    // the first card exists.
-    let present = quota.present.count();
-    // Cards grow to the tallest one (Antigravity lists a line per pool and per
-    // limit), but only while every provider still fits: a taller card never
-    // costs another provider its place.
-    let tallest = collect_cards(quota, now, OVERLAY_GRID.min_w)
-        .iter()
-        .map(|card| card.lines.len())
-        .max()
-        .unwrap_or(0);
-    let grown = GridSpec {
-        height: OVERLAY_GRID.height.max(tallest as u16 + 2),
-        ..OVERLAY_GRID
-    };
-    let spec = if grid_height(&grown, inner.width, present) <= inner.height {
-        grown
-    } else {
-        OVERLAY_GRID
-    };
-    let rows_that_fit = usize::from(inner.height / spec.height);
-    let (cols, _) = quota_grid(&spec, inner.width, present);
-    let fits = present.min(cols.saturating_mul(rows_that_fit));
-    let hidden = present - fits;
-    let cells = grid_cells(&spec, inner, fits);
-    let card_w = cells.first().map_or(spec.min_w, |cell| cell.width);
-    let cards = collect_cards(quota, now, card_w);
+    let (cards, hidden) = fit_cards(&OVERLAY_GRID, inner, quota, now, false);
 
     let mut block = Block::default()
         .borders(Borders::ALL)
@@ -1802,21 +1784,71 @@ fn render_quota_overlay(f: &mut Frame, area: Rect, quota: &QuotaView, now: i64) 
     );
     f.render_widget(block, outer);
 
-    // An empty overlay would be a dead end, so say why it is empty. The band
-    // being switched off is a setting, not a missing credential.
+    // An empty overlay would be a dead end, so say why it is empty.
     if cards.is_empty() {
-        let reason = if quota.band_enabled {
-            "No provider on this machine has quota credentials."
-        } else {
-            "Quota panels are off: set `panels` under [usage.quota] in ~/.vct/config.toml."
-        };
-        f.render_widget(Paragraph::new(dim_line(reason)).centered(), inner);
+        f.render_widget(
+            Paragraph::new(dim_line(no_cards_reason(quota))).centered(),
+            inner,
+        );
         return;
     }
 
-    for (cell, card) in cells.into_iter().zip(&cards) {
-        render_quota_card(f, cell, card);
+    for (cell, card) in &cards {
+        render_quota_card(f, *cell, card);
     }
+}
+
+/// Why a quota surface has no card to show. The band being switched off is a
+/// setting, not a missing credential.
+pub(super) fn no_cards_reason(quota: &QuotaView) -> &'static str {
+    if quota.band_enabled {
+        "No provider on this machine has quota credentials."
+    } else {
+        "Quota panels are off: set `panels` under [usage.quota] in ~/.vct/config.toml."
+    }
+}
+
+/// Builds the cards that fit `area` on a `base` grid, each with the cell it is
+/// drawn into, plus the number of providers that did not fit.
+pub(super) fn fit_cards(
+    base: &GridSpec,
+    area: Rect,
+    quota: &QuotaView,
+    now: i64,
+    wide: bool,
+) -> (Vec<(Rect, QuotaCard)>, usize) {
+    // Settle how many cards get drawn before laying any out, so the width a
+    // card is built for and the cell it is drawn into come from the same
+    // layout. A card's lines are built for the width they will be drawn at,
+    // never for the spec's maximum, or the fitting every line builder does
+    // would be against a cell the card never gets. `collect_cards` pushes one
+    // card per present provider, so the count the grid needs is known before
+    // the first card exists.
+    let present = quota.present.count();
+    // Cards grow to the tallest one (Antigravity lists a line per pool and per
+    // limit), but only while every provider still fits: a taller card never
+    // costs another provider its place.
+    let tallest = collect_cards(quota, now, base.min_w, wide)
+        .iter()
+        .map(|card| card.lines.len())
+        .max()
+        .unwrap_or(0);
+    let grown = GridSpec {
+        height: base.height.max(tallest as u16 + 2),
+        ..*base
+    };
+    let spec = if grid_height(&grown, area.width, present) <= area.height {
+        &grown
+    } else {
+        base
+    };
+    let rows_that_fit = usize::from(area.height / spec.height);
+    let (cols, _) = quota_grid(spec, area.width, present);
+    let fits = present.min(cols.saturating_mul(rows_that_fit));
+    let cells = grid_cells(spec, area, fits);
+    let card_w = cells.first().map_or(spec.min_w, |cell| cell.width);
+    let cards = collect_cards(quota, now, card_w, wide);
+    (cells.into_iter().zip(cards).collect(), present - fits)
 }
 
 /// Renders the Provider Usage totals: a three-column table over a stacked share
@@ -2091,7 +2123,7 @@ fn quota_digest(items: &[DigestItem], width: u16) -> Line<'static> {
 /// the `Q` overlay rebuilds its cards at its own roomier width. The height is
 /// not applied here: the list is ordered most-important-first, and a cell too
 /// short for it keeps the head while [`render_quota_card`] counts the rest.
-struct QuotaCard {
+pub(super) struct QuotaCard {
     title: &'static str,
     color: RatatuiColor,
     limit_reached: bool,
@@ -2107,7 +2139,7 @@ fn card_inner_w(width: u16) -> u16 {
 ///
 /// The trailing flags share the top border: `+2` for hidden lines, `LIMIT` for a
 /// spent window. `+2` is the promise that the overlay has more to show.
-fn render_quota_card(f: &mut Frame, area: Rect, card: &QuotaCard) {
+pub(super) fn render_quota_card(f: &mut Frame, area: Rect, card: &QuotaCard) {
     let capacity = usize::from(area.height.saturating_sub(2));
     let hidden = card.lines.len().saturating_sub(capacity);
 
@@ -2206,6 +2238,9 @@ fn staleness(fetched_at: i64, now: i64) -> (String, RatatuiColor) {
 /// The reset marker is fitted to what is left: full (`↻ 2h11m`), then bare
 /// (`2h11m`), then dropped — a narrow card loses the marker rather than having
 /// its duration truncated into a smaller, plausible one.
+///
+/// `wide` stretches the bar over whatever the label, percent and a full reset
+/// marker leave of `inner_w`, for the monitor's roomier cards.
 fn gauge_line(
     label: &str,
     label_w: usize,
@@ -2213,20 +2248,22 @@ fn gauge_line(
     reset: Option<i64>,
     now: i64,
     inner_w: u16,
+    wide: bool,
 ) -> Line<'static> {
     let color = gauge_color(pct);
+    let bar = bar_cells(label_w, inner_w, wide);
     let mut spans = vec![
         Span::styled(
             format!("{label:<label_w$} "),
             Style::default().fg(RatatuiColor::Gray),
         ),
-        Span::styled(mini_bar(pct), Style::default().fg(color)),
+        Span::styled(mini_bar_n(pct, bar), Style::default().fg(color)),
         Span::styled(format!(" {pct:>3.0}%"), Style::default().fg(color)),
     ];
     if let Some(reset) = reset {
         let text = format_duration_until(reset, now);
         // label + separator + bar + " nnn%".
-        let used = label_w + 1 + 5 + 5;
+        let used = label_w + 1 + bar + 5;
         let room = usize::from(inner_w).saturating_sub(used);
         let width = text.chars().count();
         let marker = if room >= width + 4 {
@@ -2259,14 +2296,22 @@ fn gauge_line_value(
     pct: f64,
     value: &str,
     inner_w: u16,
+    wide: bool,
 ) -> Line<'static> {
     let color = gauge_color(pct);
+    // As long as the gauges above it where the value leaves room, shorter
+    // where it does not: this line carries no percent or reset marker.
+    let room = usize::from(inner_w).saturating_sub(label_w + 2 + value.chars().count());
+    let bar = bar_cells(label_w, inner_w, wide).min(room);
     let mut spans = vec![Span::styled(
         format!("{label:<label_w$} "),
         Style::default().fg(RatatuiColor::Gray),
     )];
-    if label_w + 1 + 5 + 1 + value.chars().count() <= usize::from(inner_w) {
-        spans.push(Span::styled(mini_bar(pct), Style::default().fg(color)));
+    if bar >= 5 {
+        spans.push(Span::styled(
+            mini_bar_n(pct, bar),
+            Style::default().fg(color),
+        ));
         spans.push(Span::styled(
             format!(" {value}"),
             Style::default().fg(color),
@@ -2330,7 +2375,7 @@ fn label_width(labels: &[&str]) -> usize {
 }
 
 /// Builds the Claude card: plan, 5h / 7d / per-model gauges, then balance.
-fn claude_card(claude: &ClaudeQuotaSnapshot, now: i64, width: u16) -> QuotaCard {
+fn claude_card(claude: &ClaudeQuotaSnapshot, now: i64, width: u16, wide: bool) -> QuotaCard {
     let inner = card_inner_w(width);
     // The scoped row's label shares the gauge label column with `5h` / `7d`, so
     // every character past `SCOPED_LABEL_W` would come straight off the bars.
@@ -2366,6 +2411,7 @@ fn claude_card(claude: &ClaudeQuotaSnapshot, now: i64, width: u16) -> QuotaCard 
             w.resets_at_unix,
             now,
             inner,
+            wide,
         ));
         has_data = true;
     }
@@ -2377,6 +2423,7 @@ fn claude_card(claude: &ClaudeQuotaSnapshot, now: i64, width: u16) -> QuotaCard 
             w.resets_at_unix,
             now,
             inner,
+            wide,
         ));
         has_data = true;
     }
@@ -2390,6 +2437,7 @@ fn claude_card(claude: &ClaudeQuotaSnapshot, now: i64, width: u16) -> QuotaCard 
             w.resets_at_unix,
             now,
             inner,
+            wide,
         ));
         has_data = true;
     }
@@ -2410,7 +2458,7 @@ fn claude_card(claude: &ClaudeQuotaSnapshot, now: i64, width: u16) -> QuotaCard 
 }
 
 /// Builds the Codex card: plan, 5h / 7d gauges, credits, then reset extras.
-fn codex_card(codex: &CodexQuotaSnapshot, now: i64, width: u16) -> QuotaCard {
+fn codex_card(codex: &CodexQuotaSnapshot, now: i64, width: u16, wide: bool) -> QuotaCard {
     let inner = card_inner_w(width);
     let label_w = label_width(&["5h", "7d"]);
     let title = match codex.source {
@@ -2444,6 +2492,7 @@ fn codex_card(codex: &CodexQuotaSnapshot, now: i64, width: u16) -> QuotaCard {
                 w.resets_at_unix,
                 now,
                 inner,
+                wide,
             ));
         }
         if let Some(w) = &codex.secondary {
@@ -2454,6 +2503,7 @@ fn codex_card(codex: &CodexQuotaSnapshot, now: i64, width: u16) -> QuotaCard {
                 w.resets_at_unix,
                 now,
                 inner,
+                wide,
             ));
         }
         // Session-fallback data stays visible alongside the re-login hint.
@@ -2477,7 +2527,7 @@ fn codex_card(codex: &CodexQuotaSnapshot, now: i64, width: u16) -> QuotaCard {
 }
 
 /// Builds the Copilot card: plan, premium percent gauge, request-count gauge.
-fn copilot_card(copilot: &CopilotQuotaSnapshot, now: i64, width: u16) -> QuotaCard {
+fn copilot_card(copilot: &CopilotQuotaSnapshot, now: i64, width: u16, wide: bool) -> QuotaCard {
     let inner = card_inner_w(width);
     let label_w = label_width(&["prem", "reqs"]);
 
@@ -2499,6 +2549,7 @@ fn copilot_card(copilot: &CopilotQuotaSnapshot, now: i64, width: u16) -> QuotaCa
             w.resets_at_unix,
             now,
             inner,
+            wide,
         ));
         // A second gauge showing the premium requests as used/total counts.
         if let (Some(rem), Some(total)) = (copilot.premium_remaining, copilot.premium_entitlement)
@@ -2512,6 +2563,7 @@ fn copilot_card(copilot: &CopilotQuotaSnapshot, now: i64, width: u16) -> QuotaCa
                 pct,
                 &format!("{used}/{total}"),
                 inner,
+                wide,
             ));
         }
         has_data = true;
@@ -2533,7 +2585,7 @@ fn copilot_card(copilot: &CopilotQuotaSnapshot, now: i64, width: u16) -> QuotaCa
 }
 
 /// Builds the Cursor card: plan, total / auto / api gauges, on-demand spend.
-fn cursor_card(cursor: &CursorQuotaSnapshot, now: i64, width: u16) -> QuotaCard {
+fn cursor_card(cursor: &CursorQuotaSnapshot, now: i64, width: u16, wide: bool) -> QuotaCard {
     let inner = card_inner_w(width);
     let label_w = label_width(&["total", "auto", "api"]);
 
@@ -2560,6 +2612,7 @@ fn cursor_card(cursor: &CursorQuotaSnapshot, now: i64, width: u16) -> QuotaCard 
                 w.resets_at_unix,
                 now,
                 inner,
+                wide,
             ));
             has_data = true;
         }
@@ -2583,7 +2636,7 @@ fn cursor_card(cursor: &CursorQuotaSnapshot, now: i64, width: u16) -> QuotaCard 
 }
 
 /// Builds the Grok card: plan, included-allowance gauge, on-demand and prepaid.
-fn grok_card(grok: &GrokQuotaSnapshot, now: i64, width: u16) -> QuotaCard {
+fn grok_card(grok: &GrokQuotaSnapshot, now: i64, width: u16, wide: bool) -> QuotaCard {
     let inner = card_inner_w(width);
     // The label names the period the allowance runs on, which the API reports
     // per account; an unlabelled window falls back to "incl".
@@ -2609,6 +2662,7 @@ fn grok_card(grok: &GrokQuotaSnapshot, now: i64, width: u16) -> QuotaCard {
             w.resets_at_unix,
             now,
             inner,
+            wide,
         ));
         has_data = true;
     }
@@ -2622,6 +2676,7 @@ fn grok_card(grok: &GrokQuotaSnapshot, now: i64, width: u16) -> QuotaCard {
             (used / cap * 100.0).clamp(0.0, 100.0),
             &format!("{}/{}", format_cost_compact(used), format_cost_compact(cap)),
             inner,
+            wide,
         )),
         (Some(used), _) => {
             if let Some(line) =
@@ -2656,7 +2711,12 @@ fn grok_card(grok: &GrokQuotaSnapshot, now: i64, width: u16) -> QuotaCard {
 /// Builds the Antigravity card: each pool's name, then one gauge per limit
 /// named by its window. `/usage` names no plan, so the first line carries only
 /// the snapshot's age.
-fn antigravity_card(antigravity: &AntigravityQuotaSnapshot, now: i64, width: u16) -> QuotaCard {
+fn antigravity_card(
+    antigravity: &AntigravityQuotaSnapshot,
+    now: i64,
+    width: u16,
+    wide: bool,
+) -> QuotaCard {
     let inner = card_inner_w(width);
     let mut lines: Vec<Line> = vec![plan_line(None, antigravity.fetched_at, now, inner)];
     if antigravity.needs_login {
@@ -2689,6 +2749,7 @@ fn antigravity_card(antigravity: &AntigravityQuotaSnapshot, now: i64, width: u16
                 bucket.usage.resets_at_unix,
                 now,
                 inner,
+                wide,
             ));
         }
     }
@@ -2793,6 +2854,21 @@ mod tests {
             total_cost: 0.0,
             days_count: 1,
         }
+    }
+
+    #[test]
+    fn wide_value_gauge_keeps_a_bar_beside_a_long_value() {
+        let text = line_text(gauge_line_value(
+            "ondmd",
+            5,
+            25.0,
+            "$123.45/$500.00",
+            38,
+            true,
+        ));
+        assert!(text.contains('▰'), "{text}");
+        assert!(text.ends_with("$123.45/$500.00"), "{text}");
+        assert!(text.chars().count() <= 38, "{text}");
     }
 
     #[test]
@@ -2916,7 +2992,7 @@ mod tests {
             reset_credit_expirations: Some(vec![Some(now + 2 * 3_600 + 13 * 60)]),
             ..Default::default()
         };
-        let rendered = render_min_card(&codex_card(&codex, now, CARD_GRID.min_w));
+        let rendered = render_min_card(&codex_card(&codex, now, CARD_GRID.min_w, false));
 
         assert!(rendered.contains("reset expires 2h13m"), "got:\n{rendered}");
         assert!(rendered.contains("just now"), "got:\n{rendered}");
@@ -2936,7 +3012,7 @@ mod tests {
             ..Default::default()
         };
 
-        let rendered = render_min_card(&codex_card(&codex, now, CARD_GRID.min_w));
+        let rendered = render_min_card(&codex_card(&codex, now, CARD_GRID.min_w, false));
         assert!(rendered.contains("7d"), "got:\n{rendered}");
         assert!(!rendered.contains("5h"), "got:\n{rendered}");
     }
@@ -2985,7 +3061,7 @@ mod tests {
             prepaid_balance_dollars: Some(2.50),
             ..Default::default()
         };
-        let rendered = render_min_card(&grok_card(&grok, now, CARD_GRID.min_w));
+        let rendered = render_min_card(&grok_card(&grok, now, CARD_GRID.min_w, false));
 
         assert!(rendered.contains("SuperGrok"), "got:\n{rendered}");
         assert!(rendered.contains("week"));
@@ -3008,7 +3084,7 @@ mod tests {
             prepaid_balance_dollars: Some(12345.0),
             ..Default::default()
         };
-        let rendered = render_min_card(&grok_card(&grok, 0, CARD_GRID.min_w));
+        let rendered = render_min_card(&grok_card(&grok, 0, CARD_GRID.min_w, false));
         assert!(rendered.contains("$1.24K/$5.00K"), "got:\n{rendered}");
         assert!(rendered.contains("balance $12.3K"), "got:\n{rendered}");
     }
@@ -3027,7 +3103,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let rendered = render_min_card(&grok_card(&grok, now, CARD_GRID.min_w));
+        let rendered = render_min_card(&grok_card(&grok, now, CARD_GRID.min_w, false));
 
         assert!(rendered.contains("incl"));
         assert!(!rendered.contains("on-demand"));
@@ -3038,14 +3114,14 @@ mod tests {
     /// login hint rather than an empty box.
     #[test]
     fn grok_panel_reports_missing_data_and_a_needed_login() {
-        let rendered = render_min_card(&grok_card(&Default::default(), 0, CARD_GRID.min_w));
+        let rendered = render_min_card(&grok_card(&Default::default(), 0, CARD_GRID.min_w, false));
         assert!(rendered.contains("no Grok quota"));
 
         let grok = GrokQuotaSnapshot {
             needs_login: true,
             ..Default::default()
         };
-        let rendered = render_min_card(&grok_card(&grok, 0, CARD_GRID.min_w));
+        let rendered = render_min_card(&grok_card(&grok, 0, CARD_GRID.min_w, false));
         assert!(rendered.contains(GROK_LOGIN_HINT));
         assert!(!rendered.contains("no Grok quota"));
     }
@@ -3078,7 +3154,7 @@ mod tests {
     #[test]
     fn antigravity_panel_lists_each_pool_then_its_limits_5h_first() {
         let now = 1_000;
-        let card = antigravity_card(&antigravity_snapshot(now), now, OVERLAY_GRID.min_w);
+        let card = antigravity_card(&antigravity_snapshot(now), now, OVERLAY_GRID.min_w, false);
         let lines: Vec<String> = card
             .lines
             .iter()
@@ -3114,14 +3190,14 @@ mod tests {
         let now = 1_000;
         let snapshot = antigravity_snapshot(now);
         let overlay = render_card_in(
-            &antigravity_card(&snapshot, now, OVERLAY_GRID.min_w),
+            &antigravity_card(&snapshot, now, OVERLAY_GRID.min_w, false),
             OVERLAY_GRID.min_w,
             OVERLAY_GRID.height,
         );
         assert!(overlay.contains("Claude and GPT models"), "got:\n{overlay}");
         assert!(!overlay.contains('+'), "nothing may be hidden:\n{overlay}");
 
-        let grid = render_min_card(&antigravity_card(&snapshot, now, CARD_GRID.min_w));
+        let grid = render_min_card(&antigravity_card(&snapshot, now, CARD_GRID.min_w, false));
         assert!(grid.contains("+2"), "hidden lines must be flagged:\n{grid}");
     }
 
@@ -3140,14 +3216,19 @@ mod tests {
             }],
             ..Default::default()
         };
-        let rendered = render_min_card(&antigravity_card(&antigravity, 0, CARD_GRID.min_w));
+        let rendered = render_min_card(&antigravity_card(&antigravity, 0, CARD_GRID.min_w, false));
         assert!(rendered.contains("Weekly L…"), "got:\n{rendered}");
         assert!(rendered.contains("42%"), "got:\n{rendered}");
     }
 
     #[test]
     fn antigravity_panel_reports_missing_data_and_a_needed_login() {
-        let rendered = render_min_card(&antigravity_card(&Default::default(), 0, CARD_GRID.min_w));
+        let rendered = render_min_card(&antigravity_card(
+            &Default::default(),
+            0,
+            CARD_GRID.min_w,
+            false,
+        ));
         assert!(
             rendered.contains("no Antigravity quota"),
             "got:\n{rendered}"
@@ -3157,7 +3238,7 @@ mod tests {
             needs_login: true,
             ..Default::default()
         };
-        let rendered = render_min_card(&antigravity_card(&antigravity, 0, CARD_GRID.min_w));
+        let rendered = render_min_card(&antigravity_card(&antigravity, 0, CARD_GRID.min_w, false));
         assert!(
             rendered.contains(ANTIGRAVITY_LOGIN_HINT),
             "got:\n{rendered}"
@@ -3493,7 +3574,7 @@ mod tests {
             needs_login: true,
             ..Default::default()
         };
-        let rendered = render_min_card(&claude_card(&claude, 0, CARD_GRID.min_w));
+        let rendered = render_min_card(&claude_card(&claude, 0, CARD_GRID.min_w, false));
         assert!(rendered.contains(CLAUDE_LOGIN_HINT), "got:\n{rendered}");
         assert!(rendered.contains("+"), "and it says something was hidden");
     }
@@ -3509,7 +3590,7 @@ mod tests {
             scoped_label: Some("Claude Opus 4.5".into()),
             ..Default::default()
         };
-        let rendered = render_min_card(&claude_card(&claude, 0, CARD_GRID.min_w));
+        let rendered = render_min_card(&claude_card(&claude, 0, CARD_GRID.min_w, false));
         assert!(rendered.contains("Claud…"), "got:\n{rendered}");
         assert!(!rendered.contains("Opus"), "the tail is gone:\n{rendered}");
     }
@@ -3558,14 +3639,30 @@ mod tests {
     fn gauge_line_drops_the_reset_marker_before_truncating_its_duration() {
         let inner = card_inner_w(CARD_GRID.min_w);
         // A month-long cycle is the longest duration the API produces.
-        let text = line_text(gauge_line("total", 5, 41.0, Some(30 * 86_400), 0, inner));
+        let text = line_text(gauge_line(
+            "total",
+            5,
+            41.0,
+            Some(30 * 86_400),
+            0,
+            inner,
+            false,
+        ));
         assert!(text.chars().count() <= usize::from(inner), "got {text:?}");
         assert!(
             text.contains("30d0h"),
             "the duration itself is never cut: {text:?}"
         );
         // With room the marker comes back.
-        let wide = line_text(gauge_line("total", 5, 41.0, Some(30 * 86_400), 0, 40));
+        let wide = line_text(gauge_line(
+            "total",
+            5,
+            41.0,
+            Some(30 * 86_400),
+            0,
+            40,
+            false,
+        ));
         assert!(wide.contains("↻ 30d0h"), "got {wide:?}");
     }
 
@@ -3875,12 +3972,12 @@ mod tests {
             needs_login: true,
             ..Default::default()
         };
-        let small = claude_card(&claude, 0, CARD_GRID.min_w);
+        let small = claude_card(&claude, 0, CARD_GRID.min_w, false);
         assert!(
             small.lines.len() > usize::from(CARD_GRID.height - 2),
             "this snapshot is supposed to overflow the always-on card"
         );
-        let large = claude_card(&claude, 0, OVERLAY_GRID.max_w);
+        let large = claude_card(&claude, 0, OVERLAY_GRID.max_w, false);
         assert!(large.lines.len() <= usize::from(OVERLAY_GRID.height - 2));
     }
 

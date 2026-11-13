@@ -4,10 +4,12 @@
 //! it and adds the display-only provider-total rows. `interactive`, `table` and
 //! `text` render that summary as the auto-refreshing TUI, a static table, or
 //! one line per model respectively. `usage --json` is priced in core and never
-//! reaches this module.
+//! reaches this module. `monitor` is the quota-only TUI behind `vct monitor`,
+//! here because it draws the usage view's quota cards.
 
 mod averages;
 mod interactive;
+mod monitor;
 mod table;
 mod text;
 
@@ -15,5 +17,6 @@ pub use averages::*;
 pub use interactive::{
     UsageFrameBenchmark, display_usage_interactive, display_usage_interactive_with_pool,
 };
+pub use monitor::display_quota_monitor;
 pub use table::display_usage_table;
 pub use text::display_usage_text;

@@ -481,6 +481,32 @@ vct version --json   # 機器可讀的 JSON
 
 ---
 
+## Monitor 指令
+
+**只顯示即時 quota 面板，佔滿整個畫面。**
+
+`vct monitor` 顯示與 `usage` 儀表板相同的 quota 卡片，但不掃描任何 session，所以立即開啟，也夠輕量，適合放在閒置的 pane 裡常駐。它沿用相同的設定：[`config.toml`](#%E8%A8%AD%E5%AE%9A) 中 `[usage.quota]` 底下的 `panels` 與 `refresh_interval`。按 `q` 或 `Esc` 離開。
+
+```bash
+vct monitor
+```
+
+```
+ Quota Monitor                                                         15:01:37
+
+┌ Claude ──────────────────────────────┐┌ Codex ───────────────────────────────┐
+│max 5x                        just now││plus                          just now│
+│5h    ▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱  30%  ↻ 2h18m ││5h    ▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱   0%  ↻ 4h59m │
+│7d    ▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱  28%  ↻ 6d3h  ││7d    ▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱   1%  ↻ 6d8h  │
+│Fable ▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱  14%  ↻ 6d3h  ││credits 0 · +3 reset                  │
+│bal - · $0.00 used                    ││reset expires 17d11h                  │
+└──────────────────────────────────────┘└──────────────────────────────────────┘
+
+                                     q quit
+```
+
+---
+
 ## Quota 指令
 
 **印出某個供應商的原始 quota/usage API 回應 — 不解析、不彙整。**
