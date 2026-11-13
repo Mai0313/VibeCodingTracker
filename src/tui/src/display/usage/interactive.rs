@@ -7,10 +7,11 @@
 
 use crate::display::common::ProviderTotal;
 use crate::display::common::table::{
-    ColumnSpec, FOOTER_H, TableChrome, create_controls_with_status, create_provider_row,
-    create_ratatui_table, fit_columns, frame_layout, render_scrollable_table, render_too_small,
-    styled_row,
+    ColumnSpec, FOOTER_H, TableChrome, aligned_cells, create_controls_with_status,
+    create_provider_row, create_ratatui_table, fit_columns, frame_layout, render_detail_panel,
+    render_scrollable_table, render_too_small,
 };
+use crate::display::common::theme::theme;
 use crate::display::common::tui::{LEDGER_SAVE_INTERVAL, NavDelta, ScrollState, UpdateTracker};
 use crate::display::usage::averages::{
     ProviderStats, UsageProviderTotals, UsageRow, UsageTotals, build_provider_total_rows,
@@ -20,9 +21,9 @@ use ratatui::{
     Frame, Terminal,
     backend::{Backend, TestBackend},
     layout::{Constraint, Direction, Layout as RatatuiLayout, Rect},
-    style::{Color as RatatuiColor, Modifier, Style},
+    style::{Color as RatatuiColor, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Row as RatatuiRow},
+    widgets::{Block, Borders, Cell as RatatuiCell, Clear, Paragraph, Row as RatatuiRow},
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,7 +44,7 @@ use vct_core::quota::{
     save_cursor_cache, save_grok_cache, spawn_quota_worker,
 };
 use vct_core::utils::{
-    format_compact, format_cost, format_cost_compact, format_duration_until,
+    format_compact, format_cost, format_cost_compact, format_duration_until, format_number,
     get_claude_credentials_path, get_copilot_config_path, get_cursor_auth_path, get_grok_auth_path,
     resolve_paths,
 };
@@ -403,43 +404,51 @@ impl QuotaRuntime {
     }
 }
 
-/// Which column the usage table is ordered by.
+/// Which column the usage table is ordered by, in the order the columns are
+/// drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum UsageSort {
-    #[default]
-    Cost,
-    Total,
+    Model,
     Input,
     Output,
     CacheRead,
     CacheWrite,
-    Model,
+    Total,
+    #[default]
+    Cost,
 }
 
 impl UsageSort {
-    /// The column after this one, wrapping around.
-    pub(crate) fn next(self) -> Self {
-        match self {
-            Self::Cost => Self::Total,
-            Self::Total => Self::Input,
-            Self::Input => Self::Output,
-            Self::Output => Self::CacheRead,
-            Self::CacheRead => Self::CacheWrite,
-            Self::CacheWrite => Self::Model,
-            Self::Model => Self::Cost,
-        }
+    const ALL: [Self; 7] = [
+        Self::Model,
+        Self::Input,
+        Self::Output,
+        Self::CacheRead,
+        Self::CacheWrite,
+        Self::Total,
+        Self::Cost,
+    ];
+
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|sort| *sort == self).unwrap_or(0)
+    }
+
+    /// The column `step` places along the header, stopping at either end.
+    pub(crate) fn step(self, step: isize) -> Self {
+        let last = Self::ALL.len() as isize - 1;
+        Self::ALL[(self.index() as isize + step).clamp(0, last) as usize]
     }
 
     /// What the table title shows: numbers run largest first, names A to Z.
     fn label(self) -> &'static str {
         match self {
-            Self::Cost => "cost ▼",
-            Self::Total => "total ▼",
-            Self::Input => "input ▼",
-            Self::Output => "output ▼",
-            Self::CacheRead => "cache read ▼",
-            Self::CacheWrite => "cache write ▼",
-            Self::Model => "model ▲",
+            Self::Cost => "sort: cost ▼",
+            Self::Total => "sort: total ▼",
+            Self::Input => "sort: input ▼",
+            Self::Output => "sort: output ▼",
+            Self::CacheRead => "sort: cache read ▼",
+            Self::CacheWrite => "sort: cache write ▼",
+            Self::Model => "sort: model ▲",
         }
     }
 
@@ -518,6 +527,8 @@ pub(crate) struct UsageUiState {
     sort: UsageSort,
     /// Whether the Provider Usage panel is open (`p`).
     pub(crate) provider_panel_open: bool,
+    /// Whether the selected row's details are open (`Enter`).
+    pub(crate) detail_open: bool,
 }
 
 impl UsageUiState {
@@ -532,6 +543,7 @@ impl UsageUiState {
             merge_enabled,
             sort: UsageSort::default(),
             provider_panel_open: false,
+            detail_open: false,
         }
     }
 
@@ -605,10 +617,10 @@ impl UsageUiState {
         }
     }
 
-    /// Moves on to the next sort column (`o`).
-    pub(crate) fn cycle_sort(&mut self) {
+    /// Moves the sort one column left or right (`←` / `→`).
+    pub(crate) fn step_sort(&mut self, step: isize) {
         let previous = self.selected_model();
-        self.sort = self.sort.next();
+        self.sort = self.sort.step(step);
         self.sort.apply(&mut self.rows);
         self.sort.apply(&mut self.merged_rows);
         self.resync(previous, false);
@@ -628,6 +640,9 @@ impl UsageUiState {
         quota: &QuotaView,
         status: Option<&str>,
     ) {
+        // Details belong to a row: with none selected there is nothing to
+        // open, and nothing for a later Esc to close.
+        self.detail_open &= self.selected_model().is_some();
         let rows = current_view(self.merge_enabled, &self.rows, &self.merged_rows);
         draw_usage_view(
             f,
@@ -641,6 +656,7 @@ impl UsageUiState {
             self.merge_enabled,
             self.sort,
             status,
+            self.detail_open,
         );
     }
 }
@@ -790,7 +806,9 @@ fn draw_usage_view(
     merge_enabled: bool,
     sort: UsageSort,
     status: Option<&str>,
+    detail_open: bool,
 ) {
+    let theme = theme();
     let provider_rows = build_provider_total_rows(provider_totals);
     if area.width < USAGE_MIN_W || area.height < USAGE_MIN_H {
         render_too_small(f, USAGE_MIN_W, USAGE_MIN_H);
@@ -881,7 +899,7 @@ fn draw_usage_view(
         .iter()
         .map(|row| {
             let style = if update_tracker.is_recently_updated(&row.model) {
-                Style::default().bg(RatatuiColor::Rgb(60, 80, 60)).bold()
+                Style::default().bg(theme.flash_bg).bold()
             } else {
                 Style::default()
             };
@@ -896,10 +914,17 @@ fn draw_usage_view(
             let mut cells = Vec::with_capacity(header.len());
             cells.push(row.display_model.clone());
             cells.extend(kept.iter().map(|&i| all[i].clone()));
+            let mut cells = aligned_cells(cells, 1);
             if share_w > 0 {
-                cells.push(share_cell(row.total, totals.total, share_w));
+                let share = share_cell(row.total, totals.total, share_w);
+                let bar: String = share.chars().take_while(|c| *c == '━').collect();
+                let rest = share[bar.len()..].to_string();
+                cells.push(RatatuiCell::from(Line::from(vec![
+                    Span::styled(bar, theme.accent()),
+                    Span::styled(rest, theme.dim()),
+                ])));
             }
-            styled_row(cells, style, 1)
+            RatatuiRow::new(cells).style(style)
         })
         .collect();
 
@@ -920,7 +945,12 @@ fn draw_usage_view(
             } else {
                 sort.label().to_string()
             }),
-            border_color: RatatuiColor::Green,
+            // The model column, or the sorted numeric column where it was
+            // not dropped.
+            sorted: match sort.index().checked_sub(1) {
+                None => Some(0),
+                Some(numeric) => kept.iter().position(|&i| i == numeric).map(|at| at + 1),
+            },
         },
         header,
         rows,
@@ -987,28 +1017,57 @@ fn draw_usage_view(
     }
 
     // When merged, the toggle un-merges, so label it "split" to match.
-    let merge_hint = if merge_enabled {
-        " split  "
-    } else {
-        " merge  "
-    };
+    let merge_hint = if merge_enabled { "split" } else { "merge" };
     f.render_widget(
         create_controls_with_status(
+            // Most needed first: the tail is what a narrow terminal drops,
+            // and `p` is the only way to what the provider line leaves out.
             &[
-                ("o", " sort  "),
-                ("t", " range  "),
+                ("↑↓", "move"),
+                ("←→", "sort"),
+                ("[ ]", "range"),
+                ("p", "providers"),
                 ("m", merge_hint),
-                ("p", " providers  "),
+                ("⏎", "details"),
+                ("r", "refresh"),
             ],
-            status,
+            status.map(|text| (text, theme.warn)),
             chunks.controls.width,
         ),
         chunks.controls,
     );
 
-    // Drawn last so it covers the frame it is layered over.
+    // Drawn last so they cover the frame they are layered over.
     if quota.provider_panel_open {
         render_provider_panel(f, area, &provider_rows);
+    }
+    if detail_open && let Some(row) = scroll.table.selected().and_then(|at| rows_data.get(at)) {
+        let share = |part: f64, whole: f64| {
+            if whole > 0.0 {
+                format!("{:.1}%", part / whole * 100.0)
+            } else {
+                "-".to_string()
+            }
+        };
+        render_detail_panel(
+            f,
+            area,
+            &row.display_model,
+            &[
+                ("Input", format_number(row.input_tokens)),
+                ("Output", format_number(row.output_tokens)),
+                ("Reasoning", format_number(row.reasoning_tokens)),
+                ("Cache read", format_number(row.cache_read)),
+                ("Cache write", format_number(row.cache_creation)),
+                ("Total tokens", format_number(row.total)),
+                ("Cost", format_cost(row.cost)),
+                ("Share of cost", share(row.cost, totals.cost)),
+                (
+                    "Share of tokens",
+                    share(row.total as f64, totals.total as f64),
+                ),
+            ],
+        );
     }
 }
 
@@ -1038,6 +1097,7 @@ fn render_usage_frame<B: Backend<Error: Send + Sync + 'static>>(
             merge_enabled,
             UsageSort::default(),
             status,
+            false,
         );
     })?;
     Ok(())
@@ -1180,20 +1240,9 @@ impl UsageFrameBenchmark {
     }
 }
 
-/// Maps a usage percentage to a traffic-light color (green/yellow/red).
-fn gauge_color(pct: f64) -> RatatuiColor {
-    if pct >= 90.0 {
-        RatatuiColor::Red
-    } else if pct >= 70.0 {
-        RatatuiColor::Yellow
-    } else {
-        RatatuiColor::Green
-    }
-}
-
 /// Cells a gauge bar gets in a card `inner_w` columns wide.
 ///
-/// Five everywhere but the monitor, whose `wide` bars take what the label, the
+/// Five everywhere but the Quota tab, whose `wide` bars take what the label, the
 /// percent and a full reset marker (`  ↻ 23h59m`) leave over.
 fn bar_cells(label_w: usize, inner_w: u16, wide: bool) -> usize {
     if wide {
@@ -1205,12 +1254,15 @@ fn bar_cells(label_w: usize, inner_w: u16, wide: bool) -> usize {
     }
 }
 
-/// Renders a `cells`-segment mini bar like `▰▰▱▱▱` (any usage shows one block).
-fn mini_bar_n(pct: f64, cells: usize) -> String {
+/// A `cells`-wide gauge like `━━━━━`: the consumed part in its traffic-light
+/// color, the rest in the border color (any usage shows one cell).
+fn bar_spans(pct: f64, cells: usize) -> [Span<'static>; 2] {
+    let theme = theme();
     let filled = ((pct / (100.0 / cells as f64)).ceil() as i64).clamp(0, cells as i64) as usize;
-    (0..cells)
-        .map(|i| if i < filled { '▰' } else { '▱' })
-        .collect()
+    [
+        Span::styled("━".repeat(filled), Style::default().fg(theme.gauge(pct))),
+        Span::styled("━".repeat(cells - filled), theme.border()),
+    ]
 }
 
 /// Builds a horizontal stacked share bar filling `width` columns: one solid
@@ -1232,10 +1284,7 @@ fn provider_share_bar(rows: &[ProviderTotal<'_, ProviderStats>], width: u16) -> 
     let total: i64 = segments.iter().map(|(_, t)| *t).sum();
 
     if width == 0 || total <= 0 {
-        return Line::from(Span::styled(
-            "░".repeat(width),
-            Style::default().fg(RatatuiColor::DarkGray),
-        ));
+        return Line::from(Span::styled("░".repeat(width), theme().border()));
     }
 
     // Largest-remainder apportionment: floor each share, then hand the leftover
@@ -1273,10 +1322,7 @@ fn provider_share_bar(rows: &[ProviderTotal<'_, ProviderStats>], width: u16) -> 
 
 /// A dim gray line for placeholder / hint text.
 pub(crate) fn dim_line(text: &str) -> Line<'static> {
-    Line::from(Span::styled(
-        text.to_string(),
-        Style::default().fg(RatatuiColor::DarkGray),
-    ))
+    Line::from(Span::styled(text.to_string(), theme().dim()))
 }
 
 /// [`dim_line`] fitted to a card's content width.
@@ -1291,9 +1337,7 @@ fn dim_line_fit(text: &str, inner_w: u16) -> Line<'static> {
 fn login_hint_line(hint: &str, inner_w: u16) -> Line<'static> {
     Line::from(Span::styled(
         fit_text(hint, inner_w),
-        Style::default()
-            .fg(RatatuiColor::Red)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(theme().bad).bold(),
     ))
 }
 
@@ -1384,7 +1428,11 @@ fn share_cell(value: i64, total: i64, width: u16) -> String {
     // Six columns are reserved for " nnn.n%".
     let bar_w = usize::from(width - 6);
     let filled = (share * bar_w as f64).round() as usize;
-    format!("{}{:>5.1}%", "█".repeat(filled.min(bar_w)), share * 100.0)
+    format!(
+        "{:<bar_w$}{:>5.1}%",
+        "━".repeat(filled.min(bar_w)),
+        share * 100.0
+    )
 }
 
 /// Collects every present provider's card, in the fixed render order.
@@ -1452,17 +1500,25 @@ fn fit_digest(
     keep
 }
 
+/// Column count of one digest segment.
+fn segment_width(segment: &[Span<'_>]) -> usize {
+    segment
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum()
+}
+
 /// Assembles a digest line from the segments [`fit_digest`] kept, plus the
 /// trailing count of the ones it did not.
 fn digest_line(
-    segments: Vec<(String, Style)>,
+    segments: Vec<Vec<Span<'static>>>,
     keep: &[bool],
     sep: &'static str,
     tail: &str,
 ) -> Line<'static> {
-    let dim = Style::default().fg(RatatuiColor::DarkGray);
-    let mut spans: Vec<Span> = Vec::with_capacity(segments.len() * 2);
-    for (text, style) in segments
+    let dim = theme().dim();
+    let mut spans: Vec<Span> = Vec::with_capacity(segments.len() * 3);
+    for segment in segments
         .into_iter()
         .zip(keep)
         .filter_map(|(segment, keep)| keep.then_some(segment))
@@ -1470,7 +1526,7 @@ fn digest_line(
         if !spans.is_empty() {
             spans.push(Span::styled(sep, dim));
         }
-        spans.push(Span::styled(text, style));
+        spans.extend(segment);
     }
     let hidden = keep.iter().filter(|keep| !**keep).count();
     if hidden > 0 {
@@ -1482,7 +1538,7 @@ fn digest_line(
 
 /// The one-line Provider Usage digest drawn under the model table.
 ///
-/// One segment per provider (`Claude $0.91`), painted in that provider's own
+/// One segment per provider (`● Claude $0.91`), the dot in that provider's own
 /// color so it reads the same way its rows and share-bar segments do. Cost is
 /// the one number that earns a permanent row here; tokens and the per-provider
 /// day counts live behind `p`. Whatever does not fit is named in a trailing
@@ -1491,8 +1547,8 @@ fn provider_digest(rows: &[ProviderTotal<'_, ProviderStats>], width: u16) -> Lin
     /// Narrower than the quota digest's separator on purpose: there are ten
     /// providers to the quota band's five, so every column saved per gap is
     /// another provider named on the line before the rest fold into the
-    /// `+N more` tail.
-    const SEP: &str = " · ";
+    /// `+N more` tail. Each segment's dot already marks where it starts.
+    const SEP: &str = "  ";
     const TAIL: &str = "more → p";
     // The table title already carries the grand total, so the aggregate row
     // would only repeat it.
@@ -1504,17 +1560,17 @@ fn provider_digest(rows: &[ProviderTotal<'_, ProviderStats>], width: u16) -> Lin
         return dim_line("no provider data yet");
     }
 
-    let segments: Vec<(String, Style)> = listed
+    let segments: Vec<Vec<Span<'static>>> = listed
         .iter()
         .map(|row| {
-            (
-                format!(
+            vec![
+                Span::styled("● ", Style::default().fg(row.tui_color)),
+                Span::raw(format!(
                     "{} {}",
                     row.label,
                     format_cost_compact(row.stats.total_cost)
-                ),
-                Style::default().fg(row.tui_color),
-            )
+                )),
+            ]
         })
         .collect();
 
@@ -1534,10 +1590,7 @@ fn provider_digest(rows: &[ProviderTotal<'_, ProviderStats>], width: u16) -> Lin
             .then(b.cmp(&a))
     });
 
-    let widths: Vec<usize> = segments
-        .iter()
-        .map(|(text, _)| text.chars().count())
-        .collect();
+    let widths: Vec<usize> = segments.iter().map(|spans| segment_width(spans)).collect();
     let keep = fit_digest(
         &widths,
         SEP.chars().count(),
@@ -1653,19 +1706,17 @@ fn render_provider_table(
     }
     let shown = listed.len() - hidden;
 
+    let theme = theme();
     let mut block = Block::default()
         .borders(Borders::ALL)
-        .title(Line::from(" Providers · esc to close "))
-        .border_style(Style::default().fg(RatatuiColor::Magenta));
-    if hidden > 0 {
-        block = block.title(
-            Line::from(Span::styled(
-                format!("+{hidden} "),
-                Style::default().fg(RatatuiColor::DarkGray),
-            ))
-            .right_aligned(),
-        );
-    }
+        .title(Line::from(Span::styled(" Providers ", theme.title())))
+        .border_style(theme.accent());
+    let flag = if hidden > 0 {
+        format!(" +{hidden} · esc close ")
+    } else {
+        " esc close ".to_string()
+    };
+    block = block.title(Line::from(Span::styled(flag, theme.dim())).right_aligned());
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -1698,7 +1749,7 @@ fn render_provider_table(
                 String::new(),
                 String::new(),
             ])
-            .style(Style::default().fg(RatatuiColor::DarkGray)),
+            .style(theme.dim()),
         );
     }
     // The placeholder is a sentence, not a row: as a table cell it would be
@@ -1726,7 +1777,7 @@ fn render_provider_table(
         totals_rows,
         vec!["Provider", "Tokens", "Cost"],
         &totals_widths,
-        RatatuiColor::Magenta,
+        None,
     )
     .block(Block::default());
     f.render_widget(totals_table, rows_area);
@@ -1842,47 +1893,41 @@ fn digest_items(quota: &QuotaView) -> Vec<DigestItem> {
 fn quota_digest(items: &[DigestItem], width: u16) -> Line<'static> {
     const SEP: &str = "  ·  ";
     const TAIL: &str = "more → 3";
-    /// `Claude ▰▰▱ 58%`, `Claude LIMIT`, `Claude login` — a three-cell bar keeps
-    /// the line short.
-    fn segment(item: &DigestItem) -> String {
+    /// `● Claude ━━━ 58%`, `● Claude ━━━ LIMIT`, `● Claude login` — a
+    /// three-cell bar keeps the line short. A provider needing attention is
+    /// painted like the card's own flag, so the digest reads the same way the
+    /// grid would have.
+    fn segment(item: &DigestItem) -> Vec<Span<'static>> {
+        let alert = Style::default().fg(theme().bad).bold();
+        let mut spans = vec![Span::styled("● ", Style::default().fg(item.color))];
         if item.needs_login {
-            return format!("{} login", item.name);
+            spans.push(Span::styled(format!("{} login", item.name), alert));
+            return spans;
         }
         match item.peak {
-            Some(pct) if item.limit_reached => {
-                format!("{} {} LIMIT", item.name, mini_bar_n(pct, 3))
+            Some(pct) => {
+                spans.push(Span::raw(format!("{} ", item.name)));
+                spans.extend(bar_spans(pct, 3));
+                spans.push(if item.limit_reached {
+                    Span::styled(" LIMIT", alert)
+                } else {
+                    Span::raw(format!(" {pct:.0}%"))
+                });
             }
-            Some(pct) => format!("{} {} {pct:.0}%", item.name, mini_bar_n(pct, 3)),
-            None => format!("{} -", item.name),
+            None => spans.push(Span::raw(format!("{} -", item.name))),
         }
+        spans
     }
 
     if items.is_empty() {
         return dim_line("no quota panels");
     }
 
-    let segments: Vec<(String, Style)> = items
-        .iter()
-        .map(|item| {
-            // A provider needing attention is painted like the card's own flag,
-            // so the digest reads the same way the grid would have.
-            let style = if item.needs_login || item.limit_reached {
-                Style::default()
-                    .fg(RatatuiColor::Red)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(item.color)
-            };
-            (segment(item), style)
-        })
-        .collect();
+    let segments: Vec<Vec<Span<'static>>> = items.iter().map(segment).collect();
 
     // Every gauge here is equally worth showing, so the tail goes first.
     let drop_order: Vec<usize> = (0..items.len()).rev().collect();
-    let widths: Vec<usize> = segments
-        .iter()
-        .map(|(text, _)| text.chars().count())
-        .collect();
+    let widths: Vec<usize> = segments.iter().map(|spans| segment_width(spans)).collect();
     let keep = fit_digest(
         &widths,
         SEP.chars().count(),
@@ -1919,26 +1964,32 @@ pub(crate) fn render_quota_card(f: &mut Frame, area: Rect, card: &QuotaCard) {
     let capacity = usize::from(area.height.saturating_sub(2));
     let hidden = card.lines.len().saturating_sub(capacity);
 
-    let mut block = Block::default()
-        .borders(Borders::ALL)
-        .title(Line::from(format!(" {} ", card.title)))
-        .border_style(Style::default().fg(card.color));
-
+    let theme = theme();
     let mut flags: Vec<Span> = Vec::new();
     if hidden > 0 {
-        flags.push(Span::styled(
-            format!("+{hidden} "),
-            Style::default().fg(RatatuiColor::DarkGray),
-        ));
+        flags.push(Span::styled(format!("+{hidden} "), theme.dim()));
     }
     if card.limit_reached {
         flags.push(Span::styled(
             "LIMIT ",
-            Style::default()
-                .fg(RatatuiColor::Red)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.bad).bold(),
         ));
     }
+    // A narrow card gives up the dot before a flag overwrites the name.
+    let name_w = card.title.chars().count() + 2;
+    let room = usize::from(area.width.saturating_sub(2));
+    let dot = if name_w + 2 + segment_width(&flags) <= room {
+        " ● "
+    } else {
+        " "
+    };
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .title(Line::from(vec![
+            Span::styled(dot, Style::default().fg(card.color)),
+            Span::styled(format!("{} ", card.title), theme.title()),
+        ]))
+        .border_style(theme.border());
     if !flags.is_empty() {
         block = block.title(Line::from(flags).right_aligned());
     }
@@ -1979,7 +2030,7 @@ fn plan_line(plan: Option<&str>, fetched_at: i64, now: i64, inner_w: u16) -> Lin
     let plan = fit_text(plan.unwrap_or("-"), plan_w as u16);
     let pad = inner.saturating_sub(plan.chars().count() + age_w);
     Line::from(vec![
-        Span::styled(plan, Style::default().fg(RatatuiColor::Gray)),
+        Span::styled(plan, theme().dim()),
         Span::raw(" ".repeat(pad)),
         Span::styled(age, Style::default().fg(color)),
     ])
@@ -1988,16 +2039,17 @@ fn plan_line(plan: Option<&str>, fetched_at: i64, now: i64, inner_w: u16) -> Lin
 /// The "how old is this snapshot" marker, escalating in color past 1h and 6h so
 /// a panel stuck on stale data reads as such.
 fn staleness(fetched_at: i64, now: i64) -> (String, RatatuiColor) {
+    let theme = theme();
     if fetched_at <= 0 {
-        return ("never".to_string(), RatatuiColor::DarkGray);
+        return ("never".to_string(), theme.dim);
     }
     let age = (now - fetched_at).max(0);
     let color = if age > 6 * 3600 {
-        RatatuiColor::Red
+        theme.bad
     } else if age > 3600 {
-        RatatuiColor::Yellow
+        theme.warn
     } else {
-        RatatuiColor::DarkGray
+        theme.dim
     };
     let ago = format_duration_until(now, fetched_at);
     let text = if ago == "now" {
@@ -2008,7 +2060,7 @@ fn staleness(fetched_at: i64, now: i64) -> (String, RatatuiColor) {
     (text, color)
 }
 
-/// Builds one gauge line: `5h    ▰▰▱▱▱  34%  ↻ 2h11m`.
+/// Builds one gauge line: `5h    ━━━━━  34%  ↻ 2h11m`.
 ///
 /// The label column is padded to `label_w` so the bars line up down the card.
 /// The reset marker is fitted to what is left: full (`↻ 2h11m`), then bare
@@ -2016,7 +2068,7 @@ fn staleness(fetched_at: i64, now: i64) -> (String, RatatuiColor) {
 /// its duration truncated into a smaller, plausible one.
 ///
 /// `wide` stretches the bar over whatever the label, percent and a full reset
-/// marker leave of `inner_w`, for the monitor's roomier cards.
+/// marker leave of `inner_w`, for the Quota tab's roomier cards.
 fn gauge_line(
     label: &str,
     label_w: usize,
@@ -2026,16 +2078,10 @@ fn gauge_line(
     inner_w: u16,
     wide: bool,
 ) -> Line<'static> {
-    let color = gauge_color(pct);
     let bar = bar_cells(label_w, inner_w, wide);
-    let mut spans = vec![
-        Span::styled(
-            format!("{label:<label_w$} "),
-            Style::default().fg(RatatuiColor::Gray),
-        ),
-        Span::styled(mini_bar_n(pct, bar), Style::default().fg(color)),
-        Span::styled(format!(" {pct:>3.0}%"), Style::default().fg(color)),
-    ];
+    let mut spans = vec![Span::raw(format!("{label:<label_w$} "))];
+    spans.extend(bar_spans(pct, bar));
+    spans.push(Span::raw(format!(" {pct:>3.0}%")));
     if let Some(reset) = reset {
         let text = format_duration_until(reset, now);
         // label + separator + bar + " nnn%".
@@ -2050,10 +2096,7 @@ fn gauge_line(
             None
         };
         if let Some(marker) = marker {
-            spans.push(Span::styled(
-                marker,
-                Style::default().fg(RatatuiColor::DarkGray),
-            ));
+            spans.push(Span::styled(marker, theme().dim()));
         }
     }
     Line::from(spans)
@@ -2074,26 +2117,20 @@ fn gauge_line_value(
     inner_w: u16,
     wide: bool,
 ) -> Line<'static> {
-    let color = gauge_color(pct);
     // As long as the gauges above it where the value leaves room, shorter
     // where it does not: this line carries no percent or reset marker.
     let room = usize::from(inner_w).saturating_sub(label_w + 2 + value.chars().count());
     let bar = bar_cells(label_w, inner_w, wide).min(room);
-    let mut spans = vec![Span::styled(
-        format!("{label:<label_w$} "),
-        Style::default().fg(RatatuiColor::Gray),
-    )];
+    let mut spans = vec![Span::raw(format!("{label:<label_w$} "))];
     if bar >= 5 {
-        spans.push(Span::styled(
-            mini_bar_n(pct, bar),
-            Style::default().fg(color),
-        ));
-        spans.push(Span::styled(
-            format!(" {value}"),
-            Style::default().fg(color),
-        ));
+        spans.extend(bar_spans(pct, bar));
+        spans.push(Span::raw(format!(" {value}")));
     } else {
-        spans.push(Span::styled(value.to_string(), Style::default().fg(color)));
+        // With no bar to carry it, the value takes the traffic-light color.
+        spans.push(Span::styled(
+            value.to_string(),
+            Style::default().fg(theme().gauge(pct)),
+        ));
     }
     Line::from(spans)
 }
@@ -2134,10 +2171,7 @@ fn detail_line(parts: &[String], inner_w: u16) -> Option<Line<'static>> {
     if hidden > 0 {
         text.push_str(&format!(" +{hidden}"));
     }
-    Some(Line::from(Span::styled(
-        text,
-        Style::default().fg(RatatuiColor::DarkGray),
-    )))
+    Some(Line::from(Span::styled(text, theme().dim())))
 }
 
 /// Width of the label column in a card, wide enough for its longest label.
@@ -2650,7 +2684,7 @@ mod tests {
             38,
             true,
         ));
-        assert!(text.contains('▰'), "{text}");
+        assert!(text.contains('━'), "{text}");
         assert!(text.ends_with("$123.45/$500.00"), "{text}");
         assert!(text.chars().count() <= 38, "{text}");
     }
@@ -2985,6 +3019,28 @@ mod tests {
         assert!(grid.contains("+2"), "hidden lines must be flagged:\n{grid}");
     }
 
+    /// The longest provider name still reads whole beside both flags in the
+    /// narrowest card: the dot goes, not a letter of the name.
+    #[test]
+    fn a_narrow_card_title_gives_up_its_dot_before_its_name() {
+        let card = |title, lines: usize| QuotaCard {
+            title,
+            color: RatatuiColor::Gray,
+            limit_reached: true,
+            lines: vec![Line::from("x"); lines],
+        };
+        let crowded = render_min_card(&card("Antigravity", usize::from(CARD_GRID.height)));
+        let title = crowded.lines().next().unwrap();
+        assert!(
+            title.contains("Antigravity") && title.contains("LIMIT") && title.contains('+'),
+            "{title}"
+        );
+        assert!(!title.contains('●'), "{title}");
+        // With room for all of it the dot stays.
+        let roomy = render_min_card(&card("Codex", 1));
+        assert!(roomy.lines().next().unwrap().contains("● Codex"), "{roomy}");
+    }
+
     /// A limit agy names by its title alone still shows its gauge in the
     /// narrowest card: the title is cut, never the bar or the percent.
     #[test]
@@ -3107,16 +3163,16 @@ mod tests {
 
         // Wide enough for every provider: each one is named, nothing is counted
         // away.
-        let wide = line_text(provider_digest(&rows, 160));
+        let wide = line_text(provider_digest(&rows, 170));
         for provider in PROVIDER_NAMES {
             assert!(
                 wide.contains(provider.display_name()),
-                "width=160 dropped {}: {wide}",
+                "width=170 dropped {}: {wide}",
                 provider.display_name()
             );
         }
         assert!(!wide.contains("more"), "got: {wide}");
-        assert!(wide.chars().count() <= 160, "got: {wide}");
+        assert!(wide.chars().count() <= 170, "got: {wide}");
 
         // A full ten no longer fits the 120-column terminal the separator was
         // sized for, so the line has to say what it left out instead of
@@ -3705,7 +3761,7 @@ mod tests {
         let bar = |value: i64| {
             share_cell(value, 100, width)
                 .chars()
-                .filter(|c| *c == '█')
+                .filter(|c| *c == '━')
                 .count()
         };
         // Twice the share, twice the bar (the column reserves 6 for the number).
@@ -3726,8 +3782,8 @@ mod tests {
             }
         }
         // A full share fills the bar; an empty one draws none of it.
-        assert!(share_cell(100, 100, 20).starts_with('█'));
-        assert!(!share_cell(0, 100, 20).starts_with('█'));
+        assert!(share_cell(100, 100, 20).starts_with('━'));
+        assert!(!share_cell(0, 100, 20).starts_with('━'));
         // No totals yet, or a column too narrow to say anything: draw nothing
         // rather than a bar that means nothing.
         assert_eq!(share_cell(5, 0, 20), "");
@@ -3885,7 +3941,7 @@ mod tests {
             let panel = render_frame(w, h, ALL_PRESENT, true).join("\n");
             assert!(panel.contains("Tokens"), "{w}x{h} panel lost its columns");
             assert!(
-                panel.contains("esc to close"),
+                panel.contains("esc close"),
                 "{w}x{h} panel lost its close hint"
             );
         }

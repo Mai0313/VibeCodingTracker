@@ -10,15 +10,16 @@
 //! left-align the first two (index 0 and 1); the ratatui `styled_row` helper
 //! takes the number of left-aligned columns as its `left_cols` argument.
 
+use crate::display::common::theme::theme;
 use crate::display::common::tui::ScrollState;
 use comfy_table::{Attribute, Cell, CellAlignment, Color, Table, presets::UTF8_FULL};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
-    style::{Color as RatatuiColor, Modifier, Style},
+    style::{Color as RatatuiColor, Style},
     text::{Line, Span, Text},
     widgets::{
-        Block, Borders, Cell as RatatuiCell, Paragraph, Row as RatatuiRow, Scrollbar,
+        Block, Borders, Cell as RatatuiCell, Clear, Paragraph, Row as RatatuiRow, Scrollbar,
         ScrollbarOrientation, ScrollbarState, Table as RatatuiTable,
     },
 };
@@ -95,88 +96,84 @@ pub const REPO_LABEL: &str = "Star on GitHub";
 /// URL the footer's repository label points at when clicked.
 pub const REPO_URL: &str = "https://github.com/Mai0313/VibeCodingTracker";
 
-/// Builds the single-line key-hint footer (navigation + the GitHub repo link).
+/// The hints every tab's footer ends with.
+const CORE_HINTS: [(&str, &str); 3] = [("1-4/tab", "view"), ("?", "help"), ("q", "quit")];
+
+/// Builds the single-line key-hint footer with no status.
 ///
-/// Everything is on one line to save vertical space. `extra` inserts
-/// view-specific `(key, label)` hints just before `r refresh`. This is the
-/// no-status shorthand for [`create_controls_with_status`]. The repo label is
-/// drawn as plain (underlined) text here; a terminal hyperlink is layered on
-/// afterward by
-/// [`overlay_repo_hyperlink`](super::tui::overlay_repo_hyperlink).
-pub fn create_controls(extra: &[(&str, &str)], width: u16) -> Paragraph<'static> {
-    create_controls_with_status(extra, None, width)
+/// This is the no-status shorthand for [`create_controls_with_status`].
+pub fn create_controls(hints: &[(&str, &str)], width: u16) -> Paragraph<'static> {
+    create_controls_with_status(hints, None, width)
 }
 
-/// Builds the controls footer with an optional transient refresh status.
+/// Builds the footer every tab shares: `hints` as `(key, what it does)` pairs,
+/// the hints common to all tabs, an optional status in its color, and the
+/// GitHub repo label at the right edge.
 ///
-/// Hints are dropped whole rather than clipped mid-word when they do not fit
-/// `width`, in this order: the repo label, then the view-specific `extra` hints
-/// from the right, then the status. Scrolling, refresh and quit always survive —
-/// a footer that cannot say how to quit is worse than one that says less.
+/// What does not fit `width` is dropped whole rather than clipped mid-word, in
+/// this order: the repo label, then `hints` from the right. The common hints
+/// stay, since `?` lists whatever was dropped. A status too long to sit beside
+/// them takes the row: it is the only place a failure is reported.
+///
+/// The repo label is drawn as plain underlined text; a terminal hyperlink is
+/// layered on afterward by
+/// [`overlay_repo_hyperlink`](super::tui::overlay_repo_hyperlink).
 pub fn create_controls_with_status(
-    extra: &[(&str, &str)],
-    status: Option<&str>,
+    hints: &[(&str, &str)],
+    status: Option<(&str, RatatuiColor)>,
     width: u16,
 ) -> Paragraph<'static> {
-    let key = Style::default().fg(RatatuiColor::Cyan).bold();
-    let dim = Style::default().fg(RatatuiColor::DarkGray);
+    let theme = theme();
+    let dim = theme.dim();
     let available = width as usize;
+    let hint_w = |(key, label): &(&str, &str)| seg_width(key) + 1 + seg_width(label) + 2;
 
-    // Width of every part; which of them survive is decided below.
-    let core = seg_width("↑/↓ scroll  r refresh  q quit");
-    let repo = seg_width("  |  ") + seg_width(REPO_LABEL);
-    let status_w = status.map_or(0, |s| seg_width("  |  ") + seg_width(s));
-    let extra_w: Vec<usize> = extra
-        .iter()
-        .map(|(k, label)| seg_width(k) + seg_width(label))
-        .collect();
-
-    // Drop from the cheapest end until what is left fits.
-    let mut shown_extra = extra.len();
-    let mut show_status = status.is_some();
+    let core: usize = CORE_HINTS.iter().map(hint_w).sum::<usize>() - 1;
+    let repo = seg_width(REPO_LABEL) + 3;
+    let status_w = status.map_or(0, |(text, _)| seg_width(text) + 5);
+    let mut shown = hints.len();
     let mut show_repo = true;
-    let used = |shown: usize, status: bool, repo_shown: bool| {
-        core + extra_w[..shown].iter().sum::<usize>()
-            + if status { status_w } else { 0 }
+    let used = |shown: usize, repo_shown: bool| {
+        hints[..shown].iter().map(hint_w).sum::<usize>()
+            + core
+            + status_w
             + if repo_shown { repo } else { 0 }
     };
-    if used(shown_extra, show_status, show_repo) > available {
+    if used(shown, show_repo) > available {
         show_repo = false;
     }
-    while shown_extra > 0 && used(shown_extra, show_status, show_repo) > available {
-        shown_extra -= 1;
-    }
-    if used(shown_extra, show_status, show_repo) > available {
-        show_status = false;
+    while shown > 0 && used(shown, show_repo) > available {
+        shown -= 1;
     }
 
-    let mut spans = vec![Span::styled("↑/↓", key), Span::styled(" scroll  ", dim)];
-    for (k, label) in &extra[..shown_extra] {
-        spans.push(Span::styled(k.to_string(), key));
-        spans.push(Span::styled(label.to_string(), dim));
-    }
-    spans.push(Span::styled("r", key));
-    spans.push(Span::styled(" refresh  ", dim));
-    spans.push(Span::styled(
-        "q",
-        Style::default().fg(RatatuiColor::Red).bold(),
-    ));
-    spans.push(Span::styled(" quit", dim));
-    if show_status && let Some(status) = status {
-        spans.push(Span::styled("  |  ", dim));
+    let mut spans = Vec::new();
+    if let Some((text, color)) = status
+        && used(0, false) > available
+    {
         spans.push(Span::styled(
-            status.to_string(),
-            Style::default().fg(RatatuiColor::Yellow).bold(),
+            format!(" {text}"),
+            Style::default().fg(color).bold(),
+        ));
+        return Paragraph::new(Line::from(spans));
+    }
+    for (key, label) in hints[..shown].iter().chain(&CORE_HINTS) {
+        let gap = if spans.is_empty() { " " } else { "  " };
+        spans.push(Span::styled(format!("{gap}{key}"), Style::default().bold()));
+        spans.push(Span::styled(format!(" {label}"), dim));
+    }
+    if let Some((text, color)) = status {
+        spans.push(Span::styled("  ·  ", dim));
+        spans.push(Span::styled(
+            text.to_string(),
+            Style::default().fg(color).bold(),
         ));
     }
     if show_repo {
-        spans.push(Span::styled("  |  ", dim));
-        spans.push(Span::styled(
-            REPO_LABEL,
-            Style::default().fg(RatatuiColor::Cyan).underlined(),
-        ));
+        let gap = available.saturating_sub(used(shown, true)) + 2;
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.push(Span::styled(REPO_LABEL, dim.underlined()));
     }
-    Paragraph::new(vec![Line::from(spans)]).centered()
+    Paragraph::new(Line::from(spans))
 }
 
 /// Rows the scrollable content pane is never squeezed below. The block border,
@@ -276,23 +273,40 @@ pub fn fit_columns(specs: &[ColumnSpec], inner: u16, name_min_w: u16) -> (Vec<us
     (kept, dropped)
 }
 
-/// Border, title and drop-notice for a scrollable table.
+/// Title, drop-notice and sort mark for a scrollable table.
 pub struct TableChrome<'a> {
     /// Left-aligned title; carries the totals for the rows underneath.
     pub title: &'a str,
     /// Right-aligned notice naming what the table had to leave out.
     pub note: Option<String>,
-    /// Border color.
-    pub border_color: RatatuiColor,
+    /// Index of the header the rows are ordered by, when it is on screen.
+    pub sorted: Option<usize>,
 }
 
-/// Builds a table row with the first `left_cols` cells left-aligned and the
-/// rest right-aligned, painted with `style`.
-///
-/// Right-aligning the numeric columns keeps variable-width compact values
-/// (`1.23M`, `999K`) flush instead of ragged.
-pub fn styled_row(cells: Vec<String>, style: Style, left_cols: usize) -> RatatuiRow<'static> {
-    let cells: Vec<RatatuiCell> = cells
+/// A block title from `text`: the part before the first ` · ` bold, each
+/// separator dim.
+pub fn title_line(text: &str) -> Line<'static> {
+    let dim = theme().dim();
+    let mut spans = vec![Span::raw(" ")];
+    for (at, part) in text.split(" · ").enumerate() {
+        if at > 0 {
+            spans.push(Span::styled(" · ", dim));
+        }
+        let style = if at == 0 {
+            theme().title()
+        } else {
+            theme().title().not_bold()
+        };
+        spans.push(Span::styled(part.to_string(), style));
+    }
+    spans.push(Span::raw(" "));
+    Line::from(spans)
+}
+
+/// `cells` as table cells, the first `left_cols` left-aligned and the rest
+/// right-aligned.
+pub fn aligned_cells(cells: Vec<String>, left_cols: usize) -> Vec<RatatuiCell<'static>> {
+    cells
         .into_iter()
         .enumerate()
         .map(|(i, s)| {
@@ -303,8 +317,16 @@ pub fn styled_row(cells: Vec<String>, style: Style, left_cols: usize) -> Ratatui
             };
             RatatuiCell::from(Text::from(s).alignment(align))
         })
-        .collect();
-    RatatuiRow::new(cells).style(style)
+        .collect()
+}
+
+/// Builds a table row with the first `left_cols` cells left-aligned and the
+/// rest right-aligned, painted with `style`.
+///
+/// Right-aligning the numeric columns keeps variable-width compact values
+/// (`1.23M`, `999K`) flush instead of ragged.
+pub fn styled_row(cells: Vec<String>, style: Style, left_cols: usize) -> RatatuiRow<'static> {
+    RatatuiRow::new(aligned_cells(cells, left_cols)).style(style)
 }
 
 /// Renders a scrollable, selectable table plus a side scrollbar into `area`.
@@ -325,30 +347,21 @@ pub fn render_scrollable_table(
     scroll: &mut ScrollState,
 ) {
     let viewport = area.height.saturating_sub(4);
+    let theme = theme();
 
     let mut block = Block::default()
         .borders(Borders::ALL)
-        .title(Line::from(format!(" {} ", chrome.title)))
-        .border_style(Style::default().fg(chrome.border_color));
+        .title(title_line(chrome.title))
+        .border_style(theme.border());
     if let Some(note) = chrome.note {
-        block = block.title(
-            Line::from(Span::styled(
-                format!(" {note} "),
-                Style::default().fg(RatatuiColor::DarkGray),
-            ))
-            .right_aligned(),
-        );
+        block =
+            block.title(Line::from(Span::styled(format!(" {note} "), theme.dim())).right_aligned());
     }
 
     // Selection is shown purely by the row color (no leading symbol / gutter).
-    let table = create_ratatui_table(rows, header, widths, chrome.border_color)
+    let table = create_ratatui_table(rows, header, widths, chrome.sorted)
         .block(block)
-        .row_highlight_style(
-            Style::default()
-                .fg(RatatuiColor::Black)
-                .bg(RatatuiColor::Cyan)
-                .add_modifier(Modifier::BOLD),
-        );
+        .row_highlight_style(theme.selected());
 
     f.render_stateful_widget(table, area, &mut scroll.table);
 
@@ -358,15 +371,70 @@ pub fn render_scrollable_table(
     scroll.scrollbar = ScrollbarState::new(row_count)
         .viewport_content_length(viewport as usize)
         .position(selected);
+    // Nothing to scroll to when every row is on screen.
+    if row_count <= usize::from(viewport) {
+        return;
+    }
     f.render_stateful_widget(
+        // Drawn as the border itself, with the part in view a heavier line.
         Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
-            .end_symbol(None),
+            .end_symbol(None)
+            .track_symbol(Some("│"))
+            .thumb_symbol("┃")
+            .track_style(theme.border())
+            .thumb_style(theme.dim()),
         area.inner(Margin {
             vertical: 1,
             horizontal: 0,
         }),
         &mut scroll.scrollbar,
+    );
+}
+
+/// Draws a centered panel over `area` with the details of one table row:
+/// `name` in full, wrapped where it is wider than the panel, then `label
+/// value` rows. Closed with `Esc`.
+pub fn render_detail_panel(f: &mut Frame, area: Rect, name: &str, rows: &[(&str, String)]) {
+    let theme = theme();
+    let width = area.width.saturating_sub(4).min(52);
+    let inner_w = usize::from(width.saturating_sub(4)).max(1);
+    let name: Vec<char> = name.chars().collect();
+    let mut lines: Vec<Line> = name
+        .chunks(inner_w)
+        .map(|chunk| {
+            Line::from(Span::styled(
+                format!(" {}", chunk.iter().collect::<String>()),
+                Style::default().bold(),
+            ))
+        })
+        .collect();
+    lines.push(Line::default());
+    lines.extend(rows.iter().map(|(label, value)| {
+        let pad = inner_w.saturating_sub(label.chars().count() + value.chars().count());
+        Line::from(vec![
+            Span::styled(format!(" {label}"), theme.dim()),
+            Span::raw(" ".repeat(pad)),
+            Span::raw(value.clone()),
+        ])
+    }));
+    let height = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let rect = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme.accent())
+                .title(Line::from(Span::styled(" Details ", theme.title())))
+                .title(Line::from(Span::styled(" esc close ", theme.dim())).right_aligned()),
+        ),
+        rect,
     );
 }
 
@@ -379,20 +447,20 @@ pub fn render_too_small(f: &mut Frame, min_w: u16, min_h: u16) {
     let para = Paragraph::new(vec![
         Line::from(Span::styled(
             "Terminal too small",
-            Style::default().fg(RatatuiColor::Red).bold(),
+            Style::default().fg(theme().bad).bold(),
         )),
         Line::from(Span::styled(
             format!(
                 "resize to at least {min_w} x {min_h}  (now {} x {})",
                 area.width, area.height
             ),
-            Style::default().fg(RatatuiColor::Gray),
+            theme().dim(),
         )),
     ])
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(RatatuiColor::Red)),
+            .border_style(theme().border()),
     )
     .alignment(Alignment::Center);
 
@@ -409,29 +477,35 @@ pub fn render_too_small(f: &mut Frame, min_w: u16, min_h: u16) {
 
 /// Builds a ratatui [`Table`](RatatuiTable) with the standard header and border styling.
 ///
-/// `widths` sets the per-column constraints; the header row is rendered black-on-green
-/// and bold with a one-line bottom margin.
+/// `widths` sets the per-column constraints. The header is dim with a
+/// one-line bottom margin, aligned like the body (first column left, the rest
+/// right); the `sorted` header, if any, is drawn in the accent color.
 pub fn create_ratatui_table<'a>(
     rows: Vec<RatatuiRow<'a>>,
     header: Vec<&'a str>,
     widths: &'a [Constraint],
-    border_color: RatatuiColor,
+    sorted: Option<usize>,
 ) -> RatatuiTable<'a> {
+    let theme = theme();
+    let header = header.into_iter().enumerate().map(|(i, name)| {
+        let align = if i == 0 {
+            Alignment::Left
+        } else {
+            Alignment::Right
+        };
+        let style = if sorted == Some(i) {
+            theme.accent().bold()
+        } else {
+            theme.dim()
+        };
+        RatatuiCell::from(Text::from(name).alignment(align)).style(style)
+    });
     RatatuiTable::new(rows, widths)
-        .header(
-            RatatuiRow::new(header)
-                .style(
-                    Style::default()
-                        .fg(RatatuiColor::Black)
-                        .bg(RatatuiColor::Green)
-                        .bold(),
-                )
-                .bottom_margin(1),
-        )
+        .header(RatatuiRow::new(header).bottom_margin(1))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(border_color)),
+                .border_style(theme.border()),
         )
 }
 
@@ -499,19 +573,27 @@ pub fn create_metric_cell(value: String, color: Color, emphasize: bool) -> Cell 
     cell
 }
 
-/// Builds a ratatui [`Row`](RatatuiRow) styled in `color`, bolded when `emphasize`.
+/// Builds a provider's ratatui [`Row`](RatatuiRow): a dot in the provider's
+/// `color` before its name, the remaining cells right-aligned, bold when
+/// `emphasize`.
 pub fn create_provider_row<'a>(
     cells: Vec<String>,
     color: RatatuiColor,
     emphasize: bool,
 ) -> RatatuiRow<'a> {
+    let mut cells = cells.into_iter();
+    let name = cells.next().unwrap_or_default();
+    let mut row = vec![RatatuiCell::from(Line::from(vec![
+        Span::styled("● ", Style::default().fg(color)),
+        Span::raw(name),
+    ]))];
+    row.extend(cells.map(|cell| RatatuiCell::from(Text::from(cell).alignment(Alignment::Right))));
     let style = if emphasize {
-        Style::default().fg(color).add_modifier(Modifier::BOLD)
+        Style::default().bold()
     } else {
-        Style::default().fg(color)
+        Style::default()
     };
-
-    RatatuiRow::new(cells).style(style)
+    RatatuiRow::new(row).style(style)
 }
 
 #[cfg(test)]
@@ -602,38 +684,73 @@ mod tests {
         assert_eq!(normalized_cpu(410.0, 4.0), 100.0);
     }
 
+    fn controls(hints: &[(&str, &str)], status: Option<&str>, width: u16) -> String {
+        use ratatui::widgets::Widget;
+        let area = Rect::new(0, 0, width, 1);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        let status = status.map(|text| (text, ratatui::style::Color::Yellow));
+        create_controls_with_status(hints, status, width).render(area, &mut buf);
+        (0..width)
+            .map(|x| buf.cell((x, 0)).unwrap().symbol())
+            .collect::<String>()
+    }
+
     #[test]
     fn controls_drop_hints_whole_and_always_keep_quit() {
-        use ratatui::widgets::Widget;
         let render = |width: u16| {
-            let area = Rect::new(0, 0, width, 1);
-            let mut buf = ratatui::buffer::Buffer::empty(area);
-            create_controls_with_status(
-                &[("m", " merge  "), ("p", " panes  "), ("t", " range  ")],
+            controls(
+                &[("m", "merge"), ("p", "providers"), ("[ ]", "range")],
                 None,
                 width,
             )
-            .render(area, &mut buf);
-            (0..width)
-                .map(|x| buf.cell((x, 0)).unwrap().symbol())
-                .collect::<String>()
         };
 
-        // Wide: everything, including the repo label.
+        // Wide: everything, the repo label at the right edge.
         let wide = render(120);
-        assert!(wide.contains("Star on GitHub") && wide.contains("t range"));
+        assert!(wide.trim_end().ends_with("Star on GitHub"), "got {wide:?}");
+        assert!(wide.contains("[ ] range  1-4/tab view  ? help  q quit"));
 
-        // The hard minimum terminal width. The repo label goes first, then the
-        // extras from the right, and nothing is left half-drawn.
-        let min = render(74);
-        assert!(!min.contains("Star"), "got {min:?}");
-        assert!(min.contains("q quit"), "got {min:?}");
-        assert!(min.trim_end().chars().count() <= 74);
+        // The repo label goes first, then the tab's hints from the right, and
+        // nothing is left half-drawn.
+        let narrow = render(52);
+        assert!(!narrow.contains("Star"), "got {narrow:?}");
+        assert!(!narrow.contains("range"), "got {narrow:?}");
+        assert!(
+            narrow.contains("m merge  p providers  1-4/tab view  ? help  q quit"),
+            "got {narrow:?}"
+        );
 
-        // Absurdly narrow: the keys that still fit are whole words.
+        // The common hints stay even when no tab hint fits.
         let tiny = render(30);
-        assert!(!tiny.contains("Star"), "got {tiny:?}");
-        assert!(!tiny.contains("range"), "got {tiny:?}");
-        assert!(tiny.contains("quit"), "got {tiny:?}");
+        assert_eq!(tiny.trim(), "1-4/tab view  ? help  q quit");
+    }
+
+    #[test]
+    fn the_detail_panel_shows_a_long_name_in_full() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let name = "fireworks-ai/accounts/fireworks/models/qwen3-coder-480k-a35b-instruct";
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        terminal
+            .draw(|f| {
+                super::render_detail_panel(f, f.area(), name, &[("Cost", "$1.00".to_string())]);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let shown: String = (0..16)
+            .flat_map(|y| (0..80).map(move |x| (x, y)))
+            .map(|(x, y)| buffer[(x, y)].symbol())
+            .filter(|symbol| !matches!(*symbol, " " | "│"))
+            .collect();
+        assert!(shown.contains(name), "{shown}");
+        assert!(shown.contains("Cost$1.00"), "{shown}");
+    }
+
+    #[test]
+    fn a_status_sits_beside_the_hints_or_takes_the_row() {
+        let short = controls(&[("r", "refresh")], Some("Refreshing..."), 80);
+        assert!(short.contains("q quit  ·  Refreshing..."), "got {short:?}");
+        let long = "not saved: config.toml does not parse, fix it first (e)";
+        let taken = controls(&[("r", "refresh")], Some(long), 70);
+        assert_eq!(taken.trim(), long);
     }
 }

@@ -29,6 +29,9 @@ rayon = { workspace = true }
 serde_json = { workspace = true }
 sysinfo = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 criterion = { workspace = true }
 tempfile = { workspace = true }

@@ -30,7 +30,7 @@
 
 選擇你偏好的檢視方式：
 
-- **互動式儀表板**: 一個終端 app, 內含 Usage, Analysis, Quota 與 Settings 四個分頁, 可立即顯示 loading spinner, 支援背景 incremental refresh, 可捲動並可排序的 model 清單 (方向鍵, `o`), process 層級的 CPU/記憶體即時讀數, 以及 K/M/B 精簡數字格式
+- **互動式儀表板**: 一個終端 app, 內含 Usage, Analysis, Quota 與 Settings 四個分頁, 可立即顯示 loading spinner, 支援背景 incremental refresh, 可捲動並可排序的 model 清單 (方向鍵), process 層級的 CPU/記憶體即時讀數, 以及 K/M/B 精簡數字格式
 - **靜態報表**:專業的表格格式,適合撰寫文件
 - **腳本友好**:純文字及 JSON 輸出,方便自動化處理
 - **完整精度**:匯出精確費用供會計使用
@@ -128,17 +128,20 @@ vct analysis
 
 不帶任何指令執行 `vct` 會開啟互動式介面，一個畫面有四個分頁：`1 Usage`、`2 Analysis`、`3 Quota` 與 `4 Settings`。`vct usage`、`vct analysis` 與 `vct quota` 會開啟同一個介面並停在各自的分頁，`--json`、`--text` 與 `--table` 則只輸出結果，不會開啟介面。沒有終端時（輸出被 pipe 或重新導向），單獨的 `vct` 會印出說明並以狀態碼 2 結束。
 
-| 按鍵                | 動作                                                                      |
-| ------------------- | ------------------------------------------------------------------------- |
-| `1`-`4`             | 跳到對應的分頁                                                            |
-| `Tab` / `Shift+Tab` | 下一個 / 上一個分頁（在 Settings 分頁，`Tab` 改為在它的兩個窗格之間切換） |
-| `↑` / `↓`           | 移動選取的列                                                              |
-| `o`                 | 切換排序欄位（Usage、Analysis）                                           |
-| `t`                 | 切換時間範圍：day、week、month、all（Usage、Analysis）                    |
-| `r`                 | 立即刷新（Usage、Analysis）                                               |
-| `m`                 | 合併 / 拆開 provider 前綴，會存進設定檔（Usage）                          |
-| `p`                 | 開啟 Provider Usage 面板，按 `Esc` 關閉（Usage）                          |
-| `q` / `Esc`         | 離開                                                                      |
+| 按鍵                | 動作                                                              |
+| ------------------- | ----------------------------------------------------------------- |
+| `1`-`4`             | 跳到對應的分頁                                                    |
+| `Tab` / `Shift+Tab` | 下一個 / 上一個分頁                                               |
+| `↑` / `↓`           | 移動選取的列                                                      |
+| `Enter`             | 顯示選取 model 的完整數字（Usage、Analysis）                      |
+| `←` / `→`           | 改用左邊 / 右邊那一欄排序（Usage、Analysis）                      |
+| `[` / `]`           | 上一個 / 下一個時間範圍：day、week、month、all（Usage、Analysis） |
+| `r`                 | 立即刷新（Usage、Analysis）                                       |
+| `m`                 | 合併 / 拆開 provider 前綴，會存進設定檔（Usage）                  |
+| `p`                 | 開啟 Provider Usage 面板（Usage）                                 |
+| `?`                 | 列出目前分頁的按鍵                                                |
+| `Esc`               | 關閉開啟的面板                                                    |
+| `q`                 | 離開                                                              |
 
 Quota 與 Settings 分頁不掃描任何 session。第一次切到 Usage 或 Analysis 時才開始該分頁的掃描，而且只有畫面上的分頁會依計時器刷新。分頁列右側顯示時間範圍，以及 vct 自己的記憶體與 CPU 用量。
 
@@ -186,7 +189,7 @@ vct usage --table --merge-providers
 ```
 
 > [!NOTE]
-> `--table` 與 `--text` 的 model 列會依 cost 由小到大排序，所以花費最高的 model 會排在最後（在 `--table` 中緊鄰 `TOTAL` 列上方）；`--json` 的列則沒有固定順序。互動式介面預設依 cost 由大到小排序，按 `o` 可切換排序欄位：cost、total、input、output、cache read、cache write、model 名稱。表格標題右側會標出目前的排序（`cost ▼`）。互動式介面也會隱藏在所選範圍內用量為 0 的 model。
+> `--table` 與 `--text` 的 model 列會依 cost 由小到大排序，所以花費最高的 model 會排在最後（在 `--table` 中緊鄰 `TOTAL` 列上方）；`--json` 的列則沒有固定順序。互動式介面預設依 cost 由大到小排序，按 `←` / `→` 可改用左邊或右邊那一欄排序，排序欄的表頭會標亮。表格標題右側會標出目前的排序（`sort: cost ▼`）。互動式介面也會隱藏在所選範圍內用量為 0 的 model。
 
 > [!TIP]
 > 同一個 model 在不同 provider 前綴下路由時會顯示成多列（`openai/gpt-5.5`、`azure/gpt-5.5`、純 `gpt-5.5`）。`--merge-providers` 會把第一個 `/` 之後 base 名稱相同的列合併（`gpt-5.5` 與 `gpt-5.4` 這類版本不同的仍分開），並把它們已定價的 cost 相加。在 Usage 分頁按 `m` 可即時切換（這個選擇會存進 `~/.vct/config.toml`，所以下次啟動時會記住這個設定）;`--merge-providers` 則讓該分頁一打開就是合併狀態。`--json` 保持為逐一 model 的原始輸出。
@@ -195,24 +198,24 @@ vct usage --table --merge-providers
 
 ```
  vct  1 Usage  2 Analysis  3 Quota  4 Settings                         range  day  week  month  all   61.8 MB · CPU 0.1%
-┌ Models · $79.33 · 49.1M tokens · 3 models ─────────────────────────────────────────────────────────────────── cost ▼ ┐
-│Model                              Input     Output    Cache Read  Cache Write Total     Cost (USD)   Share           █
-│                                                                                                                      █
-│claude-opus-4-8                        25.7K      179K       42.9M        496K     43.6M       $77.59  █████████ 88.8%█
-│claude-haiku-4-5-20251001              5.57K     19.8K       5.20M       55.0K     5.28M        $1.34          █ 10.8%█
-│gemini-3.1-pro-preview                  129K     10.3K       66.0K       1.70K      207K        $0.40             0.4%█
-│                                                                                                                      █
-│                                                                                                                      █
+┌ Models · $79.33 · 49.1M tokens · 3 models ───────────────────────────────────────────────────────────── sort: cost ▼ ┐
+│Model                                  Input    Output  Cache Read Cache Write     Total   Cost (USD)            Share│
+│                                                                                                                      │
+│claude-opus-4-8                        25.7K      179K       42.9M        496K     43.6M       $77.59 ━━━━━━━━━  88.8%│
+│claude-haiku-4-5-20251001              5.57K     19.8K       5.20M       55.0K     5.28M        $1.34 ━          10.8%│
+│gemini-3.1-pro-preview                  129K     10.3K       66.0K       1.70K      207K        $0.40             0.4%│
+│                                                                                                                      │
+│                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-                                              Claude $78.93 · Gemini $0.40
-┌ Claude ──────────────┐┌ Codex ───────────────┐┌ Copilot ─────────────┐┌ Cursor ────────LIMIT ┐┌ Grok ────────────────┐
+                                            ● Claude $78.93  ● Gemini $0.40
+┌ ● Claude ────────────┐┌ ● Codex ─────────────┐┌ ● Copilot ───────────┐┌ ● Cursor ──────LIMIT ┐┌ ● Grok ──────────────┐
 │max 20x       just now││plus          just now││individual    just now││free          just now││SuperGrok     just now│
-│5h    ▰▱▱▱▱  13% 1h42m││5h    ▰▰▱▱▱  33% 12m  ││prem  ▰▱▱▱▱   3% 24d0h││total ▰▰▰▰▰  94% 16d0h││week  ▰▰▱▱▱  38% 3d4h │
-│7d    ▰▰▰▱▱  58% 1d23h││7d    ▰▰▱▱▱  36% 1h54m││reqs  ▰▱▱▱▱ 45/1500   ││auto  ▰▰▰▰▰ 100% 16d0h││ondmd $4.20/$50.00    │
-│Fable ▰▰▰▰▱  79% 1d23h││credits 0 · +3 reset  ││                      ││api   ▰▰▰▱▱  44% 16d0h││balance $12.00        │
+│5h    ━────  13% 1h42m││5h    ━━───  33% 12m  ││prem  ━────   3% 24d0h││total ━━━━━  94% 16d0h││week  ━━───  38% 3d4h │
+│7d    ━━━──  58% 1d23h││7d    ━━───  36% 1h54m││reqs  ━──── 45/1500   ││auto  ━━━━━ 100% 16d0h││ondmd $4.20/$50.00    │
+│Fable ━━━━─  79% 1d23h││credits 0 · +3 reset  ││                      ││api   ━━━──  44% 16d0h││balance $12.00        │
 │bal - · $0.00 used    ││reset expires 17d0h   ││                      ││                      ││                      │
 └──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘
-                ↑/↓ scroll  o sort  t range  m merge  p providers  r refresh  q quit  |  Star on GitHub
+ ↑↓ move  ←→ sort  [ ] range  p providers  m merge  ⏎ details  r refresh  1-4/tab view  ? help  q quit   Star on GitHub
 ```
 
 Usage 與 Analysis 分頁各自在第一次切到時開始掃描, 並繪製置中的 `Loading sessions...` spinner. Loading 期間仍可處理 `q`, Ctrl+C 與 resize event. 後續掃描會在 `Refreshing...` footer 下保留上一次成功的資料. 如果 refresh 失敗, 分頁會保留 last-known-good view, 並在下次排程或手動刷新時重試. 所選範圍內沒有任何 session 時, 會顯示空的表格.
@@ -314,18 +317,18 @@ vct 會透過 ssh 在每台主機上執行 `vct ledger export`，並把回傳的
 `vct usage` 會**在儀表板中直接顯示 Claude Code、Codex、GitHub Copilot、Cursor、Grok 與 Antigravity 的即時額度用量——完全零設定。** 不需要 status-line hook，也不需要手動輸入憑證：vct 會讀取各 provider 自己的 OAuth 憑證，在背景執行緒呼叫其用量 API（Antigravity 則是詢問 `agy` CLI），並在你工作時讓面板保持最新。每個進度條都是**已用**百分比，所以進度條滿格代表該額度週期已用盡，而不是還沒開始用。（想要更清爽的儀表板嗎？在 [`config.toml`](#%E8%A8%AD%E5%AE%9A) 中精簡 `[usage.quota]` 下的 `panels`,或設為 `[]` 隱藏所有額度卡片。表格下方那行各 provider 成本是本機掃描資料而不是額度面板,所以不受這裡的設定影響。）
 
 ```
-┌ Claude ──────────────┐┌ Codex ───────────────┐┌ Copilot ─────────────┐┌ Cursor ────────LIMIT ┐┌ Grok ────────────────┐
+┌ ● Claude ────────────┐┌ ● Codex ─────────────┐┌ ● Copilot ───────────┐┌ ● Cursor ──────LIMIT ┐┌ ● Grok ──────────────┐
 │max 20x       just now││plus          just now││individual    just now││free          just now││SuperGrok     just now│
-│5h    ▰▱▱▱▱  13% 1h42m││5h    ▰▰▱▱▱  33% 12m  ││prem  ▰▱▱▱▱   3% 24d0h││total ▰▰▰▰▰  94% 16d0h││week  ▰▰▱▱▱  38% 3d4h │
-│7d    ▰▰▰▱▱  58% 1d23h││7d    ▰▰▱▱▱  36% 1h54m││reqs  ▰▱▱▱▱ 45/1500   ││auto  ▰▰▰▰▰ 100% 16d0h││ondmd $4.20/$50.00    │
-│Fable ▰▰▰▰▱  79% 1d23h││credits 0 · +3 reset  ││                      ││api   ▰▰▰▱▱  44% 16d0h││balance $12.00        │
+│5h    ━────  13% 1h42m││5h    ━━───  33% 12m  ││prem  ━────   3% 24d0h││total ━━━━━  94% 16d0h││week  ━━───  38% 3d4h │
+│7d    ━━━──  58% 1d23h││7d    ━━───  36% 1h54m││reqs  ━──── 45/1500   ││auto  ━━━━━ 100% 16d0h││ondmd $4.20/$50.00    │
+│Fable ━━━━─  79% 1d23h││credits 0 · +3 reset  ││                      ││api   ━━━──  44% 16d0h││balance $12.00        │
 │bal - · $0.00 used    ││reset expires 17d0h   ││                      ││                      ││                      │
 └──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘
-┌ Antigravity ──────+2 ┐
+┌ ● Antigravity ────+2 ┐
 │-             just now│
 │Gemini Models         │
-│5h     ▰▰▱▱▱  23%     │
-│weekly ▰▱▱▱▱   8%     │
+│5h     ━━───  23%     │
+│weekly ━────   8%     │
 │Claude and GPT models │
 └──────────────────────┘
 ```
@@ -387,24 +390,24 @@ vct analysis --json --daily > today.json
 
 ```
  vct  1 Usage  2 Analysis  3 Quota  4 Settings                         range  day  week  month  all   61.9 MB · CPU 0.1%
-┌ Models · 135K lines · 1.80K tool calls · 3 models ────────────────────────────────────────────────────────── lines ▼ ┐
-│Model                                   Edit Lines  Read Lines  Write Lines Bash    Edit    Read    TodoWrite  Write  █
-│                                                                                                                      █
-│claude-opus-4-8                               12.4K       88.1K       9.02K     412     231     604         96      88█
-│gemini-3.1-pro-preview                        2.10K       14.8K       1.62K      84      44     112         16      15█
-│claude-haiku-4-5-20251001                       840       5.40K         610      31      16      42          6       5█
-│                                                                                                                      █
+┌ Models · 135K lines · 1.80K tool calls · 3 models ─────────────────────────────────────────────── sort: edit lines ▼ ┐
+│Model                                    Edit Lines  Read Lines Write Lines    Bash    Edit    Read  TodoWrite   Write│
+│                                                                                                                      │
+│claude-opus-4-8                               12.4K       88.1K       9.02K     412     231     604         96      88│
+│gemini-3.1-pro-preview                        2.10K       14.8K       1.62K      84      44     112         16      15│
+│claude-haiku-4-5-20251001                       840       5.40K         610      31      16      42          6       5│
+│                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌ Providers ───────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│Provider                 Edit Lines  Read Lines  Write Lines  Bash     Edit     Read     TodoWrite   Write    Days    │
+│Provider                  Edit Lines  Read Lines  Write Lines     Bash     Edit     Read   TodoWrite    Write     Days│
 │                                                                                                                      │
-│Claude                   13.2K       93.5K       9.63K        443      247      646      102         93       12      │
-│Gemini                   2.10K       14.8K       1.62K        84       44       112      16          15       3       │
+│● Claude                       13.2K       93.5K        9.63K      443      247      646         102       93       12│
+│● Gemini                       2.10K       14.8K        1.62K       84       44      112          16       15        3│
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-                           ↑/↓ scroll  o sort  t range  r refresh  q quit  |  Star on GitHub
+ ↑↓ move  ←→ sort  [ ] range  ⏎ details  r refresh  1-4/tab view  ? help  q quit                         Star on GitHub
 ```
 
-表格預設依總行數由大到小排序；按 `o` 可切換排序欄位：lines、edit lines、read lines、write lines、tool calls、model 名稱。
+表格預設依 edit lines 由大到小排序；按 `←` / `→` 可改用左邊或右邊那一欄排序，排序欄的表頭會標亮。
 
 ### 預覽：表格與 JSON（`vct analysis`）
 
@@ -531,15 +534,15 @@ vct quota
 ```
  vct  1 Usage  2 Analysis  3 Quota  4 Settings                31.6 MB · CPU 0.0%
 
-┌ Claude ──────────────────────────────┐┌ Codex ───────────────────────────────┐
+┌ ● Claude ────────────────────────────┐┌ ● Codex ─────────────────────────────┐
 │max 5x                        just now││plus                          just now│
-│5h    ▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱  30%  ↻ 2h18m ││5h    ▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱   0%  ↻ 4h59m │
-│7d    ▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱  28%  ↻ 6d3h  ││7d    ▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱   1%  ↻ 6d8h  │
-│Fable ▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱  14%  ↻ 6d3h  ││credits 0 · +3 reset                  │
+│5h    ━━━━━━───────────  30%  ↻ 2h18m ││5h    ─────────────────   0%  ↻ 4h59m │
+│7d    ━━━━━────────────  28%  ↻ 6d3h  ││7d    ━────────────────   1%  ↻ 6d8h  │
+│Fable ━━━──────────────  14%  ↻ 6d3h  ││credits 0 · +3 reset                  │
 │bal - · $0.00 used                    ││reset expires 17d11h                  │
 └──────────────────────────────────────┘└──────────────────────────────────────┘
 
-                                     q quit
+ 1-4/tab view  ? help  q quit                                    Star on GitHub
 ```
 
 > `vct monitor` 與隱藏別名 `vct fetch` 已移除。要看卡片請用 `vct quota`，要看原始回應請用 `vct quota <provider>`。
@@ -585,26 +588,34 @@ vct 會把使用者設定存放在 `~/.vct/config.toml`。這個檔案會在**�
 
 ### Settings 分頁
 
-在互動式介面中按 `4`（或用 `Tab` 切過去），就能以表單編輯 `config.toml` 的每一項設定：左邊是區段，右邊是該區段的欄位，下方則是目前欄位的說明、設定鍵與預設值。
+在互動式介面中按 `4`（或用 `Tab` 切過去），就能以表單編輯 `config.toml` 的每一項設定：所有設定依區段排成一份清單，左邊的區段清單標出目前所在的區段，下方則是目前欄位的說明、設定鍵與預設值。`*` 表示該欄位已不是預設值。
 
 ```
  vct  1 Usage  2 Analysis  3 Quota  4 Settings                                                        31.8 MB · CPU 0.0%
-┌ Sections ──────┐┌ Usage ─────────────────────────────────────────────────────────────────────────────────────────────┐
-│ General        ││ Merge models across providers                                                               [x] on │
-│ Usage          ││ Redraw interval                                                                           ‹ 10 s › │
-│ Analysis       ││ Quota panel: Claude                                                                         [x] on │
-│ Providers      ││ Quota panel: Codex                                                                          [x] on │
-│ Remotes        ││ Quota panel: Copilot                                                                        [x] on │
-│ Performance    ││ Quota panel: Cursor                                                                         [x] on │
-│ Logging        ││ Quota panel: Grok                                                                           [x] on │
+┌ Sections ──────┐┌ Settings ─────────────────────────────────────────────────────────────────────────────── 27 more ↓ ┐
+│   General      ││ General                                                                                            │
+│ › Usage        ││   Default time range                                                                        ‹ all ›│
+│   Analysis     ││   Check for updates on start                                                                 [x] on│
+│   Providers    ││                                                                                                    │
+│   Remotes      ││ Usage                                                                                              │
+│   Performance  ││   Merge models across providers                                                             [ ] off│
+│   Logging      ││   Redraw interval                                                                          ‹ 10 s ›│
+│                ││   Quota panel: Claude                                                                        [x] on│
+│                ││   Quota panel: Codex                                                                         [x] on│
+│                ││   Quota panel: Copilot                                                                       [x] on│
+│                ││   Quota panel: Cursor                                                                        [x] on│
+│                ││   Quota panel: Grok                                                                          [x] on│
+│                ││   Quota panel: Antigravity                                                                   [x] on│
+│                ││   Quota poll interval                                                                      ‹ 60 s ›│
 └────────────────┘└────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌ Quota panel: Claude · usage.quota.panels ─────────────────────────────────────────────────────────── default: [x] on ┐
-│Which live quota panels to show in the app, by provider name. An empty list hides every quota card.                   │
+│Which live quota panels to show in the app (by provider name: `claude` / `codex` / `copilot` / `cursor` / `grok` /    │
+│`antigravity`). An empty list hides every quota card.                                                                 │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-                       ↑↓ move  ←→ change  ⏎ edit  tab pane  x reset  e editor  1-4 view  q quit
+ ↑↓ move  ←→ change  space toggle  ⏎ edit  x reset  e editor  1-4/tab view  ? help  q quit               Star on GitHub
 ```
 
-- `↑` / `↓` 移動，`Tab` 切換窗格，`←` / `→` 變更數值（開關、增減數字、切換選項），`x` 把欄位重設為預設值，`e` 用 `$VISUAL` / `$EDITOR` 開啟設定檔，編輯器結束後重新載入。
+- `↑` / `↓` 在所有設定之間移動，`PgUp` / `PgDn` 跳到上一個 / 下一個區段，`←` / `→` 變更數值（開關、增減數字、切換選項），`Space` 開關，`x` 把欄位重設為預設值，`e` 用 `$VISUAL` / `$EDITOR` 開啟設定檔，編輯器結束後重新載入。
 - `Enter` 開啟編輯器：可挑選的清單、數字或文字輸入，或遠端主機清單（`a` 新增、`Enter` 編輯、`d` 刪除）。
 - 每次變更都會立即寫入檔案，並保留檔案裡的註解。
 - 合併、刷新間隔、quota 面板、quota 輪詢間隔與 provider 開關的變更會直接反映在執行中的介面（quota 面板則在離開 Settings 分頁時生效）。預設時間範圍、自動更新、掃描執行緒數、logging 與 remotes 要到下次啟動才生效，表單會在這些欄位上標明。

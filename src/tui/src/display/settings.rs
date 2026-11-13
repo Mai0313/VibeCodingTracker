@@ -1,16 +1,19 @@
 //! The Settings tab: every `config.toml` field as a form, saved on change.
 //!
-//! The fields are one table ([`FIELDS`]); a section is a run of fields sharing
-//! a name. Values are read and written by path through
+//! The fields are one table ([`FIELDS`]), drawn as one list the selection
+//! walks from end to end; a section is a run of fields sharing a name, and the
+//! section list beside the form only marks which one the selection is in.
+//! Values are read and written by path through
 //! [`vct_core::config`], so the typed [`Config`] stays the only definition of
 //! what a field holds, and its doc-comment is the help text shown here.
 
-use crate::display::common::table::render_too_small;
+use crate::display::common::table::{create_controls_with_status, render_too_small, title_line};
+use crate::display::common::theme::theme;
 use crossterm::event::KeyCode;
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::{Color, Style},
+    style::Style,
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
@@ -323,6 +326,12 @@ pub(crate) enum SettingsOutcome {
     Quit,
     /// Show another tab (zero-based).
     SwitchTab(usize),
+    /// Show the tab after this one (`Tab`).
+    NextTab,
+    /// Show the tab before this one (`Shift+Tab`).
+    PrevTab,
+    /// Show the key list (`?`).
+    Help,
     /// A field changed and was saved; the app re-reads [`SettingsUiState::config`].
     Changed,
     /// Open the config file in the user's editor (`e`).
@@ -338,10 +347,10 @@ pub(crate) struct SettingsUiState {
     save: SaveSetting,
     sections: Vec<&'static str>,
     descriptions: Vec<String>,
-    section: usize,
-    /// Index into the current section's fields.
+    /// Index into [`FIELDS`] of the selected field.
     row: usize,
-    in_fields: bool,
+    /// First line of the form on screen.
+    offset: usize,
     editor: Option<Editor>,
     /// The last save's outcome and whether it succeeded.
     message: Option<(String, bool)>,
@@ -368,9 +377,8 @@ impl SettingsUiState {
                         .join(" ")
                 })
                 .collect(),
-            section: 0,
             row: 0,
-            in_fields: false,
+            offset: 0,
             editor: None,
             message: None,
         }
@@ -391,16 +399,24 @@ impl SettingsUiState {
         self.message = Some((text, ok));
     }
 
-    /// Indexes into [`FIELDS`] of the current section's rows.
-    fn rows(&self) -> Vec<usize> {
-        let name = self.sections[self.section];
-        (0..FIELDS.len())
-            .filter(|&index| FIELDS[index].section == name)
-            .collect()
+    fn current(&self) -> usize {
+        self.row
     }
 
-    fn current(&self) -> usize {
-        self.rows()[self.row]
+    /// The first field of the section `step` sections away, stopping at
+    /// either end.
+    fn section_start(&self, step: isize) -> usize {
+        let section = FIELDS[self.row].section;
+        let at = self
+            .sections
+            .iter()
+            .position(|name| *name == section)
+            .unwrap_or(0) as isize;
+        let target = self.sections[(at + step).clamp(0, self.sections.len() as isize - 1) as usize];
+        FIELDS
+            .iter()
+            .position(|field| field.section == target)
+            .unwrap_or(0)
     }
 
     fn value(&self, config: &Config, index: usize) -> Option<SettingValue> {
@@ -541,32 +557,25 @@ impl SettingsUiState {
             return self.handle_editor_key(key);
         }
         match key {
-            KeyCode::Char('q') | KeyCode::Esc => return SettingsOutcome::Quit,
+            KeyCode::Char('q') => return SettingsOutcome::Quit,
             KeyCode::Char('e') => return SettingsOutcome::OpenEditor,
+            KeyCode::Char('?') => return SettingsOutcome::Help,
             KeyCode::Char(digit @ '1'..='4') => {
                 return SettingsOutcome::SwitchTab(digit as usize - '1' as usize);
             }
-            KeyCode::Tab | KeyCode::BackTab => self.in_fields = !self.in_fields,
-            KeyCode::Up | KeyCode::Down => {
-                let step: i64 = if key == KeyCode::Up { -1 } else { 1 };
-                if self.in_fields {
-                    let last = self.rows().len() as i64 - 1;
-                    self.row = (self.row as i64 + step).clamp(0, last) as usize;
-                } else {
-                    let last = self.sections.len() as i64 - 1;
-                    self.section = (self.section as i64 + step).clamp(0, last) as usize;
-                    self.row = 0;
-                }
-                self.message = None;
-            }
-            KeyCode::Right | KeyCode::Enter if !self.in_fields => self.in_fields = true,
-            KeyCode::Left if self.in_fields => return self.nudge(-1),
-            KeyCode::Right if self.in_fields => return self.nudge(1),
-            KeyCode::Char(' ') if self.in_fields => return self.nudge(1),
+            KeyCode::Tab => return SettingsOutcome::NextTab,
+            KeyCode::BackTab => return SettingsOutcome::PrevTab,
+            KeyCode::Up => self.row = self.row.saturating_sub(1),
+            KeyCode::Down => self.row = (self.row + 1).min(FIELDS.len() - 1),
+            KeyCode::PageUp => self.row = self.section_start(-1),
+            KeyCode::PageDown => self.row = self.section_start(1),
+            KeyCode::Left => return self.nudge(-1),
+            KeyCode::Right | KeyCode::Char(' ') => return self.nudge(1),
             KeyCode::Enter => return self.open_editor(),
-            KeyCode::Char('x') if self.in_fields => return self.reset(),
-            _ => {}
+            KeyCode::Char('x') => return self.reset(),
+            _ => return SettingsOutcome::Stay,
         }
+        self.message = None;
         SettingsOutcome::Stay
     }
 
@@ -686,7 +695,7 @@ impl SettingsUiState {
     }
 
     /// Draws the tab into `area`.
-    pub(crate) fn draw(&self, f: &mut Frame, area: Rect) {
+    pub(crate) fn draw(&mut self, f: &mut Frame, area: Rect) {
         if area.width < SETTINGS_MIN_W || area.height < SETTINGS_MIN_H {
             render_too_small(f, SETTINGS_MIN_W, SETTINGS_MIN_H);
             return;
@@ -699,21 +708,21 @@ impl SettingsUiState {
         .areas(area);
         let [left, right] =
             Layout::horizontal([Constraint::Length(SECTIONS_W), Constraint::Min(0)]).areas(main);
-        let dim = Style::default().fg(Color::DarkGray);
-        let focus = Style::default().fg(Color::Cyan);
-        let selected = Style::default().bg(Color::Rgb(40, 52, 66)).bold();
-        let border = |focused: bool| if focused { focus } else { dim };
+        let theme = theme();
+        let dim = theme.dim();
+        let here = FIELDS[self.row].section;
 
         let section_lines: Vec<Line> = self
             .sections
             .iter()
-            .enumerate()
-            .map(|(at, name)| {
-                let text = format!(" {name:<w$}", w = usize::from(SECTIONS_W) - 3);
-                if at == self.section {
-                    Line::from(Span::styled(text, selected))
+            .map(|name| {
+                if *name == here {
+                    Line::from(vec![
+                        Span::styled(" › ", theme.accent()),
+                        Span::styled(*name, Style::default().bold()),
+                    ])
                 } else {
-                    Line::from(text)
+                    Line::from(Span::styled(format!("   {name}"), dim))
                 }
             })
             .collect();
@@ -721,52 +730,100 @@ impl SettingsUiState {
             Paragraph::new(section_lines).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" Sections ")
-                    .border_style(border(!self.in_fields)),
+                    .title(title_line("Sections"))
+                    .border_style(theme.border()),
             ),
             left,
         );
 
-        let rows = self.rows();
-        let inner_w = usize::from(right.width.saturating_sub(4));
+        // One list: a heading before each section's fields, a blank line
+        // after them.
+        let inner_w = usize::from(right.width.saturating_sub(5));
         let defaults = Config::default();
-        let field_lines: Vec<Line> = rows
-            .iter()
-            .enumerate()
-            .map(|(at, &index)| {
-                let value = self.display(&self.config, index);
-                let label_w = inner_w.saturating_sub(value.chars().count());
-                let label: String = FIELDS[index].label.chars().take(label_w).collect();
-                let text = format!(" {label:<label_w$}{value} ");
-                let changed = self.value(&self.config, index) != self.value(&defaults, index);
-                let style = match (self.in_fields && at == self.row, changed) {
-                    (true, _) => selected,
-                    (false, true) => Style::default().fg(Color::Yellow),
-                    (false, false) => Style::default(),
-                };
-                Line::from(Span::styled(text, style))
-            })
-            .collect();
+        let mut lines: Vec<Line> = Vec::new();
+        let mut selected_line = 0;
+        let mut changed_count = 0;
+        for (index, field) in FIELDS.iter().enumerate() {
+            if index == 0 || FIELDS[index - 1].section != field.section {
+                if index > 0 {
+                    lines.push(Line::default());
+                }
+                lines.push(Line::from(Span::styled(
+                    format!(" {}", field.section),
+                    dim.bold(),
+                )));
+            }
+            let value = self.display(&self.config, index);
+            let label_w = inner_w.saturating_sub(value.chars().count());
+            let label: String = field.label.chars().take(label_w).collect();
+            let changed = self.value(&self.config, index) != self.value(&defaults, index);
+            changed_count += usize::from(changed);
+            let value_style = match value.as_str() {
+                "[x] on" => Style::default().fg(theme.good),
+                "[ ] off" => dim,
+                _ => Style::default(),
+            };
+            let mut line = Line::from(vec![
+                Span::styled(
+                    if changed { " * " } else { "   " },
+                    Style::default().fg(theme.warn),
+                ),
+                Span::raw(format!("{label:<label_w$}")),
+                Span::styled(value, value_style),
+                Span::raw(" "),
+            ]);
+            if index == self.row {
+                selected_line = lines.len();
+                line = line.style(theme.selected());
+            }
+            lines.push(line);
+        }
+        // Keep the selection on screen, with its section heading when it is
+        // the first field under one.
+        let visible = usize::from(right.height.saturating_sub(2));
+        let top = if self.row == 0 || FIELDS[self.row - 1].section != here {
+            selected_line - 1
+        } else {
+            selected_line
+        };
+        self.offset = self.offset.min(top);
+        if selected_line >= self.offset + visible {
+            self.offset = selected_line + 1 - visible;
+        }
+        let hidden_below = lines.len().saturating_sub(self.offset + visible);
+        let mut block = Block::default()
+            .borders(Borders::ALL)
+            .title(title_line("Settings"))
+            .border_style(theme.border());
+        let mut notes = Vec::new();
+        if changed_count > 0 {
+            notes.push(format!("* {changed_count} changed from default"));
+        }
+        if hidden_below > 0 {
+            notes.push(format!("{hidden_below} more ↓"));
+        }
+        if !notes.is_empty() {
+            block = block.title(
+                Line::from(Span::styled(format!(" {} ", notes.join(" · ")), dim)).right_aligned(),
+            );
+        }
         f.render_widget(
-            Paragraph::new(field_lines).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!(" {} ", self.sections[self.section]))
-                    .border_style(border(self.in_fields)),
-            ),
+            Paragraph::new(lines)
+                .scroll((self.offset as u16, 0))
+                .block(block),
             right,
         );
 
         let index = self.current();
         let field = &FIELDS[index];
         let mut title = vec![
-            Span::styled(format!(" {} ", field.label), Style::default().bold()),
+            Span::styled(format!(" {} ", field.label), theme.title()),
             Span::styled(format!("· {} ", field.path.join(".")), dim),
         ];
         if !field.live {
             title.push(Span::styled(
                 "· applies on next start ",
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(theme.warn),
             ));
         }
         let default = format!(" default: {} ", self.display(&defaults, index));
@@ -776,44 +833,30 @@ impl SettingsUiState {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .border_style(dim)
+                        .border_style(theme.border())
                         .title(Line::from(title))
                         .title(Line::from(Span::styled(default, dim)).right_aligned()),
                 ),
             help,
         );
 
-        let key = Style::default().fg(Color::Cyan).bold();
-        let mut hints = Vec::new();
-        for (name, label) in [
-            ("↑↓", " move  "),
-            ("←→", " change  "),
-            ("⏎", " edit  "),
-            ("tab", " pane  "),
-            ("x", " reset  "),
-            ("e", " editor  "),
-            ("1-4", " view  "),
-            ("q", " quit"),
-        ] {
-            hints.push(Span::styled(name, key));
-            hints.push(Span::styled(label, dim));
-        }
-        if let Some((text, ok)) = &self.message {
-            let color = if *ok { Color::Green } else { Color::Red };
-            let hints_w: usize = hints.iter().map(|span| span.content.chars().count()).sum();
-            // A message too long to sit beside the hints takes the row: it is
-            // the only place a failure is reported.
-            if hints_w + 5 + text.chars().count() > usize::from(controls.width) {
-                hints.clear();
-            } else {
-                hints.push(Span::styled("  |  ", dim));
-            }
-            hints.push(Span::styled(
-                text.clone(),
-                Style::default().fg(color).bold(),
-            ));
-        }
-        f.render_widget(Paragraph::new(Line::from(hints)).centered(), controls);
+        f.render_widget(
+            create_controls_with_status(
+                &[
+                    ("↑↓", "move"),
+                    ("←→", "change"),
+                    ("space", "toggle"),
+                    ("⏎", "edit"),
+                    ("x", "reset"),
+                    ("e", "editor"),
+                ],
+                self.message
+                    .as_ref()
+                    .map(|(text, ok)| (text.as_str(), if *ok { theme.good } else { theme.bad })),
+                controls.width,
+            ),
+            controls,
+        );
 
         if let Some(editor) = &self.editor {
             self.draw_editor(f, area, editor, field);
@@ -822,9 +865,10 @@ impl SettingsUiState {
 
     /// Draws the open editor centered over `area`.
     fn draw_editor(&self, f: &mut Frame, area: Rect, editor: &Editor, field: &Field) {
-        let dim = Style::default().fg(Color::DarkGray);
-        let selected = Style::default().bg(Color::Rgb(40, 52, 66)).bold();
-        let caret = Span::styled("▏", Style::default().fg(Color::Cyan));
+        let theme = theme();
+        let dim = theme.dim();
+        let selected = theme.selected();
+        let caret = Span::styled("▏", theme.accent());
         let (lines, hint): (Vec<Line>, &str) = match editor {
             Editor::Choice { selected: at } => {
                 let Kind::Choice(options) = field.kind else {
@@ -893,8 +937,11 @@ impl SettingsUiState {
             Paragraph::new(body).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan))
-                    .title(format!(" {} ", field.label)),
+                    .border_style(theme.accent())
+                    .title(Line::from(Span::styled(
+                        format!(" {} ", field.label),
+                        theme.title(),
+                    ))),
             ),
             rect,
         );
@@ -937,17 +984,19 @@ mod tests {
     }
 
     fn go_to(state: &mut SettingsUiState, section: &str, label: &str) {
-        state.section = state
-            .sections
+        state.row = FIELDS
             .iter()
-            .position(|name| *name == section)
+            .position(|field| field.section == section && field.label == label)
             .unwrap();
-        state.row = state
-            .rows()
-            .iter()
-            .position(|&index| FIELDS[index].label == label)
-            .unwrap();
-        state.in_fields = true;
+    }
+
+    fn screen(state: &mut SettingsUiState, w: u16, h: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| state.draw(f, f.area())).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..h)
+            .map(|y| (0..w).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect()
     }
 
     #[test]
@@ -1134,59 +1183,108 @@ mod tests {
     #[test]
     fn keys_outside_an_editor_leave_or_switch() {
         let (mut state, _) = form();
-        assert_eq!(
-            press(&mut state, &[KeyCode::Char('2')]),
-            SettingsOutcome::SwitchTab(1)
-        );
-        assert_eq!(
-            press(&mut state, &[KeyCode::Char('q')]),
-            SettingsOutcome::Quit
-        );
-        assert_eq!(
-            press(&mut state, &[KeyCode::Char('e')]),
-            SettingsOutcome::OpenEditor
-        );
-        // Inside an input `e` is a letter.
+        for (key, outcome) in [
+            (KeyCode::Char('2'), SettingsOutcome::SwitchTab(1)),
+            (KeyCode::Tab, SettingsOutcome::NextTab),
+            (KeyCode::BackTab, SettingsOutcome::PrevTab),
+            (KeyCode::Char('?'), SettingsOutcome::Help),
+            (KeyCode::Char('q'), SettingsOutcome::Quit),
+            (KeyCode::Char('e'), SettingsOutcome::OpenEditor),
+            // Esc backs out of an editor and does nothing without one.
+            (KeyCode::Esc, SettingsOutcome::Stay),
+        ] {
+            assert_eq!(press(&mut state, &[key]), outcome, "{key:?}");
+        }
+        // Inside an input `e` and `q` are letters, and Tab stays put.
         go_to(&mut state, "Remotes", "vct command on the hosts");
-        assert_eq!(
-            press(&mut state, &[KeyCode::Enter, KeyCode::Char('e')]),
-            SettingsOutcome::Stay
-        );
-        press(&mut state, &[KeyCode::Esc]);
-        state.in_fields = false;
-        state.section = 0;
-        // Moving down the sections changes which fields are listed.
-        press(&mut state, &[KeyCode::Down]);
-        assert_eq!(state.sections[state.section], "Usage");
+        for key in [
+            KeyCode::Enter,
+            KeyCode::Char('e'),
+            KeyCode::Char('q'),
+            KeyCode::Tab,
+        ] {
+            assert_eq!(press(&mut state, &[key]), SettingsOutcome::Stay, "{key:?}");
+        }
+        assert!(state.editor.is_some());
     }
 
     #[test]
-    fn a_long_message_takes_the_hint_row_rather_than_being_cut() {
+    fn the_selection_walks_every_field_and_jumps_by_section() {
+        let (mut state, _) = form();
+        assert_eq!(press(&mut state, &[KeyCode::Up]), SettingsOutcome::Stay);
+        assert_eq!(state.row, 0);
+        // Down from a section's last field lands on the next section's first.
+        press(&mut state, &[KeyCode::Down, KeyCode::Down]);
+        assert_eq!(FIELDS[state.row].section, "Usage");
+        // A field is changed where the selection is, with no pane to enter.
+        let before = state.config().usage.merge_models;
+        assert_eq!(
+            press(&mut state, &[KeyCode::Right]),
+            SettingsOutcome::Changed
+        );
+        assert_eq!(state.config().usage.merge_models, !before);
+
+        press(&mut state, &[KeyCode::PageDown]);
+        assert_eq!(FIELDS[state.row].label, "Redraw interval");
+        assert_eq!(FIELDS[state.row].section, "Analysis");
+        press(&mut state, &[KeyCode::PageUp]);
+        assert_eq!(FIELDS[state.row].label, "Merge models across providers");
+        for _ in 0..FIELDS.len() {
+            press(&mut state, &[KeyCode::Down]);
+        }
+        assert_eq!(state.row, FIELDS.len() - 1);
+        for _ in 0..FIELDS.len() {
+            press(&mut state, &[KeyCode::PageDown]);
+        }
+        assert_eq!(FIELDS[state.row].label, "Log level");
+    }
+
+    #[test]
+    fn the_form_scrolls_to_keep_the_selection_and_its_heading_on_screen() {
+        let (mut state, _) = form();
+        let (w, h) = (100u16, 20u16);
+        let top = screen(&mut state, w, h).join("\n");
+        assert!(top.contains("General") && top.contains("more ↓"), "{top}");
+        assert!(!top.contains("Keep log files for"), "{top}");
+
+        go_to(&mut state, "Logging", "Keep log files for");
+        let bottom = screen(&mut state, w, h).join("\n");
+        assert!(bottom.contains("Keep log files for"), "{bottom}");
+        assert!(!bottom.contains("more ↓"), "{bottom}");
+
+        // Back at a section's first field, its heading is shown above it.
+        go_to(&mut state, "Providers", "Claude Code");
+        let lines = screen(&mut state, w, h);
+        let field = lines
+            .iter()
+            .position(|line| line.contains("Claude Code"))
+            .unwrap();
+        // Row 0 is the pane's border, so the heading is the first row inside.
+        assert_eq!(field, 2, "{lines:#?}");
+        assert!(lines[1].contains("Providers"), "{lines:#?}");
+    }
+
+    #[test]
+    fn a_message_is_never_cut_and_takes_the_row_when_it_must() {
         let (mut state, _) = form();
         let message = "Editor 'code --wait' exited with exit status: 1, nothing changed";
         state.set_message(message.to_string(), false);
-        let (w, h) = (100u16, 24u16);
-        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
-        terminal.draw(|f| state.draw(f, f.area())).unwrap();
-        let buffer = terminal.backend().buffer();
-        let last: String = (0..w).map(|x| buffer[(x, h - 1)].symbol()).collect();
-        assert!(last.contains(message), "{last}");
-        assert!(!last.contains("q quit"), "{last}");
+        let wide = screen(&mut state, 100, 24);
+        let last = wide.last().unwrap();
+        assert!(last.contains(message) && last.contains("q quit"), "{last}");
+        let narrow = screen(&mut state, 80, 24);
+        let last = narrow.last().unwrap();
+        assert!(last.contains(message) && !last.contains("q quit"), "{last}");
     }
 
     #[test]
     fn the_form_names_the_field_its_path_and_its_default() {
         let (mut state, _) = form();
         go_to(&mut state, "Remotes", "Fetch interval");
-        let (w, h) = (100u16, 24u16);
-        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
-        terminal.draw(|f| state.draw(f, f.area())).unwrap();
-        let buffer = terminal.backend().buffer();
-        let screen: String = (0..h)
-            .map(|y| (0..w).map(|x| buffer[(x, y)].symbol()).collect::<String>() + "\n")
-            .collect();
+        let screen = screen(&mut state, 100, 24).join("\n");
         for expected in [
             "Sections",
+            "› Remotes",
             "Fetch interval",
             "remotes.refresh_interval",
             "applies on next start",

@@ -4,12 +4,11 @@
 use super::interactive::{
     GridSpec, QuotaView, dim_line, fit_cards, no_cards_reason, render_quota_card,
 };
-use crate::display::common::table::render_too_small;
+use crate::display::common::table::{create_controls_with_status, render_too_small};
+use crate::display::common::theme::theme;
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::{Color, Style},
-    text::{Line, Span},
     widgets::Paragraph,
 };
 
@@ -31,7 +30,6 @@ pub(crate) fn draw_quota_tab(f: &mut Frame, area: Rect, quota: &QuotaView, now: 
         return;
     }
     let [body, footer] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
-    let dim = Style::default().fg(Color::DarkGray);
 
     let (cards, hidden) = fit_cards(&QUOTA_GRID, body, quota, now, true);
     if cards.is_empty() {
@@ -55,17 +53,15 @@ pub(crate) fn draw_quota_tab(f: &mut Frame, area: Rect, quota: &QuotaView, now: 
         render_quota_card(f, cell, card);
     }
 
-    let mut controls = vec![
-        Span::styled("q", Style::default().fg(Color::Red).bold()),
-        Span::styled(" quit", dim),
-    ];
-    if hidden > 0 {
-        controls.push(Span::styled(
-            format!("  |  +{hidden} hidden, enlarge the terminal"),
-            Style::default().fg(Color::Yellow),
-        ));
-    }
-    f.render_widget(Line::from(controls).centered(), footer);
+    let note = (hidden > 0).then(|| format!("+{hidden} hidden, enlarge the terminal"));
+    f.render_widget(
+        create_controls_with_status(
+            &[],
+            note.as_deref().map(|text| (text, theme().warn)),
+            footer.width,
+        ),
+        footer,
+    );
 }
 
 #[cfg(test)]
@@ -127,9 +123,9 @@ mod tests {
     fn bars_stretch_with_the_card() {
         let narrow = frame(40, 12, 1, true);
         let wide = frame(72, 12, 1, true);
-        let filled = |frame: &str| frame.matches('▰').count();
-        assert!(filled(&narrow) > 3, "{narrow}");
-        assert!(filled(&wide) > filled(&narrow), "{wide}");
+        let cells = |frame: &str| frame.matches('━').count();
+        assert!(cells(&narrow) > 5, "{narrow}");
+        assert!(cells(&wide) > cells(&narrow), "{wide}");
     }
 
     #[test]
