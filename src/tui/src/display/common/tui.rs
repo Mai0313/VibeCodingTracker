@@ -9,7 +9,10 @@ use crossterm::{
     cursor::{MoveTo, Show},
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute, queue,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+        enable_raw_mode,
+    },
 };
 use ratatui::{
     Frame, Terminal,
@@ -126,6 +129,34 @@ impl TerminalSession {
     /// [`Self::finish`].
     pub fn terminal_mut(&mut self) -> &mut Terminal<CrosstermBackend<io::Stdout>> {
         self.terminal.as_mut().expect("terminal session is open")
+    }
+
+    /// Hands the terminal to `run` (an editor, say) and takes it back.
+    ///
+    /// The alternate screen and raw mode are left for the call and entered
+    /// again after it, and the next frame is drawn in full.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if leaving or re-entering the terminal mode fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics once the session has been closed.
+    pub fn suspend<T>(&mut self, run: impl FnOnce() -> T) -> anyhow::Result<T> {
+        let terminal = self.terminal.as_mut().expect("terminal session is open");
+        restore_terminal(terminal)?;
+        let output = run();
+        // A fresh `Terminal` has empty buffers, so the next frame is drawn in
+        // full. `Terminal::clear` would do too, but it asks the terminal for
+        // the cursor position and fails on one that does not answer.
+        self.terminal = None;
+        let mut terminal = setup_terminal()?;
+        // Not every terminal empties the alternate screen on re-entry, and the
+        // empty buffers mean blank cells are never written.
+        execute!(terminal.backend_mut(), Clear(ClearType::All))?;
+        self.terminal = Some(terminal);
+        Ok(output)
     }
 
     /// Restores the terminal now, attempting every cleanup step.

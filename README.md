@@ -601,10 +601,10 @@ Press `4` in the app (or `Tab` over to it) to edit every `config.toml` setting a
 ┌ Quota panel: Claude · usage.quota.panels ─────────────────────────────────────────────────────────── default: [x] on ┐
 │Which live quota panels to show in the app, by provider name. An empty list hides every quota card.                   │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-                            ↑↓ move  ←→ change  ⏎ edit  tab pane  x reset  1-4 view  q quit
+                       ↑↓ move  ←→ change  ⏎ edit  tab pane  x reset  e editor  1-4 view  q quit
 ```
 
-- `↑` / `↓` move, `Tab` switches pane, `←` / `→` change a value (toggle, step a number, cycle a choice), and `x` resets the field to its default.
+- `↑` / `↓` move, `Tab` switches pane, `←` / `→` change a value (toggle, step a number, cycle a choice), `x` resets the field to its default, and `e` opens the file in `$VISUAL` / `$EDITOR` and reloads it when the editor exits.
 - `Enter` opens an editor: a list to pick from, a number or text input, or the remote host list (`a` add, `Enter` edit, `d` delete).
 - Each change is written to the file at once and keeps the file's comments.
 - Changes to merge, the refresh intervals, the quota panels, the quota poll interval and the provider toggles show in the running app (quota panels when you leave the Settings tab). Default time range, auto update, scan threads, logging and remotes apply from the next start, and the form says so on those fields.

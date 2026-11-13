@@ -325,6 +325,8 @@ pub(crate) enum SettingsOutcome {
     SwitchTab(usize),
     /// A field changed and was saved; the app re-reads [`SettingsUiState::config`].
     Changed,
+    /// Open the config file in the user's editor (`e`).
+    OpenEditor,
 }
 
 /// Writes one field to the config file.
@@ -382,6 +384,11 @@ impl SettingsUiState {
     /// Replaces the settings, after something else wrote the file.
     pub(crate) fn set_config(&mut self, config: Config) {
         self.config = config;
+    }
+
+    /// Shows `text` beside the key hints, as a success or a failure.
+    pub(crate) fn set_message(&mut self, text: String, ok: bool) {
+        self.message = Some((text, ok));
     }
 
     /// Indexes into [`FIELDS`] of the current section's rows.
@@ -535,6 +542,7 @@ impl SettingsUiState {
         }
         match key {
             KeyCode::Char('q') | KeyCode::Esc => return SettingsOutcome::Quit,
+            KeyCode::Char('e') => return SettingsOutcome::OpenEditor,
             KeyCode::Char(digit @ '1'..='4') => {
                 return SettingsOutcome::SwitchTab(digit as usize - '1' as usize);
             }
@@ -783,6 +791,7 @@ impl SettingsUiState {
             ("⏎", " edit  "),
             ("tab", " pane  "),
             ("x", " reset  "),
+            ("e", " editor  "),
             ("1-4", " view  "),
             ("q", " quit"),
         ] {
@@ -791,7 +800,14 @@ impl SettingsUiState {
         }
         if let Some((text, ok)) = &self.message {
             let color = if *ok { Color::Green } else { Color::Red };
-            hints.push(Span::styled("  |  ", dim));
+            let hints_w: usize = hints.iter().map(|span| span.content.chars().count()).sum();
+            // A message too long to sit beside the hints takes the row: it is
+            // the only place a failure is reported.
+            if hints_w + 5 + text.chars().count() > usize::from(controls.width) {
+                hints.clear();
+            } else {
+                hints.push(Span::styled("  |  ", dim));
+            }
             hints.push(Span::styled(
                 text.clone(),
                 Style::default().fg(color).bold(),
@@ -1126,9 +1142,36 @@ mod tests {
             press(&mut state, &[KeyCode::Char('q')]),
             SettingsOutcome::Quit
         );
+        assert_eq!(
+            press(&mut state, &[KeyCode::Char('e')]),
+            SettingsOutcome::OpenEditor
+        );
+        // Inside an input `e` is a letter.
+        go_to(&mut state, "Remotes", "vct command on the hosts");
+        assert_eq!(
+            press(&mut state, &[KeyCode::Enter, KeyCode::Char('e')]),
+            SettingsOutcome::Stay
+        );
+        press(&mut state, &[KeyCode::Esc]);
+        state.in_fields = false;
+        state.section = 0;
         // Moving down the sections changes which fields are listed.
         press(&mut state, &[KeyCode::Down]);
         assert_eq!(state.sections[state.section], "Usage");
+    }
+
+    #[test]
+    fn a_long_message_takes_the_hint_row_rather_than_being_cut() {
+        let (mut state, _) = form();
+        let message = "Editor 'code --wait' exited with exit status: 1, nothing changed";
+        state.set_message(message.to_string(), false);
+        let (w, h) = (100u16, 24u16);
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| state.draw(f, f.area())).unwrap();
+        let buffer = terminal.backend().buffer();
+        let last: String = (0..w).map(|x| buffer[(x, h - 1)].symbol()).collect();
+        assert!(last.contains(message), "{last}");
+        assert!(!last.contains("q quit"), "{last}");
     }
 
     #[test]

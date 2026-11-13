@@ -601,10 +601,10 @@ vct 会把用户设置保存在 `~/.vct/config.toml` 中。该文件会在**首�
 ┌ Quota panel: Claude · usage.quota.panels ─────────────────────────────────────────────────────────── default: [x] on ┐
 │Which live quota panels to show in the app, by provider name. An empty list hides every quota card.                   │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-                            ↑↓ move  ←→ change  ⏎ edit  tab pane  x reset  1-4 view  q quit
+                       ↑↓ move  ←→ change  ⏎ edit  tab pane  x reset  e editor  1-4 view  q quit
 ```
 
-- `↑` / `↓` 移动，`Tab` 切换窗格，`←` / `→` 修改数值（开关、增减数字、切换选项），`x` 把字段重置为默认值。
+- `↑` / `↓` 移动，`Tab` 切换窗格，`←` / `→` 修改数值（开关、增减数字、切换选项），`x` 把字段重置为默认值，`e` 用 `$VISUAL` / `$EDITOR` 打开配置文件，编辑器退出后重新加载。
 - `Enter` 打开编辑器：可挑选的列表、数字或文本输入，或远程主机列表（`a` 新增、`Enter` 编辑、`d` 删除）。
 - 每次修改都会立即写入文件，并保留文件里的注释。
 - 合并、刷新间隔、quota 面板、quota 轮询间隔与 provider 开关的修改会直接反映在运行中的界面（quota 面板则在离开 Settings 标签页时生效）。默认时间范围、自动更新、扫描线程数、logging 与 remotes 要到下次启动才生效，表单会在这些字段上标明。
