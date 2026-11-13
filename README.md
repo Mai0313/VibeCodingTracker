@@ -572,7 +572,7 @@ Generic placeholder names (e.g. `default`, what cursor-agent records for auto-mo
 - **OpenCode**: a novel model name is priced from its tokens only on an **exact** LiteLLM match; with no exact match, vct trusts the assistant message's own stored cost instead of guessing from a loosely-similar name.
 - **Hermes**: priced the same way as OpenCode — an **exact** LiteLLM match prices from tokens, otherwise vct uses Hermes's own stored cost.
 - **DeepSeek Harness**: `dsh` records no cost of its own, so every model is priced from LiteLLM through the same lookup chain as the other file-based providers — there is no stored-cost fallback like OpenCode's or Hermes's. It routes to whatever the deployment configures, so expect deployment-defined model names, which land at $0 when nothing in LiteLLM matches.
-- **Antigravity**: priced from LiteLLM like the other file-based providers, under the model each request's generation record names. Compaction requests name no model, so their tokens are counted under `unknown` at $0.
+- **Antigravity**: priced from LiteLLM like the other file-based providers, under the model each request's generation record names. Compaction requests name no model, so their tokens are priced as the model in use when they ran.
 - **Grok**: `contextTokensUsed` is priced as cache-read tokens only (falling back to the input rate when the model publishes no cache-read price); this is a point-in-time local context estimate, not cumulative billed usage.
 
 ---

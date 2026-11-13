@@ -627,14 +627,18 @@ fn antigravity_roots_add_up_to_one_provider() {
     let data = aggregate_usage_from_paths(&home.paths, TimeRange::All).expect("aggregate usage");
     let usage = &data.per_provider.antigravity;
     // The fixture's three requests on `gemini-3.5-flash` total 13300 / 24800 /
-    // 870, and its one compaction request names no model.
-    assert_eq!(usage["gemini-3.5-flash"]["input_tokens"], 3 * 13_300);
+    // 870, and its one compaction request (4000 / 9000 / 600) ran while that model was
+    // in use.
+    assert_eq!(
+        usage["gemini-3.5-flash"]["input_tokens"],
+        3 * (13_300 + 4_000)
+    );
     assert_eq!(
         usage["gemini-3.5-flash"]["cache_read_input_tokens"],
-        3 * 24_800
+        3 * (24_800 + 9_000)
     );
     assert_eq!(usage["gemini-3.8-flash"]["output_tokens"], 3 * 90);
-    assert_eq!(usage["unknown"]["input_tokens"], 3 * 4_000);
+    assert!(!usage.contains_key("unknown"));
     assert_eq!(data.provider_days.antigravity, 1);
 }
 

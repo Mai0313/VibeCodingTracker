@@ -316,8 +316,9 @@ struct PendingCall {
 struct AntigravityParser<'a> {
     state: SessionParseState,
     usage: FastHashMap<String, ModelUsage>,
-    /// Compaction requests' tokens, which no generation record attributes.
-    compaction: Option<Tokens>,
+    /// Compaction requests' tokens per model. No generation record names a
+    /// compaction's model, so each is billed to the model in use when it ran.
+    compaction: FastHashMap<String, ModelUsage>,
     diagnostics: ParseDiagnostics,
     classifier: Option<TierClassifier<'a>>,
     meta: ConversationMeta,
@@ -340,7 +341,7 @@ impl<'a> AntigravityParser<'a> {
         Self {
             state,
             usage: FastHashMap::default(),
-            compaction: None,
+            compaction: FastHashMap::default(),
             diagnostics: ParseDiagnostics::default(),
             classifier: tiers.map(TierClassifier::new),
             current_model: meta.first_model.clone(),
@@ -396,11 +397,20 @@ impl<'a> AntigravityParser<'a> {
                 }
             }
             // A compaction summary is a billed request, but no generation
-            // record names the model that produced it.
+            // record names its model, so it goes to the model in use.
             "CHECKPOINT" => {
                 if let Some(tokens) = Tokens::from_record(object) {
                     self.diagnostics.record_relevant(true);
-                    self.compaction.get_or_insert_default().merge(tokens);
+                    let model = self
+                        .current_model
+                        .clone()
+                        .unwrap_or_else(|| UNKNOWN_MODEL.to_string());
+                    let level = self.classifier.as_mut().map_or(0, |classifier| {
+                        classifier.level(&model, tokens.request_context())
+                    });
+                    let entry = self.compaction.entry(model).or_default();
+                    entry.total.merge(tokens);
+                    entry.classify(level, tokens);
                 }
             }
             "GENERIC" => {
@@ -498,14 +508,10 @@ impl<'a> AntigravityParser<'a> {
         let mut record = self.state.into_record(conversation_usage);
         // Every model in `conversation_usage` is credited with the session's
         // tool counts, and a compaction request runs no tools.
-        if let Some(tokens) = self.compaction {
-            let usage = ModelUsage {
-                total: tokens,
-                above_tiers: Vec::new(),
-            };
+        for (model, usage) in &self.compaction {
             record
                 .advisor_usage
-                .insert(UNKNOWN_MODEL.to_string(), usage_value(&usage));
+                .insert(model.clone(), usage_value(usage));
         }
 
         ParsedAnalysis::new(
@@ -664,23 +670,27 @@ mod tests {
         assert_eq!(usage["gemini-a"]["output_tokens"], 15);
         assert_eq!(usage["gemini-b"]["cache_read_input_tokens"], 300);
         assert!(!usage.contains_key(UNKNOWN_MODEL));
-        assert_eq!(
-            parsed.analysis.records[0].advisor_usage[UNKNOWN_MODEL]["input_tokens"],
-            50
-        );
+        // The compaction ran while gemini-a was in use.
+        let advisor = &parsed.analysis.records[0].advisor_usage;
+        assert_eq!(advisor["gemini-a"]["input_tokens"], 50);
+        assert!(!advisor.contains_key(UNKNOWN_MODEL));
         assert_eq!(parsed.analysis.records[0].task_id, "conv");
     }
 
     #[test]
     fn a_conversation_without_its_database_bills_unknown() {
         let temp = tempfile::tempdir().unwrap();
-        let path = conversation(temp.path(), &[planner(1, 100, 0, 10)], None);
+        let mut checkpoint = planner(2, 50, 60, 7);
+        checkpoint["type"] = json!("CHECKPOINT");
+        let path = conversation(temp.path(), &[planner(1, 100, 0, 10), checkpoint], None);
 
         let parsed = parse_antigravity_session(&path, ParseMode::UsageOnly, None).unwrap();
+        let record = &parsed.analysis.records[0];
         assert_eq!(
-            parsed.analysis.records[0].conversation_usage[UNKNOWN_MODEL]["input_tokens"],
+            record.conversation_usage[UNKNOWN_MODEL]["input_tokens"],
             100
         );
+        assert_eq!(record.advisor_usage[UNKNOWN_MODEL]["input_tokens"], 50);
     }
 
     #[test]
@@ -698,6 +708,25 @@ mod tests {
         assert_eq!(usage["cache_read_input_tokens"], 300_000);
         assert_eq!(usage["above_tier"]["level_1_cache_read_tokens"], 300_000);
         assert_eq!(usage["above_tier"]["level_1_output_tokens"], 2);
+    }
+
+    #[test]
+    fn a_compaction_lands_in_the_price_level_its_own_context_reached() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut checkpoint = planner(2, 100, 300_000, 5);
+        checkpoint["type"] = json!("CHECKPOINT");
+        let path = conversation(
+            temp.path(),
+            &[planner(1, 100, 0, 1), checkpoint],
+            Some(&[generation("gemini-a", Some(0))]),
+        );
+        let tiers = TierThresholds::from_entries([("gemini-a", vec![200_000])].into_iter());
+
+        let parsed = parse_antigravity_session(&path, ParseMode::UsageOnly, Some(&tiers)).unwrap();
+        let usage = &parsed.analysis.records[0].advisor_usage["gemini-a"];
+        assert_eq!(usage["cache_read_input_tokens"], 300_000);
+        assert_eq!(usage["above_tier"]["level_1_cache_read_tokens"], 300_000);
+        assert_eq!(usage["above_tier"]["level_1_output_tokens"], 5);
     }
 
     #[test]
