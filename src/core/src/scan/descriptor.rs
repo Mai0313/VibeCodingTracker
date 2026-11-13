@@ -24,7 +24,7 @@ use std::path::Path;
 ///
 /// `dirs` is a list because a provider can keep its sessions in more than one
 /// root — Codex splits them across active and archived directories, and
-/// Antigravity across the `agy` CLI, Desktop and Jetski.
+/// Antigravity across the `agy` CLI, Desktop and other builds.
 struct FileProviderSpec {
     provider: ExtensionType,
     enabled: fn(&ProvidersConfig) -> bool,

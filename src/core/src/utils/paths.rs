@@ -55,7 +55,7 @@ pub struct HelperPaths {
     /// DeepSeek Harness session logs (`$DSH_HOME/sessions` or `~/.dsh/sessions`).
     pub dsh_session_dir: PathBuf,
     /// Antigravity conversation roots: `~/.gemini/{antigravity-cli,antigravity,jetski}/brain`,
-    /// written by the `agy` CLI, the Desktop app and Jetski in the same layout.
+    /// written by the `agy` CLI, the Desktop app and other builds in the same layout.
     pub antigravity_brain_dirs: [PathBuf; 3],
     /// OpenCode data root (`$XDG_DATA_HOME/opencode` or `~/.local/share/opencode`).
     pub opencode_dir: PathBuf,
