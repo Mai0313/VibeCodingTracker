@@ -30,7 +30,7 @@ Built with Rust for minimal resource footprint. The interactive TUI dashboard ty
 
 Choose your preferred view:
 
-- **Interactive Dashboard**: Responsive terminal UI with an immediate loading spinner, background incremental refreshes, a scrollable model list (arrow keys), a live per-process CPU/memory readout, and compact K/M/B number formatting
+- **Interactive Dashboard**: One terminal app with Usage, Analysis, Quota and Settings tabs, an immediate loading spinner, background incremental refreshes, a scrollable, sortable model list (arrow keys, `o`), a live per-process CPU/memory readout, and compact K/M/B number formatting
 - **Static Reports**: Professional tables for documentation
 - **Script-Friendly**: Plain text and JSON for automation
 - **Full Precision**: Export exact costs for accounting
@@ -110,13 +110,13 @@ cargo install vct-cli
 ### First Run
 
 ```bash
-# View your usage with the interactive dashboard
-vct usage
+# Open the interactive app on the Usage tab
+vct
 
 # Or run the binary built by Cargo/pip
-vibe_coding_tracker usage
+vibe_coding_tracker
 
-# Analyze code operations across all sessions
+# Open it on the Analysis tab (code operations across all sessions)
 vct analysis
 ```
 
@@ -126,7 +126,23 @@ vct analysis
 
 Run `vct --help` to list the commands, and `vct <command> --help` for a command's flags.
 
-Time range flags (shared by `usage` and `analysis`, mutually exclusive, default `--all`):
+`vct` with no command opens the interactive app, one screen with four tabs: `1 Usage`, `2 Analysis`, `3 Quota` and `4 Settings`. `vct usage`, `vct analysis` and `vct quota` open the same app on their own tab, while `--json`, `--text` and `--table` print and never open it. Without a terminal (piped or redirected), a bare `vct` prints the help and exits with status 2.
+
+| Key                 | Action                                                                          |
+| ------------------- | ------------------------------------------------------------------------------- |
+| `1`-`4`             | Jump to a tab                                                                   |
+| `Tab` / `Shift+Tab` | Next / previous tab (on the Settings tab, `Tab` switches between its two panes) |
+| `↑` / `↓`           | Move the selected row                                                           |
+| `o`                 | Cycle the sort column (Usage, Analysis)                                         |
+| `t`                 | Cycle the time range: day, week, month, all (Usage, Analysis)                   |
+| `r`                 | Refresh now (Usage, Analysis)                                                   |
+| `m`                 | Merge / split provider prefixes, saved to the config file (Usage)               |
+| `p`                 | Open the Provider Usage panel; `Esc` closes it (Usage)                          |
+| `q` / `Esc`         | Quit                                                                            |
+
+The Quota and Settings tabs scan no sessions. The first visit to Usage or Analysis starts that tab's scan, and only the tab on screen refreshes on its timer. The right side of the tab bar shows the time range and vct's own memory and CPU.
+
+Time range flags (shared by `usage` and `analysis`, mutually exclusive, default `--all`; in the app they set the range it opens with):
 
 | Flag          | Window                            |
 | ------------- | --------------------------------- |
@@ -144,7 +160,7 @@ Time range flags (shared by `usage` and `analysis`, mutually exclusive, default 
 ### Basic Usage
 
 ```bash
-# Interactive dashboard (recommended)
+# Open the app on the Usage tab (recommended)
 vct usage
 
 # Static table for reports
@@ -170,20 +186,21 @@ vct usage --table --merge-providers
 ```
 
 > [!NOTE]
-> Model rows are sorted by cost in ascending order, so the highest-spending model is listed last (right above the `TOTAL` row in `--table`). This applies to the interactive dashboard, `--table`, and `--text` output; `--json` lists its rows in no fixed order. The interactive dashboard also hides models with zero usage in the selected range.
+> `--table` and `--text` sort model rows by cost in ascending order, so the highest-spending model is listed last (right above the `TOTAL` row in `--table`); `--json` lists its rows in no fixed order. The app sorts by cost, highest first, and `o` cycles the sort column: cost, total, input, output, cache read, cache write, model name. The right side of the table title names the current sort (`cost ▼`). The app also hides models with zero usage in the selected range.
 
 > [!TIP]
-> The same model can show up as several rows when it is routed under different provider prefixes (`openai/gpt-5.5`, `azure/gpt-5.5`, plain `gpt-5.5`). `--merge-providers` collapses rows that share the base name after the first `/` (versions like `gpt-5.5` vs `gpt-5.4` stay separate) and sums their already-priced cost. In the interactive dashboard, press `m` to toggle it live (the choice is saved to `~/.vct/config.toml`, so the next launch remembers it); `--merge-providers` opens the dashboard already merged. `--json` is left as the raw per-model export.
+> The same model can show up as several rows when it is routed under different provider prefixes (`openai/gpt-5.5`, `azure/gpt-5.5`, plain `gpt-5.5`). `--merge-providers` collapses rows that share the base name after the first `/` (versions like `gpt-5.5` vs `gpt-5.4` stay separate) and sums their already-priced cost. On the Usage tab, press `m` to toggle it live (the choice is saved to `~/.vct/config.toml`, so the next launch remembers it); `--merge-providers` opens the tab already merged. `--json` is left as the raw per-model export.
 
-### Preview: Interactive Dashboard (`vct usage`)
+### Preview: Usage Tab (`vct usage`)
 
 ```
-┌ Models · $79.33 · 49.1M tokens · 3 models ───────────────────────────────────────────────────────────────────────────┐
+ vct  1 Usage  2 Analysis  3 Quota  4 Settings                         range  day  week  month  all   61.8 MB · CPU 0.1%
+┌ Models · $79.33 · 49.1M tokens · 3 models ─────────────────────────────────────────────────────────────────── cost ▼ ┐
 │Model                              Input     Output    Cache Read  Cache Write Total     Cost (USD)   Share           █
 │                                                                                                                      █
-│gemini-3.1-pro-preview                  129K     10.3K       66.0K       1.70K      207K        $0.40             0.4%█
-│claude-haiku-4-5-20251001              5.57K     19.8K       5.20M       55.0K     5.28M        $1.34          █ 10.8%█
 │claude-opus-4-8                        25.7K      179K       42.9M        496K     43.6M       $77.59  █████████ 88.8%█
+│claude-haiku-4-5-20251001              5.57K     19.8K       5.20M       55.0K     5.28M        $1.34          █ 10.8%█
+│gemini-3.1-pro-preview                  129K     10.3K       66.0K       1.70K      207K        $0.40             0.4%█
 │                                                                                                                      █
 │                                                                                                                      █
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
@@ -195,11 +212,10 @@ vct usage --table --merge-providers
 │Fable ▰▰▰▰▱  79% 1d23h││credits 0 · +3 reset  ││                      ││api   ▰▰▰▱▱  44% 16d0h││balance $12.00        │
 │bal - · $0.00 used    ││reset expires 17d0h   ││                      ││                      ││                      │
 └──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘
-                Total Cost: $79.33  |  Total Tokens: 49.1M  |  Models: 3  |  Memory: 4.7 MB  |  CPU: 0.0%
-                    ↑/↓ scroll  m merge  p providers  Q quota  r refresh  q quit  |  Star on GitHub
+                ↑/↓ scroll  o sort  t range  m merge  p providers  r refresh  q quit  |  Star on GitHub
 ```
 
-Both interactive dashboards draw a centered `Loading sessions...` spinner as soon as terminal setup finishes. Loading stays responsive to `q`, Ctrl+C, and resize events. Later scans keep the last successful data visible with a `Refreshing...` footer. A failed refresh keeps the last-known-good view and retries on the next scheduled or manual refresh.
+The Usage and Analysis tabs each start their scan on the first visit and draw a centered `Loading sessions...` spinner. Loading stays responsive to `q`, Ctrl+C, and resize events. Later scans keep the last successful data visible with a `Refreshing...` footer. A failed refresh keeps the last-known-good view and retries on the next scheduled or manual refresh. A range with no sessions shows an empty table.
 
 ### Preview: Table & JSON (`vct usage`)
 
@@ -287,8 +303,8 @@ hosts = ["devbox", "wei@laptop"]
 
 vct then runs `vct ledger export` on each host over ssh and folds what comes back into every total. Only that machine's ledger crosses the connection, which is per-day token counts and tool counters: conversations, databases and credentials stay where they are. Each host needs vct installed, in a version that has `ledger export`, and a login that works without a prompt, because vct runs `ssh` in batch mode: a key, an agent, or whatever your `~/.ssh/config` sets up for that name.
 
-- A one-shot command (`--json`, `--text`, `--table`) fetches first and waits up to 30 seconds per host. A host's first export parses its whole history and can outlast that wait; it finishes there anyway, so the next run gets it. The dashboards fetch in the background every `refresh_interval` seconds (default 300) and never wait.
-- A host that cannot be reached keeps showing its last fetched data, with a warning on stderr for a one-shot command and in the log for a dashboard. Taking a host out of `hosts` removes its data.
+- A one-shot command (`--json`, `--text`, `--table`) fetches first and waits up to 30 seconds per host. A host's first export parses its whole history and can outlast that wait; it finishes there anyway, so the next run gets it. The app fetches in the background every `refresh_interval` seconds (default 300) and never waits.
+- A host that cannot be reached keeps showing its last fetched data, with a warning on stderr for a one-shot command and in the log for the app. Taking a host out of `hosts` removes its data.
 - A non-interactive ssh session has a bare `PATH`, so vct looks for the remote binary on `PATH`, in `~/.local/bin`, in `~/.cargo/bin` and under `~/.nvm`. If it is installed elsewhere, set `command` to how to start it.
 - A session both machines hold, as with a shared home directory, counts once. Days are each machine's own local dates. Totals are merged, with no per-machine breakdown.
 - `vct analysis --json`, `vct analysis FILE` and the quota panels stay local.
@@ -319,11 +335,11 @@ vct then runs `vct ledger export` on each host over ssh and folds what comes bac
 - **Copilot** — plan tier plus your premium-request quota, shown as two gauges: percent used and the used / total request count (e.g. `45/1500`), from GitHub's Copilot API (`GET /copilot_internal/user`), read from `~/.copilot/config.json`. The request impersonates the Copilot CLI. The token is long-lived, so there is no refresh; a `401` / `403` shows a `run: copilot login` hint.
 - **Cursor** — plan tier, total / auto / API percent **used**, and on-demand spend from cursor.com (`GET /api/usage-summary`), using the session token in `~/.config/cursor/auth.json`.
 - **Grok** — plan tier plus your included-allowance usage for the current weekly or monthly period, from the Grok CLI's own billing endpoint (`GET /v1/billing?format=credits`), read from `~/.grok/auth.json`. A prepaid balance is shown only once it is non-zero, and pay-as-you-go spend once you have either spent something or set a cap. The request impersonates the Grok CLI; a `401` / `403` shows a `run: grok login` hint.
-- **Antigravity** — the limits of each shared model pool (for agy: Gemini, and Claude / GPT, each with a 5-hour and a weekly limit), from the `agy` CLI's own `/usage` command (`agy -p /usage --output-format json`). The card names each pool as agy does and labels each limit by agy's own window (`5h` first, then `weekly`); a card too short for every pool flags the rest with `+N`, and the `Q` overlay grows to show them. `/usage` reports no plan, so the first line shows only the age. vct runs `agy` from your `PATH`, or else from where agy installs (`~/.local/bin/agy`, `%LOCALAPPDATA%\agy\bin\agy.exe`) or where Google's internal Jetski build lives (`/google/bin/releases/jetski-devs/tools/cli` on gLinux, `/usr/local/bin/jetski` on macOS); an agy that has not signed in never hides a Jetski install. agy keeps its own sign-in fresh, so vct only checks that `~/.gemini/antigravity-cli/antigravity-oauth-token` exists and never reads or writes it; Jetski signs in its own way, so finding it is enough. Each poll starts agy (a few seconds and about 260 MB), so this card refreshes at most every 5 minutes. When agy cannot sign in, the card shows a `run: agy acp --login` hint and the dashboard does not run agy again until that file changes.
+- **Antigravity** — the limits of each shared model pool (for agy: Gemini, and Claude / GPT, each with a 5-hour and a weekly limit), from the `agy` CLI's own `/usage` command (`agy -p /usage --output-format json`). The card names each pool as agy does and labels each limit by agy's own window (`5h` first, then `weekly`); a card too short for every pool flags the rest with `+N`. `/usage` reports no plan, so the first line shows only the age. vct runs `agy` from your `PATH`, or else from where agy installs (`~/.local/bin/agy`, `%LOCALAPPDATA%\agy\bin\agy.exe`) or where Google's internal Jetski build lives (`/google/bin/releases/jetski-devs/tools/cli` on gLinux, `/usr/local/bin/jetski` on macOS); an agy that has not signed in never hides a Jetski install. agy keeps its own sign-in fresh, so vct only checks that `~/.gemini/antigravity-cli/antigravity-oauth-token` exists and never reads or writes it; Jetski signs in its own way, so finding it is enough. Each poll starts agy (a few seconds and about 260 MB), so this card refreshes at most every 5 minutes. When agy cannot sign in, the card shows a `run: agy acp --login` hint and the dashboard does not run agy again until that file changes.
 
 **Automatic token refresh.** For Claude, Codex, and Grok, when a token is near expiry or rejected, vct refreshes it and writes the new token back to the provider's own credential file (in that CLI's exact format). For Grok, every other login in the file is preserved on write. If a refresh cannot proceed, the panel shows a `run: <provider> auth login` hint instead of breaking. Copilot (long-lived token) and Cursor (kept fresh by its own client) are read-only — vct never writes their credential files. Antigravity's token belongs to agy, which refreshes it whenever vct asks it for `/usage`.
 
-A panel appears only for a provider whose credentials are present. Panels are placed on a uniform grid that fits as many cards per row as the terminal allows and wraps the rest onto the next row. On a terminal too short to spend rows on the grid, it folds into a one-line digest showing the gauges that still fit and counting the rest; press `Q` for the full-detail overlay, whose cards grow to the tallest card while every provider still fits, so every line has room on a tall enough terminal, and `p` for the Provider Usage panel with per-provider tokens and share. Quota panels appear only in the interactive TUI; `--table`, `--text`, and `--json` are unchanged.
+A panel appears only for a provider whose credentials are present. Panels are placed on a uniform grid that fits as many cards per row as the terminal allows and wraps the rest onto the next row. On a terminal too short to spend rows on the grid, it folds into a one-line digest showing the gauges that still fit and counting the rest as `+N more → 3`; press `3` for the [Quota tab](#quota-tab), which gives the cards the whole screen, and `p` for the Provider Usage panel with per-provider tokens and share. Quota panels appear only in the interactive TUI; `--table`, `--text`, and `--json` are unchanged.
 
 > **Platform note:** on macOS, Claude Code stores its OAuth credentials in the system Keychain rather than `~/.claude/.credentials.json`, so the Claude panel is not shown on macOS. agy keeps its sign-in in the Keychain there too, so on macOS the Antigravity panel is shown only for Google's internal Jetski build. Cursor's `~/.config/cursor` credential path is Linux-oriented.
 
@@ -338,7 +354,7 @@ See [`tests/fixtures/sessions/`](tests/fixtures/sessions/) for sample inputs and
 ### Basic Usage
 
 ```bash
-# Interactive dashboard for all sessions (default)
+# Open the app on the Analysis tab, all sessions (default)
 vct analysis
 
 # Static table output with per-provider totals
@@ -367,10 +383,11 @@ vct analysis --json --daily
 vct analysis --json --daily > today.json
 ```
 
-### Preview: Interactive Dashboard (`vct analysis`)
+### Preview: Analysis Tab (`vct analysis`)
 
 ```
-┌ Models · 135K lines · 1.80K tool calls · 3 models ───────────────────────────────────────────────────────────────────┐
+ vct  1 Usage  2 Analysis  3 Quota  4 Settings                         range  day  week  month  all   61.9 MB · CPU 0.1%
+┌ Models · 135K lines · 1.80K tool calls · 3 models ────────────────────────────────────────────────────────── lines ▼ ┐
 │Model                                   Edit Lines  Read Lines  Write Lines Bash    Edit    Read    TodoWrite  Write  █
 │                                                                                                                      █
 │claude-opus-4-8                               12.4K       88.1K       9.02K     412     231     604         96      88█
@@ -384,9 +401,10 @@ vct analysis --json --daily > today.json
 │Claude                   13.2K       93.5K       9.63K        443      247      646      102         93       12      │
 │Gemini                   2.10K       14.8K       1.62K        84       44       112      16          15       3       │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-                 Total Lines: 135K  |  Total Tools: 1.80K  |  Models: 3  |  Memory: 4.8 MB  |  CPU: 0.0%
-                                    ↑/↓ scroll  r refresh  q quit  |  Star on GitHub
+                           ↑/↓ scroll  o sort  t range  r refresh  q quit  |  Star on GitHub
 ```
+
+The table is sorted by total lines, highest first; `o` cycles the sort column: lines, edit lines, read lines, write lines, tool calls, model name.
 
 ### Preview: Table & JSON (`vct analysis`)
 
@@ -498,18 +516,20 @@ vct version --json   # Machine-readable JSON
 
 ---
 
-## Monitor Command
+## Quota Command
 
-**Nothing but the live quota panels, full screen.**
+**The live quota panels full screen, or one provider's raw quota/usage API response.**
 
-`vct monitor` shows the same quota cards as the `usage` dashboard and scans no session, so it opens at once and is light enough to leave running in a spare pane. It follows the same settings: `panels` and `refresh_interval` under `[usage.quota]` in [`config.toml`](#configuration). Press `q` or `Esc` to quit.
+### Quota Tab
+
+`vct quota` opens the app on the Quota tab. It shows the same quota cards as the Usage tab with wider gauge bars, as many as the terminal fits (a `+N hidden, enlarge the terminal` note counts the rest). It scans no session, so it opens at once and is light enough to leave running in a spare pane. It follows the same settings: `panels` and `refresh_interval` under `[usage.quota]` in [`config.toml`](#configuration).
 
 ```bash
-vct monitor
+vct quota
 ```
 
 ```
- Quota Monitor                                                         15:01:37
+ vct  1 Usage  2 Analysis  3 Quota  4 Settings                31.6 MB · CPU 0.0%
 
 ┌ Claude ──────────────────────────────┐┌ Codex ───────────────────────────────┐
 │max 5x                        just now││plus                          just now│
@@ -522,17 +542,13 @@ vct monitor
                                      q quit
 ```
 
----
+> `vct monitor` and the hidden alias `vct fetch` are removed. Use `vct quota` for the cards and `vct quota <provider>` for a raw response.
 
-## Quota Command
+### Raw Response (`vct quota <provider>`)
 
-**Print a provider's raw quota/usage API response — no parsing, no aggregation.**
+With a provider, `vct quota` prints that provider's raw response with no parsing or aggregation. It calls the same quota endpoint the `usage` dashboard uses (Claude / Codex / Copilot / Cursor / Grok) exactly once and prints the raw body, so you can inspect the exact API shape or sanity-check your credentials. It reads each provider's stored credentials and does **not** refresh tokens: if a token is expired, re-auth with that provider's own CLI (`claude` / `codex` / `copilot` / `cursor-agent` / `grok`). `vct quota antigravity` instead runs `agy -p /usage --output-format json` once (or Jetski, found the way the dashboard finds it) and prints what it printed; agy refreshes its own token as it does so.
 
-Calls the same quota endpoint the `usage` dashboard uses (Claude / Codex / Copilot / Cursor / Grok) exactly once and prints the raw body, so you can inspect the exact API shape or sanity-check your credentials. It reads each provider's stored credentials and does **not** refresh tokens: if a token is expired, re-auth with that provider's own CLI (`claude` / `codex` / `copilot` / `cursor-agent` / `grok`). `vct quota antigravity` instead runs `agy -p /usage --output-format json` once (or Jetski, found the way the dashboard finds it) and prints what it printed; agy refreshes its own token as it does so.
-
-> The previous name `vct fetch` is kept as a hidden alias, so existing scripts keep working.
-
-### Basic Usage
+`--json`, `--text` and `--table` print one provider's response, so `vct quota --json` without a provider is an error.
 
 ```bash
 # Raw JSON (default)
@@ -566,6 +582,34 @@ Run `vct config show` to print the file; its comments explain every setting.
 
 > [!NOTE]
 > vct writes diagnostics to `~/.vct/logs/vct-YYYY-MM-DD.log` (plain text, file only — never shown in the dashboard). It stays quiet when healthy (default level `warn`) and the file is created lazily, so a healthy run leaves nothing behind. When a quota fetch fails or a session is skipped, that is where the reason is recorded — bump `logging.level` to `debug` for the full detail.
+
+### Settings Tab
+
+Press `4` in the app (or `Tab` over to it) to edit every `config.toml` setting as a form: sections on the left, that section's fields on the right, and under them the focused field's description, config key and default.
+
+```
+ vct  1 Usage  2 Analysis  3 Quota  4 Settings                                                        31.8 MB · CPU 0.0%
+┌ Sections ──────┐┌ Usage ─────────────────────────────────────────────────────────────────────────────────────────────┐
+│ General        ││ Merge models across providers                                                               [x] on │
+│ Usage          ││ Redraw interval                                                                           ‹ 10 s › │
+│ Analysis       ││ Quota panel: Claude                                                                         [x] on │
+│ Providers      ││ Quota panel: Codex                                                                          [x] on │
+│ Remotes        ││ Quota panel: Copilot                                                                        [x] on │
+│ Performance    ││ Quota panel: Cursor                                                                         [x] on │
+│ Logging        ││ Quota panel: Grok                                                                           [x] on │
+└────────────────┘└────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Quota panel: Claude · usage.quota.panels ─────────────────────────────────────────────────────────── default: [x] on ┐
+│Which live quota panels to show in the app, by provider name. An empty list hides every quota card.                   │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+                            ↑↓ move  ←→ change  ⏎ edit  tab pane  x reset  1-4 view  q quit
+```
+
+- `↑` / `↓` move, `Tab` switches pane, `←` / `→` change a value (toggle, step a number, cycle a choice), and `x` resets the field to its default.
+- `Enter` opens an editor: a list to pick from, a number or text input, or the remote host list (`a` add, `Enter` edit, `d` delete).
+- Each change is written to the file at once and keeps the file's comments.
+- Changes to merge, the refresh intervals, the quota panels, the quota poll interval and the provider toggles show in the running app (quota panels when you leave the Settings tab). Default time range, auto update, scan threads, logging and remotes apply from the next start, and the form says so on those fields.
+
+Editing the file by hand and the `vct config` commands below still work.
 
 ### Managing the file
 
