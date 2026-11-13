@@ -9,6 +9,7 @@ use crate::display::analysis::{AnalysisUiState, scan_analysis};
 use crate::display::common::table::{
     init_process_metrics, process_metrics, refresh_process_metrics,
 };
+use crate::display::common::theme::theme;
 use crate::display::common::tui::{
     InputAction, RefreshWorker, RefreshWorkerError, TerminalSession, handle_input,
     handle_key_input, overlay_repo_hyperlink, refresh_status, render_loading,
@@ -18,9 +19,11 @@ use crate::display::usage::{
     QuotaRuntime, QuotaSnapshots, UsageRefreshPayload, UsageScanner, UsageUiState, draw_quota_tab,
 };
 use ratatui::{
-    layout::{Constraint, Layout},
-    style::{Color, Style},
+    Frame,
+    layout::{Constraint, Layout, Rect},
+    style::Style,
     text::{Line, Span},
+    widgets::{Block, Borders, Clear, Paragraph},
 };
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -104,13 +107,21 @@ struct ScanOutput {
     data: ScanData,
 }
 
-fn next_range(range: TimeRange) -> TimeRange {
-    match range {
-        TimeRange::Daily => TimeRange::Weekly,
-        TimeRange::Weekly => TimeRange::Monthly,
-        TimeRange::Monthly => TimeRange::All,
-        TimeRange::All => TimeRange::Daily,
-    }
+/// The time ranges, in the order the tab bar lists them.
+const RANGES: [(TimeRange, &str); 4] = [
+    (TimeRange::Daily, "day"),
+    (TimeRange::Weekly, "week"),
+    (TimeRange::Monthly, "month"),
+    (TimeRange::All, "all"),
+];
+
+/// The range `step` places along the tab bar's list, stopping at either end.
+fn step_range(range: TimeRange, step: isize) -> TimeRange {
+    let at = RANGES
+        .iter()
+        .position(|(candidate, _)| *candidate == range)
+        .unwrap_or(0) as isize;
+    RANGES[(at + step).clamp(0, RANGES.len() as isize - 1) as usize].0
 }
 
 /// What the Settings tab does once the editor has returned: whether to reload
@@ -243,6 +254,8 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
         let mut last_metrics = Instant::now();
         let mut last_draw: Option<Instant> = None;
         let mut spinner = 0usize;
+        // Whether the key list is open (`?`).
+        let mut help_open = false;
 
         loop {
             let mut redraw = false;
@@ -356,6 +369,9 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                         Tab::Quota => draw_quota_tab(f, body, &view, now),
                         Tab::Settings => settings.draw(f, body),
                     }
+                    if help_open {
+                        render_help(f, body, tab);
+                    }
                 })?;
                 // ratatui can't embed the OSC 8 escape itself, so hyperlink the
                 // repo label it just drew.
@@ -367,12 +383,26 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
             if tab == Tab::Settings {
                 match handle_key_input()? {
                     InputAction::Quit => break,
+                    // The key list closes on the keys that opened or dismiss
+                    // it; an editor open over the form takes every key itself.
+                    InputAction::Key(key) if help_open => {
+                        match key {
+                            crossterm::event::KeyCode::Char('q') => break,
+                            crossterm::event::KeyCode::Esc
+                            | crossterm::event::KeyCode::Char('?') => help_open = false,
+                            _ => {}
+                        }
+                        last_draw = None;
+                    }
                     InputAction::Key(key) => {
                         match settings.handle_key(key) {
                             SettingsOutcome::Quit => break,
                             SettingsOutcome::SwitchTab(index) => {
                                 go_to = Tab::ALL.get(index).copied()
                             }
+                            SettingsOutcome::NextTab => go_to = Some(tab.offset(1)),
+                            SettingsOutcome::PrevTab => go_to = Some(tab.offset(-1)),
+                            SettingsOutcome::Help => help_open = true,
                             outcome @ (SettingsOutcome::Changed | SettingsOutcome::OpenEditor) => {
                                 if outcome == SettingsOutcome::OpenEditor {
                                     let result =
@@ -398,24 +428,37 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                     _ => {}
                 }
             } else {
-                match handle_input()? {
+                let action = handle_input()?;
+                if !matches!(action, InputAction::Continue) {
+                    last_draw = None;
+                }
+                match action {
                     InputAction::Quit => break,
-                    InputAction::Close if tab == Tab::Usage && usage.provider_panel_open => {
-                        usage.provider_panel_open = false;
-                        last_draw = None;
+                    // Esc and `?` close the key list; while it is open the
+                    // other keys wait.
+                    InputAction::Close | InputAction::Help if help_open => help_open = false,
+                    _ if help_open => {}
+                    InputAction::Help => help_open = true,
+                    // Esc closes what is open, the innermost first, and never
+                    // leaves the app.
+                    InputAction::Close => {
+                        if usage.detail_open || analysis.detail_open {
+                            usage.detail_open = false;
+                            analysis.detail_open = false;
+                        } else {
+                            usage.provider_panel_open = false;
+                        }
                     }
-                    InputAction::Close => break,
                     InputAction::SwitchTab(index) => go_to = Tab::ALL.get(index).copied(),
                     InputAction::NextTab => go_to = Some(tab.offset(1)),
                     InputAction::PrevTab => go_to = Some(tab.offset(-1)),
-                    InputAction::CycleRange if tab.scans() => {
+                    InputAction::StepRange(step) if tab.scans() => {
                         let mut request = request
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        request.time_range = next_range(request.time_range);
+                        request.time_range = step_range(request.time_range, step);
                         failure_until = None;
                         retry_at = None;
-                        last_draw = None;
                     }
                     InputAction::Refresh if tab.scans() => {
                         if let Some(worker) = worker.as_mut() {
@@ -423,15 +466,13 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                             retry_at = None;
                             worker.request();
                         }
-                        last_draw = None;
                     }
-                    InputAction::CycleSort if tab.scans() && !loading => {
+                    InputAction::StepSort(step) if tab.scans() && !loading => {
                         if tab == Tab::Usage {
-                            usage.cycle_sort();
+                            usage.step_sort(step);
                         } else {
-                            analysis.cycle_sort();
+                            analysis.step_sort(step);
                         }
-                        last_draw = None;
                     }
                     InputAction::Navigate(delta) if tab.scans() && !loading => {
                         if tab == Tab::Usage {
@@ -439,17 +480,20 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                         } else {
                             analysis.navigate(delta);
                         }
-                        last_draw = None;
+                    }
+                    InputAction::Open if tab.scans() && !loading => {
+                        if tab == Tab::Usage {
+                            usage.detail_open = !usage.detail_open;
+                        } else {
+                            analysis.detail_open = !analysis.detail_open;
+                        }
                     }
                     InputAction::TogglePane if tab == Tab::Usage && !loading => {
                         usage.provider_panel_open = !usage.provider_panel_open;
-                        last_draw = None;
                     }
                     InputAction::ToggleMerge if tab == Tab::Usage && !loading => {
                         usage.toggle_merge();
-                        last_draw = None;
                     }
-                    InputAction::Resize => last_draw = None,
                     _ => {}
                 }
             }
@@ -471,6 +515,10 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                     settings.set_config(config.clone());
                 }
                 tab = next;
+                help_open = false;
+                usage.detail_open = false;
+                analysis.detail_open = false;
+                usage.provider_panel_open = false;
                 failure_until = None;
                 retry_at = None;
                 last_draw = None;
@@ -489,32 +537,31 @@ fn tab_bar(
     range: Option<TimeRange>,
     metrics: (f64, f32),
 ) -> Line<'static> {
-    let dim = Style::default().fg(Color::DarkGray);
-    let on = Style::default().fg(Color::Black).bg(Color::Cyan).bold();
+    let theme = theme();
+    let dim = theme.dim();
     let mut left = vec![Span::styled(" vct ", Style::default().bold())];
     for tab in Tab::ALL {
-        let text = format!(" {} {} ", tab.index() + 1, tab.label());
-        left.push(if tab == current {
-            Span::styled(text, on)
+        let number = tab.index() + 1;
+        if tab == current {
+            left.push(Span::styled(
+                format!(" {number} {} ", tab.label()),
+                theme.active(),
+            ));
         } else {
-            Span::styled(text, dim)
-        });
+            left.push(Span::styled(format!(" {number} "), dim));
+            left.push(Span::raw(format!("{} ", tab.label())));
+        }
     }
 
     let mut ranges = Vec::new();
     if let Some(range) = range {
         ranges.push(Span::styled("range ", dim));
-        for (candidate, name) in [
-            (TimeRange::Daily, "day"),
-            (TimeRange::Weekly, "week"),
-            (TimeRange::Monthly, "month"),
-            (TimeRange::All, "all"),
-        ] {
+        for (candidate, name) in RANGES {
             let text = format!(" {name} ");
             ranges.push(if candidate == range {
-                Span::styled(text, on)
+                Span::styled(text, theme.active())
             } else {
-                Span::styled(text, dim)
+                Span::raw(text)
             });
         }
     }
@@ -545,6 +592,83 @@ fn tab_bar(
     left.push(Span::raw(" ".repeat(gap)));
     left.extend(right);
     Line::from(left)
+}
+
+/// What every key does on `tab`, most specific first.
+fn help_rows(tab: Tab) -> Vec<(&'static str, &'static str)> {
+    let mut rows = match tab {
+        Tab::Usage | Tab::Analysis => vec![
+            ("↑ ↓", "select a model"),
+            ("⏎", "show the selected model's details"),
+            ("← →", "sort by the column to the left or right"),
+            ("[ ]", "earlier or later time range"),
+            ("r", "scan again now"),
+        ],
+        Tab::Quota => Vec::new(),
+        Tab::Settings => vec![
+            ("↑ ↓", "move between settings"),
+            ("PgUp PgDn", "jump to the previous or next section"),
+            ("← →", "change the value"),
+            ("space", "turn on or off"),
+            ("⏎", "edit: type a value or pick from a list"),
+            ("x", "reset to the default"),
+            ("e", "open config.toml in $EDITOR"),
+        ],
+    };
+    if tab == Tab::Usage {
+        rows.push(("m", "merge or split the same model across providers"));
+        rows.push(("p", "per-provider totals"));
+    }
+    rows.extend([
+        ("1-4", "go to a tab"),
+        ("tab", "next tab, shift+tab for the previous one"),
+        ("esc", "close a panel"),
+        ("?", "this list"),
+        ("q", "quit"),
+    ]);
+    rows
+}
+
+/// Draws the key list for `tab` centered over `area`.
+fn render_help(f: &mut Frame, area: Rect, tab: Tab) {
+    let theme = theme();
+    let rows = help_rows(tab);
+    let key_w = rows
+        .iter()
+        .map(|(key, _)| key.chars().count())
+        .max()
+        .unwrap_or(0);
+    let lines: Vec<Line> = rows
+        .iter()
+        .map(|(key, what)| {
+            Line::from(vec![
+                Span::styled(format!(" {key:<key_w$}  "), Style::default().bold()),
+                Span::styled(*what, theme.dim()),
+            ])
+        })
+        .collect();
+    let width = area.width.saturating_sub(4).min(64);
+    let height = (rows.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let rect = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme.accent())
+                .title(Line::from(Span::styled(
+                    format!(" Keys · {} ", tab.label()),
+                    theme.title(),
+                )))
+                .title(Line::from(Span::styled(" esc close ", theme.dim())).right_aligned()),
+        ),
+        rect,
+    );
 }
 
 #[cfg(test)]
@@ -639,10 +763,25 @@ mod tests {
     }
 
     #[test]
-    fn tabs_wrap_and_ranges_cycle() {
+    fn tabs_wrap_and_ranges_stop_at_either_end() {
         assert_eq!(Tab::Settings.offset(1), Tab::Usage);
         assert_eq!(Tab::Usage.offset(-1), Tab::Settings);
-        assert_eq!(next_range(TimeRange::All), TimeRange::Daily);
-        assert_eq!(next_range(TimeRange::Monthly), TimeRange::All);
+        assert_eq!(step_range(TimeRange::Monthly, 1), TimeRange::All);
+        assert_eq!(step_range(TimeRange::All, 1), TimeRange::All);
+        assert_eq!(step_range(TimeRange::Weekly, -1), TimeRange::Daily);
+        assert_eq!(step_range(TimeRange::Daily, -1), TimeRange::Daily);
+    }
+
+    #[test]
+    fn the_key_list_names_every_tab_s_own_keys_and_how_to_leave() {
+        for tab in Tab::ALL {
+            let keys: Vec<_> = help_rows(tab).iter().map(|(key, _)| *key).collect();
+            for expected in ["1-4", "tab", "esc", "?", "q"] {
+                assert!(keys.contains(&expected), "{tab:?} lacks {expected}");
+            }
+        }
+        let keys = |tab| -> Vec<_> { help_rows(tab).iter().map(|(key, _)| *key).collect() };
+        assert!(keys(Tab::Usage).contains(&"m") && !keys(Tab::Analysis).contains(&"m"));
+        assert!(keys(Tab::Settings).contains(&"e") && !keys(Tab::Quota).contains(&"⏎"));
     }
 }

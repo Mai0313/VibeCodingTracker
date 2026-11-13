@@ -10,21 +10,22 @@ use crate::display::analysis::averages::{
 };
 use crate::display::common::table::{
     CONTENT_MIN_H, ColumnSpec, FOOTER_H, TableChrome, create_controls_with_status,
-    create_provider_row, create_ratatui_table, fit_columns, frame_layout, render_scrollable_table,
-    render_too_small, styled_row,
+    create_provider_row, create_ratatui_table, fit_columns, frame_layout, render_detail_panel,
+    render_scrollable_table, render_too_small, styled_row, title_line,
 };
+use crate::display::common::theme::theme;
 use crate::display::common::tui::{LEDGER_SAVE_INTERVAL, NavDelta, ScrollState, UpdateTracker};
 use ratatui::{
     Frame,
     layout::{Constraint, Rect},
-    style::{Color as RatatuiColor, Style},
+    style::Style,
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Row as RatatuiRow},
 };
 use vct_core::analysis::AnalysisData;
 use vct_core::config::ProvidersConfig;
 use vct_core::ledger::SessionLedger;
-use vct_core::utils::format_compact;
+use vct_core::utils::{format_compact, format_number};
 
 /// Upper bound on the number of rows tracked for the "recently updated"
 /// highlight, capping the tracker's memory footprint.
@@ -58,64 +59,74 @@ fn analysis_panels_height(area_height: u16, provider_row_count: usize) -> Option
         .then_some(totals_height)
 }
 
-/// Which column the analysis table is ordered by.
+/// Which column the analysis table is ordered by, in the order the columns
+/// are drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum AnalysisSort {
+    Model,
     #[default]
-    Lines,
     EditLines,
     ReadLines,
     WriteLines,
-    Tools,
-    Model,
+    Bash,
+    Edit,
+    Read,
+    TodoWrite,
+    Write,
 }
 
 impl AnalysisSort {
-    /// The column after this one, wrapping around.
-    fn next(self) -> Self {
-        match self {
-            Self::Lines => Self::EditLines,
-            Self::EditLines => Self::ReadLines,
-            Self::ReadLines => Self::WriteLines,
-            Self::WriteLines => Self::Tools,
-            Self::Tools => Self::Model,
-            Self::Model => Self::Lines,
-        }
+    const ALL: [Self; 9] = [
+        Self::Model,
+        Self::EditLines,
+        Self::ReadLines,
+        Self::WriteLines,
+        Self::Bash,
+        Self::Edit,
+        Self::Read,
+        Self::TodoWrite,
+        Self::Write,
+    ];
+
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|sort| *sort == self).unwrap_or(0)
+    }
+
+    /// The column `step` places along the header, stopping at either end.
+    fn step(self, step: isize) -> Self {
+        let last = Self::ALL.len() as isize - 1;
+        Self::ALL[(self.index() as isize + step).clamp(0, last) as usize]
     }
 
     /// What the table title shows: numbers run largest first, names A to Z.
     fn label(self) -> &'static str {
         match self {
-            Self::Lines => "lines ▼",
-            Self::EditLines => "edit lines ▼",
-            Self::ReadLines => "read lines ▼",
-            Self::WriteLines => "write lines ▼",
-            Self::Tools => "tool calls ▼",
-            Self::Model => "model ▲",
+            Self::Model => "sort: model ▲",
+            Self::EditLines => "sort: edit lines ▼",
+            Self::ReadLines => "sort: read lines ▼",
+            Self::WriteLines => "sort: write lines ▼",
+            Self::Bash => "sort: bash ▼",
+            Self::Edit => "sort: edit ▼",
+            Self::Read => "sort: read ▼",
+            Self::TodoWrite => "sort: todowrite ▼",
+            Self::Write => "sort: write ▼",
         }
     }
 
     /// Orders `rows` by this column, model name breaking ties.
     fn apply(self, rows: &mut [AnalysisRow]) {
-        let lines = |row: &AnalysisRow| row.edit_lines + row.read_lines + row.write_lines;
-        let tools = |row: &AnalysisRow| {
-            row.bash_count
-                + row.edit_count
-                + row.read_count
-                + row.todo_write_count
-                + row.write_count
+        let key = |row: &AnalysisRow| match self {
+            Self::Model => 0,
+            Self::EditLines => row.edit_lines,
+            Self::ReadLines => row.read_lines,
+            Self::WriteLines => row.write_lines,
+            Self::Bash => row.bash_count,
+            Self::Edit => row.edit_count,
+            Self::Read => row.read_count,
+            Self::TodoWrite => row.todo_write_count,
+            Self::Write => row.write_count,
         };
-        rows.sort_by(|a, b| {
-            let primary = match self {
-                Self::Lines => lines(b).cmp(&lines(a)),
-                Self::EditLines => b.edit_lines.cmp(&a.edit_lines),
-                Self::ReadLines => b.read_lines.cmp(&a.read_lines),
-                Self::WriteLines => b.write_lines.cmp(&a.write_lines),
-                Self::Tools => tools(b).cmp(&tools(a)),
-                Self::Model => std::cmp::Ordering::Equal,
-            };
-            primary.then_with(|| a.model.cmp(&b.model))
-        });
+        rows.sort_by(|a, b| key(b).cmp(&key(a)).then_with(|| a.model.cmp(&b.model)));
     }
 }
 
@@ -127,6 +138,8 @@ pub(crate) struct AnalysisUiState {
     update_tracker: UpdateTracker,
     scroll: ScrollState,
     sort: AnalysisSort,
+    /// Whether the selected row's details are open (`Enter`).
+    pub(crate) detail_open: bool,
 }
 
 impl AnalysisUiState {
@@ -138,6 +151,7 @@ impl AnalysisUiState {
             update_tracker: UpdateTracker::new(MAX_TRACKED_ANALYSIS_ROWS, 1000),
             scroll: ScrollState::new(),
             sort: AnalysisSort::default(),
+            detail_open: false,
         }
     }
 
@@ -209,10 +223,10 @@ impl AnalysisUiState {
         );
     }
 
-    /// Moves on to the next sort column (`o`).
-    pub(crate) fn cycle_sort(&mut self) {
+    /// Moves the sort one column left or right (`←` / `→`).
+    pub(crate) fn step_sort(&mut self, step: isize) {
         let previous = self.selected_model();
-        self.sort = self.sort.next();
+        self.sort = self.sort.step(step);
         self.sort.apply(&mut self.rows);
         let models: Vec<_> = self.rows.iter().map(|row| row.model.clone()).collect();
         self.scroll.sync(previous.as_deref(), &models);
@@ -225,6 +239,9 @@ impl AnalysisUiState {
 
     /// Draws the tab into `area`.
     pub(crate) fn draw(&mut self, f: &mut Frame, area: Rect, status: Option<&str>) {
+        // Details belong to a row: with none selected there is nothing to
+        // open, and nothing for a later Esc to close.
+        self.detail_open &= self.selected_model().is_some();
         draw_analysis_view(
             f,
             area,
@@ -235,6 +252,7 @@ impl AnalysisUiState {
             &mut self.scroll,
             self.sort,
             status,
+            self.detail_open,
         );
     }
 }
@@ -296,7 +314,9 @@ fn draw_analysis_view(
     scroll: &mut ScrollState,
     sort: AnalysisSort,
     status: Option<&str>,
+    detail_open: bool,
 ) {
+    let theme = theme();
     let provider_rows = build_analysis_provider_rows(provider_totals);
     {
         if area.width < ANALYSIS_MIN_W || area.height < ANALYSIS_MIN_H {
@@ -374,7 +394,7 @@ fn draw_analysis_view(
             .iter()
             .map(|row| {
                 let style = if update_tracker.is_recently_updated(&row.model) {
-                    Style::default().bg(RatatuiColor::Rgb(60, 80, 60)).bold()
+                    Style::default().bg(theme.flash_bg).bold()
                 } else {
                     Style::default()
                 };
@@ -418,7 +438,12 @@ fn draw_analysis_view(
                 } else {
                     sort.label().to_string()
                 }),
-                border_color: RatatuiColor::Green,
+                // The model column, or the sorted numeric column where it
+                // was not dropped.
+                sorted: match sort.index().checked_sub(1) {
+                    None => Some(0),
+                    Some(numeric) => kept.iter().position(|&i| i == numeric).map(|at| at + 1),
+                },
             },
             header,
             rows,
@@ -440,7 +465,7 @@ fn draw_analysis_view(
                             .saturating_add(ANALYSIS_BELOW_BAND_MIN_H)
                             .saturating_sub(area.height)
                     ),
-                    Style::default().fg(RatatuiColor::DarkGray),
+                    theme.dim(),
                 )))
                 .centered(),
                 panel_area,
@@ -542,42 +567,57 @@ fn draw_analysis_view(
             if totals_rows.is_empty() {
                 let mut cells = vec!["No provider data yet".to_string()];
                 cells.extend(std::iter::repeat_n("-".to_string(), band_kept.len()));
-                totals_rows.push(
-                    RatatuiRow::new(cells).style(Style::default().fg(RatatuiColor::DarkGray)),
-                );
+                totals_rows.push(RatatuiRow::new(cells).style(theme.dim()));
             }
 
             let mut band_block = Block::default()
                 .borders(Borders::ALL)
-                .title(Line::from(" Providers "))
-                .border_style(Style::default().fg(RatatuiColor::Magenta));
+                .title(title_line("Providers"))
+                .border_style(theme.border());
             if band_dropped > 0 {
                 band_block = band_block.title(
-                    Line::from(Span::styled(
-                        format!(" −{band_dropped} cols "),
-                        Style::default().fg(RatatuiColor::DarkGray),
-                    ))
-                    .right_aligned(),
+                    Line::from(Span::styled(format!(" −{band_dropped} cols "), theme.dim()))
+                        .right_aligned(),
                 );
             }
-            let totals_table = create_ratatui_table(
-                totals_rows,
-                totals_header,
-                &totals_widths,
-                RatatuiColor::Magenta,
-            )
-            .block(band_block);
+            let totals_table =
+                create_ratatui_table(totals_rows, totals_header, &totals_widths, None)
+                    .block(band_block);
             f.render_widget(totals_table, panel_area);
         }
 
         f.render_widget(
             create_controls_with_status(
-                &[("o", " sort  "), ("t", " range  ")],
-                status,
+                &[
+                    ("↑↓", "move"),
+                    ("←→", "sort"),
+                    ("[ ]", "range"),
+                    ("⏎", "details"),
+                    ("r", "refresh"),
+                ],
+                status.map(|text| (text, theme.warn)),
                 chunks.controls.width,
             ),
             chunks.controls,
         );
+
+        if detail_open && let Some(row) = scroll.table.selected().and_then(|at| rows_data.get(at)) {
+            render_detail_panel(
+                f,
+                area,
+                &row.model,
+                &[
+                    ("Edit lines", format_number(row.edit_lines)),
+                    ("Read lines", format_number(row.read_lines)),
+                    ("Write lines", format_number(row.write_lines)),
+                    ("Bash calls", format_number(row.bash_count)),
+                    ("Edit calls", format_number(row.edit_count)),
+                    ("Read calls", format_number(row.read_count)),
+                    ("TodoWrite calls", format_number(row.todo_write_count)),
+                    ("Write calls", format_number(row.write_count)),
+                ],
+            );
+        }
     }
 }
 
@@ -615,14 +655,31 @@ mod tests {
     #[test]
     fn rows_sort_by_the_chosen_column_largest_first() {
         let mut rows = vec![row("b", 1, 50), row("a", 9, 2), row("c", 1, 50)];
-        AnalysisSort::Lines.apply(&mut rows);
+        AnalysisSort::ReadLines.apply(&mut rows);
         let order = |rows: &[AnalysisRow]| rows.iter().map(|r| r.model.clone()).collect::<String>();
-        // Equal totals fall back to the name.
+        // Equal counts fall back to the name.
         assert_eq!(order(&rows), "bca");
         AnalysisSort::EditLines.apply(&mut rows);
         assert_eq!(order(&rows), "abc");
         AnalysisSort::Model.apply(&mut rows);
         assert_eq!(order(&rows), "abc");
+    }
+
+    #[test]
+    fn details_do_not_stay_open_without_a_row_to_show() {
+        let mut state = AnalysisUiState::new();
+        state.detail_open = true;
+        let mut terminal = Terminal::new(TestBackend::new(ANALYSIS_MIN_W, 20)).unwrap();
+        terminal.draw(|f| state.draw(f, f.area(), None)).unwrap();
+        assert!(!state.detail_open);
+    }
+
+    #[test]
+    fn the_sort_moves_along_the_header_and_stops_at_either_end() {
+        assert_eq!(AnalysisSort::default().step(-1), AnalysisSort::Model);
+        assert_eq!(AnalysisSort::Model.step(-1), AnalysisSort::Model);
+        assert_eq!(AnalysisSort::EditLines.step(1), AnalysisSort::ReadLines);
+        assert_eq!(AnalysisSort::Write.step(1), AnalysisSort::Write);
     }
 
     #[test]
@@ -662,6 +719,7 @@ mod tests {
                     &mut scroll,
                     AnalysisSort::default(),
                     None,
+                    false,
                 );
             })
             .unwrap();

@@ -5,6 +5,7 @@
 //! ([`RefreshWorker`]), and recently-changed row highlighting ([`UpdateTracker`]).
 
 use crate::display::common::table::{REPO_LABEL, REPO_URL};
+use crate::display::common::theme::{self, theme};
 use crossterm::{
     cursor::{MoveTo, Show},
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -19,7 +20,7 @@ use ratatui::{
     backend::CrosstermBackend,
     buffer::Buffer,
     layout::{Constraint, Flex, Layout, Rect},
-    style::{Color, Style},
+    style::Color,
     text::Line,
     widgets::{Block, Borders, Paragraph, ScrollbarState, TableState},
 };
@@ -116,8 +117,11 @@ pub struct TerminalSession {
 impl TerminalSession {
     /// Enters raw alternate-screen mode with rollback on partial setup failure.
     pub fn new() -> anyhow::Result<Self> {
+        let terminal = setup_terminal()?;
+        // Before any input is read: the terminal's answer arrives on stdin.
+        theme::probe();
         Ok(Self {
-            terminal: Some(setup_terminal()?),
+            terminal: Some(terminal),
         })
     }
 
@@ -394,10 +398,11 @@ pub fn render_loading(frame: &mut Frame, area: Rect, spinner_index: usize, messa
         LOADING_SPINNER[spinner_index % LOADING_SPINNER.len()]
     ));
     frame.render_widget(
-        Paragraph::new(text)
-            .style(Style::default().fg(Color::Cyan))
-            .centered()
-            .block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(text).centered().block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme().border()),
+        ),
         middle,
     );
 }
@@ -504,13 +509,17 @@ pub fn overlay_repo_hyperlink(buffer: &Buffer) -> io::Result<()> {
         return Ok(());
     };
 
-    // OSC 8 open (params ; URL, ST-terminated), then cyan + underline to match
+    // OSC 8 open (params ; URL, ST-terminated), then dim + underline to match
     // the label ratatui drew, then reset, then the empty OSC 8 close.
+    let color = match theme().dim {
+        Color::Rgb(r, g, b) => format!("38;2;{r};{g};{b}"),
+        _ => "90".to_string(),
+    };
     let mut stdout = io::stdout();
     queue!(stdout, MoveTo(x, y))?;
     write!(
         stdout,
-        "\x1b]8;;{REPO_URL}\x1b\\\x1b[36;4m{REPO_LABEL}\x1b[0m\x1b]8;;\x1b\\"
+        "\x1b]8;;{REPO_URL}\x1b\\\x1b[{color};4m{REPO_LABEL}\x1b[0m\x1b]8;;\x1b\\"
     )?;
     stdout.flush()
 }
@@ -593,19 +602,20 @@ fn handle_input_from(source: &mut impl EventSource) -> anyhow::Result<InputActio
                 {
                     return Ok(InputAction::Quit);
                 }
-                // Esc is a "back out of what is open" key, so a view with an
-                // overlay closes it; one without treats it as quit.
-                if key.code == KeyCode::Esc {
-                    return Ok(InputAction::Close);
-                }
                 match key.code {
+                    // Esc backs out of what is open and never leaves the app.
+                    KeyCode::Esc => return Ok(InputAction::Close),
+                    KeyCode::Enter => return Ok(InputAction::Open),
+                    KeyCode::Char('?') => return Ok(InputAction::Help),
                     KeyCode::Char(digit @ '1'..='9') => {
                         return Ok(InputAction::SwitchTab(digit as usize - '1' as usize));
                     }
                     KeyCode::Tab => return Ok(InputAction::NextTab),
                     KeyCode::BackTab => return Ok(InputAction::PrevTab),
-                    KeyCode::Char('t' | 'T') => return Ok(InputAction::CycleRange),
-                    KeyCode::Char('o' | 'O') => return Ok(InputAction::CycleSort),
+                    KeyCode::Char('[') => return Ok(InputAction::StepRange(-1)),
+                    KeyCode::Char(']') => return Ok(InputAction::StepRange(1)),
+                    KeyCode::Left => return Ok(InputAction::StepSort(-1)),
+                    KeyCode::Right => return Ok(InputAction::StepSort(1)),
                     _ => {}
                 }
                 if key.code == KeyCode::Char('p') || key.code == KeyCode::Char('P') {
@@ -694,18 +704,22 @@ impl NavDelta {
 pub enum InputAction {
     /// User asked to exit (`q` or `Ctrl+C`).
     Quit,
-    /// User pressed `Esc`: close whatever is open, or quit when nothing is.
+    /// User pressed `Esc`: close whatever is open.
     Close,
+    /// User pressed `Enter`: open the selected row's details.
+    Open,
+    /// User asked for the key list (`?`).
+    Help,
     /// User picked a tab by its number (`1`-`9`), zero-based.
     SwitchTab(usize),
     /// User moved to the next tab (`Tab`).
     NextTab,
     /// User moved to the previous tab (`Shift+Tab`).
     PrevTab,
-    /// User cycled the time range (`t` / `T`).
-    CycleRange,
-    /// User cycled the sort column (`o` / `O`).
-    CycleSort,
+    /// User stepped the time range back (`[`) or forward (`]`).
+    StepRange(isize),
+    /// User moved the sort one column left (`←`) or right (`→`).
+    StepSort(isize),
     /// User toggled the Provider Usage panel (`p` / `P`); usage view only,
     /// ignored elsewhere.
     TogglePane,
@@ -971,7 +985,7 @@ mod tests {
     fn find_label_start_locates_repo_label_on_bottom_row() {
         let area = Rect::new(0, 0, 120, 1);
         let mut buf = Buffer::empty(area);
-        create_controls(&[("m", " merge  ")], area.width).render(area, &mut buf);
+        create_controls(&[("m", "merge")], area.width).render(area, &mut buf);
 
         let (x, y) = find_label_start(&buf).expect("repo label should be present");
         assert_eq!(y, 0);
@@ -1069,8 +1083,12 @@ mod tests {
         assert_eq!(press(KeyCode::Char('3')), InputAction::SwitchTab(2));
         assert_eq!(press(KeyCode::Tab), InputAction::NextTab);
         assert_eq!(press(KeyCode::BackTab), InputAction::PrevTab);
-        assert_eq!(press(KeyCode::Char('t')), InputAction::CycleRange);
-        assert_eq!(press(KeyCode::Char('o')), InputAction::CycleSort);
+        assert_eq!(press(KeyCode::Enter), InputAction::Open);
+        assert_eq!(press(KeyCode::Char('?')), InputAction::Help);
+        assert_eq!(press(KeyCode::Char('[')), InputAction::StepRange(-1));
+        assert_eq!(press(KeyCode::Char(']')), InputAction::StepRange(1));
+        assert_eq!(press(KeyCode::Left), InputAction::StepSort(-1));
+        assert_eq!(press(KeyCode::Right), InputAction::StepSort(1));
         assert_eq!(press(KeyCode::Char('p')), InputAction::TogglePane);
         assert_eq!(press(KeyCode::Char('P')), InputAction::TogglePane);
 
