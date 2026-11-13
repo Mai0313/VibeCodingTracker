@@ -481,6 +481,32 @@ vct version --json   # Machine-readable JSON
 
 ---
 
+## Monitor Command
+
+**Nothing but the live quota panels, full screen.**
+
+`vct monitor` shows the same quota cards as the `usage` dashboard and scans no session, so it opens at once and is light enough to leave running in a spare pane. It follows the same settings: `panels` and `refresh_interval` under `[usage.quota]` in [`config.toml`](#configuration). Press `q` or `Esc` to quit.
+
+```bash
+vct monitor
+```
+
+```
+ Quota Monitor                                                         15:01:37
+
+┌ Claude ──────────────────────────────┐┌ Codex ───────────────────────────────┐
+│max 5x                        just now││plus                          just now│
+│5h    ▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱  30%  ↻ 2h18m ││5h    ▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱   0%  ↻ 4h59m │
+│7d    ▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱  28%  ↻ 6d3h  ││7d    ▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱   1%  ↻ 6d8h  │
+│Fable ▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱  14%  ↻ 6d3h  ││credits 0 · +3 reset                  │
+│bal - · $0.00 used                    ││reset expires 17d11h                  │
+└──────────────────────────────────────┘└──────────────────────────────────────┘
+
+                                     q quit
+```
+
+---
+
 ## Quota Command
 
 **Print a provider's raw quota/usage API response — no parsing, no aggregation.**

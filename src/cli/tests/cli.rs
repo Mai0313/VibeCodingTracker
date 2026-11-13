@@ -405,6 +405,17 @@ fn test_version_help() {
 }
 
 #[test]
+fn test_monitor_help() {
+    Command::cargo_bin("vibe_coding_tracker")
+        .unwrap()
+        .arg("monitor")
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("quota"));
+}
+
+#[test]
 fn test_quota_help() {
     Command::cargo_bin("vibe_coding_tracker")
         .unwrap()

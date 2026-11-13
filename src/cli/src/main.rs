@@ -32,7 +32,8 @@ use vct_core::scan::build_scan_pool;
 use vct_core::session::{ParseMode, parse_session_file_with_diagnostics};
 use vct_core::usage::scan_usage_priced;
 use vct_tui::display::usage::{
-    display_usage_interactive_with_pool, display_usage_table, display_usage_text,
+    display_quota_monitor, display_usage_interactive_with_pool, display_usage_table,
+    display_usage_text,
 };
 
 const AUTO_UPDATE_REEXEC_ENV: &str = "VCT_AUTO_UPDATE_REEXEC";
@@ -244,6 +245,13 @@ fn run() -> Result<()> {
                     scan_pool,
                 )?;
             }
+        }
+
+        Commands::Monitor => {
+            let config = vct_core::config::load();
+            vct_core::logging::apply(&config.logging);
+            let quota_refresh = config.usage.quota_refresh_secs();
+            display_quota_monitor(config.usage.quota.panels, config.providers, quota_refresh)?;
         }
 
         Commands::Version { json, text } => {
