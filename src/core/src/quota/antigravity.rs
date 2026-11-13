@@ -4,7 +4,7 @@
 //! of its limits into a gauge. agy signs in, refreshes and stores its own OAuth
 //! token, so vct never reads or writes that token and holds no client secret:
 //! the sign-in file is only checked for existence, which with agy found is what
-//! decides whether the panel shows at all. Google's internal build, Jetski,
+//! decides whether the panel shows at all. Google's internal Antigravity build
 //! answers the same command but signs in without that file, so finding it is
 //! enough.
 //!
@@ -49,36 +49,36 @@ const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 pub struct AgyBinary {
     /// The executable to run.
     pub path: PathBuf,
-    /// Whether this is Jetski, which signs in without agy's sign-in file
+    /// Whether this is Google's internal Antigravity build, which signs in without agy's sign-in file
     /// (through LOAS on gLinux), so that file says nothing about it.
-    pub jetski: bool,
+    pub internal: bool,
 }
 
 /// Where each build installs on `os` (a [`std::env::consts::OS`] value), in the
 /// order they are tried after `agy` on `PATH`. On gLinux `agy` is a shell alias
-/// for the Jetski launcher, which a child process never sees.
+/// for the internal build's launcher, which a child process never sees.
 fn agy_install_paths(os: &str, home: &Path, local_appdata: &Path) -> Vec<AgyBinary> {
     let agy = |path: PathBuf| AgyBinary {
         path,
-        jetski: false,
+        internal: false,
     };
-    let jetski = |path: &str| AgyBinary {
+    let internal = |path: &str| AgyBinary {
         path: PathBuf::from(path),
-        jetski: true,
+        internal: true,
     };
     match os {
         "windows" => vec![agy(local_appdata.join("agy").join("bin").join("agy.exe"))],
-        "macos" => vec![jetski("/usr/local/bin/jetski")],
+        "macos" => vec![internal("/usr/local/bin/jetski")],
         _ => vec![
             agy(home.join(".local").join("bin").join("agy")),
-            jetski("/google/bin/releases/jetski-devs/tools/cli"),
+            internal("/google/bin/releases/jetski-devs/tools/cli"),
         ],
     }
 }
 
 /// The first of `agy` on `path_var`, then `installs`, that exists and can sign
-/// in: Jetski, or agy when `agy_signed_in`. An agy without its sign-in file
-/// therefore never hides a Jetski install; with no such build, the first that
+/// in: the internal build, or agy when `agy_signed_in`. An agy without its
+/// sign-in file therefore never hides the internal build; with no such build, the first that
 /// exists, so the missing sign-in can be reported.
 fn locate_agy_in(
     path_var: Option<OsString>,
@@ -91,19 +91,19 @@ fn locate_agy_in(
         .flat_map(std::env::split_paths)
         .map(|dir| AgyBinary {
             path: dir.join(name),
-            jetski: false,
+            internal: false,
         })
         .chain(installs)
         .filter(|binary| binary.path.is_file())
         .collect();
     found
         .iter()
-        .find(|binary| binary.jetski || agy_signed_in)
+        .find(|binary| binary.internal || agy_signed_in)
         .or(found.first())
         .cloned()
 }
 
-/// Finds agy: `agy` on `PATH`, then where agy or Jetski installs on this OS,
+/// Finds agy: `agy` on `PATH`, then where agy or the internal build installs on this OS,
 /// preferring a build that can sign in.
 pub fn locate_agy() -> Option<AgyBinary> {
     let home = resolve_paths().ok()?.home_dir;
@@ -117,19 +117,19 @@ pub fn locate_agy() -> Option<AgyBinary> {
     )
 }
 
-/// Whether the Antigravity panel has something to run: Jetski, or agy with its
+/// Whether the Antigravity panel has something to run: the internal build, or agy with its
 /// sign-in file. Checking costs no process, where asking agy would start one.
 pub fn antigravity_quota_present() -> bool {
     match locate_agy() {
-        Some(binary) if binary.jetski => true,
+        Some(binary) if binary.internal => true,
         Some(_) => get_antigravity_token_path().is_ok_and(|token| token.exists()),
         None => false,
     }
 }
 
-/// agy's sign-in file, or `None` for Jetski, which has none to check.
+/// agy's sign-in file, or `None` for the internal build, which has none to check.
 fn sign_in_file(binary: &AgyBinary) -> Result<Option<PathBuf>> {
-    if binary.jetski {
+    if binary.internal {
         Ok(None)
     } else {
         get_antigravity_token_path().map(Some)
@@ -253,11 +253,12 @@ fn token_endpoint_reachable() -> bool {
 ///
 /// # Errors
 ///
-/// Returns an error if neither agy nor Jetski is found, if agy's sign-in file
+/// Returns an error if neither agy nor the internal build is found, if agy's sign-in file
 /// is missing, since agy would then wait a minute for an interactive sign-in,
 /// or if agy cannot be started.
 pub fn fetch_antigravity_raw() -> Result<String> {
-    let agy = locate_agy().context("agy not found on PATH or where agy or Jetski installs")?;
+    let agy = locate_agy()
+        .context("agy not found on PATH or where agy or the internal build installs")?;
     // agy's own stderr goes to the terminal, so a sign-in prompt explains the
     // wait and a startup error is not swallowed.
     fetch_antigravity_raw_with(sign_in_file(&agy)?.as_deref(), || {
@@ -269,7 +270,7 @@ pub fn fetch_antigravity_raw() -> Result<String> {
 }
 
 /// The injectable core of [`fetch_antigravity_raw`]: production passes the real
-/// sign-in file (`None` for Jetski) and agy runner, tests a temp file and a
+/// sign-in file (`None` for the internal build) and agy runner, tests a temp file and a
 /// fake.
 fn fetch_antigravity_raw_with(
     token: Option<&Path>,
@@ -331,7 +332,7 @@ impl AntigravityState {
     }
 
     /// The injectable core of [`Self::resolve`]: production passes the real
-    /// sign-in file (`None` for Jetski), reachability probe and agy runner,
+    /// sign-in file (`None` for the internal build), reachability probe and agy runner,
     /// tests fakes. Without a sign-in file there is no hold, so a failed sign-in
     /// is tried again on the next tick.
     fn resolve_with(
@@ -661,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn jetski_has_no_sign_in_file_to_wait_on_or_hold_with() {
+    fn internal_build_has_no_sign_in_file_to_wait_on_or_hold_with() {
         let mut state = AntigravityState::default();
         let runs = Cell::new(0);
         let signed_out = || {
@@ -697,7 +698,7 @@ mod tests {
         let paths = |os| {
             agy_install_paths(os, home, appdata)
                 .into_iter()
-                .map(|binary| (binary.path, binary.jetski))
+                .map(|binary| (binary.path, binary.internal))
                 .collect::<Vec<_>>()
         };
         assert_eq!(
@@ -727,24 +728,27 @@ mod tests {
         std::fs::create_dir(&bin).unwrap();
         let missing = AgyBinary {
             path: dir.path().join("missing"),
-            jetski: false,
+            internal: false,
         };
-        let jetski = AgyBinary {
+        let internal = AgyBinary {
             path: dir.path().join("cli"),
-            jetski: true,
+            internal: true,
         };
-        std::fs::write(&jetski.path, "").unwrap();
-        let installs = || vec![missing.clone(), jetski.clone()];
+        std::fs::write(&internal.path, "").unwrap();
+        let installs = || vec![missing.clone(), internal.clone()];
         let path_var = || Some(bin.clone().into_os_string());
 
-        assert_eq!(locate_agy_in(None, installs(), true), Some(jetski.clone()));
+        assert_eq!(
+            locate_agy_in(None, installs(), true),
+            Some(internal.clone())
+        );
         assert_eq!(
             locate_agy_in(path_var(), installs(), true),
-            Some(jetski.clone())
+            Some(internal.clone())
         );
         let on_path = AgyBinary {
             path: bin.join(if cfg!(windows) { "agy.exe" } else { "agy" }),
-            jetski: false,
+            internal: false,
         };
         std::fs::write(&on_path.path, "").unwrap();
         assert_eq!(
@@ -753,11 +757,11 @@ mod tests {
         );
         assert_eq!(locate_agy_in(None, vec![missing.clone()], true), None);
 
-        // An agy that has not signed in never hides Jetski, and is still found
+        // An agy that has not signed in never hides the internal build, and is still found
         // when it is the only build, so its missing sign-in can be reported.
         assert_eq!(
             locate_agy_in(path_var(), installs(), false),
-            Some(jetski.clone())
+            Some(internal.clone())
         );
         assert_eq!(
             locate_agy_in(path_var(), vec![missing.clone()], false),
