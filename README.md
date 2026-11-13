@@ -288,12 +288,12 @@ Every `usage` and `analysis` scan reads and writes a per-session ledger under `~
 │Fable ▰▰▰▰▱  79% 1d23h││credits 0 · +3 reset  ││                      ││api   ▰▰▰▱▱  44% 16d0h││balance $12.00        │
 │bal - · $0.00 used    ││reset expires 17d0h   ││                      ││                      ││                      │
 └──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘
-┌ Antigravity ─────────┐
+┌ Antigravity ──────+2 ┐
 │-             just now│
-│G 7d  ▰▱▱▱▱   8% 2d18h│
-│G 5h  ▰▰▱▱▱  23% 2h50m│
-│C 7d  ▰▰▰▱▱  57% 20h5m│
-│C 5h  ▱▱▱▱▱   0% 4h59m│
+│Gemini Models         │
+│5h     ▰▰▱▱▱  23%     │
+│weekly ▰▱▱▱▱   8%     │
+│Claude and GPT models │
 └──────────────────────┘
 ```
 
@@ -302,13 +302,13 @@ Every `usage` and `analysis` scan reads and writes a per-session ledger under `~
 - **Copilot** — plan tier plus your premium-request quota, shown as two gauges: percent used and the used / total request count (e.g. `45/1500`), from GitHub's Copilot API (`GET /copilot_internal/user`), read from `~/.copilot/config.json`. The request impersonates the Copilot CLI. The token is long-lived, so there is no refresh; a `401` / `403` shows a `run: copilot login` hint.
 - **Cursor** — plan tier, total / auto / API percent **used**, and on-demand spend from cursor.com (`GET /api/usage-summary`), using the session token in `~/.config/cursor/auth.json`.
 - **Grok** — plan tier plus your included-allowance usage for the current weekly or monthly period, from the Grok CLI's own billing endpoint (`GET /v1/billing?format=credits`), read from `~/.grok/auth.json`. A prepaid balance is shown only once it is non-zero, and pay-as-you-go spend once you have either spent something or set a cap. The request impersonates the Grok CLI; a `401` / `403` shows a `run: grok login` hint.
-- **Antigravity** — the weekly and 5-hour limits of each shared model pool (Gemini, and Claude / GPT), from the `agy` CLI's own `/usage` command (`agy -p /usage --output-format json`). The card names each limit by its pool's first word, or only its initial in a narrow card (`G 7d` is the Gemini weekly limit). `/usage` reports no plan, so the first line shows only the age. agy keeps its own sign-in fresh, so vct only checks that `~/.gemini/antigravity-cli/antigravity-oauth-token` exists and never reads or writes it. Each poll starts agy (a few seconds and about 260 MB), so this card refreshes at most every 5 minutes. When agy cannot sign in, the card shows a `run: agy acp --login` hint and the dashboard does not run agy again until that file changes.
+- **Antigravity** — the limits of each shared model pool (for agy: Gemini, and Claude / GPT, each with a 5-hour and a weekly limit), from the `agy` CLI's own `/usage` command (`agy -p /usage --output-format json`). The card names each pool as agy does and labels each limit by agy's own window (`5h` first, then `weekly`); a card too short for every pool flags the rest with `+N`, and the `Q` overlay grows to show them. `/usage` reports no plan, so the first line shows only the age. vct runs `agy` from your `PATH`, or else from where agy installs (`~/.local/bin/agy`, `%LOCALAPPDATA%\agy\bin\agy.exe`) or where Google's internal Jetski build lives (`/google/bin/releases/jetski-devs/tools/cli` on gLinux, `/usr/local/bin/jetski` on macOS); an agy that has not signed in never hides a Jetski install. agy keeps its own sign-in fresh, so vct only checks that `~/.gemini/antigravity-cli/antigravity-oauth-token` exists and never reads or writes it; Jetski signs in its own way, so finding it is enough. Each poll starts agy (a few seconds and about 260 MB), so this card refreshes at most every 5 minutes. When agy cannot sign in, the card shows a `run: agy acp --login` hint and the dashboard does not run agy again until that file changes.
 
 **Automatic token refresh.** For Claude, Codex, and Grok, when a token is near expiry or rejected, vct refreshes it and writes the new token back to the provider's own credential file (in that CLI's exact format). For Grok, every other login in the file is preserved on write. If a refresh cannot proceed, the panel shows a `run: <provider> auth login` hint instead of breaking. Copilot (long-lived token) and Cursor (kept fresh by its own client) are read-only — vct never writes their credential files. Antigravity's token belongs to agy, which refreshes it whenever vct asks it for `/usage`.
 
-A panel appears only for a provider whose credentials are present. Panels are placed on a uniform grid that fits as many cards per row as the terminal allows and wraps the rest onto the next row. On a terminal too short to spend rows on the grid, it folds into a one-line digest showing the gauges that still fit and counting the rest; press `Q` for the full-detail overlay, where every card has room for every line whatever the terminal size, and `p` for the Provider Usage panel with per-provider tokens and share. Quota panels appear only in the interactive TUI; `--table`, `--text`, and `--json` are unchanged.
+A panel appears only for a provider whose credentials are present. Panels are placed on a uniform grid that fits as many cards per row as the terminal allows and wraps the rest onto the next row. On a terminal too short to spend rows on the grid, it folds into a one-line digest showing the gauges that still fit and counting the rest; press `Q` for the full-detail overlay, whose cards grow to the tallest card while every provider still fits, so every line has room on a tall enough terminal, and `p` for the Provider Usage panel with per-provider tokens and share. Quota panels appear only in the interactive TUI; `--table`, `--text`, and `--json` are unchanged.
 
-> **Platform note:** on macOS, Claude Code stores its OAuth credentials in the system Keychain rather than `~/.claude/.credentials.json`, so the Claude panel is not shown on macOS. agy keeps its sign-in in the Keychain there too, so the Antigravity panel is not shown on macOS either. Cursor's `~/.config/cursor` credential path is Linux-oriented.
+> **Platform note:** on macOS, Claude Code stores its OAuth credentials in the system Keychain rather than `~/.claude/.credentials.json`, so the Claude panel is not shown on macOS. agy keeps its sign-in in the Keychain there too, so on macOS the Antigravity panel is shown only for Google's internal Jetski build. Cursor's `~/.config/cursor` credential path is Linux-oriented.
 
 ---
 
@@ -485,7 +485,7 @@ vct version --json   # Machine-readable JSON
 
 **Print a provider's raw quota/usage API response — no parsing, no aggregation.**
 
-Calls the same quota endpoint the `usage` dashboard uses (Claude / Codex / Copilot / Cursor / Grok) exactly once and prints the raw body, so you can inspect the exact API shape or sanity-check your credentials. It reads each provider's stored credentials and does **not** refresh tokens: if a token is expired, re-auth with that provider's own CLI (`claude` / `codex` / `copilot` / `cursor-agent` / `grok`). `vct quota antigravity` instead runs `agy -p /usage --output-format json` once and prints what agy printed; agy refreshes its own token as it does so.
+Calls the same quota endpoint the `usage` dashboard uses (Claude / Codex / Copilot / Cursor / Grok) exactly once and prints the raw body, so you can inspect the exact API shape or sanity-check your credentials. It reads each provider's stored credentials and does **not** refresh tokens: if a token is expired, re-auth with that provider's own CLI (`claude` / `codex` / `copilot` / `cursor-agent` / `grok`). `vct quota antigravity` instead runs `agy -p /usage --output-format json` once (or Jetski, found the way the dashboard finds it) and prints what it printed; agy refreshes its own token as it does so.
 
 > The previous name `vct fetch` is kept as a hidden alias, so existing scripts keep working.
 

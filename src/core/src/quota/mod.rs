@@ -22,7 +22,10 @@ pub mod provider;
 pub mod refresh;
 pub mod wham;
 
-pub use antigravity::{ANTIGRAVITY_LOGIN_HINT, ANTIGRAVITY_MIN_REFRESH_SECS, AntigravityState};
+pub use antigravity::{
+    ANTIGRAVITY_LOGIN_HINT, ANTIGRAVITY_MIN_REFRESH_SECS, AntigravityState,
+    antigravity_quota_present,
+};
 pub use cache::{
     load_antigravity_cache, load_claude_cache, load_codex_cache, load_copilot_cache,
     load_cursor_cache, load_grok_cache, save_antigravity_cache, save_claude_cache,

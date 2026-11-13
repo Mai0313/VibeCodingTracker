@@ -3,8 +3,10 @@
 //! Runs the agy CLI's local `/usage` slash command in print mode and maps each
 //! of its limits into a gauge. agy signs in, refreshes and stores its own OAuth
 //! token, so vct never reads or writes that token and holds no client secret:
-//! the sign-in file is only checked for existence, which is what decides
-//! whether the panel shows at all.
+//! the sign-in file is only checked for existence, which with agy found is what
+//! decides whether the panel shows at all. Google's internal build, Jetski,
+//! answers the same command but signs in without that file, so finding it is
+//! enough.
 //!
 //! One run starts a whole agy process (a few seconds and ~260 MB), so the panel
 //! polls no more often than [`ANTIGRAVITY_MIN_REFRESH_SECS`]. A signed-out agy
@@ -20,12 +22,12 @@ use crate::models::{
 use crate::quota::http::iso_to_unix_secs;
 use crate::quota::provider::QuotaOutcome;
 use crate::quota::refresh::file_mtime;
-use crate::utils::get_antigravity_token_path;
+use crate::utils::{get_antigravity_token_path, resolve_paths};
 use anyhow::{Context, Result, bail};
 use std::ffi::OsString;
 use std::io;
 use std::net::{TcpStream, ToSocketAddrs};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
@@ -42,14 +44,106 @@ pub const ANTIGRAVITY_MIN_REFRESH_SECS: u64 = 300;
 /// neither adds a file there nor repoints agy's `cli.log` link.
 const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 
+/// An agy build that answers `/usage`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgyBinary {
+    /// The executable to run.
+    pub path: PathBuf,
+    /// Whether this is Jetski, which signs in without agy's sign-in file
+    /// (through LOAS on gLinux), so that file says nothing about it.
+    pub jetski: bool,
+}
+
+/// Where each build installs on `os` (a [`std::env::consts::OS`] value), in the
+/// order they are tried after `agy` on `PATH`. On gLinux `agy` is a shell alias
+/// for the Jetski launcher, which a child process never sees.
+fn agy_install_paths(os: &str, home: &Path, local_appdata: &Path) -> Vec<AgyBinary> {
+    let agy = |path: PathBuf| AgyBinary {
+        path,
+        jetski: false,
+    };
+    let jetski = |path: &str| AgyBinary {
+        path: PathBuf::from(path),
+        jetski: true,
+    };
+    match os {
+        "windows" => vec![agy(local_appdata.join("agy").join("bin").join("agy.exe"))],
+        "macos" => vec![jetski("/usr/local/bin/jetski")],
+        _ => vec![
+            agy(home.join(".local").join("bin").join("agy")),
+            jetski("/google/bin/releases/jetski-devs/tools/cli"),
+        ],
+    }
+}
+
+/// The first of `agy` on `path_var`, then `installs`, that exists and can sign
+/// in: Jetski, or agy when `agy_signed_in`. An agy without its sign-in file
+/// therefore never hides a Jetski install; with no such build, the first that
+/// exists, so the missing sign-in can be reported.
+fn locate_agy_in(
+    path_var: Option<OsString>,
+    installs: Vec<AgyBinary>,
+    agy_signed_in: bool,
+) -> Option<AgyBinary> {
+    let name = if cfg!(windows) { "agy.exe" } else { "agy" };
+    let found: Vec<AgyBinary> = path_var
+        .iter()
+        .flat_map(std::env::split_paths)
+        .map(|dir| AgyBinary {
+            path: dir.join(name),
+            jetski: false,
+        })
+        .chain(installs)
+        .filter(|binary| binary.path.is_file())
+        .collect();
+    found
+        .iter()
+        .find(|binary| binary.jetski || agy_signed_in)
+        .or(found.first())
+        .cloned()
+}
+
+/// Finds agy: `agy` on `PATH`, then where agy or Jetski installs on this OS,
+/// preferring a build that can sign in.
+pub fn locate_agy() -> Option<AgyBinary> {
+    let home = resolve_paths().ok()?.home_dir;
+    let local_appdata = std::env::var_os("LOCALAPPDATA")
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| home.join("AppData").join("Local"), PathBuf::from);
+    locate_agy_in(
+        std::env::var_os("PATH"),
+        agy_install_paths(std::env::consts::OS, &home, &local_appdata),
+        get_antigravity_token_path().is_ok_and(|token| token.exists()),
+    )
+}
+
+/// Whether the Antigravity panel has something to run: Jetski, or agy with its
+/// sign-in file. Checking costs no process, where asking agy would start one.
+pub fn antigravity_quota_present() -> bool {
+    match locate_agy() {
+        Some(binary) if binary.jetski => true,
+        Some(_) => get_antigravity_token_path().is_ok_and(|token| token.exists()),
+        None => false,
+    }
+}
+
+/// agy's sign-in file, or `None` for Jetski, which has none to check.
+fn sign_in_file(binary: &AgyBinary) -> Result<Option<PathBuf>> {
+    if binary.jetski {
+        Ok(None)
+    } else {
+        get_antigravity_token_path().map(Some)
+    }
+}
+
 /// The `agy -p /usage` command line.
 ///
 /// `output()` closes stdin and captures stderr unless told otherwise, so in the
 /// TUI a sign-in prompt can neither read its keystrokes nor draw over it. The
 /// exit status is never checked: a failed run still prints its JSON result,
 /// which says why.
-fn agy_usage_command() -> Command {
-    let mut command = Command::new("agy");
+fn agy_usage_command(agy: &Path) -> Command {
+    let mut command = Command::new(agy);
     command.args([
         "--log-file",
         NULL_DEVICE,
@@ -159,13 +253,15 @@ fn token_endpoint_reachable() -> bool {
 ///
 /// # Errors
 ///
-/// Returns an error if agy's sign-in file is missing, since agy would then wait
-/// a minute for an interactive sign-in, or if agy cannot be started.
+/// Returns an error if neither agy nor Jetski is found, if agy's sign-in file
+/// is missing, since agy would then wait a minute for an interactive sign-in,
+/// or if agy cannot be started.
 pub fn fetch_antigravity_raw() -> Result<String> {
+    let agy = locate_agy().context("agy not found on PATH or where agy or Jetski installs")?;
     // agy's own stderr goes to the terminal, so a sign-in prompt explains the
     // wait and a startup error is not swallowed.
-    fetch_antigravity_raw_with(&get_antigravity_token_path()?, || {
-        agy_usage_command()
+    fetch_antigravity_raw_with(sign_in_file(&agy)?.as_deref(), || {
+        agy_usage_command(&agy.path)
             .stderr(Stdio::inherit())
             .output()
             .map(|output| output.stdout)
@@ -173,12 +269,13 @@ pub fn fetch_antigravity_raw() -> Result<String> {
 }
 
 /// The injectable core of [`fetch_antigravity_raw`]: production passes the real
-/// sign-in file and agy runner, tests a temp file and a fake.
+/// sign-in file (`None` for Jetski) and agy runner, tests a temp file and a
+/// fake.
 fn fetch_antigravity_raw_with(
-    token: &Path,
+    token: Option<&Path>,
     run: impl FnOnce() -> io::Result<Vec<u8>>,
 ) -> Result<String> {
-    if !token.exists() {
+    if let Some(token) = token.filter(|token| !token.exists()) {
         bail!(
             "no Antigravity sign-in at {} ({ANTIGRAVITY_LOGIN_HINT})",
             token.display()
@@ -218,32 +315,38 @@ impl AntigravityState {
     /// One worker tick: run `/usage` unless agy is known to be signed out or
     /// cannot reach Google.
     pub fn resolve(&mut self) -> QuotaOutcome<AntigravityQuotaSnapshot> {
-        let Ok(token) = get_antigravity_token_path() else {
+        let Some(agy) = locate_agy() else {
+            log::warn!("antigravity quota: agy not found; nothing run");
+            return QuotaOutcome::Transient;
+        };
+        let Ok(token) = sign_in_file(&agy) else {
             return QuotaOutcome::Transient;
         };
         self.resolve_with(
-            &token,
+            token.as_deref(),
             chrono::Local::now().timestamp(),
             token_endpoint_reachable,
-            || agy_usage_command().output(),
+            || agy_usage_command(&agy.path).output(),
         )
     }
 
     /// The injectable core of [`Self::resolve`]: production passes the real
-    /// sign-in file, reachability probe and agy runner, tests fakes.
+    /// sign-in file (`None` for Jetski), reachability probe and agy runner,
+    /// tests fakes. Without a sign-in file there is no hold, so a failed sign-in
+    /// is tried again on the next tick.
     fn resolve_with(
         &mut self,
-        token: &Path,
+        token: Option<&Path>,
         now: i64,
         online: impl FnOnce() -> bool,
         run: impl FnOnce() -> io::Result<Output>,
     ) -> QuotaOutcome<AntigravityQuotaSnapshot> {
-        if !token.exists() {
+        if token.is_some_and(|token| !token.exists()) {
             return QuotaOutcome::NeedsLogin;
         }
         // Read before the run: a re-login during the minute a dead sign-in
         // keeps agy waiting must still count as a change afterwards.
-        let mtime = file_mtime(token);
+        let mtime = token.and_then(file_mtime);
         if mtime.is_some() && self.last.signed_out_mtime == mtime {
             return QuotaOutcome::NeedsLogin;
         }
@@ -386,13 +489,14 @@ mod tests {
     fn raw_fetch_without_a_sign_in_file_never_starts_agy() {
         let dir = tempfile::tempdir().unwrap();
         let token = dir.path().join("antigravity-oauth-token");
-        let err = fetch_antigravity_raw_with(&token, || panic!("agy must not run"))
+        let err = fetch_antigravity_raw_with(Some(&token), || panic!("agy must not run"))
             .unwrap_err()
             .to_string();
         assert!(err.contains(ANTIGRAVITY_LOGIN_HINT), "{err}");
 
         std::fs::write(&token, "{}").unwrap();
-        let body = fetch_antigravity_raw_with(&token, || Ok(USAGE.as_bytes().to_vec())).unwrap();
+        let body =
+            fetch_antigravity_raw_with(Some(&token), || Ok(USAGE.as_bytes().to_vec())).unwrap();
         assert_eq!(body, USAGE);
     }
 
@@ -412,7 +516,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let token = dir.path().join("antigravity-oauth-token");
         let outcome = AntigravityState::default()
-            .resolve_with(&token, 0, online, || panic!("agy must not run"));
+            .resolve_with(Some(&token), 0, online, || panic!("agy must not run"));
         assert!(matches!(outcome, QuotaOutcome::NeedsLogin));
     }
 
@@ -428,18 +532,21 @@ mod tests {
         };
         let mut state = AntigravityState::default();
 
-        assert!(holds_sign_in(
-            &state.resolve_with(&token, 0, online, signed_out)
-        ));
+        assert!(holds_sign_in(&state.resolve_with(
+            Some(&token),
+            0,
+            online,
+            signed_out
+        )));
         assert!(matches!(
-            state.resolve_with(&token, 0, online, signed_out),
+            state.resolve_with(Some(&token), 0, online, signed_out),
             QuotaOutcome::NeedsLogin
         ));
         assert_eq!(runs.get(), 1, "a dead sign-in must not relaunch agy");
 
         // A re-login rewrites the file, which is what earns another run.
         touch_later(&token);
-        let outcome = state.resolve_with(&token, 5, online, || ran(USAGE));
+        let outcome = state.resolve_with(Some(&token), 5, online, || ran(USAGE));
         assert!(
             matches!(outcome, QuotaOutcome::Data(ref s) if s.buckets.len() == 4 && !s.needs_login)
         );
@@ -454,10 +561,11 @@ mod tests {
         let mut state = AntigravityState::default();
 
         assert!(matches!(
-            state.resolve_with(&token, 5, online, || ran(USAGE)),
+            state.resolve_with(Some(&token), 5, online, || ran(USAGE)),
             QuotaOutcome::Data(_)
         ));
-        let QuotaOutcome::Data(saved) = state.resolve_with(&token, 9, online, || ran(SIGNED_OUT))
+        let QuotaOutcome::Data(saved) =
+            state.resolve_with(Some(&token), 9, online, || ran(SIGNED_OUT))
         else {
             panic!("a failed sign-in must hand out the hold");
         };
@@ -471,8 +579,9 @@ mod tests {
 
         // The next process resumes from what the worker wrote to the cache file.
         let cached = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
-        let outcome = AntigravityState::resume(cached)
-            .resolve_with(&token, 20, online, || panic!("agy must not run"));
+        let outcome =
+            AntigravityState::resume(cached)
+                .resolve_with(Some(&token), 20, online, || panic!("agy must not run"));
         assert!(matches!(outcome, QuotaOutcome::NeedsLogin));
     }
 
@@ -494,7 +603,7 @@ mod tests {
         std::fs::write(&token, "{}").unwrap();
         let mut state = AntigravityState::default();
 
-        let outcome = state.resolve_with(&token, 0, || false, || panic!("agy must not run"));
+        let outcome = state.resolve_with(Some(&token), 0, || false, || panic!("agy must not run"));
         assert!(matches!(outcome, QuotaOutcome::Transient));
         assert!(state.last.signed_out_mtime.is_none());
     }
@@ -517,13 +626,13 @@ mod tests {
         std::fs::write(&token, "{}").unwrap();
         let mut state = AntigravityState::default();
 
-        let outcome = state.resolve_with(&token, 0, online, || {
+        let outcome = state.resolve_with(Some(&token), 0, online, || {
             touch_later(&token);
             ran(SIGNED_OUT)
         });
         assert!(holds_sign_in(&outcome));
         let reran = Cell::new(false);
-        let outcome = state.resolve_with(&token, 5, online, || {
+        let outcome = state.resolve_with(Some(&token), 5, online, || {
             reran.set(true);
             ran(USAGE)
         });
@@ -540,14 +649,119 @@ mod tests {
 
         let not_found = || Err(io::Error::from(io::ErrorKind::NotFound));
         assert!(matches!(
-            state.resolve_with(&token, 0, online, not_found),
+            state.resolve_with(Some(&token), 0, online, not_found),
             QuotaOutcome::Transient
         ));
         let broken = || ran("garbage");
         assert!(matches!(
-            state.resolve_with(&token, 0, online, broken),
+            state.resolve_with(Some(&token), 0, online, broken),
             QuotaOutcome::Transient
         ));
         assert!(state.last.signed_out_mtime.is_none());
+    }
+
+    #[test]
+    fn jetski_has_no_sign_in_file_to_wait_on_or_hold_with() {
+        let mut state = AntigravityState::default();
+        let runs = Cell::new(0);
+        let signed_out = || {
+            runs.set(runs.get() + 1);
+            ran(SIGNED_OUT)
+        };
+        assert!(matches!(
+            state.resolve_with(None, 0, online, signed_out),
+            QuotaOutcome::Data(ref s) if s.needs_login && s.signed_out_mtime.is_none()
+        ));
+        assert!(matches!(
+            state.resolve_with(None, 0, online, signed_out),
+            QuotaOutcome::Data(_)
+        ));
+        assert_eq!(
+            runs.get(),
+            2,
+            "with no sign-in file, every tick tries again"
+        );
+        assert!(matches!(
+            state.resolve_with(None, 5, online, || ran(USAGE)),
+            QuotaOutcome::Data(ref s) if !s.needs_login && s.buckets.len() == 4
+        ));
+
+        let body = fetch_antigravity_raw_with(None, || Ok(USAGE.as_bytes().to_vec())).unwrap();
+        assert_eq!(body, USAGE);
+    }
+
+    #[test]
+    fn each_os_tries_its_own_installs_in_order() {
+        let home = Path::new("/home/u");
+        let appdata = Path::new("/appdata");
+        let paths = |os| {
+            agy_install_paths(os, home, appdata)
+                .into_iter()
+                .map(|binary| (binary.path, binary.jetski))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            paths("linux"),
+            [
+                (home.join(".local").join("bin").join("agy"), false),
+                (
+                    PathBuf::from("/google/bin/releases/jetski-devs/tools/cli"),
+                    true
+                ),
+            ]
+        );
+        assert_eq!(
+            paths("macos"),
+            [(PathBuf::from("/usr/local/bin/jetski"), true)]
+        );
+        assert_eq!(
+            paths("windows"),
+            [(appdata.join("agy").join("bin").join("agy.exe"), false)]
+        );
+    }
+
+    #[test]
+    fn agy_on_path_wins_then_the_first_install_that_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let missing = AgyBinary {
+            path: dir.path().join("missing"),
+            jetski: false,
+        };
+        let jetski = AgyBinary {
+            path: dir.path().join("cli"),
+            jetski: true,
+        };
+        std::fs::write(&jetski.path, "").unwrap();
+        let installs = || vec![missing.clone(), jetski.clone()];
+        let path_var = || Some(bin.clone().into_os_string());
+
+        assert_eq!(locate_agy_in(None, installs(), true), Some(jetski.clone()));
+        assert_eq!(
+            locate_agy_in(path_var(), installs(), true),
+            Some(jetski.clone())
+        );
+        let on_path = AgyBinary {
+            path: bin.join(if cfg!(windows) { "agy.exe" } else { "agy" }),
+            jetski: false,
+        };
+        std::fs::write(&on_path.path, "").unwrap();
+        assert_eq!(
+            locate_agy_in(path_var(), installs(), true),
+            Some(on_path.clone())
+        );
+        assert_eq!(locate_agy_in(None, vec![missing.clone()], true), None);
+
+        // An agy that has not signed in never hides Jetski, and is still found
+        // when it is the only build, so its missing sign-in can be reported.
+        assert_eq!(
+            locate_agy_in(path_var(), installs(), false),
+            Some(jetski.clone())
+        );
+        assert_eq!(
+            locate_agy_in(path_var(), vec![missing.clone()], false),
+            Some(on_path)
+        );
     }
 }

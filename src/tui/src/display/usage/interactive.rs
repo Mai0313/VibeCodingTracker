@@ -46,16 +46,16 @@ use vct_core::pricing::{ModelPricingMap, fetch_model_pricing};
 use vct_core::quota::{
     ANTIGRAVITY_LOGIN_HINT, ANTIGRAVITY_MIN_REFRESH_SECS, AntigravityState, CLAUDE_LOGIN_HINT,
     CODEX_LOGIN_HINT, COPILOT_LOGIN_HINT, CURSOR_LOGIN_HINT, ClaudeState, CodexState, CopilotState,
-    CursorState, GROK_LOGIN_HINT, GrokState, load_antigravity_cache, load_claude_cache,
-    load_codex_cache, load_copilot_cache, load_cursor_cache, load_grok_cache,
+    CursorState, GROK_LOGIN_HINT, GrokState, antigravity_quota_present, load_antigravity_cache,
+    load_claude_cache, load_codex_cache, load_copilot_cache, load_cursor_cache, load_grok_cache,
     save_antigravity_cache, save_claude_cache, save_codex_cache, save_copilot_cache,
     save_cursor_cache, save_grok_cache, spawn_quota_worker,
 };
 use vct_core::scan::build_scan_pool;
 use vct_core::utils::{
     format_compact, format_cost, format_cost_compact, format_duration_until,
-    get_antigravity_token_path, get_claude_credentials_path, get_copilot_config_path,
-    get_cursor_auth_path, get_grok_auth_path, resolve_paths,
+    get_claude_credentials_path, get_copilot_config_path, get_cursor_auth_path, get_grok_auth_path,
+    resolve_paths,
 };
 
 /// How wide and tall the cards in one grid are.
@@ -132,9 +132,9 @@ const MAX_QUOTA_PANELS: usize = 6;
 /// width the bars lose; `label_width`'s own floor is 5, making 6 the first
 /// width that costs anything at all.
 const SCOPED_LABEL_W: u16 = 6;
-/// Widest an Antigravity gauge label may be: the longest agy's own windows
-/// produce (`Gemini 7d`), and narrow enough that the bar and percent still fit
-/// the narrowest card.
+/// Widest an Antigravity gauge label may be: agy's own windows (`weekly`,
+/// `5h`, `20h`) fit, and a limit named by its title is cut here so the bar and
+/// percent still fit the narrowest card.
 const ANTIGRAVITY_LABEL_W: u16 = 9;
 
 /// Which provider quota panels have credentials on this machine.
@@ -167,11 +167,7 @@ impl QuotaPresence {
             .unwrap_or(false);
         let cursor = get_cursor_auth_path().map(|p| p.exists()).unwrap_or(false);
         let grok = get_grok_auth_path().map(|p| p.exists()).unwrap_or(false);
-        // agy's sign-in file stands in for credentials: checking it costs
-        // nothing, where asking agy itself would start a whole process.
-        let antigravity = get_antigravity_token_path()
-            .map(|p| p.exists())
-            .unwrap_or(false);
+        let antigravity = antigravity_quota_present();
         Self {
             claude,
             codex,
@@ -1763,12 +1759,29 @@ fn render_quota_overlay(f: &mut Frame, area: Rect, quota: &QuotaView, now: i64) 
     // card per present provider, so the count the grid needs is known before
     // the first card exists.
     let present = quota.present.count();
-    let rows_that_fit = usize::from(inner.height / OVERLAY_GRID.height);
-    let (cols, _) = quota_grid(&OVERLAY_GRID, inner.width, present);
+    // Cards grow to the tallest one (Antigravity lists a line per pool and per
+    // limit), but only while every provider still fits: a taller card never
+    // costs another provider its place.
+    let tallest = collect_cards(quota, now, OVERLAY_GRID.min_w)
+        .iter()
+        .map(|card| card.lines.len())
+        .max()
+        .unwrap_or(0);
+    let grown = GridSpec {
+        height: OVERLAY_GRID.height.max(tallest as u16 + 2),
+        ..OVERLAY_GRID
+    };
+    let spec = if grid_height(&grown, inner.width, present) <= inner.height {
+        grown
+    } else {
+        OVERLAY_GRID
+    };
+    let rows_that_fit = usize::from(inner.height / spec.height);
+    let (cols, _) = quota_grid(&spec, inner.width, present);
     let fits = present.min(cols.saturating_mul(rows_that_fit));
     let hidden = present - fits;
-    let cells = grid_cells(&OVERLAY_GRID, inner, fits);
-    let card_w = cells.first().map_or(OVERLAY_GRID.min_w, |cell| cell.width);
+    let cells = grid_cells(&spec, inner, fits);
+    let card_w = cells.first().map_or(spec.min_w, |cell| cell.width);
     let cards = collect_cards(quota, now, card_w);
 
     let mut block = Block::default()
@@ -2640,25 +2653,44 @@ fn grok_card(grok: &GrokQuotaSnapshot, now: i64, width: u16) -> QuotaCard {
     }
 }
 
-/// Builds the Antigravity card: one gauge per `/usage` limit. `/usage` names no
-/// plan, so the first line carries only the snapshot's age.
+/// Builds the Antigravity card: each pool's name, then one gauge per limit
+/// named by its window. `/usage` names no plan, so the first line carries only
+/// the snapshot's age.
 fn antigravity_card(antigravity: &AntigravityQuotaSnapshot, now: i64, width: u16) -> QuotaCard {
     let inner = card_inner_w(width);
     let mut lines: Vec<Line> = vec![plan_line(None, antigravity.fetched_at, now, inner)];
     if antigravity.needs_login {
         lines.push(login_hint_line(ANTIGRAVITY_LOGIN_HINT, inner));
     }
-    let labels = antigravity_labels(&antigravity.buckets, inner);
-    let label_w = label_width(&labels.iter().map(String::as_str).collect::<Vec<_>>());
-    for (label, bucket) in labels.iter().zip(&antigravity.buckets) {
-        lines.push(gauge_line(
-            label,
-            label_w,
-            bucket.usage.used_percent,
-            bucket.usage.resets_at_unix,
-            now,
-            inner,
-        ));
+    let label_w = label_width(
+        &antigravity
+            .buckets
+            .iter()
+            .map(|b| b.window.as_str())
+            .collect::<Vec<_>>(),
+    )
+    .min(usize::from(ANTIGRAVITY_LABEL_W));
+    // Each pool by its own name, then its limits by agy's window names, 5h first.
+    let mut pools: Vec<(&str, Vec<&AntigravityBucket>)> = Vec::new();
+    for bucket in &antigravity.buckets {
+        match pools.iter_mut().find(|(name, _)| *name == bucket.group) {
+            Some((_, limits)) => limits.push(bucket),
+            None => pools.push((&bucket.group, vec![bucket])),
+        }
+    }
+    for (name, mut limits) in pools {
+        limits.sort_by_key(|b| b.window != "5h");
+        lines.push(Line::from(fit_text(name, inner)));
+        for bucket in limits {
+            lines.push(gauge_line(
+                &fit_text(&bucket.window, ANTIGRAVITY_LABEL_W),
+                label_w,
+                bucket.usage.used_percent,
+                bucket.usage.resets_at_unix,
+                now,
+                inner,
+            ));
+        }
     }
     // The login hint already explains an empty card, so the two never stack.
     if antigravity.buckets.is_empty() && !antigravity.needs_login {
@@ -2670,36 +2702,6 @@ fn antigravity_card(antigravity: &AntigravityQuotaSnapshot, now: i64, width: u16
         color: ANTIGRAVITY_COLOR,
         limit_reached: antigravity.limit_reached,
         lines,
-    }
-}
-
-/// Gauge labels for the Antigravity limits: the pool's first word and the
-/// window (`Gemini 7d`), or only the word's initial (`G 7d`) when the full
-/// labels would leave no room for a reset time at this width. A longer label,
-/// such as a limit's title standing in for a missing window, is cut to
-/// [`ANTIGRAVITY_LABEL_W`] rather than pushing the bar off the card.
-fn antigravity_labels(buckets: &[AntigravityBucket], inner_w: u16) -> Vec<String> {
-    let label = |bucket: &AntigravityBucket, initial_only: bool| {
-        let word = bucket.group.split_whitespace().next().unwrap_or("");
-        let word: String = if initial_only {
-            word.chars().take(1).collect()
-        } else {
-            word.to_string()
-        };
-        let window = if bucket.window == "weekly" {
-            "7d"
-        } else {
-            bucket.window.as_str()
-        };
-        fit_text(&format!("{word} {window}"), ANTIGRAVITY_LABEL_W)
-    };
-    let full: Vec<String> = buckets.iter().map(|b| label(b, false)).collect();
-    // label + separator + bar + " nnn%" + a bare reset as long as " 23h59m".
-    let widest = label_width(&full.iter().map(String::as_str).collect::<Vec<_>>());
-    if widest + 1 + 5 + 5 + 7 <= usize::from(inner_w) {
-        full
-    } else {
-        buckets.iter().map(|b| label(b, true)).collect()
     }
 }
 
@@ -2942,15 +2944,20 @@ mod tests {
     /// Renders a card into the smallest cell the grid ever hands out and returns
     /// its text, so a test can assert what survives that width.
     fn render_min_card(card: &QuotaCard) -> String {
-        let mut terminal =
-            Terminal::new(TestBackend::new(CARD_GRID.min_w, CARD_GRID.height)).unwrap();
+        render_card_in(card, CARD_GRID.min_w, CARD_GRID.height)
+    }
+
+    /// Renders `card` into a `w` x `h` cell, borders included, and returns its
+    /// text.
+    fn render_card_in(card: &QuotaCard, w: u16, h: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         terminal
             .draw(|frame| render_quota_card(frame, frame.area(), card))
             .expect("card renders");
         let buffer = terminal.backend().buffer();
-        (0..CARD_GRID.height)
+        (0..h)
             .map(|y| {
-                (0..CARD_GRID.min_w)
+                (0..w)
                     .map(|x| buffer.cell((x, y)).unwrap().symbol())
                     .collect::<String>()
             })
@@ -3066,45 +3073,56 @@ mod tests {
         }
     }
 
-    /// Four limits fill the narrowest cell: the pool shrinks to its initial so
-    /// every gauge keeps its reset time.
+    /// Each pool's own name heads its limits, which agy's window names label,
+    /// the 5-hour one first whatever order agy lists them in.
     #[test]
-    fn antigravity_panel_fits_every_limit_in_the_minimum_cell() {
+    fn antigravity_panel_lists_each_pool_then_its_limits_5h_first() {
         let now = 1_000;
-        let rendered = render_min_card(&antigravity_card(
-            &antigravity_snapshot(now),
-            now,
-            CARD_GRID.min_w,
-        ));
-        for line in [
-            "G 7d",
-            "8% 2d18h",
-            "G 5h",
-            "23% 2h50m",
-            "C 7d",
-            "57% 20h",
-            "C 5h",
-        ] {
-            assert!(rendered.contains(line), "{line} missing from:\n{rendered}");
-        }
-        assert!(rendered.contains("just now"), "got:\n{rendered}");
-        assert!(
-            !rendered.contains('+'),
-            "nothing may be hidden:\n{rendered}"
-        );
-    }
-
-    /// A card with room to spare names the pool in full.
-    #[test]
-    fn antigravity_panel_names_the_pool_when_it_has_the_room() {
-        let card = antigravity_card(&antigravity_snapshot(0), 0, OVERLAY_GRID.min_w);
-        let text: String = card
+        let card = antigravity_card(&antigravity_snapshot(now), now, OVERLAY_GRID.min_w);
+        let lines: Vec<String> = card
             .lines
             .iter()
-            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
             .collect();
-        assert!(text.contains("Gemini 7d"), "got {text:?}");
-        assert!(text.contains("Claude 5h"), "got {text:?}");
+        let heads: Vec<&str> = lines[1..]
+            .iter()
+            .map(|line| line.split_whitespace().next().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            heads,
+            ["Gemini", "5h", "weekly", "Claude", "5h", "weekly"],
+            "got {lines:#?}"
+        );
+        assert!(lines[1].starts_with("Gemini Models"), "got {lines:#?}");
+        assert!(
+            lines[4].starts_with("Claude and GPT models"),
+            "got {lines:#?}"
+        );
+        assert!(lines[2].contains("23%"), "got {lines:#?}");
+        assert!(lines[3].contains("8%"), "got {lines:#?}");
+    }
+
+    /// The overlay cell holds every line of agy's two pools; the always-on cell
+    /// flags what it cannot hold rather than dropping it.
+    #[test]
+    fn antigravity_panel_fits_the_overlay_and_flags_the_rest_in_the_grid() {
+        let now = 1_000;
+        let snapshot = antigravity_snapshot(now);
+        let overlay = render_card_in(
+            &antigravity_card(&snapshot, now, OVERLAY_GRID.min_w),
+            OVERLAY_GRID.min_w,
+            OVERLAY_GRID.height,
+        );
+        assert!(overlay.contains("Claude and GPT models"), "got:\n{overlay}");
+        assert!(!overlay.contains('+'), "nothing may be hidden:\n{overlay}");
+
+        let grid = render_min_card(&antigravity_card(&snapshot, now, CARD_GRID.min_w));
+        assert!(grid.contains("+2"), "hidden lines must be flagged:\n{grid}");
     }
 
     /// A limit agy names by its title alone still shows its gauge in the
@@ -3123,7 +3141,7 @@ mod tests {
             ..Default::default()
         };
         let rendered = render_min_card(&antigravity_card(&antigravity, 0, CARD_GRID.min_w));
-        assert!(rendered.contains("G Weekly…"), "got:\n{rendered}");
+        assert!(rendered.contains("Weekly L…"), "got:\n{rendered}");
         assert!(rendered.contains("42%"), "got:\n{rendered}");
     }
 
@@ -3695,6 +3713,66 @@ mod tests {
             !rendered.contains("hidden"),
             "nothing was hidden:\n{rendered}"
         );
+    }
+
+    /// Jetski's six pools outgrow the overlay's usual card, which grows to hold
+    /// them while the terminal has the rows and keeps its height when it does
+    /// not, flagging the rest.
+    #[test]
+    fn overlay_grows_its_cards_to_the_tallest_while_every_provider_fits() {
+        let pools = [
+            "Gemini Pro Next",
+            "Gemini Flash Next",
+            "Gemini Teamfood Models",
+            "Gemini Flash",
+            "Gemini Flash Lite",
+            "Third-Party Models",
+        ];
+        let antigravity = AntigravityQuotaSnapshot {
+            buckets: pools
+                .iter()
+                .map(|pool| AntigravityBucket {
+                    group: pool.to_string(),
+                    window: "20h".to_string(),
+                    usage: QuotaWindow {
+                        used_percent: 1.0,
+                        resets_at_unix: None,
+                    },
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let (c, x, p, u, g) = Default::default();
+        let quota = QuotaView {
+            present: QuotaPresence {
+                antigravity: true,
+                ..Default::default()
+            },
+            ..every_provider(&c, &x, &p, &u, &g, &antigravity)
+        };
+        let render = |width: u16, height: u16| {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| render_quota_overlay(frame, frame.area(), &quota, 0))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..height)
+                .map(|y| {
+                    (0..width)
+                        .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let tall = render(60, 20);
+        assert!(tall.contains("Third-Party Models"), "got:\n{tall}");
+        assert!(!tall.contains("+6"), "nothing may be hidden:\n{tall}");
+
+        let short = render(60, 14);
+        assert!(short.contains("Antigravity"), "got:\n{short}");
+        assert!(short.contains("+6"), "the rest must be flagged:\n{short}");
     }
 
     #[test]
