@@ -1115,3 +1115,171 @@ fn config_edit_propagates_a_failing_editor() {
         .assert()
         .failure();
 }
+
+// ============================================================================
+// Group 3: remote ledgers
+// ============================================================================
+
+#[test]
+fn ledger_export_prints_one_line_of_totals_and_creates_no_config() {
+    let home = TempHome::new();
+    // Claude names a project directory after the working directory.
+    home.put_claude_session(
+        "-home-wei-repo-secret",
+        "session.jsonl",
+        &vct_test_support::fixture_str("sessions/claude_code.jsonl"),
+    );
+
+    let output = child_cmd(&home)
+        .args(["ledger", "export"])
+        .output()
+        .expect("spawn vct");
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(stdout.lines().count(), 1);
+    let export: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(export["vct_ledger_export"], 1);
+    let sessions = export["providers"]["claude"]["sessions"]
+        .as_object()
+        .unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert!(!stdout.contains("-home-wei-repo") && !stdout.contains("session.jsonl"));
+    assert!(!home.home().join(".vct/config.toml").exists());
+    assert!(home.home().join(".vct/sessions/claude.json").exists());
+}
+
+/// [`child_cmd`] without `VCT_OFFLINE`, which would skip the remote fetch.
+///
+/// The seeded pricing cache answers the one request such a child would make;
+/// the dead proxy makes it fail rather than leave the machine if a test ever
+/// straddles the UTC midnight that renames that cache.
+#[cfg(unix)]
+fn online_cmd(home: &TempHome) -> Command {
+    let mut cmd = child_cmd(home);
+    cmd.env_remove("VCT_OFFLINE")
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .env_remove("NO_PROXY");
+    cmd
+}
+
+/// A stand-in `ssh` that ignores its destination and runs the real binary's
+/// `ledger export` against `remote`, the way sshd would on the other machine.
+#[cfg(unix)]
+fn fake_ssh_dir(remote: &TempHome) -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let script = format!(
+        "#!/bin/sh\nHOME='{}' VCT_OFFLINE=1 exec '{}' ledger export\n",
+        remote.home().display(),
+        assert_cmd::cargo::cargo_bin("vibe_coding_tracker").display()
+    );
+    let path = dir.path().join("ssh");
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    dir
+}
+
+#[cfg(unix)]
+#[test]
+fn usage_and_analysis_merge_a_configured_remote_and_drop_it_once_unconfigured() {
+    let remote = TempHome::new();
+    remote.put_claude_session(
+        "proj",
+        "session.jsonl",
+        &vct_test_support::fixture_str("sessions/claude_code.jsonl"),
+    );
+    let ssh = fake_ssh_dir(&remote);
+    let local = TempHome::new();
+    // Today's pricing cache answers the pricing fetch before any request, so
+    // the child can run without `VCT_OFFLINE`, which would skip the remote.
+    local.seed_pricing_cache(&pricing_seed());
+    local.put(".vct/config.toml", "[remotes]\nhosts = [\"devbox\"]\n");
+    let online = |args: &[&str]| {
+        online_cmd(&local)
+            .env("PATH", ssh.path())
+            .args(args)
+            .output()
+            .expect("spawn vct")
+    };
+
+    let usage = online(&["usage", "--json"]);
+    assert!(
+        usage.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&usage.stderr)
+    );
+    let rows: serde_json::Value = serde_json::from_slice(&usage.stdout).unwrap();
+    assert_eq!(rows[0]["model"], "claude-sonnet-4-20250514");
+    assert!(
+        rows[0]["usage"]["input_tokens"]
+            .as_u64()
+            .is_some_and(|tokens| tokens > 0)
+    );
+
+    // Offline nothing is fetched, and the stored snapshot still counts.
+    let offline = child_cmd(&local)
+        .args(["usage", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(offline.stdout, usage.stdout);
+
+    // With the snapshot gone, analysis has to do its own fetch to show it.
+    std::fs::remove_dir_all(local.home().join(".vct/remotes")).unwrap();
+    let analysis = online(&["analysis", "--text"]);
+    assert!(String::from_utf8_lossy(&analysis.stdout).contains("claude-sonnet-4-20250514"));
+
+    // A config that does not parse reads as no hosts; that is not the user
+    // removing one, so the snapshot stays and keeps counting.
+    local.put(".vct/config.toml", "[remotes]\nhosts = \"devbox\"\n");
+    let broken = online(&["usage", "--json"]);
+    assert_eq!(broken.stdout, usage.stdout);
+    assert!(local.home().join(".vct/remotes/devbox").exists());
+
+    local.put(".vct/config.toml", "[remotes]\nhosts = []\n");
+    let unconfigured = online(&["usage", "--json"]);
+    assert_eq!(String::from_utf8_lossy(&unconfigured.stdout).trim(), "[]");
+    assert!(!local.home().join(".vct/remotes/devbox").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreachable_remote_warns_and_leaves_the_local_result_standing() {
+    use std::os::unix::fs::PermissionsExt;
+    let local = TempHome::new();
+    local.put_claude_session(
+        "proj",
+        "session.jsonl",
+        &vct_test_support::fixture_str("sessions/claude_code.jsonl"),
+    );
+    local.seed_pricing_cache(&pricing_seed());
+    local.put(".vct/config.toml", "[remotes]\nhosts = [\"devbox\"]\n");
+    let ssh = tempfile::tempdir().unwrap();
+    let path = ssh.path().join("ssh");
+    std::fs::write(
+        &path,
+        "#!/bin/sh\necho 'ssh: connect to host devbox: timed out' >&2\nexit 255\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = online_cmd(&local)
+        .env("PATH", ssh.path())
+        .args(["usage", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("remote devbox") && stderr.contains("timed out"),
+        "{stderr}"
+    );
+    let rows: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(rows[0]["model"], "claude-sonnet-4-20250514");
+}

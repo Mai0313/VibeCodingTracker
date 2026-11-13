@@ -16,6 +16,7 @@
 
 pub(crate) mod format;
 pub(crate) mod key;
+pub(crate) mod remote;
 pub(crate) mod stamp;
 
 use crate::constants::{FastHashMap, FastHashSet};
@@ -27,6 +28,7 @@ pub(crate) use format::{
     DayEntry, HalfStamps, ScanFeature, ScanStamp, SessionEntry, merge_analysis_rows,
 };
 use format::{LedgerFile, LedgerHeader, SCHEMA_VERSION};
+pub use remote::{EXPORT_LINE_PREFIX, REMOTES_DIR_NAME, prune_remotes, remote_dir, store_export};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -60,6 +62,8 @@ pub struct LedgerStats {
 pub struct SessionLedger {
     dir: Option<PathBuf>,
     providers: FastHashMap<ExtensionType, ProviderLedger>,
+    /// Other machines' snapshots, reloaded at the start of every scan.
+    remotes: Vec<remote::RemoteSnapshot>,
     parsed_sources: usize,
     total_parsed_sources: usize,
     retained: usize,
@@ -78,6 +82,7 @@ impl SessionLedger {
         Self {
             dir: None,
             providers: FastHashMap::default(),
+            remotes: Vec::new(),
             parsed_sources: 0,
             total_parsed_sources: 0,
             retained: 0,
@@ -201,6 +206,7 @@ impl SessionLedger {
     pub(crate) fn begin_scan(&mut self) {
         self.parsed_sources = 0;
         self.retained = 0;
+        self.reload_remotes();
     }
 
     /// Records that `count` sources were read during this scan.
@@ -282,7 +288,7 @@ impl ProviderLedger {
     }
 }
 
-const ALL_PROVIDERS: [ExtensionType; 10] = [
+pub(crate) const ALL_PROVIDERS: [ExtensionType; 10] = [
     ExtensionType::ClaudeCode,
     ExtensionType::Codex,
     ExtensionType::Copilot,

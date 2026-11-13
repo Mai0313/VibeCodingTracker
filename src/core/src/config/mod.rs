@@ -24,7 +24,7 @@
 //! `usage = { ... }` table), so the returned [`Config`] is always correct even
 //! when the file was not rewritten.
 
-use crate::models::TimeRange;
+use crate::models::{ExtensionType, TimeRange};
 use crate::utils::{get_cache_dir, resolve_paths, write_string_atomic};
 use anyhow::Result;
 use schemars::JsonSchema;
@@ -68,6 +68,8 @@ pub struct Config {
     pub providers: ProvidersConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub remotes: RemotesConfig,
 }
 
 /// `[performance]` - controls for CPU-bound local scans.
@@ -268,6 +270,24 @@ pub struct ProvidersConfig {
     pub antigravity: bool,
 }
 
+impl ProvidersConfig {
+    /// Whether `provider` is switched on.
+    pub fn includes(&self, provider: ExtensionType) -> bool {
+        match provider {
+            ExtensionType::ClaudeCode => self.claude,
+            ExtensionType::Codex => self.codex,
+            ExtensionType::Copilot => self.copilot,
+            ExtensionType::Gemini => self.gemini,
+            ExtensionType::OpenCode => self.opencode,
+            ExtensionType::Cursor => self.cursor,
+            ExtensionType::Hermes => self.hermes,
+            ExtensionType::Grok => self.grok,
+            ExtensionType::DeepSeek => self.dsh,
+            ExtensionType::Antigravity => self.antigravity,
+        }
+    }
+}
+
 impl Default for ProvidersConfig {
     fn default() -> Self {
         Self {
@@ -283,6 +303,42 @@ impl Default for ProvidersConfig {
             antigravity: true,
         }
     }
+}
+
+/// `[remotes]` — other machines whose usage is merged into this one's.
+///
+/// vct runs `vct ledger export` on each host over ssh and adds the sessions it
+/// returns to the usage and analysis views. Only computed totals cross the
+/// connection, never conversations. vct must be installed on each host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RemotesConfig {
+    /// ssh destinations to merge, as you would pass them to `ssh`: a host
+    /// name, `user@host`, or an alias from `~/.ssh/config`. Each must accept a
+    /// non-interactive login (a key or an agent, no password prompt).
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    /// How to start vct on the hosts, for example "/opt/vct/bin/vct". Empty
+    /// looks for it on the remote PATH, in ~/.local/bin, ~/.cargo/bin and
+    /// under ~/.nvm.
+    #[serde(default)]
+    pub command: String,
+    /// Seconds between fetches while a TUI is open (minimum 60).
+    #[serde(default = "default_remotes_refresh_interval")]
+    pub refresh_interval: u64,
+}
+
+impl Default for RemotesConfig {
+    fn default() -> Self {
+        Self {
+            hosts: Vec::new(),
+            command: String::new(),
+            refresh_interval: default_remotes_refresh_interval(),
+        }
+    }
+}
+
+fn default_remotes_refresh_interval() -> u64 {
+    300
 }
 
 /// `[logging]` — file logging preferences.
@@ -405,6 +461,23 @@ pub fn load_read_only() -> Config {
     match resolve_paths() {
         Ok(paths) => load_read_only_in(&paths.cache_dir),
         Err(_) => Config::default(),
+    }
+}
+
+/// Whether `~/.vct/config.toml` is absent or holds settings that parse.
+///
+/// Every read is infallible and turns a broken file into the defaults, so a
+/// caller about to act on a setting being empty uses this to tell "the user
+/// removed it" from "the file is mid-edit".
+pub fn file_is_valid() -> bool {
+    resolve_paths().is_ok_and(|paths| file_is_valid_in(&paths.cache_dir))
+}
+
+/// [`file_is_valid`] rooted at an explicit directory (test seam).
+pub fn file_is_valid_in(dir: &Path) -> bool {
+    match std::fs::read_to_string(dir.join("config.toml")) {
+        Ok(text) => toml_edit::de::from_str::<Config>(&text).is_ok(),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
     }
 }
 
@@ -1121,6 +1194,30 @@ mod tests {
         assert!(cfg.providers.grok);
         assert_eq!(cfg.logging.level, LogLevel::Warn);
         assert_eq!(cfg.logging.retention_days, 7);
+        assert!(cfg.remotes.hosts.is_empty());
+        assert_eq!(cfg.remotes.command, "");
+        assert_eq!(cfg.remotes.refresh_interval, 300);
+    }
+
+    #[test]
+    fn a_file_is_valid_when_absent_or_parsing_and_not_when_a_key_has_the_wrong_type() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(file_is_valid_in(dir.path()));
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, default_document().to_string()).unwrap();
+        assert!(file_is_valid_in(dir.path()));
+        std::fs::write(&path, "[remotes]\nhosts = \"devbox\"\n").unwrap();
+        assert!(!file_is_valid_in(dir.path()));
+        std::fs::write(&path, "[remotes\n").unwrap();
+        assert!(!file_is_valid_in(dir.path()));
+    }
+
+    #[test]
+    fn remotes_hosts_parse_and_leave_the_other_keys_at_their_defaults() {
+        let cfg = parse_config_text("[remotes]\nhosts = [\"devbox\", \"wei@laptop\"]\n");
+        assert_eq!(cfg.remotes.hosts, ["devbox", "wei@laptop"]);
+        assert_eq!(cfg.remotes.command, "");
+        assert_eq!(cfg.remotes.refresh_interval, 300);
     }
 
     #[test]

@@ -169,12 +169,31 @@ pub enum Commands {
         table: bool,
     },
 
+    /// Work with the session ledger, the per-day totals vct keeps of every
+    /// session it has read.
+    Ledger {
+        /// What to do.
+        #[command(subcommand)]
+        action: LedgerAction,
+    },
+
     /// Show or edit the persistent settings file (`~/.vct/config.toml`).
     Config {
         /// What to do; defaults to showing the current settings.
         #[command(subcommand)]
         action: Option<ConfigAction>,
     },
+}
+
+/// Actions for the `ledger` subcommand.
+#[derive(Subcommand, Debug, Clone, Copy)]
+pub enum LedgerAction {
+    /// Scan this machine and print its ledger as one line of JSON.
+    ///
+    /// This is what another machine runs here over ssh when this one is
+    /// listed under `[remotes]` in its config. Only per-day totals are
+    /// printed, never conversations.
+    Export,
 }
 
 /// Actions for the `config` subcommand.

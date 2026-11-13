@@ -11,7 +11,9 @@
 
 mod cli;
 
-use crate::cli::{Cli, Commands, ConfigAction, QuotaProvider, resolve_time_range_with_default};
+use crate::cli::{
+    Cli, Commands, ConfigAction, LedgerAction, QuotaProvider, resolve_time_range_with_default,
+};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use comfy_table::{Cell, CellAlignment, Color, ContentArrangement, Table, presets::UTF8_FULL};
@@ -153,6 +155,9 @@ fn run() -> Result<()> {
                     );
                     let scan_pool =
                         Arc::new(build_scan_pool(config.performance.resolved_scan_threads())?);
+                    if !json {
+                        prepare_remotes(&config.remotes, text || table)?;
+                    }
                     if json {
                         let dataset = scan_pool.install(|| {
                             vct_core::analysis::collect_analysis_sessions_with(
@@ -212,6 +217,7 @@ fn run() -> Result<()> {
             // preference decides. The TUI's `m` toggle persists back to config.
             let merge = merge_providers || config.usage.merge_models;
             let scan_pool = Arc::new(build_scan_pool(config.performance.resolved_scan_threads())?);
+            prepare_remotes(&config.remotes, json || text || table)?;
 
             if json {
                 let scan = scan_usage_priced(time_range, config.providers, &scan_pool)?;
@@ -325,11 +331,45 @@ fn run() -> Result<()> {
             run_quota(provider, text, table)?;
         }
 
+        Commands::Ledger {
+            action: LedgerAction::Export,
+        } => {
+            // Run over ssh by another machine, so nothing here may create or
+            // rewrite this one's settings.
+            let config = vct_core::config::load_read_only();
+            let scan_pool = build_scan_pool(config.performance.resolved_scan_threads())?;
+            vct_core::remote::export(config.providers, &scan_pool, io::stdout().lock())?;
+        }
+
         Commands::Config { action } => {
             run_config(action.unwrap_or(ConfigAction::Show))?;
         }
     }
 
+    Ok(())
+}
+
+/// Brings the snapshots of the `[remotes]` hosts up to date for a scan.
+///
+/// A one-shot command waits for the fetch and warns about each host that
+/// failed, since its output is final. A TUI must not wait on ssh, so the fetch
+/// runs behind it and the next refresh picks up what arrived.
+fn prepare_remotes(config: &vct_core::config::RemotesConfig, one_shot: bool) -> Result<()> {
+    let cache_dir = vct_core::utils::resolve_paths()?.cache_dir;
+    // A file that failed to parse reads as no hosts, which must not cost the
+    // snapshots of hosts that are merely unreachable right now.
+    if vct_core::config::file_is_valid() {
+        vct_core::remote::prune(&cache_dir, config);
+    }
+    if one_shot {
+        for (host, error) in vct_core::remote::sync(&cache_dir, config) {
+            eprintln!(
+                "Warning: Could not fetch usage from remote {host}: {error}. Its last fetched data, if any, is shown."
+            );
+        }
+    } else {
+        vct_core::remote::spawn_sync_loop(cache_dir, config.clone());
+    }
     Ok(())
 }
 

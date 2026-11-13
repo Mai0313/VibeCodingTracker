@@ -276,6 +276,23 @@ For noninteractive `usage` and `analysis` scans, vct exits with an error when ev
 
 Every `usage` and `analysis` scan reads and writes a per-session ledger under `~/.vct/sessions/` (one `<provider>.json` per assistant). A session that has not changed is never parsed twice, so one-shot runs and the dashboard's first paint only spend time on what changed. More importantly, a session stays in the ledger after its source is gone: when an assistant prunes its own history (Claude Code keeps 30 days by default) or a whole session directory such as `~/.claude/projects` is deleted, every total still includes it, and noninteractive runs print a one-line note saying how many sessions came from the ledger. A resumed session is re-read when its log changes. The ledger holds only per-day token counts and tool counters in each provider's own shape, never transcripts or prices, and vct never deletes it: an unreadable file is renamed aside and a file written by a newer vct is left alone. Delete the directory to start over from what is on disk. `vct analysis --json` and `vct analysis FILE` parse their files in full and do not use it.
 
+### Other Machines
+
+`vct usage` and `vct analysis` can add the sessions of other machines to this one's totals. List them as ssh destinations in [`config.toml`](#configuration):
+
+```toml
+[remotes]
+hosts = ["devbox", "wei@laptop"]
+```
+
+vct then runs `vct ledger export` on each host over ssh and folds what comes back into every total. Only that machine's ledger crosses the connection, which is per-day token counts and tool counters: conversations, databases and credentials stay where they are. Each host needs vct installed, in a version that has `ledger export`, and a login that works without a prompt, because vct runs `ssh` in batch mode: a key, an agent, or whatever your `~/.ssh/config` sets up for that name.
+
+- A one-shot command (`--json`, `--text`, `--table`) fetches first and waits up to 30 seconds per host. A host's first export parses its whole history and can outlast that wait; it finishes there anyway, so the next run gets it. The dashboards fetch in the background every `refresh_interval` seconds (default 300) and never wait.
+- A host that cannot be reached keeps showing its last fetched data, with a warning on stderr for a one-shot command and in the log for a dashboard. Taking a host out of `hosts` removes its data.
+- A non-interactive ssh session has a bare `PATH`, so vct looks for the remote binary on `PATH`, in `~/.local/bin`, in `~/.cargo/bin` and under `~/.nvm`. If it is installed elsewhere, set `command` to how to start it.
+- A session both machines hold, as with a shared home directory, counts once. Days are each machine's own local dates. Totals are merged, with no per-machine breakdown.
+- `vct analysis --json`, `vct analysis FILE` and the quota panels stay local.
+
 ### Live Quota Panels
 
 `vct usage` shows **live quota usage for Claude Code, Codex, GitHub Copilot, Cursor, Grok, and Antigravity right in the dashboard — with zero setup.** No status-line hook, no credentials to enter: vct reads each provider's own credentials, calls its usage API (for Antigravity, asks the `agy` CLI) on a background thread, and keeps the panels current while you work. Every gauge is percent **used**, so a full bar means the window is spent, not untouched. (Prefer a quieter dashboard? Trim `panels` under `[usage.quota]` in [`config.toml`](#configuration), or set it to `[]` to hide the quota cards entirely. The per-provider cost line under the table is local scan data, not a quota panel, so it stays whatever you set here.)

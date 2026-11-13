@@ -98,6 +98,25 @@ pub(crate) fn fold_unseen(
     retained
 }
 
+/// Folds the sessions of other machines that `ledger` holds snapshots of, for
+/// every provider `enabled` lets through.
+pub(crate) fn fold_remotes(
+    ledger: &SessionLedger,
+    enabled: impl Fn(ExtensionType) -> bool,
+    time_range: TimeRange,
+    sink: &mut impl CompactSink,
+) {
+    let cutoff = cutoff_string(time_range);
+    for provider in crate::ledger::ALL_PROVIDERS {
+        if !enabled(provider) {
+            continue;
+        }
+        for entry in ledger.remote_sessions(provider) {
+            fold_days(provider, &entry.days, cutoff.as_deref(), sink);
+        }
+    }
+}
+
 /// Parses one session log in `UsageOnly` mode into its ledger entry, stamped
 /// with `stamp` and the read's verdict.
 ///

@@ -15,7 +15,10 @@ use vct_core::analysis::aggregator::{
     AnalysisCollection, aggregate_sessions_by_model_from_paths_with_cache,
 };
 use vct_core::config::ProvidersConfig;
-use vct_core::ledger::{LEDGER_DIR_NAME, SessionLedger, provider_path};
+use vct_core::ledger::{
+    EXPORT_LINE_PREFIX, LEDGER_DIR_NAME, REMOTES_DIR_NAME, SessionLedger, provider_path,
+    prune_remotes, remote_dir, store_export,
+};
 use vct_core::models::ExtensionType;
 use vct_core::usage::aggregator::{UsageCollection, aggregate_usage_from_paths_with_cache};
 use vct_test_support::{TempHome, fixture_str};
@@ -639,4 +642,260 @@ fn an_antigravity_conversation_database_change_rereads_its_transcript() {
     assert_eq!(ledger.stats().parsed_sources, 1);
     let models: Vec<&String> = rescan.data.per_provider.antigravity.keys().collect();
     assert_eq!(models, ["unknown"]);
+}
+
+// ============================================================================
+// Remote snapshots
+// ============================================================================
+
+const MODEL: &str = "claude-sonnet-4-20250514";
+
+/// What `vct ledger export` prints for `home`.
+fn export_of(home: &TempHome) -> String {
+    let mut ledger = open(home);
+    usage(
+        home,
+        TimeRange::All,
+        ProvidersConfig::default(),
+        &mut ledger,
+    );
+    analysis(
+        home,
+        TimeRange::All,
+        ProvidersConfig::default(),
+        &mut ledger,
+    );
+    let mut line = Vec::new();
+    ledger.write_export(&mut line).expect("write export");
+    String::from_utf8(line).expect("export is UTF-8")
+}
+
+/// Stores `remote`'s export as the snapshot `name` under `local`.
+fn fetch_into(local: &TempHome, name: &str, remote: &TempHome) {
+    store_export(&local.paths.cache_dir, name, &export_of(remote)).expect("store export");
+}
+
+fn claude_home() -> (TempHome, std::path::PathBuf) {
+    let home = TempHome::new();
+    let log = home.put_claude_session(
+        "proj",
+        "session.jsonl",
+        &fixture_str("sessions/claude_code.jsonl"),
+    );
+    (home, log)
+}
+
+fn input_tokens(collection: &UsageCollection) -> Option<u64> {
+    collection.data.per_provider.claude.get(MODEL)?["input_tokens"].as_u64()
+}
+
+#[test]
+fn a_remote_snapshot_is_folded_into_usage_and_analysis_and_never_saved_locally() {
+    let (remote, _) = claude_home();
+    let local = TempHome::new();
+    fetch_into(&local, "devbox", &remote);
+
+    let mut ledger = open(&local);
+    let merged = usage(
+        &local,
+        TimeRange::All,
+        ProvidersConfig::default(),
+        &mut ledger,
+    );
+    assert!(input_tokens(&merged).is_some_and(|tokens| tokens > 0));
+    assert_eq!(merged.data.provider_days.claude, 1);
+    assert_eq!(merged.diagnostics, Default::default());
+
+    let rows = analysis(
+        &local,
+        TimeRange::All,
+        ProvidersConfig::default(),
+        &mut ledger,
+    );
+    assert_eq!(rows.data.per_provider.claude.len(), 1);
+    assert!(rows.data.rows[0].edit_lines > 0);
+
+    ledger.save().unwrap();
+    assert!(
+        !provider_path(
+            &local.paths.cache_dir.join(LEDGER_DIR_NAME),
+            ExtensionType::ClaudeCode
+        )
+        .exists()
+    );
+}
+
+#[test]
+fn a_session_two_machines_both_hold_counts_once() {
+    let (remote, _) = claude_home();
+    let (local, _) = claude_home();
+    let mut ledger = open(&local);
+    let alone = usage(
+        &local,
+        TimeRange::All,
+        ProvidersConfig::default(),
+        &mut ledger,
+    );
+
+    fetch_into(&local, "devbox", &remote);
+    fetch_into(&local, "laptop", &remote);
+    let merged = usage(
+        &local,
+        TimeRange::All,
+        ProvidersConfig::default(),
+        &mut ledger,
+    );
+    assert_eq!(input_tokens(&merged), input_tokens(&alone));
+
+    // A session only the remotes hold counts once however many of them do.
+    let empty = TempHome::new();
+    fetch_into(&empty, "devbox", &remote);
+    fetch_into(&empty, "laptop", &remote);
+    let remote_only = usage(
+        &empty,
+        TimeRange::All,
+        ProvidersConfig::default(),
+        &mut open(&empty),
+    );
+    assert_eq!(input_tokens(&remote_only), input_tokens(&alone));
+}
+
+#[test]
+fn a_disabled_provider_and_a_day_out_of_range_fold_no_remote_session() {
+    let (remote, log) = claude_home();
+    set_modified(&log, years_ago(2));
+    let local = TempHome::new();
+    fetch_into(&local, "devbox", &remote);
+    let mut ledger = open(&local);
+
+    let all = usage(
+        &local,
+        TimeRange::All,
+        ProvidersConfig::default(),
+        &mut ledger,
+    );
+    assert!(input_tokens(&all).is_some());
+    let daily = usage(
+        &local,
+        TimeRange::Daily,
+        ProvidersConfig::default(),
+        &mut ledger,
+    );
+    assert!(input_tokens(&daily).is_none());
+    let codex_only = usage(
+        &local,
+        TimeRange::All,
+        only(ExtensionType::Codex),
+        &mut ledger,
+    );
+    assert!(input_tokens(&codex_only).is_none());
+    let no_claude_rows = analysis(
+        &local,
+        TimeRange::All,
+        only(ExtensionType::Codex),
+        &mut ledger,
+    );
+    assert!(no_claude_rows.data.rows.is_empty());
+}
+
+#[test]
+fn an_open_ledger_follows_snapshots_arriving_changing_and_leaving() {
+    let (remote, _) = claude_home();
+    let local = TempHome::new();
+    let providers = ProvidersConfig::default();
+    let mut ledger = open(&local);
+    assert!(input_tokens(&usage(&local, TimeRange::All, providers, &mut ledger)).is_none());
+
+    fetch_into(&local, "devbox", &remote);
+    let first = input_tokens(&usage(&local, TimeRange::All, providers, &mut ledger));
+    assert!(first.is_some());
+
+    remote.put_claude_session(
+        "proj",
+        "second.jsonl",
+        &fixture_str("sessions/claude_code.jsonl"),
+    );
+    fetch_into(&local, "devbox", &remote);
+    let second = input_tokens(&usage(&local, TimeRange::All, providers, &mut ledger));
+    assert_eq!(second, first.map(|tokens| tokens * 2));
+
+    prune_remotes(&local.paths.cache_dir, &[]);
+    assert!(input_tokens(&usage(&local, TimeRange::All, providers, &mut ledger)).is_none());
+}
+
+#[test]
+fn an_export_carries_days_only_and_none_of_the_machines_own_remotes() {
+    let (remote, _) = claude_home();
+    let export = export_of(&remote);
+    assert!(export.starts_with(EXPORT_LINE_PREFIX));
+    assert_eq!(export.trim_end().lines().count(), 1);
+    for private in ["\"cwd\"", "\"git_remote\"", "\"scanned\"", "\"files\""] {
+        assert!(!export.contains(private), "export leaks {private}");
+    }
+    // The session key spells out the project directory, so it travels hashed.
+    assert!(!export.contains("proj") && !export.contains("session.jsonl"));
+    let value: serde_json::Value = serde_json::from_str(&export).unwrap();
+    let sessions = value["providers"]["claude"]["sessions"]
+        .as_object()
+        .unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert!(sessions.values().all(|session| session["days"].is_object()));
+    assert_eq!(value["providers"].as_object().unwrap().len(), 10);
+
+    let relay = TempHome::new();
+    fetch_into(&relay, "devbox", &remote);
+    let relayed: serde_json::Value = serde_json::from_str(&export_of(&relay)).unwrap();
+    assert_eq!(
+        relayed["providers"]["claude"]["sessions"],
+        serde_json::json!({})
+    );
+}
+
+#[test]
+fn storing_an_export_rejects_what_it_cannot_read_and_keeps_the_previous_snapshot() {
+    let (remote, _) = claude_home();
+    let local = TempHome::new();
+    let cache = &local.paths.cache_dir;
+    fetch_into(&local, "devbox", &remote);
+    let snapshot = provider_path(
+        &remote_dir(cache, "devbox").join(LEDGER_DIR_NAME),
+        ExtensionType::ClaudeCode,
+    );
+    let stored = std::fs::read_to_string(&snapshot).unwrap();
+
+    let no_line = store_export(cache, "devbox", "Welcome\nbash: vct: command not found\n");
+    assert!(
+        no_line
+            .unwrap_err()
+            .to_string()
+            .contains("printed no ledger export")
+    );
+    let newer = store_export(
+        cache,
+        "devbox",
+        "{\"vct_ledger_export\":2,\"providers\":{}}\n",
+    );
+    assert!(newer.unwrap_err().to_string().contains("version 2"));
+
+    // A provider written in another ledger layout is skipped, not an error.
+    let other_layout = "{\"vct_ledger_export\":1,\"providers\":{\"claude\":{\"schema_version\":99,\"provider\":\"claude\",\"sessions\":{}}}}";
+    store_export(cache, "devbox", other_layout).unwrap();
+    assert_eq!(std::fs::read_to_string(&snapshot).unwrap(), stored);
+}
+
+#[test]
+fn pruning_removes_only_the_snapshots_of_unconfigured_remotes() {
+    let (remote, _) = claude_home();
+    let local = TempHome::new();
+    let cache = &local.paths.cache_dir;
+    fetch_into(&local, "devbox", &remote);
+    fetch_into(&local, "gone", &remote);
+    let stray_file = cache.join(REMOTES_DIR_NAME).join("notes.txt");
+    std::fs::write(&stray_file, "kept").unwrap();
+
+    prune_remotes(cache, &["devbox".to_string()]);
+
+    assert!(remote_dir(cache, "devbox").exists());
+    assert!(!remote_dir(cache, "gone").exists());
+    assert!(stray_file.exists());
 }
