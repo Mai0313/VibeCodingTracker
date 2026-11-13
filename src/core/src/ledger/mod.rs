@@ -8,7 +8,8 @@
 //! session whose source is gone keeps its entry and keeps contributing, which
 //! is what makes an `--all` total survive the assistants pruning their own
 //! history. vct never deletes a ledger file: an unreadable one is set aside
-//! under a new name and a newer one is left alone.
+//! under a new name and a newer one is left alone. The one thing it removes
+//! from the directory is the temp file of a save that was killed mid-write.
 //!
 //! `analysis --json` and `analysis FILE` are full-parse paths that never touch
 //! the ledger, so retained sessions appear in every view but those two.
@@ -19,6 +20,7 @@ pub(crate) mod stamp;
 
 use crate::constants::{FastHashMap, FastHashSet};
 use crate::models::ExtensionType;
+use crate::utils::file::ATOMIC_TEMP_PREFIX;
 use crate::utils::{now_rfc3339_utc_nanos, write_json_atomic_pretty};
 use anyhow::Result;
 pub(crate) use format::{
@@ -31,6 +33,11 @@ use std::time::{Duration, Instant};
 
 /// The directory under `~/.vct` that holds the per-provider ledger files.
 pub const LEDGER_DIR_NAME: &str = "sessions";
+
+/// How old a temp file in the ledger directory must be to count as abandoned.
+///
+/// A save takes seconds, so anything this old belongs to no running process.
+const STALE_TEMP_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// Observable ledger statistics used by tests and diagnostic logging.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -85,6 +92,7 @@ impl SessionLedger {
     /// is left exactly as it is and that provider is never written back.
     pub fn open(cache_dir: &Path) -> Self {
         let dir = cache_dir.join(LEDGER_DIR_NAME);
+        remove_stale_temp_files(&dir);
         let mut providers = FastHashMap::default();
         for provider in ALL_PROVIDERS {
             providers.insert(provider, load_provider(&provider_path(&dir, provider)));
@@ -354,6 +362,37 @@ fn adopt_unseen_sessions(path: &Path, sessions: &mut BTreeMap<String, SessionEnt
     }
 }
 
+/// Removes the temp files that saves killed mid-write left in `dir`.
+///
+/// A killed process cannot clean up after itself, and each leftover is as
+/// large as the provider ledger it was about to replace.
+fn remove_stale_temp_files(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(ATOMIC_TEMP_PREFIX)
+        {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= STALE_TEMP_AGE);
+        if stale && let Err(error) = std::fs::remove_file(entry.path()) {
+            log::warn!(
+                "cannot remove stale ledger temp file {}: {error}",
+                entry.path().display()
+            );
+        }
+    }
+}
+
 fn load_provider(path: &Path) -> ProviderLedger {
     let body = match std::fs::read(path) {
         Ok(body) => body,
@@ -456,6 +495,34 @@ mod tests {
         day.active.analysis = true;
         entry.days.insert(date.to_string(), day);
         entry
+    }
+
+    #[test]
+    fn open_removes_only_stale_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join(LEDGER_DIR_NAME);
+        std::fs::create_dir_all(&sessions).unwrap();
+        let stale = sessions.join(".tmpStale1");
+        let fresh = sessions.join(".tmpFresh1");
+        let ledger_file = sessions.join("kept.json");
+        let old = std::time::SystemTime::now() - STALE_TEMP_AGE;
+        for path in [&stale, &fresh, &ledger_file] {
+            std::fs::write(path, "{").unwrap();
+        }
+        for path in [&stale, &ledger_file] {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+
+        SessionLedger::open(dir.path());
+
+        assert!(!stale.exists());
+        assert!(fresh.exists());
+        assert!(ledger_file.exists());
     }
 
     #[test]

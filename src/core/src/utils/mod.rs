@@ -27,7 +27,7 @@ pub use directory::{
     is_copilot_session_file, is_dsh_session_file, is_gemini_session_file, is_grok_session_file,
 };
 pub use file::{
-    count_lines, read_json, read_jsonl, save_json_pretty, write_json_atomic,
+    count_lines, finish_atomic_writes, read_json, read_jsonl, save_json_pretty, write_json_atomic,
     write_json_atomic_pretty, write_string_atomic,
 };
 pub use format::{
