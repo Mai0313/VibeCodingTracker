@@ -277,7 +277,7 @@ pub enum ExtensionType {
     Grok,
     /// DeepSeek Harness (`dsh`).
     DeepSeek,
-    /// Google Antigravity: the `agy` CLI, the Desktop app and the internal build.
+    /// Google Antigravity: the `agy` CLI, the Desktop app and other builds.
     Antigravity,
 }
 

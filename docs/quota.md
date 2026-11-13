@@ -239,7 +239,7 @@ Older builds lack that RPC; the legacy fallbacks are 5h-only and take the same b
 
 ### Refresh token
 
-vct does not run this recipe: its Antigravity panel and `vct quota antigravity` run `agy -p /usage --output-format json` (Google's internal Antigravity build answers the same command with the same JSON), and agy refreshes an expired token in place before answering (seen with agy 1.5.5), so vct needs neither the refresh token nor the client secret below.
+vct does not run this recipe: its Antigravity panel and `vct quota antigravity` run `agy -p /usage --output-format json`, and agy refreshes an expired token in place before answering (seen with agy 1.5.5), so vct needs neither the refresh token nor the client secret below.
 
 ```bash
 CRED=~/.gemini/antigravity-cli/antigravity-oauth-token

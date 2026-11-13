@@ -543,7 +543,7 @@ fn cached_analysis_matches_uncached_and_reuses_unchanged_sources() {
     home.put_dsh_fixture_session("dsh-project", "dsh-session");
     // Two of Antigravity's three roots, so both are walked and kept apart.
     home.put_antigravity_fixture_session("antigravity-cli", "agy-conversation");
-    home.put_antigravity_fixture_session("jetski", "internal-conversation");
+    home.put_antigravity_fixture_session("jetski", "other-conversation");
     seed_opencode_tie_breaker_db(&home.paths.opencode_db);
     home.put_cursor_session(
         "cursor-project",

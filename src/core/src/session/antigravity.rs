@@ -1,6 +1,6 @@
 //! Antigravity conversation transcript parser.
 //!
-//! Antigravity CLI (`agy`), Antigravity Desktop and the internal build keep one directory
+//! Antigravity CLI (`agy`), Antigravity Desktop and other builds keep one directory
 //! per conversation under `<root>/brain/<conversation-id>/`, whose
 //! `.system_generated/logs/transcript_full.jsonl` is the conversation's step
 //! log. The model that served each generation is not in that log: it lives in
@@ -234,7 +234,7 @@ fn decode_generation(data: &[u8]) -> Option<(Option<i64>, String)> {
     Some((step, model))
 }
 
-/// The internal build records `<config name>|<backend>`. A backend in Vertex's
+/// Some builds record `<config name>|<backend>`. A backend in Vertex's
 /// `<model>@<version>` form is a published model id, so it names the model;
 /// any other backend is a serving path, leaving the config name.
 fn model_name(id: &str) -> String {
@@ -707,7 +707,7 @@ mod tests {
     }
 
     #[test]
-    fn an_internal_build_model_id_is_named_by_its_model_not_its_backend() {
+    fn a_model_id_with_a_backend_is_named_by_its_model_not_its_backend() {
         assert_eq!(
             model_name("opus-5.5-high|claude-opus-5-5@default"),
             "claude-opus-5-5"

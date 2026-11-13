@@ -3650,7 +3650,7 @@ mod tests {
         );
     }
 
-    /// The internal build's six pools outgrow the Quota tab's usual card, which grows to hold
+    /// Six pools outgrow the Quota tab's usual card, which grows to hold
     /// them while the terminal has the rows and keeps its height when it does
     /// not, flagging the rest.
     #[test]
