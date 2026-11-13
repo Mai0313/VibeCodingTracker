@@ -1,41 +1,32 @@
-//! Auto-refreshing TUI for the usage view.
+//! The Usage tab, and the quota workers and cards it shares with the Quota tab.
 //!
-//! Runs a render loop that incrementally re-aggregates the session directories
-//! every `refresh_secs` seconds (from `config.toml`), reusing one pricing map
-//! for the current UTC day and highlighting rows whose tokens changed since
-//! the last tick. The loop holds only the small per-model display state
-//! between frames so a resize repaints instantly without re-aggregating; memory
-//! is trimmed back to the OS after each refresh.
+//! [`UsageScanner`] re-aggregates the session directories, reusing one pricing
+//! map for the current UTC day; [`UsageUiState`] holds only the small per-model
+//! display state between frames, so a resize repaints without re-aggregating,
+//! and highlights rows whose tokens changed since the last scan.
 
 use crate::display::common::ProviderTotal;
 use crate::display::common::table::{
     ColumnSpec, FOOTER_H, TableChrome, create_controls_with_status, create_provider_row,
-    create_ratatui_table, create_summary, fit_columns, frame_layout, init_process_metrics,
-    refresh_process_metrics, render_scrollable_table, render_too_small, styled_row,
+    create_ratatui_table, fit_columns, frame_layout, render_scrollable_table, render_too_small,
+    styled_row,
 };
-use crate::display::common::tui::{
-    InputAction, LEDGER_SAVE_INTERVAL, RefreshWorker, RefreshWorkerError, ScrollState,
-    TerminalSession, UpdateTracker, handle_input, overlay_repo_hyperlink, refresh_status,
-    render_loading_frame,
-};
+use crate::display::common::tui::{LEDGER_SAVE_INTERVAL, NavDelta, ScrollState, UpdateTracker};
 use crate::display::usage::averages::{
     ProviderStats, UsageProviderTotals, UsageRow, UsageTotals, build_provider_total_rows,
     build_usage_summary, merge_rows_by_base_model,
 };
 use ratatui::{
     Frame, Terminal,
-    backend::{Backend, CrosstermBackend, TestBackend},
+    backend::{Backend, TestBackend},
     layout::{Constraint, Direction, Layout as RatatuiLayout, Rect},
     style::{Color as RatatuiColor, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Row as RatatuiRow},
 };
 use std::collections::HashMap;
-use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-use sysinfo::{Pid, System};
 use vct_core::config::ProvidersConfig;
 use vct_core::ledger::SessionLedger;
 use vct_core::models::{
@@ -51,7 +42,6 @@ use vct_core::quota::{
     save_antigravity_cache, save_claude_cache, save_codex_cache, save_copilot_cache,
     save_cursor_cache, save_grok_cache, spawn_quota_worker,
 };
-use vct_core::scan::build_scan_pool;
 use vct_core::utils::{
     format_compact, format_cost, format_cost_compact, format_duration_until,
     get_claude_credentials_path, get_copilot_config_path, get_cursor_auth_path, get_grok_auth_path,
@@ -61,14 +51,14 @@ use vct_core::utils::{
 /// How wide and tall the cards in one grid are.
 ///
 /// The placement formula is shared; only these numbers differ between the
-/// always-on grid under the table and the full-screen `Q` overlay.
-pub(super) struct GridSpec {
+/// grid under the usage table and the Quota tab's.
+pub(crate) struct GridSpec {
     /// Narrowest a card may be, and the divisor that decides the column count.
-    pub(super) min_w: u16,
+    pub(crate) min_w: u16,
     /// Widest a card grows to; past this the grid centers its slack instead.
-    pub(super) max_w: u16,
+    pub(crate) max_w: u16,
     /// Card height, borders included.
-    pub(super) height: u16,
+    pub(crate) height: u16,
 }
 
 /// The always-on grid under the model table.
@@ -83,13 +73,6 @@ const CARD_GRID: GridSpec = GridSpec {
     height: 7,
 };
 
-/// The `Q` overlay grid: wider and taller, so every provider shows every line
-/// no matter how narrow the terminal made the always-on cards.
-const OVERLAY_GRID: GridSpec = GridSpec {
-    min_w: 34,
-    max_w: 46,
-    height: 9,
-};
 /// Claude brand color for the quota panel border.
 const CLAUDE_COLOR: RatatuiColor = RatatuiColor::Rgb(190, 116, 87);
 /// Codex brand color for the quota panel border.
@@ -139,13 +122,13 @@ const ANTIGRAVITY_LABEL_W: u16 = 9;
 
 /// Which provider quota panels have credentials on this machine.
 #[derive(Clone, Copy, Default)]
-pub(super) struct QuotaPresence {
-    pub(super) claude: bool,
-    pub(super) codex: bool,
-    pub(super) copilot: bool,
-    pub(super) cursor: bool,
-    pub(super) grok: bool,
-    pub(super) antigravity: bool,
+pub(crate) struct QuotaPresence {
+    pub(crate) claude: bool,
+    pub(crate) codex: bool,
+    pub(crate) copilot: bool,
+    pub(crate) cursor: bool,
+    pub(crate) grok: bool,
+    pub(crate) antigravity: bool,
 }
 
 impl QuotaPresence {
@@ -190,23 +173,21 @@ impl QuotaPresence {
 }
 
 /// Borrowed quota state passed to the render frame.
-pub(super) struct QuotaView<'a> {
-    pub(super) claude: &'a ClaudeQuotaSnapshot,
-    pub(super) codex: &'a CodexQuotaSnapshot,
-    pub(super) copilot: &'a CopilotQuotaSnapshot,
-    pub(super) cursor: &'a CursorQuotaSnapshot,
-    pub(super) grok: &'a GrokQuotaSnapshot,
-    pub(super) antigravity: &'a AntigravityQuotaSnapshot,
-    pub(super) present: QuotaPresence,
+pub(crate) struct QuotaView<'a> {
+    pub(crate) claude: &'a ClaudeQuotaSnapshot,
+    pub(crate) codex: &'a CodexQuotaSnapshot,
+    pub(crate) copilot: &'a CopilotQuotaSnapshot,
+    pub(crate) cursor: &'a CursorQuotaSnapshot,
+    pub(crate) grok: &'a GrokQuotaSnapshot,
+    pub(crate) antigravity: &'a AntigravityQuotaSnapshot,
+    pub(crate) present: QuotaPresence,
     /// Whether the quota surface is shown at all. `false` when
     /// `usage.quota.panels` is empty, which drops the card grid and its digest.
     /// It does not touch the Provider Usage line: that is local scan data, not
     /// a quota panel.
-    pub(super) band_enabled: bool,
+    pub(crate) band_enabled: bool,
     /// Whether the Provider Usage detail panel is open (`p`).
-    pub(super) provider_panel_open: bool,
-    /// Whether the full-detail quota overlay is open (`Q`).
-    pub(super) overlay_open: bool,
+    pub(crate) provider_panel_open: bool,
 }
 
 /// Upper bound on rows the [`UpdateTracker`] remembers for change highlighting.
@@ -216,7 +197,7 @@ const MAX_TRACKED_ROWS: usize = 100;
 const USAGE_MIN_W: u16 = 74;
 const USAGE_MIN_H: u16 = 14;
 
-struct UsageRefreshPayload {
+pub(crate) struct UsageRefreshPayload {
     rows: Vec<UsageRow>,
     merged_rows: Vec<UsageRow>,
     totals: UsageTotals,
@@ -233,20 +214,20 @@ impl Drop for QuotaShutdownGuard {
     }
 }
 
-pub(super) struct QuotaRuntime {
-    pub(super) present: QuotaPresence,
-    pub(super) band_enabled: bool,
-    pub(super) claude: Arc<Mutex<ClaudeQuotaSnapshot>>,
-    pub(super) codex: Arc<Mutex<CodexQuotaSnapshot>>,
-    pub(super) copilot: Arc<Mutex<CopilotQuotaSnapshot>>,
-    pub(super) cursor: Arc<Mutex<CursorQuotaSnapshot>>,
-    pub(super) grok: Arc<Mutex<GrokQuotaSnapshot>>,
-    pub(super) antigravity: Arc<Mutex<AntigravityQuotaSnapshot>>,
+pub(crate) struct QuotaRuntime {
+    pub(crate) present: QuotaPresence,
+    pub(crate) band_enabled: bool,
+    pub(crate) claude: Arc<Mutex<ClaudeQuotaSnapshot>>,
+    pub(crate) codex: Arc<Mutex<CodexQuotaSnapshot>>,
+    pub(crate) copilot: Arc<Mutex<CopilotQuotaSnapshot>>,
+    pub(crate) cursor: Arc<Mutex<CursorQuotaSnapshot>>,
+    pub(crate) grok: Arc<Mutex<GrokQuotaSnapshot>>,
+    pub(crate) antigravity: Arc<Mutex<AntigravityQuotaSnapshot>>,
     _guard: QuotaShutdownGuard,
 }
 
 impl QuotaRuntime {
-    pub(super) fn start(
+    pub(crate) fn start(
         quota_panels: &[String],
         providers: ProvidersConfig,
         quota_refresh_secs: u64,
@@ -422,16 +403,69 @@ impl QuotaRuntime {
     }
 }
 
-struct UsageUiState {
-    rows: Vec<UsageRow>,
-    merged_rows: Vec<UsageRow>,
-    totals: UsageTotals,
-    provider_totals: UsageProviderTotals,
-    update_tracker: UpdateTracker,
-    scroll: ScrollState,
-    merge_enabled: bool,
-    provider_panel_open: bool,
-    overlay_open: bool,
+/// Which column the usage table is ordered by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum UsageSort {
+    #[default]
+    Cost,
+    Total,
+    Input,
+    Output,
+    CacheRead,
+    CacheWrite,
+    Model,
+}
+
+impl UsageSort {
+    /// The column after this one, wrapping around.
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::Cost => Self::Total,
+            Self::Total => Self::Input,
+            Self::Input => Self::Output,
+            Self::Output => Self::CacheRead,
+            Self::CacheRead => Self::CacheWrite,
+            Self::CacheWrite => Self::Model,
+            Self::Model => Self::Cost,
+        }
+    }
+
+    /// What the table title shows: numbers run largest first, names A to Z.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cost => "cost ▼",
+            Self::Total => "total ▼",
+            Self::Input => "input ▼",
+            Self::Output => "output ▼",
+            Self::CacheRead => "cache read ▼",
+            Self::CacheWrite => "cache write ▼",
+            Self::Model => "model ▲",
+        }
+    }
+
+    /// Orders `rows` by this column, model name breaking ties.
+    fn apply(self, rows: &mut [UsageRow]) {
+        rows.sort_by(|a, b| {
+            let primary = match self {
+                Self::Cost => b
+                    .cost
+                    .partial_cmp(&a.cost)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+                Self::Total => b.total.cmp(&a.total),
+                Self::Input => b.input_tokens.cmp(&a.input_tokens),
+                Self::Output => b.output_with_reasoning().cmp(&a.output_with_reasoning()),
+                Self::CacheRead => b.cache_read.cmp(&a.cache_read),
+                Self::CacheWrite => b.cache_creation.cmp(&a.cache_creation),
+                Self::Model => a.display_model.cmp(&b.display_model),
+            };
+            primary.then_with(|| a.model.cmp(&b.model))
+        });
+    }
+}
+
+/// A copy of every quota worker's latest snapshot, taken once per frame.
+#[derive(Default)]
+pub(crate) struct QuotaSnapshots {
     claude: ClaudeQuotaSnapshot,
     codex: CodexQuotaSnapshot,
     copilot: CopilotQuotaSnapshot,
@@ -440,127 +474,25 @@ struct UsageUiState {
     antigravity: AntigravityQuotaSnapshot,
 }
 
-impl UsageUiState {
-    fn new(merge_enabled: bool) -> Self {
+impl QuotaSnapshots {
+    /// Copies the current snapshots out of `runtime`.
+    pub(crate) fn read(runtime: &QuotaRuntime) -> Self {
+        fn copy<T: Clone + Default>(shared: &Mutex<T>) -> T {
+            shared.lock().map(|value| value.clone()).unwrap_or_default()
+        }
         Self {
-            rows: Vec::new(),
-            merged_rows: Vec::new(),
-            totals: UsageTotals::default(),
-            provider_totals: UsageProviderTotals::default(),
-            update_tracker: UpdateTracker::new(MAX_TRACKED_ROWS, 1000),
-            scroll: ScrollState::new(),
-            merge_enabled,
-            provider_panel_open: false,
-            overlay_open: false,
-            claude: ClaudeQuotaSnapshot::default(),
-            codex: CodexQuotaSnapshot::default(),
-            copilot: CopilotQuotaSnapshot::default(),
-            cursor: CursorQuotaSnapshot::default(),
-            grok: GrokQuotaSnapshot::default(),
-            antigravity: AntigravityQuotaSnapshot::default(),
+            claude: copy(&runtime.claude),
+            codex: copy(&runtime.codex),
+            copilot: copy(&runtime.copilot),
+            cursor: copy(&runtime.cursor),
+            grok: copy(&runtime.grok),
+            antigravity: copy(&runtime.antigravity),
         }
     }
 
-    fn view(&self) -> &[UsageRow] {
-        current_view(self.merge_enabled, &self.rows, &self.merged_rows)
-    }
-
-    fn apply(&mut self, payload: UsageRefreshPayload) {
-        let previous = self
-            .scroll
-            .table
-            .selected()
-            .and_then(|index| self.view().get(index))
-            .map(|row| row.model.clone());
-        self.rows = payload.rows;
-        self.merged_rows = payload.merged_rows;
-        self.totals = payload.totals;
-        self.provider_totals = payload.provider_totals;
-
-        let fingerprints: Vec<_> = self
-            .view()
-            .iter()
-            .map(|row| (row.model.clone(), row_fingerprint(row)))
-            .collect();
-        let models: Vec<_> = fingerprints
-            .iter()
-            .map(|(model, _)| model.clone())
-            .collect();
-        self.scroll.sync(previous.as_deref(), &models);
-        self.update_tracker.cleanup(models);
-        for (model, fingerprint) in fingerprints {
-            self.update_tracker.track_update(model, &fingerprint);
-        }
-    }
-
-    fn toggle_merge(&mut self) {
-        let previous = self
-            .scroll
-            .table
-            .selected()
-            .and_then(|index| self.view().get(index))
-            .map(|row| row.model.clone());
-        self.merge_enabled = !self.merge_enabled;
-        let _ = vct_core::config::save_merge_models(self.merge_enabled);
-        let fingerprints: Vec<_> = self
-            .view()
-            .iter()
-            .map(|row| (row.model.clone(), row_fingerprint(row)))
-            .collect();
-        let models: Vec<_> = fingerprints
-            .iter()
-            .map(|(model, _)| model.clone())
-            .collect();
-        self.scroll.sync(previous.as_deref(), &models);
-        self.update_tracker.cleanup(models);
-        for (model, fingerprint) in fingerprints {
-            self.update_tracker.prime(model, &fingerprint);
-        }
-    }
-
-    fn refresh_quota(&mut self, runtime: &QuotaRuntime) {
-        self.claude = runtime
-            .claude
-            .lock()
-            .map(|value| value.clone())
-            .unwrap_or_default();
-        self.codex = runtime
-            .codex
-            .lock()
-            .map(|value| value.clone())
-            .unwrap_or_default();
-        self.copilot = runtime
-            .copilot
-            .lock()
-            .map(|value| value.clone())
-            .unwrap_or_default();
-        self.cursor = runtime
-            .cursor
-            .lock()
-            .map(|value| value.clone())
-            .unwrap_or_default();
-        self.grok = runtime
-            .grok
-            .lock()
-            .map(|value| value.clone())
-            .unwrap_or_default();
-        self.antigravity = runtime
-            .antigravity
-            .lock()
-            .map(|value| value.clone())
-            .unwrap_or_default();
-    }
-
-    fn render(
-        &mut self,
-        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-        sys: &System,
-        pid: Pid,
-        runtime: &QuotaRuntime,
-        status: Option<&str>,
-    ) -> anyhow::Result<()> {
-        self.refresh_quota(runtime);
-        let quota = QuotaView {
+    /// Borrows the snapshots as the view the renderers take.
+    pub(crate) fn view(&self, runtime: &QuotaRuntime, provider_panel_open: bool) -> QuotaView<'_> {
+        QuotaView {
             claude: &self.claude,
             codex: &self.codex,
             copilot: &self.copilot,
@@ -569,344 +501,248 @@ impl UsageUiState {
             antigravity: &self.antigravity,
             present: runtime.present,
             band_enabled: runtime.band_enabled,
-            provider_panel_open: self.provider_panel_open,
-            overlay_open: self.overlay_open,
-        };
+            provider_panel_open,
+        }
+    }
+}
+
+/// What the usage tab keeps between frames.
+pub(crate) struct UsageUiState {
+    rows: Vec<UsageRow>,
+    merged_rows: Vec<UsageRow>,
+    totals: UsageTotals,
+    provider_totals: UsageProviderTotals,
+    update_tracker: UpdateTracker,
+    scroll: ScrollState,
+    merge_enabled: bool,
+    sort: UsageSort,
+    /// Whether the Provider Usage panel is open (`p`).
+    pub(crate) provider_panel_open: bool,
+}
+
+impl UsageUiState {
+    pub(crate) fn new(merge_enabled: bool) -> Self {
+        Self {
+            rows: Vec::new(),
+            merged_rows: Vec::new(),
+            totals: UsageTotals::default(),
+            provider_totals: UsageProviderTotals::default(),
+            update_tracker: UpdateTracker::new(MAX_TRACKED_ROWS, 1000),
+            scroll: ScrollState::new(),
+            merge_enabled,
+            sort: UsageSort::default(),
+            provider_panel_open: false,
+        }
+    }
+
+    fn view(&self) -> &[UsageRow] {
+        current_view(self.merge_enabled, &self.rows, &self.merged_rows)
+    }
+
+    fn selected_model(&self) -> Option<String> {
+        self.scroll
+            .table
+            .selected()
+            .and_then(|index| self.view().get(index))
+            .map(|row| row.model.clone())
+    }
+
+    /// Re-finds the selection among the rows now shown. `changed` says whether
+    /// the rows carry new numbers (a refresh) or only moved (a toggle), which
+    /// decides whether a difference flashes.
+    fn resync(&mut self, previous: Option<String>, changed: bool) {
+        let fingerprints: Vec<_> = self
+            .view()
+            .iter()
+            .map(|row| (row.model.clone(), row_fingerprint(row)))
+            .collect();
+        let models: Vec<_> = fingerprints
+            .iter()
+            .map(|(model, _)| model.clone())
+            .collect();
+        self.scroll.sync(previous.as_deref(), &models);
+        self.update_tracker.cleanup(models);
+        for (model, fingerprint) in fingerprints {
+            if changed {
+                self.update_tracker.track_update(model, &fingerprint);
+            } else {
+                self.update_tracker.prime(model, &fingerprint);
+            }
+        }
+    }
+
+    /// Takes in a finished scan.
+    pub(crate) fn apply(&mut self, payload: UsageRefreshPayload) {
+        let previous = self.selected_model();
+        self.rows = payload.rows;
+        self.merged_rows = payload.merged_rows;
+        self.totals = payload.totals;
+        self.provider_totals = payload.provider_totals;
+        self.sort.apply(&mut self.rows);
+        self.sort.apply(&mut self.merged_rows);
+        self.resync(previous, true);
+    }
+
+    /// Flips provider-prefix merging (`m`) and saves the choice.
+    pub(crate) fn toggle_merge(&mut self) {
+        let previous = self.selected_model();
+        self.merge_enabled = !self.merge_enabled;
+        let _ = vct_core::config::save_merge_models(self.merge_enabled);
+        self.resync(previous, false);
+    }
+
+    /// Whether provider prefixes are merged.
+    pub(crate) fn merge_enabled(&self) -> bool {
+        self.merge_enabled
+    }
+
+    /// Sets provider-prefix merging without saving it.
+    pub(crate) fn set_merge(&mut self, enabled: bool) {
+        if enabled != self.merge_enabled {
+            let previous = self.selected_model();
+            self.merge_enabled = enabled;
+            self.resync(previous, false);
+        }
+    }
+
+    /// Moves on to the next sort column (`o`).
+    pub(crate) fn cycle_sort(&mut self) {
+        let previous = self.selected_model();
+        self.sort = self.sort.next();
+        self.sort.apply(&mut self.rows);
+        self.sort.apply(&mut self.merged_rows);
+        self.resync(previous, false);
+    }
+
+    /// Moves the selection.
+    pub(crate) fn navigate(&mut self, delta: NavDelta) {
+        let rows = self.view().len();
+        self.scroll.apply(delta, rows);
+    }
+
+    /// Draws the tab into `area`.
+    pub(crate) fn draw(
+        &mut self,
+        f: &mut Frame,
+        area: Rect,
+        quota: &QuotaView,
+        status: Option<&str>,
+    ) {
         let rows = current_view(self.merge_enabled, &self.rows, &self.merged_rows);
-        render_usage_frame_with_status(
-            terminal,
+        draw_usage_view(
+            f,
+            area,
             rows,
             &self.totals,
             &self.provider_totals,
             &self.update_tracker,
-            sys,
-            pid,
-            &quota,
+            quota,
             &mut self.scroll,
             self.merge_enabled,
+            self.sort,
             status,
-            true,
-        )
+        );
     }
 }
 
-/// Displays usage with a dedicated scan pool supplied by the CLI.
-///
-/// Every scan runs inside `scan_pool`; the argument, error and panic contract is
-/// otherwise [`display_usage_interactive`]'s, which wraps this with a pool of
-/// its own.
-#[allow(clippy::too_many_arguments)]
-pub fn display_usage_interactive_with_pool(
-    time_range: vct_core::models::TimeRange,
-    merge_providers: bool,
-    quota_panels: Vec<String>,
-    providers: ProvidersConfig,
-    refresh_secs: u64,
-    quota_refresh_secs: u64,
-    scan_pool: Arc<rayon::ThreadPool>,
-) -> anyhow::Result<()> {
-    let mut terminal = TerminalSession::new()?;
-    let result = (|| -> anyhow::Result<()> {
-        let mut spinner_index = 0usize;
-        render_loading_frame(terminal.terminal_mut(), spinner_index)?;
+/// The usage scan a refresh worker runs, with the pricing it keeps between
+/// runs.
+pub(crate) struct UsageScanner {
+    pricing: ModelPricingMap,
+    scan_options: vct_core::usage::UsageScanOptions,
+    loaded_pricing_utc_date: Option<chrono::NaiveDate>,
+}
 
-        let paths = resolve_paths()?;
-        let quota = QuotaRuntime::start(&quota_panels, providers, quota_refresh_secs);
-        let worker_paths = paths.clone();
-        let worker_pool = Arc::clone(&scan_pool);
-        let mut worker = RefreshWorker::new_with_init(refresh_secs, move || {
-            let mut ledger = SessionLedger::open(&worker_paths.cache_dir);
-            let mut pricing = ModelPricingMap::new(HashMap::new());
-            let mut scan_options = vct_core::usage::UsageScanOptions::default();
-            let mut loaded_pricing_utc_date = None;
-            move || {
-                let today = chrono::Utc::now().date_naive();
-                if loaded_pricing_utc_date != Some(today) {
-                    match fetch_model_pricing() {
-                        Ok(map) => {
-                            // A new pricing map can move tier thresholds; the
-                            // scan invalidates its cache when the snapshot's
-                            // fingerprint changes.
-                            scan_options.tiers = Some(std::sync::Arc::new(map.tier_thresholds()));
-                            pricing = map;
-                            loaded_pricing_utc_date = Some(today);
-                        }
-                        Err(error) => {
-                            log::warn!("failed to refresh pricing: {error}");
-                        }
-                    }
-                }
+impl UsageScanner {
+    pub(crate) fn new() -> Self {
+        Self {
+            pricing: ModelPricingMap::new(HashMap::new()),
+            scan_options: vct_core::usage::UsageScanOptions::default(),
+            loaded_pricing_utc_date: None,
+        }
+    }
 
-                let collection = worker_pool.install(|| {
-                    vct_core::usage::aggregate_usage_from_paths_with_cache_opts(
-                        &worker_paths,
-                        time_range,
-                        providers,
-                        &mut ledger,
-                        &scan_options,
-                    )
-                })?;
-                // A live session changes every tick; writing its provider's
-                // file once a minute keeps the ledger current without
-                // rewriting it on every refresh.
-                if let Err(error) = ledger.save_if_due(LEDGER_SAVE_INTERVAL) {
-                    log::warn!("failed to save the session ledger: {error:#}");
+    /// Scans `paths` for `time_range` and prices the result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the scan itself fails or every source failed to
+    /// parse. A partial failure keeps what parsed and is logged.
+    pub(crate) fn scan(
+        &mut self,
+        paths: &vct_core::utils::HelperPaths,
+        time_range: vct_core::models::TimeRange,
+        providers: ProvidersConfig,
+        ledger: &mut SessionLedger,
+        pool: &rayon::ThreadPool,
+    ) -> anyhow::Result<UsageRefreshPayload> {
+        let today = chrono::Utc::now().date_naive();
+        if self.loaded_pricing_utc_date != Some(today) {
+            match fetch_model_pricing() {
+                Ok(map) => {
+                    // A new pricing map can move tier thresholds; the scan
+                    // invalidates its cache when the snapshot's fingerprint
+                    // changes.
+                    self.scan_options.tiers = Some(Arc::new(map.tier_thresholds()));
+                    self.pricing = map;
+                    self.loaded_pricing_utc_date = Some(today);
                 }
-                if collection.diagnostics.all_failed() {
-                    let first = collection
-                        .diagnostics
-                        .failures
-                        .first()
-                        .map(|failure| failure.error.as_str())
-                        .unwrap_or("unknown source failure");
-                    anyhow::bail!(
-                        "failed to parse all {} usage sources: {first}",
-                        collection.diagnostics.candidates
-                    );
+                Err(error) => {
+                    log::warn!("failed to refresh pricing: {error}");
                 }
-                if collection.diagnostics.partially_failed() {
-                    log::warn!(
-                        "usage refresh kept partial data after {} source failures",
-                        collection.diagnostics.failures.len()
-                    );
-                }
-
-                let mut summary = build_usage_summary(
-                    &collection.data.models,
-                    &collection.data.per_provider,
-                    &collection.data.provider_days,
-                    &pricing,
-                    &collection.data.stored_costs,
-                );
-                summary.rows.retain(|row| row.total != 0 || row.cost != 0.0);
-                let merged_rows = merge_rows_by_base_model(&summary.rows);
-                Ok(UsageRefreshPayload {
-                    rows: summary.rows,
-                    merged_rows,
-                    totals: summary.totals,
-                    provider_totals: summary.provider_totals,
-                })
-            }
-        });
-        worker.request();
-
-        let pid = sysinfo::get_current_pid()
-            .expect("Failed to get current process ID for memory monitoring");
-        let mut sys = System::new();
-        init_process_metrics(&mut sys, pid);
-        let metrics_interval =
-            Duration::from_millis(vct_core::constants::refresh::METRICS_REFRESH_MS);
-        let mut last_metrics = Instant::now();
-        let mut last_spinner = Instant::now();
-        let mut state = UsageUiState::new(merge_providers);
-        let mut loaded = false;
-        let mut failure_until = None;
-
-        loop {
-            if let Some(result) = worker.try_result() {
-                match result {
-                    Ok(payload) => {
-                        state.apply(payload);
-                        loaded = true;
-                        failure_until = None;
-                        refresh_process_metrics(&mut sys, pid);
-                        state.render(
-                            terminal.terminal_mut(),
-                            &sys,
-                            pid,
-                            &quota,
-                            refresh_status(worker.is_active(), failure_until),
-                        )?;
-                        vct_core::utils::release_freed_heap();
-                        last_metrics = Instant::now();
-                    }
-                    Err(RefreshWorkerError::Disconnected) => {
-                        return Err(anyhow::anyhow!("refresh worker disconnected"));
-                    }
-                    Err(error) if !loaded => {
-                        return Err(anyhow::anyhow!("initial usage load failed: {error}"));
-                    }
-                    Err(error) => {
-                        log::warn!("usage refresh failed: {error}");
-                        failure_until = Some(Instant::now() + Duration::from_secs(3));
-                        state.render(
-                            terminal.terminal_mut(),
-                            &sys,
-                            pid,
-                            &quota,
-                            refresh_status(worker.is_active(), failure_until),
-                        )?;
-                    }
-                }
-            }
-
-            let auto_refresh_started = worker.request_if_due();
-            if !loaded && last_spinner.elapsed() >= Duration::from_millis(100) {
-                spinner_index = spinner_index.wrapping_add(1);
-                last_spinner = Instant::now();
-                render_loading_frame(terminal.terminal_mut(), spinner_index)?;
-            } else if loaded && (auto_refresh_started || last_metrics.elapsed() >= metrics_interval)
-            {
-                if last_metrics.elapsed() >= metrics_interval {
-                    last_metrics = Instant::now();
-                    refresh_process_metrics(&mut sys, pid);
-                }
-                let status = refresh_status(worker.is_active(), failure_until);
-                state.render(terminal.terminal_mut(), &sys, pid, &quota, status)?;
-            }
-
-            match handle_input()? {
-                InputAction::Quit => break,
-                InputAction::Refresh => {
-                    worker.request();
-                    if loaded {
-                        state.render(
-                            terminal.terminal_mut(),
-                            &sys,
-                            pid,
-                            &quota,
-                            refresh_status(worker.is_active(), failure_until),
-                        )?;
-                    }
-                }
-                // Esc backs out of whichever panel is open; with nothing open it
-                // quits.
-                InputAction::Close if state.overlay_open || state.provider_panel_open => {
-                    state.overlay_open = false;
-                    state.provider_panel_open = false;
-                    if loaded {
-                        state.render(
-                            terminal.terminal_mut(),
-                            &sys,
-                            pid,
-                            &quota,
-                            refresh_status(worker.is_active(), failure_until),
-                        )?;
-                    }
-                }
-                InputAction::Close => break,
-                InputAction::ToggleMerge => {
-                    state.toggle_merge();
-                    if loaded {
-                        state.render(
-                            terminal.terminal_mut(),
-                            &sys,
-                            pid,
-                            &quota,
-                            refresh_status(worker.is_active(), failure_until),
-                        )?;
-                    }
-                }
-                // The two panels are both centered and full of numbers, so they
-                // take turns rather than stacking.
-                InputAction::ToggleQuota => {
-                    state.overlay_open = !state.overlay_open;
-                    state.provider_panel_open = false;
-                    if loaded {
-                        state.render(
-                            terminal.terminal_mut(),
-                            &sys,
-                            pid,
-                            &quota,
-                            refresh_status(worker.is_active(), failure_until),
-                        )?;
-                    }
-                }
-                InputAction::TogglePane => {
-                    state.provider_panel_open = !state.provider_panel_open;
-                    state.overlay_open = false;
-                    if loaded {
-                        state.render(
-                            terminal.terminal_mut(),
-                            &sys,
-                            pid,
-                            &quota,
-                            refresh_status(worker.is_active(), failure_until),
-                        )?;
-                    }
-                }
-                InputAction::Navigate(delta) if loaded => {
-                    state.scroll.apply(delta, state.view().len());
-                    state.render(
-                        terminal.terminal_mut(),
-                        &sys,
-                        pid,
-                        &quota,
-                        refresh_status(worker.is_active(), failure_until),
-                    )?;
-                }
-                InputAction::Resize if loaded => {
-                    state.render(
-                        terminal.terminal_mut(),
-                        &sys,
-                        pid,
-                        &quota,
-                        refresh_status(worker.is_active(), failure_until),
-                    )?;
-                }
-                InputAction::Resize => {
-                    render_loading_frame(terminal.terminal_mut(), spinner_index)?;
-                }
-                InputAction::Navigate(_) | InputAction::Continue => {}
             }
         }
 
-        Ok(())
-    })();
-    terminal.finish(result)
-}
+        let collection = pool.install(|| {
+            vct_core::usage::aggregate_usage_from_paths_with_cache_opts(
+                paths,
+                time_range,
+                providers,
+                ledger,
+                &self.scan_options,
+            )
+        })?;
+        // A live session changes every tick; writing its provider's file once a
+        // minute keeps the ledger current without rewriting it on every
+        // refresh.
+        if let Err(error) = ledger.save_if_due(LEDGER_SAVE_INTERVAL) {
+            log::warn!("failed to save the session ledger: {error:#}");
+        }
+        if collection.diagnostics.all_failed() {
+            let first = collection
+                .diagnostics
+                .failures
+                .first()
+                .map(|failure| failure.error.as_str())
+                .unwrap_or("unknown source failure");
+            anyhow::bail!(
+                "failed to parse all {} usage sources: {first}",
+                collection.diagnostics.candidates
+            );
+        }
+        if collection.diagnostics.partially_failed() {
+            log::warn!(
+                "usage refresh kept partial data after {} source failures",
+                collection.diagnostics.failures.len()
+            );
+        }
 
-/// Displays token usage data in an interactive TUI with auto-refresh.
-///
-/// Runs until the user quits; `time_range` filters which sessions are scanned.
-///
-/// Features:
-/// - Auto-refresh on a configurable interval (usage + pricing)
-/// - Real-time memory monitoring
-/// - Provider-grouped totals
-/// - Scrollable model table (arrow keys)
-/// - Keyboard controls: `q` or `Ctrl+C` to exit; `Esc` closes whichever panel
-///   is open and otherwise exits; `r` to refresh; `Q` to open the full quota
-///   detail; `p` to open the Provider Usage detail panel (`Q` and `p` close
-///   each other); `m` to toggle merging models that share a base name across
-///   provider prefixes (e.g. `openai/gpt-5.5` + `azure/gpt-5.5`).
-///   `merge_providers` seeds the initial state and the `m` toggle is persisted
-///   back to `config.toml`.
-///
-/// `quota_panels` selects which live quota panels to show (by provider name);
-/// an empty list drops the band entirely. `providers` (from the config) selects
-/// which providers are aggregated. `refresh_secs` is the TUI re-aggregation
-/// cadence; `quota_refresh_secs` is the shared poll cadence for every live quota
-/// worker, which Antigravity raises to `ANTIGRAVITY_MIN_REFRESH_SECS`.
-///
-/// # Errors
-///
-/// Returns an error if the terminal cannot be set up or restored, if the initial
-/// usage load fails, if reading a terminal input event fails, or if a frame fails
-/// to draw. A later refresh failure is logged and the previous data is kept.
-///
-/// # Panics
-///
-/// Panics if the current process ID cannot be obtained for memory monitoring.
-pub fn display_usage_interactive(
-    time_range: vct_core::models::TimeRange,
-    merge_providers: bool,
-    quota_panels: Vec<String>,
-    providers: ProvidersConfig,
-    refresh_secs: u64,
-    quota_refresh_secs: u64,
-) -> anyhow::Result<()> {
-    let threads = vct_core::config::PerformanceConfig::default().resolved_scan_threads();
-    let pool = Arc::new(build_scan_pool(threads)?);
-    display_usage_interactive_with_pool(
-        time_range,
-        merge_providers,
-        quota_panels,
-        providers,
-        refresh_secs,
-        quota_refresh_secs,
-        pool,
-    )
+        let mut summary = build_usage_summary(
+            &collection.data.models,
+            &collection.data.per_provider,
+            &collection.data.provider_days,
+            &self.pricing,
+            &collection.data.stored_costs,
+        );
+        summary.rows.retain(|row| row.total != 0 || row.cost != 0.0);
+        let merged_rows = merge_rows_by_base_model(&summary.rows);
+        Ok(UsageRefreshPayload {
+            rows: summary.rows,
+            merged_rows,
+            totals: summary.totals,
+            provider_totals: summary.provider_totals,
+        })
+    }
 }
 
 fn current_view<'a>(
@@ -939,270 +775,278 @@ fn row_fingerprint(row: &UsageRow) -> (i64, i64, i64, i64) {
     )
 }
 
+/// Draws the usage tab into `area`: the model table, the Provider Usage line,
+/// the quota cards and the controls line.
 #[allow(clippy::too_many_arguments)]
-fn render_usage_frame_with_status<B: Backend<Error: Send + Sync + 'static>>(
+fn draw_usage_view(
+    f: &mut Frame,
+    area: Rect,
+    rows_data: &[UsageRow],
+    totals: &UsageTotals,
+    provider_totals: &UsageProviderTotals,
+    update_tracker: &UpdateTracker,
+    quota: &QuotaView,
+    scroll: &mut ScrollState,
+    merge_enabled: bool,
+    sort: UsageSort,
+    status: Option<&str>,
+) {
+    let provider_rows = build_provider_total_rows(provider_totals);
+    if area.width < USAGE_MIN_W || area.height < USAGE_MIN_H {
+        render_too_small(f, USAGE_MIN_W, USAGE_MIN_H);
+        return;
+    }
+
+    // `band_enabled == false` (empty `quota_panels`) drops the quota
+    // surface. The Provider Usage line is local scan data, not a quota
+    // panel, so it is always drawn and costs its one row unconditionally.
+    let n = quota.present.count();
+    let grid_h = visible_grid_height(area, quota.band_enabled, n);
+    // A folded grid still costs one row, for the digest that replaces it.
+    let quota_h = if grid_h > 0 {
+        grid_h
+    } else {
+        u16::from(quota.band_enabled && n > 0)
+    };
+    let chunks = frame_layout(area, PROVIDER_LINE_H + quota_h);
+
+    // Numeric columns in display order, each ranked by how readily it may be
+    // dropped when the pane is narrow. Cost and Total are the reason the
+    // view exists, so they stay; the cache split goes first.
+    const NUMERIC: [ColumnSpec; 6] = [
+        ColumnSpec {
+            header: "Input",
+            width: 9,
+            drop_rank: 3,
+        },
+        ColumnSpec {
+            header: "Output",
+            width: 9,
+            drop_rank: 2,
+        },
+        ColumnSpec {
+            header: "Cache Read",
+            width: 11,
+            drop_rank: 4,
+        },
+        ColumnSpec {
+            header: "Cache Write",
+            width: 11,
+            drop_rank: 5,
+        },
+        ColumnSpec {
+            header: "Total",
+            width: 9,
+            drop_rank: 1,
+        },
+        ColumnSpec {
+            header: "Cost (USD)",
+            width: 12,
+            drop_rank: 0,
+        },
+    ];
+
+    let inner = chunks.content.width.saturating_sub(2);
+    let (kept, dropped) = fit_columns(&NUMERIC, inner, MODEL_COL_MIN_W);
+    let numeric_span: u16 = kept.iter().map(|&i| NUMERIC[i].width + 1).sum();
+    // Slack past the model column's cap becomes the share bar.
+    let avail = inner.saturating_sub(numeric_span);
+    let slack = avail.saturating_sub(MODEL_COL_COMFORTABLE_W);
+    let share_w = if dropped == 0 && slack > SHARE_COL_MIN_W {
+        (slack - 1).min(SHARE_COL_MAX_W)
+    } else {
+        0
+    };
+    let model_w = avail
+        .saturating_sub(if share_w > 0 { share_w + 1 } else { 0 })
+        .max(MODEL_COL_MIN_W);
+
+    let mut header: Vec<&str> = Vec::with_capacity(kept.len() + 2);
+    header.push("Model");
+    header.extend(kept.iter().map(|&i| NUMERIC[i].header));
+    if share_w > 0 {
+        header.push("Share");
+    }
+
+    let mut widths: Vec<Constraint> = Vec::with_capacity(header.len());
+    widths.push(Constraint::Length(model_w));
+    widths.extend(kept.iter().map(|&i| Constraint::Length(NUMERIC[i].width)));
+    if share_w > 0 {
+        widths.push(Constraint::Length(share_w));
+    }
+
+    // No total row: the grand total is carried by the table title, never by
+    // a selectable row.
+    let rows: Vec<RatatuiRow> = rows_data
+        .iter()
+        .map(|row| {
+            let style = if update_tracker.is_recently_updated(&row.model) {
+                Style::default().bg(RatatuiColor::Rgb(60, 80, 60)).bold()
+            } else {
+                Style::default()
+            };
+            let all = [
+                format_compact(row.input_tokens),
+                format_compact(row.output_with_reasoning()),
+                format_compact(row.cache_read),
+                format_compact(row.cache_creation),
+                format_compact(row.total),
+                format_cost(row.cost),
+            ];
+            let mut cells = Vec::with_capacity(header.len());
+            cells.push(row.display_model.clone());
+            cells.extend(kept.iter().map(|&i| all[i].clone()));
+            if share_w > 0 {
+                cells.push(share_cell(row.total, totals.total, share_w));
+            }
+            styled_row(cells, style, 1)
+        })
+        .collect();
+
+    let row_count = rows.len();
+    let title = format!(
+        "Models · {} · {} tokens · {} models",
+        format_cost(totals.cost),
+        format_compact(totals.total),
+        rows_data.len()
+    );
+    render_scrollable_table(
+        f,
+        chunks.content,
+        TableChrome {
+            title: &title,
+            note: Some(if dropped > 0 {
+                format!("{} · −{dropped} cols", sort.label())
+            } else {
+                sort.label().to_string()
+            }),
+            border_color: RatatuiColor::Green,
+        },
+        header,
+        rows,
+        &widths,
+        row_count,
+        scroll,
+    );
+
+    if let Some(band_area) = chunks.band {
+        // The band carries the Provider Usage line first, then whatever
+        // quota surface is left. Splitting here (rather than asking the
+        // frame for two bands) keeps the frame's vertical story to one
+        // caller-sized region.
+        let rows = RatatuiLayout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(PROVIDER_LINE_H), Constraint::Min(0)])
+            .split(band_area);
+        let (provider_area, quota_area) = (rows[0], rows[1]);
+
+        f.render_widget(
+            Paragraph::new(provider_digest(&provider_rows, provider_area.width)).centered(),
+            provider_area,
+        );
+
+        let now = chrono::Local::now().timestamp();
+        if grid_h > 0 {
+            let cells = grid_cells(&CARD_GRID, quota_area, n);
+            // Present providers render in a fixed order (Claude → Codex →
+            // Copilot → Cursor → Grok → Antigravity) into the cells; a
+            // missing provider consumes no cell, and `grid_cells` always
+            // returns exactly `n`.
+            let mut idx = 0;
+            let mut place = |f: &mut Frame, card: QuotaCard| {
+                if let Some(cell) = cells.get(idx) {
+                    render_quota_card(f, *cell, &card);
+                }
+                idx += 1;
+            };
+            let card_w = cells.first().map_or(CARD_GRID.min_w, |cell| cell.width);
+            if quota.present.claude {
+                place(f, claude_card(quota.claude, now, card_w, false));
+            }
+            if quota.present.codex {
+                place(f, codex_card(quota.codex, now, card_w, false));
+            }
+            if quota.present.copilot {
+                place(f, copilot_card(quota.copilot, now, card_w, false));
+            }
+            if quota.present.cursor {
+                place(f, cursor_card(quota.cursor, now, card_w, false));
+            }
+            if quota.present.grok {
+                place(f, grok_card(quota.grok, now, card_w, false));
+            }
+            if quota.present.antigravity {
+                place(f, antigravity_card(quota.antigravity, now, card_w, false));
+            }
+        } else if quota_area.height > 0 {
+            f.render_widget(
+                Paragraph::new(quota_digest(&digest_items(quota), quota_area.width)).centered(),
+                quota_area,
+            );
+        }
+    }
+
+    // When merged, the toggle un-merges, so label it "split" to match.
+    let merge_hint = if merge_enabled {
+        " split  "
+    } else {
+        " merge  "
+    };
+    f.render_widget(
+        create_controls_with_status(
+            &[
+                ("o", " sort  "),
+                ("t", " range  "),
+                ("m", merge_hint),
+                ("p", " providers  "),
+            ],
+            status,
+            chunks.controls.width,
+        ),
+        chunks.controls,
+    );
+
+    // Drawn last so it covers the frame it is layered over.
+    if quota.provider_panel_open {
+        render_provider_panel(f, area, &provider_rows);
+    }
+}
+
+/// Draws one whole-frame usage view, for tests and benchmarks.
+#[allow(clippy::too_many_arguments)]
+fn render_usage_frame<B: Backend<Error: Send + Sync + 'static>>(
     terminal: &mut Terminal<B>,
     rows_data: &[UsageRow],
     totals: &UsageTotals,
     provider_totals: &UsageProviderTotals,
     update_tracker: &UpdateTracker,
-    sys: &System,
-    pid: Pid,
     quota: &QuotaView,
     scroll: &mut ScrollState,
     merge_enabled: bool,
     status: Option<&str>,
-    write_hyperlink: bool,
 ) -> anyhow::Result<()> {
-    let provider_rows = build_provider_total_rows(provider_totals);
-
-    let completed = terminal.draw(|f| {
-        let area = f.area();
-        if area.width < USAGE_MIN_W || area.height < USAGE_MIN_H {
-            render_too_small(f, USAGE_MIN_W, USAGE_MIN_H);
-            return;
-        }
-
-        // `band_enabled == false` (empty `quota_panels`) drops the quota
-        // surface. The Provider Usage line is local scan data, not a quota
-        // panel, so it is always drawn and costs its one row unconditionally.
-        let n = quota.present.count();
-        let grid_h = visible_grid_height(area, quota.band_enabled, n);
-        // A folded grid still costs one row, for the digest that replaces it.
-        let quota_h = if grid_h > 0 {
-            grid_h
-        } else {
-            u16::from(quota.band_enabled && n > 0)
-        };
-        let chunks = frame_layout(area, PROVIDER_LINE_H + quota_h);
-
-        // Numeric columns in display order, each ranked by how readily it may be
-        // dropped when the pane is narrow. Cost and Total are the reason the
-        // view exists, so they stay; the cache split goes first.
-        const NUMERIC: [ColumnSpec; 6] = [
-            ColumnSpec {
-                header: "Input",
-                width: 9,
-                drop_rank: 3,
-            },
-            ColumnSpec {
-                header: "Output",
-                width: 9,
-                drop_rank: 2,
-            },
-            ColumnSpec {
-                header: "Cache Read",
-                width: 11,
-                drop_rank: 4,
-            },
-            ColumnSpec {
-                header: "Cache Write",
-                width: 11,
-                drop_rank: 5,
-            },
-            ColumnSpec {
-                header: "Total",
-                width: 9,
-                drop_rank: 1,
-            },
-            ColumnSpec {
-                header: "Cost (USD)",
-                width: 12,
-                drop_rank: 0,
-            },
-        ];
-
-        let inner = chunks.content.width.saturating_sub(2);
-        let (kept, dropped) = fit_columns(&NUMERIC, inner, MODEL_COL_MIN_W);
-        let numeric_span: u16 = kept.iter().map(|&i| NUMERIC[i].width + 1).sum();
-        // Slack past the model column's cap becomes the share bar.
-        let avail = inner.saturating_sub(numeric_span);
-        let slack = avail.saturating_sub(MODEL_COL_COMFORTABLE_W);
-        let share_w = if dropped == 0 && slack > SHARE_COL_MIN_W {
-            (slack - 1).min(SHARE_COL_MAX_W)
-        } else {
-            0
-        };
-        let model_w = avail
-            .saturating_sub(if share_w > 0 { share_w + 1 } else { 0 })
-            .max(MODEL_COL_MIN_W);
-
-        let mut header: Vec<&str> = Vec::with_capacity(kept.len() + 2);
-        header.push("Model");
-        header.extend(kept.iter().map(|&i| NUMERIC[i].header));
-        if share_w > 0 {
-            header.push("Share");
-        }
-
-        let mut widths: Vec<Constraint> = Vec::with_capacity(header.len());
-        widths.push(Constraint::Length(model_w));
-        widths.extend(kept.iter().map(|&i| Constraint::Length(NUMERIC[i].width)));
-        if share_w > 0 {
-            widths.push(Constraint::Length(share_w));
-        }
-
-        // No total row: the grand total is carried by the table title and the
-        // summary bar, never by a selectable row.
-        let rows: Vec<RatatuiRow> = rows_data
-            .iter()
-            .map(|row| {
-                let style = if update_tracker.is_recently_updated(&row.model) {
-                    Style::default().bg(RatatuiColor::Rgb(60, 80, 60)).bold()
-                } else {
-                    Style::default()
-                };
-                let all = [
-                    format_compact(row.input_tokens),
-                    format_compact(row.output_with_reasoning()),
-                    format_compact(row.cache_read),
-                    format_compact(row.cache_creation),
-                    format_compact(row.total),
-                    format_cost(row.cost),
-                ];
-                let mut cells = Vec::with_capacity(header.len());
-                cells.push(row.display_model.clone());
-                cells.extend(kept.iter().map(|&i| all[i].clone()));
-                if share_w > 0 {
-                    cells.push(share_cell(row.total, totals.total, share_w));
-                }
-                styled_row(cells, style, 1)
-            })
-            .collect();
-
-        let row_count = rows.len();
-        let title = format!(
-            "Models · {} · {} tokens · {} models",
-            format_cost(totals.cost),
-            format_compact(totals.total),
-            rows_data.len()
-        );
-        render_scrollable_table(
+    terminal.draw(|f| {
+        draw_usage_view(
             f,
-            chunks.content,
-            TableChrome {
-                title: &title,
-                note: (dropped > 0).then(|| format!("−{dropped} cols")),
-                border_color: RatatuiColor::Green,
-            },
-            header,
-            rows,
-            &widths,
-            row_count,
+            f.area(),
+            rows_data,
+            totals,
+            provider_totals,
+            update_tracker,
+            quota,
             scroll,
+            merge_enabled,
+            UsageSort::default(),
+            status,
         );
-
-        if let Some(band_area) = chunks.band {
-            // The band carries the Provider Usage line first, then whatever
-            // quota surface is left. Splitting here (rather than asking the
-            // frame for two bands) keeps the frame's vertical story to one
-            // caller-sized region.
-            let rows = RatatuiLayout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(PROVIDER_LINE_H), Constraint::Min(0)])
-                .split(band_area);
-            let (provider_area, quota_area) = (rows[0], rows[1]);
-
-            f.render_widget(
-                Paragraph::new(provider_digest(&provider_rows, provider_area.width)).centered(),
-                provider_area,
-            );
-
-            let now = chrono::Local::now().timestamp();
-            if grid_h > 0 {
-                let cells = grid_cells(&CARD_GRID, quota_area, n);
-                // Present providers render in a fixed order (Claude → Codex →
-                // Copilot → Cursor → Grok → Antigravity) into the cells; a
-                // missing provider consumes no cell, and `grid_cells` always
-                // returns exactly `n`.
-                let mut idx = 0;
-                let mut place = |f: &mut Frame, card: QuotaCard| {
-                    if let Some(cell) = cells.get(idx) {
-                        render_quota_card(f, *cell, &card);
-                    }
-                    idx += 1;
-                };
-                let card_w = cells.first().map_or(CARD_GRID.min_w, |cell| cell.width);
-                if quota.present.claude {
-                    place(f, claude_card(quota.claude, now, card_w, false));
-                }
-                if quota.present.codex {
-                    place(f, codex_card(quota.codex, now, card_w, false));
-                }
-                if quota.present.copilot {
-                    place(f, copilot_card(quota.copilot, now, card_w, false));
-                }
-                if quota.present.cursor {
-                    place(f, cursor_card(quota.cursor, now, card_w, false));
-                }
-                if quota.present.grok {
-                    place(f, grok_card(quota.grok, now, card_w, false));
-                }
-                if quota.present.antigravity {
-                    place(f, antigravity_card(quota.antigravity, now, card_w, false));
-                }
-            } else if quota_area.height > 0 {
-                f.render_widget(
-                    Paragraph::new(quota_digest(&digest_items(quota), quota_area.width)).centered(),
-                    quota_area,
-                );
-            }
-        }
-
-        let total_cost_str = format_cost(totals.cost);
-        let total_tokens_str = format_compact(totals.total);
-        let entries_str = format!("{}", rows_data.len());
-
-        let summary_items = vec![
-            ("Total Cost:", total_cost_str.as_str(), RatatuiColor::Yellow),
-            (
-                "Total Tokens:",
-                total_tokens_str.as_str(),
-                RatatuiColor::Cyan,
-            ),
-            ("Models:", entries_str.as_str(), RatatuiColor::Blue),
-        ];
-
-        let summary = create_summary(summary_items, sys, pid, chunks.summary.width);
-        f.render_widget(summary, chunks.summary);
-
-        // When merged, the toggle un-merges, so label it "split" to match.
-        let merge_hint = if merge_enabled {
-            " split  "
-        } else {
-            " merge  "
-        };
-        f.render_widget(
-            create_controls_with_status(
-                &[("m", merge_hint), ("p", " providers  "), ("Q", " quota  ")],
-                status,
-                chunks.controls.width,
-            ),
-            chunks.controls,
-        );
-
-        // Drawn last so it covers the frame it is layered over. Only one panel
-        // is ever open: `p` and `Q` close each other, so they cannot stack.
-        if quota.provider_panel_open {
-            render_provider_panel(f, area, &provider_rows);
-        }
-        if quota.overlay_open {
-            render_quota_overlay(f, area, quota, chrono::Local::now().timestamp());
-        }
     })?;
-
-    // ratatui can't embed the OSC 8 escape itself, so hyperlink the repo label
-    // it just drew (a no-op on terminals without hyperlink support).
-    if write_hyperlink {
-        overlay_repo_hyperlink(completed.buffer)?;
-    }
-
     Ok(())
 }
 
 /// Production-shaped usage frame fixture used by Criterion benchmarks.
 ///
 /// The fixture owns a [`TestBackend`] so benchmarks exercise the same table,
-/// provider band, quota panels, summary, controls, and terminal diff path as
+/// provider band, quota panels, controls, and terminal diff path as
 /// the interactive renderer without writing control sequences to stdout.
 #[doc(hidden)]
 pub struct UsageFrameBenchmark {
@@ -1211,8 +1055,6 @@ pub struct UsageFrameBenchmark {
     totals: UsageTotals,
     provider_totals: UsageProviderTotals,
     update_tracker: UpdateTracker,
-    sys: System,
-    pid: Pid,
     claude: ClaudeQuotaSnapshot,
     codex: CodexQuotaSnapshot,
     copilot: CopilotQuotaSnapshot,
@@ -1288,19 +1130,12 @@ impl UsageFrameBenchmark {
         let mut scroll = ScrollState::new();
         scroll.sync(None, &models);
 
-        let pid = sysinfo::get_current_pid()
-            .map_err(|error| anyhow::anyhow!("get benchmark process ID: {error}"))?;
-        let mut sys = System::new();
-        init_process_metrics(&mut sys, pid);
-
         Ok(Self {
             terminal: Terminal::new(TestBackend::new(width, height))?,
             rows,
             totals,
             provider_totals,
             update_tracker,
-            sys,
-            pid,
             claude: ClaudeQuotaSnapshot::default(),
             codex: CodexQuotaSnapshot::default(),
             copilot: CopilotQuotaSnapshot::default(),
@@ -1330,21 +1165,17 @@ impl UsageFrameBenchmark {
             },
             band_enabled: true,
             provider_panel_open: false,
-            overlay_open: false,
         };
-        render_usage_frame_with_status(
+        render_usage_frame(
             &mut self.terminal,
             &self.rows,
             &self.totals,
             &self.provider_totals,
             &self.update_tracker,
-            &self.sys,
-            self.pid,
             &quota,
             &mut self.scroll,
             false,
             status,
-            false,
         )
     }
 }
@@ -1441,7 +1272,7 @@ fn provider_share_bar(rows: &[ProviderTotal<'_, ProviderStats>], width: u16) -> 
 }
 
 /// A dim gray line for placeholder / hint text.
-pub(super) fn dim_line(text: &str) -> Line<'static> {
+pub(crate) fn dim_line(text: &str) -> Line<'static> {
     Line::from(Span::styled(
         text.to_string(),
         Style::default().fg(RatatuiColor::DarkGray),
@@ -1663,7 +1494,7 @@ fn provider_digest(rows: &[ProviderTotal<'_, ProviderStats>], width: u16) -> Lin
     /// `+N more` tail.
     const SEP: &str = " · ";
     const TAIL: &str = "more → p";
-    // The summary bar already carries the grand total, so the aggregate row
+    // The table title already carries the grand total, so the aggregate row
     // would only repeat it.
     let listed: Vec<_> = rows
         .iter()
@@ -1743,74 +1574,19 @@ fn render_provider_panel(
     render_provider_table(f, rect, provider_rows);
 }
 
-/// Renders the full-screen quota overlay opened with `Q`.
-///
-/// This is where a card gets enough room for every line it has, whatever the
-/// always-on grid had to leave out. It uses the same placement formula with a
-/// roomier spec; a terminal too short even for that says how many providers it
-/// could not reach rather than ending at the border.
-fn render_quota_overlay(f: &mut Frame, area: Rect, quota: &QuotaView, now: i64) {
-    let outer = Rect {
-        x: area.x + 1,
-        y: area.y + 1,
-        width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(2),
-    };
-    f.render_widget(Clear, outer);
-
-    let inner = Rect {
-        x: outer.x + 1,
-        y: outer.y + 1,
-        width: outer.width.saturating_sub(2),
-        height: outer.height.saturating_sub(2),
-    };
-    let (cards, hidden) = fit_cards(&OVERLAY_GRID, inner, quota, now, false);
-
-    let mut block = Block::default()
-        .borders(Borders::ALL)
-        .title(Line::from(" Quota — all providers "))
-        .border_style(Style::default().fg(RatatuiColor::Cyan));
-    let hint = if hidden > 0 {
-        format!(" +{hidden} hidden · esc to close ")
-    } else {
-        " esc to close ".to_string()
-    };
-    block = block.title(
-        Line::from(Span::styled(
-            hint,
-            Style::default().fg(RatatuiColor::DarkGray),
-        ))
-        .right_aligned(),
-    );
-    f.render_widget(block, outer);
-
-    // An empty overlay would be a dead end, so say why it is empty.
-    if cards.is_empty() {
-        f.render_widget(
-            Paragraph::new(dim_line(no_cards_reason(quota))).centered(),
-            inner,
-        );
-        return;
-    }
-
-    for (cell, card) in &cards {
-        render_quota_card(f, *cell, card);
-    }
-}
-
 /// Why a quota surface has no card to show. The band being switched off is a
 /// setting, not a missing credential.
-pub(super) fn no_cards_reason(quota: &QuotaView) -> &'static str {
+pub(crate) fn no_cards_reason(quota: &QuotaView) -> &'static str {
     if quota.band_enabled {
         "No provider on this machine has quota credentials."
     } else {
-        "Quota panels are off: set `panels` under [usage.quota] in ~/.vct/config.toml."
+        "Quota panels are off: turn one on under Settings > Usage."
     }
 }
 
 /// Builds the cards that fit `area` on a `base` grid, each with the cell it is
 /// drawn into, plus the number of providers that did not fit.
-pub(super) fn fit_cards(
+pub(crate) fn fit_cards(
     base: &GridSpec,
     area: Rect,
     quota: &QuotaView,
@@ -1863,7 +1639,7 @@ fn render_provider_table(
     area: Rect,
     provider_rows: &[ProviderTotal<'_, ProviderStats>],
 ) {
-    // Drop the "All Providers" aggregate; the summary bar carries the totals.
+    // Drop the "All Providers" aggregate; the table title carries the totals.
     let listed: Vec<_> = provider_rows
         .iter()
         .filter(|row| row.label != "All Providers")
@@ -1972,7 +1748,7 @@ struct DigestItem {
 }
 
 /// Every present provider's headline gauge plus the two states that must not
-/// wait for the overlay: a spent window and a token that needs a re-login.
+/// wait for the Quota tab: a spent window and a token that needs a re-login.
 fn digest_items(quota: &QuotaView) -> Vec<DigestItem> {
     fn peak(windows: &[Option<&QuotaWindow>]) -> Option<f64> {
         windows
@@ -2059,13 +1835,13 @@ fn digest_items(quota: &QuotaView) -> Vec<DigestItem> {
 /// The one-line quota digest shown in place of the grid on a short terminal.
 ///
 /// Segments are dropped whole from the tail, and the remainder is named in a
-/// trailing `+N more → Q`, so the line never implies it lists every provider.
-/// A spent window and a dead token are carried here rather than left for the
-/// overlay: they are the two states a user needs to act on, and the digest is
-/// the only quota surface on these terminal sizes.
+/// trailing `+N more → 3` (the Quota tab's key), so the line never implies it
+/// lists every provider. A spent window and a dead token are carried here
+/// rather than left for that tab: they are the two states a user needs to act
+/// on.
 fn quota_digest(items: &[DigestItem], width: u16) -> Line<'static> {
     const SEP: &str = "  ·  ";
-    const TAIL: &str = "more → Q";
+    const TAIL: &str = "more → 3";
     /// `Claude ▰▰▱ 58%`, `Claude LIMIT`, `Claude login` — a three-cell bar keeps
     /// the line short.
     fn segment(item: &DigestItem) -> String {
@@ -2120,10 +1896,10 @@ fn quota_digest(items: &[DigestItem], width: u16) -> Line<'static> {
 /// One provider's quota, laid out as an ordered list of lines.
 ///
 /// Every line is built for the width of the cell the card will be drawn in, so
-/// the `Q` overlay rebuilds its cards at its own roomier width. The height is
+/// the Quota tab rebuilds its cards at its own roomier width. The height is
 /// not applied here: the list is ordered most-important-first, and a cell too
 /// short for it keeps the head while [`render_quota_card`] counts the rest.
-pub(super) struct QuotaCard {
+pub(crate) struct QuotaCard {
     title: &'static str,
     color: RatatuiColor,
     limit_reached: bool,
@@ -2138,8 +1914,8 @@ fn card_inner_w(width: u16) -> u16 {
 /// Renders `card` into `area`, flagging a hit cap and any lines that did not fit.
 ///
 /// The trailing flags share the top border: `+2` for hidden lines, `LIMIT` for a
-/// spent window. `+2` is the promise that the overlay has more to show.
-pub(super) fn render_quota_card(f: &mut Frame, area: Rect, card: &QuotaCard) {
+/// spent window. `+2` is the promise that the Quota tab has more to show.
+pub(crate) fn render_quota_card(f: &mut Frame, area: Rect, card: &QuotaCard) {
     let capacity = usize::from(area.height.saturating_sub(2));
     let hidden = card.lines.len().saturating_sub(capacity);
 
@@ -2839,6 +2615,14 @@ fn claude_balance_parts(claude: &ClaudeQuotaSnapshot) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::display::usage::draw_quota_tab;
+
+    /// A cell with more room than the grid under the table gives a card.
+    const ROOMY_GRID: GridSpec = GridSpec {
+        min_w: 34,
+        max_w: 46,
+        height: 9,
+    };
     use vct_core::models::Provider;
 
     fn line_text(line: Line<'_>) -> String {
@@ -3154,7 +2938,7 @@ mod tests {
     #[test]
     fn antigravity_panel_lists_each_pool_then_its_limits_5h_first() {
         let now = 1_000;
-        let card = antigravity_card(&antigravity_snapshot(now), now, OVERLAY_GRID.min_w, false);
+        let card = antigravity_card(&antigravity_snapshot(now), now, ROOMY_GRID.min_w, false);
         let lines: Vec<String> = card
             .lines
             .iter()
@@ -3183,19 +2967,19 @@ mod tests {
         assert!(lines[3].contains("8%"), "got {lines:#?}");
     }
 
-    /// The overlay cell holds every line of agy's two pools; the always-on cell
+    /// A roomy cell holds every line of agy's two pools; the always-on cell
     /// flags what it cannot hold rather than dropping it.
     #[test]
-    fn antigravity_panel_fits_the_overlay_and_flags_the_rest_in_the_grid() {
+    fn antigravity_panel_fits_a_roomy_cell_and_flags_the_rest_in_the_grid() {
         let now = 1_000;
         let snapshot = antigravity_snapshot(now);
-        let overlay = render_card_in(
-            &antigravity_card(&snapshot, now, OVERLAY_GRID.min_w, false),
-            OVERLAY_GRID.min_w,
-            OVERLAY_GRID.height,
+        let roomy = render_card_in(
+            &antigravity_card(&snapshot, now, ROOMY_GRID.min_w, false),
+            ROOMY_GRID.min_w,
+            ROOMY_GRID.height,
         );
-        assert!(overlay.contains("Claude and GPT models"), "got:\n{overlay}");
-        assert!(!overlay.contains('+'), "nothing may be hidden:\n{overlay}");
+        assert!(roomy.contains("Claude and GPT models"), "got:\n{roomy}");
+        assert!(!roomy.contains('+'), "nothing may be hidden:\n{roomy}");
 
         let grid = render_min_card(&antigravity_card(&snapshot, now, CARD_GRID.min_w, false));
         assert!(grid.contains("+2"), "hidden lines must be flagged:\n{grid}");
@@ -3348,7 +3132,7 @@ mod tests {
         assert!(!narrow.contains("Hermes"), "got: {narrow}");
         assert!(narrow.chars().count() <= 46, "got: {narrow}");
 
-        // The aggregate row is the summary bar's job, not the digest's.
+        // The aggregate row is the table title's job, not the digest's.
         let overall = ProviderTotal::new_overall(&stats);
         let mut with_overall = provider_rows(2, &stats);
         with_overall.push(overall);
@@ -3713,7 +3497,7 @@ mod tests {
 
         let narrow = line_text(quota_digest(&items, 60));
         assert!(narrow.chars().count() <= 60, "got {narrow:?}");
-        assert!(narrow.contains("more → Q"), "got {narrow:?}");
+        assert!(narrow.contains("more → 3"), "got {narrow:?}");
 
         // Even at an absurd width one provider survives, so the row is never
         // blank without an explanation.
@@ -3725,7 +3509,7 @@ mod tests {
     #[test]
     fn digest_carries_the_states_that_need_acting_on() {
         // The digest is the only quota surface on the sizes where the grid
-        // folds, so a spent window and a dead token cannot wait for the overlay.
+        // folds, so a spent window and a dead token cannot wait for the Quota tab.
         let items = vec![
             DigestItem {
                 name: "Cursor",
@@ -3751,7 +3535,7 @@ mod tests {
         assert!(!text.contains("58%"), "got {text:?}");
     }
 
-    /// Builds a `QuotaView` with every provider present, for overlay tests.
+    /// Builds a `QuotaView` with every provider present, for Quota tab tests.
     fn every_provider<'a>(
         claude: &'a ClaudeQuotaSnapshot,
         codex: &'a CodexQuotaSnapshot,
@@ -3770,17 +3554,16 @@ mod tests {
             present: ALL_PRESENT,
             band_enabled: true,
             provider_panel_open: false,
-            overlay_open: true,
         }
     }
 
-    fn render_overlay(width: u16, height: u16) -> String {
+    fn render_quota_tab(width: u16, height: u16) -> String {
         let (claude, codex, copilot, cursor, grok, antigravity) = Default::default();
         let quota = every_provider(&claude, &codex, &copilot, &cursor, &grok, &antigravity);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| render_quota_overlay(frame, frame.area(), &quota, 0))
-            .expect("overlay renders");
+            .draw(|frame| draw_quota_tab(frame, frame.area(), &quota, 0))
+            .expect("quota tab renders");
         let buffer = terminal.backend().buffer();
         (0..height)
             .map(|y| {
@@ -3793,8 +3576,8 @@ mod tests {
     }
 
     #[test]
-    fn overlay_shows_every_provider_when_it_has_the_room() {
-        let rendered = render_overlay(140, 30);
+    fn quota_tab_shows_every_provider_when_it_has_the_room() {
+        let rendered = render_quota_tab(140, 30);
         for name in [
             "Claude",
             "Codex",
@@ -3805,18 +3588,17 @@ mod tests {
         ] {
             assert!(rendered.contains(name), "{name} missing from:\n{rendered}");
         }
-        assert!(rendered.contains("esc to close"), "got:\n{rendered}");
         assert!(
             !rendered.contains("hidden"),
             "nothing was hidden:\n{rendered}"
         );
     }
 
-    /// Jetski's six pools outgrow the overlay's usual card, which grows to hold
+    /// Jetski's six pools outgrow the Quota tab's usual card, which grows to hold
     /// them while the terminal has the rows and keeps its height when it does
     /// not, flagging the rest.
     #[test]
-    fn overlay_grows_its_cards_to_the_tallest_while_every_provider_fits() {
+    fn quota_tab_grows_its_cards_to_the_tallest_while_every_provider_fits() {
         let pools = [
             "Gemini Pro Next",
             "Gemini Flash Next",
@@ -3850,7 +3632,7 @@ mod tests {
         let render = |width: u16, height: u16| {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
-                .draw(|frame| render_quota_overlay(frame, frame.area(), &quota, 0))
+                .draw(|frame| draw_quota_tab(frame, frame.area(), &quota, 0))
                 .unwrap();
             let buffer = terminal.backend().buffer();
             (0..height)
@@ -3865,15 +3647,15 @@ mod tests {
 
         let tall = render(60, 20);
         assert!(tall.contains("Third-Party Models"), "got:\n{tall}");
-        assert!(!tall.contains("+6"), "nothing may be hidden:\n{tall}");
+        assert!(!tall.contains('+'), "nothing may be hidden:\n{tall}");
 
         let short = render(60, 14);
         assert!(short.contains("Antigravity"), "got:\n{short}");
-        assert!(short.contains("+6"), "the rest must be flagged:\n{short}");
+        assert!(short.contains("+8"), "the rest must be flagged:\n{short}");
     }
 
     #[test]
-    fn overlay_explains_itself_when_there_is_nothing_to_show() {
+    fn quota_tab_explains_itself_when_there_is_nothing_to_show() {
         let (c, x, p, u, g, a) = Default::default();
         let mut quota = QuotaView {
             claude: &c,
@@ -3885,12 +3667,11 @@ mod tests {
             present: QuotaPresence::default(),
             band_enabled: true,
             provider_panel_open: false,
-            overlay_open: true,
         };
         let render = |quota: &QuotaView| {
             let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
             terminal
-                .draw(|frame| render_quota_overlay(frame, frame.area(), quota, 0))
+                .draw(|frame| draw_quota_tab(frame, frame.area(), quota, 0))
                 .unwrap();
             let buffer = terminal.backend().buffer();
             (0..20u16)
@@ -3904,16 +3685,16 @@ mod tests {
         };
         // No credentials anywhere: an empty box would be a dead end.
         assert!(render(&quota).contains("quota credentials"));
-        // Panels switched off is a setting, and the overlay says where to change it.
+        // Panels switched off is a setting, and the tab says where to change it.
         quota.band_enabled = false;
-        assert!(render(&quota).contains("[usage.quota]"));
+        assert!(render(&quota).contains("Settings > Usage"));
     }
 
     #[test]
-    fn overlay_says_how_many_providers_it_could_not_reach() {
+    fn quota_tab_says_how_many_providers_it_could_not_reach() {
         // Two columns of one row is all a short terminal fits; the rest are
-        // counted in the title rather than ending at the border unannounced.
-        let rendered = render_overlay(80, 13);
+        // counted in the footer rather than ending at the border unannounced.
+        let rendered = render_quota_tab(80, 13);
         assert!(rendered.contains("hidden"), "got:\n{rendered}");
         assert!(rendered.contains("Claude"), "got:\n{rendered}");
     }
@@ -3953,46 +3734,12 @@ mod tests {
         assert_eq!(share_cell(5, 100, 4), "");
     }
 
-    #[test]
-    fn overlay_grid_gives_cards_room_the_always_on_grid_cannot() {
-        // The overlay exists so a provider's full line list has somewhere to go.
-        const _: () = assert!(OVERLAY_GRID.min_w > CARD_GRID.min_w);
-        const _: () = assert!(OVERLAY_GRID.height > CARD_GRID.height);
-
-        // Concretely: a snapshot that overflows the always-on card must fit the
-        // overlay one, which is the only reason the overlay exists.
-        let claude = ClaudeQuotaSnapshot {
-            plan_type: Some("max 20x".into()),
-            five_hour: Some(QuotaWindow::default()),
-            seven_day: Some(QuotaWindow::default()),
-            scoped_weekly: Some(QuotaWindow::default()),
-            scoped_label: Some("Opus".into()),
-            balance: Some("$5.00".into()),
-            spend_used: Some("$1.20".into()),
-            needs_login: true,
-            ..Default::default()
-        };
-        let small = claude_card(&claude, 0, CARD_GRID.min_w, false);
-        assert!(
-            small.lines.len() > usize::from(CARD_GRID.height - 2),
-            "this snapshot is supposed to overflow the always-on card"
-        );
-        let large = claude_card(&claude, 0, OVERLAY_GRID.max_w, false);
-        assert!(large.lines.len() <= usize::from(OVERLAY_GRID.height - 2));
-    }
-
     /// Renders a whole usage frame at `w`x`h` and returns its rows.
     ///
     /// Frame-level rather than unit-level on purpose: every piece of this
     /// layout fits itself to a width it is handed, so the defects worth
     /// catching are the ones where the width handed down is the wrong one.
-    fn render_frame(
-        w: u16,
-        h: u16,
-        present: QuotaPresence,
-        overlay: bool,
-        provider_panel: bool,
-    ) -> Vec<String> {
+    fn render_frame(w: u16, h: u16, present: QuotaPresence, provider_panel: bool) -> Vec<String> {
         let mut bench = UsageFrameBenchmark::new(w, h).expect("frame fixture");
         let quota = QuotaView {
             claude: &bench.claude,
@@ -4004,21 +3751,17 @@ mod tests {
             present,
             band_enabled: true,
             provider_panel_open: provider_panel,
-            overlay_open: overlay,
         };
-        render_usage_frame_with_status(
+        render_usage_frame(
             &mut bench.terminal,
             &bench.rows,
             &bench.totals,
             &bench.provider_totals,
             &bench.update_tracker,
-            &bench.sys,
-            bench.pid,
             &quota,
             &mut bench.scroll,
             false,
             None,
-            false,
         )
         .expect("frame renders");
         let buffer = bench.terminal.backend().buffer();
@@ -4074,16 +3817,13 @@ mod tests {
 
     #[test]
     fn frame_never_draws_outside_its_own_width() {
-        // Both panels are covered: each is centered over the frame at every
-        // terminal size, so an over-wide one would run off the edge here.
+        // The provider panel is covered: it is centered over the frame at
+        // every terminal size, so an over-wide one would run off the edge here.
         for (w, h) in FRAME_SIZES {
-            let plain = render_frame(w, h, ALL_PRESENT, false, false);
-            for (overlay, panel) in [(false, false), (true, false), (false, true)] {
-                let context = format!("{w}x{h} overlay={overlay} panel={panel}");
-                for (y, row) in render_frame(w, h, ALL_PRESENT, overlay, panel)
-                    .iter()
-                    .enumerate()
-                {
+            let plain = render_frame(w, h, ALL_PRESENT, false);
+            for panel in [false, true] {
+                let context = format!("{w}x{h} panel={panel}");
+                for (y, row) in render_frame(w, h, ALL_PRESENT, panel).iter().enumerate() {
                     assert_eq!(row.chars().count(), usize::from(w), "{context}");
                     // The provider panel hides the middle of the rows behind
                     // it, and what is left of them either side can end
@@ -4116,12 +3856,12 @@ mod tests {
     #[test]
     fn every_size_shows_a_quota_surface_and_a_model_table() {
         for (w, h) in FRAME_SIZES {
-            let screen = render_frame(w, h, ALL_PRESENT, false, false).join("\n");
+            let screen = render_frame(w, h, ALL_PRESENT, false).join("\n");
             assert!(screen.contains("Models"), "{w}x{h} lost the model table");
             // Either the cards are on screen or the digest that replaces them
             // is — never neither, and never both.
             let has_cards = screen.contains("Claude") && screen.contains("Grok");
-            let has_digest = screen.contains("more → Q") || screen.contains("Claude -");
+            let has_digest = screen.contains("more → 3") || screen.contains("Claude -");
             assert!(has_cards || has_digest, "{w}x{h} has no quota surface");
             // Quitting is always discoverable.
             assert!(screen.contains("q quit"), "{w}x{h} lost the quit hint");
@@ -4134,7 +3874,7 @@ mod tests {
             // The provider line costs its row unconditionally, and drops the
             // cheapest first, so the fixture's biggest spender survives at
             // every size rather than at the wide ones only.
-            let screen = render_frame(w, h, ALL_PRESENT, false, false).join("\n");
+            let screen = render_frame(w, h, ALL_PRESENT, false).join("\n");
             assert!(
                 screen.contains("Hermes $"),
                 "{w}x{h} dropped the highest-cost provider"
@@ -4142,7 +3882,7 @@ mod tests {
             assert!(screen.contains("p providers"), "{w}x{h} lost the `p` hint");
 
             // ...and `p` reaches the numbers the line could not carry.
-            let panel = render_frame(w, h, ALL_PRESENT, false, true).join("\n");
+            let panel = render_frame(w, h, ALL_PRESENT, true).join("\n");
             assert!(panel.contains("Tokens"), "{w}x{h} panel lost its columns");
             assert!(
                 panel.contains("esc to close"),
@@ -4152,15 +3892,14 @@ mod tests {
     }
 
     #[test]
-    fn overlay_cards_are_built_for_the_cell_they_are_drawn_in() {
+    fn quota_tab_cards_are_built_for_the_cell_they_are_drawn_in() {
         // Every "+N" on screen is a promise that N things were held back. If a
         // card is laid out for a wider cell than it is drawn in, the marker
         // itself is what gets cut — the promise loses its number, which is the
         // exact shape of laying a card out against the spec maximum instead of
         // the cell it gets. Codex's extras are sized to land on that boundary.
         for (w, h) in [(100u16, 30u16), (120, 40), (160, 45), (220, 50)] {
-            let mut bench = UsageFrameBenchmark::new(w, h).expect("frame fixture");
-            bench.codex = CodexQuotaSnapshot {
+            let codex = CodexQuotaSnapshot {
                 source: QuotaSource::Api,
                 fetched_at: 1,
                 plan_type: Some("plus".into()),
@@ -4171,34 +3910,13 @@ mod tests {
                 spend_limit: Some(50.0),
                 ..Default::default()
             };
-            let quota = QuotaView {
-                claude: &bench.claude,
-                codex: &bench.codex,
-                copilot: &bench.copilot,
-                cursor: &bench.cursor,
-                grok: &bench.grok,
-                antigravity: &bench.antigravity,
-                present: ALL_PRESENT,
-                band_enabled: true,
-                provider_panel_open: false,
-                overlay_open: true,
-            };
-            render_usage_frame_with_status(
-                &mut bench.terminal,
-                &bench.rows,
-                &bench.totals,
-                &bench.provider_totals,
-                &bench.update_tracker,
-                &bench.sys,
-                bench.pid,
-                &quota,
-                &mut bench.scroll,
-                false,
-                None,
-                false,
-            )
-            .expect("frame renders");
-            let buffer = bench.terminal.backend().buffer();
+            let (claude, copilot, cursor, grok, antigravity) = Default::default();
+            let quota = every_provider(&claude, &codex, &copilot, &cursor, &grok, &antigravity);
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal
+                .draw(|frame| draw_quota_tab(frame, frame.area(), &quota, 0))
+                .expect("quota tab renders");
+            let buffer = terminal.backend().buffer();
             for y in 0..h {
                 let row: String = (0..w)
                     .map(|x| buffer.cell((x, y)).unwrap().symbol())

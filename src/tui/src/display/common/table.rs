@@ -42,7 +42,7 @@ fn normalized_cpu(raw: f32, cores: f32) -> f32 {
 /// deliberately narrower than sysinfo's default `refresh_processes`. On Linux it
 /// reads this process's stat plus `/proc/stat` for the CPU-time delta (a couple
 /// of small reads), cheap enough to run on a fast metrics tick. `.with_cpu()`
-/// also populates `sys.cpus()`, which `create_summary` uses to normalize CPU%.
+/// also populates `sys.cpus()`, which `process_metrics` uses to normalize CPU%.
 pub fn refresh_process_metrics(sys: &mut System, pid: sysinfo::Pid) {
     sys.refresh_processes_specifics(
         sysinfo::ProcessesToUpdate::Some(&[pid]),
@@ -56,7 +56,7 @@ pub fn refresh_process_metrics(sys: &mut System, pid: sysinfo::Pid) {
 /// One-time init for the summary-bar metrics `System`, called once after
 /// `System::new()` before the refresh loop.
 ///
-/// It populates the CPU list (`refresh_cpu_all`) so `create_summary` can read
+/// It populates the CPU list (`refresh_cpu_all`) so `process_metrics` can read
 /// `sys.cpus().len()` as the CPU% divisor, then primes this process's first
 /// sample. The CPU-list step is **required**: a process-only refresh does not
 /// initialize `sys.cpus()` on macOS, which would leave the divisor at 1 and
@@ -67,114 +67,27 @@ pub fn init_process_metrics(sys: &mut System, pid: sysinfo::Pid) {
     refresh_process_metrics(sys, pid);
 }
 
-/// Separator drawn between summary-bar segments.
-const SUMMARY_SEP: &str = "  |  ";
-
-/// Display width of an ASCII summary fragment (labels / formatted numbers are
+/// Display width of an ASCII footer fragment (labels / formatted numbers are
 /// ASCII, so char count equals column count).
 fn seg_width(s: &str) -> usize {
     s.chars().count()
 }
 
-/// Decides which trailing diagnostic segments fit after the primary items.
+/// This process's resident memory in MB and its CPU use as a 0-100% share of
+/// the machine, both `0.0` when `sys` has no entry for `pid`.
 ///
-/// `used` is the primary items' width, `available` the content width. Returns
-/// `(show_memory, show_cpu)`: Memory is shown only if it fits, and CPU only if
-/// Memory is also shown and both fit — so on a narrowing bar CPU drops first,
-/// then Memory, and neither is ever clipped mid-word.
-fn fit_diagnostics(
-    used: usize,
-    available: usize,
-    mem_width: usize,
-    cpu_width: usize,
-) -> (bool, bool) {
-    if used + mem_width > available {
-        return (false, false);
-    }
-    (true, used + mem_width + cpu_width <= available)
-}
-
-/// Builds the one-line TUI summary bar from caller-supplied items plus live
-/// memory and CPU readouts.
-///
-/// Each `(icon, value, color)` tuple in `summary_items` becomes a colored,
-/// pipe-separated segment; these primary items are always rendered. A
-/// `Memory: <n> MB` and a `CPU: <n>%` segment for the current process `pid` are
-/// then appended **only while they fit** within `width` (the summary rect's
-/// width): on a terminal too narrow for the full line the diagnostic segments
-/// degrade gracefully, dropped whole (CPU first, then Memory) instead of
-/// clipped mid-word. They read `0.0` if `sys` has no entry for `pid`. CPU is
-/// normalized to a 0-100% share of the machine. `sys` is expected to have been
-/// refreshed by the caller before this call.
-///
-/// The bar is deliberately unbordered: it carries a single line of text, and a
-/// border around it would cost two more rows of the scrollable table above.
-pub fn create_summary<'a>(
-    summary_items: Vec<(&'a str, &'a str, RatatuiColor)>, // (icon, value, color) tuples
-    sys: &'a System,
-    pid: sysinfo::Pid,
-    width: u16,
-) -> Paragraph<'a> {
-    let available = width as usize;
-
-    let mut spans = Vec::new();
-    let mut used = 0usize;
-
-    // Primary items are always shown (they clip only on an extremely narrow bar).
-    for (i, (icon, value, color)) in summary_items.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw(SUMMARY_SEP));
-            used += seg_width(SUMMARY_SEP);
-        }
-        let label = format!("{} ", icon);
-        used += seg_width(&label) + seg_width(value);
-        spans.push(Span::styled(label, Style::default().fg(*color).bold()));
-        spans.push(Span::styled(*value, Style::default().fg(*color).bold()));
-    }
-
-    // Diagnostic segments for this process. Both are measured up front; how
-    // many actually render is decided by `fit_diagnostics` (CPU drops first).
+/// `sys` is expected to have been refreshed by the caller before this call.
+pub fn process_metrics(sys: &System, pid: sysinfo::Pid) -> (f64, f32) {
     let memory_mb = sys
         .process(pid)
         .map_or(0.0, |p| p.memory() as f64 / 1024.0 / 1024.0);
-    let mem_value = format!("{:.1} MB", memory_mb);
-    let mem_width = seg_width(SUMMARY_SEP) + seg_width("Memory: ") + seg_width(&mem_value);
-
-    // CPU normalized to a 0-100% machine share. Divide by `sys.cpus().len()`
-    // (sysinfo's own basis, populated by `init_process_metrics`); `.max(1)`
-    // guards the empty-CPU-list case.
+    // Divide by `sys.cpus().len()` (sysinfo's own basis, populated by
+    // `init_process_metrics`); `.max(1)` guards the empty-CPU-list case.
     let cores = sys.cpus().len().max(1) as f32;
     let cpu_percent = sys
         .process(pid)
         .map_or(0.0, |p| normalized_cpu(p.cpu_usage(), cores));
-    let cpu_value = format!("{:.1}%", cpu_percent);
-    let cpu_width = seg_width(SUMMARY_SEP) + seg_width("CPU: ") + seg_width(&cpu_value);
-
-    let (show_mem, show_cpu) = fit_diagnostics(used, available, mem_width, cpu_width);
-    if show_mem {
-        spans.push(Span::raw(SUMMARY_SEP));
-        spans.push(Span::styled(
-            "Memory: ",
-            Style::default().fg(RatatuiColor::LightRed).bold(),
-        ));
-        spans.push(Span::styled(
-            mem_value,
-            Style::default().fg(RatatuiColor::LightYellow).bold(),
-        ));
-    }
-    if show_cpu {
-        spans.push(Span::raw(SUMMARY_SEP));
-        spans.push(Span::styled(
-            "CPU: ",
-            Style::default().fg(RatatuiColor::LightRed).bold(),
-        ));
-        spans.push(Span::styled(
-            cpu_value,
-            Style::default().fg(RatatuiColor::LightYellow).bold(),
-        ));
-    }
-
-    Paragraph::new(vec![Line::from(spans)]).centered()
+    (memory_mb, cpu_percent)
 }
 
 /// Short call-to-action shown in the footer (also the OSC 8 hyperlink text).
@@ -269,8 +182,8 @@ pub fn create_controls_with_status(
 /// Rows the scrollable content pane is never squeezed below. The block border,
 /// header row and header margin eat 4, so this keeps ~2 body rows alive.
 pub const CONTENT_MIN_H: u16 = 6;
-/// Rows the frame always spends below the content: summary + controls.
-pub const FOOTER_H: u16 = 2;
+/// Rows the frame always spends below the content: the controls line.
+pub const FOOTER_H: u16 = 1;
 
 /// Chunk rects for an interactive frame.
 pub struct FrameChunks {
@@ -278,8 +191,6 @@ pub struct FrameChunks {
     pub content: Rect,
     /// Full-width band under the content, present only when one was asked for.
     pub band: Option<Rect>,
-    /// Single-line summary area.
-    pub summary: Rect,
     /// Single-line controls footer area.
     pub controls: Rect,
 }
@@ -287,17 +198,16 @@ pub struct FrameChunks {
 /// Splits `area` into the standard interactive-view regions.
 ///
 /// The content pane absorbs all leftover height, then an optional
-/// `band_height`-row band, then one row each of summary and controls. Every
+/// `band_height`-row band, then one row of controls. Every
 /// region spans the full width: a view that wants to show more than its table
 /// spends rows on a band, never columns on a side pane, so the table's own
 /// columns are never the thing that pays for it.
 pub fn frame_layout(area: Rect, band_height: u16) -> FrameChunks {
-    let mut constraints: Vec<Constraint> = Vec::with_capacity(4);
+    let mut constraints: Vec<Constraint> = Vec::with_capacity(3);
     constraints.push(Constraint::Min(CONTENT_MIN_H));
     if band_height > 0 {
         constraints.push(Constraint::Length(band_height));
     }
-    constraints.push(Constraint::Length(1));
     constraints.push(Constraint::Length(1));
 
     let rows = Layout::default()
@@ -313,13 +223,11 @@ pub fn frame_layout(area: Rect, band_height: u16) -> FrameChunks {
     };
     let content = take();
     let band = (band_height > 0).then(&mut take);
-    let summary = take();
     let controls = take();
 
     FrameChunks {
         content,
         band,
-        summary,
         controls,
     }
 }
@@ -610,7 +518,7 @@ pub fn create_provider_row<'a>(
 mod tests {
     use super::{
         CONTENT_MIN_H, ColumnSpec, FOOTER_H, Rect, create_controls_with_status, fit_columns,
-        fit_diagnostics, frame_layout, normalized_cpu,
+        frame_layout, normalized_cpu,
     };
 
     #[test]
@@ -619,7 +527,6 @@ mod tests {
         let c = frame_layout(area, 0);
         assert_eq!(c.content.height, 40 - FOOTER_H);
         assert!(c.band.is_none());
-        assert_eq!(c.summary.height, 1);
         assert_eq!(c.controls.height, 1);
         assert_eq!(c.controls.y, 39);
 
@@ -636,7 +543,6 @@ mod tests {
             let c = frame_layout(Rect::new(0, 0, width, 40), 6);
             assert_eq!(c.content.width, width);
             assert_eq!(c.band.expect("band requested").width, width);
-            assert_eq!(c.summary.width, width);
             assert_eq!(c.controls.width, width);
         }
     }
@@ -683,7 +589,6 @@ mod tests {
         // first; the content pane never drops below its minimum.
         let c = frame_layout(Rect::new(0, 0, 120, CONTENT_MIN_H + FOOTER_H), 0);
         assert_eq!(c.content.height, CONTENT_MIN_H);
-        assert_eq!(c.summary.height, 1);
         assert_eq!(c.controls.height, 1);
     }
 
@@ -704,7 +609,7 @@ mod tests {
             let area = Rect::new(0, 0, width, 1);
             let mut buf = ratatui::buffer::Buffer::empty(area);
             create_controls_with_status(
-                &[("m", " merge  "), ("p", " panes  "), ("Q", " quota  ")],
+                &[("m", " merge  "), ("p", " panes  "), ("t", " range  ")],
                 None,
                 width,
             )
@@ -716,7 +621,7 @@ mod tests {
 
         // Wide: everything, including the repo label.
         let wide = render(120);
-        assert!(wide.contains("Star on GitHub") && wide.contains("Q quota"));
+        assert!(wide.contains("Star on GitHub") && wide.contains("t range"));
 
         // The hard minimum terminal width. The repo label goes first, then the
         // extras from the right, and nothing is left half-drawn.
@@ -728,25 +633,7 @@ mod tests {
         // Absurdly narrow: the keys that still fit are whole words.
         let tiny = render(30);
         assert!(!tiny.contains("Star"), "got {tiny:?}");
-        assert!(!tiny.contains("quota"), "got {tiny:?}");
+        assert!(!tiny.contains("range"), "got {tiny:?}");
         assert!(tiny.contains("quit"), "got {tiny:?}");
-    }
-
-    #[test]
-    fn fit_diagnostics_drops_cpu_before_memory() {
-        let (mem, cpu) = (20usize, 15usize); // realistic segment widths
-        let used = 56; // primary items
-
-        // Wide bar: both fit.
-        assert_eq!(fit_diagnostics(used, 91, mem, cpu), (true, true));
-        // Exactly enough for Memory but not CPU (the common ~80-col case).
-        assert_eq!(fit_diagnostics(used, used + mem, mem, cpu), (true, false));
-        assert_eq!(fit_diagnostics(used, 78, mem, cpu), (true, false));
-        // Too narrow even for Memory: both drop, never a lone CPU.
-        assert_eq!(
-            fit_diagnostics(used, used + mem - 1, mem, cpu),
-            (false, false)
-        );
-        assert_eq!(fit_diagnostics(used, 60, mem, cpu), (false, false));
     }
 }

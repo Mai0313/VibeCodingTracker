@@ -39,9 +39,9 @@ pub enum QuotaProvider {
 #[command(name = "vibe_coding_tracker")]
 #[command(author, version = vct_core::VERSION, about, long_about = None)]
 pub struct Cli {
-    /// The subcommand to run.
+    /// The subcommand to run; without one the interactive app opens.
     #[command(subcommand)]
-    pub command: Commands,
+    pub command: Option<Commands>,
 }
 
 /// Top-level subcommands exposed by the CLI.
@@ -64,7 +64,7 @@ pub enum Commands {
         #[arg(long, group = "analysis_format")]
         text: bool,
 
-        /// Output as static table (instead of interactive TUI).
+        /// Output as static table.
         #[arg(long, group = "analysis_format")]
         table: bool,
 
@@ -122,9 +122,6 @@ pub enum Commands {
         all: bool,
     },
 
-    /// Watch live quota usage for every signed-in provider.
-    Monitor,
-
     /// Display version information.
     Version {
         /// Output as JSON.
@@ -147,14 +144,13 @@ pub enum Commands {
         force: bool,
     },
 
-    /// Fetch a provider's raw quota/usage API response.
+    /// Watch live quota usage, or print one provider's raw quota API response.
     ///
-    /// The old name `fetch` is kept as a hidden alias for back-compat.
-    #[command(alias = "fetch")]
+    /// Without a provider this opens the interactive app on its Quota tab.
     Quota {
-        /// Which provider to query (claude | codex | copilot | cursor | grok |
-        /// antigravity).
-        provider: QuotaProvider,
+        /// Print this provider's raw response instead (claude | codex | copilot
+        /// | cursor | grok | antigravity).
+        provider: Option<QuotaProvider>,
 
         /// Output as pretty JSON (default).
         #[arg(long, group = "quota_format")]

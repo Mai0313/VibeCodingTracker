@@ -13,9 +13,9 @@ use crossterm::{
 };
 use ratatui::{
     Frame, Terminal,
-    backend::{Backend, CrosstermBackend},
+    backend::CrosstermBackend,
     buffer::Buffer,
-    layout::{Constraint, Flex, Layout},
+    layout::{Constraint, Flex, Layout, Rect},
     style::{Color, Style},
     text::Line,
     widgets::{Block, Borders, Paragraph, ScrollbarState, TableState},
@@ -301,9 +301,9 @@ impl<T: Send + 'static> RefreshWorker<T> {
         false
     }
 
-    /// Starts the automatic timer without dispatching a load immediately.
-    pub fn defer_until_interval(&mut self) {
-        self.next_due = Instant::now() + self.interval;
+    /// Changes the automatic refresh interval, from the next completed load on.
+    pub fn set_interval(&mut self, refresh_secs: u64) {
+        self.interval = Duration::from_secs(refresh_secs.max(1));
     }
 
     /// Returns a completed load without blocking.
@@ -341,15 +341,6 @@ impl<T: Send + 'static> RefreshWorker<T> {
     }
 }
 
-/// Draws a centered loading spinner that also works on very small terminals.
-pub fn render_loading_frame(
-    terminal: &mut Terminal<impl Backend<Error: Send + Sync + 'static>>,
-    spinner_index: usize,
-) -> anyhow::Result<()> {
-    terminal.draw(|frame| render_loading(frame, spinner_index, "Loading sessions..."))?;
-    Ok(())
-}
-
 /// Resolves the footer status consistently for every redraw path.
 pub fn refresh_status(active: bool, failure_until: Option<Instant>) -> Option<&'static str> {
     if active {
@@ -361,8 +352,9 @@ pub fn refresh_status(active: bool, failure_until: Option<Instant>) -> Option<&'
     }
 }
 
-fn render_loading(frame: &mut Frame, spinner_index: usize, message: &str) {
-    let area = frame.area();
+/// Draws a centered loading spinner into `area`; it also works when `area` is
+/// very small.
+pub fn render_loading(frame: &mut Frame, area: Rect, spinner_index: usize, message: &str) {
     let [middle] = Layout::vertical([Constraint::Length(3)])
         .flex(Flex::Center)
         .areas(area);
@@ -575,8 +567,15 @@ fn handle_input_from(source: &mut impl EventSource) -> anyhow::Result<InputActio
                 if key.code == KeyCode::Esc {
                     return Ok(InputAction::Close);
                 }
-                if key.code == KeyCode::Char('Q') {
-                    return Ok(InputAction::ToggleQuota);
+                match key.code {
+                    KeyCode::Char(digit @ '1'..='9') => {
+                        return Ok(InputAction::SwitchTab(digit as usize - '1' as usize));
+                    }
+                    KeyCode::Tab => return Ok(InputAction::NextTab),
+                    KeyCode::BackTab => return Ok(InputAction::PrevTab),
+                    KeyCode::Char('t' | 'T') => return Ok(InputAction::CycleRange),
+                    KeyCode::Char('o' | 'O') => return Ok(InputAction::CycleSort),
+                    _ => {}
                 }
                 if key.code == KeyCode::Char('p') || key.code == KeyCode::Char('P') {
                     return Ok(InputAction::TogglePane);
@@ -614,6 +613,35 @@ fn handle_input_from(source: &mut impl EventSource) -> anyhow::Result<InputActio
     }
 }
 
+/// Waits up to 100 ms for one event and hands a key press back unmapped, for a
+/// view that reads keys itself (a settings form, a text input).
+///
+/// Only `Ctrl+C` is still read here, as [`InputAction::Quit`].
+///
+/// # Errors
+///
+/// Returns an error if polling for or reading a terminal event fails.
+pub fn handle_key_input() -> anyhow::Result<InputAction> {
+    handle_key_input_from(&mut CrosstermEventSource)
+}
+
+fn handle_key_input_from(source: &mut impl EventSource) -> anyhow::Result<InputAction> {
+    if !source.poll(Duration::from_millis(100))? {
+        return Ok(InputAction::Continue);
+    }
+    Ok(match source.read()? {
+        Event::Key(key) if key.kind != KeyEventKind::Release => {
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                InputAction::Quit
+            } else {
+                InputAction::Key(key.code)
+            }
+        }
+        Event::Resize(_, _) => InputAction::Resize,
+        _ => InputAction::Continue,
+    })
+}
+
 /// A net navigation move accumulated from one [`handle_input`] batch.
 ///
 /// `lines` is single-row steps (arrow keys), summed across the drained event
@@ -637,9 +665,16 @@ pub enum InputAction {
     Quit,
     /// User pressed `Esc`: close whatever is open, or quit when nothing is.
     Close,
-    /// User toggled the full-screen quota detail overlay (`Q`); usage view
-    /// only, ignored elsewhere.
-    ToggleQuota,
+    /// User picked a tab by its number (`1`-`9`), zero-based.
+    SwitchTab(usize),
+    /// User moved to the next tab (`Tab`).
+    NextTab,
+    /// User moved to the previous tab (`Shift+Tab`).
+    PrevTab,
+    /// User cycled the time range (`t` / `T`).
+    CycleRange,
+    /// User cycled the sort column (`o` / `O`).
+    CycleSort,
     /// User toggled the Provider Usage panel (`p` / `P`); usage view only,
     /// ignored elsewhere.
     TogglePane,
@@ -650,6 +685,8 @@ pub enum InputAction {
     ToggleMerge,
     /// User scrolled / moved the selection; redraw without re-fetching.
     Navigate(NavDelta),
+    /// A key press, unmapped; only [`handle_key_input`] returns it.
+    Key(KeyCode),
     /// Terminal was resized — redraw the current frame at the new size
     /// without re-fetching session data.
     Resize,
@@ -997,8 +1034,12 @@ mod tests {
         // Esc is distinct from quit so a view with an overlay can back out of it
         // instead of exiting.
         assert_eq!(press(KeyCode::Esc), InputAction::Close);
-        // Shift+q opens the quota detail; plain `q` still quits.
-        assert_eq!(press(KeyCode::Char('Q')), InputAction::ToggleQuota);
+        assert_eq!(press(KeyCode::Char('1')), InputAction::SwitchTab(0));
+        assert_eq!(press(KeyCode::Char('3')), InputAction::SwitchTab(2));
+        assert_eq!(press(KeyCode::Tab), InputAction::NextTab);
+        assert_eq!(press(KeyCode::BackTab), InputAction::PrevTab);
+        assert_eq!(press(KeyCode::Char('t')), InputAction::CycleRange);
+        assert_eq!(press(KeyCode::Char('o')), InputAction::CycleSort);
         assert_eq!(press(KeyCode::Char('p')), InputAction::TogglePane);
         assert_eq!(press(KeyCode::Char('P')), InputAction::TogglePane);
 
