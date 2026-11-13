@@ -587,6 +587,14 @@ pub fn aggregate_sessions_by_model_from_paths_with_cache(
         );
     }
 
+    // Hermes records no file operations, so analysis folds it nowhere.
+    crate::scan::fold_remotes(
+        ledger,
+        |provider| provider != ExtensionType::Hermes && providers.includes(provider),
+        time_range,
+        &mut projection,
+    );
+
     diagnostics.finalize();
     Ok(AnalysisCollection {
         data: projection.finish(),

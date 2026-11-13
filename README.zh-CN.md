@@ -276,6 +276,23 @@ Grok 的 `usage` 是单一时点的本地 context 估算：vct 会把 `signals.j
 
 每次 `usage` 与 `analysis` 扫描都会读写 `~/.vct/sessions/` 下的 session 账本（每个助手一个 `<provider>.json`）。没有变动的 session 不会被解析第二次，所以一次性运行与面板的首次加载只需处理有变动的部分。更重要的是，来源消失后 session 仍会留在账本里：当助手清掉自己的历史（Claude Code 默认只保留 30 天），或整个 session 目录（例如 `~/.claude/projects`）被删除时，所有汇总仍会把它们算进去，非交互式运行也会打印一行说明有多少 session 来自账本。继续对话的 session 会在日志变动时重新读取。账本只保存每日的 token 数与工具计数（沿用各 provider 自己的字段形状），不存对话内容也不存价格，而且 vct 永远不会删除它：读不了的文件会改名放在旁边，较新版 vct 写的文件则原封不动。想从磁盘现状重新开始，删掉这个目录即可。`vct analysis --json` 与 `vct analysis FILE` 会完整解析文件，不使用账本。
 
+### 其他机器
+
+`vct usage` 与 `vct analysis` 可以把其他机器的 session 加进这台的汇总。在 [`config.toml`](#%E9%85%8D%E7%BD%AE) 里把它们列为 ssh 目标：
+
+```toml
+[remotes]
+hosts = ["devbox", "wei@laptop"]
+```
+
+vct 会通过 ssh 在每台主机上运行 `vct ledger export`，并把返回的结果并入所有汇总。经过连接的只有那台机器的账本，也就是每日的 token 数与工具计数：对话内容、数据库与凭证都留在原地。每台主机都要装有支持 `ledger export` 的 vct，并且能不经提示登录，因为 vct 以批处理模式运行 `ssh`：密钥、agent，或 `~/.ssh/config` 为该名称配置的任何方式皆可。
+
+- 一次性命令（`--json`、`--text`、`--table`）会先抓取，每台主机最多等 30 秒。主机第一次导出要解析完整历史，可能超过这个时间；它在那边仍会跑完，所以下一次运行就拿得到。面板则每 `refresh_interval` 秒（默认 300）在后台抓取，从不等待。
+- 连不上的主机会继续显示上次抓到的数据，一次性命令在 stderr 打印警告，面板则记在日志。把主机从 `hosts` 拿掉就会移除它的数据。
+- 非交互式 ssh 的 `PATH` 很精简，所以 vct 会依次在 `PATH`、`~/.local/bin`、`~/.cargo/bin` 与 `~/.nvm` 下找远端的可执行文件。装在别处时，把 `command` 设成启动它的方式。
+- 两台机器都有的 session（例如共用主目录）只算一次。日期是各机器自己的本地日期。汇总是合并后的数字，没有分机器的明细。
+- `vct analysis --json`、`vct analysis FILE` 与额度面板只看本机。
+
 ### 实时额度面板
 
 `vct usage` 会**在仪表盘中直接显示 Claude Code、Codex、GitHub Copilot、Cursor、Grok 与 Antigravity 的实时额度用量——完全零配置。** 不需要 status-line hook，也无需手动输入任何凭证：vct 会读取各 provider 自己的 OAuth 凭证，在后台线程调用其用量 API（Antigravity 则是询问 `agy` CLI），并在你工作时保持面板持续更新。每个进度条都是**已用**百分比，所以进度条满格代表该额度周期已耗尽，而不是还没开始用。（想要更清爽的面板？在 [`config.toml`](#%E9%85%8D%E7%BD%AE) 中精简 `[usage.quota]` 下的 `panels`，或设为 `[]` 隐藏所有额度卡片。表格下方那行各 provider 成本是本机扫描数据而不是额度面板，所以不受这里的设置影响。）

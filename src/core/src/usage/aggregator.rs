@@ -557,6 +557,13 @@ pub fn aggregate_usage_from_paths_with_cache_opts(
         );
     }
 
+    crate::scan::fold_remotes(
+        ledger,
+        |provider| providers.includes(provider),
+        time_range,
+        &mut accumulator,
+    );
+
     diagnostics.finalize();
     Ok(UsageCollection {
         data: accumulator.finish(),

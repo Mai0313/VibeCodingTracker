@@ -41,6 +41,7 @@ pub mod logging;
 pub mod models;
 pub mod pricing;
 pub mod quota;
+pub mod remote;
 pub mod scan;
 pub mod session;
 pub mod update;

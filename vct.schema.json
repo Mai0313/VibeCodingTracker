@@ -194,6 +194,37 @@
       },
       "type": "object"
     },
+    "remotes": {
+      "default": {
+        "command": "",
+        "hosts": [],
+        "refresh_interval": 300
+      },
+      "description": "`[remotes]` — other machines whose usage is merged into this one's.\n\nvct runs `vct ledger export` on each host over ssh and adds the sessions it\nreturns to the usage and analysis views. Only computed totals cross the\nconnection, never conversations. vct must be installed on each host.",
+      "properties": {
+        "command": {
+          "default": "",
+          "description": "How to start vct on the hosts, for example \"/opt/vct/bin/vct\". Empty\nlooks for it on the remote PATH, in ~/.local/bin, ~/.cargo/bin and\nunder ~/.nvm.",
+          "type": "string"
+        },
+        "hosts": {
+          "default": [],
+          "description": "ssh destinations to merge, as you would pass them to `ssh`: a host\nname, `user@host`, or an alias from `~/.ssh/config`. Each must accept a\nnon-interactive login (a key or an agent, no password prompt).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "refresh_interval": {
+          "default": 300,
+          "description": "Seconds between fetches while a TUI is open (minimum 60).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "usage": {
       "default": {
         "merge_models": false,
