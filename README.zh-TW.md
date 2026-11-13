@@ -572,7 +572,7 @@ vct config migrate
 - **OpenCode**：只有在 LiteLLM **完全比對**成功時，才會依 token 為新型 model 計價；若沒有完全比對，vct 會採信該 assistant 訊息本身儲存的費用，而不是從名稱相近的 model 去猜測。
 - **Hermes**：與 OpenCode 相同，LiteLLM **完全比對**成功時依 token 計價，否則使用 Hermes 本身儲存的費用。
 - **DeepSeek Harness**：`dsh` 本身不記錄任何費用，因此一律經由與其他 file-based provider 相同的查找鏈依 LiteLLM 計價，沒有 OpenCode 或 Hermes 那樣的 stored cost 兜底。它會路由到部署方設定的任意 provider，因此部署自訂的 model 名稱很常見；LiteLLM 完全比對不到時費用為 $0。
-- **Antigravity**：和其他 file-based provider 一樣依 LiteLLM 計價，model 取自每個 request 的 generation 紀錄。Compaction request 沒有記錄 model，其 token 會記在 `unknown` 下，費用為 $0。
+- **Antigravity**：和其他 file-based provider 一樣依 LiteLLM 計價，model 取自每個 request 的 generation 紀錄。Compaction request 沒有記錄 model，其 token 依當下正在使用的 model 計價。
 - **Grok**：只會把 `contextTokensUsed` 當成 cache-read token 計價（若該 model 沒有公布 cache-read 費率則改用 input 費率）；這是單一當下的本地 context 估算，不是累計的 billed usage。
 
 ---
