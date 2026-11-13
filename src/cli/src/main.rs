@@ -86,6 +86,9 @@ fn main() -> Result<()> {
         // process exits — the log file is the durable record of the failure.
         log::error!("command failed: {error:#}");
     }
+    // A detached worker may still be saving; returning now would kill it
+    // mid-write.
+    vct_core::utils::finish_atomic_writes();
     result
 }
 

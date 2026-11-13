@@ -4,6 +4,25 @@ use serde_json::Value;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
+use std::sync::{PoisonError, RwLock};
+
+/// The file-name prefix of the temp file every atomic write goes through.
+pub(crate) const ATOMIC_TEMP_PREFIX: &str = ".tmp";
+
+/// Held shared by every atomic write, and exclusively for good once
+/// [`finish_atomic_writes`] has run.
+static WRITE_GATE: RwLock<()> = RwLock::new(());
+
+/// Waits for every atomic write in progress and lets none start afterwards.
+///
+/// Call it last, right before the process exits. A background thread still writing when the main thread returns dies mid-write without running its destructors, which leaves the temp file behind next to the file it was replacing.
+pub fn finish_atomic_writes() {
+    close_gate(&WRITE_GATE);
+}
+
+fn close_gate(gate: &RwLock<()>) {
+    std::mem::forget(gate.write().unwrap_or_else(PoisonError::into_inner));
+}
 
 /// Reads a JSONL file and returns one [`Value`] per non-empty line.
 ///
@@ -132,7 +151,10 @@ fn persist_atomic(
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir)
         .with_context(|| format!("Failed to create directory: {}", dir.display()))?;
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)
+    let _writing = WRITE_GATE.read().unwrap_or_else(PoisonError::into_inner);
+    let mut tmp = tempfile::Builder::new()
+        .prefix(ATOMIC_TEMP_PREFIX)
+        .tempfile_in(dir)
         .with_context(|| format!("Failed to create temp file in: {}", dir.display()))?;
     write(&mut tmp)?;
     tmp.as_file().sync_all().ok();
@@ -225,6 +247,38 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
     use tempfile::tempdir;
+
+    #[test]
+    fn closing_the_gate_waits_for_a_write_and_stays_closed() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        static GATE: RwLock<()> = RwLock::new(());
+        static CLOSED: AtomicBool = AtomicBool::new(false);
+        let writing = GATE.read().unwrap();
+        let closer = std::thread::spawn(|| {
+            close_gate(&GATE);
+            CLOSED.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!CLOSED.load(Ordering::SeqCst));
+        drop(writing);
+        closer.join().unwrap();
+        assert!(GATE.try_read().is_err());
+    }
+
+    #[test]
+    fn an_atomic_write_waits_for_the_gate() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("out.json");
+        let closed = WRITE_GATE.write().unwrap();
+        let target = path.clone();
+        let writer = std::thread::spawn(move || write_string_atomic(target, "{}").unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+        drop(closed);
+        writer.join().unwrap();
+        assert!(path.exists());
+    }
 
     #[test]
     fn test_count_lines_empty() {
