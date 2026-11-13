@@ -405,14 +405,28 @@ fn test_version_help() {
 }
 
 #[test]
-fn test_monitor_help() {
+fn test_removed_subcommands_are_rejected() {
+    // `monitor` became `vct quota`, and `fetch` was an alias of `quota`.
+    for name in ["monitor", "fetch"] {
+        Command::cargo_bin("vibe_coding_tracker")
+            .unwrap()
+            .arg(name)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("unrecognized subcommand"));
+    }
+}
+
+#[test]
+fn test_no_subcommand_off_a_terminal_prints_help() {
+    // The interactive app needs a terminal; a pipe gets the help instead, and
+    // nothing is dispatched.
     Command::cargo_bin("vibe_coding_tracker")
         .unwrap()
-        .arg("monitor")
-        .arg("--help")
         .assert()
-        .success()
-        .stdout(predicate::str::contains("quota"));
+        .code(2)
+        .stderr(predicate::str::contains("Usage:"))
+        .stderr(predicate::str::contains("quota"));
 }
 
 #[test]
@@ -429,18 +443,6 @@ fn test_quota_help() {
         .stdout(predicate::str::contains("cursor"))
         .stdout(predicate::str::contains("grok"))
         .stdout(predicate::str::contains("antigravity"));
-}
-
-#[test]
-fn test_fetch_alias_still_works() {
-    // `fetch` is kept as a hidden alias of `quota` for back-compat.
-    Command::cargo_bin("vibe_coding_tracker")
-        .unwrap()
-        .arg("fetch")
-        .arg("--help")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("claude"));
 }
 
 #[test]
@@ -564,13 +566,18 @@ fn single_file_summary_projection_is_parse_mode_invariant() {
 }
 
 #[test]
-fn test_quota_requires_provider() {
-    Command::cargo_bin("vibe_coding_tracker")
-        .unwrap()
-        .arg("quota")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("required").or(predicate::str::contains("PROVIDER")));
+fn test_quota_format_requires_provider() {
+    // Without a provider `quota` opens the app; a format flag asks for a
+    // printed response, which is one provider's.
+    for flag in ["--json", "--text", "--table"] {
+        Command::cargo_bin("vibe_coding_tracker")
+            .unwrap()
+            .arg("quota")
+            .arg(flag)
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("name a provider"));
+    }
 }
 
 #[test]

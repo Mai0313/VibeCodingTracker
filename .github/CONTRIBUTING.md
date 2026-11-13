@@ -82,7 +82,7 @@ The repository is a Cargo workspace: all the Rust code lives in the four members
 ├── scripts/          # install.sh / install.ps1, plus test.sh to regenerate the JSONL goldens
 ├── src/              # The four workspace members
 │   ├── core/         # vct-core: parsing, aggregation, pricing, quota, config, self-update — no terminal deps
-│   ├── tui/          # vct-tui: TUI dashboards, static tables, plain-text renderers, Criterion benchmarks
+│   ├── tui/          # vct-tui: the interactive app, static tables, plain-text renderers, Criterion benchmarks
 │   ├── cli/          # vct-cli: the vibe_coding_tracker binary — clap definitions and command dispatch
 │   └── test-support/ # vct-test-support: dev-only TempHome / fixture helpers (unpublished)
 └── tests/

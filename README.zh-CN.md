@@ -30,7 +30,7 @@
 
 选择你喜欢的查看方式：
 
-- **交互式面板**: 可立即显示 loading spinner 的响应式终端 UI, 支持后台 incremental refresh, 可滚动的模型列表 (方向键), 进程级 CPU/内存实时读数, 以及 K/M/B 精简数字格式
+- **交互式面板**: 一个终端 app, 包含 Usage, Analysis, Quota 与 Settings 四个标签页, 可立即显示 loading spinner, 支持后台 incremental refresh, 可滚动并可排序的模型列表 (方向键, `o`), 进程级 CPU/内存实时读数, 以及 K/M/B 精简数字格式
 - **静态报表**：专业的表格，适合文档记录
 - **脚本友好**：纯文本和 JSON 格式，方便自动化
 - **完整精度**：导出精确费用，满足财务核算需求
@@ -110,13 +110,13 @@ cargo install vct-cli
 ### 首次运行
 
 ```bash
-# View your usage with the interactive dashboard
-vct usage
+# Open the interactive app on the Usage tab
+vct
 
 # Or run the binary built by Cargo/pip
-vibe_coding_tracker usage
+vibe_coding_tracker
 
-# Analyze code operations across all sessions
+# Open it on the Analysis tab (code operations across all sessions)
 vct analysis
 ```
 
@@ -126,7 +126,23 @@ vct analysis
 
 运行 `vct --help` 可列出所有命令，`vct <command> --help` 则会列出该命令的 flag。
 
-时间范围 flag（`usage` 与 `analysis` 共用，互斥，默认 `--all`）：
+不带任何命令运行 `vct` 会打开交互式界面，一个画面有四个标签页：`1 Usage`、`2 Analysis`、`3 Quota` 与 `4 Settings`。`vct usage`、`vct analysis` 与 `vct quota` 会打开同一个界面并停在各自的标签页，`--json`、`--text` 与 `--table` 则只输出结果，不会打开界面。没有终端时（输出被 pipe 或重定向），单独的 `vct` 会打印帮助并以状态码 2 退出。
+
+| 按键                | 动作                                                                          |
+| ------------------- | ----------------------------------------------------------------------------- |
+| `1`-`4`             | 跳到对应的标签页                                                              |
+| `Tab` / `Shift+Tab` | 下一个 / 上一个标签页（在 Settings 标签页，`Tab` 改为在它的两个窗格之间切换） |
+| `↑` / `↓`           | 移动选中的行                                                                  |
+| `o`                 | 切换排序列（Usage、Analysis）                                                 |
+| `t`                 | 切换时间范围：day、week、month、all（Usage、Analysis）                        |
+| `r`                 | 立即刷新（Usage、Analysis）                                                   |
+| `m`                 | 合并 / 拆开 provider 前缀，会保存到配置文件（Usage）                          |
+| `p`                 | 打开 Provider Usage 面板，按 `Esc` 关闭（Usage）                              |
+| `q` / `Esc`         | 退出                                                                          |
+
+Quota 与 Settings 标签页不扫描任何 session。第一次切到 Usage 或 Analysis 时才开始该标签页的扫描，而且只有画面上的标签页会按定时器刷新。标签栏右侧显示时间范围，以及 vct 自己的内存与 CPU 用量。
+
+时间范围 flag（`usage` 与 `analysis` 共用，互斥，默认 `--all`；在交互式界面中则决定打开时的范围）：
 
 | Flag          | 范围                         |
 | ------------- | ---------------------------- |
@@ -144,7 +160,7 @@ vct analysis
 ### 基本用法
 
 ```bash
-# Interactive dashboard (recommended)
+# Open the app on the Usage tab (recommended)
 vct usage
 
 # Static table for reports
@@ -170,20 +186,21 @@ vct usage --table --merge-providers
 ```
 
 > [!NOTE]
-> Model 行会按 cost 升序排序，因此花费最高的 model 会排在最后（在 `--table` 中紧邻 `TOTAL` 行上方）。该排序适用于交互式面板、`--table` 与 `--text` 三种输出；`--json` 的行则没有固定顺序。交互式面板还会隐藏在所选范围内用量为 0 的模型。
+> `--table` 与 `--text` 的 model 行会按 cost 升序排序，因此花费最高的 model 会排在最后（在 `--table` 中紧邻 `TOTAL` 行上方）；`--json` 的行则没有固定顺序。交互式界面默认按 cost 降序排序，按 `o` 可切换排序列：cost、total、input、output、cache read、cache write、model 名称。表格标题右侧会标出当前的排序（`cost ▼`）。交互式界面还会隐藏在所选范围内用量为 0 的模型。
 
 > [!TIP]
-> 同一个 model 在不同 provider 前缀下路由时会显示成多行（`openai/gpt-5.5`、`azure/gpt-5.5`、纯 `gpt-5.5`）。`--merge-providers` 会把第一个 `/` 之后 base 名称相同的行合并（`gpt-5.5` 与 `gpt-5.4` 这类版本不同的仍分开），并把它们已定价的 cost 相加。在交互式面板中按 `m` 可实时切换（该选择会保存到 `~/.vct/config.toml`，因此下次启动会记住它）；`--merge-providers` 则让面板一打开就是合并状态。`--json` 保持为逐一 model 的原始导出。
+> 同一个 model 在不同 provider 前缀下路由时会显示成多行（`openai/gpt-5.5`、`azure/gpt-5.5`、纯 `gpt-5.5`）。`--merge-providers` 会把第一个 `/` 之后 base 名称相同的行合并（`gpt-5.5` 与 `gpt-5.4` 这类版本不同的仍分开），并把它们已定价的 cost 相加。在 Usage 标签页按 `m` 可实时切换（该选择会保存到 `~/.vct/config.toml`，因此下次启动会记住它）；`--merge-providers` 则让该标签页一打开就是合并状态。`--json` 保持为逐一 model 的原始导出。
 
-### 预览：交互式面板（`vct usage`）
+### 预览：Usage 标签页（`vct usage`）
 
 ```
-┌ Models · $79.33 · 49.1M tokens · 3 models ───────────────────────────────────────────────────────────────────────────┐
+ vct  1 Usage  2 Analysis  3 Quota  4 Settings                         range  day  week  month  all   61.8 MB · CPU 0.1%
+┌ Models · $79.33 · 49.1M tokens · 3 models ─────────────────────────────────────────────────────────────────── cost ▼ ┐
 │Model                              Input     Output    Cache Read  Cache Write Total     Cost (USD)   Share           █
 │                                                                                                                      █
-│gemini-3.1-pro-preview                  129K     10.3K       66.0K       1.70K      207K        $0.40             0.4%█
-│claude-haiku-4-5-20251001              5.57K     19.8K       5.20M       55.0K     5.28M        $1.34          █ 10.8%█
 │claude-opus-4-8                        25.7K      179K       42.9M        496K     43.6M       $77.59  █████████ 88.8%█
+│claude-haiku-4-5-20251001              5.57K     19.8K       5.20M       55.0K     5.28M        $1.34          █ 10.8%█
+│gemini-3.1-pro-preview                  129K     10.3K       66.0K       1.70K      207K        $0.40             0.4%█
 │                                                                                                                      █
 │                                                                                                                      █
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
@@ -195,11 +212,10 @@ vct usage --table --merge-providers
 │Fable ▰▰▰▰▱  79% 1d23h││credits 0 · +3 reset  ││                      ││api   ▰▰▰▱▱  44% 16d0h││balance $12.00        │
 │bal - · $0.00 used    ││reset expires 17d0h   ││                      ││                      ││                      │
 └──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘
-                Total Cost: $79.33  |  Total Tokens: 49.1M  |  Models: 3  |  Memory: 4.7 MB  |  CPU: 0.0%
-                    ↑/↓ scroll  m merge  p providers  Q quota  r refresh  q quit  |  Star on GitHub
+                ↑/↓ scroll  o sort  t range  m merge  p providers  r refresh  q quit  |  Star on GitHub
 ```
 
-两个交互式面板都会在 terminal setup 完成后立即绘制居中的 `Loading sessions...` spinner. Loading 期间仍可响应 `q`, Ctrl+C 与 resize event. 后续扫描会在 `Refreshing...` footer 下保留上一次成功的数据. 如果 refresh 失败, 面板会保留 last-known-good view, 并在下次排程或手动刷新时重试.
+Usage 与 Analysis 标签页各自在第一次切到时开始扫描, 并绘制居中的 `Loading sessions...` spinner. Loading 期间仍可响应 `q`, Ctrl+C 与 resize event. 后续扫描会在 `Refreshing...` footer 下保留上一次成功的数据. 如果 refresh 失败, 标签页会保留 last-known-good view, 并在下次排程或手动刷新时重试. 所选范围内没有任何 session 时, 会显示空的表格.
 
 ### 预览：表格与 JSON（`vct usage`）
 
@@ -319,11 +335,11 @@ vct 会通过 ssh 在每台主机上运行 `vct ledger export`，并把返回的
 - **Copilot** — 方案类型，以及你的 premium 请求额度，以两个进度条呈现：已用百分比，以及已用 / 总量的请求数（例如 `45/1500`），来自 GitHub 的 Copilot API（`GET /copilot_internal/user`），从 `~/.copilot/config.json` 读取。该请求会模拟 Copilot CLI。token 为长期有效，因此不需要刷新；遇到 `401` / `403` 时会显示 `run: copilot login` 提示。
 - **Cursor** — 方案类型、total / auto / API **已用**百分比，以及按需消费，来自 cursor.com（`GET /api/usage-summary`），使用 `~/.config/cursor/auth.json` 中的 session token。
 - **Grok** — 方案类型，以及当前每周或每月周期内的方案内含额度用量，来自 Grok CLI 自己的计费端点（`GET /v1/billing?format=credits`），从 `~/.grok/auth.json` 读取。预付余额只有在非零时才会显示；按量付费的消费则在你有过消费、或设置了上限之后才会显示。该请求会模拟 Grok CLI；遇到 `401` / `403` 时会显示 `run: grok login` 提示。
-- **Antigravity** — 每个共享模型池的额度（agy 的是 Gemini 以及 Claude / GPT，各有 5 小时与每周额度），来自 `agy` CLI 自己的 `/usage` 命令（`agy -p /usage --output-format json`）。卡片直接使用 agy 给出的模型池名称，每个额度则按 agy 的时间窗原样标示（`5h` 排在最前，然后是 `weekly`）；卡片放不下所有模型池时，其余的以 `+N` 标出，`Q` 浮层会加高到全部放得下。`/usage` 不提供方案名称，所以第一行只显示数据的新旧。vct 会运行 `PATH` 上的 `agy`，找不到时改找 agy 的安装位置（`~/.local/bin/agy`、`%LOCALAPPDATA%\agy\bin\agy.exe`），或 Google 内部版本 Jetski 的位置（gLinux 上的 `/google/bin/releases/jetski-devs/tools/cli`、macOS 上的 `/usr/local/bin/jetski`）；尚未登录的 agy 不会挡掉 Jetski。agy 会自行维持登录状态，因此 vct 只检查 `~/.gemini/antigravity-cli/antigravity-oauth-token` 是否存在，从不读取或写入它；Jetski 有自己的登录方式，找到它就够了。每次轮询都会启动一次 agy（需要几秒、约 260 MB），所以这张卡片最多每 5 分钟更新一次。agy 无法登录时，卡片会显示 `run: agy acp --login` 提示，而且在该文件变动之前，仪表盘不会再运行 agy。
+- **Antigravity** — 每个共享模型池的额度（agy 的是 Gemini 以及 Claude / GPT，各有 5 小时与每周额度），来自 `agy` CLI 自己的 `/usage` 命令（`agy -p /usage --output-format json`）。卡片直接使用 agy 给出的模型池名称，每个额度则按 agy 的时间窗原样标示（`5h` 排在最前，然后是 `weekly`）；卡片放不下所有模型池时，其余的以 `+N` 标出。`/usage` 不提供方案名称，所以第一行只显示数据的新旧。vct 会运行 `PATH` 上的 `agy`，找不到时改找 agy 的安装位置（`~/.local/bin/agy`、`%LOCALAPPDATA%\agy\bin\agy.exe`），或 Google 内部版本 Jetski 的位置（gLinux 上的 `/google/bin/releases/jetski-devs/tools/cli`、macOS 上的 `/usr/local/bin/jetski`）；尚未登录的 agy 不会挡掉 Jetski。agy 会自行维持登录状态，因此 vct 只检查 `~/.gemini/antigravity-cli/antigravity-oauth-token` 是否存在，从不读取或写入它；Jetski 有自己的登录方式，找到它就够了。每次轮询都会启动一次 agy（需要几秒、约 260 MB），所以这张卡片最多每 5 分钟更新一次。agy 无法登录时，卡片会显示 `run: agy acp --login` 提示，而且在该文件变动之前，仪表盘不会再运行 agy。
 
 **自动刷新 token。** 对 Claude、Codex 和 Grok，当 token 接近过期或被拒绝时，vct 会刷新它并把新 token 写回该 provider 自己的凭证文件（采用该 CLI 的原始格式）。写入 Grok 的凭证文件时，会保留文件中其他所有的登录信息。如果刷新失败，面板会显示 `run: <provider> auth login` 提示，而不会直接中断。Copilot（长期有效的 token）和 Cursor（由其自身客户端保持最新）为只读——vct 从不写入它们的凭证文件。Antigravity 的 token 属于 agy，每当 vct 向它询问 `/usage` 时由 agy 自行刷新。
 
-只有在某个 provider 的凭证存在时，才会显示对应的面板。面板排在一个统一网格上：一行放得下几张就放几张，放不下的自动折到下一行。当终端高度不足以留给网格时，它会收成一行摘要，显示放得下的 gauge，并把其余的记成数量；按 `Q` 打开完整的额度浮层，卡片会加高到最高那张的高度（前提是所有 provider 仍放得下），终端够高时每张卡片都放得下全部内容，按 `p` 打开 Provider Usage 面板，里面有各 provider 的 token 数与占比。额度面板仅在交互式 TUI 中显示；`--table`、`--text`、`--json` 不受影响。
+只有在某个 provider 的凭证存在时，才会显示对应的面板。面板排在一个统一网格上：一行放得下几张就放几张，放不下的自动折到下一行。当终端高度不足以留给网格时，它会收成一行摘要，显示放得下的 gauge，并把其余的记成 `+N more → 3`；按 `3` 切到 [Quota 标签页](#quota-%E6%A0%87%E7%AD%BE%E9%A1%B5)，整个画面都留给卡片，按 `p` 打开 Provider Usage 面板，里面有各 provider 的 token 数与占比。额度面板仅在交互式 TUI 中显示；`--table`、`--text`、`--json` 不受影响。
 
 > **平台说明：** 在 macOS 上，Claude Code 会把 OAuth 凭证保存在系统 Keychain 中，而不是 `~/.claude/.credentials.json`，因此在 macOS 上不会显示 Claude 面板。agy 在 macOS 上同样把登录信息保存在 Keychain，所以 macOS 上只有 Google 内部版本 Jetski 会显示 Antigravity 面板。Cursor 的 `~/.config/cursor` 凭证路径偏向 Linux。
 
@@ -338,7 +354,7 @@ vct 会通过 ssh 在每台主机上运行 `vct ledger export`，并把返回的
 ### 基本用法
 
 ```bash
-# Interactive dashboard for all sessions (default)
+# Open the app on the Analysis tab, all sessions (default)
 vct analysis
 
 # Static table output with per-provider totals
@@ -367,10 +383,11 @@ vct analysis --json --daily
 vct analysis --json --daily > today.json
 ```
 
-### 预览：交互式面板（`vct analysis`）
+### 预览：Analysis 标签页（`vct analysis`）
 
 ```
-┌ Models · 135K lines · 1.80K tool calls · 3 models ───────────────────────────────────────────────────────────────────┐
+ vct  1 Usage  2 Analysis  3 Quota  4 Settings                         range  day  week  month  all   61.9 MB · CPU 0.1%
+┌ Models · 135K lines · 1.80K tool calls · 3 models ────────────────────────────────────────────────────────── lines ▼ ┐
 │Model                                   Edit Lines  Read Lines  Write Lines Bash    Edit    Read    TodoWrite  Write  █
 │                                                                                                                      █
 │claude-opus-4-8                               12.4K       88.1K       9.02K     412     231     604         96      88█
@@ -384,9 +401,10 @@ vct analysis --json --daily > today.json
 │Claude                   13.2K       93.5K       9.63K        443      247      646      102         93       12      │
 │Gemini                   2.10K       14.8K       1.62K        84       44       112      16          15       3       │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-                 Total Lines: 135K  |  Total Tools: 1.80K  |  Models: 3  |  Memory: 4.8 MB  |  CPU: 0.0%
-                                    ↑/↓ scroll  r refresh  q quit  |  Star on GitHub
+                           ↑/↓ scroll  o sort  t range  r refresh  q quit  |  Star on GitHub
 ```
+
+表格默认按总行数降序排序；按 `o` 可切换排序列：lines、edit lines、read lines、write lines、tool calls、model 名称。
 
 ### 预览：表格与 JSON（`vct analysis`）
 
@@ -498,18 +516,20 @@ vct version --json   # 机读 JSON
 
 ---
 
-## Monitor 命令
+## Quota 命令
 
-**只显示实时 quota 面板，占满整个画面。**
+**全屏的实时 quota 面板，或某个供应商的原始 quota/usage API 响应。**
 
-`vct monitor` 显示与 `usage` 仪表板相同的 quota 卡片，但不扫描任何 session，所以立即打开，也足够轻量，适合放在空闲的 pane 里常驻。它沿用相同的设置：[`config.toml`](#%E9%85%8D%E7%BD%AE) 中 `[usage.quota]` 下的 `panels` 与 `refresh_interval`。按 `q` 或 `Esc` 退出。
+### Quota 标签页
+
+`vct quota` 会打开交互式界面并停在 Quota 标签页。它显示与 Usage 标签页相同的 quota 卡片，进度条更宽，终端放得下几张就显示几张（其余的以 `+N hidden, enlarge the terminal` 标出数量）。它不扫描任何 session，所以立即打开，也足够轻量，适合放在空闲的 pane 里常驻。它沿用相同的设置：[`config.toml`](#%E9%85%8D%E7%BD%AE) 中 `[usage.quota]` 下的 `panels` 与 `refresh_interval`。
 
 ```bash
-vct monitor
+vct quota
 ```
 
 ```
- Quota Monitor                                                         15:01:37
+ vct  1 Usage  2 Analysis  3 Quota  4 Settings                31.6 MB · CPU 0.0%
 
 ┌ Claude ──────────────────────────────┐┌ Codex ───────────────────────────────┐
 │max 5x                        just now││plus                          just now│
@@ -522,17 +542,13 @@ vct monitor
                                      q quit
 ```
 
----
+> `vct monitor` 与隐藏别名 `vct fetch` 已移除。要看卡片请用 `vct quota`，要看原始响应请用 `vct quota <provider>`。
 
-## Quota 命令
+### 原始响应（`vct quota <provider>`）
 
-**打印某个供应商的原始 quota/usage API 响应 — 不解析、不聚合。**
+带上供应商时，`vct quota` 会打印该供应商的原始响应，不解析、不聚合。它对 `usage` 面板使用的同一个 quota 端点（Claude / Codex / Copilot / Cursor / Grok）发一次请求，直接打印原始 body，方便你查看 API 的实际结构或检查凭证是否正常。它读取各供应商已保存的凭证，并且**不会**刷新 token：token 过期时，请用对应供应商自己的 CLI 重新登录（`claude` / `codex` / `copilot` / `cursor-agent` / `grok`）。`vct quota antigravity` 则是运行一次 `agy -p /usage --output-format json`（或按仪表盘相同的方式找到的 Jetski）并打印它的输出；agy 会在运行时自行刷新 token。
 
-对 `usage` 面板使用的同一个 quota 端点（Claude / Codex / Copilot / Cursor / Grok）发一次请求，直接打印原始 body，方便你查看 API 的实际结构或检查凭证是否正常。它读取各供应商已保存的凭证，并且**不会**刷新 token：token 过期时，请用对应供应商自己的 CLI 重新登录（`claude` / `codex` / `copilot` / `cursor-agent` / `grok`）。`vct quota antigravity` 则是运行一次 `agy -p /usage --output-format json`（或按仪表盘相同的方式找到的 Jetski）并打印它的输出；agy 会在运行时自行刷新 token。
-
-> 旧名称 `vct fetch` 保留为隐藏别名，现有脚本仍可继续使用。
-
-### 基本用法
+`--json`、`--text` 与 `--table` 打印的是单个供应商的响应，所以不带供应商的 `vct quota --json` 会报错。
 
 ```bash
 # 原始 JSON（默认）
@@ -566,6 +582,34 @@ vct 会把用户设置保存在 `~/.vct/config.toml` 中。该文件会在**首�
 
 > [!NOTE]
 > vct 会把诊断信息写入 `~/.vct/logs/vct-YYYY-MM-DD.log`（纯文本，仅写文件，绝不显示在面板上）。健康运行时保持安静（默认级别 `warn`），且文件是惰性创建的，所以一次正常运行不会留下任何文件。当额度获取失败或某个 session 被跳过时，原因就记录在这里——需要完整细节时把 `logging.level` 调到 `debug`。
+
+### Settings 标签页
+
+在交互式界面中按 `4`（或用 `Tab` 切过去），就能以表单编辑 `config.toml` 的每一项设置：左边是分区，右边是该分区的字段，下方则是当前字段的说明、配置键与默认值。
+
+```
+ vct  1 Usage  2 Analysis  3 Quota  4 Settings                                                        31.8 MB · CPU 0.0%
+┌ Sections ──────┐┌ Usage ─────────────────────────────────────────────────────────────────────────────────────────────┐
+│ General        ││ Merge models across providers                                                               [x] on │
+│ Usage          ││ Redraw interval                                                                           ‹ 10 s › │
+│ Analysis       ││ Quota panel: Claude                                                                         [x] on │
+│ Providers      ││ Quota panel: Codex                                                                          [x] on │
+│ Remotes        ││ Quota panel: Copilot                                                                        [x] on │
+│ Performance    ││ Quota panel: Cursor                                                                         [x] on │
+│ Logging        ││ Quota panel: Grok                                                                           [x] on │
+└────────────────┘└────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Quota panel: Claude · usage.quota.panels ─────────────────────────────────────────────────────────── default: [x] on ┐
+│Which live quota panels to show in the app, by provider name. An empty list hides every quota card.                   │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+                            ↑↓ move  ←→ change  ⏎ edit  tab pane  x reset  1-4 view  q quit
+```
+
+- `↑` / `↓` 移动，`Tab` 切换窗格，`←` / `→` 修改数值（开关、增减数字、切换选项），`x` 把字段重置为默认值。
+- `Enter` 打开编辑器：可挑选的列表、数字或文本输入，或远程主机列表（`a` 新增、`Enter` 编辑、`d` 删除）。
+- 每次修改都会立即写入文件，并保留文件里的注释。
+- 合并、刷新间隔、quota 面板、quota 轮询间隔与 provider 开关的修改会直接反映在运行中的界面（quota 面板则在离开 Settings 标签页时生效）。默认时间范围、自动更新、扫描线程数、logging 与 remotes 要到下次启动才生效，表单会在这些字段上标明。
+
+手动编辑文件与下方的 `vct config` 命令仍然可用。
 
 ### 管理配置文件
 

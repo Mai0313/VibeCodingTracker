@@ -10,7 +10,7 @@
       "properties": {
         "refresh_interval": {
           "default": 10,
-          "description": "Seconds between automatic redraws of the analysis TUI (minimum 1).",
+          "description": "Seconds between automatic refreshes of the Analysis tab (minimum 1).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -217,7 +217,7 @@
         },
         "refresh_interval": {
           "default": 300,
-          "description": "Seconds between fetches while a TUI is open (minimum 60).",
+          "description": "Seconds between fetches while the app is open (minimum 60).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -271,7 +271,7 @@
                 "grok",
                 "antigravity"
               ],
-              "description": "Which live quota panels to show in the usage TUI (by provider name:\n`claude` / `codex` / `copilot` / `cursor` / `grok` / `antigravity`). An\nempty list hides every quota card; the Provider Usage pane has its own `p`\ntoggle.",
+              "description": "Which live quota panels to show in the app (by provider name:\n`claude` / `codex` / `copilot` / `cursor` / `grok` / `antigravity`). An\nempty list hides every quota card.",
               "items": {
                 "type": "string"
               },
@@ -289,7 +289,7 @@
         },
         "refresh_interval": {
           "default": 10,
-          "description": "Seconds between automatic redraws of the usage TUI (minimum 1).",
+          "description": "Seconds between automatic refreshes of the Usage tab (minimum 1).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"

@@ -10,28 +10,20 @@ use crate::display::analysis::averages::{
 };
 use crate::display::common::table::{
     CONTENT_MIN_H, ColumnSpec, FOOTER_H, TableChrome, create_controls_with_status,
-    create_provider_row, create_ratatui_table, create_summary, fit_columns, frame_layout,
-    init_process_metrics, refresh_process_metrics, render_scrollable_table, render_too_small,
-    styled_row,
+    create_provider_row, create_ratatui_table, fit_columns, frame_layout, render_scrollable_table,
+    render_too_small, styled_row,
 };
-use crate::display::common::tui::{
-    InputAction, RefreshWorker, RefreshWorkerError, ScrollState, TerminalSession, UpdateTracker,
-    handle_input, overlay_repo_hyperlink, refresh_status, render_loading_frame,
-};
+use crate::display::common::tui::{LEDGER_SAVE_INTERVAL, NavDelta, ScrollState, UpdateTracker};
 use ratatui::{
-    Terminal,
-    backend::{Backend, CrosstermBackend},
-    layout::Constraint,
+    Frame,
+    layout::{Constraint, Rect},
     style::{Color as RatatuiColor, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Row as RatatuiRow},
 };
-use std::io;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use sysinfo::{Pid, System};
 use vct_core::analysis::AnalysisData;
 use vct_core::config::ProvidersConfig;
+use vct_core::ledger::SessionLedger;
 use vct_core::utils::format_compact;
 
 /// Upper bound on the number of rows tracked for the "recently updated"
@@ -44,7 +36,7 @@ const ANALYSIS_MIN_W: u16 = 84;
 const ANALYSIS_MIN_H: u16 = 14;
 /// Rows that must fit *below* the provider band before it is worth showing: the
 /// scrollable table (`frame_layout` gives it `CONTENT_MIN_H` ≈ 2 body rows after
-/// the border + header + margin) plus the one-line summary and controls rows.
+/// the border + header + margin) plus the one-line controls row.
 const ANALYSIS_BELOW_BAND_MIN_H: u16 = CONTENT_MIN_H + FOOTER_H;
 /// Floor for the model-name column, so narrowing the pane drops a metric column
 /// rather than cutting the name.
@@ -53,7 +45,7 @@ const MODEL_COL_MIN_W: u16 = 26;
 const PROVIDER_COL_MIN_W: u16 = 15;
 
 /// Height of the provider band, or `None` when the terminal is too short to
-/// show it without squeezing the table / summary / controls beneath it.
+/// show it without squeezing the table / controls beneath it.
 ///
 /// The band is `provider_row_count + 4` rows tall (its own border + header),
 /// floored at 4. Because it scales with the number of providers, gating on a
@@ -66,32 +58,100 @@ fn analysis_panels_height(area_height: u16, provider_row_count: usize) -> Option
         .then_some(totals_height)
 }
 
-struct AnalysisUiState {
+/// Which column the analysis table is ordered by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum AnalysisSort {
+    #[default]
+    Lines,
+    EditLines,
+    ReadLines,
+    WriteLines,
+    Tools,
+    Model,
+}
+
+impl AnalysisSort {
+    /// The column after this one, wrapping around.
+    fn next(self) -> Self {
+        match self {
+            Self::Lines => Self::EditLines,
+            Self::EditLines => Self::ReadLines,
+            Self::ReadLines => Self::WriteLines,
+            Self::WriteLines => Self::Tools,
+            Self::Tools => Self::Model,
+            Self::Model => Self::Lines,
+        }
+    }
+
+    /// What the table title shows: numbers run largest first, names A to Z.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Lines => "lines ▼",
+            Self::EditLines => "edit lines ▼",
+            Self::ReadLines => "read lines ▼",
+            Self::WriteLines => "write lines ▼",
+            Self::Tools => "tool calls ▼",
+            Self::Model => "model ▲",
+        }
+    }
+
+    /// Orders `rows` by this column, model name breaking ties.
+    fn apply(self, rows: &mut [AnalysisRow]) {
+        let lines = |row: &AnalysisRow| row.edit_lines + row.read_lines + row.write_lines;
+        let tools = |row: &AnalysisRow| {
+            row.bash_count
+                + row.edit_count
+                + row.read_count
+                + row.todo_write_count
+                + row.write_count
+        };
+        rows.sort_by(|a, b| {
+            let primary = match self {
+                Self::Lines => lines(b).cmp(&lines(a)),
+                Self::EditLines => b.edit_lines.cmp(&a.edit_lines),
+                Self::ReadLines => b.read_lines.cmp(&a.read_lines),
+                Self::WriteLines => b.write_lines.cmp(&a.write_lines),
+                Self::Tools => tools(b).cmp(&tools(a)),
+                Self::Model => std::cmp::Ordering::Equal,
+            };
+            primary.then_with(|| a.model.cmp(&b.model))
+        });
+    }
+}
+
+/// What the analysis tab keeps between frames.
+pub(crate) struct AnalysisUiState {
     rows: Vec<AnalysisRow>,
     totals: AnalysisRow,
     provider_totals: AnalysisProviderTotals,
     update_tracker: UpdateTracker,
     scroll: ScrollState,
+    sort: AnalysisSort,
 }
 
 impl AnalysisUiState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             rows: Vec::new(),
             totals: AnalysisRow::default(),
             provider_totals: AnalysisProviderTotals::default(),
             update_tracker: UpdateTracker::new(MAX_TRACKED_ANALYSIS_ROWS, 1000),
             scroll: ScrollState::new(),
+            sort: AnalysisSort::default(),
         }
     }
 
-    fn apply(&mut self, data: AnalysisData) {
-        let previous = self
-            .scroll
+    fn selected_model(&self) -> Option<String> {
+        self.scroll
             .table
             .selected()
             .and_then(|index| self.rows.get(index))
-            .map(|row| row.model.clone());
+            .map(|row| row.model.clone())
+    }
+
+    /// Takes in a finished scan.
+    pub(crate) fn apply(&mut self, data: AnalysisData) {
+        let previous = self.selected_model();
         self.rows = convert_to_analysis_rows(&data.rows);
         self.rows.retain(|row| {
             row.edit_lines != 0
@@ -103,6 +163,7 @@ impl AnalysisUiState {
                 || row.todo_write_count != 0
                 || row.write_count != 0
         });
+        self.sort.apply(&mut self.rows);
         self.totals = AnalysisRow::default();
         let fingerprints: Vec<_> = self
             .rows
@@ -148,298 +209,96 @@ impl AnalysisUiState {
         );
     }
 
-    fn render(
-        &mut self,
-        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-        sys: &System,
-        pid: Pid,
-        status: Option<&str>,
-    ) -> anyhow::Result<()> {
-        render_analysis_frame_with_status(
-            terminal,
+    /// Moves on to the next sort column (`o`).
+    pub(crate) fn cycle_sort(&mut self) {
+        let previous = self.selected_model();
+        self.sort = self.sort.next();
+        self.sort.apply(&mut self.rows);
+        let models: Vec<_> = self.rows.iter().map(|row| row.model.clone()).collect();
+        self.scroll.sync(previous.as_deref(), &models);
+    }
+
+    /// Moves the selection.
+    pub(crate) fn navigate(&mut self, delta: NavDelta) {
+        self.scroll.apply(delta, self.rows.len());
+    }
+
+    /// Draws the tab into `area`.
+    pub(crate) fn draw(&mut self, f: &mut Frame, area: Rect, status: Option<&str>) {
+        draw_analysis_view(
+            f,
+            area,
             &self.rows,
             &self.totals,
             &self.provider_totals,
             &self.update_tracker,
-            sys,
-            pid,
             &mut self.scroll,
+            self.sort,
             status,
-        )
+        );
     }
 }
 
-/// Starts the CLI analysis TUI with its initial scan in the background.
-pub fn display_analysis_interactive_loading(
-    time_range: vct_core::models::TimeRange,
-    providers: ProvidersConfig,
-    refresh_secs: u64,
-) -> anyhow::Result<()> {
-    let threads = vct_core::config::PerformanceConfig::default().resolved_scan_threads();
-    let pool = Arc::new(vct_core::scan::build_scan_pool(threads)?);
-    display_analysis_interactive_loading_with_pool(time_range, providers, refresh_secs, pool)
-}
-
-/// [`display_analysis_interactive_loading`] with a caller-owned scan pool.
-pub fn display_analysis_interactive_loading_with_pool(
-    time_range: vct_core::models::TimeRange,
-    providers: ProvidersConfig,
-    refresh_secs: u64,
-    scan_pool: Arc<rayon::ThreadPool>,
-) -> anyhow::Result<()> {
-    run_analysis_interactive(None, time_range, providers, refresh_secs, scan_pool)
-}
-
-fn run_analysis_interactive(
-    initial_data: Option<AnalysisData>,
-    time_range: vct_core::models::TimeRange,
-    providers: ProvidersConfig,
-    refresh_secs: u64,
-    scan_pool: Arc<rayon::ThreadPool>,
-) -> anyhow::Result<()> {
-    let mut terminal = TerminalSession::new()?;
-    let mut show_no_data = false;
-    let result = (|| -> anyhow::Result<()> {
-        let mut spinner_index = 0usize;
-        let mut loaded = initial_data.is_some();
-        if !loaded {
-            render_loading_frame(terminal.terminal_mut(), spinner_index)?;
-        }
-
-        let paths = vct_core::utils::resolve_paths()?;
-        let worker_paths = paths.clone();
-        let worker_pool = Arc::clone(&scan_pool);
-        let mut worker = RefreshWorker::new_with_init(refresh_secs, move || {
-            let mut ledger = vct_core::ledger::SessionLedger::open(&worker_paths.cache_dir);
-            move || {
-                let aggregation = worker_pool.install(|| {
-                    vct_core::analysis::aggregate_sessions_by_model_from_paths_with_cache(
-                        &worker_paths,
-                        time_range,
-                        providers,
-                        &mut ledger,
-                    )
-                })?;
-                // A live session changes every tick; writing its provider's
-                // file once a minute keeps the ledger current without
-                // rewriting it on every refresh.
-                if let Err(error) =
-                    ledger.save_if_due(crate::display::common::tui::LEDGER_SAVE_INTERVAL)
-                {
-                    log::warn!("failed to save the session ledger: {error:#}");
-                }
-                if aggregation.diagnostics.all_failed() {
-                    let first = aggregation
-                        .diagnostics
-                        .failures
-                        .first()
-                        .map(|failure| failure.error.as_str())
-                        .unwrap_or("unknown source failure");
-                    anyhow::bail!(
-                        "failed to parse all {} analysis sources: {first}",
-                        aggregation.diagnostics.candidates
-                    );
-                }
-                if aggregation.diagnostics.partially_failed() {
-                    log::warn!(
-                        "analysis refresh kept partial data after {} source failures",
-                        aggregation.diagnostics.failures.len()
-                    );
-                }
-                Ok(aggregation.data)
-            }
-        });
-
-        let pid = sysinfo::get_current_pid()
-            .expect("Failed to get current process ID for memory monitoring");
-        let mut sys = System::new();
-        init_process_metrics(&mut sys, pid);
-        let metrics_interval =
-            Duration::from_millis(vct_core::constants::refresh::METRICS_REFRESH_MS);
-        let mut last_metrics = Instant::now();
-        let mut last_spinner = Instant::now();
-        let mut state = AnalysisUiState::new();
-        let mut failure_until = None;
-
-        if let Some(data) = initial_data {
-            state.apply(data);
-            state.render(terminal.terminal_mut(), &sys, pid, None)?;
-            worker.defer_until_interval();
-        } else {
-            worker.request();
-        }
-
-        loop {
-            if let Some(result) = worker.try_result() {
-                match result {
-                    Ok(data) => {
-                        if !loaded && data.rows.is_empty() {
-                            show_no_data = true;
-                            return Ok(());
-                        }
-                        state.apply(data);
-                        loaded = true;
-                        failure_until = None;
-                        refresh_process_metrics(&mut sys, pid);
-                        state.render(
-                            terminal.terminal_mut(),
-                            &sys,
-                            pid,
-                            refresh_status(worker.is_active(), failure_until),
-                        )?;
-                        vct_core::utils::release_freed_heap();
-                        last_metrics = Instant::now();
-                    }
-                    Err(RefreshWorkerError::Disconnected) => {
-                        return Err(anyhow::anyhow!("refresh worker disconnected"));
-                    }
-                    Err(error) if !loaded => {
-                        return Err(anyhow::anyhow!("initial analysis load failed: {error}"));
-                    }
-                    Err(error) => {
-                        log::warn!("analysis refresh failed: {error}");
-                        failure_until = Some(Instant::now() + Duration::from_secs(3));
-                        state.render(
-                            terminal.terminal_mut(),
-                            &sys,
-                            pid,
-                            refresh_status(worker.is_active(), failure_until),
-                        )?;
-                    }
-                }
-            }
-
-            let auto_refresh_started = worker.request_if_due();
-            if !loaded && last_spinner.elapsed() >= Duration::from_millis(100) {
-                spinner_index = spinner_index.wrapping_add(1);
-                last_spinner = Instant::now();
-                render_loading_frame(terminal.terminal_mut(), spinner_index)?;
-            } else if loaded && (auto_refresh_started || last_metrics.elapsed() >= metrics_interval)
-            {
-                if last_metrics.elapsed() >= metrics_interval {
-                    last_metrics = Instant::now();
-                    refresh_process_metrics(&mut sys, pid);
-                }
-                let status = refresh_status(worker.is_active(), failure_until);
-                state.render(terminal.terminal_mut(), &sys, pid, status)?;
-            }
-
-            match handle_input()? {
-                // Nothing is layered over the analysis view, so Esc is quit.
-                InputAction::Quit | InputAction::Close => break,
-                InputAction::Refresh => {
-                    worker.request();
-                    if loaded {
-                        state.render(
-                            terminal.terminal_mut(),
-                            &sys,
-                            pid,
-                            refresh_status(worker.is_active(), failure_until),
-                        )?;
-                    }
-                }
-                InputAction::ToggleMerge | InputAction::ToggleQuota => {}
-                InputAction::TogglePane => {}
-                InputAction::Navigate(delta) if loaded => {
-                    state.scroll.apply(delta, state.rows.len());
-                    state.render(
-                        terminal.terminal_mut(),
-                        &sys,
-                        pid,
-                        refresh_status(worker.is_active(), failure_until),
-                    )?;
-                }
-                InputAction::Resize if loaded => {
-                    state.render(
-                        terminal.terminal_mut(),
-                        &sys,
-                        pid,
-                        refresh_status(worker.is_active(), failure_until),
-                    )?;
-                }
-                InputAction::Resize => {
-                    render_loading_frame(terminal.terminal_mut(), spinner_index)?;
-                }
-                InputAction::Navigate(_) | InputAction::Continue => {}
-            }
-        }
-
-        Ok(())
-    })();
-    let finished = terminal.finish(result);
-    if finished.is_ok() && show_no_data {
-        println!("No analysis data found");
-    }
-    finished
-}
-
-/// Render the `analysis` view as an interactive, auto-refreshing TUI.
-///
-/// Takes over the terminal and runs a draw loop until the user quits. Every
-/// `refresh_secs` a background worker incrementally re-aggregates the session
-/// directories for `time_range`, highlights changed counters, and keeps the
-/// previous rows visible if a refresh fails. `initial_data` renders immediately
-/// for library callers; the CLI-specific loading entry point starts with a
-/// spinner instead. Returns immediately after printing a message if
-/// `initial_data` is empty.
+/// Runs one analysis scan of `paths` for `time_range`.
 ///
 /// # Errors
 ///
-/// Returns an error if the terminal cannot be put into / restored from raw
-/// alternate-screen mode, or if drawing a frame or polling for input fails.
-///
-/// # Panics
-///
-/// Panics if the current process ID cannot be obtained for memory monitoring.
-///
-/// # Examples
-///
-/// ```no_run
-/// use vct_core::analysis::aggregate_sessions_by_model;
-/// use vct_tui::display::analysis::display_analysis_interactive;
-/// use vct_core::TimeRange;
-///
-/// let data = aggregate_sessions_by_model(TimeRange::All)?;
-/// display_analysis_interactive(data, TimeRange::All, Default::default(), 10)?;
-/// # Ok::<(), anyhow::Error>(())
-/// ```
-pub fn display_analysis_interactive(
-    initial_data: AnalysisData,
+/// Returns an error when the scan itself fails or every source failed to
+/// parse. A partial failure keeps what parsed and is logged.
+pub(crate) fn scan_analysis(
+    paths: &vct_core::utils::HelperPaths,
     time_range: vct_core::models::TimeRange,
     providers: ProvidersConfig,
-    refresh_secs: u64,
-) -> anyhow::Result<()> {
-    if initial_data.rows.is_empty() {
-        println!("No analysis data found");
-        return Ok(());
+    ledger: &mut SessionLedger,
+    pool: &rayon::ThreadPool,
+) -> anyhow::Result<AnalysisData> {
+    let aggregation = pool.install(|| {
+        vct_core::analysis::aggregate_sessions_by_model_from_paths_with_cache(
+            paths, time_range, providers, ledger,
+        )
+    })?;
+    // A live session changes every tick; writing its provider's file once a
+    // minute keeps the ledger current without rewriting it on every refresh.
+    if let Err(error) = ledger.save_if_due(LEDGER_SAVE_INTERVAL) {
+        log::warn!("failed to save the session ledger: {error:#}");
     }
-    let threads = vct_core::config::PerformanceConfig::default().resolved_scan_threads();
-    let pool = Arc::new(vct_core::scan::build_scan_pool(threads)?);
-    run_analysis_interactive(
-        Some(initial_data),
-        time_range,
-        providers,
-        refresh_secs,
-        pool,
-    )
+    if aggregation.diagnostics.all_failed() {
+        let first = aggregation
+            .diagnostics
+            .failures
+            .first()
+            .map(|failure| failure.error.as_str())
+            .unwrap_or("unknown source failure");
+        anyhow::bail!(
+            "failed to parse all {} analysis sources: {first}",
+            aggregation.diagnostics.candidates
+        );
+    }
+    if aggregation.diagnostics.partially_failed() {
+        log::warn!(
+            "analysis refresh kept partial data after {} source failures",
+            aggregation.diagnostics.failures.len()
+        );
+    }
+    Ok(aggregation.data)
 }
 
+/// Draws the analysis tab into `area`: the model table, the provider table
+/// and the controls line.
 #[allow(clippy::too_many_arguments)]
-fn render_analysis_frame_with_status<B: Backend<Error: Send + Sync + 'static>>(
-    terminal: &mut Terminal<B>,
+fn draw_analysis_view(
+    f: &mut Frame,
+    area: Rect,
     rows_data: &[AnalysisRow],
     totals: &AnalysisRow,
     provider_totals: &AnalysisProviderTotals,
     update_tracker: &UpdateTracker,
-    sys: &System,
-    pid: Pid,
     scroll: &mut ScrollState,
+    sort: AnalysisSort,
     status: Option<&str>,
-) -> anyhow::Result<()> {
+) {
     let provider_rows = build_analysis_provider_rows(provider_totals);
-
-    let completed = terminal.draw(|f| {
-        let area = f.area();
+    {
         if area.width < ANALYSIS_MIN_W || area.height < ANALYSIS_MIN_H {
             render_too_small(f, ANALYSIS_MIN_W, ANALYSIS_MIN_H);
             return;
@@ -510,7 +369,7 @@ fn render_analysis_frame_with_status<B: Backend<Error: Send + Sync + 'static>>(
         widths.extend(kept.iter().map(|&i| Constraint::Length(NUMERIC[i].width)));
 
         // One selectable row per model; the grand total lives only in the
-        // summary bar below. Compact K/M/B numbers keep long counts in-column.
+        // table title. Compact K/M/B numbers keep long counts in-column.
         let rows: Vec<RatatuiRow> = rows_data
             .iter()
             .map(|row| {
@@ -554,7 +413,11 @@ fn render_analysis_frame_with_status<B: Backend<Error: Send + Sync + 'static>>(
             chunks.content,
             TableChrome {
                 title: &title,
-                note: (dropped > 0).then(|| format!("−{dropped} cols")),
+                note: Some(if dropped > 0 {
+                    format!("{} · −{dropped} cols", sort.label())
+                } else {
+                    sort.label().to_string()
+                }),
                 border_color: RatatuiColor::Green,
             },
             header,
@@ -652,7 +515,7 @@ fn render_analysis_frame_with_status<B: Backend<Error: Send + Sync + 'static>>(
                     .map(|&i| Constraint::Length(BAND_NUMERIC[i].width)),
             );
 
-            // Drop the "All Providers" aggregate; the summary bar already
+            // Drop the "All Providers" aggregate; the table title already
             // carries the grand totals.
             let mut totals_rows: Vec<RatatuiRow> = provider_rows
                 .iter()
@@ -707,78 +570,68 @@ fn render_analysis_frame_with_status<B: Backend<Error: Send + Sync + 'static>>(
             f.render_widget(totals_table, panel_area);
         }
 
-        // Summary
-        let total_lines_str =
-            format_compact((totals.edit_lines + totals.read_lines + totals.write_lines) as i64);
-        let total_tools_str = format_compact(
-            (totals.bash_count
-                + totals.edit_count
-                + totals.read_count
-                + totals.todo_write_count
-                + totals.write_count) as i64,
-        );
-        let entries_str = format!("{}", rows_data.len());
-
-        let summary_items = vec![
-            (
-                "Total Lines:",
-                total_lines_str.as_str(),
-                RatatuiColor::Yellow,
-            ),
-            ("Total Tools:", total_tools_str.as_str(), RatatuiColor::Cyan),
-            ("Models:", entries_str.as_str(), RatatuiColor::Blue),
-        ];
-
-        let summary = create_summary(summary_items, sys, pid, chunks.summary.width);
-        f.render_widget(summary, chunks.summary);
-
         f.render_widget(
-            create_controls_with_status(&[], status, chunks.controls.width),
+            create_controls_with_status(
+                &[("o", " sort  "), ("t", " range  ")],
+                status,
+                chunks.controls.width,
+            ),
             chunks.controls,
         );
-    })?;
-
-    // ratatui can't embed the OSC 8 escape itself, so hyperlink the repo label
-    // it just drew (a no-op on terminals without hyperlink support).
-    overlay_repo_hyperlink(completed.buffer)?;
-
-    Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
 
     #[test]
     fn band_shown_only_when_it_fits_in_full() {
-        // Five sample providers + the overall row = 6 band rows -> 10 tall, so the
-        // band needs at least 18 rows of terminal to also fit table+summary+
-        // controls. Below that it is hidden (previously it rendered truncated).
+        // Five sample providers + the overall row = 6 band rows -> 10 tall, so
+        // the band needs 17 rows to also fit the table and the controls. Below
+        // that it is hidden rather than drawn truncated.
         assert_eq!(analysis_panels_height(16, 6), None);
-        assert_eq!(analysis_panels_height(17, 6), None);
-        assert_eq!(analysis_panels_height(18, 6), Some(10));
+        assert_eq!(analysis_panels_height(17, 6), Some(10));
 
-        // The threshold scales down with fewer providers instead of a fixed 18.
-        assert_eq!(analysis_panels_height(12, 1), None);
-        assert_eq!(analysis_panels_height(13, 1), Some(5));
+        // The threshold scales down with fewer providers.
+        assert_eq!(analysis_panels_height(11, 1), None);
+        assert_eq!(analysis_panels_height(12, 1), Some(5));
 
-        // No providers still floors the band height at 4 (needs 12 rows).
-        assert_eq!(analysis_panels_height(11, 0), None);
-        assert_eq!(analysis_panels_height(12, 0), Some(4));
+        // No providers still floors the band height at 4.
+        assert_eq!(analysis_panels_height(10, 0), None);
+        assert_eq!(analysis_panels_height(11, 0), Some(4));
+    }
+
+    fn row(model: &str, edit_lines: usize, read_lines: usize) -> AnalysisRow {
+        AnalysisRow {
+            model: model.to_string(),
+            edit_lines,
+            read_lines,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rows_sort_by_the_chosen_column_largest_first() {
+        let mut rows = vec![row("b", 1, 50), row("a", 9, 2), row("c", 1, 50)];
+        AnalysisSort::Lines.apply(&mut rows);
+        let order = |rows: &[AnalysisRow]| rows.iter().map(|r| r.model.clone()).collect::<String>();
+        // Equal totals fall back to the name.
+        assert_eq!(order(&rows), "bca");
+        AnalysisSort::EditLines.apply(&mut rows);
+        assert_eq!(order(&rows), "abc");
+        AnalysisSort::Model.apply(&mut rows);
+        assert_eq!(order(&rows), "abc");
     }
 
     #[test]
     fn dropped_provider_band_is_announced() {
-        use ratatui::backend::TestBackend;
-        // 6 provider rows need 10 band rows plus 8 below, so 17 is too short.
-        let (w, h) = (ANALYSIS_MIN_W, 17u16);
+        // 6 provider rows need 10 band rows plus 7 below, so 16 is too short.
+        let (w, h) = (ANALYSIS_MIN_W, 16u16);
         assert_eq!(analysis_panels_height(h, 6), None);
 
-        let rows = vec![AnalysisRow {
-            model: "claude-opus-4-8".to_string(),
-            edit_lines: 1,
-            ..Default::default()
-        }];
+        let rows = vec![row("claude-opus-4-8", 1, 0)];
         // Five providers plus the overall row make up those 6 band rows.
         let mut provider_totals = AnalysisProviderTotals::default();
         for stats in [
@@ -797,21 +650,21 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         let mut scroll = ScrollState::new();
-        let pid = sysinfo::get_current_pid().unwrap();
-        let mut sys = System::new();
-        init_process_metrics(&mut sys, pid);
-        render_analysis_frame_with_status(
-            &mut terminal,
-            &rows,
-            &AnalysisRow::default(),
-            &provider_totals,
-            &UpdateTracker::new(MAX_TRACKED_ANALYSIS_ROWS, 0),
-            &sys,
-            pid,
-            &mut scroll,
-            None,
-        )
-        .unwrap();
+        terminal
+            .draw(|f| {
+                draw_analysis_view(
+                    f,
+                    f.area(),
+                    &rows,
+                    &AnalysisRow::default(),
+                    &provider_totals,
+                    &UpdateTracker::new(MAX_TRACKED_ANALYSIS_ROWS, 0),
+                    &mut scroll,
+                    AnalysisSort::default(),
+                    None,
+                );
+            })
+            .unwrap();
 
         let buffer = terminal.backend().buffer();
         let screen: String = (0..h)
@@ -819,5 +672,6 @@ mod tests {
             .map(|(x, y)| buffer.cell((x, y)).unwrap().symbol().to_string())
             .collect();
         assert!(screen.contains("provider totals hidden"), "got:\n{screen}");
+        assert!(screen.contains("lines ▼"), "got:\n{screen}");
     }
 }

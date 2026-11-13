@@ -149,7 +149,7 @@ pub struct UsageConfig {
     /// Toggled live with `m`; the last state is saved back here.
     #[serde(default)]
     pub merge_models: bool,
-    /// Seconds between automatic redraws of the usage TUI (minimum 1).
+    /// Seconds between automatic refreshes of the Usage tab (minimum 1).
     #[serde(default = "default_refresh_secs")]
     pub refresh_interval: u64,
     /// Live quota-panel preferences.
@@ -168,7 +168,7 @@ impl Default for UsageConfig {
 }
 
 impl UsageConfig {
-    /// The usage TUI redraw cadence, clamped to a sane minimum so a `0` cannot
+    /// The Usage tab's refresh cadence, clamped to a sane minimum so a `0` cannot
     /// busy-loop.
     pub fn refresh_secs(&self) -> u64 {
         self.refresh_interval.max(1)
@@ -188,10 +188,9 @@ impl UsageConfig {
 /// `[usage.quota]` — live quota-panel preferences.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct QuotaConfig {
-    /// Which live quota panels to show in the usage TUI (by provider name:
+    /// Which live quota panels to show in the app (by provider name:
     /// `claude` / `codex` / `copilot` / `cursor` / `grok` / `antigravity`). An
-    /// empty list hides every quota card; the Provider Usage pane has its own `p`
-    /// toggle.
+    /// empty list hides every quota card.
     #[serde(default = "default_quota_panels")]
     pub panels: Vec<String>,
     /// Seconds between live quota-panel polls, shared by every provider
@@ -214,7 +213,7 @@ impl Default for QuotaConfig {
 /// Whether `name` is one of the selected quota-panel names (case-insensitive).
 ///
 /// The single home for the panel-selection rule, shared by
-/// [`UsageConfig::shows_quota_panel`] and the usage TUI's panel masking.
+/// [`UsageConfig::shows_quota_panel`] and the app's panel masking.
 pub fn quota_panel_selected(panels: &[String], name: &str) -> bool {
     panels.iter().any(|p| p.eq_ignore_ascii_case(name))
 }
@@ -222,7 +221,7 @@ pub fn quota_panel_selected(panels: &[String], name: &str) -> bool {
 /// `[analysis]` — analysis dashboard preferences.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AnalysisConfig {
-    /// Seconds between automatic redraws of the analysis TUI (minimum 1).
+    /// Seconds between automatic refreshes of the Analysis tab (minimum 1).
     #[serde(default = "default_refresh_secs")]
     pub refresh_interval: u64,
 }
@@ -322,7 +321,7 @@ pub struct RemotesConfig {
     /// under ~/.nvm.
     #[serde(default)]
     pub command: String,
-    /// Seconds between fetches while a TUI is open (minimum 60).
+    /// Seconds between fetches while the app is open (minimum 60).
     #[serde(default = "default_remotes_refresh_interval")]
     pub refresh_interval: u64,
 }
@@ -1037,18 +1036,146 @@ pub fn save_merge_models(enabled: bool) -> Result<()> {
 
 /// [`save_merge_models`] rooted at an explicit directory (test seam).
 pub fn save_merge_models_in(dir: &Path, enabled: bool) -> Result<()> {
-    edit_in(dir, |doc| {
-        // A hand-edited file could make `usage` a scalar (`usage = "bad"`);
-        // replace any non-table-like value with an empty table so indexing into
-        // it below cannot panic. `is_table_like` accepts both the `[usage]`
-        // header form AND an inline table (`usage = { ... }`), so a valid config
-        // in either form is left intact (its keys/comments preserved) — only a
-        // genuine scalar is repaired.
-        if !doc["usage"].is_table_like() {
-            doc["usage"] = Item::Table(Table::new());
+    save_setting_in(
+        dir,
+        &["usage", "merge_models"],
+        &SettingValue::Bool(enabled),
+    )
+}
+
+/// One value a settings screen reads from or writes to a [`Config`] field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingValue {
+    /// An on/off field.
+    Bool(bool),
+    /// A whole number, such as an interval in seconds.
+    Integer(i64),
+    /// Free text, or the name of an enum variant.
+    String(String),
+    /// A list of names.
+    List(Vec<String>),
+}
+
+impl SettingValue {
+    fn from_json(value: &Value) -> Option<Self> {
+        match value {
+            Value::Bool(flag) => Some(Self::Bool(*flag)),
+            Value::Number(number) => number.as_i64().map(Self::Integer),
+            Value::String(text) => Some(Self::String(text.clone())),
+            Value::Array(items) => items
+                .iter()
+                .map(|item| item.as_str().map(str::to_string))
+                .collect::<Option<Vec<_>>>()
+                .map(Self::List),
+            _ => None,
         }
-        doc["usage"]["merge_models"] = value(enabled);
+    }
+
+    fn to_json(&self) -> Value {
+        match self {
+            Self::Bool(flag) => Value::from(*flag),
+            Self::Integer(number) => Value::from(*number),
+            Self::String(text) => Value::from(text.as_str()),
+            Self::List(items) => Value::from(items.clone()),
+        }
+    }
+
+    fn to_item(&self) -> Item {
+        match self {
+            Self::Bool(flag) => value(*flag),
+            Self::Integer(number) => value(*number),
+            Self::String(text) => value(text.as_str()),
+            Self::List(items) => value(items.iter().map(String::as_str).collect::<Array>()),
+        }
+    }
+}
+
+/// Reads the field at `path` (`["usage", "quota", "refresh_interval"]`), or
+/// `None` when `path` names no scalar or string-list field.
+pub fn get_setting(config: &Config, path: &[&str]) -> Option<SettingValue> {
+    let root = serde_json::to_value(config).ok()?;
+    let mut current = &root;
+    for key in path {
+        current = current.get(key)?;
+    }
+    SettingValue::from_json(current)
+}
+
+/// Sets the field at `path` in memory.
+///
+/// # Errors
+///
+/// Returns an error, leaving `config` untouched, when `path` names no field or
+/// the field does not accept `value`.
+pub fn apply_setting(config: &mut Config, path: &[&str], value: &SettingValue) -> Result<()> {
+    let mut root = serde_json::to_value(&*config)?;
+    let mut current = &mut root;
+    for key in path {
+        current = current
+            .get_mut(key)
+            .ok_or_else(|| anyhow::anyhow!("unknown setting {}", path.join(".")))?;
+    }
+    *current = value.to_json();
+    *config = serde_json::from_value(root)?;
+    Ok(())
+}
+
+/// Writes the field at `path` to the config file, keeping its comments and
+/// every other key.
+///
+/// # Errors
+///
+/// Returns an error when `path` is empty or the file cannot be written.
+pub fn save_setting(path: &[&str], value: &SettingValue) -> Result<()> {
+    save_setting_in(&get_cache_dir()?, path, value)
+}
+
+/// [`save_setting`] rooted at an explicit directory (test seam).
+pub fn save_setting_in(dir: &Path, path: &[&str], value: &SettingValue) -> Result<()> {
+    let Some((key, sections)) = path.split_last() else {
+        anyhow::bail!("a setting needs a name");
+    };
+    edit_in(dir, |doc| {
+        let mut table = doc.as_item_mut();
+        for section in sections {
+            table = section_mut(table, section);
+        }
+        let Some(table) = table.as_table_like_mut() else {
+            return;
+        };
+        // Assigning through the existing entry keeps the comment above it.
+        match table.get_mut(key) {
+            Some(existing) => *existing = value.to_item(),
+            None => {
+                table.insert(key, value.to_item());
+            }
+        }
     })
+}
+
+/// The section `name` of `parent`, created when the file has none (an older
+/// file predates `[remotes]`) and replacing a hand-edited scalar where a
+/// section belongs. Inside an inline table the new section is inline too.
+fn section_mut<'a>(parent: &'a mut Item, name: &str) -> &'a mut Item {
+    let inline = parent.is_inline_table();
+    let table = parent
+        .as_table_like_mut()
+        .expect("the document root and every section reached here are tables");
+    if !table.get(name).is_some_and(Item::is_table_like) {
+        let fresh = if inline {
+            Item::Value(toml_edit::Value::InlineTable(toml_edit::InlineTable::new()))
+        } else {
+            Item::Table(Table::new())
+        };
+        table.insert(name, fresh);
+    }
+    table.get_mut(name).expect("the section was just ensured")
+}
+
+/// The documentation of the field at `path`, as the config file's own comment
+/// states it.
+pub fn setting_description(path: &[&str]) -> Option<String> {
+    schema_description(&json_schema(), path)
 }
 
 /// Reads the current document (or the template when absent/malformed), applies

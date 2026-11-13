@@ -356,3 +356,78 @@ fn time_range_default_precedence() {
         TimeRange::Monthly
     );
 }
+
+#[test]
+fn a_setting_is_read_changed_and_saved_by_its_path() {
+    use vct_core::config::SettingValue;
+
+    let th = TempHome::new();
+    let dir = &th.paths.cache_dir;
+    let mut cfg = config::load_in(dir);
+    let path = ["usage", "quota", "refresh_interval"];
+    assert_eq!(
+        config::get_setting(&cfg, &path),
+        Some(SettingValue::Integer(60))
+    );
+
+    config::apply_setting(&mut cfg, &path, &SettingValue::Integer(90)).unwrap();
+    config::save_setting_in(dir, &path, &SettingValue::Integer(90)).unwrap();
+    let panels = SettingValue::List(vec!["codex".to_string()]);
+    config::save_setting_in(dir, &["usage", "quota", "panels"], &panels).unwrap();
+    let range = SettingValue::String("weekly".to_string());
+    config::save_setting_in(dir, &["general", "default_time_range"], &range).unwrap();
+
+    assert_eq!(cfg.usage.quota.refresh_interval, 90);
+    let reloaded = config::load_in(dir);
+    assert_eq!(reloaded.usage.quota.refresh_interval, 90);
+    assert_eq!(reloaded.usage.quota.panels, vec!["codex".to_string()]);
+    assert_eq!(reloaded.general.default_time_range, TimeRange::Weekly);
+    // The generated comments are still there.
+    let text = fs::read_to_string(dir.join("config.toml")).unwrap();
+    assert!(text.contains("# Seconds between live quota-panel polls"));
+}
+
+#[test]
+fn a_setting_refuses_a_value_its_field_cannot_hold() {
+    use vct_core::config::SettingValue;
+
+    let mut cfg = Config::default();
+    let before = cfg.clone();
+    let bad = SettingValue::String("yearly".to_string());
+    assert!(config::apply_setting(&mut cfg, &["general", "default_time_range"], &bad).is_err());
+    assert!(config::apply_setting(&mut cfg, &["general", "nope"], &bad).is_err());
+    assert_eq!(cfg, before);
+    assert!(config::setting_description(&["usage", "merge_models"]).is_some());
+}
+
+#[test]
+fn a_setting_is_saved_into_a_file_that_lacks_its_section() {
+    use vct_core::config::SettingValue;
+
+    let th = TempHome::new();
+    let dir = &th.paths.cache_dir;
+    fs::create_dir_all(dir).unwrap();
+    let hosts = SettingValue::List(vec!["box".to_string()]);
+    let poll = SettingValue::Integer(120);
+
+    // A file written before `[remotes]` existed, and with no `[usage.quota]`.
+    fs::write(dir.join("config.toml"), "[usage]\nmerge_models = true\n").unwrap();
+    config::save_setting_in(dir, &["remotes", "hosts"], &hosts).unwrap();
+    config::save_setting_in(dir, &["usage", "quota", "refresh_interval"], &poll).unwrap();
+    let cfg = config::load_in(dir);
+    assert_eq!(cfg.remotes.hosts, vec!["box".to_string()]);
+    assert_eq!(cfg.usage.quota.refresh_interval, 120);
+    assert!(cfg.usage.merge_models);
+
+    // An inline `usage` table gains the nested section and keeps its keys.
+    fs::write(dir.join("config.toml"), "usage = { merge_models = true }\n").unwrap();
+    config::save_setting_in(dir, &["usage", "quota", "refresh_interval"], &poll).unwrap();
+    let cfg = config::load_in(dir);
+    assert_eq!(cfg.usage.quota.refresh_interval, 120);
+    assert!(cfg.usage.merge_models);
+
+    // A scalar where a section belongs is replaced, at any depth.
+    fs::write(dir.join("config.toml"), "usage = \"bad\"\n").unwrap();
+    config::save_setting_in(dir, &["usage", "quota", "refresh_interval"], &poll).unwrap();
+    assert_eq!(config::load_in(dir).usage.quota.refresh_interval, 120);
+}

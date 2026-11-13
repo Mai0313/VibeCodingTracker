@@ -16,7 +16,7 @@ use vct_core::session::{
 };
 use vct_core::usage::aggregator::aggregate_usage_from_paths_with_cache;
 use vct_core::utils::{HelperPaths, resolve_paths_from_home};
-use vct_tui::display::common::render_loading_frame;
+use vct_tui::display::common::render_loading;
 use vct_tui::display::usage::UsageFrameBenchmark;
 
 /// Absolute path to a file under the repo's `tests/fixtures/` directory.
@@ -536,7 +536,15 @@ fn benchmark_tui_frame_render(c: &mut Criterion) {
     let mut spinner_index = 0usize;
     group.bench_function("loading", |b| {
         b.iter(|| {
-            render_loading_frame(&mut loading, black_box(spinner_index))
+            loading
+                .draw(|frame| {
+                    render_loading(
+                        frame,
+                        frame.area(),
+                        black_box(spinner_index),
+                        "Loading sessions...",
+                    )
+                })
                 .expect("render loading benchmark frame");
             spinner_index = spinner_index.wrapping_add(1);
         })

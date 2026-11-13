@@ -33,10 +33,8 @@ use vct_core::get_version_info;
 use vct_core::scan::build_scan_pool;
 use vct_core::session::{ParseMode, parse_session_file_with_diagnostics};
 use vct_core::usage::scan_usage_priced;
-use vct_tui::display::usage::{
-    display_quota_monitor, display_usage_interactive_with_pool, display_usage_table,
-    display_usage_text,
-};
+use vct_tui::display::app::{AppOptions, Tab, run_app};
+use vct_tui::display::usage::{display_usage_table, display_usage_text};
 
 const AUTO_UPDATE_REEXEC_ENV: &str = "VCT_AUTO_UPDATE_REEXEC";
 
@@ -97,12 +95,16 @@ fn main() -> Result<()> {
 /// Parses the CLI and dispatches the selected subcommand.
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    reject_unusable_invocation(&cli);
     // After the parse, so a `--help` or a rejected flag exits without touching
     // the user's `~/.vct` at all.
     vct_core::utils::remove_legacy_cache_files();
     run_startup_auto_update(&cli);
 
-    match cli.command {
+    let Some(command) = cli.command else {
+        return open_app(Tab::Usage, [false; 4], false);
+    };
+    match command {
         Commands::Analysis {
             file,
             json,
@@ -153,10 +155,13 @@ fn run() -> Result<()> {
                         all,
                         config.general.default_time_range,
                     );
+                    if !(json || text || table) {
+                        return open_app(Tab::Analysis, [daily, weekly, monthly, all], false);
+                    }
                     let scan_pool =
                         Arc::new(build_scan_pool(config.performance.resolved_scan_threads())?);
                     if !json {
-                        prepare_remotes(&config.remotes, text || table)?;
+                        prepare_remotes(&config.remotes)?;
                     }
                     if json {
                         let dataset = scan_pool.install(|| {
@@ -168,7 +173,7 @@ fn run() -> Result<()> {
                         })?;
                         report_analysis_collection(&dataset.diagnostics)?;
                         write_pretty_json(&dataset)?;
-                    } else if text || table {
+                    } else {
                         let aggregation = scan_pool.install(|| {
                             vct_core::analysis::aggregate_sessions_by_model_with_diagnostics(
                                 time_range,
@@ -182,13 +187,6 @@ fn run() -> Result<()> {
                         } else {
                             vct_tui::display::analysis::display_analysis_table(&aggregation.data);
                         }
-                    } else {
-                        vct_tui::display::analysis::display_analysis_interactive_loading_with_pool(
-                            time_range,
-                            config.providers,
-                            config.analysis.refresh_secs(),
-                            scan_pool,
-                        )?;
                     }
                 }
             }
@@ -204,6 +202,9 @@ fn run() -> Result<()> {
             monthly,
             all,
         } => {
+            if !(json || text || table) {
+                return open_app(Tab::Usage, [daily, weekly, monthly, all], merge_providers);
+            }
             let config = vct_core::config::load();
             vct_core::logging::apply(&config.logging);
             let time_range = resolve_time_range_with_default(
@@ -214,10 +215,10 @@ fn run() -> Result<()> {
                 config.general.default_time_range,
             );
             // A `--merge-providers` flag forces merging on; otherwise the saved
-            // preference decides. The TUI's `m` toggle persists back to config.
+            // preference decides.
             let merge = merge_providers || config.usage.merge_models;
             let scan_pool = Arc::new(build_scan_pool(config.performance.resolved_scan_threads())?);
-            prepare_remotes(&config.remotes, json || text || table)?;
+            prepare_remotes(&config.remotes)?;
 
             if json {
                 let scan = scan_usage_priced(time_range, config.providers, &scan_pool)?;
@@ -234,33 +235,11 @@ fn run() -> Result<()> {
                 let scan = scan_usage_priced(time_range, config.providers, &scan_pool)?;
                 report_usage_collection(&scan.collection.diagnostics)?;
                 display_usage_text(&scan.collection.data, merge);
-            } else if table {
+            } else {
                 let scan = scan_usage_priced(time_range, config.providers, &scan_pool)?;
                 report_usage_collection(&scan.collection.diagnostics)?;
                 display_usage_table(&scan.collection.data, merge);
-            } else {
-                // `config` is not used after this, so hand the panel list off by
-                // move; read both cadences first so the borrows end before the
-                // partial move out of `config.usage`.
-                let refresh = config.usage.refresh_secs();
-                let quota_refresh = config.usage.quota_refresh_secs();
-                display_usage_interactive_with_pool(
-                    time_range,
-                    merge,
-                    config.usage.quota.panels,
-                    config.providers,
-                    refresh,
-                    quota_refresh,
-                    scan_pool,
-                )?;
             }
-        }
-
-        Commands::Monitor => {
-            let config = vct_core::config::load();
-            vct_core::logging::apply(&config.logging);
-            let quota_refresh = config.usage.quota_refresh_secs();
-            display_quota_monitor(config.usage.quota.panels, config.providers, quota_refresh)?;
         }
 
         Commands::Version { json, text } => {
@@ -327,9 +306,10 @@ fn run() -> Result<()> {
             text,
             table,
             ..
-        } => {
-            run_quota(provider, text, table)?;
-        }
+        } => match provider {
+            Some(provider) => run_quota(provider, text, table)?,
+            None => return open_app(Tab::Quota, [false; 4], false),
+        },
 
         Commands::Ledger {
             action: LedgerAction::Export,
@@ -349,26 +329,84 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-/// Brings the snapshots of the `[remotes]` hosts up to date for a scan.
+/// Stops an invocation that cannot run, before anything touches `~/.vct`.
 ///
-/// A one-shot command waits for the fetch and warns about each host that
-/// failed, since its output is final. A TUI must not wait on ssh, so the fetch
-/// runs behind it and the next refresh picks up what arrived.
-fn prepare_remotes(config: &vct_core::config::RemotesConfig, one_shot: bool) -> Result<()> {
+/// No subcommand means the interactive app, which needs a terminal: without
+/// one the help is printed with exit code 2, as it was while a subcommand was
+/// required. `quota` prints one provider's response, so a format flag needs a
+/// provider.
+fn reject_unusable_invocation(cli: &Cli) {
+    use clap::CommandFactory;
+    use std::io::IsTerminal;
+
+    match &cli.command {
+        None if !io::stdout().is_terminal() => {
+            eprintln!("{}", Cli::command().render_help());
+            std::process::exit(2);
+        }
+        Some(Commands::Quota {
+            provider: None,
+            json,
+            text,
+            table,
+        }) if *json || *text || *table => Cli::command()
+            .error(
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "--json, --text and --table print one provider's response: name a provider",
+            )
+            .exit(),
+        _ => {}
+    }
+}
+
+/// Opens the interactive app on `start`.
+///
+/// `period` is the `--daily` / `--weekly` / `--monthly` / `--all` flags, which
+/// win over the configured default range; `merge_providers` forces the usage
+/// table to start merged.
+fn open_app(start: Tab, period: [bool; 4], merge_providers: bool) -> Result<()> {
+    let config = vct_core::config::load();
+    vct_core::logging::apply(&config.logging);
+    let [daily, weekly, monthly, all] = period;
+    let time_range = resolve_time_range_with_default(
+        daily,
+        weekly,
+        monthly,
+        all,
+        config.general.default_time_range,
+    );
+    let scan_pool = Arc::new(build_scan_pool(config.performance.resolved_scan_threads())?);
+    prune_remotes(&config.remotes)?;
+    run_app(AppOptions {
+        start,
+        time_range,
+        merge: merge_providers || config.usage.merge_models,
+        config,
+        scan_pool,
+    })
+}
+
+/// Drops the snapshots of hosts no longer listed under `[remotes]`.
+fn prune_remotes(config: &vct_core::config::RemotesConfig) -> Result<std::path::PathBuf> {
     let cache_dir = vct_core::utils::resolve_paths()?.cache_dir;
     // A file that failed to parse reads as no hosts, which must not cost the
     // snapshots of hosts that are merely unreachable right now.
     if vct_core::config::file_is_valid() {
         vct_core::remote::prune(&cache_dir, config);
     }
-    if one_shot {
-        for (host, error) in vct_core::remote::sync(&cache_dir, config) {
-            eprintln!(
-                "Warning: Could not fetch usage from remote {host}: {error}. Its last fetched data, if any, is shown."
-            );
-        }
-    } else {
-        vct_core::remote::spawn_sync_loop(cache_dir, config.clone());
+    Ok(cache_dir)
+}
+
+/// Brings the snapshots of the `[remotes]` hosts up to date for a one-shot
+/// scan, warning about each host that failed since its output is final.
+///
+/// The interactive app never waits on ssh: it fetches behind its first scan.
+fn prepare_remotes(config: &vct_core::config::RemotesConfig) -> Result<()> {
+    let cache_dir = prune_remotes(config)?;
+    for (host, error) in vct_core::remote::sync(&cache_dir, config) {
+        eprintln!(
+            "Warning: Could not fetch usage from remote {host}: {error}. Its last fetched data, if any, is shown."
+        );
     }
     Ok(())
 }
@@ -383,7 +421,7 @@ fn run_startup_auto_update(cli: &Cli) {
     if std::env::var_os(AUTO_UPDATE_REEXEC_ENV).is_some()
         || matches!(
             &cli.command,
-            Commands::Update { .. } | Commands::Config { .. }
+            Some(Commands::Update { .. } | Commands::Config { .. })
         )
     {
         return;
