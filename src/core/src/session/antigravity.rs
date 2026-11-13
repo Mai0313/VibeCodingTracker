@@ -217,7 +217,7 @@ fn decode_generation(data: &[u8]) -> Option<(Option<i64>, String)> {
     for (field, value) in ProtoFields(generation, 0) {
         match (field, value) {
             (19, ProtoValue::Bytes(bytes)) => {
-                model = std::str::from_utf8(bytes).ok().map(str::to_string);
+                model = std::str::from_utf8(bytes).ok().map(model_name);
             }
             (20, ProtoValue::Bytes(pair))
                 if bytes_field(pair, 1) == Some(b"last_step_index".as_slice()) =>
@@ -232,6 +232,19 @@ fn decode_generation(data: &[u8]) -> Option<(Option<i64>, String)> {
     }
     let model = model.filter(|model| !model.is_empty())?;
     Some((step, model))
+}
+
+/// Jetski records `<config name>|<backend>`. A backend in Vertex's
+/// `<model>@<version>` form is a published model id, so it names the model;
+/// any other backend is a serving path, leaving the config name.
+fn model_name(id: &str) -> String {
+    let Some((name, backend)) = id.split_once('|') else {
+        return id.to_string();
+    };
+    match backend.split_once('@') {
+        Some((model, _)) if !model.contains('/') => model.to_string(),
+        _ => name.to_string(),
+    }
 }
 
 /// Reads the trajectory blob: field 1 holds the workspace URI (field 1) and
@@ -691,6 +704,23 @@ mod tests {
             100
         );
         assert_eq!(record.advisor_usage[UNKNOWN_MODEL]["input_tokens"], 50);
+    }
+
+    #[test]
+    fn a_jetski_model_id_is_named_by_its_model_not_its_backend() {
+        assert_eq!(
+            model_name("opus-5.5-high|claude-opus-5-5@default"),
+            "claude-opus-5-5"
+        );
+        assert_eq!(
+            model_name("gemini-4-carbon-high|carbon-g-jetski/cns/x-d/home/y/checkpoints/1"),
+            "gemini-4-carbon-high"
+        );
+        assert_eq!(
+            model_name("gemini-4-carbon-high|carbon-g-jetski"),
+            "gemini-4-carbon-high"
+        );
+        assert_eq!(model_name("gemini-4-argon"), "gemini-4-argon");
     }
 
     #[test]
