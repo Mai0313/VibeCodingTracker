@@ -113,6 +113,24 @@ fn next_range(range: TimeRange) -> TimeRange {
     }
 }
 
+/// What the Settings tab does once the editor has returned: whether to reload
+/// the file, and the message to show with whether it is good news.
+///
+/// The file is reloaded whenever it parses, even after a failed editor, which
+/// may have saved first. One that does not parse is never loaded: every read
+/// turns it into the defaults, and the next save would write those over it.
+fn after_editor(result: anyhow::Result<()>, file_is_valid: bool) -> (bool, String, bool) {
+    match (file_is_valid, result) {
+        (false, _) => (
+            false,
+            "config.toml does not parse, nothing reloaded: fix it (e)".to_string(),
+            false,
+        ),
+        (true, Ok(())) => (true, "reloaded".to_string(), true),
+        (true, Err(error)) => (true, format!("reloaded; {error:#}"), false),
+    }
+}
+
 /// Whether to scan now for a tab whose data does not answer what is on screen.
 ///
 /// Never while a scan is running: its result may be the one wanted, and if it
@@ -192,8 +210,17 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
         let mut quota_stale = false;
         let mut usage = UsageUiState::new(merge);
         let mut analysis = AnalysisUiState::new();
-        let mut settings =
-            SettingsUiState::new(config.clone(), Box::new(vct_core::config::save_setting));
+        let mut settings = SettingsUiState::new(
+            config.clone(),
+            Box::new(|path, value| {
+                // Saving into a file that does not parse would replace all
+                // of it with the defaults.
+                if !vct_core::config::file_is_valid() {
+                    anyhow::bail!("config.toml does not parse, fix it first (e)");
+                }
+                vct_core::config::save_setting(path, value)
+            }),
+        );
 
         let request = Arc::new(Mutex::new(ScanRequest {
             tab,
@@ -346,7 +373,17 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                             SettingsOutcome::SwitchTab(index) => {
                                 go_to = Tab::ALL.get(index).copied()
                             }
-                            SettingsOutcome::Changed => {
+                            outcome @ (SettingsOutcome::Changed | SettingsOutcome::OpenEditor) => {
+                                if outcome == SettingsOutcome::OpenEditor {
+                                    let result =
+                                        terminal.suspend(vct_core::config::open_in_editor)?;
+                                    let (reload, message, ok) =
+                                        after_editor(result, vct_core::config::file_is_valid());
+                                    if reload {
+                                        settings.set_config(vct_core::config::load());
+                                    }
+                                    settings.set_message(message, ok);
+                                }
                                 let next = settings.config().clone();
                                 quota_stale |= next.usage.quota != config.usage.quota
                                     || next.providers != config.providers;
@@ -577,6 +614,28 @@ mod tests {
         // A failed scan is retried when its wait is over, not before.
         assert!(!should_rescan(false, false, Some(later), now));
         assert!(should_rescan(false, false, Some(now), later));
+    }
+
+    #[test]
+    fn a_file_the_editor_left_broken_is_never_reloaded() {
+        let failed = || Err(anyhow::anyhow!("Editor 'vi' exited with 1"));
+        assert_eq!(
+            after_editor(Ok(()), true),
+            (true, "reloaded".to_string(), true)
+        );
+        // A failed editor may have saved first, so a file that parses is read.
+        let (reload, message, ok) = after_editor(failed(), true);
+        assert!(
+            reload && !ok && message.contains("exited with 1"),
+            "{message}"
+        );
+        for result in [Ok(()), failed()] {
+            let (reload, message, ok) = after_editor(result, false);
+            assert!(
+                !reload && !ok && message.contains("does not parse"),
+                "{message}"
+            );
+        }
     }
 
     #[test]

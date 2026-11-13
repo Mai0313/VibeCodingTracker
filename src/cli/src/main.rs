@@ -14,7 +14,7 @@ mod cli;
 use crate::cli::{
     Cli, Commands, ConfigAction, LedgerAction, QuotaProvider, resolve_time_range_with_default,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use clap::Parser;
 use comfy_table::{Cell, CellAlignment, Color, ContentArrangement, Table, presets::UTF8_FULL};
 use owo_colors::OwoColorize;
@@ -482,31 +482,9 @@ fn run_config(action: ConfigAction) -> Result<()> {
             println!();
             print!("{}", contents);
         }
-        ConfigAction::Edit => {
-            let path = vct_core::utils::get_config_path()?;
-            // Ensure the file exists before handing it to the editor.
-            let _ = vct_core::config::load();
-            let editor = std::env::var("VISUAL")
-                .or_else(|_| std::env::var("EDITOR"))
-                .unwrap_or_else(|_| default_editor().to_string());
-            // `$EDITOR` / `$VISUAL` often carry arguments (`code --wait`, `vim -f`),
-            // so split into program + args rather than treating the whole string as
-            // one executable name.
-            let mut parts = editor.split_whitespace();
-            let program = parts
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("empty editor command"))?;
-            let status = std::process::Command::new(program)
-                .args(parts)
-                .arg(&path)
-                .status()
-                .with_context(|| format!("Failed to launch editor '{}'", editor))?;
-            // Surface an aborted / failed editor as a non-zero CLI exit so scripts
-            // (and users) can tell the edit did not complete cleanly.
-            if !status.success() {
-                anyhow::bail!("Editor '{}' exited with {}", editor, status);
-            }
-        }
+        // A failed or aborted editor is a non-zero exit, so scripts (and
+        // users) can tell the edit did not complete cleanly.
+        ConfigAction::Edit => vct_core::config::open_in_editor()?,
         ConfigAction::Migrate => {
             use vct_core::config::MigrationStatus;
             let path = vct_core::utils::get_config_path()?;
@@ -673,11 +651,6 @@ fn report_usage_collection(diagnostics: &vct_core::usage::ScanDiagnostics) -> Re
         );
     }
     Ok(())
-}
-
-/// The fallback editor when neither `$VISUAL` nor `$EDITOR` is set.
-fn default_editor() -> &'static str {
-    if cfg!(windows) { "notepad" } else { "vi" }
 }
 
 #[cfg(all(test, unix))]

@@ -1043,6 +1043,43 @@ pub fn save_merge_models_in(dir: &Path, enabled: bool) -> Result<()> {
     )
 }
 
+/// Opens the config file in `$VISUAL`, else `$EDITOR`, else `vi` (`notepad`
+/// on Windows), creating the file first when it is missing, and waits for the
+/// editor to exit.
+///
+/// The caller owns the terminal: an interactive app leaves its alternate
+/// screen before calling this.
+///
+/// # Errors
+///
+/// Returns an error when the editor cannot be started or exits unsuccessfully.
+pub fn open_in_editor() -> Result<()> {
+    use anyhow::Context;
+
+    let path = crate::utils::get_config_path()?;
+    // Ensure the file exists before handing it to the editor.
+    let _ = load();
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| if cfg!(windows) { "notepad" } else { "vi" }.to_string());
+    // `$EDITOR` / `$VISUAL` often carry arguments (`code --wait`, `vim -f`),
+    // so split into program + args rather than treating the whole string as
+    // one executable name.
+    let mut parts = editor.split_whitespace();
+    let program = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("empty editor command"))?;
+    let status = std::process::Command::new(program)
+        .args(parts)
+        .arg(&path)
+        .status()
+        .with_context(|| format!("Failed to launch editor '{editor}'"))?;
+    if !status.success() {
+        anyhow::bail!("Editor '{editor}' exited with {status}");
+    }
+    Ok(())
+}
+
 /// One value a settings screen reads from or writes to a [`Config`] field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingValue {
