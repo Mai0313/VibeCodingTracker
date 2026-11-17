@@ -1051,12 +1051,13 @@ pub struct AntigravityQuotaSnapshot {
     /// Whether any limit is spent (drives the `LIMIT` flag).
     #[serde(default)]
     pub limit_reached: bool,
-    /// The sign-in file is gone or agy could not sign in; the panel shows an
+    /// agy has no stored sign-in or could not sign in; the panel shows an
     /// `agy acp --login` hint.
     #[serde(default)]
     pub needs_login: bool,
-    /// The sign-in file's mtime when agy last failed to sign in. agy is not run
-    /// again until the file changes, which a re-login does; kept here so the
+    /// Modification time of agy's sign-in entry (OS credential store or
+    /// fallback file) when agy last failed to sign in. agy is not run again
+    /// until that timestamp changes, which a re-login does; kept here so the
     /// hold outlives the process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed_out_mtime: Option<std::time::SystemTime>,

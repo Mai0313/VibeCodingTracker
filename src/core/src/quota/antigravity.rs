@@ -3,18 +3,19 @@
 //! Runs the agy CLI's local `/usage` slash command in print mode and maps each
 //! of its limits into a gauge. agy signs in, refreshes and stores its own OAuth
 //! token, so vct never reads or writes that token and holds no client secret:
-//! the sign-in file is only checked for existence, which with agy found is what
-//! decides whether the panel shows at all. A build with its own sign-in
-//! answers the same command without that file, so finding it is
-//! enough.
+//! it only checks whether agy's sign-in entry exists (in Windows Credential
+//! Manager, macOS Keychain, or the fallback file) and reads its modification
+//! time, which with agy found is what decides whether the panel shows at all.
+//! A build with its own sign-in answers the same command without those stores,
+//! so finding it is enough.
 //!
 //! One run starts a whole agy process (a few seconds and ~260 MB), so the panel
 //! polls no more often than [`ANTIGRAVITY_MIN_REFRESH_SECS`]. A signed-out agy
 //! waits a minute for an interactive sign-in and may open a browser, so a run
-//! that reports a failed sign-in is not repeated until the sign-in file changes,
-//! across restarts too. An offline agy whose token has expired reports the same
-//! failed sign-in, so agy is not run while Google's token endpoint is out of
-//! reach.
+//! that reports a failed sign-in is not repeated until the sign-in entry's
+//! modification time changes, across restarts too. An offline agy whose token
+//! has expired reports the same failed sign-in, so agy is not run while
+//! Google's token endpoint is out of reach.
 
 use crate::models::{
     AgyPrintResponse, AntigravityBucket, AntigravityQuotaSnapshot, QuotaSource, QuotaWindow,
@@ -29,7 +30,7 @@ use std::io;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// Login hint shown when agy has no usable sign-in. `agy acp --login` signs in
 /// from the terminal and exits; inside an interactive `agy`, `/login` does the
@@ -49,9 +50,175 @@ const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 pub struct AgyBinary {
     /// The executable to run.
     pub path: PathBuf,
-    /// Whether this build signs in without agy's sign-in file, so that file
-    /// says nothing about it.
+    /// Whether this build signs in without agy's OAuth sign-in stores, so
+    /// those stores say nothing about it.
     pub own_sign_in: bool,
+}
+
+/// State of an Antigravity build's sign-in, checked without starting agy or
+/// reading its OAuth token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignIn {
+    /// A build that signs in on its own, with no store for vct to check.
+    Own,
+    /// agy's sign-in entry exists, stamped with its modification time when
+    /// available.
+    Present(Option<SystemTime>),
+    /// Neither agy's OS credential entry nor its fallback sign-in file exists.
+    Absent,
+}
+
+/// Converts a Windows `FILETIME` (100-ns intervals since 1601-01-01 UTC) to a
+/// post-`UNIX_EPOCH` [`SystemTime`]. Pre-1970 values return `None` so serde
+/// can always serialize a cached hold.
+#[cfg(any(windows, test))]
+fn filetime_to_system_time(low: u32, high: u32) -> Option<SystemTime> {
+    const INTERVALS_PER_SEC: u64 = 10_000_000;
+    const INTERVALS_TO_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
+    let ticks = (u64::from(high) << 32) | u64::from(low);
+    let since_unix = ticks.checked_sub(INTERVALS_TO_UNIX_EPOCH)?;
+    SystemTime::UNIX_EPOCH.checked_add(Duration::new(
+        since_unix / INTERVALS_PER_SEC,
+        ((since_unix % INTERVALS_PER_SEC) * 100) as u32,
+    ))
+}
+
+/// Converts a Core Foundation `CFAbsoluteTime` (seconds since 2001-01-01 UTC)
+/// to a post-`UNIX_EPOCH` [`SystemTime`]. Pre-1970 and non-finite values
+/// return `None` so serde can always serialize a cached hold.
+#[cfg(any(target_os = "macos", test))]
+fn cf_absolute_time_to_system_time(abs_time: f64) -> Option<SystemTime> {
+    const CF_EPOCH_UNIX_SECS: f64 = 978_307_200.0;
+    let since_unix = Duration::try_from_secs_f64(abs_time + CF_EPOCH_UNIX_SECS).ok()?;
+    SystemTime::UNIX_EPOCH.checked_add(since_unix)
+}
+
+/// Checks Windows Credential Manager for agy's generic credential
+/// (`gemini:antigravity`), returning `Some(last_written)` when present.
+#[cfg(windows)]
+fn os_credential_mtime() -> Option<Option<SystemTime>> {
+    use windows_sys::Win32::Security::Credentials::{
+        CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW,
+    };
+
+    // `gemini:antigravity\0` in UTF-16, the `go-keyring` generic credential
+    // target (`<service>:<account>`).
+    const TARGET: &[u16] = &[
+        b'g' as u16,
+        b'e' as u16,
+        b'm' as u16,
+        b'i' as u16,
+        b'n' as u16,
+        b'i' as u16,
+        b':' as u16,
+        b'a' as u16,
+        b'n' as u16,
+        b't' as u16,
+        b'i' as u16,
+        b'g' as u16,
+        b'r' as u16,
+        b'a' as u16,
+        b'v' as u16,
+        b'i' as u16,
+        b't' as u16,
+        b'y' as u16,
+        0,
+    ];
+    let mut cred: *mut CREDENTIALW = std::ptr::null_mut();
+    // SAFETY: `TARGET` is NUL-terminated UTF-16 and `cred` is a valid out-pointer.
+    let ok = unsafe { CredReadW(TARGET.as_ptr(), CRED_TYPE_GENERIC, 0, &mut cred) };
+    if ok == 0 || cred.is_null() {
+        return None;
+    }
+    // SAFETY: `CredReadW` succeeded, so `cred` points to a valid allocation
+    // until `CredFree`. Only `LastWritten` is copied; `CredentialBlob` is not
+    // read.
+    let last_written = unsafe {
+        let ft = (*cred).LastWritten;
+        CredFree(cred.cast());
+        ft
+    };
+    Some(filetime_to_system_time(
+        last_written.dwLowDateTime,
+        last_written.dwHighDateTime,
+    ))
+}
+
+/// Checks macOS Keychain for agy's generic password (`service="gemini"`,
+/// `account="antigravity"`) via attributes only (`load_data` stays `false`),
+/// so Keychain neither decrypts the secret nor prompts for authorization.
+#[cfg(target_os = "macos")]
+fn os_credential_mtime() -> Option<Option<SystemTime>> {
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::date::CFDate;
+    use core_foundation::string::CFStringRef;
+    use security_framework::item::{ItemClass, ItemSearchOptions, SearchResult};
+
+    #[link(name = "Security", kind = "framework")]
+    unsafe extern "C" {
+        #[link_name = "kSecAttrModificationDate"]
+        static SEC_ATTR_MODIFICATION_DATE: CFStringRef;
+    }
+
+    let results = ItemSearchOptions::new()
+        .class(ItemClass::generic_password())
+        .service("gemini")
+        .account("antigravity")
+        .load_attributes(true)
+        .search()
+        .ok()?;
+    let first = results.first()?;
+    let mtime = match first {
+        SearchResult::Dict(dict) => {
+            // SAFETY: `SEC_ATTR_MODIFICATION_DATE` is an immutable `CFStringRef`
+            // constant exported by `Security.framework`.
+            let key = unsafe { SEC_ATTR_MODIFICATION_DATE.cast() };
+            dict.find(key)
+                .map(|value| *value)
+                .filter(|ptr| !ptr.is_null())
+                .and_then(|ptr| {
+                    // SAFETY: values in a `CFDictionary` returned by
+                    // `SecItemCopyMatching` are valid Core Foundation objects
+                    // borrowed from `dict` ("Get Rule"), and null was filtered
+                    // above.
+                    unsafe { CFType::wrap_under_get_rule(ptr) }.downcast_into::<CFDate>()
+                })
+                .and_then(|date| cf_absolute_time_to_system_time(date.abs_time()))
+        }
+        _ => None,
+    };
+    Some(mtime)
+}
+
+/// Other platforms store agy's sign-in in the fallback file.
+#[cfg(not(any(windows, target_os = "macos")))]
+fn os_credential_mtime() -> Option<Option<SystemTime>> {
+    None
+}
+
+/// Checks the fallback sign-in file for existence and modification time,
+/// without opening it.
+fn file_sign_in(token: Option<&Path>) -> Option<Option<SystemTime>> {
+    let token = token.filter(|token| token.exists())?;
+    Some(file_mtime(token))
+}
+
+/// Merges the OS credential store and fallback file checks into one [`SignIn`].
+/// When both exist, the newer modification time wins so re-signing into either
+/// store advances the stamp past a `signed_out_mtime` hold.
+fn combine_sign_in(cred: Option<Option<SystemTime>>, file: Option<Option<SystemTime>>) -> SignIn {
+    match (cred, file) {
+        (None, None) => SignIn::Absent,
+        (Some(a), None) | (None, Some(a)) => SignIn::Present(a),
+        (Some(a), Some(b)) => SignIn::Present(a.max(b)),
+    }
+}
+
+/// Checks whether agy has a stored sign-in in the OS credential store or at its
+/// fallback token file, without starting agy or reading the token.
+fn probe_agy_sign_in() -> SignIn {
+    let token = get_antigravity_token_path().ok();
+    combine_sign_in(os_credential_mtime(), file_sign_in(token.as_deref()))
 }
 
 /// Where each build installs on `os` (a [`std::env::consts::OS`] value), in the
@@ -68,7 +235,10 @@ fn agy_install_paths(os: &str, home: &Path, local_appdata: &Path) -> Vec<AgyBina
     };
     match os {
         "windows" => vec![agy(local_appdata.join("agy").join("bin").join("agy.exe"))],
-        "macos" => vec![own_sign_in("/usr/local/bin/jetski")],
+        "macos" => vec![
+            agy(home.join(".local").join("bin").join("agy")),
+            own_sign_in("/usr/local/bin/jetski"),
+        ],
         _ => vec![
             agy(home.join(".local").join("bin").join("agy")),
             own_sign_in("/google/bin/releases/jetski-devs/tools/cli"),
@@ -77,9 +247,9 @@ fn agy_install_paths(os: &str, home: &Path, local_appdata: &Path) -> Vec<AgyBina
 }
 
 /// The first of `agy` on `path_var`, then `installs`, that exists and can sign
-/// in: a build with its own sign-in, or agy when `agy_signed_in`. An agy without its
-/// sign-in file therefore never hides a build with its own sign-in; with no such build, the first that
-/// exists, so the missing sign-in can be reported.
+/// in: a build with its own sign-in, or agy when `agy_signed_in`. An agy without a
+/// stored sign-in therefore never hides a build with its own sign-in; with no such
+/// build, the first that exists, so the missing sign-in can be reported.
 fn locate_agy_in(
     path_var: Option<OsString>,
     installs: Vec<AgyBinary>,
@@ -103,9 +273,8 @@ fn locate_agy_in(
         .cloned()
 }
 
-/// Finds agy: `agy` on `PATH`, then where agy or a build with its own sign-in installs on this OS,
-/// preferring a build that can sign in.
-pub fn locate_agy() -> Option<AgyBinary> {
+/// Resolves the paths [`locate_agy`] searches, given an already-probed `agy_signed_in`.
+fn locate_agy_with_sign_in(agy_signed_in: bool) -> Option<AgyBinary> {
     let home = resolve_paths().ok()?.home_dir;
     let local_appdata = std::env::var_os("LOCALAPPDATA")
         .filter(|value| !value.is_empty())
@@ -113,26 +282,24 @@ pub fn locate_agy() -> Option<AgyBinary> {
     locate_agy_in(
         std::env::var_os("PATH"),
         agy_install_paths(std::env::consts::OS, &home, &local_appdata),
-        get_antigravity_token_path().is_ok_and(|token| token.exists()),
+        agy_signed_in,
     )
 }
 
-/// Whether the Antigravity panel has something to run: a build with its own sign-in, or agy with its
-/// sign-in file. Checking costs no process, where asking agy would start one.
-pub fn antigravity_quota_present() -> bool {
-    match locate_agy() {
-        Some(binary) if binary.own_sign_in => true,
-        Some(_) => get_antigravity_token_path().is_ok_and(|token| token.exists()),
-        None => false,
-    }
+/// Finds agy: `agy` on `PATH`, then where agy or a build with its own sign-in installs on this OS,
+/// preferring a build that can sign in.
+pub fn locate_agy() -> Option<AgyBinary> {
+    locate_agy_with_sign_in(matches!(probe_agy_sign_in(), SignIn::Present(_)))
 }
 
-/// agy's sign-in file, or `None` for a build with its own sign-in, which has none to check.
-fn sign_in_file(binary: &AgyBinary) -> Result<Option<PathBuf>> {
-    if binary.own_sign_in {
-        Ok(None)
-    } else {
-        get_antigravity_token_path().map(Some)
+/// Whether the Antigravity panel has something to run: a build with its own sign-in, or agy with a
+/// stored sign-in. Checking costs no process, where asking agy would start one.
+pub fn antigravity_quota_present() -> bool {
+    let agy_signed_in = matches!(probe_agy_sign_in(), SignIn::Present(_));
+    match locate_agy_with_sign_in(agy_signed_in) {
+        Some(binary) if binary.own_sign_in => true,
+        Some(_) => agy_signed_in,
+        None => false,
     }
 }
 
@@ -248,19 +415,53 @@ fn token_endpoint_reachable() -> bool {
         .any(|addr| TcpStream::connect_timeout(&addr, Duration::from_secs(3)).is_ok())
 }
 
+/// Error message when agy has no stored sign-in on `os` (a
+/// [`std::env::consts::OS`] value).
+fn missing_sign_in_error(os: &str, token: Option<&Path>) -> String {
+    let store = match (os, token) {
+        ("windows", Some(path)) => format!(
+            "in Windows Credential Manager (gemini:antigravity) or at {}",
+            path.display()
+        ),
+        ("windows", None) => "in Windows Credential Manager (gemini:antigravity)".to_string(),
+        ("macos", Some(path)) => {
+            format!(
+                "in Keychain (gemini / antigravity) or at {}",
+                path.display()
+            )
+        }
+        ("macos", None) => "in Keychain (gemini / antigravity)".to_string(),
+        (_, Some(path)) => format!("at {}", path.display()),
+        (_, None) => String::new(),
+    };
+    if store.is_empty() {
+        format!("no Antigravity sign-in ({ANTIGRAVITY_LOGIN_HINT})")
+    } else {
+        format!("no Antigravity sign-in {store} ({ANTIGRAVITY_LOGIN_HINT})")
+    }
+}
+
 /// Runs `agy -p /usage` once for `vct quota antigravity` and returns its raw
 /// stdout, whether or not the run succeeded ([`antigravity_raw_error`] says).
 ///
 /// # Errors
 ///
-/// Returns an error if neither agy nor a build with its own sign-in is found, if agy's sign-in file
-/// is missing, since agy would then wait a minute for an interactive sign-in,
-/// or if agy cannot be started.
+/// Returns an error if neither agy nor a build with its own sign-in is found,
+/// if agy has no stored sign-in, since agy would then wait a minute for an
+/// interactive sign-in, or if agy cannot be started.
 pub fn fetch_antigravity_raw() -> Result<String> {
-    let agy = locate_agy().context("agy not found on PATH or at its install paths")?;
+    let sign_in = probe_agy_sign_in();
+    let agy = locate_agy_with_sign_in(matches!(sign_in, SignIn::Present(_)))
+        .context("agy not found on PATH or at its install paths")?;
+    let sign_in = if agy.own_sign_in {
+        SignIn::Own
+    } else {
+        sign_in
+    };
+    let token = get_antigravity_token_path().ok();
     // agy's own stderr goes to the terminal, so a sign-in prompt explains the
     // wait and a startup error is not swallowed.
-    fetch_antigravity_raw_with(sign_in_file(&agy)?.as_deref(), || {
+    fetch_antigravity_raw_with(sign_in, std::env::consts::OS, token.as_deref(), || {
         agy_usage_command(&agy.path)
             .stderr(Stdio::inherit())
             .output()
@@ -268,18 +469,17 @@ pub fn fetch_antigravity_raw() -> Result<String> {
     })
 }
 
-/// The injectable core of [`fetch_antigravity_raw`]: production passes the real
-/// sign-in file (`None` for a build with its own sign-in) and agy runner, tests a temp file and a
-/// fake.
+/// The injectable core of [`fetch_antigravity_raw`]: production passes the
+/// probed [`SignIn`], OS name, fallback token path and agy runner; tests pass
+/// fakes.
 fn fetch_antigravity_raw_with(
+    sign_in: SignIn,
+    os: &str,
     token: Option<&Path>,
     run: impl FnOnce() -> io::Result<Vec<u8>>,
 ) -> Result<String> {
-    if let Some(token) = token.filter(|token| !token.exists()) {
-        bail!(
-            "no Antigravity sign-in at {} ({ANTIGRAVITY_LOGIN_HINT})",
-            token.display()
-        );
+    if matches!(sign_in, SignIn::Absent) {
+        bail!("{}", missing_sign_in_error(os, token));
     }
     let stdout = run().context("Failed to run agy")?;
     Ok(String::from_utf8_lossy(&stdout).into_owned())
@@ -315,38 +515,42 @@ impl AntigravityState {
     /// One worker tick: run `/usage` unless agy is known to be signed out or
     /// cannot reach Google.
     pub fn resolve(&mut self) -> QuotaOutcome<AntigravityQuotaSnapshot> {
-        let Some(agy) = locate_agy() else {
+        // Probed before `run` so a re-login during the minute a dead sign-in
+        // keeps agy waiting still counts as a change on the next tick.
+        let sign_in = probe_agy_sign_in();
+        let Some(agy) = locate_agy_with_sign_in(matches!(sign_in, SignIn::Present(_))) else {
             log::warn!("antigravity quota: agy not found; nothing run");
             return QuotaOutcome::Transient;
         };
-        let Ok(token) = sign_in_file(&agy) else {
-            return QuotaOutcome::Transient;
+        let sign_in = if agy.own_sign_in {
+            SignIn::Own
+        } else {
+            sign_in
         };
         self.resolve_with(
-            token.as_deref(),
+            sign_in,
             chrono::Local::now().timestamp(),
             token_endpoint_reachable,
             || agy_usage_command(&agy.path).output(),
         )
     }
 
-    /// The injectable core of [`Self::resolve`]: production passes the real
-    /// sign-in file (`None` for a build with its own sign-in), reachability probe and agy runner,
-    /// tests fakes. Without a sign-in file there is no hold, so a failed sign-in
-    /// is tried again on the next tick.
+    /// The injectable core of [`Self::resolve`]: production passes the probed
+    /// [`SignIn`], reachability probe and agy runner; tests pass fakes. Without
+    /// a modification timestamp (`SignIn::Own` or `SignIn::Present(None)`) there
+    /// is no hold, so a failed sign-in is tried again on the next tick.
     fn resolve_with(
         &mut self,
-        token: Option<&Path>,
+        sign_in: SignIn,
         now: i64,
         online: impl FnOnce() -> bool,
         run: impl FnOnce() -> io::Result<Output>,
     ) -> QuotaOutcome<AntigravityQuotaSnapshot> {
-        if token.is_some_and(|token| !token.exists()) {
-            return QuotaOutcome::NeedsLogin;
-        }
-        // Read before the run: a re-login during the minute a dead sign-in
-        // keeps agy waiting must still count as a change afterwards.
-        let mtime = token.and_then(file_mtime);
+        let mtime = match sign_in {
+            SignIn::Absent => return QuotaOutcome::NeedsLogin,
+            SignIn::Own => None,
+            SignIn::Present(mtime) => mtime,
+        };
         if mtime.is_some() && self.last.signed_out_mtime == mtime {
             return QuotaOutcome::NeedsLogin;
         }
@@ -407,6 +611,10 @@ mod tests {
             AgyUsage::Data(snapshot) => snapshot,
             _ => panic!("expected a snapshot"),
         }
+    }
+
+    fn from_file(token: &Path) -> SignIn {
+        combine_sign_in(None, file_sign_in(Some(token)))
     }
 
     #[test]
@@ -486,17 +694,38 @@ mod tests {
     }
 
     #[test]
-    fn raw_fetch_without_a_sign_in_file_never_starts_agy() {
+    fn raw_fetch_without_a_sign_in_never_starts_agy_and_names_the_os_store() {
         let dir = tempfile::tempdir().unwrap();
         let token = dir.path().join("antigravity-oauth-token");
-        let err = fetch_antigravity_raw_with(Some(&token), || panic!("agy must not run"))
+        for (os, expected) in [
+            ("linux", token.display().to_string()),
+            ("windows", "gemini:antigravity".to_string()),
+            ("macos", "Keychain (gemini / antigravity)".to_string()),
+        ] {
+            let err = fetch_antigravity_raw_with(from_file(&token), os, Some(&token), || {
+                panic!("agy must not run")
+            })
             .unwrap_err()
             .to_string();
-        assert!(err.contains(ANTIGRAVITY_LOGIN_HINT), "{err}");
+            assert!(err.contains(&expected), "{os}: {err}");
+            assert!(err.contains(ANTIGRAVITY_LOGIN_HINT), "{os}: {err}");
+        }
+
+        // An OS credential entry suffices even when the fallback file is absent.
+        let body = fetch_antigravity_raw_with(
+            SignIn::Present(Some(SystemTime::UNIX_EPOCH)),
+            "windows",
+            Some(&token),
+            || Ok(USAGE.as_bytes().to_vec()),
+        )
+        .unwrap();
+        assert_eq!(body, USAGE);
 
         std::fs::write(&token, "{}").unwrap();
-        let body =
-            fetch_antigravity_raw_with(Some(&token), || Ok(USAGE.as_bytes().to_vec())).unwrap();
+        let body = fetch_antigravity_raw_with(from_file(&token), "linux", Some(&token), || {
+            Ok(USAGE.as_bytes().to_vec())
+        })
+        .unwrap();
         assert_eq!(body, USAGE);
     }
 
@@ -512,11 +741,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_without_a_sign_in_file_asks_for_login_without_starting_agy() {
+    fn resolve_without_a_sign_in_asks_for_login_without_starting_agy() {
         let dir = tempfile::tempdir().unwrap();
         let token = dir.path().join("antigravity-oauth-token");
-        let outcome = AntigravityState::default()
-            .resolve_with(Some(&token), 0, online, || panic!("agy must not run"));
+        let outcome =
+            AntigravityState::default()
+                .resolve_with(from_file(&token), 0, online, || panic!("agy must not run"));
         assert!(matches!(outcome, QuotaOutcome::NeedsLogin));
     }
 
@@ -533,20 +763,20 @@ mod tests {
         let mut state = AntigravityState::default();
 
         assert!(holds_sign_in(&state.resolve_with(
-            Some(&token),
+            from_file(&token),
             0,
             online,
             signed_out
         )));
         assert!(matches!(
-            state.resolve_with(Some(&token), 0, online, signed_out),
+            state.resolve_with(from_file(&token), 0, online, signed_out),
             QuotaOutcome::NeedsLogin
         ));
         assert_eq!(runs.get(), 1, "a dead sign-in must not relaunch agy");
 
         // A re-login rewrites the file, which is what earns another run.
         touch_later(&token);
-        let outcome = state.resolve_with(Some(&token), 5, online, || ran(USAGE));
+        let outcome = state.resolve_with(from_file(&token), 5, online, || ran(USAGE));
         assert!(
             matches!(outcome, QuotaOutcome::Data(ref s) if s.buckets.len() == 4 && !s.needs_login)
         );
@@ -561,11 +791,11 @@ mod tests {
         let mut state = AntigravityState::default();
 
         assert!(matches!(
-            state.resolve_with(Some(&token), 5, online, || ran(USAGE)),
+            state.resolve_with(from_file(&token), 5, online, || ran(USAGE)),
             QuotaOutcome::Data(_)
         ));
         let QuotaOutcome::Data(saved) =
-            state.resolve_with(Some(&token), 9, online, || ran(SIGNED_OUT))
+            state.resolve_with(from_file(&token), 9, online, || ran(SIGNED_OUT))
         else {
             panic!("a failed sign-in must hand out the hold");
         };
@@ -581,8 +811,117 @@ mod tests {
         let cached = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
         let outcome =
             AntigravityState::resume(cached)
-                .resolve_with(Some(&token), 20, online, || panic!("agy must not run"));
+                .resolve_with(from_file(&token), 20, online, || panic!("agy must not run"));
         assert!(matches!(outcome, QuotaOutcome::NeedsLogin));
+    }
+
+    #[test]
+    fn an_os_credential_sign_in_holds_across_restarts_until_the_credential_updates() {
+        let t1 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let t2 = t1 + Duration::from_secs(60);
+        let mut state = AntigravityState::default();
+
+        assert!(matches!(
+            state.resolve_with(SignIn::Present(Some(t1)), 5, online, || ran(USAGE)),
+            QuotaOutcome::Data(_)
+        ));
+        let QuotaOutcome::Data(saved) =
+            state.resolve_with(SignIn::Present(Some(t1)), 9, online, || ran(SIGNED_OUT))
+        else {
+            panic!("a failed sign-in must hand out the hold");
+        };
+        assert!(saved.needs_login);
+        assert_eq!(saved.signed_out_mtime, Some(t1));
+        assert_eq!(
+            saved.buckets.len(),
+            4,
+            "a failed sign-in must not blank the gauges"
+        );
+        assert_eq!(saved.fetched_at, 5);
+
+        // Resuming from the persisted cache keeps holding while the OS credential
+        // entry carries the same timestamp, and retries once re-login updates it.
+        let cached = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        let mut resumed = AntigravityState::resume(cached);
+        assert!(matches!(
+            resumed.resolve_with(SignIn::Present(Some(t1)), 20, online, || {
+                panic!("agy must not run")
+            }),
+            QuotaOutcome::NeedsLogin
+        ));
+        let outcome = resumed.resolve_with(SignIn::Present(Some(t2)), 25, online, || ran(USAGE));
+        assert!(matches!(
+            outcome,
+            QuotaOutcome::Data(ref s) if !s.needs_login && s.signed_out_mtime.is_none()
+        ));
+    }
+
+    #[test]
+    fn combine_sign_in_detects_either_store_and_picks_the_newer_timestamp() {
+        let older = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let newer = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
+
+        assert_eq!(combine_sign_in(None, None), SignIn::Absent);
+        assert_eq!(
+            combine_sign_in(Some(Some(older)), None),
+            SignIn::Present(Some(older))
+        );
+        assert_eq!(combine_sign_in(Some(None), None), SignIn::Present(None));
+        assert_eq!(
+            combine_sign_in(None, Some(Some(older))),
+            SignIn::Present(Some(older))
+        );
+        assert_eq!(
+            combine_sign_in(Some(Some(older)), Some(Some(newer))),
+            SignIn::Present(Some(newer))
+        );
+        assert_eq!(
+            combine_sign_in(Some(Some(newer)), Some(Some(older))),
+            SignIn::Present(Some(newer))
+        );
+        assert_eq!(
+            combine_sign_in(Some(None), Some(Some(older))),
+            SignIn::Present(Some(older))
+        );
+    }
+
+    #[test]
+    fn os_credential_timestamps_convert_post_epoch_values_and_reject_pre_epoch() {
+        // FILETIME: 1970-01-01T00:00:00Z is 116_444_736_000_000_000 ticks.
+        let unix_epoch_ticks: u64 = 116_444_736_000_000_000;
+        assert_eq!(filetime_to_system_time(0, 0), None);
+        let before = unix_epoch_ticks - 1;
+        assert_eq!(
+            filetime_to_system_time(before as u32, (before >> 32) as u32),
+            None
+        );
+        assert_eq!(
+            filetime_to_system_time(unix_epoch_ticks as u32, (unix_epoch_ticks >> 32) as u32),
+            Some(SystemTime::UNIX_EPOCH)
+        );
+        // +1_700_000_000.5 s in 100-ns intervals.
+        let sample = unix_epoch_ticks + 1_700_000_000 * 10_000_000 + 5_000_000;
+        assert_eq!(
+            filetime_to_system_time(sample as u32, (sample >> 32) as u32),
+            Some(SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 500_000_000))
+        );
+
+        // CFAbsoluteTime: 0.0 is 2001-01-01T00:00:00Z (UNIX_EPOCH + 978_307_200 s).
+        assert_eq!(
+            cf_absolute_time_to_system_time(0.0),
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(978_307_200))
+        );
+        assert_eq!(
+            cf_absolute_time_to_system_time(-978_307_200.0),
+            Some(SystemTime::UNIX_EPOCH)
+        );
+        assert_eq!(
+            cf_absolute_time_to_system_time(100.5),
+            Some(SystemTime::UNIX_EPOCH + Duration::new(978_307_300, 500_000_000))
+        );
+        assert_eq!(cf_absolute_time_to_system_time(-978_307_201.0), None);
+        assert_eq!(cf_absolute_time_to_system_time(f64::NAN), None);
+        assert_eq!(cf_absolute_time_to_system_time(f64::INFINITY), None);
     }
 
     #[test]
@@ -603,7 +942,12 @@ mod tests {
         std::fs::write(&token, "{}").unwrap();
         let mut state = AntigravityState::default();
 
-        let outcome = state.resolve_with(Some(&token), 0, || false, || panic!("agy must not run"));
+        let outcome = state.resolve_with(
+            from_file(&token),
+            0,
+            || false,
+            || panic!("agy must not run"),
+        );
         assert!(matches!(outcome, QuotaOutcome::Transient));
         assert!(state.last.signed_out_mtime.is_none());
     }
@@ -626,13 +970,15 @@ mod tests {
         std::fs::write(&token, "{}").unwrap();
         let mut state = AntigravityState::default();
 
-        let outcome = state.resolve_with(Some(&token), 0, online, || {
+        // `resolve` probes before `run`, so capture `from_file` beforehand too.
+        let before = from_file(&token);
+        let outcome = state.resolve_with(before, 0, online, || {
             touch_later(&token);
             ran(SIGNED_OUT)
         });
         assert!(holds_sign_in(&outcome));
         let reran = Cell::new(false);
-        let outcome = state.resolve_with(Some(&token), 5, online, || {
+        let outcome = state.resolve_with(from_file(&token), 5, online, || {
             reran.set(true);
             ran(USAGE)
         });
@@ -649,44 +995,45 @@ mod tests {
 
         let not_found = || Err(io::Error::from(io::ErrorKind::NotFound));
         assert!(matches!(
-            state.resolve_with(Some(&token), 0, online, not_found),
+            state.resolve_with(from_file(&token), 0, online, not_found),
             QuotaOutcome::Transient
         ));
         let broken = || ran("garbage");
         assert!(matches!(
-            state.resolve_with(Some(&token), 0, online, broken),
+            state.resolve_with(from_file(&token), 0, online, broken),
             QuotaOutcome::Transient
         ));
         assert!(state.last.signed_out_mtime.is_none());
     }
 
     #[test]
-    fn a_build_with_its_own_sign_in_has_no_file_to_wait_on_or_hold_with() {
-        let mut state = AntigravityState::default();
-        let runs = Cell::new(0);
-        let signed_out = || {
-            runs.set(runs.get() + 1);
-            ran(SIGNED_OUT)
-        };
-        assert!(matches!(
-            state.resolve_with(None, 0, online, signed_out),
-            QuotaOutcome::Data(ref s) if s.needs_login && s.signed_out_mtime.is_none()
-        ));
-        assert!(matches!(
-            state.resolve_with(None, 0, online, signed_out),
-            QuotaOutcome::Data(_)
-        ));
-        assert_eq!(
-            runs.get(),
-            2,
-            "with no sign-in file, every tick tries again"
-        );
-        assert!(matches!(
-            state.resolve_with(None, 5, online, || ran(USAGE)),
-            QuotaOutcome::Data(ref s) if !s.needs_login && s.buckets.len() == 4
-        ));
+    fn a_sign_in_without_a_timestamp_retries_each_tick() {
+        for sign_in in [SignIn::Own, SignIn::Present(None)] {
+            let mut state = AntigravityState::default();
+            let runs = Cell::new(0);
+            let signed_out = || {
+                runs.set(runs.get() + 1);
+                ran(SIGNED_OUT)
+            };
+            assert!(matches!(
+                state.resolve_with(sign_in, 0, online, signed_out),
+                QuotaOutcome::Data(ref s) if s.needs_login && s.signed_out_mtime.is_none()
+            ));
+            assert!(matches!(
+                state.resolve_with(sign_in, 0, online, signed_out),
+                QuotaOutcome::Data(_)
+            ));
+            assert_eq!(runs.get(), 2, "{sign_in:?}: without a timestamp, retry");
+            assert!(matches!(
+                state.resolve_with(sign_in, 5, online, || ran(USAGE)),
+                QuotaOutcome::Data(ref s) if !s.needs_login && s.buckets.len() == 4
+            ));
+        }
 
-        let body = fetch_antigravity_raw_with(None, || Ok(USAGE.as_bytes().to_vec())).unwrap();
+        let body = fetch_antigravity_raw_with(SignIn::Own, "linux", None, || {
+            Ok(USAGE.as_bytes().to_vec())
+        })
+        .unwrap();
         assert_eq!(body, USAGE);
     }
 
@@ -712,7 +1059,10 @@ mod tests {
         );
         assert_eq!(
             paths("macos"),
-            [(PathBuf::from("/usr/local/bin/jetski"), true)]
+            [
+                (home.join(".local").join("bin").join("agy"), false),
+                (PathBuf::from("/usr/local/bin/jetski"), true),
+            ]
         );
         assert_eq!(
             paths("windows"),
