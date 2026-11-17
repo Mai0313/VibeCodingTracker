@@ -8,14 +8,14 @@ These are minimal examples: they stop at "dump the JSON response". Field extract
 
 ## At a glance
 
-| Provider    | Credential file                                     | Quota endpoint                                                               | Refresh model                                    |
-| ----------- | --------------------------------------------------- | ---------------------------------------------------------------------------- | ------------------------------------------------ |
-| Codex       | `~/.codex/auth.json`                                | `GET  chatgpt.com/backend-api/wham/usage` + reset-credit details             | `POST auth.openai.com/oauth/token` (rotates)     |
-| Claude Code | `~/.claude/.credentials.json`                       | `GET  api.anthropic.com/api/oauth/usage`                                     | `POST platform.claude.com/v1/oauth/token`        |
-| Copilot     | `~/.copilot/config.json`                            | `GET  api.github.com/copilot_internal/user`                                  | none (long-lived `gho_` token)                   |
-| Cursor      | `~/.config/cursor/auth.json`                        | `GET  cursor.com/api/usage-summary`                                          | reactive (official CLI keeps the file fresh)     |
-| Antigravity | `~/.gemini/antigravity-cli/antigravity-oauth-token` | `POST daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary` | `POST oauth2.googleapis.com/token` (no rotation) |
-| Grok        | `~/.grok/auth.json`                                 | `GET  cli-chat-proxy.grok.com/v1/billing?format=credits`                     | `POST auth.x.ai/oauth2/token` (rotates)          |
+| Provider    | Credential file                                                                              | Quota endpoint                                                               | Refresh model                                    |
+| ----------- | -------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | ------------------------------------------------ |
+| Codex       | `~/.codex/auth.json`                                                                         | `GET  chatgpt.com/backend-api/wham/usage` + reset-credit details             | `POST auth.openai.com/oauth/token` (rotates)     |
+| Claude Code | `~/.claude/.credentials.json`                                                                | `GET  api.anthropic.com/api/oauth/usage`                                     | `POST platform.claude.com/v1/oauth/token`        |
+| Copilot     | `~/.copilot/config.json`                                                                     | `GET  api.github.com/copilot_internal/user`                                  | none (long-lived `gho_` token)                   |
+| Cursor      | `~/.config/cursor/auth.json`                                                                 | `GET  cursor.com/api/usage-summary`                                          | reactive (official CLI keeps the file fresh)     |
+| Antigravity | `~/.gemini/antigravity-cli/antigravity-oauth-token` (or OS keyring `gemini` / `antigravity`) | `POST daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary` | `POST oauth2.googleapis.com/token` (no rotation) |
+| Grok        | `~/.grok/auth.json`                                                                          | `GET  cli-chat-proxy.grok.com/v1/billing?format=credits`                     | `POST auth.x.ai/oauth2/token` (rotates)          |
 
 ## Client impersonation
 
@@ -182,7 +182,7 @@ Reactive. The `accessToken` is valid ~60 days (`offline_access` scope) and the o
 
 ## Antigravity
 
-Credential file (Linux) `~/.gemini/antigravity-cli/antigravity-oauth-token`: plain JSON, `.token.access_token`, `.token.refresh_token`, `.token.expiry`, plus `.auth_method` (`consumer` for a personal Google account, `gcp` for a Google Cloud sign-in) and, for Cloud sign-ins, `.project_id`. On macOS the same blob lives in the Keychain instead (service `gemini`, account `antigravity`), sometimes wrapped with a `go-keyring-base64:` prefix; the field names are the same once unwrapped.
+Credential file (Linux / fallback) `~/.gemini/antigravity-cli/antigravity-oauth-token`: plain JSON, `.token.access_token`, `.token.refresh_token`, `.token.expiry`, plus `.auth_method` (`consumer` for a personal Google account, `gcp` for a Google Cloud sign-in) and, for Cloud sign-ins, `.project_id`. On Windows and macOS the same blob lives in the OS credential store instead — Windows Credential Manager generic credential `gemini:antigravity`, and macOS Keychain generic password with service `gemini` and account `antigravity` — sometimes wrapped with a `go-keyring-base64:` prefix; the field names are the same once unwrapped.
 
 Antigravity also has a second, richer source when the app (or the `agy` CLI) is **running**: a local Connect-RPC language server on loopback (`RetrieveUserQuotaSummary` on `https://127.0.0.1:<port>/...`), discovered by scanning for the process and reading its `--csrf_token`. That path needs no OAuth but only works while the app is up. The recipe below is the **app-closed** path, the one that fits this file: credential file in, HTTP out, works over plain SSH.
 
