@@ -2,8 +2,8 @@
 //!
 //! [`run_app`] owns the event loop. The Usage and Analysis tabs share one
 //! background [`RefreshWorker`] and one session ledger, started on the first
-//! visit to either, so opening on the Quota tab scans nothing. Only the tab on
-//! screen refreshes on its timer.
+//! visit to either, and the Quota tab starts its workers on the first visit to
+//! it. Only the tab on screen refreshes on its timer.
 
 use crate::display::analysis::{AnalysisUiState, scan_analysis};
 use crate::display::common::table::{
@@ -211,14 +211,7 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
         let paths = vct_core::utils::resolve_paths()?;
         let mut tab = start;
         let mut config = config;
-        let mut quota = QuotaRuntime::start(
-            &config.usage.quota.panels,
-            config.providers,
-            config.usage.quota_refresh_secs(),
-        );
-        // A change to what the quota workers poll is applied on leaving
-        // Settings, not per key press: each restart fetches at once.
-        let mut quota_stale = false;
+        let mut quota: Option<QuotaRuntime> = None;
         let mut usage = UsageUiState::new(merge);
         let mut analysis = AnalysisUiState::new();
         let mut settings = SettingsUiState::new(
@@ -347,9 +340,16 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                 spinner = spinner.wrapping_add(1);
                 let active = worker.as_ref().is_some_and(RefreshWorker::is_active);
                 let status = refresh_status(active, failure_until);
-                let snapshots = QuotaSnapshots::read(&quota);
-                let view = snapshots.view(&quota, usage.provider_panel_open);
-                let now = chrono::Local::now().timestamp();
+                let quota_snapshots = (tab == Tab::Quota).then(|| {
+                    let runtime = quota.get_or_insert_with(|| {
+                        QuotaRuntime::start(
+                            &config.usage.quota.panels,
+                            config.providers,
+                            config.usage.quota_refresh_secs(),
+                        )
+                    });
+                    QuotaSnapshots::read(runtime)
+                });
                 let metrics = process_metrics(&sys, pid);
                 let completed = terminal.terminal_mut().draw(|f| {
                     let [bar, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)])
@@ -366,9 +366,14 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                             };
                             render_loading(f, body, spinner, message);
                         }
-                        Tab::Usage => usage.draw(f, body, &view, status),
+                        Tab::Usage => usage.draw(f, body, status),
                         Tab::Analysis => analysis.draw(f, body, status),
-                        Tab::Quota => draw_quota_tab(f, body, &view, now),
+                        Tab::Quota => {
+                            let runtime = quota.as_ref().expect("started for Quota tab");
+                            let snapshots = quota_snapshots.as_ref().expect("read for Quota tab");
+                            let now = chrono::Local::now().timestamp();
+                            draw_quota_tab(f, body, &snapshots.view(runtime), now);
+                        }
                         Tab::Settings => settings.draw(f, body),
                     }
                     if help_open {
@@ -414,8 +419,11 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                                     settings.set_message(message, ok);
                                 }
                                 let next = settings.config().clone();
-                                quota_stale |= next.usage.quota != config.usage.quota
-                                    || next.providers != config.providers;
+                                if next.usage.quota != config.usage.quota
+                                    || next.providers != config.providers
+                                {
+                                    quota = None;
+                                }
                                 usage.set_merge(next.usage.merge_models);
                                 config = next;
                             }
@@ -507,14 +515,6 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
             if let Some(next) = go_to
                 && next != tab
             {
-                if tab == Tab::Settings && quota_stale {
-                    quota = QuotaRuntime::start(
-                        &config.usage.quota.panels,
-                        config.providers,
-                        config.usage.quota_refresh_secs(),
-                    );
-                    quota_stale = false;
-                }
                 if next == Tab::Settings {
                     // `m` on the Usage tab writes the file too.
                     config.usage.merge_models = usage.merge_enabled();

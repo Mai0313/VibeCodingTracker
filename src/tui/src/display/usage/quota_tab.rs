@@ -91,7 +91,6 @@ mod tests {
             antigravity: &antigravity,
             present: Default::default(),
             band_enabled,
-            provider_panel_open: false,
         };
         let flags = [
             &mut quota.present.claude,
