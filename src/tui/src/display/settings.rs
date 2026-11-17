@@ -324,8 +324,6 @@ pub(crate) enum SettingsOutcome {
     Stay,
     /// Leave the app.
     Quit,
-    /// Show another tab (zero-based).
-    SwitchTab(usize),
     /// Show the tab after this one (`Tab`).
     NextTab,
     /// Show the tab before this one (`Shift+Tab`).
@@ -397,6 +395,11 @@ impl SettingsUiState {
     /// Shows `text` beside the key hints, as a success or a failure.
     pub(crate) fn set_message(&mut self, text: String, ok: bool) {
         self.message = Some((text, ok));
+    }
+
+    /// Whether a field editor is currently open over the form.
+    pub(crate) fn has_open_editor(&self) -> bool {
+        self.editor.is_some()
     }
 
     fn current(&self) -> usize {
@@ -560,9 +563,6 @@ impl SettingsUiState {
             KeyCode::Char('q') => return SettingsOutcome::Quit,
             KeyCode::Char('e') => return SettingsOutcome::OpenEditor,
             KeyCode::Char('?') => return SettingsOutcome::Help,
-            KeyCode::Char(digit @ '1'..='4') => {
-                return SettingsOutcome::SwitchTab(digit as usize - '1' as usize);
-            }
             KeyCode::Tab => return SettingsOutcome::NextTab,
             KeyCode::BackTab => return SettingsOutcome::PrevTab,
             KeyCode::Up => self.row = self.row.saturating_sub(1),
@@ -1184,7 +1184,7 @@ mod tests {
     fn keys_outside_an_editor_leave_or_switch() {
         let (mut state, _) = form();
         for (key, outcome) in [
-            (KeyCode::Char('2'), SettingsOutcome::SwitchTab(1)),
+            (KeyCode::Char('2'), SettingsOutcome::Stay),
             (KeyCode::Tab, SettingsOutcome::NextTab),
             (KeyCode::BackTab, SettingsOutcome::PrevTab),
             (KeyCode::Char('?'), SettingsOutcome::Help),

@@ -8,7 +8,10 @@ use crate::display::common::table::{REPO_LABEL, REPO_URL};
 use crate::display::common::theme::{self, theme};
 use crossterm::{
     cursor::{MoveTo, Show},
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseButton, MouseEventKind,
+    },
     execute, queue,
     terminal::{
         Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
@@ -57,11 +60,18 @@ pub fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<io::Stdout>>
     ensure_terminal_panic_hook();
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    // We navigate with the keyboard only, so mouse reporting is left OFF. This
-    // also keeps the terminal's native drag-to-select / copy working untouched.
     if let Err(error) = execute!(stdout, EnterAlternateScreen) {
         let _ = disable_raw_mode();
         let _ = execute!(stdout, LeaveAlternateScreen, Show);
+        return Err(error.into());
+    }
+    // Before mouse capture is turned on: the terminal's answer arrives on
+    // stdin, and an interleaved SGR mouse packet would keep `probe` waiting
+    // past the device-attributes reply (`OnceLock`, so re-entries do nothing).
+    theme::probe();
+    if let Err(error) = execute!(stdout, EnableMouseCapture) {
+        let _ = disable_raw_mode();
+        let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen, Show);
         return Err(error.into());
     }
     IN_TUI.store(true, Ordering::SeqCst);
@@ -89,6 +99,9 @@ pub fn restore_terminal(
     let mut failures = Vec::new();
     if let Err(error) = disable_raw_mode() {
         failures.push(format!("disable raw mode: {error}"));
+    }
+    if let Err(error) = execute!(terminal.backend_mut(), DisableMouseCapture) {
+        failures.push(format!("disable mouse capture: {error}"));
     }
     if let Err(error) = execute!(terminal.backend_mut(), LeaveAlternateScreen) {
         failures.push(format!("leave alternate screen: {error}"));
@@ -118,8 +131,6 @@ impl TerminalSession {
     /// Enters raw alternate-screen mode with rollback on partial setup failure.
     pub fn new() -> anyhow::Result<Self> {
         let terminal = setup_terminal()?;
-        // Before any input is read: the terminal's answer arrives on stdin.
-        theme::probe();
         Ok(Self {
             terminal: Some(terminal),
         })
@@ -427,7 +438,12 @@ pub fn force_restore_terminal() {
     }
     set_tui_owner(None);
     let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+    let _ = execute!(
+        io::stdout(),
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        Show
+    );
 }
 
 /// Whether a TUI currently owns the process terminal.
@@ -607,9 +623,6 @@ fn handle_input_from(source: &mut impl EventSource) -> anyhow::Result<InputActio
                     KeyCode::Esc => return Ok(InputAction::Close),
                     KeyCode::Enter => return Ok(InputAction::Open),
                     KeyCode::Char('?') => return Ok(InputAction::Help),
-                    KeyCode::Char(digit @ '1'..='9') => {
-                        return Ok(InputAction::SwitchTab(digit as usize - '1' as usize));
-                    }
                     KeyCode::Tab => return Ok(InputAction::NextTab),
                     KeyCode::BackTab => return Ok(InputAction::PrevTab),
                     KeyCode::Char('[') => return Ok(InputAction::StepRange(-1)),
@@ -635,6 +648,12 @@ fn handle_input_from(source: &mut impl EventSource) -> anyhow::Result<InputActio
                     _ => {}
                 }
             }
+            Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
+                return Ok(InputAction::Click {
+                    column: mouse.column,
+                    row: mouse.row,
+                });
+            }
             Event::Resize(_, _) => resized = true,
             _ => {}
         }
@@ -654,10 +673,12 @@ fn handle_input_from(source: &mut impl EventSource) -> anyhow::Result<InputActio
     }
 }
 
-/// Waits up to 100 ms for one event and hands a key press back unmapped, for a
+/// Waits up to 100 ms for an event and hands a key press back unmapped, for a
 /// view that reads keys itself (a settings form, a text input).
 ///
-/// Only `Ctrl+C` is still read here, as [`InputAction::Quit`].
+/// Only `Ctrl+C` ([`InputAction::Quit`]) and primary mouse clicks
+/// ([`InputAction::Click`]) are mapped here; non-click mouse events are drained
+/// so cursor motion does not queue behind key presses.
 ///
 /// # Errors
 ///
@@ -670,17 +691,36 @@ fn handle_key_input_from(source: &mut impl EventSource) -> anyhow::Result<InputA
     if !source.poll(Duration::from_millis(100))? {
         return Ok(InputAction::Continue);
     }
-    Ok(match source.read()? {
-        Event::Key(key) if key.kind != KeyEventKind::Release => {
-            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                InputAction::Quit
-            } else {
-                InputAction::Key(key.code)
+    let mut resized = false;
+    let mut drained = 0usize;
+    loop {
+        match source.read()? {
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    return Ok(InputAction::Quit);
+                }
+                return Ok(InputAction::Key(key.code));
             }
+            Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
+                return Ok(InputAction::Click {
+                    column: mouse.column,
+                    row: mouse.row,
+                });
+            }
+            Event::Resize(_, _) => resized = true,
+            _ => {}
         }
-        Event::Resize(_, _) => InputAction::Resize,
-        _ => InputAction::Continue,
-    })
+
+        drained += 1;
+        if drained >= MAX_DRAINED_EVENTS || !source.poll(Duration::from_millis(0))? {
+            break;
+        }
+    }
+    if resized {
+        Ok(InputAction::Resize)
+    } else {
+        Ok(InputAction::Continue)
+    }
 }
 
 /// A net navigation move accumulated from one [`handle_input`] batch.
@@ -710,8 +750,8 @@ pub enum InputAction {
     Open,
     /// User asked for the key list (`?`).
     Help,
-    /// User picked a tab by its number (`1`-`9`), zero-based.
-    SwitchTab(usize),
+    /// User clicked the primary mouse button at `(column, row)`.
+    Click { column: u16, row: u16 },
     /// User moved to the next tab (`Tab`).
     NextTab,
     /// User moved to the previous tab (`Shift+Tab`).
@@ -1079,8 +1119,8 @@ mod tests {
         // Esc is distinct from quit so a view with an overlay can back out of it
         // instead of exiting.
         assert_eq!(press(KeyCode::Esc), InputAction::Close);
-        assert_eq!(press(KeyCode::Char('1')), InputAction::SwitchTab(0));
-        assert_eq!(press(KeyCode::Char('3')), InputAction::SwitchTab(2));
+        assert_eq!(press(KeyCode::Char('1')), InputAction::Continue);
+        assert_eq!(press(KeyCode::Char('3')), InputAction::Continue);
         assert_eq!(press(KeyCode::Tab), InputAction::NextTab);
         assert_eq!(press(KeyCode::BackTab), InputAction::PrevTab);
         assert_eq!(press(KeyCode::Enter), InputAction::Open);
@@ -1097,6 +1137,38 @@ mod tests {
             KeyModifiers::CONTROL,
         ))]);
         assert_eq!(handle_input_from(&mut ctrl_c).unwrap(), InputAction::Quit);
+    }
+
+    #[test]
+    fn primary_clicks_map_to_click_actions_across_both_input_modes() {
+        let mouse = |kind, column, row| {
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+
+        let mut normal = FakeEventSource::new([
+            mouse(MouseEventKind::Moved, 4, 0),
+            mouse(MouseEventKind::Down(MouseButton::Right), 8, 0),
+            mouse(MouseEventKind::Down(MouseButton::Left), 12, 0),
+        ]);
+        assert_eq!(
+            handle_input_from(&mut normal).unwrap(),
+            InputAction::Click { column: 12, row: 0 }
+        );
+
+        let mut raw = FakeEventSource::new([
+            mouse(MouseEventKind::Moved, 4, 0),
+            mouse(MouseEventKind::Up(MouseButton::Left), 8, 0),
+            mouse(MouseEventKind::Down(MouseButton::Left), 25, 0),
+        ]);
+        assert_eq!(
+            handle_key_input_from(&mut raw).unwrap(),
+            InputAction::Click { column: 25, row: 0 }
+        );
     }
 
     #[test]

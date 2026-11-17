@@ -78,7 +78,7 @@ pub fn display_usage_table(usage_data: &UsageData, merge: bool) {
 
     for row in rows {
         table.add_row(vec![
-            Cell::new(&row.display_model)
+            Cell::new(&row.model)
                 .fg(Color::Green)
                 .set_alignment(CellAlignment::Left),
             Cell::new(format_number(row.input_tokens))

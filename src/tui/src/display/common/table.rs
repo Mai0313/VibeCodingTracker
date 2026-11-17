@@ -97,7 +97,7 @@ pub const REPO_LABEL: &str = "Star on GitHub";
 pub const REPO_URL: &str = "https://github.com/Mai0313/VibeCodingTracker";
 
 /// The hints every tab's footer ends with.
-const CORE_HINTS: [(&str, &str); 3] = [("1-4/tab", "view"), ("?", "help"), ("q", "quit")];
+const CORE_HINTS: [(&str, &str); 3] = [("tab", "view"), ("?", "help"), ("q", "quit")];
 
 /// Builds the single-line key-hint footer with no status.
 ///
@@ -410,14 +410,24 @@ pub fn render_detail_panel(f: &mut Frame, area: Rect, name: &str, rows: &[(&str,
         })
         .collect();
     lines.push(Line::default());
-    lines.extend(rows.iter().map(|(label, value)| {
-        let pad = inner_w.saturating_sub(label.chars().count() + value.chars().count());
-        Line::from(vec![
-            Span::styled(format!(" {label}"), theme.dim()),
-            Span::raw(" ".repeat(pad)),
-            Span::raw(value.clone()),
-        ])
-    }));
+    for (label, value) in rows {
+        if label.chars().count() + 1 + value.chars().count() <= inner_w {
+            let pad = inner_w.saturating_sub(label.chars().count() + value.chars().count());
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {label}"), theme.dim()),
+                Span::raw(" ".repeat(pad)),
+                Span::raw(value.clone()),
+            ]));
+        } else {
+            lines.push(Line::from(Span::styled(format!(" {label}"), theme.dim())));
+            let chars: Vec<char> = value.chars().collect();
+            for chunk in chars.chunks(inner_w) {
+                let text: String = chunk.iter().collect();
+                let pad = inner_w.saturating_sub(chunk.len());
+                lines.push(Line::from(format!(" {}{text}", " ".repeat(pad))));
+            }
+        }
+    }
     let height = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
     let rect = Rect {
         x: area.x + (area.width - width) / 2,
@@ -708,41 +718,51 @@ mod tests {
         // Wide: everything, the repo label at the right edge.
         let wide = render(120);
         assert!(wide.trim_end().ends_with("Star on GitHub"), "got {wide:?}");
-        assert!(wide.contains("[ ] range  1-4/tab view  ? help  q quit"));
+        assert!(wide.contains("[ ] range  tab view  ? help  q quit"));
 
         // The repo label goes first, then the tab's hints from the right, and
         // nothing is left half-drawn.
-        let narrow = render(52);
+        let narrow = render(48);
         assert!(!narrow.contains("Star"), "got {narrow:?}");
         assert!(!narrow.contains("range"), "got {narrow:?}");
         assert!(
-            narrow.contains("m merge  p providers  1-4/tab view  ? help  q quit"),
+            narrow.contains("m merge  p providers  tab view  ? help  q quit"),
             "got {narrow:?}"
         );
 
         // The common hints stay even when no tab hint fits.
-        let tiny = render(30);
-        assert_eq!(tiny.trim(), "1-4/tab view  ? help  q quit");
+        let tiny = render(26);
+        assert_eq!(tiny.trim(), "tab view  ? help  q quit");
     }
 
     #[test]
     fn the_detail_panel_shows_a_long_name_in_full() {
         use ratatui::{Terminal, backend::TestBackend};
         let name = "fireworks-ai/accounts/fireworks/models/qwen3-coder-480k-a35b-instruct";
-        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        let matched = "openrouter/qwen/qwen3-coder-480b-a35b-instruct-fp8-nitro";
+        let mut terminal = Terminal::new(TestBackend::new(80, 18)).unwrap();
         terminal
             .draw(|f| {
-                super::render_detail_panel(f, f.area(), name, &[("Cost", "$1.00".to_string())]);
+                super::render_detail_panel(
+                    f,
+                    f.area(),
+                    name,
+                    &[
+                        ("Cost", "$1.00".to_string()),
+                        ("Priced as", matched.to_string()),
+                    ],
+                );
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
-        let shown: String = (0..16)
+        let shown: String = (0..18)
             .flat_map(|y| (0..80).map(move |x| (x, y)))
             .map(|(x, y)| buffer[(x, y)].symbol())
             .filter(|symbol| !matches!(*symbol, " " | "│"))
             .collect();
         assert!(shown.contains(name), "{shown}");
         assert!(shown.contains("Cost$1.00"), "{shown}");
+        assert!(shown.contains(matched), "{shown}");
     }
 
     #[test]

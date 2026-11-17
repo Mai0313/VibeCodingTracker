@@ -9,7 +9,6 @@ use crate::models::{PerProviderUsage, ProviderActiveDays, UsageResult};
 use crate::pricing::CostSource;
 use crate::usage::StoredCosts;
 use serde_json::Value;
-use std::borrow::Cow;
 
 /// Per-provider cost basis, resolved to a [`CostSource`] per model.
 #[derive(Clone, Copy)]
@@ -51,9 +50,9 @@ impl ProviderPricing<'_> {
 pub struct UsageRow {
     /// Raw model name as reported by the session (the pricing-lookup key).
     pub model: String,
-    /// Name shown in the table; appends the fuzzy-matched pricing model in
-    /// parentheses when the lookup was not exact.
-    pub display_model: String,
+    /// The LiteLLM key actually used to price this row, when it differed from
+    /// `model`; `None` on an exact match, when unpriced, or after prefix merging.
+    pub matched_model: Option<String>,
     /// Prompt (input) tokens.
     pub input_tokens: i64,
     /// User-visible response tokens, excluding reasoning.
@@ -338,8 +337,7 @@ pub fn build_usage_summary(
 /// Builds one priced [`UsageRow`] from a model's raw usage `Value`, pricing it
 /// on the basis `source` names.
 ///
-/// A non-exact LiteLLM match appends the matched model name to `display_model`
-/// in parentheses.
+/// A non-exact LiteLLM match records the matched model name in `matched_model`.
 fn extract_usage_row(
     model: &str,
     usage: &Value,
@@ -387,15 +385,9 @@ fn build_usage_row_from_counts(
     cost: f64,
     matched_model: Option<String>,
 ) -> UsageRow {
-    let display_model = if let Some(matched) = &matched_model {
-        Cow::Owned(format!("{} ({})", model, matched))
-    } else {
-        Cow::Borrowed(model)
-    };
-
     UsageRow {
         model: model.to_string(),
-        display_model: display_model.into_owned(),
+        matched_model,
         input_tokens: counts.input_tokens,
         output_tokens: counts.output_tokens,
         reasoning_tokens: counts.reasoning_tokens,
@@ -422,10 +414,9 @@ fn base_model_key(model: &str) -> &str {
 /// priced against its full model name, so a merged `gpt-5.5` adds the
 /// differently-priced `openai/gpt-5.5`, `azure/gpt-5.5` and bare `gpt-5.5`
 /// pieces. The prefix is dropped even from a model with no duplicate
-/// (`opencode/big-pickle` -> `big-pickle`), which also discards any
-/// fuzzy-match annotation the row's `display_model` carried. The result is
-/// re-sorted by ascending cost, tie-broken by model name, matching
-/// [`build_usage_summary`].
+/// (`opencode/big-pickle` -> `big-pickle`), which also clears any
+/// `matched_model` the row carried. The result is re-sorted by ascending cost,
+/// tie-broken by model name, matching [`build_usage_summary`].
 pub fn merge_rows_by_base_model(rows: &[UsageRow]) -> Vec<UsageRow> {
     use std::collections::HashMap;
 
@@ -441,7 +432,6 @@ pub fn merge_rows_by_base_model(rows: &[UsageRow]) -> Vec<UsageRow> {
     for (key, members) in groups {
         let mut acc = UsageRow {
             model: key.to_string(),
-            display_model: key.to_string(),
             ..UsageRow::default()
         };
         for m in members {
@@ -542,7 +532,8 @@ mod tests {
 
         assert_eq!(summary.rows.len(), 1);
         assert!((summary.rows[0].cost - 8.0).abs() < 1e-9);
-        assert_eq!(summary.rows[0].display_model, "shared-pro (shared)");
+        assert_eq!(summary.rows[0].model, "shared-pro");
+        assert_eq!(summary.rows[0].matched_model.as_deref(), Some("shared"));
     }
 
     #[test]
@@ -619,7 +610,6 @@ mod tests {
     fn row(model: &str, input: i64, total: i64, cost: f64) -> UsageRow {
         UsageRow {
             model: model.to_string(),
-            display_model: model.to_string(),
             input_tokens: input,
             total,
             cost,
@@ -640,7 +630,7 @@ mod tests {
         assert_eq!(merged.len(), 1);
         let m = &merged[0];
         assert_eq!(m.model, "gpt-5.5");
-        assert_eq!(m.display_model, "gpt-5.5");
+        assert_eq!(m.matched_model, None);
         assert_eq!(m.input_tokens, 600);
         assert_eq!(m.total, 600);
         assert!((m.cost - 8.20).abs() < 1e-9);
@@ -659,10 +649,8 @@ mod tests {
 
         assert_eq!(merged.len(), 2);
         let five_five = merged.iter().find(|r| r.model == "gpt-5.5").unwrap();
-        assert_eq!(five_five.display_model, "gpt-5.5");
         assert_eq!(five_five.total, 40);
         let five_four = merged.iter().find(|r| r.model == "gpt-5.4").unwrap();
-        assert_eq!(five_four.display_model, "gpt-5.4");
         assert_eq!(five_four.total, 20);
     }
 
@@ -671,13 +659,13 @@ mod tests {
         // Even a model with no duplicate drops its provider prefix (and any
         // fuzzy-match hint) so the merged view reads uniformly.
         let mut only = row("deepseek/deepseek-v4-pro", 5, 5, 1.5);
-        only.display_model = "deepseek/deepseek-v4-pro (deepseek-v4)".to_string();
+        only.matched_model = Some("deepseek-v4".to_string());
 
         let merged = merge_rows_by_base_model(std::slice::from_ref(&only));
 
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].model, "deepseek-v4-pro");
-        assert_eq!(merged[0].display_model, "deepseek-v4-pro");
+        assert_eq!(merged[0].matched_model, None);
         assert_eq!(merged[0].total, 5);
     }
 

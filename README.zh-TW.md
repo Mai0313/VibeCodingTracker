@@ -126,14 +126,13 @@ vct analysis
 
 執行 `vct --help` 可列出所有指令，`vct <command> --help` 則會列出該指令的 flag。
 
-不帶任何指令執行 `vct` 會開啟互動式介面，一個畫面有四個分頁：`1 Usage`、`2 Analysis`、`3 Quota` 與 `4 Settings`。`vct usage`、`vct analysis` 與 `vct quota` 會開啟同一個介面並停在各自的分頁，`--json`、`--text` 與 `--table` 則只輸出結果，不會開啟介面。沒有終端時（輸出被 pipe 或重新導向），單獨的 `vct` 會印出說明並以狀態碼 2 結束。
+不帶任何指令執行 `vct` 會開啟互動式介面，一個畫面有四個分頁：`Usage`、`Analysis`、`Quota` 與 `Settings`。`vct usage`、`vct analysis` 與 `vct quota` 會開啟同一個介面並停在各自的分頁，`--json`、`--text` 與 `--table` 則只輸出結果，不會開啟介面。沒有終端時（輸出被 pipe 或重新導向），單獨的 `vct` 會印出說明並以狀態碼 2 結束。
 
 | 按鍵                | 動作                                                              |
 | ------------------- | ----------------------------------------------------------------- |
-| `1`-`4`             | 跳到對應的分頁                                                    |
-| `Tab` / `Shift+Tab` | 下一個 / 上一個分頁                                               |
+| `Tab` / `Shift+Tab` | 下一個 / 上一個分頁（也可直接點擊頂部分頁列）                     |
 | `↑` / `↓`           | 移動選取的列                                                      |
-| `Enter`             | 顯示選取 model 的完整數字（Usage、Analysis）                      |
+| `Enter`             | 顯示選取 model 的完整數字（Usage 也會顯示對應計價 model）         |
 | `←` / `→`           | 改用左邊 / 右邊那一欄排序（Usage、Analysis）                      |
 | `[` / `]`           | 上一個 / 下一個時間範圍：day、week、month、all（Usage、Analysis） |
 | `r`                 | 立即刷新（Usage、Analysis）                                       |
@@ -197,7 +196,7 @@ vct usage --table --merge-providers
 ### 預覽：Usage 分頁（`vct usage`）
 
 ```
- vct  1 Usage  2 Analysis  3 Quota  4 Settings                         range  day  week  month  all   61.8 MB · CPU 0.1%
+ vct  Usage  Analysis  Quota  Settings                                 range  day  week  month  all   61.8 MB · CPU 0.1%
 ┌ Models · $79.33 · 49.1M tokens · 3 models ───────────────────────────────────────────────────────────── sort: cost ▼ ┐
 │Model                                  Input    Output  Cache Read Cache Write     Total   Cost (USD)            Share│
 │                                                                                                                      │
@@ -208,14 +207,7 @@ vct usage --table --merge-providers
 │                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
                                             ● Claude $78.93  ● Gemini $0.40
-┌ ● Claude ────────────┐┌ ● Codex ─────────────┐┌ ● Copilot ───────────┐┌ ● Cursor ──────LIMIT ┐┌ ● Grok ──────────────┐
-│max 20x       just now││plus          just now││individual    just now││free          just now││SuperGrok     just now│
-│5h    ━────  13% 1h42m││5h    ━━───  33% 12m  ││prem  ━────   3% 24d0h││total ━━━━━  94% 16d0h││week  ━━───  38% 3d4h │
-│7d    ━━━──  58% 1d23h││7d    ━━───  36% 1h54m││reqs  ━──── 45/1500   ││auto  ━━━━━ 100% 16d0h││ondmd $4.20/$50.00    │
-│Fable ━━━━─  79% 1d23h││credits 0 · +3 reset  ││                      ││api   ━━━──  44% 16d0h││balance $12.00        │
-│bal - · $0.00 used    ││reset expires 17d0h   ││                      ││                      ││                      │
-└──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘
- ↑↓ move  ←→ sort  [ ] range  p providers  m merge  ⏎ details  r refresh  1-4/tab view  ? help  q quit   Star on GitHub
+ ↑↓ move  ←→ sort  [ ] range  p providers  m merge  ⏎ details  r refresh  tab view  ? help  q quit       Star on GitHub
 ```
 
 Usage 與 Analysis 分頁各自在第一次切到時開始掃描, 並繪製置中的 `Loading sessions...` spinner. Loading 期間仍可處理 `q`, Ctrl+C 與 resize event. 後續掃描會在 `Refreshing...` footer 下保留上一次成功的資料. 如果 refresh 失敗, 分頁會保留 last-known-good view, 並在下次排程或手動刷新時重試. 所選範圍內沒有任何 session 時, 會顯示空的表格.
@@ -287,7 +279,7 @@ Totals (by Provider)
 - `$DSH_HOME/sessions/*/*/session.jsonl.zstd`（DeepSeek Harness，預設使用 `~/.dsh`；若該 root 設定為 `compression = "none"` 則寫成 `session.jsonl`，兩種都會讀取）
 - `~/.gemini/{antigravity-cli,antigravity,jetski}/brain/*/.system_generated/logs/transcript_full.jsonl`（Antigravity：`agy` CLI、Desktop app 與其他 Antigravity 版本合併算成同一個 provider；每段對話的 model 取自同層的 `conversations/<id>.db`）
 
-Grok 的 `usage` 是單一當下的本地 context 估算：vct 會把 `signals.json` 的 `contextTokensUsed` 記為 cache-read token，並以該 model 的 cache-read 費率估算費用。這不是累計的 billed usage。`analysis` 會從同層的 `updates.jsonl` 還原已完成的 Read / Write / Edit / Bash / TodoWrite 操作。想知道實際計費的額度用量，請參考下方的 Grok 額度面板。
+Grok 的 `usage` 是單一當下的本地 context 估算：vct 會把 `signals.json` 的 `contextTokensUsed` 記為 cache-read token，並以該 model 的 cache-read 費率估算費用。這不是累計的 billed usage。`analysis` 會從同層的 `updates.jsonl` 還原已完成的 Read / Write / Edit / Bash / TodoWrite 操作。想知道實際計費的額度用量，請參考 [Quota 指令](#quota-%E6%8C%87%E4%BB%A4) 下的 Grok 額度面板。
 
 對於非互動式 `usage` 與 `analysis` 掃描, 如果所有找到的 source 都失敗, vct 會回傳錯誤. 如果只有部分 source 失敗, vct 會保留成功的結果, 並向 stderr 印出一則診斷摘要. TUI 則保持 best-effort, 並保留上一次成功的 payload.
 
@@ -311,40 +303,6 @@ vct 會透過 ssh 在每台主機上執行 `vct ledger export`，並把回傳的
 - 非互動式 ssh 的 `PATH` 很精簡，所以 vct 會依序在 `PATH`、`~/.local/bin`、`~/.cargo/bin` 與 `~/.nvm` 底下找遠端的執行檔。裝在別處時，把 `command` 設成啟動它的方式。
 - 兩台機器都有的 session（例如共用家目錄）只算一次。日期是各機器自己的本地日期。總計是合併後的數字，沒有分機器的明細。
 - `vct analysis --json`、`vct analysis FILE` 與額度面板只看本機。
-
-### 即時額度面板
-
-`vct usage` 會**在儀表板中直接顯示 Claude Code、Codex、GitHub Copilot、Cursor、Grok 與 Antigravity 的即時額度用量——完全零設定。** 不需要 status-line hook，也不需要手動輸入憑證：vct 會讀取各 provider 自己的 OAuth 憑證，在背景執行緒呼叫其用量 API（Antigravity 則是詢問 `agy` CLI），並在你工作時讓面板保持最新。每個進度條都是**已用**百分比，所以進度條滿格代表該額度週期已用盡，而不是還沒開始用。（想要更清爽的儀表板嗎？在 [`config.toml`](#%E8%A8%AD%E5%AE%9A) 中精簡 `[usage.quota]` 下的 `panels`,或設為 `[]` 隱藏所有額度卡片。表格下方那行各 provider 成本是本機掃描資料而不是額度面板,所以不受這裡的設定影響。）
-
-```
-┌ ● Claude ────────────┐┌ ● Codex ─────────────┐┌ ● Copilot ───────────┐┌ ● Cursor ──────LIMIT ┐┌ ● Grok ──────────────┐
-│max 20x       just now││plus          just now││individual    just now││free          just now││SuperGrok     just now│
-│5h    ━────  13% 1h42m││5h    ━━───  33% 12m  ││prem  ━────   3% 24d0h││total ━━━━━  94% 16d0h││week  ━━───  38% 3d4h │
-│7d    ━━━──  58% 1d23h││7d    ━━───  36% 1h54m││reqs  ━──── 45/1500   ││auto  ━━━━━ 100% 16d0h││ondmd $4.20/$50.00    │
-│Fable ━━━━─  79% 1d23h││credits 0 · +3 reset  ││                      ││api   ━━━──  44% 16d0h││balance $12.00        │
-│bal - · $0.00 used    ││reset expires 17d0h   ││                      ││                      ││                      │
-└──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘
-┌ ● Antigravity ────+2 ┐
-│-             just now│
-│Gemini Models         │
-│5h     ━━───  23%     │
-│weekly ━────   8%     │
-│Claude and GPT models │
-└──────────────────────┘
-```
-
-- **Claude** — 方案類型、5 小時、每週以及單模型每週用量，來自官方 OAuth 用量 API（`GET /api/oauth/usage`），從 `~/.claude/.credentials.json` 讀取，並顯示額度餘額。約每分鐘輪詢一次以避開該端點的速率限制；觸及上限時標題會出現紅色 `LIMIT` 標記。單模型每週那一行屬於盡力而為，未回傳該範圍時就自動隱藏。
-- **Codex** — 方案類型、可用的 5 小時和每週用量週期、額度餘額以及已取得的可用 reset credit 中最早的到期時間，使用 `~/.codex/auth.json` 從 ChatGPT 後端（`wham/usage` + `wham/rate-limit-reset-credits`）取得（在適用時顯示大致剩餘訊息數 / 消費上限）；API 無法使用時回退到 Codex 工作階段紀錄中最新的 `rate_limits`（標題顯示 `Codex` 或 `Codex (session)`）。
-- **Copilot** — 方案類型以及你的 premium 請求額度，以兩個進度條呈現：已用百分比，以及已用 / 總量請求數（例如 `45/1500`），來自 GitHub 的 Copilot API（`GET /copilot_internal/user`），從 `~/.copilot/config.json` 讀取。該請求會模擬 Copilot CLI。token 為長期有效，因此不需要刷新；遇到 `401` / `403` 時會顯示 `run: copilot login` 提示。
-- **Cursor** — 方案類型、total / auto / API **已用**百分比，以及按需消費，來自 cursor.com（`GET /api/usage-summary`），使用 `~/.config/cursor/auth.json` 中的 session token。
-- **Grok** — 方案類型以及目前每週或每月週期的內含額度用量，來自 Grok CLI 自己的計費端點（`GET /v1/billing?format=credits`），從 `~/.grok/auth.json` 讀取。預付餘額只有在不為零時才會顯示；按量計費的消費則在你有過消費、或設定了上限之後才會顯示。該請求會模擬 Grok CLI；遇到 `401` / `403` 時會顯示 `run: grok login` 提示。
-- **Antigravity** — 每個共用模型池的額度（agy 的是 Gemini 以及 Claude / GPT，各有 5 小時與每週額度），來自 `agy` CLI 自己的 `/usage` 指令（`agy -p /usage --output-format json`）。卡片直接用 agy 給的模型池名稱，每個額度則以 agy 的時間窗原樣標示（`5h` 排最前，接著是 `weekly`）；卡片放不下所有模型池時，其餘的以 `+N` 標出。`/usage` 不提供方案名稱，所以第一行只顯示資料的新舊。vct 會執行 `PATH` 上的 `agy`，找不到時改找 agy 的安裝位置（`~/.local/bin/agy`、`%LOCALAPPDATA%\agy\bin\agy.exe`），或 Linux 上的 `/google/bin/releases/jetski-devs/tools/cli`、macOS 上的 `/usr/local/bin/jetski`；尚未登入的 agy 不會擋掉在那裡找到的版本。agy 會自行維持登入狀態，因此 vct 只檢查 `~/.gemini/antigravity-cli/antigravity-oauth-token` 是否存在，從不讀取或寫入它；這兩個路徑上的版本有自己的登入方式，找到它就夠了。每次輪詢都會啟動一次 agy（需要幾秒、約 260 MB），所以這張卡片最多每 5 分鐘更新一次。agy 無法登入時，卡片會顯示 `run: agy acp --login` 提示，而且在該檔案變動之前，儀表板不會再執行 agy。
-
-**自動刷新 token。** 對 Claude、Codex 和 Grok，當 token 接近過期或被拒絕時，vct 會刷新它並把新的 token 寫回該 provider 自己的憑證檔案（採用該 CLI 的原始格式）。寫入 Grok 的憑證檔案時，會保留該檔案中其他所有的登入資訊。如果刷新失敗，面板會顯示 `run: <provider> auth login` 提示，而不會直接中斷。Copilot（長期有效的 token）和 Cursor（由其自身用戶端保持最新）為唯讀——vct 從不寫入它們的憑證檔案。Antigravity 的 token 屬於 agy，每當 vct 向它詢問 `/usage` 時由 agy 自行刷新。
-
-只有在某個 provider 的憑證存在時，才會顯示對應的面板。面板排在一個統一網格上：一列放得下幾張就放幾張，放不下的自動折到下一列。當終端高度不足以留給網格時，它會收成一行摘要，顯示放得下的 gauge，並把其餘的記成 `+N more → 3`；按 `3` 切到 [Quota 分頁](#quota-%E5%88%86%E9%A0%81)，整個畫面都留給卡片，按 `p` 開啟 Provider Usage 面板，裡面有各 provider 的 token 數與佔比。額度面板僅在互動式 TUI 中顯示；`--table`、`--text`、`--json` 不受影響。
-
-> **平台說明：** 在 macOS 上，Claude Code 會把 OAuth 憑證儲存在系統 Keychain 中，而不是 `~/.claude/.credentials.json`，因此在 macOS 上不會顯示 Claude 面板。agy 在 macOS 上同樣把登入資訊存在 Keychain，所以 macOS 上只有自帶登入方式的版本會顯示 Antigravity 面板。Cursor 的 `~/.config/cursor` 憑證路徑偏向 Linux。
 
 ---
 
@@ -389,7 +347,7 @@ vct analysis --json --daily > today.json
 ### 預覽：Analysis 分頁（`vct analysis`）
 
 ```
- vct  1 Usage  2 Analysis  3 Quota  4 Settings                         range  day  week  month  all   61.9 MB · CPU 0.1%
+ vct  Usage  Analysis  Quota  Settings                                 range  day  week  month  all   61.9 MB · CPU 0.1%
 ┌ Models · 135K lines · 1.80K tool calls · 3 models ─────────────────────────────────────────────── sort: edit lines ▼ ┐
 │Model                                    Edit Lines  Read Lines Write Lines    Bash    Edit    Read  TodoWrite   Write│
 │                                                                                                                      │
@@ -404,7 +362,7 @@ vct analysis --json --daily > today.json
 │● Claude                       13.2K       93.5K        9.63K      443      247      646         102       93       12│
 │● Gemini                       2.10K       14.8K        1.62K       84       44      112          16       15        3│
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
- ↑↓ move  ←→ sort  [ ] range  ⏎ details  r refresh  1-4/tab view  ? help  q quit                         Star on GitHub
+ ↑↓ move  ←→ sort  [ ] range  ⏎ details  r refresh  tab view  ? help  q quit                             Star on GitHub
 ```
 
 表格預設依 edit lines 由大到小排序；按 `←` / `→` 可改用左邊或右邊那一欄排序，排序欄的表頭會標亮。
@@ -525,14 +483,14 @@ vct version --json   # 機器可讀的 JSON
 
 ### Quota 分頁
 
-`vct quota` 會開啟互動式介面並停在 Quota 分頁。它顯示與 Usage 分頁相同的 quota 卡片，進度條更寬，終端放得下幾張就顯示幾張（其餘的以 `+N hidden, enlarge the terminal` 標出數量）。它不掃描任何 session，所以立即開啟，也夠輕量，適合放在閒置的 pane 裡常駐。它沿用相同的設定：[`config.toml`](#%E8%A8%AD%E5%AE%9A) 中 `[usage.quota]` 底下的 `panels` 與 `refresh_interval`。
+`vct quota` 會開啟互動式介面並停在 Quota 分頁（也可在介面中按 `Tab` 或點擊頂部分頁列的 `Quota` 切過去）。它會**零設定顯示 Claude Code、Codex、GitHub Copilot、Cursor、Grok 與 Antigravity 的即時額度用量**：vct 會讀取各 provider 自己的憑證，在背景執行緒呼叫其用量 API（Antigravity 則是詢問 `agy` CLI），並在你工作時讓卡片保持最新。每個進度條都是**已用**百分比，所以進度條滿格代表該額度週期已用盡，而不是還沒開始用。進度條會延展到卡片寬度，終端放得下幾張就顯示幾張（其餘的以 `+N hidden, enlarge the terminal` 標出數量）。它不掃描任何 session，所以立即開啟，也夠輕量，適合放在閒置的 pane 裡常駐。可在 [`config.toml`](#%E8%A8%AD%E5%AE%9A) 中精簡 `[usage.quota]` 底下的 `panels`，或設為 `[]` 隱藏所有額度卡片。
 
 ```bash
 vct quota
 ```
 
 ```
- vct  1 Usage  2 Analysis  3 Quota  4 Settings                31.6 MB · CPU 0.0%
+ vct  Usage  Analysis  Quota  Settings                        31.6 MB · CPU 0.0%
 
 ┌ ● Claude ────────────────────────────┐┌ ● Codex ─────────────────────────────┐
 │max 5x                        just now││plus                          just now│
@@ -542,8 +500,21 @@ vct quota
 │bal - · $0.00 used                    ││reset expires 17d11h                  │
 └──────────────────────────────────────┘└──────────────────────────────────────┘
 
- 1-4/tab view  ? help  q quit                                    Star on GitHub
+ tab view  ? help  q quit                                        Star on GitHub
 ```
+
+- **Claude** — 方案類型、5 小時、每週以及單模型每週用量，來自官方 OAuth 用量 API（`GET /api/oauth/usage`），從 `~/.claude/.credentials.json` 讀取，並顯示額度餘額。約每分鐘輪詢一次以避開該端點的速率限制；觸及上限時標題會出現紅色 `LIMIT` 標記。單模型每週那一行屬於盡力而為，未回傳該範圍時就自動隱藏。
+- **Codex** — 方案類型、可用的 5 小時和每週用量週期、額度餘額以及已取得的可用 reset credit 中最早的到期時間，使用 `~/.codex/auth.json` 從 ChatGPT 後端（`wham/usage` + `wham/rate-limit-reset-credits`）取得（在適用時顯示大致剩餘訊息數 / 消費上限）；API 無法使用時回退到 Codex 工作階段紀錄中最新的 `rate_limits`（標題顯示 `Codex` 或 `Codex (session)`）。
+- **Copilot** — 方案類型以及你的 premium 請求額度，以兩個進度條呈現：已用百分比，以及已用 / 總量請求數（例如 `45/1500`），來自 GitHub 的 Copilot API（`GET /copilot_internal/user`），從 `~/.copilot/config.json` 讀取。該請求會模擬 Copilot CLI。token 為長期有效，因此不需要刷新；遇到 `401` / `403` 時會顯示 `run: copilot login` 提示。
+- **Cursor** — 方案類型、total / auto / API **已用**百分比，以及按需消費，來自 cursor.com（`GET /api/usage-summary`），使用 `~/.config/cursor/auth.json` 中的 session token。
+- **Grok** — 方案類型以及目前每週或每月週期的內含額度用量，來自 Grok CLI 自己的計費端點（`GET /v1/billing?format=credits`），從 `~/.grok/auth.json` 讀取。預付餘額只有在不為零時才會顯示；按量計費的消費則在你有過消費、或設定了上限之後才會顯示。該請求會模擬 Grok CLI；遇到 `401` / `403` 時會顯示 `run: grok login` 提示。
+- **Antigravity** — 每個共用模型池的額度（agy 的是 Gemini 以及 Claude / GPT，各有 5 小時與每週額度），來自 `agy` CLI 自己的 `/usage` 指令（`agy -p /usage --output-format json`）。卡片直接用 agy 給的模型池名稱，每個額度則以 agy 的時間窗原樣標示（`5h` 排最前，接著是 `weekly`）；卡片放不下所有模型池時，其餘的以 `+N` 標出。`/usage` 不提供方案名稱，所以第一行只顯示資料的新舊。vct 會執行 `PATH` 上的 `agy`，找不到時改找 agy 的安裝位置（`~/.local/bin/agy`、`%LOCALAPPDATA%\agy\bin\agy.exe`），或 Linux 上的 `/google/bin/releases/jetski-devs/tools/cli`、macOS 上的 `/usr/local/bin/jetski`；尚未登入的 agy 不會擋掉在那裡找到的版本。agy 會自行維持登入狀態，因此 vct 只檢查 `~/.gemini/antigravity-cli/antigravity-oauth-token` 是否存在，從不讀取或寫入它；這兩個路徑上的版本有自己的登入方式，找到它就夠了。每次輪詢都會啟動一次 agy（需要幾秒、約 260 MB），所以這張卡片最多每 5 分鐘更新一次。agy 無法登入時，卡片會顯示 `run: agy acp --login` 提示，而且在該檔案變動之前，儀表板不會再執行 agy。
+
+**自動刷新 token。** 對 Claude、Codex 和 Grok，當 token 接近過期或被拒絕時，vct 會刷新它並把新的 token 寫回該 provider 自己的憑證檔案（採用該 CLI 的原始格式）。寫入 Grok 的憑證檔案時，會保留該檔案中其他所有的登入資訊。如果刷新失敗，面板會顯示 `run: <provider> auth login` 提示，而不會直接中斷。Copilot（長期有效的 token）和 Cursor（由其自身用戶端保持最新）為唯讀——vct 從不寫入它們的憑證檔案。Antigravity 的 token 屬於 agy，每當 vct 向它詢問 `/usage` 時由 agy 自行刷新。
+
+只有在某個 provider 的憑證存在時才會顯示對應的卡片，並排在統一網格上：一列放得下幾張就放幾張，放不下的自動折到下一列。
+
+> **平台說明：** 在 macOS 上，Claude Code 會把 OAuth 憑證儲存在系統 Keychain 中，而不是 `~/.claude/.credentials.json`，因此在 macOS 上不會顯示 Claude 面板。agy 在 macOS 上同樣把登入資訊存在 Keychain，所以 macOS 上只有自帶登入方式的版本會顯示 Antigravity 面板。Cursor 的 `~/.config/cursor` 憑證路徑偏向 Linux。
 
 > `vct monitor` 與隱藏別名 `vct fetch` 已移除。要看卡片請用 `vct quota`，要看原始回應請用 `vct quota <provider>`。
 
@@ -588,10 +559,10 @@ vct 會把使用者設定存放在 `~/.vct/config.toml`。這個檔案會在**�
 
 ### Settings 分頁
 
-在互動式介面中按 `4`（或用 `Tab` 切過去），就能以表單編輯 `config.toml` 的每一項設定：所有設定依區段排成一份清單，左邊的區段清單標出目前所在的區段，下方則是目前欄位的說明、設定鍵與預設值。`*` 表示該欄位已不是預設值。
+在互動式介面中用 `Tab`（或點擊頂部分頁列的 `Settings`）切到 Settings 分頁，就能以表單編輯 `config.toml` 的每一項設定：所有設定依區段排成一份清單，左邊的區段清單標出目前所在的區段，下方則是目前欄位的說明、設定鍵與預設值。`*` 表示該欄位已不是預設值。
 
 ```
- vct  1 Usage  2 Analysis  3 Quota  4 Settings                                                        31.8 MB · CPU 0.0%
+ vct  Usage  Analysis  Quota  Settings                                                                31.8 MB · CPU 0.0%
 ┌ Sections ──────┐┌ Settings ─────────────────────────────────────────────────────────────────────────────── 27 more ↓ ┐
 │   General      ││ General                                                                                            │
 │ › Usage        ││   Default time range                                                                        ‹ all ›│
@@ -612,13 +583,13 @@ vct 會把使用者設定存放在 `~/.vct/config.toml`。這個檔案會在**�
 │Which live quota panels to show in the app (by provider name: `claude` / `codex` / `copilot` / `cursor` / `grok` /    │
 │`antigravity`). An empty list hides every quota card.                                                                 │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
- ↑↓ move  ←→ change  space toggle  ⏎ edit  x reset  e editor  1-4/tab view  ? help  q quit               Star on GitHub
+ ↑↓ move  ←→ change  space toggle  ⏎ edit  x reset  e editor  tab view  ? help  q quit                   Star on GitHub
 ```
 
 - `↑` / `↓` 在所有設定之間移動，`PgUp` / `PgDn` 跳到上一個 / 下一個區段，`←` / `→` 變更數值（開關、增減數字、切換選項），`Space` 開關，`x` 把欄位重設為預設值，`e` 用 `$VISUAL` / `$EDITOR` 開啟設定檔，編輯器結束後重新載入。
 - `Enter` 開啟編輯器：可挑選的清單、數字或文字輸入，或遠端主機清單（`a` 新增、`Enter` 編輯、`d` 刪除）。
 - 每次變更都會立即寫入檔案，並保留檔案裡的註解。
-- 合併、刷新間隔、quota 面板、quota 輪詢間隔與 provider 開關的變更會直接反映在執行中的介面（quota 面板則在離開 Settings 分頁時生效）。預設時間範圍、自動更新、掃描執行緒數、logging 與 remotes 要到下次啟動才生效，表單會在這些欄位上標明。
+- 合併、刷新間隔、quota 面板、quota 輪詢間隔與 provider 開關的變更會直接反映在執行中的介面（quota 面板則在切到 Quota 分頁時生效）。預設時間範圍、自動更新、掃描執行緒數、logging 與 remotes 要到下次啟動才生效，表單會在這些欄位上標明。
 
 手動編輯檔案與下方的 `vct config` 指令仍然可用。
 

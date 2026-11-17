@@ -2,8 +2,8 @@
 //!
 //! [`run_app`] owns the event loop. The Usage and Analysis tabs share one
 //! background [`RefreshWorker`] and one session ledger, started on the first
-//! visit to either, so opening on the Quota tab scans nothing. Only the tab on
-//! screen refreshes on its timer.
+//! visit to either, and the Quota tab starts its workers on the first visit to
+//! it. Only the tab on screen refreshes on its timer.
 
 use crate::display::analysis::{AnalysisUiState, scan_analysis};
 use crate::display::common::table::{
@@ -211,14 +211,7 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
         let paths = vct_core::utils::resolve_paths()?;
         let mut tab = start;
         let mut config = config;
-        let mut quota = QuotaRuntime::start(
-            &config.usage.quota.panels,
-            config.providers,
-            config.usage.quota_refresh_secs(),
-        );
-        // A change to what the quota workers poll is applied on leaving
-        // Settings, not per key press: each restart fetches at once.
-        let mut quota_stale = false;
+        let mut quota: Option<QuotaRuntime> = None;
         let mut usage = UsageUiState::new(merge);
         let mut analysis = AnalysisUiState::new();
         let mut settings = SettingsUiState::new(
@@ -254,6 +247,7 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
         let mut last_metrics = Instant::now();
         let mut last_draw: Option<Instant> = None;
         let mut spinner = 0usize;
+        let mut bar_width = terminal.terminal_mut().size().map_or(0, |s| s.width);
         // Whether the key list is open (`?`).
         let mut help_open = false;
 
@@ -346,13 +340,21 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                 spinner = spinner.wrapping_add(1);
                 let active = worker.as_ref().is_some_and(RefreshWorker::is_active);
                 let status = refresh_status(active, failure_until);
-                let snapshots = QuotaSnapshots::read(&quota);
-                let view = snapshots.view(&quota, usage.provider_panel_open);
-                let now = chrono::Local::now().timestamp();
+                let quota_snapshots = (tab == Tab::Quota).then(|| {
+                    let runtime = quota.get_or_insert_with(|| {
+                        QuotaRuntime::start(
+                            &config.usage.quota.panels,
+                            config.providers,
+                            config.usage.quota_refresh_secs(),
+                        )
+                    });
+                    QuotaSnapshots::read(runtime)
+                });
                 let metrics = process_metrics(&sys, pid);
                 let completed = terminal.terminal_mut().draw(|f| {
                     let [bar, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)])
                         .areas(f.area());
+                    bar_width = bar.width;
                     let range = tab.scans().then_some(wanted.time_range);
                     f.render_widget(tab_bar(bar.width, tab, range, metrics), bar);
                     match tab {
@@ -364,9 +366,14 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                             };
                             render_loading(f, body, spinner, message);
                         }
-                        Tab::Usage => usage.draw(f, body, &view, status),
+                        Tab::Usage => usage.draw(f, body, status),
                         Tab::Analysis => analysis.draw(f, body, status),
-                        Tab::Quota => draw_quota_tab(f, body, &view, now),
+                        Tab::Quota => {
+                            let runtime = quota.as_ref().expect("started for Quota tab");
+                            let snapshots = quota_snapshots.as_ref().expect("read for Quota tab");
+                            let now = chrono::Local::now().timestamp();
+                            draw_quota_tab(f, body, &snapshots.view(runtime), now);
+                        }
                         Tab::Settings => settings.draw(f, body),
                     }
                     if help_open {
@@ -397,9 +404,6 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                     InputAction::Key(key) => {
                         match settings.handle_key(key) {
                             SettingsOutcome::Quit => break,
-                            SettingsOutcome::SwitchTab(index) => {
-                                go_to = Tab::ALL.get(index).copied()
-                            }
                             SettingsOutcome::NextTab => go_to = Some(tab.offset(1)),
                             SettingsOutcome::PrevTab => go_to = Some(tab.offset(-1)),
                             SettingsOutcome::Help => help_open = true,
@@ -415,14 +419,22 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                                     settings.set_message(message, ok);
                                 }
                                 let next = settings.config().clone();
-                                quota_stale |= next.usage.quota != config.usage.quota
-                                    || next.providers != config.providers;
+                                if next.usage.quota != config.usage.quota
+                                    || next.providers != config.providers
+                                {
+                                    quota = None;
+                                }
                                 usage.set_merge(next.usage.merge_models);
                                 config = next;
                             }
                             SettingsOutcome::Stay => {}
                         }
                         last_draw = None;
+                    }
+                    InputAction::Click { column, row }
+                        if !help_open && !settings.has_open_editor() =>
+                    {
+                        go_to = tab_at(column, row, bar_width);
                     }
                     InputAction::Resize => last_draw = None,
                     _ => {}
@@ -449,7 +461,9 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                             usage.provider_panel_open = false;
                         }
                     }
-                    InputAction::SwitchTab(index) => go_to = Tab::ALL.get(index).copied(),
+                    InputAction::Click { column, row } => {
+                        go_to = tab_at(column, row, bar_width);
+                    }
                     InputAction::NextTab => go_to = Some(tab.offset(1)),
                     InputAction::PrevTab => go_to = Some(tab.offset(-1)),
                     InputAction::StepRange(step) if tab.scans() => {
@@ -501,14 +515,6 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
             if let Some(next) = go_to
                 && next != tab
             {
-                if tab == Tab::Settings && quota_stale {
-                    quota = QuotaRuntime::start(
-                        &config.usage.quota.panels,
-                        config.providers,
-                        config.usage.quota_refresh_secs(),
-                    );
-                    quota_stale = false;
-                }
                 if next == Tab::Settings {
                     // `m` on the Usage tab writes the file too.
                     config.usage.merge_models = usage.merge_enabled();
@@ -529,6 +535,26 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
     terminal.finish(result)
 }
 
+const TAB_PREFIX: &str = " vct ";
+
+/// The tab under `(column, row)`, when the click landed on a tab label in the
+/// top bar (`row == 0`).
+fn tab_at(column: u16, row: u16, width: u16) -> Option<Tab> {
+    if row != 0 || column >= width {
+        return None;
+    }
+    let col = usize::from(column);
+    let mut x = TAB_PREFIX.chars().count();
+    for tab in Tab::ALL {
+        let end = x + tab.label().chars().count() + 2;
+        if (x..end).contains(&col) {
+            return Some(tab);
+        }
+        x = end;
+    }
+    None
+}
+
 /// Builds the tab bar: the tabs on the left; the time range and this process's
 /// memory and CPU on the right, each dropped whole when `width` is short.
 fn tab_bar(
@@ -539,18 +565,14 @@ fn tab_bar(
 ) -> Line<'static> {
     let theme = theme();
     let dim = theme.dim();
-    let mut left = vec![Span::styled(" vct ", Style::default().bold())];
+    let mut left = vec![Span::styled(TAB_PREFIX, Style::default().bold())];
     for tab in Tab::ALL {
-        let number = tab.index() + 1;
-        if tab == current {
-            left.push(Span::styled(
-                format!(" {number} {} ", tab.label()),
-                theme.active(),
-            ));
+        let text = format!(" {} ", tab.label());
+        left.push(if tab == current {
+            Span::styled(text, theme.active())
         } else {
-            left.push(Span::styled(format!(" {number} "), dim));
-            left.push(Span::raw(format!("{} ", tab.label())));
-        }
+            Span::raw(text)
+        });
     }
 
     let mut ranges = Vec::new();
@@ -620,7 +642,6 @@ fn help_rows(tab: Tab) -> Vec<(&'static str, &'static str)> {
         rows.push(("p", "per-provider totals"));
     }
     rows.extend([
-        ("1-4", "go to a tab"),
         ("tab", "next tab, shift+tab for the previous one"),
         ("esc", "close a panel"),
         ("?", "this list"),
@@ -687,16 +708,31 @@ mod tests {
         let line = tab_bar(120, Tab::Usage, Some(TimeRange::All), (97.5, 0.0));
         let shown = text(&line);
         assert_eq!(shown.chars().count(), 120);
-        for expected in [
-            "1 Usage",
-            "2 Analysis",
-            "3 Quota",
-            "4 Settings",
-            "month",
-            "97.5 MB",
-        ] {
+        for expected in ["Usage", "Analysis", "Quota", "Settings", "month", "97.5 MB"] {
             assert!(shown.contains(expected), "{expected} missing: {shown}");
         }
+        assert!(!shown.contains("1 Usage"), "numbers removed: {shown}");
+    }
+
+    #[test]
+    fn clicking_the_tab_bar_picks_the_tab_under_the_cursor() {
+        let shown = text(&tab_bar(120, Tab::Usage, Some(TimeRange::All), (97.5, 0.0)));
+        for tab in Tab::ALL {
+            let needle = format!(" {} ", tab.label());
+            let start = shown.find(&needle).unwrap() as u16;
+            let end = start + needle.len() as u16;
+            for col in start..end {
+                assert_eq!(tab_at(col, 0, 120), Some(tab), "col {col}");
+                assert_eq!(tab_at(col, 1, 120), None, "body row ignored at col {col}");
+            }
+        }
+        // Prefix and right-hand slack hit no tab, nor does a column past a
+        // narrow terminal's right edge.
+        for col in 0..TAB_PREFIX.len() as u16 {
+            assert_eq!(tab_at(col, 0, 120), None);
+        }
+        assert_eq!(tab_at(50, 0, 120), None);
+        assert_eq!(tab_at(35, 0, 30), None);
     }
 
     #[test]
@@ -719,7 +755,7 @@ mod tests {
             (97.5, 0.0),
         ));
         assert!(
-            tiny.contains("4 Settings") && !tiny.contains("range"),
+            tiny.contains("Settings") && !tiny.contains("range"),
             "{tiny}"
         );
         // The Quota and Settings tabs have no time range to show.
@@ -776,9 +812,10 @@ mod tests {
     fn the_key_list_names_every_tab_s_own_keys_and_how_to_leave() {
         for tab in Tab::ALL {
             let keys: Vec<_> = help_rows(tab).iter().map(|(key, _)| *key).collect();
-            for expected in ["1-4", "tab", "esc", "?", "q"] {
+            for expected in ["tab", "esc", "?", "q"] {
                 assert!(keys.contains(&expected), "{tab:?} lacks {expected}");
             }
+            assert!(!keys.contains(&"1-4"), "{tab:?} still lists 1-4");
         }
         let keys = |tab| -> Vec<_> { help_rows(tab).iter().map(|(key, _)| *key).collect() };
         assert!(keys(Tab::Usage).contains(&"m") && !keys(Tab::Analysis).contains(&"m"));
