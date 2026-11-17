@@ -8,14 +8,13 @@
 //! the entry point the `vct update` subcommand calls.
 //!
 //! Submodules: `github` (Releases API + download), `archive` (extraction with
-//! path-traversal guards), `lock` (cross-process serialization), `ownership`
-//! (official-installer marker), `platform` (asset-name derivation and the
-//! OS-specific binary swap), and `version_cache` (daily check cadence).
+//! path-traversal guards), `lock` (cross-process serialization), `platform`
+//! (asset-name derivation and the OS-specific binary swap), and `version_cache`
+//! (daily check cadence).
 
 mod archive;
 mod github;
 mod lock;
-mod ownership;
 mod platform;
 mod version_cache;
 
@@ -29,21 +28,34 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+pub(crate) use github::GITHUB_API_RELEASES_URL;
 pub use github::{GitHubAsset, GitHubRelease};
+#[cfg(all(test, unix))]
+pub(crate) use platform::get_asset_pattern;
 
-/// Result of the best-effort startup update hook.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Result of the best-effort background auto-update hook.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AutoUpdateOutcome {
     /// The hook was disabled, ineligible, already claimed, or not due today.
     Skipped,
     /// A daily check completed and the running version is current.
     UpToDate,
-    /// The executable was replaced. Unix callers should re-exec their command.
-    Updated,
-    /// Windows staged a replacement that will run after this process exits.
-    Deferred,
+    /// The executable was replaced with the returned release version.
+    Updated(String),
+    /// Windows staged a replacement for the returned version, applied after exit.
+    Deferred(String),
     /// A best-effort check or install failed; the caller should continue.
     Failed,
+}
+
+impl AutoUpdateOutcome {
+    /// Returns the newly installed or staged version (without leading `v`), if any.
+    pub fn installed_version(&self) -> Option<&str> {
+        match self {
+            Self::Updated(version) | Self::Deferred(version) => Some(version),
+            Self::Skipped | Self::UpToDate | Self::Failed => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +181,73 @@ pub fn check_update() -> Result<Option<String>> {
     }
 }
 
+/// Downloads and extracts the latest release binary for a POSIX `(os, arch)`
+/// target locally, then writes it as a single-file gzip stream in an anonymous
+/// rewound temporary file ready to pipe into a remote SSH bootstrap session.
+pub(crate) fn prepare_remote_binary_gzip_from(
+    release_url: &str,
+    os: &str,
+    arch: &str,
+    timeout: Duration,
+) -> Result<fs::File> {
+    let started = Instant::now();
+    let release = github::fetch_latest_release_from_with_timeout(release_url, timeout)
+        .context("Failed to fetch latest release information")?;
+    let latest_version = parse_latest_version(&release)?;
+    let asset_pattern = platform::get_asset_pattern_for(&latest_version.to_string(), os, arch)?;
+    let asset = release
+        .assets
+        .iter()
+        .find(|a| a.name == asset_pattern)
+        .with_context(|| format!("No release binary found for {os} ({arch})"))?;
+
+    let remaining = timeout.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        anyhow::bail!("Timed out before downloading remote release archive");
+    }
+
+    let staging = tempfile::Builder::new()
+        .prefix("vct-remote-")
+        .tempdir()
+        .context("Cannot create temporary directory")?;
+    let archive_path = staging.path().join(&asset.name);
+    let mut archive_file =
+        fs::File::create(&archive_path).context("Cannot create temporary archive file")?;
+    let downloaded = github::download_to_writer_with_timeout(
+        &asset.browser_download_url,
+        &mut archive_file,
+        remaining,
+    )
+    .context("Download error")?;
+    if downloaded != asset.size {
+        anyhow::bail!(
+            "Downloaded asset size mismatch (expected {}, got {})",
+            asset.size,
+            downloaded
+        );
+    }
+    drop(archive_file);
+
+    let extract_dir = staging.path().join("extracted");
+    fs::create_dir_all(&extract_dir).context("Cannot create temporary extraction directory")?;
+    let binary_path =
+        archive::extract_targz(&archive_path, &extract_dir).context("Cannot extract archive")?;
+
+    let mut source = fs::File::open(&binary_path).context("Cannot open extracted binary")?;
+    let mut gz_temp = tempfile::tempfile().context("Cannot create temporary gzip stream")?;
+    {
+        let mut encoder = flate2::write::GzEncoder::new(&mut gz_temp, flate2::Compression::fast());
+        std::io::copy(&mut source, &mut encoder).context("Cannot compress remote binary")?;
+        encoder
+            .finish()
+            .context("Cannot finish remote binary stream")?;
+    }
+    gz_temp
+        .rewind()
+        .context("Cannot rewind remote binary stream")?;
+    Ok(gz_temp)
+}
+
 /// Downloads, extracts, and installs a specific `release`, no version check.
 ///
 /// Selects the asset matching the current platform, downloads it into a unique
@@ -227,33 +306,35 @@ fn perform_installation_at(
         anyhow::bail!("Update failed: Unsupported archive format");
     };
 
-    #[cfg(unix)]
-    {
-        let staged = platform::stage_update_unix(current_exe, &new_binary)
-            .context("Update failed: Cannot stage binary replacement")?;
-        validate_candidate_binary(&staged, latest_version)
-            .context("Update failed: Candidate binary validation failed")?;
-        platform::commit_update_unix(current_exe, staged)
-            .context("Update failed: Cannot replace binary")?;
-        Ok(InstallationDisposition::Applied)
-    }
+    crate::utils::file::with_atomic_write_gate(|| {
+        #[cfg(unix)]
+        {
+            let staged = platform::stage_update_unix(current_exe, &new_binary)
+                .context("Update failed: Cannot stage binary replacement")?;
+            validate_candidate_binary(&staged, latest_version)
+                .context("Update failed: Candidate binary validation failed")?;
+            platform::commit_update_unix(current_exe, staged)
+                .context("Update failed: Cannot replace binary")?;
+            Ok(InstallationDisposition::Applied)
+        }
 
-    #[cfg(windows)]
-    {
-        validate_candidate_binary(&new_binary, latest_version)
-            .context("Update failed: Candidate binary validation failed")?;
-        let lock_dir = current_exe
-            .parent()
-            .context("Update failed: Current executable has no parent directory")?;
-        platform::perform_update_windows(
-            current_exe,
-            &new_binary,
-            &latest_version.to_string(),
-            &lock::update_lock_path(lock_dir),
-        )
-        .context("Update failed: Cannot stage binary replacement")?;
-        Ok(InstallationDisposition::Deferred)
-    }
+        #[cfg(windows)]
+        {
+            validate_candidate_binary(&new_binary, latest_version)
+                .context("Update failed: Candidate binary validation failed")?;
+            let lock_dir = current_exe
+                .parent()
+                .context("Update failed: Current executable has no parent directory")?;
+            platform::perform_update_windows(
+                current_exe,
+                &new_binary,
+                &latest_version.to_string(),
+                &lock::update_lock_path(lock_dir),
+            )
+            .context("Update failed: Cannot stage binary replacement")?;
+            Ok(InstallationDisposition::Deferred)
+        }
+    })
 }
 
 fn validate_candidate_binary(candidate: &Path, expected_version: &Version) -> Result<()> {
@@ -376,9 +457,7 @@ fn install_and_report(
 ///
 /// Returns `Ok(())` without doing anything when already up to date, or when
 /// `VCT_OFFLINE` is set — offline is a no-op rather than an error, and costs
-/// neither a request nor a lock file. Unlike [`maybe_auto_update`] this applies
-/// to any installation: it replaces whatever executable is running, with no
-/// ownership marker required.
+/// neither a request nor a lock file.
 ///
 /// # Errors
 ///
@@ -453,36 +532,26 @@ fn acquire_update_lock_at(current_exe: &Path) -> Result<lock::UpdateLock> {
         .context("Another vct update is already running; try again after it exits")
 }
 
-/// Checks for and silently installs a newer release when startup policy allows.
+/// Checks for and silently installs a newer release when policy allows.
 ///
-/// This is a best-effort hook for ordinary commands. It performs no work when
-/// disabled, offline, already checked on the current UTC date, or when the
-/// executable lacks the official release installer's ownership marker. A
-/// failure is logged and reported as [`AutoUpdateOutcome::Failed`] so it can
-/// never block the requested command.
+/// This is a best-effort hook for ordinary runs. It performs no work when
+/// disabled, offline, running a debug build, or already checked on the current
+/// UTC date. A failure is logged and reported as [`AutoUpdateOutcome::Failed`]
+/// so it can never disrupt the requested command or dashboard.
 pub fn maybe_auto_update(enabled: bool) -> AutoUpdateOutcome {
     let offline = crate::utils::network_disabled();
-    let current_exe = match env::current_exe() {
-        Ok(path) => path,
-        Err(error) => {
-            log::warn!(
-                "startup auto-update failed: cannot resolve the running executable: {error}"
-            );
-            return AutoUpdateOutcome::Failed;
-        }
-    };
-    let managed = ownership::is_release_managed(&current_exe);
-    if !auto_update_allowed(enabled, offline, managed) {
+    if !auto_update_allowed(enabled, offline, !cfg!(debug_assertions)) {
         return AutoUpdateOutcome::Skipped;
     }
 
     let result = (|| -> Result<AutoUpdateOutcome> {
-        let current_exe = current_exe
+        let current_exe = env::current_exe()
+            .context("Cannot locate current executable")?
             .canonicalize()
-            .context("Failed to resolve release-managed executable")?;
+            .context("Failed to resolve current executable")?;
         let lock_dir = current_exe
             .parent()
-            .context("Release-managed executable has no parent directory")?;
+            .context("Current executable has no parent directory")?;
         let cache_dir = crate::utils::get_cache_dir()?;
         let (_, current_version) = get_current_version()?;
         auto_update_with(
@@ -498,14 +567,14 @@ pub fn maybe_auto_update(enabled: bool) -> AutoUpdateOutcome {
     match result {
         Ok(outcome) => outcome,
         Err(error) => {
-            log::warn!("startup auto-update failed: {error:#}");
+            log::warn!("auto-update failed: {error:#}");
             AutoUpdateOutcome::Failed
         }
     }
 }
 
-fn auto_update_allowed(enabled: bool, offline: bool, release_managed: bool) -> bool {
-    enabled && !offline && release_managed
+fn auto_update_allowed(enabled: bool, offline: bool, release_build: bool) -> bool {
+    enabled && !offline && release_build
 }
 
 fn auto_update_with(
@@ -528,16 +597,15 @@ fn auto_update_with(
     version_cache::record_check_attempt_in(cache_dir, now)?;
 
     let Some(_lock) = lock::UpdateLock::try_acquire(lock_dir)? else {
-        log::warn!("startup auto-update skipped because another update is running");
+        log::warn!("auto-update skipped because another update is running");
         return Ok(AutoUpdateOutcome::Skipped);
     };
 
     let release = fetch_release().context("Failed to fetch latest release information")?;
     let latest_version = parse_latest_version(&release)?;
-    if let Err(error) =
-        version_cache::record_version_result_in(cache_dir, &latest_version.to_string(), now)
-    {
-        log::warn!("failed to record startup update result: {error:#}");
+    let version = latest_version.to_string();
+    if let Err(error) = version_cache::record_version_result_in(cache_dir, &version, now) {
+        log::warn!("failed to record auto-update result: {error:#}");
     }
 
     if latest_version <= *current_version {
@@ -546,9 +614,9 @@ fn auto_update_with(
 
     match install_release(&release, &latest_version)? {
         #[cfg(unix)]
-        InstallationDisposition::Applied => Ok(AutoUpdateOutcome::Updated),
+        InstallationDisposition::Applied => Ok(AutoUpdateOutcome::Updated(version)),
         #[cfg(windows)]
-        InstallationDisposition::Deferred => Ok(AutoUpdateOutcome::Deferred),
+        InstallationDisposition::Deferred => Ok(AutoUpdateOutcome::Deferred(version)),
     }
 }
 
@@ -609,9 +677,7 @@ pub fn update_interactive(force: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
-    use flate2::{Compression, write::GzEncoder};
-    #[cfg(unix)]
+    use flate2::{Compression, read::GzDecoder, write::GzEncoder};
     use httpmock::prelude::*;
     use serial_test::serial;
     use std::cell::Cell;
@@ -625,7 +691,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     fn release_archive(contents: &[u8]) -> Vec<u8> {
         let encoder = GzEncoder::new(Vec::new(), Compression::default());
         let mut archive = tar::Builder::new(encoder);
@@ -778,6 +843,17 @@ mod tests {
         assert!(!auto_update_allowed(false, false, true));
         assert!(!auto_update_allowed(true, true, true));
         assert!(!auto_update_allowed(true, false, false));
+        assert_eq!(
+            AutoUpdateOutcome::Updated("3.2.0".into()).installed_version(),
+            Some("3.2.0")
+        );
+        assert_eq!(
+            AutoUpdateOutcome::Deferred("3.2.0".into()).installed_version(),
+            Some("3.2.0")
+        );
+        assert_eq!(AutoUpdateOutcome::UpToDate.installed_version(), None);
+        assert_eq!(AutoUpdateOutcome::Skipped.installed_version(), None);
+        assert_eq!(AutoUpdateOutcome::Failed.installed_version(), None);
     }
 
     #[test]
@@ -858,7 +934,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(outcome, AutoUpdateOutcome::Updated);
+        assert_eq!(outcome, AutoUpdateOutcome::Updated("1.1.0".into()));
+        assert_eq!(outcome.installed_version(), Some("1.1.0"));
         assert_eq!(installs.get(), 1);
         assert_eq!(
             version_cache::read_self_version_in(dir.path())
@@ -1125,5 +1202,40 @@ mod tests {
 
         assert!(perform_installation_at(&target, &Version::new(1, 1, 0), &release).is_err());
         assert_eq!(fs::read(&target).unwrap(), b"old binary");
+    }
+
+    #[test]
+    fn prepare_remote_binary_gzip_extracts_posix_tarball_on_every_host_os() {
+        let payload = b"#!/bin/sh\necho linux-elf\n";
+        let archive = release_archive(payload);
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/releases/latest");
+            then.status(200).json_body(serde_json::json!({
+                "tag_name": "v1.2.3",
+                "name": "v1.2.3",
+                "body": null,
+                "assets": [{
+                    "name": "vibe_coding_tracker-v1.2.3-linux-x64-gnu.tar.gz",
+                    "browser_download_url": server.url("/asset.tar.gz"),
+                    "size": archive.len()
+                }]
+            }));
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/asset.tar.gz");
+            then.status(200).body(archive);
+        });
+
+        let gz_file = prepare_remote_binary_gzip_from(
+            &server.url("/releases/latest"),
+            "linux",
+            "x86_64",
+            Duration::from_secs(5),
+        )
+        .expect("Windows and Unix clients alike must unpack POSIX remote tarballs");
+        let mut decoded = Vec::new();
+        GzDecoder::new(gz_file).read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, payload);
     }
 }

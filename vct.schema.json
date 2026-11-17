@@ -200,11 +200,11 @@
         "hosts": [],
         "refresh_interval": 300
       },
-      "description": "`[remotes]` — other machines whose usage is merged into this one's.\n\nvct runs `vct ledger export` on each host over ssh and adds the sessions it\nreturns to the usage and analysis views. Only computed totals cross the\nconnection, never conversations. vct must be installed on each host.",
+      "description": "`[remotes]` — other machines whose usage is merged into this one's.\n\nvct runs `vct ledger export` on each host over ssh and adds the sessions it\nreturns to the usage and analysis views. Only computed totals cross the\nconnection, never conversations. Missing vct on a Linux or macOS remote is\ninstalled into `~/.local/bin` automatically over ssh.",
       "properties": {
         "command": {
           "default": "",
-          "description": "How to start vct on the hosts, for example \"/opt/vct/bin/vct\". Empty\nlooks for it on the remote PATH, in ~/.local/bin, ~/.cargo/bin and\nunder ~/.nvm.",
+          "description": "How to start vct on the hosts, for example \"/opt/vct/bin/vct\". Empty\nlooks for it on the remote PATH, in ~/.local/bin, ~/.cargo/bin and\nunder ~/.nvm, and installs into ~/.local/bin if missing.",
           "type": "string"
         },
         "hosts": {

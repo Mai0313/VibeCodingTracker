@@ -18,7 +18,7 @@ use crate::display::common::tui::{LEDGER_SAVE_INTERVAL, NavDelta, ScrollState, U
 use ratatui::{
     Frame,
     layout::{Constraint, Rect},
-    style::Style,
+    style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Row as RatatuiRow},
 };
@@ -238,7 +238,7 @@ impl AnalysisUiState {
     }
 
     /// Draws the tab into `area`.
-    pub(crate) fn draw(&mut self, f: &mut Frame, area: Rect, status: Option<&str>) {
+    pub(crate) fn draw(&mut self, f: &mut Frame, area: Rect, status: Option<(&str, Color)>) {
         // Details belong to a row: with none selected there is nothing to
         // open, and nothing for a later Esc to close.
         self.detail_open &= self.selected_model().is_some();
@@ -313,7 +313,7 @@ fn draw_analysis_view(
     update_tracker: &UpdateTracker,
     scroll: &mut ScrollState,
     sort: AnalysisSort,
-    status: Option<&str>,
+    status: Option<(&str, Color)>,
     detail_open: bool,
 ) {
     let theme = theme();
@@ -595,7 +595,7 @@ fn draw_analysis_view(
                     ("⏎", "details"),
                     ("r", "refresh"),
                 ],
-                status.map(|text| (text, theme.warn)),
+                status,
                 chunks.controls.width,
             ),
             chunks.controls,

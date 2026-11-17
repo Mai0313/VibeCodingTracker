@@ -9,6 +9,7 @@ use crate::display::common::theme::theme;
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
+    style::Color,
     widgets::Paragraph,
 };
 
@@ -24,7 +25,13 @@ const QUOTA_MIN_H: u16 = QUOTA_GRID.height + 1;
 
 /// Draws the Quota tab into `area`: the card grid centered in it, and a footer
 /// that counts any provider the terminal had no room for.
-pub(crate) fn draw_quota_tab(f: &mut Frame, area: Rect, quota: &QuotaView, now: i64) {
+pub(crate) fn draw_quota_tab(
+    f: &mut Frame,
+    area: Rect,
+    quota: &QuotaView,
+    now: i64,
+    status: Option<(&str, Color)>,
+) {
     if area.width < QUOTA_MIN_W || area.height < QUOTA_MIN_H {
         render_too_small(f, QUOTA_MIN_W, QUOTA_MIN_H);
         return;
@@ -54,12 +61,9 @@ pub(crate) fn draw_quota_tab(f: &mut Frame, area: Rect, quota: &QuotaView, now: 
     }
 
     let note = (hidden > 0).then(|| format!("+{hidden} hidden, enlarge the terminal"));
+    let footer_status = note.as_deref().map(|text| (text, theme().warn)).or(status);
     f.render_widget(
-        create_controls_with_status(
-            &[],
-            note.as_deref().map(|text| (text, theme().warn)),
-            footer.width,
-        ),
+        create_controls_with_status(&[], footer_status, footer.width),
         footer,
     );
 }
@@ -105,7 +109,7 @@ mod tests {
         }
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|f| draw_quota_tab(f, f.area(), &quota, 0))
+            .draw(|f| draw_quota_tab(f, f.area(), &quota, 0, None))
             .unwrap();
         let buffer = terminal.backend().buffer();
         (0..height)
@@ -158,5 +162,45 @@ mod tests {
     #[test]
     fn a_terminal_below_the_minimum_only_says_so() {
         assert!(frame(39, 24, 1, true).contains("Terminal too small"));
+    }
+
+    #[test]
+    fn hidden_card_warning_preempts_the_background_update_notice() {
+        let (claude, codex, copilot, cursor, grok, antigravity) = Default::default();
+        let mut quota = QuotaView {
+            claude: &claude,
+            codex: &codex,
+            copilot: &copilot,
+            cursor: &cursor,
+            grok: &grok,
+            antigravity: &antigravity,
+            present: Default::default(),
+            band_enabled: true,
+        };
+        quota.present.claude = true;
+        quota.present.codex = true;
+        quota.present.copilot = true;
+        quota.present.cursor = true;
+        let render = |height: u16| {
+            let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
+            terminal
+                .draw(|f| {
+                    draw_quota_tab(
+                        f,
+                        f.area(),
+                        &quota,
+                        0,
+                        Some(("Updated to v3.2.0", theme().good)),
+                    );
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..80)
+                .map(|x| buffer[(x, height - 1)].symbol())
+                .collect::<String>()
+        };
+        assert!(render(24).contains("Updated to v3.2.0"));
+        let crowded = render(12);
+        assert!(crowded.contains("+2 hidden") && !crowded.contains("Updated to v3.2.0"));
     }
 }

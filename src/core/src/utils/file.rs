@@ -24,6 +24,13 @@ fn close_gate(gate: &RwLock<()>) {
     std::mem::forget(gate.write().unwrap_or_else(PoisonError::into_inner));
 }
 
+/// Runs `action` inside the shared atomic-write gate so [`finish_atomic_writes`]
+/// waits for an in-progress sibling stage-and-rename before process exit.
+pub(crate) fn with_atomic_write_gate<T>(action: impl FnOnce() -> T) -> T {
+    let _writing = WRITE_GATE.read().unwrap_or_else(PoisonError::into_inner);
+    action()
+}
+
 /// Reads a JSONL file and returns one [`Value`] per non-empty line.
 ///
 /// Blank and whitespace-only lines are skipped. Parsing is strict: one bad

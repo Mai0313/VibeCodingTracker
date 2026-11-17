@@ -6,7 +6,7 @@
 //     or the top-level `--version` / `-V` flag `main.rs` short-circuits ahead
 //     of clap — runs on the inherited environment; anything that reaches
 //     dispatch uses an isolated child HOME, because `run()` calls
-//     `run_startup_auto_update` before the subcommand arm and that reads
+//     `spawn_cli_auto_update` for one-shot commands and that reads
 //     `~/.vct/config.toml`.
 //  2. Per-child HOME smoke tests — batch `usage` / `analysis` run against an
 //     isolated temp HOME seeded with fixture sessions plus an offline pricing
@@ -936,14 +936,16 @@ fn startup_reads_auto_update_preference_without_rewriting_config() {
     assert!(!home.home().join(".vct/version/vct.json").exists());
 }
 
+#[cfg(debug_assertions)]
 #[test]
-fn package_managed_binary_skips_startup_update_before_network_or_cache_writes() {
+fn dev_build_skips_auto_update_before_network_or_cache_writes() {
     let home = TempHome::new();
     let output = child_cmd(&home)
         .env_remove("VCT_OFFLINE")
         .env("HTTPS_PROXY", "http://127.0.0.1:9")
         .env("HTTP_PROXY", "http://127.0.0.1:9")
         .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
         .arg("version")
         .arg("--json")
         .output()
@@ -954,7 +956,7 @@ fn package_managed_binary_skips_startup_update_before_network_or_cache_writes() 
     assert!(output.stderr.is_empty());
     assert!(
         !home.home().join(".vct/version/vct.json").exists(),
-        "an unmarked binary must skip before claiming the daily check"
+        "a debug build must skip before claiming the daily check"
     );
 }
 
@@ -1171,7 +1173,8 @@ fn online_cmd(home: &TempHome) -> Command {
     cmd.env_remove("VCT_OFFLINE")
         .env("HTTPS_PROXY", "http://127.0.0.1:9")
         .env("HTTP_PROXY", "http://127.0.0.1:9")
-        .env_remove("NO_PROXY");
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy");
     cmd
 }
 
@@ -1206,7 +1209,10 @@ fn usage_and_analysis_merge_a_configured_remote_and_drop_it_once_unconfigured() 
     // Today's pricing cache answers the pricing fetch before any request, so
     // the child can run without `VCT_OFFLINE`, which would skip the remote.
     local.seed_pricing_cache(&pricing_seed());
-    local.put(".vct/config.toml", "[remotes]\nhosts = [\"devbox\"]\n");
+    local.put(
+        ".vct/config.toml",
+        "[general]\nauto_update = false\n[remotes]\nhosts = [\"devbox\"]\n",
+    );
     let online = |args: &[&str]| {
         online_cmd(&local)
             .env("PATH", ssh.path())
@@ -1248,7 +1254,10 @@ fn usage_and_analysis_merge_a_configured_remote_and_drop_it_once_unconfigured() 
     assert_eq!(broken.stdout, usage.stdout);
     assert!(local.home().join(".vct/remotes/devbox").exists());
 
-    local.put(".vct/config.toml", "[remotes]\nhosts = []\n");
+    local.put(
+        ".vct/config.toml",
+        "[general]\nauto_update = false\n[remotes]\nhosts = []\n",
+    );
     let unconfigured = online(&["usage", "--json"]);
     assert_eq!(String::from_utf8_lossy(&unconfigured.stdout).trim(), "[]");
     assert!(!local.home().join(".vct/remotes/devbox").exists());
@@ -1265,7 +1274,10 @@ fn an_unreachable_remote_warns_and_leaves_the_local_result_standing() {
         &vct_test_support::fixture_str("sessions/claude_code.jsonl"),
     );
     local.seed_pricing_cache(&pricing_seed());
-    local.put(".vct/config.toml", "[remotes]\nhosts = [\"devbox\"]\n");
+    local.put(
+        ".vct/config.toml",
+        "[general]\nauto_update = false\n[remotes]\nhosts = [\"devbox\"]\n",
+    );
     let ssh = tempfile::tempdir().unwrap();
     let path = ssh.path().join("ssh");
     std::fs::write(
