@@ -609,7 +609,7 @@ impl UsageUiState {
     }
 
     /// Draws the tab into `area`.
-    pub(crate) fn draw(&mut self, f: &mut Frame, area: Rect, status: Option<&str>) {
+    pub(crate) fn draw(&mut self, f: &mut Frame, area: Rect, status: Option<(&str, RatatuiColor)>) {
         // Details belong to a row: with none selected there is nothing to
         // open, and nothing for a later Esc to close.
         self.detail_open &= self.selected_model().is_some();
@@ -774,7 +774,7 @@ fn draw_usage_view(
     scroll: &mut ScrollState,
     merge_enabled: bool,
     sort: UsageSort,
-    status: Option<&str>,
+    status: Option<(&str, RatatuiColor)>,
     provider_panel_open: bool,
     detail_open: bool,
 ) {
@@ -940,7 +940,7 @@ fn draw_usage_view(
                 ("⏎", "details"),
                 ("r", "refresh"),
             ],
-            status.map(|text| (text, theme.warn)),
+            status,
             chunks.controls.width,
         ),
         chunks.controls,
@@ -1005,7 +1005,7 @@ fn render_usage_frame<B: Backend<Error: Send + Sync + 'static>>(
             scroll,
             merge_enabled,
             UsageSort::default(),
-            status,
+            status.map(|text| (text, theme().warn)),
             provider_panel_open,
             false,
         );
@@ -3227,7 +3227,7 @@ mod tests {
         let quota = every_provider(&claude, &codex, &copilot, &cursor, &grok, &antigravity);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| draw_quota_tab(frame, frame.area(), &quota, 0))
+            .draw(|frame| draw_quota_tab(frame, frame.area(), &quota, 0, None))
             .expect("quota tab renders");
         let buffer = terminal.backend().buffer();
         (0..height)
@@ -3297,7 +3297,7 @@ mod tests {
         let render = |width: u16, height: u16| {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
-                .draw(|frame| draw_quota_tab(frame, frame.area(), &quota, 0))
+                .draw(|frame| draw_quota_tab(frame, frame.area(), &quota, 0, None))
                 .unwrap();
             let buffer = terminal.backend().buffer();
             (0..height)
@@ -3335,7 +3335,7 @@ mod tests {
         let render = |quota: &QuotaView| {
             let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
             terminal
-                .draw(|frame| draw_quota_tab(frame, frame.area(), quota, 0))
+                .draw(|frame| draw_quota_tab(frame, frame.area(), quota, 0, None))
                 .unwrap();
             let buffer = terminal.backend().buffer();
             (0..20u16)
@@ -3566,7 +3566,7 @@ mod tests {
             let quota = every_provider(&claude, &codex, &copilot, &cursor, &grok, &antigravity);
             let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
             terminal
-                .draw(|frame| draw_quota_tab(frame, frame.area(), &quota, 0))
+                .draw(|frame| draw_quota_tab(frame, frame.area(), &quota, 0, None))
                 .expect("quota tab renders");
             let buffer = terminal.backend().buffer();
             for y in 0..h {

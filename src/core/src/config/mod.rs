@@ -308,7 +308,8 @@ impl Default for ProvidersConfig {
 ///
 /// vct runs `vct ledger export` on each host over ssh and adds the sessions it
 /// returns to the usage and analysis views. Only computed totals cross the
-/// connection, never conversations. vct must be installed on each host.
+/// connection, never conversations. Missing vct on a Linux or macOS remote is
+/// installed into `~/.local/bin` automatically over ssh.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RemotesConfig {
     /// ssh destinations to merge, as you would pass them to `ssh`: a host
@@ -318,7 +319,7 @@ pub struct RemotesConfig {
     pub hosts: Vec<String>,
     /// How to start vct on the hosts, for example "/opt/vct/bin/vct". Empty
     /// looks for it on the remote PATH, in ~/.local/bin, ~/.cargo/bin and
-    /// under ~/.nvm.
+    /// under ~/.nvm, and installs into ~/.local/bin if missing.
     #[serde(default)]
     pub command: String,
     /// Seconds between fetches while the app is open (minimum 60).

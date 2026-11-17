@@ -296,11 +296,11 @@ Every `usage` and `analysis` scan reads and writes a per-session ledger under `~
 hosts = ["devbox", "wei@laptop"]
 ```
 
-vct then runs `vct ledger export` on each host over ssh and folds what comes back into every total. Only that machine's ledger crosses the connection, which is per-day token counts and tool counters: conversations, databases and credentials stay where they are. Each host needs vct installed, in a version that has `ledger export`, and a login that works without a prompt, because vct runs `ssh` in batch mode: a key, an agent, or whatever your `~/.ssh/config` sets up for that name.
+vct then runs `vct ledger export` on each host over ssh and folds what comes back into every total. Only that machine's ledger crosses the connection, which is per-day token counts and tool counters: conversations, databases and credentials stay where they are. Each host needs a login that works without a prompt, because vct runs `ssh` in batch mode: a key, an agent, or whatever your `~/.ssh/config` sets up for that name. If a Linux or macOS remote does not have vct installed yet, the local vct automatically downloads the matching release binary, streams it over ssh into `~/.local/bin/vct`, and exports the ledger right away (even if the remote machine has no outbound internet access).
 
 - A one-shot command (`--json`, `--text`, `--table`) fetches first and waits up to 30 seconds per host. A host's first export parses its whole history and can outlast that wait; it finishes there anyway, so the next run gets it. The app fetches in the background every `refresh_interval` seconds (default 300) and never waits.
 - A host that cannot be reached keeps showing its last fetched data, with a warning on stderr for a one-shot command and in the log for the app. Taking a host out of `hosts` removes its data.
-- A non-interactive ssh session has a bare `PATH`, so vct looks for the remote binary on `PATH`, in `~/.local/bin`, in `~/.cargo/bin` and under `~/.nvm`. If it is installed elsewhere, set `command` to how to start it.
+- A non-interactive ssh session has a bare `PATH`, so vct looks for the remote binary on `PATH`, in `~/.local/bin`, in `~/.cargo/bin` and under `~/.nvm` before auto-installing into `~/.local/bin`. If it is installed elsewhere, set `command` to how to start it.
 - A session both machines hold, as with a shared home directory, counts once. Days are each machine's own local dates. Totals are merged, with no per-machine breakdown.
 - `vct analysis --json`, `vct analysis FILE` and the quota panels stay local.
 
@@ -426,13 +426,11 @@ Codex code-mode sessions expose a completed JavaScript `exec` cell but no struct
 
 ## Update Command
 
-**Keep supported direct installations up to date automatically.**
+**Keep installations up to date automatically in the background.**
 
-At startup, vct silently checks for a newer release at most once per UTC day. A newer release is downloaded and applied only when the current binary was installed by the official `scripts/install.sh` or `scripts/install.ps1` installer and carries its `.vct-managed` marker. The check, download, and replacement never print to stdout or stderr. A network failure, rate limit, read-only directory, or another running vct process only leaves the current command running; the reason is recorded in the diagnostic log. `VCT_OFFLINE=1` skips the check completely.
+Release builds check for a newer release in the background at most once per UTC day across every installation method (the installer scripts, npm, PyPI, and `cargo install`). When a newer release is available, vct downloads and installs the matching binary without printing to stdout or stderr, and the new version takes effect on the next launch. In the interactive app, the footer shows `Updated to vX.Y.Z` once the update is ready; on Windows, a quiet post-exit helper swaps the executable after the running process exits. A network failure, rate limit, read-only install directory, or another running update leaves the current session untouched and records the reason in the diagnostic log (throttled to once per UTC day). Local debug builds and `VCT_OFFLINE=1` skip the check completely.
 
-After a Unix update, vct re-executes the current command with the new binary. On Windows, the current command finishes and a helper applies the replacement afterwards. The automatic path never modifies installs from cargo, npm, PyPI, a distro package, or an unmarked manual or development build. Update those through their package manager instead. To add automatic updates to an existing direct install, run the current official installer once more so it creates the marker.
-
-Set `general.auto_update = false` in `~/.vct/config.toml` to disable startup checks and automatic updates. The explicit `vct update` command retains its existing manual behavior. `VCT_OFFLINE=1` also applies to it: `--check`, the interactive prompt, and `--force` alike return without contacting GitHub.
+Set `general.auto_update = false` in `~/.vct/config.toml` to disable automatic background updates. The explicit `vct update` command retains its manual behavior, and `VCT_OFFLINE=1` applies to it as well: `--check`, the interactive prompt, and `--force` return without contacting GitHub.
 
 ### Basic Usage
 

@@ -13,7 +13,7 @@ use std::path::Path;
 #[cfg(windows)]
 use std::io::Write;
 #[cfg(windows)]
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// Builds the release asset file name for the current platform and `version`.
 ///
@@ -25,9 +25,11 @@ use std::process::{Command, Stdio};
 ///
 /// Returns an error if the host OS is not one of linux, macos, or windows.
 pub fn get_asset_pattern(version: &str) -> Result<String> {
-    let os = env::consts::OS;
-    let arch = env::consts::ARCH;
+    get_asset_pattern_for(version, env::consts::OS, env::consts::ARCH)
+}
 
+/// Builds the release asset file name for an explicit `(os, arch)` pair.
+pub(crate) fn get_asset_pattern_for(version: &str, os: &str, arch: &str) -> Result<String> {
     let arch_name = match arch {
         "x86_64" => "x64",
         "aarch64" => "arm64",
@@ -98,7 +100,7 @@ pub fn commit_update_unix(current_exe: &Path, staged: tempfile::TempPath) -> Res
 /// Stages `new_binary` and starts a quiet helper to finish the swap on Windows.
 ///
 /// Windows will not let a running executable be replaced. The PowerShell helper
-/// acquires the updater's exclusive lock, waits for this process to exit,
+/// waits for this process to exit, acquires the updater's exclusive lock,
 /// refuses to replace a newer installed version, retries the replacement while
 /// another process still has the executable open, and then deletes itself. The
 /// command already in progress is not relaunched.
@@ -117,6 +119,7 @@ pub fn perform_update_windows(
     use std::os::windows::process::CommandExt;
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let current_exe = strip_verbatim_drive(current_exe);
     let parent = current_exe
         .parent()
         .context("Current executable has no parent directory")?;
@@ -163,18 +166,7 @@ pub fn perform_update_windows(
         }
     };
 
-    let spawn = Command::new("powershell.exe")
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-WindowStyle",
-            "Hidden",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-        ])
-        .arg(&helper_path)
+    let spawn = build_windows_helper_command(&helper_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -207,6 +199,10 @@ $lock = $null
 $replaced = $false
 
 try {
+  while (Get-Process -Id $parentPid -ErrorAction SilentlyContinue) {
+    Start-Sleep -Milliseconds 250
+  }
+
   for ($attempt = 0; $attempt -lt 1200 -and $null -eq $lock; $attempt++) {
     try {
       $lock = [System.IO.File]::Open(
@@ -221,10 +217,6 @@ try {
   }
   if ($null -eq $lock) {
     throw 'Timed out while waiting for the update lock'
-  }
-
-  while (Get-Process -Id $parentPid -ErrorAction SilentlyContinue) {
-    Start-Sleep -Milliseconds 250
   }
 
   $installed = $null
@@ -272,8 +264,41 @@ try {
 }
 
 #[cfg(any(windows, test))]
+fn strip_verbatim_drive(path: &Path) -> &Path {
+    match path.to_str().and_then(|raw| raw.strip_prefix(r"\\?\")) {
+        Some(rest)
+            if rest.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+                && rest.as_bytes().get(1) == Some(&b':') =>
+        {
+            Path::new(rest)
+        }
+        _ => path,
+    }
+}
+
+#[cfg(any(windows, test))]
+fn build_windows_helper_command(helper_path: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new("powershell.exe");
+    command
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(strip_verbatim_drive(helper_path));
+    command
+}
+
+#[cfg(any(windows, test))]
 fn powershell_literal(path: &Path) -> String {
-    path.to_string_lossy().replace('\'', "''")
+    strip_verbatim_drive(path)
+        .to_string_lossy()
+        .replace('\'', "''")
 }
 
 #[cfg(test)]
@@ -324,17 +349,22 @@ mod tests {
     }
 
     #[test]
-    fn windows_helper_holds_the_lock_and_prevents_downgrades() {
+    fn windows_helper_waits_for_exit_before_locking_and_prevents_downgrades() {
         let script = windows_update_script(
-            Path::new(r"C:\Program Files\VCT\vibe_coding_tracker.exe"),
-            Path::new(r"C:\Program Files\VCT\candidate.new"),
+            Path::new(r"\\?\C:\Program Files\VCT\vibe_coding_tracker.exe"),
+            Path::new(r"\\?\C:\Program Files\VCT\candidate.new"),
             "2.5.0",
-            Path::new(r"C:\Program Files\VCT\.vct-update.lock"),
+            Path::new(r"\\?\C:\Program Files\VCT\.vct-update.lock"),
             4242,
         );
 
         assert!(script.contains("$parentPid = 4242"));
-        assert!(script.contains("[System.IO.FileShare]::None"));
+        let wait_pos = script.find("Get-Process -Id $parentPid").unwrap();
+        let lock_pos = script.find("[System.IO.FileShare]::None").unwrap();
+        assert!(
+            wait_pos < lock_pos,
+            "helper must wait for exit before holding the update lock"
+        );
         assert!(script.contains("Start-Sleep -Milliseconds 250"));
         assert!(script.contains("$installed -le $expected"));
         assert!(script.contains("$attempt -lt 120"));
@@ -357,5 +387,20 @@ mod tests {
 
         assert!(script.contains(r"$target = 'C:\Wei''s Tools\vibe_coding_tracker.exe'"));
         assert!(script.contains(r"$staged = 'C:\Wei''s Tools\candidate.new'"));
+    }
+
+    #[test]
+    fn windows_helper_command_strips_verbatim_drive_prefix_from_file_arg() {
+        let command = build_windows_helper_command(Path::new(
+            r"\\?\C:\Program Files\VCT\.vct-update-1234.ps1",
+        ));
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some(r"C:\Program Files\VCT\.vct-update-1234.ps1")
+        );
     }
 }

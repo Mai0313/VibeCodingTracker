@@ -296,11 +296,11 @@ Grok 的 `usage` 是單一當下的本地 context 估算：vct 會把 `signals.j
 hosts = ["devbox", "wei@laptop"]
 ```
 
-vct 會透過 ssh 在每台主機上執行 `vct ledger export`，並把回傳的結果併入所有總計。經過連線的只有那台機器的帳本，也就是每日的 token 數與工具計數：對話內容、資料庫與憑證都留在原地。每台主機都要裝有支援 `ledger export` 的 vct，並且能不經提示登入，因為 vct 以批次模式執行 `ssh`：金鑰、agent，或 `~/.ssh/config` 為該名稱設定的任何方式皆可。
+vct 會透過 ssh 在每台主機上執行 `vct ledger export`，並把回傳的結果併入所有總計。經過連線的只有那台機器的帳本，也就是每日的 token 數與工具計數：對話內容、資料庫與憑證都留在原地。每台主機需要能不經提示登入，因為 vct 以批次模式執行 `ssh`：金鑰、agent，或 `~/.ssh/config` 為該名稱設定的任何方式皆可。若 Linux 或 macOS 遠端主機尚未安裝 vct，本地 vct 會自動下載對應架構的 release 執行檔、透過 ssh 傳送到遠端 `~/.local/bin/vct` 安裝並立即匯出帳本（即使遠端主機無法連上外網也能運作）。
 
 - 一次性指令（`--json`、`--text`、`--table`）會先抓取，每台主機最多等 30 秒。主機第一次匯出要解析完整歷史，可能超過這個時間；它在那邊仍會跑完，所以下一次執行就拿得到。儀表板則每 `refresh_interval` 秒（預設 300）在背景抓取，從不等待。
 - 連不上的主機會繼續顯示上次抓到的資料，一次性指令在 stderr 印出警告，儀表板則記在 log。把主機從 `hosts` 拿掉就會移除它的資料。
-- 非互動式 ssh 的 `PATH` 很精簡，所以 vct 會依序在 `PATH`、`~/.local/bin`、`~/.cargo/bin` 與 `~/.nvm` 底下找遠端的執行檔。裝在別處時，把 `command` 設成啟動它的方式。
+- 非互動式 ssh 的 `PATH` 很精簡，所以 vct 會先依序在 `PATH`、`~/.local/bin`、`~/.cargo/bin` 與 `~/.nvm` 底下找遠端的執行檔，都找不到時才自動安裝到 `~/.local/bin`。裝在別處時，把 `command` 設成啟動它的方式。
 - 兩台機器都有的 session（例如共用家目錄）只算一次。日期是各機器自己的本地日期。總計是合併後的數字，沒有分機器的明細。
 - `vct analysis --json`、`vct analysis FILE` 與額度面板只看本機。
 
@@ -426,13 +426,11 @@ Codex code mode session 會提供已完成的 JavaScript `exec` cell, 但沒有 
 
 ## Update 指令
 
-**自動讓受支援的直接安裝維持最新版本.**
+**在背景自動維持最新版本.**
 
-vct 啟動時最多每天 UTC 日期檢查一次新版. 只有透過官方 `scripts/install.sh` 或 `scripts/install.ps1` 安裝, 且帶有 `.vct-managed` marker 的執行檔, 才會下載並套用新版. 檢查, 下載與替換都不會印到 stdout 或 stderr. 網路失敗, rate limit, 唯讀目錄或另一個 vct process 正在執行時, 目前指令仍會照常繼續, 原因只會寫入 diagnostic log. `VCT_OFFLINE=1` 會完全略過檢查.
+所有安裝方式（官方安裝腳本, npm, PyPI 與 `cargo install`）的 release build 最多每天 UTC 日期在背景檢查一次新版. 有新版時, vct 會在背景下載並替換對應平台的執行檔, 不會印到 stdout 或 stderr, 新版會在下次啟動時生效. 在互動式介面中, 更新準備完成後底部列會提示 `Updated to vX.Y.Z`; Windows 則會在目前程序結束後由背景 helper 完成替換. 網路失敗, rate limit, 唯讀安裝目錄或另一個更新正在進行時, 目前的指令與介面都會照常運作, 原因只會寫入 diagnostic log（每個 UTC 日期最多一次）. 本地 debug build 與 `VCT_OFFLINE=1` 會完全略過檢查.
 
-Unix 套用更新後, vct 會用新版 binary 重新執行目前指令. Windows 則會讓目前指令結束, 再由 helper 套用替換. 自動流程絕不會修改透過 cargo, npm, PyPI, distro package 安裝的版本, 或沒有 marker 的手動與 development build. 請透過對應 package manager 更新. 既有的直接安裝只要再執行一次目前的官方 installer, 就會建立 marker 並啟用自動更新.
-
-在 `~/.vct/config.toml` 設定 `general.auto_update = false` 可關閉啟動檢查與自動更新. 明確執行的 `vct update` 會保留原有的手動行為. `VCT_OFFLINE=1` 對它同樣有效: `--check`, 互動式確認與 `--force` 都會直接返回, 不會連線到 GitHub.
+在 `~/.vct/config.toml` 設定 `general.auto_update = false` 可關閉背景自動更新. 明確執行的 `vct update` 保留手動行為, `VCT_OFFLINE=1` 對它同樣有效: `--check`, 互動式確認與 `--force` 都會直接返回, 不會連線到 GitHub.
 
 ### 基本用法
 

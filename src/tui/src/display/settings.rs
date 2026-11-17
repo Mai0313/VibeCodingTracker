@@ -13,7 +13,7 @@ use crossterm::event::KeyCode;
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::Style,
+    style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
@@ -695,7 +695,7 @@ impl SettingsUiState {
     }
 
     /// Draws the tab into `area`.
-    pub(crate) fn draw(&mut self, f: &mut Frame, area: Rect) {
+    pub(crate) fn draw(&mut self, f: &mut Frame, area: Rect, status: Option<(&str, Color)>) {
         if area.width < SETTINGS_MIN_W || area.height < SETTINGS_MIN_H {
             render_too_small(f, SETTINGS_MIN_W, SETTINGS_MIN_H);
             return;
@@ -840,6 +840,11 @@ impl SettingsUiState {
             help,
         );
 
+        let footer_status = self
+            .message
+            .as_ref()
+            .map(|(text, ok)| (text.as_str(), if *ok { theme.good } else { theme.bad }))
+            .or(status);
         f.render_widget(
             create_controls_with_status(
                 &[
@@ -850,9 +855,7 @@ impl SettingsUiState {
                     ("x", "reset"),
                     ("e", "editor"),
                 ],
-                self.message
-                    .as_ref()
-                    .map(|(text, ok)| (text.as_str(), if *ok { theme.good } else { theme.bad })),
+                footer_status,
                 controls.width,
             ),
             controls,
@@ -992,7 +995,7 @@ mod tests {
 
     fn screen(state: &mut SettingsUiState, w: u16, h: u16) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
-        terminal.draw(|f| state.draw(f, f.area())).unwrap();
+        terminal.draw(|f| state.draw(f, f.area(), None)).unwrap();
         let buffer = terminal.backend().buffer();
         (0..h)
             .map(|y| (0..w).map(|x| buffer[(x, y)].symbol()).collect())
@@ -1292,5 +1295,24 @@ mod tests {
         ] {
             assert!(screen.contains(expected), "{expected} missing:\n{screen}");
         }
+    }
+
+    #[test]
+    fn save_feedback_preempts_the_background_update_notice() {
+        let (mut state, _) = form();
+        let render_footer = |state: &mut SettingsUiState| {
+            let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            terminal
+                .draw(|f| state.draw(f, f.area(), Some(("Updated to v3.2.0", theme().good))))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..100)
+                .map(|x| buffer[(x, 23)].symbol())
+                .collect::<String>()
+        };
+        assert!(render_footer(&mut state).contains("Updated to v3.2.0"));
+        state.set_message("saved".to_string(), true);
+        let saved = render_footer(&mut state);
+        assert!(saved.contains("saved") && !saved.contains("Updated to v3.2.0"));
     }
 }

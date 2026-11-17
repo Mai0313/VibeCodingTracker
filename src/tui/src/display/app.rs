@@ -21,11 +21,11 @@ use crate::display::usage::{
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::Style,
+    style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
 };
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use sysinfo::System;
 use vct_core::analysis::AnalysisData;
@@ -142,6 +142,18 @@ fn after_editor(result: anyhow::Result<()>, file_is_valid: bool) -> (bool, Strin
     }
 }
 
+/// Footer status for Usage and Analysis: an active or failed refresh wins over
+/// a completed background auto-update notice.
+fn data_tab_status<'a>(
+    refresh: Option<&'a str>,
+    update_notice: Option<&'a str>,
+) -> Option<(&'a str, Color)> {
+    let theme = theme();
+    refresh
+        .map(|text| (text, theme.warn))
+        .or_else(|| update_notice.map(|text| (text, theme.good)))
+}
+
 /// Whether to scan now for a tab whose data does not answer what is on screen.
 ///
 /// Never while a scan is running: its result may be the one wanted, and if it
@@ -211,6 +223,16 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
         let paths = vct_core::utils::resolve_paths()?;
         let mut tab = start;
         let mut config = config;
+        let update_notice = Arc::new(OnceLock::new());
+        if config.general.auto_update {
+            let slot = Arc::clone(&update_notice);
+            std::thread::spawn(move || {
+                if let Some(version) = vct_core::update::maybe_auto_update(true).installed_version()
+                {
+                    let _ = slot.set(format!("Updated to v{version}"));
+                }
+            });
+        }
         let mut quota: Option<QuotaRuntime> = None;
         let mut usage = UsageUiState::new(merge);
         let mut analysis = AnalysisUiState::new();
@@ -339,7 +361,10 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
             if redraw || last_draw.is_none_or(|at| at.elapsed() >= tick) {
                 spinner = spinner.wrapping_add(1);
                 let active = worker.as_ref().is_some_and(RefreshWorker::is_active);
-                let status = refresh_status(active, failure_until);
+                let refresh = refresh_status(active, failure_until);
+                let update_text = update_notice.get().map(String::as_str);
+                let data_status = data_tab_status(refresh, update_text);
+                let update_status = update_text.map(|text| (text, theme().good));
                 let quota_snapshots = (tab == Tab::Quota).then(|| {
                     let runtime = quota.get_or_insert_with(|| {
                         QuotaRuntime::start(
@@ -366,15 +391,15 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                             };
                             render_loading(f, body, spinner, message);
                         }
-                        Tab::Usage => usage.draw(f, body, status),
-                        Tab::Analysis => analysis.draw(f, body, status),
+                        Tab::Usage => usage.draw(f, body, data_status),
+                        Tab::Analysis => analysis.draw(f, body, data_status),
                         Tab::Quota => {
                             let runtime = quota.as_ref().expect("started for Quota tab");
                             let snapshots = quota_snapshots.as_ref().expect("read for Quota tab");
                             let now = chrono::Local::now().timestamp();
-                            draw_quota_tab(f, body, &snapshots.view(runtime), now);
+                            draw_quota_tab(f, body, &snapshots.view(runtime), now, update_status);
                         }
-                        Tab::Settings => settings.draw(f, body),
+                        Tab::Settings => settings.draw(f, body, update_status),
                     }
                     if help_open {
                         render_help(f, body, tab);
@@ -796,6 +821,19 @@ mod tests {
                 "{message}"
             );
         }
+    }
+
+    #[test]
+    fn refresh_status_preempts_the_background_update_notice() {
+        assert_eq!(data_tab_status(None, None), None);
+        assert_eq!(
+            data_tab_status(None, Some("Updated to v3.2.0")),
+            Some(("Updated to v3.2.0", theme().good))
+        );
+        assert_eq!(
+            data_tab_status(Some("Refreshing..."), Some("Updated to v3.2.0")),
+            Some(("Refreshing...", theme().warn))
+        );
     }
 
     #[test]

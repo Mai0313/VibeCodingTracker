@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 /// GitHub REST endpoint for the repository's latest release.
-const GITHUB_API_RELEASES_URL: &str =
+pub(crate) const GITHUB_API_RELEASES_URL: &str =
     "https://api.github.com/repos/Mai0313/VibeCodingTracker/releases/latest";
 /// `User-Agent` header value (`vibe_coding_tracker/<version>`), required by the
 /// GitHub API. Pinned to the product name rather than this crate's name.
@@ -68,7 +68,10 @@ pub fn fetch_latest_release_from(url: &str) -> Result<GitHubRelease> {
     fetch_latest_release_from_with_timeout(url, RELEASE_TIMEOUT)
 }
 
-fn fetch_latest_release_from_with_timeout(url: &str, timeout: Duration) -> Result<GitHubRelease> {
+pub(crate) fn fetch_latest_release_from_with_timeout(
+    url: &str,
+    timeout: Duration,
+) -> Result<GitHubRelease> {
     let client = reqwest::blocking::Client::builder()
         .user_agent(USER_AGENT)
         .connect_timeout(CONNECT_TIMEOUT.min(timeout))
@@ -107,6 +110,16 @@ pub fn download_file(url: &str, dest: &std::path::Path) -> Result<u64> {
 }
 
 fn download_file_with_timeout(url: &str, dest: &std::path::Path, timeout: Duration) -> Result<u64> {
+    let mut file = std::fs::File::create(dest)
+        .context(format!("Failed to create file: {}", dest.display()))?;
+    download_to_writer_with_timeout(url, &mut file, timeout)
+}
+
+pub(crate) fn download_to_writer_with_timeout(
+    url: &str,
+    writer: &mut impl std::io::Write,
+    timeout: Duration,
+) -> Result<u64> {
     let client = reqwest::blocking::Client::builder()
         .user_agent(USER_AGENT)
         .connect_timeout(CONNECT_TIMEOUT.min(timeout))
@@ -120,11 +133,8 @@ fn download_file_with_timeout(url: &str, dest: &std::path::Path, timeout: Durati
         anyhow::bail!("Download failed with status: {}", response.status());
     }
 
-    let mut file = std::fs::File::create(dest)
-        .context(format!("Failed to create file: {}", dest.display()))?;
-
     let bytes = response
-        .copy_to(&mut file)
+        .copy_to(writer)
         .context("Failed to write downloaded content to file")?;
 
     Ok(bytes)

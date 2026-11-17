@@ -36,8 +36,6 @@ use vct_core::usage::scan_usage_priced;
 use vct_tui::display::app::{AppOptions, Tab, run_app};
 use vct_tui::display::usage::{display_usage_table, display_usage_text};
 
-const AUTO_UPDATE_REEXEC_ENV: &str = "VCT_AUTO_UPDATE_REEXEC";
-
 /// Runs process-wide setup, then hands off to [`run`], which does the clap
 /// parse and the dispatch.
 ///
@@ -99,8 +97,15 @@ fn run() -> Result<()> {
     // After the parse, so a `--help` or a rejected flag exits without touching
     // the user's `~/.vct` at all.
     vct_core::utils::remove_legacy_cache_files();
-    run_startup_auto_update(&cli);
+    let auto_update = spawn_cli_auto_update(&cli);
+    let result = dispatch(cli);
+    if let Some(handle) = auto_update {
+        let _ = handle.join();
+    }
+    result
+}
 
+fn dispatch(cli: Cli) -> Result<()> {
     let Some(command) = cli.command else {
         return open_app(Tab::Usage, [false; 4], false);
     };
@@ -411,57 +416,52 @@ fn prepare_remotes(config: &vct_core::config::RemotesConfig) -> Result<()> {
     Ok(())
 }
 
-/// Runs the silent startup updater before any command emits output or enters a
-/// terminal session.
+/// Whether `cli` enters [`open_app`] rather than running a one-shot command.
+fn opens_interactive_app(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        None | Some(
+            Commands::Analysis {
+                file: None,
+                json: false,
+                text: false,
+                table: false,
+                ..
+            } | Commands::Usage {
+                json: false,
+                text: false,
+                table: false,
+                ..
+            } | Commands::Quota { provider: None, .. }
+        )
+    )
+}
+
+/// Starts the silent background auto-updater for one-shot commands.
 ///
-/// Skipped for `update` / `config` and inside a re-exec'd child. On Unix an
-/// applied update re-execs the current command in place, so this call may
-/// never return.
-fn run_startup_auto_update(cli: &Cli) {
-    if std::env::var_os(AUTO_UPDATE_REEXEC_ENV).is_some()
+/// Skipped for `update` / `config` and for invocations that enter the
+/// interactive app, which runs its own detached check and surfaces a footer
+/// notice on completion. Joining the returned handle after the command's own
+/// work keeps startup latency at zero while letting a fast command finish an
+/// in-flight daily download before exiting.
+fn spawn_cli_auto_update(cli: &Cli) -> Option<std::thread::JoinHandle<()>> {
+    if opens_interactive_app(cli)
         || matches!(
             &cli.command,
             Some(Commands::Update { .. } | Commands::Config { .. })
         )
     {
-        return;
+        return None;
     }
 
     let config = vct_core::config::load_read_only();
-    let reexec_path = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.canonicalize().ok());
-    if vct_core::update::maybe_auto_update(config.general.auto_update)
-        == vct_core::update::AutoUpdateOutcome::Updated
-    {
-        reexec_current_command(reexec_path);
+    if !config.general.auto_update {
+        return None;
     }
+    Some(std::thread::spawn(|| {
+        vct_core::update::maybe_auto_update(true);
+    }))
 }
-
-#[cfg(unix)]
-fn reexec_current_command(current_exe: Option<std::path::PathBuf>) {
-    use std::os::unix::process::CommandExt;
-
-    let Some(current_exe) = current_exe else {
-        log::warn!("auto-update succeeded but the current executable could not be resolved");
-        return;
-    };
-    let error = build_reexec_command(&current_exe, std::env::args_os().skip(1)).exec();
-    log::warn!("auto-update succeeded but re-exec failed: {error}");
-}
-
-#[cfg(unix)]
-fn build_reexec_command(
-    current_exe: &std::path::Path,
-    args: impl IntoIterator<Item = std::ffi::OsString>,
-) -> std::process::Command {
-    let mut command = std::process::Command::new(current_exe);
-    command.args(args).env(AUTO_UPDATE_REEXEC_ENV, "1");
-    command
-}
-
-#[cfg(not(unix))]
-fn reexec_current_command(_current_exe: Option<std::path::PathBuf>) {}
 
 /// Handles the `config` subcommand by dispatching one [`ConfigAction`].
 fn run_config(action: ConfigAction) -> Result<()> {
@@ -653,35 +653,43 @@ fn report_usage_collection(diagnostics: &vct_core::usage::ScanDiagnostics) -> Re
     Ok(())
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
-    use super::{AUTO_UPDATE_REEXEC_ENV, build_reexec_command};
-    use std::ffi::{OsStr, OsString};
-    use std::path::Path;
+    use super::opens_interactive_app;
+    use crate::cli::Cli;
+    use clap::Parser;
 
     #[test]
-    fn reexec_preserves_every_original_argument_and_sets_the_sentinel() {
-        let args = [
-            OsString::from("analysis"),
-            OsString::from("path with spaces/session.jsonl"),
-            OsString::from("--json"),
-        ];
-        let command = build_reexec_command(Path::new("/tmp/vct next"), args.clone());
+    fn interactive_classification_matches_every_app_entry_point() {
+        for args in [
+            &["vct"][..],
+            &["vct", "usage"],
+            &["vct", "usage", "--daily", "--merge-providers"],
+            &["vct", "analysis"],
+            &["vct", "analysis", "--weekly"],
+            &["vct", "quota"],
+        ] {
+            assert!(
+                opens_interactive_app(&Cli::parse_from(args)),
+                "{args:?} must be classified as interactive"
+            );
+        }
 
-        assert_eq!(command.get_program(), OsStr::new("/tmp/vct next"));
-        assert_eq!(
-            command
-                .get_args()
-                .map(OsStr::to_os_string)
-                .collect::<Vec<_>>(),
-            args
-        );
-        assert_eq!(
-            command
-                .get_envs()
-                .find(|(name, _)| *name == OsStr::new(AUTO_UPDATE_REEXEC_ENV))
-                .and_then(|(_, value)| value),
-            Some(OsStr::new("1"))
-        );
+        for args in [
+            &["vct", "usage", "--table"][..],
+            &["vct", "usage", "--json"],
+            &["vct", "analysis", "--text"],
+            &["vct", "analysis", "session.jsonl"],
+            &["vct", "quota", "claude"],
+            &["vct", "ledger", "export"],
+            &["vct", "version"],
+            &["vct", "update"],
+            &["vct", "config", "show"],
+        ] {
+            assert!(
+                !opens_interactive_app(&Cli::parse_from(args)),
+                "{args:?} must be classified as one-shot"
+            );
+        }
     }
 }

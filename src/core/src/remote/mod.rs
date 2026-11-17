@@ -36,20 +36,44 @@ const BACKGROUND_TIMEOUT: Duration = Duration::from_secs(600);
 /// The shortest pause between two fetches of the background loop.
 const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Marker printed to stderr when no `vct` binary is found on the remote host,
+/// followed by `<uname -s>:<uname -m>`.
+const MISSING_MARKER: &str = "vct-missing:";
+
 /// Runs vct on a remote whose config names no command.
 ///
 /// A non-interactive ssh session gets a bare `PATH`, without what a login
 /// profile or a version manager adds, so the usual install locations are
 /// tried in turn. The npm package's `vct` is a Node script, hence the `PATH`
-/// entry for the copy under `~/.nvm`.
+/// entry for the copy under `~/.nvm`. When none is present, prints the host's
+/// `(uname -s, uname -m)` marker so the caller can bootstrap `~/.local/bin/vct`
+/// over ssh.
 const LOCATE_AND_EXPORT: &str = concat!(
     "sh -c '",
-    "for v in vct \"$HOME/.local/bin/vct\" \"$HOME/.cargo/bin/vibe_coding_tracker\"; do ",
+    "for v in vct vibe_coding_tracker \"$HOME/.local/bin/vct\" \"$HOME/.local/bin/vibe_coding_tracker\" \"$HOME/.cargo/bin/vibe_coding_tracker\"; do ",
     "command -v \"$v\" >/dev/null 2>&1 && exec \"$v\" ledger export; done; ",
     "for v in \"$HOME\"/.nvm/versions/node/*/bin/vct; do [ -x \"$v\" ] && n=$v; done; ",
     "[ -n \"$n\" ] && PATH=\"${n%/*}:$PATH\" exec \"$n\" ledger export; ",
-    "echo \"vct was not found on PATH, in ~/.local/bin, ~/.cargo/bin or under ~/.nvm; ",
-    "set [remotes] command\" >&2; exit 127'",
+    "echo \"vct-missing:$(uname -s 2>/dev/null):$(uname -m 2>/dev/null)\" >&2; exit 127'",
+);
+
+/// Installs a gzipped `vibe_coding_tracker` binary streamed on stdin into
+/// `~/.local/bin` (with a `vct` symlink) and immediately exports its ledger.
+const INSTALL_AND_EXPORT: &str = concat!(
+    "sh -c 'set -eu; ",
+    "cleanup() { [ -n \"$stage\" ] && rm -rf \"$stage\" || true; }; ",
+    "stage=\"\"; trap cleanup EXIT; ",
+    "dir=\"$HOME/.local/bin\"; mkdir -p \"$dir\"; ",
+    "dir=\"$(cd -P \"$dir\" && pwd)\"; ",
+    "stage=\"$(mktemp -d \"$dir/.vibe_coding_tracker.XXXXXX\")\"; ",
+    "gzip -dc > \"$stage/vibe_coding_tracker\"; ",
+    "chmod 755 \"$stage/vibe_coding_tracker\"; ",
+    "\"$stage/vibe_coding_tracker\" --version >/dev/null; ",
+    "ln -s \"$dir/vibe_coding_tracker\" \"$stage/vct\"; ",
+    "mv -f \"$stage/vibe_coding_tracker\" \"$dir/vibe_coding_tracker\"; ",
+    "mv -f \"$stage/vct\" \"$dir/vct\"; ",
+    "rm -rf \"$stage\"; stage=\"\"; trap - EXIT; ",
+    "exec \"$dir/vct\" ledger export </dev/null'",
 );
 
 /// Scans this machine through its ledger and writes the export another
@@ -165,6 +189,22 @@ fn fetch_all(
     program: &OsStr,
     timeout: Duration,
 ) -> Vec<(String, String)> {
+    fetch_all_from(
+        cache_dir,
+        config,
+        program,
+        timeout,
+        crate::update::GITHUB_API_RELEASES_URL,
+    )
+}
+
+fn fetch_all_from(
+    cache_dir: &Path,
+    config: &RemotesConfig,
+    program: &OsStr,
+    timeout: Duration,
+    release_url: &str,
+) -> Vec<(String, String)> {
     let names = snapshot_names(config);
     let names = &names;
     std::thread::scope(|scope| {
@@ -178,7 +218,14 @@ fn fetch_all(
                     if names[..index].contains(&names[index]) {
                         bail!("shares its snapshot name with an earlier host; use an ssh alias");
                     }
-                    fetch_one(cache_dir, host, &config.command, program, timeout)
+                    fetch_one(
+                        cache_dir,
+                        host,
+                        &config.command,
+                        program,
+                        timeout,
+                        release_url,
+                    )
                 })
             })
             .collect();
@@ -204,31 +251,119 @@ fn fetch_one(
     command: &str,
     program: &OsStr,
     timeout: Duration,
+    release_url: &str,
 ) -> Result<()> {
     // A leading dash would reach ssh as an option rather than a destination.
     if host.is_empty() || host.starts_with('-') || host.contains(char::is_whitespace) {
         bail!("not an ssh destination");
     }
-    let remote_command = if command.trim().is_empty() {
+    let started = Instant::now();
+    let default_command = command.trim().is_empty();
+    let remote_command = if default_command {
         LOCATE_AND_EXPORT.to_string()
     } else {
         format!("{} ledger export", command.trim())
     };
+    let output = match run(
+        ssh_command(program, host, &remote_command),
+        Stdio::null(),
+        timeout,
+    ) {
+        Ok(output) => output,
+        Err(RunError::MissingRemoteVct { os, arch }) if default_command => {
+            bootstrap_and_export(program, host, &os, &arch, release_url, timeout, started)
+                .context("vct is not installed on the remote and automatic install failed")?
+        }
+        Err(error) => return Err(error.into_anyhow()),
+    };
+    store_export(cache_dir, &snapshot_name(host), &output)
+}
+
+fn ssh_command(program: &OsStr, host: &str, remote_command: &str) -> Command {
     let mut ssh = Command::new(program);
     // BatchMode makes ssh fail instead of asking for a password or a host key,
     // which would otherwise wait on a terminal the TUI owns.
     ssh.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"])
         .arg(host)
         .arg(remote_command);
-    let output = run(ssh, timeout)?;
-    store_export(cache_dir, &snapshot_name(host), &output)
+    ssh
+}
+
+fn resolve_remote_platform(os: &str, arch: &str) -> Result<(&'static str, &'static str)> {
+    let os = if os.starts_with("Linux") {
+        "linux"
+    } else if os.starts_with("Darwin") {
+        "macos"
+    } else {
+        bail!(
+            "automatic install supports Linux and macOS remotes only (remote reported OS '{os}')"
+        );
+    };
+    let arch = match arch {
+        "x86_64" | "amd64" => "x86_64",
+        "aarch64" | "arm64" => "aarch64",
+        other => bail!("automatic install does not support remote architecture '{other}'"),
+    };
+    Ok((os, arch))
+}
+
+fn bootstrap_and_export(
+    program: &OsStr,
+    host: &str,
+    raw_os: &str,
+    raw_arch: &str,
+    release_url: &str,
+    timeout: Duration,
+    started: Instant,
+) -> Result<String> {
+    let (os, arch) = resolve_remote_platform(raw_os, raw_arch)?;
+    let remaining = timeout.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        bail!("timed out before downloading release binary for remote");
+    }
+    let gz_binary =
+        crate::update::prepare_remote_binary_gzip_from(release_url, os, arch, remaining)?;
+    let remaining = timeout.saturating_sub(started.elapsed());
+    if remaining < Duration::from_secs(1) {
+        bail!(
+            "no answer within {} s; a first export can take longer, so the next fetch may succeed",
+            timeout.as_secs()
+        );
+    }
+    run(
+        ssh_command(program, host, INSTALL_AND_EXPORT),
+        Stdio::from(gz_binary),
+        remaining,
+    )
+    .map_err(RunError::into_anyhow)
+}
+
+enum RunError {
+    MissingRemoteVct { os: String, arch: String },
+    Failed(anyhow::Error),
+}
+
+impl RunError {
+    fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            Self::MissingRemoteVct { os, arch } => {
+                anyhow::anyhow!("vct was not found on remote ({os}/{arch})")
+            }
+            Self::Failed(error) => error,
+        }
+    }
 }
 
 /// Runs `command` to completion and returns its stdout, or the reason it
-/// failed: a timeout, or its exit status with the last line of its stderr.
-fn run(mut command: Command, timeout: Duration) -> Result<String> {
+/// failed: a timeout, a missing-vct bootstrap marker, or its exit status with
+/// the last line of its stderr.
+fn run(
+    mut command: Command,
+    stdin: Stdio,
+    timeout: Duration,
+) -> std::result::Result<String, RunError> {
     command
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(windows)]
@@ -251,12 +386,19 @@ fn run(mut command: Command, timeout: Duration) -> Result<String> {
             });
         }
     }
-    let mut child = command.spawn().context("cannot start ssh")?;
+    let mut child = command
+        .spawn()
+        .context("cannot start ssh")
+        .map_err(RunError::Failed)?;
     let stdout = drain(child.stdout.take());
     let stderr = drain(child.stderr.take());
     let deadline = Instant::now() + timeout;
     let status = loop {
-        if let Some(status) = child.try_wait().context("cannot wait for ssh")? {
+        if let Some(status) = child
+            .try_wait()
+            .context("cannot wait for ssh")
+            .map_err(RunError::Failed)?
+        {
             break status;
         }
         if Instant::now() >= deadline {
@@ -269,10 +411,10 @@ fn run(mut command: Command, timeout: Duration) -> Result<String> {
             let _ = child.wait();
             // The pipes are left to their threads: a descendant that outlives
             // the kill keeps them open, and joining would wait on it.
-            bail!(
+            return Err(RunError::Failed(anyhow::anyhow!(
                 "no answer within {} s; a first export can take longer, so the next fetch may succeed",
                 timeout.as_secs()
-            );
+            )));
         }
         std::thread::sleep(Duration::from_millis(50));
     };
@@ -283,7 +425,20 @@ fn run(mut command: Command, timeout: Duration) -> Result<String> {
     }
     // clap's last line is a pointer to `--help`; say what is wrong instead.
     if stderr.contains("unrecognized subcommand") {
-        bail!("the vct installed there has no `ledger export`; update it");
+        return Err(RunError::Failed(anyhow::anyhow!(
+            "the vct installed there has no `ledger export`; update it"
+        )));
+    }
+    if let Some(rest) = stderr
+        .lines()
+        .rev()
+        .find_map(|line| line.trim().strip_prefix(MISSING_MARKER))
+        && let Some((os, arch)) = rest.split_once(':')
+    {
+        return Err(RunError::MissingRemoteVct {
+            os: os.to_string(),
+            arch: arch.to_string(),
+        });
     }
     let reason = stderr
         .lines()
@@ -291,7 +446,7 @@ fn run(mut command: Command, timeout: Duration) -> Result<String> {
         .map(str::trim)
         .find(|line| !line.is_empty())
         .unwrap_or("no error output");
-    bail!("{status}: {reason}")
+    Err(RunError::Failed(anyhow::anyhow!("{status}: {reason}")))
 }
 
 /// Reads a child's pipe to its end on a thread of its own, so a child that
@@ -392,6 +547,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial(update_spawn)]
     fn a_fetch_stores_what_the_remote_printed_after_its_banner() {
         let dir = tempfile::tempdir().unwrap();
         let ssh = fake_ssh(
@@ -415,6 +571,7 @@ echo '{"vct_ledger_export":1,"providers":{"claude":{"schema_version":1,"provider
 
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial(update_spawn)]
     fn a_failed_fetch_reports_the_last_stderr_line_and_keeps_the_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let snapshot = dir.path().join("remotes/devbox/sessions/claude.json");
@@ -440,6 +597,7 @@ echo '{"vct_ledger_export":1,"providers":{"claude":{"schema_version":1,"provider
 
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial(update_spawn)]
     fn a_fetch_that_never_answers_is_cut_off() {
         let dir = tempfile::tempdir().unwrap();
         // No `exec`: the sleep is a grandchild holding both pipes open.
@@ -460,6 +618,7 @@ echo '{"vct_ledger_export":1,"providers":{"claude":{"schema_version":1,"provider
 
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial(update_spawn)]
     fn ssh_gets_batch_mode_the_host_and_the_configured_command() {
         let dir = tempfile::tempdir().unwrap();
         let args = dir.path().join("args");
@@ -480,6 +639,222 @@ echo '{"vct_ledger_export":1,"providers":{"claude":{"schema_version":1,"provider
         assert_eq!(
             std::fs::read_to_string(args).unwrap(),
             "-o\nBatchMode=yes\n-o\nConnectTimeout=10\nwei@devbox\n/opt/vct ledger export\n"
+        );
+    }
+
+    #[cfg(unix)]
+    fn hermetic_posix_bin_dir(root: &Path) -> PathBuf {
+        let bin_dir = root.join("posix-bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        for tool in [
+            "sh", "uname", "mkdir", "pwd", "mktemp", "gzip", "chmod", "ln", "mv", "rm", "printf",
+        ] {
+            let source = ["/bin", "/usr/bin"]
+                .into_iter()
+                .map(|dir| Path::new(dir).join(tool))
+                .find(|candidate| candidate.exists())
+                .unwrap_or_else(|| panic!("missing standard POSIX utility {tool}"));
+            std::os::unix::fs::symlink(source, bin_dir.join(tool)).unwrap();
+        }
+        bin_dir
+    }
+
+    #[cfg(unix)]
+    fn release_tarball(contents: &[u8]) -> Vec<u8> {
+        use flate2::{Compression, write::GzEncoder};
+
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "vibe_coding_tracker", contents)
+            .unwrap();
+        archive.into_inner().unwrap().finish().unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(update_spawn)]
+    fn a_missing_remote_vct_is_bootstrapped_over_ssh_and_reused_afterwards() {
+        use httpmock::prelude::*;
+        use serde_json::json;
+
+        let remote_bin = concat!(
+            "#!/bin/sh\n",
+            "if [ \"$1\" = \"--version\" ]; then echo 9.9.9; exit 0; fi\n",
+            "if [ \"$1\" = \"ledger\" ] && [ \"$2\" = \"export\" ]; then\n",
+            "  printf '%s\\n' '{\"vct_ledger_export\":1,\"providers\":{\"claude\":{\"schema_version\":1,\"provider\":\"claude\",\"sessions\":{}}}}'\n",
+            "  exit 0\n",
+            "fi\n",
+            "exit 2\n",
+        )
+        .as_bytes();
+        let archive_bytes = release_tarball(remote_bin);
+
+        let asset_name =
+            crate::update::get_asset_pattern("9.9.9").expect("supported host platform");
+        let server = MockServer::start();
+        let release_mock = server.mock(|when, then| {
+            when.method(GET).path("/releases/latest");
+            then.status(200).json_body(json!({
+                "tag_name": "v9.9.9",
+                "name": "v9.9.9",
+                "body": null,
+                "assets": [{
+                    "name": asset_name,
+                    "browser_download_url": server.url("/asset.tar.gz"),
+                    "size": archive_bytes.len()
+                }]
+            }));
+        });
+        let asset_mock = server.mock(|when, then| {
+            when.method(GET).path("/asset.tar.gz");
+            then.status(200).body(archive_bytes);
+        });
+
+        let remote_home = tempfile::tempdir().unwrap();
+        let local_cache = tempfile::tempdir().unwrap();
+        let posix_bin = hermetic_posix_bin_dir(local_cache.path());
+        let env_file = local_cache.path().join("remote-env.sh");
+        std::fs::write(
+            &env_file,
+            format!(
+                "export HOME='{}'\nexport PATH='{}'\n",
+                remote_home.path().to_string_lossy().replace('\'', "'\\''"),
+                posix_bin.to_string_lossy().replace('\'', "'\\''"),
+            ),
+        )
+        .unwrap();
+        let ssh = fake_ssh(
+            local_cache.path(),
+            &format!(
+                ". '{}'\nshift 5\nexec sh -c \"$1\"",
+                env_file.to_string_lossy().replace('\'', "'\\''"),
+            ),
+        );
+
+        let failures = fetch_all_from(
+            local_cache.path(),
+            &config_for("devbox"),
+            ssh.as_os_str(),
+            Duration::from_secs(10),
+            &server.url("/releases/latest"),
+        );
+        assert_eq!(failures, Vec::new());
+        release_mock.assert_calls(1);
+        asset_mock.assert_calls(1);
+        assert!(remote_home.path().join(".local/bin/vct").exists());
+        assert!(
+            local_cache
+                .path()
+                .join("remotes/devbox/sessions/claude.json")
+                .exists()
+        );
+
+        // Next sync finds `~/.local/bin/vct` on the first ssh call without
+        // contacting GitHub again.
+        let second = fetch_all_from(
+            local_cache.path(),
+            &config_for("devbox"),
+            ssh.as_os_str(),
+            Duration::from_secs(10),
+            "http://127.0.0.1:9/unreachable",
+        );
+        assert_eq!(second, Vec::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(update_spawn)]
+    fn an_unrunnable_remote_candidate_never_lands_in_local_bin() {
+        use httpmock::prelude::*;
+        use serde_json::json;
+
+        let broken_bin = b"#!/bin/sh\necho 'GLIBC_2.99 not found' >&2\nexit 127\n";
+        let archive_bytes = release_tarball(broken_bin);
+        let asset_name =
+            crate::update::get_asset_pattern("9.9.9").expect("supported host platform");
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/releases/latest");
+            then.status(200).json_body(json!({
+                "tag_name": "v9.9.9",
+                "name": "v9.9.9",
+                "body": null,
+                "assets": [{
+                    "name": asset_name,
+                    "browser_download_url": server.url("/asset.tar.gz"),
+                    "size": archive_bytes.len()
+                }]
+            }));
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/asset.tar.gz");
+            then.status(200).body(archive_bytes);
+        });
+
+        let remote_home = tempfile::tempdir().unwrap();
+        let local_cache = tempfile::tempdir().unwrap();
+        let posix_bin = hermetic_posix_bin_dir(local_cache.path());
+        let env_file = local_cache.path().join("remote-env.sh");
+        std::fs::write(
+            &env_file,
+            format!(
+                "export HOME='{}'\nexport PATH='{}'\n",
+                remote_home.path().to_string_lossy().replace('\'', "'\\''"),
+                posix_bin.to_string_lossy().replace('\'', "'\\''"),
+            ),
+        )
+        .unwrap();
+        let ssh = fake_ssh(
+            local_cache.path(),
+            &format!(
+                ". '{}'\nshift 5\nexec sh -c \"$1\"",
+                env_file.to_string_lossy().replace('\'', "'\\''"),
+            ),
+        );
+
+        let failures = fetch_all_from(
+            local_cache.path(),
+            &config_for("devbox"),
+            ssh.as_os_str(),
+            Duration::from_secs(10),
+            &server.url("/releases/latest"),
+        );
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].1.contains("GLIBC_2.99"), "{failures:?}");
+        assert!(!remote_home.path().join(".local/bin/vct").exists());
+        assert!(
+            !remote_home
+                .path()
+                .join(".local/bin/vibe_coding_tracker")
+                .exists()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(update_spawn)]
+    fn an_unsupported_remote_os_reports_why_bootstrap_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = fake_ssh(
+            dir.path(),
+            "echo 'vct-missing:FreeBSD:x86_64' >&2\nexit 127",
+        );
+        let failures = fetch_all_from(
+            dir.path(),
+            &config_for("devbox"),
+            ssh.as_os_str(),
+            Duration::from_secs(5),
+            "http://127.0.0.1:9/unused",
+        );
+        assert_eq!(failures.len(), 1);
+        assert!(
+            failures[0].1.contains("automatic install failed") && failures[0].1.contains("FreeBSD"),
+            "{failures:?}"
         );
     }
 }

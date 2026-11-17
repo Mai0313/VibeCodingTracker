@@ -47,7 +47,7 @@ pub fn extract_targz(archive_path: &Path, extract_to: &Path) -> Result<std::path
         }
     }
 
-    find_binary_in_directory(extract_to)
+    find_binary_in_directory(extract_to, &["vibe_coding_tracker", "vct"])
 }
 
 /// Extracts a zip archive into `extract_to` and returns the binary path.
@@ -90,20 +90,14 @@ pub fn extract_zip(archive_path: &Path, extract_to: &Path) -> Result<std::path::
         }
     }
 
-    find_binary_in_directory(extract_to)
+    find_binary_in_directory(extract_to, &["vibe_coding_tracker.exe", "vct.exe"])
 }
 
 /// Returns the extracted binary's path, looking only directly under
 /// `extract_to`. On Unix it is `chmod`-ed to `0o755` so the candidate can be
 /// executed for validation.
-fn find_binary_in_directory(extract_to: &Path) -> Result<PathBuf> {
-    #[cfg(unix)]
-    let binary_names = ["vibe_coding_tracker", "vct"];
-
-    #[cfg(windows)]
-    let binary_names = ["vibe_coding_tracker.exe", "vct.exe"];
-
-    for name in &binary_names {
+fn find_binary_in_directory(extract_to: &Path, binary_names: &[&str]) -> Result<PathBuf> {
+    for name in binary_names {
         let binary_path = extract_to.join(name);
         if binary_path.exists() {
             #[cfg(unix)]
