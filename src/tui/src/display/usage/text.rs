@@ -39,6 +39,6 @@ pub fn display_usage_text(usage_data: &UsageData, merge: bool) {
     }
 
     for row in &summary.rows {
-        println!("{}: ${:.6}", row.display_model, row.cost);
+        println!("{}: ${:.6}", row.model, row.cost);
     }
 }

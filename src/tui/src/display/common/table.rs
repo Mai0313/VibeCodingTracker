@@ -410,14 +410,24 @@ pub fn render_detail_panel(f: &mut Frame, area: Rect, name: &str, rows: &[(&str,
         })
         .collect();
     lines.push(Line::default());
-    lines.extend(rows.iter().map(|(label, value)| {
-        let pad = inner_w.saturating_sub(label.chars().count() + value.chars().count());
-        Line::from(vec![
-            Span::styled(format!(" {label}"), theme.dim()),
-            Span::raw(" ".repeat(pad)),
-            Span::raw(value.clone()),
-        ])
-    }));
+    for (label, value) in rows {
+        if label.chars().count() + 1 + value.chars().count() <= inner_w {
+            let pad = inner_w.saturating_sub(label.chars().count() + value.chars().count());
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {label}"), theme.dim()),
+                Span::raw(" ".repeat(pad)),
+                Span::raw(value.clone()),
+            ]));
+        } else {
+            lines.push(Line::from(Span::styled(format!(" {label}"), theme.dim())));
+            let chars: Vec<char> = value.chars().collect();
+            for chunk in chars.chunks(inner_w) {
+                let text: String = chunk.iter().collect();
+                let pad = inner_w.saturating_sub(chunk.len());
+                lines.push(Line::from(format!(" {}{text}", " ".repeat(pad))));
+            }
+        }
+    }
     let height = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
     let rect = Rect {
         x: area.x + (area.width - width) / 2,
@@ -729,20 +739,30 @@ mod tests {
     fn the_detail_panel_shows_a_long_name_in_full() {
         use ratatui::{Terminal, backend::TestBackend};
         let name = "fireworks-ai/accounts/fireworks/models/qwen3-coder-480k-a35b-instruct";
-        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        let matched = "openrouter/qwen/qwen3-coder-480b-a35b-instruct-fp8-nitro";
+        let mut terminal = Terminal::new(TestBackend::new(80, 18)).unwrap();
         terminal
             .draw(|f| {
-                super::render_detail_panel(f, f.area(), name, &[("Cost", "$1.00".to_string())]);
+                super::render_detail_panel(
+                    f,
+                    f.area(),
+                    name,
+                    &[
+                        ("Cost", "$1.00".to_string()),
+                        ("Priced as", matched.to_string()),
+                    ],
+                );
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
-        let shown: String = (0..16)
+        let shown: String = (0..18)
             .flat_map(|y| (0..80).map(move |x| (x, y)))
             .map(|(x, y)| buffer[(x, y)].symbol())
             .filter(|symbol| !matches!(*symbol, " " | "│"))
             .collect();
         assert!(shown.contains(name), "{shown}");
         assert!(shown.contains("Cost$1.00"), "{shown}");
+        assert!(shown.contains(matched), "{shown}");
     }
 
     #[test]

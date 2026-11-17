@@ -442,7 +442,7 @@ impl UsageSort {
                 Self::Output => b.output_with_reasoning().cmp(&a.output_with_reasoning()),
                 Self::CacheRead => b.cache_read.cmp(&a.cache_read),
                 Self::CacheWrite => b.cache_creation.cmp(&a.cache_creation),
-                Self::Model => a.display_model.cmp(&b.display_model),
+                Self::Model => a.model.cmp(&b.model),
             };
             primary.then_with(|| a.model.cmp(&b.model))
         });
@@ -871,7 +871,7 @@ fn draw_usage_view(
                 format_cost(row.cost),
             ];
             let mut cells = Vec::with_capacity(header.len());
-            cells.push(row.display_model.clone());
+            cells.push(row.model.clone());
             cells.extend(kept.iter().map(|&i| all[i].clone()));
             let mut cells = aligned_cells(cells, 1);
             if share_w > 0 {
@@ -958,25 +958,26 @@ fn draw_usage_view(
                 "-".to_string()
             }
         };
-        render_detail_panel(
-            f,
-            area,
-            &row.display_model,
-            &[
-                ("Input", format_number(row.input_tokens)),
-                ("Output", format_number(row.output_tokens)),
-                ("Reasoning", format_number(row.reasoning_tokens)),
-                ("Cache read", format_number(row.cache_read)),
-                ("Cache write", format_number(row.cache_creation)),
-                ("Total tokens", format_number(row.total)),
-                ("Cost", format_cost(row.cost)),
-                ("Share of cost", share(row.cost, totals.cost)),
-                (
-                    "Share of tokens",
-                    share(row.total as f64, totals.total as f64),
-                ),
-            ],
-        );
+        let mut details = vec![
+            ("Input", format_number(row.input_tokens)),
+            ("Output", format_number(row.output_tokens)),
+            ("Reasoning", format_number(row.reasoning_tokens)),
+            ("Cache read", format_number(row.cache_read)),
+            ("Cache write", format_number(row.cache_creation)),
+            ("Total tokens", format_number(row.total)),
+            ("Cost", format_cost(row.cost)),
+        ];
+        if let Some(matched) = &row.matched_model {
+            details.push(("Priced as", matched.clone()));
+        }
+        details.extend([
+            ("Share of cost", share(row.cost, totals.cost)),
+            (
+                "Share of tokens",
+                share(row.total as f64, totals.total as f64),
+            ),
+        ]);
+        render_detail_panel(f, area, &row.model, &details);
     }
 }
 
@@ -1055,8 +1056,8 @@ impl UsageFrameBenchmark {
                 input_tokens + output_tokens + reasoning_tokens + cache_read + cache_creation;
             let model = format!("{}-{index}", MODELS[index % MODELS.len()]);
             let row = UsageRow {
-                display_model: model.clone(),
                 model,
+                matched_model: None,
                 input_tokens,
                 output_tokens,
                 reasoning_tokens,
@@ -3575,5 +3576,65 @@ mod tests {
                 assert_no_clipped_markers(&row, &format!("{w}x{h} row {y}"));
             }
         }
+    }
+
+    #[test]
+    fn model_table_shows_raw_model_and_moves_pricing_match_into_details() {
+        let rows = vec![UsageRow {
+            model: "custom-sonnet-preview".to_string(),
+            matched_model: Some("claude-sonnet-4-6".to_string()),
+            input_tokens: 1_000,
+            total: 1_000,
+            cost: 0.05,
+            ..UsageRow::default()
+        }];
+        let mut totals = UsageTotals::default();
+        totals.accumulate(&rows[0]);
+        let provider_totals = UsageProviderTotals::default();
+        let tracker = UpdateTracker::new(MAX_TRACKED_ROWS, 0);
+        let mut scroll = ScrollState::new();
+        scroll.sync(None, &[rows[0].model.clone()]);
+
+        let draw = |detail_open: bool, scroll: &mut ScrollState| {
+            let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+            terminal
+                .draw(|f| {
+                    draw_usage_view(
+                        f,
+                        f.area(),
+                        &rows,
+                        &totals,
+                        &provider_totals,
+                        &tracker,
+                        scroll,
+                        false,
+                        UsageSort::default(),
+                        None,
+                        false,
+                        detail_open,
+                    );
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..24u16)
+                .map(|y| {
+                    (0..120u16)
+                        .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let table = draw(false, &mut scroll);
+        assert!(table.contains("custom-sonnet-preview"), "got:\n{table}");
+        assert!(
+            !table.contains("claude-sonnet-4-6"),
+            "table row must not append matched pricing model:\n{table}"
+        );
+
+        let details = draw(true, &mut scroll);
+        assert!(details.contains("Priced as"), "got:\n{details}");
+        assert!(details.contains("claude-sonnet-4-6"), "got:\n{details}");
     }
 }
