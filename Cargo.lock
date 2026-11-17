@@ -3832,6 +3832,7 @@ dependencies = [
  "base64 0.23.1",
  "bytecount",
  "chrono",
+ "core-foundation",
  "flate2",
  "home",
  "hostname",
@@ -3846,6 +3847,7 @@ dependencies = [
  "reqwest",
  "rusqlite",
  "schemars",
+ "security-framework",
  "semver",
  "serde",
  "serde_json",
@@ -3856,6 +3858,7 @@ dependencies = [
  "toml_edit",
  "vct-test-support",
  "walkdir",
+ "windows-sys 0.61.2",
  "zip",
  "zstd",
 ]

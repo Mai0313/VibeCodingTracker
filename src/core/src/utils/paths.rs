@@ -437,8 +437,11 @@ pub fn get_grok_auth_path() -> Result<PathBuf> {
     Ok(resolve_paths()?.grok_dir.join("auth.json"))
 }
 
-/// Returns the agy CLI's sign-in file
+/// Returns the agy CLI's fallback sign-in file
 /// (`~/.gemini/antigravity-cli/antigravity-oauth-token`).
+///
+/// On Windows and macOS agy stores its sign-in in the OS credential store
+/// instead unless that store is unavailable.
 ///
 /// # Errors
 ///
