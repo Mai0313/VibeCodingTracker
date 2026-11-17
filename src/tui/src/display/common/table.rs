@@ -97,7 +97,7 @@ pub const REPO_LABEL: &str = "Star on GitHub";
 pub const REPO_URL: &str = "https://github.com/Mai0313/VibeCodingTracker";
 
 /// The hints every tab's footer ends with.
-const CORE_HINTS: [(&str, &str); 3] = [("1-4/tab", "view"), ("?", "help"), ("q", "quit")];
+const CORE_HINTS: [(&str, &str); 3] = [("tab", "view"), ("?", "help"), ("q", "quit")];
 
 /// Builds the single-line key-hint footer with no status.
 ///
@@ -708,21 +708,21 @@ mod tests {
         // Wide: everything, the repo label at the right edge.
         let wide = render(120);
         assert!(wide.trim_end().ends_with("Star on GitHub"), "got {wide:?}");
-        assert!(wide.contains("[ ] range  1-4/tab view  ? help  q quit"));
+        assert!(wide.contains("[ ] range  tab view  ? help  q quit"));
 
         // The repo label goes first, then the tab's hints from the right, and
         // nothing is left half-drawn.
-        let narrow = render(52);
+        let narrow = render(48);
         assert!(!narrow.contains("Star"), "got {narrow:?}");
         assert!(!narrow.contains("range"), "got {narrow:?}");
         assert!(
-            narrow.contains("m merge  p providers  1-4/tab view  ? help  q quit"),
+            narrow.contains("m merge  p providers  tab view  ? help  q quit"),
             "got {narrow:?}"
         );
 
         // The common hints stay even when no tab hint fits.
-        let tiny = render(30);
-        assert_eq!(tiny.trim(), "1-4/tab view  ? help  q quit");
+        let tiny = render(26);
+        assert_eq!(tiny.trim(), "tab view  ? help  q quit");
     }
 
     #[test]
