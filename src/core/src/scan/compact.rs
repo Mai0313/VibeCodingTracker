@@ -11,7 +11,7 @@ use super::{ScanDiagnostics, ScanFeature};
 use crate::constants::FastHashSet;
 use crate::ledger::key::session_key;
 use crate::ledger::{
-    DayEntry, ProviderLedger, ScanStamp, SessionEntry, SessionLedger, stamp, today,
+    DayEntry, ProviderLedger, ScanStamp, SessionEntry, SessionLedger, TinyMap, stamp, today,
 };
 use crate::models::ExtensionType;
 use crate::models::TimeRange;
@@ -22,7 +22,6 @@ use crate::session::parser::parse_session_file_typed_as_with_diagnostics;
 use crate::utils::directory::{FileInfo, collect_provider_files_diagnostics};
 use anyhow::Result;
 use rayon::prelude::*;
-use std::collections::BTreeMap;
 use std::path::Path;
 
 /// The per-feature fold target: usage accumulates token maps, analysis
@@ -42,7 +41,7 @@ pub(crate) fn cutoff_string(time_range: TimeRange) -> Option<String> {
 /// Folds every day of `days` on or after `cutoff`.
 pub(crate) fn fold_days(
     provider: ExtensionType,
-    days: &BTreeMap<String, DayEntry>,
+    days: &TinyMap<String, DayEntry>,
     cutoff: Option<&str>,
     sink: &mut impl CompactSink,
 ) {

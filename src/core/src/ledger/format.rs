@@ -7,6 +7,7 @@
 //! priced is ever written: cost is computed at display time from the current
 //! pricing map.
 
+use super::tiny_map::TinyMap;
 use crate::constants::FastHashMap;
 use crate::models::{AggregatedAnalysisRow, CodeAnalysis};
 use crate::session::diagnostics::UsageTokenContribution;
@@ -107,7 +108,7 @@ pub(crate) struct ScanStamp {
     pub(crate) tiers: Option<String>,
     /// Every file the read depended on, by name; `None` is an optional sidecar
     /// that did not exist.
-    pub(crate) files: BTreeMap<String, Option<FileStamp>>,
+    pub(crate) files: TinyMap<String, Option<FileStamp>>,
     /// Whether the read produced usable data (a valid blank source included).
     #[serde(default = "default_true", skip_serializing_if = "Clone::clone")]
     pub(crate) parsed: bool,
@@ -123,7 +124,7 @@ fn default_true() -> bool {
 
 impl ScanStamp {
     /// A stamp for a read this build is about to do.
-    pub(crate) fn new(tiers: Option<String>, files: BTreeMap<String, Option<FileStamp>>) -> Self {
+    pub(crate) fn new(tiers: Option<String>, files: TinyMap<String, Option<FileStamp>>) -> Self {
         Self {
             parser: crate::VERSION.to_string(),
             tiers,
@@ -177,7 +178,7 @@ pub(crate) struct SessionEntry {
     /// date of its last modification; a database session has one per day it
     /// was active.
     #[serde(default)]
-    pub(crate) days: BTreeMap<String, DayEntry>,
+    pub(crate) days: TinyMap<String, DayEntry>,
     /// Local date on which the source was first found to be gone. Cleared if
     /// it comes back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -225,7 +226,7 @@ impl SessionEntry {
     /// keeping a day the re-read no longer produced would count that total
     /// twice. Retention is per session; a session the read still returns is
     /// exactly what the read says it is.
-    pub(crate) fn replace_half(&mut self, feature: ScanFeature, days: BTreeMap<String, DayEntry>) {
+    pub(crate) fn replace_half(&mut self, feature: ScanFeature, days: TinyMap<String, DayEntry>) {
         for day in self.days.values_mut() {
             day.clear_half(feature);
         }
@@ -252,16 +253,15 @@ pub(crate) struct DayEntry {
     /// Held as the JSON text they serialize to rather than as parsed trees:
     /// a whole ledger sits in memory for every refresh, a parsed object costs
     /// several times its text, and a fold re-parses a few hundred bytes per
-    /// model in microseconds. The text is compact even inside the pretty
-    /// ledger file, which also keeps one model's buckets on one line there.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub(crate) usage: BTreeMap<String, Box<RawValue>>,
+    /// model in microseconds.
+    #[serde(default, skip_serializing_if = "TinyMap::is_empty")]
+    pub(crate) usage: TinyMap<String, Box<RawValue>>,
     /// Per-model file-operation and tool-call counters.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub(crate) analysis: BTreeMap<String, AggregatedAnalysisRow>,
+    #[serde(default, skip_serializing_if = "TinyMap::is_empty")]
+    pub(crate) analysis: TinyMap<String, AggregatedAnalysisRow>,
     /// The cost the provider itself recorded, per model (OpenCode, Hermes).
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub(crate) stored_cost: BTreeMap<String, f64>,
+    #[serde(default, skip_serializing_if = "TinyMap::is_empty")]
+    pub(crate) stored_cost: TinyMap<String, f64>,
     #[serde(default)]
     pub(crate) active: ActiveFlags,
 }
@@ -417,7 +417,7 @@ fn empty_row(model: &str) -> AggregatedAnalysisRow {
     }
 }
 
-fn merge_model_usage(target: &mut BTreeMap<String, Box<RawValue>>, model: String, usage: Value) {
+fn merge_model_usage(target: &mut TinyMap<String, Box<RawValue>>, model: String, usage: Value) {
     let merged = match target.get(&model) {
         Some(existing) => {
             let mut value = DayEntry::usage_value(existing);
@@ -439,7 +439,7 @@ fn meaningful_usage(value: &Value) -> bool {
 /// Merges per-model counters into a model-keyed accumulator.
 pub(crate) fn merge_analysis_rows(
     target: &mut FastHashMap<String, AggregatedAnalysisRow>,
-    source: &BTreeMap<String, AggregatedAnalysisRow>,
+    source: &TinyMap<String, AggregatedAnalysisRow>,
 ) {
     for (model, row) in source {
         let entry = target
@@ -635,7 +635,7 @@ mod tests {
         );
         entry.replace_half(
             ScanFeature::Usage,
-            BTreeMap::from([("2026-09-02".to_string(), second)]),
+            TinyMap::from([("2026-09-02".to_string(), second)]),
         );
 
         let old = &entry.days["2026-09-01"];
@@ -655,7 +655,7 @@ mod tests {
 
     #[test]
     fn analysis_half_ignores_the_tier_snapshot() {
-        let files = BTreeMap::from([(
+        let files = TinyMap::from([(
             "session.jsonl".to_string(),
             Some(FileStamp {
                 modified: "2026-09-08T00:00:00.000000000Z".to_string(),
@@ -670,7 +670,7 @@ mod tests {
 
     #[test]
     fn file_parse_stamps_both_halves_but_tiers_only_on_usage() {
-        let stamp = ScanStamp::new(Some("abc".to_string()), BTreeMap::new());
+        let stamp = ScanStamp::new(Some("abc".to_string()), TinyMap::new());
         let entry = SessionEntry::from_file_parse(
             Some(analysis_with_usage(1)),
             true,

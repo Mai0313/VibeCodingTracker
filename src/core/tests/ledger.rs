@@ -503,10 +503,16 @@ fn a_stale_parser_stamp_rereads_present_sessions_and_keeps_missing_ones() {
         &home.paths.cache_dir.join(LEDGER_DIR_NAME),
         ExtensionType::ClaudeCode,
     );
-    let stale = std::fs::read_to_string(&path).unwrap().replace(
-        &format!("\"parser\": \"{}\"", vct_core::VERSION),
-        "\"parser\": \"0.0.0\"",
-    );
+    let stale = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace(
+            &format!("\"parser\":\"{}\"", vct_core::VERSION),
+            "\"parser\":\"0.0.0\"",
+        )
+        .replace(
+            &format!("\"parser\": \"{}\"", vct_core::VERSION),
+            "\"parser\": \"0.0.0\"",
+        );
     assert_ne!(stale, std::fs::read_to_string(&path).unwrap());
     std::fs::write(&path, stale).unwrap();
 

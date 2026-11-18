@@ -1,6 +1,7 @@
 //! Building read stamps from what is on disk right now.
 
 use super::format::FileStamp;
+use super::tiny_map::TinyMap;
 use crate::models::ExtensionType;
 use crate::pricing::TierThresholds;
 use crate::session::antigravity;
@@ -8,7 +9,6 @@ use crate::session::sqlite::{DatabaseFingerprint, append_suffix};
 use crate::utils::directory::FileInfo;
 use anyhow::Result;
 use chrono::SecondsFormat;
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::time::SystemTime;
@@ -20,8 +20,8 @@ use std::time::SystemTime;
 pub(crate) fn file_source(
     file: &FileInfo,
     provider: ExtensionType,
-) -> Result<BTreeMap<String, Option<FileStamp>>> {
-    let mut files = BTreeMap::new();
+) -> Result<TinyMap<String, Option<FileStamp>>> {
+    let mut files = TinyMap::new();
     files.insert(
         name_of(&file.path),
         Some(FileStamp {
@@ -50,8 +50,8 @@ pub(crate) fn file_source(
 }
 
 /// A SQLite database and its optional WAL.
-pub(crate) fn sqlite_source(db_path: &Path) -> Result<BTreeMap<String, Option<FileStamp>>> {
-    let mut files = BTreeMap::new();
+pub(crate) fn sqlite_source(db_path: &Path) -> Result<TinyMap<String, Option<FileStamp>>> {
+    let mut files = TinyMap::new();
     files.insert(name_of(db_path), Some(required_stamp(db_path)?));
     let wal = append_suffix(db_path, "-wal");
     files.insert(name_of(&wal), optional_stamp(&wal)?);
@@ -64,7 +64,7 @@ pub(crate) fn sqlite_source(db_path: &Path) -> Result<BTreeMap<String, Option<Fi
 /// scan; the fingerprint captured around that read is what goes into every
 /// store's stamp, so a store can never pair model map A with fingerprint B.
 pub(crate) fn add_dependency(
-    files: &mut BTreeMap<String, Option<FileStamp>>,
+    files: &mut TinyMap<String, Option<FileStamp>>,
     db_path: &Path,
     fingerprint: Option<&DatabaseFingerprint>,
 ) {
@@ -143,11 +143,11 @@ mod tests {
         std::fs::write(&tracking, b"model-a").unwrap();
         let snapshot = crate::session::sqlite::database_fingerprint(&tracking).unwrap();
 
-        let mut paired = BTreeMap::new();
+        let mut paired = TinyMap::new();
         add_dependency(&mut paired, &tracking, Some(&snapshot));
         std::fs::write(&tracking, b"model-b-longer").unwrap();
         let current = crate::session::sqlite::database_fingerprint(&tracking).unwrap();
-        let mut changed = BTreeMap::new();
+        let mut changed = TinyMap::new();
         add_dependency(&mut changed, &tracking, Some(&current));
 
         assert_ne!(paired, changed);

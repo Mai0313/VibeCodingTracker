@@ -10,7 +10,7 @@
 use super::compact::{CompactSink, cutoff_string, fold_days};
 use super::{ScanDiagnostics, ScanFeature};
 use crate::constants::FastHashSet;
-use crate::ledger::{DayEntry, ProviderLedger, ScanStamp, SessionLedger, stamp, today};
+use crate::ledger::{DayEntry, ProviderLedger, ScanStamp, SessionLedger, TinyMap, stamp, today};
 use crate::models::{ExtensionType, TimeRange};
 use crate::session::diagnostics::{DatabaseAnalysisRow, DatabaseUsageRead};
 use crate::session::sqlite::is_cacheable_sqlite_failure;
@@ -32,7 +32,7 @@ pub(crate) struct DatabaseHalfRead {
 #[derive(Default)]
 pub(crate) struct SessionRead {
     pub(crate) cwd: Option<String>,
-    pub(crate) days: BTreeMap<String, DayEntry>,
+    pub(crate) days: TinyMap<String, DayEntry>,
 }
 
 /// Groups a usage read's rows by session and day.
