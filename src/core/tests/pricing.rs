@@ -321,6 +321,186 @@ fn normalized_collision_fallback_is_deterministic() {
 }
 
 #[test]
+fn normalized_collisions_prefer_official_vendor_over_reseller_prefixes() {
+    clear_pricing_cache();
+
+    let mut raw_map = HashMap::new();
+    raw_map.insert("kyma/gemini-4-argon".to_string(), pricing_at(5.4));
+    raw_map.insert("gemini/gemini-4-argon".to_string(), pricing_at(2.0));
+    raw_map.insert("vertex_ai/gemini-4-argon".to_string(), pricing_at(2.1));
+    raw_map.insert("azure/mistral-large-latest".to_string(), pricing_at(8.0));
+    raw_map.insert("mistral/mistral-large-latest".to_string(), pricing_at(0.7));
+    let pricing_map = ModelPricingMap::new(raw_map);
+
+    let gemini = pricing_map.get("gemini-4-argon");
+    assert_eq!(gemini.pricing.input_cost_per_token, 2.0);
+    assert_eq!(
+        gemini.matched_model.as_deref(),
+        Some("gemini/gemini-4-argon")
+    );
+
+    let mistral = pricing_map.get("mistral-large-latest");
+    assert_eq!(mistral.pricing.input_cost_per_token, 0.7);
+    assert_eq!(
+        mistral.matched_model.as_deref(),
+        Some("mistral/mistral-large-latest")
+    );
+}
+
+#[test]
+fn multi_vendor_cloud_prefixes_only_count_as_official_for_their_own_models() {
+    clear_pricing_cache();
+
+    let mut raw_map = HashMap::new();
+    raw_map.insert("dashscope/glm-5.2".to_string(), pricing_at(1.8));
+    raw_map.insert("mistral/glm-5.2".to_string(), pricing_at(1.9));
+    raw_map.insert("perplexity/glm-5.2".to_string(), pricing_at(2.0));
+    raw_map.insert("tencent/glm-5.2".to_string(), pricing_at(2.1));
+    raw_map.insert("vertex_ai/glm-5.2".to_string(), pricing_at(2.2));
+    raw_map.insert("zai/glm-5.2".to_string(), pricing_at(1.4));
+    raw_map.insert("dashscope/qwen3.8-max".to_string(), pricing_at(2.0));
+    raw_map.insert("aihubmix/qwen3.8-max".to_string(), pricing_at(1.69));
+    raw_map.insert("mistral/codestral-2508".to_string(), pricing_at(0.3));
+    raw_map.insert("aihubmix/codestral-2508".to_string(), pricing_at(0.5));
+    raw_map.insert("vertex_ai/gemma-4-26b-a4b-it".to_string(), pricing_at(0.15));
+    raw_map.insert("aihubmix/gemma-4-26b-a4b-it".to_string(), pricing_at(0.14));
+    raw_map.insert("perplexity/sonar-pro".to_string(), pricing_at(3.0));
+    raw_map.insert("kyma/sonar-pro".to_string(), pricing_at(4.05));
+    raw_map.insert("tencent/hy4-preview".to_string(), pricing_at(0.417));
+    raw_map.insert("aihubmix/hy4-preview".to_string(), pricing_at(0.845));
+    let pricing_map = ModelPricingMap::new(raw_map);
+
+    // Every multi-vendor prefix sorts before `zai/` lexically, so any of them
+    // qualifying on a non-owned model would steal `glm-5.2` from `zai/`.
+    assert_eq!(
+        pricing_map.get("glm-5.2").matched_model.as_deref(),
+        Some("zai/glm-5.2")
+    );
+    assert_eq!(
+        pricing_map.get("qwen3.8-max").matched_model.as_deref(),
+        Some("dashscope/qwen3.8-max")
+    );
+    assert_eq!(
+        pricing_map.get("codestral-2508").matched_model.as_deref(),
+        Some("mistral/codestral-2508")
+    );
+    assert_eq!(
+        pricing_map
+            .get("gemma-4-26b-a4b-it")
+            .matched_model
+            .as_deref(),
+        Some("vertex_ai/gemma-4-26b-a4b-it")
+    );
+    assert_eq!(
+        pricing_map.get("sonar-pro").matched_model.as_deref(),
+        Some("perplexity/sonar-pro")
+    );
+    assert_eq!(
+        pricing_map.get("hy4-preview").matched_model.as_deref(),
+        Some("tencent/hy4-preview")
+    );
+}
+
+#[test]
+fn versioned_normalized_collisions_preserve_same_unprefixed_and_official_order() {
+    clear_pricing_cache();
+
+    // All candidates are versioned (`tier_group == 1`), with `anthropic/` <
+    // `claude-...` < `cloudflare/` < `openrouter/` lexically so lexical order
+    // opposes `same_provider` (0) < `unprefixed` (1) < `official` (2).
+    let mut same_vs_unprefixed = HashMap::new();
+    same_vs_unprefixed.insert(
+        "anthropic/claude-3-7-sonnet-20250219".to_string(),
+        pricing_at(3.1),
+    );
+    same_vs_unprefixed.insert("claude-3-7-sonnet-20250219".to_string(), pricing_at(3.0));
+    same_vs_unprefixed.insert(
+        "cloudflare/claude-3-7-sonnet-20250219".to_string(),
+        pricing_at(3.4),
+    );
+    same_vs_unprefixed.insert(
+        "openrouter/claude-3-7-sonnet-20250219".to_string(),
+        pricing_at(3.2),
+    );
+    let same_vs_unprefixed = ModelPricingMap::new(same_vs_unprefixed);
+    assert_eq!(
+        same_vs_unprefixed
+            .get("openrouter/claude-3-7-sonnet-20250301")
+            .matched_model
+            .as_deref(),
+        Some("openrouter/claude-3-7-sonnet-20250219")
+    );
+    assert_eq!(
+        same_vs_unprefixed
+            .get("bedrock/claude-3-7-sonnet-20250301")
+            .matched_model
+            .as_deref(),
+        Some("claude-3-7-sonnet-20250219")
+    );
+
+    // Versioned unprefixed canonical entry beats unsuffixed reseller.
+    let mut unprefixed = HashMap::new();
+    unprefixed.insert("aihubmix/claude-3-7-sonnet".to_string(), pricing_at(3.5));
+    unprefixed.insert("claude-3-7-sonnet-20250219".to_string(), pricing_at(3.0));
+    let unprefixed = ModelPricingMap::new(unprefixed);
+    assert_eq!(
+        unprefixed.get("claude-3-7-sonnet").matched_model.as_deref(),
+        Some("claude-3-7-sonnet-20250219")
+    );
+
+    // Versioned official vendor beats lexically-earlier reseller.
+    let mut official = HashMap::new();
+    official.insert("aihubmix/deepseek-v3.1".to_string(), pricing_at(0.58));
+    official.insert("deepseek/deepseek-v3.2".to_string(), pricing_at(0.28));
+    let official = ModelPricingMap::new(official);
+    assert_eq!(
+        official.get("deepseek-v3").matched_model.as_deref(),
+        Some("deepseek/deepseek-v3.2")
+    );
+}
+
+#[test]
+fn normalized_collisions_ignore_provider_prefix_length_and_prefer_unsuffixed_base() {
+    clear_pricing_cache();
+
+    let mut raw_map = HashMap::new();
+    raw_map.insert("kyma/claude-opus-5.5".to_string(), pricing_at(5.4));
+    raw_map.insert(
+        "github_copilot/claude-opus-5.5".to_string(),
+        pricing_at(4.0),
+    );
+    raw_map.insert("llamagate/mistral-7b-v0.3".to_string(), pricing_at(0.1));
+    raw_map.insert("snowflake/mistral-7b".to_string(), pricing_at(0.15));
+    let pricing_map = ModelPricingMap::new(raw_map);
+
+    let opus = pricing_map.get("claude-opus-5.5");
+    assert_eq!(opus.pricing.input_cost_per_token, 4.0);
+    assert_eq!(
+        opus.matched_model.as_deref(),
+        Some("github_copilot/claude-opus-5.5")
+    );
+
+    let dated = pricing_map.get("mistral-7b-20260101");
+    assert_eq!(dated.pricing.input_cost_per_token, 0.15);
+    assert_eq!(dated.matched_model.as_deref(), Some("snowflake/mistral-7b"));
+}
+
+#[test]
+fn substring_matching_prefers_official_vendor_over_reseller() {
+    clear_pricing_cache();
+
+    let mut raw_map = HashMap::new();
+    raw_map.insert("aihubmix/grok-4.6".to_string(), pricing_at(2.5));
+    raw_map.insert("kyma/grok-4.6".to_string(), pricing_at(2.758));
+    raw_map.insert("xai/grok-4.6".to_string(), pricing_at(2.0));
+    let pricing_map = ModelPricingMap::new(raw_map);
+
+    let result = pricing_map.get("grok-4.6-fast");
+    assert_eq!(result.pricing.input_cost_per_token, 2.0);
+    assert_eq!(result.matched_model.as_deref(), Some("xai/grok-4.6"));
+}
+
+#[test]
 fn test_model_pricing_substring_match() {
     clear_pricing_cache();
 
