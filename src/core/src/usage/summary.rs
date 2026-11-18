@@ -5,7 +5,7 @@
 //! totals). Terminal-free business logic, so the display layer only renders
 //! the result.
 
-use crate::models::{PerProviderUsage, ProviderActiveDays, UsageResult};
+use crate::models::{PerProviderUsage, Provider, ProviderActiveDays, UsageResult};
 use crate::pricing::CostSource;
 use crate::usage::StoredCosts;
 use serde_json::Value;
@@ -41,6 +41,17 @@ impl ProviderPricing<'_> {
     }
 }
 
+/// One provider's contribution to a [`UsageRow`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelProviderUsage {
+    /// Provider that produced these tokens.
+    pub provider: Provider,
+    /// Total tokens attributed to this provider for this model.
+    pub total_tokens: i64,
+    /// Resolved USD cost for this provider's portion of the model.
+    pub cost: f64,
+}
+
 /// One priced per-model row of a [`UsageSummary`].
 ///
 /// `output_tokens` and `reasoning_tokens` are disjoint buckets that both feed
@@ -51,7 +62,8 @@ pub struct UsageRow {
     /// Raw model name as reported by the session (the pricing-lookup key).
     pub model: String,
     /// The LiteLLM key actually used to price this row, when it differed from
-    /// `model`; `None` on an exact match, when unpriced, or after prefix merging.
+    /// `model`; `None` on an exact match, when unpriced, or when multiple
+    /// variants merged.
     pub matched_model: Option<String>,
     /// Prompt (input) tokens.
     pub input_tokens: i64,
@@ -63,10 +75,25 @@ pub struct UsageRow {
     pub cache_read: i64,
     /// Tokens written to the prompt cache.
     pub cache_creation: i64,
+    /// Cache-write tokens at the default 5-minute TTL.
+    pub cache_creation_5m: i64,
+    /// Cache-write tokens at the extended 1-hour TTL.
+    pub cache_creation_1h: i64,
+    /// Provider-reported tool payload tokens (Gemini `tool_tokens`).
+    pub tool_tokens: i64,
+    /// Subset of tokens billed at elevated long-context price levels.
+    pub above_tier_tokens: i64,
+    /// Server-side web-search queries billed separately from tokens.
+    pub web_search_requests: i64,
     /// Sum of all token buckets for this model.
     pub total: i64,
     /// LiteLLM-priced cost in USD for this model's tokens.
     pub cost: f64,
+    /// Per-provider breakdown for this model, sorted by descending cost.
+    pub providers: Vec<ModelProviderUsage>,
+    /// Raw model names folded into this row by [`merge_rows_by_base_model`],
+    /// populated when more than one variant merged or a prefix was stripped.
+    pub variants: Vec<String>,
 }
 
 impl UsageRow {
@@ -304,10 +331,20 @@ pub fn build_usage_summary(
     summary.rows.reserve(usage_data.len());
 
     for (model, usage) in usage_data.iter() {
-        let (cost, matched_model) =
-            crate::usage::resolve_merged_model_cost(model, per_provider, pricing_map, stored_costs)
-                .unwrap_or_else(|| price_usage(model, usage, pricing_map, CostSource::Litellm));
-        let row = build_usage_row(model, usage, cost, matched_model);
+        let (cost, matched_model, providers) = match crate::usage::resolve_merged_model_breakdown(
+            model,
+            per_provider,
+            pricing_map,
+            stored_costs,
+        ) {
+            Some(resolved) => (resolved.cost, resolved.matched_model, resolved.providers),
+            None => {
+                let (cost, matched) = price_usage(model, usage, pricing_map, CostSource::Litellm);
+                (cost, matched, Vec::new())
+            }
+        };
+        let mut row = build_usage_row(model, usage, cost, matched_model);
+        row.providers = providers;
         summary.rows.push(row);
     }
 
@@ -385,6 +422,18 @@ fn build_usage_row_from_counts(
     cost: f64,
     matched_model: Option<String>,
 ) -> UsageRow {
+    let above_tier_tokens = counts
+        .above_tiers
+        .iter()
+        .map(|s| {
+            s.input_tokens
+                + s.output_tokens
+                + s.reasoning_tokens
+                + s.cache_read
+                + s.cache_creation_5m
+                + s.cache_creation_1h
+        })
+        .sum();
     UsageRow {
         model: model.to_string(),
         matched_model,
@@ -393,8 +442,15 @@ fn build_usage_row_from_counts(
         reasoning_tokens: counts.reasoning_tokens,
         cache_read: counts.cache_read,
         cache_creation: counts.cache_creation,
+        cache_creation_5m: counts.cache_creation_5m,
+        cache_creation_1h: counts.cache_creation_1h,
+        tool_tokens: counts.tool_tokens,
+        above_tier_tokens,
+        web_search_requests: counts.web_search_requests,
         total: counts.total,
         cost,
+        providers: Vec::new(),
+        variants: Vec::new(),
     }
 }
 
@@ -413,10 +469,12 @@ fn base_model_key(model: &str) -> &str {
 /// Costs are summed verbatim rather than re-derived: each input row was already
 /// priced against its full model name, so a merged `gpt-5.5` adds the
 /// differently-priced `openai/gpt-5.5`, `azure/gpt-5.5` and bare `gpt-5.5`
-/// pieces. The prefix is dropped even from a model with no duplicate
-/// (`opencode/big-pickle` -> `big-pickle`), which also clears any
-/// `matched_model` the row carried. The result is re-sorted by ascending cost,
-/// tie-broken by model name, matching [`build_usage_summary`].
+/// pieces. Per-provider contributions are folded by provider, and the folded
+/// raw model names are kept in [`UsageRow::variants`] whenever more than one
+/// variant merged or a prefix was stripped. A single stripped row keeps its
+/// `matched_model` when that key still differs from the stripped base name.
+/// The result is re-sorted by ascending cost, tie-broken by model name,
+/// matching [`build_usage_summary`].
 pub fn merge_rows_by_base_model(rows: &[UsageRow]) -> Vec<UsageRow> {
     use std::collections::HashMap;
 
@@ -429,9 +487,35 @@ pub fn merge_rows_by_base_model(rows: &[UsageRow]) -> Vec<UsageRow> {
     }
 
     let mut merged: Vec<UsageRow> = Vec::with_capacity(groups.len());
-    for (key, members) in groups {
+    for (key, mut members) in groups {
+        members.sort_by(|a, b| {
+            b.cost
+                .partial_cmp(&a.cost)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.model.cmp(&b.model))
+        });
+
+        let matched_model = if members.len() == 1 {
+            members[0]
+                .matched_model
+                .as_ref()
+                .filter(|matched| matched.as_str() != key)
+                .cloned()
+        } else {
+            None
+        };
+
+        let variants = if members.len() > 1 || members.first().is_some_and(|m| m.model != key) {
+            members.iter().map(|m| m.model.clone()).collect()
+        } else {
+            Vec::new()
+        };
+
+        let mut provider_acc: HashMap<Provider, (i64, f64)> = HashMap::new();
         let mut acc = UsageRow {
             model: key.to_string(),
+            matched_model,
+            variants,
             ..UsageRow::default()
         };
         for m in members {
@@ -440,9 +524,35 @@ pub fn merge_rows_by_base_model(rows: &[UsageRow]) -> Vec<UsageRow> {
             acc.reasoning_tokens += m.reasoning_tokens;
             acc.cache_read += m.cache_read;
             acc.cache_creation += m.cache_creation;
+            acc.cache_creation_5m += m.cache_creation_5m;
+            acc.cache_creation_1h += m.cache_creation_1h;
+            acc.tool_tokens += m.tool_tokens;
+            acc.above_tier_tokens += m.above_tier_tokens;
+            acc.web_search_requests += m.web_search_requests;
             acc.total += m.total;
             acc.cost += m.cost;
+            for p in &m.providers {
+                let entry = provider_acc.entry(p.provider).or_insert((0, 0.0));
+                entry.0 += p.total_tokens;
+                entry.1 += p.cost;
+            }
         }
+        let mut providers: Vec<ModelProviderUsage> = provider_acc
+            .into_iter()
+            .map(|(provider, (total_tokens, cost))| ModelProviderUsage {
+                provider,
+                total_tokens,
+                cost,
+            })
+            .collect();
+        providers.sort_by(|a, b| {
+            b.cost
+                .partial_cmp(&a.cost)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.total_tokens.cmp(&a.total_tokens))
+                .then_with(|| a.provider.display_name().cmp(b.provider.display_name()))
+        });
+        acc.providers = providers;
         merged.push(acc);
     }
 
@@ -619,11 +729,25 @@ mod tests {
 
     #[test]
     fn merge_collapses_prefixed_and_bare_names_and_sums() {
-        let rows = vec![
-            row("openai/gpt-5.5", 100, 100, 0.20),
-            row("azure/gpt-5.5", 200, 200, 3.00),
-            row("gpt-5.5", 300, 300, 5.00),
-        ];
+        let mut r1 = row("openai/gpt-5.5", 100, 100, 0.20);
+        r1.providers = vec![ModelProviderUsage {
+            provider: Provider::OpenCode,
+            total_tokens: 100,
+            cost: 0.20,
+        }];
+        let mut r2 = row("azure/gpt-5.5", 200, 200, 3.00);
+        r2.providers = vec![ModelProviderUsage {
+            provider: Provider::OpenCode,
+            total_tokens: 200,
+            cost: 3.00,
+        }];
+        let mut r3 = row("gpt-5.5", 300, 300, 5.00);
+        r3.providers = vec![ModelProviderUsage {
+            provider: Provider::Codex,
+            total_tokens: 300,
+            cost: 5.00,
+        }];
+        let rows = vec![r1, r2, r3];
 
         let merged = merge_rows_by_base_model(&rows);
 
@@ -634,6 +758,16 @@ mod tests {
         assert_eq!(m.input_tokens, 600);
         assert_eq!(m.total, 600);
         assert!((m.cost - 8.20).abs() < 1e-9);
+        assert_eq!(
+            m.variants,
+            vec!["gpt-5.5", "azure/gpt-5.5", "openai/gpt-5.5"]
+        );
+        assert_eq!(m.providers.len(), 2);
+        assert_eq!(m.providers[0].provider, Provider::Codex);
+        assert!((m.providers[0].cost - 5.00).abs() < 1e-9);
+        assert_eq!(m.providers[1].provider, Provider::OpenCode);
+        assert_eq!(m.providers[1].total_tokens, 300);
+        assert!((m.providers[1].cost - 3.20).abs() < 1e-9);
     }
 
     #[test]
@@ -655,9 +789,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_strips_prefix_from_single_row() {
-        // Even a model with no duplicate drops its provider prefix (and any
-        // fuzzy-match hint) so the merged view reads uniformly.
+    fn merge_strips_prefix_from_single_row_and_keeps_distinct_pricing_match() {
         let mut only = row("deepseek/deepseek-v4-pro", 5, 5, 1.5);
         only.matched_model = Some("deepseek-v4".to_string());
 
@@ -665,8 +797,16 @@ mod tests {
 
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].model, "deepseek-v4-pro");
-        assert_eq!(merged[0].matched_model, None);
+        assert_eq!(merged[0].matched_model.as_deref(), Some("deepseek-v4"));
+        assert_eq!(merged[0].variants, vec!["deepseek/deepseek-v4-pro"]);
         assert_eq!(merged[0].total, 5);
+
+        // When the matched key equals the stripped base name, it is dropped so
+        // Details never shows a redundant `Priced as` identical to the heading.
+        let mut exact_after_strip = row("openai/gpt-5.5", 5, 5, 1.5);
+        exact_after_strip.matched_model = Some("gpt-5.5".to_string());
+        let merged_exact = merge_rows_by_base_model(std::slice::from_ref(&exact_after_strip));
+        assert_eq!(merged_exact[0].matched_model, None);
     }
 
     #[test]

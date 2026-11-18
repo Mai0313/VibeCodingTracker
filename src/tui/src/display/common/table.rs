@@ -392,12 +392,45 @@ pub fn render_scrollable_table(
     );
 }
 
+/// One line inside a [`DetailSection`].
+pub enum DetailItem {
+    /// Standard `label ... value` metric row.
+    Stat { label: &'static str, value: String },
+    /// Provider attribution row with a colored `●` dot before `label`.
+    Provider {
+        color: RatatuiColor,
+        label: &'static str,
+        value: String,
+    },
+}
+
+/// A titled group of rows rendered inside [`render_detail_panel`].
+pub struct DetailSection {
+    /// Section header shown above `items`.
+    pub heading: &'static str,
+    /// Rows belonging to this section; an empty section is skipped.
+    pub items: Vec<DetailItem>,
+}
+
+/// Appends right-aligned wrapped value lines inside `inner_w` columns.
+fn push_wrapped_value(lines: &mut Vec<Line<'static>>, value: &str, inner_w: usize) {
+    let chars: Vec<char> = value.chars().collect();
+    let wrap_w = inner_w.saturating_sub(2).max(1);
+    for chunk in chars.chunks(wrap_w) {
+        let text: String = chunk.iter().collect();
+        let pad = inner_w.saturating_sub(chunk.len());
+        lines.push(Line::from(format!(" {}{text}", " ".repeat(pad))));
+    }
+}
+
 /// Draws a centered panel over `area` with the details of one table row:
-/// `name` in full, wrapped where it is wider than the panel, then `label
-/// value` rows. Closed with `Esc`.
-pub fn render_detail_panel(f: &mut Frame, area: Rect, name: &str, rows: &[(&str, String)]) {
+/// `name` in full, wrapped where it is wider than the panel, followed by each
+/// non-empty [`DetailSection`]. Lines that do not fit a short terminal are
+/// counted in the title and at the bottom rather than clipped silently. Closed
+/// with `Esc`.
+pub fn render_detail_panel(f: &mut Frame, area: Rect, name: &str, sections: &[DetailSection]) {
     let theme = theme();
-    let width = area.width.saturating_sub(4).min(52);
+    let width = area.width.saturating_sub(4).min(62);
     let inner_w = usize::from(width.saturating_sub(4)).max(1);
     let name: Vec<char> = name.chars().collect();
     let mut lines: Vec<Line> = name
@@ -409,31 +442,98 @@ pub fn render_detail_panel(f: &mut Frame, area: Rect, name: &str, rows: &[(&str,
             ))
         })
         .collect();
-    lines.push(Line::default());
-    for (label, value) in rows {
-        if label.chars().count() + 1 + value.chars().count() <= inner_w {
-            let pad = inner_w.saturating_sub(label.chars().count() + value.chars().count());
-            lines.push(Line::from(vec![
-                Span::styled(format!(" {label}"), theme.dim()),
-                Span::raw(" ".repeat(pad)),
-                Span::raw(value.clone()),
-            ]));
-        } else {
-            lines.push(Line::from(Span::styled(format!(" {label}"), theme.dim())));
-            let chars: Vec<char> = value.chars().collect();
-            for chunk in chars.chunks(inner_w) {
-                let text: String = chunk.iter().collect();
-                let pad = inner_w.saturating_sub(chunk.len());
-                lines.push(Line::from(format!(" {}{text}", " ".repeat(pad))));
+
+    for section in sections.iter().filter(|s| !s.items.is_empty()) {
+        lines.push(Line::default());
+        let heading: String = section.heading.chars().take(inner_w).collect();
+        lines.push(Line::from(Span::styled(
+            format!(" {heading}"),
+            theme.accent().bold(),
+        )));
+        for item in &section.items {
+            match item {
+                DetailItem::Stat { label, value } => {
+                    let lhs_w = 1 + label.chars().count();
+                    let val_w = value.chars().count();
+                    if lhs_w + 2 + val_w <= inner_w {
+                        let pad = inner_w - lhs_w - val_w;
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("  {label}"), theme.dim()),
+                            Span::raw(" ".repeat(pad)),
+                            Span::raw(value.clone()),
+                        ]));
+                    } else {
+                        lines.push(Line::from(Span::styled(format!("  {label}"), theme.dim())));
+                        push_wrapped_value(&mut lines, value, inner_w);
+                    }
+                }
+                DetailItem::Provider {
+                    color,
+                    label,
+                    value,
+                } => {
+                    let lhs_w = 3 + label.chars().count();
+                    let val_w = value.chars().count();
+                    if lhs_w + 2 + val_w <= inner_w {
+                        let pad = inner_w - lhs_w - val_w;
+                        lines.push(Line::from(vec![
+                            Span::raw("  "),
+                            Span::styled("● ", Style::default().fg(*color)),
+                            Span::raw(*label),
+                            Span::raw(" ".repeat(pad)),
+                            Span::raw(value.clone()),
+                        ]));
+                    } else {
+                        lines.push(Line::from(vec![
+                            Span::raw("  "),
+                            Span::styled("● ", Style::default().fg(*color)),
+                            Span::raw(*label),
+                        ]));
+                        push_wrapped_value(&mut lines, value, inner_w);
+                    }
+                }
             }
         }
     }
-    let height = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
+
+    let max_h = area.height.saturating_sub(2);
+    let capacity = usize::from(max_h.saturating_sub(2));
+    let mut hidden = 0usize;
+    if lines.len() > capacity {
+        if capacity >= 2 {
+            let kept = capacity - 1;
+            hidden = lines[kept..]
+                .iter()
+                .filter(|line| !line.spans.is_empty())
+                .count()
+                .max(1);
+            lines.truncate(kept);
+            lines.push(Line::from(Span::styled(
+                format!(" +{hidden} more"),
+                theme.dim(),
+            )));
+        } else {
+            hidden = lines
+                .iter()
+                .skip(capacity)
+                .filter(|line| !line.spans.is_empty())
+                .count()
+                .max(1);
+            lines.truncate(capacity);
+        }
+    }
+
+    let height = (lines.len() as u16 + 2).min(max_h);
     let rect = Rect {
-        x: area.x + (area.width - width) / 2,
-        y: area.y + (area.height - height) / 2,
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
         width,
         height,
+    };
+    let flag = if hidden > 0 {
+        format!(" +{hidden} · esc close ")
+    } else {
+        " esc close ".to_string()
     };
     f.render_widget(Clear, rect);
     f.render_widget(
@@ -442,7 +542,7 @@ pub fn render_detail_panel(f: &mut Frame, area: Rect, name: &str, rows: &[(&str,
                 .borders(Borders::ALL)
                 .border_style(theme.accent())
                 .title(Line::from(Span::styled(" Details ", theme.title())))
-                .title(Line::from(Span::styled(" esc close ", theme.dim())).right_aligned()),
+                .title(Line::from(Span::styled(flag, theme.dim())).right_aligned()),
         ),
         rect,
     );
@@ -737,32 +837,77 @@ mod tests {
 
     #[test]
     fn the_detail_panel_shows_a_long_name_in_full() {
-        use ratatui::{Terminal, backend::TestBackend};
+        use super::{DetailItem, DetailSection};
+        use ratatui::{Terminal, backend::TestBackend, style::Color};
         let name = "fireworks-ai/accounts/fireworks/models/qwen3-coder-480k-a35b-instruct";
         let matched = "openrouter/qwen/qwen3-coder-480b-a35b-instruct-fp8-nitro";
-        let mut terminal = Terminal::new(TestBackend::new(80, 18)).unwrap();
+        let sections = [
+            DetailSection {
+                heading: "Providers",
+                items: vec![DetailItem::Provider {
+                    color: Color::Red,
+                    label: "OpenCode",
+                    value: "12.0K tok · $1.00".to_string(),
+                }],
+            },
+            DetailSection {
+                heading: "Cost & Share",
+                items: vec![
+                    DetailItem::Stat {
+                        label: "Cost",
+                        value: "$1.00".to_string(),
+                    },
+                    DetailItem::Stat {
+                        label: "Priced as",
+                        value: matched.to_string(),
+                    },
+                ],
+            },
+        ];
+        let mut terminal = Terminal::new(TestBackend::new(80, 22)).unwrap();
         terminal
             .draw(|f| {
-                super::render_detail_panel(
-                    f,
-                    f.area(),
-                    name,
-                    &[
-                        ("Cost", "$1.00".to_string()),
-                        ("Priced as", matched.to_string()),
-                    ],
-                );
+                super::render_detail_panel(f, f.area(), name, &sections);
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
-        let shown: String = (0..18)
+        let shown: String = (0..22)
             .flat_map(|y| (0..80).map(move |x| (x, y)))
             .map(|(x, y)| buffer[(x, y)].symbol())
             .filter(|symbol| !matches!(*symbol, " " | "│"))
             .collect();
         assert!(shown.contains(name), "{shown}");
+        assert!(shown.contains("●OpenCode"), "{shown}");
         assert!(shown.contains("Cost$1.00"), "{shown}");
         assert!(shown.contains(matched), "{shown}");
+    }
+
+    #[test]
+    fn the_detail_panel_counts_lines_hidden_by_a_short_terminal() {
+        use super::{DetailItem, DetailSection};
+        use ratatui::{Terminal, backend::TestBackend};
+        let sections = [DetailSection {
+            heading: "Tokens",
+            items: (0..10)
+                .map(|i| DetailItem::Stat {
+                    label: "Input",
+                    value: format!("{i}"),
+                })
+                .collect(),
+        }];
+        let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
+        terminal
+            .draw(|f| {
+                super::render_detail_panel(f, f.area(), "claude-sonnet-4-6", &sections);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let shown: String = (0..10)
+            .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(shown.contains("· esc close"), "got:\n{shown}");
+        assert!(shown.contains("more"), "got:\n{shown}");
     }
 
     #[test]

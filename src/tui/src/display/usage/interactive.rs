@@ -5,14 +5,14 @@
 //! display state between frames, so a resize repaints without re-aggregating,
 //! and highlights rows whose tokens changed since the last scan.
 
-use crate::display::common::ProviderTotal;
 use crate::display::common::table::{
-    ColumnSpec, TableChrome, aligned_cells, create_controls_with_status, create_provider_row,
-    create_ratatui_table, fit_columns, frame_layout, render_detail_panel, render_scrollable_table,
-    render_too_small,
+    ColumnSpec, DetailItem, DetailSection, TableChrome, aligned_cells, create_controls_with_status,
+    create_provider_row, create_ratatui_table, fit_columns, frame_layout, render_detail_panel,
+    render_scrollable_table, render_too_small,
 };
 use crate::display::common::theme::theme;
 use crate::display::common::tui::{LEDGER_SAVE_INTERVAL, NavDelta, ScrollState, UpdateTracker};
+use crate::display::common::{ProviderTotal, provider_tui_color};
 use crate::display::usage::averages::{
     ProviderStats, UsageProviderTotals, UsageRow, UsageTotals, build_provider_total_rows,
     build_usage_summary, merge_rows_by_base_model,
@@ -933,34 +933,164 @@ fn draw_usage_view(
         render_provider_panel(f, area, &provider_rows);
     }
     if detail_open && let Some(row) = scroll.table.selected().and_then(|at| rows_data.get(at)) {
-        let share = |part: f64, whole: f64| {
-            if whole > 0.0 {
-                format!("{:.1}%", part / whole * 100.0)
-            } else {
-                "-".to_string()
-            }
-        };
-        let mut details = vec![
-            ("Input", format_number(row.input_tokens)),
-            ("Output", format_number(row.output_tokens)),
-            ("Reasoning", format_number(row.reasoning_tokens)),
-            ("Cache read", format_number(row.cache_read)),
-            ("Cache write", format_number(row.cache_creation)),
-            ("Total tokens", format_number(row.total)),
-            ("Cost", format_cost(row.cost)),
-        ];
-        if let Some(matched) = &row.matched_model {
-            details.push(("Priced as", matched.clone()));
-        }
-        details.extend([
-            ("Share of cost", share(row.cost, totals.cost)),
-            (
-                "Share of tokens",
-                share(row.total as f64, totals.total as f64),
-            ),
-        ]);
-        render_detail_panel(f, area, &row.model, &details);
+        let sections = build_usage_detail_sections(row, totals);
+        render_detail_panel(f, area, &row.model, &sections);
     }
+}
+
+/// Builds the structured sections for one usage row's `Details` panel.
+fn build_usage_detail_sections(row: &UsageRow, totals: &UsageTotals) -> Vec<DetailSection> {
+    let share = |part: f64, whole: f64| {
+        if whole > 0.0 {
+            format!("{:.1}%", part / whole * 100.0)
+        } else {
+            "-".to_string()
+        }
+    };
+
+    let providers: Vec<DetailItem> = row
+        .providers
+        .iter()
+        .map(|entry| DetailItem::Provider {
+            color: provider_tui_color(entry.provider),
+            label: entry.provider.display_name(),
+            value: format!(
+                "{} tok · {}",
+                format_compact(entry.total_tokens),
+                format_cost(entry.cost)
+            ),
+        })
+        .collect();
+
+    let mut cost_items = vec![DetailItem::Stat {
+        label: "Cost",
+        value: format_cost(row.cost),
+    }];
+    if row.total > 0 && row.cost > 0.0 {
+        let per_million = row.cost / (row.total as f64 / 1_000_000.0);
+        let rate = if per_million < 0.01 {
+            format!("${per_million:.4} / 1M")
+        } else {
+            format!("{} / 1M", format_cost(per_million))
+        };
+        cost_items.push(DetailItem::Stat {
+            label: "Effective rate",
+            value: rate,
+        });
+    }
+    cost_items.extend([
+        DetailItem::Stat {
+            label: "Share of cost",
+            value: share(row.cost, totals.cost),
+        },
+        DetailItem::Stat {
+            label: "Share of tokens",
+            value: share(row.total as f64, totals.total as f64),
+        },
+    ]);
+    if let Some(matched) = &row.matched_model {
+        cost_items.push(DetailItem::Stat {
+            label: "Priced as",
+            value: matched.clone(),
+        });
+    }
+    if row.variants.len() == 1 {
+        cost_items.push(DetailItem::Stat {
+            label: "Raw model",
+            value: row.variants[0].clone(),
+        });
+    } else if row.variants.len() > 1 {
+        cost_items.push(DetailItem::Stat {
+            label: "Merged from",
+            value: row.variants.join(", "),
+        });
+    }
+
+    let mut token_items = vec![
+        DetailItem::Stat {
+            label: "Input",
+            value: format_number(row.input_tokens),
+        },
+        DetailItem::Stat {
+            label: "Output",
+            value: format_number(row.output_tokens),
+        },
+    ];
+    if row.reasoning_tokens > 0 {
+        token_items.push(DetailItem::Stat {
+            label: "Reasoning",
+            value: format_number(row.reasoning_tokens),
+        });
+    }
+    token_items.extend([
+        DetailItem::Stat {
+            label: "Cache read",
+            value: format_number(row.cache_read),
+        },
+        DetailItem::Stat {
+            label: "Cache write",
+            value: format_number(row.cache_creation),
+        },
+    ]);
+    if row.cache_creation_1h > 0 {
+        token_items.push(DetailItem::Stat {
+            label: "Cache write (5m)",
+            value: format_number(row.cache_creation_5m),
+        });
+        token_items.push(DetailItem::Stat {
+            label: "Cache write (1h)",
+            value: format_number(row.cache_creation_1h),
+        });
+    }
+    if row.cache_read > 0 {
+        let prompt_total = row.input_tokens + row.cache_read + row.cache_creation;
+        if prompt_total > 0 {
+            token_items.push(DetailItem::Stat {
+                label: "Cache hit rate",
+                value: format!(
+                    "{:.1}%",
+                    row.cache_read as f64 / prompt_total as f64 * 100.0
+                ),
+            });
+        }
+    }
+    if row.tool_tokens > 0 {
+        token_items.push(DetailItem::Stat {
+            label: "Tool tokens",
+            value: format_number(row.tool_tokens),
+        });
+    }
+    if row.above_tier_tokens > 0 {
+        token_items.push(DetailItem::Stat {
+            label: "Long-context tier",
+            value: format_number(row.above_tier_tokens),
+        });
+    }
+    if row.web_search_requests > 0 {
+        token_items.push(DetailItem::Stat {
+            label: "Web searches",
+            value: format_number(row.web_search_requests),
+        });
+    }
+    token_items.push(DetailItem::Stat {
+        label: "Total tokens",
+        value: format_number(row.total),
+    });
+
+    vec![
+        DetailSection {
+            heading: "Providers",
+            items: providers,
+        },
+        DetailSection {
+            heading: "Cost & Share",
+            items: cost_items,
+        },
+        DetailSection {
+            heading: "Tokens",
+            items: token_items,
+        },
+    ]
 }
 
 /// Draws one whole-frame usage view, for tests and benchmarks.
@@ -1045,6 +1175,7 @@ impl UsageFrameBenchmark {
                 cache_creation,
                 total,
                 cost: scale as f64 * 0.0175,
+                ..UsageRow::default()
             };
             totals.accumulate(&row);
             let stats = match index % MODELS.len() {
@@ -3558,12 +3689,32 @@ mod tests {
 
     #[test]
     fn model_table_shows_raw_model_and_moves_pricing_match_into_details() {
+        use crate::display::usage::averages::ModelProviderUsage;
+        use vct_core::models::Provider;
+
         let rows = vec![UsageRow {
             model: "custom-sonnet-preview".to_string(),
             matched_model: Some("claude-sonnet-4-6".to_string()),
             input_tokens: 1_000,
-            total: 1_000,
+            cache_read: 9_000,
+            total: 10_000,
             cost: 0.05,
+            providers: vec![
+                ModelProviderUsage {
+                    provider: Provider::ClaudeCode,
+                    total_tokens: 8_000,
+                    cost: 0.04,
+                },
+                ModelProviderUsage {
+                    provider: Provider::Antigravity,
+                    total_tokens: 2_000,
+                    cost: 0.01,
+                },
+            ],
+            variants: vec![
+                "custom-sonnet-preview".to_string(),
+                "anthropic/custom-sonnet-preview".to_string(),
+            ],
             ..UsageRow::default()
         }];
         let mut totals = UsageTotals::default();
@@ -3574,7 +3725,7 @@ mod tests {
         scroll.sync(None, &[rows[0].model.clone()]);
 
         let draw = |detail_open: bool, scroll: &mut ScrollState| {
-            let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+            let mut terminal = Terminal::new(TestBackend::new(120, 32)).unwrap();
             terminal
                 .draw(|f| {
                     draw_usage_view(
@@ -3593,7 +3744,7 @@ mod tests {
                 })
                 .unwrap();
             let buffer = terminal.backend().buffer();
-            (0..24u16)
+            (0..32u16)
                 .map(|y| {
                     (0..120u16)
                         .map(|x| buffer.cell((x, y)).unwrap().symbol())
@@ -3611,7 +3762,12 @@ mod tests {
         );
 
         let details = draw(true, &mut scroll);
+        assert!(details.contains("Providers"), "got:\n{details}");
+        assert!(details.contains("Claude"), "got:\n{details}");
+        assert!(details.contains("Antigravity"), "got:\n{details}");
         assert!(details.contains("Priced as"), "got:\n{details}");
         assert!(details.contains("claude-sonnet-4-6"), "got:\n{details}");
+        assert!(details.contains("Merged from"), "got:\n{details}");
+        assert!(details.contains("Cache hit rate"), "got:\n{details}");
     }
 }

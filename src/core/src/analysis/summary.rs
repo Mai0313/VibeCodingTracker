@@ -5,13 +5,24 @@
 //! (e.g. a future GUI) builds the same totals without depending on `display`.
 
 use crate::analysis::{AggregatedAnalysisRow, PerProviderAnalysisRows};
-use crate::models::ProviderActiveDays;
+use crate::models::{Provider, ProviderActiveDays};
+
+/// One provider's contribution to an [`AnalysisRow`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelProviderAnalysis {
+    /// Provider that produced these operations.
+    pub provider: Provider,
+    /// Total lines across `Edit`, `Read`, and `Write`.
+    pub total_lines: usize,
+    /// Total tool calls across `Bash`, `Edit`, `Read`, `TodoWrite`, and `Write`.
+    pub total_calls: usize,
+}
 
 /// Display-side copy of one model's analysis metrics.
 ///
-/// Field-for-field mirror of [`AggregatedAnalysisRow`], decoupled from that
-/// (de)serializable type so the renderers can also use it as the mutable
-/// `TOTAL` row accumulator.
+/// Field-for-field mirror of [`AggregatedAnalysisRow`] plus optional
+/// per-provider attribution, decoupled from that (de)serializable type so the
+/// renderers can also use it as the mutable `TOTAL` row accumulator.
 #[derive(Default)]
 pub struct AnalysisRow {
     /// Model name the metrics are grouped under.
@@ -32,6 +43,26 @@ pub struct AnalysisRow {
     pub todo_write_count: usize,
     /// Number of `Write` tool calls.
     pub write_count: usize,
+    /// Per-provider breakdown for this model, sorted by descending lines.
+    pub providers: Vec<ModelProviderAnalysis>,
+}
+
+impl AnalysisRow {
+    /// Sum of `Edit`, `Read`, and `Write` line counts.
+    #[inline]
+    pub fn total_lines(&self) -> usize {
+        self.edit_lines + self.read_lines + self.write_lines
+    }
+
+    /// Sum of all five tool-call counters.
+    #[inline]
+    pub fn total_calls(&self) -> usize {
+        self.bash_count
+            + self.edit_count
+            + self.read_count
+            + self.todo_write_count
+            + self.write_count
+    }
 }
 
 /// Per-provider totals for analysis.
@@ -236,6 +267,104 @@ pub fn convert_to_analysis_rows(data: &[AggregatedAnalysisRow]) -> Vec<AnalysisR
             read_count: row.read_count,
             todo_write_count: row.todo_write_count,
             write_count: row.write_count,
+            providers: Vec::new(),
         })
         .collect()
+}
+
+/// Converts aggregator rows into [`AnalysisRow`]s and attaches each model's
+/// per-provider breakdown from `per_provider`.
+pub fn build_analysis_rows_with_providers(
+    data: &[AggregatedAnalysisRow],
+    per_provider: &PerProviderAnalysisRows,
+) -> Vec<AnalysisRow> {
+    let PerProviderAnalysisRows {
+        claude,
+        codex,
+        copilot,
+        gemini,
+        grok,
+        deepseek,
+        antigravity,
+        opencode,
+        cursor,
+    } = per_provider;
+
+    let sources = [
+        (Provider::ClaudeCode, claude.as_slice()),
+        (Provider::Codex, codex.as_slice()),
+        (Provider::Copilot, copilot.as_slice()),
+        (Provider::Gemini, gemini.as_slice()),
+        (Provider::Grok, grok.as_slice()),
+        (Provider::DeepSeek, deepseek.as_slice()),
+        (Provider::Antigravity, antigravity.as_slice()),
+        (Provider::OpenCode, opencode.as_slice()),
+        (Provider::Cursor, cursor.as_slice()),
+    ];
+
+    let mut rows = convert_to_analysis_rows(data);
+    for row in &mut rows {
+        let mut providers = Vec::new();
+        for &(provider, slice) in &sources {
+            if let Some(found) = slice.iter().find(|r| r.model == row.model) {
+                let total_lines = found.edit_lines + found.read_lines + found.write_lines;
+                let total_calls = found.bash_count
+                    + found.edit_count
+                    + found.read_count
+                    + found.todo_write_count
+                    + found.write_count;
+                if total_lines > 0 || total_calls > 0 {
+                    providers.push(ModelProviderAnalysis {
+                        provider,
+                        total_lines,
+                        total_calls,
+                    });
+                }
+            }
+        }
+        providers.sort_by(|a, b| {
+            b.total_lines
+                .cmp(&a.total_lines)
+                .then_with(|| b.total_calls.cmp(&a.total_calls))
+                .then_with(|| a.provider.display_name().cmp(b.provider.display_name()))
+        });
+        row.providers = providers;
+    }
+    rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn analysis_rows_attach_per_provider_breakdown_sorted_by_activity() {
+        let row = |model: &str, edit_lines: usize, bash_count: usize| AggregatedAnalysisRow {
+            model: model.to_string(),
+            edit_lines,
+            read_lines: 0,
+            write_lines: 0,
+            bash_count,
+            edit_count: usize::from(edit_lines > 0),
+            read_count: 0,
+            todo_write_count: 0,
+            write_count: 0,
+        };
+        let all = vec![row("claude-opus-5", 150, 12)];
+        let per_provider = PerProviderAnalysisRows {
+            claude: vec![row("claude-opus-5", 50, 10)],
+            antigravity: vec![row("claude-opus-5", 100, 2)],
+            ..Default::default()
+        };
+
+        let built = build_analysis_rows_with_providers(&all, &per_provider);
+        assert_eq!(built.len(), 1);
+        assert_eq!(built[0].providers.len(), 2);
+        assert_eq!(built[0].providers[0].provider, Provider::Antigravity);
+        assert_eq!(built[0].providers[0].total_lines, 100);
+        assert_eq!(built[0].providers[0].total_calls, 3);
+        assert_eq!(built[0].providers[1].provider, Provider::ClaudeCode);
+        assert_eq!(built[0].providers[1].total_lines, 50);
+        assert_eq!(built[0].providers[1].total_calls, 11);
+    }
 }

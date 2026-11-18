@@ -6,12 +6,14 @@
 
 use crate::display::analysis::averages::{
     AnalysisProviderTotals, AnalysisRow, build_analysis_provider_rows,
-    calculate_analysis_provider_totals_from_per_provider, convert_to_analysis_rows,
+    build_analysis_rows_with_providers, calculate_analysis_provider_totals_from_per_provider,
 };
+use crate::display::common::provider_tui_color;
 use crate::display::common::table::{
-    CONTENT_MIN_H, ColumnSpec, FOOTER_H, TableChrome, create_controls_with_status,
-    create_provider_row, create_ratatui_table, fit_columns, frame_layout, render_detail_panel,
-    render_scrollable_table, render_too_small, styled_row, title_line,
+    CONTENT_MIN_H, ColumnSpec, DetailItem, DetailSection, FOOTER_H, TableChrome,
+    create_controls_with_status, create_provider_row, create_ratatui_table, fit_columns,
+    frame_layout, render_detail_panel, render_scrollable_table, render_too_small, styled_row,
+    title_line,
 };
 use crate::display::common::theme::theme;
 use crate::display::common::tui::{LEDGER_SAVE_INTERVAL, NavDelta, ScrollState, UpdateTracker};
@@ -166,17 +168,9 @@ impl AnalysisUiState {
     /// Takes in a finished scan.
     pub(crate) fn apply(&mut self, data: AnalysisData) {
         let previous = self.selected_model();
-        self.rows = convert_to_analysis_rows(&data.rows);
-        self.rows.retain(|row| {
-            row.edit_lines != 0
-                || row.read_lines != 0
-                || row.write_lines != 0
-                || row.bash_count != 0
-                || row.edit_count != 0
-                || row.read_count != 0
-                || row.todo_write_count != 0
-                || row.write_count != 0
-        });
+        self.rows = build_analysis_rows_with_providers(&data.rows, &data.per_provider);
+        self.rows
+            .retain(|row| row.total_lines() != 0 || row.total_calls() != 0);
         self.sort.apply(&mut self.rows);
         self.totals = AnalysisRow::default();
         let fingerprints: Vec<_> = self
@@ -418,14 +412,8 @@ fn draw_analysis_view(
         let row_count = rows.len();
         let title = format!(
             "Models · {} lines · {} tool calls · {} models",
-            format_compact((totals.edit_lines + totals.read_lines + totals.write_lines) as i64),
-            format_compact(
-                (totals.bash_count
-                    + totals.edit_count
-                    + totals.read_count
-                    + totals.todo_write_count
-                    + totals.write_count) as i64
-            ),
+            format_compact(totals.total_lines() as i64),
+            format_compact(totals.total_calls() as i64),
             rows_data.len()
         );
         render_scrollable_table(
@@ -602,23 +590,106 @@ fn draw_analysis_view(
         );
 
         if detail_open && let Some(row) = scroll.table.selected().and_then(|at| rows_data.get(at)) {
-            render_detail_panel(
-                f,
-                area,
-                &row.model,
-                &[
-                    ("Edit lines", format_number(row.edit_lines)),
-                    ("Read lines", format_number(row.read_lines)),
-                    ("Write lines", format_number(row.write_lines)),
-                    ("Bash calls", format_number(row.bash_count)),
-                    ("Edit calls", format_number(row.edit_count)),
-                    ("Read calls", format_number(row.read_count)),
-                    ("TodoWrite calls", format_number(row.todo_write_count)),
-                    ("Write calls", format_number(row.write_count)),
-                ],
-            );
+            let sections = build_analysis_detail_sections(row, totals);
+            render_detail_panel(f, area, &row.model, &sections);
         }
     }
+}
+
+/// Builds the structured sections for one analysis row's `Details` panel.
+fn build_analysis_detail_sections(row: &AnalysisRow, totals: &AnalysisRow) -> Vec<DetailSection> {
+    let with_share = |part: usize, whole: usize| {
+        if whole > 0 {
+            format!(
+                "{} ({:.1}%)",
+                format_number(part),
+                part as f64 / whole as f64 * 100.0
+            )
+        } else {
+            format_number(part)
+        }
+    };
+    let op_line = |lines: usize, calls: usize| {
+        if calls > 0 && lines > 0 {
+            let avg = (lines as f64 / calls as f64).round() as usize;
+            format!(
+                "{} lines · {} calls (~{}/op)",
+                format_number(lines),
+                format_number(calls),
+                format_number(avg)
+            )
+        } else {
+            format!(
+                "{} lines · {} calls",
+                format_number(lines),
+                format_number(calls)
+            )
+        }
+    };
+
+    let providers: Vec<DetailItem> = row
+        .providers
+        .iter()
+        .map(|entry| DetailItem::Provider {
+            color: provider_tui_color(entry.provider),
+            label: entry.provider.display_name(),
+            value: format!(
+                "{} lines · {} calls",
+                format_compact(entry.total_lines as i64),
+                format_compact(entry.total_calls as i64)
+            ),
+        })
+        .collect();
+
+    vec![
+        DetailSection {
+            heading: "Providers",
+            items: providers,
+        },
+        DetailSection {
+            heading: "Summary",
+            items: vec![
+                DetailItem::Stat {
+                    label: "Total lines",
+                    value: with_share(row.total_lines(), totals.total_lines()),
+                },
+                DetailItem::Stat {
+                    label: "Total tool calls",
+                    value: with_share(row.total_calls(), totals.total_calls()),
+                },
+            ],
+        },
+        DetailSection {
+            heading: "File Operations",
+            items: vec![
+                DetailItem::Stat {
+                    label: "Edit",
+                    value: op_line(row.edit_lines, row.edit_count),
+                },
+                DetailItem::Stat {
+                    label: "Read",
+                    value: op_line(row.read_lines, row.read_count),
+                },
+                DetailItem::Stat {
+                    label: "Write",
+                    value: op_line(row.write_lines, row.write_count),
+                },
+            ],
+        },
+        DetailSection {
+            heading: "Other Tools",
+            items: vec![
+                DetailItem::Stat {
+                    label: "Bash",
+                    value: format!("{} calls", format_number(row.bash_count)),
+                },
+                DetailItem::Stat {
+                    label: "TodoWrite",
+                    value: format!("{} calls", format_number(row.todo_write_count)),
+                },
+            ],
+        },
+    ]
 }
 
 #[cfg(test)]
@@ -731,5 +802,81 @@ mod tests {
             .collect();
         assert!(screen.contains("provider totals hidden"), "got:\n{screen}");
         assert!(screen.contains("lines ▼"), "got:\n{screen}");
+    }
+
+    #[test]
+    fn analysis_details_show_providers_summary_and_grouped_operations() {
+        use crate::display::analysis::averages::ModelProviderAnalysis;
+        use vct_core::models::Provider;
+
+        let rows = vec![AnalysisRow {
+            model: "claude-opus-5".to_string(),
+            edit_lines: 120,
+            read_lines: 1_500,
+            write_lines: 80,
+            bash_count: 14,
+            edit_count: 10,
+            read_count: 15,
+            todo_write_count: 3,
+            write_count: 2,
+            providers: vec![
+                ModelProviderAnalysis {
+                    provider: Provider::ClaudeCode,
+                    total_lines: 1_200,
+                    total_calls: 30,
+                },
+                ModelProviderAnalysis {
+                    provider: Provider::Antigravity,
+                    total_lines: 500,
+                    total_calls: 14,
+                },
+            ],
+        }];
+        let totals = AnalysisRow {
+            edit_lines: 240,
+            read_lines: 3_000,
+            write_lines: 160,
+            bash_count: 28,
+            edit_count: 20,
+            read_count: 30,
+            todo_write_count: 6,
+            write_count: 4,
+            ..Default::default()
+        };
+        let mut scroll = ScrollState::new();
+        scroll.sync(None, &[rows[0].model.clone()]);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|f| {
+                draw_analysis_view(
+                    f,
+                    f.area(),
+                    &rows,
+                    &totals,
+                    &AnalysisProviderTotals::default(),
+                    &UpdateTracker::new(MAX_TRACKED_ANALYSIS_ROWS, 0),
+                    &mut scroll,
+                    AnalysisSort::default(),
+                    None,
+                    true,
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen: String = (0..30u16)
+            .map(|y| {
+                (0..100u16)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("Providers"), "got:\n{screen}");
+        assert!(screen.contains("Claude"), "got:\n{screen}");
+        assert!(screen.contains("Antigravity"), "got:\n{screen}");
+        assert!(screen.contains("Total lines"), "got:\n{screen}");
+        assert!(screen.contains("1,700 (50.0%)"), "got:\n{screen}");
+        assert!(screen.contains("File Operations"), "got:\n{screen}");
+        assert!(screen.contains("~12/op"), "got:\n{screen}");
     }
 }
