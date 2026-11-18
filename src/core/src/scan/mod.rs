@@ -12,10 +12,10 @@ pub(crate) mod database;
 pub(crate) mod descriptor;
 
 pub(crate) use crate::ledger::ScanFeature;
-pub(crate) use compact::{CompactSink, fold_remotes, scan_cached_files};
+pub(crate) use compact::{CompactSink, fold_remotes};
 pub(crate) use cursor::scan_cursor_stores;
-pub(crate) use database::{group_analysis_rows, group_usage_rows, scan_database_half};
-pub(crate) use descriptor::scan_all_cached_files;
+pub(crate) use database::{group_usage_rows, scan_database_half};
+pub(crate) use descriptor::{refresh_ledger_for_export, scan_all_cached_files};
 
 use crate::models::ExtensionType;
 use anyhow::Result;

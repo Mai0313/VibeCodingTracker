@@ -76,6 +76,18 @@ impl HalfStamps {
             .is_some_and(|stamp| stamp.is_current(feature, current))
     }
 
+    /// Allocation-free [`Self::is_current`] fast path for providers whose read
+    /// stamp holds only the discovered file itself.
+    pub(crate) fn is_current_single_file(
+        &self,
+        feature: ScanFeature,
+        file: &crate::utils::directory::DiscoveredFile,
+        tiers: Option<&str>,
+    ) -> bool {
+        self.half(feature)
+            .is_some_and(|stamp| stamp.matches_single_file(feature, file, tiers))
+    }
+
     /// Drops the retained diagnostics; a source that is gone can no longer be
     /// re-read, so its parse verdict has nothing left to say.
     pub(crate) fn clear_failures(&mut self) {
@@ -151,6 +163,33 @@ impl ScanStamp {
         self.files == current.files
             && self.parser == current.parser
             && (feature == ScanFeature::Analysis || self.tiers == current.tiers)
+    }
+
+    pub(crate) fn matches_single_file(
+        &self,
+        feature: ScanFeature,
+        file: &crate::utils::directory::DiscoveredFile,
+        tiers: Option<&str>,
+    ) -> bool {
+        if self.parser != crate::VERSION
+            || (feature == ScanFeature::Usage && self.tiers.as_deref() != tiers)
+        {
+            return false;
+        }
+        let [(stored_name, Some(stored_stamp))] = self.files.as_slice() else {
+            return false;
+        };
+        if stored_stamp.len != file.len {
+            return false;
+        }
+        let name_matches = match file.path.file_name() {
+            Some(name) => match name.to_str() {
+                Some(text) => text == stored_name,
+                None => name.to_string_lossy() == stored_name.as_str(),
+            },
+            None => stored_name.is_empty(),
+        };
+        name_matches && super::stamp::modified_matches(file.modified, &stored_stamp.modified)
     }
 }
 

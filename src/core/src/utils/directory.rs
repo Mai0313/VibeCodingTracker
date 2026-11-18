@@ -2,10 +2,12 @@ use crate::constants::FastHashSet;
 use crate::ledger::key::session_key;
 use crate::models::{ExtensionType, TimeRange};
 use anyhow::Result;
+use rayon::prelude::*;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-use walkdir::WalkDir;
+use walkdir::{DirEntry, WalkDir};
 
 /// A file matched during directory traversal, paired with its modification date.
 pub struct FileInfo {
@@ -17,6 +19,24 @@ pub struct FileInfo {
     pub modified: SystemTime,
     /// Length in bytes at discovery time.
     pub len: u64,
+}
+
+/// A file matched during provider discovery, before formatting its local date.
+pub(crate) struct DiscoveredFile {
+    /// Absolute path to the matched file.
+    pub path: PathBuf,
+    /// Modification timestamp at discovery time.
+    pub modified: SystemTime,
+    /// Length in bytes at discovery time.
+    pub len: u64,
+}
+
+impl DiscoveredFile {
+    /// Formats [`Self::modified`] as local `YYYY-MM-DD`.
+    pub(crate) fn modified_date(&self) -> String {
+        let datetime: chrono::DateTime<chrono::Local> = self.modified.into();
+        datetime.format("%Y-%m-%d").to_string()
+    }
 }
 
 /// One directory traversal or metadata error encountered during discovery.
@@ -33,6 +53,13 @@ pub(crate) struct FileDiscovery {
     /// Matched files that could be inspected successfully.
     pub files: Vec<FileInfo>,
     /// Traversal, metadata, or mtime failures in deterministic path order.
+    pub failures: Vec<FileDiscoveryFailure>,
+}
+
+/// Candidate files discovered without eager local-date formatting.
+#[derive(Default)]
+pub(crate) struct CandidateDiscovery {
+    pub files: Vec<DiscoveredFile>,
     pub failures: Vec<FileDiscoveryFailure>,
 }
 
@@ -227,16 +254,44 @@ pub(crate) fn collect_provider_files_diagnostics<F>(
     max_depth: Option<usize>,
 ) -> FileDiscovery
 where
-    F: Fn(&Path) -> bool,
+    F: Fn(&Path) -> bool + Sync,
 {
+    let cutoff = time_range
+        .cutoff_date()
+        .map(|d| d.format("%Y-%m-%d").to_string());
+    let collect_root = |root: &Path| -> FileDiscovery {
+        let candidates = collect_candidates_in_root(root, Some(provider), &filter_fn, max_depth);
+        let files = candidates
+            .files
+            .into_iter()
+            .filter_map(|candidate| {
+                let modified_date = candidate.modified_date();
+                if let Some(ref cutoff_str) = cutoff
+                    && modified_date.as_str() < cutoff_str.as_str()
+                {
+                    return None;
+                }
+                Some(FileInfo {
+                    path: candidate.path,
+                    modified_date,
+                    modified: candidate.modified,
+                    len: candidate.len,
+                })
+            })
+            .collect();
+        FileDiscovery {
+            files,
+            failures: candidates.failures,
+        }
+    };
+
     let Some((first, rest)) = dirs.split_first() else {
         return FileDiscovery {
             files: Vec::new(),
             failures: Vec::new(),
         };
     };
-    let mut discovery =
-        collect_files_with_max_depth_diagnostics(first, &filter_fn, time_range, max_depth);
+    let mut discovery = collect_root(first);
     if rest.is_empty() {
         return discovery;
     }
@@ -247,35 +302,301 @@ where
         .map(|file| session_key(provider, &[first], &file.path))
         .collect();
     for dir in rest {
-        let mut found =
-            collect_files_with_max_depth_diagnostics(dir, &filter_fn, time_range, max_depth);
+        let mut found = collect_root(dir);
         discovery.failures.append(&mut found.failures);
-        let found_keys: Vec<String> = found
-            .files
-            .iter()
-            .map(|file| session_key(provider, &[dir], &file.path))
-            .collect();
-        let mut keys = found_keys.iter();
-        found.files.retain(|file| {
-            let duplicate = keys.next().is_some_and(|key| seen.contains(key));
-            if duplicate {
-                log::debug!(
-                    "skipping {}: already discovered under an earlier session root",
-                    file.path.display()
-                );
-            }
-            !duplicate
-        });
-        seen.extend(found_keys);
+        dedup_across_roots(&mut found.files, &mut seen, provider, dir, |f| &f.path);
         discovery.files.append(&mut found.files);
     }
 
-    discovery.failures.sort_by(|left, right| {
+    sort_failures(&mut discovery.failures);
+    discovery
+}
+
+/// Discovers every matching session file across `dirs` for a ledger scan,
+/// skipping eager local-date formatting and pruning companion output subtrees.
+pub(crate) fn collect_provider_candidates_diagnostics<F>(
+    dirs: &[&Path],
+    provider: ExtensionType,
+    filter_fn: F,
+    max_depth: Option<usize>,
+) -> CandidateDiscovery
+where
+    F: Fn(&Path) -> bool + Sync,
+{
+    let Some((first, rest)) = dirs.split_first() else {
+        return CandidateDiscovery::default();
+    };
+    let mut discovery = collect_candidates_in_root(first, Some(provider), &filter_fn, max_depth);
+    if rest.is_empty() {
+        return discovery;
+    }
+
+    let mut seen: FastHashSet<String> = discovery
+        .files
+        .iter()
+        .map(|file| session_key(provider, &[first], &file.path))
+        .collect();
+    for dir in rest {
+        let mut found = collect_candidates_in_root(dir, Some(provider), &filter_fn, max_depth);
+        discovery.failures.append(&mut found.failures);
+        dedup_across_roots(&mut found.files, &mut seen, provider, dir, |f| &f.path);
+        discovery.files.append(&mut found.files);
+    }
+
+    sort_failures(&mut discovery.failures);
+    discovery
+}
+
+fn dedup_across_roots<T>(
+    files: &mut Vec<T>,
+    seen: &mut FastHashSet<String>,
+    provider: ExtensionType,
+    root: &Path,
+    path_of: impl Fn(&T) -> &Path,
+) {
+    let found_keys: Vec<String> = files
+        .iter()
+        .map(|file| session_key(provider, &[root], path_of(file)))
+        .collect();
+    let mut keys = found_keys.iter();
+    files.retain(|file| {
+        let duplicate = keys.next().is_some_and(|key| seen.contains(key));
+        if duplicate {
+            log::debug!(
+                "skipping {}: already discovered under an earlier session root",
+                path_of(file).display()
+            );
+        }
+        !duplicate
+    });
+    seen.extend(found_keys);
+}
+
+fn sort_failures(failures: &mut [FileDiscoveryFailure]) {
+    failures.sort_by(|left, right| {
         left.path
             .cmp(&right.path)
             .then_with(|| left.error.cmp(&right.error))
     });
-    discovery
+}
+
+fn should_descend(entry: &DirEntry, depth_offset: usize, provider: Option<ExtensionType>) -> bool {
+    // Claude Code writes large `<session>/tool-results/` companion directories
+    // holding raw tool output `.txt` files and zero session logs. Depth >= 2
+    // from the root keeps a project directory literally named `tool-results` at
+    // depth 1 walkable.
+    !(provider == Some(ExtensionType::ClaudeCode)
+        && entry.depth() + depth_offset >= 2
+        && entry.file_type().is_dir()
+        && entry.file_name() == OsStr::new("tool-results"))
+}
+
+fn walk_subtree<F>(
+    sub_root: &Path,
+    depth_offset: usize,
+    provider: Option<ExtensionType>,
+    filter_fn: &F,
+    max_depth: Option<usize>,
+) -> CandidateDiscovery
+where
+    F: Fn(&Path) -> bool,
+{
+    let mut files = Vec::new();
+    let mut failures = Vec::new();
+    let mut walker = WalkDir::new(sub_root);
+    if let Some(depth) = max_depth {
+        walker = walker.max_depth(depth);
+    }
+    for entry in walker
+        .into_iter()
+        .filter_entry(|entry| should_descend(entry, depth_offset, provider))
+    {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                failures.push(FileDiscoveryFailure {
+                    path: error.path().unwrap_or(sub_root).to_path_buf(),
+                    error: error.to_string(),
+                });
+                continue;
+            }
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if !filter_fn(path) {
+            continue;
+        }
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                failures.push(FileDiscoveryFailure {
+                    path: path.to_path_buf(),
+                    error: error.to_string(),
+                });
+                continue;
+            }
+        };
+        let modified = match metadata.modified() {
+            Ok(modified) => modified,
+            Err(error) => {
+                failures.push(FileDiscoveryFailure {
+                    path: path.to_path_buf(),
+                    error: error.to_string(),
+                });
+                continue;
+            }
+        };
+        files.push(DiscoveredFile {
+            path: path.to_path_buf(),
+            modified,
+            len: metadata.len(),
+        });
+    }
+    CandidateDiscovery { files, failures }
+}
+
+fn collect_candidates_in_root<F>(
+    dir: &Path,
+    provider: Option<ExtensionType>,
+    filter_fn: &F,
+    max_depth: Option<usize>,
+) -> CandidateDiscovery
+where
+    F: Fn(&Path) -> bool + Sync,
+{
+    let root_meta = match fs::metadata(dir) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return CandidateDiscovery::default();
+        }
+        Err(error) => {
+            return CandidateDiscovery {
+                files: Vec::new(),
+                failures: vec![FileDiscoveryFailure {
+                    path: dir.to_path_buf(),
+                    error: error.to_string(),
+                }],
+            };
+        }
+    };
+
+    if !root_meta.is_dir() || max_depth.is_some_and(|depth| depth < 2) {
+        let mut out = walk_subtree(dir, 0, provider, filter_fn, max_depth);
+        sort_failures(&mut out.failures);
+        return out;
+    }
+
+    let mut out = collect_candidates_at_depth(dir, 0, provider, filter_fn, max_depth);
+    sort_failures(&mut out.failures);
+    out
+}
+
+/// Splits the first two directory levels across Rayon so one huge project
+/// folder (`<root>/<project>/<session>/...`) does not serialize the scan onto
+/// one worker.
+fn collect_candidates_at_depth<F>(
+    dir: &Path,
+    depth_offset: usize,
+    provider: Option<ExtensionType>,
+    filter_fn: &F,
+    max_depth: Option<usize>,
+) -> CandidateDiscovery
+where
+    F: Fn(&Path) -> bool + Sync,
+{
+    if depth_offset >= 2 || max_depth.is_some_and(|depth| depth < 2) {
+        return walk_subtree(dir, depth_offset, provider, filter_fn, max_depth);
+    }
+
+    let Ok(entries) = fs::read_dir(dir) else {
+        return walk_subtree(dir, depth_offset, provider, filter_fn, max_depth);
+    };
+
+    let mut files = Vec::new();
+    let mut failures = Vec::new();
+    let mut subdirs = Vec::new();
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                failures.push(FileDiscoveryFailure {
+                    path: dir.to_path_buf(),
+                    error: error.to_string(),
+                });
+                continue;
+            }
+        };
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                failures.push(FileDiscoveryFailure {
+                    path,
+                    error: error.to_string(),
+                });
+                continue;
+            }
+        };
+        if file_type.is_dir() {
+            if !(provider == Some(ExtensionType::ClaudeCode)
+                && depth_offset + 1 >= 2
+                && entry.file_name() == OsStr::new("tool-results"))
+            {
+                subdirs.push(path);
+            }
+        } else if file_type.is_file() && filter_fn(&path) {
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    failures.push(FileDiscoveryFailure {
+                        path,
+                        error: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            let modified = match metadata.modified() {
+                Ok(modified) => modified,
+                Err(error) => {
+                    failures.push(FileDiscoveryFailure {
+                        path,
+                        error: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            files.push(DiscoveredFile {
+                path,
+                modified,
+                len: metadata.len(),
+            });
+        }
+    }
+
+    let child_max_depth = max_depth.map(|depth| depth - 1);
+    let next_offset = depth_offset + 1;
+    if subdirs.len() >= 2 {
+        let sub_results: Vec<CandidateDiscovery> = subdirs
+            .par_iter()
+            .map(|sub| {
+                collect_candidates_at_depth(sub, next_offset, provider, filter_fn, child_max_depth)
+            })
+            .collect();
+        for mut sub in sub_results {
+            files.append(&mut sub.files);
+            failures.append(&mut sub.failures);
+        }
+    } else if let [only] = subdirs.as_slice() {
+        let mut sub =
+            collect_candidates_at_depth(only, next_offset, provider, filter_fn, child_max_depth);
+        files.append(&mut sub.files);
+        failures.append(&mut sub.failures);
+    }
+
+    CandidateDiscovery { files, failures }
 }
 
 /// Maximum traversal depth for Copilot CLI session scans.
@@ -1061,5 +1382,40 @@ mod tests {
         assert!(names.contains(&"agent-one.jsonl".to_string()));
         assert!(!names.iter().any(|n| n.contains(".meta.")));
         assert!(!names.iter().any(|n| n.ends_with(".png")));
+    }
+
+    #[test]
+    fn claude_candidate_discovery_prunes_nested_tool_results_but_keeps_top_level_project_dir() {
+        let dir = tempdir().unwrap();
+        let project = dir.path().join("-home-user-repo");
+        let session = project.join("sess-a");
+        let tool_results = session.join("tool-results");
+        let subagents = session.join("subagents");
+        let named_project = dir.path().join("tool-results");
+        fs::create_dir_all(&tool_results).unwrap();
+        fs::create_dir_all(&subagents).unwrap();
+        fs::create_dir_all(&named_project).unwrap();
+
+        File::create(project.join("sess-a.jsonl")).unwrap();
+        File::create(subagents.join("agent-one.jsonl")).unwrap();
+        // A stray `.jsonl` inside `<session>/tool-results/` is pruned with its directory.
+        File::create(tool_results.join("ignored.jsonl")).unwrap();
+        // A top-level project folder literally named `tool-results` at depth 1 still walks.
+        File::create(named_project.join("top.jsonl")).unwrap();
+
+        let roots = [dir.path()];
+        let found = collect_provider_candidates_diagnostics(
+            &roots,
+            ExtensionType::ClaudeCode,
+            is_claude_session_file,
+            None,
+        );
+        let mut names: Vec<String> = found
+            .files
+            .iter()
+            .filter_map(|f| f.path.file_name()?.to_str().map(String::from))
+            .collect();
+        names.sort();
+        assert_eq!(names, ["agent-one.jsonl", "sess-a.jsonl", "top.jsonl"]);
     }
 }

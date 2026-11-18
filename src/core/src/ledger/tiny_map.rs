@@ -30,6 +30,10 @@ impl<K, V> TinyMap<K, V> {
         self.0.is_empty()
     }
 
+    pub(crate) fn as_slice(&self) -> &[(K, V)] {
+        &self.0
+    }
+
     pub(crate) fn values_mut(&mut self) -> impl Iterator<Item = &mut V> {
         self.0.iter_mut().map(|(_, value)| value)
     }

@@ -11,7 +11,7 @@ use super::{ScanDiagnostics, ScanFeature};
 use crate::constants::FastHashSet;
 use crate::ledger::key::session_key;
 use crate::ledger::{
-    DayEntry, ProviderLedger, ScanStamp, SessionEntry, SessionLedger, TinyMap, stamp, today,
+    DayEntry, ProviderLedger, ScanStamp, SessionEntry, SessionLedger, TinyMap, stamp,
 };
 use crate::models::ExtensionType;
 use crate::models::TimeRange;
@@ -19,15 +19,38 @@ use crate::pricing::TierThresholds;
 use crate::session::ParseMode;
 use crate::session::diagnostics::partial_failure_reason;
 use crate::session::parser::parse_session_file_typed_as_with_diagnostics;
-use crate::utils::directory::{FileInfo, collect_provider_files_diagnostics};
+use crate::utils::directory::{DiscoveredFile, collect_provider_candidates_diagnostics};
 use anyhow::Result;
 use rayon::prelude::*;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The per-feature fold target: usage accumulates token maps, analysis
 /// accumulates file-operation rows. The shared scanners only need this one hook.
 pub(crate) trait CompactSink {
     fn fold(&mut self, provider: ExtensionType, date: &str, day: &DayEntry);
+
+    fn folds_days(&self) -> bool {
+        true
+    }
+}
+
+/// Sink for ledger-only refreshes (`vct ledger export`) that need no in-memory
+/// roll-up.
+pub(crate) struct NoopSink;
+
+impl CompactSink for NoopSink {
+    fn fold(&mut self, _provider: ExtensionType, _date: &str, _day: &DayEntry) {}
+
+    fn folds_days(&self) -> bool {
+        false
+    }
+}
+
+/// Which half (or both) a file scan requires to be current in the ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScanTarget {
+    Single(ScanFeature),
+    BothHalves,
 }
 
 /// The inclusive `YYYY-MM-DD` lower bound a scan folds from; `None` folds
@@ -45,6 +68,9 @@ pub(crate) fn fold_days(
     cutoff: Option<&str>,
     sink: &mut impl CompactSink,
 ) {
+    if !sink.folds_days() {
+        return;
+    }
     for (date, day) in days {
         if cutoff.is_none_or(|cutoff| date.as_str() >= cutoff) {
             sink.fold(provider, date, day);
@@ -122,7 +148,7 @@ pub(crate) fn fold_remotes(
 /// The only feature-specific input is the optional per-request tier snapshot
 /// (usage passes it, analysis passes `None`).
 pub(crate) fn load_file_session(
-    file: &FileInfo,
+    file: &DiscoveredFile,
     provider: ExtensionType,
     tiers: Option<&TierThresholds>,
     stamp: ScanStamp,
@@ -133,7 +159,7 @@ pub(crate) fn load_file_session(
         ParseMode::UsageOnly,
         tiers,
     )?;
-    let date = file.modified_date.clone();
+    let date = file.modified_date();
     if parsed.diagnostics.is_complete_failure() {
         let failure = if parsed.diagnostics.recognized_records == 0 {
             "source contained no recognized provider records".to_string()
@@ -173,70 +199,149 @@ pub(crate) fn load_file_session(
     ))
 }
 
-/// Scans one file-backed provider's session roots through the ledger.
-///
-/// Shared verbatim by usage and analysis: discovery of every log under the
-/// roots (the time range is applied to the folded days, never to discovery,
-/// so an older session is never mistaken for a deleted one), stamp check,
-/// parallel miss-parse, ledger update, fold, and finally the fold of every
-/// session the roots no longer hold.
+pub(crate) struct ProviderFileScanOutcome {
+    pub(crate) provider: ExtensionType,
+    pub(crate) book: ProviderLedger,
+    pub(crate) seen: FastHashSet<String>,
+    pub(crate) failed_keys: FastHashSet<String>,
+    pub(crate) candidates: usize,
+    pub(crate) parsed: usize,
+    pub(crate) parsed_sources: usize,
+    pub(crate) hard_failures: Vec<(PathBuf, String)>,
+    pub(crate) retained_failures: Vec<(PathBuf, String)>,
+}
+
+fn entry_matches_target(
+    entry: &SessionEntry,
+    target: ScanTarget,
+    file: &DiscoveredFile,
+    tiers_fingerprint: Option<&str>,
+) -> bool {
+    match target {
+        ScanTarget::Single(feature) => {
+            entry
+                .scanned
+                .is_current_single_file(feature, file, tiers_fingerprint)
+        }
+        ScanTarget::BothHalves => {
+            entry
+                .scanned
+                .is_current_single_file(ScanFeature::Usage, file, tiers_fingerprint)
+                && entry
+                    .scanned
+                    .is_current_single_file(ScanFeature::Analysis, file, None)
+        }
+    }
+}
+
+fn entry_matches_stamp(entry: &SessionEntry, target: ScanTarget, current: &ScanStamp) -> bool {
+    match target {
+        ScanTarget::Single(feature) => entry.scanned.is_current(feature, current),
+        ScanTarget::BothHalves => {
+            entry.scanned.is_current(ScanFeature::Usage, current)
+                && entry.scanned.is_current(ScanFeature::Analysis, current)
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn scan_cached_files<F>(
+pub(crate) fn scan_provider_files<F>(
     dirs: &[&Path],
     provider: ExtensionType,
     filter: F,
-    time_range: TimeRange,
     max_depth: Option<usize>,
-    ledger: &mut SessionLedger,
-    feature: ScanFeature,
-    sink: &mut impl CompactSink,
-    diagnostics: &mut ScanDiagnostics,
+    mut book: ProviderLedger,
+    target: ScanTarget,
     tiers: Option<&TierThresholds>,
-) -> Result<()>
+    tiers_fingerprint: Option<&str>,
+    today_str: &str,
+) -> ProviderFileScanOutcome
 where
     F: Copy + Fn(&Path) -> bool + Sync + Send,
 {
-    let discovery =
-        collect_provider_files_diagnostics(dirs, provider, filter, TimeRange::All, max_depth);
+    let discovery = collect_provider_candidates_diagnostics(dirs, provider, filter, max_depth);
     let partial = !discovery.failures.is_empty();
-    diagnostics.candidates += discovery.failures.len();
-    for failure in discovery.failures {
-        diagnostics.record_hard_failure(provider, &failure.path, failure.error);
-    }
+    let mut candidates = discovery.failures.len();
+    let mut hard_failures: Vec<(PathBuf, String)> = discovery
+        .failures
+        .into_iter()
+        .map(|failure| (failure.path, failure.error))
+        .collect();
 
     let mut files = discovery.files;
     files.sort_unstable_by(|left, right| left.path.cmp(&right.path));
-    diagnostics.candidates += files.len();
+    candidates += files.len();
 
-    let cutoff = cutoff_string(time_range);
-    let tiers_fingerprint = stamp::tiers_fingerprint(tiers);
-    let mut book = ledger.take_provider(provider);
-    let mut seen = FastHashSet::default();
+    let verdict_feature = match target {
+        ScanTarget::Single(feature) => feature,
+        ScanTarget::BothHalves => ScanFeature::Usage,
+    };
+    let single_file = !stamp::has_sidecars(provider);
+    let mut seen = FastHashSet::with_capacity_and_hasher(files.len(), Default::default());
+    let mut failed_keys = FastHashSet::default();
+    let mut retained_failures = Vec::new();
+    let mut parsed = 0usize;
     let mut misses = Vec::new();
+
     for file in files {
         let key = session_key(provider, dirs, &file.path);
-        seen.insert(key.clone());
-        let current = match stamp::file_source(&file, provider) {
-            Ok(files) => ScanStamp::new(tiers_fingerprint.clone(), files),
-            Err(error) => {
-                diagnostics.record_hard_failure(provider, &file.path, error.to_string());
+        if single_file {
+            if let Some(entry) = book.sessions.get(&key)
+                && entry_matches_target(entry, target, &file, tiers_fingerprint)
+            {
+                let stamp = entry.scanned.half(verdict_feature);
+                if stamp.is_none_or(|stamp| stamp.parsed) {
+                    parsed += 1;
+                }
+                if let Some(failure) = stamp.and_then(|stamp| stamp.failure.as_ref()) {
+                    retained_failures.push((file.path.clone(), failure.clone()));
+                }
+                book.mark_present(&key);
+                seen.insert(key);
                 continue;
             }
-        };
-        match book.sessions.get(&key) {
-            Some(entry) if entry.scanned.is_current(feature, &current) => {
-                fold_present(
-                    provider,
-                    &file.path,
-                    entry,
-                    feature,
-                    cutoff.as_deref(),
-                    sink,
-                    diagnostics,
-                );
-                book.mark_present(&key);
+            match stamp::file_source(&file, provider) {
+                Ok(source_files) => {
+                    let current =
+                        ScanStamp::new(tiers_fingerprint.map(str::to_string), source_files);
+                    seen.insert(key.clone());
+                    misses.push((file, key, current));
+                }
+                Err(error) => {
+                    hard_failures.push((file.path, error.to_string()));
+                    failed_keys.insert(key.clone());
+                    seen.insert(key);
+                }
             }
-            _ => misses.push((file, key, current)),
+        } else {
+            let current = match stamp::file_source(&file, provider) {
+                Ok(source_files) => {
+                    ScanStamp::new(tiers_fingerprint.map(str::to_string), source_files)
+                }
+                Err(error) => {
+                    hard_failures.push((file.path, error.to_string()));
+                    failed_keys.insert(key.clone());
+                    seen.insert(key);
+                    continue;
+                }
+            };
+            match book.sessions.get(&key) {
+                Some(entry) if entry_matches_stamp(entry, target, &current) => {
+                    let stamp = entry.scanned.half(verdict_feature);
+                    if stamp.is_none_or(|stamp| stamp.parsed) {
+                        parsed += 1;
+                    }
+                    if let Some(failure) = stamp.and_then(|stamp| stamp.failure.as_ref()) {
+                        retained_failures.push((file.path, failure.clone()));
+                    }
+                    book.mark_present(&key);
+                    seen.insert(key);
+                }
+                _ => {
+                    seen.insert(key.clone());
+                    misses.push((file, key, current));
+                }
+            }
         }
     }
 
@@ -247,29 +352,87 @@ where
             (file.path, key, result)
         })
         .collect();
-    ledger.record_parses(loaded.len());
+    let parsed_sources = loaded.len();
     for (source, key, result) in loaded {
         match result {
             Ok(entry) => {
-                fold_present(
-                    provider,
-                    &source,
-                    &entry,
-                    feature,
-                    cutoff.as_deref(),
-                    sink,
-                    diagnostics,
-                );
+                let stamp = entry.scanned.half(verdict_feature);
+                if stamp.is_none_or(|stamp| stamp.parsed) {
+                    parsed += 1;
+                }
+                if let Some(failure) = stamp.and_then(|stamp| stamp.failure.as_ref()) {
+                    retained_failures.push((source, failure.clone()));
+                }
                 book.sessions.insert(key, entry);
                 book.dirty = true;
             }
-            Err(error) => diagnostics.record_hard_failure(provider, &source, error.to_string()),
+            Err(error) => {
+                hard_failures.push((source, error.to_string()));
+                failed_keys.insert(key);
+            }
         }
     }
 
-    book.settle_unseen(&seen, !partial, &today());
-    let retained = fold_unseen(provider, &book, &seen, cutoff.as_deref(), sink, diagnostics);
+    book.settle_unseen(&seen, !partial, today_str);
+    ProviderFileScanOutcome {
+        provider,
+        book,
+        seen,
+        failed_keys,
+        candidates,
+        parsed,
+        parsed_sources,
+        hard_failures,
+        retained_failures,
+    }
+}
+
+pub(crate) fn finish_provider_scan(
+    outcome: ProviderFileScanOutcome,
+    target: ScanTarget,
+    cutoff: Option<&str>,
+    ledger: &mut SessionLedger,
+    sink: &mut impl CompactSink,
+    diagnostics: &mut ScanDiagnostics,
+) {
+    let provider = outcome.provider;
+    diagnostics.candidates += outcome.candidates;
+    diagnostics.parsed += outcome.parsed;
+    for (source, error) in outcome.hard_failures {
+        diagnostics.record_hard_failure(provider, &source, error);
+    }
+    for (source, error) in outcome.retained_failures {
+        diagnostics.record_failure(provider, &source, error);
+    }
+    ledger.record_parses(outcome.parsed_sources);
+
+    let verdict_feature = match target {
+        ScanTarget::Single(feature) => feature,
+        ScanTarget::BothHalves => ScanFeature::Usage,
+    };
+    let fold = sink.folds_days();
+    let mut retained = 0;
+    for (key, entry) in &outcome.book.sessions {
+        if outcome.seen.contains(key) {
+            if fold
+                && !outcome.failed_keys.contains(key)
+                && entry
+                    .scanned
+                    .half(verdict_feature)
+                    .is_none_or(|stamp| stamp.parsed)
+            {
+                fold_days(provider, &entry.days, cutoff, sink);
+            }
+        } else {
+            if fold {
+                fold_days(provider, &entry.days, cutoff, sink);
+            }
+            if !entry.days.is_empty() {
+                retained += 1;
+            }
+        }
+    }
+    diagnostics.retained += retained;
     ledger.record_retained(retained);
-    ledger.put_provider(provider, book);
-    Ok(())
+    ledger.put_provider(provider, outcome.book);
 }
