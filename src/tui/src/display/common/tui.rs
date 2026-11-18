@@ -637,9 +637,6 @@ fn handle_input_from(source: &mut impl EventSource) -> anyhow::Result<InputActio
                 if key.code == KeyCode::Char('r') || key.code == KeyCode::Char('R') {
                     return Ok(InputAction::Refresh);
                 }
-                if key.code == KeyCode::Char('m') || key.code == KeyCode::Char('M') {
-                    return Ok(InputAction::ToggleMerge);
-                }
                 // Navigation accumulates across the drained batch so a held key
                 // collapses into a single net move per tick.
                 match key.code {
@@ -765,9 +762,6 @@ pub enum InputAction {
     TogglePane,
     /// User asked to re-fetch and redraw (`r` / `R`).
     Refresh,
-    /// User toggled provider-prefix merging (`m` / `M`); usage view only,
-    /// ignored elsewhere.
-    ToggleMerge,
     /// User scrolled / moved the selection; redraw without re-fetching.
     Navigate(NavDelta),
     /// A key press, unmapped; only [`handle_key_input`] returns it.
@@ -1115,7 +1109,7 @@ mod tests {
 
         assert_eq!(press(KeyCode::Char('q')), InputAction::Quit);
         assert_eq!(press(KeyCode::Char('r')), InputAction::Refresh);
-        assert_eq!(press(KeyCode::Char('m')), InputAction::ToggleMerge);
+        assert_eq!(press(KeyCode::Char('m')), InputAction::Continue);
         // Esc is distinct from quit so a view with an overlay can back out of it
         // instead of exiting.
         assert_eq!(press(KeyCode::Esc), InputAction::Close);

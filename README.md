@@ -128,19 +128,18 @@ Run `vct --help` to list the commands, and `vct <command> --help` for a command'
 
 `vct` with no command opens the interactive app, one screen with four tabs: `Usage`, `Analysis`, `Quota` and `Settings`. `vct usage`, `vct analysis` and `vct quota` open the same app on their own tab, while `--json`, `--text` and `--table` print and never open it. Without a terminal (piped or redirected), a bare `vct` prints the help and exits with status 2.
 
-| Key                 | Action                                                                      |
-| ------------------- | --------------------------------------------------------------------------- |
-| `Tab` / `Shift+Tab` | Next / previous tab (or click a tab in the top bar)                         |
-| `↑` / `↓`           | Move the selected row                                                       |
-| `Enter`             | Show the selected model's full numbers (and matched pricing model on Usage) |
-| `←` / `→`           | Sort by the column to the left / right (Usage, Analysis)                    |
-| `[` / `]`           | Earlier / later time range: day, week, month, all (Usage, Analysis)         |
-| `r`                 | Refresh now (Usage, Analysis)                                               |
-| `m`                 | Merge / split provider prefixes, saved to the config file (Usage)           |
-| `p`                 | Open the Provider Usage panel (Usage)                                       |
-| `?`                 | List the current tab's keys                                                 |
-| `Esc`               | Close the open panel                                                        |
-| `q`                 | Quit                                                                        |
+| Key                 | Action                                                                     |
+| ------------------- | -------------------------------------------------------------------------- |
+| `Tab` / `Shift+Tab` | Next / previous tab (or click a tab in the top bar)                        |
+| `↑` / `↓`           | Move the selected row                                                      |
+| `Enter`             | Show the selected model's per-provider breakdown, share, and exact numbers |
+| `←` / `→`           | Sort by the column to the left / right (Usage, Analysis)                   |
+| `[` / `]`           | Earlier / later time range: day, week, month, all (Usage, Analysis)        |
+| `r`                 | Refresh now (Usage, Analysis)                                              |
+| `p`                 | Open the Provider Usage panel (Usage)                                      |
+| `?`                 | List the current tab's keys                                                |
+| `Esc`               | Close the open panel                                                       |
+| `q`                 | Quit                                                                       |
 
 The Quota and Settings tabs scan no sessions. The first visit to Usage or Analysis starts that tab's scan, and only the tab on screen refreshes on its timer. The right side of the tab bar shows the time range and vct's own memory and CPU.
 
@@ -191,7 +190,7 @@ vct usage --table --merge-providers
 > `--table` and `--text` sort model rows by cost in ascending order, so the highest-spending model is listed last (right above the `TOTAL` row in `--table`); `--json` lists its rows in no fixed order. The app sorts by cost, highest first, and `←` / `→` move the sort to the column on that side, whose header is highlighted. The right side of the table title names the current sort (`sort: cost ▼`). The app also hides models with zero usage in the selected range.
 
 > [!TIP]
-> The same model can show up as several rows when it is routed under different provider prefixes (`openai/gpt-5.5`, `azure/gpt-5.5`, plain `gpt-5.5`). `--merge-providers` collapses rows that share the base name after the first `/` (versions like `gpt-5.5` vs `gpt-5.4` stay separate) and sums their already-priced cost. On the Usage tab, press `m` to toggle it live (the choice is saved to `~/.vct/config.toml`, so the next launch remembers it); `--merge-providers` opens the tab already merged. `--json` is left as the raw per-model export.
+> The same model can show up under different provider prefixes (`openai/gpt-5.5`, `azure/gpt-5.5`, plain `gpt-5.5`). By default, `vct` collapses rows that share the base name after the first `/` (versions like `gpt-5.5` vs `gpt-5.4` stay separate) and sums their already-priced cost (`Merge models across providers` under `Settings > Usage`, `usage.merge_models = true` in `~/.vct/config.toml`). When turned off in Settings, `--merge-providers` forces merging on for that run. `--json` is left as the raw per-model export.
 
 ### Preview: Usage Tab (`vct usage`)
 
@@ -207,7 +206,7 @@ vct usage --table --merge-providers
 │                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
                                             ● Claude $78.93  ● Gemini $0.40
- ↑↓ move  ←→ sort  [ ] range  p providers  m merge  ⏎ details  r refresh  tab view  ? help  q quit       Star on GitHub
+ ↑↓ move  ←→ sort  [ ] range  p providers  ⏎ details  r refresh  tab view  ? help  q quit                Star on GitHub
 ```
 
 The Usage and Analysis tabs each start their scan on the first visit and draw a centered `Loading sessions...` spinner. Loading stays responsive to `q`, Ctrl+C, and resize events. Later scans keep the last successful data visible with a `Refreshing...` footer. A failed refresh keeps the last-known-good view and retries on the next scheduled or manual refresh. A range with no sessions shows an empty table.
@@ -567,7 +566,7 @@ Switch to the Settings tab with `Tab` (or click `Settings` in the top bar) to ed
 │   Analysis     ││   Check for updates on start                                                                 [x] on│
 │   Providers    ││                                                                                                    │
 │   Remotes      ││ Usage                                                                                              │
-│   Performance  ││   Merge models across providers                                                             [ ] off│
+│   Performance  ││   Merge models across providers                                                              [x] on│
 │   Logging      ││   Redraw interval                                                                          ‹ 10 s ›│
 │                ││   Quota panel: Claude                                                                        [x] on│
 │                ││   Quota panel: Codex                                                                         [x] on│

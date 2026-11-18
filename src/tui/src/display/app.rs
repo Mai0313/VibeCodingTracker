@@ -163,6 +163,26 @@ fn should_rescan(current: bool, active: bool, retry_at: Option<Instant>, now: In
     !current && !active && retry_at.is_none_or(|at| now >= at)
 }
 
+/// Propagates a `Settings` change into the live app state.
+///
+/// Only an actual change to `usage.merge_models` touches `usage`, so a session
+/// started with `--merge-providers` over `merge_models = false` keeps its CLI
+/// override across unrelated settings edits.
+fn apply_settings_update(
+    config: &mut Config,
+    next: Config,
+    usage: &mut UsageUiState,
+    quota: &mut Option<QuotaRuntime>,
+) {
+    if next.usage.quota != config.usage.quota || next.providers != config.providers {
+        *quota = None;
+    }
+    if next.usage.merge_models != config.usage.merge_models {
+        usage.set_merge(next.usage.merge_models);
+    }
+    *config = next;
+}
+
 /// Starts the worker both data tabs scan through, with the one ledger they
 /// share.
 fn spawn_scan_worker(
@@ -444,13 +464,7 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                                     settings.set_message(message, ok);
                                 }
                                 let next = settings.config().clone();
-                                if next.usage.quota != config.usage.quota
-                                    || next.providers != config.providers
-                                {
-                                    quota = None;
-                                }
-                                usage.set_merge(next.usage.merge_models);
-                                config = next;
+                                apply_settings_update(&mut config, next, &mut usage, &mut quota);
                             }
                             SettingsOutcome::Stay => {}
                         }
@@ -530,9 +544,6 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                     InputAction::TogglePane if tab == Tab::Usage && !loading => {
                         usage.provider_panel_open = !usage.provider_panel_open;
                     }
-                    InputAction::ToggleMerge if tab == Tab::Usage && !loading => {
-                        usage.toggle_merge();
-                    }
                     _ => {}
                 }
             }
@@ -540,11 +551,6 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
             if let Some(next) = go_to
                 && next != tab
             {
-                if next == Tab::Settings {
-                    // `m` on the Usage tab writes the file too.
-                    config.usage.merge_models = usage.merge_enabled();
-                    settings.set_config(config.clone());
-                }
                 tab = next;
                 help_open = false;
                 usage.detail_open = false;
@@ -663,7 +669,6 @@ fn help_rows(tab: Tab) -> Vec<(&'static str, &'static str)> {
         ],
     };
     if tab == Tab::Usage {
-        rows.push(("m", "merge or split the same model across providers"));
         rows.push(("p", "per-provider totals"));
     }
     rows.extend([
@@ -856,7 +861,67 @@ mod tests {
             assert!(!keys.contains(&"1-4"), "{tab:?} still lists 1-4");
         }
         let keys = |tab| -> Vec<_> { help_rows(tab).iter().map(|(key, _)| *key).collect() };
-        assert!(keys(Tab::Usage).contains(&"m") && !keys(Tab::Analysis).contains(&"m"));
+        assert!(keys(Tab::Usage).contains(&"p") && !keys(Tab::Analysis).contains(&"p"));
+        assert!(!keys(Tab::Usage).contains(&"m"));
         assert!(keys(Tab::Settings).contains(&"e") && !keys(Tab::Quota).contains(&"⏎"));
+    }
+
+    #[test]
+    fn unrelated_settings_edits_preserve_a_cli_merge_override() {
+        use ratatui::{Terminal, backend::TestBackend};
+        use vct_core::usage::summary::{UsageProviderTotals, UsageRow, UsageTotals};
+
+        let render = |usage: &mut UsageUiState| {
+            let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+            terminal
+                .draw(|f| usage.draw(f, f.area(), None))
+                .expect("draws usage");
+            let buf = terminal.backend().buffer();
+            (0..20u16)
+                .map(|y| {
+                    (0..100u16)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let mut cfg = Config::default();
+        cfg.usage.merge_models = false;
+        // Started with `--merge-providers` over `merge_models = false`.
+        let mut usage = UsageUiState::new(true);
+        usage.apply(UsageRefreshPayload {
+            rows: vec![UsageRow {
+                model: "openai/gpt-5.4".to_string(),
+                total: 10,
+                cost: 1.0,
+                ..UsageRow::default()
+            }],
+            merged_rows: vec![UsageRow {
+                model: "gpt-5.4".to_string(),
+                total: 10,
+                cost: 1.0,
+                ..UsageRow::default()
+            }],
+            totals: UsageTotals::default(),
+            provider_totals: UsageProviderTotals::default(),
+        });
+        let mut quota = None;
+
+        // Editing an unrelated field keeps the merged view intact.
+        let mut next = cfg.clone();
+        next.usage.refresh_interval = 30;
+        apply_settings_update(&mut cfg, next, &mut usage, &mut quota);
+        assert!(!render(&mut usage).contains("openai/gpt-5.4"));
+
+        // Toggling `merge_models` itself updates the live view.
+        let mut toggled_on = cfg.clone();
+        toggled_on.usage.merge_models = true;
+        apply_settings_update(&mut cfg, toggled_on, &mut usage, &mut quota);
+        let mut toggled_off = cfg.clone();
+        toggled_off.usage.merge_models = false;
+        apply_settings_update(&mut cfg, toggled_off, &mut usage, &mut quota);
+        assert!(render(&mut usage).contains("openai/gpt-5.4"));
     }
 }

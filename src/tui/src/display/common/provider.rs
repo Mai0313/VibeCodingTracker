@@ -24,6 +24,23 @@ pub struct ProviderTotal<'a, T> {
     pub emphasize: bool,
 }
 
+/// Foreground color used to draw `provider`'s dot in the TUI.
+pub const fn provider_tui_color(provider: Provider) -> RatatuiColor {
+    match provider {
+        Provider::ClaudeCode => RatatuiColor::Cyan,
+        Provider::Codex => RatatuiColor::Yellow,
+        Provider::Copilot => RatatuiColor::Green,
+        Provider::Gemini => RatatuiColor::LightBlue,
+        Provider::OpenCode => RatatuiColor::Red,
+        Provider::Cursor => RatatuiColor::LightMagenta,
+        Provider::Hermes => RatatuiColor::LightYellow,
+        Provider::Grok => RatatuiColor::LightRed,
+        Provider::DeepSeek => RatatuiColor::LightCyan,
+        Provider::Antigravity => RatatuiColor::Blue,
+        Provider::Unknown => RatatuiColor::Gray,
+    }
+}
+
 impl<'a, T> ProviderTotal<'a, T> {
     /// Creates a per-provider total row with the provider's canonical label and colors.
     ///
@@ -31,58 +48,19 @@ impl<'a, T> ProviderTotal<'a, T> {
     /// a fixed color pair (e.g. Claude → cyan, Codex → yellow). The caller
     /// chooses whether to `emphasize` (bold) the row.
     pub fn new(provider: Provider, stats: &'a T, emphasize: bool) -> Self {
-        let (label, tui_color, table_color) = match provider {
-            Provider::ClaudeCode => (
-                Provider::ClaudeCode.display_name(),
-                RatatuiColor::Cyan,
-                TableColor::Cyan,
-            ),
-            Provider::Codex => (
-                Provider::Codex.display_name(),
-                RatatuiColor::Yellow,
-                TableColor::Yellow,
-            ),
-            Provider::Copilot => (
-                Provider::Copilot.display_name(),
-                RatatuiColor::Green,
-                TableColor::Green,
-            ),
-            Provider::Gemini => (
-                Provider::Gemini.display_name(),
-                RatatuiColor::LightBlue,
-                TableColor::Blue,
-            ),
-            Provider::OpenCode => (
-                Provider::OpenCode.display_name(),
-                RatatuiColor::Red,
-                TableColor::Red,
-            ),
-            Provider::Cursor => (
-                Provider::Cursor.display_name(),
-                RatatuiColor::LightMagenta,
-                TableColor::DarkMagenta,
-            ),
-            Provider::Hermes => (
-                Provider::Hermes.display_name(),
-                RatatuiColor::LightYellow,
-                TableColor::DarkYellow,
-            ),
-            Provider::Grok => (
-                Provider::Grok.display_name(),
-                RatatuiColor::LightRed,
-                TableColor::DarkRed,
-            ),
-            Provider::DeepSeek => (
-                Provider::DeepSeek.display_name(),
-                RatatuiColor::LightCyan,
-                TableColor::DarkCyan,
-            ),
-            Provider::Antigravity => (
-                Provider::Antigravity.display_name(),
-                RatatuiColor::Blue,
-                TableColor::DarkBlue,
-            ),
-            Provider::Unknown => ("Unknown", RatatuiColor::Gray, TableColor::Grey),
+        let tui_color = provider_tui_color(provider);
+        let (label, table_color) = match provider {
+            Provider::ClaudeCode => (Provider::ClaudeCode.display_name(), TableColor::Cyan),
+            Provider::Codex => (Provider::Codex.display_name(), TableColor::Yellow),
+            Provider::Copilot => (Provider::Copilot.display_name(), TableColor::Green),
+            Provider::Gemini => (Provider::Gemini.display_name(), TableColor::Blue),
+            Provider::OpenCode => (Provider::OpenCode.display_name(), TableColor::Red),
+            Provider::Cursor => (Provider::Cursor.display_name(), TableColor::DarkMagenta),
+            Provider::Hermes => (Provider::Hermes.display_name(), TableColor::DarkYellow),
+            Provider::Grok => (Provider::Grok.display_name(), TableColor::DarkRed),
+            Provider::DeepSeek => (Provider::DeepSeek.display_name(), TableColor::DarkCyan),
+            Provider::Antigravity => (Provider::Antigravity.display_name(), TableColor::DarkBlue),
+            Provider::Unknown => ("Unknown", TableColor::Grey),
         };
 
         Self {

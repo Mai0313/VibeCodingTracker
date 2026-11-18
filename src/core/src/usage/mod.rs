@@ -17,7 +17,7 @@ pub use pipeline::{PricedUsageScan, scan_usage_priced};
 pub use priced::{PricedUsageRow, price_usage_data};
 // Shared merged-cost resolver used by both the `usage --json` payload and the
 // `summary` roll-up.
-pub(crate) use priced::resolve_merged_model_cost;
+pub(crate) use priced::resolve_merged_model_breakdown;
 // Now lives in `utils`; re-exported to keep the historical
 // `usage::normalize_usage_value` path working for library callers.
 pub use crate::utils::normalize_usage_value;

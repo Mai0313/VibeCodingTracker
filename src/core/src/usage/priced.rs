@@ -4,8 +4,9 @@
 //! and returns a `Serialize`-able row set, so a non-CLI consumer produces the
 //! same shape the CLI emits.
 
-use crate::models::PerProviderUsage;
+use crate::models::{PerProviderUsage, Provider};
 use crate::pricing::{CostSource, ModelPricingMap, resolve_model_cost};
+use crate::usage::summary::ModelProviderUsage;
 use crate::usage::{StoredCosts, UsageData};
 use crate::utils::{extract_token_counts, normalize_usage_value};
 use serde::Serialize;
@@ -64,8 +65,16 @@ pub fn price_usage_data(
     rows
 }
 
+/// Resolved cost, optional matched pricing key, and per-provider breakdown for
+/// one merged model row.
+pub(crate) struct MergedModelCost {
+    pub cost: f64,
+    pub matched_model: Option<String>,
+    pub providers: Vec<ModelProviderUsage>,
+}
+
 /// Resolves cost for one merged per-model row from its provider-scoped usage
-/// pieces.
+/// pieces, along with each contributing provider's tokens and cost.
 ///
 /// The merged row is priced by summing each provider's own portion under that
 /// provider's cost basis (LiteLLM for the file providers, an exact match else
@@ -74,60 +83,96 @@ pub fn price_usage_data(
 /// gauge), so OpenCode's stored cost applies only to OpenCode's own tokens even
 /// when another provider shares the row. Returns `None` when no provider bucket
 /// holds `model`.
+pub(crate) fn resolve_merged_model_breakdown(
+    model: &str,
+    per_provider: &PerProviderUsage,
+    pricing_map: &ModelPricingMap,
+    stored_costs: &StoredCosts,
+) -> Option<MergedModelCost> {
+    let PerProviderUsage {
+        claude,
+        codex,
+        copilot,
+        gemini,
+        opencode,
+        cursor,
+        hermes,
+        grok,
+        deepseek,
+        antigravity,
+    } = per_provider;
+
+    let stored =
+        |m: &crate::constants::FastHashMap<String, f64>| m.get(model).copied().unwrap_or(0.0);
+
+    let mut total_cost = 0.0;
+    let mut matched_model = None;
+    let mut found = false;
+    let mut providers = Vec::new();
+
+    for (provider, usage, source) in [
+        (Provider::ClaudeCode, claude, CostSource::Litellm),
+        (Provider::Codex, codex, CostSource::Litellm),
+        (Provider::Copilot, copilot, CostSource::Litellm),
+        (Provider::Gemini, gemini, CostSource::Litellm),
+        (Provider::DeepSeek, deepseek, CostSource::Litellm),
+        (Provider::Antigravity, antigravity, CostSource::Litellm),
+        (Provider::Grok, grok, CostSource::GrokGauge),
+        (
+            Provider::OpenCode,
+            opencode,
+            CostSource::OpenCodeStored(stored(&stored_costs.opencode)),
+        ),
+        (Provider::Cursor, cursor, CostSource::CursorEstimate),
+        (
+            Provider::Hermes,
+            hermes,
+            CostSource::HermesStored(stored(&stored_costs.hermes)),
+        ),
+    ] {
+        if let Some(raw_usage) = usage.get(model) {
+            found = true;
+            let counts = extract_token_counts(raw_usage);
+            let (cost, matched) = resolve_model_cost(model, &counts, pricing_map, source);
+            total_cost += cost;
+            if matched_model.is_none() {
+                matched_model = matched;
+            }
+            if counts.total != 0 || cost != 0.0 {
+                providers.push(ModelProviderUsage {
+                    provider,
+                    total_tokens: counts.total,
+                    cost,
+                });
+            }
+        }
+    }
+
+    providers.sort_by(|a, b| {
+        b.cost
+            .partial_cmp(&a.cost)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.total_tokens.cmp(&a.total_tokens))
+            .then_with(|| a.provider.display_name().cmp(b.provider.display_name()))
+    });
+
+    found.then_some(MergedModelCost {
+        cost: total_cost,
+        matched_model,
+        providers,
+    })
+}
+
+/// Resolves cost for one merged per-model row from its provider-scoped usage
+/// pieces.
 pub(crate) fn resolve_merged_model_cost(
     model: &str,
     per_provider: &PerProviderUsage,
     pricing_map: &ModelPricingMap,
     stored_costs: &StoredCosts,
 ) -> Option<(f64, Option<String>)> {
-    let mut total_cost = 0.0;
-    let mut matched_model = None;
-    let mut found = false;
-
-    for usage in [
-        &per_provider.claude,
-        &per_provider.codex,
-        &per_provider.copilot,
-        &per_provider.gemini,
-        &per_provider.deepseek,
-        &per_provider.antigravity,
-    ] {
-        if let Some(raw_usage) = usage.get(model) {
-            found = true;
-            let (cost, matched) =
-                price_usage_value(model, raw_usage, pricing_map, CostSource::Litellm);
-            total_cost += cost;
-            if matched_model.is_none() {
-                matched_model = matched;
-            }
-        }
-    }
-
-    let stored =
-        |m: &crate::constants::FastHashMap<String, f64>| m.get(model).copied().unwrap_or(0.0);
-    for (usage, source) in [
-        (&per_provider.grok, CostSource::GrokGauge),
-        (
-            &per_provider.opencode,
-            CostSource::OpenCodeStored(stored(&stored_costs.opencode)),
-        ),
-        (&per_provider.cursor, CostSource::CursorEstimate),
-        (
-            &per_provider.hermes,
-            CostSource::HermesStored(stored(&stored_costs.hermes)),
-        ),
-    ] {
-        if let Some(raw_usage) = usage.get(model) {
-            found = true;
-            let (cost, matched) = price_usage_value(model, raw_usage, pricing_map, source);
-            total_cost += cost;
-            if matched_model.is_none() {
-                matched_model = matched;
-            }
-        }
-    }
-
-    found.then_some((total_cost, matched_model))
+    resolve_merged_model_breakdown(model, per_provider, pricing_map, stored_costs)
+        .map(|resolved| (resolved.cost, resolved.matched_model))
 }
 
 /// Prices one raw usage value under `source`.
