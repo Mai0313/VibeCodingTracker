@@ -91,7 +91,22 @@ where
     T: serde::Serialize,
     P: AsRef<Path>,
 {
-    write_json_atomic_inner(path.as_ref(), value, false)
+    write_json_atomic_inner(path.as_ref(), value, false).map(|_| ())
+}
+
+/// Like [`write_json_atomic`], returning the persisted file's metadata so a
+/// caller can stamp the exact inode and mtime it just wrote without racing a
+/// concurrent writer.
+pub(crate) fn write_json_atomic_metadata<T, P>(
+    path: P,
+    value: &T,
+) -> Result<Option<std::fs::Metadata>>
+where
+    T: serde::Serialize,
+    P: AsRef<Path>,
+{
+    let file = write_json_atomic_inner(path.as_ref(), value, false)?;
+    Ok(file.metadata().ok())
 }
 
 /// Like [`write_json_atomic`] but pretty-prints the JSON.
@@ -109,7 +124,7 @@ where
     T: serde::Serialize,
     P: AsRef<Path>,
 {
-    write_json_atomic_inner(path.as_ref(), value, true)
+    write_json_atomic_inner(path.as_ref(), value, true).map(|_| ())
 }
 
 /// Shared body of the two atomic JSON writers; `pretty` selects the layout.
@@ -117,12 +132,12 @@ where
 /// The serializer emits many small writes, so they are buffered: an
 /// unbuffered session ledger of a few megabytes cost millions of `write`
 /// syscalls and several seconds.
-fn write_json_atomic_inner<T>(path: &Path, value: &T, pretty: bool) -> Result<()>
+fn write_json_atomic_inner<T>(path: &Path, value: &T, pretty: bool) -> Result<File>
 where
     T: serde::Serialize,
 {
     persist_atomic(path, |tmp| {
-        let mut writer = std::io::BufWriter::new(tmp);
+        let mut writer = std::io::BufWriter::with_capacity(buffer::FILE_READ_BUFFER, tmp);
         if pretty {
             serde_json::to_writer_pretty(&mut writer, value).context("Failed to serialize JSON")?;
         } else {
@@ -147,6 +162,7 @@ pub fn write_string_atomic<P: AsRef<Path>>(path: P, contents: &str) -> Result<()
         tmp.write_all(contents.as_bytes())
             .context("Failed to write file contents")
     })
+    .map(|_| ())
 }
 
 /// Runs `write` against a temp file in `path`'s directory, fsyncs it
@@ -154,7 +170,7 @@ pub fn write_string_atomic<P: AsRef<Path>>(path: P, contents: &str) -> Result<()
 fn persist_atomic(
     path: &Path,
     write: impl FnOnce(&mut tempfile::NamedTempFile) -> Result<()>,
-) -> Result<()> {
+) -> Result<File> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir)
         .with_context(|| format!("Failed to create directory: {}", dir.display()))?;
@@ -166,8 +182,7 @@ fn persist_atomic(
     write(&mut tmp)?;
     tmp.as_file().sync_all().ok();
     tmp.persist(path)
-        .with_context(|| format!("Failed to persist file: {}", path.display()))?;
-    Ok(())
+        .with_context(|| format!("Failed to persist file: {}", path.display()))
 }
 
 /// Reads a single JSON document and returns it wrapped in a one-element `Vec`.

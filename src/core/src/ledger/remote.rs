@@ -8,6 +8,7 @@
 //! marked missing, and replaced whole by the next fetch.
 
 use super::format::{DayEntry, LedgerFile, LedgerHeader, SCHEMA_VERSION, SessionEntry};
+use super::tiny_map::TinyMap;
 use super::{ALL_PROVIDERS, LEDGER_DIR_NAME, SessionLedger, provider_file_stem, provider_path};
 use crate::constants::{FastHashMap, FastHashSet};
 use crate::models::ExtensionType;
@@ -50,7 +51,7 @@ struct ExportFile<'a> {
 
 #[derive(Serialize)]
 struct ExportSession<'a> {
-    days: &'a BTreeMap<String, DayEntry>,
+    days: &'a TinyMap<String, DayEntry>,
 }
 
 #[derive(Deserialize)]

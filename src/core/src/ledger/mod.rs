@@ -18,11 +18,12 @@ pub(crate) mod format;
 pub(crate) mod key;
 pub(crate) mod remote;
 pub(crate) mod stamp;
+pub(crate) mod tiny_map;
 
 use crate::constants::{FastHashMap, FastHashSet};
 use crate::models::ExtensionType;
-use crate::utils::file::ATOMIC_TEMP_PREFIX;
-use crate::utils::{now_rfc3339_utc_nanos, write_json_atomic_pretty};
+use crate::utils::file::{ATOMIC_TEMP_PREFIX, write_json_atomic_metadata};
+use crate::utils::now_rfc3339_utc_nanos;
 use anyhow::Result;
 pub(crate) use format::{
     DayEntry, HalfStamps, ScanFeature, ScanStamp, SessionEntry, merge_analysis_rows,
@@ -30,8 +31,10 @@ pub(crate) use format::{
 use format::{LedgerFile, LedgerHeader, SCHEMA_VERSION};
 pub use remote::{EXPORT_LINE_PREFIX, REMOTES_DIR_NAME, prune_remotes, remote_dir, store_export};
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
+pub(crate) use tiny_map::TinyMap;
 
 /// The directory under `~/.vct` that holds the per-provider ledger files.
 pub const LEDGER_DIR_NAME: &str = "sessions";
@@ -40,6 +43,9 @@ pub const LEDGER_DIR_NAME: &str = "sessions";
 ///
 /// A save takes seconds, so anything this old belongs to no running process.
 const STALE_TEMP_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// Minimum file size worth spawning a worker thread for during [`SessionLedger::open`].
+const PARALLEL_LOAD_MIN_BYTES: u64 = 64 * 1024;
 
 /// Observable ledger statistics used by tests and diagnostic logging.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -98,9 +104,37 @@ impl SessionLedger {
     pub fn open(cache_dir: &Path) -> Self {
         let dir = cache_dir.join(LEDGER_DIR_NAME);
         remove_stale_temp_files(&dir);
-        let mut providers = FastHashMap::default();
+        let mut large = Vec::new();
+        let mut small = Vec::with_capacity(ALL_PROVIDERS.len());
         for provider in ALL_PROVIDERS {
-            providers.insert(provider, load_provider(&provider_path(&dir, provider)));
+            let path = provider_path(&dir, provider);
+            if std::fs::metadata(&path)
+                .is_ok_and(|metadata| metadata.len() >= PARALLEL_LOAD_MIN_BYTES)
+            {
+                large.push((provider, path));
+            } else {
+                small.push((provider, path));
+            }
+        }
+        let mut providers = FastHashMap::default();
+        if large.is_empty() {
+            for (provider, path) in small {
+                providers.insert(provider, load_provider(&path));
+            }
+        } else {
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = large
+                    .into_iter()
+                    .map(|(provider, path)| scope.spawn(move || (provider, load_provider(&path))))
+                    .collect();
+                for (provider, path) in small {
+                    providers.insert(provider, load_provider(&path));
+                }
+                for handle in handles {
+                    let (provider, book) = handle.join().expect("ledger loader thread panicked");
+                    providers.insert(provider, book);
+                }
+            });
         }
         Self {
             dir: Some(dir),
@@ -135,12 +169,17 @@ impl SessionLedger {
             if !book.dirty || book.read_only {
                 continue;
             }
-            match adopt_unseen_sessions(&provider_path(dir, *provider), &mut book.sessions) {
-                Adoption::Writable => {}
-                Adoption::Skip => continue,
-                Adoption::Freeze => {
-                    book.read_only = true;
-                    continue;
+            let path = provider_path(dir, *provider);
+            let unchanged = book.disk_state != DiskState::Unknown
+                && current_disk_state(&path) == Some(book.disk_state);
+            if !unchanged {
+                match adopt_unseen_sessions(&path, &mut book.sessions) {
+                    Adoption::Writable => {}
+                    Adoption::Skip => continue,
+                    Adoption::Freeze => {
+                        book.read_only = true;
+                        continue;
+                    }
                 }
             }
             let file = LedgerFile {
@@ -149,10 +188,15 @@ impl SessionLedger {
                 source: book.source.clone(),
                 sessions: std::mem::take(&mut book.sessions),
             };
-            let written = write_json_atomic_pretty(provider_path(dir, *provider), &file);
+            let written = write_json_atomic_metadata(&path, &file);
             book.sessions = file.sessions;
             match written {
-                Ok(()) => book.dirty = false,
+                Ok(metadata) => {
+                    book.dirty = false;
+                    book.disk_state = metadata.as_ref().map_or(DiskState::Unknown, |meta| {
+                        DiskState::Present(DiskFileStamp::from_metadata(meta))
+                    });
+                }
                 Err(error) => {
                     log::warn!(
                         "failed to write the {} session ledger: {error:#}",
@@ -239,6 +283,48 @@ pub(crate) struct ProviderLedger {
     pub(crate) sessions: BTreeMap<String, SessionEntry>,
     pub(crate) dirty: bool,
     read_only: bool,
+    disk_state: DiskState,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum DiskState {
+    #[default]
+    Unknown,
+    Absent,
+    Present(DiskFileStamp),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiskFileStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+}
+
+impl DiskFileStamp {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            dev: metadata.dev(),
+            #[cfg(unix)]
+            ino: metadata.ino(),
+        }
+    }
+}
+
+fn current_disk_state(path: &Path) -> Option<DiskState> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Some(DiskState::Present(DiskFileStamp::from_metadata(&metadata))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(DiskState::Absent),
+        Err(_) => None,
+    }
 }
 
 impl ProviderLedger {
@@ -400,10 +486,13 @@ fn remove_stale_temp_files(dir: &Path) {
 }
 
 fn load_provider(path: &Path) -> ProviderLedger {
-    let body = match std::fs::read(path) {
-        Ok(body) => body,
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return ProviderLedger::default();
+            return ProviderLedger {
+                disk_state: DiskState::Absent,
+                ..Default::default()
+            };
         }
         Err(error) => {
             // A file that exists but cannot be read must not be overwritten by
@@ -415,16 +504,28 @@ fn load_provider(path: &Path) -> ProviderLedger {
             };
         }
     };
+    let metadata = file.metadata().ok();
+    let mut body = Vec::with_capacity(metadata.as_ref().map_or(0, |meta| meta.len() as usize));
+    if let Err(error) = file.read_to_end(&mut body) {
+        log::warn!("cannot read session ledger {}: {error}", path.display());
+        return ProviderLedger {
+            read_only: true,
+            ..Default::default()
+        };
+    }
     match serde_json::from_slice::<LedgerFile>(&body) {
-        Ok(file) if file.schema_version == SCHEMA_VERSION => {
+        Ok(parsed) if parsed.schema_version == SCHEMA_VERSION => {
             return ProviderLedger {
-                source: file.source,
-                sessions: file.sessions,
+                source: parsed.source,
+                sessions: parsed.sessions,
                 dirty: false,
                 read_only: false,
+                disk_state: metadata.as_ref().map_or(DiskState::Unknown, |meta| {
+                    DiskState::Present(DiskFileStamp::from_metadata(meta))
+                }),
             };
         }
-        Ok(file) => return set_aside_or_freeze(path, file.schema_version),
+        Ok(parsed) => return set_aside_or_freeze(path, parsed.schema_version),
         Err(error) => {
             if let Ok(header) = serde_json::from_slice::<LedgerHeader>(&body)
                 && header.schema_version != SCHEMA_VERSION
@@ -678,5 +779,32 @@ mod tests {
         assert_eq!(SessionLedger::open(dir.path()).stats().entries, 1);
         ledger.save_if_due(Duration::ZERO).unwrap();
         assert_eq!(SessionLedger::open(dir.path()).stats().entries, 2);
+    }
+
+    #[test]
+    fn saving_without_external_changes_drops_removed_sessions_and_writes_compact_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = SessionLedger::open(dir.path());
+        let mut book = ledger.take_provider(ExtensionType::ClaudeCode);
+        book.sessions
+            .insert("first".into(), entry_with_day("2026-09-08"));
+        book.sessions
+            .insert("second".into(), entry_with_day("2026-09-08"));
+        book.dirty = true;
+        ledger.put_provider(ExtensionType::ClaudeCode, book);
+        ledger.save().unwrap();
+
+        // Removing an entry in the owning ledger must not resurrect it from disk
+        // when no external writer touched the file since the previous save.
+        let mut book = ledger.take_provider(ExtensionType::ClaudeCode);
+        book.sessions.remove("second");
+        book.dirty = true;
+        ledger.put_provider(ExtensionType::ClaudeCode, book);
+        ledger.save().unwrap();
+
+        let path = provider_path(&dir.path().join(LEDGER_DIR_NAME), ExtensionType::ClaudeCode);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(raw.lines().count(), 1);
+        assert_eq!(SessionLedger::open(dir.path()).stats().entries, 1);
     }
 }

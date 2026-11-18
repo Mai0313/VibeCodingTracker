@@ -11,7 +11,7 @@ use super::database::{DatabaseHalfRead, group_usage_rows};
 use super::{ScanDiagnostics, ScanFeature};
 use crate::constants::{FastHashMap, FastHashSet};
 use crate::ledger::key::relative_key;
-use crate::ledger::{DayEntry, ScanStamp, SessionLedger, stamp, today};
+use crate::ledger::{DayEntry, ScanStamp, SessionLedger, TinyMap, stamp, today};
 use crate::models::{ExtensionType, TimeRange};
 use crate::session::ParseMode;
 use crate::session::cursor::{
@@ -21,12 +21,11 @@ use crate::session::cursor::{
 use crate::session::sqlite::is_cacheable_sqlite_failure;
 use crate::utils::{HelperPaths, get_current_user, get_machine_id};
 use anyhow::Result;
-use std::collections::BTreeMap;
 use std::path::Path;
 
 /// One store's `feature` half from one read.
 struct StoreHalfRead {
-    days: BTreeMap<String, DayEntry>,
+    days: TinyMap<String, DayEntry>,
     parsed: bool,
     failure: Option<String>,
 }
@@ -79,7 +78,7 @@ fn read_store_half(
             } else {
                 None
             };
-            let mut days: BTreeMap<String, DayEntry> = BTreeMap::new();
+            let mut days: TinyMap<String, DayEntry> = TinyMap::new();
             for (date, analysis) in read.rows {
                 days.entry(date)
                     .or_default()
