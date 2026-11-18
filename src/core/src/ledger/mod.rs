@@ -246,10 +246,15 @@ impl SessionLedger {
         }
     }
 
-    /// Starts one scan and resets its per-scan counters.
-    pub(crate) fn begin_scan(&mut self) {
+    /// Resets per-scan counters without reloading remote snapshots.
+    pub(crate) fn begin_local_scan(&mut self) {
         self.parsed_sources = 0;
         self.retained = 0;
+    }
+
+    /// Starts one scan and resets its per-scan counters.
+    pub(crate) fn begin_scan(&mut self) {
+        self.begin_local_scan();
         self.reload_remotes();
     }
 

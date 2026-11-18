@@ -32,6 +32,17 @@ pub(crate) fn relative_key(roots: &[&Path], path: &Path) -> String {
         .iter()
         .find_map(|root| path.strip_prefix(root).ok())
         .map(|relative| {
+            if let Some(text) = relative.to_str()
+                && !text.is_empty()
+                && text != "."
+                && !text.contains('\\')
+                && !text.contains("//")
+                && !text.starts_with("./")
+                && !text.contains("/./")
+                && !text.ends_with('/')
+            {
+                return text.to_string();
+            }
             relative
                 .components()
                 .map(|component| component.as_os_str().to_string_lossy())

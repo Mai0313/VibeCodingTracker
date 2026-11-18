@@ -905,3 +905,44 @@ fn pruning_removes_only_the_snapshots_of_unconfigured_remotes() {
     assert!(!remote_dir(cache, "gone").exists());
     assert!(stray_file.exists());
 }
+
+#[test]
+fn export_refreshes_a_file_session_whose_analysis_half_is_missing() {
+    let (remote, _) = claude_home();
+    let providers = only(ExtensionType::ClaudeCode);
+    let pool = vct_core::scan::build_scan_pool(2).unwrap();
+
+    let mut first = Vec::new();
+    vct_core::remote::export_from_paths(&remote.paths, providers, &pool, None, &mut first).unwrap();
+
+    // Simulate a ledger entry whose usage stamp is current while its analysis
+    // stamp and counters were dropped: `export` must detect the missing half in
+    // its single walk and repopulate `analysis`.
+    let path = provider_path(
+        &remote.paths.cache_dir.join(LEDGER_DIR_NAME),
+        ExtensionType::ClaudeCode,
+    );
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let entry = &mut doc["sessions"]["proj/session.jsonl"];
+    entry["scanned"].as_object_mut().unwrap().remove("analysis");
+    for day in entry["days"].as_object_mut().unwrap().values_mut() {
+        day.as_object_mut().unwrap().remove("analysis");
+    }
+    std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
+
+    let mut second = Vec::new();
+    vct_core::remote::export_from_paths(&remote.paths, providers, &pool, None, &mut second)
+        .unwrap();
+
+    let local = TempHome::new();
+    store_export(
+        &local.paths.cache_dir,
+        "devbox",
+        &String::from_utf8(second).unwrap(),
+    )
+    .unwrap();
+    let rows = analysis(&local, TimeRange::All, providers, &mut open(&local));
+    assert_eq!(rows.data.per_provider.claude.len(), 1);
+    assert!(rows.data.rows[0].edit_lines > 0);
+}

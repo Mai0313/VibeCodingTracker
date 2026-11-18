@@ -6,20 +6,16 @@
 //! come back. A host that cannot be reached keeps the snapshot of its last
 //! successful fetch.
 
-use crate::analysis::aggregate_sessions_by_model_from_paths_with_cache;
 use crate::config::{ProvidersConfig, RemotesConfig};
 use crate::ledger::{SessionLedger, prune_remotes, store_export};
-use crate::models::TimeRange;
-use crate::pricing::{ModelPricingMap, fetch_model_pricing};
-use crate::usage::{UsageScanOptions, aggregate_usage_from_paths_with_cache_opts};
-use crate::utils::{network_disabled, resolve_paths};
+use crate::pricing::{ModelPricingMap, TierThresholds, fetch_model_pricing};
+use crate::utils::{HelperPaths, network_disabled, resolve_paths};
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// How long one host gets to connect, scan and answer while a one-shot
@@ -79,11 +75,9 @@ const INSTALL_AND_EXPORT: &str = concat!(
 /// Scans this machine through its ledger and writes the export another
 /// machine fetches: `vct ledger export`.
 ///
-/// Both halves of every session are brought up to date first. The usage scan
-/// goes first because its one parse of a file fills both halves, where an
-/// analysis parse leaves the usage half unclassified for the usage scan to
-/// read again. A pricing fetch that fails classifies nothing, as in `vct
-/// usage`.
+/// Both halves of every session are brought up to date first in a single file
+/// discovery pass without folding in-memory summaries or reloading remote
+/// snapshots. A pricing fetch that fails classifies nothing, as in `vct usage`.
 ///
 /// # Errors
 ///
@@ -95,30 +89,25 @@ pub fn export(
     writer: impl Write,
 ) -> Result<()> {
     let paths = resolve_paths()?;
-    let mut ledger = SessionLedger::open(&paths.cache_dir);
     let pricing = fetch_model_pricing().unwrap_or_else(|error| {
         log::warn!("failed to fetch pricing data: {error}; exporting unclassified usage");
         ModelPricingMap::new(HashMap::new())
     });
-    let options = UsageScanOptions {
-        tiers: Some(Arc::new(pricing.tier_thresholds())),
-    };
-    pool.install(|| -> Result<()> {
-        aggregate_usage_from_paths_with_cache_opts(
-            &paths,
-            TimeRange::All,
-            providers,
-            &mut ledger,
-            &options,
-        )?;
-        aggregate_sessions_by_model_from_paths_with_cache(
-            &paths,
-            TimeRange::All,
-            providers,
-            &mut ledger,
-        )?;
-        Ok(())
-    })?;
+    let tiers = pricing.tier_thresholds();
+    export_from_paths(&paths, providers, pool, Some(&tiers), writer)
+}
+
+/// Testable [`export`] entry point rooted at explicit `paths` and `tiers`.
+#[doc(hidden)]
+pub fn export_from_paths(
+    paths: &HelperPaths,
+    providers: ProvidersConfig,
+    pool: &rayon::ThreadPool,
+    tiers: Option<&TierThresholds>,
+    writer: impl Write,
+) -> Result<()> {
+    let mut ledger = SessionLedger::open(&paths.cache_dir);
+    pool.install(|| crate::scan::refresh_ledger_for_export(paths, providers, &mut ledger, tiers))?;
     if let Err(error) = ledger.save() {
         log::warn!("failed to save the session ledger: {error:#}");
     }

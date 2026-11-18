@@ -105,6 +105,31 @@ pub(crate) fn group_analysis_rows(
     }
 }
 
+/// Reads OpenCode's analysis half in `UsageOnly` mode and groups it into a
+/// [`DatabaseHalfRead`].
+pub(crate) fn read_opencode_analysis_half(db_path: &Path) -> Result<DatabaseHalfRead> {
+    let read = crate::session::opencode::read_opencode_analysis_with_diagnostics(
+        db_path,
+        TimeRange::All,
+        crate::session::ParseMode::UsageOnly,
+    )?;
+    let complete_failure = read.expected_records > 0 && read.parsed_records == 0;
+    let failed = read.expected_records.saturating_sub(read.parsed_records) + read.failed_tool_parts;
+    let failure = if complete_failure {
+        Some(format!(
+            "none of {} analysis records used a recognized schema",
+            read.expected_records
+        ))
+    } else if failed > 0 {
+        Some(format!(
+            "{failed} analysis payloads used an unsupported schema"
+        ))
+    } else {
+        None
+    };
+    Ok(group_analysis_rows(read.rows, !complete_failure, failure))
+}
+
 /// Scans one whole-database provider's `feature` half through the ledger.
 ///
 /// `read` runs only when the database's stamp is stale; it must read every

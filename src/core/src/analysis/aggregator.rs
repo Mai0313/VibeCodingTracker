@@ -3,7 +3,7 @@ use crate::constants::{FastHashMap, capacity};
 use crate::ledger::{DayEntry, SessionLedger, merge_analysis_rows};
 use crate::models::TimeRange;
 use crate::models::{CodeAnalysis, ExtensionType, ProviderActiveDays};
-use crate::scan::{ScanFeature, group_analysis_rows, scan_cursor_stores, scan_database_half};
+use crate::scan::{ScanFeature, scan_cursor_stores, scan_database_half};
 use crate::session::cursor::read_cursor_analysis_with_diagnostics;
 use crate::session::diagnostics::DatabaseAnalysisRow;
 use crate::session::opencode::read_opencode_analysis_with_diagnostics;
@@ -550,29 +550,7 @@ pub fn aggregate_sessions_by_model_from_paths_with_cache(
             ledger,
             &mut projection,
             &mut diagnostics,
-            || {
-                let read = read_opencode_analysis_with_diagnostics(
-                    &paths.opencode_db,
-                    TimeRange::All,
-                    ParseMode::UsageOnly,
-                )?;
-                let complete_failure = read.expected_records > 0 && read.parsed_records == 0;
-                let failed = read.expected_records.saturating_sub(read.parsed_records)
-                    + read.failed_tool_parts;
-                let failure = if complete_failure {
-                    Some(format!(
-                        "none of {} analysis records used a recognized schema",
-                        read.expected_records
-                    ))
-                } else if failed > 0 {
-                    Some(format!(
-                        "{failed} analysis payloads used an unsupported schema"
-                    ))
-                } else {
-                    None
-                };
-                Ok(group_analysis_rows(read.rows, !complete_failure, failure))
-            },
+            || crate::scan::database::read_opencode_analysis_half(&paths.opencode_db),
         );
     }
     if providers.cursor {
