@@ -16,7 +16,9 @@ use crate::session::state::{ParseMode, SessionParseState};
 use crate::utils::token_merge::write_tier_slice;
 use crate::utils::{MAX_TIER_LEVELS, TierSlice};
 use anyhow::{Context, Result, bail};
-use serde_json::{Map, Value, json};
+use serde::{Deserialize, Deserializer};
+use serde_json::{Map, Value, json, value::RawValue};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -245,6 +247,67 @@ pub(crate) fn is_dsh_header(value: &Value) -> bool {
         && object.get("id").is_some_and(Value::is_string)
 }
 
+#[derive(Deserialize)]
+struct BorrowedDshRecord<'a> {
+    #[serde(borrow, rename = "type")]
+    kind: Cow<'a, str>,
+    #[serde(default)]
+    time: Option<i64>,
+    #[serde(default)]
+    seq: Option<i64>,
+    #[serde(default)]
+    version: Option<i64>,
+    #[serde(default, borrow)]
+    id: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    cwd: Option<Cow<'a, str>>,
+    #[serde(default, rename = "createdAt")]
+    created_at: Option<i64>,
+    #[serde(default, borrow)]
+    data: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct BorrowedRequestContext<'a> {
+    #[serde(default, borrow)]
+    model: Option<Cow<'a, str>>,
+}
+
+#[derive(Default, Deserialize)]
+struct BorrowedChunkData<'a> {
+    #[serde(default)]
+    turn: Option<i64>,
+    #[serde(default)]
+    step: Option<i64>,
+    #[serde(default, borrow)]
+    chunk: Option<BorrowedChunk<'a>>,
+}
+
+fn deserialize_present_raw<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<&'de RawValue>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    <&'de RawValue>::deserialize(deserializer).map(Some)
+}
+
+#[derive(Deserialize)]
+struct BorrowedChunk<'a> {
+    #[serde(default, borrow, rename = "type")]
+    kind: Option<Cow<'a, str>>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    usage: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct BorrowedToolCallData<'a> {
+    #[serde(default, borrow)]
+    name: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    arguments: Option<Cow<'a, str>>,
+}
+
 struct DshParser<'a> {
     state: SessionParseState,
     usage: FastHashMap<String, ModelUsage>,
@@ -274,21 +337,178 @@ impl<'a> DshParser<'a> {
     }
 
     /// Consumes every complete line, returning the read error that stopped it.
-    fn read_lines<R: BufRead>(&mut self, reader: R) -> Option<std::io::Error> {
-        for line in reader.lines() {
-            let line = match line {
-                Ok(line) => line,
+    fn read_lines<R: BufRead>(&mut self, mut reader: R) -> Option<std::io::Error> {
+        let mut line = Vec::with_capacity(buffer::AVG_JSONL_LINE_SIZE);
+        loop {
+            line.clear();
+            match reader.read_until(b'\n', &mut line) {
+                Ok(0) => break,
+                Ok(_) => {}
                 Err(error) => return Some(error),
+            }
+            let Ok(text) = std::str::from_utf8(&line) else {
+                return Some(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "stream did not contain valid UTF-8",
+                ));
             };
-            if line.trim().is_empty() {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
                 continue;
             }
-            match serde_json::from_str::<Value>(&line) {
+            if let Ok(env) = serde_json::from_str::<BorrowedDshRecord<'_>>(trimmed)
+                && self.push_borrowed(env)
+            {
+                continue;
+            }
+            match serde_json::from_str::<Value>(trimmed) {
                 Ok(record) => self.push(&record),
                 Err(_) => self.diagnostics.record_malformed(),
             }
         }
         None
+    }
+
+    /// Fast zero-copy handler for standard envelope records; returns `false`
+    /// before mutating state if an uncommon field shape needs [`Self::push`].
+    fn push_borrowed(&mut self, env: BorrowedDshRecord<'_>) -> bool {
+        let kind = env.kind.as_ref();
+        if IGNORED_RECORD_TYPES.contains(&kind) {
+            if let Some(time) = env.time {
+                self.state.last_ts = self.state.last_ts.max(time);
+            }
+            self.diagnostics.record_recognized_source();
+            return true;
+        }
+
+        match kind {
+            "session" => {
+                if let Some(time) = env.time {
+                    self.state.last_ts = self.state.last_ts.max(time);
+                }
+                match env.version {
+                    Some(SUPPORTED_FORMAT_VERSION) => {
+                        if let Some(id) = env.id {
+                            self.state.task_id = id.into_owned();
+                        }
+                        if let Some(cwd) = env.cwd {
+                            self.state.folder_path = cwd.into_owned();
+                        }
+                        if let Some(created) = env.created_at {
+                            self.state.last_ts = self.state.last_ts.max(created);
+                        }
+                    }
+                    version => {
+                        self.unsupported_version = Some(version.unwrap_or(-1));
+                    }
+                }
+                self.diagnostics.record_recognized_source();
+                true
+            }
+            "request/context" => {
+                let model = match env.data {
+                    Some(raw) => {
+                        let Ok(ctx) = serde_json::from_str::<BorrowedRequestContext<'_>>(raw.get())
+                        else {
+                            return false;
+                        };
+                        ctx.model
+                    }
+                    None => None,
+                };
+                if let Some(time) = env.time {
+                    self.state.last_ts = self.state.last_ts.max(time);
+                }
+                if let Some(model) = model {
+                    self.route_model.clear();
+                    self.route_model.push_str(&model);
+                }
+                self.diagnostics.record_recognized_source();
+                true
+            }
+            "assistant/chunk" => {
+                let parsed_chunk = match env.data {
+                    Some(raw) => {
+                        let Ok(data) = serde_json::from_str::<BorrowedChunkData<'_>>(raw.get())
+                        else {
+                            return false;
+                        };
+                        data
+                    }
+                    None => BorrowedChunkData::default(),
+                };
+                if parsed_chunk
+                    .chunk
+                    .as_ref()
+                    .and_then(|chunk| chunk.kind.as_deref())
+                    != Some("usage")
+                {
+                    if let Some(time) = env.time {
+                        self.state.last_ts = self.state.last_ts.max(time);
+                    }
+                    self.diagnostics.record_recognized_source();
+                    return true;
+                }
+                let Some(usage_raw) = parsed_chunk.chunk.and_then(|chunk| chunk.usage) else {
+                    if let Some(time) = env.time {
+                        self.state.last_ts = self.state.last_ts.max(time);
+                    }
+                    self.diagnostics.record_recognized_source();
+                    return true;
+                };
+                let Ok(usage_val) = serde_json::from_str::<Value>(usage_raw.get()) else {
+                    return false;
+                };
+                if let Some(time) = env.time {
+                    self.state.last_ts = self.state.last_ts.max(time);
+                }
+                let model = self.route_model.clone();
+                self.apply_usage_fields(
+                    parsed_chunk.turn.unwrap_or(0),
+                    parsed_chunk.step.unwrap_or(0),
+                    Some(&usage_val),
+                    model,
+                );
+                self.diagnostics.record_recognized_source();
+                true
+            }
+            "tool/call" => {
+                let call = match env.data {
+                    Some(raw) => {
+                        let Ok(call) = serde_json::from_str::<BorrowedToolCallData<'_>>(raw.get())
+                        else {
+                            return false;
+                        };
+                        Some(call)
+                    }
+                    None => None,
+                };
+                if let Some(time) = env.time {
+                    self.state.last_ts = self.state.last_ts.max(time);
+                }
+                if let (Some(seq), Some(call)) = (env.seq, call)
+                    && let (Some(name), Some(arguments)) = (call.name, call.arguments)
+                {
+                    self.pending_calls.insert(
+                        seq,
+                        PendingCall {
+                            name: name.into_owned(),
+                            arguments: arguments.into_owned(),
+                        },
+                    );
+                }
+                self.diagnostics.record_recognized_source();
+                true
+            }
+            "assistant/message" | "tool/result" => false,
+            _ => {
+                if let Some(time) = env.time {
+                    self.state.last_ts = self.state.last_ts.max(time);
+                }
+                self.diagnostics.record_unrecognized();
+                true
+            }
+        }
     }
 
     fn push(&mut self, record: &Value) {
@@ -373,6 +593,15 @@ impl<'a> DshParser<'a> {
     /// next one supersedes describes the same billing event, so counting both
     /// would report two records where the log has one.
     fn apply_usage(&mut self, data: &Value, usage: Option<&Value>, model: String) {
+        self.apply_usage_fields(
+            data.get("turn").and_then(Value::as_i64).unwrap_or(0),
+            data.get("step").and_then(Value::as_i64).unwrap_or(0),
+            usage,
+            model,
+        );
+    }
+
+    fn apply_usage_fields(&mut self, turn: i64, step: i64, usage: Option<&Value>, model: String) {
         // An assistant message carries no `usage` when the adapter reported
         // none; that is a routing fact, not a schema failure.
         let Some(usage) = usage else {
@@ -383,8 +612,8 @@ impl<'a> DshParser<'a> {
             return;
         };
         let sample = UsageSample {
-            turn: data.get("turn").and_then(Value::as_i64).unwrap_or(0),
-            step: data.get("step").and_then(Value::as_i64).unwrap_or(0),
+            turn,
+            step,
             model,
             tokens: DshTokens::from_usage(usage),
         };
@@ -883,5 +1112,38 @@ mod tests {
         let parsed = parse(&path);
         assert!(!parsed.diagnostics.is_complete_failure());
         assert!(parsed.analysis.records[0].conversation_usage.is_empty());
+    }
+
+    #[test]
+    fn explicit_null_chunk_usage_is_reported_as_schema_drift() {
+        let dir = TempDir::new().unwrap();
+        let route = json!({
+            "type": "request/context",
+            "seq": 1,
+            "time": 1,
+            "data": {"model": "deepseek-reasoner"},
+        })
+        .to_string();
+        let chunk = json!({
+            "type": "assistant/chunk",
+            "seq": 2,
+            "time": 2,
+            "data": {
+                "turn": 1,
+                "step": 1,
+                "chunk": {"type": "usage", "usage": null},
+            },
+        })
+        .to_string();
+        let path = write_frames(
+            &dir,
+            "session.jsonl.zstd",
+            &[vec![HEADER.to_string()], vec![route, chunk]],
+        );
+
+        let parsed = parse(&path);
+        assert_eq!(parsed.diagnostics.relevant_records, 1);
+        assert_eq!(parsed.diagnostics.failed_relevant_records, 1);
+        assert!(parsed.diagnostics.is_complete_failure());
     }
 }

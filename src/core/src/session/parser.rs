@@ -5,8 +5,8 @@ use crate::models::{
 };
 use crate::pricing::TierThresholds;
 use crate::session::antigravity::parse_antigravity_session;
-use crate::session::claude::parse_claude_logs_with_diagnostics;
-use crate::session::codex::parse_codex_log_iter_with_diagnostics;
+use crate::session::claude::{parse_claude_jsonl_path, parse_claude_logs_with_diagnostics};
+use crate::session::codex::{parse_codex_jsonl_path, parse_codex_log_iter_with_diagnostics};
 use crate::session::copilot::parse_copilot_events_with_diagnostics;
 use crate::session::detector::{RecordClassifier, detect_extension_type};
 use crate::session::diagnostics::{ParseDiagnostics, ParsedAnalysis};
@@ -337,66 +337,8 @@ fn stream_parse_known(
     tiers: Option<&TierThresholds>,
 ) -> Result<Option<ParsedAnalysis>> {
     match provider {
-        ExtensionType::ClaudeCode => {
-            let Some(mut stream) = prepare_typed_stream::<ClaudeCodeLog>(path, provider)? else {
-                return Ok(None);
-            };
-            let diagnostics = Rc::new(RefCell::new(stream.diagnostics));
-            let warnings = Rc::new(RefCell::new(stream.warnings));
-            let io_failure = Rc::new(RefCell::new(None));
-            let rest = iter_jsonl_typed(
-                &mut stream.reader,
-                provider,
-                stream.lines_read,
-                Rc::clone(&diagnostics),
-                Rc::clone(&warnings),
-                Rc::clone(&io_failure),
-            );
-            let parsed = parse_claude_logs_with_diagnostics(
-                stream.first.into_iter().chain(rest),
-                mode,
-                tiers,
-            );
-            warnings.borrow().emit(path);
-            if let Some(error) = io_failure.borrow_mut().take() {
-                bail!("Failed to read session file {}: {error}", path.display());
-            }
-            let parsed = parsed?;
-            Ok(Some(finalize(
-                merge_extra_diagnostics(parsed, &diagnostics),
-                provider,
-            )))
-        }
-        ExtensionType::Codex => {
-            let Some(mut stream) = prepare_typed_stream::<CodexLog>(path, provider)? else {
-                return Ok(None);
-            };
-            let diagnostics = Rc::new(RefCell::new(stream.diagnostics));
-            let warnings = Rc::new(RefCell::new(stream.warnings));
-            let io_failure = Rc::new(RefCell::new(None));
-            let rest = iter_jsonl_typed(
-                &mut stream.reader,
-                provider,
-                stream.lines_read,
-                Rc::clone(&diagnostics),
-                Rc::clone(&warnings),
-                Rc::clone(&io_failure),
-            );
-            let parsed = parse_codex_log_iter_with_diagnostics(
-                stream.first.into_iter().chain(rest),
-                mode,
-                tiers,
-            );
-            warnings.borrow().emit(path);
-            if let Some(error) = io_failure.borrow_mut().take() {
-                bail!("Failed to read session file {}: {error}", path.display());
-            }
-            let parsed = parsed?;
-            Ok(Some(finalize(
-                merge_extra_diagnostics(parsed, &diagnostics),
-                provider,
-            )))
-        }
+        ExtensionType::ClaudeCode => parse_claude_jsonl_path(path, mode, tiers),
+        ExtensionType::Codex => parse_codex_jsonl_path(path, mode, tiers),
         ExtensionType::Copilot => {
             let Some(mut stream) = prepare_typed_stream::<CopilotEvent>(path, provider)? else {
                 return Ok(None);
@@ -484,6 +426,91 @@ struct TypedStream<T> {
     /// Physical lines the first record consumed, so the rest of the file keeps
     /// reporting real line numbers.
     lines_read: usize,
+}
+
+/// Push-based JSONL line streamer that borrows each record directly from one
+/// reusable byte buffer instead of allocating owned per-line values.
+pub(crate) fn stream_jsonl_borrowed<S>(
+    path: &Path,
+    provider: ExtensionType,
+    mut state: S,
+    mut on_line: impl FnMut(&mut S, &[u8]) -> std::result::Result<(), serde_json::Error>,
+    finish: impl FnOnce(S) -> Result<ParsedAnalysis>,
+) -> Result<Option<ParsedAnalysis>> {
+    let file =
+        File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
+    let mut reader = BufReader::with_capacity(buffer::FILE_READ_BUFFER, file);
+    let mut line = Vec::with_capacity(buffer::AVG_JSONL_LINE_SIZE);
+    let mut lines_read = 0_usize;
+
+    if !read_next_non_empty_bytes(&mut reader, &mut line, &mut lines_read)? {
+        return Ok(None);
+    }
+
+    let bytes = trim_ascii_whitespace(&line);
+    let mut diagnostics = ParseDiagnostics::default();
+    let mut warnings = ParseWarningSummary::default();
+    if let Err(typed_error) = on_line(&mut state, bytes) {
+        match serde_json::from_slice::<Value>(bytes) {
+            Ok(value) => {
+                record_typed_schema_failure(
+                    provider,
+                    &value,
+                    &mut diagnostics,
+                    &mut warnings,
+                    &typed_error,
+                );
+            }
+            Err(_) => return Ok(None),
+        }
+    }
+
+    let mut io_failure: Option<String> = None;
+    loop {
+        line.clear();
+        lines_read += 1;
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(err) => {
+                warnings.record_unreadable(lines_read, &err);
+                io_failure = Some(err.to_string());
+                break;
+            }
+        }
+
+        let bytes = trim_ascii_whitespace(&line);
+        if bytes.is_empty() {
+            continue;
+        }
+
+        if let Err(typed_error) = on_line(&mut state, bytes) {
+            match serde_json::from_slice::<Value>(bytes) {
+                Ok(value) => {
+                    record_typed_schema_failure(
+                        provider,
+                        &value,
+                        &mut diagnostics,
+                        &mut warnings,
+                        &typed_error,
+                    );
+                }
+                Err(error) => {
+                    warnings.record_malformed(lines_read, &error);
+                    diagnostics.record_malformed();
+                }
+            }
+        }
+    }
+
+    let parsed = finish(state);
+    warnings.emit(path);
+    if let Some(error) = io_failure {
+        bail!("Failed to read session file {}: {error}", path.display());
+    }
+    let mut parsed = parsed?;
+    parsed.diagnostics.merge(diagnostics);
+    Ok(Some(finalize(parsed, provider)))
 }
 
 /// Opens a JSONL source and parses its first record directly into `T`.

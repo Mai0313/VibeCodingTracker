@@ -21,7 +21,9 @@ use crate::utils::{MAX_TIER_LEVELS, TierSlice};
 use anyhow::{Context, Result};
 use percent_encoding::percent_decode_str;
 use rusqlite::OptionalExtension;
-use serde_json::{Map, Value, json};
+use serde::{Deserialize, Deserializer};
+use serde_json::{Map, Value, json, value::RawValue};
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -56,6 +58,21 @@ impl Tokens {
             input: field("input_tokens"),
             output: field("output_tokens"),
             cache_read: field("cache_read_tokens"),
+        })
+    }
+
+    fn from_borrowed(
+        input: Option<Option<i64>>,
+        output: Option<Option<i64>>,
+        cache_read: Option<Option<i64>>,
+    ) -> Option<Self> {
+        if input.is_none() && output.is_none() && cache_read.is_none() {
+            return None;
+        }
+        Some(Self {
+            input: input.flatten().unwrap_or(0),
+            output: output.flatten().unwrap_or(0),
+            cache_read: cache_read.flatten().unwrap_or(0),
         })
     }
 
@@ -143,23 +160,39 @@ pub(crate) fn parse_antigravity_session(
     {
         parser.state.task_id = id.to_string_lossy().into_owned();
     }
-    for (index, line) in BufReader::with_capacity(buffer::FILE_READ_BUFFER, file)
-        .lines()
-        .enumerate()
-    {
-        let line = line.with_context(|| {
+    let mut reader = BufReader::with_capacity(buffer::FILE_READ_BUFFER, file);
+    let mut line = Vec::with_capacity(buffer::AVG_JSONL_LINE_SIZE);
+    let mut index = 0_usize;
+    loop {
+        line.clear();
+        index += 1;
+        let count = reader.read_until(b'\n', &mut line).with_context(|| {
             format!(
-                "Failed to read Antigravity transcript line {}: {}",
-                index + 1,
+                "Failed to read Antigravity transcript line {index}: {}",
                 path.display()
             )
         })?;
-        if line.trim().is_empty() {
+        if count == 0 {
+            break;
+        }
+        let text = std::str::from_utf8(&line)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+            .with_context(|| {
+                format!(
+                    "Failed to read Antigravity transcript line {index}: {}",
+                    path.display()
+                )
+            })?;
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
             continue;
         }
-        match serde_json::from_str::<Value>(&line) {
-            Ok(record) => parser.push(&record),
-            Err(_) => parser.diagnostics.record_malformed(),
+        match serde_json::from_str::<BorrowedStep<'_>>(trimmed) {
+            Ok(step) => parser.push_borrowed(step),
+            Err(_) => match serde_json::from_str::<Value>(trimmed) {
+                Ok(record) => parser.push(&record),
+                Err(_) => parser.diagnostics.record_malformed(),
+            },
         }
     }
     Ok(parser.finish())
@@ -326,6 +359,45 @@ struct PendingCall {
     args: Value,
 }
 
+fn deserialize_present_opt_i64<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Option<i64>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<i64>::deserialize(deserializer).map(Some)
+}
+
+#[derive(Deserialize)]
+struct BorrowedStep<'a> {
+    #[serde(borrow, rename = "type")]
+    kind: Cow<'a, str>,
+    #[serde(default, borrow)]
+    created_at: Option<Cow<'a, str>>,
+    #[serde(default)]
+    step_index: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_present_opt_i64")]
+    input_tokens: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "deserialize_present_opt_i64")]
+    output_tokens: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "deserialize_present_opt_i64")]
+    cache_read_tokens: Option<Option<i64>>,
+    #[serde(default, borrow)]
+    status: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    content: Option<&'a RawValue>,
+    #[serde(default, borrow)]
+    tool_calls: Option<Vec<BorrowedToolCall<'a>>>,
+}
+
+#[derive(Deserialize)]
+struct BorrowedToolCall<'a> {
+    #[serde(default)]
+    name: String,
+    #[serde(default, borrow)]
+    args: Option<&'a RawValue>,
+}
+
 struct AntigravityParser<'a> {
     state: SessionParseState,
     usage: FastHashMap<String, ModelUsage>,
@@ -440,10 +512,92 @@ impl<'a> AntigravityParser<'a> {
         self.diagnostics.record_recognized_source();
     }
 
+    fn push_borrowed(&mut self, step: BorrowedStep<'_>) {
+        let timestamp = step.created_at.as_deref().map_or(0, parse_iso_timestamp);
+        self.state.last_ts = self.state.last_ts.max(timestamp);
+
+        match step.kind.as_ref() {
+            "PLANNER_RESPONSE" => {
+                if let Some(idx) = step.step_index
+                    && let Some(model) = self.meta.step_models.get(&idx)
+                {
+                    self.current_model = Some(model.clone());
+                }
+                let model = self
+                    .current_model
+                    .clone()
+                    .unwrap_or_else(|| UNKNOWN_MODEL.to_string());
+                if let Some(tokens) = Tokens::from_borrowed(
+                    step.input_tokens,
+                    step.output_tokens,
+                    step.cache_read_tokens,
+                ) {
+                    self.apply_tokens(tokens, model);
+                }
+                self.pending_calls.clear();
+                for call in step.tool_calls.into_iter().flatten() {
+                    let args = if matches!(
+                        call.name.as_str(),
+                        "read_file" | "write_file" | "edit_file" | "run_command"
+                    ) {
+                        call.args
+                            .and_then(|raw| serde_json::from_str::<Value>(raw.get()).ok())
+                            .unwrap_or(Value::Null)
+                    } else {
+                        Value::Null
+                    };
+                    self.pending_calls.push_back(PendingCall {
+                        name: call.name,
+                        args,
+                    });
+                }
+            }
+            "CHECKPOINT" => {
+                if let Some(tokens) = Tokens::from_borrowed(
+                    step.input_tokens,
+                    step.output_tokens,
+                    step.cache_read_tokens,
+                ) {
+                    self.diagnostics.record_relevant(true);
+                    let model = self
+                        .current_model
+                        .clone()
+                        .unwrap_or_else(|| UNKNOWN_MODEL.to_string());
+                    let level = self.classifier.as_mut().map_or(0, |classifier| {
+                        classifier.level(&model, tokens.request_context())
+                    });
+                    let entry = self.compaction.entry(model).or_default();
+                    entry.total.merge(tokens);
+                    entry.classify(level, tokens);
+                }
+            }
+            "GENERIC" => {
+                if let Some(call) = self.pending_calls.pop_front() {
+                    self.apply_result_fields(
+                        &call,
+                        step.status.as_deref(),
+                        step.content,
+                        timestamp,
+                    );
+                }
+            }
+            "USER_INPUT" | "SYSTEM_MESSAGE" => {}
+            _ => {
+                self.diagnostics.record_unrecognized();
+                return;
+            }
+        }
+        self.diagnostics.record_recognized_source();
+    }
+
     fn apply_usage(&mut self, object: &Map<String, Value>, model: String) {
         let Some(tokens) = Tokens::from_record(object) else {
             return;
         };
+        self.apply_tokens(tokens, model);
+    }
+
+    fn apply_tokens(&mut self, tokens: Tokens, model: String) {
         self.diagnostics.record_relevant(true);
         let level = self.classifier.as_mut().map_or(0, |classifier| {
             classifier.level(&model, tokens.request_context())
@@ -454,13 +608,47 @@ impl<'a> AntigravityParser<'a> {
     }
 
     fn apply_result(&mut self, call: &PendingCall, result: &Map<String, Value>, timestamp: i64) {
+        self.apply_result_inner(
+            call,
+            result.get("status").and_then(Value::as_str),
+            || {
+                result
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(Cow::Borrowed)
+            },
+            timestamp,
+        );
+    }
+
+    fn apply_result_fields(
+        &mut self,
+        call: &PendingCall,
+        status: Option<&str>,
+        content_raw: Option<&RawValue>,
+        timestamp: i64,
+    ) {
+        self.apply_result_inner(
+            call,
+            status,
+            || content_raw.and_then(|raw| serde_json::from_str::<Cow<'_, str>>(raw.get()).ok()),
+            timestamp,
+        );
+    }
+
+    fn apply_result_inner<'c>(
+        &mut self,
+        call: &PendingCall,
+        status: Option<&str>,
+        read_content: impl FnOnce() -> Option<Cow<'c, str>>,
+        timestamp: i64,
+    ) {
         if !matches!(
             call.name.as_str(),
             "read_file" | "write_file" | "edit_file" | "run_command"
         ) {
             return;
         }
-        let status = result.get("status").and_then(Value::as_str);
         // A command moved to a background task has already started running.
         let ran =
             status == Some("DONE") || (status == Some("RUNNING") && call.name == "run_command");
@@ -473,9 +661,8 @@ impl<'a> AntigravityParser<'a> {
             "read_file" => arg("Path")
                 .filter(|path| !path.is_empty())
                 .is_some_and(|path| {
-                    let content = result
-                        .get("content")
-                        .and_then(Value::as_str)
+                    let content = read_content()
+                        .as_deref()
                         .map(numbered_lines)
                         .unwrap_or_default();
                     if content.is_empty() {

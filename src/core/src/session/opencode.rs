@@ -34,10 +34,12 @@ use crate::session::sqlite::with_readonly_connection;
 use crate::session::state::{ParseMode, SessionParseState};
 use crate::utils::{get_current_user, get_machine_id};
 use anyhow::{Result, anyhow};
-use rusqlite::Connection;
-use serde_json::Value;
+use rusqlite::{Connection, types::ValueRef};
+use serde::{Deserialize, Deserializer};
 #[cfg(test)]
 use serde_json::json;
+use serde_json::{Value, value::RawValue};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -163,13 +165,12 @@ pub(crate) fn read_opencode_analysis_with_diagnostics(
     let cutoff_ms = cutoff_millis(time_range);
     with_readonly_connection(db_path, "session", "vct-opencode-", "OpenCode", |conn| {
         let transaction = conn.unchecked_transaction()?;
-        let expected_records = count_analysis_candidates(&transaction, cutoff_ms)?;
         let collected = collect_analysis(&transaction, cutoff_ms, mode)?;
         let parsed_records = collected.rows.len();
         transaction.commit()?;
         Ok(OpenCodeAnalysisRead {
             rows: collected.rows,
-            expected_records,
+            expected_records: collected.expected_records,
             parsed_records,
             failed_tool_parts: collected.failed_tool_parts,
         })
@@ -193,6 +194,7 @@ struct AnalysisAccum {
 
 struct CollectedAnalysis {
     rows: Vec<DatabaseAnalysisRow>,
+    expected_records: usize,
     failed_tool_parts: usize,
 }
 
@@ -219,56 +221,6 @@ const MESSAGE_TIMESTAMP_SQL: &str = "COALESCE( \
           THEN CAST(json_extract(message.data, '$.time.created') AS INTEGER) END, \
      session.time_updated \
      )";
-
-/// Counts rows that should be understood by the current analysis reader.
-///
-/// Every branch selects exactly what its collector counterpart selects: a row
-/// counted here but unreachable there is reported as schema drift, and a
-/// database made up entirely of such rows fails the whole scan. That is also
-/// why `cutoff_ms` arrives as a value rather than a [`TimeRange`] to resolve
-/// here — resolving it twice would let a scan that straddles local midnight
-/// count one period and collect another.
-fn count_analysis_candidates(conn: &Connection, cutoff_ms: Option<i64>) -> Result<usize> {
-    let (sql, parameterized) = if table_exists(conn, "message")? {
-        match cutoff_ms {
-            Some(_) => (
-                format!(
-                    "SELECT COUNT(*) FROM message \
-                     JOIN session ON session.id = message.session_id \
-                     WHERE json_extract(message.data, '$.role') = 'assistant' \
-                       AND {MESSAGE_TIMESTAMP_SQL} >= ?1"
-                ),
-                true,
-            ),
-            None => (
-                "SELECT COUNT(*) FROM message \
-                 JOIN session ON session.id = message.session_id \
-                 WHERE json_extract(message.data, '$.role') = 'assistant'"
-                    .to_string(),
-                false,
-            ),
-        }
-    } else {
-        match cutoff_ms {
-            Some(_) => (
-                "SELECT COUNT(*) FROM session \
-                 WHERE model IS NOT NULL AND model != '' AND time_updated >= ?1"
-                    .to_string(),
-                true,
-            ),
-            None => (
-                "SELECT COUNT(*) FROM session WHERE model IS NOT NULL AND model != ''".to_string(),
-                false,
-            ),
-        }
-    };
-    let count: i64 = if parameterized {
-        conn.query_row(&sql, [cutoff_ms.unwrap_or_default()], |row| row.get(0))?
-    } else {
-        conn.query_row(&sql, [], |row| row.get(0))?
-    };
-    Ok(usize::try_from(count).unwrap_or_default())
-}
 
 /// Collects the `usage` view from assistant messages when available.
 fn collect_usage(
@@ -381,15 +333,15 @@ fn collect_message_usage(
     while let Some(row) = rows.next()? {
         expected_records += 1;
         let message_ts = row.get::<_, i64>(0)?;
-        let data_text = row.get::<_, String>(1)?;
-        let session_id = row.get::<_, String>(2)?;
-        let directory = row.get::<_, Option<String>>(3)?;
-        let Some(message) = parse_message_usage(&data_text) else {
+        let data_text = row.get_ref(1)?.as_str()?;
+        let Some(message) = parse_message_usage(data_text) else {
             continue;
         };
         let Some(date) = ms_to_local_date(message_ts) else {
             continue;
         };
+        let session_id = row.get::<_, String>(2)?;
+        let directory = row.get::<_, Option<String>>(3)?;
 
         let tier_level = classifier.as_mut().map_or(0, |classifier| {
             classifier.level(&message.model_id, request_context(&message.usage))
@@ -439,6 +391,7 @@ fn collect_session_analysis(
 
     // 1. Load session metadata and seed one parse state per session.
     let mut sessions: HashMap<String, AnalysisAccum> = HashMap::new();
+    let mut expected_records = 0usize;
     {
         let sql = match cutoff_ms {
             Some(_) => {
@@ -460,8 +413,9 @@ fn collect_session_analysis(
         };
 
         while let Some(row) = rows.next()? {
+            expected_records += 1;
             let id = row.get::<_, String>(0)?;
-            let model = row.get::<_, String>(1)?;
+            let model = row.get_ref(1)?.as_str()?;
             let directory = row.get::<_, String>(2)?;
             let ts = row.get::<_, i64>(3)?;
             let input = row.get::<_, i64>(4)?;
@@ -469,7 +423,7 @@ fn collect_session_analysis(
             let reasoning = row.get::<_, i64>(6)?;
             let cache_read = row.get::<_, i64>(7)?;
             let cache_write = row.get::<_, i64>(8)?;
-            let Some(model_id) = parse_model_id(&model) else {
+            let Some(model_id) = parse_model_id(model) else {
                 continue;
             };
             let Some(date) = ms_to_local_date(ts) else {
@@ -524,20 +478,17 @@ fn collect_session_analysis(
         };
 
         while let Some(row) = rows.next()? {
-            let session_id = row.get::<_, String>(0)?;
-            let data_text = row.get::<_, String>(1)?;
-            let Some(accum) = sessions.get_mut(&session_id) else {
+            let ValueRef::Text(session_id_bytes) = row.get_ref(0)? else {
                 continue;
             };
-            let Ok(data) = serde_json::from_str::<Value>(&data_text) else {
-                failed_tool_parts += 1;
+            let Ok(session_id) = std::str::from_utf8(session_id_bytes) else {
                 continue;
             };
-            if let Some("tool") = data.get("type").and_then(|v| v.as_str())
-                && apply_tool_part(&mut accum.state, &data) == ToolPartOutcome::Unsupported
-            {
-                failed_tool_parts += 1;
-            }
+            let Some(accum) = sessions.get_mut(session_id) else {
+                continue;
+            };
+            let data_text = row.get_ref(1)?.as_str()?;
+            fold_tool_part_str(&mut accum.state, data_text, &mut failed_tool_parts);
         }
     }
 
@@ -557,6 +508,7 @@ fn collect_session_analysis(
 
     Ok(CollectedAnalysis {
         rows: out,
+        expected_records,
         failed_tool_parts,
     })
 }
@@ -571,6 +523,7 @@ fn collect_message_analysis(
     let machine = get_machine_id().to_string();
 
     let mut messages: HashMap<String, AnalysisAccum> = HashMap::new();
+    let mut expected_records = 0usize;
     {
         let sql = match cutoff_ms {
             Some(_) => format!(
@@ -594,12 +547,13 @@ fn collect_message_analysis(
         };
 
         while let Some(row) = rows.next()? {
+            expected_records += 1;
             let message_id = row.get::<_, String>(0)?;
             let session_id = row.get::<_, String>(1)?;
-            let data_text = row.get::<_, String>(2)?;
+            let data_text = row.get_ref(2)?.as_str()?;
             let directory = row.get::<_, String>(3)?;
             let message_ts = row.get::<_, i64>(4)?;
-            let Some(message) = parse_message_usage(&data_text) else {
+            let Some(message) = parse_message_usage(data_text) else {
                 continue;
             };
             let Some(date) = ms_to_local_date(message_ts) else {
@@ -638,12 +592,13 @@ fn collect_message_analysis(
                    AND {MESSAGE_TIMESTAMP_SQL} >= ?1 \
                  ORDER BY part.id"
             ),
-            None => "SELECT part.message_id, part.data \
+            // `messages` already holds the assistant messages selected above, so
+            // the unwindowed path avoids joining and re-extracting `message.data`
+            // on every tool part row.
+            None => "SELECT message_id, data \
                  FROM part \
-                 JOIN message ON message.id = part.message_id \
-                 WHERE json_extract(message.data, '$.role') = 'assistant' \
-                   AND json_extract(part.data, '$.type') = 'tool' \
-                 ORDER BY part.id"
+                 WHERE json_extract(data, '$.type') = 'tool' \
+                 ORDER BY id"
                 .to_string(),
         };
         let mut stmt = conn.prepare(&sql)?;
@@ -653,20 +608,17 @@ fn collect_message_analysis(
         };
 
         while let Some(row) = rows.next()? {
-            let message_id = row.get::<_, String>(0)?;
-            let data_text = row.get::<_, String>(1)?;
-            let Some(accum) = messages.get_mut(&message_id) else {
+            let ValueRef::Text(message_id_bytes) = row.get_ref(0)? else {
                 continue;
             };
-            let Ok(data) = serde_json::from_str::<Value>(&data_text) else {
-                failed_tool_parts += 1;
+            let Ok(message_id) = std::str::from_utf8(message_id_bytes) else {
                 continue;
             };
-            if let Some("tool") = data.get("type").and_then(|v| v.as_str())
-                && apply_tool_part(&mut accum.state, &data) == ToolPartOutcome::Unsupported
-            {
-                failed_tool_parts += 1;
-            }
+            let Some(accum) = messages.get_mut(message_id) else {
+                continue;
+            };
+            let data_text = row.get_ref(1)?.as_str()?;
+            fold_tool_part_str(&mut accum.state, data_text, &mut failed_tool_parts);
         }
     }
 
@@ -686,6 +638,7 @@ fn collect_message_analysis(
 
     Ok(CollectedAnalysis {
         rows: out,
+        expected_records,
         failed_tool_parts,
     })
 }
@@ -697,14 +650,121 @@ enum ToolPartOutcome {
     Unsupported,
 }
 
+fn deserialize_present_raw<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<&'de RawValue>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    <&'de RawValue>::deserialize(deserializer).map(Some)
+}
+
+#[derive(Deserialize)]
+struct BorrowedToolPart<'a> {
+    #[serde(
+        default,
+        borrow,
+        rename = "type",
+        deserialize_with = "deserialize_present_raw"
+    )]
+    kind: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    tool: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    state: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct BorrowedToolState<'a> {
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    status: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    input: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    output: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    time: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct BorrowedToolTime<'a> {
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    start: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct BorrowedToolInput<'a> {
+    #[serde(
+        default,
+        borrow,
+        rename = "filePath",
+        deserialize_with = "deserialize_present_raw"
+    )]
+    file_path: Option<&'a RawValue>,
+    #[serde(
+        default,
+        borrow,
+        rename = "oldString",
+        deserialize_with = "deserialize_present_raw"
+    )]
+    old_string: Option<&'a RawValue>,
+    #[serde(
+        default,
+        borrow,
+        rename = "newString",
+        deserialize_with = "deserialize_present_raw"
+    )]
+    new_string: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    content: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    command: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    description: Option<&'a RawValue>,
+    #[serde(
+        default,
+        borrow,
+        rename = "patchText",
+        deserialize_with = "deserialize_present_raw"
+    )]
+    patch_text: Option<&'a RawValue>,
+}
+
+fn decode_raw_str(raw: Option<&RawValue>) -> Option<Cow<'_, str>> {
+    serde_json::from_str::<Cow<'_, str>>(raw?.get()).ok()
+}
+
+fn fold_tool_part_str(
+    state: &mut SessionParseState,
+    data_text: &str,
+    failed_tool_parts: &mut usize,
+) {
+    let part = match serde_json::from_str::<BorrowedToolPart<'_>>(data_text) {
+        Ok(part) => part,
+        Err(_) => {
+            if serde_json::from_str::<Value>(data_text).is_err() {
+                *failed_tool_parts += 1;
+            }
+            return;
+        }
+    };
+    if decode_raw_str(part.kind).as_deref() != Some("tool") {
+        return;
+    }
+    if apply_tool_part(state, &part) == ToolPartOutcome::Unsupported {
+        *failed_tool_parts += 1;
+    }
+}
+
 /// Dispatches a single `part` (type `tool`) onto the session parse state.
 ///
 /// Only the tools the analyzer tracks across providers are folded in
 /// (`read`, `edit`, `write`, `bash`, `todowrite`, `apply_patch`); auxiliary
 /// tools such as `task`, `grep`, `glob`, `webfetch`, and `question` are ignored
 /// to stay consistent with the other providers' tool-count semantics.
-fn apply_tool_part(state: &mut SessionParseState, data: &Value) -> ToolPartOutcome {
-    let tool = data.get("tool").and_then(|v| v.as_str()).unwrap_or("");
+fn apply_tool_part(state: &mut SessionParseState, data: &BorrowedToolPart<'_>) -> ToolPartOutcome {
+    let tool = decode_raw_str(data.tool);
+    let tool = tool.as_deref().unwrap_or("");
     if !matches!(
         tool,
         "read" | "edit" | "write" | "bash" | "todowrite" | "apply_patch"
@@ -712,38 +772,49 @@ fn apply_tool_part(state: &mut SessionParseState, data: &Value) -> ToolPartOutco
         return ToolPartOutcome::Irrelevant;
     }
 
-    let Some(st) = data.get("state").and_then(Value::as_object) else {
+    let Some(state_raw) = data.state.filter(|raw| raw.get().starts_with('{')) else {
         return ToolPartOutcome::Unsupported;
     };
-    let Some(status) = st.get("status").and_then(Value::as_str) else {
+    let Ok(st) = serde_json::from_str::<BorrowedToolState<'_>>(state_raw.get()) else {
         return ToolPartOutcome::Unsupported;
     };
-    match status {
+    let Some(status) = decode_raw_str(st.status) else {
+        return ToolPartOutcome::Unsupported;
+    };
+    match status.as_ref() {
         "completed" => {}
         "pending" | "running" | "error" => return ToolPartOutcome::Irrelevant,
         _ => return ToolPartOutcome::Unsupported,
     }
 
-    let input = st.get("input").and_then(Value::as_object);
+    let input = st
+        .input
+        .filter(|raw| raw.get().starts_with('{'))
+        .and_then(|raw| serde_json::from_str::<BorrowedToolInput<'_>>(raw.get()).ok());
     let ts = st
-        .get("time")
-        .and_then(|t| t.get("start"))
-        .and_then(|v| v.as_i64())
+        .time
+        .filter(|raw| raw.get().starts_with('{'))
+        .and_then(|raw| serde_json::from_str::<BorrowedToolTime<'_>>(raw.get()).ok())
+        .and_then(|t| t.start)
+        .and_then(|raw| serde_json::from_str::<i64>(raw.get()).ok())
         .unwrap_or(state.last_ts);
 
-    let str_in = |key: &str| -> Option<&str> { input?.get(key)?.as_str() };
+    let str_in =
+        |field: for<'a> fn(&'a BorrowedToolInput<'a>) -> Option<&'a RawValue>| -> Option<Cow<'_, str>> {
+            decode_raw_str(input.as_ref().and_then(field))
+        };
 
     match tool {
         "read" => {
             let (Some(path), Some(output)) = (
-                str_in("filePath").filter(|path| !path.is_empty()),
-                st.get("output").and_then(Value::as_str),
+                str_in(|i| i.file_path).filter(|path| !path.is_empty()),
+                decode_raw_str(st.output),
             ) else {
                 return ToolPartOutcome::Unsupported;
             };
-            let content = extract_read_content(output);
+            let content = extract_read_content(&output);
             if !content.is_empty() {
-                state.add_read_detail(path, &content, ts);
+                state.add_read_detail(&path, &content, ts);
             } else {
                 // Directory listings (and empty reads) still count as a read
                 // invocation even though they contribute no file lines.
@@ -752,44 +823,43 @@ fn apply_tool_part(state: &mut SessionParseState, data: &Value) -> ToolPartOutco
         }
         "edit" => {
             let (Some(path), Some(old), Some(new)) = (
-                str_in("filePath").filter(|path| !path.is_empty()),
-                str_in("oldString"),
-                str_in("newString"),
+                str_in(|i| i.file_path).filter(|path| !path.is_empty()),
+                str_in(|i| i.old_string),
+                str_in(|i| i.new_string),
             ) else {
                 return ToolPartOutcome::Unsupported;
             };
-            state.add_edit_detail(path, old, new, ts);
+            state.add_edit_detail(&path, &old, &new, ts);
         }
         "write" => {
             let (Some(path), Some(content)) = (
-                str_in("filePath").filter(|path| !path.is_empty()),
-                str_in("content"),
+                str_in(|i| i.file_path).filter(|path| !path.is_empty()),
+                str_in(|i| i.content),
             ) else {
                 return ToolPartOutcome::Unsupported;
             };
-            state.add_write_detail(path, content, ts);
+            state.add_write_detail(&path, &content, ts);
         }
         "bash" => {
-            let Some(command) = str_in("command").filter(|command| !command.trim().is_empty())
+            let Some(command) = str_in(|i| i.command).filter(|command| !command.trim().is_empty())
             else {
                 return ToolPartOutcome::Unsupported;
             };
-            state.add_run_command(command, str_in("description").unwrap_or(""), ts);
+            let desc = str_in(|i| i.description);
+            state.add_run_command(&command, desc.as_deref().unwrap_or(""), ts);
         }
         "todowrite" => {
             state.tool_counts.todo_write += 1;
         }
         "apply_patch" => {
-            let Some(patch_text) = str_in("patchText") else {
+            let Some(patch_text) = str_in(|i| i.patch_text) else {
                 return ToolPartOutcome::Unsupported;
             };
-            if !parse_apply_patch_text(patch_text)
-                .iter()
-                .any(|patch| !patch.file_path.is_empty())
-            {
+            let patches = parse_apply_patch_text(&patch_text);
+            if !patches.iter().any(|patch| !patch.file_path.is_empty()) {
                 return ToolPartOutcome::Unsupported;
             }
-            apply_patch_text(state, patch_text, ts);
+            apply_parsed_patches(state, patches, ts);
         }
         _ => unreachable!("tracked OpenCode tool was filtered above"),
     }
@@ -797,9 +867,9 @@ fn apply_tool_part(state: &mut SessionParseState, data: &Value) -> ToolPartOutco
     ToolPartOutcome::Normalized
 }
 
-/// Folds an OpenCode `apply_patch` tool input into file-operation counts.
-fn apply_patch_text(state: &mut SessionParseState, patch_text: &str, ts: i64) {
-    for patch in parse_apply_patch_text(patch_text) {
+/// Folds parsed OpenCode `apply_patch` sections into file-operation counts.
+fn apply_parsed_patches(state: &mut SessionParseState, patches: Vec<OpenCodePatch>, ts: i64) {
+    for patch in patches {
         let (old_str, new_str) = extract_patch_strings(&patch.lines);
 
         match patch.action.as_str() {
@@ -1011,16 +1081,72 @@ fn parse_model_id(raw: &str) -> Option<String> {
     }
 }
 
+#[derive(Deserialize)]
+struct BorrowedMessageData<'a> {
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    role: Option<&'a RawValue>,
+    #[serde(
+        default,
+        borrow,
+        rename = "modelID",
+        deserialize_with = "deserialize_present_raw"
+    )]
+    model_id_camel: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    model_id: Option<&'a RawValue>,
+    #[serde(
+        default,
+        borrow,
+        rename = "providerID",
+        deserialize_with = "deserialize_present_raw"
+    )]
+    provider_id_camel: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    provider_id: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    model: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    tokens: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    cost: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct BorrowedNestedModel<'a> {
+    #[serde(
+        default,
+        borrow,
+        rename = "modelID",
+        deserialize_with = "deserialize_present_raw"
+    )]
+    model_id_camel: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    id: Option<&'a RawValue>,
+    #[serde(
+        default,
+        borrow,
+        rename = "providerID",
+        deserialize_with = "deserialize_present_raw"
+    )]
+    provider_id_camel: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "deserialize_present_raw")]
+    provider_id: Option<&'a RawValue>,
+}
+
 /// Parses one assistant `message.data` payload into usage and cost.
 fn parse_message_usage(raw: &str) -> Option<MessageUsage> {
-    let data = serde_json::from_str::<Value>(raw).ok()?;
-    if data.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+    let data = serde_json::from_str::<BorrowedMessageData<'_>>(raw).ok()?;
+    if decode_raw_str(data.role).as_deref() != Some("assistant") {
         return None;
     }
 
     let model_id = message_model_id(&data)?;
-    let usage = parse_message_tokens(data.get("tokens")?)?;
-    let cost = data.get("cost").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let tokens_val = serde_json::from_str::<Value>(data.tokens?.get()).ok()?;
+    let usage = parse_message_tokens(&tokens_val)?;
+    let cost = data
+        .cost
+        .and_then(|raw| serde_json::from_str::<f64>(raw.get()).ok())
+        .unwrap_or(0.0);
 
     Some(MessageUsage {
         model_id,
@@ -1071,32 +1197,27 @@ fn parse_message_tokens(tokens: &Value) -> Option<UsageTokenContribution> {
 }
 
 /// Resolves the model from an assistant message payload.
-fn message_model_id(data: &Value) -> Option<String> {
-    let model = data
-        .get("modelID")
-        .or_else(|| data.get("model_id"))
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            data.get("model")
-                .and_then(|v| v.get("modelID").or_else(|| v.get("id")))
-                .and_then(|v| v.as_str())
-        })?
-        .trim();
+fn message_model_id(data: &BorrowedMessageData<'_>) -> Option<String> {
+    let nested = data
+        .model
+        .filter(|raw| raw.get().starts_with('{'))
+        .and_then(|raw| serde_json::from_str::<BorrowedNestedModel<'_>>(raw.get()).ok());
+
+    let model_cow = decode_raw_str(data.model_id_camel.or(data.model_id)).or_else(|| {
+        let nested = nested.as_ref()?;
+        decode_raw_str(nested.model_id_camel.or(nested.id))
+    })?;
+    let model = model_cow.trim();
     if model.is_empty() {
         return None;
     }
 
-    Some(provider_qualified_model_id(
-        data.get("providerID")
-            .or_else(|| data.get("provider_id"))
-            .and_then(|v| v.as_str())
-            .or_else(|| {
-                data.get("model")
-                    .and_then(|v| v.get("providerID").or_else(|| v.get("provider_id")))
-                    .and_then(|v| v.as_str())
-            }),
-        model,
-    ))
+    let provider_cow = decode_raw_str(data.provider_id_camel.or(data.provider_id)).or_else(|| {
+        let nested = nested.as_ref()?;
+        decode_raw_str(nested.provider_id_camel.or(nested.provider_id))
+    });
+
+    Some(provider_qualified_model_id(provider_cow.as_deref(), model))
 }
 
 /// Keeps OpenCode model keys provider-qualified when the payload has provider metadata.
@@ -1440,11 +1561,13 @@ mod tests {
 
     #[test]
     fn test_message_model_id_preserves_provider() {
-        let message = serde_json::json!({
+        let raw = serde_json::json!({
             "role": "assistant",
             "modelID": "gpt-4.1",
             "providerID": "azure",
-        });
+        })
+        .to_string();
+        let message: BorrowedMessageData<'_> = serde_json::from_str(&raw).unwrap();
         assert_eq!(message_model_id(&message).as_deref(), Some("azure/gpt-4.1"));
     }
 

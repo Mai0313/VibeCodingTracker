@@ -10,12 +10,20 @@ use crate::constants::{FastHashMap, capacity};
 use crate::models::*;
 use crate::pricing::{TierClassifier, TierThresholds};
 use crate::session::diagnostics::{ParseDiagnostics, ParsedAnalysis};
+use crate::session::parser::stream_jsonl_borrowed;
 use crate::session::state::{ParseMode, SessionParseState};
 use crate::utils::{
     claude_request_context, get_git_remote_url, parse_iso_timestamp, process_claude_usage,
 };
 use anyhow::Result;
-use serde_json::Value;
+use serde::{
+    Deserialize, Deserializer,
+    de::{Error as _, IgnoredAny, MapAccess, SeqAccess, Visitor},
+};
+use serde_json::{Value, value::RawValue};
+use std::borrow::Cow;
+use std::fmt;
+use std::path::Path;
 
 /// Parse Claude Code session records already materialised as a `Vec<Value>`.
 ///
@@ -68,20 +76,202 @@ pub(crate) fn parse_claude_logs_with_diagnostics<I>(
 where
     I: IntoIterator<Item = ClaudeCodeLog>,
 {
-    let mut classifier = tiers.map(TierClassifier::new);
-    let mut state = SessionParseState::with_mode(mode);
-    let mut conversation_usage: FastHashMap<String, Value> =
-        FastHashMap::with_capacity(capacity::MODELS_PER_SESSION);
+    let mut fold = ClaudeFold::new(mode, tiers);
+
+    for mut log in logs {
+        let ts = fold.observe_envelope(
+            &log.log_type,
+            &log.cwd,
+            &log.session_id,
+            &log.timestamp,
+            log.tool_use_result.is_some(),
+        );
+
+        if log.log_type == "assistant" {
+            match &mut log.message {
+                None => fold.diagnostics.record_relevant(false),
+                Some(message) => {
+                    let usage = message.usage.take();
+                    fold.observe_assistant_usage(
+                        message.id.as_deref(),
+                        log.request_id.as_deref(),
+                        message.model.as_deref(),
+                        usage,
+                    );
+                    for item in std::mem::take(&mut message.content) {
+                        if let ClaudeContentItem::ToolUse { id, name, input } = item {
+                            fold.observe_tool_use(id, name, input, ts);
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(tur) = &log.tool_use_result {
+            fold.observe_top_level_tool_result(tur, first_tool_result(log.message.as_ref()), ts);
+        } else if log.log_type == "user"
+            && let Some(message) = &log.message
+        {
+            for item in &message.content {
+                if let ClaudeContentItem::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } = item
+                {
+                    fold.observe_user_tool_result(
+                        log.is_sidechain,
+                        tool_use_id,
+                        *is_error,
+                        ts,
+                        || Cow::Borrowed(content.as_str()),
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(fold.finish())
+}
+
+/// Zero-copy JSONL file parser for known Claude Code session files.
+///
+/// Skips `message` completely on metadata/attachment/progress lines (~40% of
+/// real session bytes), streams `message.content` without `#[serde(untagged)]`
+/// subtree buffering, and defers decoding `tool_result.content` and non-file
+/// `toolUseResult` payloads until a subagent `Read` actually needs them.
+pub(crate) fn parse_claude_jsonl_path(
+    path: &Path,
+    mode: ParseMode,
+    tiers: Option<&TierThresholds>,
+) -> Result<Option<ParsedAnalysis>> {
+    stream_jsonl_borrowed(
+        path,
+        ExtensionType::ClaudeCode,
+        ClaudeFold::new(mode, tiers),
+        |fold, bytes| {
+            let record = serde_json::from_slice::<BorrowedClaudeRecord<'_>>(bytes)?;
+            let tur_looks_like_object = record
+                .tool_use_result
+                .is_some_and(|raw| raw.get().starts_with('{'));
+
+            let needs_message = record.log_type == "assistant"
+                || record.log_type == "user"
+                || tur_looks_like_object;
+            let mut message = if needs_message {
+                match record.message {
+                    Some(raw) => {
+                        serde_json::from_str::<Option<BorrowedClaudeMessage<'_>>>(raw.get())?
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+
+            // Fast path for non-file tool results (`Bash`, `Grep`, `Agent`, …):
+            // neither branch inspects `toolUseResult` or `tool_result.content`
+            // once the single pending tool call is known not to be Read/Write/Edit.
+            if record.log_type == "user"
+                && tur_looks_like_object
+                && let Some(msg) = message.as_ref()
+                && msg.content.len() == 1
+                && let BorrowedContentItem::ToolResult { tool_use_id, .. } = &msg.content[0]
+                && fold
+                    .pending_tool_uses
+                    .get(tool_use_id.as_ref())
+                    .is_some_and(|pending| !is_tracked_file_tool(&pending.name))
+            {
+                fold.observe_envelope(
+                    &record.log_type,
+                    &record.cwd,
+                    &record.session_id,
+                    &record.timestamp,
+                    true,
+                );
+                fold.pending_tool_uses.remove(tool_use_id.as_ref());
+                return Ok(());
+            }
+
+            let tur = if tur_looks_like_object {
+                record
+                    .tool_use_result
+                    .and_then(|raw| serde_json::from_str::<ClaudeToolUseResult>(raw.get()).ok())
+            } else {
+                None
+            };
+
+            let ts = fold.observe_envelope(
+                &record.log_type,
+                &record.cwd,
+                &record.session_id,
+                &record.timestamp,
+                tur.is_some(),
+            );
+
+            if record.log_type == "assistant" {
+                match &mut message {
+                    None => fold.diagnostics.record_relevant(false),
+                    Some(msg) => {
+                        let usage = msg.usage.take();
+                        fold.observe_assistant_usage(
+                            msg.id.as_deref(),
+                            record.request_id.as_deref(),
+                            msg.model.as_deref(),
+                            usage,
+                        );
+                        for item in std::mem::take(&mut msg.content) {
+                            if let BorrowedContentItem::ToolUse { id, name, input } = item {
+                                fold.observe_tool_use(id, name, input, ts);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(tur) = &tur {
+                let first = first_borrowed_tool_result(message.as_ref());
+                fold.observe_top_level_tool_result(tur, first, ts);
+            } else if record.log_type == "user"
+                && let Some(msg) = &message
+            {
+                for item in &msg.content {
+                    if let BorrowedContentItem::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } = item
+                    {
+                        fold.observe_user_tool_result(
+                            record.is_sidechain,
+                            tool_use_id,
+                            *is_error,
+                            ts,
+                            || decode_raw_tool_result_content(*content),
+                        );
+                    }
+                }
+            }
+
+            Ok(())
+        },
+        |fold| Ok(fold.finish()),
+    )
+}
+
+struct ClaudeFold<'a> {
+    classifier: Option<TierClassifier<'a>>,
+    state: SessionParseState,
+    conversation_usage: FastHashMap<String, Value>,
     // Advisor-message token usage is kept separate from `conversation_usage`
     // so the `analysis` aggregator never attributes the main model's file-op
     // counts to an advisor model. The `usage` path merges this in.
-    let mut advisor_usage: FastHashMap<String, Value> = FastHashMap::default();
+    advisor_usage: FastHashMap<String, Value>,
     // Keep the originating tool name so polymorphic top-level results can be
     // interpreted by lifecycle rather than by ambiguous fields such as
     // `filePath` (which ExitPlanMode also carries).
-    let mut pending_tool_uses: FastHashMap<String, PendingClaudeTool> =
-        FastHashMap::with_capacity(64);
-    let mut diagnostics = ParseDiagnostics::default();
+    pending_tool_uses: FastHashMap<String, PendingClaudeTool>,
+    diagnostics: ParseDiagnostics,
     // Claude Code writes one record per content block of a single API
     // response, and every one of them repeats that response's *whole* `usage`
     // object: a reply carrying a thinking block, text and three tool calls
@@ -91,12 +281,34 @@ where
     // a key survives — the earlier ones report a partially streamed
     // `output_tokens`, never a larger one. `(model, usage)` in arrival order;
     // `billed_index` maps the request key to its slot.
-    let mut billed_requests: Vec<(String, Value)> = Vec::with_capacity(64);
-    let mut billed_index: FastHashMap<String, usize> = FastHashMap::with_capacity(64);
+    billed_requests: Vec<(String, Value)>,
+    billed_index: FastHashMap<String, usize>,
+}
 
-    for mut log in logs {
+impl<'a> ClaudeFold<'a> {
+    fn new(mode: ParseMode, tiers: Option<&'a TierThresholds>) -> Self {
+        Self {
+            classifier: tiers.map(TierClassifier::new),
+            state: SessionParseState::with_mode(mode),
+            conversation_usage: FastHashMap::with_capacity(capacity::MODELS_PER_SESSION),
+            advisor_usage: FastHashMap::default(),
+            pending_tool_uses: FastHashMap::with_capacity(64),
+            diagnostics: ParseDiagnostics::default(),
+            billed_requests: Vec::with_capacity(64),
+            billed_index: FastHashMap::with_capacity(64),
+        }
+    }
+
+    fn observe_envelope(
+        &mut self,
+        log_type: &str,
+        cwd: &str,
+        session_id: &str,
+        timestamp: &str,
+        has_tool_use_result: bool,
+    ) -> i64 {
         let recognized = matches!(
-            log.log_type.as_str(),
+            log_type,
             "assistant"
                 | "user"
                 | "system"
@@ -117,270 +329,535 @@ where
                 | "result"
                 | "agent-setting"
                 | "frame-link"
-        ) || log.tool_use_result.is_some();
+        ) || has_tool_use_result;
         if recognized {
-            diagnostics.record_recognized_source();
+            self.diagnostics.record_recognized_source();
         } else {
-            diagnostics.record_unrecognized();
+            self.diagnostics.record_unrecognized();
         }
-        if state.folder_path.is_empty() && !log.cwd.is_empty() {
-            state.folder_path.clone_from(&log.cwd);
+        if self.state.folder_path.is_empty() && !cwd.is_empty() {
+            self.state.folder_path.push_str(cwd);
         }
-        if !log.session_id.is_empty() {
-            state.task_id.clone_from(&log.session_id);
-        }
-
-        let ts = parse_iso_timestamp(&log.timestamp);
-        if ts > state.last_ts {
-            state.last_ts = ts;
+        if !session_id.is_empty() && self.state.task_id != session_id {
+            self.state.task_id.clear();
+            self.state.task_id.push_str(session_id);
         }
 
-        if log.log_type == "assistant" && log.message.is_none() {
-            diagnostics.record_relevant(false);
+        let ts = parse_iso_timestamp(timestamp);
+        if ts > self.state.last_ts {
+            self.state.last_ts = ts;
         }
+        ts
+    }
 
-        // Read the request identity before the usage below is moved out of the
-        // same record: both live in `log`, so taking one needs a mutable borrow
-        // that a live borrow for the other would conflict with.
-        let request_key = (log.log_type == "assistant"
-            && log
-                .message
-                .as_ref()
-                .is_some_and(|message| message.usage.is_some()))
-        .then(|| claude_request_key(&log))
-        .flatten();
-
-        if log.log_type == "assistant"
-            && let Some(message) = &mut log.message
-        {
-            // Moved rather than cloned: most of these records are duplicates
-            // whose usage is dropped again the moment the next one lands.
-            if let Some(usage) = message.usage.take() {
-                let model = message.model.as_deref().filter(|model| !model.is_empty());
-                if !(is_supported_claude_usage(&usage) && model.is_some()) {
-                    diagnostics.record_relevant(false);
-                } else if let Some(model) = model {
-                    let entry = (model.to_string(), usage);
-                    match request_key {
-                        Some(key) => match billed_index.get(&key) {
-                            Some(&slot) => billed_requests[slot] = entry,
-                            None => {
-                                billed_index.insert(key, billed_requests.len());
-                                billed_requests.push(entry);
-                            }
-                        },
-                        // No API response to key on: nothing can be shown to
-                        // duplicate it, so bill it on its own.
-                        None => billed_requests.push(entry),
+    fn observe_assistant_usage(
+        &mut self,
+        message_id: Option<&str>,
+        request_id: Option<&str>,
+        model: Option<&str>,
+        usage: Option<Value>,
+    ) {
+        let Some(usage) = usage else {
+            return;
+        };
+        let request_key = claude_request_key_parts(message_id, request_id);
+        let model = model.filter(|model| !model.is_empty());
+        if !(is_supported_claude_usage(&usage) && model.is_some()) {
+            self.diagnostics.record_relevant(false);
+        } else if let Some(model) = model {
+            let entry = (model.to_string(), usage);
+            match request_key {
+                Some(key) => match self.billed_index.get(&key) {
+                    Some(&slot) => self.billed_requests[slot] = entry,
+                    None => {
+                        self.billed_index.insert(key, self.billed_requests.len());
+                        self.billed_requests.push(entry);
                     }
-                }
-            }
-
-            for item in &message.content {
-                let ClaudeContentItem::ToolUse { id, name, input } = item else {
-                    continue;
-                };
-
-                let tracked_file_tool = is_tracked_file_tool(name);
-                let input_supported =
-                    tracked_file_tool && tracked_tool_input_supported(name, input.as_ref());
-                if !id.is_empty() {
-                    pending_tool_uses.insert(
-                        id.clone(),
-                        PendingClaudeTool {
-                            name: name.clone(),
-                            input: input.clone(),
-                            input_supported,
-                        },
-                    );
-                }
-
-                match name.as_str() {
-                    "Read" => {
-                        if input_supported {
-                            diagnostics.record_relevant(true);
-                            state.tool_counts.read += 1;
-                        } else if id.is_empty() {
-                            diagnostics.record_relevant(false);
-                        }
-                    }
-                    "Write" => {
-                        if input_supported {
-                            diagnostics.record_relevant(true);
-                            state.tool_counts.write += 1;
-                        } else if id.is_empty() {
-                            diagnostics.record_relevant(false);
-                        }
-                    }
-                    "Edit" => {
-                        if input_supported {
-                            diagnostics.record_relevant(true);
-                            state.tool_counts.edit += 1;
-                        } else if id.is_empty() {
-                            diagnostics.record_relevant(false);
-                        }
-                    }
-                    "TodoWrite" | "TaskCreate" | "TaskUpdate" | "TaskStop" => {
-                        diagnostics.record_relevant(true);
-                        state.tool_counts.todo_write += 1
-                    }
-                    "Bash" => {
-                        diagnostics
-                            .record_relevant(tracked_tool_input_supported(name, input.as_ref()));
-                        if let Some(input) = input {
-                            let command = input.command.as_deref().unwrap_or("");
-                            let description = input.description.as_deref().unwrap_or("");
-                            state.add_run_command(command, description, ts);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        if let Some(tur) = &log.tool_use_result {
-            let correlated =
-                first_tool_result(log.message.as_ref()).and_then(|(tool_use_id, is_error)| {
-                    pending_tool_uses
-                        .remove(tool_use_id)
-                        .map(|pending| (pending, is_error))
-                });
-
-            if let Some((pending, true)) = correlated.as_ref() {
-                if is_tracked_file_tool(&pending.name) && !pending.input_supported {
-                    // The provider understood the envelope and explicitly
-                    // rejected the bad arguments. No file operation ran.
-                    diagnostics.record_relevant(true);
-                }
-            } else {
-                let expected_tool = correlated
-                    .as_ref()
-                    .map(|(pending, _)| pending.name.as_str());
-                match validate_top_level_tool_result_for(tur, expected_tool) {
-                    TopLevelToolResult::Irrelevant => {}
-                    TopLevelToolResult::Unsupported => diagnostics.record_relevant(false),
-                    TopLevelToolResult::NonTextRead => {
-                        diagnostics.record_relevant(true);
-                        if let Some(path) = correlated
-                            .as_ref()
-                            .and_then(|(pending, _)| pending.input.as_ref())
-                            .and_then(|input| input.file_path.as_deref())
-                        {
-                            state.add_non_text_read_path(path);
-                        }
-                    }
-                    TopLevelToolResult::Supported(kind) => {
-                        diagnostics.record_relevant(true);
-                        dispatch_top_level_tool_result(&mut state, tur, kind, ts);
-                    }
-                }
-            }
-        } else if log.log_type == "user"
-            && let Some(message) = &log.message
-        {
-            // Subagent JSONL fallback: tool results live inside
-            // `message.content[].tool_result` instead of the top-level
-            // `toolUseResult` field. Gated on `is_sidechain` because a
-            // main-session user record can carry a content tool_result block
-            // alongside a string-shaped `toolUseResult` (e.g. a user
-            // rejection), which deserializes to `None` and so lands in this
-            // branch; that string result carries no file body, so the content
-            // block's text must not be counted as one.
-            for item in &message.content {
-                let ClaudeContentItem::ToolResult {
-                    tool_use_id,
-                    content,
-                    is_error,
-                } = item
-                else {
-                    continue;
-                };
-                let Some(pending) = pending_tool_uses.remove(tool_use_id) else {
-                    continue;
-                };
-
-                if *is_error {
-                    if is_tracked_file_tool(&pending.name) && !pending.input_supported {
-                        diagnostics.record_relevant(true);
-                    }
-                    continue;
-                }
-                if !log.is_sidechain || !is_tracked_file_tool(&pending.name) {
-                    continue;
-                }
-
-                let normalized = pending.input_supported;
-                diagnostics.record_relevant(normalized);
-                if normalized && let Some(input) = pending.input.as_ref() {
-                    dispatch_subagent_tool_result(&mut state, &pending.name, input, content, ts);
-                }
+                },
+                // No API response to key on: nothing can be shown to
+                // duplicate it, so bill it on its own.
+                None => self.billed_requests.push(entry),
             }
         }
     }
 
-    for (model, usage) in billed_requests {
-        diagnostics.record_relevant(true);
-        // One banked entry is one billed request; classify its own prompt
-        // context against the model's price levels.
-        let level = classifier.as_mut().map_or(0, |classifier| {
-            usage.as_object().map_or(0, |usage_obj| {
-                classifier.level(&model, claude_request_context(usage_obj))
-            })
+    fn observe_tool_use(
+        &mut self,
+        id: String,
+        name: String,
+        input: Option<ClaudeToolInput>,
+        ts: i64,
+    ) {
+        let tracked_file_tool = is_tracked_file_tool(&name);
+        let input_supported =
+            tracked_file_tool && tracked_tool_input_supported(&name, input.as_ref());
+
+        match name.as_str() {
+            "Read" => {
+                if input_supported {
+                    self.diagnostics.record_relevant(true);
+                    self.state.tool_counts.read += 1;
+                } else if id.is_empty() {
+                    self.diagnostics.record_relevant(false);
+                }
+            }
+            "Write" => {
+                if input_supported {
+                    self.diagnostics.record_relevant(true);
+                    self.state.tool_counts.write += 1;
+                } else if id.is_empty() {
+                    self.diagnostics.record_relevant(false);
+                }
+            }
+            "Edit" => {
+                if input_supported {
+                    self.diagnostics.record_relevant(true);
+                    self.state.tool_counts.edit += 1;
+                } else if id.is_empty() {
+                    self.diagnostics.record_relevant(false);
+                }
+            }
+            "TodoWrite" | "TaskCreate" | "TaskUpdate" | "TaskStop" => {
+                self.diagnostics.record_relevant(true);
+                self.state.tool_counts.todo_write += 1;
+            }
+            "Bash" => {
+                self.diagnostics
+                    .record_relevant(tracked_tool_input_supported(&name, input.as_ref()));
+                if let Some(input) = input.as_ref() {
+                    let command = input.command.as_deref().unwrap_or("");
+                    let description = input.description.as_deref().unwrap_or("");
+                    self.state.add_run_command(command, description, ts);
+                }
+            }
+            _ => {}
+        }
+
+        if !id.is_empty() {
+            self.pending_tool_uses.insert(
+                id,
+                PendingClaudeTool {
+                    name,
+                    input: tracked_file_tool.then_some(input).flatten(),
+                    input_supported,
+                },
+            );
+        }
+    }
+
+    fn observe_top_level_tool_result(
+        &mut self,
+        tur: &ClaudeToolUseResult,
+        first_result: Option<(&str, bool)>,
+        ts: i64,
+    ) {
+        let correlated = first_result.and_then(|(tool_use_id, is_error)| {
+            self.pending_tool_uses
+                .remove(tool_use_id)
+                .map(|pending| (pending, is_error))
         });
-        process_claude_usage(&mut conversation_usage, &model, &usage, level);
 
-        // Claude Code's top-level `usage` is the sum of the `message`-type
-        // entries in `usage.iterations` and EXCLUDES any `advisor_message`
-        // iteration (a secondary inference Claude Code runs but keeps off its
-        // own /cost accounting). The sample in
-        // `advisor_message_usage_is_separated_from_conversation_usage` below is
-        // what that was read off. Key each advisor iteration by the model it
-        // names so it prices at that model's rate; one that names no model
-        // falls back to the main model's key.
-        if let Some(iters) = usage.get("iterations").and_then(|v| v.as_array()) {
-            for iter in iters {
-                if iter.get("type").and_then(|t| t.as_str()) != Some("advisor_message") {
-                    continue;
+        if let Some((pending, true)) = correlated.as_ref() {
+            if is_tracked_file_tool(&pending.name) && !pending.input_supported {
+                // The provider understood the envelope and explicitly
+                // rejected the bad arguments. No file operation ran.
+                self.diagnostics.record_relevant(true);
+            }
+        } else {
+            let expected_tool = correlated
+                .as_ref()
+                .map(|(pending, _)| pending.name.as_str());
+            match validate_top_level_tool_result_for(tur, expected_tool) {
+                TopLevelToolResult::Irrelevant => {}
+                TopLevelToolResult::Unsupported => self.diagnostics.record_relevant(false),
+                TopLevelToolResult::NonTextRead => {
+                    self.diagnostics.record_relevant(true);
+                    if let Some(path) = correlated
+                        .as_ref()
+                        .and_then(|(pending, _)| pending.input.as_ref())
+                        .and_then(|input| input.file_path.as_deref())
+                    {
+                        self.state.add_non_text_read_path(path);
+                    }
                 }
-                let adv_model = iter
-                    .get("model")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or(model.as_str());
-                let normalized = !adv_model.is_empty() && is_supported_claude_usage(iter);
-                diagnostics.record_relevant(normalized);
-                if normalized {
-                    let level = classifier.as_mut().map_or(0, |classifier| {
-                        iter.as_object().map_or(0, |usage_obj| {
-                            classifier.level(adv_model, claude_request_context(usage_obj))
-                        })
-                    });
-                    process_claude_usage(&mut advisor_usage, adv_model, iter, level);
+                TopLevelToolResult::Supported(kind) => {
+                    self.diagnostics.record_relevant(true);
+                    dispatch_top_level_tool_result(&mut self.state, tur, kind, ts);
                 }
             }
         }
     }
 
-    for pending in pending_tool_uses.into_values() {
-        if is_tracked_file_tool(&pending.name) && !pending.input_supported {
-            diagnostics.record_relevant(false);
+    // Subagent JSONL fallback: tool results live inside
+    // `message.content[].tool_result` instead of the top-level `toolUseResult`
+    // field. Gated on `is_sidechain` because a main-session user record can
+    // carry a content tool_result block alongside a string-shaped
+    // `toolUseResult` (e.g. a user rejection), which deserializes to `None`
+    // and so lands in this branch; that string result carries no file body, so
+    // the content block's text must not be counted as one.
+    fn observe_user_tool_result<'c>(
+        &mut self,
+        is_sidechain: bool,
+        tool_use_id: &str,
+        is_error: bool,
+        ts: i64,
+        content: impl FnOnce() -> Cow<'c, str>,
+    ) {
+        let Some(pending) = self.pending_tool_uses.remove(tool_use_id) else {
+            return;
+        };
+
+        if is_error {
+            if is_tracked_file_tool(&pending.name) && !pending.input_supported {
+                self.diagnostics.record_relevant(true);
+            }
+            return;
+        }
+        if !is_sidechain || !is_tracked_file_tool(&pending.name) {
+            return;
+        }
+
+        let normalized = pending.input_supported;
+        self.diagnostics.record_relevant(normalized);
+        if normalized && let Some(input) = pending.input.as_ref() {
+            let body = if pending.name == "Read" {
+                content()
+            } else {
+                Cow::Borrowed("")
+            };
+            dispatch_subagent_tool_result(&mut self.state, &pending.name, input, &body, ts);
         }
     }
 
-    if state.git_remote.is_empty() {
-        state.git_remote = get_git_remote_url(&state.folder_path);
+    fn finish(mut self) -> ParsedAnalysis {
+        for (model, usage) in self.billed_requests {
+            self.diagnostics.record_relevant(true);
+            // One banked entry is one billed request; classify its own prompt
+            // context against the model's price levels.
+            let level = self.classifier.as_mut().map_or(0, |classifier| {
+                usage.as_object().map_or(0, |usage_obj| {
+                    classifier.level(&model, claude_request_context(usage_obj))
+                })
+            });
+            process_claude_usage(&mut self.conversation_usage, &model, &usage, level);
+
+            // Claude Code's top-level `usage` is the sum of the `message`-type
+            // entries in `usage.iterations` and EXCLUDES any `advisor_message`
+            // iteration (a secondary inference Claude Code runs but keeps off its
+            // own /cost accounting). The sample in
+            // `advisor_message_usage_is_separated_from_conversation_usage` below is
+            // what that was read off. Key each advisor iteration by the model it
+            // names so it prices at that model's rate; one that names no model
+            // falls back to the main model's key.
+            if let Some(iters) = usage.get("iterations").and_then(|v| v.as_array()) {
+                for iter in iters {
+                    if iter.get("type").and_then(|t| t.as_str()) != Some("advisor_message") {
+                        continue;
+                    }
+                    let adv_model = iter
+                        .get("model")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or(model.as_str());
+                    let normalized = !adv_model.is_empty() && is_supported_claude_usage(iter);
+                    self.diagnostics.record_relevant(normalized);
+                    if normalized {
+                        let level = self.classifier.as_mut().map_or(0, |classifier| {
+                            iter.as_object().map_or(0, |usage_obj| {
+                                classifier.level(adv_model, claude_request_context(usage_obj))
+                            })
+                        });
+                        process_claude_usage(&mut self.advisor_usage, adv_model, iter, level);
+                    }
+                }
+            }
+        }
+
+        for pending in self.pending_tool_uses.into_values() {
+            if is_tracked_file_tool(&pending.name) && !pending.input_supported {
+                self.diagnostics.record_relevant(false);
+            }
+        }
+
+        if self.state.git_remote.is_empty() {
+            self.state.git_remote = get_git_remote_url(&self.state.folder_path);
+        }
+
+        let mut record = self.state.into_record(self.conversation_usage);
+        record.advisor_usage = self.advisor_usage;
+
+        let analysis = CodeAnalysis {
+            user: String::new(),
+            extension_name: String::new(),
+            insights_version: String::new(),
+            machine_id: String::new(),
+            records: vec![record],
+        };
+        ParsedAnalysis::new(analysis, self.diagnostics)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BorrowedClaudeRecord<'a> {
+    #[serde(default, borrow)]
+    cwd: Cow<'a, str>,
+    #[serde(default, borrow)]
+    session_id: Cow<'a, str>,
+    #[serde(default, borrow, rename = "type")]
+    log_type: Cow<'a, str>,
+    #[serde(default, borrow)]
+    timestamp: Cow<'a, str>,
+    #[serde(default, borrow)]
+    message: Option<&'a RawValue>,
+    #[serde(default, borrow)]
+    request_id: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    tool_use_result: Option<&'a RawValue>,
+    #[serde(default)]
+    is_sidechain: bool,
+}
+
+#[derive(Deserialize)]
+struct BorrowedClaudeMessage<'a> {
+    #[serde(default, borrow)]
+    id: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    model: Option<Cow<'a, str>>,
+    #[serde(default)]
+    usage: Option<Value>,
+    #[serde(
+        default,
+        borrow,
+        deserialize_with = "deserialize_borrowed_content_items"
+    )]
+    content: Vec<BorrowedContentItem<'a>>,
+}
+
+enum BorrowedContentItem<'a> {
+    ToolUse {
+        id: String,
+        name: String,
+        input: Option<ClaudeToolInput>,
+    },
+    ToolResult {
+        tool_use_id: Cow<'a, str>,
+        content: Option<&'a RawValue>,
+        is_error: bool,
+    },
+    Other,
+}
+
+impl<'de> Deserialize<'de> for BorrowedContentItem<'de> {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ItemVisitor;
+
+        impl<'de> Visitor<'de> for ItemVisitor {
+            type Value = BorrowedContentItem<'de>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a Claude content block object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut item_type: Option<Cow<'de, str>> = None;
+                let mut id: Option<&'de RawValue> = None;
+                let mut name: Option<&'de RawValue> = None;
+                let mut input: Option<&'de RawValue> = None;
+                let mut tool_use_id: Option<&'de RawValue> = None;
+                let mut content: Option<&'de RawValue> = None;
+                let mut is_error: Option<&'de RawValue> = None;
+
+                while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+                    match key.as_ref() {
+                        "type" => item_type = map.next_value()?,
+                        "id" => id = map.next_value()?,
+                        "name" => name = map.next_value()?,
+                        "input" => input = map.next_value()?,
+                        "tool_use_id" => tool_use_id = map.next_value()?,
+                        "content" => content = map.next_value()?,
+                        "is_error" => is_error = map.next_value()?,
+                        _ => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+
+                match item_type.as_deref() {
+                    Some("tool_use") => {
+                        let id = match id {
+                            Some(raw) => serde_json::from_str::<Option<String>>(raw.get())
+                                .map_err(A::Error::custom)?
+                                .unwrap_or_default(),
+                            None => String::new(),
+                        };
+                        let name = match name {
+                            Some(raw) => serde_json::from_str::<Option<String>>(raw.get())
+                                .map_err(A::Error::custom)?
+                                .unwrap_or_default(),
+                            None => String::new(),
+                        };
+                        let input = match input {
+                            Some(raw)
+                                if matches!(name.as_str(), "Read" | "Write" | "Edit" | "Bash") =>
+                            {
+                                serde_json::from_str::<Option<ClaudeToolInput>>(raw.get())
+                                    .map_err(A::Error::custom)?
+                            }
+                            Some(raw) => {
+                                let trimmed = raw.get();
+                                if !trimmed.starts_with('{') && trimmed != "null" {
+                                    return Err(A::Error::custom(
+                                        "tool_use input must be an object",
+                                    ));
+                                }
+                                None
+                            }
+                            None => None,
+                        };
+                        Ok(BorrowedContentItem::ToolUse { id, name, input })
+                    }
+                    Some("tool_result") => {
+                        let tool_use_id = match tool_use_id {
+                            Some(raw) => serde_json::from_str::<Option<Cow<'de, str>>>(raw.get())
+                                .map_err(A::Error::custom)?
+                                .unwrap_or_default(),
+                            None => Cow::Borrowed(""),
+                        };
+                        let is_error = match is_error {
+                            Some(raw) => serde_json::from_str::<Option<bool>>(raw.get())
+                                .map_err(A::Error::custom)?
+                                .unwrap_or(false),
+                            None => false,
+                        };
+                        Ok(BorrowedContentItem::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error,
+                        })
+                    }
+                    _ => Ok(BorrowedContentItem::Other),
+                }
+            }
+        }
+
+        deserializer.deserialize_map(ItemVisitor)
+    }
+}
+
+fn deserialize_borrowed_content_items<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<BorrowedContentItem<'de>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct ItemsVisitor;
+
+    impl<'de> Visitor<'de> for ItemsVisitor {
+        type Value = Vec<BorrowedContentItem<'de>>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a content array or ignorable scalar")
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut items = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(16));
+            while let Some(item) = seq.next_element::<BorrowedContentItem<'de>>()? {
+                items.push(item);
+            }
+            Ok(items)
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_bool<E: serde::de::Error>(self, _: bool) -> std::result::Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, _: i64) -> std::result::Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, _: u64) -> std::result::Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_f64<E: serde::de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_str<E: serde::de::Error>(self, _: &str) -> std::result::Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_string<E: serde::de::Error>(
+            self,
+            _: String,
+        ) -> std::result::Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_map<A: MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+            Ok(Vec::new())
+        }
     }
 
-    let mut record = state.into_record(conversation_usage);
-    record.advisor_usage = advisor_usage;
+    deserializer.deserialize_any(ItemsVisitor)
+}
 
-    let analysis = CodeAnalysis {
-        user: String::new(),
-        extension_name: String::new(),
-        insights_version: String::new(),
-        machine_id: String::new(),
-        records: vec![record],
+fn decode_raw_tool_result_content(raw: Option<&RawValue>) -> Cow<'_, str> {
+    let Some(raw) = raw else {
+        return Cow::Borrowed("");
     };
-    Ok(ParsedAnalysis::new(analysis, diagnostics))
+    if let Ok(text) = serde_json::from_str::<Cow<'_, str>>(raw.get()) {
+        return text;
+    }
+    match serde_json::from_str::<Value>(raw.get()) {
+        Ok(Value::String(s)) => Cow::Owned(s),
+        Ok(Value::Array(arr)) => {
+            let texts: Vec<&str> = arr
+                .iter()
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .collect();
+            Cow::Owned(texts.join("\n"))
+        }
+        Ok(Value::Null) | Err(_) => Cow::Borrowed(""),
+        Ok(other) => Cow::Owned(other.to_string()),
+    }
+}
+
+fn first_borrowed_tool_result<'a>(
+    message: Option<&'a BorrowedClaudeMessage<'a>>,
+) -> Option<(&'a str, bool)> {
+    message?.content.iter().find_map(|item| {
+        let BorrowedContentItem::ToolResult {
+            tool_use_id,
+            is_error,
+            ..
+        } = item
+        else {
+            return None;
+        };
+        Some((tool_use_id.as_ref(), *is_error))
+    })
 }
 
 #[derive(Clone)]
@@ -435,14 +912,9 @@ fn tracked_tool_input_supported(name: &str, input: Option<&ClaudeToolInput>) -> 
 /// its own; `requestId` is appended where the record carries one so a retry
 /// that reuses a response id still bills separately. `None` when the record
 /// names no response at all, which no observed Claude Code build writes.
-fn claude_request_key(log: &ClaudeCodeLog) -> Option<String> {
-    let id = log
-        .message
-        .as_ref()?
-        .id
-        .as_deref()
-        .filter(|id| !id.is_empty())?;
-    match log.request_id.as_deref().filter(|id| !id.is_empty()) {
+fn claude_request_key_parts(message_id: Option<&str>, request_id: Option<&str>) -> Option<String> {
+    let id = message_id.filter(|id| !id.is_empty())?;
+    match request_id.filter(|id| !id.is_empty()) {
         Some(request_id) => Some(format!("{id}:{request_id}")),
         None => Some(id.to_string()),
     }
@@ -1463,5 +1935,87 @@ mod tests {
         let main = record.conversation_usage.get("claude-opus-4-8").unwrap();
         assert_eq!(main["input_tokens"].as_i64().unwrap(), 6527);
         assert_eq!(main["output_tokens"].as_i64().unwrap(), 764);
+    }
+
+    #[test]
+    fn borrowed_jsonl_stream_matches_owned_parser_across_edge_cases() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let lines = [
+            serde_json::json!({
+                "type": "attachment",
+                "timestamp": "2026-07-12T00:00:00Z",
+                "message": { "ignored": "large attachment payload" }
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "sessionId": "s-1",
+                "cwd": "/tmp",
+                "requestId": "req-1",
+                "timestamp": "2026-07-12T00:00:01Z",
+                "message": {
+                    "id": "msg-1",
+                    "model": "claude-opus-4-8",
+                    "usage": { "input_tokens": 10, "output_tokens": 5 },
+                    "content": [
+                        { "type": "thinking", "thinking": "deep trace" },
+                        { "type": "tool_use", "id": "b1", "name": "Bash", "input": { "command": "ls" } },
+                        { "type": "tool_use", "id": "r1", "name": "Read", "input": { "file_path": "/tmp/a.rs" } }
+                    ]
+                }
+            }),
+            serde_json::json!({
+                "type": "user",
+                "sessionId": "s-1",
+                "timestamp": "2026-07-12T00:00:02Z",
+                "toolUseResult": { "stdout": "large bash output" },
+                "message": {
+                    "content": [{ "type": "tool_result", "tool_use_id": "b1", "content": "large bash output" }]
+                }
+            }),
+            serde_json::json!({
+                "type": "user",
+                "sessionId": "s-1",
+                "isSidechain": true,
+                "timestamp": "2026-07-12T00:00:03Z",
+                "message": {
+                    "content": [{ "type": "tool_result", "tool_use_id": "r1", "content": "1\tfn a() {}\n2\tfn b() {}" }]
+                }
+            }),
+        ];
+        let body: String = lines.iter().map(|v| format!("{v}\n")).collect();
+        std::fs::write(&path, body).unwrap();
+
+        let streamed = parse_claude_jsonl_path(&path, ParseMode::Full, None)
+            .unwrap()
+            .unwrap();
+        let owned_logs: Vec<ClaudeCodeLog> = lines
+            .into_iter()
+            .map(|v| serde_json::from_value(v).unwrap())
+            .collect();
+        let owned = parse_claude_logs_with_diagnostics(owned_logs, ParseMode::Full, None).unwrap();
+
+        assert_eq!(streamed.diagnostics, owned.diagnostics);
+        assert_eq!(
+            serde_json::to_value(&streamed.analysis.records[0].tool_call_counts).unwrap(),
+            serde_json::to_value(&owned.analysis.records[0].tool_call_counts).unwrap()
+        );
+        assert_eq!(streamed.analysis.records[0].total_read_lines, 2);
+        assert_eq!(
+            streamed.analysis.records[0].conversation_usage,
+            owned.analysis.records[0].conversation_usage
+        );
+
+        // Malformed `message` on an assistant line still reports a relevant schema failure.
+        let bad_path = dir.path().join("bad.jsonl");
+        std::fs::write(
+            &bad_path,
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-07-12T00:00:00Z\",\"message\":42}\n",
+        )
+        .unwrap();
+        let bad = parse_claude_jsonl_path(&bad_path, ParseMode::UsageOnly, None)
+            .unwrap()
+            .unwrap();
+        assert!(bad.diagnostics.is_complete_failure());
     }
 }

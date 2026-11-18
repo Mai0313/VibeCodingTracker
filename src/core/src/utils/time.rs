@@ -42,14 +42,140 @@ pub fn rfc3339_utc_nanos(unix_secs: i64) -> Option<String> {
 /// assert_eq!(parse_iso_timestamp("not a timestamp"), 0);
 /// ```
 pub fn parse_iso_timestamp(ts: &str) -> i64 {
-    if ts.is_empty() {
+    if ts.len() < 20 {
         return 0;
+    }
+
+    if let Some(ms) = parse_rfc3339_ascii(ts.as_bytes()) {
+        return ms;
     }
 
     match DateTime::parse_from_rfc3339(ts) {
         Ok(dt) => dt.timestamp_millis(),
         Err(_) => 0,
     }
+}
+
+/// Zero-allocation parser for standard RFC 3339 timestamps
+/// (`YYYY-MM-DDTHH:MM:SS[.fff...](Z|[+-]HH:MM)`).
+///
+/// Returns `Some(0)` on invalid field ranges and `None` only when `chrono`
+/// should adjudicate an uncommon form (such as a `:60` leap second).
+#[inline]
+fn parse_rfc3339_ascii(bytes: &[u8]) -> Option<i64> {
+    if bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !matches!(bytes[10], b'T' | b't')
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return None;
+    }
+
+    let year = i32::try_from(parse_4_digits(bytes, 0)?).ok()?;
+    let month = parse_2_digits(bytes, 5)?;
+    let day = parse_2_digits(bytes, 8)?;
+    let hour = parse_2_digits(bytes, 11)?;
+    let minute = parse_2_digits(bytes, 14)?;
+    let second = parse_2_digits(bytes, 17)?;
+
+    if second == 60 {
+        return None;
+    }
+    if !(1..=12).contains(&month)
+        || day == 0
+        || day > days_in_month(year, month)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return Some(0);
+    }
+
+    let mut idx = 19;
+    let mut millis = 0_i64;
+    if bytes.get(idx) == Some(&b'.') {
+        idx += 1;
+        let frac_start = idx;
+        let mut weight = 100_i64;
+        while let Some(&b) = bytes.get(idx) {
+            if !b.is_ascii_digit() {
+                break;
+            }
+            if weight > 0 {
+                millis += i64::from(b - b'0') * weight;
+                weight /= 10;
+            }
+            idx += 1;
+        }
+        if idx == frac_start {
+            return Some(0);
+        }
+    }
+
+    let offset_secs = match &bytes[idx..] {
+        [b'Z' | b'z'] => 0_i64,
+        [sign @ (b'+' | b'-'), h0, h1, b':', m0, m1] => {
+            let Some(oh) = parse_2_raw(*h0, *h1) else {
+                return Some(0);
+            };
+            let Some(om) = parse_2_raw(*m0, *m1) else {
+                return Some(0);
+            };
+            if oh > 23 || om > 59 {
+                return Some(0);
+            }
+            let total = i64::from(oh) * 3_600 + i64::from(om) * 60;
+            if *sign == b'-' { -total } else { total }
+        }
+        _ => return None,
+    };
+
+    let days = days_from_civil(year, month, day);
+    let local_secs =
+        days * 86_400 + i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second);
+    let utc_secs = local_secs - offset_secs;
+    Some(utc_secs * 1_000 + millis)
+}
+
+#[inline]
+fn parse_2_raw(d0: u8, d1: u8) -> Option<u32> {
+    if !d0.is_ascii_digit() || !d1.is_ascii_digit() {
+        return None;
+    }
+    Some(u32::from(d0 - b'0') * 10 + u32::from(d1 - b'0'))
+}
+
+#[inline]
+fn parse_2_digits(bytes: &[u8], offset: usize) -> Option<u32> {
+    parse_2_raw(bytes[offset], bytes[offset + 1])
+}
+
+#[inline]
+fn parse_4_digits(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(parse_2_digits(bytes, offset)? * 100 + parse_2_digits(bytes, offset + 2)?)
+}
+
+#[inline]
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+/// Howard Hinnant's civil-to-Unix-day conversion (`1970-01-01` -> `0`).
+#[inline]
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let y = i64::from(year) - i64::from(month <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u32;
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + i64::from(doe) - 719_468
 }
 
 #[cfg(test)]
@@ -252,6 +378,38 @@ mod tests {
         // Should be in ascending order
         for i in 1..results.len() {
             assert!(results[i] > results[i - 1]);
+        }
+    }
+
+    #[test]
+    fn fast_rfc3339_matches_chrono_across_calendars_offsets_and_invalid_inputs() {
+        let samples = [
+            "1969-12-31T23:59:59.123Z",
+            "1970-01-01T00:00:00Z",
+            "2000-02-29T23:59:59.999Z",
+            "1900-02-29T12:00:00Z",
+            "2023-02-29T12:00:00Z",
+            "2024-02-29T00:00:00+08:00",
+            "2026-11-18T22:30:00.5-05:30",
+            "2026-11-18t22:30:00.123456789z",
+            "2026-11-18T22:30:00-00:00",
+            "2024-12-31T23:59:60Z",
+            "2024-01-15T10:30:45.Z",
+            "2024-01-15T10:30:45Zextra",
+            "2024-01-15T24:00:00Z",
+            "2024-01-15T10:30:45+24:00",
+            "2024-01-15T10:30:45+00:60",
+        ];
+
+        for sample in samples {
+            let expected = DateTime::parse_from_rfc3339(sample)
+                .map(|dt| dt.timestamp_millis())
+                .unwrap_or(0);
+            assert_eq!(
+                parse_iso_timestamp(sample),
+                expected,
+                "mismatch on {sample}"
+            );
         }
     }
 }
