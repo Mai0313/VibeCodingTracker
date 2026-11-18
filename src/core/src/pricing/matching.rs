@@ -247,8 +247,8 @@ impl ModelPricingMap {
         candidates
             .iter()
             .min_by(|a, b| {
-                normalized_candidate_rank(a, model_name, normalized_name, query_provider).cmp(
-                    &normalized_candidate_rank(b, model_name, normalized_name, query_provider),
+                normalized_candidate_rank(a, normalized_name, query_provider).cmp(
+                    &normalized_candidate_rank(b, normalized_name, query_provider),
                 )
             })
             .cloned()
@@ -272,8 +272,8 @@ impl ModelPricingMap {
                 }
                 let overlap = model_segment.len().min(key_segment.len());
                 let length_difference = model_segment.len().abs_diff(key_segment.len());
-                let provider_rank = substring_provider_rank(query_provider, key_lower);
-                Some((overlap, length_difference, provider_rank, original_key))
+                let p_rank = provider_rank(query_provider, key_lower);
+                Some((overlap, length_difference, p_rank, original_key))
             })
             .min_by(|a, b| {
                 b.0.cmp(&a.0)
@@ -413,26 +413,79 @@ fn provider_prefix(model_name: &str) -> Option<&str> {
 
 fn normalized_candidate_rank<'a>(
     candidate: &'a str,
-    model_name: &str,
     normalized_name: &str,
     query_provider: Option<&str>,
-) -> (u8, usize, &'a str) {
-    let same_provider_base = query_provider.is_some()
-        && provider_prefix(candidate) == query_provider
-        && model_without_provider(candidate) == normalized_name;
-    let unprefixed_base = provider_prefix(candidate).is_none() && candidate == normalized_name;
-    let priority = if same_provider_base {
-        0
-    } else if unprefixed_base {
-        1
-    } else {
+) -> (u8, u8, usize, &'a str) {
+    let cand_segment = model_without_provider(candidate);
+    let p_rank = provider_rank(query_provider, candidate);
+    let tier_group = if p_rank == 3 {
         2
+    } else if cand_segment == normalized_name {
+        0
+    } else {
+        1
     };
     (
-        priority,
-        model_name.len().abs_diff(candidate.len()),
+        tier_group,
+        p_rank,
+        normalized_name.len().abs_diff(cand_segment.len()),
         candidate,
     )
+}
+
+fn has_any_ascii_prefix(s: &str, prefixes: &[&str]) -> bool {
+    let bytes = s.as_bytes();
+    prefixes.iter().any(|prefix| {
+        bytes
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
+    })
+}
+
+/// Whether `prefix` is the model vendor's own LiteLLM namespace rather than a third-party host or reseller.
+fn is_official_provider(prefix: Option<&str>, model_segment: &str) -> bool {
+    match prefix {
+        Some(
+            "anthropic" | "cohere" | "deepseek" | "elevenlabs" | "gemini" | "meta" | "minimax"
+            | "moonshot" | "openai" | "volcengine" | "xai" | "xiaomi_mimo" | "zai",
+        ) => true,
+        Some("vertex_ai") => has_any_ascii_prefix(
+            model_segment,
+            &[
+                "gemini",
+                "gemma",
+                "chirp",
+                "deep-research",
+                "imagen",
+                "learnlm",
+                "lyria",
+                "palm",
+                "text-bison",
+                "chat-bison",
+                "code-bison",
+                "veo",
+            ],
+        ),
+        Some("mistral") => has_any_ascii_prefix(
+            model_segment,
+            &[
+                "mistral",
+                "ministral",
+                "codestral",
+                "devstral",
+                "labs-devstral",
+                "magistral",
+                "open-mistral",
+                "open-mixtral",
+                "pixtral",
+                "voxtral",
+            ],
+        ),
+        Some("dashscope") => has_any_ascii_prefix(model_segment, &["qwen", "qwq", "qvq", "wan"]),
+        Some("perplexity") => has_any_ascii_prefix(model_segment, &["sonar", "pplx"]),
+        Some("tencent") => has_any_ascii_prefix(model_segment, &["hy", "hunyuan"]),
+        _ => false,
+    }
 }
 
 fn model_without_provider(model_name: &str) -> &str {
@@ -455,11 +508,16 @@ fn eligible_for_loose_match(model_segment: &str) -> bool {
         && !LOOSE_MATCH_STOPLIST.contains(&model_segment)
 }
 
-fn substring_provider_rank(query_provider: Option<&str>, candidate: &str) -> u8 {
-    match (query_provider, provider_prefix(candidate)) {
-        (Some(query), Some(candidate)) if query == candidate => 0,
-        (_, None) => 1,
-        _ => 2,
+fn provider_rank(query_provider: Option<&str>, candidate: &str) -> u8 {
+    let cand_provider = provider_prefix(candidate);
+    if query_provider.is_some() && query_provider == cand_provider {
+        0
+    } else if cand_provider.is_none() {
+        1
+    } else if is_official_provider(cand_provider, model_without_provider(candidate)) {
+        2
+    } else {
+        3
     }
 }
 
