@@ -100,8 +100,8 @@ pub enum Commands {
         table: bool,
 
         /// Merge models that share a base name across provider prefixes
-        /// (e.g. `openai/gpt-5.5` + `azure/gpt-5.5`). In the TUI this seeds the
-        /// initial state; press `m` to toggle. Ignored for `--json`.
+        /// (e.g. `openai/gpt-5.5` + `azure/gpt-5.5`), overriding
+        /// `usage.merge_models` when it is off. Ignored for `--json`.
         #[arg(long)]
         merge_providers: bool,
 

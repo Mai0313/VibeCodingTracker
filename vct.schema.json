@@ -227,7 +227,7 @@
     },
     "usage": {
       "default": {
-        "merge_models": false,
+        "merge_models": true,
         "quota": {
           "panels": [
             "claude",
@@ -244,8 +244,8 @@
       "description": "`[usage]` — usage dashboard preferences.",
       "properties": {
         "merge_models": {
-          "default": false,
-          "description": "Start the usage dashboard with models merged across provider prefixes.\nToggled live with `m`; the last state is saved back here.",
+          "default": true,
+          "description": "Merge models that share a base name across provider prefixes.",
           "type": "boolean"
         },
         "quota": {

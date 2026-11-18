@@ -20,7 +20,7 @@ fn load_in_creates_default_commented_file_when_absent() {
     assert_eq!(cfg.general.default_time_range, TimeRange::All);
     assert!(cfg.general.auto_update);
     assert!(cfg.usage.shows_quota_panel("cursor"));
-    assert!(!cfg.usage.merge_models);
+    assert!(cfg.usage.merge_models);
     // New sections default sensibly.
     assert!(cfg.providers.cursor);
     assert!(cfg.providers.grok);
@@ -40,11 +40,11 @@ fn load_in_creates_default_commented_file_when_absent() {
     assert!(text.contains("[providers]"));
     assert!(text.contains("[performance]"));
     assert!(text.contains("[logging]"));
-    assert!(text.contains("merge_models = false"));
+    assert!(text.contains("merge_models = true"));
     assert!(text.contains("auto_update = true"));
     assert!(text.contains("grok = true"));
     // A generated comment must survive so the file is self-documenting.
-    assert!(text.contains("# Toggled live"));
+    assert!(text.contains("# Merge models that share a base name"));
 }
 
 #[test]
@@ -69,47 +69,53 @@ fn first_run_leaves_existing_version_record_untouched() {
 }
 
 #[test]
-fn save_merge_models_round_trips_and_preserves_comments() {
+fn save_setting_merge_models_round_trips_and_preserves_comments() {
+    use vct_core::config::SettingValue;
+
     let th = TempHome::new();
     let dir = &th.paths.cache_dir;
     config::load_in(dir); // materialize defaults
 
-    config::save_merge_models_in(dir, true).unwrap();
+    config::save_setting_in(dir, &["usage", "merge_models"], &SettingValue::Bool(false)).unwrap();
 
     let cfg = config::load_in(dir);
-    assert!(cfg.usage.merge_models);
+    assert!(!cfg.usage.merge_models);
     assert!(cfg.usage.shows_quota_panel("cursor")); // untouched
 
     let text = fs::read_to_string(dir.join("config.toml")).unwrap();
-    assert!(text.contains("merge_models = true"));
+    assert!(text.contains("merge_models = false"));
     // The edit is format-preserving, so comments stay put.
     assert!(text.contains("# Which live quota panels to show"));
     assert!(text.contains("[providers]"));
-    // The `#:schema` directive must survive the write-back, or the `m` toggle
+    // The `#:schema` directive must survive the write-back, or the Settings tab
     // would strip editor validation from the file.
     assert!(text.starts_with("#:schema "));
 }
 
 #[test]
-fn save_merge_models_survives_malformed_usage_section() {
-    // A hand-edited file where `usage` is a scalar must not panic the best-effort
-    // write from the TUI's `m` toggle; the section is repaired to a table.
+fn save_setting_survives_malformed_usage_section() {
+    use vct_core::config::SettingValue;
+
+    // A hand-edited file where `usage` is a scalar must not panic the write
+    // from the Settings tab; the section is repaired to a table.
     let th = TempHome::new();
     let dir = &th.paths.cache_dir;
     fs::create_dir_all(dir).unwrap();
     fs::write(dir.join("config.toml"), "usage = \"bad\"\n").unwrap();
 
-    config::save_merge_models_in(dir, true).unwrap();
+    config::save_setting_in(dir, &["usage", "merge_models"], &SettingValue::Bool(false)).unwrap();
 
     let cfg = config::load_in(dir);
-    assert!(cfg.usage.merge_models);
+    assert!(!cfg.usage.merge_models);
     let text = fs::read_to_string(dir.join("config.toml")).unwrap();
-    assert!(text.contains("merge_models = true"));
+    assert!(text.contains("merge_models = false"));
 }
 
 #[test]
-fn save_merge_models_preserves_an_inline_usage_table() {
-    // A valid inline-table `[usage]` must NOT be wiped by the toggle: its sibling
+fn save_setting_preserves_an_inline_usage_table() {
+    use vct_core::config::SettingValue;
+
+    // A valid inline-table `[usage]` must NOT be wiped on write: its sibling
     // keys have to survive the write-back (regression — `is_table()` misses inline
     // tables, so the guard must use `is_table_like()`).
     let th = TempHome::new();
@@ -121,7 +127,7 @@ fn save_merge_models_preserves_an_inline_usage_table() {
     )
     .unwrap();
 
-    config::save_merge_models_in(dir, true).unwrap();
+    config::save_setting_in(dir, &["usage", "merge_models"], &SettingValue::Bool(true)).unwrap();
 
     let cfg = config::load_in(dir);
     assert!(cfg.usage.merge_models);

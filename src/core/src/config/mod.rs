@@ -146,9 +146,8 @@ impl Default for GeneralConfig {
 /// `[usage]` — usage dashboard preferences.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct UsageConfig {
-    /// Start the usage dashboard with models merged across provider prefixes.
-    /// Toggled live with `m`; the last state is saved back here.
-    #[serde(default)]
+    /// Merge models that share a base name across provider prefixes.
+    #[serde(default = "default_true")]
     pub merge_models: bool,
     /// Seconds between automatic refreshes of the Usage tab (minimum 1).
     #[serde(default = "default_refresh_secs")]
@@ -161,7 +160,7 @@ pub struct UsageConfig {
 impl Default for UsageConfig {
     fn default() -> Self {
         Self {
-            merge_models: false,
+            merge_models: true,
             refresh_interval: default_refresh_secs(),
             quota: QuotaConfig::default(),
         }
@@ -1031,20 +1030,6 @@ fn schema_description(schema: &Value, path: &[&str]) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Persists the usage dashboard's merge toggle back to the config.
-pub fn save_merge_models(enabled: bool) -> Result<()> {
-    save_merge_models_in(&get_cache_dir()?, enabled)
-}
-
-/// [`save_merge_models`] rooted at an explicit directory (test seam).
-pub fn save_merge_models_in(dir: &Path, enabled: bool) -> Result<()> {
-    save_setting_in(
-        dir,
-        &["usage", "merge_models"],
-        &SettingValue::Bool(enabled),
-    )
-}
-
 /// Opens the config file in `$VISUAL`, else `$EDITOR`, else `vi` (`notepad`
 /// on Windows), creating the file first when it is missing, and waits for the
 /// editor to exit.
@@ -1350,7 +1335,7 @@ mod tests {
         assert_eq!(cfg.general.default_time_range, TimeRange::All);
         assert_eq!(cfg.usage.quota.panels, default_quota_panels());
         assert!(cfg.usage.shows_quota_panel("cursor"));
-        assert!(!cfg.usage.merge_models);
+        assert!(cfg.usage.merge_models);
         assert_eq!(cfg.usage.refresh_interval, 10);
         assert_eq!(cfg.usage.quota.refresh_interval, 60);
         assert_eq!(cfg.analysis.refresh_interval, 10);
@@ -1422,8 +1407,8 @@ mod tests {
 
     #[test]
     fn partial_usage_section_keeps_quota_default() {
-        let cfg: Config = toml_edit::de::from_str("[usage]\nmerge_models = true\n").unwrap();
-        assert!(cfg.usage.merge_models);
+        let cfg: Config = toml_edit::de::from_str("[usage]\nmerge_models = false\n").unwrap();
+        assert!(!cfg.usage.merge_models);
         assert_eq!(cfg.usage.quota.panels, default_quota_panels());
         assert_eq!(cfg.usage.quota_refresh_secs(), 60);
     }

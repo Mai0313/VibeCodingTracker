@@ -176,10 +176,10 @@ const USAGE_MIN_W: u16 = 74;
 const USAGE_MIN_H: u16 = 14;
 
 pub(crate) struct UsageRefreshPayload {
-    rows: Vec<UsageRow>,
-    merged_rows: Vec<UsageRow>,
-    totals: UsageTotals,
-    provider_totals: UsageProviderTotals,
+    pub(crate) rows: Vec<UsageRow>,
+    pub(crate) merged_rows: Vec<UsageRow>,
+    pub(crate) totals: UsageTotals,
+    pub(crate) provider_totals: UsageProviderTotals,
 }
 
 struct QuotaShutdownGuard {
@@ -571,19 +571,6 @@ impl UsageUiState {
         self.resync(previous, true);
     }
 
-    /// Flips provider-prefix merging (`m`) and saves the choice.
-    pub(crate) fn toggle_merge(&mut self) {
-        let previous = self.selected_model();
-        self.merge_enabled = !self.merge_enabled;
-        let _ = vct_core::config::save_merge_models(self.merge_enabled);
-        self.resync(previous, false);
-    }
-
-    /// Whether provider prefixes are merged.
-    pub(crate) fn merge_enabled(&self) -> bool {
-        self.merge_enabled
-    }
-
     /// Sets provider-prefix merging without saving it.
     pub(crate) fn set_merge(&mut self, enabled: bool) {
         if enabled != self.merge_enabled {
@@ -622,7 +609,6 @@ impl UsageUiState {
             &self.provider_totals,
             &self.update_tracker,
             &mut self.scroll,
-            self.merge_enabled,
             self.sort,
             status,
             self.provider_panel_open,
@@ -772,7 +758,6 @@ fn draw_usage_view(
     provider_totals: &UsageProviderTotals,
     update_tracker: &UpdateTracker,
     scroll: &mut ScrollState,
-    merge_enabled: bool,
     sort: UsageSort,
     status: Option<(&str, RatatuiColor)>,
     provider_panel_open: bool,
@@ -925,8 +910,6 @@ fn draw_usage_view(
         );
     }
 
-    // When merged, the toggle un-merges, so label it "split" to match.
-    let merge_hint = if merge_enabled { "split" } else { "merge" };
     f.render_widget(
         create_controls_with_status(
             // Most needed first: the tail is what a narrow terminal drops,
@@ -936,7 +919,6 @@ fn draw_usage_view(
                 ("←→", "sort"),
                 ("[ ]", "range"),
                 ("p", "providers"),
-                ("m", merge_hint),
                 ("⏎", "details"),
                 ("r", "refresh"),
             ],
@@ -990,7 +972,6 @@ fn render_usage_frame<B: Backend<Error: Send + Sync + 'static>>(
     provider_totals: &UsageProviderTotals,
     update_tracker: &UpdateTracker,
     scroll: &mut ScrollState,
-    merge_enabled: bool,
     status: Option<&str>,
     provider_panel_open: bool,
 ) -> anyhow::Result<()> {
@@ -1003,7 +984,6 @@ fn render_usage_frame<B: Backend<Error: Send + Sync + 'static>>(
             provider_totals,
             update_tracker,
             scroll,
-            merge_enabled,
             UsageSort::default(),
             status.map(|text| (text, theme().warn)),
             provider_panel_open,
@@ -1113,7 +1093,6 @@ impl UsageFrameBenchmark {
             &self.provider_totals,
             &self.update_tracker,
             &mut self.scroll,
-            false,
             status,
             false,
         )
@@ -3412,7 +3391,6 @@ mod tests {
             &bench.provider_totals,
             &bench.update_tracker,
             &mut bench.scroll,
-            false,
             None,
             provider_panel,
         )
@@ -3607,7 +3585,6 @@ mod tests {
                         &provider_totals,
                         &tracker,
                         scroll,
-                        false,
                         UsageSort::default(),
                         None,
                         false,

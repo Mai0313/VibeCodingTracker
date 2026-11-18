@@ -709,7 +709,7 @@ mod tests {
     fn controls_drop_hints_whole_and_always_keep_quit() {
         let render = |width: u16| {
             controls(
-                &[("m", "merge"), ("p", "providers"), ("[ ]", "range")],
+                &[("r", "refresh"), ("p", "providers"), ("[ ]", "range")],
                 None,
                 width,
             )
@@ -722,11 +722,11 @@ mod tests {
 
         // The repo label goes first, then the tab's hints from the right, and
         // nothing is left half-drawn.
-        let narrow = render(48);
+        let narrow = render(50);
         assert!(!narrow.contains("Star"), "got {narrow:?}");
         assert!(!narrow.contains("range"), "got {narrow:?}");
         assert!(
-            narrow.contains("m merge  p providers  tab view  ? help  q quit"),
+            narrow.contains("r refresh  p providers  tab view  ? help  q quit"),
             "got {narrow:?}"
         );
 
