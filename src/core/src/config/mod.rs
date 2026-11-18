@@ -85,8 +85,9 @@ impl PerformanceConfig {
     /// Resolves the CLI scan worker count.
     ///
     /// A positive config value wins, followed by a positive
-    /// `RAYON_NUM_THREADS`; otherwise auto mode uses at most two workers. Every
-    /// result is capped at the available parallelism and is at least one.
+    /// `RAYON_NUM_THREADS`; otherwise auto mode uses `ceil(available / 2)`
+    /// workers, floored at two and capped at eight. Every result is capped at
+    /// the available parallelism and is at least one.
     pub fn resolved_scan_threads(&self) -> usize {
         let available = std::thread::available_parallelism()
             .map(std::num::NonZeroUsize::get)
@@ -105,7 +106,7 @@ impl PerformanceConfig {
             rayon_env
                 .and_then(|value| value.parse::<usize>().ok())
                 .filter(|value| *value > 0)
-                .unwrap_or_else(|| available.min(2))
+                .unwrap_or_else(|| available.div_ceil(2).clamp(2, 8))
         };
         requested.clamp(1, available)
     }
@@ -1404,12 +1405,16 @@ mod tests {
     #[test]
     fn scan_threads_resolve_config_then_env_then_auto() {
         let auto = PerformanceConfig { scan_threads: 0 };
-        assert_eq!(auto.resolved_scan_threads_with(16, None), 2);
         assert_eq!(auto.resolved_scan_threads_with(1, None), 1);
+        assert_eq!(auto.resolved_scan_threads_with(2, None), 2);
+        assert_eq!(auto.resolved_scan_threads_with(4, None), 2);
+        assert_eq!(auto.resolved_scan_threads_with(8, None), 4);
+        assert_eq!(auto.resolved_scan_threads_with(16, None), 8);
+        assert_eq!(auto.resolved_scan_threads_with(32, None), 8);
         assert_eq!(auto.resolved_scan_threads_with(16, Some("7")), 7);
         assert_eq!(auto.resolved_scan_threads_with(4, Some("99")), 4);
-        assert_eq!(auto.resolved_scan_threads_with(16, Some("0")), 2);
-        assert_eq!(auto.resolved_scan_threads_with(16, Some("invalid")), 2);
+        assert_eq!(auto.resolved_scan_threads_with(16, Some("0")), 8);
+        assert_eq!(auto.resolved_scan_threads_with(16, Some("invalid")), 8);
 
         let configured = PerformanceConfig { scan_threads: 12 };
         assert_eq!(configured.resolved_scan_threads_with(8, Some("3")), 8);

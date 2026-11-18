@@ -14,15 +14,18 @@ use crate::constants::FastHashMap;
 use crate::models::*;
 use crate::pricing::{TierClassifier, TierThresholds};
 use crate::session::diagnostics::{ParseDiagnostics, ParsedAnalysis};
+use crate::session::parser::stream_jsonl_borrowed;
 use crate::session::state::{ParseMode, SessionParseState};
 use crate::utils::{
     CodexTokenTotals, get_git_remote_url, parse_iso_timestamp, process_codex_usage,
 };
 use anyhow::Result;
 use regex::Regex;
-use serde_json::Value;
-use std::borrow::Borrow;
+use serde::Deserialize;
+use serde_json::{Value, value::RawValue};
+use std::borrow::{Borrow, Cow};
 use std::collections::HashSet;
+use std::path::Path;
 
 /// Parse Codex session records from a slice of pre-typed logs.
 ///
@@ -59,30 +62,221 @@ where
     I: IntoIterator,
     I::Item: Borrow<CodexLog>,
 {
-    let mut classifier = tiers.map(TierClassifier::new);
-    let mut state = SessionParseState::with_mode(mode);
-    let mut conversation_usage: FastHashMap<String, Value> = FastHashMap::with_capacity(5);
-    let mut current_model = String::new();
+    let mut fold = CodexFold::new(mode, tiers);
+    for entry in logs {
+        let entry = entry.borrow();
+        fold.observe(CodexRecordRef {
+            log_type: &entry.log_type,
+            timestamp: &entry.timestamp,
+            payload_type: entry.payload.payload_type.as_deref(),
+            cwd: entry.payload.cwd.as_deref(),
+            id: entry.payload.id.as_deref(),
+            git_repository_url: entry
+                .payload
+                .git
+                .as_ref()
+                .and_then(|git| git.repository_url.as_deref()),
+            model: entry.payload.model.as_deref(),
+            info: entry.payload.info.as_ref(),
+            success: entry.payload.success,
+            changes: entry.payload.changes.as_ref(),
+            name: entry.payload.name.as_deref(),
+            arguments: entry.payload.arguments.as_deref(),
+            call_id: entry.payload.call_id.as_deref(),
+            output: entry.payload.output.as_deref(),
+        });
+    }
+    Ok(fold.finish())
+}
+
+/// Zero-copy JSONL file parser for known Codex rollout logs.
+///
+/// Skips `content`, `message`, `summary`, `encrypted_content`, and
+/// `sandbox_policy` fields during deserialization so reasoning and message
+/// records never allocate unused bodies or fall back to dynamic `Value` parses.
+pub(crate) fn parse_codex_jsonl_path(
+    path: &Path,
+    mode: ParseMode,
+    tiers: Option<&TierThresholds>,
+) -> Result<Option<ParsedAnalysis>> {
+    stream_jsonl_borrowed(
+        path,
+        ExtensionType::Codex,
+        CodexFold::new(mode, tiers),
+        |fold, bytes| {
+            let record = serde_json::from_slice::<BorrowedCodexLog<'_>>(bytes)?;
+            let payload_type = record.payload.payload_type.as_deref();
+
+            let info = if record.log_type == "event_msg" && payload_type == Some("token_count") {
+                match record.payload.info {
+                    Some(raw) => Some(serde_json::from_str::<Value>(raw.get())?),
+                    None => None,
+                }
+            } else {
+                None
+            };
+
+            let changes = if record.log_type == "event_msg"
+                && payload_type == Some("patch_apply_end")
+                && record.payload.success == Some(true)
+            {
+                match record.payload.changes {
+                    Some(raw) => Some(serde_json::from_str::<Value>(raw.get())?),
+                    None => None,
+                }
+            } else {
+                None
+            };
+
+            let output = match record.payload.output {
+                None => None,
+                Some(raw) => {
+                    let call_id = record.payload.call_id.as_deref();
+                    let tracked_output = (payload_type == Some("function_call_output")
+                        && call_id.is_some_and(|id| fold.shell_calls.contains_key(id)))
+                        || (payload_type == Some("custom_tool_call_output")
+                            && call_id.is_some_and(|id| fold.custom_calls.contains_key(id)));
+                    if !tracked_output && raw.get().starts_with('"') {
+                        None
+                    } else {
+                        let mut de = serde_json::Deserializer::from_str(raw.get());
+                        crate::models::codex::deserialize_tool_output(&mut de)?
+                    }
+                }
+            };
+
+            fold.observe(CodexRecordRef {
+                log_type: &record.log_type,
+                timestamp: &record.timestamp,
+                payload_type,
+                cwd: record.payload.cwd.as_deref(),
+                id: record.payload.id.as_deref(),
+                git_repository_url: record
+                    .payload
+                    .git
+                    .as_ref()
+                    .and_then(|git| git.repository_url.as_deref()),
+                model: record.payload.model.as_deref(),
+                info: info.as_ref(),
+                success: record.payload.success,
+                changes: changes.as_ref(),
+                name: record.payload.name.as_deref(),
+                arguments: record.payload.arguments.as_deref(),
+                call_id: record.payload.call_id.as_deref(),
+                output: output.as_deref(),
+            });
+            Ok(())
+        },
+        |fold| Ok(fold.finish()),
+    )
+}
+
+#[derive(Deserialize)]
+struct BorrowedCodexLog<'a> {
+    #[serde(borrow)]
+    timestamp: Cow<'a, str>,
+    #[serde(borrow, rename = "type")]
+    log_type: Cow<'a, str>,
+    #[serde(borrow)]
+    payload: BorrowedCodexPayload<'a>,
+}
+
+#[derive(Deserialize)]
+struct BorrowedCodexPayload<'a> {
+    #[serde(default, borrow, rename = "type")]
+    payload_type: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    name: Option<Cow<'a, str>>,
+    #[serde(
+        default,
+        alias = "input",
+        deserialize_with = "crate::models::codex::deserialize_tool_arguments"
+    )]
+    arguments: Option<String>,
+    #[serde(default, borrow)]
+    call_id: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    output: Option<&'a RawValue>,
+    #[serde(default, borrow)]
+    info: Option<&'a RawValue>,
+    #[serde(default, borrow)]
+    cwd: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    model: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    id: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    git: Option<BorrowedCodexGitInfo<'a>>,
+    #[serde(default)]
+    success: Option<bool>,
+    #[serde(default, borrow)]
+    changes: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct BorrowedCodexGitInfo<'a> {
+    #[serde(default, borrow)]
+    repository_url: Option<Cow<'a, str>>,
+}
+
+struct CodexRecordRef<'a> {
+    log_type: &'a str,
+    timestamp: &'a str,
+    payload_type: Option<&'a str>,
+    cwd: Option<&'a str>,
+    id: Option<&'a str>,
+    git_repository_url: Option<&'a str>,
+    model: Option<&'a str>,
+    info: Option<&'a Value>,
+    success: Option<bool>,
+    changes: Option<&'a Value>,
+    name: Option<&'a str>,
+    arguments: Option<&'a str>,
+    call_id: Option<&'a str>,
+    output: Option<&'a str>,
+}
+
+struct CodexFold<'a> {
+    mode: ParseMode,
+    classifier: Option<TierClassifier<'a>>,
+    state: SessionParseState,
+    conversation_usage: FastHashMap<String, Value>,
+    current_model: String,
     // Codex publishes whole-session cumulative counters on every token_count
     // event; each model is billed only the delta since the previous snapshot.
     // Pre-context snapshots (a resumed session's replayed totals) advance the
     // snapshot without attribution.
-    let mut prev_totals: Option<CodexTokenTotals> = None;
-    let mut shell_calls: FastHashMap<String, PendingCodexShellCall> =
-        FastHashMap::with_capacity(50);
-    let mut custom_calls: FastHashMap<String, CodexCustomCall> = FastHashMap::with_capacity(32);
+    prev_totals: Option<CodexTokenTotals>,
+    shell_calls: FastHashMap<String, PendingCodexShellCall>,
+    custom_calls: FastHashMap<String, CodexCustomCall>,
     // Call ids whose file ops have already been counted, by either the direct
     // apply_patch output or its authoritative patch_apply_end event. The first
     // to actually count wins; the other is skipped. A direct patch whose output
     // never confirmed success does not register here, so it can't suppress a
     // successful event.
-    let mut patch_counted_ids: HashSet<String> = HashSet::new();
-    let mut diagnostics = ParseDiagnostics::default();
+    patch_counted_ids: HashSet<String>,
+    diagnostics: ParseDiagnostics,
+}
 
-    for entry in logs {
-        let entry = entry.borrow();
+impl<'a> CodexFold<'a> {
+    fn new(mode: ParseMode, tiers: Option<&'a TierThresholds>) -> Self {
+        Self {
+            mode,
+            classifier: tiers.map(TierClassifier::new),
+            state: SessionParseState::with_mode(mode),
+            conversation_usage: FastHashMap::with_capacity(5),
+            current_model: String::new(),
+            prev_totals: None,
+            shell_calls: FastHashMap::with_capacity(50),
+            custom_calls: FastHashMap::with_capacity(32),
+            patch_counted_ids: HashSet::new(),
+            diagnostics: ParseDiagnostics::default(),
+        }
+    }
+
+    fn observe(&mut self, entry: CodexRecordRef<'_>) {
         let recognized = matches!(
-            entry.log_type.as_str(),
+            entry.log_type,
             "session_meta"
                 | "turn_context"
                 | "event_msg"
@@ -92,79 +286,75 @@ where
                 | "compacted"
         );
         if recognized {
-            diagnostics.record_recognized_source();
+            self.diagnostics.record_recognized_source();
         } else {
-            diagnostics.record_unrecognized();
+            self.diagnostics.record_unrecognized();
         }
-        let ts = parse_iso_timestamp(&entry.timestamp);
-        if ts > state.last_ts {
-            state.last_ts = ts;
+        let ts = parse_iso_timestamp(entry.timestamp);
+        if ts > self.state.last_ts {
+            self.state.last_ts = ts;
         }
 
-        match entry.log_type.as_str() {
+        match entry.log_type {
             "session_meta" => {
-                if state.folder_path.is_empty()
-                    && let Some(cwd) = &entry.payload.cwd
+                if self.state.folder_path.is_empty()
+                    && let Some(cwd) = entry.cwd
                 {
-                    state.folder_path.clone_from(cwd);
+                    self.state.folder_path.push_str(cwd);
                 }
-                if state.task_id.is_empty()
-                    && let Some(id) = &entry.payload.id
+                if self.state.task_id.is_empty()
+                    && let Some(id) = entry.id
                 {
-                    state.task_id.clone_from(id);
+                    self.state.task_id.push_str(id);
                 }
-                if state.git_remote.is_empty()
-                    && let Some(git) = &entry.payload.git
-                    && let Some(url) = &git.repository_url
+                if self.state.git_remote.is_empty()
+                    && let Some(url) = entry.git_repository_url
                 {
-                    state.git_remote.clone_from(url);
+                    self.state.git_remote.push_str(url);
                 }
             }
             "turn_context" => {
-                if state.folder_path.is_empty()
-                    && let Some(cwd) = &entry.payload.cwd
+                if self.state.folder_path.is_empty()
+                    && let Some(cwd) = entry.cwd
                 {
-                    state.folder_path.clone_from(cwd);
+                    self.state.folder_path.push_str(cwd);
                 }
-                if let Some(model) = entry
-                    .payload
-                    .model
-                    .as_ref()
-                    .filter(|model| !model.is_empty())
+                if let Some(model) = entry.model.filter(|model| !model.is_empty())
+                    && self.current_model != model
                 {
-                    current_model.clone_from(model);
+                    self.current_model.clear();
+                    self.current_model.push_str(model);
                 }
             }
             "event_msg" => {
-                if let Some(payload_type) = &entry.payload.payload_type
-                    && payload_type == "token_count"
-                    && let Some(info) = entry.payload.info.as_ref().filter(|info| !info.is_null())
+                if entry.payload_type == Some("token_count")
+                    && let Some(info) = entry.info.filter(|info| !info.is_null())
                 {
                     if !is_supported_codex_usage(info) {
-                        diagnostics.record_relevant(false);
+                        self.diagnostics.record_relevant(false);
                     } else {
-                        diagnostics.record_relevant(true);
+                        self.diagnostics.record_relevant(true);
                         let total = info.get("total_token_usage").and_then(Value::as_object);
-                        if current_model.is_empty() {
+                        if self.current_model.is_empty() {
                             // Replayed pre-context totals: advance the snapshot
                             // without attributing tokens to a guessed model.
                             if let Some(total) = total {
-                                prev_totals = Some(CodexTokenTotals::from_total_object(
+                                self.prev_totals = Some(CodexTokenTotals::from_total_object(
                                     total,
-                                    prev_totals.as_ref(),
+                                    self.prev_totals.as_ref(),
                                 ));
                             }
                         } else {
                             let delta = total
                                 .map(|total| {
-                                    CodexTokenTotals::delta_fields(total, prev_totals.as_ref())
+                                    CodexTokenTotals::delta_fields(total, self.prev_totals.as_ref())
                                 })
                                 .unwrap_or_default();
                             // One token_count is one turn; its request context
                             // is the turn's own full prompt (cached included),
                             // published as last_token_usage.input_tokens. Fall
                             // back to the delta input when absent.
-                            let level = classifier.as_mut().map_or(0, |classifier| {
+                            let level = self.classifier.as_mut().map_or(0, |classifier| {
                                 let request_context = info
                                     .get("last_token_usage")
                                     .and_then(|last| last.get("input_tokens"))
@@ -172,19 +362,19 @@ where
                                     .filter(|tokens| *tokens > 0)
                                     .or_else(|| delta.get("input_tokens").and_then(Value::as_i64))
                                     .unwrap_or(0);
-                                classifier.level(&current_model, request_context)
+                                classifier.level(&self.current_model, request_context)
                             });
                             process_codex_usage(
-                                &mut conversation_usage,
-                                &current_model,
+                                &mut self.conversation_usage,
+                                &self.current_model,
                                 &delta,
                                 info,
                                 level,
                             );
                             if let Some(total) = total {
-                                prev_totals = Some(CodexTokenTotals::from_total_object(
+                                self.prev_totals = Some(CodexTokenTotals::from_total_object(
                                     total,
-                                    prev_totals.as_ref(),
+                                    self.prev_totals.as_ref(),
                                 ));
                             }
                         }
@@ -194,141 +384,130 @@ where
                 // Modern Codex applies most edits inside opaque `exec` cells and
                 // records the resulting file changes in a `patch_apply_end` event.
                 // A successful one is the authoritative source of those file ops.
-                if entry.payload.payload_type.as_deref() == Some("patch_apply_end") {
+                if entry.payload_type == Some("patch_apply_end") {
                     // Skip when this call_id's file ops were already counted,
                     // by the direct apply_patch output or an earlier event.
                     let already_counted = entry
-                        .payload
                         .call_id
-                        .as_deref()
-                        .is_some_and(|id| patch_counted_ids.contains(id));
-                    if matches!(entry.payload.success, Some(true)) && !already_counted {
-                        match parse_patch_changes(entry.payload.changes.as_ref()) {
+                        .is_some_and(|id| self.patch_counted_ids.contains(id));
+                    if matches!(entry.success, Some(true)) && !already_counted {
+                        match parse_patch_changes(entry.changes) {
                             Some(patches) => {
                                 for patch in patches {
-                                    state.handle_patch(patch, ts);
+                                    self.state.handle_patch(patch, ts);
                                 }
-                                if let Some(id) = entry.payload.call_id.as_deref() {
-                                    patch_counted_ids.insert(id.to_string());
+                                if let Some(id) = entry.call_id {
+                                    self.patch_counted_ids.insert(id.to_string());
                                 }
-                                diagnostics.record_relevant(true);
+                                self.diagnostics.record_relevant(true);
                             }
-                            None => diagnostics.record_relevant(false),
+                            None => self.diagnostics.record_relevant(false),
                         }
                     }
                     // A failed or deduped event is recognized but creates no file ops.
                 }
             }
-            "response_item" => {
-                if let Some(payload_type) = &entry.payload.payload_type {
-                    match payload_type.as_str() {
-                        "function_call" => {
-                            if let Some(name) = entry.payload.name.as_deref()
-                                && matches!(name, "shell" | "exec_command")
-                            {
-                                let call = entry
-                                    .payload
-                                    .arguments
-                                    .as_deref()
-                                    .and_then(|args| parse_function_call(name, args, ts));
-                                if let Some(call_id) = entry.payload.call_id.as_deref() {
-                                    if let Some(call) = call {
-                                        diagnostics.record_relevant(true);
-                                        shell_calls.insert(
-                                            call_id.to_string(),
-                                            PendingCodexShellCall::Parsed(call),
-                                        );
-                                    } else {
-                                        // Defer the schema verdict until the paired output. Codex
-                                        // persists model-generated argument errors as ordinary
-                                        // lifecycle records even though no command ran.
-                                        shell_calls.insert(
-                                            call_id.to_string(),
-                                            PendingCodexShellCall::InvalidArguments,
-                                        );
-                                    }
-                                } else {
-                                    diagnostics.record_relevant(false);
-                                }
-                            }
-                        }
-                        "function_call_output" => {
-                            if let Some(call_id) = &entry.payload.call_id
-                                && let Some(call) = shell_calls.remove(call_id)
-                            {
-                                match call {
-                                    PendingCodexShellCall::Parsed(call) => {
-                                        diagnostics.record_relevant(true);
-                                        let output = shell_output(entry.payload.output.as_deref());
-                                        state.handle_shell_call(call, output);
-                                    }
-                                    PendingCodexShellCall::InvalidArguments => {
-                                        diagnostics.record_relevant(output_reports_argument_error(
-                                            entry.payload.output.as_deref(),
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                        "custom_tool_call" => {
-                            if let Some(name) = entry.payload.name.as_deref()
-                                && matches!(name, "exec" | "apply_patch")
-                            {
-                                let call = entry
-                                    .payload
-                                    .arguments
-                                    .as_deref()
-                                    .and_then(|input| parse_custom_call(name, input, ts, mode));
-                                let normalized = call.is_some() && entry.payload.call_id.is_some();
-                                diagnostics.record_relevant(normalized);
-                                if let (Some(call), Some(call_id)) =
-                                    (call, entry.payload.call_id.as_deref())
-                                {
-                                    custom_calls.insert(call_id.to_string(), call);
-                                }
-                            }
-                        }
-                        "custom_tool_call_output" => {
-                            if let Some(call_id) = entry.payload.call_id.as_deref()
-                                && let Some(call) = custom_calls.remove(call_id)
-                            {
-                                let normalized = dispatch_custom_call(
-                                    &mut state,
-                                    call,
-                                    entry.payload.output.as_deref(),
-                                    call_id,
-                                    &mut patch_counted_ids,
+            "response_item" => match entry.payload_type {
+                Some("function_call") => {
+                    if let Some(name) = entry.name
+                        && matches!(name, "shell" | "exec_command")
+                    {
+                        let call = entry
+                            .arguments
+                            .and_then(|args| parse_function_call(name, args, ts));
+                        if let Some(call_id) = entry.call_id {
+                            if let Some(call) = call {
+                                self.diagnostics.record_relevant(true);
+                                self.shell_calls.insert(
+                                    call_id.to_string(),
+                                    PendingCodexShellCall::Parsed(call),
                                 );
-                                diagnostics.record_relevant(normalized);
+                            } else {
+                                // Defer the schema verdict until the paired output. Codex
+                                // persists model-generated argument errors as ordinary
+                                // lifecycle records even though no command ran.
+                                self.shell_calls.insert(
+                                    call_id.to_string(),
+                                    PendingCodexShellCall::InvalidArguments,
+                                );
                             }
+                        } else {
+                            self.diagnostics.record_relevant(false);
                         }
-                        _ => {}
                     }
                 }
-            }
+                Some("function_call_output") => {
+                    if let Some(call_id) = entry.call_id
+                        && let Some(call) = self.shell_calls.remove(call_id)
+                    {
+                        match call {
+                            PendingCodexShellCall::Parsed(call) => {
+                                self.diagnostics.record_relevant(true);
+                                let output = shell_output(entry.output);
+                                self.state.handle_shell_call(call, output);
+                            }
+                            PendingCodexShellCall::InvalidArguments => {
+                                self.diagnostics
+                                    .record_relevant(output_reports_argument_error(entry.output));
+                            }
+                        }
+                    }
+                }
+                Some("custom_tool_call") => {
+                    if let Some(name) = entry.name
+                        && matches!(name, "exec" | "apply_patch")
+                    {
+                        let call = entry
+                            .arguments
+                            .and_then(|input| parse_custom_call(name, input, ts, self.mode));
+                        let normalized = call.is_some() && entry.call_id.is_some();
+                        self.diagnostics.record_relevant(normalized);
+                        if let (Some(call), Some(call_id)) = (call, entry.call_id) {
+                            self.custom_calls.insert(call_id.to_string(), call);
+                        }
+                    }
+                }
+                Some("custom_tool_call_output") => {
+                    if let Some(call_id) = entry.call_id
+                        && let Some(call) = self.custom_calls.remove(call_id)
+                    {
+                        let normalized = dispatch_custom_call(
+                            &mut self.state,
+                            call,
+                            entry.output,
+                            call_id,
+                            &mut self.patch_counted_ids,
+                        );
+                        self.diagnostics.record_relevant(normalized);
+                    }
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
 
-    for call in shell_calls.into_values() {
-        if matches!(call, PendingCodexShellCall::InvalidArguments) {
-            diagnostics.record_relevant(false);
+    fn finish(mut self) -> ParsedAnalysis {
+        for call in self.shell_calls.into_values() {
+            if matches!(call, PendingCodexShellCall::InvalidArguments) {
+                self.diagnostics.record_relevant(false);
+            }
         }
-    }
-    if state.git_remote.is_empty() {
-        state.git_remote = get_git_remote_url(&state.folder_path);
-    }
+        if self.state.git_remote.is_empty() {
+            self.state.git_remote = get_git_remote_url(&self.state.folder_path);
+        }
 
-    let record = state.into_record(conversation_usage);
+        let record = self.state.into_record(self.conversation_usage);
 
-    let analysis = CodeAnalysis {
-        user: String::new(),
-        extension_name: String::new(),
-        insights_version: String::new(),
-        machine_id: String::new(),
-        records: vec![record],
-    };
-    Ok(ParsedAnalysis::new(analysis, diagnostics))
+        let analysis = CodeAnalysis {
+            user: String::new(),
+            extension_name: String::new(),
+            insights_version: String::new(),
+            machine_id: String::new(),
+            records: vec![record],
+        };
+        ParsedAnalysis::new(analysis, self.diagnostics)
+    }
 }
 
 /// Whether a `token_count` info blob is a shape this parser can fold; one
@@ -1857,5 +2036,62 @@ mod tests {
         // Detail bodies are retained only in Full mode.
         assert!(!f.write_file_details.is_empty());
         assert!(u.write_file_details.is_empty());
+    }
+
+    #[test]
+    fn borrowed_jsonl_stream_handles_reasoning_arrays_and_schema_drift() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:00Z",
+                "type": "turn_context",
+                "payload": { "cwd": "/tmp", "model": "gpt-5" }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:01Z",
+                "type": "response_item",
+                "payload": { "type": "reasoning", "summary": [], "encrypted_content": "blob" }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-12T00:00:02Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 100,
+                            "cached_input_tokens": 20,
+                            "output_tokens": 30,
+                            "reasoning_output_tokens": 10,
+                            "total_tokens": 130
+                        }
+                    }
+                }
+            }),
+        ];
+        let body: String = lines.iter().map(|v| format!("{v}\n")).collect();
+        std::fs::write(&path, body).unwrap();
+
+        let parsed = parse_codex_jsonl_path(&path, ParseMode::UsageOnly, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.diagnostics.recognized_records, 3);
+        assert_eq!(parsed.diagnostics.partial_failure_count(), 0);
+        assert_eq!(
+            parsed.analysis.records[0].conversation_usage["gpt-5"]["total_token_usage"]["input_tokens"],
+            100
+        );
+
+        let bad_path = dir.path().join("bad.jsonl");
+        std::fs::write(
+            &bad_path,
+            "{\"timestamp\":\"2026-07-12T00:00:00Z\",\"type\":\"response_item\",\"payload\":{\"type\":42}}\n",
+        )
+        .unwrap();
+        let bad = parse_codex_jsonl_path(&bad_path, ParseMode::UsageOnly, None)
+            .unwrap()
+            .unwrap();
+        assert!(bad.diagnostics.is_complete_failure());
     }
 }

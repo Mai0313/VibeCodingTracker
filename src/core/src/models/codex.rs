@@ -6,45 +6,170 @@
 //! response-item records; only the fields relevant to each record type are
 //! populated.
 
-use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{Error as _, MapAccess, SeqAccess, Visitor, value},
+};
 use serde_json::Value;
+use std::fmt;
 
 /// Normalizes JSON-encoded or structured tool arguments into the legacy string field.
-fn deserialize_tool_arguments<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+pub(crate) fn deserialize_tool_arguments<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let value = Option::<Value>::deserialize(deserializer)?;
-    match value {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(text)) => Ok(Some(text)),
-        Some(value @ (Value::Object(_) | Value::Array(_))) => serde_json::to_string(&value)
-            .map(Some)
-            .map_err(|_| D::Error::custom("failed to normalize tool arguments")),
-        Some(_) => Err(D::Error::custom(
-            "tool arguments must be a string, object, or array",
-        )),
+    struct ArgsVisitor;
+
+    impl<'de> Visitor<'de> for ArgsVisitor {
+        type Value = Option<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("null, a string, an object, or an array")
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2: Deserializer<'de>>(
+            self,
+            deserializer: D2,
+        ) -> Result<Self::Value, D2::Error> {
+            deserializer.deserialize_any(Self)
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(Some(v.to_owned()))
+        }
+
+        fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+            Ok(Some(v))
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+            let obj = serde_json::Map::deserialize(value::MapAccessDeserializer::new(map))?;
+            serde_json::to_string(&Value::Object(obj))
+                .map(Some)
+                .map_err(|_| A::Error::custom("failed to normalize tool arguments"))
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+            let arr = Vec::<Value>::deserialize(value::SeqAccessDeserializer::new(seq))?;
+            serde_json::to_string(&Value::Array(arr))
+                .map(Some)
+                .map_err(|_| A::Error::custom("failed to normalize tool arguments"))
+        }
+
+        fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+            Err(E::custom(
+                "tool arguments must be a string, object, or array",
+            ))
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+            Err(E::custom(
+                "tool arguments must be a string, object, or array",
+            ))
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+            Err(E::custom(
+                "tool arguments must be a string, object, or array",
+            ))
+        }
+
+        fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+            Err(E::custom(
+                "tool arguments must be a string, object, or array",
+            ))
+        }
     }
+
+    deserializer.deserialize_any(ArgsVisitor)
 }
 
 /// Normalizes string, object, and content-block output shapes into one string;
 /// an object stays JSON-encoded for the parser to decode again.
-fn deserialize_tool_output<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+pub(crate) fn deserialize_tool_output<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let value = Option::<Value>::deserialize(deserializer)?;
-    match value {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(text)) => Ok(Some(text)),
-        Some(value @ Value::Object(_)) => serde_json::to_string(&value)
-            .map(Some)
-            .map_err(|_| D::Error::custom("failed to normalize tool output")),
-        Some(Value::Array(blocks)) => normalize_output_blocks(blocks).map(Some),
-        Some(_) => Err(D::Error::custom(
-            "tool output must be a string, object, or content-block array",
-        )),
+    struct OutputVisitor;
+
+    impl<'de> Visitor<'de> for OutputVisitor {
+        type Value = Option<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("null, a string, an object, or a content-block array")
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2: Deserializer<'de>>(
+            self,
+            deserializer: D2,
+        ) -> Result<Self::Value, D2::Error> {
+            deserializer.deserialize_any(Self)
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(Some(v.to_owned()))
+        }
+
+        fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+            Ok(Some(v))
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+            let obj = serde_json::Map::deserialize(value::MapAccessDeserializer::new(map))?;
+            serde_json::to_string(&Value::Object(obj))
+                .map(Some)
+                .map_err(|_| A::Error::custom("failed to normalize tool output"))
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+            let blocks = Vec::<Value>::deserialize(value::SeqAccessDeserializer::new(seq))?;
+            normalize_output_blocks(blocks).map(Some)
+        }
+
+        fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+            Err(E::custom(
+                "tool output must be a string, object, or content-block array",
+            ))
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+            Err(E::custom(
+                "tool output must be a string, object, or content-block array",
+            ))
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+            Err(E::custom(
+                "tool output must be a string, object, or content-block array",
+            ))
+        }
+
+        fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+            Err(E::custom(
+                "tool output must be a string, object, or content-block array",
+            ))
+        }
     }
+
+    deserializer.deserialize_any(OutputVisitor)
 }
 
 /// Flattens a content-block array into text, adding a newline only where the

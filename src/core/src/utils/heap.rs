@@ -24,12 +24,12 @@ pub fn release_freed_heap() {
 /// Must run before the first allocation that crosses thread boundaries to
 /// have its full effect. Both knobs are load-bearing, not cosmetic:
 ///
-/// - `M_ARENA_MAX = 2` caps the per-thread arenas glibc creates for the Rayon
+/// - `M_ARENA_MAX = 4` caps the per-thread arenas glibc creates for the Rayon
 ///   pool (a 16-core box otherwise gets up to 128). Each arena retains its own
 ///   free list independently of `malloc_trim`, which is how the TUI grew
-///   ~6 MB per 10 s refresh even with a trim at the end of every cycle. Two
-///   arenas keep allocator lock contention off the critical path without
-///   multiplying that retention across cores.
+///   ~6 MB per 10 s refresh even with a trim at the end of every cycle. Four
+///   arenas keep allocator lock contention off the critical path up to the
+///   8-worker auto scan cap without multiplying retention across cores.
 /// - `M_TRIM_THRESHOLD = 128 KiB` pins the point at which glibc hands the
 ///   arena's top chunk back to the OS. The default starts at this value but
 ///   grows automatically, so long sessions drift without the pin.
@@ -43,7 +43,7 @@ pub fn tune_system_allocator() {
         // SAFETY: `mallopt` is thread-safe and has no preconditions; an
         // unrecognized option number simply returns 0.
         unsafe {
-            libc::mallopt(M_ARENA_MAX, 2);
+            libc::mallopt(M_ARENA_MAX, 4);
             libc::mallopt(M_TRIM_THRESHOLD, 128 * 1024);
         }
     }
