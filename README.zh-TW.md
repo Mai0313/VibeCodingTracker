@@ -132,11 +132,10 @@ vct analysis
 | ------------------- | ----------------------------------------------------------------- |
 | `Tab` / `Shift+Tab` | 下一個 / 上一個分頁（也可直接點擊頂部分頁列）                     |
 | `↑` / `↓`           | 移動選取的列                                                      |
-| `Enter`             | 顯示選取 model 的完整數字（Usage 也會顯示對應計價 model）         |
+| `Enter`             | 顯示選取 model 的各 provider 拆解、佔比與完整數字                 |
 | `←` / `→`           | 改用左邊 / 右邊那一欄排序（Usage、Analysis）                      |
 | `[` / `]`           | 上一個 / 下一個時間範圍：day、week、month、all（Usage、Analysis） |
 | `r`                 | 立即刷新（Usage、Analysis）                                       |
-| `m`                 | 合併 / 拆開 provider 前綴，會存進設定檔（Usage）                  |
 | `p`                 | 開啟 Provider Usage 面板（Usage）                                 |
 | `?`                 | 列出目前分頁的按鍵                                                |
 | `Esc`               | 關閉開啟的面板                                                    |
@@ -191,7 +190,7 @@ vct usage --table --merge-providers
 > `--table` 與 `--text` 的 model 列會依 cost 由小到大排序，所以花費最高的 model 會排在最後（在 `--table` 中緊鄰 `TOTAL` 列上方）；`--json` 的列則沒有固定順序。互動式介面預設依 cost 由大到小排序，按 `←` / `→` 可改用左邊或右邊那一欄排序，排序欄的表頭會標亮。表格標題右側會標出目前的排序（`sort: cost ▼`）。互動式介面也會隱藏在所選範圍內用量為 0 的 model。
 
 > [!TIP]
-> 同一個 model 在不同 provider 前綴下路由時會顯示成多列（`openai/gpt-5.5`、`azure/gpt-5.5`、純 `gpt-5.5`）。`--merge-providers` 會把第一個 `/` 之後 base 名稱相同的列合併（`gpt-5.5` 與 `gpt-5.4` 這類版本不同的仍分開），並把它們已定價的 cost 相加。在 Usage 分頁按 `m` 可即時切換（這個選擇會存進 `~/.vct/config.toml`，所以下次啟動時會記住這個設定）;`--merge-providers` 則讓該分頁一打開就是合併狀態。`--json` 保持為逐一 model 的原始輸出。
+> 同一個 model 在不同 provider 前綴下路由時會帶有不同前綴（`openai/gpt-5.5`、`azure/gpt-5.5`、純 `gpt-5.5`）。預設情況下，`vct` 會把第一個 `/` 之後 base 名稱相同的列合併（`gpt-5.5` 與 `gpt-5.4` 這類版本不同的仍分開），並把它們已定價的 cost 相加（可在 `Settings > Usage > Merge models across providers` 切換，對應 `~/.vct/config.toml` 的 `usage.merge_models = true`）。若在 Settings 中關閉，`--merge-providers` 可在單次執行時強制開啟合併。`--json` 保持為逐一 model 的原始輸出。
 
 ### 預覽：Usage 分頁（`vct usage`）
 
@@ -207,7 +206,7 @@ vct usage --table --merge-providers
 │                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
                                             ● Claude $78.93  ● Gemini $0.40
- ↑↓ move  ←→ sort  [ ] range  p providers  m merge  ⏎ details  r refresh  tab view  ? help  q quit       Star on GitHub
+ ↑↓ move  ←→ sort  [ ] range  p providers  ⏎ details  r refresh  tab view  ? help  q quit                Star on GitHub
 ```
 
 Usage 與 Analysis 分頁各自在第一次切到時開始掃描, 並繪製置中的 `Loading sessions...` spinner. Loading 期間仍可處理 `q`, Ctrl+C 與 resize event. 後續掃描會在 `Refreshing...` footer 下保留上一次成功的資料. 如果 refresh 失敗, 分頁會保留 last-known-good view, 並在下次排程或手動刷新時重試. 所選範圍內沒有任何 session 時, 會顯示空的表格.
@@ -567,7 +566,7 @@ vct 會把使用者設定存放在 `~/.vct/config.toml`。這個檔案會在**�
 │   Analysis     ││   Check for updates on start                                                                 [x] on│
 │   Providers    ││                                                                                                    │
 │   Remotes      ││ Usage                                                                                              │
-│   Performance  ││   Merge models across providers                                                             [ ] off│
+│   Performance  ││   Merge models across providers                                                              [x] on│
 │   Logging      ││   Redraw interval                                                                          ‹ 10 s ›│
 │                ││   Quota panel: Claude                                                                        [x] on│
 │                ││   Quota panel: Codex                                                                         [x] on│
