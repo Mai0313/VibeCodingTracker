@@ -5,10 +5,9 @@
 //! redrawing on terminal resize without re-aggregating.
 
 use crate::display::analysis::averages::{
-    AnalysisProviderTotals, AnalysisRow, build_analysis_provider_rows,
+    AnalysisProviderStats, AnalysisProviderTotals, AnalysisRow, build_analysis_provider_rows,
     build_analysis_rows_with_providers, calculate_analysis_provider_totals_from_per_provider,
 };
-use crate::display::common::provider_tui_color;
 use crate::display::common::table::{
     CONTENT_MIN_H, ColumnSpec, DetailItem, DetailSection, FOOTER_H, TableChrome,
     create_controls_with_status, create_provider_row, create_ratatui_table, fit_columns,
@@ -17,12 +16,13 @@ use crate::display::common::table::{
 };
 use crate::display::common::theme::theme;
 use crate::display::common::tui::{LEDGER_SAVE_INTERVAL, NavDelta, ScrollState, UpdateTracker};
+use crate::display::common::{ProviderTotal, provider_tui_color};
 use ratatui::{
     Frame,
     layout::{Constraint, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Row as RatatuiRow},
+    widgets::{Block, BorderType, Borders, Paragraph, Row as RatatuiRow},
 };
 use vct_core::analysis::AnalysisData;
 use vct_core::config::ProvidersConfig;
@@ -55,7 +55,7 @@ const PROVIDER_COL_MIN_W: u16 = 15;
 /// fixed height would either hide it needlessly (few providers) or render it
 /// truncated (all provider rows + overall). We instead require room for the
 /// band *and* everything below it, so it only appears when it fits in full.
-fn analysis_panels_height(area_height: u16, provider_row_count: usize) -> Option<u16> {
+pub(crate) fn analysis_panels_height(area_height: u16, provider_row_count: usize) -> Option<u16> {
     let totals_height = (provider_row_count as u16).saturating_add(4).max(4);
     (area_height >= totals_height.saturating_add(ANALYSIS_BELOW_BAND_MIN_H))
         .then_some(totals_height)
@@ -90,18 +90,18 @@ impl AnalysisSort {
         Self::Write,
     ];
 
-    fn index(self) -> usize {
+    pub(crate) fn index(self) -> usize {
         Self::ALL.iter().position(|sort| *sort == self).unwrap_or(0)
     }
 
     /// The column `step` places along the header, stopping at either end.
-    fn step(self, step: isize) -> Self {
+    pub(crate) fn step(self, step: isize) -> Self {
         let last = Self::ALL.len() as isize - 1;
         Self::ALL[(self.index() as isize + step).clamp(0, last) as usize]
     }
 
     /// What the table title shows: numbers run largest first, names A to Z.
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Model => "sort: model ▲",
             Self::EditLines => "sort: edit lines ▼",
@@ -217,6 +217,17 @@ impl AnalysisUiState {
         );
     }
 
+    /// Sets the sort directly (e.g. when clicking a column header).
+    pub(crate) fn set_sort(&mut self, sort: AnalysisSort) {
+        if sort != self.sort {
+            let previous = self.selected_model();
+            self.sort = sort;
+            self.sort.apply(&mut self.rows);
+            let models: Vec<_> = self.rows.iter().map(|row| row.model.clone()).collect();
+            self.scroll.sync(previous.as_deref(), &models);
+        }
+    }
+
     /// Moves the sort one column left or right (`←` / `→`).
     pub(crate) fn step_sort(&mut self, step: isize) {
         let previous = self.selected_model();
@@ -229,6 +240,59 @@ impl AnalysisUiState {
     /// Moves the selection.
     pub(crate) fn navigate(&mut self, delta: NavDelta) {
         self.scroll.apply(delta, self.rows.len());
+    }
+
+    /// Currently aggregated model rows.
+    pub(crate) fn rows(&self) -> &[AnalysisRow] {
+        &self.rows
+    }
+
+    /// Grand totals across all models.
+    pub(crate) fn totals(&self) -> &AnalysisRow {
+        &self.totals
+    }
+
+    /// Per-provider totals.
+    pub(crate) fn provider_totals(&self) -> &AnalysisProviderTotals {
+        &self.provider_totals
+    }
+
+    /// Recent-update highlight tracker.
+    pub(crate) fn update_tracker(&self) -> &UpdateTracker {
+        &self.update_tracker
+    }
+
+    /// Table scroll and selection state.
+    pub(crate) fn scroll(&self) -> &ScrollState {
+        &self.scroll
+    }
+
+    /// Mutable table scroll and selection state.
+    pub(crate) fn scroll_mut(&mut self) -> &mut ScrollState {
+        &mut self.scroll
+    }
+
+    /// Current sort column.
+    pub(crate) fn sort(&self) -> AnalysisSort {
+        self.sort
+    }
+
+    /// Selected model index, if any.
+    pub(crate) fn selected_index(&self) -> Option<usize> {
+        self.scroll.table.selected()
+    }
+
+    /// Selects model row `index` directly (clamped into range).
+    pub(crate) fn select_index(&mut self, index: usize) {
+        let len = self.rows.len();
+        if len > 0 {
+            self.scroll.table.select(Some(index.min(len - 1)));
+        }
+    }
+
+    /// Currently selected row, if any.
+    pub(crate) fn selected_row(&self) -> Option<&AnalysisRow> {
+        self.selected_index().and_then(|at| self.rows.get(at))
     }
 
     /// Draws the tab into `area`.
@@ -295,6 +359,278 @@ pub(crate) fn scan_analysis(
     Ok(aggregation.data)
 }
 
+const ANALYSIS_NUMERIC_COLS: [ColumnSpec; 8] = [
+    ColumnSpec {
+        header: "Edit Lines",
+        width: 11,
+        drop_rank: 0,
+    },
+    ColumnSpec {
+        header: "Read Lines",
+        width: 11,
+        drop_rank: 1,
+    },
+    ColumnSpec {
+        header: "Write Lines",
+        width: 11,
+        drop_rank: 2,
+    },
+    ColumnSpec {
+        header: "Bash",
+        width: 7,
+        drop_rank: 4,
+    },
+    ColumnSpec {
+        header: "Edit",
+        width: 7,
+        drop_rank: 3,
+    },
+    ColumnSpec {
+        header: "Read",
+        width: 7,
+        drop_rank: 5,
+    },
+    ColumnSpec {
+        header: "TodoWrite",
+        width: 10,
+        drop_rank: 7,
+    },
+    ColumnSpec {
+        header: "Write",
+        width: 7,
+        drop_rank: 6,
+    },
+];
+
+/// Fitted column layout for an analysis model table of a given inner width.
+pub(crate) struct AnalysisTableColumns {
+    pub(crate) kept: Vec<usize>,
+    pub(crate) dropped: usize,
+    pub(crate) model_w: u16,
+    pub(crate) header: Vec<&'static str>,
+    pub(crate) widths: Vec<Constraint>,
+}
+
+impl AnalysisTableColumns {
+    /// Header index corresponding to `sort`, when that column was not dropped.
+    pub(crate) fn sorted_header_index(&self, sort: AnalysisSort) -> Option<usize> {
+        match sort.index().checked_sub(1) {
+            None => Some(0),
+            Some(numeric) => self
+                .kept
+                .iter()
+                .position(|&i| i == numeric)
+                .map(|at| at + 1),
+        }
+    }
+
+    /// Maps a clicked visible header column index back to an [`AnalysisSort`].
+    pub(crate) fn sort_for_header(&self, header_index: usize) -> Option<AnalysisSort> {
+        if header_index == 0 {
+            return Some(AnalysisSort::Model);
+        }
+        let &numeric = self.kept.get(header_index - 1)?;
+        AnalysisSort::ALL.get(numeric + 1).copied()
+    }
+}
+
+/// Computes which analysis columns fit inside `inner` content cells.
+pub(crate) fn layout_analysis_columns(inner: u16) -> AnalysisTableColumns {
+    let (kept, dropped) = fit_columns(&ANALYSIS_NUMERIC_COLS, inner, MODEL_COL_MIN_W);
+    let numeric_span: u16 = kept
+        .iter()
+        .map(|&i| ANALYSIS_NUMERIC_COLS[i].width + 1)
+        .sum();
+    let model_w = inner.saturating_sub(numeric_span).max(MODEL_COL_MIN_W);
+
+    let mut header: Vec<&'static str> = Vec::with_capacity(kept.len() + 1);
+    header.push("Model");
+    header.extend(kept.iter().map(|&i| ANALYSIS_NUMERIC_COLS[i].header));
+
+    let mut widths: Vec<Constraint> = Vec::with_capacity(header.len());
+    widths.push(Constraint::Length(model_w));
+    widths.extend(
+        kept.iter()
+            .map(|&i| Constraint::Length(ANALYSIS_NUMERIC_COLS[i].width)),
+    );
+
+    AnalysisTableColumns {
+        kept,
+        dropped,
+        model_w,
+        header,
+        widths,
+    }
+}
+
+/// Builds one formatted model row for the analysis table, optionally prepending
+/// `prefix` (such as `"▸ "` / `"▾ "` in tree layouts) to the model name.
+pub(crate) fn build_analysis_table_row(
+    row: &AnalysisRow,
+    cols: &AnalysisTableColumns,
+    prefix: &str,
+    update_tracker: &UpdateTracker,
+) -> RatatuiRow<'static> {
+    let theme = theme();
+    let style = if update_tracker.is_recently_updated(&row.model) {
+        Style::default().bg(theme.flash_bg).bold()
+    } else {
+        Style::default()
+    };
+    let all = [
+        format_compact(row.edit_lines as i64),
+        format_compact(row.read_lines as i64),
+        format_compact(row.write_lines as i64),
+        format_compact(row.bash_count as i64),
+        format_compact(row.edit_count as i64),
+        format_compact(row.read_count as i64),
+        format_compact(row.todo_write_count as i64),
+        format_compact(row.write_count as i64),
+    ];
+    let mut cells = Vec::with_capacity(cols.header.len());
+    cells.push(format!("{prefix}{}", row.model));
+    cells.extend(cols.kept.iter().map(|&i| all[i].clone()));
+    styled_row(cells, style, 1)
+}
+
+/// Renders the per-provider totals band under an analysis table (or a 1-row
+/// notice when `full_band` is `None`).
+pub(crate) fn render_analysis_provider_band(
+    f: &mut Frame,
+    panel_area: Rect,
+    provider_rows: &[ProviderTotal<'_, AnalysisProviderStats>],
+    full_band: Option<u16>,
+    frame_height: u16,
+    border_type: BorderType,
+) {
+    let theme = theme();
+    if full_band.is_none() {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(
+                    "{} provider totals hidden — needs {} more rows",
+                    provider_rows.len().saturating_sub(1),
+                    analysis_panels_height(u16::MAX, provider_rows.len())
+                        .unwrap_or(0)
+                        .saturating_add(ANALYSIS_BELOW_BAND_MIN_H)
+                        .saturating_sub(frame_height)
+                ),
+                theme.dim(),
+            )))
+            .centered(),
+            panel_area,
+        );
+        return;
+    }
+
+    const BAND_NUMERIC: [ColumnSpec; 9] = [
+        ColumnSpec {
+            header: "Edit Lines",
+            width: 11,
+            drop_rank: 0,
+        },
+        ColumnSpec {
+            header: "Read Lines",
+            width: 11,
+            drop_rank: 1,
+        },
+        ColumnSpec {
+            header: "Write Lines",
+            width: 12,
+            drop_rank: 2,
+        },
+        ColumnSpec {
+            header: "Bash",
+            width: 8,
+            drop_rank: 5,
+        },
+        ColumnSpec {
+            header: "Edit",
+            width: 8,
+            drop_rank: 4,
+        },
+        ColumnSpec {
+            header: "Read",
+            width: 8,
+            drop_rank: 6,
+        },
+        ColumnSpec {
+            header: "TodoWrite",
+            width: 11,
+            drop_rank: 8,
+        },
+        ColumnSpec {
+            header: "Write",
+            width: 8,
+            drop_rank: 7,
+        },
+        ColumnSpec {
+            header: "Days",
+            width: 8,
+            drop_rank: 3,
+        },
+    ];
+    let band_inner = panel_area.width.saturating_sub(2);
+    let (band_kept, band_dropped) = fit_columns(&BAND_NUMERIC, band_inner, PROVIDER_COL_MIN_W);
+    let band_span: u16 = band_kept.iter().map(|&i| BAND_NUMERIC[i].width + 1).sum();
+    let provider_w = band_inner.saturating_sub(band_span).max(PROVIDER_COL_MIN_W);
+
+    let mut totals_header: Vec<&str> = Vec::with_capacity(band_kept.len() + 1);
+    totals_header.push("Provider");
+    totals_header.extend(band_kept.iter().map(|&i| BAND_NUMERIC[i].header));
+
+    let mut totals_widths: Vec<Constraint> = Vec::with_capacity(totals_header.len());
+    totals_widths.push(Constraint::Length(provider_w));
+    totals_widths.extend(
+        band_kept
+            .iter()
+            .map(|&i| Constraint::Length(BAND_NUMERIC[i].width)),
+    );
+
+    let mut totals_rows: Vec<RatatuiRow> = provider_rows
+        .iter()
+        .filter(|row| row.label != "All Providers")
+        .map(|row| {
+            let all = [
+                format_compact(row.stats.total_edit_lines as i64),
+                format_compact(row.stats.total_read_lines as i64),
+                format_compact(row.stats.total_write_lines as i64),
+                format_compact(row.stats.total_bash_count as i64),
+                format_compact(row.stats.total_edit_count as i64),
+                format_compact(row.stats.total_read_count as i64),
+                format_compact(row.stats.total_todo_write_count as i64),
+                format_compact(row.stats.total_write_count as i64),
+                format_compact(row.stats.days_count as i64),
+            ];
+            let mut cells = Vec::with_capacity(totals_header.len());
+            cells.push(row.label.to_string());
+            cells.extend(band_kept.iter().map(|&i| all[i].clone()));
+            create_provider_row(cells, row.tui_color, row.emphasize)
+        })
+        .collect();
+
+    if totals_rows.is_empty() {
+        let mut cells = vec!["No provider data yet".to_string()];
+        cells.extend(std::iter::repeat_n("-".to_string(), band_kept.len()));
+        totals_rows.push(RatatuiRow::new(cells).style(theme.dim()));
+    }
+
+    let mut band_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(border_type)
+        .title(title_line("Providers"))
+        .border_style(theme.border());
+    if band_dropped > 0 {
+        band_block = band_block.title(
+            Line::from(Span::styled(format!(" −{band_dropped} cols "), theme.dim()))
+                .right_aligned(),
+        );
+    }
+    let totals_table =
+        create_ratatui_table(totals_rows, totals_header, &totals_widths, None).block(band_block);
+    f.render_widget(totals_table, panel_area);
+}
+
 /// Draws the analysis tab into `area`: the model table, the provider table
 /// and the controls line.
 #[allow(clippy::too_many_arguments)]
@@ -310,294 +646,90 @@ fn draw_analysis_view(
     status: Option<(&str, Color)>,
     detail_open: bool,
 ) {
-    let theme = theme();
     let provider_rows = build_analysis_provider_rows(provider_totals);
-    {
-        if area.width < ANALYSIS_MIN_W || area.height < ANALYSIS_MIN_H {
-            render_too_small(f, ANALYSIS_MIN_W, ANALYSIS_MIN_H);
-            return;
-        }
+    if area.width < ANALYSIS_MIN_W || area.height < ANALYSIS_MIN_H {
+        render_too_small(f, ANALYSIS_MIN_W, ANALYSIS_MIN_H);
+        return;
+    }
 
-        let full_band = analysis_panels_height(area.height, provider_rows.len());
-        // A dropped band still costs one row, for the notice that says so.
-        let band_height = full_band.unwrap_or(1);
-        let chunks = frame_layout(area, band_height);
+    let full_band = analysis_panels_height(area.height, provider_rows.len());
+    // A dropped band still costs one row, for the notice that says so.
+    let band_height = full_band.unwrap_or(1);
+    let chunks = frame_layout(area, band_height);
 
-        // Numeric columns in display order; `drop_rank` decides which go when
-        // the pane is narrow. Line counts are the headline metric, so the
-        // per-tool call counts go first.
-        const NUMERIC: [ColumnSpec; 8] = [
-            ColumnSpec {
-                header: "Edit Lines",
-                width: 11,
-                drop_rank: 0,
-            },
-            ColumnSpec {
-                header: "Read Lines",
-                width: 11,
-                drop_rank: 1,
-            },
-            ColumnSpec {
-                header: "Write Lines",
-                width: 11,
-                drop_rank: 2,
-            },
-            ColumnSpec {
-                header: "Bash",
-                width: 7,
-                drop_rank: 4,
-            },
-            ColumnSpec {
-                header: "Edit",
-                width: 7,
-                drop_rank: 3,
-            },
-            ColumnSpec {
-                header: "Read",
-                width: 7,
-                drop_rank: 5,
-            },
-            ColumnSpec {
-                header: "TodoWrite",
-                width: 10,
-                drop_rank: 7,
-            },
-            ColumnSpec {
-                header: "Write",
-                width: 7,
-                drop_rank: 6,
-            },
-        ];
+    let inner = chunks.content.width.saturating_sub(2);
+    let cols = layout_analysis_columns(inner);
 
-        let inner = chunks.content.width.saturating_sub(2);
-        let (kept, dropped) = fit_columns(&NUMERIC, inner, MODEL_COL_MIN_W);
-        let numeric_span: u16 = kept.iter().map(|&i| NUMERIC[i].width + 1).sum();
-        let model_w = inner.saturating_sub(numeric_span).max(MODEL_COL_MIN_W);
+    let rows: Vec<RatatuiRow> = rows_data
+        .iter()
+        .map(|row| build_analysis_table_row(row, &cols, "", update_tracker))
+        .collect();
 
-        let mut header: Vec<&str> = Vec::with_capacity(kept.len() + 1);
-        header.push("Model");
-        header.extend(kept.iter().map(|&i| NUMERIC[i].header));
+    let row_count = rows.len();
+    let title = format!(
+        "Models · {} lines · {} tool calls · {} models",
+        format_compact(totals.total_lines() as i64),
+        format_compact(totals.total_calls() as i64),
+        rows_data.len()
+    );
+    let sorted = cols.sorted_header_index(sort);
+    let dropped = cols.dropped;
+    render_scrollable_table(
+        f,
+        chunks.content,
+        TableChrome {
+            title: &title,
+            note: Some(if dropped > 0 {
+                format!("{} · −{dropped} cols", sort.label())
+            } else {
+                sort.label().to_string()
+            }),
+            sorted,
+        },
+        cols.header,
+        rows,
+        &cols.widths,
+        row_count,
+        scroll,
+    );
 
-        let mut widths: Vec<Constraint> = Vec::with_capacity(header.len());
-        widths.push(Constraint::Length(model_w));
-        widths.extend(kept.iter().map(|&i| Constraint::Length(NUMERIC[i].width)));
-
-        // One selectable row per model; the grand total lives only in the
-        // table title. Compact K/M/B numbers keep long counts in-column.
-        let rows: Vec<RatatuiRow> = rows_data
-            .iter()
-            .map(|row| {
-                let style = if update_tracker.is_recently_updated(&row.model) {
-                    Style::default().bg(theme.flash_bg).bold()
-                } else {
-                    Style::default()
-                };
-                let all = [
-                    format_compact(row.edit_lines as i64),
-                    format_compact(row.read_lines as i64),
-                    format_compact(row.write_lines as i64),
-                    format_compact(row.bash_count as i64),
-                    format_compact(row.edit_count as i64),
-                    format_compact(row.read_count as i64),
-                    format_compact(row.todo_write_count as i64),
-                    format_compact(row.write_count as i64),
-                ];
-                let mut cells = Vec::with_capacity(header.len());
-                cells.push(row.model.clone());
-                cells.extend(kept.iter().map(|&i| all[i].clone()));
-                styled_row(cells, style, 1)
-            })
-            .collect();
-
-        let row_count = rows.len();
-        let title = format!(
-            "Models · {} lines · {} tool calls · {} models",
-            format_compact(totals.total_lines() as i64),
-            format_compact(totals.total_calls() as i64),
-            rows_data.len()
-        );
-        render_scrollable_table(
+    if let Some(panel_area) = chunks.band {
+        render_analysis_provider_band(
             f,
-            chunks.content,
-            TableChrome {
-                title: &title,
-                note: Some(if dropped > 0 {
-                    format!("{} · −{dropped} cols", sort.label())
-                } else {
-                    sort.label().to_string()
-                }),
-                // The model column, or the sorted numeric column where it
-                // was not dropped.
-                sorted: match sort.index().checked_sub(1) {
-                    None => Some(0),
-                    Some(numeric) => kept.iter().position(|&i| i == numeric).map(|at| at + 1),
-                },
-            },
-            header,
-            rows,
-            &widths,
-            row_count,
-            scroll,
+            panel_area,
+            &provider_rows,
+            full_band,
+            area.height,
+            BorderType::Plain,
         );
+    }
 
-        if let (Some(panel_area), None) = (chunks.band, full_band) {
-            // Too short for the provider table: say so rather than leaving the
-            // reader to wonder where it went.
-            f.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    format!(
-                        "{} provider totals hidden — needs {} more rows",
-                        provider_rows.len().saturating_sub(1),
-                        analysis_panels_height(u16::MAX, provider_rows.len())
-                            .unwrap_or(0)
-                            .saturating_add(ANALYSIS_BELOW_BAND_MIN_H)
-                            .saturating_sub(area.height)
-                    ),
-                    theme.dim(),
-                )))
-                .centered(),
-                panel_area,
-            );
-        } else if let Some(panel_area) = chunks.band {
-            // The provider band carries one more column than the model table
-            // (Days) and is drawn at the full frame width, so it gets the same
-            // priority treatment rather than over-committing and clipping its
-            // own headers.
-            const BAND_NUMERIC: [ColumnSpec; 9] = [
-                ColumnSpec {
-                    header: "Edit Lines",
-                    width: 11,
-                    drop_rank: 0,
-                },
-                ColumnSpec {
-                    header: "Read Lines",
-                    width: 11,
-                    drop_rank: 1,
-                },
-                ColumnSpec {
-                    header: "Write Lines",
-                    width: 12,
-                    drop_rank: 2,
-                },
-                ColumnSpec {
-                    header: "Bash",
-                    width: 8,
-                    drop_rank: 5,
-                },
-                ColumnSpec {
-                    header: "Edit",
-                    width: 8,
-                    drop_rank: 4,
-                },
-                ColumnSpec {
-                    header: "Read",
-                    width: 8,
-                    drop_rank: 6,
-                },
-                ColumnSpec {
-                    header: "TodoWrite",
-                    width: 11,
-                    drop_rank: 8,
-                },
-                ColumnSpec {
-                    header: "Write",
-                    width: 8,
-                    drop_rank: 7,
-                },
-                ColumnSpec {
-                    header: "Days",
-                    width: 8,
-                    drop_rank: 3,
-                },
-            ];
-            let band_inner = panel_area.width.saturating_sub(2);
-            let (band_kept, band_dropped) =
-                fit_columns(&BAND_NUMERIC, band_inner, PROVIDER_COL_MIN_W);
-            let band_span: u16 = band_kept.iter().map(|&i| BAND_NUMERIC[i].width + 1).sum();
-            let provider_w = band_inner.saturating_sub(band_span).max(PROVIDER_COL_MIN_W);
+    f.render_widget(
+        create_controls_with_status(
+            &[
+                ("↑↓", "move"),
+                ("←→", "sort"),
+                ("[ ]", "range"),
+                ("⏎", "details"),
+                ("r", "refresh"),
+            ],
+            status,
+            chunks.controls.width,
+        ),
+        chunks.controls,
+    );
 
-            let mut totals_header: Vec<&str> = Vec::with_capacity(band_kept.len() + 1);
-            totals_header.push("Provider");
-            totals_header.extend(band_kept.iter().map(|&i| BAND_NUMERIC[i].header));
-
-            let mut totals_widths: Vec<Constraint> = Vec::with_capacity(totals_header.len());
-            totals_widths.push(Constraint::Length(provider_w));
-            totals_widths.extend(
-                band_kept
-                    .iter()
-                    .map(|&i| Constraint::Length(BAND_NUMERIC[i].width)),
-            );
-
-            // Drop the "All Providers" aggregate; the table title already
-            // carries the grand totals.
-            let mut totals_rows: Vec<RatatuiRow> = provider_rows
-                .iter()
-                .filter(|row| row.label != "All Providers")
-                .map(|row| {
-                    let all = [
-                        format_compact(row.stats.total_edit_lines as i64),
-                        format_compact(row.stats.total_read_lines as i64),
-                        format_compact(row.stats.total_write_lines as i64),
-                        format_compact(row.stats.total_bash_count as i64),
-                        format_compact(row.stats.total_edit_count as i64),
-                        format_compact(row.stats.total_read_count as i64),
-                        format_compact(row.stats.total_todo_write_count as i64),
-                        format_compact(row.stats.total_write_count as i64),
-                        format_compact(row.stats.days_count as i64),
-                    ];
-                    let mut cells = Vec::with_capacity(totals_header.len());
-                    cells.push(row.label.to_string());
-                    cells.extend(band_kept.iter().map(|&i| all[i].clone()));
-                    create_provider_row(cells, row.tui_color, row.emphasize)
-                })
-                .collect();
-
-            if totals_rows.is_empty() {
-                let mut cells = vec!["No provider data yet".to_string()];
-                cells.extend(std::iter::repeat_n("-".to_string(), band_kept.len()));
-                totals_rows.push(RatatuiRow::new(cells).style(theme.dim()));
-            }
-
-            let mut band_block = Block::default()
-                .borders(Borders::ALL)
-                .title(title_line("Providers"))
-                .border_style(theme.border());
-            if band_dropped > 0 {
-                band_block = band_block.title(
-                    Line::from(Span::styled(format!(" −{band_dropped} cols "), theme.dim()))
-                        .right_aligned(),
-                );
-            }
-            let totals_table =
-                create_ratatui_table(totals_rows, totals_header, &totals_widths, None)
-                    .block(band_block);
-            f.render_widget(totals_table, panel_area);
-        }
-
-        f.render_widget(
-            create_controls_with_status(
-                &[
-                    ("↑↓", "move"),
-                    ("←→", "sort"),
-                    ("[ ]", "range"),
-                    ("⏎", "details"),
-                    ("r", "refresh"),
-                ],
-                status,
-                chunks.controls.width,
-            ),
-            chunks.controls,
-        );
-
-        if detail_open && let Some(row) = scroll.table.selected().and_then(|at| rows_data.get(at)) {
-            let sections = build_analysis_detail_sections(row, totals);
-            render_detail_panel(f, area, &row.model, &sections);
-        }
+    if detail_open && let Some(row) = scroll.table.selected().and_then(|at| rows_data.get(at)) {
+        let sections = build_analysis_detail_sections(row, totals);
+        render_detail_panel(f, area, &row.model, &sections);
     }
 }
 
 /// Builds the structured sections for one analysis row's `Details` panel.
-fn build_analysis_detail_sections(row: &AnalysisRow, totals: &AnalysisRow) -> Vec<DetailSection> {
+pub(crate) fn build_analysis_detail_sections(
+    row: &AnalysisRow,
+    totals: &AnalysisRow,
+) -> Vec<DetailSection> {
     let with_share = |part: usize, whole: usize| {
         if whole > 0 {
             format!(

@@ -23,7 +23,9 @@ use ratatui::{
     layout::{Constraint, Direction, Layout as RatatuiLayout, Rect},
     style::{Color as RatatuiColor, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell as RatatuiCell, Clear, Paragraph, Row as RatatuiRow},
+    widgets::{
+        Block, BorderType, Borders, Cell as RatatuiCell, Clear, Paragraph, Row as RatatuiRow,
+    },
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -406,7 +408,7 @@ impl UsageSort {
         Self::Cost,
     ];
 
-    fn index(self) -> usize {
+    pub(crate) fn index(self) -> usize {
         Self::ALL.iter().position(|sort| *sort == self).unwrap_or(0)
     }
 
@@ -417,7 +419,7 @@ impl UsageSort {
     }
 
     /// What the table title shows: numbers run largest first, names A to Z.
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Cost => "sort: cost ▼",
             Self::Total => "sort: total ▼",
@@ -580,6 +582,17 @@ impl UsageUiState {
         }
     }
 
+    /// Sets the sort directly (e.g. when clicking a column header).
+    pub(crate) fn set_sort(&mut self, sort: UsageSort) {
+        if sort != self.sort {
+            let previous = self.selected_model();
+            self.sort = sort;
+            self.sort.apply(&mut self.rows);
+            self.sort.apply(&mut self.merged_rows);
+            self.resync(previous, false);
+        }
+    }
+
     /// Moves the sort one column left or right (`←` / `→`).
     pub(crate) fn step_sort(&mut self, step: isize) {
         let previous = self.selected_model();
@@ -593,6 +606,59 @@ impl UsageUiState {
     pub(crate) fn navigate(&mut self, delta: NavDelta) {
         let rows = self.view().len();
         self.scroll.apply(delta, rows);
+    }
+
+    /// Currently visible rows (respecting `merge_enabled`).
+    pub(crate) fn rows(&self) -> &[UsageRow] {
+        self.view()
+    }
+
+    /// Grand totals across all models.
+    pub(crate) fn totals(&self) -> &UsageTotals {
+        &self.totals
+    }
+
+    /// Per-provider totals.
+    pub(crate) fn provider_totals(&self) -> &UsageProviderTotals {
+        &self.provider_totals
+    }
+
+    /// Recent-update highlight tracker.
+    pub(crate) fn update_tracker(&self) -> &UpdateTracker {
+        &self.update_tracker
+    }
+
+    /// Table scroll and selection state.
+    pub(crate) fn scroll(&self) -> &ScrollState {
+        &self.scroll
+    }
+
+    /// Mutable table scroll and selection state.
+    pub(crate) fn scroll_mut(&mut self) -> &mut ScrollState {
+        &mut self.scroll
+    }
+
+    /// Current sort column.
+    pub(crate) fn sort(&self) -> UsageSort {
+        self.sort
+    }
+
+    /// Selected model index, if any.
+    pub(crate) fn selected_index(&self) -> Option<usize> {
+        self.scroll.table.selected()
+    }
+
+    /// Selects model row `index` directly (clamped into range).
+    pub(crate) fn select_index(&mut self, index: usize) {
+        let len = self.view().len();
+        if len > 0 {
+            self.scroll.table.select(Some(index.min(len - 1)));
+        }
+    }
+
+    /// Currently selected row, if any.
+    pub(crate) fn selected_row(&self) -> Option<&UsageRow> {
+        self.selected_index().and_then(|at| self.view().get(at))
     }
 
     /// Draws the tab into `area`.
@@ -747,6 +813,159 @@ fn row_fingerprint(row: &UsageRow) -> (i64, i64, i64, i64) {
     )
 }
 
+const USAGE_NUMERIC_COLS: [ColumnSpec; 6] = [
+    ColumnSpec {
+        header: "Input",
+        width: 9,
+        drop_rank: 3,
+    },
+    ColumnSpec {
+        header: "Output",
+        width: 9,
+        drop_rank: 2,
+    },
+    ColumnSpec {
+        header: "Cache Read",
+        width: 11,
+        drop_rank: 4,
+    },
+    ColumnSpec {
+        header: "Cache Write",
+        width: 11,
+        drop_rank: 5,
+    },
+    ColumnSpec {
+        header: "Total",
+        width: 9,
+        drop_rank: 1,
+    },
+    ColumnSpec {
+        header: "Cost (USD)",
+        width: 12,
+        drop_rank: 0,
+    },
+];
+
+/// Fitted column layout for a usage model table of a given inner width.
+pub(crate) struct UsageTableColumns {
+    pub(crate) kept: Vec<usize>,
+    pub(crate) dropped: usize,
+    pub(crate) model_w: u16,
+    pub(crate) share_w: u16,
+    pub(crate) header: Vec<&'static str>,
+    pub(crate) widths: Vec<Constraint>,
+}
+
+impl UsageTableColumns {
+    /// Header index corresponding to `sort`, when that column was not dropped.
+    pub(crate) fn sorted_header_index(&self, sort: UsageSort) -> Option<usize> {
+        match sort.index().checked_sub(1) {
+            None => Some(0),
+            Some(numeric) => self
+                .kept
+                .iter()
+                .position(|&i| i == numeric)
+                .map(|at| at + 1),
+        }
+    }
+
+    /// Maps a clicked visible header column index back to a [`UsageSort`].
+    pub(crate) fn sort_for_header(&self, header_index: usize) -> Option<UsageSort> {
+        if header_index == 0 {
+            return Some(UsageSort::Model);
+        }
+        if let Some(&numeric) = self.kept.get(header_index - 1) {
+            return UsageSort::ALL.get(numeric + 1).copied();
+        }
+        if self.share_w > 0 && header_index == self.kept.len() + 1 {
+            return Some(UsageSort::Total);
+        }
+        None
+    }
+}
+
+/// Computes which usage columns fit inside `inner` content cells.
+pub(crate) fn layout_usage_columns(inner: u16) -> UsageTableColumns {
+    let (kept, dropped) = fit_columns(&USAGE_NUMERIC_COLS, inner, MODEL_COL_MIN_W);
+    let numeric_span: u16 = kept.iter().map(|&i| USAGE_NUMERIC_COLS[i].width + 1).sum();
+    // Slack past the model column's cap becomes the share bar.
+    let avail = inner.saturating_sub(numeric_span);
+    let slack = avail.saturating_sub(MODEL_COL_COMFORTABLE_W);
+    let share_w = if dropped == 0 && slack > SHARE_COL_MIN_W {
+        (slack - 1).min(SHARE_COL_MAX_W)
+    } else {
+        0
+    };
+    let model_w = avail
+        .saturating_sub(if share_w > 0 { share_w + 1 } else { 0 })
+        .max(MODEL_COL_MIN_W);
+
+    let mut header: Vec<&'static str> = Vec::with_capacity(kept.len() + 2);
+    header.push("Model");
+    header.extend(kept.iter().map(|&i| USAGE_NUMERIC_COLS[i].header));
+    if share_w > 0 {
+        header.push("Share");
+    }
+
+    let mut widths: Vec<Constraint> = Vec::with_capacity(header.len());
+    widths.push(Constraint::Length(model_w));
+    widths.extend(
+        kept.iter()
+            .map(|&i| Constraint::Length(USAGE_NUMERIC_COLS[i].width)),
+    );
+    if share_w > 0 {
+        widths.push(Constraint::Length(share_w));
+    }
+
+    UsageTableColumns {
+        kept,
+        dropped,
+        model_w,
+        share_w,
+        header,
+        widths,
+    }
+}
+
+/// Builds one formatted model row for the usage table, optionally prepending
+/// `prefix` (such as `"▸ "` / `"▾ "` in tree layouts) to the model name.
+pub(crate) fn build_usage_table_row(
+    row: &UsageRow,
+    total_tokens: i64,
+    cols: &UsageTableColumns,
+    prefix: &str,
+    update_tracker: &UpdateTracker,
+) -> RatatuiRow<'static> {
+    let theme = theme();
+    let style = if update_tracker.is_recently_updated(&row.model) {
+        Style::default().bg(theme.flash_bg).bold()
+    } else {
+        Style::default()
+    };
+    let all = [
+        format_compact(row.input_tokens),
+        format_compact(row.output_with_reasoning()),
+        format_compact(row.cache_read),
+        format_compact(row.cache_creation),
+        format_compact(row.total),
+        format_cost(row.cost),
+    ];
+    let mut cells = Vec::with_capacity(cols.header.len());
+    cells.push(format!("{prefix}{}", row.model));
+    cells.extend(cols.kept.iter().map(|&i| all[i].clone()));
+    let mut cells = aligned_cells(cells, 1);
+    if cols.share_w > 0 {
+        let share = share_cell(row.total, total_tokens, cols.share_w);
+        let bar: String = share.chars().take_while(|c| *c == '━').collect();
+        let rest = share[bar.len()..].to_string();
+        cells.push(RatatuiCell::from(Line::from(vec![
+            Span::styled(bar, theme.accent()),
+            Span::styled(rest, theme.dim()),
+        ])));
+    }
+    RatatuiRow::new(cells).style(style)
+}
+
 /// Draws the usage tab into `area`: the model table, the Provider Usage line,
 /// and the controls line.
 #[allow(clippy::too_many_arguments)]
@@ -763,7 +982,6 @@ fn draw_usage_view(
     provider_panel_open: bool,
     detail_open: bool,
 ) {
-    let theme = theme();
     let provider_rows = build_provider_total_rows(provider_totals);
     if area.width < USAGE_MIN_W || area.height < USAGE_MIN_H {
         render_too_small(f, USAGE_MIN_W, USAGE_MIN_H);
@@ -771,105 +989,14 @@ fn draw_usage_view(
     }
 
     let chunks = frame_layout(area, PROVIDER_LINE_H);
-
-    // Numeric columns in display order, each ranked by how readily it may be
-    // dropped when the pane is narrow. Cost and Total are the reason the
-    // view exists, so they stay; the cache split goes first.
-    const NUMERIC: [ColumnSpec; 6] = [
-        ColumnSpec {
-            header: "Input",
-            width: 9,
-            drop_rank: 3,
-        },
-        ColumnSpec {
-            header: "Output",
-            width: 9,
-            drop_rank: 2,
-        },
-        ColumnSpec {
-            header: "Cache Read",
-            width: 11,
-            drop_rank: 4,
-        },
-        ColumnSpec {
-            header: "Cache Write",
-            width: 11,
-            drop_rank: 5,
-        },
-        ColumnSpec {
-            header: "Total",
-            width: 9,
-            drop_rank: 1,
-        },
-        ColumnSpec {
-            header: "Cost (USD)",
-            width: 12,
-            drop_rank: 0,
-        },
-    ];
-
     let inner = chunks.content.width.saturating_sub(2);
-    let (kept, dropped) = fit_columns(&NUMERIC, inner, MODEL_COL_MIN_W);
-    let numeric_span: u16 = kept.iter().map(|&i| NUMERIC[i].width + 1).sum();
-    // Slack past the model column's cap becomes the share bar.
-    let avail = inner.saturating_sub(numeric_span);
-    let slack = avail.saturating_sub(MODEL_COL_COMFORTABLE_W);
-    let share_w = if dropped == 0 && slack > SHARE_COL_MIN_W {
-        (slack - 1).min(SHARE_COL_MAX_W)
-    } else {
-        0
-    };
-    let model_w = avail
-        .saturating_sub(if share_w > 0 { share_w + 1 } else { 0 })
-        .max(MODEL_COL_MIN_W);
-
-    let mut header: Vec<&str> = Vec::with_capacity(kept.len() + 2);
-    header.push("Model");
-    header.extend(kept.iter().map(|&i| NUMERIC[i].header));
-    if share_w > 0 {
-        header.push("Share");
-    }
-
-    let mut widths: Vec<Constraint> = Vec::with_capacity(header.len());
-    widths.push(Constraint::Length(model_w));
-    widths.extend(kept.iter().map(|&i| Constraint::Length(NUMERIC[i].width)));
-    if share_w > 0 {
-        widths.push(Constraint::Length(share_w));
-    }
+    let cols = layout_usage_columns(inner);
 
     // No total row: the grand total is carried by the table title, never by
     // a selectable row.
     let rows: Vec<RatatuiRow> = rows_data
         .iter()
-        .map(|row| {
-            let style = if update_tracker.is_recently_updated(&row.model) {
-                Style::default().bg(theme.flash_bg).bold()
-            } else {
-                Style::default()
-            };
-            let all = [
-                format_compact(row.input_tokens),
-                format_compact(row.output_with_reasoning()),
-                format_compact(row.cache_read),
-                format_compact(row.cache_creation),
-                format_compact(row.total),
-                format_cost(row.cost),
-            ];
-            let mut cells = Vec::with_capacity(header.len());
-            cells.push(row.model.clone());
-            cells.extend(kept.iter().map(|&i| all[i].clone()));
-            let mut cells = aligned_cells(cells, 1);
-            if share_w > 0 {
-                let share = share_cell(row.total, totals.total, share_w);
-                let bar: String = share.chars().take_while(|c| *c == '━').collect();
-                let rest = share[bar.len()..].to_string();
-                cells.push(RatatuiCell::from(Line::from(vec![
-                    Span::styled(bar, theme.accent()),
-                    Span::styled(rest, theme.dim()),
-                ])));
-            }
-            RatatuiRow::new(cells).style(style)
-        })
+        .map(|row| build_usage_table_row(row, totals.total, &cols, "", update_tracker))
         .collect();
 
     let row_count = rows.len();
@@ -879,6 +1006,8 @@ fn draw_usage_view(
         format_compact(totals.total),
         rows_data.len()
     );
+    let sorted = cols.sorted_header_index(sort);
+    let dropped = cols.dropped;
     render_scrollable_table(
         f,
         chunks.content,
@@ -889,16 +1018,11 @@ fn draw_usage_view(
             } else {
                 sort.label().to_string()
             }),
-            // The model column, or the sorted numeric column where it was
-            // not dropped.
-            sorted: match sort.index().checked_sub(1) {
-                None => Some(0),
-                Some(numeric) => kept.iter().position(|&i| i == numeric).map(|at| at + 1),
-            },
+            sorted,
         },
-        header,
+        cols.header,
         rows,
-        &widths,
+        &cols.widths,
         row_count,
         scroll,
     );
@@ -939,7 +1063,10 @@ fn draw_usage_view(
 }
 
 /// Builds the structured sections for one usage row's `Details` panel.
-fn build_usage_detail_sections(row: &UsageRow, totals: &UsageTotals) -> Vec<DetailSection> {
+pub(crate) fn build_usage_detail_sections(
+    row: &UsageRow,
+    totals: &UsageTotals,
+) -> Vec<DetailSection> {
     let share = |part: f64, whole: f64| {
         if whole > 0.0 {
             format!("{:.1}%", part / whole * 100.0)
@@ -1505,7 +1632,10 @@ fn digest_line(
 /// the one number that earns a permanent row here; tokens and the per-provider
 /// day counts live behind `p`. Whatever does not fit is named in a trailing
 /// `+N more → p`, so the line never implies it lists every provider.
-fn provider_digest(rows: &[ProviderTotal<'_, ProviderStats>], width: u16) -> Line<'static> {
+pub(crate) fn provider_digest(
+    rows: &[ProviderTotal<'_, ProviderStats>],
+    width: u16,
+) -> Line<'static> {
     /// Narrower than the quota digest's separator on purpose: there are ten
     /// providers to the quota band's five, so every column saved per gap is
     /// another provider named on the line before the rest fold into the
@@ -1567,7 +1697,7 @@ fn provider_digest(rows: &[ProviderTotal<'_, ProviderStats>], width: u16) -> Lin
 ///
 /// This is where the numbers the one-line digest cannot carry live: per-provider
 /// tokens beside cost, and the stacked share bar at full panel width.
-fn render_provider_panel(
+pub(crate) fn render_provider_panel(
     f: &mut Frame,
     area: Rect,
     provider_rows: &[ProviderTotal<'_, ProviderStats>],
@@ -1654,6 +1784,47 @@ fn render_provider_table(
     area: Rect,
     provider_rows: &[ProviderTotal<'_, ProviderStats>],
 ) {
+    render_provider_box(
+        f,
+        area,
+        provider_rows,
+        Line::from(Span::styled(" Providers ", theme().title())),
+        None,
+        true,
+        BorderType::Plain,
+    );
+}
+
+/// Renders the Provider Usage table + stacked share bar into a persistent side
+/// pane (non-modal, with caller-supplied title and border style).
+pub(crate) fn render_provider_pane(
+    f: &mut Frame,
+    area: Rect,
+    provider_rows: &[ProviderTotal<'_, ProviderStats>],
+    title: Line<'static>,
+    right_note: Option<Line<'static>>,
+    border_type: BorderType,
+) {
+    render_provider_box(
+        f,
+        area,
+        provider_rows,
+        title,
+        right_note,
+        false,
+        border_type,
+    );
+}
+
+fn render_provider_box(
+    f: &mut Frame,
+    area: Rect,
+    provider_rows: &[ProviderTotal<'_, ProviderStats>],
+    title: Line<'static>,
+    right_note: Option<Line<'static>>,
+    modal: bool,
+    border_type: BorderType,
+) {
     // Drop the "All Providers" aggregate; the table title carries the totals.
     let listed: Vec<_> = provider_rows
         .iter()
@@ -1671,14 +1842,30 @@ fn render_provider_table(
     let theme = theme();
     let mut block = Block::default()
         .borders(Borders::ALL)
-        .title(Line::from(Span::styled(" Providers ", theme.title())))
-        .border_style(theme.accent());
-    let flag = if hidden > 0 {
-        format!(" +{hidden} · esc close ")
-    } else {
-        " esc close ".to_string()
-    };
-    block = block.title(Line::from(Span::styled(flag, theme.dim())).right_aligned());
+        .border_type(border_type)
+        .title(title)
+        .border_style(if modal {
+            theme.accent()
+        } else {
+            theme.border()
+        });
+    if modal {
+        let flag = if hidden > 0 {
+            format!(" +{hidden} · esc close ")
+        } else {
+            " esc close ".to_string()
+        };
+        block = block.title(Line::from(Span::styled(flag, theme.dim())).right_aligned());
+    } else if let Some(mut note) = right_note {
+        if hidden > 0 {
+            note.spans
+                .insert(0, Span::styled(format!(" +{hidden} ·"), theme.dim()));
+        }
+        block = block.title(note.right_aligned());
+    } else if hidden > 0 {
+        block = block
+            .title(Line::from(Span::styled(format!(" +{hidden} "), theme.dim())).right_aligned());
+    }
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -1755,7 +1942,8 @@ fn render_provider_table(
 /// Every line is built for the width of the cell the card will be drawn in, so
 /// the Quota tab rebuilds its cards at its own roomier width. The height is
 /// not applied here: the list is ordered most-important-first, and a cell too
-/// short for it keeps the head while [`render_quota_card`] counts the rest.
+/// short for it keeps the head while [`render_quota_card_with_border`] counts
+/// the rest.
 pub(crate) struct QuotaCard {
     title: &'static str,
     color: RatatuiColor,
@@ -1768,11 +1956,21 @@ fn card_inner_w(width: u16) -> u16 {
     width.saturating_sub(2)
 }
 
+#[cfg(test)]
+pub(crate) fn render_quota_card(f: &mut Frame, area: Rect, card: &QuotaCard) {
+    render_quota_card_with_border(f, area, card, BorderType::Plain);
+}
+
 /// Renders `card` into `area`, flagging a hit cap and any lines that did not fit.
 ///
 /// The trailing flags share the top border: `+2` for hidden lines, `LIMIT` for a
 /// spent window. `+2` is the promise that the Quota tab has more to show.
-pub(crate) fn render_quota_card(f: &mut Frame, area: Rect, card: &QuotaCard) {
+pub(crate) fn render_quota_card_with_border(
+    f: &mut Frame,
+    area: Rect,
+    card: &QuotaCard,
+    border_type: BorderType,
+) {
     let capacity = usize::from(area.height.saturating_sub(2));
     let hidden = card.lines.len().saturating_sub(capacity);
 
@@ -1797,6 +1995,7 @@ pub(crate) fn render_quota_card(f: &mut Frame, area: Rect, card: &QuotaCard) {
     };
     let mut block = Block::default()
         .borders(Borders::ALL)
+        .border_type(border_type)
         .title(Line::from(vec![
             Span::styled(dot, Style::default().fg(card.color)),
             Span::styled(format!("{} ", card.title), theme.title()),

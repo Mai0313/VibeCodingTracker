@@ -22,6 +22,7 @@
       "default": {
         "auto_update": true,
         "default_time_range": "all",
+        "layout": "classic",
         "version": 4
       },
       "description": "`[general]` — settings shared across subcommands.",
@@ -56,6 +57,11 @@
               "type": "string"
             }
           ]
+        },
+        "layout": {
+          "default": "classic",
+          "description": "Interactive TUI layout (`classic`, `simple`, `legacy`, or another built-in layout; unknown names fall back to `classic`).",
+          "type": "string"
         },
         "version": {
           "default": 1,

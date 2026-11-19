@@ -14,6 +14,7 @@ clean: ## Clean build artifacts and caches
 fmt: ## Format code with rustfmt and auto-fix clippy warnings
 	cargo clippy --all-targets --all-features --fix --allow-dirty --allow-staged
 	cargo fmt --all
+	find src/tui/src/layouts -name '*.rs' -exec rustfmt --edition 2024 {} +
 	cargo clippy --all-targets --all-features -- -D warnings
 
 build: ## Build release binary

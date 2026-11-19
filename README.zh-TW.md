@@ -30,7 +30,7 @@
 
 選擇你偏好的檢視方式：
 
-- **互動式儀表板**: 一個終端 app, 內含 Usage, Analysis, Quota 與 Settings 四個分頁, 可立即顯示 loading spinner, 支援背景 incremental refresh, 可捲動並可排序的 model 清單 (方向鍵), process 層級的 CPU/記憶體即時讀數, 以及 K/M/B 精簡數字格式
+- **互動式儀表板**: 一個終端 app, 內含 Usage, Analysis, Quota 與 Settings 四個分頁, 內建三種可即時切換的版面 (`classic` 雙欄工作台, `simple` 側邊欄 + 列內樹狀展開, `legacy`), 同時支援滑鼠點擊/滾輪與全鍵盤操作, 支援背景 incremental refresh, process 層級的 CPU/記憶體即時讀數, 以及 K/M/B 精簡數字格式
 - **靜態報表**:專業的表格格式,適合撰寫文件
 - **腳本友好**:純文字及 JSON 輸出,方便自動化處理
 - **完整精度**:匯出精確費用供會計使用
@@ -128,20 +128,20 @@ vct analysis
 
 不帶任何指令執行 `vct` 會開啟互動式介面，一個畫面有四個分頁：`Usage`、`Analysis`、`Quota` 與 `Settings`。`vct usage`、`vct analysis` 與 `vct quota` 會開啟同一個介面並停在各自的分頁，`--json`、`--text` 與 `--table` 則只輸出結果，不會開啟介面。沒有終端時（輸出被 pipe 或重新導向），單獨的 `vct` 會印出說明並以狀態碼 2 結束。
 
-| 按鍵                | 動作                                                              |
-| ------------------- | ----------------------------------------------------------------- |
-| `Tab` / `Shift+Tab` | 下一個 / 上一個分頁（也可直接點擊頂部分頁列）                     |
-| `↑` / `↓`           | 移動選取的列                                                      |
-| `Enter`             | 顯示選取 model 的各 provider 拆解、佔比與完整數字                 |
-| `←` / `→`           | 改用左邊 / 右邊那一欄排序（Usage、Analysis）                      |
-| `[` / `]`           | 上一個 / 下一個時間範圍：day、week、month、all（Usage、Analysis） |
-| `r`                 | 立即刷新（Usage、Analysis）                                       |
-| `p`                 | 開啟 Provider Usage 面板（Usage）                                 |
-| `?`                 | 列出目前分頁的按鍵                                                |
-| `Esc`               | 關閉開啟的面板                                                    |
-| `q`                 | 離開                                                              |
+| 按鍵                | 動作                                                                                |
+| ------------------- | ----------------------------------------------------------------------------------- |
+| `Tab` / `Shift+Tab` | 下一個 / 上一個分頁（也可直接點擊頂部分頁列或左側導覽欄）                           |
+| `↑` / `↓`           | 移動選取的列（也可點擊某一列或使用滑鼠滾輪）                                        |
+| `Enter` / `Space`   | 檢視或展開選取 model 的明細（`classic` 窄螢幕彈窗、`simple` 列內展開、`legacy`）    |
+| `←` / `→`           | 改用左邊 / 右邊那一欄排序，也可直接點擊表頭欄名（Usage、Analysis）                  |
+| `[` / `]`           | 上一個 / 下一個時間範圍：day、week、month、all，也可直接點擊範圍（Usage、Analysis） |
+| `r`                 | 立即刷新（Usage、Analysis）                                                         |
+| `p`                 | 切換或開啟 Provider Usage 檢視（Usage）                                             |
+| `?`                 | 列出目前分頁的按鍵                                                                  |
+| `Esc`               | 關閉開啟的面板                                                                      |
+| `q`                 | 離開                                                                                |
 
-Quota 與 Settings 分頁不掃描任何 session。第一次切到 Usage 或 Analysis 時才開始該分頁的掃描，而且只有畫面上的分頁會依計時器刷新。分頁列右側顯示時間範圍，以及 vct 自己的記憶體與 CPU 用量。
+內建三種 TUI 版面（可在 `Settings > General > Layout` 或 `config.toml` 的 `general.layout` 切換）：`classic`（預設——雙欄主從工作台，寬螢幕右側常駐可捲動 `Inspector` 明細面板，窄螢幕自動回退為置中彈窗）、`simple`（可摺疊左側導覽欄搭配列內 `▸` / `▾` 樹狀展開）與 `legacy`（全寬表格搭配置中彈窗）。Quota 與 Settings 分頁不掃描任何 session。第一次切到 Usage 或 Analysis 時才開始該分頁的掃描，而且只有畫面上的分頁會依計時器刷新。導覽欄顯示時間範圍，以及 vct 自己的記憶體與 CPU 用量。
 
 時間範圍 flag（`usage` 與 `analysis` 共用，互斥，預設 `--all`；在互動式介面中則決定開啟時的範圍）：
 
@@ -583,10 +583,10 @@ vct 會把使用者設定存放在 `~/.vct/config.toml`。這個檔案會在**�
  ↑↓ move  ←→ change  space toggle  ⏎ edit  x reset  e editor  tab view  ? help  q quit                   Star on GitHub
 ```
 
-- `↑` / `↓` 在所有設定之間移動，`PgUp` / `PgDn` 跳到上一個 / 下一個區段，`←` / `→` 變更數值（開關、增減數字、切換選項），`Space` 開關，`x` 把欄位重設為預設值，`e` 用 `$VISUAL` / `$EDITOR` 開啟設定檔，編輯器結束後重新載入。
-- `Enter` 開啟編輯器：可挑選的清單、數字或文字輸入，或遠端主機清單（`a` 新增、`Enter` 編輯、`d` 刪除）。
+- `↑` / `↓`（或滑鼠滾輪 / 點擊列）在所有設定之間移動，`PgUp` / `PgDn`（或點擊左側 `Sections`）跳到上一個 / 下一個區段，`←` / `→` 變更數值（開關、增減數字、切換選項），`Space` 開關，`x` 把欄位重設為預設值，`e` 用 `$VISUAL` / `$EDITOR` 開啟設定檔，編輯器結束後重新載入。
+- `Enter`（或再次點擊已選取的列）開啟編輯器：可挑選的清單、數字或文字輸入，或遠端主機清單（`a` 新增、`Enter` 編輯、`d` 刪除）。
 - 每次變更都會立即寫入檔案，並保留檔案裡的註解。
-- 合併、刷新間隔、quota 面板、quota 輪詢間隔與 provider 開關的變更會直接反映在執行中的介面（quota 面板則在切到 Quota 分頁時生效）。預設時間範圍、自動更新、掃描執行緒數、logging 與 remotes 要到下次啟動才生效，表單會在這些欄位上標明。
+- 介面版面（`classic` / `simple` / `legacy`）、合併、刷新間隔、quota 面板、quota 輪詢間隔與 provider 開關的變更會立即反映在執行中的介面（quota 面板則在切到 Quota 分頁時生效）。預設時間範圍、自動更新、掃描執行緒數、logging 與 remotes 要到下次啟動才生效，表單會在這些欄位上標明。
 
 手動編輯檔案與下方的 `vct config` 指令仍然可用。
 

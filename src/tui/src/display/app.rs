@@ -1,9 +1,11 @@
-//! The interactive app: one terminal session with a tab per view.
+//! The interactive app: one terminal session with a tab per view and pluggable
+//! layouts.
 //!
 //! [`run_app`] owns the event loop. The Usage and Analysis tabs share one
 //! background [`RefreshWorker`] and one session ledger, started on the first
 //! visit to either, and the Quota tab starts its workers on the first visit to
-//! it. Only the tab on screen refreshes on its timer.
+//! it. Only the tab on screen refreshes on its timer, while the active
+//! `LayoutView` owns frame geometry and mouse hit-testing.
 
 use crate::display::analysis::{AnalysisUiState, scan_analysis};
 use crate::display::common::table::{
@@ -12,15 +14,17 @@ use crate::display::common::table::{
 use crate::display::common::theme::theme;
 use crate::display::common::tui::{
     InputAction, RefreshWorker, RefreshWorkerError, TerminalSession, handle_input,
-    handle_key_input, overlay_repo_hyperlink, refresh_status, render_loading,
+    handle_key_input, overlay_repo_hyperlink, refresh_status,
 };
 use crate::display::settings::{SettingsOutcome, SettingsUiState};
 use crate::display::usage::{
-    QuotaRuntime, QuotaSnapshots, UsageRefreshPayload, UsageScanner, UsageUiState, draw_quota_tab,
+    QuotaRuntime, QuotaSnapshots, UsageRefreshPayload, UsageScanner, UsageUiState,
 };
+use crate::layouts::{EventResult, LayoutCommand, LayoutContext, LayoutView, RANGES};
+use crossterm::event::KeyCode;
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout, Rect},
+    layout::Rect,
     style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
@@ -34,9 +38,10 @@ use vct_core::ledger::SessionLedger;
 use vct_core::models::TimeRange;
 
 /// A view of the app, in tab order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     /// Per-model token counts and cost.
+    #[default]
     Usage,
     /// Per-model file operations and tool calls.
     Analysis,
@@ -47,9 +52,9 @@ pub enum Tab {
 }
 
 impl Tab {
-    const ALL: [Self; 4] = [Self::Usage, Self::Analysis, Self::Quota, Self::Settings];
+    pub(crate) const ALL: [Self; 4] = [Self::Usage, Self::Analysis, Self::Quota, Self::Settings];
 
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Usage => "Usage",
             Self::Analysis => "Analysis",
@@ -69,7 +74,7 @@ impl Tab {
     }
 
     /// Whether the tab shows scanned session data.
-    fn scans(self) -> bool {
+    pub(crate) fn scans(self) -> bool {
         matches!(self, Self::Usage | Self::Analysis)
     }
 }
@@ -106,14 +111,6 @@ struct ScanOutput {
     request: ScanRequest,
     data: ScanData,
 }
-
-/// The time ranges, in the order the tab bar lists them.
-const RANGES: [(TimeRange, &str); 4] = [
-    (TimeRange::Daily, "day"),
-    (TimeRange::Weekly, "week"),
-    (TimeRange::Monthly, "month"),
-    (TimeRange::All, "all"),
-];
 
 /// The range `step` places along the tab bar's list, stopping at either end.
 fn step_range(range: TimeRange, step: isize) -> TimeRange {
@@ -163,7 +160,9 @@ fn should_rescan(current: bool, active: bool, retry_at: Option<Instant>, now: In
     !current && !active && retry_at.is_none_or(|at| now >= at)
 }
 
-/// Propagates a `Settings` change into the live app state.
+/// Propagates a `Settings` change into the live app state, swapping the active
+/// layout instance immediately when `[general].layout` resolves to another
+/// layout plugin.
 ///
 /// Only an actual change to `usage.merge_models` touches `usage`, so a session
 /// started with `--merge-providers` over `merge_models = false` keeps its CLI
@@ -173,12 +172,19 @@ fn apply_settings_update(
     next: Config,
     usage: &mut UsageUiState,
     quota: &mut Option<QuotaRuntime>,
+    active_layout_id: &mut &'static str,
+    layout_view: &mut Box<dyn LayoutView>,
 ) {
     if next.usage.quota != config.usage.quota || next.providers != config.providers {
         *quota = None;
     }
     if next.usage.merge_models != config.usage.merge_models {
         usage.set_merge(next.usage.merge_models);
+    }
+    let resolved = crate::layouts::resolve(&next.general.layout);
+    if resolved.meta().id != *active_layout_id {
+        *active_layout_id = resolved.meta().id;
+        *layout_view = resolved.create();
     }
     *config = next;
 }
@@ -243,6 +249,8 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
         let paths = vct_core::utils::resolve_paths()?;
         let mut tab = start;
         let mut config = config;
+        let (mut active_layout_id, mut layout_view) =
+            crate::layouts::create(&config.general.layout);
         let update_notice = Arc::new(OnceLock::new());
         if config.general.auto_update {
             let slot = Arc::clone(&update_notice);
@@ -289,7 +297,6 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
         let mut last_metrics = Instant::now();
         let mut last_draw: Option<Instant> = None;
         let mut spinner = 0usize;
-        let mut bar_width = terminal.terminal_mut().size().map_or(0, |s| s.width);
         // Whether the key list is open (`?`).
         let mut help_open = false;
 
@@ -378,6 +385,7 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                 last_metrics = Instant::now();
                 refresh_process_metrics(&mut sys, pid);
             }
+            let metrics = process_metrics(&sys, pid);
             if redraw || last_draw.is_none_or(|at| at.elapsed() >= tick) {
                 spinner = spinner.wrapping_add(1);
                 let active = worker.as_ref().is_some_and(RefreshWorker::is_active);
@@ -395,34 +403,29 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                     });
                     QuotaSnapshots::read(runtime)
                 });
-                let metrics = process_metrics(&sys, pid);
                 let completed = terminal.terminal_mut().draw(|f| {
-                    let [bar, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)])
-                        .areas(f.area());
-                    bar_width = bar.width;
-                    let range = tab.scans().then_some(wanted.time_range);
-                    f.render_widget(tab_bar(bar.width, tab, range, metrics), bar);
-                    match tab {
-                        Tab::Usage | Tab::Analysis if loading => {
-                            let message = if retry_at.is_some() {
-                                "Load failed, press r to retry"
-                            } else {
-                                "Loading sessions..."
-                            };
-                            render_loading(f, body, spinner, message);
-                        }
-                        Tab::Usage => usage.draw(f, body, data_status),
-                        Tab::Analysis => analysis.draw(f, body, data_status),
-                        Tab::Quota => {
-                            let runtime = quota.as_ref().expect("started for Quota tab");
-                            let snapshots = quota_snapshots.as_ref().expect("read for Quota tab");
-                            let now = chrono::Local::now().timestamp();
-                            draw_quota_tab(f, body, &snapshots.view(runtime), now, update_status);
-                        }
-                        Tab::Settings => settings.draw(f, body, update_status),
-                    }
+                    let quota_view = quota_snapshots.as_ref().map(|snapshots| {
+                        let runtime = quota.as_ref().expect("started for Quota tab");
+                        (snapshots.view(runtime), chrono::Local::now().timestamp())
+                    });
+                    let mut ctx = LayoutContext {
+                        tab,
+                        time_range: wanted.time_range,
+                        loading,
+                        retry_pending: retry_at.is_some(),
+                        spinner,
+                        metrics,
+                        data_status,
+                        update_status,
+                        usage: &mut usage,
+                        analysis: &mut analysis,
+                        quota: quota_view,
+                        settings: &mut settings,
+                    };
+                    layout_view.draw(f, &mut ctx);
                     if help_open {
-                        render_help(f, body, tab);
+                        let rows = layout_view.help_rows(tab).unwrap_or_else(|| help_rows(tab));
+                        render_help(f, f.area(), tab, &rows);
                     }
                 })?;
                 // ratatui can't embed the OSC 8 escape itself, so hyperlink the
@@ -432,16 +435,16 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
             }
 
             let mut go_to = None;
+            let mut command = LayoutCommand::default();
+
             if tab == Tab::Settings {
-                match handle_key_input()? {
+                let action = handle_key_input()?;
+                match action {
                     InputAction::Quit => break,
-                    // The key list closes on the keys that opened or dismiss
-                    // it; an editor open over the form takes every key itself.
                     InputAction::Key(key) if help_open => {
                         match key {
-                            crossterm::event::KeyCode::Char('q') => break,
-                            crossterm::event::KeyCode::Esc
-                            | crossterm::event::KeyCode::Char('?') => help_open = false,
+                            KeyCode::Char('q') => break,
+                            KeyCode::Esc | KeyCode::Char('?') => help_open = false,
                             _ => {}
                         }
                         last_draw = None;
@@ -464,16 +467,56 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                                     settings.set_message(message, ok);
                                 }
                                 let next = settings.config().clone();
-                                apply_settings_update(&mut config, next, &mut usage, &mut quota);
+                                apply_settings_update(
+                                    &mut config,
+                                    next,
+                                    &mut usage,
+                                    &mut quota,
+                                    &mut active_layout_id,
+                                    &mut layout_view,
+                                );
                             }
                             SettingsOutcome::Stay => {}
                         }
                         last_draw = None;
                     }
-                    InputAction::Click { column, row }
-                        if !help_open && !settings.has_open_editor() =>
-                    {
-                        go_to = tab_at(column, row, bar_width);
+                    _ if help_open => {
+                        if matches!(action, InputAction::Click { .. }) {
+                            help_open = false;
+                            last_draw = None;
+                        }
+                    }
+                    _ if action.mouse().is_some() => {
+                        let mouse = action.mouse().expect("checked");
+                        let mut ctx = LayoutContext {
+                            tab,
+                            time_range: wanted.time_range,
+                            loading,
+                            retry_pending: retry_at.is_some(),
+                            spinner,
+                            metrics,
+                            data_status: None,
+                            update_status: None,
+                            usage: &mut usage,
+                            analysis: &mut analysis,
+                            quota: None,
+                            settings: &mut settings,
+                        };
+                        if let EventResult::Consumed(cmd) = layout_view.on_mouse(mouse, &mut ctx) {
+                            command = cmd;
+                        }
+                        if command.settings_changed {
+                            let next = settings.config().clone();
+                            apply_settings_update(
+                                &mut config,
+                                next,
+                                &mut usage,
+                                &mut quota,
+                                &mut active_layout_id,
+                                &mut layout_view,
+                            );
+                        }
+                        last_draw = None;
                     }
                     InputAction::Resize => last_draw = None,
                     _ => {}
@@ -485,40 +528,90 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                 }
                 match action {
                     InputAction::Quit => break,
-                    // Esc and `?` close the key list; while it is open the
-                    // other keys wait.
-                    InputAction::Close | InputAction::Help if help_open => help_open = false,
+                    InputAction::Close | InputAction::Help | InputAction::Click { .. }
+                        if help_open =>
+                    {
+                        help_open = false;
+                    }
                     _ if help_open => {}
                     InputAction::Help => help_open = true,
-                    // Esc closes what is open, the innermost first, and never
-                    // leaves the app.
-                    InputAction::Close => {
-                        if usage.detail_open || analysis.detail_open {
-                            usage.detail_open = false;
-                            analysis.detail_open = false;
-                        } else {
-                            usage.provider_panel_open = false;
+                    _ if action.mouse().is_some() => {
+                        let mouse = action.mouse().expect("checked");
+                        let mut ctx = LayoutContext {
+                            tab,
+                            time_range: wanted.time_range,
+                            loading,
+                            retry_pending: retry_at.is_some(),
+                            spinner,
+                            metrics,
+                            data_status: None,
+                            update_status: None,
+                            usage: &mut usage,
+                            analysis: &mut analysis,
+                            quota: None,
+                            settings: &mut settings,
+                        };
+                        if let EventResult::Consumed(cmd) = layout_view.on_mouse(mouse, &mut ctx) {
+                            command = cmd;
                         }
                     }
-                    InputAction::Click { column, row } => {
-                        go_to = tab_at(column, row, bar_width);
+                    InputAction::Close
+                    | InputAction::Open
+                    | InputAction::Space
+                    | InputAction::TogglePane
+                    | InputAction::Page(_) => {
+                        let key = match action {
+                            InputAction::Close => KeyCode::Esc,
+                            InputAction::Open => KeyCode::Enter,
+                            InputAction::Space => KeyCode::Char(' '),
+                            InputAction::TogglePane => KeyCode::Char('p'),
+                            InputAction::Page(step) if step < 0 => KeyCode::PageUp,
+                            InputAction::Page(_) => KeyCode::PageDown,
+                            _ => unreachable!(),
+                        };
+                        let outcome = {
+                            let mut ctx = LayoutContext {
+                                tab,
+                                time_range: wanted.time_range,
+                                loading,
+                                retry_pending: retry_at.is_some(),
+                                spinner,
+                                metrics,
+                                data_status: None,
+                                update_status: None,
+                                usage: &mut usage,
+                                analysis: &mut analysis,
+                                quota: None,
+                                settings: &mut settings,
+                            };
+                            layout_view.on_key(key, &mut ctx)
+                        };
+                        match outcome {
+                            EventResult::Consumed(cmd) => command = cmd,
+                            EventResult::Ignored => {
+                                if let InputAction::Page(step) = action
+                                    && tab.scans()
+                                    && !loading
+                                {
+                                    let delta = crate::display::common::tui::NavDelta {
+                                        lines: (step * 8) as i64,
+                                    };
+                                    if tab == Tab::Usage {
+                                        usage.navigate(delta);
+                                    } else {
+                                        analysis.navigate(delta);
+                                    }
+                                }
+                            }
+                        }
                     }
                     InputAction::NextTab => go_to = Some(tab.offset(1)),
                     InputAction::PrevTab => go_to = Some(tab.offset(-1)),
                     InputAction::StepRange(step) if tab.scans() => {
-                        let mut request = request
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        request.time_range = step_range(request.time_range, step);
-                        failure_until = None;
-                        retry_at = None;
+                        command.step_range = Some(step);
                     }
                     InputAction::Refresh if tab.scans() => {
-                        if let Some(worker) = worker.as_mut() {
-                            failure_until = None;
-                            retry_at = None;
-                            worker.request();
-                        }
+                        command.refresh = true;
                     }
                     InputAction::StepSort(step) if tab.scans() && !loading => {
                         if tab == Tab::Usage {
@@ -534,18 +627,52 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                             analysis.navigate(delta);
                         }
                     }
-                    InputAction::Open if tab.scans() && !loading => {
-                        if tab == Tab::Usage {
-                            usage.detail_open = !usage.detail_open;
-                        } else {
-                            analysis.detail_open = !analysis.detail_open;
-                        }
-                    }
-                    InputAction::TogglePane if tab == Tab::Usage && !loading => {
-                        usage.provider_panel_open = !usage.provider_panel_open;
-                    }
                     _ => {}
                 }
+            }
+
+            if command.quit {
+                break;
+            }
+            if command.open_help {
+                help_open = true;
+                last_draw = None;
+            }
+            if let Some(next) = command.switch_tab {
+                go_to = Some(next);
+            }
+            if let Some(target_range) = command.set_range
+                && tab.scans()
+            {
+                let mut req = request
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if req.time_range != target_range {
+                    req.time_range = target_range;
+                    failure_until = None;
+                    retry_at = None;
+                    last_draw = None;
+                }
+            }
+            if let Some(step) = command.step_range
+                && tab.scans()
+            {
+                let mut req = request
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                req.time_range = step_range(req.time_range, step);
+                failure_until = None;
+                retry_at = None;
+                last_draw = None;
+            }
+            if command.refresh
+                && tab.scans()
+                && let Some(worker) = worker.as_mut()
+            {
+                failure_until = None;
+                retry_at = None;
+                worker.request();
+                last_draw = None;
             }
 
             if let Some(next) = go_to
@@ -553,9 +680,23 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
             {
                 tab = next;
                 help_open = false;
-                usage.detail_open = false;
-                analysis.detail_open = false;
-                usage.provider_panel_open = false;
+                {
+                    let mut ctx = LayoutContext {
+                        tab,
+                        time_range: wanted.time_range,
+                        loading,
+                        retry_pending: false,
+                        spinner,
+                        metrics,
+                        data_status: None,
+                        update_status: None,
+                        usage: &mut usage,
+                        analysis: &mut analysis,
+                        quota: None,
+                        settings: &mut settings,
+                    };
+                    layout_view.on_tab_changed(tab, &mut ctx);
+                }
                 failure_until = None;
                 retry_at = None;
                 last_draw = None;
@@ -566,92 +707,12 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
     terminal.finish(result)
 }
 
-const TAB_PREFIX: &str = " vct ";
-
-/// The tab under `(column, row)`, when the click landed on a tab label in the
-/// top bar (`row == 0`).
-fn tab_at(column: u16, row: u16, width: u16) -> Option<Tab> {
-    if row != 0 || column >= width {
-        return None;
-    }
-    let col = usize::from(column);
-    let mut x = TAB_PREFIX.chars().count();
-    for tab in Tab::ALL {
-        let end = x + tab.label().chars().count() + 2;
-        if (x..end).contains(&col) {
-            return Some(tab);
-        }
-        x = end;
-    }
-    None
-}
-
-/// Builds the tab bar: the tabs on the left; the time range and this process's
-/// memory and CPU on the right, each dropped whole when `width` is short.
-fn tab_bar(
-    width: u16,
-    current: Tab,
-    range: Option<TimeRange>,
-    metrics: (f64, f32),
-) -> Line<'static> {
-    let theme = theme();
-    let dim = theme.dim();
-    let mut left = vec![Span::styled(TAB_PREFIX, Style::default().bold())];
-    for tab in Tab::ALL {
-        let text = format!(" {} ", tab.label());
-        left.push(if tab == current {
-            Span::styled(text, theme.active())
-        } else {
-            Span::raw(text)
-        });
-    }
-
-    let mut ranges = Vec::new();
-    if let Some(range) = range {
-        ranges.push(Span::styled("range ", dim));
-        for (candidate, name) in RANGES {
-            let text = format!(" {name} ");
-            ranges.push(if candidate == range {
-                Span::styled(text, theme.active())
-            } else {
-                Span::raw(text)
-            });
-        }
-    }
-    let (memory_mb, cpu) = metrics;
-    let usage = vec![Span::styled(
-        format!("  {memory_mb:.1} MB · CPU {cpu:.1}% "),
-        dim,
-    )];
-
-    let span_w = |spans: &[Span]| {
-        spans
-            .iter()
-            .map(|span| span.content.chars().count())
-            .sum::<usize>()
-    };
-    let mut right = Vec::new();
-    let mut room = usize::from(width).saturating_sub(span_w(&left) + 1);
-    for part in [ranges, usage] {
-        // The range matters more than the readout, so nothing after a part
-        // that does not fit is shown either.
-        if span_w(&part) > room {
-            break;
-        }
-        room -= span_w(&part);
-        right.extend(part);
-    }
-    let gap = usize::from(width).saturating_sub(span_w(&left) + span_w(&right));
-    left.push(Span::raw(" ".repeat(gap)));
-    left.extend(right);
-    Line::from(left)
-}
-
-/// What every key does on `tab`, most specific first.
+/// Default key list for `tab` when the active layout does not override it.
 fn help_rows(tab: Tab) -> Vec<(&'static str, &'static str)> {
     let mut rows = match tab {
         Tab::Usage | Tab::Analysis => vec![
-            ("↑ ↓", "select a model"),
+            ("↑ ↓ / wheel", "select a model"),
+            ("PgUp PgDn", "move up or down by 8 models"),
             ("⏎", "show the selected model's details"),
             ("← →", "sort by the column to the left or right"),
             ("[ ]", "earlier or later time range"),
@@ -659,11 +720,11 @@ fn help_rows(tab: Tab) -> Vec<(&'static str, &'static str)> {
         ],
         Tab::Quota => Vec::new(),
         Tab::Settings => vec![
-            ("↑ ↓", "move between settings"),
+            ("↑ ↓ / wheel", "move between settings"),
             ("PgUp PgDn", "jump to the previous or next section"),
             ("← →", "change the value"),
             ("space", "turn on or off"),
-            ("⏎", "edit: type a value or pick from a list"),
+            ("⏎ / click", "edit: type a value or pick from a list"),
             ("x", "reset to the default"),
             ("e", "open config.toml in $EDITOR"),
         ],
@@ -681,9 +742,8 @@ fn help_rows(tab: Tab) -> Vec<(&'static str, &'static str)> {
 }
 
 /// Draws the key list for `tab` centered over `area`.
-fn render_help(f: &mut Frame, area: Rect, tab: Tab) {
+fn render_help(f: &mut Frame, area: Rect, tab: Tab, rows: &[(&'static str, &'static str)]) {
     let theme = theme();
-    let rows = help_rows(tab);
     let key_w = rows
         .iter()
         .map(|(key, _)| key.chars().count())
@@ -698,7 +758,7 @@ fn render_help(f: &mut Frame, area: Rect, tab: Tab) {
             ])
         })
         .collect();
-    let width = area.width.saturating_sub(4).min(64);
+    let width = area.width.saturating_sub(4).min(66);
     let height = (rows.len() as u16 + 2).min(area.height.saturating_sub(2));
     let rect = Rect {
         x: area.x + (area.width - width) / 2,
@@ -726,82 +786,13 @@ fn render_help(f: &mut Frame, area: Rect, tab: Tab) {
 mod tests {
     use super::*;
 
-    fn text(line: &Line<'_>) -> String {
-        line.spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect()
-    }
-
-    #[test]
-    fn tab_bar_fills_the_width_and_names_every_tab() {
-        let line = tab_bar(120, Tab::Usage, Some(TimeRange::All), (97.5, 0.0));
-        let shown = text(&line);
-        assert_eq!(shown.chars().count(), 120);
-        for expected in ["Usage", "Analysis", "Quota", "Settings", "month", "97.5 MB"] {
-            assert!(shown.contains(expected), "{expected} missing: {shown}");
-        }
-        assert!(!shown.contains("1 Usage"), "numbers removed: {shown}");
-    }
-
-    #[test]
-    fn clicking_the_tab_bar_picks_the_tab_under_the_cursor() {
-        let shown = text(&tab_bar(120, Tab::Usage, Some(TimeRange::All), (97.5, 0.0)));
-        for tab in Tab::ALL {
-            let needle = format!(" {} ", tab.label());
-            let start = shown.find(&needle).unwrap() as u16;
-            let end = start + needle.len() as u16;
-            for col in start..end {
-                assert_eq!(tab_at(col, 0, 120), Some(tab), "col {col}");
-                assert_eq!(tab_at(col, 1, 120), None, "body row ignored at col {col}");
-            }
-        }
-        // Prefix and right-hand slack hit no tab, nor does a column past a
-        // narrow terminal's right edge.
-        for col in 0..TAB_PREFIX.len() as u16 {
-            assert_eq!(tab_at(col, 0, 120), None);
-        }
-        assert_eq!(tab_at(50, 0, 120), None);
-        assert_eq!(tab_at(35, 0, 30), None);
-    }
-
-    #[test]
-    fn tab_bar_drops_whole_parts_when_narrow() {
-        // The range still fits here, the memory readout does not.
-        let narrow = text(&tab_bar(
-            80,
-            Tab::Analysis,
-            Some(TimeRange::Daily),
-            (97.5, 0.0),
-        ));
-        assert!(
-            narrow.contains("range") && !narrow.contains("MB"),
-            "{narrow}"
-        );
-        let tiny = text(&tab_bar(
-            60,
-            Tab::Analysis,
-            Some(TimeRange::Daily),
-            (97.5, 0.0),
-        ));
-        assert!(
-            tiny.contains("Settings") && !tiny.contains("range"),
-            "{tiny}"
-        );
-        // The Quota and Settings tabs have no time range to show.
-        let quota = text(&tab_bar(120, Tab::Quota, None, (97.5, 0.0)));
-        assert!(!quota.contains("range"), "{quota}");
-    }
-
     #[test]
     fn a_stale_tab_rescans_once_the_worker_is_free_and_a_failure_waits() {
         let now = Instant::now();
         let later = now + Duration::from_secs(10);
         assert!(should_rescan(false, false, None, now));
-        // Current data is the timer's business, and a running scan is waited for.
         assert!(!should_rescan(true, false, None, now));
         assert!(!should_rescan(false, true, None, now));
-        // A failed scan is retried when its wait is over, not before.
         assert!(!should_rescan(false, false, Some(later), now));
         assert!(should_rescan(false, false, Some(now), later));
     }
@@ -813,7 +804,6 @@ mod tests {
             after_editor(Ok(()), true),
             (true, "reloaded".to_string(), true)
         );
-        // A failed editor may have saved first, so a file that parses is read.
         let (reload, message, ok) = after_editor(failed(), true);
         assert!(
             reload && !ok && message.contains("exited with 1"),
@@ -867,7 +857,7 @@ mod tests {
     }
 
     #[test]
-    fn unrelated_settings_edits_preserve_a_cli_merge_override() {
+    fn settings_updates_preserve_cli_merge_override_and_swap_layouts_live() {
         use ratatui::{Terminal, backend::TestBackend};
         use vct_core::usage::summary::{UsageProviderTotals, UsageRow, UsageTotals};
 
@@ -889,7 +879,6 @@ mod tests {
 
         let mut cfg = Config::default();
         cfg.usage.merge_models = false;
-        // Started with `--merge-providers` over `merge_models = false`.
         let mut usage = UsageUiState::new(true);
         usage.apply(UsageRefreshPayload {
             rows: vec![UsageRow {
@@ -908,20 +897,60 @@ mod tests {
             provider_totals: UsageProviderTotals::default(),
         });
         let mut quota = None;
+        let (mut active_id, mut view) = crate::layouts::create(&cfg.general.layout);
 
         // Editing an unrelated field keeps the merged view intact.
         let mut next = cfg.clone();
         next.usage.refresh_interval = 30;
-        apply_settings_update(&mut cfg, next, &mut usage, &mut quota);
+        apply_settings_update(
+            &mut cfg,
+            next,
+            &mut usage,
+            &mut quota,
+            &mut active_id,
+            &mut view,
+        );
         assert!(!render(&mut usage).contains("openai/gpt-5.4"));
+
+        // Switching `general.layout` swaps the active layout immediately.
+        if let Some(&other_id) = crate::layouts::LAYOUT_IDS
+            .iter()
+            .find(|&&id| id != active_id)
+        {
+            let mut switched = cfg.clone();
+            switched.general.layout = other_id.to_string();
+            apply_settings_update(
+                &mut cfg,
+                switched,
+                &mut usage,
+                &mut quota,
+                &mut active_id,
+                &mut view,
+            );
+            assert_eq!(active_id, other_id);
+        }
 
         // Toggling `merge_models` itself updates the live view.
         let mut toggled_on = cfg.clone();
         toggled_on.usage.merge_models = true;
-        apply_settings_update(&mut cfg, toggled_on, &mut usage, &mut quota);
+        apply_settings_update(
+            &mut cfg,
+            toggled_on,
+            &mut usage,
+            &mut quota,
+            &mut active_id,
+            &mut view,
+        );
         let mut toggled_off = cfg.clone();
         toggled_off.usage.merge_models = false;
-        apply_settings_update(&mut cfg, toggled_off, &mut usage, &mut quota);
+        apply_settings_update(
+            &mut cfg,
+            toggled_off,
+            &mut usage,
+            &mut quota,
+            &mut active_id,
+            &mut view,
+        );
         assert!(render(&mut usage).contains("openai/gpt-5.4"));
     }
 }

@@ -112,9 +112,15 @@ impl PerformanceConfig {
     }
 }
 
+/// Default interactive TUI layout identifier.
+pub const DEFAULT_LAYOUT: &str = "classic";
+
 /// `[general]` — settings shared across subcommands.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct GeneralConfig {
+    /// Interactive TUI layout (`classic`, `simple`, `legacy`, or another built-in layout; unknown names fall back to `classic`).
+    #[serde(default = "default_layout")]
+    pub layout: String,
     /// Default time range when no --daily/--weekly/--monthly/--all flag is given.
     /// One of: "daily" | "weekly" | "monthly" | "all".
     #[serde(default)]
@@ -134,6 +140,7 @@ pub struct GeneralConfig {
 impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
+            layout: default_layout(),
             default_time_range: TimeRange::default(),
             auto_update: true,
             // A file this tool writes is current by construction; only a file
@@ -389,6 +396,10 @@ pub enum LogLevel {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_layout() -> String {
+    DEFAULT_LAYOUT.to_string()
 }
 
 fn default_log_retention_days() -> u32 {

@@ -39,6 +39,7 @@ jobs:
       - name: rustfmt (check)
         run: |
           cargo fmt --all -- --check
+          find src/tui/src/layouts -name '*.rs' -exec rustfmt --edition 2024 --check {} +
 
       - name: clippy (deny warnings)
         run: |

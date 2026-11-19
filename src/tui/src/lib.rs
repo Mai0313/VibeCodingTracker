@@ -6,3 +6,4 @@
 //! and a future GUI can reuse the core without pulling ratatui in.
 
 pub mod display;
+pub(crate) mod layouts;
