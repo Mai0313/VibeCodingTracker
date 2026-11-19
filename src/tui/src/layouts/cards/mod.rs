@@ -1,7 +1,4 @@
-//! `cards` layout: summary + clickable sort-pill toolbar over a responsive
-//! multi-column visual model card grid (`1..=3` columns) with share bars,
-//! key metrics, colored provider chips, and full `Details` popups on click or
-//! `Enter`.
+//! `cards` layout: summary and clickable sort-pill toolbar over a `1..=3`-column model card grid with share bars, metrics, provider chips, and `Details` popups.
 
 use crate::display::analysis::{AnalysisRow, AnalysisSort, build_analysis_detail_sections};
 use crate::display::app::Tab;
@@ -375,9 +372,7 @@ fn render_sort_toolbar<S: Copy + PartialEq>(
         })
         .collect();
 
-    // Always reserve full room for `scroll_badge` plus a readable summary prefix,
-    // then fit the widest contiguous window of pills containing `active` so
-    // `←` / `→` always move along the drawn pills and `active` never disappears.
+    // Reserve room for `scroll_badge` and a summary prefix, then fit the widest contiguous pill window containing `active` so `←` / `→` step along drawn pills without hiding `active`.
     let prefix = "sort: ";
     let min_left = (16usize + badge_w).min(total_w);
     let max_right = total_w.saturating_sub(min_left + 1);
@@ -1166,9 +1161,7 @@ mod tests {
         let mut settings = SettingsUiState::new(Config::default(), Box::new(|_, _| Ok(())));
         let mut view = LAYOUT.create();
 
-        // Step sort left from default Cost -> Total -> CacheWrite -> CacheRead,
-        // verifying the active pill is always drawn even at narrow 68 cols and
-        // the `+N more` badge is never clipped off.
+        // Step left from Cost -> Total -> CacheWrite and verify both the active pill and `+N more` badge stay visible at 68 columns.
         usage.step_sort(-1);
         assert_eq!(usage.sort(), UsageSort::Total);
         usage.step_sort(-1);

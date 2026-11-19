@@ -1,6 +1,4 @@
-//! `editorial` layout: single unified outer rounded frame divided cleanly by
-//! hairline rules (`─` and `│`) with an accent `▎` selection cursor and zero
-//! nested box-in-box clutter.
+//! `editorial` layout: single outer rounded frame divided by `─` and `│` hairlines, with a `▎` selection cursor and a borderless table.
 
 use crate::display::analysis::{
     AnalysisRow, AnalysisTableColumns, build_analysis_detail_sections, layout_analysis_columns,
@@ -189,7 +187,6 @@ impl EditorialView {
         };
         self.side_area = right_area;
 
-        // Top hairline divider, joined cleanly with `┬` at the split column.
         let mut rule = String::with_capacity(usize::from(rule_area.width));
         for dx in 0..rule_area.width {
             if Some(rule_area.x + dx) == divider_x {
@@ -956,9 +953,7 @@ impl LayoutView for EditorialView {
             return;
         }
 
-        // Non-data tabs (`Quota`, `Settings`) and loading keep the editorial
-        // underline bar + hairline above their own bottom-row controls footer
-        // so `Star on GitHub` stays on `y = f.area().bottom() - 1`.
+        // Keep non-data tabs and loading outside the outer frame so their bottom controls footer (with `Star on GitHub`) stays on `y = f.area().bottom() - 1`.
         let [bar, rule, body] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(1),

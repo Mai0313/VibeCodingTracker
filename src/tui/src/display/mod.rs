@@ -1,9 +1,6 @@
-//! Output renderers for the `analysis` and `usage` views.
+//! Terminal output renderers and the interactive TUI app.
 //!
-//! Each view has its own submodule ([`analysis`], [`usage`]) holding its three
-//! terminal output modes (TUI / table / text); the CLI serializes the JSON mode
-//! itself. [`quota`] renders the one-shot `vct quota` response, and [`common`]
-//! gathers the rendering glue both views share.
+//! [`app`] runs the tabbed interactive TUI, [`analysis`] and [`usage`] provide each view's TUI state plus static table and plain-text renderers (JSON is serialized by the CLI), [`quota`] renders one-shot `vct quota` responses, and [`common`] holds shared rendering utilities.
 
 pub mod analysis;
 pub mod app;

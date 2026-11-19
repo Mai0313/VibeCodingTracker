@@ -1,11 +1,6 @@
-//! The Settings tab: every `config.toml` field as a form, saved on change.
+//! The Settings tab: interactive form over every `config.toml` field, saved on change.
 //!
-//! The fields are one table ([`FIELDS`]), drawn as one list the selection
-//! walks from end to end; a section is a run of fields sharing a name, and the
-//! section list beside the form only marks which one the selection is in.
-//! Values are read and written by path through
-//! [`vct_core::config`], so the typed [`Config`] stays the only definition of
-//! what a field holds, and its doc-comment is the help text shown here.
+//! All fields live in [`FIELDS`] and render as one continuous list; contiguous runs sharing a section name form sections highlighted in the sidebar. Values are read and written by path through [`vct_core::config`], keeping [`Config`] as the single source of truth for types and help text.
 
 use crate::display::common::table::{create_controls_with_status, render_too_small, title_line};
 use crate::display::common::theme::theme;
@@ -33,8 +28,7 @@ enum Kind {
     Bool,
     /// One of a fixed set of names.
     Choice(&'static [&'static str]),
-    /// A whole number no smaller than `min`. `zero` names what `0` means when
-    /// it is not a quantity.
+    /// A whole number no smaller than `min`, with an optional `zero` label for `0`.
     Number {
         min: i64,
         unit: &'static str,
@@ -299,7 +293,7 @@ const FIELDS: &[Field] = &[
     ),
 ];
 
-/// The section names, in the order they first appear in [`FIELDS`].
+/// Returns the section names in the order they first appear in [`FIELDS`].
 fn sections() -> Vec<&'static str> {
     let mut names: Vec<&'static str> = Vec::new();
     for field in FIELDS {
@@ -316,8 +310,7 @@ enum Editor {
     Choice { selected: usize },
     /// Typing a number or a line of text.
     Input { buffer: String },
-    /// Editing the host list. `input` is the line being typed, with the index
-    /// it replaces, or `None` for a new entry.
+    /// Editing the host list; `input` holds the buffer being typed and the index it replaces (`None` for a new entry).
     Hosts {
         items: Vec<String>,
         selected: usize,
@@ -325,7 +318,7 @@ enum Editor {
     },
 }
 
-/// What a key press in the Settings tab asks of the app.
+/// Action requested from the app by a Settings tab input event.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SettingsOutcome {
     /// Nothing beyond a redraw.
@@ -372,7 +365,7 @@ pub(crate) struct SettingsUiState {
 }
 
 impl SettingsUiState {
-    /// A form over `config` that persists each change through `save`.
+    /// Returns a Settings form over `config` that persists changes through `save`.
     pub(crate) fn new(config: Config, save: SaveSetting) -> Self {
         Self {
             config,
@@ -381,8 +374,7 @@ impl SettingsUiState {
             descriptions: FIELDS
                 .iter()
                 .map(|field| {
-                    // A field with no comment of its own is explained by its
-                    // section's.
+                    // Fall back to the parent section's description when a field has none.
                     setting_description(field.path)
                         .or_else(|| setting_description(&field.path[..field.path.len() - 1]))
                         .unwrap_or_default()
@@ -400,7 +392,7 @@ impl SettingsUiState {
         }
     }
 
-    /// The settings as they now stand.
+    /// Returns the current settings.
     pub(crate) fn config(&self) -> &Config {
         &self.config
     }
@@ -415,7 +407,7 @@ impl SettingsUiState {
         self.message = Some((text, ok));
     }
 
-    /// Whether a field editor is currently open over the form.
+    /// Returns whether a field editor is currently open over the form.
     pub(crate) fn has_open_editor(&self) -> bool {
         self.editor.is_some()
     }
@@ -424,8 +416,7 @@ impl SettingsUiState {
         self.row
     }
 
-    /// The first field of the section `step` sections away, stopping at
-    /// either end.
+    /// Returns the index of the first field in the section `step` sections away, clamped to the ends.
     fn section_start(&self, step: isize) -> usize {
         let section = FIELDS[self.row].section;
         let at = self
@@ -444,7 +435,7 @@ impl SettingsUiState {
         get_setting(config, FIELDS[index].path)
     }
 
-    /// The text shown for a field's value in `config`.
+    /// Returns the formatted value shown for the field at `index` in `config`.
     fn display(&self, config: &Config, index: usize) -> String {
         let field = &FIELDS[index];
         match (field.kind, self.value(config, index)) {
@@ -493,7 +484,7 @@ impl SettingsUiState {
         }
     }
 
-    /// Flips a Bool or Member field, or steps a Choice or Number by `step`.
+    /// Toggles a [`Kind::Bool`] or [`Kind::Member`] field, or steps a [`Kind::Choice`] or [`Kind::Number`] by `step`.
     fn nudge(&mut self, step: i64) -> SettingsOutcome {
         let index = self.current();
         let Some(value) = self.value(&self.config, index) else {
@@ -525,7 +516,7 @@ impl SettingsUiState {
         self.commit(index, next)
     }
 
-    /// Opens the editor a field's kind calls for; a Bool just flips.
+    /// Opens the editor for the selected field's kind, or toggles [`Kind::Bool`] and [`Kind::Member`] fields immediately.
     fn open_editor(&mut self) -> SettingsOutcome {
         let index = self.current();
         let value = self.value(&self.config, index);
@@ -832,7 +823,7 @@ impl SettingsUiState {
         }
     }
 
-    /// Draws the tab into `area` using plain borders (used by unit tests).
+    /// Draws the tab into `area` using plain borders.
     #[cfg(test)]
     pub(crate) fn draw(&mut self, f: &mut Frame, area: Rect, status: Option<(&str, Color)>) {
         self.draw_with_border(f, area, status, BorderType::Plain);
@@ -890,8 +881,6 @@ impl SettingsUiState {
             left,
         );
 
-        // One list: a heading before each section's fields, a blank line
-        // after them.
         let inner_w = usize::from(right.width.saturating_sub(5));
         let defaults = Config::default();
         let mut lines: Vec<Line> = Vec::new();
@@ -937,8 +926,7 @@ impl SettingsUiState {
             line_to_field.push(Some(index));
         }
         self.hits.line_to_field = line_to_field;
-        // Keep the selection on screen, with its section heading when it is
-        // the first field under one.
+        // Keep the selection visible, including its section heading when on a section's first field.
         let visible = usize::from(right.height.saturating_sub(2));
         let top = if self.row == 0 || FIELDS[self.row - 1].section != here {
             selected_line - 1
@@ -1136,7 +1124,7 @@ mod tests {
 
     type Saved = Rc<RefCell<Vec<(String, SettingValue)>>>;
 
-    /// A form over the defaults whose saves are recorded, not written.
+    /// Returns a default form that records saves in memory instead of writing to disk.
     fn form() -> (SettingsUiState, Saved) {
         let saved: Saved = Rc::default();
         let sink = Rc::clone(&saved);

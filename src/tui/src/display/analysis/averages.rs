@@ -1,24 +1,19 @@
 //! Analysis summary rendering helpers.
 //!
-//! Re-exports the aggregated per-provider summary from
-//! [`vct_core::analysis::summary`] and adds the display-only provider-total
-//! rows, which borrow into the comfy-table / ratatui renderers.
+//! Re-exports [`vct_core::analysis::summary`] and builds borrowed [`ProviderTotal`] rows for the table and TUI renderers.
 
 pub use vct_core::analysis::summary::*;
 
 use crate::display::common::ProviderTotal;
 use vct_core::models::Provider;
 
-/// Build the per-provider total rows for the display layer.
+/// Returns per-provider total rows for display, borrowing from `totals`.
 ///
-/// Emits one row per provider that has at least one active day, followed by an
-/// emphasized "All Providers" overall row. The overall row is always appended
-/// when there is overall activity, and also when no provider matched so the
-/// table is never empty.
+/// Includes one row per analysis provider with at least one active day, followed by an emphasized "All Providers" row whenever overall activity is non-zero or no individual provider matched.
 pub fn build_analysis_provider_rows(
     totals: &AnalysisProviderTotals,
 ) -> Vec<ProviderTotal<'_, AnalysisProviderStats>> {
-    let mut rows = Vec::with_capacity(10); // max 9 providers + overall
+    let mut rows = Vec::with_capacity(10); // 9 analysis providers (Hermes is usage-only) + overall
 
     if totals.claude.days_count > 0 {
         rows.push(ProviderTotal::new(

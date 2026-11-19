@@ -1,5 +1,4 @@
-//! The Quota tab: nothing but the quota workers' cards, as large as the
-//! terminal allows, with bars stretched to the card width.
+//! The Quota tab: full-width quota cards laid out in a centered grid with stretched gauge bars.
 
 use super::interactive::{
     GridSpec, QuotaView, dim_line, fit_cards, no_cards_reason, render_quota_card_with_border,
@@ -34,9 +33,7 @@ pub(crate) fn draw_quota_tab(
     draw_quota_tab_with_border(f, area, quota, now, status, BorderType::Plain);
 }
 
-/// Draws the Quota tab into `area`: the card grid centered in it with the
-/// requested [`BorderType`], and a footer counting any provider the terminal
-/// had no room for.
+/// Draws the Quota tab into `area` with a vertically centered card grid using `border_type` and a footer noting any providers that did not fit.
 pub(crate) fn draw_quota_tab_with_border(
     f: &mut Frame,
     area: Rect,
@@ -61,8 +58,7 @@ pub(crate) fn draw_quota_tab_with_border(
             middle,
         );
     }
-    // The grid is laid out from the top of the body; push it down by half of
-    // whatever it left unused.
+    // Center the top-aligned card grid vertically within `body`.
     let used = cards.last().map_or(body.y, |(cell, _)| cell.bottom());
     let shift = (body.bottom() - used) / 2;
     for (cell, card) in &cards {
@@ -87,8 +83,7 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
     use vct_core::models::{ClaudeQuotaSnapshot, QuotaWindow};
 
-    /// Renders the tab at `width` x `height` with `present` providers
-    /// drawn from default snapshots, Claude's 5h window half used.
+    /// Renders the Quota tab at `width` x `height` with `present` providers using default snapshots and Claude's 5h window at 50%.
     fn frame(width: u16, height: u16, present: usize, band_enabled: bool) -> String {
         let claude = ClaudeQuotaSnapshot {
             five_hour: Some(QuotaWindow {

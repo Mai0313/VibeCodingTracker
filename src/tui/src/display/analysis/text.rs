@@ -1,19 +1,18 @@
 //! Plain-text renderer for the `analysis` view.
 //!
-//! Emits one machine-parseable `key=value` line per model, suited for piping
-//! into scripts.
+//! Emits one machine-parseable `key=value` line per model for piping into scripts.
 
 use vct_core::analysis::AnalysisData;
 
-/// Displays aggregated analysis data as plain text (one model per line, key=value pairs).
+/// Prints aggregated analysis data to stdout as one `key=value` line per model.
 ///
-/// Output format (script-friendly, raw integers without thousand separators):
+/// Raw integers are emitted without thousand separators in this format:
 ///
 /// ```text
 /// {model}: editLines={N} readLines={N} writeLines={N} bash={N} edit={N} read={N} todoWrite={N} write={N}
 /// ```
 ///
-/// Prints a placeholder line and returns early when there are no rows.
+/// Prints a placeholder line and returns early when `analysis.rows` is empty.
 pub fn display_analysis_text(analysis: &AnalysisData) {
     if analysis.rows.is_empty() {
         println!("No analysis data found");

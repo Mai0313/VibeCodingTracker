@@ -1,9 +1,6 @@
-//! The Usage tab, plus the quota workers and card builders used by the Quota tab.
+//! Usage tab state, scanner, and renderer, plus shared quota workers and card builders.
 //!
-//! [`UsageScanner`] re-aggregates the session directories, reusing one pricing
-//! map for the current UTC day; [`UsageUiState`] holds only the small per-model
-//! display state between frames, so a resize repaints without re-aggregating,
-//! and highlights rows whose tokens changed since the last scan.
+//! [`UsageScanner`] caches one LiteLLM pricing map per UTC day across scans. [`UsageUiState`] retains the rendered model rows and totals between frames so resizes repaint without re-scanning, and highlights rows whose token counts changed.
 
 use crate::display::common::table::{
     ColumnSpec, DetailItem, DetailSection, TableChrome, aligned_cells, create_controls_with_status,
@@ -74,35 +71,20 @@ const GROK_COLOR: RatatuiColor = RatatuiColor::Rgb(170, 170, 178);
 /// Antigravity color (Google blue) for the quota panel border.
 const ANTIGRAVITY_COLOR: RatatuiColor = RatatuiColor::Rgb(66, 133, 244);
 
-/// Rows the Provider Usage line always costs. It is one row at every terminal
-/// size: the per-provider totals are the second thing this view is for, and one
-/// row is cheap enough that it never has to compete with the table for space.
-/// Everything that does not fit on it moves behind `p`.
+/// Height of the permanent Provider Usage digest line; overflow moves into the `p` panel.
 const PROVIDER_LINE_H: u16 = 1;
-/// Model-name column floor, so a narrowing pane drops a numeric column rather
-/// than cutting the name. Sized for a date-suffixed model id
-/// (`claude-sonnet-4-5-20250929`), because two such ids differing only in the
-/// date would otherwise render as identical rows carrying different costs.
+/// Minimum width of the Model column, sized to keep date-suffixed model IDs (such as `claude-sonnet-4-5-20250929`) distinct.
 const MODEL_COL_MIN_W: u16 = 26;
-/// Width past which the model column stops earning the slack and the share bar
-/// takes over. Long enough for the longest names in practice.
+/// Model column width threshold above which extra horizontal space goes to the Share bar.
 const MODEL_COL_COMFORTABLE_W: u16 = 34;
-/// Share-bar column bounds. It appears only once every numeric column already
-/// fits, since a bar is worth less than the numbers it summarizes.
+/// Minimum and maximum widths for the Share column, shown only after all numeric columns fit.
 const SHARE_COL_MIN_W: u16 = 12;
 const SHARE_COL_MAX_W: u16 = 24;
-/// How many providers can show a quota card (Claude / Codex / Copilot / Cursor
-/// / Grok / Antigravity). The grid never reads this — it only bounds the render
-/// dispatch.
+/// Maximum number of quota cards across all supported quota providers.
 const MAX_QUOTA_PANELS: usize = 6;
-/// Widest a provider-supplied gauge label may be (Claude's per-model weekly
-/// row). It sits in the same column as `5h` / `7d`, so anything past this is
-/// width the bars lose; `label_width`'s own floor is 5, making 6 the first
-/// width that costs anything at all.
+/// Maximum width of Claude's per-model weekly gauge label so it does not crowd out the gauge bars.
 const SCOPED_LABEL_W: u16 = 6;
-/// Widest an Antigravity gauge label may be: agy's own windows (`weekly`,
-/// `5h`, `20h`) fit, and a limit named by its title is cut here so the bar and
-/// percent still fit the narrowest card.
+/// Maximum width of an Antigravity gauge label, fitting `weekly`/`5h`/`20h` while capping longer titles.
 const ANTIGRAVITY_LABEL_W: u16 = 9;
 
 /// Which provider quota panels have credentials on this machine.
@@ -122,8 +104,7 @@ impl QuotaPresence {
         let claude = get_claude_credentials_path()
             .map(|p| p.exists())
             .unwrap_or(false);
-        // Either session root counts: the panel's API-less fallback reads rate
-        // limits from both, so presence has to track what it can actually find.
+        // Either session root counts because the API-less fallback reads rate limits from both.
         let codex = resolve_paths()
             .map(|p| {
                 p.codex_dir.join("auth.json").exists()
@@ -146,7 +127,7 @@ impl QuotaPresence {
         }
     }
 
-    /// Number of provider quota panels present.
+    /// Returns the number of present provider quota panels.
     fn count(&self) -> usize {
         self.claude as usize
             + self.codex as usize
@@ -383,8 +364,7 @@ impl QuotaRuntime {
     }
 }
 
-/// Which column the usage table is ordered by, in the order the columns are
-/// drawn.
+/// Active sort column for the usage table, in display column order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum UsageSort {
     Model,
@@ -412,13 +392,13 @@ impl UsageSort {
         Self::ALL.iter().position(|sort| *sort == self).unwrap_or(0)
     }
 
-    /// The column `step` places along the header, stopping at either end.
+    /// Returns the sort column `step` positions away, clamped to the ends.
     pub(crate) fn step(self, step: isize) -> Self {
         let last = Self::ALL.len() as isize - 1;
         Self::ALL[(self.index() as isize + step).clamp(0, last) as usize]
     }
 
-    /// What the table title shows: numbers run largest first, names A to Z.
+    /// Returns the sort indicator label shown in the table title.
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Cost => "sort: cost ▼",
@@ -478,7 +458,7 @@ impl QuotaSnapshots {
         }
     }
 
-    /// Borrows the snapshots as the view the Quota tab takes.
+    /// Returns a [`QuotaView`] borrowing these snapshots and `runtime`'s presence flags.
     pub(crate) fn view(&self, runtime: &QuotaRuntime) -> QuotaView<'_> {
         QuotaView {
             claude: &self.claude,
@@ -531,9 +511,7 @@ impl UsageUiState {
             .map(|row| row.model.clone())
     }
 
-    /// Re-finds the selection among the rows now shown. `changed` says whether
-    /// the rows carry new numbers (a refresh) or only moved (a toggle), which
-    /// decides whether a difference flashes.
+    /// Re-syncs selection and highlight tracking to the active rows; flashes differences only when `changed` is `true`.
     fn resync(&mut self, previous: Option<String>, changed: bool) {
         let fingerprints: Vec<_> = self
             .view()
@@ -555,7 +533,7 @@ impl UsageUiState {
         }
     }
 
-    /// Takes in a finished scan.
+    /// Replaces the cached scan data with `payload`, re-sorts, and flashes changed rows.
     pub(crate) fn apply(&mut self, payload: UsageRefreshPayload) {
         let previous = self.selected_model();
         self.rows = payload.rows;
@@ -655,7 +633,7 @@ impl UsageUiState {
         self.selected_index().and_then(|at| self.view().get(at))
     }
 
-    /// Draws the tab into `area` (used by unit tests).
+    /// Draws the Usage tab into `area`.
     #[cfg(test)]
     pub(crate) fn draw(&mut self, f: &mut Frame, area: Rect, status: Option<(&str, RatatuiColor)>) {
         let rows = current_view(self.merge_enabled, &self.rows, &self.merged_rows);
@@ -675,8 +653,7 @@ impl UsageUiState {
     }
 }
 
-/// The usage scan a refresh worker runs, with the pricing it keeps between
-/// runs.
+/// Stateful usage scanner that caches one pricing map per UTC day across refreshes.
 pub(crate) struct UsageScanner {
     pricing: ModelPricingMap,
     scan_options: vct_core::usage::UsageScanOptions,
@@ -696,8 +673,7 @@ impl UsageScanner {
     ///
     /// # Errors
     ///
-    /// Returns an error when the scan itself fails or every source failed to
-    /// parse. A partial failure keeps what parsed and is logged.
+    /// Returns an error if the scan fails or every source fails to parse; partial failures keep the parsed data and log a warning.
     pub(crate) fn scan(
         &mut self,
         paths: &vct_core::utils::HelperPaths,
@@ -710,9 +686,7 @@ impl UsageScanner {
         if self.loaded_pricing_utc_date != Some(today) {
             match fetch_model_pricing() {
                 Ok(map) => {
-                    // A new pricing map can move tier thresholds; the scan
-                    // invalidates its cache when the snapshot's fingerprint
-                    // changes.
+                    // Refresh tier thresholds with the pricing map; a changed threshold fingerprint invalidates cached scan entries.
                     self.scan_options.tiers = Some(Arc::new(map.tier_thresholds()));
                     self.pricing = map;
                     self.loaded_pricing_utc_date = Some(today);
@@ -732,9 +706,7 @@ impl UsageScanner {
                 &self.scan_options,
             )
         })?;
-        // A live session changes every tick; writing its provider's file once a
-        // minute keeps the ledger current without rewriting it on every
-        // refresh.
+        // Persist the ledger at most once per `LEDGER_SAVE_INTERVAL` so live sessions do not rewrite it every refresh.
         if let Err(error) = ledger.save_if_due(LEDGER_SAVE_INTERVAL) {
             log::warn!("failed to save the session ledger: {error:#}");
         }
@@ -787,15 +759,7 @@ fn current_view<'a>(
     }
 }
 
-/// The change-highlight fingerprint of a row: the token buckets only (never
-/// cost, so a fuzzy-price shift can't flicker a row).
-///
-/// Reasoning is folded into the second field so a Gemini session whose only
-/// delta lands in `thoughts_tokens` still registers as a change. When merging is
-/// on this is computed over the summed row, so a collapsed base name highlights
-/// whenever **any** of its folded-in provider variants grows — a base name that
-/// looks idle can flash because a hidden variant (a subagent, another provider
-/// prefix, a background session) is being written. That is truthful, not a bug.
+/// Returns the token-only change-highlight fingerprint for `row`, excluding cost and folding `reasoning_tokens` into output.
 fn row_fingerprint(row: &UsageRow) -> (i64, i64, i64, i64) {
     (
         row.input_tokens,
@@ -919,8 +883,7 @@ pub(crate) fn layout_usage_columns(inner: u16) -> UsageTableColumns {
     }
 }
 
-/// Builds one formatted model row for the usage table, optionally prepending
-/// `prefix` (such as `"▸ "` / `"▾ "` in tree layouts) to the model name.
+/// Builds one formatted model row for the usage table, prepending `prefix` to the model name.
 pub(crate) fn build_usage_table_row(
     row: &UsageRow,
     total_tokens: i64,
@@ -958,8 +921,7 @@ pub(crate) fn build_usage_table_row(
     RatatuiRow::new(cells).style(style)
 }
 
-/// Draws the usage tab into `area`: the model table, the Provider Usage line,
-/// and the controls line.
+/// Draws the Usage tab into `area`: the model table, Provider Usage digest, controls bar, and open overlays.
 #[allow(clippy::too_many_arguments)]
 fn draw_usage_view(
     f: &mut Frame,
@@ -984,8 +946,7 @@ fn draw_usage_view(
     let inner = chunks.content.width.saturating_sub(2);
     let cols = layout_usage_columns(inner);
 
-    // No total row: the grand total is carried by the table title, never by
-    // a selectable row.
+    // Grand totals live in the table title rather than as a selectable row.
     let rows: Vec<RatatuiRow> = rows_data
         .iter()
         .map(|row| build_usage_table_row(row, totals.total, &cols, "", update_tracker))
@@ -1028,8 +989,7 @@ fn draw_usage_view(
 
     f.render_widget(
         create_controls_with_status(
-            // Most needed first: the tail is what a narrow terminal drops,
-            // and `p` is the only way to what the provider line leaves out.
+            // Ordered by priority because narrow terminals drop trailing hints; `p` must precede less essential hints.
             &[
                 ("↑↓", "move"),
                 ("←→", "sort"),
@@ -1212,7 +1172,7 @@ pub(crate) fn build_usage_detail_sections(
     ]
 }
 
-/// Draws one whole-frame usage view, for tests and benchmarks.
+/// Draws one full Usage tab frame into `terminal`.
 #[allow(clippy::too_many_arguments)]
 fn render_usage_frame<B: Backend<Error: Send + Sync + 'static>>(
     terminal: &mut Terminal<B>,
@@ -1244,9 +1204,7 @@ fn render_usage_frame<B: Backend<Error: Send + Sync + 'static>>(
 
 /// Production-shaped usage frame fixture used by Criterion benchmarks.
 ///
-/// The fixture owns a [`TestBackend`] so benchmarks exercise the same table,
-/// provider band, controls, and terminal diff path as the interactive renderer
-/// without writing control sequences to stdout.
+/// Owns a [`TestBackend`] so benchmarks exercise the table, provider digest, controls, and terminal diff path without writing control sequences to stdout.
 #[doc(hidden)]
 pub struct UsageFrameBenchmark {
     terminal: Terminal<TestBackend>,
@@ -1349,10 +1307,7 @@ impl UsageFrameBenchmark {
     }
 }
 
-/// Cells a gauge bar gets in a card `inner_w` columns wide.
-///
-/// Five everywhere but the Quota tab, whose `wide` bars take what the label, the
-/// percent and a full reset marker (`  ↻ 23h59m`) leave over.
+/// Returns the bar width in cells: 5 normally, or the slack left after label, percent, and reset marker when `wide` is `true`.
 fn bar_cells(label_w: usize, inner_w: u16, wide: bool) -> usize {
     if wide {
         usize::from(inner_w)
@@ -1363,8 +1318,7 @@ fn bar_cells(label_w: usize, inner_w: u16, wide: bool) -> usize {
     }
 }
 
-/// A `cells`-wide gauge like `━━━━━`: the consumed part in its traffic-light
-/// color, the rest in the border color (any usage shows one cell).
+/// Returns filled and unfilled spans for a `cells`-wide gauge at `pct`% (any positive usage fills at least one cell).
 fn bar_spans(pct: f64, cells: usize) -> [Span<'static>; 2] {
     let theme = theme();
     let filled = ((pct / (100.0 / cells as f64)).ceil() as i64).clamp(0, cells as i64) as usize;
@@ -1374,20 +1328,12 @@ fn bar_spans(pct: f64, cells: usize) -> [Span<'static>; 2] {
     ]
 }
 
-/// Builds a horizontal stacked share bar filling `width` columns: one solid
-/// colored segment per provider, sized by its token share of the total.
-///
-/// Each segment reuses the provider's `tui_color` so it lines up with the table
-/// rows above. Segment widths use largest-remainder rounding so they always sum
-/// to exactly `width`. Falls back to a dim placeholder bar when there is no
-/// token data (or zero width).
+/// Builds a `width`-column stacked share bar colored by provider token share using largest-remainder rounding, or a dim placeholder when empty.
 pub(crate) fn provider_share_bar(
     rows: &[ProviderTotal<'_, ProviderStats>],
     width: u16,
 ) -> Line<'static> {
     let width = width as usize;
-    // Providers that actually contributed tokens (skip the "All Providers"
-    // aggregate and any empty provider).
     let segments: Vec<(RatatuiColor, i64)> = rows
         .iter()
         .filter(|row| row.label != "All Providers" && row.stats.total_tokens > 0)
@@ -1399,8 +1345,7 @@ pub(crate) fn provider_share_bar(
         return Line::from(Span::styled("░".repeat(width), theme().border()));
     }
 
-    // Largest-remainder apportionment: floor each share, then hand the leftover
-    // columns to the largest fractional remainders so the bar fills exactly.
+    // Largest-remainder apportionment ensures segment widths sum to exactly `width`.
     let mut widths: Vec<usize> = Vec::with_capacity(segments.len());
     let mut remainders: Vec<(usize, f64)> = Vec::with_capacity(segments.len());
     let mut used = 0usize;
@@ -1442,10 +1387,7 @@ fn dim_line_fit(text: &str, inner_w: u16) -> Line<'static> {
     dim_line(&fit_text(text, inner_w))
 }
 
-/// A red login-hint line shown when a provider's token needs a re-login.
-///
-/// Fitted rather than clipped: this is the one line on the card that tells the
-/// user what to *do*, so a half-drawn command would be worse than a marked one.
+/// Returns a bold error-colored login hint fitted to `inner_w` with an ellipsis rather than hard-clipped.
 fn login_hint_line(hint: &str, inner_w: u16) -> Line<'static> {
     Line::from(Span::styled(
         fit_text(hint, inner_w),
@@ -1453,11 +1395,7 @@ fn login_hint_line(hint: &str, inner_w: u16) -> Line<'static> {
     ))
 }
 
-/// Columns and rows the quota grid uses for `n` cards at `width`.
-///
-/// This is the whole placement rule. The card count enters only as `n`, so a
-/// new provider is a longer list and never a new case: the grid packs as many
-/// cards per row as the width allows and wraps the remainder onto further rows.
+/// Returns `(cols, rows)` to pack `n` quota cards into `width` columns under `spec`.
 fn quota_grid(spec: &GridSpec, width: u16, n: usize) -> (usize, usize) {
     if n == 0 {
         return (0, 0);
@@ -1466,18 +1404,13 @@ fn quota_grid(spec: &GridSpec, width: u16, n: usize) -> (usize, usize) {
     (cols, n.div_ceil(cols))
 }
 
-/// Rows the grid needs at `width` for `n` cards.
+/// Returns the total height in terminal rows needed for `n` cards at `width`.
 fn grid_height(spec: &GridSpec, width: u16, n: usize) -> u16 {
     let (_, rows) = quota_grid(spec, width, n);
     (rows as u16).saturating_mul(spec.height)
 }
 
-/// Splits the grid band into exactly `n` card cells, row-major.
-///
-/// Cards keep a uniform width, so a final row holding fewer than a full set is
-/// left ragged rather than stretching its cards out of alignment with the rows
-/// above. The returned length is always `n`, which is what lets the render
-/// dispatch index it by present-provider order.
+/// Splits `band` into exactly `n` uniform-width, row-major card cells (leaving any short final row ragged).
 fn grid_cells(spec: &GridSpec, band: Rect, n: usize) -> Vec<Rect> {
     let (cols, rows) = quota_grid(spec, band.width, n);
     if cols == 0 {
@@ -1505,14 +1438,13 @@ fn grid_cells(spec: &GridSpec, band: Rect, n: usize) -> Vec<Rect> {
     cells
 }
 
-/// Renders one model's share of the total tokens as a right-aligned bar plus
-/// percentage, sized to `width`.
+/// Formats `value / total` as a bar and percentage fitted to `width` columns (empty if `total <= 0` or `width < 6`).
 fn share_cell(value: i64, total: i64, width: u16) -> String {
     if total <= 0 || width < 6 {
         return String::new();
     }
     let share = (value as f64 / total as f64).clamp(0.0, 1.0);
-    // Six columns are reserved for " nnn.n%".
+    // Reserve 6 columns for "100.0%".
     let bar_w = usize::from(width - 6);
     let filled = (share * bar_w as f64).round() as usize;
     format!(
@@ -1546,14 +1478,7 @@ fn collect_cards(quota: &QuotaView, now: i64, width: u16, wide: bool) -> Vec<Quo
     cards
 }
 
-/// Chooses which one-line digest segments fit in `width` columns.
-///
-/// `widths` holds each segment's column count in display order, `drop_order`
-/// lists those same indices in the order they may be given up (least worth
-/// showing first), and `tail` is the label the `+N ` count prefixes — which
-/// costs room of its own as soon as anything is hidden. Returns a keep-mask in
-/// display order; at least one segment always survives, because a line saying
-/// only `+8 more` tells the reader nothing.
+/// Returns a keep-mask of digest segments fitting within `width`, dropping indices in `drop_order` while accounting for the `+{hidden} {tail}` suffix and always keeping at least one segment.
 fn fit_digest(
     widths: &[usize],
     sep: usize,
@@ -1592,8 +1517,7 @@ fn segment_width(segment: &[Span<'_>]) -> usize {
         .sum()
 }
 
-/// Assembles a digest line from the segments [`fit_digest`] kept, plus the
-/// trailing count of the ones it did not.
+/// Joins the segments marked `true` in `keep` with `sep` and appends `+{hidden} {tail}` when any are omitted.
 fn digest_line(
     segments: Vec<Vec<Span<'static>>>,
     keep: &[bool],
@@ -1620,25 +1544,15 @@ fn digest_line(
     Line::from(spans)
 }
 
-/// The one-line Provider Usage digest drawn under the model table.
-///
-/// One segment per provider (`● Claude $0.91`), the dot in that provider's own
-/// color so it reads the same way its rows and share-bar segments do. Cost is
-/// the one number that earns a permanent row here; tokens and the per-provider
-/// day counts live behind `p`. Whatever does not fit is named in a trailing
-/// `+N more → p`, so the line never implies it lists every provider.
+/// Builds the one-line per-provider cost digest (`● Provider $cost`), dropping the cheapest providers into `+N more → p` when `width` is tight.
 pub(crate) fn provider_digest(
     rows: &[ProviderTotal<'_, ProviderStats>],
     width: u16,
 ) -> Line<'static> {
-    /// Narrower than the quota digest's separator on purpose: there are ten
-    /// providers to the quota band's five, so every column saved per gap is
-    /// another provider named on the line before the rest fold into the
-    /// `+N more` tail. Each segment's dot already marks where it starts.
+    /// Compact two-space separator; each segment's colored dot marks the boundary.
     const SEP: &str = "  ";
     const TAIL: &str = "more → p";
-    // The table title already carries the grand total, so the aggregate row
-    // would only repeat it.
+    // Skip the aggregate row because the table title already shows the grand total.
     let listed: Vec<_> = rows
         .iter()
         .filter(|row| row.label != "All Providers")
@@ -1661,12 +1575,7 @@ pub(crate) fn provider_digest(
         })
         .collect();
 
-    // Cost is what this line is for, so the cheapest providers are the ones to
-    // give up. Dropping by list position instead would hide Cursor and Hermes
-    // first purely because of where they sit in the enum, which on an account
-    // dominated by one of them drops the very number the line exists to show.
-    // Ties go to the later provider, so a row of untouched providers still
-    // empties from the tail.
+    // Drop the cheapest providers first (breaking ties from the tail) so a high-spend provider late in the enum is never hidden.
     let mut drop_order: Vec<usize> = (0..listed.len()).collect();
     drop_order.sort_by(|&a, &b| {
         listed[a]
@@ -1688,10 +1597,7 @@ pub(crate) fn provider_digest(
     digest_line(segments, &keep, SEP, TAIL)
 }
 
-/// Renders the full Provider Usage totals as a centered panel, opened with `p`.
-///
-/// This is where the numbers the one-line digest cannot carry live: per-provider
-/// tokens beside cost, and the stacked share bar at full panel width.
+/// Renders the centered Provider Usage modal (`p`) with per-provider tokens, cost, and the stacked share bar.
 pub(crate) fn render_provider_panel(
     f: &mut Frame,
     area: Rect,
@@ -1714,8 +1620,7 @@ pub(crate) fn render_provider_panel(
     render_provider_table(f, rect, provider_rows);
 }
 
-/// Why a quota surface has no card to show. The band being switched off is a
-/// setting, not a missing credential.
+/// Returns the empty-state message explaining why no quota cards are shown.
 pub(crate) fn no_cards_reason(quota: &QuotaView) -> &'static str {
     if quota.band_enabled {
         "No provider on this machine has quota credentials."
@@ -1724,8 +1629,7 @@ pub(crate) fn no_cards_reason(quota: &QuotaView) -> &'static str {
     }
 }
 
-/// Builds the cards that fit `area` on a `base` grid, each with the cell it is
-/// drawn into, plus the number of providers that did not fit.
+/// Returns `(cell, card)` pairs that fit `area` on `base`, plus the count of omitted providers.
 pub(crate) fn fit_cards(
     base: &GridSpec,
     area: Rect,
@@ -1733,17 +1637,9 @@ pub(crate) fn fit_cards(
     now: i64,
     wide: bool,
 ) -> (Vec<(Rect, QuotaCard)>, usize) {
-    // Settle how many cards get drawn before laying any out, so the width a
-    // card is built for and the cell it is drawn into come from the same
-    // layout. A card's lines are built for the width they will be drawn at,
-    // never for the spec's maximum, or the fitting every line builder does
-    // would be against a cell the card never gets. `collect_cards` pushes one
-    // card per present provider, so the count the grid needs is known before
-    // the first card exists.
+    // Measure height at `base.min_w` first, then compute the final cell widths before building the rendered cards so line fitting matches the drawn cell.
     let present = quota.present.count();
-    // Cards grow to the tallest one (Antigravity lists a line per pool and per
-    // limit), but only while every provider still fits: a taller card never
-    // costs another provider its place.
+    // Grow card height to the tallest card only if all present providers still fit.
     let tallest = collect_cards(quota, now, base.min_w, wide)
         .iter()
         .map(|card| card.lines.len())
@@ -1767,13 +1663,7 @@ pub(crate) fn fit_cards(
     (cells.into_iter().zip(cards).collect(), present - fits)
 }
 
-/// Renders the Provider Usage totals: a three-column table over a stacked share
-/// bar, both inside one border.
-///
-/// A short terminal can leave the panel with fewer rows than there are
-/// providers, so a list longer than it can hold is truncated with a `+N more`
-/// row and a `+N` flag in the title rather than stopping at the border with no
-/// sign that anything is missing.
+/// Renders the modal Provider Usage table and stacked share bar, truncating overflow with `+N more`.
 fn render_provider_table(
     f: &mut Frame,
     area: Rect,
@@ -1790,8 +1680,7 @@ fn render_provider_table(
     );
 }
 
-/// Renders the Provider Usage table + stacked share bar into a persistent side
-/// pane (non-modal, with caller-supplied title and border style).
+/// Renders the non-modal Provider Usage table and stacked share bar with caller-supplied chrome.
 pub(crate) fn render_provider_pane(
     f: &mut Frame,
     area: Rect,
@@ -1896,8 +1785,7 @@ fn render_provider_box(
             .style(theme.dim()),
         );
     }
-    // The placeholder is a sentence, not a row: as a table cell it would be
-    // clipped to the width of the Provider column ("No provid").
+    // Render the empty placeholder as a paragraph; as a table cell it would clip to the Provider column width.
     if totals_rows.is_empty() {
         f.render_widget(
             Paragraph::new(dim_line_fit("No provider data yet", rows_area.width)),
@@ -1915,8 +1803,7 @@ fn render_provider_box(
         Constraint::Length(11),
         Constraint::Length(11),
     ];
-    // Reuse the shared table builder but strip its own border (the outer block
-    // above already draws it) by overriding the block.
+    // Strip the table's own border because the outer block above already draws it.
     let totals_table = create_ratatui_table(
         totals_rows,
         vec!["Provider", "Tokens", "Cost"],
@@ -1932,13 +1819,7 @@ fn render_provider_box(
     );
 }
 
-/// One provider's quota, laid out as an ordered list of lines.
-///
-/// Every line is built for the width of the cell the card will be drawn in, so
-/// the Quota tab rebuilds its cards at its own roomier width. The height is
-/// not applied here: the list is ordered most-important-first, and a cell too
-/// short for it keeps the head while [`render_quota_card_with_border`] counts
-/// the rest.
+/// Pre-wrapped quota card lines ordered most-important-first; excess lines are counted by [`render_quota_card_with_border`].
 pub(crate) struct QuotaCard {
     title: &'static str,
     color: RatatuiColor,
@@ -1956,10 +1837,7 @@ pub(crate) fn render_quota_card(f: &mut Frame, area: Rect, card: &QuotaCard) {
     render_quota_card_with_border(f, area, card, BorderType::Plain);
 }
 
-/// Renders `card` into `area`, flagging a hit cap and any lines that did not fit.
-///
-/// The trailing flags share the top border: `+2` for hidden lines, `LIMIT` for a
-/// spent window. `+2` is the promise that the Quota tab has more to show.
+/// Renders `card` into `area` with `border_type`, placing `+N` (hidden lines) and `LIMIT` flags on the top border.
 pub(crate) fn render_quota_card_with_border(
     f: &mut Frame,
     area: Rect,
@@ -2004,11 +1882,7 @@ pub(crate) fn render_quota_card_with_border(
     f.render_widget(Paragraph::new(shown).block(block), area);
 }
 
-/// Truncates `text` to `width` columns, marking the cut with an ellipsis.
-///
-/// For text the card cannot shorten any other way. Everything with a structure
-/// to exploit (a gauge's reset marker, a detail line's parts) drops a whole
-/// element instead, so this is the last resort rather than the default.
+/// Truncates `text` to `width` characters, appending `…` when shortened.
 fn fit_text(text: &str, width: u16) -> String {
     let width = usize::from(width);
     if text.chars().count() <= width {
@@ -2020,13 +1894,7 @@ fn fit_text(text: &str, width: u16) -> String {
         + "…"
 }
 
-/// Builds the card's first line: plan tier on the left, fetch age on the right.
-///
-/// Merging the two saves a row in every card, and they belong together — the age
-/// qualifies everything below it. The plan string is provider-supplied and
-/// unbounded, so it is the side that gives way: the age always survives, because
-/// a clipped age (`2h1`) reads as fresher data rather than as a truncation, and
-/// a retained snapshot's age is the only sign it is stale.
+/// Builds a card's header line with `plan` on the left (truncated if needed) and the untruncated fetch age on the right.
 fn plan_line(plan: Option<&str>, fetched_at: i64, now: i64, inner_w: u16) -> Line<'static> {
     let (age, color) = staleness(fetched_at, now);
     let inner = usize::from(inner_w);
@@ -2042,8 +1910,7 @@ fn plan_line(plan: Option<&str>, fetched_at: i64, now: i64, inner_w: u16) -> Lin
     ])
 }
 
-/// The "how old is this snapshot" marker, escalating in color past 1h and 6h so
-/// a panel stuck on stale data reads as such.
+/// Returns the formatted fetch age and severity color (dim, warning past 1h, error past 6h).
 fn staleness(fetched_at: i64, now: i64) -> (String, RatatuiColor) {
     let theme = theme();
     if fetched_at <= 0 {
@@ -2066,15 +1933,7 @@ fn staleness(fetched_at: i64, now: i64) -> (String, RatatuiColor) {
     (text, color)
 }
 
-/// Builds one gauge line: `5h    ━━━━━  34%  ↻ 2h11m`.
-///
-/// The label column is padded to `label_w` so the bars line up down the card.
-/// The reset marker is fitted to what is left: full (`↻ 2h11m`), then bare
-/// (`2h11m`), then dropped — a narrow card loses the marker rather than having
-/// its duration truncated into a smaller, plausible one.
-///
-/// `wide` stretches the bar over whatever the label, percent and a full reset
-/// marker leave of `inner_w`, for the Quota tab's roomier cards.
+/// Builds a gauge line padded to `label_w`, degrading the reset marker from `↻ dur` to `dur` to omitted rather than truncating the duration.
 fn gauge_line(
     label: &str,
     label_w: usize,
@@ -2108,13 +1967,7 @@ fn gauge_line(
     Line::from(spans)
 }
 
-/// Like [`gauge_line`] but labels the bar with a caller-supplied value (e.g.
-/// `1080/1500`) instead of a percentage, and carries no reset marker. `pct`
-/// still drives the bar fill and its traffic-light color.
-///
-/// The bar is dropped when the value would not otherwise fit: a used/total pair
-/// already says what the bar says, whereas a truncated `$1.24K/$5.` reads as a
-/// smaller, plausible number that contradicts the bar beside it.
+/// Builds a gauge line displaying `value` instead of a percentage, dropping the bar rather than truncating `value`.
 fn gauge_line_value(
     label: &str,
     label_w: usize,
@@ -2123,8 +1976,7 @@ fn gauge_line_value(
     inner_w: u16,
     wide: bool,
 ) -> Line<'static> {
-    // As long as the gauges above it where the value leaves room, shorter
-    // where it does not: this line carries no percent or reset marker.
+    // Match the card's standard bar width when `value` leaves room; otherwise shrink to fit.
     let room = usize::from(inner_w).saturating_sub(label_w + 2 + value.chars().count());
     let bar = bar_cells(label_w, inner_w, wide).min(room);
     let mut spans = vec![Span::raw(format!("{label:<label_w$} "))];
@@ -2141,11 +1993,7 @@ fn gauge_line_value(
     Line::from(spans)
 }
 
-/// Joins detail `parts` with ` · `, keeping as many as fit `inner_w`.
-///
-/// A part that does not fit is counted in a trailing `+N`, so a card never
-/// implies it is showing everything it has. Returns `None` when there is
-/// nothing to say.
+/// Joins as many `parts` as fit in `inner_w` with ` · `, appending `+N` for omitted parts, or returns `None` if empty.
 fn detail_line(parts: &[String], inner_w: u16) -> Option<Line<'static>> {
     if parts.is_empty() {
         return None;
@@ -2180,7 +2028,7 @@ fn detail_line(parts: &[String], inner_w: u16) -> Option<Line<'static>> {
     Some(Line::from(Span::styled(text, theme().dim())))
 }
 
-/// Width of the label column in a card, wide enough for its longest label.
+/// Returns the label column width for `labels`, with a minimum of 5.
 fn label_width(labels: &[&str]) -> usize {
     labels
         .iter()
@@ -2193,9 +2041,7 @@ fn label_width(labels: &[&str]) -> usize {
 /// Builds the Claude card: plan, 5h / 7d / per-model gauges, then balance.
 fn claude_card(claude: &ClaudeQuotaSnapshot, now: i64, width: u16, wide: bool) -> QuotaCard {
     let inner = card_inner_w(width);
-    // The scoped row's label shares the gauge label column with `5h` / `7d`, so
-    // every character past `SCOPED_LABEL_W` would come straight off the bars.
-    // Anthropic sends a full display name ("Claude Opus 4.5"), hence the cut.
+    // Cap Anthropic's full model display name to `SCOPED_LABEL_W` so it does not widen the shared label column.
     let scoped = claude
         .scoped_label
         .as_deref()
@@ -2203,17 +2049,14 @@ fn claude_card(claude: &ClaudeQuotaSnapshot, now: i64, width: u16, wide: bool) -
         .map(|label| fit_text(label, SCOPED_LABEL_W));
     let label_w = label_width(&["5h", "7d", scoped.as_deref().unwrap_or("")]);
 
-    // The plan/age line is unconditional: the age is the only sign that a
-    // retained snapshot is stale, and a provider without a plan label (Grok
-    // when its settings fetch failed) needs it just as much.
+    // Always emit the plan/age header so cached snapshots still display staleness.
     let mut lines: Vec<Line> = vec![plan_line(
         claude.plan_type.as_deref(),
         claude.fetched_at,
         now,
         inner,
     )];
-    // The hint sits above the gauges rather than after them: it is the only
-    // actionable line on the card, so it must not be the one a short cell drops.
+    // Place the login hint above gauges so short cells never drop the actionable line.
     if claude.needs_login {
         lines.push(login_hint_line(CLAUDE_LOGIN_HINT, inner));
     }
@@ -2243,8 +2086,7 @@ fn claude_card(claude: &ClaudeQuotaSnapshot, now: i64, width: u16, wide: bool) -
         ));
         has_data = true;
     }
-    // The per-model weekly cap (Fable today) is volatile on Anthropic's side, so
-    // it is only drawn when both the window and its model label are present.
+    // Draw the optional per-model weekly cap only when both the window and its label are present.
     if let (Some(w), Some(label)) = (&claude.scoped_weekly, scoped.as_deref()) {
         lines.push(gauge_line(
             label,
@@ -2322,7 +2164,7 @@ fn codex_card(codex: &CodexQuotaSnapshot, now: i64, width: u16, wide: bool) -> Q
                 wide,
             ));
         }
-        // Session-fallback data stays visible alongside the re-login hint.
+        // Keep gauges visible on re-login, but omit credit/extra lines so they do not crowd the hint.
         if !codex.needs_login {
             if let Some(line) = detail_line(&codex_credit_parts(codex), inner) {
                 v.push(line);
@@ -2367,7 +2209,6 @@ fn copilot_card(copilot: &CopilotQuotaSnapshot, now: i64, width: u16, wide: bool
             inner,
             wide,
         ));
-        // A second gauge showing the premium requests as used/total counts.
         if let (Some(rem), Some(total)) = (copilot.premium_remaining, copilot.premium_entitlement)
             && total > 0
         {
@@ -2454,8 +2295,6 @@ fn cursor_card(cursor: &CursorQuotaSnapshot, now: i64, width: u16, wide: bool) -
 /// Builds the Grok card: plan, included-allowance gauge, on-demand and prepaid.
 fn grok_card(grok: &GrokQuotaSnapshot, now: i64, width: u16, wide: bool) -> QuotaCard {
     let inner = card_inner_w(width);
-    // The label names the period the allowance runs on, which the API reports
-    // per account; an unlabelled window falls back to "incl".
     let period = grok.period_label.as_deref().unwrap_or("incl");
     let label_w = label_width(&[period, "ondmd"]);
 
@@ -2483,9 +2322,7 @@ fn grok_card(grok: &GrokQuotaSnapshot, now: i64, width: u16, wide: bool) -> Quot
         has_data = true;
     }
     match (grok.on_demand_dollars, grok.on_demand_cap_dollars) {
-        // With a cap configured the spend reads as its own gauge. Both amounts
-        // are compacted (`$1.2K`) so a four-figure cap cannot outgrow the
-        // narrowest card and get truncated into a smaller, plausible number.
+        // Compact both amounts so a four-figure cap fits narrow cards without truncating into a misleading value.
         (Some(used), Some(cap)) if cap > 0.0 => lines.push(gauge_line_value(
             "ondmd",
             label_w,
@@ -2524,9 +2361,7 @@ fn grok_card(grok: &GrokQuotaSnapshot, now: i64, width: u16, wide: bool) -> Quot
     }
 }
 
-/// Builds the Antigravity card: each pool's name, then one gauge per limit
-/// named by its window. `/usage` names no plan, so the first line carries only
-/// the snapshot's age.
+/// Builds the Antigravity card with age-only header (no plan name in `/usage`), grouped by pool with `5h` limits first.
 fn antigravity_card(
     antigravity: &AntigravityQuotaSnapshot,
     now: i64,
@@ -2546,7 +2381,6 @@ fn antigravity_card(
             .collect::<Vec<_>>(),
     )
     .min(usize::from(ANTIGRAVITY_LABEL_W));
-    // Each pool by its own name, then its limits by agy's window names, 5h first.
     let mut pools: Vec<(&str, Vec<&AntigravityBucket>)> = Vec::new();
     for bucket in &antigravity.buckets {
         match pools.iter_mut().find(|(name, _)| *name == bucket.group) {
@@ -2582,7 +2416,7 @@ fn antigravity_card(
     }
 }
 
-/// The credit parts of the Codex card.
+/// Returns the credit balance detail parts for the Codex card.
 fn codex_credit_parts(codex: &CodexQuotaSnapshot) -> Vec<String> {
     let balance = if codex.unlimited == Some(true) {
         "credits unlimited".to_string()
@@ -2600,10 +2434,7 @@ fn codex_credit_parts(codex: &CodexQuotaSnapshot) -> Vec<String> {
     parts
 }
 
-/// The Codex extras (`reset expires X`, `~L-H msgs`, `cap $X`).
-///
-/// Reset-credit details lead so the expiry stays visible in a narrow card even
-/// when message and spend metadata are also present.
+/// Returns Codex extra detail parts ordered with reset-credit expiry first so it survives narrow-card truncation.
 fn codex_extra_parts(codex: &CodexQuotaSnapshot, now: i64) -> Vec<String> {
     let mut parts: Vec<String> = Vec::new();
     if codex.reset_credits_available.is_some_and(|count| count > 0)
@@ -2640,7 +2471,7 @@ fn codex_extra_parts(codex: &CodexQuotaSnapshot, now: i64) -> Vec<String> {
     parts
 }
 
-/// The balance parts of the Claude card (mirrors Codex's credit parts).
+/// Returns the balance and spend detail parts for the Claude card.
 fn claude_balance_parts(claude: &ClaudeQuotaSnapshot) -> Vec<String> {
     let mut parts = vec![match &claude.balance {
         Some(b) => format!("bal {b}"),
@@ -2848,14 +2679,12 @@ mod tests {
         assert!(!rendered.contains("5h"), "got:\n{rendered}");
     }
 
-    /// Renders a card into the smallest cell the grid ever hands out and returns
-    /// its text, so a test can assert what survives that width.
+    /// Renders `card` into the smallest [`CARD_GRID`] cell and returns its buffer text.
     fn render_min_card(card: &QuotaCard) -> String {
         render_card_in(card, CARD_GRID.min_w, CARD_GRID.height)
     }
 
-    /// Renders `card` into a `w` x `h` cell, borders included, and returns its
-    /// text.
+    /// Renders `card` into a `w` x `h` cell (borders included) and returns its buffer text.
     fn render_card_in(card: &QuotaCard, w: u16, h: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         terminal
@@ -2872,9 +2701,7 @@ mod tests {
             .join("\n")
     }
 
-    /// A pay-as-you-go Grok account fills the panel to its documented maximum:
-    /// plan, the period-labelled allowance gauge, the on-demand gauge, the
-    /// prepaid balance, and the staleness line all have to fit.
+    /// Full pay-as-you-go Grok snapshots fit plan, allowance, on-demand gauge, balance, and age in the minimum cell.
     #[test]
     fn grok_panel_fits_every_line_in_the_minimum_cell() {
         let now = 1_000;
@@ -2902,9 +2729,7 @@ mod tests {
         assert!(rendered.contains("just now"), "got:\n{rendered}");
     }
 
-    /// A four-figure cap must stay readable in the narrowest cell. Printing it
-    /// in full overflows and the clip turns `$5000.00` into `$500`, so the
-    /// gauge and the numbers next to it tell contradictory stories.
+    /// Large Grok dollar amounts are compacted so they stay readable in the narrowest cell without truncation.
     #[test]
     fn grok_panel_compacts_large_money_rather_than_truncating_it() {
         let grok = GrokQuotaSnapshot {
@@ -2920,8 +2745,7 @@ mod tests {
         assert!(rendered.contains("balance $12.3K"), "got:\n{rendered}");
     }
 
-    /// The common free account: no money lines at all, and an unlabelled period
-    /// falls back to a generic gauge label rather than rendering nothing.
+    /// Free Grok snapshots omit money lines and label an unknown allowance period as `incl`.
     #[test]
     fn grok_panel_omits_zero_money_and_labels_an_unknown_period() {
         let now = 1_000;
@@ -2941,8 +2765,7 @@ mod tests {
         assert!(!rendered.contains("balance"));
     }
 
-    /// With no data at all the panel says so, and a rejected token adds the
-    /// login hint rather than an empty box.
+    /// Empty Grok snapshots show a no-data notice, and `needs_login` replaces it with the login hint.
     #[test]
     fn grok_panel_reports_missing_data_and_a_needed_login() {
         let rendered = render_min_card(&grok_card(&Default::default(), 0, CARD_GRID.min_w, false));
@@ -2980,8 +2803,7 @@ mod tests {
         }
     }
 
-    /// Each pool's own name heads its limits, which agy's window names label,
-    /// the 5-hour one first whatever order agy lists them in.
+    /// Antigravity cards group buckets by pool name and sort `5h` limits ahead of other windows.
     #[test]
     fn antigravity_panel_lists_each_pool_then_its_limits_5h_first() {
         let now = 1_000;
@@ -3014,8 +2836,7 @@ mod tests {
         assert!(lines[3].contains("8%"), "got {lines:#?}");
     }
 
-    /// A roomy cell holds every line of agy's two pools; the always-on cell
-    /// flags what it cannot hold rather than dropping it.
+    /// Roomy cells fit all Antigravity pool lines while compact cells flag overflow with `+N`.
     #[test]
     fn antigravity_panel_fits_a_roomy_cell_and_flags_the_rest_in_the_grid() {
         let now = 1_000;
@@ -3032,8 +2853,7 @@ mod tests {
         assert!(grid.contains("+2"), "hidden lines must be flagged:\n{grid}");
     }
 
-    /// The longest provider name still reads whole beside both flags in the
-    /// narrowest card: the dot goes, not a letter of the name.
+    /// Narrow cards drop the title dot before truncating the provider name beside `LIMIT` and `+N` flags.
     #[test]
     fn a_narrow_card_title_gives_up_its_dot_before_its_name() {
         let card = |title, lines: usize| QuotaCard {
@@ -3054,8 +2874,7 @@ mod tests {
         assert!(roomy.lines().next().unwrap().contains("● Codex"), "{roomy}");
     }
 
-    /// A limit agy names by its title alone still shows its gauge in the
-    /// narrowest card: the title is cut, never the bar or the percent.
+    /// Long Antigravity window titles truncate with an ellipsis so the gauge bar and percent stay visible.
     #[test]
     fn antigravity_panel_cuts_a_long_label_rather_than_the_gauge() {
         let antigravity = AntigravityQuotaSnapshot {
@@ -3099,8 +2918,7 @@ mod tests {
         assert!(!rendered.contains("no Antigravity quota"));
     }
 
-    /// Every provider the digest and panel can be handed, so both exercise the
-    /// real maximum rather than a sample of it.
+    /// All 10 providers in display order for full-capacity digest and panel tests.
     const PROVIDER_NAMES: [Provider; 10] = [
         Provider::ClaudeCode,
         Provider::Codex,
@@ -3148,9 +2966,7 @@ mod tests {
 
     #[test]
     fn provider_panel_says_how_many_providers_it_could_not_list() {
-        // Every provider into a panel with room for four data rows: the ones
-        // that did not fit are counted, in the title and in the body, rather
-        // than the list just stopping at the border.
+        // Overflowing rows are counted in both the title and a trailing "+N more" row.
         let short = render_panel(34, 9, PROVIDER_NAMES.len());
         assert!(short.contains("+7"), "got:\n{short}");
         assert!(short.contains("more"), "got:\n{short}");
@@ -3174,8 +2990,7 @@ mod tests {
         };
         let rows = provider_rows(PROVIDER_NAMES.len(), &stats);
 
-        // Wide enough for every provider: each one is named, nothing is counted
-        // away.
+        // Wide terminal: every provider fits with no "+N more" suffix.
         let wide = line_text(provider_digest(&rows, 170));
         for provider in PROVIDER_NAMES {
             assert!(
@@ -3187,15 +3002,12 @@ mod tests {
         assert!(!wide.contains("more"), "got: {wide}");
         assert!(wide.chars().count() <= 170, "got: {wide}");
 
-        // A full ten no longer fits the 120-column terminal the separator was
-        // sized for, so the line has to say what it left out instead of
-        // quietly listing nine of them.
+        // 120 columns cannot fit all 10 providers, so the tail reports the omitted count.
         let squeezed = line_text(provider_digest(&rows, 120));
         assert!(squeezed.contains("more → p"), "got: {squeezed}");
         assert!(squeezed.chars().count() <= 120, "got: {squeezed}");
 
-        // Narrow: whole segments go and the remainder is named, so the line
-        // never implies it listed everyone. Equal costs empty from the tail.
+        // Narrow terminal: drop whole segments from the tail on equal costs and count them.
         let narrow = line_text(provider_digest(&rows, 46));
         assert!(narrow.contains("more → p"), "got: {narrow}");
         assert!(!narrow.contains("Hermes"), "got: {narrow}");
@@ -3214,9 +3026,7 @@ mod tests {
 
     #[test]
     fn provider_digest_keeps_the_costliest_provider_however_narrow_it_gets() {
-        // The spender that dominates the account sits last in the enum order,
-        // so dropping by list position would hide exactly the number the line
-        // exists to show.
+        // Highest spender sits last in enum order to ensure dropping sorts by cost, not position.
         let idle = ProviderStats {
             total_tokens: 10,
             total_cost: 0.0,
@@ -3312,16 +3122,13 @@ mod tests {
         assert_eq!(quota_grid(&CARD_GRID, 80, 5), (3, 2));
         // Never more columns than there are cards.
         assert_eq!(quota_grid(&CARD_GRID, 400, 2), (2, 1));
-        // A terminal too narrow for even one card still gets a single column
-        // rather than a division by zero.
+        // Terminal narrower than one card still yields one column without dividing by zero.
         assert_eq!(quota_grid(&CARD_GRID, 10, 3), (1, 3));
         assert_eq!(quota_grid(&CARD_GRID, 120, 0), (0, 0));
     }
 
     #[test]
     fn grid_absorbs_a_new_provider_without_a_new_case() {
-        // The count only ever enters as a list length, so a sixth provider is
-        // placed by the same expression as the first.
         for n in 1..=8 {
             let (cols, rows) = quota_grid(&CARD_GRID, 120, n);
             assert!(cols >= 1 && cols <= n);
@@ -3335,8 +3142,7 @@ mod tests {
 
     #[test]
     fn grid_cells_always_yield_exactly_n_addressable_cards() {
-        // The render dispatch walks these cells in present-provider order, so a
-        // short or zero-width cell list would drop (or mis-place) a provider.
+        // Render dispatch indexes these cells in present-provider order, so length must equal n.
         for n in 0..=MAX_QUOTA_PANELS {
             for width in [80u16, 100, 120, 160, 200] {
                 let band = Rect::new(0, 0, width, grid_height(&CARD_GRID, width, n));
@@ -3358,9 +3164,7 @@ mod tests {
 
     #[test]
     fn grid_cards_never_shrink_below_the_readable_minimum() {
-        // The old band emitted constraints that over-committed the row and let
-        // the solver squeeze panels to 16 columns; the grid picks a column count
-        // the width can actually hold.
+        // Each cell stays within [min_w, max_w] whenever the terminal is at least min_w wide.
         for width in [74u16, 80, 96, 100, 120, 160, 200] {
             let band = Rect::new(
                 0,
@@ -3381,9 +3185,7 @@ mod tests {
 
     #[test]
     fn login_hint_survives_a_full_card() {
-        // A dead token on an otherwise-full snapshot: the actionable line must
-        // be on screen, not behind the `+N` marker, or a broken panel reads as
-        // a healthy one.
+        // Login hint stays visible above gauges even when other lines overflow behind "+N".
         let claude = ClaudeQuotaSnapshot {
             plan_type: Some("max 20x".into()),
             five_hour: Some(QuotaWindow::default()),
@@ -3402,9 +3204,7 @@ mod tests {
 
     #[test]
     fn claude_card_shortens_a_long_scoped_label() {
-        // The scoped label is a provider-supplied model name sharing the gauge
-        // label column with 5h / 7d, so the card cuts it rather than letting it
-        // push every bar to the right. The cut is marked, not silent.
+        // Long scoped model names truncate with an ellipsis instead of pushing gauge bars right.
         let claude = ClaudeQuotaSnapshot {
             five_hour: Some(QuotaWindow::default()),
             scoped_weekly: Some(QuotaWindow::default()),
@@ -3418,8 +3218,7 @@ mod tests {
 
     #[test]
     fn plan_line_shortens_the_plan_and_never_the_age() {
-        // The plan string is provider-supplied and unbounded; the age is the
-        // only signal a retained snapshot is stale, so the age always wins.
+        // Unbounded plan names truncate before the staleness age.
         let inner = card_inner_w(CARD_GRID.min_w);
         let text = line_text(plan_line(
             Some("copilot_pro_plus_enterprise"),
@@ -3442,8 +3241,7 @@ mod tests {
 
     #[test]
     fn card_counts_the_lines_it_could_not_show() {
-        // Six lines into five content rows: the card flags the remainder in its
-        // title instead of quietly ending at the border.
+        // Six lines in five content rows flags "+1" in the title and hides the last line.
         let card = QuotaCard {
             title: "Test",
             color: RatatuiColor::Gray,
@@ -3505,7 +3303,7 @@ mod tests {
         assert!(detail_line(&[], 40).is_none());
     }
 
-    /// Builds a `QuotaView` with every provider present, for Quota tab tests.
+    /// Returns a [`QuotaView`] with all providers marked present.
     fn every_provider<'a>(
         claude: &'a ClaudeQuotaSnapshot,
         codex: &'a CodexQuotaSnapshot,
@@ -3563,9 +3361,7 @@ mod tests {
         );
     }
 
-    /// Six pools outgrow the Quota tab's usual card, which grows to hold
-    /// them while the terminal has the rows and keeps its height when it does
-    /// not, flagging the rest.
+    /// Quota tab cards grow to fit tall multi-pool snapshots when rows permit, and otherwise flag hidden lines.
     #[test]
     fn quota_tab_grows_its_cards_to_the_tallest_while_every_provider_fits() {
         let pools = [
@@ -3660,8 +3456,7 @@ mod tests {
 
     #[test]
     fn quota_tab_says_how_many_providers_it_could_not_reach() {
-        // Two columns of one row is all a short terminal fits; the rest are
-        // counted in the footer rather than ending at the border unannounced.
+        // Short terminals count cards that did not fit in the footer.
         let rendered = render_quota_tab(80, 13);
         assert!(rendered.contains("hidden"), "got:\n{rendered}");
         assert!(rendered.contains("Claude"), "got:\n{rendered}");
@@ -3696,17 +3491,12 @@ mod tests {
         // A full share fills the bar; an empty one draws none of it.
         assert!(share_cell(100, 100, 20).starts_with('━'));
         assert!(!share_cell(0, 100, 20).starts_with('━'));
-        // No totals yet, or a column too narrow to say anything: draw nothing
-        // rather than a bar that means nothing.
+        // Zero total or width below the minimum renders empty.
         assert_eq!(share_cell(5, 0, 20), "");
         assert_eq!(share_cell(5, 100, 4), "");
     }
 
-    /// Renders a whole usage frame at `w`x`h` and returns its rows.
-    ///
-    /// Frame-level rather than unit-level on purpose: every piece of this
-    /// layout fits itself to a width it is handed, so the defects worth
-    /// catching are the ones where the width handed down is the wrong one.
+    /// Renders a full Usage tab frame at `w` x `h` and returns its screen rows.
     fn render_frame(w: u16, h: u16, provider_panel: bool) -> Vec<String> {
         let mut bench = UsageFrameBenchmark::new(w, h).expect("frame fixture");
         render_usage_frame(
@@ -3739,8 +3529,7 @@ mod tests {
         antigravity: true,
     };
 
-    /// Sizes worth pinning: the hard minimum, the common terminals, and one
-    /// very wide.
+    /// Terminal sizes exercised by full-frame layout tests (minimum, common, and wide).
     const FRAME_SIZES: [(u16, u16); 8] = [
         (USAGE_MIN_W, USAGE_MIN_H),
         (80, 24),
@@ -3752,11 +3541,7 @@ mod tests {
         (220, 50),
     ];
 
-    /// Asserts no cell on the row was cut mid-structure.
-    ///
-    /// `detail_line` only emits ` · ` between two parts it decided both fit,
-    /// and a `+N` marker is a promise that N things were held back — so a cell
-    /// ending on either is a line laid out for a width it did not get.
+    /// Asserts no cell in `row` ends on a clipped `·` separator or truncated `+` overflow marker.
     fn assert_no_clipped_markers(row: &str, context: &str) {
         for cell in row.split('│') {
             let cell = cell.trim_end();
@@ -3773,18 +3558,14 @@ mod tests {
 
     #[test]
     fn frame_never_draws_outside_its_own_width() {
-        // The provider panel is covered: it is centered over the frame at
-        // every terminal size, so an over-wide one would run off the edge here.
+        // Also exercise the centered provider panel overlay at every terminal size.
         for (w, h) in FRAME_SIZES {
             let plain = render_frame(w, h, false);
             for panel in [false, true] {
                 let context = format!("{w}x{h} panel={panel}");
                 for (y, row) in render_frame(w, h, panel).iter().enumerate() {
                     assert_eq!(row.chars().count(), usize::from(w), "{context}");
-                    // The provider panel hides the middle of the rows behind
-                    // it, and what is left of them either side can end
-                    // anywhere, so only the columns it drew over are checked;
-                    // the rest of the row was checked without it.
+                    // When the modal covers the middle of a row, check only the columns it overwrote; the underlying row is checked with `panel = false`.
                     let checked: String = if panel {
                         let changed: Vec<bool> = row
                             .chars()
@@ -3826,9 +3607,7 @@ mod tests {
     #[test]
     fn every_size_shows_the_provider_line_and_can_reach_the_panel() {
         for (w, h) in FRAME_SIZES {
-            // The provider line costs its row unconditionally, and drops the
-            // cheapest first, so the fixture's biggest spender survives at
-            // every size rather than at the wide ones only.
+            // The digest drops cheapest providers first, so the fixture's highest spender survives at every size.
             let screen = render_frame(w, h, false).join("\n");
             assert!(
                 screen.contains("Hermes $"),
@@ -3848,11 +3627,7 @@ mod tests {
 
     #[test]
     fn quota_tab_cards_are_built_for_the_cell_they_are_drawn_in() {
-        // Every "+N" on screen is a promise that N things were held back. If a
-        // card is laid out for a wider cell than it is drawn in, the marker
-        // itself is what gets cut — the promise loses its number, which is the
-        // exact shape of laying a card out against the spec maximum instead of
-        // the cell it gets. Codex's extras are sized to land on that boundary.
+        // Codex's extras sit on the truncation boundary, catching cards built for a wider width than their drawn cell.
         for (w, h) in [(100u16, 30u16), (120, 40), (160, 45), (220, 50)] {
             let codex = CodexQuotaSnapshot {
                 source: QuotaSource::Api,

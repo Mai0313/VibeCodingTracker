@@ -1,11 +1,6 @@
 //! Pluggable interactive TUI layouts, auto-discovered at compile time.
 //!
-//! `src/tui/build.rs` scans `src/tui/src/layouts/` for `<id>/mod.rs` folders and
-//! standalone `<id>.rs` files, generating `$OUT_DIR/layouts_registry.rs` with
-//! [`LAYOUTS`] and [`LAYOUT_IDS`]. Adding a new layout requires only dropping a
-//! new module into `src/tui/src/layouts/` that exports
-//! `pub static LAYOUT: <Type> = <Type>;` implementing [`TuiLayout`]; removing a
-//! layout is deleting its folder or file.
+//! `src/tui/build.rs` scans this directory for `<id>/mod.rs` folders and `<id>.rs` files, generating `$OUT_DIR/layouts_registry.rs` with [`LAYOUTS`] and [`LAYOUT_IDS`]. Each layout module exports a `static LAYOUT` visible to this module that implements [`TuiLayout`].
 
 use crate::display::analysis::{AnalysisRow, AnalysisUiState};
 use crate::display::app::Tab;
@@ -39,17 +34,16 @@ pub(crate) struct LayoutMeta {
     pub(crate) summary: &'static str,
 }
 
-/// Factory registered by each layout module under `src/tui/src/layouts/`.
+/// Factory registered by each layout module.
 pub(crate) trait TuiLayout: Sync {
-    /// Metadata for this layout.
+    /// Returns metadata for this layout.
     fn meta(&self) -> LayoutMeta;
 
     /// Creates a fresh per-session view instance holding this layout's UI state.
     fn create(&self) -> Box<dyn LayoutView>;
 }
 
-/// Borrowed application state passed into [`LayoutView::draw`],
-/// [`LayoutView::on_mouse`], and [`LayoutView::on_key`].
+/// Borrowed application state passed into [`LayoutView`] callbacks.
 pub(crate) struct LayoutContext<'a> {
     pub(crate) tab: Tab,
     pub(crate) time_range: TimeRange,
@@ -110,18 +104,15 @@ impl EventResult {
 
 /// Per-session stateful instance of a TUI layout.
 pub(crate) trait LayoutView {
-    /// Renders the entire terminal frame (`f.area()`), including navigation
-    /// chrome and the active tab's content.
+    /// Renders the entire terminal frame (`f.area()`), including navigation chrome and the active tab's content.
     ///
-    /// Keep the single-line controls footer on the bottom-most row of the frame
-    /// (`y = f.area().bottom() - 1`) so the host's OSC 8 hyperlink pass wraps
-    /// `Star on GitHub`.
+    /// Implementations must keep the single-line controls footer on the bottom row (`y = f.area().bottom() - 1`), where the host's OSC 8 hyperlink pass wraps `Star on GitHub`.
     fn draw(&mut self, f: &mut Frame, ctx: &mut LayoutContext<'_>);
 
     /// Handles mouse clicks and vertical scroll wheel events across the frame.
     fn on_mouse(&mut self, mouse: MouseInput, ctx: &mut LayoutContext<'_>) -> EventResult;
 
-    /// Gives the layout first refusal on keys when not on `Tab::Settings`.
+    /// Gives the layout first refusal on keys when not on [`Tab::Settings`].
     fn on_key(&mut self, key: KeyCode, ctx: &mut LayoutContext<'_>) -> EventResult {
         let _ = (key, ctx);
         EventResult::Ignored
@@ -132,8 +123,7 @@ pub(crate) trait LayoutView {
         let _ = (next, ctx);
     }
 
-    /// Customizes the `(key, description)` rows shown in the `?` help modal for
-    /// `tab`, or returns `None` to use the default list.
+    /// Returns custom `(key, description)` rows for the `?` help modal on `tab`, or `None` to use the default list.
     fn help_rows(&self, tab: Tab) -> Option<Vec<(&'static str, &'static str)>> {
         let _ = tab;
         None
@@ -173,16 +163,13 @@ impl TopBarHits {
     }
 }
 
-/// Whether `(column, row)` lies inside `rect`.
+/// Returns whether `(column, row)` lies inside `rect`.
 #[inline]
 pub(crate) fn contains(rect: Rect, column: u16, row: u16) -> bool {
     column >= rect.x && column < rect.right() && row >= rect.y && row < rect.bottom()
 }
 
-/// Handles mouse input on `Tab::Settings` for layouts using a horizontal top bar.
-///
-/// An open settings editor modal takes precedence over tab-bar clicks so
-/// clicking outside dismisses the modal instead of switching tabs behind it.
+/// Handles mouse input on [`Tab::Settings`] for layouts with a horizontal top bar, giving an open editor modal precedence over tab-bar clicks.
 pub(crate) fn handle_settings_mouse(
     mouse: MouseInput,
     ctx: &mut LayoutContext<'_>,
@@ -234,7 +221,7 @@ pub(crate) fn handle_top_bar_click(
     None
 }
 
-/// Renders the loading spinner, `Quota` tab, or `Settings` tab with `border_type`.
+/// Renders the loading/retry state, `Quota` tab, or `Settings` tab with `border_type`.
 pub(crate) fn render_standard_non_data(
     f: &mut Frame,
     body: Rect,
@@ -262,8 +249,7 @@ pub(crate) fn render_standard_non_data(
     }
 }
 
-/// Renders the standard single-row horizontal navigation bar into `area` and
-/// returns exact hit-test rectangles for every visible tab and time-range pill.
+/// Renders the single-row navigation bar into `area` and returns hit-test rectangles for visible tab and range pills.
 pub(crate) fn render_top_bar(
     f: &mut Frame,
     area: Rect,
@@ -274,8 +260,7 @@ pub(crate) fn render_top_bar(
     render_top_bar_styled(f, area, current, range, metrics, false)
 }
 
-/// Like [`render_top_bar`], optionally styling the active tab with a bold
-/// accent underline instead of an inverted pill.
+/// Like [`render_top_bar`], styling the active tab with a bold accent underline instead of an inverted pill when `underline_tabs` is set.
 pub(crate) fn render_top_bar_styled(
     f: &mut Frame,
     area: Rect,
@@ -387,9 +372,7 @@ pub(crate) fn render_top_bar_styled(
     hits
 }
 
-/// Picks the longest candidate table title (`full` -> `medium` -> `short`)
-/// that fits beside `note` inside a bordered table of width `table_w` without
-/// letting the right-aligned note overwrite the left title.
+/// Returns the longest title (`full`, `medium`, or `short`) that fits beside `note` in a bordered table of width `table_w`, truncating `short` with `…` if needed.
 pub(crate) fn fit_table_title(
     full: String,
     medium: String,
@@ -450,8 +433,7 @@ pub(crate) fn bar_spans(
     ]
 }
 
-/// Width-adaptive right-aligned toggle label for a Usage side pane switching
-/// between `Inspector` and `Providers`.
+/// Returns a width-adaptive toggle label for a Usage side pane switching between `Inspector` and `Providers`.
 pub(crate) fn side_toggle_note(inspector_active: bool, side_width: u16) -> Line<'static> {
     let theme = theme();
     if side_width >= 48 {
@@ -505,7 +487,7 @@ pub(crate) fn render_empty_inspector(
     );
 }
 
-/// One row inside a horizontal inspector strip column (used by `bento` and `drawer`).
+/// One row inside a horizontal inspector strip column.
 pub(crate) enum StripEntry {
     /// Key-value statistic row with an optional emphasis style on the value.
     Stat {
@@ -940,9 +922,7 @@ fn format_strip_entry(entry: &StripEntry, max_w: usize) -> Line<'static> {
 
 include!(concat!(env!("OUT_DIR"), "/layouts_registry.rs"));
 
-/// Resolves a configured layout name (case-insensitive) to a compiled-in
-/// [`TuiLayout`], falling back to [`vct_core::config::DEFAULT_LAYOUT`] and then
-/// the first discovered layout when an older config names a removed layout.
+/// Resolves `id` (case-insensitive, trimmed) to a compiled-in [`TuiLayout`], falling back to [`vct_core::config::DEFAULT_LAYOUT`] and then the first layout in [`LAYOUTS`].
 pub(crate) fn resolve(id: &str) -> &'static dyn TuiLayout {
     let trimmed = id.trim();
     LAYOUTS
@@ -960,8 +940,7 @@ pub(crate) fn resolve(id: &str) -> &'static dyn TuiLayout {
         .unwrap_or(LAYOUTS[0])
 }
 
-/// Instantiates a fresh [`LayoutView`] for the layout named `id`, returning
-/// both its canonical `meta().id` and the boxed view.
+/// Instantiates a fresh [`LayoutView`] for `id`, returning its canonical [`LayoutMeta::id`] and boxed view.
 pub(crate) fn create(id: &str) -> (&'static str, Box<dyn LayoutView>) {
     let plugin = resolve(id);
     (plugin.meta().id, plugin.create())
@@ -1023,7 +1002,7 @@ mod tests {
             assert_eq!(hits.hit_range(start + 1, 0), Some(range));
         }
 
-        // Narrow terminal drops metrics first, then ranges.
+        // At 60 columns, range pills do not fit and are omitted.
         let mut narrow_term = Terminal::new(TestBackend::new(60, 1)).unwrap();
         let mut narrow_hits = TopBarHits::default();
         narrow_term

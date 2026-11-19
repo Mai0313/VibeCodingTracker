@@ -1,7 +1,4 @@
-//! `hud` layout: 3-card KPI telemetry strip over a split master-detail
-//! workbench that activates starting at 94 columns (98 on Analysis), with
-//! width-adaptive `Inspector` / `Providers` side switching and full mouse
-//! support.
+//! `hud` layout: 3-card KPI strip over a split table-and-inspector view (starting at 94 columns on Usage, 98 on Analysis) with a toggleable `Inspector` / `Providers` side pane.
 
 use crate::display::analysis::{
     build_analysis_detail_sections, build_analysis_table_row, layout_analysis_columns,
@@ -1077,7 +1074,7 @@ mod tests {
             tight.join("\n")
         );
 
-        // Analysis tab shows KPI cards + Inspector and omits any bottom Providers block.
+        // Analysis tab shows KPI cards and omits any bottom Providers block.
         let a_screen = render(
             &mut view,
             104,

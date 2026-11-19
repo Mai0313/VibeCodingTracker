@@ -5,13 +5,9 @@ use std::collections::HashMap;
 use vct_core::pricing::{ModelPricingMap, fetch_model_pricing};
 use vct_core::usage::UsageData;
 
-/// Prints token usage to stdout as one `model: $cost` line per model.
+/// Prints `usage_data` to stdout as one `model: $cost` line per model.
 ///
-/// Rows are ordered by ascending cost. Prints `No usage data found` when there
-/// is nothing to show. A failed pricing fetch is swallowed, leaving
-/// LiteLLM-priced models at zero cost. When `merge` is set, rows sharing a base
-/// model name across provider prefixes (e.g. `openai/gpt-5.5` +
-/// `azure/gpt-5.5`) are collapsed into one.
+/// Rows are ordered by ascending cost. Prints `No usage data found` when empty. Pricing fetch errors are ignored, leaving LiteLLM-backed models at `$0.000000` while keeping provider-stored costs. When `merge` is `true`, collapses rows sharing a base model name across provider prefixes (for example, `openai/gpt-5.5` and `azure/gpt-5.5`).
 pub fn display_usage_text(usage_data: &UsageData, merge: bool) {
     if usage_data.models.is_empty() {
         println!("No usage data found");

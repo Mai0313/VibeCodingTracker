@@ -1,9 +1,6 @@
 //! Terminal presentation layer for the `vct` CLI.
 //!
-//! Renders the [`vct_core`] core roll-ups as an interactive
-//! ratatui TUI, a static comfy-table, plain text, or the quota panels. Depends
-//! only on the core crate, so the core stays free of any terminal dependency
-//! and a future GUI can reuse the core without pulling ratatui in.
+//! Renders [`vct_core`] roll-ups as an interactive ratatui TUI, static comfy-table output, plain text, or quota panels, keeping terminal dependencies out of `vct_core`.
 
 pub mod display;
 pub(crate) mod layouts;

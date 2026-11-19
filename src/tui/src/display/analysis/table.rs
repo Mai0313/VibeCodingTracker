@@ -1,7 +1,6 @@
 //! Static (non-interactive) table renderer for the `analysis` view.
 //!
-//! Prints two `comfy_table` grids to stdout: the per-model metrics with a
-//! `TOTAL` row, followed by the per-provider totals.
+//! Prints two `comfy_table` grids to stdout: per-model metrics with a `TOTAL` row, followed by per-provider totals.
 
 use crate::display::analysis::averages::{
     AnalysisRow, build_analysis_provider_rows, calculate_analysis_provider_totals_from_per_provider,
@@ -14,11 +13,9 @@ use owo_colors::OwoColorize;
 use vct_core::analysis::AnalysisData;
 use vct_core::utils::format_number;
 
-/// Print the `analysis` data as static, colored tables to stdout.
+/// Prints `analysis` as colored static tables to stdout.
 ///
-/// Renders a per-model metrics table with a `TOTAL` summary row, then a
-/// per-provider totals table. Prints a placeholder line and returns early when
-/// there are no rows.
+/// Renders a per-model metrics table with a `TOTAL` row followed by a per-provider totals table, or prints a placeholder line and returns early when `analysis.rows` is empty.
 pub fn display_analysis_table(analysis: &AnalysisData) {
     let data = &analysis.rows;
     if data.is_empty() {
@@ -106,8 +103,7 @@ pub fn display_analysis_table(analysis: &AnalysisData) {
     println!("{table}");
     println!();
 
-    // Each aggregated row is already scoped to a known source directory, so
-    // provider attribution needs no model-name guessing.
+    // Rows are already scoped to their source directory, so provider attribution needs no model-name guessing.
     let provider_totals = calculate_analysis_provider_totals_from_per_provider(
         &analysis.per_provider,
         &analysis.provider_days,

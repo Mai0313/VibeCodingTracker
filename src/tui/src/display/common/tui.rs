@@ -1,8 +1,6 @@
 //! Terminal scaffolding for the interactive TUI.
 //!
-//! Covers entering / leaving raw alternate-screen mode, the polling input
-//! loop ([`handle_input`]), the worker that drives periodic refreshes
-//! ([`RefreshWorker`]), and recently-changed row highlighting ([`UpdateTracker`]).
+//! Covers raw alternate-screen setup and restoration, bounded input polling ([`handle_input`], [`handle_key_input`]), background refresh workers ([`RefreshWorker`]), and row-change highlighting ([`UpdateTracker`]).
 
 use crate::display::common::table::{REPO_LABEL, REPO_URL};
 use crate::display::common::theme::{self, theme};
@@ -34,28 +32,20 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Whether the alternate-screen TUI currently owns the terminal.
-///
-/// Set while [`setup_terminal`] .. [`restore_terminal`] is active so the panic
-/// hook ([`force_restore_terminal`]) knows whether it must undo raw mode. A
-/// bare atomic (not tied to the `Terminal` handle) is what lets the panic hook,
-/// which has no access to that handle, restore the screen.
+/// Tracks whether the alternate-screen TUI currently owns the terminal for [`force_restore_terminal`].
 static IN_TUI: AtomicBool = AtomicBool::new(false);
 static TUI_OWNER: std::sync::Mutex<Option<thread::ThreadId>> = std::sync::Mutex::new(None);
 static TERMINAL_PANIC_HOOK: Once = Once::new();
 const LOADING_SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const MAX_DRAINED_EVENTS: usize = 64;
 
-/// Puts the terminal into raw mode and the alternate screen, returning a ready [`Terminal`].
+/// Enters raw mode, the alternate screen, and mouse capture, returning a ready [`Terminal`].
 ///
-/// Must be paired with [`restore_terminal`] before the process exits, otherwise
-/// the user's terminal is left in raw / alternate-screen mode.
+/// Pair with [`restore_terminal`] before exit to avoid leaving the terminal in raw or alternate-screen mode.
 ///
 /// # Errors
 ///
-/// Returns an error if enabling raw mode, switching to the alternate screen, or
-/// constructing the backing [`Terminal`] fails (typically because stdout is not
-/// a TTY or the terminal rejects the control sequences).
+/// Returns an error if enabling raw mode, switching to the alternate screen, enabling mouse capture, or creating the [`Terminal`] fails.
 pub fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     ensure_terminal_panic_hook();
     enable_raw_mode()?;
@@ -65,9 +55,7 @@ pub fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<io::Stdout>>
         let _ = execute!(stdout, LeaveAlternateScreen, Show);
         return Err(error.into());
     }
-    // Before mouse capture is turned on: the terminal's answer arrives on
-    // stdin, and an interleaved SGR mouse packet would keep `probe` waiting
-    // past the device-attributes reply (`OnceLock`, so re-entries do nothing).
+    // Probe before enabling mouse capture so interleaved SGR mouse packets on stdin cannot stall the OSC 10/11 reply; `probe` is a no-op after the first call.
     theme::probe();
     if let Err(error) = execute!(stdout, EnableMouseCapture) {
         let _ = disable_raw_mode();
@@ -86,13 +74,11 @@ pub fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<io::Stdout>>
     }
 }
 
-/// Restores the terminal to normal mode (disable raw mode, leave alternate screen, show cursor).
+/// Restores normal terminal mode (disables raw mode and mouse capture, leaves the alternate screen, and shows the cursor).
 ///
 /// # Errors
 ///
-/// Returns an error if disabling raw mode, leaving the alternate screen, or
-/// re-showing the cursor fails. On error the terminal may be left partially
-/// restored.
+/// Returns an error if any restoration step fails; all steps are still attempted, leaving the terminal partially restored on error.
 pub fn restore_terminal(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
 ) -> anyhow::Result<()> {
@@ -120,15 +106,17 @@ pub fn restore_terminal(
 
 /// RAII owner for an active terminal session.
 ///
-/// Every exit path attempts all cleanup steps. Explicitly calling
-/// [`Self::close`] surfaces cleanup failures; dropping remains best-effort so
-/// an earlier application error is not replaced during unwinding.
+/// Every exit path attempts all cleanup steps. [`Self::close`] and [`Self::finish`] surface cleanup errors; `Drop` ignores cleanup errors during unwinding.
 pub struct TerminalSession {
     terminal: Option<Terminal<CrosstermBackend<io::Stdout>>>,
 }
 
 impl TerminalSession {
     /// Enters raw alternate-screen mode with rollback on partial setup failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`setup_terminal`] returns.
     pub fn new() -> anyhow::Result<Self> {
         let terminal = setup_terminal()?;
         Ok(Self {
@@ -136,45 +124,38 @@ impl TerminalSession {
         })
     }
 
-    /// Mutable access to the ratatui terminal.
+    /// Returns mutable access to the underlying ratatui [`Terminal`].
     ///
     /// # Panics
     ///
-    /// Panics once the session has been closed by [`Self::close`] or
-    /// [`Self::finish`].
+    /// Panics after [`Self::close`] or [`Self::finish`] has closed the session.
     pub fn terminal_mut(&mut self) -> &mut Terminal<CrosstermBackend<io::Stdout>> {
         self.terminal.as_mut().expect("terminal session is open")
     }
 
-    /// Hands the terminal to `run` (an editor, say) and takes it back.
-    ///
-    /// The alternate screen and raw mode are left for the call and entered
-    /// again after it, and the next frame is drawn in full.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if leaving or re-entering the terminal mode fails.
+    /// Temporarily restores the terminal for `run` (such as an external editor), then re-enters the TUI and clears for a full redraw.
     ///
     /// # Panics
     ///
-    /// Panics once the session has been closed.
+    /// Panics after the session has been closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if leaving or re-entering terminal mode fails.
     pub fn suspend<T>(&mut self, run: impl FnOnce() -> T) -> anyhow::Result<T> {
         let terminal = self.terminal.as_mut().expect("terminal session is open");
         restore_terminal(terminal)?;
         let output = run();
-        // A fresh `Terminal` has empty buffers, so the next frame is drawn in
-        // full. `Terminal::clear` would do too, but it asks the terminal for
-        // the cursor position and fails on one that does not answer.
+        // Rebuild `Terminal` for empty buffers instead of calling `Terminal::clear`, which queries cursor position and fails on terminals that do not answer.
         self.terminal = None;
         let mut terminal = setup_terminal()?;
-        // Not every terminal empties the alternate screen on re-entry, and the
-        // empty buffers mean blank cells are never written.
+        // Explicitly clear the alternate screen because not every terminal clears it on re-entry and empty diff buffers skip blank cells.
         execute!(terminal.backend_mut(), Clear(ClearType::All))?;
         self.terminal = Some(terminal);
         Ok(output)
     }
 
-    /// Restores the terminal now, attempting every cleanup step.
+    /// Restores the terminal immediately, attempting every cleanup step.
     pub fn close(&mut self) -> anyhow::Result<()> {
         let Some(mut terminal) = self.terminal.take() else {
             return Ok(());
@@ -233,12 +214,7 @@ impl std::fmt::Display for RefreshWorkerError {
     }
 }
 
-/// How often a refresh worker writes its session ledger back to disk at most.
-///
-/// A session being used changes on every refresh, so saving on every tick
-/// would rewrite its provider's whole file every few seconds; once a minute
-/// bounds that, and what a crash loses is at most a minute of parse work,
-/// redone on the next launch.
+/// Minimum interval between disk writes of a refresh worker's session ledger.
 pub const LEDGER_SAVE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Single background loader with one active and one coalesced pending refresh.
@@ -262,10 +238,9 @@ impl<T: Send + 'static> RefreshWorker<T> {
         Self::new_with_init(refresh_secs, move || move || loader())
     }
 
-    /// Spawns a worker whose stateful loader is constructed inside the thread.
+    /// Spawns a worker whose stateful loader is constructed on the worker thread.
     ///
-    /// This supports thread-confined state such as `Rc`-backed pricing maps:
-    /// only the Send initializer crosses the thread boundary.
+    /// Only the `Send` initializer `init` crosses the thread boundary, allowing thread-confined state inside `F`.
     pub fn new_with_init<I, F>(refresh_secs: u64, init: I) -> Self
     where
         I: FnOnce() -> F + Send + 'static,
@@ -283,14 +258,7 @@ impl<T: Send + 'static> RefreshWorker<T> {
                 }
                 match command {
                     RefreshCommand::Run => {
-                        // Catching the panic keeps the worker answering the next
-                        // request; letting it unwind out of the loop drops the
-                        // result channel, and a disconnected worker never
-                        // refreshes again. It only fires on an unwinding
-                        // profile — dev, and the test profile that pins the
-                        // retry below. The release and dist profiles set
-                        // `panic = "abort"`, where the process is gone before
-                        // this is reached.
+                        // Catch panics on unwinding profiles (dev/test) so the worker stays alive for retries; release/dist use `panic = "abort"` and terminate before this runs.
                         let result =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut loader))
                                 .map_err(|_| {
@@ -337,8 +305,7 @@ impl<T: Send + 'static> RefreshWorker<T> {
 
     /// Starts an automatic refresh when the completion-based deadline is due.
     ///
-    /// Returns `true` only when this call dispatched a new load, allowing the
-    /// event loop to render its refreshing state immediately.
+    /// Returns `true` only when this call dispatched a new load.
     pub fn request_if_due(&mut self) -> bool {
         if !self.disconnected && !self.active && Instant::now() >= self.next_due {
             self.request();
@@ -347,15 +314,14 @@ impl<T: Send + 'static> RefreshWorker<T> {
         false
     }
 
-    /// Changes the automatic refresh interval, from the next completed load on.
+    /// Sets the automatic refresh interval (minimum 1 second), taking effect after the next completed load.
     pub fn set_interval(&mut self, refresh_secs: u64) {
         self.interval = Duration::from_secs(refresh_secs.max(1));
     }
 
-    /// Returns a completed load without blocking.
+    /// Returns a completed load without blocking, if one is ready.
     ///
-    /// The next automatic deadline starts now, after completion. If input was
-    /// coalesced while the job ran, the pending job is dispatched immediately.
+    /// Resets the automatic refresh deadline from completion time and immediately dispatches any coalesced pending request.
     pub fn try_result(&mut self) -> Option<std::result::Result<T, RefreshWorkerError>> {
         let result = match self.result_rx.try_recv() {
             Ok(result) => result,
@@ -376,7 +342,7 @@ impl<T: Send + 'static> RefreshWorker<T> {
         Some(result)
     }
 
-    /// Whether a loader is currently running.
+    /// Returns whether a loader invocation is currently running.
     pub fn is_active(&self) -> bool {
         self.active
     }
@@ -387,7 +353,7 @@ impl<T: Send + 'static> RefreshWorker<T> {
     }
 }
 
-/// Resolves the footer status consistently for every redraw path.
+/// Returns the footer status string for an active refresh or an unexpired failure window.
 pub fn refresh_status(active: bool, failure_until: Option<Instant>) -> Option<&'static str> {
     if active {
         Some("Refreshing...")
@@ -398,8 +364,7 @@ pub fn refresh_status(active: bool, failure_until: Option<Instant>) -> Option<&'
     }
 }
 
-/// Draws a centered loading spinner into `area`; it also works when `area` is
-/// very small.
+/// Draws a centered bordered loading spinner and `message` into `area`.
 pub fn render_loading(frame: &mut Frame, area: Rect, spinner_index: usize, message: &str) {
     let [middle] = Layout::vertical([Constraint::Length(3)])
         .flex(Flex::Center)
@@ -425,13 +390,9 @@ impl<T> Drop for RefreshWorker<T> {
     }
 }
 
-/// Best-effort terminal restore for the panic hook, when no [`Terminal`] handle
-/// is available.
+/// Best-effort terminal restore for the panic hook when no [`Terminal`] handle is available.
 ///
-/// No-ops unless the TUI currently owns the screen, so calling
-/// it from a panic that fired outside the TUI emits nothing. Every step is
-/// best-effort: a panic hook must never itself panic or early-return, so errors
-/// are ignored and the flag is cleared regardless.
+/// No-ops unless the TUI currently owns the terminal; clears the ownership flag and ignores all I/O errors.
 pub fn force_restore_terminal() {
     if !IN_TUI.swap(false, Ordering::SeqCst) {
         return;
@@ -446,12 +407,12 @@ pub fn force_restore_terminal() {
     );
 }
 
-/// Whether a TUI currently owns the process terminal.
+/// Returns whether a TUI session currently owns the process terminal.
 pub(crate) fn terminal_session_active() -> bool {
     IN_TUI.load(Ordering::SeqCst)
 }
 
-/// Whether the current thread owns the active TUI session.
+/// Returns whether the current thread owns the active TUI session.
 pub(crate) fn current_thread_owns_terminal() -> bool {
     let owner = TUI_OWNER
         .lock()
@@ -461,7 +422,7 @@ pub(crate) fn current_thread_owns_terminal() -> bool {
         .is_some_and(|owner| *owner == thread::current().id())
 }
 
-/// Decides whether a panic must restore an active terminal session.
+/// Returns whether a panic must restore an active terminal session.
 pub(crate) fn panic_requires_terminal_restore(
     tui_active: bool,
     owner_thread: bool,
@@ -474,11 +435,9 @@ fn panic_delegates_to_previous(tui_active: bool, restore_terminal: bool) -> bool
     !tui_active || restore_terminal
 }
 
-/// Installs terminal panic protection once while preserving the previous hook.
+/// Installs the terminal panic hook once while chaining to the previous hook.
 ///
-/// Owner-thread panics restore the terminal before the previous hook runs. A
-/// caught background panic does not delegate while the TUI remains active, so
-/// it cannot print through the alternate screen.
+/// Owner-thread panics (and aborting panics) restore the terminal before delegating to the previous hook; caught background panics skip delegation while the TUI remains active.
 pub fn ensure_terminal_panic_hook() {
     TERMINAL_PANIC_HOOK.call_once(|| {
         let previous = std::panic::take_hook();
@@ -506,27 +465,19 @@ fn set_tui_owner(owner: Option<thread::ThreadId>) {
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = owner;
 }
 
-/// Layers an OSC 8 terminal hyperlink over the repo label the footer just drew.
+/// Layers an OSC 8 terminal hyperlink pointing to [`REPO_URL`] over the rendered [`REPO_LABEL`] on the bottom row of `buffer`.
 ///
-/// ratatui's cell buffer can't carry the escape sequence itself (the bytes would
-/// throw off width accounting), so this runs *after* `terminal.draw()`: it finds
-/// the plain [`REPO_LABEL`] on the frame's bottom row and re-emits the identical
-/// glyphs wrapped in OSC 8, pointing at [`REPO_URL`]. The visible text is
-/// unchanged, so terminals without hyperlink support just ignore the wrapper.
-///
-/// It re-applies every frame because a redraw (resize, refresh) repaints the
-/// footer as plain text; writing the same bytes again is cheap and idempotent.
+/// Call after `terminal.draw()` on every frame; ratatui's cell buffer cannot hold raw escape sequences without breaking width accounting, and redraws repaint the footer as plain text. No-ops when [`REPO_LABEL`] is absent from the bottom row.
 ///
 /// # Errors
 ///
-/// Returns an error if writing the escape sequence to stdout fails.
+/// Returns an error if writing or flushing the escape sequence to stdout fails.
 pub fn overlay_repo_hyperlink(buffer: &Buffer) -> io::Result<()> {
     let Some((x, y)) = find_label_start(buffer) else {
         return Ok(());
     };
 
-    // OSC 8 open (params ; URL, ST-terminated), then dim + underline to match
-    // the label ratatui drew, then reset, then the empty OSC 8 close.
+    // Emit OSC 8 open, dim + underline matching the ratatui cell, reset, and OSC 8 close.
     let color = match theme().dim {
         Color::Rgb(r, g, b) => format!("38;2;{r};{g};{b}"),
         _ => "90".to_string(),
@@ -540,8 +491,7 @@ pub fn overlay_repo_hyperlink(buffer: &Buffer) -> io::Result<()> {
     stdout.flush()
 }
 
-/// Finds the `(x, y)` of the first cell of [`REPO_LABEL`] on the frame's bottom
-/// row, or `None` when it was truncated off a narrow terminal.
+/// Returns the `(x, y)` cell coordinates of [`REPO_LABEL`] on the bottom row of `buffer`, or `None` if absent.
 fn find_label_start(buffer: &Buffer) -> Option<(u16, u16)> {
     let area = buffer.area;
     if area.width == 0 || area.height == 0 {
@@ -549,8 +499,7 @@ fn find_label_start(buffer: &Buffer) -> Option<(u16, u16)> {
     }
     // The controls footer is the bottom-most row of the frame.
     let y = area.bottom() - 1;
-    // REPO_LABEL is ASCII, so every byte index is a char boundary and each cell
-    // holds exactly one of its characters.
+    // `REPO_LABEL` is ASCII, so each byte corresponds to one single-width cell.
     let len = REPO_LABEL.len();
     let last_x = area.right().checked_sub(len as u16)?;
     for x in area.left()..=last_x {
@@ -566,17 +515,13 @@ fn find_label_start(buffer: &Buffer) -> Option<(u16, u16)> {
     None
 }
 
-/// Handle terminal events and return the action to take.
+/// Polls for terminal events and returns the mapped [`InputAction`].
 ///
-/// Blocks up to 100 ms for the first event, then drains a bounded batch of
-/// already-buffered events. Batching collapses resize bursts without allowing a
-/// continuous event stream to postpone redraw indefinitely.
-/// Returns [`InputAction::Continue`] when the poll times out with no event.
+/// Blocks up to 100 ms for the first event, then drains up to 64 already-buffered events to coalesce resize and navigation bursts without starving redraws. Returns [`InputAction::Continue`] on timeout.
 ///
 /// # Errors
 ///
-/// Returns an error if polling for or reading a terminal event fails (an
-/// underlying crossterm I/O error on the event source).
+/// Returns an error if polling or reading a terminal event fails.
 pub fn handle_input() -> anyhow::Result<InputAction> {
     handle_input_from(&mut CrosstermEventSource)
 }
@@ -609,9 +554,7 @@ fn handle_input_from(source: &mut impl EventSource) -> anyhow::Result<InputActio
     let mut drained = 0usize;
     loop {
         match source.read()? {
-            // Windows emits Press/Repeat/Release for a single keystroke while
-            // Unix only emits Press; drop Release so one keypress isn't counted
-            // twice (which would double every nav step).
+            // Ignore `KeyEventKind::Release` (emitted on Windows alongside Press/Repeat) so one keystroke is not counted twice.
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 if key.code == KeyCode::Char('q')
                     || (key.code == KeyCode::Char('c')
@@ -641,8 +584,7 @@ fn handle_input_from(source: &mut impl EventSource) -> anyhow::Result<InputActio
                 if key.code == KeyCode::Char('r') || key.code == KeyCode::Char('R') {
                     return Ok(InputAction::Refresh);
                 }
-                // Navigation accumulates across the drained batch so a held key
-                // collapses into a single net move per tick.
+                // Accumulate arrow navigation across the drained batch so held keys collapse into one net move per tick.
                 match key.code {
                     KeyCode::Up => nav.lines -= 1,
                     KeyCode::Down => nav.lines += 1,
@@ -689,16 +631,13 @@ fn handle_input_from(source: &mut impl EventSource) -> anyhow::Result<InputActio
     }
 }
 
-/// Waits up to 100 ms for an event and hands a key press back unmapped, for a
-/// view that reads keys itself (a settings form, a text input).
+/// Polls up to 100 ms for an event and returns key presses unmapped as [`InputAction::Key`].
 ///
-/// Only `Ctrl+C` ([`InputAction::Quit`]), primary mouse clicks
-/// ([`InputAction::Click`]) and wheel ticks ([`InputAction::Scroll`]) are
-/// mapped here; cursor motion is drained so it does not queue behind keys.
+/// Maps `Ctrl+C` to [`InputAction::Quit`], left clicks to [`InputAction::Click`], and wheel ticks to [`InputAction::Scroll`], while draining buffered resize and cursor-motion events.
 ///
 /// # Errors
 ///
-/// Returns an error if polling for or reading a terminal event fails.
+/// Returns an error if polling or reading a terminal event fails.
 pub fn handle_key_input() -> anyhow::Result<InputAction> {
     handle_key_input_from(&mut CrosstermEventSource)
 }
@@ -755,17 +694,15 @@ fn handle_key_input_from(source: &mut impl EventSource) -> anyhow::Result<InputA
     }
 }
 
-/// A net navigation move accumulated from one [`handle_input`] batch.
-///
-/// `lines` is single-row steps (arrow keys), summed across the drained event
-/// batch so a held key collapses into one net move per tick.
+/// Net vertical navigation delta accumulated from one [`handle_input`] batch.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NavDelta {
+    /// Net row offset (negative moves up, positive moves down).
     pub lines: i64,
 }
 
 impl NavDelta {
-    /// Whether this delta would move the selection at all.
+    /// Returns whether this delta is non-zero.
     pub fn is_active(&self) -> bool {
         self.lines != 0
     }
@@ -807,8 +744,7 @@ pub enum InputAction {
     StepRange(isize),
     /// User moved the sort one column left (`←`) or right (`→`).
     StepSort(isize),
-    /// User toggled the Provider Usage panel (`p` / `P`); usage view only,
-    /// ignored elsewhere.
+    /// User toggled the Provider Usage panel (`p` / `P`).
     TogglePane,
     /// User asked to re-fetch and redraw (`r` / `R`).
     Refresh,
@@ -816,15 +752,14 @@ pub enum InputAction {
     Navigate(NavDelta),
     /// A key press, unmapped; only [`handle_key_input`] returns it.
     Key(KeyCode),
-    /// Terminal was resized — redraw the current frame at the new size
-    /// without re-fetching session data.
+    /// Terminal was resized; redraw at the new size without re-fetching.
     Resize,
     /// No actionable event; keep the current frame and loop.
     Continue,
 }
 
 impl InputAction {
-    /// Extracts a [`MouseInput`] when this action came from the mouse.
+    /// Returns the underlying [`MouseInput`] when this action originated from the mouse.
     pub fn mouse(self) -> Option<MouseInput> {
         match self {
             Self::Click { column, row } => Some(MouseInput::Click { column, row }),
@@ -834,12 +769,9 @@ impl InputAction {
     }
 }
 
-/// Tracks per-row changes to drive temporary highlighting of recently-updated rows.
+/// Tracks per-row hash changes to highlight recently updated rows.
 ///
-/// To bound memory it stores a hash of each row's data rather than a clone, and
-/// records the [`Instant`] a row last changed. `max_tracked` caps the number of
-/// retained entries (enforced by [`cleanup`](Self::cleanup), not by
-/// [`track_update`](Self::track_update)).
+/// Stores a hash and last-change [`Instant`] per key rather than cloning row data. The `max_tracked` cap is enforced by [`Self::cleanup`], not by [`Self::track_update`].
 pub struct UpdateTracker {
     last_update_times: std::collections::HashMap<String, Instant>,
     previous_hashes: std::collections::HashMap<String, u64>,
@@ -847,8 +779,7 @@ pub struct UpdateTracker {
     highlight_duration: Duration,
 }
 
-/// Hashes any `Hash` value with [`DefaultHasher`](std::collections::hash_map::DefaultHasher)
-/// — used to store a compact fingerprint of a row instead of a full clone.
+/// Returns a compact [`DefaultHasher`](std::collections::hash_map::DefaultHasher) fingerprint of `data`.
 fn hash_of<T: std::hash::Hash>(data: &T) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::Hasher;
@@ -868,12 +799,9 @@ impl UpdateTracker {
         }
     }
 
-    /// Records `data` for `key`, marking it updated if its hash differs from the previous one.
+    /// Records `data` for `key`, marking it updated when its hash differs from the previous value or `key` is first seen.
     ///
-    /// A first-seen `key` counts as changed and gets a fresh timestamp. Uses
-    /// [`DefaultHasher`](std::collections::hash_map::DefaultHasher) over `data`
-    /// to avoid retaining a full copy. This never evicts entries — call
-    /// [`cleanup`](Self::cleanup) to bound growth.
+    /// Does not evict entries; call [`Self::cleanup`] to enforce `max_tracked`.
     pub fn track_update<T: std::hash::Hash>(&mut self, key: String, data: &T) {
         let hash = hash_of(data);
 
@@ -889,23 +817,16 @@ impl UpdateTracker {
         self.previous_hashes.insert(key, hash);
     }
 
-    /// Records `data`'s hash for `key` as the baseline **without** marking it
-    /// updated.
+    /// Records `data`'s hash for `key` as a baseline without marking it updated.
     ///
-    /// Used when rows are relabeled but not actually changed — e.g. toggling the
-    /// provider-merge view swaps `openai/gpt-5.5` for `gpt-5.5`. Priming the new
-    /// key means the next [`track_update`](Self::track_update) compares against a
-    /// real baseline instead of treating it as first-seen and green-flashing the
-    /// whole table on the next refresh.
+    /// Prevents a key rename (such as toggling provider-prefix merging) from flashing the row as newly changed on the next [`Self::track_update`].
     pub fn prime<T: std::hash::Hash>(&mut self, key: String, data: &T) {
         self.previous_hashes.insert(key, hash_of(data));
     }
 
-    /// Drops tracked entries whose key is no longer present, then enforces the `max_tracked` cap.
+    /// Removes entries absent from `current_keys`, trims remaining entries to `max_tracked`, and shrinks the internal maps.
     ///
-    /// Entries for keys not in `current_keys` are removed first. If more than
-    /// `max_tracked` remain, an arbitrary subset is then dropped to fit the cap.
-    /// Finally both maps are shrunk to release excess capacity.
+    /// When trimming to `max_tracked`, evicted keys are chosen in arbitrary `HashMap` iteration order.
     pub fn cleanup<I>(&mut self, current_keys: I)
     where
         I: IntoIterator<Item = String>,
@@ -917,7 +838,7 @@ impl UpdateTracker {
         self.last_update_times
             .retain(|key, _| current_keys.contains(key));
 
-        // NOTE: HashMap iteration order is unspecified, so this is not "most recent".
+        // HashMap iteration order is unspecified, so trimming is not LRU.
         if self.previous_hashes.len() > self.max_tracked {
             let keys_to_remove: Vec<_> = self
                 .previous_hashes
@@ -935,10 +856,7 @@ impl UpdateTracker {
         self.last_update_times.shrink_to_fit();
     }
 
-    /// Returns whether `key` changed within the configured highlight window.
-    ///
-    /// `false` for keys never tracked or whose last change is older than
-    /// `highlight_duration`.
+    /// Returns whether `key` changed within the configured highlight duration.
     pub fn is_recently_updated(&self, key: &str) -> bool {
         self.last_update_times
             .get(key)
@@ -949,12 +867,7 @@ impl UpdateTracker {
     }
 }
 
-/// Scroll + selection state for a scrollable TUI table.
-///
-/// Bundles the ratatui [`TableState`] (drives auto-scroll + row highlight) and
-/// [`ScrollbarState`] (drives the side scrollbar). The event loop calls
-/// [`apply`](Self::apply) / [`sync`](Self::sync) to move and reconcile the
-/// selection.
+/// Scroll and selection state for a scrollable TUI table, pairing [`TableState`] and [`ScrollbarState`].
 #[derive(Debug, Default)]
 pub struct ScrollState {
     /// Selection + offset, fed to `render_stateful_widget`.
@@ -964,7 +877,7 @@ pub struct ScrollState {
 }
 
 impl ScrollState {
-    /// Creates an empty state with no selection (set on the first `sync`).
+    /// Creates an empty state with no active selection.
     pub fn new() -> Self {
         Self {
             table: TableState::default(),
@@ -972,12 +885,9 @@ impl ScrollState {
         }
     }
 
-    /// Reconciles the selection with a freshly aggregated row set.
+    /// Reconciles the selection against a refreshed list of selectable `models` (excluding any pinned total row).
     ///
-    /// Rows can be reordered or appear/disappear between refreshes, so the
-    /// previously selected `prev_model` is matched by name first; failing that
-    /// the existing index is clamped into range. `models` lists the selectable
-    /// model names (excluding any pinned TOTAL row).
+    /// Matches `prev_model` by name first; otherwise clamps the existing selection index into range, or clears it when `models` is empty.
     pub fn sync(&mut self, prev_model: Option<&str>, models: &[String]) {
         if models.is_empty() {
             self.table.select(None);
@@ -990,10 +900,7 @@ impl ScrollState {
         self.table.select(Some(idx.min(max)));
     }
 
-    /// Applies a navigation delta, clamping the selection to `[0, selectable-1]`.
-    ///
-    /// `selectable` is the number of selectable rows (model rows, not the
-    /// pinned TOTAL).
+    /// Applies `nav`, clamping the selection to `[0, selectable - 1]` (or clearing it when `selectable == 0`).
     pub fn apply(&mut self, nav: NavDelta, selectable: usize) {
         if selectable == 0 {
             self.table.select(None);
@@ -1092,8 +999,7 @@ mod tests {
 
     #[test]
     fn find_label_start_is_none_when_the_label_was_dropped() {
-        // Too narrow for the label → the footer drops it whole, so there is
-        // nothing to hyperlink (and nothing clipped mid-word either).
+        // Too narrow for the label: the footer drops it whole, leaving nothing to hyperlink or clip.
         let area = Rect::new(0, 0, 40, 1);
         let mut buf = Buffer::empty(area);
         create_controls(&[], area.width).render(area, &mut buf);
@@ -1171,8 +1077,7 @@ mod tests {
         assert_eq!(press(KeyCode::Char('q')), InputAction::Quit);
         assert_eq!(press(KeyCode::Char('r')), InputAction::Refresh);
         assert_eq!(press(KeyCode::Char('m')), InputAction::Continue);
-        // Esc is distinct from quit so a view with an overlay can back out of it
-        // instead of exiting.
+        // Esc is distinct from Quit so views with overlays can dismiss them without exiting.
         assert_eq!(press(KeyCode::Esc), InputAction::Close);
         assert_eq!(press(KeyCode::Char('1')), InputAction::Continue);
         assert_eq!(press(KeyCode::Char('3')), InputAction::Continue);
