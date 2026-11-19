@@ -1,8 +1,6 @@
-//! Minimal GitHub Releases client used by the self-updater.
+//! Minimal GitHub Releases client for the self-updater.
 //!
-//! Wraps the "latest release" REST endpoint and a streaming file download
-//! using a blocking `reqwest` client. Only the fields the updater needs are
-//! deserialized from the API response.
+//! Wraps the latest-release REST endpoint and streaming asset downloads using a blocking `reqwest` client, deserializing only the fields the updater uses.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -11,8 +9,7 @@ use std::time::Duration;
 /// GitHub REST endpoint for the repository's latest release.
 pub(crate) const GITHUB_API_RELEASES_URL: &str =
     "https://api.github.com/repos/Mai0313/VibeCodingTracker/releases/latest";
-/// `User-Agent` header value (`vibe_coding_tracker/<version>`), required by the
-/// GitHub API. Pinned to the product name rather than this crate's name.
+/// `User-Agent` header required by the GitHub API, pinned to the product name rather than the crate name.
 const USER_AGENT: &str = concat!("vibe_coding_tracker/", env!("CARGO_PKG_VERSION"));
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -46,24 +43,16 @@ pub struct GitHubAsset {
 ///
 /// # Errors
 ///
-/// Returns an error if the HTTP client cannot be built, if the request fails,
-/// if GitHub responds with a non-success status, or if the response body is
-/// not the expected release JSON.
+/// Returns an error if the HTTP client cannot be built, the request fails, GitHub returns a non-success status, or the body is not valid release JSON.
 pub fn fetch_latest_release() -> Result<GitHubRelease> {
     fetch_latest_release_from(GITHUB_API_RELEASES_URL)
 }
 
-/// Fetches the latest release from an explicit endpoint URL.
-///
-/// The injectable counterpart of [`fetch_latest_release`]: production passes the
-/// real GitHub endpoint, tests point `url` at a local mock server so no real API
-/// is reached.
+/// Fetches the latest release JSON from `url`.
 ///
 /// # Errors
 ///
-/// Returns an error if the HTTP client cannot be built, if the request fails,
-/// if the server responds with a non-success status, or if the response body is
-/// not the expected release JSON.
+/// Returns an error if the HTTP client cannot be built, the request fails, the server returns a non-success status, or the body is not valid release JSON.
 pub fn fetch_latest_release_from(url: &str) -> Result<GitHubRelease> {
     fetch_latest_release_from_with_timeout(url, RELEASE_TIMEOUT)
 }
@@ -95,16 +84,11 @@ pub(crate) fn fetch_latest_release_from_with_timeout(
     Ok(release)
 }
 
-/// Downloads the file at `url` and writes it to `dest`.
-///
-/// Streams the response body straight to the destination file rather than
-/// buffering it in memory, and returns the number of bytes written.
+/// Streams the file at `url` into `dest` and returns the number of bytes written.
 ///
 /// # Errors
 ///
-/// Returns an error if the HTTP client cannot be built, if the request fails,
-/// if the server responds with a non-success status, if `dest` cannot be
-/// created, or if writing the body to disk fails.
+/// Returns an error if the HTTP client cannot be built, the request fails, the server returns a non-success status, `dest` cannot be created, or writing fails.
 pub fn download_file(url: &str, dest: &std::path::Path) -> Result<u64> {
     download_file_with_timeout(url, dest, DOWNLOAD_TIMEOUT)
 }

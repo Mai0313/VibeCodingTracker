@@ -1,14 +1,6 @@
-//! Frame layout, plus the comfy-table and ratatui cell / table builders shared
-//! across both views.
+//! Frame layout, process-metrics helpers, and shared comfy-table / ratatui widget builders.
 //!
-//! The builders are pure widget constructors that encode the common styling so
-//! the static-table and TUI renderers stay visually consistent; the summary
-//! bar's process-metrics helpers are the one exception, sampling this process's
-//! own CPU and memory.
-//! A recurring convention: the leading label column(s) are left-aligned and
-//! every trailing (numeric) column is right-aligned. The comfy-table helpers
-//! left-align the first two (index 0 and 1); the ratatui `styled_row` helper
-//! takes the number of left-aligned columns as its `left_cols` argument.
+//! Leading label columns are left-aligned and trailing numeric columns are right-aligned: the comfy-table helpers left-align columns 0 and 1, while [`styled_row`] takes the count in `left_cols`.
 
 use crate::display::common::theme::theme;
 use crate::display::common::tui::ScrollState;
@@ -25,25 +17,14 @@ use ratatui::{
 };
 use sysinfo::System;
 
-/// Normalizes a process's raw (per-core-summed) CPU usage into a 0-100% share
-/// of the machine by dividing by the CPU count.
-///
-/// `cores` must be the **same basis** sysinfo scales `cpu_usage()` against, i.e.
-/// `sys.cpus().len()` (the host's logical CPUs read from `/proc/stat`). Using
-/// that basis keeps the reading a true machine share even under CPU affinity or
-/// a cgroup CPU quota, where `available_parallelism()` would report a smaller
-/// count and inflate the percentage.
+/// Normalizes sysinfo's summed per-core CPU percentage into `[0.0, 100.0]` using `cores` (`sys.cpus().len()`).
 fn normalized_cpu(raw: f32, cores: f32) -> f32 {
     (raw / cores).clamp(0.0, 100.0)
 }
 
-/// Refreshes only this process's CPU + memory in `sys` (skipping disk / exe /
-/// tasks), pruning any dead entry. This is the single source of the "our own
-/// process, cheap metrics only" contract shared by every summary-bar refresh —
-/// deliberately narrower than sysinfo's default `refresh_processes`. On Linux it
-/// reads this process's stat plus `/proc/stat` for the CPU-time delta (a couple
-/// of small reads), cheap enough to run on a fast metrics tick. `.with_cpu()`
-/// also populates `sys.cpus()`, which `process_metrics` uses to normalize CPU%.
+/// Refreshes only `pid`'s CPU and memory metrics in `sys`, pruning dead entries.
+///
+/// Skips disk, executable, and task refreshes to stay cheap on a fast metrics tick.
 pub fn refresh_process_metrics(sys: &mut System, pid: sysinfo::Pid) {
     sys.refresh_processes_specifics(
         sysinfo::ProcessesToUpdate::Some(&[pid]),
@@ -54,36 +35,27 @@ pub fn refresh_process_metrics(sys: &mut System, pid: sysinfo::Pid) {
     );
 }
 
-/// One-time init for the summary-bar metrics `System`, called once after
-/// `System::new()` before the refresh loop.
+/// Initializes `sys` for [`process_metrics`] and takes the initial sample for `pid`.
 ///
-/// It populates the CPU list (`refresh_cpu_all`) so `process_metrics` can read
-/// `sys.cpus().len()` as the CPU% divisor, then primes this process's first
-/// sample. The CPU-list step is **required**: a process-only refresh does not
-/// initialize `sys.cpus()` on macOS, which would leave the divisor at 1 and
-/// over-report CPU%. The list is stable, so it is never refreshed again — the
-/// per-tick path stays [`refresh_process_metrics`].
+/// Populates `sys.cpus()` once via `refresh_cpu_all()` (required on macOS, where a process-only refresh leaves the CPU list empty and skews the CPU% divisor); subsequent ticks only need [`refresh_process_metrics`].
 pub fn init_process_metrics(sys: &mut System, pid: sysinfo::Pid) {
     sys.refresh_cpu_all();
     refresh_process_metrics(sys, pid);
 }
 
-/// Display width of an ASCII footer fragment (labels / formatted numbers are
-/// ASCII, so char count equals column count).
+/// Returns the display column width of an ASCII footer fragment.
 fn seg_width(s: &str) -> usize {
     s.chars().count()
 }
 
-/// This process's resident memory in MB and its CPU use as a 0-100% share of
-/// the machine, both `0.0` when `sys` has no entry for `pid`.
+/// Returns `(memory_mb, cpu_percent)` for `pid`, or `(0.0, 0.0)` when `sys` has no entry for `pid`.
 ///
-/// `sys` is expected to have been refreshed by the caller before this call.
+/// `cpu_percent` is normalized to `[0.0, 100.0]` of total host capacity; the caller must have initialized `sys` with [`init_process_metrics`] and refreshed it beforehand.
 pub fn process_metrics(sys: &System, pid: sysinfo::Pid) -> (f64, f32) {
     let memory_mb = sys
         .process(pid)
         .map_or(0.0, |p| p.memory() as f64 / 1024.0 / 1024.0);
-    // Divide by `sys.cpus().len()` (sysinfo's own basis, populated by
-    // `init_process_metrics`); `.max(1)` guards the empty-CPU-list case.
+    // Divide by `sys.cpus().len()` (sysinfo's CPU% basis, populated by `init_process_metrics`), clamping to 1 if empty.
     let cores = sys.cpus().len().max(1) as f32;
     let cpu_percent = sys
         .process(pid)
@@ -99,25 +71,16 @@ pub const REPO_URL: &str = "https://github.com/Mai0313/VibeCodingTracker";
 /// The hints every tab's footer ends with.
 const CORE_HINTS: [(&str, &str); 3] = [("tab", "view"), ("?", "help"), ("q", "quit")];
 
-/// Builds the single-line key-hint footer with no status.
-///
-/// This is the no-status shorthand for [`create_controls_with_status`].
+/// Builds the single-line key-hint footer with no status (shorthand for [`create_controls_with_status`]).
 pub fn create_controls(hints: &[(&str, &str)], width: u16) -> Paragraph<'static> {
     create_controls_with_status(hints, None, width)
 }
 
-/// Builds the footer every tab shares: `hints` as `(key, what it does)` pairs,
-/// the hints common to all tabs, an optional status in its color, and the
-/// GitHub repo label at the right edge.
+/// Builds the shared single-line footer with tab `hints`, core hints, an optional colored `status`, and the right-aligned repository label.
 ///
-/// What does not fit `width` is dropped whole rather than clipped mid-word, in
-/// this order: the repo label, then `hints` from the right. The common hints
-/// stay, since `?` lists whatever was dropped. A status too long to sit beside
-/// them takes the row: it is the only place a failure is reported.
+/// Elements that do not fit `width` are dropped whole rather than clipped: first the repository label, then `hints` from the right. Core hints remain unless `status` alone cannot fit alongside them, in which case `status` takes the full row.
 ///
-/// The repo label is drawn as plain underlined text; a terminal hyperlink is
-/// layered on afterward by
-/// [`overlay_repo_hyperlink`](super::tui::overlay_repo_hyperlink).
+/// The repository label is drawn as plain underlined text; call [`overlay_repo_hyperlink`](super::tui::overlay_repo_hyperlink) after drawing to attach the OSC 8 hyperlink.
 pub fn create_controls_with_status(
     hints: &[(&str, &str)],
     status: Option<(&str, RatatuiColor)>,
@@ -176,14 +139,12 @@ pub fn create_controls_with_status(
     Paragraph::new(Line::from(spans))
 }
 
-/// Rows the scrollable content pane is never squeezed below. The block border,
-/// header row and header margin eat 4, so this keeps ~2 body rows alive.
+/// Minimum height in rows reserved for the scrollable content pane (4 rows for border, header, and margin, leaving at least 2 body rows).
 pub const CONTENT_MIN_H: u16 = 6;
 /// Rows the frame always spends below the content: the controls line.
 pub const FOOTER_H: u16 = 1;
 
-/// Chunk rects for a vertically stacked table pane (`content`, optional `band`,
-/// and `controls`), each spanning the width of the input `area`.
+/// Vertical layout regions (`content`, optional `band`, and `controls`) spanning the full input width.
 pub struct FrameChunks {
     /// Scrollable main table area.
     pub content: Rect,
@@ -193,8 +154,7 @@ pub struct FrameChunks {
     pub controls: Rect,
 }
 
-/// Splits `area` vertically into `content` (floored at [`CONTENT_MIN_H`]), an
-/// optional `band_height`-row band, and a 1-row `controls` footer.
+/// Splits `area` vertically into `content` (at least [`CONTENT_MIN_H`] rows), an optional `band_height`-row band, and a 1-row `controls` footer.
 pub fn frame_layout(area: Rect, band_height: u16) -> FrameChunks {
     let mut constraints: Vec<Constraint> = Vec::with_capacity(3);
     constraints.push(Constraint::Min(CONTENT_MIN_H));
@@ -231,18 +191,13 @@ pub struct ColumnSpec {
     pub header: &'static str,
     /// Column width in cells.
     pub width: u16,
-    /// Drop order when the pane is too narrow: the highest rank goes first.
-    /// The columns a reader would miss most carry the lowest ranks.
+    /// Drop priority when narrowing the pane; higher ranks are dropped first.
     pub drop_rank: u8,
 }
 
-/// Chooses which numeric columns survive in `inner` content columns.
+/// Returns `(kept_indices, dropped_count)` for numeric columns that fit within `inner` cells.
 ///
-/// Returns the kept columns in their original order together with the number
-/// dropped, which the caller shows in the table's title. `name_min_w` cells are
-/// reserved for the model-name column before any numeric column is fitted, so a
-/// pane too narrow for even one of them keeps none rather than squeezing the
-/// name.
+/// Reserves `name_min_w` cells for the leading name column before fitting numeric columns, dropping highest-[`drop_rank`](ColumnSpec::drop_rank) columns first while preserving original column order.
 pub fn fit_columns(specs: &[ColumnSpec], inner: u16, name_min_w: u16) -> (Vec<usize>, usize) {
     let mut kept: Vec<usize> = (0..specs.len()).collect();
     // Each column is preceded by one space of column spacing.
@@ -279,8 +234,7 @@ pub struct TableChrome<'a> {
     pub sorted: Option<usize>,
 }
 
-/// A block title from `text`: the part before the first ` · ` bold, each
-/// separator dim.
+/// Builds a block title from `text` with the first ` · `-separated segment bold and separators dim.
 pub fn title_line(text: &str) -> Line<'static> {
     let dim = theme().dim();
     let mut spans = vec![Span::raw(" ")];
@@ -299,8 +253,7 @@ pub fn title_line(text: &str) -> Line<'static> {
     Line::from(spans)
 }
 
-/// `cells` as table cells, the first `left_cols` left-aligned and the rest
-/// right-aligned.
+/// Converts `cells` into ratatui table cells, left-aligning the first `left_cols` and right-aligning the rest.
 pub fn aligned_cells(cells: Vec<String>, left_cols: usize) -> Vec<RatatuiCell<'static>> {
     cells
         .into_iter()
@@ -316,21 +269,14 @@ pub fn aligned_cells(cells: Vec<String>, left_cols: usize) -> Vec<RatatuiCell<'s
         .collect()
 }
 
-/// Builds a table row with the first `left_cols` cells left-aligned and the
-/// rest right-aligned, painted with `style`.
-///
-/// Right-aligning the numeric columns keeps variable-width compact values
-/// (`1.23M`, `999K`) flush instead of ragged.
+/// Builds a styled ratatui table row with the first `left_cols` cells left-aligned and the rest right-aligned.
 pub fn styled_row(cells: Vec<String>, style: Style, left_cols: usize) -> RatatuiRow<'static> {
     RatatuiRow::new(aligned_cells(cells, left_cols)).style(style)
 }
 
-/// Renders a scrollable, selectable table plus a side scrollbar into `area`.
+/// Renders a scrollable, selectable table and vertical scrollbar into `area` using [`BorderType::Plain`].
 ///
-/// `rows` are the already-styled body rows (highlight / TOTAL styling applied by
-/// the caller); `row_count` is the total displayed row count used to size the
-/// scrollbar. The block border + header + header margin consume 4 rows, so the
-/// visible body height is `area.height - 4`.
+/// `row_count` sizes the scrollbar; border, header, and header margin consume 4 rows, leaving `area.height.saturating_sub(4)` visible body rows.
 #[allow(clippy::too_many_arguments)]
 pub fn render_scrollable_table(
     f: &mut Frame,
@@ -355,8 +301,7 @@ pub fn render_scrollable_table(
     );
 }
 
-/// [`render_scrollable_table`] with an explicit [`BorderType`] (e.g. rounded
-/// corners for modern layouts).
+/// Renders a scrollable, selectable table and vertical scrollbar into `area` with the given `border_type`.
 #[allow(clippy::too_many_arguments)]
 pub fn render_scrollable_table_with_border(
     f: &mut Frame,
@@ -389,13 +334,11 @@ pub fn render_scrollable_table_with_border(
 
     f.render_stateful_widget(table, area, &mut scroll.table);
 
-    // Scrollbar driven by the selected index, inset by one row so it sits
-    // between the block's top/bottom borders instead of over the corners.
+    // Inset the scrollbar vertically by 1 row so it tracks the border without overwriting corners.
     let selected = scroll.table.selected().unwrap_or(0);
     scroll.scrollbar = ScrollbarState::new(row_count)
         .viewport_content_length(viewport as usize)
         .position(selected);
-    // Nothing to scroll to when every row is on screen.
     if row_count <= usize::from(viewport) {
         return;
     }
@@ -416,8 +359,7 @@ pub fn render_scrollable_table_with_border(
     );
 }
 
-/// Returns the visible header column index under `(column, row)` inside a
-/// bordered ratatui table drawn in `table_area` with `widths`.
+/// Returns the visible header column index at `(column, row)` inside a bordered table at `table_area` with `widths`.
 pub fn header_column_at(
     table_area: Rect,
     widths: &[Constraint],
@@ -441,8 +383,7 @@ pub fn header_column_at(
         .position(|cell| column >= cell.x && column < cell.right())
 }
 
-/// Returns the data row index under `(column, row)` inside a bordered ratatui
-/// table whose header has a one-row bottom margin (`body_y = table_area.y + 3`).
+/// Returns the data row index at `(column, row)` inside a bordered table whose header has a 1-row bottom margin (`body_y = table_area.y + 3`).
 pub fn table_body_row_at(
     table_area: Rect,
     scroll: &ScrollState,
@@ -478,7 +419,7 @@ pub enum DetailItem {
     },
 }
 
-/// A titled group of rows rendered inside [`render_detail_panel`].
+/// A titled group of rows rendered inside [`render_detail_panel`] or [`render_detail_pane`].
 pub struct DetailSection {
     /// Section header shown above `items`.
     pub heading: &'static str,
@@ -573,13 +514,15 @@ pub fn format_detail_lines(
 
 /// Frame titles and border style for [`render_detail_pane`].
 pub struct DetailPaneChrome {
+    /// Left-aligned block title.
     pub title: Line<'static>,
+    /// Optional right-aligned header note; an overflow counter is prepended when lines extend below the viewport.
     pub right_note: Option<Line<'static>>,
+    /// Border style for the pane's enclosing block.
     pub border_type: BorderType,
 }
 
-/// Draws a non-modal, scrollable detail pane inside `area` (used by split
-/// master-detail layouts), clamping `scroll_offset` into range.
+/// Renders a non-modal, scrollable detail pane inside `area`, clamping `scroll_offset` to the valid range.
 pub fn render_detail_pane(
     f: &mut Frame,
     area: Rect,
@@ -644,11 +587,9 @@ pub fn render_detail_pane(
     }
 }
 
-/// Draws a centered panel over `area` with the details of one table row:
-/// `name` in full, wrapped where it is wider than the panel, followed by each
-/// non-empty [`DetailSection`]. Lines that do not fit a short terminal are
-/// counted in the title and at the bottom rather than clipped silently. Closed
-/// with `Esc`.
+/// Renders a centered modal detail panel over `area` showing `name` (wrapped as needed) and each non-empty [`DetailSection`].
+///
+/// Lines that overflow a short terminal are counted in the title and at the bottom of the panel rather than clipped silently.
 pub fn render_detail_panel(f: &mut Frame, area: Rect, name: &str, sections: &[DetailSection]) {
     let theme = theme();
     let width = area.width.saturating_sub(4).min(62);
@@ -707,10 +648,7 @@ pub fn render_detail_panel(f: &mut Frame, area: Rect, name: &str, sections: &[De
     );
 }
 
-/// Renders a centered "terminal too small" notice and nothing else.
-///
-/// Used as an early-out when the window is below the view's hard minimum, so the
-/// normal layout never tries to draw into an area that would overlap.
+/// Renders a centered "Terminal too small" notice naming the required `min_w` × `min_h` dimensions.
 pub fn render_too_small(f: &mut Frame, min_w: u16, min_h: u16) {
     let area = f.area();
     let para = Paragraph::new(vec![
@@ -744,11 +682,9 @@ pub fn render_too_small(f: &mut Frame, min_w: u16, min_h: u16) {
     f.render_widget(para, v[1]);
 }
 
-/// Builds a ratatui [`Table`](RatatuiTable) with the standard header and border styling.
+/// Builds a ratatui [`Table`](RatatuiTable) with standard border, dim header, and 1-row header margin.
 ///
-/// `widths` sets the per-column constraints. The header is dim with a
-/// one-line bottom margin, aligned like the body (first column left, the rest
-/// right); the `sorted` header, if any, is drawn in the accent color.
+/// Column 0 is left-aligned and remaining columns are right-aligned; the `sorted` header index, if present, is highlighted in the accent color.
 pub fn create_ratatui_table<'a>(
     rows: Vec<RatatuiRow<'a>>,
     header: Vec<&'a str>,
@@ -778,10 +714,9 @@ pub fn create_ratatui_table<'a>(
         )
 }
 
-/// Builds an empty comfy [`Table`] with a colored, UTF-8-bordered header row.
+/// Builds an empty comfy [`Table`] with a UTF-8 border and `header_color` header row.
 ///
-/// Header cells use the shared alignment convention: indices 0 and 1 are
-/// left-aligned, the rest right-aligned. The returned table has no body rows.
+/// Columns 0 and 1 are left-aligned and remaining columns are right-aligned.
 pub fn create_comfy_table(headers: Vec<&str>, header_color: Color) -> Table {
     let mut table = Table::new();
     table.load_style(UTF8_FULL).set_header(
@@ -801,10 +736,7 @@ pub fn create_comfy_table(headers: Vec<&str>, header_color: Color) -> Table {
     table
 }
 
-/// Appends a single colored totals row to `table`.
-///
-/// Cells follow the shared alignment convention: indices 0 and 1 are
-/// left-aligned, the rest right-aligned. Every cell is painted `color`.
+/// Appends a `color`-styled totals row to `table`, left-aligning columns 0 and 1 and right-aligning the rest.
 pub fn add_totals_row(table: &mut Table, cells: Vec<String>, color: Color) {
     let colored_cells: Vec<Cell> = cells
         .into_iter()
@@ -842,9 +774,7 @@ pub fn create_metric_cell(value: String, color: Color, emphasize: bool) -> Cell 
     cell
 }
 
-/// Builds a provider's ratatui [`Row`](RatatuiRow): a dot in the provider's
-/// `color` before its name, the remaining cells right-aligned, bold when
-/// `emphasize`.
+/// Builds a ratatui [`Row`](RatatuiRow) with a `color`-styled `● ` dot before the name, remaining cells right-aligned, and bold styling when `emphasize` is true.
 pub fn create_provider_row<'a>(
     cells: Vec<String>,
     color: RatatuiColor,
@@ -888,8 +818,7 @@ mod tests {
 
     #[test]
     fn every_region_spans_the_full_frame_width() {
-        // Nothing is ever taken out of the content pane horizontally, so the
-        // table's columns only ever compete with each other.
+        // Horizontal width is never split away from the content pane, so table columns only compete with each other.
         for width in [74u16, 90, 120, 200] {
             let c = frame_layout(Rect::new(0, 0, width, 40), 6);
             assert_eq!(c.content.width, width);
@@ -924,20 +853,17 @@ mod tests {
         ];
         // Everything fits: nothing is dropped and the order is preserved.
         assert_eq!(fit_columns(&COLS, 100, 20), (vec![0, 1, 2, 3], 0));
-        // One column too many: the highest drop_rank goes first, and the kept
-        // columns stay in their original order.
+        // Highest drop_rank goes first while remaining columns preserve original order.
         assert_eq!(fit_columns(&COLS, 55, 20), (vec![0, 1, 3], 1));
         assert_eq!(fit_columns(&COLS, 44, 20), (vec![0, 1], 2));
         assert_eq!(fit_columns(&COLS, 33, 20), (vec![0], 3));
-        // The name minimum always wins; an impossibly narrow pane keeps no
-        // numeric column rather than cutting the name to nothing.
+        // Name minimum wins: an overly narrow pane drops all numeric columns.
         assert_eq!(fit_columns(&COLS, 20, 20), (vec![], 4));
     }
 
     #[test]
     fn frame_holds_the_content_minimum_when_the_terminal_is_short() {
-        // The band and footer are `Length`, so a shortfall is taken from them
-        // first; the content pane never drops below its minimum.
+        // Band and footer use fixed `Length`, so shortfalls never squeeze `content` below `CONTENT_MIN_H`.
         let c = frame_layout(Rect::new(0, 0, 120, CONTENT_MIN_H + FOOTER_H), 0);
         assert_eq!(c.content.height, CONTENT_MIN_H);
         assert_eq!(c.controls.height, 1);
@@ -947,7 +873,6 @@ mod tests {
     fn normalized_cpu_divides_by_cores_and_clamps() {
         // Two fully-used cores on a 4-core machine -> 50% of the machine.
         assert!((normalized_cpu(200.0, 4.0) - 50.0).abs() < f32::EPSILON);
-        // Idle stays at 0%.
         assert_eq!(normalized_cpu(0.0, 8.0), 0.0);
         // A transient over-count (all cores summed above 100%) is clamped.
         assert_eq!(normalized_cpu(410.0, 4.0), 100.0);
@@ -979,8 +904,7 @@ mod tests {
         assert!(wide.trim_end().ends_with("Star on GitHub"), "got {wide:?}");
         assert!(wide.contains("[ ] range  tab view  ? help  q quit"));
 
-        // The repo label goes first, then the tab's hints from the right, and
-        // nothing is left half-drawn.
+        // Drop the repo label first, then tab hints from the right, without partial clipping.
         let narrow = render(50);
         assert!(!narrow.contains("Star"), "got {narrow:?}");
         assert!(!narrow.contains("range"), "got {narrow:?}");

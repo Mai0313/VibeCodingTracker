@@ -37,7 +37,7 @@ pub(crate) fn database_fingerprint(db_path: &Path) -> Result<DatabaseFingerprint
     })
 }
 
-/// Fingerprints an optional SQLite database and WAL dependency.
+/// Fingerprints `db_path` and its optional `-wal` sidecar, returning `Ok(None)` if `db_path` does not exist.
 pub(crate) fn optional_database_fingerprint(db_path: &Path) -> Result<Option<DatabaseFingerprint>> {
     match std::fs::metadata(db_path) {
         Ok(_) => database_fingerprint(db_path).map(Some),
@@ -47,16 +47,9 @@ pub(crate) fn optional_database_fingerprint(db_path: &Path) -> Result<Option<Dat
     }
 }
 
-/// Whether a reader failure is deterministic for the current database bytes.
+/// Returns whether `error` is deterministic for the current database bytes (missing schema, malformed JSON, or corruption) rather than transient I/O or lock contention.
 ///
-/// Missing tables/columns, malformed stored JSON, and corrupt SQLite content
-/// remain failures until the source fingerprint changes, so incremental scans
-/// may cache their diagnostics. Open, permission, busy, and I/O failures are
-/// deliberately excluded and retried on every refresh.
-///
-/// The decision reads the flattened chain (`{error:#}`), so a caller rendering
-/// the same failure for the user has to flatten it too — plain `Display` keeps
-/// only the outermost context, which is never the cause this matches on.
+/// Matches against the flattened error chain (`{error:#}`); callers displaying cached failures should format with `{:#}` as well.
 pub(crate) fn is_cacheable_sqlite_failure(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}").to_ascii_lowercase();
     [
@@ -72,11 +65,9 @@ pub(crate) fn is_cacheable_sqlite_failure(error: &anyhow::Error) -> bool {
     .any(|needle| message.contains(needle))
 }
 
-/// Opens a source database read-only, falling back to a stable private copy.
+/// Runs `f` against `db_path` read-only, falling back to a read-write connection on a private temporary copy so SQLite can recover a copied WAL without touching `db_path`.
 ///
-/// `probe_table` must name a core table that exists in every supported schema.
-/// The fallback connection is read-write so SQLite can recover the copied WAL,
-/// but it points only at a private temporary copy and never at `db_path`.
+/// `probe_table` must exist in every supported schema.
 pub(crate) fn with_readonly_connection<T>(
     db_path: &Path,
     probe_table: &str,
@@ -94,9 +85,7 @@ pub(crate) fn with_readonly_connection<T>(
         return f(&conn);
     }
 
-    // The context names the source database, not the private copy: the copy's
-    // path is deleted by the time anyone reads the message, and it is the
-    // source the user can act on.
+    // Name `db_path` in error context rather than the temp copy, which is deleted on return.
     let copy = StableTempCopy::new(db_path, temp_prefix)?;
     let conn = Connection::open_with_flags(&copy.db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
         .with_context(|| {
@@ -269,8 +258,7 @@ mod tests {
         )
         .unwrap_err();
 
-        // Plain `Display` stops at the outer context, which is exactly what
-        // the cacheability check never sees.
+        // Plain `Display` stops at the outer context; `{:#}` exposes the underlying SQLite cause.
         let flattened = format!("{error:#}");
         assert!(flattened.contains("no such table"), "{flattened}");
         assert!(

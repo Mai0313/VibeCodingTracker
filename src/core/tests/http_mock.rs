@@ -1,10 +1,6 @@
 //! HTTP-layer integration tests for the public quota fetchers.
 //!
-//! Every request goes to a local `httpmock` server whose URL is injected via the
-//! endpoint parameters added for testability, so no real provider API is ever
-//! reached. Each provider's own send layer, the 401 → refresh → retry loop and
-//! the GitHub releases path are covered by inline `#[cfg(test)]` tests in their
-//! own source files, which can reach crate-private items.
+//! Every request goes to a local `httpmock` server via injected endpoint URLs, so no real provider API is reached. Each provider's own send layer, the 401 -> refresh -> retry loop, and the GitHub releases path are covered by inline `#[cfg(test)]` tests in their own source files.
 
 use httpmock::prelude::*;
 use serde_json::json;
@@ -145,7 +141,6 @@ fn refresh_codex_rotates_and_writes_back_token() {
     endpoint.assert();
     assert_eq!(access, "new-access-token");
 
-    // The rotated tokens must be persisted back into auth.json.
     let written: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&auth).unwrap()).unwrap();
     assert_eq!(written["tokens"]["access_token"], "new-access-token");

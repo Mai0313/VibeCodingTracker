@@ -1,19 +1,8 @@
 //! Grok CLI quota fetcher.
 //!
-//! Reads the bearer from `~/.grok/auth.json` and calls the CLI's own billing
-//! endpoint (`GET /v1/billing?format=credits`), impersonating the Grok CLI via
-//! its `grok-pager` / `grok-shell` User-Agent and the `X-XAI-Token-Auth` header
-//! the proxy's auth middleware requires. The plan label comes from the companion
-//! `/v1/settings` endpoint, re-read only when `auth.json` changes rather than on
-//! every tick.
+//! Reads the bearer token from each entry's `key` field in `~/.grok/auth.json` and queries `GET /v1/billing?format=credits` with the Grok CLI's `User-Agent` and `X-XAI-Token-Auth` headers. The plan label comes from `/v1/settings` and is cached per `auth.json` modification time.
 //!
-//! The access token lives in each entry's **`key`** field (not `access_token`)
-//! and expires in hours, so refresh works like Claude's: proactive near expiry,
-//! reactive on a rejected request, with the rotated token written back into that
-//! entry — preserving every other entry — and a cooldown so a revoked token
-//! cannot spin the token endpoint. The token endpoint itself is never
-//! hardcoded: it is resolved by OIDC discovery on the entry's issuer, the same
-//! way the official CLI resolves it.
+//! OAuth tokens are refreshed proactively near expiry and reactively on HTTP 401/403 against the token endpoint discovered from the entry's OIDC issuer. Rotated tokens are written back into the matching `auth.json` entry while preserving all other fields and entries, gated by [`crate::quota::refresh::RefreshCooldown`].
 
 use crate::models::{
     GrokAuthEntry, GrokBillingResponse, GrokQuotaSnapshot, GrokRefreshResponse,
@@ -37,19 +26,16 @@ use std::time::SystemTime;
 const GROK_BILLING_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
 /// The Grok remote-settings endpoint, which carries the plan label.
 const GROK_SETTINGS_URL: &str = "https://cli-chat-proxy.grok.com/v1/settings";
-/// Fallback Grok CLI version for the User-Agent and the proxy's version gate
-/// when `grok --version` cannot be resolved (CLI absent or unreadable). Bump
-/// occasionally.
+/// Fallback Grok CLI version for `User-Agent` and `x-grok-client-version` when `grok --version` cannot be resolved.
 const GROK_FALLBACK_VERSION: &str = "0.2.112";
-/// Tells the proxy's auth middleware to validate the bearer as a CLI session.
-/// Without it the request is rejected regardless of the token.
+/// Required `X-XAI-Token-Auth` header value instructing the proxy to validate the bearer as a CLI session.
 const GROK_TOKEN_AUTH: &str = "xai-grok-cli";
 /// Access-token lifetime assumed when a refresh response omits `expires_in`.
 const GROK_DEFAULT_EXPIRES_IN: i64 = 6 * 3600;
 /// Login hint shown when the Grok token is expired / rejected.
 pub const GROK_LOGIN_HINT: &str = "run: grok login";
 
-/// The installed Grok CLI's version, detected once and cached for the day.
+/// Returns the Grok CLI version string, resolved once per process.
 fn grok_version() -> &'static str {
     static VERSION: OnceLock<String> = OnceLock::new();
     VERSION
@@ -57,8 +43,7 @@ fn grok_version() -> &'static str {
         .as_str()
 }
 
-/// Builds the Grok CLI's request User-Agent, e.g.
-/// `grok-pager/0.2.112 grok-shell/0.2.112 (linux; x86_64)`.
+/// Returns the cached `grok-pager/<v> grok-shell/<v> (<os>; <arch>)` `User-Agent` string.
 fn grok_ua() -> &'static str {
     static UA: OnceLock<String> = OnceLock::new();
     UA.get_or_init(|| {
@@ -72,12 +57,7 @@ fn grok_ua() -> &'static str {
     .as_str()
 }
 
-/// One usable Grok login: the entry plus the `auth.json` key it was stored under.
-///
-/// The file holds one entry per login scope, keyed `"<issuer>::<client_id>"` for
-/// an xAI OAuth2 login, `"xai::api_key"` for a plain API key, or a legacy
-/// sign-in URL. The key is retained so a refresh writes back into the same
-/// entry and leaves every sibling untouched.
+/// Parsed `auth.json` login entry paired with its object key for in-place write-back.
 pub(crate) struct GrokCredential {
     pub(crate) entry_key: String,
     pub(crate) entry: GrokAuthEntry,
@@ -102,9 +82,7 @@ impl GrokCredential {
             .filter(|s| !s.is_empty())
     }
 
-    /// The OIDC issuer: the entry's own field, else the first `::`-delimited
-    /// half of the entry key. Only a URL counts, so an `xai::api_key` entry
-    /// (whose first half is `xai`) never yields a bogus issuer.
+    /// Returns the HTTP(S) OIDC issuer URL from `oidc_issuer` or the prefix before `::` in `entry_key`.
     fn issuer(&self) -> Option<&str> {
         self.entry
             .oidc_issuer
@@ -113,8 +91,7 @@ impl GrokCredential {
             .filter(|s| s.starts_with("http"))
     }
 
-    /// The OAuth client id: the entry's own field, else the last `::`-delimited
-    /// half of the entry key.
+    /// Returns the OAuth client ID from `oidc_client_id` or the suffix after `::` in `entry_key`.
     fn client_id(&self) -> Option<&str> {
         self.entry
             .oidc_client_id
@@ -123,8 +100,7 @@ impl GrokCredential {
             .filter(|s| !s.is_empty())
     }
 
-    /// The access-token expiry in Unix seconds, when the entry records one.
-    /// An API-key login has none, which reads as "does not expire".
+    /// Returns the access-token expiry in Unix seconds, or `None` if absent or unparseable.
     fn expires_at_secs(&self) -> Option<i64> {
         let ms = parse_iso_timestamp(self.entry.expires_at.as_deref()?);
         (ms > 0).then_some(ms / 1000)
@@ -136,14 +112,7 @@ impl GrokCredential {
     }
 }
 
-/// Picks the login to use from an `auth.json` body.
-///
-/// The file can hold several logins and JSON object order is not preserved in
-/// Rust, so the choice is made explicitly rather than by position: among entries
-/// carrying a token, a refreshable OIDC login wins over a bare API key (it is
-/// the subscription the quota describes, and it can be renewed), then the latest
-/// expiry, then the entry key — so the same file always resolves to the same
-/// login. A malformed entry is skipped rather than failing the whole file.
+/// Selects a usable login from `auth.json`, preferring refreshable OIDC logins, then the latest expiry, then the lexicographically smallest key; skips malformed entries.
 pub(crate) fn select_grok_entry(body: &str) -> Option<GrokCredential> {
     let root: serde_json::Value = serde_json::from_str(body).ok()?;
     let mut candidates: Vec<GrokCredential> = root
@@ -172,21 +141,17 @@ pub(crate) fn select_grok_entry(body: &str) -> Option<GrokCredential> {
     candidates.into_iter().next()
 }
 
-/// The outcome of reading a login for one worker tick.
+/// Outcome of reading a login from `auth.json`.
 enum CredentialRead {
-    // Boxed so the outcome enum stays pointer-sized: the credential is one
-    // per tick, but every arm would otherwise carry its whole footprint.
+    // Boxed to keep the enum compact across variants.
     Ok(Box<GrokCredential>),
-    /// The file exists but holds no usable login (logged out / cleared): an auth
-    /// failure, so nudge login rather than sitting on stale numbers.
+    /// The file is readable but holds no usable login; requires re-login.
     NeedsLogin,
-    /// The file is absent or unreadable — e.g. an atomic rewrite by the official
-    /// CLI is in flight — so keep last-known-good.
+    /// The file is missing or unreadable (e.g. concurrent atomic rewrite); retain the last snapshot.
     Transient,
 }
 
-/// Reads `auth.json` and picks the login, splitting a transient file error from
-/// an auth failure the way the Claude and Cursor workers do.
+/// Reads `auth.json` and selects a login, distinguishing unreadable files (`Transient`) from missing/invalid credentials (`NeedsLogin`).
 fn read_grok_credential(path: &Path) -> CredentialRead {
     let Ok(body) = std::fs::read_to_string(path) else {
         return CredentialRead::Transient;
@@ -197,11 +162,7 @@ fn read_grok_credential(path: &Path) -> CredentialRead {
     }
 }
 
-/// Builds a request carrying the Grok CLI's identity headers.
-///
-/// The proxy authenticates on the bearer plus `X-XAI-Token-Auth` (without which
-/// it rejects any token) and gates on `x-grok-client-version`; the rest is
-/// client identity.
+/// Returns a `GET` request for `url` with bearer auth, `X-XAI-Token-Auth`, optional `x-userid`, and Grok CLI identity headers.
 fn grok_request(client: &Client, url: &str, token: &str, user_id: Option<&str>) -> RequestBuilder {
     let mut req = client
         .get(url)
@@ -226,15 +187,13 @@ fn period_label(period_type: &str) -> Option<&'static str> {
     }
 }
 
-/// Maps a `billing?format=credits` body into a [`GrokQuotaSnapshot`] (pure).
+/// Maps a `billing?format=credits` JSON response into a [`GrokQuotaSnapshot`] stamped at `now` (Unix seconds).
 ///
-/// Proto3 JSON omits zero-valued scalars, so an absent percent or money field
-/// reads as zero. Money is in cents.
+/// Absent proto3 numeric fields default to zero; money values are converted from cents to dollars.
 ///
 /// # Errors
 ///
-/// Returns an error if the body is not valid JSON or carries no `config`
-/// object (an error payload rather than a credits response).
+/// Returns an error if `body` is not valid JSON or omits the `config` object.
 pub fn map_grok_billing(body: &str, now: i64) -> Result<GrokQuotaSnapshot> {
     let resp: GrokBillingResponse =
         serde_json::from_str(body).context("Failed to parse Grok billing response")?;
@@ -248,17 +207,13 @@ pub fn map_grok_billing(body: &str, now: i64) -> Result<GrokQuotaSnapshot> {
         .and_then(|p| p.end.as_deref())
         .or(config.billing_period_end.as_deref())
         .and_then(iso_to_unix_secs);
-    // Clamped only as an out-of-range guard: the field is already percent
-    // consumed, the same number the CLI status bar shows.
+    // `credit_usage_percent` is already percent consumed; clamp only as an out-of-range guard.
     let used_percent = config.credit_usage_percent.clamp(0.0, 100.0);
 
     let cap = config.on_demand_cap.as_ref().map(|m| m.as_dollars());
     let used = config.on_demand_used.as_ref().map(|m| m.as_dollars());
     let balance = config.prepaid_balance.as_ref().map(|m| m.as_dollars());
-    // Pay-as-you-go and prepaid credit are opt-in extras: show them only once
-    // they carry a value, so a plain subscription panel stays three lines. Once
-    // a cap is configured the spend is meaningful even at zero — and proto3
-    // omits `onDemandUsed` entirely in that case, so read its absence as $0.
+    // Omit zero pay-as-you-go and prepaid fields unless an on-demand cap is configured, in which case proto3 omits zero `onDemandUsed` and it should surface as $0.
     let on_demand_cap_dollars = cap.filter(|c| *c > 0.0);
     let on_demand_dollars = if on_demand_cap_dollars.is_some() {
         Some(used.unwrap_or(0.0))
@@ -292,9 +247,9 @@ pub fn map_grok_billing(body: &str, now: i64) -> Result<GrokQuotaSnapshot> {
 /// Outcome of a single billing request.
 enum FetchResult {
     Ok(GrokQuotaSnapshot),
-    /// 401/403 → the token is rejected; refresh and retry.
+    /// HTTP 401 or 403; the token was rejected and should be refreshed.
     Unauthorized,
-    /// Network / other non-success error → keep last-known-good.
+    /// Network, parse, or other non-2xx failure; retain the last snapshot.
     Transient,
 }
 
@@ -336,11 +291,7 @@ fn fetch_grok_billing(
     }
 }
 
-/// Reads the plan label from the remote-settings endpoint.
-///
-/// `Ok(None)` means the settings were read but carry no display tier (so the
-/// Plan line is simply omitted and nothing is retried); `Err` means the fetch
-/// itself failed and is worth retrying.
+/// Fetches the plan display tier from `settings_url`, returning `Ok(None)` when the account reports no tier and `Err` on transport/HTTP/parse failure.
 fn fetch_grok_plan(
     client: &Client,
     token: &str,
@@ -364,15 +315,7 @@ fn fetch_grok_plan(
         .filter(|s| !s.trim().is_empty()))
 }
 
-/// Resolves an issuer's OAuth token endpoint from its OIDC discovery document.
-///
-/// The Grok CLI never hardcodes the endpoint, so neither do we — a login against
-/// a different issuer (team / enterprise) keeps working.
-///
-/// # Errors
-///
-/// Returns an error if the document cannot be fetched, is not successful, or
-/// carries no `token_endpoint`.
+/// Returns `token_endpoint` from `issuer`'s `/.well-known/openid-configuration` document.
 fn discover_token_endpoint(client: &Client, issuer: &str) -> Result<String> {
     let url = format!(
         "{}/.well-known/openid-configuration",
@@ -398,11 +341,7 @@ fn discover_token_endpoint(client: &Client, issuer: &str) -> Result<String> {
         .context("grok OIDC discovery carried no token_endpoint")
 }
 
-/// Refreshes the Grok token and writes it back. Returns `(access, expires_secs)`.
-///
-/// The rotated access token replaces the entry's `key`, alongside the new
-/// refresh token and a fresh `expires_at` in the CLI's own RFC3339 nanosecond
-/// format. Every sibling entry and unknown field is preserved.
+/// Exchanges `cred`'s refresh token at `token_url`, persists the rotated credentials into `path` if its mtime still matches `expected_mtime`, and returns `(access_token, expires_at_secs)`.
 fn refresh_grok(
     client: &Client,
     path: &Path,
@@ -468,34 +407,25 @@ fn refresh_grok(
         entry.insert("expires_at".into(), json!(stamp));
         Ok(())
     })?;
-    // The refresh already rotated the token server-side; failing to persist it
-    // leaves `auth.json` holding a refresh token the server has invalidated, so
-    // treat it as a refresh failure rather than caching an ephemeral token over
-    // a broken login.
+    // Fail when write-back aborts because the server already invalidated the old refresh token, avoiding an ephemeral cached token over a broken file.
     if !wrote {
         bail!("grok token rotated but the new token could not be persisted");
     }
     Ok((access, expires_at))
 }
 
-/// Fetches the raw `billing?format=credits` response for `vct quota grok`.
+/// Returns `(status_code, body)` from `/v1/billing?format=credits` using the stored access token.
 ///
-/// Uses the stored access token verbatim (no refresh, no file writes) and
-/// returns `(status_code, body)`. A non-2xx status is left for the caller to
-/// surface — the body (often a JSON error) is still returned.
+/// Does not refresh the token or modify `auth.json`. Non-2xx responses are returned as `Ok((status_code, body))`.
 ///
 /// # Errors
 ///
-/// Returns an error if `auth.json` is missing, holds no usable login, or the
-/// request cannot be sent.
+/// Returns an error if the auth path cannot be resolved, `auth.json` is missing or holds no usable login, or the HTTP request or body read fails.
 pub fn fetch_grok_raw(client: &Client) -> Result<(u16, String)> {
     fetch_grok_raw_from(client, GROK_BILLING_URL, &get_grok_auth_path()?)
 }
 
-/// The injectable core of [`fetch_grok_raw`]: reads the login from an explicit
-/// `auth.json` path and fetches the raw billing body from an explicit
-/// `billing_url`. Production passes [`GROK_BILLING_URL`] + `~/.grok/auth.json`;
-/// tests point them at a local mock server and a temp auth file.
+/// Returns `(status_code, body)` from `billing_url` using credentials read from `auth_path`.
 pub(crate) fn fetch_grok_raw_from(
     client: &Client,
     billing_url: &str,
@@ -523,45 +453,34 @@ pub(crate) fn fetch_grok_raw_from(
     Ok((status, text))
 }
 
-/// A plan label fetched from the settings endpoint, pinned to the credential
-/// file it belongs to.
+/// Cached plan label from `/v1/settings`, invalidated when `auth.json`'s mtime changes.
 struct CachedPlan {
-    /// The label, or `None` when the account reports no display tier.
+    /// Display tier label, or `None` when the account reports none.
     label: Option<String>,
-    /// `auth.json`'s mtime when this was fetched; a re-login rewrites the file
-    /// and drops the label so the new account's plan is read fresh.
+    /// `auth.json` mtime when `label` was fetched.
     mtime: Option<SystemTime>,
 }
 
-/// The result of obtaining a usable access token.
-///
-/// There is no transient arm: the credential file is read by the caller, so the
-/// only way to get here without a token is an auth failure.
+/// Outcome of obtaining a valid access token from a parsed credential.
 enum EnsureToken {
     Token(String),
     NeedsLogin,
 }
 
-/// Per-worker Grok state: an in-memory access token, the discovered token
-/// endpoint, the plan label, and the refresh backoff.
+/// Per-worker Grok quota state holding the cached access token, discovered OIDC token endpoint, cached plan label, and refresh backoff.
 #[derive(Default)]
 pub struct GrokState {
-    /// Cached token: `(access_token, expiry_secs, auth-file mtime)`. The expiry
-    /// is `None` for an API-key login, which never expires. The mtime pins the
-    /// cache to the file it came from, so a re-login invalidates it.
+    /// `(access_token, expiry_secs, auth_mtime)`; `None` expiry means non-expiring API key.
     token: Option<(String, Option<i64>, Option<SystemTime>)>,
     cooldown: RefreshCooldown,
-    /// Discovered `(issuer, token_endpoint)`, so discovery runs once per issuer.
+    /// Cached `(issuer, token_endpoint)` pair.
     token_endpoint: Option<(String, String)>,
-    /// Plan label, fetched once per `auth.json` version rather than once per
-    /// tick: it lives behind a second endpoint, and only a re-login can change
-    /// whose plan it is. A failed fetch caches nothing, so the next tick
-    /// retries.
+    /// Cached plan label per `auth.json` mtime; populated only after a successful settings fetch.
     plan: Option<CachedPlan>,
 }
 
 impl GrokState {
-    /// One worker tick: ensure a token, fetch billing, refresh reactively on 401.
+    /// Fetches a Grok quota snapshot, refreshing the OAuth token proactively near expiry and reactively on HTTP 401/403.
     pub fn resolve(&mut self, client: &Client) -> QuotaOutcome<GrokQuotaSnapshot> {
         let now = chrono::Local::now().timestamp();
         let path = match get_grok_auth_path() {
@@ -618,12 +537,9 @@ impl GrokState {
                                     GROK_SETTINGS_URL,
                                 ))
                             }
-                            // A transient retry error keeps the freshly
-                            // refreshed token; do not nag to re-login.
+                            // Keep the freshly refreshed token on a transient retry failure instead of prompting for login.
                             FetchResult::Transient => QuotaOutcome::Transient,
-                            // Arm with the CURRENT mtime: the refresh just
-                            // rewrote the file, so a stale one would never
-                            // suppress the next tick.
+                            // Arm with the post-refresh mtime because the refresh just rewrote the file; a stale mtime would not suppress the next tick.
                             FetchResult::Unauthorized => {
                                 self.cooldown.arm(now, file_mtime(&path));
                                 self.token = None;
@@ -642,8 +558,7 @@ impl GrokState {
         }
     }
 
-    /// Attaches the plan label, fetching it from the settings endpoint when it
-    /// is not already cached for this login. A failure only costs the Plan line.
+    /// Attaches the cached plan label to `snap`, fetching it from `settings_url` when `cred_mtime` changes and leaving `plan_type` unset on failure.
     fn with_plan(
         &mut self,
         client: &Client,
@@ -658,9 +573,7 @@ impl GrokState {
             .as_ref()
             .is_none_or(|cached| cached.mtime != cred_mtime)
         {
-            // Drop the stale label first: it belongs to whoever wrote the
-            // previous `auth.json`, so a failed fetch must leave the Plan line
-            // off rather than paint the previous account's tier.
+            // Clear the previous account's label before fetching so a failed request does not display a stale tier.
             self.plan = None;
             match fetch_grok_plan(client, token, user_id, settings_url) {
                 Ok(label) => {
@@ -684,9 +597,7 @@ impl GrokState {
         cred: &GrokCredential,
         now: i64,
     ) -> EnsureToken {
-        // Cached token still valid AND the credential file unchanged since we
-        // cached it? A re-login rewrites `auth.json`, so the cached token must
-        // be dropped even while it is unexpired.
+        // Invalidate the cached token when `auth.json` changes on disk (e.g. re-login), even if it is not yet expired.
         if let Some((tok, expiry, cred_mtime)) = &self.token
             && !is_expiring(*expiry, now, EXPIRY_SKEW_SECS)
             && *cred_mtime == file_mtime(path)
@@ -715,17 +626,12 @@ impl GrokState {
         }
     }
 
-    /// Re-reads the credential file and refreshes once.
-    ///
-    /// The mtime is captured before the read, so a concurrent rewrite by the
-    /// official CLI aborts the write-back instead of clobbering the token it
-    /// just rotated.
+    /// Re-reads `path` and refreshes the OAuth token once, aborting write-back if `path` changes concurrently.
     fn force_refresh(&mut self, client: &Client, path: &Path) -> Option<String> {
         let expected_mtime = file_mtime(path);
         let body = std::fs::read_to_string(path).ok()?;
         let cred = select_grok_entry(&body)?;
-        // An API-key login has no issuer to discover a token endpoint from, so
-        // there is nothing to renew with: fall through to the login hint.
+        // API-key logins have no OIDC issuer and cannot be refreshed.
         let Some(issuer) = cred.issuer().map(str::to_string) else {
             log::warn!("grok token expired and this login cannot be refreshed");
             return None;
@@ -744,7 +650,7 @@ impl GrokState {
         }
     }
 
-    /// The issuer's token endpoint, discovered once and cached per issuer.
+    /// Returns the OIDC token endpoint for `issuer`, discovering and caching it on first use.
     fn token_endpoint(&mut self, client: &Client, issuer: &str) -> Option<String> {
         if let Some((cached_issuer, url)) = &self.token_endpoint
             && cached_issuer == issuer
@@ -790,9 +696,7 @@ mod tests {
         )
     }
 
-    /// The body a real (free, unused) account returns, captured verbatim — note
-    /// the omitted `creditUsagePercent` and the extra `topUpMethod` this
-    /// fetcher does not read.
+    /// Captured billing response from an unused free account, with `creditUsagePercent` omitted and an unused `topUpMethod` field.
     const CREDITS: &str =
         include_str!("../../../../tests/fixtures/quota/grok_billing_credits_response.json");
 
@@ -811,11 +715,7 @@ mod tests {
 
     #[test]
     fn prefers_a_refreshable_login_over_an_api_key() {
-        // Every other sort key favours the API key here — it sorts first
-        // alphabetically and carries the later expiry — so only the
-        // refreshable-first rule keeps the renewable subscription login
-        // winning. Picking the API key would leave the worker sitting on a
-        // token it can never renew.
+        // The API key sorts first and has a later expiry, so only the refreshable-first rule selects the OAuth login.
         let body = r#"{
           "xai::api_key": { "key": "api-key-token", "expires_at": "2030-01-01T00:00:00Z" },
           "https://auth.x.ai::c": {
@@ -835,13 +735,11 @@ mod tests {
         assert!(!cred.is_refreshable());
         // `xai` is not a URL, so it must never be mistaken for an issuer.
         assert_eq!(cred.issuer(), None);
-        // No expiry recorded means the token does not expire.
         assert_eq!(cred.expires_at_secs(), None);
     }
 
     #[test]
     fn derives_issuer_and_client_id_from_the_entry_key() {
-        // A legacy entry without the explicit oidc_* fields.
         let body =
             r#"{ "https://auth.x.ai::legacy-client": { "key": "t", "refresh_token": "rt" } }"#;
         let cred = select_grok_entry(body).unwrap();
@@ -869,8 +767,6 @@ mod tests {
 
     #[test]
     fn tokenless_or_malformed_entries_are_skipped() {
-        // An empty file, a logged-out entry, and a garbage entry each yield no
-        // usable login (which the worker maps to a login hint, not stale data).
         assert!(select_grok_entry("{}").is_none());
         assert!(select_grok_entry(r#"{ "xai::api_key": { "key": "" } }"#).is_none());
         assert!(select_grok_entry(r#"{ "a": 42 }"#).is_none());
@@ -899,8 +795,7 @@ mod tests {
     fn maps_an_idle_weekly_account() {
         let snap = map_grok_billing(CREDITS, 1_000_000).unwrap();
         assert_eq!(snap.source, QuotaSource::Api);
-        // Drives the panel's staleness line, so a wrong stamp reads as
-        // "updated 56 years ago" on every otherwise-healthy tick.
+        // Drives the panel's staleness line, so a wrong stamp reads as "updated 56 years ago" on every otherwise-healthy tick.
         assert_eq!(snap.fetched_at, 1_000_000);
         // `creditUsagePercent` is omitted at zero — that means 0%, not an error.
         let included = snap.included.as_ref().unwrap();
@@ -934,9 +829,7 @@ mod tests {
 
     #[test]
     fn an_untouched_cap_still_reports_zero_spend() {
-        // With a cap configured the on-demand line is meaningful even at $0, so
-        // it is shown rather than hidden as it is on a cap-less account —
-        // whether the zero arrives as `{}` or is omitted altogether.
+        // With a cap configured, $0 spend is preserved whether `onDemandUsed` is `{}` or omitted.
         let body = r#"{ "config": { "onDemandCap": { "val": 5000 }, "onDemandUsed": {} } }"#;
         let snap = map_grok_billing(body, 1).unwrap();
         assert_eq!(snap.on_demand_cap_dollars, Some(50.0));
@@ -949,9 +842,7 @@ mod tests {
 
     #[test]
     fn reads_the_nanosecond_expiry_the_grok_cli_writes() {
-        // The real `expires_at` carries nine fractional digits. Failing to parse
-        // it would read as "never expires" and silently disable proactive
-        // refresh, leaving every poll to 401 first.
+        // Real `expires_at` values carry 9 fractional digits; failing to parse them would silently disable proactive refresh.
         let cred = select_grok_entry(&oauth_auth("2026-07-26T15:33:55.311478864Z")).unwrap();
         assert_eq!(cred.expires_at_secs(), Some(1_785_080_035));
         // An unparseable stamp reads as unknown, not as the epoch.
@@ -975,14 +866,12 @@ mod tests {
         let body = r#"{ "config": { "billingPeriodEnd": "2026-08-01T00:00:00+00:00" } }"#;
         let snap = map_grok_billing(body, 1).unwrap();
         assert!(snap.included.as_ref().unwrap().resets_at_unix.unwrap() > 0);
-        // An unknown period type leaves the gauge unlabelled rather than lying.
         assert!(snap.period_label.is_none());
     }
 
     #[test]
     fn the_current_period_outranks_the_deprecated_one() {
-        // Older servers still emit both. `currentPeriod` is the live one, so a
-        // reversed precedence would count down to a stale reset date.
+        // Older servers emit both fields; `currentPeriod` is authoritative over deprecated `billingPeriodEnd`.
         let body = r#"{ "config": {
           "currentPeriod": { "type": "USAGE_PERIOD_TYPE_WEEKLY", "end": "2026-07-29T00:00:00+00:00" },
           "billingPeriodEnd": "2026-01-01T00:00:00+00:00"
@@ -1124,7 +1013,6 @@ mod tests {
         );
         assert_eq!(labelled.plan_type.as_deref(), Some("SuperGrok"));
 
-        // Same login: the label is reused rather than re-fetched.
         let cached = state.with_plan(
             &client,
             snap(),
@@ -1136,8 +1024,6 @@ mod tests {
         assert_eq!(cached.plan_type.as_deref(), Some("SuperGrok"));
         assert_eq!(settings.calls(), 1, "the label is cached per login");
 
-        // A re-login with the settings endpoint down: the panel omits the Plan
-        // line instead of painting the previous account's tier.
         let after_relogin = state.with_plan(
             &client,
             snap(),
@@ -1231,7 +1117,6 @@ mod tests {
         let stamp = entry["expires_at"].as_str().unwrap();
         assert!(stamp.ends_with('Z') && stamp.contains('.'));
         assert!(chrono::DateTime::parse_from_rfc3339(stamp).is_ok());
-        // Untouched fields and the sibling login survive.
         assert_eq!(entry["email"], "user@example.com");
         assert_eq!(written["xai::api_key"]["key"], "sibling");
     }
@@ -1281,9 +1166,7 @@ mod tests {
 
         let client = build_client().unwrap();
         let cred = select_grok_entry(&body).unwrap();
-        // A stale expected mtime stands in for the official CLI having rotated
-        // the token first: the write aborts and the refresh reports failure
-        // rather than caching a token whose rotation could not be persisted.
+        // A stale expected mtime simulates a concurrent rotation by the official CLI; write-back aborts and refresh fails.
         let result = refresh_grok(
             &client,
             &path,
@@ -1329,9 +1212,7 @@ mod tests {
 
     #[test]
     fn unreadable_credentials_stay_transient_while_a_cleared_file_needs_login() {
-        // An absent file is transient (the CLI rewrites it atomically), so the
-        // panel keeps its last-known-good rather than nagging; a readable file
-        // with no usable login is an auth failure worth a login hint.
+        // An absent file can occur during an atomic rewrite by the CLI; a readable empty/invalid file means logged out.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
         assert!(matches!(
@@ -1362,16 +1243,12 @@ mod tests {
         let mut state = GrokState::default();
         let cred = select_grok_entry(&oauth_auth("2036-01-01T00:00:00Z")).unwrap();
 
-        // An unexpired token is used as-is: no refresh, no network.
         assert!(matches!(
             state.ensure_token(&client, &missing, &cred, 1_000_000),
             EnsureToken::Token(t) if t == "access-token"
         ));
 
-        // An expired API-key login has nothing to refresh with, so the worker
-        // asks for a login instead of sitting on a dead token. The file must
-        // exist, or `force_refresh` would bail on the read and never reach the
-        // unrefreshable-login guard this pins.
+        // Write the file to disk so `force_refresh` reaches the unrefreshable-login guard rather than bailing on `read_to_string`.
         let api_key = r#"{ "xai::api_key": { "key": "t", "expires_at": "2020-01-01T00:00:00Z" } }"#;
         let path = dir.path().join("auth.json");
         std::fs::write(&path, api_key).unwrap();
@@ -1398,7 +1275,6 @@ mod tests {
         ));
         assert!(state.token.is_some());
 
-        // A re-login rewrites the file; the cached token must not survive it.
         let relogin = oauth_auth("2036-01-01T00:00:00Z").replace("access-token", "second-account");
         std::fs::write(&path, &relogin).unwrap();
         let cred = select_grok_entry(&relogin).unwrap();

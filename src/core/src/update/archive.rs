@@ -1,9 +1,6 @@
 //! Archive extraction for downloaded release assets.
 //!
-//! Unpacks tar.gz (Unix/macOS) and zip (Windows) archives into a destination
-//! directory, then locates the `vibe_coding_tracker` / `vct` binary inside it.
-//! Every entry's destination is validated to stay within the target directory,
-//! guarding against path-traversal (Zip Slip) in a malicious archive.
+//! Unpacks `.tar.gz` and `.zip` release archives into a destination directory and locates the `vibe_coding_tracker` or `vct` binary inside it. Every entry's target path is validated to remain within the extraction directory to prevent path traversal (Zip Slip).
 
 use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
@@ -12,16 +9,13 @@ use std::path::{Path, PathBuf};
 use tar::Archive;
 use zip::ZipArchive;
 
-/// Extracts a tar.gz archive into `extract_to` and returns the binary path.
+/// Extracts a `.tar.gz` archive into `extract_to` and returns the path to the extracted binary.
 ///
-/// An entry whose path would escape `extract_to` is refused and aborts the
-/// whole extraction.
+/// Refuses any entry whose path escapes `extract_to`, aborting extraction.
 ///
 /// # Errors
 ///
-/// Returns an error if the archive cannot be opened or read, if any entry
-/// attempts to escape `extract_to`, if unpacking an entry fails, or if no
-/// known binary name is found afterward (see `find_binary_in_directory`).
+/// Returns an error if the archive cannot be opened or read, if any entry escapes `extract_to`, if unpacking fails, or if neither `vibe_coding_tracker` nor `vct` exists directly under `extract_to`.
 pub fn extract_targz(archive_path: &Path, extract_to: &Path) -> Result<std::path::PathBuf> {
     let tar_gz = File::open(archive_path).context("Failed to open archive file")?;
     let tar = GzDecoder::new(tar_gz);
@@ -50,17 +44,13 @@ pub fn extract_targz(archive_path: &Path, extract_to: &Path) -> Result<std::path
     find_binary_in_directory(extract_to, &["vibe_coding_tracker", "vct"])
 }
 
-/// Extracts a zip archive into `extract_to` and returns the binary path.
+/// Extracts a `.zip` archive into `extract_to` and returns the path to the extracted binary.
 ///
-/// Each entry's destination is validated against `extract_to` before anything
-/// is written; an entry that would escape aborts the whole extraction.
+/// Validates every entry's path against `extract_to` before writing; an escaping entry aborts extraction.
 ///
 /// # Errors
 ///
-/// Returns an error if the archive cannot be opened or read, if any entry
-/// attempts to escape `extract_to`, if a directory or file cannot be created
-/// or written, or if no known binary name is found afterward (see
-/// `find_binary_in_directory`).
+/// Returns an error if the archive cannot be opened or read, if any entry escapes `extract_to`, if creating or writing an extracted path fails, or if neither `vibe_coding_tracker.exe` nor `vct.exe` exists directly under `extract_to`.
 pub fn extract_zip(archive_path: &Path, extract_to: &Path) -> Result<std::path::PathBuf> {
     let file = File::open(archive_path).context("Failed to open archive file")?;
     let mut archive = ZipArchive::new(file).context("Failed to read zip archive")?;
@@ -93,9 +83,7 @@ pub fn extract_zip(archive_path: &Path, extract_to: &Path) -> Result<std::path::
     find_binary_in_directory(extract_to, &["vibe_coding_tracker.exe", "vct.exe"])
 }
 
-/// Returns the extracted binary's path, looking only directly under
-/// `extract_to`. On Unix it is `chmod`-ed to `0o755` so the candidate can be
-/// executed for validation.
+/// Returns the first matching binary directly under `extract_to`, setting mode `0o755` on Unix.
 fn find_binary_in_directory(extract_to: &Path, binary_names: &[&str]) -> Result<PathBuf> {
     for name in binary_names {
         let binary_path = extract_to.join(name);

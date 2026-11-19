@@ -1,11 +1,6 @@
-//! Content-based provider classification for session JSON and JSONL data.
+//! Content-based provider classification for session JSON and JSONL records.
 //!
-//! Given the parsed records from a session file, this module decides which
-//! supported assistant wrote it ([`ExtensionType`]). Two entry
-//! points exist for two call shapes: [`detect_extension_type`] commits
-//! eagerly on a fully-materialised slice (the `Vec<Value>` fallback path),
-//! while [`classify_records`] returns `None` on indeterminate input so a
-//! streaming caller can keep peeking lines until a marker appears.
+//! [`classify_records`] returns `None` until a distinctive provider marker appears, supporting streaming callers with unbounded metadata preambles. [`detect_extension_type`] commits eagerly on a slice and defaults to [`ExtensionType::Codex`] when no marker matches.
 use crate::models::ExtensionType;
 use crate::session::antigravity::is_antigravity_step;
 use crate::session::dsh::is_dsh_header;
@@ -28,44 +23,18 @@ pub(crate) fn record_inspections() -> usize {
     RECORD_INSPECTIONS.get()
 }
 
-/// Detects the AI provider format by analyzing distinctive fields in the
-/// session data.
+/// Returns the [`ExtensionType`] detected from `data`, defaulting to [`ExtensionType::Codex`] when no marker matches.
 ///
-/// Thin eager wrapper over [`classify_records`]: returns whatever marker the
-/// records carry, falling back to [`ExtensionType::Codex`] when none is found.
-/// That fallback is a tie-break, not a positive identification.
+/// Evaluates the same markers as [`classify_records`] in order, testing the first five against the first record only and the last two against every record:
+/// - [`ExtensionType::Grok`]: `primaryModelId`, `contextTokensUsed`, and either `contextWindowTokens` or `toolsUsed`.
+/// - [`ExtensionType::DeepSeek`]: uncompressed session header with `type == "session"`, numeric `version`, and string `id`.
+/// - [`ExtensionType::Antigravity`]: transcript step with numeric `step_index` and string `source` and `type`.
+/// - [`ExtensionType::Gemini`]: session-meta record with `sessionId` and `projectHash` and no `messages` field.
+/// - [`ExtensionType::Copilot`]: `type == "session.start"` with `data.producer` starting with `"copilot"`.
+/// - [`ExtensionType::ClaudeCode`]: any record containing `parentUuid`.
+/// - [`ExtensionType::Codex`]: any record with `type` in `session_meta`, `turn_context`, `event_msg`, or `response_item`, or as the final fallback.
 ///
-/// Detection strategy, in the order the classifier applies it. The first five
-/// markers are tested against the first record only; the last two against
-/// every record:
-/// - Grok: `primaryModelId` + `contextTokensUsed` and either
-///   `contextWindowTokens` or `toolsUsed`
-/// - DeepSeek Harness: a session header — `type == "session"` with a numeric
-///   `version` and a string `id`. Only an uncompressed log gets this far; a
-///   zstd-framed one is routed by its frame magic before it is read as text.
-/// - Antigravity: a transcript step — a numeric `step_index` with string
-///   `source` and `type`
-/// - Gemini: a session-meta record with `sessionId` and `projectHash` fields
-///   but *no* `messages` array (legacy single-object Gemini exports are no
-///   longer supported)
-/// - Copilot: a `type == "session.start"` event whose `data.producer` field
-///   identifies a Copilot agent (e.g. `copilot-agent`, `copilot-cli`). Legacy
-///   single-object dumps under `~/.copilot/history-session-state/` are no
-///   longer supported.
-/// - Claude Code: contains `parentUuid` field in log entries
-/// - Codex: contains a record whose `type` is one of `session_meta`,
-///   `turn_context`, `event_msg`, or `response_item` — **or** as a final
-///   fallback when no other marker is present
-///
-/// Callers walking a streaming source should prefer
-/// [`classify_records`] instead: it returns `None` when the records seen
-/// so far are indeterminate, letting the caller decide whether to read more
-/// before committing to a provider (see `parser::stream_parse_autodetect`).
-///
-/// # Errors
-///
-/// Returns an error when `data` is empty — an empty slice carries no marker
-/// to classify and is treated as a caller bug rather than silently defaulted.
+/// Streaming callers should use [`classify_records`] instead so indeterminate prefixes do not trigger the fallback early.
 ///
 /// # Examples
 ///
@@ -77,6 +46,10 @@ pub(crate) fn record_inspections() -> usize {
 /// let records = [json!({ "parentUuid": "abc", "type": "user" })];
 /// assert_eq!(detect_extension_type(&records).unwrap(), ExtensionType::ClaudeCode);
 /// ```
+///
+/// # Errors
+///
+/// Returns an error if `data` is empty.
 pub fn detect_extension_type(data: &[Value]) -> Result<ExtensionType> {
     if data.is_empty() {
         bail!("Cannot detect extension type from empty data");
@@ -85,22 +58,9 @@ pub fn detect_extension_type(data: &[Value]) -> Result<ExtensionType> {
     Ok(classify_records(data).unwrap_or(ExtensionType::Codex))
 }
 
-/// Streaming-friendly classifier that only commits to a provider when the
-/// records carry a distinctive marker.
+/// Returns the first [`ExtensionType`] positively identified in `data`, or `None` if every record is indeterminate.
 ///
-/// Returns `None` when every record seen so far is indeterminate (a Claude
-/// metadata preamble, an empty record, a record without any recognised
-/// `type` discriminator, …). The streaming auto-detect path uses the
-/// `None` signal to decide whether to peek one more JSONL line before
-/// falling back to the default.
-///
-/// Why this matters: the previous design buffered a fixed 8-record peek window
-/// and then called [`detect_extension_type`], which silently committed to Codex
-/// (the default) once that buffer was exhausted. A Claude session whose
-/// `parentUuid`-bearing record sat past a long metadata prelude was then
-/// mis-classified as Codex and had its usage silently dropped. Letting the
-/// caller keep reading until a positive signal appears puts no limit on the
-/// preamble length we tolerate.
+/// Evaluates the marker rules documented on [`detect_extension_type`] without applying the [`ExtensionType::Codex`] fallback, allowing streaming callers to keep reading past arbitrarily long metadata preambles.
 ///
 /// # Examples
 ///
@@ -109,11 +69,10 @@ pub fn detect_extension_type(data: &[Value]) -> Result<ExtensionType> {
 /// use vct_core::session::detector::classify_records;
 /// use vct_core::ExtensionType;
 ///
-/// // A marker-less Claude metadata preamble stays indeterminate...
+/// // Indeterminate metadata preambles return `None` until a marker arrives.
 /// let preamble = [json!({ "type": "file-history-snapshot" })];
 /// assert!(classify_records(&preamble).is_none());
 ///
-/// // ...until a `parentUuid`-bearing record arrives.
 /// let with_marker = [
 ///     json!({ "type": "file-history-snapshot" }),
 ///     json!({ "parentUuid": "abc", "type": "user" }),
@@ -125,10 +84,7 @@ pub fn classify_records(data: &[Value]) -> Option<ExtensionType> {
     data.iter().find_map(|record| classifier.push(record))
 }
 
-/// Stateful provider classifier for a record stream.
-///
-/// Each record is inspected exactly once. This keeps single-file auto
-/// detection linear even when a Claude session has a long metadata preamble.
+/// Stateful provider classifier that inspects each record in a stream once.
 #[derive(Debug, Default)]
 pub(crate) struct RecordClassifier {
     seen_first: bool,
@@ -154,9 +110,7 @@ impl RecordClassifier {
                 return self.classified;
             }
 
-            // A `dsh` log opens with its session header. Only an uncompressed
-            // root reaches the record classifier at all — a zstd log is routed
-            // by its frame magic before anything reads it as text.
+            // Only uncompressed `dsh` logs reach text classification; zstd logs route by frame magic earlier.
             if is_dsh_header(record) {
                 self.classified = Some(ExtensionType::DeepSeek);
                 return self.classified;
@@ -229,10 +183,6 @@ mod tests {
 
     #[test]
     fn test_detect_gemini_jsonl_meta_header() {
-        // Gemini CLI writes one event per line under `chats/`. The first
-        // line is a pure session-meta record carrying `sessionId` +
-        // `projectHash` and *no* `messages` array — the detector must
-        // recognise it even when further event lines follow in the same slice.
         let data = vec![
             json!({
                 "sessionId": "0ab84937-9fe7-4284-986a-33c832af0b6a",
@@ -269,11 +219,6 @@ mod tests {
 
     #[test]
     fn test_detect_gemini_rejects_legacy_single_object() {
-        // Legacy Gemini single-object exports used to be detected as Gemini, but
-        // the analyzer no longer supports that shape. We explicitly guard
-        // against mis-classifying a record with an inline `messages` array as
-        // Gemini so it falls through to Codex (and fails clearly) instead of
-        // silently producing an empty analysis.
         let data = vec![json!({
             "sessionId": "test-session",
             "projectHash": "abc123",
@@ -286,11 +231,6 @@ mod tests {
 
     #[test]
     fn test_detect_copilot_rejects_legacy_single_object() {
-        // Older Copilot CLI releases wrote a single-object dump with
-        // `sessionId` + `startTime` + `timeline`. We no longer support that
-        // shape — the detector should fall through to the default (Codex)
-        // rather than mis-routing the file to the JSONL analyzer, which
-        // would silently produce an empty analysis.
         let data = vec![json!({
             "sessionId": "test-session",
             "startTime": 1234567890,
@@ -303,8 +243,6 @@ mod tests {
 
     #[test]
     fn test_detect_copilot_jsonl_session_start() {
-        // Modern Copilot CLI writes one event per line; the first event is always
-        // `type == "session.start"` with `data.producer == "copilot-agent"`.
         let data = vec![
             json!({
                 "type": "session.start",
@@ -339,9 +277,6 @@ mod tests {
 
     #[test]
     fn test_detect_copilot_jsonl_rejects_non_copilot_producer() {
-        // A `session.start` event without a copilot producer tag should not
-        // trigger the Copilot branch — guards against false positives if
-        // another provider ever adopts the same discriminator name.
         let data = vec![json!({
             "type": "session.start",
             "data": {
@@ -386,8 +321,6 @@ mod tests {
 
     #[test]
     fn test_detect_claude_code_in_first_few_records() {
-        // A marker that only shows up in a later record still classifies the
-        // whole slice.
         let mut data = vec![json!({"field": "value1"}), json!({"field": "value2"})];
 
         data.push(json!({
@@ -401,13 +334,7 @@ mod tests {
 
     #[test]
     fn test_detect_claude_code_past_long_preamble() {
-        // Regression guard: Claude Code sessions can carry an arbitrary
-        // number of metadata preamble records (`permission-mode`,
-        // `file-history-snapshot`, `queue-operation`, …) before the first
-        // `parentUuid`-bearing line. The detector has no upper bound — it
-        // scans the entire slice the caller hands it. A previous
-        // implementation capped the scan at 5 records and silently
-        // mis-classified long-preamble sessions as Codex.
+        // Preamble length is unbounded before the first `parentUuid` record.
         let mut data: Vec<Value> = (0..50)
             .map(|i| json!({"type": "file-history-snapshot", "idx": i}))
             .collect();
@@ -420,16 +347,8 @@ mod tests {
         assert_eq!(result, ExtensionType::ClaudeCode);
     }
 
-    // ============================================================================
-    // classify_records — the streaming-friendly variant
-    // ============================================================================
-
     #[test]
     fn test_classify_returns_none_on_indeterminate_records() {
-        // A Claude metadata preamble with no `parentUuid` yet has no
-        // distinctive marker on any provider — `classify_records` must return
-        // `None` so the streaming auto-detect loop keeps reading more lines
-        // instead of committing to a default too early.
         let preamble: Vec<Value> = (0..5)
             .map(|i| json!({"type": "file-history-snapshot", "idx": i}))
             .collect();
@@ -438,8 +357,6 @@ mod tests {
 
     #[test]
     fn test_classify_commits_when_claude_marker_arrives() {
-        // Streaming behaviour: once the caller appends a record containing
-        // `parentUuid`, classification flips from `None` to `Some(ClaudeCode)`.
         let mut buffer: Vec<Value> = (0..3)
             .map(|i| json!({"type": "file-history-snapshot", "idx": i}))
             .collect();
@@ -451,8 +368,6 @@ mod tests {
 
     #[test]
     fn test_classify_commits_on_codex_type_marker() {
-        // Codex rollout logs use a small set of `type` enum values on each
-        // record — any one of them is a positive signal.
         for codex_type in ["session_meta", "turn_context", "event_msg", "response_item"] {
             let data = vec![json!({
                 "type": codex_type,
@@ -470,8 +385,6 @@ mod tests {
 
     #[test]
     fn test_classify_gemini_meta_header_first_line() {
-        // Gemini's first-line meta record is enough to commit without needing
-        // any subsequent event lines.
         let data = vec![json!({
             "sessionId": "s",
             "projectHash": "p",
@@ -482,8 +395,6 @@ mod tests {
 
     #[test]
     fn test_classify_copilot_jsonl_first_line() {
-        // Modern Copilot CLI's first line is `type: "session.start"` with a
-        // copilot producer — one line is enough.
         let data = vec![json!({
             "type": "session.start",
             "data": {"sessionId": "s", "producer": "copilot-agent"}
@@ -514,9 +425,6 @@ mod tests {
 
     #[test]
     fn test_detect_gemini_with_extra_fields() {
-        // Unknown extra fields on the Gemini JSONL meta-header must not stop
-        // detection — the analyzer relies on `sessionId` + `projectHash` + the
-        // absence of a `messages` array and ignores everything else.
         let data = vec![json!({
             "sessionId": "test",
             "projectHash": "hash",
@@ -531,9 +439,6 @@ mod tests {
 
     #[test]
     fn test_detect_copilot_with_extra_fields() {
-        // Unknown extra fields on the Copilot `session.start` event must not
-        // stop detection — the classifier only relies on
-        // `type == "session.start"` + `data.producer` starting with `copilot`.
         let data = vec![json!({
             "type": "session.start",
             "data": {
@@ -552,8 +457,6 @@ mod tests {
 
     #[test]
     fn test_detect_partial_gemini_fields() {
-        // A record missing either `sessionId` or `projectHash` must not be
-        // classified as Gemini even when it looks superficially similar.
         let without_project_hash = vec![json!({
             "sessionId": "test"
         })];
@@ -569,18 +472,14 @@ mod tests {
 
     #[test]
     fn test_detect_partial_copilot_fields() {
-        // A `session.start` event without a copilot-flavoured producer must
-        // not be classified as Copilot — guards against false positives when
-        // other providers ever adopt the same discriminator.
         let data = vec![json!({
             "type": "session.start",
             "data": {
                 "sessionId": "test"
-                // no `producer` field at all
             }
         })];
 
         let result = detect_extension_type(&data).unwrap();
-        assert_eq!(result, ExtensionType::Codex); // Should default to Codex
+        assert_eq!(result, ExtensionType::Codex);
     }
 }

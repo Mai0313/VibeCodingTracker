@@ -1,17 +1,6 @@
-//! On-disk caches for the latest per-provider quota snapshots
-//! (`~/.vct/quota/<provider>.json`).
+//! On-disk caches for the latest per-provider quota snapshots (`~/.vct/quota/<provider>.json`).
 //!
-//! Each is a single last-known-good file (not dated like the pricing cache,
-//! since we always want the latest value). A fresh `vct usage` launch seeds
-//! the panels from here instantly while the background workers refresh them.
-//!
-//! One file per provider is what keeps the write below a blind overwrite: each
-//! is written by exactly one quota worker, which holds the whole snapshot, so
-//! nothing here reads before it writes and no lock is needed.
-//!
-//! What lands on disk is the already-derived snapshot, so every file is stamped
-//! with the writing build's per-provider schema version, and a file carrying any
-//! other version is ignored instead of displayed.
+//! Each provider has a single last-known-good file overwritten atomically by its own quota worker without locking. Every file is wrapped with a per-provider derivation schema version and provider name; files with a mismatched version or provider are ignored on load.
 
 use crate::models::{
     AntigravityQuotaSnapshot, ClaudeQuotaSnapshot, CodexQuotaSnapshot, CopilotQuotaSnapshot,
@@ -23,24 +12,13 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// A normalized snapshot persisted to one of the per-provider cache files.
+/// Normalized quota snapshot persisted to `~/.vct/quota/<provider>.json`.
 ///
-/// [`Self::SCHEMA_VERSION`] versions how the stored fields are *derived*, not
-/// the JSON shape: the file holds normalized values (a gauge's `used_percent`,
-/// a pre-formatted money amount), so a build that computes one of them
-/// differently must not paint the previous build's numbers. A transient failure
-/// keeps the last-known-good snapshot indefinitely, so an offline or
-/// rate-limited upgrade would otherwise sit on them until its first success.
-///
-/// Bump a provider's version in the same change that alters how any of its
-/// snapshot fields is derived. A file whose version differs — including a
-/// pre-versioning file, which carries none — is dropped on load and the panel
-/// waits for its own first fetch.
+/// Bump [`Self::SCHEMA_VERSION`] whenever the derivation semantics of any stored field change.
 trait CachedQuota: Serialize + DeserializeOwned {
     /// Derivation-semantics version of this provider's snapshot.
     const SCHEMA_VERSION: u32;
-    /// The provider's name, which is both the file's stem and the `provider`
-    /// field a load checks it against.
+    /// Provider identifier used as both the cache file stem and the envelope's `provider` check.
     const PROVIDER: &'static str;
 }
 
@@ -74,27 +52,20 @@ impl CachedQuota for AntigravityQuotaSnapshot {
     const PROVIDER: &'static str = "antigravity";
 }
 
-/// The on-disk envelope: the writing build's schema version, the provider the
-/// snapshot belongs to, and the snapshot.
+/// On-disk cache envelope storing the schema version, provider name, and nested snapshot.
 ///
-/// The snapshot is nested rather than `#[serde(flatten)]`ed so both directions
-/// fail safe: a pre-versioning file has no `snapshot` key and is rejected here,
-/// and an older build reading this shape finds none of its own fields, so it
-/// shows an empty panel rather than reading values it would misinterpret.
+/// Nesting `snapshot` instead of flattening guarantees pre-versioning files fail to deserialize and older builds ignore versioned files.
 #[derive(Serialize, Deserialize)]
 struct VersionedCache<T> {
     /// [`CachedQuota::SCHEMA_VERSION`] of the build that wrote the file.
     schema_version: u32,
-    /// [`CachedQuota::PROVIDER`] of the snapshot below, so a file that ended up
-    /// under the wrong name says whose numbers it holds rather than painting
-    /// them onto another provider's panel.
+    /// [`CachedQuota::PROVIDER`] expected on load to reject misplaced cache files.
     provider: String,
     /// The normalized snapshot itself.
     snapshot: T,
 }
 
-/// Loads and parses a cache file, returning `None` when it is absent, corrupt,
-/// or was written under different derivation semantics.
+/// Returns the cached snapshot from `path`, or `None` if absent, invalid, or mismatched in schema version or provider.
 fn load_cache<T: CachedQuota>(path: Result<PathBuf>) -> Option<T> {
     let path = path.ok()?;
     let body = std::fs::read_to_string(&path).ok()?;
@@ -143,8 +114,7 @@ fn cache_path<T: CachedQuota>() -> Result<PathBuf> {
     get_quota_cache_path(T::PROVIDER)
 }
 
-/// Loads the last-known Claude quota snapshot, or `None` when it is absent,
-/// corrupt, or stamped with a schema version this build does not share.
+/// Returns the cached Claude quota snapshot, or `None` if absent, corrupt, or incompatible.
 pub fn load_claude_cache() -> Option<ClaudeQuotaSnapshot> {
     load_cache(cache_path::<ClaudeQuotaSnapshot>())
 }
@@ -154,8 +124,7 @@ pub fn save_claude_cache(snap: &ClaudeQuotaSnapshot) -> Result<()> {
     save_cache(cache_path::<ClaudeQuotaSnapshot>(), snap)
 }
 
-/// Loads the last-known Codex quota snapshot, or `None` when it is absent,
-/// corrupt, or stamped with a schema version this build does not share.
+/// Returns the cached Codex quota snapshot, or `None` if absent, corrupt, or incompatible.
 pub fn load_codex_cache() -> Option<CodexQuotaSnapshot> {
     load_cache(cache_path::<CodexQuotaSnapshot>())
 }
@@ -165,8 +134,7 @@ pub fn save_codex_cache(snap: &CodexQuotaSnapshot) -> Result<()> {
     save_cache(cache_path::<CodexQuotaSnapshot>(), snap)
 }
 
-/// Loads the last-known Copilot quota snapshot, or `None` when it is absent,
-/// corrupt, or stamped with a schema version this build does not share.
+/// Returns the cached Copilot quota snapshot, or `None` if absent, corrupt, or incompatible.
 pub fn load_copilot_cache() -> Option<CopilotQuotaSnapshot> {
     load_cache(cache_path::<CopilotQuotaSnapshot>())
 }
@@ -176,8 +144,7 @@ pub fn save_copilot_cache(snap: &CopilotQuotaSnapshot) -> Result<()> {
     save_cache(cache_path::<CopilotQuotaSnapshot>(), snap)
 }
 
-/// Loads the last-known Cursor quota snapshot, or `None` when it is absent,
-/// corrupt, or stamped with a schema version this build does not share.
+/// Returns the cached Cursor quota snapshot, or `None` if absent, corrupt, or incompatible.
 pub fn load_cursor_cache() -> Option<CursorQuotaSnapshot> {
     load_cache(cache_path::<CursorQuotaSnapshot>())
 }
@@ -187,8 +154,7 @@ pub fn save_cursor_cache(snap: &CursorQuotaSnapshot) -> Result<()> {
     save_cache(cache_path::<CursorQuotaSnapshot>(), snap)
 }
 
-/// Loads the last-known Grok quota snapshot, or `None` when it is absent,
-/// corrupt, or stamped with a schema version this build does not share.
+/// Returns the cached Grok quota snapshot, or `None` if absent, corrupt, or incompatible.
 pub fn load_grok_cache() -> Option<GrokQuotaSnapshot> {
     load_cache(cache_path::<GrokQuotaSnapshot>())
 }
@@ -198,8 +164,7 @@ pub fn save_grok_cache(snap: &GrokQuotaSnapshot) -> Result<()> {
     save_cache(cache_path::<GrokQuotaSnapshot>(), snap)
 }
 
-/// Loads the last-known Antigravity quota snapshot, or `None` when it is
-/// absent, corrupt, or stamped with a schema version this build does not share.
+/// Returns the cached Antigravity quota snapshot, or `None` if absent, corrupt, or incompatible.
 pub fn load_antigravity_cache() -> Option<AntigravityQuotaSnapshot> {
     load_cache(cache_path::<AntigravityQuotaSnapshot>())
 }
@@ -326,14 +291,11 @@ mod tests {
         );
         assert_eq!(body["provider"], "cursor");
         assert_eq!(body["snapshot"]["plan_type"], "pro");
-        // The other direction of the nesting: an older build cannot read this as
-        // a bare snapshot either, so it blanks the panel instead of misreading
-        // values whose derivation it does not share.
+        // Older builds also fail to deserialize this as a bare snapshot, preventing misread values.
         assert!(serde_json::from_str::<CursorQuotaSnapshot>(&raw).is_err());
     }
 
-    /// A pre-versioning file (the bare snapshot) is never displayed, even though
-    /// it still deserializes cleanly as a snapshot — the #111 regression.
+    /// A pre-versioning bare snapshot file is rejected even though it deserializes as `CursorQuotaSnapshot`.
     #[test]
     fn unversioned_cache_is_rejected() {
         let (_dir, path) = cache_file();
@@ -362,8 +324,7 @@ mod tests {
         assert!(load_cache::<CursorQuotaSnapshot>(Ok(path)).is_none());
     }
 
-    /// A well-formed file holding another provider's snapshot is dropped rather
-    /// than painted onto this provider's panel.
+    /// A well-formed file naming another provider is dropped.
     #[test]
     fn mismatched_provider_is_rejected() {
         let (_dir, path) = cache_file();

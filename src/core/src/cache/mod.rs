@@ -1,7 +1,6 @@
-//! Library-facing LRU cache of parsed session analyses.
+//! In-memory LRU cache of parsed [`crate::models::CodeAnalysis`] records.
 //!
-//! The global singleton is retained for source compatibility with library
-//! callers. CLI summary scans use the compact process-local cache instead.
+//! Provides [`FileParseCache`] and a process-wide singleton ([`GLOBAL_FILE_CACHE`]) for single-file library callers; batch scans use [`crate::ledger::SessionLedger`] instead.
 
 mod file_cache;
 
@@ -9,7 +8,7 @@ pub use file_cache::{CacheStats, FileParseCache};
 
 use std::sync::LazyLock;
 
-/// Global singleton retained for library callers.
+/// Process-wide [`FileParseCache`] singleton.
 pub static GLOBAL_FILE_CACHE: LazyLock<FileParseCache> = LazyLock::new(FileParseCache::new);
 
 /// Returns a reference to the global file parse cache.
@@ -17,7 +16,7 @@ pub fn global_cache() -> &'static FileParseCache {
     &GLOBAL_FILE_CACHE
 }
 
-/// Clears the global cache (primarily for testing).
+/// Clears all entries from [`GLOBAL_FILE_CACHE`].
 pub fn clear_global_cache() {
     GLOBAL_FILE_CACHE.clear();
 }
@@ -89,7 +88,6 @@ mod tests {
         let stats1 = cache.stats();
         let count1 = stats1.entry_count;
 
-        // A second parse of the same path reuses the entry instead of adding one.
         cache.get_or_parse(&file_path).unwrap();
         let stats2 = cache.stats();
 

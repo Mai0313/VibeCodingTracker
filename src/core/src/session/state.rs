@@ -1,44 +1,25 @@
-//! Mutable accumulator shared by every per-provider session parser.
+//! Shared per-session accumulator for file-operation metrics and detail records.
 //!
-//! Each provider parser ([`crate::session::claude`], [`crate::session::codex`],
-//! …) walks its own JSONL shape but funnels the file-operation facts it
-//! extracts through a single [`SessionParseState`], which tallies line /
-//! character counts and (in [`ParseMode::Full`]) accumulates the per-op detail
-//! records. Once the file is consumed the state is converted into one
-//! [`CodeAnalysisRecord`] via [`SessionParseState::into_record`].
+//! Provider parsers feed operations into [`SessionParseState`] and finalize it into a [`CodeAnalysisRecord`] with [`SessionParseState::into_record`].
 use crate::constants::{FastHashMap, FastHashSet};
 use crate::models::*;
 use crate::utils::count_lines;
 use serde_json::Value;
 
-/// Controls how much per-operation detail the session parser retains.
+/// Controls how much per-operation detail a session parser retains.
 ///
-/// `Full` keeps everything that ends up in the public JSON output
-/// (file contents on `Write`, old/new strings on `Edit`, command text on
-/// `Bash`). `UsageOnly` skips those allocations — counts and totals are
-/// still accurate, but the per-detail `Vec`s stay empty. Callers that only
-/// consume `conversation_usage` / `tool_call_counts` / `total_*_lines`
-/// (the `usage` command, the aggregated `analysis` path) should pick
-/// `UsageOnly` to avoid pulling entire file bodies into memory on every
-/// session parse.
+/// Both variants produce identical scalar counts, line/character totals, and unique-file counts; only per-operation detail vectors differ.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseMode {
-    /// Retain everything that ends up in the JSON output, including file
-    /// bodies and old/new edit strings.
+    /// Retains full per-operation detail records, including file contents, edit diffs, and command text.
     Full,
-    /// Skip per-detail allocations; keep only counts and totals.
+    /// Omits per-operation detail records and retains only scalar counts and totals.
     UsageOnly,
 }
 
-/// Common parse state shared by all per-provider session parsers.
+/// Accumulator for a single session's file operations, tool counts, and metadata.
 ///
-/// Construct with [`SessionParseState::new`] (full detail) or
-/// [`SessionParseState::with_mode`], populate the metadata fields
-/// (`folder_path`, `git_remote`, `task_id`) directly as the provider header
-/// is read, feed file operations through the `add_*` helpers, then call
-/// [`SessionParseState::into_record`] to produce the final
-/// [`CodeAnalysisRecord`]. Not thread-safe; one instance parses one file on
-/// one thread.
+/// Populate `folder_path`, `git_remote`, and `task_id` from provider metadata, record operations via the `add_*` methods, and call [`SessionParseState::into_record`] to build a [`CodeAnalysisRecord`].
 pub struct SessionParseState {
     /// Detail-retention level chosen at construction.
     pub mode: ParseMode,
@@ -94,12 +75,7 @@ impl SessionParseState {
         Self::with_mode(ParseMode::Full)
     }
 
-    /// Creates an empty parse state with the given detail-retention `mode`.
-    ///
-    /// In [`ParseMode::Full`] the detail `Vec`s are pre-sized to typical session
-    /// sizes; in [`ParseMode::UsageOnly`] they stay empty, so pre-sizing them is
-    /// skipped. `unique_files` is populated in both modes — `total_unique_files`
-    /// is a scalar total that must stay exact — so it is pre-sized in both.
+    /// Returns an empty parse state configured with `mode`.
     pub fn with_mode(mode: ParseMode) -> Self {
         let pre = matches!(mode, ParseMode::Full);
         Self {
@@ -139,12 +115,9 @@ impl SessionParseState {
         }
     }
 
-    /// Records a `Read` operation against `path` with the read `content`.
+    /// Records a `Read` operation for `path` with `content` at epoch-millisecond timestamp `ts`.
     ///
-    /// Trailing newlines are stripped before counting. No-op (and no count
-    /// bump) when the trimmed content is empty or when `path` normalizes to
-    /// an empty string. The detail record is only stored in
-    /// [`ParseMode::Full`]; counts and unique-file tracking accrue in both modes.
+    /// Strips trailing `\n` characters before counting lines and characters. Does nothing if the trimmed content is empty or `path` normalizes to an empty string. Stores a detail record only in [`ParseMode::Full`].
     pub fn add_read_detail(&mut self, path: &str, content: &str, ts: i64) {
         let trimmed = content.trim_end_matches('\n');
         let line_count = count_lines(trimmed);
@@ -185,12 +158,9 @@ impl SessionParseState {
         }
     }
 
-    /// Records a `Write` operation against `path` with the written `content`.
+    /// Records a `Write` operation for `path` with `content` at epoch-millisecond timestamp `ts`.
     ///
-    /// Trailing newlines are stripped before counting. No-op when `path`
-    /// normalizes to an empty string (an empty body is still counted as a
-    /// zero-line write). The full detail (including `content`) is stored only in
-    /// [`ParseMode::Full`]; unique-file tracking remains active in both modes.
+    /// Strips trailing `\n` characters before counting; empty `content` is recorded as a zero-line write. Does nothing if `path` normalizes to an empty string. Stores a detail record only in [`ParseMode::Full`].
     pub fn add_write_detail(&mut self, path: &str, content: &str, ts: i64) {
         let trimmed = content.trim_end_matches('\n');
         let line_count = count_lines(trimmed);
@@ -219,12 +189,9 @@ impl SessionParseState {
         self.tool_counts.write += 1;
     }
 
-    /// Records an `Edit` operation against `path`, replacing `old` with `new`.
+    /// Records an `Edit` operation for `path`, replacing `old` with `new` at epoch-millisecond timestamp `ts`.
     ///
-    /// When `old` is empty but `new` is not, the edit is reclassified as a
-    /// `Write` (a new-file creation expressed as a diff) and forwarded to
-    /// [`SessionParseState::add_write_detail`]. Otherwise delegates to
-    /// [`SessionParseState::add_edit_detail_raw`].
+    /// Reclassifies the operation as a `Write` via [`SessionParseState::add_write_detail`] when `old` is empty and `new` is non-empty after stripping trailing `\n`; otherwise forwards to [`SessionParseState::add_edit_detail_raw`].
     pub fn add_edit_detail(&mut self, path: &str, old: &str, new: &str, ts: i64) {
         if old.trim_end_matches('\n').is_empty() && !new.trim_end_matches('\n').is_empty() {
             self.add_write_detail(path, new, ts);
@@ -234,13 +201,9 @@ impl SessionParseState {
         self.add_edit_detail_raw(path, old, new, ts);
     }
 
-    /// Records an `Edit` operation against `path` without the new-file
-    /// reclassification in [`SessionParseState::add_edit_detail`].
+    /// Records an `Edit` operation for `path` without reclassifying empty `old` as a `Write`.
     ///
-    /// Used for patch hunks that update an existing file, where an empty `old`
-    /// just means an insert-only hunk. The line/character tally is taken from
-    /// the trimmed `new` content. No-op when `path` normalizes to an empty
-    /// string; full detail stored only in [`ParseMode::Full`].
+    /// Counts lines and characters from `new` after stripping trailing `\n`. Does nothing if `path` normalizes to an empty string. Stores a detail record only in [`ParseMode::Full`].
     pub fn add_edit_detail_raw(&mut self, path: &str, old: &str, new: &str, ts: i64) {
         let trimmed_new = new.trim_end_matches('\n');
         let trimmed_old = old.trim_end_matches('\n');
@@ -272,11 +235,9 @@ impl SessionParseState {
         self.tool_counts.edit += 1;
     }
 
-    /// Records a `Bash`/run-command invocation with its `command` text.
+    /// Records a shell command invocation with `command` and `description` at epoch-millisecond timestamp `ts`.
     ///
-    /// No-op (and no count bump) when `command` is empty after trimming. The
-    /// detail record (attributed to `folder_path`) is stored only in
-    /// [`ParseMode::Full`]; the `bash` count accrues in both modes.
+    /// Does nothing if `command` is empty after trimming whitespace. Stores a detail record (attributed to `folder_path`) only in [`ParseMode::Full`].
     pub fn add_run_command(&mut self, command: &str, description: &str, ts: i64) {
         let command = command.trim();
         if command.is_empty() {
@@ -301,10 +262,7 @@ impl SessionParseState {
         self.tool_counts.bash += 1;
     }
 
-    /// Resolves `path` to an absolute path, joining it onto `folder_path`.
-    ///
-    /// Returns the input unchanged when it is already absolute, when it is
-    /// empty, or when `folder_path` is empty (nothing to join against).
+    /// Returns `path` joined onto `folder_path`, or `path` unchanged if it is empty, already absolute, or `folder_path` is empty.
     pub fn normalize_path(&self, path: &str) -> String {
         if path.is_empty() {
             return String::new();
@@ -325,12 +283,11 @@ impl SessionParseState {
             .to_string()
     }
 
-    /// Merges another accumulator created with the same parse mode.
+    /// Combines `other` into `self`, summing counts and totals, taking the maximum `last_ts`, and filling empty metadata fields from `other`.
     ///
-    /// This is used when a provider must deduplicate message revisions before
-    /// producing one session record. Detail vectors remain empty in
-    /// [`ParseMode::UsageOnly`], while scalar totals and unique paths are
-    /// combined in both modes.
+    /// # Panics
+    ///
+    /// Panics in debug builds if `self.mode != other.mode`.
     pub fn merge(&mut self, mut other: Self) {
         debug_assert_eq!(self.mode, other.mode);
         self.write_details.append(&mut other.write_details);
@@ -364,10 +321,7 @@ impl SessionParseState {
         }
     }
 
-    /// Consumes the state into a finished [`CodeAnalysisRecord`].
-    ///
-    /// `conversation_usage` is the per-model token map the provider parser
-    /// accumulated separately; it is folded into the record verbatim.
+    /// Consumes this state and returns a [`CodeAnalysisRecord`] carrying `conversation_usage`.
     pub fn into_record(self, conversation_usage: FastHashMap<String, Value>) -> CodeAnalysisRecord {
         CodeAnalysisRecord {
             total_unique_files: self.unique_files.len(),
@@ -479,7 +433,6 @@ mod tests {
 
         state.add_edit_detail("new_file.rs", "", "new content", 1234567890);
 
-        // Should be recorded as write, not edit
         assert_eq!(state.write_details.len(), 1);
         assert_eq!(state.edit_details.len(), 0);
         assert_eq!(state.tool_counts.write, 1);
@@ -627,7 +580,7 @@ mod tests {
         assert_eq!(state.write_details.len(), 2);
         assert_eq!(state.edit_details.len(), 1);
         assert_eq!(state.run_details.len(), 2);
-        assert_eq!(state.total_read_lines, 6); // 1 + 2 + 3
+        assert_eq!(state.total_read_lines, 6);
         assert_eq!(state.tool_counts.read, 3);
         assert_eq!(state.tool_counts.write, 2);
         assert_eq!(state.tool_counts.edit, 1);

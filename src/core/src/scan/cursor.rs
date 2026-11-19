@@ -1,10 +1,6 @@
-//! The ledger scan of Cursor's per-conversation chat stores.
+//! Ledger-backed scanner for Cursor's per-conversation SQLite chat stores.
 //!
-//! Every store is its own session and its own source, so it is stamped and
-//! settled like a session log; the two halves are read by different queries
-//! (usage reads only the gauge nodes, analysis also the tool-result blobs),
-//! so each half carries its own stamp. Every stamp also carries the shared
-//! model-attribution database, whose change re-reads every store.
+//! Each chat store is tracked as an independent session with separate usage and analysis stamps. Every stamp includes the shared model-attribution tracking database; changes to that database invalidate all stores.
 
 use super::compact::{CompactSink, cutoff_string, fold_days, fold_present, fold_unseen};
 use super::database::{DatabaseHalfRead, group_usage_rows};
@@ -132,10 +128,7 @@ pub(crate) fn scan_cursor_stores(
         diagnostics.record_hard_failure(provider, &failure.path, failure.error);
     }
 
-    // A store's model comes from the tracking database, read once per scan.
-    // When that read fails the stores are still read and folded, but nothing
-    // is stamped or written: an attribution made without it is not one worth
-    // keeping.
+    // Read the shared tracking DB once; if it fails, fold stores without stamping or caching their unattributed results.
     let (conv_models, tracking_fingerprint, tracking_ok) =
         match load_conversation_model_snapshot(tracking_db) {
             Ok(snapshot) => (snapshot.models, snapshot.fingerprint, true),

@@ -13,16 +13,9 @@ use vct_core::pricing::{ModelPricingMap, fetch_model_pricing};
 use vct_core::usage::UsageData;
 use vct_core::utils::format_number;
 
-/// Prints token usage to stdout as a colored per-model table plus a
-/// per-provider totals footer.
+/// Prints `usage_data` to stdout as a colored per-model table and a per-provider totals footer.
 ///
-/// The "Output" column folds `reasoning_tokens` back into the displayed number
-/// so each row reconciles with "Total Tokens", while cost is priced against the
-/// separated buckets. Prints a "no usage data" message when empty. A failed
-/// pricing fetch warns on stderr and leaves LiteLLM-priced models at zero cost;
-/// providers carrying their own stored cost keep it. When `merge` is set, rows
-/// sharing a base model name across provider
-/// prefixes (e.g. `openai/gpt-5.5` + `azure/gpt-5.5`) are collapsed into one.
+/// The Output column includes `reasoning_tokens` to match Total Tokens, while cost uses the separated buckets. Prints a no-data notice when empty. On pricing fetch failure, warns on stderr and prices LiteLLM-backed models at `$0.00` while keeping provider-stored costs. When `merge` is `true`, collapses rows sharing a base model name across provider prefixes (for example, `openai/gpt-5.5` and `azure/gpt-5.5`).
 pub fn display_usage_table(usage_data: &UsageData, merge: bool) {
     if usage_data.models.is_empty() {
         println!("No usage data found in enabled provider sessions");

@@ -4,13 +4,9 @@ use comfy_table::Color as TableColor;
 use ratatui::style::Color as RatatuiColor;
 use vct_core::models::Provider;
 
-/// Per-provider display configuration paired with the provider's totals.
+/// Per-provider display configuration paired with borrowed totals (`T`).
 ///
-/// Bundles a borrowed stats value (`T`) with the label and the matching color
-/// for each renderer, so the TUI ([`tui_color`](Self::tui_color)) and the
-/// static table ([`table_color`](Self::table_color)) stay visually consistent
-/// for a given provider. Construct via [`ProviderTotal::new`] (a known
-/// provider) or [`ProviderTotal::new_overall`] (the summary row).
+/// Pairs a provider's label with matching [`tui_color`](Self::tui_color) and [`table_color`](Self::table_color) values across renderers. Construct via [`ProviderTotal::new`] or [`ProviderTotal::new_overall`].
 pub struct ProviderTotal<'a, T> {
     /// Human-readable provider name shown in the row.
     pub label: &'static str,
@@ -24,7 +20,7 @@ pub struct ProviderTotal<'a, T> {
     pub emphasize: bool,
 }
 
-/// Foreground color used to draw `provider`'s dot in the TUI.
+/// Returns the TUI foreground color for `provider`.
 pub const fn provider_tui_color(provider: Provider) -> RatatuiColor {
     match provider {
         Provider::ClaudeCode => RatatuiColor::Cyan,
@@ -42,11 +38,7 @@ pub const fn provider_tui_color(provider: Provider) -> RatatuiColor {
 }
 
 impl<'a, T> ProviderTotal<'a, T> {
-    /// Creates a per-provider total row with the provider's canonical label and colors.
-    ///
-    /// The label comes from [`Provider::display_name`] and each provider maps to
-    /// a fixed color pair (e.g. Claude → cyan, Codex → yellow). The caller
-    /// chooses whether to `emphasize` (bold) the row.
+    /// Creates a per-provider total row with `provider`'s canonical label and renderer colors.
     pub fn new(provider: Provider, stats: &'a T, emphasize: bool) -> Self {
         let tui_color = provider_tui_color(provider);
         let (label, table_color) = match provider {
@@ -72,10 +64,7 @@ impl<'a, T> ProviderTotal<'a, T> {
         }
     }
 
-    /// Creates the "All Providers" summary row (sum across every provider).
-    ///
-    /// Always magenta and always emphasized, to set it apart from the
-    /// per-provider rows.
+    /// Creates an emphasized magenta "All Providers" summary row.
     pub fn new_overall(stats: &'a T) -> Self {
         Self {
             label: "All Providers",

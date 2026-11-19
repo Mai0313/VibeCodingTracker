@@ -1,11 +1,6 @@
-//! Token-usage aggregation across provider session directories.
+//! Token-usage aggregation, pricing, and summary projection across all providers.
 //!
-//! Rolls parsed [`CodeAnalysis`](crate::models::CodeAnalysis) records up into
-//! [`UsageData`] for the `usage` view. [`aggregate_usage_from_home`] is the
-//! home-resolved entry point and [`aggregate_usage_from_paths`] its
-//! test/injection twin; [`scan_usage_priced`] wraps the pricing-then-scan
-//! pipeline, [`price_usage_data`] builds the priced JSON payload, and
-//! [`summary`] builds the aggregated view the display renders.
+//! Rolls parsed [`CodeAnalysis`](crate::models::CodeAnalysis) records into [`UsageData`] via [`aggregate_usage_from_home`] or [`aggregate_usage_from_paths`]. [`scan_usage_priced`] combines pricing lookup with scanning, [`price_usage_data`] builds the priced JSON payload, and [`summary`] builds the sorted table and per-provider totals.
 
 pub mod aggregator;
 pub mod pipeline;
@@ -14,10 +9,7 @@ pub mod summary;
 
 pub use aggregator::*;
 pub use pipeline::{PricedUsageScan, scan_usage_priced};
-pub use priced::{PricedUsageRow, price_usage_data};
-// Shared merged-cost resolver used by both the `usage --json` payload and the
-// `summary` roll-up.
 pub(crate) use priced::resolve_merged_model_breakdown;
-// Now lives in `utils`; re-exported to keep the historical
-// `usage::normalize_usage_value` path working for library callers.
+pub use priced::{PricedUsageRow, price_usage_data};
+// Re-exported from `utils` to preserve the `usage::normalize_usage_value` public path.
 pub use crate::utils::normalize_usage_value;

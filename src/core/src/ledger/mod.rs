@@ -1,18 +1,8 @@
-//! The persistent per-session ledger behind the `usage` and `analysis` scans.
+//! Persistent per-session ledger backing the `usage` and `analysis` scans.
 //!
-//! One file per provider under `~/.vct/sessions/` holds, for every session
-//! the scans have ever read, its per-day token buckets, file-operation
-//! counters and the stamps of the read that produced them. A scan loads the
-//! ledger, re-reads only the sources whose stamps changed, folds every entry
-//! whose day falls in the requested range, and writes the ledger back. A
-//! session whose source is gone keeps its entry and keeps contributing, which
-//! is what makes an `--all` total survive the assistants pruning their own
-//! history. vct never deletes a ledger file: an unreadable one is set aside
-//! under a new name and a newer one is left alone. The one thing it removes
-//! from the directory is the temp file of a save that was killed mid-write.
+//! One file per provider under `~/.vct/sessions/` stores per-day token buckets, file-operation counters, and read stamps for every scanned session. Scans re-read only sources whose stamps changed, fold entries within the requested date range, and persist updates. Sessions whose source files are later deleted remain in the ledger and continue contributing to totals.
 //!
-//! `analysis --json` and `analysis FILE` are full-parse paths that never touch
-//! the ledger, so retained sessions appear in every view but those two.
+//! Ledger files are never deleted: unreadable files are renamed aside, and files written by a newer schema version are left read-only. Only stale temporary files left by interrupted saves are removed. `analysis --json` and `analysis FILE` perform full parses without consulting the ledger, so retained sessions are omitted from those two views.
 
 pub(crate) mod format;
 pub(crate) mod key;
@@ -39,9 +29,7 @@ pub(crate) use tiny_map::TinyMap;
 /// The directory under `~/.vct` that holds the per-provider ledger files.
 pub const LEDGER_DIR_NAME: &str = "sessions";
 
-/// How old a temp file in the ledger directory must be to count as abandoned.
-///
-/// A save takes seconds, so anything this old belongs to no running process.
+/// Minimum age before an atomic-save temp file in the ledger directory is treated as abandoned.
 const STALE_TEMP_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// Minimum file size worth spawning a worker thread for during [`SessionLedger::open`].
@@ -60,11 +48,9 @@ pub struct LedgerStats {
     pub retained: usize,
 }
 
-/// The ledger a scan reads from and writes to.
+/// Per-provider session ledger read and updated by scans.
 ///
-/// [`SessionLedger::new`] is in-memory only, for embedders and tests that want
-/// the incremental scan without touching the user's home;
-/// [`SessionLedger::open`] is what the CLI and the TUIs use.
+/// [`SessionLedger::new`] creates an in-memory-only ledger; [`SessionLedger::open`] loads and persists files on disk.
 pub struct SessionLedger {
     dir: Option<PathBuf>,
     providers: FastHashMap<ExtensionType, ProviderLedger>,
@@ -83,7 +69,7 @@ impl Default for SessionLedger {
 }
 
 impl SessionLedger {
-    /// An empty ledger that never touches the disk.
+    /// Creates an empty in-memory ledger that never touches disk.
     pub fn new() -> Self {
         Self {
             dir: None,
@@ -96,11 +82,9 @@ impl SessionLedger {
         }
     }
 
-    /// Loads every provider's ledger file under `<cache_dir>/sessions/`.
+    /// Loads all provider ledger files under `<cache_dir>/sessions/`.
     ///
-    /// Never fails: a missing file is an empty provider, an unreadable one is
-    /// renamed aside (never deleted) and logged, and one written by a newer vct
-    /// is left exactly as it is and that provider is never written back.
+    /// Missing files start empty, unreadable files are renamed aside and logged, and files with a newer schema version are left untouched and marked read-only.
     pub fn open(cache_dir: &Path) -> Self {
         let dir = cache_dir.join(LEDGER_DIR_NAME);
         remove_stale_temp_files(&dir);
@@ -143,23 +127,18 @@ impl SessionLedger {
         }
     }
 
-    /// Where this ledger's files live, or `None` for an in-memory ledger.
+    /// Returns the directory holding this ledger's files, or `None` if in-memory only.
     pub fn dir(&self) -> Option<&Path> {
         self.dir.as_deref()
     }
 
     /// Writes every provider whose entries changed since the last save.
     ///
-    /// Each file is replaced atomically, so a concurrent reader sees the old
-    /// file or the whole new one. A session another process wrote in the
-    /// meantime that this ledger never saw is adopted rather than overwritten,
-    /// so a long-running TUI cannot drop a session a one-shot scan recorded
-    /// just before its source went away. Providers that failed to load as
-    /// this build's format are skipped so their file is never overwritten.
+    /// Each file is replaced atomically. If a provider file changed on disk since it was loaded, unseen non-empty sessions from disk are adopted before writing; read-only providers (unreadable or newer schema version) are skipped.
     ///
     /// # Errors
     ///
-    /// Returns the first write failure after attempting every provider.
+    /// Returns the first write failure encountered after attempting all dirty providers.
     pub fn save(&mut self) -> Result<()> {
         let Some(dir) = &self.dir else {
             return Ok(());
@@ -210,15 +189,13 @@ impl SessionLedger {
         first_error.map_or(Ok(()), Err)
     }
 
-    /// [`save`](Self::save), but at most once per `min_interval`.
+    /// Calls [`Self::save`] if any provider is dirty and at least `min_interval` has elapsed since the previous save.
     ///
-    /// The first save is immediate, so a cold scan's whole parse lands on disk
-    /// right away; after that a live session that changes every refresh
-    /// rewrites its provider's file once a minute rather than every tick.
+    /// The first save on a ledger runs immediately.
     ///
     /// # Errors
     ///
-    /// As [`save`](Self::save).
+    /// Returns whatever [`Self::save`] returns.
     pub fn save_if_due(&mut self, min_interval: Duration) -> Result<()> {
         if !self.providers.values().any(|book| book.dirty) {
             return Ok(());
@@ -269,8 +246,7 @@ impl SessionLedger {
         self.retained += count;
     }
 
-    /// Takes one provider's book out of the ledger for the duration of its
-    /// scan; [`put_provider`](Self::put_provider) returns it.
+    /// Removes and returns `provider`'s book for scanning; pair with [`Self::put_provider`].
     pub(crate) fn take_provider(&mut self, provider: ExtensionType) -> ProviderLedger {
         self.providers.remove(&provider).unwrap_or_default()
     }
@@ -280,8 +256,7 @@ impl SessionLedger {
     }
 }
 
-/// One provider's sessions and, for a shared-database provider, the stamps of
-/// the database reads that produced them.
+/// One provider's sessions and, for shared-database providers, its whole-database read stamps.
 #[derive(Default)]
 pub(crate) struct ProviderLedger {
     pub(crate) source: HalfStamps,
@@ -333,15 +308,9 @@ fn current_disk_state(path: &Path) -> Option<DiskState> {
 }
 
 impl ProviderLedger {
-    /// Settles the sessions a scan did not find.
+    /// Marks unseen sessions missing as of `today` and drops unseen empty entries when `mark` is true.
     ///
-    /// When `mark` is set, a session not in `seen` is marked missing as of
-    /// `today` (its retained diagnostics dropped, since the source can no
-    /// longer be re-read) and one that holds no days at all is removed. A
-    /// scan whose discovery was partial passes `mark = false`: it cannot tell
-    /// a deleted source from one it failed to list, so it leaves the marks as
-    /// they are. Either way the unseen sessions stay in the book and are the
-    /// caller's to fold.
+    /// Pass `mark = false` after partial discovery so unreadable directories are not treated as deleted sources; missing entries have their retained failure diagnostics cleared.
     pub(crate) fn settle_unseen(&mut self, seen: &FastHashSet<String>, mark: bool, today: &str) {
         if !mark {
             return;
@@ -392,8 +361,7 @@ pub(crate) const ALL_PROVIDERS: [ExtensionType; 10] = [
     ExtensionType::Hermes,
 ];
 
-/// The file stem of a provider's ledger, the same name as its `[providers]`
-/// toggle in `config.toml`.
+/// Returns the ledger file stem for `provider`, matching its `[providers]` key in `config.toml`.
 pub(crate) fn provider_file_stem(provider: ExtensionType) -> &'static str {
     match provider {
         ExtensionType::ClaudeCode => "claude",
@@ -409,12 +377,12 @@ pub(crate) fn provider_file_stem(provider: ExtensionType) -> &'static str {
     }
 }
 
-/// `<dir>/<provider>.json`.
+/// Returns the ledger file path for `provider` inside `dir` (`<dir>/<provider>.json`).
 pub fn provider_path(dir: &Path, provider: ExtensionType) -> PathBuf {
     dir.join(format!("{}.json", provider_file_stem(provider)))
 }
 
-/// Today's local date, the way ledger days and missing marks are keyed.
+/// Returns today's local date (`YYYY-MM-DD`) as used for day keys and missing marks.
 pub(crate) fn today() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
 }
@@ -428,12 +396,9 @@ enum Adoption {
     Freeze,
 }
 
-/// Re-reads the provider file and adopts every session it holds that
-/// `sessions` does not, so a save never discards what another process wrote
-/// since this ledger loaded. In-memory entries win for a session both hold,
-/// and an entry holding no days is not adopted: it is either a blank or failed
-/// source, which costs one re-read to recover, or one this ledger has just
-/// settled away, which would otherwise come back on every save.
+/// Merges non-empty sessions present on disk at `path` but absent from `sessions`, keeping in-memory entries on conflict.
+///
+/// Empty disk entries are ignored so settled blank/failed sessions are not resurrected.
 fn adopt_unseen_sessions(path: &Path, sessions: &mut BTreeMap<String, SessionEntry>) -> Adoption {
     let body = match std::fs::read(path) {
         Ok(body) => body,
@@ -453,16 +418,12 @@ fn adopt_unseen_sessions(path: &Path, sessions: &mut BTreeMap<String, SessionEnt
             Adoption::Writable
         }
         Ok(file) if file.schema_version > SCHEMA_VERSION => Adoption::Freeze,
-        // An older or unreadable file: what this ledger holds was loaded from
-        // it or parsed since, so writing over it loses nothing.
+        // An older or unreadable file: what this ledger holds was loaded from it or parsed since, so writing over it loses nothing.
         _ => Adoption::Writable,
     }
 }
 
-/// Removes the temp files that saves killed mid-write left in `dir`.
-///
-/// A killed process cannot clean up after itself, and each leftover is as
-/// large as the provider ledger it was about to replace.
+/// Removes abandoned atomic-save temp files older than [`STALE_TEMP_AGE`] from `dir`.
 fn remove_stale_temp_files(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -500,8 +461,7 @@ fn load_provider(path: &Path) -> ProviderLedger {
             };
         }
         Err(error) => {
-            // A file that exists but cannot be read must not be overwritten by
-            // a ledger rebuilt from scratch.
+            // A file that exists but cannot be read must not be overwritten by a ledger rebuilt from scratch.
             log::warn!("cannot read session ledger {}: {error}", path.display());
             return ProviderLedger {
                 read_only: true,
@@ -543,8 +503,7 @@ fn load_provider(path: &Path) -> ProviderLedger {
     set_aside(path)
 }
 
-/// A file in another schema version: a newer one is frozen for the build that
-/// wrote it, an older one (none exists yet) is set aside like a corrupt file.
+/// Freezes a provider whose file has a newer schema version, or sets aside one with an older unmigratable version.
 fn set_aside_or_freeze(path: &Path, version: u32) -> ProviderLedger {
     if version > SCHEMA_VERSION {
         log::warn!(
@@ -563,9 +522,7 @@ fn set_aside_or_freeze(path: &Path, version: u32) -> ProviderLedger {
     set_aside(path)
 }
 
-/// Moves an unreadable file out of the way under a timestamped name and
-/// starts the provider empty. If even that fails the provider is frozen so
-/// the file is never overwritten.
+/// Renames an unreadable ledger file to a timestamped `.unreadable-*.json` sibling, or marks the provider read-only if renaming fails.
 fn set_aside(path: &Path) -> ProviderLedger {
     let stem = path
         .file_stem()
@@ -799,8 +756,7 @@ mod tests {
         ledger.put_provider(ExtensionType::ClaudeCode, book);
         ledger.save().unwrap();
 
-        // Removing an entry in the owning ledger must not resurrect it from disk
-        // when no external writer touched the file since the previous save.
+        // Removing an entry in the owning ledger must not resurrect it from disk when no external writer touched the file since the previous save.
         let mut book = ledger.take_provider(ExtensionType::ClaudeCode);
         book.sessions.remove("second");
         book.dirty = true;

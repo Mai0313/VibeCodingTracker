@@ -1,23 +1,14 @@
-//! Shared helpers for the integration test binaries.
+//! Shared hermetic helpers for integration tests.
 //!
-//! The whole point of these helpers is hermetic isolation **without** mutating
-//! process-global environment: [`TempHome`] builds a [`HelperPaths`] rooted at a
-//! `TempDir` via [`resolve_paths_from_home`], so a test can drop fixture session
-//! files into a fake home and call the `*_from_paths` aggregation entry points
-//! directly. No `HOME`/`XDG_*`/`VCT_OFFLINE` is ever touched, so every test runs
-//! in parallel and behaves identically locally and in CI.
+//! [`TempHome`] builds a [`HelperPaths`] rooted at a [`TempDir`] via [`resolve_paths_from_home`] without mutating process-global environment variables (`HOME`, `XDG_*`, `VCT_OFFLINE`), allowing tests to run in parallel against `*_from_paths` entry points.
 
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use vct_core::utils::{HelperPaths, resolve_paths_from_home};
 
-/// Absolute path to a file under the repo's `tests/fixtures/` directory.
+/// Returns the absolute path to `name` under the repository's `tests/fixtures/` directory.
 ///
-/// `name` is relative to that root, so it carries the category segment:
-/// `sessions/claude_code.jsonl`, `quota/wham_usage_response.json`.
-///
-/// Uses `CARGO_MANIFEST_DIR` so it resolves the same on any machine and
-/// regardless of the test's working directory.
+/// `name` is relative to `tests/fixtures/` (for example, `sessions/claude_code.jsonl` or `quota/wham_usage_response.json`).
 pub fn fixture(name: &str) -> PathBuf {
     // From `src/test-support` up to the repo root, then into `tests/fixtures`.
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -34,10 +25,7 @@ pub fn fixture_str(name: &str) -> String {
         .unwrap_or_else(|e| panic!("failed to read fixture {name}: {e}"))
 }
 
-/// Reads a fixture file under `tests/fixtures/` to bytes.
-///
-/// Needed for the compressed DeepSeek Harness session log, which is the one
-/// fixture that is not text.
+/// Reads a fixture file under `tests/fixtures/` into a byte vector.
 pub fn fixture_bytes(name: &str) -> Vec<u8> {
     std::fs::read(fixture(name)).unwrap_or_else(|e| panic!("failed to read fixture {name}: {e}"))
 }
@@ -60,15 +48,11 @@ pub fn append_cursor_json_blob(path: &Path, id: &str) {
         .expect("append Cursor JSON blob");
 }
 
-/// A temporary fake home directory plus the [`HelperPaths`] rooted inside it.
-///
-/// Every provider directory (`.claude`, `.codex`, `.gemini`, `.copilot`,
-/// `.cursor`, `.grok`, `.dsh`, `.hermes`, `.local/share/opencode`,
-/// `.config/cursor`) and the `~/.vct` cache resolve under `dir`, matching
-/// exactly what production would compute for a user whose `HOME` was this
-/// directory.
+/// Temporary fake home directory paired with the [`HelperPaths`] resolved under it.
 pub struct TempHome {
+    /// Underlying temporary directory, deleted on drop.
     pub dir: TempDir,
+    /// Provider and cache paths rooted at `dir`.
     pub paths: HelperPaths,
 }
 
@@ -86,7 +70,7 @@ impl TempHome {
         Self { dir, paths }
     }
 
-    /// The fake home root (what production would read from `$HOME`).
+    /// Returns the fake home root directory.
     pub fn home(&self) -> &Path {
         self.dir.path()
     }
@@ -194,10 +178,7 @@ impl TempHome {
         )
     }
 
-    /// Copies the synthetic Antigravity fixture conversation into
-    /// `~/.gemini/<app>/brain/<conversation>/` (its transcript) and
-    /// `~/.gemini/<app>/conversations/<conversation>.db` (its model map), where
-    /// `app` is `antigravity-cli`, `antigravity` or `jetski`.
+    /// Copies the synthetic Antigravity fixture conversation into `~/.gemini/<app>/brain/<conversation>/` (transcript) and `~/.gemini/<app>/conversations/<conversation>.db` (model map), where `app` is `antigravity-cli`, `antigravity`, or another build's directory name.
     pub fn put_antigravity_fixture_session(&self, app: &str, conversation: &str) -> PathBuf {
         const FIXTURE: &str = "sessions/antigravity/agy";
         const ID: &str = "5f0c2a9e-1b7d-4c3e-9a2f-6d8e4b1c7a30";

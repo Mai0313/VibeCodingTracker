@@ -1,14 +1,6 @@
-//! Quota orchestration for the `usage` panels.
+//! Quota orchestration and provider fetchers.
 //!
-//! Each supported provider (Claude / Codex / Copilot / Cursor / Grok /
-//! Antigravity) runs its own background worker ([`provider::spawn_quota_worker`])
-//! that refreshes a shared snapshot on the configured cadence, seeded from an
-//! on-disk cache. The provider-specific fetch (and, for Claude / Codex / Grok,
-//! token refresh) lives in [`claude`], [`wham`] (+ this module's [`CodexState`]),
-//! [`copilot`], [`cursor`], [`grok`], and [`antigravity`], which runs the agy
-//! CLI rather than calling an API; the shared HTTP + refresh primitives live in
-//! [`http`] and [`refresh`]. The one-shot `vct quota` raw fetchers
-//! (`fetch_*_raw`) are the reusable core entry points; the CLI does the render.
+//! Each provider runs a background worker ([`provider::spawn_quota_worker`]) that polls its quota source on the configured interval and persists snapshots via [`cache`]. Provider fetch and token-refresh logic lives in [`claude`], [`wham`] (with [`CodexState`] here), [`copilot`], [`cursor`], [`grok`], and [`antigravity`]; shared HTTP and OAuth refresh helpers live in [`http`] and [`refresh`]. The one-shot `fetch_*_raw` functions expose raw provider responses.
 
 pub mod antigravity;
 pub mod cache;
@@ -56,11 +48,7 @@ pub(crate) enum CodexWindowSlot {
     SevenDay,
 }
 
-/// Places a Codex window according to its reported period.
-///
-/// Older API responses and session logs can omit the period, so `fallback`
-/// preserves their historical positional meaning. An unrecognized reported
-/// period is ignored rather than assigned an incorrect fixed label.
+/// Assigns `window` to `five_hour` or `seven_day` by `period_seconds`, falling back to `fallback` when omitted and ignoring unrecognized periods.
 pub(crate) fn assign_codex_window(
     five_hour: &mut Option<QuotaWindow>,
     seven_day: &mut Option<QuotaWindow>,
@@ -83,33 +71,29 @@ pub(crate) fn assign_codex_window(
     }
 }
 
-/// Outcome of a Codex wham fetch (with reactive refresh).
+/// Outcome of a Codex `wham` fetch with reactive refresh.
 enum CodexFetch {
     Ok(CodexQuotaSnapshot),
-    /// Token rejected and refresh failed → show login hint (keep session data).
+    /// Token rejected and refresh failed; surface [`CODEX_LOGIN_HINT`] while retaining session fallback data.
     NeedsLogin,
-    /// Network / non-auth error → fall back to session logs.
+    /// Network or other non-auth error; fall back to local session logs.
     Transient,
 }
 
-/// Per-worker Codex state: an in-memory access token + refresh backoff.
+/// Per-worker Codex quota state holding the cached access token and refresh backoffs.
 ///
-/// Codex `auth.json` carries no explicit expiry, so refresh is **reactive**:
-/// the stored (or in-memory) access token is used until a Codex quota endpoint
-/// 401s, then it is refreshed and the rejected request is retried once.
+/// Refresh is reactive: the current access token is used until an endpoint returns HTTP 401, then refreshed and retried once.
 #[derive(Default)]
 pub struct CodexState {
-    /// Cached access token + the `auth.json` mtime it came from, so a re-login /
-    /// account switch (which rewrites the file) drops the stale token.
+    /// Cached `(access_token, auth_mtime)`; invalidated when `auth.json` changes on disk.
     token: Option<(String, Option<SystemTime>)>,
     cooldown: RefreshCooldown,
-    /// Separate backoff for a details-only 401, which must never blank a valid
-    /// usage snapshot or turn into a login hint.
+    /// Independent backoff for HTTP 401 responses from the optional reset-credit details endpoint.
     reset_credits_cooldown: RefreshCooldown,
 }
 
 impl CodexState {
-    /// One worker tick: wham API with reactive refresh, else session fallback.
+    /// Fetches a Codex quota snapshot from the `wham` API with reactive refresh, falling back to local session logs.
     pub fn resolve(
         &mut self,
         client: &reqwest::blocking::Client,
@@ -151,11 +135,7 @@ impl CodexState {
         }
     }
 
-    /// wham call with a reactive 401 → refresh → retry-once.
-    ///
-    /// The URL parameters are the usage, reset-credit details, and token
-    /// endpoints. Production passes the [`wham`] module constants; tests point
-    /// them at a local mock server so the full refresh path runs offline.
+    /// Fetches Codex usage from `wham_url` and optional reset-credit details from `reset_credits_url`, refreshing once via `token_url` on HTTP 401.
     fn fetch_with_refresh(
         &mut self,
         client: &reqwest::blocking::Client,
@@ -180,8 +160,7 @@ impl CodexState {
             }
         };
         let cur_mtime = file_mtime(auth);
-        // Reuse the cached token only if auth.json hasn't changed since we cached
-        // it; a re-login / account switch rewrites the file and must be picked up.
+        // Reuse the cached token only while `auth.json` is unchanged; a re-login or account switch rewrites the file.
         let token = match &self.token {
             Some((t, m)) if *m == cur_mtime => t.clone(),
             _ => file_token,
@@ -208,9 +187,7 @@ impl CodexState {
                 match wham::refresh_codex(client, auth, token_url) {
                     Ok(new_tok) => {
                         self.cooldown.clear();
-                        // The successful refresh just rewrote auth.json; key the
-                        // cache + cooldown on the post-write mtime (a stale one
-                        // would never suppress the next tick).
+                        // Key cache and cooldown on the post-refresh mtime because the refresh just rewrote `auth.json`.
                         let post_mtime = file_mtime(auth);
                         self.token = Some((new_tok.clone(), post_mtime));
                         match wham::call_wham(
@@ -232,8 +209,7 @@ impl CodexState {
                                 token_url,
                                 false,
                             ),
-                            // A transient retry error keeps the fresh token and
-                            // falls back to session data; only a 401 means login.
+                            // Keep the fresh token and fall back to session logs on a transient retry error; only HTTP 401 requires login.
                             WhamResult::Transient => CodexFetch::Transient,
                             WhamResult::Unauthorized => {
                                 self.cooldown.arm(now, post_mtime);
@@ -254,8 +230,7 @@ impl CodexState {
         }
     }
 
-    /// Enriches a successful usage snapshot and optionally refreshes once when
-    /// only the reset-credit details endpoint rejects the token.
+    /// Attaches optional reset-credit details to `snap`, refreshing once on HTTP 401 when `refresh_on_unauthorized` is true.
     #[allow(clippy::too_many_arguments)]
     fn finish_with_reset_credits(
         &mut self,
@@ -393,14 +368,12 @@ mod tests {
             _ => panic!("expected a recovered snapshot after refresh"),
         }
 
-        // The rotated token was persisted back to auth.json.
         let written: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&auth).unwrap()).unwrap();
         assert_eq!(written["tokens"]["access_token"], "new-access");
     }
 
-    /// A 401 from only the optional details endpoint refreshes once, retries
-    /// details with the new token, and keeps the already-successful usage body.
+    /// A 401 from only the optional details endpoint refreshes once, retries details with the new token, and keeps the usage snapshot.
     #[test]
     fn fetch_with_refresh_recovers_from_reset_credit_401() {
         let server = MockServer::start();
@@ -466,8 +439,7 @@ mod tests {
         }
     }
 
-    /// A failing details endpoint is best-effort: the usage snapshot survives
-    /// with the count `wham/usage` itself reported.
+    /// A failing details endpoint leaves the usage snapshot intact with the count reported by `wham/usage`.
     #[test]
     fn fetch_with_refresh_keeps_usage_when_details_fail() {
         let server = MockServer::start();
@@ -509,8 +481,7 @@ mod tests {
         }
     }
 
-    /// A details response that omits `available_count` still contributes its
-    /// expirations, and the count `wham/usage` reported is what survives.
+    /// A details response omitting `available_count` still contributes its expirations while keeping the `wham/usage` count.
     #[test]
     fn fetch_with_refresh_keeps_the_usage_count_when_details_omit_it() {
         let server = MockServer::start();
@@ -553,8 +524,7 @@ mod tests {
         }
     }
 
-    /// When refresh itself fails (token endpoint 400), the loop reports
-    /// `NeedsLogin` rather than looping or succeeding.
+    /// A failed token refresh returns `NeedsLogin` instead of retrying.
     #[test]
     fn fetch_with_refresh_needs_login_when_refresh_fails() {
         let server = MockServer::start();

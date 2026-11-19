@@ -54,9 +54,7 @@ pub(crate) fn parse_grok_session(path: &Path, mode: ParseMode) -> Result<ParsedA
     apply_metadata(&mut state, path, summary.as_ref())?;
     parse_updates(path, &mut state, &mut diagnostics)?;
 
-    // `contextTokensUsed` is a point-in-time context gauge, not billed usage;
-    // the cache-read bucket is what makes `CostSource::GrokGauge` price it at
-    // the model's cache-read rate.
+    // `contextTokensUsed` is a context gauge rather than billed usage; store it in `cache_read_input_tokens` so `CostSource::GrokGauge` prices it at the cache-read rate.
     let estimated_tokens = i64::try_from(signals.context_tokens_used).unwrap_or(i64::MAX);
     let mut usage = FastHashMap::default();
     usage.insert(
@@ -278,8 +276,7 @@ fn parse_updates(
                 }
                 diagnostics.record_recognized_source();
                 if !tracked {
-                    // Recognized above so it never looks like schema drift, but
-                    // mapped to no metric.
+                    // Recognized above to avoid schema drift, but mapped to no metric.
                     continue;
                 }
                 if status != "completed" {
@@ -309,9 +306,7 @@ fn is_tracked_tool(name: &str) -> bool {
     )
 }
 
-/// Grok tools we recognize but deliberately do not model. They orchestrate
-/// other tools rather than touching files, so counting them would invent
-/// metrics; recognizing them keeps them from registering as schema drift.
+/// Returns whether `name` is a recognized Grok orchestration tool intentionally excluded from metrics.
 fn is_known_unmodeled_tool(name: &str) -> bool {
     matches!(name, "spawn_subagent" | "get_command_or_subagent_output")
 }
@@ -336,9 +331,7 @@ fn apply_completed_tool(
                 .pointer("/FileContent/content")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            // `add_read_detail` counts nothing for a body that trims to no
-            // lines, so a newline-only read has to take the same branch as an
-            // empty one or the invocation vanishes from every counter.
+            // `add_read_detail` ignores content that trims to zero lines, so newline-only reads take the empty branch to keep the invocation count.
             if content.trim_end_matches('\n').is_empty() {
                 state.tool_counts.read += 1;
                 state.add_non_text_read_path(path);
@@ -351,8 +344,7 @@ fn apply_completed_tool(
             let Some(exit_code) = output.get("exit_code").and_then(Value::as_i64) else {
                 return false;
             };
-            // grep exits 1 for "no matches", which is still a completed search;
-            // any other exit code is a real failure and counts no Read.
+            // `grep` exit code 1 means "no matches" (still a completed Read); other non-zero codes are failures.
             if matches!(exit_code, 0 | 1) {
                 state.tool_counts.read += 1;
             }
@@ -379,9 +371,7 @@ fn apply_completed_tool(
                 return false;
             };
             if let Some(details) = search_replace_details(output) {
-                // One tool lifecycle is one Edit call however many hunks it
-                // applied, so the per-detail increments are rolled back to a
-                // single one below.
+                // Count one Edit invocation per tool lifecycle regardless of hunk count.
                 let edit_calls = state.tool_counts.edit;
                 for detail in details {
                     if let Some((old, new)) = search_replace_detail_strings(detail) {
@@ -661,7 +651,6 @@ mod tests {
             assert_eq!(state.tool_counts.bash, 0);
             assert_eq!(state.tool_counts.todo_write, 0);
             assert_eq!(diagnostics.partial_failure_count(), 0);
-            // Recognized (not schema drift), just not modeled.
             assert_eq!(diagnostics.recognized_records, 1);
         }
     }

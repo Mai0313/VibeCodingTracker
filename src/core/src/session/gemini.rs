@@ -1,11 +1,6 @@
-//! Parser for Gemini CLI session logs
-//! (`~/.gemini/tmp/<project_hash>/chats/*.jsonl`).
+//! Parser for Gemini CLI JSONL session logs (`~/.gemini/tmp/<project_hash>/chats/*.jsonl`).
 //!
-//! The first line is a session-meta record; every subsequent line is an
-//! event. The parser deduplicates repeated message ids across incremental
-//! updates and snapshots, while retaining messages later hidden by a rewind
-//! because their usage was billed and their tools already ran. It then processes
-//! only `type == "gemini"` messages, which carry usage and tool calls.
+//! Line 1 is a session-meta record and subsequent lines are append-only events. Repeated message ids across incremental updates and `$set.messages` snapshots resolve to the latest revision while preserving already-billed messages across `$rewindTo`; only `type == "gemini"` messages contribute usage and tool metrics.
 use crate::constants::FastHashMap;
 use crate::models::*;
 use crate::pricing::{TierClassifier, TierThresholds};
@@ -16,24 +11,13 @@ use anyhow::Result;
 use serde::Deserialize;
 use serde_json::Value;
 
-/// Parse Gemini CLI session events from the JSONL event stream.
+/// Parses Gemini CLI JSONL `events` for `session` into a [`CodeAnalysis`].
 ///
-/// `session` carries the first-line meta record (`sessionId` etc.), and
-/// `events` yields one parsed JSON value per subsequent line. The parser
-/// deduplicates append-only revisions (including `$set.messages` snapshots)
-/// into the historical message set, which holds `type == "gemini"` messages
-/// only; every other event just moves a diagnostics counter.
-///
-/// This is the only supported Gemini entry point — legacy single-object
-/// exports (`chats/<session>.json` with an inline `messages` array) are no
-/// longer handled.
+/// `session` is the parsed first-line metadata record and `events` yields each subsequent JSONL record. Repeated message ids across incremental updates and `$set.messages` snapshots resolve to the latest revision while retaining messages hidden by `$rewindTo`; only `type == "gemini"` messages contribute metrics.
 ///
 /// # Errors
 ///
-/// Returns `anyhow::Result` for parity with the other provider parsers, but
-/// has no fallible step. Non-`gemini` events are skipped, and unsupported
-/// Gemini message schemas only land in the parse diagnostics this wrapper
-/// discards.
+/// Currently infallible; non-`gemini` events and unsupported message schemas are skipped.
 pub fn parse_gemini_events<I>(
     session: GeminiSession,
     events: I,
@@ -45,7 +29,7 @@ where
     Ok(parse_gemini_events_with_diagnostics(session, events, mode, None)?.analysis)
 }
 
-/// Streaming Gemini parser with event-payload schema diagnostics.
+/// Parses Gemini CLI JSONL `events` into a [`ParsedAnalysis`] with schema diagnostics and optional context-tier classification.
 pub(crate) fn parse_gemini_events_with_diagnostics<I>(
     session: GeminiSession,
     events: I,
@@ -65,8 +49,7 @@ where
     for message in messages {
         diagnostics.merge(message.diagnostics);
         if let (Some(tokens), Some(model)) = (&message.tokens, &message.model) {
-            // One billed message is one request; `tokens.input` is its full
-            // prompt count (cached subset included).
+            // `tokens.input` already includes cached tokens, so it is the full request prompt size.
             let level = classifier
                 .as_mut()
                 .map_or(0, |classifier| classifier.level(model, tokens.input));
@@ -87,10 +70,7 @@ struct GeminiMessageAnalysis {
     diagnostics: ParseDiagnostics,
 }
 
-/// Minimal Gemini message shape needed by analysis.
-///
-/// Deliberately omits `content` and `thoughts` so neither mode retains those
-/// large fields while deduplicating revisions.
+/// Minimal Gemini message payload, omitting `content` and `thoughts` to keep deduplication memory bounded.
 #[derive(Deserialize)]
 struct GeminiAnalysisMessage {
     #[serde(default)]
@@ -103,14 +83,7 @@ struct GeminiAnalysisMessage {
     tool_calls: Vec<Value>,
 }
 
-/// Deduplicates Gemini's append-only chat log into its historical message set.
-///
-/// A message id may be appended repeatedly as tokens and tool results arrive,
-/// so only its latest revision is retained. `$set.messages` entries are merged
-/// by id instead of counted again. `$rewindTo` changes the CLI's visible chat,
-/// but does not undo already billed model calls or executed tools, so it does
-/// not remove historical analysis records. Each revision is compacted before
-/// storage, preserving the [`ParseMode::UsageOnly`] memory boundary.
+/// Deduplicates append-only `events` by message id (merging `$set.messages` snapshots and retaining `$rewindTo` history), compacting each revision under `mode`.
 fn deduplicate_messages<I>(
     events: I,
     mode: ParseMode,
@@ -228,9 +201,7 @@ fn upsert_message(
     };
 
     if let Some(&index) = positions.get(&id) {
-        // A later revision that carries no usage (tokens null / omitted) must
-        // not wipe out tokens already billed on an earlier revision of the same
-        // id; keep the prior revision's usage-bearing fields in that case.
+        // Preserve prior billed tokens and model when a later revision omits `tokens`.
         if analysis.tokens.is_none() {
             let prior = &mut messages[index];
             analysis.tokens = prior.tokens.take();
@@ -250,10 +221,7 @@ fn gemini_tokens_supported(tokens: &Value) -> bool {
     let Some(tokens) = tokens.as_object() else {
         return false;
     };
-    // Every `GeminiTokens` field defaults, so an empty object deserializes to
-    // all zeros and would pass as a clean scan that billed nothing. It carries
-    // no less drift than an object of only unknown keys, which is already
-    // refused below.
+    // Reject `{}` because all `GeminiTokens` fields default to zero and would silently bill nothing.
     if tokens.is_empty() {
         return false;
     }
@@ -293,13 +261,7 @@ fn gemini_tool_status(tool_call: &Value) -> GeminiToolStatus {
     }
 }
 
-/// A Gemini tool this parser tracks, resolved from the name in the log.
-///
-/// One variant per metric the tool folds into. [`TrackedTool::read_args`] and
-/// [`TrackedTool::record_invocation`] both match exhaustively on the enum, so a
-/// variant one of them forgets is a build error rather than a silently dropped
-/// metric. What the compiler cannot check is [`TrackedTool::from_name`] itself,
-/// which is why every tool name is spelled there and nowhere else.
+/// Gemini tools mapped to file-operation or invocation metrics; all tool-name aliases live in [`TrackedTool::from_name`].
 #[derive(Clone, Copy)]
 enum TrackedTool {
     Read,
@@ -311,32 +273,22 @@ enum TrackedTool {
 }
 
 impl TrackedTool {
-    /// Resolves a log name, or `None` for one this table does not list (the
-    /// meta tools `update_topic`, `task_complete`, … among them). A name absent
-    /// here contributes nothing at all, so a tool the parser should track but
-    /// this table misses is invisible rather than merely undetailed.
+    /// Returns the tracked tool for `name`, or `None` for untracked tools such as `update_topic` and `task_complete`.
     fn from_name(name: &str) -> Option<Self> {
         Some(match name {
             "read_file" => Self::Read,
             "write_file" | "create_file" => Self::Write,
-            // Current Gemini CLI emits `replace`; `edit_file` /
-            // `replace_in_file` were the historical names and are kept here as
-            // best-effort aliases in case older sessions are still being
-            // replayed through `vct analysis <file>`.
+            // `replace` is the current name; `edit_file` and `replace_in_file` support older session logs.
             "edit_file" | "replace_in_file" | "replace" => Self::Edit,
             "run_command" | "run_shell_command" | "execute_command" | "shell" => Self::Shell,
             "write_todos" => Self::TodoWrite,
-            // Counts as a read, but reports no content to attach, which is why
-            // it is not folded into `Read`.
+            // Distinct from `Read` because it reports no single-file content to attach.
             "read_many_files" => Self::ReadManyFiles,
             _ => return None,
         })
     }
 
-    /// Reads the arguments a successful call folds into metrics, or `None` when
-    /// this parser cannot read them — that call is counted as an invocation
-    /// only. Every argument key the parser knows, historical alias spellings
-    /// included, is listed here and nowhere else.
+    /// Extracts typed arguments for a successful call, or `None` if unreadable (caller falls back to an invocation count).
     fn read_args(self, tool_call: &Value) -> Option<ToolArgs<'_>> {
         let args = tool_call.get("args");
         Some(match self {
@@ -354,14 +306,9 @@ impl TrackedTool {
                 new_string: arg_str(args, &["new_string", "new_text"])?,
             },
             Self::Shell => ToolArgs::Shell {
-                // A blank command would be dropped by `add_run_command`,
-                // leaving the call with no metric at all, so it counts as
-                // unreadable here and is recorded as an invocation instead.
+                // Treat blank commands as unreadable because `add_run_command` drops them silently.
                 command: arg_str(args, &["command", "cmd"])
                     .filter(|command| !command.trim().is_empty())?,
-                // Optional, and absent from plenty of real calls: it is
-                // reported alongside the command, not part of what makes the
-                // call foldable.
                 description: arg_str(args, &["description"]).unwrap_or(""),
             },
             Self::TodoWrite => ToolArgs::TodoWrite,
@@ -369,8 +316,7 @@ impl TrackedTool {
         })
     }
 
-    /// Counts the call without claiming any file operation, for a call that
-    /// did not succeed or whose arguments this parser cannot read.
+    /// Increments the tool's invocation counter without recording file-operation details.
     fn record_invocation(self, state: &mut SessionParseState) {
         match self {
             Self::Read | Self::ReadManyFiles => state.tool_counts.read += 1,
@@ -382,12 +328,7 @@ impl TrackedTool {
     }
 }
 
-/// The arguments of a successful [`TrackedTool`] call, read once.
-///
-/// Building one *is* the schema check, so a key validation accepts cannot be a
-/// key the fold then fails to read: there is no second reader to disagree with.
-/// The two used to be separate `match` arms over [`TrackedTool`], each spelling
-/// out the alias pair of every argument that has one.
+/// Validated arguments of a successful [`TrackedTool`] call, shared by diagnostics and metric folding.
 enum ToolArgs<'a> {
     Read {
         file_path: &'a str,
@@ -424,9 +365,7 @@ impl ToolArgs<'_> {
                 old_string,
                 new_string,
             } => {
-                // `add_edit_detail_raw`, not `add_edit_detail`: an empty
-                // `old_string` here is an edit that replaced nothing, not a new
-                // file expressed as a diff, so it must not turn into a write.
+                // Use `add_edit_detail_raw` so an empty `old_string` stays an edit instead of converting into a write.
                 state.add_edit_detail_raw(file_path, old_string, new_string, ts);
             }
             Self::Shell {
@@ -439,17 +378,13 @@ impl ToolArgs<'_> {
     }
 }
 
-/// The string under the first of `keys` that `args` carries.
-///
-/// A key present but holding something other than a string ends the search: the
-/// log did spell the argument, just not in a shape this parser can read.
+/// Returns the string value of the first matching key in `keys`, returning `None` if that key is present with a non-string value.
 fn arg_str<'a>(args: Option<&'a Value>, keys: &[&str]) -> Option<&'a str> {
     let args = args?;
     keys.iter().find_map(|key| args.get(*key))?.as_str()
 }
 
-/// The `file_path` argument, which every variant carrying one requires to be
-/// non-empty; an operation against no path records nothing downstream.
+/// Returns the non-empty `file_path` string from `args`, if present.
 fn arg_file_path(args: Option<&Value>) -> Option<&str> {
     arg_str(args, &["file_path"]).filter(|path| !path.is_empty())
 }
@@ -472,11 +407,7 @@ fn record_message_diagnostics(message: &GeminiAnalysisMessage, diagnostics: &mut
     }
 }
 
-/// Converts the accumulated state into a single-record [`CodeAnalysis`],
-/// stamping the `task_id` from the session meta.
-///
-/// Gemini CLI records no workspace path, so `folder_path` and `git_remote`
-/// both stay empty; there is nothing to resolve a remote against.
+/// Builds a single-record [`CodeAnalysis`] with `session_id` (Gemini CLI logs omit workspace paths, leaving `folder_path` and `git_remote` empty).
 fn finalize_record(
     state: SessionParseState,
     conversation_usage: FastHashMap<String, Value>,
@@ -529,8 +460,7 @@ fn process_gemini_message(state: &mut SessionParseState, message: &GeminiAnalysi
     }
 }
 
-/// Attaches read content without letting `add_read_detail` increment the read
-/// count the caller already recorded.
+/// Attaches read details while preserving the caller's existing `tool_counts.read`.
 fn attach_read_detail(state: &mut SessionParseState, path: &str, content: &str, ts: i64) {
     let invocation_count = state.tool_counts.read;
     state.add_read_detail(path, content, ts);
@@ -621,8 +551,6 @@ mod tests {
 
     #[test]
     fn tokenless_revision_keeps_prior_billed_tokens() {
-        // A billed revision followed by a tokenless one (tokens null) of the same
-        // id keeps the earlier tokens, while the latest revision's tool calls win.
         let billed = assistant("message-1", "gemini-test", 42, json!([]));
         let mut tokenless = assistant(
             "message-1",
@@ -696,12 +624,6 @@ mod tests {
 
     #[test]
     fn every_tracked_name_folds_into_its_own_metric() {
-        // `TrackedTool::from_name` is the only place these names are spelled
-        // now, so an alias moved to the wrong variant no longer contradicts a
-        // second list a reader could hold it against. This is what catches it.
-        // An exhaustive `match self` rejects a variant a fold forgot, never a
-        // variant it folded into the wrong counter, which is what these
-        // expectations pin down.
         // Counters in order: read, write, edit, bash, todo_write.
         let cases = [
             ("read_file", [1, 0, 0, 0, 0]),
@@ -720,14 +642,10 @@ mod tests {
             ("update_topic", [0, 0, 0, 0, 0]),
         ];
 
-        // A successful call folds through `ToolArgs::record`, a failed one
-        // through `record_invocation`. They are separate matches, and a name
-        // must reach the same counter either way.
+        // Both `ToolArgs::record` (success) and `record_invocation` (error) must hit the same counter.
         for status in ["success", "error"] {
             for (name, expected) in cases {
-                // A superset of arguments, so whichever schema check applies to
-                // the name is satisfied and a successful call really does take
-                // the operation path instead of degrading to an invocation.
+                // Provide a superset of args so every tool passes validation and exercises `ToolArgs::record`.
                 let message = assistant(
                     "message-1",
                     "gemini-test",
@@ -884,9 +802,7 @@ mod tests {
         assert_eq!(record.total_edit_lines, 0);
         assert_eq!(record.total_write_lines, 0);
 
-        // The other way an edit can turn into a write: an `old_string` that is
-        // present but empty replaced nothing, which is not the same as a new
-        // file expressed as a diff. Only `add_edit_detail_raw` keeps them apart.
+        // An empty `old_string` must remain an edit rather than converting into a write.
         let empty_old = assistant(
             "empty-old-edit",
             "gemini-test",
@@ -914,12 +830,7 @@ mod tests {
 
     #[test]
     fn every_argument_alias_reaches_the_fold() {
-        // An argument's alias spellings are stated once, in
-        // `TrackedTool::read_args`, so a dropped alias no longer shows up as
-        // two lists disagreeing — it simply stops resolving. These assert on
-        // the folded content rather than on the counter, because a key that
-        // resolved to nothing would leave the counter right while the detail
-        // it carries went empty, which is the miscount this pairing produced.
+        // Assert on folded content, not just counters, because an unresolved alias still increments the invocation count.
         for (old_key, new_key) in [("old_string", "new_string"), ("old_text", "new_text")] {
             let mut args = json!({ "file_path": "/tmp/a.txt" });
             args[old_key] = json!("one");
@@ -988,9 +899,7 @@ mod tests {
 
     #[test]
     fn a_blank_command_is_counted_rather_than_dropped() {
-        // `add_run_command` drops a command that is empty after trimming, so a
-        // blank one must not be treated as readable: it would leave the call
-        // with no counter and no drift at all.
+        // `add_run_command` drops blank commands, so they must fail argument parsing and fall back to an invocation count.
         let message = assistant(
             "blank-command",
             "gemini-test",
@@ -1009,9 +918,6 @@ mod tests {
 
     #[test]
     fn an_unsupported_tool_status_records_nothing() {
-        // A status this parser does not recognize is neither a run nor a
-        // failure, so it moves no counter — unlike every other non-success
-        // status, which counts the invocation.
         let message = assistant(
             "unsupported-status",
             "gemini-test",

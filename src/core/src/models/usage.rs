@@ -1,25 +1,16 @@
-//! Token-usage aggregation types shared between the usage calculator and the
-//! display layer.
+//! Token-usage aggregation types.
 
 use crate::constants::FastHashMap;
 use serde::Serialize;
 
-/// Token usage data aggregated by model name (across all dates).
+/// Token usage aggregated by model name across dates.
 ///
-/// The value keeps the provider's own token shape, of which there are two:
-/// flat token keys (`input_tokens`, `output_tokens`, …) for every provider
-/// except Codex, which nests its counters under `total_token_usage`. Which
-/// keys a flat value carries still varies — Gemini's reasoning arrives as
-/// `thoughts_tokens` where the others use `reasoning_output_tokens`.
-/// `extract_token_counts` is what reads both shapes into disjoint buckets.
+/// Values retain each provider's wire shape: flat token keys (`input_tokens`, `output_tokens`, ...) for most providers, or nested under `total_token_usage` for Codex. Gemini reports reasoning as `thoughts_tokens` where other providers use `reasoning_output_tokens`.
 pub type UsageResult = FastHashMap<String, serde_json::Value>;
 
-/// Tracks the number of active days per AI provider.
+/// Distinct active day counts per provider and overall.
 ///
-/// Used for calculating daily averages when data is aggregated by model only.
-/// A day is counted from the session's own date: the file modification date
-/// for the file-backed providers, the stored row timestamp for the
-/// SQLite-backed ones.
+/// Active days come from the file modification date for file-backed providers and from stored row timestamps for SQLite-backed providers.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ProviderActiveDays {
     /// Distinct active days observed for Claude Code.
@@ -46,29 +37,9 @@ pub struct ProviderActiveDays {
     pub total: usize,
 }
 
-/// Per-provider usage data, bucketed by the provider that produced it rather
-/// than by model name.
+/// Per-model token usage bucketed by the originating provider.
 ///
-/// The top-level `UsageResult` in `UsageData` intentionally merges same-named
-/// models across providers (so the per-model table shows one row for
-/// `claude-sonnet-4-6` regardless of whether Claude Code, Copilot CLI, or
-/// both invoked it). That merge loses the *source* information though, which
-/// matters for the per-provider summary: once Copilot CLI stopped writing the
-/// `copilot` sentinel and started recording real model names, the old
-/// "classify each row by model-name prefix" logic mis-attributed every Copilot
-/// session to Claude Code. Keeping one `UsageResult` per provider lets the
-/// display layer sum tokens and cost by source with no prefix heuristics. It
-/// is populated at the same time as the global merged map.
-///
-/// There is deliberately no keyed accessor on this type. Its ten buckets are
-/// one per [`ExtensionType`](crate::models::ExtensionType) variant, so a
-/// [`Provider`](crate::models::Provider)-keyed lookup would carry an eleventh
-/// `Unknown` naming no bucket here. And nothing ever arrives holding a single
-/// key to look up: the summary and pricing passes each need all ten under a
-/// per-provider rule, one aggregation path names all ten fields directly, and
-/// the one that does key its write keys it on `ExtensionType`.
-// A `Provider`-keyed `get` / `get_mut` pair, reachable only through the equally
-// uncalled `UsageData::provider_usage`, was removed in #237.
+/// Preserves source attribution when multiple providers invoke the same model name. Holds one [`UsageResult`] per [`crate::models::ExtensionType`] variant and deliberately omits a [`crate::models::Provider`]-keyed lookup, as [`crate::models::Provider::Unknown`] has no bucket.
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct PerProviderUsage {
     /// Per-model usage attributed to Claude Code.

@@ -1,11 +1,6 @@
 // Integration tests for the persistent session ledger.
 //
-// These drive the ledger-backed scans against a `TempHome`, opening the ledger
-// under that home's `~/.vct` so nothing outside the temp directory is read or
-// written. What they pin is the ledger's contract rather than any parser's:
-// an unchanged source is never parsed twice, a source that is gone keeps
-// contributing, a changed one is re-read, and the time range never decides
-// what the ledger remembers.
+// These drive ledger-backed scans against a `TempHome`, opening the ledger under that home's `~/.vct` so nothing outside the temp directory is read or written. They pin the ledger contract: unchanged sources are not re-parsed, deleted sources keep contributing, changed sources are re-read, and the time range does not alter what the ledger remembers.
 
 use rusqlite::Connection;
 use std::path::Path;
@@ -212,7 +207,7 @@ fn a_deleted_session_keeps_contributing_and_is_marked_missing() {
         today()
     );
 
-    // Restoring the file clears the mark without a re-parse.
+    // Restoring the file clears `missing_since` and stops counting it as retained.
     home.put_claude_session(
         "project",
         "session.jsonl",
@@ -385,9 +380,7 @@ fn a_database_that_stops_being_readable_keeps_serving_its_sessions() {
     let before = usage(&home, TimeRange::All, providers, &mut ledger);
     ledger.save().unwrap();
 
-    // Every row turns into a schema this build does not understand: the read
-    // succeeds but understands nothing, so the sessions are served from the
-    // ledger, counted as retained, and not marked missing.
+    // Every row turns into a schema this build does not understand: the read succeeds but understands nothing, so the sessions are served from the ledger, counted as retained, and not marked missing.
     let connection = Connection::open(&home.paths.opencode_db).unwrap();
     connection
         .execute_batch(r#"UPDATE message SET data = '{"role":"assistant","futureUsage":{}}';"#)
@@ -498,7 +491,6 @@ fn a_stale_parser_stamp_rereads_present_sessions_and_keeps_missing_ones() {
     usage(&home, TimeRange::All, providers, &mut ledger);
     ledger.save().unwrap();
 
-    // A ledger written by a build whose parser differs from this one.
     let path = provider_path(
         &home.paths.cache_dir.join(LEDGER_DIR_NAME),
         ExtensionType::ClaudeCode,
@@ -636,8 +628,7 @@ fn an_antigravity_conversation_database_change_rereads_its_transcript() {
     usage(&home, TimeRange::All, providers, &mut ledger);
     assert_eq!(ledger.stats().parsed_sources, 0);
 
-    // The model map lives in the database, so losing it alone re-reads the
-    // untouched transcript, which now has no model to bill.
+    // The model map lives in the database, so losing it alone re-reads the untouched transcript, which now has no model to bill.
     let db = transcript
         .ancestors()
         .nth(5)
@@ -656,7 +647,7 @@ fn an_antigravity_conversation_database_change_rereads_its_transcript() {
 
 const MODEL: &str = "claude-sonnet-4-20250514";
 
-/// What `vct ledger export` prints for `home`.
+/// Returns the `vct ledger export` output for `home`.
 fn export_of(home: &TempHome) -> String {
     let mut ledger = open(home);
     usage(
@@ -915,9 +906,7 @@ fn export_refreshes_a_file_session_whose_analysis_half_is_missing() {
     let mut first = Vec::new();
     vct_core::remote::export_from_paths(&remote.paths, providers, &pool, None, &mut first).unwrap();
 
-    // Simulate a ledger entry whose usage stamp is current while its analysis
-    // stamp and counters were dropped: `export` must detect the missing half in
-    // its single walk and repopulate `analysis`.
+    // Simulate a ledger entry whose usage stamp is current while its analysis stamp and counters were dropped: `export` must detect the missing half in its single walk and repopulate `analysis`.
     let path = provider_path(
         &remote.paths.cache_dir.join(LEDGER_DIR_NAME),
         ExtensionType::ClaudeCode,

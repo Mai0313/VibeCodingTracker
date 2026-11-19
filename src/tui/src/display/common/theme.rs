@@ -1,18 +1,13 @@
-//! The app's palette: one accent, three state colors, and greys derived from
-//! the terminal's own foreground and background.
+//! Terminal-adaptive color palette for the TUI.
 //!
-//! The greys are blends, not fixed values, because a border or a selected-row
-//! tint is only as visible as its distance from the background it is drawn
-//! on, and the background is the user's. [`probe`] asks the terminal for both
-//! colors once at startup; where it cannot, or where the terminal has no
-//! 24-bit color, [`Theme::ANSI`] stands in.
+//! [`probe`] queries the terminal's default foreground and background once at startup to derive blended greys and background-adapted accent/state colors; [`Theme::ANSI`] is the fallback when probing is unavailable or the terminal lacks 24-bit color.
 
 use ratatui::style::{Color, Style};
 use std::sync::OnceLock;
 
 type Rgb = (u8, u8, u8);
 
-/// The accent and state colors on a dark background.
+// Default accent and state colors on a dark background.
 const ACCENT: Rgb = (86, 212, 221);
 const GOOD: Rgb = (86, 211, 100);
 const WARN: Rgb = (227, 179, 65);
@@ -44,8 +39,7 @@ pub struct Theme {
 }
 
 impl Theme {
-    /// The palette for a terminal whose colors are unknown, in the 16 colors
-    /// every terminal maps itself.
+    /// Fallback palette used when terminal colors cannot be probed or 24-bit color is unavailable.
     pub const ANSI: Self = Self {
         dim: Color::DarkGray,
         border: Color::DarkGray,
@@ -59,10 +53,9 @@ impl Theme {
         flash_bg: Color::Rgb(60, 80, 60),
     };
 
-    /// The palette for a terminal drawing `fg` text on a `bg` background.
+    /// Derives a palette for a terminal rendering `fg` text on a `bg` background.
     pub fn derive(fg: Rgb, bg: Rgb) -> Self {
-        // On a light background the pastel accent and state colors wash out,
-        // so they are pulled toward the text color.
+        // Pull pastel accent and state colors toward `fg` on light backgrounds so they stay legible.
         let light = luminance(bg) > luminance(fg);
         let tone = |color: Rgb| {
             if light { blend(color, fg, 0.45) } else { color }
@@ -82,8 +75,7 @@ impl Theme {
         }
     }
 
-    /// A block title. A title is drawn on the border and takes its color
-    /// unless it names its own.
+    /// Returns the bold block title style with [`Color::Reset`] foreground, overriding the enclosing border color.
     pub fn title(self) -> Style {
         Style::default().fg(Color::Reset).bold()
     }
@@ -130,16 +122,14 @@ impl Theme {
 
 static THEME: OnceLock<Theme> = OnceLock::new();
 
-/// The palette in use: the probed one once [`probe`] has run, else
-/// [`Theme::ANSI`].
+/// Returns the active palette: the probed theme after [`probe`], or [`Theme::ANSI`].
 pub fn theme() -> Theme {
     THEME.get().copied().unwrap_or(Theme::ANSI)
 }
 
-/// Asks the terminal for its default colors and settles the palette on them.
+/// Queries the terminal's default colors once and initializes the global palette.
 ///
-/// Call once, in raw mode, before the first input is read: the answer arrives
-/// where key presses do. Later calls do nothing.
+/// Call once in raw mode before reading input (the reply arrives on stdin alongside key events); subsequent calls are no-ops.
 pub fn probe() {
     THEME.get_or_init(|| {
         let truecolor = std::env::var("COLORTERM")
@@ -151,7 +141,7 @@ pub fn probe() {
     });
 }
 
-/// `from` moved `amount` of the way to `to`.
+/// Linearly blends `from` toward `to` by `amount` (`0.0..=1.0`).
 fn blend(from: Rgb, to: Rgb, amount: f32) -> Rgb {
     let mix = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * amount).round() as u8;
     (mix(from.0, to.0), mix(from.1, to.1), mix(from.2, to.2))
@@ -161,14 +151,9 @@ fn luminance((r, g, b): Rgb) -> f32 {
     0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b)
 }
 
-/// The terminal's default foreground and background, from its replies to OSC
-/// 10 and OSC 11.
+/// Queries the terminal's default foreground and background via OSC 10/11, returning `None` if stdin is not a TTY or the reply cannot be parsed.
 ///
-/// A reply this does not read is read later as key presses, so nothing is
-/// asked unless stdin is the terminal (with stdin redirected the reply goes to
-/// `/dev/tty`, out of reach here), and the wait ends on the reply to a
-/// device-attributes request sent last, which every terminal answers. The
-/// deadline only bounds a terminal that answers nothing at all.
+/// Appends a primary device-attributes request (`CSI c`) as a response terminator; the 1-second deadline only bounds terminals that never reply.
 #[cfg(unix)]
 fn query_default_colors() -> Option<(Rgb, Rgb)> {
     use std::io::{IsTerminal, Write};
@@ -217,8 +202,7 @@ fn query_default_colors() -> Option<(Rgb, Rgb)> {
     None
 }
 
-/// Reads `rgb:RRRR/GGGG/BBBB` out of the reply to OSC `code`; each channel is
-/// one to four hex digits.
+/// Extracts `rgb:RRRR/GGGG/BBBB` (1–4 hex digits per channel) from an OSC `code` reply.
 #[cfg_attr(not(unix), allow(dead_code))]
 fn parse_color_reply(reply: &str, code: u8) -> Option<Rgb> {
     let start = reply.find(&format!("\x1b]{code};rgb:"))?;
@@ -264,8 +248,7 @@ mod tests {
             Color::Rgb(r, g, b) => luminance((r, g, b)),
             other => panic!("not an rgb color: {other:?}"),
         };
-        // Text, secondary text, border, selected row, background: each step
-        // is further from the text and still off the background.
+        // Each step moves monotonically from foreground text toward the background.
         assert!(luminance(fg) > level(theme.dim));
         assert!(level(theme.dim) > level(theme.border));
         assert!(level(theme.border) > level(theme.selected_bg));

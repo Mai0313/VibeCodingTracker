@@ -1,18 +1,11 @@
-//! Cross-cutting session filter types shared by the whole crate.
-//!
-//! [`TimeRange`] is a core domain concept — the aggregators, scanners, and
-//! provider readers all filter sessions by it — so it lives here in `models`
-//! rather than in the CLI layer.
+//! Session time-window filtering types.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Time window applied when aggregating sessions.
 ///
-/// Each variant maps to a cutoff date via [`TimeRange::cutoff_date`];
-/// [`TimeRange::All`] is the default and disables filtering. Serializes as a
-/// lowercase string (`"daily"` / `"weekly"` / `"monthly"` / `"all"`) so it can
-/// be reused verbatim as the `config.general.default_time_range` setting.
+/// Serializes as a lowercase string (`"daily"`, `"weekly"`, `"monthly"`, or `"all"`), defaulting to [`TimeRange::All`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum TimeRange {
@@ -28,17 +21,9 @@ pub enum TimeRange {
 }
 
 impl TimeRange {
-    /// Returns the inclusive cutoff date for this range, or `None` for
-    /// [`TimeRange::All`].
+    /// Returns the inclusive cutoff date in the system local timezone, or `None` for [`TimeRange::All`].
     ///
-    /// The cutoff is computed against today in the system local timezone:
-    /// `Weekly` anchors on the most recent Monday and `Monthly` on the first
-    /// of the month. Sessions on or after the returned date are kept.
-    ///
-    /// # Panics
-    ///
-    /// Does not panic: the `with_day(1)` used for `Monthly` is always valid
-    /// because day 1 exists in every month.
+    /// [`TimeRange::Weekly`] anchors on the most recent Monday and [`TimeRange::Monthly`] anchors on the first day of the current month.
     pub fn cutoff_date(&self) -> Option<chrono::NaiveDate> {
         use chrono::{Datelike, Local};
         let today = Local::now().date_naive();
@@ -54,12 +39,9 @@ impl TimeRange {
     }
 }
 
-/// Collapses the period flags into a [`TimeRange`], falling back to `default`
-/// when the caller passed none of them.
+/// Returns the [`TimeRange`] selected by the period flags, falling back to `default` when all flags are false.
 ///
-/// An explicit flag always wins (`--all` maps to [`TimeRange::All`]); only when
-/// every flag is unset does `default` (from `config.general.default_time_range`)
-/// apply. The flags share the CLI's `period` group, so at most one is ever true.
+/// If multiple flags are true, precedence is `daily`, then `weekly`, then `monthly`, then `all`.
 pub fn resolve_time_range_with_default(
     daily: bool,
     weekly: bool,

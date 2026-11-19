@@ -1,47 +1,32 @@
-//! Allocator-level helpers that bound the TUI's resident-set growth.
+//! glibc allocator controls that bound resident-set retention.
 //!
-//! Each refresh cycle allocates and drops large numbers of small objects, and
-//! the default glibc allocator retains those as freed-but-not-returned pages.
-//! Both helpers below exist solely to stop that retention accumulating; both
-//! are no-ops outside Linux/glibc, where neither symbol exists.
+//! Both functions are no-ops outside Linux/glibc.
 
-/// Asks the system allocator to return the free pages in its arenas to the OS.
+/// Asks glibc to return free arena pages to the OS (`malloc_trim(0)`).
 ///
-/// Called after each successful TUI refresh. Cost is O(arena size), so it
-/// suits a cycle boundary rather than a hot loop. No-op outside Linux/glibc.
+/// Cost is O(arena size), suited to cycle boundaries rather than hot loops. No-op outside Linux/glibc.
 #[inline]
 pub fn release_freed_heap() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    // SAFETY: `malloc_trim` is advisory and has no preconditions; it only
-    // inspects the allocator's free lists and releases unused pages.
+    // SAFETY: `malloc_trim` is MT-Safe, takes no pointers, and only inspects allocator free lists to release unused pages.
     unsafe {
         libc::malloc_trim(0);
     }
 }
 
-/// Applies one-time glibc malloc tuning; no-op outside Linux/glibc.
+/// Applies one-time glibc `mallopt` tuning; no-op outside Linux/glibc.
 ///
-/// Must run before the first allocation that crosses thread boundaries to
-/// have its full effect. Both knobs are load-bearing, not cosmetic:
+/// Must run before multithreaded allocations begin for `M_ARENA_MAX` to take full effect and to satisfy glibc's `MT-Unsafe const:mallopt` contract.
 ///
-/// - `M_ARENA_MAX = 4` caps the per-thread arenas glibc creates for the Rayon
-///   pool (a 16-core box otherwise gets up to 128). Each arena retains its own
-///   free list independently of `malloc_trim`, which is how the TUI grew
-///   ~6 MB per 10 s refresh even with a trim at the end of every cycle. Four
-///   arenas keep allocator lock contention off the critical path up to the
-///   8-worker auto scan cap without multiplying retention across cores.
-/// - `M_TRIM_THRESHOLD = 128 KiB` pins the point at which glibc hands the
-///   arena's top chunk back to the OS. The default starts at this value but
-///   grows automatically, so long sessions drift without the pin.
+/// - `M_ARENA_MAX = 4`: caps per-thread arenas so freed pages do not accumulate independently across worker threads.
+/// - `M_TRIM_THRESHOLD = 128 KiB`: pins the top-chunk trim threshold instead of letting glibc's dynamic threshold grow over long runs.
 pub fn tune_system_allocator() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
-        // Stable glibc ABI, but not re-exported by the `libc` crate; the
-        // values come from `malloc.h`.
+        // Stable glibc ABI constants from <malloc.h>, not re-exported by `libc`.
         const M_TRIM_THRESHOLD: libc::c_int = -1;
         const M_ARENA_MAX: libc::c_int = -8;
-        // SAFETY: `mallopt` is thread-safe and has no preconditions; an
-        // unrecognized option number simply returns 0.
+        // SAFETY: `M_ARENA_MAX` and `M_TRIM_THRESHOLD` are valid glibc `mallopt` options taking integer values and no pointers; glibc marks `mallopt` MT-Unsafe (`const:mallopt`), so callers must invoke this once before spawning allocating threads.
         unsafe {
             libc::mallopt(M_ARENA_MAX, 4);
             libc::mallopt(M_TRIM_THRESHOLD, 128 * 1024);

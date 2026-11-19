@@ -1,3 +1,5 @@
+//! Parser-only diagnostics and intermediate row types shared across session readers.
+
 use crate::VERSION;
 use crate::constants::FastHashMap;
 use crate::models::{CodeAnalysis, ExtensionType};
@@ -71,22 +73,14 @@ impl ParseDiagnostics {
     }
 }
 
-/// Reason string for a source that parsed but skipped some records.
+/// Returns a failure reason for a partially parsed source that skipped `count` records.
 ///
-/// The `partially parsed:` prefix is a contract, not phrasing:
-/// [`is_partial_failure_reason`] matches it to pick the per-source log wording
-/// that keeps a partial skip from reading as a dropped source. The tail is
-/// shown verbatim in the CLI's stderr scan summary, so it has to stand on its
-/// own there; rewording the tail is free, changing the prefix silently breaks
-/// that match.
+/// The `"partially parsed:"` prefix is matched by [`is_partial_failure_reason`]; the remainder is displayed verbatim in scan summaries.
 pub(crate) fn partial_failure_reason(count: usize) -> String {
     format!("partially parsed: skipped {count} malformed or unsupported analyzer records")
 }
 
-/// Whether a stored failure reason describes a partial (data-retained) parse.
-///
-/// Recognizes only the prefix [`partial_failure_reason`] writes; any other
-/// reason is a source that produced nothing.
+/// Returns whether `reason` has the partial-parse prefix produced by [`partial_failure_reason`].
 pub(crate) fn is_partial_failure_reason(reason: &str) -> bool {
     reason.starts_with("partially parsed:")
 }
@@ -102,18 +96,13 @@ pub(crate) struct ParsedAnalysis {
 pub(crate) struct DatabaseAnalysisRow {
     /// The session the row belongs to, the ledger's key for it.
     pub session_id: String,
-    /// The row's own identity, finer than the session where a session yields
-    /// several rows (one per OpenCode message); orders batch output.
+    /// Per-row identity for ordering batch output, finer than `session_id` when a session yields multiple rows.
     pub source_id: String,
     pub date: String,
     pub analysis: CodeAnalysis,
 }
 
-/// Typed token buckets produced by database-backed usage readers.
-///
-/// SQLite rows stay in this scalar form until they are folded into a
-/// session's day, where [`Self::into_value`] materializes the historical
-/// JSON shape once per row.
+/// Scalar token buckets produced by database-backed usage readers before JSON serialization.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct UsageTokenContribution {
     pub(crate) input_tokens: i64,
@@ -124,14 +113,7 @@ pub(crate) struct UsageTokenContribution {
 }
 
 impl UsageTokenContribution {
-    /// Materializes the historical JSON shape, billed at price `tier_level`.
-    ///
-    /// Above level 0 the same buckets are additionally written into an
-    /// `above_tier` object, exactly as the file parsers write theirs, so
-    /// `calculate_cost` bills them at that level's rates and the value merges
-    /// through `merge_usage_values` like any other. A whole row sits at one
-    /// level because it is one request; level 0 is the model's base level and
-    /// leaves nothing behind.
+    /// Converts the token counts into the JSON usage object, attaching an `above_tier` slice when `tier_level > 0`.
     pub(crate) fn into_value(self, tier_level: usize) -> Value {
         let mut value = json!({
             "input_tokens": self.input_tokens,
@@ -153,8 +135,7 @@ impl UsageTokenContribution {
                 output_tokens: self.output_tokens,
                 reasoning_tokens: self.reasoning_tokens,
                 cache_read: self.cache_read_tokens,
-                // These readers see one cache-write total with no TTL split,
-                // which is the 5-minute default everywhere it is published.
+                // Database readers report a single cache-write total with no TTL split; default to 5m.
                 cache_creation_5m: self.cache_creation_tokens,
                 cache_creation_1h: 0,
             },
@@ -186,12 +167,7 @@ pub(crate) struct UsageContribution {
     pub(crate) model: String,
     pub(crate) tokens: UsageTokenContribution,
     pub(crate) stored_cost: f64,
-    /// Price level this row's own request context classified into, `0` being
-    /// the model's base level. Only a reader whose rows are single requests
-    /// can classify: a row that is already aggregated over several of them
-    /// (Hermes's per-model table, Cursor's per-conversation gauge, OpenCode's
-    /// legacy `session` fallback) carries `0` and bills at base rates, which
-    /// is a lower bound rather than an over-report.
+    /// Pricing tier for this single-request row (`0` for base rates, or when the source only provides pre-aggregated rows).
     pub(crate) tier_level: usize,
 }
 
@@ -231,11 +207,7 @@ impl UsageContribution {
         }
     }
 
-    // This is the one route from a compact row into a public `CodeAnalysis`,
-    // so `tier_level` reaching it decides whether `above_tier` appears in that
-    // public JSON. It stays absent only because every caller of this route
-    // reads with no thresholds; threading them into one would change the
-    // public shape without touching this line.
+    /// Converts this row into a `(date, CodeAnalysis, stored_cost)` tuple; a non-zero `tier_level` adds `above_tier` to the emitted JSON.
     pub(crate) fn into_public_row(
         self,
         provider: ExtensionType,

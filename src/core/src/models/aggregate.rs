@@ -1,17 +1,8 @@
-//! Neutral per-provider totals container shared by the `usage` and `analysis`
-//! roll-ups (and their display summaries).
-//!
-//! `ProviderTotals<S>` carries no feature or presentation knowledge, which is
-//! what lets it live in `models`: `usage` and `analysis` each build one without
-//! importing the other, and the display layer re-exports this type instead of
-//! defining a parallel container.
+//! Per-provider totals container shared across usage and analysis roll-ups.
 
-/// Per-provider totals organized by AI provider.
+/// Per-provider totals alongside an `overall` sum across all providers.
 ///
-/// Keeps each provider's running totals alongside an `overall` "All Providers"
-/// bucket. The `S` parameter is the per-provider stats type each feature
-/// supplies (e.g. `ProviderStats` for usage, `AnalysisProviderStats` for
-/// analysis).
+/// Parameterized by the per-provider statistics type `S`.
 pub struct ProviderTotals<S> {
     /// Totals for Claude Code sessions.
     pub claude: S,

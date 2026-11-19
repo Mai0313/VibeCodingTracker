@@ -1,9 +1,6 @@
 //! Renderers for `vct quota`.
 //!
-//! The provider quota APIs return nested JSON dicts. `--json` (the default)
-//! pretty-prints the body as-is; `--text` and `--table` flatten it to
-//! dotted-path `key -> value` rows. Every renderer falls back to printing the
-//! raw body verbatim when it is not valid JSON (e.g. an HTML error page).
+//! `--json` pretty-prints the JSON body; `--text` and `--table` flatten nested objects and arrays to dotted-path `key -> value` rows. Every renderer prints non-JSON bodies verbatim.
 
 use comfy_table::{Cell, CellAlignment, Color, ContentArrangement, Table, presets::UTF8_FULL};
 use serde_json::Value;
@@ -19,8 +16,7 @@ pub fn print_quota_json(body: &str) {
     }
 }
 
-/// Prints the response as flattened `key: value` lines, or verbatim if it is
-/// not JSON.
+/// Prints the response as flattened `key: value` lines, or verbatim if it is not JSON.
 pub fn display_quota_text(body: &str) {
     match serde_json::from_str::<Value>(body) {
         Ok(value) => {
@@ -34,8 +30,7 @@ pub fn display_quota_text(body: &str) {
     }
 }
 
-/// Prints the response as a flattened Field/Value table, or the raw body
-/// verbatim if it is not JSON.
+/// Prints the response as a flattened Field/Value table, or verbatim if it is not JSON.
 pub fn display_quota_table(body: &str) {
     let value = match serde_json::from_str::<Value>(body) {
         Ok(v) => v,
@@ -74,11 +69,9 @@ pub fn display_quota_table(body: &str) {
     println!("{table}");
 }
 
-/// Recursively flattens a JSON value into `(dotted-key, value)` rows.
+/// Recursively flattens `value` into `(dotted-key, display-value)` rows under `prefix`.
 ///
-/// Objects recurse as `prefix.key`, arrays as `prefix[i]`, and scalars emit one
-/// row. An empty container or a scalar root still yields a single row so the
-/// output is never silently empty.
+/// Objects recurse as `prefix.key`, arrays as `prefix[i]`, and empty containers or scalar roots emit a single row.
 fn flatten(value: &Value, prefix: String, out: &mut Vec<(String, String)>) {
     match value {
         Value::Object(map) if !map.is_empty() => {
@@ -107,8 +100,7 @@ fn flatten(value: &Value, prefix: String, out: &mut Vec<(String, String)>) {
     }
 }
 
-/// Renders a JSON scalar (or empty container) as a plain display string,
-/// unquoting strings so `"pro"` shows as `pro`.
+/// Returns the plain display string for a JSON scalar or empty container, with strings unquoted.
 fn scalar_to_string(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),

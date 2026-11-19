@@ -1,7 +1,6 @@
-//! Renderers for the per-model file-operation / tool-call `analysis` view.
+//! Renderers and TUI state for the per-model file-operation and tool-call `analysis` view.
 //!
-//! Re-exports the three output modes (interactive TUI / table / text) plus the
-//! per-provider total helpers in `averages` shared across them.
+//! Re-exports static table and plain-text renderers, shared per-provider total helpers from `averages`, and crate-internal TUI state from `interactive`.
 
 mod averages;
 mod interactive;

@@ -1,11 +1,6 @@
 //! Parser for Claude Code session logs (`~/.claude/projects/**/*.jsonl`).
 //!
-//! Claude writes one record per line; assistant records carry token `usage`
-//! and `tool_use` blocks, while the file operation results arrive either in a
-//! top-level `toolUseResult` field (main sessions) or, for subagent JSONL
-//! files that omit it, inside the following user record's
-//! `message.content[].tool_result` block. The parser keys those two shapes
-//! together by `tool_use_id` and routes both to [`SessionParseState`].
+//! Assistant records repeat their full `usage` object once per content block; the parser deduplicates by API response identity and keeps the last streamed snapshot. File-operation results arrive either in a top-level `toolUseResult` field (main sessions) or in a sidechain user record's `message.content[].tool_result` block (subagents), correlated with pending `tool_use` calls by `tool_use_id`.
 use crate::constants::{FastHashMap, capacity};
 use crate::models::*;
 use crate::pricing::{TierClassifier, TierThresholds};
@@ -25,16 +20,13 @@ use std::borrow::Cow;
 use std::fmt;
 use std::path::Path;
 
-/// Parse Claude Code session records already materialised as a `Vec<Value>`.
+/// Parses pre-parsed JSON `records` into a single-record [`CodeAnalysis`].
 ///
-/// Records that fail to deserialise into [`ClaudeCodeLog`] are skipped rather
-/// than aborting the parse.
+/// Records that fail to deserialize into [`ClaudeCodeLog`] are skipped. Runtime metadata fields on the returned [`CodeAnalysis`] are left blank for the caller to populate.
 ///
 /// # Errors
 ///
-/// Returns `Err` only if the underlying [`parse_claude_logs`] does; in
-/// practice the Claude parse never fails (malformed records are dropped),
-/// so this is `Ok` for any input.
+/// Never returns `Err`; returns `Result` for parity with other provider parsers.
 pub fn parse_claude_log_values(records: Vec<Value>, mode: ParseMode) -> Result<CodeAnalysis> {
     let iter = records
         .into_iter()
@@ -42,21 +34,13 @@ pub fn parse_claude_log_values(records: Vec<Value>, mode: ParseMode) -> Result<C
     parse_claude_logs(iter, mode)
 }
 
-/// Parse Claude Code session records from any iterator of pre-typed logs.
+/// Parses Claude Code session `logs` into a single-record [`CodeAnalysis`].
 ///
-/// The streaming entry point: records can be fed in one line at a time,
-/// without ever materialising a full `Vec<Value>` of raw JSON.
-///
-/// The returned [`CodeAnalysis`] always holds exactly one record; the
-/// runtime metadata fields (`user`, `extension_name`, …) are left blank here
-/// and filled in by the caller's `finalize` step.
+/// Runtime metadata fields (`user`, `extension_name`, `insights_version`, `machine_id`) are left blank for the caller to populate.
 ///
 /// # Errors
 ///
-/// Returns `anyhow::Result` for signature uniformity with the other provider
-/// parsers, but the Claude path has no fallible step — every per-record
-/// failure is tolerated by skipping that record — so it returns `Ok` for any
-/// iterator.
+/// Never returns `Err`; returns `Result` for parity with other provider parsers.
 pub fn parse_claude_logs<I>(logs: I, mode: ParseMode) -> Result<CodeAnalysis>
 where
     I: IntoIterator<Item = ClaudeCodeLog>,
@@ -64,10 +48,7 @@ where
     Ok(parse_claude_logs_with_diagnostics(logs, mode, None)?.analysis)
 }
 
-/// Streaming Claude parser with parser-only schema diagnostics.
-///
-/// `tiers` enables per-request context-tier classification (usage scans
-/// only); `None` skips classification entirely.
+/// Parses Claude Code `logs` with schema diagnostics, classifying per-request context tiers when `tiers` is `Some`.
 pub(crate) fn parse_claude_logs_with_diagnostics<I>(
     logs: I,
     mode: ParseMode,
@@ -134,12 +115,7 @@ where
     Ok(fold.finish())
 }
 
-/// Zero-copy JSONL file parser for known Claude Code session files.
-///
-/// Skips `message` completely on metadata/attachment/progress lines (~40% of
-/// real session bytes), streams `message.content` without `#[serde(untagged)]`
-/// subtree buffering, and defers decoding `tool_result.content` and non-file
-/// `toolUseResult` payloads until a subagent `Read` actually needs them.
+/// Streams and parses a Claude Code JSONL file at `path` with schema diagnostics, classifying per-request context tiers when `tiers` is `Some`.
 pub(crate) fn parse_claude_jsonl_path(
     path: &Path,
     mode: ParseMode,
@@ -169,9 +145,7 @@ pub(crate) fn parse_claude_jsonl_path(
                 None
             };
 
-            // Fast path for non-file tool results (`Bash`, `Grep`, `Agent`, …):
-            // neither branch inspects `toolUseResult` or `tool_result.content`
-            // once the single pending tool call is known not to be Read/Write/Edit.
+            // Skip deserializing `toolUseResult` for non-file tools since neither result branch inspects it.
             if record.log_type == "user"
                 && tur_looks_like_object
                 && let Some(msg) = message.as_ref()
@@ -263,24 +237,12 @@ struct ClaudeFold<'a> {
     classifier: Option<TierClassifier<'a>>,
     state: SessionParseState,
     conversation_usage: FastHashMap<String, Value>,
-    // Advisor-message token usage is kept separate from `conversation_usage`
-    // so the `analysis` aggregator never attributes the main model's file-op
-    // counts to an advisor model. The `usage` path merges this in.
+    // Kept separate from `conversation_usage` so file-op counts are not attributed to advisor models; usage aggregation merges both.
     advisor_usage: FastHashMap<String, Value>,
-    // Keep the originating tool name so polymorphic top-level results can be
-    // interpreted by lifecycle rather than by ambiguous fields such as
-    // `filePath` (which ExitPlanMode also carries).
+    // Keyed by `tool_use_id` so top-level results dispatch by originating tool rather than ambiguous fields like `filePath` (also set by `ExitPlanMode`).
     pending_tool_uses: FastHashMap<String, PendingClaudeTool>,
     diagnostics: ParseDiagnostics,
-    // Claude Code writes one record per content block of a single API
-    // response, and every one of them repeats that response's *whole* `usage`
-    // object: a reply carrying a thinking block, text and three tool calls
-    // arrives as five records all reporting the same tokens. Billing them as
-    // they arrive charges one request once per content block, so each is
-    // banked here under the request it belongs to and only the last record for
-    // a key survives — the earlier ones report a partially streamed
-    // `output_tokens`, never a larger one. `(model, usage)` in arrival order;
-    // `billed_index` maps the request key to its slot.
+    // Claude Code repeats the full `usage` object on each content block of one API response, with earlier blocks carrying partial `output_tokens`. Banking `(model, usage)` by request key in `billed_index` keeps only the final snapshot per response.
     billed_requests: Vec<(String, Value)>,
     billed_index: FastHashMap<String, usize>,
 }
@@ -374,8 +336,7 @@ impl<'a> ClaudeFold<'a> {
                         self.billed_requests.push(entry);
                     }
                 },
-                // No API response to key on: nothing can be shown to
-                // duplicate it, so bill it on its own.
+                // Without a response key, treat the record as a distinct request.
                 None => self.billed_requests.push(entry),
             }
         }
@@ -459,8 +420,7 @@ impl<'a> ClaudeFold<'a> {
 
         if let Some((pending, true)) = correlated.as_ref() {
             if is_tracked_file_tool(&pending.name) && !pending.input_supported {
-                // The provider understood the envelope and explicitly
-                // rejected the bad arguments. No file operation ran.
+                // Explicit rejection of bad arguments is a valid lifecycle, not schema drift.
                 self.diagnostics.record_relevant(true);
             }
         } else {
@@ -488,13 +448,7 @@ impl<'a> ClaudeFold<'a> {
         }
     }
 
-    // Subagent JSONL fallback: tool results live inside
-    // `message.content[].tool_result` instead of the top-level `toolUseResult`
-    // field. Gated on `is_sidechain` because a main-session user record can
-    // carry a content tool_result block alongside a string-shaped
-    // `toolUseResult` (e.g. a user rejection), which deserializes to `None`
-    // and so lands in this branch; that string result carries no file body, so
-    // the content block's text must not be counted as one.
+    // Subagent fallback for tool results inside `message.content[].tool_result`. Gated on `is_sidechain` because a main-session rejection has a string `toolUseResult` (deserializing to `None`) alongside a `tool_result` block whose text is not a file body.
     fn observe_user_tool_result<'c>(
         &mut self,
         is_sidechain: bool,
@@ -532,8 +486,6 @@ impl<'a> ClaudeFold<'a> {
     fn finish(mut self) -> ParsedAnalysis {
         for (model, usage) in self.billed_requests {
             self.diagnostics.record_relevant(true);
-            // One banked entry is one billed request; classify its own prompt
-            // context against the model's price levels.
             let level = self.classifier.as_mut().map_or(0, |classifier| {
                 usage.as_object().map_or(0, |usage_obj| {
                     classifier.level(&model, claude_request_context(usage_obj))
@@ -541,14 +493,7 @@ impl<'a> ClaudeFold<'a> {
             });
             process_claude_usage(&mut self.conversation_usage, &model, &usage, level);
 
-            // Claude Code's top-level `usage` is the sum of the `message`-type
-            // entries in `usage.iterations` and EXCLUDES any `advisor_message`
-            // iteration (a secondary inference Claude Code runs but keeps off its
-            // own /cost accounting). The sample in
-            // `advisor_message_usage_is_separated_from_conversation_usage` below is
-            // what that was read off. Key each advisor iteration by the model it
-            // names so it prices at that model's rate; one that names no model
-            // falls back to the main model's key.
+            // Top-level `usage` sums `message` iterations and excludes `advisor_message` iterations, so fold advisor iterations separately under their own model (falling back to the main model).
             if let Some(iters) = usage.get("iterations").and_then(|v| v.as_array()) {
                 for iter in iters {
                     if iter.get("type").and_then(|t| t.as_str()) != Some("advisor_message") {
@@ -906,12 +851,7 @@ fn tracked_tool_input_supported(name: &str, input: Option<&ClaudeToolInput>) -> 
     }
 }
 
-/// Identity of the one billed request an assistant record belongs to.
-///
-/// `message.id` is the API response id and already identifies the request on
-/// its own; `requestId` is appended where the record carries one so a retry
-/// that reuses a response id still bills separately. `None` when the record
-/// names no response at all, which no observed Claude Code build writes.
+/// Returns the deduplication key for an assistant response (`message_id`, with `:request_id` appended when present so retries bill separately), or `None` if `message_id` is absent.
 fn claude_request_key_parts(message_id: Option<&str>, request_id: Option<&str>) -> Option<String> {
     let id = message_id.filter(|id| !id.is_empty())?;
     match request_id.filter(|id| !id.is_empty()) {
@@ -1136,12 +1076,7 @@ fn dispatch_top_level_tool_result(
     }
 }
 
-/// Dispatch a Read / Write / Edit tool result that came from a subagent
-/// JSONL `message.content[].tool_result` block (no top-level `toolUseResult`).
-///
-/// `result_content` is what the model received back: for Read it's the
-/// numbered file contents, for Write / Edit it's a confirmation string we
-/// don't actually need (the line count comes from the original tool input).
+/// Records a subagent `Read`, `Write`, or `Edit` result using `result_content` for `Read` and `input` for `Write`/`Edit`.
 fn dispatch_subagent_tool_result(
     state: &mut SessionParseState,
     tool_name: &str,
@@ -1155,14 +1090,11 @@ fn dispatch_subagent_tool_result(
 
     match tool_name {
         "Read" => {
-            // Read's input carries only the path, so the line tally has to
-            // come from the result body.
             preserve_file_tool_counts(state, |state| {
                 state.add_read_detail(file_path, result_content, ts);
             });
         }
         "Write" => {
-            // Write's input carries the full file body it intended to write.
             let body = input.content.as_deref().unwrap_or("");
             preserve_file_tool_counts(state, |state| {
                 state.add_write_detail(file_path, body, ts);
@@ -1237,7 +1169,6 @@ mod tests {
             });
             serde_json::from_value(raw).unwrap()
         };
-        // One request below the 200k threshold, one above it.
         let logs = vec![
             usage_log("2026-07-01T00:00:00Z", 1_000, 50_000, 200),
             usage_log("2026-07-01T00:01:00Z", 2_000, 220_000, 300),
@@ -1250,14 +1181,12 @@ mod tests {
             parse_claude_logs_with_diagnostics(logs.clone(), ParseMode::UsageOnly, Some(&tiers))
                 .unwrap();
         let usage = &parsed.analysis.records[0].conversation_usage["claude-sonnet-5"];
-        // Totals cover both requests; the above_tier slice only the second.
         assert_eq!(usage["input_tokens"], 3_000);
         assert_eq!(usage["output_tokens"], 500);
         assert_eq!(usage["above_tier"]["level_1_input_tokens"], 2_000);
         assert_eq!(usage["above_tier"]["level_1_cache_read_tokens"], 220_000);
         assert_eq!(usage["above_tier"]["level_1_output_tokens"], 300);
 
-        // Without thresholds nothing is classified and the shape is unchanged.
         let parsed = parse_claude_logs_with_diagnostics(logs, ParseMode::UsageOnly, None).unwrap();
         let usage = &parsed.analysis.records[0].conversation_usage["claude-sonnet-5"];
         assert!(usage.get("above_tier").is_none());
@@ -1265,9 +1194,6 @@ mod tests {
 
     #[test]
     fn subagent_user_message_tool_result_is_dispatched_via_fallback() {
-        // Simulate a subagent JSONL: assistant calls Read, user record
-        // returns the content inside `message.content[].tool_result`
-        // (no top-level `toolUseResult`). Expect read_lines to be counted.
         let logs = vec![
             assistant_log(
                 "2025-01-01T00:00:00Z",
@@ -1300,12 +1226,7 @@ mod tests {
 
     #[test]
     fn main_session_tool_result_block_is_not_read_as_file_content() {
-        // A main-session user record can carry a content tool_result block
-        // alongside a string-shaped `toolUseResult` (a rejection message),
-        // which deserializes to `None` and so lands in the subagent fallback
-        // branch. The `!log.is_sidechain` gate there is what keeps the
-        // block's text out of the read tally, while the assistant's
-        // `tool_use` still counts one Read call.
+        // A string `toolUseResult` (rejection) deserializes to `None`; `!is_sidechain` keeps the `tool_result` text out of the read tally.
         let raw_assistant = serde_json::json!({
             "type": "assistant",
             "timestamp": "2025-01-01T00:00:00Z",
@@ -1687,12 +1608,6 @@ mod tests {
 
     #[test]
     fn advisor_message_usage_is_separated_from_conversation_usage() {
-        // Top-level usage already sums the `message`-type iterations and omits
-        // the `advisor_message` one. The advisor tokens land in `advisor_usage`
-        // (under the advisor's own model), NOT in `conversation_usage`, so the
-        // analysis aggregator never credits the advisor with the main model's
-        // file operations. The advisor here uses a *different* model than the
-        // main turn to make the separation observable.
         let raw = serde_json::json!({
             "type": "assistant",
             "timestamp": "2025-01-01T00:00:00Z",
@@ -1717,8 +1632,6 @@ mod tests {
         let analysis = parse_claude_logs(vec![log], ParseMode::Full).unwrap();
         let record = &analysis.records[0];
 
-        // `conversation_usage` (what `analysis` reads) carries only the main
-        // model with its top-level totals — no advisor key.
         let conv = &record.conversation_usage;
         assert_eq!(conv.len(), 1);
         let main = conv.get("claude-haiku-4-5").unwrap();
@@ -1726,8 +1639,6 @@ mod tests {
         assert_eq!(main["output_tokens"].as_i64().unwrap(), 7440);
         assert!(conv.get("claude-opus-4-8").is_none());
 
-        // `advisor_usage` (what `usage` merges) carries the advisor tokens
-        // under its own model for correct pricing.
         let advisor = record.advisor_usage.get("claude-opus-4-8").unwrap();
         assert_eq!(advisor["input_tokens"].as_i64().unwrap(), 47579);
         assert_eq!(advisor["output_tokens"].as_i64().unwrap(), 10521);
@@ -1735,11 +1646,6 @@ mod tests {
 
     #[test]
     fn one_response_split_across_content_blocks_bills_once() {
-        // Claude Code writes one record per content block of a single API
-        // response and repeats the whole `usage` object on each, so the three
-        // records below are one billed request, not three. The `output_tokens`
-        // rises across them because the earlier records were written while the
-        // response was still streaming; the last value is the final one.
         let response = |content: serde_json::Value, output: i64| {
             serde_json::json!({
                 "type": "assistant",
@@ -1778,18 +1684,13 @@ mod tests {
         assert_eq!(usage["input_tokens"].as_i64().unwrap(), 11);
         assert_eq!(usage["cache_read_input_tokens"].as_i64().unwrap(), 16788);
         assert_eq!(usage["cache_creation_input_tokens"].as_i64().unwrap(), 1328);
-        // The final streamed value, not 8 and not the 183 the three sum to.
         assert_eq!(usage["output_tokens"].as_i64().unwrap(), 167);
 
-        // Deduplication is scoped to the usage: the tool call carried by the
-        // last record is still counted.
         assert_eq!(analysis.records[0].tool_call_counts.read, 1);
     }
 
     #[test]
     fn advisor_iterations_of_one_response_bill_once() {
-        // The advisor tokens ride inside the same repeated `usage` object, so a
-        // response split across content blocks repeats them too.
         let response = |output: i64| {
             serde_json::json!({
                 "type": "assistant",
@@ -1826,9 +1727,7 @@ mod tests {
 
     #[test]
     fn records_naming_no_response_each_bill() {
-        // No Claude Code build observed so far omits `message.id`, so this
-        // guards the fallback rather than a live shape: with nothing to key on,
-        // two records are two requests and must not collapse into one.
+        // Guards the fallback when `message.id` is absent: records without a key must bill separately.
         let response = serde_json::json!({
             "type": "assistant",
             "timestamp": "2025-01-01T00:00:00Z",
@@ -1910,8 +1809,6 @@ mod tests {
 
     #[test]
     fn message_only_iterations_leave_advisor_usage_empty() {
-        // Without an advisor_message iteration, usage equals the top-level
-        // values and `advisor_usage` stays empty.
         let raw = serde_json::json!({
             "type": "assistant",
             "timestamp": "2025-01-01T00:00:00Z",

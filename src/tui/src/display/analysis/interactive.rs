@@ -1,8 +1,4 @@
-//! Interactive (TUI) renderer for the `analysis` view.
-//!
-//! Runs a ratatui draw loop that periodically re-aggregates the session
-//! directories, highlighting rows whose metrics changed since the last tick and
-//! redrawing on terminal resize without re-aggregating.
+//! State, scanning, column fitting, and row builders for the interactive `analysis` tab.
 
 use crate::display::analysis::averages::{AnalysisRow, build_analysis_rows_with_providers};
 use crate::display::common::provider_tui_color;
@@ -17,16 +13,13 @@ use vct_core::config::ProvidersConfig;
 use vct_core::ledger::SessionLedger;
 use vct_core::utils::{format_compact, format_number};
 
-/// Upper bound on the number of rows tracked for the "recently updated"
-/// highlight, capping the tracker's memory footprint.
+/// Maximum number of rows tracked for the recently-updated highlight.
 const MAX_TRACKED_ANALYSIS_ROWS: usize = 100;
 
-/// Floor for the model-name column, so narrowing the pane drops a metric column
-/// rather than cutting the name.
+/// Minimum width reserved for the model-name column before numeric columns are dropped.
 const MODEL_COL_MIN_W: u16 = 26;
 
-/// Which column the analysis table is ordered by, in the order the columns
-/// are drawn.
+/// Sort column for the analysis table, in header order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum AnalysisSort {
     Model,
@@ -58,13 +51,13 @@ impl AnalysisSort {
         Self::ALL.iter().position(|sort| *sort == self).unwrap_or(0)
     }
 
-    /// The column `step` places along the header, stopping at either end.
+    /// Returns the sort column `step` places along the header, clamped to either end.
     pub(crate) fn step(self, step: isize) -> Self {
         let last = Self::ALL.len() as isize - 1;
         Self::ALL[(self.index() as isize + step).clamp(0, last) as usize]
     }
 
-    /// What the table title shows: numbers run largest first, names A to Z.
+    /// Returns the sort indicator label shown in the table title.
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Model => "sort: model ▲",
@@ -79,7 +72,7 @@ impl AnalysisSort {
         }
     }
 
-    /// Orders `rows` by this column, model name breaking ties.
+    /// Sorts `rows` by this column (descending for counts, ascending by model name for ties and [`Self::Model`]).
     fn apply(self, rows: &mut [AnalysisRow]) {
         let key = |row: &AnalysisRow| match self {
             Self::Model => 0,
@@ -96,7 +89,7 @@ impl AnalysisSort {
     }
 }
 
-/// What the analysis tab keeps between frames.
+/// Persistent UI state for the analysis tab between frames.
 pub(crate) struct AnalysisUiState {
     rows: Vec<AnalysisRow>,
     totals: AnalysisRow,
@@ -124,7 +117,7 @@ impl AnalysisUiState {
             .map(|row| row.model.clone())
     }
 
-    /// Takes in a finished scan.
+    /// Replaces the displayed rows and totals from a completed scan, preserving selection and update highlights.
     pub(crate) fn apply(&mut self, data: AnalysisData) {
         let previous = self.selected_model();
         self.rows = build_analysis_rows_with_providers(&data.rows, &data.per_provider);
@@ -172,7 +165,7 @@ impl AnalysisUiState {
         }
     }
 
-    /// Sets the sort directly (e.g. when clicking a column header).
+    /// Sets the active sort column directly, re-sorting rows and preserving selection.
     pub(crate) fn set_sort(&mut self, sort: AnalysisSort) {
         if sort != self.sort {
             let previous = self.selected_model();
@@ -183,7 +176,7 @@ impl AnalysisUiState {
         }
     }
 
-    /// Moves the sort one column left or right (`←` / `→`).
+    /// Steps the sort column by `step` places along the header, preserving selection.
     pub(crate) fn step_sort(&mut self, step: isize) {
         let previous = self.selected_model();
         self.sort = self.sort.step(step);
@@ -192,47 +185,47 @@ impl AnalysisUiState {
         self.scroll.sync(previous.as_deref(), &models);
     }
 
-    /// Moves the selection.
+    /// Moves the table selection by `delta`.
     pub(crate) fn navigate(&mut self, delta: NavDelta) {
         self.scroll.apply(delta, self.rows.len());
     }
 
-    /// Currently aggregated model rows.
+    /// Returns the currently aggregated model rows.
     pub(crate) fn rows(&self) -> &[AnalysisRow] {
         &self.rows
     }
 
-    /// Grand totals across all models.
+    /// Returns the grand totals across all visible models.
     pub(crate) fn totals(&self) -> &AnalysisRow {
         &self.totals
     }
 
-    /// Recent-update highlight tracker.
+    /// Returns the recently-updated row tracker.
     pub(crate) fn update_tracker(&self) -> &UpdateTracker {
         &self.update_tracker
     }
 
-    /// Table scroll and selection state.
+    /// Returns the table scroll and selection state.
     pub(crate) fn scroll(&self) -> &ScrollState {
         &self.scroll
     }
 
-    /// Mutable table scroll and selection state.
+    /// Returns mutable access to the table scroll and selection state.
     pub(crate) fn scroll_mut(&mut self) -> &mut ScrollState {
         &mut self.scroll
     }
 
-    /// Current sort column.
+    /// Returns the active sort column.
     pub(crate) fn sort(&self) -> AnalysisSort {
         self.sort
     }
 
-    /// Selected model index, if any.
+    /// Returns the selected model row index, if any.
     pub(crate) fn selected_index(&self) -> Option<usize> {
         self.scroll.table.selected()
     }
 
-    /// Selects model row `index` directly (clamped into range).
+    /// Selects model row `index`, clamped to the last row when non-empty.
     pub(crate) fn select_index(&mut self, index: usize) {
         let len = self.rows.len();
         if len > 0 {
@@ -240,18 +233,17 @@ impl AnalysisUiState {
         }
     }
 
-    /// Currently selected row, if any.
+    /// Returns the currently selected row, if any.
     pub(crate) fn selected_row(&self) -> Option<&AnalysisRow> {
         self.selected_index().and_then(|at| self.rows.get(at))
     }
 }
 
-/// Runs one analysis scan of `paths` for `time_range`.
+/// Runs one analysis scan of `paths` for `time_range` on `pool` using `ledger`.
 ///
 /// # Errors
 ///
-/// Returns an error when the scan itself fails or every source failed to
-/// parse. A partial failure keeps what parsed and is logged.
+/// Returns an error if the scan fails or every candidate source failed to parse; partial failures are logged and kept.
 pub(crate) fn scan_analysis(
     paths: &vct_core::utils::HelperPaths,
     time_range: vct_core::models::TimeRange,
@@ -264,8 +256,7 @@ pub(crate) fn scan_analysis(
             paths, time_range, providers, ledger,
         )
     })?;
-    // A live session changes every tick; writing its provider's file once a
-    // minute keeps the ledger current without rewriting it on every refresh.
+    // Persist the ledger at most once per `LEDGER_SAVE_INTERVAL` so live sessions do not rewrite it every tick.
     if let Err(error) = ledger.save_if_due(LEDGER_SAVE_INTERVAL) {
         log::warn!("failed to save the session ledger: {error:#}");
     }
@@ -343,7 +334,7 @@ pub(crate) struct AnalysisTableColumns {
 }
 
 impl AnalysisTableColumns {
-    /// Header index corresponding to `sort`, when that column was not dropped.
+    /// Returns the visible header index for `sort`, or `None` if that column was dropped.
     pub(crate) fn sorted_header_index(&self, sort: AnalysisSort) -> Option<usize> {
         match sort.index().checked_sub(1) {
             None => Some(0),
@@ -355,7 +346,7 @@ impl AnalysisTableColumns {
         }
     }
 
-    /// Maps a clicked visible header column index back to an [`AnalysisSort`].
+    /// Returns the [`AnalysisSort`] for a visible header column index, if valid.
     pub(crate) fn sort_for_header(&self, header_index: usize) -> Option<AnalysisSort> {
         if header_index == 0 {
             return Some(AnalysisSort::Model);
@@ -365,7 +356,7 @@ impl AnalysisTableColumns {
     }
 }
 
-/// Computes which analysis columns fit inside `inner` content cells.
+/// Returns the fitted analysis table columns for an inner width of `inner` cells.
 pub(crate) fn layout_analysis_columns(inner: u16) -> AnalysisTableColumns {
     let (kept, dropped) = fit_columns(&ANALYSIS_NUMERIC_COLS, inner, MODEL_COL_MIN_W);
     let numeric_span: u16 = kept
@@ -394,8 +385,7 @@ pub(crate) fn layout_analysis_columns(inner: u16) -> AnalysisTableColumns {
     }
 }
 
-/// Builds one formatted model row for the analysis table, optionally prepending
-/// `prefix` (such as `"▸ "` / `"▾ "` in tree layouts) to the model name.
+/// Builds one formatted analysis table row, prepending `prefix` (such as `"▸ "` or `"▾ "`) to the model name.
 pub(crate) fn build_analysis_table_row(
     row: &AnalysisRow,
     cols: &AnalysisTableColumns,

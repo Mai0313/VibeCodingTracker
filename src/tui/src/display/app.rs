@@ -1,11 +1,6 @@
-//! The interactive app: one terminal session with a tab per view and pluggable
-//! layouts.
+//! Interactive tabbed TUI app with pluggable layouts.
 //!
-//! [`run_app`] owns the event loop. The Usage and Analysis tabs share one
-//! background [`RefreshWorker`] and one session ledger, started on the first
-//! visit to either, and the Quota tab starts its workers on the first visit to
-//! it. Only the tab on screen refreshes on its timer, while the active
-//! `LayoutView` owns frame geometry and mouse hit-testing.
+//! [`run_app`] owns the event loop. The Usage and Analysis tabs share one background [`RefreshWorker`] and one session ledger started on the first visit to either, and the Quota tab starts its workers on the first visit. Only the visible tab refreshes on its timer, while the active `LayoutView` owns frame geometry and mouse hit-testing.
 
 use crate::display::analysis::{AnalysisUiState, scan_analysis};
 use crate::display::common::table::{
@@ -67,19 +62,19 @@ impl Tab {
         Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0)
     }
 
-    /// The tab `step` places along, wrapping around.
+    /// Returns the tab `step` places away, wrapping around.
     fn offset(self, step: isize) -> Self {
         let count = Self::ALL.len() as isize;
         Self::ALL[(self.index() as isize + step).rem_euclid(count) as usize]
     }
 
-    /// Whether the tab shows scanned session data.
+    /// Returns whether this tab displays scanned session data.
     pub(crate) fn scans(self) -> bool {
         matches!(self, Self::Usage | Self::Analysis)
     }
 }
 
-/// What [`run_app`] starts from.
+/// Initial state and dependencies for [`run_app`].
 pub struct AppOptions {
     /// The tab shown first.
     pub start: Tab,
@@ -93,7 +88,7 @@ pub struct AppOptions {
     pub scan_pool: Arc<rayon::ThreadPool>,
 }
 
-/// What a scan is run for; the worker reads it at the start of each run.
+/// Parameters for a background scan, read by the worker at the start of each run.
 #[derive(Clone, Copy, PartialEq)]
 struct ScanRequest {
     tab: Tab,
@@ -112,7 +107,7 @@ struct ScanOutput {
     data: ScanData,
 }
 
-/// The range `step` places along the tab bar's list, stopping at either end.
+/// Returns the range `step` places along `RANGES`, clamped to either end.
 fn step_range(range: TimeRange, step: isize) -> TimeRange {
     let at = RANGES
         .iter()
@@ -121,12 +116,9 @@ fn step_range(range: TimeRange, step: isize) -> TimeRange {
     RANGES[(at + step).clamp(0, RANGES.len() as isize - 1) as usize].0
 }
 
-/// What the Settings tab does once the editor has returned: whether to reload
-/// the file, and the message to show with whether it is good news.
+/// Returns `(reload, message, ok)` after the external config editor exits.
 ///
-/// The file is reloaded whenever it parses, even after a failed editor, which
-/// may have saved first. One that does not parse is never loaded: every read
-/// turns it into the defaults, and the next save would write those over it.
+/// Reloads whenever `file_is_valid` is true (even if the editor returned an error after saving); an unparseable file is never reloaded, preventing subsequent saves from overwriting it with defaults.
 fn after_editor(result: anyhow::Result<()>, file_is_valid: bool) -> (bool, String, bool) {
     match (file_is_valid, result) {
         (false, _) => (
@@ -139,8 +131,7 @@ fn after_editor(result: anyhow::Result<()>, file_is_valid: bool) -> (bool, Strin
     }
 }
 
-/// Footer status for Usage and Analysis: an active or failed refresh wins over
-/// a completed background auto-update notice.
+/// Returns the footer status for Usage and Analysis, letting an active or failed refresh preempt an auto-update notice.
 fn data_tab_status<'a>(
     refresh: Option<&'a str>,
     update_notice: Option<&'a str>,
@@ -151,22 +142,14 @@ fn data_tab_status<'a>(
         .or_else(|| update_notice.map(|text| (text, theme.good)))
 }
 
-/// Whether to scan now for a tab whose data does not answer what is on screen.
-///
-/// Never while a scan is running: its result may be the one wanted, and if it
-/// answers an older request the next pass asks again. After a failure, not
-/// before `retry_at`.
+/// Returns whether a stale tab should start a rescan now (idle worker and past any `retry_at` backoff).
 fn should_rescan(current: bool, active: bool, retry_at: Option<Instant>, now: Instant) -> bool {
     !current && !active && retry_at.is_none_or(|at| now >= at)
 }
 
-/// Propagates a `Settings` change into the live app state, swapping the active
-/// layout instance immediately when `[general].layout` resolves to another
-/// layout plugin.
+/// Applies `next` settings to the live app state, swapping the active layout immediately when `general.layout` resolves to a different plugin.
 ///
-/// Only an actual change to `usage.merge_models` touches `usage`, so a session
-/// started with `--merge-providers` over `merge_models = false` keeps its CLI
-/// override across unrelated settings edits.
+/// Only a change to `usage.merge_models` updates `usage`, preserving a CLI `--merge-providers` override across unrelated edits.
 fn apply_settings_update(
     config: &mut Config,
     next: Config,
@@ -189,8 +172,7 @@ fn apply_settings_update(
     *config = next;
 }
 
-/// Starts the worker both data tabs scan through, with the one ledger they
-/// share.
+/// Spawns the shared background scan worker and session ledger used by the Usage and Analysis tabs.
 fn spawn_scan_worker(
     refresh_secs: u64,
     request: Arc<Mutex<ScanRequest>>,
@@ -226,16 +208,15 @@ fn spawn_scan_worker(
     })
 }
 
-/// Runs the app until the user quits.
-///
-/// # Errors
-///
-/// Returns an error if the terminal cannot be set up or restored, if reading
-/// an input event or drawing a frame fails, or if the scan worker dies.
+/// Runs the interactive TUI app until the user quits.
 ///
 /// # Panics
 ///
 /// Panics if the current process ID cannot be obtained for memory monitoring.
+///
+/// # Errors
+///
+/// Returns an error if path resolution fails, terminal setup or restoration fails, reading input or drawing a frame fails, or the scan worker disconnects.
 pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
     let mut terminal = TerminalSession::new()?;
     let result = (|| -> anyhow::Result<()> {
@@ -267,8 +248,7 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
         let mut settings = SettingsUiState::new(
             config.clone(),
             Box::new(|path, value| {
-                // Saving into a file that does not parse would replace all
-                // of it with the defaults.
+                // Saving into an unparseable config file would overwrite it with defaults.
                 if !vct_core::config::file_is_valid() {
                     anyhow::bail!("config.toml does not parse, fix it first (e)");
                 }
@@ -285,7 +265,7 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
         // The request each data tab last showed.
         let mut shown: [Option<ScanRequest>; 2] = [None, None];
         let mut failure_until = None;
-        // When a failed scan may be tried again without being asked for.
+        // Earliest instant an automatic retry may run after a failed scan.
         let mut retry_at: Option<Instant> = None;
 
         let pid = sysinfo::get_current_pid()
@@ -297,7 +277,6 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
         let mut last_metrics = Instant::now();
         let mut last_draw: Option<Instant> = None;
         let mut spinner = 0usize;
-        // Whether the key list is open (`?`).
         let mut help_open = false;
 
         loop {
@@ -364,9 +343,7 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = wanted;
                 let current = shown[tab.index()] == Some(wanted);
-                // A tab whose data answers another range or provider set is
-                // rescanned as soon as the worker is free; a failed scan waits
-                // out the refresh interval, or for `r`.
+                // Rescan stale tabs as soon as the worker is free; after a failure, wait out `retry_at` unless refreshed manually.
                 if should_rescan(current, worker.is_active(), retry_at, Instant::now()) {
                     worker.request();
                     redraw = true;
@@ -428,8 +405,7 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
                         render_help(f, f.area(), tab, &rows);
                     }
                 })?;
-                // ratatui can't embed the OSC 8 escape itself, so hyperlink the
-                // repo label it just drew.
+                // ratatui cannot embed OSC 8 escapes in cells, so hyperlink the rendered repo label directly.
                 overlay_repo_hyperlink(completed.buffer)?;
                 last_draw = Some(Instant::now());
             }
@@ -707,7 +683,7 @@ pub fn run_app(options: AppOptions) -> anyhow::Result<()> {
     terminal.finish(result)
 }
 
-/// Default key list for `tab` when the active layout does not override it.
+/// Returns the default help key list for `tab` when the active layout does not override it.
 fn help_rows(tab: Tab) -> Vec<(&'static str, &'static str)> {
     let mut rows = match tab {
         Tab::Usage | Tab::Analysis => vec![

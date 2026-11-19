@@ -1,24 +1,11 @@
-//! Neutral token-bucket merge / normalization helpers.
-//!
-//! These operate purely on the JSON usage shapes produced by the parsers, with
-//! no `usage`- or `analysis`-feature knowledge, so both features (and the
-//! shared scan cache) share one implementation instead of one reaching into the
-//! other.
+//! Provider-agnostic JSON usage merging and flat-schema normalization.
 
 use crate::utils::{
     TierSlice, TokenCounts, accumulate_i64_fields, accumulate_nested_object, extract_token_counts,
 };
 use serde_json::{Value, json};
 
-/// Accumulates the token fields of `new` into `existing` in place.
-///
-/// Dispatches on `existing`'s marker key: the flat provider shape
-/// (`input_tokens`, plus the nested `cache_creation`, `server_tool_use` and
-/// `above_tier` objects) or the Codex shape (`total_token_usage`, plus
-/// `above_tier`). When the two sides carry *different* shapes, both are
-/// normalized through [`extract_token_counts`] and `existing` is replaced
-/// wholesale by the flat sum. Values that are not both JSON objects, or that
-/// match neither shape, are left untouched.
+/// Accumulates `new`'s token fields into `existing` in place, normalizing to the flat schema when the two sides have different shapes (`input_tokens` vs `total_token_usage`).
 pub(crate) fn merge_usage_values(existing: &mut Value, new: &Value) {
     let (Some(existing_ro), Some(new_ro)) = (existing.as_object(), new.as_object()) else {
         return;
@@ -28,10 +15,7 @@ pub(crate) fn merge_usage_values(existing: &mut Value, new: &Value) {
     let new_flat = new_ro.contains_key("input_tokens");
     let new_codex = new_ro.contains_key("total_token_usage");
 
-    // Mixed shapes — e.g. a Codex `total_token_usage` row and a Cursor /
-    // Copilot flat `input_tokens` row that share a model name like `gpt-5`.
-    // The branches below only accumulate when both sides carry the *same*
-    // shape, so a mismatch would silently drop the other side's tokens.
+    // Mixed shapes (for example, Codex `total_token_usage` + flat `input_tokens` under a shared model name) normalize both sides so neither is dropped.
     if (existing_flat && new_codex) || (existing_codex && new_flat) {
         let merged = add_token_counts(&extract_token_counts(existing), &extract_token_counts(new));
         *existing = token_counts_to_flat_value(&merged);
@@ -48,10 +32,7 @@ pub(crate) fn merge_usage_values(existing: &mut Value, new: &Value) {
                     "cache_creation_input_tokens",
                     "cache_read_input_tokens",
                     "output_tokens",
-                    // Gemini's `thoughts_tokens` and the other flat providers'
-                    // `reasoning_output_tokens` carry the same reasoning-budget
-                    // semantics, so both accumulate; dropping either loses
-                    // thinking-time tokens the model was billed for.
+                    // Accumulate both flat reasoning keys (`thoughts_tokens` for Gemini, `reasoning_output_tokens` for other flat providers).
                     "thoughts_tokens",
                     "reasoning_output_tokens",
                     "tool_tokens",
@@ -63,20 +44,14 @@ pub(crate) fn merge_usage_values(existing: &mut Value, new: &Value) {
                 accumulate_nested_object(existing_obj, "cache_creation", new_cache);
             }
 
-            // Claude server-side tool counts (web_search_requests /
-            // web_fetch_requests) merge across files just like cache_creation.
             if let Some(new_stu) = new_obj.get("server_tool_use").and_then(|v| v.as_object()) {
                 accumulate_nested_object(existing_obj, "server_tool_use", new_stu);
             }
 
-            // Per-request tier slices accumulate the same way.
             if let Some(new_above) = new_obj.get("above_tier").and_then(|v| v.as_object()) {
                 accumulate_nested_object(existing_obj, "above_tier", new_above);
             }
-        }
-        // Codex keeps its buckets nested, so the whole inner object accumulates
-        // rather than a named field list.
-        else if existing_obj.contains_key("total_token_usage") {
+        } else if existing_obj.contains_key("total_token_usage") {
             if let Some(new_total) = new_obj.get("total_token_usage").and_then(|v| v.as_object()) {
                 accumulate_nested_object(existing_obj, "total_token_usage", new_total);
             }
@@ -89,8 +64,7 @@ pub(crate) fn merge_usage_values(existing: &mut Value, new: &Value) {
 
 /// Sums two normalized [`TokenCounts`] field by field.
 fn add_token_counts(a: &TokenCounts, b: &TokenCounts) -> TokenCounts {
-    // Tier slices line up by index because the index *is* the price level; the
-    // longer side's extra levels carry over untouched.
+    // Tier slices are indexed by price level; extra levels on the longer side carry over unchanged.
     let mut above_tiers = a.above_tiers.clone();
     above_tiers.resize(
         above_tiers.len().max(b.above_tiers.len()),
@@ -115,26 +89,14 @@ fn add_token_counts(a: &TokenCounts, b: &TokenCounts) -> TokenCounts {
     }
 }
 
-/// Normalizes any provider-shaped usage value into the flat key set.
+/// Returns `usage` normalized into the flat JSON token schema (`input_tokens`, `output_tokens`, `reasoning_output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `total_tokens`).
 ///
-/// `usage --json` rows pass through here so every model row carries the same
-/// flat fields (`input_tokens` / `output_tokens` / `reasoning_output_tokens` /
-/// `cache_read_input_tokens` / `cache_creation_input_tokens` / `total_tokens`)
-/// regardless of provider. Without this, Codex-only models would serialize
-/// their internal nested `total_token_usage` shape and consumers reading the
-/// flat keys would see `null` for all of that model's tokens.
+/// Optional buckets (`cache_creation`, `server_tool_use`, `tool_tokens`, `above_tier`) are included only when non-zero.
 pub fn normalize_usage_value(usage: &Value) -> Value {
     token_counts_to_flat_value(&extract_token_counts(usage))
 }
 
-/// Serializes normalized counts back into the flat usage shape.
-///
-/// The key set is exactly what [`extract_token_counts`] reads for a flat value,
-/// so every quantity round-trips — `total` included, which is why it is written
-/// even where it equals the bucket sum. Deriving it back from the buckets
-/// instead would hold only while no provider publishes a `total_tokens` larger
-/// than its own buckets sum to, and one that did would lose the difference
-/// here, the way `tool_tokens` used to.
+/// Serializes normalized [`TokenCounts`] into the flat JSON schema readable by [`extract_token_counts`], always preserving `total_tokens`.
 fn token_counts_to_flat_value(c: &TokenCounts) -> Value {
     let mut obj = serde_json::Map::new();
     obj.insert("input_tokens".into(), json!(c.input_tokens));
@@ -160,10 +122,7 @@ fn token_counts_to_flat_value(c: &TokenCounts) -> Value {
             json!({ "web_search_requests": c.web_search_requests }),
         );
     }
-    // Only Gemini publishes this, so writing it unconditionally would put a
-    // `"tool_tokens": 0` on every other provider's row. Omitting it when it
-    // carries tokens is what loses them: the extractor recomputes the total
-    // from the keys it finds, and nothing else records them.
+    // Omit `tool_tokens` when zero so non-Gemini rows stay clean, but preserve non-zero values so `extract_token_counts` round-trips them.
     if c.tool_tokens != 0 {
         obj.insert("tool_tokens".into(), json!(c.tool_tokens));
     }
@@ -179,11 +138,7 @@ fn token_counts_to_flat_value(c: &TokenCounts) -> Value {
     Value::Object(obj)
 }
 
-/// Writes one price level's non-zero buckets as `level_<n>_<bucket>` keys.
-///
-/// Keeping the whole `above_tier` object a flat integer map is what lets it
-/// merge through `accumulate_nested_object` like `cache_creation` and
-/// `server_tool_use` do, whatever levels the two sides carry.
+/// Writes non-zero buckets of `slice` into `target` as `level_<level>_<bucket>` keys.
 pub(crate) fn write_tier_slice(
     target: &mut serde_json::Map<String, Value>,
     level: usize,
@@ -218,8 +173,7 @@ mod tests {
         }));
 
         assert_eq!(normalized["tool_tokens"], json!(7));
-        // Without the key the row would report a total its own buckets fall
-        // short of by exactly the tool tokens.
+        // Without `tool_tokens`, the bucket sum would fall short of `total_tokens`.
         let buckets: i64 = [
             "input_tokens",
             "output_tokens",
@@ -236,11 +190,6 @@ mod tests {
 
     #[test]
     fn mixed_shape_merge_keeps_a_total_its_buckets_fall_short_of() {
-        // The mixed branch replaces the row wholesale with the flat sum, so
-        // anything the flat shape has no key for is gone. No provider publishes
-        // a `total_tokens` larger than its own buckets sum to today, but
-        // nothing stops one, and deriving the total back from the buckets is
-        // what silently drops the difference — the way `tool_tokens` was lost.
         let mut existing = json!({
             "input_tokens": 100,
             "output_tokens": 20,
@@ -264,9 +213,6 @@ mod tests {
 
     #[test]
     fn mixed_shape_merge_keeps_each_tier_slice_on_its_own_level() {
-        // Two rows for one model classified into different price levels. The
-        // levels are positional, so folding one into the other's index would
-        // bill a level-2 request at level 1's cheaper prices.
         let mut existing = json!({
             "input_tokens": 300_000,
             "above_tier": { "level_2_input_tokens": 300_000 }
@@ -286,7 +232,6 @@ mod tests {
 
     #[test]
     fn normalized_row_without_tool_tokens_omits_the_key() {
-        // Every provider but Gemini: the flat key set is unchanged.
         let normalized = normalize_usage_value(&json!({
             "input_tokens": 100,
             "output_tokens": 20,

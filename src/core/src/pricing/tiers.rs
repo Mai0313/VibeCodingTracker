@@ -1,39 +1,16 @@
-//! Per-request context-tier classification support.
+//! Per-request context-tier classification against a [`TierThresholds`] snapshot.
 //!
-//! LiteLLM publishes `*_above_Nk_tokens` price tiers and `tiered_pricing`
-//! ranges whose real billing semantics are **per request**: a request bills at
-//! the price level its own prompt context falls in. The usage aggregator,
-//! however, merges tokens across records, files, and sessions before pricing,
-//! so selection at pricing time would compare the boundaries against a
-//! cumulative figure and promote a whole month of small requests to the
-//! elevated rate.
-//!
-//! [`TierThresholds`] is a `Send + Sync` snapshot of "model → the ascending
-//! boundaries between its price levels" derived from a
-//! [`ModelPricingMap`](super::ModelPricingMap). The usage scan hands it to the
-//! session parsers, which classify each request as it is folded and accumulate
-//! its buckets into that level's slice of the `above_tier` object, which
-//! `calculate_cost` bills at the matching level's prices. Parsers without the
-//! snapshot (the `analysis` paths, offline runs) classify nothing, which
-//! degrades to billing everything at the model's lowest level.
+//! Context-tier boundaries are evaluated per request rather than on aggregated token totals. [`TierThresholds`] captures each model's ascending token boundaries from a [`ModelPricingMap`](super::ModelPricingMap), and [`TierClassifier`] maps each request's prompt size to a 0-based price level (`0` for the base level, `n` for the level above the `n`th boundary) for [`calculate_cost`](super::calculate_cost).
 
 use crate::constants::FastHashMap;
 use crate::pricing::normalize_model_name;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
-/// Immutable "model → ascending price-level boundaries (tokens)" snapshot.
+/// Immutable map from model name to ascending context-size boundaries (in tokens).
 ///
-/// Keys are stored both as the LiteLLM key lowercased and as its normalized
-/// form, so the session-log model names (`gpt-5.4`, `azure/gpt-5.5`,
-/// `claude-sonnet-5`) resolve without re-implementing the full pricing match
-/// chain. A model that resolves to no entry simply has one price level.
+/// Entries are indexed by both the lowercased LiteLLM key and its [`normalize_model_name`] form. A model with no entry has a single price level.
 ///
-/// A boundary means the same thing to a classifier whichever pricing strategy
-/// produced it — "above this one, the next price level applies" — but the two
-/// strategies read a level back against different price rows, so a normalized
-/// collision between a range-based and a threshold-based model would classify
-/// one of them against the other's boundaries. No such collision exists in the
-/// LiteLLM data today.
+/// Range-based and threshold-based models share this normalized namespace; a normalized-name collision between the two strategies would misalign the resulting level index.
 #[derive(Debug, Default)]
 pub struct TierThresholds {
     boundaries: FastHashMap<Box<str>, Box<[i64]>>,
@@ -41,12 +18,7 @@ pub struct TierThresholds {
 }
 
 impl TierThresholds {
-    /// Builds the snapshot from `(model key, ascending boundaries)` pairs.
-    ///
-    /// On key collisions (e.g. `openai/gpt-5.4` and `azure/gpt-5.4`
-    /// normalizing to the same name) the lexicographically smallest list wins,
-    /// which for a single boundary is the smallest threshold — the
-    /// conservative choice, since every level above the first is dearer.
+    /// Builds a snapshot from `(model_key, ascending_boundaries)` pairs, keeping the lexicographically smallest boundary list on key collision.
     pub(crate) fn from_entries<'a>(entries: impl Iterator<Item = (&'a str, Vec<i64>)>) -> Self {
         let mut boundaries: FastHashMap<Box<str>, Box<[i64]>> = FastHashMap::default();
         let mut insert_min = |key: String, levels: &[i64]| {
@@ -64,8 +36,7 @@ impl TierThresholds {
             insert_min(normalize_model_name(key), &levels);
         }
 
-        // Order-independent fingerprint so scan caches can detect a changed
-        // snapshot (daily pricing reload) without hashing map iteration order.
+        // XOR per-entry hashes for an order-independent fingerprint across map iteration orders.
         let mut fingerprint = boundaries.len() as u64;
         for entry in &boundaries {
             let mut hasher = DefaultHasher::new();
@@ -79,8 +50,7 @@ impl TierThresholds {
         }
     }
 
-    /// Ascending price-level boundaries for `model`, or `None` when the model
-    /// has a single price level (or cannot be resolved).
+    /// Returns the ascending price-level boundaries for `model`, or `None` if it has a single price level or is absent.
     pub fn boundaries_for(&self, model: &str) -> Option<&[i64]> {
         if self.boundaries.is_empty() {
             return None;
@@ -94,23 +64,18 @@ impl TierThresholds {
             .map(|levels| &**levels)
     }
 
-    /// Whether no model carries a second price level (nothing will ever
-    /// classify).
+    /// Returns whether no model in the snapshot has multiple price levels.
     pub fn is_empty(&self) -> bool {
         self.boundaries.is_empty()
     }
 
-    /// Order-independent identity of this snapshot's contents; an empty
-    /// snapshot is `0`.
+    /// Returns an order-independent fingerprint of the snapshot's entries (`0` when empty).
     pub fn fingerprint(&self) -> u64 {
         self.fingerprint
     }
 }
 
-/// Per-parse memoized classifier over a [`TierThresholds`] snapshot.
-///
-/// Memoizes the per-model resolution (which lowercases/normalizes the name)
-/// so the per-record hot path is one map hit plus an integer comparison.
+/// Memoized per-request price-level classifier over a [`TierThresholds`] snapshot.
 #[derive(Debug)]
 pub struct TierClassifier<'a> {
     thresholds: &'a TierThresholds,
@@ -118,6 +83,7 @@ pub struct TierClassifier<'a> {
 }
 
 impl<'a> TierClassifier<'a> {
+    /// Creates a classifier backed by `thresholds`.
     pub fn new(thresholds: &'a TierThresholds) -> Self {
         Self {
             thresholds,
@@ -125,11 +91,9 @@ impl<'a> TierClassifier<'a> {
         }
     }
 
-    /// Which price level a request for `model` is billed at: `0` for the
-    /// model's base level, `n` for the level above its `n`th boundary.
+    /// Returns the 0-based price level for one `model` request (`0` for the base level, `n` above the `n`th boundary).
     ///
-    /// `request_context` is that one request's own full prompt size, cached
-    /// tokens included — never a sum across requests.
+    /// `request_context` must be a single request's total prompt tokens (including cached tokens), not an aggregate across requests.
     pub fn level(&mut self, model: &str, request_context: i64) -> usize {
         let thresholds: &'a TierThresholds = self.thresholds;
         let boundaries = match self.memo.get(model) {
@@ -140,8 +104,7 @@ impl<'a> TierClassifier<'a> {
                 resolved
             }
         };
-        // Boundaries ascend, so "the request cleared this one" holds for a
-        // prefix and its length is the level.
+        // Boundaries are strictly ascending, so `partition_point` counts how many boundaries `request_context` exceeds.
         boundaries.map_or(0, |boundaries| {
             boundaries.partition_point(|boundary| request_context > *boundary)
         })
@@ -195,9 +158,7 @@ mod tests {
 
     #[test]
     fn classifier_counts_every_boundary_the_request_cleared() {
-        // A four-row range model (dashscope/qwen3-coder-plus): the boundaries
-        // are the first three rows' exclusive upper bounds, so each level is
-        // the row that prices it.
+        // Boundaries are each higher row's `min_tokens - 1`, so each returned level indexes the pricing row.
         let tiers = TierThresholds::from_entries(
             [("qwen3-coder-plus", vec![31_999, 127_999, 255_999])].into_iter(),
         );

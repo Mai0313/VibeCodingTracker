@@ -11,10 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
-/// One cached parse, checked for staleness against `fingerprint`.
-///
-/// `size_bytes` is a snapshot taken by [`estimate_analysis_bytes`] at insertion,
-/// so reporting the cache's footprint never walks the analysis again.
+/// Cached parse entry with its staleness fingerprint and insertion-time byte estimate.
 #[derive(Debug, Clone)]
 struct CachedFile {
     fingerprint: FileFingerprint,
@@ -41,19 +38,13 @@ struct FileFingerprint {
     grok_dependencies: Option<GrokDependencyStamps>,
 }
 
-/// Thread-safe LRU cache of parsed session analyses, bounded by
-/// `constants::capacity::FILE_CACHE_SIZE`.
-///
-/// Entries are handed out as `Arc<CodeAnalysis>`, the typed struct rather than a
-/// `serde_json::Value`: `serde_json::to_value` deep-clones every string and adds
-/// per-node enum overhead, which roughly doubles the working set on a long
-/// session. A caller that wants a `Value` serializes on demand instead.
+/// LRU cache of parsed [`CodeAnalysis`] records, keyed by file path and bounded by [`crate::constants::capacity::FILE_CACHE_SIZE`].
 pub struct FileParseCache {
     cache: RwLock<LruCache<PathBuf, CachedFile>>,
 }
 
 impl FileParseCache {
-    /// Creates a new LRU cache with capacity from `constants::capacity::FILE_CACHE_SIZE`.
+    /// Returns an empty cache with capacity [`crate::constants::capacity::FILE_CACHE_SIZE`].
     pub fn new() -> Self {
         // FILE_CACHE_SIZE is a nonzero const, so this cannot fail.
         let cache_size = NonZeroUsize::new(capacity::FILE_CACHE_SIZE).unwrap();
@@ -62,19 +53,13 @@ impl FileParseCache {
         }
     }
 
-    /// Retrieves cached analysis or parses the file if needed, auto-detecting
-    /// the provider from file contents.
+    /// Returns the cached [`CodeAnalysis`] for `path`, reparsing with content-based provider detection on a miss or when the file fingerprint changes.
     ///
-    /// Detection is content-based, so this suits an ad-hoc single-file path. A
-    /// caller walking one provider's session directory already knows the
-    /// provider and should parse through
-    /// [`crate::session::parse_session_file_typed_as`] instead.
+    /// When the provider is already known from the directory layout, use [`crate::session::parse_session_file_typed_as`] instead. A poisoned cache lock falls back to parsing without caching.
     ///
     /// # Errors
     ///
-    /// Returns an error if the file's metadata cannot be read or if parsing the
-    /// session file fails (malformed data, unreadable contents, etc.). A
-    /// poisoned cache lock does not error — it simply forces a reparse.
+    /// Returns an error if file metadata cannot be read or if session parsing fails.
     pub fn get_or_parse<P: AsRef<Path>>(&self, path: P) -> Result<Arc<CodeAnalysis>> {
         let path = path.as_ref();
         let path_buf = path.to_path_buf();
@@ -83,7 +68,7 @@ impl FileParseCache {
 
         {
             if let Ok(cache_read) = self.cache.read() {
-                // peek() rather than get(), so a hit needs no write lock.
+                // Use peek() under the read lock to check the fingerprint before taking a write lock.
                 if let Some(cached) = cache_read.peek(&path_buf) {
                     let is_grok = cached.analysis.extension_name == "Grok";
                     let fingerprint = FileFingerprint {
@@ -108,14 +93,12 @@ impl FileParseCache {
         }
 
         log::debug!("LRU cache miss for {}, parsing...", path.display());
-        // Sampled before the parse: a stamp taken after it could be newer than
-        // what was actually parsed, and the entry would never go stale.
+        // Sampled before the parse: a stamp taken after it could be newer than what was actually parsed, and the entry would never go stale.
         let possible_grok_dependencies = grok_dependency_stamps(path);
         let analysis = crate::session::parse_session_file_typed(path)?;
         let arc_analysis = Arc::new(analysis);
         let size_bytes = estimate_analysis_bytes(arc_analysis.as_ref());
 
-        // At capacity the LRU evicts its oldest entry to make room.
         if let Ok(mut cache_write) = self.cache.write() {
             let is_grok = arc_analysis.extension_name == "Grok";
             cache_write.put(
@@ -141,10 +124,7 @@ impl FileParseCache {
         }
     }
 
-    /// Removes entries for non-existent files (manual cleanup).
-    ///
-    /// With LRU eviction, stale entries are naturally removed over time, so this
-    /// is typically not needed in production.
+    /// Removes cached entries whose paths no longer exist on disk.
     pub fn cleanup_stale(&self) {
         if let Ok(mut cache) = self.cache.write() {
             // LRU cache doesn't have retain(), so we collect keys first
@@ -160,10 +140,7 @@ impl FileParseCache {
         }
     }
 
-    /// Returns cache statistics for monitoring and debugging.
-    ///
-    /// `estimated_memory_kb` is a real sum of per-entry sizes captured by
-    /// `estimate_analysis_bytes` at insertion time.
+    /// Returns current cache entry count and estimated heap usage.
     pub fn stats(&self) -> CacheStats {
         if let Ok(cache) = self.cache.write() {
             let total_bytes: usize = cache.iter().map(|(_, c)| c.size_bytes).sum();
@@ -226,22 +203,16 @@ impl Default for FileParseCache {
     }
 }
 
-/// Cache usage statistics for monitoring.
+/// Cache occupancy and estimated memory footprint.
 #[derive(Debug, Default, Clone)]
 pub struct CacheStats {
     /// Number of entries currently held in the cache.
     pub entry_count: usize,
-    /// Summed per-entry heap estimate in KiB (see `estimate_analysis_bytes`).
+    /// Estimated heap usage of cached entries, in KiB.
     pub estimated_memory_kb: usize,
 }
 
-/// Best-effort byte estimate of a [`CodeAnalysis`]'s heap footprint.
-///
-/// Counts the inline struct + every owned `String` capacity reachable from
-/// the records. Ignores allocator padding and `HashMap` bucket overhead, and
-/// approximates each `conversation_usage` value rather than walking it — still
-/// more honest than a flat constant and vastly cheaper than
-/// `serde_json::to_vec(...).len()`.
+/// Returns a best-effort heap-size estimate in bytes for `analysis`, summing reachable `Vec`/`String` capacities and approximating each `conversation_usage` value.
 fn estimate_analysis_bytes(analysis: &CodeAnalysis) -> usize {
     use std::mem::size_of;
 
@@ -284,8 +255,7 @@ fn estimate_analysis_bytes(analysis: &CodeAnalysis) -> usize {
 
         for (k, _) in &record.conversation_usage {
             bytes += k.capacity();
-            // Values are small token-count objects; approximate at 256 B each
-            // rather than walking Value trees on every insertion.
+            // Values are small token-count objects; approximate at 256 B each rather than walking Value trees on every insertion.
             bytes += 256;
         }
     }

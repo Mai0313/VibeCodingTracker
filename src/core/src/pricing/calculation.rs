@@ -1,3 +1,5 @@
+//! Token cost calculation across flat, threshold-tiered, and range-tiered pricing.
+
 use super::cache::{ModelPricing, TierRange};
 use crate::utils::{TierSlice, TokenCounts};
 
@@ -6,13 +8,11 @@ use crate::utils::{TierSlice, TokenCounts};
 struct PriceLevel {
     input: f64,
     output: f64,
-    /// `0.0` means "no dedicated reasoning rate at this level" — billed at
-    /// this level's output rate instead, so reasoning never prices at $0.
+    /// Dedicated reasoning rate, or `0.0` to fall back to `output`.
     reasoning_raw: f64,
     cache_read: f64,
     cc_5m: f64,
-    /// `0.0` means the level publishes no extended-TTL price — 1h cache
-    /// writes fall back to the 5m rate (under-bill rather than fabricate).
+    /// Extended 1-hour cache-write rate, or `0.0` to fall back to `cc_5m`.
     cc_1h_raw: f64,
 }
 
@@ -28,9 +28,7 @@ impl PriceLevel {
         }
     }
 
-    /// One row of a range-based model. A range replaces the input, output,
-    /// reasoning and cache-read prices outright; cache writes stay on the
-    /// model's base rates, which LiteLLM does not publish per range.
+    /// Builds a level from `range`, keeping `pricing`'s base cache-write rates (LiteLLM omits per-range cache-write prices).
     fn range(range: &TierRange, pricing: &ModelPricing) -> Self {
         Self {
             input: range.input_cost_per_token,
@@ -62,41 +60,15 @@ impl PriceLevel {
     }
 }
 
-/// Calculates total cost for normalized token counts and the model's pricing.
+/// Returns the USD token cost for `counts` under `pricing`.
 ///
-/// Both pricing strategies bill a per-level split, and **neither ever selects
-/// a level from the summed counts**: `counts` is a per-model aggregate across
-/// records, files and sessions, while LiteLLM's tier semantics are per
-/// request, so a level chosen from the sum promotes whole months of small
-/// requests to the elevated rate. The level is chosen per request instead, by
-/// the usage parsers, which accumulate each request's tokens into its level's
-/// [`TokenCounts::above_tiers`] slice.
+/// Tier selection never inspects aggregated totals in `counts`; callers populate [`TokenCounts::above_tiers`] per request, and any tokens outside those slices bill at the lowest level.
 ///
-/// 1. Range-based (`pricing.ranges` is `Some`, Qwen / doubao volume tiers):
-///    level `n`'s slice bills at `ranges[n]`, the remainder at `ranges[0]`.
-/// 2. Threshold-based (`pricing.tiers`): level `n`'s slice bills at
-///    `tiers[n - 1]`, the remainder at base prices.
-/// 3. Counts without slices (analysis paths, offline scans, providers without
-///    per-request granularity) therefore bill entirely at the lowest level —
-///    a deliberate lower bound.
+/// - Range-based (`pricing.ranges` is `Some`): slice `n` (1-based) bills at `ranges[n]` (clamped to the last row) and unclassified tokens at `ranges[0]`; an empty slice list yields `0.0`. Cache writes always use the model's base rates.
+/// - Threshold-based (`pricing.tiers` is non-empty): slice `n` bills at `tiers[n - 1]` (clamped to the last tier) and unclassified tokens at base rates. Reasoning tokens at an elevated threshold tier always use that tier's output rate.
+/// - Flat (neither set): all tokens bill at base rates, even if `above_tiers` is populated.
 ///
-/// A price a level does not publish falls back to the level below it, and a
-/// level past the model's last published row bills at that row. Only the range
-/// strategy reaches that chain in practice: `parse_litellm_entry` already fills
-/// a tier's unpublished input / output / cache prices from the model's base,
-/// so a `ThresholdTier` arrives here with nothing left to inherit.
-///
-/// `reasoning_tokens` covers the model's "thinking" budget (Gemini
-/// `thoughts_tokens`, Codex `reasoning_output_tokens`, Copilot
-/// `reasoningTokens`). When the active price level publishes
-/// `output_cost_per_reasoning_token`, reasoning is billed at that rate;
-/// otherwise it falls back to the active `output_cost_per_token` rate so
-/// providers that don't split reasoning (all Anthropic models, GPT-5.x,
-/// Grok, …) continue to bill correctly.
-///
-/// `cache_creation_5m` and `cache_creation_1h` are priced separately
-/// (5-minute default TTL vs 1-hour extended TTL). When the active price level
-/// publishes no 1hr rate (value is 0.0), the 5m price bills both buckets.
+/// Unpublished rates (`0.0`) inherit from the level directly below. Reasoning tokens fall back to the active level's output rate when `output_cost_per_reasoning_token` is `0.0`, and `cache_creation_1h` falls back to the active level's 5-minute cache-write rate when `cache_creation_input_token_cost_above_1hr` is `0.0`.
 ///
 /// # Examples
 ///
@@ -110,7 +82,6 @@ impl PriceLevel {
 ///     output_cost_per_token: 1.5e-5,
 ///     ..Default::default()
 /// };
-/// // 1000 input + 500 output tokens, no cache or reasoning.
 /// let counts = TokenCounts {
 ///     input_tokens: 1000,
 ///     output_tokens: 500,
@@ -125,11 +96,7 @@ pub fn calculate_cost(counts: &TokenCounts, pricing: &ModelPricing) -> f64 {
             return 0.0;
         };
         return bill_levels(counts, PriceLevel::range(first, pricing), |level, below| {
-            // Rows are sorted ascending and the parsers classify against each
-            // row's lower bound, so level `n` is row `n`. A level past the
-            // last published row bills there, which is also what a single-row
-            // model's inherited slice does. A price the row doesn't publish
-            // falls back to the level below rather than billing $0.
+            // Level `n` maps to `ranges[n]` (clamped to `top`), inheriting unpublished fields from `below`.
             let row = ranges.get(level).unwrap_or(top);
             PriceLevel {
                 input: positive_or(row.input_cost_per_token, below.input),
@@ -145,9 +112,7 @@ pub fn calculate_cost(counts: &TokenCounts, pricing: &ModelPricing) -> f64 {
     }
 
     bill_levels(counts, PriceLevel::base(pricing), |level, below| {
-        // Level `n` is classified against the `n`th threshold, so it bills at
-        // `tiers[n - 1]`. A tier field the model doesn't publish (0.0) falls
-        // back to the level below rather than billing $0.
+        // Level `n` maps to `tiers[n - 1]` (clamped to the last tier), inheriting unpublished fields from `below`.
         match pricing
             .tiers
             .get(level - 1)
@@ -156,27 +121,19 @@ pub fn calculate_cost(counts: &TokenCounts, pricing: &ModelPricing) -> f64 {
             Some(tier) => PriceLevel {
                 input: positive_or(tier.input_cost_per_token, below.input),
                 output: positive_or(tier.output_cost_per_token, below.output),
-                // LiteLLM publishes no tier-specific reasoning rate; billing
-                // tier reasoning at the tier output rate matches "once you're
-                // in the tier, everything is more expensive".
+                // LiteLLM publishes no tier-specific reasoning rate; force fallback to this tier's output rate rather than the lower base reasoning rate.
                 reasoning_raw: 0.0,
                 cache_read: positive_or(tier.cache_read_input_token_cost, below.cache_read),
                 cc_5m: positive_or(tier.cache_creation_input_token_cost, below.cc_5m),
                 cc_1h_raw: tier.cache_creation_input_token_cost_above_1hr,
             },
-            // Slices without a published tier (e.g. boundaries derived from a
-            // newer pricing snapshot than this entry): bill at base rates
-            // verbatim, keeping the model's dedicated reasoning rate.
+            // No published tiers (e.g. stale snapshot boundaries): keep base rates verbatim, including any dedicated reasoning rate.
             None => below,
         }
     })
 }
 
-/// Bills what no level claimed at `base` and every classified slice at the
-/// level `level_price` resolves it to.
-///
-/// Levels resolve in order even where nothing classified into one, because
-/// each level's unpublished prices fall back to the level directly below it.
+/// Bills unclassified tokens at `base` and each slice in `counts.above_tiers` at the price resolved by `level_price`.
 fn bill_levels(
     counts: &TokenCounts,
     base: PriceLevel,
@@ -187,9 +144,7 @@ fn bill_levels(
         classified.merge(slice);
     }
 
-    // The classified slices are subsets of the totals; what is left bills at
-    // the base level. Clamp defensively so a malformed merge can never bill
-    // negative tokens.
+    // Clamp remainders to zero so a malformed slice merge cannot bill negative base tokens.
     let remainder = |total: i64, classified: i64| (total - classified).max(0);
     let mut cost = base.bill(&TierSlice {
         input_tokens: remainder(counts.input_tokens, classified.input_tokens),
@@ -200,6 +155,7 @@ fn bill_levels(
         cache_creation_1h: remainder(counts.cache_creation_1h, classified.cache_creation_1h),
     });
 
+    // Resolve every level in order even for empty slices so unpublished prices inherit from the level below.
     let mut prices = base;
     for (index, slice) in counts.above_tiers.iter().enumerate() {
         prices = level_price(index + 1, prices);
@@ -240,8 +196,7 @@ mod tests {
         }
     }
 
-    /// Sets the slice classified into `level`, filling any level below it with
-    /// zeros the way the parsers' own accumulator does.
+    /// Sets the slice for 1-based `level`, zero-filling lower levels.
     fn classify(counts: &mut TokenCounts, level: usize, slice: TierSlice) {
         if counts.above_tiers.len() < level {
             counts.above_tiers.resize(level, TierSlice::default());
@@ -290,8 +245,6 @@ mod tests {
     #[test]
     fn test_flat_pricing_applies_base() {
         let p = flat_pricing();
-        // 200 cache-read tokens, and 100 cache-creation tokens that all sit in
-        // the 5m bucket (no TTL split available).
         let cost = calculate_cost(&counts(1000, 500, 0, 200, 100, 0), &p);
         let expected =
             1000.0 * 0.000003 + 500.0 * 0.000015 + 200.0 * 0.0000003 + 100.0 * 0.00000375;
@@ -309,9 +262,6 @@ mod tests {
 
     #[test]
     fn test_aggregate_volume_alone_never_promotes_to_tier() {
-        // Regression guard for the aggregate-tier bug: a month of small
-        // requests sums far past the threshold, but with no per-request
-        // above slice everything must stay on base prices.
         let p = sonnet_like_pricing();
         let cost = calculate_cost(&counts(5_000_000, 250_000, 0, 2_000_000, 0, 0), &p);
         let expected = 5_000_000.0 * 0.000003 + 250_000.0 * 0.000015 + 2_000_000.0 * 0.0000003;
@@ -351,8 +301,7 @@ mod tests {
 
     #[test]
     fn test_above_slice_without_published_tier_bills_at_base() {
-        // Thresholds can come from a newer pricing snapshot than this entry;
-        // the tokens must still be billed exactly once, at base rates.
+        // Thresholds can come from a newer pricing snapshot than this entry; the tokens must still be billed exactly once, at base rates.
         let p = flat_pricing();
         let mut c = counts(300_000, 1_000, 0, 0, 0, 0);
         classify(&mut c, 1, slice(300_000, 1_000));
@@ -362,9 +311,6 @@ mod tests {
 
     #[test]
     fn test_above_slice_without_tier_keeps_dedicated_reasoning_rate() {
-        // A model with a dedicated reasoning rate but no context tier: an
-        // above-slice (from a normalized collision or stale threshold) must
-        // still bill reasoning at that dedicated rate, not the output rate.
         let p = ModelPricing {
             input_cost_per_token: 1e-6,
             output_cost_per_token: 8e-6,
@@ -389,8 +335,6 @@ mod tests {
 
     #[test]
     fn test_unpublished_tier_field_falls_back_to_base_price() {
-        // The tier row only publishes input/output; its cache_read must fall
-        // back to the base cache_read price rather than billing $0.
         let p = ModelPricing {
             input_cost_per_token: 0.000001,
             output_cost_per_token: 0.000002,
@@ -418,9 +362,6 @@ mod tests {
 
     #[test]
     fn test_above_reasoning_uses_tier_output_rate() {
-        // No tier-specific reasoning rate exists; above-slice reasoning bills
-        // at the tier output rate ("once you're in the tier, everything is
-        // more expensive"), never at the base reasoning rate.
         let p = ModelPricing {
             input_cost_per_token: 3e-6,
             output_cost_per_token: 1.5e-5,
@@ -451,8 +392,7 @@ mod tests {
 
     #[test]
     fn test_negative_base_slice_clamps_to_zero() {
-        // A malformed merge could leave above > total; never bill negative
-        // base tokens.
+        // A malformed merge could leave above > total; never bill negative base tokens.
         let p = sonnet_like_pricing();
         let mut c = counts(100, 0, 0, 0, 0, 0);
         classify(&mut c, 1, slice(500, 0));
@@ -502,10 +442,6 @@ mod tests {
 
     #[test]
     fn test_range_aggregate_volume_alone_never_promotes_to_a_higher_row() {
-        // The counterpart of `test_aggregate_volume_alone_never_promotes_to_tier`
-        // for range pricing: 500K is a month of small requests summed, not one
-        // request, so every token stays on row 0 rather than reaching the 6x
-        // input / 12x output top row.
         let p = qwen_like_pricing();
 
         let c_low = calculate_cost(&counts(20_000, 5_000, 0, 0, 0, 0), &p);
@@ -528,9 +464,6 @@ mod tests {
 
     #[test]
     fn test_range_above_slice_reaches_the_row_it_classified_into() {
-        // A 500K-context request belongs to the top row, whose output rate is
-        // 12x row 0's. Billing it at row 1 — all one `above_*` bucket could
-        // ever express — under-reported it by 6.7x on output.
         let p = qwen_like_pricing();
         let mut c = counts(500_000, 5_000, 0, 0, 0, 0);
         classify(&mut c, 3, slice(500_000, 5_000));
@@ -540,8 +473,6 @@ mod tests {
 
     #[test]
     fn test_every_range_row_bills_its_own_slice() {
-        // One model's month: requests landed in all four rows, so each row's
-        // slice bills at that row and only the unclassified remainder at row 0.
         let p = qwen_like_pricing();
         let mut c = counts(400_000, 4_000, 0, 0, 0, 0);
         classify(&mut c, 1, slice(100_000, 1_000));
@@ -561,9 +492,7 @@ mod tests {
 
     #[test]
     fn test_each_threshold_tier_bills_its_own_slice() {
-        // Every threshold-priced model LiteLLM publishes today carries exactly
-        // one tier, so this pins the level → `tiers[n - 1]` mapping before a
-        // second one ever ships.
+        // LiteLLM currently publishes single-tier threshold models; pin multi-tier `tiers[n - 1]` indexing.
         let p = ModelPricing {
             input_cost_per_token: 1e-6,
             output_cost_per_token: 2e-6,
@@ -598,9 +527,7 @@ mod tests {
 
     #[test]
     fn test_a_level_past_the_last_row_bills_at_that_row() {
-        // Boundaries can come from a newer pricing snapshot than this entry,
-        // so a level the model no longer publishes must still bill at its
-        // dearest row rather than falling back to row 0.
+        // Stale boundaries from a newer snapshot clamp to the dearest row rather than row 0.
         let p = qwen_like_pricing();
         let mut c = counts(10_000, 0, 0, 0, 0, 0);
         classify(&mut c, 7, slice(10_000, 0));
@@ -609,8 +536,6 @@ mod tests {
 
     #[test]
     fn test_higher_range_row_inherits_prices_from_the_row_below_it() {
-        // Row 2 publishes only input; its output must fall back to row 1's
-        // rather than to row 0's, which is the cheaper of the two.
         let p = ModelPricing {
             ranges: Some(vec![
                 TierRange {
@@ -644,8 +569,6 @@ mod tests {
 
     #[test]
     fn test_range_row_one_falls_back_to_row_zero_for_unpublished_prices() {
-        // Row 1 only publishes input; its output and cache-read must fall back
-        // to row 0's rather than billing $0.
         let p = ModelPricing {
             ranges: Some(vec![
                 TierRange {
@@ -697,8 +620,7 @@ mod tests {
             ..Default::default()
         };
 
-        // A single-row model publishes no threshold, so nothing classifies and
-        // 200K past the row's own bound still bills at it rather than $0.
+        // A single-row model has no threshold, so volumes past `max_tokens` still bill at row 0.
         let cost = calculate_cost(&counts(200_000, 0, 0, 0, 0, 0), &p);
         assert_eq!(cost, 200_000.0 * 0.000001);
 
@@ -710,8 +632,6 @@ mod tests {
 
     #[test]
     fn test_range_cache_writes_stay_on_base_prices() {
-        // LiteLLM publishes no per-range cache-write price, so both TTL
-        // buckets bill at the model's base rates on either side of the split.
         let p = ModelPricing {
             cache_creation_input_token_cost: 0.00000375,
             cache_creation_input_token_cost_above_1hr: 0.000006,
@@ -764,19 +684,15 @@ mod tests {
             ..Default::default()
         };
 
-        // 10_000 tokens at 1hr TTL should cost the extended rate, not the 5m rate.
         let cost = calculate_cost(&counts(0, 0, 0, 0, 0, 10_000), &p);
         assert_eq!(cost, 10_000.0 * 1e-5);
 
-        // Mixed: 1_000 at 5m + 10_000 at 1h.
         let cost_mixed = calculate_cost(&counts(0, 0, 0, 0, 1_000, 10_000), &p);
         assert_eq!(cost_mixed, 1_000.0 * 6.25e-6 + 10_000.0 * 1e-5);
     }
 
     #[test]
     fn test_1hr_falls_back_to_5m_when_model_has_no_extended_price() {
-        // A model with only a 5m price — 1h tokens should still be billed
-        // (at the 5m rate) rather than silently costing $0.
         let p = ModelPricing {
             cache_creation_input_token_cost: 6.25e-6,
             cache_creation_input_token_cost_above_1hr: 0.0,
@@ -789,8 +705,6 @@ mod tests {
 
     #[test]
     fn test_1hr_above_slice_uses_tier_price_when_published() {
-        // Tier carries its own 1hr price (Claude 3.5 Sonnet-style); the
-        // above slice of both TTL buckets bills at the tier's rates.
         let p = ModelPricing {
             input_cost_per_token: 3e-6,
             cache_creation_input_token_cost: 3.75e-6,
@@ -823,12 +737,7 @@ mod tests {
 
     #[test]
     fn test_reasoning_billed_at_dedicated_rate_when_published() {
-        // Gemini 2.5 flash-lite publishes a dedicated
-        // `output_cost_per_reasoning_token` that happens to match its
-        // output rate; perplexity/sonar-deep-research pays $3/M for
-        // reasoning vs $8/M for output. Use the synthetic latter shape
-        // to prove the reasoning price is not being silently coerced
-        // back to the output rate.
+        // Distinct reasoning and output rates verify reasoning is not coerced to the output rate.
         let p = ModelPricing {
             input_cost_per_token: 1e-6,
             output_cost_per_token: 8e-6,
@@ -843,9 +752,6 @@ mod tests {
 
     #[test]
     fn test_reasoning_falls_back_to_output_rate_when_not_published() {
-        // Claude has no reasoning price published at all. Sessions that
-        // still report reasoning tokens (e.g. Copilot driving a Claude
-        // model) should bill them at the output rate rather than $0.
         let p = ModelPricing {
             input_cost_per_token: 3e-6,
             output_cost_per_token: 1.5e-5,
@@ -859,10 +765,6 @@ mod tests {
 
     #[test]
     fn test_reasoning_uses_range_reasoning_rate_when_published() {
-        // dashscope qwen-plus ships a per-range reasoning rate ($4/M)
-        // that's substantially higher than the per-range output rate
-        // ($1.2/M). The range-based path must route reasoning through
-        // that field.
         let p = ModelPricing {
             ranges: Some(vec![TierRange {
                 min_tokens: 0,

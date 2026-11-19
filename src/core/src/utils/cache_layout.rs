@@ -1,18 +1,11 @@
-//! Removal of what no longer belongs directly in `~/.vct`: the flat layout that
-//! preceded `quota/` and `version/`, plus one older orphan.
+//! Best-effort removal of legacy flat-layout files directly under `~/.vct`.
 //!
-//! The flat layout's files are each a cache or a throttle stamp that the next
-//! run rebuilds on its own, so they are deleted rather than migrated: a quota
-//! snapshot returns with its provider's first fetch, a CLI version with the
-//! next `<cli> --version`, and the update record with that day's check.
-//! Carrying their contents across would buy one HTTP round trip and cost a
-//! per-format field back-fill. `cursor_usage_events.json` has no reader left at
-//! all: the dashboard-billing fetch that wrote it was removed long before this.
+//! Files are deleted rather than migrated; each is a cache or throttle stamp rebuilt on the next run, or an unused orphan.
 
 use crate::utils::resolve_paths;
 use std::path::Path;
 
-/// What no longer belongs directly in `~/.vct`.
+/// Legacy top-level files under `~/.vct` eligible for deletion.
 const LEGACY_FILES: &[&str] = &[
     "claude_usage.json",
     "codex_usage.json",
@@ -28,12 +21,9 @@ const LEGACY_FILES: &[&str] = &[
     "cursor_usage_events.json",
 ];
 
-/// Deletes whatever the flat layout left in `~/.vct`.
+/// Deletes legacy flat-layout cache files directly under `~/.vct`.
 ///
-/// Best-effort and silent by design: it runs before every subcommand, so a
-/// failure here must never become one of theirs. The directory is resolved
-/// without creating it, keeping the commands that own no settings from
-/// materializing `~/.vct` on this call's account.
+/// Best-effort and silent: missing files and I/O errors are logged at debug level and ignored, and `~/.vct` is not created if absent.
 pub fn remove_legacy_cache_files() {
     let Ok(paths) = resolve_paths() else {
         return;
@@ -41,8 +31,7 @@ pub fn remove_legacy_cache_files() {
     remove_legacy_cache_files_in(&paths.cache_dir);
 }
 
-/// The injectable core of [`remove_legacy_cache_files`], acting on an explicit
-/// cache directory. Production passes `~/.vct`; tests pass a temp dir.
+/// Deletes legacy flat-layout cache files in `dir`, ignoring missing files and I/O errors without creating `dir`.
 pub(crate) fn remove_legacy_cache_files_in(dir: &Path) {
     for name in LEGACY_FILES {
         let path = dir.join(name);
@@ -82,8 +71,6 @@ mod tests {
         assert!(kept_dir.join("claude.json").exists());
     }
 
-    /// It runs before every subcommand, so an absent `~/.vct` must be a no-op
-    /// rather than a reason to create one.
     #[test]
     fn absent_cache_directory_is_not_created() {
         let dir = tempfile::tempdir().unwrap();

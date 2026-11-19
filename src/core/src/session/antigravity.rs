@@ -1,12 +1,6 @@
 //! Antigravity conversation transcript parser.
 //!
-//! Antigravity CLI (`agy`), Antigravity Desktop and other builds keep one directory
-//! per conversation under `<root>/brain/<conversation-id>/`, whose
-//! `.system_generated/logs/transcript_full.jsonl` is the conversation's step
-//! log. The model that served each generation is not in that log: it lives in
-//! the sibling `<root>/conversations/<conversation-id>.db`, whose
-//! `gen_metadata` rows are protobuf messages naming the model and the step the
-//! generation answered.
+//! Antigravity CLI (`agy`), Antigravity Desktop, and other builds keep one directory per conversation under `<root>/brain/<conversation-id>/`, whose `.system_generated/logs/transcript_full.jsonl` is the conversation's step log. The model that served each generation lives in the sibling `<root>/conversations/<conversation-id>.db`, whose `gen_metadata` rows are protobuf messages naming the model and the step the generation answered.
 
 use crate::constants::{FastHashMap, buffer};
 use crate::models::CodeAnalysis;
@@ -32,8 +26,7 @@ use std::path::{Path, PathBuf};
 /// The model name given to tokens no generation record attributes.
 const UNKNOWN_MODEL: &str = "unknown";
 
-/// One request's tokens, in vct's disjoint buckets. The transcript reports no
-/// reasoning or cache-write count.
+/// One request's tokens in vct's disjoint buckets; Antigravity transcripts report no reasoning or cache-write counts.
 #[derive(Debug, Clone, Copy, Default)]
 struct Tokens {
     input: i64,
@@ -42,10 +35,7 @@ struct Tokens {
 }
 
 impl Tokens {
-    /// Reads a step's token fields; `None` when it carries none.
-    ///
-    /// `input_tokens` already excludes cache reads, so it maps straight onto
-    /// the non-cached input bucket.
+    /// Returns a step's token counts, or `None` when none are present; `input_tokens` already excludes cache reads.
     fn from_record(record: &Map<String, Value>) -> Option<Self> {
         if !["input_tokens", "cache_read_tokens", "output_tokens"]
             .iter()
@@ -82,15 +72,13 @@ impl Tokens {
         self.cache_read += other.cache_read;
     }
 
-    /// The prompt size one request is billed against.
+    /// Returns the prompt size one request is billed against.
     fn request_context(self) -> i64 {
         self.input + self.cache_read
     }
 }
 
-/// Per-model running totals plus the per-price-level slices of them.
-///
-/// `above_tiers[n]` is the slice classified into price level `n + 1`.
+/// Per-model running totals and above-tier slices (`above_tiers[n]` holds price level `n + 1`).
 #[derive(Debug, Default)]
 struct ModelUsage {
     total: Tokens,
@@ -109,20 +97,18 @@ impl ModelUsage {
     }
 }
 
-/// What the conversation database says about the transcript beside it.
+/// Metadata read from the sibling conversation database.
 #[derive(Debug, Default)]
 struct ConversationMeta {
-    /// The model of each generation that records the step it answered, keyed
-    /// by that step's index.
+    /// Model of each generation that records the step it answered, keyed by step index.
     step_models: HashMap<i64, String>,
-    /// The first generation's model, for steps before any keyed generation.
+    /// First generation's model, used for steps before any keyed generation.
     first_model: Option<String>,
     workspace: Option<String>,
     git_remote: Option<String>,
 }
 
-/// Returns `<root>/conversations/<id>.db` for a transcript at
-/// `<root>/brain/<id>/.system_generated/logs/<file>`.
+/// Returns `<root>/conversations/<id>.db` for a transcript at `<root>/brain/<id>/.system_generated/logs/<file>`.
 pub(crate) fn conversation_db_path(transcript: &Path) -> Option<PathBuf> {
     let conversation = transcript.parent()?.parent()?.parent()?;
     let root = conversation.parent()?.parent()?;
@@ -240,9 +226,7 @@ fn read_conversation_meta(db: &Path) -> Result<ConversationMeta> {
     )
 }
 
-/// Reads one `gen_metadata` row: field 1 holds the model id (field 19) and
-/// string key/value pairs (field 20), one of which is the index of the step the
-/// generation followed. Returns the step it produced and its model.
+/// Decodes a `gen_metadata` protobuf row (field 1: model id in 19, `last_step_index` key/value in 20) into `(produced_step, model)`.
 fn decode_generation(data: &[u8]) -> Option<(Option<i64>, String)> {
     let generation = bytes_field(data, 1)?;
     let mut model = None;
@@ -267,9 +251,7 @@ fn decode_generation(data: &[u8]) -> Option<(Option<i64>, String)> {
     Some((step, model))
 }
 
-/// Some builds record `<config name>|<backend>`. A backend in Vertex's
-/// `<model>@<version>` form is a published model id, so it names the model;
-/// any other backend is a serving path, leaving the config name.
+/// Returns the model name from `id`, resolving `<config>|<backend>` to `<model>` for a Vertex `<model>@<version>` backend and `<config>` for a serving path.
 fn model_name(id: &str) -> String {
     let Some((name, backend)) = id.split_once('|') else {
         return id.to_string();
@@ -280,8 +262,7 @@ fn model_name(id: &str) -> String {
     }
 }
 
-/// Reads the trajectory blob: field 1 holds the workspace URI (field 1) and
-/// the repository (field 3, whose field 2 is the remote URL).
+/// Populates `meta` from a trajectory protobuf blob (field 1: workspace URI in 1, repository remote URL in 3.2).
 fn decode_trajectory(data: &[u8], meta: &mut ConversationMeta) {
     let Some(workspace) = bytes_field(data, 1) else {
         return;
@@ -302,14 +283,13 @@ fn workspace_path(uri: &str) -> String {
     }
 }
 
-/// One protobuf field value: a varint, or the bytes of a length-delimited one.
+/// One protobuf field value: an unparsed scalar (`Varint` or fixed-width) or length-delimited `Bytes`.
 enum ProtoValue<'a> {
     Varint,
     Bytes(&'a [u8]),
 }
 
-/// Iterates a protobuf message's top-level fields, stopping at the first
-/// malformed one.
+/// Iterates a protobuf message's top-level fields, stopping at the first malformed wire entry.
 struct ProtoFields<'a>(&'a [u8], usize);
 
 impl<'a> Iterator for ProtoFields<'a> {
@@ -345,7 +325,7 @@ impl<'a> Iterator for ProtoFields<'a> {
     }
 }
 
-/// The first length-delimited `field` of a message.
+/// Returns the first length-delimited `field` in `data`.
 fn bytes_field(data: &[u8], field: u64) -> Option<&[u8]> {
     ProtoFields(data, 0).find_map(|(number, value)| match value {
         ProtoValue::Bytes(bytes) if number == field => Some(bytes),
@@ -401,14 +381,12 @@ struct BorrowedToolCall<'a> {
 struct AntigravityParser<'a> {
     state: SessionParseState,
     usage: FastHashMap<String, ModelUsage>,
-    /// Compaction requests' tokens per model. No generation record names a
-    /// compaction's model, so each is billed to the model in use when it ran.
+    /// Compaction request tokens per model, billed to the model active when each `CHECKPOINT` runs.
     compaction: FastHashMap<String, ModelUsage>,
     diagnostics: ParseDiagnostics,
     classifier: Option<TierClassifier<'a>>,
     meta: ConversationMeta,
-    /// The model of the latest keyed generation, carried to steps whose own
-    /// generation records no step index.
+    /// Model of the latest keyed generation, carried forward to steps whose generation has no step index.
     current_model: Option<String>,
     /// A step's N tool calls are followed by exactly N result records, in order.
     pending_calls: VecDeque<PendingCall>,
@@ -462,8 +440,7 @@ impl<'a> AntigravityParser<'a> {
                     .clone()
                     .unwrap_or_else(|| UNKNOWN_MODEL.to_string());
                 self.apply_usage(object, model);
-                // Results never outlive their step, so a step that wrote fewer
-                // than it called cannot shift the pairing of the next one.
+                // Results never outlive their step, so clearing prevents a short step from shifting the next step's pairing.
                 self.pending_calls.clear();
                 for call in object
                     .get("tool_calls")
@@ -481,8 +458,7 @@ impl<'a> AntigravityParser<'a> {
                     });
                 }
             }
-            // A compaction summary is a billed request, but no generation
-            // record names its model, so it goes to the model in use.
+            // Compaction summaries are billed requests without a generation record, so attribute them to the active model.
             "CHECKPOINT" => {
                 if let Some(tokens) = Tokens::from_record(object) {
                     self.diagnostics.record_relevant(true);
@@ -706,8 +682,7 @@ impl<'a> AntigravityParser<'a> {
             .map(|(model, usage)| (model.clone(), usage_value(usage)))
             .collect();
         let mut record = self.state.into_record(conversation_usage);
-        // Every model in `conversation_usage` is credited with the session's
-        // tool counts, and a compaction request runs no tools.
+        // Route compaction usage to `advisor_usage` because models in `conversation_usage` are credited with the session's tool counts.
         for (model, usage) in &self.compaction {
             record
                 .advisor_usage
@@ -754,8 +729,7 @@ fn usage_value(usage: &ModelUsage) -> Value {
     value
 }
 
-/// The file text inside a `read_file` result, whose lines are shown as
-/// `<line number>: <text>` beneath a header.
+/// Returns the file text from a `read_file` result by stripping the header and `<line>: ` prefixes.
 fn numbered_lines(content: &str) -> String {
     content
         .split('\n')
@@ -803,8 +777,7 @@ mod tests {
         row
     }
 
-    /// Lays out `<root>/brain/conv/.system_generated/logs/transcript_full.jsonl`
-    /// and, when `generations` is given, `<root>/conversations/conv.db`.
+    /// Creates a fake transcript under `<root>/brain/conv/` and an optional sibling `conv.db`.
     fn conversation(
         root: &Path,
         lines: &[Value],

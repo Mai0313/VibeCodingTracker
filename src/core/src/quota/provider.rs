@@ -1,18 +1,10 @@
-//! Generic background quota worker, shared by every quota provider.
+//! Generic background quota polling worker shared by all quota providers.
 //!
-//! Each provider gets its own thread (so one provider's slow HTTP never stalls
-//! the others), but they all run the same panic-isolated poll loop here (cadence
-//! from `config.usage.quota.refresh_interval`, which Antigravity raises to its
-//! own floor). A provider supplies a stateful
-//! `resolve` closure returning a [`QuotaOutcome`]; the worker applies it to the
-//! shared snapshot:
+//! Each provider runs its own panic-isolated thread executing a `resolve` closure on a fixed interval and applying each [`QuotaOutcome`] to the shared snapshot:
 //!
-//! - [`QuotaOutcome::Data`] — store the fresh snapshot + persist it.
-//! - [`QuotaOutcome::NeedsLogin`] — flip `needs_login` on the *current*
-//!   snapshot (keep its data), so a refresh failure never blanks out
-//!   still-valid last-known-good numbers.
-//! - [`QuotaOutcome::Transient`] — keep last-known-good indefinitely, so a rate
-//!   limit or network blip never blanks a panel; the next success overwrites it.
+//! - [`QuotaOutcome::Data`] — replaces the shared snapshot and persists it.
+//! - [`QuotaOutcome::NeedsLogin`] — sets `needs_login` on the current snapshot without discarding existing data, then persists it.
+//! - [`QuotaOutcome::Transient`] — leaves the current snapshot unchanged until a subsequent tick succeeds.
 
 use crate::models::{
     AntigravityQuotaSnapshot, ClaudeQuotaSnapshot, CodexQuotaSnapshot, CopilotQuotaSnapshot,
@@ -25,13 +17,13 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-/// A normalized quota snapshot the worker can store and flag.
+/// A normalized quota snapshot managed by [`spawn_quota_worker`].
 pub trait QuotaSnapshot: Clone + Default + Send + Serialize + 'static {
-    /// Unix seconds when this snapshot was produced.
+    /// Returns the Unix timestamp in seconds when this snapshot was produced.
     fn fetched_at(&self) -> i64;
-    /// Whether this snapshot carries anything to show (data or a login hint).
+    /// Returns whether this snapshot carries data or a login hint to display.
     fn is_present(&self) -> bool;
-    /// Sets the `needs_login` flag without touching the data.
+    /// Sets the `needs_login` flag without modifying other fields.
     fn set_needs_login(&mut self, value: bool);
 }
 
@@ -42,8 +34,7 @@ impl QuotaSnapshot for ClaudeQuotaSnapshot {
     fn is_present(&self) -> bool {
         self.five_hour.is_some()
             || self.seven_day.is_some()
-            // Mirror the render gate: a scoped row needs both the window and its
-            // model label, so a label-less scoped window is not "present" alone.
+            // Mirror the render gate: a scoped row requires both the window and its model label.
             || (self.scoped_weekly.is_some() && self.scoped_label.is_some())
             || self.needs_login
     }
@@ -69,8 +60,7 @@ impl QuotaSnapshot for CopilotQuotaSnapshot {
         self.fetched_at
     }
     fn is_present(&self) -> bool {
-        // Mirror the render gate: a premium gauge, an unlimited flag, the plan
-        // label, or a login hint all give the panel something to show.
+        // Must match the panel's render gate.
         self.premium.is_some()
             || self.premium_unlimited
             || self.plan_type.is_some()
@@ -102,9 +92,7 @@ impl QuotaSnapshot for GrokQuotaSnapshot {
         self.fetched_at
     }
     fn is_present(&self) -> bool {
-        // Mirror the render gate: the included gauge, the plan label, or a login
-        // hint each give the panel something to show. The money fields never
-        // stand alone — a billing body that maps at all yields `included`.
+        // Mirror the render gate; money fields are omitted because any mapped billing response sets `included`.
         self.included.is_some() || self.plan_type.is_some() || self.needs_login
     }
     fn set_needs_login(&mut self, value: bool) {
@@ -124,28 +112,19 @@ impl QuotaSnapshot for AntigravityQuotaSnapshot {
     }
 }
 
-/// The result of one provider `resolve` tick.
+/// Result of one provider poll tick.
 pub enum QuotaOutcome<T> {
-    /// A fresh snapshot to store (may itself carry `needs_login`, e.g. Codex
-    /// session-fallback data + login hint).
+    /// Fresh snapshot to store and persist (may itself carry `needs_login`, e.g. Codex session fallback).
     Data(T),
-    /// Auth failed and there is no fallback data: flag the current snapshot for
-    /// re-login but keep whatever it is already showing.
+    /// Authentication failed with no fallback snapshot; sets `needs_login` on the current snapshot without discarding its data.
     NeedsLogin,
-    /// Transient failure (network / rate limit): keep last-known-good.
+    /// Transient failure (such as network error or rate limit); keeps the current snapshot unchanged.
     Transient,
 }
 
-/// Spawns a detached background worker that refreshes `shared` (and the on-disk
-/// cache via `save`) every `refresh_secs` until `shutdown` is set.
+/// Spawns a background thread that polls `resolve`, updates `shared`, and invokes `save` every `refresh_secs` seconds until `shutdown` is set.
 ///
-/// `refresh_secs` is clamped to at least one second here rather than trusted:
-/// a `0` cadence leaves no sleep at all, so the worker would hammer `resolve`
-/// (and the provider's API) in a tight loop.
-///
-/// The worker is panic-isolated and holds the mutex only for the assignment, so
-/// it can never poison the lock. It is not joined on quit — `shutdown` is set as
-/// a courtesy and the OS reclaims the thread on process exit.
+/// `refresh_secs` is clamped to at least 1 second. Panics inside `resolve` are caught and logged under `label` while the lock is not held, preserving the last snapshot and avoiding mutex poisoning.
 pub fn spawn_quota_worker<T, R, S>(
     label: &'static str,
     shared: Arc<Mutex<T>>,
@@ -183,8 +162,7 @@ where
                         save(&snap);
                     }
                 }
-                // Deliberately empty: the last-known-good snapshot stays as it is
-                // until the next success overwrites it.
+                // Keep the last-known-good snapshot until a later tick succeeds.
                 Ok(QuotaOutcome::Transient) => {}
                 Err(_) => log::warn!("{label} quota worker panicked; keeping last snapshot"),
             }

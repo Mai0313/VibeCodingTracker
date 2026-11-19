@@ -19,9 +19,8 @@ use vct_core::utils::{HelperPaths, resolve_paths_from_home};
 use vct_tui::display::common::render_loading;
 use vct_tui::display::usage::UsageFrameBenchmark;
 
-/// Absolute path to a file under the repo's `tests/fixtures/` directory.
+/// Returns the absolute path to a file under `tests/fixtures/`.
 fn fixture(name: &str) -> PathBuf {
-    // From `src/tui` up to the repo root, then into `tests/fixtures`.
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
@@ -49,7 +48,7 @@ fn benchmark_normalize_model_name(c: &mut Criterion) {
 fn benchmark_pricing_lookup(c: &mut Criterion) {
     use std::collections::HashMap;
 
-    // Create a mock pricing map (ModelPricingMap requires std HashMap)
+    // `ModelPricingMap::new` requires `std::collections::HashMap`.
     let mut pricing_data = HashMap::new();
     pricing_data.insert(
         "claude-3-sonnet".to_string(),
@@ -344,7 +343,6 @@ fn benchmark_cache_operations(c: &mut Criterion) {
         return;
     }
 
-    // Warm up cache
     let _ = global_cache().get_or_parse(&test_path);
 
     c.bench_function("cache hit (warm)", |b| {
@@ -354,7 +352,6 @@ fn benchmark_cache_operations(c: &mut Criterion) {
     c.bench_function("cache miss (cold)", |b| {
         b.iter_batched(
             || {
-                // Clear cache before each iteration
                 global_cache().invalidate(&test_path);
                 test_path.clone()
             },
@@ -373,11 +370,9 @@ fn benchmark_hashmap_performance(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("hashmap");
 
-    // Prepare test data
     let keys: Vec<String> = (0..1000).map(|i| format!("key_{}", i)).collect();
     let values: Vec<i32> = (0..1000).collect();
 
-    // ahash::AHashMap (FastHashMap)
     group.bench_function("FastHashMap insert 1000", |b| {
         b.iter(|| {
             let mut map = FastHashMap::default();
@@ -388,7 +383,6 @@ fn benchmark_hashmap_performance(c: &mut Criterion) {
         })
     });
 
-    // std::collections::HashMap
     group.bench_function("std HashMap insert 1000", |b| {
         b.iter(|| {
             let mut map = HashMap::new();
@@ -399,7 +393,6 @@ fn benchmark_hashmap_performance(c: &mut Criterion) {
         })
     });
 
-    // Lookup benchmark
     let mut fast_map = FastHashMap::default();
     let mut std_map = HashMap::new();
     for (k, v) in keys.iter().zip(values.iter()) {
@@ -457,7 +450,6 @@ fn benchmark_usage_aggregation(c: &mut Criterion) {
 // ========== Batch Analysis Benchmarks ==========
 
 fn benchmark_batch_analysis(c: &mut Criterion) {
-    // Only run if fixture files exist
     let claude_path = fixture("sessions/claude_code.jsonl");
     let codex_path = fixture("sessions/codex.jsonl");
     let copilot_path = fixture("sessions/copilot.jsonl");
@@ -486,7 +478,6 @@ fn benchmark_batch_analysis(c: &mut Criterion) {
                 (dsh_path.clone(), "dsh"),
             ];
 
-            // Simulate batch processing
             for (path, _name) in paths {
                 let _ = vct_core::session::parse_session_file_to_value(black_box(&path));
             }
@@ -500,7 +491,6 @@ fn benchmark_json_serialization(c: &mut Criterion) {
     use serde_json::json;
     use vct_core::models::usage::UsageResult;
 
-    // Create sample data
     let mut result = UsageResult::default();
     for i in 0..50 {
         let model = format!("claude-sonnet-{}", i % 3);
@@ -550,8 +540,7 @@ fn benchmark_tui_frame_render(c: &mut Criterion) {
         })
     });
 
-    // Wide and tall enough that the frame benchmarked is the full one: the model
-    // table with its share column and the Provider Usage line under it.
+    // Wide and tall enough to render the full frame: model table with share column plus the Provider Usage band.
     let mut ready =
         UsageFrameBenchmark::new(190, 42).expect("create ready frame benchmark fixture");
     group.bench_function("ready", |b| {

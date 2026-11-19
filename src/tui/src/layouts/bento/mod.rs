@@ -1,7 +1,4 @@
-//! `bento` layout: top-left `Models` table, top-right clickable horizontal
-//! block bar chart (`Spend Distribution` on Usage, `Tool Mix` on Analysis), and
-//! a full-width 3-column zero-scroll `Selected` inspector strip along the
-//! bottom.
+//! `bento` layout: `Models` table alongside a clickable horizontal bar chart (`Spend Distribution` on Usage, `Tool Mix` on Analysis), over a 3-column `Selected` inspector strip.
 
 use crate::display::analysis::{
     AnalysisSort, build_analysis_detail_sections, build_analysis_table_row, layout_analysis_columns,
@@ -993,8 +990,7 @@ mod tests {
         }
         assert_eq!(usage.selected_row().unwrap().model, "gpt-5.5");
 
-        // Analysis tab renders Tool Mix, omits bottom Providers table, and
-        // clicking a Tool Mix row sorts Analysis by that tool.
+        // Analysis renders Tool Mix without a Providers band; clicking a bar sorts by that tool.
         let a_lines = render(
             &mut view,
             112,

@@ -1,36 +1,15 @@
-//! Library crate behind the `vibe_coding_tracker` / `vct` CLI.
+//! Core library for `vibe_coding_tracker` (`vct`).
 //!
-//! The crate scans on-disk session logs written by ten AI coding assistants:
-//! JSONL logs from Claude Code, OpenAI Codex, GitHub Copilot CLI, and Gemini
-//! CLI; `signals.json` plus sibling `updates.jsonl` from Grok CLI; a
-//! zstd-framed JSONL log from DeepSeek Harness; JSONL transcripts plus a
-//! per-conversation SQLite model map from Antigravity; SQLite data from
-//! OpenCode and Cursor; and usage-only SQLite data from Hermes. It exposes two views:
+//! Scans on-disk session logs from ten AI coding assistants — Claude Code, OpenAI Codex, GitHub Copilot CLI, Gemini CLI, Grok CLI, DeepSeek Harness, Antigravity, OpenCode, Cursor, and Hermes — and aggregates them into two views:
 //!
 //! - **usage** — per-model token counts and LiteLLM-priced cost
-//! - **analysis** — complete per-session data plus compact per-model
-//!   file-operation and tool-call metrics
+//! - **analysis** — complete per-session data plus per-model file-operation and tool-call metrics
 //!
 //! # Pipeline
 //!
-//! Raw bytes flow through a two-stage pipeline. [`session`] owns the
-//! "local session data → typed [`CodeAnalysis`]" boundary (provider detection
-//! plus a parser per provider) and is the only place file parsing lives;
-//! [`scan`] holds the provider-scan machinery both features share, and
-//! [`analysis`] and [`usage`] aggregate the typed records into their own
-//! roll-ups. The `vct-tui` crate renders the result as an interactive
-//! TUI, a static table, plain text, or JSON, and the `vct-cli` binary wires
-//! the clap surface to both. This crate holds no terminal dependency, so a
-//! future GUI backend can reuse it directly.
+//! [`session`] owns the boundary from raw provider logs to typed [`CodeAnalysis`] records. [`scan`] provides the shared ledger-backed scan machinery, and [`analysis`] and [`usage`] roll records up into their respective summaries. This crate has no terminal or CLI dependencies; rendering lives in `vct-tui` and command-line dispatch lives in `vct-cli`.
 //!
-//! The remaining modules support those two views: [`models`] (the shared serde
-//! shapes), [`ledger`] (the persistent per-session ledger every scan reads
-//! and writes), [`pricing`] (LiteLLM price lookup with a daily on-disk cache), [`quota`]
-//! (live provider quota fetchers), [`config`] (`~/.vct/config.toml`),
-//! [`logging`] (file-only diagnostics), [`cache`] (library-facing LRU cache of
-//! parsed sessions), [`update`] (self-replace from the matching GitHub release
-//! asset), [`utils`] (leaf helpers), and [`constants`] (capacity and buffer
-//! sizing).
+//! Supporting modules: [`models`], [`ledger`], [`remote`], [`pricing`], [`quota`], [`config`], [`logging`], [`cache`], [`update`], [`utils`], and [`constants`].
 
 pub mod analysis;
 pub mod cache;
@@ -48,14 +27,11 @@ pub mod update;
 pub mod usage;
 pub mod utils;
 
+pub use analysis::{AnalysisData, project_code_analysis};
 pub use models::*;
+pub use scan::{ScanDiagnostics, ScanFailure};
 pub use session::parser::{parse_session_file_to_value, parse_session_file_typed};
 pub use usage::aggregator::{UsageData, aggregate_usage_from_home, aggregate_usage_from_paths};
-// Curated surface for non-CLI consumers (e.g. a future GUI backend): the
-// serializable priced-usage payload, the compact analysis summary, and the
-// shared scan diagnostics.
-pub use analysis::{AnalysisData, project_code_analysis};
-pub use scan::{ScanDiagnostics, ScanFailure};
 pub use usage::{PricedUsageRow, price_usage_data};
 
 /// Full build version: latest git tag plus commits-since and short SHA
@@ -71,12 +47,7 @@ pub const RUST_VERSION: &str = env!("BUILD_RUST_VERSION");
 /// `cargo` version string captured at build time by `build.rs`.
 pub const CARGO_VERSION: &str = env!("BUILD_CARGO_VERSION");
 
-/// Snapshots the build version, Rust toolchain, and Cargo version into a
-/// [`VersionInfo`].
-///
-/// Reads the compile-time [`VERSION`], [`RUST_VERSION`], and
-/// [`CARGO_VERSION`] constants; this is what backs the `vct version`
-/// subcommand.
+/// Returns a [`VersionInfo`] populated from [`VERSION`], [`RUST_VERSION`], and [`CARGO_VERSION`].
 ///
 /// # Examples
 ///
@@ -92,11 +63,9 @@ pub fn get_version_info() -> VersionInfo {
     }
 }
 
-/// Build metadata reported by the `vct version` subcommand.
+/// Build and toolchain version metadata captured at compile time.
 ///
-/// Construct via [`get_version_info`]; the fields mirror the [`VERSION`],
-/// [`RUST_VERSION`], and [`CARGO_VERSION`] constants. Serializes to JSON
-/// for the `--json` output mode.
+/// Construct via [`get_version_info`].
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VersionInfo {
     /// Full build version (see [`VERSION`]).

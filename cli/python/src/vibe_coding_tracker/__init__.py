@@ -1,3 +1,5 @@
+"""Wrapper package that locates and runs the bundled `vibe_coding_tracker` binary."""
+
 import os
 import platform
 import subprocess
@@ -6,11 +8,14 @@ from pathlib import Path
 
 
 def get_platform_info():
-    """Determine platform-specific directory and binary name."""
+    """Returns a mapping with `dir` and `binary` keys for the current OS and architecture.
+
+    Raises:
+        SystemExit: The host architecture or platform is unsupported.
+    """
     system = platform.system().lower()
     machine = platform.machine().lower()
 
-    # Normalize architecture names
     if machine in ("x86_64", "amd64"):
         arch = "x64"
     elif machine in ("aarch64", "arm64"):
@@ -19,7 +24,6 @@ def get_platform_info():
         print(f"Unsupported architecture: {machine}", file=sys.stderr)
         sys.exit(1)
 
-    # Map to platform-specific directory and binary name
     platform_map = {
         "darwin": {
             "x64": {"dir": "macos-x64", "binary": "vibe_coding_tracker"},
@@ -43,10 +47,13 @@ def get_platform_info():
 
 
 def find_binary():
-    """Find the binary for current platform."""
+    """Returns the `Path` to the bundled platform binary, ensuring it is executable on non-Windows systems.
+
+    Raises:
+        SystemExit: The host platform is unsupported or the bundled binary is missing.
+    """
     platform_info = get_platform_info()
 
-    # Get package root directory
     package_root = Path(__file__).parent
     binaries_dir = package_root / "binaries"
 
@@ -55,7 +62,6 @@ def find_binary():
         print("Please reinstall the package.", file=sys.stderr)
         sys.exit(1)
 
-    # Look for the binary in platform-specific subdirectory
     platform_dir = binaries_dir / platform_info["dir"]
     binary_path = platform_dir / platform_info["binary"]
 
@@ -67,22 +73,24 @@ def find_binary():
         print("Please reinstall the package.", file=sys.stderr)
         sys.exit(1)
 
-    # Make binary executable on Unix-like systems
     if platform.system() != "Windows":
         try:
             os.chmod(binary_path, 0o755)
         except OSError:
-            # Ignore error if already executable
+            # Ignore chmod errors (e.g. read-only install where the binary is already executable).
             pass
 
     return binary_path
 
 
 def main():
-    """Main entry point that forwards all arguments to the binary."""
+    """Runs the bundled binary with `sys.argv[1:]` and exits with its return code.
+
+    Raises:
+        SystemExit: Always exits with the child return code, or 1 if the binary cannot be found or started.
+    """
     binary_path = find_binary()
 
-    # Forward all arguments to the binary
     args = sys.argv[1:]
 
     try:

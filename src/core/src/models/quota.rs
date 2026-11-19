@@ -1,13 +1,6 @@
-//! Quota / rate-limit data models for the `usage` quota panels.
+//! Quota and rate-limit wire models, credential structs, and normalized snapshots.
 //!
-//! Each provider has its own raw wire shape — and, where a token is involved,
-//! its own credential file — all normalizing into one shared output
-//! ([`QuotaWindow`] / per-provider `*QuotaSnapshot`) so the TUI gauges render
-//! every provider identically. The section banners below group each provider's
-//! types with the endpoint they come from.
-//!
-//! Structs holding bearer tokens use a hand-written [`fmt::Debug`] that redacts
-//! the secret so a token can never reach a log or assertion message.
+//! Provider-specific wire shapes normalize into [`QuotaWindow`] and per-provider `*QuotaSnapshot` types. Structs holding bearer tokens or account identifiers implement [`fmt::Debug`] manually to redact secrets.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -20,11 +13,9 @@ fn redact(v: &Option<String>) -> Option<&'static str> {
 
 // ---- Claude usage API (GET /api/oauth/usage) ----
 
-/// `https://api.anthropic.com/api/oauth/usage` response (subset we read).
+/// Response subset from `GET https://api.anthropic.com/api/oauth/usage`.
 ///
-/// The richer `limits` / `spend` fields only appear when the request carries the
-/// `anthropic-beta: oauth-2025-04-20` header; without it they stay empty and the
-/// panel falls back to just the two top-level windows.
+/// `limits` and `spend` are populated only when the request sends `anthropic-beta: oauth-2025-04-20`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClaudeUsageResponse {
     /// 5-hour window.
@@ -33,8 +24,7 @@ pub struct ClaudeUsageResponse {
     /// Weekly window.
     #[serde(default)]
     pub seven_day: Option<ClaudeUsageWindow>,
-    /// Per-scope limit entries (session / weekly_all / weekly_scoped, ...).
-    /// Parsed leniently so one malformed / volatile entry never fails the body.
+    /// Per-scope limit entries (`session`, `weekly_all`, `weekly_scoped`, ...); malformed entries are skipped.
     #[serde(default, deserialize_with = "de_lenient_limits")]
     pub limits: Vec<ClaudeLimit>,
     /// Pay-as-you-go spend / credit balance.
@@ -133,8 +123,7 @@ impl ClaudeMoney {
 
 // ---- ~/.claude/.credentials.json ----
 
-/// `~/.claude/.credentials.json` (only the `claudeAiOauth` block; the sibling
-/// `designOauth` and any unknown keys are preserved on write-back).
+/// Subset of `~/.claude/.credentials.json` (`claudeAiOauth` only; sibling keys are preserved on write-back).
 #[derive(Clone, Deserialize)]
 pub struct ClaudeCredentials {
     /// The Claude subscription OAuth token bundle.
@@ -165,8 +154,7 @@ pub struct ClaudeOauth {
     /// OAuth scopes, carried back into the refresh request.
     #[serde(default)]
     pub scopes: Vec<String>,
-    /// Rate-limit tier (e.g. "default_claude_max_20x"), preferred for the Plan
-    /// line because it distinguishes 5x / 20x where `subscription_type` does not.
+    /// Rate-limit tier (for example `"default_claude_max_20x"`), preferred over `subscription_type` to distinguish 5x and 20x plans.
     #[serde(rename = "rateLimitTier", default)]
     pub rate_limit_tier: Option<String>,
     /// Subscription tier (e.g. "max" / "pro"); Plan-line fallback.
@@ -245,8 +233,7 @@ pub struct ClaudeQuotaSnapshot {
     /// Whether any window has hit its cap (drives the `LIMIT` flag).
     #[serde(default)]
     pub limit_reached: bool,
-    /// Credentials present but the token is unusable (expired / refresh
-    /// failed / 401); the panel shows a `claude auth login` hint.
+    /// Whether credentials are present but unusable (expired, refresh failed, or HTTP 401).
     #[serde(default)]
     pub needs_login: bool,
 }
@@ -335,11 +322,7 @@ pub struct WhamCredits {
     pub approx_local_messages: Option<Vec<i64>>,
 }
 
-/// Deserializes a JSON string or number into `Option<String>`.
-///
-/// The wham/usage `balance` is usually the string `"0"`, but some accounts
-/// return it as a number; accepting both keeps a numeric balance from failing
-/// the entire response. Any other type (or null) becomes `None`.
+/// Deserializes a JSON string or number into `Option<String>`, mapping other types and `null` to `None`.
 fn de_string_or_number<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -351,10 +334,7 @@ where
     })
 }
 
-/// Deserializes a JSON number into `f64`, mapping null / wrong-type to 0.0.
-///
-/// The usage windows are volatile (a scoped tier can appear or vanish); a stray
-/// `null` percent must not fail the whole response, only read as 0.
+/// Deserializes a JSON number into `f64`, mapping `null` and non-numeric values to `0.0`.
 fn de_f64_or_zero<'de, D>(deserializer: D) -> Result<f64, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -376,10 +356,7 @@ where
     ))
 }
 
-/// Deserializes the `limits` array leniently: an element that fails to parse (a
-/// volatile / malformed limit entry) is skipped rather than failing the whole
-/// response, and a non-array value yields an empty list. This keeps a broken
-/// per-model scoped entry from taking down the 5h / 7d / balance rows.
+/// Deserializes a `limits` array leniently, skipping malformed elements and mapping non-arrays to an empty `Vec`.
 fn de_lenient_limits<'de, D>(deserializer: D) -> Result<Vec<ClaudeLimit>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -407,8 +384,7 @@ pub struct WhamResetCreditsDetails {
     /// Per-credit details. The backend may cap this list.
     #[serde(default)]
     pub credits: Vec<WhamResetCreditDetails>,
-    /// Authoritative number of available reset credits, when reported. Absent
-    /// means "unknown", not zero: the caller keeps the count wham/usage gave it.
+    /// Authoritative available reset-credit count when reported; `None` means unknown rather than zero.
     #[serde(default)]
     pub available_count: Option<i64>,
 }
@@ -419,8 +395,7 @@ pub struct WhamResetCreditDetails {
     /// Stable backend identifier, only ever quoted back in an error message.
     #[serde(default)]
     pub id: String,
-    /// Lifecycle state, e.g. `available` / `redeeming` / `redeemed`. An entry
-    /// that omits it is not readable as available, so it is skipped.
+    /// Lifecycle state (`available`, `redeeming`, `redeemed`); entries without it are not treated as available.
     #[serde(default)]
     pub status: String,
     /// RFC3339 expiry time, or `None` when the credit does not expire.
@@ -438,11 +413,9 @@ pub struct CodexAuthJson {
     pub tokens: Option<CodexAuthTokens>,
 }
 
-/// The `tokens` object of `~/.codex/auth.json`.
+/// `tokens` object of `~/.codex/auth.json`.
 ///
-/// `Debug` is implemented by hand to redact the secrets: the tokens are bearer
-/// credentials and the account id is an identifier, so none should reach a log
-/// or assertion message. The wham client relies on this guarantee.
+/// [`fmt::Debug`] is implemented manually to redact all token fields and `account_id`.
 #[derive(Clone, Deserialize)]
 pub struct CodexAuthTokens {
     /// OIDC id token (JWT); refreshed alongside the access token.
@@ -499,8 +472,7 @@ impl fmt::Debug for CodexRefreshResponse {
 /// The `rate_limits` object embedded in Codex `token_count` events.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CodexSessionRateLimits {
-    /// Limit family this snapshot describes; only the main `codex` account
-    /// quota maps to the 5h/7d panel, so other families are skipped.
+    /// Limit family identifier; only the main `codex` family maps to the 5h/7d panel.
     #[serde(default)]
     pub limit_id: Option<String>,
     /// Plan tier (e.g. "plus"), alongside the windows.
@@ -552,8 +524,7 @@ pub struct QuotaWindow {
     pub resets_at_unix: Option<i64>,
 }
 
-/// Normalized Codex quota snapshot, shared via `Arc<Mutex>` and persisted to
-/// `~/.vct/quota/codex.json`.
+/// Normalized Codex quota snapshot persisted to `~/.vct/quota/codex.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CodexQuotaSnapshot {
     /// Which source produced this snapshot.
@@ -574,13 +545,10 @@ pub struct CodexQuotaSnapshot {
     pub unlimited: Option<bool>,
     /// Number of rate-limit reset credits available.
     pub reset_credits_available: Option<i64>,
-    /// Expiry times for fetched `available` reset-credit details. The outer
-    /// `None` means details were unavailable; an inner `None` never expires.
-    /// The backend may cap this list, so its length is not the total count.
+    /// Expiry timestamps (Unix seconds) for fetched `available` reset credits; outer `None` means details were unavailable, inner `None` means non-expiring, and the list may be capped below [`Self::reset_credits_available`].
     #[serde(default)]
     pub reset_credit_expirations: Option<Vec<Option<i64>>>,
-    /// Approximate `[low, high]` local (CLI) messages the remaining credits
-    /// still buy; the cloud-task pair is not carried.
+    /// Approximate `(low, high)` local CLI messages remaining credits cover.
     #[serde(default)]
     pub approx_messages: Option<(i64, i64)>,
     /// Configured spend cap, when set.
@@ -588,17 +556,14 @@ pub struct CodexQuotaSnapshot {
     pub spend_limit: Option<f64>,
     /// Whether a rate limit (or credit / spend cap) has been reached.
     pub limit_reached: Option<bool>,
-    /// Token present but unusable (refresh failed / 401); the panel shows a
-    /// `codex auth login` hint alongside any session-fallback data.
+    /// Whether credentials are present but unusable (refresh failed or HTTP 401).
     #[serde(default)]
     pub needs_login: bool,
 }
 
 // ---- GitHub Copilot usage API (GET /copilot_internal/user) ----
 
-/// `https://api.github.com/copilot_internal/user` response (subset we read).
-///
-/// Field names match the API's snake_case shape directly.
+/// Response subset from `GET https://api.github.com/copilot_internal/user`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CopilotUserResponse {
     /// Plan tier, e.g. "individual" / "business".
@@ -713,11 +678,7 @@ pub struct CursorOnDemand {
 
 // ---- Grok billing API (GET /v1/billing?format=credits) ----
 
-/// `https://cli-chat-proxy.grok.com/v1/billing?format=credits` response.
-///
-/// The credits config arrives wrapped in a `config` object. The CLI fills
-/// `subscription_tier` / `on_demand_enabled` into the same object from
-/// `/v1/settings`, so a bare fetch returns only `config`.
+/// Response from `GET https://cli-chat-proxy.grok.com/v1/billing?format=credits`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GrokBillingResponse {
     /// The credit configuration, absent on an error body.
@@ -725,14 +686,9 @@ pub struct GrokBillingResponse {
     pub config: Option<GrokCreditsConfig>,
 }
 
-/// The `config` object of a Grok credits response (subset we read).
+/// `config` object of a Grok credits response (proto3 JSON).
 ///
-/// This is a proto3 `GetGrokCreditsConfig` rendered as JSON, so every
-/// zero-valued scalar may be omitted — including the headline
-/// `creditUsagePercent`. Every field is therefore optional and an absent one
-/// reads as zero, never as an error. The wire response is a superset of the
-/// fields below (a live account also returns `topUpMethod`), so unknown keys are
-/// ignored rather than rejected.
+/// Proto3 omits zero-valued scalars, so missing numeric fields default to zero and unknown keys are ignored.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GrokCreditsConfig {
@@ -751,8 +707,7 @@ pub struct GrokCreditsConfig {
     /// Remaining purchased ("bought") credit balance.
     #[serde(default)]
     pub prepaid_balance: Option<GrokMoney>,
-    /// Deprecated legacy period end, still emitted by older servers; the
-    /// fallback reset time when `current_period` is absent.
+    /// Legacy period end fallback when `current_period` is absent.
     #[serde(default)]
     pub billing_period_end: Option<String>,
 }
@@ -768,10 +723,7 @@ pub struct GrokUsagePeriod {
     pub end: Option<String>,
 }
 
-/// A Grok money amount in **cents**, e.g. `{"val": 1840}` for $18.40.
-///
-/// A zero amount can arrive as `{}` (proto3 omits zero scalars) or as an
-/// explicit `{"val": 0}`; both read as zero.
+/// Grok money amount in cents (for example `{"val": 1840}` for `$18.40`); `{}` and `{"val": 0}` both read as zero.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GrokMoney {
     /// Amount in cents.
@@ -780,16 +732,13 @@ pub struct GrokMoney {
 }
 
 impl GrokMoney {
-    /// The amount in whole currency units (dollars).
+    /// Returns the amount in dollars.
     pub fn as_dollars(&self) -> f64 {
         self.val / 100.0
     }
 }
 
-/// `https://cli-chat-proxy.grok.com/v1/settings` response (the plan label only).
-///
-/// The real body carries well over a hundred feature flags; only the display
-/// tier is read, so every other key is ignored.
+/// Subset of `GET https://cli-chat-proxy.grok.com/v1/settings` reading only the display tier.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GrokSettingsResponse {
     /// Human-readable plan tier, e.g. "Free" / "SuperGrok".
@@ -799,12 +748,9 @@ pub struct GrokSettingsResponse {
 
 // ---- ~/.grok/auth.json ----
 
-/// One entry of `~/.grok/auth.json`, keyed in the file by login scope
-/// (`"<issuer>::<client_id>"`, `"xai::api_key"`, or the legacy sign-in URL).
+/// Single entry of `~/.grok/auth.json`, keyed by login scope (`"<issuer>::<client_id>"`, `"xai::api_key"`, or a sign-in URL).
 ///
-/// The access token is the **`key`** field, not a field named `access_token`.
-/// `Debug` is written by hand so no bearer, refresh token, or account
-/// identifier can reach a log or assertion message.
+/// The bearer access token is stored in [`Self::key`]. [`fmt::Debug`] is implemented manually to redact secrets and identifiers.
 #[derive(Clone, Default, Deserialize)]
 pub struct GrokAuthEntry {
     /// Bearer access token (a JWT).
@@ -934,8 +880,7 @@ pub struct AgyUsageBucket {
 
 // ---- Normalized Copilot / Cursor / Grok / Antigravity snapshots (worker output + cache) ----
 
-/// Normalized Copilot quota snapshot, shared via `Arc<Mutex>` and persisted to
-/// `~/.vct/quota/copilot.json`.
+/// Normalized Copilot quota snapshot persisted to `~/.vct/quota/copilot.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CopilotQuotaSnapshot {
     /// Which source produced this snapshot.
@@ -961,14 +906,12 @@ pub struct CopilotQuotaSnapshot {
     /// Whether the premium quota has been exhausted (drives the `LIMIT` flag).
     #[serde(default)]
     pub limit_reached: bool,
-    /// Credentials present but the token is unusable (401/403); the panel shows
-    /// a `copilot login` hint.
+    /// Whether credentials are present but unusable (HTTP 401/403).
     #[serde(default)]
     pub needs_login: bool,
 }
 
-/// Normalized Cursor quota snapshot, shared via `Arc<Mutex>` and persisted to
-/// `~/.vct/quota/cursor.json`.
+/// Normalized Cursor quota snapshot persisted to `~/.vct/quota/cursor.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CursorQuotaSnapshot {
     /// Which source produced this snapshot.
@@ -994,14 +937,12 @@ pub struct CursorQuotaSnapshot {
     /// Whether the plan usage has hit 100% (drives the `LIMIT` flag).
     #[serde(default)]
     pub limit_reached: bool,
-    /// Credentials present but the token is unusable (expired / 401); the panel
-    /// shows a `cursor-agent login` hint.
+    /// Whether credentials are present but unusable (expired or HTTP 401).
     #[serde(default)]
     pub needs_login: bool,
 }
 
-/// Normalized Grok quota snapshot, shared via `Arc<Mutex>` and persisted to
-/// `~/.vct/quota/grok.json`.
+/// Normalized Grok quota snapshot persisted to `~/.vct/quota/grok.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GrokQuotaSnapshot {
     /// Which source produced this snapshot.
@@ -1030,14 +971,12 @@ pub struct GrokQuotaSnapshot {
     /// Whether the included allowance is exhausted (drives the `LIMIT` flag).
     #[serde(default)]
     pub limit_reached: bool,
-    /// Credentials present but the token is unusable (expired / refresh failed /
-    /// 401); the panel shows a `grok login` hint.
+    /// Whether credentials are present but unusable (expired, refresh failed, or HTTP 401).
     #[serde(default)]
     pub needs_login: bool,
 }
 
-/// Normalized Antigravity quota snapshot, shared via `Arc<Mutex>` and persisted
-/// to `~/.vct/quota/antigravity.json`.
+/// Normalized Antigravity quota snapshot persisted to `~/.vct/quota/antigravity.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AntigravityQuotaSnapshot {
     /// Which source produced this snapshot.
@@ -1051,14 +990,10 @@ pub struct AntigravityQuotaSnapshot {
     /// Whether any limit is spent (drives the `LIMIT` flag).
     #[serde(default)]
     pub limit_reached: bool,
-    /// agy has no stored sign-in or could not sign in; the panel shows an
-    /// `agy acp --login` hint.
+    /// Whether `agy` has no stored sign-in or failed to sign in.
     #[serde(default)]
     pub needs_login: bool,
-    /// Modification time of agy's sign-in entry (OS credential store or
-    /// fallback file) when agy last failed to sign in. agy is not run again
-    /// until that timestamp changes, which a re-login does; kept here so the
-    /// hold outlives the process.
+    /// Modification time of `agy`'s sign-in store when sign-in last failed; persisted so retries pause until a re-login updates the timestamp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed_out_mtime: Option<std::time::SystemTime>,
 }

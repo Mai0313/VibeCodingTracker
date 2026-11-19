@@ -1,9 +1,6 @@
 // Integration tests for analysis functionality.
 //
-// Single-file parsing reads the in-repo fixtures via `vct_test_support::fixture` (an
-// absolute, machine-stable path). Batch aggregation drives
-// `aggregate_sessions_by_model_from_paths` against a `TempHome`, so it reads no
-// real machine session directories and mutates no environment.
+// Single-file parsing reads the in-repo fixtures via `vct_test_support::fixture` (an absolute, machine-stable path). Batch aggregation drives `aggregate_sessions_by_model_from_paths` against a `TempHome`, so it reads no real machine session directories and mutates no environment.
 
 use rusqlite::{Connection, params};
 use serde_json::json;
@@ -29,8 +26,7 @@ use vct_core::session::parser::{
 use vct_core::session::state::ParseMode;
 use vct_test_support::{TempHome, append_cursor_json_blob, fixture, fixture_str};
 
-/// A real Codex rollout file name: the archive move preserves it, and it is
-/// what cross-root deduplication keys on.
+/// Real Codex rollout file name preserved across archiving and used as the cross-root deduplication key.
 const CODEX_ROLLOUT: &str =
     "rollout-2026-06-06T10-00-00-019e4b75-8a4e-7801-a9ed-9723e77e0497.jsonl";
 
@@ -104,9 +100,7 @@ fn seed_opencode_tie_breaker_db(path: &Path) {
 
 /// Compares every bucket of two analysis results.
 ///
-/// Every struct here is destructured rather than having its fields named one at
-/// a time: a bucket added to any of them then fails to compile, instead of
-/// silently going uncompared.
+/// Every struct is destructured so adding a bucket fails to compile instead of silently going uncompared.
 fn assert_analysis_data_eq(actual: &AnalysisData, expected: &AnalysisData) {
     let AnalysisData {
         rows,
@@ -221,8 +215,7 @@ fn test_single_file_analysis_grok() {
         record["conversationUsage"]["grok-test"]["cache_read_input_tokens"],
         12_345
     );
-    // One read_file plus one successful grep. The completed grep with exit 2
-    // is a semantic failure and must not inflate Read.
+    // One `read_file` plus one successful `grep`; the completed `grep` with exit 2 is a semantic failure and must not inflate `Read`.
     assert_eq!(record["toolCallCounts"]["Read"], 2);
     assert_eq!(record["toolCallCounts"]["Write"], 1);
     assert_eq!(record["toolCallCounts"]["Edit"], 1);
@@ -434,7 +427,6 @@ fn disabled_provider_is_dropped_from_analysis_rollup() {
         "chat.jsonl",
         &fixture_str("sessions/gemini.jsonl"),
     );
-    // Turn Gemini off in `[providers]`: it must be skipped entirely.
     let providers = ProvidersConfig {
         gemini: false,
         ..ProvidersConfig::default()
@@ -476,7 +468,6 @@ fn batch_analysis_from_paths_groups_by_model() {
     let data = aggregate_sessions_by_model_from_paths(&home.paths, TimeRange::All)
         .expect("batch aggregation should succeed");
 
-    // Every row has a non-empty model name and rows are sorted.
     for row in &data.rows {
         assert!(!row.model.is_empty(), "Model should not be empty");
     }
@@ -487,7 +478,6 @@ fn batch_analysis_from_paths_groups_by_model() {
         );
     }
 
-    // The Claude fixture's model is grouped and attributed to the Claude bucket.
     assert!(
         data.rows
             .iter()
@@ -574,9 +564,7 @@ fn cached_analysis_matches_uncached_and_reuses_unchanged_sources() {
     assert!(cold.diagnostics.failures.is_empty());
     assert_eq!(cold.diagnostics, uncached.diagnostics);
     assert_analysis_data_eq(&cold.data, &uncached.data);
-    // Destructured so that a provider added later cannot be left unseeded: the
-    // new field has to be named here, and naming it without using it below is
-    // an unused-variable warning, which CI denies.
+    // Destructured so adding a provider forces seeding and asserting it here.
     let PerProviderAnalysisRows {
         claude,
         codex,
@@ -1583,9 +1571,7 @@ fn test_analysis_with_invalid_json() {
 fn analysis_rows_sum_repeated_sessions_for_one_model() {
     use vct_core::analysis::aggregator::AggregatedAnalysisRow;
 
-    /// Every counter of a row. Destructured rather than read field by field, so
-    /// a counter added later is a compile error here instead of a field the
-    /// doubling assertion silently skips.
+    /// Returns every counter of `row`, destructured so adding a field fails to compile instead of silently bypassing the doubling check.
     fn counters(row: &AggregatedAnalysisRow) -> [usize; 8] {
         let AggregatedAnalysisRow {
             model: _,
@@ -1628,8 +1614,6 @@ fn analysis_rows_sum_repeated_sessions_for_one_model() {
         counters(single_row)
     );
 
-    // The same session recorded twice: the aggregator folds both into one row
-    // per model, so every counter doubles.
     let two = TempHome::new();
     two.put_claude_session("proj", "session.jsonl", &session);
     two.put_claude_session("proj", "second.jsonl", &session);
@@ -1649,11 +1633,11 @@ fn analysis_rows_sum_repeated_sessions_for_one_model() {
     assert_eq!(counters(doubled_row), counters(single_row).map(|c| c * 2));
 }
 
-/// Writes a Claude session whose first line is a metadata sentinel carrying no
-/// `parentUuid`, followed by one assistant record with model and usage.
+/// Writes a Claude session whose first line is a metadata sentinel carrying no `parentUuid`, followed by one assistant record with model and usage.
 ///
-/// Panics unless `sentinel_type` is `permission-mode`, `file-history-snapshot`
-/// or `queue-operation`.
+/// # Panics
+///
+/// Panics unless `sentinel_type` is `permission-mode`, `file-history-snapshot`, or `queue-operation`.
 fn write_claude_fixture_with_sentinel_prelude(path: &std::path::Path, sentinel_type: &str) {
     let sentinel = match sentinel_type {
         "permission-mode" => {
@@ -1668,8 +1652,7 @@ fn write_claude_fixture_with_sentinel_prelude(path: &std::path::Path, sentinel_t
         _ => unreachable!(),
     };
 
-    // Minimal assistant message with the fields the analyzer reads:
-    // model + usage. No <synthetic> — those are intentionally skipped.
+    // Real model name required: `<synthetic>` entries are skipped by the analyzer.
     let assistant = r#"{"type":"assistant","sessionId":"sess-1","parentUuid":"pu","timestamp":"2026-04-23T00:00:00.000Z","message":{"model":"claude-opus-4-7","usage":{"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":10,"cache_read_input_tokens":20,"service_tier":"standard","cache_creation":{"ephemeral_5m_input_tokens":10}},"content":[]}}"#;
 
     let body = format!("{sentinel}\n{assistant}\n");
@@ -1762,9 +1745,6 @@ fn test_autodetect_sees_past_queue_operation_prelude() {
 
 #[test]
 fn test_autodetect_sees_past_sentinel_prelude() {
-    // The auto-detect path (used by the CLI `vct analysis <file>` form) should
-    // peek enough records to spot the Claude-shaped assistant row sitting
-    // behind the metadata preamble.
     let tmp = TempDir::new().unwrap();
     let file = tmp.path().join("session.jsonl");
     write_claude_fixture_with_sentinel_prelude(&file, "permission-mode");
@@ -1822,8 +1802,6 @@ fn codex_archived_sessions_contribute_analysis_exactly_once() {
         "the Codex fixture must contribute a row from the active root"
     );
 
-    // Archiving moves the rollout log into the flat archived root; its file
-    // operations must keep counting from there.
     let archived = TempHome::new();
     archived.put_codex_archived_session(CODEX_ROLLOUT, &rollout);
     let archived_only = aggregate_sessions_by_model_from_paths_with_providers(

@@ -1,11 +1,6 @@
-//! Ledger snapshots of other machines, and the export they are made from.
+//! Remote machine ledger snapshots and the single-line JSON export format.
 //!
-//! `vct ledger export` prints one machine's sessions as a single JSON line.
-//! The machine that fetched it stores each provider's part under
-//! `<cache>/remotes/<name>/sessions/<provider>.json`, in the layout of a local
-//! ledger file, and a scan folds those sessions after its own. A snapshot is
-//! only ever read here: it is never merged into the local ledger files, never
-//! marked missing, and replaced whole by the next fetch.
+//! `vct ledger export` writes a machine's own sessions as one JSON line. The receiving machine stores each provider under `<cache>/remotes/<name>/sessions/<provider>.json` in the local ledger layout and folds those sessions after its own. Snapshots are read-only here: they are never merged into local ledger files, never marked missing, and replaced whole on the next fetch.
 
 use super::format::{DayEntry, LedgerFile, LedgerHeader, SCHEMA_VERSION, SessionEntry};
 use super::tiny_map::TinyMap;
@@ -24,11 +19,10 @@ use std::time::SystemTime;
 /// The directory under `~/.vct` that holds one subdirectory per remote.
 pub const REMOTES_DIR_NAME: &str = "remotes";
 
-/// Version of the export line, and the key it starts with.
+/// Schema version of the single-line ledger export payload.
 const EXPORT_VERSION: u32 = 1;
 
-/// What every export line starts with, so it can be told from whatever a
-/// remote shell printed before it.
+/// Prefix identifying a ledger export line, separating it from any preceding remote shell output.
 pub const EXPORT_LINE_PREFIX: &str = "{\"vct_ledger_export\":";
 
 /// One machine's sessions as `vct ledger export` prints them.
@@ -38,10 +32,7 @@ struct Export<'a> {
     providers: BTreeMap<&'static str, ExportFile<'a>>,
 }
 
-/// A provider's ledger file reduced to what another machine folds: the days.
-/// Read stamps and working directories stay behind, and so do the session
-/// keys, which spell out a project path for some providers; each is replaced
-/// by its [`export_key`].
+/// Per-provider export payload containing only per-day data, with session keys hashed via [`export_key`].
 #[derive(Serialize)]
 struct ExportFile<'a> {
     schema_version: u32,
@@ -69,21 +60,19 @@ pub(crate) struct RemoteSnapshot {
 
 #[derive(Default)]
 struct RemoteBook {
-    /// Modification time and length of the file `sessions` was read from;
-    /// `None` when there was no file.
+    /// Modification time and length of the snapshot file last read, or `None` if absent.
     stamp: Option<(SystemTime, u64)>,
     sessions: BTreeMap<String, SessionEntry>,
 }
 
 impl SessionLedger {
-    /// Writes this machine's own sessions as one export line.
+    /// Writes this machine's local sessions as a single JSON export line to `writer`.
     ///
-    /// Snapshots fetched from this machine's own remotes are left out, so a
-    /// chain of machines never counts a session twice.
+    /// Remote snapshots held in this ledger are excluded to prevent double-counting across chained machines.
     ///
     /// # Errors
     ///
-    /// Returns an error if writing to `writer` fails.
+    /// Returns an error if serialization or writing to `writer` fails.
     pub fn write_export(&self, mut writer: impl Write) -> Result<()> {
         let mut providers = BTreeMap::new();
         for provider in ALL_PROVIDERS {
@@ -112,10 +101,7 @@ impl SessionLedger {
         writeln!(writer).context("Failed to write the ledger export")
     }
 
-    /// Brings the loaded remote snapshots in line with what is on disk.
-    ///
-    /// A provider file is re-read only when its modification time or length
-    /// changed, so a refresh that finds nothing new costs a few `stat` calls.
+    /// Refreshes loaded remote snapshots from disk, re-reading only provider files whose modification time or length changed.
     pub(crate) fn reload_remotes(&mut self) {
         let Some(root) = self
             .dir
@@ -148,12 +134,9 @@ impl SessionLedger {
         }
     }
 
-    /// Every remote session of `provider` that this machine does not hold
-    /// itself, each one once.
+    /// Yields remote sessions for `provider` not already held locally, deduplicated across remotes.
     ///
-    /// Two machines sharing a home directory hold the same sessions under the
-    /// same keys, and so can two remotes; the local copy wins, then the first
-    /// remote in directory order.
+    /// Precedence is local copy first, then the earliest remote in sorted directory order.
     pub(crate) fn remote_sessions(
         &self,
         provider: ExtensionType,
@@ -163,8 +146,7 @@ impl SessionLedger {
                 .iter()
                 .filter_map(move |remote| remote.books.get(&provider))
         };
-        // A snapshot names its sessions by export key, so the local ones are
-        // compared under theirs, and only when there is something to compare.
+        // Remote snapshots key sessions by export key, so hash local keys only when non-empty remote books exist.
         let local: FastHashSet<String> = if books().any(|book| !book.sessions.is_empty()) {
             self.providers
                 .get(&provider)
@@ -200,13 +182,9 @@ impl RemoteSnapshot {
     }
 }
 
-/// The name a session travels under: the 128-bit FNV-1a hash of its ledger
-/// key, in hex.
+/// Returns the 128-bit FNV-1a hex hash of `key` used in exports.
 ///
-/// Two machines holding the same session derive the same name, which is all
-/// deduplication needs, and the key itself never leaves the machine. The
-/// function is fixed for good: changing it would stop every snapshot already
-/// stored from matching its local twin.
+/// Must remain stable: changing the hash breaks deduplication against existing stored snapshots.
 fn export_key(key: &str) -> String {
     const OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
     const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
@@ -237,23 +215,18 @@ fn read_snapshot(path: &Path) -> BTreeMap<String, SessionEntry> {
     }
 }
 
-/// `<cache_dir>/remotes/<name>`.
+/// Returns the snapshot directory for remote `name` under `cache_dir` (`<cache_dir>/remotes/<name>`).
 pub fn remote_dir(cache_dir: &Path, name: &str) -> PathBuf {
     cache_dir.join(REMOTES_DIR_NAME).join(name)
 }
 
-/// Stores `output`, what a remote's `vct ledger export` printed, as the
-/// snapshot of the remote called `name`.
+/// Parses `output` from a remote `vct ledger export` and stores it as the snapshot for `name` under `cache_dir`.
 ///
-/// The export is the last line starting with [`EXPORT_LINE_PREFIX`], so a
-/// banner a remote shell prints first does no harm. A provider written in
-/// another ledger layout keeps its previous snapshot.
+/// Uses the last line starting with [`EXPORT_LINE_PREFIX`], ignoring any earlier shell banners. Providers with an unsupported ledger schema version keep their previous snapshot.
 ///
 /// # Errors
 ///
-/// Returns an error, leaving the previous snapshot as it was, if `output`
-/// holds no export line, the line is not a version-1 export, or a file cannot
-/// be written.
+/// Returns an error if `output` contains no export line, the export JSON is invalid, the export version is unsupported, a provider header is malformed, or writing a provider file fails.
 pub fn store_export(cache_dir: &Path, name: &str, output: &str) -> Result<()> {
     let line = output
         .lines()
@@ -288,11 +261,9 @@ pub fn store_export(cache_dir: &Path, name: &str, output: &str) -> Result<()> {
     Ok(())
 }
 
-/// Removes the snapshot of every remote whose directory name is not in `keep`.
+/// Removes every remote snapshot directory under `cache_dir` whose name is not in `keep`.
 ///
-/// A snapshot is a cache of what its remote holds, so one whose host left the
-/// config is deleted rather than folded forever. The caller has to know the
-/// host really left: a config that failed to parse also reads as no hosts.
+/// Callers must pass the authoritative configured remote list; passing an empty list after a config parse failure deletes all cached snapshots.
 pub fn prune_remotes(cache_dir: &Path, keep: &[String]) {
     let Ok(entries) = std::fs::read_dir(cache_dir.join(REMOTES_DIR_NAME)) else {
         return;

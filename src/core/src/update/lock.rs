@@ -12,7 +12,7 @@ pub(super) struct UpdateLock {
 }
 
 impl UpdateLock {
-    /// Tries to acquire the update lock without waiting.
+    /// Attempts to acquire the update lock in `lock_dir` without blocking, returning `Ok(None)` if already held.
     pub(super) fn try_acquire(lock_dir: &Path) -> Result<Option<Self>> {
         let path = update_lock_path(lock_dir);
         let file = OpenOptions::new()
@@ -34,9 +34,7 @@ pub(super) fn update_lock_path(lock_dir: &Path) -> PathBuf {
     lock_dir.join(LOCK_FILE)
 }
 
-// Both tests drop a lock and claim it again, so they join the update module's
-// `update_spawn` serial group; the note above its own tests says why a
-// concurrently forked child would otherwise keep the released `flock`.
+// Joins the `update_spawn` serial group because concurrently spawned child processes inherit the open lock descriptor until `exec`, keeping a released `flock` held.
 #[cfg(test)]
 mod tests {
     use super::*;

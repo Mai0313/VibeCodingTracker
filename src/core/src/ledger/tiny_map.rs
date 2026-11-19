@@ -1,10 +1,6 @@
-//! Compact sorted key-value map for the small per-session maps in a ledger.
+//! Compact sorted key-value map backed by a `Vec<(K, V)>` for small per-session maps.
 //!
-//! Almost every file session holds one file stamp, one active day, and one or
-//! two models, yet `std::collections::BTreeMap` allocates a full 11-slot leaf
-//! node per non-empty map. Keeping those maps in a sorted `Vec<(K, V)>`
-//! preserves the exact JSON object wire format and deterministic key order at
-//! a fraction of the heap footprint.
+//! Preserves the JSON object wire format and deterministic key order of `BTreeMap` while avoiding its per-map leaf allocation for maps that typically hold one or two entries.
 
 use serde::de::{Deserialize, Deserializer, MapAccess, Visitor};
 use serde::ser::{Serialize, Serializer};

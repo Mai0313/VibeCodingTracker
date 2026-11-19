@@ -1,6 +1,4 @@
-// Integration tests for cache system functionality
-//
-// These tests verify the LRU file parsing cache and pricing cache
+// Integration tests for the file parse cache and pricing cache.
 
 use serial_test::serial;
 use std::io::Write;
@@ -15,11 +13,9 @@ use vct_test_support::fixture;
 fn test_file_cache_basic_operations() {
     let cache = global_cache();
 
-    // Get initial stats
     let initial_stats = cache.stats();
     println!("Initial cache stats: {:?}", initial_stats);
 
-    // Test cache is accessible (these will always be non-negative due to type)
     let _ = initial_stats.entry_count;
     let _ = initial_stats.estimated_memory_kb;
 }
@@ -36,15 +32,12 @@ fn test_file_cache_get_or_parse() {
 
     let cache = global_cache();
 
-    // First call - cache miss (should parse file)
     let result1 = cache.get_or_parse(&example_file);
     assert!(result1.is_ok(), "Should successfully parse file");
 
-    // Second call - cache hit (should return cached result)
     let result2 = cache.get_or_parse(&example_file);
     assert!(result2.is_ok(), "Should return cached result");
 
-    // Results should be equivalent (Arc clones)
     if let (Ok(r1), Ok(r2)) = (result1, result2) {
         assert_eq!(
             serde_json::to_string(&*r1).unwrap(),
@@ -60,7 +53,6 @@ fn test_file_cache_invalidation() {
     let temp_dir = TempDir::new().unwrap();
     let test_file = temp_dir.path().join("test.jsonl");
 
-    // Create initial file
     let mut file = std::fs::File::create(&test_file).unwrap();
     writeln!(
         file,
@@ -71,11 +63,10 @@ fn test_file_cache_invalidation() {
 
     let cache = global_cache();
 
-    // Parse and cache
     let result1 = cache.get_or_parse(&test_file).unwrap();
     assert_eq!(result1.records[0].task_id, "one");
 
-    // Modify file (change modification time)
+    // Advance mtime before writing a same-length payload, so only the mtime half of the fingerprint can tell the two apart.
     std::thread::sleep(std::time::Duration::from_millis(100));
     let mut file = std::fs::File::create(&test_file).unwrap();
     writeln!(
@@ -85,8 +76,6 @@ fn test_file_cache_invalidation() {
     .unwrap();
     drop(file);
 
-    // The rewrite is the same length as the original, so only the timestamp
-    // half of the fingerprint can tell the two apart.
     let result2 = cache.get_or_parse(&test_file).unwrap();
     assert_eq!(result2.records[0].task_id, "two");
 }
@@ -163,15 +152,11 @@ fn test_dsh_cache_tracks_an_appended_frame() {
     let initial = cache.get_or_parse(&session).unwrap();
     let reads_before = initial.records[0].tool_call_counts.read;
 
-    // The second read must be a hit, or the re-read below could report a new
-    // count while never having been cached at all.
+    // The second read must be a hit, or the re-read below could report a new count while never having been cached at all.
     let hit = cache.get_or_parse(&session).unwrap();
     assert!(Arc::ptr_eq(&initial, &hit), "unchanged source should hit");
 
-    // `dsh` appends one self-contained zstd frame per batch instead of
-    // rewriting the log, so this is how a live session grows on disk. The
-    // leading newline terminates the previous batch's last line rather than
-    // relying on it to have ended with one.
+    // `dsh` appends one self-contained zstd frame per batch instead of rewriting the log; the leading newline terminates the previous batch's last line rather than assuming it ended with one.
     let batch = [
         r#"{"type":"tool/call","seq":24,"time":1786728869574,"data":{"turn":3,"step":1,"callId":"c8","name":"read","arguments":"{\"file_path\": \"src/appended.rs\"}"}}"#,
         r#"{"type":"tool/result","seq":25,"time":1786728870574,"data":{"turn":3,"step":1,"message":{},"meta":{"path":"/repo/demo/src/appended.rs","offset":1,"lines":[{"number":1,"text":"fn appended() {}"}],"totalLines":1,"lang":"rust"}},"surfaceOp":"append","sourceEventSeqs":[24]}"#,
@@ -197,13 +182,11 @@ fn test_dsh_cache_tracks_an_appended_frame() {
 fn test_file_cache_clear() {
     let cache = global_cache();
 
-    // Add some entries
     let example_file = fixture("sessions/claude_code.jsonl");
     if example_file.exists() {
         let _ = cache.get_or_parse(&example_file);
     }
 
-    // Clear cache
     cache.clear();
 
     let stats = cache.stats();
@@ -219,7 +202,6 @@ fn test_file_cache_stats() {
     let initial_stats = cache.stats();
     assert_eq!(initial_stats.entry_count, 0);
 
-    // Add an entry
     let example_file = fixture("sessions/claude_code.jsonl");
     if example_file.exists() {
         let _ = cache.get_or_parse(&example_file);
@@ -242,7 +224,6 @@ fn test_file_cache_cleanup_stale() {
     let temp_dir = TempDir::new().unwrap();
     let test_file = temp_dir.path().join("temp.jsonl");
 
-    // Create and cache a file
     std::fs::write(
         &test_file,
         r#"{"timestamp":"2026-07-12T00:00:00Z","type":"session_meta","payload":{"type":"session_meta","id":"stale"}}"#,
@@ -252,14 +233,10 @@ fn test_file_cache_cleanup_stale() {
     let cache = global_cache();
     cache.get_or_parse(&test_file).unwrap();
 
-    // Delete the file
     std::fs::remove_file(&test_file).ok();
 
-    // Cleanup stale entries
+    // Smoke test: verifies `cleanup_stale` completes without error after the cached file is removed.
     cache.cleanup_stale();
-
-    // File should be removed from cache
-    // (No direct way to verify, but should not error)
 }
 
 #[test]
@@ -277,7 +254,6 @@ fn test_file_cache_concurrent_access() {
 
     let file_path = Arc::new(example_file);
 
-    // Spawn multiple threads accessing cache concurrently
     let mut handles = vec![];
     for _ in 0..5 {
         let path = Arc::clone(&file_path);
@@ -326,8 +302,7 @@ fn test_file_cache_multiple_files() {
 #[test]
 #[serial(global_cache)]
 fn test_file_cache_lru_eviction() {
-    // Misnamed: one file re-read many times evicts nothing, and the final
-    // assert would pass after an eviction anyway, since a miss just re-parses.
+    // Misnamed: one file re-read many times evicts nothing, and the final assert would pass after an eviction anyway, since a miss just re-parses.
 
     let example_file = fixture("sessions/claude_code.jsonl");
 
@@ -338,7 +313,6 @@ fn test_file_cache_lru_eviction() {
 
     let cache = global_cache();
 
-    // Parse the same file multiple times
     for _ in 0..10 {
         let _ = cache.get_or_parse(&example_file);
     }
@@ -365,13 +339,10 @@ fn test_file_cache_invalidate_specific_file() {
 
     let cache = global_cache();
 
-    // Add to cache
     let _ = cache.get_or_parse(&example_file);
 
-    // Invalidate specific file
     cache.invalidate(&example_file);
 
-    // Next access should re-parse (cache miss)
     let result = cache.get_or_parse(&example_file);
     assert!(result.is_ok(), "Should re-parse after invalidation");
 }

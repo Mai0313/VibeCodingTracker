@@ -1,17 +1,8 @@
 //! GitHub Copilot quota fetcher.
 //!
-//! Reads the long-lived GitHub OAuth token (`gho_...`) from the Copilot CLI's
-//! `~/.copilot/config.json`, calls the internal usage API
-//! (`GET /copilot_internal/user`), and maps the premium-interactions quota into
-//! the shared snapshot shape. The token is long-lived and the file carries no
-//! refresh token, so there is **no** token refresh here: a 401/403 means the
-//! account is logged out and surfaces a `copilot login` hint.
+//! Reads the GitHub OAuth token (`gho_...`) from `~/.copilot/config.json`, calls `GET /copilot_internal/user`, and maps the premium-interactions quota into [`CopilotQuotaSnapshot`]. Tokens are not refreshed; HTTP 401 and 403 surface [`COPILOT_LOGIN_HINT`].
 //!
-//! The request impersonates the Copilot CLI (the client the token belongs to):
-//! a `GitHubCopilotCLI/<version>` User-Agent (version detected from
-//! `copilot --version`, cached for the day) plus `Copilot-Integration-Id:
-//! copilot-cli`. These identity headers are camouflage; the endpoint answers a
-//! bare bearer token.
+//! Requests send `GitHubCopilotCLI/<version>` as `User-Agent` (resolved via `copilot --version` when CLI probing is enabled) and `Copilot-Integration-Id: copilot-cli`.
 
 use crate::models::{CopilotQuotaSnapshot, CopilotUserResponse, QuotaSource, QuotaWindow};
 use crate::quota::http::{detect_cli_version, iso_to_unix_secs};
@@ -22,24 +13,18 @@ use reqwest::blocking::Client;
 use std::path::Path;
 use std::sync::OnceLock;
 
-/// Path of the Copilot internal usage endpoint (the host is derived per account
-/// so GHE data-residency logins reach `api.<host>` instead of api.github.com).
+/// Path of the Copilot internal usage endpoint; the API host is derived per account.
 const COPILOT_USAGE_PATH: &str = "/copilot_internal/user";
-/// Fallback Copilot CLI version for the User-Agent when `copilot --version`
-/// cannot be resolved (CLI absent or unreadable). Bump occasionally.
+/// Fallback Copilot CLI version for `User-Agent` when `copilot --version` cannot be resolved.
 const COPILOT_FALLBACK_VERSION: &str = "1.0.68";
-/// The Copilot CLI's integration id (confirmed from the CLI bundle).
+/// Copilot CLI integration ID sent in `Copilot-Integration-Id`.
 const COPILOT_INTEGRATION_ID: &str = "copilot-cli";
 /// GitHub API version pinned by the request.
 const COPILOT_API_VERSION: &str = "2025-04-01";
 /// Login hint shown when the Copilot token is rejected.
 pub const COPILOT_LOGIN_HINT: &str = "run: copilot login";
 
-/// Builds the Copilot CLI's request User-Agent, e.g. `GitHubCopilotCLI/1.0.68`.
-///
-/// Resolved once per process. [`crate::quota::http::detect_cli_version`] probes
-/// the installed CLI only when the binary has enabled probing, so an embedder
-/// (and the whole test suite) gets `COPILOT_FALLBACK_VERSION`.
+/// Returns the cached `GitHubCopilotCLI/<version>` `User-Agent` string, resolved once per process.
 fn copilot_ua() -> &'static str {
     static UA: OnceLock<String> = OnceLock::new();
     UA.get_or_init(|| {
@@ -51,9 +36,7 @@ fn copilot_ua() -> &'static str {
     .as_str()
 }
 
-/// Strips `//` line comments and `/* */` block comments from a JSONC string,
-/// leaving anything inside a JSON string alone: the `copilotTokens` keys are
-/// login URLs (`"https://github.com:octocat"`) whose `//` must survive.
+/// Returns `input` with `//` and `/* */` comments outside JSON string literals removed.
 fn strip_jsonc_comments(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -108,16 +91,7 @@ struct CopilotCreds {
     token: String,
 }
 
-/// Reads the `gho_...` GitHub token from the (JSONC) Copilot config and derives
-/// the entitlement API host from the account's login host.
-///
-/// Prefers the `lastLoggedInUser` account's `<host>:<login>` key so a config
-/// still holding several accounts queries the one the user is actually on.
-/// Without one, any host carrying a token will do — a GHE-only config is a
-/// logged-in account, not a logged-out one — picked in an explicit order
-/// (github.com first, then the lowest-sorting key) because `serde_json` is
-/// built without `preserve_order` here, so the file's own order is already
-/// gone by the time this runs.
+/// Extracts the Copilot API URL and OAuth token from a JSONC config body, preferring `lastLoggedInUser`, then `github.com`, then the lexicographically smallest valid key.
 fn read_copilot_creds(body: &str) -> Option<CopilotCreds> {
     let stripped = strip_jsonc_comments(body);
     let root: serde_json::Value = serde_json::from_str(&stripped).ok()?;
@@ -130,9 +104,7 @@ fn read_copilot_creds(body: &str) -> Option<CopilotCreds> {
         let host = user.get("host")?.as_str()?;
         let login = user.get("login")?.as_str()?;
         let key = format!("{host}:{login}");
-        // A key naming no host to call is no more usable here than in the
-        // fallback below, so drop through to the rest of the file instead of
-        // calling the whole config logged out.
+        // Reject keys without a usable host so lookup falls through to other entries instead of failing the whole config.
         split_token_key(&key)?;
         let token = tokens.get(&key).and_then(entry_token)?;
         Some((key, token))
@@ -156,11 +128,7 @@ fn read_copilot_creds(body: &str) -> Option<CopilotCreds> {
     })
 }
 
-/// Splits a `copilotTokens` key into its scheme-stripped domain and login:
-/// `https://acme.ghe.com:me` -> `("acme.ghe.com", "me")`.
-///
-/// `None` for anything that is not a `<scheme>://<host>:<login>` login URL —
-/// such a key names no host to call, so it is not a login this can use.
+/// Splits a `<scheme>://<host>:<login>` key into `(domain, login)`, returning `None` for any other shape.
 fn split_token_key(key: &str) -> Option<(&str, &str)> {
     let (host, login) = key.rsplit_once(':')?;
     let domain = host
@@ -169,27 +137,22 @@ fn split_token_key(key: &str) -> Option<(&str, &str)> {
     (!domain.is_empty() && !login.is_empty()).then_some((domain, login))
 }
 
-/// Derives the entitlement API URL from a `copilotTokens` key (`<host>:<login>`).
-///
-/// `https://github.com:me` -> `https://api.github.com/copilot_internal/user`; a
-/// GHE data-residency host (`https://acme.ghe.com:me`) maps to
-/// `https://api.acme.ghe.com/...` so those tokens reach the correct host.
+/// Returns `https://api.<domain>/copilot_internal/user` for a valid `copilotTokens` key.
 fn copilot_api_url(key: &str) -> Option<String> {
     let (domain, _) = split_token_key(key)?;
     Some(format!("https://api.{domain}{COPILOT_USAGE_PATH}"))
 }
 
-/// Maps a `/copilot_internal/user` body into a [`CopilotQuotaSnapshot`] (pure).
+/// Maps a `/copilot_internal/user` JSON response into a [`CopilotQuotaSnapshot`] stamped at `now` (Unix seconds).
 ///
 /// # Errors
 ///
-/// Returns an error if the body is not valid JSON in the expected shape.
+/// Returns an error if `body` is not valid JSON matching [`CopilotUserResponse`].
 pub fn map_copilot_user(body: &str, now: i64) -> Result<CopilotQuotaSnapshot> {
     let resp: CopilotUserResponse =
         serde_json::from_str(body).context("Failed to parse Copilot user response")?;
 
-    // Prefer the UTC instant; fall back to the date-only field (midnight UTC)
-    // so the gauge still shows a reset countdown when only that is returned.
+    // Fall back to midnight UTC of the date-only field when the full UTC timestamp is absent.
     let reset = resp
         .quota_reset_date_utc
         .as_deref()
@@ -207,11 +170,7 @@ pub fn map_copilot_user(body: &str, now: i64) -> Result<CopilotQuotaSnapshot> {
     let premium_remaining = premium_entry.and_then(|e| e.remaining).map(|v| v as i64);
     let premium_entitlement = premium_entry.and_then(|e| e.entitlement).map(|v| v as i64);
 
-    // `percent_remaining` really is percent remaining, hence the inversion into
-    // the consumed percent every gauge shows; the remaining/entitlement ratio
-    // covers a response that omits it. A zero-entitlement placeholder (common
-    // for token-based / business seats) carries no real gauge, so drop it
-    // rather than render a misleading empty bar.
+    // Invert `percent_remaining` into percent consumed, and drop 0/0 placeholders (token-based/business seats) that carry no real gauge.
     let placeholder = matches!((premium_remaining, premium_entitlement), (Some(0), Some(0)));
     let premium = if premium_unlimited || placeholder {
         None
@@ -253,9 +212,9 @@ pub fn map_copilot_user(body: &str, now: i64) -> Result<CopilotQuotaSnapshot> {
 /// Outcome of a single usage request.
 enum FetchResult {
     Ok(CopilotQuotaSnapshot),
-    /// 401/403 → the token is rejected; there is no refresh, so re-login.
+    /// HTTP 401 or 403; the token was rejected and requires re-login.
     Unauthorized,
-    /// Network / other non-success error → keep last-known-good.
+    /// Network, parse, or other non-2xx failure; retain the last snapshot.
     Transient,
 }
 
@@ -277,7 +236,6 @@ fn fetch_copilot_user(client: &Client, api_url: &str, token: &str, now: i64) -> 
         }
     };
     let status = resp.status();
-    // Copilot has no refresh; a logged-out account answers 401 or 403.
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
         return FetchResult::Unauthorized;
     }
@@ -300,22 +258,18 @@ fn fetch_copilot_user(client: &Client, api_url: &str, token: &str, now: i64) -> 
     }
 }
 
-/// Fetches the raw `/copilot_internal/user` response for `vct quota copilot`.
+/// Returns `(status_code, body)` from `/copilot_internal/user` using the stored OAuth token.
 ///
-/// Uses the stored `gho_` token verbatim (Copilot has no refresh) and returns
-/// `(status_code, body)`. A non-2xx status is left for the caller to surface.
+/// Non-2xx responses are returned as `Ok((status_code, body))` rather than errors. Tokens are never refreshed.
 ///
 /// # Errors
 ///
-/// Returns an error if the config is missing, has no usable token, or the
-/// request cannot be sent.
+/// Returns an error if the config path cannot be resolved, the config is missing or has no usable token, or the HTTP request or body read fails.
 pub fn fetch_copilot_raw(client: &Client) -> Result<(u16, String)> {
     fetch_copilot_raw_from(client, &get_copilot_config_path()?)
 }
 
-/// The injectable core of [`fetch_copilot_raw`]: reads the token from an explicit
-/// config path (the API host is derived from the token key). Production passes
-/// `~/.copilot/config.json`; tests pass a temp config file.
+/// Returns `(status_code, body)` from `/copilot_internal/user` using credentials read from `config_path`.
 pub(crate) fn fetch_copilot_raw_from(client: &Client, config_path: &Path) -> Result<(u16, String)> {
     let path = config_path;
     let body = std::fs::read_to_string(path).with_context(|| {
@@ -349,13 +303,12 @@ pub(crate) fn fetch_copilot_raw_from(client: &Client, config_path: &Path) -> Res
     Ok((status, text))
 }
 
-/// Per-worker Copilot state. Copilot's token is long-lived with no refresh, so
-/// there is no in-memory token cache or refresh backoff to keep.
+/// Per-worker Copilot quota state; holds no cached token or refresh backoff.
 #[derive(Default)]
 pub struct CopilotState;
 
 impl CopilotState {
-    /// One worker tick: read the token, call the usage API.
+    /// Reads the Copilot credential file and fetches a fresh quota snapshot.
     pub fn resolve(&mut self, client: &Client) -> QuotaOutcome<CopilotQuotaSnapshot> {
         let now = chrono::Local::now().timestamp();
         let path = match get_copilot_config_path() {
@@ -382,8 +335,7 @@ impl CopilotState {
 mod tests {
     use super::*;
 
-    // A real (redacted) config.json shape: JSONC with leading comments and a
-    // login-URL key containing `//`.
+    // Redacted `config.json` shape: JSONC with leading comments and a login-URL key containing `//`.
     const CONFIG: &str = r#"// User settings belong in settings.json.
 // This file is managed automatically.
 {
@@ -397,7 +349,6 @@ mod tests {
     fn strips_comments_without_eating_url_slashes() {
         let out = strip_jsonc_comments(CONFIG);
         assert!(!out.contains("// User settings"));
-        // The `//` inside the key string must survive.
         assert!(out.contains("https://github.com:octocat"));
         let creds = read_copilot_creds(CONFIG).unwrap();
         assert_eq!(creds.token, "gho_EXAMPLETOKEN");
@@ -539,7 +490,6 @@ mod tests {
         assert_eq!(snap.source, QuotaSource::Api);
         assert_eq!(snap.plan_type.as_deref(), Some("individual"));
         let prem = snap.premium.as_ref().unwrap();
-        // 100 - 97.6 = 2.4 used.
         assert!((prem.used_percent - 2.4).abs() < 1e-6);
         assert!(prem.resets_at_unix.unwrap() > 0);
         assert_eq!(snap.premium_remaining, Some(1464));
@@ -584,7 +534,6 @@ mod tests {
 
     #[test]
     fn reset_falls_back_to_date_only_field() {
-        // Only the date-only field is present (no UTC instant).
         let body = r#"{
           "quota_reset_date": "2026-08-01",
           "quota_snapshots": { "premium_interactions": { "percent_remaining": 50, "remaining": 750, "entitlement": 1500 } }
@@ -596,12 +545,7 @@ mod tests {
         );
     }
 
-    // ---- HTTP-layer tests against a local mock server (no real API) ----
-    //
-    // `fetch_copilot_user` takes the API URL as a parameter, so it can be pointed
-    // at a local mock. (`fetch_copilot_raw` derives an `https://api.<host>` URL
-    // from the config and is intentionally not driven here to avoid any real
-    // request; its send path is identical to the one exercised below.)
+    // HTTP-layer tests against a local mock server. `fetch_copilot_raw` derives an `https://api.<host>` URL from the config and is omitted here to avoid outbound requests.
 
     #[test]
     fn fetch_copilot_user_maps_200_and_401() {

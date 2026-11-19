@@ -1,16 +1,8 @@
 //! File-based diagnostic logging (`~/.vct/logs/vct-YYYY-MM-DD.log`).
 //!
-//! Keeps the standard `log` facade — every existing `log::warn!` / `error!` in
-//! the crate is unchanged — but swaps the output backend for a small file
-//! logger. Records land in a plain-text daily file under `~/.vct/logs`, **never**
-//! on stdout/stderr, so the interactive TUI is never corrupted. The file is
-//! created lazily on the first record, so a command that logs nothing (e.g. a
-//! successful `vct version`) leaves `~/.vct` untouched.
+//! Implements the [`log`] facade and writes plain-text UTC-dated daily files under `~/.vct/logs`; records are never written to stdout or stderr. Both the directory and the daily file are created lazily on the first emitted record, and files roll over across UTC midnight.
 //!
-//! [`init`] installs the logger (default level `warn`). Terminal-restore-on-panic
-//! is a presentation concern, so the CLI binary installs that hook separately.
-//! [`apply`] later reconfigures the level from `[logging]` in the user config and
-//! prunes stale files.
+//! [`init`] installs the global logger at `warn`, and [`apply`] updates the active filter and prunes expired files from [`LoggingConfig`].
 
 use crate::config::{LogLevel, LoggingConfig};
 use crate::utils::now_rfc3339_utc_nanos;
@@ -30,31 +22,19 @@ const LOG_FILE_SUFFIX: &str = ".log";
 /// The process-wide file logger, installed once by [`init`].
 static LOGGER: OnceLock<FileLogger> = OnceLock::new();
 
-/// An open daily log file plus the UTC date it was opened for.
-///
-/// Tracking the date lets a process that crosses UTC midnight roll over to the
-/// next day's file instead of appending a whole multi-day session into the file
-/// named for the day it started.
+/// Open daily log file paired with its `YYYY-MM-DD` UTC date for midnight rollover.
 struct OpenLog {
     date: String,
     file: File,
 }
 
-/// A thread-safe file logger implementing [`log::Log`].
-///
-/// The open file lives behind a `Mutex` so the main thread and the (up to five)
-/// background quota workers can share it. Each record is written with a single
-/// `write_all` and no user-space buffering, so nothing is lost on a
-/// `panic = "abort"` process abort.
+/// Thread-safe [`log::Log`] backend writing unbuffered records to daily UTC log files.
 struct FileLogger {
-    /// Current max level as `LevelFilter as usize`, kept in sync with
-    /// `log::set_max_level` so [`FileLogger::enabled`] stays authoritative.
+    /// Active [`LevelFilter`] discriminant, kept in sync with [`log::set_max_level`].
     level: AtomicUsize,
-    /// The log directory (`~/.vct/logs`), or `None` when the home directory
-    /// cannot be resolved (logging then silently no-ops).
+    /// Target log directory, or `None` when the home directory is unavailable (logging no-ops).
     dir: Option<PathBuf>,
-    /// The currently-open daily file, opened lazily on the first record and
-    /// reopened when the UTC day rolls over.
+    /// Lazily opened daily log file, rotated on UTC date change.
     open: Mutex<Option<OpenLog>>,
 }
 
@@ -68,12 +48,7 @@ impl FileLogger {
         }
     }
 
-    /// Appends one preformatted line, opening (or rotating to) the day's file.
-    ///
-    /// Creating `~/.vct/logs` and the file only happens here, so a process that
-    /// never emits a record never creates anything on disk. The file name uses
-    /// the same UTC date as the line timestamps, and rolls over on the first
-    /// record after UTC midnight.
+    /// Appends one preformatted line, lazily creating the directory and rotating the file on UTC date change.
     fn append(&self, line: &str) {
         let Some(dir) = self.dir.as_deref() else {
             return;
@@ -125,18 +100,12 @@ impl Log for FileLogger {
     }
 }
 
-/// Today's date in UTC as `YYYY-MM-DD`.
-///
-/// Deliberately UTC (not the local-day `utils::get_current_date`) so a log
-/// file's name matches the UTC timestamps of the lines inside it.
+/// Returns the current UTC date as `YYYY-MM-DD` to match the UTC line timestamps.
 fn utc_date() -> String {
     Utc::now().date_naive().format("%Y-%m-%d").to_string()
 }
 
-/// Formats one log line: `<utc-nanos> <LEVEL> <target>  <message>`.
-///
-/// The crate's own `vct_core::` target prefix is shortened to `vct::`
-/// to keep lines readable.
+/// Formats one log line as `<utc-nanos> <LEVEL> <target>  <message>\n` with `vct_core` shortened to `vct`.
 fn format_line(now: &str, level: Level, target: &str, msg: &str) -> String {
     format!("{now} {:<5} {}  {msg}\n", level, normalize_target(target))
 }
@@ -162,11 +131,9 @@ fn to_level_filter(level: LogLevel) -> LevelFilter {
     }
 }
 
-/// Installs the global file logger at the default level (`warn`).
+/// Installs the process-wide file logger at `warn`; repeat calls are ignored.
 ///
-/// Called once at process start, before any subcommand runs; a repeat call is
-/// ignored. The level is later refined by [`apply`] once the user config is
-/// loaded.
+/// Call [`apply`] after loading configuration to update the level and prune old logs.
 pub fn init() {
     let dir = home::home_dir().map(|home| home.join(".vct").join(LOG_DIR_NAME));
     let logger = LOGGER.get_or_init(|| FileLogger::new(dir, LevelFilter::Warn));
@@ -176,8 +143,7 @@ pub fn init() {
     }
 }
 
-/// Applies the persisted `[logging]` settings: sets the max level and prunes
-/// stale daily files. Called after the user config is loaded (usage / analysis).
+/// Applies `cfg` by updating the active log level and pruning daily log files older than `cfg.retention_days`.
 pub fn apply(cfg: &LoggingConfig) {
     let filter = to_level_filter(cfg.level);
     log::set_max_level(filter);
@@ -187,7 +153,7 @@ pub fn apply(cfg: &LoggingConfig) {
     prune_old_logs(cfg.retention_days);
 }
 
-/// Prunes daily log files older than `retention_days` from the log directory.
+/// Prunes daily log files older than `retention_days` from the log directory; `0` disables pruning.
 fn prune_old_logs(retention_days: u32) {
     if retention_days == 0 {
         return;
@@ -199,9 +165,7 @@ fn prune_old_logs(retention_days: u32) {
     prune_before(dir, cutoff);
 }
 
-/// Deletes every `vct-YYYY-MM-DD.log` file in `dir` whose date is strictly
-/// before `cutoff` (test seam: the cutoff is injected rather than derived from
-/// "now").
+/// Deletes every `vct-YYYY-MM-DD.log` file in `dir` whose date is strictly before `cutoff`.
 fn prune_before(dir: &Path, cutoff: NaiveDate) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -253,7 +217,6 @@ mod tests {
 
     #[test]
     fn level_filter_ordering_matches_log_crate() {
-        // Off gates out even Error; Warn admits Error+Warn but not Info.
         let warn = FileLogger::new(None, LevelFilter::Warn);
         assert!(warn.enabled(&Metadata::builder().level(Level::Error).build()));
         assert!(warn.enabled(&Metadata::builder().level(Level::Warn).build()));
@@ -269,7 +232,6 @@ mod tests {
         let dir = tmp.path().join("logs");
         let logger = FileLogger::new(Some(dir.clone()), LevelFilter::Warn);
 
-        // Nothing on disk until the first append.
         assert!(!dir.exists());
 
         logger.append("line one\n");
@@ -286,7 +248,6 @@ mod tests {
         let dir = tmp.path().join("logs");
         let logger = FileLogger::new(Some(dir.clone()), LevelFilter::Warn);
 
-        // Below the gate (info < warn): dropped, and nothing is created on disk.
         logger.log(
             &Record::builder()
                 .level(Level::Info)
@@ -299,7 +260,6 @@ mod tests {
             "info is below warn, so no file/dir is created"
         );
 
-        // At the gate (warn): written through the full log() -> format -> append path.
         logger.log(
             &Record::builder()
                 .level(Level::Warn)

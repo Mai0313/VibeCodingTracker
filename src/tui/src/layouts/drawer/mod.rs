@@ -1,6 +1,4 @@
-//! `drawer` layout: underline-accent top bar, always full-width `Models` table
-//! keeping all numeric columns intact, and a collapsible 3-column horizontal
-//! bottom `Drawer` toggled with `Enter`, `Space`, or a mouse click.
+//! `drawer` layout: underline-accent top bar, full-width `Models` table, and a collapsible horizontal bottom `Drawer` toggled with `Enter`, `Space`, or click.
 
 use crate::display::analysis::{
     build_analysis_detail_sections, build_analysis_table_row, layout_analysis_columns,
@@ -884,8 +882,7 @@ mod tests {
         let mut settings = SettingsUiState::new(Config::default(), Box::new(|_, _| Ok(())));
         let mut view = LAYOUT.create();
 
-        // Short terminal (`work.height < 18`): collapsed bar lists 3 providers + `+1 more`,
-        // and Enter opens Details modal.
+        // Short terminal (`work.height < 18`): collapsed bar shows 3 providers plus `+1 more`, and Enter opens the details modal.
         let short = render(
             &mut view,
             120,

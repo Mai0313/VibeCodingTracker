@@ -1,9 +1,4 @@
-//! Data-driven provider fan-out for the ledger-backed file scan.
-//!
-//! The seven file-backed providers are scanned with the identical
-//! [`scan_provider_files`] call, differing only in their session roots, filter,
-//! depth cap, and enable toggle. Listing them once here means adding a provider
-//! is a single table row instead of a new `if` block in every scan loop.
+//! Data-driven provider fan-out for ledger-backed file scans and full-ledger export refreshes.
 
 use super::compact::{
     NoopSink, ScanTarget, cutoff_string, finish_provider_scan, scan_provider_files,
@@ -27,11 +22,7 @@ use anyhow::Result;
 use rayon::prelude::*;
 use std::path::Path;
 
-/// One file-backed provider's scan parameters.
-///
-/// `dirs` is a list because a provider can keep its sessions in more than one
-/// root — Codex splits them across active and archived directories, and
-/// Antigravity across the `agy` CLI, Desktop and other builds.
+/// Scan roots, file filter, depth cap, and config toggle for one file-backed provider.
 struct FileProviderSpec {
     provider: ExtensionType,
     enabled: fn(&ProvidersConfig) -> bool,
@@ -40,10 +31,7 @@ struct FileProviderSpec {
     max_depth: Option<usize>,
 }
 
-/// The file-backed providers, in canonical scan order.
-///
-/// Database-backed providers (OpenCode, Cursor, Hermes) are not here: each has a
-/// bespoke reader that differs between the usage and analysis features.
+/// File-backed providers in canonical scan order; SQLite-backed providers (OpenCode, Cursor, Hermes) use dedicated readers.
 const FILE_PROVIDERS: [FileProviderSpec; 7] = [
     FileProviderSpec {
         provider: ExtensionType::ClaudeCode,
@@ -96,8 +84,7 @@ const FILE_PROVIDERS: [FileProviderSpec; 7] = [
     },
 ];
 
-/// Scans every enabled file-backed provider through the ledger, folding each
-/// into `sink`. Shared by the usage and analysis ledger-backed collectors.
+/// Scans every enabled file-backed provider for `feature` through `ledger`, folding matching days into `sink`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn scan_all_cached_files(
     paths: &HelperPaths,
@@ -195,9 +182,7 @@ fn scan_all_cached_files_target(
     Ok(())
 }
 
-/// Refreshes both halves of every enabled provider in `ledger` for `vct ledger
-/// export`, walking file providers once and skipping in-memory day folding and
-/// remote snapshot reloads.
+/// Refreshes both usage and analysis halves of every enabled local provider in `ledger` without in-memory folding or loading remote snapshots.
 pub(crate) fn refresh_ledger_for_export(
     paths: &HelperPaths,
     providers: ProvidersConfig,

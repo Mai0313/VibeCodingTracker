@@ -2,11 +2,9 @@
 
 use serde::Deserialize;
 
-/// Aggregate telemetry stored in each Grok CLI session's `signals.json`.
+/// Aggregate telemetry stored in a Grok CLI session's `signals.json`.
 ///
-/// Grok records a current context-window gauge rather than billed token
-/// buckets. Unknown fields are intentionally ignored so new telemetry does
-/// not break older VCT releases.
+/// Records a current context-window gauge rather than cumulative billed tokens; unknown fields are ignored.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct GrokSignals {
@@ -26,8 +24,7 @@ pub struct GrokSummary {
     pub info: GrokSessionInfo,
     /// Last session update time in RFC 3339 format.
     pub updated_at: String,
-    /// Last-activity time in RFC 3339 format; the later of it and `updated_at`
-    /// seeds the session timestamp, which `updates.jsonl` can then push later.
+    /// Last-activity time in RFC 3339 format; the later of `last_active_at` and `updated_at` seeds the session timestamp.
     pub last_active_at: String,
     /// Alias or model id used only when signals omit model attribution.
     pub current_model_id: String,

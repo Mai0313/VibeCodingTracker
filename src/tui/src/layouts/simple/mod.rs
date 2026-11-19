@@ -1,5 +1,4 @@
-//! `simple` layout: collapsible left navigation rail paired with inline
-//! expandable tree rows (`▸` / `▾`) inside the Usage and Analysis tables.
+//! `simple` layout: collapsible left navigation rail paired with inline expandable tree rows (`▸` / `▾`) in the Usage and Analysis tables.
 
 use crate::display::analysis::{
     AnalysisRow, AnalysisTableColumns, build_analysis_table_row, layout_analysis_columns,

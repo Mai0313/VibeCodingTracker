@@ -91,7 +91,7 @@ The repository is a Cargo workspace: all the Rust code lives in the four members
 
 Crates depend one way only — `vct-core` → `vct-tui` → `vct-cli` — so core never reaches into display or CLI code, and a future GUI can hang off core alone. Unit tests live inline in each crate's `src/`, integration tests under the owning crate's `tests/` directory; the root `tests/` holds fixtures only.
 
-For the module-by-module breakdown inside each crate, see the **Architecture** section of [`AGENTS.md`](../AGENTS.md).
+For architecture boundaries and subsystem invariants inside each crate, see [`AGENTS.md`](../AGENTS.md) and the `vct-dev` reference files under [`.agents/skills/vct-dev/`](../.agents/skills/vct-dev/SKILL.md).
 
 #### Building from Source
 
@@ -128,7 +128,7 @@ Two release profiles are defined in `Cargo.toml`:
 `Cargo.toml` exposes a small set of optional features; the defaults are tuned for long-running TUI sessions.
 
 - **System allocator (default)** — the build links against glibc's `malloc`. Combined with the `mallopt` tuning applied at startup (see `src/core/src/utils/heap.rs`) and the per-refresh `malloc_trim(0)` call, this keeps `usage` / `analysis` TUI RSS roughly flat (around 60 MB) even over hours of refreshes. Use this for anything you plan to leave open.
-- **`mimalloc` (opt-in)** — enable with `cargo build --release --features mimalloc`. Links Microsoft's mimalloc as the global allocator. Startup / one-shot commands (`vct usage --json`, `vct analysis file.jsonl`) are slightly faster, but mimalloc's lazy purge retains freed pages — on a 219-session directory the TUI RSS was ~11× higher than the default build in our measurements. Prefer this only for scripted, short-lived invocations.
+- **`mimalloc` (opt-in)** — enable with `cargo build --release -p vct-cli --features mimalloc`. Links Microsoft's mimalloc as the global allocator. Startup / one-shot commands (`vct usage --json`, `vct analysis file.jsonl`) are slightly faster, but mimalloc's lazy purge retains freed pages — on a 219-session directory the TUI RSS was ~11× higher than the default build in our measurements. Prefer this only for scripted, short-lived invocations.
 
 On Linux/glibc the main binary also calls `mallopt(M_ARENA_MAX, 4)` + `mallopt(M_TRIM_THRESHOLD, 128 KiB)` at start. These cap the number of per-thread allocator arenas (so Rayon workers can't multiply arena-side fragmentation across cores) and pin the trim threshold. The calls are no-ops on other platforms / allocators.
 

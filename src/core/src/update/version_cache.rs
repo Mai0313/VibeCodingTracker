@@ -1,12 +1,6 @@
-//! This tool's own version record (`~/.vct/version/vct.json`).
+//! Persistent self-version check record (`~/.vct/version/vct.json`).
 //!
-//! Written on every update check and used to throttle startup checks to one
-//! attempt per UTC date. It holds the latest release seen on GitHub, when the
-//! check last ran, and a release the user has chosen to dismiss.
-//!
-//! It sits beside the per-CLI version records under `version/` as one more
-//! entry keyed by its own name, and carries the same `schema_version` +
-//! `provider` stamp they do.
+//! Throttles startup update checks to one attempt per UTC date and records the latest GitHub release seen, the last check timestamp, and any dismissed release. Uses the same `schema_version` and `provider` envelope as the per-CLI version cache files under `version/`.
 
 use crate::utils::{
     get_version_cache_path, get_version_cache_path_in, now_rfc3339_utc_nanos, write_json_atomic,
@@ -16,17 +10,13 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// Version of the on-disk shape below. A record carrying any other version is
-/// read as an absent one, so the next check simply rewrites it.
+/// On-disk schema version; records with any other version are treated as absent.
 const SCHEMA_VERSION: u32 = 1;
 
-/// This tool's own name under `version/`, distinguishing its record from the
-/// five provider CLIs sharing that directory.
+/// Cache key under `version/` distinguishing this binary's record from provider CLI records.
 const PROVIDER: &str = "vct";
 
-/// The `~/.vct/version/vct.json` payload, e.g. `{"schema_version":1,
-/// "provider":"vct","latest_version":"0.142.5",
-/// "last_checked_at":"2026-07-07T05:34:50.563606999Z","dismissed_version":null}`.
+/// On-disk payload of `~/.vct/version/vct.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SelfVersion {
     /// [`SCHEMA_VERSION`] of the build that wrote the record.
@@ -76,11 +66,13 @@ fn with_check(mut prev: SelfVersion, latest: &str, now: String) -> SelfVersion {
     prev
 }
 
-/// Records that an update check just saw `latest` on GitHub.
+/// Records `latest` as the most recently seen GitHub release and stamps `last_checked_at` with the current UTC time.
 ///
-/// Preserves any `dismissed_version` already on disk and stamps
-/// `last_checked_at` with the current UTC time. Best-effort: callers treat a
-/// write failure as non-fatal so it never blocks the update flow.
+/// Preserves any existing `dismissed_version` on disk.
+///
+/// # Errors
+///
+/// Returns an error if the version cache path cannot be resolved or the file cannot be written.
 pub fn record_version_check(latest: &str) -> Result<()> {
     let path = get_version_cache_path(PROVIDER)?;
     let record = with_check(
@@ -91,7 +83,7 @@ pub fn record_version_check(latest: &str) -> Result<()> {
     write_json_atomic(path, &record)
 }
 
-/// Whether a startup check is due on `now`'s UTC date.
+/// Returns whether a startup check is due on `now`'s UTC date.
 pub(super) fn check_is_due(record: &SelfVersion, now: DateTime<Utc>) -> bool {
     let Ok(last) = DateTime::parse_from_rfc3339(&record.last_checked_at) else {
         return true;
@@ -107,7 +99,7 @@ pub(super) fn record_check_attempt_in(dir: &Path, now: DateTime<Utc>) -> Result<
     write_json_atomic(path, &record)
 }
 
-/// Records the release seen by a startup check without changing its attempt date.
+/// Records `latest` and `now` in the version cache under `dir`, preserving `dismissed_version`.
 pub(super) fn record_version_result_in(dir: &Path, latest: &str, now: DateTime<Utc>) -> Result<()> {
     let path = get_version_cache_path_in(dir, PROVIDER);
     let record = with_check(read_self_version_from(&path), latest, format_timestamp(now));
@@ -162,8 +154,7 @@ mod tests {
         assert!(record.dismissed_version.is_none());
     }
 
-    /// A record written by another schema, or one naming another entry under
-    /// `version/`, reads as absent so the next check simply rewrites it.
+    /// A record with a foreign schema version or provider name reads as absent.
     #[test]
     fn foreign_record_reads_as_absent() {
         let dir = tempfile::tempdir().unwrap();

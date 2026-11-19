@@ -1,3 +1,5 @@
+//! Number, USD cost, local date, and countdown duration formatting.
+
 use chrono::{Local, NaiveDate};
 use std::sync::RwLock;
 
@@ -20,9 +22,7 @@ where
     let mut buf = itoa::Buffer::new();
     let s = buf.format(n);
 
-    // Group the digits alone: counting the sign toward the leading group makes
-    // it the whole group whenever the digit count is a multiple of three, and
-    // the loop then opens with a separator ("-,123").
+    // Group the digits alone: counting the sign toward the leading group makes it the whole group whenever the digit count is a multiple of three, producing "-,123".
     let (sign, digits) = match s.strip_prefix('-') {
         Some(digits) => ("-", digits),
         None => ("", s),
@@ -58,16 +58,9 @@ where
     result
 }
 
-/// Formats an integer into a compact human string with a K/M/B/T suffix.
+/// Formats an integer with a K/M/B/T suffix and three significant figures.
 ///
-/// Values under 1000 render verbatim; larger ones use the largest fitting unit
-/// with 3 significant figures (2 / 1 / 0 decimals as the scaled value crosses
-/// 10 and 100), so the result stays within ~5 characters. Rounding that would
-/// reach 1000 within a unit is promoted to the next unit, so `999_950` renders
-/// as `"1.00M"` rather than `"1000K"`. Negative values keep a leading `-`.
-///
-/// Only the interactive TUI uses this; the static table renders the same counts
-/// exactly with [`format_number`].
+/// Magnitudes under 1000 render verbatim; larger ones select the largest fitting unit with 2, 1, or 0 decimals as the scaled value crosses 10 and 100. Values that round to 1000 within a unit promote to the next unit (for example, `999_950` renders as `"1.00M"`). Negative values keep a leading `-`.
 ///
 /// # Examples
 ///
@@ -88,8 +81,7 @@ pub fn format_compact(n: i64) -> String {
         return n.to_string();
     }
 
-    // Decimals by magnitude, with a tiny epsilon so e.g. 9.999 classifies as
-    // the 1-decimal bucket and renders "10.0K" instead of "10.00K".
+    // Thresholds include a half-ULP margin so values like 9.999 use 1 decimal ("10.0K") instead of 2 ("10.00K").
     let decimals = |v: f64| -> usize {
         if v < 9.995 {
             2
@@ -119,12 +111,9 @@ pub fn format_compact(n: i64) -> String {
     format!("{sign}{scaled:.dec$}{suffix}", suffix = UNITS[idx].1)
 }
 
-/// Formats a USD amount as `"$1,234.56"` (comma-grouped dollars, two decimals).
+/// Formats a USD amount with comma-grouped dollars and two decimal places (for example, `"$1,234.56"`).
 ///
-/// Never abbreviated, so the cents survive at any magnitude
-/// ([`format_cost_compact`] is the K/M/B/T form). Negative amounts render as
-/// `"-$1.23"`, except that an amount rounding to zero cents renders `"$0.00"`
-/// with no sign.
+/// Negative amounts render as `"-$1.23"`, except values rounding to zero cents render as `"$0.00"` without a sign. See [`format_cost_compact`] for the abbreviated form.
 ///
 /// # Examples
 ///
@@ -140,13 +129,9 @@ pub fn format_cost(cost: f64) -> String {
     format!("{sign}${}.{:02}", format_number(cents / 100), cents % 100)
 }
 
-/// Formats a USD amount for the dense interactive dashboard, abbreviating large
-/// values with a K/M/B/T suffix.
+/// Formats a USD amount with a K/M/B/T suffix for magnitudes of `$1000` and above.
 ///
-/// Amounts under `$1000` keep full cents via [`format_cost`] (`$74.18`); larger
-/// amounts drop to [`format_compact`]'s 3-significant-figure form prefixed with
-/// `$` (`$8.63K`, `$14.2K`). Only the interactive usage view uses it; the static
-/// table, text, and JSON paths emit unabbreviated amounts of their own.
+/// Magnitudes under `$1000` delegate to [`format_cost`]; larger magnitudes round to whole dollars and format via [`format_compact`] prefixed with `$` (for example, `"$4.11K"`).
 ///
 /// # Examples
 ///
@@ -168,11 +153,9 @@ pub fn format_cost_compact(cost: f64) -> String {
 
 static DATE_CACHE: RwLock<Option<(NaiveDate, String)>> = RwLock::new(None);
 
-/// Returns today's local date as a `YYYY-MM-DD` string.
+/// Returns today's local date as `YYYY-MM-DD`.
 ///
-/// Memoized in a process-wide `RwLock` and recomputed only when the local
-/// calendar day changes. A poisoned lock degrades gracefully: the value is
-/// recomputed without touching the cache rather than panicking.
+/// Memoized in a process-wide `RwLock` and recomputed when the local calendar day changes; a poisoned lock bypasses the cache rather than panicking.
 pub fn get_current_date() -> String {
     let today = Local::now().date_naive();
 
@@ -194,11 +177,9 @@ pub fn get_current_date() -> String {
     date_string
 }
 
-/// Formats the time remaining until `reset_unix` as a compact human string.
+/// Formats the time remaining from `now_unix` until `reset_unix` as a compact string.
 ///
-/// Returns `"now"` when the reset is in the past or under a minute away (the
-/// difference is clamped at 0), otherwise the two most significant units
-/// (`"4d2h"`, `"2h13m"`), or just minutes (`"13m"`) under an hour.
+/// Returns `"now"` when the difference is negative or under a minute, `"<m>m"` under an hour, and the two most significant units (`"<h>h<m>m"` or `"<d>d<h>h"`) otherwise.
 ///
 /// # Examples
 ///
@@ -269,12 +250,10 @@ mod tests {
         assert_eq!(format_number(-123), "-123");
         assert_eq!(format_number(-999), "-999");
 
-        // A digit count that is a multiple of three: the sign must not become
-        // the leading group, or the first separator lands right after it.
+        // Digit counts that are multiples of three must not treat the leading '-' as a group.
         assert_eq!(format_number(-123456), "-123,456");
         assert_eq!(format_number(-123456789), "-123,456,789");
 
-        // The widths that stayed correct even with the sign counted in.
         assert_eq!(format_number(-1234), "-1,234");
         assert_eq!(format_number(-12345), "-12,345");
 
@@ -306,8 +285,7 @@ mod tests {
 
     #[test]
     fn test_format_compact_rounding_promotion() {
-        // Rounding that reaches 1000 within a unit promotes to the next unit.
-        // 999_499 rounds to 999K; 999_500 rounds up and promotes to 1.00M.
+        // Rounding to 1000 within a unit promotes to the next unit (999_499 -> 999K; 999_500 -> 1.00M).
         assert_eq!(format_compact(999_499), "999K");
         assert_eq!(format_compact(999_500), "1.00M");
         assert_eq!(format_compact(999_999), "1.00M");
@@ -355,7 +333,7 @@ mod tests {
     #[test]
     fn test_get_current_date() {
         let date = get_current_date();
-        assert_eq!(date.len(), 10); // YYYY-MM-DD format
+        assert_eq!(date.len(), 10);
         assert!(date.contains('-'));
     }
 }

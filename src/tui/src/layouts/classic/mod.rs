@@ -1,7 +1,4 @@
-//! `classic` layout (default): split master-detail workbench with rounded
-//! borders, clickable top bar and column headers, and a live side `Inspector`
-//! pane on wide terminals (falling back to full-width modal popups on narrow
-//! terminals).
+//! `classic` layout (default): split master-detail workbench with rounded borders, clickable top bar and column headers, and a live side `Inspector` pane on wide terminals (falling back to modal popups on narrow terminals).
 
 use crate::display::analysis::{
     build_analysis_detail_sections, build_analysis_table_row, layout_analysis_columns,
@@ -877,7 +874,7 @@ mod tests {
         let (mut usage, mut analysis, mut settings) = seeded_states();
         let mut view = LAYOUT.create();
 
-        // 1. Open Details popup at 80x24, then widen to 112x16 (narrowest split width).
+        // Open Details popup at 80x24, then widen to 112x16 (narrowest split width).
         let _ = render_lines(
             &mut view,
             80,
@@ -905,8 +902,7 @@ mod tests {
             view.on_key(KeyCode::Enter, &mut ctx);
         }
 
-        // At 112x16 the Inspector overflows vertically (`+N ↓`), yet its left
-        // `Inspector` title must stay intact alongside the compact right toggle.
+        // At 112x16 the Inspector overflows vertically (`+N ↓`), keeping the left `Inspector` title intact beside the compact right toggle.
         let split_lines = render_lines(
             &mut view,
             112,
@@ -922,9 +918,7 @@ mod tests {
             split_lines.join("\n")
         );
 
-        // Toggle side pane to Providers (`p`), verify PageDown falls through
-        // (`EventResult::Ignored`) instead of scrolling hidden Inspector, and
-        // `Esc` returns straight to Inspector because stale modals were cleared.
+        // Toggle to Providers (`p`): PageDown falls through (`EventResult::Ignored`) instead of scrolling the hidden Inspector, and `Esc` returns to Inspector because stale modals were cleared.
         {
             let mut ctx = LayoutContext {
                 tab: Tab::Usage,

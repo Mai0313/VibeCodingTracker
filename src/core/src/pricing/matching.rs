@@ -1,3 +1,5 @@
+//! Multi-stage model name matching, normalization, and tier-boundary derivation.
+
 use super::cache::ModelPricing;
 use crate::utils::MAX_TIER_LEVELS;
 use lru::LruCache;
@@ -11,15 +13,13 @@ use strsim::jaro_winkler;
 // Jaro-Winkler score at or above which a fuzzy candidate is accepted.
 const SIMILARITY_THRESHOLD: f64 = 0.7;
 
-// Maximum number of cached pricing lookups per pricing map.
+// Per-map LRU capacity for pricing lookups.
 const PRICING_MATCH_CACHE_SIZE: usize = 64;
 
-// Incrementing this invalidates the per-instance caches lazily. This keeps the
-// public clear_pricing_cache() API useful without reintroducing a global result
-// cache that can leak matches between unrelated pricing maps.
+// Bumped by `clear_pricing_cache()` to lazily invalidate every `ModelPricingMap`'s local LRU without sharing results across maps.
 static MATCH_CACHE_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-/// Result of a model pricing lookup, including the matched model name for transparency.
+/// Result of a [`ModelPricingMap::get`] lookup.
 #[derive(Debug, Clone)]
 pub struct ModelPricingResult {
     /// Pricing for the matched model, or `ModelPricing::default()` (all zero) on no match.
@@ -28,24 +28,17 @@ pub struct ModelPricingResult {
     pub matched_model: Option<String>,
 }
 
-/// Pricing table with precomputed indices for O(1) exact matches and a
-/// single-pass scan for the loose stages.
+/// Model pricing table with precomputed indices for exact, normalized, substring, and fuzzy lookups.
 ///
-/// Neither `Send` nor `Sync` (`Rc` keys plus a `RefCell` lookup cache), so a
-/// thread that needs pricing builds its own map; [`ModelPricingMap::tier_thresholds`]
-/// extracts the shareable snapshot.
+/// Not `Send` or `Sync`; use [`ModelPricingMap::tier_thresholds`] to share per-request tier boundaries across threads.
 #[derive(Debug, Clone)]
 pub struct ModelPricingMap {
-    // Original pricing data (use Rc<str> to avoid cloning keys)
+    // Keys are shared across indices via `Rc<str>`.
     raw: HashMap<Rc<str>, ModelPricing>,
-    // Precomputed normalized keys for fast matching
     normalized_index: HashMap<String, Vec<Rc<str>>>,
-    // Precomputed lowercase keys for substring/fuzzy matching. Order is
-    // unobservable: both consumers scan the whole vector and tie-break on the
-    // key itself, so no arrangement of it can change a lookup.
-    lowercase_keys: Vec<(String, Rc<str>)>, // (lowercase_key, original_key as Rc)
-    // Lookup results belong to this map. A process-global result cache is
-    // incorrect because model names can map to different prices in each map.
+    // `(lowercase_key, original_key)` pairs; order is unobservable because substring and fuzzy scans tie-break on the original key.
+    lowercase_keys: Vec<(String, Rc<str>)>,
+    // Per-instance LRU so distinct pricing tables cannot leak results into each other.
     match_cache: RefCell<MatchCache>,
 }
 
@@ -112,22 +105,18 @@ impl ModelPricingMap {
         }
     }
 
-    /// Retrieves pricing for a model using a multi-tier matching strategy.
+    /// Returns pricing for `model_name` using a multi-stage matching strategy.
     ///
-    /// Matching strategy (in order of priority):
-    /// 1. Exact match (O(1) hash lookup).
-    /// 2. Normalized match (provider prefix, date and version suffixes stripped).
-    /// 3. Substring match (bidirectional contains check).
-    /// 4. Fuzzy match (Jaro-Winkler ≥ 0.7 threshold).
-    /// 5. Default (zero cost) if no match found.
+    /// Matching proceeds in order:
+    /// 1. Exact key match.
+    /// 2. Normalized match via [`normalize_model_name`] (provider prefix, 8-digit date, and `-vN` version suffixes stripped).
+    /// 3. Bidirectional substring match on the provider-stripped model segment.
+    /// 4. Fuzzy match (Jaro-Winkler similarity >= 0.7).
+    /// 5. Zero-cost [`ModelPricing::default()`] when no stage matches.
     ///
-    /// Steps 3 and 4 are skipped for a placeholder name (`default`, `auto`, …)
-    /// or a model segment shorter than four bytes: those go straight to the
-    /// zero-cost default rather than inherit a lookalike's price.
+    /// Stages 3 and 4 are skipped for placeholder names (`default`, `auto`, `custom`, `unknown`, `none`) and model segments shorter than four bytes.
     ///
-    /// Results are cached per map. [`clear_pricing_cache`] invalidates every
-    /// existing map lazily, so even the "no match" outcome can be memoized
-    /// without leaking a result from one pricing table into another.
+    /// Results (including misses) are cached in a per-map LRU invalidated lazily by [`clear_pricing_cache`].
     ///
     /// # Examples
     ///
@@ -156,7 +145,6 @@ impl ModelPricingMap {
             return cached_result;
         }
 
-        // Fast path 1: Exact match
         if let Some(pricing) = self.raw.get(model_name) {
             let result = ModelPricingResult {
                 pricing: pricing.clone(),
@@ -166,7 +154,6 @@ impl ModelPricingMap {
             return result;
         }
 
-        // Fast path 2: Normalized match
         let normalized_name = normalize_model_name(model_name);
         if let Some(original_key) = self.normalized_match(model_name, &normalized_name)
             && let Some(pricing) = self.raw.get(original_key.as_ref())
@@ -179,11 +166,6 @@ impl ModelPricingMap {
             return result;
         }
 
-        // Loose (substring / fuzzy) matching needs a distinctive query: a
-        // placeholder like `default` (what cursor-agent stores for auto-mode
-        // conversations) or a very short fragment would otherwise inherit a
-        // coincidentally-similar model's prices. Unpriced ($0) is the safer
-        // answer for those.
         let model_lower = model_name.to_lowercase();
         if !eligible_for_loose_match(model_without_provider(&model_lower)) {
             let result = ModelPricingResult {
@@ -194,9 +176,7 @@ impl ModelPricingMap {
             return result;
         }
 
-        // Slow path 1: inspect every substring candidate and choose the most
-        // specific overlap. Taking the first candidate instead prices gpt-4o
-        // as gpt-4.
+        // Score every substring candidate by overlap specificity so `gpt-4o` does not match `gpt-4` first.
         if let Some(matched_key) = self.substring_match(&model_lower)
             && let Some(pricing) = self.raw.get(matched_key.as_ref())
         {
@@ -208,7 +188,6 @@ impl ModelPricingMap {
             return result;
         }
 
-        // Slow path 2: fuzzy match.
         if let Some(matched_key) = self.fuzzy_match(&model_lower)
             && let Some(pricing) = self.raw.get(matched_key.as_ref())
         {
@@ -307,14 +286,9 @@ impl ModelPricingMap {
             .map(|(_, _, key)| key.clone())
     }
 
-    /// Returns the pricing for an **exact** model-name match only.
+    /// Returns pricing only when `model_name` is an exact key in the pricing table.
     ///
-    /// Unlike [`get`](Self::get), this performs no normalization, substring, or
-    /// fuzzy matching: it returns `Some` only when `model_name` is a verbatim
-    /// key in the pricing table, and `None` otherwise. This is the lookup used
-    /// for providers (OpenCode, Hermes) that carry their own authoritative cost
-    /// and should fall back to that stored cost rather than guess a price from
-    /// a loosely-similar model name.
+    /// Unlike [`Self::get`], performs no normalization, substring, or fuzzy matching.
     pub fn get_exact(&self, model_name: &str) -> Option<ModelPricing> {
         self.raw.get(model_name).cloned()
     }
@@ -329,9 +303,7 @@ impl ModelPricingMap {
         &self.raw
     }
 
-    /// Builds the `Send + Sync` "model → price-level boundaries" snapshot the
-    /// usage scan hands to session parsers for per-request tier
-    /// classification. Models with neither pricing strategy are absent.
+    /// Returns a [`TierThresholds`](crate::pricing::TierThresholds) snapshot of ascending context boundaries for all tiered and range-priced models in this map.
     pub fn tier_thresholds(&self) -> crate::pricing::TierThresholds {
         crate::pricing::TierThresholds::from_entries(
             self.raw.iter().filter_map(|(key, pricing)| {
@@ -341,23 +313,9 @@ impl ModelPricingMap {
     }
 }
 
-/// The ascending context sizes at which `pricing` moves up a price level, or
-/// `None` when the model has only one level.
+/// Returns ascending context-size boundaries for `pricing` in `calculate_cost` dispatch order (`ranges` before `tiers`), or `None` for single-level models.
 ///
-/// Checked in `calculate_cost`'s own dispatch order, so an entry carrying both
-/// strategies classifies against the one that will price it. Level `n` — the
-/// level above the `n`th boundary — is `ranges[n]` for a range-based model and
-/// `tiers[n - 1]` for a threshold-based one.
-///
-/// A range's boundary is the row's own inclusive `min_tokens`, so each level is
-/// the highest row whose lower bound the request cleared; row 0's is skipped
-/// because nothing sits below it. Reading the *previous* row's exclusive
-/// `max_tokens` instead says the same thing for the contiguous tables LiteLLM
-/// publishes today, but promotes a request that falls in a gap to a row it
-/// never reached. The `- 1` is because
-/// [`TierClassifier`](crate::pricing::TierClassifier) compares strictly
-/// greater, which is what makes a request of exactly `min_tokens` the first one
-/// that row prices.
+/// Range rows emit `min_tokens - 1` (skipping row 0) because [`TierClassifier`](crate::pricing::TierClassifier) compares strictly greater and `min_tokens` is inclusive; using `min_tokens` instead of the prior row's `max_tokens` avoids promoting requests in gaps between ranges.
 fn classification_boundaries(pricing: &ModelPricing) -> Option<Vec<i64>> {
     match &pricing.ranges {
         Some(ranges) => {
@@ -368,15 +326,9 @@ fn classification_boundaries(pricing: &ModelPricing) -> Option<Vec<i64>> {
     }
 }
 
-/// Keeps the leading run of `bounds` that is non-negative and strictly
-/// ascending, capped at [`MAX_TIER_LEVELS`].
+/// Takes the leading non-negative, strictly ascending prefix of `bounds`, capped at [`MAX_TIER_LEVELS`].
 ///
-/// A price row whose bound does not clear its predecessor's would make the
-/// levels above it meaningless; stopping there costs only those levels, while
-/// dropping the row instead would shift every level below it onto the wrong
-/// price row. Zero is a legitimate first bound — a model publishing an
-/// `above_0k_tokens` rate prices every request there — but a negative one only
-/// ever comes from a malformed row.
+/// Stops at the first non-ascending bound rather than skipping it so remaining levels stay aligned with their price rows.
 fn ascending_boundaries(bounds: impl Iterator<Item = i64>) -> Option<Vec<i64>> {
     let mut boundaries: Vec<i64> = Vec::new();
     for bound in bounds {
@@ -389,10 +341,9 @@ fn ascending_boundaries(bounds: impl Iterator<Item = i64>) -> Option<Vec<i64>> {
     (!boundaries.is_empty()).then_some(boundaries)
 }
 
-/// Invalidates the lookup cache in every pricing map.
+/// Lazily invalidates the lookup cache in every [`ModelPricingMap`].
 ///
-/// Existing maps observe the generation change on their next lookup and clear
-/// their own bounded LRU. No result data is stored globally.
+/// Existing maps clear their local LRU on the next lookup; no lookup results are stored globally.
 pub fn clear_pricing_cache() {
     MATCH_CACHE_GENERATION.fetch_add(1, Ordering::AcqRel);
 }
@@ -494,13 +445,10 @@ fn model_without_provider(model_name: &str) -> &str {
         .map_or(model_name, |(_, model)| model)
 }
 
-/// Placeholder names that must never take a loose price from a
-/// coincidentally-similar key (e.g. cursor-agent's literal `default`).
+/// Placeholder names excluded from substring and fuzzy matching.
 const LOOSE_MATCH_STOPLIST: [&str; 5] = ["default", "auto", "custom", "unknown", "none"];
 
-/// Minimum model-segment length for substring / fuzzy matching; anything
-/// shorter is too ambiguous to loosely price (exact and normalized matches
-/// still apply to short names like `o3`).
+/// Minimum model-segment byte length eligible for substring or fuzzy matching.
 const LOOSE_MATCH_MIN_SEGMENT_LEN: usize = 4;
 
 fn eligible_for_loose_match(model_segment: &str) -> bool {
@@ -521,12 +469,7 @@ fn provider_rank(query_provider: Option<&str>, candidate: &str) -> u8 {
     }
 }
 
-/// Normalizes model names by removing provider prefixes and version suffixes.
-///
-/// Removes patterns like:
-/// - Provider prefixes: `bedrock/`, `openai/`.
-/// - Date suffixes: `-20231201`, `-12345678` (exactly 8 ASCII digits).
-/// - Version suffixes: `-v1.0`, `-v2`.
+/// Returns `name` with any leading provider prefix (up to the first `/`) and trailing date (`-YYYYMMDD`) or numeric version (`-vN`, `-vN.M`) suffixes removed.
 ///
 /// # Examples
 ///
@@ -541,7 +484,6 @@ pub fn normalize_model_name(name: &str) -> String {
     let mut start = 0;
     let mut end = name.len();
 
-    // Remove provider prefixes (e.g., "bedrock/", "openai/") - do this first
     if let Some(idx) = name.find('/') {
         start = idx + 1;
     }
@@ -549,7 +491,6 @@ pub fn normalize_model_name(name: &str) -> String {
     loop {
         let working_slice = &name[start..end];
 
-        // Remove date suffixes only when all eight bytes are ASCII digits.
         if let Some((base, suffix)) = working_slice.rsplit_once('-')
             && suffix.len() == 8
             && suffix.bytes().all(|byte| byte.is_ascii_digit())
@@ -558,7 +499,6 @@ pub fn normalize_model_name(name: &str) -> String {
             continue;
         }
 
-        // Remove version patterns (e.g., "-v1.0", "-v2").
         if let Some((base, suffix)) = working_slice.rsplit_once("-v")
             && is_numeric_version_suffix(suffix)
         {
@@ -605,8 +545,7 @@ mod tests {
         );
         let map = ModelPricingMap::new(raw);
 
-        // `default` (cursor-agent's auto-mode placeholder) would substring
-        // match fireworks-ai-default; it must stay unpriced instead.
+        // `default` would substring-match `fireworks-ai-default`; must stay unpriced.
         let result = map.get("default");
         assert_eq!(result.pricing.input_cost_per_token, 0.0);
         assert_eq!(result.matched_model, None);
@@ -679,8 +618,6 @@ mod tests {
 
         let map = ModelPricingMap::new(raw);
 
-        // The key's 8-digit date suffix normalizes away, so the query and the
-        // key share a normalized form and never reach the looser stages.
         let result = map.get("claude-3-opus");
         assert!(result.pricing.input_cost_per_token > 0.0);
     }
@@ -694,16 +631,14 @@ mod tests {
 
         let map = ModelPricingMap::new(raw);
 
-        // `0613` is four digits, not the eight a date suffix needs, so nothing
-        // normalizes away and the price comes from the substring scan.
+        // 4-digit `-0613` is not stripped as an 8-digit date, exercising the substring scan.
         let result = map.get("gpt-4");
         assert!(result.pricing.input_cost_per_token > 0.0);
     }
 
     #[test]
     fn test_case_insensitive_match() {
-        // Case folding happens only in the loose stages, so this resolves
-        // through the substring scan rather than the exact or normalized one.
+        // Case folding runs only in the loose stages, so this resolves via substring match.
         let mut raw = HashMap::new();
         raw.insert("GPT-4".to_string(), create_test_pricing());
 
@@ -720,22 +655,19 @@ mod tests {
 
         let map = ModelPricingMap::new(raw);
 
-        // Neither name contains the other, so the substring stage finds nothing
-        // and the typo resolves on Jaro-Winkler alone (~0.98, over the 0.7 gate).
+        // No substring overlap, so this resolves via Jaro-Winkler (~0.98 >= 0.7).
         let result = map.get("claude-3-sonet");
         assert!(result.pricing.input_cost_per_token > 0.0);
     }
 
     #[test]
     fn test_get_exact_only_matches_verbatim() {
-        // get_exact must NOT normalize, substring, or fuzzy match.
         let mut raw = HashMap::new();
         raw.insert("gpt-4".to_string(), create_test_pricing());
         let map = ModelPricingMap::new(raw);
 
         assert!(map.get_exact("gpt-4").is_some());
-        // `gpt-4-turbo` and `GPT-4` resolve via get()'s substring stage and
-        // `deepseek-v4-pro` resolves to nothing; none of them is a verbatim key.
+        // Keys that `get()` would match loosely must return `None` here.
         assert!(map.get_exact("gpt-4-turbo").is_none());
         assert!(map.get_exact("deepseek-v4-pro").is_none());
         assert!(map.get_exact("GPT-4").is_none());
@@ -743,7 +675,6 @@ mod tests {
 
     #[test]
     fn test_no_match_returns_default() {
-        // Test that unmatched models return default (zero cost)
         let raw = HashMap::new();
         let map = ModelPricingMap::new(raw);
 
@@ -838,8 +769,6 @@ mod tests {
 
     #[test]
     fn test_match_priority() {
-        // An exact hit wins over the loose stages, which would also reach
-        // gpt-4-turbo.
         clear_pricing_cache();
 
         let mut raw = HashMap::new();
@@ -868,8 +797,6 @@ mod tests {
 
         let map = ModelPricingMap::new(raw);
 
-        // The 8-digit date suffix is stripped, so the query normalizes onto
-        // the bare key.
         let result = map.get("claude-3-opus-20240229");
         assert!(result.pricing.input_cost_per_token > 0.0);
     }
@@ -904,7 +831,6 @@ mod tests {
 
     #[test]
     fn test_special_characters() {
-        // Test model names with special characters
         let mut raw = HashMap::new();
         raw.insert("model/v1.0".to_string(), create_test_pricing());
         raw.insert("model:latest".to_string(), create_test_pricing());
@@ -971,10 +897,7 @@ mod tests {
         );
         let thresholds = ModelPricingMap::new(raw).tier_thresholds();
 
-        // `min_tokens` is inclusive and `TierClassifier` compares strictly
-        // greater, so a request of exactly 32_000 is row 1's first. Row 0 has
-        // no bound below it, and the top row has none above it — a request
-        // past 1M still bills there.
+        // `min_tokens` is inclusive while `TierClassifier` compares strictly greater, so each higher row emits `min_tokens - 1`.
         assert_eq!(
             thresholds.boundaries_for("qwen3-coder-plus"),
             Some(&[31_999, 127_999, 255_999][..])
@@ -998,8 +921,7 @@ mod tests {
         );
         let thresholds = ModelPricingMap::new(raw).tier_thresholds();
 
-        // Reading the previous row's `max_tokens` would put a 200k request on
-        // the top row, whose own range it never reached.
+        // Using the prior row's `max_tokens` would wrongly promote a 200k request to the top row.
         assert_eq!(
             thresholds.boundaries_for("qwen-gapped"),
             Some(&[31_999, 255_999][..])
@@ -1040,10 +962,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        // Row 2's lower bound repeats row 1's, so levels 2 and up cannot be
-        // told apart. Keeping level 1 alone under-bills the top rows; dropping
-        // the bad row instead would bill level 2's requests at row 2's prices
-        // while they belong to row 3.
+        // Row 2 repeats row 1's lower bound; stop at level 1 rather than dropping row 2 and misaligning row 3.
         assert_eq!(
             ModelPricingMap::new(raw)
                 .tier_thresholds()

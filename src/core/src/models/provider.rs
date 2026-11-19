@@ -4,11 +4,7 @@ use std::fmt;
 
 /// Supported AI coding assistant providers.
 ///
-/// Routes the per-provider usage and analysis roll-ups and labels their display
-/// rows. The assistant a session was parsed *from* is
-/// [`ExtensionType`](crate::models::ExtensionType), which has no `Unknown`;
-/// [`Provider::Unknown`] here is the fallback for a row that belongs to no
-/// known provider.
+/// Unlike [`crate::models::ExtensionType`], includes [`Provider::Unknown`] as a fallback for rows belonging to no known provider.
 ///
 /// # Examples
 ///

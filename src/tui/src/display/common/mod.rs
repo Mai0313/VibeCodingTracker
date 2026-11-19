@@ -1,10 +1,6 @@
-//! Rendering helpers shared by the `analysis` and `usage` views.
+//! Rendering helpers shared across display views.
 //!
-//! Groups the per-provider totals containers ([`averages`], [`provider`]), the
-//! frame layout and comfy-table / ratatui cell and table builders ([`table`]),
-//! the palette ([`mod@theme`]), and the TUI scaffolding ([`tui`]: terminal setup, the input event loop, and
-//! refresh / row-highlight state). All items are re-exported at this module's
-//! root so callers reach them as `crate::display::common::<item>`.
+//! Groups per-provider totals ([`averages`], [`provider`]), frame layout and comfy-table/ratatui builders ([`table`]), the color palette ([`mod@theme`]), and terminal/event/refresh scaffolding ([`tui`]). Most items are re-exported at this module root.
 
 pub mod averages;
 pub mod provider;

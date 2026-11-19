@@ -1,7 +1,6 @@
 //! Integration tests for the persistent settings file (`~/.vct/config.toml`).
 //!
-//! Every case is rooted at a `TempHome`'s `~/.vct` via the `config::*_in` seams,
-//! so nothing touches the real home directory or process environment.
+//! Every case is rooted at a `TempHome`'s `~/.vct` via the `config::*_in` seams, so nothing touches the real home directory or process environment.
 
 use std::fs;
 use vct_core::TimeRange;
@@ -22,7 +21,6 @@ fn load_in_creates_default_commented_file_when_absent() {
     assert!(cfg.general.auto_update);
     assert!(cfg.usage.shows_quota_panel("cursor"));
     assert!(cfg.usage.merge_models);
-    // New sections default sensibly.
     assert!(cfg.providers.cursor);
     assert!(cfg.providers.grok);
     assert_eq!(cfg.usage.refresh_interval, 10);
@@ -51,8 +49,6 @@ fn load_in_creates_default_commented_file_when_absent() {
 
 #[test]
 fn first_run_leaves_existing_version_record_untouched() {
-    // The self-update record (`version/vct.json`) is a separate concern from
-    // the settings file; creating config.toml must not touch or fold it in.
     let th = TempHome::new();
     let dir = &th.paths.cache_dir;
     let record = dir.join("version").join("vct.json");
@@ -82,15 +78,13 @@ fn save_setting_merge_models_round_trips_and_preserves_comments() {
 
     let cfg = config::load_in(dir);
     assert!(!cfg.usage.merge_models);
-    assert!(cfg.usage.shows_quota_panel("cursor")); // untouched
+    assert!(cfg.usage.shows_quota_panel("cursor"));
 
     let text = fs::read_to_string(dir.join("config.toml")).unwrap();
     assert!(text.contains("merge_models = false"));
-    // The edit is format-preserving, so comments stay put.
     assert!(text.contains("# Which live quota panels to show"));
     assert!(text.contains("[providers]"));
-    // The `#:schema` directive must survive the write-back, or the Settings tab
-    // would strip editor validation from the file.
+    // The `#:schema` directive must survive the write-back, or the Settings tab would strip editor validation from the file.
     assert!(text.starts_with("#:schema "));
 }
 
@@ -98,8 +92,6 @@ fn save_setting_merge_models_round_trips_and_preserves_comments() {
 fn save_setting_survives_malformed_usage_section() {
     use vct_core::config::SettingValue;
 
-    // A hand-edited file where `usage` is a scalar must not panic the write
-    // from the Settings tab; the section is repaired to a table.
     let th = TempHome::new();
     let dir = &th.paths.cache_dir;
     fs::create_dir_all(dir).unwrap();
@@ -117,9 +109,7 @@ fn save_setting_survives_malformed_usage_section() {
 fn save_setting_preserves_an_inline_usage_table() {
     use vct_core::config::SettingValue;
 
-    // A valid inline-table `[usage]` must NOT be wiped on write: its sibling
-    // keys have to survive the write-back (regression — `is_table()` misses inline
-    // tables, so the guard must use `is_table_like()`).
+    // Inline `[usage]` tables must keep sibling keys on write-back (`is_table()` misses inline tables, so the guard uses `is_table_like()`).
     let th = TempHome::new();
     let dir = &th.paths.cache_dir;
     fs::create_dir_all(dir).unwrap();
@@ -133,9 +123,7 @@ fn save_setting_preserves_an_inline_usage_table() {
 
     let cfg = config::load_in(dir);
     assert!(cfg.usage.merge_models);
-    // The other inline keys must not be lost / reverted to defaults; the legacy
-    // `quota_panels` / `refresh_interval_secs` names are honored via the read-time
-    // migration shim (an inline `usage` table is left for it, not restructured).
+    // Sibling inline keys survive write-back; legacy `quota_panels` and `refresh_interval_secs` names are honored by the read-time migration shim because an inline `usage` table is not restructured.
     assert_eq!(cfg.usage.quota.panels, vec!["claude".to_string()]);
     assert_eq!(cfg.usage.refresh_interval, 30);
 }
@@ -145,8 +133,7 @@ fn existing_current_file_is_parsed_and_left_in_place() {
     let th = TempHome::new();
     let dir = &th.paths.cache_dir;
     fs::create_dir_all(dir).unwrap();
-    // Already in the current format (new keys + `#:schema` + version marker), so
-    // load must not rewrite it.
+    // Already in the current schema (`#:schema` + current `version`), so `load_in` must not rewrite it.
     let original = "#:schema https://example.test/vct.schema.json\n[general]\ndefault_time_range = \"weekly\"\nauto_update = false\nversion = 4\n\n[usage]\nmerge_models = true\n\n[usage.quota]\npanels = [\"claude\"]\n\n[providers]\ncursor = false\n";
     fs::write(dir.join("config.toml"), original).unwrap();
 
@@ -156,11 +143,9 @@ fn existing_current_file_is_parsed_and_left_in_place() {
     assert!(cfg.usage.merge_models);
     assert!(cfg.usage.shows_quota_panel("claude"));
     assert!(!cfg.usage.shows_quota_panel("cursor"));
-    // A missing provider key still defaults to true; the given one is honored.
     assert!(!cfg.providers.cursor);
     assert!(cfg.providers.claude);
     assert!(cfg.providers.grok);
-    // A current file is byte-for-byte untouched.
     assert_eq!(
         fs::read_to_string(dir.join("config.toml")).unwrap(),
         original
@@ -194,8 +179,7 @@ fn load_in_migrates_a_legacy_file_in_place() {
     fs::write(dir.join("config.toml"), legacy).unwrap();
 
     let cfg = config::load_in(dir);
-    // The user's values are honored through the migration, and a panel that
-    // shipped after this file was written is back-filled once.
+    // The user's values survive migration, and quota panels added in later versions are back-filled once.
     assert_eq!(
         cfg.usage.quota.panels,
         vec![
@@ -208,7 +192,6 @@ fn load_in_migrates_a_legacy_file_in_place() {
     assert_eq!(cfg.analysis.refresh_interval, 20);
     assert!(cfg.general.auto_update);
 
-    // The file on disk is upgraded to the current layout.
     let text = fs::read_to_string(dir.join("config.toml")).unwrap();
     assert!(text.starts_with("#:schema "));
     assert!(text.contains("[usage.quota]"));
@@ -216,7 +199,6 @@ fn load_in_migrates_a_legacy_file_in_place() {
     assert!(!text.contains("refresh_interval_secs"));
     assert!(text.contains("auto_update = true"));
 
-    // A second load leaves the now-current file untouched.
     config::load_in(dir);
     assert_eq!(fs::read_to_string(dir.join("config.toml")).unwrap(), text);
 }
@@ -282,10 +264,7 @@ fn load_read_only_in_never_writes_or_creates_config() {
 
 #[test]
 fn load_in_does_not_reset_config_on_a_malformed_legacy_refresh_value() {
-    // A legacy `refresh_interval_secs` holding a non-u64 value must not be promoted
-    // into the typed field: doing so would make the migrated file fail to parse and
-    // silently reset EVERY setting. Instead the bad value is dropped, its default
-    // applies, and every other setting survives.
+    // Promoting a non-u64 legacy `refresh_interval_secs` would make the migrated file fail to parse and reset every setting; instead, drop the bad value so its default applies and sibling settings survive.
     let th = TempHome::new();
     let dir = &th.paths.cache_dir;
     fs::create_dir_all(dir).unwrap();
@@ -298,11 +277,10 @@ fn load_in_does_not_reset_config_on_a_malformed_legacy_refresh_value() {
     let cfg = config::load_in(dir);
     assert_eq!(cfg.general.default_time_range, TimeRange::Weekly);
     assert!(!cfg.providers.cursor);
-    assert_eq!(cfg.usage.refresh_interval, 10); // dropped -> default
+    assert_eq!(cfg.usage.refresh_interval, 10);
 
     let text = fs::read_to_string(dir.join("config.toml")).unwrap();
     assert!(!text.contains("refresh_interval = -5"));
-    // The file is now current; a second load does not rewrite it.
     config::load_in(dir);
     assert_eq!(fs::read_to_string(dir.join("config.toml")).unwrap(), text);
 }
@@ -315,19 +293,16 @@ fn migrate_config_file_reports_status() {
     fs::create_dir_all(dir).unwrap();
     let path = dir.join("config.toml");
 
-    // Absent -> a fresh default is created.
     assert_eq!(
         config::migrate_config_file(&path).unwrap(),
         MigrationStatus::Created
     );
     assert!(path.exists());
-    // The generated default is already current.
     assert_eq!(
         config::migrate_config_file(&path).unwrap(),
         MigrationStatus::AlreadyCurrent
     );
 
-    // A legacy file is migrated once, then reports current.
     fs::write(
         &path,
         "[usage]\nquota_panels = [\"claude\"]\nrefresh_interval_secs = 15\n",
@@ -390,7 +365,6 @@ fn a_setting_is_read_changed_and_saved_by_its_path() {
     assert_eq!(reloaded.usage.quota.refresh_interval, 90);
     assert_eq!(reloaded.usage.quota.panels, vec!["codex".to_string()]);
     assert_eq!(reloaded.general.default_time_range, TimeRange::Weekly);
-    // The generated comments are still there.
     let text = fs::read_to_string(dir.join("config.toml")).unwrap();
     assert!(text.contains("# Seconds between live quota-panel polls"));
 }
@@ -418,7 +392,7 @@ fn a_setting_is_saved_into_a_file_that_lacks_its_section() {
     let hosts = SettingValue::List(vec!["box".to_string()]);
     let poll = SettingValue::Integer(120);
 
-    // A file written before `[remotes]` existed, and with no `[usage.quota]`.
+    // Missing `[remotes]` and `[usage.quota]` tables.
     fs::write(dir.join("config.toml"), "[usage]\nmerge_models = true\n").unwrap();
     config::save_setting_in(dir, &["remotes", "hosts"], &hosts).unwrap();
     config::save_setting_in(dir, &["usage", "quota", "refresh_interval"], &poll).unwrap();
@@ -457,8 +431,7 @@ fn general_layout_saves_and_tolerates_removed_layout_names() {
     .unwrap();
     assert_eq!(config::load_in(dir).general.layout, "simple");
 
-    // A layout deleted in a later release must not fail config parsing or reset
-    // sibling settings; the TUI resolves unknown names to the default layout.
+    // A layout deleted in a later release must not fail config parsing or reset sibling settings; the TUI resolves unknown names to the default layout.
     fs::write(
         dir.join("config.toml"),
         "#:schema x\n[general]\nlayout = \"removed_experimental_layout\"\ndefault_time_range = \"weekly\"\nversion = 4\n",

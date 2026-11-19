@@ -1,11 +1,6 @@
-//! The on-disk shape of one provider's ledger file, and the fold helpers that
-//! build its per-day entries from parsed sessions.
+//! On-disk shape of a provider's ledger file and the fold helpers that build per-day entries from parsed sessions.
 //!
-//! Every value here is either something a provider recorded (a token bucket in
-//! the provider's own key shape, a stored cost) or a plain count, so a view for
-//! any time range is a filter on the day key followed by addition. Nothing
-//! priced is ever written: cost is computed at display time from the current
-//! pricing map.
+//! Every value is either raw provider data (a token bucket in the provider's own key shape, a stored cost) or a plain count, so any time-range view reduces to filtering by day key and summing. Priced costs are never written; pricing is computed at display time from the current pricing map.
 
 use super::tiny_map::TinyMap;
 use crate::constants::FastHashMap;
@@ -17,8 +12,7 @@ use serde_json::Value;
 use serde_json::value::{RawValue, to_raw_value};
 use std::collections::BTreeMap;
 
-/// Version of the file layout below. A file carrying a newer version is left
-/// untouched and never written; there is no older version to migrate yet.
+/// Schema version of the on-disk ledger format; files with a newer version are left untouched.
 pub(crate) const SCHEMA_VERSION: u32 = 1;
 
 /// One provider's ledger file.
@@ -26,23 +20,20 @@ pub(crate) const SCHEMA_VERSION: u32 = 1;
 pub(crate) struct LedgerFile {
     pub(crate) schema_version: u32,
     pub(crate) provider: String,
-    /// Whole-database stamps for the providers whose sessions all live in one
-    /// SQLite file (OpenCode, Hermes); absent for every other provider.
+    /// Whole-database read stamps for single-SQLite providers (OpenCode, Hermes); absent for other providers.
     #[serde(default, skip_serializing_if = "HalfStamps::is_empty")]
     pub(crate) source: HalfStamps,
     #[serde(default)]
     pub(crate) sessions: BTreeMap<String, SessionEntry>,
 }
 
-/// Just the version, so a file this build cannot decode can still say why.
+/// Minimal header decoded to inspect `schema_version` when full deserialization fails.
 #[derive(Deserialize)]
 pub(crate) struct LedgerHeader {
     pub(crate) schema_version: u32,
 }
 
-/// The two features' read stamps for one source, kept apart because a
-/// database source is read by two different queries at different costs, so one
-/// half can be current while the other is stale.
+/// Independent `usage` and `analysis` read stamps for one source, allowing either half to be current while the other is stale.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct HalfStamps {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -70,14 +61,13 @@ impl HalfStamps {
         }
     }
 
-    /// Whether `feature`'s half was read from exactly what `current` describes.
+    /// Returns whether `feature`'s half matches `current`.
     pub(crate) fn is_current(&self, feature: ScanFeature, current: &ScanStamp) -> bool {
         self.half(feature)
             .is_some_and(|stamp| stamp.is_current(feature, current))
     }
 
-    /// Allocation-free [`Self::is_current`] fast path for providers whose read
-    /// stamp holds only the discovered file itself.
+    /// Returns whether `feature`'s half matches `file` and `tiers` without allocating (fast path of [`Self::is_current`] for single-file providers).
     pub(crate) fn is_current_single_file(
         &self,
         feature: ScanFeature,
@@ -88,8 +78,7 @@ impl HalfStamps {
             .is_some_and(|stamp| stamp.matches_single_file(feature, file, tiers))
     }
 
-    /// Drops the retained diagnostics; a source that is gone can no longer be
-    /// re-read, so its parse verdict has nothing left to say.
+    /// Clears retained failure diagnostics on both halves.
     pub(crate) fn clear_failures(&mut self) {
         for stamp in [self.usage.as_mut(), self.analysis.as_mut()]
             .into_iter()
@@ -100,32 +89,26 @@ impl HalfStamps {
     }
 }
 
-/// Which feature is scanning, and therefore which half of an entry it reads
-/// and writes.
+/// Feature performing a scan, selecting which half of an entry is read and written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScanFeature {
     Usage,
     Analysis,
 }
 
-/// What one read of a source saw: the build that read it, the tier snapshot it
-/// classified against, every file the result depends on, and how the read went.
+/// Provenance and outcome of one source read: parser version, tier snapshot, dependency file stamps, and read verdict.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ScanStamp {
     pub(crate) parser: String,
-    /// Fingerprint of the context-tier snapshot the usage half classified
-    /// against; `None` when it classified nothing. The analysis half never
-    /// carries one.
+    /// Context-tier snapshot fingerprint used by the usage half; always `None` for analysis or unclassified scans.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) tiers: Option<String>,
-    /// Every file the read depended on, by name; `None` is an optional sidecar
-    /// that did not exist.
+    /// Dependency files keyed by name; `None` records an absent optional sidecar.
     pub(crate) files: TinyMap<String, Option<FileStamp>>,
     /// Whether the read produced usable data (a valid blank source included).
     #[serde(default = "default_true", skip_serializing_if = "Clone::clone")]
     pub(crate) parsed: bool,
-    /// The retained diagnostic for a present source: a partial-parse reason
-    /// beside its data, or the reason a read produced nothing.
+    /// Retained parse diagnostic for a present source (either a partial-parse note or the reason no data was produced).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) failure: Option<String>,
 }
@@ -135,7 +118,7 @@ fn default_true() -> bool {
 }
 
 impl ScanStamp {
-    /// A stamp for a read this build is about to do.
+    /// Creates a stamp for a pending read by the current build.
     pub(crate) fn new(tiers: Option<String>, files: TinyMap<String, Option<FileStamp>>) -> Self {
         Self {
             parser: crate::VERSION.to_string(),
@@ -146,19 +129,14 @@ impl ScanStamp {
         }
     }
 
-    /// The same stamp with its read verdict filled in.
+    /// Returns this stamp with `parsed` and `failure` populated.
     pub(crate) fn with_verdict(mut self, parsed: bool, failure: Option<String>) -> Self {
         self.parsed = parsed;
         self.failure = failure;
         self
     }
 
-    /// Whether a read described by `current` would see what this stamp saw.
-    ///
-    /// The analysis half ignores the tier snapshot: file-operation counts do
-    /// not depend on it, so an entry a usage scan wrote still serves an
-    /// analysis scan and vice versa, while a usage scan with a different
-    /// snapshot has to re-read.
+    /// Returns whether `current` matches this stamp for `feature`; [`ScanFeature::Analysis`] ignores `tiers`.
     pub(crate) fn is_current(&self, feature: ScanFeature, current: &ScanStamp) -> bool {
         self.files == current.files
             && self.parser == current.parser
@@ -204,32 +182,23 @@ pub(crate) struct FileStamp {
 /// One session: its read stamps, where it ran, and what it did per day.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub(crate) struct SessionEntry {
-    /// Read stamps for a session that is its own source (a file, a Cursor
-    /// store). A session inside a shared database has none; its provider's
-    /// `source` stamps cover it.
+    /// Per-session read stamps for standalone sources (files, Cursor stores); empty for shared-database sessions covered by [`LedgerFile::source`].
     #[serde(default, skip_serializing_if = "HalfStamps::is_empty")]
     pub(crate) scanned: HalfStamps,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) git_remote: Option<String>,
-    /// Keyed by local `YYYY-MM-DD`. A file session has exactly one day, the
-    /// date of its last modification; a database session has one per day it
-    /// was active.
+    /// Per-day entries keyed by local `YYYY-MM-DD` (one day for file sessions, one per active day for database sessions).
     #[serde(default)]
     pub(crate) days: TinyMap<String, DayEntry>,
-    /// Local date on which the source was first found to be gone. Cleared if
-    /// it comes back.
+    /// Local date (`YYYY-MM-DD`) when the source was first observed missing; cleared if it reappears.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) missing_since: Option<String>,
 }
 
 impl SessionEntry {
-    /// Builds a file session's entry from one parse.
-    ///
-    /// One parse yields both halves, so both are stamped. The usage half keeps
-    /// the snapshot the parse classified against (`None` for an analysis
-    /// scan, which classifies nothing); the analysis half never carries one.
+    /// Builds a file session's entry from one parse, stamping both halves (with `tiers` kept only on the usage stamp).
     pub(crate) fn from_file_parse(
         analysis: Option<CodeAnalysis>,
         emit: bool,
@@ -256,15 +225,9 @@ impl SessionEntry {
         entry
     }
 
-    /// Replaces `feature`'s half of this whole session with `days`, leaving
-    /// the other half untouched.
+    /// Replaces `feature`'s half across all days with `days`, leaving the other half untouched.
     ///
-    /// The half is replaced across every day, not merged day by day: a
-    /// database row can be cumulative and re-dated (a Hermes per-model row
-    /// carries the session's running total under its latest `last_seen`), so
-    /// keeping a day the re-read no longer produced would count that total
-    /// twice. Retention is per session; a session the read still returns is
-    /// exactly what the read says it is.
+    /// Clears prior days for `feature` rather than merging day by day: cumulative database rows (such as Hermes per-model totals) can move to a later date.
     pub(crate) fn replace_half(&mut self, feature: ScanFeature, days: TinyMap<String, DayEntry>) {
         for day in self.days.values_mut() {
             day.clear_half(feature);
@@ -286,13 +249,7 @@ fn non_empty(value: &str) -> Option<String> {
 /// What one session did on one local day.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub(crate) struct DayEntry {
-    /// Per-model token buckets in the provider's own key shape, merged across
-    /// the day's records exactly as the usage roll-up merges them.
-    ///
-    /// Held as the JSON text they serialize to rather than as parsed trees:
-    /// a whole ledger sits in memory for every refresh, a parsed object costs
-    /// several times its text, and a fold re-parses a few hundred bytes per
-    /// model in microseconds.
+    /// Per-model token buckets in the provider's raw key shape, stored as raw JSON text to keep the in-memory ledger compact.
     #[serde(default, skip_serializing_if = "TinyMap::is_empty")]
     pub(crate) usage: TinyMap<String, Box<RawValue>>,
     /// Per-model file-operation and tool-call counters.
@@ -305,11 +262,7 @@ pub(crate) struct DayEntry {
     pub(crate) active: ActiveFlags,
 }
 
-/// Whether the day counts as an active day for each feature.
-///
-/// Usage needs tokens or a stored cost; analysis needs only that the session
-/// was emitted, which is why it cannot be derived from the counters (a session
-/// that ran no tool is still a day the assistant was used).
+/// Per-feature active-day flags; `usage` requires non-zero tokens or stored cost, while `analysis` is true for any emitted session even with zero tool calls.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ActiveFlags {
     #[serde(default)]
@@ -319,20 +272,12 @@ pub(crate) struct ActiveFlags {
 }
 
 impl DayEntry {
-    /// One model's buckets as a value the roll-up can merge.
-    ///
-    /// Text that no longer parses (a hand-edited file) folds as nothing
-    /// rather than failing the scan.
+    /// Parses a stored raw usage entry back into a [`Value`], returning [`Value::Null`] on malformed JSON.
     pub(crate) fn usage_value(raw: &RawValue) -> Value {
         serde_json::from_str(raw.get()).unwrap_or(Value::Null)
     }
 
-    /// Folds one parsed file session, both halves at once.
-    ///
-    /// Every model in a record's `conversation_usage` is credited with the
-    /// record's whole counters, except a `<synthetic>` placeholder, and
-    /// advisor usage joins the token map under the advisor's own model
-    /// without any counters, since an advisor never runs a tool.
+    /// Folds a parsed file session into both halves; every non-`<synthetic>` model in `conversation_usage` receives the record's tool counters, while `advisor_usage` contributes tokens only.
     pub(crate) fn add_file_records(&mut self, analysis: CodeAnalysis, emit: bool) {
         for record in analysis.records {
             for (model, usage) in record.conversation_usage {
@@ -367,12 +312,7 @@ impl DayEntry {
         }
     }
 
-    /// Folds one database usage row into the usage half.
-    ///
-    /// `stored_cost` is `None` for a provider that prices none of its rows
-    /// (Cursor). One that does is recorded even when it is zero, matching the
-    /// uncached roll-up, whose per-model cost map carries a `0.0` entry for a
-    /// model the provider priced at nothing.
+    /// Folds one database usage row into the usage half; `Some(0.0)` for `stored_cost` is recorded, while `None` omits the entry for unpriced providers.
     pub(crate) fn add_usage_row(
         &mut self,
         model: String,

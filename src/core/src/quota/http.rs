@@ -1,10 +1,6 @@
-//! Shared HTTP helpers for the quota fetchers.
+//! Shared HTTP client construction, opt-in CLI version detection, and ISO-8601 timestamp helpers for quota fetchers.
 //!
-//! One blocking client is built without a default `User-Agent` and shared
-//! across the provider workers; each request sets its own UA. The version those
-//! User-Agents carry comes from [`detect_cli_version`], which probes the
-//! installed provider CLIs only once the binary opts in. Also holds the
-//! ISO-timestamp conversion used by the fetchers.
+//! The shared blocking client omits a default `User-Agent` so each request sets its own. [`detect_cli_version`] returns each caller's fallback until [`enable_cli_version_detection`] is called.
 
 use crate::utils::get_version_cache_path_in;
 use anyhow::{Context, Result};
@@ -12,13 +8,10 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Version of the on-disk shape below. A file carrying any other version is
-/// ignored and the CLI re-probed, the same fail-safe the quota snapshot cache
-/// applies to its own files.
+/// On-disk schema version for [`CliVersionCache`]; mismatched files are ignored and re-probed.
 const SCHEMA_VERSION: u32 = 1;
 
-/// One provider's `~/.vct/version/<provider>.json`: the installed CLI's version
-/// and when it was last probed.
+/// On-disk record at `~/.vct/version/<provider>.json` caching a probed CLI version and its probe timestamp.
 #[derive(Serialize, Deserialize)]
 struct CliVersionCache {
     schema_version: u32,
@@ -27,17 +20,12 @@ struct CliVersionCache {
     last_checked_at: String,
 }
 
-/// Whether this process may probe the installed provider CLIs for their
-/// versions. Off until [`enable_cli_version_detection`] turns it on.
+/// Process-wide gate enabling CLI `--version` probing via [`enable_cli_version_detection`].
 static CLI_VERSION_DETECTION: AtomicBool = AtomicBool::new(false);
 
-/// Lets [`detect_cli_version`] probe the installed CLIs for this process.
+/// Enables CLI version probing for [`detect_cli_version`] in this process.
 ///
-/// Probing spawns `<bin> --version` and caches the answer under `~/.vct` —
-/// side effects that belong to the application rather than to a library call,
-/// so `vct-core` keeps them off until the binary opts in (once, before
-/// dispatch). Any other embedder — including the test suite — gets each
-/// provider's fallback version without a subprocess or a home directory write.
+/// Probing spawns `<bin> --version` and writes `~/.vct/version/<provider>.json`. Library callers that do not opt in always receive the fallback version without subprocesses or filesystem writes.
 pub fn enable_cli_version_detection() {
     CLI_VERSION_DETECTION.store(true, Ordering::Relaxed);
 }
@@ -47,12 +35,9 @@ fn cli_version_detection_enabled() -> bool {
     CLI_VERSION_DETECTION.load(Ordering::Relaxed)
 }
 
-/// Detects an installed CLI's version by running `<bin> --version`, caching the
-/// result under `~/.vct/version/<provider>.json` for the day so it is not re-run
-/// on every launch. Falls back to `fallback` when the CLI is absent or
-/// unreadable, so the User-Agent it feeds is always a plausible client version —
-/// and returns that same fallback outright until
-/// [`enable_cli_version_detection`] is called.
+/// Returns the installed version of `bin` for `provider`, or `fallback` if unavailable or probing is disabled.
+///
+/// Runs `<bin> --version` at most once per UTC day and caches the result under `~/.vct/version/<provider>.json`. Always returns `fallback` until [`enable_cli_version_detection`] is called.
 pub fn detect_cli_version(bin: &str, provider: &str, fallback: &str) -> String {
     if !cli_version_detection_enabled() {
         return fallback.to_string();
@@ -67,23 +52,19 @@ pub fn detect_cli_version(bin: &str, provider: &str, fallback: &str) -> String {
     fallback.to_string()
 }
 
-/// Extracts the first version-shaped token (`2.1.201`, `0.142.5`) from a CLI's
-/// `--version` output, tolerating a leading program name (`codex-cli 0.142.5`)
-/// or a trailing label (`2.1.201 (Claude Code)`).
+/// Returns the first whitespace-delimited token starting with an ASCII digit and containing `.` (for example `2.1.201` from `2.1.201 (Claude Code)` or `codex-cli 0.142.5`).
 pub fn parse_version(raw: &str) -> Option<String> {
     raw.split_whitespace()
         .find(|t| t.starts_with(|c: char| c.is_ascii_digit()) && t.contains('.'))
         .map(str::to_string)
 }
 
-/// Reads a provider's version cache, returning the version only if it was
-/// stamped earlier on the current UTC day.
+/// Returns `provider`'s cached CLI version if stamped on the current UTC day.
 fn read_cached_version(provider: &str) -> Option<String> {
     read_cached_version_in(&crate::utils::get_cache_dir().ok()?, provider)
 }
 
-/// The injectable core of [`read_cached_version`]: reads from an explicit cache
-/// directory. Production passes `~/.vct`; tests pass a temp dir.
+/// Injectable core of [`read_cached_version`] reading from cache root `dir`.
 fn read_cached_version_in(dir: &Path, provider: &str) -> Option<String> {
     let text = std::fs::read_to_string(get_version_cache_path_in(dir, provider)).ok()?;
     let cached: CliVersionCache = serde_json::from_str(&text).ok()?;
@@ -98,8 +79,7 @@ fn write_cached_version(provider: &str, version: &str) -> Result<()> {
     write_cached_version_in(&crate::utils::get_cache_dir()?, provider, version)
 }
 
-/// The injectable core of [`write_cached_version`], writing into an explicit
-/// cache directory.
+/// Injectable core of [`write_cached_version`] writing into cache root `dir`.
 fn write_cached_version_in(dir: &Path, provider: &str, version: &str) -> Result<()> {
     crate::utils::write_json_atomic(
         get_version_cache_path_in(dir, provider),
@@ -122,26 +102,20 @@ fn run_cli_version(bin: &str) -> Option<String> {
     parse_version(&String::from_utf8_lossy(&output.stdout))
 }
 
-/// Whether `ts` (an RFC3339 timestamp) falls on the current UTC calendar day.
-///
-/// The version cache stores a full RFC3339 nanosecond stamp but is only
-/// refreshed once per day, so staleness is decided on the UTC date alone. An
-/// unparseable stamp reads as stale so the version is re-detected.
+/// Returns whether RFC3339 timestamp `ts` falls on the current UTC calendar day, or `false` if unparseable.
 fn is_today_utc(ts: &str) -> bool {
     chrono::DateTime::parse_from_rfc3339(ts)
         .map(|dt| dt.with_timezone(&chrono::Utc).date_naive() == chrono::Utc::now().date_naive())
         .unwrap_or(false)
 }
 
-/// Builds the shared blocking HTTP client (8s timeout, no default UA).
+/// Builds the shared blocking HTTP client with an 8-second timeout and no default `User-Agent`.
 ///
-/// The UA is intentionally left unset so each request can supply its own via a
-/// header; setting it on both the client and the request would send a duplicate
-/// `User-Agent`.
+/// Each request sets its own `User-Agent` header; leaving the client default unset prevents duplicate `User-Agent` headers.
 ///
 /// # Errors
 ///
-/// Returns an error if the client cannot be constructed.
+/// Returns an error if the underlying `reqwest` client cannot be constructed.
 pub fn build_client() -> Result<reqwest::blocking::Client> {
     reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(8))
@@ -149,11 +123,7 @@ pub fn build_client() -> Result<reqwest::blocking::Client> {
         .context("Failed to build HTTP client")
 }
 
-/// Parses an ISO-8601 timestamp into Unix **seconds**, or `None` on failure.
-///
-/// [`crate::utils::parse_iso_timestamp`] returns Unix *milliseconds* and `0` on
-/// failure; this divides by 1000 and maps `0` to `None` so a bad timestamp
-/// renders as "no reset" rather than the epoch.
+/// Parses an ISO-8601 timestamp into Unix seconds, returning `None` on parse failure or non-positive timestamps.
 pub fn iso_to_unix_secs(s: &str) -> Option<i64> {
     let ms = crate::utils::parse_iso_timestamp(s);
     (ms > 0).then_some(ms / 1000)
@@ -177,8 +147,7 @@ mod tests {
         assert!(!is_today_utc("not-a-timestamp"));
     }
 
-    /// Nothing in the suite may enable probing: it would spawn a provider CLI
-    /// and write into the developer's real `~/.vct`.
+    /// Keeps probing disabled under test so no provider CLI is spawned and `~/.vct` is untouched.
     #[test]
     fn cli_version_detection_stays_off_outside_the_binary() {
         assert!(!cli_version_detection_enabled());
@@ -196,8 +165,7 @@ mod tests {
             Some("0.2.112")
         );
 
-        // The seed carries this build's own schema and provider, so the stale
-        // date is the only thing left that can reject it.
+        // Same schema and provider so only the stale date triggers rejection.
         std::fs::write(
             get_version_cache_path_in(dir.path(), "grok"),
             serde_json::to_string(&CliVersionCache {
@@ -212,8 +180,7 @@ mod tests {
         assert_eq!(read_cached_version_in(dir.path(), "grok"), None);
     }
 
-    /// The record lands under `version/<provider>.json`, and one written by a
-    /// different schema or naming another provider is ignored rather than served.
+    /// Verifies the file path and that mismatched schema versions or provider names are ignored.
     #[test]
     fn version_cache_is_scoped_by_path_schema_and_provider() {
         let dir = tempfile::tempdir().unwrap();

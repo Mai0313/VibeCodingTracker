@@ -1,9 +1,6 @@
-//! The one-shot `usage` scan policy, shared by every non-interactive frontend.
+//! Pricing-first one-shot `usage` scan pipeline.
 //!
-//! [`scan_usage_priced`] fetches pricing first (so per-request context-tier
-//! classification has its thresholds), degrades to base-rate classification
-//! when that fetch fails, and runs the scan on the caller's pool. It lives in
-//! core so a non-CLI backend runs the same pipeline instead of re-deriving it.
+//! [`scan_usage_priced`] fetches pricing to derive context-tier thresholds, degrades to base-rate classification on fetch failure, and runs the scan on the caller's Rayon pool.
 
 use crate::config::ProvidersConfig;
 use crate::models::TimeRange;
@@ -21,23 +18,17 @@ pub struct PricedUsageScan {
     pub collection: UsageCollection,
     /// The pricing map used for tier classification; empty when the fetch failed.
     pub pricing: ModelPricingMap,
-    /// The pricing-fetch error when it degraded to an empty map (costs
-    /// unavailable); `None` on success.
+    /// Pricing-fetch error message when degraded to an empty map, or `None` on success.
     pub pricing_error: Option<String>,
 }
 
-/// Fetches pricing, derives the context-tier thresholds, and scans usage.
+/// Fetches model pricing, derives context-tier thresholds, and runs a usage scan on `pool`.
 ///
-/// A failed pricing fetch is logged and downgraded to an empty map (the scan
-/// still runs, classifying every request at the base rate) rather than aborting;
-/// the returned [`PricedUsageScan::pricing_error`] carries the concrete cause.
-/// The scan runs on `pool` so it never touches Rayon's global pool.
+/// Pricing fetch failures are logged and degraded to an empty [`ModelPricingMap`] (classifying all requests at base rates) with the error recorded in [`PricedUsageScan::pricing_error`]. Execution stays isolated to `pool` without initializing Rayon's global pool.
 ///
 /// # Errors
 ///
-/// Returns an error only when the provider paths cannot be resolved (e.g. the
-/// home directory is unavailable). Pricing failures degrade instead of erroring,
-/// and an unreadable source is recorded in the collection's diagnostics.
+/// Returns an error if provider paths cannot be resolved. Source read failures are recorded in [`UsageCollection::diagnostics`] instead.
 pub fn scan_usage_priced(
     time_range: TimeRange,
     providers: ProvidersConfig,

@@ -1,11 +1,6 @@
-//! The ledger scan of a provider whose sessions all live in one SQLite
-//! database (OpenCode, Hermes).
+//! Ledger-backed scanner for single-database providers (OpenCode and Hermes).
 //!
-//! One read produces every session at once, so the read stamp lives on the
-//! provider rather than on each session: when it is current every session is
-//! folded from the ledger, and when it is stale the whole database is
-//! re-read, each returned session's `feature` half replaced whole, and a
-//! session the read no longer returns is marked missing and kept.
+//! One query returns every session, placing the scan stamp on the provider book rather than individual sessions. Stale reads replace each returned session's `feature` half and mark unreturned sessions missing while retaining their history.
 
 use super::compact::{CompactSink, cutoff_string, fold_days};
 use super::{ScanDiagnostics, ScanFeature};
@@ -35,12 +30,7 @@ pub(crate) struct SessionRead {
     pub(crate) days: TinyMap<String, DayEntry>,
 }
 
-/// Groups a usage read's rows by session and day.
-///
-/// `noun` names the rows in the failure reason (`usage records`, `Cursor usage
-/// payloads`), which the CLI shows verbatim. `records_cost` says whether the
-/// provider prices its own rows (OpenCode, Hermes); a provider that does not
-/// (Cursor) gets no stored-cost map written at all.
+/// Groups a [`DatabaseUsageRead`] by session and day, formatting schema-failure messages with `noun` and recording stored costs only when `records_cost` is true.
 pub(crate) fn group_usage_rows(
     read: DatabaseUsageRead,
     noun: &str,
@@ -105,8 +95,7 @@ pub(crate) fn group_analysis_rows(
     }
 }
 
-/// Reads OpenCode's analysis half in `UsageOnly` mode and groups it into a
-/// [`DatabaseHalfRead`].
+/// Reads OpenCode's analysis half in `UsageOnly` mode and groups it into a [`DatabaseHalfRead`].
 pub(crate) fn read_opencode_analysis_half(db_path: &Path) -> Result<DatabaseHalfRead> {
     let read = crate::session::opencode::read_opencode_analysis_with_diagnostics(
         db_path,
@@ -130,12 +119,9 @@ pub(crate) fn read_opencode_analysis_half(db_path: &Path) -> Result<DatabaseHalf
     Ok(group_analysis_rows(read.rows, !complete_failure, failure))
 }
 
-/// Scans one whole-database provider's `feature` half through the ledger.
+/// Scans one single-database provider's `feature` half through `ledger`, invoking `read` only when stale.
 ///
-/// `read` runs only when the database's stamp is stale; it must read every
-/// session regardless of time range, since the range is applied to the folded
-/// days. A database that is not there marks every session missing and folds
-/// them all, so uninstalling the assistant loses nothing.
+/// `read` must return sessions across all time; `time_range` is applied during folding, and a missing database marks all cached sessions missing while continuing to fold them.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn scan_database_half<R>(
     provider: ExtensionType,
@@ -173,11 +159,7 @@ pub(crate) fn scan_database_half<R>(
         }
     };
 
-    // Whether this scan's sessions come from a read that succeeded (now or
-    // when the stamp was written) rather than from the ledger alone. A
-    // database that exists but cannot be read still serves what it held: the
-    // sessions are real usage, and they count as retained rather than parsed
-    // so the scan neither reads as all-failed nor claims a read it did not get.
+    // Track whether data came from a valid read; unreadable DBs still serve cached sessions as `retained` rather than `parsed` so the scan neither reports all-failed nor claims a fresh read.
     let read_ok;
     if let Some(stamp) = book.source.half(feature)
         && stamp.is_current(feature, &current)
@@ -203,8 +185,7 @@ pub(crate) fn scan_database_half<R>(
                     entry.replace_half(feature, session.days);
                     entry.missing_since = None;
                 }
-                // A read that understood nothing says nothing about which
-                // sessions are still there, so it marks none of them missing.
+                // Only settle unseen sessions when the read succeeded; a failed schema parse says nothing about deleted sessions.
                 if read.parsed {
                     book.settle_unseen(&seen, true, &today());
                     diagnostics.parsed += 1;
@@ -242,10 +223,7 @@ pub(crate) fn scan_database_half<R>(
     ledger.put_provider(provider, book);
 }
 
-/// Folds every session of `book`, counting as retained the ones served from
-/// the ledger alone: every session when `from_ledger` (the database is gone
-/// or unreadable), otherwise those whose source is marked missing. A session
-/// holding no days contributes nothing and is not counted.
+/// Folds all sessions in `book` and returns the count of non-empty entries served as retained (all when `from_ledger` is true, else only missing ones).
 fn fold_book(
     provider: ExtensionType,
     book: &ProviderLedger,
