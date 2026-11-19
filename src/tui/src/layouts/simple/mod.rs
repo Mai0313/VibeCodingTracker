@@ -2,8 +2,7 @@
 //! expandable tree rows (`▸` / `▾`) inside the Usage and Analysis tables.
 
 use crate::display::analysis::{
-    AnalysisRow, AnalysisTableColumns, analysis_panels_height, build_analysis_provider_rows,
-    build_analysis_table_row, layout_analysis_columns, render_analysis_provider_band,
+    AnalysisRow, AnalysisTableColumns, build_analysis_table_row, layout_analysis_columns,
 };
 use crate::display::app::Tab;
 use crate::display::common::provider_tui_color;
@@ -12,15 +11,15 @@ use crate::display::common::table::{
     render_scrollable_table_with_border, render_too_small, table_body_row_at, title_line,
 };
 use crate::display::common::theme::theme;
-use crate::display::common::tui::{MouseInput, NavDelta, ScrollState, render_loading};
+use crate::display::common::tui::{MouseInput, NavDelta, ScrollState};
 use crate::display::settings::SettingsOutcome;
 use crate::display::usage::{
     UsageRow, UsageTableColumns, UsageTotals, build_provider_total_rows, build_usage_table_row,
-    draw_quota_tab_with_border, layout_usage_columns, provider_digest, render_provider_panel,
+    layout_usage_columns, provider_digest, render_provider_panel,
 };
 use crate::layouts::{
     EventResult, LayoutCommand, LayoutContext, LayoutMeta, LayoutView, RANGES, TopBarHits,
-    TuiLayout, contains, render_top_bar,
+    TuiLayout, contains, render_standard_non_data, render_top_bar, truncate_ellipsis,
 };
 use crossterm::event::KeyCode;
 use ratatui::{
@@ -296,12 +295,7 @@ impl SimpleView {
             render_too_small(f, 84, 15);
             return;
         }
-        let provider_rows = build_analysis_provider_rows(ctx.analysis.provider_totals());
-        let avail_h = work_area.height.saturating_add(1);
-        let full_band = analysis_panels_height(avail_h, provider_rows.len());
-        let band_h = full_band.unwrap_or(1);
-        let [table_area, panel_area] =
-            Layout::vertical([Constraint::Min(6), Constraint::Length(band_h)]).areas(work_area);
+        let table_area = work_area;
         self.table_area = Some(table_area);
 
         let cols = layout_analysis_columns(table_area.width.saturating_sub(2));
@@ -367,15 +361,6 @@ impl SimpleView {
             BorderType::Rounded,
         );
 
-        render_analysis_provider_band(
-            f,
-            panel_area,
-            &provider_rows,
-            full_band,
-            avail_h,
-            BorderType::Rounded,
-        );
-
         f.render_widget(
             create_controls_with_status(
                 &[
@@ -399,20 +384,10 @@ fn toggle_set(set: &mut HashSet<String>, key: &str) {
     }
 }
 
-fn truncate_fit(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    text.chars()
-        .take(max_chars.saturating_sub(1))
-        .collect::<String>()
-        + "…"
-}
-
 fn pack_fact_lines(facts: &[String], max_chars: usize) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     for fact in facts {
-        let fitted = truncate_fit(fact, max_chars);
+        let fitted = truncate_ellipsis(fact, max_chars);
         if let Some(last) = lines.last_mut()
             && last.chars().count() + 3 + fitted.chars().count() <= max_chars
         {
@@ -685,32 +660,7 @@ impl LayoutView for SimpleView {
             main
         };
 
-        match ctx.tab {
-            Tab::Usage | Tab::Analysis => {
-                let message = if ctx.retry_pending {
-                    "Load failed, press r to retry"
-                } else {
-                    "Loading sessions..."
-                };
-                render_loading(f, body, ctx.spinner, message);
-            }
-            Tab::Quota => {
-                if let Some((ref quota, now)) = ctx.quota {
-                    draw_quota_tab_with_border(
-                        f,
-                        body,
-                        quota,
-                        now,
-                        ctx.update_status,
-                        BorderType::Rounded,
-                    );
-                }
-            }
-            Tab::Settings => {
-                ctx.settings
-                    .draw_with_border(f, body, ctx.update_status, BorderType::Rounded);
-            }
-        }
+        render_standard_non_data(f, body, ctx, BorderType::Rounded);
     }
 
     fn on_mouse(&mut self, mouse: MouseInput, ctx: &mut LayoutContext<'_>) -> EventResult {
@@ -1087,5 +1037,43 @@ mod tests {
                 ..LayoutCommand::default()
             })
         );
+    }
+
+    #[test]
+    fn analysis_tab_omits_bottom_providers_band() {
+        let (mut usage, mut analysis, mut settings) = seeded();
+        let mut view = LAYOUT.create();
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                let mut ctx = LayoutContext {
+                    tab: Tab::Analysis,
+                    time_range: TimeRange::Weekly,
+                    loading: false,
+                    retry_pending: false,
+                    spinner: 0,
+                    metrics: (52.0, 0.3),
+                    data_status: None,
+                    update_status: None,
+                    usage: &mut usage,
+                    analysis: &mut analysis,
+                    quota: None,
+                    settings: &mut settings,
+                };
+                view.draw(f, &mut ctx);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let screen: String = (0..24u16)
+            .map(|y| {
+                (0..120u16)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("Models ·"), "{screen}");
+        assert!(!screen.contains("All Providers"), "{screen}");
+        assert!(!screen.contains(" Providers "), "{screen}");
     }
 }

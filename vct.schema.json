@@ -60,7 +60,7 @@
         },
         "layout": {
           "default": "classic",
-          "description": "Interactive TUI layout (`classic`, `simple`, `legacy`, or another built-in layout; unknown names fall back to `classic`).",
+          "description": "Interactive TUI layout plugin name (default: `classic`; unknown names fall back to `classic`).",
           "type": "string"
         },
         "version": {

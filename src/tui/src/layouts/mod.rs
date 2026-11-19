@@ -7,21 +7,26 @@
 //! `pub static LAYOUT: <Type> = <Type>;` implementing [`TuiLayout`]; removing a
 //! layout is deleting its folder or file.
 
-use crate::display::analysis::AnalysisUiState;
+use crate::display::analysis::{AnalysisRow, AnalysisUiState};
 use crate::display::app::Tab;
+use crate::display::common::provider_tui_color;
+use crate::display::common::table::title_line;
 use crate::display::common::theme::theme;
-use crate::display::common::tui::MouseInput;
-use crate::display::settings::SettingsUiState;
-use crate::display::usage::{QuotaView, UsageUiState};
+use crate::display::common::tui::{MouseInput, render_loading};
+use crate::display::settings::{SettingsOutcome, SettingsUiState};
+use crate::display::usage::{
+    QuotaView, UsageRow, UsageTotals, UsageUiState, draw_quota_tab_with_border,
+};
 use crossterm::event::KeyCode;
 use ratatui::{
     Frame,
-    layout::Rect,
+    layout::{Constraint, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Block, BorderType, Borders, Paragraph},
 };
 use vct_core::models::TimeRange;
+use vct_core::utils::{format_compact, format_cost, format_cost_compact};
 
 /// Static metadata describing a compiled-in TUI layout plugin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,8 +153,8 @@ const TAB_PREFIX: &str = " vct ";
 /// Hit-test regions recorded when drawing the horizontal top bar.
 #[derive(Default, Clone, Copy)]
 pub(crate) struct TopBarHits {
-    tabs: [(Tab, Option<Rect>); 4],
-    ranges: [(TimeRange, Option<Rect>); 4],
+    pub(crate) tabs: [(Tab, Option<Rect>); 4],
+    pub(crate) ranges: [(TimeRange, Option<Rect>); 4],
 }
 
 impl TopBarHits {
@@ -174,6 +179,89 @@ pub(crate) fn contains(rect: Rect, column: u16, row: u16) -> bool {
     column >= rect.x && column < rect.right() && row >= rect.y && row < rect.bottom()
 }
 
+/// Handles mouse input on `Tab::Settings` for layouts using a horizontal top bar.
+///
+/// An open settings editor modal takes precedence over tab-bar clicks so
+/// clicking outside dismisses the modal instead of switching tabs behind it.
+pub(crate) fn handle_settings_mouse(
+    mouse: MouseInput,
+    ctx: &mut LayoutContext<'_>,
+    top_bar: &TopBarHits,
+) -> EventResult {
+    if ctx.settings.has_open_editor() {
+        let changed = ctx.settings.handle_mouse(mouse) == SettingsOutcome::Changed;
+        return EventResult::Consumed(LayoutCommand {
+            settings_changed: changed,
+            ..LayoutCommand::default()
+        });
+    }
+    if let MouseInput::Click { column, row } = mouse
+        && let Some(next) = top_bar.hit_tab(column, row)
+    {
+        return EventResult::Consumed(LayoutCommand {
+            switch_tab: Some(next),
+            ..LayoutCommand::default()
+        });
+    }
+    let changed = ctx.settings.handle_mouse(mouse) == SettingsOutcome::Changed;
+    EventResult::Consumed(LayoutCommand {
+        settings_changed: changed,
+        ..LayoutCommand::default()
+    })
+}
+
+/// Resolves a click on the top bar into a tab-switch or range-change command.
+pub(crate) fn handle_top_bar_click(
+    column: u16,
+    row: u16,
+    top_bar: &TopBarHits,
+    tab: Tab,
+) -> Option<LayoutCommand> {
+    if let Some(next) = top_bar.hit_tab(column, row) {
+        return Some(LayoutCommand {
+            switch_tab: Some(next),
+            ..LayoutCommand::default()
+        });
+    }
+    if tab.scans()
+        && let Some(range) = top_bar.hit_range(column, row)
+    {
+        return Some(LayoutCommand {
+            set_range: Some(range),
+            ..LayoutCommand::default()
+        });
+    }
+    None
+}
+
+/// Renders the loading spinner, `Quota` tab, or `Settings` tab with `border_type`.
+pub(crate) fn render_standard_non_data(
+    f: &mut Frame,
+    body: Rect,
+    ctx: &mut LayoutContext<'_>,
+    border_type: BorderType,
+) {
+    match ctx.tab {
+        Tab::Usage | Tab::Analysis => {
+            let message = if ctx.retry_pending {
+                "Load failed, press r to retry"
+            } else {
+                "Loading sessions..."
+            };
+            render_loading(f, body, ctx.spinner, message);
+        }
+        Tab::Quota => {
+            if let Some((ref quota, now)) = ctx.quota {
+                draw_quota_tab_with_border(f, body, quota, now, ctx.update_status, border_type);
+            }
+        }
+        Tab::Settings => {
+            ctx.settings
+                .draw_with_border(f, body, ctx.update_status, border_type);
+        }
+    }
+}
+
 /// Renders the standard single-row horizontal navigation bar into `area` and
 /// returns exact hit-test rectangles for every visible tab and time-range pill.
 pub(crate) fn render_top_bar(
@@ -182,6 +270,19 @@ pub(crate) fn render_top_bar(
     current: Tab,
     range: Option<TimeRange>,
     metrics: (f64, f32),
+) -> TopBarHits {
+    render_top_bar_styled(f, area, current, range, metrics, false)
+}
+
+/// Like [`render_top_bar`], optionally styling the active tab with a bold
+/// accent underline instead of an inverted pill.
+pub(crate) fn render_top_bar_styled(
+    f: &mut Frame,
+    area: Rect,
+    current: Tab,
+    range: Option<TimeRange>,
+    metrics: (f64, f32),
+    underline_tabs: bool,
 ) -> TopBarHits {
     let mut hits = TopBarHits {
         tabs: Tab::ALL.map(|tab| (tab, None)),
@@ -204,11 +305,18 @@ pub(crate) fn render_top_bar(
             hits.tabs[idx].1 = Some(Rect::new(area.x + cursor as u16, area.y, len as u16, 1));
         }
         cursor += len;
-        left.push(if tab == current {
-            Span::styled(text, theme.active())
+        let span = if tab == current {
+            if underline_tabs {
+                Span::styled(text, theme.accent().bold().underlined())
+            } else {
+                Span::styled(text, theme.active())
+            }
+        } else if underline_tabs {
+            Span::styled(text, dim)
         } else {
             Span::raw(text)
-        });
+        };
+        left.push(span);
     }
 
     let mut range_spans = Vec::new();
@@ -279,6 +387,557 @@ pub(crate) fn render_top_bar(
     hits
 }
 
+/// Picks the longest candidate table title (`full` -> `medium` -> `short`)
+/// that fits beside `note` inside a bordered table of width `table_w` without
+/// letting the right-aligned note overwrite the left title.
+pub(crate) fn fit_table_title(
+    full: String,
+    medium: String,
+    short: String,
+    table_w: u16,
+    note: &str,
+) -> String {
+    // 2 borders + 2 padding around title + 2 padding around note + >=1 dash gap.
+    let avail = usize::from(table_w).saturating_sub(note.chars().count() + 7);
+    if full.chars().count() <= avail {
+        full
+    } else if medium.chars().count() <= avail {
+        medium
+    } else if short.chars().count() <= avail {
+        short
+    } else {
+        truncate_ellipsis(&short, avail.max(6))
+    }
+}
+
+/// Truncates `text` to at most `max_chars` characters, appending `…` when cut.
+pub(crate) fn truncate_ellipsis(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// Builds a two-span horizontal progress/share bar of `width` columns.
+pub(crate) fn bar_spans(
+    ratio: f64,
+    width: usize,
+    filled_ch: char,
+    empty_ch: char,
+    filled_style: Style,
+) -> [Span<'static>; 2] {
+    let clamped = if ratio.is_finite() {
+        ratio.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let mut filled = (clamped * width as f64).round() as usize;
+    if clamped > 0.0 && width > 0 {
+        filled = filled.max(1);
+    }
+    filled = filled.min(width);
+    [
+        Span::styled(filled_ch.to_string().repeat(filled), filled_style),
+        Span::styled(
+            empty_ch.to_string().repeat(width - filled),
+            theme().border(),
+        ),
+    ]
+}
+
+/// Width-adaptive right-aligned toggle label for a Usage side pane switching
+/// between `Inspector` and `Providers`.
+pub(crate) fn side_toggle_note(inspector_active: bool, side_width: u16) -> Line<'static> {
+    let theme = theme();
+    if side_width >= 48 {
+        if inspector_active {
+            Line::from(vec![
+                Span::styled(" [Model] ", theme.accent().bold()),
+                Span::styled("· Providers (p) ", theme.dim()),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled(" Model · ", theme.dim()),
+                Span::styled("[Providers] (p) ", theme.accent().bold()),
+            ])
+        }
+    } else if side_width >= 38 {
+        if inspector_active {
+            Line::from(Span::styled(" p: providers ", theme.dim()))
+        } else {
+            Line::from(Span::styled(" p: model ", theme.accent().bold()))
+        }
+    } else if inspector_active {
+        Line::from(Span::styled(" (p) ", theme.dim()))
+    } else {
+        Line::from(Span::styled(" (p) ", theme.accent().bold()))
+    }
+}
+
+/// Renders an empty rounded `Inspector` placeholder when no model is selected.
+pub(crate) fn render_empty_inspector(
+    f: &mut Frame,
+    area: Rect,
+    right_note: Option<Line<'static>>,
+    placeholder: &'static str,
+) {
+    let theme = theme();
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.border())
+        .title(title_line("Inspector"));
+    if let Some(note) = right_note {
+        block = block.title(note.right_aligned());
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(" {placeholder}"),
+            Style::default().fg(theme.dim),
+        )))
+        .block(block),
+        area,
+    );
+}
+
+/// One row inside a horizontal inspector strip column (used by `bento` and `drawer`).
+pub(crate) enum StripEntry {
+    /// Key-value statistic row with an optional emphasis style on the value.
+    Stat {
+        label: &'static str,
+        value: String,
+        value_style: Option<Style>,
+    },
+    /// Provider attribution row prefixed with a colored `●` dot.
+    Provider {
+        color: Color,
+        label: &'static str,
+        value: String,
+    },
+}
+
+/// One titled column inside a 3-column horizontal inspector strip.
+pub(crate) struct StripColumn {
+    pub(crate) heading: &'static str,
+    pub(crate) entries: Vec<StripEntry>,
+}
+
+/// Builds the 3 compact horizontal inspector columns for a selected Usage model.
+pub(crate) fn build_usage_strip_columns(row: &UsageRow, totals: &UsageTotals) -> [StripColumn; 3] {
+    let theme = theme();
+    let providers: Vec<StripEntry> = row
+        .providers
+        .iter()
+        .map(|entry| StripEntry::Provider {
+            color: provider_tui_color(entry.provider),
+            label: entry.provider.display_name(),
+            value: format!(
+                "{} ({})",
+                format_cost_compact(entry.cost),
+                format_compact(entry.total_tokens)
+            ),
+        })
+        .collect();
+
+    let cost_share = if totals.cost > 0.0 {
+        format!("{:.1}%", row.cost / totals.cost * 100.0)
+    } else {
+        "-".to_string()
+    };
+    let eff_rate = if row.total > 0 && row.cost > 0.0 {
+        let per_m = row.cost / (row.total as f64 / 1_000_000.0);
+        if per_m < 0.01 {
+            format!("${per_m:.4}/1M")
+        } else {
+            format!("{}/1M", format_cost(per_m))
+        }
+    } else {
+        "-".to_string()
+    };
+    let prompt_total = row.input_tokens + row.cache_read + row.cache_creation;
+    let cache_hit = if row.cache_read > 0 && prompt_total > 0 {
+        format!(
+            "{:.0}%",
+            row.cache_read as f64 / prompt_total as f64 * 100.0
+        )
+    } else {
+        "-".to_string()
+    };
+
+    let mut eff_entries = vec![
+        StripEntry::Stat {
+            label: "Cost share",
+            value: cost_share,
+            value_style: Some(theme.accent().bold()),
+        },
+        StripEntry::Stat {
+            label: "Effective",
+            value: eff_rate,
+            value_style: None,
+        },
+        StripEntry::Stat {
+            label: "Cache hit",
+            value: cache_hit,
+            value_style: Some(Style::default().fg(theme.good)),
+        },
+    ];
+    if let Some(matched) = &row.matched_model {
+        eff_entries.push(StripEntry::Stat {
+            label: "Priced as",
+            value: matched.clone(),
+            value_style: None,
+        });
+    }
+
+    let mut token_entries = vec![
+        StripEntry::Stat {
+            label: "In / Out",
+            value: format!(
+                "{} / {}",
+                format_compact(row.input_tokens),
+                format_compact(row.output_with_reasoning())
+            ),
+            value_style: None,
+        },
+        StripEntry::Stat {
+            label: "Cache R/W",
+            value: format!(
+                "{} / {}",
+                format_compact(row.cache_read),
+                format_compact(row.cache_creation)
+            ),
+            value_style: None,
+        },
+    ];
+    if row.reasoning_tokens > 0 {
+        token_entries.push(StripEntry::Stat {
+            label: "Reasoning",
+            value: format_compact(row.reasoning_tokens),
+            value_style: None,
+        });
+    }
+    if row.cache_creation_1h > 0 {
+        token_entries.push(StripEntry::Stat {
+            label: "1h TTL",
+            value: format_compact(row.cache_creation_1h),
+            value_style: None,
+        });
+    }
+    if row.tool_tokens > 0 {
+        token_entries.push(StripEntry::Stat {
+            label: "Tool tok",
+            value: format_compact(row.tool_tokens),
+            value_style: None,
+        });
+    }
+    if row.above_tier_tokens > 0 {
+        token_entries.push(StripEntry::Stat {
+            label: "Long ctx",
+            value: format_compact(row.above_tier_tokens),
+            value_style: None,
+        });
+    }
+    if token_entries.len() < 3 {
+        token_entries.push(StripEntry::Stat {
+            label: "Total",
+            value: format_compact(row.total),
+            value_style: None,
+        });
+    }
+
+    [
+        StripColumn {
+            heading: "Providers",
+            entries: providers,
+        },
+        StripColumn {
+            heading: "Efficiency & Share",
+            entries: eff_entries,
+        },
+        StripColumn {
+            heading: "Token Mix",
+            entries: token_entries,
+        },
+    ]
+}
+
+/// Builds the 3 compact horizontal inspector columns for a selected Analysis model.
+pub(crate) fn build_analysis_strip_columns(
+    row: &AnalysisRow,
+    totals: &AnalysisRow,
+) -> [StripColumn; 3] {
+    let theme = theme();
+    let providers: Vec<StripEntry> = row
+        .providers
+        .iter()
+        .map(|entry| StripEntry::Provider {
+            color: provider_tui_color(entry.provider),
+            label: entry.provider.display_name(),
+            value: format!(
+                "{}L · {}c",
+                format_compact(entry.total_lines as i64),
+                format_compact(entry.total_calls as i64)
+            ),
+        })
+        .collect();
+
+    let avg = |lines: usize, ops: usize| -> String {
+        if ops > 0 && lines > 0 {
+            format!("~{}/op", (lines as f64 / ops as f64).round() as usize)
+        } else {
+            "-".to_string()
+        }
+    };
+    let line_share = if totals.total_lines() > 0 {
+        format!(
+            "{:.1}%",
+            row.total_lines() as f64 / totals.total_lines() as f64 * 100.0
+        )
+    } else {
+        "-".to_string()
+    };
+
+    [
+        StripColumn {
+            heading: "Providers",
+            entries: providers,
+        },
+        StripColumn {
+            heading: "Operations",
+            entries: vec![
+                StripEntry::Stat {
+                    label: "Edit",
+                    value: format!(
+                        "{}L ({} ops)",
+                        format_compact(row.edit_lines as i64),
+                        format_compact(row.edit_count as i64)
+                    ),
+                    value_style: None,
+                },
+                StripEntry::Stat {
+                    label: "Read",
+                    value: format!(
+                        "{}L ({} ops)",
+                        format_compact(row.read_lines as i64),
+                        format_compact(row.read_count as i64)
+                    ),
+                    value_style: None,
+                },
+                StripEntry::Stat {
+                    label: "Write",
+                    value: format!(
+                        "{}L ({} ops)",
+                        format_compact(row.write_lines as i64),
+                        format_compact(row.write_count as i64)
+                    ),
+                    value_style: None,
+                },
+            ],
+        },
+        StripColumn {
+            heading: "Commands & Avg",
+            entries: vec![
+                StripEntry::Stat {
+                    label: "Line share",
+                    value: line_share,
+                    value_style: Some(theme.accent().bold()),
+                },
+                StripEntry::Stat {
+                    label: "Bash / Todo",
+                    value: format!(
+                        "{} / {}",
+                        format_compact(row.bash_count as i64),
+                        format_compact(row.todo_write_count as i64)
+                    ),
+                    value_style: None,
+                },
+                StripEntry::Stat {
+                    label: "Avg E / R",
+                    value: format!(
+                        "{} · {}",
+                        avg(row.edit_lines, row.edit_count),
+                        avg(row.read_lines, row.read_count)
+                    ),
+                    value_style: None,
+                },
+            ],
+        },
+    ]
+}
+
+/// Renders a 3-column horizontal inspector pane with overflow `+N more` notices.
+pub(crate) fn render_strip_pane(
+    f: &mut Frame,
+    area: Rect,
+    title: Line<'static>,
+    right_note: Option<Line<'static>>,
+    accent_border: bool,
+    cols: &[StripColumn; 3],
+) {
+    let theme = theme();
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(if accent_border {
+            theme.accent()
+        } else {
+            theme.border()
+        })
+        .title(title);
+    if let Some(note) = right_note {
+        block = block.title(note.right_aligned());
+    }
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width < 12 || inner.height == 0 {
+        return;
+    }
+
+    let padded = Rect::new(
+        inner.x + 1,
+        inner.y,
+        inner.width.saturating_sub(2),
+        inner.height,
+    );
+    let spacing = if padded.width >= 66 { 2 } else { 1 };
+    let chunks = Layout::horizontal([
+        Constraint::Ratio(1, 3),
+        Constraint::Ratio(1, 3),
+        Constraint::Ratio(1, 3),
+    ])
+    .spacing(spacing)
+    .split(padded);
+
+    for (col, rect) in cols.iter().zip(chunks.iter()) {
+        render_strip_column(f, *rect, col);
+    }
+}
+
+fn render_strip_column(f: &mut Frame, area: Rect, col: &StripColumn) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let theme = theme();
+    let max_w = usize::from(area.width);
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(usize::from(area.height));
+    lines.push(Line::from(Span::styled(
+        truncate_ellipsis(col.heading, max_w),
+        theme.accent().bold(),
+    )));
+
+    let avail = usize::from(area.height.saturating_sub(1));
+    if avail == 0 {
+        f.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+    if col.entries.is_empty() {
+        lines.push(Line::from(Span::styled(
+            truncate_ellipsis("none", max_w),
+            theme.dim(),
+        )));
+        f.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+
+    let hidden = if col.entries.len() > avail {
+        col.entries.len() - avail.saturating_sub(1)
+    } else {
+        0
+    };
+    let shown = col.entries.len() - hidden;
+
+    for entry in col.entries.iter().take(shown) {
+        lines.push(format_strip_entry(entry, max_w));
+    }
+    if hidden > 0 {
+        lines.push(Line::from(Span::styled(
+            truncate_ellipsis(&format!("+{hidden} more"), max_w),
+            theme.dim(),
+        )));
+    }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn format_strip_entry(entry: &StripEntry, max_w: usize) -> Line<'static> {
+    let theme = theme();
+    match entry {
+        StripEntry::Stat {
+            label,
+            value,
+            value_style,
+        } => {
+            let v_style = value_style.unwrap_or_default();
+            let val_w = value.chars().count();
+            let lbl_w = label.chars().count();
+            if lbl_w + 1 + val_w <= max_w {
+                let gap = max_w - lbl_w - val_w;
+                Line::from(vec![
+                    Span::styled(*label, theme.dim()),
+                    Span::raw(" ".repeat(gap)),
+                    Span::styled(value.clone(), v_style),
+                ])
+            } else {
+                let max_val = max_w.saturating_sub(lbl_w + 1);
+                if max_val >= 4 {
+                    let fitted = truncate_ellipsis(value, max_val);
+                    let gap = max_w.saturating_sub(lbl_w + fitted.chars().count());
+                    Line::from(vec![
+                        Span::styled(*label, theme.dim()),
+                        Span::raw(" ".repeat(gap)),
+                        Span::styled(fitted, v_style),
+                    ])
+                } else {
+                    Line::from(Span::styled(
+                        truncate_ellipsis(&format!("{label} {value}"), max_w),
+                        theme.dim(),
+                    ))
+                }
+            }
+        }
+        StripEntry::Provider {
+            color,
+            label,
+            value,
+        } => {
+            let prefix_w = 2 + label.chars().count();
+            let val_w = value.chars().count();
+            if prefix_w + 1 + val_w <= max_w {
+                let gap = max_w - prefix_w - val_w;
+                Line::from(vec![
+                    Span::styled("● ", Style::default().fg(*color)),
+                    Span::raw(*label),
+                    Span::raw(" ".repeat(gap)),
+                    Span::raw(value.clone()),
+                ])
+            } else {
+                let max_lbl = max_w.saturating_sub(2 + 1 + val_w);
+                if max_lbl >= 3 {
+                    let fitted_lbl = truncate_ellipsis(label, max_lbl);
+                    let gap = max_w.saturating_sub(2 + fitted_lbl.chars().count() + val_w);
+                    Line::from(vec![
+                        Span::styled("● ", Style::default().fg(*color)),
+                        Span::raw(fitted_lbl),
+                        Span::raw(" ".repeat(gap)),
+                        Span::raw(value.clone()),
+                    ])
+                } else {
+                    let fitted =
+                        truncate_ellipsis(&format!("{label} {value}"), max_w.saturating_sub(2));
+                    Line::from(vec![
+                        Span::styled("● ", Style::default().fg(*color)),
+                        Span::raw(fitted),
+                    ])
+                }
+            }
+        }
+    }
+}
+
 include!(concat!(env!("OUT_DIR"), "/layouts_registry.rs"));
 
 /// Resolves a configured layout name (case-insensitive) to a compiled-in
@@ -328,6 +987,7 @@ mod tests {
     #[test]
     fn unknown_layout_name_falls_back_to_default_plugin() {
         let expected = resolve(vct_core::config::DEFAULT_LAYOUT).meta().id;
+        assert_eq!(resolve("legacy").meta().id, expected);
         assert_eq!(resolve("removed_or_unknown_layout").meta().id, expected);
         assert_eq!(resolve("").meta().id, expected);
         for &id in LAYOUT_IDS {

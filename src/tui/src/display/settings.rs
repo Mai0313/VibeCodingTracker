@@ -832,7 +832,8 @@ impl SettingsUiState {
         }
     }
 
-    /// Draws the tab into `area` using plain borders.
+    /// Draws the tab into `area` using plain borders (used by unit tests).
+    #[cfg(test)]
     pub(crate) fn draw(&mut self, f: &mut Frame, area: Rect, status: Option<(&str, Color)>) {
         self.draw_with_border(f, area, status, BorderType::Plain);
     }
