@@ -30,7 +30,7 @@
 
 选择你喜欢的查看方式：
 
-- **交互式面板**: 一个终端 app, 包含 Usage, Analysis, Quota 与 Settings 四个标签页, 内置三种可实时切换的布局 (`classic` 双栏工作台, `simple` 侧边栏 + 行内树状展开, `legacy`), 同时支持鼠标点击/滚轮与全键盘操作, 支持后台 incremental refresh, 进程级 CPU/内存实时读数, 以及 K/M/B 精简数字格式
+- **交互式面板**: 一个终端 app, 包含 Usage, Analysis, Quota 与 Settings 四个标签页, 内置七种可实时切换的布局 (`classic`, `bento`, `cards`, `drawer`, `editorial`, `hud`, `simple`), 同时支持鼠标点击/滚轮与全键盘操作, 支持后台 incremental refresh, 进程级 CPU/内存实时读数, 以及 K/M/B 精简数字格式
 - **静态报表**：专业的表格，适合文档记录
 - **脚本友好**：纯文本和 JSON 格式，方便自动化
 - **完整精度**：导出精确费用，满足财务核算需求
@@ -132,7 +132,7 @@ vct analysis
 | ------------------- | ----------------------------------------------------------------------------------- |
 | `Tab` / `Shift+Tab` | 下一个 / 上一个标签页（也可直接点击顶部标签栏或左侧导航栏）                         |
 | `↑` / `↓`           | 移动选中的行（也可点击某一行或使用鼠标滚轮）                                        |
-| `Enter` / `Space`   | 查看或展开选中 model 的明细（`classic` 窄屏弹窗、`simple` 行内展开、`legacy`）      |
+| `Enter` / `Space`   | 查看、展开或切换选中 model 的明细（`drawer` 底部抽屉、`simple` 行内展开或弹窗）     |
 | `←` / `→`           | 改用左边 / 右边那一列排序，也可直接点击表头列名（Usage、Analysis）                  |
 | `[` / `]`           | 上一个 / 下一个时间范围：day、week、month、all，也可直接点击范围（Usage、Analysis） |
 | `r`                 | 立即刷新（Usage、Analysis）                                                         |
@@ -141,7 +141,7 @@ vct analysis
 | `Esc`               | 关闭打开的面板                                                                      |
 | `q`                 | 退出                                                                                |
 
-内置三种 TUI 布局（可在 `Settings > General > Layout` 或 `config.toml` 的 `general.layout` 中切换）：`classic`（默认——双栏主从工作台，宽屏右侧常驻可滚动 `Inspector` 明细面板，窄屏自动回退为居中弹窗）、`simple`（可折叠左侧导航栏搭配行内 `▸` / `▾` 树状展开）与 `legacy`（全宽表格搭配居中弹窗）。Quota 与 Settings 标签页不扫描任何 session。第一次切到 Usage 或 Analysis 时才开始该标签页的扫描，而且只有画面上的标签页会按定时器刷新。导航栏显示时间范围，以及 vct 自己的内存与 CPU 用量。
+内置七种 TUI 布局（可在 `Settings > General > Layout` 或 `config.toml` 的 `general.layout` 中切换）：`classic`（默认——双栏主从工作台，宽屏右侧常驻可滚动 `Inspector` 明细面板，窄屏自动回退为居中弹窗）、`bento`（上方表格搭配可点击长条图 + 底部三栏免滚动明细面板）、`cards`（汇总与排序工具栏搭配多列模型卡片网格）、`drawer`（始终保留完整列的全宽表格 + 底部可折叠横向抽屉）、`editorial`（单外框细分割线搭配 `▎` 选区游标）、`hud`（顶部三格 KPI 仪表带 + 94 列即启用的双栏工作台）与 `simple`（可折叠左侧导航栏搭配行内 `▸` / `▾` 树状展开）。Quota 与 Settings 标签页不扫描任何 session。第一次切到 Usage 或 Analysis 时才开始该标签页的扫描，而且只有画面上的标签页会按定时器刷新。导航栏显示时间范围，以及 vct 自己的内存与 CPU 用量。
 
 时间范围 flag（`usage` 与 `analysis` 共用，互斥，默认 `--all`；在交互式界面中则决定打开时的范围）：
 
@@ -347,20 +347,14 @@ vct analysis --json --daily > today.json
 
 ```
  vct  Usage  Analysis  Quota  Settings                                 range  day  week  month  all   61.9 MB · CPU 0.1%
-┌ Models · 135K lines · 1.80K tool calls · 3 models ─────────────────────────────────────────────── sort: edit lines ▼ ┐
+╭ Models · 135K lines · 1.80K tool calls · 3 models ─────────────────────────────────────────────── sort: edit lines ▼ ╮
 │Model                                    Edit Lines  Read Lines Write Lines    Bash    Edit    Read  TodoWrite   Write│
 │                                                                                                                      │
 │claude-opus-4-8                               12.4K       88.1K       9.02K     412     231     604         96      88│
 │gemini-3.1-pro-preview                        2.10K       14.8K       1.62K      84      44     112         16      15│
 │claude-haiku-4-5-20251001                       840       5.40K         610      31      16      42          6       5│
 │                                                                                                                      │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌ Providers ───────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│Provider                  Edit Lines  Read Lines  Write Lines     Bash     Edit     Read   TodoWrite    Write     Days│
-│                                                                                                                      │
-│● Claude                       13.2K       93.5K        9.63K      443      247      646         102       93       12│
-│● Gemini                       2.10K       14.8K        1.62K       84       44      112          16       15        3│
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
  ↑↓ move  ←→ sort  [ ] range  ⏎ details  r refresh  tab view  ? help  q quit                             Star on GitHub
 ```
 
@@ -586,7 +580,7 @@ vct 会把用户设置保存在 `~/.vct/config.toml` 中。该文件会在**首�
 - `↑` / `↓`（或鼠标滚轮 / 点击行）在所有设置之间移动，`PgUp` / `PgDn`（或点击左侧 `Sections`）跳到上一个 / 下一个分区，`←` / `→` 修改数值（开关、增减数字、切换选项），`Space` 开关，`x` 把字段重置为默认值，`e` 用 `$VISUAL` / `$EDITOR` 打开配置文件，编辑器退出后重新加载。
 - `Enter`（或再次点击已选中的行）打开编辑器：可挑选的列表、数字或文本输入，或远程主机列表（`a` 新增、`Enter` 编辑、`d` 删除）。
 - 每次修改都会立即写入文件，并保留文件里的注释。
-- 界面布局（`classic` / `simple` / `legacy`）、合并、刷新间隔、quota 面板、quota 轮询间隔与 provider 开关的修改会立即反映在运行中的界面（quota 面板则在切到 Quota 标签页时生效）。默认时间范围、自动更新、扫描线程数、logging 与 remotes 要到下次启动才生效，表单会在这些字段上标明。
+- 界面布局（`classic` / `bento` / `cards` / `drawer` / `editorial` / `hud` / `simple`）、合并、刷新间隔、quota 面板、quota 轮询间隔与 provider 开关的修改会立即反映在运行中的界面（quota 面板则在切到 Quota 标签页时生效）。默认时间范围、自动更新、扫描线程数、logging 与 remotes 要到下次启动才生效，表单会在这些字段上标明。
 
 手动编辑文件与下方的 `vct config` 命令仍然可用。
 
