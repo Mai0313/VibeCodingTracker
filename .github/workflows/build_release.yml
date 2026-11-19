@@ -274,17 +274,14 @@ jobs:
           PACKAGE_NAME="${{ matrix.name }}"
           SCOPE="${{ matrix.scope }}"
 
-          # Update version
           npm version ${VERSION} --no-git-tag-version
 
-          # Update package name with scope if present
           if [ -n "${SCOPE}" ]; then
             FULL_NAME="${SCOPE}/${PACKAGE_NAME}"
           else
             FULL_NAME="${PACKAGE_NAME}"
           fi
 
-          # Use jq to update package name
           cat package.json | jq --arg name "${FULL_NAME}" '.name = $name' > package.json.tmp
           mv package.json.tmp package.json
 
@@ -325,7 +322,6 @@ jobs:
           echo "Waiting for npm registry to update..."
           sleep 10
 
-          # Check if version is available
           PUBLISHED_VERSION=$(npm view ${FULL_NAME}@${VERSION} version 2>/dev/null || echo "")
 
           if [ "${PUBLISHED_VERSION}" = "${VERSION}" ]; then
@@ -424,7 +420,6 @@ jobs:
           echo "Waiting for PyPI registry to update..."
           sleep 15
 
-          # Check if version is available
           PUBLISHED_VERSION=$(pip index versions ${PACKAGE_NAME} 2>/dev/null | grep "Available versions:" | grep -o "${VERSION}" || echo "")
 
           if [ "${PUBLISHED_VERSION}" = "${VERSION}" ]; then
