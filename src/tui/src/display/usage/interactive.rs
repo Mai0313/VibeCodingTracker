@@ -503,10 +503,6 @@ pub(crate) struct UsageUiState {
     scroll: ScrollState,
     merge_enabled: bool,
     sort: UsageSort,
-    /// Whether the Provider Usage panel is open (`p`).
-    pub(crate) provider_panel_open: bool,
-    /// Whether the selected row's details are open (`Enter`).
-    pub(crate) detail_open: bool,
 }
 
 impl UsageUiState {
@@ -520,8 +516,6 @@ impl UsageUiState {
             scroll: ScrollState::new(),
             merge_enabled,
             sort: UsageSort::default(),
-            provider_panel_open: false,
-            detail_open: false,
         }
     }
 
@@ -661,11 +655,9 @@ impl UsageUiState {
         self.selected_index().and_then(|at| self.view().get(at))
     }
 
-    /// Draws the tab into `area`.
+    /// Draws the tab into `area` (used by unit tests).
+    #[cfg(test)]
     pub(crate) fn draw(&mut self, f: &mut Frame, area: Rect, status: Option<(&str, RatatuiColor)>) {
-        // Details belong to a row: with none selected there is nothing to
-        // open, and nothing for a later Esc to close.
-        self.detail_open &= self.selected_model().is_some();
         let rows = current_view(self.merge_enabled, &self.rows, &self.merged_rows);
         draw_usage_view(
             f,
@@ -677,8 +669,8 @@ impl UsageUiState {
             &mut self.scroll,
             self.sort,
             status,
-            self.provider_panel_open,
-            self.detail_open,
+            false,
+            false,
         );
     }
 }
@@ -1389,7 +1381,10 @@ fn bar_spans(pct: f64, cells: usize) -> [Span<'static>; 2] {
 /// rows above. Segment widths use largest-remainder rounding so they always sum
 /// to exactly `width`. Falls back to a dim placeholder bar when there is no
 /// token data (or zero width).
-fn provider_share_bar(rows: &[ProviderTotal<'_, ProviderStats>], width: u16) -> Line<'static> {
+pub(crate) fn provider_share_bar(
+    rows: &[ProviderTotal<'_, ProviderStats>],
+    width: u16,
+) -> Line<'static> {
     let width = width as usize;
     // Providers that actually contributed tokens (skip the "All Providers"
     // aggregate and any empty provider).

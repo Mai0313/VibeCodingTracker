@@ -23,8 +23,7 @@ const QUOTA_GRID: GridSpec = GridSpec {
 const QUOTA_MIN_W: u16 = QUOTA_GRID.min_w;
 const QUOTA_MIN_H: u16 = QUOTA_GRID.height + 1;
 
-/// Draws the Quota tab into `area`: the card grid centered in it, and a footer
-/// that counts any provider the terminal had no room for.
+#[cfg(test)]
 pub(crate) fn draw_quota_tab(
     f: &mut Frame,
     area: Rect,
@@ -35,7 +34,9 @@ pub(crate) fn draw_quota_tab(
     draw_quota_tab_with_border(f, area, quota, now, status, BorderType::Plain);
 }
 
-/// [`draw_quota_tab`] with an explicit card [`BorderType`].
+/// Draws the Quota tab into `area`: the card grid centered in it with the
+/// requested [`BorderType`], and a footer counting any provider the terminal
+/// had no room for.
 pub(crate) fn draw_quota_tab_with_border(
     f: &mut Frame,
     area: Rect,

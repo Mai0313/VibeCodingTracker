@@ -4,34 +4,29 @@
 //! terminals).
 
 use crate::display::analysis::{
-    analysis_panels_height, build_analysis_detail_sections, build_analysis_provider_rows,
-    build_analysis_table_row, layout_analysis_columns, render_analysis_provider_band,
+    build_analysis_detail_sections, build_analysis_table_row, layout_analysis_columns,
 };
 use crate::display::app::Tab;
 use crate::display::common::table::{
-    DetailPaneChrome, TableChrome, create_controls_with_status, frame_layout, header_column_at,
+    DetailPaneChrome, TableChrome, create_controls_with_status, header_column_at,
     render_detail_pane, render_detail_panel, render_scrollable_table_with_border, render_too_small,
     table_body_row_at, title_line,
 };
-use crate::display::common::theme::theme;
-use crate::display::common::tui::{MouseInput, NavDelta, render_loading};
-use crate::display::settings::SettingsOutcome;
+use crate::display::common::tui::{MouseInput, NavDelta};
 use crate::display::usage::{
     build_provider_total_rows, build_usage_detail_sections, build_usage_table_row,
-    draw_quota_tab_with_border, layout_usage_columns, provider_digest, render_provider_pane,
-    render_provider_panel,
+    layout_usage_columns, provider_digest, render_provider_pane, render_provider_panel,
 };
 use crate::layouts::{
-    EventResult, LayoutCommand, LayoutContext, LayoutMeta, LayoutView, TopBarHits, TuiLayout,
-    contains, render_top_bar,
+    EventResult, LayoutContext, LayoutMeta, LayoutView, TopBarHits, TuiLayout, contains,
+    handle_settings_mouse, handle_top_bar_click, render_empty_inspector, render_standard_non_data,
+    render_top_bar, side_toggle_note,
 };
 use crossterm::event::KeyCode;
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::Style,
-    text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Paragraph},
+    widgets::{BorderType, Paragraph},
 };
 use vct_core::utils::{format_compact, format_cost};
 
@@ -102,8 +97,12 @@ impl ClassicView {
 
     fn draw_usage(&mut self, f: &mut Frame, area: Rect, ctx: &mut LayoutContext<'_>) {
         if area.width < 74 || area.height < 14 {
+            self.top_bar = TopBarHits::default();
             render_too_small(f, 74, 14);
             return;
+        }
+        if ctx.usage.selected_row().is_none() {
+            self.detail_modal_open = false;
         }
         self.sync_inspector_target(ctx);
         let [work, controls] =
@@ -175,7 +174,7 @@ impl ClassicView {
         );
 
         if let Some(side) = right_area {
-            let toggle = side_toggle_note(self.side_mode, side.width);
+            let toggle = side_toggle_note(self.side_mode == SideMode::Inspector, side.width);
             match self.side_mode {
                 SideMode::Inspector => {
                     if let Some(row) = ctx.usage.selected_row() {
@@ -247,11 +246,14 @@ impl ClassicView {
 
     fn draw_analysis(&mut self, f: &mut Frame, area: Rect, ctx: &mut LayoutContext<'_>) {
         if area.width < 84 || area.height < 14 {
+            self.top_bar = TopBarHits::default();
             render_too_small(f, 84, 14);
             return;
         }
+        if ctx.analysis.selected_row().is_none() {
+            self.detail_modal_open = false;
+        }
         self.sync_inspector_target(ctx);
-        let provider_row_count = build_analysis_provider_rows(ctx.analysis.provider_totals()).len();
         let [work, controls] =
             Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
 
@@ -268,16 +270,7 @@ impl ClassicView {
         };
         self.side_area = right_area;
 
-        let full_band = analysis_panels_height(area.height, provider_row_count);
-        let band_h = full_band.unwrap_or(1);
-        let chunks = frame_layout(
-            Rect {
-                height: left_area.height.saturating_add(1),
-                ..left_area
-            },
-            band_h,
-        );
-        let table_area = chunks.content;
+        let table_area = left_area;
         self.table_area = Some(table_area);
 
         let cols = layout_analysis_columns(table_area.width.saturating_sub(2));
@@ -318,18 +311,6 @@ impl ClassicView {
             ctx.analysis.scroll_mut(),
             BorderType::Rounded,
         );
-
-        if let Some(panel_area) = chunks.band {
-            let provider_rows = build_analysis_provider_rows(ctx.analysis.provider_totals());
-            render_analysis_provider_band(
-                f,
-                panel_area,
-                &provider_rows,
-                full_band,
-                area.height,
-                BorderType::Rounded,
-            );
-        }
 
         if let Some(side) = right_area {
             if let Some(row) = ctx.analysis.selected_row() {
@@ -382,52 +363,6 @@ impl ClassicView {
     }
 }
 
-fn side_toggle_note(mode: SideMode, side_width: u16) -> Line<'static> {
-    let theme = theme();
-    if side_width >= 48 {
-        match mode {
-            SideMode::Inspector => Line::from(vec![
-                Span::styled(" [Model] ", theme.accent().bold()),
-                Span::styled("· Providers (p) ", theme.dim()),
-            ]),
-            SideMode::Providers => Line::from(vec![
-                Span::styled(" Model · ", theme.dim()),
-                Span::styled("[Providers] (p) ", theme.accent().bold()),
-            ]),
-        }
-    } else {
-        match mode {
-            SideMode::Inspector => Line::from(Span::styled(" p: providers ", theme.dim())),
-            SideMode::Providers => Line::from(Span::styled(" p: model ", theme.accent().bold())),
-        }
-    }
-}
-
-fn render_empty_inspector(
-    f: &mut Frame,
-    area: Rect,
-    right_note: Option<Line<'static>>,
-    placeholder: &'static str,
-) {
-    let theme = theme();
-    let mut block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(theme.border())
-        .title(title_line("Inspector"));
-    if let Some(note) = right_note {
-        block = block.title(note.right_aligned());
-    }
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!(" {placeholder}"),
-            Style::default().fg(theme.dim),
-        )))
-        .block(block),
-        area,
-    );
-}
-
 impl LayoutView for ClassicView {
     fn draw(&mut self, f: &mut Frame, ctx: &mut LayoutContext<'_>) {
         self.table_area = None;
@@ -441,57 +376,15 @@ impl LayoutView for ClassicView {
         self.top_bar = render_top_bar(f, bar, ctx.tab, range, ctx.metrics);
 
         match ctx.tab {
-            Tab::Usage | Tab::Analysis if ctx.loading => {
-                let message = if ctx.retry_pending {
-                    "Load failed, press r to retry"
-                } else {
-                    "Loading sessions..."
-                };
-                render_loading(f, body, ctx.spinner, message);
-            }
-            Tab::Usage => self.draw_usage(f, body, ctx),
-            Tab::Analysis => self.draw_analysis(f, body, ctx),
-            Tab::Quota => {
-                if let Some((ref quota, now)) = ctx.quota {
-                    draw_quota_tab_with_border(
-                        f,
-                        body,
-                        quota,
-                        now,
-                        ctx.update_status,
-                        BorderType::Rounded,
-                    );
-                }
-            }
-            Tab::Settings => {
-                ctx.settings
-                    .draw_with_border(f, body, ctx.update_status, BorderType::Rounded);
-            }
+            Tab::Usage if !ctx.loading => self.draw_usage(f, body, ctx),
+            Tab::Analysis if !ctx.loading => self.draw_analysis(f, body, ctx),
+            _ => render_standard_non_data(f, body, ctx, BorderType::Rounded),
         }
     }
 
     fn on_mouse(&mut self, mouse: MouseInput, ctx: &mut LayoutContext<'_>) -> EventResult {
         if ctx.tab == Tab::Settings {
-            if ctx.settings.has_open_editor() {
-                let changed = ctx.settings.handle_mouse(mouse) == SettingsOutcome::Changed;
-                return EventResult::Consumed(LayoutCommand {
-                    settings_changed: changed,
-                    ..LayoutCommand::default()
-                });
-            }
-            if let MouseInput::Click { column, row } = mouse
-                && let Some(next) = self.top_bar.hit_tab(column, row)
-            {
-                return EventResult::Consumed(LayoutCommand {
-                    switch_tab: Some(next),
-                    ..LayoutCommand::default()
-                });
-            }
-            let changed = ctx.settings.handle_mouse(mouse) == SettingsOutcome::Changed;
-            return EventResult::Consumed(LayoutCommand {
-                settings_changed: changed,
-                ..LayoutCommand::default()
-            });
+            return handle_settings_mouse(mouse, ctx, &self.top_bar);
         }
 
         match mouse {
@@ -504,19 +397,8 @@ impl LayoutView for ClassicView {
                     }
                     return EventResult::consumed();
                 }
-                if let Some(next) = self.top_bar.hit_tab(column, row) {
-                    return EventResult::Consumed(LayoutCommand {
-                        switch_tab: Some(next),
-                        ..LayoutCommand::default()
-                    });
-                }
-                if ctx.tab.scans()
-                    && let Some(range) = self.top_bar.hit_range(column, row)
-                {
-                    return EventResult::Consumed(LayoutCommand {
-                        set_range: Some(range),
-                        ..LayoutCommand::default()
-                    });
+                if let Some(cmd) = handle_top_bar_click(column, row, &self.top_bar, ctx.tab) {
+                    return EventResult::Consumed(cmd);
                 }
                 if ctx.loading {
                     return EventResult::consumed();
@@ -647,7 +529,12 @@ impl LayoutView for ClassicView {
                         self.side_mode = SideMode::Inspector;
                     }
                 } else {
-                    self.detail_modal_open = !self.detail_modal_open;
+                    let has_sel = if ctx.tab == Tab::Usage {
+                        ctx.usage.selected_row().is_some()
+                    } else {
+                        ctx.analysis.selected_row().is_some()
+                    };
+                    self.detail_modal_open = has_sel && !self.detail_modal_open;
                 }
                 EventResult::consumed()
             }
@@ -1084,5 +971,25 @@ mod tests {
         )
         .join("\n");
         assert!(!shrunk.contains("esc close"), "{shrunk}");
+    }
+
+    #[test]
+    fn analysis_tab_omits_bottom_providers_band() {
+        let (mut usage, mut analysis, mut settings) = seeded_states();
+        let mut view = LAYOUT.create();
+        let screen = render_lines(
+            &mut view,
+            132,
+            26,
+            Tab::Analysis,
+            &mut usage,
+            &mut analysis,
+            &mut settings,
+        )
+        .join("\n");
+        assert!(screen.contains("Models ·"), "{screen}");
+        assert!(screen.contains("Inspector"), "{screen}");
+        assert!(!screen.contains("All Providers"), "{screen}");
+        assert!(!screen.contains(" Providers "), "{screen}");
     }
 }
