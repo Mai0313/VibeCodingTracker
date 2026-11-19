@@ -118,7 +118,7 @@ pub const DEFAULT_LAYOUT: &str = "classic";
 /// `[general]` — settings shared across subcommands.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct GeneralConfig {
-    /// Interactive TUI layout (`classic`, `simple`, `legacy`, or another built-in layout; unknown names fall back to `classic`).
+    /// Interactive TUI layout plugin name (default: `classic`; unknown names fall back to `classic`).
     #[serde(default = "default_layout")]
     pub layout: String,
     /// Default time range when no --daily/--weekly/--monthly/--all flag is given.
