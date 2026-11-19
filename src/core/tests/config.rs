@@ -17,6 +17,7 @@ fn load_in_creates_default_commented_file_when_absent() {
     let cfg = config::load_in(dir);
 
     assert_eq!(cfg, Config::default());
+    assert_eq!(cfg.general.layout, "classic");
     assert_eq!(cfg.general.default_time_range, TimeRange::All);
     assert!(cfg.general.auto_update);
     assert!(cfg.usage.shows_quota_panel("cursor"));
@@ -41,6 +42,7 @@ fn load_in_creates_default_commented_file_when_absent() {
     assert!(text.contains("[performance]"));
     assert!(text.contains("[logging]"));
     assert!(text.contains("merge_models = true"));
+    assert!(text.contains("layout = \"classic\""));
     assert!(text.contains("auto_update = true"));
     assert!(text.contains("grok = true"));
     // A generated comment must survive so the file is self-documenting.
@@ -436,4 +438,33 @@ fn a_setting_is_saved_into_a_file_that_lacks_its_section() {
     fs::write(dir.join("config.toml"), "usage = \"bad\"\n").unwrap();
     config::save_setting_in(dir, &["usage", "quota", "refresh_interval"], &poll).unwrap();
     assert_eq!(config::load_in(dir).usage.quota.refresh_interval, 120);
+}
+
+#[test]
+fn general_layout_saves_and_tolerates_removed_layout_names() {
+    use vct_core::config::SettingValue;
+
+    let th = TempHome::new();
+    let dir = &th.paths.cache_dir;
+    let cfg = config::load_in(dir);
+    assert_eq!(cfg.general.layout, "classic");
+
+    config::save_setting_in(
+        dir,
+        &["general", "layout"],
+        &SettingValue::String("simple".to_string()),
+    )
+    .unwrap();
+    assert_eq!(config::load_in(dir).general.layout, "simple");
+
+    // A layout deleted in a later release must not fail config parsing or reset
+    // sibling settings; the TUI resolves unknown names to the default layout.
+    fs::write(
+        dir.join("config.toml"),
+        "#:schema x\n[general]\nlayout = \"removed_experimental_layout\"\ndefault_time_range = \"weekly\"\nversion = 4\n",
+    )
+    .unwrap();
+    let reloaded = config::load_in(dir);
+    assert_eq!(reloaded.general.layout, "removed_experimental_layout");
+    assert_eq!(reloaded.general.default_time_range, TimeRange::Weekly);
 }
