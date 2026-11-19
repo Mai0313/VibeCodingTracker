@@ -30,7 +30,7 @@ Built with Rust for minimal resource footprint. The interactive TUI dashboard ty
 
 Choose your preferred view:
 
-- **Interactive Dashboard**: One terminal app with Usage, Analysis, Quota and Settings tabs, an immediate loading spinner, background incremental refreshes, a scrollable, sortable model list (arrow keys), a live per-process CPU/memory readout, and compact K/M/B number formatting
+- **Interactive Dashboard**: One terminal app with Usage, Analysis, Quota and Settings tabs, three switchable layouts (`classic` split workbench, `simple` sidebar + inline tree, and `legacy`), mouse click and scroll-wheel navigation alongside full keyboard controls, background incremental refreshes, a live per-process CPU/memory readout, and compact K/M/B number formatting
 - **Static Reports**: Professional tables for documentation
 - **Script-Friendly**: Plain text and JSON for automation
 - **Full Precision**: Export exact costs for accounting
@@ -128,20 +128,20 @@ Run `vct --help` to list the commands, and `vct <command> --help` for a command'
 
 `vct` with no command opens the interactive app, one screen with four tabs: `Usage`, `Analysis`, `Quota` and `Settings`. `vct usage`, `vct analysis` and `vct quota` open the same app on their own tab, while `--json`, `--text` and `--table` print and never open it. Without a terminal (piped or redirected), a bare `vct` prints the help and exits with status 2.
 
-| Key                 | Action                                                                     |
-| ------------------- | -------------------------------------------------------------------------- |
-| `Tab` / `Shift+Tab` | Next / previous tab (or click a tab in the top bar)                        |
-| `↑` / `↓`           | Move the selected row                                                      |
-| `Enter`             | Show the selected model's per-provider breakdown, share, and exact numbers |
-| `←` / `→`           | Sort by the column to the left / right (Usage, Analysis)                   |
-| `[` / `]`           | Earlier / later time range: day, week, month, all (Usage, Analysis)        |
-| `r`                 | Refresh now (Usage, Analysis)                                              |
-| `p`                 | Open the Provider Usage panel (Usage)                                      |
-| `?`                 | List the current tab's keys                                                |
-| `Esc`               | Close the open panel                                                       |
-| `q`                 | Quit                                                                       |
+| Key                 | Action                                                                                        |
+| ------------------- | --------------------------------------------------------------------------------------------- |
+| `Tab` / `Shift+Tab` | Next / previous tab (or click a tab in the top bar / sidebar)                                 |
+| `↑` / `↓`           | Move the selected row (or click a row / scroll the mouse wheel)                               |
+| `Enter` / `Space`   | Inspect or expand the selected model (`classic` narrow modal, `simple` inline tree, `legacy`) |
+| `←` / `→`           | Sort by the column to the left / right, or click a column header (Usage, Analysis)            |
+| `[` / `]`           | Earlier / later time range: day, week, month, all, or click a range (Usage, Analysis)         |
+| `r`                 | Refresh now (Usage, Analysis)                                                                 |
+| `p`                 | Toggle or open the Provider Usage view (Usage)                                                |
+| `?`                 | List the current tab's keys                                                                   |
+| `Esc`               | Close the open panel                                                                          |
+| `q`                 | Quit                                                                                          |
 
-The Quota and Settings tabs scan no sessions. The first visit to Usage or Analysis starts that tab's scan, and only the tab on screen refreshes on its timer. The right side of the tab bar shows the time range and vct's own memory and CPU.
+Three TUI layouts are built in (`Settings > General > Layout`, `general.layout` in `config.toml`): `classic` (default — split master-detail workbench with a live scrollable side `Inspector` on wide terminals and modal fallback when narrow), `simple` (collapsible left navigation rail with inline `▸` / `▾` expandable rows), and `legacy` (full-width tables with centered modal popups). The Quota and Settings tabs scan no sessions. The first visit to Usage or Analysis starts that tab's scan, and only the tab on screen refreshes on its timer. The navigation bar / rail shows the time range and vct's own memory and CPU.
 
 Time range flags (shared by `usage` and `analysis`, mutually exclusive, default `--all`; in the app they set the range it opens with):
 
@@ -583,10 +583,10 @@ Switch to the Settings tab with `Tab` (or click `Settings` in the top bar) to ed
  ↑↓ move  ←→ change  space toggle  ⏎ edit  x reset  e editor  tab view  ? help  q quit                   Star on GitHub
 ```
 
-- `↑` / `↓` move through every setting, `PgUp` / `PgDn` jump a section, `←` / `→` change a value (toggle, step a number, cycle a choice), `Space` toggles, `x` resets the field to its default, and `e` opens the file in `$VISUAL` / `$EDITOR` and reloads it when the editor exits.
-- `Enter` opens an editor: a list to pick from, a number or text input, or the remote host list (`a` add, `Enter` edit, `d` delete).
+- `↑` / `↓` (or mouse wheel / row clicks) move through every setting, `PgUp` / `PgDn` (or clicking `Sections`) jump a section, `←` / `→` change a value (toggle, step a number, cycle a choice), `Space` toggles, `x` resets the field to its default, and `e` opens the file in `$VISUAL` / `$EDITOR` and reloads it when the editor exits.
+- `Enter` (or clicking the selected row) opens an editor: a list to pick from, a number or text input, or the remote host list (`a` add, `Enter` edit, `d` delete).
 - Each change is written to the file at once and keeps the file's comments.
-- Changes to merge, the refresh intervals, the quota panels, the quota poll interval and the provider toggles show in the running app (quota panels when you open the Quota tab). Default time range, auto update, scan threads, logging and remotes apply from the next start, and the form says so on those fields.
+- Changes to layout (`classic` / `simple` / `legacy`), merge, the refresh intervals, the quota panels, the quota poll interval and the provider toggles show immediately in the running app (quota panels when you open the Quota tab). Default time range, auto update, scan threads, logging and remotes apply from the next start, and the form says so on those fields.
 
 Editing the file by hand and the `vct config` commands below still work.
 

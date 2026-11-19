@@ -134,15 +134,15 @@ On Linux/glibc the main binary also calls `mallopt(M_ARENA_MAX, 4)` + `mallopt(M
 
 Common Makefile shortcuts (`make help` to list all):
 
-| Target          | Description                                                               |
-| --------------- | ------------------------------------------------------------------------- |
-| `make build`    | Debug build (`cargo build`)                                               |
-| `make release`  | Locked release build (`cargo build --release --locked`)                   |
-| `make package`  | `cargo package --locked --allow-dirty`                                    |
-| `make test`     | Run the full `cargo test --all` suite                                     |
-| `make fmt`      | clippy auto-fix (`--fix`) + `cargo fmt --all` + clippy `-D warnings` gate |
-| `make coverage` | Install & run `cargo-llvm-cov` for workspace coverage                     |
-| `make clean`    | Remove build artifacts and prune git objects                              |
+| Target          | Description                                                                                  |
+| --------------- | -------------------------------------------------------------------------------------------- |
+| `make build`    | Debug build (`cargo build`)                                                                  |
+| `make release`  | Locked release build (`cargo build --release --locked`)                                      |
+| `make package`  | `cargo package --locked --allow-dirty`                                                       |
+| `make test`     | Run the full `cargo test --all` suite                                                        |
+| `make fmt`      | clippy auto-fix (`--fix`) + `cargo fmt --all` + layout `rustfmt` + clippy `-D warnings` gate |
+| `make coverage` | Install & run `cargo-llvm-cov` for workspace coverage                                        |
+| `make clean`    | Remove build artifacts and prune git objects                                                 |
 
 #### Running Tests
 
@@ -191,11 +191,13 @@ When optimizing, include before/after numbers in the PR description.
 We use `rustfmt`, `clippy` and `rustdoc` to ensure code quality. The CI (`.github/workflows/code-quality-check.yml`) runs all three with `-D warnings`, so please run them locally before submitting:
 
 ```bash
-# Format your code
+# Format your code (including auto-discovered layout plugins under src/tui/src/layouts)
 cargo fmt --all
+find src/tui/src/layouts -name '*.rs' -exec rustfmt --edition 2024 {} +
 
 # Check formatting without modifying files (same as CI)
 cargo fmt --all -- --check
+find src/tui/src/layouts -name '*.rs' -exec rustfmt --edition 2024 --check {} +
 
 # Run linting checks (warnings are errors in CI)
 cargo clippy --all-targets --all-features --locked -- -D warnings
@@ -247,7 +249,7 @@ Aggregate sessions whose modified date falls within the current ISO week.
 
 1. Fork the repository and create a topic branch (`feat/...`, `fix/...`, `docs/...`).
 2. Make focused commits following the convention above.
-3. Run `make fmt`, `uvx pre-commit run -a`, `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features --locked -- -D warnings`, `cargo doc --no-deps --workspace --all-features` (also with `--document-private-items`), `VCT_OFFLINE=1 cargo test --all-targets --all-features --locked`, `cargo +1.95.0 check --all-targets --all-features --locked`, and `cargo build --profile dist --locked`.
+3. Run `make fmt`, `uvx pre-commit run -a`, `cargo fmt --all -- --check`, `find src/tui/src/layouts -name '*.rs' -exec rustfmt --edition 2024 --check {} +`, `cargo clippy --all-targets --all-features --locked -- -D warnings`, `cargo doc --no-deps --workspace --all-features` (also with `--document-private-items`), `VCT_OFFLINE=1 cargo test --all-targets --all-features --locked`, `cargo +1.95.0 check --all-targets --all-features --locked`, and `cargo build --profile dist --locked`.
 4. Update the relevant README files (`README.md`, `README.zh-CN.md`, `README.zh-TW.md`) when behavior or flags change — all three languages should stay in sync.
 5. Open a draft PR against `main` with an English title and body. Keep it in draft until every GitHub Actions check passes; the title must satisfy the semantic-pull-request check.
 
