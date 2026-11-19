@@ -15,9 +15,13 @@ mod text;
 
 pub use averages::*;
 pub use interactive::UsageFrameBenchmark;
+#[cfg(test)]
+pub(crate) use interactive::UsageSort;
 pub(crate) use interactive::{
-    QuotaRuntime, QuotaSnapshots, UsageRefreshPayload, UsageScanner, UsageUiState,
+    QuotaRuntime, QuotaSnapshots, QuotaView, UsageRefreshPayload, UsageScanner, UsageTableColumns,
+    UsageUiState, build_usage_detail_sections, build_usage_table_row, layout_usage_columns,
+    provider_digest, render_provider_pane, render_provider_panel,
 };
-pub(crate) use quota_tab::draw_quota_tab;
+pub(crate) use quota_tab::{draw_quota_tab, draw_quota_tab_with_border};
 pub use table::display_usage_table;
 pub use text::display_usage_text;

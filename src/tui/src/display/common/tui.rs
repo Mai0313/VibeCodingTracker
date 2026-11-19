@@ -605,6 +605,7 @@ fn handle_input_from(source: &mut impl EventSource) -> anyhow::Result<InputActio
 
     let mut resized = false;
     let mut nav = NavDelta::default();
+    let mut scroll: Option<(u16, u16, i16)> = None;
     let mut drained = 0usize;
     loop {
         match source.read()? {
@@ -622,6 +623,9 @@ fn handle_input_from(source: &mut impl EventSource) -> anyhow::Result<InputActio
                     // Esc backs out of what is open and never leaves the app.
                     KeyCode::Esc => return Ok(InputAction::Close),
                     KeyCode::Enter => return Ok(InputAction::Open),
+                    KeyCode::Char(' ') => return Ok(InputAction::Space),
+                    KeyCode::PageUp => return Ok(InputAction::Page(-1)),
+                    KeyCode::PageDown => return Ok(InputAction::Page(1)),
                     KeyCode::Char('?') => return Ok(InputAction::Help),
                     KeyCode::Tab => return Ok(InputAction::NextTab),
                     KeyCode::BackTab => return Ok(InputAction::PrevTab),
@@ -645,12 +649,23 @@ fn handle_input_from(source: &mut impl EventSource) -> anyhow::Result<InputActio
                     _ => {}
                 }
             }
-            Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
-                return Ok(InputAction::Click {
-                    column: mouse.column,
-                    row: mouse.row,
-                });
-            }
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    return Ok(InputAction::Click {
+                        column: mouse.column,
+                        row: mouse.row,
+                    });
+                }
+                MouseEventKind::ScrollUp => {
+                    let prev = scroll.map_or(0, |(_, _, lines)| lines);
+                    scroll = Some((mouse.column, mouse.row, prev.saturating_sub(1)));
+                }
+                MouseEventKind::ScrollDown => {
+                    let prev = scroll.map_or(0, |(_, _, lines)| lines);
+                    scroll = Some((mouse.column, mouse.row, prev.saturating_add(1)));
+                }
+                _ => {}
+            },
             Event::Resize(_, _) => resized = true,
             _ => {}
         }
@@ -663,6 +678,10 @@ fn handle_input_from(source: &mut impl EventSource) -> anyhow::Result<InputActio
 
     if nav.is_active() {
         Ok(InputAction::Navigate(nav))
+    } else if let Some((column, row, lines)) = scroll
+        && lines != 0
+    {
+        Ok(InputAction::Scroll { column, row, lines })
     } else if resized {
         Ok(InputAction::Resize)
     } else {
@@ -673,9 +692,9 @@ fn handle_input_from(source: &mut impl EventSource) -> anyhow::Result<InputActio
 /// Waits up to 100 ms for an event and hands a key press back unmapped, for a
 /// view that reads keys itself (a settings form, a text input).
 ///
-/// Only `Ctrl+C` ([`InputAction::Quit`]) and primary mouse clicks
-/// ([`InputAction::Click`]) are mapped here; non-click mouse events are drained
-/// so cursor motion does not queue behind key presses.
+/// Only `Ctrl+C` ([`InputAction::Quit`]), primary mouse clicks
+/// ([`InputAction::Click`]) and wheel ticks ([`InputAction::Scroll`]) are
+/// mapped here; cursor motion is drained so it does not queue behind keys.
 ///
 /// # Errors
 ///
@@ -689,6 +708,7 @@ fn handle_key_input_from(source: &mut impl EventSource) -> anyhow::Result<InputA
         return Ok(InputAction::Continue);
     }
     let mut resized = false;
+    let mut scroll: Option<(u16, u16, i16)> = None;
     let mut drained = 0usize;
     loop {
         match source.read()? {
@@ -698,12 +718,23 @@ fn handle_key_input_from(source: &mut impl EventSource) -> anyhow::Result<InputA
                 }
                 return Ok(InputAction::Key(key.code));
             }
-            Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
-                return Ok(InputAction::Click {
-                    column: mouse.column,
-                    row: mouse.row,
-                });
-            }
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    return Ok(InputAction::Click {
+                        column: mouse.column,
+                        row: mouse.row,
+                    });
+                }
+                MouseEventKind::ScrollUp => {
+                    let prev = scroll.map_or(0, |(_, _, lines)| lines);
+                    scroll = Some((mouse.column, mouse.row, prev.saturating_sub(1)));
+                }
+                MouseEventKind::ScrollDown => {
+                    let prev = scroll.map_or(0, |(_, _, lines)| lines);
+                    scroll = Some((mouse.column, mouse.row, prev.saturating_add(1)));
+                }
+                _ => {}
+            },
             Event::Resize(_, _) => resized = true,
             _ => {}
         }
@@ -713,7 +744,11 @@ fn handle_key_input_from(source: &mut impl EventSource) -> anyhow::Result<InputA
             break;
         }
     }
-    if resized {
+    if let Some((column, row, lines)) = scroll
+        && lines != 0
+    {
+        Ok(InputAction::Scroll { column, row, lines })
+    } else if resized {
         Ok(InputAction::Resize)
     } else {
         Ok(InputAction::Continue)
@@ -736,6 +771,15 @@ impl NavDelta {
     }
 }
 
+/// Primary mouse click or vertical scroll wheel input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseInput {
+    /// Left mouse button pressed at `(column, row)`.
+    Click { column: u16, row: u16 },
+    /// Vertical scroll wheel movement (`negative` = up, `positive` = down).
+    Scroll { column: u16, row: u16, lines: i16 },
+}
+
 /// Action the TUI event loop should take in response to user input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputAction {
@@ -745,10 +789,16 @@ pub enum InputAction {
     Close,
     /// User pressed `Enter`: open the selected row's details.
     Open,
+    /// User pressed `Space` on a non-form tab (e.g. inline row expand).
+    Space,
+    /// User pressed `PageUp` (`-1`) or `PageDown` (`1`).
+    Page(isize),
     /// User asked for the key list (`?`).
     Help,
     /// User clicked the primary mouse button at `(column, row)`.
     Click { column: u16, row: u16 },
+    /// User spun the mouse wheel vertically at `(column, row)`.
+    Scroll { column: u16, row: u16, lines: i16 },
     /// User moved to the next tab (`Tab`).
     NextTab,
     /// User moved to the previous tab (`Shift+Tab`).
@@ -771,6 +821,17 @@ pub enum InputAction {
     Resize,
     /// No actionable event; keep the current frame and loop.
     Continue,
+}
+
+impl InputAction {
+    /// Extracts a [`MouseInput`] when this action came from the mouse.
+    pub fn mouse(self) -> Option<MouseInput> {
+        match self {
+            Self::Click { column, row } => Some(MouseInput::Click { column, row }),
+            Self::Scroll { column, row, lines } => Some(MouseInput::Scroll { column, row, lines }),
+            _ => None,
+        }
+    }
 }
 
 /// Tracks per-row changes to drive temporary highlighting of recently-updated rows.
@@ -1118,6 +1179,9 @@ mod tests {
         assert_eq!(press(KeyCode::Tab), InputAction::NextTab);
         assert_eq!(press(KeyCode::BackTab), InputAction::PrevTab);
         assert_eq!(press(KeyCode::Enter), InputAction::Open);
+        assert_eq!(press(KeyCode::Char(' ')), InputAction::Space);
+        assert_eq!(press(KeyCode::PageUp), InputAction::Page(-1));
+        assert_eq!(press(KeyCode::PageDown), InputAction::Page(1));
         assert_eq!(press(KeyCode::Char('?')), InputAction::Help);
         assert_eq!(press(KeyCode::Char('[')), InputAction::StepRange(-1));
         assert_eq!(press(KeyCode::Char(']')), InputAction::StepRange(1));
@@ -1162,6 +1226,33 @@ mod tests {
         assert_eq!(
             handle_key_input_from(&mut raw).unwrap(),
             InputAction::Click { column: 25, row: 0 }
+        );
+
+        let mut wheel_normal = FakeEventSource::new([
+            mouse(MouseEventKind::ScrollDown, 10, 5),
+            mouse(MouseEventKind::ScrollDown, 10, 5),
+            mouse(MouseEventKind::ScrollUp, 12, 6),
+        ]);
+        assert_eq!(
+            handle_input_from(&mut wheel_normal).unwrap(),
+            InputAction::Scroll {
+                column: 12,
+                row: 6,
+                lines: 1,
+            }
+        );
+
+        let mut wheel_raw = FakeEventSource::new([
+            mouse(MouseEventKind::ScrollUp, 8, 4),
+            mouse(MouseEventKind::ScrollUp, 8, 4),
+        ]);
+        assert_eq!(
+            handle_key_input_from(&mut wheel_raw).unwrap(),
+            InputAction::Scroll {
+                column: 8,
+                row: 4,
+                lines: -2,
+            }
         );
     }
 

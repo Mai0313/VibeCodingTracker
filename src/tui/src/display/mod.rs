@@ -9,5 +9,5 @@ pub mod analysis;
 pub mod app;
 pub mod common;
 pub mod quota;
-mod settings;
+pub(crate) mod settings;
 pub mod usage;

@@ -19,8 +19,8 @@ use ratatui::{
     style::{Color as RatatuiColor, Style},
     text::{Line, Span, Text},
     widgets::{
-        Block, Borders, Cell as RatatuiCell, Clear, Paragraph, Row as RatatuiRow, Scrollbar,
-        ScrollbarOrientation, ScrollbarState, Table as RatatuiTable,
+        Block, BorderType, Borders, Cell as RatatuiCell, Clear, Paragraph, Row as RatatuiRow,
+        Scrollbar, ScrollbarOrientation, ScrollbarState, Table as RatatuiTable,
     },
 };
 use sysinfo::System;
@@ -182,23 +182,19 @@ pub const CONTENT_MIN_H: u16 = 6;
 /// Rows the frame always spends below the content: the controls line.
 pub const FOOTER_H: u16 = 1;
 
-/// Chunk rects for an interactive frame.
+/// Chunk rects for a vertically stacked table pane (`content`, optional `band`,
+/// and `controls`), each spanning the width of the input `area`.
 pub struct FrameChunks {
-    /// Scrollable main table area, always the full width of the frame.
+    /// Scrollable main table area.
     pub content: Rect,
-    /// Full-width band under the content, present only when one was asked for.
+    /// Band under the content, present only when `band_height > 0`.
     pub band: Option<Rect>,
     /// Single-line controls footer area.
     pub controls: Rect,
 }
 
-/// Splits `area` into the standard interactive-view regions.
-///
-/// The content pane absorbs all leftover height, then an optional
-/// `band_height`-row band, then one row of controls. Every
-/// region spans the full width: a view that wants to show more than its table
-/// spends rows on a band, never columns on a side pane, so the table's own
-/// columns are never the thing that pays for it.
+/// Splits `area` vertically into `content` (floored at [`CONTENT_MIN_H`]), an
+/// optional `band_height`-row band, and a 1-row `controls` footer.
 pub fn frame_layout(area: Rect, band_height: u16) -> FrameChunks {
     let mut constraints: Vec<Constraint> = Vec::with_capacity(3);
     constraints.push(Constraint::Min(CONTENT_MIN_H));
@@ -346,11 +342,39 @@ pub fn render_scrollable_table(
     row_count: usize,
     scroll: &mut ScrollState,
 ) {
+    render_scrollable_table_with_border(
+        f,
+        area,
+        chrome,
+        header,
+        rows,
+        widths,
+        row_count,
+        scroll,
+        BorderType::Plain,
+    );
+}
+
+/// [`render_scrollable_table`] with an explicit [`BorderType`] (e.g. rounded
+/// corners for modern layouts).
+#[allow(clippy::too_many_arguments)]
+pub fn render_scrollable_table_with_border(
+    f: &mut Frame,
+    area: Rect,
+    chrome: TableChrome<'_>,
+    header: Vec<&str>,
+    rows: Vec<RatatuiRow>,
+    widths: &[Constraint],
+    row_count: usize,
+    scroll: &mut ScrollState,
+    border_type: BorderType,
+) {
     let viewport = area.height.saturating_sub(4);
     let theme = theme();
 
     let mut block = Block::default()
         .borders(Borders::ALL)
+        .border_type(border_type)
         .title(title_line(chrome.title))
         .border_style(theme.border());
     if let Some(note) = chrome.note {
@@ -392,6 +416,56 @@ pub fn render_scrollable_table(
     );
 }
 
+/// Returns the visible header column index under `(column, row)` inside a
+/// bordered ratatui table drawn in `table_area` with `widths`.
+pub fn header_column_at(
+    table_area: Rect,
+    widths: &[Constraint],
+    column: u16,
+    row: u16,
+) -> Option<usize> {
+    if table_area.width < 3 || table_area.height < 3 || row != table_area.y + 1 {
+        return None;
+    }
+    let inner = Rect::new(
+        table_area.x + 1,
+        table_area.y + 1,
+        table_area.width.saturating_sub(2),
+        1,
+    );
+    if column < inner.x || column >= inner.right() {
+        return None;
+    }
+    let cols = Layout::horizontal(widths).spacing(1).split(inner);
+    cols.iter()
+        .position(|cell| column >= cell.x && column < cell.right())
+}
+
+/// Returns the data row index under `(column, row)` inside a bordered ratatui
+/// table whose header has a one-row bottom margin (`body_y = table_area.y + 3`).
+pub fn table_body_row_at(
+    table_area: Rect,
+    scroll: &ScrollState,
+    row_count: usize,
+    column: u16,
+    row: u16,
+) -> Option<usize> {
+    if table_area.width < 3 || table_area.height < 5 {
+        return None;
+    }
+    let body_top = table_area.y + 3;
+    let body_bottom = table_area.bottom().saturating_sub(1);
+    if column <= table_area.x
+        || column >= table_area.right().saturating_sub(1)
+        || row < body_top
+        || row >= body_bottom
+    {
+        return None;
+    }
+    let idx = scroll.table.offset() + usize::from(row - body_top);
+    (idx < row_count).then_some(idx)
+}
+
 /// One line inside a [`DetailSection`].
 pub enum DetailItem {
     /// Standard `label ... value` metric row.
@@ -423,17 +497,16 @@ fn push_wrapped_value(lines: &mut Vec<Line<'static>>, value: &str, inner_w: usiz
     }
 }
 
-/// Draws a centered panel over `area` with the details of one table row:
-/// `name` in full, wrapped where it is wider than the panel, followed by each
-/// non-empty [`DetailSection`]. Lines that do not fit a short terminal are
-/// counted in the title and at the bottom rather than clipped silently. Closed
-/// with `Esc`.
-pub fn render_detail_panel(f: &mut Frame, area: Rect, name: &str, sections: &[DetailSection]) {
+/// Formats `name` and non-empty `sections` to fit `inner_w` content columns.
+pub fn format_detail_lines(
+    name: &str,
+    sections: &[DetailSection],
+    inner_w: usize,
+) -> Vec<Line<'static>> {
     let theme = theme();
-    let width = area.width.saturating_sub(4).min(62);
-    let inner_w = usize::from(width.saturating_sub(4)).max(1);
+    let inner_w = inner_w.max(1);
     let name: Vec<char> = name.chars().collect();
-    let mut lines: Vec<Line> = name
+    let mut lines: Vec<Line<'static>> = name
         .chunks(inner_w)
         .map(|chunk| {
             Line::from(Span::styled(
@@ -495,6 +568,92 @@ pub fn render_detail_panel(f: &mut Frame, area: Rect, name: &str, sections: &[De
             }
         }
     }
+    lines
+}
+
+/// Frame titles and border style for [`render_detail_pane`].
+pub struct DetailPaneChrome {
+    pub title: Line<'static>,
+    pub right_note: Option<Line<'static>>,
+    pub border_type: BorderType,
+}
+
+/// Draws a non-modal, scrollable detail pane inside `area` (used by split
+/// master-detail layouts), clamping `scroll_offset` into range.
+pub fn render_detail_pane(
+    f: &mut Frame,
+    area: Rect,
+    chrome: DetailPaneChrome,
+    name: &str,
+    sections: &[DetailSection],
+    scroll_offset: &mut usize,
+) {
+    let theme = theme();
+    let inner_w = usize::from(area.width.saturating_sub(4)).max(1);
+    let lines = format_detail_lines(name, sections, inner_w);
+    let line_count = lines.len();
+    let visible = usize::from(area.height.saturating_sub(2));
+    let max_offset = line_count.saturating_sub(visible);
+    *scroll_offset = (*scroll_offset).min(max_offset);
+    let hidden_below = line_count.saturating_sub(*scroll_offset + visible);
+
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(chrome.border_type)
+        .border_style(theme.border())
+        .title(chrome.title);
+    if let Some(mut note) = chrome.right_note {
+        if hidden_below > 0 {
+            note.spans.insert(
+                0,
+                Span::styled(format!(" +{hidden_below} ↓ ·"), theme.dim()),
+            );
+        }
+        block = block.title(note.right_aligned());
+    } else if hidden_below > 0 {
+        block = block.title(
+            Line::from(Span::styled(format!(" +{hidden_below} ↓ "), theme.dim())).right_aligned(),
+        );
+    }
+
+    f.render_widget(
+        Paragraph::new(lines)
+            .scroll((*scroll_offset as u16, 0))
+            .block(block),
+        area,
+    );
+
+    if line_count > visible && visible > 0 {
+        let mut bar_state = ScrollbarState::new(line_count)
+            .viewport_content_length(visible)
+            .position(*scroll_offset);
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(Some("│"))
+                .thumb_symbol("┃")
+                .track_style(theme.border())
+                .thumb_style(theme.dim()),
+            area.inner(Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut bar_state,
+        );
+    }
+}
+
+/// Draws a centered panel over `area` with the details of one table row:
+/// `name` in full, wrapped where it is wider than the panel, followed by each
+/// non-empty [`DetailSection`]. Lines that do not fit a short terminal are
+/// counted in the title and at the bottom rather than clipped silently. Closed
+/// with `Esc`.
+pub fn render_detail_panel(f: &mut Frame, area: Rect, name: &str, sections: &[DetailSection]) {
+    let theme = theme();
+    let width = area.width.saturating_sub(4).min(62);
+    let inner_w = usize::from(width.saturating_sub(4)).max(1);
+    let mut lines = format_detail_lines(name, sections, inner_w);
 
     let max_h = area.height.saturating_sub(2);
     let capacity = usize::from(max_h.saturating_sub(2));

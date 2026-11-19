@@ -2,7 +2,7 @@
 //! terminal allows, with bars stretched to the card width.
 
 use super::interactive::{
-    GridSpec, QuotaView, dim_line, fit_cards, no_cards_reason, render_quota_card,
+    GridSpec, QuotaView, dim_line, fit_cards, no_cards_reason, render_quota_card_with_border,
 };
 use crate::display::common::table::{create_controls_with_status, render_too_small};
 use crate::display::common::theme::theme;
@@ -10,7 +10,7 @@ use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
     style::Color,
-    widgets::Paragraph,
+    widgets::{BorderType, Paragraph},
 };
 
 /// The tab's grid: two cards across an 80-column terminal, three at 120.
@@ -31,6 +31,18 @@ pub(crate) fn draw_quota_tab(
     quota: &QuotaView,
     now: i64,
     status: Option<(&str, Color)>,
+) {
+    draw_quota_tab_with_border(f, area, quota, now, status, BorderType::Plain);
+}
+
+/// [`draw_quota_tab`] with an explicit card [`BorderType`].
+pub(crate) fn draw_quota_tab_with_border(
+    f: &mut Frame,
+    area: Rect,
+    quota: &QuotaView,
+    now: i64,
+    status: Option<(&str, Color)>,
+    border_type: BorderType,
 ) {
     if area.width < QUOTA_MIN_W || area.height < QUOTA_MIN_H {
         render_too_small(f, QUOTA_MIN_W, QUOTA_MIN_H);
@@ -57,7 +69,7 @@ pub(crate) fn draw_quota_tab(
             y: cell.y + shift,
             ..*cell
         };
-        render_quota_card(f, cell, card);
+        render_quota_card_with_border(f, cell, card, border_type);
     }
 
     let note = (hidden > 0).then(|| format!("+{hidden} hidden, enlarge the terminal"));

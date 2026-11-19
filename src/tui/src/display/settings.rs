@@ -9,13 +9,14 @@
 
 use crate::display::common::table::{create_controls_with_status, render_too_small, title_line};
 use crate::display::common::theme::theme;
+use crate::display::common::tui::MouseInput;
 use crossterm::event::KeyCode;
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
 };
 use vct_core::config::{Config, SettingValue, apply_setting, get_setting, setting_description};
 
@@ -81,6 +82,13 @@ const SECONDS: Kind = Kind::Number {
 const PANELS: &[&str] = &["usage", "quota", "panels"];
 
 const FIELDS: &[Field] = &[
+    field(
+        "General",
+        "Layout",
+        &["general", "layout"],
+        Kind::Choice(crate::layouts::LAYOUT_IDS),
+        true,
+    ),
     field(
         "General",
         "Default time range",
@@ -339,6 +347,14 @@ pub(crate) enum SettingsOutcome {
 /// Writes one field to the config file.
 pub(crate) type SaveSetting = Box<dyn FnMut(&[&str], &SettingValue) -> anyhow::Result<()>>;
 
+#[derive(Default)]
+struct SettingsHitMap {
+    sections_rect: Option<Rect>,
+    form_rect: Option<Rect>,
+    line_to_field: Vec<Option<usize>>,
+    editor_rect: Option<Rect>,
+}
+
 /// What the Settings tab keeps between frames.
 pub(crate) struct SettingsUiState {
     config: Config,
@@ -352,6 +368,7 @@ pub(crate) struct SettingsUiState {
     editor: Option<Editor>,
     /// The last save's outcome and whether it succeeded.
     message: Option<(String, bool)>,
+    hits: SettingsHitMap,
 }
 
 impl SettingsUiState {
@@ -379,6 +396,7 @@ impl SettingsUiState {
             offset: 0,
             editor: None,
             message: None,
+            hits: SettingsHitMap::default(),
         }
     }
 
@@ -694,8 +712,140 @@ impl SettingsUiState {
         SettingsOutcome::Stay
     }
 
-    /// Draws the tab into `area`.
+    /// Handles mouse clicks and wheel scrolls inside the Settings tab.
+    pub(crate) fn handle_mouse(&mut self, mouse: MouseInput) -> SettingsOutcome {
+        if self.editor.is_some() {
+            return self.handle_editor_mouse(mouse);
+        }
+        match mouse {
+            MouseInput::Scroll { lines, .. } => {
+                let max = FIELDS.len().saturating_sub(1) as isize;
+                self.row = (self.row as isize + isize::from(lines)).clamp(0, max) as usize;
+                self.message = None;
+                SettingsOutcome::Stay
+            }
+            MouseInput::Click { column, row } => {
+                if let Some(left) = self.hits.sections_rect
+                    && column > left.x
+                    && column < left.right().saturating_sub(1)
+                    && row > left.y
+                    && row < left.bottom().saturating_sub(1)
+                {
+                    let sec_idx = usize::from(row - (left.y + 1));
+                    if let Some(&target) = self.sections.get(sec_idx)
+                        && let Some(first) = FIELDS.iter().position(|field| field.section == target)
+                    {
+                        self.row = first;
+                        self.message = None;
+                    }
+                    return SettingsOutcome::Stay;
+                }
+                if let Some(right) = self.hits.form_rect
+                    && column > right.x
+                    && column < right.right().saturating_sub(1)
+                    && row > right.y
+                    && row < right.bottom().saturating_sub(1)
+                {
+                    let line_idx = self.offset + usize::from(row - (right.y + 1));
+                    if let Some(Some(field_idx)) = self.hits.line_to_field.get(line_idx) {
+                        let was_selected = self.row == *field_idx;
+                        self.row = *field_idx;
+                        self.message = None;
+                        let clicked_value = column >= right.right().saturating_sub(18);
+                        if was_selected || clicked_value {
+                            return self.open_editor();
+                        }
+                    }
+                }
+                SettingsOutcome::Stay
+            }
+        }
+    }
+
+    fn handle_editor_mouse(&mut self, mouse: MouseInput) -> SettingsOutcome {
+        let index = self.current();
+        match mouse {
+            MouseInput::Scroll { lines, .. } => {
+                if let Some(editor) = self.editor.as_mut() {
+                    match editor {
+                        Editor::Choice { selected } => {
+                            if let Kind::Choice(options) = FIELDS[index].kind
+                                && !options.is_empty()
+                            {
+                                let max = (options.len() - 1) as isize;
+                                *selected = (*selected as isize + isize::from(lines)).clamp(0, max)
+                                    as usize;
+                            }
+                        }
+                        Editor::Hosts {
+                            items,
+                            selected,
+                            input: None,
+                        } if !items.is_empty() => {
+                            let max = (items.len() - 1) as isize;
+                            *selected =
+                                (*selected as isize + isize::from(lines)).clamp(0, max) as usize;
+                        }
+                        _ => {}
+                    }
+                }
+                SettingsOutcome::Stay
+            }
+            MouseInput::Click { column, row } => {
+                let Some(rect) = self.hits.editor_rect else {
+                    self.editor = None;
+                    return SettingsOutcome::Stay;
+                };
+                if column < rect.x || column >= rect.right() || row < rect.y || row >= rect.bottom()
+                {
+                    self.editor = None;
+                    return SettingsOutcome::Stay;
+                }
+                if column > rect.x && column < rect.right().saturating_sub(1) && row > rect.y {
+                    let item_row = usize::from(row - (rect.y + 1));
+                    match self.editor.as_mut() {
+                        Some(Editor::Choice { .. }) => {
+                            if let Kind::Choice(options) = FIELDS[index].kind
+                                && let Some(&chosen) = options.get(item_row)
+                            {
+                                self.editor = None;
+                                return self
+                                    .commit(index, SettingValue::String(chosen.to_string()));
+                            }
+                        }
+                        Some(Editor::Hosts {
+                            items,
+                            selected,
+                            input,
+                        }) if input.is_none() && item_row < items.len() => {
+                            if *selected == item_row {
+                                *input = Some((Some(item_row), items[item_row].clone()));
+                            } else {
+                                *selected = item_row;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                SettingsOutcome::Stay
+            }
+        }
+    }
+
+    /// Draws the tab into `area` using plain borders.
     pub(crate) fn draw(&mut self, f: &mut Frame, area: Rect, status: Option<(&str, Color)>) {
+        self.draw_with_border(f, area, status, BorderType::Plain);
+    }
+
+    /// Draws the tab into `area` with an explicit [`BorderType`].
+    pub(crate) fn draw_with_border(
+        &mut self,
+        f: &mut Frame,
+        area: Rect,
+        status: Option<(&str, Color)>,
+        border_type: BorderType,
+    ) {
+        self.hits = SettingsHitMap::default();
         if area.width < SETTINGS_MIN_W || area.height < SETTINGS_MIN_H {
             render_too_small(f, SETTINGS_MIN_W, SETTINGS_MIN_H);
             return;
@@ -708,6 +858,8 @@ impl SettingsUiState {
         .areas(area);
         let [left, right] =
             Layout::horizontal([Constraint::Length(SECTIONS_W), Constraint::Min(0)]).areas(main);
+        self.hits.sections_rect = Some(left);
+        self.hits.form_rect = Some(right);
         let theme = theme();
         let dim = theme.dim();
         let here = FIELDS[self.row].section;
@@ -730,6 +882,7 @@ impl SettingsUiState {
             Paragraph::new(section_lines).block(
                 Block::default()
                     .borders(Borders::ALL)
+                    .border_type(border_type)
                     .title(title_line("Sections"))
                     .border_style(theme.border()),
             ),
@@ -741,17 +894,20 @@ impl SettingsUiState {
         let inner_w = usize::from(right.width.saturating_sub(5));
         let defaults = Config::default();
         let mut lines: Vec<Line> = Vec::new();
+        let mut line_to_field: Vec<Option<usize>> = Vec::new();
         let mut selected_line = 0;
         let mut changed_count = 0;
         for (index, field) in FIELDS.iter().enumerate() {
             if index == 0 || FIELDS[index - 1].section != field.section {
                 if index > 0 {
                     lines.push(Line::default());
+                    line_to_field.push(None);
                 }
                 lines.push(Line::from(Span::styled(
                     format!(" {}", field.section),
                     dim.bold(),
                 )));
+                line_to_field.push(None);
             }
             let value = self.display(&self.config, index);
             let label_w = inner_w.saturating_sub(value.chars().count());
@@ -777,7 +933,9 @@ impl SettingsUiState {
                 line = line.style(theme.selected());
             }
             lines.push(line);
+            line_to_field.push(Some(index));
         }
+        self.hits.line_to_field = line_to_field;
         // Keep the selection on screen, with its section heading when it is
         // the first field under one.
         let visible = usize::from(right.height.saturating_sub(2));
@@ -793,6 +951,7 @@ impl SettingsUiState {
         let hidden_below = lines.len().saturating_sub(self.offset + visible);
         let mut block = Block::default()
             .borders(Borders::ALL)
+            .border_type(border_type)
             .title(title_line("Settings"))
             .border_style(theme.border());
         let mut notes = Vec::new();
@@ -833,6 +992,7 @@ impl SettingsUiState {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
+                        .border_type(border_type)
                         .border_style(theme.border())
                         .title(Line::from(title))
                         .title(Line::from(Span::styled(default, dim)).right_aligned()),
@@ -861,13 +1021,22 @@ impl SettingsUiState {
             controls,
         );
 
-        if let Some(editor) = &self.editor {
-            self.draw_editor(f, area, editor, field);
+        if self.editor.is_some() {
+            self.hits.editor_rect = Some(self.draw_editor(f, area, field, border_type));
         }
     }
 
-    /// Draws the open editor centered over `area`.
-    fn draw_editor(&self, f: &mut Frame, area: Rect, editor: &Editor, field: &Field) {
+    /// Draws the open editor centered over `area`, returning its rectangle.
+    fn draw_editor(
+        &self,
+        f: &mut Frame,
+        area: Rect,
+        field: &Field,
+        border_type: BorderType,
+    ) -> Rect {
+        let Some(editor) = &self.editor else {
+            return Rect::default();
+        };
         let theme = theme();
         let dim = theme.dim();
         let selected = theme.selected();
@@ -875,7 +1044,7 @@ impl SettingsUiState {
         let (lines, hint): (Vec<Line>, &str) = match editor {
             Editor::Choice { selected: at } => {
                 let Kind::Choice(options) = field.kind else {
-                    return;
+                    return Rect::default();
                 };
                 let lines = options
                     .iter()
@@ -940,6 +1109,7 @@ impl SettingsUiState {
             Paragraph::new(body).block(
                 Block::default()
                     .borders(Borders::ALL)
+                    .border_type(border_type)
                     .border_style(theme.accent())
                     .title(Line::from(Span::styled(
                         format!(" {} ", field.label),
@@ -948,6 +1118,7 @@ impl SettingsUiState {
             ),
             rect,
         );
+        rect
     }
 }
 
@@ -1217,7 +1388,7 @@ mod tests {
         assert_eq!(press(&mut state, &[KeyCode::Up]), SettingsOutcome::Stay);
         assert_eq!(state.row, 0);
         // Down from a section's last field lands on the next section's first.
-        press(&mut state, &[KeyCode::Down, KeyCode::Down]);
+        press(&mut state, &[KeyCode::Down, KeyCode::Down, KeyCode::Down]);
         assert_eq!(FIELDS[state.row].section, "Usage");
         // A field is changed where the selection is, with no pane to enter.
         let before = state.config().usage.merge_models;
@@ -1314,5 +1485,69 @@ mod tests {
         state.set_message("saved".to_string(), true);
         let saved = render_footer(&mut state);
         assert!(saved.contains("saved") && !saved.contains("Updated to v3.2.0"));
+    }
+
+    #[test]
+    fn mouse_clicks_jump_sections_open_choices_and_dismiss_editors() {
+        let (mut state, saved) = form();
+        let lines = screen(&mut state, 100, 24);
+        // Click "Providers" in the Sections box on the left.
+        let sec_row = lines
+            .iter()
+            .position(|line| line.contains("Providers"))
+            .unwrap() as u16;
+        assert_eq!(
+            state.handle_mouse(MouseInput::Click {
+                column: 6,
+                row: sec_row,
+            }),
+            SettingsOutcome::Stay
+        );
+        assert_eq!(FIELDS[state.row].section, "Providers");
+
+        // Wheel scroll back to row 0 ("Layout") and click its value to open the picker.
+        state.handle_mouse(MouseInput::Scroll {
+            column: 40,
+            row: 5,
+            lines: -30,
+        });
+        assert_eq!(FIELDS[state.row].label, "Layout");
+        let lines = screen(&mut state, 100, 24);
+        let layout_row = lines
+            .iter()
+            .position(|line| line.contains("Layout"))
+            .unwrap() as u16;
+        assert_eq!(
+            state.handle_mouse(MouseInput::Click {
+                column: 92,
+                row: layout_row,
+            }),
+            SettingsOutcome::Stay
+        );
+        assert!(state.has_open_editor());
+
+        // Clicking outside the open Choice editor dismisses it without saving.
+        let _ = screen(&mut state, 100, 24);
+        assert_eq!(
+            state.handle_mouse(MouseInput::Click { column: 1, row: 1 }),
+            SettingsOutcome::Stay
+        );
+        assert!(!state.has_open_editor());
+        assert!(saved.borrow().is_empty());
+
+        // Re-open the Layout picker and click the second option directly.
+        state.open_editor();
+        let _ = screen(&mut state, 100, 24);
+        let rect = state.hits.editor_rect.unwrap();
+        if crate::layouts::LAYOUT_IDS.len() >= 2 {
+            assert_eq!(
+                state.handle_mouse(MouseInput::Click {
+                    column: rect.x + 2,
+                    row: rect.y + 2,
+                }),
+                SettingsOutcome::Changed
+            );
+            assert_eq!(state.config().general.layout, crate::layouts::LAYOUT_IDS[1]);
+        }
     }
 }
