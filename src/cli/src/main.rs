@@ -1,13 +1,8 @@
 //! Binary entry point for the `vibe_coding_tracker` (`vct`) CLI.
 //!
-//! Parses the subcommand with clap and dispatches to the library crates:
-//! batch `analysis` and `usage` views (TUI / table / text / JSON with a
-//! time-range filter), complete single-file analysis, plus `version`,
-//! `update`, `quota` and `config`. The heavy lifting lives in [`vct_core`]
-//! and [`vct_tui`]; this file is wiring.
+//! Parses the command line with clap and dispatches to [`vct_core`] and [`vct_tui`]: batch and single-file `analysis`, `usage`, `quota`, `ledger`, `config`, `version`, and `update`.
 //!
-//! Process-wide setup runs *before* clap on purpose, and the ordering is
-//! load-bearing — see [`main`].
+//! Process-wide allocator tuning, file logging, panic-hook installation, and CLI version-probe opt-in run before argument parsing; see [`main`].
 
 mod cli;
 
@@ -22,10 +17,7 @@ use serde::Serialize;
 use std::io::{self, Write};
 use std::sync::Arc;
 
-// mimalloc is opt-in behind the `mimalloc` cargo feature: it is faster for
-// short one-shot runs, but its lazy purge retains freed pages, which measured
-// roughly 10× the RSS of the system allocator on the TUI loops (repeated parse
-// of session directories). So the default build keeps the system allocator.
+// Opt-in only: mimalloc's lazy page purge retains roughly 10× the RSS of the system allocator across repeated TUI scan loops.
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -36,38 +28,17 @@ use vct_core::usage::scan_usage_priced;
 use vct_tui::display::app::{AppOptions, Tab, run_app};
 use vct_tui::display::usage::{display_usage_table, display_usage_text};
 
-/// Runs process-wide setup, then hands off to [`run`], which does the clap
-/// parse and the dispatch.
-///
-/// Everything here has to happen before [`run`] reaches `Cli::parse()`:
-/// `tune_system_allocator()` caps glibc arenas before the first allocation
-/// (a Rayon worker); the file logger and the terminal panic hook are installed
-/// before anything can log or panic; `enable_cli_version_detection()` opts this
-/// process into the `<cli> --version` probing that library embedders and tests
-/// must not do. The `--version` / `-V` branch is then handled by hand so the
-/// bare flag prints just [`vct_core::VERSION`] without going through clap
-/// (the `version` *subcommand* still renders the full table).
-///
-/// # Errors
-///
-/// Propagates any failure from the dispatched subcommand: session parsing,
-/// JSON (de)serialization, terminal/TUI errors, or the network and
-/// binary-replacement errors raised by `update`. Pricing
-/// fetch failure in `usage --json` is downgraded to a warning rather than an
-/// error, so costs are reported as unavailable instead of aborting.
+/// Runs process-wide setup before argument parsing, short-circuits bare `--version`/`-V`, and dispatches via [`run`].
 fn main() -> Result<()> {
     // Must precede the first allocation; see `tune_system_allocator`.
     vct_core::utils::tune_system_allocator();
 
-    // Default level `warn`, and it writes only to `~/.vct/logs/`, never the
-    // terminal, so it is TUI-safe.
+    // Writes only to `~/.vct/logs/` (default level `warn`), never the terminal.
     vct_core::logging::init();
-    // Terminal-restore-on-panic is a presentation concern owned by the display
-    // layer, so the binary installs it rather than core `logging`.
+    // Installed here rather than in `vct_core::logging` because terminal restoration belongs to the display layer.
     vct_tui::display::common::tui::ensure_terminal_panic_hook();
 
-    // Probing `<cli> --version` spawns a subprocess and writes to `~/.vct`, so
-    // core leaves it to the binary to allow.
+    // Opt in to `<cli> --version` subprocess probing, which core disables by default for library callers and tests.
     vct_core::quota::enable_cli_version_detection();
 
     if matches!(
@@ -80,12 +51,10 @@ fn main() -> Result<()> {
 
     let result = run();
     if let Err(error) = &result {
-        // Record the final error before anyhow prints it to stderr and the
-        // process exits — the log file is the durable record of the failure.
+        // Persist the final error to the log file before anyhow prints it and exits.
         log::error!("command failed: {error:#}");
     }
-    // A detached worker may still be saving; returning now would kill it
-    // mid-write.
+    // A detached worker may still be saving; returning now would kill it mid-write.
     vct_core::utils::finish_atomic_writes();
     result
 }
@@ -219,8 +188,6 @@ fn dispatch(cli: Cli) -> Result<()> {
                 all,
                 config.general.default_time_range,
             );
-            // A `--merge-providers` flag forces merging on; otherwise the saved
-            // preference decides.
             let merge = merge_providers || config.usage.merge_models;
             let scan_pool = Arc::new(build_scan_pool(config.performance.resolved_scan_threads())?);
             prepare_remotes(&config.remotes)?;
@@ -334,12 +301,7 @@ fn dispatch(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-/// Stops an invocation that cannot run, before anything touches `~/.vct`.
-///
-/// No subcommand means the interactive app, which needs a terminal: without
-/// one the help is printed with exit code 2, as it was while a subcommand was
-/// required. `quota` prints one provider's response, so a format flag needs a
-/// provider.
+/// Exits with code 2 before touching `~/.vct` if the bare command has no terminal or `quota` gets a format flag without a provider.
 fn reject_unusable_invocation(cli: &Cli) {
     use clap::CommandFactory;
     use std::io::IsTerminal;
@@ -364,11 +326,7 @@ fn reject_unusable_invocation(cli: &Cli) {
     }
 }
 
-/// Opens the interactive app on `start`.
-///
-/// `period` is the `--daily` / `--weekly` / `--monthly` / `--all` flags, which
-/// win over the configured default range; `merge_providers` forces the usage
-/// table to start merged.
+/// Opens the interactive app on `start`; `period` is `[daily, weekly, monthly, all]` and `merge_providers` overrides `usage.merge_models`.
 fn open_app(start: Tab, period: [bool; 4], merge_providers: bool) -> Result<()> {
     let config = vct_core::config::load();
     vct_core::logging::apply(&config.logging);
@@ -391,7 +349,7 @@ fn open_app(start: Tab, period: [bool; 4], merge_providers: bool) -> Result<()> 
     })
 }
 
-/// Drops the snapshots of hosts no longer listed under `[remotes]`.
+/// Drops snapshots for hosts removed from `[remotes]` and returns the cache directory.
 fn prune_remotes(config: &vct_core::config::RemotesConfig) -> Result<std::path::PathBuf> {
     let cache_dir = vct_core::utils::resolve_paths()?.cache_dir;
     // A file that failed to parse reads as no hosts, which must not cost the
@@ -402,10 +360,7 @@ fn prune_remotes(config: &vct_core::config::RemotesConfig) -> Result<std::path::
     Ok(cache_dir)
 }
 
-/// Brings the snapshots of the `[remotes]` hosts up to date for a one-shot
-/// scan, warning about each host that failed since its output is final.
-///
-/// The interactive app never waits on ssh: it fetches behind its first scan.
+/// Prunes removed `[remotes]` snapshots and synchronously refreshes the remaining hosts, printing a warning for each failure.
 fn prepare_remotes(config: &vct_core::config::RemotesConfig) -> Result<()> {
     let cache_dir = prune_remotes(config)?;
     for (host, error) in vct_core::remote::sync(&cache_dir, config) {
@@ -416,7 +371,7 @@ fn prepare_remotes(config: &vct_core::config::RemotesConfig) -> Result<()> {
     Ok(())
 }
 
-/// Whether `cli` enters [`open_app`] rather than running a one-shot command.
+/// Returns whether `cli` opens the interactive app via [`open_app`] rather than running a one-shot command.
 fn opens_interactive_app(cli: &Cli) -> bool {
     matches!(
         &cli.command,
@@ -437,13 +392,7 @@ fn opens_interactive_app(cli: &Cli) -> bool {
     )
 }
 
-/// Starts the silent background auto-updater for one-shot commands.
-///
-/// Skipped for `update` / `config` and for invocations that enter the
-/// interactive app, which runs its own detached check and surfaces a footer
-/// notice on completion. Joining the returned handle after the command's own
-/// work keeps startup latency at zero while letting a fast command finish an
-/// in-flight daily download before exiting.
+/// Spawns a background auto-update check for one-shot commands other than `update` and `config`, returning `None` when skipped or disabled.
 fn spawn_cli_auto_update(cli: &Cli) -> Option<std::thread::JoinHandle<()>> {
     if opens_interactive_app(cli)
         || matches!(
@@ -504,18 +453,7 @@ fn run_config(action: ConfigAction) -> Result<()> {
     Ok(())
 }
 
-/// Runs `vct quota <provider>`: fetch the raw body and render it.
-///
-/// `text` / `table` pick the output format; neither set means pretty JSON.
-/// Dispatching the clap [`QuotaProvider`] onto core's raw fetchers is CLI glue,
-/// so it stays out of the display-free core `quota` module.
-///
-/// # Errors
-///
-/// Returns an error if credentials are missing, the request fails, or the API
-/// answers a non-2xx status (the body is still printed first; a 401/403 appends
-/// the provider's login hint). For Antigravity, which runs agy instead of an
-/// HTTP request, a failed `/usage` run takes the place of the status.
+/// Fetches `provider`'s raw quota response and prints it as text, table, or pretty JSON, returning an error after printing if the status is non-2xx (or if Antigravity reports an error).
 fn run_quota(provider: QuotaProvider, text: bool, table: bool) -> Result<()> {
     use vct_core::quota::{
         CLAUDE_LOGIN_HINT, CODEX_LOGIN_HINT, COPILOT_LOGIN_HINT, CURSOR_LOGIN_HINT,
@@ -583,11 +521,7 @@ fn write_pretty_json(value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
-/// Says how many sessions came from the ledger rather than from disk.
-///
-/// Those sessions are real usage the assistant has since pruned, so they
-/// belong in every total; the note is what keeps the total from disagreeing
-/// with the files on disk in silence.
+/// Prints a stderr note when any sessions in `diagnostics` came only from the ledger rather than on-disk logs.
 fn report_retained_sessions(diagnostics: &vct_core::ScanDiagnostics) {
     if diagnostics.retained > 0 {
         eprintln!(
@@ -597,7 +531,7 @@ fn report_retained_sessions(diagnostics: &vct_core::ScanDiagnostics) {
     }
 }
 
-/// Rejects a completely failed noninteractive scan and reports partial data.
+/// Returns an error if every analysis source failed, or warns on stderr on partial failures.
 fn report_analysis_collection(diagnostics: &vct_core::analysis::ScanDiagnostics) -> Result<()> {
     report_retained_sessions(diagnostics);
     let Some(first) = diagnostics.failures.first() else {
@@ -625,7 +559,7 @@ fn report_analysis_collection(diagnostics: &vct_core::analysis::ScanDiagnostics)
     Ok(())
 }
 
-/// Rejects a completely failed noninteractive usage scan and reports partial data.
+/// Returns an error if every usage source failed, or warns on stderr on partial failures.
 fn report_usage_collection(diagnostics: &vct_core::usage::ScanDiagnostics) -> Result<()> {
     report_retained_sessions(diagnostics);
     let Some(first) = diagnostics.failures.first() else {

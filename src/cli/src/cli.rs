@@ -1,16 +1,10 @@
-//! clap command-line surface and the time-range filter it resolves to.
+//! clap command-line surface and time-range flag resolution.
 //!
-//! The `///` comments on [`Commands`] and their arguments are what clap
-//! renders as `--help` text, so they read as user-facing prose. [`Cli`] is
-//! the parsed top-level structure; [`resolve_time_range_with_default`]
-//! collapses the mutually-exclusive `--daily` / `--weekly` / `--monthly` /
-//! `--all` flags into a single `TimeRange`.
+//! Doc comments on [`Commands`], [`QuotaProvider`], [`LedgerAction`], [`ConfigAction`], and their fields are rendered by clap as `--help` text.
 
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
-// The period-flag resolver is core domain logic (no clap types), so it lives in
-// `models::filter`; re-exported here so the clap layer has one import path.
 pub use vct_core::models::resolve_time_range_with_default;
 
 /// A provider whose raw quota/usage API response `vct quota` can print.

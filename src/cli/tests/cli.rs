@@ -1,23 +1,9 @@
-// Integration tests for the built `vct` binary.
+// Integration tests for the `vct` binary:
+// 1. CLI wiring and single-file behavior (checks stopping before dispatch run on the inherited environment; anything reaching dispatch uses an isolated child HOME because `run()` checks auto-update config).
+// 2. Per-child HOME smoke tests for batch `usage`, `analysis`, `config`, and startup side effects.
+// 3. Remote ledger export and SSH sync behavior.
 //
-// Two groups:
-//  1. CLI wiring and single-file behavior. Only a check that stops before
-//     dispatch — `--help`, an unknown subcommand, a rejected flag combination,
-//     or the top-level `--version` / `-V` flag `main.rs` short-circuits ahead
-//     of clap — runs on the inherited environment; anything that reaches
-//     dispatch uses an isolated child HOME, because `run()` calls
-//     `spawn_cli_auto_update` for one-shot commands and that reads
-//     `~/.vct/config.toml`.
-//  2. Per-child HOME smoke tests — batch `usage` / `analysis` run against an
-//     isolated temp HOME seeded with fixture sessions plus an offline pricing
-//     cache, while the `config` and startup side-effect checks seed only what
-//     the case under test needs, so they can assert what the binary creates and
-//     what it rewrites. Either way the compiled binary is exercised end-to-end
-//     without touching the real home or any external API.
-//
-// Setting the environment on the child is the only way to isolate a separate
-// binary; it is per-child (no `#[serial]`, no process-global mutation) and
-// behaves identically locally and in CI.
+// Isolation is applied per child process rather than mutating the test process environment, so tests run in parallel.
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -26,8 +12,7 @@ use vct_core::session::{ParseMode, parse_session_file_typed_with_mode};
 use vct_core::{CARGO_VERSION, RUST_VERSION, VERSION, parse_session_file_typed};
 use vct_test_support::{TempHome, fixture};
 
-/// A minimal cost-fields pricing map used to seed the offline cache so `usage`
-/// prices its models without a network fetch.
+/// Returns a minimal pricing map for seeding the offline cache.
 fn pricing_seed() -> serde_json::Value {
     json!({
         "claude-sonnet-4-20250514": {
@@ -39,8 +24,7 @@ fn pricing_seed() -> serde_json::Value {
     })
 }
 
-/// `vct` with an isolated, offline per-child environment so every provider
-/// directory and `~/.vct` cache resolve under the temp home.
+/// Returns a `vct` command isolated to `home` with network access disabled.
 fn child_cmd(home: &TempHome) -> Command {
     let mut cmd = Command::cargo_bin("vibe_coding_tracker").unwrap();
     cmd.env("HOME", home.home())
@@ -98,10 +82,7 @@ fn test_version_command_json_matches_build_constants() {
         .unwrap();
     assert!(output.status.success());
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    // The whole object rather than a field at a time: the subcommand renders
-    // `get_version_info()` while `--version` prints `VERSION` from `main.rs`
-    // ahead of clap, so this pins the subcommand's side of that pair to the
-    // same constants, and an exact match pins the key set as well as the values.
+    // Assert the full object to pin both the JSON key set and that `vct version` matches the build constants.
     assert_eq!(
         json,
         json!({
@@ -302,8 +283,6 @@ fn analysis_detects_provider_by_content_not_extension() {
     let home = TempHome::new();
     let temp_dir = tempfile::TempDir::new().unwrap();
 
-    // A Claude session under a `.txt` name: detection reads the records, so the
-    // provider still resolves and the run succeeds.
     let wrong_ext = temp_dir.path().join("session.txt");
     std::fs::copy(fixture("sessions/claude_code.jsonl"), &wrong_ext).unwrap();
     child_cmd(&home)
@@ -315,8 +294,6 @@ fn analysis_detects_provider_by_content_not_extension() {
             r#""extensionName": "Claude-Code""#,
         ));
 
-    // And the mirror case: a `.jsonl` name buys nothing when the content does
-    // not even parse.
     let right_ext = temp_dir.path().join("session.jsonl");
     std::fs::write(&right_ext, "test content\n").unwrap();
     child_cmd(&home)
@@ -406,7 +383,6 @@ fn test_version_help() {
 
 #[test]
 fn test_removed_subcommands_are_rejected() {
-    // `monitor` became `vct quota`, and `fetch` was an alias of `quota`.
     for name in ["monitor", "fetch"] {
         Command::cargo_bin("vibe_coding_tracker")
             .unwrap()
@@ -419,8 +395,6 @@ fn test_removed_subcommands_are_rejected() {
 
 #[test]
 fn test_no_subcommand_off_a_terminal_prints_help() {
-    // The interactive app needs a terminal; a pipe gets the help instead, and
-    // nothing is dispatched.
     Command::cargo_bin("vibe_coding_tracker")
         .unwrap()
         .assert()
@@ -457,8 +431,6 @@ fn test_invalid_command() {
 
 #[test]
 fn test_usage_multiple_output_formats() {
-    // --json/--text/--table belong to a single clap group and must be mutually
-    // exclusive.
     for combo in [
         ["--json", "--text"],
         ["--json", "--table"],
@@ -567,8 +539,6 @@ fn single_file_summary_projection_is_parse_mode_invariant() {
 
 #[test]
 fn test_quota_format_requires_provider() {
-    // Without a provider `quota` opens the app; a format flag asks for a
-    // printed response, which is one provider's.
     for flag in ["--json", "--text", "--table"] {
         Command::cargo_bin("vibe_coding_tracker")
             .unwrap()
@@ -622,9 +592,7 @@ fn usage_json_smoke_prices_seeded_session() {
         "session.jsonl",
         &vct_test_support::fixture_str("sessions/claude_code.jsonl"),
     );
-    // Codex is the provider whose usage stays nested internally, so the
-    // flat-shape loop below only means anything with one of its sessions in the
-    // scan.
+    // Codex keeps usage nested internally, so include one to verify flat normalization below.
     home.put_codex_session(
         "2026/06/06/rollout-2026-06-06T10-00-00-019e4b75-8a4e-7801-a9ed-9723e77e0497.jsonl",
         &vct_test_support::fixture_str("sessions/codex.jsonl"),
@@ -650,8 +618,6 @@ fn usage_json_smoke_prices_seeded_session() {
         .expect("seeded Claude model should appear in usage output");
     assert!(sonnet["cost_usd"].is_number(), "cost should be priced");
 
-    // Every row's usage serializes to the same flat key set regardless of the
-    // provider's internal shape (Codex is nested internally).
     for row in arr {
         let usage = row["usage"]
             .as_object()
@@ -851,7 +817,6 @@ fn analysis_noninteractive_formats_warn_and_keep_partial_results() {
 fn all_short_flag_parses_for_both_subcommands() {
     let home = TempHome::new();
     home.seed_pricing_cache(&pricing_seed());
-    // `-a` is the short alias for `--all`; a parse error would be a non-zero exit.
     for subcommand in ["usage", "analysis"] {
         child_cmd(&home)
             .arg(subcommand)
@@ -864,8 +829,6 @@ fn all_short_flag_parses_for_both_subcommands() {
 
 #[test]
 fn readonly_commands_do_not_create_config() {
-    // `version` (like other settings-free commands) must not materialize
-    // ~/.vct/config.toml as a home-directory side effect.
     let home = TempHome::new();
     child_cmd(&home).arg("version").assert().success();
     assert!(
@@ -878,8 +841,6 @@ fn readonly_commands_do_not_create_config() {
     );
 }
 
-/// The flat layout that preceded `quota/` and `version/` is swept on the way
-/// in, by a command that owns no settings and creates nothing else.
 #[test]
 fn startup_removes_the_flat_cache_layout() {
     const LEGACY: [&str; 12] = [
@@ -960,8 +921,7 @@ fn dev_build_skips_auto_update_before_network_or_cache_writes() {
     );
 }
 
-// The dead proxy is what makes a regressed offline guard fail this assertion
-// rather than download a release over the compiled test binary.
+// The dead proxy makes a regressed offline guard fail instead of downloading a release over the test binary.
 #[test]
 fn explicit_update_is_a_no_op_when_offline() {
     let home = TempHome::new();
@@ -1024,8 +984,7 @@ fn config_show_creates_and_prints_settings() {
         .stdout(predicate::str::contains("[providers]"))
         .stdout(predicate::str::contains("[usage.quota]"));
 
-    // The show path must have materialized the file under the temp home, and it
-    // must not fold in any version.json bookkeeping.
+    // Update check bookkeeping must stay out of config.toml.
     let config = home.home().join(".vct/config.toml");
     assert!(config.exists());
     let text = std::fs::read_to_string(&config).unwrap();
@@ -1035,7 +994,6 @@ fn config_show_creates_and_prints_settings() {
 #[test]
 fn config_migrate_upgrades_a_legacy_file() {
     let home = TempHome::new();
-    // Seed a pre-`[usage.quota]` config with the legacy key names.
     home.put(
         ".vct/config.toml",
         "[usage]\nquota_panels = [\"claude\"]\nrefresh_interval_secs = 15\n",
@@ -1055,7 +1013,6 @@ fn config_migrate_upgrades_a_legacy_file() {
     assert!(!text.contains("quota_panels"));
     assert!(!text.contains("refresh_interval_secs"));
 
-    // Running it again is a no-op.
     child_cmd(&home)
         .arg("config")
         .arg("migrate")
@@ -1067,8 +1024,6 @@ fn config_migrate_upgrades_a_legacy_file() {
 #[cfg(unix)]
 #[test]
 fn config_edit_splits_a_multi_word_editor_command() {
-    // `$EDITOR` / `$VISUAL` often carry arguments (`code --wait`); the program +
-    // args must be split, with the config path passed as the trailing arg.
     use std::os::unix::fs::PermissionsExt;
 
     let home = TempHome::new();
@@ -1105,8 +1060,6 @@ fn config_edit_splits_a_multi_word_editor_command() {
 #[cfg(unix)]
 #[test]
 fn config_edit_propagates_a_failing_editor() {
-    // An editor that exits non-zero must make `vct config edit` exit non-zero, so
-    // scripts can tell the edit was aborted / failed.
     use std::os::unix::fs::PermissionsExt;
 
     let home = TempHome::new();
@@ -1162,11 +1115,7 @@ fn ledger_export_prints_one_line_of_totals_and_creates_no_config() {
     assert!(home.home().join(".vct/sessions/claude.json").exists());
 }
 
-/// [`child_cmd`] without `VCT_OFFLINE`, which would skip the remote fetch.
-///
-/// The seeded pricing cache answers the one request such a child would make;
-/// the dead proxy makes it fail rather than leave the machine if a test ever
-/// straddles the UTC midnight that renames that cache.
+/// Returns a [`child_cmd`] without `VCT_OFFLINE` so remote sync runs, with a dead proxy so any unexpected HTTP request fails locally (for example if a test straddles UTC midnight and misses the seeded pricing cache).
 #[cfg(unix)]
 fn online_cmd(home: &TempHome) -> Command {
     let mut cmd = child_cmd(home);
@@ -1178,8 +1127,7 @@ fn online_cmd(home: &TempHome) -> Command {
     cmd
 }
 
-/// A stand-in `ssh` that ignores its destination and runs the real binary's
-/// `ledger export` against `remote`, the way sshd would on the other machine.
+/// Creates a temporary directory with a stub `ssh` that runs `vct ledger export` against `remote`.
 #[cfg(unix)]
 fn fake_ssh_dir(remote: &TempHome) -> tempfile::TempDir {
     use std::os::unix::fs::PermissionsExt;
@@ -1206,8 +1154,7 @@ fn usage_and_analysis_merge_a_configured_remote_and_drop_it_once_unconfigured() 
     );
     let ssh = fake_ssh_dir(&remote);
     let local = TempHome::new();
-    // Today's pricing cache answers the pricing fetch before any request, so
-    // the child can run without `VCT_OFFLINE`, which would skip the remote.
+    // Seed pricing so `online_cmd` needs no HTTP request.
     local.seed_pricing_cache(&pricing_seed());
     local.put(
         ".vct/config.toml",
@@ -1247,8 +1194,7 @@ fn usage_and_analysis_merge_a_configured_remote_and_drop_it_once_unconfigured() 
     let analysis = online(&["analysis", "--text"]);
     assert!(String::from_utf8_lossy(&analysis.stdout).contains("claude-sonnet-4-20250514"));
 
-    // A config that does not parse reads as no hosts; that is not the user
-    // removing one, so the snapshot stays and keeps counting.
+    // An unparseable config reads as no hosts; that is not the user removing one, so the snapshot stays and keeps counting.
     local.put(".vct/config.toml", "[remotes]\nhosts = \"devbox\"\n");
     let broken = online(&["usage", "--json"]);
     assert_eq!(broken.stdout, usage.stdout);
