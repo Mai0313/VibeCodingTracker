@@ -1,25 +1,11 @@
-//! Cursor session reader (local SQLite blob stores).
+//! Cursor session reader for local SQLite blob stores.
 //!
-//! Cursor keeps session data in two places under `~/.cursor`:
+//! Cursor stores session data in two places under `~/.cursor`:
 //!
-//! - `ai-tracking/ai-code-tracking.db` — one row per AI-authored code line,
-//!   carrying the `model` that wrote it. Both views use it to attribute a
-//!   conversation to a model (`conversationId -> model`).
-//! - `chats/<projectHash>/<conversationId>/store.db` — a content-addressed blob
-//!   store holding the whole conversation. Assistant turns live in binary
-//!   protobuf DAG nodes (`field 4` = the message JSON, `field 26` = timestamp,
-//!   `field 5` = the running context-window gauge); tool results live in
-//!   standalone JSON blobs. `analysis` reads the tool calls out of it; `usage`
-//!   wants only the gauge, so it never loads the JSON blobs at all.
+//! - `ai-tracking/ai-code-tracking.db`: one row per AI-authored code line carrying the `model` that wrote it, used to attribute `conversationId -> model`.
+//! - `chats/<projectHash>/<conversationId>/store.db`: a content-addressed blob store where assistant turns live in binary protobuf DAG nodes (`field 4` = message JSON, `field 26` = epoch-ms timestamp, `field 5` = running context-window gauge) and tool results live in standalone JSON blobs.
 //!
-//! Cursor does **not** persist real billing tokens locally (only that gauge),
-//! so the `usage` view is a deliberately-rough **local estimate**. There is no
-//! dashboard-API path here; see `docs/quota.md` for the raw endpoint if it is
-//! ever reintroduced.
-//!
-//! Both entry points return the same `(local YYYY-MM-DD, CodeAnalysis[, cost])`
-//! shape the OpenCode reader produces, so the `usage` / `analysis` aggregators
-//! fold Cursor in exactly like the other providers.
+//! Cursor persists no billing tokens locally, only the context-window gauge; the `usage` view is a rough local estimate derived from that gauge and never loads the JSON tool-result blobs. No dashboard API is queried; see `docs/quota.md` for the raw endpoint.
 
 use crate::VERSION;
 use crate::constants::FastHashMap;
@@ -43,23 +29,15 @@ use std::path::{Path, PathBuf};
 // Public entry points
 // ===========================================================================
 
-/// Reads per-model token usage for Cursor.
+/// Returns per-model estimated token usage for Cursor within `time_range`.
 ///
-/// A deliberately-rough estimate: Cursor persists no billing tokens locally, so
-/// each conversation's context gauge is counted as cache-read tokens instead.
-/// Pricing is left to the caller's shared LiteLLM map so a TUI refresh does not
-/// rebuild one per reader call.
+/// Cursor persists no billing tokens locally; each assistant turn's context-window gauge from `chats_dir` is summed as cache-read tokens and attributed to a model via `tracking_db` (falling back to the store's `lastUsedModel`, then `"unknown"`). Each tuple is `(local YYYY-MM-DD, CodeAnalysis, 0.0)` with one model's `conversation_usage` and zero stored cost, matching [`crate::session::read_opencode_usage`].
 ///
-/// Each returned tuple is `(local YYYY-MM-DD, CodeAnalysis, 0.0)` with the
-/// analysis carrying one model's `conversation_usage`, matching the shape of
-/// [`crate::session::read_opencode_usage`].
+/// Unreadable stores are logged and skipped when at least one candidate decodes.
 ///
 /// # Errors
 ///
-/// A store that cannot be read is logged and skipped. Returns an error only
-/// when no candidate decoded at all — a candidate being a discovered store or
-/// a directory that could not be walked, so an unreadable chats root errors on
-/// its own.
+/// Returns an error when at least one candidate (discovered store or unreadable directory under `chats_dir`) exists and none could be decoded.
 pub fn read_cursor_usage(
     chats_dir: &Path,
     tracking_db: &Path,
@@ -115,20 +93,15 @@ pub(crate) fn read_cursor_usage_with_diagnostics(
     }
 }
 
-/// Reads per-model file-operation metrics for Cursor from the chat stores.
+/// Returns per-model file-operation metrics for Cursor within `time_range`.
 ///
-/// Walks every `chats/*/*/store.db`, extracts each assistant turn's tool calls
-/// (`Read`/`ReadFile` / `Write` / `StrReplace`→edit / `Shell`→bash /
-/// `TodoWrite`), and attributes them to the conversation's model (from
-/// `ai-code-tracking.db`, else the store's `lastUsedModel`, else `"unknown"`).
-/// Records are bucketed by the assistant turn's local date and filtered by
-/// `time_range`.
+/// Walks every `<projectHash>/<conversationId>/store.db` under `chats_dir`, extracts each assistant turn's tracked tool calls (`Read`/`ReadFile`, `Write`, `StrReplace`, `Shell`, `TodoWrite`), and attributes them to the conversation's model from `tracking_db` (falling back to the store's `lastUsedModel`, then `"unknown"`). Records are bucketed by the assistant turn's local date; `mode` controls whether per-operation detail bodies are retained.
+///
+/// Unreadable stores are logged and skipped when at least one candidate decodes.
 ///
 /// # Errors
 ///
-/// A bad store is logged and skipped when any other store succeeds. Returns an
-/// error when stores exist but none can be read, allowing batch diagnostics to
-/// distinguish total parser failure from an empty Cursor history.
+/// Returns an error when at least one candidate (discovered store or unreadable directory under `chats_dir`) exists and none could be decoded.
 pub fn read_cursor_analysis(
     chats_dir: &Path,
     tracking_db: &Path,
@@ -178,8 +151,7 @@ pub(crate) struct CursorAnalysisRead {
     pub candidates: usize,
     /// Number of stores decoded successfully, including valid empty stores.
     pub parsed: usize,
-    /// Traversal, tracking-DB, and per-store failures retained for
-    /// noninteractive diagnostics.
+    /// Traversal, tracking-DB, and per-store failures.
     pub failures: Vec<CursorAnalysisFailure>,
 }
 
@@ -190,7 +162,7 @@ pub(crate) struct CursorStoreAnalysis {
     pub(crate) failed_payloads: usize,
 }
 
-/// Reads Cursor stores while retaining one diagnostic per store.
+/// Reads Cursor analysis stores while retaining traversal, tracking-DB, and per-store failures.
 pub(crate) fn read_cursor_analysis_with_diagnostics(
     chats_dir: &Path,
     tracking_db: &Path,
@@ -267,8 +239,7 @@ pub(crate) fn read_cursor_analysis_with_diagnostics(
 // usage: local estimate
 // ===========================================================================
 
-/// One usage row carrying its own local date, so any time range can filter it
-/// after the fact. A purely in-memory intermediate — never serialized.
+/// In-memory per-conversation usage event carrying its local date for post-hoc range filtering.
 #[derive(Debug)]
 struct UsageEvent {
     conversation_id: String,
@@ -302,21 +273,16 @@ fn aggregate_events(events: &[UsageEvent], time_range: TimeRange) -> Vec<UsageCo
             e.timestamp_ms,
             e.model.clone(),
             cursor_usage_value(e.input, e.output, e.cache_read, e.cache_write),
-            // Cursor records no cost locally, so every row is priced by the
-            // caller's exact LiteLLM match alone.
+            // Cursor records no cost locally; pricing comes solely from exact LiteLLM matches.
             0.0,
-            // The gauge is one conversation's running context, not one
-            // request's, so there is nothing to classify against a tier.
+            // The gauge is a conversation-level running context rather than a single request, so tier classification does not apply.
             0,
         ));
     }
     out
 }
 
-/// Reads one Cursor store into compact usage contributions.
-///
-/// The caller owns discovery and the shared tracking index so an incremental
-/// scan can fingerprint and refresh each store independently.
+/// Reads one Cursor store into compact usage contributions within `time_range`.
 pub(crate) fn read_cursor_usage_store(
     store_db: &Path,
     conv_models: &FastHashMap<String, String>,
@@ -347,20 +313,7 @@ pub(crate) fn read_cursor_usage_store(
     })
 }
 
-/// Builds all-time usage-estimate events from the local context gauge.
-///
-/// Cursor stores only the running context-window size per assistant turn, not
-/// billed tokens. Each turn re-sends (and prompt-cache-reads) the accumulated
-/// context, so summing the gauge over a conversation's turns approximates the
-/// **cache-read** token volume. It goes in the cache-read bucket both because
-/// that is the honest bucket and because it is then billed at the much cheaper
-/// cache rate rather than a wildly-inflated full-input rate. Input/output are
-/// unknown (`0`) and the stored cost is `0`; the caller prices Cursor on an
-/// exact LiteLLM match alone, so a model Cursor prices itself (e.g.
-/// `composer-*`) stays at `$0` rather than being guessed at from a similar
-/// name. Deliberately rough.
-///
-/// Returns all dates; the caller filters by time range.
+/// Returns all-time estimated usage events built from each store's per-turn context-window gauge.
 fn approximation_events(chats_dir: &Path, tracking_db: &Path) -> CursorUsageEvents {
     let (conv_models, tracking_failure) = match load_conversation_models(tracking_db) {
         Ok(models) => (models, None),
@@ -436,6 +389,7 @@ fn approximation_events(chats_dir: &Path, tracking_db: &Path) -> CursorUsageEven
                     model,
                     input: 0,
                     output: 0,
+                    // Each turn re-sends accumulated context; attributing the gauge to cache reads approximates prompt-cache volume and avoids full-input pricing.
                     cache_read: ctx,
                     cache_write: 0,
                 },
@@ -451,8 +405,7 @@ fn approximation_events(chats_dir: &Path, tracking_db: &Path) -> CursorUsageEven
 // analysis: store.db parsing
 // ===========================================================================
 
-/// Enumerates every `chats/<projectHash>/<conversationId>/store.db` under the
-/// chats root (exactly two directory levels deep).
+/// Enumerates every `<projectHash>/<conversationId>/store.db` two levels under `chats_dir`.
 pub(crate) fn discover_cursor_store_dbs(chats_dir: &Path) -> CursorStoreDiscovery {
     let mut dbs = Vec::new();
     let mut failures = Vec::new();
@@ -542,7 +495,7 @@ pub(crate) fn discover_cursor_store_dbs(chats_dir: &Path) -> CursorStoreDiscover
     }
 }
 
-/// The conversationId is the store.db's parent directory name.
+/// Returns the `conversationId` from a `store.db` path's parent directory name.
 fn conversation_id_from_path(store_db: &Path) -> String {
     store_db
         .parent()
@@ -551,11 +504,9 @@ fn conversation_id_from_path(store_db: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Loads `conversationId -> model` from `ai-code-tracking.db`.
+/// Loads `conversationId -> model` from `tracking_db`, returning an empty map when the file does not exist.
 ///
-/// Each conversation is authored by a single model in practice; when more than
-/// one appears, the one with the most tracked lines wins. Returns an empty map
-/// when the DB is absent; read and schema failures remain retryable errors.
+/// When a conversation has multiple models, the one with the most tracked lines wins (ties break lexically).
 pub(crate) fn load_conversation_models(tracking_db: &Path) -> Result<FastHashMap<String, String>> {
     match std::fs::metadata(tracking_db) {
         Ok(_) => {}
@@ -581,8 +532,7 @@ pub(crate) fn load_conversation_models(tracking_db: &Path) -> Result<FastHashMap
             let mut m: FastHashMap<String, String> = FastHashMap::default();
             for row in rows {
                 let row = row?;
-                // Rows are ordered by descending line count, so the first model seen
-                // for a conversation is its dominant one.
+                // Rows are ordered by descending line count, so the first model seen for a conversation wins.
                 m.entry(row.0).or_insert(row.1);
             }
             Ok(m)
@@ -596,7 +546,7 @@ pub(crate) struct ConversationModelSnapshot {
     pub(crate) fingerprint: Option<DatabaseFingerprint>,
 }
 
-/// Loads Cursor model attribution without pairing map A with fingerprint B.
+/// Loads Cursor model attribution together with a matching pre- and post-read database fingerprint.
 pub(crate) fn load_conversation_model_snapshot(
     tracking_db: &Path,
 ) -> Result<ConversationModelSnapshot> {
@@ -621,7 +571,7 @@ pub(crate) fn load_conversation_model_snapshot(
     unreachable!("tracking snapshot loop always returns")
 }
 
-/// Parses one chat store into per-(date) analysis records for its model.
+/// Parses one chat store into per-date analysis records for its model.
 pub(crate) fn read_store_analysis(
     store_db: &Path,
     conv_models: &FastHashMap<String, String>,
@@ -638,8 +588,7 @@ pub(crate) fn read_store_analysis(
         let model = resolve_store_model(&transaction, conv_models, &conv_id);
         let blobs = load_blobs(&transaction)?;
 
-        // Pass 1: index Read tool results by tool-call id so their file lines can
-        // be attributed to the matching Read call in pass 2.
+        // Pass 1: index Read tool results by tool-call id for attribution in pass 2.
         let read_results = collect_read_results(&blobs);
         let mut failed_payloads = 0usize;
 
@@ -652,10 +601,7 @@ pub(crate) fn read_store_analysis(
             }
             let node = walk_node(data);
             let Some(msg_bytes) = node.msg else {
-                // Cursor also writes aggregate DAG nodes with the normal
-                // context-gauge field and a timestamp but no message. They are
-                // not assistant turns. A timestamped node with neither the
-                // message nor the known gauge remains suspicious schema drift.
+                // Aggregate DAG nodes carry a context gauge and timestamp without a message and are not assistant turns; a timestamped node missing both message and gauge indicates schema drift.
                 if node.ctx_msg.is_none()
                     && let Some(ts) = node.ts
                     && ms_to_local_date(ts).is_some_and(|date| !is_before_cutoff(&date, &cutoff))
@@ -677,9 +623,7 @@ pub(crate) fn read_store_analysis(
                 failed_payloads += 1;
                 continue;
             };
-            // Only assistant turns carry tool calls. Guard before creating a
-            // date bucket so a non-assistant node never emits a zero-metric row
-            // or inflates the Cursor active-day count.
+            // Guard before creating a date bucket so non-assistant nodes never emit zero-metric rows or inflate active-day counts.
             if role != "assistant" {
                 continue;
             }
@@ -716,8 +660,7 @@ pub(crate) fn read_store_analysis(
         let mut out = Vec::with_capacity(per_date.len());
         for (date, state) in per_date {
             let mut usage = FastHashMap::default();
-            // The analysis aggregator only reads the model key; the value is a
-            // placeholder (tokens come from the usage view's local estimate).
+            // The analysis aggregator reads only the model key; token counts come from the usage estimate.
             usage.insert(model.clone(), json!({}));
             let record = state.into_record(usage);
             out.push((date, wrap_record(record, user, machine)));
@@ -731,8 +674,7 @@ pub(crate) fn read_store_analysis(
     })
 }
 
-/// One store's context-gauge read: the conversation's model plus
-/// `(timestamp_ms, context_tokens)` for every assistant turn carrying the gauge.
+/// One store's context-gauge read: the conversation's model and `(timestamp_ms, context_tokens)` per assistant turn.
 struct CursorStoreContextRead {
     model: String,
     turns: Vec<(i64, i64)>,
@@ -749,9 +691,7 @@ fn read_store_context(
     with_readonly_connection(store_db, "blobs", "vct-cursor-", "Cursor", |conn| {
         let transaction = conn.unchecked_transaction()?;
         let model = resolve_store_model(&transaction, conv_models, conv_id);
-        // The gauge scan only reads binary DAG nodes; filtering in SQL keeps
-        // the (potentially large) JSON tool-result payloads from ever being
-        // materialized on the usage cheap path.
+        // Filter to binary DAG nodes in SQL so large JSON tool-result blobs are never loaded on the usage path.
         let blobs = load_node_blobs(&transaction)?;
         let mut turns = Vec::new();
         let mut expected_records = 0usize;
@@ -765,16 +705,11 @@ fn read_store_context(
             else {
                 continue;
             };
-            // Only assistant turns represent a real per-request context. Cursor
-            // also stores intermediate DAG nodes that carry the running gauge on
-            // a non-assistant message; counting those would roughly double the
-            // estimate's tokens and inflate its active-day count.
+            // Only assistant turns represent per-request context; intermediate non-assistant DAG nodes also carry the gauge and would roughly double estimated tokens and inflate active days.
             let role = message_role(msg_bytes);
             match role.as_deref() {
                 Some("assistant") => {
-                    // An empty gauge payload is an observed benign variant (a
-                    // turn recorded before any context reading, e.g. aborted);
-                    // only a non-empty payload we cannot decode is drift.
+                    // Empty gauge payloads occur on turns recorded before a context reading (e.g. aborted); only non-empty undecodable payloads indicate schema drift.
                     if ctx_msg.is_empty() {
                         continue;
                     }
@@ -798,8 +733,7 @@ fn read_store_context(
     })
 }
 
-/// Resolves a store's model: the tracking DB attribution, else the store's own
-/// `lastUsedModel`, else `"unknown"`.
+/// Resolves a store's model from `conv_models`, falling back to `meta.lastUsedModel` and then `"unknown"`.
 fn resolve_store_model(
     conn: &Connection,
     conv_models: &FastHashMap<String, String>,
@@ -812,19 +746,10 @@ fn resolve_store_model(
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// Reads `lastUsedModel` from the store's `meta` table.
-///
-/// The `meta.value` is a hex-encoded JSON string; decode then read the field.
-/// Tolerates a plain-JSON value too, in case a future build stops hex-encoding.
-/// `meta` is keyed `(key PRIMARY KEY, value)` and current stores hold one row
-/// keyed `0`, but that name is cursor-agent's to change, so every row is
-/// decoded and the first one carrying the field wins rather than whichever row
-/// SQLite happens to return first.
+/// Returns the first non-empty `lastUsedModel` across `meta` rows ordered by `key` (decoding hex-encoded or plain JSON values).
 fn store_meta_model(conn: &Connection) -> Option<String> {
     let mut stmt = conn.prepare("SELECT value FROM meta ORDER BY key").ok()?;
-    // A row whose `value` is NULL or not text is skipped, not fatal: failing
-    // the whole read on one would lose the lookup for exactly the multi-row
-    // store this scan exists to handle.
+    // Skip NULL or non-text `value` rows instead of aborting the scan across multi-row `meta` tables.
     let values = stmt
         .query_map([], |r| r.get::<_, String>(0))
         .ok()?
@@ -847,10 +772,7 @@ fn load_blobs(conn: &Connection) -> Result<Vec<Vec<u8>>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// Loads only the binary DAG-node blobs (first byte `0x0A`).
-///
-/// The usage gauge path never inspects the JSON message/tool-result blobs the
-/// analysis path joins by `toolCallId`, so it skips them at the SQL layer.
+/// Loads only binary DAG-node blobs (first byte `0x0A`) ordered by `id`.
 fn load_node_blobs(conn: &Connection) -> Result<Vec<Vec<u8>>> {
     let mut stmt =
         conn.prepare("SELECT data FROM blobs WHERE substr(data, 1, 1) = X'0A' ORDER BY id")?;
@@ -858,7 +780,7 @@ fn load_node_blobs(conn: &Connection) -> Result<Vec<Vec<u8>>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// The `role` of a message JSON blob, when it parses and carries one.
+/// Returns the `role` field of a message JSON blob, if present.
 fn message_role(bytes: &[u8]) -> Option<String> {
     serde_json::from_slice::<Value>(bytes)
         .ok()
@@ -872,8 +794,7 @@ fn message_role(bytes: &[u8]) -> Option<String> {
 
 /// Applies one assistant message's tool calls to `state`.
 ///
-/// Returns how many tool payloads used an unsupported schema; `Err(())` when
-/// the message itself is not a usable assistant turn.
+/// Returns the count of tool payloads with an unsupported schema, or `Err(())` when `msg` is not a usable assistant turn.
 fn apply_assistant_tools(
     state: &mut SessionParseState,
     msg: &Value,
@@ -941,8 +862,7 @@ fn apply_assistant_tools(
                         state.tool_counts.read += 1;
                     }
                     _ => {
-                        // A read whose result we could not recover still counts as a
-                        // read invocation, matching the OpenCode reader.
+                        // Unrecovered read results still count as read invocations, matching OpenCode.
                         state.tool_counts.read += 1;
                     }
                 }
@@ -968,8 +888,7 @@ enum CursorReadResult {
     Unsupported,
 }
 
-/// Indexes `Read` tool results by tool-call id, with line-number prefixes
-/// stripped so the recovered content is the file's own lines.
+/// Indexes `Read` / `ReadFile` tool results by `toolCallId` with line-number prefixes stripped.
 fn collect_read_results(blobs: &[Vec<u8>]) -> HashMap<String, CursorReadResult> {
     let mut map = HashMap::new();
     for data in blobs {
@@ -980,10 +899,7 @@ fn collect_read_results(blobs: &[Vec<u8>]) -> HashMap<String, CursorReadResult> 
             continue;
         };
         let role = msg.get("role").and_then(Value::as_str);
-        // Assistant messages are also stored as standalone content-addressed
-        // JSON blobs and referenced from binary DAG nodes. Pass 2 reads the
-        // dated node, so this undated payload copy is expected and skipped
-        // here along with every other non-tool role.
+        // Standalone JSON blobs also hold undated copies of assistant messages referenced by DAG nodes; pass 2 reads those via their dated nodes, so skip every non-tool role here.
         if role != Some("tool") {
             continue;
         }
@@ -1021,8 +937,7 @@ fn collect_read_results(blobs: &[Vec<u8>]) -> HashMap<String, CursorReadResult> 
     map
 }
 
-/// Strips Cursor's `"<spaces><digits>|"` read-output line prefixes, keeping only
-/// the numbered content lines so the recovered text has the file's line count.
+/// Strips Cursor's `"<spaces><digits>|"` read-output prefixes and drops unnumbered lines.
 fn strip_cursor_line_numbers(text: &str) -> String {
     let mut lines = Vec::new();
     for line in text.split('\n') {
@@ -1033,8 +948,7 @@ fn strip_cursor_line_numbers(text: &str) -> String {
     lines.join("\n")
 }
 
-/// Returns the content after a `"<spaces><digits>|"` prefix, or `None` when the
-/// line has no such prefix.
+/// Returns the content after a `"<spaces><digits>|"` prefix, or `None` when `line` has none.
 fn strip_line_number_prefix(line: &str) -> Option<&str> {
     let trimmed = line.trim_start_matches(' ');
     let digits_end = trimmed
@@ -1051,7 +965,7 @@ fn strip_line_number_prefix(line: &str) -> Option<&str> {
 // protobuf DAG node decoding
 // ===========================================================================
 
-/// The subset of a binary DAG node fields the reader needs.
+/// Binary DAG node fields extracted by [`walk_node`].
 #[derive(Default)]
 struct NodeFields<'a> {
     /// `field 4`: the embedded message JSON bytes.
@@ -1062,11 +976,7 @@ struct NodeFields<'a> {
     ctx_msg: Option<&'a [u8]>,
 }
 
-/// Walks a node's top-level protobuf fields, extracting `field 4/5/26`.
-///
-/// Deliberately does not traverse the DAG (child hash refs in `field 1/3`); it
-/// only reads the three fields the reader cares about, so it stays robust to
-/// unrelated schema additions.
+/// Extracts top-level protobuf fields 4 (message JSON), 5 (context gauge), and 26 (timestamp) without traversing DAG links.
 fn walk_node(data: &[u8]) -> NodeFields<'_> {
     let mut nf = NodeFields::default();
     let mut i = 0;
@@ -1139,10 +1049,7 @@ fn context_tokens(ctx_msg: &[u8]) -> Option<i64> {
     None
 }
 
-/// Reads a base-128 varint at `pos`, returning `(value, next_pos)`.
-///
-/// Bounded to 10 bytes and to the slice length so a truncated blob can never
-/// spin or read out of bounds.
+/// Reads a base-128 varint at `pos`, returning `(value, next_pos)` or `None` if truncated or longer than 10 bytes.
 pub(crate) fn read_varint(data: &[u8], pos: usize) -> Option<(u64, usize)> {
     let mut result: u64 = 0;
     let mut shift = 0u32;
@@ -1211,8 +1118,7 @@ fn is_before_cutoff(date: &str, cutoff: &Option<String>) -> bool {
     matches!(cutoff, Some(c) if date < c.as_str())
 }
 
-/// Decodes an even-length ASCII hex string into bytes, or `None` when it is not
-/// valid hex.
+/// Decodes an even-length ASCII hex string into bytes, returning `None` on invalid input.
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
     let s = s.trim();
     if s.is_empty() || !s.len().is_multiple_of(2) {
@@ -1259,14 +1165,12 @@ mod tests {
 
     #[test]
     fn strip_ignores_unnumbered_lines() {
-        // Only numbered content lines survive, so the recovered line count is the
-        // file's line count.
+        // Only numbered content lines survive, so the recovered line count matches the file's line count.
         let raw = "header without number\n     1|real line";
         assert_eq!(strip_cursor_line_numbers(raw), "real line");
     }
 
-    /// Builds a minimal binary DAG node: `field 4` = message JSON, `field 26` =
-    /// timestamp varint, optional `field 5` = context gauge.
+    /// Builds a minimal binary DAG node (`field 4` = message JSON, `field 26` = timestamp varint, optional `field 5` = context gauge).
     fn make_node(msg: &str, ts: i64, ctx: Option<i64>) -> Vec<u8> {
         fn varint(mut v: u64, out: &mut Vec<u8>) {
             loop {
@@ -1281,8 +1185,7 @@ mod tests {
                 }
             }
         }
-        // A protobuf tag is itself a varint `(field << 3) | wire`; field 26's tag
-        // (208) needs two bytes, so encode every tag as a varint.
+        // A protobuf tag is a varint `(field << 3) | wire`; field 26's tag (208) needs two bytes.
         fn tag(field: u64, wire: u64, out: &mut Vec<u8>) {
             varint((field << 3) | wire, out);
         }
@@ -1332,10 +1235,7 @@ mod tests {
 
     #[test]
     fn json_blob_is_not_read_as_an_assistant_turn() {
-        // Assistant turns are binary DAG nodes; a JSON blob is a tool-result
-        // payload even when its own `role` says assistant. Neither reader may
-        // pick one up as a turn, or the same tool calls would be billed twice
-        // once a real node references them.
+        // Assistant turns live in binary DAG nodes; a JSON blob is never treated as a turn even with `"role": "assistant"`, preventing double counting once referenced by a node.
         let json_blob = r#"{"role":"assistant","content":[
             {"type":"tool-call","toolName":"Write","toolCallId":"a","args":{"path":"/r/x.rs","contents":"l1\nl2"}}
         ]}"#;
@@ -1461,7 +1361,6 @@ mod tests {
                 cache_write: 0,
             },
         ];
-        // Daily cutoff drops the ancient 2000 row but keeps the far-future one.
         let rows = aggregate_events(&events, TimeRange::Daily);
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
@@ -1540,7 +1439,7 @@ mod tests {
             1_700_000_000_000,
             Some(50_000),
         );
-        // A non-assistant node must NOT create a date bucket or an active day.
+        // A non-assistant node must not create a date bucket or an active day.
         let user_node = make_node(r#"{"role":"user","content":[]}"#, 1_700_000_100_000, None);
         let tool_result = r#"{"role":"tool","content":[{"type":"tool-result","toolName":"Read","toolCallId":"z","result":"     1|line one\n     2|line two"}]}"#;
         let assistant_payload = r#"{"role":"assistant","content":[]}"#;
@@ -1558,7 +1457,6 @@ mod tests {
         )
         .unwrap();
 
-        // Exactly one assistant turn -> one (date) record; the user node is dropped.
         assert_eq!(store.rows.len(), 1);
         assert_eq!(store.normalized_messages, 1);
         assert_eq!(store.failed_payloads, 0);
@@ -1567,7 +1465,6 @@ mod tests {
         assert_eq!(rec.tool_call_counts.bash, 1);
         assert_eq!(rec.tool_call_counts.read, 1);
         assert_eq!(rec.total_write_lines, 2);
-        // Read result lines were recovered and prefix-stripped (2 numbered lines).
         assert_eq!(rec.total_read_lines, 2);
         // No tracking DB / meta -> model falls back to "unknown".
         assert!(rec.conversation_usage.contains_key("unknown"));
@@ -1585,8 +1482,7 @@ mod tests {
             1_700_000_500_000,
             Some(88_000),
         );
-        // A gauge-bearing node that is NOT an assistant turn must be excluded so
-        // the offline approximation does not double-count context.
+        // Exclude gauge-bearing non-assistant nodes so the local estimate does not double-count context.
         let non_assistant = make_node(
             r#"{"role":"user","content":[]}"#,
             1_700_000_600_000,

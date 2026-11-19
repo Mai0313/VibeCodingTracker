@@ -1,10 +1,6 @@
 // Integration tests for usage aggregation.
 //
-// These drive `aggregate_usage_from_paths` against a `TempHome` (fixture session files
-// under a temp directory) so the real aggregation runs hermetically: no
-// process-global env is mutated, no machine files are read, and no external API
-// is reached. The lone exception is the cost-math case, which prices a token
-// bucket directly and needs no sources at all.
+// These drive `aggregate_usage_from_paths` against a `TempHome` so aggregation runs hermetically: no process-global env is mutated, no machine files are read, and no external API is reached. The lone exception is the cost-math case, which prices a token bucket directly and needs no sources.
 
 use rusqlite::{Connection, params};
 #[cfg(unix)]
@@ -19,8 +15,7 @@ use vct_core::usage::aggregator::{
 };
 use vct_test_support::{TempHome, append_cursor_json_blob, fixture_str};
 
-/// A real Codex rollout file name: the archive move preserves it, and it is
-/// what cross-root deduplication keys on.
+/// Real Codex rollout file name preserved across archiving and used as the cross-root deduplication key.
 const CODEX_ROLLOUT: &str =
     "rollout-2026-06-06T10-00-00-019e4b75-8a4e-7801-a9ed-9723e77e0497.jsonl";
 
@@ -174,9 +169,7 @@ fn seed_hermes_usage_db(path: &std::path::Path) {
 
 /// Compares every bucket of two usage results.
 ///
-/// Every struct here is destructured rather than having its fields named one at
-/// a time: a bucket added to any of them then fails to compile, instead of
-/// silently going uncompared the way DeepSeek Harness did.
+/// Every struct is destructured so adding a bucket fails to compile instead of silently going uncompared.
 fn assert_usage_data_eq(actual: &UsageData, expected: &UsageData) {
     let UsageData {
         models,
@@ -315,9 +308,7 @@ fn cached_usage_matches_uncached_for_every_provider_source() {
     assert!(cold.diagnostics.failures.is_empty());
     assert_eq!(cache.stats().parsed_sources, 11);
     assert_usage_data_eq(&cold.data, &uncached);
-    // Destructured so that a provider added later cannot be left unseeded: the
-    // new field has to be named here, and naming it without using it below is
-    // an unused-variable warning, which CI denies.
+    // Destructured so adding a provider forces seeding and asserting it here.
     let PerProviderUsage {
         claude,
         codex,
@@ -579,10 +570,7 @@ fn incremental_cache_reuses_unchanged_sources_and_tracks_mutations() {
     assert_eq!(cache.stats().entries, 2);
 }
 
-/// Each assistant step reports its usage twice — once as an early
-/// `assistant/chunk` sample and again on the assembled `assistant/message`.
-/// Counting both would double every bucket, so this pins the totals the fixture
-/// was built to produce.
+/// Verifies DeepSeek Harness counts each assistant step once despite emitting usage on both `assistant/chunk` and `assistant/message`.
 #[test]
 fn dsh_usage_counts_each_step_once() {
     let home = TempHome::new();
@@ -608,9 +596,7 @@ fn dsh_usage_counts_each_step_once() {
         .expect("DeepSeek reasoning row");
     // Reasoning is a subset of output upstream, so it is subtracted back out.
     assert_eq!(reasoner["reasoning_output_tokens"], 30);
-    // 80 - 30 from the message, plus the 2 of the step that died after its
-    // usage chunk — that one names no model, so it is attributed to the route
-    // the harness last logged.
+    // 80 - 30 from the message, plus the 2 from the step that died after its usage chunk (unnamed, so attributed to the last logged route).
     assert_eq!(reasoner["output_tokens"], 52);
     assert_eq!(reasoner["input_tokens"], 6);
     assert_eq!(data.provider_days.deepseek, 1);
@@ -626,9 +612,7 @@ fn antigravity_roots_add_up_to_one_provider() {
 
     let data = aggregate_usage_from_paths(&home.paths, TimeRange::All).expect("aggregate usage");
     let usage = &data.per_provider.antigravity;
-    // The fixture's three requests on `gemini-3.5-flash` total 13300 / 24800 /
-    // 870, and its one compaction request (4000 / 9000 / 600) ran while that model was
-    // in use.
+    // The fixture's three requests on `gemini-3.5-flash` total 13300 / 24800 / 870, and its one compaction request (4000 / 9000 / 600) ran while that model was in use.
     assert_eq!(
         usage["gemini-3.5-flash"]["input_tokens"],
         3 * (13_300 + 4_000)
@@ -1059,7 +1043,6 @@ fn disabled_provider_is_dropped_from_usage_rollup() {
         &fixture_str("sessions/gemini.jsonl"),
     );
 
-    // Turn Gemini off in `[providers]`: it must be skipped entirely.
     let providers = ProvidersConfig {
         gemini: false,
         ..ProvidersConfig::default()
@@ -1091,7 +1074,6 @@ fn test_usage_calculation_cost_accuracy() {
         ..Default::default()
     };
 
-    // 2000 cache_creation tokens, all default (5 minute) TTL, no reasoning.
     let counts = vct_core::utils::TokenCounts {
         input_tokens: 1000,
         output_tokens: 500,
@@ -1125,8 +1107,6 @@ fn usage_json_rows_flatten_the_codex_nested_shape() {
     );
     let data = aggregate_usage_from_paths(&home.paths, TimeRange::All).expect("aggregate codex");
 
-    // Codex keeps its own nested shape in the aggregate, which is exactly why
-    // the payload builder has to flatten it.
     let raw = data
         .models
         .get("aide-gpt-5")
@@ -1150,10 +1130,7 @@ fn usage_json_rows_flatten_the_codex_nested_shape() {
         .find(|row| row.model == "aide-gpt-5")
         .expect("a priced row for the Codex model");
 
-    // The fixture's final snapshot reports `input 270530 (136832 cached) /
-    // output 12551 (9536 reasoning) / total 283081`. Flattening splits those
-    // into disjoint buckets so each token is billed exactly once, and nothing
-    // of the nested shape survives.
+    // The fixture's final snapshot reports `input 270530 (136832 cached) / output 12551 (9536 reasoning) / total 283081`; flattening splits those into disjoint buckets so each token is billed once and nothing of the nested shape survives.
     assert_eq!(
         row.usage,
         json!({
@@ -1166,8 +1143,7 @@ fn usage_json_rows_flatten_the_codex_nested_shape() {
         })
     );
 
-    // Only input carries a rate here, so the cost is billed off the flattened
-    // bucket rather than Codex's raw prompt size.
+    // Only input carries a rate here, so cost is billed off the flattened bucket rather than Codex's raw prompt size.
     assert!(
         (row.cost_usd - 0.133_698).abs() < 1e-9,
         "got {}",
@@ -1190,8 +1166,7 @@ fn usage_json_reports_absent_cache_buckets_as_zero() {
     );
     let data = aggregate_usage_from_paths(&home.paths, TimeRange::All).expect("aggregate gemini");
 
-    // The fixture's Pro model never writes to the cache, so its record carries
-    // no cache-write bucket at all.
+    // The fixture's Pro model never writes to the cache, so its record carries no cache-write bucket.
     let raw = data
         .models
         .get("gemini-3.1-pro-preview")
@@ -1231,8 +1206,6 @@ fn codex_archived_sessions_contribute_usage_exactly_once() {
         "the Codex fixture must contribute usage from the active root"
     );
 
-    // Archiving moves the rollout log into the flat archived root, so a scan
-    // that only reads the active one would silently lose this session.
     let archived = TempHome::new();
     archived.put_codex_archived_session(CODEX_ROLLOUT, &rollout);
     let archived_only = aggregate_usage_from_paths(&archived.paths, TimeRange::All).unwrap();
@@ -1263,9 +1236,7 @@ fn moving_a_codex_session_between_roots_keeps_cached_usage_stable() {
     assert_eq!(before.diagnostics.parsed, 1);
     assert_eq!(cache.stats().entries, 1);
 
-    // Archiving, then un-archiving: the ledger keys Codex on the file name, so
-    // both moves find the same entry rather than retaining the vacated path as
-    // a missing session beside a new one.
+    // Archiving, then un-archiving: the ledger keys Codex on the file name, so both moves find the same entry instead of retaining the vacated path as a missing session beside a new one.
     for (from, to) in [(&active, &archived), (&archived, &active)] {
         std::fs::rename(from, to).unwrap();
         let after = aggregate_usage_from_paths_with_cache(
@@ -1299,8 +1270,6 @@ fn an_unreadable_codex_root_does_not_sink_the_other_one() {
     std::fs::set_permissions(archived, original_permissions).unwrap();
     let partial = partial.unwrap();
 
-    // One root failing is a partial failure, not an all-failed scan: the active
-    // root's session still counts, and the unreadable root is reported.
     assert_eq!(partial.diagnostics.parsed, 1);
     assert_eq!(partial.diagnostics.failures.len(), 1);
     assert_eq!(partial.diagnostics.failures[0].source, *archived);
@@ -1316,8 +1285,7 @@ fn opencode_bills_a_large_request_at_the_tier_it_reached() {
 
     clear_pricing_cache();
     let home = TempHome::new();
-    // Two requests on one tiered model straddling its 272k boundary: 200k
-    // input plus 80k cache reads clears it, 1k on its own does not.
+    // Two requests on one tiered model straddling its 272k boundary: 200k input plus 80k cache reads clears it, while 1k on its own does not.
     seed_opencode_tiered_db(&home.paths.opencode_db);
 
     let mut prices = HashMap::new();
@@ -1362,9 +1330,7 @@ fn opencode_bills_a_large_request_at_the_tier_it_reached() {
         .iter()
         .find(|row| row.model == "azure/gpt-5.5")
         .expect("a priced row for the seeded model");
-    // The big request's 200k input bills at the tier rate and only the small
-    // one's 1k stays at base. Billing the pair as one aggregate would report
-    // $0.201; classifying nothing at all would report the same.
+    // The big request's 200k input bills at the tier rate and only the small one's 1k stays at base (billing as one aggregate or classifying nothing would both report $0.201).
     assert!((row.cost_usd - 0.801).abs() < 1e-9, "got {}", row.cost_usd);
 }
 
@@ -1383,8 +1349,7 @@ fn an_analysis_scan_sharing_a_cache_keeps_the_usage_tier_slices() {
         &fixture_str("sessions/claude_code.jsonl"),
     );
 
-    // The fixture's per-request contexts straddle 20k, so a snapshot carrying
-    // that boundary classifies some of its requests and leaves the rest at base.
+    // The fixture's per-request contexts straddle 20k, so a snapshot carrying that boundary classifies some requests and leaves the rest at base.
     let mut prices = HashMap::new();
     prices.insert(
         "claude-sonnet-4-20250514".to_string(),
@@ -1412,10 +1377,7 @@ fn an_analysis_scan_sharing_a_cache_keeps_the_usage_tier_slices() {
         .expect("aggregate claude usage")
     };
 
-    // What an embedder holding one cache for both views gets. The second
-    // session is what makes the analysis scan miss the cache: it reparses that
-    // source with no snapshot, and whatever it leaves behind is what the next
-    // usage scan prices.
+    // Adding a second session forces the analysis scan to miss the cache and parse without a tier snapshot; the next usage scan must still price tier slices accurately.
     let mut shared = SessionLedger::new();
     usage_scan(&mut shared);
     home.put_claude_session(
@@ -1444,8 +1406,7 @@ fn an_analysis_scan_sharing_a_cache_keeps_the_usage_tier_slices() {
     assert_usage_data_eq(&usage_scan(&mut shared).data, &cold.data);
 }
 
-/// Seeds two assistant messages on one exactly-priced tiered model, one either
-/// side of its context boundary.
+/// Seeds two assistant messages on one exactly-priced tiered model, one on each side of its context boundary.
 fn seed_opencode_tiered_db(path: &std::path::Path) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let connection = Connection::open(path).unwrap();

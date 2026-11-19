@@ -1,15 +1,6 @@
-//! Parser for OpenAI Codex rollout logs (the `*.jsonl` files under `~/.codex`).
+//! Parser for OpenAI Codex rollout logs (`~/.codex/**/*.jsonl`).
 //!
-//! Codex records carry a `type` discriminator (`session_meta`,
-//! `turn_context`, `event_msg`, `response_item`). File operations are not
-//! first-class: Codex records them as legacy `function_call` pairs, current
-//! `custom_tool_call` pairs, or `patch_apply_end` events. This parser joins
-//! each call to its output by `call_id`. Legacy shell calls retain
-//! command-level analysis. A top-level custom `exec` is counted as one run
-//! command because its JavaScript source does not prove which nested tools
-//! actually ran. Direct custom patches are applied only when their paired
-//! output explicitly reports success; a successful `patch_apply_end` is folded
-//! in unless the same `call_id` was already counted.
+//! File operations arrive via `function_call` pairs, `custom_tool_call` pairs, or `patch_apply_end` events, joined to their outputs by `call_id`. Shell calls undergo command-level read/patch extraction, while a top-level custom `exec` counts as a single run command. Direct custom `apply_patch` calls are counted only when their output reports success, and a successful `patch_apply_end` is folded in unless its `call_id` was already counted.
 use crate::constants::FastHashMap;
 use crate::models::*;
 use crate::pricing::{TierClassifier, TierThresholds};
@@ -27,23 +18,18 @@ use std::borrow::{Borrow, Cow};
 use std::collections::HashSet;
 use std::path::Path;
 
-/// Parse Codex session records from a slice of pre-typed logs.
+/// Parses Codex session `logs` into a single-record [`CodeAnalysis`].
 ///
-/// Walks the records in order, threading function and custom-tool calls to
-/// their outputs and folding token usage from `token_count` events. Returns a
-/// single-record [`CodeAnalysis`] with the runtime metadata fields blank
-/// (the caller's `finalize` step fills them).
+/// Runtime metadata fields (`user`, `extension_name`, `insights_version`, `machine_id`) are left blank for the caller to populate.
 ///
 /// # Errors
 ///
-/// Returns `anyhow::Result` for parity with the other provider parsers, but
-/// has no fallible step: malformed arguments and outputs are tolerated
-/// (skipped or substituted), so it returns `Ok` for any slice.
+/// Never returns `Err`; returns `Result` for parity with other provider parsers.
 pub fn parse_codex_logs(logs: &[CodexLog], mode: ParseMode) -> Result<CodeAnalysis> {
     parse_codex_log_iter(logs, mode)
 }
 
-/// Streaming Codex parser used by JSONL readers that already own an iterator.
+/// Parses Codex session `logs` from any iterator into a [`CodeAnalysis`].
 pub(crate) fn parse_codex_log_iter<I>(logs: I, mode: ParseMode) -> Result<CodeAnalysis>
 where
     I: IntoIterator,
@@ -52,7 +38,7 @@ where
     Ok(parse_codex_log_iter_with_diagnostics(logs, mode, None)?.analysis)
 }
 
-/// Streaming Codex parser with parser-only schema diagnostics.
+/// Parses Codex session `logs` with schema diagnostics, classifying per-turn context tiers when `tiers` is `Some`.
 pub(crate) fn parse_codex_log_iter_with_diagnostics<I>(
     logs: I,
     mode: ParseMode,
@@ -89,11 +75,7 @@ where
     Ok(fold.finish())
 }
 
-/// Zero-copy JSONL file parser for known Codex rollout logs.
-///
-/// Skips `content`, `message`, `summary`, `encrypted_content`, and
-/// `sandbox_policy` fields during deserialization so reasoning and message
-/// records never allocate unused bodies or fall back to dynamic `Value` parses.
+/// Streams and parses a Codex JSONL rollout file at `path` with schema diagnostics, classifying per-turn context tiers when `tiers` is `Some`.
 pub(crate) fn parse_codex_jsonl_path(
     path: &Path,
     mode: ParseMode,
@@ -242,18 +224,11 @@ struct CodexFold<'a> {
     state: SessionParseState,
     conversation_usage: FastHashMap<String, Value>,
     current_model: String,
-    // Codex publishes whole-session cumulative counters on every token_count
-    // event; each model is billed only the delta since the previous snapshot.
-    // Pre-context snapshots (a resumed session's replayed totals) advance the
-    // snapshot without attribution.
+    // Codex emits cumulative session totals on each `token_count`; each model is billed only the delta since this snapshot (pre-context snapshots advance it without attribution).
     prev_totals: Option<CodexTokenTotals>,
     shell_calls: FastHashMap<String, PendingCodexShellCall>,
     custom_calls: FastHashMap<String, CodexCustomCall>,
-    // Call ids whose file ops have already been counted, by either the direct
-    // apply_patch output or its authoritative patch_apply_end event. The first
-    // to actually count wins; the other is skipped. A direct patch whose output
-    // never confirmed success does not register here, so it can't suppress a
-    // successful event.
+    // Call ids already counted by either a confirmed direct `apply_patch` output or a successful `patch_apply_end`; first to count wins, and unconfirmed direct outputs never register here.
     patch_counted_ids: HashSet<String>,
     diagnostics: ParseDiagnostics,
 }
@@ -336,8 +311,7 @@ impl<'a> CodexFold<'a> {
                         self.diagnostics.record_relevant(true);
                         let total = info.get("total_token_usage").and_then(Value::as_object);
                         if self.current_model.is_empty() {
-                            // Replayed pre-context totals: advance the snapshot
-                            // without attributing tokens to a guessed model.
+                            // Replayed pre-context totals advance the baseline without guessing a model.
                             if let Some(total) = total {
                                 self.prev_totals = Some(CodexTokenTotals::from_total_object(
                                     total,
@@ -350,10 +324,7 @@ impl<'a> CodexFold<'a> {
                                     CodexTokenTotals::delta_fields(total, self.prev_totals.as_ref())
                                 })
                                 .unwrap_or_default();
-                            // One token_count is one turn; its request context
-                            // is the turn's own full prompt (cached included),
-                            // published as last_token_usage.input_tokens. Fall
-                            // back to the delta input when absent.
+                            // Classify against the turn's own prompt (`last_token_usage.input_tokens`, which includes cached input), falling back to the delta input.
                             let level = self.classifier.as_mut().map_or(0, |classifier| {
                                 let request_context = info
                                     .get("last_token_usage")
@@ -381,12 +352,8 @@ impl<'a> CodexFold<'a> {
                     }
                 }
 
-                // Modern Codex applies most edits inside opaque `exec` cells and
-                // records the resulting file changes in a `patch_apply_end` event.
-                // A successful one is the authoritative source of those file ops.
+                // `patch_apply_end` is the authoritative record for edits applied inside opaque `exec` cells.
                 if entry.payload_type == Some("patch_apply_end") {
-                    // Skip when this call_id's file ops were already counted,
-                    // by the direct apply_patch output or an earlier event.
                     let already_counted = entry
                         .call_id
                         .is_some_and(|id| self.patch_counted_ids.contains(id));
@@ -423,9 +390,7 @@ impl<'a> CodexFold<'a> {
                                     PendingCodexShellCall::Parsed(call),
                                 );
                             } else {
-                                // Defer the schema verdict until the paired output. Codex
-                                // persists model-generated argument errors as ordinary
-                                // lifecycle records even though no command ran.
+                                // Defer the schema verdict until the paired output, since Codex logs model argument errors as normal lifecycle records.
                                 self.shell_calls.insert(
                                     call_id.to_string(),
                                     PendingCodexShellCall::InvalidArguments,
@@ -510,8 +475,7 @@ impl<'a> CodexFold<'a> {
     }
 }
 
-/// Whether a `token_count` info blob is a shape this parser can fold; one
-/// carrying no recognized key at all is reported as schema drift.
+/// Returns whether a `token_count` `info` object contains at least one recognized, well-typed field.
 fn is_supported_codex_usage(info: &Value) -> bool {
     let Some(info) = info.as_object() else {
         return false;
@@ -528,8 +492,7 @@ fn is_supported_codex_usage(info: &Value) -> bool {
     }
     if let Some(context_window) = info.get("model_context_window") {
         if context_window.is_null() {
-            // Older Codex records retain the field with a null value while
-            // still carrying valid token objects.
+            // Older records emit `null` here alongside valid token objects.
         } else if context_window.as_i64().is_none() {
             return false;
         } else {
@@ -570,8 +533,7 @@ enum PendingCodexShellCall {
     InvalidArguments,
 }
 
-/// Whether an output is Codex reporting that the model's arguments failed to
-/// parse, rather than the result of a command that actually ran.
+/// Returns whether `output` is a Codex argument-parse error rather than command output.
 fn output_reports_argument_error(output: Option<&str>) -> bool {
     let output = shell_output(output).output;
     let output = strip_exec_command_metadata_prefix(&output)
@@ -584,24 +546,7 @@ fn output_reports_argument_error(output: Option<&str>) -> bool {
             || output.contains("invalid argument"))
 }
 
-/// Strip the metadata header that current Codex (`exec_command`) prepends
-/// to every shell output. Format observed in the wild:
-///
-/// ```text
-/// Chunk ID: <hex>
-/// Wall time: <num> seconds
-/// Process exited with code <num>
-/// Original token count: <num>
-/// Output:
-/// <actual stdout>
-/// ```
-///
-/// Without stripping, sed/cat read-detail extraction over-counts the file
-/// by 5 lines (the prefix). Legacy `shell` outputs do not include the
-/// header, so the search returns the original slice unchanged when no
-/// `\nOutput:\n` marker is found — or when what precedes the marker is not a
-/// header, which is how a `cat` of a file whose body contains a line reading
-/// `Output:` keeps everything above it.
+/// Strips the `exec_command` metadata header before `Output:\n`, leaving `output` unchanged when no recognized header precedes the marker.
 fn strip_exec_command_metadata_prefix(output: &str) -> &str {
     const MARKER: &str = "\nOutput:\n";
     if let Some(idx) = output.find(MARKER)
@@ -612,14 +557,9 @@ fn strip_exec_command_metadata_prefix(output: &str) -> &str {
     output.strip_prefix("Output:\n").unwrap_or(output)
 }
 
-/// Whether everything ahead of the `Output:` marker is Codex's own header.
-///
-/// The header vocabulary is a closed set on purpose: an open rule such as
-/// "looks like `Key: value`" matches the YAML and log dumps a `cat` most often
-/// produces, which is the content this guard exists to protect. A header line
-/// this build has never seen therefore stops the strip rather than truncating,
-/// which over-counts a read by the header's length instead of losing its body.
+/// Returns whether every line in `prefix` matches a known `exec_command` metadata header.
 fn is_exec_metadata_header(prefix: &str) -> bool {
+    // Closed set so YAML or log output containing `Key: value` lines before an `Output:` line is never truncated.
     const HEADER_LINES: [&str; 5] = [
         "Chunk ID:",
         "Original token count:",
@@ -634,9 +574,7 @@ fn is_exec_metadata_header(prefix: &str) -> bool {
             .all(|line| HEADER_LINES.iter().any(|known| line.starts_with(known)))
 }
 
-/// Decodes a shell output into a `CodexShellOutput`, falling back to the
-/// object's `output` field and then to the raw text when it is not the
-/// structured envelope.
+/// Decodes `output` into a [`CodexShellOutput`], falling back to a JSON `output` string field or the raw text.
 fn shell_output(output: Option<&str>) -> CodexShellOutput {
     let Some(output) = output else {
         return CodexShellOutput {
@@ -654,14 +592,7 @@ fn shell_output(output: Option<&str>) -> CodexShellOutput {
     })
 }
 
-/// Build a `CodexShellCall` from either the legacy `shell` function or the
-/// current `exec_command` function.
-///
-/// Returns `None` when the function name is unrelated (e.g. `update_plan`,
-/// MCP tool calls) or when the arguments fail to deserialize. Both shapes
-/// collapse to the same downstream representation so the patch / sed / cat
-/// dispatch in `handle_shell_call` does not need to branch on the source
-/// function name.
+/// Parses a `shell` or `exec_command` call into a [`CodexShellCall`], returning `None` for other tools or invalid arguments.
 fn parse_function_call(name: &str, args_str: &str, ts: i64) -> Option<CodexShellCall> {
     match name {
         "shell" => {
@@ -728,9 +659,7 @@ fn dispatch_custom_call(
 ) -> bool {
     match call {
         CodexCustomCall::Exec { source, timestamp } => {
-            // The JavaScript wrapper can contain branches, loops, retries, or
-            // tool calls whose execution cannot be proven from source text.
-            // Treat the completed cell itself as the only observable action.
+            // Nested tool calls in JavaScript source cannot be proven to have executed; count the completed `exec` cell as one command.
             if let Some(source) = source {
                 state.add_run_command(&source, "", timestamp);
             } else {
@@ -741,8 +670,6 @@ fn dispatch_custom_call(
         CodexCustomCall::ApplyPatch { patches, timestamp } => {
             match custom_apply_patch_result(output) {
                 CustomApplyPatchResult::Success => {
-                    // Count once per call_id; a paired patch_apply_end for the
-                    // same id is then skipped (whichever arrives first wins).
                     if patch_counted_ids.insert(call_id.to_string()) {
                         for patch in patches {
                             state.handle_patch(patch, timestamp);
@@ -796,13 +723,9 @@ fn normalize_custom_output(output: Option<&str>) -> String {
     }
 }
 
-/// Codex-specific dispatch helpers grafted onto [`SessionParseState`].
-///
-/// Kept as a private extension trait so the generic state type stays free of
-/// Codex's `apply_patch`/`sed`/`cat` heuristics.
+/// Codex-specific shell and patch dispatch helpers on [`SessionParseState`].
 trait CodexAnalysisExt {
-    /// Routes a completed shell call to the read / patch / run-command tally
-    /// based on what its `script` did.
+    /// Routes a completed shell call to read, patch, or run-command metrics based on its `script`.
     fn handle_shell_call(&mut self, call: CodexShellCall, output: CodexShellOutput);
     /// Applies one parsed `apply_patch` hunk as a write, delete, or edit.
     fn handle_patch(&mut self, patch: CodexPatch, ts: i64);
@@ -821,9 +744,6 @@ impl CodexAnalysisExt for SessionParseState {
             return;
         }
 
-        // `exec_command` wraps the captured command output in a metadata
-        // header (legacy `shell` did not); strip it so line counting sees only
-        // the file body.
         let output_body = strip_exec_command_metadata_prefix(&output.output);
 
         if let Some(path) = extract_sed_file_path(&call.script) {
@@ -856,9 +776,7 @@ impl CodexAnalysisExt for SessionParseState {
                 self.add_write_detail(&resolved, &new_str, ts);
             }
             "delete" => {
-                // A delete is a real file operation on a unique file; record
-                // it even when the diff carried no removed content (an entry
-                // may omit `unified_diff`), consistent with add/update.
+                // Use `_raw` so deletes without a `unified_diff` body still count as a file operation.
                 let content = old_str.trim_end_matches('\n');
                 self.add_edit_detail_raw(&resolved, content, "", ts);
             }
@@ -879,8 +797,7 @@ impl CodexAnalysisExt for SessionParseState {
     }
 }
 
-/// A Codex shell invocation awaiting its output, normalized across the
-/// legacy `shell` and current `exec_command` function shapes.
+/// A pending Codex `shell` or `exec_command` invocation awaiting its output.
 struct CodexShellCall {
     /// Event timestamp in epoch milliseconds.
     timestamp: i64,
@@ -890,7 +807,7 @@ struct CodexShellCall {
     full_command: Vec<String>,
 }
 
-/// One file hunk extracted from an `apply_patch` script.
+/// One per-file hunk from an `apply_patch` script or `patch_apply_end` event.
 struct CodexPatch {
     /// `"add"`, `"delete"`, or `"update"`.
     action: String,
@@ -900,9 +817,7 @@ struct CodexPatch {
     lines: Vec<String>,
 }
 
-/// Parses an `apply_patch` script into its constituent per-file hunks.
-///
-/// Returns an empty `Vec` when no `*** Begin Patch` marker is present.
+/// Parses an `apply_patch` script into per-file hunks, returning empty if no `*** Begin Patch` marker is present.
 fn parse_apply_patch_script(script: &str) -> Vec<CodexPatch> {
     let start = match script.find("*** Begin Patch") {
         Some(idx) => idx,
@@ -910,7 +825,6 @@ fn parse_apply_patch_script(script: &str) -> Vec<CodexPatch> {
     };
 
     let segment = &script[start..];
-    // Pre-allocate capacity based on typical patch count (1-5 patches)
     let mut patches = Vec::with_capacity(3);
     let mut current: Option<CodexPatch> = None;
 
@@ -935,7 +849,7 @@ fn parse_apply_patch_script(script: &str) -> Vec<CodexPatch> {
             current = Some(CodexPatch {
                 action: "update".to_string(),
                 file_path,
-                lines: Vec::with_capacity(20), // typical: 10-30 lines per patch
+                lines: Vec::with_capacity(20),
             });
         } else if line.starts_with("*** Add File:") {
             if let Some(patch) = current.take() {
@@ -972,12 +886,7 @@ fn parse_apply_patch_script(script: &str) -> Vec<CodexPatch> {
     patches
 }
 
-/// Normalizes a `patch_apply_end` `changes` map into patch hunks.
-///
-/// Returns `None` when the payload is missing, not an object, or carries only
-/// unrecognizable entries (schema drift). An empty object is a well-formed
-/// no-op and yields an empty `Vec`. Entries are visited in sorted-path order
-/// (the underlying map is a `BTreeMap`) so the folded detail order is stable.
+/// Parses a `patch_apply_end` `changes` object into patch hunks, returning `None` if missing, non-object, or containing only unrecognized entries (empty object returns `Some(vec![])`).
 fn parse_patch_changes(changes: Option<&Value>) -> Option<Vec<CodexPatch>> {
     let obj = changes?.as_object()?;
     let mut patches = Vec::with_capacity(obj.len());
@@ -992,10 +901,7 @@ fn parse_patch_changes(changes: Option<&Value>) -> Option<Vec<CodexPatch>> {
     Some(patches)
 }
 
-/// Builds one [`CodexPatch`] from a single `changes` entry.
-///
-/// The unified diff feeds the same `(old, new)` extraction as the direct
-/// apply_patch path, so add / update / delete map to the identical metrics.
+/// Builds a [`CodexPatch`] from one `patch_apply_end` `changes` entry.
 fn parse_patch_change_entry(path: &str, entry: &Value) -> Option<CodexPatch> {
     if path.is_empty() {
         return None;
@@ -1005,8 +911,7 @@ fn parse_patch_change_entry(path: &str, entry: &Value) -> Option<CodexPatch> {
     if !matches!(action, "add" | "update" | "delete") {
         return None;
     }
-    // Real logs omit `unified_diff` on some entries (observed on `add`); the
-    // operation still counts, with no invented line/char content.
+    // `unified_diff` may be omitted on `add`/`delete` entries; count the operation with empty lines.
     let lines = entry
         .get("unified_diff")
         .and_then(Value::as_str)
@@ -1019,11 +924,7 @@ fn parse_patch_change_entry(path: &str, entry: &Value) -> Option<CodexPatch> {
     })
 }
 
-/// Splits diff `lines` into the joined `(old, new)` text.
-///
-/// `+`-prefixed lines build the new content, `-`-prefixed lines the old;
-/// `@@` hunk headers and `\` no-newline markers are skipped. Both results
-/// have their trailing newline trimmed.
+/// Splits unified diff `lines` into `(old, new)` text with trailing newlines trimmed, skipping `@@` and `\` markers.
 fn extract_patch_strings(lines: &[String]) -> (String, String) {
     let estimated_size = lines.iter().map(|l| l.len()).sum::<usize>();
     let mut old_str = String::with_capacity(estimated_size / 2);
@@ -1063,9 +964,7 @@ fn extract_patch_strings(lines: &[String]) -> (String, String) {
     (old_str, new_str)
 }
 
-/// Extracts the file path read by a `sed -n '<range>' <path>` command.
-///
-/// Returns `None` when the script is not a recognised `sed -n` read.
+/// Extracts the target file path from a `sed -n '<range>' <path>` command.
 fn extract_sed_file_path(script: &str) -> Option<String> {
     use std::sync::OnceLock;
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -1079,10 +978,7 @@ fn extract_sed_file_path(script: &str) -> Option<String> {
     )
 }
 
-/// Extracts the `(path, content)` read by a `cat <path>` command.
-///
-/// `output` is the captured stdout (already metadata-stripped); content after
-/// a `\n---` separator is dropped. Returns `None` when no `cat` line is found.
+/// Extracts `(path, content)` from a `cat <path>` command using metadata-stripped `output`, truncating at `\n---`.
 fn extract_cat_read(script: &str, output: &str) -> Option<(String, String)> {
     for line in script.lines() {
         let trimmed = line.trim();
@@ -1090,7 +986,6 @@ fn extract_cat_read(script: &str, output: &str) -> Option<(String, String)> {
             continue;
         }
 
-        // `trimmed` starts with "cat "; skip that field and take the path.
         let mut fields = trimmed.split_whitespace();
         fields.next();
         let Some(path_field) = fields.next() else {
@@ -1156,7 +1051,6 @@ mod tests {
 
     #[test]
     fn legacy_shell_function_parses_into_call() {
-        // Old schema: arguments = {"command": ["bash", "-lc", "<script>"]}
         let args = r#"{"command":["bash","-lc","ls -la"]}"#;
         let call = parse_function_call("shell", args, 42).expect("shell call should parse");
         assert_eq!(call.timestamp, 42);
@@ -1166,15 +1060,13 @@ mod tests {
 
     #[test]
     fn current_exec_command_function_parses_into_call() {
-        // Current schema: arguments = {"cmd":"...","workdir":"...","yield_time_ms":...}
         let args =
             r#"{"cmd":"sed -n '1,260p' src/main.rs","workdir":"/repo","yield_time_ms":1000}"#;
         let call =
             parse_function_call("exec_command", args, 99).expect("exec_command should parse");
         assert_eq!(call.timestamp, 99);
         assert_eq!(call.script, "sed -n '1,260p' src/main.rs");
-        // `full_command` collapses to the single cmd string so
-        // `record_run_command`'s `join(" ")` produces the verbatim command.
+        // `full_command` collapses to the single cmd string so `record_run_command`'s `join(" ")` produces the verbatim command.
         assert_eq!(call.full_command, vec!["sed -n '1,260p' src/main.rs"]);
     }
 
@@ -1202,7 +1094,6 @@ mod tests {
 
     #[test]
     fn unrelated_function_names_are_ignored() {
-        // MCP tool calls, `update_plan`, etc. must not be treated as shell.
         assert!(parse_function_call("update_plan", "{}", 0).is_none());
         assert!(parse_function_call("_fetch_pr", "{}", 0).is_none());
     }
@@ -1296,9 +1187,6 @@ mod tests {
 
     #[test]
     fn resumed_usage_bills_only_post_baseline_deltas() {
-        // A resumed session replays its prior context before the first
-        // `turn_context`: that opening snapshot only advances the parse loop's
-        // baseline, and every later event is billed its own delta.
         let logs: Vec<CodexLog> = [
             serde_json::json!({
                 "timestamp": "2026-07-12T00:00:00Z",
@@ -1410,9 +1298,6 @@ mod tests {
 
     #[test]
     fn mid_session_model_switch_bills_each_model_its_own_delta() {
-        // The cumulative counter keeps growing across a model switch; the
-        // second model must be billed only the post-switch increment, not the
-        // whole-session cumulative that already contains the first model.
         let token_count = |input: i64, cached: i64, output: i64, total: i64| {
             serde_json::json!({
                 "timestamp": "2026-07-12T00:00:00Z",
@@ -1471,10 +1356,6 @@ mod tests {
 
     #[test]
     fn per_turn_tier_classification_uses_the_turns_own_context() {
-        // Two turns: the first's own prompt (last_token_usage.input_tokens)
-        // is below the 272k threshold, the second's is above. Only the second
-        // turn's delta lands in above_tier even though the cumulative total
-        // crosses the threshold much earlier.
         let event = |cum_input: i64, cum_out: i64, cum_total: i64, last_input: i64| {
             serde_json::json!({
                 "timestamp": "2026-07-12T00:00:00Z",
@@ -1515,7 +1396,6 @@ mod tests {
                 .unwrap();
         let usage = &parsed.analysis.records[0].conversation_usage["gpt-5.4"];
         assert_eq!(usage["total_token_usage"]["total_tokens"], 502_500);
-        // Only the second turn's delta (input 300k, output 1.5k) is above.
         assert_eq!(usage["above_tier"]["level_1_input_tokens"], 300_000);
         assert_eq!(usage["above_tier"]["level_1_output_tokens"], 1_500);
         assert!(
@@ -1578,9 +1458,6 @@ mod tests {
 
     #[test]
     fn exec_command_metadata_prefix_is_stripped() {
-        // Real-world Codex `exec_command` output wraps actual stdout with
-        // a 5-line header; without stripping, the analyzer over-counts
-        // file reads by 5 lines per sed/cat invocation.
         let raw = "Chunk ID: deadbeef\n\
                    Wall time: 0.0000 seconds\n\
                    Process exited with code 0\n\
@@ -1596,17 +1473,12 @@ mod tests {
 
     #[test]
     fn legacy_shell_output_passes_through_unchanged() {
-        // Legacy `shell` function output has no metadata header; the
-        // helper must leave non-prefixed strings exactly as-is so the
-        // existing fixture-based tests keep matching.
         let raw = "line one\nline two\n";
         assert_eq!(strip_exec_command_metadata_prefix(raw), raw);
     }
 
     #[test]
     fn a_body_line_reading_output_is_not_a_metadata_header() {
-        // `cat` of a file that documents its own output; nothing above the
-        // `Output:` line may be discarded.
         let raw = "fn main() {}\nUsage: demo\nOutput:\nthe answer\n";
         assert_eq!(strip_exec_command_metadata_prefix(raw), raw);
     }
@@ -1619,8 +1491,6 @@ mod tests {
 
     #[test]
     fn output_starting_with_marker_handles_no_leading_newline() {
-        // Defensive: if a future Codex variant drops the leading newline
-        // before the `Output:` marker, still strip it cleanly.
         let raw = "Output:\nthe content";
         assert_eq!(strip_exec_command_metadata_prefix(raw), "the content");
     }
@@ -1871,9 +1741,6 @@ mod tests {
 
     #[test]
     fn patch_apply_end_without_unified_diff_still_counts_the_operation() {
-        // Observed in real 2026-06 logs: an `add` entry with no unified_diff.
-        // The write must count (invocation + unique file, zero line/char
-        // content) instead of flagging the record as schema drift.
         let changes = serde_json::json!({
             "/repo/generated.bin": { "type": "add" }
         });
@@ -1906,7 +1773,6 @@ mod tests {
 
     #[test]
     fn patch_apply_end_malformed_changes_is_relevant_failure() {
-        // success is true but `changes` is not an object → schema drift.
         let logs = vec![patch_apply_end(
             "call-x",
             true,
@@ -1925,7 +1791,6 @@ mod tests {
         let changes = serde_json::json!({
             "lib.rs": { "type": "update", "unified_diff": "@@ -1,1 +1,1 @@\n-old\n+new\n" }
         });
-        // Event arrives between the custom_tool_call and its output.
         let logs = vec![
             response_item(serde_json::json!({
                 "type": "custom_tool_call",
@@ -1949,7 +1814,6 @@ mod tests {
         let changes = serde_json::json!({
             "lib.rs": { "type": "update", "unified_diff": "@@ -1,1 +1,1 @@\n-old\n+new\n" }
         });
-        // Event arrives after the pending call was already consumed by its output.
         let logs = vec![
             response_item(serde_json::json!({
                 "type": "custom_tool_call",
@@ -1969,9 +1833,6 @@ mod tests {
 
     #[test]
     fn unrecognized_direct_output_does_not_suppress_authoritative_event() {
-        // A direct apply_patch whose output envelope is unrecognized counts
-        // nothing (Unknown); the paired successful patch_apply_end is the only
-        // authoritative record and must still be folded in.
         let patch = "*** Begin Patch\n*** Update File: lib.rs\n@@\n-old\n+new\n*** End Patch";
         let changes = serde_json::json!({
             "lib.rs": { "type": "update", "unified_diff": "@@ -1,1 +1,1 @@\n-old\n+new\n" }
@@ -2033,7 +1894,6 @@ mod tests {
         assert_eq!(f.total_edit_lines, u.total_edit_lines);
         assert_eq!(f.total_write_characters, u.total_write_characters);
         assert_eq!(f.total_edit_characters, u.total_edit_characters);
-        // Detail bodies are retained only in Full mode.
         assert!(!f.write_file_details.is_empty());
         assert!(u.write_file_details.is_empty());
     }

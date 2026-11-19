@@ -1,12 +1,6 @@
 //! DeepSeek Harness (`dsh`) session-log parser.
 //!
-//! `dsh` writes one append-only JSONL log per session. By default the file is a
-//! concatenation of independent zstd frames — one holding the header line, then
-//! one per durable append batch — so a live session's log can end inside a
-//! structurally incomplete frame. The reader keeps every record decoded before
-//! that point rather than rejecting the whole log, and it also accepts the
-//! uncompressed `session.jsonl` a root configured with `compression: 'none'`
-//! writes.
+//! `dsh` writes one append-only JSONL log per session, either as concatenated zstd frames (header frame followed by one frame per append batch) or as uncompressed `session.jsonl` when `compression: 'none'`. When a live session ends inside an incomplete trailing frame, the reader keeps every record decoded before the error instead of rejecting the file.
 
 use crate::constants::{FastHashMap, buffer};
 use crate::models::CodeAnalysis;
@@ -27,18 +21,12 @@ use std::path::Path;
 /// Magic bytes opening every zstd frame (`0xFD2FB528`, little-endian).
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
-/// The only `SESSION_FORMAT_VERSION` upstream reads or writes. A log stamped
-/// with anything else was produced by a harness whose layout this parser has
-/// never seen, and upstream ships no migration for it either.
+/// Only `SESSION_FORMAT_VERSION` supported by this parser; any other version fails the parse.
 const SUPPORTED_FORMAT_VERSION: i64 = 0;
 
-/// Event types this build knows about but has nothing to extract from.
+/// Known event types and packed chunk-row tags that carry no extractable metrics.
 ///
-/// Kept explicit so a type introduced by a future harness is reported as drift
-/// instead of being silently skipped. Mirrors upstream's
-/// `KNOWN_SESSION_EVENT_TYPES`, minus the types handled in [`DshParser::push`],
-/// plus the three packed chunk-row tags (deliberately slash-less upstream, so
-/// they can never collide with an event type).
+/// Listed explicitly to flag unknown future event types as drift; mirrors upstream `KNOWN_SESSION_EVENT_TYPES` minus types handled in [`DshParser::push`], plus the three slash-less packed chunk tags.
 const IGNORED_RECORD_TYPES: [&str; 42] = [
     "agent-preset/selected",
     "agent/inbox/spliced",
@@ -76,8 +64,7 @@ const IGNORED_RECORD_TYPES: [&str; 42] = [
     "tool-workflow/agent-start",
     "tool-workflow/run-end",
     "tool-workflow/run-start",
-    // Sub-dispatches of a `run_code` program. The enclosing `run_code`
-    // `tool/call` already counts, so counting these would count twice.
+    // Sub-dispatches of `run_code`; the enclosing `tool/call` already counts.
     "tool/code-dispatch",
     "tool/code-dispatch-start",
     "turn/end",
@@ -86,12 +73,9 @@ const IGNORED_RECORD_TYPES: [&str; 42] = [
     "web/deepseek-search-llm-request",
 ];
 
-/// One assistant step's token usage, held until the next step supersedes it.
+/// Held token usage for one `(turn, step)`, kept last-wins until the next step arrives.
 ///
-/// Upstream reports the same `(turn, step)` usage twice — once as an
-/// `assistant/chunk` early sample that survives a later request failure, then
-/// again on the assembled `assistant/message`. Its own fold is last-wins per
-/// step for exactly that reason, and summing both would double every bucket.
+/// Each step is reported as an early `assistant/chunk` sample and again on the assembled `assistant/message`.
 #[derive(Debug, Default)]
 struct UsageSample {
     turn: i64,
@@ -111,13 +95,9 @@ struct DshTokens {
 }
 
 impl DshTokens {
-    /// Reads one `TokenUsage` payload.
+    /// Returns disjoint token counts parsed from a `TokenUsage` object.
     ///
-    /// `inputTokens` already excludes cache reads (the adapters subtract them
-    /// out), so it maps straight onto the non-cached input bucket. Reasoning is
-    /// the one overlapping field: upstream follows the OpenAI convention where
-    /// `outputTokens` already includes `reasoningTokens`, so it is subtracted
-    /// back out here and billed once from its own bucket.
+    /// `inputTokens` already excludes cache reads; `outputTokens` includes `reasoningTokens` and is reduced accordingly.
     fn from_usage(usage: &Map<String, Value>) -> Self {
         let field = |key: &str| usage.get(key).and_then(Value::as_i64).unwrap_or(0);
         let reasoning = field("reasoningTokens");
@@ -138,17 +118,13 @@ impl DshTokens {
         self.cache_write += other.cache_write;
     }
 
-    /// The prompt size one request is billed against, which is what a model's
-    /// `*_above_Nk_tokens` context tier is compared with.
+    /// Returns the prompt token count compared against a model's context-tier thresholds.
     fn request_context(self) -> i64 {
         self.input + self.cache_read + self.cache_write
     }
 }
 
-/// Per-model running totals plus the per-price-level slices of them.
-///
-/// `above_tiers[n]` is the slice classified into price level `n + 1`; the base
-/// level is the remainder and is never held here.
+/// Per-model running totals and above-tier slices (`above_tiers[n]` holds price level `n + 1`; the base level is the remainder).
 #[derive(Debug, Default)]
 struct ModelUsage {
     total: DshTokens,
@@ -156,8 +132,7 @@ struct ModelUsage {
 }
 
 impl ModelUsage {
-    /// Merges `tokens` into the slice for `level`, growing the vector to reach
-    /// it. Level 0 is the base level and holds no slice.
+    /// Merges `tokens` into the slice for price `level` (level 0 is the base level and stores no slice).
     fn classify(&mut self, level: usize, tokens: DshTokens) {
         if level == 0 || level > MAX_TIER_LEVELS {
             return;
@@ -173,8 +148,7 @@ impl ModelUsage {
 #[derive(Debug)]
 struct PendingCall {
     name: String,
-    /// Raw JSON string exactly as the model produced it, so it is parsed
-    /// defensively and only once the paired result reports success.
+    /// Raw JSON argument string from the model, parsed only when the paired result succeeds.
     arguments: String,
 }
 
@@ -201,8 +175,7 @@ pub(crate) fn parse_dsh_session(
         parser.read_lines(reader)
     };
 
-    // A foreign format version means the envelope's own semantics may have
-    // moved, so every number derived from it would be a guess.
+    // Reject unknown format versions because envelope semantics may have changed.
     if let Some(version) = parser.unsupported_version {
         bail!(
             "DeepSeek session {} uses format version {version}, but only version {SUPPORTED_FORMAT_VERSION} is supported",
@@ -210,9 +183,7 @@ pub(crate) fn parse_dsh_session(
         );
     }
 
-    // A live session's log can end inside a half-written frame, so a read that
-    // fails after some records decoded is expected and keeps what it got. One
-    // that fails before any record did is a genuinely unreadable file.
+    // A live session can end mid-frame: keep partial records if any decoded, and fail only when nothing decoded.
     if let Some(error) = truncated {
         if parser.diagnostics.source_records == 0 {
             return Err(error)
@@ -224,11 +195,7 @@ pub(crate) fn parse_dsh_session(
     Ok(parser.finish())
 }
 
-/// Returns whether `path` opens with the zstd frame magic.
-///
-/// The single-file entry point uses this to route a compressed log to this
-/// parser before anything tries to read it as UTF-8 text. An unreadable or
-/// too-short file is simply not zstd as far as this check is concerned.
+/// Returns whether `path` begins with the zstd frame magic, returning `false` if unreadable or shorter than 4 bytes.
 pub(crate) fn has_zstd_magic(path: &Path) -> bool {
     File::open(path).is_ok_and(|file| {
         BufReader::with_capacity(ZSTD_MAGIC.len(), file)
@@ -313,8 +280,7 @@ struct DshParser<'a> {
     usage: FastHashMap<String, ModelUsage>,
     diagnostics: ParseDiagnostics,
     classifier: Option<TierClassifier<'a>>,
-    /// Model from the latest `request/context`, which upstream logs only when
-    /// the route changes, so it has to be carried forward as parser state.
+    /// Model from the latest `request/context`, which is only emitted on route changes.
     route_model: String,
     pending_usage: Option<UsageSample>,
     pending_calls: HashMap<i64, PendingCall>,
@@ -369,8 +335,7 @@ impl<'a> DshParser<'a> {
         None
     }
 
-    /// Fast zero-copy handler for standard envelope records; returns `false`
-    /// before mutating state if an uncommon field shape needs [`Self::push`].
+    /// Handles standard envelope records without `Value` allocation, returning `false` before mutating state when [`Self::push`] is needed.
     fn push_borrowed(&mut self, env: BorrowedDshRecord<'_>) -> bool {
         let kind = env.kind.as_ref();
         if IGNORED_RECORD_TYPES.contains(&kind) {
@@ -557,9 +522,7 @@ impl<'a> DshParser<'a> {
         if let Some(id) = object.get("id").and_then(Value::as_str) {
             self.state.task_id = id.to_string();
         }
-        // `cwd` is absent for a session started outside a workspace, and the
-        // `--<normalized-cwd>--` directory name is a deliberately lossy slug
-        // upstream, so there is nothing to fall back to.
+        // `cwd` is absent outside a workspace, and the directory name slug is lossy, so there is no fallback.
         if let Some(cwd) = object.get("cwd").and_then(Value::as_str) {
             self.state.folder_path = cwd.to_string();
         }
@@ -581,17 +544,11 @@ impl<'a> DshParser<'a> {
         if data.pointer("/chunk/type").and_then(Value::as_str) != Some("usage") {
             return;
         }
-        // The step's identity is on the event, while the usage payload sits
-        // inside the chunk.
         let model = self.route_model.clone();
         self.apply_usage(data, data.pointer("/chunk/usage"), model);
     }
 
-    /// Holds one step's usage sample, flushing the previous step's.
-    ///
-    /// The sample's verdict is left to [`Self::flush_usage`]: a report that the
-    /// next one supersedes describes the same billing event, so counting both
-    /// would report two records where the log has one.
+    /// Records one step's usage sample in the last-wins slot, flushing the prior step when `(turn, step)` changes.
     fn apply_usage(&mut self, data: &Value, usage: Option<&Value>, model: String) {
         self.apply_usage_fields(
             data.get("turn").and_then(Value::as_i64).unwrap_or(0),
@@ -602,8 +559,7 @@ impl<'a> DshParser<'a> {
     }
 
     fn apply_usage_fields(&mut self, turn: i64, step: i64, usage: Option<&Value>, model: String) {
-        // An assistant message carries no `usage` when the adapter reported
-        // none; that is a routing fact, not a schema failure.
+        // Missing `usage` means the adapter reported none, not a schema failure.
         let Some(usage) = usage else {
             return;
         };
@@ -624,13 +580,9 @@ impl<'a> DshParser<'a> {
         self.pending_usage = Some(sample);
     }
 
-    /// Folds the held sample into the per-model totals and records its verdict.
+    /// Folds the held usage sample into per-model totals and records one diagnostics verdict for the surviving `(turn, step)` report.
     ///
-    /// Every step reports its usage twice, so the verdict belongs to the
-    /// survivor of the last-wins slot rather than to each report. A sample
-    /// whose route never resolved (usage before the first `request/context`)
-    /// cannot be attributed to a model, so it is a relevant record the parser
-    /// could not normalize rather than a silent zero.
+    /// Usage without a resolved model is recorded as an unnormalized relevant record.
     fn flush_usage(&mut self) {
         let Some(sample) = self.pending_usage.take() else {
             return;
@@ -664,17 +616,9 @@ impl<'a> DshParser<'a> {
         );
     }
 
-    /// Applies a completed tool call's file operations.
-    ///
-    /// A result is a surface event whose `sourceEventSeqs` points back at its
-    /// `tool/call`, which is what carries the operation's own arguments. A
-    /// result reporting `error` leaves no metric behind.
+    /// Pairs a `tool/result` with its pending `tool/call` via `sourceEventSeqs` and records its metrics unless it reports an `error`.
     fn apply_tool_result(&mut self, object: &Map<String, Value>, data: &Value) {
-        // The envelope can list several source events, so every entry is
-        // searched rather than index 0 alone: reading one position mispairs the
-        // result and leaks the real call. A call whose own record was lost with
-        // a torn frame cannot be identified, and the result payload alone does
-        // not say which tool produced it.
+        // Search every `sourceEventSeqs` entry rather than index 0 because multiple events can be listed, and the result payload alone does not name the tool.
         let Some(call) = object
             .get("sourceEventSeqs")
             .and_then(Value::as_array)
@@ -705,16 +649,14 @@ impl<'a> DshParser<'a> {
                 self.state.tool_counts.todo_write += 1;
                 true
             }
-            // The tool set is composable per agent preset and plugins register
-            // their own, so an unmapped name is normal operation.
+            // Tool sets are plugin-composable, so unmapped tool names are expected.
             _ => return,
         };
         self.diagnostics.record_relevant(applied);
     }
 
     fn apply_read(&mut self, arguments: &Value, meta: &Value, timestamp: i64) -> bool {
-        // The result meta carries the resolved absolute path; the call's own
-        // `file_path` may be relative to the session's cwd.
+        // Prefer `meta.path` (resolved absolute path) over `arguments.file_path`, which may be relative to cwd.
         let path = meta
             .get("path")
             .and_then(Value::as_str)
@@ -746,9 +688,7 @@ impl<'a> DshParser<'a> {
     }
 
     fn apply_write(&mut self, arguments: &Value, timestamp: i64) -> bool {
-        // The result's diff meta is empty for a newly created file and pads
-        // every other hunk with three context lines on each side, so the call's
-        // own content is the only exact record of what was written.
+        // Use the call's `content` because diff meta is empty for new files and pads hunks with context lines.
         let Some(path) = arguments.get("file_path").and_then(Value::as_str) else {
             return false;
         };
@@ -856,8 +796,7 @@ mod tests {
         .to_string()
     }
 
-    /// Compresses each group of lines into its own zstd frame and concatenates
-    /// them, which is exactly how upstream writes one frame per append batch.
+    /// Writes one zstd frame per line batch, matching how `dsh` appends batches.
     fn write_frames(dir: &TempDir, name: &str, batches: &[Vec<String>]) -> std::path::PathBuf {
         let mut bytes = Vec::new();
         for batch in batches {
@@ -909,8 +848,7 @@ mod tests {
             parse_dsh_session(&path, ParseMode::UsageOnly, Some(&tiers)).expect("parse session");
         let above = &parsed.analysis.records[0].conversation_usage["qwen3"]["above_tier"];
 
-        // The first step stays on the base level, and the other two must not
-        // pile into one slice: they belong to different price rows.
+        // First step stays at base level; the other two must land in distinct above-tier slices.
         assert_eq!(above["level_1_input_tokens"], 60_000);
         assert_eq!(above["level_3_input_tokens"], 500_000);
         assert!(above.get("level_2_input_tokens").is_none());
@@ -948,9 +886,7 @@ mod tests {
                 vec![usage_event(2, 1, 2, "m", 20)],
             ],
         );
-        // A live session's log can end mid-frame, which is a normal state, not
-        // corruption: the harness truncates back to the torn frame on its next
-        // open.
+        // Simulate a live session ending mid-frame by truncating the trailing frame.
         let mut bytes = std::fs::read(&path).unwrap();
         bytes.truncate(bytes.len() - 5);
         std::fs::write(&path, bytes).unwrap();
@@ -968,8 +904,7 @@ mod tests {
     fn rejects_a_log_whose_very_first_frame_is_unreadable() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("session.jsonl.zstd");
-        // Opens with the frame magic, so it is routed here, but decodes to
-        // nothing — a genuinely unreadable file rather than an empty session.
+        // Valid zstd magic followed by corrupt bytes must error instead of producing an empty session.
         std::fs::write(&path, [&ZSTD_MAGIC[..], &[0xff; 16]].concat()).unwrap();
 
         assert!(parse_dsh_session(&path, ParseMode::Full, None).is_err());
@@ -1031,8 +966,6 @@ mod tests {
         );
 
         let parsed = parse(&path);
-        // The early chunk and the assembled message describe the same step, so
-        // the pair bills once and is counted once.
         assert_eq!(
             parsed.analysis.records[0].conversation_usage["m"]["output_tokens"],
             2
@@ -1044,8 +977,7 @@ mod tests {
     #[test]
     fn usage_with_no_route_is_a_failed_record_not_a_silent_drop() {
         let dir = TempDir::new().unwrap();
-        // A usage chunk takes its model from the last `request/context`, so one
-        // arriving before the first route has nothing to attribute it to.
+        // Usage chunk arrives before any `request/context`, leaving its model unresolved.
         let chunk = json!({
             "type": "assistant/chunk",
             "seq": 1,
@@ -1082,8 +1014,7 @@ mod tests {
             },
         })
         .to_string();
-        // The call seq sits past index 0; reading only the first entry loses the
-        // operation and leaves the call pending.
+        // Call seq is at index 1 to ensure pairing scans all `sourceEventSeqs` entries.
         let result = json!({
             "type": "tool/result",
             "seq": 6,

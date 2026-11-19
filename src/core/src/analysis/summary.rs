@@ -1,8 +1,6 @@
-//! Aggregated per-provider `analysis` summary shared by every frontend.
+//! Aggregated per-model and per-provider `analysis` summaries.
 //!
-//! Folds the roll-up's per-provider model rows into per-provider file-operation
-//! and tool-call totals. Ratatui-free business logic, so a non-CLI backend
-//! (e.g. a future GUI) builds the same totals without depending on `display`.
+//! Folds [`PerProviderAnalysisRows`] and [`AggregatedAnalysisRow`] slices into [`AnalysisRow`] and [`AnalysisProviderTotals`].
 
 use crate::analysis::{AggregatedAnalysisRow, PerProviderAnalysisRows};
 use crate::models::{Provider, ProviderActiveDays};
@@ -18,11 +16,9 @@ pub struct ModelProviderAnalysis {
     pub total_calls: usize,
 }
 
-/// Display-side copy of one model's analysis metrics.
+/// One model's aggregated analysis metrics with optional per-provider attribution.
 ///
-/// Field-for-field mirror of [`AggregatedAnalysisRow`] plus optional
-/// per-provider attribution, decoupled from that (de)serializable type so the
-/// renderers can also use it as the mutable `TOTAL` row accumulator.
+/// Mirrors [`AggregatedAnalysisRow`] without serialization attributes and adds a per-provider breakdown in [`providers`](Self::providers).
 #[derive(Default)]
 pub struct AnalysisRow {
     /// Model name the metrics are grouped under.
@@ -43,18 +39,18 @@ pub struct AnalysisRow {
     pub todo_write_count: usize,
     /// Number of `Write` tool calls.
     pub write_count: usize,
-    /// Per-provider breakdown for this model, sorted by descending lines.
+    /// Per-provider breakdown for this model, sorted by descending lines, then calls.
     pub providers: Vec<ModelProviderAnalysis>,
 }
 
 impl AnalysisRow {
-    /// Sum of `Edit`, `Read`, and `Write` line counts.
+    /// Returns the sum of `Edit`, `Read`, and `Write` line counts.
     #[inline]
     pub fn total_lines(&self) -> usize {
         self.edit_lines + self.read_lines + self.write_lines
     }
 
-    /// Sum of all five tool-call counters.
+    /// Returns the sum of all five tool-call counters.
     #[inline]
     pub fn total_calls(&self) -> usize {
         self.bash_count
@@ -67,8 +63,7 @@ impl AnalysisRow {
 
 /// Per-provider totals for analysis.
 ///
-/// The counters are summed from the provider's [`AnalysisRow`]s; `days_count`
-/// is copied from [`ProviderActiveDays`] instead.
+/// Line and tool-call counters are summed from the provider's [`AnalysisRow`]s; `days_count` comes from [`ProviderActiveDays`].
 #[derive(Default, Clone)]
 pub struct AnalysisProviderStats {
     /// Sum of `Edit` lines across the provider's models.
@@ -108,14 +103,9 @@ impl AnalysisProviderStats {
 /// Per-provider analysis totals, including the "All Providers" bucket.
 pub type AnalysisProviderTotals = crate::models::ProviderTotals<AnalysisProviderStats>;
 
-/// Calculate per-provider analysis totals using **source-directory**
-/// attribution, mirroring the usage command's per-provider roll-up.
+/// Returns per-provider analysis totals using source-directory attribution.
 ///
-/// Folding [`PerProviderAnalysisRows`] keeps a model recorded by two providers
-/// (e.g. `claude-sonnet-4-6` under both Claude Code and Copilot CLI) attributed
-/// to each source directory rather than to whichever provider its name
-/// resembles. The `hermes` bucket stays at its default: Hermes is usage-only,
-/// so no analysis rows reach it.
+/// Folding [`PerProviderAnalysisRows`] attributes shared model names to each originating provider rather than inferring ownership from the model name. The `hermes` bucket remains zero (Hermes is usage-only).
 pub fn calculate_analysis_provider_totals_from_per_provider(
     per_provider: &PerProviderAnalysisRows,
     provider_days: &ProviderActiveDays,
@@ -143,9 +133,7 @@ pub fn calculate_analysis_provider_totals_from_per_provider(
     accumulate_analysis_provider(&mut totals.opencode, &per_provider.opencode);
     accumulate_analysis_provider(&mut totals.cursor, &per_provider.cursor);
 
-    // Summing the per-provider stats, rather than folding the model-keyed
-    // roll-up, keeps the "All Providers" row equal to Σ providers even when a
-    // model appears under more than one provider.
+    // Sum the per-provider stats rather than the merged model rows so "All Providers" stays equal to Σ providers when a model spans multiple providers.
     totals.overall.total_edit_lines = totals.claude.total_edit_lines
         + totals.codex.total_edit_lines
         + totals.copilot.total_edit_lines
@@ -230,7 +218,7 @@ fn accumulate_analysis_provider(stats: &mut AnalysisProviderStats, rows: &[Aggre
     }
 }
 
-/// Convert aggregator rows into the renderers' [`AnalysisRow`] shape.
+/// Converts [`AggregatedAnalysisRow`] slices into [`AnalysisRow`]s with empty per-provider breakdowns.
 ///
 /// # Examples
 ///
@@ -272,8 +260,9 @@ pub fn convert_to_analysis_rows(data: &[AggregatedAnalysisRow]) -> Vec<AnalysisR
         .collect()
 }
 
-/// Converts aggregator rows into [`AnalysisRow`]s and attaches each model's
-/// per-provider breakdown from `per_provider`.
+/// Converts `data` into [`AnalysisRow`]s with per-provider breakdowns attached from `per_provider`.
+///
+/// Providers with zero lines and zero calls for a model are omitted; remaining entries are sorted by descending lines, then descending calls, then provider display name.
 pub fn build_analysis_rows_with_providers(
     data: &[AggregatedAnalysisRow],
     per_provider: &PerProviderAnalysisRows,

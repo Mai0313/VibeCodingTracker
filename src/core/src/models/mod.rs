@@ -1,16 +1,6 @@
-//! Serde data models mirroring the supported assistants' on-disk session
-//! formats plus the analyzer's own aggregated result types.
+//! Provider session serde models and normalized cross-provider output types.
 //!
-//! Each JSON/JSONL provider submodule (`claude`, `codex`, `copilot`, `gemini`,
-//! `grok`) defines the minimal subset of fields the analyzer reads from that
-//! provider's session logs. The rest define no serde model at all: the SQLite
-//! providers (OpenCode / Cursor / Hermes), DeepSeek Harness and Antigravity read
-//! their sources directly in `session`. `analysis` and `usage` hold the
-//! normalized, cross-provider output shapes and `quota` the provider
-//! quota/rate-limit ones; `provider` carries the [`Provider`] discriminator,
-//! `filter` the [`TimeRange`] session filter, and `aggregate` the per-provider
-//! totals container. All items are re-exported at the module root for
-//! convenience.
+//! Only JSON/JSONL providers (`claude`, `codex`, `copilot`, `gemini`, `grok`) define wire models here; SQLite providers, DeepSeek Harness, and Antigravity decode directly in `session`. All submodules are re-exported at the module root.
 
 pub mod aggregate;
 pub mod analysis;

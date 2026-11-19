@@ -1,8 +1,6 @@
-//! Priced `usage` rows: the library-owned `usage --json` payload.
+//! Priced `usage` rows for the `usage --json` payload.
 //!
-//! [`price_usage_data`] joins each model's tokens with its resolved USD cost
-//! and returns a `Serialize`-able row set, so a non-CLI consumer produces the
-//! same shape the CLI emits.
+//! [`price_usage_data`] joins each model's normalized token counts with its resolved USD cost.
 
 use crate::models::{PerProviderUsage, Provider};
 use crate::pricing::{CostSource, ModelPricingMap, resolve_model_cost};
@@ -14,11 +12,7 @@ use serde_json::Value;
 
 /// One priced model row of the `usage --json` output.
 ///
-/// Fields are declared in alphabetical order (`cost_usd`, `matched_model`,
-/// `model`, `usage`) on purpose: the CLI used to build each row as a
-/// `serde_json::Value`, whose `serde_json::Map` (this crate does not enable
-/// `preserve_order`) serializes keys alphabetically, so keeping that order makes
-/// the derived output byte-for-byte identical. Do not reorder them.
+/// Fields are declared in alphabetical order (`cost_usd`, `matched_model`, `model`, `usage`) to preserve canonical JSON key order; do not reorder them.
 #[derive(Debug, Clone, Serialize)]
 pub struct PricedUsageRow {
     /// Resolved cost in USD.
@@ -32,13 +26,9 @@ pub struct PricedUsageRow {
     pub usage: Value,
 }
 
-/// Builds the priced `usage --json` payload, joining each model's token counts
-/// with its resolved USD cost.
+/// Returns the priced `usage --json` rows, joining each model's normalized tokens with its resolved USD cost.
 ///
-/// OpenCode and Hermes models without an exact LiteLLM price report their own
-/// stored cost for their own portion of a merged row rather than applying it to
-/// other providers with the same model name. Rows follow the insertion order of
-/// `usage_data.models` (deliberately unsorted, matching the historical output).
+/// Each provider's share of a merged model row is priced under that provider's cost basis (stored fallback costs for OpenCode and Hermes apply only to their own tokens). Rows are unsorted and follow the iteration order of `usage_data.models`.
 pub fn price_usage_data(
     usage_data: &UsageData,
     pricing_map: &ModelPricingMap,
@@ -65,24 +55,14 @@ pub fn price_usage_data(
     rows
 }
 
-/// Resolved cost, optional matched pricing key, and per-provider breakdown for
-/// one merged model row.
+/// Resolved cost, matched pricing key, and per-provider breakdown for one merged model row.
 pub(crate) struct MergedModelCost {
     pub cost: f64,
     pub matched_model: Option<String>,
     pub providers: Vec<ModelProviderUsage>,
 }
 
-/// Resolves cost for one merged per-model row from its provider-scoped usage
-/// pieces, along with each contributing provider's tokens and cost.
-///
-/// The merged row is priced by summing each provider's own portion under that
-/// provider's cost basis (LiteLLM for the file providers, an exact match else
-/// the stored cost for OpenCode / Hermes, an exact match else `$0` for Cursor's
-/// local estimate, LiteLLM with an input-rate fallback for Grok's cache-read
-/// gauge), so OpenCode's stored cost applies only to OpenCode's own tokens even
-/// when another provider shares the row. Returns `None` when no provider bucket
-/// holds `model`.
+/// Resolves `model`'s total cost, matched key, and per-provider breakdown by pricing each provider's share under its own [`CostSource`], returning `None` when no provider holds `model`.
 pub(crate) fn resolve_merged_model_breakdown(
     model: &str,
     per_provider: &PerProviderUsage,
@@ -163,8 +143,7 @@ pub(crate) fn resolve_merged_model_breakdown(
     })
 }
 
-/// Resolves cost for one merged per-model row from its provider-scoped usage
-/// pieces.
+/// Returns the resolved cost and optional matched pricing key for `model` across provider buckets, or `None` when absent.
 pub(crate) fn resolve_merged_model_cost(
     model: &str,
     per_provider: &PerProviderUsage,

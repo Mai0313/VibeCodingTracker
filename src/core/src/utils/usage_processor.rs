@@ -1,18 +1,13 @@
-//! Per-provider usage accumulation: merges the token fields of one session
-//! record into a running per-model map, normalising provider-specific shapes
-//! along the way.
+//! Per-provider usage accumulation into running per-model JSON maps.
 
 use crate::constants::FastHashMap;
 use crate::utils::TierSlice;
 use crate::utils::token_merge::write_tier_slice;
 use serde_json::Value;
 
-/// Adds the named `i64` fields from `source` into `target`, in place.
+/// Adds the named `i64` fields from `source` into `target` in place.
 ///
-/// For each name in `fields`, the matching integer in `source` is added to
-/// the matching integer in `target` (treating a missing target as `0`).
-/// Fields absent from `source`, or present but non-integer, are skipped — so
-/// `target` only ever gains the keys that actually carried a number.
+/// Missing `target` entries start at `0`. Fields absent from `source` or non-integer are skipped without modifying `target`.
 ///
 /// # Examples
 ///
@@ -44,13 +39,9 @@ pub fn accumulate_i64_fields(
     }
 }
 
-/// Adds every `i64` field of `source_nested` into the nested object stored
-/// at `target_obj[field_name]`.
+/// Adds every `i64` entry of `source_nested` into the object at `target_obj[field_name]`.
 ///
-/// The nested target object is created (as `{}`) if it does not yet exist.
-/// Unlike [`accumulate_i64_fields`], the set of keys is taken from
-/// `source_nested` rather than a fixed list, so any integer key present in
-/// the source is merged. Non-integer source values are ignored.
+/// Creates an empty object at `field_name` if absent, and ignores non-integer values in `source_nested` (or a non-object existing value at `field_name`).
 ///
 /// # Examples
 ///
@@ -91,13 +82,7 @@ pub fn accumulate_nested_object(
     }
 }
 
-/// Accumulates one classified request's tokens into `existing_obj`'s
-/// `above_tier` object under its price level.
-///
-/// `extract_token_counts` reads that object back into
-/// `TokenCounts::above_tiers`, so `calculate_cost` can bill each level's slice
-/// at that level's rates. A `level` of 0 is the model's base level and leaves
-/// nothing behind.
+/// Accumulates `slice` into `existing_obj["above_tier"]` under `level`, doing nothing when `level == 0`.
 fn accumulate_tier_slice(
     existing_obj: &mut serde_json::Map<String, Value>,
     level: usize,
@@ -113,9 +98,7 @@ fn accumulate_tier_slice(
     }
 }
 
-/// The full prompt context of one Claude request: non-cached input plus
-/// cache reads plus cache writes — what the provider compares against the
-/// "above Nk tokens" threshold.
+/// Returns a Claude request's full prompt context (`input_tokens` + `cache_read_input_tokens` + cache creation tokens).
 pub fn claude_request_context(usage_obj: &serde_json::Map<String, Value>) -> i64 {
     let field = |key: &str| usage_obj.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
     let mut cache_creation = field("cache_creation_input_tokens");
@@ -127,17 +110,11 @@ pub fn claude_request_context(usage_obj: &serde_json::Map<String, Value>) -> i64
     field("input_tokens") + field("cache_read_input_tokens") + cache_creation
 }
 
-/// Merges one Claude usage record into `conversation_usage`, keyed by `model`.
+/// Merges one Claude usage record into `conversation_usage` under `model`.
 ///
-/// Token fields accumulate across calls (the per-model entry is created on
-/// first sight). `service_tier` is overwritten with the latest value rather
-/// than accumulated, and the `cache_creation` TTL split is merged via
-/// [`accumulate_nested_object`]. Records for synthetic models (whose name
-/// contains `<synthetic>`) and non-object `usage` payloads are ignored.
+/// Token counters, `cache_creation`, and `server_tool_use` accumulate across calls; `service_tier` is overwritten with the latest value. Models containing `<synthetic>` and non-object `usage` payloads are ignored.
 ///
-/// `tier_level` is the price level this record (one request) classified into:
-/// its buckets are additionally accumulated into that level's `above_tier`
-/// slice, which prices at that level's rates. `0` is the model's base level.
+/// When `tier_level > 0`, the request's buckets are also accumulated into `above_tier` at that price level.
 pub fn process_claude_usage(
     conversation_usage: &mut FastHashMap<String, Value>,
     model: &str,
@@ -189,8 +166,6 @@ pub fn process_claude_usage(
         accumulate_nested_object(existing_obj, "cache_creation", cache_creation);
     }
 
-    // Accumulate server_tool_use (web_search_requests / web_fetch_requests) so
-    // per-query web-search billing sees the session total.
     if let Some(server_tool_use) = usage_obj.get("server_tool_use").and_then(|v| v.as_object()) {
         accumulate_nested_object(existing_obj, "server_tool_use", server_tool_use);
     }
@@ -198,10 +173,7 @@ pub fn process_claude_usage(
     if tier_level > 0 {
         let field = |key: &str| usage_obj.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
         let scalar_cc = field("cache_creation_input_tokens");
-        // Mirror `extract_token_counts`: the total is the larger of the scalar
-        // and the split sum, the 1h portion comes from the split, and the
-        // remainder bills at 5m so no cache-creation token is dropped from the
-        // classified slice either.
+        // Mirror `extract_token_counts`: total cache creation is max(scalar, 5m + 1h), with any remainder assigned to 5m.
         let cc_1h = usage_obj
             .get("cache_creation")
             .and_then(|v| v.as_object())
@@ -239,13 +211,9 @@ pub const CODEX_TOKEN_FIELDS: [&str; 5] = [
     "total_tokens",
 ];
 
-/// Snapshot of Codex's cumulative `total_token_usage` counters.
+/// Snapshot of Codex's cumulative `total_token_usage` counters for delta attribution across turns and model switches.
 ///
-/// Codex publishes a whole-session running total on every `token_count`
-/// event. Attribution therefore works on the *delta* between consecutive
-/// snapshots, so a mid-session model switch bills each model only for the
-/// tokens produced while it was current instead of double-counting the
-/// pre-switch prefix under both models.
+/// Stores raw Codex counters (`input_tokens` includes `cached_input_tokens`; `output_tokens` includes `reasoning_output_tokens`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CodexTokenTotals {
     pub input_tokens: i64,
@@ -256,15 +224,7 @@ pub struct CodexTokenTotals {
 }
 
 impl CodexTokenTotals {
-    /// Reads the cumulative counters out of a `total_token_usage` object,
-    /// carrying `prev`'s value forward for every field the object omits (or
-    /// reports as a non-integer).
-    ///
-    /// The counters are whole-session cumulative, so an omitted field is
-    /// unreported rather than back to zero, and its last reported value is
-    /// the only defensible reading. Reading it as zero instead makes the
-    /// snapshot look like a counter restart and re-attributes the whole
-    /// session prefix to the current model.
+    /// Reads cumulative counters from `total`, carrying `prev`'s values forward for any omitted or non-integer field.
     pub fn from_total_object(total: &serde_json::Map<String, Value>, prev: Option<&Self>) -> Self {
         let carried = prev.copied().unwrap_or_default();
         let field = |key: &str| {
@@ -293,18 +253,9 @@ impl CodexTokenTotals {
         }
     }
 
-    /// Builds the per-event delta map against `prev`, keeping only the keys
-    /// actually present in `total` so absent fields stay absent downstream.
+    /// Returns the per-event delta map against `prev`, preserving only keys present in `total` and clamping each field at `0`.
     ///
-    /// A reported drop in `total_tokens` means the counter restarted (never
-    /// observed in real logs, but cheap to guard): the event is treated as
-    /// the start of a new segment rather than clamping every field to zero,
-    /// which would silently drop the new segment's early tokens. An object
-    /// that omits the field reports no drop at all — [`from_total_object`]
-    /// carries the previous total forward, so an absent field can never be
-    /// mistaken for a restart.
-    ///
-    /// [`from_total_object`]: Self::from_total_object
+    /// If `total_tokens` drops below `prev.total_tokens`, the event is treated as a counter restart and measured from zero; an omitted `total_tokens` carries `prev`'s value forward via [`Self::from_total_object`] and never triggers a restart.
     pub fn delta_fields(
         total: &serde_json::Map<String, Value>,
         prev: Option<&Self>,
@@ -327,19 +278,11 @@ impl CodexTokenTotals {
     }
 }
 
-/// Merges one Codex usage delta into `conversation_usage`, keyed by `model`.
+/// Merges one Codex usage `delta` into `conversation_usage` under `model`.
 ///
-/// `delta` carries the per-event increments derived from consecutive
-/// cumulative snapshots (see [`CodexTokenTotals`]) and is *accumulated* into
-/// the model's `total_token_usage`, so each model ends up with exactly the
-/// tokens produced while it was the active model. `last_token_usage` and
-/// `model_context_window` are replaced with the latest values. Synthetic
-/// models and non-object `info` payloads are ignored.
+/// Accumulates `delta` (see [`CodexTokenTotals::delta_fields`]) into `total_token_usage`, and replaces `last_token_usage` and `model_context_window` from `info`. Models containing `<synthetic>` and non-object `info` payloads are ignored.
 ///
-/// `tier_level` is the price level this turn classified into: the delta is
-/// additionally accumulated (in the extractor's disjoint form) into that
-/// level's `above_tier` slice, which prices at that level's rates. `0` is the
-/// model's base level.
+/// When `tier_level > 0`, the disjoint delta buckets are also accumulated into `above_tier` at that price level.
 pub fn process_codex_usage(
     conversation_usage: &mut FastHashMap<String, Value>,
     model: &str,
@@ -399,18 +342,11 @@ pub fn process_codex_usage(
     }
 }
 
-/// Merges one Gemini usage record into `conversation_usage`, keyed by `model`.
+/// Merges one Gemini usage record into `conversation_usage` under `model`.
 ///
-/// All token buckets accumulate across calls. Gemini reports `tokens.input`
-/// as the *full* prompt count (cached subset included), so this function
-/// stores `input - cached` under `input_tokens` and the cached portion under
-/// `cache_read_input_tokens`, mirroring the Claude convention where input and
-/// cache reads are disjoint. The subtraction is clamped at `0` to stay
-/// defensive against a misreport where `cached > input`.
+/// Stores `(tokens.input - tokens.cached).max(0)` under `input_tokens` and `tokens.cached` under `cache_read_input_tokens` so input and cache reads are disjoint, while accumulating all other buckets.
 ///
-/// `tier_level` is the price level this message (one request) classified into:
-/// its buckets are additionally accumulated into that level's `above_tier`
-/// slice, which prices at that level's rates. `0` is the model's base level.
+/// When `tier_level > 0`, the disjoint buckets are also accumulated into `above_tier` at that price level.
 pub fn process_gemini_usage(
     conversation_usage: &mut FastHashMap<String, Value>,
     model: &str,
@@ -434,11 +370,7 @@ pub fn process_gemini_usage(
         return;
     };
 
-    // `tokens.input` is the full promptTokenCount and already includes
-    // `tokens.cached` (every observed record satisfies `total == input + output
-    // + thoughts`, with cached *not* added on top). LiteLLM prices the two
-    // independently, so accumulating input verbatim would bill every cached
-    // token at both `input_cost_per_token` and `cache_read_input_token_cost`.
+    // Gemini `tokens.input` includes `tokens.cached`; subtract cached reads so LiteLLM does not bill them twice.
     let input_non_cached = (tokens.input - tokens.cached).max(0);
 
     let current_input = existing_obj
@@ -714,8 +646,6 @@ mod tests {
 
     #[test]
     fn codex_delta_attributes_only_the_increment_to_the_current_model() {
-        // Mirrors a real mid-session model switch: the cumulative counter at
-        // the switch point must not be billed again under the second model.
         let mut conversation_usage = FastHashMap::default();
 
         let first = json!({
@@ -759,8 +689,6 @@ mod tests {
 
     #[test]
     fn codex_delta_treats_a_counter_reset_as_a_new_segment() {
-        // total_tokens dropping below the previous snapshot means the session
-        // counter restarted; the event's own values are the new segment.
         let total = json!({
             "input_tokens": 500,
             "output_tokens": 100,
@@ -781,9 +709,6 @@ mod tests {
 
     #[test]
     fn codex_delta_ignores_a_total_tokens_the_event_never_reported() {
-        // An object carrying only some of the counters says nothing about a
-        // restart: only its own increments may be attributed, never the whole
-        // cumulative prefix.
         let prev = CodexTokenTotals {
             input_tokens: 20_000,
             cached_input_tokens: 4_000,
@@ -805,8 +730,6 @@ mod tests {
 
     #[test]
     fn codex_snapshot_carries_an_unreported_counter_forward() {
-        // The next event that does report `total_tokens` must measure against
-        // the last reported value, not against zero.
         let first = json!({
             "input_tokens": 20_000,
             "cached_input_tokens": 4_000,
@@ -840,8 +763,7 @@ mod tests {
     fn test_process_gemini_usage_basic() {
         let mut conversation_usage = FastHashMap::default();
         let model = "gemini-2.0-flash";
-        // Use a realistic shape: `input` (300) includes `cached` (200),
-        // so non-cached input is 100.
+        // `input` (300) includes `cached` (200), so non-cached input is 100.
         let tokens = crate::models::GeminiTokens {
             input: 300,
             output: 50,
@@ -868,7 +790,6 @@ mod tests {
 
     #[test]
     fn test_process_gemini_usage_no_cache() {
-        // Sanity check: a record with `cached: 0` must not alter input.
         let mut conversation_usage = FastHashMap::default();
         let model = "gemini-2.0-flash";
         let tokens = crate::models::GeminiTokens {

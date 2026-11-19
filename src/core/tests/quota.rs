@@ -1,14 +1,12 @@
-//! Integration test for the Codex session-log quota fallback.
+//! Integration tests for the Codex session-log quota fallback.
 //!
-//! Drops a fixture rollout into a `TempHome`'s Codex session roots and calls the
-//! path-injected resolver directly, so the test needs no `HOME` mutation and no
-//! `#[serial]` — it runs in parallel and reads no machine files.
+//! Drops a fixture rollout into a `TempHome`'s Codex session roots and calls the path-injected resolver directly, so the tests need no `HOME` mutation or `#[serial]` and read no machine files.
 
 use vct_core::models::QuotaSource;
 use vct_core::quota::codex_session::latest_session_rate_limits_in;
 use vct_test_support::{TempHome, fixture_str};
 
-/// Rewrites the fixture's percentages so a second rollout is distinguishable.
+/// Returns the Codex rate-limits fixture with `primary` and `secondary` percentages substituted.
 fn fixture_with_percent(primary: &str, secondary: &str) -> String {
     fixture_str("quota/codex_session_rate_limits.jsonl")
         .replace("42.0", primary)
@@ -37,7 +35,6 @@ fn session_fallback_picks_newest_rate_limits() {
 #[test]
 fn missing_sessions_dir_is_none() {
     let home = TempHome::new();
-    // No sessions written: the resolver returns Ok(None), never an error.
     let result = latest_session_rate_limits_in(&home.paths.codex_session_dirs()).unwrap();
     assert!(result.is_none());
 }
@@ -45,7 +42,6 @@ fn missing_sessions_dir_is_none() {
 #[test]
 fn archived_only_home_still_yields_a_snapshot() {
     let home = TempHome::new();
-    // The user archived every session: the active root does not even exist.
     home.put_codex_archived_session(
         "rollout-2026-06-09T21-00-00-test.jsonl",
         &fixture_str("quota/codex_session_rate_limits.jsonl"),
@@ -69,8 +65,7 @@ fn newest_snapshot_wins_across_roots() {
         "rollout-2026-06-09T21-00-00-new.jsonl",
         &fixture_with_percent("77.0", "88.0"),
     );
-    // mtime ranks across roots, and users archive same-day, so the freshest
-    // snapshot on disk is frequently the archived one.
+    // mtime ranks across roots, and users archive same-day, so the freshest snapshot on disk is frequently the archived one.
     let base = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
     std::fs::File::options()
         .write(true)

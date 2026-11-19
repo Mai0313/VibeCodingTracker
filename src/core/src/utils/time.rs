@@ -1,36 +1,22 @@
-//! RFC 3339 timestamp helpers: parsing the ISO-8601 strings that provider
-//! session logs and quota responses carry, and formatting the UTC stamps vct
-//! writes back into credential and cache files.
+//! RFC 3339 timestamp parsing and UTC nanosecond formatting.
 
 use chrono::{DateTime, SecondsFormat, Utc};
 
-/// Current UTC time as RFC3339 with nanoseconds and a `Z` suffix
-/// (e.g. `2026-07-07T05:34:50.563606999Z`).
-///
-/// Matches the format Codex writes for `auth.json`'s `last_refresh`, so a
-/// refreshed token can be written back in that CLI's own shape; the caches and
-/// log lines vct writes itself reuse the same stamp.
+/// Returns the current UTC time as an RFC 3339 string with nanosecond precision and a `Z` suffix (for example, `2026-07-07T05:34:50.563606999Z`).
 pub fn now_rfc3339_utc_nanos() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
 
-/// Formats `unix_secs` in the same shape [`now_rfc3339_utc_nanos`] produces.
+/// Formats `unix_secs` as an RFC 3339 UTC timestamp with nanosecond precision and a `Z` suffix.
 ///
-/// Used to stamp a refreshed token's expiry in the exact format the Grok CLI
-/// writes into `auth.json`. Returns `None` for a timestamp outside the
-/// representable range rather than silently substituting another instant.
+/// Returns `None` if `unix_secs` is outside the representable `DateTime` range.
 pub fn rfc3339_utc_nanos(unix_secs: i64) -> Option<String> {
     DateTime::from_timestamp(unix_secs, 0).map(|dt| dt.to_rfc3339_opts(SecondsFormat::Nanos, true))
 }
 
-/// Parses an RFC 3339 timestamp into Unix milliseconds.
+/// Parses an RFC 3339 timestamp into Unix milliseconds, returning `0` on invalid or empty input.
 ///
-/// Any offset the standard allows is accepted (`Z` or a numeric offset), at
-/// any sub-second precision. An input carrying no offset is rejected, and
-/// surrounding whitespace is *not* tolerated.
-///
-/// Returns `0` for an empty string or any input that is not RFC 3339;
-/// callers treat `0` as "unknown time" rather than the Unix epoch.
+/// Accepts `Z` or a numeric UTC offset at any sub-second precision (truncated to milliseconds). Naive timestamps without an offset and inputs with surrounding whitespace return `0`.
 ///
 /// # Examples
 ///
@@ -56,11 +42,7 @@ pub fn parse_iso_timestamp(ts: &str) -> i64 {
     }
 }
 
-/// Zero-allocation parser for standard RFC 3339 timestamps
-/// (`YYYY-MM-DDTHH:MM:SS[.fff...](Z|[+-]HH:MM)`).
-///
-/// Returns `Some(0)` on invalid field ranges and `None` only when `chrono`
-/// should adjudicate an uncommon form (such as a `:60` leap second).
+/// Parses standard ASCII RFC 3339 bytes without allocating; requires `bytes.len() >= 20` and returns `None` to defer uncommon forms (such as leap seconds) to `chrono`.
 #[inline]
 fn parse_rfc3339_ascii(bytes: &[u8]) -> Option<i64> {
     if bytes[4] != b'-'
@@ -186,14 +168,12 @@ mod tests {
     fn rfc3339_utc_nanos_round_trips_and_matches_the_now_shape() {
         let stamp = rfc3339_utc_nanos(1_785_058_368).expect("in range");
         assert_eq!(stamp, "2026-07-26T09:32:48.000000000Z");
-        // The same shape `now_rfc3339_utc_nanos` writes, and re-readable.
         assert_eq!(parse_iso_timestamp(&stamp), 1_785_058_368_000);
         assert_eq!(
             stamp.len(),
             now_rfc3339_utc_nanos().len(),
             "both stamps must be the fixed-width nanosecond form"
         );
-        // Out of range yields None rather than a substituted instant.
         assert!(rfc3339_utc_nanos(i64::MAX).is_none());
     }
 
@@ -222,8 +202,7 @@ mod tests {
 
     #[test]
     fn test_parse_iso_timestamp_sub_second_precision() {
-        // Every sub-second width RFC 3339 allows lands on the same instant,
-        // truncated to milliseconds.
+        // Every sub-second width RFC 3339 allows lands on the same instant, truncated to milliseconds.
         assert_eq!(
             parse_iso_timestamp("2024-01-15T10:30:45.123Z"),
             1_705_314_645_123
@@ -240,8 +219,6 @@ mod tests {
 
     #[test]
     fn test_parse_iso_timestamp_requires_an_offset() {
-        // A naive timestamp has no offset to resolve, so it is rejected
-        // rather than assumed to be UTC.
         assert_eq!(parse_iso_timestamp("2024-01-15T10:30:45"), 0);
         assert_eq!(parse_iso_timestamp("2024-01-15T10:30:45.123"), 0);
     }
@@ -287,7 +264,6 @@ mod tests {
 
         assert!(result1 > 0);
         assert!(result2 > 0);
-        // Should be ~999ms apart
         assert!(result2 > result1);
         assert!(result2 - result1 < 1000);
     }
@@ -343,14 +319,12 @@ mod tests {
 
     #[test]
     fn test_parse_iso_timestamp_whitespace() {
-        // Test that whitespace is not tolerated
         let result = parse_iso_timestamp(" 2024-01-15T10:30:45Z ");
         assert_eq!(result, 0);
     }
 
     #[test]
     fn test_parse_iso_timestamp_partial() {
-        // Test partial timestamps (invalid)
         let result = parse_iso_timestamp("2024-01-15");
         assert_eq!(result, 0);
 
@@ -372,10 +346,8 @@ mod tests {
             .map(|ts| parse_iso_timestamp(ts))
             .collect();
 
-        // All should be non-zero
         assert!(results.iter().all(|&r| r > 0));
 
-        // Should be in ascending order
         for i in 1..results.len() {
             assert!(results[i] > results[i - 1]);
         }

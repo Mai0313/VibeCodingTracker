@@ -1,19 +1,13 @@
-//! Compile-time sizing knobs: pre-allocation capacities, I/O buffer sizes, and
-//! the TUI metrics cadence.
+//! Compile-time sizing hints, I/O buffer sizes, refresh cadence, and non-cryptographic hash aliases.
 //!
-//! The capacities and buffer sizes are best-effort hints to size collections
-//! and buffers up front so the hot paths reallocate less; they are not hard
-//! limits except for [`capacity::FILE_CACHE_SIZE`], which bounds the LRU.
+//! Values in [`capacity`] and [`buffer`] are pre-allocation hints rather than hard limits, except [`capacity::FILE_CACHE_SIZE`], which bounds the LRU cache.
 
-/// Hash map backed by `ahash` for fast, non-cryptographic hashing.
+/// Non-cryptographic hash map backed by [`ahash::AHashMap`].
 ///
-/// Used in place of `std::collections::HashMap` on the hot aggregation paths;
-/// every key is process-local rather than attacker-controlled, so DoS
-/// resistance is not required.
+/// Intended only for trusted, process-local keys; do not use for untrusted input that requires HashDoS resistance.
 pub type FastHashMap<K, V> = ahash::AHashMap<K, V>;
 
-/// Hash set backed by `ahash`, replacing `std::collections::HashSet` on the
-/// same paths and the same grounds as [`FastHashMap`].
+/// Non-cryptographic hash set backed by [`ahash::AHashSet`]; see [`FastHashMap`] for key-trust assumptions.
 pub type FastHashSet<T> = ahash::AHashSet<T>;
 
 /// Pre-allocation capacity hints to minimize reallocation overhead.
@@ -30,11 +24,7 @@ pub mod capacity {
     /// Expected number of session files per directory.
     pub const SESSION_FILES: usize = 50;
 
-    /// Maximum number of parsed files held in the LRU file cache.
-    ///
-    /// Deliberately small: every entry holds an `Arc<CodeAnalysis>`, and only
-    /// library callers reach this cache; the CLI and TUI scan paths use the
-    /// compact [`crate::ledger::SessionLedger`] instead.
+    /// Maximum number of parsed files held in [`crate::cache::FileParseCache`].
     pub const FILE_CACHE_SIZE: usize = 5;
 
     /// Expected number of token fields per usage entry.
@@ -53,10 +43,6 @@ pub mod buffer {
 
 /// TUI refresh cadences.
 pub mod refresh {
-    /// CPU/memory sampling + redraw cadence for the summary bar.
-    ///
-    /// Sampling our own process stats and repainting cached rows is nearly
-    /// free, so this runs far more often than the session-aggregation refresh
-    /// it is decoupled from.
+    /// Process CPU/memory sampling and summary-bar redraw interval, in milliseconds.
     pub const METRICS_REFRESH_MS: u64 = 2000;
 }

@@ -1,11 +1,6 @@
-//! Shared ledger-scan machinery for the usage and analysis roll-ups.
+//! Shared ledger-scan machinery for file-backed providers.
 //!
-//! Both features discover the same session files, look each one up in the same
-//! [`SessionLedger`], parse misses into the same [`SessionEntry`], fold the
-//! same days, and record the same failures. The only per-feature parts are
-//! which half of an entry a scan checks and writes ([`ScanFeature`]) and where
-//! a folded day lands ([`CompactSink`]). Usage also threads a per-request tier
-//! snapshot; analysis passes `None`.
+//! Discovers session files, checks and updates [`SessionLedger`] entries per [`ScanFeature`], parses misses into [`SessionEntry`], and folds matching days into a [`CompactSink`].
 
 use super::{ScanDiagnostics, ScanFeature};
 use crate::constants::FastHashSet;
@@ -24,8 +19,7 @@ use anyhow::Result;
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 
-/// The per-feature fold target: usage accumulates token maps, analysis
-/// accumulates file-operation rows. The shared scanners only need this one hook.
+/// Fold target receiving per-day ledger entries during a scan.
 pub(crate) trait CompactSink {
     fn fold(&mut self, provider: ExtensionType, date: &str, day: &DayEntry);
 
@@ -34,8 +28,7 @@ pub(crate) trait CompactSink {
     }
 }
 
-/// Sink for ledger-only refreshes (`vct ledger export`) that need no in-memory
-/// roll-up.
+/// No-op [`CompactSink`] for ledger-only refreshes that skip in-memory folding.
 pub(crate) struct NoopSink;
 
 impl CompactSink for NoopSink {
@@ -53,8 +46,7 @@ pub(crate) enum ScanTarget {
     BothHalves,
 }
 
-/// The inclusive `YYYY-MM-DD` lower bound a scan folds from; `None` folds
-/// every day.
+/// Returns the inclusive `YYYY-MM-DD` lower bound for `time_range`, or `None` when unbounded.
 pub(crate) fn cutoff_string(time_range: TimeRange) -> Option<String> {
     time_range
         .cutoff_date()
@@ -78,8 +70,7 @@ pub(crate) fn fold_days(
     }
 }
 
-/// Folds a session that is present on disk and reports the verdict its
-/// `feature` half retained from the read that produced it.
+/// Folds an on-disk session from `entry` and records its cached `feature` verdict in `diagnostics`.
 pub(crate) fn fold_present(
     provider: ExtensionType,
     source: &Path,
@@ -99,8 +90,7 @@ pub(crate) fn fold_present(
     }
 }
 
-/// Folds every session of `book` the scan did not find on disk, and returns
-/// how many of them held anything.
+/// Folds every session in `book` absent from `seen` and returns how many non-empty entries were retained.
 pub(crate) fn fold_unseen(
     provider: ExtensionType,
     book: &ProviderLedger,
@@ -123,8 +113,7 @@ pub(crate) fn fold_unseen(
     retained
 }
 
-/// Folds the sessions of other machines that `ledger` holds snapshots of, for
-/// every provider `enabled` lets through.
+/// Folds remote-machine sessions stored in `ledger` for every provider passing `enabled`.
 pub(crate) fn fold_remotes(
     ledger: &SessionLedger,
     enabled: impl Fn(ExtensionType) -> bool,
@@ -142,11 +131,7 @@ pub(crate) fn fold_remotes(
     }
 }
 
-/// Parses one session log in `UsageOnly` mode into its ledger entry, stamped
-/// with `stamp` and the read's verdict.
-///
-/// The only feature-specific input is the optional per-request tier snapshot
-/// (usage passes it, analysis passes `None`).
+/// Parses one session file in [`ParseMode::UsageOnly`] into a [`SessionEntry`] stamped with `stamp` and its parse verdict.
 pub(crate) fn load_file_session(
     file: &DiscoveredFile,
     provider: ExtensionType,
@@ -199,6 +184,7 @@ pub(crate) fn load_file_session(
     ))
 }
 
+/// Result of scanning one file-backed provider's roots against its ledger book.
 pub(crate) struct ProviderFileScanOutcome {
     pub(crate) provider: ExtensionType,
     pub(crate) book: ProviderLedger,
@@ -244,6 +230,7 @@ fn entry_matches_stamp(entry: &SessionEntry, target: ScanTarget, current: &ScanS
     }
 }
 
+/// Discovers, stamps, and parses stale files for one provider, returning an updated ledger book and diagnostics.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn scan_provider_files<F>(
     dirs: &[&Path],
@@ -387,6 +374,7 @@ where
     }
 }
 
+/// Merges a [`ProviderFileScanOutcome`] into `ledger`, `sink`, and `diagnostics`.
 pub(crate) fn finish_provider_scan(
     outcome: ProviderFileScanOutcome,
     target: ScanTarget,

@@ -1,26 +1,9 @@
-//! OpenCode session reader (SQLite, not JSONL).
+//! OpenCode session reader for the local SQLite database (`~/.local/share/opencode/opencode.db`).
 //!
-//! Unlike the file-based providers, OpenCode stores every session in a
-//! single SQLite database at `~/.local/share/opencode/opencode.db` (WAL mode).
-//! This module owns the "SQLite rows -> typed [`CodeAnalysis`]" boundary, so
-//! both the `usage` and `analysis` aggregators consume the same shape the
-//! file-based providers produce.
+//! - [`read_opencode_usage`] reads assistant messages for per-model tokens and stored cost, falling back to the legacy `session` table when no `message` table exists.
+//! - [`read_opencode_analysis`] additionally folds tracked `part` tool calls (`read`, `edit`, `write`, `bash`, `todowrite`, `apply_patch`) into per-message file-operation metrics.
 //!
-//! Two entry points keep the work proportional to what each command needs:
-//!
-//! - [`read_opencode_usage`] reads assistant messages for per-model tokens and
-//!   cost, with an older `session`-table fallback.
-//! - [`read_opencode_analysis`] additionally folds the `part` table's tool
-//!   calls (`read`, `edit`, `write`, `bash`, `todowrite`, `apply_patch`) into
-//!   per-message file-operation metrics.
-//!
-//! Token columns map onto the Claude-style flat usage shape, so the shared
-//! `merge_usage_values` / `extract_token_counts` path handles them unchanged.
-//! Cost is the exception: the usage layer prices an OpenCode model from tokens
-//! only on an exact LiteLLM match, and otherwise falls back to the per-message
-//! cost this module returns. Assistant messages carry their own `providerID` +
-//! `modelID`, so sessions that switch model mid-stream are split before
-//! aggregation.
+//! Output uses the shared [`CodeAnalysis`] shape with disjoint token buckets (`input`, `output`, `reasoning`, `cache_read`, `cache_write`). Assistant messages carry their own `providerID` and `modelID`, splitting mid-session model switches into separate rows.
 
 use crate::VERSION;
 use crate::constants::FastHashMap;
@@ -43,19 +26,13 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 
-/// Reads per-session token usage from the OpenCode database.
+/// Returns per-message token usage from the OpenCode database at `db_path` within `time_range`.
 ///
-/// Each returned tuple is `(local YYYY-MM-DD date, CodeAnalysis, stored_cost)`
-/// where the `CodeAnalysis` holds one assistant message's
-/// `conversation_usage`, keyed by that message's provider-qualified model id,
-/// and `stored_cost` is OpenCode's own cost for that message. The date comes
-/// from the assistant message timestamp and is filtered by `time_range`,
-/// matching the file-walker semantics. Databases with no `message` table fall
-/// back to one row per `session`, dated by `time_updated`.
+/// Each tuple is `(local YYYY-MM-DD, CodeAnalysis, stored_cost)`, where the [`CodeAnalysis`] holds one assistant message's `conversation_usage` keyed by its provider-qualified model id and `stored_cost` is OpenCode's stored cost for that message. Dates come from the message timestamp (`time.completed`, `time.created`, or `session.time_updated`). Databases without a `message` table fall back to one row per `session`, dated by `time_updated`.
 ///
 /// # Errors
 ///
-/// Returns an error if the database cannot be opened or queried.
+/// Returns an error if `db_path` cannot be opened or queried, or if expected usage records exist and none used a recognized schema.
 pub fn read_opencode_usage(
     db_path: &Path,
     time_range: TimeRange,
@@ -82,11 +59,7 @@ pub fn read_opencode_usage(
         .collect())
 }
 
-/// Reads compact OpenCode usage rows for the summary aggregation path.
-///
-/// `tiers` is the usage scan's context-tier snapshot; each assistant message is
-/// one billed request, so it is classified against its own prompt context.
-/// `None` classifies nothing and bills everything at base rates.
+/// Reads compact OpenCode usage contributions within `time_range`, classifying each assistant message against `tiers` (or leaving all rows at base tier when `None`).
 pub(crate) fn read_opencode_usage_contributions(
     db_path: &Path,
     time_range: TimeRange,
@@ -98,19 +71,13 @@ pub(crate) fn read_opencode_usage_contributions(
     })
 }
 
-/// Reads per-session file-operation metrics from the OpenCode database.
+/// Returns per-message file-operation metrics from the OpenCode database at `db_path` within `time_range`.
 ///
-/// Like [`read_opencode_usage`], but also folds each row's tool calls from the
-/// `part` table into `tool_call_counts` and the `total_*` line/character
-/// counts. `mode` controls whether the heavy per-operation detail bodies are
-/// retained ([`ParseMode::Full`]) or skipped ([`ParseMode::UsageOnly`]).
-/// Message/session metadata and tool parts are read inside one transaction so
-/// a concurrent OpenCode commit cannot split the result across two SQLite
-/// snapshots.
+/// Like [`read_opencode_usage`], and also folds tracked `part` tool calls into `tool_call_counts` and `total_*` line/character metrics inside a single SQLite transaction for snapshot consistency. `mode` controls whether per-operation detail bodies are retained ([`ParseMode::Full`]) or skipped ([`ParseMode::UsageOnly`]).
 ///
 /// # Errors
 ///
-/// Returns an error if the database cannot be opened or queried.
+/// Returns an error if `db_path` cannot be opened or queried, or if expected analysis records exist and none used a recognized schema.
 pub fn read_opencode_analysis(
     db_path: &Path,
     time_range: TimeRange,
@@ -123,8 +90,7 @@ pub fn read_opencode_analysis(
             result.expected_records
         ));
     }
-    // Records and tool parts are different units: one message can carry many
-    // parts, so adding them together reports a part count as a record count.
+    // Log record and tool-part failures separately because one message can contain many parts.
     let failed_records = result
         .expected_records
         .saturating_sub(result.parsed_records);
@@ -198,22 +164,8 @@ struct CollectedAnalysis {
     failed_tool_parts: usize,
 }
 
-/// The one epoch-millis timestamp an assistant message is dated by.
-///
-/// Every query that selects or filters assistant messages interpolates this
-/// same fragment, and the collectors read the resolved column rather than
-/// re-deriving a timestamp from the JSON: two readers of one value cannot
-/// disagree about which rows a period contains. Every query using it must
-/// join both `message` and `session`.
-///
-/// The `typeof` guard is what makes the fallback chain total. `json_extract`
-/// hands back whatever JSON type the field holds, and only a number is a
-/// timestamp: anything else is passed over so the next candidate gets its
-/// turn, rather than being coerced into a number SQLite invents (`CAST` keeps
-/// the longest leading numeric prefix, so an ISO-8601 string would read as its
-/// year). Unguarded, such a value would also compare above every integer
-/// instead of numerically. The `CAST` itself is for a float, which `rusqlite`
-/// cannot read back as an `i64` at all.
+/// SQL expression resolving an assistant message's epoch-ms timestamp (`time.completed`, `time.created`, or `session.time_updated`); requires both `message` and `session` in scope.
+// Guard with `typeof` so non-numeric JSON values (e.g. ISO-8601 strings) fall through instead of sorting above integers or casting their leading digits; `CAST` converts reals so rusqlite can read `i64`.
 const MESSAGE_TIMESTAMP_SQL: &str = "COALESCE( \
      CASE WHEN typeof(json_extract(message.data, '$.time.completed')) IN ('integer', 'real') \
           THEN CAST(json_extract(message.data, '$.time.completed') AS INTEGER) END, \
@@ -276,9 +228,7 @@ fn collect_session_usage(conn: &Connection, cutoff_ms: Option<i64>) -> Result<Da
             continue;
         };
 
-        // A `session` row is the whole conversation's totals, not one request,
-        // so there is no context to compare against a tier boundary; it bills
-        // at base rates the same way every pre-`message` schema already did.
+        // Legacy `session` rows hold conversation totals rather than single-request context, so tier level is always 0.
         let mut contribution = UsageContribution::single_model(
             session_id,
             date,
@@ -570,8 +520,7 @@ fn collect_message_analysis(
                 AnalysisAccum {
                     model_id: message.model_id,
                     date,
-                    // The `analysis` view is never priced, so it classifies
-                    // nothing and its usage values stay free of `above_tier`.
+                    // Analysis is never priced, so tier level is always 0.
                     usage: message.usage.into_value(0),
                     state,
                 },
@@ -592,9 +541,7 @@ fn collect_message_analysis(
                    AND {MESSAGE_TIMESTAMP_SQL} >= ?1 \
                  ORDER BY part.id"
             ),
-            // `messages` already holds the assistant messages selected above, so
-            // the unwindowed path avoids joining and re-extracting `message.data`
-            // on every tool part row.
+            // Without a cutoff, filter in memory against `messages` instead of joining and re-parsing `message.data` per part.
             None => "SELECT message_id, data \
                  FROM part \
                  WHERE json_extract(data, '$.type') = 'tool' \
@@ -756,12 +703,7 @@ fn fold_tool_part_str(
     }
 }
 
-/// Dispatches a single `part` (type `tool`) onto the session parse state.
-///
-/// Only the tools the analyzer tracks across providers are folded in
-/// (`read`, `edit`, `write`, `bash`, `todowrite`, `apply_patch`); auxiliary
-/// tools such as `task`, `grep`, `glob`, `webfetch`, and `question` are ignored
-/// to stay consistent with the other providers' tool-count semantics.
+/// Folds one tracked `tool` part (`read`, `edit`, `write`, `bash`, `todowrite`, `apply_patch`) into `state`, ignoring auxiliary tools.
 fn apply_tool_part(state: &mut SessionParseState, data: &BorrowedToolPart<'_>) -> ToolPartOutcome {
     let tool = decode_raw_str(data.tool);
     let tool = tool.as_deref().unwrap_or("");
@@ -816,8 +758,7 @@ fn apply_tool_part(state: &mut SessionParseState, data: &BorrowedToolPart<'_>) -
             if !content.is_empty() {
                 state.add_read_detail(&path, &content, ts);
             } else {
-                // Directory listings (and empty reads) still count as a read
-                // invocation even though they contribute no file lines.
+                // Directory listings and empty reads still count as read invocations.
                 state.tool_counts.read += 1;
             }
         }
@@ -986,24 +927,9 @@ fn extract_patch_strings(lines: &[String]) -> (String, String) {
     (old_str, new_str)
 }
 
-/// Packs OpenCode's token counters into the shared usage buckets.
+/// Packs OpenCode's token counters directly into [`UsageTokenContribution`].
 ///
-/// OpenCode records non-cached input separately from cache reads (input is
-/// disjoint from cache, matching the Claude convention), so each counter drops
-/// into one bucket with no adjustment.
-///
-/// `reasoning` is disjoint from `output` as well, which is why nothing here
-/// mirrors the `output - reasoning` correction Copilot, Hermes and DeepSeek
-/// Harness each apply at their parsers: OpenCode has already made it, in
-/// `Session.getUsage`, which is where both the message payload and the legacy
-/// columns get their token object from. Current databases bear it out — the
-/// stored `total` (the provider's own count, kept untouched) comes to
-/// `input + output + reasoning + cache`, and plenty of rows report more
-/// reasoning than output, which is impossible had output ever contained it.
-/// Subtracting a second time would floor most short thinking-heavy replies at
-/// zero output; `test_read_usage_maps_tokens` and
-/// `test_legacy_session_usage_keeps_reasoning_disjoint` hold the two read
-/// paths to that.
+/// OpenCode's `input`, `output`, `reasoning`, `cache_read`, and `cache_write` counters are already mutually disjoint (`Session.getUsage` splits them before persistence); do not subtract `reasoning` from `output` or cache from `input`.
 fn session_usage_value(
     input: i64,
     output: i64,
@@ -1020,35 +946,13 @@ fn session_usage_value(
     }
 }
 
-/// The full prompt context of one assistant message.
-///
-/// The buckets above are disjoint, so the prompt is everything that is not
-/// completion: fresh input plus both cache buckets. That sum is what the
-/// provider compares against a context-tier boundary, the same way
-/// [`claude_request_context`](crate::utils::claude_request_context) reads a
-/// Claude request.
-//
-// One message is one request only because OpenCode almost always finishes an
-// assistant turn in a single step: on a real 1287-message database 1236 of the
-// 1237 messages carrying step parts have exactly one `step-start`, and the lone
-// two-step message recorded usage for only one of them, so no message there
-// actually sums two billed requests. A message that did would be classified
-// against the sum of its steps' contexts and could land a level high. Per-step
-// figures exist (`part` rows of type `step-finish` carry their own `tokens`),
-// but reading them would pull the whole `part` table onto the usage path, which
-// is the cost this reader exists to avoid, and 68 messages carry no
-// `step-finish` part at all to read.
+/// Returns the total prompt context (`input + cache_read + cache_creation`) of one assistant message for tier classification.
+// Classify at message granularity to keep the `part` table off the usage path; assistant messages almost always represent a single billed step, and some lack `step-finish` parts.
 fn request_context(tokens: &UsageTokenContribution) -> i64 {
     tokens.input_tokens + tokens.cache_read_tokens + tokens.cache_creation_tokens
 }
 
-/// Resolves the model name from the `session.model` column.
-///
-/// Modern OpenCode stores it as a JSON object `{"id", "providerID", ...}`. When
-/// `providerID` is present, the returned key is `providerID/id` so same-named
-/// models from different backends do not merge. Older builds may store a bare
-/// model string, which is used verbatim. Returns `None` when no usable model
-/// name is present.
+/// Resolves `session.model` from either a `{"id", "providerID"}` JSON object (formatted as `providerID/id`) or a legacy bare model string.
 fn parse_model_id(raw: &str) -> Option<String> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -1071,12 +975,9 @@ fn parse_model_id(raw: &str) -> Option<String> {
             let s = s.trim();
             (!s.is_empty()).then(|| s.to_string())
         }
-        // A bare model name is not valid JSON, so a parse failure is what the
-        // legacy plain-string column looks like.
+        // Non-JSON text is the legacy plain-string column format.
         Err(_) => Some(raw.to_string()),
-        // Any other JSON value carries no model name. The SQL guard tests for
-        // SQL `NULL`, not for a column holding the four characters `null`,
-        // which would otherwise be priced and displayed as a model.
+        // Reject non-string JSON scalars/arrays (such as literal `"null"`, which bypasses SQL `IS NOT NULL`).
         _ => None,
     }
 }
@@ -1241,35 +1142,23 @@ fn ms_to_local_date(ms: i64) -> Option<String> {
     })
 }
 
-/// Converts the inclusive local-date cutoff into an epoch-millis lower bound.
-///
-/// `None` means [`TimeRange::All`] and nothing else. Every query builder reads
-/// it as "no date predicate", so a conversion that gave up here would drop the
-/// filter from the SQL while the caller still believed it had one.
+/// Returns the inclusive local-date cutoff as an epoch-millis lower bound, or `None` only for [`TimeRange::All`].
 fn cutoff_millis(time_range: TimeRange) -> Option<i64> {
     time_range
         .cutoff_date()
         .map(|date| day_start_millis(&chrono::Local, date))
 }
 
-/// Epoch-millis of the first instant of `date` in `tz`.
-///
-/// The timezone is a parameter so a test can drive one whose midnight is
-/// skipped without touching the ambient `TZ`.
+/// Returns the epoch-millis of the first instant of `date` in `tz`.
 fn day_start_millis<Tz: chrono::TimeZone>(tz: &Tz, date: chrono::NaiveDate) -> i64 {
     use chrono::{Offset, TimeDelta};
 
     let midnight = date.and_time(chrono::NaiveTime::MIN);
-    // `earliest()` also picks the first of the pair when midnight is ambiguous,
-    // which is what a zone falling back onto its own midnight produces.
+    // `earliest()` handles fall-back DST transitions where local midnight occurs twice.
     if let Some(start) = tz.from_local_datetime(&midnight).earliest() {
         return start.timestamp_millis();
     }
-    // `America/Santiago`, `America/Havana` and `Asia/Beirut` put their spring
-    // DST jump at local midnight, so once a year `00:00` never happens and
-    // there is nothing to map. The day still begins — at the jump itself,
-    // which is midnight read against the offset in force just before it. The
-    // probe is a full day earlier, further back than any offset can reach.
+    // Spring-forward zones that jump at local midnight (e.g. `America/Santiago`) have no `00:00`; compute the transition instant using the pre-jump offset probed 24h earlier.
     let before = tz.offset_from_utc_datetime(&(midnight - TimeDelta::days(1)));
     (midnight - TimeDelta::seconds(i64::from(before.fix().local_minus_utc())))
         .and_utc()
@@ -1550,8 +1439,7 @@ mod tests {
         );
         assert_eq!(parse_model_id(r#"{"providerID":"x"}"#), None);
         assert_eq!(parse_model_id("   "), None);
-        // A column holding a JSON scalar names no model; the SQL guard only
-        // filters SQL `NULL` and the empty string.
+        // JSON scalars/arrays name no model even though they bypass SQL `IS NOT NULL`.
         assert_eq!(parse_model_id("null"), None);
         assert_eq!(parse_model_id("42"), None);
         assert_eq!(parse_model_id("[]"), None);
@@ -1640,8 +1528,7 @@ mod tests {
         assert_eq!(usage["cache_creation_input_tokens"], 25);
     }
 
-    /// The legacy branch only runs when there is no `message` table, so the
-    /// session row in `test_read_usage_maps_tokens` never reaches it.
+    /// Legacy `session`-table usage keeps `reasoning` disjoint from `output`.
     #[test]
     fn test_legacy_session_usage_keeps_reasoning_disjoint() {
         let (_dir, db_path) = make_db();
@@ -1659,9 +1546,7 @@ mod tests {
         let rows = read_opencode_usage(&db_path, TimeRange::All).unwrap();
         assert_eq!(rows.len(), 1);
         let usage = &rows[0].1.records[0].conversation_usage["gpt-5.4"];
-        // More reasoning than output is the shape real rows take, and is
-        // impossible had output ever contained reasoning; a subtraction added
-        // here would floor this at zero.
+        // Real rows can have more reasoning than output; subtracting reasoning from output would wrongly floor output at 0.
         assert_eq!(usage["output_tokens"], 21);
         assert_eq!(usage["reasoning_output_tokens"], 26);
     }
@@ -1670,8 +1555,7 @@ mod tests {
         TierThresholds::from_entries([("azure/gpt-5.5", vec![272_000])].into_iter())
     }
 
-    /// Seeds two assistant messages on one tiered model, straddling its
-    /// boundary, and returns the compact rows a usage scan would collect.
+    /// Seeds two assistant messages straddling one tiered model's boundary and returns their usage contributions.
     fn straddling_tier_rows(tiers: Option<&TierThresholds>) -> Vec<UsageContribution> {
         let (_dir, db_path) = make_db();
         let conn = Connection::open(&db_path).unwrap();
@@ -1708,9 +1592,7 @@ mod tests {
 
     #[test]
     fn request_context_counts_the_whole_prompt() {
-        // Everything that is not completion: OpenCode's buckets are disjoint,
-        // so leaving either cache bucket out under-reports the context the
-        // provider actually billed the request against.
+        // Prompt context includes fresh input and both cache buckets because OpenCode's buckets are disjoint.
         let tokens = session_usage_value(200_000, 100, 10, 80_000, 5_000);
         assert_eq!(request_context(&tokens), 285_000);
     }
@@ -1746,8 +1628,7 @@ mod tests {
 
     #[test]
     fn no_thresholds_classifies_nothing() {
-        // An offline scan has no pricing to derive boundaries from, so every
-        // request bills at base rates rather than being guessed at.
+        // Without pricing thresholds, every request stays at base tier 0.
         let rows = straddling_tier_rows(None);
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|row| row.tier_level == 0));
@@ -1772,9 +1653,7 @@ mod tests {
             .unwrap()
             .rows;
         assert_eq!(rows.len(), 1);
-        // The column is the whole conversation's total, not one request's
-        // context, so it must not be compared against a per-request boundary
-        // however far above it the sum happens to land.
+        // Legacy session rows hold whole-conversation totals, so they stay at tier 0 regardless of size.
         assert_eq!(rows[0].tier_level, 0);
     }
 
@@ -1823,8 +1702,7 @@ mod tests {
             [assistant_message("model", 1, 2, 0, 0, 0, 0.5)],
         )
         .unwrap();
-        // The collectors join `session`, so an assistant row whose session is
-        // gone can never be collected and must not be counted as expected.
+        // Messages whose session is missing are excluded by the `session` join and not counted as expected.
         conn.execute(
             "INSERT INTO message (id, session_id, data) VALUES ('m2', 'gone', ?1)",
             [assistant_message("model", 3, 4, 0, 0, 0, 0.5)],
@@ -1953,7 +1831,6 @@ mod tests {
         let (_dir, db_path) = make_db();
         let conn = Connection::open(&db_path).unwrap();
         let now_ms = chrono::Local::now().timestamp_millis();
-        // One session today, one well in the past.
         conn.execute(
 	            "INSERT INTO session (id, model, directory, time_updated, tokens_input) VALUES ('recent', '{\"id\":\"m1\"}', '/repo', ?1, 10)",
 	            rusqlite::params![now_ms],
@@ -2059,8 +1936,7 @@ mod tests {
         assert_eq!(record.total_read_lines, 1);
     }
 
-    /// A zone that skips local midnight, the way `America/Santiago` does on
-    /// 2026-09-06: the clock jumps straight from `00:00` to `01:00`.
+    /// Test timezone that skips local midnight (`00:00` -> `01:00`), like `America/Santiago` on 2026-09-06.
     #[derive(Clone)]
     struct MidnightGapZone;
 
@@ -2147,27 +2023,19 @@ mod tests {
     fn message_timestamp_resolves_the_same_way_for_the_count_and_the_collectors() {
         let now_ms = chrono::Local::now().timestamp_millis();
         let stale_ms = 1000000000000i64;
-        // Every `$.time.*` value in a real OpenCode database is a JSON integer,
-        // so these are shapes a future writer could produce rather than ones it
-        // does. SQLite and serde_json read each of them differently, which is
-        // why the timestamp is resolved once in SQL and read back from there.
+        // Resolve timestamps once in SQL so malformed non-integer `$.time.*` values behave consistently across count and collection.
         for (completed, created, kept) in [
             // A JSON null is not a value, so `created` gets its turn.
             (json!(null), now_ms, true),
             (json!(now_ms as f64), stale_ms, true),
-            // Text is not a number however much it looks like one, and it must
-            // not drag a stale row into the period: unguarded, SQLite sorts it
-            // above every integer and the count keeps the row the collector
-            // cannot place.
+            // Non-numeric strings must fall through instead of sorting above integers in SQLite.
             (json!(now_ms.to_string()), stale_ms, false),
-            // Falling through leaves the row dated by `created`, not by the
-            // year SQLite would read out of the front of the string.
+            // ISO-8601 strings fall through to `created` instead of casting their leading year digits.
             (json!("2026-08-20T00:00:00Z"), now_ms, true),
         ] {
             let (_dir, db_path) = make_db();
             let conn = Connection::open(&db_path).unwrap();
-            // The session is stale, so only the message's own timestamp can put
-            // this row inside today.
+            // Keep `session.time_updated` stale so only the message timestamp can place the row in today's window.
             conn.execute(
                 "INSERT INTO session (id, model, directory, time_updated) VALUES ('s1', '{\"id\":\"m1\"}', '/repo', ?1)",
                 rusqlite::params![stale_ms],
@@ -2426,8 +2294,7 @@ mod tests {
         let rows = read_opencode_analysis(&db_path, TimeRange::All, ParseMode::UsageOnly).unwrap();
         assert_eq!(rows.len(), 1);
         let record = &rows[0].1.records[0];
-        // An insert-only update hunk targets an existing file: it must stay an
-        // edit instead of being reclassified as a write.
+        // Insert-only update hunks target existing files and stay classified as edits.
         assert_eq!(record.tool_call_counts.edit, 1);
         assert_eq!(record.tool_call_counts.write, 0);
         assert_eq!(record.total_edit_lines, 2);

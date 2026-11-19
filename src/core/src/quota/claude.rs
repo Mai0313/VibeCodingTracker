@@ -1,12 +1,6 @@
 //! Claude Code quota fetcher.
 //!
-//! Reads the OAuth access token from `~/.claude/.credentials.json`, calls the
-//! official usage API (`GET /api/oauth/usage`), and — when the token is
-//! near-expiry or rejected — refreshes it against the Claude token endpoint and
-//! writes the rotated token back, preserving every other field. A refreshed
-//! access token is cached in memory so the worker reuses it rather than
-//! refreshing each tick. A refresh failure arms a cooldown (so a revoked token
-//! cannot spin the endpoint) and surfaces a `claude auth login` hint.
+//! Reads the OAuth access token from `~/.claude/.credentials.json` and queries `GET /api/oauth/usage`. When the token is near expiry or rejected with 401, refreshes it against the Claude OAuth token endpoint and persists the rotated token in place without clobbering sibling fields. Refreshed access tokens are cached in memory per credential file mtime; a refresh failure arms a cooldown and surfaces [`CLAUDE_LOGIN_HINT`].
 
 use crate::models::{
     ClaudeCredentials, ClaudeOauth, ClaudeQuotaSnapshot, ClaudeRefreshResponse,
@@ -30,8 +24,7 @@ use std::time::SystemTime;
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 /// OAuth beta header that unlocks the richer usage response (`limits` / `spend`).
 const CLAUDE_OAUTH_BETA: &str = "oauth-2025-04-20";
-/// Fallback Claude Code version for the User-Agent when `claude --version`
-/// cannot be resolved (CLI absent or unreadable). Bump occasionally.
+/// Fallback Claude Code version for the `User-Agent` header when `claude --version` is unavailable.
 const CLAUDE_FALLBACK_VERSION: &str = "2.1.201";
 /// `x-app` value the Claude Code CLI sends.
 const CLAUDE_APP: &str = "cli";
@@ -43,15 +36,10 @@ const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const CLAUDE_TOKEN_URL_PRIMARY: &str = "https://platform.claude.com/v1/oauth/token";
 /// Legacy token endpoint host (fallback on 404/405 from the primary).
 const CLAUDE_TOKEN_URL_LEGACY: &str = "https://console.anthropic.com/v1/oauth/token";
-/// Login hint surfaced when the stored credentials cannot be used (refresh
-/// failed, or there is no access token at all).
+/// Login hint surfaced when stored Claude credentials are missing or cannot be refreshed.
 pub const CLAUDE_LOGIN_HINT: &str = "run: claude auth login";
 
-/// Builds Claude Code's request User-Agent, e.g. `claude-cli/2.1.201 (external, cli)`.
-///
-/// The version is detected from the installed CLI (see
-/// [`crate::quota::http::detect_cli_version`]) so the UA tracks the real client
-/// rather than drifting from a hardcoded constant.
+/// Returns Claude Code's `User-Agent` header value, using [`crate::quota::http::detect_cli_version`].
 fn claude_ua() -> &'static str {
     static UA: OnceLock<String> = OnceLock::new();
     UA.get_or_init(|| {
@@ -63,8 +51,7 @@ fn claude_ua() -> &'static str {
     .as_str()
 }
 
-/// The production token endpoints to try, in order (primary then legacy); tests
-/// pass their own list to [`refresh_claude`] instead.
+/// Returns the token refresh endpoints in preference order (primary, then legacy).
 fn claude_token_urls_default() -> Vec<String> {
     vec![
         CLAUDE_TOKEN_URL_PRIMARY.to_string(),
@@ -77,33 +64,24 @@ fn read_claude_oauth(path: &Path) -> Option<ClaudeOauth> {
     parse_claude_oauth(&std::fs::read_to_string(path).ok()?)
 }
 
-/// Parses the OAuth block from a `.credentials.json` body. Split out from the
-/// file read so a worker can tell an unreadable/absent file (transient) apart
-/// from a present-but-unparseable one (an auth failure), matching how the
-/// Cursor and Copilot workers classify their credential files.
+/// Parses the `claudeAiOauth` block from a `.credentials.json` body.
 fn parse_claude_oauth(body: &str) -> Option<ClaudeOauth> {
     let creds: ClaudeCredentials = serde_json::from_str(body).ok()?;
     creds.claude_ai_oauth
 }
 
-/// Fetches the raw `/api/oauth/usage` response for `vct quota claude`.
+/// Fetches the raw `/api/oauth/usage` response as `(status_code, body)` using the stored access token verbatim.
 ///
-/// Uses the stored access token verbatim (no refresh, no file writes) and
-/// returns `(status_code, body)`. A non-2xx status is left for the caller to
-/// surface — the body (often a JSON error) is still returned.
+/// Does not refresh tokens or modify credentials on disk; non-2xx responses are returned as `Ok((status, body))`.
 ///
 /// # Errors
 ///
-/// Returns an error if the credentials file is missing, has no access token, or
-/// the request cannot be sent.
+/// Returns an error if the credentials file is missing, has no access token, or the HTTP request fails.
 pub fn fetch_claude_raw(client: &Client) -> Result<(u16, String)> {
     fetch_claude_raw_from(client, CLAUDE_USAGE_URL, &get_claude_credentials_path()?)
 }
 
-/// The injectable core of [`fetch_claude_raw`]: reads the token from an explicit
-/// credentials path and fetches the raw usage body from an explicit `usage_url`.
-/// Production passes [`CLAUDE_USAGE_URL`] + `~/.claude/.credentials.json`; tests
-/// point them at a local mock server and a temp credentials file.
+/// Injectable core of [`fetch_claude_raw`] reading the access token from `creds_path` and querying `usage_url`.
 pub(crate) fn fetch_claude_raw_from(
     client: &Client,
     usage_url: &str,
@@ -136,9 +114,7 @@ pub(crate) fn fetch_claude_raw_from(
     Ok((status, body))
 }
 
-/// Reads the plan tier for the Plan line: prefer `rateLimitTier` (it
-/// distinguishes 5x / 20x), fall back to `subscriptionType`, prettified. Returns
-/// `None` when neither is set, so the Plan line is simply omitted.
+/// Returns the prettified plan tier from `path`, preferring `rateLimitTier` over `subscriptionType`.
 fn read_claude_plan(path: &Path) -> Option<String> {
     let oauth = read_claude_oauth(path)?;
     let raw = oauth.rate_limit_tier.or(oauth.subscription_type)?;
@@ -166,11 +142,7 @@ pub fn map_claude_usage(body: &str, now: i64) -> Result<ClaudeQuotaSnapshot> {
         resets_at_unix: w.resets_at.as_deref().and_then(iso_to_unix_secs),
     };
 
-    // The per-model weekly cap (`weekly_scoped`): prefer the active one, else the
-    // highest-percent scoped entry. This scope is volatile on Anthropic's side
-    // (e.g. Fable is subscription-only and time-limited), so it is best-effort:
-    // when it is absent — or present without a usable model label — the whole row
-    // is simply omitted, never an error.
+    // Per-model weekly caps are optional and volatile upstream; prefer an active entry, then highest percent, and omit the row if unlabeled.
     let scoped = resp
         .limits
         .iter()
@@ -182,8 +154,7 @@ pub fn map_claude_usage(body: &str, now: i64) -> Result<ClaudeQuotaSnapshot> {
                     .unwrap_or(std::cmp::Ordering::Equal),
             )
         });
-    // The label is carried whole: how much of it fits is a panel-layout
-    // question, so the renderer that owns the column width decides it.
+    // Carry the full display name; the panel renderer decides truncation.
     let scoped_label = scoped
         .and_then(|l| l.scope.as_ref())
         .and_then(|s| s.model.as_ref())
@@ -284,12 +255,9 @@ fn fetch_claude_usage(client: &Client, token: &str, now: i64, usage_url: &str) -
     }
 }
 
-/// Refreshes the Claude token and writes it back. Returns `(access, expires_ms)`.
+/// Refreshes the Claude OAuth token, persists it to `path` if `expected_mtime` still matches, and returns `(access_token, expires_ms)`.
 ///
-/// Tries the primary host first and falls back to the legacy host on a 404/405
-/// (a moved endpoint) or a request that could not be sent, never on 400/401
-/// (`invalid_grant`, meaning the refresh token is stale — likely rotated by a
-/// running Claude Code).
+/// Falls back to subsequent `token_urls` only on transport error or HTTP 404/405, not on 400/401.
 fn refresh_claude(
     client: &Client,
     path: &Path,
@@ -303,9 +271,7 @@ fn refresh_claude(
         "refresh_token": refresh_token,
         "client_id": CLAUDE_CLIENT_ID,
     });
-    // Only re-send the scopes already granted; omit `scope` when the file has
-    // none so the server preserves the original grant, rather than narrowing a
-    // full Claude Code login down to `user:inference`.
+    // Re-send only previously granted scopes; omitting `scope` preserves the original grant instead of narrowing it.
     if !scopes.is_empty() {
         body["scope"] = json!(scopes.join(" "));
     }
@@ -378,10 +344,7 @@ fn refresh_claude(
         }
         Ok(())
     })?;
-    // The refresh already rotated the refresh token server-side; if we could not
-    // persist the new one, the file now holds a stale/invalid refresh token, so
-    // treat it as a refresh failure (surface needs_login) rather than caching an
-    // ephemeral access token over a broken login.
+    // Server-side rotation already invalidated the old refresh token, so failing to persist leaves the file broken; fail rather than caching an ephemeral access token.
     if !wrote {
         bail!("claude token rotated but the new token could not be persisted");
     }
@@ -398,9 +361,7 @@ enum EnsureToken {
 /// Per-worker Claude state: an in-memory access token + refresh backoff.
 #[derive(Default)]
 pub struct ClaudeState {
-    /// Cached fresh token: `(access_token, expires_at_ms, credential-file mtime)`.
-    /// The mtime pins the cache to the file it came from, so a re-login / account
-    /// switch invalidates it even while the old token is unexpired.
+    /// Cached `(access_token, expires_at_ms, credential_mtime)`; invalidated whenever the credentials file mtime changes.
     token: Option<(String, i64, Option<SystemTime>)>,
     cooldown: RefreshCooldown,
 }
@@ -440,12 +401,9 @@ impl ClaudeState {
                             snap.plan_type = read_claude_plan(&path);
                             QuotaOutcome::Data(snap)
                         }
-                        // A transient retry error keeps the freshly refreshed
-                        // token + last-known-good data; do not nag to re-login.
+                        // Keep the freshly refreshed token and last-known-good snapshot on a transient retry error.
                         FetchResult::Transient => QuotaOutcome::Transient,
-                        // Arm with the CURRENT mtime (re-read): a successful
-                        // refresh just rewrote the file, so a stale mtime would
-                        // never suppress the next tick.
+                        // Re-read mtime because the successful refresh above just rewrote the file.
                         FetchResult::Unauthorized => {
                             self.cooldown.arm(now_secs, file_mtime(&path));
                             self.token = None;
@@ -478,9 +436,7 @@ impl ClaudeState {
             return EnsureToken::Token(tok.clone());
         }
 
-        // An unreadable/absent file is transient (e.g. an atomic rewrite by the
-        // official CLI); a present-but-unparseable one is an auth failure that
-        // should nudge re-login rather than sit on stale data.
+        // Treat an absent or unreadable file as transient (e.g. an atomic rewrite in flight), but unparseable JSON as an auth failure.
         let body = match std::fs::read_to_string(path) {
             Ok(b) => b,
             Err(_) => return EnsureToken::Transient,
@@ -518,11 +474,7 @@ impl ClaudeState {
         }
     }
 
-    /// Reads the refresh token and refreshes once.
-    ///
-    /// Captures the credential mtime together with the refresh token (same read)
-    /// so the write-back guards on the exact file version we send — otherwise we
-    /// could consume a refresh token the CLI just wrote and then abort its write.
+    /// Reads the refresh token from `path` with its mtime guard and refreshes the access token once.
     fn force_refresh(&mut self, client: &Client, path: &Path) -> Option<String> {
         let expected_mtime = file_mtime(path);
         let oauth = read_claude_oauth(path)?;
@@ -628,8 +580,7 @@ mod tests {
 
     #[test]
     fn scoped_label_is_carried_whole() {
-        // Anthropic sends a full display name. Shortening it is the panel's
-        // call, so the mapper must not spend it here.
+        // Anthropic sends a full display name; shortening is left to the panel renderer.
         let body = r#"{
           "limits": [ { "kind": "weekly_scoped", "percent": 30, "is_active": true,
                         "scope": { "model": { "display_name": "Claude Opus 4.5" } } } ]
@@ -640,8 +591,7 @@ mod tests {
 
     #[test]
     fn scoped_hidden_without_model_label() {
-        // A weekly_scoped entry with no model name must not render a row (and
-        // must not error): we never assume the scoped window is present.
+        // A `weekly_scoped` entry without a model name is silently omitted.
         let body = r#"{
           "limits": [ { "kind": "weekly_scoped", "percent": 55, "is_active": true } ]
         }"#;
@@ -652,8 +602,7 @@ mod tests {
 
     #[test]
     fn no_scoped_limit_is_silent() {
-        // Fable retired / not returned: 5h and 7d still map, scoped stays empty,
-        // and mapping succeeds without an error.
+        // Without any `weekly_scoped` limit, 5h and 7d still map without error.
         let body = r#"{
           "five_hour": { "utilization": 10.0 },
           "seven_day": { "utilization": 20.0 },
@@ -668,7 +617,6 @@ mod tests {
 
     #[test]
     fn scoped_prefers_active_over_higher_percent() {
-        // Two scoped entries: the active one wins even at a lower percent.
         let body = r#"{
           "limits": [
             { "kind": "weekly_scoped", "percent": 90, "scope": { "model": { "display_name": "Haiku" } }, "is_active": false },
@@ -711,8 +659,6 @@ mod tests {
 
     #[test]
     fn malformed_credentials_need_login_not_transient() {
-        // An existing but unparseable `.credentials.json` is an auth failure
-        // (nudge re-login), not a transient blip that would sit on stale quota.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".credentials.json");
         std::fs::write(&path, "{ not valid json").unwrap();
@@ -726,8 +672,6 @@ mod tests {
 
     #[test]
     fn unreadable_credentials_stay_transient() {
-        // An absent/unreadable file is transient (e.g. an atomic rewrite in
-        // flight), so the panel keeps its last-known-good rather than nagging.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("missing.json");
         let client = build_client().unwrap();
@@ -740,8 +684,7 @@ mod tests {
 
     #[test]
     fn malformed_scoped_never_breaks_the_body() {
-        // A weekly_scoped with null percent plus a null 5h utilization: the body
-        // must still map (scoped dropped, 5h reads 0), never Err.
+        // Null `percent` drops the scoped entry while null 5h `utilization` maps to 0.
         let body = r#"{
           "five_hour": { "utilization": null, "resets_at": "2026-07-03T22:00:00+00:00" },
           "seven_day": { "utilization": 40.0 },
@@ -762,7 +705,6 @@ mod tests {
 
     #[test]
     fn limits_non_array_is_tolerated() {
-        // limits arriving as null / non-array must not fail the body.
         let snap =
             map_claude_usage(r#"{"five_hour":{"utilization":5.0},"limits":null}"#, 1).unwrap();
         assert!(snap.five_hour.is_some());

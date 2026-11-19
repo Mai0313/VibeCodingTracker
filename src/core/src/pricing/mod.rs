@@ -1,13 +1,6 @@
-//! Model pricing: fetch, cache, match, and cost calculation.
+//! LiteLLM model pricing: fetch, daily cache, name matching, and USD cost calculation.
 //!
-//! This module pulls per-model token prices from LiteLLM, caches them on disk
-//! (one file per calendar day), matches a session's model name against that
-//! table, and computes the USD cost of a request. The public surface is the
-//! re-exports below; every submodule is internal wiring.
-//!
-//! Lookup proceeds exact -> normalized -> substring -> Jaro-Winkler fuzzy
-//! (see [`ModelPricingMap::get`]), and cost is computed by [`calculate_cost`]
-//! across flat, threshold-tiered, and range-tiered pricing shapes.
+//! Prices are cached on disk by UTC calendar date as raw LiteLLM cost-field projections and parsed on load into [`ModelPricing`]. Lookups resolve exact, normalized, substring, then Jaro-Winkler fuzzy via [`ModelPricingMap::get`], and [`calculate_cost`] prices flat, threshold-tiered, and range-tiered models.
 
 mod cache;
 mod calculation;
@@ -43,22 +36,9 @@ pub use matching::{
 };
 pub use tiers::{TierClassifier, TierThresholds};
 
-/// Fetches AI model pricing data from the LiteLLM repository with automatic caching.
+/// Returns model pricing from today's UTC cache, fetching from LiteLLM on a miss.
 ///
-/// Pricing is cached locally by UTC calendar date to minimize network calls.
-/// If today's cache exists and is in the current schema it is loaded directly;
-/// otherwise the upstream JSON is fetched, filtered to its cost fields,
-/// persisted, and parsed. A failure to write the cache is logged but does not
-/// abort the fetch. In offline mode (`VCT_OFFLINE`) nothing is fetched: today's
-/// cache is used when present, otherwise an empty map is returned and every
-/// model prices at $0.
-///
-/// # Errors
-///
-/// Returns an error if the HTTP client cannot be built, the LiteLLM request
-/// fails, the response is not successful, or the response body does not contain
-/// at least one priced model. A corrupt or legacy on-disk cache does not surface
-/// here — it is logged and falls through to a refetch.
+/// A missing, corrupt, or legacy on-disk cache falls through to a remote fetch, and a cache write failure is logged without failing the call. When `VCT_OFFLINE` is set, no network request is made and a cache miss returns an empty [`ModelPricingMap`]. Failed remote fetches are backed off for five minutes per URL and cache directory.
 ///
 /// # Examples
 ///
@@ -70,12 +50,13 @@ pub use tiers::{TierClassifier, TierThresholds};
 /// assert!(opus.pricing.input_cost_per_token >= 0.0);
 /// # Ok::<(), anyhow::Error>(())
 /// ```
+///
+/// # Errors
+///
+/// Returns an error if the cache directory cannot be resolved, a recent fetch failure is still in backoff, the HTTP request fails or returns a non-success status, or the payload is not valid JSON containing at least one valid priced model.
 pub fn fetch_model_pricing() -> Result<ModelPricingMap> {
     let cache_dir = get_cache_dir()?;
 
-    // Offline mode: never hit the network, but still honour a cache hit.
-    // Callers already treat a missing price as $0, so an empty map keeps
-    // `usage` working (cost unavailable) without a fetch.
     if crate::utils::network_disabled() {
         let today = cache::pricing_cache_date();
         if find_pricing_cache_for_date_in(&cache_dir, &today).is_some()
@@ -90,23 +71,13 @@ pub fn fetch_model_pricing() -> Result<ModelPricingMap> {
     fetch_model_pricing_with(LITELLM_PRICING_URL, &cache_dir)
 }
 
-/// Fetches model pricing from an explicit URL, caching under an explicit dir.
+/// Returns model pricing from today's cache under `cache_dir`, fetching `url` on a miss.
 ///
-/// The env-free, injectable counterpart of [`fetch_model_pricing`]: today's
-/// cache under `cache_dir` short-circuits before any request, otherwise `url`
-/// is fetched, filtered to its cost fields, persisted, and parsed. Tests point
-/// `url` at a local mock server and `cache_dir` at a temp directory so no real
-/// API is reached and the real `~/.vct` is never touched. This function does
-/// **not** consult `VCT_OFFLINE` — the offline gate lives in the production
-/// wrapper.
+/// Unlike [`fetch_model_pricing`], this does not consult `VCT_OFFLINE`. A corrupt or legacy cache is logged and triggers a refetch; cache write failures are logged without failing the call. Failed remote fetches are backed off for five minutes per `(url, cache_dir)`.
 ///
 /// # Errors
 ///
-/// Returns an error if the HTTP client cannot be built, the request fails, the
-/// response is not successful, or the response body does not contain at least
-/// one priced model. A corrupt or legacy on-disk cache is logged and falls
-/// through to a refetch. Failed requests are backed off for five minutes per
-/// URL and cache directory.
+/// Returns an error if a recent fetch failure is still in backoff, the HTTP client or request fails, the status is not successful, or the body is not valid JSON containing at least one valid priced model.
 pub fn fetch_model_pricing_with(url: &str, cache_dir: &Path) -> Result<ModelPricingMap> {
     let today = cache::pricing_cache_date();
     let fetch_key = PricingFetchKey {
@@ -152,9 +123,7 @@ fn fetch_model_pricing_remote(
     cache_dir: &Path,
 ) -> Result<HashMap<String, ModelPricing>> {
     log::info!("Fetching model pricing from remote...");
-    // Bound the fetch so a slow/blocked network cannot hang the usage TUI's
-    // first frame (which fetches pricing synchronously on the first launch of
-    // the day, before any cache exists).
+    // Bound the blocking fetch so an unreachable network cannot stall startup.
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
@@ -180,11 +149,7 @@ fn fetch_model_pricing_remote(
         "Invalid model pricing JSON: top-level value must be an object"
     );
 
-    // Project the upstream JSON down to just the cost-related keys before
-    // anything else. Doing the filter first guarantees the on-disk cache
-    // and the in-memory `ModelPricing` are derived from the *same* view of
-    // the data — so nothing we price against can differ from what the
-    // cache preserves for future calculation strategies.
+    // Filter before parsing so in-memory pricing and the on-disk cache derive from the exact same subset of keys.
     let filtered_raw = cache::build_filtered_cost_json(&raw);
 
     let parsed = cache::parse_litellm_pricing_map(filtered_raw.clone());
@@ -198,10 +163,7 @@ fn fetch_model_pricing_remote(
         "Invalid model pricing JSON: no priced models"
     );
 
-    // The cache deliberately holds the raw cost keys rather than our derived
-    // `ModelPricing` shape, so priority / flex / batch / audio / image tiers
-    // that `calculate_cost` doesn't consume yet are still available to future
-    // versions without a re-fetch.
+    // Persist the raw cost-key projection rather than `ModelPricing` so unparsed LiteLLM cost keys remain available to future versions.
     if let Err(e) = cache::save_to_cache_in(cache_dir, &filtered_raw) {
         log::warn!("Failed to save pricing to cache: {}", e);
     } else {
@@ -240,8 +202,6 @@ mod tests {
 
     #[test]
     fn test_normalize_pricing_preserves_valid_model() {
-        // A model with valid base prices survives `normalize_pricing` with
-        // every rate untouched; the pass only drops entries.
         let mut pricing_map = HashMap::new();
         pricing_map.insert(
             "test-model".to_string(),

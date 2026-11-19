@@ -1,9 +1,6 @@
-//! Priced, aggregated `usage` summary shared by every frontend.
+//! Priced, aggregated `usage` summaries.
 //!
-//! Turns the roll-up's per-model and per-provider usage maps into the priced
-//! [`UsageSummary`] (sorted per-model rows, column totals, per-provider
-//! totals). Terminal-free business logic, so the display layer only renders
-//! the result.
+//! Builds [`UsageSummary`] (sorted per-model rows, column totals, and per-provider totals) from aggregated usage maps and pricing data.
 
 use crate::models::{PerProviderUsage, Provider, ProviderActiveDays, UsageResult};
 use crate::pricing::CostSource;
@@ -15,8 +12,7 @@ use serde_json::Value;
 enum ProviderPricing<'a> {
     /// File-based providers priced purely from LiteLLM.
     Litellm,
-    /// Grok's context-gauge estimate: LiteLLM with an input-rate fallback for
-    /// entries that publish no cache-read price.
+    /// Grok's context-gauge estimate: LiteLLM with an input-rate fallback when cache-read pricing is absent.
     GrokGauge,
     /// OpenCode: exact LiteLLM match, else its stored cost.
     OpenCode(&'a crate::constants::FastHashMap<String, f64>),
@@ -27,7 +23,7 @@ enum ProviderPricing<'a> {
 }
 
 impl ProviderPricing<'_> {
-    /// The [`CostSource`] to use for `model` under this provider's basis.
+    /// Returns the [`CostSource`] for `model` under this provider's basis.
     fn source_for(&self, model: &str) -> CostSource {
         let stored =
             |m: &crate::constants::FastHashMap<String, f64>| m.get(model).copied().unwrap_or(0.0);
@@ -54,16 +50,12 @@ pub struct ModelProviderUsage {
 
 /// One priced per-model row of a [`UsageSummary`].
 ///
-/// `output_tokens` and `reasoning_tokens` are disjoint buckets that both feed
-/// `total`, so a display layer showing a single "Output" column wants their
-/// sum via [`UsageRow::output_with_reasoning`] for the row to add up.
+/// `output_tokens` and `reasoning_tokens` are disjoint buckets that both contribute to `total`; use [`UsageRow::output_with_reasoning`] for their combined count.
 #[derive(Default, Clone)]
 pub struct UsageRow {
     /// Raw model name as reported by the session (the pricing-lookup key).
     pub model: String,
-    /// The LiteLLM key actually used to price this row, when it differed from
-    /// `model`; `None` on an exact match, when unpriced, or when multiple
-    /// variants merged.
+    /// LiteLLM key used to price this row when it differed from `model`; `None` on an exact match, when unpriced, or when multiple variants merged.
     pub matched_model: Option<String>,
     /// Prompt (input) tokens.
     pub input_tokens: i64,
@@ -87,17 +79,16 @@ pub struct UsageRow {
     pub web_search_requests: i64,
     /// Sum of all token buckets for this model.
     pub total: i64,
-    /// LiteLLM-priced cost in USD for this model's tokens.
+    /// Resolved cost in USD for this model's tokens.
     pub cost: f64,
     /// Per-provider breakdown for this model, sorted by descending cost.
     pub providers: Vec<ModelProviderUsage>,
-    /// Raw model names folded into this row by [`merge_rows_by_base_model`],
-    /// populated when more than one variant merged or a prefix was stripped.
+    /// Raw model names folded into this row by [`merge_rows_by_base_model`], populated when multiple variants merged or a prefix was stripped.
     pub variants: Vec<String>,
 }
 
 impl UsageRow {
-    /// Sum of this row's output and reasoning tokens.
+    /// Returns the sum of this row's output and reasoning tokens.
     #[inline]
     pub fn output_with_reasoning(&self) -> i64 {
         self.output_tokens + self.reasoning_tokens
@@ -135,7 +126,7 @@ impl UsageTotals {
         self.cost += row.cost;
     }
 
-    /// Same helper as [`UsageRow::output_with_reasoning`] for totals.
+    /// Returns the sum of `output_tokens` and `reasoning_tokens`.
     #[inline]
     pub fn output_with_reasoning(&self) -> i64 {
         self.output_tokens + self.reasoning_tokens
@@ -144,8 +135,7 @@ impl UsageTotals {
 
 /// Per-provider totals for usage.
 ///
-/// `days_count` doubles as the presence predicate: the display layer renders a
-/// provider's row only while it is nonzero.
+/// A nonzero `days_count` indicates that the provider had recorded activity.
 #[derive(Default, Clone)]
 pub struct ProviderStats {
     /// Total tokens attributed to this provider.
@@ -178,11 +168,9 @@ pub struct UsageSummary {
     pub provider_totals: UsageProviderTotals,
 }
 
-/// Calculates per-provider totals using **source-directory** attribution.
+/// Returns per-provider token and cost totals using source-scoped attribution from `per_provider`.
 ///
-/// Tokens come from the `per_provider` map, which `usage::aggregator` fills
-/// per source directory (or source database), so the provider assignment is
-/// exact regardless of what model name the session happens to carry.
+/// Each provider bucket is priced under its own cost basis regardless of shared model names across providers.
 pub fn calculate_provider_totals_from_per_provider(
     per_provider: &PerProviderUsage,
     provider_days: &ProviderActiveDays,
@@ -264,10 +252,7 @@ pub fn calculate_provider_totals_from_per_provider(
         ProviderPricing::Hermes(&stored_costs.hermes),
     );
 
-    // The "All Providers" row sums the already-priced per-provider stats, so it
-    // stays consistent with the rows above. Re-pricing the cross-provider merged
-    // `UsageData.models` map instead would total the same tokens but has no
-    // provider attribution left to price each portion on its own basis.
+    // Sum the already-priced per-provider stats so "All Providers" reflects each provider's cost basis and stays equal to Σ providers.
     totals.overall.total_tokens = totals.claude.total_tokens
         + totals.codex.total_tokens
         + totals.copilot.total_tokens
@@ -292,8 +277,7 @@ pub fn calculate_provider_totals_from_per_provider(
     totals
 }
 
-/// Prices every model in `usage` under `pricing`'s cost basis and folds the
-/// results into `stats`.
+/// Prices every model in `usage` under `pricing`'s cost basis and folds the results into `stats`.
 fn accumulate_provider(
     stats: &mut ProviderStats,
     usage: &UsageResult,
@@ -306,15 +290,9 @@ fn accumulate_provider(
     }
 }
 
-/// Builds the priced summary from a roll-up's usage maps.
+/// Builds a priced [`UsageSummary`] from merged and per-provider usage maps.
 ///
-/// `usage_data` is the cross-provider merged map and supplies the per-model
-/// rows; `per_provider` is the source-directory-scoped map and supplies both
-/// the per-provider totals and each merged row's cost, so Copilot-billed
-/// Claude tokens keep Copilot's cost basis even where they share a row with
-/// Claude Code. A model absent from every per-provider map falls back to a
-/// plain LiteLLM price. An empty `usage_data` returns the default summary,
-/// dropping the day counts `provider_days` carried.
+/// `usage_data` supplies the per-model rows, while `per_provider` supplies per-provider totals and per-source cost resolution (falling back to plain LiteLLM pricing if a model appears in no provider bucket). Returns [`UsageSummary::default()`] when `usage_data` is empty, discarding `provider_days`.
 pub fn build_usage_summary(
     usage_data: &UsageResult,
     per_provider: &PerProviderUsage,
@@ -348,9 +326,7 @@ pub fn build_usage_summary(
         summary.rows.push(row);
     }
 
-    // Ascending cost puts the expensive models at the bottom of the table. The
-    // model-name tie-break is what keeps equal-cost rows in a stable order:
-    // `usage_data` is a hash map, so its iteration order is not reproducible.
+    // Sort by ascending cost with a model-name tie-break so hash-map iteration order cannot reorder equal-cost rows.
     summary.rows.sort_by(|a, b| {
         a.cost
             .partial_cmp(&b.cost)
@@ -371,10 +347,7 @@ pub fn build_usage_summary(
     summary
 }
 
-/// Builds one priced [`UsageRow`] from a model's raw usage `Value`, pricing it
-/// on the basis `source` names.
-///
-/// A non-exact LiteLLM match records the matched model name in `matched_model`.
+/// Builds one priced [`UsageRow`] from `usage` under `source`.
 fn extract_usage_row(
     model: &str,
     usage: &Value,
@@ -414,8 +387,7 @@ fn build_usage_row(
     build_usage_row_from_counts(model, &counts, cost, matched_model)
 }
 
-/// Builds one display row from already-extracted token counts and a resolved
-/// cost, so callers that already have the counts do not re-walk the usage value.
+/// Builds a [`UsageRow`] from pre-extracted [`TokenCounts`](crate::utils::TokenCounts) and a resolved cost.
 fn build_usage_row_from_counts(
     model: &str,
     counts: &crate::utils::TokenCounts,
@@ -454,27 +426,14 @@ fn build_usage_row_from_counts(
     }
 }
 
-/// Returns the base model key used to merge rows across provider-routing
-/// prefixes: everything after the first `/`, or the whole name when there is no
-/// `/`. Unlike [`normalize_model_name`](crate::pricing::normalize_model_name)
-/// this does **not** strip version/date suffixes, so `gpt-5.5` and `gpt-5.4`
-/// stay distinct.
+/// Returns the slice after the first `/`, or `model` unchanged when no `/` is present, preserving version and date suffixes.
 fn base_model_key(model: &str) -> &str {
     model.split_once('/').map(|(_, rest)| rest).unwrap_or(model)
 }
 
-/// Collapses rows by `base_model_key`, summing every token bucket and the
-/// already-resolved cost, and labels each merged row with the bare base name.
+/// Merges rows that share a base model name (after stripping any leading `<prefix>/` segment), summing token buckets and pre-resolved costs.
 ///
-/// Costs are summed verbatim rather than re-derived: each input row was already
-/// priced against its full model name, so a merged `gpt-5.5` adds the
-/// differently-priced `openai/gpt-5.5`, `azure/gpt-5.5` and bare `gpt-5.5`
-/// pieces. Per-provider contributions are folded by provider, and the folded
-/// raw model names are kept in [`UsageRow::variants`] whenever more than one
-/// variant merged or a prefix was stripped. A single stripped row keeps its
-/// `matched_model` when that key still differs from the stripped base name.
-/// The result is re-sorted by ascending cost, tie-broken by model name,
-/// matching [`build_usage_summary`].
+/// Costs are summed verbatim rather than re-priced. Per-provider contributions are folded by provider, and [`UsageRow::variants`] records the contributing raw model names whenever multiple variants merged or a prefix was stripped. A single stripped row retains [`UsageRow::matched_model`] only when it still differs from the base name. Output is sorted by ascending cost, then model name.
 pub fn merge_rows_by_base_model(rows: &[UsageRow]) -> Vec<UsageRow> {
     use std::collections::HashMap;
 
@@ -650,7 +609,6 @@ mod tests {
     fn cursor_row_uses_exact_litellm_price() {
         clear_pricing_cache();
 
-        // An exact LiteLLM price exists for the model Cursor reports.
         let mut raw_pricing = std::collections::HashMap::new();
         raw_pricing.insert(
             "gemini-2.5-pro".to_string(),
@@ -684,11 +642,9 @@ mod tests {
     #[test]
     fn stored_cost_prices_only_its_own_providers_share_of_a_merged_row() {
         clear_pricing_cache();
-        // Empty pricing: OpenCode falls back to its stored cost while Cursor's
-        // local estimate stays unpriced.
+        // Empty pricing: OpenCode falls back to its stored cost while Cursor's local estimate stays unpriced.
         let pricing_map = ModelPricingMap::new(std::collections::HashMap::new());
 
-        // The same bare model name appears under both OpenCode and Cursor.
         let mut usage_data = UsageResult::default();
         usage_data.insert("collide".to_string(), json!({"input_tokens": 10}));
 
@@ -772,7 +728,6 @@ mod tests {
 
     #[test]
     fn merge_keeps_different_versions_apart() {
-        // The key check: the 5.4 tokens never fold into the merged 5.5 row.
         let rows = vec![
             row("openai/gpt-5.5", 10, 10, 1.0),
             row("azure/gpt-5.5", 30, 30, 3.0),
@@ -801,8 +756,7 @@ mod tests {
         assert_eq!(merged[0].variants, vec!["deepseek/deepseek-v4-pro"]);
         assert_eq!(merged[0].total, 5);
 
-        // When the matched key equals the stripped base name, it is dropped so
-        // Details never shows a redundant `Priced as` identical to the heading.
+        // Drop `matched_model` when it equals the stripped base name to avoid a redundant `Priced as` label.
         let mut exact_after_strip = row("openai/gpt-5.5", 5, 5, 1.5);
         exact_after_strip.matched_model = Some("gpt-5.5".to_string());
         let merged_exact = merge_rows_by_base_model(std::slice::from_ref(&exact_after_strip));
@@ -827,7 +781,6 @@ mod tests {
         let merged = merge_rows_by_base_model(&rows);
 
         assert_eq!(merged.len(), 2);
-        // cheap-model (0.01) sorts before the merged gpt-5.5 row (18.0).
         assert_eq!(merged[0].model, "cheap-model");
         assert_eq!(merged[1].model, "gpt-5.5");
         assert!((merged[1].cost - 18.0).abs() < 1e-9);

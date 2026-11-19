@@ -1,3 +1,5 @@
+//! Atomic file writes, JSON/JSONL readers, and line counting.
+
 use crate::constants::buffer;
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -9,8 +11,7 @@ use std::sync::{PoisonError, RwLock};
 /// The file-name prefix of the temp file every atomic write goes through.
 pub(crate) const ATOMIC_TEMP_PREFIX: &str = ".tmp";
 
-/// Held shared by every atomic write, and exclusively for good once
-/// [`finish_atomic_writes`] has run.
+/// Held shared by every atomic write, and exclusively for good once [`finish_atomic_writes`] has run.
 static WRITE_GATE: RwLock<()> = RwLock::new(());
 
 /// Waits for every atomic write in progress and lets none start afterwards.
@@ -24,8 +25,7 @@ fn close_gate(gate: &RwLock<()>) {
     std::mem::forget(gate.write().unwrap_or_else(PoisonError::into_inner));
 }
 
-/// Runs `action` inside the shared atomic-write gate so [`finish_atomic_writes`]
-/// waits for an in-progress sibling stage-and-rename before process exit.
+/// Runs `action` under the shared atomic-write gate so [`finish_atomic_writes`] waits for it before process exit.
 pub(crate) fn with_atomic_write_gate<T>(action: impl FnOnce() -> T) -> T {
     let _writing = WRITE_GATE.read().unwrap_or_else(PoisonError::into_inner);
     action()
@@ -33,15 +33,11 @@ pub(crate) fn with_atomic_write_gate<T>(action: impl FnOnce() -> T) -> T {
 
 /// Reads a JSONL file and returns one [`Value`] per non-empty line.
 ///
-/// Blank and whitespace-only lines are skipped. Parsing is strict: one bad
-/// line fails the whole file, and callers that must tolerate a torn tail use
-/// their own lenient reader instead.
+/// Blank and whitespace-only lines are skipped; any malformed line fails the whole read.
 ///
 /// # Errors
 ///
-/// Returns an error if the file cannot be opened, if reading any line fails
-/// (e.g. invalid UTF-8 or an I/O error), or if any non-empty line is not
-/// valid JSON. The error context names the offending line number.
+/// Returns an error if `path` cannot be opened, any line cannot be read, or any non-empty line is invalid JSON.
 pub fn read_jsonl<P: AsRef<Path>>(path: P) -> Result<Vec<Value>> {
     let file = File::open(path.as_ref())
         .with_context(|| format!("Failed to open file: {}", path.as_ref().display()))?;
@@ -50,7 +46,7 @@ pub fn read_jsonl<P: AsRef<Path>>(path: P) -> Result<Vec<Value>> {
     let estimated_lines = if file_size > 0 {
         file_size / buffer::AVG_JSONL_LINE_SIZE
     } else {
-        10 // Default minimum capacity
+        10
     };
     let mut results = Vec::with_capacity(estimated_lines);
 
@@ -74,18 +70,13 @@ pub fn read_jsonl<P: AsRef<Path>>(path: P) -> Result<Vec<Value>> {
     Ok(results)
 }
 
-/// Serializes `value` as compact JSON and writes it to `path` atomically.
+/// Serializes `value` as compact JSON and replaces `path` via a same-directory temporary file and rename.
 ///
-/// Writes to a temporary file in the same directory, fsyncs it, then renames
-/// it over `path`, so a concurrent reader sees either the old file or the
-/// whole new one, never a partial write. Missing parent directories are
-/// created. The fsync is best-effort: its failure is ignored, so the rename
-/// is atomic but not proof against a crash before the data reaches disk.
+/// Missing parent directories are created. `sync_all` is best-effort: failures are ignored, so the replacement is atomic against concurrent readers but not crash-durable.
 ///
 /// # Errors
 ///
-/// Returns an error if the parent directory cannot be created, the temp file
-/// cannot be written, or the final rename fails.
+/// Returns an error if the parent directory cannot be created, serialization fails, the temp file cannot be written, or the rename fails.
 pub fn write_json_atomic<T, P>(path: P, value: &T) -> Result<()>
 where
     T: serde::Serialize,
@@ -94,9 +85,7 @@ where
     write_json_atomic_inner(path.as_ref(), value, false).map(|_| ())
 }
 
-/// Like [`write_json_atomic`], returning the persisted file's metadata so a
-/// caller can stamp the exact inode and mtime it just wrote without racing a
-/// concurrent writer.
+/// Like [`write_json_atomic`], returning the persisted file's metadata when available.
 pub(crate) fn write_json_atomic_metadata<T, P>(
     path: P,
     value: &T,
@@ -109,16 +98,13 @@ where
     Ok(file.metadata().ok())
 }
 
-/// Like [`write_json_atomic`] but pretty-prints the JSON.
+/// Serializes `value` as pretty-printed JSON and replaces `path` atomically.
 ///
-/// For files another tool or a human also reads, such as credential write-back
-/// where collapsing a provider CLI's token file onto one line would be a
-/// visible regression.
+/// Uses the same temp-file, best-effort fsync, and rename protocol as [`write_json_atomic`].
 ///
 /// # Errors
 ///
-/// Returns an error if the parent directory cannot be created, the temp file
-/// cannot be written, or the final rename fails.
+/// Returns an error if the parent directory cannot be created, serialization fails, the temp file cannot be written, or the rename fails.
 pub fn write_json_atomic_pretty<T, P>(path: P, value: &T) -> Result<()>
 where
     T: serde::Serialize,
@@ -127,16 +113,13 @@ where
     write_json_atomic_inner(path.as_ref(), value, true).map(|_| ())
 }
 
-/// Shared body of the two atomic JSON writers; `pretty` selects the layout.
-///
-/// The serializer emits many small writes, so they are buffered: an
-/// unbuffered session ledger of a few megabytes cost millions of `write`
-/// syscalls and several seconds.
+/// Serializes `value` into `path` atomically using compact or pretty layout.
 fn write_json_atomic_inner<T>(path: &Path, value: &T, pretty: bool) -> Result<File>
 where
     T: serde::Serialize,
 {
     persist_atomic(path, |tmp| {
+        // Buffer serde_json's small writes to avoid per-token write syscalls on large files.
         let mut writer = std::io::BufWriter::with_capacity(buffer::FILE_READ_BUFFER, tmp);
         if pretty {
             serde_json::to_writer_pretty(&mut writer, value).context("Failed to serialize JSON")?;
@@ -147,16 +130,13 @@ where
     })
 }
 
-/// Writes `contents` to `path` atomically (temp file in the same dir, fsync,
-/// rename), so a concurrent reader never observes a partial file.
+/// Writes `contents` to `path` atomically via a same-directory temporary file and rename.
 ///
-/// The string counterpart of [`write_json_atomic`], with the same best-effort
-/// fsync and the same parent-directory creation.
+/// Missing parent directories are created, and `sync_all` is best-effort as in [`write_json_atomic`].
 ///
 /// # Errors
 ///
-/// Returns an error if the parent directory cannot be created, the temp file
-/// cannot be written, or the final rename fails.
+/// Returns an error if the parent directory cannot be created, the temp file cannot be written, or the rename fails.
 pub fn write_string_atomic<P: AsRef<Path>>(path: P, contents: &str) -> Result<()> {
     persist_atomic(path.as_ref(), |tmp| {
         tmp.write_all(contents.as_bytes())
@@ -165,8 +145,7 @@ pub fn write_string_atomic<P: AsRef<Path>>(path: P, contents: &str) -> Result<()
     .map(|_| ())
 }
 
-/// Runs `write` against a temp file in `path`'s directory, fsyncs it
-/// best-effort, then atomically renames it over `path`.
+/// Stages `write` in a same-directory temp file, fsyncs best-effort, and renames it over `path`.
 fn persist_atomic(
     path: &Path,
     write: impl FnOnce(&mut tempfile::NamedTempFile) -> Result<()>,
@@ -185,16 +164,13 @@ fn persist_atomic(
         .with_context(|| format!("Failed to persist file: {}", path.display()))
 }
 
-/// Reads a single JSON document and returns it wrapped in a one-element `Vec`.
+/// Reads a single JSON document from `path` and returns it as a one-element `Vec`.
 ///
-/// The wrapping keeps the return type identical to [`read_jsonl`] so callers
-/// can treat both file shapes uniformly. Whatever top-level JSON the file
-/// contains (object, array, scalar) becomes the sole element.
+/// Any top-level JSON value (object, array, or scalar) becomes the sole element.
 ///
 /// # Errors
 ///
-/// Returns an error if the file cannot be opened, if it cannot be read to a
-/// string, or if its contents are not valid JSON.
+/// Returns an error if `path` cannot be opened, cannot be read as UTF-8, or is not valid JSON.
 pub fn read_json<P: AsRef<Path>>(path: P) -> Result<Vec<Value>> {
     let file = File::open(path.as_ref())
         .with_context(|| format!("Failed to open file: {}", path.as_ref().display()))?;
@@ -219,9 +195,7 @@ pub fn read_json<P: AsRef<Path>>(path: P) -> Result<Vec<Value>> {
 
 /// Counts the lines in `text`.
 ///
-/// A line is a `\n`-terminated run; a trailing partial line (text not ending
-/// in `\n`) counts as one more. The empty string is zero lines. `\r\n` is
-/// counted the same as `\n`.
+/// A line is a `\n`-terminated run; a trailing partial line not ending in `\n` counts as one more. The empty string has zero lines, and `\r\n` counts the same as `\n`.
 ///
 /// # Examples
 ///
@@ -245,14 +219,11 @@ pub fn count_lines(text: &str) -> usize {
     }
 }
 
-/// Serializes `value` as pretty-printed JSON and writes it to `path`.
-///
-/// Any existing file at `path` is overwritten.
+/// Serializes `value` as pretty-printed JSON and writes it to `path`, overwriting any existing file.
 ///
 /// # Errors
 ///
-/// Returns an error if `value` cannot be serialized to JSON or if the file
-/// cannot be written.
+/// Returns an error if serialization fails or `path` cannot be written.
 pub fn save_json_pretty<P: AsRef<Path>>(path: P, value: &Value) -> Result<()> {
     let json_str = serde_json::to_string_pretty(value).context("Failed to serialize JSON")?;
 

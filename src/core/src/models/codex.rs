@@ -1,10 +1,6 @@
 //! Serde models for the OpenAI Codex CLI `*.jsonl` session format.
 //!
-//! Every line is a [`CodexLog`] wrapping a `type` discriminator and a
-//! [`CodexPayload`]. The payload is a wide union of optional fields because the
-//! same struct deserializes session-meta, turn-context, event-message, and
-//! response-item records; only the fields relevant to each record type are
-//! populated.
+//! Each line is a [`CodexLog`] with a `type` discriminator and a flat [`CodexPayload`] union whose optional fields are populated according to the record type.
 
 use serde::{
     Deserialize, Deserializer, Serialize,
@@ -13,7 +9,7 @@ use serde::{
 use serde_json::Value;
 use std::fmt;
 
-/// Normalizes JSON-encoded or structured tool arguments into the legacy string field.
+/// Normalizes string, object, or array tool arguments into a single string.
 pub(crate) fn deserialize_tool_arguments<'de, D>(
     deserializer: D,
 ) -> Result<Option<String>, D::Error>
@@ -94,8 +90,7 @@ where
     deserializer.deserialize_any(ArgsVisitor)
 }
 
-/// Normalizes string, object, and content-block output shapes into one string;
-/// an object stays JSON-encoded for the parser to decode again.
+/// Normalizes string, object, or content-block array tool outputs into one string (keeping objects JSON-encoded).
 pub(crate) fn deserialize_tool_output<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
@@ -172,9 +167,7 @@ where
     deserializer.deserialize_any(OutputVisitor)
 }
 
-/// Flattens a content-block array into text, adding a newline only where the
-/// blocks do not already supply one; `input_image` blocks carry no text and are
-/// skipped, while any other textless block is rejected as an unknown shape.
+/// Flattens a content-block array into text, skipping `input_image` blocks and rejecting unknown textless shapes.
 fn normalize_output_blocks<E>(blocks: Vec<Value>) -> Result<String, E>
 where
     E: serde::de::Error,
@@ -226,8 +219,7 @@ pub struct CodexLog {
 
 /// Event-specific payload of a [`CodexLog`].
 ///
-/// A single flat union covering every Codex record type; each field is `Option`
-/// and only the subset meaningful to the record's `payload_type` is present.
+/// Flat union across all Codex record types; only the subset matching `payload_type` is populated.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodexPayload {
     /// Inner payload discriminator (e.g. `message`, `function_call`).
@@ -311,12 +303,7 @@ pub struct CodexShellArguments {
     pub command: Vec<String>,
 }
 
-/// Arguments for the current `name == "exec_command"` function call.
-///
-/// Codex CLI replaced the legacy `shell` function (whose arguments were a
-/// `["bash", "-lc", "<script>"]` array) with a flat `{cmd, workdir, ...}`
-/// object. The analyzer normalises both into the same `CodexShellCall`
-/// downstream so the patch / sed / cat detection can stay shared.
+/// Arguments of an `exec_command` function call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodexExecCommandArguments {
     /// Full command string to execute.

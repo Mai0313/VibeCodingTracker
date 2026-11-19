@@ -1,20 +1,15 @@
 // Golden-output comparison for the session parsers.
 //
-// `insightsVersion`, `machineId` and `user` are excluded everywhere: each is
-// stamped from the machine running the test. Claude Code / Codex / Copilot also
-// exclude `gitRemoteUrl`, which is a git lookup against the workspace the
-// session recorded.
+// `insightsVersion`, `machineId`, and `user` are excluded everywhere because each is stamped from the machine running the test. Claude Code, Codex, and Copilot also exclude `gitRemoteUrl`, which is a git lookup against the workspace the session recorded.
 
 use serde_json::Value;
 use vct_core::session::parser::parse_session_file_to_value;
 use vct_test_support::fixture;
 
-/// Compares two JSON values recursively, ignoring `ignore_fields` at every
-/// level of nesting. Prints the first mismatch it finds to stderr.
+/// Returns whether `actual` and `expected` match recursively while ignoring `ignore_fields` at every nesting level, printing the first mismatch to stderr.
 fn compare_json_ignore_fields(actual: &Value, expected: &Value, ignore_fields: &[&str]) -> bool {
     match (actual, expected) {
         (Value::Object(actual_map), Value::Object(expected_map)) => {
-            // Get all keys from both objects (excluding ignored fields)
             let actual_keys: std::collections::HashSet<_> = actual_map
                 .keys()
                 .filter(|k| !ignore_fields.contains(&k.as_str()))
@@ -25,7 +20,6 @@ fn compare_json_ignore_fields(actual: &Value, expected: &Value, ignore_fields: &
                 .filter(|k| !ignore_fields.contains(&k.as_str()))
                 .collect();
 
-            // Check that both have the same keys (excluding ignored fields)
             if actual_keys != expected_keys {
                 eprintln!("Key mismatch:");
                 eprintln!("  Actual keys: {:?}", actual_keys);
@@ -33,7 +27,6 @@ fn compare_json_ignore_fields(actual: &Value, expected: &Value, ignore_fields: &
                 return false;
             }
 
-            // Recursively compare each value
             for key in actual_keys {
                 let actual_value = &actual_map[key.as_str()];
                 let expected_value = &expected_map[key.as_str()];
@@ -85,7 +78,6 @@ fn test_claude_code_parser() {
     let input_file = fixture("sessions/claude_code.jsonl");
     let expected_file = fixture("sessions/claude_code.expected.json");
 
-    // Skip test if files don't exist
     if !input_file.exists() {
         eprintln!("Input file not found: {:?}", input_file);
         return;
@@ -139,7 +131,6 @@ fn test_codex_parser() {
     let input_file = fixture("sessions/codex.jsonl");
     let expected_file = fixture("sessions/codex.expected.json");
 
-    // Skip test if files don't exist
     if !input_file.exists() {
         eprintln!("Input file not found: {:?}", input_file);
         return;
@@ -193,7 +184,6 @@ fn test_copilot_parser() {
     let input_file = fixture("sessions/copilot.jsonl");
     let expected_file = fixture("sessions/copilot.expected.json");
 
-    // Skip test if files don't exist
     if !input_file.exists() {
         eprintln!("Input file not found: {:?}", input_file);
         return;
@@ -247,7 +237,6 @@ fn test_gemini_parser() {
     let input_file = fixture("sessions/gemini.jsonl");
     let expected_file = fixture("sessions/gemini.expected.json");
 
-    // Skip test if files don't exist
     if !input_file.exists() {
         eprintln!("Input file not found: {:?}", input_file);
         return;
@@ -272,8 +261,7 @@ fn test_gemini_parser() {
 
     let actual_json = actual_result.unwrap();
 
-    // Gemini logs carry no cwd, so `folderPath` and `gitRemoteUrl` are both
-    // empty on every machine and the golden asserts them like any other field.
+    // Gemini logs carry no cwd, so `folderPath` and `gitRemoteUrl` are both empty on every machine and the golden asserts them like any other field.
     let ignore_fields = ["insightsVersion", "machineId", "user"];
     let matches = compare_json_ignore_fields(&actual_json, &expected_json, &ignore_fields);
 
@@ -342,9 +330,7 @@ fn test_dsh_parser() {
     .expect("Failed to parse DeepSeek golden result");
     let ignore_fields = ["insightsVersion", "machineId", "user"];
 
-    // The same session in both on-disk encodings: a root configured with
-    // `compression: 'none'` writes the plain JSONL, and the default zstd root
-    // writes it as one frame per append batch. Neither may change the result.
+    // The same session in both on-disk encodings: a root configured with `compression: 'none'` writes plain JSONL, and the default zstd root writes one frame per append batch. Neither may change the result.
     for name in [
         "sessions/dsh/session.jsonl.zstd",
         "sessions/dsh/session.jsonl",
@@ -406,8 +392,7 @@ fn test_antigravity_parser() {
     );
 }
 
-/// Verifies a Gemini assistant event's usage and `replace` tool call are
-/// recorded while `info` / `user` / `$set` lines contribute nothing.
+/// Verifies a Gemini assistant event's usage and `replace` tool call are recorded while `info`, `user`, and `$set` lines contribute nothing.
 #[test]
 fn test_gemini_parser_jsonl() {
     use std::io::Write;
@@ -438,11 +423,7 @@ fn test_gemini_parser_jsonl() {
     let record = &actual["records"][0];
     assert_eq!(record["taskId"], "fixture-session");
 
-    // Token usage attributed to the sole assistant model in the fixture.
-    // Gemini's `tokens.input` (100) is the full prompt including the
-    // cached subset (10), so `process_gemini_usage` stores it as
-    // non-cached (90) — mirroring Claude's "input ⊥ cache_read"
-    // convention and preventing `calculate_cost` from double-billing.
+    // Gemini's `tokens.input` (100) includes the cached subset (10), so the parser stores non-cached input (90) to match the disjoint `input` / `cache_read` convention and avoid double-billing.
     let usage = &record["conversationUsage"]["gemini-3-flash-preview"];
     assert_eq!(usage["input_tokens"], 90);
     assert_eq!(usage["output_tokens"], 50);
@@ -450,7 +431,6 @@ fn test_gemini_parser_jsonl() {
     assert_eq!(usage["thoughts_tokens"], 5);
     assert_eq!(usage["total_tokens"], 165);
 
-    // `replace` tool call should land in edit_file_details.
     assert_eq!(record["editFileDetails"][0]["oldString"], "old");
     assert_eq!(record["editFileDetails"][0]["newString"], "new");
     assert_eq!(record["toolCallCounts"]["Edit"], 1);

@@ -1,10 +1,6 @@
-//! Codex session-log fallback: the newest `rate_limits` embedded in a Codex
-//! rollout JSONL, used when the wham API is unavailable.
+//! Codex session-log fallback that extracts the newest `rate_limits` record from rollout JSONL files when the wham API is unavailable.
 //!
-//! Scans raw `serde_json::Value` rather than the typed `CodexLog`, so it never
-//! touches the usage-aggregation parser and correctly captures "latest value"
-//! semantics (the usage pipeline sums across files and drops per-file state,
-//! which is the wrong shape for a point-in-time quota).
+//! Scans raw [`serde_json::Value`] lines newest-first to preserve point-in-time latest-value semantics rather than aggregating across sessions.
 
 use crate::models::{
     CodexQuotaSnapshot, CodexSessionRateLimits, CodexSessionWindow, QuotaSource, QuotaWindow,
@@ -21,38 +17,27 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 /// Maximum number of newest rollout files to scan for a `rate_limits` snapshot.
-///
-/// The scan walks files newest-first and stops at the first one carrying a
-/// snapshot, so the common case costs a single parse. This cap only bites when
-/// many recent sessions ran without rate limits (e.g. API-key mode); it is kept
-/// generous enough to look past a multi-day run of quota-less sessions, yet
-/// bounded so the background quota refresh never reparses an unbounded history.
 const MAX_FILES: usize = 64;
 
-/// Returns the newest Codex session `rate_limits` as a snapshot, if any.
+/// Returns the newest live Codex session `rate_limits` snapshot, if any.
+///
+/// Missing session directories yield `Ok(None)`, and unreadable files or torn trailing lines are skipped.
 ///
 /// # Errors
 ///
-/// Returns an error only if path resolution fails; a missing sessions dir
-/// yields `Ok(None)`. An unreadable file (or a half-written tail line on a
-/// live session) is tolerated rather than aborting the scan.
+/// Returns an error if Codex session paths cannot be resolved.
 pub fn latest_session_rate_limits() -> Result<Option<CodexQuotaSnapshot>> {
     let paths = resolve_paths()?;
     latest_session_rate_limits_in(&paths.codex_session_dirs())
 }
 
-/// Returns the newest Codex session `rate_limits` under explicit session roots.
+/// Returns the newest live Codex session `rate_limits` snapshot under `codex_session_dirs`, if any.
 ///
-/// The env-free, injectable counterpart of [`latest_session_rate_limits`]: the
-/// roots are passed in rather than resolved from the home directory, so tests
-/// can point them at a temp tree of fixture rollouts without mutating
-/// process-global `HOME`. Production passes `HelperPaths::codex_session_dirs`,
-/// the active root followed by the archived one.
+/// Searches each root without reading environment variables; missing roots yield `Ok(None)` and unreadable files or torn trailing lines are skipped.
 ///
 /// # Errors
 ///
-/// Never returns an error: a missing root yields `Ok(None)` and an unreadable
-/// file is skipped. The `Result` mirrors [`latest_session_rate_limits`].
+/// This function currently never returns `Err`; the `Result` signature mirrors [`latest_session_rate_limits`].
 pub fn latest_session_rate_limits_in(
     codex_session_dirs: &[&Path],
 ) -> Result<Option<CodexQuotaSnapshot>> {
@@ -66,12 +51,7 @@ pub fn latest_session_rate_limits_in(
     Ok(None)
 }
 
-/// Reads a JSONL file leniently, returning one [`Value`] per parseable line.
-///
-/// Unlike the strict `read_jsonl`, a line that fails to read (e.g. a torn tail
-/// on a session being actively appended) or fails to parse is skipped instead
-/// of aborting the whole file, so a live Codex rollout still yields its earlier,
-/// fully written `rate_limits` records.
+/// Reads parseable JSONL lines from `path`, skipping unreadable or malformed lines (such as a torn tail on a live rollout).
 fn read_jsonl_lenient(path: &Path) -> Vec<Value> {
     let Ok(file) = File::open(path) else {
         return Vec::new();
@@ -92,22 +72,10 @@ fn read_jsonl_lenient(path: &Path) -> Vec<Value> {
     values
 }
 
-/// Maximum number of recent date directories (`YYYY/MM/DD`) to scan.
-///
-/// Codex lays sessions out as `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`.
-/// Restricting the walk to the newest few day directories keeps the background
-/// quota refresh from re-walking an entire multi-month history every tick (on
-/// top of the `usage` scan the TUI already runs).
+/// Maximum number of newest `YYYY/MM/DD` date directories to scan per session root.
 const MAX_DAY_DIRS: usize = 14;
 
-/// Collects up to `n` Codex rollout files across every session root, newest by
-/// mtime first.
-///
-/// Each root contributes its own bounded candidate list (see
-/// [`root_candidates`]); mtime is the ranking key across roots, so an archived
-/// session competes with an active one on equal terms. A rollout name already
-/// seen in an earlier root is dropped from a later one, so a scan racing the
-/// archive move does not spend two parses on one session.
+/// Returns up to `n` Codex rollout files across `dirs` ordered newest by mtime, deduplicating by file name across roots.
 fn newest_codex_files(dirs: &[&Path], n: usize) -> Vec<PathBuf> {
     let mut files: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
     let mut seen: HashSet<OsString> = HashSet::new();
@@ -120,9 +88,7 @@ fn newest_codex_files(dirs: &[&Path], n: usize) -> Vec<PathBuf> {
             if seen.contains(name) {
                 continue;
             }
-            // A name is claimed only by a file that could be stat'd, so a rollout
-            // the archive move took away between the listing and this call does
-            // not block the copy the later root now holds.
+            // Claim the file name only after `metadata()` succeeds so a file moved mid-scan does not block its copy in a later root.
             let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
                 continue;
             };
@@ -136,14 +102,7 @@ fn newest_codex_files(dirs: &[&Path], n: usize) -> Vec<PathBuf> {
     files.into_iter().map(|(_, p)| p).collect()
 }
 
-/// Bounded rollout candidates under one session root, both layouts covered.
-///
-/// Codex keeps active sessions in a dated `YYYY/MM/DD/` tree and archived ones
-/// flat, and each layout needs its own bound: the dated subtree stops after
-/// [`MAX_DAY_DIRS`] day directories, while a flat root has no directory
-/// structure to descend and is bounded by file name instead (see
-/// [`newest_named_files`]). Both are collected so neither root needs to declare
-/// which shape it is.
+/// Collects bounded rollout candidates under `dir`, covering both flat roots (via [`newest_named_files`]) and dated `YYYY/MM/DD/` trees (up to [`MAX_DAY_DIRS`]).
 fn root_candidates(dir: &Path, n: usize) -> Vec<PathBuf> {
     let mut files = newest_named_files(dir, n);
     for day in recent_day_dirs(dir, MAX_DAY_DIRS) {
@@ -159,20 +118,9 @@ fn root_candidates(dir: &Path, n: usize) -> Vec<PathBuf> {
     files
 }
 
-/// The `n` newest rollout logs sitting directly in `dir`, by file name.
+/// Returns up to `n` rollout files directly in `dir`, ordered descending by file name (`rollout-<ISO-8601>-<uuid>.jsonl`).
 ///
-/// Codex names a rollout `rollout-<ISO-8601 start>-<uuid>.jsonl`, so sorting the
-/// names descending orders them by session start without reading any metadata.
-/// Only the survivors are stat'd by the caller, which is what keeps a flat
-/// archive of a thousand-odd sessions from costing a thousand stats per refresh
-/// tick.
-///
-/// Selecting by name rather than mtime is also the safer read of an archived
-/// file: archiving does not always preserve the original mtime — a bulk archive
-/// run can stamp its whole batch with the run's own time — so a months-old
-/// session can look freshly written and crowd genuinely recent files out of the
-/// candidate set. The name is written by the session that produced the log and
-/// survives the move.
+/// Ranking flat archive roots by file name avoids stat'ing the whole directory and ignores bulk-archive mtime rewrites.
 fn newest_named_files(dir: &Path, n: usize) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -188,11 +136,7 @@ fn newest_named_files(dir: &Path, n: usize) -> Vec<PathBuf> {
     files
 }
 
-/// Returns the newest leaf date directories under `sessions`, newest first.
-///
-/// Descends `YYYY` -> `MM` -> `DD` reading only directory entries (sorted by
-/// name descending, which is chronological for zero-padded dates) and stops once
-/// `limit` leaves are gathered, so a deep history is never fully enumerated.
+/// Returns up to `limit` newest `YYYY/MM/DD` leaf directories under `sessions`, descending by name.
 fn recent_day_dirs(sessions: &Path, limit: usize) -> Vec<PathBuf> {
     let mut days = Vec::new();
     for year in sorted_subdirs_desc(sessions) {
@@ -222,17 +166,9 @@ fn sorted_subdirs_desc(dir: &Path) -> Vec<PathBuf> {
     subdirs
 }
 
-/// Scans `values` in reverse, returning the newest usable `rate_limits`
-/// snapshot as of `now`.
+/// Scans `values` in reverse and returns the newest live `rate_limits` snapshot as of `now`.
 ///
-/// Looks at both `payload.rate_limits` and `payload.info.rate_limits`, and
-/// captures `plan_type` from the same object. A record is skipped when its
-/// `rate_limits` belongs to a non-`codex` limit family, or when it leaves no
-/// usable window behind: none reported, every one naming a `window_minutes`
-/// period the panel does not recognize (an absent one keeps its positional
-/// meaning), or every one already past its `resets_at` (an elapsed window's
-/// percentage no longer reflects current usage). Each window is judged on its
-/// own, so a record can still contribute the one that is live.
+/// Checks both `payload.rate_limits` and `payload.info.rate_limits` and skips non-`codex` limit families, unrecognized `window_minutes` periods, and windows already past `resets_at`. Each window is evaluated independently so a record with one live window still yields a snapshot.
 pub fn extract_latest_rate_limits(values: &[Value], now: i64) -> Option<CodexQuotaSnapshot> {
     for v in values.iter().rev() {
         let Some(payload) = v.get("payload") else {
@@ -247,8 +183,7 @@ pub fn extract_latest_rate_limits(values: &[Value], now: i64) -> Option<CodexQuo
         let Ok(rl) = serde_json::from_value::<CodexSessionRateLimits>(rl_val.clone()) else {
             continue;
         };
-        // Only the main "codex" account limit maps to the 5h/7d panel; skip
-        // other metered families so they are not mislabeled as Codex quota.
+        // Only the main "codex" limit family maps to the 5h/7d panel; skip other metered families.
         if rl.limit_id.as_deref().is_some_and(|id| id != "codex") {
             continue;
         }
@@ -283,7 +218,6 @@ pub fn extract_latest_rate_limits(values: &[Value], now: i64) -> Option<CodexQuo
             }
         }
         if primary.is_none() && secondary.is_none() {
-            // Nothing usable in this record; fall back to the next older one.
             continue;
         }
         return Some(CodexQuotaSnapshot {
@@ -306,10 +240,7 @@ pub fn extract_latest_rate_limits(values: &[Value], now: i64) -> Option<CodexQuo
     None
 }
 
-/// Whether a window is still current: it has a known reset time in the future.
-///
-/// A window with no `resets_at_unix` cannot be proven fresh, so it is treated as
-/// not live rather than rendered as authoritative current quota indefinitely.
+/// Returns whether `w` has a reset timestamp strictly after `now` (missing reset times count as stale).
 fn is_window_live(w: &QuotaWindow, now: i64) -> bool {
     w.resets_at_unix.is_some_and(|reset| reset > now)
 }
@@ -403,7 +334,6 @@ mod tests {
 
     #[test]
     fn rejects_fully_expired_snapshot() {
-        // Both windows reset before `now` (500 < 1000) -> no usable data.
         let values = vec![
             json!({"payload":{"rate_limits":{"limit_id":"codex","primary":{"used_percent":90.0,"resets_at":500},"secondary":{"used_percent":80.0,"resets_at":400}}}}),
         ];
@@ -423,7 +353,6 @@ mod tests {
 
     #[test]
     fn drops_window_without_reset_time() {
-        // No resets_at: freshness cannot be established, so it must not render.
         let values = vec![
             json!({"payload":{"rate_limits":{"limit_id":"codex","primary":{"used_percent":50.0}}}}),
         ];

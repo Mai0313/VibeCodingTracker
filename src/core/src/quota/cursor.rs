@@ -1,16 +1,8 @@
 //! Cursor quota fetcher.
 //!
-//! Reads the WorkOS session JWT from the Cursor CLI's `auth.json`, synthesizes
-//! the `WorkosCursorSessionToken` cookie the way the official client does, and
-//! calls `GET /api/usage-summary`, impersonating the Cursor CLI via a
-//! `cursor-agent/<version>` User-Agent (version detected from
-//! `cursor-agent --version`, cached for the day).
+//! Reads the WorkOS session JWT from the Cursor CLI's `auth.json`, synthesizes the `WorkosCursorSessionToken` cookie, and calls `GET /api/usage-summary` with a `cursor-agent/<version>` `User-Agent`.
 //!
-//! The access token is valid ~60 days and the official Cursor CLI / IDE keeps
-//! `auth.json` fresh in the background, so refresh is **reactive**: the file is
-//! re-read every tick and its token used while the JWT `exp` is still in the
-//! future. We never write the file back. An expired token or a 401/403 surfaces
-//! a `cursor-agent login` hint.
+//! `auth.json` is re-read on each tick and never modified; token refresh is left to the Cursor CLI/IDE. An expired JWT `exp` or HTTP 401/403 surfaces [`CURSOR_LOGIN_HINT`].
 
 use crate::models::{CursorQuotaSnapshot, CursorUsageSummary, QuotaSource, QuotaWindow};
 use crate::quota::http::{detect_cli_version, iso_to_unix_secs};
@@ -24,18 +16,14 @@ use std::sync::OnceLock;
 
 /// The Cursor usage-summary endpoint.
 const CURSOR_USAGE_URL: &str = "https://cursor.com/api/usage-summary";
-/// Fallback Cursor CLI version for the User-Agent when `cursor-agent --version`
-/// cannot be resolved (CLI absent or unreadable). Bump occasionally.
+/// Fallback Cursor CLI version for `User-Agent` when `cursor-agent --version` cannot be resolved.
 const CURSOR_FALLBACK_VERSION: &str = "2026.07.07";
-/// Login hint shown when the Cursor session is expired / rejected. The CLI that
-/// manages `auth.json` is `cursor-agent` (`cursor` is the editor launcher).
+/// Login hint shown when the Cursor session is expired or rejected.
+///
+/// `cursor-agent` manages `auth.json`; `cursor` is the editor launcher.
 pub const CURSOR_LOGIN_HINT: &str = "run: cursor-agent login";
 
-/// Builds the Cursor CLI's request User-Agent, e.g. `cursor-agent/2026.07.07`.
-///
-/// Resolved once per process. [`crate::quota::http::detect_cli_version`] probes
-/// the installed CLI only when the binary has enabled probing, so an embedder
-/// (and the whole test suite) gets `CURSOR_FALLBACK_VERSION`.
+/// Returns the cached `cursor-agent/<version>` `User-Agent` string, resolved once per process.
 pub(crate) fn cursor_ua() -> &'static str {
     static UA: OnceLock<String> = OnceLock::new();
     UA.get_or_init(|| {
@@ -47,11 +35,7 @@ pub(crate) fn cursor_ua() -> &'static str {
     .as_str()
 }
 
-/// A usable Cursor session: the synthesized cookie header + the JWT expiry.
-///
-/// Built and consumed only by this fetcher. The session-data reader
-/// (`crate::session::cursor`) reads local chat stores, so it needs neither a
-/// cookie nor the network.
+/// Synthesized `WorkosCursorSessionToken` cookie header and JWT `exp` timestamp (Unix seconds).
 pub(crate) struct CursorSession {
     pub(crate) cookie: String,
     pub(crate) exp: i64,
@@ -68,10 +52,7 @@ fn decode_jwt_payload(token: &str) -> Option<serde_json::Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Builds the `WorkosCursorSessionToken` cookie + reads `exp` from `auth.json`.
-///
-/// The cookie value is `<userID>::<accessToken>` with `::` percent-encoded,
-/// where `userID` is the JWT `sub` claim after the final `|`.
+/// Parses `auth.json` into a [`CursorSession`] with cookie `WorkosCursorSessionToken=<uid>%3A%3A<accessToken>` (`uid` from the JWT `sub` claim after the last `|`).
 pub(crate) fn read_cursor_session(body: &str) -> Option<CursorSession> {
     let root: serde_json::Value = serde_json::from_str(body).ok()?;
     let access = root.get("accessToken")?.as_str()?;
@@ -91,21 +72,17 @@ pub(crate) fn read_cursor_session(body: &str) -> Option<CursorSession> {
     })
 }
 
-/// Maps a `/api/usage-summary` body into a [`CursorQuotaSnapshot`] (pure).
+/// Maps a `/api/usage-summary` JSON response into a [`CursorQuotaSnapshot`] stamped at `now` (Unix seconds).
 ///
 /// # Errors
 ///
-/// Returns an error if the body is not valid JSON in the expected shape.
+/// Returns an error if `body` is not valid JSON matching [`CursorUsageSummary`].
 pub fn map_cursor_usage(body: &str, now: i64) -> Result<CursorQuotaSnapshot> {
     let resp: CursorUsageSummary =
         serde_json::from_str(body).context("Failed to parse Cursor usage summary")?;
 
     let reset = resp.billing_cycle_end.as_deref().and_then(iso_to_unix_secs);
-    // `*PercentUsed` is percent consumed: the same response restates those very
-    // numbers in English via `autoModelSelectedDisplayMessage` /
-    // `namedModelSelectedDisplayMessage` ("You've used N% of your included …").
-    // Take them verbatim, clamped only as an out-of-range guard. Do not invert:
-    // #69 did, which reported an idle account as a full gauge with LIMIT set.
+    // `*PercentUsed` is already percent consumed (not percent remaining); clamp verbatim without inverting.
     let win = |pct: Option<f64>| {
         pct.map(|p| QuotaWindow {
             used_percent: p.clamp(0.0, 100.0),
@@ -118,8 +95,7 @@ pub fn map_cursor_usage(body: &str, now: i64) -> Result<CursorQuotaSnapshot> {
     let auto = win(plan.and_then(|p| p.auto_percent_used));
     let api = win(plan.and_then(|p| p.api_percent_used));
 
-    // Prefer the individual on-demand spend; team/enterprise accounts bill it
-    // under `teamUsage.onDemand` while the individual branch is disabled.
+    // Prefer individual on-demand spend; team/enterprise accounts bill under `teamUsage.onDemand` while individual on-demand is disabled.
     let individual_od = resp
         .individual_usage
         .as_ref()
@@ -156,9 +132,9 @@ pub fn map_cursor_usage(body: &str, now: i64) -> Result<CursorQuotaSnapshot> {
 /// Outcome of a single usage request.
 enum FetchResult {
     Ok(CursorQuotaSnapshot),
-    /// 401/403 → the session is rejected; re-login.
+    /// HTTP 401 or 403; the session was rejected and requires re-login.
     Unauthorized,
-    /// Network / other non-success error → keep last-known-good.
+    /// Network, parse, or other non-2xx failure; retain the last snapshot.
     Transient,
 }
 
@@ -200,25 +176,18 @@ fn fetch_cursor_usage(client: &Client, cookie: &str, now: i64, usage_url: &str) 
     }
 }
 
-/// Fetches the raw `/api/usage-summary` response for `vct quota cursor`.
+/// Returns `(status_code, body)` from `/api/usage-summary` using the stored session JWT.
 ///
-/// Synthesizes the session cookie from the stored JWT and sends one request. It
-/// does **not** check the JWT `exp` (an expired token just 401s) and never
-/// writes the file back. Returns `(status_code, body)`; a non-2xx status is
-/// left for the caller to surface.
+/// Does not pre-check JWT `exp` or modify `auth.json`. Non-2xx responses are returned as `Ok((status_code, body))`.
 ///
 /// # Errors
 ///
-/// Returns an error if `auth.json` is missing, has no usable session, or the
-/// request cannot be sent.
+/// Returns an error if the auth path cannot be resolved, `auth.json` is missing or has no usable session, or the HTTP request or body read fails.
 pub fn fetch_cursor_raw(client: &Client) -> Result<(u16, String)> {
     fetch_cursor_raw_from(client, CURSOR_USAGE_URL, &get_cursor_auth_path()?)
 }
 
-/// The injectable core of [`fetch_cursor_raw`]: reads the session from an
-/// explicit `auth.json` path and fetches the raw usage body from an explicit
-/// `usage_url`. Production passes [`CURSOR_USAGE_URL`] + `~/.config/cursor/auth.json`;
-/// tests point them at a local mock server and a temp auth file.
+/// Returns `(status_code, body)` from `usage_url` using the session read from `auth_path`.
 pub(crate) fn fetch_cursor_raw_from(
     client: &Client,
     usage_url: &str,
@@ -251,13 +220,12 @@ pub(crate) fn fetch_cursor_raw_from(
     Ok((status, text))
 }
 
-/// Per-worker Cursor state. Refresh is reactive (the official CLI keeps
-/// `auth.json` fresh), so nothing is cached between ticks.
+/// Per-worker Cursor quota state; holds no cached session between ticks.
 #[derive(Default)]
 pub struct CursorState;
 
 impl CursorState {
-    /// One worker tick: re-read the session, call the usage API.
+    /// Reads `auth.json`, validates the JWT expiry, and fetches a fresh quota snapshot.
     pub fn resolve(&mut self, client: &Client) -> QuotaOutcome<CursorQuotaSnapshot> {
         let now = chrono::Local::now().timestamp();
         let path = match get_cursor_auth_path() {
@@ -268,9 +236,7 @@ impl CursorState {
             Ok(b) => b,
             Err(_) => return QuotaOutcome::Transient,
         };
-        // The file exists but yields no usable session (cleared on logout, no
-        // `accessToken`, or a malformed JWT) — an auth failure, not a network
-        // blip — so nudge login instead of silently showing "no Cursor quota".
+        // A readable file with no usable session (e.g. cleared on logout) is an auth failure, not a transient read error.
         let session = match read_cursor_session(&body) {
             Some(s) => s,
             None => return QuotaOutcome::NeedsLogin,
@@ -347,12 +313,10 @@ mod tests {
         let snap = map_cursor_usage(SUMMARY, 1_000_000).unwrap();
         assert_eq!(snap.source, QuotaSource::Api);
         assert_eq!(snap.plan_type.as_deref(), Some("free"));
-        // The API reports percent used; the gauge shows it verbatim.
         assert_eq!(snap.total.as_ref().unwrap().used_percent, 94.0);
         assert_eq!(snap.auto.as_ref().unwrap().used_percent, 100.0);
         assert_eq!(snap.api.as_ref().unwrap().used_percent, 44.0);
         assert!(snap.total.as_ref().unwrap().resets_at_unix.unwrap() > 0);
-        // On-demand disabled → no dollar figure.
         assert!(snap.on_demand_dollars.is_none());
         assert!(!snap.limit_reached);
     }
@@ -366,7 +330,6 @@ mod tests {
 
     #[test]
     fn on_demand_falls_back_to_team_usage() {
-        // Individual on-demand disabled, but the team pool carries the spend.
         let body = r#"{
           "membershipType": "enterprise",
           "individualUsage": { "onDemand": { "enabled": false } },
@@ -385,7 +348,6 @@ mod tests {
 
     #[test]
     fn unlimited_never_flags_limit() {
-        // Even at 100% used, the unlimited flag suppresses LIMIT.
         let body = r#"{ "isUnlimited": true, "individualUsage": { "plan": { "totalPercentUsed": 100 } } }"#;
         let snap = map_cursor_usage(body, 1).unwrap();
         assert!(!snap.limit_reached);
@@ -393,8 +355,7 @@ mod tests {
 
     #[test]
     fn idle_account_reads_as_unused() {
-        // The shape a never-used plan actually returns. Inverting it renders
-        // three full gauges and a spurious LIMIT flag.
+        // Real never-used plan shape; inverting `*PercentUsed` would render full gauges and a spurious LIMIT flag.
         let body = r#"{
           "membershipType": "free",
           "isUnlimited": false,
@@ -414,8 +375,7 @@ mod tests {
 
     #[test]
     fn out_of_range_percentages_are_clamped() {
-        // The clamp is the whole mapping, so pin both arms: a gauge outside
-        // 0..=100 would break the bar width and the limit comparison.
+        // Values outside 0..=100 would corrupt bar widths and the limit comparison.
         let body = r#"{ "individualUsage": { "plan": { "totalPercentUsed": 150, "autoPercentUsed": -5 } } }"#;
         let snap = map_cursor_usage(body, 1).unwrap();
         assert_eq!(snap.total.as_ref().unwrap().used_percent, 100.0);

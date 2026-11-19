@@ -1,18 +1,13 @@
 //! Serde models for the Claude Code `*.jsonl` session format.
 //!
-//! Only the fields the analyzer reads are materialized; unrelated payloads are
-//! dropped during deserialization so long sessions stay cheap to parse. Several
-//! fields in this format are polymorphic (string-or-array, object-or-scalar),
-//! handled by the custom `deserialize_*` helpers below.
+//! Only fields read by the analyzer are materialized; unrelated payloads are discarded during deserialization, and polymorphic fields (string-or-array, object-or-scalar) are normalized to a single shape.
 
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
 /// Single log entry from a Claude Code session file.
 ///
-/// Large unrelated payloads — assistant text content, `parentUuid`, version
-/// metadata — are dropped by serde during parse so they never retain memory,
-/// which is what keeps long sessions from ballooning the working set.
+/// Unrelated fields (assistant text, `parentUuid`, version metadata) are ignored during deserialization.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClaudeCodeLog {
@@ -31,32 +26,23 @@ pub struct ClaudeCodeLog {
     /// The message body, when the record carries one.
     #[serde(default)]
     pub message: Option<ClaudeMessage>,
-    /// API request identifier, paired with `message.id` to identify the one
-    /// billed request a record belongs to.
+    /// API request identifier, paired with `message.id` to deduplicate repeated usage records per billed request.
     #[serde(default)]
     pub request_id: Option<String>,
     /// Legacy top-level `toolUseResult`; absent on subagent records.
     #[serde(default, deserialize_with = "deserialize_tool_use_result")]
     pub tool_use_result: Option<ClaudeToolUseResult>,
-    /// `true` for records inside a subagent JSONL
-    /// (`<session>/subagents/agent-*.jsonl`). Subagent records do not carry
-    /// the top-level `toolUseResult` field, so the analyzer falls back to
-    /// scanning `message.content[].tool_result` for them; main-session
-    /// records (`isSidechain == false` or missing) skip that fallback.
+    /// Whether this record belongs to a subagent log (`<session>/subagents/agent-*.jsonl`), where tool results appear only under `message.content[].tool_result` instead of top-level `toolUseResult`.
     #[serde(default)]
     pub is_sidechain: bool,
 }
 
-/// Assistant/user message, carrying only the fields the Claude parser inspects.
+/// Message body within a [`ClaudeCodeLog`].
 ///
-/// `content` may appear in the source as either an array of typed blocks
-/// (assistant messages) or a plain string (user messages like `"Caveat: ..."`).
-/// Only the array form carries analyzer-relevant data, so the string form is
-/// swallowed without allocating.
+/// Non-array `content` values (such as plain user-message strings) deserialize as an empty vector without allocating.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ClaudeMessage {
-    /// API response identifier (`msg_…`), paired with the record's
-    /// `requestId` to identify the one billed request this record belongs to.
+    /// API response identifier (`msg_...`), paired with [`ClaudeCodeLog::request_id`] to identify one billed request.
     #[serde(default)]
     pub id: Option<String>,
     /// Model name that produced an assistant message.
@@ -70,14 +56,9 @@ pub struct ClaudeMessage {
     pub content: Vec<ClaudeContentItem>,
 }
 
-/// One element of a message's `content` array.
+/// Element of a Claude message `content` array.
 ///
-/// `ToolUse` carries the assistant-side invocation. `ToolResult` carries the
-/// matching result block from the *user*-role record — used as a fallback
-/// when the legacy top-level `toolUseResult` field is absent (subagent JSONL
-/// files embed results only inside `message.content[].tool_result`). Anything
-/// else (text, thinking traces, images, …) collapses to `Other` and is
-/// discarded at parse time.
+/// Only `tool_use` and `tool_result` blocks are retained; all other block types deserialize as [`Self::Other`].
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClaudeContentItem {
@@ -110,9 +91,7 @@ pub enum ClaudeContentItem {
     Other,
 }
 
-/// Tool input across all tools we care about. Each tool populates only a
-/// subset of these fields; unrelated tools (Glob, Grep, WebSearch, …)
-/// deserialize into an all-`None` value the analyzer treats as a no-op.
+/// Union of tool input fields across tracked Claude tools; untracked tools deserialize as all-`None`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ClaudeToolInput {
     /// Shell command line (Bash tool).
@@ -135,17 +114,7 @@ pub struct ClaudeToolInput {
     pub new_string: Option<String>,
 }
 
-/// Flattens a polymorphic tool-result `content` field into a single `String`.
-///
-/// Tool-result `content` can be either a plain string or an array of typed
-/// blocks (e.g. `[{"type":"text","text":"..."}]`). Both shapes flatten to a
-/// single `String` for the analyzer's line-counting helpers; `null` becomes an
-/// empty string and any other JSON value is stringified.
-///
-/// # Errors
-///
-/// Returns a deserialization error if the underlying tokens are not valid JSON
-/// for [`Value`].
+/// Flattens a tool-result `content` field (string, `{text}` block array, `null`, or other JSON value) into one `String`.
 fn deserialize_tool_result_content<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: Deserializer<'de>,
@@ -165,9 +134,7 @@ where
     }
 }
 
-/// Object form of `toolUseResult`. String-shaped values (user-rejection error
-/// messages, etc.) are swallowed by `deserialize_tool_use_result` without
-/// allocating their body.
+/// Object form of top-level `toolUseResult`; scalar values deserialize as `None`.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClaudeToolUseResult {
@@ -203,17 +170,7 @@ pub struct ClaudeToolUseFile {
     pub content: Option<String>,
 }
 
-/// Deserializes `toolUseResult`, keeping only its object form.
-///
-/// `toolUseResult` can legally be either an object or a scalar string. The
-/// analyzer only cares about the object form, so scalar values are consumed
-/// via `IgnoredAny` (serde walks the JSON tokens but allocates nothing) and
-/// yield `None`.
-///
-/// # Errors
-///
-/// Returns a deserialization error if the field is neither a valid
-/// [`ClaudeToolUseResult`] object nor an otherwise ignorable JSON value.
+/// Deserializes `toolUseResult` when it is an object, discarding scalar values as `None`.
 fn deserialize_tool_use_result<'de, D>(
     deserializer: D,
 ) -> Result<Option<ClaudeToolUseResult>, D::Error>
@@ -236,17 +193,7 @@ where
     }
 }
 
-/// Deserializes `message.content`, tolerating the non-array shape.
-///
-/// `message.content` is an array for assistant turns but a plain string for
-/// some user turns (e.g. `"Caveat: ..."`). Non-array shapes carry nothing the
-/// analyzer needs, so they are consumed via `IgnoredAny` and yield an empty
-/// `Vec` rather than failing the whole record.
-///
-/// # Errors
-///
-/// Returns a deserialization error if the field is neither a valid array of
-/// [`ClaudeContentItem`] nor an otherwise ignorable JSON value.
+/// Deserializes `message.content` when it is an array, discarding non-array values as an empty `Vec`.
 fn deserialize_content_items<'de, D>(deserializer: D) -> Result<Vec<ClaudeContentItem>, D::Error>
 where
     D: Deserializer<'de>,

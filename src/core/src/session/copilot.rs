@@ -1,12 +1,6 @@
-//! Parser for GitHub Copilot CLI session events
-//! (`~/.copilot/session-state/<sessionId>/events.jsonl`).
+//! Parser for GitHub Copilot CLI session events (`~/.copilot/session-state/<sessionId>/events.jsonl`).
 //!
-//! One [`CopilotEvent`] per line, dispatched on `event_type`. Token usage is
-//! taken from the authoritative `session.shutdown` record when present, with
-//! streamed `assistant.message.outputTokens` as a partial fallback for
-//! sessions that never shut down cleanly. File operations are paired across
-//! `tool.execution_start` / `tool.execution_complete` by `toolCallId` and
-//! only counted on success. See the table below for the event map.
+//! Token usage comes from `session.shutdown` when present, falling back to streamed `assistant.message.outputTokens` (with `input_tokens: 0`) for sessions that did not shut down cleanly. File operations are paired across `tool.execution_start` and `tool.execution_complete` by `toolCallId` and counted only on success. Legacy single-object dumps under `~/.copilot/history-session-state/` are not supported.
 use crate::constants::{FastHashMap, capacity};
 use crate::models::*;
 use crate::session::diagnostics::{ParseDiagnostics, ParsedAnalysis};
@@ -15,42 +9,13 @@ use crate::utils::{get_git_remote_url, parse_iso_timestamp};
 use anyhow::Result;
 use serde_json::{Value, json};
 
-// =============================================================================
-// Copilot CLI `events.jsonl` streaming parser
-// =============================================================================
-//
-// Each line is a single `CopilotEvent` whose `event_type` decides how to
-// interpret `data`:
-//
-//   session.start            → session-scoped context (sessionId, cwd, …)
-//   session.model_change     → tracks the currently active model
-//   session.shutdown         → authoritative per-model token usage
-//   assistant.message        → streaming output; only outputTokens is reliable
-//   tool.execution_start     → paired with the matching complete event
-//   tool.execution_complete  → fires the analyzer's file-op handlers
-//
-// Every other entry in the `recognized` list below (system / user messages,
-// turn and hook bookkeeping, subagents, aborts, …) is known-and-ignored; an
-// `event_type` outside that list counts as schema drift.
-//
-// Legacy single-object dumps under `~/.copilot/history-session-state/` are
-// not supported — users with old dumps will see them fall through to the
-// Codex default in `detect_extension_type` and fail cleanly rather than
-// being mis-parsed.
-
-/// Parse Copilot CLI session events from the JSONL event stream.
+/// Parses Copilot CLI session `events` into a single-record [`CodeAnalysis`].
 ///
-/// Returns a single-record [`CodeAnalysis`] stamped with the
-/// `"Copilot-CLI"` extension name. When the stream lacks a
-/// `session.shutdown` record, the per-model usage map is grafted from the
-/// streamed output-token fallback and will report `input_tokens: 0` so
-/// callers can detect the partial accounting.
+/// Stamps `extension_name` as `"Copilot-CLI"` and leaves the remaining runtime metadata fields blank. When no `session.shutdown` event is present, per-model usage falls back to streamed `outputTokens` with `input_tokens: 0`.
 ///
 /// # Errors
 ///
-/// Returns `anyhow::Result` for parity with the other provider parsers, but
-/// has no fallible step — events that fail to deserialise into their typed
-/// payload are skipped — so it returns `Ok` for any iterator.
+/// Never returns `Err`; returns `Result` for parity with other provider parsers.
 pub fn parse_copilot_events<I>(events: I, mode: ParseMode) -> Result<CodeAnalysis>
 where
     I: IntoIterator<Item = CopilotEvent>,
@@ -58,7 +23,7 @@ where
     Ok(parse_copilot_events_with_diagnostics(events, mode)?.analysis)
 }
 
-/// Streaming Copilot parser with event-payload schema diagnostics.
+/// Parses Copilot CLI session `events` with schema diagnostics.
 pub(crate) fn parse_copilot_events_with_diagnostics<I>(
     events: I,
     mode: ParseMode,
@@ -72,14 +37,9 @@ where
     // Pending tool calls indexed by `toolCallId`.
     let mut pending_tools: FastHashMap<String, PendingTool> = FastHashMap::with_capacity(32);
 
-    // Fallback accounting used when the session does not reach
-    // `session.shutdown` (e.g. crash, SIGKILL, ongoing session). We still
-    // want to attribute `assistant.message.outputTokens` to *some* model,
-    // so we track the active model switches.
+    // Active model for fallback `assistant.message.outputTokens` attribution when `session.shutdown` never arrives.
     let mut current_model = String::new();
-    // A consumed `session.shutdown` record is authoritative. The fallback
-    // graft below inserts on the same canonicalized model key, so without
-    // this guard it would replace that row with a zero-`input_tokens` one.
+    // Guards against the fallback overwriting authoritative `session.shutdown` rows on the same canonicalized model key.
     let mut shutdown_seen = false;
     let mut pending_output_tokens: FastHashMap<String, i64> = FastHashMap::with_capacity(3);
     let mut diagnostics = ParseDiagnostics::default();
@@ -142,9 +102,6 @@ where
                 }
             }
             "session.model_change" => {
-                // A session may switch models at any point, so the streamed
-                // `assistant.message` tokens below are attributed to whichever
-                // model was current when they arrived.
                 let new_model = event
                     .data
                     .get("newModel")
@@ -168,10 +125,7 @@ where
                         let Some(usage) = metric.usage else {
                             continue;
                         };
-                        // Copilot's `outputTokens` follows OpenAI's convention
-                        // and already includes `reasoningTokens`, so subtract it
-                        // back out to keep each token billed once (the flat token
-                        // shape treats output and reasoning as disjoint buckets).
+                        // Copilot's `outputTokens` includes `reasoningTokens`, whereas the flat usage shape keeps output and reasoning disjoint.
                         let output_tokens =
                             usage.output_tokens.saturating_sub(usage.reasoning_tokens);
                         let usage_json = json!({
@@ -217,9 +171,7 @@ where
                     }
                     Ok(data) => {
                         diagnostics.record_relevant(false);
-                        // The verdict for this call is already taken. Holding
-                        // the id keeps its completion pairing, so the same
-                        // drift is not counted a second time as an orphan.
+                        // Keep the `toolCallId` registered so its completion pairs cleanly instead of double-counting the drift as an orphan.
                         if !data.tool_call_id.is_empty() {
                             pending_tools.insert(
                                 data.tool_call_id,
@@ -245,11 +197,7 @@ where
                     continue;
                 };
                 let Some(pending) = pending_tools.remove(tool_call_id) else {
-                    // Without the start event there is no tool name, so there
-                    // is no `tracked` flag to gate on. Only a completion that
-                    // reported success could have carried a file operation —
-                    // a failed one is skipped even when it does pair — so that
-                    // is the orphan counted as a record left unnormalized.
+                    // Only successful orphans count as drift because failed tool calls are ignored even when paired.
                     if event.data.get("success").and_then(Value::as_bool) == Some(true) {
                         diagnostics.record_relevant(false);
                     }
@@ -261,9 +209,7 @@ where
                     }
                     continue;
                 };
-                // Only dispatch successful tool calls — failures rarely
-                // produce meaningful arguments (e.g. path validation errors)
-                // and would skew line-count totals.
+                // Failed tool calls do not apply file operations; count them as valid lifecycle records without dispatching.
                 if !success {
                     if pending.tool.is_some() {
                         diagnostics.record_relevant(true);
@@ -294,10 +240,6 @@ where
         }
     }
 
-    // If `session.shutdown` never arrived, graft the fallback streamed
-    // output-token counters into `conversation_usage` so the row still has
-    // a non-zero number (callers can tell it's partial by the missing
-    // `input_tokens`).
     if !shutdown_seen {
         for (model, output_tokens) in pending_output_tokens {
             conversation_usage.insert(
@@ -312,8 +254,6 @@ where
         }
     }
 
-    // Fallback git remote lookup when `session.start.context` did not carry
-    // a repository string (e.g. running outside a git tree or pre-1.0 CLI).
     if state.git_remote.is_empty() {
         state.git_remote = get_git_remote_url(&state.folder_path);
     }
@@ -372,13 +312,7 @@ fn copilot_usage_supported(usage: &Value) -> bool {
     recognized
 }
 
-/// A Copilot tool this parser tracks, resolved from the name in the log.
-///
-/// One variant per metric the tool folds into. [`TrackedTool::read_args`] and
-/// [`ToolArgs::record`] match exhaustively on their enum, so a variant one of
-/// them forgets is a build error rather than a silently dropped metric. What
-/// the compiler cannot check is [`TrackedTool::from_name`] itself, which is why
-/// every tool name is spelled there and nowhere else.
+/// Tracked Copilot CLI tool category, resolved from the log's tool name.
 #[derive(Clone, Copy)]
 enum TrackedTool {
     Read,
@@ -391,24 +325,13 @@ enum TrackedTool {
 }
 
 impl TrackedTool {
-    /// Resolves a log name, or `None` for one this table does not list
-    /// (`report_intent`, `task_complete`, `update_topic`, … among them). An
-    /// unsupported payload on a listed tool is schema drift; on any other tool
-    /// it is not.
+    /// Maps a Copilot tool `name` to its tracked category, or `None` for untracked tools whose payloads are ignored.
     fn from_name(name: &str) -> Option<Self> {
         Some(match name {
-            // Historical releases exposed reads as `str_replace_editor` with
-            // `command == "view"`, which we no longer attempt to parse.
             "view" | "show_file" | "read_file" => Self::Read,
-            // Search and web tools surface content but do not identify one
-            // complete file body, so they retain the invocation without
-            // inventing line totals.
+            // Search/web tools count as read invocations without line totals because they do not return a single file body.
             "rg" | "grep" | "glob" | "web_search" | "web_fetch" => Self::Search,
-            // `create` is the primary write tool; the other names are ones the
-            // CLI is known or likely to emit. A tool name outside this table is
-            // ignored, however similar its argument shape.
             "create" | "write_file" | "write" => Self::Write,
-            // Edit-style tool names the CLI is known or likely to emit.
             "str_replace" | "edit" | "replace" | "edit_file" => Self::Edit,
             "apply_patch" => Self::ApplyPatch,
             "bash" | "shell" | "execute" => Self::Shell,
@@ -417,16 +340,7 @@ impl TrackedTool {
         })
     }
 
-    /// Reads what a successful call folds into metrics, or `None` when this
-    /// parser cannot read its arguments — that call is schema drift and folds
-    /// nothing. Every argument key looked up by name, historical alias
-    /// spellings included, is listed here and nowhere else; the one exception
-    /// is the patch envelope, whose own spellings live in
-    /// [`extract_apply_patch_text`].
-    ///
-    /// `result` arrives with the completion and only [`TrackedTool::Read`] uses
-    /// it; a result that does not read leaves the call foldable, so it is the
-    /// variant's business rather than this `Option`'s.
+    /// Extracts the foldable payload for a completed tool call, returning `None` if required arguments are missing or unreadable (schema drift).
     fn read_args<'a>(self, args: &'a Value, result: &Value) -> Option<ToolArgs<'a>> {
         Some(match self {
             Self::Read => ToolArgs::Read {
@@ -445,22 +359,16 @@ impl TrackedTool {
             },
             Self::ApplyPatch => {
                 let patches = parse_apply_patch_text(extract_apply_patch_text(args)?);
-                // A patch envelope naming no file at all folds nothing, so it
-                // reads as unsupported rather than as an empty success.
+                // Treat a patch envelope naming no file as unsupported rather than an empty success.
                 if patches.iter().all(|patch| patch.file_path.is_empty()) {
                     return None;
                 }
                 ToolArgs::ApplyPatch { patches }
             }
             Self::Shell => ToolArgs::Shell {
-                // A blank command would be dropped by `add_run_command`,
-                // leaving the call with no metric at all, so it counts as
-                // unreadable here.
+                // Reject blank commands here since `add_run_command` would silently drop them.
                 command: arg_str(args, &["command", "cmd"])
                     .filter(|command| !command.trim().is_empty())?,
-                // Optional, and absent from plenty of real calls: it is
-                // reported alongside the command, not part of what makes the
-                // call foldable.
                 description: arg_str(args, &["description"]).unwrap_or(""),
             },
             Self::WriteBash => ToolArgs::WriteBash {
@@ -470,16 +378,9 @@ impl TrackedTool {
     }
 }
 
-/// The payload of a successful [`TrackedTool`] call, read once.
-///
-/// Building one *is* the schema check, so a key validation accepts cannot be a
-/// key the fold then fails to read: there is no second reader to disagree with.
-/// The two used to be separate `match` arms over the tool name, each restating
-/// the whole name table and the alias set of every argument that has one.
+/// Validated payload of a successful [`TrackedTool`] call.
 enum ToolArgs<'a> {
-    /// `content` is `None` when the completion carried no body this parser
-    /// could read. The arguments were fine, so the call still counts as one
-    /// read invocation, but it contributes no lines and reads as schema drift.
+    /// `content` is `None` when the completion body is unreadable; the read invocation still counts, but records schema drift.
     Read {
         path: &'a str,
         content: Option<String>,
@@ -507,8 +408,7 @@ enum ToolArgs<'a> {
 }
 
 impl ToolArgs<'_> {
-    /// Whether the whole payload read. Only [`ToolArgs::Read`] can be built
-    /// from arguments this parser understands and still answer `false`.
+    /// Returns whether the payload is complete (`false` only for [`ToolArgs::Read`] with an unreadable result body).
     fn is_complete(&self) -> bool {
         !matches!(self, Self::Read { content: None, .. })
     }
@@ -537,16 +437,12 @@ impl ToolArgs<'_> {
     }
 }
 
-/// The string under the first of `keys` that `args` carries.
-///
-/// A key present but holding something other than a string ends the search: the
-/// log did spell the argument, just not in a shape this parser can read.
+/// Returns the string value of the first matching key in `keys`, returning `None` immediately if that key is present with a non-string value.
 fn arg_str<'a>(args: &'a Value, keys: &[&str]) -> Option<&'a str> {
     keys.iter().find_map(|key| args.get(*key))?.as_str()
 }
 
-/// The `path` argument, which every variant carrying one requires to be
-/// non-empty; an operation against no path records nothing downstream.
+/// Returns the non-empty `path` string argument, if present.
 fn arg_path(args: &Value) -> Option<&str> {
     arg_str(args, &["path"]).filter(|path| !path.is_empty())
 }
@@ -559,25 +455,17 @@ fn extract_apply_patch_text(args: &Value) -> Option<&str> {
         .or_else(|| args.get("string").and_then(Value::as_str))
 }
 
-/// A `tool.execution_start` event held until its matching
-/// `tool.execution_complete` arrives, keyed by `toolCallId`.
+/// A `tool.execution_start` event awaiting its matching `tool.execution_complete`.
 struct PendingTool {
-    /// The tracked tool this call names, or `None` for a name outside
-    /// [`TrackedTool::from_name`] — such a call folds nothing and is not
-    /// schema drift either.
+    /// Tracked tool category, or `None` for untracked tools.
     tool: Option<TrackedTool>,
-    /// Raw tool arguments object, read by [`TrackedTool::read_args`] once the
-    /// completion supplies the result half of the payload.
+    /// Raw tool arguments from `tool.execution_start`.
     arguments: Value,
-    /// Start-event timestamp in epoch milliseconds, used for the detail record.
+    /// Start-event timestamp in epoch milliseconds.
     timestamp: i64,
 }
 
-/// Attaches the read body without double-counting the invocation.
-///
-/// The caller has already bumped `tool_counts.read` so an empty or
-/// undecodable body still shows up, and `add_read_detail` bumps it again for
-/// a non-empty body, so the count is saved and restored around the call.
+/// Attaches read line/file details without incrementing `tool_counts.read` a second time.
 fn attach_read_detail(state: &mut SessionParseState, path: &str, content: &str, ts: i64) {
     let invocation_count = state.tool_counts.read;
     state.add_read_detail(path, content, ts);
@@ -602,7 +490,7 @@ struct CopilotPatch {
     lines: Vec<String>,
 }
 
-/// Parses the patch envelope used by the current Copilot CLI.
+/// Parses a `*** Begin Patch` envelope into per-file hunks.
 fn parse_apply_patch_text(patch_text: &str) -> Vec<CopilotPatch> {
     let Some(start) = patch_text.find("*** Begin Patch") else {
         return Vec::new();
@@ -672,19 +560,7 @@ fn extract_patch_strings(lines: &[String]) -> (String, String) {
     (old_string, new_string)
 }
 
-/// Resolve the content a Copilot `view`-family call saw, or `None` when
-/// neither source reads — the arguments were still fine, so the call keeps its
-/// invocation and only its body is reported as drift.
-///
-/// Two sources, in order:
-///
-/// 1. `arguments.view_range` — inclusive `[start, end]` line numbers. Only
-///    the line count matters downstream, so a placeholder of that many lines
-///    stands in for the body (see the comment on its shape below). A bound
-///    that is not an integer reads as nothing, rather than as the `[0, 0]`
-///    span an `unwrap_or(0)` would invent for it.
-/// 2. `result.content` — the string the model actually received. Used when
-///    no `view_range` was supplied.
+/// Returns the read body for a `view`-family call from `arguments.view_range` (synthesized line placeholder) or `result.content`, or `None` if neither is readable.
 fn read_view_content(arguments: &Value, result: &Value) -> Option<String> {
     if let Some(range) = arguments
         .get("view_range")
@@ -697,26 +573,14 @@ fn read_view_content(arguments: &Value, result: &Value) -> Option<String> {
         if line_count == 0 {
             return Some(String::new());
         }
-        // A pure-newline placeholder ("\n".repeat(N - 1)) would survive
-        // `count_lines` on its own, but `add_read_detail` first trims
-        // trailing newlines and then the whole thing collapses to an
-        // empty string — so the line tally would silently come back as
-        // zero. Use single-char "lines" joined by '\n' so the trim is a
-        // no-op and `count_lines` recovers exactly `line_count`.
+        // Use non-empty lines so `add_read_detail`'s trailing-newline trim cannot collapse the placeholder to empty.
         return Some(vec!["-"; line_count].join("\n"));
     }
 
     Some(result.get("content")?.as_str()?.to_string())
 }
 
-/// Best-effort reconstruction of a repository's git remote URL from the
-/// `session.start.context` fields.
-///
-/// Copilot writes `{ repository: "owner/repo", repositoryHost: "github.com" }`
-/// but does *not* include the full clone URL. We prefix with `https://`
-/// because that's the canonical web-facing form; the value is only used for
-/// display in the usage report, not for actual git operations, so the
-/// SSH-vs-HTTPS distinction does not matter.
+/// Builds an `https://{host}/{repository}` remote URL, or an empty string if either part is empty.
 fn build_remote_url(host: &str, repository: &str) -> String {
     if host.is_empty() || repository.is_empty() {
         return String::new();
@@ -724,29 +588,9 @@ fn build_remote_url(host: &str, repository: &str) -> String {
     format!("https://{}/{}", host.trim(), repository.trim())
 }
 
-/// Canonicalise a Copilot-supplied model name.
-///
-/// Copilot CLI writes Anthropic model names with **dot-separated** minor
-/// versions (e.g. `claude-sonnet-4.6`, `claude-opus-4.7`), while the
-/// LiteLLM pricing table and every other CLI in this tool (Claude Code,
-/// Codex) use the **dash-separated** form (`claude-sonnet-4-6`,
-/// `claude-opus-4-7`).
-///
-/// If we leave the Copilot names as-is, two things go wrong:
-///
-/// 1. `merge_usage_values` keeps Copilot's `claude-sonnet-4.6` separate
-///    from Claude Code's `claude-sonnet-4-6`, splitting a single model's
-///    usage across two rows.
-/// 2. The pricing matcher's substring/fuzzy tier finds no exact key for
-///    `claude-sonnet-4.6` and picks the *only* dot-named variant it has
-///    — `openrouter/anthropic/claude-sonnet-4.6` — which is an OpenRouter
-///    proxy entry with different per-token rates, not the Anthropic
-///    native rate the Copilot caller is actually being billed against.
-///
-/// We limit the rewrite to names starting with `claude-` so OpenAI /
-/// Google models whose native form legitimately contains dots (e.g.
-/// `gpt-5.1`, `gemini-1.5-pro`) are left untouched.
+/// Rewrites dots to dashes in `claude-*` model names while leaving other providers' names unchanged.
 fn canonicalize_model_name(name: &str) -> String {
+    // Copilot emits `claude-sonnet-4.6`, whereas LiteLLM native keys and other CLIs use `claude-sonnet-4-6` (OpenAI/Google models natively use dots).
     if name.starts_with("claude-") {
         name.replace('.', "-")
     } else {
@@ -775,10 +619,7 @@ mod tests {
         }
     }
 
-    /// Reads a completed call's payload the way the completion arm does.
-    ///
-    /// Panics on a name outside the tracked table so a test cannot silently
-    /// assert about a tool the parser stopped resolving.
+    /// Resolves `tool_name` and reads its payload, panicking if `tool_name` is untracked.
     fn read<'a>(tool_name: &str, arguments: &'a Value, result: &Value) -> Option<ToolArgs<'a>> {
         TrackedTool::from_name(tool_name)
             .unwrap_or_else(|| panic!("`{tool_name}` must resolve to a tracked tool"))
@@ -794,8 +635,7 @@ mod tests {
         state
     }
 
-    /// What one folded call moved, so a tool filed under the wrong variant
-    /// fails on the whole shape rather than on one counter it happens to share.
+    /// Subset of [`SessionParseState`] counters asserted together per folded tool call.
     #[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
     struct Counters {
         read: usize,
@@ -817,8 +657,7 @@ mod tests {
         }
     }
 
-    /// An arguments object built from string pairs, for the alias walk below
-    /// (whose keys are loop variables rather than literals).
+    /// Builds a JSON object from string key-value pairs.
     fn args_of(pairs: &[(&str, &str)]) -> Value {
         Value::Object(
             pairs
@@ -829,9 +668,7 @@ mod tests {
     }
 
     fn count_lines_after_trim(s: &str) -> usize {
-        // Mirror `add_read_detail`'s `trim_end_matches('\n')` + `count_lines`
-        // so the test reflects the actual line tally the analyzer would
-        // record.
+        // Mirrors `add_read_detail`'s trailing-newline trim before line counting.
         let trimmed = s.trim_end_matches('\n');
         if trimmed.is_empty() {
             0
@@ -842,9 +679,6 @@ mod tests {
 
     #[test]
     fn view_range_placeholder_survives_trim_end() {
-        // view_range [1, 5] → 5 logical lines. The synthesised
-        // placeholder must yield 5 from `count_lines` even after
-        // `trim_end_matches('\n')` runs in `add_read_detail`.
         let args = json!({ "view_range": [1, 5], "path": "/tmp/foo" });
         let result = json!({});
         let placeholder = read_view_content(&args, &result).expect("a readable range");
@@ -857,8 +691,6 @@ mod tests {
 
     #[test]
     fn view_range_with_zero_span_returns_empty() {
-        // Edge case: empty range produces an empty placeholder so the
-        // upstream early-return in `add_read_detail` skips it cleanly.
         let args = json!({ "view_range": [5, 4], "path": "/tmp/foo" });
         let result = json!({});
         assert_eq!(read_view_content(&args, &result).as_deref(), Some(""));
@@ -916,10 +748,6 @@ mod tests {
 
     #[test]
     fn an_unreadable_view_range_counts_the_read_without_inventing_lines() {
-        // A bound that is not an integer used to be called drift by the schema
-        // check and read anyway by the fold, whose `unwrap_or(0)` turned it
-        // into the span `[0, 0]` — one fabricated line for a range nobody
-        // could read.
         let args = json!({ "path": "/tmp/a.txt", "view_range": ["1", "5"] });
         let result = json!({ "content": "alpha\nbeta" });
         assert!(
@@ -1012,10 +840,6 @@ mod tests {
 
     #[test]
     fn every_tracked_tool_name_folds_into_its_metric() {
-        // `TrackedTool::from_name` is the only place these names are spelled
-        // now, and a list of strings is not something the compiler checks, so
-        // every one is walked here: a name dropped from the table stops folding
-        // altogether rather than merely losing its detail.
         let read_args = json!({ "path": "/tmp/a.txt", "view_range": [1, 2] });
         let search_args = json!({ "pattern": "needle" });
         let write_args = json!({ "path": "/tmp/a.txt", "content": "one\ntwo" });
@@ -1025,9 +849,7 @@ mod tests {
         let shell_args = json!({ "command": "ls" });
         let write_bash_args = json!({ "input": "yes" });
 
-        // Read lines are what separate the two families sharing the read
-        // counter. Every other pair needs different arguments, so a name filed
-        // under the wrong variant reads as nothing and folds nothing.
+        // `read_lines` distinguishes `Read` from `Search`, which both increment `read`.
         let families: &[(&[&str], &Value, Counters)] = &[
             (
                 &["view", "show_file", "read_file"],
@@ -1099,18 +921,11 @@ mod tests {
             }
         }
 
-        // A name outside the table is not tracked, so it is neither folded nor
-        // reported as drift.
         assert!(TrackedTool::from_name("report_intent").is_none());
     }
 
     #[test]
     fn an_edit_that_replaces_nothing_is_reclassified_as_a_write() {
-        // Copilot folds edits through `add_edit_detail`, not the `_raw` form
-        // its Gemini counterpart uses: an empty `old_string` here is a new file
-        // expressed as a diff, and lands as a write. Nothing pinned that before
-        // the two readers became one, and the schema check has always let an
-        // empty string through.
         let state = fold(
             "str_replace",
             json!({ "path": "/tmp/a.txt", "old_string": "", "new_string": "one\ntwo" }),
@@ -1123,11 +938,6 @@ mod tests {
 
     #[test]
     fn every_argument_alias_reaches_the_fold() {
-        // The alias sets live in `TrackedTool::read_args` alone now, but a list
-        // of strings is not something the compiler checks either. Each case
-        // asserts on the folded *content*, not on a counter: an alias that
-        // resolved to nothing would leave the counter right and the detail
-        // empty.
         for old_key in ["old_string", "old_str", "old_text"] {
             for new_key in ["new_string", "new_str", "new_text"] {
                 let state = fold(
@@ -1172,10 +982,6 @@ mod tests {
 
     #[test]
     fn a_log_spelling_two_aliases_takes_the_earlier_one() {
-        // `arg_str` resolves an alias list in order, which is what the chain of
-        // `.or_else(|| args.get(..))` calls it replaced did. Reordering a list
-        // is the one edit to `read_args` that changes an answer without
-        // changing what the parser accepts.
         let state = fold(
             "str_replace",
             json!({
@@ -1310,15 +1116,13 @@ mod tests {
             parse_copilot_events_with_diagnostics(vec![complete(true)], ParseMode::Full).unwrap();
         assert_eq!(orphan.diagnostics.failed_relevant_records, 1);
 
-        // A failed tool produces no metric even when it does pair, so its
-        // orphan lost nothing and must not read as a gap.
+        // Failed completions produce no metrics even when paired, so an orphan failure is not drift.
         let failed =
             parse_copilot_events_with_diagnostics(vec![complete(false)], ParseMode::Full).unwrap();
         assert_eq!(failed.diagnostics.failed_relevant_records, 0);
         assert_eq!(failed.diagnostics.partial_failure_count(), 0);
 
-        // A start whose schema drifted already recorded the failure, so its
-        // completion must not record a second one for the same call.
+        // A drifted start already recorded the failure, so its completion must not double-count it.
         let drifted = parse_copilot_events_with_diagnostics(
             vec![
                 event(
@@ -1355,7 +1159,6 @@ mod tests {
 
     #[test]
     fn non_claude_models_keep_dots() {
-        // OpenAI / Azure model names use dots natively; do not touch them.
         assert_eq!(canonicalize_model_name("gpt-5.1"), "gpt-5.1");
         assert_eq!(canonicalize_model_name("gpt-4.1-mini"), "gpt-4.1-mini");
         assert_eq!(canonicalize_model_name("gemini-1.5-pro"), "gemini-1.5-pro");

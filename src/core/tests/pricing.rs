@@ -1,8 +1,6 @@
-// Integration tests for pricing system functionality
+// Integration tests for pricing system functionality.
 //
-// The fetch/cache path is exercised against a local httpmock server pointed at
-// a temp cache dir, so no real LiteLLM request is ever made and the real
-// `~/.vct` is never touched. The rest are pure lookup / cost-math tests.
+// The fetch/cache path runs against a local `httpmock` server pointed at a temp cache dir, so no real LiteLLM request is made and `~/.vct` is never touched. The rest are pure lookup and cost-math tests.
 
 use httpmock::prelude::*;
 use serde_json::json;
@@ -14,8 +12,7 @@ use vct_core::pricing::{
 };
 use vct_core::utils::{TierSlice, get_pricing_cache_path_in};
 
-/// Builds normalized counts for the positional (input, output, reasoning,
-/// cache_read, cache_creation_5m, cache_creation_1h) test shorthand.
+/// Builds a `TokenCounts` with `cache_creation` set to `cc_5m + cc_1h`.
 fn tc(
     input: i64,
     output: i64,
@@ -72,7 +69,7 @@ fn fetch_pricing_from_mock_parses_and_caches() {
     let map = fetch_model_pricing_with(&server.url("/pricing"), cache_dir.path())
         .expect("fetch pricing from mock server");
 
-    endpoint.assert(); // the mock endpoint was reached
+    endpoint.assert();
 
     let sonnet = map.get("claude-sonnet-4-6");
     assert_eq!(sonnet.pricing.input_cost_per_token, 3e-6);
@@ -81,7 +78,6 @@ fn fetch_pricing_from_mock_parses_and_caches() {
     assert_eq!(sonnet.pricing.tiers[0].threshold_tokens, 200_000);
     assert_eq!(map.get("gpt-5").pricing.input_cost_per_token, 1e-6);
 
-    // The cache lands in the temp dir — never the real `~/.vct`.
     let cache_file = get_pricing_cache_path_in(cache_dir.path(), &pricing_cache_date());
     assert!(
         cache_file.exists(),
@@ -93,15 +89,13 @@ fn fetch_pricing_from_mock_parses_and_caches() {
 fn fetch_pricing_prefers_cache_over_network() {
     clear_pricing_cache();
     let server = MockServer::start();
-    // If today's cache is honored, this endpoint is never hit; it 500s so a
-    // regression that reached the network would fail loudly instead of silently.
+    // If today's cache is honored, this endpoint is never hit; it returns 500 so a regression that reaches the network fails loudly.
     let endpoint = server.mock(|when, then| {
         when.method(GET).path("/pricing");
         then.status(500);
     });
     let cache_dir = TempDir::new().unwrap();
 
-    // Pre-seed today's cache with a cost-fields JSON (current, non-legacy schema).
     let cache_file = get_pricing_cache_path_in(cache_dir.path(), &pricing_cache_date());
     std::fs::write(
         &cache_file,
@@ -248,7 +242,6 @@ fn test_model_pricing_normalized_match() {
     );
     let pricing_map = ModelPricingMap::new(raw_map);
 
-    // Test with date suffix
     let result = pricing_map.get("claude-3-sonnet-20240229");
     assert_eq!(result.pricing.input_cost_per_token, 0.000003);
     assert_eq!(
@@ -370,8 +363,7 @@ fn multi_vendor_cloud_prefixes_only_count_as_official_for_their_own_models() {
     raw_map.insert("aihubmix/hy4-preview".to_string(), pricing_at(0.845));
     let pricing_map = ModelPricingMap::new(raw_map);
 
-    // Every multi-vendor prefix sorts before `zai/` lexically, so any of them
-    // qualifying on a non-owned model would steal `glm-5.2` from `zai/`.
+    // Every multi-vendor prefix sorts before `zai/` lexically, so any of them qualifying on a non-owned model would steal `glm-5.2` from `zai/`.
     assert_eq!(
         pricing_map.get("glm-5.2").matched_model.as_deref(),
         Some("zai/glm-5.2")
@@ -405,9 +397,7 @@ fn multi_vendor_cloud_prefixes_only_count_as_official_for_their_own_models() {
 fn versioned_normalized_collisions_preserve_same_unprefixed_and_official_order() {
     clear_pricing_cache();
 
-    // All candidates are versioned (`tier_group == 1`), with `anthropic/` <
-    // `claude-...` < `cloudflare/` < `openrouter/` lexically so lexical order
-    // opposes `same_provider` (0) < `unprefixed` (1) < `official` (2).
+    // All candidates are versioned (`tier_group == 1`), with `anthropic/` < `claude-...` < `cloudflare/` < `openrouter/` lexically so lexical order opposes `same_provider` (0) < `unprefixed` (1) < `official` (2).
     let mut same_vs_unprefixed = HashMap::new();
     same_vs_unprefixed.insert(
         "anthropic/claude-3-7-sonnet-20250219".to_string(),
@@ -604,7 +594,6 @@ fn test_calculate_cost_basic() {
         ..Default::default()
     };
 
-    // 2000 cache_creation tokens at default (5 minute) TTL, no reasoning tokens.
     let cost = calculate_cost(&tc(1000, 500, 0, 10000, 2000, 0), &pricing);
     // input: 1000 * 0.000003 = 0.003
     // output: 500 * 0.000015 = 0.0075
@@ -638,7 +627,6 @@ fn test_calculate_cost_no_cache() {
 
 #[test]
 fn test_calculate_cost_large_numbers() {
-    // Flat pricing (no tiers): every request uses base prices regardless of size.
     let pricing = ModelPricing {
         input_cost_per_token: 0.000001,
         output_cost_per_token: 0.000002,
@@ -665,7 +653,6 @@ fn test_pricing_with_provider_prefix() {
     );
     let pricing_map = ModelPricingMap::new(raw_map);
 
-    // Test with provider prefix
     let result = pricing_map.get("bedrock/claude-3-opus-20240229");
     assert!(
         result.pricing.input_cost_per_token > 0.0 || result.matched_model.is_some(),
@@ -705,7 +692,6 @@ fn test_pricing_multiple_models() {
 
     let pricing_map = ModelPricingMap::new(raw_map);
 
-    // Test all models
     assert!(
         pricing_map
             .get("claude-3-opus")
@@ -793,8 +779,7 @@ fn test_pricing_above_200k_tokens_via_tier() {
     let below = calculate_cost(&tc(100_000, 50_000, 0, 0, 0, 0), &pricing);
     assert_eq!(below, 100_000.0 * 0.000001 + 50_000.0 * 0.000002);
 
-    // Aggregated volume alone never promotes to the tier — only the
-    // per-request above_tier slice does.
+    // Aggregated volume alone never promotes to the tier; only the per-request `above_tiers` slice does.
     let aggregate = calculate_cost(&tc(300_000, 50_000, 0, 0, 0, 0), &pricing);
     assert_eq!(aggregate, 300_000.0 * 0.000001 + 50_000.0 * 0.000002);
 
@@ -813,7 +798,7 @@ fn test_pricing_above_200k_tokens_via_tier() {
 fn test_pricing_range_based() {
     // Mimics Qwen-style range-based pricing.
     let pricing = ModelPricing {
-        input_cost_per_token: 999.0, // Should be ignored — ranges takes priority.
+        input_cost_per_token: 999.0, // Ignored when `ranges` is set.
         ranges: Some(vec![
             TierRange {
                 min_tokens: 0,
@@ -836,8 +821,7 @@ fn test_pricing_range_based() {
     let low = calculate_cost(&tc(10_000, 1000, 0, 0, 0, 0), &pricing);
     assert_eq!(low, 10_000.0 * 0.000001 + 1000.0 * 0.000005);
 
-    // Aggregated volume alone never promotes to row 1 — only the per-request
-    // above slice the parsers classify does.
+    // Aggregated volume alone never promotes to the upper range; only per-request `above_tiers` slices do.
     let aggregate = calculate_cost(&tc(100_000, 1000, 0, 0, 0, 0), &pricing);
     assert_eq!(aggregate, 100_000.0 * 0.000001 + 1000.0 * 0.000005);
 
@@ -867,13 +851,11 @@ fn test_pricing_result_structure() {
 
 #[test]
 fn test_pricing_edge_cases() {
-    // Test with empty string
     let raw_map = HashMap::new();
     let pricing_map = ModelPricingMap::new(raw_map);
     let result = pricing_map.get("");
     assert_eq!(result.pricing.input_cost_per_token, 0.0);
 
-    // Test with very long model name
     let long_name = "a".repeat(1000);
     let result = pricing_map.get(&long_name);
     assert_eq!(result.pricing.input_cost_per_token, 0.0);

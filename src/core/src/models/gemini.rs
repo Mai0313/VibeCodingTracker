@@ -1,29 +1,11 @@
-//! Serde models for the Google Gemini CLI chat-log JSONL format.
+//! Serde models for the Google Gemini CLI chat-log JSONL format (`~/.gemini/tmp/<project>/chats/session-*.jsonl`).
 //!
-//! The first line of each chat file is a [`GeminiSession`] meta record; the
-//! remaining lines are individual events the parser handles as plain `Value`s.
-//! The `content` field is polymorphic and handled by the `deserialize_content`
-//! helper.
+//! Each file opens with a [`GeminiSession`] metadata line followed by per-event JSON records.
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
-/// Top-level session metadata line of a Gemini CLI chat log.
-///
-/// Current Gemini CLI writes chats as JSONL event streams under
-/// `~/.gemini/tmp/<project>/chats/session-*.jsonl`. The very first line is a
-/// pure session-meta record:
-///
-/// ```json
-/// {"sessionId":"...","projectHash":"...","startTime":"...","lastUpdated":"...","kind":"main"}
-/// ```
-///
-/// Subsequent lines are individual assistant / user / info events that the
-/// parser handles one-by-one as plain `Value`s (see
-/// `parse_gemini_events`), so this struct only needs to capture the
-/// identifiers found on that opening meta line. Legacy single-object
-/// exports (`chats/<session>.json` with an inline `messages` array) are no
-/// longer supported — the filesystem filter ignores `.json` entirely.
+/// Opening session-metadata line of a Gemini CLI chat log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GeminiSession {
@@ -38,19 +20,14 @@ pub struct GeminiSession {
     /// ISO-8601 timestamp of the last update to the session.
     #[serde(default)]
     pub last_updated: String,
-    /// Present on JSONL session-meta records (e.g. `"main"`), but not
-    /// required — older CLI builds occasionally omit it.
+    /// Session kind (for example `"main"`), when present.
     #[serde(default)]
     pub kind: Option<String>,
 }
 
-/// Single message within a Gemini session.
+/// Wire shape of a `type == "gemini"` chat event.
 ///
-/// A `type == "gemini"` event as written on the wire. No parser in this crate
-/// deserializes into it today — the Gemini parser uses its own narrower
-/// analysis shape — and legacy `messages[]` exports are no longer read at all.
-/// Every field tolerates absence, so a partially populated event still
-/// deserializes.
+/// All fields default when absent so partially populated events still deserialize.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GeminiMessage {
@@ -78,16 +55,7 @@ pub struct GeminiMessage {
     pub tool_calls: Vec<Value>,
 }
 
-/// Flattens a polymorphic message `content` field into a single `String`.
-///
-/// Content may be a string, an array of `{text: "..."}` objects, null, or
-/// missing entirely. Arrays are joined with newlines, `null` becomes an empty
-/// string, and any other JSON value is stringified.
-///
-/// # Errors
-///
-/// Returns a deserialization error if the underlying tokens are not valid JSON
-/// for [`Value`].
+/// Flattens a message `content` field (string, `{text}` array, `null`, or other JSON value) into one `String`.
 fn deserialize_content<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: Deserializer<'de>,
@@ -124,8 +92,7 @@ pub struct GeminiThought {
 /// Token-usage breakdown for a single Gemini message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeminiTokens {
-    /// Input (prompt) tokens: the full prompt count, with the `cached` subset
-    /// already folded in.
+    /// Total prompt tokens, including the `cached` subset.
     #[serde(default)]
     pub input: i64,
     /// Output (response) tokens.
@@ -134,8 +101,7 @@ pub struct GeminiTokens {
     /// Tokens served from cache.
     #[serde(default)]
     pub cached: i64,
-    /// Tokens spent on reasoning / thoughts, disjoint from `output` — every
-    /// observed record satisfies `total == input + output + thoughts`.
+    /// Reasoning tokens, disjoint from `output` (`total == input + output + thoughts`).
     #[serde(default)]
     pub thoughts: i64,
     /// Tokens attributed to tool use.

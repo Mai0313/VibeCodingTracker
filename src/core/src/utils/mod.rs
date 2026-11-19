@@ -1,11 +1,4 @@
-//! Leaf helpers shared across the crate: directory walking, JSON/JSONL file
-//! IO, number/date formatting, git remote lookup, glibc heap tuning, path
-//! resolution, RFC 3339 timestamps, and token-count extraction, merging, and
-//! per-provider usage folding.
-//!
-//! The most frequently used items are re-exported at this module's root so
-//! callers can write `utils::format_number` instead of reaching into the
-//! per-concern submodules.
+//! Leaf helpers shared across the crate: legacy cache cleanup, directory walking, JSON/JSONL file I/O, number/date formatting, git remote lookup, glibc heap tuning, path resolution, RFC 3339 timestamps, and token-count extraction, merging, and per-provider usage folding.
 
 pub mod cache_layout;
 pub mod directory;

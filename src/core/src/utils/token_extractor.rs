@@ -1,21 +1,15 @@
+//! Extraction of normalized token counts and per-tier slices from provider usage JSON.
+
 use serde_json::Value;
 
-/// Highest context-tier price level a usage value can express.
+/// Maximum context-tier price level supported in [`TokenCounts::above_tiers`].
 ///
-/// LiteLLM's dearest range-priced model publishes four rows today, so this is
-/// far above anything real; it exists because [`extract_token_counts`] indexes
-/// a vector by the level it reads out of a key name, and that key can come
-/// from any caller. A model publishing more levels than this bills its top
-/// ones at level `MAX_TIER_LEVELS` — a lower bound, never a lost token.
+/// [`extract_token_counts`] ignores `above_tier` keys whose level is `0` or exceeds this limit.
 pub const MAX_TIER_LEVELS: usize = 16;
 
-/// One context-tier price level's slice of a model's tokens.
+/// One context-tier price level's subset of a [`TokenCounts`] record.
 ///
-/// The buckets mirror the same-named [`TokenCounts`] fields and use the same
-/// disjoint semantics (input excludes cache reads, output excludes reasoning),
-/// because a slice is always a subset of the totals — never tokens on top of
-/// them. `calculate_cost` bills the slice at level *n*'s prices and the
-/// remainder at the model's base level.
+/// Bucket semantics match [`TokenCounts`] (non-cached input, output excluding reasoning); each slice is a subset of the parent totals rather than additional tokens.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TierSlice {
     /// Non-cached prompt tokens billed at this level.
@@ -43,31 +37,22 @@ impl TierSlice {
         self.cache_creation_1h += other.cache_creation_1h;
     }
 
-    /// Whether this level classified no tokens at all.
+    /// Returns whether all buckets in this slice are zero.
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
 }
 
-/// Normalized token counts extracted from provider-specific usage data.
+/// Normalized, disjoint token counts extracted from provider usage JSON.
 ///
-/// `cache_creation == cache_creation_5m + cache_creation_1h` always holds.
-/// The split mirrors Anthropic's two cache TTL tiers, which bill at different
-/// rates; providers that publish no split (Codex, Gemini, older Claude Code
-/// records) put every cache-write token in the 5m bucket.
-///
-/// `reasoning_tokens` carries the model's "thinking" budget, billed separately
-/// from user-visible output. Codex publishes it inside `total_token_usage`,
-/// Gemini as `thoughts_tokens`, and Copilot / OpenCode / Hermes / DeepSeek
-/// Harness as a flat `reasoning_output_tokens`. Claude, Cursor and Grok report
-/// no reasoning at all and leave this at 0.
+/// `cache_creation == cache_creation_5m + cache_creation_1h` always holds; providers without a TTL split place all cache-write tokens in `cache_creation_5m`. `input_tokens` excludes `cache_read`, and `output_tokens` excludes `reasoning_tokens`.
 #[derive(Debug, Default)]
 pub struct TokenCounts {
-    /// Non-cached prompt tokens (cached reads are excluded; see `cache_read`).
+    /// Non-cached prompt tokens (excludes `cache_read`).
     pub input_tokens: i64,
-    /// User-visible completion tokens, excluding reasoning.
+    /// Completion tokens excluding `reasoning_tokens`.
     pub output_tokens: i64,
-    /// Model "thinking" tokens, billed separately from `output_tokens`.
+    /// Model reasoning ("thinking") tokens, disjoint from `output_tokens`.
     pub reasoning_tokens: i64,
     /// Prompt tokens served from the provider's prompt cache.
     pub cache_read: i64,
@@ -77,34 +62,18 @@ pub struct TokenCounts {
     pub cache_creation_5m: i64,
     /// Cache-write tokens at the extended 1-hour TTL.
     pub cache_creation_1h: i64,
-    /// Server-side web-search requests (Claude `server_tool_use`). Billed
-    /// per query (not per token) at the model's web-search rate, so it is
-    /// tracked here but excluded from `total`.
+    /// Server-side web-search request count (Claude `server_tool_use`), billed per query and excluded from `total`.
     pub web_search_requests: i64,
-    /// Tokens a provider bills for tool payloads alone (Gemini `tool_tokens`).
-    /// LiteLLM publishes no rate for them, so they are counted in `total` and
-    /// left out of every priced bucket.
+    /// Unpriced tool-payload tokens (Gemini `tool_tokens`), included in `total`.
     pub tool_tokens: i64,
-    /// Token total shown in the UI and used by [`TokenCounts::has_activity`].
-    /// Includes `tool_tokens`, which have no price bucket, so `calculate_cost`
-    /// bills the individual buckets rather than this.
+    /// Total tokens across all token buckets (including `tool_tokens`, excluding `web_search_requests`).
     pub total: i64,
-    /// Per-level slices of the buckets above, from requests whose own prompt
-    /// context reached the model's higher price levels (see the `above_tier`
-    /// object written by the usage parsers). Index `n` is price level `n + 1`,
-    /// the model's base level being 0, and a level nothing classified into is
-    /// a zero entry rather than a gap. Always subsets of the fields they
-    /// mirror — never additional tokens — so displays keep using the totals
-    /// above while `calculate_cost` bills each slice at its level's rates.
-    /// Empty for everything that classifies nothing.
+    /// Per-level token subsets for requests that reached higher context-tier price levels; index `n` corresponds to price level `n + 1`, with zero entries for empty intermediate levels.
     pub above_tiers: Vec<TierSlice>,
 }
 
 impl TokenCounts {
-    /// The slice billed at price `level`, growing the vector to reach it.
-    ///
-    /// `None` for level 0 (the base level is the remainder, not a slice) and
-    /// for a level past [`MAX_TIER_LEVELS`].
+    /// Returns a mutable reference to price `level`'s slice (growing `above_tiers`), or `None` for level `0` or levels above [`MAX_TIER_LEVELS`].
     fn tier_slice_mut(&mut self, level: usize) -> Option<&mut TierSlice> {
         if level == 0 || level > MAX_TIER_LEVELS {
             return None;
@@ -115,12 +84,9 @@ impl TokenCounts {
         self.above_tiers.get_mut(level - 1)
     }
 
-    /// Whether this usage did anything; the one test for whether a date counts
-    /// as active.
+    /// Returns whether any token bucket or `web_search_requests` is non-zero.
     ///
-    /// Covers every field except `tool_tokens` and the `above_tiers` slices,
-    /// which are subsets of fields already checked (`tool_tokens` is a summand
-    /// of `total`). A new bucket must be added here too.
+    /// `tool_tokens` and `above_tiers` are covered transitively via `total` and the parent buckets.
     pub fn has_activity(&self) -> bool {
         self.total != 0
             || self.input_tokens != 0
@@ -134,10 +100,7 @@ impl TokenCounts {
     }
 }
 
-/// Splits an `above_tier` key into its price level and bucket name.
-///
-/// `"level_2_input_tokens"` is level 2's `input_tokens` bucket. A key in any
-/// other shape belongs to no level and is skipped.
+/// Parses `level_<n>_<bucket>` into `(n, bucket)`, returning `None` for other key shapes.
 fn split_tier_key(key: &str) -> Option<(usize, &str)> {
     let rest = key.strip_prefix("level_")?;
     let separator = rest.find('_')?;
@@ -145,17 +108,9 @@ fn split_tier_key(key: &str) -> Option<(usize, &str)> {
     Some((level, &rest[separator + 1..]))
 }
 
-/// Extracts token counts from usage data in any provider format.
+/// Extracts normalized, disjoint [`TokenCounts`] from provider usage JSON.
 ///
-/// Handles two shapes: the flat provider fields (`input_tokens`,
-/// `output_tokens`, …), which already arrive disjoint, and Codex's nested
-/// `total_token_usage`, which is normalized to the same convention by
-/// subtracting cache reads out of input and reasoning out of output. Every
-/// bucket of the result is therefore billed exactly once, and reasoning can
-/// take `output_cost_per_reasoning_token` where the model publishes one.
-///
-/// Returns a normalized [`TokenCounts`]; a non-object `usage` yields the
-/// all-zero default.
+/// Supports both flat provider objects (`input_tokens`, `output_tokens`, ...) and Codex's nested `total_token_usage` object (subtracting cached input from `input_tokens` and reasoning from `output_tokens`). Non-object inputs yield [`TokenCounts::default()`].
 ///
 /// # Examples
 ///
@@ -199,10 +154,7 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
             counts.cache_creation = cache_creation;
         }
 
-        // Claude `server_tool_use.web_search_requests`: server-side web search
-        // count, billed per query separately from tokens. Read here in the
-        // flat section so it is captured before the Codex `total_token_usage`
-        // early-return below (Codex never carries this field, so it stays 0).
+        // Read `server_tool_use` before the Codex early return below.
         if let Some(server_tool_use) = usage_obj.get("server_tool_use").and_then(|v| v.as_object())
         {
             counts.web_search_requests = server_tool_use
@@ -211,20 +163,14 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
                 .unwrap_or(0);
         }
 
-        // Per-request tier classification (usage scans only): the parsers
-        // accumulate each classified request's buckets into a nested
-        // `above_tier` object, keyed `level_<n>_<bucket>` so the whole thing
-        // stays one flat integer map and merges like every other nested usage
-        // object. Read it here — before the Codex early return — so both the
-        // flat and the nested shapes carry it into pricing.
+        // Read `above_tier` before the Codex early return so both flat and nested shapes carry tier slices into pricing.
         if let Some(above) = usage_obj.get("above_tier").and_then(|v| v.as_object()) {
             for (key, value) in above {
                 let (Some(tokens), Some((level, bucket))) = (value.as_i64(), split_tier_key(key))
                 else {
                     continue;
                 };
-                // Resolved before the level, so a key naming no bucket cannot
-                // conjure the level it claims to sit at.
+                // Validate the bucket name before resizing `above_tiers` so unknown keys cannot allocate empty levels.
                 let bucket: fn(&mut TierSlice) -> &mut i64 = match bucket {
                     "input_tokens" => |slice| &mut slice.input_tokens,
                     "output_tokens" => |slice| &mut slice.output_tokens,
@@ -241,12 +187,7 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
             }
         }
 
-        // Gemini writes reasoning budget as `thoughts_tokens`; the other flat
-        // providers (Copilot / OpenCode / Hermes / DeepSeek Harness) use
-        // `reasoning_output_tokens`. A single record only carries one of them,
-        // but a cross-provider merge of the same model (e.g. Gemini CLI and
-        // Hermes both using `gemini-*`) keeps both keys, so sum them — an
-        // overwrite would drop one provider's thinking-time tokens.
+        // Sum both flat reasoning keys so cross-provider merges (Gemini `thoughts_tokens` + `reasoning_output_tokens`) do not overwrite each other.
         let thoughts = usage_obj
             .get("thoughts_tokens")
             .and_then(|v| v.as_i64())
@@ -257,13 +198,7 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
             .unwrap_or(0);
         counts.reasoning_tokens = thoughts + reasoning_output;
 
-        // Claude Code records cache_creation split by TTL:
-        //   "cache_creation": { ephemeral_5m_input_tokens, ephemeral_1h_input_tokens }
-        // Take the 1h portion from the split and bill everything else at the
-        // default (5m) TTL, so the two priced buckets always sum to the total.
-        // Billing 5m+1h verbatim would drop tokens: merging multi-iteration
-        // turns can leave the scalar larger than the published split (some
-        // iterations report only the scalar).
+        // Bill the 1h TTL portion from the split and assign any remainder (including tokens missing from the split) to 5m so 5m + 1h == cache_creation.
         if let Some(cc_split) = usage_obj.get("cache_creation").and_then(|v| v.as_object()) {
             let ephemeral_5m = cc_split
                 .get("ephemeral_5m_input_tokens")
@@ -273,14 +208,13 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
                 .get("ephemeral_1h_input_tokens")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
-            // The total is the larger of the scalar and the split sum (the
-            // scalar may be missing, or the split may exceed a stale scalar).
+            // Use the larger of the scalar and split sum in case the scalar is absent or stale.
             counts.cache_creation = counts
                 .cache_creation
                 .max(ephemeral_5m + counts.cache_creation_1h);
             counts.cache_creation_5m = counts.cache_creation - counts.cache_creation_1h;
         } else {
-            // No TTL split → treat every cache_creation token as default (5 min) TTL.
+            // No TTL split: treat all `cache_creation` tokens as 5m TTL.
             counts.cache_creation_5m = counts.cache_creation;
         }
 
@@ -289,13 +223,7 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
             .get("total_token_usage")
             .and_then(|v| v.as_object())
         {
-            // Codex follows OpenAI's convention: `input_tokens` is the full
-            // prompt size and `cached_input_tokens` is the subset that hit the
-            // prompt cache. LiteLLM prices non-cached input
-            // (`input_cost_per_token`) and cached reads
-            // (`cache_read_input_token_cost`) *separately*, so subtract cached
-            // out of raw input — forwarding both verbatim would charge every
-            // cached token twice.
+            // OpenAI/Codex `input_tokens` includes `cached_input_tokens`; subtract cached reads so LiteLLM does not bill them twice.
             let raw_input = total_usage
                 .get("input_tokens")
                 .and_then(|v| v.as_i64())
@@ -316,30 +244,16 @@ pub fn extract_token_counts(usage: &Value) -> TokenCounts {
             {
                 counts.reasoning_tokens = reasoning;
             }
-            // OpenAI convention: `output_tokens` (completion) already INCLUDES
-            // `reasoning_output_tokens`. Subtract it back out so each token is
-            // billed once — visible output at the output rate, reasoning at its
-            // dedicated rate (or the output fallback). Without this, reasoning
-            // is billed twice: once inside output and again as its own bucket.
-            // Measured over 21,113 real Codex `token_count` events:
-            // `total_tokens == input + output` held for every one and
-            // `reasoning > output` never occurred, so reasoning is always a
-            // subset of output and the clamp below is a guard, not a live case.
+            // OpenAI/Codex `output_tokens` includes `reasoning_output_tokens`; subtract reasoning so each token is billed once.
             counts.output_tokens = (counts.output_tokens - counts.reasoning_tokens).max(0);
             if let Some(total) = total_usage.get("total_tokens").and_then(|v| v.as_i64()) {
-                // `total_tokens == input (incl. cached) + output`, and output
-                // already contains reasoning, so the published total is the
-                // correct each-token-once figure. Use it verbatim.
+                // Published `total_tokens` already equals input (incl. cached) + output (incl. reasoning); use it verbatim.
                 counts.total = total;
                 return counts;
             }
         }
 
-        // Flat providers may publish tool-only tokens with no LiteLLM billing
-        // bucket. Fold them into the displayed/activity total without giving
-        // them an input or output price, and take the larger of that sum and
-        // any provider-published `total_tokens`, so a session whose priced
-        // buckets are all zero does not read as inactive.
+        // Include unpriced `tool_tokens` in `total`, and take the max against any published `total_tokens` so tool-only sessions stay active.
         counts.tool_tokens = usage_obj
             .get("tool_tokens")
             .and_then(|value| value.as_i64())
@@ -366,7 +280,6 @@ mod tests {
 
     #[test]
     fn claude_format_without_ttl_split_defaults_to_5m() {
-        // Old-style Claude record or provider that predates the ephemeral split.
         let usage = json!({
             "input_tokens": 100,
             "output_tokens": 50,
@@ -399,9 +312,6 @@ mod tests {
 
     #[test]
     fn merged_thoughts_and_reasoning_output_are_summed() {
-        // A single record carries only one reasoning key, but a cross-provider
-        // merge (Gemini `thoughts_tokens` + a flat `reasoning_output_tokens` for
-        // the same model) keeps both — they must add, not overwrite.
         let gemini_only = json!({ "input_tokens": 10, "thoughts_tokens": 30 });
         assert_eq!(extract_token_counts(&gemini_only).reasoning_tokens, 30);
 
@@ -434,9 +344,6 @@ mod tests {
 
     #[test]
     fn ttl_split_smaller_than_scalar_bills_the_remainder_at_5m() {
-        // Merged multi-iteration turn: the scalar total exceeds the published
-        // 5m+1h split. The remainder must bill at the 5m TTL, not be dropped —
-        // and the two priced buckets must sum back to the scalar total.
         let usage = json!({
             "cache_creation_input_tokens": 397_602_459_i64,
             "cache_creation": {
@@ -447,14 +354,12 @@ mod tests {
         let c = extract_token_counts(&usage);
         assert_eq!(c.cache_creation, 397_602_459);
         assert_eq!(c.cache_creation_1h, 213_022_705);
-        // 5m carries its own tokens plus the 616,793-token remainder.
         assert_eq!(c.cache_creation_5m, 397_602_459 - 213_022_705);
         assert_eq!(c.cache_creation_5m + c.cache_creation_1h, c.cache_creation);
     }
 
     #[test]
     fn ttl_split_derives_total_when_scalar_missing() {
-        // Edge case: only the split object is present, not the scalar total.
         let usage = json!({
             "cache_creation": {
                 "ephemeral_5m_input_tokens": 200,
@@ -469,7 +374,6 @@ mod tests {
 
     #[test]
     fn codex_format_no_cache_creation() {
-        // Codex JSONL uses total_token_usage; no cache_creation concept at all.
         let usage = json!({
             "total_token_usage": {
                 "input_tokens": 1000,
@@ -483,16 +387,12 @@ mod tests {
         assert_eq!(c.cache_creation_5m, 0);
         assert_eq!(c.cache_creation_1h, 0);
         assert_eq!(c.cache_read, 200);
-        // Codex `input_tokens` includes `cached_input_tokens`; the extractor
-        // must subtract cached so the two buckets don't overlap.
+        // Codex `input_tokens` includes `cached_input_tokens`.
         assert_eq!(c.input_tokens, 800);
     }
 
     #[test]
     fn codex_input_tokens_excludes_cached_bucket() {
-        // Taken from a real Codex session: input=576_145 includes
-        // cached=408_832. The extractor must split the two so
-        // `calculate_cost` doesn't bill every cached token twice.
         let usage = json!({
             "total_token_usage": {
                 "input_tokens": 576_145,
@@ -505,18 +405,13 @@ mod tests {
         let c = extract_token_counts(&usage);
         assert_eq!(c.input_tokens, 576_145 - 408_832);
         assert_eq!(c.cache_read, 408_832);
-        // `output_tokens` (completion) already includes reasoning; the
-        // extractor splits them so each token is billed once.
         assert_eq!(c.output_tokens, 13_156 - 8_591);
         assert_eq!(c.reasoning_tokens, 8_591);
-        // `total_tokens == input + output` already, so it is used verbatim.
         assert_eq!(c.total, 589_301);
     }
 
     #[test]
     fn codex_cached_exceeding_input_clamps_to_zero() {
-        // Defensive: never emit a negative `input_tokens` even if the provider
-        // ever misreports cached > input.
         let usage = json!({
             "total_token_usage": {
                 "input_tokens": 100,
@@ -532,9 +427,6 @@ mod tests {
 
     #[test]
     fn gemini_thoughts_tokens_populate_reasoning_bucket() {
-        // Drives Gemini 2.5 flash pricing — thoughts_tokens must reach the
-        // reasoning bucket instead of being silently dropped or bundled
-        // into output.
         let usage = json!({
             "input_tokens": 13_906,
             "output_tokens": 185,
@@ -567,9 +459,6 @@ mod tests {
 
     #[test]
     fn codex_reasoning_is_split_out_of_output() {
-        // Mimics a real Codex `event_msg` record mid-session: `output_tokens`
-        // already includes `reasoning_output_tokens`, so the extractor
-        // subtracts reasoning out of output to keep the two buckets disjoint.
         let usage = json!({
             "total_token_usage": {
                 "input_tokens": 5_645,
@@ -588,17 +477,11 @@ mod tests {
             "reasoning must be subtracted out of output, not double-counted"
         );
         assert_eq!(c.reasoning_tokens, 640);
-        // `total_tokens == input + output` (reasoning lives inside output),
-        // so the published total is used verbatim.
         assert_eq!(c.total, 6_455);
     }
 
     #[test]
     fn codex_real_world_reasoning_subset_of_output() {
-        // The exact `info.total_token_usage` shape from a real session: output
-        // 508 already contains the 255 reasoning tokens; total 73_861 already
-        // equals input + output. Regression guard against re-introducing the
-        // double-count.
         let usage = json!({
             "total_token_usage": {
                 "input_tokens": 73_353,
@@ -618,8 +501,6 @@ mod tests {
 
     #[test]
     fn claude_server_tool_use_web_search_is_extracted() {
-        // `server_tool_use.web_search_requests` feeds the per-query web-search
-        // billing path; a missing object leaves the count at 0.
         let with_search = json!({
             "input_tokens": 100,
             "output_tokens": 50,
@@ -636,8 +517,7 @@ mod tests {
 
     #[test]
     fn above_tier_slices_are_extracted_for_both_shapes() {
-        // Flat shape (Claude / Gemini): above_tier is a sibling of the token
-        // fields and mirrors them as subsets.
+        // Flat shape.
         let flat = json!({
             "input_tokens": 300_000,
             "output_tokens": 1_000,
@@ -660,8 +540,7 @@ mod tests {
             }]
         );
 
-        // Codex shape: above_tier sits beside total_token_usage and must
-        // survive the early return that consumes the published total.
+        // Codex shape: `above_tier` must survive the early return for `total_tokens`.
         let codex = json!({
             "total_token_usage": {
                 "input_tokens": 400_000,
@@ -693,9 +572,7 @@ mod tests {
 
     #[test]
     fn every_price_level_gets_its_own_slice() {
-        // A range-priced model whose requests landed in rows 1 and 3. Level 2
-        // saw nothing, and must read back as a zero entry rather than shifting
-        // level 3's tokens down onto row 2's cheaper prices.
+        // Missing intermediate level 2 stays a zero entry rather than shifting level 3 down.
         let usage = json!({
             "input_tokens": 500_000,
             "output_tokens": 3_000,
@@ -727,9 +604,6 @@ mod tests {
 
     #[test]
     fn unreadable_above_tier_keys_are_skipped() {
-        // The object is a flat map so it merges like every other nested usage
-        // object, which means anything can land in it. A key naming no level
-        // classifies nothing, and an absurd one must not size a vector by it.
         let usage = json!({
             "input_tokens": 10,
             "above_tier": {
@@ -744,9 +618,6 @@ mod tests {
 
     #[test]
     fn copilot_reasoning_output_tokens_populate_reasoning_bucket() {
-        // After `session::copilot::parse_copilot_events` normalisation,
-        // Copilot sessions use the same flat `reasoning_output_tokens` key
-        // as Codex's nested one.
         let usage = json!({
             "input_tokens": 2_000,
             "output_tokens": 300,

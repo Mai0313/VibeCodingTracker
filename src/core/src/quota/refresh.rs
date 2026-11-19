@@ -1,18 +1,8 @@
-//! Shared OAuth token-refresh primitives used by the Claude, Codex, and Grok
-//! quota fetchers.
+//! Shared OAuth token-refresh primitives.
 //!
-//! The provider-specific request/response shapes live in each fetcher; this
-//! module owns the cross-cutting concerns:
+//! Provides mtime-keyed refresh backoff ([`RefreshCooldown`]), proactive expiry checks ([`is_expiring`]), non-logging refresh HTTP dispatch ([`send_refresh`]), and mtime-guarded atomic JSON write-back ([`update_json_file_in_place`]) that preserves unknown keys.
 //!
-//! - a per-provider refresh **backoff** so a revoked token cannot make the
-//!   worker hammer the token endpoint every tick (`RefreshCooldown`),
-//! - **write-back that preserves unknown fields** by mutating a whole
-//!   `serde_json::Value` and re-checking the file mtime just before the
-//!   atomic write (TOCTOU guard against a concurrently-running official CLI),
-//! - the near-expiry check that decides when to refresh proactively.
-//!
-//! No function here ever logs a request/response body or a token; callers only
-//! surface the HTTP status.
+//! Functions in this module never log request bodies, response bodies, or tokens.
 
 use anyhow::{Context, Result};
 use reqwest::StatusCode;
@@ -21,19 +11,15 @@ use serde_json::Value;
 use std::path::Path;
 use std::time::SystemTime;
 
-/// Cooldown after a refresh failure, so a revoked/rotated-away refresh token
-/// cannot make the quota worker retry the token endpoint on every poll.
+/// Duration in seconds that [`RefreshCooldown`] suppresses retries after a refresh failure.
 pub const REFRESH_COOLDOWN_SECS: i64 = 300;
 
 /// Skew applied to proactive expiry checks, to absorb a slightly-fast clock.
 pub const EXPIRY_SKEW_SECS: i64 = 60;
 
-/// Per-provider refresh backoff keyed on the credential file's mtime.
+/// Per-provider refresh backoff keyed on the credential file's modification time.
 ///
-/// After a refresh failure the worker arms the cooldown; while it is active a
-/// refresh is skipped (the panel shows the login hint) — *unless* the
-/// credential file's mtime changes, which means the user re-logged in or the
-/// official CLI rotated the token, so a retry is worthwhile immediately.
+/// Once armed, the cooldown stays active for [`REFRESH_COOLDOWN_SECS`] seconds while the file's mtime is unchanged; any mtime change ends suppression immediately.
 #[derive(Default)]
 pub struct RefreshCooldown {
     until: i64,
@@ -41,18 +27,18 @@ pub struct RefreshCooldown {
 }
 
 impl RefreshCooldown {
-    /// Whether a refresh should be skipped right now.
+    /// Returns whether the cooldown is active at `now` (Unix seconds) for `cur_mtime`.
     pub fn active(&self, now: i64, cur_mtime: Option<SystemTime>) -> bool {
         now < self.until && self.mtime == cur_mtime
     }
 
-    /// Arms the cooldown after a refresh failure.
+    /// Arms the cooldown for [`REFRESH_COOLDOWN_SECS`] seconds from `now` (Unix seconds), bound to `mtime`.
     pub fn arm(&mut self, now: i64, mtime: Option<SystemTime>) {
         self.until = now + REFRESH_COOLDOWN_SECS;
         self.mtime = mtime;
     }
 
-    /// Clears the cooldown after a success.
+    /// Clears the cooldown.
     pub fn clear(&mut self) {
         self.until = 0;
         self.mtime = None;
@@ -64,20 +50,20 @@ pub fn file_mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-/// True when `expires_at_secs` is known and within `skew_secs` of `now_secs`.
+/// Returns whether `expires_at_secs` is known and within `skew_secs` of `now_secs`.
 ///
-/// An unknown expiry (`None`) returns `false` — we never refresh blindly, which
-/// would spin the token endpoint.
+/// Returns `false` when `expires_at_secs` is `None`.
 pub fn is_expiring(expires_at_secs: Option<i64>, now_secs: i64, skew_secs: i64) -> bool {
     expires_at_secs.is_some_and(|exp| exp - now_secs <= skew_secs)
 }
 
-/// Sends a refresh request and returns `(status, body)` without ever logging
-/// the body (which echoes tokens). The caller checks the status.
+/// Sends `req` and returns `(status, body)` without logging the response body.
+///
+/// Non-2xx statuses are returned as `Ok`; unreadable response bodies yield an empty string.
 ///
 /// # Errors
 ///
-/// Returns an error only if the request could not be sent (network).
+/// Returns an error if sending the HTTP request fails.
 pub fn send_refresh(req: RequestBuilder) -> Result<(StatusCode, String)> {
     let resp = req.send().context("token refresh request failed")?;
     let status = resp.status();
@@ -85,18 +71,13 @@ pub fn send_refresh(req: RequestBuilder) -> Result<(StatusCode, String)> {
     Ok((status, text))
 }
 
-/// Reads a credential file, applies `mutate` to only the fields it touches, and
-/// writes the whole `Value` back atomically (pretty), preserving every other
-/// key.
+/// Reads the JSON file at `path`, applies `mutate` to its [`Value`], and atomically writes the pretty-printed result back while preserving untouched keys.
 ///
-/// Re-checks the file's mtime against `expected_mtime` just before writing and
-/// **aborts the write** (returns `Ok(false)`) if it changed — a concurrently
-/// running official CLI may have rotated the token, and clobbering it would log
-/// that CLI out. Returns `Ok(true)` when the write happened.
+/// Compares the file's mtime against `expected_mtime` before reading and again before writing; returns `Ok(false)` without writing if the mtime changed, or `Ok(true)` when the write succeeds.
 ///
 /// # Errors
 ///
-/// Returns an error if the file cannot be read or parsed, or the write fails.
+/// Returns an error if reading or parsing `path` fails, `mutate` returns an error, or the atomic write fails.
 pub fn update_json_file_in_place(
     path: &Path,
     expected_mtime: Option<SystemTime>,
@@ -110,10 +91,7 @@ pub fn update_json_file_in_place(
         .with_context(|| format!("Failed to read {}", path.display()))?;
     let mut root: Value = serde_json::from_str(&body).context("Failed to parse credential file")?;
     mutate(&mut root)?;
-    // Re-check right before writing: a concurrent official CLI may have rotated
-    // the credential during the read/mutate above. This shrinks the TOCTOU
-    // window to the serialize+rename below (fully closing it would need file
-    // locking).
+    // Re-check before writing to avoid clobbering a concurrent credential rotation by an official CLI (shrinks the TOCTOU window to serialize+rename without file locking).
     if file_mtime(path) != expected_mtime {
         return Ok(false);
     }
@@ -132,11 +110,8 @@ mod tests {
 
     #[test]
     fn is_expiring_boundaries() {
-        // Expires in 61s, skew 60 → not expiring yet.
         assert!(!is_expiring(Some(1061), 1000, 60));
-        // Expires in exactly 60s → expiring.
         assert!(is_expiring(Some(1060), 1000, 60));
-        // Already expired → expiring.
         assert!(is_expiring(Some(900), 1000, 60));
     }
 
@@ -146,11 +121,8 @@ mod tests {
         let mt1 = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(5);
         let mut cd = RefreshCooldown::default();
         cd.arm(1000, Some(mt0));
-        // Within cooldown, same mtime → active (skip refresh).
         assert!(cd.active(1100, Some(mt0)));
-        // Within cooldown but mtime changed → not active (retry).
         assert!(!cd.active(1100, Some(mt1)));
-        // Past cooldown → not active.
         assert!(!cd.active(2000, Some(mt0)));
     }
 
@@ -183,12 +155,10 @@ mod tests {
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(v["tokens"]["access_token"], "new");
         assert_eq!(v["tokens"]["refresh_token"], "newr");
-        // Unknown fields survive.
         assert_eq!(v["auth_mode"], "chatgpt");
         assert_eq!(v["extra"], 123);
         assert!(v.get("OPENAI_API_KEY").is_some());
 
-        // A stale expected_mtime aborts the write.
         let wrote2 = update_json_file_in_place(&path, Some(SystemTime::UNIX_EPOCH), |root| {
             root["tokens"]["access_token"] = serde_json::json!("should-not-write");
             Ok(())
@@ -229,10 +199,8 @@ mod tests {
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(v["claudeAiOauth"]["accessToken"], "newacc");
         assert_eq!(v["claudeAiOauth"]["refreshToken"], "newref");
-        // expiresAt stays a NUMBER (ms), not a string.
         assert_eq!(v["claudeAiOauth"]["expiresAt"], 1783108188604i64);
         assert!(v["claudeAiOauth"]["expiresAt"].is_number());
-        // Preserved siblings.
         assert_eq!(v["claudeAiOauth"]["subscriptionType"], "max");
         assert_eq!(v["claudeAiOauth"]["rateLimitTier"], "t");
         assert_eq!(v["designOauth"]["accessToken"], "design");

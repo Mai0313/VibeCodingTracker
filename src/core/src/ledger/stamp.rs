@@ -13,16 +13,12 @@ use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Whether `provider`'s read stamp includes sidecar files beyond the discovered
-/// session file itself.
+/// Returns whether `provider`'s read stamp includes sidecar files beyond the discovered session file.
 pub(crate) const fn has_sidecars(provider: ExtensionType) -> bool {
     matches!(provider, ExtensionType::Grok | ExtensionType::Antigravity)
 }
 
-/// The files a session log's parse depends on: the log itself, stamped from
-/// the metadata discovery already read, plus, for Grok, the sidecars the
-/// parser reads beside it, and for Antigravity the conversation database its
-/// model map comes from.
+/// Builds the dependency stamp map for a discovered session file, including Grok sidecars and Antigravity's conversation database when applicable.
 pub(crate) fn file_source(
     file: &DiscoveredFile,
     provider: ExtensionType,
@@ -55,7 +51,7 @@ pub(crate) fn file_source(
     Ok(files)
 }
 
-/// A SQLite database and its optional WAL.
+/// Builds the dependency stamp map for a SQLite database and its optional `-wal` file.
 pub(crate) fn sqlite_source(db_path: &Path) -> Result<TinyMap<String, Option<FileStamp>>> {
     let mut files = TinyMap::new();
     files.insert(name_of(db_path), Some(required_stamp(db_path)?));
@@ -64,11 +60,7 @@ pub(crate) fn sqlite_source(db_path: &Path) -> Result<TinyMap<String, Option<Fil
     Ok(files)
 }
 
-/// Adds an already-fingerprinted dependency to `files`.
-///
-/// Cursor's model attribution comes from a tracking database read once per
-/// scan; the fingerprint captured around that read is what goes into every
-/// store's stamp, so a store can never pair model map A with fingerprint B.
+/// Inserts a pre-captured [`DatabaseFingerprint`] (database and optional `-wal`) into `files`, binding the stamp to the exact snapshot read.
 pub(crate) fn add_dependency(
     files: &mut TinyMap<String, Option<FileStamp>>,
     db_path: &Path,
@@ -99,8 +91,7 @@ pub(crate) fn add_dependency(
     }
 }
 
-/// The snapshot fingerprint a usage scan stamps its entries with; `None` when
-/// the scan classifies nothing (no snapshot, or one with no boundaries).
+/// Returns the 16-hex-char fingerprint for `tiers`, or `None` when no tier boundaries are present.
 pub(crate) fn tiers_fingerprint(tiers: Option<&TierThresholds>) -> Option<String> {
     tiers
         .map(TierThresholds::fingerprint)
@@ -143,8 +134,7 @@ fn format_modified(time: SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
 
-/// Compares `time` against a stored RFC 3339 nanosecond stamp without heap
-/// allocation for normal post-epoch timestamps.
+/// Returns whether `time` matches the RFC 3339 nanosecond timestamp `expected`, avoiding heap allocation for timestamps in `1970..=9999`.
 pub(crate) fn modified_matches(time: SystemTime, expected: &str) -> bool {
     if let Some(bytes) = format_modified_ascii(time) {
         return expected.as_bytes() == bytes;
@@ -153,8 +143,7 @@ pub(crate) fn modified_matches(time: SystemTime, expected: &str) -> bool {
         == expected
 }
 
-/// Formats `1970-01-01T00:00:00.000000000Z` through
-/// `9999-12-31T23:59:59.999999999Z` onto the stack.
+/// Formats UTC timestamps from `1970-01-01T00:00:00.000000000Z` through `9999-12-31T23:59:59.999999999Z` onto the stack.
 fn format_modified_ascii(time: SystemTime) -> Option<[u8; 30]> {
     const MAX_YEAR_9999_SECS: u64 = 253_402_300_799;
     let duration = time.duration_since(UNIX_EPOCH).ok()?;

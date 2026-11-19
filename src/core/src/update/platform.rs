@@ -1,9 +1,6 @@
-//! Platform-specific pieces of the self-updater.
+//! Platform-specific asset naming and executable replacement for the self-updater.
 //!
-//! Derives the release asset file name for the host `(os, arch)` and performs
-//! the OS-specific binary swap. Unix can rename over the running executable;
-//! Windows cannot, so it stages the new binary and launches a quiet helper that
-//! finishes the replacement after the process exits.
+//! Maps `(os, arch)` to release asset names and performs the OS-specific binary swap: an atomic rename on Unix, or a staged file plus detached PowerShell helper that completes replacement after exit on Windows.
 
 use anyhow::{Context, Result};
 use std::env;
@@ -15,20 +12,18 @@ use std::io::Write;
 #[cfg(windows)]
 use std::process::Stdio;
 
-/// Builds the release asset file name for the current platform and `version`.
+/// Returns the release asset file name for the current host and `version`.
 ///
-/// Maps the running OS and `env::consts::ARCH` to the release naming scheme
-/// (`x86_64` → `x64`, `aarch64` → `arm64`; Linux assets are `-gnu.tar.gz`,
-/// macOS `.tar.gz`, Windows `.zip`).
+/// Maps `env::consts::ARCH` (`x86_64` to `x64`, `aarch64` to `arm64`) and `env::consts::OS` (`linux` as `-gnu.tar.gz`, `macos` as `.tar.gz`, `windows` as `.zip`).
 ///
 /// # Errors
 ///
-/// Returns an error if the host OS is not one of linux, macos, or windows.
+/// Returns an error if the host OS is not `linux`, `macos`, or `windows`.
 pub fn get_asset_pattern(version: &str) -> Result<String> {
     get_asset_pattern_for(version, env::consts::OS, env::consts::ARCH)
 }
 
-/// Builds the release asset file name for an explicit `(os, arch)` pair.
+/// Returns the release asset file name for an explicit `(os, arch)` pair.
 pub(crate) fn get_asset_pattern_for(version: &str, os: &str, arch: &str) -> Result<String> {
     let arch_name = match arch {
         "x86_64" => "x64",
@@ -54,15 +49,13 @@ pub(crate) fn get_asset_pattern_for(version: &str, os: &str, arch: &str) -> Resu
     Ok(pattern)
 }
 
-/// Copies `new_binary` into an executable sibling staging file on Unix.
+/// Copies `new_binary` into an executable sibling staging file in `current_exe`'s directory on Unix.
 ///
-/// The downloaded candidate may live on a `noexec` temporary filesystem, so
-/// validation must run from this sibling file before it is committed.
+/// Staging beside `current_exe` avoids executing candidates from a `noexec` temporary filesystem and ensures [`commit_update_unix`] renames within one filesystem.
 ///
 /// # Errors
 ///
-/// Returns an error if the sibling staging file cannot be created, copied,
-/// assigned the candidate permissions, or synced.
+/// Returns an error if `current_exe` has no parent directory, or if creating, copying, setting permissions on, or syncing the staging file fails.
 #[cfg(unix)]
 pub fn stage_update_unix(current_exe: &Path, new_binary: &Path) -> Result<tempfile::TempPath> {
     let parent = current_exe
@@ -84,11 +77,11 @@ pub fn stage_update_unix(current_exe: &Path, new_binary: &Path) -> Result<tempfi
     Ok(staged.into_temp_path())
 }
 
-/// Atomically commits a validated Unix sibling staging file.
+/// Atomically replaces `current_exe` with a validated Unix sibling staging file.
 ///
 /// # Errors
 ///
-/// Returns an error if the single rename over `current_exe` fails.
+/// Returns an error if renaming `staged` over `current_exe` fails.
 #[cfg(unix)]
 pub fn commit_update_unix(current_exe: &Path, staged: tempfile::TempPath) -> Result<()> {
     fs::rename(&staged, current_exe)
@@ -97,18 +90,13 @@ pub fn commit_update_unix(current_exe: &Path, staged: tempfile::TempPath) -> Res
     Ok(())
 }
 
-/// Stages `new_binary` and starts a quiet helper to finish the swap on Windows.
+/// Stages `new_binary` and launches a hidden PowerShell helper to finish replacing `current_exe` on Windows.
 ///
-/// Windows will not let a running executable be replaced. The PowerShell helper
-/// waits for this process to exit, acquires the updater's exclusive lock,
-/// refuses to replace a newer installed version, retries the replacement while
-/// another process still has the executable open, and then deletes itself. The
-/// command already in progress is not relaunched.
+/// The helper waits for this process to exit, acquires the exclusive lock at `lock_path`, skips replacement if the installed version is newer than `expected_version`, retries while the executable is held open, and deletes itself afterward.
 ///
 /// # Errors
 ///
-/// Returns an error if the sibling staging/helper files cannot be created or if
-/// the helper process cannot be started.
+/// Returns an error if `current_exe` has no parent directory, if staging or helper files cannot be created or synced, or if the helper process fails to spawn.
 #[cfg(windows)]
 pub fn perform_update_windows(
     current_exe: &Path,

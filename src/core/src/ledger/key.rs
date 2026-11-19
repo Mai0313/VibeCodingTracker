@@ -1,21 +1,11 @@
-//! Stable session identity per provider.
+//! Stable, path-independent session keys per provider.
 //!
-//! A ledger entry has to survive the source moving and the home directory
-//! changing, and two machines' ledgers have to be mergeable by key, so a key
-//! never carries an absolute path.
+//! Keys never contain absolute paths, allowing entries to survive home-directory changes and cross-machine ledger merges.
 
 use crate::models::ExtensionType;
 use std::path::Path;
 
-/// The ledger key of a session log found under one of `roots`.
-///
-/// Every provider keys on the path relative to its session root, with `/` as
-/// the separator on every platform. Codex keys on the bare file name instead:
-/// archiving moves a rollout log from the dated `sessions/` tree into the flat
-/// `archived_sessions/` root under the same name, and the name is already
-/// what cross-root deduplication treats as the session's identity, so keying
-/// on it is what keeps the move from reading as one session gone and another
-/// one new.
+/// Returns the ledger key for `path` under `roots`: the bare file name for [`ExtensionType::Codex`] (invariant across `sessions/` and `archived_sessions/`), and a `/`-separated path relative to `roots` for all other providers.
 pub(crate) fn session_key(provider: ExtensionType, roots: &[&Path], path: &Path) -> String {
     if provider == ExtensionType::Codex {
         return file_name(path);
@@ -23,10 +13,7 @@ pub(crate) fn session_key(provider: ExtensionType, roots: &[&Path], path: &Path)
     relative_key(roots, path)
 }
 
-/// `path` relative to the first of `roots` that contains it, `/`-separated.
-///
-/// Falls back to the file name when no root contains it, which discovery never
-/// produces (every path it returns was found under one of them).
+/// Returns `path` relative to the first matching root in `roots` using `/` separators, falling back to the file name if no root matches.
 pub(crate) fn relative_key(roots: &[&Path], path: &Path) -> String {
     roots
         .iter()

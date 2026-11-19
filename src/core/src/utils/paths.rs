@@ -1,27 +1,22 @@
-//! Filesystem path resolution: the per-provider session directories under the
-//! user's home, the tool's own cache directory, and the dated pricing-cache
-//! file naming scheme.
+//! Filesystem path resolution for provider session roots, credentials, and `~/.vct` cache files.
 
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-/// Resolved on-disk locations for every provider's session logs plus the
-/// tool's cache directory.
+/// Resolved on-disk locations for provider session logs, databases, and the `~/.vct` cache directory.
 ///
-/// Construct one with [`resolve_paths`] or [`resolve_paths_from_home`]; no
-/// field is checked for existence.
+/// Constructed with [`resolve_paths`] or [`resolve_paths_from_home`]; no path is checked for existence.
 #[derive(Debug, Clone)]
 pub struct HelperPaths {
-    /// The user's home directory, the root for every other path.
+    /// User's home directory, the base for home-relative default paths.
     pub home_dir: PathBuf,
     /// Codex root (`~/.codex`).
     pub codex_dir: PathBuf,
     /// Codex active session logs (`~/.codex/sessions`).
     pub codex_session_dir: PathBuf,
-    /// Codex archived session logs (`~/.codex/archived_sessions`); see
-    /// [`HelperPaths::codex_session_dirs`].
+    /// Codex archived session logs (`~/.codex/archived_sessions`); see [`HelperPaths::codex_session_dirs`].
     pub codex_archived_session_dir: PathBuf,
     /// Claude Code root (`~/.claude`).
     pub claude_dir: PathBuf,
@@ -31,16 +26,11 @@ pub struct HelperPaths {
     pub copilot_dir: PathBuf,
     /// Copilot CLI session state (`~/.copilot/session-state`).
     pub copilot_session_dir: PathBuf,
-    /// Cursor CLI config root (`$XDG_CONFIG_HOME/cursor` or `~/.config/cursor`),
-    /// holding the quota panel's OAuth credentials. Cursor's session data lives
-    /// elsewhere, under `~/.cursor`.
+    /// Cursor CLI config root (`$XDG_CONFIG_HOME/cursor` or `~/.config/cursor`), holding OAuth credentials; session data lives under `~/.cursor`.
     pub cursor_dir: PathBuf,
-    /// Cursor AI-code tracking database (`~/.cursor/ai-tracking/ai-code-tracking.db`),
-    /// mapping each conversation to its model for both `usage` and `analysis`.
+    /// Cursor AI-code tracking database (`~/.cursor/ai-tracking/ai-code-tracking.db`), mapping conversations to models.
     pub cursor_tracking_db: PathBuf,
-    /// Cursor chat session stores root (`~/.cursor/chats`), one
-    /// `chats/<projectHash>/<conversationId>/store.db` SQLite blob store per
-    /// conversation.
+    /// Cursor chat stores root (`~/.cursor/chats`), containing `<projectHash>/<conversationId>/store.db` SQLite stores.
     pub cursor_chats_dir: PathBuf,
     /// Gemini CLI root (`~/.gemini`).
     pub gemini_dir: PathBuf,
@@ -54,39 +44,33 @@ pub struct HelperPaths {
     pub dsh_dir: PathBuf,
     /// DeepSeek Harness session logs (`$DSH_HOME/sessions` or `~/.dsh/sessions`).
     pub dsh_session_dir: PathBuf,
-    /// Antigravity conversation roots: `~/.gemini/{antigravity-cli,antigravity,jetski}/brain`,
-    /// written by the `agy` CLI, the Desktop app and other builds in the same layout.
+    /// Antigravity conversation roots under `~/.gemini/*/brain`, written by the `agy` CLI, the Desktop app, and another build in the same layout.
     pub antigravity_brain_dirs: [PathBuf; 3],
     /// OpenCode data root (`$XDG_DATA_HOME/opencode` or `~/.local/share/opencode`).
     pub opencode_dir: PathBuf,
     /// OpenCode SQLite database (`<opencode_dir>/opencode.db`).
     pub opencode_db: PathBuf,
-    /// Hermes SQLite database (`state.db` under `$HERMES_HOME`, else
-    /// `%LOCALAPPDATA%\hermes` on Windows / `~/.hermes` elsewhere).
+    /// Hermes SQLite database (`state.db` under `$HERMES_HOME`, `%LOCALAPPDATA%\hermes` on Windows, or `~/.hermes` elsewhere).
     pub hermes_db: PathBuf,
     /// This tool's cache directory (`~/.vct`).
     pub cache_dir: PathBuf,
 }
 
 impl HelperPaths {
-    /// Every directory that can hold a Codex rollout log, active root first.
+    /// Returns the Codex rollout log roots, active root first.
     ///
-    /// Archiving moves a log from the dated `sessions/YYYY/MM/DD/` tree into the
-    /// flat `archived_sessions/`, so both must be scanned. The order is
-    /// load-bearing: a discovery walk drops a rollout file name it already found
-    /// under an earlier root, so a scan racing the move counts the session once.
+    /// Discovery deduplicates across roots by file name, preferring earlier roots when a log appears in both `sessions/` and `archived_sessions/`.
     pub fn codex_session_dirs(&self) -> [&Path; 2] {
         [&self.codex_session_dir, &self.codex_archived_session_dir]
     }
 
-    /// Every Antigravity conversation root, as discovery walks them.
+    /// Returns all Antigravity conversation roots in discovery order.
     pub fn antigravity_session_dirs(&self) -> [&Path; 3] {
         self.antigravity_brain_dirs.each_ref().map(PathBuf::as_path)
     }
 }
 
-/// Builds a [`HelperPaths`] from the current user's home directory and the
-/// provider home / XDG environment variables.
+/// Returns a [`HelperPaths`] resolved from the current user's home directory and provider/XDG environment variables.
 ///
 /// None of the returned paths are checked for existence.
 ///
@@ -97,8 +81,7 @@ pub fn resolve_paths() -> Result<HelperPaths> {
     let home_dir =
         home::home_dir().ok_or_else(|| anyhow::anyhow!("Unable to resolve user home directory"))?;
 
-    // A relative XDG value is treated as unset, so both fall back to the
-    // home-relative default.
+    // Treat relative XDG values as unset per the XDG Base Directory spec.
     let xdg_config = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute());
@@ -109,8 +92,7 @@ pub fn resolve_paths() -> Result<HelperPaths> {
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty());
     let grok_home = resolve_grok_home(&home_dir, grok_home_env.as_deref());
-    // A whitespace-only `DSH_HOME` counts as unset, matching `dsh`'s own
-    // `resolveDshHome`.
+    // Treat whitespace-only `DSH_HOME` as unset, matching `dsh`'s `resolveDshHome`.
     let dsh_home_env = std::env::var_os("DSH_HOME")
         .map(PathBuf::from)
         .filter(|p| !p.to_string_lossy().trim().is_empty());
@@ -153,12 +135,7 @@ fn resolve_grok_home(home_dir: &Path, grok_home: Option<&Path>) -> PathBuf {
         .unwrap_or_else(|| home_dir.join(".grok"))
 }
 
-/// Resolves the Hermes home directory the way Hermes's own `get_hermes_home`
-/// does: `hermes_home` if given, else `<local_appdata>\hermes` when
-/// `is_windows` (`~/AppData/Local/hermes` without one), else `~/.hermes`.
-///
-/// Environment values are injected rather than read here so the platform
-/// branch stays testable on one host.
+/// Resolves the Hermes home directory (`hermes_home`, else `<local_appdata>\hermes` or `~/AppData/Local/hermes` on Windows, else `~/.hermes`).
 fn resolve_hermes_home(
     home_dir: &Path,
     hermes_home: Option<&Path>,
@@ -177,22 +154,14 @@ fn resolve_hermes_home(
     home_dir.join(".hermes")
 }
 
-/// Builds a [`HelperPaths`] rooted at an explicit home directory, reading no
-/// environment variable.
+/// Returns a [`HelperPaths`] rooted at `home_dir` without reading environment variables.
 ///
-/// Every provider takes its home-relative default (`~/.config/cursor`,
-/// `~/.local/share/opencode`, `~/.hermes`, `~/.grok`, `~/.dsh`), which is what
-/// [`resolve_paths`] falls back to with none of the env vars set — except on
-/// Windows, where it puts Hermes under `%LOCALAPPDATA%` instead. This is the
-/// seam tests use to point every path at a temp directory instead of mutating
-/// process-global `HOME` / `XDG_*` state.
+/// Every provider takes its `home_dir`-relative default (`~/.config/cursor`, `~/.local/share/opencode`, `~/.hermes`, `~/.grok`, `~/.dsh`).
 pub fn resolve_paths_from_home(home_dir: &Path) -> HelperPaths {
     build_paths(home_dir, None, None, None, None, None)
 }
 
-/// Pure path composition shared by [`resolve_paths`] and
-/// [`resolve_paths_from_home`]. Every `None` argument falls back to the
-/// corresponding `home_dir`-relative default.
+/// Composes [`HelperPaths`] from `home_dir`, substituting home-relative defaults for any `None` override.
 fn build_paths(
     home_dir: &Path,
     xdg_config: Option<&Path>,
@@ -207,16 +176,12 @@ fn build_paths(
     let claude_dir = home_dir.join(".claude");
     let claude_session_dir = claude_dir.join("projects");
     let copilot_dir = home_dir.join(".copilot");
-    // Each session is a `session-state/<sessionId>/` directory holding the
-    // event log plus snapshot/checkpoint siblings; picking only `events.jsonl`
-    // out of it is `is_copilot_session_file`'s job, not this root's.
     let copilot_session_dir = copilot_dir.join("session-state");
     let cursor_dir = xdg_config
         .map(Path::to_path_buf)
         .unwrap_or_else(|| home_dir.join(".config"))
         .join("cursor");
-    // Cursor session data is not under the config dir above: it lives in
-    // `~/.cursor`, and follows no XDG variable.
+    // Cursor session data lives under `~/.cursor` and ignores XDG variables.
     let cursor_data_dir = home_dir.join(".cursor");
     let cursor_tracking_db = cursor_data_dir
         .join("ai-tracking")
@@ -267,21 +232,16 @@ fn build_paths(
     }
 }
 
-/// Whether `VCT_OFFLINE` is set to a non-empty value.
+/// Returns whether `VCT_OFFLINE` is set to a non-empty value.
 ///
-/// The pricing fetch degrades to today's cache or an empty map, and every
-/// update path skips the GitHub probe — the startup hook, `--check`, the
-/// interactive prompt and `--force` alike. The quota fetchers do not consult
-/// this.
+/// When true, pricing fetches degrade to cache or an empty map and update checks skip GitHub; quota fetchers do not consult this flag.
 pub fn network_disabled() -> bool {
     std::env::var_os("VCT_OFFLINE").is_some_and(|v| !v.is_empty())
 }
 
-/// Returns the current username from the environment.
+/// Returns the current username from the environment, memoized on first call.
 ///
-/// Reads `USER`, falling back to `USERNAME` (Windows), and finally to the
-/// literal `"unknown"`. Memoized on first call, so a later change to those
-/// variables is not observed.
+/// Reads `USER`, then `USERNAME`, falling back to `"unknown"`. Subsequent environment changes are not observed.
 pub fn get_current_user() -> String {
     static CACHE: OnceLock<String> = OnceLock::new();
     CACHE
@@ -302,9 +262,7 @@ fn get_home_dir() -> Result<PathBuf> {
 
 /// Returns a machine identifier, memoized on first call.
 ///
-/// Reads `/etc/machine-id`, falling back to the hostname and then to the
-/// literal `"unknown-machine-id"`, so it is stable per process but not
-/// guaranteed unique across hosts.
+/// Reads `/etc/machine-id`, then the system hostname, falling back to `"unknown-machine-id"`.
 pub fn get_machine_id() -> &'static str {
     MACHINE_ID_CACHE.get_or_init(|| {
         if let Ok(id) = std::fs::read_to_string("/etc/machine-id") {
@@ -321,13 +279,11 @@ pub fn get_machine_id() -> &'static str {
     })
 }
 
-/// Returns the tool's cache directory (`~/.vct`), creating it (and any missing
-/// parents) if it does not already exist.
+/// Returns `~/.vct`, creating it and any missing parent directories if absent.
 ///
 /// # Errors
 ///
-/// Returns an error if the home directory cannot be determined or if the
-/// cache directory cannot be created.
+/// Returns an error if the home directory cannot be determined or the directory cannot be created.
 pub fn get_cache_dir() -> Result<PathBuf> {
     let home_dir = get_home_dir()?;
     let cache_dir = home_dir.join(".vct");
@@ -339,8 +295,7 @@ pub fn get_cache_dir() -> Result<PathBuf> {
     Ok(cache_dir)
 }
 
-/// Returns `~/.vct/model_pricing_<date>.json`, where `date` is a `YYYY-MM-DD`
-/// string, creating `~/.vct` if missing.
+/// Returns `~/.vct/model_pricing_<date>.json` (`date` as `YYYY-MM-DD`), creating `~/.vct` if absent.
 ///
 /// # Errors
 ///
@@ -349,20 +304,12 @@ pub fn get_pricing_cache_path(date: &str) -> Result<PathBuf> {
     Ok(get_pricing_cache_path_in(&get_cache_dir()?, date))
 }
 
-/// Returns `<dir>/model_pricing_<date>.json`.
-///
-/// The env-free counterpart of [`get_pricing_cache_path`]: pure composition,
-/// touching neither the home directory nor the filesystem.
+/// Returns `<dir>/model_pricing_<date>.json` without reading the environment or touching the filesystem.
 pub fn get_pricing_cache_path_in(dir: &Path, date: &str) -> PathBuf {
     dir.join(format!("model_pricing_{}.json", date))
 }
 
-/// Returns a provider's quota cache path (`~/.vct/quota/<provider>.json`),
-/// creating `~/.vct` if missing.
-///
-/// One file per provider, the same shape as the session ledger's
-/// `~/.vct/sessions/<provider>.json`: each is written by exactly one quota
-/// worker, so the blind overwrite in [`crate::quota::cache`] needs no locking.
+/// Returns `~/.vct/quota/<provider>.json`, creating `~/.vct` if absent.
 ///
 /// # Errors
 ///
@@ -373,8 +320,7 @@ pub fn get_quota_cache_path(provider: &str) -> Result<PathBuf> {
         .join(format!("{provider}.json")))
 }
 
-/// Returns the persistent settings file path (`~/.vct/config.toml`), creating
-/// `~/.vct` if missing.
+/// Returns `~/.vct/config.toml`, creating `~/.vct` if absent.
 ///
 /// # Errors
 ///
@@ -383,13 +329,9 @@ pub fn get_config_path() -> Result<PathBuf> {
     Ok(get_cache_dir()?.join("config.toml"))
 }
 
-/// Returns a version record path (`~/.vct/version/<provider>.json`), creating
-/// `~/.vct` if missing.
+/// Returns `~/.vct/version/<provider>.json`, creating `~/.vct` if absent.
 ///
-/// The five provider entries hold the installed CLI's version, detected for the
-/// User-Agents in [`crate::quota`]; `vct` holds this tool's own update-check
-/// record, whose `last_checked_at` throttles the startup check to one per UTC
-/// date.
+/// Provider entries cache detected CLI versions; `"vct"` stores the self-update check throttle record.
 ///
 /// # Errors
 ///
@@ -398,17 +340,14 @@ pub fn get_version_cache_path(provider: &str) -> Result<PathBuf> {
     Ok(get_version_cache_path_in(&get_cache_dir()?, provider))
 }
 
-/// Returns `<dir>/version/<provider>.json`.
-///
-/// The env-free counterpart of [`get_version_cache_path`]: pure composition,
-/// touching neither the home directory nor the filesystem.
+/// Returns `<dir>/version/<provider>.json` without reading the environment or touching the filesystem.
 pub fn get_version_cache_path_in(dir: &Path, provider: &str) -> PathBuf {
     dir.join("version").join(format!("{provider}.json"))
 }
 
 /// Returns the Copilot CLI config path (`~/.copilot/config.json`).
 ///
-/// The file is JSONC, so a caller must strip comments before parsing it.
+/// The file uses JSONC and requires comment stripping before JSON parsing.
 ///
 /// # Errors
 ///
@@ -417,8 +356,7 @@ pub fn get_copilot_config_path() -> Result<PathBuf> {
     Ok(resolve_paths()?.copilot_dir.join("config.json"))
 }
 
-/// Returns the Cursor CLI OAuth credentials path
-/// (`$XDG_CONFIG_HOME/cursor/auth.json` or `~/.config/cursor/auth.json`).
+/// Returns the Cursor CLI OAuth credentials path (`$XDG_CONFIG_HOME/cursor/auth.json` or `~/.config/cursor/auth.json`).
 ///
 /// # Errors
 ///
@@ -427,8 +365,7 @@ pub fn get_cursor_auth_path() -> Result<PathBuf> {
     Ok(resolve_paths()?.cursor_dir.join("auth.json"))
 }
 
-/// Returns the Grok CLI OAuth credentials path
-/// (`$GROK_HOME/auth.json` or `~/.grok/auth.json`).
+/// Returns the Grok CLI OAuth credentials path (`$GROK_HOME/auth.json` or `~/.grok/auth.json`).
 ///
 /// # Errors
 ///
@@ -437,11 +374,9 @@ pub fn get_grok_auth_path() -> Result<PathBuf> {
     Ok(resolve_paths()?.grok_dir.join("auth.json"))
 }
 
-/// Returns the agy CLI's fallback sign-in file
-/// (`~/.gemini/antigravity-cli/antigravity-oauth-token`).
+/// Returns the `agy` CLI fallback sign-in file (`~/.gemini/antigravity-cli/antigravity-oauth-token`).
 ///
-/// On Windows and macOS agy stores its sign-in in the OS credential store
-/// instead unless that store is unavailable.
+/// On Windows and macOS, `agy` uses the OS credential store unless unavailable.
 ///
 /// # Errors
 ///
@@ -462,49 +397,44 @@ pub fn get_claude_credentials_path() -> Result<PathBuf> {
     Ok(resolve_paths()?.claude_dir.join(".credentials.json"))
 }
 
-/// Returns the pricing cache path for `date` only if that file exists.
+/// Returns `~/.vct/model_pricing_<date>.json` if that file exists.
 ///
-/// Yields `None` when the file is absent or when the cache directory cannot
-/// be resolved.
+/// Creates `~/.vct` if absent. Returns `None` if the file does not exist or the cache directory cannot be resolved.
 pub fn find_pricing_cache_for_date(date: &str) -> Option<PathBuf> {
     find_pricing_cache_for_date_in(&get_cache_dir().ok()?, date)
 }
 
-/// Returns the pricing cache path for `date` under an explicit cache dir, only
-/// if that file exists.
-///
-/// The env-free counterpart of [`find_pricing_cache_for_date`].
+/// Returns `<dir>/model_pricing_<date>.json` if that file exists, without reading the environment.
 pub fn find_pricing_cache_for_date_in(dir: &Path, date: &str) -> Option<PathBuf> {
     let cache_path = get_pricing_cache_path_in(dir, date);
     cache_path.exists().then_some(cache_path)
 }
 
-/// Lists every `model_pricing_*.json` file in the cache directory as a
-/// `(file name, full path)` pair; an unreadable directory yields an empty
-/// `Vec` rather than an error.
+/// Returns `(file_name, path)` pairs for all `model_pricing_*.json` files in `~/.vct`.
+///
+/// Creates `~/.vct` if absent. An unreadable directory yields an empty `Vec`.
 ///
 /// # Errors
 ///
-/// Returns an error only if the cache directory cannot be resolved or created.
+/// Returns an error if the cache directory cannot be resolved or created.
 pub fn list_pricing_cache_files() -> Result<Vec<(String, PathBuf)>> {
     Ok(list_pricing_cache_files_in(&get_cache_dir()?))
 }
 
-/// Lists every `model_pricing_*.json` file in an explicit cache dir.
+/// Returns `(file_name, path)` pairs for all `model_pricing_*.json` files in `dir`.
 ///
-/// The env-free counterpart of [`list_pricing_cache_files`]; a missing or
-/// unreadable directory yields an empty `Vec`.
+/// A missing or unreadable `dir` yields an empty `Vec`.
 pub fn list_pricing_cache_files_in(dir: &Path) -> Vec<(String, PathBuf)> {
     let mut cache_files = Vec::new();
 
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-                // Match pattern: model_pricing_YYYY-MM-DD.json
-                if filename.starts_with("model_pricing_") && filename.ends_with(".json") {
-                    cache_files.push((filename.to_string(), path));
-                }
+            if let Some(filename) = path.file_name().and_then(|n| n.to_str())
+                && filename.starts_with("model_pricing_")
+                && filename.ends_with(".json")
+            {
+                cache_files.push((filename.to_string(), path));
             }
         }
     }
@@ -562,8 +492,7 @@ mod tests {
         assert!(p.opencode_dir.ends_with("opencode"));
         assert_eq!(p.hermes_db, home.join(".hermes").join("state.db"));
 
-        // Cursor config dir uses the non-XDG default (`~/.config/cursor`); its
-        // session data lives under `~/.cursor`.
+        // Cursor config dir uses `~/.config/cursor`; session data lives under `~/.cursor`.
         assert_eq!(p.cursor_dir, home.join(".config").join("cursor"));
         assert!(p.cursor_tracking_db.ends_with("ai-code-tracking.db"));
         assert!(p.cursor_chats_dir.ends_with("chats"));
@@ -657,7 +586,6 @@ mod tests {
 
     #[test]
     fn resolve_paths_succeeds_on_the_running_host() {
-        // Sanity: production resolution works wherever HOME is set (dev + CI).
         assert!(resolve_paths().is_ok());
     }
 

@@ -1,16 +1,6 @@
-//! Self-update: replace the running binary from the matching GitHub release.
+//! Self-updater that replaces the running binary from GitHub Releases.
 //!
-//! The flow is: resolve the current host's `(os, arch)` pair, fetch the latest
-//! GitHub Releases tag, pick the asset whose name matches that pair, download
-//! and extract it (zip on Windows, tar.gz elsewhere), then swap it over the
-//! current executable — an atomic rename on Unix, a post-exit helper on
-//! Windows. [`check_update`] is a read-only probe; [`update_interactive`] is
-//! the entry point the `vct update` subcommand calls.
-//!
-//! Submodules: `github` (Releases API + download), `archive` (extraction with
-//! path-traversal guards), `lock` (cross-process serialization), `platform`
-//! (asset-name derivation and the OS-specific binary swap), and `version_cache`
-//! (daily check cadence).
+//! [`check_update`] probes for a newer release without installing; [`perform_update`], [`perform_force_update`], and [`update_interactive`] download, validate, and install the platform-matching release asset (atomic rename on Unix, post-exit PowerShell helper on Windows). [`maybe_auto_update`] runs a best-effort daily check gated by release-build and offline policies.
 
 mod archive;
 mod github;
@@ -69,12 +59,9 @@ enum InstallationDisposition {
 const CANDIDATE_VALIDATION_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_VERSION_OUTPUT_BYTES: u64 = 256;
 
-/// Strips git metadata from a `BUILD_VERSION` string, leaving the base semver.
+/// Returns the portion of `build_version` before the first `-`, stripping any git or pre-release suffix.
 ///
-/// `BUILD_VERSION` may carry a `git describe` suffix such as
-/// `"0.1.6-5-g1234567-dirty"`; this returns just `"0.1.6"` by taking the text
-/// before the first `-`. A `v` prefix is *not* stripped — callers do that
-/// separately when comparing against a release tag.
+/// A leading `v` prefix is preserved.
 ///
 /// # Examples
 ///
@@ -88,15 +75,7 @@ pub fn extract_semver_version(build_version: &str) -> &str {
     build_version.split('-').next().unwrap_or(build_version)
 }
 
-/// Returns the running build's version as `(display string, parsed semver)`.
-///
-/// The display string is the raw [`crate::VERSION`] (with any git suffix); the
-/// parsed [`Version`] is the cleaned base version used for comparison.
-///
-/// # Errors
-///
-/// Returns an error if the base version extracted from [`crate::VERSION`] is
-/// not valid semver.
+/// Returns the running build's `(raw version string, parsed base semver)` from [`crate::VERSION`].
 fn get_current_version() -> Result<(String, Version)> {
     let full_version = crate::VERSION;
     let semver_str = extract_semver_version(full_version);
@@ -116,18 +95,7 @@ fn parse_latest_version(release: &GitHubRelease) -> Result<Version> {
     ))
 }
 
-/// Fetches the latest release and compares it against the running version.
-///
-/// Returns `Some((current_display, current, latest, release))` when the latest
-/// tag is strictly newer than the current version, or `None` when already up to
-/// date (also printing a short "already on latest" line in that case). The
-/// release tag's leading `v` is trimmed before parsing.
-///
-/// # Errors
-///
-/// Returns an error if the GitHub release fetch fails, if the current version
-/// cannot be parsed (see `get_current_version`), or if the release tag is not
-/// valid semver.
+/// Fetches the latest release, stamps the daily check cache, and returns `Some((current_display, current, latest, release))` if newer, or prints an up-to-date notice and returns `None`.
 fn get_version_comparison() -> Result<Option<(String, Version, Version, GitHubRelease)>> {
     let release =
         github::fetch_latest_release().context("Failed to fetch latest release information")?;
@@ -136,8 +104,7 @@ fn get_version_comparison() -> Result<Option<(String, Version, Version, GitHubRe
 
     let latest_version = parse_latest_version(&release)?;
 
-    // Recorded before the up-to-date early return, so a no-op check still
-    // stamps the daily cadence.
+    // Record before the up-to-date early return so a no-op check still stamps the daily cadence.
     let _ = version_cache::record_version_check(&latest_version.to_string());
 
     if latest_version <= current_version {
@@ -153,17 +120,13 @@ fn get_version_comparison() -> Result<Option<(String, Version, Version, GitHubRe
     )))
 }
 
-/// Probes for a newer release without installing anything.
+/// Checks GitHub for a newer release without installing it.
 ///
-/// Prints an "update available" line and returns `Some(tag_name)` when a newer
-/// release exists, or `None` when already current. This is the read-only path
-/// behind `vct update --check`. With `VCT_OFFLINE` set it returns `None`
-/// without contacting GitHub.
+/// Prints a notice and returns `Some(tag_name)` when a newer release exists, or `None` when already up to date or `VCT_OFFLINE` is set.
 ///
 /// # Errors
 ///
-/// Returns an error if the version comparison fails — i.e. the GitHub fetch or
-/// any version parse fails (see `get_version_comparison`).
+/// Returns an error if fetching the latest release fails or if either the current or latest version is not valid semver.
 pub fn check_update() -> Result<Option<String>> {
     if crate::utils::network_disabled() {
         return Ok(None);
@@ -181,9 +144,7 @@ pub fn check_update() -> Result<Option<String>> {
     }
 }
 
-/// Downloads and extracts the latest release binary for a POSIX `(os, arch)`
-/// target locally, then writes it as a single-file gzip stream in an anonymous
-/// rewound temporary file ready to pipe into a remote SSH bootstrap session.
+/// Downloads and extracts the latest release binary for a POSIX `(os, arch)` target, returning a rewound temporary file containing the single-file gzip stream.
 pub(crate) fn prepare_remote_binary_gzip_from(
     release_url: &str,
     os: &str,
@@ -248,19 +209,7 @@ pub(crate) fn prepare_remote_binary_gzip_from(
     Ok(gz_temp)
 }
 
-/// Downloads, extracts, and installs a specific `release`, no version check.
-///
-/// Selects the asset matching the current platform, downloads it into a unique
-/// temporary directory, checks its exact size, extracts it, and executes its
-/// bounded `--version` probe before swapping it over the running executable.
-/// Unix uses an atomic rename; Windows stages a post-exit helper.
-///
-/// # Errors
-///
-/// Returns an error if no release asset matches this `(os, arch)`, if the
-/// staging directory cannot be created, if the download size is wrong, if the
-/// archive is invalid, if the candidate cannot report the expected version
-/// within the timeout, or if replacing the binary fails.
+/// Downloads, extracts, validates (`--version`), and installs `release` over `current_exe` (atomic rename on Unix, post-exit helper on Windows).
 fn perform_installation_at(
     current_exe: &Path,
     latest_version: &Version,
@@ -453,18 +402,13 @@ fn install_and_report(
     Ok(())
 }
 
-/// Installs the latest release, but only if it is newer than the current one.
+/// Installs the latest release if it is newer than the running version.
 ///
-/// Returns `Ok(())` without doing anything when already up to date, or when
-/// `VCT_OFFLINE` is set — offline is a no-op rather than an error, and costs
-/// neither a request nor a lock file.
+/// Returns `Ok(())` without contacting GitHub or acquiring the lock when `VCT_OFFLINE` is set, and returns `Ok(())` when already up to date.
 ///
 /// # Errors
 ///
-/// Returns an error if the lock file beside the executable cannot be claimed
-/// (another update is running, or the directory is not writable), if the
-/// version comparison fails (GitHub fetch or version parse), or if the
-/// subsequent install fails (see `perform_installation_at`).
+/// Returns an error if the update lock beside the executable cannot be acquired, if fetching or parsing versions fails, or if downloading, extracting, validating, or replacing the binary fails.
 pub fn perform_update() -> Result<()> {
     if crate::utils::network_disabled() {
         return Ok(());
@@ -481,20 +425,13 @@ fn perform_update_unlocked() -> Result<()> {
     install_and_report(&current_version, &latest_version, &release)
 }
 
-/// Installs the latest release unconditionally, skipping the freshness check.
+/// Installs the latest release unconditionally, skipping the version freshness check.
 ///
-/// Always re-downloads and reinstalls the latest tag even when the current
-/// binary already matches it (useful for repairing a broken install). The one
-/// thing `force` does not override is `VCT_OFFLINE`: with it set this returns
-/// `Ok(())` without contacting GitHub or claiming the lock.
+/// Returns `Ok(())` without contacting GitHub or acquiring the lock when `VCT_OFFLINE` is set.
 ///
 /// # Errors
 ///
-/// Returns an error if the lock file beside the executable cannot be claimed
-/// (another update is running, or the directory is not writable), if the
-/// GitHub release fetch fails, if the current or latest version cannot be
-/// parsed, or if the install fails (see
-/// `perform_installation_at`, notably when no asset matches this platform).
+/// Returns an error if the update lock beside the executable cannot be acquired, if fetching or parsing versions fails, or if downloading, extracting, validating, or replacing the binary fails.
 pub fn perform_force_update() -> Result<()> {
     if crate::utils::network_disabled() {
         return Ok(());
@@ -534,10 +471,7 @@ fn acquire_update_lock_at(current_exe: &Path) -> Result<lock::UpdateLock> {
 
 /// Checks for and silently installs a newer release when policy allows.
 ///
-/// This is a best-effort hook for ordinary runs. It performs no work when
-/// disabled, offline, running a debug build, or already checked on the current
-/// UTC date. A failure is logged and reported as [`AutoUpdateOutcome::Failed`]
-/// so it can never disrupt the requested command or dashboard.
+/// Returns [`AutoUpdateOutcome::Skipped`] when `enabled` is false, `VCT_OFFLINE` is set, the binary is a debug build, another update holds the lock, or a check already ran on the current UTC date. Failures are logged and returned as [`AutoUpdateOutcome::Failed`].
 pub fn maybe_auto_update(enabled: bool) -> AutoUpdateOutcome {
     let offline = crate::utils::network_disabled();
     if !auto_update_allowed(enabled, offline, !cfg!(debug_assertions)) {
@@ -590,10 +524,7 @@ fn auto_update_with(
         return Ok(AutoUpdateOutcome::Skipped);
     }
 
-    // Claim today's attempt before the lock and before the network, so whatever
-    // stops this run — a lock another process holds, an install directory this
-    // user cannot write, a GitHub outage — is reported once rather than on every
-    // command until the next UTC date. The price is the check this run gives up.
+    // Record today's attempt before locking or hitting the network so lock contention, permission errors, or outages fail once per UTC date instead of on every command.
     version_cache::record_check_attempt_in(cache_dir, now)?;
 
     let Some(_lock) = lock::UpdateLock::try_acquire(lock_dir)? else {
@@ -620,26 +551,19 @@ fn auto_update_with(
     }
 }
 
-/// Runs the `vct update` flow, optionally prompting for confirmation.
+/// Runs the interactive update flow, prompting on stdin unless `force` is true.
 ///
-/// With `force` set, skips the freshness check and the prompt and reinstalls
-/// the latest release outright. Otherwise it checks for a newer version and,
-/// only if one exists, asks for `y`/`N` confirmation on stdin before
-/// installing — anything other than `y` cancels. With `VCT_OFFLINE` set
-/// neither path reaches GitHub.
+/// When `force` is true, reinstalls the latest release without checking freshness or prompting. Otherwise checks for a newer version and asks for `y`/`N` confirmation before installing; anything other than `y` cancels. Returns `Ok(())` without contacting GitHub when `VCT_OFFLINE` is set.
 ///
 /// # Errors
 ///
-/// Returns an error if the update check or install fails (network, version
-/// parse, asset selection, extraction, or binary swap), or if reading the
-/// confirmation from stdin fails.
+/// Returns an error if reading confirmation from stdin fails, or if the update check or installation fails.
 pub fn update_interactive(force: bool) -> Result<()> {
     println!("Checking for updates...");
 
     if force {
         perform_force_update()
     } else {
-        // Normal update: check version and prompt for confirmation
         if crate::utils::network_disabled() {
             return Ok(());
         }
@@ -666,14 +590,7 @@ pub fn update_interactive(force: bool) -> Result<()> {
     }
 }
 
-// `Command::spawn` copies the descriptor table into the child, and the copies
-// only close at the child's own `exec`. Until then the child pins whatever the
-// rest of the process had open: a write descriptor on a staged candidate, so
-// another thread's `execve` of it fails with `ETXTBSY`, and the update lock's
-// `flock`, which outlives its owner dropping it and makes the next claim report
-// contention. Both were seen as CI flakes (#224), so every test here and in
-// `lock` that can reach a spawn or claim the lock joins the `update_spawn`
-// serial group.
+// Every test that spawns a process or claims the update lock joins the `update_spawn` serial group: `Command::spawn` copies open descriptors into the child until `exec`, which can pin a staged candidate's write fd (`ETXTBSY`) or keep a dropped `flock` held across threads.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -996,8 +913,7 @@ mod tests {
         .unwrap();
         assert_eq!(outcome, AutoUpdateOutcome::Skipped);
 
-        // The losing run spent today's check, so a lock that has since been
-        // released is not retried until the next UTC date.
+        // The losing run spent today's check, so a lock that has since been released is not retried until the next UTC date.
         drop(lock);
         let second = auto_update_with(
             dir.path(),
@@ -1016,9 +932,7 @@ mod tests {
     #[serial(update_spawn)]
     fn unclaimable_lock_is_throttled_for_the_rest_of_the_day() {
         let dir = tempfile::tempdir().unwrap();
-        // A regular file where the install directory belongs: opening the lock
-        // inside it fails for every user, root included, unlike a directory
-        // made unwritable by its mode.
+        // A regular file where the install directory belongs: opening the lock inside it fails for every user, root included, unlike a directory made unwritable by its mode.
         let lock_dir = dir.path().join("not-a-directory");
         fs::write(&lock_dir, b"binary").unwrap();
         let now = "2026-07-30T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
@@ -1083,8 +997,7 @@ mod tests {
         );
 
         assert!(result.is_err());
-        // Today's claim precedes the lock's, so a failed one leaves the install
-        // directory untouched.
+        // Today's claim precedes the lock's, so a failed one leaves the install directory untouched.
         assert!(!lock::update_lock_path(root.path()).exists());
     }
 

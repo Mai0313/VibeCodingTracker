@@ -1,3 +1,5 @@
+//! Session-file discovery, provider path filters, and per-provider traversal depth bounds.
+
 use crate::constants::FastHashSet;
 use crate::ledger::key::session_key;
 use crate::models::{ExtensionType, TimeRange};
@@ -11,7 +13,7 @@ use walkdir::{DirEntry, WalkDir};
 
 /// A file matched during directory traversal, paired with its modification date.
 pub struct FileInfo {
-    /// Absolute path to the matched file.
+    /// Path to the matched file.
     pub path: PathBuf,
     /// Local modification date formatted as `YYYY-MM-DD`, used for grouping.
     pub modified_date: String,
@@ -23,7 +25,7 @@ pub struct FileInfo {
 
 /// A file matched during provider discovery, before formatting its local date.
 pub(crate) struct DiscoveredFile {
-    /// Absolute path to the matched file.
+    /// Path to the matched file.
     pub path: PathBuf,
     /// Modification timestamp at discovery time.
     pub modified: SystemTime,
@@ -63,18 +65,13 @@ pub(crate) struct CandidateDiscovery {
     pub failures: Vec<FileDiscoveryFailure>,
 }
 
-/// Recursively collects the files under `dir` that pass `filter_fn`, tagging
-/// each with its modification date.
+/// Recursively collects files under `dir` matching `filter_fn` within `time_range`.
 ///
-/// `filter_fn` decides whether a given path is included; `time_range` drops
-/// files whose modification date falls before its cutoff. Equivalent to
-/// [`collect_files_with_max_depth`] with no depth cap.
+/// Equivalent to [`collect_files_with_max_depth`] with `max_depth` set to `None`.
 ///
 /// # Errors
 ///
-/// Returns `Result` for caller ergonomics but never fails: a missing directory
-/// yields an empty list, and per-entry traversal or metadata failures are
-/// dropped by this wrapper.
+/// Never returns `Err`: a missing `dir` yields an empty `Vec`, and per-entry traversal or metadata failures are skipped.
 pub fn collect_files_with_dates<P, F>(
     dir: P,
     filter_fn: F,
@@ -87,19 +84,13 @@ where
     collect_files_with_max_depth(dir, filter_fn, time_range, None)
 }
 
-/// Same as [`collect_files_with_dates`] but with an optional traversal depth cap.
+/// Recursively collects files under `dir` matching `filter_fn` within `time_range`, bounded by `max_depth`.
 ///
-/// `max_depth` is counted from the root directory: `None` walks the whole
-/// tree, `Some(2)` only descends two levels. A caller that knows the exact
-/// nesting of the file it wants uses this to keep `WalkDir` out of large
-/// sibling subtrees that can never match; see [`COPILOT_SESSION_MAX_DEPTH`]
-/// for the shape that motivated it.
+/// `max_depth` counts levels below `dir` (`None` is unbounded; `Some(2)` descends at most two levels).
 ///
 /// # Errors
 ///
-/// Returns `Result` for caller ergonomics but never fails: a missing directory
-/// yields an empty list, and per-entry traversal or metadata failures are
-/// dropped by this wrapper.
+/// Never returns `Err`: a missing `dir` yields an empty `Vec`, and per-entry traversal or metadata failures are skipped.
 pub fn collect_files_with_max_depth<P, F>(
     dir: P,
     filter_fn: F,
@@ -148,7 +139,7 @@ where
         .cutoff_date()
         .map(|d| d.format("%Y-%m-%d").to_string());
 
-    // Pre-allocate Vec with estimated capacity (typical: 10-50 session files)
+    // Typical scans find 10-50 session files.
     let mut results = Vec::with_capacity(20);
     let mut failures = Vec::new();
 
@@ -174,12 +165,10 @@ where
 
         let path = entry.path();
 
-        // Apply filter
         if !filter_fn(path) {
             continue;
         }
 
-        // Get file modification time for date grouping
         let metadata = match entry.metadata() {
             Ok(metadata) => metadata,
             Err(error) => {
@@ -204,7 +193,6 @@ where
         let datetime: chrono::DateTime<chrono::Local> = modified.into();
         let date_key = datetime.format("%Y-%m-%d").to_string();
 
-        // Apply time range filter
         if let Some(ref cutoff_str) = cutoff
             && date_key.as_str() < cutoff_str.as_str()
         {
@@ -230,22 +218,7 @@ where
     }
 }
 
-/// Discovers matching files across every root one provider's sessions live in.
-///
-/// Roots are walked in order and their results concatenated, so a provider with
-/// a single root behaves exactly as [`collect_files_with_max_depth_diagnostics`]
-/// does. With more than one root, a session whose ledger key (`session_key`)
-/// was already found in an **earlier** root is dropped from a later one: Codex
-/// archives a session by moving its rollout log from `sessions/` to
-/// `archived_sessions/` under the same `rollout-<timestamp>-<uuid>.jsonl` name,
-/// and a scan that races that move would otherwise fold the same session twice.
-/// Codex keys on that file name; every other provider keys on the path relative
-/// to its root, so Antigravity's identically named transcripts stay apart unless
-/// two roots hold the same conversation directory.
-///
-/// Keys are compared only across roots, never within one. Each drop is logged
-/// at debug level so a wrong identity is diagnosable rather than a silently
-/// missing session.
+/// Discovers matching files within `time_range` across `dirs` in order, dropping sessions whose [`session_key`] was already seen in an earlier root.
 pub(crate) fn collect_provider_files_diagnostics<F>(
     dirs: &[&Path],
     provider: ExtensionType,
@@ -312,8 +285,7 @@ where
     discovery
 }
 
-/// Discovers every matching session file across `dirs` for a ledger scan,
-/// skipping eager local-date formatting and pruning companion output subtrees.
+/// Discovers matching files across `dirs` in order without formatting dates, pruning companion subtrees and deduplicating across roots by [`session_key`].
 pub(crate) fn collect_provider_candidates_diagnostics<F>(
     dirs: &[&Path],
     provider: ExtensionType,
@@ -381,10 +353,7 @@ fn sort_failures(failures: &mut [FileDiscoveryFailure]) {
 }
 
 fn should_descend(entry: &DirEntry, depth_offset: usize, provider: Option<ExtensionType>) -> bool {
-    // Claude Code writes large `<session>/tool-results/` companion directories
-    // holding raw tool output `.txt` files and zero session logs. Depth >= 2
-    // from the root keeps a project directory literally named `tool-results` at
-    // depth 1 walkable.
+    // Claude Code stores raw tool output under `<session>/tool-results/`; requiring depth >= 2 keeps a top-level project named `tool-results` walkable.
     !(provider == Some(ExtensionType::ClaudeCode)
         && entry.depth() + depth_offset >= 2
         && entry.file_type().is_dir()
@@ -493,9 +462,7 @@ where
     out
 }
 
-/// Splits the first two directory levels across Rayon so one huge project
-/// folder (`<root>/<project>/<session>/...`) does not serialize the scan onto
-/// one worker.
+/// Walks `dir` recursively, parallelizing the first two directory levels across Rayon.
 fn collect_candidates_at_depth<F>(
     dir: &Path,
     depth_offset: usize,
@@ -601,46 +568,25 @@ where
 
 /// Maximum traversal depth for Copilot CLI session scans.
 ///
-/// Copilot writes `~/.copilot/session-state/<sessionId>/events.jsonl`, so
-/// the event log is always exactly two directory levels below
-/// `session-state/`. Anything deeper belongs to companion subtrees
-/// (`rewind-snapshots/backups/`, `checkpoints/`, `files/`, `research/`) that
-/// hold no session log but can carry hundreds of files per session.
+/// Event logs sit at `<root>/<sessionId>/events.jsonl` (depth 2); deeper sibling subtrees (`rewind-snapshots/`, `checkpoints/`, `files/`, `research/`) contain no session logs.
 pub const COPILOT_SESSION_MAX_DEPTH: usize = 2;
 
 /// Maximum traversal depth for Grok CLI session scans.
 ///
-/// Grok writes `$GROK_HOME/sessions/<workspace>/<session>/signals.json`, so
-/// each signals file is exactly three levels below the sessions root.
+/// Signal files sit at `<root>/<workspace>/<session>/signals.json` (depth 3).
 pub const GROK_SESSION_MAX_DEPTH: usize = 3;
 
 /// Maximum traversal depth for DeepSeek Harness session scans.
 ///
-/// `dsh` writes `$DSH_HOME/sessions/<project>/<session>/session.jsonl.zstd`,
-/// so each log is exactly three levels below the sessions root.
+/// Session logs sit at `<root>/<project>/<session>/session.jsonl[.zstd]` (depth 3).
 pub const DSH_SESSION_MAX_DEPTH: usize = 3;
 
 /// Maximum traversal depth for Antigravity conversation scans.
 ///
-/// Each conversation's log sits at
-/// `brain/<conversation>/.system_generated/logs/transcript_full.jsonl`, four
-/// levels below the `brain` root; deeper siblings (`steps/<n>/`, `chunks/`)
-/// hold per-step output and are never logs.
+/// Transcript logs sit at `<root>/<conversation>/.system_generated/logs/transcript_full.jsonl` (depth 4); deeper siblings (`steps/`, `chunks/`) contain no logs.
 pub const ANTIGRAVITY_SESSION_MAX_DEPTH: usize = 4;
 
-/// Filter for Codex session files.
-///
-/// Codex writes `rollout-*.jsonl` files directly into the dated sub-folders of
-/// `~/.codex/sessions/YYYY/MM/DD/`, and keeps those names in the flat
-/// `~/.codex/archived_sessions/` root; both are scanned with this filter. We
-/// also accept `.json` defensively in case an older dump ever gets dropped into
-/// the tree, but reject Claude Code's `*.meta.json` / `*.meta.jsonl` subagent
-/// sidecar files (those live under `~/.claude/projects/` in practice, but the
-/// filter still guards against the unlikely collision).
-///
-/// Kept separate from the other per-provider filters even though the body is
-/// trivial, so a format change on one provider does not have to be teased out
-/// of a shared implementation.
+/// Returns whether `path` matches a Codex session log (`.jsonl` or `.json`, excluding `*.meta.json` and `*.meta.jsonl` sidecars).
 pub fn is_codex_session_file(path: &Path) -> bool {
     if is_meta_sidecar_file(path) {
         return false;
@@ -652,12 +598,7 @@ pub fn is_codex_session_file(path: &Path) -> bool {
     }
 }
 
-/// Filter for Claude Code session files (`.jsonl` only).
-///
-/// Matches both top-level sessions (`~/.claude/projects/<project>/<session>.jsonl`)
-/// and subagent sessions (`~/.claude/projects/<project>/<session>/subagents/agent-*.jsonl`).
-/// Rejects meta sidecars (`*.meta.json` / `*.meta.jsonl`) and any non-JSONL artifact
-/// that ends up under the projects directory (e.g. screenshots pasted into prompts).
+/// Returns whether `path` matches a Claude Code session log (`.jsonl`, excluding `*.meta.jsonl` sidecars).
 pub fn is_claude_session_file(path: &Path) -> bool {
     if is_meta_sidecar_file(path) {
         return false;
@@ -665,17 +606,9 @@ pub fn is_claude_session_file(path: &Path) -> bool {
     path.extension().is_some_and(|ext| ext == "jsonl")
 }
 
-/// Filter for Gemini CLI session files.
+/// Returns whether `path` matches a Gemini CLI session log (`.jsonl` directly under `chats/` or one subagent directory below `chats/`).
 ///
-/// Current Gemini CLI stores each chat as a line-delimited event stream at
-/// `~/.gemini/tmp/<project>/chats/session-*.jsonl`. Subagent sessions sit one
-/// level deeper at `chats/<parent-session>/<subagent>.jsonl`. Artifacts outside
-/// `chats/` (stray `.json` logs, the `bin/rg` binary, `.project_root`) are
-/// rejected.
-///
-/// Legacy single-object exports (`chats/<session>.json`) are intentionally
-/// not matched: the JSONL format is the only shape the analyzer understands
-/// today, so scanning them would only add parse failures to every scan.
+/// Legacy single-object `chats/<session>.json` exports are excluded.
 pub fn is_gemini_session_file(path: &Path) -> bool {
     if path.extension() != Some(std::ffi::OsStr::new("jsonl")) {
         false
@@ -689,41 +622,23 @@ pub fn is_gemini_session_file(path: &Path) -> bool {
     }
 }
 
-/// Filter for Copilot CLI session files.
+/// Returns whether `path` matches a Copilot CLI event log (`session-state/<sessionId>/events.jsonl`).
 ///
-/// Copilot CLI stores each session as a directory under
-/// `~/.copilot/session-state/<sessionId>/` containing the event log
-/// (`events.jsonl`) plus sibling subdirectories for file snapshots
-/// (`rewind-snapshots/`, `files/`, `research/`, `checkpoints/`) and a
-/// per-workspace YAML file. Only `events.jsonl` carries the conversation
-/// stream we want to analyze — if we fell back to the generic JSON filter,
-/// `rewind-snapshots/index.json` would be mis-picked up as a session log
-/// and fail to parse.
-///
-/// The historical single-file layout
-/// (`~/.copilot/history-session-state/<sessionId>.json`) is not matched and is
-/// not supported by the analyzer at all.
+/// Excludes legacy single-file exports under `history-session-state/`.
 pub fn is_copilot_session_file(path: &Path) -> bool {
-    // Compare raw `OsStr` rather than going through `to_str()` so a path with
-    // non-UTF-8 bytes elsewhere in the tree is not silently rejected.
+    // Compare raw `OsStr` rather than going through `to_str()` so a path with non-UTF-8 bytes elsewhere in the tree is not silently rejected.
     if path.file_name() != Some(std::ffi::OsStr::new("events.jsonl")) {
         return false;
     }
 
-    // The parent of the parent must be `session-state`, so anything that just
-    // happens to be called `events.jsonl` in a nested subfolder (e.g.
-    // `rewind-snapshots/events.jsonl`) is rejected.
+    // Require `session-state/<sessionId>/events.jsonl` so nested `events.jsonl` snapshots are rejected.
     path.parent()
         .and_then(|p| p.parent())
         .map(|pp| pp.file_name() == Some(std::ffi::OsStr::new("session-state")))
         .unwrap_or(false)
 }
 
-/// Filter for Grok CLI session signal files.
-///
-/// Only `$GROK_HOME/sessions/<workspace>/<session>/signals.json` is a session
-/// entry point. Sibling files such as `summary.json` and `updates.jsonl` are
-/// consumed by the Grok parser after the signals file has been selected.
+/// Returns whether `path` matches a Grok CLI session entry point (`sessions/<workspace>/<session>/signals.json`).
 pub fn is_grok_session_file(path: &Path) -> bool {
     if path.file_name() != Some(std::ffi::OsStr::new("signals.json")) {
         return false;
@@ -735,13 +650,7 @@ pub fn is_grok_session_file(path: &Path) -> bool {
         .is_some_and(|sessions| sessions.file_name() == Some(std::ffi::OsStr::new("sessions")))
 }
 
-/// Filter for DeepSeek Harness session logs.
-///
-/// `dsh` writes one log per session at
-/// `$DSH_HOME/sessions/<project>/<session>/session.jsonl.zstd`, and the same
-/// path without the `.zstd` suffix when the root is configured with
-/// `compression: 'none'`. A root only ever uses one of the two encodings, but
-/// accepting both here keeps the filter independent of that setting.
+/// Returns whether `path` matches a DeepSeek Harness session log (`sessions/<project>/<session>/session.jsonl` or `session.jsonl.zstd`).
 pub fn is_dsh_session_file(path: &Path) -> bool {
     let name = path.file_name();
     if name != Some(std::ffi::OsStr::new("session.jsonl.zstd"))
@@ -756,11 +665,9 @@ pub fn is_dsh_session_file(path: &Path) -> bool {
         .is_some_and(|sessions| sessions.file_name() == Some(std::ffi::OsStr::new("sessions")))
 }
 
-/// Filter for Antigravity conversation transcripts.
+/// Returns whether `path` matches an Antigravity full transcript (`<conversation>/.system_generated/logs/transcript_full.jsonl`).
 ///
-/// `logs/` also holds `transcript.jsonl`, the same steps with every tool
-/// argument re-encoded as a JSON string and long fields truncated, so only the
-/// `_full` log is read.
+/// Sibling `transcript.jsonl` files carry truncated, re-encoded tool arguments and are excluded.
 pub fn is_antigravity_session_file(path: &Path) -> bool {
     if path.file_name() != Some(std::ffi::OsStr::new("transcript_full.jsonl")) {
         return false;
@@ -771,9 +678,7 @@ pub fn is_antigravity_session_file(path: &Path) -> bool {
             == Some(std::ffi::OsStr::new(".system_generated"))
 }
 
-/// Returns true for a Claude Code metadata sidecar written beside a subagent
-/// session log. Today those are `*.meta.json`; `*.meta.jsonl` matches too, in
-/// case the format ever switches to line-delimited JSON.
+/// Returns whether `path` is a `*.meta.json` or `*.meta.jsonl` subagent metadata sidecar.
 fn is_meta_sidecar_file(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
@@ -867,13 +772,9 @@ mod tests {
 
     #[test]
     fn test_is_gemini_session_file_excludes_sibling_dirs() {
-        // `tmp/discordbot/logs.json` lives next to the `chats/` folder but
-        // must not be picked up because its parent is not `chats`.
         let sibling = std::path::Path::new("/home/user/.gemini/tmp/discordbot/logs.json");
         assert!(!is_gemini_session_file(sibling));
 
-        // The `bin/rg` binary that Gemini CLI drops alongside session data has no
-        // JSON extension at all.
         let binary = std::path::Path::new("/home/user/.gemini/tmp/bin/rg");
         assert!(!is_gemini_session_file(binary));
     }
@@ -888,8 +789,6 @@ mod tests {
 
     #[test]
     fn test_is_copilot_session_file_rejects_snapshots() {
-        // Rewind snapshots also emit JSON files; they must not be picked up as
-        // session logs.
         let snapshot_index = std::path::Path::new(
             "/home/user/.copilot/session-state/d2e098d0/rewind-snapshots/index.json",
         );
@@ -907,8 +806,6 @@ mod tests {
 
     #[test]
     fn test_is_copilot_session_file_rejects_nested_events_jsonl() {
-        // A stray `events.jsonl` inside a rewind snapshot must not count as a
-        // session log — the parent of the parent must be `session-state`.
         let nested = std::path::Path::new(
             "/home/user/.copilot/session-state/d2e098d0/rewind-snapshots/events.jsonl",
         );
@@ -970,10 +867,7 @@ mod tests {
 
     #[test]
     fn test_collect_files_with_max_depth_respects_bound() {
-        // Layout mirrors a real Copilot `session-state/` tree: `events.jsonl` sits
-        // at depth 2 and must be collected, while snapshot artifacts deeper in
-        // the tree (`rewind-snapshots/backups/<hash>`) must be skipped entirely
-        // by a max_depth(2) walk so they never even hit `is_copilot_session_file`.
+        // Copilot layout: `events.jsonl` sits at depth 2; deeper snapshot files are skipped by `max_depth(2)`.
         let dir = tempdir().unwrap();
         let session = dir.path().join("session-state").join("sess-abc");
         let backups = session.join("rewind-snapshots").join("backups");
@@ -981,10 +875,9 @@ mod tests {
 
         File::create(session.join("events.jsonl")).unwrap();
         File::create(backups.join("deadbeef-123")).unwrap();
-        File::create(backups.join("events.jsonl")).unwrap(); // still valid JSONL
+        File::create(backups.join("events.jsonl")).unwrap();
         File::create(session.join("workspace.yaml")).unwrap();
 
-        // Unbounded walk picks up every file whose filter passes...
         let unbounded = collect_files_with_dates(
             dir.path().join("session-state"),
             is_copilot_session_file,
@@ -995,12 +888,8 @@ mod tests {
             .iter()
             .filter_map(|f| f.path.file_name()?.to_str())
             .collect();
-        // `rewind-snapshots/backups/events.jsonl` fails the filter (parent-of-parent
-        // is `rewind-snapshots`, not `session-state`), so the filter already blocks
-        // it. But we must have picked up the real one at depth 2.
         assert!(unbounded_names.contains(&"events.jsonl"));
 
-        // Bounded walk (depth 2) must not even descend into backups/.
         let bounded = collect_files_with_max_depth(
             dir.path().join("session-state"),
             is_copilot_session_file,
@@ -1014,8 +903,7 @@ mod tests {
 
     #[test]
     fn test_collect_provider_files_deduplicates_only_across_roots() {
-        // Mirrors Codex: a dated active root plus the flat archived root the
-        // rollout log is moved into, with one session momentarily in both.
+        // Mirrors Codex: a dated active root plus the flat archived root, with one session momentarily in both.
         let dir = tempdir().unwrap();
         let active = dir
             .path()
@@ -1053,8 +941,7 @@ mod tests {
 
     #[test]
     fn test_collect_provider_files_keeps_same_named_files_in_one_root() {
-        // Every Copilot session log is named `events.jsonl`; a single-root
-        // provider must never have those collapsed into one.
+        // Every Copilot session log is named `events.jsonl`; a single-root provider must never collapse them.
         let dir = tempdir().unwrap();
         let sessions = dir.path().join("session-state");
         for session in ["sess-a", "sess-b"] {
@@ -1078,8 +965,7 @@ mod tests {
 
     #[test]
     fn test_collect_provider_files_keeps_same_named_files_across_roots_by_relative_path() {
-        // Every Antigravity transcript has the same file name; only the same
-        // conversation directory in two roots is one session.
+        // Every Antigravity transcript shares the same file name; only the same conversation directory across roots is one session.
         let dir = tempdir().unwrap();
         let roots = [dir.path().join("cli"), dir.path().join("jetski")];
         for (root, conversation) in [(0, "a"), (1, "b"), (1, "a")] {
@@ -1167,7 +1053,7 @@ mod tests {
 
         File::create(dir.path().join("file1.json")).unwrap();
         File::create(dir.path().join("file2.jsonl")).unwrap();
-        File::create(dir.path().join("file3.txt")).unwrap(); // Should be filtered out
+        File::create(dir.path().join("file3.txt")).unwrap();
 
         let results =
             collect_files_with_dates(dir.path(), is_codex_session_file, TimeRange::All).unwrap();
@@ -1175,7 +1061,7 @@ mod tests {
 
         for file_info in &results {
             assert!(!file_info.modified_date.is_empty());
-            assert!(file_info.modified_date.contains('-')); // Should be YYYY-MM-DD format
+            assert!(file_info.modified_date.contains('-'));
         }
     }
 
@@ -1247,8 +1133,8 @@ mod tests {
         assert_eq!(results.len(), 1);
 
         let date = &results[0].modified_date;
-        assert_eq!(date.len(), 10); // YYYY-MM-DD is 10 chars
-        assert_eq!(date.chars().filter(|&c| c == '-').count(), 2); // Two dashes
+        assert_eq!(date.len(), 10);
+        assert_eq!(date.chars().filter(|&c| c == '-').count(), 2);
     }
 
     #[test]
@@ -1261,7 +1147,7 @@ mod tests {
 
         let results =
             collect_files_with_dates(dir.path(), is_codex_session_file, TimeRange::All).unwrap();
-        assert_eq!(results.len(), 1); // Only the file, not the directory
+        assert_eq!(results.len(), 1);
     }
 
     #[test]
@@ -1275,8 +1161,7 @@ mod tests {
 
     #[test]
     fn test_is_gemini_session_file_multiple_levels() {
-        // Depth of the enclosing directory does not matter as long as the
-        // *immediate* parent is `chats/` and the extension is `.jsonl`.
+        // Enclosing path depth above `chats/` does not matter.
         let path = std::path::Path::new("/a/b/c/d/chats/file.jsonl");
         assert!(is_gemini_session_file(path));
     }
@@ -1297,9 +1182,6 @@ mod tests {
 
     #[test]
     fn test_is_codex_session_file_excludes_meta_sidecars() {
-        // *.meta.json sidecars live next to Claude Code subagent sessions and must not
-        // be picked up by the generic json filter (they would otherwise be parsed and
-        // mis-detected as Codex logs).
         let path = std::path::Path::new("agent-afda1991051a0eb93.meta.json");
         assert!(!is_codex_session_file(path));
 
@@ -1308,8 +1190,6 @@ mod tests {
         );
         assert!(!is_codex_session_file(nested));
 
-        // Pre-emptive defense: reject `.meta.jsonl` too, in case Claude Code ever
-        // switches the sidecar format to line-delimited JSON.
         let meta_jsonl = std::path::Path::new(
             "/home/user/.claude/projects/proj/sess/subagents/agent-x.meta.jsonl",
         );
@@ -1335,8 +1215,7 @@ mod tests {
         );
         assert!(!is_claude_session_file(meta));
 
-        // A `.meta.jsonl` sidecar has the accepted extension, so without the
-        // sidecar check it would slip through.
+        // `.meta.jsonl` has the `.jsonl` extension and relies on the sidecar check.
         let meta_jsonl = std::path::Path::new(
             "/home/user/.claude/projects/proj/sess/subagents/agent-afda1991051a0eb93.meta.jsonl",
         );
@@ -1352,12 +1231,6 @@ mod tests {
 
     #[test]
     fn test_collect_claude_session_files_includes_subagents() {
-        // Simulates the `~/.claude/projects/<project>/<session>/subagents/` layout:
-        //   projects/<project>/
-        //     sess-a.jsonl                          <- top-level session
-        //     sess-a/subagents/agent-one.jsonl      <- subagent session
-        //     sess-a/subagents/agent-one.meta.json  <- metadata sidecar (ignored)
-        //     sess-a/screenshot.png                 <- pasted artifact (ignored)
         let dir = tempdir().unwrap();
         let project = dir.path().join("-home-user-repo");
         let session_subdir = project.join("sess-a");
@@ -1398,9 +1271,7 @@ mod tests {
 
         File::create(project.join("sess-a.jsonl")).unwrap();
         File::create(subagents.join("agent-one.jsonl")).unwrap();
-        // A stray `.jsonl` inside `<session>/tool-results/` is pruned with its directory.
         File::create(tool_results.join("ignored.jsonl")).unwrap();
-        // A top-level project folder literally named `tool-results` at depth 1 still walks.
         File::create(named_project.join("top.jsonl")).unwrap();
 
         let roots = [dir.path()];

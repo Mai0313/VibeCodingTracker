@@ -1,13 +1,6 @@
 //! Aggregates per-model token usage across every provider source.
 //!
-//! File-backed providers are walked with the provider fixed by its *source
-//! path* (never re-detected from file contents) and parsed in
-//! [`ParseMode::UsageOnly`] to skip the heavy file-operation payloads;
-//! OpenCode, Cursor and Hermes are read straight out of their SQLite
-//! databases. Every source's per-model usage is merged into a [`UsageData`],
-//! which tracks the provider twice on purpose — once merged across providers
-//! (the per-model table) and once kept per source (the per-provider footer) —
-//! see [`UsageData`] for why.
+//! File-backed providers fix their provider from the source path rather than content detection and parse in [`ParseMode::UsageOnly`]; OpenCode, Cursor, and Hermes are read from SQLite. Results land in [`UsageData`], storing both cross-provider model totals and source-scoped per-provider maps.
 
 use crate::config::ProvidersConfig;
 use crate::constants::{FastHashMap, capacity};
@@ -39,15 +32,9 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
-/// Aggregated token usage plus the per-provider active-day counts.
+/// Aggregated token usage, per-provider active-day counts, and stored provider costs.
 ///
-/// All fields are public for the display layer to read. Token totals are
-/// tracked two ways at once because the two views need different attribution:
-/// [`models`](UsageData::models) merges a shared model (e.g. `claude-sonnet-4-6`
-/// emitted by both Claude Code and Copilot CLI) into one row, while
-/// [`per_provider`](UsageData::per_provider) keeps the same tokens scoped to the
-/// source so the footer can attribute them correctly. The same tokens land in
-/// both maps, so a consumer reads one view or the other and never sums them.
+/// [`models`](UsageData::models) merges tokens across providers by model name, while [`per_provider`](UsageData::per_provider) partitions the same tokens by originating provider. Consumers read one view or the other and never sum both.
 ///
 /// # Examples
 ///
@@ -55,33 +42,22 @@ use std::sync::Arc;
 /// use vct_core::{aggregate_usage_from_home, TimeRange};
 ///
 /// let data = aggregate_usage_from_home(TimeRange::All)?;
-/// // Total distinct days that contributed any usage, across all providers.
 /// println!("active days: {}", data.provider_days.total);
 /// # Ok::<(), anyhow::Error>(())
 /// ```
 #[derive(Debug, Clone, Serialize)]
 pub struct UsageData {
-    /// Tokens aggregated across *all* providers, keyed by model name.
-    ///
-    /// Drives the per-model summary table where, e.g., `claude-sonnet-4-6`
-    /// tokens from Claude Code and Copilot CLI share a single row.
+    /// Tokens aggregated across all providers, keyed by model name.
     pub models: UsageResult,
-    /// Tokens kept separate per source directory, keyed by provider → model.
-    ///
-    /// Drives the per-provider totals in the summary footer. Keeping this
-    /// split at aggregation time avoids the display layer from having to
-    /// guess a model's provider from its name, which broke once Copilot CLI
-    /// started emitting real (Claude / OpenAI / …) model names.
+    /// Tokens partitioned by originating provider, then keyed by model name.
     pub per_provider: PerProviderUsage,
-    /// Count of distinct calendar dates that contributed usage, per provider
-    /// and overall.
+    /// Count of distinct calendar dates that contributed usage, per provider and overall.
     pub provider_days: ProviderActiveDays,
     /// Provider-authoritative per-model cost (USD), summed from the source.
     pub stored_costs: StoredCosts,
 }
 
-// Usage and analysis both report the one unified scan-diagnostics type; it is
-// re-exported here so callers can reach it as `usage::ScanDiagnostics`.
+// Re-exported from `scan` so callers can reach the shared diagnostics type as `usage::ScanDiagnostics`.
 pub use crate::scan::{ScanDiagnostics, ScanFailure};
 
 /// Usage data paired with source-collection diagnostics.
@@ -92,12 +68,9 @@ pub struct UsageCollection {
     pub diagnostics: ScanDiagnostics,
 }
 
-/// Provider-authoritative per-model costs, kept **separate per provider**.
+/// Provider-authoritative per-model costs in USD, partitioned by provider.
 ///
-/// OpenCode and Hermes are the providers that record their own costs; Cursor
-/// carries none, so its local estimate is priced by an exact LiteLLM match
-/// alone. Separate maps prevent a colliding bare model name from
-/// cross-contaminating providers.
+/// Only OpenCode and Hermes record their own costs; separating maps isolates colliding bare model names across providers.
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct StoredCosts {
     /// OpenCode's per-model stored cost, keyed by model name.
@@ -121,9 +94,7 @@ fn extract_conversation_usage_from_analysis(analysis: CodeAnalysis) -> FastHashM
         for (model, usage) in record.conversation_usage {
             merge_into(model, usage);
         }
-        // Claude advisor-message tokens live in a separate map so the
-        // `analysis` aggregator ignores them; the `usage` path folds them in
-        // here, attributed to the advisor's own model for correct pricing.
+        // Advisor and compaction tokens live in `advisor_usage` so `analysis` skips crediting them with file ops; fold them here for usage and pricing.
         for (model, usage) in record.advisor_usage {
             merge_into(model, usage);
         }
@@ -132,20 +103,9 @@ fn extract_conversation_usage_from_analysis(analysis: CodeAnalysis) -> FastHashM
     conversation_usage
 }
 
-/// Aggregates token usage from all AI provider session directories.
+/// Aggregates token usage from all enabled AI provider sources under the current user's home.
 ///
-/// Scans every provider source resolved by [`resolve_paths`], filtered by
-/// `time_range`, and rolls every session's per-model usage into a
-/// [`UsageData`]. Missing provider sources are skipped silently, and a source
-/// file or database that fails to parse logs a warning to the diagnostic log
-/// and is excluded rather than aborting the whole scan.
-///
-/// # Errors
-///
-/// Returns an error if [`resolve_paths`] cannot determine the provider
-/// directories (e.g. the home directory is unavailable). Directory traversal
-/// and metadata errors are currently skipped by the walker rather than
-/// propagated.
+/// Scans every source resolved by [`resolve_paths`] within `time_range` and rolls per-model usage into [`UsageData`]. Missing provider sources are skipped, and unreadable sources are logged and excluded.
 ///
 /// # Examples
 ///
@@ -158,12 +118,19 @@ fn extract_conversation_usage_from_analysis(analysis: CodeAnalysis) -> FastHashM
 /// }
 /// # Ok::<(), anyhow::Error>(())
 /// ```
+///
+/// # Errors
+///
+/// Returns an error if [`resolve_paths`] cannot determine provider directories.
 pub fn aggregate_usage_from_home(time_range: TimeRange) -> Result<UsageData> {
     aggregate_usage_from_home_with_providers(time_range, ProvidersConfig::default())
 }
 
-/// [`aggregate_usage_from_home`] with explicit per-provider toggles (from
-/// `~/.vct/config.toml`). A disabled provider is skipped entirely.
+/// Aggregates token usage from the current user's home for providers enabled in `providers`.
+///
+/// # Errors
+///
+/// Returns an error if [`resolve_paths`] cannot determine provider directories.
 pub fn aggregate_usage_from_home_with_providers(
     time_range: TimeRange,
     providers: ProvidersConfig,
@@ -171,25 +138,12 @@ pub fn aggregate_usage_from_home_with_providers(
     aggregate_usage_from_paths_with_providers(&resolve_paths()?, time_range, providers)
 }
 
-/// Aggregates token usage from provider session directories rooted at an
-/// explicit [`HelperPaths`].
-///
-/// The env-free, injectable counterpart of [`aggregate_usage_from_home`]:
-/// every provider path comes from `paths` rather than the resolved home
-/// directory, so tests can point them at a temp tree and exercise the real
-/// aggregation without mutating process-global `HOME`. See
-/// [`aggregate_usage_from_home`] for the aggregation semantics.
-///
-/// # Errors
-///
-/// Returns an error only under the same conditions as
-/// [`aggregate_usage_from_home`].
+/// Aggregates token usage from explicit provider locations in `paths` without reading environment variables or the session ledger.
 pub fn aggregate_usage_from_paths(paths: &HelperPaths, time_range: TimeRange) -> Result<UsageData> {
     aggregate_usage_from_paths_with_providers(paths, time_range, ProvidersConfig::default())
 }
 
-/// [`aggregate_usage_from_paths`] with explicit provider toggles (the injectable core
-/// used by the CLI once `config.toml` is loaded).
+/// Aggregates token usage from `paths` for providers enabled in `providers`, without reading the session ledger.
 pub fn aggregate_usage_from_paths_with_providers(
     paths: &HelperPaths,
     time_range: TimeRange,
@@ -211,8 +165,7 @@ pub fn aggregate_usage_from_paths_with_providers(
     let mut hermes_dates: HashSet<String> = HashSet::new();
 
     if providers.claude && paths.claude_session_dir.exists() {
-        // Walks the projects tree recursively, so top-level `<session>.jsonl` logs
-        // and `<session>/subagents/agent-*.jsonl` logs are both collected here.
+        // Recursive walk collects both top-level `<session>.jsonl` and `<session>/subagents/agent-*.jsonl`.
         process_usage_directory(
             &[paths.claude_session_dir.as_path()],
             ExtensionType::ClaudeCode,
@@ -240,10 +193,7 @@ pub fn aggregate_usage_from_paths_with_providers(
     }
 
     if providers.copilot && paths.copilot_session_dir.exists() {
-        // `events.jsonl` always lives exactly two levels under `session-state/`,
-        // so bounding the walk keeps per-session snapshot subtrees
-        // (`rewind-snapshots/backups/*`, `files/*`, …) out of the iteration and
-        // the scan cost linear in sessions rather than total artifacts.
+        // Cap depth because `events.jsonl` sits two levels under `session-state/`; deeper subtrees hold snapshots and artifacts.
         process_usage_directory(
             &[paths.copilot_session_dir.as_path()],
             ExtensionType::Copilot,
@@ -308,8 +258,6 @@ pub fn aggregate_usage_from_paths_with_providers(
         );
     }
 
-    // OpenCode lives in a single SQLite database rather than a session
-    // directory, so it is read directly instead of walked.
     if providers.opencode
         && paths.opencode_db.exists()
         && let Err(err) = process_opencode_usage(
@@ -327,9 +275,6 @@ pub fn aggregate_usage_from_paths_with_providers(
         );
     }
 
-    // Cursor's usage is a local estimate from its chat stores (read directly like
-    // OpenCode, not a walked session directory), so it is only attempted when the
-    // chat stores are present — matching the analysis path.
     if providers.cursor
         && paths.cursor_chats_dir.exists()
         && let Err(err) = process_cursor_usage(
@@ -344,7 +289,6 @@ pub fn aggregate_usage_from_paths_with_providers(
         log::warn!("failed to read Cursor usage: {err}");
     }
 
-    // Hermes, like OpenCode, is a single SQLite database read directly.
     if providers.hermes
         && paths.hermes_db.exists()
         && let Err(err) = process_hermes_usage(
@@ -396,22 +340,22 @@ pub fn aggregate_usage_from_paths_with_providers(
     })
 }
 
-/// Optional knobs for a usage scan.
+/// Options controlling a usage scan.
 ///
-/// `tiers` is the per-request context-tier snapshot derived from the current
-/// pricing map (see [`TierThresholds`]); `None` (the default) classifies
-/// nothing and every request bills at base rates.
+/// When [`tiers`](Self::tiers) is `None` (the default), all requests bill at base rates.
 #[derive(Debug, Default, Clone)]
 pub struct UsageScanOptions {
-    /// "Model → lowest tier threshold" snapshot for per-request classification.
+    /// Per-model context-tier thresholds for per-request tier classification.
     pub tiers: Option<Arc<TierThresholds>>,
 }
 
-/// Diagnostics-aware usage scan rooted at the current user's provider paths.
+/// Scans usage from the current user's resolved paths with default [`UsageScanOptions`] and returns scan diagnostics.
 ///
-/// Reads and writes the on-disk session ledger under `~/.vct/sessions/`, so
-/// sessions whose source is gone still count; see
-/// [`aggregate_usage_from_home_with_diagnostics_opts`].
+/// Delegates to [`aggregate_usage_from_home_with_diagnostics_opts`].
+///
+/// # Errors
+///
+/// Returns an error if [`resolve_paths`] cannot determine provider directories.
 pub fn aggregate_usage_from_home_with_diagnostics(
     time_range: TimeRange,
     providers: ProvidersConfig,
@@ -423,11 +367,13 @@ pub fn aggregate_usage_from_home_with_diagnostics(
     )
 }
 
-/// [`aggregate_usage_from_home_with_diagnostics`] with scan options.
+/// Scans usage from the current user's resolved paths with `options`, updating the on-disk session ledger.
 ///
-/// Opens the session ledger under the user's `~/.vct`, scans through it, and
-/// writes it back; a ledger that cannot be written is logged and the scan's
-/// result returned anyway.
+/// Retains sessions whose source files have been deleted; ledger save failures are logged without failing the scan.
+///
+/// # Errors
+///
+/// Returns an error if [`resolve_paths`] cannot determine provider directories.
 pub fn aggregate_usage_from_home_with_diagnostics_opts(
     time_range: TimeRange,
     providers: ProvidersConfig,
@@ -448,8 +394,7 @@ pub fn aggregate_usage_from_home_with_diagnostics_opts(
     Ok(collection)
 }
 
-/// Diagnostics-aware usage scan rooted at explicit provider paths, through an
-/// in-memory ledger that touches nothing on disk.
+/// Scans usage from explicit `paths` with diagnostics using a transient in-memory ledger.
 pub fn aggregate_usage_from_paths_with_diagnostics(
     paths: &HelperPaths,
     time_range: TimeRange,
@@ -459,12 +404,9 @@ pub fn aggregate_usage_from_paths_with_diagnostics(
     aggregate_usage_from_paths_with_cache(paths, time_range, providers, &mut ledger)
 }
 
-/// Incremental usage scan through a session ledger.
+/// Runs an incremental usage scan from `paths` with default [`UsageScanOptions`], updating `ledger` in place.
 ///
-/// Reusing `ledger` across calls re-reads only sources whose stamp changed,
-/// and keeps folding sessions whose source has gone. Retained schema failures
-/// keep their diagnostics, while metadata, open, and read errors are not
-/// recorded and are retried next time.
+/// Unchanged sources fold from `ledger` and deleted sources remain counted. Cached schema failures preserve their diagnostics, while transient I/O errors are retried on the next scan.
 pub fn aggregate_usage_from_paths_with_cache(
     paths: &HelperPaths,
     time_range: TimeRange,
@@ -480,12 +422,9 @@ pub fn aggregate_usage_from_paths_with_cache(
     )
 }
 
-/// [`aggregate_usage_from_paths_with_cache`] with scan options.
+/// Runs an incremental usage scan from `paths` with `options`, updating `ledger` in place.
 ///
-/// The ledger stamps each session's usage half with the tier snapshot it was
-/// classified against, so one ledger serves both features: an entry an
-/// analysis scan wrote is re-read by a usage scan that carries a snapshot, and
-/// nothing else is disturbed.
+/// Each session's usage half records the tier-threshold fingerprint used to classify it; entries stamped without a matching fingerprint (including those written by an analysis scan) are re-read.
 pub fn aggregate_usage_from_paths_with_cache_opts(
     paths: &HelperPaths,
     time_range: TimeRange,
@@ -509,8 +448,7 @@ pub fn aggregate_usage_from_paths_with_cache_opts(
         tiers,
     )?;
 
-    // Every database read covers all time: the range is applied to the folded
-    // days, so a `--daily` scan cannot mistake older sessions for deleted ones.
+    // Read all time from databases and apply `time_range` when folding so narrower ranges do not mark older sessions missing.
     if providers.opencode {
         scan_database_half(
             ExtensionType::OpenCode,
@@ -527,8 +465,7 @@ pub fn aggregate_usage_from_paths_with_cache_opts(
             },
         );
     }
-    // Cursor and Hermes classify nothing, so no snapshot goes on their stamps
-    // and a pricing change never re-reads them.
+    // Cursor and Hermes do not classify context tiers, so leave their tier fingerprint empty to avoid unnecessary re-reads on pricing updates.
     if providers.cursor {
         scan_cursor_stores(
             paths,
@@ -602,8 +539,7 @@ impl crate::scan::CompactSink for UsageAccumulator {
             ExtensionType::Cursor => &mut self.per_provider.cursor,
             ExtensionType::Hermes => &mut self.per_provider.hermes,
         };
-        // Clone the model key only on a miss (an insert genuinely needs an owned
-        // key); a merge into an existing row needs no allocation at all.
+        // Use `get_mut` before `insert` to avoid cloning `model` on existing keys.
         for (model, raw) in &day.usage {
             let usage = DayEntry::usage_value(raw);
             match provider_result.get_mut(model) {
@@ -615,7 +551,6 @@ impl crate::scan::CompactSink for UsageAccumulator {
             match self.models.get_mut(model) {
                 Some(existing) => merge_usage_values(existing, &usage),
                 None => {
-                    // Last use of `usage`, so move it in rather than clone.
                     self.models.insert(model.clone(), usage);
                 }
             }
@@ -652,8 +587,6 @@ impl crate::scan::CompactSink for UsageAccumulator {
 
 impl UsageAccumulator {
     fn finish(self) -> UsageData {
-        // Only the union's cardinality is needed, so union references rather
-        // than cloning every date string across the ten per-provider sets.
         let mut all_dates: HashSet<&String> = HashSet::new();
         all_dates.extend(self.claude_dates.iter());
         all_dates.extend(self.codex_dates.iter());
@@ -687,16 +620,7 @@ impl UsageAccumulator {
     }
 }
 
-/// Walks one provider's session roots and merges their usage into both result maps.
-///
-/// Files matching `filter_fn` (and within `max_depth`, when set) are parsed in
-/// parallel with the provider fixed to `provider` — never re-detected from
-/// contents — and each session's per-model tokens are merged into both
-/// `global_result` (cross-provider view) and `provider_result` (source-scoped
-/// view). A session that contributed any tokens has its modified date inserted
-/// into `unique_dates` for the active-day count. Traversal and metadata errors
-/// are skipped by the collector, and a file that fails to parse logs a warning
-/// and is skipped, so this is best-effort by construction and cannot fail.
+/// Walks one provider's session roots in [`ParseMode::UsageOnly`] and merges per-model usage into `global_result`, `provider_result`, and `unique_dates`.
 #[allow(clippy::too_many_arguments)] // per-provider helper; struct-wrapping the args would hurt readability
 fn process_usage_directory<F>(
     dirs: &[&Path],
@@ -710,18 +634,11 @@ fn process_usage_directory<F>(
 ) where
     F: Copy + Fn(&Path) -> bool + Sync + Send,
 {
-    // This entry point has no diagnostics channel, so discovery failures are
-    // dropped here; the `*_with_diagnostics` scanners are the ones that report them.
+    // Discovery failures are dropped here because this non-diagnostic path has no diagnostics sink.
     let files =
         collect_provider_files_diagnostics(dirs, provider, filter_fn, time_range, max_depth).files;
 
-    // Fixing the provider by source directory is what keeps a Claude session
-    // whose first line is a metadata sentinel (`permission-mode`,
-    // `file-history-snapshot`) from being re-detected as another provider and
-    // silently dropped. The global file cache is bypassed on purpose: the
-    // `usage` path never needs the heavy `write_file_details` /
-    // `edit_file_details` payloads, so caching the full analysis would waste
-    // the memory win from `UsageOnly`.
+    // Fix the provider by directory so metadata-only preambles cannot trigger mis-detection, and parse in `UsageOnly` to skip file-op detail payloads.
     let file_results: Vec<(String, FastHashMap<String, Value>)> = files
         .into_par_iter()
         .filter_map(|file_info| {
@@ -738,7 +655,6 @@ fn process_usage_directory<F>(
         })
         .collect();
 
-    // Merged sequentially; it is cheap next to the parallel parse above.
     for (date, conversation_usage) in file_results {
         if usage_map_has_activity(&conversation_usage, 0.0) {
             unique_dates.insert(date);
@@ -758,18 +674,7 @@ fn process_usage_directory<F>(
     }
 }
 
-/// Reads OpenCode's SQLite database and merges its per-model usage into both
-/// the global and OpenCode-scoped maps.
-///
-/// Mirrors the tail of [`process_usage_directory`] but sources sessions from
-/// the database (via [`read_opencode_usage`]) instead of a directory walk. Each
-/// row's date comes from the assistant message timestamp (falling back to
-/// `session.time_updated` on legacy schemas) and is recorded in `unique_dates`
-/// for the active-day count.
-///
-/// # Errors
-///
-/// Returns an error if the database cannot be opened or queried.
+/// Reads OpenCode's SQLite database and merges its usage and stored costs into the accumulators.
 fn process_opencode_usage(
     db_path: &Path,
     global_result: &mut UsageResult,
@@ -789,12 +694,7 @@ fn process_opencode_usage(
     Ok(())
 }
 
-/// Reads Cursor's per-model usage (a local estimate from the chat stores) and
-/// merges it into both the global and Cursor-scoped maps.
-///
-/// Mirrors [`process_opencode_usage`], but Cursor records no cost of its own,
-/// so there is no stored-cost map to fold into and pricing accepts only an
-/// exact LiteLLM match rather than a fuzzy price guess.
+/// Reads Cursor's chat-store usage estimates and merges them into the accumulators.
 fn process_cursor_usage(
     chats_dir: &Path,
     tracking_db: &Path,
@@ -808,15 +708,7 @@ fn process_cursor_usage(
     Ok(())
 }
 
-/// Reads Hermes's per-model usage from its SQLite database and merges it into
-/// both the global and Hermes-scoped maps.
-///
-/// Mirrors [`process_opencode_usage`]: Hermes stores its own per-model cost, so
-/// it uses the same stored-cost path rather than a fuzzy price guess.
-///
-/// # Errors
-///
-/// Returns an error if the database cannot be opened or queried.
+/// Reads Hermes's SQLite database and merges its usage and stored costs into the accumulators.
 fn process_hermes_usage(
     db_path: &Path,
     global_result: &mut UsageResult,
@@ -836,11 +728,7 @@ fn process_hermes_usage(
     Ok(())
 }
 
-/// Folds `(date, analysis, cost)` rows from a database provider (OpenCode /
-/// Cursor / Hermes) into the global + provider-scoped maps.
-///
-/// `stored_costs` is `None` for Cursor, whose local estimate reports no cost of
-/// its own; the other two fold their per-model cost into the table.
+/// Merges `(date, analysis, cost)` rows from a database provider into the global and provider-scoped accumulators.
 fn fold_database_sessions(
     sessions: Vec<(String, CodeAnalysis, f64)>,
     global_result: &mut UsageResult,
@@ -897,7 +785,6 @@ mod tests {
                 "total_tokens": 1500
             }
         });
-        // A Cursor / flat value for the same model name.
         let flat = json!({
             "input_tokens": 100,
             "output_tokens": 20,
@@ -938,9 +825,7 @@ mod tests {
                 "total_tokens": 1500
             }
         });
-        // A Gemini row for the same model name. `tool_tokens` is the one bucket
-        // with no price and no field of its own in the flat key set, so it is
-        // the one the mixed-shape rewrite used to drop.
+        // Gemini's `tool_tokens` is unpriced and outside the standard flat key set, so verify mixed-shape merges preserve it.
         let gemini = json!({
             "input_tokens": 100,
             "output_tokens": 20,

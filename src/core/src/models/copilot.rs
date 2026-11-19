@@ -1,25 +1,12 @@
-//! Serde models for the GitHub Copilot CLI `events.jsonl` session format.
-//!
-//! Current Copilot CLI writes `~/.copilot/session-state/<sessionId>/events.jsonl`
-//! where every line is a single event carrying its own `type` discriminator.
-//! The analyzer walks these events in order and pulls session metadata from
-//! `session.start`, model switches from `session.model_change`, tool calls
-//! from the `tool.execution_start` / `tool.execution_complete` pair, and
-//! authoritative per-model token usage from `session.shutdown.modelMetrics`.
-//!
-//! Earlier Copilot CLI releases wrote a single pretty-printed JSON object
-//! under `~/.copilot/history-session-state/<sessionId>.json` with no token
-//! accounting at all; that layout is no longer supported.
+//! Serde models for the GitHub Copilot CLI `events.jsonl` session format (`~/.copilot/session-state/<sessionId>/events.jsonl`).
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-/// Single line of the Copilot `events.jsonl` stream.
+/// Single line of a Copilot `events.jsonl` stream.
 ///
-/// `data` intentionally stays as raw [`Value`] — every event type has a
-/// different payload, so the analyzer branches on `event_type` and then
-/// deserialises `data` into the concrete shape on demand.
+/// [`Self::data`] stays as raw [`Value`] and is deserialized per [`Self::event_type`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CopilotEvent {
@@ -68,22 +55,17 @@ pub struct CopilotSessionContext {
     /// Commit hash checked out at session start.
     #[serde(default)]
     pub head_commit: String,
-    /// E.g. `"Mai0313/VibeCodingTracker"` — empty when the session did not
-    /// run inside a git repo.
+    /// Repository slug (for example `"Mai0313/VibeCodingTracker"`), empty outside a git repo.
     #[serde(default)]
     pub repository: String,
-    /// E.g. `"github.com"`; used together with `repository` to reconstruct
-    /// the remote URL.
+    /// Git host (for example `"github.com"`), paired with `repository` to form the remote URL.
     #[serde(default)]
     pub repository_host: String,
 }
 
-/// `session.shutdown` payload — authoritative per-model token usage.
+/// `session.shutdown` payload carrying authoritative per-model token usage keyed by model name.
 ///
-/// The map key is the model name (e.g. `"claude-sonnet-4.6"`). Copilot CLI
-/// writes this event on graceful shutdown after totalling up every API
-/// interaction in the session, which is the only place that carries *input*
-/// tokens (individual `assistant.message` events only carry `outputTokens`).
+/// Only this event records input tokens; individual `assistant.message` events carry only `outputTokens`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CopilotShutdownData {
@@ -101,11 +83,7 @@ pub struct CopilotModelMetric {
     pub usage: Option<CopilotModelUsage>,
 }
 
-/// Token counts captured by Copilot CLI at session shutdown.
-///
-/// Field names mirror the camelCase keys the CLI writes to disk — the Copilot
-/// parser normalises these into the flat token keys (`input_tokens`,
-/// `cache_read_input_tokens`, …) before storing them in `conversation_usage`.
+/// Token counts reported by Copilot CLI at session shutdown, matching its camelCase wire keys.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CopilotModelUsage {
@@ -121,14 +99,12 @@ pub struct CopilotModelUsage {
     /// Tokens written into the prompt cache.
     #[serde(default)]
     pub cache_write_tokens: i64,
-    /// Reasoning tokens, a subset of `output_tokens` rather than a separate
-    /// charge; the parser subtracts them back out so each token bills once.
+    /// Reasoning tokens, included as a subset of `output_tokens` rather than billed separately.
     #[serde(default)]
     pub reasoning_tokens: i64,
 }
 
-/// `tool.execution_start` payload — paired with `tool.execution_complete`
-/// via `tool_call_id`.
+/// `tool.execution_start` payload, paired with [`CopilotToolCompleteData`] via `tool_call_id`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CopilotToolStartData {
@@ -143,9 +119,7 @@ pub struct CopilotToolStartData {
     pub arguments: Value,
 }
 
-/// `tool.execution_complete` payload — carries the tool's actual output
-/// (file contents on `view`, creation confirmation on `create`, …) under
-/// `result`, plus the model that invoked the tool.
+/// `tool.execution_complete` payload carrying the tool result and invoking model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CopilotToolCompleteData {

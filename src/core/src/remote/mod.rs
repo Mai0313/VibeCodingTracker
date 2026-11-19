@@ -18,15 +18,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// How long one host gets to connect, scan and answer while a one-shot
-/// command waits for it before printing anything.
-///
-/// A first export parses every session the remote has ever kept, which can
-/// take minutes; cutting the connection does not stop that scan, so a later
-/// fetch finds the remote's ledger built and returns in seconds.
+/// Per-host timeout for synchronous [`sync`] calls; cutting the connection leaves any in-progress remote scan running to populate its ledger for later fetches.
 const ONE_SHOT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The same limit for the background loop, which nothing waits on.
+/// Per-host timeout for [`spawn_sync_loop`].
 const BACKGROUND_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// The shortest pause between two fetches of the background loop.
@@ -36,14 +31,9 @@ const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// followed by `<uname -s>:<uname -m>`.
 const MISSING_MARKER: &str = "vct-missing:";
 
-/// Runs vct on a remote whose config names no command.
+/// Remote shell command used when `[remotes].command` is unset.
 ///
-/// A non-interactive ssh session gets a bare `PATH`, without what a login
-/// profile or a version manager adds, so the usual install locations are
-/// tried in turn. The npm package's `vct` is a Node script, hence the `PATH`
-/// entry for the copy under `~/.nvm`. When none is present, prints the host's
-/// `(uname -s, uname -m)` marker so the caller can bootstrap `~/.local/bin/vct`
-/// over ssh.
+/// Probes common install paths because non-interactive ssh gets a minimal `PATH`, prepends the matching `~/.nvm` bin directory so the npm Node script can find `node`, and emits [`MISSING_MARKER`] with `<uname -s>:<uname -m>` if no binary is found.
 const LOCATE_AND_EXPORT: &str = concat!(
     "sh -c '",
     "for v in vct vibe_coding_tracker \"$HOME/.local/bin/vct\" \"$HOME/.local/bin/vibe_coding_tracker\" \"$HOME/.cargo/bin/vibe_coding_tracker\"; do ",
@@ -72,17 +62,13 @@ const INSTALL_AND_EXPORT: &str = concat!(
     "exec \"$dir/vct\" ledger export </dev/null'",
 );
 
-/// Scans this machine through its ledger and writes the export another
-/// machine fetches: `vct ledger export`.
+/// Refreshes this machine's session ledger and writes its JSON export to `writer`.
 ///
-/// Both halves of every session are brought up to date first in a single file
-/// discovery pass without folding in-memory summaries or reloading remote
-/// snapshots. A pricing fetch that fails classifies nothing, as in `vct usage`.
+/// Updates local provider sessions without reloading remote snapshots; if pricing data cannot be fetched, usage is exported without tier classification.
 ///
 /// # Errors
 ///
-/// Returns an error if the provider paths cannot be resolved, a scan fails
-/// outright, or `writer` cannot be written.
+/// Returns an error if provider paths cannot be resolved, the scan fails, or writing to `writer` fails.
 pub fn export(
     providers: ProvidersConfig,
     pool: &rayon::ThreadPool,
@@ -114,12 +100,9 @@ pub fn export_from_paths(
     ledger.write_export(writer)
 }
 
-/// Fetches every configured host's ledger and returns the hosts that failed,
-/// each with the reason.
+/// Fetches every configured host's ledger and returns `(host, error)` pairs for hosts that failed.
 ///
-/// With `VCT_OFFLINE` set nothing is fetched and the stored snapshots stand.
-/// The caller is waiting, so a host that does not answer within half a minute
-/// is given up on; [`spawn_sync_loop`] is the patient variant.
+/// Each host has 30 seconds to answer; see [`spawn_sync_loop`] for background polling with a longer timeout. Does nothing and returns an empty list when `VCT_OFFLINE` is set.
 pub fn sync(cache_dir: &Path, config: &RemotesConfig) -> Vec<(String, String)> {
     sync_within(cache_dir, config, ONE_SHOT_TIMEOUT)
 }
@@ -135,11 +118,9 @@ fn sync_within(
     fetch_all(cache_dir, config, OsStr::new("ssh"), timeout)
 }
 
-/// Removes the snapshots of hosts that are no longer in `config`.
+/// Removes stored snapshots for hosts no longer listed in `config`.
 ///
-/// Call it only with a config known to have parsed: a broken file reads as no
-/// hosts at all, and pruning on that would drop every snapshot, including
-/// those of hosts that cannot be fetched again right now.
+/// Call only with a successfully parsed config: an unparseable config yields an empty host list and would delete every stored snapshot.
 pub fn prune(cache_dir: &Path, config: &RemotesConfig) {
     prune_remotes(cache_dir, &snapshot_names(config));
 }
@@ -152,11 +133,9 @@ fn snapshot_names(config: &RemotesConfig) -> Vec<String> {
         .collect()
 }
 
-/// Keeps the snapshots current for as long as the process lives.
+/// Spawns a detached thread that polls configured hosts on `config.refresh_interval` (clamped to at least 60 s) until process exit.
 ///
-/// The first fetch starts at once on a detached thread, so a TUI opens on the
-/// snapshots already stored and picks up fresh ones at its next refresh.
-/// Failures go to the diagnostic log.
+/// Does nothing if `config.hosts` is empty. The first fetch runs immediately; failures are written to the diagnostic log.
 pub fn spawn_sync_loop(cache_dir: PathBuf, config: RemotesConfig) {
     if config.hosts.is_empty() {
         return;
@@ -450,10 +429,7 @@ fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<St
     })
 }
 
-/// The directory name a host's snapshot is stored under.
-///
-/// Anything but letters, digits and `._@-` becomes `_`, and so does a leading
-/// dot, so no host can name a path outside the remotes directory.
+/// Returns a sanitized directory name for `host`, replacing a leading `.` and any character outside ASCII alphanumerics and `._@-` with `_`.
 fn snapshot_name(host: &str) -> String {
     host.chars()
         .enumerate()

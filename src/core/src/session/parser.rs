@@ -1,3 +1,7 @@
+//! Entry points for parsing file-backed session logs into [`CodeAnalysis`].
+//!
+//! Callers that know the provider from the source directory should use [`parse_session_file_typed_as`]; content-based detection is provided by [`parse_session_file_typed`] and [`parse_session_file_typed_with_mode`].
+
 use crate::VERSION;
 use crate::constants::buffer;
 use crate::models::{
@@ -24,11 +28,7 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::rc::Rc;
 
-/// Content-safe warning summary used by the CLI's single-file path.
-///
-/// Public only because the binary is a separate workspace crate and so can
-/// reach nothing narrower than `pub`. The richer provider diagnostics stay
-/// crate-private.
+/// Content-safe partial-parse summary for single-file parsing.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SessionFileParseDiagnostics {
@@ -36,9 +36,7 @@ pub struct SessionFileParseDiagnostics {
 }
 
 impl SessionFileParseDiagnostics {
-    /// Number of malformed, unrecognized, or unsupported analyzer records that
-    /// an otherwise-successful parse skipped. Zero when the whole source
-    /// failed, since that surfaces as an error instead.
+    /// Returns the number of malformed, unrecognized, or unsupported records skipped during parsing.
     pub fn skipped_records(self) -> usize {
         self.skipped_records
     }
@@ -99,19 +97,9 @@ impl ParseWarningSummary {
     }
 }
 
-/// Parses a session file (JSONL or JSON) and returns the result as a
-/// `serde_json::Value`.
+/// Parses a session file at `path` and returns the result as a [`serde_json::Value`].
 ///
-/// A thin wrapper over [`parse_session_file_typed`], kept for library callers
-/// and the golden tests; the CLI's own single-file path goes through
-/// `parse_session_file_with_diagnostics`. An empty input yields `{}` (not a
-/// populated-but-empty `CodeAnalysis`), to preserve historical CLI behaviour.
-///
-/// # Errors
-///
-/// Returns an error if the file cannot be opened or read, if a nonempty source
-/// has no supported analyzer payload, or if the parsed [`crate::CodeAnalysis`]
-/// fails to serialise to a `serde_json::Value`.
+/// Auto-detects the provider via [`parse_session_file_typed`] in [`ParseMode::Full`]. Empty input yields `{}` rather than an empty [`CodeAnalysis`].
 ///
 /// # Examples
 ///
@@ -122,35 +110,22 @@ impl ParseWarningSummary {
 /// assert!(value.is_object());
 /// # Ok::<(), anyhow::Error>(())
 /// ```
+///
+/// # Errors
+///
+/// Returns an error if `path` cannot be read, if a non-empty file has no supported provider payload, or if serialization to [`serde_json::Value`] fails.
 pub fn parse_session_file_to_value<P: AsRef<Path>>(path: P) -> Result<Value> {
     let analysis = parse_session_file_typed(path)?;
     if analysis.records.is_empty() && analysis.extension_name.is_empty() {
-        // Empty input never reaches `finalize`, so a blank `extension_name`
-        // is what marks it.
+        // Empty input bypasses `finalize`, leaving `extension_name` blank as the sentinel.
         return Ok(serde_json::json!({}));
     }
     Ok(serde_json::to_value(&analysis)?)
 }
 
-/// Typed entry point that auto-detects the provider from file contents.
+/// Parses a session file at `path` in [`ParseMode::Full`], auto-detecting the provider from its contents.
 ///
-/// Prefer [`parse_session_file_typed_as`] whenever the caller already knows
-/// which provider the file belongs to (e.g. when walking
-/// `~/.claude/projects/*.jsonl` vs `~/.codex/sessions/*.jsonl`). Content-based
-/// detection is only intended for the CLI single-file path where the user
-/// hands us an arbitrary path.
-///
-/// Parses in [`ParseMode::Full`] — for callers that only consume tool
-/// counts and token usage (usage / aggregated analysis), use
-/// [`parse_session_file_typed_with_mode`] with [`ParseMode::UsageOnly`]
-/// to avoid allocating `write_file_details`/`edit_file_details` bodies.
-///
-/// # Errors
-///
-/// Returns an error if the file cannot be opened or read, if no record in a
-/// nonempty source has a recognized provider schema, or if every
-/// analyzer-relevant payload uses an unsupported schema. Empty input resolves
-/// to an empty [`CodeAnalysis`].
+/// Prefer [`parse_session_file_typed_as`] when the provider is known from the source directory, or [`parse_session_file_typed_with_mode`] with [`ParseMode::UsageOnly`] when per-operation detail bodies are not needed. Empty input returns an empty [`CodeAnalysis`].
 ///
 /// # Examples
 ///
@@ -161,24 +136,17 @@ pub fn parse_session_file_to_value<P: AsRef<Path>>(path: P) -> Result<Value> {
 /// println!("provider: {}", analysis.extension_name);
 /// # Ok::<(), anyhow::Error>(())
 /// ```
+///
+/// # Errors
+///
+/// Returns an error if `path` cannot be opened or read, if a non-empty file has no recognized provider records, or if every analyzer-relevant record uses an unsupported schema.
 pub fn parse_session_file_typed<P: AsRef<Path>>(path: P) -> Result<CodeAnalysis> {
     parse_session_file_typed_with_mode(path, ParseMode::Full)
 }
 
-/// Content-detecting typed parse with an explicit [`ParseMode`].
+/// Parses a session file at `path` with the given [`ParseMode`], auto-detecting the provider from its contents.
 ///
-/// Same auto-detection as [`parse_session_file_typed`], but the caller
-/// chooses whether to retain per-operation detail ([`ParseMode::Full`]) or
-/// only counts and totals ([`ParseMode::UsageOnly`]). The streaming path is
-/// tried first; only a file whose first line is not valid JSON (e.g. a
-/// pretty-printed single-object dump) falls back to reading the whole file.
-///
-/// # Errors
-///
-/// Returns an error if the file cannot be opened or read, if the fallback path
-/// cannot detect a provider, if no record in a nonempty source has a recognized
-/// provider schema, or if every analyzer-relevant payload uses an unsupported
-/// schema. Empty input resolves to an empty [`CodeAnalysis`].
+/// Empty input returns an empty [`CodeAnalysis`].
 ///
 /// # Examples
 ///
@@ -188,10 +156,13 @@ pub fn parse_session_file_typed<P: AsRef<Path>>(path: P) -> Result<CodeAnalysis>
 ///
 /// let analysis =
 ///     parse_session_file_typed_with_mode("session.jsonl", ParseMode::UsageOnly)?;
-/// // UsageOnly skips per-file detail bodies; counts still populate.
 /// assert!(analysis.records.iter().all(|r| r.write_file_details.is_empty()));
 /// # Ok::<(), anyhow::Error>(())
 /// ```
+///
+/// # Errors
+///
+/// Returns an error if `path` cannot be opened or read, if no provider can be detected, if a non-empty file has no recognized provider records, or if every analyzer-relevant record uses an unsupported schema.
 pub fn parse_session_file_typed_with_mode<P: AsRef<Path>>(
     path: P,
     mode: ParseMode,
@@ -199,7 +170,11 @@ pub fn parse_session_file_typed_with_mode<P: AsRef<Path>>(
     Ok(parse_session_file_with_diagnostics(path, mode)?.0)
 }
 
-/// Single-file parse with a content-safe partial-failure summary for the CLI.
+/// Parses a session file at `path` with auto-detection and returns a [`SessionFileParseDiagnostics`] summary alongside the [`CodeAnalysis`].
+///
+/// # Errors
+///
+/// Returns the same errors as [`parse_session_file_typed_with_mode`].
 #[doc(hidden)]
 pub fn parse_session_file_with_diagnostics<P: AsRef<Path>>(
     path: P,
@@ -218,8 +193,7 @@ fn parse_session_file_typed_with_mode_internal(
     path: &Path,
     mode: ParseMode,
 ) -> Result<ParsedAnalysis> {
-    // A compressed `dsh` log is the one binary session format, so it is routed
-    // by its frame magic before anything tries to read the file as text.
+    // Route compressed `dsh` logs by zstd frame magic before attempting UTF-8 line reading.
     if has_zstd_magic(path) {
         return Ok(finalize(
             parse_dsh_session(path, mode, None)?,
@@ -231,9 +205,7 @@ fn parse_session_file_typed_with_mode_internal(
         return Ok(parsed);
     }
 
-    // Fallback for anything the streaming path could not peek (e.g. a
-    // hand-edited file whose first line is not valid JSON). This is also the
-    // normal path for Grok's pretty-printed `signals.json` object.
+    // Whole-file fallback for non-JSONL files, including pretty-printed Grok `signals.json`.
     let data = match read_jsonl(path) {
         Ok(data) => data,
         Err(_) => read_json(path)?,
@@ -247,22 +219,9 @@ fn parse_session_file_typed_with_mode_internal(
     dispatch_by_vec(data, ext_type, mode, path, None)
 }
 
-/// Typed entry point when the caller already knows the provider.
+/// Parses a session file at `path` as `provider` with the given [`ParseMode`], skipping content-based detection.
 ///
-/// Directory scanners should use this instead of [`parse_session_file_typed`]
-/// so that provider classification follows the source path — `~/.claude/projects`
-/// is always [`ExtensionType::ClaudeCode`], `~/.codex/sessions` is always
-/// [`ExtensionType::Codex`], and so on. This eliminates a whole class of bug
-/// where a metadata sentinel record at the top of a session (`permission-mode`,
-/// `file-history-snapshot`) leads the content-based detector to mis-file the
-/// log under another provider and silently drop its usage totals.
-///
-/// # Errors
-///
-/// Returns an error if the file cannot be opened or read, if no record in a
-/// nonempty source has a recognized schema for `provider`, or if every
-/// analyzer-relevant payload uses an unsupported schema. Empty input resolves
-/// to an empty [`CodeAnalysis`].
+/// Empty input returns an empty [`CodeAnalysis`].
 ///
 /// # Examples
 ///
@@ -271,7 +230,6 @@ fn parse_session_file_typed_with_mode_internal(
 /// use vct_core::session::ParseMode;
 /// use vct_core::ExtensionType;
 ///
-/// // A file walked out of `~/.claude/projects` is known to be Claude Code.
 /// let analysis = parse_session_file_typed_as(
 ///     "session.jsonl",
 ///     ExtensionType::ClaudeCode,
@@ -280,6 +238,10 @@ fn parse_session_file_typed_with_mode_internal(
 /// # let _ = analysis;
 /// # Ok::<(), anyhow::Error>(())
 /// ```
+///
+/// # Errors
+///
+/// Returns an error if `path` cannot be opened or read, if a non-empty file has no recognized records for `provider`, or if every analyzer-relevant record uses an unsupported schema.
 pub fn parse_session_file_typed_as<P: AsRef<Path>>(
     path: P,
     provider: ExtensionType,
@@ -301,8 +263,7 @@ pub(crate) fn parse_session_file_typed_as_with_diagnostics(
         return Ok(parsed);
     }
 
-    // Fallback for empty files or anything the streaming peek could not
-    // parse on line one.
+    // Whole-file fallback for empty files or multi-line JSON documents.
     let data = match read_jsonl(path) {
         Ok(data) => data,
         Err(_) => read_json(path)?,
@@ -315,21 +276,7 @@ pub(crate) fn parse_session_file_typed_as_with_diagnostics(
     dispatch_by_vec(data, provider, mode, path, tiers)
 }
 
-/// Streaming path when the provider is known from the caller's source.
-///
-/// Peeks only the first non-empty line to split a JSONL file (where each line
-/// is a record) from a pretty-printed single-object JSON (which parses as a
-/// multi-line block and therefore fails `from_str` on line one). No detection
-/// happens here — the provider was decided by the path the file came from.
-///
-/// Returns `Ok(None)` for an empty file or one whose first line is not JSONL,
-/// signalling the caller to use the `read_json` fallback.
-///
-/// # Errors
-///
-/// Returns an error if the file cannot be opened or a line cannot be read, or
-/// if the chosen provider's dispatch step fails (the Gemini arm requires a
-/// parseable session-meta first line).
+/// Streams a file for a known `provider`, returning `Ok(None)` if empty or not line-delimited JSON.
 fn stream_parse_known(
     path: &Path,
     provider: ExtensionType,
@@ -366,14 +313,12 @@ fn stream_parse_known(
                 provider,
             )))
         }
-        // A `dsh` log is binary by default (concatenated zstd frames), so it
-        // never goes near the shared line reader.
+        // DeepSeek logs are concatenated zstd frames by default, so `parse_dsh_session` reads them directly.
         ExtensionType::DeepSeek => Ok(Some(finalize(
             parse_dsh_session(path, mode, tiers)?,
             provider,
         ))),
-        // The model map comes from the conversation database beside the log,
-        // so the parser opens the transcript itself.
+        // Antigravity joins transcript steps against a sibling SQLite DB, so its parser opens the path directly.
         ExtensionType::Antigravity => Ok(Some(finalize(
             parse_antigravity_session(path, mode, tiers)?,
             provider,
@@ -396,12 +341,13 @@ fn stream_parse_known_dynamic(
     let mut lines_read = 0_usize;
     let first_line = match read_next_non_empty_line(&mut reader, &mut lines_read)? {
         Some(line) => line,
-        None => return Ok(None), // empty file — caller returns the empty shape
+        None => return Ok(None),
     };
 
     let first_value: Value = match serde_json::from_str(first_line.trim()) {
         Ok(v) => v,
-        Err(_) => return Ok(None), // not JSONL → caller falls back to read_json
+        // Not JSONL; defer to whole-file `read_json`.
+        Err(_) => return Ok(None),
     };
 
     let parsed = dispatch_streaming_buffered(
@@ -423,13 +369,11 @@ struct TypedStream<T> {
     reader: BufReader<File>,
     diagnostics: ParseDiagnostics,
     warnings: ParseWarningSummary,
-    /// Physical lines the first record consumed, so the rest of the file keeps
-    /// reporting real line numbers.
+    /// Physical lines consumed while reading the first record, keeping subsequent warning line numbers accurate.
     lines_read: usize,
 }
 
-/// Push-based JSONL line streamer that borrows each record directly from one
-/// reusable byte buffer instead of allocating owned per-line values.
+/// Streams JSONL lines into `on_line` using one reusable byte buffer, returning `Ok(None)` if empty or non-JSONL.
 pub(crate) fn stream_jsonl_borrowed<S>(
     path: &Path,
     provider: ExtensionType,
@@ -513,10 +457,7 @@ pub(crate) fn stream_jsonl_borrowed<S>(
     Ok(Some(finalize(parsed, provider)))
 }
 
-/// Opens a JSONL source and parses its first record directly into `T`.
-///
-/// A raw `Value` is only materialized after typed deserialization fails, so
-/// successful records avoid building a second JSON tree solely for dispatch.
+/// Opens a JSONL file and deserializes its first non-empty line into `T`, returning `Ok(None)` if empty or non-JSONL.
 fn prepare_typed_stream<T>(path: &Path, provider: ExtensionType) -> Result<Option<TypedStream<T>>>
 where
     T: DeserializeOwned,
@@ -547,9 +488,7 @@ where
                 );
                 None
             }
-            // A first line that is not a complete JSON value indicates a
-            // pretty-printed document. Let the caller use the whole-file
-            // fallback instead of treating it as malformed JSONL.
+            // Incomplete JSON on line one indicates a pretty-printed document; defer to whole-file fallback.
             Err(_) => return Ok(None),
         },
     };
@@ -563,31 +502,7 @@ where
     }))
 }
 
-/// Streaming path when the provider is unknown.
-///
-/// Reads JSONL records one line at a time and feeds a stateful classifier that
-/// commits to a provider as soon as any record carries a distinctive marker.
-/// The classifier returns `None` until it sees a positive signal, so this loop
-/// keeps peeking until one appears (or EOF): a Claude metadata preamble has no
-/// bounded length, and the previous fixed 8-record peek window silently
-/// mis-classified any session whose first `parentUuid` record sat past it as
-/// Codex, dropping that session's usage.
-///
-/// If the entire file is consumed without any marker firing, the default is
-/// Codex. The recorded reason is a likelihood tradeoff rather than a proof: a
-/// real Codex rollout log does carry one of the recognised `type` values, so a
-/// file with no marker at all is more likely a deliberately-empty Codex fixture
-/// than a silently-broken Claude log. Nothing in the marker set forces that
-/// answer — treat it as the tie-break it is.
-///
-/// Returns `Ok(None)` when the file is empty or its first line is not JSON
-/// (a pretty-printed dump), signalling the caller to use the `read_json`
-/// fallback.
-///
-/// # Errors
-///
-/// Returns an error if the file cannot be opened or a line cannot be read, or
-/// if the resolved provider's dispatch step fails.
+/// Streams a JSONL file while classifying its provider, returning `Ok(None)` if empty or non-JSONL.
 fn stream_parse_autodetect(path: &Path, mode: ParseMode) -> Result<Option<ParsedAnalysis>> {
     let file =
         File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
@@ -599,8 +514,7 @@ fn stream_parse_autodetect(path: &Path, mode: ParseMode) -> Result<Option<Parsed
     let mut initial_diagnostics = ParseDiagnostics::default();
     let mut classifier = RecordClassifier::default();
     let warnings = Rc::new(RefCell::new(ParseWarningSummary::default()));
-    // Physical lines, blank ones included, so the number a malformed record is
-    // reported under is the one an editor shows.
+    // Count all physical lines (including blanks) so warning line numbers match editor lines.
     let mut lines_read = 0_usize;
 
     loop {
@@ -620,11 +534,7 @@ fn stream_parse_autodetect(path: &Path, mode: ParseMode) -> Result<Option<Parsed
                 }
             }
             Err(err) => {
-                // A non-JSON line on the very first record means the file is a
-                // pretty-printed single-object document (Grok's
-                // `signals.json`); let the caller fall through to `read_json`.
-                // Past that, at least one valid record is already buffered —
-                // stop peeking and let the dispatcher decide.
+                // Non-JSON on the first record means a multi-line JSON file; defer to `read_json`. Later lines are malformed JSONL records.
                 if buffered.is_empty() {
                     first_line_was_json = Some(false);
                     break;
@@ -658,17 +568,7 @@ fn stream_parse_autodetect(path: &Path, mode: ParseMode) -> Result<Option<Parsed
     Ok(Some(finalize(parsed, ext)))
 }
 
-/// Reads lines from `reader` until it finds a non-empty one. Returns `Ok(None)`
-/// at EOF.
-///
-/// `consumed` counts every physical line read, blank ones included, so a caller
-/// that continues the file with another reader can keep reporting the same line
-/// numbers the user sees in an editor.
-///
-/// # Errors
-///
-/// Returns an error if the underlying `read_line` fails (e.g. an I/O error or
-/// invalid UTF-8 in the stream).
+/// Returns the next non-empty line from `reader` (or `None` at EOF), incrementing `consumed` for every physical line read.
 fn read_next_non_empty_line<R: BufRead>(
     reader: &mut R,
     consumed: &mut usize,
@@ -689,9 +589,7 @@ fn read_next_non_empty_line<R: BufRead>(
     }
 }
 
-/// Reuses `line` while reading through blank lines to the next JSONL record.
-///
-/// `consumed` counts physical lines exactly as in [`read_next_non_empty_line`].
+/// Reads the next non-empty line into `line`, incrementing `consumed` for every physical line read and returning `false` at EOF.
 fn read_next_non_empty_bytes<R: BufRead>(
     reader: &mut R,
     line: &mut Vec<u8>,
@@ -724,12 +622,7 @@ fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
     &bytes[start..end]
 }
 
-/// Streams the rest of the file, prepending any already-parsed records.
-///
-/// Claude / Codex / Copilot turn each buffered `Value` into their typed record
-/// and chain the remaining reader; Gemini's parser consumes `Value`s directly.
-/// Grok drops the reader and reopens by path, because its parser also reads the
-/// sibling `summary.json` and `updates.jsonl`.
+/// Dispatches `buffered` records followed by the remaining lines of `reader` to the parser for `ext`.
 #[allow(clippy::too_many_arguments)] // parse plumbing; a struct would obscure the seams
 fn dispatch_streaming_buffered(
     ext: ExtensionType,
@@ -788,9 +681,7 @@ fn dispatch_streaming_buffered(
                 .map(|parsed| merge_extra_diagnostics(parsed, &extra_diagnostics))
         }
         ExtensionType::Gemini => {
-            // Gemini's first line is the session-meta record and every later
-            // line an event, so the first buffered value is peeled off before
-            // the rest of the stream reaches the event parser.
+            // Peel off Gemini's first-line session-meta record before streaming event lines.
             (|| {
                 let mut iter = buffered.into_iter();
                 let first = iter
@@ -814,8 +705,7 @@ fn dispatch_streaming_buffered(
             drop(reader);
             parse_grok_session(path, mode)
         }
-        // Only an uncompressed `dsh` root reaches this path; the parser reopens
-        // the file so the zstd and plain layouts stay one code path.
+        // Reopen uncompressed `dsh` logs so plain and zstd layouts share `parse_dsh_session`.
         ExtensionType::DeepSeek => {
             drop(reader);
             parse_dsh_session(path, mode, tiers)
@@ -824,14 +714,11 @@ fn dispatch_streaming_buffered(
             drop(reader);
             parse_antigravity_session(path, mode, tiers)
         }
-        // OpenCode stores sessions in a SQLite database, not a JSONL file, so
-        // it never flows through the file parser. See `session::opencode`.
+        // SQLite-backed providers are not file streams; see `session::opencode`.
         ExtensionType::OpenCode => Ok(empty_parsed_analysis()),
-        // Cursor sessions live in per-conversation SQLite blob stores, never a
-        // JSONL file. See `session::cursor`.
+        // SQLite-backed providers are not file streams; see `session::cursor`.
         ExtensionType::Cursor => Ok(empty_parsed_analysis()),
-        // Hermes stores usage in a single SQLite database, not a JSONL file, so
-        // it never flows through the file parser. See `session::hermes`.
+        // SQLite-backed providers are not file streams; see `session::hermes`.
         ExtensionType::Hermes => Ok(empty_parsed_analysis()),
     };
     warnings.borrow().emit(path);
@@ -850,12 +737,7 @@ fn json_error_category(error: &serde_json::Error) -> &'static str {
     }
 }
 
-/// Iterator that deserializes JSONL records directly into the provider model.
-///
-/// The line buffer is retained across iterations. A raw `Value` is only built
-/// when typed deserialization fails and diagnostics need to classify the
-/// unsupported record. `lines_read` is how many physical lines the caller
-/// already consumed from `reader`, so reported line numbers stay absolute.
+/// Yields JSONL records deserialized directly into `T`, offsetting reported line numbers by `lines_read`.
 fn iter_jsonl_typed<'a, T>(
     reader: &'a mut BufReader<File>,
     provider: ExtensionType,
@@ -911,18 +793,7 @@ where
     })
 }
 
-/// Iterator that yields raw [`Value`]s, one per non-empty line in the reader.
-///
-/// Gemini's parser consumes `Value`s directly, which is how a walked Gemini
-/// session is parsed: `stream_parse_known`'s `_` arm routes it here with no
-/// classifier involved. The auto-detect path sends Claude / Codex / Copilot
-/// through this too, since the classifier has already materialized their
-/// buffered prefix as `Value`s; those three convert each one into their typed
-/// record straight away.
-///
-/// `lines_read` is how many physical lines the caller already consumed from
-/// `reader` — the buffered prefix on the auto-detect path — so reported line
-/// numbers stay absolute instead of restarting at 1.
+/// Yields one [`Value`] per non-empty JSONL line from `reader`, offsetting reported line numbers by `lines_read`.
 fn iter_jsonl_values<'a>(
     reader: &'a mut BufReader<File>,
     lines_read: usize,
@@ -930,8 +801,7 @@ fn iter_jsonl_values<'a>(
     warnings: Rc<RefCell<ParseWarningSummary>>,
     io_failure: Rc<RefCell<Option<String>>>,
 ) -> impl Iterator<Item = Value> + 'a {
-    // Reuse one byte buffer via `read_until` instead of allocating a `String`
-    // per line (`reader.lines()`).
+    // Reuse one byte buffer via `read_until` instead of allocating a `String` per line.
     let mut line = Vec::with_capacity(buffer::AVG_JSONL_LINE_SIZE);
     let mut line_number = lines_read;
 
@@ -1134,9 +1004,7 @@ fn raw_record_kind(provider: ExtensionType, value: &Value) -> (bool, bool) {
             (recognized, relevant)
         }
         ExtensionType::Gemini => (false, false),
-        // Grok, DeepSeek and Antigravity run their own readers (and the SQLite
-        // providers are not files at all), so no record of theirs ever reaches
-        // the typed-stream path this classifies for.
+        // These providers either use dedicated readers or SQLite and never enter the typed-stream path.
         ExtensionType::Grok
         | ExtensionType::DeepSeek
         | ExtensionType::Antigravity
@@ -1154,11 +1022,7 @@ fn merge_extra_diagnostics(
     parsed
 }
 
-/// Whole-file dispatch over an already-materialised `Vec<Value>`.
-///
-/// Reached only when the streaming peek could not read line one as JSON, which
-/// in practice means a pretty-printed single-object document such as Grok's
-/// `signals.json`.
+/// Dispatches a whole-file `Vec<Value>` fallback (such as pretty-printed JSON) to the parser for `ext_type`.
 fn dispatch_by_vec(
     data: Vec<Value>,
     ext_type: ExtensionType,
@@ -1191,11 +1055,7 @@ fn dispatch_by_vec(
         | ExtensionType::OpenCode
         | ExtensionType::Cursor
         | ExtensionType::Hermes => {
-            // Gemini only supports the JSONL event stream, while OpenCode,
-            // Cursor, and Hermes are read from SQLite, not a file. A file that
-            // falls through to this branch (e.g. a stray pretty-printed export)
-            // has no parser for its shape — return an empty analysis instead of
-            // silently mis-parsing.
+            // Gemini requires JSONL and the SQLite providers are not file-backed; mark whole-file fallbacks unrecognized.
             let mut diagnostics = ParseDiagnostics::default();
             for _ in data {
                 diagnostics.record_unrecognized();
@@ -1296,8 +1156,7 @@ mod tests {
 
         let mut reader = BufReader::new(File::open(&path).unwrap());
         let mut lines_read = 0_usize;
-        // Every streaming entry point consumes the first record before handing
-        // the rest of the file to the iterator.
+        // Mimic streaming entry points that consume the first record before creating the iterator.
         read_next_non_empty_line(&mut reader, &mut lines_read)
             .unwrap()
             .unwrap();

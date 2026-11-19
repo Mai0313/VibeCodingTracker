@@ -1,11 +1,6 @@
-//! Codex `wham/usage` + reset-credit details client and token refresh.
+//! Codex `wham/usage` client, reset-credit details client, and OAuth token refresh.
 //!
-//! Reads the bearer token + account id from `~/.codex/auth.json`, calls the
-//! ChatGPT backend usage endpoint, and maps the response into the normalized
-//! [`CodexQuotaSnapshot`]. On a 401 the caller refreshes the token via
-//! [`refresh_codex`] (which rotates and writes back the refresh token) and
-//! retries. Tokens are never logged nor stored in a `Debug`-formatted struct;
-//! only the HTTP status appears in errors.
+//! Reads credentials from `~/.codex/auth.json` and maps backend responses into [`CodexQuotaSnapshot`]. Tokens are never logged or included in error messages; only HTTP status codes are reported.
 
 use crate::models::{
     CodexAuthJson, CodexQuotaSnapshot, CodexRefreshResponse, QuotaSource, QuotaWindow,
@@ -19,26 +14,21 @@ use serde_json::{Value, json};
 use std::path::Path;
 use std::sync::OnceLock;
 
-/// The ChatGPT backend usage endpoint (production default; injectable in tests).
+/// ChatGPT backend quota usage endpoint.
 pub(crate) const WHAM_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
-/// The earned reset-credit details endpoint (production default; injectable in tests).
+/// ChatGPT backend earned reset-credit details endpoint.
 pub(crate) const WHAM_RESET_CREDITS_URL: &str =
     "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
-/// The Codex OAuth token endpoint (production default; injectable in tests).
+/// Codex OAuth token refresh endpoint.
 pub(crate) const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 /// The Codex OAuth client id (public PKCE client).
 const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-/// Fallback Codex CLI version for the User-Agent when `codex --version` cannot be
-/// resolved. Bump occasionally.
+/// Fallback Codex CLI version for the `User-Agent` header when `codex --version` is unavailable.
 const CODEX_FALLBACK_VERSION: &str = "0.142.5";
-/// Codex CLI originator (headless invocation; the TUI reports `codex-tui`). Sent
-/// only for client-identity parity; the ChatGPT usage endpoint does not need it.
+/// Headless Codex CLI `originator` header value sent for client-identity parity.
 const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 
-/// Builds the Codex CLI request User-Agent, e.g. `codex_cli_rs/0.142.5 (linux; x86_64)`.
-///
-/// The version is detected from the installed CLI (see
-/// [`crate::quota::http::detect_cli_version`]); os/arch come from the build target.
+/// Returns the Codex CLI `User-Agent` header value, using [`crate::quota::http::detect_cli_version`] and target OS/arch.
 fn codex_ua() -> &'static str {
     static UA: OnceLock<String> = OnceLock::new();
     UA.get_or_init(|| {
@@ -133,8 +123,7 @@ pub fn map_wham_response(body: &str, now: i64) -> Result<CodexQuotaSnapshot> {
         None => (None, None),
     };
 
-    // A limit is "reached" if the rate window, the credit overage, or the spend
-    // cap says so. Stay `None` only when no source reports at all.
+    // Report `Some(true)` if any limit source is reached, `Some(false)` if any reported false, and `None` only when none reported.
     let reached = [rate_reached, overage, spend_reached];
     let limit_reached = reached
         .iter()
@@ -161,18 +150,13 @@ pub fn map_wham_response(body: &str, now: i64) -> Result<CodexQuotaSnapshot> {
     })
 }
 
-/// Maps reset-credit details into the authoritative count plus sorted expiry
-/// times for credits whose status is `available`.
+/// Maps a `wham/rate-limit-reset-credits` response into `(available_count, expirations)` for `available` credits.
 ///
-/// The expiry list may be shorter than the count because the backend can cap
-/// detail rows. `None` entries sort last and mean the credit never expires. A
-/// `None` count means the response did not report one, leaving whatever
-/// wham/usage already said standing.
+/// `expirations` is sorted ascending with non-expiring (`None`) credits last, and may contain fewer entries than `available_count` when the backend truncates detail rows. A `None` count indicates the response omitted `available_count`.
 ///
 /// # Errors
 ///
-/// Returns an error when the response shape or an available credit's RFC3339
-/// expiry is malformed.
+/// Returns an error if the JSON shape or any available credit's RFC3339 `expires_at` timestamp is malformed.
 pub fn map_reset_credits_response(body: &str) -> Result<(Option<i64>, Vec<Option<i64>>)> {
     let resp: WhamResetCreditsDetails = serde_json::from_str(body)
         .context("Failed to parse wham/rate-limit-reset-credits response")?;
@@ -196,8 +180,7 @@ pub fn map_reset_credits_response(body: &str) -> Result<(Option<i64>, Vec<Option
     Ok((available_count, expirations))
 }
 
-/// Extracts a `[low, high]` approximate-messages pair, dropping one whose upper
-/// bound is zero (no credits → nothing useful to show).
+/// Extracts a `(low, high)` approximate-messages pair, returning `None` when `high <= 0`.
 fn approx_pair(v: &Option<Vec<i64>>) -> Option<(i64, i64)> {
     let v = v.as_ref()?;
     let low = *v.first()?;
@@ -232,8 +215,7 @@ pub enum WhamResult {
 
 /// Outcome of the optional reset-credit details request.
 pub enum ResetCreditsResult {
-    /// Authoritative count plus sorted available-credit expirations. A `None`
-    /// count means the response omitted it; keep the one wham/usage reported.
+    /// Authoritative count (`None` if omitted by the response) plus sorted available-credit expirations.
     Ok {
         available_count: Option<i64>,
         expirations: Vec<Option<i64>>,
@@ -323,25 +305,19 @@ pub fn call_reset_credit_details(
     }
 }
 
-/// Fetches the raw `wham/usage` response for `vct quota codex`.
+/// Fetches the raw `wham/usage` response as `(status_code, body)` using the stored access token verbatim.
 ///
-/// Uses the stored access token verbatim (no refresh, no file writes) and
-/// returns `(status_code, body)`. A non-2xx status is left for the caller to
-/// surface.
+/// Does not refresh tokens or modify `auth.json`; non-2xx responses are returned as `Ok((status, body))`.
 ///
 /// # Errors
 ///
-/// Returns an error if `auth.json` is missing, has no access token, or the
-/// request cannot be sent.
+/// Returns an error if `auth.json` is missing, has no access token, or the HTTP request fails.
 pub fn fetch_codex_raw(client: &reqwest::blocking::Client) -> Result<(u16, String)> {
     let auth_path = crate::utils::resolve_paths()?.codex_dir.join("auth.json");
     fetch_codex_raw_from(client, WHAM_URL, &auth_path)
 }
 
-/// The injectable core of [`fetch_codex_raw`]: reads the token from an explicit
-/// `auth.json` path and fetches the raw usage body from an explicit `wham_url`.
-/// Production passes [`WHAM_URL`] + `~/.codex/auth.json`; tests point them at a
-/// local mock server and a temp auth file.
+/// Injectable core of [`fetch_codex_raw`] reading credentials from `auth_path` and querying `wham_url`.
 pub(crate) fn fetch_codex_raw_from(
     client: &reqwest::blocking::Client,
     wham_url: &str,
@@ -365,24 +341,19 @@ pub(crate) fn fetch_codex_raw_from(
     Ok((status, text))
 }
 
-/// Refreshes the Codex token and writes it back (rotation-safe). Returns the new
-/// access token.
+/// Refreshes the Codex OAuth token at `auth_path`, writes the rotated credentials back, and returns the new access token.
 ///
-/// The refresh token rotates: the response's new refresh token must be persisted
-/// or the next refresh reuses the old one and 401s. The write-back re-checks the
-/// file mtime and aborts if a concurrent Codex CLI rotated it first.
+/// Guards the write-back on `auth_path`'s pre-read mtime so a concurrent rotation by the Codex CLI is not overwritten. Tokens never appear in returned errors.
 ///
 /// # Errors
 ///
-/// Returns an error if the auth file has no refresh token, the request fails, or
-/// the status is non-success. The token never appears in an error.
+/// Returns an error if `auth_path` cannot be read or has no refresh token, if the token endpoint fails or returns a non-2xx status, or if the rotated token cannot be persisted.
 pub fn refresh_codex(
     client: &reqwest::blocking::Client,
     auth_path: &Path,
     token_url: &str,
 ) -> Result<String> {
-    // Capture the mtime before the read, so a concurrent rewrite by the official
-    // CLI aborts the write-back instead of clobbering the token it just rotated.
+    // Capture mtime before reading so a concurrent CLI rotation aborts write-back instead of being clobbered.
     let expected_mtime = file_mtime(auth_path);
     let body = std::fs::read_to_string(auth_path)
         .with_context(|| format!("Failed to read {}", auth_path.display()))?;
@@ -434,9 +405,7 @@ pub fn refresh_codex(
         root["last_refresh"] = json!(now_rfc3339_utc_nanos());
         Ok(())
     })?;
-    // The refresh already rotated the refresh token server-side; if we could not
-    // persist the new one, auth.json now holds a stale/invalid refresh token, so
-    // treat it as a refresh failure rather than reporting success.
+    // Server-side rotation already invalidated the old refresh token; fail rather than reporting success with a stale `auth.json`.
     if !wrote {
         bail!("codex token rotated but the new token could not be persisted");
     }
@@ -655,13 +624,11 @@ mod tests {
 
     #[test]
     fn limit_reached_is_none_when_unreported() {
-        // No rate_limit / credits / spend_control at all → stays None.
         let snap = map_wham_response(r#"{"plan_type":"plus"}"#, 1).unwrap();
         assert_eq!(snap.limit_reached, None);
     }
 
-    /// Version probing is off outside the binary, so the User-Agent is built
-    /// from the fallback and is stable enough to assert on.
+    /// Uses the fallback version under test while CLI version probing is disabled.
     #[test]
     fn codex_ua_uses_the_fallback_version_under_test() {
         assert_eq!(

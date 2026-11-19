@@ -10,20 +10,14 @@ fn main() {
     println!("cargo:rustc-env=BUILD_RUST_VERSION={}", rust_version);
     println!("cargo:rustc-env=BUILD_CARGO_VERSION={}", cargo_version);
 
-    // Emitting any `rerun-if-changed` opts out of Cargo's default "re-run when
-    // any package file changes", so the stamped version refreshes when HEAD or
-    // the index moves rather than on every source edit. This crate is a
-    // workspace member, so `<crate>/.git` does not exist; resolve the
-    // repository's real git dir instead (a file->dir indirection under a git
-    // worktree).
+    // Emitting `rerun-if-changed` opts out of Cargo's default package-wide rebuild trigger so the build version refreshes only when HEAD or the index changes. Use the resolved git dir because workspace members have no `<crate>/.git` and worktrees use a `.git` file indirection.
     if let Some(git_dir) = git_dir() {
         println!("cargo:rerun-if-changed={git_dir}/HEAD");
         println!("cargo:rerun-if-changed={git_dir}/index");
     }
 }
 
-/// Absolute path to the repository's git dir (worktree-aware), or `None`
-/// outside a git checkout (e.g. a packaged `.crate`).
+/// Returns the repository's absolute git dir (worktree-aware), or `None` outside a git checkout.
 fn git_dir() -> Option<String> {
     let output = Command::new("git")
         .args(["rev-parse", "--absolute-git-dir"])

@@ -1,18 +1,6 @@
-//! Shared session-file parsing layer.
+//! Session parsing layer that normalizes provider logs and databases into [`crate::CodeAnalysis`].
 //!
-//! Every supported provider writes its session history to disk in a
-//! provider-specific JSON, JSONL (zstd-framed for DeepSeek Harness), or SQLite
-//! shape.
-//! This module owns the "turn raw bytes into a typed
-//! [`crate::CodeAnalysis`]" boundary so both of the features that consume
-//! session files — [`crate::analysis`] (aggregated tool-call metrics) and
-//! [`crate::usage`] (aggregated token counts) — share the same parsers
-//! and intermediate shape instead of one feature reaching into the other.
-//!
-//! Naming convention: the file-backed providers expose `parse_*` entry points
-//! (`parse_session_file_*`), while the SQLite-backed providers (OpenCode /
-//! Cursor / Hermes) expose `read_*` entry points, since they query a database
-//! rather than parse a byte stream.
+//! File-backed providers (JSON, JSONL, and zstd-framed JSONL for DeepSeek Harness) expose `parse_*` entry points; SQLite-backed providers (OpenCode, Cursor, Hermes) expose `read_*` entry points.
 pub(crate) mod antigravity;
 pub mod claude;
 pub mod codex;
