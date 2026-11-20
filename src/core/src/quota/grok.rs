@@ -414,23 +414,75 @@ fn refresh_grok(
     Ok((access, expires_at))
 }
 
-/// Returns `(status_code, body)` from `/v1/billing?format=credits` using the stored access token.
+/// Sends one raw `GET` request to `usage_url` and returns `(status_code, body)`.
+fn send_grok_usage_raw(
+    client: &Client,
+    usage_url: &str,
+    token: &str,
+    user_id: Option<&str>,
+) -> Result<(u16, String)> {
+    let resp = grok_request(client, usage_url, token, user_id)
+        .send()
+        .context("Failed to send Grok billing request")?;
+    let status = resp.status().as_u16();
+    let text = resp
+        .text()
+        .context("Failed to read Grok billing response body")?;
+    Ok((status, text))
+}
+
+/// Discovers the OIDC token endpoint for `cred` and refreshes it once in place, returning the new access token or logging a warning on failure.
+fn try_refresh_grok(
+    client: &Client,
+    path: &Path,
+    cred: &GrokCredential,
+    expected_mtime: Option<SystemTime>,
+) -> Option<String> {
+    if !cred.is_refreshable() {
+        log::warn!("grok token expired and this login cannot be refreshed");
+        return None;
+    }
+    let issuer = cred.issuer()?;
+    let token_url = match discover_token_endpoint(client, issuer) {
+        Ok(url) => url,
+        Err(e) => {
+            log::warn!("grok OIDC discovery failed: {e}");
+            return None;
+        }
+    };
+    match refresh_grok(client, path, cred, expected_mtime, &token_url) {
+        Ok((access, _)) => Some(access),
+        Err(e) => {
+            log::warn!("grok token refresh failed: {e}");
+            None
+        }
+    }
+}
+
+/// Returns `(status_code, body)` from `/v1/billing?format=credits`.
 ///
-/// Does not refresh the token or modify `auth.json`. Non-2xx responses are returned as `Ok((status_code, body))`.
+/// Refreshes OAuth tokens proactively within [`EXPIRY_SKEW_SECS`] of expiry and reactively once on HTTP 401/403 via OIDC discovery, persisting rotated tokens into the matching `auth.json` entry with an mtime guard. Non-2xx responses (including the original 401/403 when refresh fails) are returned as `Ok((status_code, body))`.
 ///
 /// # Errors
 ///
 /// Returns an error if the auth path cannot be resolved, `auth.json` is missing or holds no usable login, or the HTTP request or body read fails.
 pub fn fetch_grok_raw(client: &Client) -> Result<(u16, String)> {
-    fetch_grok_raw_from(client, GROK_BILLING_URL, &get_grok_auth_path()?)
+    fetch_grok_raw_from(
+        client,
+        GROK_BILLING_URL,
+        &get_grok_auth_path()?,
+        chrono::Local::now().timestamp(),
+    )
 }
 
-/// Returns `(status_code, body)` from `billing_url` using credentials read from `auth_path`.
+/// Injectable core of [`fetch_grok_raw`] querying `billing_url` using credentials from `auth_path` relative to `now_secs`.
 pub(crate) fn fetch_grok_raw_from(
     client: &Client,
     billing_url: &str,
     auth_path: &Path,
+    now_secs: i64,
 ) -> Result<(u16, String)> {
+    let expected_mtime = file_mtime(auth_path);
     let body = std::fs::read_to_string(auth_path).with_context(|| {
         format!(
             "no Grok credentials at {} ({GROK_LOGIN_HINT})",
@@ -443,13 +495,36 @@ pub(crate) fn fetch_grok_raw_from(
             auth_path.display()
         )
     })?;
-    let resp = grok_request(client, billing_url, cred.access_token(), cred.user_id())
-        .send()
-        .context("Failed to send Grok billing request")?;
-    let status = resp.status().as_u16();
-    let text = resp
-        .text()
-        .context("Failed to read Grok billing response body")?;
+    let user_id = cred.user_id().map(str::to_string);
+
+    let mut attempted_refresh = false;
+    let token = if is_expiring(cred.expires_at_secs(), now_secs, EXPIRY_SKEW_SECS) {
+        attempted_refresh = true;
+        try_refresh_grok(client, auth_path, &cred, expected_mtime)
+            .unwrap_or_else(|| cred.access_token().to_string())
+    } else {
+        cred.access_token().to_string()
+    };
+
+    let (status, text) = send_grok_usage_raw(client, billing_url, &token, user_id.as_deref())?;
+    let unauthorized = status == reqwest::StatusCode::UNAUTHORIZED.as_u16()
+        || status == reqwest::StatusCode::FORBIDDEN.as_u16();
+    if unauthorized && !attempted_refresh {
+        let reactive_mtime = file_mtime(auth_path);
+        if let Ok(fresh_body) = std::fs::read_to_string(auth_path)
+            && let Some(fresh_cred) = select_grok_entry(&fresh_body)
+            && let Some(fresh_token) =
+                try_refresh_grok(client, auth_path, &fresh_cred, reactive_mtime)
+        {
+            let fresh_uid = fresh_cred.user_id().map(str::to_string);
+            return send_grok_usage_raw(
+                client,
+                billing_url,
+                &fresh_token,
+                fresh_uid.as_deref().or(user_id.as_deref()),
+            );
+        }
+    }
     Ok((status, text))
 }
 
@@ -1191,7 +1266,8 @@ mod tests {
 
         let client = build_client().unwrap();
         let (status, body) =
-            fetch_grok_raw_from(&client, &server.url("/billing"), &path).expect("raw fetch");
+            fetch_grok_raw_from(&client, &server.url("/billing"), &path, 1_700_000_000)
+                .expect("raw fetch");
         assert_eq!(status, 200);
         assert!(body.contains("currentPeriod"));
     }
@@ -1201,11 +1277,258 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("auth.json");
         let client = build_client().unwrap();
-        assert!(fetch_grok_raw_from(&client, "http://127.0.0.1:1/x", &missing).is_err());
+        assert!(
+            fetch_grok_raw_from(&client, "http://127.0.0.1:1/x", &missing, 1_700_000_000).is_err()
+        );
 
         std::fs::write(&missing, "{}").unwrap();
-        let err = fetch_grok_raw_from(&client, "http://127.0.0.1:1/x", &missing).unwrap_err();
+        let err = fetch_grok_raw_from(&client, "http://127.0.0.1:1/x", &missing, 1_700_000_000)
+            .unwrap_err();
         assert!(format!("{err}").contains(GROK_LOGIN_HINT));
+    }
+
+    /// Builds an `auth.json` with an OIDC entry pointing at `issuer` plus a sibling API-key entry.
+    fn grok_auth_for_issuer(issuer: &str, expires_at: &str) -> String {
+        serde_json::json!({
+            format!("{issuer}::client-1"): {
+                "auth_mode": "oidc",
+                "key": "stale-access",
+                "refresh_token": "old-refresh",
+                "expires_at": expires_at,
+                "oidc_issuer": issuer,
+                "oidc_client_id": "client-1",
+                "user_id": "user-1",
+                "email": "user@example.com"
+            },
+            "xai::api_key": {
+                "key": "sibling-key"
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn fetch_grok_raw_from_refreshes_proactively_when_expiring_and_writes_back() {
+        let server = MockServer::start();
+        let discovery = server.mock(|when, then| {
+            when.method(GET).path("/.well-known/openid-configuration");
+            then.status(200)
+                .json_body(serde_json::json!({ "token_endpoint": server.url("/token") }));
+        });
+        let token = server.mock(|when, then| {
+            when.method(POST).path("/token");
+            then.status(200).json_body(serde_json::json!({
+                "access_token": "fresh-access",
+                "refresh_token": "fresh-refresh",
+                "expires_in": 3600
+            }));
+        });
+        let billing = server.mock(|when, then| {
+            when.method(GET)
+                .path("/billing")
+                .header("authorization", "Bearer fresh-access")
+                .header("x-userid", "user-1");
+            then.status(200).body(CREDITS);
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let issuer = server.base_url();
+        // 2023-11-14T22:13:50Z is 30s after now_secs = 1_700_000_000 (within EXPIRY_SKEW_SECS).
+        let now_secs = 1_700_000_000i64;
+        std::fs::write(&path, grok_auth_for_issuer(&issuer, "2023-11-14T22:13:50Z")).unwrap();
+
+        let client = build_client().unwrap();
+        let (status, body) = fetch_grok_raw_from(&client, &server.url("/billing"), &path, now_secs)
+            .expect("proactive refresh should succeed");
+
+        discovery.assert_calls(1);
+        token.assert_calls(1);
+        billing.assert_calls(1);
+        assert_eq!(status, 200);
+        assert!(body.contains("currentPeriod"));
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let entry = &written[format!("{issuer}::client-1")];
+        assert_eq!(entry["key"], "fresh-access");
+        assert_eq!(entry["refresh_token"], "fresh-refresh");
+        assert_eq!(entry["email"], "user@example.com");
+        assert_eq!(written["xai::api_key"]["key"], "sibling-key");
+    }
+
+    #[test]
+    fn fetch_grok_raw_from_refreshes_reactively_on_401_and_403_and_writes_back() {
+        let client = build_client().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let now_secs = 1_700_000_000i64;
+
+        for reject_status in [401u16, 403u16] {
+            let server = MockServer::start();
+            let stale_billing = server.mock(|when, then| {
+                when.method(GET)
+                    .path("/billing")
+                    .header("authorization", "Bearer stale-access");
+                then.status(reject_status)
+                    .body(r#"{"error":"unauthorized"}"#);
+            });
+            let discovery = server.mock(|when, then| {
+                when.method(GET).path("/.well-known/openid-configuration");
+                then.status(200)
+                    .json_body(serde_json::json!({ "token_endpoint": server.url("/token") }));
+            });
+            let token = server.mock(|when, then| {
+                when.method(POST).path("/token");
+                then.status(200).json_body(serde_json::json!({
+                    "access_token": "fresh-access",
+                    "refresh_token": "fresh-refresh",
+                    "expires_in": 3600
+                }));
+            });
+            let fresh_billing = server.mock(|when, then| {
+                when.method(GET)
+                    .path("/billing")
+                    .header("authorization", "Bearer fresh-access");
+                then.status(200).body(CREDITS);
+            });
+
+            let path = dir.path().join(format!("auth_{reject_status}.json"));
+            let issuer = server.base_url();
+            std::fs::write(&path, grok_auth_for_issuer(&issuer, "2036-01-01T00:00:00Z")).unwrap();
+
+            let (status, body) =
+                fetch_grok_raw_from(&client, &server.url("/billing"), &path, now_secs)
+                    .expect("reactive refresh should recover");
+
+            stale_billing.assert_calls(1);
+            discovery.assert_calls(1);
+            token.assert_calls(1);
+            fresh_billing.assert_calls(1);
+            assert_eq!(status, 200);
+            assert!(body.contains("currentPeriod"));
+
+            let written: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(
+                written[format!("{issuer}::client-1")]["key"],
+                "fresh-access"
+            );
+            assert_eq!(written["xai::api_key"]["key"], "sibling-key");
+        }
+    }
+
+    #[test]
+    fn fetch_grok_raw_from_preserves_status_on_refresh_failure_and_retries_at_most_once() {
+        let client = build_client().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let now_secs = 1_700_000_000i64;
+
+        // Reactive refresh failure keeps the original (403, body) and leaves auth.json untouched.
+        let server = MockServer::start();
+        let billing = server.mock(|when, then| {
+            when.method(GET).path("/billing");
+            then.status(403).body(r#"{"error":"forbidden"}"#);
+        });
+        let discovery = server.mock(|when, then| {
+            when.method(GET).path("/.well-known/openid-configuration");
+            then.status(200)
+                .json_body(serde_json::json!({ "token_endpoint": server.url("/token") }));
+        });
+        let token = server.mock(|when, then| {
+            when.method(POST).path("/token");
+            then.status(400)
+                .json_body(serde_json::json!({ "error": "invalid_grant" }));
+        });
+        let path = dir.path().join("reactive_fail.json");
+        let original = grok_auth_for_issuer(&server.base_url(), "2036-01-01T00:00:00Z");
+        std::fs::write(&path, &original).unwrap();
+
+        let (status, body) = fetch_grok_raw_from(&client, &server.url("/billing"), &path, now_secs)
+            .expect("should preserve 403 response");
+        billing.assert_calls(1);
+        discovery.assert_calls(1);
+        token.assert_calls(1);
+        assert_eq!(status, 403);
+        assert_eq!(body, r#"{"error":"forbidden"}"#);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        // Proactive refresh failure falls back to the stored token once without refreshing again on 401.
+        let pro_server = MockServer::start();
+        let pro_discovery = pro_server.mock(|when, then| {
+            when.method(GET).path("/.well-known/openid-configuration");
+            then.status(200)
+                .json_body(serde_json::json!({ "token_endpoint": pro_server.url("/token") }));
+        });
+        let pro_token = pro_server.mock(|when, then| {
+            when.method(POST).path("/token");
+            then.status(400)
+                .json_body(serde_json::json!({ "error": "invalid_grant" }));
+        });
+        let pro_billing = pro_server.mock(|when, then| {
+            when.method(GET)
+                .path("/billing")
+                .header("authorization", "Bearer stale-access");
+            then.status(401).body(r#"{"error":"expired"}"#);
+        });
+        let pro_path = dir.path().join("proactive_fail.json");
+        std::fs::write(
+            &pro_path,
+            grok_auth_for_issuer(&pro_server.base_url(), "2020-01-01T00:00:00Z"),
+        )
+        .unwrap();
+
+        let (status, body) =
+            fetch_grok_raw_from(&client, &pro_server.url("/billing"), &pro_path, now_secs)
+                .expect("should return 401 without looping");
+        pro_discovery.assert_calls(1);
+        pro_token.assert_calls(1);
+        pro_billing.assert_calls(1);
+        assert_eq!(status, 401);
+        assert_eq!(body, r#"{"error":"expired"}"#);
+
+        // Retry returning 403 after a successful refresh must stop after one refresh.
+        let loop_server = MockServer::start();
+        let loop_stale = loop_server.mock(|when, then| {
+            when.method(GET)
+                .path("/billing")
+                .header("authorization", "Bearer stale-access");
+            then.status(401).body(r#"{"error":"first"}"#);
+        });
+        let loop_discovery = loop_server.mock(|when, then| {
+            when.method(GET).path("/.well-known/openid-configuration");
+            then.status(200)
+                .json_body(serde_json::json!({ "token_endpoint": loop_server.url("/token") }));
+        });
+        let loop_token = loop_server.mock(|when, then| {
+            when.method(POST).path("/token");
+            then.status(200).json_body(serde_json::json!({
+                "access_token": "still-bad",
+                "refresh_token": "rt2",
+                "expires_in": 3600
+            }));
+        });
+        let loop_fresh = loop_server.mock(|when, then| {
+            when.method(GET)
+                .path("/billing")
+                .header("authorization", "Bearer still-bad");
+            then.status(403).body(r#"{"error":"second"}"#);
+        });
+        let loop_path = dir.path().join("no_loop.json");
+        std::fs::write(
+            &loop_path,
+            grok_auth_for_issuer(&loop_server.base_url(), "2036-01-01T00:00:00Z"),
+        )
+        .unwrap();
+
+        let (status, body) =
+            fetch_grok_raw_from(&client, &loop_server.url("/billing"), &loop_path, now_secs)
+                .expect("retry 403 should stop after one refresh");
+        loop_stale.assert_calls(1);
+        loop_discovery.assert_calls(1);
+        loop_token.assert_calls(1);
+        loop_fresh.assert_calls(1);
+        assert_eq!(status, 403);
+        assert_eq!(body, r#"{"error":"second"}"#);
     }
 
     // ---- worker state ----

@@ -511,7 +511,7 @@ vct quota
 
 ### 原始回應（`vct quota <provider>`）
 
-帶上供應商時，`vct quota` 會印出該供應商的原始回應，不解析、不彙整。它對 `usage` 面板使用的同一個 quota 端點（Claude / Codex / Copilot / Cursor / Grok）發一次請求，直接印出原始 body，方便你檢視 API 的實際結構或確認憑證是否正常。它讀取各供應商已儲存的憑證，而且**不會**刷新 token：token 過期時，請用對應供應商自己的 CLI 重新登入（`claude` / `codex` / `copilot` / `cursor-agent` / `grok`）。`vct quota antigravity` 則是執行一次 `agy -p /usage --output-format json`（用儀表板相同的方式找到它）並印出它的輸出；agy 會在執行時自行刷新 token。
+帶上供應商時，`vct quota` 會印出該供應商的原始回應，不解析、不彙整。它對 `usage` 面板使用的同一個 quota 端點（Claude / Codex / Copilot / Cursor / Grok）發起請求，直接印出原始 body，方便你檢視 API 的實際結構或確認憑證是否正常。對 Claude、Codex 和 Grok，它會在 OAuth token 接近過期或被拒絕時自動刷新一次，並將輪換後的 token 寫回該 CLI 的憑證檔案，行為與儀表板一致；Copilot 和 Cursor 為唯讀，無法刷新時請用對應供應商自己的 CLI 重新登入（`claude` / `codex` / `copilot` / `cursor-agent` / `grok`）。`vct quota antigravity` 則是執行一次 `agy -p /usage --output-format json`（用儀表板相同的方式找到它）並印出它的輸出；agy 會在執行時自行刷新 token。
 
 `--json`、`--text` 與 `--table` 印出的是單一供應商的回應，所以不帶供應商的 `vct quota --json` 會回報錯誤。
 
