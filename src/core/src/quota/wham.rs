@@ -305,23 +305,41 @@ pub fn call_reset_credit_details(
     }
 }
 
-/// Fetches the raw `wham/usage` response as `(status_code, body)` using the stored access token verbatim.
+/// Sends one raw `GET` request to `wham_url` and returns `(status_code, body)`.
+fn send_codex_usage_raw(
+    client: &reqwest::blocking::Client,
+    wham_url: &str,
+    token: &str,
+    account_id: Option<&str>,
+) -> Result<(u16, String)> {
+    let resp = codex_get(client, wham_url, token, account_id)
+        .send()
+        .context("Failed to send Codex usage request")?;
+    let status = resp.status().as_u16();
+    let text = resp
+        .text()
+        .context("Failed to read Codex usage response body")?;
+    Ok((status, text))
+}
+
+/// Fetches the raw `wham/usage` response as `(status_code, body)`.
 ///
-/// Does not refresh tokens or modify `auth.json`; non-2xx responses are returned as `Ok((status, body))`.
+/// On HTTP 401, refreshes the OAuth token once via [`refresh_codex`] (persisting rotated credentials to `auth.json` with an mtime guard) and retries once; non-2xx responses (including the original 401 when refresh fails) are returned as `Ok((status, body))`.
 ///
 /// # Errors
 ///
 /// Returns an error if `auth.json` is missing, has no access token, or the HTTP request fails.
 pub fn fetch_codex_raw(client: &reqwest::blocking::Client) -> Result<(u16, String)> {
     let auth_path = crate::utils::resolve_paths()?.codex_dir.join("auth.json");
-    fetch_codex_raw_from(client, WHAM_URL, &auth_path)
+    fetch_codex_raw_from(client, WHAM_URL, &auth_path, CODEX_TOKEN_URL)
 }
 
-/// Injectable core of [`fetch_codex_raw`] reading credentials from `auth_path` and querying `wham_url`.
+/// Injectable core of [`fetch_codex_raw`] reading credentials from `auth_path`, querying `wham_url`, and refreshing against `token_url` on HTTP 401.
 pub(crate) fn fetch_codex_raw_from(
     client: &reqwest::blocking::Client,
     wham_url: &str,
     auth_path: &Path,
+    token_url: &str,
 ) -> Result<(u16, String)> {
     let body = std::fs::read_to_string(auth_path).with_context(|| {
         format!(
@@ -331,13 +349,18 @@ pub(crate) fn fetch_codex_raw_from(
         )
     })?;
     let (access_token, account_id) = parse_auth(&body)?;
-    let resp = codex_get(client, wham_url, &access_token, account_id.as_deref())
-        .send()
-        .context("Failed to send Codex usage request")?;
-    let status = resp.status().as_u16();
-    let text = resp
-        .text()
-        .context("Failed to read Codex usage response body")?;
+    let (status, text) =
+        send_codex_usage_raw(client, wham_url, &access_token, account_id.as_deref())?;
+    if status == reqwest::StatusCode::UNAUTHORIZED.as_u16() {
+        match refresh_codex(client, auth_path, token_url) {
+            Ok(new_token) => {
+                return send_codex_usage_raw(client, wham_url, &new_token, account_id.as_deref());
+            }
+            Err(e) => {
+                log::warn!("codex token refresh failed: {e}");
+            }
+        }
+    }
     Ok((status, text))
 }
 
@@ -663,8 +686,136 @@ mod tests {
 
         let client = build_client().unwrap();
         let (status, body) =
-            fetch_codex_raw_from(&client, &server.url("/wham"), &auth).expect("raw fetch");
+            fetch_codex_raw_from(&client, &server.url("/wham"), &auth, &server.url("/token"))
+                .expect("raw fetch");
         assert_eq!(status, 200);
         assert!(body.contains("plan_type"));
+    }
+
+    #[test]
+    fn fetch_codex_raw_from_refreshes_reactively_on_401_and_writes_back() {
+        use crate::quota::http::build_client;
+        use httpmock::prelude::*;
+
+        let server = MockServer::start();
+        let stale = server.mock(|when, then| {
+            when.method(GET)
+                .path("/wham")
+                .header("authorization", "Bearer stale");
+            then.status(401).body(r#"{"detail":"token_expired"}"#);
+        });
+        let token = server.mock(|when, then| {
+            when.method(POST).path("/token");
+            then.status(200).json_body(serde_json::json!({
+                "access_token": "fresh-access",
+                "refresh_token": "fresh-refresh",
+                "id_token": "fresh-id"
+            }));
+        });
+        let fresh = server.mock(|when, then| {
+            when.method(GET)
+                .path("/wham")
+                .header("authorization", "Bearer fresh-access")
+                .header("chatgpt-account-id", "acct");
+            then.status(200).body(SAMPLE);
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let auth = dir.path().join("auth.json");
+        std::fs::write(
+            &auth,
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"stale","refresh_token":"old-rt","account_id":"acct"}}"#,
+        )
+        .unwrap();
+
+        let client = build_client().unwrap();
+        let (status, body) =
+            fetch_codex_raw_from(&client, &server.url("/wham"), &auth, &server.url("/token"))
+                .expect("reactive refresh should recover from 401");
+
+        stale.assert_calls(1);
+        token.assert_calls(1);
+        fresh.assert_calls(1);
+        assert_eq!(status, 200);
+        assert!(body.contains("plan_type"));
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&auth).unwrap()).unwrap();
+        assert_eq!(written["tokens"]["access_token"], "fresh-access");
+        assert_eq!(written["tokens"]["refresh_token"], "fresh-refresh");
+        assert_eq!(written["tokens"]["id_token"], "fresh-id");
+        assert_eq!(written["auth_mode"], "chatgpt");
+        assert!(written["last_refresh"].as_str().is_some());
+    }
+
+    #[test]
+    fn fetch_codex_raw_from_preserves_401_on_refresh_failure_and_retries_at_most_once() {
+        use crate::quota::http::build_client;
+        use httpmock::prelude::*;
+
+        let client = build_client().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+
+        // Refresh failure preserves the original (401, body) and leaves auth.json untouched.
+        let server = MockServer::start();
+        let wham = server.mock(|when, then| {
+            when.method(GET).path("/wham");
+            then.status(401).body(r#"{"detail":"invalid"}"#);
+        });
+        let token = server.mock(|when, then| {
+            when.method(POST).path("/token");
+            then.status(400)
+                .json_body(serde_json::json!({ "error": "invalid_grant" }));
+        });
+        let auth = dir.path().join("fail_auth.json");
+        let original =
+            r#"{"tokens":{"access_token":"stale","refresh_token":"old-rt","account_id":"acct"}}"#;
+        std::fs::write(&auth, original).unwrap();
+
+        let (status, body) =
+            fetch_codex_raw_from(&client, &server.url("/wham"), &auth, &server.url("/token"))
+                .expect("should preserve 401 response");
+        wham.assert_calls(1);
+        token.assert_calls(1);
+        assert_eq!(status, 401);
+        assert_eq!(body, r#"{"detail":"invalid"}"#);
+        assert_eq!(std::fs::read_to_string(&auth).unwrap(), original);
+
+        // Retry returning 401 after refresh must stop after a single refresh attempt.
+        let loop_server = MockServer::start();
+        let stale = loop_server.mock(|when, then| {
+            when.method(GET)
+                .path("/wham")
+                .header("authorization", "Bearer stale");
+            then.status(401).body(r#"{"detail":"first"}"#);
+        });
+        let loop_token = loop_server.mock(|when, then| {
+            when.method(POST).path("/token");
+            then.status(200).json_body(serde_json::json!({
+                "access_token": "still-bad",
+                "refresh_token": "rt2"
+            }));
+        });
+        let fresh = loop_server.mock(|when, then| {
+            when.method(GET)
+                .path("/wham")
+                .header("authorization", "Bearer still-bad");
+            then.status(401).body(r#"{"detail":"second"}"#);
+        });
+        let loop_auth = dir.path().join("no_loop.json");
+        std::fs::write(&loop_auth, original).unwrap();
+
+        let (status, body) = fetch_codex_raw_from(
+            &client,
+            &loop_server.url("/wham"),
+            &loop_auth,
+            &loop_server.url("/token"),
+        )
+        .expect("retry 401 should stop after one refresh");
+        stale.assert_calls(1);
+        loop_token.assert_calls(1);
+        fresh.assert_calls(1);
+        assert_eq!(status, 401);
+        assert_eq!(body, r#"{"detail":"second"}"#);
     }
 }

@@ -70,33 +70,8 @@ fn parse_claude_oauth(body: &str) -> Option<ClaudeOauth> {
     creds.claude_ai_oauth
 }
 
-/// Fetches the raw `/api/oauth/usage` response as `(status_code, body)` using the stored access token verbatim.
-///
-/// Does not refresh tokens or modify credentials on disk; non-2xx responses are returned as `Ok((status, body))`.
-///
-/// # Errors
-///
-/// Returns an error if the credentials file is missing, has no access token, or the HTTP request fails.
-pub fn fetch_claude_raw(client: &Client) -> Result<(u16, String)> {
-    fetch_claude_raw_from(client, CLAUDE_USAGE_URL, &get_claude_credentials_path()?)
-}
-
-/// Injectable core of [`fetch_claude_raw`] reading the access token from `creds_path` and querying `usage_url`.
-pub(crate) fn fetch_claude_raw_from(
-    client: &Client,
-    usage_url: &str,
-    creds_path: &Path,
-) -> Result<(u16, String)> {
-    let path = creds_path;
-    let token = read_claude_oauth(path)
-        .and_then(|o| o.access_token)
-        .filter(|t| !t.is_empty())
-        .with_context(|| {
-            format!(
-                "no Claude access token in {} ({CLAUDE_LOGIN_HINT})",
-                path.display()
-            )
-        })?;
+/// Sends one raw `GET` request to `usage_url` with `token` and returns `(status_code, body)`.
+fn send_claude_usage_raw(client: &Client, usage_url: &str, token: &str) -> Result<(u16, String)> {
     let resp = client
         .get(usage_url)
         .header(reqwest::header::USER_AGENT, claude_ua())
@@ -104,13 +79,118 @@ pub(crate) fn fetch_claude_raw_from(
         .header("anthropic-version", CLAUDE_ANTHROPIC_VERSION)
         .header("anthropic-beta", CLAUDE_OAUTH_BETA)
         .header("anthropic-dangerous-direct-browser-access", "true")
-        .bearer_auth(&token)
+        .bearer_auth(token)
         .send()
         .context("Failed to send Claude usage request")?;
     let status = resp.status().as_u16();
     let body = resp
         .text()
         .context("Failed to read Claude usage response body")?;
+    Ok((status, body))
+}
+
+/// Fetches the raw `/api/oauth/usage` response as `(status_code, body)`.
+///
+/// Refreshes the OAuth token proactively when missing or within [`EXPIRY_SKEW_SECS`] of expiry, and reactively once on HTTP 401, persisting rotated credentials to `~/.claude/.credentials.json` with an mtime guard. Non-2xx responses (including a 401 when refresh fails) are returned as `Ok((status, body))`.
+///
+/// # Errors
+///
+/// Returns an error if the credentials file is missing or unreadable, holds neither a usable access token nor a refreshable token, or the HTTP request fails.
+pub fn fetch_claude_raw(client: &Client) -> Result<(u16, String)> {
+    fetch_claude_raw_from(
+        client,
+        CLAUDE_USAGE_URL,
+        &get_claude_credentials_path()?,
+        &claude_token_urls_default(),
+        chrono::Local::now().timestamp(),
+    )
+}
+
+/// Injectable core of [`fetch_claude_raw`] reading credentials from `creds_path`, querying `usage_url`, and refreshing against `token_urls` relative to `now_secs`.
+pub(crate) fn fetch_claude_raw_from(
+    client: &Client,
+    usage_url: &str,
+    creds_path: &Path,
+    token_urls: &[String],
+    now_secs: i64,
+) -> Result<(u16, String)> {
+    let expected_mtime = file_mtime(creds_path);
+    let oauth = read_claude_oauth(creds_path).with_context(|| {
+        format!(
+            "no Claude access token in {} ({CLAUDE_LOGIN_HINT})",
+            creds_path.display()
+        )
+    })?;
+    let access = oauth
+        .access_token
+        .as_deref()
+        .filter(|t| !t.is_empty())
+        .map(str::to_string);
+    let refresh_token = oauth.refresh_token.as_deref().filter(|t| !t.is_empty());
+    let expires_secs = oauth.expires_at.map(|ms| ms / 1000);
+    let need_proactive = access.is_none() || is_expiring(expires_secs, now_secs, EXPIRY_SKEW_SECS);
+
+    let mut attempted_refresh = false;
+    let token = if need_proactive {
+        attempted_refresh = true;
+        match refresh_token {
+            Some(rt) => match refresh_claude(
+                client,
+                creds_path,
+                rt,
+                &oauth.scopes,
+                expected_mtime,
+                token_urls,
+            ) {
+                Ok((fresh, _)) => fresh,
+                Err(e) => {
+                    log::warn!("claude token refresh failed: {e}");
+                    match access {
+                        Some(existing) => existing,
+                        None => {
+                            return Err(e).with_context(|| {
+                                format!(
+                                    "failed to refresh Claude access token in {} ({CLAUDE_LOGIN_HINT})",
+                                    creds_path.display()
+                                )
+                            });
+                        }
+                    }
+                }
+            },
+            None => access.with_context(|| {
+                format!(
+                    "no Claude access token in {} ({CLAUDE_LOGIN_HINT})",
+                    creds_path.display()
+                )
+            })?,
+        }
+    } else {
+        access.expect("access is some when need_proactive is false")
+    };
+
+    let (status, body) = send_claude_usage_raw(client, usage_url, &token)?;
+    if status == reqwest::StatusCode::UNAUTHORIZED.as_u16() && !attempted_refresh {
+        let reactive_mtime = file_mtime(creds_path);
+        if let Some(fresh_oauth) = read_claude_oauth(creds_path)
+            && let Some(rt) = fresh_oauth
+                .refresh_token
+                .as_deref()
+                .filter(|t| !t.is_empty())
+        {
+            match refresh_claude(
+                client,
+                creds_path,
+                rt,
+                &fresh_oauth.scopes,
+                reactive_mtime,
+                token_urls,
+            ) {
+                Ok((fresh, _)) => return send_claude_usage_raw(client, usage_url, &fresh),
+                Err(e) => log::warn!("claude token refresh failed: {e}"),
+            }
+        }
+    }
     Ok((status, body))
 }
 
@@ -802,8 +882,288 @@ mod tests {
 
         let client = build_client().unwrap();
         let (status, body) =
-            fetch_claude_raw_from(&client, &server.url("/usage"), &path).expect("raw fetch");
+            fetch_claude_raw_from(&client, &server.url("/usage"), &path, &[], 1_000_000)
+                .expect("raw fetch");
         assert_eq!(status, 200);
         assert!(body.contains("five_hour"));
+    }
+
+    #[test]
+    fn fetch_claude_raw_from_refreshes_proactively_when_expiring_and_writes_back() {
+        let server = MockServer::start();
+        let token = server.mock(|when, then| {
+            when.method(POST).path("/token");
+            then.status(200).json_body(serde_json::json!({
+                "access_token": "fresh-access",
+                "refresh_token": "fresh-refresh",
+                "expires_in": 3600
+            }));
+        });
+        let usage = server.mock(|when, then| {
+            when.method(GET)
+                .path("/usage")
+                .header("authorization", "Bearer fresh-access");
+            then.status(200).body(SAMPLE);
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".credentials.json");
+        let now_secs = 1_700_000_000i64;
+        // Expires within EXPIRY_SKEW_SECS (30s left).
+        let expires_ms = (now_secs + 30) * 1000;
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"stale","refreshToken":"old-rt","expiresAt":{expires_ms},"scopes":["user:inference"]}},"designOauth":{{"accessToken":"keep"}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let client = build_client().unwrap();
+        let urls = vec![server.url("/token")];
+        let (status, body) =
+            fetch_claude_raw_from(&client, &server.url("/usage"), &path, &urls, now_secs)
+                .expect("proactive refresh should succeed");
+
+        token.assert_calls(1);
+        usage.assert_calls(1);
+        assert_eq!(status, 200);
+        assert!(body.contains("five_hour"));
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["claudeAiOauth"]["accessToken"], "fresh-access");
+        assert_eq!(written["claudeAiOauth"]["refreshToken"], "fresh-refresh");
+        assert!(written["claudeAiOauth"]["expiresAt"].as_i64().unwrap() > expires_ms);
+        assert_eq!(written["designOauth"]["accessToken"], "keep");
+    }
+
+    #[test]
+    fn fetch_claude_raw_from_refreshes_proactively_when_access_token_missing() {
+        let server = MockServer::start();
+        let token = server.mock(|when, then| {
+            when.method(POST).path("/token");
+            then.status(200).json_body(serde_json::json!({
+                "access_token": "fresh-access",
+                "refresh_token": "fresh-refresh",
+                "expires_in": 3600
+            }));
+        });
+        let usage = server.mock(|when, then| {
+            when.method(GET)
+                .path("/usage")
+                .header("authorization", "Bearer fresh-access");
+            then.status(200).body(SAMPLE);
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".credentials.json");
+        std::fs::write(
+            &path,
+            r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"old-rt","scopes":[]}}"#,
+        )
+        .unwrap();
+
+        let client = build_client().unwrap();
+        let urls = vec![server.url("/token")];
+        let (status, body) =
+            fetch_claude_raw_from(&client, &server.url("/usage"), &path, &urls, 1_700_000_000)
+                .expect("missing access token should refresh proactively");
+
+        token.assert_calls(1);
+        usage.assert_calls(1);
+        assert_eq!(status, 200);
+        assert!(body.contains("five_hour"));
+
+        // When accessToken is missing and refresh fails, report a clear error with the login hint.
+        let fail_server = MockServer::start();
+        fail_server.mock(|when, then| {
+            when.method(POST).path("/token");
+            then.status(400)
+                .json_body(serde_json::json!({ "error": "invalid_grant" }));
+        });
+        let fail_path = dir.path().join("fail.json");
+        std::fs::write(
+            &fail_path,
+            r#"{"claudeAiOauth":{"refreshToken":"old-rt","scopes":[]}}"#,
+        )
+        .unwrap();
+        let err = fetch_claude_raw_from(
+            &client,
+            &fail_server.url("/usage"),
+            &fail_path,
+            &[fail_server.url("/token")],
+            1_700_000_000,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains(CLAUDE_LOGIN_HINT));
+    }
+
+    #[test]
+    fn fetch_claude_raw_from_refreshes_reactively_on_401_and_writes_back() {
+        let server = MockServer::start();
+        let stale_usage = server.mock(|when, then| {
+            when.method(GET)
+                .path("/usage")
+                .header("authorization", "Bearer stale");
+            then.status(401).body(r#"{"error":"token_expired"}"#);
+        });
+        let token = server.mock(|when, then| {
+            when.method(POST).path("/token");
+            then.status(200).json_body(serde_json::json!({
+                "access_token": "fresh-access",
+                "refresh_token": "fresh-refresh",
+                "expires_in": 3600
+            }));
+        });
+        let fresh_usage = server.mock(|when, then| {
+            when.method(GET)
+                .path("/usage")
+                .header("authorization", "Bearer fresh-access");
+            then.status(200).body(SAMPLE);
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".credentials.json");
+        let now_secs = 1_700_000_000i64;
+        let future_ms = (now_secs + 3600) * 1000;
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"stale","refreshToken":"old-rt","expiresAt":{future_ms},"scopes":[]}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let client = build_client().unwrap();
+        let urls = vec![server.url("/token")];
+        let (status, body) =
+            fetch_claude_raw_from(&client, &server.url("/usage"), &path, &urls, now_secs)
+                .expect("reactive refresh should recover from 401");
+
+        stale_usage.assert_calls(1);
+        token.assert_calls(1);
+        fresh_usage.assert_calls(1);
+        assert_eq!(status, 200);
+        assert!(body.contains("five_hour"));
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["claudeAiOauth"]["accessToken"], "fresh-access");
+        assert_eq!(written["claudeAiOauth"]["refreshToken"], "fresh-refresh");
+    }
+
+    #[test]
+    fn fetch_claude_raw_from_preserves_401_on_refresh_failure_and_retries_at_most_once() {
+        let client = build_client().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let now_secs = 1_700_000_000i64;
+        let future_ms = (now_secs + 3600) * 1000;
+
+        // Reactive refresh failure keeps the original (401, body) and leaves the file untouched.
+        let server = MockServer::start();
+        let usage = server.mock(|when, then| {
+            when.method(GET).path("/usage");
+            then.status(401).body(r#"{"error":"invalid_token"}"#);
+        });
+        let token = server.mock(|when, then| {
+            when.method(POST).path("/token");
+            then.status(400)
+                .json_body(serde_json::json!({ "error": "invalid_grant" }));
+        });
+        let path = dir.path().join("reactive_fail.json");
+        let original = format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"stale","refreshToken":"old-rt","expiresAt":{future_ms},"scopes":[]}}}}"#
+        );
+        std::fs::write(&path, &original).unwrap();
+
+        let (status, body) = fetch_claude_raw_from(
+            &client,
+            &server.url("/usage"),
+            &path,
+            &[server.url("/token")],
+            now_secs,
+        )
+        .expect("should preserve 401 response");
+        usage.assert_calls(1);
+        token.assert_calls(1);
+        assert_eq!(status, 401);
+        assert_eq!(body, r#"{"error":"invalid_token"}"#);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        // Proactive refresh failure falls back to the existing access token once and does not refresh a second time on 401.
+        let pro_server = MockServer::start();
+        let pro_token = pro_server.mock(|when, then| {
+            when.method(POST).path("/token");
+            then.status(400)
+                .json_body(serde_json::json!({ "error": "invalid_grant" }));
+        });
+        let pro_usage = pro_server.mock(|when, then| {
+            when.method(GET)
+                .path("/usage")
+                .header("authorization", "Bearer stale");
+            then.status(401).body(r#"{"error":"expired"}"#);
+        });
+        let pro_path = dir.path().join("proactive_fail.json");
+        let expired_ms = (now_secs - 10) * 1000;
+        std::fs::write(
+            &pro_path,
+            format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"stale","refreshToken":"old-rt","expiresAt":{expired_ms},"scopes":[]}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let (status, body) = fetch_claude_raw_from(
+            &client,
+            &pro_server.url("/usage"),
+            &pro_path,
+            &[pro_server.url("/token")],
+            now_secs,
+        )
+        .expect("should return 401 without looping");
+        pro_token.assert_calls(1);
+        pro_usage.assert_calls(1);
+        assert_eq!(status, 401);
+        assert_eq!(body, r#"{"error":"expired"}"#);
+
+        // Retry returning 401 after a successful refresh must not trigger a second refresh.
+        let loop_server = MockServer::start();
+        let loop_stale = loop_server.mock(|when, then| {
+            when.method(GET)
+                .path("/usage")
+                .header("authorization", "Bearer stale");
+            then.status(401).body(r#"{"error":"first"}"#);
+        });
+        let loop_token = loop_server.mock(|when, then| {
+            when.method(POST).path("/token");
+            then.status(200).json_body(serde_json::json!({
+                "access_token": "still-bad",
+                "refresh_token": "rt2",
+                "expires_in": 3600
+            }));
+        });
+        let loop_fresh = loop_server.mock(|when, then| {
+            when.method(GET)
+                .path("/usage")
+                .header("authorization", "Bearer still-bad");
+            then.status(401).body(r#"{"error":"second"}"#);
+        });
+        let loop_path = dir.path().join("no_loop.json");
+        std::fs::write(&loop_path, &original).unwrap();
+
+        let (status, body) = fetch_claude_raw_from(
+            &client,
+            &loop_server.url("/usage"),
+            &loop_path,
+            &[loop_server.url("/token")],
+            now_secs,
+        )
+        .expect("retry 401 should stop after one refresh");
+        loop_stale.assert_calls(1);
+        loop_token.assert_calls(1);
+        loop_fresh.assert_calls(1);
+        assert_eq!(status, 401);
+        assert_eq!(body, r#"{"error":"second"}"#);
     }
 }

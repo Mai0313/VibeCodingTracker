@@ -511,7 +511,7 @@ A card appears only for a provider whose credentials are present, placed on a un
 
 ### Raw Response (`vct quota <provider>`)
 
-With a provider, `vct quota` prints that provider's raw response with no parsing or aggregation. It calls the same quota endpoint the `usage` dashboard uses (Claude / Codex / Copilot / Cursor / Grok) exactly once and prints the raw body, so you can inspect the exact API shape or sanity-check your credentials. It reads each provider's stored credentials and does **not** refresh tokens: if a token is expired, re-auth with that provider's own CLI (`claude` / `codex` / `copilot` / `cursor-agent` / `grok`). `vct quota antigravity` instead runs `agy -p /usage --output-format json` once (found the way the dashboard finds it) and prints what it printed; agy refreshes its own token as it does so.
+With a provider, `vct quota` prints that provider's raw response with no parsing or aggregation. It calls the same quota endpoint the `usage` dashboard uses (Claude / Codex / Copilot / Cursor / Grok) and prints the raw body, so you can inspect the exact API shape or sanity-check your credentials. For Claude, Codex, and Grok it refreshes an expiring or rejected OAuth token once and writes the rotated token back to that CLI's credential file, matching the dashboard; Copilot and Cursor are read-only, and if a refresh cannot proceed you can re-auth with that provider's own CLI (`claude` / `codex` / `copilot` / `cursor-agent` / `grok`). `vct quota antigravity` instead runs `agy -p /usage --output-format json` once (found the way the dashboard finds it) and prints what it printed; agy refreshes its own token as it does so.
 
 `--json`, `--text` and `--table` print one provider's response, so `vct quota --json` without a provider is an error.
 
