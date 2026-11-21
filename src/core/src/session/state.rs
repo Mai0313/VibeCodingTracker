@@ -61,6 +61,94 @@ impl StreamingTextCounter {
         self.trailing_newlines += 1;
     }
 
+    /// Feeds an unescaped UTF-8 slice that may contain `\n` characters.
+    pub(crate) fn push_str(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let bytes = text.as_bytes();
+        let trailing = bytes.iter().rev().take_while(|&&b| b == b'\n').count();
+        let body_len = bytes.len() - trailing;
+        if body_len > 0 {
+            let body = &bytes[..body_len];
+            let body_newlines = bytecount::count(body, b'\n');
+            let body_chars = bytecount::num_chars(body);
+            if self.trailing_newlines > 0 {
+                self.total_chars += self.trailing_newlines;
+                self.interior_newlines += self.trailing_newlines;
+                self.trailing_newlines = 0;
+            }
+            self.total_chars += body_chars;
+            self.interior_newlines += body_newlines;
+        }
+        self.trailing_newlines += trailing;
+    }
+
+    /// Feeds a `serde_json`-validated raw JSON string literal directly without allocating a `String`.
+    ///
+    /// Returns `Some(is_empty)` when `raw` is a valid JSON string literal (where `is_empty` is `true` only for `""`), or `None` if `raw` is not a JSON string literal or contains an invalid escape or unpaired UTF-16 surrogate.
+    pub(crate) fn push_json_string(&mut self, raw: &str) -> Option<bool> {
+        let bytes = raw.as_bytes();
+        if bytes.len() < 2 || bytes[0] != b'"' || bytes[bytes.len() - 1] != b'"' {
+            return None;
+        }
+        let inner = &raw[1..raw.len() - 1];
+        if inner.is_empty() {
+            return Some(true);
+        }
+        let inner_bytes = inner.as_bytes();
+        let mut i = 0;
+
+        while i < inner_bytes.len() {
+            let seg_end = match inner[i..].find('\\') {
+                Some(offset) => i + offset,
+                None => inner_bytes.len(),
+            };
+            if seg_end > i {
+                self.push_non_newline_chars(bytecount::num_chars(&inner_bytes[i..seg_end]));
+            }
+            if seg_end == inner_bytes.len() {
+                break;
+            }
+            let esc = *inner_bytes.get(seg_end + 1)?;
+            match esc {
+                b'n' => {
+                    self.push_newline();
+                    i = seg_end + 2;
+                }
+                b'"' | b'\\' | b'/' | b'b' | b'f' | b'r' | b't' => {
+                    self.push_non_newline_chars(1);
+                    i = seg_end + 2;
+                }
+                b'u' => {
+                    let code = parse_hex4(inner_bytes.get(seg_end + 2..seg_end + 6)?)?;
+                    if code == 0x000A {
+                        self.push_newline();
+                        i = seg_end + 6;
+                    } else if (0xD800..=0xDBFF).contains(&code) {
+                        if inner_bytes.get(seg_end + 6..seg_end + 8) != Some(b"\\u") {
+                            return None;
+                        }
+                        let low = parse_hex4(inner_bytes.get(seg_end + 8..seg_end + 12)?)?;
+                        if !(0xDC00..=0xDFFF).contains(&low) {
+                            return None;
+                        }
+                        self.push_non_newline_chars(1);
+                        i = seg_end + 12;
+                    } else if (0xDC00..=0xDFFF).contains(&code) {
+                        return None;
+                    } else {
+                        self.push_non_newline_chars(1);
+                        i = seg_end + 6;
+                    }
+                }
+                _ => return None,
+            }
+        }
+
+        Some(false)
+    }
+
     /// Finalizes the accumulated counts, discarding trailing `\n` characters.
     #[inline]
     pub(crate) fn finish(self) -> TextMetrics {
@@ -97,62 +185,8 @@ fn parse_hex4(bytes: &[u8]) -> Option<u16> {
 ///
 /// Returns `None` if `raw` is not a JSON string literal or contains an invalid escape or unpaired UTF-16 surrogate.
 pub(crate) fn count_json_string_metrics(raw: &str) -> Option<TextMetrics> {
-    let bytes = raw.as_bytes();
-    if bytes.len() < 2 || bytes[0] != b'"' || bytes[bytes.len() - 1] != b'"' {
-        return None;
-    }
-    let inner = &raw[1..raw.len() - 1];
-    let inner_bytes = inner.as_bytes();
     let mut counter = StreamingTextCounter::default();
-    let mut i = 0;
-
-    while i < inner_bytes.len() {
-        let seg_end = match inner[i..].find('\\') {
-            Some(offset) => i + offset,
-            None => inner_bytes.len(),
-        };
-        if seg_end > i {
-            counter.push_non_newline_chars(bytecount::num_chars(&inner_bytes[i..seg_end]));
-        }
-        if seg_end == inner_bytes.len() {
-            break;
-        }
-        let esc = *inner_bytes.get(seg_end + 1)?;
-        match esc {
-            b'n' => {
-                counter.push_newline();
-                i = seg_end + 2;
-            }
-            b'"' | b'\\' | b'/' | b'b' | b'f' | b'r' | b't' => {
-                counter.push_non_newline_chars(1);
-                i = seg_end + 2;
-            }
-            b'u' => {
-                let code = parse_hex4(inner_bytes.get(seg_end + 2..seg_end + 6)?)?;
-                if code == 0x000A {
-                    counter.push_newline();
-                    i = seg_end + 6;
-                } else if (0xD800..=0xDBFF).contains(&code) {
-                    if inner_bytes.get(seg_end + 6..seg_end + 8) != Some(b"\\u") {
-                        return None;
-                    }
-                    let low = parse_hex4(inner_bytes.get(seg_end + 8..seg_end + 12)?)?;
-                    if !(0xDC00..=0xDFFF).contains(&low) {
-                        return None;
-                    }
-                    counter.push_non_newline_chars(1);
-                    i = seg_end + 12;
-                } else if (0xDC00..=0xDFFF).contains(&code) {
-                    return None;
-                } else {
-                    counter.push_non_newline_chars(1);
-                    i = seg_end + 6;
-                }
-            }
-            _ => return None,
-        }
-    }
-
+    counter.push_json_string(raw)?;
     Some(counter.finish())
 }
 
@@ -999,5 +1033,34 @@ mod tests {
             serde_json::from_str::<Option<CountedJsonString>>("null").unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn streaming_text_counter_push_str_matches_joined_lines() {
+        let chunks_cases: &[&[&str]] = &[
+            &[],
+            &[""],
+            &["", ""],
+            &["hello"],
+            &["line1", "line2", ""],
+            &["繁體中文\n第二行", "🚀🎉\r\n", "結尾\n\n"],
+            &["\n", "a\n\nb", "\n"],
+        ];
+
+        for chunks in chunks_cases {
+            let joined = chunks.join("\n");
+            let mut counter = StreamingTextCounter::default();
+            for (idx, chunk) in chunks.iter().enumerate() {
+                if idx > 0 {
+                    counter.push_newline();
+                }
+                counter.push_str(chunk);
+            }
+            assert_eq!(
+                counter.finish(),
+                TextMetrics::from_str(&joined),
+                "mismatch for chunks {chunks:?}"
+            );
+        }
     }
 }
