@@ -465,7 +465,7 @@ impl<'a> AntigravityParser<'a> {
                     self.apply_result(&call, object, timestamp);
                 }
             }
-            "USER_INPUT" | "SYSTEM_MESSAGE" => {}
+            "USER_INPUT" | "SYSTEM_MESSAGE" | "ERROR_MESSAGE" => {}
             _ => {
                 self.diagnostics.record_unrecognized();
                 return;
@@ -527,7 +527,7 @@ impl<'a> AntigravityParser<'a> {
                     );
                 }
             }
-            "USER_INPUT" | "SYSTEM_MESSAGE" => {}
+            "USER_INPUT" | "SYSTEM_MESSAGE" | "ERROR_MESSAGE" => {}
             _ => {
                 self.diagnostics.record_unrecognized();
                 return;
@@ -1009,6 +1009,68 @@ mod tests {
 
         let parsed = parse_antigravity_session(&path, ParseMode::UsageOnly, None).unwrap();
         assert_eq!(parsed.diagnostics.partial_failure_count(), 1);
+    }
+
+    #[test]
+    fn error_message_step_is_recognized_without_affecting_usage_or_tools() {
+        let mut step = planner(1, 100, 20, 15);
+        step["tool_calls"] = json!([
+            {"name": "read_file", "args": {"Path": "/w/a.rs"}}
+        ]);
+        let tool_result = json!({
+            "step_index": 2,
+            "source": "MODEL",
+            "type": "GENERIC",
+            "status": "DONE",
+            "created_at": "2026-11-11T12:00:01Z",
+            "content": "1: fn a() {}\n2: fn b() {}"
+        });
+        let base_lines = vec![
+            json!({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE", "created_at": "2026-11-11T11:59:59Z"}),
+            step,
+            tool_result,
+        ];
+        let mut with_errors = base_lines.clone();
+        // Borrowed fast path (`push_borrowed`).
+        with_errors.push(json!({
+            "step_index": 3,
+            "source": "SYSTEM",
+            "type": "ERROR_MESSAGE",
+            "status": "DONE",
+            "error": "stream interrupted",
+            "created_at": "2026-11-11T12:00:02Z",
+            "content": "Error: stream interrupted"
+        }));
+        // Owned fallback path (`push`, triggered by non-integer `step_index`).
+        with_errors.push(json!({
+            "step_index": "4",
+            "source": "SYSTEM",
+            "type": "ERROR_MESSAGE",
+            "status": "DONE",
+            "error": "retryable error",
+            "created_at": "2026-11-11T12:00:03Z",
+            "content": "Error: retryable error"
+        }));
+
+        let base_dir = tempfile::tempdir().unwrap();
+        let err_dir = tempfile::tempdir().unwrap();
+        let gens = [generation("gemini-a", Some(0))];
+        let base_path = conversation(base_dir.path(), &base_lines, Some(&gens));
+        let err_path = conversation(err_dir.path(), &with_errors, Some(&gens));
+
+        for mode in [ParseMode::Full, ParseMode::UsageOnly] {
+            let base = parse_antigravity_session(&base_path, mode, None).unwrap();
+            let with_err = parse_antigravity_session(&err_path, mode, None).unwrap();
+            assert_eq!(with_err.diagnostics.partial_failure_count(), 0);
+            let b = &base.analysis.records[0];
+            let w = &with_err.analysis.records[0];
+            assert_eq!(w.conversation_usage, b.conversation_usage);
+            assert_eq!(w.advisor_usage, b.advisor_usage);
+            assert_eq!(w.tool_call_counts.read, b.tool_call_counts.read);
+            assert_eq!(w.total_read_lines, b.total_read_lines);
+            assert_eq!(w.total_read_characters, b.total_read_characters);
+            assert_eq!(w.total_unique_files, b.total_unique_files);
+        }
     }
 
     #[test]
