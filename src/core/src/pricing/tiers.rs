@@ -3,12 +3,12 @@
 //! Context-tier boundaries are evaluated per request rather than on aggregated token totals. [`TierThresholds`] captures each model's ascending token boundaries from a [`ModelPricingMap`](super::ModelPricingMap), and [`TierClassifier`] maps each request's prompt size to a 0-based price level (`0` for the base level, `n` for the level above the `n`th boundary) for [`calculate_cost`](super::calculate_cost).
 
 use crate::constants::FastHashMap;
-use crate::pricing::normalize_model_name;
+use crate::pricing::matching::{is_ascii_lowercase_str, normalize_model_name_slice};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 /// Immutable map from model name to ascending context-size boundaries (in tokens).
 ///
-/// Entries are indexed by both the lowercased LiteLLM key and its [`normalize_model_name`] form. A model with no entry has a single price level.
+/// Entries are indexed by both the lowercased LiteLLM key and its [`normalize_model_name`](super::normalize_model_name) form. A model with no entry has a single price level.
 ///
 /// Range-based and threshold-based models share this normalized namespace; a normalized-name collision between the two strategies would misalign the resulting level index.
 #[derive(Debug, Default)]
@@ -21,19 +21,23 @@ impl TierThresholds {
     /// Builds a snapshot from `(model_key, ascending_boundaries)` pairs, keeping the lexicographically smallest boundary list on key collision.
     pub(crate) fn from_entries<'a>(entries: impl Iterator<Item = (&'a str, Vec<i64>)>) -> Self {
         let mut boundaries: FastHashMap<Box<str>, Box<[i64]>> = FastHashMap::default();
-        let mut insert_min = |key: String, levels: &[i64]| {
-            boundaries
-                .entry(key.into_boxed_str())
-                .and_modify(|existing| {
-                    if levels < &**existing {
-                        *existing = levels.into();
-                    }
-                })
-                .or_insert_with(|| levels.into());
+        let mut insert_min = |key: &str, levels: &[i64]| {
+            if let Some(existing) = boundaries.get_mut(key) {
+                if levels < &**existing {
+                    *existing = levels.into();
+                }
+            } else {
+                boundaries.insert(key.into(), levels.into());
+            }
         };
         for (key, levels) in entries {
-            insert_min(key.to_lowercase(), &levels);
-            insert_min(normalize_model_name(key), &levels);
+            if is_ascii_lowercase_str(key) {
+                insert_min(key, &levels);
+            } else {
+                let lowered = key.to_lowercase();
+                insert_min(&lowered, &levels);
+            }
+            insert_min(normalize_model_name_slice(key), &levels);
         }
 
         // XOR per-entry hashes for an order-independent fingerprint across map iteration orders.
@@ -55,12 +59,18 @@ impl TierThresholds {
         if self.boundaries.is_empty() {
             return None;
         }
-        let lowered = model.to_lowercase();
-        if let Some(levels) = self.boundaries.get(lowered.as_str()) {
-            return Some(levels);
+        if is_ascii_lowercase_str(model) {
+            if let Some(levels) = self.boundaries.get(model) {
+                return Some(levels);
+            }
+        } else {
+            let lowered = model.to_lowercase();
+            if let Some(levels) = self.boundaries.get(lowered.as_str()) {
+                return Some(levels);
+            }
         }
         self.boundaries
-            .get(normalize_model_name(model).as_str())
+            .get(normalize_model_name_slice(model))
             .map(|levels| &**levels)
     }
 

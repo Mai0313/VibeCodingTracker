@@ -34,8 +34,8 @@ pub fn resolve_model_cost(
         token_cost + counts.web_search_requests as f64 * pricing.web_search_cost_per_query
     };
 
-    let exact_or = |stored: f64| match pricing_map.get_exact(model) {
-        Some(pricing) => (priced(&pricing), None),
+    let exact_or = |stored: f64| match pricing_map.get_exact_ref(model) {
+        Some(pricing) => (priced(pricing), None),
         None => (stored, None),
     };
 
@@ -43,16 +43,22 @@ pub fn resolve_model_cost(
         CostSource::CursorEstimate => exact_or(0.0),
         CostSource::OpenCodeStored(stored) | CostSource::HermesStored(stored) => exact_or(stored),
         CostSource::Litellm => {
-            let result = pricing_map.get(model);
-            (priced(&result.pricing), result.matched_model)
+            let (pricing, matched_model) = pricing_map.lookup_ref(model);
+            let cost = pricing.map_or(0.0, priced);
+            (cost, matched_model.map(|key| key.to_string()))
         }
         CostSource::GrokGauge => {
-            let result = pricing_map.get(model);
-            let mut pricing = result.pricing;
-            if pricing.cache_read_input_token_cost <= 0.0 {
-                pricing.cache_read_input_token_cost = pricing.input_cost_per_token;
-            }
-            (priced(&pricing), result.matched_model)
+            let (pricing, matched_model) = pricing_map.lookup_ref(model);
+            let cost = match pricing {
+                Some(pricing) if pricing.cache_read_input_token_cost > 0.0 => priced(pricing),
+                Some(pricing) => {
+                    let mut adjusted = pricing.clone();
+                    adjusted.cache_read_input_token_cost = adjusted.input_cost_per_token;
+                    priced(&adjusted)
+                }
+                None => 0.0,
+            };
+            (cost, matched_model.map(|key| key.to_string()))
         }
     }
 }

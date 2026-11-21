@@ -8,11 +8,12 @@ mod cost;
 mod matching;
 mod tiers;
 
+use crate::constants::FastHashMap;
 use crate::utils::{find_pricing_cache_for_date_in, get_cache_dir};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 const LITELLM_PRICING_URL: &str =
@@ -63,9 +64,9 @@ pub fn fetch_model_pricing() -> Result<ModelPricingMap> {
             && let Ok(pricing) = cache::load_from_cache_in(&cache_dir)
         {
             log::debug!("Loaded model pricing from today's cache (offline)");
-            return Ok(ModelPricingMap::new(pricing));
+            return Ok(ModelPricingMap::from_fast_map(pricing));
         }
-        return Ok(ModelPricingMap::new(std::collections::HashMap::new()));
+        return Ok(ModelPricingMap::from_fast_map(FastHashMap::default()));
     }
 
     fetch_model_pricing_with(LITELLM_PRICING_URL, &cache_dir)
@@ -90,7 +91,7 @@ pub fn fetch_model_pricing_with(url: &str, cache_dir: &Path) -> Result<ModelPric
             Ok(pricing) => {
                 log::debug!("Loaded model pricing from today's cache");
                 clear_fetch_failure(&fetch_key);
-                return Ok(ModelPricingMap::new(pricing));
+                return Ok(ModelPricingMap::from_fast_map(pricing));
             }
             Err(e) => {
                 log::warn!("Failed to load from cache: {}, fetching from remote", e);
@@ -109,7 +110,7 @@ pub fn fetch_model_pricing_with(url: &str, cache_dir: &Path) -> Result<ModelPric
     match result {
         Ok(pricing) => {
             clear_fetch_failure(&fetch_key);
-            Ok(ModelPricingMap::new(pricing))
+            Ok(ModelPricingMap::from_fast_map(pricing))
         }
         Err(error) => {
             record_fetch_failure(fetch_key);
@@ -121,7 +122,7 @@ pub fn fetch_model_pricing_with(url: &str, cache_dir: &Path) -> Result<ModelPric
 fn fetch_model_pricing_remote(
     url: &str,
     cache_dir: &Path,
-) -> Result<HashMap<String, ModelPricing>> {
+) -> Result<FastHashMap<Arc<str>, ModelPricing>> {
     log::info!("Fetching model pricing from remote...");
     // Bound the blocking fetch so an unreachable network cannot stall startup.
     let client = reqwest::blocking::Client::builder()

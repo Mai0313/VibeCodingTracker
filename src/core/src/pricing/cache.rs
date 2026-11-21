@@ -1,5 +1,6 @@
 //! LiteLLM pricing data types, JSON parsing, and daily on-disk cache I/O.
 
+use crate::constants::FastHashMap;
 use crate::utils::{
     find_pricing_cache_for_date_in, get_pricing_cache_path_in, list_pricing_cache_files_in,
 };
@@ -9,10 +10,12 @@ use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqA
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::borrow::Cow;
+#[cfg(test)]
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 /// Per-token prices applied when a request's input context exceeds `threshold_tokens`.
 ///
@@ -317,11 +320,11 @@ pub fn parse_litellm_pricing_map(raw: &serde_json::Value) -> HashMap<String, Mod
 /// Rejects the payload if it is not a JSON object, if any entry has a negative or non-finite rate, or if no model has a positive price.
 pub(crate) fn parse_and_validate_litellm_map(
     raw: &serde_json::Value,
-) -> Result<HashMap<String, ModelPricing>> {
+) -> Result<FastHashMap<Arc<str>, ModelPricing>> {
     let Some(obj) = raw.as_object() else {
         anyhow::bail!("Invalid model pricing JSON: top-level value must be an object");
     };
-    let mut pricing = HashMap::with_capacity(obj.len());
+    let mut pricing = FastHashMap::with_capacity(obj.len());
     for (name, value) in obj {
         if !value.is_object() {
             continue;
@@ -332,7 +335,7 @@ pub(crate) fn parse_and_validate_litellm_map(
             "Invalid model pricing JSON: negative or non-finite price"
         );
         if model_pricing_has_positive_rate(&entry) {
-            pricing.insert(name.clone(), entry);
+            pricing.insert(Arc::from(name.as_str()), entry);
         }
     }
     anyhow::ensure!(
@@ -757,7 +760,7 @@ struct PricingCacheMapSeed<'a> {
 }
 
 impl<'de> DeserializeSeed<'de> for PricingCacheMapSeed<'_> {
-    type Value = HashMap<String, ModelPricing>;
+    type Value = FastHashMap<Arc<str>, ModelPricing>;
 
     fn deserialize<D: Deserializer<'de>>(
         self,
@@ -768,7 +771,7 @@ impl<'de> DeserializeSeed<'de> for PricingCacheMapSeed<'_> {
 }
 
 impl<'de> Visitor<'de> for PricingCacheMapSeed<'_> {
-    type Value = HashMap<String, ModelPricing>;
+    type Value = FastHashMap<Arc<str>, ModelPricing>;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("a JSON object mapping model names to pricing objects")
@@ -778,7 +781,7 @@ impl<'de> Visitor<'de> for PricingCacheMapSeed<'_> {
         self,
         mut map: A,
     ) -> std::result::Result<Self::Value, A::Error> {
-        let mut entries = HashMap::with_capacity(self.initial_capacity);
+        let mut entries = FastHashMap::with_capacity(self.initial_capacity);
         while let Some(JsonStr(key)) = map.next_key::<JsonStr<'de>>()? {
             let Some(pricing) = map.next_value_seed(PricingEntrySeed { abort: self.abort })? else {
                 continue;
@@ -788,7 +791,7 @@ impl<'de> Visitor<'de> for PricingCacheMapSeed<'_> {
                 return Err(de::Error::custom("negative or non-finite pricing rate"));
             }
             if model_pricing_has_positive_rate(&pricing) {
-                entries.insert(key.into_owned(), pricing);
+                entries.insert(Arc::from(key.as_ref()), pricing);
             } else {
                 entries.remove(key.as_ref());
             }
@@ -801,7 +804,7 @@ impl<'de> Visitor<'de> for PricingCacheMapSeed<'_> {
 fn parse_litellm_cache_bytes(
     bytes: &[u8],
     cache_path: Option<&Path>,
-) -> Result<HashMap<String, ModelPricing>> {
+) -> Result<FastHashMap<Arc<str>, ModelPricing>> {
     // Filtered LiteLLM entries average ~200–225 bytes each; pre-sizing avoids repeated rehashes.
     let initial_capacity = (bytes.len() / 220).min(16_384);
     let mut abort = None;
@@ -899,7 +902,7 @@ pub fn cleanup_old_cache_in(dir: &Path) {
 /// # Errors
 ///
 /// Returns an error if today's cache file is missing, unreadable, invalid JSON, not a JSON object, in the legacy serialized-[`ModelPricing`] format, contains a negative or non-finite rate, or yields no priced models.
-pub fn load_from_cache_in(dir: &Path) -> Result<HashMap<String, ModelPricing>> {
+pub fn load_from_cache_in(dir: &Path) -> Result<FastHashMap<Arc<str>, ModelPricing>> {
     let today = pricing_cache_date();
     let cache_path = find_pricing_cache_for_date_in(dir, &today)
         .ok_or_else(|| anyhow::anyhow!("No cache file found for today"))?;

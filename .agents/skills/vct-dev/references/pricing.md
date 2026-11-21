@@ -12,7 +12,7 @@
 - Generic placeholders (`default`, `auto`, …) and model segments shorter than 4 **bytes** skip substring and fuzzy stages (unpriced beats a coincidental neighbor).
 - Date suffixes require exactly 8 ASCII digits; version suffixes allow numeric/dot forms (`v2`, `v1.0`) only, never words like `vision`.
 - Normalized collisions and substring tie-breaks prefer: same provider → unprefixed canonical key → model vendor's own official provider prefix (unsuffixed base ahead of versioned variants across all three) → suffix length → lexical order.
-- Each `ModelPricingMap` owns its own capacity-64 LRU. `clear_pricing_cache()` advances a generation counter so existing maps lazily invalidate without cross-map contamination.
+- Each `ModelPricingMap` owns its own lazily allocated capacity-512 LRU for non-exact lookups, and builds its normalized and lowercase indices lazily via `OnceLock` so exact lookups and `tier_thresholds()` skip secondary indexing. `clear_pricing_cache()` advances a generation counter so existing maps lazily invalidate without cross-map contamination.
 
 ## Per-request context tiers and non-token billing
 
